@@ -302,3 +302,177 @@ inside either window has been evicted yet. But BEFORE's summaries start ageing o
 
 CPU-seconds and peak memory therefore cannot be read from production for either window. §4
 measures them in a controlled run instead.
+
+## 2. Gate wall (`merge_verify.duration_ms`), keyed by tree and arm
+
+`merge_verify.duration_ms` is the whole gate: nine modules run one after another, and each
+module's test, lint and type-check legs run side by side. One Python block keys every
+`merge_verify` row in [T − 7 d, T + 7 d) by §1(c) and §1(d), then reports each
+(tree × arm) cell. Run it from the worktree root; it calls `git merge-base` once per row.
+
+```python
+import json, sqlite3, statistics, subprocess
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+DB = 'file:/home/leo/src/dark-factory/data/orchestrator/runs.db?mode=ro'
+EDIT = 'b39a4f57caa4818967fbf9ccb9c1556891a8fed5'
+T = datetime(2026, 9, 17, 6, 30, 1, 881486, tzinfo=timezone.utc)
+ARMS = [(datetime(2026, 9, 8, 10, 18, 7, 313447, tzinfo=timezone.utc), 16),   # config_reload instants, §1(d)
+        (datetime(2026, 9, 10, 19, 6, 50, 398743, tzinfo=timezone.utc), 8),
+        (datetime(2026, 9, 17, 11, 39, 26, 361661, tzinfo=timezone.utc), 16)]
+
+def arm_at(t):
+    return [value for boundary, value in ARMS if boundary <= t][-1]
+
+def pct(xs, p):  # nearest rank, the definition scripts/merge-pytest-n-ab-analysis.py::pct uses
+    ys = sorted(xs)
+    return ys[max(0, min(len(ys) - 1, int(round(p * (len(ys) - 1)))))]
+
+rows = []
+for ts, task, data in sqlite3.connect(DB, uri=True).execute(
+        "SELECT timestamp, task_id, data FROM events WHERE event_type = 'merge_verify' "
+        "AND timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+        ((T - timedelta(days=7)).isoformat(), (T + timedelta(days=7)).isoformat())):
+    d = json.loads(data)
+    end = datetime.fromisoformat(ts)
+    rc = subprocess.run(['git', 'merge-base', '--is-ancestor', EDIT, d['merge_sha']], capture_output=True).returncode
+    rows.append(dict(ts=ts, task=task, secs=d['duration_ms'] / 1000, passed=d['passed'], spec=bool(d.get('speculative')),
+                     runner=d.get('runner'), window='BEFORE' if end < T else 'AFTER',
+                     edit={0: 'edit', 1: 'no-edit'}.get(rc, f'unresolved rc={rc}'),
+                     arm=arm_at(end - timedelta(milliseconds=d['duration_ms']))))
+
+def clean(sel):  # passed, non-speculative, local
+    return [r['secs'] for r in sel if r['passed'] and not r['spec'] and r['runner'] == 'local']
+
+print('unresolved:', [(r['ts'], r['task'], r['edit']) for r in rows if r['edit'].startswith('unresolved')])
+cells = defaultdict(list)
+for r in rows:
+    cells[r['edit'], r['arm']].append(r)
+med = {}
+for key in sorted(cells):
+    sel = cells[key]; xs = clean(sel); med[key] = statistics.median(xs) if xs else None
+    print(key, 'n', len(sel), 'failed', sum(not r['passed'] for r in sel), 'spec', sum(r['spec'] for r in sel),
+          'clean', len(xs), 'median', round(med[key]), 'p90', round(pct(xs, 0.9)), 'max', round(max(xs)),
+          'first', sel[0]['ts'][:19], 'last', sel[-1]['ts'][:19],
+          'windows', sorted({r['window'] for r in sel}), 'tasks' if len(sel) < 6 else '', [r['task'] for r in sel] if len(sel) < 6 else '')
+for w in ('BEFORE', 'AFTER'):
+    xs = clean([r for r in rows if r['window'] == w]); med[w] = statistics.median(xs)
+    print(w, 'clean n', len(xs), 'median', round(med[w]))
+print('(i) naive AFTER/BEFORE', round(med['AFTER'] / med['BEFORE'], 3))
+print('(ii) arm 16 edit/no-edit', round(med['edit', 16] / med['no-edit', 16], 3))
+print('(iii) arm 8 edit/no-edit', round(med['edit', 8] / med['no-edit', 8], 3))
+predicted = med['no-edit', 8] / 1.296
+print('arm switch alone predicts', round(predicted), 'observed (edit,16)', round(med['edit', 16]),
+      'residual s', round(med['edit', 16] - predicted), 'residual ratio', round(med['edit', 16] / predicted, 3))
+```
+
+```
+unresolved: []
+('edit', 8) n 5 failed 0 spec 2 clean 3 median 4196 p90 4561 max 4561 first 2026-09-17T06:27:06 last 2026-09-17T11:35:19 windows ['AFTER', 'BEFORE'] tasks ['5408', '5450', '4984', '5359', '4252']
+('edit', 16) n 142 failed 20 spec 66 clean 62 median 3136 p90 4048 max 4665 first 2026-09-17T13:05:54 last 2026-09-24T06:11:07 windows ['AFTER']
+('no-edit', 8) n 98 failed 27 spec 30 clean 49 median 4224 p90 5329 max 6857 first 2026-09-10T20:13:45 last 2026-09-17T05:24:41 windows ['BEFORE']
+('no-edit', 16) n 13 failed 2 spec 7 clean 5 median 3294 p90 4289 max 4289 first 2026-09-10T06:33:09 last 2026-09-10T18:16:27 windows ['BEFORE']
+BEFORE clean n 54 median 4188
+AFTER clean n 65 median 3169
+(i) naive AFTER/BEFORE 0.757
+(ii) arm 16 edit/no-edit 0.952
+(iii) arm 8 edit/no-edit 0.994
+arm switch alone predicts 3259 observed (edit,16) 3136 residual s -123 residual ratio 0.962
+```
+
+**All 258 rows resolved: 0 unresolved.** Every edit-absent row ended in BEFORE. Every row that
+ended in AFTER is edit-present, and so is 5408's own verify in BEFORE.
+
+"Clean" means passed, non-speculative and runner `local`: the population 5204's A/B used.
+Speculative and failed rows overlap, so the three counts need not sum to n. Percentiles are
+nearest-rank, as in `scripts/merge-pytest-n-ab-analysis.py::pct`. First and last are verify end
+times.
+
+| tree | arm | n (all) | failed | speculative | n clean | median s | p90 s | max s | first → last (UTC) |
+|---|---|---|---|---|---|---|---|---|---|
+| edit-absent | 16 | 13 | 2 | 7 | **5** | 3294 | 4289 | 4289 | 09-10T06:33:09 → 09-10T18:16:27 |
+| edit-absent | 8 | 98 | 27 | 30 | 49 | 4224 | 5329 | 6857 | 09-10T20:13:45 → 09-17T05:24:41 |
+| edit-present | 8 | 5 | 0 | 2 | **3** | 4196 | 4561 | 4561 | 09-17T06:27:06 → 09-17T11:35:19 |
+| edit-present | 16 | 142 | 20 | 66 | 62 | 3136 | 4048 | 4665 | 09-17T13:05:54 → 09-24T06:11:07 |
+| *supplementary, quoted from 5204's report, not recomputed:* edit-absent | 16 | 52 | 27 | 12 | 14 | 3212 | 4270 | 4289 | 09-08T10:38 → 09-10T18:16 |
+
+No verify straddles an arm switch. The last 16-arm verify before the 09-10 switch ended at
+18:16:27, and the first 8-arm one ended at 20:13:45. Around the 09-17 switch the gap runs from
+11:35:19 to 13:05:54. Keying arms by start or by end therefore gives the same cells here.
+
+The edit-present 8-arm cell is 5408's own verify plus four verifies that ended in the five hours
+between T and the 09-17T11:39Z switch. The edit-absent 16-arm cell is the first 12 hours of
+BEFORE, before the 09-10T19:06Z switch. Both are tiny, and **neither the windows nor the cells
+are widened to fill them.** The supplementary row is 5204's committed 16-arm figure from
+`plans/merge-pytest-n-ab-report-2026-09-16.md`. Its window starts on 09-08, outside BEFORE, and
+overlaps this report's edit-absent 16-arm cell only on 09-10.
+
+### Contrasts
+
+| contrast | numerator (n) | denominator (n) | ratio | reading |
+|---|---|---|---|---|
+| (i) naive 7 d / 7 d | AFTER 3169 s (65) | BEFORE 4188 s (54) | **0.757** | −24.3%. Mixes 5408 with the arm switch; see below |
+| (ii) arm-matched at 16 | edit-present 3136 s (62) | edit-absent 3294 s (**5**) | 0.952 | −4.8%. **Indicative only**: n = 5 < 10 |
+| (iii) arm-matched at 8 | edit-present 4196 s (**3**) | edit-absent 4224 s (49) | 0.994 | −0.6%. **Indicative only**: n = 3 < 10 |
+| supplementary, at 16 | edit-present 3136 s (62) | 5204's 16 arm 3212 s (14) | 0.976 | −2.4%. Different window; quoted, not recomputed |
+
+**What the arm switch alone predicts.** 5204 measured median(8) / median(16) = 1.296 on the
+whole gate. Applied to this report's edit-absent 8-arm median, that predicts a 16-arm gate of
+4224 / 1.296 = **3259 s** with no edit at all. The observed edit-present 16-arm median is
+3136 s. The **residual is −123 s, a ratio of 0.962**.
+
+So the arm switch alone predicts a 965 s drop (4224 → 3259 s), against the naive drop of
+1,019 s (4188 → 3169 s). Roughly 4% of gate wall is left for 5408 and every other confound in
+§1(f). The three arm-aware estimates
+of 5408's effect (−4.8%, −0.6% and −3.8%) and the supplementary row (−2.4%) agree in sign and
+size. None of them rests on two cells that both have n ≥ 10.
+
+The 1.296 ratio was measured on edit-absent trees. On edit-present trees the four changed
+modules also scale with the pin, so the ratio may differ somewhat there. §5(e) compares the
+residual with the per-module savings from §3.
+
+### Landings per window
+
+A landing is a `merge_finalized` event with state `done`, or a `train_merged` event, deduped by
+merge sha. That is the 6021 report's §2 definition.
+
+```sql
+WITH landings AS (
+  SELECT min(timestamp) AS ts,
+         COALESCE(json_extract(data,'$.merge_sha'), json_extract(data,'$.merge_commit_sha')) AS sha
+  FROM events
+  WHERE timestamp >= '2026-09-10T06:30:01.881486+00:00' AND timestamp < '2026-09-24T06:30:01.881486+00:00'
+    AND ((event_type = 'merge_finalized' AND json_extract(data,'$.state') = 'done') OR event_type = 'train_merged')
+  GROUP BY sha
+)
+SELECT CASE WHEN ts < '2026-09-17T06:30:01.881486+00:00' THEN 'BEFORE' ELSE 'AFTER' END AS w,
+       substr(ts, 1, 10) AS day, count(*)
+FROM landings GROUP BY w, day ORDER BY day;
+```
+
+| UTC day | 09-10* | 09-11 | 09-12 | 09-13 | 09-14 | 09-15 | 09-16 | 09-17* | total | per hour |
+|---|---|---|---|---|---|---|---|---|---|---|
+| BEFORE | 11 | 5 | 12 | 13 | 10 | 13 | 12 | 5 | **81** | 0.48 |
+
+| UTC day | 09-17* | 09-18 | 09-19 | 09-20 | 09-21 | 09-22 | 09-23 | 09-24* | total | per hour |
+|---|---|---|---|---|---|---|---|---|---|---|
+| AFTER | 14 | 18 | 17 | 17 | 15 | 25 | 18 | 2 | **126** | 0.75 |
+
+\* partial day: each window starts and ends at 06:30:01Z, and 09-17 is split at T. The 207 rows
+(189 `merge_finalized`, 18 `train_merged`) carry 207 distinct shas.
+
+**The landing rate is arrival-bounded,** as the 6021 report's caveat says. Arrivals rose too:
+
+```sql
+SELECT CASE WHEN timestamp < '2026-09-17T06:30:01.881486+00:00' THEN 'BEFORE' ELSE 'AFTER' END AS w,
+       count(*), count(DISTINCT task_id)
+FROM events
+WHERE event_type = 'merge_queued'
+  AND timestamp >= '2026-09-10T06:30:01.881486+00:00' AND timestamp < '2026-09-24T06:30:01.881486+00:00'
+GROUP BY w ORDER BY w DESC;
+-- BEFORE | 186 | 110
+-- AFTER  | 208 | 151
+```
+
+Distinct tasks enqueued rose 37%, and landings rose 56%. The +56% therefore does not measure
+5408, nor the gate on its own.
