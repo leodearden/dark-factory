@@ -9,8 +9,7 @@ dark_factory codebook entry-cand-20260729-4.
 The mechanical half is
 `orchestrator/src/orchestrator/agents/invoke.py::apply_bash_cwd_reset_env`.
 This prose is written to hold whether or not the shell is reset: non-Claude
-backends ignore that env var, an operator may opt out, and its live effect has
-not yet been exercised end-to-end.
+backends ignore that env var, and an operator may opt out.
 
 `orchestrator/src/orchestrator/agents/path_not_found_guidance.py::PATH_NOT_FOUND_GUIDANCE`
 owns RECOVERING a not-found path by search; this block owns the CWD cause and

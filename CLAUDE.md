@@ -151,8 +151,9 @@ any earlier `cd` moved it — including one buried in a compound command several
 turns ago. An orchestrator-dispatched Claude session is launched with
 `CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1`
 (`orchestrator/src/orchestrator/agents/invoke.py::apply_bash_cwd_reset_env`),
-so the CLI silently puts its shell back at the dispatch root after every call.
-The anchor below is correct in both cases; use it regardless. Your own
+which the CLI reads as a request to put its shell back at the dispatch root,
+silently, after every call. The anchor below is correct whether or not that
+happens; use it regardless. Your own
 command text does not show where the command will run: in the transcript behind
 `plans/confusion-census-2026-09-20.md` §1.4, two adjacent Bash calls in one
 session carried different tracked cwds.
