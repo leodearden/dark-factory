@@ -101,9 +101,9 @@ PROBE_PLUGINS = ('xdist', 'timeout')
 # trivial test can take longer than 2s, and the tally must not depend on that.
 NON_BLOCKING_TIMEOUT_SECS = 60
 
-# Below each probe's @pytest.mark.timeout, so a wedged child fails its probe
-# with a message naming this budget and printing its partial output.
-PROBE_SUBPROCESS_TIMEOUT_SECS = 100
+# Strictly below the per-test axe the probes run under (300 under verify), as
+# test_the_probes_take_this_runs_per_test_timeout_and_the_child_budget_sits_below_it enforces.
+PROBE_SUBPROCESS_TIMEOUT_SECS = 240
 
 # Keeps the two probes on one worker wherever --dist loadgroup is in force, so
 # two nested pytest sessions never run at once on an already-loaded host.
@@ -241,7 +241,6 @@ def _text(stream: str | bytes | None) -> str:
 
 
 @pytest.mark.xdist_group(TIMEOUT_METHOD_PROBE_GROUP)
-@pytest.mark.timeout(120)
 def test_signal_timeout_fails_the_test_and_the_xdist_worker_survives(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -284,7 +283,6 @@ def test_signal_timeout_fails_the_test_and_the_xdist_worker_survives(
 
 
 @pytest.mark.xdist_group(TIMEOUT_METHOD_PROBE_GROUP)
-@pytest.mark.timeout(120)
 def test_thread_timeout_kills_the_xdist_worker(tmp_path: pathlib.Path) -> None:
     """THE PAIRED CONTROL: the same suite under thread, as orchestrator and fused-memory run.
 
