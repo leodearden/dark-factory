@@ -123,16 +123,20 @@ fi
 
 # 3. Hot-reload via the escalation MCP, and assert the value is live. The
 #    transport, its failure diagnostics and the argv-only heredoc contract are
-#    scripts/_config_reload_gate.py's; this checks only verify_env.
+#    scripts/_config_reload_gate.py's; this checks that the reload committed
+#    a re-read of THIS file, then verify_env.
 #
 #    The value is live in either of two shapes. `applied` carrying verify_env
 #    with the new value is the flip. ABSENCE of verify_env from `applied` is
 #    the converged re-run — and absence is the ONLY converged signal on the
 #    wire, because `unchanged` is a bare int COUNT of equal leaves
-#    (config.py::ConfigDiff), naming no keys and carrying no values. Absence is
-#    weaker than convergence, though: a rolled-back reload, a reload of a
-#    DIFFERENT orchestrator, and a verify_env bucketed as restart-required all
-#    produce it, which is what the three corroborators below exclude.
+#    (config.py::ConfigDiff), naming no keys and carrying no values. Neither
+#    shape says anything about OUR file on its own: a rolled-back reload and a
+#    reload of a DIFFERENT orchestrator produce the absence, and that other
+#    orchestrator's own pending change to the same value produces the flip. So
+#    both shapes are gated on the reload having committed and having re-read
+#    this config file; the converged shape is further gated on verify_env not
+#    being bucketed as restart-required.
 "$PY" - "$SCRIPT_DIR" "$KEY" "$VALUE" "$SHA" "$(realpath "$CONFIG")" "$PORT" <<'RELOAD_PY'
 import json, os, sys
 script_dir, key, value, sha, config_path, port = sys.argv[1:7]
@@ -154,21 +158,21 @@ try:
     tool = fetch_reload_report(port, committed_as=sha)
 except ReloadNotConfirmed as exc:
     fail(exc.failure.value, exc.detail)
+reloaded = tool.get('reloaded')
+reported = tool.get('config_path')
+if not reloaded:
+    fail('reload_not_committed', f'reload did not commit: reloaded={reloaded!r} '
+                                 f'(a failed reload rolls every leaf back, so the live config is untouched)')
+# `reported` is the ORCHESTRATOR's own ORCH_CONFIG_PATH, so a RELATIVE one is
+# resolved by the SERVER's cwd — realpath here would resolve it against OURS,
+# and a different unit whose ORCH_CONFIG_PATH is the bare
+# `dark-factory-orchestrator.yaml` would then match us whenever this runs from
+# our project root. Uncomparable is not a match.
+if not reported or not os.path.isabs(reported) or os.path.realpath(reported) != config_path:
+    fail('different_config_file', f'reload re-read a different file: '
+                                  f'config_path={reported!r} expected={config_path!r}')
 entry = (tool.get('applied') or {}).get('verify_env')
 if entry is None:
-    reloaded = tool.get('reloaded')
-    reported = tool.get('config_path')
-    if not reloaded:
-        fail('reload_not_committed', f'reload reported no verify_env change, but did not commit it: reloaded={reloaded!r} '
-                                     f'(a failed reload rolls every leaf back, so the live config is untouched)')
-    # `reported` is the ORCHESTRATOR's own ORCH_CONFIG_PATH, so a RELATIVE one
-    # is resolved by the SERVER's cwd — realpath here would resolve it against
-    # OURS, and a different unit whose ORCH_CONFIG_PATH is the bare
-    # `dark-factory-orchestrator.yaml` would then match us whenever this runs
-    # from our project root. Uncomparable is not a match.
-    if not reported or not os.path.isabs(reported) or os.path.realpath(reported) != config_path:
-        fail('different_config_file', f'reload reported no verify_env change, but re-read a different file: '
-                                      f'config_path={reported!r} expected={config_path!r}')
     # verify_env is in RELOADABLE_FIELDS today, so a change to it is never
     # bucketed as restart-required (config.py::diff_config) and this never
     # fires. One allowlist edit away it would: a genuine flip then produces
