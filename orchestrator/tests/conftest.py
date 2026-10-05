@@ -10,6 +10,7 @@ import itertools
 import json
 import os
 import shutil
+import subprocess
 import sys
 import uuid
 from collections.abc import Iterator
@@ -69,6 +70,7 @@ if str(REPO_ROOT) not in sys.path:
 # `_DEBUG_ASSERTS = os.environ.get(...)` seed picks it up.
 os.environ.setdefault('ORCH_DEBUG_ASSERTS', '1')
 
+from _agent_cli_guard import AgentCliSpawnGuard  # noqa: E402
 from _git_fixtures import RepoTemplates, session_templates  # noqa: E402
 from _orch_helpers import (  # noqa: E402
     CLAIMANT_TTL_SECS,
@@ -763,6 +765,22 @@ def _no_dry_run_unblock(monkeypatch, request):
         return None
 
     monkeypatch.setattr('orchestrator.workflow.run_dry_run_unblock', _noop)
+
+
+@pytest.fixture(autouse=True)
+def _forbid_agent_cli_spawn(monkeypatch, request):
+    """Fail any test that starts an agent-CLI process (claude/codex/gemini/pi).
+
+    Fails at the spawn seam, and again at teardown for a spawn whose raise a
+    caller absorbed. The guard is ``_agent_cli_guard.py``; its tests are
+    ``test_agent_cli_guard.py``.
+    """
+    guard = AgentCliSpawnGuard(request.node.nodeid)
+    monkeypatch.setattr(subprocess.Popen, '__init__', guard.guarded(subprocess.Popen.__init__))
+    yield guard
+    message = guard.violation_message()
+    if message is not None:
+        pytest.fail(message)
 
 
 @pytest.fixture(autouse=True)
