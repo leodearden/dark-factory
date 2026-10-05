@@ -2,7 +2,8 @@
 
 Injected in place of the production adapters through
 ``MergeLane(..., verifier=FakeVerifier(...), clock=FakeClock(...))``.
-``FakeVerifier`` scripts the verify outcome per task id; ``FakeClock`` is a
+``FakeVerifier`` scripts the verify outcome per task id and records each
+scoped verify as a ``ScopedVerifyCall``; ``FakeClock`` is a
 hand-advanced clock whose ``sleep`` advances it instead of waiting;
 ``RecordingEscalations`` stands in for the escalation queue and keeps what
 the lane filed; ``lane_state``/``lane_entry`` read an item's state back off
@@ -116,6 +117,15 @@ class VerifyScript:
     release: asyncio.Event | None = None
 
 
+@dataclasses.dataclass(frozen=True)
+class ScopedVerifyCall:
+    """What one ``FakeVerifier.run_scoped`` call was handed."""
+
+    task_id: str | None
+    worktree: Path
+    module_configs: tuple[Any, ...]
+
+
 def passes(summary: str = 'fake verify passed') -> VerifyScript:
     return VerifyScript(result=VerifyResult(
         passed=True, test_output='', lint_output='', type_output='', summary=summary,
@@ -149,7 +159,10 @@ class FakeVerifier:
 
     ``run_scoped`` follows ``scripts[task_id]``, or ``default`` for a task
     without a script, and records every task id it was asked about in
-    ``verified``. ``await_entry(n)`` waits for the *n*-th entry into
+    ``verified`` and what each call was handed in ``verify_calls``, one
+    ``ScopedVerifyCall`` per entry into the BASE ``run_scoped`` (an override
+    that does not delegate records only ``verified``/``entered_count``,
+    through ``_note_entry``). ``await_entry(n)`` waits for the *n*-th entry into
     ``run_scoped``, which is how a test waits for a scripted hang to be
     genuinely under way before it probes the lane -- per CALL, so a test
     that drives two verifies can wait for the SECOND one instead of being
@@ -174,6 +187,7 @@ class FakeVerifier:
         self.scripts: dict[str | None, VerifyScript] = dict(scripts or {})
         self.disk_reason = disk_reason
         self.verified: list[str | None] = []
+        self.verify_calls: list[ScopedVerifyCall] = []
         self.investigations: list[dict[str, Any]] = []
         self.entered_count = 0
         self._entry_bell = asyncio.Event()
@@ -206,6 +220,9 @@ class FakeVerifier:
         **options: Any,
     ) -> VerifyResult:
         task_id = options.get('task_id')
+        self.verify_calls.append(ScopedVerifyCall(
+            task_id=task_id, worktree=worktree, module_configs=tuple(module_configs),
+        ))
         self._note_entry(task_id)
         script = self.scripts.get(task_id, self.default)
         if script.release is not None:
