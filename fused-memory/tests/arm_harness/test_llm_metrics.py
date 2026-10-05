@@ -141,8 +141,9 @@ def test_latency_is_nearest_rank_over_ok_outcomes_in_milliseconds():
     p95 = latency_metric(LlmMetricId.EPISODE_LATENCY_P95, outcomes)
 
     assert p50 is not None and p95 is not None
-    assert (p50.metric_id, p50.kind, p50.value, p50.n) == ('episode-latency-p50', 'scalar', 30.0, 5)
-    assert (p95.metric_id, p95.kind, p95.value, p95.n) == ('episode-latency-p95', 'scalar', 100.0, 5)
+    assert (p50.metric_id, p50.kind, p50.n) == ('episode-latency-p50', 'scalar', 5)
+    assert (p95.metric_id, p95.kind, p95.n) == ('episode-latency-p95', 'scalar', 5)
+    assert (p50.value, p95.value) == (30.0, 100.0)
 
 
 def test_latency_ignores_failed_outcomes():

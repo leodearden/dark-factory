@@ -7,6 +7,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
+from shared.memory_eval_metrics import Metric
+
+from arm_harness._fakes import incumbent_control_spec, llm_spec, run_manifest_for
 from fused_memory.arm_harness.instrument_checks import (
     PREREGISTRATION_DOC_PATH,
     CheckResult,
@@ -16,17 +20,13 @@ from fused_memory.arm_harness.instrument_checks import (
     check_reference_nonempty,
     check_token_cost_accounting,
 )
+from fused_memory.arm_harness.metrics_record import LlmMetricId, record_for
+from fused_memory.arm_harness.replay import ArmAbort, EpisodeOutcome
 from fused_memory.arm_harness.run_manifest import (
     RunManifest,
     load_run_manifest,
     serialize_run_manifest,
 )
-from pydantic import ValidationError
-from shared.memory_eval_metrics import Metric
-
-from arm_harness._fakes import incumbent_control_spec, llm_spec, run_manifest_for
-from fused_memory.arm_harness.metrics_record import LlmMetricId, record_for
-from fused_memory.arm_harness.replay import ArmAbort, EpisodeOutcome
 
 MEASURED_AT = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
 
@@ -64,7 +64,8 @@ def repo(tmp_path: Path) -> Repo:
     doc.write_text('# preregistration\n')
     _git(root, 'add', '-A')
     _git(root, 'commit', '-q', '--no-verify', '-m', 'prereg')
-    return Repo(root=root, without_prereg=without_prereg, with_prereg=_git(root, 'rev-parse', 'HEAD'))
+    with_prereg = _git(root, 'rev-parse', 'HEAD')
+    return Repo(root=root, without_prereg=without_prereg, with_prereg=with_prereg)
 
 
 # --- CheckResult ---------------------------------------------------------------------

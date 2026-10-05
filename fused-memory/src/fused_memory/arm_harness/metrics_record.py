@@ -138,6 +138,7 @@ def record_for(
     measured_at: datetime,
     incomplete: bool,
     index_configuration: IndexConfiguration | None = None,
+    delta_of: DeltaOf | None = None,
 ) -> MetricsRecord:
     return MetricsRecord(
         schema_version=METRICS_SCHEMA_VERSION,
@@ -150,6 +151,7 @@ def record_for(
         preregistration_sha=spec.preregistration_sha,
         incomplete=incomplete,
         index_configuration=index_configuration,
+        delta_of=delta_of,
         metric=metric,
     )
 

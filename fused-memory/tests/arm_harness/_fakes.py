@@ -5,17 +5,15 @@ from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec
+from fused_memory.arm_harness.run_manifest import RunManifest
 from fused_memory.backends.llm_token_usage import (
     AttributingTokenUsageTracker,
     TokenMeasurement,
     measure_llm_tokens,
 )
-
-if TYPE_CHECKING:  # RED: a plain import at GREEN
-    from fused_memory.arm_harness.run_manifest import RunManifest
 
 CODE_SHA = 'a' * 40
 CORPUS_SHA = 'b' * 64
@@ -78,10 +76,8 @@ STARTED_AT = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
 FINISHED_AT = datetime(2026, 10, 5, 13, 30, tzinfo=UTC)
 
 
-def run_manifest_for(spec: LlmArmSpec | EmbeddingArmSpec, **overrides) -> 'RunManifest':
+def run_manifest_for(spec: LlmArmSpec | EmbeddingArmSpec, **overrides) -> RunManifest:
     """A complete run of ``spec`` over three episodes; override any field by keyword."""
-    from fused_memory.arm_harness.run_manifest import RunManifest  # RED: hoisted at GREEN
-
     data = {
         'schema_version': 1,
         'spec': spec,

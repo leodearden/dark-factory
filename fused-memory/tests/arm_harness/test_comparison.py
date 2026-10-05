@@ -3,13 +3,6 @@
 from datetime import UTC, datetime
 
 import pytest
-from fused_memory.arm_harness.comparison import (
-    ParityPreconditionError,
-    check_arm_config_symmetry,
-    check_single_code_sha,
-    client_class_parity,
-)
-from fused_memory.arm_harness.instrument_checks import InstrumentCheckId
 from shared.memory_eval_metrics import Metric
 
 from arm_harness._fakes import (
@@ -19,6 +12,13 @@ from arm_harness._fakes import (
     llm_spec,
     run_manifest_for,
 )
+from fused_memory.arm_harness.comparison import (
+    ParityPreconditionError,
+    check_arm_config_symmetry,
+    check_single_code_sha,
+    client_class_parity,
+)
+from fused_memory.arm_harness.instrument_checks import InstrumentCheckId
 from fused_memory.arm_harness.metrics_record import DeltaOf, LlmMetricId, MetricsRecord, record_for
 from fused_memory.arm_harness.replay import ArmAbort
 
@@ -53,8 +53,12 @@ def test_symmetric_arms_pass_though_model_serving_and_client_differ():
 
 _ARM_B = {'arm_id': 'qwen3-8b-b', 'scratch_group_id': 'evalmem_b'}
 _ASYMMETRIES = {
-    'params.temperature': {'spec': llm_spec(**_ARM_B, params={'temperature': 0.7, 'max_tokens': 4096})},
-    'params.max_tokens': {'spec': llm_spec(**_ARM_B, params={'temperature': 0.0, 'max_tokens': 512})},
+    'params.temperature': {
+        'spec': llm_spec(**_ARM_B, params={'temperature': 0.7, 'max_tokens': 4096})
+    },
+    'params.max_tokens': {
+        'spec': llm_spec(**_ARM_B, params={'temperature': 0.0, 'max_tokens': 512})
+    },
     'concurrency': {
         'settings_summary': {
             'concurrency': 8, 'index_configuration': 'with-indices', 'episode_timeout_s': 120.0
