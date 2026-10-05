@@ -463,6 +463,27 @@ async def test_cancellation_mid_spawn_kills_a_backgrounded_grandchild(
                         os.kill(member.pid, signal.SIGKILL)
 
 
+async def test_cancellation_mid_spawn_wins_over_a_spawn_that_then_fails() -> None:
+    """A cancel that waits out a spawn which then fails still raises CancelledError."""
+    entered: list[str] = []
+    released = asyncio.Event()
+
+    async def _fake_spawn(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        entered.append('spawn')
+        await released.wait()
+        raise FileNotFoundError(args[0])
+
+    with mock.patch.object(asyncio, 'create_subprocess_exec', _fake_spawn):
+        task = asyncio.ensure_future(run_git(['git', 'status']))
+        await _settle_until(lambda: entered)
+        assert entered
+
+        task.cancel()
+        released.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+
+
 async def test_own_timeout_kills_a_backgrounded_grandchild(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
