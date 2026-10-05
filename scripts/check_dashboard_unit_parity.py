@@ -807,6 +807,21 @@ UNITS: dict[str, UnitSpec] = {
             # makes the cap effective reports parity on exactly that host.
             ("Service", "RestartSteps"),
             ("Service", "RestartMaxDelaySec"),
+            # A clean SIGTERM stop exits 143, because `uv run` translates its
+            # child's signal death into 128+15. Without this line systemd's
+            # default classification records every routine restart as a
+            # failure, until "failed" means nothing and a real crash reads
+            # exactly like a deploy.  Value-compared, not presence-only: 143
+            # is a host-invariant literal, and an installed copy that kept the
+            # directive but changed the code would restore the false-failure
+            # accounting while presence still matched.
+            #
+            # This key's ABSENCE FROM THE REGISTRY — not from the unit — is why
+            # the drift measured 2026-08-19 went unreported for ~3 weeks while
+            # this gate reported parity. It is the worked example
+            # UnitSpec.unchecked_directives and its completeness guard exist
+            # to stop recurring.
+            ("Service", "SuccessExitStatus"),
             # 15 is sized against uvicorn's own 8s drain bound (see the unit's
             # comment); a drifted value silently re-opens the SIGKILL window
             # that produced the ~16s dead restarts.
