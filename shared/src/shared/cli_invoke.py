@@ -542,6 +542,13 @@ class AgentResult:
     SIGTERM/SIGKILL timeout path (via count_transcript_turns) AND on the
     normal-exit path (task 2761 — derived from the same records read for the
     ended_awaiting_background check, at no extra I/O)."""
+    model_id: str | None = None
+    """The exact model id the CLI actually served (e.g. ``claude-opus-5``),
+    read from the on-disk transcript via ``detect_transcript_model_id``; None
+    when the transcript could not be read or carries no real id.  Deliberately
+    distinct from the caller-supplied lineage alias (``opus``/``sonnet``) that
+    callers record as ``model`` — that alias names the routing choice, this
+    names the version that answered."""
 
 
 def _resolve_transcript_path(config_dir: Path, session_id: str) -> Path | None:
@@ -1926,6 +1933,11 @@ class _SubprocessResult:
     backgrounded Bash command; carried into AgentResult and used by
     _parse_claude_output to downgrade success→failure.  Never set on the
     timeout path (a timed-out run is already non-success)."""
+    model_id: str | None = None
+    """The exact CLI-served model id read from the transcript on BOTH the
+    normal-exit and timeout paths, or None when unavailable; carried verbatim
+    into ``AgentResult.model_id``.  Distinct from the caller's lineage alias
+    passed in as ``_run_subprocess``'s ``model``."""
 
 
 async def invoke_claude_agent(
@@ -3319,8 +3331,8 @@ async def _invoke_claude(
 def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     """Parse Claude Code JSON output into AgentResult.
 
-    timed_out and transcript_turns are propagated directly from result on every
-    return path.
+    timed_out, transcript_turns and model_id are propagated directly from
+    result on every return path.
     """
     if not result.stdout.strip():
         # Distinct subtype (task 2360 fix #3): a wall-clock timeout that DID
@@ -3356,6 +3368,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             proc_tree=result.proc_tree,
             transcript_turns=result.transcript_turns,
             ended_awaiting_background=result.ended_awaiting_background,
+            model_id=result.model_id,
         )
 
     try:
@@ -3370,6 +3383,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             proc_tree=result.proc_tree,
             transcript_turns=result.transcript_turns,
             ended_awaiting_background=result.ended_awaiting_background,
+            model_id=result.model_id,
         )
 
     cost = data.get('cost_usd', data.get('total_cost_usd', 0.0))
@@ -3459,6 +3473,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         api_error_status=api_error_status,
         proc_tree=result.proc_tree,
         transcript_turns=result.transcript_turns,
+        model_id=result.model_id,
     )
 
 
@@ -3768,12 +3783,12 @@ async def _run_subprocess(
             comm_task = asyncio.ensure_future(proc.communicate())
 
             # ── INVARIANT (task 3925): every transcript read below is OFF-LOOP ─
-            # THE authoritative statement of this invariant.  The four call
+            # THE authoritative statement of this invariant.  The five call
             # sites below point back here with one-liners instead of restating
             # it; keep it that way — duplicated prose drifts independently.
             #
-            # WHAT.  All four transcript reads in _run_subprocess (the two
-            # watchdog polls in this loop, the one-shot re-read in the
+            # WHAT.  All five transcript reads in _run_subprocess (the two
+            # watchdog polls in this loop, the two one-shot re-reads in the
             # except-TimeoutError handler, and the normal-exit read after it) go
             # through `await asyncio.to_thread(...)`.
             #
@@ -3787,7 +3802,7 @@ async def _run_subprocess(
             # The deliberate COUNTER-example is the `archive_task_transcripts`
             # hook in workflow.py's `_invoke` finally, kept synchronous on
             # purpose: it is a WRITE whose in-flight transcripts a cancellation
-            # point would lose.  These four are side-effect-free READS, so that
+            # point would lose.  These five are side-effect-free READS, so that
             # argument does not transfer.
             #
             # HOW TO SPELL IT.  Bare positional reference —
@@ -3813,7 +3828,7 @@ async def _run_subprocess(
             # logged at warning past _WATCHDOG_SLOW_READ_WARN_SECS.  A dedicated
             # ThreadPoolExecutor for transcript reads was considered and NOT
             # adopted: a small private pool trades contention with unrelated
-            # offloads for contention among these four reads (the normal-exit one
+            # offloads for contention among these five reads (the normal-exit one
             # is paid by every completing agent) and adds a process-global pool
             # with no shutdown path.  Revisit if that warning ever fires.
             while True:
@@ -4107,6 +4122,17 @@ async def _run_subprocess(
                 if (config_dir and session_id)
                 else None
             )
+            # A SECOND read rather than one shared with the turn count above, by
+            # design: TestTimeoutPathRereadOffLoop (test_cli_invoke_transcript_
+            # offloop.py) patches `count_transcript_turns` BY NAME and asserts its
+            # value lands, so folding both into one `read_transcript_records`
+            # call would defeat the suite that polices this seam.  The extra read
+            # is confined to the rare timeout path and is OFF-LOOP like the rest.
+            served_model_id = (
+                await asyncio.to_thread(transcript_model_id_for_session, config_dir, session_id)
+                if (config_dir and session_id)
+                else None
+            )
             return _SubprocessResult(
                 stdout=stdout_text,
                 stderr=stderr_text,
@@ -4115,6 +4141,7 @@ async def _run_subprocess(
                 timed_out=True,
                 proc_tree=proc_tree,
                 transcript_turns=tt,
+                model_id=served_model_id,
             )
     except asyncio.CancelledError:
         # Orchestrator shutdown path: the awaiting task was cancelled. Kill the
@@ -4151,8 +4178,8 @@ async def _run_subprocess(
         )
 
     # Re-read the on-disk transcript ONCE on the normal-exit path and derive
-    # BOTH signals from the same parsed records — no double file I/O (task 2761
-    # amendment):
+    # ALL THREE signals from the same parsed records — no double file I/O (task
+    # 2761 amendment):
     #   • transcript_turns — the assistant-turn count surfaced in
     #     classify_agent_failure's diagnostic_detail.  Previously stamped only on
     #     the timeout path, so a normal-exit ENDED_AWAITING_BACKGROUND
@@ -4163,19 +4190,24 @@ async def _run_subprocess(
     #     silently abandoned the work.  Symmetric to the timeout path's
     #     transcript re-read above; _parse_claude_output owns the actual
     #     success→failure downgrade.
-    # Both fail safe when the transcript can't be located (records None →
-    # transcript_turns None, ended_awaiting_background False).
+    #   • model_id — the exact CLI-served model id (task 4826), which the
+    #     caller's alias cannot tell apart across versions.  Pure in-memory
+    #     work on the already-read list, so it adds no I/O and keeps both the
+    #     single-read property and the OFF-LOOP invariant intact.  A cap-killed
+    #     run exits normally (subtype error_max_budget_usd), so it reaches here.
+    # All fail safe when the transcript can't be located (records None →
+    # transcript_turns None, ended_awaiting_background False, model_id None).
     # OFF-LOOP — see the task-3925 INVARIANT block above the poll loop.  This is
-    # the largest of the four reads: it parses the FULL record list, and every
+    # the largest of the five reads: it parses the FULL record list, and every
     # successful run pays it.
-    # Site-specific cancellation note: unlike the other three this read sits
+    # Site-specific cancellation note: unlike the other four this read sits
     # OUTSIDE both try blocks, so a CancelledError here is NOT caught by the
     # `except asyncio.CancelledError:` handler above and propagates directly.
     # That is safe and needs no asyncio.shield: comm_task has already completed
     # (proc.communicate() returned), so the child has exited and been reaped —
     # there is no process group left to orphan.  The only loss is the
-    # transcript_turns / ended_awaiting_background enrichment on a run that is
-    # being torn down anyway.
+    # transcript_turns / ended_awaiting_background / model_id enrichment on a
+    # run that is being torn down anyway.
     transcript_records = (
         await asyncio.to_thread(read_transcript_records, config_dir, session_id)
         if (config_dir and session_id)
@@ -4184,9 +4216,11 @@ async def _run_subprocess(
     if transcript_records is None:
         transcript_turns = None
         ended_awaiting_background = False
+        model_id = None
     else:
         transcript_turns = sum(1 for r in transcript_records if r.get('type') == 'assistant')
         ended_awaiting_background = detect_ended_awaiting_background(transcript_records)
+        model_id = detect_transcript_model_id(transcript_records)
 
     return _SubprocessResult(
         stdout=stdout.decode(),
@@ -4195,4 +4229,5 @@ async def _run_subprocess(
         duration_ms=duration_ms,
         transcript_turns=transcript_turns,
         ended_awaiting_background=ended_awaiting_background,
+        model_id=model_id,
     )
