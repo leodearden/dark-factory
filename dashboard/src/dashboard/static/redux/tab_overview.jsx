@@ -1,5 +1,5 @@
 /* Overview tab — command-center grid */
-const { Sparkline, LineChart, StatTile, PALETTE: P } = window.DF_CHARTS;
+const { Sparkline, LineChart, StatTile, PALETTE: P, niceCountMax } = window.DF_CHARTS;
 const { Glyph, LiveFeed, DatumReading } = window.DF_SHELL;
 const D = window.DF_DATA;
 // The census readers and the Datum wrappers. Module scope, no fallback — see
@@ -251,6 +251,7 @@ function OverviewTab({ paused }) {
               ]}
               height={210}
               formatY={v => v >= 1000 ? `${(v/1000).toFixed(1)}k` : Math.round(v)}
+              snapMax={niceCountMax}
               formatX={window.DF_SHELL.fmtDateTime}
             />
           </div>
