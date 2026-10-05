@@ -335,6 +335,39 @@ def test_a_timed_out_probe_child_reports_its_partial_output() -> None:
     assert "b'" not in report, report
 
 
+def test_the_probes_take_this_runs_per_test_timeout_and_the_child_budget_sits_below_it(
+    request: pytest.FixtureRequest,
+) -> None:
+    pytest_timeout = pytest.importorskip('pytest_timeout')
+    axe = pytest_timeout.get_env_settings(request.config).timeout
+    if not axe:
+        pytest.skip('no per-test timeout configured, nothing can truncate a probe')
+    module = request.node.getparent(pytest.Module)
+    assert module is not None
+
+    # Re-collected, so the probes' marks are seen even when -k deselected them.
+    marked = {
+        item.name: marker.args[0] if marker.args else marker.kwargs['timeout']
+        for item in module.collect()
+        if (marker := item.get_closest_marker('timeout')) is not None
+    }
+    tightening = {name: secs for name, secs in marked.items() if secs < axe}
+    assert not tightening, (
+        f'{tightening!r} carry a timeout mark below this run\'s per-test timeout '
+        f'of {axe}s. A pytest-timeout mark REPLACES the run\'s budget in both '
+        'directions (precedence recorded at '
+        'orchestrator/tests/_orch_helpers.py::VERIFY_CLI_PER_TEST_TIMEOUT), so '
+        'such a mark tightens the budget verify grants this leg and takes a slow '
+        "probe child's time away before it can report."
+    )
+    assert axe > PROBE_SUBPROCESS_TIMEOUT_SECS, (
+        f'PROBE_SUBPROCESS_TIMEOUT_SECS={PROBE_SUBPROCESS_TIMEOUT_SECS} is not '
+        f'below this run\'s per-test timeout of {axe}s, so a wedged probe child '
+        'would be cut off by the per-test axe instead of reporting its partial '
+        'output.'
+    )
+
+
 def test_thread_timeout_method_is_confined_to_the_recorded_configs() -> None:
     thread_configs = {
         name
