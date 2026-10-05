@@ -486,6 +486,14 @@ Ranked ids are nextest binary ids plus test paths, and they are not resolved
 against the tree. A test renamed or removed since its last logged run can
 therefore still be ranked.
 
+Ten rows of the top 100 rest on fewer than 3 runs. Ranks 28, 31 and 39 rest on
+one run each, and ranks 12, 17, 18, 50, 54, 69 and 78 on two. The median runs
+per row in the top 100 is 29. Each run's time depends on the host load it ran
+under, so these ten medians are weak evidence, and each may have pushed a
+better-evidenced test out of the top 100. Censuses run after this one print
+this list under the ranking
+(`scripts/suite_census_outcomes.py::THIN_SAMPLE_RUNS`).
+
 ### Failure evidence
 
 | measure | study | census |

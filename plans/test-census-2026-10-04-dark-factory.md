@@ -399,7 +399,10 @@ Unreadable files (0; the census is complete):
 This section is written by hand; everything above it is generated and unedited.
 The study is `plans/verify-speed-study-df-2026-09-10.md` with its
 `A-baseline.md` and `E-selection.md`, untracked files that exist only in the
-main checkout.
+main checkout. The study passages this section quotes, the two study scripts it
+re-ran and their output are copied verbatim into the tracked
+`plans/test-census-2026-10-04-dark-factory-study-sources.md`, so the comparison
+can still be read and re-run once the untracked files are gone.
 
 ### Junit is archived green and red
 
@@ -467,6 +470,13 @@ direction for the never-failed claim. Measured against the tree above:
   a slightly larger store (56,564 ranked), found 1,236 such rows (2.2%), 58 of
   them in its top 1,000. Each describes a test that was renamed or removed
   inside a file that still exists.
+- **Thin samples.** Four rows of the top 100 rest on fewer than 3 runs: ranks
+  59, 71 and 74 on one run each, and rank 92 on two. The median runs per row in
+  the top 100 is 313. Each run's time depends on the host load and xdist width
+  it ran under, so these four medians are weak evidence, and each may have
+  pushed a better-evidenced test out of the top 100. Censuses run after this
+  one print this list under the ranking
+  (`scripts/suite_census_outcomes.py::THIN_SAMPLE_RUNS`).
 
 ### Part 2 against the study's own scripts
 
@@ -510,6 +520,10 @@ python3 /tmp/5414-study/static_rest.py
 
 Only section 6 of `static_rest.py` is used here. The script then stops in
 section 7 on a `sleep(...)` literal that it cannot parse.
+
+`scratch-E/` is untracked. If it is gone, take the two scripts from
+`plans/test-census-2026-10-04-dark-factory-study-sources.md` §2, which also
+records their sha256. Their output on this tree is in §3 of the same file.
 
 ### No retirement
 
