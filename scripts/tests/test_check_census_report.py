@@ -452,3 +452,78 @@ def test_unparseable_record_is_malformed(tmp_path, capsys):
     assert_nonconforming(rc, verdict)
     assert f"plans/{STEM}.json" in verdict["malformed"]
     assert any(f"plans/{STEM}.json" in line and str(decode_error.value) in line for line in lines[1:-1])
+
+
+SUFFIXED_STEM = "confusion-census-2026-10-20-2"
+
+
+def test_the_fixture_run_id_carries_the_basename_suffix():
+    assert method_for(SUFFIXED_STEM)["run_id"] == "census-dark_factory-20261020-2"
+
+
+@pytest.mark.parametrize(("incomplete", "expected_rc"), [(SUFFIXED_STEM, 1), (STEM, 0)], ids=["suffixed-incomplete", "unsuffixed-incomplete"])
+def test_same_day_suffix_is_newer(tmp_path, capsys, incomplete, expected_rc):
+    for stem in (STEM, SUFFIXED_STEM):
+        sections = without(SECTIONS, "Adjudication") if stem == incomplete else SECTIONS
+        write_report(tmp_path / "plans", stem, sections=sections)
+
+    rc, _, verdict = run(tmp_path, capsys)
+
+    assert rc == expected_rc
+    assert verdict["report"] == f"plans/{SUFFIXED_STEM}.md"
+    assert ("## Adjudication" in verdict["missing"]) == (expected_rc == 1)
+
+
+def test_payloads_file_is_not_a_report(tmp_path, capsys):
+    write_report(tmp_path / "plans", STEM)
+    (tmp_path / "plans" / "confusion-census-2026-10-21-payloads.json").write_text("[]", encoding="utf-8")
+
+    rc, _, verdict = run(tmp_path, capsys)
+
+    assert rc == 0
+    assert verdict["report"] == f"plans/{STEM}.md"
+
+
+def test_record_without_rendering_is_named(tmp_path, capsys):
+    write_report(tmp_path / "plans", STEM, md=False)
+
+    rc, _, verdict = run(tmp_path, capsys)
+
+    assert_nonconforming(rc, verdict)
+    assert f"plans/{STEM}.md" in verdict["missing"]
+
+
+@pytest.mark.parametrize(
+    ("stem", "run_id"),
+    [(SUFFIXED_STEM, "census-dark_factory-20261020"), (STEM, "census-dark_factory-20261019")],
+    ids=["suffix-disagrees", "date-disagrees"],
+)
+def test_run_id_disagreeing_with_basename_is_malformed(tmp_path, capsys, stem, run_id):
+    write_report(tmp_path / "plans", stem, method={**method_for(stem), "run_id": run_id})
+
+    rc, lines, verdict = run(tmp_path, capsys)
+
+    assert_nonconforming(rc, verdict)
+    assert "method.run_id" in verdict["malformed"]
+    assert "record.method.run_id" in verdict["malformed"]
+    assert any(" method.run_id" in line and run_id in line and stem in line for line in lines[1:-1])
+
+
+def test_only_the_record_run_id_disagreeing_is_named(tmp_path, capsys):
+    wrong = {**method_for(STEM), "run_id": "census-dark_factory-20261019"}
+    write_report(tmp_path / "plans", STEM, method=wrong, bodies={"Method": method_section(method_for(STEM))})
+
+    rc, _, verdict = run(tmp_path, capsys)
+
+    assert_nonconforming(rc, verdict)
+    assert verdict["malformed"] == ["record.method.run_id"]
+
+
+@pytest.mark.parametrize("run_id", ["review-dark_factory-20261020", "census-20261020"], ids=["wrong-instrument", "no-project"])
+def test_run_id_off_pattern_is_malformed(tmp_path, capsys, run_id):
+    write_report(tmp_path / "plans", STEM, method={**method_for(STEM), "run_id": run_id})
+
+    rc, _, verdict = run(tmp_path, capsys)
+
+    assert_nonconforming(rc, verdict)
+    assert "method.run_id" in verdict["malformed"]
