@@ -352,3 +352,103 @@ def test_record_without_method_is_named(tmp_path, capsys):
 
     assert_nonconforming(rc, verdict)
     assert "record.method" in verdict["missing"]
+
+
+CONTRACT_FINDING_FIELDS = (
+    "key",
+    "area",
+    "sub_area",
+    "anchor",
+    "tags",
+    "severity",
+    "evidence_source",
+    "statement",
+    "proposal",
+    "verdict",
+    "disposition",
+    "first_seen",
+    "last_seen",
+    "supersedes",
+)
+
+
+def finding_lacking(*fields: str, **values: object) -> dict:
+    return {k: v for k, v in {**copy.deepcopy(FINDING), **values}.items() if k not in fields}
+
+
+def test_finding_missing_contract_fields_is_named(tmp_path, capsys):
+    second = finding_lacking("proposal", "supersedes", key="fk-aaaaaaaaaaaa")
+    write_report(tmp_path / "plans", STEM, findings=[copy.deepcopy(FINDING), second])
+
+    rc, lines, verdict = run(tmp_path, capsys)
+
+    assert_nonconforming(rc, verdict)
+    assert "findings[1].proposal" in verdict["missing"]
+    assert "findings[1].supersedes" in verdict["missing"]
+    assert not [name for name in verdict["missing"] if name.startswith("findings[0]")]
+    for field in ("proposal", "supersedes"):
+        assert any("fk-aaaaaaaaaaaa" in line and f"findings[1].{field}" in line for line in lines[1:-1])
+
+
+def test_the_fixture_finding_carries_every_contract_field():
+    assert set(FINDING) == set(CONTRACT_FINDING_FIELDS)
+
+
+@pytest.mark.parametrize("field", CONTRACT_FINDING_FIELDS)
+def test_each_contract_field_is_required(tmp_path, capsys, field):
+    write_report(tmp_path / "plans", STEM, findings=[finding_lacking(field)])
+
+    rc, _, verdict = run(tmp_path, capsys)
+
+    assert_nonconforming(rc, verdict)
+    assert f"findings[0].{field}" in verdict["missing"]
+
+
+def test_null_valued_optional_fields_conform(tmp_path, capsys):
+    finding = {**copy.deepcopy(FINDING), "sub_area": None, "proposal": None}
+    write_report(tmp_path / "plans", STEM, findings=[finding])
+
+    rc, _, verdict = run(tmp_path, capsys)
+
+    assert rc == 0
+    assert verdict["verdict"] == "conforms"
+
+
+@pytest.mark.parametrize(
+    ("record_doc", "kind", "name"),
+    [
+        ({}, "missing", "findings"),
+        ({"findings": {}}, "malformed", "findings"),
+        ({"findings": [FINDING, "x"]}, "malformed", "findings[1]"),
+    ],
+    ids=["no-findings-key", "findings-not-a-list", "finding-not-an-object"],
+)
+def test_record_without_findings_list(tmp_path, capsys, record_doc, kind, name):
+    write_report(tmp_path / "plans", STEM, record_text=json.dumps({"method": method_for(STEM), **record_doc}))
+
+    rc, _, verdict = run(tmp_path, capsys)
+
+    assert_nonconforming(rc, verdict)
+    assert name in verdict[kind]
+
+
+def test_empty_findings_list_conforms(tmp_path, capsys):
+    write_report(tmp_path / "plans", STEM, findings=[])
+
+    rc, lines, verdict = run(tmp_path, capsys)
+
+    assert rc == 0
+    assert verdict["verdict"] == "conforms"
+    assert "0 findings" in lines[0]
+
+
+def test_unparseable_record_is_malformed(tmp_path, capsys):
+    write_report(tmp_path / "plans", STEM, record_text="{not json")
+    with pytest.raises(json.JSONDecodeError) as decode_error:
+        json.loads("{not json")
+
+    rc, lines, verdict = run(tmp_path, capsys)
+
+    assert_nonconforming(rc, verdict)
+    assert f"plans/{STEM}.json" in verdict["malformed"]
+    assert any(f"plans/{STEM}.json" in line and str(decode_error.value) in line for line in lines[1:-1])
