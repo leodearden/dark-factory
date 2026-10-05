@@ -750,6 +750,137 @@ class TestTrackedPythonFilesFailsHard:
 
 
 # ---------------------------------------------------------------------------
+# The workspace domain: every tracked .py of each member, classified.
+
+#: Declared out of alphabetical order, so declared order is what is pinned.
+_DOMAIN_PYPROJECT = '[tool.uv.workspace]\nmembers = ["beta", "alpha"]\n'
+
+_DOMAIN_TRACKED = (
+    'alpha/src/alpha/__init__.py',
+    'alpha/src/alpha/mod.py',
+    'alpha/src/alpha/sub/deep.py',
+    'alpha/tests/test_a.py',
+    'beta/src/beta/b.py',
+    'beta/tests/helpers/fx.py',
+    'alpha/scripts/tool.py',
+    'scripts/x.py',
+    'scripts/legibility/y.py',
+    'scripts/tests/test_x.py',
+    'tests/test_y.py',
+    'hooks/h.py',
+    'hooks/tests/test_h.py',
+)
+
+
+def _domain_repo(
+    root: Path,
+    *,
+    pyproject: str | None = _DOMAIN_PYPROJECT,
+    tracked: tuple[str, ...] = _DOMAIN_TRACKED,
+    untracked: tuple[str, ...] = (),
+) -> Path:
+    """A repo whose index holds *tracked* (each with distinct content) and whose
+    root pyproject.toml is *pyproject*, absent when None."""
+    files = {relpath: f'# {relpath}\n' for relpath in tracked}
+    if pyproject is not None:
+        files['pyproject.toml'] = pyproject
+    repo = _indexed_repo(root, files)
+    for relpath in untracked:
+        target = repo / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f'# {relpath}\n', encoding='utf-8')
+    return repo
+
+
+class TestWorkspaceDomain:
+    @pytest.fixture
+    def root(self, tmp_path: Path) -> Path:
+        return _domain_repo(tmp_path / 'repo', untracked=('alpha/src/alpha/untracked.py',))
+
+    def test_members_come_in_declared_order_then_the_pseudo_members(
+        self, root: Path
+    ) -> None:
+        members = source_measures.workspace_domain(root)
+        assert tuple(member.name for member in members) == ('beta', 'alpha', 'scripts', 'tests')
+        assert tuple(member.pseudo for member in members) == (False, False, True, True)
+
+    def test_each_members_files_are_classified_in_path_order(self, root: Path) -> None:
+        src, tests = source_measures.FileKind.SRC, source_measures.FileKind.TESTS
+        members = source_measures.workspace_domain(root)
+        assert {
+            member.name: [(f.path, f.kind, f.import_name) for f in member.files]
+            for member in members
+        } == {
+            'beta': [
+                ('beta/src/beta/b.py', src, 'beta.b'),
+                ('beta/tests/helpers/fx.py', tests, None),
+            ],
+            'alpha': [
+                # A package's __init__ is named by its package.
+                ('alpha/src/alpha/__init__.py', src, 'alpha'),
+                ('alpha/src/alpha/mod.py', src, 'alpha.mod'),
+                ('alpha/src/alpha/sub/deep.py', src, 'alpha.sub.deep'),
+                ('alpha/tests/test_a.py', tests, None),
+            ],
+            'scripts': [
+                ('scripts/legibility/y.py', src, 'legibility.y'),
+                # The tests root wins over the scripts src root that contains it.
+                ('scripts/tests/test_x.py', tests, None),
+                ('scripts/x.py', src, 'x'),
+            ],
+            'tests': [('tests/test_y.py', tests, None)],
+        }
+
+    def test_files_outside_every_member_root_are_not_in_the_domain(
+        self, root: Path
+    ) -> None:
+        paths = {f.path for member in source_measures.workspace_domain(root) for f in member.files}
+        outside = {
+            'hooks/h.py',
+            'hooks/tests/test_h.py',
+            'alpha/scripts/tool.py',
+            'alpha/src/alpha/untracked.py',
+        }
+        assert not outside & paths
+
+    def test_every_blob_is_the_content_sha_of_its_file(self, root: Path) -> None:
+        files = [f for member in source_measures.workspace_domain(root) for f in member.files]
+        assert files
+        for f in files:
+            assert f.blob == git(root, 'hash-object', f.path).strip(), f.path
+
+    def test_the_result_is_frozen(self, root: Path) -> None:
+        member = source_measures.workspace_domain(root)[0]
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            member.name = 'other'  # type: ignore[misc]
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            member.files[0].blob = '0' * 40  # type: ignore[misc]
+
+    def test_kind_is_a_structured_value_that_reads_as_its_name(self, root: Path) -> None:
+        kinds = {f.kind for member in source_measures.workspace_domain(root) for f in member.files}
+        assert all(isinstance(kind, source_measures.FileKind) for kind in kinds)
+        assert str(source_measures.FileKind.SRC) == 'src'
+        assert str(source_measures.FileKind.TESTS) == 'tests'
+
+    def test_the_real_workspace_is_enumerated(self) -> None:
+        # ANTI-VACUITY over the real checkout: floors and membership, never
+        # exact counts.
+        members = source_measures.workspace_domain(REPO_ROOT)
+        names = tuple(member.name for member in members)
+        assert len(names) >= 9
+        assert names[-2:] == ('scripts', 'tests')
+        assert {'orchestrator', 'shared', 'fused-memory'} <= set(names[:-2])
+        by_name = {member.name: {f.path: f for f in member.files} for member in members}
+        layer = by_name['scripts']['scripts/source_measures.py']
+        assert (layer.kind, layer.import_name) == (source_measures.FileKind.SRC, 'source_measures')
+        package = by_name['orchestrator']['orchestrator/src/orchestrator/__init__.py']
+        assert package.import_name == 'orchestrator'
+        script_kinds = [f.kind for f in by_name['scripts'].values()]
+        assert script_kinds.count(source_measures.FileKind.SRC) >= 50
+        assert script_kinds.count(source_measures.FileKind.TESTS) >= 50
+
+
+# ---------------------------------------------------------------------------
 # Layering: the measures import nothing from a consumer, and stay lazy about
 # the third-party tools.
 
