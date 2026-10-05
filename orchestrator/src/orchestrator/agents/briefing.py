@@ -687,6 +687,110 @@ remains, that is option (b): call `confirm_plan()` and let the escalation
 triage it.
 """
 
+    async def build_plan_schema_repair_prompt(
+        self,
+        task: dict,
+        context: str | None = None,
+    ) -> str:
+        """Architect pass that restructures an on-disk plan missing ``steps``.
+
+        The plan is never copied into the prompt: plan.json is its single home,
+        read through the lane's ``.task/plan.json``. Completeness is attested
+        only by the architect's own ``confirm_plan()``.
+        """
+        if context is None:
+            context = await self._get_memory_context(
+                BriefingScope.from_task(task), 'architect',
+            )
+
+        task_block = self._format_task(task)
+        identity = self._agent_identity(task.get('id'), 'architect')
+
+        return f"""\
+{context}
+
+{identity}
+
+# Task
+
+{task_block}
+
+# Plan Schema Repair
+
+The plan for this task is on disk at `.task/plan.json` (a symlink into the
+durable `<worktree_base>/.task-meta/<worktree-name>/plan.json`), but it has no
+non-empty top-level `steps` array, so it cannot advance. It is NOT reproduced
+here — read the file in full.
+
+## Action
+
+1. Read `.task/plan.json` in full.
+2. Record its existing step content with the plan-tools:
+   `add_prerequisite(prereq_id, description)` for setup work and
+   `add_plan_step(step_id, step_type, description)` for each TDD step, in the
+   plan's own order, carrying each description across unchanged. If `files`
+   is missing or empty, set it with `update_plan_metadata(files=[...])`.
+3. Restructure only: do not redesign the plan or explore beyond what
+   restructuring needs. Do not call `create_plan` — it replaces the document
+   wholesale and would discard the analysis and decisions you are
+   restructuring.
+4. Call `confirm_plan()` as your FINAL action. Without it the repaired plan is
+   treated as incomplete and will not advance.
+
+If the file holds no step content to restructure, do not invent steps: stop
+without calling `confirm_plan()` and the task will be re-planned.
+"""
+
+    async def build_replan_prompt(
+        self,
+        task: dict,
+        review_feedback: str,
+        context: str | None = None,
+    ) -> str:
+        """Architect pass that extends the plan to answer blocking review issues.
+
+        The plan is never copied into the prompt: plan.json is its single home,
+        read through the lane's ``.task/plan.json``, so a replayed prompt cannot
+        show stale steps.
+        """
+        if context is None:
+            context = await self._get_memory_context(
+                BriefingScope.from_task(task), 'architect',
+            )
+
+        task_block = self._format_task(task)
+        identity = self._agent_identity(task.get('id'), 'architect')
+
+        return f"""\
+{context}
+
+{identity}
+
+# Task
+
+{task_block}
+
+# Re-Plan After Review
+
+The implementation was reviewed and blocking issues were found.
+
+{review_feedback}
+
+## Action
+
+1. Read `.task/plan.json` (a symlink into the durable
+   `<worktree_base>/.task-meta/<worktree-name>/plan.json`) for the current plan
+   and each step's status — it is not reproduced here.
+2. Add the steps that address the blocking issues with
+   `add_plan_step(step_id, step_type, description)`, using step ids not
+   already in the plan. New steps are recorded as pending.
+3. If those steps touch files the plan does not list, call
+   `update_plan_metadata(files=[...])` with the full widened list.
+4. Keep every existing step in place, in order: do not remove or reorder
+   steps, and do not call `create_plan` — it replaces the plan wholesale and
+   would discard completed steps.
+"""
+
     async def build_simple_task_prompt(
         self,
         task: dict,
