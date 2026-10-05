@@ -518,7 +518,7 @@ class TestClassifyAndMergeSpeculativeWorker:
 
         asked: list[tuple[str, str]] = []
 
-        async def _fail_open(head: str, upstream: str, git_ops: GitOps) -> bool:
+        async def _fail_open(head: str, upstream: str, _ops: GitOps, /) -> bool:
             asked.append((head, upstream))
             return False
 
