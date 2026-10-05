@@ -57,6 +57,9 @@ class FakeEscalationMcp:
     `initialize_reply` / `tool_call_reply` each override one step of that
     exchange with a literal (status, headers, body) triple, which is how the
     transport-fault cases below are built without restating the handshake.
+    `tool_call_delay` holds the authenticated `tools/call` reply back that many
+    seconds (released early at exit), modelling a tool that outlives the
+    client's read timeout.
     """
 
     SESSION_ID = "sess-5379-fake"
@@ -71,10 +74,13 @@ class FakeEscalationMcp:
         }),
     )
 
-    def __init__(self, report=None, *, initialize_reply=None, tool_call_reply=None):
+    def __init__(self, report=None, *, initialize_reply=None, tool_call_reply=None,
+                 tool_call_delay=0.0):
         self.report = report
         self.initialize_reply = initialize_reply
         self.tool_call_reply = tool_call_reply
+        self.tool_call_delay = tool_call_delay
+        self._release = threading.Event()
         self.received = []
         outer = self
 
@@ -126,6 +132,8 @@ class FakeEscalationMcp:
             )
         if method == "notifications/initialized":
             return (202, {}, "")
+        if self.tool_call_delay > 0:
+            self._release.wait(self.tool_call_delay)
         return self.tool_call_reply or (
             200,
             {"Content-Type": "text/event-stream"},
@@ -162,6 +170,7 @@ class FakeEscalationMcp:
         return self
 
     def __exit__(self, *exc):
+        self._release.set()
         self._httpd.shutdown()
         self._httpd.server_close()
         self._thread.join(timeout=5)
