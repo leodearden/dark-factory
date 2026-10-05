@@ -300,6 +300,7 @@ __all__ = [
     'AllAccountsCappedException',
     'build_failure_message',
     'classify_agent_failure',
+    'classify_cap_kill',
     'count_transcript_turns',
     'detect_ended_awaiting_background',
     'detect_resumable_progress',
@@ -1871,6 +1872,53 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
         summary=(f'agent failed: subtype={result.subtype!r} (no specific failure signal)'),
         diagnostic_detail=diagnostic_detail,
     )
+
+
+def classify_cap_kill(
+    result: AgentResult,
+    *,
+    budget_usd: float | None,
+    max_turns: int | None,
+) -> str | None:
+    """Return which configured ceiling ended *result* — ``'budget'`` or
+    ``'turns'`` — or None when no ceiling did.
+
+    Answers "was this run ended by a configured ceiling, and which one?".
+    That is deliberately narrower than :func:`classify_agent_failure`'s "why
+    did this fail?" ladder, which has no budget kind at all.
+
+    The CLI subtype is authoritative and is checked first, ungated on
+    ``success`` (a schema-salvaged run is reported successful yet was still
+    ended at the turn ceiling).  The numeric comparison against *budget_usd* /
+    *max_turns* is only a fallback for a FAILED run whose subtype is
+    inconclusive: a healthy run that spends its whole budget or uses its last
+    turn finished on its own terms and is not a cap kill.  When both fallbacks
+    fire, ``'budget'`` is reported.  A None ceiling disables its fallback.
+    Total — never raises.
+
+    The return value is the ``invocations.capped_reason`` vocabulary.  Its
+    third value, ``'account'``, is produced by ``invoke_with_cap_retry``'s
+    unattributed-account-cap path and is intentionally not this function's
+    business: an account usage cap is not a configured ceiling.
+
+    The two subtype literals are the ones already read as authoritative by
+    ``shared/src/shared/usage_gate.py`` (the ``error_max_budget_usd`` check)
+    and by :func:`classify_agent_failure` (``error_max_turns`` →
+    ``MAX_TURNS``).  A third spelling of the budget one lives in
+    ``orchestrator/src/orchestrator/dry_run_unblock.py::_BUDGET_SUBTYPES`` —
+    the place to start if these are ever consolidated.
+    """
+    if result.subtype == 'error_max_budget_usd':
+        return 'budget'
+    if result.subtype == 'error_max_turns':
+        return 'turns'
+    if result.success:
+        return None
+    if budget_usd is not None and result.cost_usd >= budget_usd:
+        return 'budget'
+    if max_turns is not None and result.turns >= max_turns:
+        return 'turns'
+    return None
 
 
 def build_failure_message(label: str, result: AgentResult) -> str:
