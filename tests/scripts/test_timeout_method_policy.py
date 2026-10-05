@@ -299,6 +299,22 @@ def test_thread_timeout_kills_the_xdist_worker(tmp_path: pathlib.Path) -> None:
     )
 
 
+def test_a_timed_out_probe_child_reports_its_partial_output() -> None:
+    partial = 'bringing up nodes...\n........'
+    timed_out = subprocess.TimeoutExpired(
+        ['python', '-m', 'pytest'], 240, output=partial.encode(), stderr=None
+    )
+
+    report = _captured(timed_out)
+
+    assert partial in report, (
+        "a TimeoutExpired carries the child's streams as bytes, even under "
+        f'text=True; they must be decoded, not shown as a repr.\n{report}'
+    )
+    assert 'stdout:' in report and 'stderr:' in report, report
+    assert "b'" not in report, report
+
+
 def test_thread_timeout_method_is_confined_to_the_recorded_configs() -> None:
     thread_configs = {
         name
