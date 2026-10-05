@@ -19,6 +19,7 @@ one the test itself owns, bound to an ephemeral port.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import types
 from pathlib import Path
@@ -552,22 +553,17 @@ def test_the_transport_diagnostic_keeps_the_committed_shas_remedy(tmp_path):
 CHECKOUT_VENV_PYTHON = SCRIPT.parent.parent / ".venv" / "bin" / "python3"
 
 
-def test_the_reload_ignores_a_path_python3_that_cannot_import_the_transport(tmp_path):
-    """PATH's `python3` cannot import the transport; the flip still lands.
+def test_no_step_runs_under_path_python3_when_the_checkout_venv_exists(tmp_path):
+    """PATH's `python3` cannot run at all; the flip still lands.
 
-    That can only happen if the reload step resolved the SCRIPT's own
-    checkout venv rather than inheriting PATH. Step 1's YAML editor is
-    stdlib-only and keeps working under the shim, so this isolates the reload
-    interpreter specifically.
+    That can only pass if BOTH the YAML edit and the reload resolved the
+    SCRIPT's own checkout venv rather than inheriting PATH.
     """
-    system_python, why = system_python_without_the_transport()
-    if system_python is None:
-        pytest.skip(why)
     if not CHECKOUT_VENV_PYTHON.exists():
         pytest.skip(f"{CHECKOUT_VENV_PYTHON} is absent (an un-synced worktree)")
 
     config = _make_repo(tmp_path, "16")
-    env = path_python3_shimmed_to(tmp_path, system_python)
+    env = path_python3_shimmed_to(tmp_path, shutil.which("false"))
 
     with FakeEscalationMcp(reload_report(
         config_path=str(config),
