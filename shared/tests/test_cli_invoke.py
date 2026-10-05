@@ -5557,3 +5557,289 @@ class TestTranscriptModelIdForSession:
             [json.dumps({'type': 'user', 'content': 'hi'})],
         )
         assert transcript_model_id_for_session(tmp_path, sid) is None
+
+
+# ── model_id threaded from transcript onto AgentResult (task 4826) ──────────
+
+
+def _write_model_transcript(config_dir: Path, session_id: str, records: list[dict]) -> None:
+    slug_dir = config_dir / 'projects' / 'slug-model'
+    slug_dir.mkdir(parents=True, exist_ok=True)
+    (slug_dir / f'{session_id}.jsonl').write_text(
+        '\n'.join(json.dumps(r) for r in records) + '\n'
+    )
+
+
+def _normal_exit_proc(stdout: bytes = _CLAUDE_VALID_JSON_STDOUT.encode()) -> MagicMock:
+    proc = MagicMock()
+    proc.communicate = AsyncMock(return_value=(stdout, b''))
+    proc.terminate = MagicMock()
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock()
+    proc.returncode = 0
+    proc.pid = 12345
+    return proc
+
+
+def _sigkill_proc() -> MagicMock:
+    proc = MagicMock()
+    proc.communicate = AsyncMock(side_effect=TimeoutError)
+    proc.terminate = MagicMock()
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock()
+    proc.returncode = None
+    proc.pid = 12345
+    return proc
+
+
+# Two assistant turns served by a real model, the second of which launches a
+# background Bash command that is never reaped — so ONE transcript yields all
+# three normal-exit signals at once: transcript_turns == 2,
+# ended_awaiting_background is True, model_id == 'claude-opus-5'.
+_MODEL_AND_ABANDONED_LAUNCH_RECORDS = [
+    {'type': 'user', 'message': {'role': 'user', 'content': 'go'}},
+    {
+        'type': 'assistant',
+        'message': {
+            'model': 'claude-opus-5',
+            'role': 'assistant',
+            'content': [{'type': 'text', 'text': 'kick off the long build'}],
+        },
+    },
+    {
+        'type': 'assistant',
+        'message': {
+            'model': 'claude-opus-5',
+            'role': 'assistant',
+            'content': [{
+                'type': 'tool_use',
+                'name': 'Bash',
+                'input': {'command': './long-build.sh', 'run_in_background': True},
+            }],
+        },
+    },
+]
+
+
+class TestModelIdFieldDefaults:
+    def test_subprocess_result_defaults_model_id_none(self):
+        r = _SubprocessResult(stdout='', stderr='', returncode=0, duration_ms=10)
+        assert r.model_id is None
+
+    def test_agent_result_defaults_model_id_none(self):
+        r = AgentResult(success=True, output='ok')
+        assert r.model_id is None
+
+
+class TestParseClaudeOutputPropagatesModelId:
+    """``model_id`` reaches AgentResult on EVERY ``_parse_claude_output`` branch.
+
+    The empty-output branch matters most: a cap-killed or timed-out run
+    frequently lands there, and that is exactly the run whose served model a
+    saturation analysis needs to attribute.
+    """
+
+    @pytest.mark.parametrize(
+        'stdout,returncode,timed_out',
+        [
+            ('', -15, True),
+            ('not valid json', 1, False),
+            (_CLAUDE_VALID_JSON_STDOUT, 0, False),
+        ],
+        ids=['empty_stdout', 'json_decode_error', 'normal_parse'],
+    )
+    def test_model_id_propagates(self, stdout, returncode, timed_out):
+        sub = _SubprocessResult(
+            stdout=stdout, stderr='', returncode=returncode, duration_ms=100,
+            timed_out=timed_out, model_id='claude-sonnet-5',
+        )
+        assert _parse_claude_output(sub).model_id == 'claude-sonnet-5'
+
+    @pytest.mark.parametrize(
+        'stdout,returncode',
+        [('', 1), ('not valid json', 1), (_CLAUDE_VALID_JSON_STDOUT, 0)],
+        ids=['empty_stdout', 'json_decode_error', 'normal_parse'],
+    )
+    def test_model_id_defaults_to_none(self, stdout, returncode):
+        sub = _SubprocessResult(stdout=stdout, stderr='', returncode=returncode, duration_ms=100)
+        assert _parse_claude_output(sub).model_id is None
+
+    def test_model_id_is_not_the_caller_alias(self):
+        """The exact served id is carried verbatim; it is never back-filled
+        from the caller-supplied lineage alias the envelope knows nothing of."""
+        sub = _SubprocessResult(
+            stdout=_CLAUDE_VALID_JSON_STDOUT, stderr='', returncode=0, duration_ms=100,
+            model_id='claude-opus-5',
+        )
+        agent = _parse_claude_output(sub)
+        assert agent.model_id == 'claude-opus-5'
+        assert agent.model_id != 'opus'
+
+
+@pytest.mark.asyncio
+class TestRunSubprocessStampsModelId:
+    """``_run_subprocess`` derives ``model_id`` from the on-disk transcript.
+
+    The normal-exit read count is NOT asserted here: the single-read property
+    for this seam is owned by
+    ``test_cli_invoke_transcript_offloop.py::TestNormalExitReadOffLoop``.
+    """
+
+    async def test_normal_exit_stamps_model_id_alongside_existing_signals(self, tmp_path):
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        _write_model_transcript(cfg_dir, sid, _MODEL_AND_ABANDONED_LAUNCH_RECORDS)
+
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            AsyncMock(return_value=_normal_exit_proc()),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=5.0,
+                session_id=sid, config_dir=cfg_dir,
+            )
+
+        assert result.timed_out is False
+        assert result.model_id == 'claude-opus-5'
+        assert result.transcript_turns == 2
+        assert result.ended_awaiting_background is True
+
+    async def test_normal_exit_model_id_none_without_config_dir(self, tmp_path):
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            AsyncMock(return_value=_normal_exit_proc()),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=5.0,
+                session_id=str(uuid.uuid4()), config_dir=None,
+            )
+
+        assert result.model_id is None
+        assert result.transcript_turns is None
+        assert result.ended_awaiting_background is False
+
+    async def test_normal_exit_model_id_none_without_session_id(self, tmp_path):
+        cfg_dir = tmp_path / 'cfg'
+        cfg_dir.mkdir()
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            AsyncMock(return_value=_normal_exit_proc()),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=5.0,
+                session_id=None, config_dir=cfg_dir,
+            )
+
+        assert result.model_id is None
+        assert result.transcript_turns is None
+        assert result.ended_awaiting_background is False
+
+    async def test_normal_exit_model_id_none_when_transcript_missing(self, tmp_path):
+        cfg_dir = tmp_path / 'cfg'
+        (cfg_dir / 'projects' / 'slug-model').mkdir(parents=True)
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            AsyncMock(return_value=_normal_exit_proc()),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=5.0,
+                session_id=str(uuid.uuid4()), config_dir=cfg_dir,
+            )
+
+        assert result.model_id is None
+        assert result.transcript_turns is None
+        assert result.ended_awaiting_background is False
+
+    async def test_normal_exit_model_id_none_when_transcript_has_no_model(self, tmp_path):
+        """A transcript with turns but no model field leaves model_id None
+        while transcript_turns is still counted."""
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        _write_model_transcript(
+            cfg_dir, sid,
+            [{'type': 'assistant', 'content': 'turn 1'}, {'type': 'assistant', 'content': 'turn 2'}],
+        )
+        with patch(
+            'shared.cli_invoke.asyncio.create_subprocess_exec',
+            AsyncMock(return_value=_normal_exit_proc()),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=5.0,
+                session_id=sid, config_dir=cfg_dir,
+            )
+
+        assert result.model_id is None
+        assert result.transcript_turns == 2
+        assert result.ended_awaiting_background is False
+
+    async def test_timeout_path_stamps_model_id_without_disturbing_turns(self, tmp_path):
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        _write_model_transcript(
+            cfg_dir, sid,
+            [
+                {'type': 'system', 'content': 'init'},
+                {'type': 'assistant', 'message': {'model': 'claude-sonnet-5'}},
+                {'type': 'user', 'content': 'reply'},
+                {'type': 'assistant', 'message': {'model': 'claude-sonnet-5'}},
+                {'type': 'assistant', 'message': {'model': '<synthetic>'}},
+            ],
+        )
+
+        with (
+            patch(
+                'shared.cli_invoke.asyncio.create_subprocess_exec',
+                AsyncMock(return_value=_sigkill_proc()),
+            ),
+            patch('shared.cli_invoke.terminate_process_group', new_callable=AsyncMock),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=0.1,
+                session_id=sid, config_dir=cfg_dir,
+            )
+
+        assert result.timed_out is True
+        assert result.model_id == 'claude-sonnet-5'
+        assert result.transcript_turns == 3
+
+    async def test_timeout_path_model_id_none_without_session_id(self, tmp_path):
+        with (
+            patch(
+                'shared.cli_invoke.asyncio.create_subprocess_exec',
+                AsyncMock(return_value=_sigkill_proc()),
+            ),
+            patch('shared.cli_invoke.terminate_process_group', new_callable=AsyncMock),
+        ):
+            result = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=0.1,
+                session_id=None, config_dir=tmp_path,
+            )
+
+        assert result.timed_out is True
+        assert result.model_id is None
+        assert result.transcript_turns is None
+
+    async def test_model_id_survives_parse_on_timeout_path(self, tmp_path):
+        """End-to-end: a SIGKILLed run lands on the empty-output parse branch
+        and still carries the served model id to AgentResult."""
+        sid = str(uuid.uuid4())
+        cfg_dir = tmp_path / 'cfg'
+        _write_model_transcript(
+            cfg_dir, sid, [{'type': 'assistant', 'message': {'model': 'claude-opus-5'}}],
+        )
+
+        with (
+            patch(
+                'shared.cli_invoke.asyncio.create_subprocess_exec',
+                AsyncMock(return_value=_sigkill_proc()),
+            ),
+            patch('shared.cli_invoke.terminate_process_group', new_callable=AsyncMock),
+        ):
+            sub = await _run_subprocess(
+                ['fake'], cwd=tmp_path, env={}, model='opus', timeout_seconds=0.1,
+                session_id=sid, config_dir=cfg_dir,
+            )
+
+        agent = _parse_claude_output(sub)
+        assert agent.subtype == 'error_timeout_killed_with_progress'
+        assert agent.model_id == 'claude-opus-5'
