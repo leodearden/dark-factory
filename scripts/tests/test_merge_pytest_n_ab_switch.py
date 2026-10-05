@@ -290,16 +290,18 @@ def test_a_config_with_no_verify_env_block_is_refused_before_the_commit(tmp_path
 # and by a reload of a different orchestrator entirely (the port is a
 # caller-supplied argument, so a wrong one reaches another project's MCP).
 # This is a DEPLOY gate -- blessing an undeployed arm is worse than the
-# over-strict assertion the converged branch removes.
+# over-strict assertion the converged branch removes. A PRESENT verify_env
+# carrying our value is no stronger about OUR file: another orchestrator with
+# its own pending change to the same value reports exactly that, so the same
+# corroborators gate the flip.
 #
 # Each case pins the failure TAG it is about, not merely a non-zero exit: a
 # transport rejection also exits non-zero, and a bare `returncode != 0` would
 # let one stand in for all four and pass for the wrong reason.
 # ---------------------------------------------------------------------------
 
-def _converged_verdict_lines(proc):
-    """Every stdout line that parses as a verdict claiming convergence."""
-    claims = []
+def _verdict_lines(proc):
+    """(line, verdict) for every stdout line that parses as a JSON object."""
     for line in proc.stdout.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -308,39 +310,50 @@ def _converged_verdict_lines(proc):
             parsed = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(parsed, dict) and parsed.get("outcome") == "already_converged":
-            claims.append(line)
-    return claims
+        if isinstance(parsed, dict):
+            yield line, parsed
+
+
+def _converged_verdict_lines(proc):
+    """Every stdout line that parses as a verdict claiming convergence."""
+    return [
+        line for line, verdict in _verdict_lines(proc)
+        if verdict.get("outcome") == "already_converged"
+    ]
+
+
+def _outcome_verdict_lines(proc):
+    """Every stdout line that parses as a verdict claiming any success outcome."""
+    return [line for line, verdict in _verdict_lines(proc) if "outcome" in verdict]
+
+
+def _other_projects_config(tmp_path):
+    """Another project's dark-factory-orchestrator.yaml, outside this repo."""
+    other = tmp_path / "other-project" / "dark-factory-orchestrator.yaml"
+    other.parent.mkdir()
+    other.write_text(f'verify_env:\n  {KEY}: "2"\n')
+    return other
 
 
 # id -> (builder taking (this repo's config, another project's config) and
-# returning a reload report with verify_env ABSENT from `applied`, the failure
-# tag naming why that absence is not convergence).
-_UNCORROBORATED_ABSENCE = {
-    # Control: the existing error branch already rejects this one, so a green
-    # here proves the group's harness really drives the script.
-    "reload_failed_loudly": (
-        lambda config, other: reload_report(
-            reloaded=False, error="load_config: while parsing a block mapping",
-            config_path=str(config),
-        ),
-        "reload_error",
-    ),
+# returning reload-report fields that fail to show THIS config file was
+# re-read and committed, the failure tag naming which corroborator is missing).
+# Shared by the converged and flip shapes, which must hold the reload to the
+# same corroborators.
+_CORROBORATOR_BREACHES = {
     # apply_reload rolled every leaf back, so the live config is untouched.
     "reload_failed_silently": (
-        lambda config, other: reload_report(
-            reloaded=False, error=None, config_path=str(config),
-        ),
+        lambda config, other: {"reloaded": False, "error": None, "config_path": str(config)},
         "reload_not_committed",
     ),
     # We reloaded something that is not the file we just edited, so its
     # verify_env says nothing about ours.
     "different_config_file": (
-        lambda config, other: reload_report(reloaded=True, config_path=str(other)),
+        lambda config, other: {"reloaded": True, "config_path": str(other)},
         "different_config_file",
     ),
     "no_config_path": (
-        lambda config, other: reload_report(reloaded=True, config_path=None),
+        lambda config, other: {"reloaded": True, "config_path": None},
         "different_config_file",
     ),
     # A RELATIVE config_path is the reporting orchestrator's own
@@ -349,39 +362,50 @@ _UNCORROBORATED_ABSENCE = {
     # runs from the config's checkout, which is exactly how it is run (and how
     # this group runs it below). Uncomparable, therefore not corroborating.
     "relative_config_path": (
-        lambda config, other: reload_report(
-            reloaded=True, config_path="dark-factory-orchestrator.yaml",
-        ),
+        lambda config, other: {"reloaded": True, "config_path": "dark-factory-orchestrator.yaml"},
         "different_config_file",
     ),
+}
+
+# The converged shape's cases: every corroborator breach, plus two that only
+# an ABSENT verify_env can carry.
+_UNCORROBORATED_ABSENCE = {
+    # Control: the existing error branch already rejects this one, so a green
+    # here proves the group's harness really drives the script.
+    "reload_failed_loudly": (
+        lambda config, other: {
+            "reloaded": False, "error": "load_config: while parsing a block mapping",
+            "config_path": str(config),
+        },
+        "reload_error",
+    ),
+    **_CORROBORATOR_BREACHES,
     # verify_env DID change, but was bucketed as restart-required instead of
     # hot-applied, so the arm is committed and NOT live -- and it is absent
     # from `applied` exactly like a converged one. Latent while verify_env
     # stays in RELOADABLE_FIELDS; a fail-open the moment it does not.
     "verify_env_is_restart_required": (
-        lambda config, other: reload_report(
-            reloaded=True, config_path=str(config),
-            restart_required={"verify_env": {"old": {KEY: "16"}, "new": {KEY: "8"}}},
-        ),
+        lambda config, other: {
+            "reloaded": True, "config_path": str(config),
+            "restart_required": {"verify_env": {"old": {KEY: "16"}, "new": {KEY: "8"}}},
+        },
         "restart_required",
     ),
 }
 
 
 @pytest.mark.parametrize(
-    ("build_report", "failure"),
+    ("report_fields", "failure"),
     list(_UNCORROBORATED_ABSENCE.values()),
     ids=list(_UNCORROBORATED_ABSENCE),
 )
-def test_uncorroborated_absence_is_not_convergence(tmp_path, build_report, failure):
+def test_uncorroborated_absence_is_not_convergence(tmp_path, report_fields, failure):
     """An absent verify_env that is NOT corroborated by a committed reload of
     THIS config file must fail, naming which corroborator was missing."""
     config = _make_repo(tmp_path, "8", marker=True)
-    other = tmp_path / "other-project" / "dark-factory-orchestrator.yaml"
-    other.parent.mkdir()
-    other.write_text(f'verify_env:\n  {KEY}: "2"\n')
+    other = _other_projects_config(tmp_path)
 
-    with FakeEscalationMcp(build_report(config, other)) as server:
+    with FakeEscalationMcp(reload_report(**report_fields(config, other))) as server:
         # From the config's own checkout, as an operator runs it -- and the
         # only cwd from which a relative reported config_path could realpath
         # onto ours and falsely corroborate.
@@ -389,6 +413,32 @@ def test_uncorroborated_absence_is_not_convergence(tmp_path, build_report, failu
 
     assert _failure(proc) == failure
     assert not _converged_verdict_lines(proc)
+
+
+@pytest.mark.parametrize(
+    ("report_fields", "failure"),
+    list(_CORROBORATOR_BREACHES.values()),
+    ids=list(_CORROBORATOR_BREACHES),
+)
+def test_a_flip_reported_by_an_uncorroborated_reload_is_not_applied(
+    tmp_path, report_fields, failure,
+):
+    """A verify_env flip to our value that is NOT corroborated by a committed
+    reload of THIS config file must fail too. The flip commit has landed, by
+    design, so the failure verdict names it."""
+    config = _make_repo(tmp_path, "16")
+    repo = config.parent
+    other = _other_projects_config(tmp_path)
+
+    with FakeEscalationMcp(reload_report(
+        **report_fields(config, other),
+        applied={"verify_env": {"old": {KEY: "16"}, "new": {KEY: "8"}}},
+    )) as server:
+        proc = _run(server, config, "8", cwd=config.parent)
+
+    assert _failure(proc) == failure
+    assert not _outcome_verdict_lines(proc)
+    assert _verdict(proc)["commit"] == head(repo, short=True)
 
 
 def test_applied_verify_env_carrying_a_different_value_still_fails(tmp_path):
