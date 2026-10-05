@@ -475,11 +475,12 @@ PARALLEL_TEST_COMMAND_LEGS = {
         '394-490s serial'
     ),
     'tests/scripts': (
-        'task 5470: MEASURED 307.13s serial vs 70.12s at -n auto '
-        '(PYTEST_XDIST_AUTO_NUM_WORKERS=16) --dist loadgroup, 2535 passed / 2 '
-        'skipped, rc=0 both. It matters because dark-factory-orchestrator.yaml '
-        'sets merge_verify_max_concurrent_modules: 1, which runs module legs one '
-        "at a time, so this leg's wall clock adds directly onto the merge gate"
+        'task 5470: measured several times faster parallel than serial, every '
+        "run of both forms recorded in tests/scripts/orchestrator.yaml's "
+        'MEASUREMENT PROVENANCE block. It matters because '
+        'dark-factory-orchestrator.yaml sets merge_verify_max_concurrent_modules: '
+        '1, which runs module legs one at a time, so this leg\'s wall clock adds '
+        'directly onto the merge gate'
     ),
 }
 

@@ -58,8 +58,8 @@
 # ::test_non_member_legs_carry_the_parallel_flags_on_their_test_command and
 # ::test_root_addopts_never_leaks_the_parallel_flags; why `auto` and why
 # loadgroup is that guard's module docstring. shared already declares
-# pytest-xdist (task 5408), so no dependency changed. MEASURED at base
-# 54a84fba86: 307.13s serial vs 70.12s parallel (PYTEST_XDIST_AUTO_NUM_WORKERS=16).
+# pytest-xdist (task 5408), so no dependency changed. Both forms' measured runs
+# are in the MEASUREMENT PROVENANCE block above verify_command_timeout_secs.
 test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300 -n auto --dist loadgroup"
 
 # THIS COMMAND ALSO CARRIES THE skills/ LINT GATE (task 3554), which is not
@@ -120,14 +120,13 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # gap task 3460 closed.
 #
 # THE COST SURVIVES, in narrowed form. `scripts` and `tests/scripts` both still
-# run tests/scripts/ under a full verify, so THIS suite still executes twice
-# (70.12s of duplicated work per full verify, measured at -n 16) — only the
-# second command is now a superset rather than a copy.
-#   CORRECTED IN PLACE (task 5470): this used to say "~110-230s", a figure
-#   for the serial form. Both legs now run tests/scripts/ parallel, so the
-#   duplicated execution is the parallel figure. The two dedupe layers still each miss it
-# for a different reason, cited by SYMBOL rather than by file:line: the pins
-# this block previously carried (verify.py:4735, workflow.py:3558) were BOTH
+# run tests/scripts/ under a full verify, so THIS suite still executes twice —
+# only the second command is now a superset rather than a copy. Both legs run it
+# parallel, so the duplicated work is one parallel run of this suite: see the
+# PARALLEL runs in the MEASUREMENT PROVENANCE block below. The two dedupe layers
+# still each miss it for a different reason, cited by SYMBOL rather than by
+# file:line: the pins this block previously carried (verify.py:4735,
+# workflow.py:3558) were BOTH
 # stale at the time of writing — run_full_verification had drifted ~510 lines
 # and `seen[mc.prefix]` ~100, and each pin landed on unrelated code, so the
 # rot was compounding exactly as scripts/orchestrator.yaml's LINT block records
@@ -383,6 +382,9 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 #     57.44s wall / 56.02s pytest    task 5470 implementer run, step-4 tree,
 #                                    same pin; rc=0, 2538 passed / 2 skipped;
 #                                    loadavg 134.94 -> 129.42
+#     46.85s wall / 45.66s pytest    task 5470 amendment-pass run, same pin;
+#                                    rc=0, 2538 passed / 2 skipped; loadavg
+#                                    259.22 -> 463.43
 #
 #   FALLBACK-PATH runs — NOT this command; the fleet chain's legs narrowed to a
 #   tests/scripts diff. Kept for history, never for sizing:
