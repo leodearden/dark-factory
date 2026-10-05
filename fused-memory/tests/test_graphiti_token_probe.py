@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from _mock_openai_server import mock_openai_server
 from graphiti_core.llm_client.config import LLMConfig as GraphitiLLMConfig
+from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from graphiti_core.llm_client.token_tracker import TokenUsageTracker
 from graphiti_core.prompts.models import Message
 from pydantic import BaseModel, ValidationError
@@ -341,4 +342,22 @@ async def test_generic_client_records_nothing_when_every_attempt_fails_like_upst
             prompt_name=_PROMPT_NAME,
         )
 
+    assert client.token_tracker.get_usage() == {}
+
+
+@pytest.mark.asyncio
+async def test_upstream_generic_client_still_records_nothing_so_ours_cannot_double_count():
+    """``TokenRecordingOpenAIGenericClient`` records on top of an upstream that
+    never does. If an upgrade makes upstream record, every generic-arm call
+    would count twice: delete the wrapper then."""
+    fake = MagicMock()
+    fake.chat.completions.create = AsyncMock(return_value=_completion(_OFF_ENVELOPE, 60, 6))
+    client = OpenAIGenericClient(config=GraphitiLLMConfig(api_key='k', model='m'), client=fake)
+
+    await client.generate_response(
+        [Message(role='system', content='s'), Message(role='user', content='u')],
+        prompt_name=_PROMPT_NAME,
+    )
+
+    fake.chat.completions.create.assert_awaited_once()
     assert client.token_tracker.get_usage() == {}
