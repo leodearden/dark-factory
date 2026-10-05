@@ -560,6 +560,15 @@ class TestBudget:
         assert summary['budget_exhausted'] is True
         assert summary['arms']['gpt-4o-mini@5']['complete'] is False
 
+    def test_calls_in_flight_when_the_cap_is_crossed_still_land(self, tmp_path: Path) -> None:
+        path = _snapshot_file(tmp_path)
+        cap = 0.5 * _ONE_CALL_USD
+        summary = _run_arms(path, _Provider(delay=0.05), concurrency=4, budget_usd=cap)
+        assert len(_rows(path, 'gpt-4o-mini@5')) == 4
+        assert summary['budget_exhausted'] is True
+        assert summary['spent_usd'] == pytest.approx(4 * _ONE_CALL_USD)
+        assert cap < summary['spent_usd'] < cap + 4 * _ONE_CALL_USD
+
     def test_prior_spend_in_any_arm_file_counts_toward_the_cap(self, tmp_path: Path) -> None:
         path = _snapshot_file(tmp_path)
         _run_arms(path, _Provider(), arms=['gpt-4o-mini@20'], max_writes=2)
@@ -637,12 +646,11 @@ class _Published:
         ]
         writes += [_publish_write('det', 'restated'), _publish_write('low', 'stored')]
         self.path = _freeze_mod().write_snapshot(tmp_path / 'data', {
-            'schema_version': 1, 'frozen_at': '2026-10-05T07:00:00+00:00',
+            'schema_version': 2, 'frozen_at': '2026-10-05T07:00:00+00:00',
             'projects': ['dark_factory', 'reify'], 'candidate_k': 20, 'writes': writes,
             'targets': {'P': {'project_id': 'reify', 'content': 'the parent'}},
-            'excluded': {
-                'undated': 1, 'vanished': 2, 'own_children_dropped': 3, 'self_retrieved': 4,
-            },
+            'excluded_writes': {'undated': 1, 'vanished': 2},
+            'slate_rows_dropped': {'self': 4, 'own_children': 3},
         })
         self.snapshot, self.sha = _freeze_mod().load_snapshot(self.path)
         self.order = [w['memory_id'] for w in _mod().judge_band_order(self.snapshot, self.sha)]
@@ -681,6 +689,12 @@ class _Published:
             if row['memory_id'] in answers:
                 outcome, target = answers[row['memory_id']]
                 row.update(outcome=outcome, verdict_candidate_id=target, judged_candidate_id=target)
+
+    def judge_a_write_outside_the_snapshot(self, arm_name: str) -> None:
+        self.rows[arm_name][0].update(
+            memory_id='not-frozen', outcome='amended',
+            verdict_candidate_id='a', judged_candidate_id='a',
+        )
 
     def write_arm_files(self) -> None:
         arms_dir = self.path.parent / 'arms'
@@ -730,9 +744,8 @@ class TestThePopulationBlock:
             'recon_marker_writes': 2,
             'recon_marker_run_set': sum(1 for m in published.run_set if m == 'w00'),
             'declares_attach_keys_writes': 1,
-            'excluded': {
-                'undated': 1, 'vanished': 2, 'own_children_dropped': 3, 'self_retrieved': 4,
-            },
+            'excluded_writes': {'undated': 1, 'vanished': 2},
+            'slate_rows_dropped': {'self': 4, 'own_children': 3},
             'judge_band_with_later_candidates': later,
         }
 
@@ -807,6 +820,54 @@ class TestPublishRefuses:
         with pytest.raises(ValueError, match='prefix'):
             published.artifact()
 
+    def test_the_pairs_refuse_a_row_of_a_write_outside_the_snapshot(
+        self, published: _Published,
+    ) -> None:
+        published.judge_a_write_outside_the_snapshot('gpt-6-luna:low@5')
+        with pytest.raises(ValueError, match='gpt-6-luna:low@5'):
+            published.pairs()
+
+
+class TestThePublishCommand:
+    @staticmethod
+    def _publish(published: _Published, out: Path, population_out: Path | None = None) -> int:
+        return _mod().main([
+            'publish', '--snapshot', str(published.path),
+            '--population-out', str(population_out or out / 'population.json'),
+            '--pairs-out', str(out / 'pairs.jsonl'),
+            '--already-rated', str(out / 'no-verdicts.jsonl'),
+        ])
+
+    def test_the_artifact_names_the_pairs_file_written_beside_it(
+        self, published: _Published, tmp_path: Path,
+    ) -> None:
+        published.write_arm_files()
+        assert self._publish(published, tmp_path) == 0
+        artifact = json.loads((tmp_path / 'population.json').read_text(encoding='utf-8'))
+        body = (tmp_path / 'pairs.jsonl').read_bytes()
+        assert artifact['pairs_to_rate']['path'] == 'pairs.jsonl'
+        assert artifact['pairs_to_rate']['sha256'] == _sha(body)
+        assert list(tmp_path.glob('*.tmp')) == []
+
+    def test_a_row_of_a_write_outside_the_snapshot_is_refused_before_anything_is_written(
+        self, published: _Published, tmp_path: Path,
+    ) -> None:
+        published.judge_a_write_outside_the_snapshot('gpt-6-luna:low@5')
+        published.write_arm_files()
+        with pytest.raises(ValueError, match='gpt-6-luna:low@5'):
+            self._publish(published, tmp_path)
+        assert not (tmp_path / 'population.json').exists()
+        assert not (tmp_path / 'pairs.jsonl').exists()
+
+    def test_an_artifact_that_cannot_be_written_leaves_the_pairs_file_unwritten(
+        self, published: _Published, tmp_path: Path,
+    ) -> None:
+        published.write_arm_files()
+        with pytest.raises(FileNotFoundError):
+            self._publish(published, tmp_path, population_out=tmp_path / 'absent' / 'p.json')
+        assert not (tmp_path / 'pairs.jsonl').exists()
+        assert list(tmp_path.glob('*.tmp')) == []
+
 
 class TestTheSpend:
     def test_the_total_and_the_price_table_it_was_priced_at(self, published: _Published) -> None:
@@ -868,7 +929,9 @@ class TestTheWordingReadout:
         self, published: _Published,
     ) -> None:
         readout = published.artifact()['wording_attribution']['population']
-        five = readout['5']
+        assert set(readout) == {'gpt-4o-mini@5+pre-psi', 'gpt-4o-mini@20+pre-psi'}
+        five = readout['gpt-4o-mini@5+pre-psi']
+        assert (five['shipped_arm'], five['other_arm']) == ('gpt-4o-mini@5', 'gpt-4o-mini@5+pre-psi')
         assert five['shipped'] == {
             'outcomes': {'amended': 1, 'contested': 2, 'stored': 1},
             'attaches': 3, 'contested': 2, 'contested_share_of_attaches': pytest.approx(2 / 3),
@@ -879,7 +942,7 @@ class TestTheWordingReadout:
         }
         assert (five['contested_only_shipped'], five['contested_only_pre_psi']) == (1, 2)
         assert five['mcnemar_p'] == 1.0
-        assert readout['20']['shipped']['contested_share_of_attaches'] is None
+        assert readout['gpt-4o-mini@20+pre-psi']['shipped']['contested_share_of_attaches'] is None
 
     def test_no_fixture_reports_means_no_fixture_half(self, published: _Published) -> None:
         assert published.artifact()['wording_attribution']['fixture'] is None
@@ -997,9 +1060,17 @@ class TestCommittedPopulationIsTraceable:
         population = _committed()['population']
         assert {
             'n_writes', 'n_judge_band', 'frozen_at', 'by_category', 'recon_marker_writes',
+            'excluded_writes', 'slate_rows_dropped',
         } <= set(population)
+        assert 'excluded' not in population
         assert population['projects'] == ['dark_factory', 'reify']
         assert re.fullmatch(r'[0-9a-f]{64}', population['snapshot_sha256'])
+
+    def test_the_wording_readout_is_keyed_by_each_non_shipped_arm(self) -> None:
+        readout = _committed()['wording_attribution']['population']
+        assert set(readout) == {arm.name for arm in _mod().ARMS if arm.wording != 'shipped'}
+        for name, entry in readout.items():
+            assert entry['other_arm'] == name
 
     def test_the_pairs_file_is_the_one_the_artifact_names(self) -> None:
         body, rows = _committed_pairs()

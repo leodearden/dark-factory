@@ -360,7 +360,13 @@ def _spent_usd(arms_dir: Path) -> float:
 
 @dataclass
 class _Budget:
-    """The run's shared spend tally against its hard cap."""
+    """The run's list-price tally of landed rows, and the cap that stops dispatch.
+
+    A call is dispatched only while the tally is under the cap, and counted
+    only once its row lands. So calls already in flight when the cap is
+    crossed still land (the overshoot is under concurrency x the costliest
+    call), and a transient failure the provider billed is never counted.
+    """
 
     spent: float
     cap: float
@@ -468,8 +474,10 @@ async def run_arms(
 
     Resumable: a row already in ``arms_dir/<arm>.jsonl`` is never re-judged.
     Dispatch stops once the list-price spend of every arm file reaches
-    *budget_usd*. Returns per-arm coverage of the run set, whether the budget
-    refused a dispatch, and the spend.
+    *budget_usd*; calls in flight then still land, so the spend can pass it
+    by up to *concurrency* calls (see :class:`_Budget`). Returns per-arm
+    coverage of the run set, whether the budget refused a dispatch, and the
+    spend.
     """
     too_wide = [arm.name for arm in arms if arm.width > snapshot['candidate_k']]
     if too_wide:
@@ -590,7 +598,7 @@ def _population_block(
         'recon_marker_writes': sum(1 for write in writes if write['recon_marker']),
         'recon_marker_run_set': sum(1 for write in run_set if write['recon_marker']),
         'declares_attach_keys_writes': sum(1 for w in writes if w['declares_attach_keys']),
-        'excluded': dict(snapshot['excluded']),
+        **_freeze.exclusions(snapshot),
         'judge_band_with_later_candidates': sum(1 for w in run_set if _has_later_candidate(w)),
     }
 
@@ -655,7 +663,7 @@ def _wording_side(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 def _wording_population(
     arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
 ) -> dict[str, Any]:
-    """Each non-shipped arm against its shipped twin on the same writes, keyed by width.
+    """Each non-shipped arm against its shipped twin on the same writes, keyed by its name.
 
     Label-free: contested shares and the paired discordance, with ι's exact
     McNemar p on the discordant counts.
@@ -670,14 +678,15 @@ def _wording_population(
         contested_other = {r['memory_id'] for r in other if r['outcome'] == OUTCOME_CONTESTED}
         only_shipped = len(contested_shipped - contested_other)
         only_other = len(contested_other - contested_shipped)
-        readout[str(arm.width)] = {
+        readout[arm.name] = {
             'shipped_arm': twin.name,
             'other_arm': arm.name,
             _SHIPPED: _wording_side(shipped),
             arm.wording: _wording_side(other),
             'contested_only_shipped': only_shipped,
             f'contested_only_{arm.wording.replace("-", "_")}': only_other,
-            # ι is the one home of the flip-gate statistics; its test is reused, not re-spelled.
+            # A private reach into ι, the one home of the flip-gate statistics, so its test
+            # is reused rather than re-spelled. Promoting it is a follow-up of task 6151.
             'mcnemar_p': _scorer._mcnemar_exact(only_shipped, only_other),
         }
     return readout
@@ -789,8 +798,10 @@ def build_pairs_to_rate(
 
     Rows carry texts only: no arm, outcome, band or score. Pairs already in
     *already_rated* are left out and counted; a target whose text is gone is
-    kept as ``null`` and counted.
+    kept as ``null`` and counted. Refuses (``ValueError``) every run
+    :func:`build_population_artifact` refuses.
     """
+    _validated_run_set(snapshot, snapshot_sha256, arm_rows_by_name)
     writes = {write['memory_id']: write for write in snapshot['writes']}
     judged = {
         (row['memory_id'], row['judged_candidate_id'])
@@ -863,6 +874,22 @@ def _fixture_reports(values: Sequence[str]) -> dict[str, dict[str, Any]] | None:
     return reports
 
 
+def _write_staged(bodies: Mapping[Path, str]) -> None:
+    """Write every body beside its path before moving any into place.
+
+    A body that cannot be written therefore replaces none of the files.
+    """
+    staged = {Path(path): Path(path).with_name(f'{Path(path).name}.tmp') for path in bodies}
+    try:
+        for path, body in bodies.items():
+            staged[Path(path)].write_text(body, encoding='utf-8')
+        for path, temporary in staged.items():
+            os.replace(temporary, path)
+    finally:
+        for temporary in staged.values():
+            temporary.unlink(missing_ok=True)
+
+
 def _command_publish(args: argparse.Namespace) -> int:
     snapshot, snapshot_sha256 = _freeze.load_snapshot(args.snapshot)
     arms_dir = Path(args.snapshot).parent / 'arms'
@@ -880,11 +907,11 @@ def _command_publish(args: argparse.Namespace) -> int:
             **stats, 'path': repo_relative(args.pairs_out), 'sha256': _sha256(pairs_body),
         },
     )
-    Path(args.pairs_out).write_text(pairs_body, encoding='utf-8')
-    Path(args.population_out).write_text(
-        json.dumps(artifact, indent=2, sort_keys=True, ensure_ascii=False) + '\n',
-        encoding='utf-8',
-    )
+    _write_staged({
+        args.pairs_out: pairs_body,
+        args.population_out: json.dumps(artifact, indent=2, sort_keys=True, ensure_ascii=False)
+        + '\n',
+    })
     print(json.dumps({
         'population_out': str(args.population_out), 'pairs_out': str(args.pairs_out),
         'n_judge_band': artifact['population']['n_judge_band'],
@@ -909,7 +936,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     run.add_argument('--concurrency', type=int, default=8,
                      help='calls in flight within one arm (default: 8)')
     run.add_argument('--budget-usd', dest='budget_usd', type=float, default=40.0,
-                     help='hard list-price cap over every arm file (default: 40.0)')
+                     help='list-price spend over every arm file at which dispatch stops; '
+                          'calls in flight still land, so spend can pass it by up to '
+                          '--concurrency calls (default: 40.0)')
     run.add_argument('--arms', nargs='+', choices=[arm.name for arm in ARMS], default=None,
                      help='arms to run, in ARMS order whatever the order given (default: all)')
     run.set_defaults(handler=_command_run)

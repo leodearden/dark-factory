@@ -297,9 +297,7 @@
       "reify": 537
     },
     "declares_attach_keys_writes": 40,
-    "excluded": {
-      "own_children_dropped": 4,
-      "self_retrieved": 1517,
+    "excluded_writes": {
       "undated": 1,
       "vanished": 0
     },
@@ -319,6 +317,10 @@
     ],
     "recon_marker_run_set": 165,
     "recon_marker_writes": 326,
+    "slate_rows_dropped": {
+      "own_children": 4,
+      "self": 1517
+    },
     "snapshot_path": "data/write-triage-population-2026-10-05/snapshot.json",
     "snapshot_sha256": "55398cd73c9a355d05f9454a2e1cca9e7da760bd89df141b2f6b5b8f28293e38"
   },
@@ -364,7 +366,7 @@
       }
     },
     "population": {
-      "20": {
+      "gpt-4o-mini@20+pre-psi": {
         "contested_only_pre_psi": 2,
         "contested_only_shipped": 249,
         "mcnemar_p": 0.0,
@@ -393,7 +395,7 @@
         },
         "shipped_arm": "gpt-4o-mini@20"
       },
-      "5": {
+      "gpt-4o-mini@5+pre-psi": {
         "contested_only_pre_psi": 0,
         "contested_only_shipped": 209,
         "mcnemar_p": 0.0,
