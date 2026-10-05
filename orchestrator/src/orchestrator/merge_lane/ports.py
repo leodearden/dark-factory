@@ -166,6 +166,17 @@ class EscalationPort(Protocol):
         ...
 
 
+class ContainmentPredicate(Protocol):
+    """Whether every commit of *head* is already in *upstream* by patch-id.
+
+    False whenever that cannot be established, so a guard that skips only on
+    True fails open into a merge. Production implementation:
+    ``orchestrator/src/orchestrator/merge_lane/landing_evidence.py::patch_content_contained``.
+    """
+
+    async def __call__(self, head: str, upstream: str, git_ops: GitOps, /) -> bool: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class ProductionVerifier:
     """``VerifyPort`` as the running orchestrator wires it.
