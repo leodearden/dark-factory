@@ -24,20 +24,28 @@
 # Exit 0 on either of the two ways the value can be live: the reload
 # hot-applied it ('applied'), or the running config already carried it and the
 # reload provably re-read THIS config file ('already_converged'). The last
-# stdout line is a JSON verdict — {switched_to, commit, outcome} — for a
-# kind='predicate' before_done note.
+# stdout line of every designed exit is a JSON verdict, for a kind='predicate'
+# before_done note: {switched_to, commit, outcome} on exit 0 (--dry-run prints
+# its own {dry_run, would_set}), or one carrying `failure: <tag>` on exit 1.
+# The tags come from die() below, the reload step's fail(), and
+# scripts/_config_reload_gate.py::ReloadFailure.
 set -euo pipefail
-die() { echo "merge-pytest-n-ab-switch: $*" >&2; exit 1; }
+die() {
+    local failure="$1"; shift
+    printf '{"failure": "%s"}\n' "$failure"
+    echo "merge-pytest-n-ab-switch: $*" >&2
+    exit 1
+}
 
 DRY=0; ARGS=()
 for a in "$@"; do case "$a" in --dry-run) DRY=1;; *) ARGS+=("$a");; esac; done
-[ "${#ARGS[@]}" -ge 1 ] || die "usage: merge-pytest-n-ab-switch.sh <value> [config_yaml] [escalation_port] [--dry-run]"
+[ "${#ARGS[@]}" -ge 1 ] || die usage "usage: merge-pytest-n-ab-switch.sh <value> [config_yaml] [escalation_port] [--dry-run]"
 VALUE="${ARGS[0]}"
 CONFIG="${ARGS[1]:-/home/leo/src/dark-factory/dark-factory-orchestrator.yaml}"
 PORT="${ARGS[2]:-8102}"
-[[ "$VALUE" =~ ^[0-9]+$ ]] || die "value must be a positive integer, got '$VALUE'"
-[[ "$PORT" =~ ^[0-9]+$ ]] || die "escalation_port must be a port number, got '$PORT'"
-[ -f "$CONFIG" ] || die "config not found: $CONFIG"
+[[ "$VALUE" =~ ^[0-9]+$ ]] || die invalid_value "value must be a positive integer, got '$VALUE'"
+[[ "$PORT" =~ ^[0-9]+$ ]] || die invalid_port "escalation_port must be a port number, got '$PORT'"
+[ -f "$CONFIG" ] || die config_not_found "config not found: $CONFIG"
 # The reload step imports its MCP transport from the checkout the SCRIPT lives
 # in — never from $REPO below, which is the CONFIG's checkout and may be a
 # different project entirely. That transport is not stdlib (httpx, pydantic),
@@ -50,7 +58,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHECKOUT="$SCRIPT_DIR/.."
 PY="$CHECKOUT/.venv/bin/python3"
 [ -x "$PY" ] || PY=python3
-REPO="$(cd "$(dirname "$CONFIG")" && git rev-parse --show-toplevel)" || die "config is not inside a git checkout"
+REPO="$(cd "$(dirname "$CONFIG")" && git rev-parse --show-toplevel)" || die config_not_in_git "config is not inside a git checkout"
 CONFIG_BASE="$(realpath --relative-to="$REPO" "$CONFIG")"
 KEY='PYTEST_XDIST_AUTO_NUM_WORKERS'
 STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -61,7 +69,7 @@ if [ "$DRY" -eq 1 ]; then TARGET="$(mktemp)"; cp "$CONFIG" "$TARGET"; fi
 # 1. Rewrite the value inside the top-level `verify_env:` mapping. Line-based
 #    on purpose (no yaml round-trip: the file is 1000 lines of load-bearing
 #    comments). Replaces an existing A/B marker line rather than stacking them.
-python3 - "$TARGET" "$KEY" "$VALUE" "$STAMP" <<'PY'
+python3 - "$TARGET" "$KEY" "$VALUE" "$STAMP" <<'PY' || die config_edit_refused "step 1 left ${CONFIG} unedited (reason above)"
 import re, sys
 path, key, value, stamp = sys.argv[1:5]
 lines = open(path, encoding='utf-8').read().split('\n')
@@ -109,7 +117,7 @@ if git -C "$REPO" diff --quiet -- "$CONFIG_BASE"; then
 else
     git -C "$REPO" commit --only "$CONFIG_BASE" -q \
         -m "config(ab): merge test leg ${KEY}=${VALUE} (pytest -n A/B arm switch, ${STAMP})" \
-        || die "git commit --only ${CONFIG_BASE} failed"
+        || die commit_failed "git commit --only ${CONFIG_BASE} failed"
     SHA="$(git -C "$REPO" rev-parse --short HEAD)"
 fi
 
@@ -129,40 +137,53 @@ fi
 import json, os, sys
 script_dir, key, value, sha, config_path, port = sys.argv[1:7]
 sys.path.insert(0, script_dir)
-from _config_reload_gate import die, reload_or_exit
+from _config_reload_gate import ReloadNotConfirmed, fetch_reload_report
 
-PROG = 'merge-pytest-n-ab-switch'
-tool = reload_or_exit(port, prog=PROG, committed_as=sha)
+
+def verdict(**result):
+    print(json.dumps({'switched_to': value, 'commit': sha, **result}))
+
+
+def fail(failure, message):
+    print(f'merge-pytest-n-ab-switch: {message}', file=sys.stderr)
+    verdict(failure=failure)
+    sys.exit(1)
+
+
+try:
+    tool = fetch_reload_report(port, committed_as=sha)
+except ReloadNotConfirmed as exc:
+    fail(exc.failure.value, exc.detail)
 entry = (tool.get('applied') or {}).get('verify_env')
 if entry is None:
     reloaded = tool.get('reloaded')
     reported = tool.get('config_path')
     if not reloaded:
-        die(PROG, f'reload reported no verify_env change, but did not commit it: reloaded={reloaded!r} '
-                  f'(a failed reload rolls every leaf back, so the live config is untouched)')
+        fail('reload_not_committed', f'reload reported no verify_env change, but did not commit it: reloaded={reloaded!r} '
+                                     f'(a failed reload rolls every leaf back, so the live config is untouched)')
     # `reported` is the ORCHESTRATOR's own ORCH_CONFIG_PATH, so a RELATIVE one
     # is resolved by the SERVER's cwd — realpath here would resolve it against
     # OURS, and a different unit whose ORCH_CONFIG_PATH is the bare
     # `dark-factory-orchestrator.yaml` would then match us whenever this runs
     # from our project root. Uncomparable is not a match.
     if not reported or not os.path.isabs(reported) or os.path.realpath(reported) != config_path:
-        die(PROG, f'reload reported no verify_env change, but re-read a different file: '
-                  f'config_path={reported!r} expected={config_path!r}')
+        fail('different_config_file', f'reload reported no verify_env change, but re-read a different file: '
+                                      f'config_path={reported!r} expected={config_path!r}')
     # verify_env is in RELOADABLE_FIELDS today, so a change to it is never
     # bucketed as restart-required (config.py::diff_config) and this never
     # fires. One allowlist edit away it would: a genuine flip then produces
     # this branch's exact shape — reloaded, our file, nothing under `applied`
     # — while the arm is committed and NOT live.
     if 'verify_env' in (tool.get('restart_required') or {}):
-        die(PROG, f'verify_env changed but is restart-required, not hot-applied: '
-                  f'restart_required_keys={sorted(tool.get("restart_required") or {})} '
-                  f'(committed as {sha}; the value lands at the next restart)')
+        fail('restart_required', f'verify_env changed but is restart-required, not hot-applied: '
+                                 f'restart_required_keys={sorted(tool.get("restart_required") or {})} '
+                                 f'(committed as {sha}; the value lands at the next restart)')
     outcome = 'already_converged'
 else:
     new = (entry or {}).get('new') or {}
     if str(new.get(key)) != value:
-        die(PROG, f'applied.verify_env does not carry {key}={value}: applied_keys={sorted(tool.get("applied") or {})} '
-                  f'restart_required_keys={sorted(tool.get("restart_required") or {})} entry={entry}')
+        fail('value_mismatch', f'applied.verify_env does not carry {key}={value}: applied_keys={sorted(tool.get("applied") or {})} '
+                               f'restart_required_keys={sorted(tool.get("restart_required") or {})} entry={entry}')
     outcome = 'applied'
-print(json.dumps({'switched_to': value, 'commit': sha, 'outcome': outcome}))
+verdict(outcome=outcome)
 RELOAD_PY
