@@ -100,7 +100,7 @@ asyncio_mode = "auto"
 # which carry timeout_method = "signal" and record themselves measured green
 # under exactly those flags (task 5408). The argument for why flipping to
 # `thread` is a real trade rather than a free upgrade lives once, in
-# fused-memory/pyproject.toml's own timeout_method block.
+# tests/scripts/test_timeout_method_policy.py.
 # Value provenance: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 # Rationale for the setting: shared/pyproject.toml. Neither is restated here.
 timeout = 540

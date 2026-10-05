@@ -380,6 +380,9 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 #     59.04s wall / 57.10s pytest    task 5470 implementer run, step-2 tree,
 #                                    same pin; rc=0, 2535 passed / 2 skipped;
 #                                    loadavg 127.32 -> 101.59
+#     57.44s wall / 56.02s pytest    task 5470 implementer run, step-4 tree,
+#                                    same pin; rc=0, 2538 passed / 2 skipped;
+#                                    loadavg 134.94 -> 129.42
 #
 #   FALLBACK-PATH runs — NOT this command; the fleet chain's legs narrowed to a
 #   tests/scripts diff. Kept for history, never for sizing:

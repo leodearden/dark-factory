@@ -438,6 +438,9 @@ def test_executed_for_touched_is_hermetic_against_the_ambient_orch_config_path(
 #     59.04s wall / 57.10s pytest    task 5470 implementer run, step-2 tree,
 #                                    same pin; rc=0, 2535 passed / 2 skipped;
 #                                    loadavg 127.32 -> 101.59
+#     57.44s wall / 56.02s pytest    task 5470 implementer run, step-4 tree,
+#                                    same pin; rc=0, 2538 passed / 2 skipped;
+#                                    loadavg 134.94 -> 129.42
 #
 #   FALLBACK-PATH runs — A DIFFERENT COMMAND, kept for history and LABELLED so
 #   nobody sizes this budget against them again:

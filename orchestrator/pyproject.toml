@@ -194,10 +194,10 @@ filterwarnings = [
 # — whose comment block on that constant is the SINGLE home of this rationale,
 # including why the marker beats this setting. Enforced by
 # tests/test_timeout_marker_inversion_guard.py.
-# timeout_method: signal mode was paired with serial execution; once xdist
-# was enabled here (matching fused-memory/pyproject.toml) the worker
-# subprocesses run pytest in a thread, so signal-based interruption is no
-# longer reliable inside the worker — switch to thread mode like fused-memory.
+# timeout_method: thread is RETAINED. Its original premise, that xdist worker
+# subprocesses run pytest in a thread so signal cannot reach the test, is
+# falsified by tests/scripts/test_timeout_method_policy.py, where the
+# signal-vs-thread trade lives.
 # UNCHANGED by the 60→300 and 300→540 raises, deliberately: a raise attacks the
 # trigger, not the two safety mechanisms.
 # MIRRORED by tests/_orch_helpers.py::PYPROJECT_DEFAULT_TIMEOUT, which
