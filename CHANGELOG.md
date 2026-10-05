@@ -515,6 +515,16 @@ landed, have since landed under task 3134 (below).
 
 ### Changed
 
+#### Store preflight refuses an existing-but-empty target, not just a missing one (task 5468)
+
+The seven fused-memory store scripts that preflight their target now refuse an
+EMPTY one as well as a missing one: an escalation queue directory with no entries, or
+a `tasks.db` holding no tasks. That empty store is exactly the residue a mis-targeted
+run leaves behind, because both substrates auto-create themselves. An unreadable
+target still fails open. The wrappers are renamed `assert_queue_dir_populated` and
+`assert_task_store_populated`, and the general `assert_target_store_exists` is gone.
+See `fused-memory/src/fused_memory/utils/target_store_preflight.py`.
+
 #### Pinned tasks earn a pin reservation; reservation events carry `source`; new `pin_blocked` (task 6040)
 
 **Old behaviour.** A pinned task that failed `try_acquire` was skipped silently. It

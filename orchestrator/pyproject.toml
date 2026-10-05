@@ -312,8 +312,8 @@ dev = [
     "ruff>=0.7.1",
 ]
 
-# mutmut: task 5035's mutation-score baseline, run from this directory. The
-# procedure, the mutant sample and the results are in
+# mutmut: the merge lane's mutation-score baseline (tasks 5035, 6374), run from
+# this directory. The procedure and results are in
 # plans/merge-lane-quality-prd.mutation-baseline.md. merge_lane/worker.py is
 # deliberately not mutated; task 6327 owns it.
 [tool.mutmut]
@@ -322,6 +322,10 @@ only_mutate = [
     "src/orchestrator/merge_lane/gates.py",
     "src/orchestrator/merge_lane/types.py",
 ]
+# Logger calls are not mutated (PRD Open question 4, Leo 2026-10-05). mutmut
+# skips any expression that starts on a matching line, multi-line calls
+# included; the anchor keeps lines that merely mention `logger.` mutable.
+do_not_mutate_patterns = ['^\s*logger\.(debug|info|warning|error|exception|critical)\(']
 # mutmut maps tests to the functions they reach in-process, so xdist is off.
 pytest_add_cli_args = ["-n", "0", "-p", "no:cacheprovider"]
 # The lane-importing test files (scripts/merge_lane_metrics.py::

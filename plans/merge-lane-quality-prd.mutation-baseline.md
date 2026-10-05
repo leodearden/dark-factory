@@ -1,5 +1,156 @@
 # Merge lane: mutation-score baseline
 
+## 2026-10-05: fenced, unsampled baseline (current)
+
+**Task:** 6374. Leo's ruling on 2026-10-05 settles the granularity half of PRD Open
+question 4:
+- logger calls are not mutated (an anchored `do_not_mutate_patterns` in
+  `[tool.mutmut]`);
+- measure unsampled where the run fits;
+- every measurement files tasks for its live-code survivors. Task 6327 is the
+  standing owner.
+
+Whether a ratchet exists at all is still open.
+**Taken against:** main `c285747072`, with mutmut 3.7.0 and CPython 3.13.9. Run
+2026-10-05, 14:49–19:56 UTC (5 h 07 min). That was about 1 h 25 min of serial stats
+and clean-test passes, then about 3 h 40 min of mutants at 0.13 mutants per second,
+with 8 workers on the shared host (load average 75–230).
+**Run id:** `mutation-dark_factory-20261005`, which is the `x_finding_run` on the
+filed tasks.
+
+| Module | Mutants (fenced) | Killed | Survived | Timeout | No tests | Score |
+|---|---|---|---|---|---|---|
+| `merge_lane/types.py` | 191 | 170 | 21 | 0 | 0 | **0.890** |
+| `merge_lane/gates.py` | 1,540 | 1,322 | 218 | 0 | 0 | **0.858** |
+| `merge_lane/worker.py` | **INCOMPLETE** | — | — | — | — | — |
+
+- **The fence** removes the 956 logger-call mutants from `gates.py` (2,496 → 1,540)
+  and none from `types.py`. None of the 239 survivors sits inside a logger call.
+- **`gates.py`'s 0.858 covers the whole population.** The 2026-10-04 sample's
+  code-only estimate was 0.868 (0.809–0.911), so the sample was sound.
+- **`types.py`'s numbers match 2026-10-04.**
+- **`worker.py`** is INCOMPLETE for the unchanged reason given in the 2026-10-04
+  section below. Task 6327 owns it.
+- **Selection.** Re-derived with the recorder (Method, below) on `c285747072`: the
+  same 141 files, with 3,205 tests reaching a target. All 8,804 lane-importing tests,
+  and all 5,115 selected tests inside mutmut's layout, passed before the run.
+- **Run.** As in the Method below, but with a bare `mutmut run --max-children 8`.
+  The fenced population is small enough to run in full.
+
+### Survivors, keyed and dispositioned
+
+The source of this section is
+`plans/merge-lane-quality-prd.mutation-baseline.findings.json`. It records every
+finding's key, anchor, tags, severity, verdict, disposition and full survivor list,
+in the shape of `docs/quality-findings-contract.md` §1, §2 and §5. The table below is
+rendered from it, so edit the JSON, not the table. Mutation testing is not a
+registered instrument under that contract; the record follows the contract's shape
+so that its keys join with the other instruments'.
+
+Keys follow §2: area `orchestrator`, anchor
+`orchestrator/src/orchestrator/merge_lane/<module>::<symbol>`, primary tag `tests`.
+Deduplication followed §8:
+- **Step 1:** no task carried any of these keys.
+- **Step 2:** a semantic search at 0.6 or more found no owner. It did find task 5293,
+  which touches three groups of anchors:
+  - its workstreams A and B rewrite `_map_advance_failure`'s fall-through;
+  - its C1 changes how `_reverify_rebased_tree` records its decision;
+  - its C2 reworks the overlap set, pending re-measurement.
+  The tasks for exactly those anchors depend on it, and the advance-failure task
+  also depends on π (task 5046).
+- **`TerminalOutcomeRetention`** went to task 4833 from the 3149 dead-code finding,
+  not from either dedup step.
+
+| Anchor | Key | Survivors | Disposition |
+|---|---|---|---|
+| `gates.py::_map_advance_failure` | `fk-686d7c85ef80` | 40 | filed:6416 |
+| `gates.py::_commit_is_linear` | `fk-0d9ce2c36201` | 20 | filed:6411 |
+| `gates.py::_finalize_advanced_merge` | `fk-04a3cd4d3f09` | 20 | filed:6411 |
+| `gates.py::_run_unscoped_typechecks` | `fk-f9dcfd18b280` | 17 | filed:6414 |
+| `gates.py::_resolve_renamed_plan_path` | `fk-bb48145757ed` | 12 | filed:6412 |
+| `gates.py::_auto_chain_on_equivalence_blocked` | `fk-370ecc0921e0` | 11 | filed:6413 |
+| `gates.py::_rename_aware_real_drops` | `fk-e2d18dfdac1c` | 11 | filed:6412 |
+| `gates.py::_rename_aware_compare_set` | `fk-cf497f9a2cdc` | 11 | filed:6412 |
+| `gates.py::_run_equivalence_gate` | `fk-1de95aeeb9d2` | 7 | filed:6413 |
+| `gates.py::_ls_tree_object_type` | `fk-36edb2cbd99e` | 7 | filed:6411 |
+| `gates.py::_check_plan_files_touched_in_branch` | `fk-639ce0161c9b` | 7 | filed:6412 |
+| `gates.py::_reverify_rebased_tree` | `fk-2450ca4c2aab` | 7 | filed:6419 |
+| `gates.py::_branch_delta_survives` | `fk-5ae4fd352530` | 6 | filed:6413 |
+| `gates.py::_rename_pair_for` | `fk-d77867b27fab` | 6 | filed:6412 |
+| `gates.py::_run_pyright_gate` | `fk-e36d4f7542e9` | 5 | filed:6414 |
+| `gates.py::_emit_merge_attempt` | `fk-7a290cbad0ba` | 4 | filed:6411 |
+| `gates.py::_rebase_delta_touched_overlap` | `fk-def205571cc4` | 4 | filed:6419 |
+| `gates.py::_rename_pairs` | `fk-f846fc5058ff` | 3 | filed:6412 |
+| `gates.py::_entry_touched_beneath` | `fk-311b5e19680b` | 3 | filed:6411 |
+| `gates.py::_disjoint_skip_blockers` | `fk-5b1980f1df07` | 3 | filed:6419 |
+| `gates.py::_check_post_merge_pyright` | `fk-82dd948d2330` | 3 | filed:6414 |
+| `gates.py::_check_plan_targets_in_tree` | `fk-f13d7fa78353` | 2 | filed:6412 |
+| `gates.py::_resolve_already_landed_branch` | `fk-964c53f450b7` | 2 | filed:6411 |
+| `gates.py::_path_existed_in_branch_history` | `fk-c1f6739d8a37` | 2 | filed:6411 |
+| `gates.py::_check_post_merge_equivalence` | `fk-0adcde3b4223` | 2 | filed:6413 |
+| `gates.py::_elapsed_ms` | `fk-430f0c416fd6` | 1 | filed:6411 |
+| `gates.py::is_cross_repo_task` | `fk-f9775451871b` | 1 | filed:6411 |
+| `gates.py::_normalize_plan_path` | `fk-5cda09732e42` | 1 | filed:6412 |
+| `types.py::TerminalOutcomeRetention.record_alias` | `fk-373739976009` | 5 | filed:4833 (dead code; 4833 deletes it) |
+| `types.py::InFlightMergeRegistry.acquire` | `fk-5d9b64f39791` | 4 | filed:6415 |
+| `types.py::InFlightMergeRegistry.eta_seconds` | `fk-cc7acc4aba57` | 3 | filed:6415 |
+| `types.py::item_merge_wt` | `fk-f7b381081691` | 2 | refuted (unreachable) |
+| `types.py::MergeBounceRegistry.clear` | `fk-7c10d081e252` | 1 | filed:6415 |
+| `types.py::TerminalOutcomeRetention.__init__` | `fk-b023d75909a5` | 1 | filed:4833 (dead code; 4833 deletes it) |
+| `types.py::TerminalOutcomeRetention.record` | `fk-54f2462a0dea` | 1 | filed:4833 (dead code; 4833 deletes it) |
+| `types.py::TerminalOutcomeRetention.forget` | `fk-b165b0dafef7` | 1 | filed:4833 (dead code; 4833 deletes it) |
+| `types.py::InFlightMergeRegistry.attach` | `fk-c4e383c51351` | 1 | filed:6415 |
+| `types.py::InFlightMergeRegistry.detach` | `fk-6cfc9d7664a7` | 1 | filed:6415 |
+| `types.py::InFlightMergeRegistry._release_if_current` | `fk-785f153e6313` | 1 | refuted (equivalent) |
+
+| Task | Cluster | Survivors | Depends on |
+|---|---|---|---|
+| 6411 | git-history probes and the post-advance finalize path (`_commit_is_linear`, `_finalize_advanced_merge` et al.) | 60 | 6374 |
+| 6412 | rename-aware plan-files and drop-guard family | 53 | 6374 |
+| 6413 | post-merge equivalence and auto-chain | 26 | 6374 |
+| 6414 | type-check gates' call shape (no seam today: likely an interface finding) | 25 | 6374 |
+| 6415 | `InFlightMergeRegistry`, `MergeBounceRegistry` | 10 | 6374 |
+| 6416 | advance-failure mapping (`_map_advance_failure`) | 40 | 6374, 5293, 5046 |
+| 6419 | rebased-tree reverify, overlap and disjoint-skip | 14 | 6374, 5293 |
+
+Each task's details carry every survivor's one-line diff, and they cover 228 of
+the 239 survivors. The other 11 have no new task:
+- 8 are in `TerminalOutcomeRetention` (`filed:4833`). The class is never
+  constructed in production, and task 4833 deletes it.
+- 3 are in the two anchors refuted above.
+
+More survivors inside the filed clusters are equivalent and are flagged in their
+tasks, for example `InFlightMergeRegistry.acquire__mutmut_18` and most of
+`_ls_tree_object_type`'s. The tasks record those as equivalent rather than killing
+them.
+
+The clearest gaps:
+- **`_commit_is_linear`.** Every mutation of its git call survives, including
+  replacing the argv with `None` and flipping `rc != 0`. No test depends on its
+  result, so the post-advance linearity fail-safe is effectively unverified.
+- **`_run_unscoped_typechecks`.** Every keyword it passes to `run_verification`
+  (`max_retries`, `is_merge_verify`, `role`) can change unnoticed. So can dropping
+  the `test_command=None` that makes the gate type-only. There is no seam to observe
+  that call: the injected verifier port sits above this function. Task 6414 says so.
+- **`_map_advance_failure`.** It has 40 survivors, mostly in human-facing reason
+  prose. Its task pins behaviour, not wording.
+
+**Cost, for sizing the next run.** `gates.py` code mutants averaged 65.1 s each in
+this run, and survivors 387 s. That is 2.2 times the 29.7 s that the 2026-10-04
+sample suggested, so the mutant phase came to about 3.5 h of summed durations at 8
+workers, against the 1.6 h projected. Size an unsampled run (task 6327) on these
+figures.
+
+## 2026-10-04: first baseline (task 5035)
+
+Superseded for `gates.py` by the section above, and kept as provenance. Its "For
+Open question 4" recommendation was adopted on 2026-10-05.
+
+Its mutant names use the UNFENCED numbering. Under the committed
+`do_not_mutate_patterns` many `gates.py` functions renumber, and some names below no
+longer exist (for example `_commit_is_linear__mutmut_27`). To inspect them, regenerate
+with `do_not_mutate_patterns` removed. `types.py` numbering is unchanged.
+
 **Task:** 5035, `plans/merge-lane-quality-prd.md` task ε (Phase 1, measurement).
 Scope ruled by Leo on esc-5035-3 (2026-10-04, option D). The run was hand-carried
 from an interactive session rather than dispatched.
@@ -11,7 +162,7 @@ becomes a ratchet measure, and at what granularity, is PRD Open question 4.
 **Follow-up:** task 6327 measures the modules that κ, μ and ο (5040, 5042, 5045)
 extract from `merge_lane/worker.py`.
 
-## Results
+### Results
 
 | Module | Mutants | Measured | Killed | Survived | Timeout | No tests | Score | Code-only score |
 |---|---|---|---|---|---|---|---|---|
@@ -71,7 +222,7 @@ How to read it:
   keep them and ratchet on a number that partly measures whether error paths are
   reached at all.
 
-## What survived (behavioural survivors)
+### What survived (behavioural survivors)
 
 These are the 41 survivors outside logger calls and unreachable arms: 22 in
 `gates.py` and 19 in `types.py`. At least five are equivalent mutants, meaning no
@@ -148,7 +299,7 @@ orchestrator.merge_lane.<module>.<mangled name>`. Methods mangle as
 
 </details>
 
-## Why `merge_lane/worker.py` is INCOMPLETE
+### Why `merge_lane/worker.py` is INCOMPLETE
 
 mutmut 3 does not patch the file once per mutant. It writes **a complete copy of
 the enclosing function for every mutant**, plus a trampoline that picks the copy at
@@ -203,7 +354,7 @@ complexity 40 or less. ο caps the residual `worker.py` at 1,500 lines.
 Fencing logger calls (see Open question 4 above) shrinks every module further.
 Task 6327 measures the split modules.
 
-## Method
+### Method
 
 **Configuration** is `[tool.mutmut]` in `orchestrator/pyproject.toml`, committed
 with this report. mutmut is pinned `>=3.7,<3.8` in the orchestrator dev group,
@@ -263,7 +414,14 @@ def pytest_unconfigure(config):
     worker = os.environ.get('PYTEST_XDIST_WORKER', 'main')
     with open(os.path.join(os.environ['LANE_HIT_DIR'], f'{worker}.json'), 'w') as fh:
         json.dump({k: sorted(v) for k, v in _hits.items()}, fh)
+    _mon.set_events(_TOOL, 0)
+    _mon.free_tool_id(_TOOL)
 ```
+
+The last two lines of the plugin were added after both runs. They stop a harmless
+shutdown `TypeError`, raised when the monitoring callback fires after module globals
+are cleared. Both runs used the plugin without them, and their hits had already
+been written.
 
 **Sample.** `types.py` was measured in full (191 mutants). For `gates.py`, the full
 population of 2,496 mutant names came from mutmut's own generator

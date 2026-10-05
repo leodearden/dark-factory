@@ -52,19 +52,19 @@ Safety properties:
 - Only ever calls EscalationQueue methods (get_pending, get, submit, resolve);
   never enumerates, moves, or deletes raw files directly.
 - Blocking escalations (infra_issue, recon_failure, etc.) are never touched.
-- The queue directory must ALREADY EXIST; ``run()`` refuses otherwise.  See the
-  section below.
+- The queue directory must ALREADY EXIST and hold at least one entry;
+  ``run()`` refuses otherwise.  See the section below.
 
 WHY THIS SCRIPT PREFLIGHTS ITS TARGET (a decision, task 4319)
 -------------------------------------------------------------
 :func:`run` refuses, before the scan, unless ``--queue-dir`` names a directory
-that ALREADY exists.  The default is the RELATIVE
+that ALREADY exists and holds at least one entry.  The default is the RELATIVE
 ``./data/reconciliation/escalations``, so a run from anywhere but the project
 root -- a task worktree in particular -- manufactures an empty queue and reports
 ``"pending_before": 0``, a false all-clear that ``main()`` below would hand back
 as exit 0.
 
-See ``fused_memory/utils/target_store_preflight.py::assert_queue_dir_exists``
+See ``fused_memory/utils/target_store_preflight.py::assert_queue_dir_populated``
 for the mechanism, the probe-vs-existence argument, the prior art and the
 placement rules -- that module is the single normative copy, and this note
 deliberately does not restate it.
@@ -106,7 +106,7 @@ from escalation.dedupe import DedupeConfig, compute_content_fingerprint
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
 
-from fused_memory.utils.target_store_preflight import assert_queue_dir_exists
+from fused_memory.utils.target_store_preflight import assert_queue_dir_populated
 
 logger = logging.getLogger(__name__)
 
@@ -336,11 +336,11 @@ def run(
     Returns a report dict.  When ``apply`` is False (dry-run, the default),
     no writes are performed.
 
-    Refuses with ``TargetStoreMissing`` when *queue_dir* does not exist — see
+    Refuses with ``TargetStoreMissing`` when *queue_dir* is missing or empty — see
     the module docstring.  The check lives here rather than in ``main()`` so
     programmatic callers inherit it too.
     """
-    assert_queue_dir_exists(queue_dir, operation='backfill_recon_escalations')
+    assert_queue_dir_populated(queue_dir, operation='backfill_recon_escalations')
 
     queue = EscalationQueue(Path(queue_dir))
     pending = queue.get_pending()
