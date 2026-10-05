@@ -345,6 +345,30 @@ def _selected_member(pre_anchor_tokens: list[str]) -> str | None:
     return None
 
 
+def _verify_would_inject_workers(test_command: str, injected_workers: str) -> bool:
+    """Whether verify would append ``-n <injected_workers>`` to any pytest it runs for *test_command*.
+
+    Asks the production code rather than copying it, at the width verify itself
+    works at. Verify hands ``verify_cmd.apply_pytest_numprocesses`` either the
+    WHOLE ``test_command`` or, on a path that segments the test leg, each clause
+    ``verify_cmd.split_and_chain_segments`` yields — which refuses every single
+    command, so the two coincide for every module config committed today. Both
+    candidates are tried, so neither verify path can inject where this says it
+    would not: for ``A && B -p no:xdist`` the whole chain is refused while its
+    clause ``A`` is not.
+
+    The transform's identity no-op contract is then the single home of every
+    rule for when it refuses (``''``/``'auto'``, ``-p no:xdist``, a non-pytest
+    tool, an unspliceable chain), so none of them is restated here.
+    """
+    chain = verify_cmd.split_and_chain_segments(test_command) or []
+    for candidate in [test_command, *(segment.command for segment in chain)]:
+        parsed = verify_cmd.parse_config_command(candidate)
+        if verify_cmd.apply_pytest_numprocesses(parsed, injected_workers) is not parsed:
+            return True
+    return False
+
+
 def _pytest_legs_carrying_workers(
     module_configs: dict[str, ModuleConfig],
     injected_workers: str,
@@ -365,12 +389,9 @@ def _pytest_legs_carrying_workers(
       * the SELECTED member's own addopts (how the ``--directory <m>`` legs get
         it);
       * verify's own injection of ``-n <injected_workers>`` (task 5486), which
-        reaches even a member whose addopts are serial. Whether it applies is
-        decided by CALLING the production transform,
-        ``verify_cmd.apply_pytest_numprocesses``, on the same segment — its
-        identity no-op contract is the single home of every rule for when it
-        refuses (``''``/``'auto'``, ``-p no:xdist``, a non-pytest tool), so
-        none of them is restated here.
+        reaches even a member whose addopts are serial — decided by
+        ``_verify_would_inject_workers``, which calls the production code
+        rather than restating it.
 
     Read no more strongly than it holds: the addopts consulted is the selected
     member's, which for a ``--directory <m>`` command is also the rootdir
@@ -403,8 +424,7 @@ def _pytest_legs_carrying_workers(
             sources.append(f'{prefix}/orchestrator.yaml::test_command argv')
         if WORKERS_FLAG in shlex.split(_declared_addopts(member)):
             sources.append(f'{member}/pyproject.toml addopts')
-        parsed = verify_cmd.parse_config_command(segment)
-        if verify_cmd.apply_pytest_numprocesses(parsed, injected_workers) is not parsed:
+        if _verify_would_inject_workers(command, injected_workers):
             sources.append(
                 f'verify_admission_pytest_n={injected_workers!r}, which verify '
                 f'appends as {WORKERS_FLAG} at the roles '
@@ -490,31 +510,37 @@ def test_every_pytest_leg_running_workers_declares_the_plugin(
 
 
 @pytest.mark.parametrize(
-    ('injected_workers', 'extra_flags', 'expect_counted'),
+    ('injected_workers', 'tail', 'expect_counted'),
     [
         pytest.param('8', '', True, id='numeral-injects'),
         pytest.param('auto', '', False, id='auto-is-a-no-op'),
         pytest.param('8', ' -p no:xdist', False, id='forced-serial-refuses'),
+        pytest.param(
+            '8', ' && uv run pytest scripts/ -p no:xdist', True,
+            id='segmented-clause-injects-past-a-serial-sibling',
+        ),
     ],
 )
 def test_the_injected_worker_count_is_counted_exactly_when_verify_would_inject(
-    injected_workers: str, extra_flags: str, expect_counted: bool
+    injected_workers: str, tail: str, expect_counted: bool
 ) -> None:
     """THE CONTROL that keeps the third ``-n`` source from silently narrowing back.
 
     The probe leg selects a RULED serial member, whose addopts
     ``test_ruled_serial_members_stay_serial`` pins free of ``-n``, and its own
     argv carries none either — so the injection is the ONLY way it can count.
-    The positive case proves the helper sees the injection at all; the two
-    negative cases prove it defers to the production transform's refusals
+    The first positive case proves the helper sees the injection at all; the
+    two negative cases prove it defers to the production transform's refusals
     rather than counting every knob value, the same shape as this file's
-    pyright ``--stats`` negative control.
+    pyright ``--stats`` negative control. The chain case proves it also asks at
+    verify's SEGMENTED width: the transform refuses that whole chain, yet
+    verify, segmenting it, appends ``-n`` to the probe's own clause.
     """
     member = sorted(RULED_SERIAL_MEMBERS)[0]
     probe = {
         'probe': ModuleConfig(
             prefix='probe',
-            test_command=f'uv run --directory {member} pytest tests/{extra_flags}',
+            test_command=f'uv run --directory {member} pytest tests/{tail}',
         ),
     }
 
