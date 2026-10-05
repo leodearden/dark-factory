@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 import suite_census_pinning as pinning
-from merge_lane_metrics import private_reads_in_tree
+from source_measures import private_reads_in_tree
 from suite_census_fixtures import git_tree
 
 MOD = '''\

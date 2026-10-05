@@ -1,4 +1,4 @@
-"""The two public seams the suite census reuses from the ratchet: patch calls and tracked files."""
+"""The two public seams the suite census reuses from scripts/source_measures.py: patch calls and tracked files."""
 from __future__ import annotations
 
 import ast
@@ -6,7 +6,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from merge_lane_metrics import (
+from source_measures import (
     MetricsError,
     PatchCall,
     patch_calls_in_tree,
@@ -93,21 +93,25 @@ def test_order_follows_the_walk_and_duplicates_are_kept():
     ]
 
 
-def test_lane_patch_targets_are_unchanged_over_mixed_patches():
+def test_patch_targets_pair_each_leaf_with_its_module_over_mixed_patches():
     tree = ast.parse(
         textwrap.dedent(
             """
-            import orchestrator.merge_queue as mq
-            from orchestrator import merge_lane
+            import pkg.mod as m
+            from pkg import lane
 
-            patch('orchestrator.merge_queue._run')
-            patch.object(mq, '_x')
-            monkeypatch.setattr(merge_lane, '_y', 1)
-            patch('orchestrator.verify._run_cmd')
+            patch('pkg.mod._run')
+            patch.object(m, '_x')
+            monkeypatch.setattr(lane, '_y', 1)
+            patch('pkg.other._run_cmd')
             """
         )
     )
-    assert patch_targets_in_tree(tree) == {'_run', '_x', '_y'}
+    assert patch_targets_in_tree(tree, ('pkg.mod', 'pkg.lane')) == {
+        ('pkg.mod', '_run'),
+        ('pkg.mod', '_x'),
+        ('pkg.lane', '_y'),
+    }
 
 
 class TestTrackedFiles:

@@ -1053,13 +1053,14 @@ class TestAConflictedMergeBaselineIsBoundedByBothParents:
         assert 'absent from both parents' in result.stdout
 
 
-#: The four real files a miniature repo needs before its hooks mean anything.
+#: The five real files a miniature repo needs before its hooks mean anything.
 #: Copied VERBATIM rather than restated: if someone renames the auditor or drops
 #: the project-checks section, the copied hook stops refusing and these go red.
 _WIRED_FILES = (
     'hooks/pre-commit',
     'hooks/project-checks',
     'scripts/merge_lane_metrics.py',
+    'scripts/source_measures.py',
     'scripts/check_staged_ratchet_raise.py',
 )
 

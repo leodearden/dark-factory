@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
-from merge_lane_metrics import (
+from source_measures import (
     MetricsError,
     PatchCall,
     file_size_measures_in_tree,
