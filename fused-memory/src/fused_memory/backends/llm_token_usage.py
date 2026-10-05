@@ -20,7 +20,7 @@ from graphiti_core.llm_client.token_tracker import TokenUsageTracker
 
 @dataclass(frozen=True)
 class LlmTokenUsage:
-    """Exact LLM spend of one measured window. ``llm_calls`` counts records."""
+    """The LLM usage recorded inside one measured window. ``llm_calls`` counts records."""
 
     input_tokens: int
     output_tokens: int

@@ -668,7 +668,7 @@ async def test_graphiti_write_persists_its_llm_tokens_and_duration(
 
 
 @pytest.mark.asyncio
-async def test_failed_graphiti_write_still_persists_the_tokens_it_burned(
+async def test_failed_graphiti_write_still_persists_the_tokens_it_recorded(
     service, write_journal, llm_tracked_client
 ):
     async def _add_episode(**_kwargs):

@@ -157,7 +157,7 @@ async def test_measured_window_without_llm_calls_is_a_real_zero():
 
 
 @pytest.mark.asyncio
-async def test_raising_body_propagates_and_still_freezes_the_tokens_it_burned():
+async def test_raising_body_propagates_and_still_freezes_the_tokens_it_recorded():
     client = _attributing_client()
 
     with pytest.raises(RuntimeError, match='extraction failed'):

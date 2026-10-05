@@ -1,10 +1,13 @@
 """SQLite-backed write journal for durable auditing of all memory writes.
 
-``OPERATOR_TELEMETRY_QUERY`` is the read-only per-write telemetry query, and
-OPERATIONS.md §11 carries the operator copy. In it, a NULL
-``backend_ops.duration_ms`` means the row predates the column; a value is the
-measured backend-call time, excluding identity-lock and queue wait. Its token
-columns are populated only on graphiti LLM-bearing writes.
+``OPERATOR_TELEMETRY_QUERY`` is the read-only per-write telemetry query, which
+operators run through ``fused-memory/scripts/telemetry_query.py`` (OPERATIONS.md
+§11). In it, a NULL ``backend_ops.duration_ms`` means the row predates the
+column; a value is the measured backend-call time, excluding identity-lock and
+queue wait. Its token columns are populated only on graphiti LLM-bearing
+writes. They are attributed to their write exactly, but they count what the
+upstream LLM client records, so tokens from failed or retried attempts are not
+included.
 """
 
 from __future__ import annotations

@@ -1775,44 +1775,25 @@ escalations worth triaging before you resume, not just resuming blind.
 ### Per-write telemetry (duration + tokens)
 
 Every Layer-2 `backend_ops` row in the fused-memory write journal records how
-long its backend call took, and every graphiti write that ran the LLM
-extraction pipeline also records its exact token spend. To read both per write:
+long its backend call took. Every graphiti write that ran the LLM extraction
+pipeline also records the tokens its LLM client recorded for it. To read both
+per write:
 
 ```bash
-sqlite3 -readonly /home/leo/src/dark-factory/data/reconciliation/write_journal.db <<'SQL'
-.headers on
-.mode column
-.parameter set ?1 "'2026-10-04T00:00:00+00:00'"
-.parameter set ?2 50
-SELECT
-    bo.created_at AS created_at,
-    wo.operation AS operation,
-    wo.project_id AS project_id,
-    bo.backend AS backend,
-    bo.success AS success,
-    bo.duration_ms AS duration_ms,
-    CASE WHEN json_valid(bo.result_summary)
-        THEN json_extract(bo.result_summary, '$.tokens.input_tokens') END AS input_tokens,
-    CASE WHEN json_valid(bo.result_summary)
-        THEN json_extract(bo.result_summary, '$.tokens.output_tokens') END AS output_tokens,
-    CASE WHEN json_valid(bo.result_summary)
-        THEN json_extract(bo.result_summary, '$.tokens.total_tokens') END AS total_tokens,
-    CASE WHEN json_valid(bo.result_summary)
-        THEN json_extract(bo.result_summary, '$.tokens.llm_calls') END AS llm_calls
-FROM backend_ops AS bo
-LEFT JOIN write_ops AS wo ON wo.id = bo.write_op_id
-WHERE bo.created_at >= ?
-ORDER BY bo.created_at DESC
-LIMIT ?;
-SQL
+uv run --frozen --project fused-memory python \
+    fused-memory/scripts/telemetry_query.py --since 2026-10-04T00:00:00Z --limit 50
 ```
 
-`?1` is the lower `created_at` bound, an ISO-8601 UTC timestamp (the journal's
-own format), and `?2` is the row limit. Rows come back most recent first. The
-query is read-only and range-seeks `idx_bo_created`, so it is safe to run
-against the serving instance's live journal; `server/main.py` opens that file
-under `config.reconciliation.data_dir`, which is `./data/reconciliation`
-relative to the unit's repo-root working directory.
+It prints one JSON object per row, most recent first. `--since` is the lower
+`created_at` bound, any ISO-8601 timestamp (a naive one is UTC), and defaults to
+24 hours ago. `--limit` defaults to 50. The script runs
+`fused-memory/src/fused_memory/services/write_journal.py::OPERATOR_TELEMETRY_QUERY`,
+the only copy of the SQL, over a read-only connection. The query range-seeks
+`idx_bo_created`, so it is safe against the serving instance's live journal.
+That journal is the script's default `--journal`:
+`/home/leo/src/dark-factory/data/reconciliation/write_journal.db`. A journal
+that no serving instance has opened since this column shipped has not been
+migrated yet, and the script reports `no such column: bo.duration_ms`.
 
 How to read the columns:
 
@@ -1823,20 +1804,18 @@ How to read the columns:
 - **`input_tokens` / `output_tokens` / `total_tokens` / `llm_calls`**: populated
   only on graphiti writes that ran the LLM extraction pipeline (`add_episode`
   and `add_memory_graphiti`). They are NULL everywhere else, including on every
-  historical row. The counts are exact per write: they are attributed by asyncio
+  historical row. Attribution is exact: each write is credited by asyncio
   context, so concurrent writes sharing the one LLM client do not bleed into
-  each other. `llm_calls` follows upstream graphiti's own retry accounting. On
-  the OpenAI-shaped arms (the shipped `openai` default and both
-  `openai_generic` modes) that is one per successful LLM call, carrying that
-  attempt's tokens; other providers follow their upstream client's accounting.
+  each other. What gets credited is what upstream graphiti's client records,
+  which is not every token spent. On the OpenAI-shaped arms (the shipped
+  `openai` default and both `openai_generic` modes), a call records only its
+  successful attempt, as one `llm_calls`. An attempt that failed validation and
+  was re-prompted is not counted, and a call that exhausted its retries records
+  nothing. So on a retried or failed write these columns under-count the real
+  spend. Other providers follow their own upstream client's accounting.
 - **`operation`** comes from `write_ops`, joined through `write_op_id`, so
   `add_episode` and `add_memory_graphiti` stay distinct.
   `backend_ops.operation` reads `add_episode` for both.
-
-This copy quotes
-`fused-memory/src/fused_memory/services/write_journal.py::OPERATOR_TELEMETRY_QUERY`,
-which `fused-memory/tests/test_write_journal.py` executes. If the two ever
-disagree, the constant wins.
 
 ---
 
