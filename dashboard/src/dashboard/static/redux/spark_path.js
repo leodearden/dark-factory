@@ -557,10 +557,16 @@ function barFractions(values, max) {
 // full column's topmost drawn top IS its total — and is stated anyway, at zero
 // cost, so "a partial sum is not a total" stays legible in the code.
 //
+// THE OPTIONAL `snapMax` maps that folded maximum to the axis maximum BEFORE
+// any band is scaled, and defaults to the identity. StackedAreaChart passes
+// niceCountMax for count axes (task 5121). It has to live here rather than at
+// the call site because the polygons are scaled inside this function: a snap
+// applied to the returned `max` would move the ticks but not the bands.
+//
 // On hole-free input this reproduces the pre-fix polygons character-for-
 // character (the scrub never fires, and clause (b) introduces no new maximum);
 // spark_path.test.mjs pins that by exact string equality.
-function stackedAreaPaths(stacks, geom) {
+function stackedAreaPaths(stacks, geom, snapMax = (foldedMax) => foldedMax) {
   const layers = (stacks || []).map(st => (st && st.values) || []);
   const count = geom.count;
   const stepX = geom.width / Math.max(count - 1, 1);
@@ -596,7 +602,7 @@ function stackedAreaPaths(stacks, geom) {
     if (plottable) axisCandidates.push(running);
   }
 
-  const max = plottableMax(axisCandidates, 1);
+  const max = snapMax(plottableMax(axisCandidates, 1));
   const valueGeom = { y0: geom.y0, height: geom.height, min: 0, range: max };
 
   const paths = layers.map((_, li) => {
