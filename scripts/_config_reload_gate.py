@@ -92,9 +92,18 @@ def fetch_reload_report(
             f"  remedy: sync this checkout so {scripts_dir.parent / '.venv'} exists, or re-run\n"
             f"  this script under `uv run --project shared`",
         ) from exc
+    import httpx
+
     url = f"http://127.0.0.1:{port}/mcp"
     try:
         report = census_trigger.post_mcp_tool_call(url, "reload_config", {}, timeout=timeout)
+    except httpx.ReadTimeout as exc:
+        raise ReloadNotConfirmed(
+            ReloadFailure.REPLY_TIMED_OUT,
+            f"no reply from reload_config at {url} within {timeout}s: the request was sent, so "
+            f"the tool may have run and applied the change, and the live config is unknown "
+            f"(committed as {committed_as}; re-run to converge, or the value lands at the next restart)",
+        ) from exc
     except Exception as exc:
         # Broad on purpose: census_trigger raises StatusFetchUnavailable for a
         # malformed or error envelope, RuntimeError for a failed handshake, and
