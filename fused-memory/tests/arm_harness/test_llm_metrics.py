@@ -3,17 +3,6 @@
 from datetime import UTC, datetime
 
 import pytest
-from fused_memory.arm_harness.llm_metrics import (
-    GRAPH_SAMENESS_DETAILS_FILENAME,
-    TokenAccountingError,
-    episode_failure_rate_metric,
-    graph_sameness_details,
-    graph_sameness_metric,
-    latency_metric,
-    llm_axis_records,
-    tokens_per_episode_metric,
-    usd_per_episode_metric,
-)
 from shared.memory_eval_metrics import canonical_json_text
 
 from arm_harness._fakes import (
@@ -25,6 +14,17 @@ from arm_harness._fakes import (
     llm_spec,
 )
 from fused_memory.arm_harness.conformance import ConformanceCounts
+from fused_memory.arm_harness.llm_metrics import (
+    GRAPH_SAMENESS_DETAILS_FILENAME,
+    TokenAccountingError,
+    episode_failure_rate_metric,
+    graph_sameness_details,
+    graph_sameness_metric,
+    latency_metric,
+    llm_axis_records,
+    tokens_per_episode_metric,
+    usd_per_episode_metric,
+)
 from fused_memory.arm_harness.metrics_record import LlmMetricId, MetricsRecord
 from fused_memory.arm_harness.replay import ArmAbort, ArmRunResult, EpisodeOutcome
 from fused_memory.arm_harness.retrieval import RETRIEVAL_UTILITY_K
@@ -424,7 +424,7 @@ def test_the_composer_surfaces_a_token_accounting_failure():
 def test_an_embedding_spec_is_refused():
     with pytest.raises(TypeError, match='embedding'):
         llm_axis_records(
-            embedding_spec(),  # type: ignore[arg-type]
+            embedding_spec(),
             _complete_result(),
             CONFORMANCE,
             reference=None,
