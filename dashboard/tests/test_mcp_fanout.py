@@ -22,6 +22,7 @@ import types
 import httpx
 import pytest
 from _dashboard_helpers import drain, never_resolving_refresh, wedge_one_bypass
+from shared.testing_virtual_clock import virtual_clock_test
 
 from dashboard.data.mcp_fanout import TTLCache, first_success
 
@@ -2166,8 +2167,10 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
     assert the TOTAL, over many bound-windows.
 
     Every method monkeypatches ``_LOCK_ACQUIRE_TIMEOUT_SECONDS`` to a small
-    value and uses the REAL clock. They deliberately create tasks that
-    never complete, so teardown cancels everything outstanding.
+    value. The cap-decline test runs on the virtual loop clock and drives
+    callers by count; the others still use the REAL clock. They
+    deliberately create tasks that never complete, so teardown cancels
+    everything outstanding.
     """
 
     BOUND_SECONDS = 0.02
@@ -2181,6 +2184,18 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
             t.cancel()
         if live:
             await asyncio.gather(*live, return_exceptions=True)
+
+    @classmethod
+    async def _drive_callers(cls, cache, key, refresh, *, count):
+        """Start *count* callers of *key*, one every half bound-window of LOOP time.
+
+        The count, not a host clock, fixes how many arrive.
+        """
+        waiters = []
+        for _ in range(count):
+            waiters.append(asyncio.create_task(cache.get_or_refresh(key, refresh)))
+            await asyncio.sleep(cls.CALLER_INTERVAL_SECONDS)
+        return waiters
 
     async def test_total_live_refreshes_stay_under_the_cap_across_many_windows(
         self, monkeypatch
@@ -2301,6 +2316,7 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
             wedged_lock.release()
             await self._cancel_all(*waiters, *cache._live_bypasses.get('wedged', []))
 
+    @virtual_clock_test
     async def test_declining_to_re_arm_at_the_cap_is_logged(self, monkeypatch, caplog):
         """A silent cap would hide the next occurrence.
 
@@ -2309,6 +2325,9 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
         the cap is a distinct, operator-relevant state -- the key is now
         deliberately NOT getting fresh attempts -- so it gets its own
         worded record, throttled through the same per-key streak counter.
+
+        The first refresh stalls the host for ``HOST_STALL_SECONDS``, so a
+        caller driver bounded by wall-clock time fails here on every run.
         """
         import dashboard.data.mcp_fanout as fanout_mod
 
@@ -2333,12 +2352,7 @@ class TestTTLCacheBoundsLiveBypassesPerKey:
         waiters = []
         try:
             with caplog.at_level(logging.DEBUG, logger='dashboard.data.mcp_fanout'):
-                start = time.monotonic()
-                while time.monotonic() - start < 0.30:
-                    waiters.append(
-                        asyncio.create_task(cache.get_or_refresh('k', _refresh))
-                    )
-                    await asyncio.sleep(0.01)
+                waiters = await self._drive_callers(cache, 'k', _refresh, count=30)
 
             assert calls['n'] == 3, (
                 'precondition: the key must reach the live-bypass cap (3 '
