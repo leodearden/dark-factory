@@ -163,6 +163,32 @@ class TestLoadQueueEscalations:
         assert loaded['worktree'] == '/home/leo/src/proj/.worktrees/3'
         assert loaded['extra_field'] == 'should-survive'
 
+    def test_non_escalation_json_resident_is_not_read(self, tmp_path):
+        """A well-formed non-``esc-*`` JSON file in the queue root is not an escalation.
+
+        The queue directory has a second writer:
+        ``orchestrator/src/orchestrator/b3_gate.py::STATE_REL_PATH`` keeps
+        ``b3-state.json`` there.  Read as an escalation it becomes a row with
+        no ``id``.  It is a permanent resident, not a read failure, so it is
+        not reported in *skipped* either.
+        """
+        from dashboard.data.escalations import load_queue_escalations
+
+        esc_dir = tmp_path / 'escalations'
+        esc_dir.mkdir()
+        good = _esc('esc-good-1', task_id='1', level=1, status='pending')
+        _write_esc(esc_dir, 'esc-good-1.json', good)
+        _write_esc(esc_dir, 'b3-state.json', {
+            'launches': [],
+            'charges': [{'task_id': '1615', 'charged_at': '2026-09-20T00:00:00+00:00'}],
+        })
+
+        skipped: list = []
+        result = load_queue_escalations(esc_dir, skipped=skipped)
+
+        assert result == [good]
+        assert skipped == []
+
     # -- the opt-in ``skipped`` out-parameter -------------------------------
     #
     # Skipping an unparseable file is correct — one corrupt escalation must not
