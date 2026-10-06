@@ -2632,3 +2632,12 @@ class TestCancelOutcomesAreNotCounted:
             {'path': 'one-pass', 'count': 1, 'pct': 50.0},
             {'path': 'blocked', 'count': 1, 'pct': 50.0},
         ]
+
+    @pytest.mark.asyncio
+    async def test_escalation_rates_count_no_cancel(self, cancels_conn, empty_escalations_dir):
+        rates = (await get_escalation_rates(
+            cancels_conn, empty_escalations_dir, days=CARDS_DAYS, now=CARDS_NOW,
+        ))['proj']
+        assert rates['total_tasks'] == 2
+        assert rates['steward_count'] == 0
+        assert rates['steward_rate'] == 0.0
