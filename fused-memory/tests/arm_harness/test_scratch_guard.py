@@ -73,6 +73,7 @@ def test_checkpoints_are_a_closed_enum():
         'ARM_SPEC',
         'REPLAY',
         'INDEX_BUILD',
+        'INDEX_PROBE',
         'TOPOLOGY_READ',
         'TEARDOWN_GRAPH',
         'TEARDOWN_COLLECTION',

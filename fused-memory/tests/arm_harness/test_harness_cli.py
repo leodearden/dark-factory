@@ -30,7 +30,7 @@ from arm_harness._fakes import (
     run_manifest_for,
 )
 from fused_memory.arm_harness.arm_spec import LlmArmSpec
-from fused_memory.arm_harness.checks import PROBE_CYPHER
+from fused_memory.arm_harness.checks import CLEANUP_CYPHER, PROBE_CYPHER
 from fused_memory.arm_harness.conformance import ConformanceLedger
 from fused_memory.arm_harness.corpus import corpus_sha
 from fused_memory.arm_harness.instrument_checks import InstrumentCheckId
@@ -611,6 +611,34 @@ def test_index_check_probes_only_the_arms_scratch_graph(
 
     assert code == getattr(harness, expected_code)
     assert {graph for _, graph in live.falkor.calls} == {spec.scratch_group_id}
+
+
+class _CleanupFailingGraph(FakeScratchGraph):
+    async def query(self, q: str, params: dict[str, Any] | None = None) -> Any:
+        if q == CLEANUP_CYPHER:
+            raise ConnectionError('connection dropped')
+        return await super().query(q, params)
+
+
+class _CleanupFailingFalkor(FakeFalkor):
+    def select_graph(self, graph_id: str) -> FakeScratchGraph:
+        self.calls.append(('select_graph', graph_id))
+        return _CleanupFailingGraph(graph_id, self)
+
+
+def test_index_check_whose_probe_node_survives_exits_1_naming_it(harness, live, tmp_path, capsys):
+    spec = llm_spec()
+    live.falkor = _CleanupFailingFalkor()
+
+    code = harness.main(
+        ['index-check', '--arm-spec', str(_spec_file(tmp_path, spec)), '--expect', 'embedding-only'],
+        deps=live.factory(harness),
+    )
+
+    assert code == harness.EXIT_RUN_FAILED
+    err = capsys.readouterr().err
+    assert 'ProbeCleanupError' in err
+    assert spec.scratch_group_id in err
 
 
 # --- integrity ------------------------------------------------------------------------

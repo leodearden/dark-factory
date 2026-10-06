@@ -124,6 +124,18 @@ PROBE_CYPHER = "CALL db.idx.fulltext.queryNodes('Entity', $token) YIELD node RET
 CLEANUP_CYPHER = 'MATCH (n:Entity {uuid: $uuid}) DELETE n'
 
 
+class ProbeCleanupError(RuntimeError):
+    """The index probe's seeded node could not be removed, so the scratch graph still holds it."""
+
+    def __init__(self, graph_name: str, node_uuid: str) -> None:
+        self.graph_name = graph_name
+        self.node_uuid = node_uuid
+        super().__init__(
+            f'the index probe left Entity {node_uuid!r} in {graph_name!r}: its cleanup failed, '
+            'so topology reads and retrieval on that graph will see it until it is deleted'
+        )
+
+
 class ProbeGraph(Protocol):
     """The slice of a falkordb ``AsyncGraph`` the index probe uses."""
 
@@ -147,23 +159,35 @@ async def check_index_configuration(
 ) -> CheckResult:
     """Whether the scratch graph's fulltext index exists in fact, as ``expected`` claims.
 
-    The probe seeds one uniquely-named Entity (an ``evalmem_``-only write) and removes it.
+    The probe seeds one uniquely-named Entity (an ``evalmem_``-only write) and removes it;
+    a failed removal raises ``ProbeCleanupError`` naming the node left behind.
     """
-    require_scratch_name(graph_name, checkpoint=GuardCheckpoint.INDEX_BUILD)
+    require_scratch_name(graph_name, checkpoint=GuardCheckpoint.INDEX_PROBE)
     token = f'evalmemprobe{uuid.uuid4().hex}'
     node_uuid = str(uuid.uuid4())
     await graph.query(SEED_CYPHER, {'uuid': node_uuid, 'name': token})
     try:
         answer = await _probe_fulltext(graph, token, sleep)
     finally:
-        await graph.query(CLEANUP_CYPHER, {'uuid': node_uuid})
+        await _remove_probe_node(graph, graph_name, node_uuid)
     return _index_verdict(graph_name, expected, answer)
+
+
+async def _remove_probe_node(graph: ProbeGraph, graph_name: str, node_uuid: str) -> None:
+    try:
+        await graph.query(CLEANUP_CYPHER, {'uuid': node_uuid})
+    except Exception as error:
+        raise ProbeCleanupError(graph_name, node_uuid) from error
 
 
 async def _probe_fulltext(
     graph: ProbeGraph, token: str, sleep: Callable[[float], Awaitable[object]]
 ) -> _ProbeAnswer:
-    """Polls until a row arrives; a server-side query error (no such index) ends the poll."""
+    """Polls until a row arrives. A server-side ``ResponseError`` ends the poll.
+
+    FalkorDB answers a fulltext query on an unindexed label with 0 rows, not an error
+    (measured on graph module 4.18.0), so an error says nothing about the index.
+    """
     rows = 0
     for attempt in range(INDEX_PROBE_ATTEMPTS):
         if attempt:
@@ -182,8 +206,13 @@ def _index_verdict(
     graph_name: str, expected: IndexConfiguration, answer: _ProbeAnswer
 ) -> CheckResult:
     check_id = InstrumentCheckId.INDEX_CONFIGURATION
-    seen = f'query error: {answer.error}' if answer.error else f'{answer.rows} row(s)'
-    observed = f'fulltext probe on {graph_name!r} gave {seen}'
+    if answer.error is not None:
+        detail = (
+            f'fulltext probe on {graph_name!r} raised {type(answer.error).__name__}: '
+            f'{answer.error}; a failed probe cannot confirm {expected.value}'
+        )
+        return check_failed(check_id, detail, (graph_name,))
+    observed = f'fulltext probe on {graph_name!r} gave {answer.rows} row(s)'
     found = answer.rows > 0
     if expected is IndexConfiguration.WITH_INDICES and not found:
         detail = f'{observed}; the with-indices configuration does not differ in fact'

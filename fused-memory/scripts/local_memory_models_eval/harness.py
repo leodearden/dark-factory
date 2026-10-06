@@ -39,6 +39,7 @@ from shared.memory_eval_metrics import run_stamp
 from fused_memory.arm_harness.arm_backend import IndexBuildError, open_arm_backend
 from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec, load_arm_spec
 from fused_memory.arm_harness.checks import (
+    ProbeCleanupError,
     check_index_configuration,
     control_variance_check,
     smoke_endpoint,
@@ -379,7 +380,7 @@ def _cmd_index_check(args: argparse.Namespace, deps: DepsFactory) -> int:
 
 async def _index_check(live: HarnessDeps, scratch: str, expect: IndexConfiguration) -> CheckResult:
     async with live.open_falkordb() as client:
-        graph = _scratch_graph(client, scratch, GuardCheckpoint.INDEX_BUILD)
+        graph = _scratch_graph(client, scratch, GuardCheckpoint.INDEX_PROBE)
         return await check_index_configuration(graph, scratch, expect)
 
 
@@ -538,7 +539,7 @@ def main(argv: list[str] | None = None, *, deps: DepsFactory = build_live_deps) 
         return _report(EXIT_REFUSED, _named(error))
     except (CorpusIntegrityError, build_corpus.CorpusBuildError) as error:
         return _report(EXIT_CORPUS_INTEGRITY, _named(error))
-    except (IndexBuildError, RedisError) as error:
+    except (IndexBuildError, ProbeCleanupError, RedisError) as error:
         return _report(EXIT_RUN_FAILED, _named(error))
 
 

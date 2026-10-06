@@ -17,8 +17,10 @@ from arm_harness._fakes import (
     run_manifest_for,
 )
 from fused_memory.arm_harness.checks import (
+    CLEANUP_CYPHER,
     INDEX_PROBE_ATTEMPTS,
     INDEX_PROBE_INTERVAL_S,
+    ProbeCleanupError,
     check_index_configuration,
     control_variance_check,
     smoke_endpoint,
@@ -148,15 +150,21 @@ class FakeProbeGraph:
     """An AsyncGraph double: writes recorded, each fulltext probe answered from a script.
 
     Each scripted answer is a row count, or an exception instance to raise.
+    ``cleanup_error``, when given, is raised by the probe node's DELETE.
     """
 
-    def __init__(self, probe_answers: list[int | Exception]) -> None:
+    def __init__(
+        self, probe_answers: list[int | Exception], *, cleanup_error: Exception | None = None
+    ) -> None:
         self._answers = list(probe_answers)
+        self._cleanup_error = cleanup_error
         self.writes: list[tuple[str, dict | None]] = []
         self.probes: list[tuple[str, dict | None]] = []
 
     async def query(self, cypher: str, params: dict | None = None) -> Any:
         self.writes.append((cypher, params))
+        if self._cleanup_error is not None and cypher == CLEANUP_CYPHER:
+            raise self._cleanup_error
         return SimpleNamespace(result_set=[])
 
     async def ro_query(self, cypher: str, params: dict | None = None) -> Any:
@@ -186,7 +194,7 @@ async def test_index_check_refuses_a_protected_graph_before_any_query():
     with pytest.raises(ScratchGuardError) as caught:
         await _check(graph, IndexConfiguration.WITH_INDICES, name='dark_factory')
 
-    assert caught.value.checkpoint is GuardCheckpoint.INDEX_BUILD
+    assert caught.value.checkpoint is GuardCheckpoint.INDEX_PROBE
     assert graph.writes == [] and graph.probes == []
 
 
@@ -242,15 +250,27 @@ async def test_with_indices_fails_when_no_row_ever_arrives_within_the_bound():
     assert sum(sleep.calls) <= 5.0
 
 
-@pytest.mark.asyncio
-async def test_with_indices_fails_on_a_query_error():
-    graph = FakeProbeGraph([ResponseError('no such index')])
+SERVER_ERRORS = {
+    'procedure-renamed': 'Procedure `db.idx.fulltext.queryNodes` is not registered',
+    'signature-changed': 'Procedure `db.idx.fulltext.queryNodes` requires 2 arguments, got 1',
+    'acl-denied': "NOPERM User default has no permissions to run the 'graph.ro_query' command",
+}
+"""The first two are the messages FalkorDB 4.18.0 gave when measured; none is about an index."""
 
-    result = await _check(graph, IndexConfiguration.WITH_INDICES)
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('expected', list(IndexConfiguration))
+@pytest.mark.parametrize('message', sorted(SERVER_ERRORS.values()), ids=sorted(SERVER_ERRORS))
+async def test_a_server_error_fails_the_check_whatever_it_expects(expected, message):
+    graph = FakeProbeGraph([ResponseError(message)])
+
+    result = await _check(graph, expected)
 
     assert result.passed is False
-    assert 'does not differ in fact' in result.detail
-    assert 'no such index' in result.detail
+    assert message in result.detail
+    assert 'ResponseError' in result.detail
+    assert result.offenders == (SCRATCH,)
+    assert len(graph.probes) == 1
 
 
 @pytest.mark.asyncio
@@ -261,16 +281,6 @@ async def test_embedding_only_passes_when_no_row_arrives():
 
     assert result.passed is True, result.detail
     assert len(graph.probes) == INDEX_PROBE_ATTEMPTS
-
-
-@pytest.mark.asyncio
-async def test_embedding_only_passes_on_a_missing_index_error():
-    graph = FakeProbeGraph([ResponseError('no such index')])
-
-    result = await _check(graph, IndexConfiguration.EMBEDDING_ONLY)
-
-    assert result.passed is True, result.detail
-    assert len(graph.probes) == 1
 
 
 @pytest.mark.asyncio
@@ -289,6 +299,22 @@ async def test_a_connection_error_is_not_mistaken_for_a_missing_index():
 
     with pytest.raises(ConnectionError):
         await _check(graph, IndexConfiguration.EMBEDDING_ONLY)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('rows', [0, 1], ids=['would-pass', 'would-fail'])
+async def test_a_failed_cleanup_raises_naming_the_node_left_in_the_graph(rows):
+    graph = FakeProbeGraph([rows], cleanup_error=ConnectionError('connection dropped'))
+
+    with pytest.raises(ProbeCleanupError) as caught:
+        await _check(graph, IndexConfiguration.EMBEDDING_ONLY)
+
+    (_, seed_params), _ = graph.writes
+    assert seed_params is not None
+    assert caught.value.node_uuid == seed_params['uuid']
+    assert caught.value.graph_name == SCRATCH
+    assert seed_params['uuid'] in str(caught.value)
+    assert isinstance(caught.value.__cause__, ConnectionError)
 
 
 # --- boundary row 4: control variance ------------------------------------------------

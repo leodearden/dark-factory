@@ -252,7 +252,7 @@ population.
 | Code | Meaning |
 |---|---|
 | 0 | ok |
-| 1 | the run could not complete (store unreachable, index build failed, or a traceback) |
+| 1 | the run could not complete (store unreachable, index build failed, the index probe could not remove its seeded node — the error names it — or a traceback) |
 | 2 | refused: invalid spec or input, a pre-run instrument check failed, a run dir is not fresh or not complete |
 | 3 | an instrument check failed (post-run, smoke, index-check, integrity, control-check) |
 | 4 | INV-4 abort: consecutive episode failures stopped the run |

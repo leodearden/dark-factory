@@ -21,6 +21,7 @@ class GuardCheckpoint(StrEnum):
     ARM_SPEC = 'arm-spec'
     REPLAY = 'replay'
     INDEX_BUILD = 'index-build'
+    INDEX_PROBE = 'index-probe'
     TOPOLOGY_READ = 'topology-read'
     TEARDOWN_GRAPH = 'teardown-graph'
     TEARDOWN_COLLECTION = 'teardown-collection'
