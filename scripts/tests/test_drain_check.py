@@ -130,6 +130,46 @@ def test_default_fleet_dir_matches_orchestrator_fleet_heartbeat():
     assert drain_check.DEFAULT_FLEET_DIR == fleet_heartbeat.DEFAULT_FLEET_DIR
 
 
+def test_classify_reads_the_orchestrators_own_drain_heartbeat():
+    """DRIFT GUARD (task 5371): classify mirrors a payload it cannot import, so
+    every drain verdict is pinned here against heartbeats built by the
+    producer's own builders rather than against hand-written dicts."""
+    from orchestrator.fleet_drain import DrainRefusal, DrainRequest, DrainVerdict
+    from orchestrator.fleet_heartbeat import build_heartbeat_payload
+    from orchestrator.merge_lane.types import VerifyInFlight, VerifyInFlightKind
+
+    now = 1_791_240_100.0
+    requested_ts = 1_791_240_000
+    request = DrainRequest(
+        unit='u', invocation_id='0' * 32, sweep_pid=1, requested_ts=requested_ts,
+    )
+    honoured = DrainVerdict(
+        requested_ts=requested_ts, refused=None, request=request,
+    ).heartbeat_block(admission_halted=True)
+    refused = DrainVerdict(
+        requested_ts=requested_ts, refused=DrainRefusal.INVOCATION_MISMATCH, request=request,
+    ).heartbeat_block(admission_halted=False)
+
+    def heartbeat(drain, verifies):
+        return build_heartbeat_payload(
+            unit='u', merge_idle=False, depth=3, queue_empty=False, ts_epoch=now,
+            drain=drain, verifies_in_flight=verifies,
+        )
+
+    def verify(deadline_ts):
+        return VerifyInFlight(
+            task_id='6015', host='laptop', kind=VerifyInFlightKind.TRAIN,
+            started_ts=now - 60, deadline_ts=deadline_ts,
+        ).to_wire()
+
+    assert classify(heartbeat(honoured, []), now, 120, requested_ts) == 'idle'
+    assert classify(heartbeat(honoured, [verify(now + 600)]), now, 120, requested_ts) == 'verifying'
+    assert classify(heartbeat(honoured, [verify(now - 1)]), now, 120, requested_ts) == 'overdue'
+    assert classify(heartbeat(refused, []), now, 120, requested_ts) == 'refused'
+    assert classify(heartbeat(None, []), now, 120, requested_ts) == 'busy'
+    assert classify(heartbeat(honoured, []), now, 120) == 'busy'
+
+
 # ---------------------------------------------------------------------------
 # step-5: CLI (argparse) tests -- drive via subprocess.run
 #

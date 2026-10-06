@@ -2258,6 +2258,48 @@ def test_stage_a_writes_every_units_request_before_the_first_restart(tmp_path):
     assert not list(fleet_dir.glob("*.drain.json")), "the sweep must leave no request behind"
 
 
+def test_the_orchestrator_honours_the_request_this_script_writes(tmp_path):
+    """Cross-tier pin: the writer here and orchestrator.fleet_drain's reader
+    cannot import each other, so this is where a drift between them goes red.
+    The request the sweep wrote must read as well-formed, at the path the
+    reader derives, and be honoured by the incarnation it names."""
+    from orchestrator.fleet_drain import (
+        DrainIdentity,
+        DrainRequest,
+        drain_request_path,
+        evaluate_drain_request,
+        read_drain_request,
+    )
+
+    fleet_dir = tmp_path / "fleet"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R],
+        units={UNIT_R: {"scenario": "fresh", "InvocationID": _INVOCATION_R}},
+    )
+    _install_fixed_epoch(bin_dir, _REQUESTED_TS)
+    _write_heartbeat(fleet_dir, UNIT_R, **_HB_IDLE)
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir, "--drain", env={"RESTART_VERIFY_TIMEOUT": "5"},
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    [(_, held)] = _drain_observations(_load_state(state_path))
+    [(name, body)] = held.items()
+    assert name == drain_request_path(fleet_dir, UNIT_R).name
+    copy = tmp_path / name
+    copy.write_text(json.dumps(body), encoding="utf-8")
+    read = read_drain_request(copy)
+    assert isinstance(read, DrainRequest), read
+    verdict = evaluate_drain_request(
+        read,
+        DrainIdentity(unit=UNIT_R, invocation_id=_INVOCATION_R, max_age_secs=14400.0),
+        now=_REQUESTED_TS + 1,
+        pid_alive=lambda pid: True,
+    )
+    assert verdict is not None and verdict.honoured, verdict
+
+
 def test_an_empty_invocation_id_still_writes_a_request(tmp_path):
     """The unit then refuses it (invocation_mismatch) and falls back to the
     merge-idle gate, visibly -- rather than the sweep silently skipping it."""
