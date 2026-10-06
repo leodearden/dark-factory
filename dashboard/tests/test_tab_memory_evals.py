@@ -386,7 +386,7 @@ def _return_label_exprs(badge_body: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-# The seven top-level keys of ``redux_api.shape_memory_evals``'s return body.
+# The eight top-level keys of ``redux_api.shape_memory_evals``'s return body.
 # This list IS the payload contract (that fn's own docstring says so, per PRD
 # open question 4); the React section consumes exactly these spellings.
 _MEMORY_EVALS_CONTRACT_KEYS = (
@@ -397,6 +397,7 @@ _MEMORY_EVALS_CONTRACT_KEYS = (
     'issues',
     'issue_count',
     'unmatched_escalations',
+    'escalation_queue',
 )
 
 
@@ -441,7 +442,7 @@ def test_data_js_registers_memory_evals_endpoint(data_js_body: str) -> None:
         'reads undefined and crashes the Memory tab.'
     )
 
-    # (d) exactly the seven contract keys — no more, no fewer
+    # (d) exactly the eight contract keys — no more, no fewer
     for key in _MEMORY_EVALS_CONTRACT_KEYS:
         assert re.search(rf'\b{key}\s*:', seed_block), (
             f"data.js MEMORY_EVALS seed is missing the '{key}' key required by "
@@ -462,6 +463,10 @@ def test_data_js_registers_memory_evals_endpoint(data_js_body: str) -> None:
     )
     assert re.search(r'\bgenerated_at\s*:\s*null\b', seed_block), (
         'data.js MEMORY_EVALS seed must default generated_at to `null`.'
+    )
+    assert re.search(r'\bescalation_queue\s*:\s*null\b', seed_block), (
+        'data.js MEMORY_EVALS seed must default escalation_queue to `null` — the '
+        "server's default body names no queue, so a pre-fetch link renders disabled."
     )
     assert re.search(r'\bstorm_escape\s*:\s*null\b', seed_block), (
         'data.js MEMORY_EVALS seed must default storm_escape to `null` — a '
