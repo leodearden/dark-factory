@@ -7,10 +7,15 @@ redirected through trickle_state's one supported lever.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
+from cli_subprocess_timeout import cli_timeout_from_env
 from legibility import session_ledger, trickle_state
 from legibility.session_ledger import (
     CodedBy,
@@ -316,3 +321,90 @@ def test_prune_compares_instants_not_local_clock_text(tmp_path):
     )
     assert snapshot.pruned == 1
     assert snapshot.sessions == frozenset({'after'})
+
+
+# ---------------------------------------------------------------------------
+# `stats` CLI — run as a subprocess so stdout is exactly what an operator sees
+# ---------------------------------------------------------------------------
+
+_SCRIPT = Path(__file__).resolve().parents[1] / 'legibility' / 'session_ledger.py'
+_CLI_TIMEOUT_SECS = cli_timeout_from_env('SESSION_LEDGER_CLI_TIMEOUT_SECS')
+
+
+def _stats(state_root, *args):
+    env = {**os.environ, trickle_state.STATE_ROOT_ENV: str(state_root)}
+    return subprocess.run(
+        [sys.executable, str(_SCRIPT), 'stats', *args],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=_CLI_TIMEOUT_SECS,
+        check=False,
+    )
+
+
+def test_stats_without_a_ledger_says_no_producer_has_written(tmp_path):
+    path = session_ledger.ledger_path('p')
+    result = _stats(tmp_path / 'state', '--project-id', 'p')
+    assert result.returncode == session_ledger.EXIT_NO_LEDGER
+    assert 'no ledger yet - no producer has written' in result.stdout
+    assert str(path) in result.stdout
+    assert not path.exists()
+
+
+def test_stats_on_an_empty_ledger_reports_zero_rows(tmp_path):
+    session_ledger.open_for_census(session_ledger.ledger_path('p'), prune_before=_NOW)
+    result = _stats(tmp_path / 'state', '--project-id', 'p')
+    assert result.returncode == session_ledger.EXIT_OK
+    assert 'rows: 0' in result.stdout.splitlines()
+    assert 'no ledger yet' not in result.stdout
+
+
+def test_stats_breaks_rows_down_by_producer_and_outcome(tmp_path):
+    path = session_ledger.ledger_path('p')
+    session_ledger.record_codings(path, [
+        _row('t1', coded_at=datetime(2026, 9, 20, 8, 0, tzinfo=UTC), outcome=Outcome.MATCHED),
+        _row('t2', outcome=Outcome.CANDIDATE),
+        _row('c1', coded_by=CodedBy.CENSUS, coded_at=datetime(2026, 10, 4, 9, 30, tzinfo=UTC)),
+    ])
+
+    result = _stats(tmp_path / 'state', '--project-id', 'p')
+
+    assert result.returncode == session_ledger.EXIT_OK
+    lines = result.stdout.splitlines()
+    assert str(path) in result.stdout
+    for expected in (
+        'rows: 3',
+        'trickle: 2',
+        'census: 1',
+        'matched: 1',
+        'candidate: 1',
+        'empty: 1',
+        'oldest coded_at: 2026-09-20T08:00:00+00:00',
+        f'newest coded_at: {_NOW.isoformat()}',
+    ):
+        assert expected in lines, (expected, lines)
+
+
+def test_stats_on_a_corrupt_ledger_reports_it_unreadable(tmp_path):
+    path = session_ledger.ledger_path('p')
+    path.parent.mkdir(parents=True)
+    path.write_bytes(_GARBAGE)
+
+    result = _stats(tmp_path / 'state', '--project-id', 'p')
+
+    assert result.returncode == session_ledger.EXIT_UNREADABLE
+    assert len({
+        session_ledger.EXIT_OK,
+        session_ledger.EXIT_UNREADABLE,
+        session_ledger.EXIT_NO_LEDGER,
+    }) == 3
+    assert 'unreadable' in result.stdout
+    assert str(path) in result.stdout
+    assert 'not a database' in result.stdout
+    assert path.read_bytes() == _GARBAGE
+
+
+def test_stats_requires_a_project_id(tmp_path):
+    result = _stats(tmp_path / 'state')
+    assert result.returncode == 2
