@@ -132,35 +132,16 @@ def resolve_config_path(
 def select_scored_records(
     cfg: LegibilityConfig, projects_root: Path | str, target_date: date,
 ) -> list[sampling.ScoredRecord]:
-    """Enumerate *target_date*'s sessions for *cfg* and assemble a
-    :class:`~legibility.sampling.ScoredRecord` per session.
-
-    Reuses ``inventory.enumerate_sessions`` plus sampling's own private
-    one-pass helpers (``_score_and_find_first_turn`` /
-    ``_first_user_turn_text``) -- the EXACT loop ``sampling.main`` uses --
-    rather than duplicating the score+first-turn pass or adding a new public
-    function to the already-landed β module.
-    """
+    """Enumerate *target_date*'s sessions for *cfg* and score each one with
+    :func:`legibility.sampling.score_session`, the loop ``sampling.main``
+    uses too."""
     sessions = inventory.enumerate_sessions(
         projects_root, cfg.cwd_prefixes, target_date,
         agent_transcript_roots=inventory.resolve_agent_transcript_roots(
             cfg.project_root, cfg.agent_transcript_roots
         ),
     )
-
-    scored: list[sampling.ScoredRecord] = []
-    for session in sessions:
-        counts, first_turn = sampling._score_and_find_first_turn(session.path)
-        stratum = sampling.classify_agent_class(first_turn, session.path)
-        scored.append(
-            sampling.ScoredRecord(
-                session=session,
-                stratum=stratum,
-                counts=counts,
-                first_turn_text=sampling._first_user_turn_text(first_turn),
-            )
-        )
-    return scored
+    return [sampling.score_session(session) for session in sessions]
 
 
 DEFAULT_MAX_DIGEST_BYTES = sampling.DEFAULT_DIGEST_MAX_BYTES

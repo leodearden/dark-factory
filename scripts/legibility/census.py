@@ -3060,16 +3060,15 @@ def default_batch_source(cfg, *, projects_root, now: datetime,
     # tree ONCE (O(total_files), not O(window_days × files)).
     window = _census_window_dates(cfg.project_root, now=now)
     start_date, end_date = window[0], window[-1]
-    scored = []
-    for session in inventory.enumerate_sessions_in_range(
-        projects_root, cfg.cwd_prefixes, start_date, end_date,
-        agent_transcript_roots=inventory.resolve_agent_transcript_roots(
-            cfg.project_root, cfg.agent_transcript_roots
-        ),
-    ):
-        counts, first_turn = sampling._score_and_find_first_turn(session.path)
-        stratum = sampling.classify_agent_class(first_turn, session.path)
-        scored.append(sampling.ScoredRecord(session=session, stratum=stratum, counts=counts))
+    scored = [
+        sampling.score_session(session)
+        for session in inventory.enumerate_sessions_in_range(
+            projects_root, cfg.cwd_prefixes, start_date, end_date,
+            agent_transcript_roots=inventory.resolve_agent_transcript_roots(
+                cfg.project_root, cfg.agent_transcript_roots
+            ),
+        )
+    ]
 
     by_stratum: dict[str, list] = {}
     for record in scored:
