@@ -959,62 +959,45 @@ def mark_entry_filed(cb: dict, entry_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# advance_census_state — §7.5 census-state.json sole writer (zeta/2579
-# MUST-persist contract: last_census_done_count is ALWAYS present)
+# advance_census_state — census-state.json's sole writer
 # ---------------------------------------------------------------------------
 
 def advance_census_state(
-    path, *, now_iso: str, report_path: str, done_count: int | None,
+    path,
+    *,
+    census_at: str,
+    run_id: str,
+    report_path: str,
+    as_of_sha: str,
+    session_watermark: str | None,
+    done_count: int | None,
 ) -> None:
-    """Write the §7.5 census-state dict to *path*, atomically.
+    """Write census-state.json to *path*, atomically, as exactly
+    ``{last_census_at, last_census_run_id, last_census_report,
+    last_census_as_of_sha, session_watermark, last_census_done_count}`` in
+    that order (``plans/census-incremental-prd.md`` §4.2). *census_at* is
+    the run's ``YYYY-MM-DD``, *report_path* is repo-relative, and
+    *session_watermark* is the exclusive end of the mined window (``None``
+    when the run had no window).
 
-    Always writes exactly ``{"last_census_at": now_iso,
-    "last_census_report": report_path, "last_census_done_count":
-    done_count}`` -- ``last_census_done_count`` is NEVER conditionally
-    omitted, even when ``done_count == 0`` (falsy but a real baseline).
-    zeta's ``census_trigger.compute_tasks_landed()`` returns ``None`` --
-    and its condition (b) permanently fails safe -- whenever that key is
-    absent (census_trigger.py:410-416), and this module is
-    census-state.json's SOLE writer, so this is the one place that
-    baseline can ever be supplied.
+    Every key is always written. ``done_count`` is three-valued: a positive
+    int or ``0`` is a real observed baseline (``0`` is never dropped as
+    falsy), and ``None`` -- serialised as ``null`` -- means the count could
+    not be observed. ``census_trigger.compute_tasks_landed`` treats ``null``
+    like an absent key, so its condition (b) fails safe; never pass a
+    fabricated ``0`` or a carried-forward value for an unknown (task 3291;
+    ``census_trigger``'s module docstring has the measurements).
 
-    ``done_count`` is THREE-VALUED (task 3291):
-
-    * a positive int -- a real observed done-count;
-    * ``0`` -- also a real observed done-count, for a project with no done
-      tasks. Unchanged, and still never dropped as falsy;
-    * ``None`` -- the done-count could not be OBSERVED at census time
-      (get_statuses unreachable, or it answered with something that was not
-      a ``{"statuses": mapping}`` envelope). Serialised as JSON ``null``,
-      so the key is still always present and the MUST-persist contract
-      above holds literally. ``compute_tasks_landed`` treats ``null``
-      exactly like an absent key, so condition (b) fails SAFE until the
-      next successful census, with condition (a) (``max_interval_days``)
-      remaining the unconditional backstop.
-
-    Writing a fabricated ``0`` for an unobservable count, or carrying
-    forward the previous file's value, are both FORBIDDEN here. A fabricated
-    0 was written on 2026-07-24 and on 2026-07-31 (task 3291), and it is
-    unsound rather than merely untidy: it turns the delta into
-    ``current_done - 0`` -- every done task ever, ~2872 against a 120
-    threshold. That stayed latent only while the get_statuses fetch was ALSO
-    broken (the same defect zeroed ``current_done``, so the measured pre-fix
-    delta was ``0 - 0``); repairing the fetch alone would have detonated it.
-    See ``census_trigger``'s module docstring for the replayed measurements.
-    A carried-forward stale count is merely a quieter guess, silently
-    under-reporting the next window's delta. ``null`` is the only honest
-    value for an unknown, and it is the caller's job to pass it rather than
-    invent a number.
-
-    Uses the same ``tempfile.mkstemp`` + ``os.replace`` atomic-write
-    pattern as ``codebook.dump`` (temp file in the same directory as
-    *path*, then an atomic rename): a crash or kill mid-write can never
-    leave a partial state file for the next ``load_census_state`` to trip
-    over, and a pre-existing state file is fully replaced, never merged.
+    ``tempfile.mkstemp`` in *path*'s directory plus ``os.replace``: a crash
+    mid-write never leaves a partial file, and an existing one is fully
+    replaced, never merged.
     """
     state = {
-        "last_census_at": now_iso,
+        "last_census_at": census_at,
+        "last_census_run_id": run_id,
         "last_census_report": report_path,
+        "last_census_as_of_sha": as_of_sha,
+        "session_watermark": session_watermark,
         "last_census_done_count": done_count,
     }
     directory = os.path.dirname(os.fspath(path)) or "."
@@ -1970,6 +1953,17 @@ def _free_payloads_path(path: Path, *, limit: int = 1000) -> Path:
     )
 
 
+def _repo_relative(path, project_root) -> str:
+    """*path* relative to *project_root*, both resolved; ``ValueError``
+    naming both when *path* lies outside it."""
+    try:
+        return Path(path).resolve().relative_to(Path(project_root).resolve()).as_posix()
+    except ValueError:
+        raise ValueError(
+            f"report_path {path} is not under project_root {project_root}"
+        ) from None
+
+
 def _ensure_output_parents(*paths) -> None:
     """Create the parent directory of every non-``None`` output path."""
     for path in paths:
@@ -2248,6 +2242,9 @@ def run_census(
     census_state_path,
     report_path,
     date: str,
+    run_id: str,
+    as_of_sha: str,
+    since: str | None,
     force: bool = False,
     max_batches: int | None = None,
     max_verify_clusters: int | None = None,
@@ -2428,6 +2425,7 @@ def run_census(
             "-- a negative cap would slice novel_clusters[:N] from the END rather "
             "than bounding it; omit it entirely to verify every novel cluster"
         )
+    report_relpath = _repo_relative(report_path, project_root)
 
     # Real probe accounting for the report's cost note. A legibility tool
     # that under-reports its own spend -- in the very artifact an operator
@@ -2927,7 +2925,13 @@ def run_census(
     # re-run -- see this function's docstring for why that is safe.
     codebook.dump(updated_codebook, codebook_path)
     advance_census_state(
-        census_state_path, now_iso=date, report_path=str(report_path), done_count=done_count,
+        census_state_path,
+        census_at=date,
+        run_id=run_id,
+        report_path=report_relpath,
+        as_of_sha=as_of_sha,
+        session_watermark=None,
+        done_count=done_count,
     )
 
     landed = CensusOutcome(
@@ -3881,6 +3885,9 @@ def main(argv: list[str] | None = None) -> int:
                 census_state_path=census_state_path,
                 report_path=report_path,
                 date=date_str,
+                run_id=f"census-{cfg.project_id}-{date_str.replace('-', '')}",
+                as_of_sha="",
+                since=prior.as_of_sha,
                 force=args.force,
                 max_batches=args.max_batches,
                 max_verify_clusters=args.max_verify_clusters,
