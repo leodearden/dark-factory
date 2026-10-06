@@ -776,6 +776,15 @@ class TestUsageGateProbeRequiresServedResult:
             (
                 {
                     'type': 'result',
+                    'subtype': 'error_max_budget_usd',
+                    'total_cost_usd': 0,
+                    'api_error_status': 403,
+                },
+                False,
+            ),
+            (
+                {
+                    'type': 'result',
                     'subtype': 'success',
                     'is_error': False,
                     'api_error_status': 529,
@@ -784,7 +793,11 @@ class TestUsageGateProbeRequiresServedResult:
                 False,
             ),
         ],
-        ids=['local-budget-cap-is-served', 'api-error-status-alone-is-not-served'],
+        ids=[
+            'local-budget-cap-is-served',
+            'budget-cap-with-api-error-status-is-not-served',
+            'api-error-status-alone-is-not-served',
+        ],
     )
     async def test_exit_0_verdict_on_edge_results(
         self,
@@ -2600,7 +2613,7 @@ class TestAuthRecoveryViaTransition:
         proc = MagicMock()
         proc.returncode = 1
         proc.pid = 12345
-        proc.communicate = AsyncMock(return_value=(b'', cap_stderr))
+        proc.communicate = AsyncMock(return_value=(b'{"subtype":"error_max_budget_usd"}', cap_stderr))
 
         with patch('shared.usage_gate.asyncio.create_subprocess_exec', return_value=proc):
             ok = await gate._run_probe(acct)

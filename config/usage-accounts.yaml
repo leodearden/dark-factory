@@ -9,10 +9,11 @@
 # and must be robust to cap/429 events (ruling 2026-08-30, task 4741).
 
 # max-b and max-h are switched off on the Anthropic side by Leo's deliberate
-# choice (ruling 2026-10-06, task 5944). They stay listed, last, so switching
-# them back on there is the whole restore: a long-running gate re-probes an
-# auth-failed account (usage_cap.auth_reprobe_secs) and re-admits it once a
-# probe is served, and the nightly legibility trickle starts each run afresh.
+# choice (ruling 2026-10-06, task 5944). They stay listed, at the end of the
+# order, so switching them back on there is the whole restore: a long-running
+# gate re-probes an auth-failed account (usage_cap.auth_reprobe_secs) and
+# re-admits it once a probe is served, and the nightly legibility trickle
+# starts each run afresh.
 # Do not comment them out. max-c was off too on 2026-09-29 and was measured
 # served again on 2026-09-30.
 accounts:

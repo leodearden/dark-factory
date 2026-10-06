@@ -190,7 +190,7 @@ def _load_probe_result(stdout_bytes: bytes) -> dict[str, object] | None:
         return None
     try:
         obj = json.loads(stdout_bytes.decode(errors='replace'))
-    except (json.JSONDecodeError, ValueError):
+    except ValueError:
         return None
     return obj if isinstance(obj, dict) else None
 
@@ -2760,7 +2760,11 @@ class UsageGate:
         # creation on a fresh session easily pushes total_cost past $0.01, so
         # this is a routine outcome, not a cap hit.
         probe_result = _load_probe_result(stdout_bytes)
-        if _probe_hit_local_budget_cap(probe_result):
+        result_fields = probe_result or {}
+        if (
+            _probe_hit_local_budget_cap(probe_result)
+            and result_fields.get('api_error_status') is None
+        ):
             logger.info(
                 f'Account {acct.name}: probe hit local $0.01 budget '
                 f'cap (API accepted request) — treating as success',
@@ -2769,7 +2773,6 @@ class UsageGate:
         if _probe_succeeded(proc.returncode, probe_result):
             logger.info(f'Account {acct.name}: probe succeeded')
             return True
-        result_fields = probe_result or {}
         logger.warning(
             'Account %s: probe did not succeed — exit %s, subtype=%r, '
             'api_error_status=%s: %s — account stays blocked',

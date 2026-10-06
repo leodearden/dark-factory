@@ -671,6 +671,32 @@ def _make_mock_proc(
     return proc
 
 
+def _served_stdout(result_text: str = 'ok') -> bytes:
+    """CLI JSON result proving the call WAS served (exit 0 + subtype success).
+
+    With this on stdout the cap-prefix check is the only thing that can make
+    ``_run_probe`` return False, so a test feeding cap text alongside it pins
+    that check rather than the served-result rule.
+    """
+    return json.dumps({
+        'type': 'result',
+        'subtype': 'success',
+        'is_error': False,
+        'result': result_text,
+        'num_turns': 1,
+        'total_cost_usd': 0.002,
+    }).encode()
+
+
+def _budget_cap_stdout() -> bytes:
+    """CLI JSON result of the probe's own $0.01 cap: served, returns True alone."""
+    return json.dumps({
+        'type': 'result',
+        'subtype': 'error_max_budget_usd',
+        'total_cost_usd': 0.053,
+    }).encode()
+
+
 @pytest.mark.asyncio
 class TestRunProbe:
     """Tests for _run_probe — mock asyncio.create_subprocess_exec."""
@@ -704,6 +730,7 @@ class TestRunProbe:
         gate, acct = await self._make_probing_gate()
         proc = _make_mock_proc(
             returncode=0,
+            stdout=_served_stdout(),
             stderr=b"You've hit your usage limit",
         )
 
@@ -717,7 +744,7 @@ class TestRunProbe:
         gate, acct = await self._make_probing_gate()
         proc = _make_mock_proc(
             returncode=0,
-            stdout=b"You're close to your usage limit",
+            stdout=_served_stdout("You're close to your usage limit"),
         )
 
         with patch('asyncio.create_subprocess_exec', return_value=proc):
@@ -731,7 +758,9 @@ class TestRunProbe:
         proc = _make_mock_proc(
             returncode=0,
             stderr=b'Some info',
-            stdout=b"You're close to your usage limit for this billing period",
+            stdout=_served_stdout(
+                "You're close to your usage limit for this billing period",
+            ),
         )
 
         with patch('asyncio.create_subprocess_exec', return_value=proc):
@@ -928,6 +957,7 @@ class TestRunProbe:
         gate, acct = await self._make_probing_gate()
         proc = _make_mock_proc(
             returncode=1,
+            stdout=_budget_cap_stdout(),
             stderr=b"You've hit your usage limit",
         )
 
@@ -937,11 +967,13 @@ class TestRunProbe:
         assert result is False
 
     async def test_all_cap_hit_prefixes_detected(self):
-        """Every prefix in CAP_HIT_PREFIXES triggers False."""
+        """Every prefix in CAP_HIT_PREFIXES triggers False even on a served result."""
         gate, acct = await self._make_probing_gate()
 
         for prefix in CAP_HIT_PREFIXES:
-            proc = _make_mock_proc(returncode=0, stderr=prefix.encode())
+            proc = _make_mock_proc(
+                returncode=0, stdout=_served_stdout(), stderr=prefix.encode(),
+            )
             with patch('asyncio.create_subprocess_exec', return_value=proc):
                 result = await gate._run_probe(acct)
             assert result is False, f'CAP_HIT prefix {prefix!r} not detected'
@@ -951,7 +983,9 @@ class TestRunProbe:
         gate, acct = await self._make_probing_gate()
 
         for prefix in NEAR_CAP_PREFIXES:
-            proc = _make_mock_proc(returncode=0, stdout=prefix.encode())
+            proc = _make_mock_proc(
+                returncode=0, stdout=_served_stdout(prefix),
+            )
             with patch('asyncio.create_subprocess_exec', return_value=proc):
                 result = await gate._run_probe(acct)
             assert result is False, f'NEAR_CAP prefix {prefix!r} not detected'
@@ -961,6 +995,7 @@ class TestRunProbe:
         gate, acct = await self._make_probing_gate()
         proc = _make_mock_proc(
             returncode=0,
+            stdout=_served_stdout(),
             stderr=b"YOU'VE HIT YOUR USAGE LIMIT",
         )
 
@@ -990,7 +1025,9 @@ class TestRunProbe:
         prefix = CAP_HIT_PREFIXES[0]  # e.g. "You've hit your"
         # Deliberately no 'resets', 'usage limit', or 'upgrade your plan' in the string.
         stderr_content = f'{prefix} quota'.encode()
-        proc = _make_mock_proc(returncode=0, stderr=stderr_content)
+        proc = _make_mock_proc(
+            returncode=0, stdout=_served_stdout(), stderr=stderr_content,
+        )
 
         with patch('asyncio.create_subprocess_exec', return_value=proc):
             result = await gate._run_probe(acct)
@@ -2165,7 +2202,9 @@ class TestRunProbeClassifyInvocationConsistency:
         )
         assert isinstance(outcome, (CapHit, NearCap))
 
-        proc = _make_mock_proc(returncode=0, stderr=text.encode())
+        proc = _make_mock_proc(
+            returncode=0, stdout=_served_stdout(), stderr=text.encode(),
+        )
         with patch('asyncio.create_subprocess_exec', return_value=proc):
             result = await gate._run_probe(acct)
         assert result is False
