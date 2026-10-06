@@ -319,3 +319,30 @@ def test_a_ledger_write_failure_after_the_commit_is_reported_not_raised(census, 
         if r.levelno == logging.WARNING and str(census.ledger_path) in r.getMessage()
     ]
     assert len(ledger_warnings) == 1
+
+
+def test_row3_a_second_run_on_one_day_gets_its_own_identity_and_files(census):
+    plans = census.root / "plans"
+    census.session("S-tango")
+    first = mod.allocate_run_identity(
+        project_id="p", day=_NOW.date(), plans_dir=plans, taken_run_ids=frozenset(),
+    )
+    mod.run_census(**census.kwargs(report_path=plans / f"{first.basename}.md", run_id=first.run_id))
+    first_files = [plans / f"{first.basename}{suffix}" for suffix in (".md", ".json")]
+    first_bytes = [path.read_bytes() for path in first_files]
+
+    census.session("S-uniform")
+    second = mod.allocate_run_identity(
+        project_id="p", day=_NOW.date(), plans_dir=plans, taken_run_ids=frozenset({first.run_id}),
+    )
+    mod.run_census(
+        **census.kwargs(report_path=plans / f"{second.basename}.md", run_id=second.run_id),
+    )
+
+    assert second == mod.RunIdentity(
+        run_id=f"{_RUN_ID}-2", basename=f"confusion-census-{_DATE}-2",
+    )
+    assert (plans / f"{second.basename}.md").exists()
+    _, record = _record_of(plans / f"{second.basename}.md")
+    assert record["run_id"] == f"{_RUN_ID}-2"
+    assert [path.read_bytes() for path in first_files] == first_bytes

@@ -20,7 +20,7 @@ import functools
 import json
 import logging
 import subprocess
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 
 import census as mod
@@ -3470,7 +3470,7 @@ def test_main_done_line_names_unresolved_verdicts_only_when_non_zero(
     """The CLI clause appears exactly when it carries information, so a normal
     run's summary line stays BYTE-unchanged -- same gating reasoning as
     render_report's coverage-shortfall clause."""
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
     def _run_main(unresolved):
@@ -4639,6 +4639,25 @@ def _write_legibility_yaml(project_root, *, config_path=None, project_id="dark_f
     return config_path
 
 
+def _commit_all(repo):
+    """Commit everything under *repo*, initialising it as a git repo first
+    if it is not one yet."""
+    if not (repo / ".git").exists():
+        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "config", "user.email", "test@example.com")
+        _git(repo, "config", "user.name", "Test")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "fixture")
+
+
+def _census_project(project_root, **yaml_kwargs):
+    """A project main() can census: its legibility.yaml committed in a real
+    git repo, since main() resolves as_of_sha from the project's HEAD."""
+    config_path = _write_legibility_yaml(project_root, **yaml_kwargs)
+    _commit_all(project_root)
+    return config_path
+
+
 class _SpyRunner:
     """Stands in for the pooled session runner census.main opens: records
     each stage it hands an invoker for, each call, and each close, and
@@ -4704,7 +4723,7 @@ def _make_fake_main_run_census(outcome=None):
 
 
 def test_main_force_bypasses_gate_and_calls_run_census(tmp_path, monkeypatch):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     # proves --force never even reaches the gate
@@ -4720,7 +4739,7 @@ def test_main_force_bypasses_gate_and_calls_run_census(tmp_path, monkeypatch):
 def test_main_without_force_no_fire_noops_with_exit_zero(
     tmp_path, monkeypatch, capsys, opened_runners,
 ):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
@@ -4742,7 +4761,7 @@ def test_main_without_force_no_fire_noops_with_exit_zero(
 def test_main_exits_nonzero_and_names_the_quarantine_when_the_census_did_not_land(
     tmp_path, monkeypatch, capsys,
 ):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     quarantine_dir = tmp_path / "q" / "census-2026-07-14-x"
     fake_run_census = _make_fake_main_run_census(outcome=mod.CensusOutcome(
         status="unlanded",
@@ -4763,7 +4782,7 @@ def test_main_exits_nonzero_and_names_the_quarantine_when_the_census_did_not_lan
 def test_main_done_line_names_a_ledger_write_failure_only_when_there_was_one(
     tmp_path, monkeypatch, capsys, ledger_error,
 ):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     monkeypatch.setattr(mod, "run_census", _make_fake_main_run_census(outcome=mod.CensusOutcome(
         status="done", report_path="plans/confusion-census-2026-01-02.md",
         filed_ticket_ids=["tkt_1234"], stop_reason="exhausted",
@@ -4865,7 +4884,7 @@ def test_main_configures_logging_so_info_lines_reach_the_journal(tmp_path, monke
     # debugging the trickle (or a host whose unit env is sourced) exporting
     # LEGIBILITY_LOG_LEVEL=WARNING would otherwise turn a working fix red.
     monkeypatch.delenv("LEGIBILITY_LOG_LEVEL", raising=False)
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
@@ -4891,7 +4910,7 @@ def test_main_configures_logging_so_info_lines_reach_the_journal(tmp_path, monke
 
 
 def test_main_without_force_fire_decision_runs_pipeline(tmp_path, monkeypatch):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
 
@@ -4910,7 +4929,7 @@ def test_main_without_force_fire_decision_runs_pipeline(tmp_path, monkeypatch):
 def test_main_config_flag_overrides_default_path_and_date_flag_threads_through(tmp_path, monkeypatch):
     # deliberately NOT at the default <project-root>/docs/legibility/legibility.yaml
     # location, so this only passes if --config is actually honored.
-    alt_config = _write_legibility_yaml(tmp_path, config_path=tmp_path / "alt-legibility.yaml")
+    alt_config = _census_project(tmp_path, config_path=tmp_path / "alt-legibility.yaml")
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
@@ -4930,7 +4949,7 @@ def test_main_config_flag_overrides_default_path_and_date_flag_threads_through(t
 
 
 def test_main_cost_control_flags_thread_into_run_census(tmp_path, monkeypatch):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
@@ -5020,7 +5039,7 @@ def test_main_accepts_a_project_root_that_matches_the_config_via_a_relative_spel
     ``--project-root`` is not mistaken for a mixed-project run."""
     project = tmp_path / "project_a"
     project.mkdir()
-    _write_legibility_yaml(project)
+    _census_project(project)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
@@ -5036,7 +5055,7 @@ def test_main_without_cost_control_flags_passes_defaults(tmp_path, monkeypatch):
     # The flagless shape -- an operator run with no flags, or a trickle launch
     # whose census.trickle_caps are null -- must stay behaviorally
     # byte-identical.
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
@@ -5065,7 +5084,7 @@ def test_main_rejects_a_nonpositive_cost_cap_at_the_cli_boundary(
     # A nonsense cap on a flag whose entire purpose is to be an explicit,
     # legible bound must exit non-zero with a message, not degenerate into a
     # half-applied cap. argparse raises SystemExit(2) for a type= rejection.
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     monkeypatch.setattr(mod, "run_census", _poison("run_census"))
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
@@ -5080,7 +5099,7 @@ def test_main_rejects_a_nonpositive_cost_cap_at_the_cli_boundary(
 
 def test_main_accepts_a_cap_of_one(tmp_path, monkeypatch):
     # The boundary itself is valid: 1 is the smallest cap that can be honored.
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
@@ -5096,7 +5115,7 @@ def test_main_accepts_a_cap_of_one(tmp_path, monkeypatch):
 
 
 def test_main_dry_run_summary_line_names_payload_file(tmp_path, monkeypatch, capsys):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     payloads_path = "/p/plans/confusion-census-2026-07-30-payloads.json"
     fake_run_census = _make_fake_main_run_census(
         outcome=mod.CensusOutcome(
@@ -5132,7 +5151,7 @@ def test_main_done_summary_line_counts_filed_tickets_not_tasks(tmp_path, monkeyp
     # The operator reads this line to learn what the run produced. Filing
     # yields tickets, not tasks (census.py::_ticket_id_from_submit_result),
     # so "filed_tasks=N" would overclaim N tasks that may not exist.
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census(
         outcome=mod.CensusOutcome(
             status="done",
@@ -5167,7 +5186,7 @@ def test_main_missing_config_returns_nonzero(tmp_path, monkeypatch):
 
 
 def test_main_returns_nonzero_on_fail_loud_error(tmp_path, monkeypatch):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
 
     def raising_run_census(**kwargs):
         raise RuntimeError("codebook merge produced an invalid codebook")
@@ -5189,7 +5208,7 @@ def test_main_failure_files_escalation(tmp_path, monkeypatch):
     escalate_fn closure (PRD decision 8: degradation never silent) -- a hard
     census failure exits non-zero AND leaves an operator signal, rather than
     dying with only a stderr line (the silent-census incident this fixes)."""
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
 
     def raising_run_census(**kwargs):
         raise RuntimeError("codebook merge produced an invalid codebook")
@@ -5221,7 +5240,7 @@ def test_main_failure_escalation_is_best_effort_when_poster_raises(tmp_path, mon
     """The failure escalation is best-effort: if the escalation POST itself
     raises, the closure swallows it (logging a WARNING) and main() STILL
     returns 1 -- the escalation never masks the authoritative exit code."""
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
 
     def raising_run_census(**kwargs):
         raise RuntimeError("codebook merge produced an invalid codebook")
@@ -5248,8 +5267,159 @@ def test_main_failure_escalation_is_best_effort_when_poster_raises(tmp_path, mon
 # ledger; selection itself is covered in test_census_window.py.
 # ---------------------------------------------------------------------------
 
-def test_main_hands_run_census_a_window_source_over_the_project_ledger(tmp_path, monkeypatch):
+# ---------------------------------------------------------------------------
+# run identity and as_of_sha (PRD census-incremental §4.2)
+# ---------------------------------------------------------------------------
+
+_ID_DAY = date(2026, 10, 6)
+
+
+def _allocate(plans_dir, taken=frozenset(), **kwargs):
+    return mod.allocate_run_identity(
+        project_id="dark_factory", day=_ID_DAY, plans_dir=plans_dir,
+        taken_run_ids=taken, **kwargs,
+    )
+
+
+def test_allocate_run_identity_takes_the_plain_names_when_free(tmp_path):
+    assert _allocate(tmp_path) == mod.RunIdentity(
+        run_id="census-dark_factory-20261006", basename="confusion-census-2026-10-06",
+    )
+
+
+@pytest.mark.parametrize("existing", [".md", ".json"])
+def test_allocate_run_identity_skips_a_basename_whose_report_or_record_exists(
+    tmp_path, existing,
+):
+    (tmp_path / f"confusion-census-2026-10-06{existing}").write_text("x", encoding="utf-8")
+
+    assert _allocate(tmp_path) == mod.RunIdentity(
+        run_id="census-dark_factory-20261006-2", basename="confusion-census-2026-10-06-2",
+    )
+
+
+def test_allocate_run_identity_skips_a_taken_run_id(tmp_path):
+    identity = _allocate(tmp_path, frozenset({"census-dark_factory-20261006"}))
+
+    assert identity.run_id == "census-dark_factory-20261006-2"
+    assert identity.basename == "confusion-census-2026-10-06-2"
+
+
+def test_allocate_run_identity_takes_the_first_free_suffix(tmp_path):
+    (tmp_path / "confusion-census-2026-10-06.md").write_text("x", encoding="utf-8")
+
+    identity = _allocate(tmp_path, frozenset({"census-dark_factory-20261006-2"}))
+
+    assert identity == mod.RunIdentity(
+        run_id="census-dark_factory-20261006-3", basename="confusion-census-2026-10-06-3",
+    )
+
+
+def test_allocate_run_identity_raises_naming_the_directory_when_exhausted(tmp_path):
+    for name in ("confusion-census-2026-10-06", "confusion-census-2026-10-06-2"):
+        (tmp_path / f"{name}.md").write_text("x", encoding="utf-8")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _allocate(tmp_path, limit=2)
+
+    assert str(tmp_path) in str(excinfo.value)
+
+
+def test_resolve_as_of_sha_is_the_project_head(tmp_path):
+    _commit_all(tmp_path)
+
+    assert mod.resolve_as_of_sha(tmp_path) == _git(tmp_path, "rev-parse", "HEAD").decode().strip()
+
+
+def test_resolve_as_of_sha_raises_naming_a_root_that_is_no_repo(tmp_path):
+    with pytest.raises(RuntimeError) as excinfo:
+        mod.resolve_as_of_sha(tmp_path)
+
+    assert str(tmp_path) in str(excinfo.value)
+
+
+def _write_census_state(root, state):
+    path = root / "docs" / "legibility" / "census-state.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+
+def _main_with_fake_census(tmp_path, monkeypatch, *extra_args):
+    fake_run_census = _make_fake_main_run_census()
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
+    exit_code = mod.main([
+        "--project-root", str(tmp_path), "--force", "--date", "2026-10-06", *extra_args,
+    ])
+    assert exit_code == 0
+    [call] = fake_run_census.calls
+    return call
+
+
+def test_main_allocates_the_next_identity_and_threads_sha_and_since(tmp_path, monkeypatch):
     _write_legibility_yaml(tmp_path)
+    plans = tmp_path / "plans"
+    plans.mkdir()
+    (plans / "confusion-census-2026-10-06.md").write_text("earlier\n", encoding="utf-8")
+    _write_census_state(tmp_path, {
+        "last_census_at": "2026-10-06",
+        "last_census_run_id": "census-dark_factory-20261006",
+        "last_census_report": "plans/confusion-census-2026-10-06.md",
+        "last_census_as_of_sha": "b" * 40,
+        "session_watermark": "2026-10-06T00:00:00+00:00",
+        "last_census_done_count": 3,
+    })
+    _commit_all(tmp_path)
+
+    call = _main_with_fake_census(tmp_path, monkeypatch)
+
+    assert call["report_path"] == plans / "confusion-census-2026-10-06-2.md"
+    assert call["run_id"] == "census-dark_factory-20261006-2"
+    assert call["as_of_sha"] == _git(tmp_path, "rev-parse", "HEAD").decode().strip()
+    assert call["since"] == "b" * 40
+
+
+def test_main_passes_no_since_for_a_legacy_state(tmp_path, monkeypatch):
+    _write_legibility_yaml(tmp_path)
+    _write_census_state(tmp_path, {"last_census_at": "2026-10-01"})
+    _commit_all(tmp_path)
+
+    call = _main_with_fake_census(tmp_path, monkeypatch)
+
+    assert call["since"] is None
+    assert call["run_id"] == "census-dark_factory-20261006"
+    assert call["report_path"] == tmp_path / "plans" / "confusion-census-2026-10-06.md"
+
+
+def test_main_names_the_dry_run_payloads_after_the_allocated_basename(tmp_path, monkeypatch):
+    _write_legibility_yaml(tmp_path)
+    (tmp_path / "plans").mkdir()
+    (tmp_path / "plans" / "confusion-census-2026-10-06.json").write_text("{}", encoding="utf-8")
+    _commit_all(tmp_path)
+
+    call = _main_with_fake_census(tmp_path, monkeypatch, "--dry-run-filing")
+
+    assert call["dry_run_payloads_path"] == (
+        tmp_path / "plans" / "confusion-census-2026-10-06-2-payloads.json"
+    )
+
+
+def test_main_fails_loud_before_any_spend_on_a_root_that_is_no_repo(
+    tmp_path, monkeypatch, capsys, opened_runners,
+):
+    _write_legibility_yaml(tmp_path)
+    monkeypatch.setattr(mod, "run_census", _poison("run_census"))
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code == 1
+    err = capsys.readouterr().err
+    assert "as_of_sha" in err
+    assert str(tmp_path) in err
+    assert opened_runners == []
+
+
+def test_main_hands_run_census_a_window_source_over_the_project_ledger(tmp_path, monkeypatch):
+    _census_project(tmp_path)
     last_census = datetime.now(UTC).date() - timedelta(days=3)
     (tmp_path / "docs" / "legibility" / "census-state.json").write_text(
         json.dumps({"last_census_at": last_census.isoformat()}), encoding="utf-8",
@@ -5402,7 +5572,7 @@ def test_main_hard_failure_under_pytest_reaches_no_real_mcp_endpoint(tmp_path, m
 
     The exit contract is asserted alongside: refusing the POST must not
     change `main()`'s authoritative signal (tasks 2951/2952/3644)."""
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
 
     def raising_run_census(**kwargs):
         raise RuntimeError("codebook merge produced an invalid codebook")
@@ -5553,7 +5723,7 @@ def test_main_hands_run_census_one_runners_invokers_for_the_census_stages(
     one 120s invoke to EVERY stage, so every verify and synthesis call died
     at 120s. DEFAULT config (no timeouts block), the shape of a pre-existing
     legibility.yaml."""
-    config_path = _write_legibility_yaml(tmp_path)
+    config_path = _census_project(tmp_path)
     fake_run_census = _make_fake_main_run_census()
     monkeypatch.setattr(mod, "run_census", fake_run_census)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
@@ -5581,7 +5751,7 @@ def test_main_hands_run_census_one_runners_invokers_for_the_census_stages(
 def test_main_closes_its_one_runner_on_the_done_and_the_failed_exit(
     tmp_path, monkeypatch, opened_runners, run_fails,
 ):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     if run_fails:
         def raising_run_census(**kwargs):
             raise RuntimeError("codebook merge produced an invalid codebook")
@@ -7283,7 +7453,7 @@ def test_run_census_clean_run_emits_no_run_summary_line(tmp_path, caplog):
 def test_main_done_line_names_unresolved_verdicts_when_nonzero(
     tmp_path, monkeypatch, capsys,
 ):
-    _write_legibility_yaml(tmp_path)
+    _census_project(tmp_path)
     monkeypatch.setattr(census_trigger, "decide_for_project", _poison("decide_for_project"))
 
     def _run_main(unresolved):
