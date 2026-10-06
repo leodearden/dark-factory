@@ -1601,6 +1601,13 @@ def _arch_task_no_reference() -> dict:
     return task
 
 
+def _architect_prompt_sent() -> str:
+    """What the hermetic architect receives: the stubbed production briefing plus the replay frame."""
+    from orchestrator.evals.replay_frame import build_replay_frame_block
+
+    return 'ARCH PROMPT' + build_replay_frame_block(_arch_task()['pre_task_commit'])
+
+
 async def _run_architect_eval_hermetic(
     cfg,
     *,
@@ -1734,6 +1741,7 @@ async def _run_architect_eval_hermetic(
     """
     from shared.config_models import UsageCapConfig
 
+    from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.evals import runner
     from orchestrator.evals.judge import PlanQualityVerdict
 
@@ -1772,8 +1780,9 @@ async def _run_architect_eval_hermetic(
         assert _kind in _DECLINE_READERS, f'unknown decline kind {_kind!r}'
         getattr(artifacts_instance, _DECLINE_READERS[_kind]).side_effect = _exc
 
-    briefing_instance = MagicMock()
-    briefing_instance.build_architect_prompt = AsyncMock(return_value='ARCH PROMPT')
+    # Stubs the PRODUCTION briefing only; the replay-frame subclass the runner
+    # builds still appends its block for real (task 4844).
+    production_architect_prompt = AsyncMock(return_value='ARCH PROMPT')
 
     mock_judge = AsyncMock(return_value=judge_return, side_effect=judge_side_effect)
     mock_verify = AsyncMock()
@@ -1827,8 +1836,8 @@ async def _run_architect_eval_hermetic(
         p(patch('orchestrator.agents.invoke.invoke_agent', mock_invoke))
         p(patch('orchestrator.artifacts.TaskArtifacts',
                 MagicMock(return_value=artifacts_instance)))
-        p(patch('orchestrator.agents.briefing.BriefingAssembler',
-                MagicMock(return_value=briefing_instance)))
+        p(patch.object(BriefingAssembler, 'build_architect_prompt',
+                       production_architect_prompt))
         p(patch('orchestrator.evals.runner.build_eval_orch_config',
                 MagicMock(
                     return_value=orch_stub,
@@ -2264,6 +2273,54 @@ class TestRunArchitectEval:
             '--worktree', str(Path('/fake/wt')),
             '--meta-root', str(expected_meta_root),
         ]
+
+
+@pytest.mark.asyncio
+class TestArchitectCellCarriesReplayFrame:
+    """The architect is briefed in the replay frame and the cell says so (4844)."""
+
+    def _cfg(self):
+        from orchestrator.evals.configs import EvalConfig
+
+        return EvalConfig(
+            'architect-sonnet-high', 'claude', 'sonnet', 'high', role='architect',
+        )
+
+    async def test_architect_prompt_is_production_briefing_plus_replay_frame(self):
+        _, mocks = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+
+        assert mocks['invoke'].call_args.kwargs['prompt'] == _architect_prompt_sent()
+
+    async def test_cell_is_stamped_with_the_replay_frame(self):
+        from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
+
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(), produced_plan=_well_formed_plan(),
+        )
+
+        assert result.metrics['replay_frame'] == REPLAY_FRAME_ID
+
+    @pytest.mark.parametrize('unmeasurable_cell', [
+        pytest.param(
+            lambda: {'produced_plan': _well_formed_plan(),
+                     'invoke_side_effect': RuntimeError('boom')},
+            id='harness-error',
+        ),
+        pytest.param(
+            lambda: {'produced_plan': {}, 'arch_result': _cap_agent_result()},
+            id='cap-tainted',
+        ),
+    ])
+    async def test_stamp_survives_unmeasurable_cells(self, unmeasurable_cell):
+        from orchestrator.evals.replay_frame import REPLAY_FRAME_ID
+
+        result, _ = await _run_architect_eval_hermetic(
+            self._cfg(), **unmeasurable_cell(),
+        )
+
+        assert result.metrics['replay_frame'] == REPLAY_FRAME_ID
 
 
 # ---------------------------------------------------------------------------
@@ -4300,7 +4357,7 @@ class TestArchitectEvalCapFailover:
         assert kw['model'] == 'sonnet'
         assert kw['backend'] == 'claude'
         assert kw['effort'] == 'high'
-        assert kw['prompt'] == 'ARCH PROMPT'
+        assert kw['prompt'] == _architect_prompt_sent()
         assert kw['cwd'] == Path('/fake/wt')
         assert kw['max_turns'] == 50
         assert kw['system_prompt']
@@ -5248,7 +5305,7 @@ class TestArchitectEvalCapResume:
         first, second = mocks['invoke'].call_args_list
 
         # (a) Attempt 1 is a normal fresh dispatch carrying the real prompt.
-        assert first.kwargs['prompt'] == 'ARCH PROMPT'
+        assert first.kwargs['prompt'] == _architect_prompt_sent()
         assert first.kwargs.get('resume_session_id') is None
 
         # (b) Attempt 2 RESUMES that session on the OTHER account, rather than
@@ -5296,7 +5353,7 @@ class TestArchitectEvalCapResume:
 
         _first, second = mocks['invoke'].call_args_list
         assert second.kwargs.get('resume_session_id') is None
-        assert second.kwargs['prompt'] == 'ARCH PROMPT'
+        assert second.kwargs['prompt'] == _architect_prompt_sent()
 
 
 def _decline_artifact(reported_at: str = '2026-07-19T12:00:00+00:00') -> dict:

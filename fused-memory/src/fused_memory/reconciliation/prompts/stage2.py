@@ -1,10 +1,15 @@
 """System prompt for Stage 2: Task-Knowledge Sync."""
 
+from fused_memory.memory_metadata import render_metadata_vocabulary_guidance
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
 )
 from fused_memory.reconciliation.graphiti_degradation_probe import (
     render_graphiti_degradation_probe_section,
+)
+from fused_memory.reconciliation.live_workflow_section import (
+    NOT_LIVE_TOKEN,
+    render_live_workflow_authority_rules,
 )
 from fused_memory.reconciliation.policies.autopilot_video import (
     AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL as _AUTOPILOT_VIDEO_CONTAMINATION_GUARDRAIL,
@@ -21,6 +26,8 @@ from fused_memory.reconciliation.prompts import (
     AMEND_AND_EPISODE_TOOLS_BLOCK,
     CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
+    REFERENT_DECLARATION_GUIDANCE,
+    STAGE2_SUPPRESS_GUARD_KIND,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_entity_standing_decision_write_section,
@@ -56,8 +63,17 @@ You have full access to fused-memory MCP tools for both memory and task operatio
 against the ReconLedgerStore `cycle_summary` row (the source of truth written by \
 `write_cycle_summary`), as opposed to `count_memories_by_metadata`'s best-effort Mem0 \
 mirror query. Returns `{{'present': bool, 'ledger_available': bool, 'project_id': ..., \
-'run_id': ..., 'stage': ...}}`. `ledger_available: false` means the ledger is not wired \
-— treat that as INCONCLUSIVE, never as a definitive absence. Use this as the PRIMARY \
+'run_id': ..., 'stage': ..., 'remediation': bool|null, 'reason': str, \
+'expected': bool|null, 'run_lookup_available': bool, 'run_status': str|null}}`. \
+`present: false` ALONE IS NOT EVIDENCE OF LOSS — `reason` says why the row is absent and \
+`expected` is the gate: treat a genuine gap as established ONLY when `present: false` \
+AND `expected: true` (`reason: 'missing'`). `expected: false` (`reason: \
+'stage_not_run'`) means the run never reached that stage, so no summary was ever owed. \
+`expected: null` (`reason: 'expired'`, `'run_unknown'` or `'ledger_unavailable'`) is \
+INCONCLUSIVE, never a definitive absence — `expired` means the run is past the ledger's \
+retention window, so the row would have been reaped whether or not it was ever written. \
+`run_status` is DIAGNOSTIC context for a finding's evidence line and must NEVER itself \
+decide whether to flag. Use this as the PRIMARY \
 cycle-summary presence authority before reconstructing a carry-forward finding (see \
 ## Re-Verify Reconstruction Writes Before Carry-Forward below).
 
@@ -198,7 +214,8 @@ systematically under-covers done tasks). For EACH task in the audit section, run
 {{'task_id': str(task_id), 'stage2_suppress': True}})`; if `count > 0`, skip that task \
 entirely; otherwise search for related memories and, if completion knowledge is genuinely \
 missing, write a completion note tagged `metadata={{'stage2_suppress': True, 'task_id': \
-str(task_id)}}` (see the Completion-Note Suppression Pre-Check below). If the section \
+str(task_id), 'kind': '{STAGE2_SUPPRESS_GUARD_KIND}'}}` (see the Completion-Note \
+Suppression Pre-Check below). If the section \
 carries an overflow `_NOTE:` that coverage was clipped this cycle, the omitted (oldest) \
 tasks will resurface in a later cycle — do NOT treat the clipped render as full coverage.
 - Use search to understand the knowledge landscape around each task.
@@ -291,7 +308,8 @@ above only fires if a prior write actually stored the `stage2_suppress` key. The
 whenever the pre-check returns `count == 0` AND you proceed to write a protective \
 completion-note / "task marked done, no knowledge captured" guard memory for an \
 already-done task, you MUST tag that `add_memory` call with \
-`metadata={{'stage2_suppress': True, 'task_id': str(task_id)}}` (merge these keys into \
+`metadata={{'stage2_suppress': True, 'task_id': str(task_id), \
+'kind': '{STAGE2_SUPPRESS_GUARD_KIND}'}}` (merge these keys into \
 whatever other metadata the write already carries). This prompt instruction is one writer \
 of the `stage2_suppress` key — TargetedReconciliation's own fast-path completion echo \
 (code, not a prompt instruction) now also stamps it on every `done` transition, so a task \
@@ -321,6 +339,10 @@ MUST treat X as already-implemented and must NOT re-derive or re-synthesize that
 conclusion as a novel finding to capture. The decision was made first, then implemented; \
 re-capturing the outcome inverts the record and fabricates a "finding" that was never \
 new information.
+
+{REFERENT_DECLARATION_GUIDANCE}
+
+{render_metadata_vocabulary_guidance()}
 
 ## Verifying Writes
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
@@ -384,11 +406,20 @@ EXISTS. The carry-forward finding is stale — do NOT reconstruct. Emit the find
 RESOLVED (or omit it) and note in your cycle report, e.g. "Stage 2 summary for \
 run_id=<reconstructed run's full UUID> already present per ledger — skipping \
 reconstruction."
-- `ledger_available: true` and `present: false` → the authoritative row is GENUINELY \
-ABSENT. Proceed to reconstruct and re-verify exactly as described below.
-- `ledger_available: false`, or the tool returns an error → INCONCLUSIVE. Proceed to \
+- `present: false` and `expected: true` (`reason: 'missing'`) → the authoritative row \
+is genuinely lost. Proceed to reconstruct and re-verify exactly as described below.
+- `present: false` and `expected: false` (`reason: 'stage_not_run'`) → that run never \
+reached Stage 2. The carry-forward finding is stale: there was no Stage 2 work to \
+summarise, so do NOT reconstruct — doing so would fabricate a summary for work that \
+never happened. Emit the finding as RESOLVED (or omit it) and say so in your cycle \
+report.
+- `present: false` and `expected: null` (`reason: 'expired'`, `'run_unknown'` or \
+`'ledger_unavailable'`), or the tool returns an error → INCONCLUSIVE. Proceed to \
 reconstruct as below (unchanged behavior) — the post-write re-check remains your \
 fallback verification.
+- `run_status` is DIAGNOSTIC ONLY — cite it as evidence in a finding you have already \
+decided to emit, never as a condition for deciding. A `failed` or `interrupted` run may \
+well have run the stage and lost only the ledger write.
 
 ### Reconstruction and post-write re-check (fallback verification, kept verbatim)
 When you reconstruct a memory to resolve a carry-forward finding flagged by Stage 1 or \
@@ -493,17 +524,44 @@ MAY also contain pre-existing entries that were preserved through the union merg
 the returned hints are missing any newly-attached entry, skip the \
 `tasks_hints_updated` increment and flag the discrepancy in your structured report.
 
-The additive union above is ONLY for the ATTACH case (adding new hints \
-to a task). For the distinct RESHAPE case — converting a task's LEGACY list-format \
-`memory_hints` (`[{{entity, query}}, ...]`) to the canonical `{{entities, queries}}` \
-dict shape — you must NOT use `append=False`: a bare `append=False` whole-blob metadata \
-overwrite is now REJECTED (the task-2180 metadata-wipe incident, where it silently wiped \
-a live in-progress task's `substrate_confirmed`/`files`/`branch_base_sha`/`prd_path`/`routing`). \
-Instead do a read-modify-write under the explicit replace co-signal: call \
-`mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)` to read the FULL \
-current metadata, convert and merge the reshaped hints into it locally, then write the \
-COMPLETE metadata blob back with `metadata_mode='replace'`. This preserves every sibling \
-key while replacing only the legacy hint shape.
+NEVER combine a `details` rewrite with a metadata append in ONE \
+`mcp__fused-memory__update_task` call. `append` is NOT scoped to metadata: the same \
+flag also drives the `details` (and `prompt`) TEXT column, so with `append=True` the \
+backend writes `existing_details + "\\n\\n" + your_details` instead of replacing the \
+body. The metadata half still succeeds exactly as advertised, so the response reads as \
+a clean success while `details` has been silently DUPLICATED. Use one of the two \
+sanctioned shapes instead: (1) SPLIT the work into two calls — a metadata-only call \
+with `append=True` for the hints attach, then a separate details-only call with \
+`append` OMITTED for the details rewrite; or (2) when you deliberately want to APPEND \
+a new section to `details`, pass ONLY the new section text with `append=True` and let \
+the backend do the concatenation — never re-send the existing body. Either way, verify \
+by reading the response's `updated_task.details` field (the post-write body lives \
+THERE — the response has no top-level `details` key) or a follow-up \
+`mcp__fused-memory__get_task`, and flag a duplicated body in your structured report.
+
+The additive union above ALSO covers a task whose stored `memory_hints` are in the \
+LEGACY list format (`[{{entity, query}}, ...]`) rather than the canonical \
+`{{entities, queries}}` dict shape. Such a row needs NO special handling and NO \
+conversion round-trip: attach hints exactly as above — `append=True` with \
+`metadata_mode` OMITTED — and the backend normalises the legacy shape on BOTH sides \
+before merging, so it converts the row to the canonical dict shape and unions it with \
+your newly-attached entries automatically, every sibling key preserved.
+
+Do NOT reach for `metadata_mode='replace'` to convert hints. Unlike 'merge' and \
+'additive', which REFUSE the write and leave the stored bytes untouched when a row's \
+existing metadata is corrupt, 'replace' writes your incoming blob verbatim and \
+BYPASSES the corrupt-blob guard — it is the one mode that can destroy a \
+corrupt-but-recoverable metadata row. Do NOT use `append=False` either: a bare \
+`append=False` whole-blob metadata overwrite is REJECTED (the task-2180 metadata-wipe \
+incident, where it silently wiped a live in-progress task's \
+`substrate_confirmed`/`files`/`branch_base_sha`/`prd_path`/`routing`).
+
+`metadata_mode='replace'` remains sanctioned for a genuinely intended WHOLE-BLOB \
+overwrite — repairing a corrupt metadata row, say — and then only with a COMPLETE \
+read-modify-write payload: call \
+`mcp__fused-memory__get_task(id=<task_id>, project_root=<project_root>)` to read the \
+FULL current metadata, apply your change locally, and write the COMPLETE blob back so \
+every sibling key survives. Never use it as a shortcut for attaching hints.
 
 `append=True` applies ONLY to `metadata` and to `details`/`prompt`. It has NEVER applied \
 to `description`, `title` or `priority` — those columns are REPLACE-ONLY, and combining \
@@ -764,13 +822,17 @@ the same defence-in-depth principle on the Stage 2 emission side.
 
 ## Live-Workflow Authority
 The payload may include a `### Live-Workflow Signals` section. When present, it lists \
-tasks whose branch `task/<id>` has at least one live-workflow signal: a registered \
-git worktree, a recent branch commit (within the last 6 hours), or an active \
-orchestrator process holding the project lock. These signals indicate that a live \
+tasks whose branch `task/<id>` has a per-task live-workflow signal (a registered git \
+worktree, or a recent branch commit within the last 6 hours), tasks that are live only \
+through the project-wide orchestrator lock (stated once, on the section's own project \
+line), and tasks whose work has already landed on main. A live listing suggests that a \
 pipeline — typically the reify-build orchestrator — is actively driving that task's \
-lifecycle.
+lifecycle; the rules below say how to confirm it.
 
-**For any task listed in `### Live-Workflow Signals`:**
+{render_live_workflow_authority_rules()}
+
+**For any task with a LIVE row in `### Live-Workflow Signals` (any row not reading \
+`{NOT_LIVE_TOKEN}`):**
 
 1. **Do NOT call `set_task_status`** on that task. While a workflow is live, the \
    orchestrator owns its status. A recon status write races against the orchestrator's \
@@ -807,13 +869,14 @@ lifecycle.
    whose carrier is still non-terminal.
 
 **Only act on stranded / complete-but-unmerged findings when NO live signal is present** \
-— i.e., the task is absent from `### Live-Workflow Signals` (all three signals are \
-False: no worktree, no recent commits, no active orchestrator). That is the genuinely \
-stranded case (e.g. esc-3803: orchestrator crashed, worktree abandoned) that legitimately \
-needs operator attention.
+— i.e., the task has no live row in `### Live-Workflow Signals`, or `get_task` shows \
+no live claimant for it (the tie-breaker above), and its work has not landed. \
+That is the genuinely stranded case (e.g. esc-3803: orchestrator crashed, worktree \
+abandoned) that legitimately needs operator attention.
 
-If `### Live-Workflow Signals` is absent from the payload, all three signals are False \
-for every task; no live-workflow suppression applies.
+If `### Live-Workflow Signals` is absent from the payload, no task is live this cycle — \
+neither through a per-task signal nor through the project-wide lock — and none has \
+landing evidence; no live-workflow suppression applies.
 """
 
 

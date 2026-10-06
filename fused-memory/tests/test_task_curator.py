@@ -14,6 +14,9 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _curator_helpers import agent_result as _agent_result
+from _curator_helpers import make_config as _make_config
+from _curator_helpers import pool_with_ids as _pool_with_ids
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 from shared.neutral_cwd import neutral_cli_cwd
 from shared.prompt_artifact import (
@@ -32,6 +35,7 @@ from fused_memory.mcp_tools.scheduler_state import (
     effective_lock_depth,
 )
 from fused_memory.middleware.candidate_key import compute_candidate_key
+from fused_memory.middleware.curator_escalator import CuratorEscalator
 from fused_memory.middleware.task_curator import (
     _CURATOR_PROMPT_HARNESS_VERSION,
     CURATOR_BATCH_OUTPUT_SCHEMA,
@@ -53,6 +57,7 @@ from fused_memory.middleware.task_curator import (
     _to_pool_entry,
     _trim_pool,
     clip_for_prompt,
+    embedding_text,
     flatten_task_tree,
     is_combine_eligible_status,
     normalize_title,
@@ -249,6 +254,22 @@ class TestClipForPrompt:
     def test_marker_keeps_the_ellipsis_prefix(self):
         clipped = clip_for_prompt('z' * 50, 10)
         assert clipped[10] == '\u2026'
+
+
+class TestEmbeddingText:
+    """`embedding_text` is the single owner of the curator corpus embedding text."""
+
+    def test_title_alone(self):
+        assert embedding_text('Fix the bug', '', []) == 'Fix the bug'
+
+    def test_title_and_description_join_with_blank_line(self):
+        assert embedding_text('T', 'D', []) == 'T\n\nD'
+
+    def test_files_are_their_own_newline_block(self):
+        assert embedding_text('T', 'D', ['a.py', 'b.py']) == 'T\n\nD\n\na.py\nb.py'
+
+    def test_empty_description_contributes_nothing(self):
+        assert embedding_text('T', '', ['a.py']) == 'T\n\na.py'
 
 
 class TestTrimPool:
@@ -548,34 +569,6 @@ class TestNormalizeKeyDelegatesToCandidateKey:
 # ----------------------------------------------------------------------
 
 
-def _agent_result(structured: dict | None = None, output: str = '') -> AgentResult:
-    return AgentResult(
-        success=True,
-        output=output,
-        structured_output=structured,
-        cost_usd=0.01,
-    )
-
-
-def _pool_with_ids(*pairs: tuple[str, str]) -> list[_PoolEntry]:
-    """Build a pool with the given (task_id, status) pairs."""
-    return [
-        _PoolEntry(
-            task_id=tid,
-            title='t',
-            description='',
-            details='',
-            files_to_modify=[],
-            module_keys=[],
-            status=status,
-            priority='medium',
-            source='module',
-            combine_eligible=is_combine_eligible_status(status),
-        )
-        for tid, status in pairs
-    ]
-
-
 def _carries_guidance(text: str) -> bool:
     """Does *text* carry the pool-truncation decision-safety guidance?
 
@@ -753,12 +746,6 @@ class TestCuratorOutputSchema:
 # ----------------------------------------------------------------------
 # TaskCurator.curate() — idempotency cache + fallback behavior
 # ----------------------------------------------------------------------
-
-
-def _make_config() -> FusedMemoryConfig:
-    cfg = FusedMemoryConfig()
-    cfg.curator = CuratorConfig()
-    return cfg
 
 
 class TestCurateIdempotency:
@@ -1037,7 +1024,11 @@ class TestCurateFallbacks:
 
     @pytest.mark.asyncio
     async def test_call_llm_passes_max_turns_three(self):
-        """R1: max_turns=1 was incompatible with --json-schema; must be >= 3."""
+        """R1: max_turns must be >= 3; 1 is broken with --json-schema.
+
+        A cap of 1 leaves no room for the prose turn the model emits before
+        calling StructuredOutput (see agent_loop._AGENT_CLI_MAX_TURNS).
+        """
         config = _make_config()
         curator = TaskCurator(config=config, taskmaster=None)
 
@@ -1098,6 +1089,34 @@ class TestCurateFallbacks:
         assert kwargs['subtype'] == 'error_max_budget_usd'
         assert kwargs['cost_usd'] == pytest.approx(0.30574)
         assert kwargs['pool_sizes'] == known_pool_sizes
+
+    @pytest.mark.asyncio
+    async def test_curate_threads_transcript_evidence_to_report_failure(self):
+        """curate() passes transcript_turns and tools_used from CuratorFailureError
+        into report_failure so the escalation detail says what the run did."""
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value=None)
+        curator = TaskCurator(config=_make_config(), taskmaster=None, escalator=escalator)
+
+        async def empty_corpus(*a, **k):
+            return [], {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}, PoolWithheld()
+
+        wandered = CuratorFailureError(
+            'killed with progress',
+            timed_out=True,
+            subtype='error_timeout_killed_with_progress',
+            transcript_turns=6,
+            tools_used=('ToolSearch', 'TaskGet', 'ToolSearch'),
+        )
+        with (
+            patch.object(curator, '_build_corpus', side_effect=empty_corpus),
+            patch.object(curator, '_call_llm', side_effect=wandered),
+        ):
+            await curator.curate(CandidateTask(title='T'), project_id='p', project_root='/x')
+
+        kwargs = escalator.report_failure.await_args.kwargs
+        assert kwargs['transcript_turns'] == 6
+        assert kwargs['tools_used'] == ('ToolSearch', 'TaskGet', 'ToolSearch')
 
 
 class TestCallLlmNeutralCwd:
@@ -1428,6 +1447,130 @@ class TestZeroOutputTimeoutAcceptance:
         assert result_a.action == 'create'
         assert result_b.action == 'drop'
         assert mock_llm.await_count == 2
+
+
+_EMPTY_POOL_SIZES = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+
+def _prepared(candidate: CandidateTask) -> PreparedCandidate:
+    return PreparedCandidate(
+        candidate=candidate, pool=[], pool_sizes=dict(_EMPTY_POOL_SIZES), prompt_tokens=0,
+    )
+
+
+def _zot_agent_result() -> AgentResult:
+    return AgentResult(
+        success=False, output='', subtype='error_empty_output',
+        timed_out=True, turns=0, cost_usd=0.0, duration_ms=181_000,
+    )
+
+
+class TestCuratorDecisionZotMarker:
+    """Task 5491: a structured marker says dedupe was skipped by a ZOT hang."""
+
+    @staticmethod
+    def _curator(*, breaker_threshold: int | None = None) -> TaskCurator:
+        config = _make_config()
+        if breaker_threshold is not None:
+            config.curator.zero_output_breaker_threshold = breaker_threshold
+            config.curator.zero_output_breaker_cooldown_seconds = 600.0
+        escalator = AsyncMock()
+        escalator.report_failure = AsyncMock(return_value='esc-curator-7')
+        return TaskCurator(config=config, taskmaster=None, escalator=escalator)
+
+    @staticmethod
+    async def _curate(curator: TaskCurator, candidate: CandidateTask, llm_result: AgentResult):
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=llm_result)):
+            return await curator.curate(
+                candidate, project_id='p', project_root='/x', prepared=_prepared(candidate),
+            )
+
+    def test_defaults_are_not_degraded(self):
+        decision = CuratorDecision(action='create')
+        assert decision.degraded_by_zot is False
+        assert decision.zot_escalation_id is None
+
+    @pytest.mark.asyncio
+    async def test_zot_curate_is_marked_with_the_escalation_id(self):
+        decision = await self._curate(
+            self._curator(), CandidateTask(title='ZOT candidate'), _zot_agent_result(),
+        )
+        assert decision.action == 'create'
+        assert decision.degraded_by_zot is True
+        assert decision.zot_escalation_id == 'esc-curator-7'
+
+    @pytest.mark.asyncio
+    async def test_non_zot_llm_failure_is_not_marked(self):
+        max_turns = AgentResult(
+            success=False, output='partial', subtype='error_max_turns',
+            timed_out=False, turns=3, cost_usd=0.05, duration_ms=9_000,
+        )
+        decision = await self._curate(
+            self._curator(), CandidateTask(title='Max-turns candidate'), max_turns,
+        )
+        assert decision.action == 'create'
+        assert decision.justification == 'llm-error-escalated'
+        assert decision.degraded_by_zot is False
+        assert decision.zot_escalation_id is None
+
+    @pytest.mark.asyncio
+    async def test_curate_breaker_short_circuit_is_marked(self):
+        curator = self._curator(breaker_threshold=1)
+        await self._curate(curator, CandidateTask(title='Opener'), _zot_agent_result())
+
+        decision = await self._curate(
+            curator, CandidateTask(title='Second distinct candidate'), _zot_agent_result(),
+        )
+        assert decision.justification == 'zero-output-breaker-open'
+        assert decision.degraded_by_zot is True
+        assert decision.zot_escalation_id is None
+
+    @pytest.mark.asyncio
+    async def test_batch_breaker_short_circuit_marks_every_decision(self):
+        curator = self._curator(breaker_threshold=1)
+        await self._curate(curator, CandidateTask(title='Opener'), _zot_agent_result())
+
+        prepared = [
+            _prepared(CandidateTask(title='Batch Alpha', description='alpha details')),
+            _prepared(CandidateTask(title='Batch Beta', description='beta details')),
+        ]
+        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                   new=AsyncMock(return_value=_zot_agent_result())):
+            decisions = await curator.curate_batch_prepared(
+                prepared, project_id='p', project_root='/x',
+            )
+        assert len(decisions) == 2
+        for decision in decisions:
+            assert decision.justification == 'zero-output-breaker-open'
+            assert decision.degraded_by_zot is True
+
+    @pytest.mark.asyncio
+    async def test_interactive_path_reraises_with_the_zot_marker(self, tmp_path):
+        curator = TaskCurator(
+            config=_make_config(), taskmaster=None, escalator=CuratorEscalator(),
+        )
+        candidate = CandidateTask(title='ZOT with no orchestrator')
+        with (
+            patch('fused_memory.middleware.task_curator.invoke_with_cap_retry',
+                  new=AsyncMock(return_value=_zot_agent_result())),
+            pytest.raises(CuratorFailureError) as exc_info,
+        ):
+            await curator.curate(
+                candidate, project_id='p', project_root=str(tmp_path),
+                prepared=_prepared(candidate),
+            )
+        assert exc_info.value.zero_output_timeout is True
+
+    @pytest.mark.asyncio
+    async def test_successful_curate_is_not_marked(self):
+        healthy = _agent_result({'action': 'create', 'justification': 'genuinely new'})
+        decision = await self._curate(
+            self._curator(), CandidateTask(title='Healthy candidate'), healthy,
+        )
+        assert decision.action == 'create'
+        assert decision.degraded_by_zot is False
+        assert decision.zot_escalation_id is None
 
 
 class TestZeroOutputBreakerCurate:
@@ -3677,7 +3820,7 @@ class TestCuratorFailureErrorSchemaToolDenied:
     """CLI 2.1.168 guard — ``CuratorFailureError`` carries the underlying agent
     result's ``schema_tool_denied`` from both LLM call sites so the curate()
     handler can route a LOUD, un-suppressed escalation when the synthetic
-    ``StructuredOutput`` schema tool is blocked by the deny-list."""
+    ``StructuredOutput`` schema tool is blocked despite the ``--tools ''`` filter."""
 
     @pytest.mark.asyncio
     async def test_schema_tool_denied_propagated_from_call_llm_single(self):
@@ -4997,6 +5140,24 @@ class TestCancelledPremiseBlocklistLoader:
         assert entries == []
         warnings = [r for r in caplog.records if r.levelname == "WARNING"]
         assert len(warnings) == 1
+
+    def test_load_undecodable_encoding_returns_empty_and_warns(self, tmp_path, caplog):
+        """(c2) File with bytes that are not valid UTF-8 returns [] and emits
+        exactly one WARNING, on this module's own logger.
+        """
+        from fused_memory.middleware.cancelled_premise_blocklist import load_blocklist
+
+        bad_encoding = tmp_path / "bad_encoding.yaml"
+        bad_encoding.write_bytes(b"\xff\xfe- name: x\x00")
+
+        with caplog.at_level("WARNING"):
+            entries = load_blocklist(bad_encoding)
+
+        assert entries == []
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        assert str(bad_encoding) in warnings[0].getMessage()
+        assert warnings[0].name == "fused_memory.middleware.cancelled_premise_blocklist"
 
     def test_load_entry_missing_required_field_skips_and_warns(self, tmp_path, caplog):
         """(d) Entry missing title_substrings is skipped with WARNING; well-formed entries returned."""

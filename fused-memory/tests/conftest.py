@@ -71,12 +71,14 @@ if str(REPO_ROOT) not in sys.path:
 from _fm_helpers import (  # noqa: E402
     _leaked_async_httpx_clients,
     _warn_if_drain_closed_a_foreign_client,
+    install_identity_mocks,
     pydantic_spec,
     reap_leaked_async_httpx_clients,
     reap_leaked_ticket_workers,
     resolve_xdist_worker_id,
     track_async_httpx_clients,
 )
+from _graphiti_fake import FakeGraphitiClient  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
@@ -95,6 +97,7 @@ from fused_memory.config.schema import (  # noqa: E402
     QueueConfig,
     RoutingConfig,
 )
+from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV  # noqa: E402
 
 
 def pytest_configure(config):
@@ -272,6 +275,26 @@ def _isolate_fm_config(monkeypatch):
         monkeypatch.delenv(interpolated, raising=False)
 
     monkeypatch.setenv('CONFIG_PATH', str(FM_CONFIG_PATH))
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_project_registry(monkeypatch):
+    """Drop an INHERITED ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (task 3708).
+
+    A ``GraphitiBackend`` built without ``registered_graph_ids`` (through
+    ``MemoryService`` or a direct construction, rather than ``make_backend``)
+    derives its index-provisioning registry from this variable plus
+    ``taskmaster.project_root``.  The live service exports it, so an operator
+    shell would otherwise register real project ids, and writes to them would
+    attempt provisioning against mock drivers.  A test that sets it itself still
+    wins, because its ``monkeypatch.setenv`` runs after this fixture.
+
+    The project_root half stays as ``_isolate_fm_config`` leaves it, ``'.'``,
+    which registers the launching CWD's basename.  MEASURED 2026-10-01 with
+    both halves live (the variable set to the dark-factory checkout, run from
+    ``fused-memory/``): the whole suite passes, 24106 passed, 0 failed.
+    """
+    monkeypatch.delenv(KNOWN_PROJECT_ROOTS_ENV, raising=False)
 
 
 @pytest.fixture
@@ -495,11 +518,47 @@ def standard_mock_config() -> MagicMock:
 
 @pytest.fixture
 def make_backend():
-    """Factory fixture: returns a callable(config) -> GraphitiBackend with mock client."""
-    def _factory(config) -> GraphitiBackend:
-        backend = GraphitiBackend(config)
+    """Factory fixture: returns a callable(config) -> GraphitiBackend with mock client.
+
+    ``registered_graph_ids`` defaults to EMPTY, not to the derived registry, so
+    no ambient DASHBOARD_KNOWN_PROJECT_ROOTS or CWD-derived project id can turn
+    on index provisioning against a MagicMock driver (task 3708).
+
+    For a client that enforces graphiti_core's uuid= contract, use
+    make_backend_over_fake_graphiti.
+    """
+    def _factory(config, *, registered_graph_ids=()) -> GraphitiBackend:
+        backend = GraphitiBackend(config, registered_graph_ids=registered_graph_ids)
         backend.client = MagicMock()
         backend._driver = MagicMock()
+        return backend
+
+    return _factory
+
+
+@pytest.fixture
+def make_backend_over_fake_graphiti():
+    """Factory fixture: returns a callable(config, fake, *, registered_graph_ids=()) -> GraphitiBackend over *fake*.
+
+    The contract-faithful sibling of make_backend: use it when a test depends
+    on graphiti_core's argument semantics (FakeGraphitiClient models the
+    ``uuid=`` load-or-raise contract); use make_backend when a permissive
+    MagicMock client suffices.  Same empty registry default as make_backend.
+
+    The real backend stays in the path; only the graphiti_core client is
+    replaced.  ``_driver_for`` returns None because there is no FalkorDB
+    driver and the fake ignores ``client.search(driver=...)``.
+    ``install_identity_mocks`` keeps the post-write reconcile off the
+    nonexistent driver.
+    """
+    def _factory(
+        config, fake: FakeGraphitiClient, *, registered_graph_ids=(),
+    ) -> GraphitiBackend:
+        backend = GraphitiBackend(config, registered_graph_ids=registered_graph_ids)
+        backend.client = fake  # type: ignore[assignment]
+        backend._client_for = MagicMock(return_value=fake)  # type: ignore[method-assign]
+        backend._driver_for = MagicMock(return_value=None)  # type: ignore[method-assign]
+        install_identity_mocks(backend)  # type: ignore[arg-type]
         return backend
 
     return _factory

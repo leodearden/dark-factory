@@ -33,6 +33,75 @@ Operator-observable when the batch lands:
 - Three days of log mode precede `on`: every would-hit is recorded and the unit is
   run anyway, so the first enable is made against a measured leak count.
 
+## Amendments — 2026-09-29, from the landing-latency study
+
+Leo ratified four amendments on 2026-09-29. They came out of the landing-latency study of
+2026-09-25..28, which found the task-role verify admission flock to be the binding
+constraint on landing. About a third of DF task-lane verify runs re-checked code that had
+already reached the merge phase. They are carried into decisions 13–16 below and into the
+affected leaves' `details`. Measurements are dated provenance, not live counts.
+
+**A1 — The pre-merge re-verify emits a verify event (α).**
+- `workflow.py::TaskWorkflow._run_merge_phase` Phase 1 re-runs `run_scoped_verification(role='task')`
+  after `rebase_onto_main`.
+- It emits nothing on a pass or a timeout; a fail emits only `waste_detected`.
+- `workflow_verify` is emitted only on the VERIFY→REVIEW transition (`TaskWorkflow._enter_phase`).
+
+So as written, the pre-merge re-verify cannot record a green (`Registry.record_green` needs an
+evidence event), its replays are invisible, and ζ2's signal cannot be observed at the site ζ2's
+item 3 wires. α emits a verify event for every pre-merge re-verify, pass or fail, with
+`plan_hash`, `cache_mode`, `units`, `duration_ms`, the post-rebase `tip_sha` and `base_sha`, and a
+site discriminator distinguishing it from the implement-phase verify.
+
+α chooses the shape (a site field on `workflow_verify`, or a sibling event type) against every
+existing `workflow_verify` reader and states each reader's change:
+- `merge_disposition.py::_branch_pre_merge_verify_green`
+- `merge_completion.py::merge_completion_eligible`
+- `stranded_verified_green.py::last_verified_green_tip`
+- `verify_checkpoint.py::green_checkpoint_at_tip`
+
+A pass stamped at the post-rebase tip also lets the 2752 checkpoint hit on a re-dispatch when
+main has not moved since. Coordinate the constructor with 5409.
+
+**A2 — ζ2's signal and projection count the pre-merge re-verify.**
+- `rebase_verify_cost` is emitted only in the verify phase (`TaskWorkflow._emit_rebase_verify_cost`;
+  all 347 events 09-14..09-28 carry `phase='verify'`). So the 5.1 h/day in § Goal excludes the
+  pre-merge re-verify.
+- The pre-merge re-verify was 66 of 339 DF task-lane verify runs from 09-14 to 09-25, counted
+  from the verify plan files under `data/verify-logs/` by the phase they ran in. That is a
+  count, not a duration.
+- ζ2's signal gains a pre-merge row: a pre-merge re-verify whose main delta touches no recorded
+  input replays every test, and its A1 event lists them as `cache_hit`.
+- The projection for that population is stated once A1's `duration_ms` has measured it, not
+  before.
+
+**A3 — The cache mode is per role; the task role may go `on` ahead of the merge role.**
+
+`verify_cache.mode` becomes `{task: off|log|on, merge: off|log|on}`. A task-role replay cannot
+land a red on main: DF's gate runs `merge_verify_breadth: "full"` — every registered module's
+full suite on the merged tree — so a task-role false hit still meets a gate that runs
+everything. The audit and its kill switch bound the MERGE role's risk.
+
+Each role keeps its own three-day log window. The task role may flip `on` without waiting for ε
+(5655), whose prerequisite chain is 4226 → 5036 → 5034 → 5024..5033. The merge role's `on` stays
+behind ε as written. `disabled_until` still forces a miss in both roles (row 19).
+
+Consequence for ζ1: its recordings come from "the offline lane's audit run (ε)". So for the
+task-role per-test tier to go `on` before ε, recording runs as its own lane command. Recording
+consumes green runs' coverage only, not the lane's confirmed-red set that 4226 repairs, so it
+needs neither 4226 nor ε's attribution. The module tier needs no recordings and is unaffected.
+
+**A4 — A recording is valid only for the test content it was recorded against.**
+
+Recordings are made from landed heads. When a branch edits a test file or a conftest in its
+chain, main's recording of that node id may list an incomplete input set for the branch's
+version. A test that now reads `c.py` would replay green through a change to `c.py`.
+
+Each recording therefore carries the object ids of the test file and the conftest chain it was
+recorded against, and `keys.py::test_unit_key` returns `None` (no recording, so the test runs)
+when either differs in the dispatched tree. Tests a branch edits always run, at both roles,
+until the new version has been recorded after landing. Boundary row 20 pins this.
+
 ## Background
 
 - The 09-10 verify-speed study (`plans/verify-speed-study-df-2026-09-10.md` §B8,
@@ -191,12 +260,14 @@ result at verdict time, not at landing, so nothing in 5036's Appendix A is touch
 
 ### Modes and rollout
 
-`off` (default in code) → `log` for three days on DF (Leo's ruling) → `on`. The
-flip to `on` is made unless log mode recorded a `would_hit` unit that ran red for a
-cause the branch's own diff explains (a leak that would have landed). Spurious reds
-(infra kill, worker crash, deploy clock, known load flake) do not block the flip;
-they are the classes the 09-14 study measured at ~4% of runs. After `on`, the
-audit is the net.
+Per role (A3), each of `task` and `merge` goes `off` (default in code) → `log` for
+three days on DF (Leo's ruling) → `on`. The task role may flip before ε lands; the
+merge role may not. A role's flip to `on` is made unless its log mode recorded a
+`would_hit` unit that ran red for a cause the branch's own diff explains (a leak that
+would have landed). Spurious reds (infra kill, worker crash, deploy clock, known load
+flake) do not block the flip; they are the classes the 09-14 study measured at ~4% of
+runs. After the merge role is `on`, the audit is the net; for the task role the net is
+the full-breadth gate itself.
 
 ## Resolved design decisions
 
@@ -232,6 +303,15 @@ audit is the net.
     misses.
 12. **Registry is derived state** in its own sqlite file; deleting it is a cold
     start. Verdict provenance on the event points at the entry (INV-9: one home).
+13. **The pre-merge re-verify emits a verify event** (A1, Leo 2026-09-29), so its
+    greens are admissible, its replays are visible, and ζ2's signal is observable there.
+14. **ζ2 counts the pre-merge re-verify** in its signal and, once A1 measures it, its
+    projection (A2, Leo 2026-09-29).
+15. **Mode is per role**; the task role may go `on` before ε, because the full-breadth
+    gate still runs every unit a task-role replay skipped. Recording runs as its own lane
+    command so the per-test tier is not held behind 4226 (A3, Leo 2026-09-29).
+16. **A recording is bound to the test file and conftest chain it was recorded
+    against**; a mismatch is no recording and the test runs (A4, Leo 2026-09-29).
 
 ## Pre-conditions for activating
 
@@ -414,6 +494,7 @@ points with an injected registry path.
 | 17 | per-test: unkeyable read without marker fails | t4 runs `git` with cwd in repo, no marker, role task | t4 fails with the marker instruction |
 | 18 | per-test: new test always runs | no recording for t5 | t5 runs, recording created |
 | 19 | kill switch honoured everywhere | `disabled_until` in future | task and merge roles both miss |
+| 20 | per-test: a branch-edited test ignores main's recording (A4) | recording of t1 from main (reads a.py); the branch edits t1 so it now also reads c.py; change c.py | t1 runs at both roles; no replay |
 
 ## Decomposition plan
 
@@ -430,7 +511,7 @@ proves the seam.
 | ε | Audit: `verify-cache-audit` lane command, `audit.py` attribution, eviction, streak kill switch, L2 blocker | orchestrator: `offline_lane.py` hook, `verify_cache/audit.py`, yaml, tests | leaf: a seeded leak on the fixture yields eviction + a fix task carrying the leak record; a second within 7 d sets `disabled_until` and files the blocker | α, β, 4226 |
 | ζ1 | Per-test recorder: coverage contexts + observer plugin + `repo_state` marker enforcement; per-test keys recorded in log mode | new plugin module beside `df_pytest_isolation.py`, `verify_cache/keys.py`, conftests, tests | intermediate → unlocks ζ2; observable: recordings exist for every executed test after one gate; an unmarked repo-state read fails at task role with the instruction | β, γ |
 | ζ2 | Per-test replay: collection-time deselection of hits, per-test verdict merge into the module verdict, task-role wiring | plugin, `verify.py`, tests | leaf: a task-leg post-rebase re-verify whose main delta touches files no recorded test of the module reads replays every test and runs none, with the `workflow_verify` event listing them as `cache_hit`; expected effect (projection, not the signal): `rebase_verify_cost` wall/day falls by 3 to 5 h of 5.1 | ζ1 |
-| η | Integration gate: the boundary-test sketch rows 1–19 executed end-to-end on the fixture repo | orchestrator/tests/ | leaf: all 19 rows green on main | γ, δ, ε, ζ2 |
+| η | Integration gate: the boundary-test sketch rows 1–20 executed end-to-end on the fixture repo | orchestrator/tests/ | leaf: all 20 rows green on main | γ, δ, ε, ζ2 |
 | θ | Companion: `OPERATIONS.md` config reference (modes, audit, kill switch, re-enable), close 5294 as superseded, retirement note on 5410, memory | docs | leaf: docs-only commit; 5294 status | γ |
 | ι | **Milestone (human gate, filed in reify):** author the Reify per-step verify-cache PRD against § Reify seam contract. `task_kind='deterministic'`, `always_escalates=True`, no `before_done`; `metadata.milestone = {mode: delayed, after_secs: 604800}` so it fires seven days after its deps are done, once the tree tier has audit data on Reify | reify task store only | leaf: a born-at-L2 escalation on reify naming this PRD's seam section and the Reify tree-tier audit figures to date; Leo authors the reify PRD via `/prd` | γ (external dep `dark_factory:<γ>`), reify 7424 |
 

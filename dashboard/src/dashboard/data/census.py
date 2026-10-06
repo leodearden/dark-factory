@@ -1,11 +1,13 @@
 """The task census — what the nine task statuses mean to the dashboard.
 
 Declared by ``plans/dashboard-one-datum-one-path-prd.md``, section "The task
-census" (decision 3). This module is the dashboard's SINGLE home for the two
-facts every surface needs about a status: which named view it belongs to, and
-which tone it draws in. The vocabulary itself is not restated here — it is
-imported from ``shared.task_statuses``, the one home the factory already has
-for it, so a tenth member appears in every count, view and tone at once.
+census" (decision 3). This module is the dashboard's SINGLE home for the three
+facts every surface needs about a status: which named view it belongs to,
+which tone it draws in, and the identifier-safe key naming its count in the
+burndown store and on the burndown wire. The vocabulary itself is not
+restated here — it is imported from ``shared.task_statuses``, the one home
+the factory already has for it, so a tenth member appears in every count,
+view, tone and series key at once.
 
 Why ``in_flight`` and ``backlog`` are ENUMERATED rather than derived
 --------------------------------------------------------------------
@@ -24,7 +26,9 @@ consumer can re-add the sub-view into the partition.
 
 ``TONES`` maps each status to a ``charts.jsx::PALETTE`` tone KEY, never to a
 colour literal: the palette stays owned by ``charts.jsx`` alone, following the
-injection convention ``burndown_bands.js`` states at length.
+injection convention ``burndown_bands.js`` states at length. The map is
+injective because the burndown Status mix stacks all nine members: two
+members sharing a tone would draw two indistinguishable bands.
 
 This module reads no clock and performs no I/O.
 """
@@ -77,15 +81,27 @@ TONES: MappingProxyType[TaskStatus, str] = MappingProxyType(
     {
         TaskStatus.IN_PROGRESS: 'accent',
         TaskStatus.BLOCKED: 'bad',
-        TaskStatus.MERGE_DEFERRED: 'warn',
+        TaskStatus.MERGE_DEFERRED: 'accent2',
         TaskStatus.REVIEW: 'info',
         TaskStatus.INFRA_HOLD: 'stranded',
         TaskStatus.PENDING: 'warn',
         TaskStatus.DEFERRED: 'fg3',
         TaskStatus.DONE: 'ok',
-        TaskStatus.CANCELLED: 'fg3',
+        TaskStatus.CANCELLED: 'fg2',
     }
 )
+
+SERIES_KEYS: MappingProxyType[TaskStatus, str] = MappingProxyType(
+    {member: member.value.replace('-', '_') for member in TaskStatus}
+)
+"""The key naming each member's count in the burndown store and on its wire.
+
+ONE naming rule over the closed enum, in ``TaskStatus`` order, so the burndown
+``snapshots`` columns and the payload's series keys follow the vocabulary
+rather than restating it. A tenth member maps to a column that does not
+exist, and the burndown INSERT fails loudly instead of the count being
+absorbed into another member.
+"""
 
 
 class CensusVocabularyError(ValueError):

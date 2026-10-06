@@ -22,6 +22,7 @@ load_dotenv()
 from functools import partial  # noqa: E402
 
 from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
+from shared.systemd_listeners import take_systemd_listeners  # noqa: E402
 
 from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
 from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
@@ -554,6 +555,7 @@ async def run_server():
     logger.info(f'  Graphiti: {config.graphiti.provider} ({config.graphiti.falkordb.uri})')
     logger.info(f'  Mem0/Qdrant: {config.mem0.qdrant_url}')
     logger.info(f'  Transport: {config.server.transport}')
+    systemd_listeners = take_systemd_listeners()
 
     # Initialize memory service
     memory_service = MemoryService(config)
@@ -784,6 +786,12 @@ async def run_server():
         recon_journal = ReconciliationJournal(Path(config.reconciliation.data_dir))
         await recon_journal.initialize()
         recon_journal.set_write_journal(write_journal)
+        # Read-only runs-table source for get_cycle_summary_presence (task
+        # 3731). Deliberately wired ABOVE the recon_ledger_enabled gate below:
+        # the journal exists whenever reconciliation does, while the ledger is
+        # feature-gated, so the presence payload reports the two availability
+        # signals separately rather than inferring one from the other.
+        memory_service.set_recon_journal(recon_journal)
 
         if config.reconciliation.recon_ledger_enabled:
             recon_ledger = await _build_recon_ledger_store(Path(config.reconciliation.data_dir))
@@ -969,6 +977,9 @@ async def run_server():
             known_projects=_known_projects_map,
             recon_report_state=recon_report_state,
             server_ready_event=recon_server_ready,
+            escalation_listener=_claim_listener(
+                systemd_listeners, config.reconciliation.escalation_port,
+            ),
         )
         harness_loop_task = asyncio.create_task(reconciliation_harness.run_loop())
         logger.info('  Reconciliation: enabled (background loop started)')
@@ -1151,7 +1162,7 @@ async def run_server():
             import uvicorn
 
             display_host = 'localhost' if config.server.host == '0.0.0.0' else config.server.host
-            logger.info(f'  MCP Endpoint: http://{display_host}:{config.server.port}/mcp/')
+            logger.info(f'  MCP Endpoint: http://{display_host}:{config.server.port}/mcp/')  # mcp-url-sweep: allow display string in a startup log line, never fetched
             configure_uvicorn_logging()
             starlette_app = mcp.streamable_http_app()
 
@@ -1172,6 +1183,12 @@ async def run_server():
                 keepalive_timeout=config.server.keepalive_timeout,
             )
             server = uvicorn.Server(uv_config)
+            primary_socket = _claim_listener(systemd_listeners, config.server.port)
+            if systemd_listeners:
+                logger.warning(
+                    'systemd passed listening sockets for ports %s that nothing here serves',
+                    sorted(systemd_listeners),
+                )
 
             # Second uvicorn: recon_report MCP namespace on port recon_report_port.
             # Constructed BEFORE _install_operator_stop_handler so that the stop
@@ -1221,7 +1238,7 @@ async def run_server():
             recon_report_state.start_persistence()
             await recon_report_state.start_reaper()
             logger.info(
-                '  Recon Report Endpoint: http://%s:%d/mcp/',
+                '  Recon Report Endpoint: http://%s:%d/mcp/',  # mcp-url-sweep: allow display string in a startup log line, never fetched
                 display_host,
                 config.server.recon_report_port,
             )
@@ -1234,7 +1251,10 @@ async def run_server():
             # but does NOT cancel the sibling on first failure — the surviving
             # Task would continue serving while the finally block runs, emitting
             # "Task was destroyed but it is pending!" on loop teardown.
-            _primary_task = asyncio.create_task(server.serve(), name='fused_memory_primary')
+            _primary_task = asyncio.create_task(
+                server.serve(sockets=[primary_socket] if primary_socket else None),
+                name='fused_memory_primary',
+            )
             _recon_task = asyncio.create_task(recon_server.serve(), name='fused_memory_recon_report')
 
             # Signal the harness once the recon-report server is accepting connections.
@@ -2002,6 +2022,19 @@ def _build_uvicorn_config(
     return uvicorn.Config(app, **kwargs)
 
 
+def _claim_listener(listeners: dict[int, socket.socket], port: int) -> socket.socket | None:
+    """Remove and return the systemd-held listening socket for *port*, if any.
+
+    Under ``fused-memory.socket`` the port stays bound across restarts, so
+    clients queue instead of being refused. None means the caller binds the
+    port itself (not socket-activated, or systemd holds no socket for it).
+    """
+    sock = listeners.pop(port, None)
+    if sock is not None:
+        logger.info('  Port %d: serving on the systemd-held socket (survives restarts)', port)
+    return sock
+
+
 def _build_recon_report_components(
     config: FusedMemoryConfig,
     memory_service: Any = None,
@@ -2018,6 +2051,10 @@ def _build_recon_report_components(
     Optional service args (task β): when provided they are injected into the
     returned ReconReportState so cite_* tools can validate citations at call time.
 
+    Production enforces the known-stage vocabulary here (task 4865), not as a
+    ``ReconReportState`` default, because many test modules construct the state
+    directly with ad-hoc stage names.
+
     Args:
         recon_journal: the open ReconciliationJournal (task 3065), used solely by
             ``repair_memory_citation`` to reach the durable ``runs.stage_reports``
@@ -2029,7 +2066,11 @@ def _build_recon_report_components(
     Returns:
         (ReconReportState, FastMCP, uvicorn.Config)
     """
-    from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
+    from fused_memory.server.recon_report import (
+        KNOWN_RECON_STAGES,
+        ReconReportState,
+        create_recon_report_server,
+    )
     from fused_memory.server.recon_report_store import ReconReportStore
 
     ttl = config.reconciliation.recon_report_state_ttl_seconds
@@ -2051,6 +2092,7 @@ def _build_recon_report_components(
         task_interceptor=task_interceptor,
         store=recon_report_store,
         journal=recon_journal,
+        known_stages=KNOWN_RECON_STAGES,
     )
     if known_projects is not None:
         state.known_projects = known_projects

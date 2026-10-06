@@ -431,6 +431,57 @@ class TestInitialScan:
         assert result is not None
         assert result.id == 'esc-6-1'
 
+    def test_malformed_json_is_warned_not_silent(self, tmp_path, caplog):
+        """A corrupt record is skipped AND logged at WARNING naming the file."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        (queue_dir / 'esc-garbage.json').write_text('{not valid json}}}')
+        with caplog.at_level(logging.WARNING):
+            assert _initial_scan(queue_dir, task_id=None, level=None) is None
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(
+            'watcher._initial_scan' in r.getMessage() and 'esc-garbage.json' in r.getMessage()
+            for r in warnings
+        ), [(r.levelname, r.getMessage()) for r in caplog.records]
+
+    def test_undecodable_file_is_warned_and_scan_continues(self, tmp_path, caplog):
+        """A non-UTF-8 record must not crash the scan; a valid sibling is still found."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        (queue_dir / 'esc-binary.json').write_bytes(b'\xff\xfe\x00\x80')
+        esc = Escalation(
+            id='esc-6-2', task_id='6', agent_role='orchestrator',
+            severity='blocking', category='task_failure', summary='valid',
+        )
+        _write_esc(queue_dir, esc)
+        with caplog.at_level(logging.WARNING):
+            result = _initial_scan(queue_dir, task_id=None, level=None)
+        assert result is not None
+        assert result.id == 'esc-6-2'
+        assert any(
+            r.levelno == logging.WARNING and 'esc-binary.json' in r.getMessage()
+            for r in caplog.records
+        ), [(r.levelname, r.getMessage()) for r in caplog.records]
+
+    def test_unreadable_file_is_warned(self, tmp_path, caplog):
+        """A permission-denied record is skipped AND logged at WARNING."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        (queue_dir / 'esc-denied.json').write_text('{}')
+        real_read_text = Path.read_text
+
+        def deny(self, *a, **kw):
+            if self.name == 'esc-denied.json':
+                raise PermissionError(13, 'Permission denied')
+            return real_read_text(self, *a, **kw)
+
+        with patch.object(Path, 'read_text', deny), caplog.at_level(logging.WARNING):
+            assert _initial_scan(queue_dir, task_id=None, level=None) is None
+        assert any(
+            r.levelno == logging.WARNING and 'esc-denied.json' in r.getMessage()
+            for r in caplog.records
+        ), [(r.levelname, r.getMessage()) for r in caplog.records]
+
     def test_exclude_single_pending(self, tmp_path):
         """Sole pending escalation in exclude_ids -> returns None."""
         queue_dir = tmp_path / 'queue'
@@ -739,6 +790,44 @@ class TestMainLoop:
                 main()
 
             mock_exit.assert_called_once_with(0)
+
+    def test_undecodable_event_is_warned_and_loop_continues(
+        self, tmp_path, blocking_escalation: Escalation, capsys, caplog,
+    ):
+        """A non-UTF-8 record arriving via inotify must not crash the loop."""
+        queue_dir = tmp_path / 'queue'
+        queue_dir.mkdir()
+        (queue_dir / 'esc-binary.json').write_bytes(b'\xff\xfe\x00\x80')
+        (queue_dir / f'{blocking_escalation.id}.json').write_text(blocking_escalation.to_json())
+
+        binary_event = MagicMock()
+        binary_event.name = 'esc-binary.json'
+        valid_event = MagicMock()
+        valid_event.name = f'{blocking_escalation.id}.json'
+
+        with (
+            patch('escalation.watcher.INotify') as MockINotify,
+            patch('escalation.watcher.sys.argv', [
+                'watcher', '--queue-dir', str(queue_dir),
+            ]),
+            patch('escalation.watcher._initial_scan', return_value=None),
+            caplog.at_level(logging.WARNING),
+        ):
+            MockINotify.return_value.read.side_effect = [[binary_event, valid_event]]
+
+            from escalation.watcher import main
+
+            with pytest.raises(SystemExit) as exc_info:
+                main()
+
+        assert exc_info.value.code == 0
+        assert blocking_escalation.id in capsys.readouterr().out
+        assert any(
+            r.levelno == logging.WARNING
+            and 'watcher.main' in r.getMessage()
+            and 'esc-binary.json' in r.getMessage()
+            for r in caplog.records
+        ), [(r.levelname, r.getMessage()) for r in caplog.records]
 
 
 class TestTimeout:

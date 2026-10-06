@@ -30,11 +30,13 @@ from the merge lane too — see the same warning at
 from __future__ import annotations
 
 import functools
+import shutil
+import subprocess
 import types
 from pathlib import Path
 
 import pytest
-from _fm_helpers import load_script_module
+from _fm_helpers import _init_git_repo, load_script_module
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'harvest_production_queries.py'
@@ -690,57 +692,107 @@ class TestReadOnlyAccess:
         assert hashlib.sha256(db.read_bytes()).hexdigest() == before
 
 
-class TestTheJournalPathIsRepoRelative:
+_CHECKOUT_COPY_MOD_NAME = 'harvest_production_queries__checkout_copy'
+
+
+def _seed_checkout_with_harvest_copy(base: Path) -> tuple[Path, Path]:
+    """A main checkout with the script committed, plus a `.worktrees/lane`.
+
+    Mirrors production's `<main>/.worktrees/<id>` layout, so a copy of the
+    script loaded from either checkout decides its anchor exactly as the
+    real file would.  Returns resolved `(main, lane)`.
+    """
+    main = base / 'repo'
+    scripts = main / 'fused-memory' / 'scripts'
+    scripts.mkdir(parents=True)
+    shutil.copy2(SCRIPT_PATH, scripts / SCRIPT_PATH.name)
+    _init_git_repo(main)
+    lane = main / '.worktrees' / 'lane'
+    subprocess.run(
+        ['git', '-C', str(main), 'worktree', 'add', '-q', '-b', 'lane', str(lane)],
+        check=True,
+    )
+    return main.resolve(), lane.resolve()
+
+
+def _load_copy_in(checkout: Path) -> types.ModuleType:
+    """Load the copy of the script living in *checkout*.
+
+    Never under the real module's key: that would replace the real module
+    in `sys.modules` and break `TestTheScriptIsLoadedOnceNotReExecuted`.
+    """
+    copy = checkout / 'fused-memory' / 'scripts' / SCRIPT_PATH.name
+    return load_script_module(copy, mod_name=_CHECKOUT_COPY_MOD_NAME)
+
+
+def _journal_under_data_of(main: Path, tmp_path: Path) -> Path:
+    target = main / 'data' / 'reconciliation' / 'write_journal.db'
+    target.parent.mkdir(parents=True)
+    return _standard_journal(tmp_path).rename(target)
+
+
+class TestTheJournalPathIsAnchoredOnTheMainCheckout:
     """A published artifact must not name somebody's home directory.
 
-    An absolute checkout path is neither reproducible nor readable by anyone
-    else, and it leaks the worktree the run happened in -- the rule
-    `fused-memory/scripts/bake_off_storage_shape.py::fixture_digests`
-    already states.
-
-    Both tests patch `mod._REPO_ROOT`, a module global `_repo_relative` reads
-    at call time, so the property is pinned without depending on the
-    filesystem layout the suite happens to run under.
+    The journal is untracked runtime data under the MAIN checkout's
+    gitignored `/data/`, so a harvest run from a `.worktrees/<id>` lane must
+    still record it relative to the main checkout.
     """
 
-    def test_a_journal_under_the_repo_root_is_recorded_repo_relative(
-        self, tmp_path, monkeypatch
+    def test_a_harvest_run_from_a_worktree_lane_records_the_journal_relative_to_the_main_checkout(
+        self, tmp_path
     ):
-        mod = _mod()
-        db = _standard_journal(tmp_path)
-        # Move it under a `data/` subdir so the relative value has structure.
-        nested = tmp_path / 'data'
-        nested.mkdir()
-        db = db.rename(nested / 'j.db')
-        # Resolve BOTH sides: `_repo_relative` resolves its input, so an
-        # unresolved anchor would spuriously fail behind a symlinked tmpdir.
-        monkeypatch.setattr(mod, '_REPO_ROOT', tmp_path.resolve())
+        main, lane = _seed_checkout_with_harvest_copy(tmp_path)
+        journal = _journal_under_data_of(main, tmp_path)
 
-        result = mod.harvest(db, tail_sample=5)
+        result = _load_copy_in(lane).harvest(journal, tail_sample=5)
 
-        assert result.journal_path == 'data/j.db'
-        assert not Path(result.journal_path).is_absolute()
+        assert result.journal_path == 'data/reconciliation/write_journal.db'
         # The sidecar is what actually gets published, so pin it too.
-        assert result.provenance()['journal_path'] == 'data/j.db'
+        assert result.provenance()['journal_path'] == result.journal_path
 
-    def test_a_journal_genuinely_outside_the_repo_root_stays_absolute(
-        self, tmp_path, monkeypatch
+    def test_a_harvest_run_from_the_main_checkout_records_the_journal_repo_relative(
+        self, tmp_path
     ):
+        main, _lane = _seed_checkout_with_harvest_copy(tmp_path)
+        journal = _journal_under_data_of(main, tmp_path)
+
+        result = _load_copy_in(main).harvest(journal, tail_sample=5)
+
+        assert result.journal_path == 'data/reconciliation/write_journal.db'
+        assert result.provenance()['journal_path'] == result.journal_path
+
+    def test_a_journal_genuinely_outside_the_repo_stays_absolute(self, tmp_path):
         """The fallback is ABSOLUTE, not a bare filename.
 
-        This is the regression guard against over-relativizing: a journal
-        parked outside the tree is genuinely checkout-independent and must
-        stay identifiable.  It distinguishes the census-shaped helper (which
-        this uses) from the bake-off one, whose fallback is `resolved.name`.
+        The regression guard against over-relativizing: a journal parked
+        outside the tree is genuinely checkout-independent and must stay
+        identifiable.
         """
-        mod = _mod()
-        db = _standard_journal(tmp_path)
-        monkeypatch.setattr(mod, '_REPO_ROOT', (tmp_path / 'somewhere_else').resolve())
+        _main, lane = _seed_checkout_with_harvest_copy(tmp_path)
+        journal = _standard_journal(tmp_path)
 
-        result = mod.harvest(db, tail_sample=5)
+        result = _load_copy_in(lane).harvest(journal, tail_sample=5)
 
         assert Path(result.journal_path).is_absolute()
         assert Path(result.journal_path).name == 'journal.db'
+
+    def test_a_copy_outside_any_git_checkout_anchors_on_its_own_location(
+        self, tmp_path, monkeypatch
+    ):
+        # Stop git's discovery at tmp_path, so the case holds even if the
+        # suite's basetemp ever lands inside some checkout.
+        monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(tmp_path.resolve()))
+        plain = tmp_path / 'plain'
+        scripts = plain / 'fused-memory' / 'scripts'
+        scripts.mkdir(parents=True)
+        shutil.copy2(SCRIPT_PATH, scripts / SCRIPT_PATH.name)
+        (plain / 'data').mkdir()
+        journal = _standard_journal(tmp_path).rename(plain / 'data' / 'j.db')
+
+        result = _load_copy_in(plain).harvest(journal, tail_sample=5)
+
+        assert result.journal_path == 'data/j.db'
 
 
 class TestTheCommittedArtifactsCarryNoAbsolutePath:

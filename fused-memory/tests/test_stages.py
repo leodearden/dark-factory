@@ -11,6 +11,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from _flag_for_stage2_pool_fake import LiveFlagPool
 from _fm_helpers import (
     as_async_run_git,
     assert_id_title_pairing,
@@ -21,7 +22,14 @@ from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 import fused_memory.reconciliation.stages.base as base_module
 from fused_memory.config.schema import ReconciliationConfig
-from fused_memory.models.reconciliation import StageId, StageReport, Watermark
+from fused_memory.models.reconciliation import (
+    EventSource,
+    EventType,
+    ReconciliationEvent,
+    StageId,
+    StageReport,
+    Watermark,
+)
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
@@ -38,6 +46,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     _normalize_report,
     run_stage_via_cli,
 )
+from fused_memory.reconciliation.live_workflow_section import NO_PER_TASK_SIGNAL_TOKEN
 from fused_memory.reconciliation.prompts import (
     ESCALATION_BOUNDARY_NOTE,
     render_escalation_boundary_note,
@@ -45,25 +54,30 @@ from fused_memory.reconciliation.prompts import (
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
-from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.stages.base import BaseStage, RequiredSection
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
+    _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE,
+    _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS,
     _FLAGGED_ITEMS_CHAR_BUDGET,
     IntegrityCheck,
     TaskKnowledgeSync,
     _format_flagged,
     _git_show_name_only,
-    _needs_hint_conversion,
+    _needs_hint_attention,
     _queue_briefing_refresh_tasks,
     _render_done_provenance_section,
     _run_briefing_known_gaps_script,
     _select_proactive_sample,
     _suppress_same_run_human_operator_dups,
+    _sweep_stale_mem0_flag_for_stage2_markers,
+    retire_flag_markers_for_terminal_task,
 )
 from fused_memory.reconciliation.standing_decision_constants import (
     CATEGORY_STANDING_DECISION_STORM,
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
     SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+    SUPPRESSION_STREAK_THRESHOLD_CYCLES,
 )
 from fused_memory.reconciliation.task_filter import (
     MAX_CANCELLED_TASKS_RETAINED,
@@ -173,7 +187,11 @@ class TestMockTypesConstant:
 #     which is the correct destination. escalate_blocker is Stage 2's sanctioned
 #     FIX D path; denying it would break FIX D (see render_escalation_boundary_note).
 #   - resolve_issue / stamp_triage / promote_to_l2 — act on an escalation the
-#     caller already has an id for; they answer no existence question.
+#     caller already has an id for. resolve_issue's response also carries a
+#     pending-only census (related_pending, task 4886), but it is scoped to the
+#     record the caller holds and has just mutated, in the queue it is connected
+#     to — never an arbitrary per-task query, so it answers no existence
+#     question either.
 #   - merge_* / *_scheduler / *_merge_queue / *_warm_worktree / release_workflow /
 #     reload_config / get_task_runtime_state — orchestrator control-plane and
 #     merge-lane surface, unrelated to the escalation-record question.
@@ -183,6 +201,10 @@ class TestMockTypesConstant:
 # DISALLOW_ESCALATION_READS. Adding a name here is a decision that the tool
 # cannot mislead a stage about the reconciliation queue — not a formality.
 _REVIEWED_STAGE_SAFE = {
+    # amend_escalation (task 4886) acts on a record the caller already holds
+    # an id for and reads no per-task state, so against the reconciliation
+    # queue it can only ever answer "not found" — never a categorical [].
+    'mcp__escalation__amend_escalation',
     'mcp__escalation__claim_warm_worktree',
     # declare_pin (task 4377) is stamp_triage's structural twin: a
     # restrictive-only write that marks a record as load-bearing.  Against the
@@ -2077,6 +2099,9 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # Always present (task 2896 γ): stays 0 on the empty-flags path — the
             # entity-standing-decision filter only runs inside `if items_flagged`.
             'entity_standing_decision_suppressed': 0,
+            # Always present (task 2943): streak accounting runs on every full
+            # cycle; 0 here because no standing decision suppressed anything.
+            'entity_standing_decision_max_suppression_streak': 0,
             # Always present (task 4223): the preservation-specimen guard runs
             # ABOVE the remediation early-return, so all three keys are on EVERY
             # report. All stay empty here — no flag was emitted, so the guard
@@ -2084,6 +2109,9 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'preservation_specimen_suppressed': 0,
             'preservation_specimen_unresolved': 0,
             'preservation_specimen_citations': {},
+            # Always present (task 4874): the live-workflow citation guard runs
+            # ABOVE the remediation early-return; 0 with no flag emitted.
+            'stage1_live_workflow_citation_contradictions': 0,
             # Always present on the full-cycle path (task 2229 W5-λ): 1 when the
             # deterministic write_cycle_summary helper upserted the authoritative
             # ledger row. This test's mock_deps memory_service is an unconfigured
@@ -2102,6 +2130,18 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'stage1_phantom_citations_dropped': 0,
             'stage1_citations_verified': 0,
             'stage1_citation_verification_errors': 0,
+            # The PROSE half of the same invariant (task 4818), merged from the
+            # same shared assembly immediately after the structured triple above
+            # and carrying the same stageN_ prefix from STAGE_STAT_PREFIX. It is
+            # WARN-ONLY: it never drops a citation and never mutates a finding,
+            # so its whole observable output is these four counters plus a log
+            # line. All four are reported rather than just the phantom count,
+            # because a bare prose_phantom_citations: 0 cannot distinguish "we
+            # scanned and everything is clean" from "nothing was scannable".
+            'stage1_prose_citations_verified': 0,
+            'stage1_prose_citations_tombstoned': 0,
+            'stage1_prose_phantom_citations': 0,
+            'stage1_prose_citation_verification_errors': 0,
             # Always present (task 3084), set before the remediation early-return
             # beside the task-2312/2229 pre-inits above. All three stay 0 here:
             # this stage's filtered_task_tree is unset, so the
@@ -2266,6 +2306,9 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # Always present (task 2896 γ): stays 0 on the empty-flags path — the
             # entity-standing-decision filter only runs inside `if items_flagged`.
             'entity_standing_decision_suppressed': 0,
+            # Always present (task 2943): streak accounting runs on every full
+            # cycle; 0 here because no standing decision suppressed anything.
+            'entity_standing_decision_max_suppression_streak': 0,
             # Always present (task 4223): the preservation-specimen guard runs
             # ABOVE the remediation early-return, so all three keys are on EVERY
             # report. All stay empty here — no flag was emitted, so the guard
@@ -2273,6 +2316,9 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'preservation_specimen_suppressed': 0,
             'preservation_specimen_unresolved': 0,
             'preservation_specimen_citations': {},
+            # Always present (task 4874): the live-workflow citation guard runs
+            # ABOVE the remediation early-return; 0 with no flag emitted.
+            'stage1_live_workflow_citation_contradictions': 0,
             # Always present on the full-cycle path (task 2229 W5-λ): 1 when the
             # deterministic write_cycle_summary helper upserted the authoritative
             # ledger row. This test's mock_deps memory_service is an unconfigured
@@ -2291,6 +2337,18 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'stage1_phantom_citations_dropped': 0,
             'stage1_citations_verified': 0,
             'stage1_citation_verification_errors': 0,
+            # The PROSE half of the same invariant (task 4818), merged from the
+            # same shared assembly immediately after the structured triple above
+            # and carrying the same stageN_ prefix from STAGE_STAT_PREFIX. It is
+            # WARN-ONLY: it never drops a citation and never mutates a finding,
+            # so its whole observable output is these four counters plus a log
+            # line. All four are reported rather than just the phantom count,
+            # because a bare prose_phantom_citations: 0 cannot distinguish "we
+            # scanned and everything is clean" from "nothing was scannable".
+            'stage1_prose_citations_verified': 0,
+            'stage1_prose_citations_tombstoned': 0,
+            'stage1_prose_phantom_citations': 0,
+            'stage1_prose_citation_verification_errors': 0,
             # Always present (task 3084), set before the remediation early-return
             # beside the task-2312/2229 pre-inits above. All three stay 0 here:
             # this stage's filtered_task_tree is unset, so the
@@ -2766,13 +2824,16 @@ class TestProactiveSampling:
         assert _select_proactive_sample(iter([]), 0) == []
 
 
-class TestNeedsHintConversion:
-    """Tests for _needs_hint_conversion helper.
+class TestNeedsHintAttention:
+    """Tests for _needs_hint_attention helper.
 
     Verifies the three-branch classification from the task 1275 pseudo-code:
-      1. list memory_hints  -> True  (legacy list-of-dict format, conversion target)
+      1. list memory_hints  -> True  (legacy list-of-dict format, attach target)
       2. falsy memory_hints -> True  (missing key or empty dict, existing falsy path)
       3. truthy non-list   -> False (assumed already-structured dict, skip)
+
+    Both True branches are served by the SAME plain additive attach (task
+    4216) — hence "attention", not "conversion".
     """
 
     # ------------------------------------------------------------------ helpers
@@ -2787,34 +2848,34 @@ class TestNeedsHintConversion:
 
     # ------------------------------------------------------------------ branch 1: list
 
-    def test_list_memory_hints_classified_as_conversion_target(self):
+    def test_list_memory_hints_needs_attention(self):
         """Non-empty list-of-dict memory_hints returns True (NEW branch — legacy format)."""
         task = self._make_task([{'entity': 'Foo', 'query': 'what is Foo'}])
-        assert _needs_hint_conversion(task) is True
+        assert _needs_hint_attention(task) is True
 
-    def test_empty_list_memory_hints_classified_as_conversion_target(self):
+    def test_empty_list_memory_hints_needs_attention(self):
         """Empty list memory_hints returns True via the list branch (not the falsy branch)."""
         task = self._make_task([])
-        assert _needs_hint_conversion(task) is True
+        assert _needs_hint_attention(task) is True
 
     # ------------------------------------------------------------------ branch 2: falsy
 
-    def test_missing_memory_hints_classified_as_conversion_target(self):
+    def test_missing_memory_hints_needs_attention(self):
         """Task with metadata dict that has no memory_hints key returns True."""
         task = self._make_task_no_hints()
-        assert _needs_hint_conversion(task) is True
+        assert _needs_hint_attention(task) is True
 
-    def test_empty_dict_memory_hints_classified_as_conversion_target(self):
+    def test_empty_dict_memory_hints_needs_attention(self):
         """Empty dict memory_hints returns True (existing falsy path)."""
         task = self._make_task({})
-        assert _needs_hint_conversion(task) is True
+        assert _needs_hint_attention(task) is True
 
     # ------------------------------------------------------------------ branch 3: already-valid dict
 
     def test_structured_dict_memory_hints_not_flagged(self):
         """Task with {entities: [...], queries: [...]} dict returns False (already valid)."""
         task = self._make_task({'entities': ['Foo'], 'queries': ['what is Foo']})
-        assert _needs_hint_conversion(task) is False
+        assert _needs_hint_attention(task) is False
 
     def test_truthy_non_dict_non_list_memory_hints_not_flagged(self):
         """Truthy non-list, non-dict values (string, int) return False — pins branch-3 contract.
@@ -2824,25 +2885,25 @@ class TestNeedsHintConversion:
         to flag malformed scalars is a separable robustness concern deferred to a follow-up task.
         This test documents the current contract so future narrowing is a deliberate, visible change.
         """
-        assert _needs_hint_conversion(self._make_task('oops')) is False
-        assert _needs_hint_conversion(self._make_task(42)) is False
+        assert _needs_hint_attention(self._make_task('oops')) is False
+        assert _needs_hint_attention(self._make_task(42)) is False
 
     # ------------------------------------------------------------------ defensive edge cases
 
-    def test_task_without_metadata_key_classified_as_conversion_target(self):
+    def test_task_without_metadata_key_needs_attention(self):
         """Task dict with no 'metadata' key at all returns True (treated as no hints attached)."""
         task = {'id': 1, 'title': 'T', 'status': 'pending'}
-        assert _needs_hint_conversion(task) is True
+        assert _needs_hint_attention(task) is True
 
-    def test_task_with_none_metadata_classified_as_conversion_target(self):
+    def test_task_with_none_metadata_needs_attention(self):
         """Task with metadata=None returns True (malformed metadata can't carry valid hints)."""
         task = {'id': 1, 'title': 'T', 'status': 'pending', 'metadata': None}
-        assert _needs_hint_conversion(task) is True
+        assert _needs_hint_attention(task) is True
 
-    def test_task_with_non_dict_metadata_string_classified_as_conversion_target(self):
+    def test_task_with_non_dict_metadata_string_needs_attention(self):
         """Task with metadata as a string returns True (defensive: non-dict metadata treated as no hints)."""
         task = {'id': 1, 'title': 'T', 'status': 'pending', 'metadata': 'not-a-dict'}
-        assert _needs_hint_conversion(task) is True
+        assert _needs_hint_attention(task) is True
 
 
 class TestRunIdValidation(BaseStageValidationTest):
@@ -5884,6 +5945,247 @@ class TestMemoryConsolidatorStaleBulkGetStatusesFilter:
             'acknowledge_resolved_flags so its stage1_flag_marker is reclaimed; got '
             f'{call_kwargs.get("resolved_flags")!r}'
         )
+
+
+async def _run_consolidator_filter_chain(
+    stage: MemoryConsolidator,
+    flags: list[dict],
+    *,
+    events: list | None = None,
+) -> tuple[StageReport, list[list[dict]], AsyncMock]:
+    """Run *stage* over an LLM report carrying *flags*, through the real filter chain.
+
+    Returns the final report, every flag list dedup_flags was handed, and the
+    acknowledge_resolved_flags mock.  filter_false_absence_flags is a
+    passthrough so only the chain under test decides what survives.
+    """
+    base_report = StageReport(
+        stage=StageId.memory_consolidator,
+        started_at=datetime.now(UTC),
+        completed_at=datetime.now(UTC),
+        items_flagged=list(flags),
+        stats={},
+        llm_calls=1,
+        tokens_used=100,
+    )
+    dedup_call_args: list[list[dict]] = []
+
+    async def _dedup_spy(**kwargs):
+        dedup_call_args.append(kwargs.get('flags', []))
+        return kwargs.get('flags', [])
+
+    ack_mock = AsyncMock(return_value=1)
+    module = 'fused_memory.reconciliation.stages.memory_consolidator'
+    with (
+        patch.object(BaseStage, 'run', new=AsyncMock(return_value=base_report)),
+        patch(f'{module}.dedup_flags', new=_dedup_spy),
+        patch(
+            f'{module}.filter_false_absence_flags',
+            new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+        ),
+        patch(f'{module}.acknowledge_resolved_flags', new=ack_mock),
+    ):
+        report = await stage.run(
+            events=[] if events is None else events,
+            watermark=Watermark(project_id=stage.project_id),
+            prior_reports=[],
+            run_id='r-test',
+        )
+    return report, dedup_call_args, ack_mock
+
+
+class TestMemoryConsolidatorAlreadyRecordedCaveatFilter:
+    """filter_already_recorded_caveat_flags runs in MemoryConsolidator.run()'s
+    pre-dedup chain (task 5271).
+
+    A premature-widening-caveat flag whose cited caveat-source memory id is
+    already in the task's live metadata is dropped before dedup_flags, counted
+    in already_recorded_caveat_flags_dropped, and reclaimed as RESOLVED via
+    acknowledge_resolved_flags(mode='delete').
+    """
+
+    _CAVEAT_MEMORY_ID = '6597957b-2269-4913-b4a3-8c5bff0df51d'
+
+    def _stage(self, *, hint_queries: list[str]) -> MemoryConsolidator:
+        stage = MemoryConsolidator(StageId.memory_consolidator, **_mock_stage_deps())
+        stage.scope = _scope('pump_web_ui', '/proj')
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        task_18 = {
+            'id': 18,
+            'title': 'Widen the pump-curve evidence window',
+            'status': 'pending',
+            'description': '',
+            'details': '',
+            'metadata': {'memory_hints': {'queries': hint_queries}},
+        }
+        stage.taskmaster = AsyncMock()
+        stage.taskmaster.get_task = AsyncMock(
+            side_effect=lambda tid, root: task_18 if str(tid) == '18' else {'status': 'pending'}
+        )
+        return stage
+
+    def _caveat_flag(self) -> dict:
+        return {
+            'task_id': '18',
+            'flag_type': 'premature_widening_evidence_caveat',
+            'category': 'task_metadata_gap',
+            'description': (
+                "Task 18's metadata.memory_hints still lacks the premature-widening "
+                'evidence caveat.'
+            ),
+            'cited_tasks': [{'project_id': 'pump_web_ui', 'task_id': '18', 'title': 't'}],
+            'cited_memories': [{'memory_id': self._CAVEAT_MEMORY_ID, 'store': 'mem0'}],
+        }
+
+    @pytest.mark.asyncio
+    async def test_recorded_caveat_is_dropped_counted_and_reclaimed(self):
+        stage = self._stage(hint_queries=[
+            'task 18 temporal caveat recorded 2026-07-30c. '
+            f'Full rationale: Mem0 memory {self._CAVEAT_MEMORY_ID}.',
+        ])
+        caveat_flag = self._caveat_flag()
+        survivor = {'task_id': '2000', 'flag_type': 'missing_deliverable'}
+
+        report, dedup_call_args, ack_mock = await _run_consolidator_filter_chain(
+            stage, [caveat_flag, survivor],
+        )
+
+        assert caveat_flag not in (report.items_flagged or []), (
+            "the caveat is already in task 18's live metadata, so the flag must "
+            'be dropped'
+        )
+        assert survivor in (report.items_flagged or [])
+        assert report.stats.get('already_recorded_caveat_flags_dropped') == 1
+        assert len(dedup_call_args) == 1, 'dedup_flags must be called exactly once'
+        assert caveat_flag not in dedup_call_args[0], (
+            'the dropped flag must NOT reach dedup_flags, or a stage1_flag_marker '
+            'is written for it every cycle'
+        )
+        assert survivor in dedup_call_args[0]
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_kwargs = ack_mock.await_args.kwargs
+        assert call_kwargs.get('mode') == 'delete'
+        assert call_kwargs.get('resolved_flags') == [caveat_flag], (
+            'the drop is a RESOLUTION, so exactly the caveat flag must be '
+            f'acknowledged; got {call_kwargs.get("resolved_flags")!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_caveat_survives_with_a_zero_stat(self):
+        stage = self._stage(hint_queries=['pump curve evidence window widening'])
+        caveat_flag = self._caveat_flag()
+
+        report, _, _ = await _run_consolidator_filter_chain(stage, [caveat_flag])
+
+        assert caveat_flag in (report.items_flagged or [])
+        assert report.stats.get('already_recorded_caveat_flags_dropped') == 0, (
+            'the stat must be present (always-present-within-the-block) and 0; '
+            f'got stats={report.stats!r}'
+        )
+
+
+class TestMemoryConsolidatorBenignSweepDeletionFilter:
+    """filter_benign_sweep_deletion_flags runs in MemoryConsolidator.run()'s
+    pre-dedup chain (task 5271), over the events run() was handed.
+
+    A deletion-pattern flag whose swept id a documented sweep tombstoned is
+    dropped before dedup_flags, counted in benign_sweep_deletion_flags_dropped,
+    and reclaimed as RESOLVED via acknowledge_resolved_flags(mode='delete').
+    """
+
+    _SWEPT = '445c97ac-14d7-4956-9e46-e4475eecff16'
+
+    def _stage(self, *, tombstoned: bool) -> MemoryConsolidator:
+        stage = MemoryConsolidator(StageId.memory_consolidator, **_mock_stage_deps())
+        stage.scope = _scope('p', '/proj')
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        stage.taskmaster = AsyncMock()
+        stage.taskmaster.get_task = AsyncMock(return_value={'status': 'pending'})
+        trim = {'deleter': 'stage1_cycle_summary_trim', 'deleting_run_id': 'run-trim'}
+        stage.memory.get_mem0_deletion_tombstone = AsyncMock(
+            side_effect=lambda pid, mid: trim if tombstoned and mid == self._SWEPT else None
+        )
+        return stage
+
+    def _deletion_flag(self) -> dict:
+        return {
+            'task_id': '165',
+            'flag_type': 'mem0_evidentiary_anchor_deletion_pattern',
+            'description': (
+                f'Evidentiary-anchor deletion recurs: mem0 {self._SWEPT} deleted '
+                '+0.065s after the ledger-stamp write.'
+            ),
+        }
+
+    def _deleted_event(self) -> ReconciliationEvent:
+        return ReconciliationEvent(
+            id='evt-deleted',
+            type=EventType.memory_deleted,
+            source=EventSource.agent,
+            project_id='p',
+            timestamp=datetime.now(UTC),
+            payload={'memory_id': self._SWEPT},
+        )
+
+    @pytest.mark.asyncio
+    async def test_benign_sweep_flag_is_dropped_counted_and_reclaimed(self):
+        stage = self._stage(tombstoned=True)
+        deletion_flag = self._deletion_flag()
+        survivor = {'task_id': '2000', 'flag_type': 'missing_deliverable'}
+
+        report, dedup_call_args, ack_mock = await _run_consolidator_filter_chain(
+            stage, [deletion_flag, survivor], events=[self._deleted_event()],
+        )
+
+        assert deletion_flag not in (report.items_flagged or []), (
+            'the only swept id carries a documented trim tombstone, so the flag '
+            'describes a designed sweep and must be dropped'
+        )
+        assert survivor in (report.items_flagged or [])
+        assert report.stats.get('benign_sweep_deletion_flags_dropped') == 1
+        assert len(dedup_call_args) == 1, 'dedup_flags must be called exactly once'
+        assert deletion_flag not in dedup_call_args[0], (
+            'the dropped flag must NOT reach dedup_flags, or a stage1_flag_marker '
+            'is written for it every cycle'
+        )
+        ack_mock.assert_awaited_once()
+        assert ack_mock.await_args is not None
+        call_kwargs = ack_mock.await_args.kwargs
+        assert call_kwargs.get('mode') == 'delete'
+        assert call_kwargs.get('resolved_flags') == [deletion_flag], (
+            'the drop is a RESOLUTION, so exactly the deletion flag must be '
+            f'acknowledged; got {call_kwargs.get("resolved_flags")!r}'
+        )
+
+    @pytest.mark.parametrize(('with_event', 'decision'), [
+        (True, 'kept_unexplained_deletion'),
+        (False, 'kept_no_swept_ids'),
+    ])
+    @pytest.mark.asyncio
+    async def test_gate_reads_the_events_run_was_given(self, with_event, decision):
+        """Untombstoned, the id is swept only if run()'s events deleted it."""
+        stage = self._stage(tombstoned=False)
+        deletion_flag = self._deletion_flag()
+
+        report, _, _ = await _run_consolidator_filter_chain(
+            stage,
+            [deletion_flag],
+            events=[self._deleted_event()] if with_event else [],
+        )
+
+        survivors = [
+            f for f in report.items_flagged or []
+            if f.get('flag_type') == deletion_flag['flag_type']
+        ]
+        assert len(survivors) == 1, f'the flag must survive; got {report.items_flagged!r}'
+        assert report.stats.get('benign_sweep_deletion_flags_dropped') == 0, (
+            'the stat must be present (always-present-within-the-block) and 0; '
+            f'got stats={report.stats!r}'
+        )
+        assert survivors[0]['sweep_deletion_provenance']['decision'] == decision
 
 
 # ---------------------------------------------------------------------------
@@ -9025,6 +9327,162 @@ class TestSweepStaleMem0FlagForStage2Markers:
         assert tombstone.await_args is not None
         assert [v['id'] for v in tombstone.await_args.args[2]] == ['relay-terminal']
 
+    @pytest.mark.asyncio
+    async def test_default_max_age_days_is_the_wired_in_seven_day_ttl(self):
+        """Pins the default TTL: two markers one hour either side of the
+        7-day cutoff; max_age_days deliberately omitted so the default is
+        what is exercised.
+        """
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _sweep_stale_mem0_flag_for_stage2_markers,
+        )
+
+        fixed_now = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+        members = [
+            {
+                'id': 'stale-7d1h',
+                'created_at': (fixed_now - timedelta(days=7, hours=1)).isoformat(),
+                'metadata': {'flag_for_stage2': True, 'task_id': 't-done'},
+            },
+            {
+                'id': 'fresh-6d23h',
+                'created_at': (fixed_now - timedelta(days=6, hours=23)).isoformat(),
+                'metadata': {'flag_for_stage2': True, 'task_id': 't-done'},
+            },
+        ]
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=len(members))
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'reify', run_id='r1', now=fixed_now,
+            terminal_task_ids={'t-done'},
+        )
+
+        assert result == 1
+
+        deleted_ids = {
+            call.kwargs.get('memory_id') for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'stale-7d1h'}
+
+
+_RETIRE_NOW = datetime(2026, 9, 28, 12, 0, 0, tzinfo=UTC)
+_STALE_DAYS = _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS + 6
+
+
+def _relay_marker(mid: str, age_days: int, **metadata) -> dict:
+    return {
+        'id': mid,
+        'created_at': (_RETIRE_NOW - timedelta(days=age_days)).isoformat(),
+        'metadata': {'flag_for_stage2': True, **metadata},
+    }
+
+
+def _every_gate_pool() -> LiveFlagPool:
+    """One marker per gate for task T, plus one for another task."""
+    stale = _STALE_DAYS
+    return LiveFlagPool([
+        _relay_marker('eligible', stale, task_id='T', run_id='prior-run'),
+        _relay_marker('fresh', 1, task_id='T', run_id='prior-run'),
+        _relay_marker('mirror', stale, task_id='T', kind='cycle_summary'),
+        _relay_marker('audit', stale, task_id='T', kind='cadence_check'),
+        _relay_marker('other-task', stale, task_id='OTHER', run_id='prior-run'),
+    ])
+
+
+class TestRetireFlagMarkersForTerminalTask:
+    """retire_flag_markers_for_terminal_task is the done-transition hook's
+    public seam onto the per-cycle flag_for_stage2 retirement (task 4376): the
+    sweep's own composite rule, scoped to the one task that just closed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_inherits_every_sweep_gate_end_to_end(self):
+        from fused_memory.reconciliation.mem0_tombstone import PROTECTED_AUDIT_KINDS
+        assert 'cadence_check' in PROTECTED_AUDIT_KINDS
+        pool = _every_gate_pool()
+
+        result = await retire_flag_markers_for_terminal_task(
+            pool, 'dark_factory', 'run-1', task_id='  T  ', now=_RETIRE_NOW,
+        )
+
+        assert result == 1
+        assert pool.deleted_ids() == ['eligible']
+        assert pool.delete_memory.await_args is not None
+        kwargs = pool.delete_memory.await_args.kwargs
+        assert kwargs['store'] == 'mem0'
+        assert kwargs['project_id'] == 'dark_factory'
+        assert kwargs['causation_id'] == 'run-1'
+        assert kwargs['_source'] == _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE
+
+    @pytest.mark.asyncio
+    async def test_never_retires_what_the_sweep_would_keep(self):
+        hook_pool, sweep_pool = _every_gate_pool(), _every_gate_pool()
+
+        await retire_flag_markers_for_terminal_task(
+            hook_pool, 'dark_factory', 'done-run', task_id='T', now=_RETIRE_NOW,
+        )
+        await _sweep_stale_mem0_flag_for_stage2_markers(
+            sweep_pool, 'dark_factory', 'cycle-run',
+            terminal_task_ids={'T', 'OTHER'}, now=_RETIRE_NOW,
+        )
+
+        hook_deleted = set(hook_pool.deleted_ids())
+        sweep_deleted = set(sweep_pool.deleted_ids())
+        assert hook_deleted == {'eligible'}
+        assert hook_deleted <= sweep_deleted
+        assert sweep_deleted - hook_deleted == {'other-task'}
+
+    @pytest.mark.asyncio
+    async def test_reads_only_the_closing_tasks_markers(self):
+        pool = LiveFlagPool([
+            _relay_marker(f'other-{n}', _STALE_DAYS, task_id=f'OTHER-{n}')
+            for n in range(5)
+        ])
+
+        result = await retire_flag_markers_for_terminal_task(
+            pool, 'dark_factory', 'done-run', task_id='T', now=_RETIRE_NOW,
+        )
+
+        assert result == 0
+        assert pool.filters_read(), 'the hook must at least probe for the task'
+        assert all(f.get('task_id') == 'T' for f in pool.filters_read())
+        pool.get_memories_by_metadata.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_emits_none_of_the_sweeps_pool_wide_diagnostics(self, caplog):
+        stale = _STALE_DAYS
+        pool = LiveFlagPool([
+            _relay_marker('eligible', stale, task_id='T'),
+            _relay_marker('open-task', stale, task_id='OPEN'),
+            _relay_marker('audit', stale, task_id='OPEN', kind='cadence_check'),
+            {
+                'id': 'string-typed', 'created_at': _RETIRE_NOW.isoformat(),
+                'metadata': {'flag_for_stage2': 'true', 'task_id': 'OPEN'},
+            },
+        ])
+
+        with caplog.at_level(logging.WARNING):
+            retired = await retire_flag_markers_for_terminal_task(
+                pool, 'dark_factory', 'done-run', task_id='T', now=_RETIRE_NOW,
+            )
+        hook_warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            await _sweep_stale_mem0_flag_for_stage2_markers(
+                pool, 'dark_factory', 'cycle-run', terminal_task_ids={'T'}, now=_RETIRE_NOW,
+            )
+        sweep_warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+        assert retired == 1
+        assert hook_warnings == []
+        assert any('RETAINED 1 age-stale' in m for m in sweep_warnings), sweep_warnings
+        assert any('RETAINED 1 protected audit' in m for m in sweep_warnings), sweep_warnings
+        assert any("stored as the string 'true'" in m for m in sweep_warnings), sweep_warnings
+
 
 class TestWarnOnFlagForStage2TypeDrift:
     """_warn_on_flag_for_stage2_type_drift: best-effort boolean/string
@@ -12160,12 +12618,12 @@ class TestPropagateEscalationQueueHelper:
             )
 
 
-class TestStage2HintConversionDetection:
+class TestStage2HintAttentionDetection:
     """assemble_payload() surfaces Tasks Needing Memory Hint Attention section.
 
     Tests that the new conditional ``### Tasks Needing Memory Hint Attention``
     section is produced by ``assemble_payload()`` exactly when active tasks fail
-    ``_needs_hint_conversion()``.  Uses the harness-injection pattern
+    ``_needs_hint_attention()``.  Uses the harness-injection pattern
     (``stage.filtered_task_tree``) from ``TestTaskKnowledgeSyncFilteredTaskTree``
     to control the task pool without calling taskmaster.
     """
@@ -12198,7 +12656,7 @@ class TestStage2HintConversionDetection:
     def _make_task_no_hints(self, tid: int, status: str) -> dict:
         """Build a task dict whose ``metadata`` dict has no ``memory_hints`` key.
 
-        Covers the ``not task_hints`` (falsy) branch of ``_needs_hint_conversion``.
+        Covers the ``not task_hints`` (falsy) branch of ``_needs_hint_attention``.
         For the complementary case where ``metadata`` is absent entirely, use
         ``_make_task_no_metadata``.
         """
@@ -12208,9 +12666,9 @@ class TestStage2HintConversionDetection:
         """Build a task dict with no ``metadata`` key at all.
 
         Exercises the ``isinstance(metadata, dict) else None`` guard in
-        ``_needs_hint_conversion``: ``task.get('metadata')`` returns ``None``,
+        ``_needs_hint_attention``: ``task.get('metadata')`` returns ``None``,
         which is not a dict, so ``task_hints`` is forced to ``None`` (falsy →
-        ``_needs_hint_conversion`` returns ``True``).
+        ``_needs_hint_attention`` returns ``True``).
         """
         return {'id': tid, 'title': f'Task {tid}', 'status': status, 'dependencies': []}
 
@@ -12337,9 +12795,9 @@ class TestStage2HintConversionDetection:
         """Active task with no 'metadata' key at all must appear in the section.
 
         Exercises the ``isinstance(metadata, dict) else None`` guard in
-        ``_needs_hint_conversion``: ``task.get('metadata')`` returns ``None``
+        ``_needs_hint_attention``: ``task.get('metadata')`` returns ``None``
         (not a dict), so ``task_hints`` is forced to ``None`` → falsy →
-        ``_needs_hint_conversion`` returns ``True``.
+        ``_needs_hint_attention`` returns ``True``.
         """
         task = self._make_task_no_metadata(60, 'pending')
         stage = make_configured_task_knowledge_sync_stage(
@@ -12429,7 +12887,7 @@ class TestStage2HintConversionDetection:
         """
         import re as _re
 
-        # Positions 1..40: dict-format hints (non-qualifying via _needs_hint_conversion)
+        # Positions 1..40: dict-format hints (non-qualifying via _needs_hint_attention)
         tasks = [
             self._make_task_with_hints(
                 i, 'pending', {'entities': [f'E{i}'], 'queries': ['q']}
@@ -12682,7 +13140,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
     """assemble_payload() renders a '### Live-Workflow Signals' section when any
     active/proactive-sample task has a live workflow detected.
 
-    RED until step-10 adds _render_live_workflow_section + detect_live_workflow
+    RED until step-10 adds render_live_workflow_section + detect_live_workflow
     import to task_knowledge_sync.py.
     """
 
@@ -12707,16 +13165,25 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             max_task_id=max((t.get('id', 0) for t in tasks), default=0),
         )
 
-    @pytest.mark.asyncio
-    async def test_live_workflow_signals_section_present_for_live_task(
-        self, mock_deps, watermark, monkeypatch
-    ):
-        """When an active task is LIVE, '### Live-Workflow Signals' appears in payload
-        and includes the live task's id.
+    @staticmethod
+    def _live_workflow_section(payload: str) -> str:
+        """The '### Live-Workflow Signals' section of *payload*, up to the next markdown header."""
+        section_start = payload.find('### Live-Workflow Signals')
+        section_end = payload.find('\n#', section_start + 1)
+        return payload[section_start:section_end if section_end != -1 else None]
 
-        RED until step-10 implements _render_live_workflow_section.
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('remediation_mode', [False, True], ids=['full', 'remediation'])
+    async def test_live_workflow_signals_section_present_for_live_task(
+        self, mock_deps, watermark, monkeypatch, remediation_mode
+    ):
+        """When an active task is LIVE, '### Live-Workflow Signals' lists it — on both passes.
+
+        The remediation case is a characterization pin (task 5113): Stage 1's
+        remediation payload once dropped this section (task 3839), and
+        prompts/stage2.py reads its absence as "no task is live".
         """
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         live_task_id = '4321'
@@ -12745,21 +13212,28 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
                 last_commit_at=None,
             )
 
-        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
 
         stage = make_configured_task_knowledge_sync_stage(
             mock_deps, project_id='dark_factory', project_root='/project'
         )
         stage.filtered_task_tree = self._make_filtered_tree_with_tasks([live_task, other_task])
+        stage.remediation_mode = remediation_mode
 
         payload = await stage.assemble_payload([], watermark, [])
 
         assert '### Live-Workflow Signals' in payload, (
             f"Expected '### Live-Workflow Signals' section in payload; got snippet:\n{payload[-500:]!r}"
         )
-        assert live_task_id in payload, (
-            f"Expected live task id {live_task_id!r} listed under Live-Workflow Signals; "
-            f"got snippet:\n{payload[-500:]!r}"
+        # Sliced, because both task ids also appear in the Active Task Tree.
+        section_body = self._live_workflow_section(payload)
+        assert f'task/{live_task_id}' in section_body, (
+            f"Expected live task {live_task_id} listed under Live-Workflow Signals; "
+            f"got section:\n{section_body!r}"
+        )
+        assert f'task/{not_live_task_id}' not in section_body, (
+            f"Expected not-live task {not_live_task_id} NOT listed under Live-Workflow "
+            f"Signals; got section:\n{section_body!r}"
         )
 
     @pytest.mark.asyncio
@@ -12769,11 +13243,11 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         """When no active tasks are live, '### Live-Workflow Signals' is absent (keep prompt tight).
 
         Absent means the payload contains neither the header nor any live-task listing.
-        RED until step-10 implements _render_live_workflow_section (the section never
+        RED until step-10 implements render_live_workflow_section (the section never
         renders today, so this test may be GREEN trivially; the companion
         test_live_task_present test is the real RED driver).
         """
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         not_live_task = {'id': 100, 'title': 'Other task', 'status': 'pending'}
@@ -12788,7 +13262,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
                 last_commit_at=None,
             )
 
-        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
 
         stage = make_configured_task_knowledge_sync_stage(
             mock_deps, project_id='dark_factory', project_root='/project'
@@ -12810,9 +13284,9 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         """When a task is live with worktree + recent_commit signals firing, both signal
         names appear in the rendered section (structural presence check, not full prose).
 
-        RED until step-10 implements _render_live_workflow_section.
+        RED until step-10 implements render_live_workflow_section.
         """
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         live_task_id = '4321'
@@ -12827,7 +13301,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
                 last_commit_at=None,
             )
 
-        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
 
         stage = make_configured_task_knowledge_sync_stage(
             mock_deps, project_id='dark_factory', project_root='/project'
@@ -12842,9 +13316,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             f"Expected '### Live-Workflow Signals' section; got:\n{payload[-500:]!r}"
         )
         # The firing signals ('worktree' and/or 'recent-commit') should appear
-        section_start = payload.find('### Live-Workflow Signals')
-        section_end = payload.find('\n#', section_start + 1)
-        section_body = payload[section_start:section_end if section_end != -1 else None]
+        section_body = self._live_workflow_section(payload)
         assert 'worktree' in section_body.lower(), (
             f"Expected 'worktree' signal name in section; got section:\n{section_body!r}"
         )
@@ -12868,7 +13340,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         """
         import subprocess
 
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
 
         deferred_task_id = '452'
         pending_task_id = '100'
@@ -12880,7 +13352,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         }
 
         # Project-wide orchestrator lock reports live...
-        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+        monkeypatch.setattr(lws_module, 'is_orchestrator_live_for', lambda _pr: True)
 
         # ...and both git-derived signals are False for every branch (no worktree
         # registered, unparseable "commit timestamp" => recent_commit fail-safe
@@ -12906,9 +13378,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             f"Expected '### Live-Workflow Signals' section (pending task is live via "
             f"the orchestrator signal); got snippet:\n{payload[-500:]!r}"
         )
-        section_start = payload.find('### Live-Workflow Signals')
-        section_end = payload.find('\n#', section_start + 1)
-        section_body = payload[section_start:section_end if section_end != -1 else None]
+        section_body = self._live_workflow_section(payload)
 
         assert f'task/{pending_task_id}' in section_body, (
             f"Expected pending task 100 (status still eligible for the orchestrator "
@@ -12942,7 +13412,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         """
         import subprocess
 
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
 
         blocked_deterministic_id = '561'
         blocked_normal_id = '742'
@@ -12959,7 +13429,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         }
 
         # Project-wide orchestrator lock reports live...
-        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+        monkeypatch.setattr(lws_module, 'is_orchestrator_live_for', lambda _pr: True)
 
         # ...and both git-derived signals are False for every branch: no worktree
         # registered (porcelain lists only the main worktree), and the
@@ -13033,7 +13503,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         """
         import subprocess
 
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
 
         bare_normal_id = '2335'
         bare_kindless_id = '2196'
@@ -13057,7 +13527,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         }
 
         # Project-wide orchestrator lock reports live...
-        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+        monkeypatch.setattr(lws_module, 'is_orchestrator_live_for', lambda _pr: True)
 
         # ...and git-derived signals are False for every branch EXCEPT a registered
         # worktree for task/999 (the with_worktree_task's branch); `git log` exits
@@ -13091,9 +13561,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             f"Expected '### Live-Workflow Signals' section (the with-worktree task "
             f"is live); got snippet:\n{payload[-500:]!r}"
         )
-        section_start = payload.find('### Live-Workflow Signals')
-        section_end = payload.find('\n#', section_start + 1)
-        section_body = payload[section_start:section_end if section_end != -1 else None]
+        section_body = self._live_workflow_section(payload)
 
         assert f'task/{with_worktree_id}' in section_body, (
             f"Expected blocked normal task {with_worktree_id} WITH a registered "
@@ -13112,8 +13580,100 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         )
 
 
+class TestAssemblePayloadRequiredSections:
+    """assemble_payload() carries every REQUIRED_SECTIONS renderer's output (task 5113).
+
+    Driven through a TWO-member STAND-IN registry of stub renderers: against
+    the real single-member registry, registry order and the absence of a
+    separator are not falsifiable. That the real registry's sections reach the
+    payload is pinned by TestAssemblePayloadLiveWorkflowSignalsSection.
+    """
+
+    STUB_REGISTRY = (
+        RequiredSection('### Alpha', 'stub_alpha'),
+        RequiredSection('### Beta', 'stub_beta'),
+    )
+    EXPECTED_SECTIONS = '\n### Alpha\nfirst\n\n### Beta\nsecond\n'
+
+    @pytest.fixture
+    def mock_deps(self):
+        return _mock_stage_deps()
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='dark_factory')
+
+    def _install_stub_registry(self, stage, monkeypatch) -> dict[str, FilteredTaskTree]:
+        """Swap in STUB_REGISTRY; return the tree each stub renderer received, by stub."""
+        received: dict[str, FilteredTaskTree] = {}
+
+        async def stub_alpha(filtered: FilteredTaskTree) -> str:
+            received['alpha'] = filtered
+            return '\n### Alpha\nfirst\n'
+
+        async def stub_beta(filtered: FilteredTaskTree) -> str:
+            received['beta'] = filtered
+            return '\n### Beta\nsecond\n'
+
+        monkeypatch.setattr(stage, 'stub_alpha', stub_alpha, raising=False)
+        monkeypatch.setattr(stage, 'stub_beta', stub_beta, raising=False)
+        monkeypatch.setattr(TaskKnowledgeSync, 'REQUIRED_SECTIONS', self.STUB_REGISTRY)
+        return received
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('remediation_mode', [False, True], ids=['full', 'remediation'])
+    async def test_payload_carries_registry_renderers_in_order_without_separator(
+        self, mock_deps, watermark, monkeypatch, remediation_mode
+    ):
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='dark_factory', project_root='/project'
+        )
+        stage.filtered_task_tree = filter_task_tree(
+            {'tasks': [{'id': 7, 'title': 'Any task', 'status': 'pending'}]}
+        )
+        stage.remediation_mode = remediation_mode
+        received = self._install_stub_registry(stage, monkeypatch)
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert self.EXPECTED_SECTIONS in payload, (
+            "The Stage-2 payload must carry its registry renderers' output "
+            'concatenated in REGISTRY ORDER, with no separator and no '
+            f'post-processing; expected {self.EXPECTED_SECTIONS!r} in:\n{payload!r}'
+        )
+        assert received.get('alpha') is stage.filtered_task_tree
+        assert received.get('beta') is stage.filtered_task_tree
+
+    @pytest.mark.asyncio
+    async def test_self_fetched_tree_reaches_every_registry_renderer(
+        self, mock_deps, watermark, monkeypatch
+    ):
+        """With no harness-injected tree, renderers get the tree assemble_payload fetched.
+
+        Pins Stage 2's contract over Stage 1's zero-arg aggregator: a renderer
+        reading self.filtered_task_tree would see None on this path.
+        """
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [{'id': 7, 'title': 'Fetched task', 'status': 'pending'}]
+        }
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='dark_factory', project_root='/project'
+        )
+        received = self._install_stub_registry(stage, monkeypatch)
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert self.EXPECTED_SECTIONS in payload
+        assert stage.filtered_task_tree is None
+        assert received['alpha'] is received['beta'], (
+            'Every Stage-2 registry renderer must receive the SAME resolved '
+            f'FilteredTaskTree; received {received!r}'
+        )
+        assert [task['id'] for task in received['alpha'].active_tasks] == [7]
+
+
 class TestRenderLiveWorkflowSectionEmptyTasksNoOp:
-    """_render_live_workflow_section retains its empty-``tasks`` no-op (task
+    """render_live_workflow_section retains its empty-``tasks`` no-op (task
     2150 step-3/4): the falsy-``project_root`` half of its guard is dead code
     under a required ProjectScope and is deleted in step-4, but the
     empty-``tasks`` half survives — this pins that surviving behavior so the
@@ -13122,17 +13682,17 @@ class TestRenderLiveWorkflowSectionEmptyTasksNoOp:
 
     @pytest.mark.asyncio
     async def test_empty_tasks_returns_empty_string(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
-        result = await _render_live_workflow_section(tasks=[], project_root=ProjectRoot('/p'))
+        result = await render_live_workflow_section(tasks=[], project_root=ProjectRoot('/p'))
 
         assert result == ''
 
 
 class TestRenderLiveWorkflowSectionCorroborationGate:
-    """_render_live_workflow_section threads per-task corroboration into
+    """render_live_workflow_section threads per-task corroboration into
     detect_live_workflow for IN-PROGRESS tasks (task 2963 step-8).
 
     Scenario: an in-progress task whose ONLY live signals are a lingering
@@ -13233,17 +13793,17 @@ class TestRenderLiveWorkflowSectionCorroborationGate:
         }
 
     async def _render(self, tmp_path, task, monkeypatch):
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        import fused_memory.reconciliation.live_workflow_section as lws_module
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
         # Project-wide orchestrator lock reports live (a real PID check would
         # fail against the fake PID in the lock file — orchestrator_started_at
         # only parses the `started` token and needs no live PID).
-        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+        monkeypatch.setattr(lws_module, 'is_orchestrator_live_for', lambda _pr: True)
         with patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(self._git_side_effect())):
-            return await _render_live_workflow_section(
+            return await render_live_workflow_section(
                 [task], ProjectRoot(str(tmp_path)), now=self._NOW
             )
 
@@ -13349,7 +13909,7 @@ class TestRenderLiveWorkflowSectionCorroborationGate:
 
 
 class TestRenderLiveWorkflowSectionPendingPureGate:
-    """_render_live_workflow_section drops the bare project-wide orchestrator
+    """render_live_workflow_section drops the bare project-wide orchestrator
     signal for a PENDING deterministic PURE GATE (task 3751 step-9/10).
 
     The observed Stage-2 symptom: dark_factory task 3845 — a pending
@@ -13416,19 +13976,19 @@ class TestRenderLiveWorkflowSectionPendingPureGate:
         return side_effect
 
     async def _render(self, tmp_path, task, monkeypatch, *, worktree_for_branch=None):
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        import fused_memory.reconciliation.live_workflow_section as lws_module
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
-        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+        monkeypatch.setattr(lws_module, 'is_orchestrator_live_for', lambda _pr: True)
         with patch(
             'fused_memory.services.live_workflow_detector.run_git',
             side_effect=as_async_run_git(
                 self._git_side_effect(worktree_for_branch=worktree_for_branch)
             ),
         ):
-            return await _render_live_workflow_section(
+            return await render_live_workflow_section(
                 [task], ProjectRoot(str(tmp_path)), now=self._NOW
             )
 
@@ -13468,8 +14028,8 @@ class TestRenderLiveWorkflowSectionPendingPureGate:
 
         result = await self._render(tmp_path, task, monkeypatch)
 
-        assert f'- {self._BRANCH}: orchestrator' in result, (
-            f"Expected {self._BRANCH} STILL listed with the orchestrator signal "
+        assert f'- {self._BRANCH}: {NO_PER_TASK_SIGNAL_TOKEN}' in result, (
+            f"Expected {self._BRANCH} STILL listed through the project-wide lock "
             f"(before_done disqualifies the pure-gate shape); got:\n{result!r}"
         )
 
@@ -13484,7 +14044,7 @@ class TestRenderLiveWorkflowSectionPendingPureGate:
 
         result = await self._render(tmp_path, task, monkeypatch)
 
-        assert f'- {self._BRANCH}: orchestrator' in result, (
+        assert f'- {self._BRANCH}: {NO_PER_TASK_SIGNAL_TOKEN}' in result, (
             f"Expected pending NORMAL task {self._BRANCH} STILL listed — rule 5 is "
             f"deterministic-only; got:\n{result!r}"
         )
@@ -16211,7 +16771,7 @@ class TestSweepStaleMem0PoolTombstones:
 class TestRenderLiveWorkflowSectionHoistsWorktreeList:
     """`git worktree list` runs ONCE per render, not once per task.
 
-    The measured defect: `_render_live_workflow_section` already hoists three
+    The measured defect: `render_live_workflow_section` already hoists three
     per-render invariants (`is_orchestrator_live_for`, `read_scheduler_state`,
     `orchestrator_started_at`) but not the fourth and most expensive one — the
     whole-repo worktree list, which `detect_live_workflow` re-ran inside
@@ -16266,14 +16826,14 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
     @pytest.mark.parametrize('n_tasks', [1, 8, 30])
     @pytest.mark.asyncio
     async def test_worktree_list_probe_count_is_constant_in_task_count(self, n_tasks):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
         side_effect, counts = self._counting_side_effect()
 
         with patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(side_effect)):
-            await _render_live_workflow_section(
+            await render_live_workflow_section(
                 tasks=self._tasks(n_tasks),
                 project_root=ProjectRoot('/p'),
                 now=self._NOW,
@@ -16292,16 +16852,16 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
         *unknown* (which degrades to exactly the pre-hoist per-task probe
         path), and pins that the two agree byte-for-byte.
         """
-        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        from fused_memory.reconciliation import live_workflow_section as lws
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
         side_effect, _ = self._counting_side_effect()
         tasks = self._tasks(4)
 
         with patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(side_effect)):
-            hoisted = await _render_live_workflow_section(
+            hoisted = await render_live_workflow_section(
                 tasks=tasks, project_root=ProjectRoot('/p'), now=self._NOW,
             )
 
@@ -16310,9 +16870,9 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
             patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(side_effect)),
             # `{}` from worktree_index_kwargs means *unknown* — omit the kwarg.
             # (A known-empty repo would be `{'worktree_index': {}}`.)
-            patch.object(tks, 'worktree_index_kwargs', return_value={}),
+            patch.object(lws, 'worktree_index_kwargs', return_value={}),
         ):
-            per_task = await _render_live_workflow_section(
+            per_task = await render_live_workflow_section(
                 tasks=tasks, project_root=ProjectRoot('/p'), now=self._NOW,
             )
 
@@ -16332,18 +16892,18 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
         a state production can no longer reach. That catch is unit-tested where
         it lives (test_live_workflow_detector.py::TestWorktreeIndexKwargs).
         """
-        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        from fused_memory.reconciliation import live_workflow_section as lws
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
         side_effect, counts = self._counting_side_effect()
 
         with (
             patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(side_effect)),
-            patch.object(tks, 'worktree_index_kwargs', return_value={}),
+            patch.object(lws, 'worktree_index_kwargs', return_value={}),
         ):
-            result = await _render_live_workflow_section(
+            result = await render_live_workflow_section(
                 tasks=self._tasks(3), project_root=ProjectRoot('/p'), now=self._NOW,
             )
 
@@ -16362,8 +16922,8 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
         sentinel rather than raising — so the WARNING has to come from the
         detector, and the section must still render off the surviving signals.
         """
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
         detector_logger = 'fused_memory.services.live_workflow_detector'
@@ -16393,7 +16953,7 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
                 side_effect=as_async_run_git(failing_worktree_list),
             ),
         ):
-            result = await _render_live_workflow_section(
+            result = await render_live_workflow_section(
                 tasks=self._tasks(3), project_root=ProjectRoot('/p'), now=self._NOW,
             )
 
@@ -16465,14 +17025,14 @@ class TestRenderLiveWorkflowSectionCapsFanOut:
         return fake
 
     async def _render(self, tasks, monkeypatch):
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        import fused_memory.reconciliation.live_workflow_section as lws_module
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
         probed: list[str] = []
         monkeypatch.setattr(
-            tks_module, 'detect_live_workflow', self._recording_detector(probed)
+            lws_module, 'detect_live_workflow', self._recording_detector(probed)
         )
         # Neutralise the (already-tested) per-render hoists so this class
         # measures only the fan-out, with no real subprocess. `{'worktree_index':
@@ -16489,8 +17049,8 @@ class TestRenderLiveWorkflowSectionCapsFanOut:
         async def _worktree_index_kwargs(_pr):
             return {'worktree_index': {}}
 
-        monkeypatch.setattr(tks_module, 'worktree_index_kwargs', _worktree_index_kwargs)
-        result = await _render_live_workflow_section(
+        monkeypatch.setattr(lws_module, 'worktree_index_kwargs', _worktree_index_kwargs)
+        result = await render_live_workflow_section(
             tasks=tasks, project_root=ProjectRoot('/p'), now=self._NOW,
         )
         return result, probed
@@ -16575,9 +17135,9 @@ class TestRenderLiveWorkflowSectionCapsFanOut:
         Monkeypatching `MAX_ACTIVE_TASKS_RENDERED` in the renderer's namespace
         must move the cap; a hard-coded `50` in the renderer reads RED here.
         """
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
 
-        monkeypatch.setattr(tks_module, 'MAX_ACTIVE_TASKS_RENDERED', 5)
+        monkeypatch.setattr(lws_module, 'MAX_ACTIVE_TASKS_RENDERED', 5)
 
         with caplog.at_level(logging.WARNING, logger=self._LOGGER):
             _result, probed = await self._render(self._tasks(12), monkeypatch)
@@ -16625,7 +17185,7 @@ class TestLiveWorkflowRenderIsNonBlocking:
     """The renderer must not pin the event loop while it shells out to git.
 
     This is the defect task 3778 exists to fix, stated as a test: the recon
-    payload assembler awaited a SYNC `_render_live_workflow_section` that ran
+    payload assembler awaited a SYNC `render_live_workflow_section` that ran
     blocking `subprocess.run` once per active task, so for 15-43 s at a stretch
     nothing else on the loop — health checks, heartbeats, MCP replies — could
     run at all.
@@ -16642,11 +17202,11 @@ class TestLiveWorkflowRenderIsNonBlocking:
     def test_renderer_is_a_coroutine_function(self):
         import inspect
 
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
-        assert inspect.iscoroutinefunction(_render_live_workflow_section)
+        assert inspect.iscoroutinefunction(render_live_workflow_section)
 
     def test_memory_consolidator_section_builder_is_a_coroutine_function(self):
         import inspect
@@ -16665,7 +17225,7 @@ class TestLiveWorkflowRenderIsNonBlocking:
 
         from shared.git_async import GitResult
 
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services import live_workflow_detector as lwd
 
         probe_delay = 0.02
@@ -16676,7 +17236,7 @@ class TestLiveWorkflowRenderIsNonBlocking:
             return GitResult(returncode=1, stdout='', stderr='')
 
         monkeypatch.setattr(lwd, 'run_git', slow_run_git)
-        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: False)
+        monkeypatch.setattr(lws_module, 'is_orchestrator_live_for', lambda _pr: False)
 
         ticks = 0
         stop = False
@@ -16689,7 +17249,7 @@ class TestLiveWorkflowRenderIsNonBlocking:
 
         tick_task = asyncio.create_task(ticker())
         try:
-            await tks_module._render_live_workflow_section(
+            await lws_module.render_live_workflow_section(
                 tasks=[{'id': str(i), 'status': 'pending'} for i in range(n_tasks)],
                 project_root=ProjectRoot('/p'),
                 now=self._NOW,
@@ -16997,6 +17557,249 @@ class TestMemoryConsolidatorEntityStandingDecision:
 
         assert report.stats['entity_standing_decision_suppressed'] == 0
         assert esd_mock.await_count == 0, 'a remediation pass must not run the filter'
+
+
+# ---------------------------------------------------------------------------
+# Task 2943 — the storm escape's cross-cycle streak arm, wired into
+# MemoryConsolidator.run():
+#   • every full cycle advances each standing decision's suppression streak,
+#     including a zero-flag cycle, which never enters the filter chain yet is a
+#     quiet cycle that must reset the streak;
+#   • a decision whose streak has reached K and that suppressed more than N
+#     flags in total across its last K cycles files a storm-category L1 when an
+#     escalation queue is wired, while the streak state accrues with or without
+#     one;
+#   • one flag per cycle, which is how a decision that works behaves, never
+#     files, however long its streak;
+#   • a remediation pass neither increments nor resets.
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryConsolidatorSuppressionStreak:
+    """MemoryConsolidator.run() accounts cross-cycle suppression streaks (task 2943)."""
+
+    _U = TestMemoryConsolidatorEntityStandingDecision._U
+    _STAT = 'entity_standing_decision_max_suppression_streak'
+    _make_base_report = TestMemoryConsolidatorEntityStandingDecision._make_base_report
+    _ledger_with_active_decision = (
+        TestMemoryConsolidatorEntityStandingDecision._ledger_with_active_decision
+    )
+    _strong_flag = TestMemoryConsolidatorEntityStandingDecision._strong_flag
+
+    @pytest.fixture
+    def stage(self):
+        config = ReconciliationConfig(enabled=True, explore_codebase_root='/tmp/test')
+        stage = MemoryConsolidator(
+            StageId.memory_consolidator,
+            memory_service=AsyncMock(),
+            taskmaster=AsyncMock(),
+            journal=AsyncMock(),
+            config=config,
+            scope=_scope('test_project', '/tmp/test'),
+        )
+        stage.scope = _scope('p', '/proj')
+        stage.episode_limit = 10
+        stage.memory_limit = 10
+        return stage
+
+    async def _run_cycle(self, stage, run_id: str, flags: list[dict]) -> StageReport:
+        """One full Stage-1 cycle whose LLM pass emitted *flags*."""
+        with (
+            patch.object(
+                BaseStage, 'run', new=AsyncMock(return_value=self._make_base_report(flags))
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.dedup_flags',
+                new=AsyncMock(side_effect=lambda **kwargs: kwargs.get('flags', [])),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.filter_false_absence_flags',
+                new=AsyncMock(side_effect=lambda taskmaster, project_root, flags: flags),
+            ),
+            patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.acknowledge_resolved_flags',
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            return await stage.run(
+                events=[],
+                watermark=Watermark(project_id='p'),
+                prior_reports=[],
+                run_id=run_id,
+            )
+
+    async def _suppressing_cycle(self, stage, run_id: str) -> StageReport:
+        """A full cycle in which the seeded decision suppresses ONE flag (< N)."""
+        return await self._run_cycle(stage, run_id, [self._strong_flag('oversized_entity')])
+
+    async def _stored_streak(self, ledger) -> int | None:
+        rows = await ledger.list_suppression_streaks('p')
+        return {row.entity_uuid: row.streak for row in rows}.get(self._U)
+
+    def _pending_storms(self, queue) -> list:
+        return [
+            esc
+            for esc in queue.get_by_task(self._U, status='pending', level=1)
+            if esc.category == CATEGORY_STANDING_DECISION_STORM
+        ]
+
+    @pytest.mark.asyncio
+    async def test_one_flag_per_cycle_never_files(self, stage, tmp_path):
+        """The review-round-1 regression, end to end. A decision that works
+        suppresses its re-derived complaint about once per cycle; K+1 such
+        cycles carry its streak past K and file nothing."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'escalations')
+        stage._escalation_queue = queue
+        ledger = await self._ledger_with_active_decision(tmp_path)
+        stage.memory.recon_ledger = ledger
+
+        observed = []
+        try:
+            for n in range(1, SUPPRESSION_STREAK_THRESHOLD_CYCLES + 2):
+                report = await self._suppressing_cycle(stage, f'r-steady-{n}')
+                assert report.stats['entity_standing_decision_suppressed'] == 1
+                observed.append((report.stats[self._STAT], len(self._pending_storms(queue))))
+        finally:
+            await ledger.close()
+
+        assert observed == [(1, 0), (2, 0), (3, 0), (4, 0)]
+
+    @pytest.mark.asyncio
+    async def test_sustained_volume_files_on_the_kth_cycle(self, stage, tmp_path):
+        """Two flags per cycle stay under the per-cycle N, yet total more than
+        N across K consecutive cycles, so the streak escape files on the Kth."""
+        from escalation.queue import EscalationQueue
+
+        queue = EscalationQueue(tmp_path / 'escalations')
+        stage._escalation_queue = queue
+        ledger = await self._ledger_with_active_decision(tmp_path)
+        stage.memory.recon_ledger = ledger
+
+        observed = []
+        try:
+            for n in range(1, 4):
+                flags = [
+                    self._strong_flag('oversized_entity'),
+                    self._strong_flag('topic_conflation'),
+                ]
+                report = await self._run_cycle(stage, f'r-volume-{n}', flags)
+                assert report.stats['entity_standing_decision_suppressed'] == 2
+                observed.append(
+                    (report.stats[self._STAT], await self._stored_streak(ledger),
+                     len(self._pending_storms(queue)))
+                )
+        finally:
+            await ledger.close()
+
+        assert observed == [(1, 1, 0), (2, 2, 0), (3, 3, 1)]
+
+    @pytest.mark.asyncio
+    async def test_streak_accrues_without_an_escalation_queue(self, stage, tmp_path):
+        """State is real before a queue is wired; only the filing needs one."""
+        assert stage._escalation_queue is None
+        ledger = await self._ledger_with_active_decision(tmp_path)
+        stage.memory.recon_ledger = ledger
+        filer = AsyncMock(return_value=[])
+
+        try:
+            with patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.'
+                'maybe_escalate_suppression_streak',
+                new=filer,
+            ):
+                for n in range(1, 4):
+                    report = await self._suppressing_cycle(stage, f'r-noqueue-{n}')
+            assert await self._stored_streak(ledger) == 3
+        finally:
+            await ledger.close()
+
+        assert report.stats[self._STAT] == 3
+        filer.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_zero_flag_full_cycle_resets_the_streak(self, stage, tmp_path):
+        """A cycle whose LLM pass flagged nothing never enters the filter chain,
+        yet it is a quiet cycle, not a skipped one.  Without the reset, a
+        decision suppressing on alternate cycles would reach K with gaps."""
+        ledger = await self._ledger_with_active_decision(tmp_path)
+        stage.memory.recon_ledger = ledger
+
+        try:
+            await self._suppressing_cycle(stage, 'r-reset-1')
+            await self._suppressing_cycle(stage, 'r-reset-2')
+            assert await self._stored_streak(ledger) == 2
+
+            report = await self._run_cycle(stage, 'r-reset-3', [])
+            assert await self._stored_streak(ledger) == 0
+        finally:
+            await ledger.close()
+
+        assert report.items_flagged == []
+        assert report.stats[self._STAT] == 0
+
+    @pytest.mark.asyncio
+    async def test_remediation_pass_neither_increments_nor_resets(self, stage, tmp_path):
+        ledger = await self._ledger_with_active_decision(tmp_path)
+        stage.memory.recon_ledger = ledger
+        updater = AsyncMock(return_value=[])
+
+        try:
+            await self._suppressing_cycle(stage, 'r-rem-1')
+            await self._suppressing_cycle(stage, 'r-rem-2')
+
+            stage.remediation_findings = [{'description': 'fix me'}]
+            with patch(
+                'fused_memory.reconciliation.stages.memory_consolidator.'
+                'update_suppression_streaks',
+                new=updater,
+            ):
+                report = await self._suppressing_cycle(stage, 'r-rem-3')
+            assert await self._stored_streak(ledger) == 2
+        finally:
+            await ledger.close()
+
+        updater.assert_not_awaited()
+        assert report.stats[self._STAT] == 0
+
+    @pytest.mark.asyncio
+    async def test_both_escapes_run_with_one_per_cycle_n(self, stage, tmp_path):
+        """The streak total leaves out a cycle over the per-cycle N only because
+        the per-cycle escape reported it, so the two must be handed one N."""
+        from escalation.queue import EscalationQueue
+
+        stage._escalation_queue = EscalationQueue(tmp_path / 'escalations')
+        ledger = await self._ledger_with_active_decision(tmp_path)
+        stage.memory.recon_ledger = ledger
+        storm = AsyncMock(return_value=[])
+        updater = AsyncMock(return_value=[])
+        consolidator = 'fused_memory.reconciliation.stages.memory_consolidator'
+
+        try:
+            with (
+                patch(f'{consolidator}.maybe_escalate_suppression_storm', new=storm),
+                patch(f'{consolidator}.update_suppression_streaks', new=updater),
+            ):
+                await self._suppressing_cycle(stage, 'r-shared-n')
+        finally:
+            await ledger.close()
+
+        assert storm.await_args is not None
+        assert updater.await_args is not None
+        assert storm.await_args.kwargs['threshold'] == SUPPRESSION_STORM_THRESHOLD_PER_CYCLE
+        assert (
+            updater.await_args.kwargs['per_cycle_threshold']
+            == storm.await_args.kwargs['threshold']
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_publishes_zero_and_does_not_raise(self, stage):
+        stage.memory.recon_ledger = None
+
+        report = await self._suppressing_cycle(stage, 'r-noledger')
+
+        assert report.stats[self._STAT] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -17340,3 +18143,45 @@ class TestMemoryConsolidatorPreservationSpecimenGuard:
         pending = queue.get_by_task('3105', status='pending', level=1)
         assert len(pending) == 1
         assert pending[0].category == 'reconciliation_preservation_specimen_storm'
+
+
+class TestTypedAbsenceReachesEveryPrompt:
+    """A widened payload nobody reads is a no-op (task 3731).
+
+    The service can now distinguish a genuine gap from a stage that never ran
+    and from a row the TTL reaped, but that only removes false findings if the
+    prompts consuming the presence check name every branch it can return. This
+    is the producer/consumer coupling guard.
+
+    Token-level by design, matching the style
+    ``test_stage1_prompt_checks_ledger_for_stage2_summary`` documents: a
+    ``reason`` literal is a value the service really returns and cannot occur
+    incidentally, so harmless rewording does not break this while a dropped
+    branch does. Nothing here pins the prompts' PROSE — how each branch phrases
+    its gate is a wording choice, and a test that pinned it would fail on a
+    reword that changed no behaviour while still passing on a prompt that kept
+    the words and dropped the branch.
+    """
+
+    @staticmethod
+    def _prompts():
+        from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
+        from fused_memory.reconciliation.prompts.stage2 import (
+            build_stage2_system_prompt,
+        )
+        from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
+
+        return {
+            'stage1': STAGE1_SYSTEM_PROMPT,
+            'stage2': build_stage2_system_prompt('dark_factory'),
+            'stage3': STAGE3_SYSTEM_PROMPT,
+        }
+
+    @pytest.mark.parametrize('reason', ['stage_not_run', 'expired', 'run_unknown'])
+    def test_every_reason_the_service_can_return_is_named(self, reason):
+        for name, prompt in self._prompts().items():
+            assert reason in prompt, (
+                f'{name} consumes get_cycle_summary_presence but never names '
+                f'reason={reason!r}. An unnamed reason is one the stage cannot '
+                f'act on, so the absence silently reads as a gap again.'
+            )

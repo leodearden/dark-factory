@@ -1,4 +1,14 @@
-"""SQLite-backed write journal for durable auditing of all memory writes."""
+"""SQLite-backed write journal for durable auditing of all memory writes.
+
+``OPERATOR_TELEMETRY_QUERY`` is the read-only per-write telemetry query, which
+operators run through ``fused-memory/scripts/telemetry_query.py`` (OPERATIONS.md
+§11). In it, a NULL ``backend_ops.duration_ms`` means the row predates the
+column; a value is the measured backend-call time, excluding identity-lock and
+queue wait. Its token columns are populated only on graphiti LLM-bearing
+writes. They are attributed to their write exactly, but they count what the
+upstream LLM client records, so tokens from failed or retried attempts are not
+included.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +24,8 @@ from pathlib import Path
 
 import aiosqlite
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
+
+from fused_memory.backends.llm_token_usage import LlmTokenUsage
 
 logger = logging.getLogger(__name__)
 
@@ -189,7 +201,8 @@ CREATE TABLE IF NOT EXISTS backend_ops (
     result_summary TEXT,
     success INTEGER DEFAULT 1,
     error TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    duration_ms REAL  -- backend-call milliseconds; NULL = not measured / predates the column
 );
 CREATE INDEX IF NOT EXISTS idx_bo_write_op ON backend_ops(write_op_id);
 CREATE INDEX IF NOT EXISTS idx_bo_causation ON backend_ops(causation_id);
@@ -271,6 +284,44 @@ CREATE TABLE IF NOT EXISTS referent_findings (
 CREATE INDEX IF NOT EXISTS idx_rf_group_time ON referent_findings(group_id, created_at);
 """
 
+#: Parameters: ``(since_iso_timestamp, limit)``.
+OPERATOR_TELEMETRY_QUERY = """
+SELECT
+    bo.created_at AS created_at,
+    wo.operation AS operation,
+    wo.project_id AS project_id,
+    bo.backend AS backend,
+    bo.success AS success,
+    bo.duration_ms AS duration_ms,
+    CASE WHEN json_valid(bo.result_summary)
+        THEN json_extract(bo.result_summary, '$.tokens.input_tokens') END AS input_tokens,
+    CASE WHEN json_valid(bo.result_summary)
+        THEN json_extract(bo.result_summary, '$.tokens.output_tokens') END AS output_tokens,
+    CASE WHEN json_valid(bo.result_summary)
+        THEN json_extract(bo.result_summary, '$.tokens.total_tokens') END AS total_tokens,
+    CASE WHEN json_valid(bo.result_summary)
+        THEN json_extract(bo.result_summary, '$.tokens.llm_calls') END AS llm_calls
+FROM backend_ops AS bo
+LEFT JOIN write_ops AS wo ON wo.id = bo.write_op_id
+WHERE bo.created_at >= ?
+ORDER BY bo.created_at DESC
+LIMIT ?
+"""
+
+
+def _backend_result_summary(
+    result_summary: dict | str | None, llm_tokens: LlmTokenUsage | None
+) -> dict | str | None:
+    """The persisted ``result_summary``: nested under ``result`` beside the
+    ``tokens`` block ``OPERATOR_TELEMETRY_QUERY`` reads, when tokens were measured."""
+    if llm_tokens is None:
+        return result_summary
+    if not isinstance(llm_tokens, LlmTokenUsage):
+        raise TypeError(
+            f'llm_tokens must be an LlmTokenUsage or None, got {type(llm_tokens).__name__}'
+        )
+    return {'result': result_summary, 'tokens': llm_tokens.as_journal_dict()}
+
 
 class WriteJournal:
     """Two-layer write journal backed by SQLite (WAL mode)."""
@@ -335,6 +386,8 @@ class WriteJournal:
         db = self._require_db()
         async with db.execute('PRAGMA table_info(write_ops)') as cursor:
             existing = {row[1] for row in await cursor.fetchall()}
+        async with db.execute('PRAGMA table_info(backend_ops)') as cursor:
+            existing_backend_ops = {row[1] for row in await cursor.fetchall()}
 
         async with self._txn() as db:
             if 'session_id' not in existing:
@@ -369,6 +422,12 @@ class WriteJournal:
             if 'terminal_error' not in existing:
                 await db.execute('ALTER TABLE write_ops ADD COLUMN terminal_error TEXT')
                 logger.info('Migration: added terminal_error column to write_ops')
+
+            # Same O(1), no-backfill stance as terminal_* above: a historical
+            # row's duration is unknown, so it stays NULL.
+            if 'duration_ms' not in existing_backend_ops:
+                await db.execute('ALTER TABLE backend_ops ADD COLUMN duration_ms REAL')
+                logger.info('Migration: added duration_ms column to backend_ops')
 
             # Indexes on new columns (safe after migration ensures columns exist)
             await db.execute(
@@ -472,15 +531,19 @@ class WriteJournal:
         result_summary: dict | str | None = None,
         success: bool = True,
         error: str | None = None,
+        duration_ms: float | None = None,
+        llm_tokens: LlmTokenUsage | None = None,
     ) -> None:
         """Log a Layer 2 backend dispatch. Fire-and-forget — never raises."""
         try:
+            summary = _backend_result_summary(result_summary, llm_tokens)
             async with self._txn() as db:
                 await db.execute(
                     """INSERT INTO backend_ops
                        (id, write_op_id, causation_id, backend, operation,
-                        payload, result_summary, success, error, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        payload, result_summary, success, error, created_at,
+                        duration_ms)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         str(uuid_mod.uuid4()),
                         write_op_id,
@@ -488,10 +551,11 @@ class WriteJournal:
                         backend,
                         operation,
                         json.dumps(payload) if payload else '{}',
-                        json.dumps(result_summary) if isinstance(result_summary, dict) else result_summary,
+                        json.dumps(summary) if isinstance(summary, dict) else summary,
                         1 if success else 0,
                         error,
                         datetime.now(UTC).isoformat(),
+                        duration_ms,
                     ),
                 )
         except Exception as e:

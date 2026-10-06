@@ -2,13 +2,16 @@
 
 Injected in place of the production adapters through
 ``MergeLane(..., verifier=FakeVerifier(...), clock=FakeClock(...))``.
-``FakeVerifier`` scripts the verify outcome per task id; ``FakeClock`` is a
+``FakeVerifier`` scripts the verify outcome per task id or in call order,
+and records each scoped verify as a ``ScopedVerifyCall``; ``FakeClock`` is a
 hand-advanced clock whose ``sleep`` advances it instead of waiting;
 ``RecordingEscalations`` stands in for the escalation queue and keeps what
 the lane filed; ``lane_state``/``lane_entry`` read an item's state back off
 the lane's public ``snapshot()`` census. ``make_lane`` builds a lane on all three at once, so a test
-that owns its worker never falls back to a production adapter by omission,
-and ``drive_merge`` plays the merger for a caller that enqueues onto a queue
+that owns its worker never falls back to a production adapter by omission;
+``running_lane`` runs such a lane for the body of a block and
+``merge_through_lane`` until it resolves one request; ``drive_merge`` plays
+the merger for a caller that enqueues onto a queue
 nothing is draining. ``main_health_probe_spawned`` reads off a red
 ``MergeOutcome`` whether it left a detached main-health probe running, and
 ``lane_scene_config`` builds a scene's ``OrchestratorConfig`` with that probe
@@ -20,9 +23,10 @@ Imported by bare module name (``from _merge_lane_fakes import ...``), like
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import dataclasses
-from collections.abc import Collection, Coroutine, Mapping
+from collections.abc import AsyncIterator, Collection, Coroutine, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -103,15 +107,27 @@ def lane_scene_config(
 
 @dataclasses.dataclass(frozen=True)
 class VerifyScript:
-    """What ``FakeVerifier.run_scoped`` does for one task.
+    """What one ``FakeVerifier.run_scoped`` call does.
 
     Exactly one of the shapes below applies: return ``result``, raise
     ``error``, or wait for ``release`` first and then return ``result``.
+    *entered*, when given, is set the moment a call reaches this script,
+    before any release wait; it is the arrival half of a release gate.
     """
 
     result: VerifyResult
     error: BaseException | None = None
     release: asyncio.Event | None = None
+    entered: asyncio.Event | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class ScopedVerifyCall:
+    """What one ``FakeVerifier.run_scoped`` call was handed."""
+
+    task_id: str | None
+    worktree: Path
+    module_configs: tuple[Any, ...]
 
 
 def passes(summary: str = 'fake verify passed') -> VerifyScript:
@@ -131,27 +147,40 @@ def raises(error: BaseException) -> VerifyScript:
     return VerifyScript(result=passes().result, error=error)
 
 
-def hangs_until(release: asyncio.Event) -> VerifyScript:
-    return VerifyScript(result=passes().result, release=release)
+def hangs_until(
+    release: asyncio.Event, *, entered: asyncio.Event | None = None,
+) -> VerifyScript:
+    return VerifyScript(result=passes().result, release=release, entered=entered)
+
+
+def times_out(summary: str = 'Verification timed out') -> VerifyScript:
+    return VerifyScript(result=VerifyResult(
+        passed=False, test_output='', lint_output='', type_output='',
+        summary=summary, timed_out=True,
+    ))
 
 
 class FakeVerifier:
-    """``VerifyPort`` scripted per task id.
+    """``VerifyPort`` scripted per task id or in call order.
 
-    ``run_scoped`` follows ``scripts[task_id]``, or ``default`` for a task
-    without a script, and records every task id it was asked about in
-    ``verified``. ``await_entry(n)`` waits for the *n*-th entry into
-    ``run_scoped``, which is how a test waits for a scripted hang to be
-    genuinely under way before it probes the lane -- per CALL, so a test
-    that drives two verifies can wait for the SECOND one instead of being
-    let through early by the first. The gates a merge passes through after a
-    green scoped verify all report clean, the disk guard reports
-    *disk_reason* (``None``, the default, being "proceed"), and dry-run
-    investigations are recorded in ``investigations`` rather than run.
+    Each ``run_scoped`` call follows the next of the ordered ``sequence``
+    scripts while any remain, then ``scripts[task_id]``, then ``default``.
+    It records every task id it was asked about in ``verified`` and what each
+    call was handed in ``verify_calls``, one ``ScopedVerifyCall`` per entry
+    into the BASE ``run_scoped`` (an override that does not delegate records
+    only ``verified``/``entered_count``, through ``_note_entry``).
+    ``await_entry(n)`` waits for the *n*-th entry into ``run_scoped``, which
+    is how a test waits for a scripted hang to be genuinely under way before
+    it probes the lane -- per CALL, so a test that drives two verifies can
+    wait for the SECOND one instead of being let through early by the first.
+    The gates a merge passes through after a green scoped verify all report
+    clean, the disk guard reports *disk_reason* (``None``, the default, being
+    "proceed"), and dry-run investigations are recorded in ``investigations``
+    rather than run.
 
-    A subclass that overrides ``run_scoped`` to script a per-CALL sequence
-    calls ``_note_entry`` itself, so ``verified`` and ``entered_count`` stay
-    truthful for it too.
+    Script a per-CALL sequence with ``sequence=``; a subclass that must vary
+    the selection further overrides ``next_script``. A legacy subclass that
+    overrides ``run_scoped`` itself must still call ``_note_entry``.
     """
 
     def __init__(
@@ -159,12 +188,15 @@ class FakeVerifier:
         default: VerifyScript | None = None,
         scripts: Mapping[str | None, VerifyScript] | None = None,
         *,
+        sequence: Iterable[VerifyScript] = (),
         disk_reason: str | None = None,
     ) -> None:
         self.default = passes() if default is None else default
         self.scripts: dict[str | None, VerifyScript] = dict(scripts or {})
+        self._ordered = collections.deque(sequence)
         self.disk_reason = disk_reason
         self.verified: list[str | None] = []
+        self.verify_calls: list[ScopedVerifyCall] = []
         self.investigations: list[dict[str, Any]] = []
         self.entered_count = 0
         self._entry_bell = asyncio.Event()
@@ -188,6 +220,17 @@ class FakeVerifier:
             self._entry_bell.clear()
             await self._entry_bell.wait()
 
+    def next_script(self, task_id: str | None) -> VerifyScript:
+        """The script the current ``run_scoped`` call for *task_id* follows.
+
+        The selection a subclass overrides to vary which script a call
+        follows; recording the call and playing the script stay in
+        ``run_scoped``.
+        """
+        if self._ordered:
+            return self._ordered.popleft()
+        return self.scripts.get(task_id, self.default)
+
     async def run_scoped(
         self,
         worktree: Path,
@@ -197,8 +240,13 @@ class FakeVerifier:
         **options: Any,
     ) -> VerifyResult:
         task_id = options.get('task_id')
+        self.verify_calls.append(ScopedVerifyCall(
+            task_id=task_id, worktree=worktree, module_configs=tuple(module_configs),
+        ))
         self._note_entry(task_id)
-        script = self.scripts.get(task_id, self.default)
+        script = self.next_script(task_id)
+        if script.entered is not None:
+            script.entered.set()
         if script.release is not None:
             await script.release.wait()
         if script.error is not None:
@@ -390,6 +438,66 @@ def make_lane(
         clock=FakeClock() if clock is None else clock,
         **kwargs,
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class LaneRun:
+    """A lane's ``run()`` task, as ``running_lane`` yields it."""
+
+    task: asyncio.Task[None]
+
+    async def outcome(self, request: Any, *, timeout: float = 120.0) -> MergeOutcome:
+        """The outcome the lane resolves *request* with.
+
+        Watches the ``run()`` task while waiting, so a lane that crashes or
+        returns first raises that, instead of surfacing as a timeout.
+        """
+        done, _ = await asyncio.wait(
+            {self.task, request.result}, timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if request.result in done:
+            return request.result.result()
+        if self.task in done:
+            self.task.result()
+            raise AssertionError('the lane stopped before resolving the request')
+        raise TimeoutError(f'the lane did not resolve the request within {timeout}s')
+
+
+@contextlib.asynccontextmanager
+async def running_lane(
+    lane: MergeLane, *, stop_timeout: float = 60.0,
+) -> AsyncIterator[LaneRun]:
+    """Run *lane* for the body of the block, then stop it.
+
+    On the way out, whatever happened, the lane is stopped and its ``run()``
+    awaited, so a failure of ``run()`` itself is raised rather than lost.
+    """
+    run = asyncio.create_task(lane.run())
+    try:
+        yield LaneRun(run)
+    finally:
+        await lane.stop()
+        await asyncio.wait_for(run, stop_timeout)
+
+
+async def merge_through_lane(
+    lane: MergeLane,
+    queue: asyncio.Queue[Any],
+    request: Any,
+    *,
+    timeout: float = 120.0,
+) -> MergeOutcome:
+    """Run *lane* until it resolves *request*, then stop it; return the outcome.
+
+    *queue* is the one *lane* was built on. The request -- a single
+    ``MergeRequest`` or a train's ``GroupMergeRequest`` -- goes in through the
+    lane's queue like any submission, so it takes the production dispatch
+    route rather than a test-chosen internal entry point.
+    """
+    async with running_lane(lane) as run:
+        await queue.put(request)
+        return await run.outcome(request, timeout=timeout)
 
 
 @dataclasses.dataclass(frozen=True)

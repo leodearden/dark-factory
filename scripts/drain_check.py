@@ -9,11 +9,19 @@ importable -- mirroring the stdlib watchdog's decoupled heartbeat read
 
 On-disk contract mirrored from orchestrator/src/orchestrator/fleet_heartbeat.py:
     {unit, merge_idle: bool, depth: int, queue_empty: bool, ts_epoch: float}
+plus, from a unit running task-5371 code, two further keys:
+    drain: null | {requested_ts: int|null, admission_halted: bool,
+                   refused: null|str}
+    verifies_in_flight: [{task_id, host, kind, started_ts, deadline_ts}, ...]
+A heartbeat without ``verifies_in_flight`` comes from a pre-5371 unit; see
+``classify`` for how that is read.
 
 CLI usage (called by restart-all-orchestrators.sh's drain_gate):
     python3 scripts/drain_check.py --unit <unit> [--fleet-dir DIR]
-        [--fresh-window SECS] [--now EPOCH]
-Prints exactly one of idle/busy/stale/absent to stdout and exits 0.
+        [--fresh-window SECS] [--now EPOCH] [--drain-requested-ts INT]
+Prints exactly one of idle/busy/verifying/overdue/refused/stale/absent to
+stdout and exits 0. Without --drain-requested-ts only idle/busy/stale/absent
+can appear.
 """
 
 from __future__ import annotations
@@ -70,8 +78,46 @@ def heartbeat_path(fleet_dir: Path, unit: str) -> Path:
     return Path(fleet_dir) / f'{unit}.json'
 
 
-def classify(heartbeat: dict | None, now: float, fresh_window: float) -> str:
-    """Classify a heartbeat payload into idle / busy / stale / absent.
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _classify_drain_progress(
+    heartbeat: Mapping, now: float, drain_requested_ts: int,
+) -> str:
+    """Verdict for a fresh, new-producer heartbeat under a drain request."""
+    drain = heartbeat.get('drain')
+    if not isinstance(drain, dict) or drain.get('requested_ts') != drain_requested_ts:
+        return 'busy'
+    if isinstance(drain.get('refused'), str):
+        return 'refused'
+    if drain.get('admission_halted') is not True:
+        return 'busy'
+    verifies = heartbeat['verifies_in_flight']
+    if not isinstance(verifies, list):
+        return 'busy'
+    if not verifies:
+        return 'idle'
+    if all(
+        isinstance(entry, dict)
+        and _is_number(entry.get('deadline_ts'))
+        and entry['deadline_ts'] <= now
+        for entry in verifies
+    ):
+        return 'overdue'
+    return 'verifying'
+
+
+def classify(
+    heartbeat: dict | None,
+    now: float,
+    fresh_window: float,
+    drain_requested_ts: int | None = None,
+) -> str:
+    """Classify a heartbeat payload.
+
+    Without a drain request (``drain_requested_ts is None``) the vocabulary is
+    idle / busy / stale / absent:
 
     - idle iff the heartbeat is fresh (now - ts_epoch <= fresh_window) AND
       merge_idle is True.
@@ -82,6 +128,21 @@ def classify(heartbeat: dict | None, now: float, fresh_window: float) -> str:
       ts_epoch, but that ts_epoch is older than fresh_window.
     - absent iff heartbeat is None, not a mapping, or ts_epoch is missing
       or not numeric (malformed).
+
+    With a drain request, absent and stale are unchanged, and a fresh
+    heartbeat with no ``verifies_in_flight`` key (a unit still running
+    pre-5371 code, which cannot see the request) is read exactly as above.
+    Otherwise, first match wins:
+
+    - busy: the request is not yet acknowledged (``drain`` is null or echoes
+      another requested_ts), or admission is not yet halted, or
+      ``verifies_in_flight`` is malformed -- all conservative.
+    - refused: the unit examined the request and declined it.
+    - idle: acknowledged, admission halted, nothing in flight (drained).
+    - overdue: everything still in flight is past its own deadline_ts, so
+      the unit's command timeout is about to kill it regardless.
+    - verifying: at least one in-flight verify is still inside its deadline
+      (an entry with a non-numeric deadline counts as inside it).
     """
     if not isinstance(heartbeat, dict):
         return 'absent'
@@ -90,6 +151,8 @@ def classify(heartbeat: dict | None, now: float, fresh_window: float) -> str:
         return 'absent'
     if now - ts_epoch > fresh_window:
         return 'stale'
+    if drain_requested_ts is not None and 'verifies_in_flight' in heartbeat:
+        return _classify_drain_progress(heartbeat, now, drain_requested_ts)
     if heartbeat.get('merge_idle') is True:
         return 'idle'
     return 'busy'
@@ -118,7 +181,8 @@ def _read_heartbeat(path: Path) -> dict | None:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            'Print the drain-gate verdict (idle/busy/stale/absent) for one '
+            'Print the drain-gate verdict '
+            '(idle/busy/verifying/overdue/refused/stale/absent) for one '
             "orchestrator unit's merge-idle heartbeat."
         ),
     )
@@ -139,6 +203,12 @@ def _build_parser() -> argparse.ArgumentParser:
         '--now', type=float, default=time.time(),
         help='Reference "now" in epoch seconds (default: current time)',
     )
+    parser.add_argument(
+        '--drain-requested-ts', type=int, default=None,
+        help='requested_ts of the drain request the sweep wrote for this '
+             'unit; enables the verifying/overdue/refused verdicts (default: '
+             'none = merge_idle-only verdicts)',
+    )
     return parser
 
 
@@ -146,7 +216,9 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     path = heartbeat_path(args.fleet_dir, args.unit)
     heartbeat = _read_heartbeat(path)
-    verdict = classify(heartbeat, args.now, args.fresh_window)
+    verdict = classify(
+        heartbeat, args.now, args.fresh_window, args.drain_requested_ts,
+    )
     print(verdict)
     return 0
 

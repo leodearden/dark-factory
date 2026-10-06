@@ -55,6 +55,7 @@ from fused_memory.reconciliation.graphiti_degradation_probe import (
     NEGATIVE_SET_VERDICT,
 )
 from fused_memory.reconciliation.recon_pool_map import (
+    CYCLE_SUMMARY_KIND,
     CYCLE_SUMMARY_STAGE_TO_RECON_POOL,
     STAGE1_CYCLE_SUMMARY_RECON_POOL,
     STAGE2_CYCLE_SUMMARY_RECON_POOL,
@@ -189,11 +190,18 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
         # since these markers carry no source metadata field.
         #
         # That collector is NO LONGER age-based (task 4375). Retirement is now
-        # COMPOSITE: a marker is deleted only when it is past the 14-day age
-        # cutoff AND is not a protected cycle_summary mirror AND its kind is
-        # not in mem0_tombstone.PROTECTED_AUDIT_KINDS AND its task_id is
-        # confirmed terminal. The age-only rule destroyed 40 kind='cadence_check'
-        # audit records in autopilot_video, all citing a merely-'deferred' task.
+        # COMPOSITE: a marker is deleted only when it is past the
+        # _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS age cutoff AND is not a protected
+        # cycle_summary mirror AND its kind is not in
+        # mem0_tombstone.PROTECTED_AUDIT_KINDS AND its task_id is confirmed
+        # terminal. The age-only rule destroyed 40 kind='cadence_check' audit
+        # records in autopilot_video, all citing a merely-'deferred' task.
+        #
+        # Second firing site (task 4376), a latency layer applying the same
+        # rule to the one task that just closed:
+        # stages/task_knowledge_sync.py::retire_flag_markers_for_terminal_task,
+        # called from reconciliation/targeted.py::TargetedReconciler._on_task_done.
+        # The per-cycle sweep in TaskKnowledgeSync.run() stays primary.
         #
         # The terminal-closure arm NARROWS the declared-vs-actual gap this
         # comment documents, without closing it: the Mem0 side now applies the
@@ -381,7 +389,10 @@ MCP_CALL_SIGNATURES: dict[str, str] = {
     'get_cycle_summary_presence': (
         'get_cycle_summary_presence(project_id, run_id, stage) -> '
         "{'present': bool, 'ledger_available': bool, 'project_id': ..., "
-        "'run_id': ..., 'stage': ...}"
+        "'run_id': ..., 'stage': ..., 'remediation': bool|None, "
+        "'reason': 'present'|'missing'|'stage_not_run'|'expired'|"
+        "'run_unknown'|'ledger_unavailable', 'expected': bool|None, "
+        "'run_lookup_available': bool, 'run_status': str|None}"
     ),
 }
 
@@ -555,7 +566,10 @@ def render_cycle_summary_section() -> str:
         'this runs unconditionally every cycle. Do NOT author your own per-cycle '
         'summary `add_memory` write on the normal flow: doing so creates a second '
         "cycle_summary record for the same run_id. Python's mirror is tagged with "
-        "metadata={'kind': 'cycle_summary', 'stage': <stage_name>, "
+        # Task 3202 / INV-5: the kind literal is rendered from the shared
+        # CYCLE_SUMMARY_KIND constant, never re-typed, so a rename in
+        # recon_pool_map reaches this prompt instead of stranding it.
+        f"metadata={{'kind': '{CYCLE_SUMMARY_KIND}', 'stage': <stage_name>, "
         "'run_id': <run_id>, 'recon_pool': <recon_pool>, 'record_type': 'ledger_stamp'}. "
         '<run_id> is the exact run_id from the payload context (the same run_id '
         'embedded in the summary content). <recon_pool> is looked up from the '
@@ -606,7 +620,7 @@ def render_cycle_summary_section() -> str:
         'author and is unrelated to the normal-flow write this section '
         'describes.\n\n'
         'The summary is deterministically findable by a metadata-keyed lookup — '
-        "count_memories_by_metadata(project_id, {'kind': 'cycle_summary', "
+        f"count_memories_by_metadata(project_id, {{'kind': '{CYCLE_SUMMARY_KIND}', "
         "'run_id': <run_id>, 'stage': <stage_name>}) — which downstream stages "
         'use as a second verification path instead of relying on semantic search '
         'alone. The stage key in this lookup is REQUIRED: both Stage 1 and '

@@ -98,13 +98,15 @@ if str(_SHARED_SRC) not in sys.path:
 import codebook  # noqa: E402
 import coder  # noqa: E402
 import digest  # noqa: E402
+import filing_policy  # noqa: E402
 import inventory  # noqa: E402
 import sampling  # noqa: E402
-from legibility import census_trigger, unlanded  # noqa: E402
+from legibility import census_trigger, session_runner, unlanded  # noqa: E402
 
 # The banner marker list itself lives in shared.cap_markers and is never
 # restated here -- this module only asks the question, via the predicate.
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
+from shared.toolcall_markup import escape_envelope_literals  # noqa: E402
 
 import config  # noqa: E402
 
@@ -696,11 +698,16 @@ def preflight_headroom(invoke, *, model: str) -> HeadroomResult:
     ``shared.cap_markers.looks_like_blocking_banner`` (capacity OR auth --
     either means no useful model output is coming); a match defers, and
     the reason quotes the marker that fired. An invocation error
-    raised by *invoke* (e.g. a ``CoderInvocationError``-shaped failure)
+    raised by *invoke* (e.g. a ``session_runner.InvocationFailed``-shaped failure)
     is also treated as a deferral -- fail-safe, never a crash, since a
     probe failure is exactly the kind of "the model isn't reachable right
     now" signal this preflight exists to catch. Makes no mining decisions
     itself -- just the ok/deferred verdict + reason.
+
+    In production *invoke* is the pooled runner's mining stage, so a capped
+    account fails over to the next INSIDE the probe; only a pool with no
+    headroom left raises (``session_runner.NoHeadroom``) and defers the
+    census (task 5515).
     """
     try:
         reply = invoke(_HEADROOM_PROBE_PROMPT, model)
@@ -758,7 +765,7 @@ def _stage_headroom_gate(
 # decision 4: a harness-rooted cluster may target dark_factory)
 # ---------------------------------------------------------------------------
 
-def _cluster_description(cluster: dict, *, project_id: str) -> str:
+def _cluster_description(cluster: dict, *, observed_project_id: str) -> str:
     """Factual cluster summary + evidence -- no prose routing intent
     (lesson `prose-routing-intent`: routing is expressed structurally, via
     payload fields, never as English directives embedded in the text)."""
@@ -777,41 +784,23 @@ def _cluster_description(cluster: dict, *, project_id: str) -> str:
     sightings = cluster.get("sightings") or []
     if sightings:
         lines.append("")
-        lines.append(f"Observed in {len(sightings)} sighting(s) (project: {project_id}).")
+        lines.append(f"Observed in {len(sightings)} sighting(s) (project: {observed_project_id}).")
+
+    remediation = filing_policy.proposed_remediation(cluster)
+    if remediation is not None:
+        lines.append("")
+        lines.append(f"Proposed remediation: {remediation['path']} -- {remediation['change']}")
 
     return "\n".join(lines)
 
 
-def _resolve_target_project(
-    cluster: dict, *, project_root: str, project_id: str, title: str,
-) -> tuple[str, str]:
-    """Resolve one cluster's target project_root/project_id, honoring the
-    ``target_project_root``/``target_project_id`` override pair (PRD
-    decision 4) as ALL-OR-NOTHING: the two name the SAME project and must
-    move together, so a cluster carrying only one of the two (a malformed
-    override -- e.g. a verify_fn/synthesis bug) can never mix an override
-    root with the census's own id, or vice versa, and file into the wrong
-    registry. A partial pair is logged and IGNORED entirely, falling back
-    to the census's own *project_root*/*project_id* -- the same fail-safe
-    default as no override at all (reviewer_comprehensive finding #2)."""
-    has_root_override = "target_project_root" in cluster
-    has_id_override = "target_project_id" in cluster
-    if has_root_override != has_id_override:
-        logger.warning(
-            "census: cluster %r supplies only one of "
-            "target_project_root/target_project_id (must move together, "
-            "PRD decision 4) -- ignoring the partial override and filing "
-            "into this census's own project %r instead",
-            title, project_id,
-        )
-        return project_root, project_id
-    return (
-        cluster.get("target_project_root", project_root),
-        cluster.get("target_project_id", project_id),
-    )
-
-
-def build_task_payloads(clusters, *, project_root: str, project_id: str) -> list[dict]:
+def build_task_payloads(
+    clusters,
+    *,
+    project_root: str,
+    project_id: str,
+    harness: filing_policy.ProjectRef | None = None,
+) -> list[dict]:
     """Map each verified cluster to one curator-path ``submit_task`` kwarg
     dict. ``task_kind`` is always ``"normal"``; ``planning_mode`` is
     deliberately OMITTED (defaults False at the submit_task layer) --
@@ -819,34 +808,41 @@ def build_task_payloads(clusters, *, project_root: str, project_id: str) -> list
     decision 9), and ``planning_mode`` is exactly the curator-bypassing
     path that would defeat it.
 
-    A cluster observed in a hosted project whose root cause is
-    harness-rooted may carry ``target_project_root``/``target_project_id``
-    overrides to file into dark_factory instead of the census's own
-    project (PRD decision 4, same fused-memory, different project_root);
-    absent those, the payload targets the census's own *project_root*/
-    *project_id*. The two overrides move together -- see
-    ``_resolve_target_project``.
+    *project_root*/*project_id* name the OBSERVED project. Which project each
+    payload files into is decided by ``filing_policy.resolve_target``; a
+    payload routed to *harness* carries the matched markers under
+    ``metadata.x_fix_surface``, and ``metadata.origin_project_id`` always names
+    the observed project.
+
+    ``title`` and ``description`` pass through
+    ``shared.toolcall_markup::escape_envelope_literals`` because cluster
+    evidence may QUOTE tool-call envelope literals, which the boundary
+    markup guard refuses (task 5907).
 
     Pure function -- returns payloads only; the actual ``submit_fn`` call
     happens in ``run_census``.
     """
+    observed = filing_policy.ProjectRef(project_root=project_root, project_id=project_id)
     payloads = []
     for cluster in clusters:
+        target = filing_policy.resolve_target(cluster, observed=observed, harness=harness)
+        metadata: dict = {"source": "legibility_census", "origin_project_id": project_id}
+        if target.fix_surface:
+            metadata["x_fix_surface"] = [
+                {"component": match.component, "evidence": match.evidence}
+                for match in target.fix_surface
+            ]
         title = cluster.get("title") or "Untitled confusion cluster"
-        target_project_root, target_project_id = _resolve_target_project(
-            cluster, project_root=project_root, project_id=project_id, title=title,
-        )
         payloads.append(
             {
-                "project_root": target_project_root,
-                "title": f"[legibility census] {title}",
-                "description": _cluster_description(cluster, project_id=target_project_id),
+                "project_root": target.project.project_root,
+                "title": escape_envelope_literals(f"[legibility census] {title}"),
+                "description": escape_envelope_literals(
+                    _cluster_description(cluster, observed_project_id=project_id)
+                ),
                 "task_kind": "normal",
                 "priority": cluster.get("priority", "medium"),
-                "metadata": {
-                    "source": "legibility_census",
-                    "origin_project_id": project_id,
-                },
+                "metadata": metadata,
             }
         )
     return payloads
@@ -872,8 +868,8 @@ def _ticket_id_from_submit_result(result) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# promote_candidate / reject_candidate / retire_entry — census-only
-# codebook lifecycle transforms (PRD decision 1: deterministic, in-memory,
+# promote_candidate / reject_candidate / retire_entry / mark_entry_filed —
+# census-only codebook lifecycle transforms (PRD decision 1: deterministic, in-memory,
 # reuse gamma's validator + never-delete assertion + sole-writer dump;
 # codebook.py itself is NOT modified)
 # ---------------------------------------------------------------------------
@@ -934,6 +930,27 @@ def retire_entry(cb: dict, entry_id: str) -> dict:
     result = copy.deepcopy(cb)
     entry = _find_by_id(result.get("entries") or [], entry_id, kind="retire_entry")
     entry["status"] = "retired"
+
+    codebook.assert_no_deletion(cb, result)
+    return result
+
+
+ENTRY_FILING_KEY = "filing"
+ENTRY_FILING_WITHHELD = "withheld"
+ENTRY_FILING_FILED = "filed"
+"""An entry's filing marker, written by the census and never by codebook.py
+(the v2 entry schema is open-world). WITHHELD means the singleton filing gate
+held the entry back until it recurs; FILED means a ticket was filed for it
+since. An entry with no marker is not the gate's concern -- it was filed on
+first sight, or predates the gate -- and is never re-filed. Plain ``str``, not
+an Enum: ``codebook.dump`` is ``yaml.safe_dump``, which cannot represent one."""
+
+
+def mark_entry_filed(cb: dict, entry_id: str) -> dict:
+    """Mark entry *entry_id* withheld -> filed on a deep copy, RETAINED."""
+    result = copy.deepcopy(cb)
+    entry = _find_by_id(result.get("entries") or [], entry_id, kind="mark_entry_filed")
+    entry[ENTRY_FILING_KEY] = ENTRY_FILING_FILED
 
     codebook.assert_no_deletion(cb, result)
     return result
@@ -1106,6 +1123,16 @@ class DryRunFiling:
     payload_count: int
 
 
+@dataclass(frozen=True)
+class CrossProjectTicket:
+    """A curator ticket this run filed into a project OTHER than the one it
+    observed (``filing_policy.resolve_target``). ``resolve_ticket`` must be
+    pointed at *project_root* to learn its task id."""
+
+    ticket_id: str
+    project_root: str
+
+
 SECTION_HEADER = "header"
 SECTION_FORCE_MARKER = "force-marker"
 SECTION_SATURATION = "saturation"
@@ -1114,6 +1141,7 @@ SECTION_UNRESOLVED_VERDICTS = "unresolved-verdicts"
 SECTION_MATRIX = "matrix"
 SECTION_SYNTHESIS = "synthesis"
 SECTION_FILED_TASKS = "filed-tasks"
+SECTION_WITHHELD = "withheld-clusters"
 SECTION_COST = "cost"
 """Stable machine keys for the blocks :func:`census_report_sections` emits.
 
@@ -1169,6 +1197,8 @@ def census_report_sections(
     dry_run: DryRunFiling | None = None,
     dropped_verdicts: tuple[DroppedVerdict, ...] = (),
     mass_rejection: MassRejection | None = None,
+    withheld: tuple[filing_policy.WithheldCluster, ...] = (),
+    cross_project_tickets: tuple[CrossProjectTicket, ...] = (),
 ) -> tuple[ReportSection, ...]:
     """The dated census report, decomposed -- see :func:`render_report` for
     the markdown an operator reads.
@@ -1381,9 +1411,37 @@ def census_report_sections(
         )
         filed_tasks.append("")
         filed_tasks.extend(f"- {ticket_id}" for ticket_id in filed_ticket_ids)
+        if cross_project_tickets:
+            filed_tasks.append("")
+            filed_tasks.append(
+                f"_{len(cross_project_tickets)} of these ticket(s) were filed into "
+                "another project's task tree, so resolve_ticket needs that "
+                "project_root:_"
+            )
+            filed_tasks.append("")
+            filed_tasks.extend(
+                f"- {ticket.ticket_id} -> {ticket.project_root}"
+                for ticket in cross_project_tickets
+            )
     else:
         filed_tasks.append("_none filed._")
     emit(SECTION_FILED_TASKS, filed_tasks)
+
+    if withheld:
+        recorded_not_filed = [
+            "",
+            "## Recorded, Not Filed",
+            "",
+            f"- {len(withheld)} verified cluster(s) were promoted into the codebook "
+            f"and marked withheld, not filed: each has fewer than "
+            f"{filing_policy.MIN_UNREMEDIATED_SIGHTINGS} sightings and no in-tree "
+            "remediation from the verifier. Each files automatically once a later "
+            f"census counts {filing_policy.MIN_UNREMEDIATED_SIGHTINGS} sightings of it.",
+        ]
+        recorded_not_filed.extend(
+            f"  - {cluster.title} (sightings: {cluster.sighting_count})" for cluster in withheld
+        )
+        emit(SECTION_WITHHELD, recorded_not_filed)
 
     # The trailing "" is the report's final newline, which the join would
     # otherwise not supply.
@@ -1415,6 +1473,8 @@ def render_report(
     dry_run: DryRunFiling | None = None,
     dropped_verdicts: tuple[DroppedVerdict, ...] = (),
     mass_rejection: MassRejection | None = None,
+    withheld: tuple[filing_policy.WithheldCluster, ...] = (),
+    cross_project_tickets: tuple[CrossProjectTicket, ...] = (),
 ) -> str:
     """Assemble the dated census report as markdown, purely from the
     pieces passed in -- no clock, no model call, no I/O. *date* and every
@@ -1439,6 +1499,8 @@ def render_report(
         dry_run=dry_run,
         dropped_verdicts=dropped_verdicts,
         mass_rejection=mass_rejection,
+        withheld=withheld,
+        cross_project_tickets=cross_project_tickets,
     ))
 
 
@@ -1446,6 +1508,23 @@ def render_report(
 # run_census — full orchestration: preflight -> mine -> verify -> synthesize
 # -> matrix -> codebook update -> file tasks -> report -> advance state
 # ---------------------------------------------------------------------------
+
+def _cluster_record(
+    *, title, cause, area, origin_phase, manifested_phase, evidence, sightings,
+) -> dict:
+    """The one shape of a verification/filing cluster, whichever record it
+    was built from."""
+    return {
+        "title": title,
+        "summary": cause or title,
+        "cause": cause,
+        "area": area,
+        "origin_phase": origin_phase,
+        "manifested_phase": manifested_phase,
+        "evidence": evidence,
+        "sightings": sightings,
+    }
+
 
 def _novel_clusters(records: list[dict]) -> list[dict]:
     """Build one verification cluster per DISTINCT candidate title carried
@@ -1489,22 +1568,21 @@ def _novel_clusters(records: list[dict]) -> list[dict]:
             manifested_phase = candidate.get("manifested_phase") or "unknown"
             evidence_quote = candidate.get("evidence_quote")
             clusters.append(
-                {
-                    "title": title,
-                    "summary": candidate.get("cause") or title,
-                    "cause": candidate.get("cause"),
-                    "area": candidate.get("area"),
-                    "origin_phase": origin_phase,
-                    "manifested_phase": manifested_phase,
-                    "evidence": [evidence_quote] if evidence_quote else [],
-                    "sightings": [
+                _cluster_record(
+                    title=title,
+                    cause=candidate.get("cause"),
+                    area=candidate.get("area"),
+                    origin_phase=origin_phase,
+                    manifested_phase=manifested_phase,
+                    evidence=[evidence_quote] if evidence_quote else [],
+                    sightings=[
                         {
                             "session": session,
                             "origin_phase": origin_phase,
                             "manifested_phase": manifested_phase,
                         }
                     ],
-                }
+                )
             )
     return clusters
 
@@ -1530,6 +1608,124 @@ def _find_pending_candidate_id(cb: dict, title: str | None) -> str | None:
     for candidate in cb.get("candidates") or []:
         if candidate.get("title") == title and candidate.get("disposition") == "pending":
             return candidate.get("id")
+    return None
+
+
+def _sighting_counts_by_title(cb: dict) -> dict[str | None, int]:
+    """How many DISTINCT sessions have sighted each title, across every entry
+    and candidate carrying it -- the same title key
+    ``_find_pending_candidate_id`` resolves by. A promoted entry holds a copy
+    of its candidate's sightings, hence the dedup by session.
+
+    Every record counts, whatever its disposition or status, including a
+    standing record from an earlier window. A sighting records that a
+    confusion was SEEN; a rejection judges the claim, and a retirement judges
+    the fix. The singleton gate asks only whether a confusion is a one-off.
+    This run's verifier has already answered whether it is real."""
+    sessions_by_title: dict[str | None, set] = {}
+    for record in [*(cb.get("entries") or []), *(cb.get("candidates") or [])]:
+        sessions = sessions_by_title.setdefault(record.get("title"), set())
+        sessions.update(
+            sighting.get("session")
+            for sighting in record.get("sightings") or []
+            if sighting.get("session")
+        )
+    return {title: len(sessions) for title, sessions in sessions_by_title.items()}
+
+
+def _split_fileable(
+    verified: list[dict], cb: dict,
+) -> tuple[list[dict], dict[str | None, filing_policy.WithheldCluster]]:
+    """Partition *verified* by ``filing_policy.is_fileable``, counting each
+    cluster's sightings in the post-merge codebook *cb*. The clusters held
+    back are keyed by title, the key promotion resolves a cluster by: only a
+    held-back cluster that is then PROMOTED is marked, and reported, withheld."""
+    sighting_counts = _sighting_counts_by_title(cb)
+    fileable: list[dict] = []
+    held_back: dict[str | None, filing_policy.WithheldCluster] = {}
+    for cluster in verified:
+        title = cluster.get("title")
+        sighting_count = sighting_counts.get(title, 0)
+        if filing_policy.is_fileable(cluster, sighting_count=sighting_count):
+            fileable.append(cluster)
+        else:
+            held_back[title] = filing_policy.WithheldCluster(
+                title=title, sighting_count=sighting_count,
+            )
+    return fileable, held_back
+
+
+_RELEASABLE_ENTRY_STATUSES = frozenset({"open", "partially"})
+"""Entry statuses a withheld entry may still be filed from: a fixed or
+retired confusion needs no ticket."""
+
+
+def _entry_cluster(cb: dict, entry: dict) -> dict:
+    """A fileable cluster rebuilt from codebook *entry*. Its cause and area are
+    the entry's own when a correction has written them, else those of the
+    candidate it was promoted from."""
+    source = _promoted_from(cb, entry["id"]) or {}
+    sightings = list(entry.get("sightings") or [])
+    return _cluster_record(
+        title=entry["title"],
+        cause=entry.get("cause") or source.get("cause"),
+        area=entry.get("area") or source.get("area"),
+        origin_phase=entry["origin_phase"],
+        manifested_phase=entry["manifested_phase"],
+        evidence=[s["evidence_quote"] for s in sightings if s.get("evidence_quote")],
+        sightings=sightings,
+    )
+
+
+@dataclass(frozen=True)
+class PendingFiling:
+    """One cluster to file this run. A genuine ticket for it releases the
+    withheld codebook entry *withheld_entry_id* names, if any."""
+
+    cluster: dict
+    withheld_entry_id: str | None = None
+
+
+def _filing_queue(fileable: list[dict], cb: dict) -> list[PendingFiling]:
+    """Every cluster to file this run, from the post-merge codebook *cb*.
+
+    Each *fileable* cluster is paired with the releasable withheld entry of
+    its title, if any -- a recurrence coded as a fresh candidate files one
+    ticket for its title, not two. Every other releasable withheld entry that
+    ``filing_policy.is_fileable`` now accepts at its title's sighting count
+    follows. An entry withheld THIS run is never among them: the split that
+    withheld it used that same count."""
+    releasable = [
+        entry for entry in cb.get("entries") or []
+        if entry.get(ENTRY_FILING_KEY) == ENTRY_FILING_WITHHELD
+        and entry.get("status") in _RELEASABLE_ENTRY_STATUSES
+    ]
+    entry_id_by_title: dict[str | None, str] = {}
+    for entry in releasable:
+        entry_id_by_title.setdefault(entry["title"], entry["id"])
+
+    queue = [
+        PendingFiling(cluster, entry_id_by_title.get(cluster.get("title")))
+        for cluster in fileable
+    ]
+    paired = {pending.withheld_entry_id for pending in queue}
+    sighting_counts = _sighting_counts_by_title(cb)
+    for entry in releasable:
+        if entry["id"] in paired:
+            continue
+        cluster = _entry_cluster(cb, entry)
+        sighting_count = sighting_counts.get(entry["title"], 0)
+        if filing_policy.is_fileable(cluster, sighting_count=sighting_count):
+            queue.append(PendingFiling(cluster, entry["id"]))
+    return queue
+
+
+def _promoted_from(cb: dict, entry_id: str) -> dict | None:
+    """The candidate ``promote_candidate`` promoted to entry *entry_id*, found
+    by its ``promoted_to`` link."""
+    for candidate in cb.get("candidates") or []:
+        if candidate.get("promoted_to") == entry_id:
+            return candidate
     return None
 
 
@@ -1883,6 +2079,21 @@ class CensusOutcome:
     being re-mined and re-verified against a verdict that will never change
     without a hand re-open."""
 
+    withheld: tuple[filing_policy.WithheldCluster, ...] = ()
+    """Verified clusters promoted into the codebook, marked withheld, and NOT
+    filed, because ``filing_policy.is_fileable`` found neither an in-tree
+    remediation nor a recurrence (``"done"`` and ``"unlanded"`` runs only).
+    Each files automatically once a later census counts
+    ``filing_policy.MIN_UNREMEDIATED_SIGHTINGS`` sightings of it."""
+
+    cross_project_tickets: tuple[CrossProjectTicket, ...] = ()
+    """The subset of ``filed_ticket_ids`` filed into a project other than the
+    observed one, each naming the project_root ``resolve_ticket`` needs."""
+
+    released_entry_ids: tuple[str, ...] = ()
+    """Withheld codebook entries filed this run because they recurred, each
+    now marked ``filing: filed``."""
+
 
 def _defer(
     stage: str,
@@ -2039,6 +2250,7 @@ def run_census(
     max_batches: int | None = None,
     max_verify_clusters: int | None = None,
     dry_run_payloads_path: str | Path | None = None,
+    harness_project: filing_policy.ProjectRef | None = None,
 ) -> CensusOutcome:
     """Run one periodic legibility census end to end.
 
@@ -2082,8 +2294,15 @@ def run_census(
     from *verify_fn* would otherwise fail ``codebook.validate`` deep into
     the pipeline) and ``retire_entry`` for any entry ids *verify_fn*
     reports fixed -> ``codebook.validate`` (raises and aborts BEFORE
-    anything is written, on an invalid merge) -> ``build_task_payloads`` +
-    *submit_fn* per payload, best-effort (a raised exception, or a result
+    anything is written, on an invalid merge) -> the singleton filing gate
+    (``_split_fileable``: a verified cluster files only with an in-tree
+    remediation or a recurrence, counted in the merged codebook; a withheld
+    one stays promoted, is marked withheld on its entry and is listed in the
+    report, while one whose verdict was dropped is neither filed nor listed)
+    -> ``_filing_queue``, which adds every earlier-withheld entry that
+    has since recurred -> ``build_task_payloads`` over that queue + *submit_fn*
+    per payload, best-effort (a genuine ticket for a withheld entry marks it
+    filed, so it is never filed twice; a raised exception, or a result
     carrying no ticket id, is logged and excluded from ``filed_ticket_ids``
     rather than aborting the run or inflating the filed count) ->
     ``render_report`` -> write the report to *report_path* ->
@@ -2094,6 +2313,12 @@ def run_census(
     restores them to HEAD -- census-state included, so ``last_census_at``
     is not advanced by a census that did not land -- and the run returns
     status ``"unlanded"`` (see ``_unlanded``).
+
+    A cluster whose fix surface belongs to *harness_project*
+    (``filing_policy.resolve_target``) files into that project's task tree,
+    where the curator dedups it against the harness's own tasks. The report
+    and ``CensusOutcome.cross_project_tickets`` name the project_root each
+    such ticket went to, which is where ``resolve_ticket`` must look.
 
     The report write, ``codebook.dump``, and ``advance_census_state`` run
     in that fixed order, with nothing else in between the latter two, to
@@ -2422,6 +2647,12 @@ def run_census(
     # report and the tests all read one structure.
     dropped_verdicts: list[DroppedVerdict] = []
 
+    # Split BEFORE promotion so a withheld cluster's entry is marked as it is
+    # created. Promotion cannot change the count: it only copies a candidate's
+    # sightings into its entry, and _sighting_counts_by_title dedups by session.
+    fileable, held_back = _split_fileable(verified, updated_codebook)
+    marked_withheld: list[filing_policy.WithheldCluster] = []
+
     for cluster in verified:
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
         if cand_id is None:
@@ -2460,7 +2691,20 @@ def run_census(
             "origin_phase": cluster.get("origin_phase") or "unknown",
             "manifested_phase": cluster.get("manifested_phase") or "unknown",
         }
+        held = held_back.get(cluster.get("title"))
+        if held is not None:
+            entry_fields[ENTRY_FILING_KEY] = ENTRY_FILING_WITHHELD
+            marked_withheld.append(held)
         updated_codebook = promote_candidate(updated_codebook, cand_id, entry_fields)
+
+    withheld = tuple(marked_withheld)
+    if withheld:
+        logger.info(
+            "census: %d verified cluster(s) recorded but not filed (no in-tree "
+            "remediation, fewer than %d sightings): %s",
+            len(withheld), filing_policy.MIN_UNREMEDIATED_SIGHTINGS,
+            [cluster.title for cluster in withheld],
+        )
 
     for cluster in rejected:
         cand_id = _find_pending_candidate_id(updated_codebook, cluster.get("title"))
@@ -2504,8 +2748,14 @@ def run_census(
     # (reviewer_comprehensive finding #4): a bug in payload construction can
     # then only abort the run before anything is persisted, never strand an
     # already-advanced codebook.
-    task_payloads = build_task_payloads(verified, project_root=project_root, project_id=project_id)
+    filing_queue = _filing_queue(fileable, updated_codebook)
+    task_payloads = build_task_payloads(
+        [pending.cluster for pending in filing_queue],
+        project_root=project_root, project_id=project_id, harness=harness_project,
+    )
     filed_ticket_ids = []
+    cross_project_tickets: list[CrossProjectTicket] = []
+    released_tickets: dict[str, str] = {}
     dry_run_filing = None
     if dry_run_payloads_path is not None:
         # --dry-run-filing: write the payloads for human review and file
@@ -2543,6 +2793,16 @@ def run_census(
             "matches, not candidates, and the census window has re-anchored).",
             len(task_payloads), resolved_path,
         )
+        withheld_offered = sum(
+            1 for pending in filing_queue if pending.withheld_entry_id is not None
+        )
+        if withheld_offered:
+            logger.warning(
+                "census: --dry-run-filing -- %d of those payload(s) are withheld "
+                "codebook entries that have since recurred; they stay marked "
+                "withheld, so the next real census re-offers them.",
+                withheld_offered,
+            )
         # Every downstream consumer -- the report's Filed Tasks section, the
         # commit paths and CensusOutcome -- reads the path off this one
         # object, so they all name the file actually written.
@@ -2550,7 +2810,7 @@ def run_census(
             path=str(resolved_path), payload_count=len(task_payloads),
         )
     else:
-        for payload in task_payloads:
+        for pending, payload in zip(filing_queue, task_payloads, strict=True):
             try:
                 submit_result = submit_fn(**payload)
             except Exception as exc:  # noqa: BLE001 - best-effort, see comment above
@@ -2566,6 +2826,19 @@ def run_census(
                 )
                 continue
             filed_ticket_ids.append(ticket_id)
+            if payload["project_root"] != project_root:
+                cross_project_tickets.append(
+                    CrossProjectTicket(ticket_id=ticket_id, project_root=payload["project_root"]),
+                )
+            if pending.withheld_entry_id is not None:
+                updated_codebook = mark_entry_filed(updated_codebook, pending.withheld_entry_id)
+                released_tickets[pending.withheld_entry_id] = ticket_id
+        if released_tickets:
+            logger.info(
+                "census: %d withheld codebook entr(ies) recurred and were filed "
+                "(entry -> ticket): %s",
+                len(released_tickets), released_tickets,
+            )
 
     storm_batch_indices = [s.index for s in mining_result.batch_stats if s.status == "failure"]
     if storm_batch_indices:
@@ -2607,6 +2880,8 @@ def run_census(
         dry_run=dry_run_filing,
         dropped_verdicts=tuple(dropped_verdicts),
         mass_rejection=mass_rejection,
+        withheld=withheld,
+        cross_project_tickets=tuple(cross_project_tickets),
     )
     # Written BEFORE codebook.dump()/advance_census_state() below -- a
     # failure here (e.g. a disk-full write_text) leaves nothing but this one
@@ -2661,6 +2936,9 @@ def run_census(
         dry_run=dry_run_filing,
         dropped_verdicts=tuple(dropped_verdicts),
         unresolved_verdicts=len(dropped_verdicts),
+        withheld=withheld,
+        cross_project_tickets=tuple(cross_project_tickets),
+        released_entry_ids=tuple(released_tickets),
     )
     commit_paths = [str(report_path), str(codebook_path), str(census_state_path)]
     if dry_run_filing is not None:
@@ -2692,6 +2970,13 @@ DEFAULT_PROJECTS_ROOT = Path.home() / ".claude" / "projects"
 inventory.enumerate_sessions scans -- distinct from a censused project's
 OWN project_root (which only ever holds that project's docs/legibility/
 state, not any transcripts)."""
+
+DEFAULT_HARNESS_CONFIG_PATH = (
+    Path(__file__).resolve().parents[2] / "docs" / "legibility" / "legibility.yaml"
+)
+"""legibility.yaml of the checkout that ships this census: the harness whose
+own components can be a confusion's fix surface. Its project_root names the
+MAIN checkout even when the census runs from a worktree."""
 
 _DEFAULT_CENSUS_LOOKBACK_DAYS = 30
 """Fallback mining-window length (days) when a project has never been
@@ -2810,8 +3095,8 @@ def _verify_prompt(cluster: dict, *, project_root: str) -> str:
     cluster against *project_root*'s current main via targeted file reads.
 
     The CLI subprocess this prompt is delivered to runs with its cwd set to
-    *project_root* (``_build_stage_invokes`` binds it). That is load-bearing
-    for a reason that is NOT relative-path resolution: ``claude -p``
+    *project_root* (``census_stage_specs`` binds it). That is load-bearing
+    for a reason that is NOT relative-path resolution: the CLI
     SANDBOXES tool access to the cwd tree, so a verifier launched from
     anywhere else has every Read/Bash against this tree permission-denied,
     with no interactive prompt to approve (proven 2026-08-03). The
@@ -2829,8 +3114,14 @@ def _verify_prompt(cluster: dict, *, project_root: str) -> str:
         "OBSERVABLE fact about the CURRENT state of that tree -- never a "
         "diagnosis or a guess about root cause you cannot directly "
         "verify.\n\n"
+        "Give a remediation ONLY when a specific EXISTING file or directory "
+        "in this tree (never the tree root itself) produces, teaches, or fails to guard against the "
+        "confusion; otherwise null -- including when the cause lies in "
+        "tooling this tree does not contain.\n\n"
         "Respond with STRICT JSON ONLY (no prose, no markdown fences), "
-        'exactly this shape: {"verified": true|false, "reason": "..."}.\n\n'
+        'exactly this shape: {"verified": true|false, "reason": "...", '
+        '"remediation": {"path": "<path relative to ' + str(project_root) + '>", '
+        '"change": "<one sentence>"} | null}.\n\n'
         "=== CLUSTER ===\n" + json.dumps(cluster)
     )
 
@@ -2849,6 +3140,42 @@ def _synthesis_prompt(verified: list) -> str:
     )
 
 
+def _in_tree_remediation(raw, *, project_root: str) -> dict | None:
+    """The verifier's proposed remediation, normalised to a path relative to
+    *project_root*, or ``None`` unless it names something that EXISTS below
+    that tree's root. The root itself names no fix surface: it would let a
+    vague reply pass the singleton gate. The verifier is sandboxed to the
+    observed tree, so a remediation is by construction a change the observed
+    project can make."""
+    if filing_policy.proposed_remediation({"remediation": raw}) is None:
+        return None
+    root = Path(project_root).resolve()
+    try:
+        target = (root / raw["path"]).resolve()
+        below_root = target != root and target.is_relative_to(root) and target.exists()
+    except (OSError, ValueError):
+        return None
+    if not below_root:
+        return None
+    return {"path": target.relative_to(root).as_posix(), "change": raw["change"].strip()}
+
+
+def _with_in_tree_remediation(cluster: dict, raw, *, project_root: str) -> dict:
+    """*cluster*, plus the verifier's remediation when it survives
+    ``_in_tree_remediation``. An offered-but-rejected remediation is logged,
+    never silently dropped."""
+    remediation = _in_tree_remediation(raw, project_root=project_root)
+    if remediation is not None:
+        return {**cluster, "remediation": remediation}
+    if raw is not None:
+        logger.warning(
+            "census: verifier remediation for cluster %r rejected (not an existing "
+            "path below %s): %r",
+            cluster.get("title"), project_root, raw.get("path") if isinstance(raw, dict) else raw,
+        )
+    return cluster
+
+
 def _build_default_verify_fn(
     project_root: str,
     invoke,
@@ -2857,8 +3184,8 @@ def _build_default_verify_fn(
     probe_every: int = _VERIFY_PROBE_EVERY,
 ):
     """Build the real ``verify_fn(clusters, *, model)`` seam: one Sonnet
-    call per cluster via *invoke* (default ``coder._invoke_cli`` --
-    headless ``claude -p --model``), parsed via ``coder.parse_coder_output``.
+    call per cluster via *invoke* (in production the pooled runner's verify
+    stage, ``census_stage_specs``), parsed via ``coder.parse_coder_output``.
     Any per-cluster failure (invocation error, unparseable output) rejects
     that cluster rather than crashing the whole census -- a conservative
     fail-closed default for an unverifiable claim. This default never
@@ -2870,7 +3197,7 @@ def _build_default_verify_fn(
     the censused tree, every permission-denied verifier read became an
     ordinary per-cluster rejection, so a whole census mass-rejected without
     a single error surfacing. What keeps the default honest rather than
-    indiscriminate is ``_build_stage_invokes`` scoping the subprocess cwd to
+    indiscriminate is ``census_stage_specs`` scoping the subprocess cwd to
     *project_root* -- a rejection then means the claim really could not be
     verified, not that the verifier could not see the tree.
 
@@ -3074,7 +3401,14 @@ def _build_default_verify_fn(
                 )
                 rejected.append(cluster)
                 continue
-            (verified if verdict.get("verified") else rejected).append(cluster)
+            if verdict.get("verified"):
+                verified.append(
+                    _with_in_tree_remediation(
+                        cluster, verdict.get("remediation"), project_root=project_root,
+                    )
+                )
+            else:
+                rejected.append(cluster)
 
             # (c) The backstop. Guarded on `remaining > 1` so no probe is
             # spent after the last cluster, where it would guard a stage
@@ -3265,63 +3599,68 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _build_stage_invokes(cfg, *, project_root):
-    """Build the three per-stage ``invoke(prompt, model)`` seams, each
-    carrying its OWN claude-CLI subprocess timeout from ``cfg.timeouts``
-    (see ``config.Timeouts`` for the rationale — why each stage needs its
-    own budget) and each scoped to *project_root* as its subprocess cwd.
+_MINING_MAX_TURNS, _MINING_MAX_BUDGET_USD = 2, 2.0
+_VERIFY_MAX_TURNS, _VERIFY_MAX_BUDGET_USD = 100, 10.0
+_SYNTHESIS_MAX_TURNS, _SYNTHESIS_MAX_BUDGET_USD = 2, 50.0
+"""Per-call ceilings the CLI requires, set well above any measured call so
+``cfg.timeouts`` stays the binding bound. Verify alone takes turns: it
+explores the tree with Read/Grep/Glob."""
 
-    Returns ``(mining_invoke, verify_invoke, synthesis_invoke)``. Every
-    census stage calls its invoke as ``invoke(prompt, model)`` with two
-    positional args and no kwargs, so a ``functools.partial`` that
-    pre-binds the keyword-only ``timeout`` is a drop-in ``invoke``.
-    ``mining_invoke`` also backs the headroom probe (``run_census`` routes
-    both through its single ``invoke`` param).
 
-    *project_root* is bound as ``cwd`` on ALL THREE partials, not on verify
-    alone. VERIFY is where the gap was proven fatal (fleet session
-    census-reify-3386101, 2026-08-03): it is the only stage whose prompt
-    directs the model to read the target tree, and ``claude -p`` sandboxes
-    tool access to its cwd tree, so censusing a project from some other
-    directory permission-denied every verifier read. Scoping only verify
-    would nonetheless leave mining and synthesis silently rooted in
-    whatever directory the operator launched from — an asymmetry with no
-    defensible reason that a later reader would file as a bug. Binding all
-    three makes "the census subprocess runs inside the censused project" a
-    uniform invariant instead of a verify-only patch.
+def census_stage_specs(cfg, *, project_root):
+    """How each census stage calls the model:
+    ``(mining, verify, synthesis)``.
 
-    That uniformity is NOT free, and the cost belongs on the record.
-    Mining and synthesis take no tool action, but their cwd is still
-    observable: ``claude -p`` assembles context from the directory it runs
-    in — CLAUDE.md, ``.claude/settings.json`` (hooks included) and
-    ``.mcp.json`` are all cwd-relative. Scoping the subprocess to the
-    censused project therefore prepends THAT project's CLAUDE.md to every
-    mining call — and mining is both the highest-volume stage (hundreds of
-    calls) and the dominant cost of a ~$100 census — and can fire that
-    project's session hooks inside the census subprocess. It is still the
-    right trade: reading the censused project's own conventions is if
-    anything more correct for mining, and the alternative is two stages
-    silently rooted in an arbitrary directory. But if the added per-call
-    context ever measures material, the lever is an explicit
-    ``--settings``/``--strict-mcp-config``-style flag on the mining and
-    synthesis partials — NOT un-scoping their cwd, which would restore the
-    asymmetry this paragraph exists to rule out.
+    Each carries its OWN timeout from ``cfg.timeouts`` (see
+    ``config.Timeouts`` for why each stage needs its own budget). Mining —
+    which also backs the headroom probe — and synthesis are pure classifiers
+    with no tools; verify may Read/Grep/Glob the censused tree and nothing
+    else, so it can never write into what it is censusing.
 
-    ``coder._invoke_cli`` is looked up here at call time (inside this
-    function, invoked from ``main``), never bound at import, so
-    monkeypatching ``coder._invoke_cli`` in tests takes effect.
+    *project_root* is the cwd of ALL THREE, not of verify alone. VERIFY is
+    where its absence was proven fatal (fleet session census-reify-3386101,
+    2026-08-03): it is the only stage whose prompt directs the model to read
+    the target tree, and the CLI scopes tool access to its cwd tree, so
+    censusing a project from some other directory permission-denied every
+    verifier read. Scoping only verify would leave mining and synthesis
+    rooted in whatever directory the operator launched from — an asymmetry a
+    later reader would file as a bug. The cost: the CLI loads the censused
+    project's CLAUDE.md into every mining call, the highest-volume stage. It
+    is the right trade, and if that context ever measures material the lever
+    is a settings flag on those two stages, not un-scoping their cwd.
     """
-    cwd = str(project_root)
+    timeouts = cfg.timeouts
     return (
-        functools.partial(
-            coder._invoke_cli, timeout=cfg.timeouts.census_mining_secs, cwd=cwd,
+        session_runner.StageSpec(
+            name="census-mining", cwd=project_root,
+            timeout_secs=timeouts.census_mining_secs,
+            max_turns=_MINING_MAX_TURNS, max_budget_usd=_MINING_MAX_BUDGET_USD,
+            tools=session_runner.CLASSIFIER,
         ),
-        functools.partial(
-            coder._invoke_cli, timeout=cfg.timeouts.census_verify_secs, cwd=cwd,
+        session_runner.StageSpec(
+            name="census-verify", cwd=project_root,
+            timeout_secs=timeouts.census_verify_secs,
+            max_turns=_VERIFY_MAX_TURNS, max_budget_usd=_VERIFY_MAX_BUDGET_USD,
+            tools=session_runner.READ_ONLY_EXPLORER,
         ),
-        functools.partial(
-            coder._invoke_cli, timeout=cfg.timeouts.census_synthesis_secs, cwd=cwd,
+        session_runner.StageSpec(
+            name="census-synthesis", cwd=project_root,
+            timeout_secs=timeouts.census_synthesis_secs,
+            max_turns=_SYNTHESIS_MAX_TURNS, max_budget_usd=_SYNTHESIS_MAX_BUDGET_USD,
+            tools=session_runner.CLASSIFIER,
         ),
+    )
+
+
+def _build_stage_invokes(cfg, *, project_root, runner):
+    """The three per-stage ``invoke(prompt, model)`` seams on *runner*:
+    ``(mining_invoke, verify_invoke, synthesis_invoke)``, one per
+    :func:`census_stage_specs` entry. ``mining_invoke`` also backs the
+    headroom probe (``run_census`` routes both through its single ``invoke``
+    param), so the probe rotates over the pool exactly as mining does."""
+    return tuple(
+        runner.invoker(spec)
+        for spec in census_stage_specs(cfg, project_root=project_root)
     )
 
 
@@ -3363,13 +3702,19 @@ def main(argv: list[str] | None = None) -> int:
     a stratified-random ``batch_source`` over the mining window, a
     scoped git-commit helper, and the ``unlanded.roll_back`` that puts
     back a commit that did not land) and runs the full pipeline via
-    ``run_census``.
+    ``run_census``. ``--harness-config`` (default ``DEFAULT_HARNESS_CONFIG_PATH``)
+    names the project whose task tree receives harness-owned fix surfaces,
+    and is loaded before the trigger gate so an unloadable one fails loud
+    rather than quietly filing them into the censused project.
 
     Three OPERATOR COST-CONTROL flags bound what a single run may spend,
     each defaulting to today's unbounded behavior so a flagless
-    invocation -- notably the nightly trickle's, which passes only
-    ``--project-root``/``--config`` and no cost-control flags -- is
-    unchanged: ``--max-batches N`` bounds mining (the
+    invocation is unchanged. The nightly trickle's launch passes
+    ``--max-batches`` / ``--max-verify-clusters`` from the project's
+    legibility.yaml ``census.trickle_caps`` (``config.TrickleCensusCaps``;
+    either one omitted when set to null). census.py itself never reads that
+    block, so these flags remain the single cap mechanism.
+    ``--max-batches N`` bounds mining (the
     capped-away sessions are NOT re-mined by a later census -- this run
     still advances ``last_census_at``, so the next window starts here),
     ``--max-verify-clusters N`` bounds per-cluster verification (a deferred
@@ -3428,6 +3773,13 @@ def main(argv: list[str] | None = None) -> int:
         "(default: <project-root>/docs/legibility/legibility.yaml).",
     )
     parser.add_argument(
+        "--harness-config", default=None,
+        help="Path to the legibility.yaml of the project that owns tooling fix "
+        "surfaces (dark-factory): a verified cluster whose fix surface is that "
+        "project's files into its task tree (default: this census checkout's "
+        "own docs/legibility/legibility.yaml).",
+    )
+    parser.add_argument(
         "--force", action="store_true",
         help="Bypass the census_trigger gate (operator-initiated run).",
     )
@@ -3478,7 +3830,7 @@ def main(argv: list[str] | None = None) -> int:
     # Rejected LOUDLY here, at the CLI boundary, rather than left to fail
     # somewhere downstream. Now that project_root is also the stage
     # subprocess cwd, a typo'd root surfaces on the FIRST invoke -- the
-    # headroom probe -- as a CoderInvocationError, and preflight_headroom
+    # headroom probe -- as a session_runner.InvocationFailed, and preflight_headroom
     # deliberately folds ANY probe exception into HeadroomResult(ok=False).
     # Without this check `census --project-root /typo --config <real one>`
     # would exit 0 with "census deferred: headroom probe invocation
@@ -3508,6 +3860,21 @@ def main(argv: list[str] | None = None) -> int:
     if mismatch is not None:
         print(f"census: {mismatch}", file=sys.stderr)
         return 1
+
+    harness_config_path = (
+        Path(args.harness_config) if args.harness_config else DEFAULT_HARNESS_CONFIG_PATH
+    )
+    try:
+        harness_cfg = config.load_config(harness_config_path)
+    except Exception as exc:  # noqa: BLE001 - an unloadable harness config fails loud at CLI startup
+        print(
+            f"census: failed to load harness config at {harness_config_path}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    harness_project = filing_policy.ProjectRef(
+        project_root=harness_cfg.project_root, project_id=harness_cfg.project_id,
+    )
 
     now = datetime.now(UTC)
     date_str = args.date.isoformat() if args.date is not None else now.date().isoformat()
@@ -3541,71 +3908,75 @@ def main(argv: list[str] | None = None) -> int:
         )
         codebook_dict = {"version": 2, "entries": [], "candidates": []}
 
-    # Each census stage gets its OWN claude-CLI subprocess timeout; see
-    # config.Timeouts for the rationale.
-    mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(
-        cfg, project_root=project_root,
-    )
-
     # One escalate_fn closure shared by BOTH consumers: run_census's
-    # headroom-defer path (lines ~800) and main()'s hard-failure catch-all
-    # below -- so defer and hard-failure escalations share one census
-    # escalation source and one never-mask-the-exit contract.
+    # headroom-defer path and main()'s hard-failure catch-all below -- so
+    # defer and hard-failure escalations share one census escalation source
+    # and one never-mask-the-exit contract.
     escalate_fn = _build_default_escalate_fn(cfg)
 
-    try:
-        outcome = run_census(
-            batch_source=default_batch_source(
-                cfg, projects_root=DEFAULT_PROJECTS_ROOT, now=now,
-            ),
-            invoke=mining_invoke,
-            # The in-verify re-probe rides the SAME cwd-scoped invoke as the
-            # verifier it guards (so it fails exactly when the verifier would)
-            # but on the cheap trickle tier, matching every other headroom
-            # gate -- one probe implementation, one model tier, four sites.
-            verify_fn=_build_default_verify_fn(
-                str(project_root),
-                verify_invoke,
-                headroom_probe=functools.partial(
-                    preflight_headroom, verify_invoke, model=cfg.models.trickle,
+    # ONE pooled session runner for the whole census: every stage and every
+    # headroom probe rotates over the shared account pool per invocation
+    # (task 6042), and cap state learned by one stage carries to the next.
+    with session_runner.open_pooled_runner(
+        label=f"legibility-census[{cfg.project_id}]",
+    ) as runner:
+        mining_invoke, verify_invoke, synthesis_invoke = _build_stage_invokes(
+            cfg, project_root=project_root, runner=runner,
+        )
+        try:
+            outcome = run_census(
+                batch_source=default_batch_source(
+                    cfg, projects_root=DEFAULT_PROJECTS_ROOT, now=now,
                 ),
-            ),
-            synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
-            submit_fn=default_submit_fn,
-            escalate_fn=escalate_fn,
-            status_fetcher=status_fetcher,
-            commit=_build_default_commit(project_root),
-            roll_back=functools.partial(
-                unlanded.roll_back, project_root,
-                project_id=cfg.project_id, label=f"census-{date_str}",
-            ),
-            codebook_dict=codebook_dict,
-            config=cfg,
-            project_root=str(project_root),
-            project_id=cfg.project_id,
-            codebook_path=codebook_path,
-            census_state_path=census_state_path,
-            report_path=report_path,
-            date=date_str,
-            force=args.force,
-            max_batches=args.max_batches,
-            max_verify_clusters=args.max_verify_clusters,
-            dry_run_payloads_path=dry_run_payloads_path,
-        )
-    except Exception as exc:  # noqa: BLE001 - fail loud: escalate (PRD decision 8) AND exit non-zero, never a silent crash
-        print(f"census: FAILED -- {exc}", file=sys.stderr)
-        # PRD decision 8 -- degradation never silent: file a best-effort
-        # escalation via the shared closure so a hard failure leaves an
-        # operator signal, not just a stderr line. The closure swallows all
-        # POST errors internally (logging a best-effort warning), so this
-        # never masks the exit and `return 1` always runs.
-        escalate_fn(
-            category="infra_issue",
-            severity="info",
-            summary=f"legibility census run failed ({cfg.project_id}): {exc}",
-            detail=traceback.format_exc(),
-        )
-        return 1
+                invoke=mining_invoke,
+                # The in-verify re-probe rides the SAME cwd-scoped invoke as the
+                # verifier it guards (so it fails exactly when the verifier would)
+                # but on the cheap trickle tier, matching every other headroom
+                # gate -- one probe implementation, one model tier, four sites.
+                verify_fn=_build_default_verify_fn(
+                    str(project_root),
+                    verify_invoke,
+                    headroom_probe=functools.partial(
+                        preflight_headroom, verify_invoke, model=cfg.models.trickle,
+                    ),
+                ),
+                synthesize_fn=_build_default_synthesize_fn(synthesis_invoke),
+                submit_fn=default_submit_fn,
+                escalate_fn=escalate_fn,
+                status_fetcher=status_fetcher,
+                commit=_build_default_commit(project_root),
+                roll_back=functools.partial(
+                    unlanded.roll_back, project_root,
+                    project_id=cfg.project_id, label=f"census-{date_str}",
+                ),
+                codebook_dict=codebook_dict,
+                config=cfg,
+                project_root=str(project_root),
+                project_id=cfg.project_id,
+                codebook_path=codebook_path,
+                census_state_path=census_state_path,
+                report_path=report_path,
+                date=date_str,
+                force=args.force,
+                max_batches=args.max_batches,
+                max_verify_clusters=args.max_verify_clusters,
+                dry_run_payloads_path=dry_run_payloads_path,
+                harness_project=harness_project,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail loud: escalate (PRD decision 8) AND exit non-zero, never a silent crash
+            print(f"census: FAILED -- {exc}", file=sys.stderr)
+            # PRD decision 8 -- degradation never silent: file a best-effort
+            # escalation via the shared closure so a hard failure leaves an
+            # operator signal, not just a stderr line. The closure swallows all
+            # POST errors internally (logging a best-effort warning), so this
+            # never masks the exit and `return 1` always runs.
+            escalate_fn(
+                category="infra_issue",
+                severity="info",
+                summary=f"legibility census run failed ({cfg.project_id}): {exc}",
+                detail=traceback.format_exc(),
+            )
+            return 1
 
     if outcome.status == "deferred":
         # The FIELDS, not only the prose. The two defer flavours read much the

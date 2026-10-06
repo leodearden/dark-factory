@@ -3,9 +3,8 @@
 const { useRef, useEffect, useState, useMemo } = React;
 
 // The Datum render decision. Module scope, no fallback, bound under datum.js's
-// own name — a text/babel tag joins no classic-script scope, so there is
-// nothing to collide with. See the CANONICAL note in datum.js's header; the
-// spark_path.js destructure below follows the same rule.
+// own name, which is safe here — see the CANONICAL note in datum.js's header;
+// the spark_path.js destructure below follows the same rule.
 const { datumView } = window.DF_DATUM;
 
 // The scale+path math for every chart primitive here lives in the plain-JS
@@ -30,6 +29,7 @@ const {
   plottableMax,
   axisY,
   formatCountTick,
+  niceCountMax,
   axisPaths,
   barFractions,
   stackedAreaPaths,
@@ -41,11 +41,9 @@ const PALETTE = {
   ok:      'oklch(0.74 0.14 155)',
   warn:    'oklch(0.80 0.14 80)',
   bad:     'oklch(0.68 0.18 25)',
-  // In-progress work with no live claimant. Named rather than inlined so the
-  // burndown stack and its legend cannot drift apart. Magenta because the
-  // band sits between `accent` (live, 230) and `bad` (blocked, 25) in the
-  // status-mix stack: reusing either would make the split unreadable, and a
-  // strand is a different failure from a block, not a worse one.
+  // census.py::TONES' infra-hold tone. Magenta so it reads apart from both
+  // `accent` (in-progress, 230) and `bad` (blocked, 25): work parked on an
+  // infrastructure hold is a different condition from a block, not a worse one.
   stranded: 'oklch(0.66 0.19 330)',
   info:    'oklch(0.62 0.20 305)',
   fg2:     'oklch(0.66 0.012 250)',
@@ -130,7 +128,11 @@ function StepSpark({ values, width = 100, height = 28, color = PALETTE.bad, stro
 // explicitly with `formatY={formatCountTick}` (spark_path.js, where its
 // blank-don't-round rule is behaviourally tested). Do not "align" these two
 // defaults without redoing that audit.
-function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v }) {
+//
+// `snapMax` (task 5121) is opt-in for the same caller-audit reason: count
+// callers pass niceCountMax, and fraction axes must not, because 1 would snap
+// to 4. The rationale lives at spark_path.js::niceCountMax.
+function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v, snapMax = (dataMax) => dataMax }) {
   const ref = useRef(null);
   const [w, setW] = useState(600);
   useEffect(() => {
@@ -150,7 +152,8 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
   // minV = 0: switching to a `Math.min(...)` fold would newly bring negative
   // samples in-range and silently re-frame every LineChart on the dashboard.
   // This is a null-handling fix, not a re-scaling.
-  const maxV = plottableMax(all, 1);
+  const ticks = 4;
+  const maxV = snapMax(plottableMax(all, 1), ticks);
   const minV = 0;
   const range = maxV - minV || 1;
   const n = labels.length;
@@ -173,7 +176,6 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
   // reads as "no data in this window"), so the x-mapping is taken from a builder
   // call either way — never recomputed here.
   const { stepX } = built[0] ?? axisPaths([], geom);
-  const ticks = 4;
   const yTicks = Array.from({ length: ticks + 1 }, (_, i) => minV + (range * i) / ticks);
   return (
     <div ref={ref} style={{ width: '100%', height }}>
@@ -215,7 +217,7 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
   );
 }
 
-function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(Math.round(v)), formatX = v => v }) {
+function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(Math.round(v)), formatX = v => v, snapMax = (dataMax) => dataMax }) {
   // stacks: [{ key, color, values }]
   const ref = useRef(null);
   const [w, setW] = useState(600);
@@ -242,7 +244,8 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
   // label row: one x-mapping, so the labels can never drift out of line with
   // the bands they name.
   const geom = { x0: padL, y0: padT, width: chartW, height: chartH, count: n };
-  const { max: maxV, paths, stepX } = stackedAreaPaths(stacks, geom);
+  const ticks = 4;
+  const { max: maxV, paths, stepX } = stackedAreaPaths(stacks, geom, (foldedMax) => snapMax(foldedMax, ticks));
 
   // The value axis the builder scaled every band against: 0..maxV.
   const tickGeom = { y0: padT, height: chartH, min: 0, range: maxV };
@@ -258,7 +261,6 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
   // integer count axes instead of gaining 2.5 / 7.5 labels. LineChart
   // already passed the raw tick and is deliberately left alone (see the note
   // at its signature: only the two formatY DEFAULTS differ).
-  const ticks = 4;
   const yTicks = Array.from({ length: ticks + 1 }, (_, i) => (maxV * i) / ticks);
 
   return (
@@ -610,10 +612,11 @@ function defaultSmoothingForWindow(windowKey) {
 // the window's left boundary is non-decreasing as i advances, so `left` only
 // ever moves forward.
 //
-// Cf. dailyDeltas() in shell.jsx — related but distinct: dailyDeltas buckets by
-// calendar day, clamps rates to >=0, and returns N-1 entries (day-to-day diff).
-// deriveVelocitySeries uses a configurable trailing time window, allows negative
-// rates (backlog can shrink), and returns N entries aligned to each sample.
+// Cf. burndown.py::compute_window_completion's `completed_per_day` — related
+// but distinct: the server buckets by calendar day, clamps each day's gain at 0
+// and serves one entry per ISO day. deriveVelocitySeries uses a configurable
+// trailing time window, allows negative rates (backlog can shrink), and returns
+// N entries aligned to each sample.
 function deriveVelocitySeries(series, labels, smoothingWindowSeconds) {
   if (!series || !labels || series.length !== labels.length || series.length < 2) return [];
   const t = labels.map(l => {
@@ -635,4 +638,4 @@ function deriveVelocitySeries(series, labels, smoothingWindowSeconds) {
   return result;
 }
 
-window.DF_CHARTS = { PALETTE, DATUM_AGE_STYLE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries, formatCountTick };
+window.DF_CHARTS = { PALETTE, DATUM_AGE_STYLE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries, formatCountTick, niceCountMax };

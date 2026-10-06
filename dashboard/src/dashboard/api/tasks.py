@@ -1,4 +1,4 @@
-"""`/api/v2/dashboard/tasks` — the active-task table and its done counts.
+"""`/api/v2/dashboard/tasks` — the per-project task snapshot (census and rows).
 
 Fans out over every known project root, reporting four distinct failure
 facts separately (offline / degraded / count-unknown / no root measured)
@@ -8,6 +8,7 @@ for why each is its own signal.
 
 from __future__ import annotations
 
+import enum
 import logging
 from dataclasses import replace
 from datetime import datetime
@@ -22,6 +23,7 @@ from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import (
     _all_project_roots,
     _project_label,
+    collect_census_snapshots,
     collect_tasks_with_counts,
     shape_terminal_rows,
 )
@@ -156,20 +158,44 @@ def _terminal_key(project: str) -> str:
     return f'TASKS_TERMINAL:{project}'
 
 
+class TasksProjection(enum.StrEnum):
+    """Which part of every root's snapshot ``GET /api/v2/dashboard/tasks`` serves.
+
+    A validated query parameter rather than a free string, so an unknown value
+    is FastAPI's 422 instead of silently falling through to the full render.
+    """
+
+    FULL = 'full'
+    CENSUS = 'census'
+
+
+async def _collect_snapshots(
+    projection: TasksProjection,
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    *,
+    now: datetime,
+) -> dict[str, TaskSnapshot]:
+    """Every root's unit, through the collector *projection* names."""
+    if projection is TasksProjection.CENSUS:
+        return await collect_census_snapshots(client, config, now=now)
+    _, snapshots = await collect_tasks_with_counts(
+        client, config, resolve_external=True, now=now,
+    )
+    return snapshots
+
+
 @router.get('/api/v2/dashboard/tasks')
-async def api_tasks(request: Request) -> JSONResponse:
-    """ACTIVE_TASKS (lock state surfaced via the scheduler endpoint — see /api/v2/dashboard/scheduler).
+async def api_tasks(
+    request: Request, projection: TasksProjection = TasksProjection.FULL,
+) -> JSONResponse:
+    """TASKS_SNAPSHOT per project root (lock state surfaced via the scheduler endpoint — see /api/v2/dashboard/scheduler).
 
-    Each task in ACTIVE_TASKS includes a ``meta_files`` field (taskmaster
-    ``metadata.files``) that is retained on the wire for debugging and tooling.
-    No frontend UI reads it directly — lock display routes through D.SCHEDULER.
-
-    ACTIVE_TASKS is the concatenation, in canonical root order, of every
-    ``TASKS_SNAPSHOT[p].rows.value``. They are the same row dicts, so every
-    active row crosses the wire TWICE until leaf γ3 (task 5590) moves the
-    readers onto the snapshot and deletes this key. That doubles the largest
-    part of the payload. The measured cost is recorded beside the budget it
-    spends, ``active_tasks._TASKS_TOTAL_BUDGET``.
+    The rows travel only as ``TASKS_SNAPSHOT[p].rows``, a ``Datum`` per root;
+    there is no flat row list on the wire. Each row includes a ``meta_files``
+    field (taskmaster ``metadata.files``) that is retained on the wire for
+    debugging and tooling. No frontend UI reads it directly — lock display
+    routes through D.SCHEDULER.
 
     **Four distinct failure facts (plus a denominator), deliberately not
     collapsed:**
@@ -255,8 +281,23 @@ async def api_tasks(request: Request) -> JSONResponse:
     silently. The exemption machinery that used to widen the window per-PRD is
     gone with it: its own constant comment recorded that it could only ever
     exempt rows that were FETCHED, so it never met that contract either. The
-    CLIENT half — reading the state and rendering the disclosure — belongs to
-    leaf γ3, which migrates the Tasks tab.
+    client half is ``tab_tasks.jsx``: it requests the window and renders the
+    ``lower_bound`` disclosure.
+
+    **``?projection=census`` — the census without the rows.** The dashboard
+    chrome (the rail badges and the topbar) reads only each root's census, on
+    every tab, so it polls this projection instead of the multi-MB full render.
+    It is a projection of THIS endpoint rather than an endpoint of its own
+    because PRD decision 2 (``plans/dashboard-one-datum-one-path-prd.md``) puts
+    the census inside ``/tasks`` as one snapshot unit and rejects a second
+    wire copy. It reads the same unit as the full render and
+    ``/api/v2/dashboard/scheduler``, through the same budgets and the same
+    classification loop below, so the census and the banner lists cannot
+    differ between projections. What it skips is the runtime probe, row
+    shaping and the external-dep read. Each measured rows half is WITHHELD as
+    an ``unknown`` ``Datum`` naming the projection, never omitted, so the
+    five-key shape holds and a rows tab can say why it has none yet.
+    ``?projection=full`` is the default.
     """
     config = request.app.state.config
     http_client = request.app.state.http_client
@@ -282,8 +323,8 @@ async def api_tasks(request: Request) -> JSONResponse:
     # under one TTL. The third slot in task_snapshot.PER_PROJECT_MCP_CALLS is
     # the terminal window, which only the `?terminal=` request spends.
     render_at = resolve_now(None)
-    active, snapshots = await collect_tasks_with_counts(
-        http_client, config, resolve_external=True, now=render_at,
+    snapshots = await _collect_snapshots(
+        projection, http_client, config, now=render_at,
     )
     served_at = resolve_now(None)
     offline_projects: list[str] = []
@@ -310,7 +351,7 @@ async def api_tasks(request: Request) -> JSONResponse:
     # The loop above routes each root to at most one banner, so a root in
     # neither of these two lists had its rows read this render, with or
     # without a count, and either case vetoes the flag. An offline root's
-    # last-good rows do not veto it, although they are in ACTIVE_TASKS. A set,
+    # last-good rows do not veto it, although they are served, aged. A set,
     # not a sum, so a duplicate label can only ever UNDERcount and fail safe
     # (flag stays False).
     no_root_measured = (
@@ -335,7 +376,6 @@ async def api_tasks(request: Request) -> JSONResponse:
     return JSONResponse(
         {
             **payload,
-            'ACTIVE_TASKS': active,
             'TASKS_SNAPSHOT': wire_snapshots,
             'TASKS_OFFLINE': (
                 bool(total_roots) and bool(offline_projects) and no_root_measured

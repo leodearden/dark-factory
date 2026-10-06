@@ -483,6 +483,31 @@ episode, and the tag they stamp is the very signal a future sweep would trust. C
 Filed as follow-up work rather than fixed here — this task's scope is a read-only report,
 and the fixes belong in the gate module.
 
+## Resolution (task 4853)
+
+Each finding above, mapped to what the gate (`fused_memory.services.completion_claim_gate`)
+does now:
+
+1. **Filing claims use an existence standard.** A `filing_dispatch` claim verifies against
+   any real task status. *"cancelled"* / *"closed as"* became their own `disposition` kind,
+   which keeps the terminal standard, so a false *"task N was cancelled"* is still a mismatch.
+2. **Commit claims are checked against every registered repository**
+   (`make_registry_commit_probe`), the claimed project's first. Absence is asserted only when
+   all of them answer "no such object".
+3. **The negation and attribution misses are closed.** *"<verb> nothing"* is stripped as a
+   denial; a hyphenated compound (*"merge-landed"*, *"auto-filed"*) is not a marker; and each
+   marker binds to its one nearest ref, so *"…landed as task #5478 (done) while its GATE, task
+   #5480, is STILL PENDING"* now claims 5478 only.
+4. **Ticket disposition stays existence-only**, deliberately out of scope.
+
+*Measured, text-only replay, not a re-sweep:* the 172 mismatch `claimed_text` values in
+`report.json` run through the shipped `extract_completion_claims` + `verify_claims`, with each
+finding's own `observed` as the probe answer for its own ref. **2 of 142** task findings and
+**21 of 30** commit findings still yield a non-verified verdict. The two task residuals (5317,
+3846) are attributive markers (*"the shipped … CLI"*, *"a landed-on-main check"*). The replay
+answers each commit with its recorded "absent", so it cannot exercise the registry-wide lookup
+that addresses Class C's 12.
+
 ## Invariant
 
 **This sweep invalidated nothing and deleted nothing.** Every episode and edge named above

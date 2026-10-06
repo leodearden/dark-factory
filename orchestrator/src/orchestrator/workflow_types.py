@@ -256,6 +256,7 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
     from shared.cli_invoke import AllAccountsCappedException
     from shared.usage_gate import (
         IllegalTransitionError,
+        PoolFrozen,
         ProbeSpawnError,
         SessionBudgetExhausted,
     )
@@ -304,6 +305,19 @@ def _disposition_table() -> dict[type[BaseException], BlockDisposition]:
             requeue_kind=RequeueKind.BLOCK,
             counts_against_requeue_cap=True,
             reason_prefix='Session budget exhausted',
+            block_class=BlockClass.AGENT_FAILURE,
+        ),
+        # Raised only to a park=False caller; no orchestrator site opts in
+        # (only scripts/legibility/session_runner.py does), so this row
+        # mirrors AllAccountsCappedException's. Its message names any
+        # AUTH_FAILED accounts, so a credential freeze stays legible in the
+        # block reason without paging a human for an ordinary all-capped pool.
+        PoolFrozen: BlockDisposition(
+            category=FailureCategory.NONE,
+            escalate_to_human=False,
+            requeue_kind=RequeueKind.BLOCK,
+            counts_against_requeue_cap=True,
+            reason_prefix='Account pool frozen',
             block_class=BlockClass.AGENT_FAILURE,
         ),
         # ── Warm-lane requeue family ─────────────────────────────────────

@@ -389,10 +389,10 @@ own prior canonicals. The cure is ordering plus a closure that is CORROBORATED b
 live re-read, never inferred from "the delete call returned ok".
 
 Ordering is the contract, and each step sits where it does because of what its
-failure would cost: (1) argument validation, pure and free to refuse; (2) fail-closed
-`metadata_patch` authorization, inherited from task 3088's resolver and run
-unconditionally — reparenting is only discovered after the canonical exists, so a late
-denial would abort mid-transaction; (3) the same tool-layer citation gate `delete_memory`
+failure would cost: (1) fail-closed `metadata_patch` authorization, inherited from task
+3088's resolver and run unconditionally — reparenting is only discovered after the
+canonical exists, so a late denial would abort mid-transaction; (2) argument validation,
+pure and free to refuse; (3) the same tool-layer citation gate `delete_memory`
 runs, in its non-mutating `scan_only` pre-flight, so a set that cannot be cleared leaves
 the corpus byte-identical; (4) the canonical write, before anything destructive; (5)
 retained peers tagged, then per supersede read → re-home children → corroborate → delete;
@@ -514,6 +514,144 @@ entry, bounding but not closing it), and `x_memory_citation_tombstones` on citin
 landed, have since landed under task 3134 (below).
 
 ### Changed
+
+#### Store preflight refuses an existing-but-empty target, not just a missing one (task 5468)
+
+The seven fused-memory store scripts that preflight their target now refuse an
+EMPTY one as well as a missing one: an escalation queue directory with no entries, or
+a `tasks.db` holding no tasks. That empty store is exactly the residue a mis-targeted
+run leaves behind, because both substrates auto-create themselves. An unreadable
+target still fails open. The wrappers are renamed `assert_queue_dir_populated` and
+`assert_task_store_populated`, and the general `assert_target_store_exists` is gone.
+See `fused-memory/src/fused_memory/utils/target_store_preflight.py`.
+
+#### Pinned tasks earn a pin reservation; reservation events carry `source`; new `pin_blocked` (task 6040)
+
+**Old behaviour.** A pinned task that failed `try_acquire` was skipped silently. It
+earned no reservation, accrued no skip count and emitted no event. Every module that
+freed up could be taken by whichever task scored next, so a pin on a hot file could
+starve indefinitely. Task 3659 is the replay: pinned, behind a holder on one module and
+a critical fairness park on it, while a medium task took its other module.
+
+**New behaviour.**
+
+- **Pin reservation.** The lowest-`pin_order` pins that are pinned, present, eligible,
+  not landed-outbox gated, not deterministic and lock-blocked are HEADS. At most
+  `pin_reservation_max_active` of them exist. A head reserves its current module set
+  on the ordinary park stacks, at a pin rank band that sits above every priority tier
+  and is ordered by `pin_order`. It installs inline in the pin loop, so a later pin or
+  scored candidate in the same tick cannot take a module the head is waiting for. It
+  shadows any fairness park, critical included, and restores it when used or released.
+  The pin owner's own fairness park on a module stays beneath its pin reservation, so a
+  release by the pin phase leaves that park exactly where it was; an owner whose skip
+  count has reached its tier's threshold also completes, at release, the fairness parks
+  the pin reservation had made redundant. It never preempts a HELD lock. A dispatch
+  consumes it, and EASY-backfill borrows through it as through a fairness park. It is
+  derived state, so the first tick after a restart rebuilds it. A pin still accrues no
+  skip count from the pin loop.
+- **`data.source` on every `reservation_*` event**: `'pin'` or `'fairness'`, derived
+  from the park's rank. `reserve_now` parks read `'fairness'`. This is the only new key
+  on `reservation_used`, `reservation_restored`, `reservation_expired`,
+  `reservation_force_evicted` and `reservation_force_evict_refused`. Pin-sourced
+  `reservation_installed`, `reservation_shadowed` and `reservation_install_blocked`
+  carry `pin_order` IN PLACE OF the tier fields `priority` / `preempted_by_priority`:
+  a pin rank lies above every tier, so the owner's tier would misdescribe it. On
+  `reservation_restored`, `source` is that of the restored entries themselves.
+- **New `reservation_expired` reasons** for releases decided in the pin phase:
+  `unpinned`, `gated`, `ineligible`, `deterministic`, `pin_displaced` (outranked by a
+  lower `pin_order` or past the cap) and `pin_reservations_disabled`. These remove only
+  the owner's pin entries. Terminal, missing and deps-unsatisfied pins are released by
+  park GC with its existing reasons, which remove every park the owner holds.
+- **New `pin_blocked` event**, payload `{task_id, pin_order, head, blockers: [{module,
+  owner, kind: held|parked}]}`. The blockers are read before the head's own
+  reservation installs. It fires when a pin becomes blocked, then at most once per
+  `pin_blocked_emit_interval_secs` while it stays blocked. Dispatching or leaving the
+  pin queue resets it, and a PSI-held tick neither emits nor resets it.
+- **New snapshot key `pin_reservations`**, `{task_id: {modules, installed_at}}`, in
+  `get_state_snapshot()` and `scheduler_state.json` (so `get_scheduler_state` too).
+  `parks` still reports every active top, pin owners included.
+- **Three green-tier knobs**, hot-reloadable and read at tick time:
+  `pin_reservations_enabled` (default `true`), `pin_reservation_max_active` (default
+  `1`, `ge=1`) and `pin_blocked_emit_interval_secs` (default `3600`). The kill switch
+  restores the pre-change pin loop: no reservation, no `pin_blocked`, and leftover pin
+  reservations are released once with reason `pin_reservations_disabled`.
+
+The design rationale is the annotation to
+`plans/scheduler-dispatch-scoring-and-lock-layer-prd.md` §7 and the module docstring of
+`orchestrator/src/orchestrator/pin_reservation.py`.
+
+**Migration for historical series.** Consumers filtering `reservation_installed` (or any
+`reservation_*` event) should add `json_extract(data, '$.source') = 'fairness'` to keep
+post-change series comparable with pre-change ones. Pre-change rows carry no `source`,
+and all of them are fairness. The change boundary is this task's merge commit.
+
+#### The plan-target drop-guard judges the tip the merge commit merged, not the submitted worktree's HEAD (task 4956)
+
+- **Plan-target drop-guard** — before: the guard took the task's HEAD from the submitted
+  worktree. A worktree left on a foreign commit (a recycled lane, or a resubmit passing a
+  checkout on main) made it cite files the branch never owned, against a speculative base
+  that predated them. After: it reads the merge commit's second parent, the tip
+  `GitOps.merge_to_main` actually merged, and fails open with a WARNING when there is
+  none. Measured: reify task 6249 / `mr-f09b27f5`. Replaying the guard with task_head
+  `995f13fd` (main just after a sibling landed) against the speculative base `433ebac3`
+  reproduces exactly the two cited files; the true branch tip `238c380e` yields none.
+
+**Operator consequence.** A `Merge commit is missing plan target files` block that cites
+paths outside the task's `metadata.files` is no longer expected. Before this fix, the
+correct response to one was to resubmit unchanged.
+
+#### `consolidate_memories` lists its closure as `{id, canonical}` rows, and its step contract now numbers authorization first (task 5275)
+
+- **Projection (wire-visible).** `topic_members` rows lose `content`, `created_at` and
+  `metadata`; the ids and the `topic_members_total` / `topic_members_truncated` /
+  `topic_members_available` qualifiers are unchanged. The envelope is the only record of
+  an irreversible multi-delete, and 200 raw rows could exceed the ~62 KB documented-safe
+  MCP response, which would lose every per-id disposition for records already gone. The
+  projection lives in `server/consolidation.py::build_consolidation_result`, so the
+  `execute_retain_consolidation` envelope gets it too; the topic-guard seed still reads
+  the full closure rows.
+- **Order.** The docs now match the code: (1) authorize, then (2) validate. Reordering
+  the code instead was rejected because auth-first is the repo-wide posture
+  (`update_memory`, `apply_retain_arm`). A test pins that an unauthorized caller with
+  malformed arguments gets `Mem0UpdateNotAuthorized`, not `ValidationError`.
+
+#### Fairness parks: `reservation_installed` never empty; new `reservation_install_blocked`; parks settled on every dispatch (task 5308)
+
+**Old behaviour.** An install attempt that parked zero modules — every requested module
+blocked by a same-or-higher-tier foreign park (INV-3) — still emitted
+`reservation_installed` with `data.modules == []`. Those no-ops were **62% (DF) and 82%
+(reify)** of all `reservation_installed` rows
+(`plans/evidence/scheduler-scoring-2026-08-06/PARKING_MODEL_REPORT.md` §0 item 4). A
+partial install was never completed: once an owner held any park, the `has_parks` guard
+stopped every further attempt, so the modules it missed stayed unparked for the rest of
+the episode.
+
+**New behaviour.**
+
+- `reservation_installed` fires only when an attempt NEWLY parked at least one module,
+  and `data.modules` is that increment. A passed-over top past its skip threshold now
+  re-attempts its remainder — every module it has not parked yet — on each qualifying
+  skip, so one park episode can emit several rows: the initial install, then completions.
+- New `reservation_install_blocked` event, payload `{requested, installed, blocked,
+  attempts, skip_count, priority}`, emitted whenever an attempt parked fewer modules than
+  it requested. Empty and partial installs are one signal. It is rate-limited to
+  `attempts` in {1, 10, 100, 1000, 10000} on the owner's consecutive blocked-attempt
+  streak; the attempt itself is not rate-limited.
+- `reservation_used` is now also emitted for pin-loop and non-top scored dispatches.
+  Those tasks' parks were previously kept while running and cleared silently at release,
+  so `reservation_used` counts rise.
+- reserve_now installs at the effective (boosted or inherited) tier, and `install_parks`
+  never duplicates an owner's existing entry. An owner's lower-tier entry is re-ranked in
+  place (and reported in `reserve_now_consumed`'s `data.modules`) unless a same-or-higher
+  tier top blocks it; an entry is never downgraded. The skip-driven completion rule
+  fills only unparked modules and does not re-rank.
+
+**Migration for historical series.** Count pre-change real installs with
+`json_array_length(json_extract(data, '$.modules')) > 0`; measure the install live-lock
+after the change from `reservation_install_blocked`. The change boundary is this task's
+merge commit. Audit: zero in-repo consumers filter `reservation_installed` — the only
+references are the `event_store.py` enum, the scheduler producer, tests and `plans/`
+docs.
 
 #### The referent write path is finished: registry wiring, `.ambiguous` on the wire, and a pure verification layer (task 5262)
 

@@ -99,6 +99,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
+    JudgeUsage,
 )
 
 logger = logging.getLogger(__name__)
@@ -161,6 +162,22 @@ def load_retrieval() -> types.ModuleType:
     """
     return _load_script(_RETRIEVAL_PATH, 'eval_write_triage_retrieval')
 
+
+_WORDING_PATH = _PACKAGE_ROOT / 'scripts' / 'write_triage_judge_wording.py'
+
+
+def load_wording() -> types.ModuleType:
+    """Load the judge-wording knob (PRD §11 D16), the same by-path way.
+
+    Loaded at import, unlike the retrieval edge: it pulls in only the judge
+    module, and the guard's default wording is one of its names.
+    """
+    return _load_script(_WORDING_PATH, 'write_triage_judge_wording')
+
+
+_wording = load_wording()
+
+
 # Alpha's vocabulary and fixture handling, re-exported rather than re-spelled.
 LABEL_CANONICAL = _calibrate.LABEL_CANONICAL
 LABEL_DUPLICATE = _calibrate.LABEL_DUPLICATE
@@ -218,6 +235,8 @@ PROVENANCE_KEYS: tuple[str, ...] = (
     'fixture_path',
     'judge_provider',
     'judge_model',
+    # The system prompt wording the verdicts came from (PRD C2'').
+    'judge_system_prompt_sha256',
     'limit',
     'canonical_aliases_path',
     'canonical_aliases_count',
@@ -264,9 +283,9 @@ SLATE_SEEDED = 'seeded'
 SLATE_RETRIEVED = 'retrieved'
 SLATE_MODES: tuple[str, ...] = (SLATE_SEEDED, SLATE_RETRIEVED)
 
-#: The outcomes under which ``triage_write`` files the write against
-#: ``decision.canonical_id``. ``stored`` is the one that attaches to nothing
-#: (write_triage.py: ``canonical_id = None if verdict == OUTCOME_STORED``).
+#: The outcomes under which ``triage_write`` attaches the write at all.
+#: ``stored`` is the one that attaches to nothing
+#: (``write_triage.py::_apply_judge_verdict`` nulls its ``canonical_id``).
 ATTACH_OUTCOMES: frozenset[str] = frozenset({
     OUTCOME_RESTATED, OUTCOME_AMENDED, OUTCOME_CONTESTED,
 })
@@ -361,7 +380,7 @@ def _case(
     candidates: list[str],
     expected_class: str,
     acceptable: frozenset[str],
-    attach_target_id: str | None,
+    band_winner_id: str | None,
     band: str,
     similarity: float | None,
     canonical_present: bool | None,
@@ -381,7 +400,7 @@ def _case(
         'candidates': candidates,
         'expected_class': expected_class,
         'acceptable_outcomes': acceptable,
-        'attach_target_id': attach_target_id,
+        'band_winner_id': band_winner_id,
         'band': band,
         'similarity': similarity,
         'canonical_present': canonical_present,
@@ -398,7 +417,7 @@ def _seeded_case(
 ) -> dict[str, Any]:
     """A case whose slate is CONSTRUCTED rather than retrieved.
 
-    The lead record is the attach target and the band is the middle one — the
+    The lead record is the band winner and the band is the middle one — the
     only band that reaches a judge — because that is what `build_judge_fn`
     synthesizes. Similarity and canonical liveness are unmeasured here, and
     `None` says so rather than claiming a figure.
@@ -408,7 +427,7 @@ def _seeded_case(
         candidates=slate,
         expected_class=expected_class,
         acceptable=acceptable,
-        attach_target_id=slate[0] if slate else None,
+        band_winner_id=slate[0] if slate else None,
         band=OUTCOME_JUDGE,
         similarity=None,
         canonical_present=None,
@@ -584,7 +603,7 @@ def plan_from_slates(
     (default: *records*), so a ``--limit`` run describes a target exactly as
     the full run does.
 
-    The expected class stays the fixture's label. The slate, the attach target
+    The expected class stays the fixture's label. The slate, the band winner
     and the band come from the retrieval — including for a record whose
     canonical is no longer in the corpus, which is kept in the population and
     flagged rather than dropped.
@@ -603,7 +622,7 @@ def plan_from_slates(
             candidates=[str(c['memory_id']) for c in slate.candidates],
             expected_class=str(record['label']),
             acceptable=_acceptable_for(str(record['label'])),
-            attach_target_id=slate.attach_target_id,
+            band_winner_id=slate.attach_target_id,
             band=slate.band,
             similarity=slate.similarity,
             canonical_present=slate.canonical_present,
@@ -633,13 +652,28 @@ class JudgeAnswer:
 
     The elision flags and ``usage`` are ``None`` for the same reason: nothing
     was rendered and nothing was spent.
+
+    ``candidate_id`` is the slate id the verdict named, and ``None`` when no
+    judge was asked or its verdict named nothing.
     """
 
     outcome: str
     verdict: str | None = None
     entry_elided: bool | None = None
     candidates_elided: Mapping[str, bool] | None = None
-    usage: Mapping[str, int] | None = None
+    usage: Mapping[str, int | None] | None = None
+    candidate_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.candidate_id is None:
+            return
+        if self.verdict is None or self.outcome not in ATTACH_OUTCOMES:
+            raise ValueError(
+                f'candidate_id {self.candidate_id!r} named with verdict '
+                f'{self.verdict!r} and outcome {self.outcome!r}: only a judge '
+                f'verdict that attaches (one of {sorted(ATTACH_OUTCOMES)}) names '
+                f'a candidate',
+            )
 
 
 def _as_answer(value: Any) -> JudgeAnswer:
@@ -771,9 +805,14 @@ def score_attachments(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Count WHERE each case attached, not merely whether its class was right.
 
     `score_cases` scores the verdict WORD against the curator label. This
-    scores the production consequence: `triage_write` files every non-`stored`
-    outcome against `decision.canonical_id`, so a case can answer `amended` —
-    correct for its label — while attaching the write to an unrelated record.
+    scores the attach target, so a case can answer `amended` — correct for its
+    label — while attaching the write to an unrelated record.
+
+    The target scored is each row's `attach_target_id`, the record production
+    files the write against: for a middle-band attach, the candidate the judge
+    named, hoisted to its canonical; otherwise the band winner. Rows from a
+    judge that named no candidate (before task 5794) carry the band winner,
+    which is where production attached them then.
 
     Pure counting over the per-case dump. Every rule is a field of a row;
     nothing is recomputed from the cases here.
@@ -877,11 +916,11 @@ def _band_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
 
 
 def _spend(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """Tokens billed across the run, or ``None`` where the client reported none.
+    """Tokens billed across the run, or ``None`` where the provider reported none.
 
-    ``judge_write`` discards the provider response's ``usage``, so this is
-    populated only when the run installed a recording client; an ``anthropic``
-    run and an injected stub judge both report ``None`` rather than zero.
+    Usage arrives on the shipped judge's verdict (``TriageJudgeVerdict.usage``),
+    so every provider arm is priced; a dry run, an injected stub judge, or a
+    call whose usage could not be read reports ``None`` rather than zero.
     """
     used = [row['usage'] for row in rows if row['usage']]
     if not used:
@@ -908,6 +947,33 @@ def _attachable_id(record: Mapping[str, Any]) -> str:
     return str(record.get('canonical_id') or record['memory_id'])
 
 
+def _judged_candidate_id(
+    case: Mapping[str, Any],
+    answer: JudgeAnswer,
+    shown: Mapping[str, Mapping[str, Any]],
+) -> str | None:
+    """The record the verdict named, hoisted as production attaches to it.
+
+    *shown* is the case's own slate by memory id. A named id off it RAISES
+    rather than being scored as an attach production never makes, or as the
+    `stored` production would fail it open to. Neither shipped edge can reach
+    it: each hands `judge_write` exactly these records, and
+    `parse_judge_verdict` refuses an id off what it rendered from them. So
+    reaching it means a `judge_fn` answered about records it was not shown, a
+    defect every later judged attach would repeat; stopping at the first costs
+    one call where failing open would buy a whole run of meaningless rows.
+    """
+    if answer.candidate_id is None:
+        return None
+    record = shown.get(answer.candidate_id)
+    if record is None:
+        raise ValueError(
+            f'case {case["memory_id"]!r}: the verdict named '
+            f'{answer.candidate_id!r}, which is not on its slate {sorted(shown)}',
+        )
+    return _attachable_id(record)
+
+
 def case_row(
     index: int,
     case: Mapping[str, Any],
@@ -922,11 +988,19 @@ def case_row(
     fixture record, so a null cluster or label means it is not one, and
     otherwise from its row on this slate.
 
+    The attach target is where production files the write: the candidate the
+    verdict named when it named one, otherwise ``band_winner_id``.
+    ``verdict_candidate_id`` is the raw slate id the verdict named and
+    ``judged_candidate_id`` is that id HOISTED (PRD
+    ``plans/write-triage-flip-readiness-prd.md`` §11 C2''), unlike
+    ``BandDecision.judged_candidate_id``, which is the raw id.
+
     JSON-serializable verbatim: this is the line appended to the cases file as
     each case completes, so a run interrupted partway keeps what it paid for.
     """
-    target_id = case['attach_target_id']
     shown = {str(record['memory_id']): record for record in candidate_records}
+    judged = _judged_candidate_id(case, answer, shown)
+    target_id = judged if judged is not None else case['band_winner_id']
     target = (
         (fixture_by_id.get(str(target_id)) or shown.get(str(target_id))) if target_id else None
     )
@@ -942,6 +1016,9 @@ def case_row(
         'expected_class': case['expected_class'],
         'acceptable_outcomes': sorted(case['acceptable_outcomes']),
         'candidates': list(case['candidates']),
+        'band_winner_id': case['band_winner_id'],
+        'verdict_candidate_id': answer.candidate_id,
+        'judged_candidate_id': judged,
         'attach_target_id': target_id,
         'attach_target_cluster_id': target.get('cluster_id') if target else None,
         'attach_target_category': target.get('category') if target else None,
@@ -1064,7 +1141,7 @@ MODE_CAVEATS: dict[str, tuple[str, ...]] = {
         'the corpus. Those are KEPT in the population, because production '
         'meets them.',
         'Every figure here is measured over the population production would '
-        'actually route: the slate, the attach target and the band all come '
+        'actually route: the slate, the band winner and the band all come '
         'from a live retrieval through `retrieve_candidates` / `decide_band` / '
         '`select_judge_candidates` at this config\'s `candidate_k`, `t_high` '
         'and `t_low`, and the judge was asked ONLY for the middle band. So '
@@ -1072,11 +1149,16 @@ MODE_CAVEATS: dict[str, tuple[str, ...]] = {
         '`stored` are counted there without an LLM having seen the case — and '
         '`production_shape.middle_band` is the judge\'s own accuracy. '
         'A verdict that is correct for its curator label can still attach to '
-        'ANOTHER RECORD: `triage_write` files every non-`stored` outcome '
-        'against `decision.canonical_id`, the band\'s argmax, not against '
-        'whatever the judge reasoned about. '
-        '`production_shape.duplicate_attach.strict` is the figure that '
-        'accounts for that and `per_class` is not.',
+        'ANOTHER RECORD, which `per_class` cannot show. '
+        '`production_shape.duplicate_attach.strict` and '
+        '`production_shape.wrong_record_attach` score `attach_target_id`, the '
+        'record production files the write against. For a middle-band attach '
+        'that is the candidate the judge NAMED, hoisted to its canonical '
+        '(`judged_candidate_id`); otherwise it is the band winner '
+        '(`band_winner_id`). So for the middle band `strict` is recall at '
+        '`judge_candidate_count`, not at 1. An artifact from a judge that named '
+        'no candidate (before task 5794) attached every judged write to the '
+        'band winner, and its rows carry no `judged_candidate_id`.',
     ),
 }
 
@@ -1084,6 +1166,76 @@ MODE_CAVEATS: dict[str, tuple[str, ...]] = {
 def caveats_for(slate_mode: Any) -> list[str]:
     """The caveats a report assembled under *slate_mode* must carry."""
     return [*CAVEATS, *MODE_CAVEATS.get(str(slate_mode), MODE_CAVEATS[SLATE_SEEDED])]
+
+
+def _judged_share(label: str, production_shape: Mapping[str, Any] | None) -> str:
+    """How many *label* cases reached the judge, where the run measured a band split."""
+    band_split = (production_shape or {}).get('band_split') or {}
+    if label not in band_split:
+        return ''
+    return f' (of the {band_split[label][OUTCOME_JUDGE]} the judge saw)'
+
+
+def pseudo_contradiction_caveat(
+    scored: Mapping[str, Any], production_shape: Mapping[str, Any] | None,
+) -> str:
+    """How the pseudo_contradiction class read under the shipped `contests` definition.
+
+    Derived from the scored confusion row, and from the band split where the
+    run measured one, so the counts have one source. It reports the reading
+    and asserts nothing about whether it is right: the records keep the labels
+    they were adjudicated under and are still scored against them.
+    """
+    label = LABEL_PSEUDO_CONTRADICTION
+    row = scored['confusion'][label]
+    n = scored['per_class'][label]['n']
+    breakdown = ', '.join(f'`{outcome}` {row[outcome]}' for outcome in EVAL_OUTCOMES)
+    return (
+        'Under the shipped `contests` definition — the entry says a candidate '
+        "is wrong, outdated or different (Leo's ruling 2026-09-30, "
+        "plans/write-triage-flip-readiness-prd.md §11.3 C1'') — the judge "
+        f'answered `contested` on {row[OUTCOME_CONTESTED]} of {n} {label} '
+        f'cases{_judged_share(label, production_shape)}; all outcomes: '
+        f'{breakdown}. These records were '
+        'adjudicated NOT contradictions under the EARLIER definition ("cannot '
+        'be true at the same time"), and this report still scores `contested` '
+        'on them as wrong and counts it in false_contested. The fixture is '
+        'deliberately not relabelled, so this reports how the new definition '
+        'reads them without asserting which reading is right.'
+    )
+
+
+def duplicate_contested_caveat(
+    scored: Mapping[str, Any],
+    production_shape: Mapping[str, Any] | None,
+    judge_model: Any,
+) -> str:
+    """How often a duplicate read as `contested`, and on which judge.
+
+    Derived from the scored confusion row like
+    :func:`pseudo_contradiction_caveat`. Every one of these is a write the
+    run's judge would flag for a human, so this is the false-alarm figure the
+    flip operator reads, and it is only as general as the judge that
+    produced it.
+    """
+    label = LABEL_DUPLICATE
+    contested = scored['confusion'][label][OUTCOME_CONTESTED]
+    n = scored['per_class'][label]['n']
+    return (
+        f'The judge, `{judge_model}`, answered `contested` on {contested} of '
+        f'{n} {label} cases{_judged_share(label, production_shape)}. The '
+        'curator labelled each duplicate the same claim as its canonical, so '
+        'this report scores `contested` on one as wrong; with triage enabled, '
+        'each is a write this judge would flag `contested` for a human to '
+        'read. The `contests` definition was settled on a frontier reasoning '
+        'judge: its live boundary test, '
+        'fused-memory/tests/server/test_write_triage_judge.py::TestTheShippedWordingLive, '
+        "pins one, because gpt-4o-mini answers that test's outdated cases "
+        '`contested` under the earlier wording too. Where this judge is not '
+        'the model that test pins, the figure measures the wording on a judge '
+        'it was not settled on: read it beside a run on that model before '
+        'deciding which judge the flip ships.'
+    )
 
 
 def build_report(
@@ -1143,7 +1295,13 @@ def build_report(
             'available': False,
             'reason': CONTESTED_GROUND_TRUTH_REASON,
         },
-        'caveats': caveats_for(run_provenance.get('slate_mode')),
+        'caveats': [
+            *caveats_for(run_provenance.get('slate_mode')),
+            pseudo_contradiction_caveat(scored, production_shape),
+            duplicate_contested_caveat(
+                scored, production_shape, run_provenance['judge_model'],
+            ),
+        ],
         'provenance': run_provenance,
     }
 
@@ -1412,7 +1570,7 @@ def _record_slate_widths(
 #: one, so a slate carrying no scores would arrive at the model empty.
 #:
 #: Descending by slate position, which preserves the order
-#: ``build_judge_cases`` chose — the attach target first. These numbers never
+#: ``build_judge_cases`` chose — the band winner first. These numbers never
 #: reach the model: ``build_judge_prompt`` renders id and text only, no
 #: metadata at all (PRD C1). They exist solely to survive the selector.
 _SYNTHETIC_TOP_SCORE = 0.90
@@ -1452,6 +1610,7 @@ def _is_committed_report(report_path: str) -> bool:
 
 def guard_committed_report(
     report_path: str, *, dry_run: bool, limit: int | None, slate_mode: str,
+    wording: str = _wording.WORDING_SHIPPED,
 ) -> str:
     """Keep a non-measurement run from publishing itself as the measurement.
 
@@ -1469,6 +1628,8 @@ def guard_committed_report(
       a temp path — the documented "prove the pipeline" invocation keeps
       working and still prints its report, it just cannot overwrite the
       committed one.
+    - a non-shipped ``--wording`` measures a prompt production does not
+      send, so it is refused outright beside the slate-mode refusal.
     - ``--limit N`` measures REALLY, just partially. Its numbers are the
       judge's own, and ``provenance.limit`` records the truncation in the
       artifact itself, so an operator (and
@@ -1499,6 +1660,12 @@ def guard_committed_report(
             f'--report-path for a {slate_mode} run',
         )
 
+    if wording != _wording.WORDING_SHIPPED:
+        raise ValueError(
+            f'the committed artifact measures the shipped wording; pass '
+            f'--report-path for a {wording} run',
+        )
+
     if limit is not None:
         logger.warning(
             'a --limit run is about to OVERWRITE the committed report at '
@@ -1511,81 +1678,38 @@ def guard_committed_report(
     return report_path
 
 
-@contextlib.contextmanager
-def field_chars_override(field_chars: int | None) -> Iterator[int]:
-    """Run with the judge's per-field prompt budget set to *field_chars*.
+def apply_field_chars(config: Any, requested: int | None) -> int:
+    """Set this run's ``write_triage.judge_field_chars``; return the width to record.
 
-    A MODULE-LEVEL override, restored on exit, because the seam admits nothing
-    finer: ``_FIELD_CHARS`` is read inside ``_elide``, which ``build_judge_prompt``
-    calls with no width parameter, which ``judge_write`` in turn calls with
-    none either. Threading one would mean widening three production signatures
-    for a knob only this eval turns.
+    Written on the run's own in-memory config, exactly as
+    ``--judge-candidate-count`` is: config.yaml is never written and nothing
+    module-global changes, and the shipped judge reads the leaf live per call.
 
-    ``0`` means NO elision and is spelled as an effective cap of ``sys.maxsize``
-    rather than 0, which would elide every field to nothing. ``None`` overrides
-    nothing and yields the shipped value, so the caller records what was in
-    force either way.
+    ``0`` means NO elision. The leaf is a positive cap, so it is spelled there
+    as ``sys.maxsize``, while the returned provenance keeps ``0``. ``None``
+    writes nothing and returns the width the config already resolves to.
+
+    A negative width is refused: the resolver would silently read the default
+    instead, so the provenance would record a width the judge never used.
     """
     import sys  # noqa: PLC0415
 
-    from fused_memory.server import write_triage_judge  # noqa: PLC0415
+    from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        resolve_judge_field_chars,
+    )
 
-    shipped = write_triage_judge._FIELD_CHARS
-    if field_chars is None:
-        yield shipped
-        return
-    write_triage_judge._FIELD_CHARS = sys.maxsize if field_chars == 0 else field_chars
-    try:
-        yield field_chars
-    finally:
-        write_triage_judge._FIELD_CHARS = shipped
-
-
-@contextlib.contextmanager
-def usage_recording_openai() -> Iterator[list[Any]]:
-    """Collect every openai completion's ``usage`` for the duration of the block.
-
-    ``_call_llm`` discards the response's usage, and the operator deciding the
-    3169 flip is deciding about a per-write cost. The client is wrapped rather
-    than the production call changed: the wrapper adds one append and returns
-    the provider's own response untouched.
-
-    It swaps ``openai.AsyncOpenAI`` for a plain factory process-wide, so enter
-    it around the judge calls alone: a client anything else built inside it,
-    as the retrieved plan's ``MemoryService`` stores do, would not be the SDK's
-    class.
-
-    Yields the sink. It stays EMPTY on the anthropic arm and for an injected
-    stub judge, which is why the spend block reports ``None`` rather than 0.
-    """
-    import openai  # noqa: PLC0415
-
-    recorded: list[Any] = []
-    shipped = openai.AsyncOpenAI
-
-    def factory(**kwargs: Any) -> Any:
-        client = shipped(**kwargs)
-        create = client.chat.completions.create
-
-        async def recording_create(**call: Any) -> Any:
-            response = await create(**call)
-            recorded.append(response.usage)
-            return response
-
-        client.chat.completions.create = recording_create
-        return client
-
-    openai.AsyncOpenAI = factory
-    try:
-        yield recorded
-    finally:
-        openai.AsyncOpenAI = shipped
+    if requested is None:
+        return resolve_judge_field_chars(types.SimpleNamespace(config=config))
+    if requested < 0:
+        raise ValueError(f'--field-chars must be 0 (no elision) or positive, got {requested}')
+    config.write_triage.judge_field_chars = sys.maxsize if requested == 0 else requested
+    return requested
 
 
 def _elision_flags(
-    content: str, slate: Sequence[Any],
+    content: str, slate: Sequence[Any], field_chars: int,
 ) -> tuple[bool, dict[str, bool]]:
-    """Which rendered fields the judge's own ``_elide`` cut, at the width in force.
+    """Which rendered fields the judge's own ``_elide`` cut at *field_chars*.
 
     Asked of the shipped function rather than re-derived from a length
     comparison here, so the flags cannot disagree with the prompt.
@@ -1593,19 +1717,26 @@ def _elision_flags(
     from fused_memory.server.write_triage_judge import _elide  # noqa: PLC0415
 
     return (
-        _elide(content) != content,
-        {c.id: _elide(c.content) != c.content for c in slate},
+        _elide(content, field_chars) != content,
+        {c.id: _elide(c.content, field_chars) != c.content for c in slate},
     )
 
 
-def _usage_of(recorded: Sequence[Any]) -> dict[str, int] | None:
-    """The last recorded completion's token counts, or ``None`` if none was."""
-    if not recorded:
+def _usage_row(usage: JudgeUsage | None) -> dict[str, int] | None:
+    """The verdict's usage under the artifact's ESTABLISHED keys, or ``None``.
+
+    The key names are kept because ``_spend`` and
+    ``fused-memory/scripts/score_write_triage_pairs.py::JudgedCase.from_row``
+    read them, and the row carries nothing they do not read. The mapping is
+    exact: output (``completion_tokens``) already includes reasoning on both
+    OpenAI APIs.
+    """
+    if usage is None:
         return None
-    usage = recorded[-1]
     return {
-        field: int(getattr(usage, field, 0) or 0)
-        for field in ('prompt_tokens', 'completion_tokens', 'total_tokens')
+        'prompt_tokens': usage.input_tokens,
+        'completion_tokens': usage.output_tokens,
+        'total_tokens': usage.input_tokens + usage.output_tokens,
     }
 
 
@@ -1615,9 +1746,8 @@ def _ask_judge(
     slate: Sequence[Any],
     *,
     outcome: str,
-    attach_target_id: str | None,
+    band_winner_id: str | None,
     similarity: float | None,
-    recorded: Sequence[Any],
 ) -> JudgeAnswer:
     """Drive the SHIPPED judge for one case, or restate a band that decided itself.
 
@@ -1632,20 +1762,24 @@ def _ask_judge(
     import asyncio  # noqa: PLC0415
 
     from fused_memory.server.write_triage import BandDecision  # noqa: PLC0415
-    from fused_memory.server.write_triage_judge import judge_write  # noqa: PLC0415
+    from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        judge_write,
+        resolve_judge_field_chars,
+    )
 
     if outcome != OUTCOME_JUDGE:
         return JudgeAnswer(outcome=outcome)
 
-    entry_elided, candidates_elided = _elision_flags(content, slate)
-    before = len(recorded)
+    entry_elided, candidates_elided = _elision_flags(
+        content, slate, resolve_judge_field_chars(service),
+    )
     verdict = asyncio.run(judge_write(
         memory_service=service,
         content=content,
         project_id=_EVAL_PROJECT_ID,
         decision=BandDecision(
             outcome=OUTCOME_JUDGE,
-            canonical_id=attach_target_id,
+            canonical_id=band_winner_id,
             similarity=similarity,
             t_high=None,
             t_low=None,
@@ -1653,11 +1787,12 @@ def _ask_judge(
         candidates=list(slate),
     ))
     return JudgeAnswer(
-        outcome=verdict,
-        verdict=verdict,
+        outcome=verdict.outcome,
+        verdict=verdict.outcome,
         entry_elided=entry_elided,
         candidates_elided=candidates_elided,
-        usage=_usage_of(recorded[before:]),
+        usage=_usage_row(verdict.usage),
+        candidate_id=verdict.candidate_id,
     )
 
 
@@ -1674,7 +1809,7 @@ def _as_memory_result(record: Mapping[str, Any], metadata: Mapping[str, Any]) ->
     )
 
 
-def build_judge_fn(config: Any, recorded: Sequence[Any] = ()) -> Any:
+def build_judge_fn(config: Any) -> Any:
     """The SEEDED live edge: drive the SHIPPED judge, not a re-implementation.
 
     ``server/write_triage_judge.judge_write`` is called with a duck-typed
@@ -1705,18 +1840,17 @@ def build_judge_fn(config: Any, recorded: Sequence[Any] = ()) -> Any:
             str(case['content']),
             slate,
             outcome=OUTCOME_JUDGE,
-            attach_target_id=slate[0].id if slate else None,
+            band_winner_id=slate[0].id if slate else None,
             similarity=_SYNTHETIC_TOP_SCORE,
-            recorded=recorded,
         )
 
     return judge_fn
 
 
-def build_retrieved_judge_fn(config: Any, recorded: Sequence[Any] = ()) -> Any:
+def build_retrieved_judge_fn(config: Any) -> Any:
     """The RETRIEVED live edge: the case already carries production's routing.
 
-    The slate, the attach target, the band and the similarity all came from
+    The slate, the band winner, the band and the similarity all came from
     ``decide_band``/``select_judge_candidates`` over a real retrieval, so this
     only rebuilds the records and defers to the same judge edge. The candidate
     metadata is passed through whole because it carries the cosine the shipped
@@ -1736,9 +1870,8 @@ def build_retrieved_judge_fn(config: Any, recorded: Sequence[Any] = ()) -> Any:
             str(case['content']),
             slate,
             outcome=str(case['band']),
-            attach_target_id=case['attach_target_id'],
+            band_winner_id=case['band_winner_id'],
             similarity=case['similarity'],
-            recorded=recorded,
         )
 
     return judge_fn
@@ -1884,7 +2017,7 @@ def _run(args: Any) -> int:
     # artifacts with fixed-answer numbers.
     report_path = guard_committed_report(
         args.report_path, dry_run=args.dry_run, limit=args.limit,
-        slate_mode=args.slate_mode,
+        slate_mode=args.slate_mode, wording=args.wording,
     )
     aliases = load_canonical_aliases(args.canonical_aliases) if args.canonical_aliases else {}
 
@@ -1895,6 +2028,7 @@ def _run(args: Any) -> int:
     # `judge_write` applies to it.
     if args.judge_candidate_count is not None:
         config.write_triage.judge_candidate_count = args.judge_candidate_count
+    field_chars = apply_field_chars(config, args.field_chars)
     service = types.SimpleNamespace(config=config)
     provider = resolve_judge_provider(service)
     model = resolve_judge_model(service)
@@ -1921,24 +2055,21 @@ def _run(args: Any) -> int:
     else:
         plan = seeded_plan(records, distractors=args.distractors, aliases=aliases)
 
-    with (
-        field_chars_override(args.field_chars) as field_chars,
-        usage_recording_openai() as recorded,
-    ):
-        if args.dry_run:
-            judge_fn = _dry_run_judge_fn()
-            provider, model = 'dry-run', f'fixed:{_DRY_RUN_VERDICT}'
-            logger.info('--dry-run: no provider call will be made')
-        else:
-            # Logged BEFORE the first call, so a mis-resolved model is visible
-            # while the run is still free to abort.
-            logger.info('Judge resolves to provider=%s model=%s', provider, model)
-            judge_fn = (
-                build_retrieved_judge_fn(config, recorded)
-                if args.slate_mode == SLATE_RETRIEVED
-                else build_judge_fn(config, recorded)
-            )
+    if args.dry_run:
+        judge_fn = _dry_run_judge_fn()
+        provider, model = 'dry-run', f'fixed:{_DRY_RUN_VERDICT}'
+        logger.info('--dry-run: no provider call will be made')
+    else:
+        # Logged BEFORE the first call, so a mis-resolved model is visible
+        # while the run is still free to abort.
+        logger.info('Judge resolves to provider=%s model=%s', provider, model)
+        judge_fn = (
+            build_retrieved_judge_fn(config)
+            if args.slate_mode == SLATE_RETRIEVED
+            else build_judge_fn(config)
+        )
 
+    with _wording.judge_wording(args.wording) as prompt_sha256:
         report = run_judge_eval(
             plan=plan,
             judge_fn=judge_fn,
@@ -1948,6 +2079,7 @@ def _run(args: Any) -> int:
                 'fixture_path': package_relative(args.fixture),
                 'judge_provider': provider,
                 'judge_model': model,
+                'judge_system_prompt_sha256': prompt_sha256,
                 # Present on EVERY run, `None` on a full one. An absent key
                 # would be indistinguishable from an artifact predating the
                 # field, and this is the one field that says a committed
@@ -1955,10 +2087,13 @@ def _run(args: Any) -> int:
                 # measurement the task-3169 flip gate reads it as.
                 'limit': args.limit,
                 'canonical_aliases_path': (
-                    package_relative(args.canonical_aliases) if args.canonical_aliases else None
+                    package_relative(args.canonical_aliases)
+                    if args.canonical_aliases else None
                 ),
                 'canonical_aliases_count': len(aliases),
-                'cases_path': package_relative(args.cases_path) if args.cases_path else None,
+                'cases_path': (
+                    package_relative(args.cases_path) if args.cases_path else None
+                ),
                 'field_chars': field_chars,
                 'judge_candidate_count': judge_candidate_count,
                 'judge_enabled': judge_enabled,
@@ -1992,8 +2127,8 @@ def main() -> int:
     parser.add_argument('--slate-mode', dest='slate_mode', default=SLATE_SEEDED,
                         choices=SLATE_MODES,
                         help='seeded: the cluster canonical is placed at slate '
-                             'position 0. retrieved: the slate, the attach '
-                             'target and the band all come from a real '
+                             'position 0. retrieved: the slate, the band '
+                             'winner and the band all come from a real '
                              'retrieval against the live store, as production '
                              'would produce them (default: seeded)')
     parser.add_argument('--project-id', dest='project_id', default='reify',
@@ -2002,8 +2137,9 @@ def main() -> int:
     parser.add_argument('--field-chars', dest='field_chars', type=int, default=None,
                         help="override the judge's per-field prompt budget for "
                              'this run; 0 renders every field UN-elided. '
-                             'Recorded as provenance.field_chars (default: the '
-                             'shipped _FIELD_CHARS)')
+                             'Recorded as provenance.field_chars (default: '
+                             'write_triage.judge_field_chars as the config '
+                             'resolves it)')
     parser.add_argument('--judge-candidate-count', dest='judge_candidate_count',
                         type=int, default=None,
                         help='override write_triage.judge_candidate_count for '
@@ -2015,8 +2151,16 @@ def main() -> int:
                              'attach to the canonical (default: none)')
     parser.add_argument('--cases-path', dest='cases_path', default=None,
                         help='append one JSON line per case as it completes: '
-                             'slate, attach target, band, verdict, outcome and '
+                             'slate, band winner, the candidate the verdict '
+                             'named, attach target, band, verdict, outcome and '
                              'elision flags (default: no per-case dump)')
+    parser.add_argument('--wording', default=_wording.WORDING_SHIPPED,
+                        choices=_wording.WORDINGS,
+                        help='the judge system prompt the run is made under; '
+                             'pre-psi is the pre-psi wording as an eval-side '
+                             'override. Recorded as '
+                             'provenance.judge_system_prompt_sha256 '
+                             '(default: shipped)')
     return _run(parser.parse_args())
 
 

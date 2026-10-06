@@ -1583,10 +1583,9 @@ class TestResolveAlreadyLandedBranch:
     ) -> None:
         """Signal 4 in ISOLATION, with every earlier signal fully satisfied.
 
-        The sibling test above is now caught one step earlier, by the
-        revert-subject attribution guard — which is correct, but it means that
-        test no longer proves signal 4 does anything.  Here the removal is an
-        ORDINARY commit (``impl(924): ...``), so the merge marker is still the
+        Here the removal is an ORDINARY commit (``impl(924): ...``), so this
+        test isolates signal 4 independently of how the sibling test's revert
+        shape is attributed: the merge marker is still the
         attributing commit, its subject is not revert-shaped, and
         ``M^1..M`` still names the declared file.  The ONLY thing left that
         can decline is "does the landing's effect survive at current HEAD".
@@ -1694,6 +1693,56 @@ class TestResolveAlreadyLandedBranch:
 
         assert ALREADY_LANDED_CITATION_PATTERN != DEFAULT_COMMIT_CITATION_PATTERN
 
+    # --- (9b) the REVERT-SUBJECT GUARD, pinned on its own -------------------
+    #
+    # Since task 5765 neither probe answers with a revert, so each revert test
+    # above is declined by an EARLIER layer (signal 4, or the strict citation
+    # template) and stays green with `_REVERT_SUBJECT_RE` deleted.  This one
+    # widens the marker probe back to its pre-5765 answer through the injected
+    # `git_ops` port, leaving the guard as the only layer that can decline.
+
+    async def test_a_marker_probe_answering_a_revert_is_declined_by_the_guard(
+        self, git_repo: Path, git_config: GitConfig,
+    ) -> None:
+        """The probe answers ``Revert "Merge task/930 into main"``, as the
+        real one did before task 5765.
+
+        The revert's OWN effect (the deletion) is present at main HEAD and its
+        touched set is exactly the declared file, so signals 3 and 4 would both
+        admit it — asserted below, so the decline cannot come from them.
+        """
+        plan_files = ['src/pkg/reverted_again.py']
+        merge_sha = await _land_via_merge(
+            git_repo, 'task/930', {f: f'# {f}\n' for f in plan_files},
+        )
+        rc, _, err = await _run(
+            ['git', 'revert', '--no-edit', '-m', '1', merge_sha], cwd=git_repo,
+        )
+        assert rc == 0, f'revert failed: {err}'
+        revert_sha = await _head_of(git_repo)
+        await _reseed(git_repo, 'task/930', revert_sha)
+
+        class _WidenedMarkerProbe(GitOps):
+            async def find_merge_marker(
+                self, branch: str, *, gate_on_existing_ref: bool = True,
+            ) -> str | None:
+                return revert_sha
+
+        widened = _WidenedMarkerProbe(git_config, git_repo)
+
+        assert await widened.get_files_touched_in_branch(
+            f'{revert_sha}^1', revert_sha,
+        ) == plan_files
+        assert await widened.commit_effect_present_in_main(revert_sha)
+
+        assert await _resolve(
+            plan_files, revert_sha, revert_sha, widened,
+            task_id='930', branch='task/930',
+        ) is None, (
+            'a revert undoes a delivery; the revert-subject guard must decline '
+            'it even when a probe answers with it'
+        )
+
     # --- (10) TRAP 3 — the rename gap, asserted rather than assumed ---------
 
     async def test_a_declared_entry_renamed_on_main_is_a_known_gap(
@@ -1780,7 +1829,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         async def fake_check(*a, **k):  # noqa: ARG001
             return PlanFilesTouchedResult(not_touched=['a.py'])
         monkeypatch.setattr(
-            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
             fake_check, )
 
         emits: list = []
@@ -1965,7 +2014,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         async def passing_check(*a, **k):  # noqa: ARG001
             return PlanFilesTouchedResult()
         monkeypatch.setattr(
-            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
             passing_check, )
 
         # A healthy branch runs off the end of the gate and into the real
@@ -2062,7 +2111,7 @@ class TestAlreadyLandedLadderWithRealMarkBlocked:
         async def fake_check(*a, **k):  # noqa: ARG001
             return PlanFilesTouchedResult(not_touched=['a.py'])
         monkeypatch.setattr(
-            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
             fake_check, )
         monkeypatch.setattr(
             'orchestrator.merge_queue._emit_merge_attempt',
@@ -2258,7 +2307,7 @@ class TestLandedButPinnedZombieLoop:
             # test_merge_gates_plan_files_rename.py already owns).
             return PlanFilesTouchedResult(not_touched=list(self._PLAN_FILES))
         monkeypatch.setattr(
-            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
             fake_check, )
 
         emits: list = []

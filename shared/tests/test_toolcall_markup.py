@@ -23,7 +23,6 @@ appears verbatim in the file text. Leave it escaped.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
@@ -388,24 +387,6 @@ class TestTheWidenedGateCostsWhatItClaims:
         names = toolcall_markup._extra_names('rationale', frozenset({'a-b', 'decision'}))
 
         assert names == frozenset({'rationale', 'decision'})
-
-
-def test_this_module_spells_no_raw_envelope_literal():
-    """This file's own SOURCE must never contain a raw ``chr(60)`` + ``/``.
-
-    The mechanical half of the authoring-hazard note in the module docstring
-    above, promoted here from ``scripts/tests/test_sweep_toolcall_markup.py``
-    by task **4696** so every file this containment work touches carries the
-    same guard. Computed at runtime from :func:`chr` so the needle itself is
-    not spelled here either — a test that had to write the literal to check
-    for it would be the very hazard it guards.
-    """
-    needle = chr(60) + '/'
-    source = Path(__file__).read_text(encoding='utf-8')
-    assert needle not in source, (
-        'A raw envelope literal was written into this test file. Spell it with '
-        'the \\x3c escape instead — see this module\'s docstring for why.'
-    )
 
 
 # ---------------------------------------------------------------------------

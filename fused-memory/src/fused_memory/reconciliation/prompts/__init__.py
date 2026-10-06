@@ -6,6 +6,7 @@ import logging
 from collections.abc import Mapping
 
 from fused_memory.reconciliation.standing_decision_writer import ARM2_MIN_DISTINCT_RUNS
+from fused_memory.utils.referent_resolution import render_referent_declaration_guidance
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +177,12 @@ lookup or write.
 On success `status` is `"repaired"`. Every refusal is keyed by `"error"` and carries no \
 `"status"`, so `status` is safe to branch on.\
 """
+
+# ---------------------------------------------------------------------------
+# Shared referent-declaration guidance (task 3675)
+# ---------------------------------------------------------------------------
+# Scope pinned by test_referent_guidance_prompt_drift.py.
+REFERENT_DECLARATION_GUIDANCE = render_referent_declaration_guidance()
 
 # ---------------------------------------------------------------------------
 # Stage-2-only entity-standing-decision writer listing (task 4395)
@@ -554,6 +561,16 @@ FINDING_MEMORY_IDS_METADATA_KEY = 'related_memory_ids'
 FLAGGED_ITEM_FINDING_ID_FIELD = 'finding_id'
 FLAGGED_ITEM_CITED_MEMORIES_FIELD = 'cited_memories'
 
+# Declared `kind` of the two recon marker records whose only writer is a stage
+# prompt: the Stage 1 `flag_for_stage2` marker and the Stage 2 `stage2_suppress`
+# guard. A declared kind keeps the marker out of write triage
+# (server/write_triage.py::declares_attach_keys), so it is never filed as a
+# child of another memory. KIND_REGISTRY membership is pinned by
+# tests/test_recon_marker_kind_prompt_guidance.py. Source: PRD
+# plans/write-triage-flip-readiness-prd.md §11 χ.
+FLAG_FOR_STAGE2_MARKER_KIND = 'flag_for_stage2'
+STAGE2_SUPPRESS_GUARD_KIND = 'stage2_suppress_guard'
+
 # The negative half of the vocabulary rule, single-sourced per INV-5
 # `no-lockstep-duplication` for the same reason DUPLICATE_FINDING_SALVAGE_GUIDANCE
 # above is: it was briefly written twice — once in the shared recon-report block
@@ -777,15 +794,8 @@ _STAGE2_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
 #   Stage 3 — "## Report Channel" section header + read-only NOTE inserted
 #             between the cite-tool list and the stats line.
 #
-# Dedup anchor (reviewer finding dedup_correctness, PRD §9.3; corrected task-1594):
-#   _derive_affected_ids reads cited_tasks (not the top-level task_id field of
-#   add_finding) when building the fingerprint identity for compute_content_fingerprint.
-#   Always call cite_task for the primary subject task so the fingerprint is stable.
-#   For multi-task findings, the cited_tasks signature shifts as citations grow or
-#   shrink — pass task_id=<primary> at the top level of add_finding as a supplementary
-#   stable anchor when one primary subject exists.
-#   Exception: cross_project findings use task_id=None (operator routing); cite_task
-#   is the sole dedup anchor there (see ## Cross-Project Routing in stage2.py).
+# Dedup anchor (reviewer finding dedup_correctness, PRD §9.3; corrected tasks 1594, 4772):
+#   the rule is stated once, in _GUIDANCE_TOOL_PROSE['cite_task'], and not restated here.
 #
 # Call shapes below are GENERATED from live FastMCP tool signatures (task-2559
 # root-cause fix for run_id-omission drift that survived two reviewer rounds) —
@@ -952,15 +962,15 @@ _GUIDANCE_TOOL_PROSE: dict[str, str] = {
         ' (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`). Never truncate or construct edge UUIDs.\n'
     ),
     'cite_task': (
-        '- `{call}` — both project_id and task_id are required. **Dedup anchor**:'
-        ' `_derive_affected_ids` reads `cited_tasks` (not the top-level `task_id` field of'
-        ' `add_finding`) when building the fingerprint for `compute_content_fingerprint`.'
-        ' Always call `cite_task` for the primary subject task so the fingerprint is stable.'
-        ' For multi-task findings, the cited_tasks signature shifts as citations grow or'
-        ' shrink — also pass `task_id=<primary>` at the top level of `add_finding` as a'
-        ' supplementary stable anchor when one clear primary subject exists. Exception:'
-        ' cross_project findings use `task_id=None` (operator routing); `cite_task` is the'
-        ' sole dedup anchor there.\n'
+        '- `{call}` — both project_id and task_id are required. **Dedup anchor**: cross-cycle'
+        ' dedup keys a finding on its whole citation set: `_derive_affected_ids` feeds every'
+        ' cited task, entity, edge and memory into `compute_content_fingerprint`, and never'
+        ' the top-level `task_id` field of `add_finding`. Always call `cite_task` for the'
+        ' primary subject task, and cite the same set every cycle: the primary subject plus'
+        ' only citations that are stable evidence. Adding or dropping any citation re-keys'
+        ' the finding. Keep passing the top-level `task_id` for the subject task anyway: it'
+        ' keys in-run dedup and the `actionable` default. Exception: cross_project findings'
+        ' use `task_id=None` (operator routing); `cite_task` is the sole dedup anchor there.\n'
     ),
     'cite_memory': (
         '- `{call}` — `memory_id` must be the full 36-char UUID from the `id` field of a'

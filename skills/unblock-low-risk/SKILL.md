@@ -71,7 +71,7 @@ The watcher pre-gated, but you re-assert defensively (state can change between t
      --worktree <worktree> \
      --project-root <project_root> \
      --category <category> \
-     --config <project_root>/orchestrator/config.yaml
+     --config <project_root>/dark-factory-orchestrator.yaml
    ```
 
    `<category>` is the escalation category already asserted in precondition 4. The gate reads
@@ -123,7 +123,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
 
 3. **Apply the fix — scoped.** Edit/Write **only** files in `latest['files_referenced']` (and their
    direct test files). The moment the correct fix demands touching a file outside that set — or any
-   of `main`-only paths, CI config, infra, or `orchestrator/config.yaml`/`.mcp.json`/systemd units —
+   of `main`-only paths, CI config, infra, or `dark-factory-orchestrator.yaml`/`.mcp.json`/systemd units —
    the change is no longer low-risk: **ABORT**. Do not commit `.task/`.
 
 4. **Rebase onto main.** `git -C <worktree> rebase main` (main may have moved). On **any conflict** →
@@ -134,7 +134,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    mid-rebase leaves precondition 5 refusing the *next* run for that exact reason, so the task
    deadlocks: nothing can retry it and nothing cleans it up.
 
-5. **Verify.** Run the project's full verify suite from `orchestrator/config.yaml` in the worktree —
+5. **Verify.** Run the project's full verify suite from `<project_root>/dark-factory-orchestrator.yaml` in the worktree —
    `test_command`, then `lint_command`, then `type_check_command` (read them from the file; do not
    hardcode). Any non-zero exit → **ABORT**. (Pipe to a file + check exit status; never trust a
    tail.)
@@ -148,7 +148,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
    .venv/bin/python -m orchestrator.b3_gate charge \
      --task-id <task_id> \
      --project-root <project_root> \
-     --config <project_root>/orchestrator/config.yaml
+     --config <project_root>/dark-factory-orchestrator.yaml
    ```
 
    Note: `charge` takes **no `--worktree`** argument — cap state is keyed on `project_root` only.
@@ -316,7 +316,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
        request id:
        - **`coalesce-*`** → a **train** id, not a request id: this submission was absorbed into a
          coalesce train (`MergeOutcome('superseded', superseded_by=train_id)`,
-         `orchestrator/src/orchestrator/merge_queue.py`). Do **not** poll it by `request_id` —
+         `orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._maybe_coalesce_waiting_singles`). Do **not** poll it by `request_id` —
          that returns an honest `unknown` which never resolves to anything else.
        - **`mr-*`** → a generation advance: this same branch re-enqueued at a newer generation
          (`MergeOutcome('superseded', superseded_by=gen_next.request_id, ...)`, same module).

@@ -18,13 +18,25 @@ decisions for the point-by-point mirror rationale.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
+import os
+import signal
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from _recording_event_store import _RecordingEventStore
+from df_pytest_isolation import PIPE_CLOSING_LEAKER_SRC, read_leaked_pid
 from pydantic import ValidationError
+from shared.delivered_check_polarity import (
+    CheckOutcome,
+    build_grep_argv,
+    build_path_argv,
+    interpret_grep_rc,
+)
+from shared.proc_group import read_stat_fields
 
 from orchestrator.config import RELOADABLE_FIELDS, DeliveredChecksConfig, OrchestratorConfig
 from orchestrator.delivered_checks import (
@@ -151,6 +163,153 @@ class TestRunnerGrepKind:
 
 
 # ---------------------------------------------------------------------------
+# TestRunnerGrepDelegatesToSharedPrimitive (task 3500 — step-3 RED / step-4 GREEN)
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerGrepDelegatesToSharedPrimitive:
+    """``_run_grep_check`` must CALL ``shared.delivered_check_polarity``, not
+    rebuild git-grep semantics locally.
+
+    Task 3500 adds an AUTHORING-TIME polarity gate that evaluates the very
+    same grep checks before they are ever committed to a task's metadata.
+    If that gate and this runtime runner drift — on POSIX-ERE-via-``git grep
+    -E`` vs Python ``re``, on the ``-e`` separator, on ``--`` pathspec
+    placement, or on the ``rc >= 2 → ERRORED`` boundary — the gate becomes a
+    new source of the defect it exists to prevent: a check the lint judges
+    healthy but this runner later fails still wedges its dependent forever.
+    One builder plus one interpreter, shared by both, makes that divergence
+    structurally impossible.
+
+    These tests assert the DELEGATION (patching a name that does not exist
+    yet is an AttributeError, which is what makes them RED before step-4) as
+    well as the resulting parity, and then re-pin the whole rc→verdict
+    mapping through the public entry point so the refactor is provably
+    bit-identical.
+    """
+
+    def _fake_runner(self, rc: int, out: str = '', err: str = ''):
+        calls: list[list[str]] = []
+
+        async def _runner(argv, **kwargs):
+            calls.append(argv)
+            return (rc, out, err)
+
+        return _runner, calls
+
+    @pytest.mark.asyncio
+    async def test_argv_is_built_by_the_shared_builder_with_paths(self):
+        runner, calls = self._fake_runner(rc=0)
+        check = {
+            'name': 'cap',
+            'kind': 'grep',
+            'pattern': 'FooBar',
+            'expect': 'present',
+            'paths': ['src/a.py', 'src/b.py'],
+        }
+
+        with patch(
+            'orchestrator.delivered_checks.build_grep_argv', wraps=build_grep_argv
+        ) as spy:
+            await run_delivered_check(check, project_root='/proj', ref='main', runner=runner)
+
+        assert spy.call_count == 1
+        assert calls == [
+            build_grep_argv(
+                'FooBar', ['src/a.py', 'src/b.py'], project_root='/proj', ref='main'
+            )
+        ]
+
+    @pytest.mark.asyncio
+    async def test_argv_is_built_by_the_shared_builder_without_paths(self):
+        runner, calls = self._fake_runner(rc=0)
+        check = {'name': 'cap', 'kind': 'grep', 'pattern': 'FooBar', 'expect': 'present'}
+
+        with patch(
+            'orchestrator.delivered_checks.build_grep_argv', wraps=build_grep_argv
+        ) as spy:
+            await run_delivered_check(check, project_root='/proj', ref='main', runner=runner)
+
+        assert spy.call_count == 1
+        assert calls == [build_grep_argv('FooBar', [], project_root='/proj', ref='main')]
+
+    @pytest.mark.asyncio
+    async def test_leading_dash_pattern_still_lands_after_the_e_separator(self):
+        """The one argv subtlety that MUST survive the refactor: without the
+        ``-e`` separator a pattern beginning with ``'-'`` is parsed by ``git
+        grep`` as an option and the check ERRORs instead of running."""
+        runner, calls = self._fake_runner(rc=0)
+        check = {'name': 'cap', 'kind': 'grep', 'pattern': '--force', 'expect': 'present'}
+
+        await run_delivered_check(check, project_root='/proj', ref='main', runner=runner)
+
+        assert calls == [build_grep_argv('--force', [], project_root='/proj', ref='main')]
+        assert calls[0][calls[0].index('-e') + 1] == '--force'
+
+    @pytest.mark.asyncio
+    async def test_verdict_comes_from_the_shared_interpreter(self):
+        runner, _calls = self._fake_runner(rc=1)
+        check = {'name': 'cap', 'kind': 'grep', 'pattern': 'x', 'expect': 'absent'}
+
+        with patch(
+            'orchestrator.delivered_checks.interpret_grep_rc', wraps=interpret_grep_rc
+        ) as spy:
+            result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert spy.call_count == 1
+        assert spy.call_args.args == (1, 'absent')
+        assert result is DeliveredCheckResult.DELIVERED
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('rc', 'expect', 'expected'),
+        [
+            (0, 'present', DeliveredCheckResult.DELIVERED),
+            (1, 'present', DeliveredCheckResult.FAILED),
+            (2, 'present', DeliveredCheckResult.ERRORED),
+            (128, 'present', DeliveredCheckResult.ERRORED),
+            (0, 'absent', DeliveredCheckResult.FAILED),
+            (1, 'absent', DeliveredCheckResult.DELIVERED),
+            (2, 'absent', DeliveredCheckResult.ERRORED),
+            (128, 'absent', DeliveredCheckResult.ERRORED),
+        ],
+    )
+    async def test_rc_mapping_is_bit_identical_after_delegation(self, rc, expect, expected):
+        """The whole rc→verdict table, re-pinned through the PUBLIC entry
+        point. ``CheckOutcome`` is a different enum from
+        ``DeliveredCheckResult`` on purpose (predicate-held vs
+        capability-delivered), so the mapping between them is the one place
+        the refactor could silently change an outcome."""
+        runner, _calls = self._fake_runner(rc=rc)
+        check = {'name': 'cap', 'kind': 'grep', 'pattern': 'x', 'expect': expect}
+
+        result = await run_delivered_check(check, project_root='/proj', runner=runner)
+
+        assert result is expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('rc', 'outcome', 'expected'),
+        [
+            (0, CheckOutcome.PASS, DeliveredCheckResult.DELIVERED),
+            (1, CheckOutcome.FAIL, DeliveredCheckResult.FAILED),
+            (2, CheckOutcome.ERRORED, DeliveredCheckResult.ERRORED),
+        ],
+    )
+    async def test_every_check_outcome_member_maps_onto_a_result_member(
+        self, rc, outcome, expected
+    ):
+        """Exhaustive over ``CheckOutcome``: no member may fall through the
+        mapping (which would either raise or, worse, quietly return the
+        wrong verdict for a whole class of checks)."""
+        runner, _calls = self._fake_runner(rc=rc)
+        check = {'name': 'cap', 'kind': 'grep', 'pattern': 'x', 'expect': 'present'}
+
+        assert interpret_grep_rc(rc, 'present') is outcome
+        assert await run_delivered_check(check, project_root='/proj', runner=runner) is expected
+
+
+# ---------------------------------------------------------------------------
 # TestRunnerScriptKind (task 2580 — step-3 RED / step-4 GREEN)
 # ---------------------------------------------------------------------------
 
@@ -240,6 +399,53 @@ class TestRunnerScriptKind:
 
         assert called, 'the injected runner must actually be invoked'
         assert result is DeliveredCheckResult.ERRORED
+
+    @pytest.mark.asyncio
+    async def test_timeout_kills_the_scripts_helpers_too(self, tmp_path, monkeypatch):
+        """A real script run through the DEFAULT runner (task 4155): on timeout,
+        a helper the script backgrounded dies with it.
+
+        The helper is judged while the check is still in flight and only then
+        awaited: a surviving helper holds the script's pipes open, so awaiting
+        first would hang rather than fail.
+        """
+        leaker = tmp_path / 'leaker.sh'
+        leaker.write_text('#!/bin/sh\n' + PIPE_CLOSING_LEAKER_SRC)
+        leaker.chmod(0o755)
+        pidfile = tmp_path / 'leaked.pid'
+        monkeypatch.setenv('LEAK_PIDFILE', str(pidfile))
+        check = {'name': 'cap', 'kind': 'script', 'script': 'leaker.sh', 'timeout_secs': 1}
+
+        task = asyncio.ensure_future(run_delivered_check(check, project_root=tmp_path))
+        leaked_pid = None
+        try:
+            leaked_pid = await asyncio.to_thread(read_leaked_pid, pidfile)
+
+            assert await _wait_pid_exited(leaked_pid, timeout=check['timeout_secs'] + 5.0), (
+                f'pid {leaked_pid}, a helper the script backgrounded, survived its timeout'
+            )
+            assert await task is DeliveredCheckResult.ERRORED
+        finally:
+            task.cancel()
+            if leaked_pid is not None:
+                with contextlib.suppress(OSError):
+                    os.kill(leaked_pid, signal.SIGKILL)
+
+
+async def _wait_pid_exited(pid: int, timeout: float = 5.0) -> bool:
+    """Poll until *pid* is gone or a zombie; False if still running at *timeout*.
+
+    A zombie counts as exited: an orphaned grandchild of a killed group awaits
+    systemd --user's reap, which is not the runner's to perform (task 6029).
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        fields = read_stat_fields(Path('/proc') / str(pid))
+        if fields is None or fields.state in ('Z', 'X'):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +556,26 @@ class TestRunnerPathKind:
         result = await run_delivered_check(check, project_root='/proj', runner=runner)
 
         assert result is expected
+
+    @pytest.mark.asyncio
+    async def test_every_probe_is_the_shared_builders_argv(self):
+        """Parity with the authoring-time lint (task 3500): both gates build
+        each ``ls-tree`` probe with ``shared.delivered_check_polarity.build_path_argv``,
+        so they cannot disagree about what a path check asks git."""
+        runner, calls = self._fake_runner(rc=0, out='hit\n')
+        check = {
+            'name': 'cap',
+            'kind': 'path',
+            'expect': 'present',
+            'paths': ['a/one.py', 'b/two'],
+        }
+
+        await run_delivered_check(check, project_root='/proj', ref='abc123', runner=runner)
+
+        assert calls == [
+            build_path_argv('a/one.py', project_root='/proj', ref='abc123'),
+            build_path_argv('b/two', project_root='/proj', ref='abc123'),
+        ]
 
     @pytest.mark.asyncio
     async def test_multiple_paths_issue_one_call_each(self):

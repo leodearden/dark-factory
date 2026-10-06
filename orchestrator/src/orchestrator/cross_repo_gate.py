@@ -35,22 +35,18 @@ and explained in :func:`classify_cross_repo`'s docstring.  The stamp survives
 here only as an owner-NAMING fallback (:func:`_resolve_owner`), which is reached
 only once one of the two real legs has already fired.
 
-KNOWN DUPLICATION: :func:`_extract_metadata` is the fourth hand-copy of the
-dict-or-JSON-string metadata coercion (``Scheduler._normalize_task_metadata``,
-``substrate_gate.carries_substrate_probe`` / ``extract_probe_set``,
-``TaskInterceptor._extract_metadata_dict``).  Unifying them into one shared
-dependency-light helper needs edits in packages this task does not hold, so it
-is filed as a follow-up; until it lands, a wire-format change is a four-site
-audit and this copy's tri-state contract (below) is the one that differs.
+Task metadata is read through ``shared.task_metadata_wire.coerce_task_metadata``,
+whose unreadable (``None``) result is what defines :data:`SKIP` here.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from shared.task_metadata_wire import coerce_task_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -104,58 +100,6 @@ class CrossRepoVerdict:
 
 
 # ---------------------------------------------------------------------------
-# Metadata extraction
-# ---------------------------------------------------------------------------
-
-
-def _extract_metadata(task: dict[str, Any]) -> dict[str, Any] | None:
-    """Return ``task['metadata']`` as a dict, or None when PRESENT-but-unreadable.
-
-    Applies the same JSON-string→dict coercion as
-    ``substrate_gate.carries_substrate_probe`` / ``extract_probe_set`` (and
-    ``Scheduler._normalize_task_metadata``) so both dispatch gates read task
-    metadata through identical rules — a wire-format change cannot make one
-    gate see a marker the other misses.  (See the module docstring's KNOWN
-    DUPLICATION note: "identical rules" is currently maintained by hand.)
-
-    Three-way, and the distinction is load-bearing for both callers:
-
-    * ``{}`` when metadata is ABSENT or ``None`` — readable, declares nothing.
-      This is the ordinary shape of most tasks, so it must be SILENT: it is not
-      a defect, and treating it as one would warn on every metadata-free
-      dispatch and admit every such task to the gate.
-    * a dict — read fine, weigh whatever it carries.
-    * ``None`` when metadata is PRESENT but cannot be read as a dict: a non-dict
-      value, a string that fails to parse, or a string decoding to a non-dict.
-      Callers must treat this as "no evidence readable", never "carries
-      nothing" — that is the whole of the SKIP contract.
-
-    Note this differs from ``Scheduler._normalize_task_metadata``, which
-    collapses BOTH the absent and the unreadable case to ``{}`` (loudly, since
-    task 3121).  The distinction is kept here because the gate's SKIP verdict
-    is defined by it.
-    """
-    raw = task.get('metadata')
-
-    if raw is None:
-        return {}
-
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return None
-        if not isinstance(parsed, dict):
-            return None
-        return parsed
-
-    if not isinstance(raw, dict):
-        return None
-
-    return raw
-
-
-# ---------------------------------------------------------------------------
 # Dispatch predicate
 # ---------------------------------------------------------------------------
 
@@ -188,9 +132,10 @@ def carries_cross_repo_signal(task: dict[str, Any]) -> bool:
     marker does.  Returning False there would be the sharper version of the same
     defect — the gate would silently skip a task whose markers it could not
     read, which is precisely the outcome :data:`SKIP` exists to make loud.  So
-    the tri-state of :func:`_extract_metadata` is honored end to end: absent
-    metadata (``{}``) is the ordinary shape and stays out of the gate silently;
-    present-but-unreadable enters it.
+    the tri-state of ``shared.task_metadata_wire.coerce_task_metadata`` is
+    honored end to end: absent metadata (``{}``) is the ordinary shape of most
+    tasks and stays out of the gate silently — admitting it would warn on every
+    metadata-free dispatch — while present-but-unreadable enters it.
 
     ``'possible_scope_mismatch'`` is NOT a signal here.  It cannot contribute to
     a block (see :func:`classify_cross_repo` — there is no leg for it), so
@@ -205,7 +150,7 @@ def carries_cross_repo_signal(task: dict[str, Any]) -> bool:
 
     Never raises — it runs on every dispatch and must not take down a slot.
     """
-    meta = _extract_metadata(task)
+    meta = coerce_task_metadata(task.get('metadata'))
     if meta is None:
         # Present but unreadable — admit it so the gate reports a loud SKIP.
         return True
@@ -380,7 +325,8 @@ def classify_cross_repo(
     wave a task through with no trace that its markers could not be read, which
     is precisely the no-silent-fail-soft failure this gate exists to prevent.
     ABSENT metadata is a different thing entirely — it is readable and simply
-    declares nothing, so it is a silent ALLOW (see :func:`_extract_metadata`).
+    declares nothing, so it is a silent ALLOW (see
+    ``shared.task_metadata_wire.coerce_task_metadata``).
 
     In production the scheduler normalizes ``task['metadata']`` to a dict at the
     wire boundary (``Scheduler._normalize_task_metadata``, itself loud since
@@ -395,9 +341,9 @@ def classify_cross_repo(
     additionally fails CLOSED should that ever prove wrong.
     """
     root = Path(project_root)
-    meta = _extract_metadata(task)
+    raw = task.get('metadata')
+    meta = coerce_task_metadata(raw)
     if meta is None:
-        raw = task.get('metadata')
         logger.warning(
             'cross_repo_gate: task %s metadata is not a readable dict '
             '(type=%s, repr=%.200r) — classifying SKIP; markers, if any, were '

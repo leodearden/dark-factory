@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -28,11 +28,13 @@ from fused_memory.reconciliation.degenerate_task_node_sweep import (
     sweep_degenerate_task_nodes,
 )
 from fused_memory.reconciliation.flag_dedup import (
+    EntityStandingSuppressionResult,
     acknowledge_resolved_flags,
     compute_content_fingerprint_signature,
     compute_flag_signature,
     dedup_flags,
     filter_accounted_cluster_growth_flags,
+    filter_already_recorded_caveat_flags,
     filter_already_tracked_systemic_patterns,
     filter_entity_standing_decisions,
     filter_false_absence_flags,
@@ -40,12 +42,17 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_stale_count_snapshot_corrections,
     filter_style_only_authorship_flags,
     filter_terminal_metadata_flags,
-    maybe_escalate_suppression_storm,
 )
 from fused_memory.reconciliation.gate_owned_finding_phrasing import (
     extract_human_gated_task_ids,
     normalize_gate_owned_suggested_actions,
     stamp_curator_gate_sweep_provenance,
+)
+from fused_memory.reconciliation.live_workflow_citation_guard import check_live_workflow_citations
+from fused_memory.reconciliation.live_workflow_section import (
+    CITATION_CONTRADICTIONS_STAT,
+    LiveWorkflowSnapshot,
+    build_live_workflow_snapshot,
 )
 from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
     sweep_orphaned_recon_escalations,
@@ -67,10 +74,7 @@ from fused_memory.reconciliation.stage1_stall_detector import (
     maybe_escalate_stalled_tasks,
     track_human_operator_stalls,
 )
-from fused_memory.reconciliation.stages.base import BaseStage
-from fused_memory.reconciliation.stages.task_knowledge_sync import (
-    _render_live_workflow_section,
-)
+from fused_memory.reconciliation.stages.base import BaseStage, RequiredSection
 from fused_memory.reconciliation.stale_priority_override_edge_sweep import (
     PRIORITY_OVERRIDE_ENUMERATION_COMPLETE_STAT_KEY,
     PRIORITY_OVERRIDE_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
@@ -81,8 +85,19 @@ from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     STATUS_SNAPSHOT_ENUMERATION_INCOMPLETE_KIND_STAT_KEY,
     sweep_stale_status_snapshot_edges,
 )
+from fused_memory.reconciliation.standing_decision_constants import (
+    SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+)
+from fused_memory.reconciliation.standing_decision_storm_escape import (
+    maybe_escalate_suppression_storm,
+    maybe_escalate_suppression_streak,
+    update_suppression_streaks,
+)
 from fused_memory.reconciliation.summary_pool import (
     write_cycle_summary,
+)
+from fused_memory.reconciliation.sweep_deletion_guard import (
+    filter_benign_sweep_deletion_flags,
 )
 from fused_memory.reconciliation.task_filter import (
     FilteredTaskTree,
@@ -90,6 +105,7 @@ from fused_memory.reconciliation.task_filter import (
     format_filtered_task_tree,
     strip_snapshot_lines,
 )
+from fused_memory.server.grouped_read import PARENT_ID_KEY, _parent_id_in_meta
 
 if TYPE_CHECKING:
     from fused_memory.services.memory_service import MemoryService
@@ -105,16 +121,6 @@ logger = logging.getLogger(__name__)
 # deleting the OLDEST entries — deterministically via Qdrant scroll, NOT semantic search.
 STAGE1_CYCLE_SUMMARY_POOL_CAP: int = 2
 _STAGE1_CYCLE_SUMMARY_TRIM_SOURCE = 'stage1_cycle_summary_trim'
-
-
-class RequiredSection(NamedTuple):
-    """One payload section every Stage-1 payload builder must emit (task 4708).
-
-    See :attr:`MemoryConsolidator.REQUIRED_SECTIONS` for the inclusion criterion.
-    """
-
-    header: str  # exact markdown header the shipped Stage-1 prompt names
-    renderer: str  # name of the MemoryConsolidator method that renders it
 
 
 async def write_stage1_cycle_summary(
@@ -161,10 +167,11 @@ class MemoryConsolidator(BaseStage):
     # INCLUSION CRITERION — a section belongs here iff the shipped Stage-1 prompt
     # tells the model to draw an inference from that section's ABSENCE. Today
     # prompts/stage1.py says: "If `### Live-Workflow Signals` is absent from the
-    # payload, all three signals are False for every task; no live-workflow
-    # suppression applies …". That makes absence load-bearing: a payload builder
-    # that omits the section does not merely produce a terser payload, it makes
-    # the model conclude something FALSE. Every builder therefore renders these
+    # payload, no task is live this cycle — neither through a per-task signal nor
+    # through the project-wide lock — and none has landing evidence; no
+    # live-workflow suppression applies …". That makes absence load-bearing: a
+    # payload builder that omits the section does not merely produce a terser
+    # payload, it makes the model conclude something FALSE. Every builder therefore renders these
     # via _render_required_sections() — adding a section is ONE edit here, not
     # one edit per builder. Enforced by
     # tests/reconciliation/test_stage1_payload_section_parity.py.
@@ -248,6 +255,7 @@ class MemoryConsolidator(BaseStage):
         # state across all instances (and across reused-instance runs).
         self._fetch_degraded_sources: list = []
         self._undatable_freshness_records: int = 0
+        self._live_workflow_snapshot: LiveWorkflowSnapshot | None = None
 
     async def run(
         self,
@@ -264,6 +272,7 @@ class MemoryConsolidator(BaseStage):
         point of a remediation pass is to re-emit a curated list, and running
         dedup on those flags would defeat the remediation contract.
         """
+        self._live_workflow_snapshot = None
         report = await super().run(
             events, watermark, prior_reports, run_id, model=model,
             resume_session_id=resume_session_id,
@@ -344,7 +353,9 @@ class MemoryConsolidator(BaseStage):
         # that found nothing (scanned > 0, flags_emitted == 0, errors == 0)
         # from a degraded one (errors > 0), from a registry gap
         # (unresolvable > 0) and from a cross-tag id collision
-        # (ambiguous > 0), without a .get(..., 0) fallback.
+        # (ambiguous > 0), without a .get(..., 0) fallback.  The classification
+        # counts are fleet-wide while flags_emitted is this project's only, so
+        # terminal + missing > flags_emitted is normal.
         report.stats['orphaned_recon_escalations_scanned'] = 0
         report.stats['orphaned_recon_escalations_terminal'] = 0
         report.stats['orphaned_recon_escalations_missing'] = 0
@@ -363,7 +374,11 @@ class MemoryConsolidator(BaseStage):
         # is simply ABSENT from a remediation report, which is the .get(..., 0)
         # fallback the always-present convention exists to spare consumers — and
         # Stage 1's whole stats blob is serialized verbatim into Stage 2's prompt.
+        # The longest cross-cycle suppression streak (task 2943) follows the same
+        # convention: overwritten by _account_suppression_streaks on every full
+        # cycle, 0 on a remediation pass.
         report.stats['entity_standing_decision_suppressed'] = 0
+        report.stats['entity_standing_decision_max_suppression_streak'] = 0
 
         # ── Preservation-specimen corroboration guard (task 4223) ──────────────
         # Decline stranded/reset recommendations for tasks whose odd state is
@@ -432,6 +447,18 @@ class MemoryConsolidator(BaseStage):
                 'passing %d flag(s) through unfiltered this cycle)',
                 self.project_id, len(report.items_flagged or []),
             )
+
+        # Live-workflow citation guard (task 4874): annotate, never drop, a finding
+        # citing a signal THIS run's section did not render (rationale: the module
+        # docstring of live_workflow_citation_guard).  Above the remediation
+        # early-return, like the guard above, so both passes are covered.
+        report.stats[CITATION_CONTRADICTIONS_STAT] = 0
+        try:
+            report.items_flagged, report.stats[CITATION_CONTRADICTIONS_STAT] = (
+                check_live_workflow_citations(report.items_flagged or [], self._live_workflow_snapshot)
+            )
+        except Exception:
+            logger.exception('live-workflow citation guard failed for project %s', self.project_id)
 
         # Always present (task 4814, same convention as the three pre-inits
         # above — tasks 2312 / 2229 / 3084): set BEFORE the remediation
@@ -574,6 +601,10 @@ class MemoryConsolidator(BaseStage):
         # watcher session is the sole closer, reached via
         # skills/recon-escalation-watcher/SKILL.md.
         #
+        # The sweep emits flags only for THIS project's orphans, while its
+        # counts cover the whole shared queue; the trade-off is stated at
+        # orphaned_recon_escalation_sweep.py::sweep_orphaned_recon_escalations.
+        #
         # Placement mirrors the curator-gate block above, for the same two
         # reasons: this sweep EMITS flags, so it must sit ABOVE dedup_flags so
         # (1) each appended flag earns a stage1_flag_marker ledger row keyed on
@@ -597,6 +628,7 @@ class MemoryConsolidator(BaseStage):
                     self._escalation_queue,
                     self.taskmaster,
                     self.known_projects,
+                    running_project_id=self.project_id,
                 )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
@@ -641,6 +673,9 @@ class MemoryConsolidator(BaseStage):
         # below when there is anything to acknowledge; stays 0 when items_flagged is
         # empty/falsy.
         report.stats['stage1_flag_markers_acknowledged'] = 0
+        # Hook A reassigns this inside the block below; a cycle that flagged
+        # nothing keeps the empty batch, which is the same observation.
+        _esd_result = EntityStandingSuppressionResult.empty_batch()
         if report.items_flagged:
             # Snapshot before the filter chain (task-2029): used below to compute
             # which flags the chain dropped for a MOOT reason — terminal task,
@@ -787,6 +822,40 @@ class MemoryConsolidator(BaseStage):
             report.stats['accounted_cluster_growth_flags_dropped'] = (
                 _before_accounted_cluster_growth_filter - len(report.items_flagged)
             )
+            # ── Already-recorded caveat guard (task 5271): drop ──────────────────
+            # "task N's metadata still lacks the caveat" findings whose cited
+            # caveat-source memory id the task's LIVE metadata already records.
+            # Fail-KEEP; rationale in filter_already_recorded_caveat_flags'
+            # docstring.  After the _pre_filter_flags snapshot and before
+            # dedup_flags, so a drop writes no stage1_flag_marker and is
+            # acknowledged as resolved by the task-2029 diff below.
+            _before_already_recorded_caveat_filter = len(report.items_flagged)
+            report.items_flagged = await filter_already_recorded_caveat_flags(
+                taskmaster=self.taskmaster,
+                project_root=self.project_root,
+                flags=report.items_flagged,
+            )
+            report.stats['already_recorded_caveat_flags_dropped'] = (
+                _before_already_recorded_caveat_filter - len(report.items_flagged)
+            )
+            # ── Benign sweep-deletion guard (task 5271): drop ─────────────────────
+            # evidentiary-anchor deletion-pattern findings whose every swept id
+            # carries a documented recon sweep's tombstone (a designed trim, not
+            # an anomaly).  Reads this cycle's buffered `events` for deletions
+            # that left no tombstone.  Fail-KEEP; rationale in the
+            # sweep_deletion_guard module docstring.  After the _pre_filter_flags
+            # snapshot and before dedup_flags, so a drop writes no
+            # stage1_flag_marker and is acknowledged as resolved below.
+            _before_benign_sweep_deletion_filter = len(report.items_flagged)
+            report.items_flagged = await filter_benign_sweep_deletion_flags(
+                memory_service=self.memory,
+                project_id=self.project_id,
+                flags=report.items_flagged,
+                events=events,
+            )
+            report.stats['benign_sweep_deletion_flags_dropped'] = (
+                _before_benign_sweep_deletion_filter - len(report.items_flagged)
+            )
             # ── Entity-standing-decision suppression (task 2896 γ, Hook A) ────────
             # Drop flags already adjudicated by an ACTIVE entity_standing_decision
             # ledger row BEFORE dedup_flags so a suppressed flag never writes a
@@ -819,14 +888,16 @@ class MemoryConsolidator(BaseStage):
             # Per-cycle "storm escape": one active decision suppressing more than the
             # threshold in a single cycle is a signal it may be over-broad or the
             # entity's situation changed — file one L1 recon escalation for that
-            # entity (best-effort; deduped per entity_uuid + category). Skipped when
-            # no escalation queue is wired (nothing would consume the escalation).
+            # entity (best-effort; recurrences fold onto it by content fingerprint).
+            # Skipped when no escalation queue is wired (nothing would consume the
+            # escalation).  Its cross-cycle streak arm runs after this block.
             if self._escalation_queue is not None:
                 await maybe_escalate_suppression_storm(
                     escalation_queue=self._escalation_queue,
                     project_id=self.project_id,
                     run_id=run_id,
                     result=_esd_result,
+                    threshold=SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
                 )
             # Snapshot immediately before dedup_flags, which internally applies the
             # suppression gate (filter_suppressed) as its first step, so suppression
@@ -913,7 +984,7 @@ class MemoryConsolidator(BaseStage):
             )
 
             # ── Flag-marker acknowledgment (task-2029 scenario a) ──────────────────
-            # Flags DROPPED anywhere in the chain above (terminal task, false-absence,
+            # Flags DROPPED anywhere in the chain above (e.g. terminal task, false-absence,
             # stale-snapshot correction, or already-tracked systemic-pattern) have a
             # moot requested action; reclaim any persisted stage1_flag_marker for them
             # best-effort.  Computed as a
@@ -996,6 +1067,8 @@ class MemoryConsolidator(BaseStage):
                         )
                     )
                     report.stats['gate_owned_suggested_actions_normalized'] = _normalized
+
+        await self._account_suppression_streaks(run_id, _esd_result, report)
 
         # ── Census inconsistency detection ────────────────────────────────────
         # Compare task IDs referenced in this cycle's events against the census
@@ -1326,6 +1399,54 @@ class MemoryConsolidator(BaseStage):
         report.stats['stage1_cycle_summary_ledger_written'] = 1 if ledger_written else 0
 
         return report
+
+    async def _account_suppression_streaks(
+        self,
+        run_id: str,
+        esd_result: EntityStandingSuppressionResult,
+        report: StageReport,
+    ) -> None:
+        """Advance every standing decision's suppression streak and file the sustained drains.
+
+        The storm escape's cross-cycle arm (task 2943).  The per-cycle escape
+        catches one decision suppressing a flood in ONE cycle; this one catches
+        a sustained drain — a streak of at least K consecutive full cycles
+        whose last K suppressed more than N flags in total, not counting a
+        cycle the per-cycle escape already reported — which can hide a
+        genuinely new finding as surely as a single-cycle flood.  One flag per
+        cycle, which is how a decision that works behaves, totals K <= N and
+        never files.
+
+        It runs on EVERY full cycle, zero-flag ones included, which is why
+        run() calls it after the ``if report.items_flagged:`` block rather than
+        beside Hook A inside it.  A cycle that flagged nothing is one in which
+        no decision drained anything, so it must reset every streak; skipping it
+        would let a decision suppressing on alternate cycles reach K with gaps
+        in between.  On such a cycle *esd_result* is the pre-bound empty batch.
+
+        The state update sits outside the escalation-queue gate so the streak is
+        already real when a queue is wired; only the filing needs the queue.
+        Both callees are best-effort and never raise.  The updater's per-cycle
+        cutoff is the N run() hands the per-cycle escape, so a cycle that
+        escape reported is never counted a second time.
+        """
+        updates = await update_suppression_streaks(
+            memory_service=self.memory,
+            project_id=self.project_id,
+            run_id=run_id,
+            result=esd_result,
+            per_cycle_threshold=SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
+        )
+        report.stats['entity_standing_decision_max_suppression_streak'] = max(
+            (update.streak for update in updates), default=0
+        )
+        if self._escalation_queue is not None:
+            await maybe_escalate_suppression_streak(
+                escalation_queue=self._escalation_queue,
+                project_id=self.project_id,
+                run_id=run_id,
+                updates=updates,
+            )
 
     def get_system_prompt(self) -> str:
         return STAGE1_SYSTEM_PROMPT
@@ -1705,30 +1826,33 @@ Review the above data and perform memory consolidation:
     async def _build_live_workflow_section(self) -> str:
         """Return the Live-Workflow Signals prompt section, or empty string if inapplicable.
 
-        Mirrors Stage 2's guard/source exactly (task 1655): renders over
-        ``self.filtered_task_tree.active_tasks`` when ``self.filtered_task_tree``
-        is set and ``active_tasks`` is non-empty. A stage is only constructible
-        with a validated ``ProjectScope``, so ``self.project_root`` is always a
-        non-empty absolute path and is not part of this guard (task 2150).
-        Reuses Stage 2's ``_render_live_workflow_section`` renderer (imported from
-        task_knowledge_sync.py) so both stages emit byte-identical section
-        formatting for the same underlying live-workflow signals (task 1977).
+        Renders over Stage 2's source, ``self.filtered_task_tree.active_tasks``
+        (task 1655). A stage is only constructible with a validated
+        ``ProjectScope``, so ``self.project_root`` is always a non-empty
+        absolute path and is not part of this guard (task 2150).
+        Reuses Stage 2's snapshot builder,
+        ``reconciliation/live_workflow_section.py::build_live_workflow_snapshot``,
+        so both stages emit byte-identical section formatting for the same
+        underlying live-workflow signals (task 1977).
         This reuse means detector-layer behavior changes apply here
         automatically with no code change — including the blocked-normal
         bare-orchestrator-signal suppression added in task 2409.
 
-        Returns '' when the guard fails or no active task is currently live —
-        keeps the payload tight, matching _build_task_tree_section's pattern.
+        Returns '' when no task tree is set or no active task is listed — keeps
+        the payload tight, matching _build_task_tree_section's pattern.  The
+        snapshot is retained for :meth:`run`'s citation guard.  A tree with no
+        active task yields a real, empty snapshot, because an absent section
+        tells this stage that no task is live; only an unset tree leaves it
+        None, and the guard inert.
         """
-        if not (self.filtered_task_tree and self.filtered_task_tree.active_tasks):
+        if self.filtered_task_tree is None:
             return ''
-        section = await _render_live_workflow_section(
+        self._live_workflow_snapshot = await build_live_workflow_snapshot(
             self.filtered_task_tree.active_tasks,
             self.scope.project_root,
         )
-        if not section:
-            return ''
-        return '\n' + section
+        section = self._live_workflow_snapshot.render()
+        return '\n' + section if section else ''
 
     def _build_task_count_census_section(self) -> str:
         """Return the Task Count Census payload section, or empty string if unavailable.
@@ -1868,6 +1992,14 @@ def _format_episodes(episodes: list[dict]) -> tuple[str, int]:
     return '\n'.join(lines), total_stripped
 
 
+def _parent_link(meta: Mapping[str, Any]) -> str:
+    """Render a child's parent link for prompts/stage1.py::CHILD_MEMORY_AUTHORITY_RULE."""
+    parent_id = _parent_id_in_meta(meta)
+    if parent_id is None:
+        return ''
+    return f' {PARENT_ID_KEY}={parent_id} kind={meta["kind"]}'
+
+
 def _format_memories(memories: list[dict]) -> tuple[str, int]:
     if not memories:
         return 'No memories.', 0
@@ -1880,7 +2012,7 @@ def _format_memories(memories: list[dict]) -> tuple[str, int]:
         content = cleaned[:500]
         meta = m.get('metadata', {}) or {}
         cat = meta.get('category', '?')
-        lines.append(f'- [{m.get("id", "?")}] ({cat}): {content}')
+        lines.append(f'- [{m.get("id", "?")}]{_parent_link(meta)} ({cat}): {content}')
     return '\n'.join(lines), total_stripped
 
 

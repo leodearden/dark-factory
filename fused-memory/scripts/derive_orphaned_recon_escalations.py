@@ -23,6 +23,12 @@ warnings included, so this script adds only the ``queue.resolve`` step.  A
 second copy of that loop could drift and make the flag and the reap disagree
 about which records are safe to close.
 
+This reap is deliberately FLEET-WIDE, unlike the in-cycle flags, which are
+scoped to the running project
+(``orphaned_recon_escalation_sweep.py::sweep_orphaned_recon_escalations``).
+It is the only channel that reaches an orphan whose project never runs a
+recon cycle, so it must not be scoped.
+
 Closing here does not contradict A7b.  That invariant bans the HARNESS from
 resolving its own queue; an operator-run one-shot over the same queue is
 precedented by ``fused-memory/scripts/backfill_recon_escalations.py``, whose
@@ -50,8 +56,8 @@ Exit codes
 ==  ============================================================================
 0   Clean scan.  Every reapable record was classified against a census that
     was read successfully.  ``reaped: 0`` here genuinely means "nothing to do".
-1   REFUSED: ``--queue-dir`` does not exist.  Nothing was scanned, nothing was
-    created; the refusal is printed on stderr.
+1   REFUSED: ``--queue-dir`` does not exist or is empty.  Nothing was scanned,
+    nothing was created; the refusal is printed on stderr.
 3   DEGRADED: at least one project's census could not be read
     (``errors > 0``), so its records were classified as nothing at all.  Re-run
     once the store is readable — the reap set is re-derived every run.
@@ -71,9 +77,9 @@ watcher session's action, taken under
 implementing agent's.
 
 :func:`run` refuses, before the scan and before the task backend is built,
-unless ``--queue-dir`` names a directory that ALREADY exists.  The default is
-the RELATIVE ``./data/reconciliation/escalations``, so a run from anywhere but
-the project root -- a task worktree in particular, and
+unless ``--queue-dir`` names a directory that ALREADY exists and holds at least
+one entry.  The default is the RELATIVE ``./data/reconciliation/escalations``,
+so a run from anywhere but the project root -- a task worktree in particular, and
 ``skills/recon-escalation-watcher/SKILL.md`` documents the invocation without
 pinning a cwd -- would otherwise have ``EscalationQueue.__init__`` mkdir an
 empty queue and report ``"scanned": 0, "reaped": 0``, a false all-clear.  The
@@ -81,7 +87,7 @@ exit codes below cannot catch that one: a manufactured empty queue produces no
 ``errors`` and no ``unresolvable`` records, so it exits 0 exactly like a
 genuinely clean scan.  The preflight is what tells the two apart.
 
-See ``fused_memory/utils/target_store_preflight.py::assert_queue_dir_exists``
+See ``fused_memory/utils/target_store_preflight.py::assert_queue_dir_populated``
 for the mechanism, the probe-vs-existence argument, the prior art and the
 placement rules -- that module is the single normative copy, and this note
 deliberately does not restate it.
@@ -126,7 +132,7 @@ from fused_memory.reconciliation.orphaned_recon_escalation_sweep import (
 )
 from fused_memory.utils.target_store_preflight import (
     TargetStoreMissing,
-    assert_queue_dir_exists,
+    assert_queue_dir_populated,
 )
 
 logger = logging.getLogger(__name__)
@@ -214,12 +220,12 @@ async def run(
         ``.get()``.  ``reaped`` is simply 0 on a dry run.
 
     Raises:
-        TargetStoreMissing: When *queue_dir* does not exist — see the module
+        TargetStoreMissing: When *queue_dir* is missing or empty — see the module
             docstring.  The check lives here rather than in ``main()`` so
             programmatic callers inherit it, and ahead of the backend build so
             a refusal costs nothing and leaves nothing behind.
     """
-    assert_queue_dir_exists(queue_dir, operation='derive_orphaned_recon_escalations')
+    assert_queue_dir_populated(queue_dir, operation='derive_orphaned_recon_escalations')
 
     owns_backend = taskmaster is None
     if owns_backend:

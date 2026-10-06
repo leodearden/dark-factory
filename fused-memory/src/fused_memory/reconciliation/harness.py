@@ -7,6 +7,7 @@ import dataclasses
 import json
 import logging
 import os
+import socket
 import time
 import traceback
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -55,9 +56,10 @@ from fused_memory.reconciliation.escalation_archive import (
 )
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.finding_task_escalation import (
-    FINDING_TASK_ESCALATION_CATEGORY,
     build_finding_task_escalation_kwargs,
+    is_routable_task_id,
     resolve_finding_task_target,
+    routed_record_covers_finding,
 )
 from fused_memory.reconciliation.index_drift_detector import escalate_missing_indices
 from fused_memory.reconciliation.index_health import summarize_index_health
@@ -126,6 +128,20 @@ try:
 except ImportError:
     HAS_ESCALATION = False
 
+PROJECT_STATUS_CORRECTION_KIND = 'project_status_correction'
+"""The ``kind`` of the per-project Mem0 record that
+:meth:`ReconciliationHarness._reconcile_status_correction` reads back and
+supersedes. A STORED spelling, also read by E4 to attribute this writer's
+reaped ``supersedes`` edges
+(``fused-memory/scripts/memory_eval_staleness_sweep.py::by_design_reaper``)."""
+
+_RECON_INTEGRITY_ISSUE_CATEGORY = 'recon_integrity_issue'
+"""The recon-queue category of a Stage-3 integrity finding, and the category
+that keys the finding's persistence identity (:func:`_recon_finding_fingerprint`).
+The routed orchestrator record carries that identity, so the recon filing, the
+persistence count, the pending check and the routed filer must all read this
+one spelling: a drifted literal would silently stop folding."""
+
 # Recon-wide dedup config: covers all four recon escalation categories.
 # Wider than DedupeConfig.for_recon() (which only covers recon_integrity_issue)
 # because A7b also folds non-finding categories so each DISTINCT recurring message
@@ -159,7 +175,7 @@ _RECON_DEDUP_CONFIG = (
     dataclasses.replace(
         DedupeConfig.for_recon(),  # type: ignore[possibly-undefined]
         infra_dedupe_categories=(
-            'recon_integrity_issue',
+            _RECON_INTEGRITY_ISSUE_CATEGORY,
             'recon_failure',
             'recon_stale_run',
             'recon_backlog_overflow',
@@ -355,6 +371,12 @@ def _derive_affected_ids(finding: dict) -> list[str]:
     A legacy ``affected_ids`` field takes precedence when present, so cross-run
     recurrence counting still works against pre-cutover journal rows that carry
     the old shape.
+
+    The top-level ``add_finding`` ``task_id`` is deliberately NOT an identity
+    source: only the legacy ``affected_ids`` and the typed ``cited_*`` lists
+    are.  Guarded by
+    ``tests/reconciliation/test_derive_affected_ids.py::TestDeriveAffectedIds``
+    (task-4772 section).
     """
     legacy = finding.get('affected_ids')
     if legacy:
@@ -378,6 +400,21 @@ def _derive_affected_ids(finding: dict) -> list[str]:
         if mid:
             ids.append(str(mid))
     return ids
+
+
+def _recon_finding_fingerprint(escalation_category: str, finding: dict) -> str:
+    """The identity of a recon *finding* under *escalation_category*.
+
+    One expression for every finding-keyed consumer: ``_escalate``'s dedupe,
+    the persistence count, the open-escalation check and the routed record's
+    ``finding_fingerprint``, so none of them can drift from the others.
+    """
+    return compute_content_fingerprint(  # type: ignore[possibly-undefined]
+        escalation_category,
+        finding.get('category') or '',
+        _derive_affected_ids(finding),
+        finding.get('description') or '',
+    )
 
 
 def _finding_has_reference(finding: dict) -> bool:
@@ -769,8 +806,12 @@ class ReconciliationHarness:
         known_projects: dict[str, str] | None = None,
         recon_report_state=None,
         server_ready_event: asyncio.Event | None = None,
+        escalation_listener: socket.socket | None = None,
     ):
         self.memory = memory_service
+        # systemd-held listening socket for the escalation port, so it stays
+        # bound across fused-memory restarts; None means bind it ourselves.
+        self._escalation_listener = escalation_listener
         self.taskmaster = taskmaster
         self.journal = journal
         self.buffer = event_buffer
@@ -1735,7 +1776,7 @@ class ReconciliationHarness:
             try:
                 memories = await self.memory.get_memories_by_metadata(
                     project_id=project_id,
-                    filters={'kind': 'project_status_correction'},
+                    filters={'kind': PROJECT_STATUS_CORRECTION_KIND},
                 )
             except Exception as exc:
                 # A project whose Qdrant collection was never provisioned has no
@@ -1806,7 +1847,7 @@ class ReconciliationHarness:
 
             live = diff['live']
             corrected_metadata = {
-                'kind': 'project_status_correction',
+                'kind': PROJECT_STATUS_CORRECTION_KIND,
                 # PRD D2 (task 3196): `supersedes` is a LIST of full UUIDs.  The
                 # shape contract, the read tolerance for the legacy scalar, and
                 # the writer/reader map all live in ONE place —
@@ -1829,12 +1870,17 @@ class ReconciliationHarness:
                 # the eval program's E4 dangling-pointer census
                 # (docs/prds/memory-eval-program.md §γ, which resolves
                 # `supersedes` targets via `get_memory_by_id`): 100% of this
-                # writer's edges are dangling BY DESIGN, so E4 must allowlist
-                # `kind=project_status_correction` rather than report a census
-                # spike.  Making the target resolvable would mean keeping
-                # `latest` alive, which reopens the unbounded-pool bug — i.e.
-                # not a documentation-only change, which is why this leaf
-                # records the invariant instead of "fixing" it.
+                # writer's edges are dangling BY DESIGN.  E4 ATTRIBUTES these
+                # edges by PROJECT_STATUS_CORRECTION_KIND rather than
+                # allowlisting them, keeping them in the `dangling-pointers`
+                # total but out of the alarmed population and the successor
+                # tripwire — see
+                # fused-memory/scripts/memory_eval_staleness_sweep.py::by_design_reaper
+                # and docs/prds/memory-eval-program.md D11.  Making the target
+                # resolvable would mean keeping `latest` alive, which reopens
+                # the unbounded-pool bug — i.e. not a documentation-only
+                # change, which is why this leaf records the invariant
+                # instead of "fixing" it.
                 'supersedes': [latest['id']],
                 'task_count_done': live['done'],
                 'task_count_total': live['total'],
@@ -1977,6 +2023,8 @@ class ReconciliationHarness:
                 run, lock_holder, lock_age,
                 error_message=f'Run stale (>{cutoff}s, lock expired), recovered by harness',
             )
+            if diag is None:
+                continue
             logger.warning(
                 f'Recovering stale run {run.id} for {run.project_id} '
                 f'(started {run.started_at.isoformat()}, lock expired, '
@@ -2053,8 +2101,8 @@ class ReconciliationHarness:
         disposition: str = 'failed',
         error_type: str = 'StaleRunRecovery',
         error_message: str | None = None,
-    ) -> dict:
-        """Recover a single stuck 'running' row to a terminal status.
+    ) -> dict | None:
+        """Recover a single orphaned run row to a terminal status.
 
         Shared mechanical body for both recovery passes — the age-based
         ``_recover_stale_runs`` reaper and the startup ``_recover_predecessor_runs``
@@ -2063,6 +2111,11 @@ class ReconciliationHarness:
         and replay any deferred writes for the project. Returns the
         ``build_stale_run_diagnostics`` dict so the caller can drive its own
         logging/escalation policy on top of this shared body.
+
+        The terminalisation is a compare-and-set on ``run.status``, the status
+        the caller's read observed. ``None`` means the row moved on since that
+        read — its own coroutine terminalised it, and owns its cleanup — so
+        nothing was written, restored, released or replayed.
 
         The restore is run-scoped (task 2711 / E7): only events this run
         itself drained (plus any pre-task-2711, unattributed leftovers — see
@@ -2084,8 +2137,23 @@ class ReconciliationHarness:
             'failed_stage': None,
             **diag,
         }
-        await self.journal.update_run_stage_reports(run.id, run.stage_reports)
-        await self.journal.complete_run(run.id, disposition)
+        recovered = await self.journal.complete_run_if_status(
+            run.id,
+            expected_status=run.status,
+            status=disposition,
+            stage_reports=run.stage_reports,
+        )
+        if not recovered:
+            logger.warning(
+                'reconciliation.stale_run_recovery_refused',
+                extra={
+                    'run_id': run.id,
+                    'project_id': run.project_id,
+                    'expected_status': str(run.status),
+                    'error_type': error_type,
+                },
+            )
+            return None
 
         # Task 2744: sweep the config dir a dead predecessor process may have left
         # behind for this run. Defensive — never mask the recovery outcome.
@@ -2185,6 +2253,8 @@ class ReconciliationHarness:
                     'Run owned by dead predecessor instance, recovered at startup'
                 ),
             )
+            if diag is None:
+                continue
             logger.info(
                 'reconciliation.predecessor_run_recovered',
                 extra={
@@ -2242,7 +2312,7 @@ class ReconciliationHarness:
             # a resume failure, so it deliberately does NOT feed the
             # _record_resume_failure storm counter.
             if not self.config.resume_after_restart:
-                await self._recover_one_run(
+                diag = await self._recover_one_run(
                     run, lock_holder, lock_age,
                     disposition='failed',
                     error_type='InterruptedRunResumeDisabled',
@@ -2252,6 +2322,8 @@ class ReconciliationHarness:
                         'out of resuming into a changed prompt/toolset)'
                     ),
                 )
+                if diag is None:
+                    continue
                 logger.info(
                     'reconciliation.interrupted_run_resume_disabled',
                     extra={
@@ -2270,12 +2342,14 @@ class ReconciliationHarness:
             # predecessor's lock exactly as the predecessor-recovery pass does.
             unresumable_reason = self._resume_guard_reason(run)
             if unresumable_reason is not None:
-                await self._recover_one_run(
+                diag = await self._recover_one_run(
                     run, lock_holder, lock_age,
                     disposition='failed',
                     error_type='InterruptedRunUnresumable',
                     error_message=unresumable_reason,
                 )
+                if diag is None:
+                    continue
                 logger.info(
                     'reconciliation.interrupted_run_unresumable',
                     extra={
@@ -2738,9 +2812,17 @@ class ReconciliationHarness:
         host = self.config.escalation_host
         port = self.config.escalation_port
 
+        listener = self._escalation_listener
+
         async def _serve():
             try:
-                await mcp_server.run_http_async(host=host, port=port)
+                if listener is None:
+                    await mcp_server.run_http_async(host=host, port=port)
+                else:
+                    import uvicorn
+
+                    config = uvicorn.Config(mcp_server.http_app(), log_level='warning')
+                    await uvicorn.Server(config).serve(sockets=[listener])
             except Exception as e:
                 logger.error(f'Escalation server error: {e}')
 
@@ -2814,12 +2896,7 @@ class ReconciliationHarness:
         try:
             queue = self._escalation_queue
             if finding is not None:
-                fingerprint = compute_content_fingerprint(  # type: ignore[possibly-undefined]
-                    category,
-                    finding.get('category') or '',
-                    _derive_affected_ids(finding),
-                    finding.get('description') or '',
-                )
+                fingerprint = _recon_finding_fingerprint(category, finding)
             else:
                 # No finding in scope: use '' for finding_category (sentinel for
                 # "summary-only, no finding identity") so the description-hash branch
@@ -2851,7 +2928,7 @@ class ReconciliationHarness:
                 task_id=f'recon-{run_id[:8]}',
                 agent_role='reconciliation-harness',
                 severity='info' if category in (
-                    'recon_stale_run', 'recon_integrity_issue', TASK_COUNT_SNAPSHOT_ESCALATION_CATEGORY,
+                    'recon_stale_run', _RECON_INTEGRITY_ISSUE_CATEGORY, TASK_COUNT_SNAPSHOT_ESCALATION_CATEGORY,
                 ) else 'blocking',
                 category=category,
                 summary=summary,
@@ -2888,12 +2965,14 @@ class ReconciliationHarness:
           supplied as None and
           :func:`~fused_memory.reconciliation.finding_task_escalation.resolve_finding_task_target`
           also returned None;
+        - the target is not a routable queue key (``is_routable_task_id``);
         - the project is not registered in ``_known_projects``;
         - no orchestrator is live for that root, so nothing would drain the
           record;
-        - a pending record of this same CATEGORY is already on the task, at
-          ANY level -- level-blind so the fold survives the orphan reaper
-          promoting an earlier record from L0 to L1.
+        - a pending record already covers this finding: a level-0 record with
+          the same finding fingerprint, or a routed record a human already
+          holds at a higher level
+          (:func:`~fused_memory.reconciliation.finding_task_escalation.routed_record_covers_finding`).
 
         LEVEL 0, deliberately: `EscalationQueue.has_open_l1` is level-1-only
         and is what a spread of orchestrator guards read as "a human is already
@@ -2939,6 +3018,14 @@ class ReconciliationHarness:
                 },
             )
             return None
+        # Re-check at the point of use, before any I/O: a caller-supplied
+        # task_id need not have come from the resolver.
+        if not is_routable_task_id(task_id):
+            logger.warning(
+                'reconciliation.finding_task_escalation_unroutable_target',
+                extra={'project_id': project_id, 'run_id': run_id, 'task_id': task_id},
+            )
+            return None
 
         project_root = self._resolve_known_root(project_id)
         if project_root is None:
@@ -2968,57 +3055,19 @@ class ReconciliationHarness:
             queue = EscalationQueue(  # type: ignore[possibly-undefined]
                 Path(project_root) / _ORCHESTRATOR_ESCALATION_QUEUE_DIRNAME
             )
-            # Cross-cycle dedupe.  The `_sweep_escalate_l1` template omits this
-            # and can refile on every sweep — fine for a one-shot cancellation
-            # event, wrong for a filer that re-evaluates each reconciliation
-            # cycle.
-            #
-            # NOT `has_open_l1`: that helper is LEVEL-1-ONLY, and these records
-            # are written at level 0 precisely so they stay off the
-            # orchestrator's L1 guard surface, so it would see nothing and the
-            # filer would refile every cycle.  This is the pending-scan idiom
-            # transcribed from
-            # `orchestrator/harness.py::_file_warm_base_hard_down_notice`.
-            #
-            # The scan filters on `category` ONLY, and is deliberately
-            # LEVEL-BLIND even though the write side is pinned to
-            # FINDING_TASK_ESCALATION_LEVEL.  The asymmetry is load-bearing in
-            # both directions:
-            #
-            #   - `category` is the task-2757 property: it lets a NEW root cause
-            #     escape being silently suppressed by an UNRELATED open record.
-            #     Without it a lingering starvation INFO on the task would
-            #     swallow every recon finding for it forever, and an
-            #     uncategorized `has_open_l1`-style read would do the same via
-            #     the level axis.
-            #   - Level-blindness makes the fold survive PROMOTION.
-            #     `orchestrator/harness.py::_reap_orphan_l0_escalations`
-            #     promotes an aged pending L0 to L1 with no category filter, and
-            #     this filer fires only when NO workflow is live for the task —
-            #     the very condition that makes a record an orphan candidate. So
-            #     a record filed here is born eligible for promotion. A
-            #     `level == 0` scan stopped matching the moment that happened,
-            #     the next cycle filed a fresh L0, and the reaper dismissed it as
-            #     a duplicate of the open L1 — one born-and-dismissed record per
-            #     reconciliation cycle, forever, while the finding persists.
-            #     Matching at ANY level folds onto the promoted record instead,
-            #     which is the right answer: the L1 IS this finding, escalated.
-            #
-            # `FINDING_TASK_ESCALATION_CATEGORY` is IMPORTED, never re-spelled,
-            # so the scan and the builder cannot drift on the one axis they
-            # BOTH read.  The level is set by the builder alone
-            # (`FINDING_TASK_ESCALATION_LEVEL`, public and exported for exactly
-            # that contract) and deliberately not imported here — this scan does
-            # not read it, and an import that only appeared in a comment would
-            # imply a coupling that no longer exists.
-            #
-            # `status='pending'` skips the archive by construction, so a finding
-            # that recurs after a human adjudicated the last record reaches the
-            # ladder again.
-            if [
-                e for e in queue.get_by_task(task_id, status='pending')
-                if e.category == FINDING_TASK_ESCALATION_CATEGORY
-            ]:
+            fingerprint = _recon_finding_fingerprint(_RECON_INTEGRITY_ISSUE_CATEGORY, finding)
+            # Cross-cycle dedupe: the fold policy is
+            # `finding_task_escalation.py::routed_record_covers_finding`. The
+            # scan reads PENDING records only, so a finding re-files once its
+            # record is adjudicated.
+            covering = next(
+                (
+                    e for e in queue.get_by_task(task_id, status='pending')
+                    if routed_record_covers_finding(e, fingerprint)
+                ),
+                None,
+            )
+            if covering is not None:
                 logger.info(
                     'reconciliation.finding_task_escalation_deduped',
                     extra={
@@ -3026,6 +3075,8 @@ class ReconciliationHarness:
                         'run_id': run_id,
                         'task_id': task_id,
                         'finding_category': finding.get('category', ''),
+                        'covering_escalation_id': covering.id,
+                        'covering_level': covering.level,
                     },
                 )
                 return None
@@ -3037,6 +3088,7 @@ class ReconciliationHarness:
                     project_id=project_id,
                     run_id=run_id,
                     persistence=persistence,
+                    finding_fingerprint=fingerprint,
                 ),
             )
             esc_id: str = queue.submit(esc)
@@ -3869,12 +3921,17 @@ class ReconciliationHarness:
                     reports.append(report)
                     run.stage_reports[stage_key] = report
 
-                # Update watermark
-                watermark.last_full_run_id = run_id
-                watermark.last_full_run_completed = datetime.now(UTC)
-                watermark.last_episode_timestamp = datetime.now(UTC)
-                watermark.last_memory_timestamp = datetime.now(UTC)
-                watermark.last_task_change_timestamp = datetime.now(UTC)
+                completed_at = datetime.now(UTC)
+                watermark = watermark.model_copy(update={
+                    'last_full_run_id': run_id,
+                    'last_full_run_completed': completed_at,
+                    # Run start, not completion (on resume, the original start): a mid-cycle
+                    # item is shown to the next cycle rather than to neither. Why, and the cost:
+                    # tests/reconciliation/test_recon_window_anchor.py
+                    'last_episode_timestamp': run.started_at,
+                    'last_memory_timestamp': run.started_at,
+                    'last_task_change_timestamp': completed_at,
+                })
                 await self.journal.update_watermark(watermark)
 
                 run.completed_at = datetime.now(UTC)
@@ -4035,51 +4092,7 @@ class ReconciliationHarness:
                 await self._flush_cycle_summaries(
                     run, run_id, project_id, current_stage_name, cycle_start_time,
                 )
-                # Shielded against a second cancellation arriving mid-write;
-                # the write keeps running to completion in its own Task.
-                # asyncio.shield only protects work once its coroutine exists
-                # as its own Task — on the already-being-cancelled path this
-                # whole finally exists to serve, an unshielded await here
-                # would re-raise the very CancelledError the backstop arms
-                # above just survived, discarding the stage_reports copy
-                # (including the markers _flush_cycle_summaries just
-                # stamped) before it ever reaches the DB (task 4431).
-                # Materialized explicitly (rather than handed to
-                # asyncio.shield as a bare coroutine) so a done-callback can
-                # log a failure that survives a second cancellation instead
-                # of vanishing silently (task 4431).
-                stage_reports_write = asyncio.ensure_future(
-                    self.journal.update_run_stage_reports(run_id, run.stage_reports)
-                )
-                stage_reports_write.add_done_callback(
-                    lambda t: self._log_stage_reports_write_failure(run_id, t)
-                )
-                await asyncio.shield(stage_reports_write)
-                # Known residual (task 4431): asyncio.shield protects the
-                # WRITE, not this awaiting frame — a second cancellation
-                # still raises CancelledError HERE, so the gc_run_config_dir
-                # block below remains unreachable on that path, exactly as
-                # before this fix (not a regression). A try/finally around
-                # this await (finally: run the gc block) would make it
-                # reachable WITHOUT swallowing the CancelledError —
-                # gc_run_config_dir is synchronous filesystem work with no
-                # awaits, so it cannot itself be re-interrupted. Left
-                # unaddressed here by scope, not necessity: this task's
-                # remit is the shield alone (design decision 3), so the
-                # reachability fix is deferred to a follow-up task rather
-                # than folded in here.
-                # Task 2744/σ: GC this run's per-run recon CLI config dir on every
-                # exit path (success/failure) EXCEPT an interrupted (resumable) run —
-                # its transcript must survive on disk for the startup --resume pass.
-                # Defensive — a filesystem hiccup must never mask the run's real
-                # terminal outcome.
-                if run.status != RunStatus.interrupted:
-                    try:
-                        gc_run_config_dir(self.journal.data_dir, run_id)
-                    except Exception as gc_err:  # noqa: BLE001
-                        logger.warning(
-                            'gc_run_config_dir failed for run %s: %r', run_id, gc_err
-                        )
+                await self._persist_stage_reports_then_gc_config_dir(run)
 
     # ── Shared cycle-summary backstop arms ────────────────────────────
     #
@@ -4339,13 +4352,46 @@ class ReconciliationHarness:
             run, run_id, project_id, anchor,
         )
 
+    async def _persist_stage_reports_then_gc_config_dir(
+        self, run: ReconciliationRun,
+    ) -> None:
+        """Persist *run*'s stage_reports under ``asyncio.shield``, then GC its
+        per-run CLI config dir: the shared ``finally`` tail of
+        :meth:`run_full_cycle` and :meth:`_run_remediation_pass`, called after
+        :meth:`_flush_cycle_summaries` so the persisted copy carries its markers.
+
+        The GC runs even when a second cancellation lands mid-write, and that
+        cancellation still propagates
+        (``tests/test_harness.py::test_run_full_cycle_finally_gcs_config_dir_despite_a_second_cancellation``).
+        An interrupted run keeps its dir for the startup ``--resume`` pass
+        (task σ). A GC failure is logged, never raised.
+        """
+        stage_reports_write = asyncio.ensure_future(
+            self.journal.update_run_stage_reports(run.id, run.stage_reports)
+        )
+        stage_reports_write.add_done_callback(
+            lambda t: self._log_stage_reports_write_failure(run.id, t)
+        )
+        try:
+            await asyncio.shield(stage_reports_write)
+        finally:
+            if run.status != RunStatus.interrupted:
+                try:
+                    gc_run_config_dir(self.journal.data_dir, run.id)
+                except Exception as gc_err:  # noqa: BLE001
+                    logger.warning(
+                        'gc_run_config_dir failed for %s run %s: %r',
+                        run.run_type, run.id, gc_err,
+                    )
+
     def _log_stage_reports_write_failure(
         self, run_id: str, task: asyncio.Task,
     ) -> None:
         """Done-callback for the ``update_run_stage_reports`` write once
-        ``asyncio.shield`` has detached it into its own Task, in
-        :meth:`run_full_cycle`'s and :meth:`_run_remediation_pass`'s
-        ``finally`` blocks (task 4431). Once detached, a second
+        ``asyncio.shield`` has detached it into its own Task, attached by
+        :meth:`_persist_stage_reports_then_gc_config_dir` — the shared
+        ``finally`` tail of both :meth:`run_full_cycle` and
+        :meth:`_run_remediation_pass` (task 4431). Once detached, a second
         cancellation leaves nothing else awaiting that Task again.
         ``asyncio.shield`` itself retrieves the inner Task's exception once
         it is done (to suppress the generic "exception was never
@@ -4790,12 +4836,7 @@ class ReconciliationHarness:
         if not HAS_ESCALATION:
             return 0
         try:
-            target_fp = compute_content_fingerprint(  # type: ignore[possibly-undefined]
-                'recon_integrity_issue',
-                finding.get('category') or '',
-                _derive_affected_ids(finding),
-                finding.get('description') or '',
-            )
+            target_fp = _recon_finding_fingerprint(_RECON_INTEGRITY_ISSUE_CATEGORY, finding)
         except Exception as exc:
             logger.warning(
                 'reconciliation.persistence_fingerprint_failed',
@@ -4823,12 +4864,7 @@ class ReconciliationHarness:
                 # Count this run once if any item matches the target fingerprint
                 for item in items:
                     try:
-                        fp = compute_content_fingerprint(  # type: ignore[possibly-undefined]
-                            'recon_integrity_issue',
-                            item.get('category') or '',
-                            _derive_affected_ids(item),
-                            item.get('description') or '',
-                        )
+                        fp = _recon_finding_fingerprint(_RECON_INTEGRITY_ISSUE_CATEGORY, item)
                     except Exception:
                         any_item_fp_failed = True
                         continue
@@ -4997,13 +5033,13 @@ class ReconciliationHarness:
     ) -> bool:
         """Return True iff an OPEN pending escalation already covers this finding.
 
-        Uses the same compute_content_fingerprint key as _escalate and
-        _finding_persistence_count (category='recon_integrity_issue', finding
-        category, _derive_affected_ids, description) to guarantee suppression
-        is consistent with what _escalate would fold via submit_or_dedupe.
+        Uses the same _recon_finding_fingerprint key as _escalate and
+        _finding_persistence_count (category _RECON_INTEGRITY_ISSUE_CATEGORY)
+        to guarantee suppression is consistent with what _escalate would fold
+        via submit_or_dedupe.
 
         pending_fps: pre-fetched set of dedupe_fingerprints for
-        'recon_integrity_issue' pending escalations.  When supplied (built once
+        _RECON_INTEGRITY_ISSUE_CATEGORY pending escalations.  When supplied (built once
         by _maybe_remediate), the check is an O(1) set membership test — no
         extra disk scan.  Pass None to fall back to a full get_pending() scan
         per-finding (direct / unit-test use).
@@ -5017,18 +5053,13 @@ class ReconciliationHarness:
         if not HAS_ESCALATION or self._escalation_queue is None:
             return False
         try:
-            target_fp = compute_content_fingerprint(  # type: ignore[possibly-undefined]
-                'recon_integrity_issue',
-                finding.get('category') or '',
-                _derive_affected_ids(finding),
-                finding.get('description') or '',
-            )
+            target_fp = _recon_finding_fingerprint(_RECON_INTEGRITY_ISSUE_CATEGORY, finding)
             if pending_fps is not None:
                 return target_fp in pending_fps
             # Fallback: per-finding scan (no pre-fetched set supplied).
             for e in self._escalation_queue.get_pending():
                 if (
-                    e.category == 'recon_integrity_issue'
+                    e.category == _RECON_INTEGRITY_ISSUE_CATEGORY
                     and e.dedupe_fingerprint == target_fp
                 ):
                     return True
@@ -5232,13 +5263,14 @@ class ReconciliationHarness:
             # sensitivity to a mixed burst (see this task's plan
             # design_decisions), and a genuinely sustained single-cause outage
             # still fires its own alarm at the same threshold as before the
-            # split. test_maybe_remediate_mixed_drop_causes_below_threshold_neither_storm_escalates
-            # (test_harness.py) pins the current, reduced-coverage-on-mixed-
-            # bursts behaviour so a future reader sees it as a decision, not a
-            # bug. If mixed-cause bursts under each per-cause threshold prove to
-            # matter operationally, the fix is a THIRD StormCounter fed by BOTH
-            # loops below, whose escalation names both per-cause counts — not
-            # raising these two thresholds, which would blunt each alarm's own
+            # split.
+            # fused-memory/tests/test_harness.py::test_maybe_remediate_mixed_phantom_and_placeholder_drops_below_threshold_neither_storm_escalates
+            # pins the current, reduced-coverage-on-mixed-bursts behaviour so a
+            # future reader sees it as a decision, not a bug. If mixed-cause
+            # bursts under each per-cause threshold prove to matter
+            # operationally, the fix is a THIRD StormCounter fed by BOTH loops
+            # below, whose escalation names both per-cause counts — not raising
+            # these two thresholds, which would blunt each alarm's own
             # single-cause sensitivity instead of restoring aggregate coverage.
             for finding in dropped_phantom_cited:
                 logger.warning(
@@ -5338,7 +5370,7 @@ class ReconciliationHarness:
                     pending_fps = {
                         e.dedupe_fingerprint
                         for e in self._escalation_queue.get_pending()
-                        if e.category == 'recon_integrity_issue'
+                        if e.category == _RECON_INTEGRITY_ISSUE_CATEGORY
                         and e.dedupe_fingerprint is not None
                     }
                 except Exception as _fps_err:
@@ -5454,7 +5486,7 @@ class ReconciliationHarness:
         except Exception as e:
             logger.error(f'Remediation check failed for run {parent_run_id}: {e}')
             self._escalate(
-                'recon_integrity_issue',
+                _RECON_INTEGRITY_ISSUE_CATEGORY,
                 parent_run_id,
                 f'Remediation orchestration failed: {e}',
             )
@@ -5869,8 +5901,8 @@ class ReconciliationHarness:
                 # point: a task the scheduler picked up (or parked) mid-pass would
                 # read as uncorroborated from a t0 snapshot and the gate would file
                 # a stranded-work escalation for a task that is in fact live. The
-                # renderer's identical hoist (_render_live_workflow_section in
-                # reconciliation/stages/task_knowledge_sync.py) is safe at the top of
+                # renderer's identical hoist (render_live_workflow_section in
+                # reconciliation/live_workflow_section.py) is safe at the top of
                 # its call only because its read-to-use gap is microseconds; this
                 # one's is not, so the read moves to the use.
                 #
@@ -5894,7 +5926,7 @@ class ReconciliationHarness:
 
                 # Task 3778: hoist the whole-repo `git worktree list --porcelain`
                 # out of the cited-task fan-out below, the same way
-                # _render_live_workflow_section hoists it out of its per-task
+                # render_live_workflow_section hoists it out of its per-task
                 # loop (and the same way the is_orchestrator_live_for hoist
                 # noted above already works here). It is invariant across every
                 # cited task in this pass, so the doubly-nested loop pays ONE
@@ -5974,7 +6006,7 @@ class ReconciliationHarness:
                             # toward live with no extra check here. This
                             # completes the input parity: this consumer,
                             # recon_write_policy Gate 2 and
-                            # _render_live_workflow_section now all pass
+                            # render_live_workflow_section now all pass
                             # the identical status/task_kind/pure_gate/
                             # corroborated tuple — the invariant task 2964
                             # exists to establish.
@@ -6073,7 +6105,7 @@ class ReconciliationHarness:
                             )
                         else:
                             self._escalate(
-                                'recon_integrity_issue',
+                                _RECON_INTEGRITY_ISSUE_CATEGORY,
                                 run_id,
                                 f'Persistently unresolved after remediation '
                                 f'({persistence} cycles): {finding.get("description", "?")}',
@@ -6211,23 +6243,10 @@ class ReconciliationHarness:
                                     },
                                 )
                             else:
-                                # VOLUME PARITY: at most one orchestrator-queue
-                                # record per finding that already files one recon
-                                # escalation today, folded across later cycles by
-                                # the filer's own pending scan on
-                                # FINDING_TASK_ESCALATION_CATEGORY.
-                                #
-                                # That scan is deliberately level-BLIND (see the
-                                # dedupe comment in
-                                # `_file_finding_task_escalation`) so the fold
-                                # survives `orchestrator/harness.py::
-                                # _reap_orphan_l0_escalations` promoting the
-                                # record from L0 to L1.  Without that, promotion
-                                # broke the fold and the next cycle filed a fresh
-                                # L0 that the reaper then dismissed as a
-                                # duplicate — one born-and-dismissed record per
-                                # reconciliation cycle, forever, on a task
-                                # already represented by an open L1.
+                                # VOLUME PARITY: at most one open routed record
+                                # per DISTINCT persistent finding per task, and
+                                # none filed behind an open routed L1 — see
+                                # `finding_task_escalation.py::routed_record_covers_finding`.
                                 self._file_finding_task_escalation(
                                     project_id, run_id, finding, persistence,
                                     task_id=routed_task_id,
@@ -6306,7 +6325,7 @@ class ReconciliationHarness:
             # Do NOT re-raise — parent run already completed
             # Do NOT restore events — there are none
             self._escalate(
-                'recon_integrity_issue',
+                _RECON_INTEGRITY_ISSUE_CATEGORY,
                 run_id,
                 f'Remediation pass failed at {current_stage_name}: {e}',
             )
@@ -6326,48 +6345,12 @@ class ReconciliationHarness:
             # NO remediation exclusion: Stage 2's in-stage write is unconditional
             # by explicit design, so a lost row here is a genuine gap. Anchored
             # at run.started_at (this driver has no separate cycle_start_time
-            # local), and placed strictly before update_run_stage_reports so the
-            # persisted copy captures whatever markers either arm stamped —
-            # and that call is itself shielded against a second cancellation
-            # arriving mid-write, the identical mirror-site fix applied to
-            # run_full_cycle's finally: asyncio.shield only protects work
-            # once its coroutine exists as its own Task, so this driver needs
-            # the same guard for the same reason (task 4431).
+            # local), and placed strictly before the stage_reports persist so
+            # the persisted copy captures whatever markers either arm stamped.
             await self._flush_cycle_summaries(
                 run, run_id, project_id, current_stage_name, run.started_at,
             )
-            # Materialized explicitly (rather than handed to asyncio.shield
-            # as a bare coroutine) so a done-callback can log a failure that
-            # survives a second cancellation instead of vanishing silently
-            # (task 4431).
-            stage_reports_write = asyncio.ensure_future(
-                self.journal.update_run_stage_reports(run_id, run.stage_reports)
-            )
-            stage_reports_write.add_done_callback(
-                lambda t: self._log_stage_reports_write_failure(run_id, t)
-            )
-            await asyncio.shield(stage_reports_write)
-            # Known residual (task 4431): asyncio.shield protects the WRITE,
-            # not this awaiting frame — a second cancellation still raises
-            # CancelledError HERE, so the gc_run_config_dir block below
-            # remains unreachable on that path, exactly as before this fix
-            # (not a regression). A try/finally around this await (finally:
-            # run the gc block) would make it reachable WITHOUT swallowing
-            # the CancelledError — gc_run_config_dir is synchronous
-            # filesystem work with no awaits, so it cannot itself be
-            # re-interrupted. Left unaddressed here by scope, not necessity:
-            # this task's remit is the shield alone (design decision 3), so
-            # the reachability fix is deferred to a follow-up task rather
-            # than folded in here.
-            # Task 2744: GC this remediation run's per-run recon CLI config dir on
-            # every exit path. Defensive — never mask the run's terminal outcome.
-            try:
-                gc_run_config_dir(self.journal.data_dir, run_id)
-            except Exception as gc_err:  # noqa: BLE001
-                logger.warning(
-                    'gc_run_config_dir failed for remediation run %s: %r',
-                    run_id, gc_err,
-                )
+            await self._persist_stage_reports_then_gc_config_dir(run)
 
 
 # ── Backlog iteration ──────────────────────────────────────────────────

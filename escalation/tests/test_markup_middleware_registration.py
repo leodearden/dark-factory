@@ -905,7 +905,7 @@ def _leak(absorbed: str, param: str, value: str) -> str:
         # reason ``closer_for`` exists: never written verbatim. This is the
         # dialect the corpus's own repaired specimens carry, and the one
         # ``shared/tests/test_mcp_markup_middleware.py`` drives the untypable
-        # case with — the canonical ``<parameter name=...>`` opener anchors
+        # case with — the canonical ``\x3cparameter name=...>`` opener anchors
         # ``detect`` at a different literal and reaches the unrepairable path
         # instead, which is a different test.
         + '\x3c' + param + '>'

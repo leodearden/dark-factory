@@ -23,9 +23,9 @@ Harness notes (see plan pre-1):
     runs STRICT, so ``@pytest.mark.asyncio`` is required on async test classes.
   * That same config turns "marked with @pytest.mark.asyncio but not an async
     function" into an ERROR — never put a sync ``test_*`` inside a marked class.
-  * Default per-test ``timeout = 60``; real-git classes carry
-    ``@pytest.mark.timeout(180)`` since a chain of 3 merges plus worktree
-    creation can exceed it.
+  * Real-git classes carry
+    ``@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)`` because a chain of 3
+    merges plus worktree creation is slow.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -351,7 +352,7 @@ class TestChainResultContract:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestMergeBranchIntoWorktree:
     """merge_branch_into_worktree merges into a CALLER-SUPPLIED worktree.
 
@@ -614,7 +615,7 @@ class TestMergeBranchIntoWorktree:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestChainBuildLane:
     """The chain-build worktree-routing seam in merge_liveness.py."""
 
@@ -787,7 +788,7 @@ class TestChainBuildLane:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestChainSnapshot:
     """chain_snapshot() returns queued items in pick order without mutating."""
 
@@ -980,7 +981,7 @@ def _count_spec_lane_acquires(git_ops: GitOps, monkeypatch) -> list[str]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestBuildChainDegenerate:
     """Degenerate inputs return an empty ChainResult and touch ZERO worktrees.
 
@@ -1120,7 +1121,7 @@ class TestBuildChainDegenerate:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestBuildChainClean:
     """A clean 3-item chain builds in exactly one worktree."""
 
@@ -1348,7 +1349,7 @@ async def _assert_lane_clean_at(lane: Path, tip: str) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestBuildChainTruncation:
     """The task's headline signal: clean prefix, conflicted item UNTOUCHED, ONE worktree.
 
@@ -1877,7 +1878,7 @@ def _fail_rev_parse_head(monkeypatch, *, after_merge: bool) -> dict[str, int]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(180)
+@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
 class TestMergeBranchIntoWorktreeRevParseGuard:
     """An unreadable HEAD must be a loud failure, never a phantom empty sha.
 

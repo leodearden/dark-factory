@@ -10,6 +10,7 @@ commit_planning integration tests in test_task_tools.py).
 
 import json
 import logging
+import subprocess
 from unittest.mock import AsyncMock
 
 import pytest
@@ -832,3 +833,281 @@ async def test_rejected_write_does_not_block_sibling_labels(tmp_path):
     assert len(report['errors']) == 1
     assert 'first' in report['errors'][0]
     assert 'second' not in report['errors'][0]
+
+
+# ---------------------------------------------------------------------------
+# Delivered-check POLARITY: the stamper's REFUSE-TO-COPY path
+# (task 3500, step-15 RED / step-16 GREEN)
+#
+# Same lint as commit_planning's gate, OPPOSITE contract. commit_planning is a
+# synchronous gate whose caller is a live agent that can repair a descriptor
+# and re-commit, so it REJECTS the batch. This helper is contractually
+# never-raising and must not block the status flip that called it, so the
+# worst it may do is REFUSE TO COPY the offending check — leaving a dependent
+# ungated (the pre-gate status quo) rather than blocked forever (the wedge
+# this task exists to prevent).
+# ---------------------------------------------------------------------------
+
+#: Committed into the polarity fixture tree, so an `expect=present` grep for
+#: it is already green at the authoring tree -> vacuous_present.
+_POL_LANDED = 'LandedSymbol'
+#: Never committed, so an `expect=present` grep for it is the healthy
+#: forward-looking shape the gate must leave alone.
+_POL_FUTURE = 'FutureSymbol'
+#: Committed into BOTH fixture files, so an `expect=absent` grep for it is
+#: healthy under the 2x2 but over-broad for a task owning only the seed.
+_POL_WIDE = 'WidelyUsedSymbol'
+_POL_SEED_REL = 'src/seeded.py'
+_POL_OTHER_REL = 'src/other.py'
+
+# NOTE every pattern above is a bare identifier. `git grep -E` is POSIX
+# EXTENDED regex, so the neighbouring fixtures' 'TODO(alpha)' pattern actually
+# searches for the literal `TODOalpha` — a capture group, not parentheses.
+# A polarity fixture whose pattern did that would silently test the wrong cell.
+
+
+def _polarity_git_repo(root):
+    """git init *root* and commit the two-file polarity seed tree."""
+    root.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ['git', 'init', '-b', 'main', str(root)],
+        check=True, capture_output=True, text=True,
+    )
+    for args in (
+        ('config', 'user.email', 'polarity-test@example.com'),
+        ('config', 'user.name', 'Polarity Test'),
+    ):
+        subprocess.run(
+            ['git', '-C', str(root), *args], check=True, capture_output=True, text=True,
+        )
+    seed = root / _POL_SEED_REL
+    seed.parent.mkdir(parents=True, exist_ok=True)
+    seed.write_text(
+        f'class {_POL_LANDED}:\n    pass\n\n{_POL_WIDE} = 1\n', encoding='utf-8',
+    )
+    (root / _POL_OTHER_REL).write_text(f'use({_POL_WIDE})\n', encoding='utf-8')
+    subprocess.run(
+        ['git', '-C', str(root), 'add', _POL_SEED_REL, _POL_OTHER_REL],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ['git', '-C', str(root), 'commit', '-m', 'seed the authoring tree'],
+        check=True, capture_output=True, text=True,
+    )
+    return root
+
+
+def _polarity_sidecar_yaml(prd_stem, label, checks):
+    """Render a sidecar whose single *label* declares *checks*.
+
+    *checks* is a list of ``(name, pattern, expect, paths)`` tuples; ``paths``
+    may be ``None`` to omit the key (a whole-tree grep).
+    """
+    blocks = []
+    for name, pattern, expect, paths in checks:
+        block = (
+            f'      - name: {name}\n'
+            f"        binding: 'polarity fixture {name}'\n"
+            f'        verdict: PASS\n'
+            f'        delivered_check:\n'
+            f'          kind: grep\n'
+            f"          pattern: '{pattern}'\n"
+            f'          expect: {expect}\n'
+        )
+        if paths:
+            block += '          paths:\n' + ''.join(f'            - {p}\n' for p in paths)
+        blocks.append(block)
+    return (
+        f'prd: plans/{prd_stem}-prd.md\n'
+        f'schema_version: 1\n'
+        f'tasks:\n'
+        f'  - label: {label}\n'
+        f'    task_id: null\n'
+        f'    title: Polarity fixture {label}\n'
+        f'    capabilities:\n' + ''.join(blocks)
+    )
+
+
+async def _stamp_polarity(root, sidecar_yaml, *, prd_stem, label, files, task_id='401'):
+    """Write the sidecar, run the stamper against *root*, return (report, interceptor)."""
+    plans_dir = root / 'plans'
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    sidecar_path = plans_dir / f'{prd_stem}-prd.capability-manifest.yaml'
+    sidecar_path.write_text(sidecar_yaml, encoding='utf-8')
+
+    task_interceptor = AsyncMock()
+    task_interceptor.update_task = AsyncMock(return_value={'success': True})
+    report = await stamp_capability_manifests(
+        project_root=str(root),
+        ids=[task_id],
+        tasks_data=[
+            {
+                'id': task_id,
+                'metadata': {
+                    'prd_path': f'plans/{prd_stem}-prd.md',
+                    'prd_task_label': label,
+                    'files': files,
+                },
+            },
+        ],
+        task_interceptor=task_interceptor,
+    )
+    # The sidecar exists and carries the label, so the stamper always returns a
+    # report here. Pinning it once keeps every caller's subscript legible, and
+    # turns a regression to the None no-op path into a named failure rather
+    # than a TypeError at the first subscript.
+    assert report is not None, 'stamper returned the no-op None for a live sidecar'
+    return report, task_interceptor, sidecar_path
+
+
+def _copied_checks(task_interceptor):
+    call = task_interceptor.update_task.call_args
+    return json.loads(call.kwargs['metadata'])['delivered_checks']
+
+
+@pytest.mark.asyncio
+async def test_stamper_refuses_vacuous_check_but_copies_the_clean_sibling(tmp_path):
+    """A label mixing one vacuous and one clean check copies ONLY the clean one.
+
+    Refusal is per CHECK, not per label: dropping the whole label would strip
+    a sound gate along with the unsound one.
+    """
+    root = _polarity_git_repo(tmp_path / 'proj')
+    report, interceptor, sidecar_path = await _stamp_polarity(
+        root,
+        _polarity_sidecar_yaml('mix', 'alpha', [
+            ('vacuous_grep', _POL_LANDED, 'present', [_POL_SEED_REL]),
+            ('clean_grep', _POL_FUTURE, 'present', [_POL_SEED_REL]),
+        ]),
+        prd_stem='mix', label='alpha', files=[_POL_SEED_REL],
+    )
+
+    interceptor.update_task.assert_called_once()
+    copied = _copied_checks(interceptor)
+    assert [c['name'] for c in copied] == ['clean_grep']
+
+    # (b) The refusal is named loudly, with enough to act on.
+    joined = ' '.join(report['errors'])
+    assert 'plans/mix-prd.capability-manifest.yaml' in joined
+    assert 'alpha' in joined
+    assert 'vacuous_grep' in joined
+    assert 'vacuous_present' in joined
+
+    # (c) A refused check NEVER rolls back the task_id stamp step 4 already
+    # committed to disk.
+    assert report['stamped'] == ['alpha']
+    reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
+    assert reloaded['tasks'][0]['task_id'] == 401
+
+
+@pytest.mark.asyncio
+async def test_stamper_all_refused_label_calls_no_update_task(tmp_path):
+    """When a label's ONLY check is refused, update_task is not called at all."""
+    root = _polarity_git_repo(tmp_path / 'proj')
+    report, interceptor, _ = await _stamp_polarity(
+        root,
+        _polarity_sidecar_yaml('solo', 'alpha', [
+            ('only_grep', _POL_LANDED, 'present', [_POL_SEED_REL]),
+        ]),
+        prd_stem='solo', label='alpha', files=[_POL_SEED_REL],
+    )
+
+    interceptor.update_task.assert_not_called()
+    assert report['stamped'] == ['alpha']
+    joined = ' '.join(report['errors'])
+    assert 'only_grep' in joined
+    assert 'vacuous_present' in joined
+
+
+@pytest.mark.asyncio
+async def test_stamper_warn_tier_check_is_copied_and_reported(tmp_path):
+    """A warn-tier check IS copied and surfaces under polarity_warnings."""
+    root = _polarity_git_repo(tmp_path / 'proj')
+    report, interceptor, _ = await _stamp_polarity(
+        root,
+        _polarity_sidecar_yaml('warned', 'alpha', [
+            # Whole-tree expect=absent: healthy under the 2x2 (it still
+            # matches, so it can go green) but also matches src/other.py,
+            # which this task does not declare.
+            ('wide_grep', _POL_WIDE, 'absent', None),
+        ]),
+        prd_stem='warned', label='alpha', files=[_POL_SEED_REL],
+    )
+
+    interceptor.update_task.assert_called_once()
+    assert [c['name'] for c in _copied_checks(interceptor)] == ['wide_grep']
+    assert report['errors'] == []
+    warnings = report.get('polarity_warnings')
+    assert warnings, f'an over-broad absent check must be reported, got {report!r}'
+    assert [(w['name'], w['code'], w['severity']) for w in warnings] == [
+        ('wide_grep', 'absent_overbroad', 'warn'),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stamper_clean_sidecar_report_has_no_polarity_warnings_key(tmp_path):
+    """A fully clean sidecar's report keeps its exact 4-key shape.
+
+    Protects the exact-dict-equality assertions on this report, e.g.
+    ``fused-memory/tests/test_manifest_stamping.py::test_happy_path_stamps_file_and_copies_mechanical_checks``,
+    ``fused-memory/tests/test_delivered_checks_e2e.py::_verify_row1_stamp`` and
+    ``fused-memory/tests/test_task_tools.py::test_commit_planning_stamps_manifest_and_copies_delivered_checks``.
+    """
+    root = _polarity_git_repo(tmp_path / 'proj')
+    report, interceptor, _ = await _stamp_polarity(
+        root,
+        _polarity_sidecar_yaml('clean', 'alpha', [
+            ('clean_grep', _POL_FUTURE, 'present', [_POL_SEED_REL]),
+        ]),
+        prd_stem='clean', label='alpha', files=[_POL_SEED_REL],
+    )
+
+    assert report == {
+        'path': 'plans/clean-prd.capability-manifest.yaml',
+        'stamped': ['alpha'],
+        'missing_labels': [],
+        'errors': [],
+    }
+    assert [c['name'] for c in _copied_checks(interceptor)] == ['clean_grep']
+
+
+@pytest.mark.asyncio
+async def test_stamper_non_git_root_copies_everything_and_logs(tmp_path, caplog):
+    """Infra fail-open: an unevaluable check is still copied, and reported.
+
+    The lint cannot reach a verdict on a non-git root. Refusing to copy would
+    convert an availability failure into the very wedge this gate prevents, so
+    every check is copied — but the failure is recorded at WARNING rather than
+    passed over in silence.
+
+    The report itself keeps its 4-key shape: an errored disposition on a
+    non-git root is the DEFAULT state of every pre-existing fixture in this
+    file, so routing it into `errors`/`polarity_warnings` would break the five
+    exact-dict assertions decision 7 exists to protect (filed as esc-3500-2).
+    """
+    root = tmp_path / 'proj'  # deliberately NOT a git repo
+    with caplog.at_level(logging.WARNING):
+        report, interceptor, _ = await _stamp_polarity(
+            root,
+            _polarity_sidecar_yaml('nogit', 'alpha', [
+                ('unevaluable_grep', _POL_LANDED, 'present', [_POL_SEED_REL]),
+            ]),
+            prd_stem='nogit', label='alpha', files=[_POL_SEED_REL],
+        )
+
+    interceptor.update_task.assert_called_once()
+    assert [c['name'] for c in _copied_checks(interceptor)] == ['unevaluable_grep']
+    assert report == {
+        'path': 'plans/nogit-prd.capability-manifest.yaml',
+        'stamped': ['alpha'],
+        'missing_labels': [],
+        'errors': [],
+    }
+    polarity_warnings = [
+        r for r in caplog.records
+        if r.levelname == 'WARNING' and 'unevaluable_grep' in r.getMessage()
+    ]
+    assert polarity_warnings, (
+        'an unevaluable check must be loudly recorded, not silently passed; '
+        f'got {[r.getMessage() for r in caplog.records]}'
+    )

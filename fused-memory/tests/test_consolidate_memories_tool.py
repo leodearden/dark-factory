@@ -25,7 +25,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pydantic_core
 import pytest
+from _fm_helpers import MCP_SAFE_RESPONSE_CHARS
 
 import fused_memory.server.tools as tools_module
 from fused_memory.config.schema import Mem0UpdateConfig
@@ -537,6 +539,29 @@ class TestAuthorizationIsFailClosedAndPreWrite:
         svc.add_memory.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_an_unauthorized_caller_with_malformed_arguments_is_denied_not_validated(
+        self,
+    ):
+        """Authorization is step (1): as in `update_memory`, an unauthorized
+        caller is refused before validation could tell it anything about its
+        arguments."""
+        malformed = {'topic': 'Not_A_Slug', 'supersedes': ['873889a1'], 'run_id': None}
+        contrast = await call_consolidate(make_service(), **malformed)
+        assert contrast['error_type'] == 'ValidationError'
+        assert contrast['hint']
+        assert 'supersedes[0]' in contrast['error']
+
+        svc = make_service()
+        result = await call_consolidate(svc, agent_id='claude-interactive', **malformed)
+
+        assert result['error_type'] == 'Mem0UpdateNotAuthorized'
+        assert 'hint' not in result
+        assert 'supersedes[0]' not in result['error']
+        svc.add_memory.assert_not_called()
+        svc.get_memory_by_id.assert_not_called()
+        svc.get_memories_by_metadata.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_kill_switch_denies_every_agent(self):
         svc = make_service()
         svc.config.mem0_update = Mem0UpdateConfig(enabled=False)
@@ -1042,10 +1067,10 @@ class TestClosureIsCorroboratedNeverClaimed:
     @pytest.mark.asyncio
     async def test_a_truncated_closure_listing_says_so(self):
         """(d) A capped listing must never read as the whole closure."""
-        from fused_memory.server.tools import _TOPIC_MEMBER_LIMIT
+        from fused_memory.services.consolidation_ops import TOPIC_MEMBER_LIMIT
 
         svc = make_service(
-            topic_members=[f'member-{i}' for i in range(_TOPIC_MEMBER_LIMIT)],
+            topic_members=[f'member-{i}' for i in range(TOPIC_MEMBER_LIMIT)],
             topic_total=512,
         )
 
@@ -1053,7 +1078,7 @@ class TestClosureIsCorroboratedNeverClaimed:
 
         assert result['topic_members_truncated'] is True
         assert result['topic_members_total'] == 512
-        assert len(result['topic_members']) == _TOPIC_MEMBER_LIMIT
+        assert len(result['topic_members']) == TOPIC_MEMBER_LIMIT
 
     @pytest.mark.asyncio
     async def test_the_common_path_pays_for_no_count(self):
@@ -2391,3 +2416,215 @@ class TestASeedShortfallIsDisclosedNotFatal:
 
         assert result['status'] == 'consolidated'
         assert result['topic_cluster_seed'] == seed
+
+
+class TestTheEnvelopeSurvivesTheExtraction:
+    """Task β's before/after signal (PRD §10 β): the tool's envelope must be
+    identical across the extraction of its retain arm into
+    `services/consolidation_ops.py`.
+
+    This is a CHARACTERIZATION pin, GREEN at the commit that introduces it
+    by construction — both literals were captured from the unmodified tree
+    before any production edit, which is what makes them evidence of the
+    PRE-extraction behaviour rather than a rewritten expectation. A pure
+    refactor has no new behaviour to drive red-first, so its TDD signal is
+    INVARIANCE, and these two cases are what make that signal checkable by
+    a test rather than by a reviewer diffing two runs.
+
+    The comparison is whole-dict `==`, never a key subset: the property
+    under test is that no key appears, vanishes or changes value, and a
+    subset assertion is blind to exactly that.
+
+    The two cases are the op's two arms. The fixture cluster exercises the
+    delete arm alongside the retain arm; the retain-only shape is the
+    gate-3200 ratified default and the only shape the auto-consolidation
+    executor takes, so it is pinned in its own right rather than assumed to
+    be covered by the first.
+    """
+
+    #: The projected closure listing for this fixture's topic.
+    _TOPIC_MEMBERS = [
+        {'id': S1, 'canonical': False},
+        {'id': S2, 'canonical': False},
+        {'id': S3, 'canonical': False},
+    ]
+
+    @pytest.mark.asyncio
+    async def test_the_fixture_cluster_envelope_is_pinned(self):
+        result = await call_consolidate(make_service(), known_projects=KNOWN_PROJECTS)
+
+        assert result == {
+            'status': 'consolidated',
+            'canonical_id': CANONICAL,
+            'topic': TOPIC,
+            'canonical_supersedes': [S1, S2, S3],
+            'deleted': [S1, S2, S3],
+            'failed_deletes': [],
+            'retained': [],
+            'retain_failures': [],
+            'reparented': [],
+            'reparent_failures': [],
+            'survivors': [],
+            'survivor_check_failed': [],
+            'topic_members': self._TOPIC_MEMBERS,
+            'topic_members_total': 3,
+            'topic_members_truncated': False,
+            'topic_members_available': True,
+            'tombstones_written': 3,
+            'tombstones_expected': 3,
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_retain_only_envelope_is_pinned(self):
+        result = await call_consolidate(
+            make_service(), supersedes=[], retain=[RETAIN_1, RETAIN_2], run_id=None
+        )
+
+        assert result == {
+            'status': 'consolidated',
+            'canonical_id': CANONICAL,
+            'topic': TOPIC,
+            'canonical_supersedes': [],
+            'deleted': [],
+            'failed_deletes': [],
+            'retained': [RETAIN_1, RETAIN_2],
+            'retain_failures': [],
+            'reparented': [],
+            'reparent_failures': [],
+            'survivors': [],
+            'survivor_check_failed': [],
+            'topic_members': self._TOPIC_MEMBERS,
+            'topic_members_total': 3,
+            'topic_members_truncated': False,
+            'topic_members_available': True,
+            'tombstones_written': 0,
+            'tombstones_expected': 0,
+        }
+
+
+class TestTheClosureListingIsReadAfterTheFold:
+    """The envelope must never report as a LIVE topic member an id it
+    reports in `deleted`.
+
+    The flagship case is not exotic: the ratchet this op exists to end is
+    "a cluster ends up containing the consolidator's own prior
+    canonicals", so a supersede that already carries the topic — the
+    incumbent being reaped — is the ordinary shape of a fold. A listing
+    taken before the deletes names it; a listing taken after does not.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_reaped_topic_member_is_not_listed_as_live(self):
+        svc = make_service()
+
+        # The scroll answers from the world, which the op changes: a record
+        # this call has deleted is no longer a topic member. A constant
+        # answer would make any placement of the read look correct.
+        async def _live_topic_rows(**_):
+            reaped = {c.kwargs['memory_id'] for c in svc.delete_memory.await_args_list}
+            return [
+                _scroll_row(m)
+                for m in (CANONICAL, RETAIN_1, RETAIN_2, S1)
+                if m not in reaped
+            ]
+
+        svc.get_memories_by_metadata = AsyncMock(side_effect=_live_topic_rows)
+
+        result = await call_consolidate(svc, retain=[RETAIN_1, RETAIN_2])
+
+        assert [m['id'] for m in result['topic_members']] == [
+            CANONICAL,
+            RETAIN_1,
+            RETAIN_2,
+        ]
+        assert S1 in result['deleted']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'shape',
+        [
+            {'retain': [RETAIN_1, RETAIN_2]},
+            {'supersedes': [], 'retain': [RETAIN_1, RETAIN_2], 'run_id': None},
+        ],
+        ids=['with-a-fold', 'retain-only'],
+    )
+    async def test_the_closure_is_scrolled_exactly_once(self, shape):
+        """The envelope's `topic_members*` fields have ONE source: the
+        listing read once the fold is done. A second read would be a second
+        source for the same fields, and a wasted scroll on every call."""
+        svc = make_service()
+
+        await call_consolidate(svc, **shape)
+
+        svc.get_memories_by_metadata.assert_awaited_once()
+
+
+class TestTheClosureListingIsProjected:
+    """The envelope is the ONLY record of an irreversible multi-delete, so a
+    dumping-ground topic must not push it past the MCP transport limit, where
+    it is rejected wholesale and every per-id disposition is lost for records
+    that are already gone. A closure proof needs the id and the canonical
+    flag; the rest of a row is one `get_memory_by_id` away (task 5275)."""
+
+    @pytest.mark.asyncio
+    async def test_member_rows_carry_only_the_id_and_the_canonical_flag(self):
+        svc = make_service()
+        svc.get_memories_by_metadata = AsyncMock(
+            return_value=[
+                _scroll_row(
+                    CANONICAL, content='x' * 500, canonical=True, supersedes=list(SUPERSEDES)
+                ),
+                _scroll_row(RETAIN_1, content='y' * 500, source='recon'),
+            ]
+        )
+
+        result = await call_consolidate(svc)
+
+        assert result['topic_members'] == [
+            {'id': CANONICAL, 'canonical': True},
+            {'id': RETAIN_1, 'canonical': False},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_full_listing_of_fat_members_stays_inside_the_transport_envelope(self):
+        from fused_memory.services.consolidation_ops import TOPIC_MEMBER_LIMIT
+
+        ids = [f'{i:08x}-0000-4000-8000-000000000000' for i in range(TOPIC_MEMBER_LIMIT)]
+        svc = make_service(
+            topic_members=ids, topic_total=512, contents={m: 'x' * 2_000 for m in ids}
+        )
+
+        result = await call_consolidate(svc)
+
+        raw_rows = [_scroll_row(m, content='x' * 2_000) for m in ids]
+        assert len(json.dumps(raw_rows)) > MCP_SAFE_RESPONSE_CHARS
+        # The TextContent FastMCP emits for a dict result.
+        assert len(pydantic_core.to_json(result, indent=2)) < MCP_SAFE_RESPONSE_CHARS
+        assert result['status'] == 'consolidated'
+        assert result['deleted'] == SUPERSEDES
+        assert result['survivors'] == []
+        assert result['failed_deletes'] == []
+        assert result['topic_members_truncated'] is True
+        assert result['topic_members_total'] == 512
+        assert len(result['topic_members']) == TOPIC_MEMBER_LIMIT
+
+    def test_a_malformed_closure_row_never_costs_the_envelope(self):
+        result = build_consolidation_result(
+            canonical_id=CANONICAL,
+            topic=TOPIC,
+            deleted=[S1],
+            failed_deletes=[],
+            survivors=[],
+            topic_members=[
+                {'id': CANONICAL, 'metadata': None},
+                'not-a-row',
+                {'id': RETAIN_1, 'metadata': {'canonical': 'true'}},
+            ],
+        )
+
+        assert result['deleted'] == [S1]
+        assert result['topic_members'] == [
+            {'id': CANONICAL, 'canonical': False},
+            {'id': None, 'canonical': False},
+            {'id': RETAIN_1, 'canonical': False},
+        ]

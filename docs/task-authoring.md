@@ -441,9 +441,12 @@ A **declared deliverable** can, so it is what the advisory is attributed on.
 The annotation is suppressed when your declared deliverables attest local
 work — meaning **both** of:
 
-- at least one entry across `metadata.files`, `metadata.files_to_modify` or
-  `metadata.modules` is owned by the project you are filing into, **and**
-- **no** entry across those three keys is owned by a *different* project.
+- at least one entry across `metadata.files` or `metadata.files_to_modify`
+  is owned by the project you are filing into, **and**
+- **no** entry across those two keys is owned by a *different* project.
+
+`metadata.modules` is retired: it is not read here, and a new submission
+carrying it is rejected (see §8 Tier-A).
 
 When both hold, the prose citation is treated as incidental and neither the
 annotation nor the escalation fires. **Supplying accurate deliverable
@@ -484,8 +487,8 @@ None of this relaxes the rule above. A submission whose **`metadata.files`**
 mix local and foreign entries is still a hard reject — attribution is
 consulted only after that check has already passed, so a locally-owned entry
 can never buy a mixed `files` list past it. A foreign entry that the reject
-never classified (one in `metadata.modules`, or in `metadata.files_to_modify`
-when `metadata.files` is also present and takes precedence) does not reject,
+never classified (one in `metadata.files_to_modify` when `metadata.files` is
+also present and takes precedence) does not reject,
 but it *does* fail the second condition above, so such a submission keeps the
 annotation and the escalation rather than being silently suppressed.
 
@@ -538,6 +541,116 @@ listed entry must exist for `expect: "present"`, every one must be gone for
 be expressed as either, at the cost of running against the working checkout
 rather than a materialized `main` tree.
 
+**Non-vacuity: a delivered_check must FAIL when you write it**
+
+A sound `delivered_check` **fails at the authoring tree and passes once its
+producer lands** — 0→N or N→0 across the task. That is the whole content of
+the check: it is a claim about a *change*, and a check that cannot observe a
+change observes nothing. Because `commit_planning` runs *before* the task
+lands, `main` at that moment **is** the pre-task tree, so the property is
+decidable at authoring time with nothing but the manifest and git. The lint
+reads `main` — the ref the runtime gate reads
+(`shared/src/shared/delivered_check_polarity.py::GATE_REF`) — never the
+checkout's `HEAD`, which may sit on another branch; where `main` does not
+resolve, every check is reported `unevaluable` rather than judged:
+
+| | `expect: present` | `expect: absent` |
+|---|---|---|
+| **matches at authoring** | rejected `vacuous_present` | healthy |
+| **no match at authoring** | healthy | rejected `vacuous_absent` |
+
+The table covers every kind that carries an `expect`. For `kind: "grep"`,
+"matches" means the pattern matches; for `kind: "path"` it means every listed
+path already exists — the gate's own conjunctive reading. `script` has no
+`expect`, so it has no cell and is not linted.
+
+A check in a rejected cell is already green the day it is written: landing the
+producer cannot change its verdict, so the dependent is dispatched as if
+unguarded. The opposite failure is worse — a check that can *never* go green
+blocks its dependent forever, and at runtime that is indistinguishable from a
+genuinely undelivered capability.
+
+**Reject codes** (all five block; the `_self_referential` and `_comment_only`
+entries are diagnostic refinements of `vacuous_present` for grep, not separate
+gates):
+
+| Code | What fired | Measured specimen |
+|---|---|---|
+| `vacuous_present` | `expect: present` check already passes at authoring (the pattern matches, or every listed path exists) | task **5799** asserted `present` for patterns its own diff was scoped to *remove* — necessarily present already, which is what made them removable; the wedge landed on dependent 5919 |
+| `vacuous_present_self_referential` | the only matches are the descriptor's own `pattern:` line in a manifest | task **2863**'s `fable-architect-eval-decision`, whose first match was the sidecar declaring it |
+| `vacuous_present_comment_only` | the only matches are comments, not code | task **2792**'s `archive_task_transcripts`, matching one fossil comment in `git_ops.py` |
+| `vacuous_absent` | `expect: absent` check already passes at authoring (the pattern does not match, or no listed path exists) | the mirror cell: nothing to remove, so the check is green before any work starts |
+| `filename_shaped` | `kind: grep`, `expect: present` pattern has zero content matches and either names a tracked **filename**, or is exactly the basename or stem of a file the task declares in `metadata.files` inside the check's `paths` (the file need not exist yet) | task **3536**'s `test_workflow_merge_gating_strand` — authored before 3536 created that module, and a test module does not mention its own name, so `git grep` (which reads *contents*) could never see it. The rejection names the `kind: "path"` descriptor that says what was meant (see *Choosing a descriptor*) |
+
+**Warn code** (reported, never blocking):
+
+| Code | What fired | Why it is not a reject |
+|---|---|---|
+| `absent_overbroad` | an `expect: absent` pattern also matches files outside the task's declared `metadata.files` | genuinely undecidable at authoring time — task **3534**'s pattern legitimately matched inside the very file it owned. On a hard gate a false reject costs more than a missed catch |
+
+**The standing authoring preference.** Assert the **new** symbol positively
+rather than banning the old one: `kind: grep`, `expect: present`, `pattern` = a
+class, function or constant that does not exist yet, scoped with `paths` to the
+files this task actually writes. That is the shape all three measured repairs
+took, and it is the only shape the gate can observe going green. When the
+capability IS a file's existence, use `kind: "path"` naming the file the task
+creates (or, with `expect: absent`, deletes).
+
+**Two enforcement points, deliberately different contracts:**
+
+- **`commit_planning`** — a synchronous gate whose caller is a live agent that
+  can fix the metadata and re-commit. A reject-tier finding on any task in the
+  batch returns `error_type: "DeliveredCheckPolarityViolation"` and **flips
+  nothing** — all-or-nothing, before `set_task_status`, exactly like the
+  existing lock-charter rejection (which keeps precedence). Scoped to
+  `target_status == 'pending'`: that is the only status that releases a task
+  for scheduling, so gating a `cancelled`/`deferred` commit would only block
+  cleanup.
+- **The capability-manifest stamper** — contractually never-raising and never
+  blocking, so it cannot reject. It **refuses to copy** the offending check
+  into `metadata.delivered_checks` and names it in
+  `manifest_stamping.errors`. Dropping degrades toward the safe direction
+  (a dependent dispatched ungated, the pre-gate status quo) rather than the
+  wedge (a dependent blocked forever).
+
+**Fail closed on a verdict, fail open on infrastructure.** The validation is
+applied unconditionally, but "git could not answer" is never a verdict: an
+unevaluable check (no repo, unresolvable ref, `git grep` rc ≥ 2, `git ls-tree`
+rc ≠ 0) is reported as
+`unevaluable` and **never** rejects. An availability failure must not be able
+to halt planning — but it must not read as a clean bill of health either, which
+is why it is reported rather than silently passed.
+
+**Response keys**, both attached **only when non-empty** so a clean call's
+response stays byte-identical to what it was before the gate existed:
+
+| Key | On | Carries |
+|---|---|---|
+| `delivered_check_warnings` | `commit_planning`'s result | every `warn`- and `errored`-severity finding — the latter coded `unevaluable` — as `{task_id, name, code, severity, message}` |
+| `polarity_warnings` | the `manifest_stamping` report | warn-tier findings for checks that were still copied |
+
+**Auditing the existing population.** `scripts/audit_delivered_checks.py` is a
+read-only, status-aware sweep over the descriptors already committed, which the
+authoring gate by construction cannot see. It is status-aware because
+evaluating a descriptor against main yields a *bit*, not a verdict —
+"`expect: present` and it matches" is the success state of a landed producer
+*and* a never-fires gate on a live one, and a status-blind rule flags 313 of
+548 descriptors (57%), overwhelmingly correctly delivered work. Exit 1 keys
+only on `broken` (a done producer whose capability is nowhere on main) and
+`vacuous_live_gate` (an open producer whose check already passes);
+`superseded` — a correct descriptor that later work legitimately undid — is
+reported and never actionable. A separate report-only section lists sidecar
+descriptors carrying a structural code (`vacuous_present_self_referential`,
+`vacuous_present_comment_only`, `filename_shaped`). Those codes are measured
+against today's tree, and a reworded comment or a later file flips them, so
+they never affect the exit code and no gating test sweeps them.
+
+**At runtime**, a `DEP_CAPABILITY_NOT_DELIVERED` escalation whose check is
+mis-authored now carries an `AUTHORING DIAGNOSIS` block in its `detail`,
+naming the code and a remedy. Without it a malformed check and a genuinely
+undelivered capability produce identical records, and they need opposite
+responses.
+
 **Dispatch-time policy**
 
 | Check outcome | Scheduler action |
@@ -571,7 +684,8 @@ canonical specimen, measured: task 3536 asserted `kind: "grep"`,
 mention its own filename, so the check could never go green — and it blocked
 four dependents (3537, 3544, 3545, 3837). `kind: "path"` with
 `paths: ["orchestrator/tests/test_workflow_merge_gating_strand.py"]` says
-what was meant.
+what was meant. The grep form is now refused at `commit_planning` as
+`filename_shaped`, whose message names this `kind: "path"` fix.
 
 When the capability IS behavioural, prefer `kind: "script"` pointing at a
 COMMITTED predicate. If the same invariant is already gated elsewhere (a
@@ -766,6 +880,50 @@ rather than a `DeterministicRunner` action or a code merge.
 
 **Dep convention:** deterministic deploys and gates use **normal**
 dependencies — including cross-project `project_id:task_id` deps (§3.2).
+
+### Gitignored-only deliverables are flagged at submit
+
+A `task_kind='normal'` submission is flagged when **every** declared
+`metadata.files` path is gitignored in the target project. The check runs
+`git check-ignore`, which consults the index, so a tracked file is never
+flagged even if an ignore rule matches it. One committable path anywhere in
+the list suppresses the flag.
+
+Such a task is structurally undeliverable. Its plan still passes, because
+`confirm_plan` only checks that `plan.files` is declared and non-empty. But
+no commit can ever touch a gitignored path, so neither of these can be
+satisfied:
+
+- the merge-time plan-files-touched gate (`plan_files_not_touched`);
+- `done_provenance` (§2).
+
+**Exempt (no flag):**
+
+- `files=[]`;
+- `task_kind='deterministic'`;
+- `execution_class` `operational` or `decision`;
+- a hand-set `metadata.cross_repo` (§3.2.1);
+- any case where git cannot answer, such as a non-git root or a declared
+  path outside the repo. These fail open.
+
+A path whose extension is not on the lock-charter allowlist (for example
+`tasks.db`) is refused earlier, as a "directory declaration" with
+`LockCharterViolation`, so this lint never sees it.
+
+**Posture.** By default the lint only warns. When the submission succeeds,
+it merges a `gitignored_deliverable_warning` key into the result and logs a
+`gitignored_deliverable_lint.flagged` census line, so the census counts
+accepted filings only. Setting
+`FUSED_GITIGNORED_DELIVERABLE_ENFORCE=1` makes it a hard reject
+(`ValidationError`) instead.
+
+**Fix.** Most such tasks should be filed as `task_kind='deterministic'`:
+
+- with `before_done` pointing at a committed script, for a scripted action;
+- or with `always_escalates=True`, for a human gate.
+
+If a code deliverable really is intended, declare at least one committable
+path.
 
 ---
 
@@ -1185,6 +1343,31 @@ recon **Stage 1/2 prompts now name both canonical keys literally**
 the writer. Grepping for a *code* writer and finding none is therefore not
 evidence that these entries are dead.
 
+`modules` is **retired 2026-08 — historical carrier, no live writer; rejected
+on new submissions.** It stays blessed so the immutable terminal and deferred
+carriers do not emit `unknown_key`: the same corpus-dominance reasoning that
+blessed the writer-less finding-provenance family (`origin_finding_id` et al.,
+`esc-3796-1`, described just above), applied in reverse — un-blessing a
+dominant key manufactures the census noise the scan exists to surface.
+
+- A **new** `submit_task` carrying top-level `metadata.modules`, on either
+  creation path, is rejected with `error_type: "RetiredMetadataKey"`
+  (`retired_key: "modules"`, `replacement_key: "files"`). Declare scope in
+  `metadata.files` with FILE paths, or `[]` to defer to the architect.
+- `update_task` and `commit_planning` stay tolerant, so existing carriers can
+  be re-written whole.
+- Lock derivation and the §3.2.1 attestation read `files` /
+  `files_to_modify` only.
+- Quoting the key in prose, or nesting it under an `x_` key, never trips the
+  guard, which is why there is no bypass flag.
+- Retained readers: the `orchestrator/src/orchestrator/cli.py` task listing
+  (historical display), and `scripts/mint_hard_v2_fixtures.py` (historical
+  eval corpus, where `files` on a done task is the merge diff, i.e. the
+  answer).
+
+See `plans/metadata-modules-retirement-prd.md`; run evidence is in
+`plans/metadata-modules-migration-run.md`.
+
 `cross_repo` + `cross_repo_project` are the cross-repo deliverable marker
 (§3.2.1): auto-set by the fused-memory submit path when a task's
 `metadata.files` are all owned by one other registered project (and the
@@ -1224,7 +1407,7 @@ ahead of the queue.
 request inherits `metadata.merge_lane`, under the precedence **`lane`
 argument > `metadata.merge_lane` > `'normal'`**. An unrecognised value in a
 task's *metadata* is silently normalised to `'normal'` by
-`orchestrator/src/orchestrator/merge_queue.py::_normalize_lane`, so a typo
+`orchestrator/src/orchestrator/merge_lane/worker.py::_normalize_lane`, so a typo
 *here* is a silent downgrade — which is exactly why the companion `lane`
 parameter rejects an unknown value loudly instead (see its docstring in
 `escalation/src/escalation/server.py::merge_request` for that contract). The
@@ -1497,22 +1680,30 @@ it. Generalising: prefer blessing when validation is context-dependent, when
 the live corpus already contains values a type would reject, or when the
 apparent enum is not the thing writers are actually held to.
 
-### Known gaps (re-measured 2026-08-18 — not fixed)
+### Known gaps (re-measured 2026-10-02 — none open)
 
-Two `unknown_key` sources are known, measured, and deliberately left
-open. They are recorded here so the next reader does not re-measure them.
-All counts are a snapshot of a **growing** corpus, not an invariant: 4748
-tasks carried dict metadata at the latest corpus-wide measurement
+No tracked `unknown_key` source is open. All counts are a snapshot of a
+**growing** corpus, not an invariant: 4748 tasks carried dict metadata at
+the latest corpus-wide measurement
 (2026-08-31), up from 4204 on 2026-08-18 and 3553 when this section was
 first written. Across that corpus 1516 tasks emit at least one
-`unknown_key` line, 3130 lines over 1028 distinct spellings. The *per-gap*
-counts in the table below are still the 2026-08-18 figures and were **not**
-re-measured — only the corpus total was.
+`unknown_key` line, 3130 lines over 1028 distinct spellings; those are
+untracked Tier-C keys, not gaps this section owns.
 
-| Gap | Measured | Owner |
-|---|---|---|
-| Ad-hoc reify/escalation keys unmigrated corpus-wide | `origin_escalation` 19, `related_reify_tasks` 8, `origin_reify_task` 4, `related_reify_memories` 1 — 29 distinct tasks, of which only 6 are writable today | task 4302 |
-| Task 3083 still emits 6 `unknown_key` lines — the write path is blocked | 6 of an original 7 | `tkt_0RS4WVMH1RSTSY88N781E70F5S` |
+**The two rows this table last carried are CLOSED**, recorded in the same
+shape as the `execution_class` row below so a reader arriving from an older
+revision does not re-open them:
+
+- **Ad-hoc reify/escalation keys unmigrated corpus-wide** (task 4302) — swept
+  on 2026-10-02. All 30 carriers (`origin_escalation` 20,
+  `related_reify_tasks` 7, `origin_reify_task` 3, `related_reify_memories` 0)
+  were renamed into `x_`, one `--apply` per task, and a re-run census finds
+  zero tasks carrying any of the four bare spellings. The one code reader,
+  `scripts/sitting/ownership.py::FOLLOWUP_KEYS`, was changed first (task
+  6196) to read `x_origin_escalation` as well as the legacy spelling.
+- **Task 3083's `unknown_key` lines** — task 3777 opened the write path
+  described below and gate 6118 applied the migration; 3083's live blob now
+  parses with zero `unknown_key` lines (measured 2026-10-02).
 
 **`execution_class` was the third row here and is now CLOSED** — task 3780
 blessed it into Tier-A rather than typing or retiring it. Recorded so a
@@ -1535,8 +1726,9 @@ largest single `unknown_key` contributor in the corpus and, unusually, the
 following the documentation still minted a census line. Blessing rather
 than retiring, in one line: it is the documented migration target for three
 live aliases, it is corpus-dominant on the `esc-3796-1` precedent, and
-retirement is structurally blocked today because ~70% of its carriers hold
-`done_provenance` and are unwritable under the floor described below —
+retirement was structurally blocked when it was decided, because ~70% of its
+carriers held `done_provenance` and were unwritable under the floor described
+below (task 3777 has since opened a passthrough route) —
 sweeping only the writable remainder is the same "fifth of the benefit"
 vocabulary fork ruled out for task 4302 just below. See the frozenset entry
 in `shared/src/shared/task_metadata.py` for the census, the value-shape
@@ -1563,12 +1755,11 @@ re-running a task-metadata census must import the submodel registrations
 first, or they will measure phantom leaks. The corpus totals quoted above
 were measured with them imported.
 
-**The `x_` sweep** was scoped to task 3083 alone, not the corpus, because
-a ~30-task metadata rewrite has a very different blast radius from one
-reserved task. `x_`-prefixed precedents for these same spellings already
-exist (`x_origin_escalation` 1, `x_related_reify_tasks` 1,
-`x_related_df_tasks` 5), so the target spelling is not in doubt and the
-sweep is a mechanical per-task re-run of
+**The `x_` sweep** was first scoped to task 3083 alone, not the corpus,
+because a ~30-task metadata rewrite has a very different blast radius from
+one reserved task. `x_`-prefixed precedents for these same spellings
+already existed, so the target spelling was not in doubt and the corpus
+sweep was a mechanical per-task re-run of
 `fused-memory/scripts/migrate_task_metadata_to_x_namespace.py`. That
 script's "no reader anywhere" grep argument covers only its six built-in
 default keys, so when you re-run it with your own `--keys` it validates
@@ -1579,27 +1770,26 @@ its own timestamped pre-write snapshot and never overwrites an existing
 one — a path you named is refused, one the script chose steps aside — so
 the re-run prescribed here cannot cost you the original row.
 
-What actually gates the sweep is **writability**, not effort. Of the 29
-target tasks, 23 carry `done_provenance` and are structurally unwritable
-under the floor described below; only 3048, 3084, 3116, 3162, 3282 and 3501
-can be migrated today. Sweeping just those six is worse than not sweeping:
-it forks the vocabulary across the corpus for a fifth of the benefit, which
-is the outcome the canonical-spelling convention exists to prevent. Hence
-task 4302 (split out of task 3780, which reached this measurement while
-closing the `execution_class` row; originally filed as
+What gated the corpus sweep was **writability**, not effort. Of the 29
+targets measured on 2026-08-16, 23 carried `done_provenance` and were
+unwritable under the floor described below. Sweeping only the writable six
+would have forked the vocabulary across the corpus for a fifth of the
+benefit, which is the outcome the canonical-spelling convention exists to
+prevent. So task 4302 (split out of task 3780, which reached this
+measurement while closing the `execution_class` row; originally filed as
 `tkt_0RSM2ECXBS1RPHMGYQVZ0V3QZZ`, which the curator dropped into 4302 as a
-duplicate) carries a hard dependency on task 3777 and should not be started
-before it lands.
+duplicate) waited on task 3777 and then ran once over all of them.
 
-**The write-path blocker** is why the second row is still open, and it
-bounds the other one too: `update_task` rejects any metadata payload
-containing `done_provenance` — a presence-only write-authority floor
-evaluated *before* `metadata_mode` is resolved — and `'merge'` mode cannot
-retire a key at all, since `_merge_metadata` is a shallow `{**old, **new}`
-with no deletion sentinel. A whole-blob `'replace'` is therefore
-structurally impossible on any `done`/merged task, which is most of the
-corpus above. Check a target task's status before assuming its metadata is
-writable.
+**The write-path floor** bounds any metadata repair on a `done`/merged
+task: `update_task` may never add, change or remove
+`metadata.done_provenance`, and `'merge'` mode cannot retire a key at all,
+since `_merge_metadata` is a shallow `{**old, **new}` with no deletion
+sentinel. Until task 3777 that made a whole-blob `'replace'` impossible on
+most of the corpus. It is now admitted when the payload carries the stored
+`done_provenance` through verbatim (the contract is
+`fused-memory/src/fused_memory/backends/sqlite_task_backend.py::_assert_done_provenance_passthrough`),
+which is exactly what the migration script sends. Any other shape that
+touches the key is still refused.
 
 ---
 

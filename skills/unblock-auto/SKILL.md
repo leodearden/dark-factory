@@ -100,7 +100,7 @@ landing on the current `main` tip (e.g. "post-merge verify failed", a
 rebase conflict, a pyright/lint break against the new main tip) — this
 investigation is running on the **merge-stage completion mode** path
 (orchestrator `block_class == MERGE_VERIFY_RED`; see
-`orchestrator/src/orchestrator/merge_completion.py`). This is narrower than
+`orchestrator/src/orchestrator/merge_lane/completion.py`). This is narrower than
 the general risk assessment above: only label `risk_label: "low"` for
 **MECHANICAL** completion classes:
 

@@ -15,8 +15,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _live_merge_worker import REAL_GIT_MERGE_RESULT_TIMEOUT, running_merge_worker
 from _merge_lane_verifier_doubles import ScriptedVerifier
-from _orch_helpers import make_placeholder_future
+from _orch_helpers import make_placeholder_future, wait_responsive
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -144,7 +145,7 @@ class TestEnforcePersistentWorktreeSerialLane:
 
     def test_knob_on_bound_gt1_raises(self, tmp_path: Path):
         """persistent_merge_worktree=True + merge_ahead_bound=2 → raises PersistentWorktreeConfigError."""
-        from orchestrator.merge_queue import (  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import (
             PersistentWorktreeConfigError,
             enforce_persistent_worktree_serial_lane,
         )
@@ -161,8 +162,8 @@ class TestEnforcePersistentWorktreeSerialLane:
 
     def test_knob_on_bound_1_no_raise(self, tmp_path: Path):
         """persistent_merge_worktree=True + merge_ahead_bound=1 → no raise."""
-        from orchestrator.merge_queue import (  # noqa: PLC0415
-            enforce_persistent_worktree_serial_lane,
+        from orchestrator.merge_lane.liveness import (
+            enforce_persistent_worktree_serial_lane,  # noqa: PLC0415
         )
 
         cfg = _make_config(tmp_path, persistent=True)
@@ -172,8 +173,8 @@ class TestEnforcePersistentWorktreeSerialLane:
 
     def test_knob_off_bound_gt1_no_raise(self, tmp_path: Path):
         """persistent_merge_worktree=False + merge_ahead_bound=2 → guard inert."""
-        from orchestrator.merge_queue import (  # noqa: PLC0415
-            enforce_persistent_worktree_serial_lane,
+        from orchestrator.merge_lane.liveness import (
+            enforce_persistent_worktree_serial_lane,  # noqa: PLC0415
         )
 
         cfg = _make_config(tmp_path, persistent=False)
@@ -185,9 +186,7 @@ class TestEnforcePersistentWorktreeSerialLane:
 
     def test_reframe_bound2_num_hosts2_no_raise(self, tmp_path: Path):
         """knob ON + bound=2 + num_hosts=2 → per_host=ceil(2/2)=1 → no raise (K=2 / 2-host)."""
-        from orchestrator.merge_queue import (
-            enforce_persistent_worktree_serial_lane,  # noqa: PLC0415
-        )
+        from orchestrator.merge_lane.liveness import enforce_persistent_worktree_serial_lane
 
         cfg = _make_config(tmp_path, persistent=True)
         result = enforce_persistent_worktree_serial_lane(cfg, merge_ahead_bound=2, num_hosts=2)
@@ -195,7 +194,7 @@ class TestEnforcePersistentWorktreeSerialLane:
 
     def test_reframe_bound2_num_hosts1_raises(self, tmp_path: Path):
         """knob ON + bound=2 + num_hosts=1 → per_host=ceil(2/1)=2 → raises (single host, 2 in-flight)."""
-        from orchestrator.merge_queue import (  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import (
             PersistentWorktreeConfigError,
             enforce_persistent_worktree_serial_lane,
         )
@@ -209,7 +208,7 @@ class TestEnforcePersistentWorktreeSerialLane:
 
     def test_reframe_bound3_num_hosts2_raises(self, tmp_path: Path):
         """knob ON + bound=3 + num_hosts=2 → per_host=ceil(3/2)=2 → raises (uneven split)."""
-        from orchestrator.merge_queue import (  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import (
             PersistentWorktreeConfigError,
             enforce_persistent_worktree_serial_lane,
         )
@@ -220,9 +219,7 @@ class TestEnforcePersistentWorktreeSerialLane:
 
     def test_reframe_bound4_num_hosts4_no_raise(self, tmp_path: Path):
         """knob ON + bound=4 + num_hosts=4 → per_host=ceil(4/4)=1 → no raise."""
-        from orchestrator.merge_queue import (
-            enforce_persistent_worktree_serial_lane,  # noqa: PLC0415
-        )
+        from orchestrator.merge_lane.liveness import enforce_persistent_worktree_serial_lane
 
         cfg = _make_config(tmp_path, persistent=True)
         result = enforce_persistent_worktree_serial_lane(cfg, merge_ahead_bound=4, num_hosts=4)
@@ -230,7 +227,7 @@ class TestEnforcePersistentWorktreeSerialLane:
 
     def test_reframe_bound4_num_hosts2_raises(self, tmp_path: Path):
         """knob ON + bound=4 + num_hosts=2 → per_host=ceil(4/2)=2 → raises."""
-        from orchestrator.merge_queue import (  # noqa: PLC0415
+        from orchestrator.merge_lane.liveness import (
             PersistentWorktreeConfigError,
             enforce_persistent_worktree_serial_lane,
         )
@@ -365,13 +362,13 @@ class TestPersistentWorktreeVerifyRouting:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)
-        worker_task = asyncio.create_task(worker.run())
-
-        await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=60)
-
-        await worker.stop()
-        await worker_task
+        async with running_merge_worker(worker):
+            await queue.put(req)
+            outcome = await wait_responsive(
+                req.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='warm-test merge outcome (knob ON, warm _merge-verify)',
+            )
 
         assert outcome.status == 'done', f'Expected done, got: {outcome}'
 
@@ -405,13 +402,13 @@ class TestPersistentWorktreeVerifyRouting:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)
-        worker_task = asyncio.create_task(worker.run())
-
-        await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=60)
-
-        await worker.stop()
-        await worker_task
+        async with running_merge_worker(worker):
+            await queue.put(req)
+            outcome = await wait_responsive(
+                req.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='cold-test merge outcome (knob OFF, ephemeral _merge-<uuid>)',
+            )
 
         assert outcome.status == 'done', f'Expected done, got: {outcome}'
 
@@ -529,13 +526,13 @@ class TestSafetyValveIntegration:
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         worker = SpeculativeMergeWorker(git_ops, queue, verifier=verifier)
-        worker_task = asyncio.create_task(worker.run())
-
-        await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=60)
-
-        await worker.stop()
-        await worker_task
+        async with running_merge_worker(worker):
+            await queue.put(req)
+            outcome = await wait_responsive(
+                req.result,
+                timeout=REAL_GIT_MERGE_RESULT_TIMEOUT,
+                label='valve-test merge outcome (safety_valve_every_n=1, ephemeral)',
+            )
 
         assert outcome.status == 'done', f'Expected done; got: {outcome}'
 

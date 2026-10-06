@@ -279,22 +279,33 @@ class ReviewAggregation:
         return bool(self.reviewer_errors) and not self.reviews
 
     def format_for_replan(self) -> str:
-        """Format blocking issues for the architect to address."""
-        lines = ['# Review Feedback — Blocking Issues\n']
-        for issue in self.blocking_issues:
-            reviewer = issue.get('reviewer', 'unknown')
-            location = issue.get('location', '')
-            category = issue.get('category', '')
-            description = issue.get('description', '')
-            fix = issue.get('suggested_fix', '')
-            lines.append(f'## [{reviewer}] {category}')
-            if location:
-                lines.append(f'**Location:** {location}')
-            lines.append(f'**Issue:** {description}')
-            if fix:
-                lines.append(f'**Suggested fix:** {fix}')
-            lines.append('')
-        return '\n'.join(lines)
+        """Blocking issues only — the architect's input (TaskWorkflow._replan)."""
+        return _format_issue_section('# Review Feedback — Blocking Issues\n', self.blocking_issues)
+
+    def format_for_escalation(self) -> str:
+        """Blocking issues then suggestions — the steward's review_issues detail (TaskWorkflow._escalate_review_issues)."""
+        text = self.format_for_replan()
+        if self.suggestions:
+            text += '\n' + _format_issue_section('# Review Feedback — Suggestions\n', self.suggestions)
+        return text
+
+
+def _format_issue_section(heading: str, issues: list[dict]) -> str:
+    lines = [heading]
+    for issue in issues:
+        reviewer = issue.get('reviewer', 'unknown')
+        location = issue.get('location', '')
+        category = issue.get('category', '')
+        description = issue.get('description', '')
+        fix = issue.get('suggested_fix', '')
+        lines.append(f'## [{reviewer}] {category}')
+        if location:
+            lines.append(f'**Location:** {location}')
+        lines.append(f'**Issue:** {description}')
+        if fix:
+            lines.append(f'**Suggested fix:** {fix}')
+        lines.append('')
+    return '\n'.join(lines)
 
 
 class TaskArtifacts:
@@ -379,16 +390,21 @@ class TaskArtifacts:
         """Read the created_at timestamp stored at init time.
 
         Mirrors ``read_base_commit``'s shape, but is exception-tolerant for a
-        corrupt/unreadable metadata.json (returns ``None`` instead of
-        raising) so a runtime "started" lookup never raises.
+        corrupt/unreadable or malformed metadata.json (returns ``None``
+        instead of raising) so a runtime "started" lookup never raises.
         """
         meta_path = self._read_path('metadata.json')
         if not meta_path.exists():
             return None
         try:
-            metadata = json.loads(meta_path.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
+            metadata = json.loads(meta_path.read_text(encoding='utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
             logger.warning('Corrupt metadata.json at %s: %s', meta_path, exc)
+            return None
+        if not isinstance(metadata, dict):
+            logger.warning(
+                'Malformed metadata.json at %s: not an object', meta_path
+            )
             return None
         return metadata.get('created_at')
 
@@ -628,9 +644,10 @@ class TaskArtifacts:
 
         Returns a fresh default state ``{'amendment_rounds_total': 0,
         'review_cycles_total': 0, 'verdicts': {}}`` when the file is absent,
-        and — mirroring ``read_created_at``'s fail-safe (:264-279) — logs a
-        warning and returns those same defaults on a corrupt/unreadable or
-        malformed file rather than raising.  A present-but-partial file is
+        and — in the same fail-safe spirit as ``read_created_at`` (:378-398),
+        though the two readers' exact exception coverage has since diverged —
+        logs a warning and returns those same defaults on a corrupt/unreadable
+        or malformed file rather than raising.  A present-but-partial file is
         merged over the defaults so all canonical keys are always exposed.
         """
         default = {

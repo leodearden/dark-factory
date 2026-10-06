@@ -10,12 +10,13 @@ import os
 import shutil
 import subprocess
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import NamedTuple
 from unittest.mock import patch
 
 import pytest
+from _git_fixtures import seed_repo
 from _orch_helpers import (
     NonIsolatedGitRepoError,
     assert_isolated_git_repo,
@@ -52,10 +53,7 @@ from orchestrator.git_ops import (
 @pytest.fixture
 def git_repo(tmp_path: Path) -> Path:
     """Create a temporary git repository with an initial commit."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_setup_repo(repo))
-    return repo
+    return seed_repo(tmp_path / 'repo')
 
 
 def _seed_default_warm_base(repo: Path) -> None:
@@ -80,15 +78,6 @@ def _seed_default_warm_base(repo: Path) -> None:
     default_base.mkdir(parents=True, exist_ok=True)
     (default_base / '.keep').write_text('warm base sentinel\n')
     (repo / '.worktrees' / '.pool-root').touch()
-
-
-async def _setup_repo(repo: Path):
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
 
 
 async def _inject_uu_state(cwd: Path, path: str, tag: str = '') -> None:
@@ -174,14 +163,7 @@ async def _setup_repo_with_remote(tmp_path: Path) -> tuple[Path, Path]:
     await _run(['git', 'init', '--bare', '-b', 'main'], cwd=origin)
 
     # Seed origin via a temp non-bare repo
-    seed = tmp_path / 'seed'
-    seed.mkdir()
-    await _run(['git', 'init', '-b', 'main'], cwd=seed)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=seed)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=seed)
-    (seed / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=seed)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=seed)
+    seed = seed_repo(tmp_path / 'seed')
     await _run(['git', 'remote', 'add', 'origin', str(origin)], cwd=seed)
     await _run(['git', 'push', 'origin', 'main'], cwd=seed)
 
@@ -2080,8 +2062,8 @@ class TestHasUncommittedWork:
     async def test_file_only_in_task_dir_returns_false(self, git_ops: GitOps):
         """Production's repo-root .gitignore carries a tracked `.task/`
         entry (independent of the since-removed `_ensure_task_gitignore`
-        nested gitignore) that every worktree inherits.  `_setup_repo`
-        builds a bare synthetic repo with no .gitignore at all, so commit
+        nested gitignore) that every worktree inherits.  The `git_repo` fixture
+        seeds a bare synthetic repo with no .gitignore at all, so commit
         one here first to exercise the same real-world condition
         `has_uncommitted_work` relies on.
         """
@@ -3419,7 +3401,13 @@ class TestAdvanceMainConflictMarkerGate:
         wt = await git_ops.create_worktree('task-dir-no-longer-blocks')
         lane = wt.path
 
-        # Force a `.task/` entry into the branch tree with RAW git.
+        # Force a `.task/` entry into the branch tree with RAW git.  Pin the
+        # repo's excludes file to an empty one first: without it `git add -A`
+        # honours the host user's global excludes (~/.config/git/ignore), and a
+        # host that ignores `.task/` there would silently skip the hostile add.
+        await _run(
+            ['git', 'config', 'core.excludesFile', '/dev/null'], cwd=lane,
+        )
         task_dir = lane / '.task'
         task_dir.mkdir(exist_ok=True)
         (task_dir / 'plan.json').write_text('{}')
@@ -3563,7 +3551,7 @@ class TestUnmergedDetection:
         # Sentinel standing in for the live task worktree that was corrupted.
         sentinel = tmp_path / 'live-worktree'
         sentinel.mkdir()
-        await _setup_repo(sentinel)
+        seed_repo(sentinel)
 
         # Stand-in for a pytest basetemp nested INSIDE that worktree.
         nested = sentinel / '.pytest-tmp' / 'test_x0'
@@ -4175,8 +4163,8 @@ class TestFindMergeMarker:
         """Substring safety: merging task/10 writes 'Merge task/10 into main'.
         find_merge_marker('task/1') must NOT match this commit.
 
-        The trailing ' into ' literal in the --fixed-strings --grep pattern
-        means 'Merge task/1 into ' is not a substring of 'Merge task/10 into main'.
+        A marker's subject must EQUAL 'Merge task/1 into main', which
+        'Merge task/10 into main' does not.
         """
         # Merge task/10 and delete branch
         tid = '10'
@@ -4234,7 +4222,7 @@ class TestFindMergeMarker:
         so a git-log invocation with conflicting --max-count=1 and -n 5000 flags would
         return both SHAs newline-joined (last-wins: -n 5000 overrides --max-count=1),
         corrupting done_provenance={'commit': marker_sha} in harness reconcile.
-        After dropping -n 5000, --max-count=1 alone ensures a single SHA is returned.
+        The newest marker must win, as a single SHA.
         """
         tid = 'reopened-1'
 
@@ -4283,7 +4271,7 @@ class TestFindMergeMarker:
         assert marker_sha is not None
         assert '\n' not in marker_sha   # anti-multiline regression
         assert len(marker_sha) == 40    # single-SHA shape
-        assert marker_sha == second_sha  # most-recent first (reverse chrono + --max-count=1)
+        assert marker_sha == second_sha  # most-recent first (git log is newest-first)
 
 
 @pytest.mark.asyncio
@@ -4312,23 +4300,6 @@ class TestMergeMarkerIndex:
 
         assert await git_ops.find_merge_marker('task/absent') is None
         assert await git_ops._scan_merge_marker('task/absent') is None
-
-    async def test_marker_in_commit_BODY_is_found(self, git_ops: GitOps):
-        """A marker in the body, not the subject, must still be found.
-
-        ``git log --grep`` matches anywhere in the commit message, so the index
-        reads ``%B`` rather than ``%s``.  Measured on dark-factory's own main:
-        19 of 62,950 commits carry a marker only in the body, so a subject-only
-        index would silently change those verdicts.
-        """
-        repo = git_ops.project_root
-        marker = _merge_subject('task/body-only', git_ops.config.main_branch)
-        message = f'chore: record a landing\n\n{marker}\n'
-        sha = await _seed_on_main(repo, {'body.txt': 'x\n'}, message)
-
-        assert await git_ops.find_merge_marker('task/body-only') == sha
-        # Equivalence with the path it replaced.
-        assert await git_ops._scan_merge_marker('task/body-only') == sha
 
     async def test_non_canonical_subject_stays_invisible(self, git_ops: GitOps):
         """A hand-written ``Merge task/x: ...`` subject is not a marker.
@@ -4444,6 +4415,97 @@ class TestMergeMarkerIndex:
 
         assert match is not None
         assert match.group(1) == 'task/derived'
+
+
+async def _quote_marker_in_body(repo: Path, marker: str) -> None:
+    await _seed_on_main(
+        repo, {'notes.md': 'x\n'},
+        f'docs: explain markers\n\nQuoting {marker} verbatim.\n',
+    )
+
+
+async def _body_quote_only(repo: Path, task_id: str, marker: str) -> str | None:
+    """Task 4104 shape: e79f9b1094 quotes a marker in prose; nothing landed."""
+    await _quote_marker_in_body(repo, marker)
+    return None
+
+
+async def _body_quote_newer_than_true_merge(
+    repo: Path, task_id: str, marker: str,
+) -> str | None:
+    """Task 4181 shape: d0d67f0c53 quotes the marker after the real merge landed."""
+    merge = await _land_branch(repo, task_id, {'landed.txt': 'x\n'})
+    await _quote_marker_in_body(repo, marker)
+    return merge
+
+
+async def _revert_of_true_merge(repo: Path, task_id: str, marker: str) -> str | None:
+    """Task 5668 shape: 3e7d55ce47 'Revert "<marker>"' contains the marker."""
+    assert_isolated_git_repo(repo)
+    merge = await _land_branch(repo, task_id, {'landed.txt': 'x\n'})
+    rc, _, err = await _run(
+        ['git', 'revert', '--no-edit', '-m', '1', merge], cwd=repo,
+    )
+    assert rc == 0, f'revert failed: {err}'
+    return merge
+
+
+async def _suffixed_subject(repo: Path, task_id: str, marker: str) -> str | None:
+    """ce78ad8546 shape: '<marker>: extra words' is a longer subject."""
+    await _seed_on_main(repo, {'suffixed.txt': 'x\n'}, f'{marker}: extra words')
+    return None
+
+
+async def _single_parent_exact_subject(
+    repo: Path, task_id: str, marker: str,
+) -> str | None:
+    """task/176 shape: ba1bba2611 is a real marker with a single parent."""
+    return await _seed_on_main(repo, {'single.txt': 'x\n'}, marker)
+
+
+async def _wrapped_first_paragraph(repo: Path, task_id: str, marker: str) -> str | None:
+    """git's %s joins a wrapped first paragraph back into the marker."""
+    wrapped = marker.replace(' into ', '\ninto ', 1)
+    return await _seed_on_main(repo, {'wrapped.txt': 'x\n'}, wrapped)
+
+
+@pytest.mark.asyncio
+class TestMergeMarkerIsExactSubject:
+    """A marker is a commit whose git subject (``%s``) equals
+    ``_merge_subject(branch, main_branch)``; the body and the parent count are
+    never consulted (task 5765).
+    """
+
+    @pytest.mark.parametrize(
+        'build',
+        [
+            pytest.param(_body_quote_only, id='body_quote_only'),
+            pytest.param(
+                _body_quote_newer_than_true_merge,
+                id='body_quote_newer_than_true_merge',
+            ),
+            pytest.param(_revert_of_true_merge, id='revert_of_true_merge'),
+            pytest.param(_suffixed_subject, id='suffixed_subject'),
+            pytest.param(
+                _single_parent_exact_subject, id='single_parent_exact_subject',
+            ),
+            pytest.param(_wrapped_first_paragraph, id='wrapped_first_paragraph'),
+        ],
+    )
+    async def test_marker_is_the_commit_whose_subject_is_exactly_the_merge_subject(
+        self,
+        git_ops: GitOps,
+        build: Callable[[Path, str, str], Awaitable[str | None]],
+    ):
+        repo = git_ops.project_root
+        task_id = '5765'
+        branch = f'task/{task_id}'
+        marker = _merge_subject(branch, git_ops.config.main_branch)
+
+        expected = await build(repo, task_id, marker)
+
+        assert await git_ops.find_merge_marker(branch, gate_on_existing_ref=False) == expected
+        assert await git_ops._scan_merge_marker(branch) == expected
 
 
 @pytest.mark.asyncio
@@ -6792,13 +6854,10 @@ async def _assert_child_reaped(
 # had to do both jobs at once and was tuned down to 0/40 misses on one box
 # rather than eliminated (task 4109).
 #
-# One narrow parent-side window is covered probabilistically rather than by
-# construction: the child's pid can land on disk while _run's own coroutine
-# is still inside create_subprocess_exec's pipe/transport setup rather than
-# the try block that owns kill+reap. That window is covered by
-# _wait_for_child_pid's 0.1s poll interval giving the parent time to reach
-# the owning await point before cancellation lands, not eliminated
-# structurally.
+# A cancel landing while _run is still inside create_subprocess_exec's
+# post-fork setup is closed structurally (task 6346):
+# shared/src/shared/git_async.py::_spawn_session_leader shields the spawn and
+# kills what it forked.
 _CANCEL_TIMEOUT = 0.05
 
 
@@ -10015,7 +10074,7 @@ class TestRecoverRedMain:
             git_repo,
         )
         target_sha, expected_main = await self._two_main_shas(git_repo)
-        # git_repo starts on main (git init -b main in _setup_repo)
+        # git_repo starts on main (git init -b main in _git_fixtures.py::build_repo)
 
         original_run = _run
         recorded: list[list[str]] = []
@@ -10175,7 +10234,7 @@ class TestWarmLaneScriptsHelperIsolation:
     async def test_cannot_commit_into_an_enclosing_repo(self, tmp_path: Path):
         sentinel = tmp_path / 'live-worktree'
         sentinel.mkdir()
-        await _setup_repo(sentinel)
+        seed_repo(sentinel)
 
         # Stand-in for a pytest basetemp nested inside that live worktree.
         nested = sentinel / '.pytest-tmp' / 'test_x0'
@@ -13938,7 +13997,7 @@ class TestDisableSharedRepoAutoMaintenance:
         self, git_ops: GitOps,
     ):
         """Both keys are set repo-locally, and a second call is a no-op-in-effect
-        (git config overwrites in place → naturally idempotent)."""
+        (it leaves identical values)."""
         await git_ops.disable_shared_repo_auto_maintenance()
 
         rc_gc, gc_val, _ = await _run(
@@ -13952,7 +14011,7 @@ class TestDisableSharedRepoAutoMaintenance:
         assert rc_mt == 0
         assert mt_val.strip() == 'false'
 
-        # Idempotency: a second call overwrites in place, leaving identical values.
+        # Idempotency: a second call leaves identical values.
         await git_ops.disable_shared_repo_auto_maintenance()
         rc_gc2, gc_val2, _ = await _run(
             ['git', 'config', '--get', 'gc.auto'], cwd=git_ops.project_root,
@@ -13964,6 +14023,31 @@ class TestDisableSharedRepoAutoMaintenance:
         assert gc_val2.strip() == '0'
         assert rc_mt2 == 0
         assert mt_val2.strip() == 'false'
+
+    @pytest.mark.parametrize(
+        ('key', 'value', 'stale'),
+        [('gc.auto', '0', '1'), ('maintenance.auto', 'false', 'true')],
+    )
+    async def test_disable_shared_repo_auto_maintenance_converges_duplicated_key(
+        self, git_ops: GitOps, key: str, value: str, stale: str,
+    ):
+        """A key already holding multiple values (manual ``git config --add``)
+        is converged to exactly one value; a plain ``git config`` would be
+        refused with exit 5 and leave it duplicated."""
+        cwd = git_ops.project_root
+        rc_set, _, _ = await _run(['git', 'config', key, stale], cwd=cwd)
+        rc_add, _, _ = await _run(['git', 'config', '--add', key, value], cwd=cwd)
+        assert rc_set == 0
+        assert rc_add == 0
+        rc_pre, out_pre, _ = await _run(['git', 'config', '--get-all', key], cwd=cwd)
+        assert rc_pre == 0
+        assert out_pre.splitlines() == [stale, value]
+
+        await git_ops.disable_shared_repo_auto_maintenance()
+
+        rc, out, _ = await _run(['git', 'config', '--get-all', key], cwd=cwd)
+        assert rc == 0
+        assert out.splitlines() == [value]
 
     async def test_disable_shared_repo_auto_maintenance_degrades_loudly_on_rc(
         self, git_ops: GitOps, caplog,
@@ -14133,6 +14217,7 @@ class TestRunDelegatesToSharedGitAsync:
         spawned: list[str] = []
 
         class _Blocking:
+            pid = -1
             returncode = 0
 
             def __init__(self, tag: str) -> None:

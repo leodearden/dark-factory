@@ -59,6 +59,19 @@ For each capability, optionally bind a `delivered_check` — the dispatch-time-c
 
 The sidecar's `task_id` fields stay `null` (Greek labels only) until it is stamped — see the post-`commit_planning` step after Step 5.
 
+**A block whose producer lives in another project's registry sets `external_task_id` instead.** When a PRD's decomposition assigns a leaf to a task you are filing in a *different* project — a reify-side deploy step, say — that block's producer will never appear in this project's task store, so a stamped integer would read forever as a stale binding and a `null` would be indistinguishable from un-authored. Write the same canonical qualified `"project_id:task_id"` form used for cross-project `depends_on` (Step 3 → **Cross-project dependencies**, below):
+
+```yaml
+- label: η
+  external_task_id: reify:5613      # NOT task_id — the producer is reify's
+  title: Repoint the reify warm-lane GC systemd unit at dark-factory's sweep
+  capabilities: [...]               # authored exactly as any other block's
+```
+
+The two fields are **mutually exclusive** — a block naming both fails to load with a `ValidationError`, because it would be claiming two different producers in two different registries. `commit_planning` never stamps such a block (its write-back only touches labels present in the batch being committed, and a foreign producer is by construction not in one). Its `delivered_check`s are therefore deliberately **not evaluated by this project's dispatch gate**, which `docs/task-authoring.md` §3.3 already scopes to *local* (same-project) dependencies — record them anyway when the foreign project's own verify should assert them; they are the record of what that gate ought to check. `audit_manifest_descriptor_drift.py` counts these blocks in their own `external-registry task blocks:` coverage row, separate from the stale-binding row, so an operator is never told to re-stamp or retire a block that is correct as authored.
+
+Two details the model and the audit enforce, so you do not have to remember them. The value is **normalised to its canonical spelling on load** (`ExternalDep.render()`), so `" reify:5613 "` is accepted but stored as `"reify:5613"` — the stored string always joins against a task's `metadata.external_deps` entry. And the `project_id` half must name **another** project: a block spelling the *audited* project's own id validates structurally but is a mis-authored binding — it would excuse a LOCAL producer's block from drift comparison — so the audit counts it in a separate `self-bound external blocks:` row and names the manifest, label and value in the coverage details. A local producer belongs in `task_id`.
+
 ### Step 3 — File tasks (ALWAYS planning_mode=True; synchronous, curator-bypassing)
 
 PRD-decomposition batches are the canonical use case for `planning_mode=True`. **Every task in the batch is filed with `planning_mode=True`, no exceptions.** This lands them as `deferred` so the scheduler picks nothing up before the wiring is complete and the batch is flipped together in Step 5.
@@ -101,6 +114,8 @@ Modules touched: <list>
 )
 task_id = result["task_id"]   # status == "deferred", planning_mode == True
 ```
+
+Only a task in the PRD's decomposition plan carries a `prd_task_label`, and it is that plan's own label, verbatim; a task filed against the PRD from outside the plan (an out-of-batch dependent, a later follow-up) keeps `prd_path` and sets no `prd_task_label` — never an invented one — because Step 5.5 binds only labels the sidecar declares.
 
 If `submit_task` itself times out (no `task_id` returned), **don't retry**; poll `get_task` (by title, or by IDs above your last known one) to see whether the write landed asynchronously. Re-submitting on timeout risks double-filing — the curator-dedupe path is not active in planning_mode.
 

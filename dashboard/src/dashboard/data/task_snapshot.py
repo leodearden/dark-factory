@@ -29,11 +29,10 @@ different clocks: the TTL is 15 s, the last good is held for
 :data:`_RETENTION_BOUND_SECONDS`.
 
 A FULLY-STALE UNIT IS ITSELF CACHED for the TTL (``cache_ok`` is left at its
-always-true default). That is what replaces ``_FETCH_TASKS_NEGATIVE_TTL_SECONDS``'
-retry suppression on this path, and it is strictly longer: a wedged root costs
-one attempt per 15 s instead of one per 3 s browser poll. The price is up to
-15 s of recovery latency — a recovered root is noticed on the next refresh,
-not on the next poll — and that is deliberate.
+always-true default). That is the only retry suppression on this path: a wedged
+root costs one attempt per 15 s instead of one per 3 s browser poll. The price
+is up to 15 s of recovery latency — a recovered root is noticed on the next
+refresh, not on the next poll — and that is deliberate.
 """
 
 from __future__ import annotations
@@ -58,7 +57,7 @@ from dashboard.data.census import (
     TaskView,
     build_census,
 )
-from dashboard.data.datum import Datum, DatumState, validate_datum
+from dashboard.data.datum import Datum, DatumState, aged_at, unknown_datum, validate_datum
 from dashboard.data.mcp_fanout import TTLCache
 from dashboard.data.tasks import (
     fetch_statuses,
@@ -130,7 +129,7 @@ lands, narrowing the STATUSES does not narrow the WORK.
 WHY THIS IS TASKS-TAB-LOCAL rather than a bump of the shared
 ``tasks.DEFAULT_PER_CALL_TIMEOUT``: that constant feeds
 ``tasks.DEFAULT_WHOLE_OPERATION_BUDGET``, which
-``merge_queue._TASK_TITLES_BUDGET`` and ``escalations._TASK_CARDS_BUDGET``
+``task_lookup.LOOKUP_BUDGET_SECONDS`` and ``escalations._TASK_CARDS_BUDGET``
 both bind BY REFERENCE (task 4788). Raising the shared default to fix the
 Tasks tab would silently widen unrelated route budgets, neither of which
 fetches a 5 000-task tree. ``test_tasks_budget.py`` assertion (e) pins both
@@ -140,9 +139,8 @@ halves.
 SNAPSHOT_TTL_SECONDS = 15.0
 """How long one acquired unit is served before both halves are re-read.
 
-THE ONLY TTL ON THIS PATH. The 5 s ``fetch_statuses`` cache was removed and
-the row read passes ``cached=False``, so nothing underneath holds a value that
-could be older than the ``as_of`` this unit stamps on it.
+THE ONLY TTL ON THIS PATH. Nothing beneath the unit caches, so no read
+underneath can return a value older than the ``as_of`` this unit stamps on it.
 
 15 s sits inside the PRD's 15-30 s staleness window for a monitoring view, and
 is five times ``data.js``'s 3 s poll, so a browser polling two endpoints that
@@ -210,20 +208,29 @@ class TaskSnapshot:
 
     Attributes:
         census: Every status's population, as a ``Datum``.
-        rows: The project's ACTIVE rows, as a ``Datum``, in one of two shapes
-            depending on which unit holds it. The unit :func:`acquire_snapshot`
-            returns and caches holds the RAW MCP rows. The unit
-            ``active_tasks.collect_tasks_with_counts`` returns holds the shaped
-            ``TaskRow`` list, the same row dicts as ``ACTIVE_TASKS``, and that
-            one crosses the wire. The two cannot be one list. Shaping reads the
-            integer ids, ``dependencies`` and ``metadata`` that only a raw row
-            carries, so the cache must keep raw rows for the next render to
-            shape. And a render's shaped rows belong to that render: they are
-            joined to its runtime probe and its clock, and its external-dep
-            tail overwrites them in place, so a cache shared across renders
-            must never hold them. Raw rows on the wire would ship the whole
-            ``metadata`` blob a second time beside ``ACTIVE_TASKS`` and break
-            the PRD's ``Datum[list[TaskRow]]`` contract.
+        rows: The project's ACTIVE rows, as a ``Datum``, in one of three
+            shapes depending on which unit holds it:
+
+            * RAW — the unit :func:`acquire_snapshot` returns and caches holds
+              the raw MCP rows;
+            * SHAPED — the unit ``active_tasks.collect_tasks_with_counts``
+              returns holds the shaped ``TaskRow`` list, and that one crosses
+              the wire on the full render;
+            * WITHHELD — the unit ``active_tasks.collect_census_snapshots``
+              returns holds no rows at all: :func:`withhold_rows` replaced a
+              measured half with an ``unknown`` ``Datum`` naming the census
+              projection.
+
+            Raw and shaped cannot be one list. Shaping reads the integer ids,
+            ``dependencies`` and ``metadata`` that only a raw row carries, so
+            the cache must keep raw rows for the next render to shape. And a
+            render's shaped rows belong to that render: they are joined to its
+            runtime probe and its clock, and its external-dep tail overwrites
+            them in place, so a cache shared across renders must never hold
+            them. Raw rows on the wire would ship the whole ``metadata`` blob
+            and break the PRD's ``Datum[list[TaskRow]]`` contract, which is
+            why neither wire-bound collector ever returns the cached unit
+            as-is.
         in_progress_live: In-progress rows with a live claimant, or ``None``
             when the rows were never measured — never a fabricated zero.
         in_progress_stranded: The complement of the above, by the same
@@ -262,7 +269,7 @@ class TaskSnapshot:
 # One unit per project root. ``TTLCache`` rather than a hand-rolled lock: it
 # carries the per-key single-flight that keeps two concurrent endpoint polls
 # from each issuing their own pair of reads, the bounded lock bypass, and the
-# ``_evict_expired`` reclamation that eight other call sites already depend on.
+# ``_evict_expired`` reclamation that every other call site already depends on.
 # The key space — project-root strings — is small and bounded.
 _snapshot_cache: TTLCache[TaskSnapshot, str] = TTLCache(
     ttl_seconds=lambda: SNAPSHOT_TTL_SECONDS
@@ -375,16 +382,13 @@ def _datum(
     reason = half.reason or 'read failed'
     previous = _last_good.get(project_root, {}).get(name)
     if previous is None:
-        return Datum(
-            None, None, DatumState.UNKNOWN, reason, FRESHNESS_BOUND_SECONDS,
-        )
+        return unknown_datum(reason, FRESHNESS_BOUND_SECONDS)
     age = (now - previous.as_of).total_seconds()
     if age > _RETENTION_BOUND_SECONDS:
         # Past the bound a last good stops being evidence about the present.
         # Serving it would put a day-old census behind a stale badge that
         # reads the same as a twenty-second-old one.
-        return Datum(
-            None, None, DatumState.UNKNOWN,
+        return unknown_datum(
             f'{reason} (last good is {int(age)}s old, past the '
             f'{_RETENTION_BOUND_SECONDS}s retention bound)',
             FRESHNESS_BOUND_SECONDS,
@@ -514,11 +518,6 @@ async def _read_unit(
                 client, config, project_root,
                 statuses=sorted(ACTIVE),
                 timeout=PER_CALL_TIMEOUT,
-                # UNCACHED, deliberately. ``_fetch_tasks_cache`` would serve
-                # rows up to 20 s old under an ``as_of`` this unit stamps at
-                # the present instant — the envelope's one unforgivable lie.
-                # The unit's own TTL is what bounds the read cost instead.
-                cached=False,
             ),
             label='active rows',
         ),
@@ -566,9 +565,43 @@ def unmeasured_snapshot(
     so its last good is still honest evidence.
     """
     return _assemble(
-        Datum(None, None, DatumState.UNKNOWN, reason, FRESHNESS_BOUND_SECONDS),
+        unknown_datum(reason, FRESHNESS_BOUND_SECONDS),
         _HalfRead(None, failure, reason),
         failure=failure, now=now, project_root=str(project_root),
+    )
+
+
+ROWS_WITHHELD_REASON = (
+    'rows not requested: this poll asked /tasks for the census only '
+    '(?projection=census)'
+)
+"""Why a census-projection unit carries no rows, shown verbatim in a rows tab.
+
+A rows tab opened while the browser is still polling the census reads this
+as its hole placeholder's title until its own full fetch lands.
+"""
+
+
+def withhold_rows(snapshot: TaskSnapshot) -> TaskSnapshot:
+    """*snapshot* with a MEASURED rows half replaced by an ``unknown`` ``Datum``.
+
+    The ``?projection=census`` render's one transformation of a unit. The rows
+    are withheld rather than omitted so the wire keeps the five-key shape and a
+    consumer is told WHY there are none. Fresh and stale rows alike are
+    withheld: both are measured values the projection chose not to ship.
+
+    A rows half that was never measured is returned unchanged. Its reason is
+    already the producer's verbatim failure, and overwriting it with "not
+    requested" would hide a real outage behind a choice nobody made.
+
+    The census, the live/stranded split, the skew and the failure kind are
+    untouched, so every banner routed from this unit routes exactly as the
+    full render's does.
+    """
+    if snapshot.rows.value is None:
+        return snapshot
+    return replace(
+        snapshot, rows=unknown_datum(ROWS_WITHHELD_REASON, FRESHNESS_BOUND_SECONDS),
     )
 
 
@@ -614,23 +647,6 @@ def classify(snapshot: TaskSnapshot) -> SnapshotHealth:
     return SnapshotHealth.OK
 
 
-def _aged(datum: Datum[T], served_at: datetime) -> Datum[T]:
-    """*datum* as it reads at *served_at*: ``stale`` once past its freshness bound."""
-    if datum.state is not DatumState.FRESH or datum.as_of is None:
-        return datum
-    age = (served_at - datum.as_of).total_seconds()
-    if age <= datum.freshness_bound_seconds:
-        return datum
-    return replace(
-        datum,
-        state=DatumState.STALE,
-        reason=(
-            f'measured {int(age)}s before it was served, past the '
-            f'{datum.freshness_bound_seconds}s freshness bound'
-        ),
-    )
-
-
 def as_served(snapshot: TaskSnapshot, served_at: datetime) -> TaskSnapshot:
     """*snapshot* re-read at the instant a payload carrying it is served.
 
@@ -644,8 +660,8 @@ def as_served(snapshot: TaskSnapshot, served_at: datetime) -> TaskSnapshot:
     """
     return replace(
         snapshot,
-        census=_aged(snapshot.census, served_at),
-        rows=_aged(snapshot.rows, served_at),
+        census=aged_at(snapshot.census, served_at),
+        rows=aged_at(snapshot.rows, served_at),
     )
 
 
@@ -752,8 +768,7 @@ async def acquire_terminal_window(
     completing between the two shifts the window by a row.
     """
     if terminal_total is None:
-        return Datum(
-            None, None, DatumState.UNKNOWN,
+        return unknown_datum(
             'the terminal window cannot be positioned without a measured '
             'terminal count, and an unpositioned window serves the OLDEST '
             'rows rather than the newest',
@@ -782,10 +797,7 @@ async def acquire_terminal_window(
         label='terminal window',
     )
     if half.value is None:
-        return Datum(
-            None, None, DatumState.UNKNOWN, half.reason or 'read failed',
-            FRESHNESS_BOUND_SECONDS,
-        )
+        return unknown_datum(half.reason or 'read failed', FRESHNESS_BOUND_SECONDS)
     return Datum(
         half.value, now, DatumState.LOWER_BOUND,
         (

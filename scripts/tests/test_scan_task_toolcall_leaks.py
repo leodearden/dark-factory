@@ -1,6 +1,6 @@
 """Tests for scripts/scan_task_toolcall_leaks.py — the READ-ONLY,
 detection-only sweep for leaked serialized tool-call XML fragments (e.g.
-``</description>\\n<parameter name="priority">low``) in Taskmaster task text
+``\x3c/description>\\n\x3cparameter name="priority">low``) in Taskmaster task text
 columns.
 
 Task 2939: builds the proactive sweep after the pattern recurred on ~32 live
@@ -21,11 +21,11 @@ false-positive prose mentions (tasks 2938/2939) — not invented shapes.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 
+from cli_subprocess_timeout import cli_timeout_from_env
 from scan_task_toolcall_leaks import (
     LeakMatch,
     detect_leak,
@@ -41,36 +41,36 @@ from scan_task_toolcall_leaks import (
 
 # ---------------------------------------------------------------------------
 # Genuine-leak fixtures: a stray closing tag, a REAL newline, then one or more
-# serialized <parameter name="..."> fragments running to end-of-string.
+# serialized \x3cparameter name="..."> fragments running to end-of-string.
 # ---------------------------------------------------------------------------
 
 # Shape (a) — task 992: a description leak ending in a bare priority param.
-GENUINE_DESCRIPTION_LEAK_FRAGMENT = '</description>\n<parameter name="priority">low'
+GENUINE_DESCRIPTION_LEAK_FRAGMENT = '\x3c/description>\n\x3cparameter name="priority">low'
 GENUINE_DESCRIPTION_LEAK = (
     "Add a new test that writes >limit records and asserts only the newest "
     "`limit` are materialised."
 ) + GENUINE_DESCRIPTION_LEAK_FRAGMENT
 
 # Shape (b) — task 1068: a chained leak where the stray tag is itself
-# </parameter> rather than </description>.
-CHAINED_PARAMETER_LEAK_FRAGMENT = '</parameter>\n<parameter name="priority">high'
+# \x3c/parameter> rather than \x3c/description>.
+CHAINED_PARAMETER_LEAK_FRAGMENT = '\x3c/parameter>\n\x3cparameter name="priority">high'
 CHAINED_PARAMETER_LEAK = (
     "Root cause is documented in a code comment; a regression test exercises "
     "the orphaned-commit path."
 ) + CHAINED_PARAMETER_LEAK_FRAGMENT
 
-# Shape (c) — task 1067: the leak lands in `details` (closing tag </details>).
-DETAILS_LEAK_FRAGMENT = '</details>\n<parameter name="priority">polish'
+# Shape (c) — task 1067: the leak lands in `details` (closing tag \x3c/details>).
+DETAILS_LEAK_FRAGMENT = '\x3c/details>\n\x3cparameter name="priority">polish'
 DETAILS_LEAK_TEXT = (
     "Verify with `pytest fused-memory/tests/test_bulk_reset_guard.py -q`."
 ) + DETAILS_LEAK_FRAGMENT
 
 # Shape (d) — task 2691: the "swallowed-details" variant, where an entire
-# serialized <parameter name="details">...</parameter> tool-call payload
+# serialized \x3cparameter name="details">...\x3c/parameter> tool-call payload
 # leaked into `description` and runs all the way to end-of-string, while the
 # real `details` column is left empty.
 SWALLOWED_DETAILS_FRAGMENT = (
-    '</description>\n<parameter name="details">Run fused-memory/scripts/'
+    '\x3c/description>\n\x3cparameter name="details">Run fused-memory/scripts/'
     "audit_duplicate_memories.py or a direct Qdrant admin query against "
     "memory_id=028edb1f-299c-4755-9438-deadbeefcafe (null category, "
     "unretrievable content matching the fingerprint) to confirm-safe the "
@@ -91,26 +91,26 @@ SWALLOWED_DETAILS_LEAK = (
 
 PROSE_MENTION_FALSE_POSITIVE = (
     "Stage 1 found that task 2865's description had a leaked plain-text "
-    'tool-call/XML fragment appended: `</description>\\n<parameter '
+    'tool-call/XML fragment appended: `\x3c/description>\\n\x3cparameter '
     'name="priority">low`. Stage 2 (this run) verified the fragment '
     "verbatim via live get_task and stripped it from the description via "
     "update_task."
 )
 
 BARE_PARAMETER_MENTION = (
-    'The bug report mentions <parameter name="priority"> appearing in raw '
+    'The bug report mentions \x3cparameter name="priority"> appearing in raw '
     "form somewhere upstream, but this description itself is clean."
 )
 
 CLEAN_TEXT = "This is a perfectly normal task description with no XML leakage at all."
 
 # Zero-whitespace adjacency: a closing tag immediately followed by
-# `<parameter name=...>` with no real whitespace character in between. No
+# `\x3cparameter name=...>` with no real whitespace character in between. No
 # live leak has ever been observed in this shape (the recon serialization
 # bug always emits a real newline — see the module docstring); LEAK_TAIL
 # requires `\s+` (one or more real whitespace chars), so this must NOT match.
 ZERO_WHITESPACE_ADJACENT_TAG = (
-    'Some clean lead-in text.</description><parameter name="priority">low'
+    'Some clean lead-in text.\x3c/description>\x3cparameter name="priority">low'
 )
 
 
@@ -269,7 +269,7 @@ def test_format_report_summary_counts_distinct_tasks_not_fragments():
 
 
 def test_format_report_truncates_long_fragment():
-    long_fragment = '</description>\n<parameter name="details">' + "x" * 500
+    long_fragment = '\x3c/description>\n\x3cparameter name="details">' + "x" * 500
     matches = [LeakMatch("/a/tasks.db", "master", 1, "description", long_fragment)]
 
     report = format_report(matches)
@@ -303,49 +303,12 @@ def test_format_json_empty_list_is_empty_array():
 # ---------------------------------------------------------------------------
 # CLI (main), driven via subprocess.run — mirrors test_recon_busy_check.py
 #
-# test_recon_busy_check.py now carries the same defensive-timeout pattern
-# under its own RECON_BUSY_CHECK_TEST_TIMEOUT env var (task 4515), so the two
-# harnesses no longer diverge on this point.
+# The budget comes from cli_subprocess_timeout.py, shared with
+# test_recon_busy_check.py and test_drain_check.py.
 # ---------------------------------------------------------------------------
 
 SCRIPT = Path(__file__).parent.parent / "scan_task_toolcall_leaks.py"
-
-
-def _cli_timeout_from_env(default: float = 60.0) -> float:
-    """Resolve the default wall-clock budget (seconds) for a CLI subprocess.
-
-    10s was tight enough to flake under machine load (task 4217): concurrent
-    orchestrator agents can push interpreter startup + imports past 10s even
-    though the CLI under test behaves correctly (returncode/stderr already
-    correct at the moment the old budget expired). 60s gives real headroom
-    without materially slowing an idle-machine run.
-
-    SCAN_TASK_TOOLCALL_LEAKS_TEST_TIMEOUT overrides the default for further
-    tuning without a code change. An unset or blank value (e.g. a CI template
-    that always exports the var) is treated as "not overridden" rather than
-    an error — otherwise this escape hatch would itself fail the *entire*
-    module's collection, including the pure-unit tests here that never spawn
-    a subprocess. A present-but-malformed value (non-numeric or non-positive)
-    still fails loudly, naming the offending value, rather than silently
-    falling back and masking a typo'd override.
-    """
-    raw = os.environ.get("SCAN_TASK_TOOLCALL_LEAKS_TEST_TIMEOUT", "").strip()
-    if not raw:
-        return default
-    error = ValueError(
-        "SCAN_TASK_TOOLCALL_LEAKS_TEST_TIMEOUT must be a positive number of "
-        f"seconds; got {raw!r}"
-    )
-    try:
-        value = float(raw)
-    except ValueError:
-        raise error from None
-    if value <= 0:
-        raise error
-    return value
-
-
-_CLI_TIMEOUT = _cli_timeout_from_env()
+_CLI_TIMEOUT = cli_timeout_from_env("SCAN_TASK_TOOLCALL_LEAKS_TEST_TIMEOUT")
 
 
 def _run_cli(*args, timeout=_CLI_TIMEOUT):
@@ -355,6 +318,29 @@ def _run_cli(*args, timeout=_CLI_TIMEOUT):
         text=True,
         timeout=timeout,
     )
+
+
+def test_run_cli_passes_resolved_timeout_to_subprocess_run(monkeypatch):
+    captured = {}
+    captured_args = []
+
+    def spy(*args, **kwargs):
+        captured_args.append(args[0])
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(args=args, returncode=2, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    _run_cli("--db", "/nonexistent.db")
+    # No bound on the magnitude: the 60.0 default is pinned in
+    # test_cli_subprocess_timeout.py, and a bound here would break
+    # SCAN_TASK_TOOLCALL_LEAKS_TEST_TIMEOUT whenever it lowers the budget.
+    assert captured["timeout"] == _CLI_TIMEOUT
+    # The script imports `shared` (and its third-party deps), so it needs the
+    # project interpreter, unlike its stdlib-only siblings run as python3.
+    assert captured_args[0][0] == sys.executable
+
+    _run_cli("--db", "/nonexistent.db", timeout=3)
+    assert captured["timeout"] == 3
 
 
 def test_cli_leaky_db_exits_1_with_task_id_in_stdout_and_does_not_mutate(make_tasks_db):
@@ -475,7 +461,7 @@ class TestGeneralizedShapesAreReportedByScanDb:
     generalizations must be visible through this script too."""
 
     def test_closing_content_tag_leak_is_reported(self, make_tasks_db):
-        fragment = _CLOSE_CONTENT + '\n<parameter name="priority">high'
+        fragment = _CLOSE_CONTENT + '\n\x3cparameter name="priority">high'
         db_path = make_tasks_db([{"id": 3083, "description": "Body prose." + fragment}])
 
         matches = scan_db(str(db_path))

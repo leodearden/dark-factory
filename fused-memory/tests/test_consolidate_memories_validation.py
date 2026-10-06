@@ -406,6 +406,30 @@ class TestProposalArm:
 
         assert err is None, err
 
+    @pytest.mark.parametrize(
+        'content', [_CONTENT, '', '   '], ids=['text', 'empty', 'whitespace']
+    )
+    def test_canonical_content_passed_with_limits_is_refused_by_name(self, content):
+        """Fails CLOSED on a caller that believes it is submitting the op shape:
+        a silently dropped canonical text is the mirror of the silently dropped
+        claim the op arm already refuses. The boundary is `is not None`, so a
+        blank string is refused too rather than dropped."""
+        err, _, _ = _propose(canonical_content=content)
+
+        assert err is not None
+        assert err['error_type'] == 'ValidationError'
+        assert 'canonical_content' in err['error']
+        assert 'limits' in err['error']
+
+    def test_canonical_content_refusal_is_collected_not_short_circuited(self):
+        """Refusing the stray text must not cost the caller the claim checks:
+        one round trip names every problem, on this branch as on every other."""
+        err, _, _ = _propose(canonical_content=_CONTENT, claim=_SHORT)
+
+        assert err is not None
+        assert 'canonical_content' in err['error']
+        assert '8-word minimum' in err['error']
+
     def test_a_missing_claim_is_refused(self):
         err, _, _ = _propose(claim=None)
 

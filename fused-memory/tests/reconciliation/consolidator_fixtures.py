@@ -1,15 +1,11 @@
 """Shared ``MemoryConsolidator`` construction fixtures for ``tests/reconciliation/``.
 
-Two suites need the same mock-backed ``MemoryConsolidator``, for deliberately
-different reasons:
+Several suites need the same mock-backed ``MemoryConsolidator``, among them
+behavioural payload/section rendering tests and the structural builder-parity
+guard (task 4708), which needs a real instance only to drive
+``_render_required_sections()``.
 
-1. ``test_stage1.py`` — behavioural payload/section RENDERING tests, the
-   factory's original home and still its heaviest consumer.
-2. ``test_stage1_payload_section_parity.py`` — the structural builder-parity
-   guard (task 4708), which needs a real instance only to drive
-   ``_render_required_sections()``.
-
-WHY A MODULE RATHER THAN A CROSS-SUITE IMPORT. The guard used to obtain the
+WHY A MODULE RATHER THAN A CROSS-SUITE IMPORT. The parity guard used to obtain the
 factory with ``from reconciliation.test_stage1 import _make_consolidator``. That
 imported a ~2700-line test module and its entire import graph to get one
 callable, and bound the guard to a LEADING-UNDERSCORE private symbol whose
@@ -19,8 +15,8 @@ problems are properties of reaching into a test module for a helper, not of the
 helper itself, so the helper moved out.
 
 WHY NOT A CONFTEST FIXTURE. These are plain callables taking arguments
-(``make_consolidator(project_root=...)``), invoked ~90 times across the two
-suites with several different roots and often more than once in a single test.
+(``make_consolidator(project_root=...)``), invoked many times across their
+importers with several different roots and often more than once in a single test.
 A pytest fixture would have to be a factory fixture to serve that, which is
 strictly more machinery for the same result, and would additionally be
 unavailable at module import time — which the parity guard's collection-time
@@ -59,8 +55,14 @@ def make_scope(project_id: str, project_root: str) -> ProjectScope:
     return ProjectScope(ProjectId(project_id), ProjectRoot(project_root))
 
 
-def make_consolidator(project_root: str = '/tmp/test') -> MemoryConsolidator:
+def make_consolidator(
+    project_root: str = '/tmp/test',
+    recon_report_port: int | None = None,
+) -> MemoryConsolidator:
     """Build a MemoryConsolidator with mocked deps — mirrors test_stages.py ~L1418.
+
+    ``recon_report_port`` is forwarded to the constructor only when given, so
+    ``BaseStage``'s own default stays the single point of truth for the port.
 
     NOTE: callers must pass a non-empty absolute ``project_root``. Passing
     ``project_root=''`` (the pre-task-2146 "unset root" sentinel) raises
@@ -90,6 +92,7 @@ def make_consolidator(project_root: str = '/tmp/test') -> MemoryConsolidator:
         return_value=({}, complete_paged_read()),
     )
 
+    port_kwargs = {} if recon_report_port is None else {'recon_report_port': recon_report_port}
     stage = MemoryConsolidator(
         StageId.memory_consolidator,
         memory_mock,
@@ -97,6 +100,7 @@ def make_consolidator(project_root: str = '/tmp/test') -> MemoryConsolidator:
         AsyncMock(),  # journal
         config,
         scope=make_scope('test_project', project_root),
+        **port_kwargs,
     )
     stage.episode_limit = 5
     stage.memory_limit = 10

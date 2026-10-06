@@ -123,11 +123,22 @@ heartbeat-only staleness (loudly logged) rather than recording an unrelated dura
 make the lease unreapable forever.
 
 Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-readable message, then
-`holder_liveness=<none|held|orphaned>`, then `slug=<the slug this claim used>`.
+`holder_liveness=<none|held|orphaned>`, then `slug=<the slug this claim used>`, then
+`holder_record=<unlinked|absent|unreadable|active|exited>`.
 - **`slug=`** reports the identity the CLI derived for *you* (never the holder's). Quote it to the
   user when useful, and compare it against `lease-show`'s `holder_slug` if a later heartbeat returns
   `result=refused`. It is a **diagnostic only** — do not carry it into the next call; the CLI
   re-derives it.
+- **`holder_record=`** is a second, INDEPENDENT axis beside `holder_liveness=`: the state of the
+  holder's own session-registry record (yours, on an acquired claim), looked up through the
+  `record_slug` the CLI stamps into the lease body from the claiming pid. Read the two together:
+  `orphaned` + `exited`/`absent` are two agreeing signals that the holder is gone; `orphaned` +
+  `unlinked` is the pid signal alone (a lease claimed before `record_slug` existed, or whose
+  claimant's record was unresolvable); `held` + `exited` suggests the recorded pid was reused.
+  `unlinked` means nothing was looked up — it is **not** evidence the holder is alive — and
+  `active` only means the record is not terminal (for a hand-launched holder it tracks the
+  terminal, not the `claude` process), so it never overrides `orphaned`. A faulted `proceed` prints
+  no `holder_record=` line.
 - **`decision=acquired` or `decision=proceed`**: continue into the Main Loop. `proceed` is the
   fail-open outcome — a lease-substrate fault is logged loudly and reported as `proceed`, never a
   false `stand-down`, so a lease fault can never block the only consumer of this queue. An acquired
@@ -145,7 +156,7 @@ Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-reada
 
   ```bash
   python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-show \
-    --name recon-watcher-<project>
+    --name recon-watcher-<project>     # holder_slug / holder_pid / heartbeat_age_secs / reclaimable / holder_record
 
   python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
     --id recon-watcher-lease-orphan-<project> --project <project> \
@@ -159,11 +170,11 @@ Parse the printed lines: `decision=<acquired|stand-down|proceed>`, a human-reada
   DecisionRecord is strictly worse than one that files it with a degraded label.
 
   Never force-release on this evidence alone: `holder_liveness` is a single-signal pid probe, and a
-  dead-*looking* holder that is merely quiet is the duplicate-spawn incident. This guard carries the
-  whole weight — a pid probe is the *only* corroboration there is. (Task 3994 designed a second
-  signal, cross-checking the holder's own session-registry record, then measured it structurally
-  impossible — a lease slug is a claimant-chosen ownership token, not a record key — and withdrew it
-  rather than ship a check that never fires.) Reclaiming is the human's call, or the reaper's once
+  dead-*looking* holder that is merely quiet is the duplicate-spawn incident. A
+  `holder_record=exited` or `absent` beside it is corroboration, not a licence: **never
+  auto-steal**. (Task 3994 withdrew an earlier record cross-check because a lease slug is a
+  claimant-chosen ownership token, not a record key; `holder_record=` instead reads the separate
+  `record_slug` the lease body now carries.) Reclaiming is the human's call, or the reaper's once
   the TTL expires.
 
 **Reading the contention message.** It names two INDEPENDENT axes — whether the holder's *pid* is
@@ -177,6 +188,38 @@ lease held by recon-watcher-df-1348600 (pid 1348600 is not running, but its hear
 
 A fresh heartbeat means you **stand down** even when the pid reads as not running: staleness needs
 BOTH a dead pid AND a heartbeat past the TTL.
+
+**A detached `recon-watch/loop.sh` tree on this queue is not a second closer (task 5876).** A
+process probe may show a `scripts/watcher-rearm.sh --queue-dir …/data/reconciliation/escalations`
+you did not start, with its `escalation.watcher` python child, under an ancestor
+`/bin/bash …/.claude/recon-watch/loop.sh`. That is a host-local helper **not tracked in this
+repo**; its own header is the only other statement of this contract. It is a detached re-arm loop,
+reparented away from any Claude session so it survives the harness background-task reaper, and it
+outlives the session that launched it — so a fresh watcher session routinely finds it already
+running. It only arms the watcher and journals fires under `~/.claude/recon-watch/` (`history.log`,
+`fired-*.json`). Its tree holds no `claude` process: it never calls `resolve_issue` and closes
+nothing. Two read-only inotify watchers on one queue are harmless redundancy — each fire is
+observed twice (once by your watcher, once journaled by the loop), and there is still exactly one
+closer.
+
+It **deliberately never heartbeats, claims or releases** the `recon-watcher-<project>` lease. A
+lease becomes reclaimable only when BOTH its holder pid is dead AND its heartbeat is past
+`orchestrator/src/orchestrator/session_registry.py::LEASE_HEARTBEAT_TTL`. A detached process that
+kept heartbeating after its owning session died would pin that lease at `holder_liveness=orphaned`
+indefinitely: every later watcher would take the orphaned stand-down above, and the 8103 queue
+would have no closer. So:
+- **A stale or reapable lease at startup while loop.sh runs is this contract working** — not a
+  fault, and nothing to report. `lease-reap`, then `lease-claim`, exactly as above.
+- **The heartbeat is yours alone.** The loop will never keep your lease alive — not even if you
+  read fires from its journal instead of re-arming your own watcher — so heartbeat every Main Loop
+  cycle regardless.
+- **Only the lease verdict says whether a second closer exists** (`lease-claim`'s `decision=` /
+  `holder_liveness=`), never the process table: a watcher tree with no `claude` process in it
+  cannot close anything.
+- **Do not stop or kill it.** You did not start it, so "Process safety" (under "Starting the
+  watcher") forbids it.
+- **Its `history.log` is corroboration only** — e.g. repeated re-fires of one id reveal a pending
+  record missing from the exclude file. The drain (`get_pending_escalations`) stays authoritative.
 
 **Heartbeat + release.** Touch the lease every Main Loop cycle (see "Starting the watcher" below),
 and release it when the session ends. Both verbs act **only for the holder** — a mismatched slug is
@@ -301,7 +344,9 @@ cd $DARK_FACTORY_ROOT && scripts/watcher-rearm.sh \
 
 **Lease heartbeat (each cycle):** each time you (re)start this watcher subprocess, also touch the
 `recon-watcher-<project>` lease claimed at session startup, so a second session's `lease-claim`
-observes this one as alive and stands down:
+observes this one as alive and stands down. No other process heartbeats this lease — not even a
+running `recon-watch/loop.sh` (see "Claiming the Recon Watcher Lease" above) — so this call is its
+only keep-alive:
 
 ```bash
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py lease-heartbeat \
@@ -439,7 +484,8 @@ default path `<queue-dir>/.watcher-rearm-exclude-l2` there,
 `--baseline` — is what is actually consistent across both watcher skills.
 
 **Process safety:** only stop watcher processes you started via background task
-controls. Never `pkill` by pattern.
+controls. Never `pkill` by pattern. A `recon-watch/loop.sh` tree is not one you
+started, so this rule covers it too.
 
 ## The Action Set
 
@@ -588,7 +634,7 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   mcp__escalation__stamp_triage(
     escalation_id,
     triage_note="PARK: task-650 status==blocked, gate_escalated_at=2026-06-20T..."
-                 " | probe: get_task 650 -> status=blocked | decision: <cockpit --id>",
+                 " | probe: get_task 650 -> status=blocked | decision: <printed decision id>",
   )
   ```
   (registered on the 8103 server, `escalation/src/escalation/server.py:1120`).
@@ -655,7 +701,11 @@ Both archive the record. Be specific in the note — it is the only audit trail.
   cycle: read the report stats `orphaned_recon_escalations_terminal` and
   `orphaned_recon_escalations_missing`, and the emitted
   `orphaned_recon_escalation` flags, each of which names the escalation id,
-  the subject's project, and the observed subject status. (ii) On demand,
+  the subject's project, and the observed subject status. The stats count the
+  WHOLE shared queue, but since task 5813 a cycle's flags name only the
+  orphans whose subject belongs to THAT cycle's project, so no single report's
+  flags list every orphan. The fleet-wide view is the reaper in (ii), which
+  the main loop already runs with `--apply` every cycle. (ii) On demand,
   re-derive it live. **Run from the project root** — `--queue-dir` defaults to
   the relative `./data/reconciliation/escalations`, so the cwd is what decides
   which queue is read; from anywhere else the script refuses with
@@ -830,12 +880,25 @@ the primary return-triage surface across both watchers:
 python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py write-decision \
   --id <stable-id> --project <project> --text "<one-line question>" \
   --escalations-dir $DARK_FACTORY_ROOT/data/reconciliation/escalations \
-  [--task-id <task_id>] [--escalation-id <escalation_id>] [--severity <esc.severity>]
+  [--task-id <task_id>] [--escalation-id <escalation_id>] \
+  [--session-id "recon-watcher-<project>-${CLAUDE_PID:-unknown}"] \
+  [--severity <esc.severity>]
 ```
 
 - **`--id`**: a stable id you can recompute idempotently for the same pending item — the
   escalation id (e.g. `esc-recon-abc-1`) is the natural choice. Re-filing the same id overwrites
   the prior record rather than duplicating it.
+  **`--id` is project-LOCAL (task 4835).** The verb files the record as
+  `<canonical project>-<id>` (e.g. `dark_factory-esc-42-1`) and **prints that id**: use the
+  PRINTED id for cross-links (including the `decision:` field of a PARK
+  triage note) and for `close-decision` / `reopen-decision`. Keep passing
+  the bare escalation id — never hand-prefix the project. A record filed before this change under a
+  bare id is continued in place by your re-file, so do **not** change an existing `--id` template
+  (such as `recon-watcher-lease-orphan-<project>` above): rows already filed under it would stop receiving
+  your re-files. That includes a template that already hand-prefixes the project (`df-esc-<id>`):
+  keep it as it is, and the verb continues the `df-esc-…` row in place. "Never hand-prefix"
+  governs only a template you are writing new; dropping an existing prefix moves your re-files to
+  a fresh row that ignores the old row's answered or dropped state.
   **You no longer have to pre-check before filing (task 3559).** Decision ids are fleet-global, so
   the orchestrator's `escalation-watcher` may already have filed a decision under this id for the
   same underlying human gate. The verb now handles that for you: if an `open` record already exists
@@ -874,24 +937,26 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   overwrite that re-opens it: there it may truly be an unrelated new question, and holding it
   closed would hide a live gate instead of surfacing it.
 
-  **Across *projects*, a shared id is a collision, not a shared gate.** Decision ids are
-  fleet-global while `esc-<taskid>-<n>` numbering restarts per project, so `esc-42-1` under two
-  different `--project` values names two unrelated gates. A filing whose `--project` differs from
-  the `open` record already at that id is therefore **refused** with an `ERROR` — nothing written,
-  rc still 0 — because merging would hide your ask inside the other project's cockpit row and
-  overwriting would delete that row. Your ask still reaches the human through the in-session note
-  / afk-digest line this filing accompanies; if you need the cockpit row too, re-file under an id
-  that is unique fleet-wide.
+  **Across *projects*, the same local id is two rows.** `esc-<taskid>-<n>` numbering restarts
+  per project, so `esc-42-1` under two different `--project` values names two unrelated gates, and
+  because the stored id carries the project they land on two rows (`dark_factory-esc-42-1`,
+  `reify-esc-42-1`). A refusal remains only when the qualified id is already held `open` by
+  **another** project's legacy hand-prefixed record (say a dark_factory record someone filed by
+  hand under the id `reify-esc-42-1`): an `ERROR`, nothing written, rc still 0, because merging would hide your ask
+  inside that row and overwriting would delete it. Your ask still reaches the human through the
+  in-session note / afk-digest line this filing accompanies; a different `--id` gets it a cockpit
+  row too.
 - **`--project`**: the project's **canonical token** — the `memory.project_id` its
   `dark-factory-orchestrator.yaml` declares. For dark-factory that is **`dark_factory`**, not `df`
   and not `dark-factory`. The value is normalized at the CLI boundary (case-folded, `-` and `_`
   equivalent, `df` aliased to `dark_factory`), so a stale spelling can no longer create a hidden
   partition — but pass the canonical token anyway, so what you type matches what the cockpit shows
-  and no rewrite warning is logged. **The `df-` prefix on ids like `df-esc-3524-1` is part of
-  `--id`, which YOU type**; `write-decision` never derives it from, or rewrites it because of,
-  `--project`. Conflating the two is what produced a three-way split of one project's decisions
-  (41 open dark-factory rows spread across `dark_factory`/`df`/`dark-factory`, each invisible to a
-  reap scoped to either of the others).
+  and no rewrite warning is logged. The project prefix on a stored id (`dark_factory-esc-3524-1`)
+  is added by `write-decision` from the **folded** `--project`, so never type it into `--id`;
+  hand-prefixed ids like `df-esc-3524-1` are legacy, from before the verb qualified ids. Typing a
+  project spelling into an id is what led humans to pass `--project df`, and so to a three-way
+  split of one project's decisions (41 open dark-factory rows spread across
+  `dark_factory`/`df`/`dark-factory`, each invisible to a reap scoped to either of the others).
   - **Caveat — check your project's existing rows before trusting the declared token.** Folding
     merges spellings that differ only by case or separator; only an entry in
     `PROJECT_TOKEN_ALIASES` can bridge a project whose filed decisions fold to something *other*
@@ -905,13 +970,20 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
     the evidence in `PROJECT_TOKEN_ALIASES_DECLINED`. You no longer have to remember this
     unaided — `write-decision` and `reap-decisions` both **warn** if you pass
     `my_solar_challenge`, so the mismatch announces itself instead of returning a silent
-    zero-row no-op. To check your own project, list the tokens its rows actually carry:
-    ```bash
-    python3 -c "import json,glob,collections;print(collections.Counter(json.load(open(f))['project'] for f in glob.glob('$HOME/.claude/fleet/decisions/*.json')))"
-    ```
+    zero-row no-op. To check any other token, run
+    `reap-decisions --project <token> --escalations-dir <queue> --expect-matches` by hand: it warns
+    when no record, in any state, carries the folded `--project` token, and lists the folded tokens
+    that do. (It replaces a `collections.Counter` one-liner that listed RAW spellings,
+    which the reaper folds together, so it showed splits that were not there.) Leave the flag off
+    the per-cycle Main Loop reap: a project that has simply never filed would warn every cycle.
 - **`--text`**: the one-line question a human needs to answer.
 - **`--task-id` / `--escalation-id`**: thread through the synthetic `recon-<runid>` task id (if
   any) and the escalation id, so the cockpit can cross-link the decision to its source.
+- **`--session-id`**: a **provenance label** saying which watcher filed the row — not a link, since
+  its lease-token shape is not a session-registry key. The cockpit's Enter-to-focus follows
+  `record_slug`, your session record's key, which `write-decision` stamps itself from `$CLAUDE_PID`;
+  there is no shell token to add. If it cannot be resolved the decision is still filed, just
+  unlinked.
 - **`--severity`**: pass through the parked escalation's own severity (`esc.severity` —
   `info`/`blocking`/`critical`/`urgent`). This now weights the cockpit decision-queue rank, so a
   freshly-filed `critical`/`urgent` park surfaces at the top of the queue instead of being buried
@@ -927,6 +999,10 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   it** (task 3559): omit the flag and the verb exits 2 with nothing filed, and pass it empty and it
   refuses with a loud error and prints no id — so if the id doesn't come back on stdout, your
   filing did not land. It is the same directory you already pass to `reap-decisions`.
+  It is mandatory **even for a sentinel park with no `--escalation-id`** (a lease orphan, a
+  pipeline stall): task 4835 decided against exempting them, because the same-queue custody hold
+  keys on stamp equality, so an unstamped sentinel later re-filed with a stamp would re-open a row
+  an operator had dropped.
   There is a third value the field can hold: `<unknown>` (`session_registry.UNKNOWN_QUEUE`) —
   "this record's owning queue was investigated and could not be determined". You never write it —
   and that is now enforced, not just asked: `write-decision` **rejects**
@@ -942,11 +1018,19 @@ python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py wri
   filed id still comes back on stdout — that signal is unchanged, and your filing did land, since
   your text/severity/ids were written — plus a `WARNING` on stderr naming the state it held. That
   warning means a human dealt with this gate while it sat parked, so **adjudicate** it rather than
-  re-filing blindly on your next restart. If the ask is genuinely new, **file it under a new id** —
-  that is the remedy with a shipped surface. Re-opening the row *in place* currently needs a direct
-  registry write: the cockpit's decision pane offers a drop action but no re-open, and there is no
-  `update-decision-state` CLI verb — so ask an operator for that only when a new id genuinely will
-  not do. Either way, do not try to force the row open by re-filing.
+  re-filing blindly on your next restart. If this **same** gate genuinely needs a human again,
+  re-open the row in place; the warning names the exact command:
+  ```bash
+  python3 $DARK_FACTORY_ROOT/orchestrator/src/orchestrator/session_registry.py reopen-decision \
+    --id <printed id> --project <project> --escalations-dir $DARK_FACTORY_ROOT/data/reconciliation/escalations
+  ```
+  It clears the row's closing evidence, so a later `close-decision` can quote fresh evidence, and
+  it exits non-zero when it refuses (the record at that id is another project's or queue's) or
+  finds no record. It cannot hold open a row whose escalation is already resolved or dismissed:
+  the next reap closes it again, and the verb warns on stderr when that is the case. Such a gate
+  needs a new escalation, filed under its own id. File under a **new** id only for a genuinely
+  *different* ask. Either way, do not
+  try to force the row open by re-filing.
 - The verb is fail-soft (a registry fault is logged and swallowed, never raised) — filing a
   decision can never crash the watch loop or block the "leave pending" action itself.
 
@@ -1041,7 +1125,8 @@ Two collision modes exist and must not be conflated:
   queue against an `open` record enriches it, never clobbering or downgrading (see `--id` above).
   The queue stamp is scalar, so the collapsed record keeps the **first** filer's queue and is
   therefore reapable only by that queue's reaper; the verb logs a warning naming both queues when
-  it discards the other.
+  it discards the other. The single stamp is a **decided** limit, not a pending fix (task 4835;
+  see `plans/4835-decision-plumbing-decisions.md`).
 
 This closes (`answered`/`dropped`) any `state=open`, `escalation_id`-bearing decision whose
 escalation has since resolved (`resolved` → `answered`) or been dismissed (`dismissed` →

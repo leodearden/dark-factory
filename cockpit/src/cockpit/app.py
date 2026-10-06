@@ -21,10 +21,10 @@ writes from the poll timer (CockpitApp._poll_registry) only when that
 differs from what was last persisted, leaving CockpitApp.on_unmount as the
 single unconditional final write. So neither a keypress nor a table rebuild
 ever WRITES cockpit-ui.json -- a narrower claim than it may look: the
-debounce reduces how OFTEN that synchronous mkdir + mkstemp + json.dump +
-os.replace runs, it does not move it off the event-loop thread the way
-esc-2303-1 threaded the registry scan, and the poll-tick flush still
-performs it inline. The only other event-path I/O is C5b's sanctioned
+debounce reduces how OFTEN that synchronous atomic write
+(cockpit/src/cockpit/ui_config.py::save_ui_config) runs, it does not move it
+off the event-loop thread the way esc-2303-1 threaded the registry scan, and
+the poll-tick flush still performs it inline. The only other event-path I/O is C5b's sanctioned
 decision writes: its explicit-action keybindings (boost/drop) add
 action-only writes to a DECISION's manual_boost/state via C1's
 set_manual_boost/update_decision_state, each of which runs synchronously on
@@ -146,7 +146,8 @@ def _default_spawn_runner(argv: list[str]) -> None:
         _log.exception('spawn_session: failed to launch %r', argv)
 
 
-# Decision fields that feed the queue's scoring/display -- excludes
+# Decision fields that feed the queue's scoring/display/focus target (session_id
+# and record_slug both feed DecisionRecord.linked_session_slug) -- excludes
 # escalation_id/options (order_queue/format_queue_row never read them), so a
 # change to those never triggers a rebuild. Mirrors registry_reader's
 # _SNAPSHOT_FIELDS convention: keyed for a cheap equality diff, not identity.
@@ -155,6 +156,7 @@ _DECISION_SNAPSHOT_FIELDS = (
     'text',
     'filed_at',
     'session_id',
+    'record_slug',
     'task_id',
     'manual_boost',
     'state',
@@ -1581,7 +1583,7 @@ class CockpitApp(App):
         There is nothing to retry on. _persist_ui_config advances the
         baseline immediately after the fail-soft
         cockpit/src/cockpit/ui_config.py::save_ui_config call, which logs
-        and swallows OSError and returns None either way, so a failed write
+        and swallows any exception and returns None either way, so a failed write
         is dropped exactly as a highlight-time save failure used to be. The
         next selection change makes the two values differ again, and
         on_unmount's unconditional write gets one more attempt at shutdown.

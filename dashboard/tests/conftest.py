@@ -475,6 +475,11 @@ def tab_analytics_jsx_body(_client):
 
 
 @pytest.fixture(scope='module')
+def tab_overview_jsx_body(_client):
+    return _client.get('/static/redux/tab_overview.jsx').text
+
+
+@pytest.fixture(scope='module')
 def tab_escalations_jsx_body(_client):
     return _client.get('/static/redux/tab_escalations.jsx').text
 

@@ -103,6 +103,11 @@ contain — the agent's own Write/Edit argument terminates early, truncating thi
 file and silently dropping the sibling arguments of that same call. ``\\x3c`` is
 byte-identical at runtime and never appears verbatim in the file text, so it is
 immune. Leave it escaped.
+Runtime text quoting them gets the same spelling via :func:`escape_envelope_literals`.
+``tests/scripts/test_no_raw_envelope_literal.py::test_no_markup_handling_file_spells_a_raw_envelope_literal``
+enforces the rule on every ``.py`` source that already spells the bracket as
+``chr(60)`` or ``\\x3c``, or imports this module; a source spelling envelope
+literals only raw is outside that population.
 
 This module is pure and stdlib-only (``re``, ``json``). It deliberately imports
 nothing from ``fused_memory``, ``orchestrator`` or ``escalation`` so that every
@@ -131,6 +136,7 @@ __all__ = [
     'closer_for',
     'detect',
     'detect_for',
+    'escape_envelope_literals',
     'markup_override_requested',
     'repair',
     'strip_markup_override',
@@ -995,6 +1001,41 @@ def repair(
         )
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Escaping — text that QUOTES envelope literals as data.
+# ---------------------------------------------------------------------------
+
+_LITERAL_ESCAPE = '\\x3c'
+
+# Every token detect_for can report for any param or schema, and every candidate
+# repair() can qualify — built from the existing grammar, so no literal is
+# enumerated here (INV-5).
+_ESCAPABLE_RE = re.compile(_CLOSER_RE.pattern + '|' + re.escape(CANONICAL_OPENER_PREFIX))
+
+
+def escape_envelope_literals(text: str) -> str:
+    """Re-spell the opening bracket of every envelope-shaped token as ``\\x3c``.
+
+    For text that deliberately QUOTES envelope literals as data — census
+    sighting evidence, for one — and is headed for a guarded MCP write. The
+    spelling is the one this module's "Sentinel-literal hazard" section uses,
+    so a reader recognises it. Substituting the bracket back inverts it only
+    for text that held no ``\\x3c`` spelling beforehand: an already-escaped
+    literal passes through unchanged, and would come back as a raw bracket.
+
+    Post-condition: ``detect_for(result, param, schema_params) is None`` for
+    every *param* and *schema_params*, and :func:`repair` finds no candidate.
+    Idempotent; only the bracket that begins a closer of any tag name
+    (blend-tolerant) or the canonical opener prefix changes, so benign angle
+    brackets survive verbatim.
+
+    Not :func:`repair`, which recovers the parameters an ACCIDENTAL leak
+    dropped, and not the :data:`MARKUP_OVERRIDE_KEY` override, which lets raw
+    literals persist for every later reader to re-trip on.
+    """
+    return _ESCAPABLE_RE.sub(lambda match: _LITERAL_ESCAPE + match.group(0)[1:], text)
 
 
 # ---------------------------------------------------------------------------

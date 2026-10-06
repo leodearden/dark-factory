@@ -71,7 +71,7 @@ leave the lease unreapable forever.
 `PROJECT_ROOT`.) Parse the printed lines (`decision=<acquired|proceed>`, message,
 `holder_liveness=<none|held|orphaned>`, then `slug=<the slug this claim used>` — your own derived
 identity, a diagnostic to compare against `lease-show`'s `holder_slug`, never a value to carry into
-the release):
+the release — then `holder_record=<unlinked|absent|unreadable|active|exited>`):
 
 - **`decision=proceed` with a holder reported in the message**: surface that line verbatim to the
   user — this is exactly the near-duplicate second-`/unblock`-on-the-same-task case (reify 06-28) —
@@ -91,6 +91,12 @@ the release):
   way, and you never force-release someone else's lease to "clean up".
 - **`decision=acquired`**: no prior holder; continue normally. It prints `holder_liveness=none` —
   there is no contending holder to report, the lease is yours.
+
+The lease body also carries `record_slug`: the claimant's session-registry record key, which the CLI
+resolves from the claiming pid. `lease-claim` and `lease-show` print `holder_record=` from it: the
+state of the holder's record (yours, on an acquired claim), a second axis independent of
+`holder_liveness=`. `unlinked` means nothing was looked up (a lease claimed before the field existed,
+or an unresolvable record), not that the holder is alive. Like `orphaned`, it changes nothing here.
 
 To inspect a lease, use `lease-show --name "unblock-<project>#<TASK_ID>"` — never `cat`, which shows
 the holder's immutable `start_ts` but cannot show freshness (the heartbeat is the file's mtime).
@@ -167,6 +173,14 @@ In the worktree:
   nothing, so this is safe to run during analysis. A `blocked` verdict, or a non-empty `dangling`
   list, means a plain `git rebase --abort` here is not safe — see
   [Recovering a wedged rebase or merge](#recovering-a-wedged-rebase-or-merge) before you run one.
+
+### 1e. Event history
+```bash
+python3 $DARK_FACTORY_ROOT/scripts/task_event_timeline.py --project-root <PROJECT_ROOT> <TASK_ID>
+```
+Step 2's agent team and Step 3's findings count the task's failure events from this listing before
+joining any of them into one story — see
+[`skills/_shared/counting-failure-events.md`](../_shared/counting-failure-events.md).
 
 ---
 
@@ -405,7 +419,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
    - `status: "superseded"` → **this submission was absorbed into a coalesced train, or replaced
      by a generation-advance resubmission, before the bounded wait returned.** Absorption
      resolves the waiting future directly (`MergeOutcome('superseded', superseded_by=train_id)`,
-     `orchestrator/src/orchestrator/merge_queue.py:12703`) and `merge_request` returns that status
+     `orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._maybe_coalesce_waiting_singles`) and `merge_request` returns that status
      verbatim (`escalation/server.py:1733`), so with `wait_secs=100` this is the *ordinary*
      absorption outcome, not an exotic one. It is always submission-scoped here — it is your own
      call's response, so none of the unscoped-handle staleness guard applies — so go straight to
@@ -596,9 +610,9 @@ The merge procedure is iterative — don't assume one pass will be enough:
   `superseded` is permanent by construction, not merely stale: it will never itself turn
   `done`.** Nothing overwrites it — the absorbed member's own `merge_finalized` record is
   written under its own branch/task keys at absorption time
-  (`orchestrator/src/orchestrator/merge_queue.py:4353-4354, 4373-4377`), the train instead lands
+  (`orchestrator/src/orchestrator/merge_lane/worker.py::enqueue_merge_request`, its `_on_finalized` callback), the train instead lands
   under a brand-new `GroupMergeRequest` that bypasses `enqueue_merge_request` via direct queue
-  surgery (`orchestrator/src/orchestrator/merge_queue.py:12685-12696`), and
+  surgery (`orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._maybe_coalesce_waiting_singles`), and
   `orchestrator/src/orchestrator/harness.py::mark_member_done` flips scheduler status without
   writing a merge record. Because the durable tiers keep serving that stale hit, Tier 3.5's git-authority
   probe — gated behind a durable-tier *miss* (`escalation/server.py:2407-2420`) — never runs to
@@ -607,7 +621,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
   resuming branch-handle polling for the derail/re-drive case below, where the orchestrator
   itself re-lands or re-dispatches the member. (A generation-advance `mr-*` successor is
   simpler: it is enqueued the normal way,
-  `orchestrator/src/orchestrator/merge_queue.py:4289`, so branch/task_id polling does eventually
+  `orchestrator/src/orchestrator/merge_lane/worker.py::_maybe_auto_chain_generation`, so branch/task_id polling does eventually
   reflect its outcome there — see its dispatch below.) Once you are following a successor,
   **never resubmit and never direct-merge, on any arm**, while it is still unresolved — it may
   already be in flight and either would race it. `superseded_by` names one of two shapes:
@@ -627,13 +641,13 @@ The merge procedure is iterative — don't assume one pass will be enough:
     - `conflict` or `blocked` → the successor has now failed on its own terms, and nothing
       auto-retries it — `_redrive_coalesce_members` is gated on
       `isinstance(req, GroupMergeRequest)` and the train id starting with `coalesce-`
-      (`orchestrator/src/orchestrator/merge_queue.py:12914, 12928`), neither of which holds for
+      (`orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._merger_loop`), neither of which holds for
       a generation-advance successor. Fix in the worktree, rebase on main, and resubmit — the
       standard *Polled terminal failures* remediation, loop back to step 7. (Both states are
       reachable here: this successor is an ordinary solo merge through `classify_and_merge`,
-      which returns `conflict` (`merge_queue.py:5746`) and which `_map_terminal_state` passes
+      which returns `conflict` (`merge_lane/worker.py::classify_and_merge`) and which `_map_terminal_state` passes
       through unchanged (`escalation/server.py:2194-2195`). The conflict→`blocked` collapse
-      (`merge_queue.py:6339, 6357`) is inside `_do_train_merge` — train path only.)
+      (`merge_lane/worker.py::_do_train_merge`) is inside `_do_train_merge` — train path only.)
     - `abandoned` → stop and report to the human. Do not resubmit; the resubmission may have
       been cancelled deliberately.
     - `superseded` → the successor was itself superseded (a further generation advance, or
@@ -705,7 +719,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
   **Neither an empty rc=128 marker search nor rc=1 means "not landed" here.** A coalesce train
   stacks its members linearly and merges only the **tip** branch into main (the `GroupMergeRequest`
   carries `tip_branch=tip_req.branch`, set in
-  `orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker._maybe_coalesce_waiting_singles`),
+  `orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._maybe_coalesce_waiting_singles`),
   so a non-tip absorbed member gets its commits onto main with **no `Merge task/<TASK_ID> into main`
   marker of its own**. And that tip is **rebased onto current main before the merge**, rewriting
   every stacked commit's sha, while this member's own `task/<TASK_ID>` ref is never advanced to the
@@ -766,7 +780,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
   - **`get_merge_queue()` no longer showing the train is NOT a landing signal.** It means only
     "stop waiting on the train," and is equally consistent with a **derail**: on any non-`done`
     train outcome the orchestrator re-pends the still-unlanded members for solo re-merge
-    (`orchestrator/src/orchestrator/merge_queue.py::SpeculativeMergeWorker._redrive_coalesce_members`),
+    (`orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._redrive_coalesce_members`),
     which also removes the train from the queue with nothing of yours on main. On queue-absence with
     neither (a) nor (b), the correct action is to **resume polling the `branch` handle** to the
     20-minute ceiling **under the [resumed-poll terminal set](#resumed-poll)** — the
@@ -826,10 +840,9 @@ Choose one of these based on the analysis:
 at session end.** Trigger (already computed, costs nothing): the block cause was a pending
 escalation — any category — that you read in Step 1b, and the session chose an option (with or
 without human ratification) rather than deferring the question. Immediately append the ruling to
-the escalation record: the chosen option, the ruling commit sha, and what remains (e.g. "closure
-deferred pending merge gate"). Use `amend_escalation` once it lands; until then, fold via
-`promote_to_l2` re-passing the record's exact `root_cause` and its existing member ids — the member
-union is a no-op and the fold appends an amendment. The amendment bumps `updated_at`, which is
+the escalation record with `amend_escalation(escalation_id=..., summary=..., detail=...)`: the
+chosen option, the ruling commit sha, and what remains (e.g. "closure deferred pending merge
+gate"). The amendment bumps `updated_at`, which is
 exactly what re-arms the watcher's re-verify on a parked record. This is an annotation, not a
 closure — L2 close rules are unchanged. Do NOT defer the record-write behind a merge gate or any
 tail plan: a deferred write is precisely what dies when a session ends early (esc-6107-7 sat
@@ -837,7 +850,8 @@ answered-but-unrecorded for 183h because its close was sequenced behind a merge 
 session stopped first). While you're there, check `get_pending_escalations(task_id="<TASK_ID>")`
 for OTHER pending records on the same task and disposition them in the same sitting — a ruling
 recorded on one twin while another record survives is the same failure class (esc-3875-12 kept a
-Leo-released task pinned 6.8 further days).
+Leo-released task pinned 6.8 further days). When you later resolve the record, the `resolve_issue`
+response's `related_pending` lists the twins still pending after that resolve; dispose of those too.
 
 ### 4.4: Execute the plan
 
