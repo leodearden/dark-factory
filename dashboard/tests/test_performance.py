@@ -2658,3 +2658,22 @@ class TestCancelOutcomesAreNotCounted:
             'labels': ['2026-09-30T10:00', '2026-09-30T11:00'], 'values': [0.0, 0.0],
         }
         assert 'drained' not in history
+
+    @pytest.mark.asyncio
+    async def test_cards_age_and_list_by_completions_not_cancels(
+        self, cancels_conn, empty_escalations_dir,
+    ):
+        """Fresh exactly when the window's tally counts a completion: a
+        redeploy's cancel alone neither lists a project nor freshens one."""
+        cards = await aggregate_performance_cards(
+            [cancels_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+        assert set(cards) == {'proj', 'redeployed-idle'}
+        assert cards['proj'].state is DatumState.FRESH
+        assert cards['proj'].as_of == CARDS_NOW - timedelta(hours=1)
+        idle = cards['redeployed-idle']
+        assert idle.state is DatumState.STALE
+        assert idle.as_of == CARDS_NOW - timedelta(days=20)
+        assert idle.value is not None and idle.value.to_wire()['paths'] == []
+        for datum in cards.values():
+            validate_datum(datum, CARDS_NOW)
