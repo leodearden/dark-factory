@@ -3225,6 +3225,43 @@ class ConsolidationAutoConfig(BaseModel):
             )
         return self
 
+
+class LinkHealConfig(BaseModel):
+    """Caps and storm escapes for the link-heal executor (task 6181).
+
+    Contract: ``plans/write-triage-link-healing-prd.md`` H1, "Caps and storm
+    escapes". The only consumer is ``fused-memory/scripts/link_heal.py``, which
+    loads config afresh at each run start; the server holds no copy, so every
+    leaf is green-tier.
+    """
+
+    max_actions_per_run: int = Field(
+        default=25,
+        ge=0,
+        description=(
+            'Most write attempts one unattended run may make, oldest-planned '
+            'first; the rest stay pending as skipped_cap. 0 applies nothing '
+            'unattended. PRD H1.'
+        ),
+    )
+    backlog_multiplier: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            'An unattended writing run escalates once under link-heal-backlog '
+            'when pending actions exceed max_actions_per_run times this. PRD H1.'
+        ),
+    )
+    write_failure_streak: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Consecutive failed actions that stop a run with a non-zero exit '
+            'and escalate under link-heal-write-failure. PRD H1.'
+        ),
+    )
+
+
 class FusedMemoryConfig(BaseSettings):
     """Fused Memory configuration with YAML and environment support."""
 
@@ -3263,6 +3300,8 @@ class FusedMemoryConfig(BaseSettings):
     consolidation_auto: ConsolidationAutoConfig = Field(
         default_factory=ConsolidationAutoConfig,
     )
+    # Bare submodel for the same per-leaf-reload reason as write_triage above.
+    link_heal: LinkHealConfig = Field(default_factory=LinkHealConfig)
     curator: CuratorConfig = Field(default_factory=CuratorConfig)
     summary_rebuild: SummaryRebuildConfig = Field(default_factory=SummaryRebuildConfig)
     path_scope_adjudicator: PathScopeAdjudicatorConfig = Field(

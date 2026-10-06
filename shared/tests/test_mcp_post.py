@@ -24,6 +24,7 @@ import pytest
 
 from shared.mcp_post import (
     MCP_POST_HEADERS,
+    call_mcp_tool,
     check_mcp_post_response,
     decode_mcp_response_body,
     mcp_endpoint_url,
@@ -637,3 +638,150 @@ def test_decode_raises_value_error_when_no_data_line(text, headers):
     """The decoder RAISES on an undecodable body; only the checker swallows it."""
     with pytest.raises(ValueError):
         decode_mcp_response_body(_response(200, text=text, headers=headers))
+
+
+# ---------------------------------------------------------------------------
+# Pair 5 — call_mcp_tool, the reply-returning twin of post_mcp_tool_call
+# (task 6181)
+# ---------------------------------------------------------------------------
+#
+# post_mcp_tool_call answers only "did it land", so a caller that needs the
+# tool's reply (a read's payload, a write's error_type) had no composed path.
+# call_mcp_tool shares the same four-part send and returns the decoded reply.
+
+#: The decoder (shared.mcp_envelope) warns under its own logger name.
+SHARED_LOGGERS = {LOGGER_NAME, 'shared.mcp_envelope'}
+
+
+def _shared_warnings(caplog):
+    return [
+        r for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name in SHARED_LOGGERS
+    ]
+
+
+def _tool_reply(text: str, *, is_error: bool = False) -> dict:
+    result: dict = {'content': [{'type': 'text', 'text': text}]}
+    if is_error:
+        result['isError'] = True
+    return {'jsonrpc': '2.0', 'id': 1, 'result': result}
+
+
+_FOUND = {'found': True, 'content': 'x'}
+
+
+@pytest.mark.asyncio
+async def test_call_mcp_tool_applies_all_four_parts_at_once():
+    client = _RecordingClient(
+        response=_response(200, json_body=_tool_reply(json.dumps(_FOUND))),
+    )
+
+    await call_mcp_tool(
+        client, 'http://memory.test:8002/', 'get_memory_by_id', {'memory_id': 'm'},
+        context='link-heal get_memory_by_id', request_id=7, timeout=3,
+    )
+
+    assert len(client.calls) == 1
+    sent = client.calls[0]
+    assert sent['url'] == 'http://memory.test:8002/mcp'
+    assert sent['headers'] == MCP_POST_HEADERS
+    assert sent['json'] == mcp_tool_call_payload(
+        'get_memory_by_id', {'memory_id': 'm'}, request_id=7,
+    )
+    assert sent['timeout'] == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('framing', ['json', 'sse'])
+async def test_call_mcp_tool_returns_the_tool_reply_dict(framing, caplog):
+    envelope = _tool_reply(json.dumps(_FOUND))
+    if framing == 'json':
+        resp = _response(200, json_body=envelope)
+    else:
+        resp = _response(200, text=_sse_body(envelope), headers=SSE_HEADERS)
+
+    with caplog.at_level(logging.WARNING):
+        reply = await call_mcp_tool(
+            _RecordingClient(response=resp), 'http://memory.test:8002',
+            'get_memory_by_id', {}, context='fuzz',
+        )
+
+    assert reply == _FOUND
+    assert _shared_warnings(caplog) == []
+
+
+@pytest.mark.asyncio
+async def test_call_mcp_tool_returns_an_error_type_reply_unchanged():
+    """A tool-level rejection is a successful call; its reply must survive so
+    the caller can read the rejection class."""
+    rejection = {'error': 'no', 'error_type': 'Mem0UpdateNotAuthorized'}
+    client = _RecordingClient(
+        response=_response(200, json_body=_tool_reply(json.dumps(rejection))),
+    )
+
+    reply = await call_mcp_tool(
+        client, 'http://memory.test:8002', 'update_memory', {}, context='fuzz',
+    )
+
+    assert reply == rejection
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'resp',
+    [
+        _response(307, headers={'Location': '/mcp'}),
+        _response(406, json_body={'error': {'code': -32600, 'message': 'Not Acceptable'}}),
+        _response(
+            200,
+            json_body={'jsonrpc': '2.0', 'id': 1, 'error': {'code': -32601, 'message': 'x'}},
+        ),
+        _response(200, json_body=_tool_reply('Error calling tool', is_error=True)),
+        _response(200, json_body=_tool_reply('not json at all')),
+        _response(200, json_body=_tool_reply(json.dumps(['a', 'list']))),
+    ],
+    ids=[
+        'redirect-307', 'http-406', 'jsonrpc-error', 'result-isError',
+        'text-not-json', 'json-not-an-object',
+    ],
+)
+async def test_call_mcp_tool_returns_none_and_warns_when_no_reply(resp, caplog):
+    with caplog.at_level(logging.WARNING):
+        reply = await call_mcp_tool(
+            _RecordingClient(response=resp), 'http://memory.test:8002',
+            'get_memory_by_id', {}, context='link-heal get_memory_by_id',
+        )
+
+    assert reply is None
+    assert _shared_warnings(caplog), 'a missing reply must never be silent'
+
+
+@pytest.mark.asyncio
+async def test_call_mcp_tool_propagates_a_transport_exception():
+    class _Down:
+        follow_redirects = True
+
+        async def post(self, url, *, headers=None, json=None, timeout=None):
+            raise httpx.ConnectError('connection refused')
+
+    with pytest.raises(httpx.ConnectError):
+        await call_mcp_tool(
+            _Down(), 'http://memory.test:8002', 'get_memory_by_id', {}, context='fuzz',
+        )
+
+
+@pytest.mark.asyncio
+async def test_call_mcp_tool_warns_when_the_client_ignores_redirects(caplog):
+    client = _RecordingClient(
+        response=_response(200, json_body=_tool_reply(json.dumps(_FOUND))),
+        follow_redirects=False,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await call_mcp_tool(
+            client, 'http://memory.test:8002', 'get_memory_by_id', {}, context='fuzz',
+        )
+
+    message = ' '.join(r.getMessage() for r in _warnings(caplog))
+    assert 'follow_redirects' in message
+    assert 'open_mcp_client' in message
