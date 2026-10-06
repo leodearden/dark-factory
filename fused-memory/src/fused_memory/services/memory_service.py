@@ -7813,6 +7813,7 @@ class MemoryService:
                 continue
 
             temporal = _serialize_temporal(valid_at, invalid_at)
+            created_at = getattr(edge, 'created_at', None)
 
             # Extract entity names from source/target nodes
             entities = []
@@ -7856,6 +7857,7 @@ class MemoryService:
                 temporal=temporal,
                 entities=entities,
                 metadata=metadata,
+                created_at=created_at.isoformat() if created_at is not None else None,
             ))
         # Truncate to the original limit (over-fetch may have produced extras).
         return results[:limit]
