@@ -1987,6 +1987,42 @@
           "current": 31834
         }
       ]
+    },
+    {
+      "task_id": "5447",
+      "reason": "amend (reviewer_comprehensive robustness): InflightEntrySlot.publish_verify_base names the dispatch-fills-the-slot-before-the-verify-runs invariant with a warning, as _vacate_inflight_entry does, instead of _run_inflight_verify silently skipping an empty slot; types.py gains the method and a module logger (+19 lines, +7 prose, +1 cognitive) while _run_inflight_verify drops its compound guard (-1 cognitive).",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 63,
+          "current": 64
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 1742,
+          "current": 1761
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 935,
+          "current": 942
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57011,
+          "current": 57030
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31834,
+          "current": 31841
+        }
+      ]
     }
   ]
 }

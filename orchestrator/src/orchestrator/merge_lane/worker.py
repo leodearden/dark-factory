@@ -18322,8 +18322,8 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     req.config.project_root, main_sha, item.merged_branch_tip,
                 ),
             )
-            if entry_slot is not None and entry_slot.entry is not None:
-                entry_slot.entry.verify_base = verify_base
+            if entry_slot is not None:
+                entry_slot.publish_verify_base(verify_base)
 
             verify_task = asyncio.ensure_future(_run_post_merge_verify(
                 self._git_ops, req, merge_wt,

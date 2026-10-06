@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import dataclasses
+import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -28,6 +29,8 @@ from orchestrator.verify import VerifyResult
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
+
+logger = logging.getLogger(__name__)
 
 
 class MainHealthAutoHealRegistry:
@@ -1629,11 +1632,27 @@ class InflightEntrySlot:
 
     Built empty before the verify task for the reason
     :class:`VerifyWorktreeHandle` gives, and filled by ``_dispatch_item`` once
-    the entry exists, so a verify that requeues or drops its request vacates
-    its OWN entry.
+    the entry exists, before the verify first runs, so a verify that requeues
+    or drops its request vacates its OWN entry, and publishes its base facts
+    onto it.
     """
 
     entry: InflightEntry | None = None
+
+    def publish_verify_base(self, facts: VerifyBaseFacts) -> None:
+        """Record *facts* on the entry for ``snapshot()`` (task 5447).
+
+        An empty slot means the fill-before-the-verify-runs ordering broke:
+        warn, as ``_vacate_inflight_entry`` does, rather than leave
+        ``verify_base`` silently ``None``.
+        """
+        if self.entry is None:
+            logger.warning(
+                'verify_base %s not published: _dispatch_item never filled '
+                'the entry slot before the verify ran', facts,
+            )
+            return
+        self.entry.verify_base = facts
 
 
 @dataclass
