@@ -14,15 +14,15 @@ introduced by this task).  Tests are organised as:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import subprocess
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from _main_probe_doubles import PROBE_MODULES, MainProbeHarness
 
 from orchestrator import verify as verify_module
-from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, WorktreeKind
 from orchestrator.verify import VerifyResult
 
@@ -916,84 +916,10 @@ class TestMainBaselineFailingIds:
 # registered (unchanged) command, all inside ONE MAIN_PROBE worktree.
 # ---------------------------------------------------------------------------
 
-RED_PROBE_MODULES = {
-    prefix: ModuleConfig(
-        prefix=prefix, test_command=f'pytest {prefix.lower()}/tests',
-        lint_command=None, type_check_command=None,
-    )
-    for prefix in ('A', 'B', 'C')
-}
-
-
-class _MainProbeHarness:
-    """Doubles for probing main: a recording MAIN_PROBE worktree, a per-module
-    main-side ``run_verification`` and a whole-tree ``run_scoped_verification``.
-
-    ``main_ids[prefix]`` is what that module fails on main: a list, ``None``
-    (no junit collected) or an exception to raise. ``whole_tree_ids`` left at
-    ``None`` means the whole-tree probe must not run.
-    """
-
-    def __init__(self, tmp_path: Path) -> None:
-        self.config = _make_config(tmp_path)
-        self.main_ids: dict[str, list[str] | None | Exception] = {}
-        self.whole_tree_ids: list[str] | None = None
-        self.worktrees: list[tuple[WorktreeKind, str, bool]] = []
-        self.module_runs: list[tuple[ModuleConfig, dict]] = []
-        self.whole_tree_runs: list[dict] = []
-        self.git_ops = MagicMock()
-        self.git_ops.ephemeral_worktree = self._ephemeral_worktree
-        self.git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)
-        self._probe_dir = tmp_path / 'main-probe'
-        self._probe_dir.mkdir()
-
-    @contextlib.asynccontextmanager
-    async def _ephemeral_worktree(self, kind, sha, *, warm_seed=False):
-        self.worktrees.append((kind, sha, warm_seed))
-        yield self._probe_dir
-
-    async def run_verification(self, worktree, config, module_config=None, **kwargs):
-        assert module_config is not None
-        self.module_runs.append((module_config, kwargs))
-        outcome = self.main_ids[module_config.prefix]
-        if isinstance(outcome, Exception):
-            raise outcome
-        return VerifyResult(
-            passed=not outcome, test_output='', lint_output='', type_output='',
-            summary='main side', failing_test_ids=outcome,
-            failing_test_ids_by_module=(
-                None if outcome is None else {module_config.prefix: outcome}
-            ),
-        )
-
-    async def run_scoped_verification(self, worktree, config, module_configs, task_files=None, **kwargs):
-        self.whole_tree_runs.append({'task_files': task_files, **kwargs})
-        if self.whole_tree_ids is None:
-            raise AssertionError('the whole-tree probe must not run on this path')
-        return VerifyResult(
-            passed=False, test_output='', lint_output='', type_output='',
-            summary='main side', failing_test_ids=self.whole_tree_ids,
-        )
-
-    def baseline(self, *red_module_prefixes: str) -> frozenset[str] | None:
-        return asyncio.run(verify_module.main_baseline_failing_ids(
-            self.config, list(RED_PROBE_MODULES.values()), self.git_ops, MAIN_SHA,
-            red_module_prefixes=frozenset(red_module_prefixes),
-        ))
-
-    def probed_prefixes(self) -> list[str]:
-        return [mc.prefix for mc, _ in self.module_runs]
-
-
 @pytest.fixture
 def main_probe(tmp_path: Path):
-    harness = _MainProbeHarness(tmp_path)
-    with (
-        patch.object(verify_module, 'run_verification', side_effect=harness.run_verification),
-        patch.object(
-            verify_module, 'run_scoped_verification', side_effect=harness.run_scoped_verification,
-        ),
-    ):
+    harness = MainProbeHarness(_make_config(tmp_path), MAIN_SHA, tmp_path / 'main-probe')
+    with harness.patched():
         yield harness
 
 
@@ -1002,7 +928,7 @@ class TestMainBaselineRedModuleProbe:
     with the command the branch gate ran, never an id-selected one."""
 
     def test_only_the_red_module_is_probed_with_its_registered_command(
-        self, main_probe: _MainProbeHarness,
+        self, main_probe: MainProbeHarness,
     ) -> None:
         main_probe.main_ids = {'B': ['b1']}
 
@@ -1010,14 +936,14 @@ class TestMainBaselineRedModuleProbe:
 
         assert main_probe.worktrees == [(WorktreeKind.MAIN_PROBE, MAIN_SHA, True)]
         [(module_config, kwargs)] = main_probe.module_runs
-        assert module_config == RED_PROBE_MODULES['B']
+        assert module_config == PROBE_MODULES['B']
         assert module_config.test_command == 'pytest b/tests'
         assert kwargs.get('role') == 'merge'
         assert kwargs.get('max_retries') == 0
         assert kwargs.get('is_merge_verify') is not True
         assert main_probe.whole_tree_runs == []
 
-    def test_a_known_module_is_not_probed_again(self, main_probe: _MainProbeHarness) -> None:
+    def test_a_known_module_is_not_probed_again(self, main_probe: MainProbeHarness) -> None:
         main_probe.main_ids = {'B': ['b1'], 'C': ['c1']}
         main_probe.baseline('B')
 
@@ -1030,7 +956,7 @@ class TestMainBaselineRedModuleProbe:
         assert len(main_probe.worktrees) == 2
 
     def test_red_modules_share_one_worktree_and_their_ids_are_unioned(
-        self, main_probe: _MainProbeHarness,
+        self, main_probe: MainProbeHarness,
     ) -> None:
         main_probe.main_ids = {'A': ['a1'], 'C': ['c1', 'c2']}
 
@@ -1039,21 +965,21 @@ class TestMainBaselineRedModuleProbe:
         assert sorted(main_probe.probed_prefixes()) == ['A', 'C']
         assert len(main_probe.worktrees) == 1
 
-    def test_a_whole_tree_seed_answers_without_probing(self, main_probe: _MainProbeHarness) -> None:
+    def test_a_whole_tree_seed_answers_without_probing(self, main_probe: MainProbeHarness) -> None:
         verify_module.seed_main_baseline(MAIN_SHA, frozenset())
 
         assert main_probe.baseline('B') == frozenset()
         assert main_probe.worktrees == []
         assert main_probe.module_runs == []
 
-    def test_no_red_module_needs_no_probe(self, main_probe: _MainProbeHarness) -> None:
+    def test_no_red_module_needs_no_probe(self, main_probe: MainProbeHarness) -> None:
         assert main_probe.baseline() == frozenset()
         assert main_probe.worktrees == []
         assert main_probe.module_runs == []
         assert main_probe.whole_tree_runs == []
 
     def test_an_unregistered_prefix_falls_back_to_the_whole_tree_probe(
-        self, main_probe: _MainProbeHarness,
+        self, main_probe: MainProbeHarness,
     ) -> None:
         main_probe.whole_tree_ids = ['m::1']
 
@@ -1066,7 +992,7 @@ class TestMainBaselineRedModuleProbe:
         assert verify_module.cached_main_baseline_failing_ids(MAIN_SHA) == frozenset({'m::1'})
 
     def test_a_module_that_collects_nothing_degrades_and_is_not_cached(
-        self, main_probe: _MainProbeHarness,
+        self, main_probe: MainProbeHarness,
     ) -> None:
         main_probe.main_ids = {'B': None, 'C': ['c1']}
 
@@ -1080,7 +1006,7 @@ class TestMainBaselineRedModuleProbe:
         assert len(main_probe.module_runs) == probes_so_far
 
     def test_a_probe_that_raises_degrades_and_caches_nothing(
-        self, main_probe: _MainProbeHarness,
+        self, main_probe: MainProbeHarness,
     ) -> None:
         main_probe.main_ids = {'B': RuntimeError('probe blew up')}
 
@@ -1090,7 +1016,7 @@ class TestMainBaselineRedModuleProbe:
         assert main_probe.probed_prefixes() == ['B', 'B']
 
     def test_the_peek_answers_only_scopes_it_knows_completely(
-        self, main_probe: _MainProbeHarness,
+        self, main_probe: MainProbeHarness,
     ) -> None:
         peek = verify_module.cached_main_baseline_failing_ids
         main_probe.main_ids = {'B': ['b1']}
@@ -1116,7 +1042,7 @@ class TestMainBaselineRedModuleProbe:
         assert verify_module.known_failing_ids_on_main(MAIN_SHA) == frozenset({'w'})
 
     def test_a_degraded_module_leaves_its_scope_unknown(
-        self, main_probe: _MainProbeHarness,
+        self, main_probe: MainProbeHarness,
     ) -> None:
         peek = verify_module.cached_main_baseline_failing_ids
         main_probe.main_ids = {'B': None, 'C': ['c1']}
@@ -1128,12 +1054,12 @@ class TestMainBaselineRedModuleProbe:
         assert verify_module.known_failing_ids_on_main(MAIN_SHA) == frozenset({'c1'})
 
     def test_without_red_modules_the_whole_tree_probe_runs(
-        self, main_probe: _MainProbeHarness,
+        self, main_probe: MainProbeHarness,
     ) -> None:
         main_probe.whole_tree_ids = ['w1']
 
         served = asyncio.run(verify_module.main_baseline_failing_ids(
-            main_probe.config, list(RED_PROBE_MODULES.values()), main_probe.git_ops, MAIN_SHA,
+            main_probe.config, list(PROBE_MODULES.values()), main_probe.git_ops, MAIN_SHA,
         ))
 
         assert served == frozenset({'w1'})
@@ -1187,17 +1113,17 @@ class TestPreexistingForkProbesOnlyRedModules:
 
     @staticmethod
     def _classify(
-        main_probe: _MainProbeHarness, tmp_path: Path, failing_result: VerifyResult,
+        main_probe: MainProbeHarness, tmp_path: Path, failing_result: VerifyResult,
     ) -> tuple[bool, str]:
         worktree = tmp_path / 'task-wt'
         worktree.mkdir()
         return asyncio.run(verify_module.verify_failure_is_preexisting_on_main(
-            worktree, main_probe.config, list(RED_PROBE_MODULES.values()),
+            worktree, main_probe.config, list(PROBE_MODULES.values()),
             ['b/src/x.py'], failing_result, main_probe.git_ops,
         ))
 
     def test_red_ids_wholly_on_main_in_their_one_module(
-        self, main_probe: _MainProbeHarness, tmp_path: Path,
+        self, main_probe: MainProbeHarness, tmp_path: Path,
     ) -> None:
         main_probe.main_ids = {'B': ['b1', 'b2']}
         branch = self._branch_red(['b1'], {'A': [], 'B': ['b1'], 'C': []})
@@ -1206,7 +1132,7 @@ class TestPreexistingForkProbesOnlyRedModules:
         assert main_probe.probed_prefixes() == ['B']
 
     def test_a_red_id_main_does_not_have_blames_the_branch(
-        self, main_probe: _MainProbeHarness, tmp_path: Path,
+        self, main_probe: MainProbeHarness, tmp_path: Path,
     ) -> None:
         main_probe.main_ids = {'B': []}
         branch = self._branch_red(['b1'], {'A': [], 'B': ['b1'], 'C': []})
@@ -1215,7 +1141,7 @@ class TestPreexistingForkProbesOnlyRedModules:
         assert main_probe.probed_prefixes() == ['B']
 
     def test_two_red_modules_are_answered_by_their_union(
-        self, main_probe: _MainProbeHarness, tmp_path: Path,
+        self, main_probe: MainProbeHarness, tmp_path: Path,
     ) -> None:
         main_probe.main_ids = {'A': ['a1'], 'C': ['c1']}
         branch = self._branch_red(['a1', 'c1'], {'A': ['a1'], 'C': ['c1']})
@@ -1234,7 +1160,7 @@ class TestPreexistingForkProbesOnlyRedModules:
     )
     def test_unattributable_red_ids_fall_back_to_the_whole_tree_probe(
         self,
-        main_probe: _MainProbeHarness,
+        main_probe: MainProbeHarness,
         tmp_path: Path,
         failing_test_ids: list[str],
         by_module: dict[str, list[str]] | None,
@@ -1249,7 +1175,7 @@ class TestPreexistingForkProbesOnlyRedModules:
         assert main_probe.module_runs == []
 
     def test_a_red_with_no_failing_ids_needs_no_probe(
-        self, main_probe: _MainProbeHarness, tmp_path: Path,
+        self, main_probe: MainProbeHarness, tmp_path: Path,
     ) -> None:
         branch = self._branch_red([], {'A': []})
 
