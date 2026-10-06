@@ -2601,3 +2601,34 @@ async def cancels_conn(tmp_path):
     async with aiosqlite.connect(str(db_path)) as conn:
         conn.row_factory = aiosqlite.Row
         yield conn
+
+
+class TestCancelOutcomesAreNotCounted:
+    """A cancel ('cancelled' or 'soft-cancelled') ends an attempt from outside:
+    no performance reading counts one, so a redeploy moves no card."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_history_cache(self):
+        _HISTORY_CACHE.clear()
+
+    @pytest.mark.asyncio
+    async def test_completion_paths_count_no_cancel(self, cancels_conn, empty_escalations_dir):
+        result = await get_completion_paths(
+            cancels_conn, empty_escalations_dir, days=CARDS_DAYS, now=CARDS_NOW,
+        )
+        assert result['proj'] == [
+            {'path': 'one-pass', 'count': 1, 'pct': 50.0},
+            {'path': 'blocked', 'count': 1, 'pct': 50.0},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_aggregated_card_paths_count_no_cancel(
+        self, cancels_conn, empty_escalations_dir,
+    ):
+        result = await aggregate_completion_paths(
+            [cancels_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+        assert result['proj'] == [
+            {'path': 'one-pass', 'count': 1, 'pct': 50.0},
+            {'path': 'blocked', 'count': 1, 'pct': 50.0},
+        ]
