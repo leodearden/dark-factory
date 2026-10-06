@@ -1052,7 +1052,7 @@ def test_focus_handoff_retries_then_reports_a_miss(
             continue
         miss_state, miss_setter = state, setter
         break
-    assert miss_state is not None, (
+    assert miss_state is not None and miss_setter is not None, (
         'no `uS` state is both written by the focus effect\'s no-row branch and '
         'the gate on the `data-testid="esc-focus-miss"` subtree. A miss must be '
         'recorded by the branch that observed it AND displayed — the operator '
