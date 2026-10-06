@@ -4317,10 +4317,10 @@ def test_run_census_dry_run_filing_writes_payloads_and_files_nothing(tmp_path, c
 # codebook merge, the promotions, codebook.dump and advance_census_state all
 # really happened, so re-running the census files NOTHING (the same confusions
 # now code as `matches` against the advanced codebook, `_novel_clusters` comes
-# back empty, build_task_payloads returns [], and _census_window_dates has
-# re-anchored at this run's last_census_at so the earlier window is never
-# enumerated again). Advertising a re-run as the recovery path sends the
-# operator down a road that silently drops the remediation work.
+# back empty, build_task_payloads returns [], and the mined sessions are
+# ledgered as coded, so no later census mines them again). Advertising a re-run
+# as the recovery path sends the operator down a road that silently drops the
+# remediation work.
 # ---------------------------------------------------------------------------
 
 def test_run_census_dry_run_warning_states_advanced_state_and_no_rerun_recovery(
@@ -4365,6 +4365,11 @@ def test_run_census_dry_run_warning_states_advanced_state_and_no_rerun_recovery(
 
     # (c) names hand-filing the payload file as the remaining path
     assert "hand" in msg
+
+    # (c2) names the ledger as why the sessions are not mined again; the
+    # retired window re-anchoring is not offered as the reason
+    assert "ledger" in msg
+    assert "re-anchor" not in msg
 
     # (d) THE FINDING: never advertise a re-run as recovery. A second census
     # cannot re-file these payloads, so pointing the operator at one loses
@@ -4752,6 +4757,33 @@ def test_main_exits_nonzero_and_names_the_quarantine_when_the_census_did_not_lan
 
     assert exit_code == 1
     assert str(quarantine_dir) in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("ledger_error", [None, "/state/coded-sessions.sqlite: disk I/O error"])
+def test_main_done_line_names_a_ledger_write_failure_only_when_there_was_one(
+    tmp_path, monkeypatch, capsys, ledger_error,
+):
+    _write_legibility_yaml(tmp_path)
+    monkeypatch.setattr(mod, "run_census", _make_fake_main_run_census(outcome=mod.CensusOutcome(
+        status="done", report_path="plans/confusion-census-2026-01-02.md",
+        filed_ticket_ids=["tkt_1234"], stop_reason="exhausted",
+        ledger_write_error=ledger_error,
+    )))
+
+    exit_code = mod.main(["--project-root", str(tmp_path), "--force"])
+
+    assert exit_code == 0
+    [done_line] = [
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("census: done")
+    ]
+    if ledger_error is None:
+        assert done_line == (
+            "census: done -- report=plans/confusion-census-2026-01-02.md "
+            "filed_tickets=1 stop_reason=exhausted"
+        )
+    else:
+        assert "ledger_write_failed" in done_line
+        assert ledger_error in done_line
 
 
 def test_main_wires_a_roll_back_bound_to_the_censused_project(tmp_path, monkeypatch):
