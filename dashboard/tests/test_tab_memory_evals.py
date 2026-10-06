@@ -783,7 +783,7 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         (r'\{\s*ev\.truncated\s*&&\s*\(',),
     ),
     (
-        # `localStorage` is real code in this file (the persisted open-state
+        # `localStorage` was real code in this file (the persisted open-state
         # helpers), so the old alternation stayed green with `<details` deleted
         # — it was answered by a different feature entirely. `\s` spans the
         # newline before `open={provOpen}`.
@@ -2747,7 +2747,7 @@ def test_limits_provenance_rendered(
     # Compact / expandable so provenance does not dominate the card.
     #
     # Narrowed to the <details> element carrying an `open=` attribute. The old
-    # alternation also accepted `localStorage`, which is real code in this file
+    # alternation also accepted `localStorage`, which was real code in this file
     # for the persisted open-state helpers — so it stayed green with `<details`
     # deleted, answered by a different feature entirely.
     #
@@ -2852,18 +2852,14 @@ def test_limits_provenance_open_state_is_per_eval(
         'rather than per-section.'
     )
     initializer = state_decl.group(3)
-    read_helpers = sorted({
-        fn[0]
-        for m in re.finditer(r'localStorage\.getItem\(', code)
-        if (fn := _enclosing_function(code, m.start())) is not None
-    })
+    read_helpers = _policy_helpers(code, 'readPersisted')
     assert read_helpers, (
-        'no function in tab_memory_evals.jsx reads localStorage — the '
+        'no function in tab_memory_evals.jsx reads through readPersisted — the '
         'provenance open state must still be PERSISTED across reloads.'
     )
     assert any(re.search(r'\b' + re.escape(h) + r'\s*\(', initializer) for h in read_helpers), (
         f'the state initializer {initializer.strip()!r} does not call the '
-        f'localStorage read helper (one of {read_helpers}). The stored open '
+        f'persisted read helper (one of {read_helpers}). The stored open '
         'state must seed the component exactly once at mount.'
     )
 
@@ -2890,7 +2886,7 @@ def test_limits_provenance_open_state_is_per_eval(
     )
 
     # (d) the persisted key is derived from the EVAL IDENTITY, so the key
-    #     expression reaching localStorage varies per card.
+    #     expression reaching storage varies per card.
     assert re.search(r'\bev\.eval_id\b', prov_body), (
         'LimitsProvenance never reads `ev.eval_id`, so its persisted open-state '
         'key cannot vary per eval — one card\'s toggle would expand every other '
@@ -2900,25 +2896,66 @@ def test_limits_provenance_open_state_is_per_eval(
     # (e) the read and write helpers take the key as a PARAMETER rather than
     #     closing over one module constant. This is what makes a single global
     #     key structurally unrepresentable, not merely absent today.
-    for call in ('getItem', 'setItem'):
-        sites = list(re.finditer(
-            r'localStorage\.' + call + r'\(\s*([\w.]+)', code
-        ))
-        assert sites, f'no `localStorage.{call}(` call site found in tab_memory_evals.jsx.'
+    for call in ('readPersisted', 'writePersisted'):
+        sites = list(re.finditer(r'\b' + call + r'\(\s*([\w.]+)', code))
+        assert sites, f'no `{call}(` call site found in tab_memory_evals.jsx.'
         for site in sites:
             first_arg = site.group(1)
             enclosing = _enclosing_function(code, site.start())
             assert enclosing is not None, (
-                f'a `localStorage.{call}(` call sits at module scope — the '
+                f'a `{call}(` call sits at module scope — the '
                 'storage key must be a parameter of an enclosing helper.'
             )
             fn_name, param_names = enclosing
             assert first_arg in param_names, (
-                f'`{fn_name}` passes {first_arg!r} to localStorage.{call}() but '
+                f'`{fn_name}` passes {first_arg!r} to {call}() but '
                 f'its parameters are {param_names}. The storage key must be a '
                 'PARAMETER, so a single module-global key shared by every eval '
                 'card is unrepresentable rather than merely not-currently-written.'
             )
+
+
+def _policy_helpers(code: str, call: str) -> list[str]:
+    """Names of the functions in *code* that call persisted_state.js's *call*."""
+    return sorted({
+        fn[0]
+        for m in re.finditer(r'\b' + call + r'\s*\(', code)
+        if (fn := _enclosing_function(code, m.start())) is not None
+    })
+
+
+def test_provenance_open_state_persists_through_the_policy_module(
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """The provenance open state is stored through persisted_state.js, as a boolean.
+
+    The helpers wrote '1'/'0' straight to localStorage inside a catch that
+    swallowed a failure.  The policy module stores a JSON boolean, drops the key
+    while the state is the default (collapsed), and warns on a failed write.
+    A legacy '1' still reads truthy; a legacy '0' reads falsy and is swept.
+    """
+    code = tab_memory_evals_jsx_code
+    destructure = re.search(r'const\s*\{([^}]*)\}\s*=\s*window\.DF_PERSISTED_STATE\s*;', code)
+    assert destructure is not None, (
+        'tab_memory_evals.jsx must destructure window.DF_PERSISTED_STATE at module scope.'
+    )
+    for call in ('readPersisted', 'writePersisted'):
+        assert re.search(rf'\b{call}\b', destructure.group(1)), (
+            f'tab_memory_evals.jsx destructures DF_PERSISTED_STATE without `{call}`.'
+        )
+        helpers = _policy_helpers(code, call)
+        assert helpers, f'no provenance helper in tab_memory_evals.jsx calls `{call}(`.'
+        for helper in helpers:
+            assert not re.search(r"""['"][01]['"]""", extract_function_body(code, helper)), (
+                f"`{helper}` still encodes the open state as '1'/'0'; pass the boolean "
+                'to the policy module, which stores it as JSON.'
+            )
+    assert not re.search(r'\blocalStorage\b', code), (
+        'tab_memory_evals.jsx reaches localStorage directly; go through readPersisted / writePersisted.'
+    )
+    assert not re.search(r'\bcatch\s*(?:\(\s*\w*\s*\))?\s*\{\s*\}', code), (
+        'tab_memory_evals.jsx still has an empty catch block, which swallows a storage failure unseen.'
+    )
 
 
 # ---------------------------------------------------------------------------

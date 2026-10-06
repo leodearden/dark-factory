@@ -1326,3 +1326,37 @@ def test_tab_escalations_states_the_corpus_age(tab_escalations_jsx_code: str) ->
         'EscalationsTab renders no `{corpusAgeCaption(…)}` — a count read from a '
         'cached walk must say when the walk was.'
     )
+
+
+# ---------------------------------------------------------------------------
+# task 5743: the storage hooks go through persisted_state.js
+# ---------------------------------------------------------------------------
+
+
+def test_escalations_persist_only_through_the_policy_module(tab_escalations_jsx_code: str) -> None:
+    """Every persisted-preference access in tab_escalations.jsx goes through persisted_state.js.
+
+    One place to change the policy, and one place a quota failure is observed:
+    the hooks' own ``try { localStorage... } catch (e) {}`` swallowed it.
+    """
+    code = tab_escalations_jsx_code
+    destructure = re.search(r'const\s*\{([^}]*)\}\s*=\s*window\.DF_PERSISTED_STATE\s*;', code)
+    assert destructure is not None, (
+        'tab_escalations.jsx must destructure window.DF_PERSISTED_STATE at module scope.'
+    )
+    for name in ('readPersisted', 'writePersisted'):
+        assert re.search(rf'\b{name}\b', destructure.group(1)), (
+            f'tab_escalations.jsx destructures DF_PERSISTED_STATE without `{name}`.'
+        )
+    for hook in ('usePersistedState', 'useOpenSet'):
+        body = extract_function_body(code, hook)
+        for name in ('readPersisted', 'writePersisted'):
+            assert re.search(rf'\b{name}\s*\(', body), (
+                f'tab_escalations.jsx {hook} must call `{name}(`.'
+            )
+    assert not re.search(r'\blocalStorage\b', code), (
+        'tab_escalations.jsx reaches localStorage directly; go through readPersisted / writePersisted.'
+    )
+    assert not re.search(r'\bcatch\s*(?:\(\s*\w*\s*\))?\s*\{\s*\}', code), (
+        'tab_escalations.jsx still has an empty catch block, which swallows a storage failure unseen.'
+    )

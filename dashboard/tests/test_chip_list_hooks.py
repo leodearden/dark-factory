@@ -10,6 +10,9 @@ function body at a time.
 whose ``persistKey`` changed between renders would get React's "Rendered fewer
 hooks than expected".  The fix calls ``usePersistedState`` unconditionally and
 makes it tolerate a falsy key.
+
+Both of tabs.jsx's storage hooks also delegate to persisted_state.js, the one
+copy of the storage policy, whose behaviour is pinned under ``node --test``.
 """
 
 from __future__ import annotations
@@ -92,4 +95,32 @@ def test_use_persisted_state_tolerates_a_falsy_key(
         f"usePersistedState's {hook}(...) touches storage with no falsy-key guard, "
         f'so ChipList without a persistKey would read or write the key "undefined": '
         f'{argument!r}'
+    )
+
+
+_POLICY_DESTRUCTURE = re.compile(r'const\s*\{([^}]*)\}\s*=\s*window\.DF_PERSISTED_STATE\s*;')
+_EMPTY_CATCH = re.compile(r'\bcatch\s*(?:\(\s*\w*\s*\))?\s*\{\s*\}')
+
+
+def test_tabs_jsx_persists_only_through_the_policy_module(tabs_jsx_code: str) -> None:
+    """Every persisted-preference access in tabs.jsx goes through persisted_state.js.
+
+    One place to change the policy, and one place a quota failure is observed:
+    the hooks' own ``try { localStorage... } catch (e) {}`` swallowed it.
+    """
+    destructure = _POLICY_DESTRUCTURE.search(tabs_jsx_code)
+    assert destructure is not None, 'tabs.jsx must destructure window.DF_PERSISTED_STATE at module scope.'
+    for name in ('readPersisted', 'writePersisted'):
+        assert re.search(rf'\b{name}\b', destructure.group(1)), (
+            f'tabs.jsx destructures DF_PERSISTED_STATE without `{name}`: {destructure.group(0)!r}'
+        )
+    for hook in ('usePersistedState', 'useOpenSet'):
+        body = extract_function_body(tabs_jsx_code, hook)
+        for name in ('readPersisted', 'writePersisted'):
+            assert re.search(rf'\b{name}\s*\(', body), f'tabs.jsx {hook} must call `{name}(`.'
+    assert not re.search(r'\blocalStorage\b', tabs_jsx_code), (
+        'tabs.jsx reaches localStorage directly; go through readPersisted / writePersisted.'
+    )
+    assert not _EMPTY_CATCH.search(tabs_jsx_code), (
+        'tabs.jsx still has an empty catch block, which swallows a storage failure unseen.'
     )
