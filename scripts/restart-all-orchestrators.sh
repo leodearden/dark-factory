@@ -226,7 +226,9 @@ LEASE_STARTED_TS=""
 # fleet a SECOND time -- three dark_factory runs of 1.26h/0.92h/1.33h that
 # together spent $146.39 and landed zero tasks.
 # 600s shrinks a sweep to ~15m, which shrinks that collision window; it does
-# NOT reduce the restart COUNT. The real fixes are the head-start reference
+# NOT reduce the restart COUNT. Since task 5371 this grace is only the LEGACY
+# gate (pre-5371 units, refused requests); a merge verify in flight is awaited
+# under the two-stage drain above, not killed at 600s. The real fixes are the head-start reference
 # point and an in-flight lease (see the filed tasks); revert this then.
 # TRADE-OFF: a genuinely mid-merge unit now gets 10m, not 75m, before it is
 # force-restarted. I9 keeps that crash-safe (recover_pending_merges), but a

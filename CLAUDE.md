@@ -393,9 +393,9 @@ column reference, and the soak signal to watch:
 **`OPERATIONS.md` §"Fleet redeploy & watchdog"**.
 
 Two things that section used to claim, and that measurement disproved on
-2026-08-24/25: only the **staleness** tier passes `--drain` (the coordinator
-passes no arguments, so it restarts mid-merge units ungated), and the two
-tiers **can** both redeploy inside one 8h window — the clock is stamped only
+2026-08-24/25: only the **staleness** tier passes `--drain` (historical: the
+coordinator passed no arguments then; since task **5371** both tiers pass it),
+and the two tiers **can** both redeploy inside one 8h window — the clock is stamped only
 when a sweep completes, so a long sweep leaves it reading the previous deploy
 throughout. Tasks **4754** and **4755** have since closed this: a sweep now
 holds an in-flight lease that the backstop, the coordinator and (for its
@@ -403,6 +403,13 @@ holds an in-flight lease that the backstop, the coordinator and (for its
 sweep overrunning `orchestrator_restart_lease_max_age_secs` loses the lease
 and degrades to the old collision, and the fused-memory tier has no lease at
 all — so read `--report`'s `FLEET-LEASE:` line rather than assuming.
+
+`--drain` (task 5371) is a two-stage drain: Stage A halts merge admission on
+every unit up front, Stage B restarts a unit only once no merge verify is in
+flight on any host (bounded by each verify's own timeout and
+`ORCH_DRAIN_VERIFY_MAX_WAIT_SECS`). Pre-5371 units and refused requests keep
+the old 600s merge-idle gate. The first sweep after a deploy of that code still
+meets old-code units. Detail: `OPERATIONS.md` §"Reading a drain".
 
 ## Working in the main checkout
 

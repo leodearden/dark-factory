@@ -1296,10 +1296,13 @@ restart:
   clock file (`data/orchestrator/last_redeploy_orchestrator.json`) — see
   the correction below for why that cap does not currently hold,
   delegating the actual restart to
-  `scripts/restart-all-orchestrators.sh --drain` — which is drain-aware
-  (defers a unit that's mid-merge, then force-restarts it after
-  `ORCH_RESTART_FORCE_FIRE_AFTER_SECS` of continuous busy: 10 minutes
-  since 2026-08-26, 75 minutes before that) and stamps the clock only
+  `scripts/restart-all-orchestrators.sh --drain` — a two-stage drain (task
+  5371, see [Reading a drain](#reading-a-drain)) that halts merge admission
+  fleet-wide and restarts a unit only once no merge verify is in flight on any
+  host. Units still on pre-5371 code, and units that refuse the request, keep
+  the legacy merge-idle gate: defer while busy, then force-restart after
+  `ORCH_RESTART_FORCE_FIRE_AFTER_SECS` (10 minutes since 2026-08-26, 75
+  minutes before that). The script stamps the clock only
   once the restart is fully verified (the script exits 0). Note this env
   knob is a *different* setting from the coordinator's
   `orchestrator_restart_force_fire_after_secs` config field below, despite
@@ -1313,7 +1316,8 @@ restart:
   It fires on a clean idle window, or force-fires after
   `orchestrator_restart_force_fire_after_secs` (default 4500s / 75 min) of
   eligibility — bypassing the idle/debounce gates — but honors the same
-  shared 8-hour clock.
+  shared 8-hour clock. Since task 5371 it passes `--drain` too (it is still
+  disabled by config until task 5020).
 
 Both staleness and the coordinator invoke the same
 `restart-all-orchestrators.sh` chokepoint, so **clock-stamping** is defined
@@ -1344,14 +1348,18 @@ verdicts and on why the two are told apart the way they are.
 **Drain behavior is NOT defined once, and the two tiers CAN both redeploy
 inside one 8-hour window.** Two corrections measured 2026-08-24/25:
 
-- Only the staleness backstop passes `--drain`. The coordinator invokes the
-  script with no arguments (`script_args=[]`), so it restarts a mid-merge unit
-  with no drain gate at all. Confirmed from the transient units' own command
-  lines — `orch-fleet-staleness-redeploy.service` carries `--drain`,
-  `orch-selfrestart-on-merge-N.service` does not.
+- Historical, fixed by task 5371: only the staleness backstop passed
+  `--drain`. The coordinator invoked the script with no arguments
+  (`script_args=[]`), so it restarted a mid-merge unit with no drain gate at
+  all (the transient units' command lines showed it:
+  `orch-fleet-staleness-redeploy.service` carried `--drain`,
+  `orch-selfrestart-on-merge-N.service` did not). Both tiers now pass it, from
+  one definition in
+  `orchestrator/src/orchestrator/harness.py::Harness._build_orchestrator_restart_coordinator`.
 - Because the clock is stamped only when a sweep *completes*, a long sweep
   leaves the clock reading the previous deploy for its whole duration, and any
-  other tier's min-interval check then legitimately passes. With one unit stuck
+  other tier's min-interval check then legitimately passes. At the time (before
+  5371's verify-aware drain), with one unit stuck
   reporting `merge_idle:false`, sweeps ran ~81 minutes and the fleet was
   redeployed twice per window — dark_factory runs of 1.26h / 0.92h / 1.33h.
   Task **4754** has since landed the head-start half: both staleness tiers now
@@ -1368,20 +1376,69 @@ inside one 8-hour window.** Two corrections measured 2026-08-24/25:
   its restart for `current_unit` **only** — so a genuinely wedged *other* unit
   is still revived immediately. A lease counts as held only while its recorded
   pid is alive **and** it is younger than
-  `orchestrator_restart_lease_max_age_secs` (7200s), so a SIGKILLed sweep —
+  `orchestrator_restart_lease_max_age_secs` (14400s since task 5371), so a SIGKILLed sweep —
   the one exit no trap can catch — costs at most one delayed window rather
   than wedging the fleet.
 
-  **Still not guaranteed.** The 7200s bound is derived from the worst
-  *legitimate* sweep (~6270s: one permanently-busy unit burning the full
-  busy grace, plus unknown-grace and verify time for the rest). A sweep with
-  **two or more simultaneously-busy units** exceeds it, loses its lease
+  **Still not guaranteed.** The 14400s bound is derived from the worst
+  *legitimate* `--drain` sweep (~13,300s: the whole 11400s
+  `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS` verify-wait cap, plus 7 x (30s verify +
+  120s grace) and 7 x 120s unknown-grace); it was 7200s while the worst sweep
+  was one busy unit burning the 600s-to-4500s busy grace. A sweep that
+  overruns it loses its lease
   mid-sweep and degrades to exactly the pre-4755 collision. And the
   **fused-memory tier has no lease at all** — `fused_memory_staleness_pass`
   can still collide with its own in-flight `restart-fused-memory.sh`, because
   fm's clock is likewise stamped only on completion. So "one deploy per 8h" is
   now the normal case rather than merely the intent, but read the clock file's
   timestamp and the `FLEET-LEASE:` line rather than assuming it.
+
+### Reading a drain
+
+`--drain` (task 5371) runs in two stages. **Stage A**, fleet-wide and up
+front: the script writes `data/fleet/<unit>.drain.json` for every unit. Each
+unit's 15 s merge-heartbeat service honours the request only for its own
+systemd `INVOCATION_ID`, a live sweep pid, and an age within
+`orchestrator_restart_lease_max_age_secs`; it then halts merge *admission* (no
+new merges or verify dispatches) without aborting in-flight verifies. The cost:
+a unit late in the order (dark-factory is restarted last) keeps its lane halted
+until its turn. **Stage B**, per unit: the script classifies the heartbeat
+(`scripts/drain_check.py::classify`) as one of
+
+- `idle` — acknowledged, halted, nothing in flight: restart.
+- `verifying` — a merge verify is inside its own deadline: wait, with no busy
+  grace, until it finishes, goes `overdue`, or the sweep-wide cap
+  `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS` (default 11400, counted once from Stage A)
+  expires.
+- `overdue` — every in-flight verify is past its own command timeout: restart
+  at once.
+- `busy` / `refused` — not acknowledged yet, or the unit declined the request:
+  the legacy merge-idle gate with the 600 s force-fire. A unit still on
+  pre-5371 code never acknowledges, so it stays on this gate.
+- `stale` / `absent` — the unchanged unknown-grace handling.
+
+The **first** sweep after this lands still runs against old-code units, so the
+first drained restart where the new behaviour applies is the second one.
+
+**Where to read it:**
+
+- The unit's heartbeat (`data/fleet/<unit>.json`) carries `drain`
+  (`null`, or `requested_ts` / `admission_halted` / `refused`) and
+  `verifies_in_flight` (task, host, kind, start and deadline per verify).
+- `get_merge_queue` shows the halt under `restart_drain`
+  (`admission_halted`, `admission_halt_reason`, `verifies_in_flight`).
+- One `fleet_drain` event is emitted per honoured request, with outcome
+  `drained` (nothing was in flight at restart), `verifies_killed` (SIGTERM
+  arrived with verifies still in flight) or `abandoned` (the request went away
+  without a restart, e.g. the sweep died).
+
+**A stranded halt cannot exist by construction.** The request is re-evaluated
+on every heartbeat pass, so once the sweep pid is dead (or the request has
+expired or been removed) the next pass lifts the halt, within about 15 s. If
+`restart_drain.admission_halted` stays true, check that the sweep pid is
+still alive (`--report`'s `FLEET-LEASE:` line names it). The `--report`
+MERGE-IDLE columns are unchanged: the watchdog classifies without a drain
+request.
 
 ### Reading a staleness redeploy's registration
 
