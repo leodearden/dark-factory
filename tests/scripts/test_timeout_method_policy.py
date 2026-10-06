@@ -74,6 +74,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import types
 
 import pytest
 
@@ -162,8 +163,15 @@ def _write_probe_suite(tmp_path: pathlib.Path, method: str) -> _ProbeSuite:
     return _ProbeSuite(root=root, ini=ini)
 
 
-def _run_probe_suite(suite: _ProbeSuite, *extra: str) -> subprocess.CompletedProcess[str]:
+def _run_probe_suite(
+    suite: _ProbeSuite,
+    *extra: str,
+    budget_secs: float = PROBE_SUBPROCESS_TIMEOUT_SECS,
+) -> subprocess.CompletedProcess[str]:
     """Run *suite* at ``-n PROBE_WORKERS --dist loadgroup -rA`` plus *extra*.
+
+    A child still running after *budget_secs* is killed and fails the calling
+    test with whatever it had printed.
 
     ``PYTEST_*`` is scrubbed from the child's environment, so an inherited
     ``PYTEST_ADDOPTS``, ``PYTEST_TIMEOUT`` or ``PYTEST_XDIST_WORKER`` cannot
@@ -197,16 +205,16 @@ def _run_probe_suite(suite: _ProbeSuite, *extra: str) -> subprocess.CompletedPro
             env=env,
             capture_output=True,
             text=True,
-            timeout=PROBE_SUBPROCESS_TIMEOUT_SECS,
+            timeout=budget_secs,
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
         pytest.fail(
-            'the probe child did not finish within PROBE_SUBPROCESS_TIMEOUT_SECS '
-            f'= {PROBE_SUBPROCESS_TIMEOUT_SECS}s. A starved child and a wedged '
-            'one look the same here; the partial output shows how far it got: '
-            'the header alone means it was stuck in startup, and progress '
-            f'characters without an F mean {BLOCKING_TEST} never timed out.\n'
+            f'the probe child did not finish within its budget of {budget_secs}s. '
+            'A starved child and a wedged one look the same here; the partial '
+            'output shows how far it got: the header alone means it was stuck '
+            'in startup, and progress characters without an F mean '
+            f'{BLOCKING_TEST} never timed out.\n'
             f'{_captured(exc)}',
             pytrace=False,
         )
@@ -333,6 +341,89 @@ def test_a_timed_out_probe_child_reports_its_partial_output() -> None:
     assert "b'" not in report, report
 
 
+def test_a_probe_child_that_outlives_its_budget_fails_the_calling_test(
+    tmp_path: pathlib.Path,
+) -> None:
+    budget_secs = 0.5
+    # --timeout=0 lifts the cap on BLOCKING_TEST, so the child can never finish;
+    # -n 0 runs it in the child itself, so the kill leaves no xdist worker behind.
+    never_finishes = ('--timeout=0', '-n', '0')
+
+    with pytest.raises(pytest.fail.Exception) as failure:
+        _run_probe_suite(
+            _write_probe_suite(tmp_path, SIGNAL_METHOD),
+            *never_finishes,
+            budget_secs=budget_secs,
+        )
+
+    report = str(failure.value)
+    assert f'within its budget of {budget_secs}s' in report, report
+    assert 'stdout:' in report and 'stderr:' in report, report
+
+
+@pytest.mark.parametrize(
+    ('output', 'plugins'),
+    [
+        (
+            'rootdir: /suite\nplugins: xdist-3.8.0, timeout-2.4.0\ncollected 9 items\n',
+            {'xdist', 'timeout'},
+        ),
+        ('plugins: rerun-failures-16.1\n', {'rerun-failures'}),
+        ('rootdir: /suite\ncollected 9 items\n', None),
+    ],
+    ids=['measured-pair', 'hyphenated-name', 'no-header'],
+)
+def test_header_plugins_names_each_plugin_without_its_version(
+    output: str, plugins: set[str] | None,
+) -> None:
+    assert _header_plugins(output) == plugins
+
+
+def _timeout_marks(module: types.ModuleType) -> list[tuple[str, float]]:
+    """``(marked name, seconds)`` for every timeout mark in *module* that sets a timeout.
+
+    Read off the module's own objects rather than its collected items, so a test
+    that -k deselected still counts and nothing is collected a second time.
+    """
+    carriers = [(module.__name__, module)] + [
+        (name, obj) for name, obj in vars(module).items() if name.startswith(('test_', 'Test'))
+    ]
+    found: list[tuple[str, float]] = []
+    for name, carrier in carriers:
+        marks = getattr(carrier, 'pytestmark', [])
+        for mark in marks if isinstance(marks, list) else [marks]:
+            if mark.name != 'timeout':
+                continue
+            secs = mark.args[0] if mark.args else mark.kwargs.get('timeout')
+            if secs is not None:
+                found.append((name, secs))
+    return found
+
+
+def test_timeout_marks_finds_every_mark_that_sets_a_timeout() -> None:
+    @pytest.mark.timeout(120)
+    def test_positional() -> None: ...
+
+    @pytest.mark.timeout(timeout=90)
+    def test_keyword() -> None: ...
+
+    @pytest.mark.timeout(method=THREAD_METHOD)
+    def test_method_only() -> None: ...
+
+    @pytest.mark.timeout(5)
+    def helper() -> None: ...
+
+    module = types.ModuleType('marked')
+    vars(module).update(
+        {fn.__name__: fn for fn in (test_positional, test_keyword, test_method_only, helper)},
+        pytestmark=pytest.mark.timeout(30),
+    )
+
+    assert sorted(_timeout_marks(module)) == [
+        ('marked', 30), ('test_keyword', 90), ('test_positional', 120),
+    ]
+
+
 def test_the_probes_take_this_runs_per_test_timeout_and_the_child_budget_sits_below_it(
     request: pytest.FixtureRequest,
 ) -> None:
@@ -340,16 +431,8 @@ def test_the_probes_take_this_runs_per_test_timeout_and_the_child_budget_sits_be
     axe = pytest_timeout.get_env_settings(request.config).timeout
     if not axe:
         pytest.skip('no per-test timeout configured, nothing can truncate a probe')
-    module = request.node.getparent(pytest.Module)
-    assert module is not None
 
-    # Re-collected, so the probes' marks are seen even when -k deselected them.
-    marked = {
-        item.name: marker.args[0] if marker.args else marker.kwargs['timeout']
-        for item in module.collect()
-        if (marker := item.get_closest_marker('timeout')) is not None
-    }
-    tightening = {name: secs for name, secs in marked.items() if secs < axe}
+    tightening = [(name, secs) for name, secs in _timeout_marks(request.module) if secs < axe]
     assert not tightening, (
         f'{tightening!r} carry a timeout mark below this run\'s per-test timeout '
         f'of {axe}s. A pytest-timeout mark REPLACES the run\'s budget in both '
