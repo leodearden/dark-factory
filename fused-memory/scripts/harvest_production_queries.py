@@ -89,33 +89,95 @@ import json
 import random
 import re
 import sqlite3
+import string
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from fused_memory.models.scope import resolve_main_checkout
 
 # --------------------------------------------------------------------------
-# The briefing-assembler query family
+# The briefing-assembler query classes
 # --------------------------------------------------------------------------
-#: The three literal briefing queries, in the order briefing.py fires them.
-LITERAL_TEMPLATES: tuple[str, ...] = (
+#: The three literal briefing queries task 3659 retired, in their old firing
+#: order. Their source is gone, so this is now their only home.
+RETIRED_LITERAL_TEMPLATES: tuple[str, ...] = (
     'project overview architecture goals',
     'coding conventions and project norms',
     'recent decisions and rationale',
 )
 
-#: The parameterized fourth query, kept in `str.format` shape so the
+#: The retired parameterized query, kept in `str.format` shape so the
 #: template string itself is what lands in the fixture and the report.
-TASK_TEMPLATE = 'task {task_id} context and related decisions'
+RETIRED_TASK_TEMPLATE = 'task {task_id} context and related decisions'
 
-#: The pattern the parameterized family is matched by. The task id is any
-#: run of non-space characters: ids in this repo are numeric ('4004') but
-#: subtask ids carry a dot ('3.1'), so the class must not assume \d+.
-TASK_TEMPLATE_RE = re.compile(r'^task (?P<task_id>\S+) context and related decisions$')
+
+class BriefingEra(StrEnum):
+    """Whether a class is fired by today's briefing or only by older journal rows."""
+
+    RETIRED = 'retired'
+    CURRENT = 'current'
+
+
+class MatchKind(StrEnum):
+    """How a class recognises its ops."""
+
+    LITERAL = 'literal'
+    PARAMETERIZED = 'parameterized'
+
+
+@dataclass(frozen=True)
+class BriefingClass:
+    """One briefing query class: its template and how an op is matched to it."""
+
+    template: str
+    match: MatchKind
+    era: BriefingEra
+    pattern: re.Pattern[str]
+
+
+#: Field patterns narrower than "anything". A task id is any run of
+#: non-space characters: ids are numeric ('4004') but subtask ids carry a
+#: dot ('3.1'), so the class must not assume \d+.
+_FIELD_PATTERNS: dict[str, str] = {'task_id': r'\S+'}
+_ANY_FIELD_PATTERN = '.+'
+
+
+def _template_fields(template: str) -> tuple[str, ...]:
+    return tuple(
+        name for _, name, _, _ in string.Formatter().parse(template) if name is not None
+    )
+
+
+def _template_pattern(template: str) -> re.Pattern[str]:
+    """Render a `str.format` template into the pattern its instances fullmatch."""
+    parts: list[str] = []
+    for literal, name, _, _ in string.Formatter().parse(template):
+        parts.append(re.escape(literal))
+        if name is not None:
+            parts.append(f'(?P<{name}>{_FIELD_PATTERNS.get(name, _ANY_FIELD_PATTERN)})')
+    return re.compile(''.join(parts))
+
+
+def _pattern_class(template: str, era: BriefingEra) -> BriefingClass:
+    return BriefingClass(
+        template=template,
+        match=MatchKind.PARAMETERIZED if _template_fields(template) else MatchKind.LITERAL,
+        era=era,
+        pattern=_template_pattern(template),
+    )
+
+
+RETIRED_CLASSES: tuple[BriefingClass, ...] = tuple(
+    _pattern_class(template, BriefingEra.RETIRED)
+    for template in (*RETIRED_LITERAL_TEMPLATES, RETIRED_TASK_TEMPLATE)
+)
+
+BRIEFING_CLASSES: tuple[BriefingClass, ...] = RETIRED_CLASSES
 
 #: briefing.py:1376 fires the family at limit=5, not the E2 default of 10.
 #: This is a fact about the BRIEFING ASSEMBLER only. It is never stamped onto
@@ -181,8 +243,11 @@ class TemplateClass:
     template: str
     """The template the class was matched by (== `text` for literals)."""
 
-    match: str
+    match: MatchKind
     """``'literal'`` or ``'parameterized'``."""
+
+    era: BriefingEra
+    """``'retired'`` or ``'current'``."""
 
     observed_count: int
     """Search ops in this class, summed across every instance."""
@@ -281,6 +346,7 @@ class HarvestResult:
                     'text': t.text,
                     'template': t.template,
                     'match': t.match,
+                    'era': t.era,
                     'observed_count': t.observed_count,
                     'traffic_share': t.traffic_share,
                     'distinct_instances': t.distinct_instances,
@@ -325,17 +391,15 @@ def _connect_readonly(db_path: Path | str) -> sqlite3.Connection:
     return con
 
 
-def _classify(text: str) -> tuple[str, str] | None:
-    """Return (template, match_kind) for `text`, or None if it is tail.
+def _classify(text: str) -> BriefingClass | None:
+    """The briefing class `text` belongs to, or None if it is tail.
 
-    The parameterized family is matched by PATTERN. Matching it literally
+    A parameterized class is matched by PATTERN. Matching it literally
     would scatter one class across thousands of singletons.
     """
-    if text in LITERAL_TEMPLATES:
-        return text, 'literal'
-    if TASK_TEMPLATE_RE.match(text):
-        return TASK_TEMPLATE, 'parameterized'
-    return None
+    return next(
+        (cls for cls in BRIEFING_CLASSES if cls.pattern.fullmatch(text)), None
+    )
 
 
 def _query_op(params: str | None) -> tuple[str, int | None] | None:
@@ -407,6 +471,34 @@ def _share(count: int, total: int) -> float | None:
     if total <= 0:
         return None
     return round(count / total, 6)
+
+
+def _template_class(
+    cls: BriefingClass,
+    instances: Counter[str],
+    limits: Counter[int | None],
+    total: int,
+) -> TemplateClass:
+    """Measure one class from its per-text instance counts and its limits."""
+    observed = sum(instances.values())
+    # The fixture text is the most-frequent real instance, so a parameterized
+    # class carries production text rather than a '{field}' placeholder.
+    text = (
+        min(instances.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+        if instances
+        else cls.template
+    )
+    return TemplateClass(
+        text=text,
+        template=cls.template,
+        match=cls.match,
+        era=cls.era,
+        observed_count=observed,
+        traffic_share=_share(observed, total),
+        distinct_instances=len(instances),
+        observed_limits=_limit_histogram(limits),
+        observed_limit=_unanimous_limit(limits),
+    )
 
 
 def _main_checkout_root() -> Path:
@@ -550,61 +642,33 @@ def harvest(
     total = sum(counts.values())
 
     # Fold every observed query into its class.
-    literal_counts: dict[str, int] = {t: 0 for t in LITERAL_TEMPLATES}
-    family_counts: Counter[str] = Counter()
-    tail_counts: Counter[str] = Counter()
-    literal_limits: dict[str, Counter[int | None]] = {
-        t: Counter() for t in LITERAL_TEMPLATES
+    class_instances: dict[BriefingClass, Counter[str]] = {
+        cls: Counter() for cls in BRIEFING_CLASSES
     }
-    family_limits: Counter[int | None] = Counter()
+    class_limits: dict[BriefingClass, Counter[int | None]] = {
+        cls: Counter() for cls in BRIEFING_CLASSES
+    }
+    tail_counts: Counter[str] = Counter()
     tail_limits: Counter[int | None] = Counter()
     for text, n in counts.items():
-        classified = _classify(text)
+        cls = _classify(text)
         seen_limits = limits.get(text, Counter())
-        if classified is None:
+        if cls is None:
             tail_counts[text] += n
             tail_limits.update(seen_limits)
-        elif classified[1] == 'literal':
-            literal_counts[text] += n
-            literal_limits[text].update(seen_limits)
         else:
-            family_counts[text] += n
-            family_limits.update(seen_limits)
+            class_instances[cls][text] += n
+            class_limits[cls].update(seen_limits)
 
-    templates: list[TemplateClass] = [
-        TemplateClass(
-            text=text,
-            template=text,
-            match='literal',
-            observed_count=literal_counts[text],
-            traffic_share=_share(literal_counts[text], total),
-            observed_limits=_limit_histogram(literal_limits[text]),
-            observed_limit=_unanimous_limit(literal_limits[text]),
-        )
-        for text in LITERAL_TEMPLATES
+    templates = [
+        _template_class(cls, class_instances[cls], class_limits[cls], total)
+        for cls in BRIEFING_CLASSES
     ]
-    family_total = sum(family_counts.values())
-    # The family's fixture text is its most-frequent real instance, so the
-    # fixture carries production text rather than a '{task_id}' placeholder.
-    family_text = (
-        min(family_counts.items(), key=lambda kv: (-kv[1], kv[0]))[0]
-        if family_counts
-        else TASK_TEMPLATE.format(task_id='0000')
-    )
-    templates.append(
-        TemplateClass(
-            text=family_text,
-            template=TASK_TEMPLATE,
-            match='parameterized',
-            observed_count=family_total,
-            traffic_share=_share(family_total, total),
-            distinct_instances=len(family_counts),
-            observed_limits=_limit_histogram(family_limits),
-            observed_limit=_unanimous_limit(family_limits),
-        )
-    )
 
-    literal_total = sum(literal_counts.values())
+    literal_total = sum(
+        t.observed_count for t in templates if t.match is MatchKind.LITERAL
+    )
+    family_total = sum(t.observed_count for t in templates)
     tail_total = sum(tail_counts.values())
 
     # --- deterministic tail sample -------------------------------------
@@ -650,6 +714,7 @@ def harvest(
                 'source': 'briefing_template',
                 'template': tpl.template,
                 'match': tpl.match,
+                'era': tpl.era,
                 'observed_count': tpl.observed_count,
                 'observed_limit': tpl.observed_limit,
                 'observed_limits': tpl.observed_limits,
@@ -685,15 +750,15 @@ def harvest(
         tail_distinct=len(tail_counts),
         tail_share=_share(tail_total, total),
         literal_share=_share(literal_total, total),
-        # The UNION of all four briefing templates, not the parameterized
-        # family alone -- see `HarvestResult.family_share`.
-        family_share=_share(literal_total + family_total, total),
+        # The UNION of every briefing class, not the parameterized family
+        # alone -- see `HarvestResult.family_share`.
+        family_share=_share(family_total, total),
         journal_path=_repo_relative(db_path),
         tail_sample=tail_sample,
         tail_top=tail_top,
         seed=seed,
         briefing_observed_limits=_limit_histogram(
-            sum(literal_limits.values(), Counter()) + family_limits
+            sum(class_limits.values(), Counter())
         ),
         tail_observed_limits=_limit_histogram(tail_limits),
         harvested_at=datetime.now(UTC).isoformat(),
