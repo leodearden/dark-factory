@@ -166,6 +166,8 @@ from orchestrator.merge_lane.types import (
     TerminalOutcomeRecord,
     TerminalOutcomeRetention,
     TrainCallbackFactory,
+    VerifyInFlight,
+    VerifyInFlightKind,
     VerifyWorktreeHandle,
     _HostUnavailability,
     _InFlightEntry,
@@ -8296,9 +8298,10 @@ def _request_of(obj: MergeRequest | SpeculativeItem | InflightEntry) -> MergeReq
     docstring). Kept literally beside it so a future FOURTH ``_live_items``
     shape has exactly one place to be taught.
 
-    Sole caller: :meth:`SpeculativeMergeWorker._coalesce_reentrant_drain`,
+    Callers: :meth:`SpeculativeMergeWorker._coalesce_reentrant_drain`,
     which needs the live object's ``result`` future — not just its id — to tell
-    a re-drain of the LIVE ORIGINAL apart from a duplicate twin.
+    a re-drain of the LIVE ORIGINAL apart from a duplicate twin; and
+    :meth:`SpeculativeMergeWorker._verifies_in_flight`, which needs its config.
     """
     if isinstance(obj, InflightEntry):
         return obj.item.request
@@ -8495,6 +8498,10 @@ def _alarm_coalesce_live_original(
             },
         )
 
+
+# Registry states in which the lane holds an item with no in-flight entry
+# for it: the restart drain counts these as in flight (task 5371).
+_HELD_STATES = frozenset({ItemLifecycleState.MERGING, ItemLifecycleState.DISPATCHING})
 
 _REGISTRY_STATE_TO_WIRE: dict[ItemLifecycleState, str] = {
     ItemLifecycleState.QUEUED: 'queued',
@@ -9526,6 +9533,14 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # merges; cleared by unhalt_all_lanes(). Distinct from the per-lane halt
         # state so the automatic WIP-halt path (halt_for_wip) never aborts a verify.
         self._operator_halt = asyncio.Event()
+        # Restart-drain admission halt (task 5371): while set, no new merge or
+        # verify starts and nothing in flight is aborted. Never an escalation
+        # halt — see halt_admission.
+        self._admission_halt_reason: str | None = None
+        # When each item the lane holds mid-merge or mid-dispatch got there
+        # (restamped as a train's inline verify starts), for the restart
+        # drain's deadlines.
+        self._held_since: dict[str, float] = {}
         # Cross-workflow auto-heal attempt counter; shared via
         # self.merge_worker on TaskWorkflow instances.
         self.auto_heal_registry: MainHealthAutoHealRegistry = MainHealthAutoHealRegistry()
@@ -9963,6 +9978,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 event_store=self._event_store,
             )
             return
+        if to_state in _HELD_STATES:
+            self._held_since[request_id] = self._clock.now()
+        elif from_state in _HELD_STATES:
+            self._held_since.pop(request_id, None)
         if live_obj is not None:
             self._live_items[request_id] = live_obj
 
@@ -11567,7 +11586,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         as the merger loop's dequeued item, the registry already reads
         MERGING for it (task 2435 kappa-b: formerly illustrated by the
         now-deleted ``self._inflight_req = req`` assignment).
+
+        Returns None too while admission is halted (:meth:`halt_admission`).
         """
+        if self.is_admission_halted:
+            return None
         graph = self._suffix_conflict_graph
         for lane in MERGE_LANES:  # high → normal
             if self.is_lane_halted(lane):
@@ -13341,6 +13364,65 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         drift = self._merge_metrics.main_position - base
         self._merge_metrics.record_drift(drift)
 
+    @property
+    def is_admission_halted(self) -> bool:
+        """True while :meth:`halt_admission` holds new merges and verifies back."""
+        return self._admission_halt_reason is not None
+
+    def halt_admission(self, reason: str) -> None:
+        """Start no new merge or verify; let everything in flight finish (task 5371).
+
+        The restart drain's stage A. The merger picks nothing and a merged
+        item reaching dispatch is requeued as under :meth:`operator_halt`,
+        but unlike that halt no in-flight verify is aborted, no lane reads
+        WIP-halted and no escalation owns it: :meth:`resume_admission` alone
+        reverses it. Idempotent.
+        """
+        if self._admission_halt_reason is None:
+            logger.warning('Merge admission halted: %s', reason)
+        self._admission_halt_reason = reason
+
+    def resume_admission(self) -> None:
+        """Reverse :meth:`halt_admission` and wake the merger. Idempotent."""
+        if self._admission_halt_reason is None:
+            return
+        logger.info('Merge admission resumed (was halted: %s)', self._admission_halt_reason)
+        self._admission_halt_reason = None
+        self._signal_resume()
+
+    def _verifies_in_flight(self, now: float) -> list[VerifyInFlight]:
+        """Every merge verify a restart would kill now, on any host (task 5371).
+
+        The frozen entries (dispatched verifies and the finalize head), then
+        every other item the lane holds mid-merge or mid-dispatch — a train
+        verifying inline in the merger among them, which no entry represents
+        (task 5245), and a dispatch that passed the admission gate just
+        before a halt and has yet to start its verify.
+        """
+        held = self._frozen_inflight_entries()
+        found = [
+            VerifyInFlight.for_request(
+                entry.item.request,
+                host=entry.lease.name if entry.lease is not None else None,
+                kind=VerifyInFlightKind.for_phase(self._entry_phase(entry)),
+                started_ts=entry.started_at if entry.started_at is not None else now,
+            )
+            for entry in held
+        ]
+        held_ids = {entry.item.request.request_id for entry in held}
+        for rid, state in self._lifecycle.non_terminal_items().items():
+            if state not in _HELD_STATES or rid in held_ids:
+                continue
+            request = _request_of(self._live_items[rid])
+            is_train = isinstance(request, GroupMergeRequest)
+            found.append(VerifyInFlight.for_request(
+                request,
+                host=LocalRunner.name if is_train else None,
+                kind=VerifyInFlightKind.held(state.value, is_train=is_train),
+                started_ts=self._held_since.get(rid, now),
+            ))
+        return found
+
     def snapshot(self) -> dict:
         """Return a synchronous read-only snapshot of the merge worker pipeline state.
 
@@ -13397,6 +13479,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
               - free, never asked for  : slot_state == 'free', quarantined False
           is_wip_halted: bool.
           halt_owner_esc_id: str or None.
+          restart_drain: {admission_halted, admission_halt_reason,
+            verifies_in_flight} (task 5371) — the admission halt and every merge
+            verify a restart would kill, from :meth:`_verifies_in_flight`.
           owned_merge_worktrees: sorted resolved absolute path strings for this
             worker's merge-worktree liveness ledger (the paths
             _touch_owned_merge_worktrees heartbeats).  Read by
@@ -13705,6 +13790,13 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             'is_wip_halted': self.is_wip_halted,
             'halt_owner_esc_id': self.halt_owner_esc_id,
             'occupancy': occupancy,
+            # task 5371 additive key: the restart drain's view — admission
+            # halt state and every merge verify a restart would kill.
+            'restart_drain': {
+                'admission_halted': self.is_admission_halted,
+                'admission_halt_reason': self._admission_halt_reason,
+                'verifies_in_flight': [v.to_wire() for v in self._verifies_in_flight(now)],
+            },
             # 3275 additive key: per-host slot state + quarantine class.
             # Backward-compatible (no collision with the existing key set);
             # pure synchronous read via HostAllocator.host_states() — no await,
@@ -15804,6 +15896,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             # the train's DecidedItem base_sha and the
                             # _redrive_coalesce_members is-ancestor checks.
                             actual_main = await self._git_ops.get_main_sha()
+                        self._held_since[req.request_id] = self._clock.now()
                         outcome = await _do_train_merge(self, req)
                         # 1867: coalesce-train derail recovery.
                         # Both hooks below are gated on the coalesce prefix so
@@ -21042,10 +21135,11 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 permit=item.permit,
             )
 
-        # ── Pre-dispatch operator-halt ──────────────────────────────────────
+        # ── Pre-dispatch operator-halt / admission halt ─────────────────────
         # immediate_outcome items (trains / already-decided) are NOT halted here;
         # they fall through to the passthrough branch so they resolve in order.
-        if self._operator_halt.is_set() and isinstance(item, RealMergeItem):
+        halted = self._operator_halt.is_set() or self.is_admission_halted
+        if halted and isinstance(item, RealMergeItem):
             # merge_wt is a required non-Optional Path on RealMergeItem — no
             # None/truthy guard needed here (task ο).
             with contextlib.suppress(BaseException):
