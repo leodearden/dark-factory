@@ -14,6 +14,7 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import check_census_report
@@ -64,11 +65,11 @@ SECTIONS = (
 )
 
 
-def method_for(stem: str) -> dict:
+def method_for(stem: str, project: str = "dark_factory") -> dict:
     """METHOD with the run_id the contract §5 basename rule gives *stem*."""
     suffix = stem.removeprefix("confusion-census-")
     date, _, n = suffix[:10], suffix[10:11], suffix[11:]
-    run_id = "census-dark_factory-" + date.replace("-", "") + (f"-{n}" if n else "")
+    run_id = f"census-{project}-" + date.replace("-", "") + (f"-{n}" if n else "")
     return {**copy.deepcopy(METHOD), "run_id": run_id}
 
 
@@ -298,24 +299,22 @@ def yaml_error_text(text: str) -> str:
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "detail"),
     [
-        "```yaml\nrun_id: census-dark_factory-20261020\n",
-        "```yaml\n" + UNPARSEABLE_YAML + "```\n",
-        "```yaml\n- run_id\n- as_of_sha\n```\n",
+        ("```yaml\nrun_id: census-dark_factory-20261020\n", "never closes"),
+        ("```yaml\n" + UNPARSEABLE_YAML + "```\n", yaml_error_text(UNPARSEABLE_YAML)),
+        ("```yaml\n- run_id\n- as_of_sha\n```\n", "not a mapping"),
     ],
     ids=["unclosed-fence", "invalid-yaml", "yaml-list"],
 )
-def test_method_block_unparseable_or_not_a_mapping_is_malformed(tmp_path, capsys, body):
-    write_report(tmp_path / "plans", STEM, bodies={"Method": body})
+def test_method_block_unparseable_or_not_a_mapping_is_malformed(tmp_path, capsys, body, detail):
+    write_report(tmp_path / "plans", STEM, bodies={"Method": body, "Synthesis": "```\nan example\n```\n"})
 
     rc, lines, verdict = run(tmp_path, capsys)
 
     assert_nonconforming(rc, verdict)
     assert "## Method yaml block" in verdict["malformed"]
-    if UNPARSEABLE_YAML in body:
-        error = yaml_error_text(UNPARSEABLE_YAML)
-        assert any("## Method yaml block" in line and error in line for line in lines)
+    assert any("## Method yaml block" in line and detail in line for line in lines[1:-1])
 
 
 def test_method_key_outside_extra_is_malformed(tmp_path, capsys):
@@ -391,10 +390,6 @@ def test_finding_missing_contract_fields_is_named(tmp_path, capsys):
         assert any("fk-aaaaaaaaaaaa" in line and f"findings[1].{field}" in line for line in lines[1:-1])
 
 
-def test_the_fixture_finding_carries_every_contract_field():
-    assert set(FINDING) == set(CONTRACT_FINDING_FIELDS)
-
-
 @pytest.mark.parametrize("field", CONTRACT_FINDING_FIELDS)
 def test_each_contract_field_is_required(tmp_path, capsys, field):
     write_report(tmp_path / "plans", STEM, findings=[finding_lacking(field)])
@@ -458,21 +453,21 @@ def test_unparseable_record_is_malformed(tmp_path, capsys):
 SUFFIXED_STEM = "confusion-census-2026-10-20-2"
 
 
-def test_the_fixture_run_id_carries_the_basename_suffix():
-    assert method_for(SUFFIXED_STEM)["run_id"] == "census-dark_factory-20261020-2"
-
-
-@pytest.mark.parametrize(("incomplete", "expected_rc"), [(SUFFIXED_STEM, 1), (STEM, 0)], ids=["suffixed-incomplete", "unsuffixed-incomplete"])
-def test_same_day_suffix_is_newer(tmp_path, capsys, incomplete, expected_rc):
-    for stem in (STEM, SUFFIXED_STEM):
-        sections = without(SECTIONS, "Adjudication") if stem == incomplete else SECTIONS
-        write_report(tmp_path / "plans", stem, sections=sections)
+@pytest.mark.parametrize(
+    ("older", "newer"),
+    [(STEM, SUFFIXED_STEM), (STEM, f"{STEM}-1"), (SUFFIXED_STEM, f"{STEM}-10")],
+    ids=["unsuffixed-then-2", "unsuffixed-then-1", "2-then-10"],
+)
+@pytest.mark.parametrize("newer_complete", [True, False], ids=["newer-complete", "newer-incomplete"])
+def test_same_day_suffix_is_newer(tmp_path, capsys, older, newer, newer_complete):
+    for stem, complete in ((older, not newer_complete), (newer, newer_complete)):
+        write_report(tmp_path / "plans", stem, sections=SECTIONS if complete else without(SECTIONS, "Adjudication"))
 
     rc, _, verdict = run(tmp_path, capsys)
 
-    assert rc == expected_rc
-    assert verdict["report"] == f"plans/{SUFFIXED_STEM}.md"
-    assert ("## Adjudication" in verdict["missing"]) == (expected_rc == 1)
+    assert verdict["report"] == f"plans/{newer}.md"
+    assert rc == (0 if newer_complete else 1)
+    assert ("## Adjudication" in verdict["missing"]) == (not newer_complete)
 
 
 def test_payloads_file_is_not_a_report(tmp_path, capsys):
@@ -483,6 +478,22 @@ def test_payloads_file_is_not_a_report(tmp_path, capsys):
 
     assert rc == 0
     assert verdict["report"] == f"plans/{STEM}.md"
+
+
+@pytest.mark.parametrize("record", [True, False], ids=["with-record", "rendering-only"])
+def test_undecodable_rendering_is_malformed(tmp_path, capsys, record):
+    undecodable = b"## Method\n\xff\xfe\n"
+    write_report(tmp_path / "plans", STEM, record=record)
+    (tmp_path / "plans" / f"{STEM}.md").write_bytes(undecodable)
+    with pytest.raises(UnicodeDecodeError) as decode_error:
+        undecodable.decode("utf-8")
+
+    rc, lines, verdict = run(tmp_path, capsys)
+
+    assert_nonconforming(rc, verdict)
+    assert verdict["report"] == f"plans/{STEM}.md"
+    assert f"plans/{STEM}.md" in verdict["malformed"]
+    assert any(f"plans/{STEM}.md" in line and str(decode_error.value) in line for line in lines[1:-1])
 
 
 def test_record_without_rendering_is_named(tmp_path, capsys):
@@ -520,6 +531,16 @@ def test_only_the_record_run_id_disagreeing_is_named(tmp_path, capsys):
     assert verdict["malformed"] == ["record.method.run_id"]
 
 
+@pytest.mark.parametrize("stem", [STEM, SUFFIXED_STEM], ids=["unsuffixed", "suffixed"])
+def test_run_id_project_segment_is_any_project_id(tmp_path, capsys, stem):
+    write_report(tmp_path / "plans", stem, method=method_for(stem, project="Acme-Widgets"))
+
+    rc, _, verdict = run(tmp_path, capsys)
+
+    assert rc == 0
+    assert verdict["verdict"] == "conforms"
+
+
 @pytest.mark.parametrize("run_id", ["review-dark_factory-20261020", "census-20261020"], ids=["wrong-instrument", "no-project"])
 def test_run_id_off_pattern_is_malformed(tmp_path, capsys, run_id):
     write_report(tmp_path / "plans", STEM, method={**method_for(STEM), "run_id": run_id})
@@ -534,6 +555,17 @@ ELISION_RE = re.compile(r"^\.\.\.\+(\d+) more$")
 NOTE_CAP = 400
 
 
+def assert_capped_verdict(lines: list[str], verdict: dict, expected_missing: list[str]) -> None:
+    assert len(lines[-1]) <= NOTE_CAP
+    assert verdict["verdict"] == "nonconforming"
+    assert verdict["report"] == f"plans/{STEM}.md"
+    *kept, marker = verdict["missing"]
+    elided = ELISION_RE.match(marker)
+    assert elided is not None
+    assert kept == expected_missing[: len(kept)]
+    assert len(kept) + int(elided.group(1)) == len(expected_missing)
+
+
 def test_trailing_verdict_fits_the_note_cap(tmp_path, capsys):
     dropped = ("statement", "proposal", "supersedes")
     findings = [finding_lacking(*dropped, key=f"fk-{index:012x}") for index in range(30)]
@@ -544,16 +576,23 @@ def test_trailing_verdict_fits_the_note_cap(tmp_path, capsys):
     rc, lines, verdict = run(tmp_path, capsys)
 
     assert rc == 1
-    assert len(lines[-1]) <= NOTE_CAP
-    assert verdict["verdict"] == "nonconforming"
-    assert verdict["report"] == f"plans/{STEM}.md"
-    *kept, marker = verdict["missing"]
-    elided = ELISION_RE.match(marker)
-    assert elided is not None
-    assert kept == expected[: len(kept)]
-    assert len(kept) + int(elided.group(1)) == len(expected)
+    assert_capped_verdict(lines, verdict, expected)
     for name in expected:
         assert any(f"missing {name}" in line for line in lines[1:-1]), name
+
+
+def test_capping_a_huge_gap_count_stays_well_inside_the_gate_timeout(tmp_path, capsys):
+    count = 2000
+    write_report(tmp_path / "plans", STEM, findings=[{} for _ in range(count)])
+    expected = [f"findings[{index}].{field}" for index in range(count) for field in CONTRACT_FINDING_FIELDS]
+
+    started = time.monotonic()
+    rc, lines, verdict = run(tmp_path, capsys)
+    elapsed = time.monotonic() - started
+
+    assert rc == 1
+    assert_capped_verdict(lines, verdict, expected)
+    assert elapsed < 15
 
 
 def test_complete_report_verdict_is_compact(tmp_path, capsys):

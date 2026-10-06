@@ -35,7 +35,7 @@ SECTIONS = (
     "Structural",
     "Synthesis",
 )
-RUN_ID_RE = re.compile(r"^census-(?P<project>[a-z0-9_]+)-(?P<date>\d{8})(?:-(?P<n>\d+))?$")
+RUN_ID_RE = re.compile(r"^census-(?P<project>.+)-(?P<date>\d{8})(?:-(?P<n>\d+))?$")
 METHOD_KEYS = ("run_id", "as_of_sha", "since", "evidence", "verification", "cost", "inputs_consumed", "extra")
 METHOD_BLOCK = "## Method yaml block"
 FINDING_FIELDS = (
@@ -55,6 +55,7 @@ FINDING_FIELDS = (
     "supersedes",
 )
 NOTE_CAP = 400
+MOST_NAMES_A_NOTE_HOLDS = NOTE_CAP // len('"",')
 
 
 class Verdict(enum.StrEnum):
@@ -112,7 +113,7 @@ def newest_report(plans_dir: Path) -> Report | None:
             halves.setdefault((match["date"], match["n"]), {})[match["ext"]] = path
     if not halves:
         return None
-    (date, suffix), paths = max(halves.items(), key=lambda item: (item[0][0], int(item[0][1] or 1)))
+    (date, suffix), paths = max(halves.items(), key=lambda item: (item[0][0], int(item[0][1] or 0)))
     return Report(date, suffix, record=paths.get("json"), rendering=paths.get("md"))
 
 
@@ -172,10 +173,10 @@ def method_block(md_text: str) -> dict | Gap:
     if first is None or body[first].rstrip() != "```yaml":
         return Gap(GapKind.MISSING, METHOD_BLOCK, f"the first element under {heading(METHOD_TITLE)} is not a ```yaml fence")
     rest = body[first + 1 :]
-    close = next((index for index, line in enumerate(rest) if line.startswith("```")), None)
-    if close is None:
-        return Gap(GapKind.MALFORMED, METHOD_BLOCK, "the ```yaml fence never closes")
-    return parse_method_yaml("\n".join(rest[:close]))
+    end = next((index for index, line in enumerate(rest) if line.startswith(("```", "## "))), len(rest))
+    if end == len(rest) or not rest[end].startswith("```"):
+        return Gap(GapKind.MALFORMED, METHOD_BLOCK, f"the ```yaml fence never closes within {heading(METHOD_TITLE)}")
+    return parse_method_yaml("\n".join(rest[:end]))
 
 
 def check_run_id(run_id: object, name: str, report: Report) -> list[Gap]:
@@ -203,10 +204,20 @@ def check_rendered_method(md_text: str, report: Report) -> list[Gap]:
     return [block] if isinstance(block, Gap) else check_method_mapping(block, "method", report)
 
 
-def load_record(path: Path, shown: str) -> dict | Gap:
+def read_text(path: Path, shown: str) -> str | Gap:
     try:
-        record = json.loads(path.read_text(encoding="utf-8"))
+        return path.read_text(encoding="utf-8")
     except (OSError, ValueError) as exc:
+        return Gap(GapKind.MALFORMED, shown, one_line(str(exc)))
+
+
+def load_record(path: Path, shown: str) -> dict | Gap:
+    text = read_text(path, shown)
+    if isinstance(text, Gap):
+        return text
+    try:
+        record = json.loads(text)
+    except ValueError as exc:
         return Gap(GapKind.MALFORMED, shown, one_line(str(exc)))
     if not isinstance(record, dict):
         return Gap(GapKind.MALFORMED, shown, "not a JSON object")
@@ -249,14 +260,16 @@ def check_record(record: dict | Gap | None, report: Report) -> list[Gap]:
     return check_record_method(record, report) + check_findings(record)
 
 
-def check_rendering(md_text: str | None, report: Report) -> list[Gap]:
-    if md_text is None:
+def check_rendering(rendering: str | Gap | None, report: Report) -> list[Gap]:
+    if rendering is None:
         return []
-    return check_sections(md_text) + check_rendered_method(md_text, report)
+    if isinstance(rendering, Gap):
+        return [rendering]
+    return check_sections(rendering) + check_rendered_method(rendering, report)
 
 
-def predates_header(report: Report, titles: list[str]) -> bool:
-    return report.record is None and METHOD_TITLE not in titles
+def predates_header(report: Report, rendering: str | Gap | None) -> bool:
+    return report.record is None and isinstance(rendering, str) and METHOD_TITLE not in level2_titles(rendering)
 
 
 def names(gaps: tuple[Gap, ...], kind: GapKind) -> list[str]:
@@ -287,9 +300,9 @@ def nonconforming_headline(report: str, gaps: tuple[Gap, ...]) -> str:
     return f"{report} does not conform -- " + "; ".join(parts)
 
 
-def post_header_result(report: Report, md_text: str | None) -> Result:
+def post_header_result(report: Report, rendering: str | Gap | None) -> Result:
     record = load_record(report.record, report.shown("json")) if report.record else None
-    gaps = tuple(check_halves(report) + check_rendering(md_text, report) + check_record(record, report))
+    gaps = tuple(check_halves(report) + check_rendering(rendering, report) + check_record(record, report))
     if not gaps and isinstance(record, dict):
         headline = f"{report.shown_path} conforms ({len(record['findings'])} findings)"
         return Result(Verdict.CONFORMS, report.shown_path, (), headline)
@@ -300,10 +313,10 @@ def check(project_root: Path) -> Result:
     report = newest_report(project_root / PLANS_DIR)
     if report is None:
         return no_report_result(project_root)
-    md_text = report.rendering.read_text(encoding="utf-8") if report.rendering else None
-    if predates_header(report, level2_titles(md_text or "")):
+    rendering = read_text(report.rendering, report.shown("md")) if report.rendering else None
+    if predates_header(report, rendering):
         return predates_header_result(report)
-    return post_header_result(report, md_text)
+    return post_header_result(report, rendering)
 
 
 def gap_line(gap: Gap) -> str:
@@ -314,21 +327,21 @@ def elided(kept: list[str], dropped: int) -> list[str]:
     return [*kept, f"...+{dropped} more"] if dropped else kept
 
 
-def serialise_verdict(result: Result, kept: dict[GapKind, list[str]], dropped: dict[GapKind, int]) -> str:
+def serialise_verdict(result: Result, kept: dict[GapKind, list[str]], totals: dict[GapKind, int]) -> str:
     payload: dict[str, object] = {"verdict": str(result.verdict), "report": result.report}
-    payload |= {str(kind): elided(kept[kind], dropped[kind]) for kind in GapKind}
+    payload |= {str(kind): elided(kept[kind], totals[kind] - len(kept[kind])) for kind in GapKind}
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
 def compact_verdict(result: Result) -> str:
-    kept = {kind: names(result.gaps, kind) for kind in GapKind}
-    dropped = dict.fromkeys(GapKind, 0)
-    text = serialise_verdict(result, kept, dropped)
+    every = {kind: names(result.gaps, kind) for kind in GapKind}
+    totals = {kind: len(every[kind]) for kind in GapKind}
+    kept = {kind: every[kind][:MOST_NAMES_A_NOTE_HOLDS] for kind in GapKind}
+    text = serialise_verdict(result, kept, totals)
     while len(text) > NOTE_CAP and any(kept.values()):
         longer = max(GapKind, key=lambda kind: len(kept[kind]))
         kept[longer].pop()
-        dropped[longer] += 1
-        text = serialise_verdict(result, kept, dropped)
+        text = serialise_verdict(result, kept, totals)
     return text
 
 
