@@ -77,15 +77,19 @@ function useOpenSet(ids, defaultOpen = true, storageKey = null) {
   return [openMap, toggle, setAll];
 }
 
-// generic persisted state hook
+// generic persisted state hook; a falsy key keeps the state in memory only
 function usePersistedState(storageKey, defaultValue) {
   const [v, setV] = uS(() => {
+    if (!storageKey) return defaultValue;
     try {
       const raw = localStorage.getItem(storageKey);
       return raw === null ? defaultValue : JSON.parse(raw);
     } catch (e) { return defaultValue; }
   });
-  uE(() => { try { localStorage.setItem(storageKey, JSON.stringify(v)); } catch (e) {} }, [storageKey, v]);
+  uE(() => {
+    if (!storageKey) return;
+    try { localStorage.setItem(storageKey, JSON.stringify(v)); } catch (e) {}
+  }, [storageKey, v]);
   return [v, setV];
 }
 
@@ -189,7 +193,8 @@ function LockChip({ path, label, module, currentTaskId, currentProject }) {
 
 // Generic chips list with truncate-or-expand. blockers (incomplete deps / taken locks) sort first.
 function ChipList({ items, renderChip, maxInline = 2, persistKey, expandLayout = 'multiline', alwaysToggle = false }) {
-  const [expanded, setExpanded] = persistKey ? usePersistedState(persistKey, false) : uS(false);
+  // Unconditional: picking hooks on persistKey threw "Rendered fewer hooks than expected".
+  const [expanded, setExpanded] = usePersistedState(persistKey, false);
   if (!items || items.length === 0) return <span className="chip-empty">—</span>;
 
   if (expanded) {
