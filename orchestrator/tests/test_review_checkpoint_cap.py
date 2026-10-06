@@ -317,7 +317,7 @@ class TestReviewCheckpointInvocationRecord:
         await checkpoint.run_focused()
 
         cost_store.save_invocation.assert_awaited_once()
-        return cost_store.save_invocation.call_args.kwargs, mock_invoke.call_args.kwargs
+        return cost_store.save_invocation.call_args.kwargs, dict(mock_invoke.call_args.kwargs)
 
     async def test_exact_model_id_is_recorded_beside_the_resolved_alias(self, monkeypatch):
         save_kw, invoke_kw = await self._drive(
