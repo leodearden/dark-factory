@@ -90,42 +90,6 @@ class TestReadCreatedAt:
         (ta.root / 'metadata.json').write_text(json.dumps({'task_id': 'x'}))
         assert ta.read_created_at() is None
 
-    def test_undecodable_metadata_json_returns_none(self, worktree: Path):
-        """A metadata.json that isn't valid UTF-8 raises UnicodeDecodeError
-        (a ValueError, not a json.JSONDecodeError) out of
-        ``Path.read_text()`` before ``json.loads`` ever runs. The "never
-        raises" contract must catch that too, not just malformed JSON.
-
-        ``read_created_at`` reads with ``encoding='utf-8'`` explicitly (matching
-        ``atomic_write_text``'s writer default), so these bytes — an invalid
-        UTF-8 lead byte — are guaranteed to fail decoding rather than json
-        parsing on every platform, regardless of the process locale.
-        """
-        worktree.mkdir()
-        ta = TaskArtifacts(worktree)
-        ta.root.mkdir(parents=True, exist_ok=True)
-        (ta.root / 'metadata.json').write_bytes(b'\xff\xfe{"created_at": "x"}')
-        assert ta.read_created_at() is None
-
-    def test_malformed_json_metadata_returns_none(self, worktree: Path):
-        """The pre-existing ``json.JSONDecodeError`` branch (syntactically
-        invalid but validly-encoded JSON) stays covered alongside the
-        undecodable-bytes branch above."""
-        worktree.mkdir()
-        ta = TaskArtifacts(worktree)
-        ta.root.mkdir(parents=True, exist_ok=True)
-        (ta.root / 'metadata.json').write_text('{not json')
-        assert ta.read_created_at() is None
-
-    def test_non_object_metadata_json_returns_none(self, worktree: Path):
-        """Valid JSON that isn't an object (e.g. a bare list) must not reach
-        ``metadata.get(...)`` and raise AttributeError."""
-        worktree.mkdir()
-        ta = TaskArtifacts(worktree)
-        ta.root.mkdir(parents=True, exist_ok=True)
-        (ta.root / 'metadata.json').write_text('[]')
-        assert ta.read_created_at() is None
-
 
 class TestPlan:
     def test_write_and_read_plan(self, artifacts: TaskArtifacts):
@@ -827,10 +791,6 @@ class TestAgentSession:
         artifacts.clear_agent_session()  # must not raise
         artifacts.clear_agent_session()  # still idempotent
 
-    def test_read_returns_none_on_corrupt_json(self, artifacts: TaskArtifacts):
-        (artifacts.root / 'agent_session.json').write_text('{not valid json')
-        assert artifacts.read_agent_session() is None
-
     def test_write_persists_resume_count(self, artifacts: TaskArtifacts):
         artifacts.write_agent_session(
             'sess-r', 'implementer', 'now', task_id='t-7', resume_count=3,
@@ -914,8 +874,7 @@ class TestEmittedStepEscalations:
     process-local, so an orchestrator restart re-files every prior pair.  These
     emitted ``(step_id, stale_commit)`` keys are persisted to
     ``reconcile_state.json`` in the meta-root and hydrated on the next run so a
-    restarted workflow files at most genuinely-new pairs.  This mirrors the
-    ``TestAgentSession`` read/write/corrupt-fail-safe structure.
+    restarted workflow files at most genuinely-new pairs.
     """
 
     def test_read_returns_empty_set_when_missing(self, artifacts: TaskArtifacts):
@@ -953,12 +912,6 @@ class TestEmittedStepEscalations:
             ('step-2', 'def456'),
         }
 
-    def test_read_returns_empty_set_on_corrupt_json(self, artifacts: TaskArtifacts):
-        # Fail-safe: unreadable JSON reads as an empty set (mirrors
-        # ``test_read_returns_none_on_corrupt_json`` for the agent-session sidecar).
-        (artifacts.root / 'reconcile_state.json').write_text('{not valid json')
-        assert artifacts.read_emitted_step_escalations() == set()
-
     def test_survives_restart_new_instance_same_root(
         self, artifacts: TaskArtifacts, worktree: Path
     ):
@@ -989,10 +942,6 @@ class TestVerdicts:
 
     def test_read_returns_none_when_missing(self, artifacts: TaskArtifacts):
         assert artifacts.read_verdict('missing') is None
-
-    def test_read_returns_none_on_corrupt_json(self, artifacts: TaskArtifacts):
-        (artifacts.root / 'verdicts' / 'judge.json').write_text('{not valid json')
-        assert artifacts.read_verdict('judge') is None
 
     def test_clear_removes_file(self, artifacts: TaskArtifacts):
         envelope = {
@@ -1028,6 +977,70 @@ class TestVerdicts:
     def test_clear_verdict_rejects_unsafe_role(self, artifacts: TaskArtifacts, bad_role):
         with pytest.raises(ValueError, match='invalid verdict role'):
             artifacts.clear_verdict(bad_role)
+
+
+class TestJsonSidecarReadersFailSafe:
+    """Every JSON-sidecar reader shares one fail-safe posture: a corrupt
+    sidecar reads as that reader's fallback value and logs a warning."""
+
+    @pytest.mark.parametrize(
+        ('name', 'read', 'expected'),
+        [
+            pytest.param(
+                'metadata.json',
+                lambda ta: ta.read_created_at(),
+                None,
+                id='created_at',
+            ),
+            pytest.param(
+                'review_state.json',
+                lambda ta: ta.read_review_state(),
+                {'amendment_rounds_total': 0, 'review_cycles_total': 0, 'verdicts': {}},
+                id='review_state',
+            ),
+            pytest.param(
+                'agent_session.json',
+                lambda ta: ta.read_agent_session(),
+                None,
+                id='agent_session',
+            ),
+            pytest.param(
+                'reconcile_state.json',
+                lambda ta: ta.read_emitted_step_escalations(),
+                set(),
+                id='reconcile_state',
+            ),
+            pytest.param(
+                'verdicts/judge.json',
+                lambda ta: ta.read_verdict('judge'),
+                None,
+                id='verdict',
+            ),
+        ],
+    )
+    @pytest.mark.parametrize(
+        'payload',
+        [
+            pytest.param(b'\xff\xfe{"x": 1}', id='undecodable'),
+            pytest.param(b'{not valid json', id='malformed'),
+            pytest.param(b'[1]', id='non_object'),
+        ],
+    )
+    def test_corrupt_sidecar_reads_as_fail_safe_value(
+        self, artifacts: TaskArtifacts, caplog, name, read, expected, payload
+    ):
+        (artifacts.root / name).write_bytes(payload)
+
+        with caplog.at_level('WARNING'):
+            assert read(artifacts) == expected
+
+        basename = Path(name).name
+        assert any(
+            record.name == 'orchestrator.artifacts'
+            and record.levelname == 'WARNING'
+            and basename in record.getMessage()
+            for record in caplog.records
+        )
 
 
 class TestReviews:
@@ -1998,13 +2011,10 @@ class TestReviewVerdictCache:
         assert rec['verdict'] == 'PASS'
         assert rec['suggestions_routed'] is False
 
-    def test_corrupt_review_state_is_fail_safe(self, artifacts: TaskArtifacts):
+    def test_get_cached_verdict_on_corrupt_review_state_returns_none(
+        self, artifacts: TaskArtifacts
+    ):
         (artifacts.root / 'review_state.json').write_text('{not valid json')
-        assert artifacts.read_review_state() == {
-            'amendment_rounds_total': 0,
-            'review_cycles_total': 0,
-            'verdicts': {},
-        }
         assert artifacts.get_cached_verdict('tree_abc') is None
 
     def test_reviewer_fingerprint_round_trips(self, artifacts: TaskArtifacts):

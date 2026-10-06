@@ -386,18 +386,8 @@ class TaskArtifacts:
         corrupt/unreadable or malformed metadata.json (returns ``None``
         instead of raising) so a runtime "started" lookup never raises.
         """
-        meta_path = self._read_path('metadata.json')
-        if not meta_path.exists():
-            return None
-        try:
-            metadata = json.loads(meta_path.read_text(encoding='utf-8'))
-        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
-            logger.warning('Corrupt metadata.json at %s: %s', meta_path, exc)
-            return None
-        if not isinstance(metadata, dict):
-            logger.warning(
-                'Malformed metadata.json at %s: not an object', meta_path
-            )
+        metadata = self._read_json_object('metadata.json')
+        if metadata is None:
             return None
         return metadata.get('created_at')
 
@@ -637,29 +627,19 @@ class TaskArtifacts:
 
         Returns a fresh default state ``{'amendment_rounds_total': 0,
         'review_cycles_total': 0, 'verdicts': {}}`` when the file is absent,
-        and — in the same fail-safe spirit as ``read_created_at`` (:378-398),
-        though the two readers' exact exception coverage has since diverged —
-        logs a warning and returns those same defaults on a corrupt/unreadable
-        or malformed file rather than raising.  A present-but-partial file is
-        merged over the defaults so all canonical keys are always exposed.
+        and returns those same defaults, logging a warning, when the file is
+        corrupt, unreadable, not valid UTF-8, or not a JSON object — the
+        fail-safe every ``_read_json_object`` reader shares.  A
+        present-but-partial file is merged over the defaults so all canonical
+        keys are always exposed.
         """
         default = {
             'amendment_rounds_total': 0,
             'review_cycles_total': 0,
             'verdicts': {},
         }
-        path = self._read_path('review_state.json')
-        if not path.exists():
-            return default
-        try:
-            data = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning('Corrupt review_state.json at %s: %s', path, exc)
-            return default
-        if not isinstance(data, dict):
-            logger.warning(
-                'Malformed review_state.json at %s: not an object', path
-            )
+        data = self._read_json_object('review_state.json')
+        if data is None:
             return default
         merged = {**default, **data}
         if not isinstance(merged.get('verdicts'), dict):
@@ -769,6 +749,27 @@ class TaskArtifacts:
     def _read_path(self, name: str) -> Path:
         """Resolve *name* under ``self.root``."""
         return self.root / name
+
+    def _read_json_object(self, name: str) -> dict | None:
+        """The single fail-safe read seam for the whole-file JSON-object
+        sidecars written by ``_write_json``.
+
+        Returns ``None`` for an absent, unreadable, undecodable, malformed or
+        non-object file, logging a warning for every case except absent.
+        Decodes as UTF-8 to match ``shared.safe_io.atomic_write_text``.
+        """
+        path = self._read_path(name)
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            return None
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+            logger.warning('Corrupt %s at %s: %s', name, path, exc)
+            return None
+        if not isinstance(data, dict):
+            logger.warning('Malformed %s at %s: not an object', name, path)
+            return None
+        return data
 
     def _clear_path(self, name: str) -> None:
         """Remove *name* from ``self.root`` if present."""
@@ -1163,25 +1164,16 @@ class TaskArtifacts:
         """Return the parsed ``.task/agent_session.json`` as a typed
         :class:`AgentSession`, or ``None`` if missing/corrupt.
 
-        Fail-safe: a missing file, corrupt/unreadable JSON, a present-but-
-        non-object payload, or a payload whose numeric fields
+        Fail-safe: a missing file, corrupt/unreadable or non-UTF-8 JSON, a
+        present-but-non-object payload, or a payload whose numeric fields
         (``resume_count`` / ``schema_version``) cannot be coerced to ``int``
         all return ``None`` (the caller reads absence as "no in-flight
         session").  A v1 sidecar (missing v2 keys) is tolerated via
         :meth:`AgentSession.from_mapping`, which supplies legacy defaults.
         """
-        path = self._read_path('agent_session.json')
-        if not path.exists():
-            return None
-        try:
-            data = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning('Corrupt agent_session.json at %s: %s', path, exc)
-            return None
-        if not isinstance(data, dict):
-            logger.warning(
-                'Malformed agent_session.json at %s: not an object', path
-            )
+        name = 'agent_session.json'
+        data = self._read_json_object(name)
+        if data is None:
             return None
         try:
             return AgentSession.from_mapping(data)
@@ -1190,8 +1182,8 @@ class TaskArtifacts:
             # makes from_mapping's int() coercion raise; map that to the same
             # fail-safe None as any other corruption rather than propagating.
             logger.warning(
-                'Malformed agent_session.json at %s: unparseable field (%s)',
-                path, exc,
+                'Malformed %s at %s: unparseable field (%s)',
+                name, self._read_path(name), exc,
             )
             return None
 
@@ -1217,22 +1209,12 @@ class TaskArtifacts:
         ``{"emitted_done_step_escalations": [[step_id, commit], ...]}``; each
         2-element list is re-tupled here and malformed entries are skipped.
 
-        Fail-safe: a missing file, corrupt/unreadable JSON, or a non-object
-        payload all return an empty ``set`` (mirrors ``read_agent_session``),
-        so a corrupt sidecar re-files rather than silently suppressing.
+        Fail-safe: a missing file, corrupt/unreadable or non-UTF-8 JSON, or a
+        non-object payload all return an empty ``set``, so a corrupt sidecar
+        re-files rather than silently suppressing.
         """
-        path = self._read_path('reconcile_state.json')
-        if not path.exists():
-            return set()
-        try:
-            data = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning('Corrupt reconcile_state.json at %s: %s', path, exc)
-            return set()
-        if not isinstance(data, dict):
-            logger.warning(
-                'Malformed reconcile_state.json at %s: not an object', path
-            )
+        data = self._read_json_object('reconcile_state.json')
+        if data is None:
             return set()
         result: set[tuple[str, str]] = set()
         for entry in data.get('emitted_done_step_escalations', []):
@@ -1307,21 +1289,14 @@ class TaskArtifacts:
         self._write_json(verdict_path, envelope)
 
     def read_verdict(self, role: str) -> dict | None:
-        """Return parsed ``.task/verdicts/{role}.json``, or ``None`` if
-        missing/corrupt.
+        """Return parsed ``.task/verdicts/{role}.json``, or ``None`` if the
+        file is missing, corrupt, or not a JSON object.
 
         Raises:
             ValueError: if *role* is invalid — see ``_validate_verdict_role``.
         """
         _validate_verdict_role(role)
-        path = self._read_path(f'verdicts/{role}.json')
-        if not path.exists():
-            return None
-        try:
-            return json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning('Corrupt verdicts/%s.json at %s: %s', role, path, exc)
-            return None
+        return self._read_json_object(f'verdicts/{role}.json')
 
     def clear_verdict(self, role: str) -> None:
         """Remove ``.task/verdicts/{role}.json`` if present (idempotent).
