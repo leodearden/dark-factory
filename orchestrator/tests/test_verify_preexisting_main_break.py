@@ -788,7 +788,7 @@ class TestMainBaselineFailingIds:
     ) -> None:
         """A probe result with failing_test_ids=None (OPAQUE / unreadable junit)
         degrades to None (B3) and must NOT be cached — a transient hiccup
-        shouldn't pin a falsely-empty baseline for the TTL window."""
+        shouldn't pin a falsely-empty baseline for the SHA's life."""
         from orchestrator import verify as verify_module
 
         config = _make_config(tmp_path)
@@ -836,36 +836,6 @@ class TestMainBaselineFailingIds:
             raise AssertionError('probe must not run on a cache hit')
 
         return _explode
-
-    def test_seeded_baseline_outlives_an_hour(self, tmp_path: Path) -> None:
-        from orchestrator import verify as verify_module
-
-        config = _make_config(tmp_path)
-        git_ops = GitOps(config.git, config.project_root)
-        verify_module.seed_main_baseline(MAIN_SHA, frozenset())
-
-        real_monotonic = verify_module.time.monotonic
-        probe_calls: list[str] = []
-        with (
-            patch.object(
-                verify_module.time, 'monotonic', side_effect=lambda: real_monotonic() + 3600,
-            ),
-            patch.object(
-                verify_module, 'run_scoped_verification',
-                side_effect=self._probe_recorder(probe_calls),
-            ),
-            patch.object(
-                git_ops, 'ephemeral_worktree', side_effect=self._probe_recorder(probe_calls),
-            ),
-        ):
-            peeked = verify_module.cached_main_baseline_failing_ids(MAIN_SHA)
-            served = asyncio.run(
-                verify_module.main_baseline_failing_ids(config, [], git_ops, MAIN_SHA)
-            )
-
-        assert peeked == frozenset()
-        assert served == frozenset()
-        assert probe_calls == []
 
     def test_cache_is_bounded_by_recency(self) -> None:
         from orchestrator import verify as verify_module
@@ -1065,6 +1035,39 @@ class TestMainBaselineRedModuleProbe:
         assert served == frozenset({'w1'})
         assert len(main_probe.whole_tree_runs) == 1
         assert main_probe.module_runs == []
+
+    def test_concurrent_probes_of_one_sha_keep_each_others_modules(
+        self, main_probe: MainProbeHarness,
+    ) -> None:
+        main_probe.main_ids = {'B': ['b1'], 'C': ['c1']}
+        b_entered, b_release = main_probe.hold('B')
+
+        async def _probe_c_while_b_runs() -> tuple[frozenset[str] | None, ...]:
+            b_probe = asyncio.create_task(main_probe.probe('B'))
+            await b_entered.wait()
+            c_answer = await main_probe.probe('C')
+            b_release.set()
+            return c_answer, await b_probe
+
+        assert asyncio.run(_probe_c_while_b_runs()) == (frozenset({'c1'}), frozenset({'b1'}))
+        assert verify_module.cached_main_baseline_failing_ids(
+            MAIN_SHA, red_module_prefixes=frozenset({'B', 'C'}),
+        ) == frozenset({'b1', 'c1'})
+
+    def test_a_seed_landing_mid_probe_is_kept(self, main_probe: MainProbeHarness) -> None:
+        main_probe.main_ids = {'B': ['b1']}
+        b_entered, b_release = main_probe.hold('B')
+
+        async def _seed_while_b_runs() -> None:
+            b_probe = asyncio.create_task(main_probe.probe('B'))
+            await b_entered.wait()
+            verify_module.seed_main_baseline(MAIN_SHA, frozenset({'w'}))
+            b_release.set()
+            await b_probe
+
+        asyncio.run(_seed_while_b_runs())
+
+        assert verify_module.cached_main_baseline_failing_ids(MAIN_SHA) == frozenset({'w'})
 
 
 class TestRedModulePrefixesOf:
