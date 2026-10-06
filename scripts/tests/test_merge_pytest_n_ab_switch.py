@@ -19,7 +19,6 @@ one the test itself owns, bound to an ephemeral port.
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 import types
 from pathlib import Path
@@ -34,6 +33,7 @@ from config_reload_script_fakes import (
     head,
     init_repo,
     path_python3_shimmed_to,
+    path_python3_that_cannot_run,
     reload_report,
     system_python_without_the_transport,
     venvless_checkout_copy,
@@ -483,6 +483,10 @@ def test_applied_verify_env_carrying_a_different_value_still_fails(tmp_path):
 # should have failed -- it was that it failed while naming the WRONG cause:
 # every session-less POST got a 400 before any tool ran, and the script
 # reported `reloaded=None` and blamed an in-orchestrator rollback for it.
+#
+# The fault cases start from a config already at the value, so nothing is
+# committed and the transport fault is the only failure source; the flip-path
+# case at the end of this group owns the committed sha.
 # ---------------------------------------------------------------------------
 
 def _assert_failed_closed_on_the_transport(proc):
@@ -564,7 +568,7 @@ def test_no_step_runs_under_path_python3_when_the_checkout_venv_exists(tmp_path)
         pytest.skip(f"{CHECKOUT_VENV_PYTHON} is absent (an un-synced worktree)")
 
     config = _make_repo(tmp_path, "16")
-    env = path_python3_shimmed_to(tmp_path, shutil.which("false"))
+    env = path_python3_that_cannot_run(tmp_path)
 
     with FakeEscalationMcp(reload_report(
         config_path=str(config),

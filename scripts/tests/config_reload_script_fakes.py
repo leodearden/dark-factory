@@ -320,10 +320,20 @@ def venvless_checkout_copy(tmp_path, script):
 
 def path_python3_shimmed_to(tmp_path, interpreter):
     """An env whose PATH `python3` is *interpreter*."""
+    return _path_python3_running(tmp_path, f'exec {interpreter} "$@"')
+
+
+def path_python3_that_cannot_run(tmp_path):
+    """An env whose PATH `python3` exits 1 without running anything."""
+    return _path_python3_running(tmp_path, "exit 1")
+
+
+def _path_python3_running(tmp_path, shell_body):
+    """An env whose PATH `python3` is a /bin/sh shim executing *shell_body*."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     shim = bin_dir / "python3"
-    shim.write_text(f'#!/bin/sh\nexec {interpreter} "$@"\n')
+    shim.write_text(f"#!/bin/sh\n{shell_body}\n")
     shim.chmod(0o755)
     env = dict(os.environ)
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
