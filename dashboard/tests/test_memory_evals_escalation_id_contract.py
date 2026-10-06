@@ -28,6 +28,7 @@ only as good as that one.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -35,9 +36,9 @@ from typing import Any
 
 from _dashboard_helpers import build_dual_escalation_tree, write_escalation_record
 
-from dashboard.data.escalation_corpus import corpus_queues, measure_corpus
+from dashboard.data.escalation_corpus import corpus_queues, measure_corpus, reconciliation_queue
 from dashboard.data.escalations import build_escalation_queues, card_datums
-from dashboard.data.redux_api import shape_escalations
+from dashboard.data.redux_api import shape_escalations, shape_memory_evals
 
 NOW = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
 """The instant the ESCALATIONS side's corpus walk is measured at."""
@@ -211,11 +212,14 @@ def collect_escalation_id_violations(
 
 
 def _build_memory_evals(config) -> dict[str, Any]:
+    """The MEMORY_EVALS block, composed the way ``app.py::api_memory_evals`` composes it."""
     from dashboard.data.memory_evals import build_memory_evals
 
-    return build_memory_evals(
-        config.memory_evals_dir, config.reconciliation_escalations_dir
-    )
+    queue = reconciliation_queue(config)
+    return shape_memory_evals(
+        **build_memory_evals(config.memory_evals_dir, queue.directory),
+        escalation_queue=queue.id,
+    )['MEMORY_EVALS']
 
 
 def _build_escalations(config) -> dict[str, Any]:
@@ -412,6 +416,66 @@ def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monke
     assert idless_violations[0]['id'] is None, (
         f'the violation must carry the emitted id (None): {idless_violations}'
     )
+
+
+def test_the_id_space_check_scopes_by_queue(tmp_path: Path) -> None:
+    """The checker keys rows on ``(queue, id)``, as ``findEscalationRow`` does.
+
+    The browser resolves a link only inside the subsection MEMORY_EVALS names
+    (``escalation_queue``), and elects a row only when exactly one matches. An
+    id-only checker would report clean for a link scoped to the wrong queue,
+    for a tie the browser refuses to break, and for a payload that names no
+    queue at all, each of which the browser renders as a miss or a disabled
+    link.
+    """
+    tree = build_dual_escalation_tree(tmp_path)
+    escalations = _build_escalations(tree.config)
+    memory_evals = _build_memory_evals(tree.config)
+    reached = list(_iter_memory_eval_escalations(memory_evals))
+
+    # (a) CONTROL: clean on the real producers, and something was checked.
+    assert reached, 'the fixture reached no escalation, so every arm below is vacuous'
+    assert collect_escalation_id_violations(memory_evals, escalations) == []
+
+    # (b) WRONG QUEUE: a subsection ESCALATIONS serves, but not the one the
+    #     escalations live in. corpus_queues always lists the project root's
+    #     queue, even when its directory is absent.
+    other_queues = [
+        sub['id'] for sub in escalations['subsections'] if sub['kind'] != 'reconciliation'
+    ]
+    assert other_queues, 'ESCALATIONS served no non-reconciliation subsection'
+    wrong_queue = {**memory_evals, 'escalation_queue': other_queues[0]}
+    wrong = collect_escalation_id_violations(wrong_queue, escalations)
+    assert [v['kind'] for v in wrong] == ['absent'] * len(reached), (
+        f'every link scoped to {other_queues[0]!r} resolves to no row: {wrong}'
+    )
+    assert all(v['path'] for v in wrong), wrong
+
+    # (c) AMBIGUITY: two rows under one (queue, id). The browser opens neither.
+    reconciliation = next(
+        sub for sub in escalations['subsections'] if sub['id'] == 'reconciliation'
+    )
+    reached_ids = {escalation['id'] for _path, escalation in reached}
+    duplicated = next(row for row in reconciliation['escalations'] if row['id'] in reached_ids)
+    tied = copy.deepcopy(escalations)
+    next(
+        sub for sub in tied['subsections'] if sub['id'] == 'reconciliation'
+    )['escalations'].append(copy.deepcopy(duplicated))
+    ambiguous = collect_escalation_id_violations(memory_evals, tied)
+    assert ambiguous, f'a tie on {duplicated["id"]!r} must be reported'
+    assert {(v['id'], v['kind']) for v in ambiguous} == {(duplicated['id'], 'ambiguous')}, (
+        ambiguous
+    )
+    for violation in ambiguous:
+        assert violation['path'], violation
+        assert 'reconciliation' in violation['detail'], violation
+        assert '2' in violation['detail'], violation
+
+    # (d) NO QUEUE: the link renders disabled, so nothing resolves.
+    unscoped_payload = {**memory_evals, 'escalation_queue': None}
+    unscoped = collect_escalation_id_violations(unscoped_payload, escalations)
+    assert [v['kind'] for v in unscoped] == ['unscoped'] * len(reached), unscoped
+    assert all(v['path'] for v in unscoped), unscoped
 
 
 # ---------------------------------------------------------------------------
