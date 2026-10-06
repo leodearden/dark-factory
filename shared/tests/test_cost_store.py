@@ -6,12 +6,13 @@ import asyncio
 import logging
 import sqlite3
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import aiosqlite
 import pytest
 
-from shared.cost_store import CostStore
+from shared.cost_store import CapReason, CostStore
 
 
 def _conn(store: CostStore) -> aiosqlite.Connection:
@@ -112,6 +113,7 @@ class TestSaveInvocation:
                 cache_create_tokens=None,
                 duration_ms=0,
                 capped=True,
+                capped_reason=CapReason.ACCOUNT,
                 started_at='2024-01-01T00:00:00',
                 completed_at='2024-01-01T00:00:00',
             )
@@ -1350,6 +1352,64 @@ def _invocation_column_specs(path: Path) -> dict[str, tuple[int, str | None]]:
         conn.close()
 
 
+class _RowsCursor:
+    """A cursor stand-in that reports a fixed row set."""
+
+    def __init__(self, rows: list) -> None:
+        self._rows = rows
+
+    async def fetchall(self) -> list:
+        return self._rows
+
+    async def close(self) -> None:
+        pass
+
+
+def _probe_reports_pre_4826_columns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``PRAGMA table_info(invocations)`` omit the task-4826 columns even
+    when the table has them: the stale view a store holds when a concurrent
+    open adds them between its probe and its ``ALTER``."""
+    real_execute = aiosqlite.Connection.execute
+
+    def execute(self, sql, *args, **kwargs):
+        result = real_execute(self, sql, *args, **kwargs)
+        if sql != 'PRAGMA table_info(invocations)':
+            return result
+
+        async def stale_probe() -> _RowsCursor:
+            cursor = await result
+            rows = await cursor.fetchall()
+            await cursor.close()
+            return _RowsCursor([r for r in rows if r[1] not in _NEW_INVOCATION_COLUMNS_SET])
+
+        return stale_probe()
+
+    monkeypatch.setattr(aiosqlite.Connection, 'execute', execute)
+
+
+def _invocation_kwargs(**overrides: Any) -> dict[str, Any]:
+    """A complete, valid ``save_invocation`` keyword set; *overrides* win."""
+    kwargs: dict[str, Any] = {
+        'run_id': 'run-1',
+        'task_id': None,
+        'project_id': 'dark_factory',
+        'account_name': 'max-d',
+        'model': 'opus',
+        'role': 'implementer',
+        'cost_usd': 0.5,
+        'input_tokens': None,
+        'output_tokens': None,
+        'cache_read_tokens': None,
+        'cache_create_tokens': None,
+        'duration_ms': 10,
+        'capped': False,
+        'started_at': '2026-09-11T00:00:00+00:00',
+        'completed_at': '2026-09-11T00:00:01+00:00',
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
 class TestInvocationsSchemaColumns:
     """The fresh-DB shape of the two task-4826 columns."""
 
@@ -1475,6 +1535,52 @@ class TestInvocationsMigration:
 
         assert _invocation_columns(db) == before
 
+    async def test_column_added_concurrently_after_the_probe_is_tolerated(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """The probe-then-ALTER race between two processes opening one runs.db.
+
+        Another open adds the columns after this store's ``table_info`` probe
+        found them missing, so this store's ``ALTER`` meets SQLite's real
+        ``duplicate column name`` error — which must not fail the open.
+        """
+        db = tmp_path / 'raced.db'
+        async with CostStore(db):  # the concurrent open that added the columns
+            pass
+        _probe_reports_pre_4826_columns(monkeypatch)
+
+        async with CostStore(db) as store:
+            await store.save_invocation(**_invocation_kwargs(model_id='claude-opus-5'))
+
+        columns = _invocation_columns(db)
+        assert columns.count('model_id') == 1, columns
+        assert columns.count('capped_reason') == 1, columns
+
+    async def test_other_operational_error_fails_the_open_and_leaves_it_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Any OperationalError but a duplicate column propagates from
+        ``open()``, and the store is left closed — so a later open succeeds
+        instead of raising "already opened" on a half-open store."""
+        db = tmp_path / 'legacy.db'
+        _legacy_cost_db(db)
+        real_execute = aiosqlite.Connection.execute
+
+        def execute(self, sql, *args, **kwargs):
+            if sql.startswith('ALTER TABLE invocations'):
+                raise sqlite3.OperationalError('database is locked')
+            return real_execute(self, sql, *args, **kwargs)
+
+        monkeypatch.setattr(aiosqlite.Connection, 'execute', execute)
+        store = CostStore(db)
+        with pytest.raises(sqlite3.OperationalError, match='database is locked'):
+            await store.open()
+
+        monkeypatch.undo()
+        async with store:
+            pass
+        assert set(_invocation_columns(db)) >= _NEW_INVOCATION_COLUMNS_SET
+
     async def test_widened_insert_succeeds_after_migration(self, tmp_path: Path):
         db = tmp_path / 'legacy.db'
         _legacy_cost_db(db)
@@ -1497,7 +1603,7 @@ class TestInvocationsMigration:
                 started_at='2026-09-11T00:00:00+00:00',
                 completed_at='2026-09-11T00:00:01+00:00',
                 model_id='claude-opus-5',
-                capped_reason='budget',
+                capped_reason=CapReason.BUDGET,
             )
             async with _conn(store).execute(
                 'SELECT model, model_id, capped, capped_reason FROM invocations '
@@ -1537,7 +1643,7 @@ class TestSaveInvocationModelIdAndCappedReason:
                 started_at='2026-09-11T00:00:00+00:00',
                 completed_at='2026-09-11T00:00:01+00:00',
                 model_id='claude-opus-5',
-                capped_reason='turns',
+                capped_reason=CapReason.TURNS,
             )
             async with _conn(store).execute(
                 'SELECT model, model_id, capped, capped_reason FROM invocations'
@@ -1577,3 +1683,45 @@ class TestSaveInvocationModelIdAndCappedReason:
                 row = await cur.fetchone()
 
         assert row == (None, None)
+
+
+class TestSaveInvocationCapInvariant:
+    """``capped == (capped_reason is not None)``, enforced by the one writer."""
+
+    @pytest.mark.parametrize(
+        'capped,capped_reason',
+        [(True, None), (False, CapReason.BUDGET)],
+        ids=['capped_without_reason', 'reason_without_capped'],
+    )
+    async def test_contradicting_pair_is_rejected_and_writes_nothing(
+        self, tmp_path: Path, capped: bool, capped_reason: CapReason | None,
+    ):
+        async with CostStore(tmp_path / 'costs.db') as store:
+            with pytest.raises(ValueError, match='contradict'):
+                await store.save_invocation(
+                    **_invocation_kwargs(capped=capped, capped_reason=capped_reason),
+                )
+            async with _conn(store).execute('SELECT COUNT(*) FROM invocations') as cur:
+                row = await cur.fetchone()
+
+        assert row == (0,)
+
+    async def test_reason_outside_the_vocabulary_is_rejected(self, tmp_path: Path):
+        async with CostStore(tmp_path / 'costs.db') as store:
+            with pytest.raises(ValueError, match='wallclock'):
+                await store.save_invocation(
+                    **_invocation_kwargs(capped=True, capped_reason='wallclock'),
+                )
+
+    @pytest.mark.parametrize('reason', list(CapReason))
+    async def test_each_reason_is_stored_as_its_plain_text_value(
+        self, tmp_path: Path, reason: CapReason,
+    ):
+        async with CostStore(tmp_path / 'costs.db') as store:
+            await store.save_invocation(**_invocation_kwargs(capped=True, capped_reason=reason))
+            async with _conn(store).execute(
+                'SELECT capped, capped_reason, typeof(capped_reason) FROM invocations'
+            ) as cur:
+                row = await cur.fetchone()
+
+        assert row == (1, reason.value, 'text')
