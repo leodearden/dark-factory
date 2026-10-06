@@ -22,6 +22,7 @@ from arm_harness._fakes import (
     FakeArmGraph,
     PreregRepo,
     RecordingJournal,
+    embedding_spec,
     fail,
     incumbent_control_spec,
     llm_spec,
@@ -823,6 +824,89 @@ def test_control_check_refuses_a_limited_run_against_a_full_one(harness, live, t
     captured = capsys.readouterr()
     assert "lacks ['e2', 'e3']" in captured.err
     assert captured.out == ''
+
+
+def test_control_check_refuses_an_embedding_arm_run(harness, live, tmp_path, capsys):
+    spec_a = _control('ctrl-a', 'evalmem_ctrl_a')
+    run_a = _write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
+    run_b = _write_run(tmp_path / 'b', run_manifest_for(embedding_spec()), [])
+
+    code = harness.main(
+        ['control-check', '--run', str(run_a), '--run', str(run_b)], deps=live.factory(harness)
+    )
+
+    assert code == harness.EXIT_REFUSED
+    assert 'embedding arm' in capsys.readouterr().err
+
+
+# --- unreadable inputs are refusals (exit 2), never tracebacks -------------------------
+
+_RUN_CORRUPTIONS = {
+    'run-json-not-json': (RUN_MANIFEST_FILENAME, '{not json'),
+    'run-json-missing-fields': (RUN_MANIFEST_FILENAME, '{"schema_version": 1}'),
+    'metrics-record-not-json': ('metrics/tokens-per-episode.json', '{not json'),
+}
+
+
+def _comparison_argv(command: str, run_a: Path, run_b: Path) -> list[str]:
+    if command == 'parity-check':
+        return ['parity-check', '--run-a', str(run_a), '--run-b', str(run_b)]
+    return ['control-check', '--run', str(run_a), '--run', str(run_b)]
+
+
+@pytest.mark.parametrize('corruption', sorted(_RUN_CORRUPTIONS))
+@pytest.mark.parametrize('command', ['parity-check', 'control-check'])
+def test_an_unreadable_run_is_refused_naming_it(
+    harness, live, tmp_path, capsys, command, corruption
+):
+    spec_a, spec_b = _control('ctrl-a', 'evalmem_ctrl_a'), _control('ctrl-b', 'evalmem_ctrl_b')
+    run_a = _write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
+    run_b = _write_run(tmp_path / 'b', run_manifest_for(spec_b), _accounted(spec_b))
+    relative, text = _RUN_CORRUPTIONS[corruption]
+    (run_b / relative).write_text(text)
+
+    code = harness.main(_comparison_argv(command, run_a, run_b), deps=live.factory(harness))
+
+    assert code == harness.EXIT_REFUSED
+    assert f'{run_b} is not a readable run' in capsys.readouterr().err
+    assert not (run_a / harness.PARITY_DIRNAME).exists()
+
+
+@pytest.mark.parametrize('content', [None, '{not json\n'], ids=['missing', 'not-json'])
+def test_control_check_refuses_an_unreadable_reference(harness, live, tmp_path, capsys, content):
+    spec_a, spec_b = _control('ctrl-a', 'evalmem_ctrl_a'), _control('ctrl-b', 'evalmem_ctrl_b')
+    run_a = _write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
+    run_b = _write_run(tmp_path / 'b', run_manifest_for(spec_b), _accounted(spec_b))
+    reference = tmp_path / 'reference.jsonl'
+    if content is not None:
+        reference.write_text(content)
+
+    code = harness.main(
+        ['control-check', '--run', str(run_a), '--run', str(run_b),
+         '--reference-outcomes', str(reference)],
+        deps=live.factory(harness),
+    )
+
+    assert code == harness.EXIT_REFUSED
+    assert f'{reference} is not a readable outcomes file' in capsys.readouterr().err
+
+
+def test_run_refuses_an_unreadable_reference_before_any_backend(
+    harness, live, run_inputs, corpus, repo, tmp_path, capsys
+):
+    live.population = corpus.population
+    reference = tmp_path / 'reference.jsonl'
+    reference.write_text('{not json\n')
+
+    code = harness.main(
+        _run_argv(run_inputs, corpus, repo, '--reference-outcomes', str(reference)),
+        deps=live.factory(harness),
+    )
+
+    assert code == harness.EXIT_REFUSED
+    assert f'{reference} is not a readable outcomes file' in capsys.readouterr().err
+    assert live.log.factory_calls == 0
+    assert not run_inputs.run_dir.exists()
 
 
 def test_control_check_needs_at_least_two_runs(harness, live, tmp_path):

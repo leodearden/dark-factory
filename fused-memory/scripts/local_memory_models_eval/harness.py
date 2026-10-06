@@ -256,13 +256,36 @@ def _fresh_run_dir(run_dir: Path) -> Path:
 
 
 def _load_run(run_dir: Path) -> tuple[RunManifest, tuple[MetricsRecord, ...]]:
+    """A committed run's manifest and records; a spec naming a protected graph raises raw."""
     manifest_path = run_dir / RUN_MANIFEST_FILENAME
     if not manifest_path.is_file():
         raise _Refusal(
             EXIT_REFUSED,
             f'{run_dir} has no {RUN_MANIFEST_FILENAME}: an interrupted run, or not a run dir',
         )
-    return load_run_manifest(manifest_path), load_metrics_records(run_dir)
+    try:
+        return load_run_manifest(manifest_path), load_metrics_records(run_dir)
+    except (OSError, ValueError) as error:
+        raise _Refusal(EXIT_REFUSED, f'{run_dir} is not a readable run: {error}') from error
+
+
+def _load_control_run(run_dir: Path) -> tuple[RunManifest, tuple[MetricsRecord, ...]]:
+    run, records = _load_run(run_dir)
+    if not isinstance(run.spec, LlmArmSpec):
+        raise _Refusal(
+            EXIT_REFUSED,
+            f'control-check compares LLM control runs; {run_dir} is a {run.spec.axis} arm',
+        )
+    return run, records
+
+
+def _load_reference(path: Path | None) -> tuple[EpisodeOutcome, ...] | None:
+    if path is None:
+        return None
+    try:
+        return load_outcomes(path)
+    except (OSError, ValueError) as error:
+        raise _Refusal(EXIT_REFUSED, f'{path} is not a readable outcomes file: {error}') from error
 
 
 def _scratch_graph(
@@ -297,7 +320,7 @@ def _cmd_run(args: argparse.Namespace, deps: DepsFactory) -> int:
     spec = _load_llm_spec(args.arm_spec, 'run')
     require_pre_run_checks(spec, args.repo_root)
     manifest = _read_manifest(args.manifest, spec)
-    reference = None if args.reference_outcomes is None else load_outcomes(args.reference_outcomes)
+    reference = _load_reference(args.reference_outcomes)
     run_dir = _fresh_run_dir(args.out_root / spec.arm_id / run_stamp())
     result = asyncio.run(_replay(args, spec, manifest, reference, run_dir, deps()))
     print(f'run: {run_dir}')
@@ -391,8 +414,8 @@ def _cmd_parity_check(args: argparse.Namespace, deps: DepsFactory) -> int:
 
 
 def _cmd_control_check(args: argparse.Namespace, deps: DepsFactory) -> int:
-    loaded = [_load_run(run_dir) for run_dir in args.run]
-    reference = None if args.reference_outcomes is None else load_outcomes(args.reference_outcomes)
+    loaded = [_load_control_run(run_dir) for run_dir in args.run]
+    reference = _load_reference(args.reference_outcomes)
     results = control_variance_check(
         [run for run, _ in loaded],
         {run.spec.arm_id: records for run, records in loaded},
