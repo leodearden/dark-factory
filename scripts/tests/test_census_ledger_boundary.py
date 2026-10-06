@@ -18,7 +18,15 @@ from typing import Any
 
 import census as mod
 import pytest
-from legibility import census_window, config, inventory, session_ledger, trickle_state, unlanded
+from legibility import (
+    census_identity,
+    census_window,
+    config,
+    inventory,
+    session_ledger,
+    trickle_state,
+    unlanded,
+)
 from legibility.session_ledger import CodedBy, LedgerRow, Outcome
 
 _NOW = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
@@ -343,7 +351,7 @@ def test_a_ledger_write_failure_after_the_commit_is_reported_not_raised(census, 
 def test_row3_a_second_run_on_one_day_gets_its_own_identity_and_files(census):
     plans = census.root / "plans"
     census.session("S-tango")
-    first = mod.allocate_run_identity(
+    first = census_identity.allocate_run_identity(
         project_id="p", day=_NOW.date(), plans_dir=plans, taken_run_ids=frozenset(),
     )
     mod.run_census(**census.kwargs(report_path=plans / f"{first.basename}.md", run_id=first.run_id))
@@ -351,14 +359,14 @@ def test_row3_a_second_run_on_one_day_gets_its_own_identity_and_files(census):
     first_bytes = [path.read_bytes() for path in first_files]
 
     census.session("S-uniform")
-    second = mod.allocate_run_identity(
+    second = census_identity.allocate_run_identity(
         project_id="p", day=_NOW.date(), plans_dir=plans, taken_run_ids=frozenset({first.run_id}),
     )
     mod.run_census(
         **census.kwargs(report_path=plans / f"{second.basename}.md", run_id=second.run_id),
     )
 
-    assert second == mod.RunIdentity(
+    assert second == census_identity.RunIdentity(
         run_id=f"{_RUN_ID}-2", basename=f"confusion-census-{_DATE}-2",
     )
     assert (plans / f"{second.basename}.md").exists()

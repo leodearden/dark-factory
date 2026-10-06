@@ -20,7 +20,7 @@ import functools
 import json
 import logging
 import subprocess
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
 
 import census as mod
@@ -5288,77 +5288,6 @@ def test_main_failure_escalation_is_best_effort_when_poster_raises(tmp_path, mon
 # main() mines through a census_window.WindowBatchSource over the project's
 # ledger; selection itself is covered in test_census_window.py.
 # ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# run identity and as_of_sha (PRD census-incremental §4.2)
-# ---------------------------------------------------------------------------
-
-_ID_DAY = date(2026, 10, 6)
-
-
-def _allocate(plans_dir, taken=frozenset(), **kwargs):
-    return mod.allocate_run_identity(
-        project_id="dark_factory", day=_ID_DAY, plans_dir=plans_dir,
-        taken_run_ids=taken, **kwargs,
-    )
-
-
-def test_allocate_run_identity_takes_the_plain_names_when_free(tmp_path):
-    assert _allocate(tmp_path) == mod.RunIdentity(
-        run_id="census-dark_factory-20261006", basename="confusion-census-2026-10-06",
-    )
-
-
-@pytest.mark.parametrize("existing", [".md", ".json"])
-def test_allocate_run_identity_skips_a_basename_whose_report_or_record_exists(
-    tmp_path, existing,
-):
-    (tmp_path / f"confusion-census-2026-10-06{existing}").write_text("x", encoding="utf-8")
-
-    assert _allocate(tmp_path) == mod.RunIdentity(
-        run_id="census-dark_factory-20261006-2", basename="confusion-census-2026-10-06-2",
-    )
-
-
-def test_allocate_run_identity_skips_a_taken_run_id(tmp_path):
-    identity = _allocate(tmp_path, frozenset({"census-dark_factory-20261006"}))
-
-    assert identity.run_id == "census-dark_factory-20261006-2"
-    assert identity.basename == "confusion-census-2026-10-06-2"
-
-
-def test_allocate_run_identity_takes_the_first_free_suffix(tmp_path):
-    (tmp_path / "confusion-census-2026-10-06.md").write_text("x", encoding="utf-8")
-
-    identity = _allocate(tmp_path, frozenset({"census-dark_factory-20261006-2"}))
-
-    assert identity == mod.RunIdentity(
-        run_id="census-dark_factory-20261006-3", basename="confusion-census-2026-10-06-3",
-    )
-
-
-def test_allocate_run_identity_raises_naming_the_directory_when_exhausted(tmp_path):
-    for name in ("confusion-census-2026-10-06", "confusion-census-2026-10-06-2"):
-        (tmp_path / f"{name}.md").write_text("x", encoding="utf-8")
-
-    with pytest.raises(RuntimeError) as excinfo:
-        _allocate(tmp_path, limit=2)
-
-    assert str(tmp_path) in str(excinfo.value)
-
-
-def test_resolve_as_of_sha_is_the_project_head(tmp_path):
-    _commit_all(tmp_path)
-
-    assert mod.resolve_as_of_sha(tmp_path) == _git(tmp_path, "rev-parse", "HEAD").decode().strip()
-
-
-def test_resolve_as_of_sha_raises_naming_a_root_that_is_no_repo(tmp_path):
-    with pytest.raises(RuntimeError) as excinfo:
-        mod.resolve_as_of_sha(tmp_path)
-
-    assert str(tmp_path) in str(excinfo.value)
-
 
 def _write_census_state(root, state):
     path = root / "docs" / "legibility" / "census-state.json"

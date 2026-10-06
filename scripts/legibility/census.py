@@ -103,6 +103,7 @@ import codebook  # noqa: E402
 import coder  # noqa: E402
 import filing_policy  # noqa: E402
 from legibility import (  # noqa: E402
+    census_identity,
     census_trigger,
     census_window,
     digest,
@@ -3747,99 +3748,6 @@ def _project_identity_mismatch(project_root: Path, cfg, config_path: Path) -> st
     )
 
 
-@dataclass(frozen=True)
-class PriorCensus:
-    """What census-state.json records about the previous run. A field is
-    ``None`` when the state is missing, malformed, or predates it."""
-
-    last_census_at: date | None = None
-    run_id: str | None = None
-    as_of_sha: str | None = None
-
-
-def _state_text(value: object) -> str | None:
-    return value if isinstance(value, str) and value else None
-
-
-def prior_census(status: str, state: dict | None) -> PriorCensus:
-    """Read :func:`census_trigger.load_census_state`'s result, which has
-    already validated ``last_census_at``."""
-    if status != "ok" or state is None:
-        return PriorCensus()
-    last_census_at = _state_text(state.get("last_census_at"))
-    return PriorCensus(
-        last_census_at=(
-            datetime.fromisoformat(last_census_at).date() if last_census_at else None
-        ),
-        run_id=_state_text(state.get("last_census_run_id")),
-        as_of_sha=_state_text(state.get("last_census_as_of_sha")),
-    )
-
-
-@dataclass(frozen=True)
-class RunIdentity:
-    """One census run's ``run_id`` and the basename its report and record
-    share (plans/census-incremental-prd.md §4.2)."""
-
-    run_id: str
-    basename: str
-
-
-def _identity_taken(identity: RunIdentity, plans_dir: Path, taken_run_ids) -> bool:
-    return identity.run_id in taken_run_ids or any(
-        (plans_dir / f"{identity.basename}{suffix}").exists() for suffix in (".md", ".json")
-    )
-
-
-def allocate_run_identity(
-    *,
-    project_id: str,
-    day: date,
-    plans_dir: Path,
-    taken_run_ids: frozenset[str],
-    limit: int = 1000,
-) -> RunIdentity:
-    """The first free identity for a census on *day*: ``census-<project>-
-    <YYYYMMDD>`` / ``confusion-census-<YYYY-MM-DD>``, else the same with
-    ``-2``, ``-3``, ... A candidate is taken when its report or record
-    exists in *plans_dir* or its run_id is in *taken_run_ids*, so a second
-    run never overwrites the first. Exhausting *limit* raises
-    ``RuntimeError`` naming the directory."""
-    for n in range(1, limit + 1):
-        suffix = "" if n == 1 else f"-{n}"
-        candidate = RunIdentity(
-            run_id=f"census-{project_id}-{day:%Y%m%d}{suffix}",
-            basename=f"confusion-census-{day.isoformat()}{suffix}",
-        )
-        if not _identity_taken(candidate, plans_dir, taken_run_ids):
-            return candidate
-    raise RuntimeError(
-        f"census: no free run identity for {day.isoformat()} -- {limit} census "
-        f"reports for that day already exist in {plans_dir}"
-    )
-
-
-_GIT_REV_PARSE_TIMEOUT_SECS = 30
-
-
-def resolve_as_of_sha(project_root: Path | str) -> str:
-    """The commit this census reads the project at: its ``HEAD``. Raises
-    ``RuntimeError`` naming *project_root* and git's own error."""
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(project_root), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=_GIT_REV_PARSE_TIMEOUT_SECS,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"git rev-parse HEAD failed in {project_root}: {exc}") from exc
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"git rev-parse HEAD failed in {project_root} (exit {result.returncode}): "
-            f"{result.stderr.strip()}"
-        )
-    return result.stdout.strip()
-
-
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint.
 
@@ -3887,11 +3795,11 @@ def main(argv: list[str] | None = None) -> int:
     a bounded run masquerade as a complete one -- see ``run_census`` and
     ``census_report_sections``.
 
-    Each run gets a fresh :class:`RunIdentity` (:func:`allocate_run_identity`),
-    so a second census on one day writes ``...-2`` files and never
-    overwrites the first, and reads the project at ``as_of_sha``, its HEAD
-    (:func:`resolve_as_of_sha`), resolved after the gate and before any
-    spend.
+    Each run gets a fresh ``census_identity.RunIdentity``
+    (``census_identity.allocate_run_identity``), so a second census on one
+    day writes ``...-2`` files and never overwrites the first, and reads the
+    project at ``as_of_sha``, its HEAD (``census_identity.resolve_as_of_sha``),
+    resolved after the gate and before any spend.
 
     Returns non-zero only on a genuine fail-loud error (a config-load
     failure, a project root that is not a git repo, an uncaught exception
@@ -4052,16 +3960,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     try:
-        as_of_sha = resolve_as_of_sha(project_root)
+        as_of_sha = census_identity.resolve_as_of_sha(project_root)
     except RuntimeError as exc:
         print(f"census: cannot resolve as_of_sha -- {exc}", file=sys.stderr)
         return 1
 
     codebook_path = project_root / "docs" / "legibility" / "confusion-codebook.yaml"
     census_state_path = project_root / "docs" / "legibility" / "census-state.json"
-    prior = prior_census(*census_trigger.load_census_state(census_state_path))
+    prior = census_identity.prior_census(*census_trigger.load_census_state(census_state_path))
     plans_dir = project_root / "plans"
-    identity = allocate_run_identity(
+    identity = census_identity.allocate_run_identity(
         project_id=cfg.project_id,
         day=census_day,
         plans_dir=plans_dir,
