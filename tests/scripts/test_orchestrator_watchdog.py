@@ -3,7 +3,10 @@
 The watchdog module has a hyphenated filename so it cannot be imported via
 ``import orchestrator_watchdog``.  We use importlib to load it by file path.
 
-No live systemd runtime is needed — all subprocess.run calls are monkeypatched.
+No live systemd runtime is needed — all subprocess.run calls are monkeypatched,
+except in test_unit_parity_verdict_runs_the_real_checker_and_reads_its_tag,
+which runs the real dashboard unit-parity checker under a tmp HOME (still no
+systemd).
 """
 
 import ast
@@ -12481,10 +12484,10 @@ def test_unit_parity_verdict_classifies_the_checkers_exit_code(
 ) -> None:
     """0/1/2 map to the checker's own parity/drift/absent vocabulary.
 
-    The same 0/1/2 setup-host.sh branches on, so the watchdog and the
-    installer cannot read one exit code two ways. The combined stdout/stderr
-    comes back with the verdict because that text is how an operator learns
-    WHICH directive drifted.
+    The codes map only once the checker's tag shows it actually reported (see
+    test_unit_parity_verdict_without_the_checkers_tag_is_unknown); this input
+    is tagged. The combined stdout/stderr comes back with the verdict because
+    that text is how an operator learns WHICH directive drifted.
     """
     wdog = _load_watchdog()
     calls: list[list[str]] = []
@@ -12554,14 +12557,103 @@ def test_unit_parity_verdict_tooling_failure_is_unknown_and_never_raises(
 def test_unit_parity_verdict_unexpected_exit_code_is_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An exit code outside 0/1/2 is not a parity claim, and says which code it was."""
+    """A TAGGED exit code outside 0/1/2 is not a parity claim, and says which code it was."""
     wdog = _load_watchdog()
-    monkeypatch.setattr(subprocess, "run", _checker_run([], returncode=7, stdout="boom"))
+    monkeypatch.setattr(
+        subprocess, "run", _checker_run([], returncode=7, stdout="[dashboard_unit_parity] boom")
+    )
 
     verdict, report = wdog.unit_parity_verdict()
 
     assert verdict == "unknown"
     assert "7" in report, f"the report must name the unexpected exit code: {report!r}"
+
+
+# Real failure shapes that carry NO [dashboard_unit_parity] tag, so the checker
+# never reported. Exit 2 is also python3's can't-open-file status and
+# argparse's usage-error status, and an uncaught traceback exits 1.
+_UNTAGGED_CHECKER_OUTPUTS = [
+    pytest.param(
+        2,
+        "",
+        "python3: can't open file '/nonexistent/check_dashboard_unit_parity.py': "
+        "[Errno 2] No such file or directory",
+        id="cant-open",
+    ),
+    pytest.param(
+        2,
+        "",
+        "usage: check_dashboard_unit_parity.py [-h] [--installed-dir INSTALLED_DIR]\n"
+        "check_dashboard_unit_parity.py: error: unrecognized arguments: --repo-root /x",
+        id="argparse-reject",
+    ),
+    pytest.param(
+        1,
+        "",
+        "Traceback (most recent call last):\n"
+        '  File "check_dashboard_unit_parity.py", line 1, in <module>\n'
+        "ValueError: boom",
+        id="traceback",
+    ),
+    pytest.param(0, "", "", id="silent-zero"),
+]
+
+
+@pytest.mark.parametrize(("returncode", "stdout", "stderr"), _UNTAGGED_CHECKER_OUTPUTS)
+def test_unit_parity_verdict_without_the_checkers_tag_is_unknown(
+    monkeypatch: pytest.MonkeyPatch, returncode: int, stdout: str, stderr: str
+) -> None:
+    """No tag, no verdict — whatever the exit code says.
+
+    Trusting the code alone turns a moved checker or a renamed --repo-root
+    into a permanently silent 'absent', and a crash into a WARNING drift.
+    'silent-zero' proves the tag outranks even a parity-looking 0, which is
+    scripts/setup-host.sh::_parity_verdict's own rule.
+    """
+    wdog = _load_watchdog()
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _checker_run([], returncode=returncode, stdout=stdout, stderr=stderr),
+    )
+
+    verdict, report = wdog.unit_parity_verdict()
+
+    assert verdict == "unknown", report
+    assert stderr in report, f"the captured stderr must reach the report: {report!r}"
+    assert f"exit {returncode}" in report, f"the report must name the exit status: {report!r}"
+
+
+def test_unit_parity_verdict_runs_the_real_checker_and_reads_its_tag(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """CONTRACT LOCK: the real checker, run the way the watchdog runs it, reports.
+
+    The one test here that does not fake subprocess.run. Every other one
+    would stay green through a renamed or moved checker, a renamed
+    --repo-root, or a changed tag, while the hourly pass went quiet.
+
+    REPO_DIR is redirected to this checkout because its hardcoded default
+    would run MAIN's checker, not the code under test; the script path is
+    re-derived from the constant's own relative path so a rename still
+    fails. HOME points at an empty tmp dir, so the checker's default installed
+    dir holds no units and the real ones are never read, while the production
+    argv stays intact. 'absent' is then the only correct answer, and getting
+    it proves the script runs at that path, accepts --repo-root, and prints
+    the tag the watchdog searches for.
+    """
+    wdog = _load_watchdog()
+    rel = os.path.relpath(wdog.DASHBOARD_PARITY_SCRIPT, wdog.REPO_DIR)
+    assert (REPO_ROOT / rel).is_file(), (
+        f"DASHBOARD_PARITY_SCRIPT names {rel}, which this checkout does not have"
+    )
+    monkeypatch.setattr(wdog, "REPO_DIR", str(REPO_ROOT))
+    monkeypatch.setattr(wdog, "DASHBOARD_PARITY_SCRIPT", str(REPO_ROOT / rel))
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    verdict, report = wdog.unit_parity_verdict()
+
+    assert verdict == "absent", f"expected 'absent' from an empty installed dir: {report!r}"
 
 
 def _pass_log_lines(
@@ -12627,6 +12719,43 @@ def test_unit_parity_pass_reports_a_broken_checker_without_a_warning(
     assert "WARNING" not in line, line
     assert "unit parity" in line, line
     assert "PermissionError" in line, line
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr"),
+    [p for p in _UNTAGGED_CHECKER_OUTPUTS if p.id in {"cant-open", "traceback"}],
+)
+def test_unit_parity_pass_reports_an_untagged_exit_instead_of_trusting_its_code(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    returncode: int,
+    stdout: str,
+    stderr: str,
+) -> None:
+    """End to end through the pass: a checker that never reported is one plain line.
+
+    Not a stubbed verdict — subprocess.run is faked, so the regression is
+    locked where the hourly pass actually reads it. Trusting the code alone,
+    a moved checker (rc=2) logged nothing at all, and a crash (rc=1) logged a
+    WARNING that the installed units had drifted.
+    """
+    wdog = _load_watchdog()
+    _isolate_unit_parity(wdog, monkeypatch, tmp_path)
+    lines: list[str] = []
+    monkeypatch.setattr(wdog, "log", lines.append)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _checker_run([], returncode=returncode, stdout=stdout, stderr=stderr),
+    )
+
+    wdog.unit_parity_pass()
+
+    assert len(lines) == 1, lines
+    (line,) = lines
+    assert "WARNING" not in line, line
+    assert "unit parity" in line, line
+    assert stderr in line, line
 
 
 def test_unit_parity_pass_never_raises(
@@ -12823,6 +12952,15 @@ def _parity_row(out: str) -> str:
     return rows[0]
 
 
+def _row_verdict(row: str) -> str:
+    """Return the verdict field of a parity row: between the first ':' and the first '|'.
+
+    Asserting ``"parity" in row`` is vacuous, because the row's label,
+    ``dashboard unit parity``, always contains the word.
+    """
+    return row.split(":", 1)[1].split("|", 1)[0].strip()
+
+
 @pytest.mark.parametrize("verdict", ["parity", "drift", "absent", "unknown"])
 def test_print_unit_parity_prints_one_labelled_row(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], verdict: str
@@ -12834,7 +12972,7 @@ def test_print_unit_parity_prints_one_labelled_row(
     wdog._print_unit_parity()
 
     row = _parity_row(capsys.readouterr().out)
-    assert verdict in row, row
+    assert _row_verdict(row) == verdict, row
     assert " | " in row, f"the row must keep --report's LABEL: value | LABEL: value shape: {row!r}"
 
 
@@ -12869,7 +13007,15 @@ def test_print_unit_parity_is_not_clock_gated_and_writes_no_clock(
     clock.write_text(json.dumps({"ts": int(time.time()), "iso": "fresh"}) + "\n")
     before = clock.read_bytes()
     calls: list[list[str]] = []
-    monkeypatch.setattr(subprocess, "run", _checker_run(calls, returncode=0))
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        _checker_run(
+            calls,
+            returncode=0,
+            stdout="[dashboard_unit_parity] [ok] parity — 3 unit(s) match their committed copies.",
+        ),
+    )
 
     wdog._print_unit_parity()
 
@@ -12878,7 +13024,7 @@ def test_print_unit_parity_is_not_clock_gated_and_writes_no_clock(
     ]
     assert len(checker_runs) == 1, f"the row must run the checker despite a fresh stamp: {calls}"
     assert clock.read_bytes() == before, "--report must never write the parity clock"
-    assert "parity" in _parity_row(capsys.readouterr().out)
+    assert _row_verdict(_parity_row(capsys.readouterr().out)) == "parity"
 
 
 @pytest.mark.parametrize("report_rc", [0, 1])
@@ -12925,7 +13071,7 @@ def test_cli_report_runs_no_mutating_pass_including_unit_parity(
         )
 
     assert wdog._cli(["--report"]) == 0
-    assert "parity" in _parity_row(capsys.readouterr().out)
+    assert _row_verdict(_parity_row(capsys.readouterr().out)) == "parity"
 
 
 def test_print_unit_parity_degrades_to_unknown_on_an_unexpected_failure(
