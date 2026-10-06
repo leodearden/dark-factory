@@ -28,6 +28,8 @@ from orchestrator.merge_lane.gates import (
     Gate,
     GateVerdict,
     _finalize_advanced_merge,
+    is_cross_repo_task,
+    resolve_already_landed_branch,
 )
 from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, OutcomeKind, QueuedBranch
 
@@ -347,3 +349,98 @@ async def test_a_gate_returning_a_hand_built_blocked_verdict_is_refused_loudly(
             git_ops, _request(lane_config, scene.worktree),
             advanced_sha=scene.landed, base_sha=scene.base,
         )
+
+
+LANDED_TASK_ID = '9101'
+LANDED_BRANCH = f'task/{LANDED_TASK_ID}'
+
+
+@pytest.fixture
+def landed_and_reparked(repo: Path) -> str:
+    """Task 9101's work is merged into main, and its branch re-parked on that merge.
+
+    The branch range is then empty, the merge subject attributes the landing
+    to the task, and the landing touched ``pkg/a.py``, ``pkg/b.py`` and
+    ``docs/INDEX/a.md``.  Returns the merge commit.
+    """
+    _git(repo, 'checkout', '-b', LANDED_BRANCH)
+    _commit(
+        repo,
+        {'pkg/a.py': 'A = 1\n', 'pkg/b.py': 'B = 2\n', 'docs/INDEX/a.md': '# a\n'},
+        f'impl({LANDED_TASK_ID}): deliver',
+    )
+    _git(repo, 'checkout', 'main')
+    _git(repo, 'merge', '--no-ff', '-m', f'Merge {LANDED_BRANCH} into main', LANDED_BRANCH)
+    merge = _git(repo, 'rev-parse', 'HEAD')
+    _git(repo, 'branch', '-f', LANDED_BRANCH, merge)
+    return merge
+
+
+async def _matched_files(git_ops: GitOps, landed: str, plan_files: list[str]) -> list[str] | None:
+    result = await resolve_already_landed_branch(
+        plan_files, landed, landed, git_ops, task_id=LANDED_TASK_ID, branch=LANDED_BRANCH,
+    )
+    return None if result is None else result.matched_files
+
+
+@pytest.mark.asyncio
+async def test_a_declared_directory_is_covered_by_a_file_beneath_it(
+    git_ops: GitOps, landed_and_reparked: str,
+) -> None:
+    """A declared directory counts as delivered when the landing touched a file inside it."""
+    assert await _matched_files(git_ops, landed_and_reparked, ['pkg']) == ['pkg']
+
+
+@pytest.mark.asyncio
+async def test_a_directory_whose_name_ends_in_x_is_covered_by_its_contents(
+    git_ops: GitOps, landed_and_reparked: str,
+) -> None:
+    """Only a trailing separator is trimmed from a declared directory, never its own last letters."""
+    assert await _matched_files(git_ops, landed_and_reparked, ['docs/INDEX']) == ['docs/INDEX']
+
+
+@pytest.mark.asyncio
+async def test_trailing_whitespace_is_not_trimmed_into_a_different_directory(
+    git_ops: GitOps, landed_and_reparked: str,
+) -> None:
+    """``'pkg '`` names a different path from ``pkg``, so the landing does not cover it."""
+    assert await _matched_files(git_ops, landed_and_reparked, ['pkg ']) is None
+
+
+@pytest.mark.asyncio
+async def test_a_leading_slash_entry_is_not_rerooted_onto_the_repo(
+    git_ops: GitOps, landed_and_reparked: str,
+) -> None:
+    """``'/pkg'`` is an absolute path, not the repo's ``pkg``, so the landing does not cover it."""
+    assert await _matched_files(git_ops, landed_and_reparked, ['/pkg']) is None
+
+
+@pytest.mark.asyncio
+async def test_every_declared_entry_is_matched(
+    git_ops: GitOps, landed_and_reparked: str,
+) -> None:
+    """Coverage keeps checking after a hit, and reports every declared entry it matched."""
+    matched = await _matched_files(git_ops, landed_and_reparked, ['pkg/a.py', 'pkg/b.py'])
+
+    assert matched == ['pkg/a.py', 'pkg/b.py']
+
+
+@pytest.mark.asyncio
+async def test_an_uncovered_entry_after_a_covered_one_fails_closed(
+    git_ops: GitOps, landed_and_reparked: str,
+) -> None:
+    """A partial landing never excuses the branch: one uncovered entry declines the whole set."""
+    assert await _matched_files(git_ops, landed_and_reparked, ['pkg/a.py', 'other/c.py']) is None
+
+
+@pytest.mark.asyncio
+async def test_a_blank_entry_is_skipped_not_terminal(
+    git_ops: GitOps, landed_and_reparked: str,
+) -> None:
+    """A blank declared entry is ignored and the entries after it are still checked."""
+    assert await _matched_files(git_ops, landed_and_reparked, ['', 'pkg/a.py']) == ['pkg/a.py']
+
+
+def test_plan_files_of_only_blank_entries_are_not_cross_repo(tmp_path: Path) -> None:
+    """Declared entries that are all blank name no foreign project, so the task is not cross-repo."""
+    assert is_cross_repo_task(['', ''], tmp_path, None) is False
