@@ -354,9 +354,8 @@ function MemoryEvalMetricRow({ metric, onOpenEscalation }) {
 
 // ── Limits provenance ──
 //
-// Collapsed by default (a <details>, open state persisted in the
-// useOpenSet/usePersistedState idiom of tab_escalations.jsx:286) so provenance
-// does not dominate the card.
+// Collapsed by default (a <details>, open state persisted through
+// persisted_state.js) so provenance does not dominate the card.
 //
 // The persisted key is PER EVAL — `df.memevals.prov.<eval_id>` — and the open
 // state is held in component state seeded from storage exactly once at mount.

@@ -10,7 +10,6 @@
  * Export:     window.DF_TABS.EscalationAnalyticsTab  (additive mutation of
  *             the object created by tabs.jsx; app.jsx destructures it last)
  */
-const { useState: uS, useEffect: uE } = React;
 const DF = window.DF_DATA;
 const { ProjectGroup, Segmented, fmtUptime, fmtDateTime, taskId } = window.DF_SHELL;
 const C = window.DF_CHARTS;
@@ -21,48 +20,15 @@ const { plainDatum } = window.DF_DATUM;
 // The corpus' class split and views — read only through their one client
 // reader, escalation_views.js.
 const { resolutionSegments, corpusAgeCaption, openInHistoryOver } = window.DF_ESCALATION_VIEWS;
-// The storage policy for UI preferences — persisted_state.js.
-const { readPersisted, writePersisted } = window.DF_PERSISTED_STATE;
+// The persisted UI-preference hooks — persisted_state.js.
+const { createPersistedHooks } = window.DF_PERSISTED_STATE;
+const { usePersistedState, useOpenSet } = createPersistedHooks(React);
 
 // Every number this tab renders arrives on one endpoint, and the path is the
 // lookup key into DF_DATA.__receipt (data.js keys one receipt per polled
 // endpoint by its URL with the query stripped).
 const EP_ANALYTICS = '/api/v2/dashboard/escalation-analytics';
 const { LifecycleFlowDiagram } = window.DF_ESC_FLOW || {};
-
-// ── Local helpers (tab_escalations.jsx-compatible copies; not exported from
-//    any namespace) ──
-
-function useOpenSet(ids, defaultOpen = true, storageKey = null) {
-  const [openMap, setOpenMap] = uS(() => {
-    const stored = readPersisted(storageKey, {}) || {};
-    const init = {};
-    for (const id of ids) init[id] = id in stored ? !!stored[id] : defaultOpen;
-    return init;
-  });
-  // Backfill ids that arrive after mount (per_project starts [] and is
-  // populated by the first poll, so groups would otherwise render collapsed).
-  const idsKey = ids.join('\0');
-  uE(() => {
-    setOpenMap(m => {
-      let patch = null;
-      for (const id of ids) {
-        if (!(id in m)) { if (!patch) patch = {}; patch[id] = defaultOpen; }
-      }
-      return patch ? { ...m, ...patch } : m;
-    });
-  }, [idsKey]); // eslint-disable-line react-hooks/exhaustive-deps
-  uE(() => { writePersisted(storageKey, openMap, {}); }, [storageKey, openMap]);
-  const toggle = id => setOpenMap(m => ({ ...m, [id]: !m[id] }));
-  const setAll = v => setOpenMap(Object.fromEntries(ids.map(id => [id, v])));
-  return [openMap, toggle, setAll];
-}
-
-function usePersistedState(storageKey, defaultValue) {
-  const [v, setV] = uS(() => readPersisted(storageKey, defaultValue));
-  uE(() => { writePersisted(storageKey, v, defaultValue); }, [storageKey, v]);
-  return [v, setV];
-}
 
 // ── Window slicing ──
 //

@@ -2933,16 +2933,11 @@ def test_provenance_open_state_persists_through_the_policy_module(
     swallowed a failure.  The policy module stores a JSON boolean, drops the key
     while the state is the default (collapsed), and warns on a failed write.
     A legacy '1' still reads truthy; a legacy '0' reads falsy and is swept.
+    What every consumer of the module shares — binding, no direct localStorage,
+    no empty catch — is checked once, in test_persisted_state_consumers.py.
     """
     code = tab_memory_evals_jsx_code
-    destructure = re.search(r'const\s*\{([^}]*)\}\s*=\s*window\.DF_PERSISTED_STATE\s*;', code)
-    assert destructure is not None, (
-        'tab_memory_evals.jsx must destructure window.DF_PERSISTED_STATE at module scope.'
-    )
     for call in ('readPersisted', 'writePersisted'):
-        assert re.search(rf'\b{call}\b', destructure.group(1)), (
-            f'tab_memory_evals.jsx destructures DF_PERSISTED_STATE without `{call}`.'
-        )
         helpers = _policy_helpers(code, call)
         assert helpers, f'no provenance helper in tab_memory_evals.jsx calls `{call}(`.'
         for helper in helpers:
@@ -2950,12 +2945,6 @@ def test_provenance_open_state_persists_through_the_policy_module(
                 f"`{helper}` still encodes the open state as '1'/'0'; pass the boolean "
                 'to the policy module, which stores it as JSON.'
             )
-    assert not re.search(r'\blocalStorage\b', code), (
-        'tab_memory_evals.jsx reaches localStorage directly; go through readPersisted / writePersisted.'
-    )
-    assert not re.search(r'\bcatch\s*(?:\(\s*\w*\s*\))?\s*\{\s*\}', code), (
-        'tab_memory_evals.jsx still has an empty catch block, which swallows a storage failure unseen.'
-    )
 
 
 # ---------------------------------------------------------------------------

@@ -29,8 +29,9 @@ const {
 } = window.DF_ESCALATION_VIEWS;
 // The cross-tab focus lookup, keyed on (queue, id) — escalation_focus.js.
 const { findEscalationRow } = window.DF_ESCALATION_FOCUS;
-// The storage policy for UI preferences — persisted_state.js.
-const { readPersisted, writePersisted } = window.DF_PERSISTED_STATE;
+// The persisted UI-preference hooks — persisted_state.js.
+const { createPersistedHooks } = window.DF_PERSISTED_STATE;
+const { usePersistedState, useOpenSet } = createPersistedHooks(React);
 
 // Every number this tab renders arrives on one endpoint, and the path is the
 // lookup key into DF_DATA.__receipt (data.js keys one receipt per polled
@@ -74,38 +75,7 @@ function escalationsLoaded() {
   return !!(DF.__loaded && DF.__loaded.ESCALATIONS);
 }
 
-// ── Local helpers (tabs.jsx-compatible copies; not exported from any namespace) ──
-
-function useOpenSet(ids, defaultOpen = true, storageKey = null) {
-  const [openMap, setOpenMap] = uS(() => {
-    const stored = readPersisted(storageKey, {}) || {};
-    const init = {};
-    for (const id of ids) init[id] = id in stored ? !!stored[id] : defaultOpen;
-    return init;
-  });
-  // Backfill ids that arrive after mount (ESCALATIONS.subsections starts [] and
-  // is populated by the first poll, so groups would otherwise render collapsed).
-  const idsKey = ids.join('\0');
-  uE(() => {
-    setOpenMap(m => {
-      let patch = null;
-      for (const id of ids) {
-        if (!(id in m)) { if (!patch) patch = {}; patch[id] = defaultOpen; }
-      }
-      return patch ? { ...m, ...patch } : m;
-    });
-  }, [idsKey]); // eslint-disable-line react-hooks/exhaustive-deps
-  uE(() => { writePersisted(storageKey, openMap, {}); }, [storageKey, openMap]);
-  const toggle = id => setOpenMap(m => ({ ...m, [id]: !m[id] }));
-  const setAll = v => setOpenMap(Object.fromEntries(ids.map(id => [id, v])));
-  return [openMap, toggle, setAll];
-}
-
-function usePersistedState(storageKey, defaultValue) {
-  const [v, setV] = uS(() => readPersisted(storageKey, defaultValue));
-  uE(() => { writePersisted(storageKey, v, defaultValue); }, [storageKey, v]);
-  return [v, setV];
-}
+// ── Local helpers (a tabs.jsx-compatible copy; not exported from any namespace) ──
 
 function GroupAllToggle({ allOpen, onSetAll }) {
   return (

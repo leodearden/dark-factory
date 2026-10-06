@@ -33,9 +33,10 @@ const { ON_DEMAND_KEYS: LOADER_ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
 const { windowEcho, windowLabel, recentMergesCaption } = window.DF_WINDOW_CHIP;
 const { projectInQueue, inQueueOver, inQueueHistory, latencyCaption } = window.DF_MERGE_QUEUE;
 const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalText } = window.DF_MEMORY_READINGS;
-// The storage policy for UI preferences — persisted_state.js.
-const { readPersisted, writePersisted } = window.DF_PERSISTED_STATE;
-const { useState: uS, useEffect: uE } = React;
+const { useState: uS } = React;
+// The persisted UI-preference hooks — persisted_state.js.
+const { createPersistedHooks } = window.DF_PERSISTED_STATE;
+const { usePersistedState, useOpenSet } = createPersistedHooks(React);
 
 // Which endpoint each rendered number arrived on. plainDatum's provenance is
 // endpoint-granular until PRD leaf beta puts a served Datum on the wire, and the
@@ -57,27 +58,6 @@ const EP = Object.freeze({
 // repeats the `x == null ? '—' : …` sentinel that used to sit at every site.
 const fmtCount = n => n.toLocaleString();
 const fmtUsd = n => `$${n.toFixed(2)}`;
-
-// shared open-state helper for furl/unfurl, persisted by key
-function useOpenSet(ids, defaultOpen = true, storageKey = null) {
-  const [openMap, setOpenMap] = uS(() => {
-    const stored = readPersisted(storageKey, {}) || {};
-    const init = {};
-    for (const id of ids) init[id] = id in stored ? !!stored[id] : defaultOpen;
-    return init;
-  });
-  uE(() => { writePersisted(storageKey, openMap, {}); }, [storageKey, openMap]);
-  const toggle = id => setOpenMap(m => ({ ...m, [id]: !m[id] }));
-  const setAll = v => setOpenMap(Object.fromEntries(ids.map(id => [id, v])));
-  return [openMap, toggle, setAll];
-}
-
-// generic persisted state hook; a falsy key keeps the state in memory only
-function usePersistedState(storageKey, defaultValue) {
-  const [v, setV] = uS(() => readPersisted(storageKey, defaultValue));
-  uE(() => { writePersisted(storageKey, v, defaultValue); }, [storageKey, v]);
-  return [v, setV];
-}
 
 function GroupAllToggle({ allOpen, onSetAll }) {
   return (

@@ -1,7 +1,9 @@
 // persisted_state.js — the localStorage POLICY for dashboard UI preferences
-// (open/expanded flags, sort and filter choices). It owns no React: the
-// usePersistedState / useOpenSet hooks stay in the .jsx and delegate here, so
-// the policy has one copy and a storage failure has one place to surface.
+// (open/expanded flags, sort and filter choices), and the one copy of the
+// usePersistedState / useOpenSet hooks that apply it. It imports no React:
+// createPersistedHooks builds the hooks from the useState / useEffect its
+// caller hands in, so node can drive them and a storage failure has one place
+// to surface.
 //
 // THE RULE: a key exists only while its value differs from its default. A
 // value back at its default removes the key instead of writing it. The hooks
@@ -112,6 +114,64 @@ function prunePersistedBooleans(prefixes, storage = persistedStateStorage()) {
   return removed;
 }
 
+// The id -> open flag map stored under `storageKey`, or {} when there is none
+// or the stored value is not such a map.
+function storedOpenFlags(storageKey) {
+  const stored = readPersisted(storageKey, {});
+  return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+}
+
+// `openMap` plus every id in `ids` it lacks, each at its stored flag, else at
+// defaultOpen. Returns `openMap` itself when it lacks none, so a state setter
+// handed this sees no change.
+function withOpenFlags(openMap, ids, storedFlags, defaultOpen) {
+  let added = null;
+  for (const id of ids) {
+    if (id in openMap) continue;
+    if (!added) added = {};
+    added[id] = id in storedFlags ? !!storedFlags[id] : defaultOpen;
+  }
+  return added ? { ...openMap, ...added } : openMap;
+}
+
+// The entries of `openMap` that differ from defaultOpen: under THE RULE, the
+// only part of an open set that is stored.
+function openFlagDeviations(openMap, defaultOpen) {
+  return Object.fromEntries(Object.entries(openMap).filter(([, open]) => open !== defaultOpen));
+}
+
+// The two preference hooks, built over `react` (React itself, or anything
+// carrying its useState and useEffect).
+function createPersistedHooks({ useState, useEffect }) {
+  // State stored under `storageKey`; a falsy key keeps it in memory only.
+  function usePersistedState(storageKey, defaultValue) {
+    const [value, setValue] = useState(() => readPersisted(storageKey, defaultValue));
+    useEffect(() => { writePersisted(storageKey, value, defaultValue); }, [storageKey, value]);
+    return [value, setValue];
+  }
+
+  // Open flags for a set of fold groups, keyed by id. An id seen after mount
+  // opens at its stored flag, else at defaultOpen: the payloads that supply
+  // `ids` start empty and fill on the first poll, so a tab often mounts with
+  // none. The stored flags are read once, at mount, for that reason.
+  function useOpenSet(ids, defaultOpen = true, storageKey = null) {
+    const [storedFlags] = useState(() => storedOpenFlags(storageKey));
+    const [openMap, setOpenMap] = useState(() => withOpenFlags({}, ids, storedFlags, defaultOpen));
+    const idsKey = ids.join('\0');
+    useEffect(() => {
+      setOpenMap(m => withOpenFlags(m, ids, storedFlags, defaultOpen));
+    }, [idsKey]); // eslint-disable-line react-hooks/exhaustive-deps
+    useEffect(() => {
+      writePersisted(storageKey, openFlagDeviations(openMap, defaultOpen), {});
+    }, [storageKey, openMap, defaultOpen]);
+    const toggle = id => setOpenMap(m => ({ ...m, [id]: !m[id] }));
+    const setAll = open => setOpenMap(Object.fromEntries(ids.map(id => [id, open])));
+    return [openMap, toggle, setAll];
+  }
+
+  return { usePersistedState, useOpenSet };
+}
+
 // Module-unique export const, never a bare `API` — the CANONICAL note in
 // datum.js's header, enforced at runtime by classic_script_scope.test.mjs.
 const PERSISTED_STATE_API = {
@@ -119,6 +179,7 @@ const PERSISTED_STATE_API = {
   writePersisted,
   prunePersistedBooleans,
   PERSISTED_ENTITY_KEY_PREFIXES,
+  createPersistedHooks,
 };
 
 if (typeof module !== 'undefined' && module.exports) {

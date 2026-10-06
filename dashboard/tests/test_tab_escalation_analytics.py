@@ -439,8 +439,8 @@ def test_tab_analytics_jsx_served_and_exports(_client) -> None:
     )
     # Fold state persisted with the correct key
     assert 'useOpenSet(' in tab_body, (
-        'EscalationAnalyticsTab does not call useOpenSet( — add the local copy of '
-        "useOpenSet from tab_escalations.jsx and call it with project ids and 'df.open.escanalytics'."
+        "EscalationAnalyticsTab does not call useOpenSet( — call persisted_state.js's "
+        "useOpenSet with project ids and 'df.open.escanalytics'."
     )
     assert "'df.open.escanalytics'" in tab_body, (
         "EscalationAnalyticsTab does not reference the localStorage key "
@@ -1135,40 +1135,4 @@ def test_tab_analytics_states_the_corpus_age(tab_analytics_jsx_body: str) -> Non
     assert re.search(r'\{\s*corpusAgeCaption\(', tab_body), (
         'EscalationAnalyticsTab renders no `{corpusAgeCaption(…)}` — the payload is '
         'derived from a cached walk and must say when that walk was.'
-    )
-
-
-# ---------------------------------------------------------------------------
-# task 5743: the storage hooks go through persisted_state.js
-# ---------------------------------------------------------------------------
-
-
-def test_analytics_persist_only_through_the_policy_module(tab_analytics_jsx_body: str) -> None:
-    """Every persisted-preference access in tab_escalation_analytics.jsx goes through persisted_state.js.
-
-    One place to change the policy, and one place a quota failure is observed:
-    the hooks' own ``try { localStorage... } catch (e) {}`` swallowed it.
-    """
-    code = strip_js_comments(tab_analytics_jsx_body)
-    destructure = re.search(r'const\s*\{([^}]*)\}\s*=\s*window\.DF_PERSISTED_STATE\s*;', code)
-    assert destructure is not None, (
-        'tab_escalation_analytics.jsx must destructure window.DF_PERSISTED_STATE at module scope.'
-    )
-    for name in ('readPersisted', 'writePersisted'):
-        assert re.search(rf'\b{name}\b', destructure.group(1)), (
-            f'tab_escalation_analytics.jsx destructures DF_PERSISTED_STATE without `{name}`.'
-        )
-    for hook in ('usePersistedState', 'useOpenSet'):
-        body = extract_function_body(code, hook)
-        for name in ('readPersisted', 'writePersisted'):
-            assert re.search(rf'\b{name}\s*\(', body), (
-                f'tab_escalation_analytics.jsx {hook} must call `{name}(`.'
-            )
-    assert not re.search(r'\blocalStorage\b', code), (
-        'tab_escalation_analytics.jsx reaches localStorage directly; '
-        'go through readPersisted / writePersisted.'
-    )
-    assert not re.search(r'\bcatch\s*(?:\(\s*\w*\s*\))?\s*\{\s*\}', code), (
-        'tab_escalation_analytics.jsx still has an empty catch block, which swallows a '
-        'storage failure unseen.'
     )
