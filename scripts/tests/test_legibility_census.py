@@ -20,7 +20,7 @@ import functools
 import json
 import logging
 import subprocess
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
 
 import census as mod
@@ -28,9 +28,16 @@ import codebook
 import coder
 import digest as digest_mod
 import filing_policy
-import inventory
 import pytest
-from legibility import account_pool, census_trigger, session_runner, unlanded
+from legibility import (
+    account_pool,
+    census_trigger,
+    census_window,
+    session_ledger,
+    session_runner,
+    trickle_state,
+    unlanded,
+)
 from shared.cap_markers import (
     BLOCKING_BANNER_MARKERS,
     REAL_CLI_CAP_HIT_MESSAGES,
@@ -38,6 +45,14 @@ from shared.cap_markers import (
 )
 
 import config as config_mod
+
+
+@pytest.fixture(autouse=True)
+def _isolate_legibility_state(tmp_path, monkeypatch):
+    """Keep every ledger and quarantine this module's census runs write
+    under tmp_path, never the operator's real legibility state root."""
+    monkeypatch.setenv(trickle_state.STATE_ROOT_ENV, str(tmp_path / "legibility-state"))
+
 
 # ---------------------------------------------------------------------------
 # Shared fixture helpers — synthetic transcript -> real digest text, mirrors
@@ -4892,55 +4907,38 @@ def test_main_failure_escalation_is_best_effort_when_poster_raises(tmp_path, mon
 
 
 # ---------------------------------------------------------------------------
-# default_batch_source — the whole census window is enumerated in ONE walk via
-# enumerate_sessions_in_range (O(files), not O(window_days × files)), and the
-# shipped agent_transcript_roots is threaded into that single call with NO
-# operator flip (resolved against cfg.project_root). Patches
-# inventory.enumerate_sessions_in_range (the module object census.py itself
-# references via `import inventory`) to capture its window + kwargs.
+# main() mines through a census_window.WindowBatchSource over the project's
+# ledger; selection itself is covered in test_census_window.py.
 # ---------------------------------------------------------------------------
 
-def test_default_batch_source_passes_resolved_archive_roots_to_enumerate(tmp_path, monkeypatch):
-    config_path = _write_legibility_yaml(
-        tmp_path, agent_transcript_roots=["data/orchestrator/agent-transcripts"],
+def test_main_hands_run_census_a_window_source_over_the_project_ledger(tmp_path, monkeypatch):
+    _write_legibility_yaml(tmp_path)
+    last_census = datetime.now(UTC).date() - timedelta(days=3)
+    (tmp_path / "docs" / "legibility" / "census-state.json").write_text(
+        json.dumps({"last_census_at": last_census.isoformat()}), encoding="utf-8",
     )
-    cfg = config_mod.load_config(config_path)
+    monkeypatch.setattr(mod, "DEFAULT_PROJECTS_ROOT", tmp_path / "no-projects")
+    sources = []
 
-    captured = []
+    def fake_run_census(**kwargs):
+        source = kwargs["batch_source"]
+        list(source)
+        sources.append(source)
+        return mod.CensusOutcome(
+            status="done", report_path="plans/r.md", filed_ticket_ids=[],
+            stop_reason="exhausted",
+        )
 
-    def fake_enumerate_sessions_in_range(
-        projects_root, cwd_prefixes, start_date, end_date, **kwargs
-    ):
-        captured.append((start_date, end_date, kwargs))
-        return []
+    monkeypatch.setattr(mod, "run_census", fake_run_census)
 
-    monkeypatch.setattr(
-        inventory, "enumerate_sessions_in_range", fake_enumerate_sessions_in_range
-    )
+    assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
 
-    now = datetime(2026, 7, 13, 12, 0, tzinfo=UTC)
-    # Consume the generator: nothing enumerates until it is iterated.
-    list(mod.default_batch_source(cfg, projects_root=tmp_path / "projects", now=now))
-
-    # With no census-state.json under cfg.project_root the window is the
-    # multi-date default lookback (>1 date) — the old per-date loop would have
-    # called the enumerator once per date.
-    window = mod._census_window_dates(cfg.project_root, now=now)
-    assert len(window) > 1, "sanity: this test needs a genuinely multi-date window"
-
-    # (1) ONE range-enumerate call regardless of window length — the
-    # O(files)-not-O(window_days × files) census-level signal.
-    assert len(captured) == 1, "enumerate_sessions_in_range must be called exactly once"
-
-    start_date, end_date, kwargs = captured[0]
-    # (2) resolved archive roots threaded with no operator flip.
-    expected_roots = inventory.resolve_agent_transcript_roots(
-        cfg.project_root, cfg.agent_transcript_roots
-    )
-    assert expected_roots == [tmp_path / "data" / "orchestrator" / "agent-transcripts"]
-    assert kwargs["agent_transcript_roots"] == expected_roots
-    # (3) the [start, end] window equals _census_window_dates' first/last.
-    assert (start_date, end_date) == (window[0], window[-1])
+    (source,) = sources
+    assert isinstance(source, census_window.WindowBatchSource)
+    assert source.selection is not None
+    assert source.selection.window.start == datetime.combine(last_census, time(), UTC)
+    assert source.selection.ledger.path == session_ledger.ledger_path("dark_factory")
+    assert source.selection.ledger.state is session_ledger.LedgerState.CREATED
 
 
 # ---------------------------------------------------------------------------
