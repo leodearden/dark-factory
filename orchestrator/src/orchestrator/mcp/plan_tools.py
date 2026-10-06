@@ -116,8 +116,8 @@ logger = logging.getLogger(__name__)
 _RESIDUAL_CORRUPTION_CHARS = frozenset("[]{}'\"")
 
 
-def _coerce_files(files: list[str] | str | None) -> list[str]:
-    """Coerce a possibly mis-serialized ``files`` MCP arg into a clean list.
+def _coerce_files(files: object) -> list[str]:
+    """Coerce a possibly mis-serialized ``files`` value into a clean list.
 
     The agent harness intermittently mis-serializes the ``create_plan``
     (and ``update_plan_metadata``) call when a large/complex ``analysis``
@@ -128,11 +128,23 @@ def _coerce_files(files: list[str] | str | None) -> list[str]:
     ``list[str]``; ``None`` maps to ``[]``. Shapes that cannot be
     confidently recovered are logged (rather than silently accepted) so
     the corruption stays visible to operators.
+
+    A ``files`` read back out of a stored plan has passed no pydantic
+    boundary, so it may be any JSON type: one that is neither list, str nor
+    ``None`` maps to ``[]``, logged, rather than raising.
     """
     if files is None:
         return []
     if isinstance(files, list):
         return [str(f).strip() for f in files if str(f).strip()]
+    if not isinstance(files, str):
+        logger.warning(
+            "_coerce_files: files value has unrecognized type %s (expected "
+            "list, str or None); treating it as no files: %r",
+            type(files).__name__,
+            files,
+        )
+        return []
 
     text = files.strip()
     if not text:
@@ -1221,8 +1233,11 @@ def _drop_plan_file(
     Atomicity is the invariant, not a convenience. Because the removal and the
     note are the same write, it is structurally impossible to note a file that
     was kept, to drop without a reason, or to ADD a file — so
-    ``workflow._try_narrow_plan``'s ``after.issubset(before)`` guard holds by
-    construction and needs no change.
+    ``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._try_narrow_plan``'s
+    ``after.issubset(before)`` guard holds by construction whenever the stored
+    ``files`` is a list. A stored non-list ``files`` breaks that: this function
+    coerces it and writes back a real list, but the guard takes ``before``
+    from the raw stored value.
     """
     plan, markup_facts = _read_plan_repaired(artifacts)
     if not plan:
@@ -1245,7 +1260,7 @@ def _drop_plan_file(
             markup_facts,
         )
 
-    current = plan.get('files', [])
+    current = _coerce_files(plan.get('files'))
     if path not in current:
         return _with_markup_repairs(
             {
@@ -1307,23 +1322,64 @@ def _mark_step_done(
     commit_sha: str,
 ) -> dict[str, Any]:
     plan, markup_facts = _read_plan_repaired(artifacts)
-    for collection in ('prerequisites', 'steps'):
-        for item in plan.get(collection, []):
-            if isinstance(item, dict) and item.get('id') == step_id:
-                # The repair write-back has already landed, so the re-read
-                # inside update_step_status picks up the repaired document.
-                artifacts.update_step_status(step_id, 'done', commit=commit_sha)
-                return _with_markup_repairs(
-                    {
-                        'status': 'ok',
-                        'step_id': step_id,
-                        'new_status': 'done',
-                        'commit': commit_sha,
-                    },
-                    markup_facts,
-                )
+    # CHEAP IN-MEMORY VALIDATION FIRST. The step lookup is a dict walk over an
+    # already-parsed plan; the reachability guard below shells out to git
+    # twice. Resolving the id first means a typo'd step id reports the
+    # actionable 'Step ... not found in plan.' instead of a reachability
+    # complaint about a sha that was never going to be written, and no call
+    # that cannot write pays for a subprocess.
+    if not any(
+        isinstance(item, dict) and item.get('id') == step_id
+        for collection in ('prerequisites', 'steps')
+        for item in plan.get(collection, [])
+    ):
+        return _with_markup_repairs(
+            {'status': 'error', 'message': f'Step {step_id!r} not found in plan.'},
+            markup_facts,
+        )
+    # task 3651 — a plan step must never record a sha the branch does not
+    # carry: a bogus commit here silently destroys the step's provenance and
+    # feeds workflow.py::_reconcile_done_step_commits an orphan it cannot
+    # resolve. Placed AFTER _read_plan_repaired because that helper has already
+    # written any repair back to disk, so the reject path must still report it
+    # via _with_markup_repairs like every other exit.
+    #
+    # Fail-OPEN on 'unknown', deliberately asymmetric to _mark_step_committed's
+    # fail-CLOSED reuse of _sha_exists_on_branch: this caller is an implementer
+    # recording work it JUST committed, so a false reject would leave the step
+    # `pending` while its code sits on the branch — inviting a re-implementation
+    # on top of a correct one, the exact harm the guard exists to prevent. The
+    # degradation is logged at WARNING rather than passing silently.
+    reachability = _sha_branch_reachability(artifacts.worktree, commit_sha)
+    if reachability == 'unreachable':
+        return _with_markup_repairs(
+            {
+                'status': 'error',
+                'message': (
+                    f'commit_sha {commit_sha!r} is not reachable from HEAD on '
+                    f'this branch (git merge-base --is-ancestor failed) — a '
+                    f'plan step must never record a sha the branch does not '
+                    f'carry'
+                ),
+            },
+            markup_facts,
+        )
+    if reachability == 'unknown':
+        logger.warning(
+            'mark_step_done(%r, %r): on-branch reachability check could not '
+            'run (no usable git repo at %s); recording the sha unverified',
+            step_id, commit_sha, artifacts.worktree,
+        )
+    # The repair write-back has already landed, so the re-read inside
+    # update_step_status picks up the repaired document.
+    artifacts.update_step_status(step_id, 'done', commit=commit_sha)
     return _with_markup_repairs(
-        {'status': 'error', 'message': f'Step {step_id!r} not found in plan.'},
+        {
+            'status': 'ok',
+            'step_id': step_id,
+            'new_status': 'done',
+            'commit': commit_sha,
+        },
         markup_facts,
     )
 
@@ -1667,7 +1723,63 @@ def _sha_exists_on_branch(worktree: Path, sha: str) -> bool:
     deliberately does NOT prove the step's semantics — VERIFY remains the gate.
     Mirrors :func:`_resolve_main_sha`'s subprocess shape (cwd=worktree,
     timeout=10, OSError/SubprocessError -> safe ``False``).
+
+    Implemented as the fail-CLOSED projection of :func:`_sha_branch_reachability`
+    (task 3651): ``'reachable'`` is the only True, so both ``'unreachable'`` and
+    ``'unknown'`` collapse into this function's existing ``False``, which is
+    behaviour-preserving and keeps ONE copy of the probe — a future change to
+    the argv, the cwd or the timeout cannot now be made to one caller and
+    forgotten at the other. The fail-CLOSED reading is deliberate and stays
+    here: a pre-satisfaction guard that cannot check must refuse, the opposite
+    of :func:`_mark_step_done`'s fail-OPEN treatment of ``'unknown'``.
     """
+    return _sha_branch_reachability(worktree, sha) == 'reachable'
+
+
+def _sha_branch_reachability(worktree: Path, sha: str) -> str:
+    """Tri-state reachability probe for *sha*: ``'reachable' | 'unreachable' | 'unknown'`` (task 3651).
+
+    THE ONE PROBE. :func:`_sha_exists_on_branch` is now a thin fail-CLOSED
+    projection of this function (``== 'reachable'``), so the argv, the cwd and
+    the ``timeout=10`` are stated once and both callers move together. What
+    this function adds over that boolean is a THIRD outcome the projection
+    folds into its bare ``False``: "the check could not run at all". That
+    distinction is what lets :func:`_mark_step_done` fail OPEN on an infra
+    fault while still rejecting a sha the branch genuinely does not carry.
+
+    Two probes, in order:
+
+    1. ``git rev-parse --git-dir`` — is there a usable repo at *worktree*? A
+       non-zero rc (or an ``OSError``/``SubprocessError``) means git or the
+       worktree is unavailable, which is an INFRA fault and says nothing about
+       the sha: return ``'unknown'``.
+    2. ``git merge-base --is-ancestor <sha> HEAD`` — rc 0 -> ``'reachable'``;
+       ANY other rc -> ``'unreachable'``. Folding rc 1 (a real commit that is
+       not an ancestor) and rc 128 (a bad/fabricated object) together is
+       correct here precisely because probe 1 already proved the repo healthy —
+       see :func:`_sha_exists_on_branch`'s docstring for those two return
+       codes. An ``OSError``/``SubprocessError`` on this call -> ``'unknown'``.
+
+    :func:`_mark_step_committed` keeps calling :func:`_sha_exists_on_branch`
+    rather than this function directly: a fail-CLOSED architect guard has no
+    use for the third state, and that function's docstring is where the
+    INV-1/INV-3 corroborate-before-acting rationale lives.
+    """
+    try:
+        health = subprocess.run(
+            ['git', 'rev-parse', '--git-dir'],
+            cwd=str(worktree),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if health.returncode != 0:
+            return 'unknown'
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.warning(
+            'Reachability probe: no usable git repo at %s (%s)', worktree, exc
+        )
+        return 'unknown'
     try:
         result = subprocess.run(
             ['git', 'merge-base', '--is-ancestor', sha, 'HEAD'],
@@ -1676,12 +1788,12 @@ def _sha_exists_on_branch(worktree: Path, sha: str) -> bool:
             text=True,
             timeout=10,
         )
-        return result.returncode == 0
     except (subprocess.SubprocessError, OSError) as exc:
         logger.warning(
-            'Failed git merge-base --is-ancestor for sha %r: %s', sha, exc
+            'Reachability probe failed for sha %r: %s', sha, exc
         )
-        return False
+        return 'unknown'
+    return 'reachable' if result.returncode == 0 else 'unreachable'
 
 
 def _mark_step_committed(
@@ -2215,9 +2327,25 @@ def create_server(artifacts: TaskArtifacts) -> FastMCP:
         Only the status and commit fields are updated; all other plan
         structure (including provenance metadata) is preserved.
 
+        *commit_sha* MUST be reachable from HEAD on the current branch — it is
+        checked with a real ``git merge-base --is-ancestor`` before anything is
+        written (``plan_tools.py::_sha_branch_reachability``). A sha the branch
+        does not carry is REJECTED with ``{'status': 'error'}`` and the step is
+        left untouched. On rejection: COMMIT the work first, then call again
+        with the sha that commit produced — never retry with a guessed or
+        invented one. An ABBREVIATED sha is fine and always has been: the
+        already-committed-WIP notice in your briefing shows 12-char short
+        forms, ``git merge-base --is-ancestor`` resolves them like any other
+        rev, and the harness prefix-matches when it dedups
+        (``workflow.py::_detect_tip_wip_commits``) — so keep using the short
+        sha that notice gave you. If the check cannot run at all (no usable
+        git repo at the worktree) the sha is recorded anyway and a WARNING is
+        logged, so an infra fault never blocks recording real work.
+
         Args:
             step_id: The step or prerequisite ID (e.g. "step-1", "pre-1").
-            commit_sha: The git commit SHA for this step's changes.
+            commit_sha: The git commit SHA for this step's changes. Must be
+                reachable from HEAD on the current branch.
         """
         return _mark_step_done(artifacts, step_id, commit_sha)
 

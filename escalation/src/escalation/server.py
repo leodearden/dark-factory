@@ -9,12 +9,13 @@ import logging
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, assert_never, cast
 
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from pydantic import Field, ValidationError
 from shared.branch_names import canonical_queued_branch_name
+from shared.eval_lane import eval_lane_provenance
 
 # Fully qualified rather than `from shared import ...`: the module is
 # deliberately NOT re-exported from shared/__init__, so `import shared` does
@@ -66,6 +67,7 @@ from escalation.models import (
 from escalation.pins import classify_pins
 from escalation.queue import AmendmentOutcome, EscalationQueue, ResolveOutcome
 from escalation.queue import observed_submit_response as _observed_submit_response
+from escalation.related_pending import related_pending
 from escalation.server_instructions import ESCALATION_SERVER_INSTRUCTIONS
 
 logger = logging.getLogger(__name__)
@@ -105,8 +107,8 @@ def _is_harness_sentinel_role(agent_role: str) -> bool:
 def _read_members(queue: EscalationQueue, member_ids: list[str]) -> dict[str, Escalation | None]:
     """Read each DISTINCT member id once — ``None`` for an id that does not resolve.
 
-    The one member read ``promote_to_l2`` makes; :func:`_derive_l2_severity`
-    and :func:`_sentinel_bound_task_ids` both consume it.  Through
+    The one member read ``promote_to_l2`` makes; :func:`_derive_l2_severity`,
+    :func:`_sentinel_bound_task_ids` and :func:`_eval_lane_members` all consume it.  Through
     ``queue.get()`` rather than the queue root directly, so a member already
     resolved and archived between the watcher's drain and its promote still
     contributes (``get`` falls back to the archive), and repeated lookups of a
@@ -221,6 +223,49 @@ def _sentinel_bound_task_ids(members: dict[str, Escalation | None]) -> frozenset
             return frozenset()
         bound_task_ids.add(member.task_id)
     return frozenset(bound_task_ids)
+
+
+def _eval_lane_members(members: dict[str, Escalation | None]) -> dict[str, str]:
+    """Map each resolvable member that carries eval-lane provenance to its reason.
+
+    Judged from the member's OWN record (task id and worktree), so a cluster
+    promoted under a production task id still cannot carry an eval-lane record
+    into a human L2.  *members* is :func:`_read_members`' answer.
+    """
+    flagged: dict[str, str] = {}
+    for member_id, member in members.items():
+        if member is None:
+            continue
+        reason = eval_lane_provenance(member.task_id, member.worktree)
+        if reason is not None:
+            flagged[member_id] = reason
+    return flagged
+
+
+def _eval_lane_refusal(subject: str) -> dict[str, str]:
+    """The ``promote_to_l2`` refusal for an eval-lane *subject*; nothing is minted."""
+    return {
+        'error': (
+            f'{subject}; eval-lane escalations are contained to the eval harness '
+            'and never promoted to the human L2 queue. Close the eval-lane L1(s) '
+            "with resolve_issue(action='close_only', resolution_class='benign') "
+            'and re-promote only the production members, if any, under a '
+            'production task_id.'
+        ),
+        'code': 'eval_lane_contained',
+    }
+
+
+def _amend_not_pending_refusal(escalation_id: str, status: str) -> dict[str, str]:
+    """The ``amend_escalation`` refusal for a record that exists but is *status*."""
+    return {
+        'error': (
+            f'Escalation {escalation_id} is {status}, not pending; only a pending '
+            'record can be amended. Nothing was recorded.'
+        ),
+        'code': 'not_pending',
+        'status': status,
+    }
 
 
 # The role the steward's own filings carry (orchestrator.steward
@@ -1286,24 +1331,26 @@ def create_server(
     async def _report_amendment_truncation_storm(l2_id: str) -> None:
         """File ONE info escalation when amendment truncation BURSTS.
 
-        ``queue.add_members_to_l2`` already counts every dropped amendment on
-        the record itself (``amendments_truncated``) and logs a WARNING.  The
+        Called by both amendment writers' tools — a ``promote_to_l2`` fold and
+        an explicit ``amend_escalation`` — whenever their write shed entries.
+        ``queue._append_amendment_capped`` already counts every dropped
+        amendment on the record itself (``amendments_truncated``) and logs a
+        WARNING.  The
         counter stays the PRIMARY structured fact — the contract is assertable
         from the record, never by log-scrape (INV-8) — but a WARNING has no
         audience.  This is the rate-thresholded NOTIFICATION layered on top,
         which is what INV-4 asks for: a hearer, at a threshold.
 
         Deliberately lives here and not in ``queue.py``.  That module is a pure
-        storage leaf, and a self-file from inside ``add_members_to_l2`` would
+        storage leaf, and a self-file from inside a locked amendment write would
         re-enter ``make_id``/``submit``/``_atomic_write`` while still holding
-        ``escalation_id_lock``.  ``promote_to_l2`` already calls ``queue.submit``
-        on its create path and runs outside that flock.
+        ``escalation_id_lock``.  Both callers await this outside that flock.
 
         PURELY ADDITIVE, NEVER FATAL, mirroring the house analogues
         ``emit_markup_storm_escalation`` and
         ``emit_residual_candidate_key_escalation``: nothing raised in here may
-        fail the promote that triggered it.  A dropped report costs a
-        notification; a raised one would cost the fold.
+        fail the write that triggered it.  A dropped report costs a
+        notification; a raised one would cost the fold or the amend.
 
         Filed under ``_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID``, following the same
         analogues, because the condition is system-scoped rather than a property
@@ -1494,6 +1541,10 @@ def create_server(
         """Auto-resolve *esc* if the target task is already terminal, else submit normally.
 
         Gate order (first match wins, all others fall through to _submit_or_dedupe):
+          0. eval-lane provenance (shared.eval_lane) → contain: file as resolved
+               with resolution_action='close_only' via submit_resolved before
+               ANY other gate or lookup, so no argument can mint it pending or
+               at L2
           1. terminal_state_is_the_bug=True  → bypass (submit normally)
           2. category == 'review_suggestions' → bypass (A4b owns this category)
           3. task_status_lookup is None       → bypass (chokepoint disabled)
@@ -1504,15 +1555,42 @@ def create_server(
                any other status or None → submit normally
           On any exception from the lookup: fail-open to _submit_or_dedupe (never drop).
         """
-        # Task 3550 — stamp the FILING incarnation, ABOVE everything else.
+        eval_lane_reason = eval_lane_provenance(esc.task_id, esc.worktree)
+        if eval_lane_reason is not None:
+            logger.info(
+                'Eval-lane containment: filing %s as resolved (%s); task_id=%r '
+                'agent_role=%r severity=%r level=%r',
+                esc.id, eval_lane_reason, esc.task_id, esc.agent_role,
+                esc.severity, esc.level,
+            )
+            esc.resolution_action = 'close_only'
+            contained = queue.submit_resolved(
+                esc,
+                f'contained: eval-lane artifact ({eval_lane_reason}); not a '
+                'production signal, the eval measurement is scored from the '
+                'cell result artifacts',
+                resolved_by='escalation-eval-lane-containment',
+                resolution_class='benign',
+            )
+            return {
+                'id': contained.id,
+                'status': contained.status,
+                'resolution': contained.resolution,
+                'resolved_by': contained.resolved_by,
+                'level': contained.level,
+            }
+
+        # Task 3550 — stamp the FILING incarnation, ABOVE everything else that
+        # can leave a record OPEN.
         #
         # Placement is the whole design: this runs before the C4/D3 downgrade,
         # before the born-at-L2 `esc.level = 2` assignment, and before all four
-        # gates, so EVERY exit path carries the identity — the two bypass
-        # gates, the lookup-disabled gate, _submit_or_dedupe, the fail-open
-        # except branch below, and the terminal-task submit_resolved
-        # auto-resolve.  No gate can lose it, so those cases need no
-        # special-casing.
+        # numbered gates, so every exit path that can leave a record open
+        # carries the identity — the two bypass gates, the lookup-disabled
+        # gate, _submit_or_dedupe, the fail-open except branch below — and so
+        # does the terminal-task submit_resolved auto-resolve.  Only Gate 0
+        # above precedes it: a contained record is filed resolved, and
+        # `escalation.pins.classify_pins` reads only open records.
         #
         # `escalation.pins` Link 4 reads this to tell a LIVE agent handoff from
         # one filed by a dead incarnation.  None means UNKNOWN, which pins
@@ -1660,6 +1738,9 @@ def create_server(
         *severity* defaults to ``'info'``.  Pass ``'critical'`` or ``'urgent'`` to
         create a born-at-L2 escalation (``models.BORN_AT_L2_SEVERITIES``) that
         bypasses the auto-watcher and routes directly to a human.
+        Eval-lane filings (an eval fixture task id or an eval-worktree path, see
+        ``shared/src/shared/eval_lane.py``) are filed already-resolved whatever
+        the severity, and never reach L1/L2.
 
         *severity* must be one of ``models.KNOWN_SEVERITIES``
         (``'info'``, ``'blocking'``, ``'critical'``, ``'urgent'``).  Unknown values
@@ -1753,6 +1834,9 @@ def create_server(
         *severity* defaults to ``'blocking'``.  Pass ``'critical'`` or ``'urgent'`` to
         create a born-at-L2 escalation (``models.BORN_AT_L2_SEVERITIES``) that
         bypasses the auto-watcher and routes directly to a human.
+        Eval-lane filings (an eval fixture task id or an eval-worktree path, see
+        ``shared/src/shared/eval_lane.py``) are filed already-resolved whatever
+        the severity or *level*, and never reach L1/L2.
 
         *severity* must be one of ``models.KNOWN_SEVERITIES``
         (``'info'``, ``'blocking'``, ``'critical'``, ``'urgent'``).  Unknown values
@@ -1894,6 +1978,28 @@ def create_server(
 
     # --- Handler-side tools ---
 
+    def _attach_related_pending(
+        payload: dict[str, Any], resolved: Escalation,
+    ) -> dict[str, Any]:
+        """Add ``resolve_issue``'s sideways census to *payload*, or leave it ABSENT.
+
+        A census that cannot be computed must never fail the resolve that has
+        already happened, and must never read as ``[]`` ("no pending twins"):
+        on any failure the key stays absent, which is the contract's UNKNOWN —
+        the same seam guard as the ``pins_recovery`` annotation in
+        ``get_pending_escalations``.
+        """
+        try:
+            payload['related_pending'] = related_pending(
+                queue.get_pending(), resolved=resolved,
+            )
+        except Exception:
+            logger.exception(
+                'related_pending census failed after resolving %s; the response '
+                'reports UNKNOWN (key absent)', resolved.id,
+            )
+        return payload
+
     @mcp.tool()
     def resolve_issue(
         escalation_id: str,
@@ -1985,6 +2091,18 @@ def create_server(
         ``_COMPACT_ESCALATION_FIELDS`` is a fixed ALLOWLIST and is deliberately
         NOT widened by any of this — ``late_resolutions`` is forensic detail for
         a full-record read, not triage-facing.
+
+        **Sideways census (``related_pending``)** (task 4886).  Both success
+        returns — ``park`` and resolve/dismiss — carry ``related_pending``: the
+        PENDING records that may carry the same question, one entry per record
+        (shape: ``escalation/related_pending.py::RelatedPendingEntry``) — another
+        record on the same task, or a pending L2 sharing a member with this
+        record or clustering it.  REPORT-ONLY: nothing is closed or changed;
+        disposing of each twin is the caller's call.  PENDING-ONLY, so ``[]``
+        means "no pending twins".  Computed AFTER the mutation, so this record's
+        own cascade-closed members are not listed.  The key is ABSENT when the
+        census could not be computed — absent means UNKNOWN, never "none".
+        Error returns carry no census: they changed nothing.
 
         ``escalate_model`` (task μ, adaptive-routing trigger 3): when True and
         the action leads to a *next dispatch* (``resume`` / ``restart``), the
@@ -2255,7 +2373,7 @@ def create_server(
             )
             if esc is None:
                 return {'error': f'Escalation {escalation_id} not found'}
-            return esc.to_dict()
+            return _attach_related_pending(esc.to_dict(), esc)
 
         # DECLARED-PIN GATE (task 4377) — see the "Declared-pin gate" section of
         # this docstring.  Its POSITION is load-bearing in two ways.  It sits
@@ -2388,7 +2506,7 @@ def create_server(
                     if corrected else '.'
                 )
             )
-        return payload
+        return _attach_related_pending(payload, esc)
 
     @mcp.tool()
     async def get_pending_escalations(
@@ -2851,6 +2969,97 @@ def create_server(
             return {'error': f'Escalation {escalation_id} not found or not pending'}
         return esc.to_dict()
 
+    @mcp.tool()
+    async def amend_escalation(
+        escalation_id: str,
+        summary: str = '',
+        detail: str = '',
+        options: list[str] | None = None,
+        root_cause: str = '',
+        agent_role: str = '',
+    ) -> dict[str, Any]:
+        """Append one framing amendment to a pending escalation (task 4886).
+
+        Writes a ruling made elsewhere onto the record it rules on, without
+        the side effects of the only other amendment writer, a
+        ``promote_to_l2`` fold.  APPEND-ONLY and PENDING-ONLY (parked records
+        included) via ``queue.amend``, which carries the full contract: the
+        amendment caps and repeat suppression are the fold's, but there is NO
+        severity floor, it is category-agnostic, and it never touches
+        ``status`` / ``severity`` / ``level`` / ``members``, the resolution
+        fields, the triage quad, the record's own framing or
+        ``root_cause_variants``.
+
+        Deliberately NOT gated by the connection-capability level check, for
+        ``stamp_triage``'s reason: an annotation is not a state transition, so
+        an L0/L1-capped connection may amend an L2 it cannot resolve.
+
+        *agent_role* attribution: an X-Escalation-Identity header overrides
+        the arg, mirroring ``triaged_by`` / ``resolved_by``.  Attribution only,
+        never a deny path.
+
+        A recorded amendment bumps ``updated_at``, the watcher's re-assess
+        trigger (``updated_at > triaged_at``).
+
+        Returns:
+
+        - the full record dict plus ``amendment_recorded: True``;
+        - the full record dict plus ``amendment_recorded: False`` and
+          ``no_op_reason: 'repeat_framing'`` when the framing repeats what the
+          record already says (a success: nothing new to record);
+        - ``{'error', 'code': 'empty_amendment'}`` when every framing arg is
+          empty;
+        - ``{'error', 'code': 'not_pending', 'status'}`` when the record exists
+          (archive included) but is not pending;
+        - ``{'error', 'code': 'not_found'}`` otherwise.
+
+        Queue I/O hops off the event loop: this server shares the
+        ORCHESTRATOR's loop, and ``queue.amend`` fires no loop-affine callback,
+        so the reason flock'd writes elsewhere stay inline (stated beside
+        ``dedupe.py::submit_or_dedupe_off_loop``) does not apply.
+        """
+        identity = get_http_headers().get(_IDENTITY_HEADER)
+        if identity is not None:
+            agent_role = identity
+
+        result = await asyncio.to_thread(
+            queue.amend, escalation_id, root_cause=root_cause, summary=summary,
+            detail=detail, options=options, agent_role=agent_role,
+        )
+        match result['status']:
+            case 'amended':
+                # An alarm whose census excluded a truncation source would
+                # under-report exactly the cap pressure it exists to detect.
+                if result['dropped'] > 0:
+                    await _report_amendment_truncation_storm(escalation_id)
+                return {**result['escalation'].to_dict(), 'amendment_recorded': True}
+            case 'repeat_framing':
+                return {
+                    **result['escalation'].to_dict(),
+                    'amendment_recorded': False,
+                    'no_op_reason': 'repeat_framing',
+                }
+            case 'not_pending':
+                return _amend_not_pending_refusal(escalation_id, result['escalation'].status)
+            case 'no_framing':
+                return {
+                    'error': (
+                        f'amend_escalation on {escalation_id} carries no framing: pass '
+                        'at least one of summary / detail / options / root_cause. '
+                        'Nothing was recorded.'
+                    ),
+                    'code': 'empty_amendment',
+                }
+            case 'not_found':
+                # queue.amend reads the queue root only, and a closed record
+                # lives in the archive.  Read-only, so it resurrects nothing.
+                archived = await asyncio.to_thread(queue.get, escalation_id)
+                if archived is not None and archived.status != 'pending':
+                    return _amend_not_pending_refusal(escalation_id, archived.status)
+                return {'error': f'Escalation {escalation_id} not found', 'code': 'not_found'}
+            case unhandled:
+                assert_never(unhandled)
+
     # --- L2 promotion tool ---
 
     @mcp.tool()
@@ -2907,13 +3116,24 @@ def create_server(
         ``_chokepoint_or_submit`` are intentionally bypassed — L2 is set
         explicitly by this tool.  Because that severity→level gate is bypassed
         by design, nothing else reconciles an L2's severity with the records it
-        clusters; the inherited default below is what does it.
+        clusters; the inherited default below is what does it.  The one
+        filing-provenance gate this tool does honour is the eval-lane refusal
+        below.
 
         **Identity gate** (PRD task-status-authority C8/D7): the create side
         is gated by ``escalation.authority.PROMOTE_ALLOWED`` — a connection
         asserting an ``X-Escalation-Identity`` not in that set is denied
         (``{'error': ..., 'code': 'level_forbidden'}``, no L2 minted); a
         header-less connection (no identity asserted) is always allowed.
+
+        **Eval-lane refusal** (task 3096): a *task_id* with eval-lane
+        provenance (``shared/src/shared/eval_lane.py``) is refused with
+        ``code: 'eval_lane_contained'`` right after the identity gate, before
+        any read; a member whose own record carries eval-lane provenance is
+        refused the same way right after the member read, whatever the
+        *task_id*.  Both precede the create AND the fold path, so an eval-lane
+        record can never be minted into, or folded into, a production L2.
+        Close the eval-lane member L1s with ``close_only`` instead.
 
         **Sentinel-bound members** (task 4541): when at least one member
         resolves and EVERY resolved member was filed under a role in
@@ -3040,6 +3260,10 @@ def create_server(
 
             {'error': '<reason>'}
 
+        Eval-lane refusal (see **Eval-lane refusal**)::
+
+            {'error': '<reason and next action>', 'code': 'eval_lane_contained'}
+
         Sentinel-bound refusal (see **Sentinel-bound members**)::
 
             {'error': '<reason>', 'code': 'sentinel_task_id_required',
@@ -3055,6 +3279,19 @@ def create_server(
                 'error': f'identity {identity!r} is not permitted to mint L2 escalations',
                 'code': 'level_forbidden',
             }
+
+        # The caller's task_id is judged here, before any read; each member's
+        # own record is judged right after the member read below.
+        eval_lane_reason = eval_lane_provenance(task_id)
+        if eval_lane_reason is not None:
+            logger.warning(
+                'promote_to_l2 refused: eval-lane task_id=%r (%s); members=%s '
+                'root_cause=%r',
+                task_id, eval_lane_reason, member_ids, root_cause,
+            )
+            return _eval_lane_refusal(
+                f'task_id {task_id!r} is an eval-lane artifact ({eval_lane_reason})'
+            )
 
         # Validate required non-empty fields
         if not member_ids:
@@ -3123,11 +3360,24 @@ def create_server(
                     derived,
                     queue.find_pending_l2_by_root_cause(root_cause),
                     _sentinel_bound_task_ids(members),
+                    _eval_lane_members(members),
                 )
 
-            derived, existing_id, required_task_ids = await asyncio.to_thread(
-                _read_for_promote,
-            )
+            (
+                derived, existing_id, required_task_ids, eval_lane_members,
+            ) = await asyncio.to_thread(_read_for_promote)
+
+            if eval_lane_members:
+                logger.warning(
+                    'promote_to_l2 refused: eval-lane members %s under task_id=%r '
+                    'root_cause=%r',
+                    eval_lane_members, task_id, root_cause,
+                )
+                named = ', '.join(
+                    f'{member_id} ({reason})'
+                    for member_id, reason in eval_lane_members.items()
+                )
+                return _eval_lane_refusal(f'member(s) {named} are eval-lane artifacts')
 
             # CREATE must land on some severity, so an underivable set fails safe
             # UP to 'blocking' — unchanged from before task 3976.
@@ -3516,11 +3766,13 @@ def create_server(
         from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
             branch_is_degenerate,
         )
+        from orchestrator.merge_lane import (  # type: ignore[reportMissingImports]
+            WaiterRecord,
+        )
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             MergeOutcome,
             MergeRequest,
             QueuedBranch,
-            WaiterRecord,
             coalesce_or_enqueue_merge_request,
             patch_content_contained,
         )

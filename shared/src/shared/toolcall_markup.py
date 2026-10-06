@@ -104,6 +104,10 @@ file and silently dropping the sibling arguments of that same call. ``\\x3c`` is
 byte-identical at runtime and never appears verbatim in the file text, so it is
 immune. Leave it escaped.
 Runtime text quoting them gets the same spelling via :func:`escape_envelope_literals`.
+``tests/scripts/test_no_raw_envelope_literal.py::test_no_markup_handling_file_spells_a_raw_envelope_literal``
+enforces the rule on every ``.py`` source that already spells the bracket as
+``chr(60)`` or ``\\x3c``, or imports this module; a source spelling envelope
+literals only raw is outside that population.
 
 This module is pure and stdlib-only (``re``, ``json``). It deliberately imports
 nothing from ``fused_memory``, ``orchestrator`` or ``escalation`` so that every

@@ -561,6 +561,16 @@ FINDING_MEMORY_IDS_METADATA_KEY = 'related_memory_ids'
 FLAGGED_ITEM_FINDING_ID_FIELD = 'finding_id'
 FLAGGED_ITEM_CITED_MEMORIES_FIELD = 'cited_memories'
 
+# Declared `kind` of the two recon marker records whose only writer is a stage
+# prompt: the Stage 1 `flag_for_stage2` marker and the Stage 2 `stage2_suppress`
+# guard. A declared kind keeps the marker out of write triage
+# (server/write_triage.py::declares_attach_keys), so it is never filed as a
+# child of another memory. KIND_REGISTRY membership is pinned by
+# tests/test_recon_marker_kind_prompt_guidance.py. Source: PRD
+# plans/write-triage-flip-readiness-prd.md §11 χ.
+FLAG_FOR_STAGE2_MARKER_KIND = 'flag_for_stage2'
+STAGE2_SUPPRESS_GUARD_KIND = 'stage2_suppress_guard'
+
 # The negative half of the vocabulary rule, single-sourced per INV-5
 # `no-lockstep-duplication` for the same reason DUPLICATE_FINDING_SALVAGE_GUIDANCE
 # above is: it was briefly written twice — once in the shared recon-report block

@@ -69,7 +69,8 @@ support and PER-UNIT state. State shape:
                           "ActiveEnterTimestampMonotonic": int,
                           "scenario": "fresh"|"stale"|"delayed-fresh",
                           "fresh_after": int, "restarted": bool,
-                          "post_restart_shows": int}},
+                          "post_restart_shows": int,
+                          "InvocationID": str}},
       "calls": [...],
     }
 `list-units` prints one line per entry in running_units (first
@@ -83,6 +84,10 @@ mirroring tests/scripts/test_restart_all_orchestrators.py's bash
 "delayed-fresh" fake's semantics, but keyed by per-unit state
 (`restarted`, `post_restart_shows`, `fresh_after`) rather than an env var,
 since this fake is already per-unit-state-based.
+
+`show -p InvocationID --value UNIT` (task 5371) prints the unit's
+"InvocationID" state key (default: 32 zeros) bare, as the real systemctl
+does under --value: the sweep reads it to address its drain request.
 """
 import json
 import os
@@ -132,6 +137,30 @@ def _observe_lease(args):
     return obs
 
 
+def _observe_drain_requests():
+    """Snapshot every drain request in the fleet dir as of THIS call (task 5371).
+
+    The same vantage point as _observe_lease: this fake runs mid-sweep, so it
+    is the only place a test can see which requests the sweep holds at the
+    moment each unit is restarted. {filename: parsed body (None if unparseable)}.
+    """
+    fleet_dir = os.environ.get("ORCH_FLEET_DIR", "")
+    seen = {}
+    try:
+        names = sorted(os.listdir(fleet_dir))
+    except OSError:
+        return seen
+    for name in names:
+        if not name.endswith(".drain.json"):
+            continue
+        try:
+            with open(os.path.join(fleet_dir, name)) as f:
+                seen[name] = json.load(f)
+        except (OSError, ValueError):
+            seen[name] = None
+    return seen
+
+
 def main(argv):
     args = [a for a in argv[1:] if a != "--user"]
     if not args:
@@ -141,6 +170,9 @@ def main(argv):
     state = _load()
     state.setdefault("calls", []).append(argv[1:])
     state.setdefault("lease_observations", []).append(_observe_lease(args))
+    state.setdefault("drain_request_observations", []).append(
+        {"args": args, "requests": _observe_drain_requests()}
+    )
 
     if verb == "list-units":
         for unit in state.get("running_units", []):
@@ -169,12 +201,16 @@ def main(argv):
     if verb == "show":
         fields = None
         unit = None
+        value_only = False
         i = 0
         while i < len(rest):
             tok = rest[i]
             if tok == "-p":
                 fields = rest[i + 1]
                 i += 2
+            elif tok == "--value":
+                value_only = True
+                i += 1
             elif tok.startswith("--property="):
                 fields = tok.split("=", 1)[1]
                 i += 1
@@ -198,10 +234,11 @@ def main(argv):
             "ActiveState": ustate.get("ActiveState", "active"),
             "ActiveEnterTimestamp": ustate.get("ActiveEnterTimestamp", "baseline"),
             "ActiveEnterTimestampMonotonic": str(ustate.get("ActiveEnterTimestampMonotonic", 0)),
+            "InvocationID": ustate.get("InvocationID", "0" * 32),
         }
         keys = fields.split(",") if fields else list(current.keys())
         for k in keys:
-            print(f"{k}={current.get(k, '')}")
+            print(current.get(k, "") if value_only else f"{k}={current.get(k, '')}")
         _save(state)
         return 0
 
@@ -247,6 +284,23 @@ def _make_fake_systemctl(tmp_path, *, running_units, units=None):
     return bin_dir, state_path
 
 
+def _install_fixed_epoch(bin_dir, epoch):
+    """Shadow `date +%s` with a constant, delegating every other `date` call.
+
+    The sweep stamps each drain request's requested_ts from `date +%s`, and a
+    new-producer heartbeat must echo it back to be read as acknowledged. Fixing
+    the clock lets a test write that heartbeat BEFORE the sweep starts, with no
+    watcher racing the gate's first poll.
+    """
+    shim = bin_dir / "date"
+    shim.write_text(
+        '#!/bin/sh\n'
+        f'if [ "$#" -eq 1 ] && [ "$1" = "+%s" ]; then echo {int(epoch)}; '
+        'else exec /bin/date "$@"; fi\n'
+    )
+    shim.chmod(0o755)
+
+
 def _write_heartbeat(fleet_dir, unit, **overrides):
     """Write <fleet_dir>/<unit>.json, replacing it ATOMICALLY.
 
@@ -290,10 +344,11 @@ def _write_heartbeat(fleet_dir, unit, **overrides):
 def _run_script(bin_dir, state_path, fleet_dir, *extra_args, env=None, timeout=20):
     """Run restart-all-orchestrators.sh with the fake systemctl on PATH.
 
-    ORCH_FLEET_DEPLOY_CLOCK is NOT set here: conftest.py's session-scoped
-    autouse `_df_fleet_deploy_clock_redirect` already points it at a tmp file
-    for every spawner in this directory (task 3797). A per-test override still
-    wins via `env=`, which is applied after the os.environ copy below.
+    ORCH_FLEET_DEPLOY_CLOCK is NOT set here:
+    df_pytest_isolation.py::_df_deploy_clocks_unwritten, autoused by every
+    conftest, already points it at a tmp file suite-wide (task 3797). A
+    per-test override still wins via `env=`, which is applied after the
+    os.environ copy below.
 
     The spawn is SESSION-ISOLATED via run_in_new_session (task 3798), not a
     plain subprocess.run: subprocess.run's timeout kill()s the direct child
@@ -712,7 +767,7 @@ def test_suite_never_stamps_the_repo_fleet_deploy_clock(
         f"{reason}\nThe write came from THIS test spawning "
         "restart-all-orchestrators.sh against a fake systemctl: point "
         "ORCH_FLEET_DEPLOY_CLOCK at a tmp file "
-        "(scripts/tests/conftest.py::_df_fleet_deploy_clock_redirect)."
+        "(df_pytest_isolation.py::_df_deploy_clocks_unwritten, autoused suite-wide)."
     )
 
     stamped_after = (
@@ -1271,9 +1326,15 @@ def _rewrites_on_gate_polls(fleet_dir, unit, trace_path, rewrites):
                 raise AssertionError(f"heartbeat rewrite(s) raised: {errors!r}")
 
 
-def _run_busy_unit_through(tmp_path, rewrites, *, spawn_timeout, **knobs):
+def _run_busy_unit_through(
+    tmp_path, rewrites, *, spawn_timeout, initial=None, fixed_epoch=None, **knobs,
+):
     """Run restart-all-orchestrators.sh --drain on a busy UNIT_R, applying
     `rewrites` as the gate polls, and return (result, state, polls).
+
+    `initial` replaces the busy starting heartbeat (`_write_heartbeat`
+    overrides), and `fixed_epoch` pins the script's `date +%s` -- so the
+    requested_ts a new-producer heartbeat must echo is known in advance.
 
     `knobs` are merged into `_run_script`'s env over
     {"RESTART_VERIFY_TIMEOUT": "5", "ORCH_DRAIN_POLL_INTERVAL_SECS":
@@ -1291,7 +1352,9 @@ def _run_busy_unit_through(tmp_path, rewrites, *, spawn_timeout, **knobs):
     bin_dir, state_path = _make_fake_systemctl(
         tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
     )
-    _write_heartbeat(fleet_dir, UNIT_R, **_HB_BUSY)
+    _write_heartbeat(fleet_dir, UNIT_R, **(_HB_BUSY if initial is None else initial))
+    if fixed_epoch is not None:
+        _install_fixed_epoch(bin_dir, fixed_epoch)
 
     env = {
         "RESTART_VERIFY_TIMEOUT": "5",
@@ -2051,7 +2114,7 @@ def test_every_exit_after_acquisition_is_covered_by_the_release_trap():
         )
         return hits[0]
 
-    trap_at = _sole_index(r"^trap lease_release EXIT$", "EXIT-trap install")
+    trap_at = _sole_index(r"^trap release_sweep_state EXIT$", "EXIT-trap install")
     acquire_at = _sole_index(r"^lease_acquire$", "top-level lease_acquire call")
     enumerate_at = _sole_index(r"^mapfile -t running_units", "unit-enumeration")
 
@@ -2083,3 +2146,385 @@ def test_every_exit_after_acquisition_is_covered_by_the_release_trap():
         f"the argument rejection (line {reject_at + 1}) must stay ahead of the "
         f"trap and the acquisition, so an unknown argument never writes a lease"
     )
+
+
+# ---------------------------------------------------------------------------
+# task 5371: the two-stage fleet drain. Stage A writes a drain request for every
+# unit up front; Stage B (drain_gate) awaits in-flight merge verifies rather
+# than burning the busy grace and killing them.
+# ---------------------------------------------------------------------------
+
+# The spec's own example epoch; `_install_fixed_epoch` makes the sweep stamp it.
+_REQUESTED_TS = 1_791_240_000
+_INVOCATION_R = "caaef715c93445dbb0c1cc608a9f4ef8"
+_INVOCATION_S = "0123456789abcdef0123456789abcdef"
+_DRAIN_SPAWN_TIMEOUT_SECS = 15
+
+
+def _verifying_entry(*, deadline_in):
+    now = time.time()
+    return {
+        "task_id": "5371", "host": "local", "kind": "verify",
+        "started_ts": now - 60, "deadline_ts": now + deadline_in,
+    }
+
+
+def _hb_drain(verifies, *, halted=True, refused=None):
+    """`_write_heartbeat` overrides for a task-5371 producer that has seen this
+    sweep's request (its requested_ts is the `_install_fixed_epoch` one).
+    merge_idle stays False: the queue is never empty on the units this is for."""
+    return {
+        "merge_idle": False,
+        "drain": {
+            "requested_ts": _REQUESTED_TS,
+            "admission_halted": halted,
+            "refused": refused,
+        },
+        "verifies_in_flight": verifies,
+    }
+
+
+def _drain_observations(state):
+    """The drain requests held at each `restart` call, in restart order."""
+    return [
+        (o["args"][1], o["requests"])
+        for o in state["drain_request_observations"]
+        if o["args"][:1] == ["restart"]
+    ]
+
+
+def test_stage_a_writes_every_units_request_before_the_first_restart(tmp_path):
+    """The request is the contract orchestrator.fleet_drain reads: exactly the
+    keys unit/invocation_id/sweep_pid/requested_ts, as str/str/int/int, at
+    <fleet_dir>/<unit>.drain.json -- for EVERY unit, before ANY restart.
+
+    The units hold legacy (pre-5371) heartbeats, so the gate ignores the
+    requests and only their presence is under test.
+    """
+    fleet_dir = tmp_path / "fleet"
+    lease_path = tmp_path / "lease.json"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path,
+        running_units=[UNIT_R, UNIT_S],
+        units={
+            UNIT_R: {"scenario": "fresh", "InvocationID": _INVOCATION_R},
+            UNIT_S: {"scenario": "fresh", "InvocationID": _INVOCATION_S},
+        },
+    )
+    _install_fixed_epoch(bin_dir, _REQUESTED_TS)
+    for unit in (UNIT_R, UNIT_S):
+        _write_heartbeat(fleet_dir, unit, **_HB_IDLE)
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir, "--drain",
+        env={"RESTART_VERIFY_TIMEOUT": "5", "ORCH_FLEET_LEASE": str(lease_path)},
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    state = _load_state(state_path)
+    sweep_pid = next(
+        o["lease"]["pid"] for o in state["lease_observations"] if o["lease"] is not None
+    )
+    restarts = _drain_observations(state)
+    assert [unit for unit, _ in restarts] == [UNIT_R, UNIT_S], (
+        f"ordered_units puts SELF_UNIT last; got {restarts!r}"
+    )
+
+    def expected(unit, invocation_id):
+        return {
+            "unit": unit,
+            "invocation_id": invocation_id,
+            "sweep_pid": sweep_pid,
+            "requested_ts": _REQUESTED_TS,
+        }
+
+    _, held_at_first_restart = restarts[0]
+    assert held_at_first_restart == {
+        f"{UNIT_R}.drain.json": expected(UNIT_R, _INVOCATION_R),
+        f"{UNIT_S}.drain.json": expected(UNIT_S, _INVOCATION_S),
+    }, f"Stage A must have written EVERY unit's request first; got {held_at_first_restart!r}"
+    for body in held_at_first_restart.values():
+        assert [type(body[k]) for k in ("unit", "invocation_id", "sweep_pid", "requested_ts")] == [
+            str, str, int, int,
+        ], body
+
+    _, held_at_second_restart = restarts[1]
+    assert held_at_second_restart == {
+        f"{UNIT_S}.drain.json": expected(UNIT_S, _INVOCATION_S),
+    }, (
+        f"a unit's request is removed right after its own restart, so only the "
+        f"last unit's remains; got {held_at_second_restart!r}"
+    )
+    assert not list(fleet_dir.glob("*.drain.json")), "the sweep must leave no request behind"
+
+
+def test_the_orchestrator_honours_the_request_this_script_writes(tmp_path):
+    """Cross-tier pin: the writer here and orchestrator.fleet_drain's reader
+    cannot import each other, so this is where a drift between them goes red.
+    The request the sweep wrote must read as well-formed, at the path the
+    reader derives, and be honoured by the incarnation it names."""
+    from orchestrator.fleet_drain import (
+        DrainIdentity,
+        DrainRequest,
+        drain_request_path,
+        evaluate_drain_request,
+        read_drain_request,
+    )
+
+    fleet_dir = tmp_path / "fleet"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R],
+        units={UNIT_R: {"scenario": "fresh", "InvocationID": _INVOCATION_R}},
+    )
+    _install_fixed_epoch(bin_dir, _REQUESTED_TS)
+    _write_heartbeat(fleet_dir, UNIT_R, **_HB_IDLE)
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir, "--drain", env={"RESTART_VERIFY_TIMEOUT": "5"},
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    [(_, held)] = _drain_observations(_load_state(state_path))
+    [(name, body)] = held.items()
+    assert name == drain_request_path(fleet_dir, UNIT_R).name
+    copy = tmp_path / name
+    copy.write_text(json.dumps(body), encoding="utf-8")
+    read = read_drain_request(copy)
+    assert isinstance(read, DrainRequest), read
+    verdict = evaluate_drain_request(
+        read,
+        DrainIdentity(unit=UNIT_R, invocation_id=_INVOCATION_R, max_age_secs=14400.0),
+        now=_REQUESTED_TS + 1,
+        pid_alive=lambda pid: True,
+    )
+    assert verdict is not None and verdict.honoured, verdict
+
+
+def test_an_empty_invocation_id_still_writes_a_request(tmp_path):
+    """The unit then refuses it (invocation_mismatch) and falls back to the
+    merge-idle gate, visibly -- rather than the sweep silently skipping it."""
+    fleet_dir = tmp_path / "fleet"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R],
+        units={UNIT_R: {"scenario": "fresh", "InvocationID": ""}},
+    )
+    _install_fixed_epoch(bin_dir, _REQUESTED_TS)
+    _write_heartbeat(fleet_dir, UNIT_R, **_HB_IDLE)
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir, "--drain", env={"RESTART_VERIFY_TIMEOUT": "5"},
+    )
+
+    assert result.returncode == 0, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    [(_, held)] = _drain_observations(_load_state(state_path))
+    assert held[f"{UNIT_R}.drain.json"]["invocation_id"] == ""
+
+
+def test_a_verifying_unit_is_awaited_without_the_busy_grace_until_it_drains(tmp_path):
+    """verifying withholds the restart until the heartbeat flips to idle.
+
+    ORCH_RESTART_FORCE_FIRE_AFTER_SECS=0 is the proof the busy grace does not
+    apply here: on a `busy` verdict that knob force-fires at once.
+    """
+    result, state, polls = _run_busy_unit_through(
+        tmp_path,
+        [_Rewrite(after="verifying", to=_hb_drain([]), polls=2)],
+        spawn_timeout=_DRAIN_SPAWN_TIMEOUT_SECS,
+        initial=_hb_drain([_verifying_entry(deadline_in=3600)]),
+        fixed_epoch=_REQUESTED_TS,
+        ORCH_RESTART_FORCE_FIRE_AFTER_SECS="0",
+    )
+
+    context = f"ledger={polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.returncode == 0, context
+    assert polls[:2] == [("verifying", UNIT_R)] * 2, context
+    assert polls == [("verifying", UNIT_R)] * (len(polls) - 1) + [("idle", UNIT_R)], context
+    assert result.stdout.count(f"awaiting in-flight merge verify on {UNIT_R}") == 1, context
+    assert f"resuming restart of {UNIT_R}: drained" in result.stdout, context
+    assert "deferring" not in result.stdout and "force-restarting" not in result.stdout, context
+    assert ["--user", "restart", UNIT_R] in state["calls"], context
+
+
+def test_an_overdue_unit_is_force_restarted_at_once(tmp_path):
+    result, state, polls = _run_busy_unit_through(
+        tmp_path, [], spawn_timeout=_DRAIN_SPAWN_TIMEOUT_SECS,
+        initial=_hb_drain([_verifying_entry(deadline_in=-10)]),
+        fixed_epoch=_REQUESTED_TS,
+    )
+
+    context = f"ledger={polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.returncode == 0, context
+    assert polls == [("overdue", UNIT_R)], context
+    assert (
+        f"force-restarting {UNIT_R}: in-flight merge verify past its own timeout"
+        in result.stdout
+    ), context
+    assert ["--user", "restart", UNIT_R] in state["calls"], context
+
+
+def test_a_refused_request_falls_back_to_the_merge_idle_gate_and_force_fires(tmp_path):
+    result, state, polls = _run_busy_unit_through(
+        tmp_path, [], spawn_timeout=_DRAIN_SPAWN_TIMEOUT_SECS,
+        initial=_hb_drain([], halted=False, refused="invocation_mismatch"),
+        fixed_epoch=_REQUESTED_TS,
+        ORCH_RESTART_FORCE_FIRE_AFTER_SECS="0",
+    )
+
+    context = f"ledger={polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.returncode == 0, context
+    assert polls == [("refused", UNIT_R), ("busy", UNIT_R)], (
+        f"after a refusal the unit is read by merge_idle alone. {context}"
+    )
+    assert (
+        f"drain request not honoured by {UNIT_R}; falling back to the merge-idle gate"
+        in result.stdout
+    ), context
+    assert f"deferring restart of {UNIT_R}: mid-merge" in result.stdout, context
+    assert f"force-restarting {UNIT_R}: mid-merge grace of 0s exceeded" in result.stdout, context
+    assert ["--user", "restart", UNIT_R] in state["calls"], context
+
+
+def test_a_refused_but_merge_idle_unit_restarts_without_a_defer(tmp_path):
+    """The fallback is to the merge-idle gate itself, not to `busy`: a unit
+    that refused the request and is idle by the old measure restarts at once."""
+    result, state, polls = _run_busy_unit_through(
+        tmp_path, [], spawn_timeout=_DRAIN_SPAWN_TIMEOUT_SECS,
+        initial={**_hb_drain([], halted=False, refused="sweep_dead"), "merge_idle": True},
+        fixed_epoch=_REQUESTED_TS,
+    )
+
+    context = f"ledger={polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.returncode == 0, context
+    assert polls == [("refused", UNIT_R), ("idle", UNIT_R)], context
+    assert "deferring" not in result.stdout, context
+    assert ["--user", "restart", UNIT_R] in state["calls"], context
+
+
+def test_the_verify_wait_cap_force_restarts_a_unit_still_verifying(tmp_path):
+    result, state, polls = _run_busy_unit_through(
+        tmp_path, [], spawn_timeout=30,
+        initial=_hb_drain([_verifying_entry(deadline_in=3600)]),
+        fixed_epoch=_REQUESTED_TS,
+        ORCH_DRAIN_VERIFY_MAX_WAIT_SECS="2",
+    )
+
+    context = f"ledger={polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.returncode == 0, context
+    assert len(polls) >= 1 and all(p == ("verifying", UNIT_R) for p in polls), context
+    assert (
+        f"force-restarting {UNIT_R}: drain verify-wait cap of 2s exceeded" in result.stdout
+    ), context
+    assert ["--user", "restart", UNIT_R] in state["calls"], context
+
+
+def test_a_legacy_heartbeat_under_drain_behaves_exactly_as_before(tmp_path):
+    """A unit still on pre-5371 code cannot see the request: the busy gate and
+    its force-fire are unchanged, and none of the new lines or verdicts appear."""
+    result, state, polls = _run_busy_unit_through(
+        tmp_path, [], spawn_timeout=_DRAIN_SPAWN_TIMEOUT_SECS,
+        fixed_epoch=_REQUESTED_TS,
+        ORCH_RESTART_FORCE_FIRE_AFTER_SECS="0",
+    )
+
+    context = f"ledger={polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.returncode == 0, context
+    assert polls == [("busy", UNIT_R)], context
+    assert f"deferring restart of {UNIT_R}: mid-merge" in result.stdout, context
+    assert f"force-restarting {UNIT_R}: mid-merge grace of 0s exceeded" in result.stdout, context
+    assert "awaiting" not in result.stdout and "not honoured" not in result.stdout, context
+    assert ["--user", "restart", UNIT_R] in state["calls"], context
+
+
+def test_a_failed_restart_still_removes_that_units_request(tmp_path):
+    fleet_dir = tmp_path / "fleet"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "stale"}},
+    )
+    _write_heartbeat(fleet_dir, UNIT_R, **_HB_IDLE)
+
+    result = _run_script(
+        bin_dir, state_path, fleet_dir, "--drain",
+        env={"RESTART_VERIFY_TIMEOUT": "1", "RESTART_VERIFY_GRACE_SECS": "1"},
+    )
+
+    assert result.returncode == 1, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert not list(fleet_dir.glob("*.drain.json")), (
+        f"removal follows restart_and_verify whether or not it verified; "
+        f"stdout={result.stdout!r}"
+    )
+
+
+def test_sigterm_mid_sweep_removes_its_own_requests_and_leaves_another_sweeps(tmp_path):
+    """The EXIT trap removes every request carrying this sweep's pid, and none
+    carrying another's -- the same guard lease_release applies to the lease."""
+    fleet_dir = tmp_path / "fleet"
+    lease_path = tmp_path / "lease.json"
+    bin_dir, state_path = _make_fake_systemctl(
+        tmp_path, running_units=[UNIT_R], units={UNIT_R: {"scenario": "fresh"}},
+    )
+    _install_fixed_epoch(bin_dir, _REQUESTED_TS)
+    # Parked on a verify that never ends, so there is a sweep to signal.
+    _write_heartbeat(fleet_dir, UNIT_R, **_hb_drain([_verifying_entry(deadline_in=3600)]))
+    foreign = fleet_dir / f"{synthetic_unit('other')}.drain.json"
+    foreign_body = {
+        "unit": synthetic_unit("other"), "invocation_id": _INVOCATION_S,
+        "sweep_pid": 1, "requested_ts": _REQUESTED_TS,
+    }
+    foreign.write_text(json.dumps(foreign_body))
+    own = fleet_dir / f"{UNIT_R}.drain.json"
+
+    with _sweep_in_background(
+        bin_dir, state_path, fleet_dir, lease_path, "--drain",
+        env={"RESTART_VERIFY_TIMEOUT": "5", "ORCH_DRAIN_POLL_INTERVAL_SECS": "1"},
+    ) as (proc, pgid):
+        deadline = time.monotonic() + load_scaled_grace(
+            10, cap_secs=WAIT_PROOF_SPAWN_TIMEOUT_CAP_SECS,
+        )
+        while not own.exists():
+            assert proc.poll() is None, "the sweep exited before Stage A wrote its request"
+            assert time.monotonic() < deadline, f"no request appeared at {own}"
+            time.sleep(0.05)
+        os.killpg(pgid, signal.SIGTERM)
+        stdout, stderr = proc.communicate(timeout=30)
+
+    assert not own.exists(), (
+        f"a SIGTERMed sweep must remove its own request. stdout={stdout!r} stderr={stderr!r}"
+    )
+    assert json.loads(foreign.read_text()) == foreign_body, (
+        "another sweep's request (a different sweep_pid) must be left alone"
+    )
+    assert f"{foreign.name} in place" in stderr, stderr
+
+
+def test_a_unit_that_acknowledges_the_request_mid_defer_moves_from_busy_to_verifying_to_idle(
+    tmp_path,
+):
+    """An unacknowledged request reads busy (the unit has not yet halted
+    admission), which defers; the later verdicts are announced once each, as
+    the verdict changes, and the busy grace stops applying once verifying."""
+    spawn_timeout = _DRAIN_SPAWN_TIMEOUT_SECS
+    result, state, polls = _run_busy_unit_through(
+        tmp_path,
+        [
+            _Rewrite(after="busy", to=_hb_drain([_verifying_entry(deadline_in=3600)])),
+            _Rewrite(after="verifying", to=_hb_drain([])),
+        ],
+        spawn_timeout=spawn_timeout,
+        initial={"merge_idle": False, "drain": None, "verifies_in_flight": []},
+        fixed_epoch=_REQUESTED_TS,
+        ORCH_RESTART_FORCE_FIRE_AFTER_SECS=str(wait_proof_grace_secs(spawn_timeout)),
+    )
+
+    context = f"ledger={polls!r} stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert result.returncode == 0, context
+    verdicts = [verdict for verdict, _ in polls]
+    assert verdicts[0] == "busy" and verdicts[-1] == "idle" and "verifying" in verdicts, context
+    assert verdicts == sorted(verdicts, key=["busy", "verifying", "idle"].index), (
+        f"verdicts must only advance busy -> verifying -> idle. {context}"
+    )
+    out = result.stdout
+    assert out.count("deferring restart of") == 1, context
+    assert out.count("awaiting in-flight merge verify on") == 1, context
+    assert out.count("resuming restart of") == 1, context
+    assert out.index("deferring") < out.index("awaiting") < out.index("resuming"), context
+    assert ["--user", "restart", UNIT_R] in state["calls"], context

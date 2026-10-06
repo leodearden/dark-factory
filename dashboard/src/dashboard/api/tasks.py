@@ -8,6 +8,7 @@ for why each is its own signal.
 
 from __future__ import annotations
 
+import enum
 import logging
 from dataclasses import replace
 from datetime import datetime
@@ -22,6 +23,7 @@ from dashboard.config import DashboardConfig
 from dashboard.data.active_tasks import (
     _all_project_roots,
     _project_label,
+    collect_census_snapshots,
     collect_tasks_with_counts,
     shape_terminal_rows,
 )
@@ -156,8 +158,37 @@ def _terminal_key(project: str) -> str:
     return f'TASKS_TERMINAL:{project}'
 
 
+class TasksProjection(enum.StrEnum):
+    """Which part of every root's snapshot ``GET /api/v2/dashboard/tasks`` serves.
+
+    A validated query parameter rather than a free string, so an unknown value
+    is FastAPI's 422 instead of silently falling through to the full render.
+    """
+
+    FULL = 'full'
+    CENSUS = 'census'
+
+
+async def _collect_snapshots(
+    projection: TasksProjection,
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    *,
+    now: datetime,
+) -> dict[str, TaskSnapshot]:
+    """Every root's unit, through the collector *projection* names."""
+    if projection is TasksProjection.CENSUS:
+        return await collect_census_snapshots(client, config, now=now)
+    _, snapshots = await collect_tasks_with_counts(
+        client, config, resolve_external=True, now=now,
+    )
+    return snapshots
+
+
 @router.get('/api/v2/dashboard/tasks')
-async def api_tasks(request: Request) -> JSONResponse:
+async def api_tasks(
+    request: Request, projection: TasksProjection = TasksProjection.FULL,
+) -> JSONResponse:
     """TASKS_SNAPSHOT per project root (lock state surfaced via the scheduler endpoint — see /api/v2/dashboard/scheduler).
 
     The rows travel only as ``TASKS_SNAPSHOT[p].rows``, a ``Datum`` per root;
@@ -252,6 +283,21 @@ async def api_tasks(request: Request) -> JSONResponse:
     exempt rows that were FETCHED, so it never met that contract either. The
     client half is ``tab_tasks.jsx``: it requests the window and renders the
     ``lower_bound`` disclosure.
+
+    **``?projection=census`` — the census without the rows.** The dashboard
+    chrome (the rail badges and the topbar) reads only each root's census, on
+    every tab, so it polls this projection instead of the multi-MB full render.
+    It is a projection of THIS endpoint rather than an endpoint of its own
+    because PRD decision 2 (``plans/dashboard-one-datum-one-path-prd.md``) puts
+    the census inside ``/tasks`` as one snapshot unit and rejects a second
+    wire copy. It reads the same unit as the full render and
+    ``/api/v2/dashboard/scheduler``, through the same budgets and the same
+    classification loop below, so the census and the banner lists cannot
+    differ between projections. What it skips is the runtime probe, row
+    shaping and the external-dep read. Each measured rows half is WITHHELD as
+    an ``unknown`` ``Datum`` naming the projection, never omitted, so the
+    five-key shape holds and a rows tab can say why it has none yet.
+    ``?projection=full`` is the default.
     """
     config = request.app.state.config
     http_client = request.app.state.http_client
@@ -277,8 +323,8 @@ async def api_tasks(request: Request) -> JSONResponse:
     # under one TTL. The third slot in task_snapshot.PER_PROJECT_MCP_CALLS is
     # the terminal window, which only the `?terminal=` request spends.
     render_at = resolve_now(None)
-    _, snapshots = await collect_tasks_with_counts(
-        http_client, config, resolve_external=True, now=render_at,
+    snapshots = await _collect_snapshots(
+        projection, http_client, config, now=render_at,
     )
     served_at = resolve_now(None)
     offline_projects: list[str] = []

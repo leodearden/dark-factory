@@ -14,45 +14,54 @@
 #   [escalation_port] default 8102 (dark-factory's escalation MCP)
 #   --dry-run         edit a temp copy, print the diff, no commit, no reload
 #
-# Shares scripts/merge-deep-set-cap.sh's `git commit --only` shape, and that
-# alone: the escalation MCP is STATEFUL, so a single-shot `tools/call` POST is
-# rejected at the TRANSPORT layer — `Bad Request: Missing session ID`, HTTP 400,
-# measured live on 2026-09-12 — before any tool runs, and `curl` without -f
-# exits 0 on it. The reload therefore goes through
-# legibility.census_trigger.post_mcp_tool_call, which handshakes.
-# (merge-deep-set-cap.sh still carries that single-shot defect; copying from it
-# again would reintroduce this bug.)
+# Shares scripts/merge-deep-set-cap.sh's `git commit --only` shape and its
+# reload transport: the escalation MCP is STATEFUL, so a single-shot
+# `tools/call` POST is rejected at the TRANSPORT layer — `Bad Request: Missing
+# session ID`, HTTP 400, measured live on 2026-09-12 — before any tool runs,
+# and `curl` without -f exits 0 on it. Both scripts therefore reload through
+# scripts/_config_reload_gate.py, which handshakes.
 #
 # Exit 0 on either of the two ways the value can be live: the reload
 # hot-applied it ('applied'), or the running config already carried it and the
 # reload provably re-read THIS config file ('already_converged'). The last
-# stdout line is a JSON verdict — {switched_to, commit, outcome} — for a
-# kind='predicate' before_done note.
+# stdout line of every designed exit is a JSON verdict, for a kind='predicate'
+# before_done note: {switched_to, commit, outcome} on exit 0 (--dry-run prints
+# its own {dry_run, would_set}), or one carrying `failure: <tag>` on exit 1.
+# The tags come from die() below, the reload step's fail(), and
+# scripts/_config_reload_gate.py::ReloadFailure.
 set -euo pipefail
-die() { echo "merge-pytest-n-ab-switch: $*" >&2; exit 1; }
+die() {
+    local failure="$1"; shift
+    printf '{"failure": "%s"}\n' "$failure"
+    echo "merge-pytest-n-ab-switch: $*" >&2
+    exit 1
+}
 
 DRY=0; ARGS=()
 for a in "$@"; do case "$a" in --dry-run) DRY=1;; *) ARGS+=("$a");; esac; done
-[ "${#ARGS[@]}" -ge 1 ] || die "usage: merge-pytest-n-ab-switch.sh <value> [config_yaml] [escalation_port] [--dry-run]"
+[ "${#ARGS[@]}" -ge 1 ] || die usage "usage: merge-pytest-n-ab-switch.sh <value> [config_yaml] [escalation_port] [--dry-run]"
 VALUE="${ARGS[0]}"
 CONFIG="${ARGS[1]:-/home/leo/src/dark-factory/dark-factory-orchestrator.yaml}"
 PORT="${ARGS[2]:-8102}"
-[[ "$VALUE" =~ ^[0-9]+$ ]] || die "value must be a positive integer, got '$VALUE'"
-[[ "$PORT" =~ ^[0-9]+$ ]] || die "escalation_port must be a port number, got '$PORT'"
-[ -f "$CONFIG" ] || die "config not found: $CONFIG"
-# The reload step imports its MCP transport from the checkout the SCRIPT lives
-# in — never from $REPO below, which is the CONFIG's checkout and may be a
-# different project entirely. That transport is not stdlib (httpx, pydantic),
-# so the interpreter is resolved for the same reason: inheriting whatever
-# `python3` a login shell offers makes this gate unreachable. This tree's one
-# root .venv (CLAUDE.md, "Locating installed code"), else the caller's python3.
-# Derived from the path rather than `git rev-parse` so a copy of this script
-# outside any checkout still resolves under `set -e`.
+[[ "$VALUE" =~ ^[0-9]+$ ]] || die invalid_value "value must be a positive integer, got '$VALUE'"
+[[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( PORT <= 65535 )) || die invalid_port "escalation_port must be a TCP port in 1-65535, got '$PORT'"
+[ -f "$CONFIG" ] || die config_not_found "config not found: $CONFIG"
+# One interpreter, resolved once, runs both python steps below. The reload
+# step imports its MCP transport from the checkout the SCRIPT lives in — never
+# from $REPO below, which is the CONFIG's checkout and may be a different
+# project entirely. That transport is not stdlib (httpx, pydantic), so the
+# interpreter is resolved for the same reason: inheriting whatever `python3` a
+# login shell offers makes this gate unreachable. Step 1's editor is
+# stdlib-only but runs under the same interpreter, so the script has one
+# resolution mechanism rather than two. This tree's one root .venv (CLAUDE.md,
+# "Locating installed code"), else the caller's python3. Derived from the path
+# rather than `git rev-parse` so a copy of this script outside any checkout
+# still resolves under `set -e`.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHECKOUT="$SCRIPT_DIR/.."
 PY="$CHECKOUT/.venv/bin/python3"
 [ -x "$PY" ] || PY=python3
-REPO="$(cd "$(dirname "$CONFIG")" && git rev-parse --show-toplevel)" || die "config is not inside a git checkout"
+REPO="$(cd "$(dirname "$CONFIG")" && git rev-parse --show-toplevel)" || die config_not_in_git "config is not inside a git checkout"
 CONFIG_BASE="$(realpath --relative-to="$REPO" "$CONFIG")"
 KEY='PYTEST_XDIST_AUTO_NUM_WORKERS'
 STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -63,7 +72,7 @@ if [ "$DRY" -eq 1 ]; then TARGET="$(mktemp)"; cp "$CONFIG" "$TARGET"; fi
 # 1. Rewrite the value inside the top-level `verify_env:` mapping. Line-based
 #    on purpose (no yaml round-trip: the file is 1000 lines of load-bearing
 #    comments). Replaces an existing A/B marker line rather than stacking them.
-python3 - "$TARGET" "$KEY" "$VALUE" "$STAMP" <<'PY'
+"$PY" - "$TARGET" "$KEY" "$VALUE" "$STAMP" <<'PY' || die config_edit_refused "step 1 left ${CONFIG} unedited (reason above)"
 import re, sys
 path, key, value, stamp = sys.argv[1:5]
 lines = open(path, encoding='utf-8').read().split('\n')
@@ -111,100 +120,64 @@ if git -C "$REPO" diff --quiet -- "$CONFIG_BASE"; then
 else
     git -C "$REPO" commit --only "$CONFIG_BASE" -q \
         -m "config(ab): merge test leg ${KEY}=${VALUE} (pytest -n A/B arm switch, ${STAMP})" \
-        || die "git commit --only ${CONFIG_BASE} failed"
+        || die commit_failed "git commit --only ${CONFIG_BASE} failed"
     SHA="$(git -C "$REPO" rev-parse --short HEAD)"
 fi
 
-# 3. Hot-reload via the escalation MCP, and assert the value is live.
-#    `legibility.census_trigger.post_mcp_tool_call` is the single transport
-#    definition every consumer of this server goes through (task 3644). It
-#    supplies the four things one POST cannot: the session-less `initialize`
-#    handshake the stateful server demands, SSE decoding of the reply, raising
-#    on both an envelope-level JSON-RPC `error` and `result.isError`, and the
-#    session-terminating DELETE without which every run leaks a live anyio task
-#    in the long-lived escalation process. None of it is re-implemented here:
-#    three legibility posters each hand-rolled this transport and all three
-#    silently dropped every escalation they ever filed.
+# 3. Hot-reload via the escalation MCP, and assert the value is live. The
+#    transport, its failure diagnostics, the argv-only heredoc contract and the
+#    check that the reload committed a re-read of THIS file are
+#    scripts/_config_reload_gate.py's; this checks verify_env.
 #
 #    The value is live in either of two shapes. `applied` carrying verify_env
 #    with the new value is the flip. ABSENCE of verify_env from `applied` is
 #    the converged re-run — and absence is the ONLY converged signal on the
 #    wire, because `unchanged` is a bare int COUNT of equal leaves
-#    (config.py::ConfigDiff), naming no keys and carrying no values. Absence is
-#    weaker than convergence, though: a rolled-back reload, a reload of a
-#    DIFFERENT orchestrator, and a verify_env bucketed as restart-required all
-#    produce it, which is what the three corroborators below exclude.
-"$PY" - "$SCRIPT_DIR" "$KEY" "$VALUE" "$SHA" "$(realpath "$CONFIG")" "$PORT" <<'RELOAD_PY'
-import json, os, sys
+#    (config.py::ConfigDiff), naming no keys and carrying no values. Neither
+#    shape says anything about OUR file on its own: a rolled-back reload and a
+#    reload of a DIFFERENT orchestrator produce the absence, and that other
+#    orchestrator's own pending change to the same value produces the flip. So
+#    both shapes are held to the re-read check, by passing this config file to
+#    fetch_reload_report; the converged shape is further gated on verify_env
+#    not being bucketed as restart-required.
+"$PY" - "$SCRIPT_DIR" "$KEY" "$VALUE" "$SHA" "$CONFIG" "$PORT" <<'RELOAD_PY'
+import json, sys
 script_dir, key, value, sha, config_path, port = sys.argv[1:7]
 sys.path.insert(0, script_dir)
-try:
-    from legibility import census_trigger
-except ImportError as exc:
-    # Not stdlib: httpx, and pydantic via census_trigger's legibility.config
-    # import. Name the interpreter and the remedy rather than emitting a
-    # traceback — an operator hitting this from a login shell has no other clue
-    # that the interpreter, not the code, is what is wrong.
-    print(f'the MCP reload transport is not importable under {sys.executable}: {exc}\n'
-          f'  sys.path entry added: {script_dir}\n'
-          f'  remedy: sync this checkout so {script_dir}/../.venv exists, or re-run\n'
-          f'  this script under `uv run --project shared`',
-          file=sys.stderr)
+from _config_reload_gate import ReloadNotConfirmed, fetch_reload_report
+
+
+def verdict(**result):
+    print(json.dumps({'switched_to': value, 'commit': sha, **result}))
+
+
+def fail(failure, message):
+    print(f'merge-pytest-n-ab-switch: {message}', file=sys.stderr)
+    verdict(failure=failure)
     sys.exit(1)
 
-try:
-    tool = census_trigger.post_mcp_tool_call(
-        f'http://127.0.0.1:{port}/mcp', 'reload_config', {})
-except Exception as exc:
-    # Broad on purpose, and the breadth is the point: census_trigger raises
-    # StatusFetchUnavailable for a malformed or error envelope, RuntimeError
-    # for a failed handshake, and httpx's own exceptions for a dead socket —
-    # all three mean the live config is UNKNOWN, and a deploy gate must not
-    # pass on an unknown. Naming the TRANSPORT keeps this distinct from the
-    # rolled-back-reload diagnostic below, which is about a reload that ran.
-    print(f'reload_config never reached the tool: {type(exc).__name__}: {exc} '
-          f'(committed as {sha}; the value lands at the next restart)', file=sys.stderr)
-    sys.exit(1)
 
-# reload_config's OWN error field: a config that failed to parse, reported by a
-# perfectly successful tools/call. `_raise_on_mcp_error` inspects the JSON-RPC
-# envelope and never sees this one.
-if tool.get('error'):
-    print(f'reload_config error: {tool["error"]}', file=sys.stderr); sys.exit(1)
+try:
+    tool = fetch_reload_report(port, committed_as=sha, config_path=config_path)
+except ReloadNotConfirmed as exc:
+    fail(exc.failure.value, exc.detail)
 entry = (tool.get('applied') or {}).get('verify_env')
 if entry is None:
-    reloaded = tool.get('reloaded')
-    reported = tool.get('config_path')
-    if not reloaded:
-        print(f'reload reported no verify_env change, but did not commit it: reloaded={reloaded!r} '
-              f'(a failed reload rolls every leaf back, so the live config is untouched)', file=sys.stderr)
-        sys.exit(1)
-    # `reported` is the ORCHESTRATOR's own ORCH_CONFIG_PATH, so a RELATIVE one
-    # is resolved by the SERVER's cwd — realpath here would resolve it against
-    # OURS, and a different unit whose ORCH_CONFIG_PATH is the bare
-    # `dark-factory-orchestrator.yaml` would then match us whenever this runs
-    # from our project root. Uncomparable is not a match.
-    if not reported or not os.path.isabs(reported) or os.path.realpath(reported) != config_path:
-        print(f'reload reported no verify_env change, but re-read a different file: '
-              f'config_path={reported!r} expected={config_path!r}', file=sys.stderr)
-        sys.exit(1)
     # verify_env is in RELOADABLE_FIELDS today, so a change to it is never
     # bucketed as restart-required (config.py::diff_config) and this never
     # fires. One allowlist edit away it would: a genuine flip then produces
     # this branch's exact shape — reloaded, our file, nothing under `applied`
     # — while the arm is committed and NOT live.
     if 'verify_env' in (tool.get('restart_required') or {}):
-        print(f'verify_env changed but is restart-required, not hot-applied: '
-              f'restart_required_keys={sorted(tool.get("restart_required") or {})} '
-              f'(committed as {sha}; the value lands at the next restart)', file=sys.stderr)
-        sys.exit(1)
+        fail('restart_required', f'verify_env changed but is restart-required, not hot-applied: '
+                                 f'restart_required_keys={sorted(tool.get("restart_required") or {})} '
+                                 f'(committed as {sha}; the value lands at the next restart)')
     outcome = 'already_converged'
 else:
     new = (entry or {}).get('new') or {}
     if str(new.get(key)) != value:
-        print(f'applied.verify_env does not carry {key}={value}: applied_keys={sorted(tool.get("applied") or {})} '
-              f'restart_required_keys={sorted(tool.get("restart_required") or {})} entry={entry}', file=sys.stderr)
-        sys.exit(1)
+        fail('value_mismatch', f'applied.verify_env does not carry {key}={value}: applied_keys={sorted(tool.get("applied") or {})} '
+                               f'restart_required_keys={sorted(tool.get("restart_required") or {})} entry={entry}')
     outcome = 'applied'
-print(json.dumps({'switched_to': value, 'commit': sha, 'outcome': outcome}))
+verdict(outcome=outcome)
 RELOAD_PY

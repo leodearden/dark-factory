@@ -11,22 +11,21 @@ import re
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from _fm_helpers import (
     extract_cypher,
     extract_params,
+    lease_dir_fixture,  # also activates the autouse lease-dir isolation here
     load_script_module,
     make_rebuild_detail,
 )
+from _graphiti_fake import FakeGraphitiClient
 
-# --- lease-dir isolation (task 4775, prerequisite pre-1) -------------------
-#
-# Defined once in the sibling module so five importers cannot drift apart;
-# its docstring says why redirecting the directory is a hard boundary rather
-# than a convenience.  Autouse applies to every test in THIS module.
-from _fm_lease_dir_fixture import lease_dir_fixture  # noqa: F401
+from fused_memory.backends.graphiti_client import GraphitiBackend
+from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV
 
 CONFTEST_PATH = Path(__file__).parent / 'conftest.py'
 
@@ -448,6 +447,59 @@ class TestMakeGraphMockCypherDispatch:
 
 
 # ---------------------------------------------------------------------------
+# make_backend_over_fake_graphiti factory fixture (task 5473)
+# ---------------------------------------------------------------------------
+
+
+class TestMakeBackendOverFakeGraphiti:
+    """The contract-faithful sibling of make_backend (task 5473)."""
+
+    @pytest.mark.asyncio
+    async def test_a_write_reaches_the_fake_it_was_given(
+        self, mock_config, make_backend_over_fake_graphiti,
+    ):
+        fake = FakeGraphitiClient()
+        backend = make_backend_over_fake_graphiti(mock_config, fake)
+        assert isinstance(backend, GraphitiBackend)
+
+        result = await backend.add_episode(name='n', content='body', group_id='g')
+
+        assert [c['episode_body'] for c in fake.calls] == ['body']
+        assert fake.episodes[result.episode.uuid] is result.episode
+
+    @pytest.mark.asyncio
+    async def test_a_search_reaches_the_fake_it_was_given(
+        self, mock_config, make_backend_over_fake_graphiti,
+    ):
+        fake = FakeGraphitiClient()
+        backend = make_backend_over_fake_graphiti(mock_config, fake)
+        edge = SimpleNamespace(episodes=[])
+        fake.next_edges = [edge]
+
+        await backend.add_episode(name='n', content='body', group_id='g')
+
+        assert await backend.search('q', group_ids=['g']) == [edge]
+
+    def test_the_registry_defaults_to_empty(
+        self, mock_config, make_backend_over_fake_graphiti, monkeypatch, tmp_path,
+    ):
+        (tmp_path / 'ambient-proj').mkdir()
+        monkeypatch.setenv(KNOWN_PROJECT_ROOTS_ENV, str(tmp_path / 'ambient-proj'))
+
+        over_fake = make_backend_over_fake_graphiti(mock_config, FakeGraphitiClient())
+
+        assert over_fake.registered_graph_ids == frozenset()
+
+    def test_an_explicit_registry_is_honoured_and_canonicalized(
+        self, mock_config, make_backend_over_fake_graphiti,
+    ):
+        backend = make_backend_over_fake_graphiti(
+            mock_config, FakeGraphitiClient(), registered_graph_ids={'Reg-A'},
+        )
+        assert backend.registered_graph_ids == frozenset({'reg_a'})
+
+
+# ---------------------------------------------------------------------------
 # The integration-lane in-use lease (task 4775)
 # ---------------------------------------------------------------------------
 
@@ -555,7 +607,8 @@ class TestTheIntegrationLaneLeaseFixture:
 
 class TestTheLeaseDirIsolationHasOneDefinition:
     """The fixture keeping tests out of the machine-global lease directory is
-    defined ONCE and imported by the modules that need it.
+    defined ONCE, in ``_fm_helpers.py``, and imported by the modules that
+    need it.
 
     It was five verbatim copies of a ~26-line function before this guard
     (task 4775 pre-1).  The duplication is correctness-relevant rather than
@@ -566,7 +619,7 @@ class TestTheLeaseDirIsolationHasOneDefinition:
     """
 
     TESTS_DIR = Path(__file__).parent
-    HOME = '_fm_lease_dir_fixture.py'
+    HOME = '_fm_helpers.py'
     #: `lease_dir\w*` so a copy under either spelling is caught — the shared
     #: definition is `lease_dir_fixture`, registered under the fixture NAME
     #: `lease_dir`.  Spelled as a regex so this file does not match itself.
@@ -581,8 +634,8 @@ class TestTheLeaseDirIsolationHasOneDefinition:
 
         assert definitions == [self.HOME], (
             f'{definitions} define the fixture themselves; import the one '
-            f'definition instead — `from _fm_lease_dir_fixture import '
-            f'lease_dir  # noqa: F401`'
+            f'definition instead — `from _fm_helpers import '
+            f'lease_dir_fixture  # noqa: F401`'
         )
 
     def test_an_importing_module_really_gets_the_isolation(self, lease_dir):
@@ -593,3 +646,14 @@ class TestTheLeaseDirIsolationHasOneDefinition:
 
         assert reaper.lease_dir() == lease_dir
         assert reaper.lease_dir() != reaper.DEFAULT_LEASE_DIR
+
+    def test_conftest_never_activates_it_for_the_whole_package(self):
+        """Bound into conftest.py, the autouse fixture would redirect every
+        test, the ``-m integration`` lane included, whose lease must land in
+        the real directory the live cron reads.  Opt-in is per module, by
+        import."""
+        conftest = _fused_memory_conftest()
+
+        assert not any(
+            value is lease_dir_fixture for value in vars(conftest).values()
+        )

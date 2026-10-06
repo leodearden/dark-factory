@@ -51,7 +51,16 @@
 # test_per_module_merge_verify_raises_per_test_timeout guard, and is correct on
 # its own merits: this verbatim FULL_SUITE form runs when a touched file
 # classifies STRUCTURAL and under merge-role merge_verify_breadth=full.
-test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300"
+#
+# -n auto --dist loadgroup (task 5470). They live HERE because this prefix owns
+# no pyproject.toml, so pytest's rootdir inifile is the ROOT pyproject, which
+# must not carry them. Held by tests/scripts/test_merge_gate_parallelism_config.py
+# ::test_non_member_legs_carry_the_parallel_flags_on_their_test_command and
+# ::test_root_addopts_never_leaks_the_parallel_flags; why `auto` and why
+# loadgroup is that guard's module docstring. shared already declares
+# pytest-xdist (task 5408), so no dependency changed. Both forms' measured runs
+# are in the MEASUREMENT PROVENANCE block above verify_command_timeout_secs.
+test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --timeout=300 -n auto --dist loadgroup"
 
 # THIS COMMAND ALSO CARRIES THE skills/ LINT GATE (task 3554), which is not
 # recoverable from the string itself and is why the note exists.
@@ -89,6 +98,8 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # (`1 failed, 5 passed`). So an edit here can only break the half named above —
 # do not read a green run of that one test as the gate being intact.
 
+# This command also carries test_config_retune_gate_decision.py (docs/config-retune-gate.md).
+
 # KNOWN COST, recorded rather than left invisible (task 3350 amendment;
 # restated by task 3460, which falsified this block's original premise).
 #
@@ -109,11 +120,13 @@ test_command: "uv run --project shared pytest tests/scripts/ --tb=short -q --tim
 # gap task 3460 closed.
 #
 # THE COST SURVIVES, in narrowed form. `scripts` and `tests/scripts` both still
-# run tests/scripts/ under a full verify, so THIS suite still executes twice
-# (~110-230s of duplicated work per full verify) — only the second command is
-# now a superset rather than a copy. The two dedupe layers still each miss it
-# for a different reason, cited by SYMBOL rather than by file:line: the pins
-# this block previously carried (verify.py:4735, workflow.py:3558) were BOTH
+# run tests/scripts/ under a full verify, so THIS suite still executes twice —
+# only the second command is now a superset rather than a copy. Both legs run it
+# parallel, so the duplicated work is one parallel run of this suite: see the
+# PARALLEL runs in the MEASUREMENT PROVENANCE block below. The two dedupe layers
+# still each miss it for a different reason, cited by SYMBOL rather than by
+# file:line: the pins this block previously carried (verify.py:4735,
+# workflow.py:3558) were BOTH
 # stale at the time of writing — run_full_verification had drifted ~510 lines
 # and `seen[mc.prefix]` ~100, and each pin landed on unrelated code, so the
 # rot was compounding exactly as scripts/orchestrator.yaml's LINT block records
@@ -310,7 +323,12 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 # are a DIFFERENT command, and crediting them was half of what let the owning
 # guard's floor sit at 300s while this block recorded 233.50s.
 #
-#   VERBATIM runs of the test_command declared above:
+#   SERIAL-FORM runs — the test_command above WITHOUT `-n auto --dist
+#   loadgroup`. Every one was the verbatim command until task 5470, and they
+#   remain the sizing basis because the serial form is what verify's
+#   ENV_TRANSIENT recovery re-runs under this SAME budget:
+#   verify.py::_serial_pytest_str sheds -n/--dist, then _run_or_skip_timed
+#   applies the same per-command timeout.
 #     233.50s, 167.73s               two runs, 369 passed / 1 skipped each, on
 #                                    the task 3350 worktree at HEAD 9d6af5289f
 #     146.93s wall / 142.11s pytest  task 3703 pre-1 run A, base d6a5e32535;
@@ -349,13 +367,33 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 #                                    loadavg 80.03 -> 85.81
 #     148.20s wall / 145.77s pytest  pre-1 run 5, same base/counts, rc=0;
 #                                    loadavg 85.81 -> 103.79
+#     307.13s wall / 301.06s pytest  task 5470 architect run, base
+#                                    54a84fba86; rc=0, 2535 passed / 2 skipped
+#                                    / 10 deselected; loadavg 51.04 -> 139.61
+#
+#   PARALLEL runs (verbatim since task 5470) — NOT a sizing input:
+#     70.12s wall / 68.16s pytest    task 5470 architect run, base 54a84fba86,
+#                                    PYTEST_XDIST_AUTO_NUM_WORKERS=16; rc=0,
+#                                    2535 passed / 2 skipped; loadavg
+#                                    176.28 -> 164.10
+#     59.04s wall / 57.10s pytest    task 5470 implementer run, step-2 tree,
+#                                    same pin; rc=0, 2535 passed / 2 skipped;
+#                                    loadavg 127.32 -> 101.59
+#     57.44s wall / 56.02s pytest    task 5470 implementer run, step-4 tree,
+#                                    same pin; rc=0, 2538 passed / 2 skipped;
+#                                    loadavg 134.94 -> 129.42
+#     46.85s wall / 45.66s pytest    task 5470 amendment-pass run, same pin;
+#                                    rc=0, 2538 passed / 2 skipped; loadavg
+#                                    259.22 -> 463.43
 #
 #   FALLBACK-PATH runs — NOT this command; the fleet chain's legs narrowed to a
 #   tests/scripts diff. Kept for history, never for sizing:
 #     105-127s                       four runs (task 3062, esc-3062-3)
 #
 # SIZING (task 4320). Size against 397.47s — the largest figure across every
-# VERBATIM run above, measured on the command this file declares. 1000s is
+# SERIAL-FORM run above, because the serial form is what the ENV_TRANSIENT
+# recovery runs inside this budget (sizing against the faster parallel form
+# would re-create the false-infra_timeout trap on that recovery path). 1000s is
 # 2.52x it, which is this family's own convention for the multiple (this module
 # sat at 600/233.50 = 2.57x until today; scripts/ sits at 2400/930.59 = 2.58x),
 # and it clears the 700s floor the owning guard DERIVES from the same figure
@@ -388,8 +426,8 @@ type_check_command: "uv run --project shared pyright tests/scripts/"
 # "Size against 233.50s ... 600s is ~2.6x it", and under a SUITE GROWTH heading
 # that 233.50s "is therefore a LOWER BOUND on today's contended worst case ...
 # RE-MEASURE under load before tightening this budget against it". Both halves
-# are now false: the suite HAS been re-measured under load (the ten VERBATIM
-# runs above, at 1256 passed / 2 skipped / 6 deselected against the 369 of the
+# are now false: the suite HAS been re-measured under load (the ten task-4320
+# SERIAL-FORM runs above, at 1256 passed / 2 skipped / 6 deselected against the 369 of the
 # 233.50s run), and what survived is 397.47s, not 233.50s. Corrected rather than
 # deleted, because that caveat is why the re-measurement happened; corrected
 # rather than left standing, because an authoritative-reading comment a later

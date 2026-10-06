@@ -48,7 +48,7 @@ Row    Name                                        Seam(s) driven
                                                      routing, no branch charge, one probe across two merges)
 6      infra non-consumption, both consumers        task-verify: ``TaskWorkflow._verify_debugfix_loop``;
                                                      merge-verify: ``_run_post_merge_verify`` accounting
-7      train amortization                           ``MergeWorker._do_merge`` (exactly one broad,
+7      train amortization                           ``MergeLane`` train merge (exactly one broad,
                                                      per-module merge-role verify of the train tip)
 8      rollback path (breadth='scoped')              producer: ``run_scoped_verification`` (byte-identical
                                                      legacy merge-role plan)
@@ -104,7 +104,7 @@ from typing import Literal, cast
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _serial_merge_worker import MergeWorker
+from _merge_lane_fakes import merge_through_lane
 from test_merge_queue_main_health import _make_config, _make_git_ops, _make_req
 from test_train_integration import _SpyEventStore, build_group_merge_request, make_stacked_member
 from test_verify import _real_worktree_reader
@@ -123,6 +123,7 @@ from test_workflow_verify_infra_resume import _make as _make_workflow
 from orchestrator import verify, verify_plan
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
+from orchestrator.merge_lane import MergeLane
 from orchestrator.merge_queue import (
     MAIN_HEALTH_RED_REASON_PREFIX,
     TRANSIENT_INFRA_REASON_PREFIX,
@@ -937,11 +938,11 @@ class TestRow6InfraTransientConsumesNoAttemptBothConsumers:
 # Row 7: "train amortization" (λ/σ, T1). A 3-member line-stacked Python
 # train lands via exactly ONE broad, per-module merge-role verify of the
 # TIP — the amortization win — driven through the REAL
-# ``MergeWorker._do_merge`` -> ``_do_train_merge`` -> ``_run_post_merge_verify``
+# ``MergeLane`` -> ``_do_train_merge`` -> ``_run_post_merge_verify``
 # chokepoint chain. Adapts test_train_integration.py's real-git train harness
-# (``make_stacked_member`` / ``build_group_merge_request`` / ``_SpyEventStore``
-# / the test-local ``MergeWorker`` reference) to non-cargo Python modules
-# with an instrumented fake ``run_verification`` — no cargo, no ssh.
+# (``make_stacked_member`` / ``build_group_merge_request`` / ``_SpyEventStore``)
+# driven through ``MergeLane``, to non-cargo Python modules with an
+# instrumented fake ``run_verification`` — no cargo, no ssh.
 # ---------------------------------------------------------------------------
 
 
@@ -1072,13 +1073,13 @@ class TestRow7TrainAmortizationOneFullBreadthVerify:
         })
 
         queue: asyncio.Queue = asyncio.Queue()
-        worker = MergeWorker(git_ops, queue, event_store=spy_events)
+        lane = MergeLane(git_ops, queue, event_store=spy_events)
 
         with (
             patch('orchestrator.merge_queue.run_scoped_verification', side_effect=_spy_verify),
             patch.object(verify, 'run_verification', new=run_verification_fake),
         ):
-            outcome = await worker._do_merge(req)
+            outcome = await merge_through_lane(lane, queue, req)
 
         assert outcome is not None
         assert outcome.status == 'done', f'expected the train to land; got {outcome!r}'

@@ -26,13 +26,15 @@ therefore checked once, in one place, rather than re-typed per caller.
 calls NONE of this: PRD C2 makes the benign codes the emit boundary's business,
 and the predicate re-derives none of them.
 
-WHY VALIDATION IS A SEPARATE, FIRST STEP
-----------------------------------------
+WHY VALIDATION IS A SEPARATE, PRE-WRITE STEP (2)
+------------------------------------------------
 ``consolidate_memories`` is irreversible by construction: it writes a
 canonical, patches retained peers and DELETES its supersedes.  Argument
-validation is the only stage that can refuse at zero cost, so everything
-decidable from the arguments alone is decided here — before the canonical
-exists, before a single victim is touched.
+validation runs as step (2): immediately after the fail-closed
+authorization gate, which deliberately precedes it, and before anything
+reads or writes the corpus.  It is the last point where everything
+decidable from the arguments alone can be refused for free — before the
+canonical exists, before a single victim is touched.
 
 Two properties follow from that position and are not incidental:
 
@@ -223,6 +225,12 @@ _CLAIM_HINT = (
     'becomes the canonical\'s first paragraph verbatim.'
 )
 
+_PROPOSAL_TEXT_HINT = (
+    'A proposal carries no canonical text: the canonical is rendered from '
+    '`claim` by `reconciliation/consolidation_auto.py::build_auto_canonical`, '
+    'its one home. Put the assertion in `claim` instead.'
+)
+
 
 def _claim_problems(claim: str, topic: str, *, max_chars: int) -> list[str]:
     """The ONE home of the five claim-shape rules. Collects, never short-circuits.
@@ -313,9 +321,11 @@ def validate_consolidate_args(
       of having its claim (and therefore every cap on it) silently dropped.
       ``server/tools.py::consolidate_memories`` takes this arm by omission,
       which is why it needs no edit.
-    * ``limits is not None`` — the PROPOSAL shape. ``canonical_content`` is not
-      required (a proposal has no canonical text yet, by construction), *claim*
-      is, and the retain arm's length must fall in
+    * ``limits is not None`` — the PROPOSAL shape. A proposal has no canonical
+      text yet, by construction, so a non-``None`` ``canonical_content`` is
+      REFUSED rather than dropped — the same fail-closed reason the op arm
+      refuses a claim without limits. *claim* is required, and the retain
+      arm's length must fall in
       ``[member_min, member_max]``. Task gamma's ``propose_consolidation`` takes
       this arm at the EMIT boundary so the LLM fixes its own shape in-turn, and
       task delta's executor takes it again when re-checking an aged ledger row
@@ -372,19 +382,27 @@ def validate_consolidate_args(
                 'ConsolidationAutoConfig to select the proposal shape'
             )
             _add_hint(_CLAIM_HINT)
-    elif not isinstance(claim, str) or not claim.strip():
-        problems.append(
-            '`claim` must be a non-empty string in a proposal, got '
-            f'{_safe_repr(claim)}'
-        )
-        _add_hint(_CLAIM_HINT)
     else:
-        claim_problems = _claim_problems(
-            claim, topic, max_chars=limits.claim_max_chars,
-        )
-        if claim_problems:
-            problems.extend(claim_problems)
+        if canonical_content is not None:
+            problems.append(
+                '`canonical_content` was passed with `limits`, so the proposal '
+                'shape was selected and the text would be dropped; omit it, or '
+                'pass `limits=None` to select the op shape'
+            )
+            _add_hint(_PROPOSAL_TEXT_HINT)
+        if not isinstance(claim, str) or not claim.strip():
+            problems.append(
+                '`claim` must be a non-empty string in a proposal, got '
+                f'{_safe_repr(claim)}'
+            )
             _add_hint(_CLAIM_HINT)
+        else:
+            claim_problems = _claim_problems(
+                claim, topic, max_chars=limits.claim_max_chars,
+            )
+            if claim_problems:
+                problems.extend(claim_problems)
+                _add_hint(_CLAIM_HINT)
 
     if not is_valid_topic_slug(topic):
         problems.append(f'`topic` is not a valid topic slug: {_safe_repr(topic)}')
@@ -515,6 +533,16 @@ def validate_consolidate_args(
     )
 
 
+def _closure_member_ref(row: Any) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        return {'id': None, 'canonical': False}
+    meta = row.get('metadata')
+    return {
+        'id': row.get('id'),
+        'canonical': isinstance(meta, dict) and meta.get('canonical') is True,
+    }
+
+
 def build_consolidation_result(
     *,
     canonical_id: str,
@@ -609,6 +637,14 @@ def build_consolidation_result(
     ``topic_cluster_seed`` (absent means no topic-cluster store is wired, so
     no seed was attempted) and ``hint`` (recovery guidance on a clean run
     would be noise).
+
+    ``topic_members`` rows are projected to ``{'id', 'canonical'}``.  This
+    envelope is the ONLY record of an irreversible multi-delete, and a
+    dumping-ground topic's raw rows could push it past the MCP transport
+    limit, where it is rejected wholesale and ``deleted``, ``survivors`` and
+    ``failed_deletes`` are lost for records that are already gone.  A
+    closure proof needs only the id and the canonical flag, and the
+    projection never raises, for the same reason.
     """
     failed_deletes = list(failed_deletes)
     survivors = list(survivors)
@@ -622,7 +658,7 @@ def build_consolidation_result(
         or survivors
         or survivor_check_failed
     )
-    members = list(topic_members or [])
+    members = [_closure_member_ref(row) for row in (topic_members or [])]
     result: dict[str, Any] = {
         'status': 'partial' if open_business else 'consolidated',
         'canonical_id': canonical_id,

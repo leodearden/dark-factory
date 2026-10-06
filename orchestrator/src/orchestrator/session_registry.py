@@ -30,7 +30,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterator, Mapping
+from collections import Counter
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -59,7 +60,8 @@ logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
-SCHEMA_MINOR = 2
+# 3: LeaseHolder.record_slug and DecisionRecord.record_slug (task 4237).
+SCHEMA_MINOR = 3
 """Additive-extension counter for this module's contract (Fleet Cockpit C1,
 plans/fleet-cockpit-prd.md §6.1). A CODE-LEVEL signal only -- never persisted
 per-record. Bump this when a new backward-compatible (optional/defaulted)
@@ -402,7 +404,13 @@ class DecisionRecord:
     project: the project_id this decision concerns.
     text: the decision/question text as filed.
     filed_at: ISO-8601 timestamp of when this decision was filed.
-    session_id: the session that filed this decision, or None.
+    session_id: the filer's provenance label, or None -- in practice a
+        watcher's lease token (``<lease-name>-<pid>``), which is NOT a
+        session-registry record key. Kept as filed; never resolved.
+    record_slug: the filer's session-registry record key (a
+        ``record_path_for_slug`` slug), or '' when it was unresolvable or the
+        record predates this field. Derived by ``write-decision`` from
+        ``$CLAUDE_PID``'s pid pointer, never typed by the filer.
     task_id: the task this decision is scoped to, or None.
     escalation_id: the escalation this decision resolves, or None.
     options: the candidate answers offered, or None.
@@ -433,13 +441,15 @@ class DecisionRecord:
         hold before; packing it into ``text`` (the cockpit's one-line
         question) would bury a structured fact in prose. Written only by
         close_decision_with_evidence, which the sitting preparer's apply step
-        drives through the ``close-decision`` verb. Defaults to '' (not
+        drives through the ``close-decision`` verb, and cleared only by
+        reopen_decision. Defaults to '' (not
         closed with evidence, or filed before this field existed). CUSTODY,
         like ``state``: a watcher's re-file never changes it.
     closed_at: the ISO-8601 UTC instant close_decision_with_evidence recorded
         the close -- on the reap-decisions-got-there-first path, when the
         evidence was attached. Written only by close_decision_with_evidence,
-        in the same write as ``closing_evidence``, and CUSTODY like it. It
+        in the same write as ``closing_evidence``, cleared with it by
+        reopen_decision, and CUSTODY like it. It
         exists because the return brief windows its autonomous-closes section
         on when a close happened, and ``filed_at`` is the wrong clock for
         that: a carve-out close targets an L2 that has been open a while.
@@ -454,11 +464,12 @@ class DecisionRecord:
     are up -- scripts/backfill_decision_queue_stamp.py (via
     set_decision_escalations_dir), the ``write-decision`` verb itself
     (task 3559), whose enrichment path folds a SECOND watcher's filing into
-    an existing open record, and -- for task 5376's sitting preparer -- the
-    ``close-decision`` verb (via close_decision_with_evidence). The
+    an existing open record, -- for task 5376's sitting preparer -- the
+    ``close-decision`` verb (via close_decision_with_evidence), and the
+    ``reopen-decision`` verb (via reopen_decision, task 4835). The
     ``write-decision`` verb is the only mutator that may CREATE the record
     rather than merely mutate an existing one, so it races on a path where
-    nothing exists on disk yet. All five serialize their
+    nothing exists on disk yet. All six serialize their
     read-modify-write span per-decision-id via
     decision_id_lock (a stable ``<id>.json.lock`` sidecar, mirroring task
     1609's escalation_id_lock), so a concurrent state-update, boost-update,
@@ -467,7 +478,7 @@ class DecisionRecord:
     read+mutate+write span is serialized against other callers on the same
     id. See update_decision_state/set_manual_boost/
     set_decision_escalations_dir/_run_write_decision/
-    close_decision_with_evidence for the caller-facing note.
+    close_decision_with_evidence/reopen_decision for the caller-facing note.
     """
 
     id: str
@@ -484,6 +495,19 @@ class DecisionRecord:
     escalations_dir: str = field(default='', kw_only=True)
     closing_evidence: str = field(default='', kw_only=True)
     closed_at: str = field(default='', kw_only=True)
+    record_slug: str = field(default='', kw_only=True)
+
+    @property
+    def linked_session_slug(self) -> str | None:
+        """The session-registry slug this decision links to, or None.
+
+        THE one home of the decision -> session link policy: ``record_slug``
+        when set, else ``session_id`` (which resolves only when a filer
+        happened to write a real record key there). Every consumer that
+        resolves a decision against the registry reads this, never either
+        field directly.
+        """
+        return self.record_slug or self.session_id or None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -501,6 +525,7 @@ class DecisionRecord:
             'escalations_dir': self.escalations_dir,
             'closing_evidence': self.closing_evidence,
             'closed_at': self.closed_at,
+            'record_slug': self.record_slug,
         }
 
     @classmethod
@@ -525,6 +550,7 @@ class DecisionRecord:
             # Same `or ''` idiom as escalations_dir above, for both custody fields.
             closing_evidence=data.get('closing_evidence') or '',
             closed_at=data.get('closed_at') or '',
+            record_slug=data.get('record_slug') or '',
         )
 
     def to_json(self) -> str:
@@ -620,6 +646,94 @@ def record_path_for_slug(slug: str, root: Path | str | None = None) -> Path:
     return sessions_dir(root) / slug / 'record.json'
 
 
+SESSION_POINTERS_DIRNAME = 'sessions-by-pid'
+
+
+def session_pointers_dir(root: Path | str | None = None) -> Path:
+    """The pid-pointer dir, ``<fleet_root>/sessions-by-pid/``.
+
+    A SIBLING of ``sessions_dir``, never a child of it: every sweep over
+    ``sessions_dir`` treats each of its children as a record dir, so a
+    pointer dir inside it would be read as a corrupt record.
+    """
+    return fleet_root(root) / SESSION_POINTERS_DIRNAME
+
+
+def session_pointer_path_for_pid(pid: int, root: Path | str | None = None) -> Path:
+    return session_pointers_dir(root) / str(pid)
+
+
+def _is_record_key(slug: str) -> bool:
+    """True iff *slug* can name a record dir directly inside ``sessions_dir``.
+
+    The one well-formedness check for every pointer and ``record_slug`` read
+    or write: non-empty, already sanitized, and not an all-dots traversal
+    segment.
+    """
+    return bool(slug) and sanitize_slug(slug) == slug and not _ALL_DOTS_RE.match(slug)
+
+
+def _read_session_pointer(path: Path) -> str | None:
+    """The slug a pointer file holds, stripped; None when it cannot be read."""
+    try:
+        return path.read_text(encoding='utf-8').strip()
+    except (OSError, ValueError):
+        return None
+
+
+def write_session_pointer(pid: int, slug: str, root: Path | str | None = None) -> bool:
+    """Record *slug* as the record key of claude process *pid*'s current record.
+
+    The file ``sessions-by-pid/<pid>`` holds exactly that slug, last writer
+    wins. *pid* is the OWNING ``claude`` process's pid (the value
+    ``$CLAUDE_PID`` carries), never the record's ``launcher_pid``.
+
+    Returns True without rewriting when the pointer already holds *slug*.
+    Returns False without writing for a non-positive *pid* or a *slug* that
+    is not a record key, and False (after a WARNING) when the write itself
+    fails. Never raises: its callers are session hooks.
+    """
+    if pid <= 0 or not _is_record_key(slug):
+        return False
+    path = session_pointer_path_for_pid(pid, root=root)
+    if _read_session_pointer(path) == slug:
+        return True
+    try:
+        _atomic_write_text(path, slug)
+    except OSError as exc:
+        logger.warning(
+            'session pointer write failed: pid=%s slug=%s path=%s: %s', pid, slug, path, exc
+        )
+        return False
+    return True
+
+
+def resolve_session_slug_for_pid(pid: int, root: Path | str | None = None) -> str | None:
+    """Return the record slug of claude process *pid*'s current record, or None.
+
+    The pointer's slug is returned only when it is a record key AND the
+    record it names still carries ``claude_owner_pid == pid``: the record
+    must vouch for the pointer, so an unowned record, another pid's record,
+    a reaped one and an unreadable one all read as None. None is the
+    caller-visible degradation signal; this function is read-only and never
+    raises.
+
+    Contract limit: a new process that reuses a dead claude's pid can read
+    that session's pointer until its own SessionStart hook overwrites it or
+    ``reap_stale_session_pointers`` removes it.
+    """
+    if pid <= 0:
+        return None
+    slug = _read_session_pointer(session_pointer_path_for_pid(pid, root=root))
+    if slug is None or not _is_record_key(slug):
+        return None
+    try:
+        record = read_record(slug, root=root)
+    except (OSError, CorruptSessionRecord):
+        return None
+    return slug if record.claude_owner_pid == pid else None
+
+
 def encode_cwd(cwd: str) -> str:
     """Encode *cwd* to Claude Code's own ``~/.claude/projects/<enc>`` dir name.
 
@@ -682,6 +796,25 @@ def decision_path_for_id(decision_id: str, root: Path | str | None = None) -> Pa
     return decisions_dir(root) / f'{stem}.json'
 
 
+DECISION_ID_PROJECT_SEPARATOR = '-'
+
+
+def qualify_decision_id(project: object, local_id: str) -> str:
+    """The fleet-unique decision key: *local_id* prefixed by the canonical *project*.
+
+    A pure join that never inspects *local_id*. A project that folds to ``''``
+    leaves *local_id* unqualified. ``-`` is the separator because canonical
+    tokens never contain one (so the join is injective), it survives
+    _DECISION_ID_SANITIZE_RE (so the file stem equals the id), and it matches
+    the sitting's existing ``<project>-<esc>`` ids. See
+    plans/4835-decision-plumbing-decisions.md.
+    """
+    folded = normalize_project_token(project)
+    if not folded:
+        return local_id
+    return f'{folded}{DECISION_ID_PROJECT_SEPARATOR}{local_id}'
+
+
 # ---------------------------------------------------------------------------
 # Single-writer atomic write / read / update
 # ---------------------------------------------------------------------------
@@ -689,6 +822,12 @@ def decision_path_for_id(decision_id: str, root: Path | str | None = None) -> Pa
 
 class CorruptSessionRecord(Exception):
     """Raised by read_record when a record.json exists but fails to parse."""
+
+
+_ATOMIC_WRITE_TEMP_SUFFIX = '.tmp'
+"""Suffix of ``_atomic_write_text``'s in-flight temp file. A sweep that visits
+every entry of a dir this module writes into (``reap_stale_session_pointers``)
+keys on it to leave a concurrent writer's temp file alone."""
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -748,7 +887,7 @@ def _atomic_write_text(path: Path, text: str) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path_str = tempfile.mkstemp(
-        suffix='.tmp',
+        suffix=_ATOMIC_WRITE_TEMP_SUFFIX,
         prefix=path.stem,
         dir=str(path.parent),
     )
@@ -981,7 +1120,8 @@ def _mutate_decision(
 
     The single implementation of the field-setter body shared by
     update_decision_state, set_manual_boost, set_decision_escalations_dir
-    (task 3640 amendment) and close_decision_with_evidence (task 5376). Those
+    (task 3640 amendment), close_decision_with_evidence (task 5376) and
+    reopen_decision (task 4835). Those
     are the public, caller-facing names and keep their own docstrings; this holds the parts that MUST NOT diverge
     between them -- the lock placement, the read, the write, and the
     fail-soft except-tuple.
@@ -1112,6 +1252,29 @@ def set_decision_escalations_dir(
 CLOSING_DECISION_STATES = frozenset({DecisionState.ANSWERED, DecisionState.DROPPED})
 
 
+def _decision_identity(project: object, escalations_dir: str | Path) -> tuple[str, str]:
+    """The folded (project, queue stamp) pair a caller names a fleet-global decision record by."""
+    return normalize_project_token(project), normalize_escalations_dir(escalations_dir)
+
+
+def _refuse_unless_named_record(
+    decision_id: str,
+    record: DecisionRecord,
+    wanted: tuple[str, str],
+    refused: type[Exception],
+    *,
+    action: str,
+) -> None:
+    """Raise *refused* unless *record* is the one *wanted* names: the compare-and-swap of close and reopen."""
+    found = _decision_identity(record.project, record.escalations_dir)
+    if found != wanted:
+        raise refused(
+            f'{decision_id} is project {found[0]!r} in queue {found[1]!r}, not the record the '
+            f'caller named (project {wanted[0]!r} in queue {wanted[1]!r}); decision ids are '
+            f'fleet-global, so another project\'s or queue\'s record is never {action}'
+        )
+
+
 class DecisionCloseRefused(Exception):
     """close_decision_with_evidence refused; the record is untouched and the message names why.
 
@@ -1167,16 +1330,10 @@ def close_decision_with_evidence(
             f'{decision_id}: closing evidence is empty; quote the deciding evidence verbatim'
         )
 
-    wanted = (normalize_project_token(expected_project), normalize_escalations_dir(expected_escalations_dir))
+    wanted = _decision_identity(expected_project, expected_escalations_dir)
 
     def _close(record: DecisionRecord) -> None:
-        found = (normalize_project_token(record.project), normalize_escalations_dir(record.escalations_dir))
-        if found != wanted:
-            raise DecisionCloseRefused(
-                f'{decision_id} is project {found[0]!r} in queue {found[1]!r}, not the record the '
-                f'caller named (project {wanted[0]!r} in queue {wanted[1]!r}); decision ids are '
-                'fleet-global, so another project\'s or queue\'s record is never closed'
-            )
+        _refuse_unless_named_record(decision_id, record, wanted, DecisionCloseRefused, action='closed')
         if record.closing_evidence:
             raise DecisionCloseRefused(
                 f'{decision_id} already carries closing evidence; refusing to overwrite it'
@@ -1193,6 +1350,46 @@ def close_decision_with_evidence(
     return _mutate_decision(
         decision_id, _close, caller='close_decision_with_evidence', root=root
     )
+
+
+class DecisionReopenRefused(Exception):
+    """reopen_decision refused; the record is untouched and the message names why.
+
+    Not a ValueError, for DecisionCloseRefused's reason: _mutate_decision
+    absorbs ValueError, and a refusal must reach its caller.
+    """
+
+
+def reopen_decision(
+    decision_id: str,
+    root: Path | str | None = None,
+    *,
+    expected_project: str,
+    expected_escalations_dir: str | Path,
+) -> DecisionRecord | None:
+    """Re-open *decision_id* IN PLACE, in ONE locked read-modify-write.
+
+    The caller names the record it means exactly as for
+    close_decision_with_evidence, and any other record at that id raises
+    DecisionReopenRefused. Clears ``closing_evidence`` and ``closed_at``,
+    because a close never overwrites evidence, so a re-opened gate could
+    otherwise never be closed with evidence again. Every other field is kept,
+    ``filed_at`` and ``manual_boost`` included (custody). It is reopen-only
+    rather than a generic state setter, which would bypass the evidence-quoting
+    close; see plans/4835-decision-plumbing-decisions.md.
+
+    Otherwise FAIL-SOFT like its sibling setters: None (logged at ERROR) on a
+    missing file, a corrupt body, a lock fault or a write failure.
+    """
+    wanted = _decision_identity(expected_project, expected_escalations_dir)
+
+    def _reopen(record: DecisionRecord) -> None:
+        _refuse_unless_named_record(decision_id, record, wanted, DecisionReopenRefused, action='reopened')
+        record.state = DecisionState.OPEN
+        record.closing_evidence = ''
+        record.closed_at = ''
+
+    return _mutate_decision(decision_id, _reopen, caller='reopen_decision', root=root)
 
 
 def _merge_queue_and_escalation_id(
@@ -1328,10 +1525,10 @@ def merge_decision_enrichment(
       restamp queue age, re-open or close the record (that is
       update_decision_state's job), reset an operator's C5 cockpit boost, or
       erase the evidence a close recorded or when it recorded it.
-    - ``text`` / ``task_id`` / ``session_id`` / ``options`` -- keep
-      *existing* where it is non-empty; take *incoming* ONLY to fill a field
-      the first filer left empty/None. That fill is what makes this
-      enrichment rather than a no-op.
+    - ``text`` / ``task_id`` / ``session_id`` / ``record_slug`` /
+      ``options`` -- keep *existing* where it is non-empty; take *incoming*
+      ONLY to fill a field the first filer left empty/None. That fill is what
+      makes this enrichment rather than a no-op.
     - ``severity``           -- ``_max_decision_severity``: never downgrade.
     - ``escalations_dir`` + ``escalation_id`` -- NOT independent fields, and
       ``escalation_id`` is deliberately NOT a plain fill-if-empty one: the
@@ -1358,8 +1555,9 @@ def merge_decision_enrichment(
     field unguarded. (2) Task 3640 (merged) hard-commits the field to a
     scalar, adding UNKNOWN_QUEUE as a THIRD scalar state plus a back-fill
     that stamps the live population as scalars; a list would contradict
-    shipped, tested behaviour. (3) Widening it needs a SCHEMA_VERSION minor
-    bump (fleet-cockpit-prd.md:180) and belongs to its own task.
+    shipped, tested behaviour. (3) DECIDED won't-do by task 4835 (a faithful
+    widening would be (queue, escalation_id) pairs, and any-of closure fails
+    closed); see plans/4835-decision-plumbing-decisions.md.
 
     First-writer-wins therefore leaves the known MODE-2 reap gap that
     test_main_reap_decisions_mode2_collapsed_decision_is_reapable_only_by_
@@ -1380,6 +1578,7 @@ def merge_decision_enrichment(
         task_id=existing.task_id or incoming.task_id,
         escalation_id=merged_escalation_id,
         session_id=existing.session_id or incoming.session_id,
+        record_slug=existing.record_slug or incoming.record_slug,
         options=existing.options or incoming.options,
         severity=_max_decision_severity(existing.severity, incoming.severity),
         escalations_dir=merged_queue,
@@ -1402,9 +1601,9 @@ def merge_same_queue_refile(
     Field policy:
 
     - ``text`` / ``severity`` / ``task_id`` / ``session_id`` /
-      ``escalation_id`` / ``options`` / ``escalations_dir`` -- from
-      *incoming*, VERBATIM, including a severity DOWNGRADE and a field going
-      EMPTY. The watcher is the sole authority on its own escalation, and
+      ``record_slug`` / ``escalation_id`` / ``options`` / ``escalations_dir``
+      -- from *incoming*, VERBATIM, including a severity DOWNGRADE and a field
+      going EMPTY. The watcher is the sole authority on its own escalation, and
       freezing the first values (enrichment's fill-if-empty +
       _max_decision_severity) would strand stale prose and a stale severity
       in the cockpit queue forever. This is the whole reason the same-queue
@@ -1467,15 +1666,10 @@ def merge_same_queue_refile(
     reap_answered_decisions skips a non-open record ("already resolved -- no
     re-close"), so without this the operator's dismissal is undone forever
     and C5b's drop action is inert for exactly the class of row it exists
-    for. The escape hatch for a genuinely NEW ask at a closed id is to FILE
-    IT UNDER A NEW ID -- the remedy that exists on a shipped surface, and the
-    one _run_write_decision's divergence WARNING points a watcher at.
-    Re-opening the row IN PLACE is deliberately not offered as the headline
-    remedy, because today it needs a direct registry write: this module's
-    update_decision_state has no operator-facing caller that re-opens (the
-    cockpit's C5b decision pane writes DROPPED only) and the argparse below
-    exposes write-decision / reap-decisions but no update-decision-state
-    verb. Say "file a new id" until one of those exists.
+    for. When the SAME gate genuinely needs a human again, the row is
+    re-opened in place with the ``reopen-decision`` verb (reopen_decision),
+    which _run_write_decision's divergence WARNING names; a genuinely
+    DIFFERENT ask is filed under a new id.
 
     ADDITIVE-SAFE: ``state`` is copied as an opaque ``str``, never coerced
     through DecisionState -- mirrors DecisionRecord's own no-coercion note,
@@ -1944,10 +2138,11 @@ def declined_project_token_hint(value: object, action: str = '') -> str | None:
     must land. ``solar_challenge`` -- the token both SKILL.md files recommend
     -- must stay SILENT, or a watcher accrues a warning every Main Loop
     cycle and the signal degrades into noise. Because the check is gated on
-    a one-entry table it has zero false positives; it is deliberately
-    narrower than a generic "your --project matched zero records" warning,
-    which cannot distinguish a token nothing uses from a healthy project
-    with nothing open.
+    a one-entry table it has zero false positives, so it fires on every
+    reap. The general "your --project matched zero records" case is
+    unmatched_project_token_hint, which is OPT-IN (``reap-decisions
+    --expect-matches``) because by count alone a never-filed project cannot
+    be told apart from a mismatched one; this hint takes precedence over it.
 
     WHY IT IS VERB-AWARE. The two callers hit this table for OPPOSITE
     reasons, and one message cannot be true for both. ``reap-decisions`` is
@@ -2006,6 +2201,44 @@ def declined_project_token_hint(value: object, action: str = '') -> str | None:
             ),
         }.get(action, '')
         return f'{core}{consequence} See PROJECT_TOKEN_ALIASES_DECLINED for the evidence.'
+    return None
+
+
+def project_token_census(decisions: Iterable[DecisionRecord]) -> Counter[str]:
+    """How many *decisions*, in any state, carry each folded project token; an unset token is dropped."""
+    return Counter(
+        token for token in (normalize_project_token(d.project) for d in decisions) if token
+    )
+
+
+def unmatched_project_token_hint(value: object, census: Mapping[str, int]) -> str | None:
+    """One-line warning when *value* folds to a token no registry record carries, else None.
+
+    *census* is project_token_census over the whole registry. The line names
+    the tokens that DO exist, most common first, so a mismatched spelling is
+    one glance from its fix.
+    """
+    folded = normalize_project_token(value)
+    if not folded or folded in census:
+        return None
+    present = ', '.join(
+        f'{token}={count}'
+        for token, count in sorted(census.items(), key=lambda item: (-item[1], item[0]))
+    )
+    return (
+        f'--project {folded!r} matches ZERO of {sum(census.values())} decision records in the '
+        f'registry (any state), so this reap can close nothing. Tokens present: '
+        f'{present or "none"}. Re-run with the token whose rows you meant.'
+    )
+
+
+def _reap_scope_hint(reaper_project: str, *, expect_matches: bool) -> str | None:
+    """The one advisory reap-decisions logs: the declined-alias special case first, else the opt-in census."""
+    declined = declined_project_token_hint(reaper_project, action='reap')
+    if declined is not None:
+        return declined
+    if expect_matches:
+        return unmatched_project_token_hint(reaper_project, project_token_census(list_decisions()))
     return None
 
 
@@ -2462,6 +2695,78 @@ def reap_stale_records(
                 break
 
     return reaped
+
+
+_POINTER_TEMP_FILE_GRACE = timedelta(minutes=5)
+"""How long a ``sessions-by-pid/`` temp file is presumed to belong to a writer
+still between ``mkstemp`` and ``os.replace``. Past it, the writer was killed."""
+
+
+def _is_abandoned_temp_file(path: Path) -> bool:
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return False
+    age = datetime.now(UTC) - datetime.fromtimestamp(mtime, tz=UTC)
+    return age > _POINTER_TEMP_FILE_GRACE
+
+
+def _is_stale_session_pointer(path: Path, root: Path | str | None) -> bool:
+    if path.name.endswith(_ATOMIC_WRITE_TEMP_SUFFIX):
+        return _is_abandoned_temp_file(path)
+    try:
+        pid = int(path.name)
+    except ValueError:
+        return True
+    if pid <= 0 or path.name != str(pid) or not _pid_alive(pid):
+        return True
+    slug = _read_session_pointer(path)
+    return (
+        slug is None
+        or not _is_record_key(slug)
+        or not record_path_for_slug(slug, root=root).is_file()
+    )
+
+
+def reap_stale_session_pointers(root: Path | str | None = None) -> list[Path]:
+    """Remove every ``sessions-by-pid/`` entry that can no longer serve a reader.
+
+    An entry is stale when its name is not a canonical positive pid, its pid
+    is dead, its content is not a record key, or the record it names has no
+    ``record.json``. The one exception is a ``write_session_pointer`` temp
+    file, which is left to its writer until ``_POINTER_TEMP_FILE_GRACE`` has
+    passed, so a sweep never unlinks it out from under a concurrent
+    ``os.replace``. A dead pid's pointer goes even while its record still
+    exists: its owner can never query it again, and a process that reuses
+    the pid must not inherit it. Record bodies are never parsed, so the cost
+    is O(pointer files), not O(records).
+
+    This is a separate sweep from ``reap_stale_records`` because that one
+    derives identity from each record's PATH and never reads the body, so it
+    cannot know which pointers name the records it removes. Returns the
+    removed paths; an entry that cannot be removed is logged and skipped.
+    """
+    base = session_pointers_dir(root)
+    if not base.is_dir():
+        return []
+    entries = sorted(base.iterdir())
+    removed: list[Path] = []
+    for path in entries:
+        if not _is_stale_session_pointer(path, root):
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.warning('reap_stale_session_pointers: failed to remove %s: %s', path, exc)
+            continue
+        removed.append(path)
+    logger.info(
+        'reap_stale_session_pointers: removed %d of %d pointer(s) under %s',
+        len(removed),
+        len(entries),
+        base,
+    )
+    return removed
 
 
 ORPHAN_EXIT_CODE: int = 200
@@ -2933,6 +3238,15 @@ SESSION_PID_ENV = 'CLAUDE_PID'
 """Env var naming the long-lived ``claude`` process's pid (see resolve_session_pid)."""
 
 
+def _parse_session_pid(env: Mapping[str, str]) -> int | None:
+    """Parse *env*'s ``CLAUDE_PID`` as a positive int, else None. Never raises, never logs."""
+    try:
+        pid = int(env.get(SESSION_PID_ENV, '').strip())
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
 def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
     """Resolve THIS Claude Code session's long-lived pid -- the lease's liveness anchor.
 
@@ -2986,12 +3300,8 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
     """
     if env is None:
         env = os.environ
-    raw = env.get(SESSION_PID_ENV, '')
-    try:
-        pid = int(raw.strip())
-    except (AttributeError, TypeError, ValueError):
-        pid = 0
-    if pid > 0:
+    pid = _parse_session_pid(env)
+    if pid is not None:
         return pid
     logger.warning(
         'resolve_session_pid: %s is unset or unusable (%r); the lease pid/liveness '
@@ -3002,9 +3312,32 @@ def resolve_session_pid(env: Mapping[str, str] | None = None) -> int:
         'stable across tool calls either. Set $CLAUDE_PID; if you cannot, the lease '
         'slug is underivable too, so pass an explicit --slug <stable-token>.',
         SESSION_PID_ENV,
-        raw,
+        env.get(SESSION_PID_ENV, ''),
     )
     return 0
+
+
+def resolve_own_record_slug(
+    env: Mapping[str, str] | None = None, *, root: Path | str | None = None
+) -> str | None:
+    """Return THIS claude session's registry record slug, via ``$CLAUDE_PID``'s pointer.
+
+    A lease slug (``default_lease_slug``: ``<lease-name>-$CLAUDE_PID``) and a
+    registry record slug (``build_session_slug``) are different namespaces,
+    so neither can be looked up as the other. The pid pointer is the join:
+    the session hooks stamp ``sessions-by-pid/<claude pid>`` with the record
+    key, and ``resolve_session_slug_for_pid`` reads it back only while that
+    record still names the pid as its owner. Its consumers are
+    ``LeaseHolder.record_slug`` and ``DecisionRecord.record_slug``.
+
+    None when ``CLAUDE_PID`` is unusable or no vouched-for pointer exists.
+    Quiet by contract: this serves enrichment, so an unresolvable slug is a
+    blank field in the caller's result, not a log line.
+    """
+    pid = _parse_session_pid(os.environ if env is None else env)
+    if pid is None:
+        return None
+    return resolve_session_slug_for_pid(pid, root=root)
 
 
 def default_lease_slug(
@@ -3170,15 +3503,43 @@ class LeaseMutation(StrEnum):
     FAULTED = 'faulted'
 
 
+class HolderRecordState(StrEnum):
+    """What a lease holder's ``record_slug`` says about its registry record.
+
+    An axis INDEPENDENT of pid liveness (``holder_alive``): neither
+    overrides the other, and reading them together is the caller's job.
+
+    UNLINKED: the holder carries no ``record_slug`` (a body that predates the
+        field, or a claimant whose pointer was unresolvable), so nothing was
+        looked up. No evidence either way -- in particular NOT evidence that
+        the holder is alive or gone.
+    ABSENT: a ``record_slug`` WAS carried and no record exists under it: the
+        record has been reaped. Evidence the holder's session is gone.
+    UNREADABLE: the ``record_slug`` is not a record key, or its record
+        exists but cannot be read or parsed.
+    ACTIVE: the record's status is not terminal. For a hand-launched holder
+        that tracks its terminal, not the claude process, so ACTIVE never
+        overrides a dead pid.
+    EXITED: the record's status is terminal (``TERMINAL_STATUSES``).
+    """
+
+    UNLINKED = 'unlinked'
+    ABSENT = 'absent'
+    UNREADABLE = 'unreadable'
+    ACTIVE = 'active'
+    EXITED = 'exited'
+
+
 @dataclass(frozen=True)
 class LeaseHolder:
     """Serialized identity of a lease's current holder -- the exact ``.lease`` file body.
 
     session_slug: a CLAIMANT-CHOSEN ownership token, NOT a session-registry
         record key. The skills prescribe ``<lease-role>-<project>-<pid>``
-        (skills/escalation-watcher/SKILL.md:50,
-        skills/recon-escalation-watcher/SKILL.md:87,
-        skills/unblock/SKILL.md:42). Do NOT pass it to ``read_record``.
+        (escalation-watcher's and recon-escalation-watcher's "Claiming the
+        ... Lease" sections, and unblock's "Claim the unblock lease"). Do NOT
+        pass it to ``read_record``; the holder's record is reached through
+        ``record_slug`` below.
 
         THIS DOCSTRING USED TO CLAIM THE OPPOSITE -- that it was "the
         holder's own session-registry slug (see build_session_slug), letting
@@ -3202,18 +3563,33 @@ class LeaseHolder:
         human-readable contention/refusal message.
     pid: the holder process's pid; liveness is checked via _pid_alive.
     start_ts: ISO-8601 timestamp of when this holder claimed the lease.
+    record_slug: the holder's session-registry record key, resolved at claim
+        time from *pid*'s pointer (``resolve_session_slug_for_pid``). '' when
+        it could not be resolved or the body predates the field -- an
+        absence of evidence, never evidence of absence.
     """
 
     session_slug: str
     pid: int
     start_ts: str
+    record_slug: str = ''
 
     def to_dict(self) -> dict[str, Any]:
-        return {'session_slug': self.session_slug, 'pid': self.pid, 'start_ts': self.start_ts}
+        return {
+            'session_slug': self.session_slug,
+            'pid': self.pid,
+            'start_ts': self.start_ts,
+            'record_slug': self.record_slug,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> LeaseHolder:
-        return cls(session_slug=data['session_slug'], pid=data['pid'], start_ts=data['start_ts'])
+        return cls(
+            session_slug=data['session_slug'],
+            pid=data['pid'],
+            start_ts=data['start_ts'],
+            record_slug=data.get('record_slug') or '',
+        )
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict())
@@ -3221,6 +3597,25 @@ class LeaseHolder:
     @classmethod
     def from_json(cls, raw: str) -> LeaseHolder:
         return cls.from_dict(json.loads(raw))
+
+
+def holder_record_state(
+    holder: LeaseHolder | None, *, root: Path | str | None = None
+) -> HolderRecordState:
+    """Classify *holder*'s registry record -- see ``HolderRecordState``. Never raises."""
+    if holder is None or not holder.record_slug:
+        return HolderRecordState.UNLINKED
+    if not _is_record_key(holder.record_slug):
+        return HolderRecordState.UNREADABLE
+    try:
+        record = read_record(holder.record_slug, root=root)
+    except FileNotFoundError:
+        return HolderRecordState.ABSENT
+    except (OSError, CorruptSessionRecord):
+        return HolderRecordState.UNREADABLE
+    if record.status in TERMINAL_STATUSES:
+        return HolderRecordState.EXITED
+    return HolderRecordState.ACTIVE
 
 
 @dataclass(frozen=True)
@@ -3239,20 +3634,15 @@ class LeaseClaim:
         freshly-acquired lease.
     message: fully-formatted, user-observable line -- callers print this
         verbatim rather than re-deriving it from the other fields.
+    holder_record_state: `holder`'s registry record, via its ``record_slug``
+        (see HolderRecordState) -- a second axis beside ``holder_alive``,
+        which alone still drives ``decision``.
 
-    There is deliberately NO holder_session_state field. Task 3994 added one
-    ('live'/'exited'/'absent'/'unknown', read via
-    ``read_record(holder.session_slug)``) to corroborate the defect-4 orphan
-    signal, and withdrew it on measurement: a lease slug is not a
-    session-registry record key (see LeaseHolder.session_slug), so the field
-    was a CONSTANT 'absent' in production and the orphan predicate
-    ``not holder_alive and state in ('absent', 'exited')`` already
-    degenerated to ``not holder_alive``. A field documented as corroborating
-    evidence that never actually corroborates is worse than no field: it is
-    the false-derivation-left-in-place failure this task exists to break.
-    ``holder_alive`` alone is now the orphan signal, and it is sound because
-    resolve_session_pid records the long-lived ``claude`` pid rather than the
-    old always-dead ``$$``.
+    Task 3994 withdrew an earlier ``holder_session_state`` that read
+    ``read_record(holder.session_slug)``: a lease slug is not a record key,
+    so that field was a structural constant. This one reads
+    ``holder.record_slug``, a real record key, and spells the no-evidence
+    case UNLINKED so it cannot be mistaken for a finding.
     """
 
     name: str
@@ -3262,6 +3652,7 @@ class LeaseClaim:
     holder_alive: bool
     heartbeat_age_secs: float
     message: str
+    holder_record_state: HolderRecordState
 
 
 def _render_contention_message(
@@ -3347,7 +3738,7 @@ def _create_and_write_lease(path: Path, holder: LeaseHolder) -> None:
         os.close(fd)
 
 
-def _acquired_claim(name: str, holder: LeaseHolder) -> LeaseClaim:
+def _acquired_claim(name: str, holder: LeaseHolder, root: Path | str | None) -> LeaseClaim:
     return LeaseClaim(
         name=name,
         decision=LeaseDecision.ACQUIRED,
@@ -3356,6 +3747,7 @@ def _acquired_claim(name: str, holder: LeaseHolder) -> LeaseClaim:
         holder_alive=True,
         heartbeat_age_secs=0.0,
         message=f'lease {name} acquired by {holder.session_slug}',
+        holder_record_state=holder_record_state(holder, root=root),
     )
 
 
@@ -3420,7 +3812,7 @@ def claim_lease(
     except FileExistsError:
         pass
     else:
-        return _acquired_claim(name, holder)
+        return _acquired_claim(name, holder, root)
 
     existing_holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
     is_stale = (not holder_alive) and age_secs > LEASE_HEARTBEAT_TTL.total_seconds()
@@ -3468,7 +3860,7 @@ def claim_lease(
                 age_secs,
                 holder.session_slug,
             )
-            return _acquired_claim(name, holder)
+            return _acquired_claim(name, holder, root)
 
     decision = LeaseDecision.STAND_DOWN if policy is LeasePolicy.STAND_DOWN else LeaseDecision.PROCEED
     return LeaseClaim(
@@ -3481,6 +3873,7 @@ def claim_lease(
         message=_render_contention_message(
             existing_holder, holder_alive=holder_alive, age_secs=age_secs, policy=policy
         ),
+        holder_record_state=holder_record_state(existing_holder, root=root),
     )
 
 
@@ -3653,13 +4046,15 @@ class LeaseStatus:
         i.e. exactly claim_lease/reap_stale_leases' own staleness predicate
         (a dead holder pid AND a heartbeat strictly past LEASE_HEARTBEAT_TTL).
         A live holder is never reclaimable, however quiet it has been.
+    holder_record_slug: the body's ``record_slug``, or None when it is blank
+        or the lease is not 'held'.
+    holder_record_state: the holder's registry record (see
+        HolderRecordState) -- the record axis, independent of liveness.
 
-    There is deliberately NO holder_session field. It briefly reported the
-    holder's own session-registry state, but a lease slug is not a record key
-    (see LeaseHolder.session_slug), so it printed a constant
-    ``holder_session=absent`` that an operator could read as a positive
-    orphan finding. Withdrawn under task 3994 rather than left as a
-    plausible-looking constant.
+    Task 3994 withdrew an earlier ``holder_session`` field that printed a
+    constant ``holder_session=absent`` (a lease slug is not a record key).
+    ``holder_record_state`` reads the body's ``record_slug`` instead, and
+    spells the no-evidence case UNLINKED.
     """
 
     name: str
@@ -3670,6 +4065,8 @@ class LeaseStatus:
     heartbeat_ts: str | None
     heartbeat_age_secs: float
     reclaimable: bool
+    holder_record_slug: str | None
+    holder_record_state: HolderRecordState
 
 
 def lease_status(
@@ -3711,6 +4108,8 @@ def lease_status(
             heartbeat_ts=None,
             heartbeat_age_secs=0.0,
             reclaimable=False,
+            holder_record_slug=None,
+            holder_record_state=HolderRecordState.UNLINKED,
         )
     holder, holder_alive, age_secs = _read_lease_holder_state(path, now=now)
     return LeaseStatus(
@@ -3725,6 +4124,8 @@ def lease_status(
         # BOTH a dead pid AND an aged heartbeat. Restating it any other way
         # would re-create the two-clocks-disagreeing failure this fixes.
         reclaimable=(not holder_alive) and age_secs > LEASE_HEARTBEAT_TTL.total_seconds(),
+        holder_record_slug=(holder.record_slug or None) if holder is not None else None,
+        holder_record_state=holder_record_state(holder, root=root),
     )
 
 
@@ -3811,6 +4212,66 @@ def reap_stale_leases(
 
 
 # ---------------------------------------------------------------------------
+# Project token from cwd: the enclosing git checkout's main working tree
+# (reads git's on-disk layout, gitrepository-layout(5); never raises)
+# ---------------------------------------------------------------------------
+
+
+def _enclosing_checkout(path: Path) -> Path | None:
+    """The nearest of *path* and its ancestors holding a ``.git`` entry."""
+    for candidate in (path, *path.parents):
+        if os.path.exists(candidate / '.git'):
+            return candidate
+    return None
+
+
+def _read_git_path(pointer_file: Path, prefix: str = '') -> Path | None:
+    """The path a git pointer file (gitfile, ``commondir``) holds on its first line.
+
+    The line must start with *prefix*; a relative path is resolved against
+    the pointer file's directory and lexically normalised. Unreadable,
+    unprefixed or empty -> None.
+    """
+    try:
+        lines = pointer_file.read_text(encoding='utf-8').splitlines()
+    except (OSError, ValueError):
+        return None
+    if not lines or not lines[0].startswith(prefix):
+        return None
+    raw = lines[0][len(prefix):].strip()
+    if not raw:
+        return None
+    return Path(os.path.normpath(pointer_file.parent / raw))
+
+
+def _main_working_tree(checkout: Path) -> Path:
+    """The main working tree *checkout* belongs to.
+
+    *checkout* itself when its ``.git`` is a directory, or when its gitfile
+    does not lead to a common dir named ``.git`` (submodule, bare-backed
+    worktree, broken gitfile).
+    """
+    dotgit = checkout / '.git'
+    if os.path.isdir(dotgit):
+        return checkout
+    gitdir = _read_git_path(dotgit, prefix='gitdir:')
+    common_dir = _read_git_path(gitdir / 'commondir') if gitdir is not None else None
+    if common_dir is not None and common_dir.name == '.git':
+        return common_dir.parent
+    return checkout
+
+
+def _cwd_project_token(cwd: str) -> str:
+    """``parse_spawn_identity``'s default project -- see its step 3."""
+    checkout = _enclosing_checkout(Path(cwd)) if os.path.isabs(cwd) else None
+    if checkout is not None:
+        name = _main_working_tree(checkout).name
+        if name:
+            return name
+    return os.path.basename(cwd.rstrip('/')) or 'unknown'
+
+
+# ---------------------------------------------------------------------------
 # CLI + fail-soft (PRD: a registry fault must never change the spawn's exit code)
 # ---------------------------------------------------------------------------
 
@@ -3844,9 +4305,12 @@ def parse_spawn_identity(
        ``'<role>:<project>#<task-id> <short-slug>'`` (skills/spawn/SKILL.md).
        The trailing short-slug is always discarded; a project-level title
        (no ``#``) yields ``task_id=None``.
-    3. Defaults: ``role='session'``, ``project=basename(cwd.rstrip('/'))`` or
-       ``'unknown'`` (a trailing ``'/'`` is stripped first so it doesn't
-       degrade the basename to empty).
+    3. Defaults: ``role='session'``; ``project`` is the basename of the
+       enclosing git checkout's MAIN working tree (a linked worktree resolves
+       through its gitfile's ``gitdir`` and ``commondir`` to the checkout it
+       belongs to), else ``basename(cwd.rstrip('/'))`` or ``'unknown'``. A
+       relative *cwd* is not resolved against the process cwd. The token is
+       written raw (unfolded); the cockpit folds at its read boundary.
 
     *prompt* takes no part in this resolution; it is accepted so callers have
     one function for the whole spawn-identity cascade.
@@ -3867,7 +4331,7 @@ def parse_spawn_identity(
     if role is None:
         role = 'session'
     if project is None:
-        project = os.path.basename(cwd.rstrip('/')) or 'unknown'
+        project = _cwd_project_token(cwd)
 
     return SpawnIdentity(role=role, project=project, task_id=task_id, escalation_id=escalation_id)
 
@@ -3906,6 +4370,10 @@ def _run_launching(env: Mapping[str, str]) -> str:
     The bounded prune (``limit=REAP_BATCH_LIMIT``) caps its own scan/rmtree
     cost per call regardless of backlog size; the CLI ``reap`` verb
     (``_run_reap``) remains the operator's unbounded full-drain path.
+
+    Last, ``reap_stale_session_pointers`` drops dead-pid and dangling pid
+    pointers, under the same per-sweep guard; spawns are its only regular
+    driver.
     """
     title = env.get('CLAUDE_SPAWN_TITLE', '') or ''
     prompt = env.get('CLAUDE_SPAWN_PROMPT', '') or ''
@@ -3939,6 +4407,8 @@ def _run_launching(env: Mapping[str, str]) -> str:
         mark_windowless_wm_sessions_exited()
     with contextlib.suppress(Exception):
         reap_stale_records(limit=REAP_BATCH_LIMIT)
+    with contextlib.suppress(Exception):
+        reap_stale_session_pointers()
     return str(record_dir)
 
 
@@ -3995,13 +4465,21 @@ def _run_reap() -> list[ReapedSessionRecord]:
     it reaps exactly the live-pid / age<1h wm-display zombies (a closed
     terminal window with a still-alive launcher_pid) the pid/TTL sweep is
     forced to keep, so `reap` must drive both before deleting.
+
+    ``reap_stale_session_pointers`` runs after the deletion so pointers to
+    records removed in this same pass go too; the return value still lists
+    only the removed record dirs.
     """
     mark_orphaned_sessions_exited()
     mark_windowless_wm_sessions_exited()
-    return reap_stale_records()
+    reaped = reap_stale_records()
+    reap_stale_session_pointers()
+    return reaped
 
 
-def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -> None:
+def _run_lease_claim(
+    name: str, slug: str, pid: int | None, policy_value: str, *, record_slug: str = ''
+) -> None:
     """Run the ``lease-claim`` verb: ALWAYS prints a ``decision=<value>`` line + message.
 
     *pid* is the claimant's long-lived session pid. Resolving it in code
@@ -4016,6 +4494,8 @@ def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -
     therefore a defensive path for a DIRECT caller (a test, a future in-process
     caller), not the CLI's route -- and it stays, so this function remains
     correct standalone rather than depending on a caller it cannot see.
+    *record_slug* likewise arrives resolved from ``main()``, from that same
+    pid; it is never resolved here, so the fallback path records ''.
 
     This carries its OWN fail-open guard, independent of main()'s outer
     try/except: a fault raised by claim_lease itself (a corrupt lease body,
@@ -4028,7 +4508,12 @@ def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -
     try:
         if pid is None:
             pid = resolve_session_pid()
-        holder = LeaseHolder(session_slug=slug, pid=pid, start_ts=datetime.now(UTC).isoformat())
+        holder = LeaseHolder(
+            session_slug=slug,
+            pid=pid,
+            start_ts=datetime.now(UTC).isoformat(),
+            record_slug=record_slug,
+        )
         claim = claim_lease(name, holder=holder, policy=LeasePolicy(policy_value))
     except Exception:
         logger.error('lease-claim %s failed', name, exc_info=True)
@@ -4073,9 +4558,19 @@ def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -
     # breaking a reader. The line is absent only on the fail-open path above,
     # where a substrate fault means we genuinely know nothing about a holder
     # and must not assert one either way.
+    #
+    # `holder_record=` (task 4237), last of all, is a SECOND, INDEPENDENT orphan
+    # axis: the holder's registry record, per HolderRecordState -- the
+    # claimant's own on an acquired claim, the existing holder's on a contended
+    # one. It deliberately does not change the `orphaned` predicate below: every
+    # lease claimed before LeaseHolder.record_slug existed reads `unlinked`, so
+    # requiring corroboration would silence today's orphan signal for that whole
+    # population. Reading the two lines together is the skills' job; collapsing
+    # them into one verdict is what task 3994 defect 3 forbade.
     if claim.acquired:
         print('holder_liveness=none')
         print(f'slug={slug}')
+        print(f'holder_record={claim.holder_record_state.value}')
         return
     # A SINGLE signal, deliberately: `orphaned` means exactly "the pid
     # recorded in the lease body is not running". This predicate used to
@@ -4105,6 +4600,7 @@ def _run_lease_claim(name: str, slug: str, pid: int | None, policy_value: str) -
     print(f'holder_liveness={"orphaned" if orphaned else "held"}')
     # THIS CALLER's slug, never the holder's -- see the block comment above.
     print(f'slug={slug}')
+    print(f'holder_record={claim.holder_record_state.value}')
 
 
 def _run_lease_mutation(
@@ -4180,6 +4676,8 @@ def _run_lease_show(name: str) -> None:
     printed only when the body actually parsed, so an unreadable body reads
     as unreadable rather than as a holder named ``<unknown>``. Booleans are
     rendered lowercase (``true``/``false``) so a shell test is trivial.
+    ``holder_record=`` and ``holder_record_slug=`` are ADDITIVE and LAST,
+    the convention ``_run_lease_claim`` states.
 
     Read-only and fail-soft, like lease_status itself: it never mutates the
     lease and never raises.
@@ -4197,14 +4695,59 @@ def _run_lease_show(name: str) -> None:
     print(f'heartbeat_ts={status.heartbeat_ts}')
     print(f'heartbeat_age_secs={int(status.heartbeat_age_secs)}')
     print(f'reclaimable={str(status.reclaimable).lower()}')
+    print(f'holder_record={status.holder_record_state.value}')
+    if status.holder_record_slug is not None:
+        print(f'holder_record_slug={status.holder_record_slug}')
 
 
 def _run_lease_reap() -> list[ReapedLease]:
     return reap_stale_leases()
 
 
+def _read_decision_or_none(decision_id: str) -> DecisionRecord | None:
+    """The record at *decision_id*, or None when it is absent, unreadable or corrupt."""
+    try:
+        return DecisionRecord.from_json(decision_path_for_id(decision_id).read_text())
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
+@contextlib.contextmanager
+def _locked_filing_target(
+    canonical_project: str, local_id: str
+) -> Iterator[tuple[str, DecisionRecord | None]]:
+    """Lock and read the record a write-decision filing of *local_id* lands on.
+
+    That is the project-qualified id, unless only a bare-keyed record filed
+    before task 4835 exists at *local_id* for the SAME project: the filing
+    then continues that record in place, keeping its custody and any
+    held-closed state. Migration is lazy and ids are never rewritten, as in
+    migrate_decision_project_tokens. Locks go qualified-then-legacy, and the
+    legacy one only when its file exists, so a fresh filing leaves no orphan
+    sidecar. See plans/4835-decision-plumbing-decisions.md.
+    """
+    qualified = qualify_decision_id(canonical_project, local_id)
+    with decision_id_lock(qualified):
+        if (
+            local_id != qualified
+            and not decision_path_for_id(qualified).exists()
+            and decision_path_for_id(local_id).exists()
+        ):
+            with decision_id_lock(local_id):
+                legacy = _read_decision_or_none(local_id)
+                if (
+                    legacy is not None
+                    and normalize_project_token(legacy.project) == canonical_project
+                ):
+                    yield local_id, legacy
+                else:
+                    yield qualified, None
+            return
+        yield qualified, _read_decision_or_none(qualified)
+
+
 def _run_write_decision(
-    decision_id: str,
+    local_id: str,
     project: str,
     text: str,
     task_id: str | None,
@@ -4212,6 +4755,8 @@ def _run_write_decision(
     session_id: str | None,
     severity: str = '',
     escalations_dir: str = '',
+    *,
+    record_slug: str = '',
 ) -> None:
     """Run the ``write-decision`` verb (Fleet Cockpit C8: park-to-registry).
 
@@ -4228,6 +4773,11 @@ def _run_write_decision(
     weight this ask (Fleet Cockpit F7 fix 1); defaults to '' when the
     caller doesn't supply one.
 
+    ``record_slug`` is best-effort enrichment derived from ``$CLAUDE_PID``'s
+    pid pointer (resolve_own_record_slug), never typed by the caller and
+    never a reason to refuse or delay a filing: an unresolvable one is filed
+    as '' and is visible downstream as an unresolved link.
+
     ``project`` is stored NORMALIZED (see normalize_project_token, task
     3807), so ``df``, ``dark-factory`` and ``Dark_Factory`` all persist as
     the one canonical ``dark_factory`` and ``reap-decisions`` can no longer
@@ -4242,11 +4792,12 @@ def _run_write_decision(
     into an availability dependency. A rewrite is logged at WARNING so it
     stays LOUD rather than silent.
 
-    NOTE that ``decision_id`` is untouched by that normalization: the ``df-``
-    prefix on an id like ``df-esc-3524-1`` is part of ``--id``, which the
-    caller types, and is never derived from or rewritten because of
-    ``--project``. Conflating the two is how the three-way project split
-    arose.
+    ``local_id`` (``--id``) is project-LOCAL (task 4835): the record is
+    filed under ``qualify_decision_id(canonical project, local_id)``, so the
+    same escalation id in two projects lands on two rows, while both queues
+    of ONE project still share a row (the MODE-2 collapse below). A
+    same-project record filed before then under the bare id is continued in
+    place (_locked_filing_target), and the printed id is the one landed on.
 
     ``escalations_dir`` names the escalation QUEUE *escalation_id* belongs
     to, and is stored NORMALIZED (see normalize_escalations_dir). A watcher
@@ -4273,13 +4824,15 @@ def _run_write_decision(
     UPSERT, NOT A BLIND OVERWRITE (task 3559). Against an existing record at
     the same id, three cases are told apart:
 
-    - DIFFERENT project -- an id COLLISION, not one gate seen twice, since
-      DecisionRecords are fleet-global while ``esc-<taskid>-<n>`` task
-      numbering restarts per project. REFUSED (loud, fail-soft, nothing
-      written): merging would hide this ask inside the other project's row
-      and overwriting would delete that row. Scoped to an OPEN incumbent --
-      a closed row in another project is a question already dealt with, so a
-      filing there starts a new ask.
+    - DIFFERENT project -- an id COLLISION, not one gate seen twice. Since
+      task 4835 qualifies the id by project, this is reachable only when the
+      qualified id is itself held by another project's record: a legacy
+      hand-prefixed id such as the live ``recon-esc-7459-1`` held by project
+      reify. REFUSED (loud, fail-soft, nothing written): merging would hide
+      this ask inside the other project's row and overwriting would delete
+      that row. Scoped to an OPEN incumbent -- a closed row in another
+      project is a question already dealt with, so a filing there starts a
+      new ask.
     - DIFFERENT queue stamp -- the second watcher observing the same human
       gate through another queue (the observed esc-5914-1 MODE-2 shape), so
       the filing is folded in via merge_decision_enrichment rather than
@@ -4356,7 +4909,7 @@ def _run_write_decision(
             'normalized to nothing. A DecisionRecord is fleet-global but an '
             'esc-<taskid>-<n> id is unique only within one queue, so a queue-less '
             'record is cross-queue-ambiguous. Pass the SAME queue dir you reap with.',
-            decision_id,
+            local_id,
         )
         return
     if stamp == UNKNOWN_QUEUE:
@@ -4366,7 +4919,7 @@ def _run_write_decision(
             'reaper will ever close a decision stamped with it -- only a human could. '
             'A watcher knows its own queue by construction; pass the real queue dir '
             'you also reap with.',
-            decision_id,
+            local_id,
             UNKNOWN_QUEUE,
         )
         return
@@ -4390,18 +4943,6 @@ def _run_write_decision(
     if declined_hint is not None:
         logger.warning('write-decision: %s', declined_hint)
 
-    incoming = DecisionRecord(
-        id=decision_id,
-        project=canonical_project,
-        text=text,
-        filed_at=datetime.now(UTC).isoformat(),
-        task_id=task_id,
-        escalation_id=escalation_id,
-        session_id=session_id,
-        severity=severity,
-        escalations_dir=stamp,
-    )
-
     # WHY THIS IS NOT ROUTED THROUGH _mutate_decision, despite sharing its
     # read-modify-write shape: _mutate_decision is a STRICT read-modify-write
     # -- it does DecisionRecord.from_json(path.read_text()) and fail-softs to
@@ -4420,27 +4961,31 @@ def _run_write_decision(
     # decision_id_lock's own docstring), and INSIDE the try/except so a
     # lock-acquisition fault is absorbed rather than raised at a watcher.
     try:
-        with decision_id_lock(decision_id):
+        with _locked_filing_target(canonical_project, local_id) as (decision_id, existing):
+            incoming = DecisionRecord(
+                id=decision_id,
+                project=canonical_project,
+                text=text,
+                filed_at=datetime.now(UTC).isoformat(),
+                task_id=task_id,
+                escalation_id=escalation_id,
+                session_id=session_id,
+                severity=severity,
+                escalations_dir=stamp,
+                record_slug=record_slug,
+            )
             record = incoming
-            try:
-                existing = DecisionRecord.from_json(
-                    decision_path_for_id(decision_id).read_text()
-                )
-            except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-                # Absent (the common first-filing case), unreadable, or
-                # corrupt: all fall through to writing fresh.
-                existing = None
             if existing is not None:
                 if normalize_project_token(existing.project) != canonical_project:
                     # SAME id, DIFFERENT project: an id COLLISION, not a
-                    # MODE-2 collapse. Both SKILL.md files tell a watcher to
-                    # use the escalation id as the decision id, and
-                    # esc-<taskid>-<n> task numbering RESTARTS per project,
-                    # so 'esc-42-1' in dark_factory and 'esc-42-1' in reify
-                    # are two unrelated gates. Two projects also always have
-                    # different queue dirs, so without this guard every such
-                    # collision lands in the enrichment branch below and gets
-                    # folded into the OTHER project's row -- one cockpit row
+                    # MODE-2 collapse. The id is project-qualified (task
+                    # 4835), so this is reachable only when the qualified id
+                    # is held by a LEGACY hand-prefixed record of another
+                    # project (the live 'recon-esc-7459-1' held by reify is
+                    # the shape). Two projects also always have different
+                    # queue dirs, so without this guard such a collision
+                    # lands in the enrichment branch below and gets folded
+                    # into the OTHER project's row -- one cockpit row
                     # claiming to be project A's ask while B's human gate is
                     # invisible and unreapable by B's reaper.
                     #
@@ -4474,17 +5019,16 @@ def _run_write_decision(
                     if existing.state == DecisionState.OPEN:
                         logger.error(
                             'write-decision refusing to file %s for project %s: an OPEN '
-                            'decision already exists at that id for a DIFFERENT project '
-                            '(%s). DecisionRecords are fleet-global while '
-                            'esc-<taskid>-<n> ids restart per project, so this is an id '
+                            'decision already exists at that project-qualified id for a '
+                            'DIFFERENT project (%s) -- a legacy hand-prefixed id filed '
+                            'before ids were qualified by project. This is an id '
                             'COLLISION, not a MODE-2 cross-queue collapse of one human '
                             'gate -- merging would hide this ask inside the other '
                             'project\'s cockpit row and overwriting would delete that '
                             'row, so neither is safe. The existing row is left intact '
                             'and THIS ask did not reach the cockpit; it is still '
                             'carried by the in-session note / afk-digest line this '
-                            'filing accompanies. Re-file it under an id that is unique '
-                            'fleet-wide.',
+                            'filing accompanies. Re-file it under a different --id.',
                             decision_id,
                             project,
                             existing.project,
@@ -4537,18 +5081,20 @@ def _run_write_decision(
                             'already answered or dropped, not a new ask. Your text, '
                             'severity and ids DID land, but the row stays CLOSED and '
                             'will NOT reappear in the cockpit decision queue, which '
-                            'shows only state=open rows. Re-opening it would make an '
-                            'operator\'s cockpit disposition impossible to ever make '
-                            'stick, since a watcher re-files its stable id on every '
+                            'shows only state=open rows. Re-opening it on a re-file would '
+                            'make an operator\'s cockpit disposition impossible to ever '
+                            'make stick, since a watcher re-files its stable id on every '
                             'restart while an item stays parked. ADJUDICATE this rather '
-                            'than re-filing blindly: if the gate is genuinely a NEW ask, '
-                            'file it under a NEW id -- that is the remedy with a shipped '
-                            'surface, since re-opening this row in place currently needs '
-                            'a direct registry write (the cockpit decision pane offers a '
-                            'drop action but no re-open, and there is no '
-                            'update-decision-state CLI verb).',
+                            'than re-filing blindly: if this SAME gate genuinely needs a '
+                            'human again, re-open the row in place with '
+                            '`session_registry.py reopen-decision --id %s --project %s '
+                            '--escalations-dir %s`; file under a NEW id only for a '
+                            'genuinely DIFFERENT ask.',
                             decision_id,
                             str(existing.state),
+                            stamp,
+                            decision_id,
+                            canonical_project,
                             stamp,
                         )
                 elif existing.state == DecisionState.OPEN:
@@ -4568,10 +5114,15 @@ def _run_write_decision(
             if write_decision(record):
                 print(record.id)
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
-        logger.error('write-decision: failed to file %s', decision_id, exc_info=True)
+        logger.error(
+            'write-decision: failed to file %s for project %s',
+            local_id,
+            canonical_project,
+            exc_info=True,
+        )
 
 
-def _run_reap_decisions(project: str, escalations_dir: str) -> None:
+def _run_reap_decisions(project: str, escalations_dir: str, *, expect_matches: bool = False) -> None:
     """Run the ``reap-decisions`` verb (Fleet Cockpit C8: close-on-resolve driver).
 
     Builds the production ``escalation_status`` closure for
@@ -4600,8 +5151,14 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
        A ``--project`` naming a DECLINED alias target now WARNS (task 3813,
        see PROJECT_TOKEN_ALIASES_DECLINED), so an operator passing a
        config-declared token that matches zero rows learns it immediately
-       instead of reading a silent no-op as "nothing to reap". Advisory
-       only: it does not change the axis, the scoping, or what gets closed.
+       instead of reading a silent no-op as "nothing to reap". The general
+       case is opt-in: with *expect_matches* (``--expect-matches``, task
+       4835) a token no registry record carries in ANY state warns and
+       names the tokens that do. It is not always on because by count alone
+       a never-filed project cannot be told apart from a mismatched one, and
+       a watcher reaps every Main Loop cycle. Both are advisory, one line
+       per invocation (_reap_scope_hint): neither changes the axis, the
+       scoping, or what gets closed.
     2. QUEUE (task 3528). An escalation id (``esc-<taskid>-<n>``) is unique
        only WITHIN one queue, and a project can run several: dark_factory
        runs ``data/escalations`` (orchestrator) and
@@ -4656,16 +5213,14 @@ def _run_reap_decisions(project: str, escalations_dir: str) -> None:
     reaper_dir = normalize_escalations_dir(escalations_dir)
     reaper_project = normalize_project_token(project)
 
-    # Advisory only (task 3813). Deliberately OUTSIDE _status, so it fires
-    # ONCE per invocation rather than once per record scanned -- a watcher
-    # runs this every Main Loop cycle and a per-record line would flood its
-    # log. It must not touch reaper_project, neither scoping axis, nor what
-    # gets closed: both guards below stay fail-OPEN exactly as documented.
-    # action='reap': this path really is MATCHING, so the zero-row-no-op
-    # consequence is the true one here (contrast _run_write_decision).
-    declined_hint = declined_project_token_hint(reaper_project, action='reap')
-    if declined_hint is not None:
-        logger.warning('reap-decisions: %s', declined_hint)
+    # Advisory only (tasks 3813, 4835). Deliberately OUTSIDE _status, so it
+    # fires ONCE per invocation rather than once per record scanned -- a
+    # watcher runs this every Main Loop cycle and a per-record line would
+    # flood its log. It must not touch reaper_project, neither scoping axis,
+    # nor what gets closed: both guards below stay fail-OPEN as documented.
+    scope_hint = _reap_scope_hint(reaper_project, expect_matches=expect_matches)
+    if scope_hint is not None:
+        logger.warning('reap-decisions: %s', scope_hint)
 
     def _status(decision: DecisionRecord) -> str | None:
         # Axis 1: normalize the decision's OWN stored token at compare time
@@ -4716,7 +5271,7 @@ def _run_close_decision(
     expected_project: str,
     expected_escalations_dir: str,
 ) -> int:
-    """Run the ``close-decision`` verb; the one decision verb whose failure is a non-zero exit.
+    """Run the ``close-decision`` verb, whose failure, like ``reopen-decision``'s, is a non-zero exit.
 
     Its caller is an agent executing a pre-built apply payload
     (``scripts/sitting/payloads.py::close_decision_argv``), not
@@ -4742,6 +5297,62 @@ def _run_close_decision(
     return 0
 
 
+def _run_reopen_decision(
+    decision_id: str,
+    root: str | None,
+    *,
+    expected_project: str,
+    expected_escalations_dir: str,
+) -> int:
+    """Run the ``reopen-decision`` verb; like close-decision, a refusal or an unreadable record exits non-zero.
+
+    Its caller is a human or agent adjudicating a held-closed row, who must
+    see a refusal rather than read it as success. Prints the record's id on
+    success, plus a stderr WARNING when the linked escalation is already
+    terminal in the stamped queue: the next reap-decisions cycle then closes
+    the row again, so the reopen alone cannot keep it open.
+    """
+    try:
+        record = reopen_decision(
+            decision_id,
+            root=root,
+            expected_project=expected_project,
+            expected_escalations_dir=expected_escalations_dir,
+        )
+    except DecisionReopenRefused as exc:
+        print(f'reopen-decision refused: {exc}', file=sys.stderr)
+        return 1
+    if record is None:
+        print(f'reopen-decision: {decision_id} has no readable record to reopen (see the ERROR log)', file=sys.stderr)
+        return 1
+    print(record.id)
+    closing_status = _reapable_escalation_status(record)
+    if closing_status is not None:
+        print(
+            f'reopen-decision: WARNING {record.id} is open again, but its escalation '
+            f'{record.escalation_id} is already {closing_status!r} in {record.escalations_dir}, so the '
+            'next reap-decisions cycle closes it again. A gate that needs a human again needs a new '
+            'escalation, filed under its own --id.',
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _reapable_escalation_status(record: DecisionRecord) -> str | None:
+    """The terminal status the reaper would close *record* on, read from its stamped queue; else None.
+
+    The reaper's own join (_run_reap_decisions._status) for a record whose
+    queue is known. None when the record has no escalation id, is unstamped
+    or stamped UNKNOWN_QUEUE (no reaper can be named), or its escalation is
+    not in DECISION_CLOSE_MAP.
+    """
+    queue = normalize_escalations_dir(record.escalations_dir)
+    if not record.escalation_id or queue in ('', UNKNOWN_QUEUE):
+        return None
+    status = read_escalation_status(queue, record.escalation_id)
+    return status if status in DECISION_CLOSE_MAP else None
+
+
 def _run_migrate_decision_projects(dry_run: bool) -> None:
     """Run the ``migrate-decision-projects`` verb (task 3807).
 
@@ -4763,6 +5374,27 @@ def _run_migrate_decision_projects(dry_run: bool) -> None:
     """
     for migrated in migrate_decision_project_tokens(dry_run=dry_run):
         print(f'{migrated.id} {migrated.old_project} -> {migrated.new_project}')
+
+
+def _add_record_identity_args(verb_parser: argparse.ArgumentParser) -> None:
+    """The compare-and-swap expectations close-decision and reopen-decision name a record by."""
+    verb_parser.add_argument(
+        '--project',
+        required=True,
+        help=(
+            "compare-and-swap expectation of the record's CURRENT project, not a stamp "
+            "like write-decision's: a record at --id whose folded project differs is refused"
+        ),
+    )
+    verb_parser.add_argument(
+        '--escalations-dir',
+        required=True,
+        help=(
+            "compare-and-swap expectation of the record's CURRENT queue stamp, not a stamp "
+            "like write-decision's, so '' is a legal expectation for a legacy unstamped record; "
+            'a record at --id whose normalized stamp differs is refused'
+        ),
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -4868,7 +5500,14 @@ def _build_parser() -> argparse.ArgumentParser:
         'write-decision',
         help='file an OPEN DecisionRecord (Fleet Cockpit C8: park-to-registry)',
     )
-    write_decision_p.add_argument('--id', required=True, help="this decision's id")
+    write_decision_p.add_argument(
+        '--id',
+        required=True,
+        help=(
+            "this decision's id LOCAL to --project (usually the escalation id); "
+            'filed fleet-unique as <project>-<id>, which is printed'
+        ),
+    )
     write_decision_p.add_argument(
         '--project',
         required=True,
@@ -4907,24 +5546,18 @@ def _build_parser() -> argparse.ArgumentParser:
     close_decision_p.add_argument('--id', required=True, help="the decision's id")
     close_decision_p.add_argument('--state', required=True, help='answered or dropped')
     close_decision_p.add_argument('--evidence', required=True, help='the deciding evidence, verbatim')
-    close_decision_p.add_argument(
-        '--project',
-        required=True,
-        help=(
-            "compare-and-swap expectation of the record's CURRENT project, not a stamp "
-            "like write-decision's: a record at --id whose folded project differs is refused"
-        ),
-    )
-    close_decision_p.add_argument(
-        '--escalations-dir',
-        required=True,
-        help=(
-            "compare-and-swap expectation of the record's CURRENT queue stamp, not a stamp "
-            "like write-decision's, so '' is a legal expectation for a legacy unstamped record; "
-            'a record at --id whose normalized stamp differs is refused'
-        ),
-    )
+    _add_record_identity_args(close_decision_p)
     close_decision_p.add_argument('--root', default=None, help='fleet root (default: fleet_root())')
+
+    reopen_decision_p = sub.add_parser(
+        'reopen-decision',
+        help='re-open a closed decision in place, clearing its closing evidence (task 4835)',
+    )
+    reopen_decision_p.add_argument(
+        '--id', required=True, help='the record id as stored/printed by write-decision'
+    )
+    _add_record_identity_args(reopen_decision_p)
+    reopen_decision_p.add_argument('--root', default=None, help='fleet root (default: fleet_root())')
 
     # NOTE: --escalations-dir is required on BOTH halves of the file/reap
     # pair. reap-decisions has always required it; write-decision joined it
@@ -4944,6 +5577,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     reap_decisions_p.add_argument('--escalations-dir', required=True)
+    reap_decisions_p.add_argument(
+        '--expect-matches',
+        action='store_true',
+        help=(
+            'opt-in: warn when no registry record, in any state, carries the folded '
+            '--project token, naming the tokens that do; for diagnosis and manual runs, '
+            'not the per-cycle Main Loop reap'
+        ),
+    )
 
     migrate_projects_p = sub.add_parser(
         'migrate-decision-projects',
@@ -4978,8 +5620,9 @@ def main(argv: list[str] | None = None) -> int:
     distinguish from a supplied one) stays fail-soft: ERROR log, nothing
     written, nothing printed, rc 0.
 
-    ``close-decision`` is the one exception, and it is dispatched before the
-    swallowing try/except: see _run_close_decision for why its refusals exit
+    ``close-decision`` and ``reopen-decision`` are the two exceptions, and
+    they are dispatched before the swallowing try/except: see
+    _run_close_decision and _run_reopen_decision for why their refusals exit
     non-zero.
     """
     parser = _build_parser()
@@ -5008,6 +5651,9 @@ def main(argv: list[str] | None = None) -> int:
     # overrides the BODY's liveness pid only, deliberately, and never the slug
     # -- the identity has to stay derivable by the mutating verbs, which have no
     # --pid at all (see that flag's help, and the parser.error below).
+    # The body pid has a third consumer: the holder's `record_slug` is read from
+    # THAT pid's pointer, so the record's claude_owner_pid cross-checks the very
+    # pid the body records -- with no second resolution and no WARNING.
     #
     # Resolution is DEMAND-DRIVEN: an explicit --slug on a mutating verb needs
     # no pid at all (those verbs never write one), and resolving anyway would
@@ -5052,12 +5698,23 @@ def main(argv: list[str] | None = None) -> int:
                 'pid, not this session\'s identity, and lease-heartbeat/lease-release have no '
                 '--pid at all -- only --slug is honoured by all three verbs.'
             )
+        if args.verb == 'lease-claim':
+            args.record_slug = ''
+            if args.pid is not None:
+                args.record_slug = resolve_session_slug_for_pid(args.pid) or ''
 
     if args.verb == 'close-decision':
         return _run_close_decision(
             args.id,
             args.state,
             args.evidence,
+            args.root,
+            expected_project=args.project,
+            expected_escalations_dir=args.escalations_dir,
+        )
+    if args.verb == 'reopen-decision':
+        return _run_reopen_decision(
+            args.id,
             args.root,
             expected_project=args.project,
             expected_escalations_dir=args.escalations_dir,
@@ -5075,7 +5732,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.verb == 'reap':
             _run_reap()
         elif args.verb == 'lease-claim':
-            _run_lease_claim(args.name, args.slug, args.pid, args.policy)
+            _run_lease_claim(
+                args.name, args.slug, args.pid, args.policy, record_slug=args.record_slug
+            )
         elif args.verb == 'lease-heartbeat':
             _run_lease_heartbeat(args.name, args.slug, args.force)
         elif args.verb == 'lease-release':
@@ -5094,9 +5753,12 @@ def main(argv: list[str] | None = None) -> int:
                 args.session_id,
                 args.severity,
                 args.escalations_dir,
+                record_slug=resolve_own_record_slug() or '',
             )
         elif args.verb == 'reap-decisions':
-            _run_reap_decisions(args.project, args.escalations_dir)
+            _run_reap_decisions(
+                args.project, args.escalations_dir, expect_matches=args.expect_matches
+            )
         elif args.verb == 'migrate-decision-projects':
             _run_migrate_decision_projects(args.dry_run)
     except Exception:

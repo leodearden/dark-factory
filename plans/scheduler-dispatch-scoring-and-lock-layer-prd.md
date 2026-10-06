@@ -376,7 +376,7 @@ watchdog.
 
 | class | example | auto-pin? |
 |---|---|---|
-| never top-scored | 3534 — rank 32/294, zero skips, four days undispatched | **yes**, this is what the pin is for |
+| never top-scored | 3534 — rank 32/294, zero skips, four days undispatched | **yes**, this is what the pin is for. Since task 6040 a pin that is lock-blocked also earns a pin reservation |
 | parked behind a live holder | 3248 — 16h parked, 9 of 10 modules free, one held by 3455 | **no**, provably inert |
 
 The second row is measured, not argued: during the 2026-08-06/07 outage
@@ -519,6 +519,15 @@ Each row faces **both** sides of a seam. Rows 1–3 face the fused-memory ↔ or
 | **Lexicographic CPM buckets (S3)** | `floor(log2(1+D))` lets 3585 (D=1, age 211) displace 3090 (D=0, age **706**) on a bucket boundary. Within-tier starvation exposure rises to 706, the worst of any variant, and aging is structurally defeated — the same failure class as today's saturation with the polarity flipped. |
 | **Flat continuity credit ≥ cpm max** | Inverts the fix: 115/291 candidates carry prior-dispatch history, and 3534 drops to rank 35–40, worse than baseline. |
 | **Detecting continuity from dispatch-event history** | The events DB has both false positives (orphan releases, 3563-class stuck locks) and false negatives (173/294 candidates have no events at all, ever). |
+
+**Annotation (task 6040) on the "Below-rank-1 park INSTALLATION" row.** Task 6040
+adds a BOUNDED exception to that row. It is not a reversal: only the head eligible
+lock-blocked pin(s) reserve, capped by `pin_reservation_max_active` (default 1). That
+is the EASY-backfill head reservation, and it avoids each harm measured above. A single
+operator-chosen reservation cannot gridlock with itself, its idle cost is one task's
+footprint, and C7 backfill borrows through it exactly as through a fairness park. It
+never preempts a held lock, so the preemption row above stands unchanged. See
+`orchestrator/src/orchestrator/pin_reservation.py`.
 
 ## 8. Pre-conditions and substrate verification (G3)
 

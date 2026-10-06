@@ -6,6 +6,16 @@ from typing import Literal
 
 from shared.prompt_artifact import PromptSpec
 
+from orchestrator.agents.bash_cwd_guidance import BASH_CWD_ANCHOR_GUIDANCE
+from orchestrator.agents.chained_command_guidance import CHAINED_COMMAND_STATUS_GUIDANCE
+from orchestrator.agents.code_quality import guidance
+from orchestrator.agents.file_lookup_guidance import FILE_LOOKUP_GUIDANCE
+from orchestrator.agents.grep_pattern_guidance import GREP_PATTERN_ESCAPING_GUIDANCE
+from orchestrator.agents.partial_failure_guidance import MULTI_PATH_PARTIAL_FAILURE_GUIDANCE
+from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
+from orchestrator.agents.pkill_guidance import PKILL_SELF_MATCH_GUIDANCE
+from orchestrator.agents.python_literal_guidance import PASTED_TEXT_PYTHON_LITERAL_GUIDANCE
+
 # Maps each MCP-family name to the allowed_tools prefixes that "belong" to
 # it.  Used by AgentRole.__post_init__ (below) to enforce that wiring a tool
 # family is a property OF THE ROLE, not a decision made elsewhere by
@@ -303,6 +313,72 @@ _PLAN_STATUS_TOOLS = [
     'mcp__plan-tools__mark_step_done',
 ]
 
+# The writer-facing metadata vocabulary spliced onto the tail of
+# _MEMORY_INSTRUCTIONS (task 3202, PRD docs/prds/memory-metadata-vocabulary.md
+# leaf iota).  Before it, the word `metadata` did not appear anywhere in the
+# memory block: every role told to write memories was told nothing about the
+# reserved keys the writer path actually validates.
+#
+# POINTER, NOT A SECOND COPY (INV-5).  The single normative home of the
+# vocabulary is `fused-memory/src/fused_memory/memory_metadata.py` (leaf beta,
+# task 3195) -- RESERVED_VOCABULARY_KEYS, KIND_REGISTRY, TOPIC_SLUG_RE,
+# TOPIC_SLUG_MAX_LEN, BLESSED_METADATA_KEYS, EXPERIMENTAL_KEY_PREFIX.  The prose
+# below summarises those for a writer; it must never enumerate a registry
+# COLLECTION (the 336 kinds, the blessed key set) -- name the shape and point at
+# the module instead.  The drift pin that fails when the two sides disagree
+# lives in `fused-memory/tests/test_metadata_vocabulary_prompt_pinning.py` (that
+# suite has BOTH packages on its pythonpath, so the guard is a hard import there
+# rather than a silently-skipped no-op).  That pin is registry-DERIVED only: it
+# asserts the reserved keys reach this text and each memory role's rendered
+# prompt, and never pins wording, so reflowing the prose below stays green.
+#
+# THE ONE SCALAR THIS TEXT DOES QUOTE is the topic-slug length cap, because a
+# writer cannot obey a cap it is not told (review, task 3202).  The orchestrator
+# package cannot import `fused_memory` -- there is no dependency edge -- so the
+# value cannot be interpolated here; instead the drift pin carries a
+# value-RESOLUTION assertion (`str(TOPIC_SLUG_MAX_LEN)` must appear in this
+# text), which goes red if the registry raises the cap and this prose is left
+# behind, while staying green under any reflow.  Any future scalar quoted here
+# must acquire the same kind of assertion.
+#
+# SEQUENCING SEAM -- task 3131 (dep-gated behind 3169) inverts the
+# write-eagerness guidance in the PRECEDING block ("Write when you discover..."
+# / "Write immediately..."). The two edits are different sentences at the same
+# site and must NOT be merged: 3131 rewrites what comes before, 3202 only
+# appends this section at the end.  This is a CONVENTION recorded here, not a
+# test assertion: an `endswith` pin was removed in review (task 3202) because it
+# failed correct refactors while catching no functional regression.  Keep 3131's
+# rewrite confined to the preceding block and this section additive at the end.
+#
+# Plain text, NO literal `{`/`}` braces -- same reason as
+# MANDATED_STAGING_COMMAND and BACKGROUND_TASK_WARNING below: role prompts are
+# plain `+` concatenation precisely because they carry literal braces, and
+# staying brace-free keeps this section safe if a future splice site ever
+# interpolates it.
+METADATA_VOCABULARY_INSTRUCTIONS = """
+### Memory metadata vocabulary
+
+`add_memory` also takes an optional `metadata` dict. Five keys are RESERVED and
+validated on write:
+
+- `topic` — kebab-case slug naming the subject an entry is about, 100 characters at most: `memory-write-path` is a valid slug, `Memory Write Path` is not; set it whenever other entries cover the same subject, so they group.
+- `canonical` — bool marking the one authoritative entry for a topic; requires `topic`, and at most one entry per project and topic may claim it.
+- `kind` — the record type, drawn from a closed registry; distinct from `source`, which records writer provenance rather than record type.
+- `parent_id` — full 36-character UUID of a live entry this one attaches to; triage attach outcomes only, kinds `amendment` and `sighting`.
+- `supersedes` — LIST of full 36-character UUIDs this entry replaces; never a bare string, even for a single UUID.
+
+A small blessed set of conventional keys — `task_id`, `source`, `transition`,
+`stage` and a few more — is already known and does NOT warn; use those exact
+spellings rather than inventing an `x_` variant of them, because downstream
+metadata-keyed lookups filter on them. Any key outside that set and the five
+above still writes, but WARNS to a census line; if such an annotation is
+deliberate, prefix it `x_` and it passes silently.
+
+The registry module `fused-memory/src/fused_memory/memory_metadata.py` is the
+single normative source for all of this; consult it rather than guessing.
+"""
+
+
 _MEMORY_INSTRUCTIONS = """
 ## Memory
 
@@ -343,7 +419,7 @@ Parameters:
 These two record WHO IS ASKING so a read can be attributed. They are NOT the
 `agent_id` parameter, which is a FILTER restricting results to one authoring
 agent — passing your own id there would hide everyone else's memories from you.
-"""
+""" + METADATA_VOCABULARY_INSTRUCTIONS
 
 # The canonical staging command that every role's "## CRITICAL: Git Staging
 # Rules" section (implementer, debugger, merger, steward, simple_task) must
@@ -1186,9 +1262,13 @@ GREP_LOOKAROUND_GUIDANCE_READ_ONLY = _GREP_ENGINE_LIMITS + _GREP_PCRE_READ_ONLY_
 # dropping that block from this one -- JUDGE already does: no wait block and
 # the read-only grep variant.
 #
-# APPEND-ONLY AT THE TAIL. Every adjacency here is pinned by the later block's
-# own test module (each asserts it starts exactly where its predecessor ends),
-# and BACKGROUND_WAIT_GUIDANCE's heading must stay the prompt's first `##`.
+# APPEND-ONLY AT THE TAIL. Each block through GREP_LOOKAROUND_GUIDANCE has its
+# own test module pin it to start exactly where its predecessor ends; blocks
+# appended after it pin only ORDER (after GREP_LOOKAROUND_GUIDANCE), so
+# concurrent appends do not break each other. That order pin is the one shared
+# orchestrator/tests/_role_splice_contract.py::SpliceContract.assert_lands_after;
+# do not add a local copy. BACKGROUND_WAIT_GUIDANCE's heading must stay the
+# prompt's first `##`.
 # _GREP_ENGINE_LIMITS's prose also points at ERROR_REMEDY_HINT_GUIDANCE as "the
 # section just above". Inserting anywhere but the end breaks a pin, or
 # silently redirects that pointer.
@@ -1197,6 +1277,14 @@ _BASH_CAPABLE_ROLE_PREAMBLE = (
     + TOOL_CALL_REJECTION_GUIDANCE
     + ERROR_REMEDY_HINT_GUIDANCE
     + GREP_LOOKAROUND_GUIDANCE
+    + PKILL_SELF_MATCH_GUIDANCE
+    + CHAINED_COMMAND_STATUS_GUIDANCE
+    + GREP_PATTERN_ESCAPING_GUIDANCE
+    + PASTED_TEXT_PYTHON_LITERAL_GUIDANCE
+    + MULTI_PATH_PARTIAL_FAILURE_GUIDANCE
+    + PATH_NOT_FOUND_GUIDANCE
+    + BASH_CWD_ANCHOR_GUIDANCE
+    + FILE_LOOKUP_GUIDANCE
 )
 
 
@@ -1390,127 +1478,18 @@ SCOPE_BOUNDARY_GUIDANCE = _SCOPE_BOUNDARY_FACTS + _SCOPE_BOUNDARY_RECOURSE
 SCOPE_BOUNDARY_GUIDANCE_SIMPLE = _SCOPE_BOUNDARY_FACTS + _SCOPE_BOUNDARY_RECOURSE_SIMPLE
 
 
-# Inlined from docs/code-quality.md, which remains the single normative copy
-# (INV-9). The inline copy exists at all because a dispatched agent's system
-# prompt cannot follow a cross-reference, the same reason this module already
-# carries its own copy of the refs/stash prohibition.
-#
-# CARRIED HERE, and nothing else: the fourteen headline TOKENS; both stances;
-# and the do-not-steer-by list. The Tests stance deliberately FOLDS IN the three
-# measurable symptoms the doc lists under heuristic 13's reading (reach-back
-# imports, cycle-breaking function-local imports, re-export shims), because a
-# reviewer meets all five symptoms as one test-shaped finding rather than as two
-# separate lookups. NOT carried: the agreed reading of every other headline.
-#
-# orchestrator/tests/test_code_quality_guidance_parity.py is the drift guard: it
-# parses BOTH the doc and the production-RENDERED prompt with one parser, and
-# compares the headline tokens and both bullet lists' LABELS as ordered
-# equalities, so those are provably derived rather than a second source. The
-# folded symptom list is NOT guarded -- labels are compared, bullet bodies are
-# not -- so it is the one place where an edit to heuristic 13's reading in the
-# doc must be mirrored here by hand. Cited by FILE PATH, not by test class name,
-# because test_cited_test_class_drift.py requires every cited Test<CamelCase>
-# identifier in src prose to resolve to a real class.
-#
-# Interpolation-safe by contract: this reaches _REVIEWER_HEURISTICS_TEMPLATE's
-# str.format() call, so it must carry no literal brace.
-CODE_QUALITY_GUIDANCE = """
-## Code quality — judge against this definition
-
-Code quality is the expected cost and risk of the next change. In a
-factory-operated codebase the next change is made by an agent working from a
-partial view of the code, reviewed by an agent, and verified by machine. So
-quality means two things: how cheaply and safely an agent can make a correct
-change, and how likely a wrong change is to be caught before it lands.
-
-The mechanical gates — pytest, ruff, pyright — are the FLOOR. This definition
-is the BAR. A change can pass every gate and still be correctly rejected
-against it.
-
-## The fourteen heuristics
-
-1. **Informative names.**
-2. **Simple control flows.**
-3. **Carefully factored orthogonal dimensions of variability.**
-4. **Small function scopes.**
-5. **Minimum data access scopes and lifetimes.**
-6. **Well-defined purpose for each entity.**
-7. **Prefer stateless interactions between modules.**
-8. **Prefer immutable data.**
-9. **Deep modules with appropriate nesting and coherent narrow interfaces.**
-10. **Clear invariants, informatively, redundantly, uniformly enforced.**
-11. **SPOT — single point of truth.**
-12. **Structured data instead of meaningful strings.**
-13. **Files make internal sense in isolation.**
-14. **No file too large.**
-
-The agreed reading of each headline lives in `docs/code-quality.md` when the
-repository under review carries that file — read it there rather than guessing
-at a headline's intent. The readings are deliberately not restated here so that
-doc stays the one normative copy.
-
-Name the heuristic you are applying — say "heuristic 13, files make internal
-sense in isolation" — whenever a finding or a design decision turns on it. An
-unnamed appeal to "quality" is neither reviewable nor actionable.
-
-## Two stances
-
-- **Comments.** Aim for code that is clear with no or low comments. Needing
-  abundant and escalating amounts of commenting is a symptom of poor clarity,
-  and comments drift away from the code they describe. Rationale that must
-  persist belongs in a tracked file the next agent can read — the PRD, docs/,
-  or a test — with a pointer from the code. A pointer into memory or an
-  escalation record does not count: no dispatched role but the steward can read
-  an escalation, and a memory record is reached by search, not by a path the
-  code can name. Prose written to answer a reviewer — a measurement, a rejected
-  alternative, a defence of a decision — belongs in the commit message, or in
-  the task record where the agent holds a task write, not in the file. This
-  does not license deleting existing rationale during unrelated work.
-- **Tests.** Test access to a module's internals is an interface design smell:
-  such a test pins implementation rather than behaviour, and the seam it reaches
-  through is usually the real defect. Five symptoms, each reportable as an
-  interface-design finding rather than a style nit: monkeypatching a private
-  name by dotted path; reading a private attribute from a test; a
-  reach-back import into a parent module; a function-local import placed to
-  break an import cycle; and a re-export shim that exists only to keep an old
-  path resolving.
-
-## Do not steer by
-
-- **Raw line count.** Comments and docstrings can be most of a file; one large
-  module in this factory's own code measured 55% prose. That is a caution about
-  the metric, not a tolerance for prose: heuristic 14's thresholds are alarms
-  that trigger a measurement, never a number to get under by deleting prose or
-  by a cheating split.
-- **Average complexity.** A file can average a good grade while eight of its
-  functions score the worst one.
-- **Line coverage under autouse stubs.** A suite that stubs the thing under test
-  into passing reports coverage of paths it cannot fail.
-- **Test count or test-to-code ratio.** Tests that pin implementation are a
-  liability carrying a green tick.
-"""
+# Rendered from the packaged normative doc; see
+# orchestrator/src/orchestrator/agents/code_quality.py::guidance.
+CODE_QUALITY_GUIDANCE = guidance()
 
 
-# Architect-only, and deliberately NOT admitted into the shared constant above:
-# a reviewer variant and an architect variant would each carry their own copy of
-# the fourteen headlines, which is the exact defect that constant exists to
-# prevent. Public rather than underscore-private so its drift guard can assert
-# against a NAMED CONSTANT rather than a prose literal.
+# Architect-only: the shared block above reaches reviewers too.
 ARCHITECT_CODE_QUALITY_ADDENDUM = """
 ## Splitting or extracting a module
 
-When a plan splits or extracts a module, heuristics 13 and 14 bind hardest. A
-split is legitimate only when every resulting file makes internal sense in
-isolation: size is necessary, not sufficient. Small satellites that are
-function-bags over a parent's private state fail 13 while passing 14. Layering
-is a downward import of names a lower file defines and never takes back; a
-satellite that imports from the file that imports it is stitching, regardless
-of what the import brings across. When a plan leaves a large file whole rather
-than splitting it, record as a design decision the partition it tried and the
-heuristic-13 symptom each candidate hit — an upward import, a cycle, a
-reach-back — or none. Naming a symptom means naming the two modules and the
-specific import that would close the cycle or reach back; a sentence that
-merely asserts one exists is not a measurement.
+When a plan splits or extracts a module, or leaves a large file whole rather
+than splitting it, record heuristic 14's measurement as a design decision: the
+partition it tried and the heuristic-13 symptom each candidate hit, or none.
 """
 
 
@@ -1766,15 +1745,9 @@ still ends up staged.
 # constants — unlike the curator's single global prompt, every reviewer role
 # has a distinct identity literal and specialization text.
 #
-# Every section's PROSE below is copied VERBATIM from the pre-split
-# _reviewer_role prompt — no instruction is reworded or dropped. The EMITTED
-# prompt is NOT byte-identical to the pre-split text though: compose_prompt()
-# (shared/prompt_artifact.py) always renders CONTRACT, then the "\n\n---\n\n"
-# separator, then HEURISTICS, which moves the "## Rules" + specialization
-# footer to the end of the prompt instead of directly following the verdict
-# schema. Treat parity as content-preservation (no instruction lost), not
-# byte-identity — see TestReviewerPromptSplit's superset test in
-# test_reviewer_prompt_split.py.
+# shared/src/shared/prompt_artifact.py::compose_prompt renders CONTRACT, then
+# the "\n\n---\n\n" separator, then HEURISTICS, so the "## Rules" +
+# specialization footer always follows the whole contract.
 # ----------------------------------------------------------------------
 
 _REVIEWER_CONTRACT_TEMPLATE = """\
@@ -1808,7 +1781,11 @@ _REVIEWER_HEURISTICS_TEMPLATE = """\
    - Design concerns that are valid but outside this task's scope
    - Edge cases that cannot occur given the task's stated constraints
    - Missing features that belong in a follow-up task
-   - Style, naming, or structural preferences
+   - Formatting or layout preferences
+
+   Naming and structure are NOT preferences: judge them under the code-quality heuristics
+   below. A heuristic violation is always reportable; it is `blocking` only when it also
+   meets this rule's definition of broken, and otherwise a `suggestion`.
 3. **When in doubt, suggest.** If you're unsure whether something is blocking, it's a suggestion.
 4. **Read the codebase** to understand context before judging patterns or naming.
 """ + CODE_QUALITY_GUIDANCE + """
@@ -1897,7 +1874,7 @@ JUDGE = AgentRole(
 You are a completion judge. You decide whether an implementer agent has
 *substantively* completed a task's work, regardless of whether the plan.json
 bookkeeping reflects that.
-""" + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE_READ_ONLY + """
+""" + TOOL_CALL_REJECTION_GUIDANCE + ERROR_REMEDY_HINT_GUIDANCE + GREP_LOOKAROUND_GUIDANCE_READ_ONLY + PATH_NOT_FOUND_GUIDANCE + FILE_LOOKUP_GUIDANCE + """
 ## Context
 
 You run AFTER each implementer iteration inside the orchestrator's execute

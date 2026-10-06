@@ -31,7 +31,7 @@ import digest as mod
 import pytest
 import yaml
 from legibility import inventory as inventory_mod
-from orchestrator.agents.briefing import (
+from orchestrator.agents.memory_recall import (
     MEMORY_CONTEXT_CAVEAT,
     MEMORY_DEGRADED_STORES_NOTICE,
     MEMORY_EMPTY_NOTICE,
@@ -2046,7 +2046,8 @@ def _briefing_text(body_filler='Project overview and recent decisions go here.')
     literal shape ``BriefingAssembler`` injects as the harness preamble of
     every dispatched-agent session
     (orchestrator/src/orchestrator/agents/briefing.py): a '# Context'
-    heading (``_get_memory_context``, emits '# Context\\n\\n...'), a
+    heading (``orchestrator/src/orchestrator/agents/memory_recall.py::render_context_block``,
+    emits '# Context\\n\\n...'), a
     '## Agent Identity' heading with an agent_id bullet
     (``_agent_identity``), and a '# Task' heading with a task block (the
     per-role prompt templates, e.g. ``build_architect_prompt``)."""
@@ -2085,8 +2086,8 @@ harness-authored preamble."""
 
 def _memory_context_block(body='## Project Context\n\n{...}'):
     """Build the real shape of a LONE '# Context' memory-context block --
-    ``_get_memory_context``'s recalled-sections return path
-    (orchestrator/src/orchestrator/agents/briefing.py) WITHOUT its
+    ``orchestrator/src/orchestrator/agents/memory_recall.py::render_context_block``'s
+    recalled-sections return path WITHOUT its
     '## Agent Identity' / '# Task' siblings. This is exactly the shape
     HARNESS_BRIEFING_HEADINGS' all()-co-occurrence guard admits today:
     only one of its three headings is present."""
@@ -2097,10 +2098,9 @@ _DROP_NOTE_EXAMPLE = (
     '2 memory result slot(s) across 1 query were tagged to another project '
     'and filtered out'
 )
-"""Representative drop_note text -- the shape
-``_get_memory_context`` builds it in
-(``f'{foreign_dropped} memory result slot(s) across {queries_fired} '
-f'{query_word} were tagged to another project and filtered out'``)."""
+"""Representative drop_note text -- the result-slots-only shape
+``orchestrator/src/orchestrator/agents/memory_recall.py::RecallTally.drop_note``
+builds."""
 
 _SECTION_NOTICES_EXAMPLE = '\n\n'.join((
     MEMORY_SECTION_FAILURE_NOTICE.format(section='Task Context', reason='transport'),
@@ -2111,7 +2111,7 @@ server-reported store outage, the two lines ``_section_notices`` emits."""
 
 
 def _no_recalled_sections_variants() -> tuple[str, ...]:
-    """Every shape ``_get_memory_context`` returns with no section recalled.
+    """Every shape ``render_context_block`` returns with no section recalled.
 
     Two families -- MEMORY_OUTAGE_NOTICE (nothing worked) and
     MEMORY_EMPTY_NOTICE (the corpus had nothing to say) -- each in three
@@ -2121,11 +2121,12 @@ def _no_recalled_sections_variants() -> tuple[str, ...]:
     sentence verbatim.
 
     Built by composing the PRODUCTION constants exactly as
-    ``_get_memory_context`` composes them -- family line first, notices
+    ``orchestrator/src/orchestrator/agents/memory_recall.py::render_context_block``
+    composes them -- family line first, notices
     joined after it, drop_note appended last -- so a rewording of either
     family turns this red instead of silently un-covering the marker it
-    pins. Lockstep-importable since task 3659 hoisted both families out of
-    ``_get_memory_context``'s body into module-level constants.
+    pins. Lockstep-importable since task 3659 hoisted both families into
+    module-level constants.
     """
     variants = []
     for family in (MEMORY_OUTAGE_NOTICE.format(reasons='transport'), MEMORY_EMPTY_NOTICE):
@@ -2142,8 +2143,8 @@ _NO_RECALLED_SECTIONS_VARIANTS = _no_recalled_sections_variants()
 
 def _recalled_sections_with_trailing_unavailable_note():
     """The recalled-sections return path's fullest composite shape
-    (``orchestrator/src/orchestrator/agents/briefing.py::BriefingAssembler._get_memory_context``)
-    -- ``_get_memory_context``'s OTHER return, distinct from
+    (``orchestrator/src/orchestrator/agents/memory_recall.py::render_context_block``)
+    -- ``render_context_block``'s OTHER return, distinct from
     the ``_NO_RECALLED_SECTIONS_VARIANTS`` shapes above (those all
     have recalled_sections EMPTY; this one has it non-empty). Builds a
     caveat carrying its own drop_note suffix (a foreign-tagged result was
@@ -2249,10 +2250,10 @@ class TestHarnessInjectedTurnFilter:
 
     def test_memory_unavailable_context_variant_is_excluded(self):
         # The REAL memory-unavailable shape, as it actually reaches a user
-        # turn. ``_get_memory_context``'s exception and no-context early
-        # returns emit '# Context' with a SINGLE hash (briefing.py:1325,
-        # :1328, :1330, :1331) -- the literal '## Context' is emitted
-        # nowhere in briefing.py. build_architect_prompt (:355-375) then
+        # turn. The memory block's no-recalled-sections path
+        # (orchestrator/src/orchestrator/agents/memory_recall.py::render_context_block)
+        # emits '# Context' with a SINGLE hash -- the literal '## Context'
+        # is emitted nowhere in the briefing. build_architect_prompt (:355-375) then
         # composes that block as
         # '{context}\n\n{identity}\n\n# Task\n\n...\n\n# Action\n\n...',
         # so the injected turn carries 3 anchors plus 1 corroborator.
@@ -2513,7 +2514,7 @@ class TestHarnessInjectedTurnFilter:
         ],
     )
     def test_no_recalled_sections_variant_is_excluded(self, text):
-        # Exhaustive over _get_memory_context's no-recalled-sections
+        # Exhaustive over render_context_block's no-recalled-sections
         # return shapes, not just the caveat-bearing happy path covered
         # above -- the marker set must cover every output of that
         # function, not merely its most common case.
@@ -2522,10 +2523,10 @@ class TestHarnessInjectedTurnFilter:
         assert mod.iter_user_turns(records) == []
 
     def test_recalled_sections_with_trailing_unavailable_note_is_excluded(self):
-        # The fifth _get_memory_context return path (recalled_sections
-        # non-empty), at its fullest composite: a drop_note folded into
-        # the caveat PLUS a trailing memory-unavailable note from a later
-        # failed query. Both suffixes are appended AFTER the caveat
+        # The fifth render_context_block return shape (sections
+        # recalled), at its fullest composite: a drop_note folded into
+        # the caveat PLUS a trailing memory-unavailable note from a recall
+        # loop that broke later. Both suffixes are appended AFTER the caveat
         # prefix HARNESS_CONTEXT_BLOCK_MARKERS matches on, so the caveat
         # marker alone must still cover this shape -- not just the plain
         # caveat-only shape _memory_context_block() builds.

@@ -46,6 +46,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     _normalize_report,
     run_stage_via_cli,
 )
+from fused_memory.reconciliation.live_workflow_section import NO_PER_TASK_SIGNAL_TOKEN
 from fused_memory.reconciliation.prompts import (
     ESCALATION_BOUNDARY_NOTE,
     render_escalation_boundary_note,
@@ -53,7 +54,7 @@ from fused_memory.reconciliation.prompts import (
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
 from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 from fused_memory.reconciliation.prompts.stage3 import STAGE3_SYSTEM_PROMPT
-from fused_memory.reconciliation.stages.base import BaseStage
+from fused_memory.reconciliation.stages.base import BaseStage, RequiredSection
 from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsolidator
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE,
@@ -186,7 +187,11 @@ class TestMockTypesConstant:
 #     which is the correct destination. escalate_blocker is Stage 2's sanctioned
 #     FIX D path; denying it would break FIX D (see render_escalation_boundary_note).
 #   - resolve_issue / stamp_triage / promote_to_l2 — act on an escalation the
-#     caller already has an id for; they answer no existence question.
+#     caller already has an id for. resolve_issue's response also carries a
+#     pending-only census (related_pending, task 4886), but it is scoped to the
+#     record the caller holds and has just mutated, in the queue it is connected
+#     to — never an arbitrary per-task query, so it answers no existence
+#     question either.
 #   - merge_* / *_scheduler / *_merge_queue / *_warm_worktree / release_workflow /
 #     reload_config / get_task_runtime_state — orchestrator control-plane and
 #     merge-lane surface, unrelated to the escalation-record question.
@@ -196,6 +201,10 @@ class TestMockTypesConstant:
 # DISALLOW_ESCALATION_READS. Adding a name here is a decision that the tool
 # cannot mislead a stage about the reconciliation queue — not a formality.
 _REVIEWED_STAGE_SAFE = {
+    # amend_escalation (task 4886) acts on a record the caller already holds
+    # an id for and reads no per-task state, so against the reconciliation
+    # queue it can only ever answer "not found" — never a categorical [].
+    'mcp__escalation__amend_escalation',
     'mcp__escalation__claim_warm_worktree',
     # declare_pin (task 4377) is stamp_triage's structural twin: a
     # restrictive-only write that marks a record as load-bearing.  Against the
@@ -2100,6 +2109,9 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'preservation_specimen_suppressed': 0,
             'preservation_specimen_unresolved': 0,
             'preservation_specimen_citations': {},
+            # Always present (task 4874): the live-workflow citation guard runs
+            # ABOVE the remediation early-return; 0 with no flag emitted.
+            'stage1_live_workflow_citation_contradictions': 0,
             # Always present on the full-cycle path (task 2229 W5-λ): 1 when the
             # deterministic write_cycle_summary helper upserted the authoritative
             # ledger row. This test's mock_deps memory_service is an unconfigured
@@ -2118,6 +2130,18 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'stage1_phantom_citations_dropped': 0,
             'stage1_citations_verified': 0,
             'stage1_citation_verification_errors': 0,
+            # The PROSE half of the same invariant (task 4818), merged from the
+            # same shared assembly immediately after the structured triple above
+            # and carrying the same stageN_ prefix from STAGE_STAT_PREFIX. It is
+            # WARN-ONLY: it never drops a citation and never mutates a finding,
+            # so its whole observable output is these four counters plus a log
+            # line. All four are reported rather than just the phantom count,
+            # because a bare prose_phantom_citations: 0 cannot distinguish "we
+            # scanned and everything is clean" from "nothing was scannable".
+            'stage1_prose_citations_verified': 0,
+            'stage1_prose_citations_tombstoned': 0,
+            'stage1_prose_phantom_citations': 0,
+            'stage1_prose_citation_verification_errors': 0,
             # Always present (task 3084), set before the remediation early-return
             # beside the task-2312/2229 pre-inits above. All three stay 0 here:
             # this stage's filtered_task_tree is unset, so the
@@ -2292,6 +2316,9 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'preservation_specimen_suppressed': 0,
             'preservation_specimen_unresolved': 0,
             'preservation_specimen_citations': {},
+            # Always present (task 4874): the live-workflow citation guard runs
+            # ABOVE the remediation early-return; 0 with no flag emitted.
+            'stage1_live_workflow_citation_contradictions': 0,
             # Always present on the full-cycle path (task 2229 W5-λ): 1 when the
             # deterministic write_cycle_summary helper upserted the authoritative
             # ledger row. This test's mock_deps memory_service is an unconfigured
@@ -2310,6 +2337,18 @@ class TestProjectIdValidation(BaseStageValidationTest):
             'stage1_phantom_citations_dropped': 0,
             'stage1_citations_verified': 0,
             'stage1_citation_verification_errors': 0,
+            # The PROSE half of the same invariant (task 4818), merged from the
+            # same shared assembly immediately after the structured triple above
+            # and carrying the same stageN_ prefix from STAGE_STAT_PREFIX. It is
+            # WARN-ONLY: it never drops a citation and never mutates a finding,
+            # so its whole observable output is these four counters plus a log
+            # line. All four are reported rather than just the phantom count,
+            # because a bare prose_phantom_citations: 0 cannot distinguish "we
+            # scanned and everything is clean" from "nothing was scannable".
+            'stage1_prose_citations_verified': 0,
+            'stage1_prose_citations_tombstoned': 0,
+            'stage1_prose_phantom_citations': 0,
+            'stage1_prose_citation_verification_errors': 0,
             # Always present (task 3084), set before the remediation early-return
             # beside the task-2312/2229 pre-inits above. All three stay 0 here:
             # this stage's filtered_task_tree is unset, so the
@@ -13101,7 +13140,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
     """assemble_payload() renders a '### Live-Workflow Signals' section when any
     active/proactive-sample task has a live workflow detected.
 
-    RED until step-10 adds _render_live_workflow_section + detect_live_workflow
+    RED until step-10 adds render_live_workflow_section + detect_live_workflow
     import to task_knowledge_sync.py.
     """
 
@@ -13126,16 +13165,25 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             max_task_id=max((t.get('id', 0) for t in tasks), default=0),
         )
 
-    @pytest.mark.asyncio
-    async def test_live_workflow_signals_section_present_for_live_task(
-        self, mock_deps, watermark, monkeypatch
-    ):
-        """When an active task is LIVE, '### Live-Workflow Signals' appears in payload
-        and includes the live task's id.
+    @staticmethod
+    def _live_workflow_section(payload: str) -> str:
+        """The '### Live-Workflow Signals' section of *payload*, up to the next markdown header."""
+        section_start = payload.find('### Live-Workflow Signals')
+        section_end = payload.find('\n#', section_start + 1)
+        return payload[section_start:section_end if section_end != -1 else None]
 
-        RED until step-10 implements _render_live_workflow_section.
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('remediation_mode', [False, True], ids=['full', 'remediation'])
+    async def test_live_workflow_signals_section_present_for_live_task(
+        self, mock_deps, watermark, monkeypatch, remediation_mode
+    ):
+        """When an active task is LIVE, '### Live-Workflow Signals' lists it — on both passes.
+
+        The remediation case is a characterization pin (task 5113): Stage 1's
+        remediation payload once dropped this section (task 3839), and
+        prompts/stage2.py reads its absence as "no task is live".
         """
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         live_task_id = '4321'
@@ -13164,21 +13212,28 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
                 last_commit_at=None,
             )
 
-        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
 
         stage = make_configured_task_knowledge_sync_stage(
             mock_deps, project_id='dark_factory', project_root='/project'
         )
         stage.filtered_task_tree = self._make_filtered_tree_with_tasks([live_task, other_task])
+        stage.remediation_mode = remediation_mode
 
         payload = await stage.assemble_payload([], watermark, [])
 
         assert '### Live-Workflow Signals' in payload, (
             f"Expected '### Live-Workflow Signals' section in payload; got snippet:\n{payload[-500:]!r}"
         )
-        assert live_task_id in payload, (
-            f"Expected live task id {live_task_id!r} listed under Live-Workflow Signals; "
-            f"got snippet:\n{payload[-500:]!r}"
+        # Sliced, because both task ids also appear in the Active Task Tree.
+        section_body = self._live_workflow_section(payload)
+        assert f'task/{live_task_id}' in section_body, (
+            f"Expected live task {live_task_id} listed under Live-Workflow Signals; "
+            f"got section:\n{section_body!r}"
+        )
+        assert f'task/{not_live_task_id}' not in section_body, (
+            f"Expected not-live task {not_live_task_id} NOT listed under Live-Workflow "
+            f"Signals; got section:\n{section_body!r}"
         )
 
     @pytest.mark.asyncio
@@ -13188,11 +13243,11 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         """When no active tasks are live, '### Live-Workflow Signals' is absent (keep prompt tight).
 
         Absent means the payload contains neither the header nor any live-task listing.
-        RED until step-10 implements _render_live_workflow_section (the section never
+        RED until step-10 implements render_live_workflow_section (the section never
         renders today, so this test may be GREEN trivially; the companion
         test_live_task_present test is the real RED driver).
         """
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         not_live_task = {'id': 100, 'title': 'Other task', 'status': 'pending'}
@@ -13207,7 +13262,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
                 last_commit_at=None,
             )
 
-        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
 
         stage = make_configured_task_knowledge_sync_stage(
             mock_deps, project_id='dark_factory', project_root='/project'
@@ -13229,9 +13284,9 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         """When a task is live with worktree + recent_commit signals firing, both signal
         names appear in the rendered section (structural presence check, not full prose).
 
-        RED until step-10 implements _render_live_workflow_section.
+        RED until step-10 implements render_live_workflow_section.
         """
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services.live_workflow_detector import WorkflowLiveness
 
         live_task_id = '4321'
@@ -13246,7 +13301,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
                 last_commit_at=None,
             )
 
-        monkeypatch.setattr(tks_module, 'detect_live_workflow', _fake_detect)
+        monkeypatch.setattr(lws_module, 'detect_live_workflow', _fake_detect)
 
         stage = make_configured_task_knowledge_sync_stage(
             mock_deps, project_id='dark_factory', project_root='/project'
@@ -13261,9 +13316,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             f"Expected '### Live-Workflow Signals' section; got:\n{payload[-500:]!r}"
         )
         # The firing signals ('worktree' and/or 'recent-commit') should appear
-        section_start = payload.find('### Live-Workflow Signals')
-        section_end = payload.find('\n#', section_start + 1)
-        section_body = payload[section_start:section_end if section_end != -1 else None]
+        section_body = self._live_workflow_section(payload)
         assert 'worktree' in section_body.lower(), (
             f"Expected 'worktree' signal name in section; got section:\n{section_body!r}"
         )
@@ -13287,7 +13340,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         """
         import subprocess
 
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
 
         deferred_task_id = '452'
         pending_task_id = '100'
@@ -13299,7 +13352,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         }
 
         # Project-wide orchestrator lock reports live...
-        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+        monkeypatch.setattr(lws_module, 'is_orchestrator_live_for', lambda _pr: True)
 
         # ...and both git-derived signals are False for every branch (no worktree
         # registered, unparseable "commit timestamp" => recent_commit fail-safe
@@ -13325,9 +13378,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             f"Expected '### Live-Workflow Signals' section (pending task is live via "
             f"the orchestrator signal); got snippet:\n{payload[-500:]!r}"
         )
-        section_start = payload.find('### Live-Workflow Signals')
-        section_end = payload.find('\n#', section_start + 1)
-        section_body = payload[section_start:section_end if section_end != -1 else None]
+        section_body = self._live_workflow_section(payload)
 
         assert f'task/{pending_task_id}' in section_body, (
             f"Expected pending task 100 (status still eligible for the orchestrator "
@@ -13361,7 +13412,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         """
         import subprocess
 
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
 
         blocked_deterministic_id = '561'
         blocked_normal_id = '742'
@@ -13378,7 +13429,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         }
 
         # Project-wide orchestrator lock reports live...
-        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+        monkeypatch.setattr(lws_module, 'is_orchestrator_live_for', lambda _pr: True)
 
         # ...and both git-derived signals are False for every branch: no worktree
         # registered (porcelain lists only the main worktree), and the
@@ -13452,7 +13503,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         """
         import subprocess
 
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
 
         bare_normal_id = '2335'
         bare_kindless_id = '2196'
@@ -13476,7 +13527,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         }
 
         # Project-wide orchestrator lock reports live...
-        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+        monkeypatch.setattr(lws_module, 'is_orchestrator_live_for', lambda _pr: True)
 
         # ...and git-derived signals are False for every branch EXCEPT a registered
         # worktree for task/999 (the with_worktree_task's branch); `git log` exits
@@ -13510,9 +13561,7 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
             f"Expected '### Live-Workflow Signals' section (the with-worktree task "
             f"is live); got snippet:\n{payload[-500:]!r}"
         )
-        section_start = payload.find('### Live-Workflow Signals')
-        section_end = payload.find('\n#', section_start + 1)
-        section_body = payload[section_start:section_end if section_end != -1 else None]
+        section_body = self._live_workflow_section(payload)
 
         assert f'task/{with_worktree_id}' in section_body, (
             f"Expected blocked normal task {with_worktree_id} WITH a registered "
@@ -13531,8 +13580,100 @@ class TestAssemblePayloadLiveWorkflowSignalsSection:
         )
 
 
+class TestAssemblePayloadRequiredSections:
+    """assemble_payload() carries every REQUIRED_SECTIONS renderer's output (task 5113).
+
+    Driven through a TWO-member STAND-IN registry of stub renderers: against
+    the real single-member registry, registry order and the absence of a
+    separator are not falsifiable. That the real registry's sections reach the
+    payload is pinned by TestAssemblePayloadLiveWorkflowSignalsSection.
+    """
+
+    STUB_REGISTRY = (
+        RequiredSection('### Alpha', 'stub_alpha'),
+        RequiredSection('### Beta', 'stub_beta'),
+    )
+    EXPECTED_SECTIONS = '\n### Alpha\nfirst\n\n### Beta\nsecond\n'
+
+    @pytest.fixture
+    def mock_deps(self):
+        return _mock_stage_deps()
+
+    @pytest.fixture
+    def watermark(self):
+        return Watermark(project_id='dark_factory')
+
+    def _install_stub_registry(self, stage, monkeypatch) -> dict[str, FilteredTaskTree]:
+        """Swap in STUB_REGISTRY; return the tree each stub renderer received, by stub."""
+        received: dict[str, FilteredTaskTree] = {}
+
+        async def stub_alpha(filtered: FilteredTaskTree) -> str:
+            received['alpha'] = filtered
+            return '\n### Alpha\nfirst\n'
+
+        async def stub_beta(filtered: FilteredTaskTree) -> str:
+            received['beta'] = filtered
+            return '\n### Beta\nsecond\n'
+
+        monkeypatch.setattr(stage, 'stub_alpha', stub_alpha, raising=False)
+        monkeypatch.setattr(stage, 'stub_beta', stub_beta, raising=False)
+        monkeypatch.setattr(TaskKnowledgeSync, 'REQUIRED_SECTIONS', self.STUB_REGISTRY)
+        return received
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('remediation_mode', [False, True], ids=['full', 'remediation'])
+    async def test_payload_carries_registry_renderers_in_order_without_separator(
+        self, mock_deps, watermark, monkeypatch, remediation_mode
+    ):
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='dark_factory', project_root='/project'
+        )
+        stage.filtered_task_tree = filter_task_tree(
+            {'tasks': [{'id': 7, 'title': 'Any task', 'status': 'pending'}]}
+        )
+        stage.remediation_mode = remediation_mode
+        received = self._install_stub_registry(stage, monkeypatch)
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert self.EXPECTED_SECTIONS in payload, (
+            "The Stage-2 payload must carry its registry renderers' output "
+            'concatenated in REGISTRY ORDER, with no separator and no '
+            f'post-processing; expected {self.EXPECTED_SECTIONS!r} in:\n{payload!r}'
+        )
+        assert received.get('alpha') is stage.filtered_task_tree
+        assert received.get('beta') is stage.filtered_task_tree
+
+    @pytest.mark.asyncio
+    async def test_self_fetched_tree_reaches_every_registry_renderer(
+        self, mock_deps, watermark, monkeypatch
+    ):
+        """With no harness-injected tree, renderers get the tree assemble_payload fetched.
+
+        Pins Stage 2's contract over Stage 1's zero-arg aggregator: a renderer
+        reading self.filtered_task_tree would see None on this path.
+        """
+        mock_deps['taskmaster'].get_tasks.return_value = {
+            'tasks': [{'id': 7, 'title': 'Fetched task', 'status': 'pending'}]
+        }
+        stage = make_configured_task_knowledge_sync_stage(
+            mock_deps, project_id='dark_factory', project_root='/project'
+        )
+        received = self._install_stub_registry(stage, monkeypatch)
+
+        payload = await stage.assemble_payload([], watermark, [])
+
+        assert self.EXPECTED_SECTIONS in payload
+        assert stage.filtered_task_tree is None
+        assert received['alpha'] is received['beta'], (
+            'Every Stage-2 registry renderer must receive the SAME resolved '
+            f'FilteredTaskTree; received {received!r}'
+        )
+        assert [task['id'] for task in received['alpha'].active_tasks] == [7]
+
+
 class TestRenderLiveWorkflowSectionEmptyTasksNoOp:
-    """_render_live_workflow_section retains its empty-``tasks`` no-op (task
+    """render_live_workflow_section retains its empty-``tasks`` no-op (task
     2150 step-3/4): the falsy-``project_root`` half of its guard is dead code
     under a required ProjectScope and is deleted in step-4, but the
     empty-``tasks`` half survives — this pins that surviving behavior so the
@@ -13541,17 +13682,17 @@ class TestRenderLiveWorkflowSectionEmptyTasksNoOp:
 
     @pytest.mark.asyncio
     async def test_empty_tasks_returns_empty_string(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
-        result = await _render_live_workflow_section(tasks=[], project_root=ProjectRoot('/p'))
+        result = await render_live_workflow_section(tasks=[], project_root=ProjectRoot('/p'))
 
         assert result == ''
 
 
 class TestRenderLiveWorkflowSectionCorroborationGate:
-    """_render_live_workflow_section threads per-task corroboration into
+    """render_live_workflow_section threads per-task corroboration into
     detect_live_workflow for IN-PROGRESS tasks (task 2963 step-8).
 
     Scenario: an in-progress task whose ONLY live signals are a lingering
@@ -13652,17 +13793,17 @@ class TestRenderLiveWorkflowSectionCorroborationGate:
         }
 
     async def _render(self, tmp_path, task, monkeypatch):
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        import fused_memory.reconciliation.live_workflow_section as lws_module
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
         # Project-wide orchestrator lock reports live (a real PID check would
         # fail against the fake PID in the lock file — orchestrator_started_at
         # only parses the `started` token and needs no live PID).
-        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+        monkeypatch.setattr(lws_module, 'is_orchestrator_live_for', lambda _pr: True)
         with patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(self._git_side_effect())):
-            return await _render_live_workflow_section(
+            return await render_live_workflow_section(
                 [task], ProjectRoot(str(tmp_path)), now=self._NOW
             )
 
@@ -13768,7 +13909,7 @@ class TestRenderLiveWorkflowSectionCorroborationGate:
 
 
 class TestRenderLiveWorkflowSectionPendingPureGate:
-    """_render_live_workflow_section drops the bare project-wide orchestrator
+    """render_live_workflow_section drops the bare project-wide orchestrator
     signal for a PENDING deterministic PURE GATE (task 3751 step-9/10).
 
     The observed Stage-2 symptom: dark_factory task 3845 — a pending
@@ -13835,19 +13976,19 @@ class TestRenderLiveWorkflowSectionPendingPureGate:
         return side_effect
 
     async def _render(self, tmp_path, task, monkeypatch, *, worktree_for_branch=None):
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        import fused_memory.reconciliation.live_workflow_section as lws_module
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
-        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: True)
+        monkeypatch.setattr(lws_module, 'is_orchestrator_live_for', lambda _pr: True)
         with patch(
             'fused_memory.services.live_workflow_detector.run_git',
             side_effect=as_async_run_git(
                 self._git_side_effect(worktree_for_branch=worktree_for_branch)
             ),
         ):
-            return await _render_live_workflow_section(
+            return await render_live_workflow_section(
                 [task], ProjectRoot(str(tmp_path)), now=self._NOW
             )
 
@@ -13887,8 +14028,8 @@ class TestRenderLiveWorkflowSectionPendingPureGate:
 
         result = await self._render(tmp_path, task, monkeypatch)
 
-        assert f'- {self._BRANCH}: orchestrator' in result, (
-            f"Expected {self._BRANCH} STILL listed with the orchestrator signal "
+        assert f'- {self._BRANCH}: {NO_PER_TASK_SIGNAL_TOKEN}' in result, (
+            f"Expected {self._BRANCH} STILL listed through the project-wide lock "
             f"(before_done disqualifies the pure-gate shape); got:\n{result!r}"
         )
 
@@ -13903,7 +14044,7 @@ class TestRenderLiveWorkflowSectionPendingPureGate:
 
         result = await self._render(tmp_path, task, monkeypatch)
 
-        assert f'- {self._BRANCH}: orchestrator' in result, (
+        assert f'- {self._BRANCH}: {NO_PER_TASK_SIGNAL_TOKEN}' in result, (
             f"Expected pending NORMAL task {self._BRANCH} STILL listed — rule 5 is "
             f"deterministic-only; got:\n{result!r}"
         )
@@ -16630,7 +16771,7 @@ class TestSweepStaleMem0PoolTombstones:
 class TestRenderLiveWorkflowSectionHoistsWorktreeList:
     """`git worktree list` runs ONCE per render, not once per task.
 
-    The measured defect: `_render_live_workflow_section` already hoists three
+    The measured defect: `render_live_workflow_section` already hoists three
     per-render invariants (`is_orchestrator_live_for`, `read_scheduler_state`,
     `orchestrator_started_at`) but not the fourth and most expensive one — the
     whole-repo worktree list, which `detect_live_workflow` re-ran inside
@@ -16685,14 +16826,14 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
     @pytest.mark.parametrize('n_tasks', [1, 8, 30])
     @pytest.mark.asyncio
     async def test_worktree_list_probe_count_is_constant_in_task_count(self, n_tasks):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
         side_effect, counts = self._counting_side_effect()
 
         with patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(side_effect)):
-            await _render_live_workflow_section(
+            await render_live_workflow_section(
                 tasks=self._tasks(n_tasks),
                 project_root=ProjectRoot('/p'),
                 now=self._NOW,
@@ -16711,16 +16852,16 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
         *unknown* (which degrades to exactly the pre-hoist per-task probe
         path), and pins that the two agree byte-for-byte.
         """
-        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        from fused_memory.reconciliation import live_workflow_section as lws
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
         side_effect, _ = self._counting_side_effect()
         tasks = self._tasks(4)
 
         with patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(side_effect)):
-            hoisted = await _render_live_workflow_section(
+            hoisted = await render_live_workflow_section(
                 tasks=tasks, project_root=ProjectRoot('/p'), now=self._NOW,
             )
 
@@ -16729,9 +16870,9 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
             patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(side_effect)),
             # `{}` from worktree_index_kwargs means *unknown* — omit the kwarg.
             # (A known-empty repo would be `{'worktree_index': {}}`.)
-            patch.object(tks, 'worktree_index_kwargs', return_value={}),
+            patch.object(lws, 'worktree_index_kwargs', return_value={}),
         ):
-            per_task = await _render_live_workflow_section(
+            per_task = await render_live_workflow_section(
                 tasks=tasks, project_root=ProjectRoot('/p'), now=self._NOW,
             )
 
@@ -16751,18 +16892,18 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
         a state production can no longer reach. That catch is unit-tested where
         it lives (test_live_workflow_detector.py::TestWorktreeIndexKwargs).
         """
-        from fused_memory.reconciliation.stages import task_knowledge_sync as tks
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        from fused_memory.reconciliation import live_workflow_section as lws
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
         side_effect, counts = self._counting_side_effect()
 
         with (
             patch('fused_memory.services.live_workflow_detector.run_git', side_effect=as_async_run_git(side_effect)),
-            patch.object(tks, 'worktree_index_kwargs', return_value={}),
+            patch.object(lws, 'worktree_index_kwargs', return_value={}),
         ):
-            result = await _render_live_workflow_section(
+            result = await render_live_workflow_section(
                 tasks=self._tasks(3), project_root=ProjectRoot('/p'), now=self._NOW,
             )
 
@@ -16781,8 +16922,8 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
         sentinel rather than raising — so the WARNING has to come from the
         detector, and the section must still render off the surviving signals.
         """
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
         detector_logger = 'fused_memory.services.live_workflow_detector'
@@ -16812,7 +16953,7 @@ class TestRenderLiveWorkflowSectionHoistsWorktreeList:
                 side_effect=as_async_run_git(failing_worktree_list),
             ),
         ):
-            result = await _render_live_workflow_section(
+            result = await render_live_workflow_section(
                 tasks=self._tasks(3), project_root=ProjectRoot('/p'), now=self._NOW,
             )
 
@@ -16884,14 +17025,14 @@ class TestRenderLiveWorkflowSectionCapsFanOut:
         return fake
 
     async def _render(self, tasks, monkeypatch):
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        import fused_memory.reconciliation.live_workflow_section as lws_module
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
         probed: list[str] = []
         monkeypatch.setattr(
-            tks_module, 'detect_live_workflow', self._recording_detector(probed)
+            lws_module, 'detect_live_workflow', self._recording_detector(probed)
         )
         # Neutralise the (already-tested) per-render hoists so this class
         # measures only the fan-out, with no real subprocess. `{'worktree_index':
@@ -16908,8 +17049,8 @@ class TestRenderLiveWorkflowSectionCapsFanOut:
         async def _worktree_index_kwargs(_pr):
             return {'worktree_index': {}}
 
-        monkeypatch.setattr(tks_module, 'worktree_index_kwargs', _worktree_index_kwargs)
-        result = await _render_live_workflow_section(
+        monkeypatch.setattr(lws_module, 'worktree_index_kwargs', _worktree_index_kwargs)
+        result = await render_live_workflow_section(
             tasks=tasks, project_root=ProjectRoot('/p'), now=self._NOW,
         )
         return result, probed
@@ -16994,9 +17135,9 @@ class TestRenderLiveWorkflowSectionCapsFanOut:
         Monkeypatching `MAX_ACTIVE_TASKS_RENDERED` in the renderer's namespace
         must move the cap; a hard-coded `50` in the renderer reads RED here.
         """
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
 
-        monkeypatch.setattr(tks_module, 'MAX_ACTIVE_TASKS_RENDERED', 5)
+        monkeypatch.setattr(lws_module, 'MAX_ACTIVE_TASKS_RENDERED', 5)
 
         with caplog.at_level(logging.WARNING, logger=self._LOGGER):
             _result, probed = await self._render(self._tasks(12), monkeypatch)
@@ -17044,7 +17185,7 @@ class TestLiveWorkflowRenderIsNonBlocking:
     """The renderer must not pin the event loop while it shells out to git.
 
     This is the defect task 3778 exists to fix, stated as a test: the recon
-    payload assembler awaited a SYNC `_render_live_workflow_section` that ran
+    payload assembler awaited a SYNC `render_live_workflow_section` that ran
     blocking `subprocess.run` once per active task, so for 15-43 s at a stretch
     nothing else on the loop — health checks, heartbeats, MCP replies — could
     run at all.
@@ -17061,11 +17202,11 @@ class TestLiveWorkflowRenderIsNonBlocking:
     def test_renderer_is_a_coroutine_function(self):
         import inspect
 
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _render_live_workflow_section,
+        from fused_memory.reconciliation.live_workflow_section import (
+            render_live_workflow_section,
         )
 
-        assert inspect.iscoroutinefunction(_render_live_workflow_section)
+        assert inspect.iscoroutinefunction(render_live_workflow_section)
 
     def test_memory_consolidator_section_builder_is_a_coroutine_function(self):
         import inspect
@@ -17084,7 +17225,7 @@ class TestLiveWorkflowRenderIsNonBlocking:
 
         from shared.git_async import GitResult
 
-        import fused_memory.reconciliation.stages.task_knowledge_sync as tks_module
+        import fused_memory.reconciliation.live_workflow_section as lws_module
         from fused_memory.services import live_workflow_detector as lwd
 
         probe_delay = 0.02
@@ -17095,7 +17236,7 @@ class TestLiveWorkflowRenderIsNonBlocking:
             return GitResult(returncode=1, stdout='', stderr='')
 
         monkeypatch.setattr(lwd, 'run_git', slow_run_git)
-        monkeypatch.setattr(tks_module, 'is_orchestrator_live_for', lambda _pr: False)
+        monkeypatch.setattr(lws_module, 'is_orchestrator_live_for', lambda _pr: False)
 
         ticks = 0
         stop = False
@@ -17108,7 +17249,7 @@ class TestLiveWorkflowRenderIsNonBlocking:
 
         tick_task = asyncio.create_task(ticker())
         try:
-            await tks_module._render_live_workflow_section(
+            await lws_module.render_live_workflow_section(
                 tasks=[{'id': str(i), 'status': 'pending'} for i in range(n_tasks)],
                 project_root=ProjectRoot('/p'),
                 now=self._NOW,

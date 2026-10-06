@@ -1,20 +1,21 @@
-"""Fail-closed preflight against MIS-TARGETING a task store or escalation queue (task 4319).
+"""Fail-closed preflight against MIS-TARGETING a task store or escalation queue (tasks 4319, 5468).
 
 THE POLICY THIS ENFORCES
 ------------------------
 **An in-process READER OR MUTATOR of ``tasks.db`` or of the durable escalation
-queue must refuse when its target store does not ALREADY exist.** Neither
-substrate will tell you it was not there: both silently create themselves and
-then report empty, so "nothing to do" and "you are pointed at the wrong
-filesystem location" are the same output.
+queue must refuse unless its target store already HOLDS A RECORD — merely
+existing is not enough.** Neither substrate will tell you it was not there:
+both silently create themselves and then report empty, so "nothing to do" and
+"you are pointed at the wrong filesystem location" are the same output — and
+the empty store that creation leaves behind EXISTS for every later run.
 
 READERS are in scope, not merely mutators, and that is not a widening of
 convenience: a read-only audit reporting "0 offenders" against a store it just
 conjured is exactly as false as a no-op apply, and it is the read paths — dry
-runs, CI predicates — that actually get pointed at the wrong checkout. Of the
-six call sites this guard has, every one is reached on a READ path — and,
-where the script has an apply mode at all, on that path too. One of the six is
-a read-only CI/runbook predicate with no ``--apply`` to gate on.
+runs, CI predicates — that actually get pointed at the wrong checkout. Every
+call site this guard has is reached on a READ path — and, where the script has
+an apply mode at all, on that path too. One is a read-only CI/runbook
+predicate with no ``--apply`` to gate on.
 
 THE TWO MEASURED AUTO-CREATES (task 4319, re-measured at base 56fb6fec97)
 -------------------------------------------------------------------------
@@ -80,7 +81,29 @@ non-destructive — a ``PermissionError`` out of the queue lockfile's
 ``os.open``, or an ``OperationalError`` at connection-open, since WAL needs a
 writable ``-shm``/``-wal`` beside ``tasks.db``. A probe would buy only a nicer
 message, at the cost of creating a scratch file inside live production state.
-Hence: an EXISTENCE assertion, which writes nothing in either direction.
+Hence: a READ-ONLY check that the target already holds a record, which never
+creates the store.
+
+WHAT COUNTS AS POPULATED (task 5468)
+------------------------------------
+* Queue: the directory holds at least one entry. The residue is the empty
+  directory ``EscalationQueue.__init__`` mkdirs; a live queue never returns to
+  empty, because a resolve leaves ``archive/`` and lock sidecars behind.
+* Task store: a ``tasks`` table with at least one row, read through a
+  ``mode=ro`` URI so the probe cannot create the file. The residues are a
+  zero-byte file and the row-less db ``get_tasks`` seeds.
+
+MISSING and EMPTY are refused. An UNREADABLE target (a file at the queue path,
+non-SQLite bytes or a directory at tasks.db) fails OPEN, because the backend's
+own open already fails loudly.
+
+RESIDUAL HOLES, left open deliberately:
+
+* a POPULATED wrong location (another deployment's queue, another project's
+  tasks.db) passes, since nothing pins the live store (see below);
+* a stray file makes a residue queue directory pass;
+* a read-only probe of a closed WAL-mode tasks.db may leave ``-shm``/``-wal``
+  sidecars beside it.
 
 PRIOR ART
 ---------
@@ -131,33 +154,41 @@ The guard deliberately does NOT require an absolute path and does not try to
 verify the target is "the live store". The documented, working invocation for
 both escalation scripts is repo-root-relative, and run from the project root it
 resolves correctly; requiring absoluteness would break a correct invocation to
-catch a case plain existence already catches. Pinning an expected live path
+catch a case the populated check already catches. Pinning an expected live path
 would hardcode one deployment into a general-purpose script — the mistake
 ``store_mutation_preflight.py::resolve_history_dir``'s docstring already warns
 about for ``~/.mem0``.
 
-Everything above is a DATED MEASUREMENT (task 4319), not an invariant, and must
+Everything above is a DATED MEASUREMENT (tasks 4319, 5468), not an invariant, and must
 not be restated as one: nothing enforces the rule mechanically, so a script
 added tomorrow is unguarded by default.
 
-Pure stdlib. No probe write, no mem0 import, no network, no backend import.
+Pure stdlib, ``sqlite3`` included. No probe write, no mem0 import, no network,
+no backend import.
 """
 
 from __future__ import annotations
 
+import sqlite3
+from collections.abc import Callable
+from enum import Enum
 from pathlib import Path
 
 __all__ = [
     'TargetStoreMissing',
-    'assert_queue_dir_exists',
-    'assert_target_store_exists',
-    'assert_task_store_exists',
+    'assert_queue_dir_populated',
+    'assert_task_store_populated',
     'task_store_path',
 ]
 
+_TASKS_TABLE = 'tasks'
+
 
 class TargetStoreMissing(RuntimeError):
-    """Raised when the store an operation would mutate does not exist yet.
+    """Raised when the store an operation would touch is missing or EMPTY.
+
+    An empty placeholder counts as missing: it is what the auto-creates leave
+    behind for a run aimed at the wrong location, not the store itself.
 
     CALLER CONTRACT: on this exception the caller MUST NOT begin the scan, let
     alone the mutation. Refusing before the scan is the entire point — the
@@ -173,8 +204,16 @@ class TargetStoreMissing(RuntimeError):
 
     The remedy is never to weaken the guard. Point the operation at the store
     that actually exists — an absolute ``--queue-dir``, or the main checkout as
-    ``--project-root`` — or create the store deliberately first.
+    ``--project-root`` — and remove any empty placeholder a mis-targeted run
+    left behind.
     """
+
+
+class _StoreState(Enum):
+    MISSING = 'missing'
+    EMPTY = 'empty'
+    POPULATED = 'populated'
+    UNDETERMINED = 'undetermined'
 
 
 def task_store_path(project_root: Path | str) -> Path:
@@ -186,7 +225,7 @@ def task_store_path(project_root: Path | str) -> Path:
     ``correct_found_on_main_backlog``) all guard the SAME path -- ``scripts/``
     is not a package, so a shared module is the only place they can agree.
 
-    Those four call :func:`assert_task_store_exists`, which applies this
+    Those four call :func:`assert_task_store_populated`, which applies this
     derivation for them; the function stays public for a caller that needs the
     path WITHOUT the assertion -- reporting it, or guarding a store it reaches
     by some other route.
@@ -198,58 +237,80 @@ def task_store_path(project_root: Path | str) -> Path:
     the point of refusing before the backend exists. The duplication is one
     three-segment join, and a drift between the two shows up as a guard that
     refuses a project that works (loud), never as one that passes a project
-    that does not (silent).
+    that does not (silent). ``_TASKS_TABLE`` mirrors the backend's table name
+    on the same terms.
     """
     return Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db'
 
 
-def assert_target_store_exists(
+def _refuse_unless_populated(
     path: Path | str,
+    classify: Callable[[Path], _StoreState],
     *,
     operation: str,
     what: str,
     remedy: str,
 ) -> None:
-    """Refuse *operation* unless the target store at *path* already exists.
+    """Refuse *operation* unless *classify* finds the store at *path* populated.
 
-    Accepts a FILE or a DIRECTORY: ``tasks.db`` is a file, an escalation queue
-    is a directory, and one helper serves both because the question asked is
-    the same one.
-
-    Writes nothing, in either direction — no probe file, no ``mkdir``. That is
-    deliberate and is the property that distinguishes this guard from
-    ``store_mutation_preflight.py::assert_store_mutation_allowed``: creating
-    anything here would begin the same silent auto-creation the guard exists to
-    catch.
-
-    Args:
-        path: The target store. Reported RESOLVED in the refusal, because the
-            measured trigger is a relative default (``./data/reconciliation/
-            escalations``) echoed back verbatim, which tells an operator
-            nothing about which directory was actually consulted.
-        operation: Name of the run being gated (e.g.
-            ``'dismiss_recon_integrity_noise'``). Echoed into the refusal so an
-            operator can tell WHICH run was refused.
-        what: What the path is meant to BE, in operator words (e.g.
-            ``'the durable escalation queue directory'``).
-        remedy: The concrete corrective invocation, script-specific. This is
-            the part an operator acts on, so it names the flag to pass rather
-            than restating the policy.
-
-    Raises:
-        TargetStoreMissing: When *path* does not exist. The caller MUST NOT
-            proceed to the scan.
+    The one enforcement point both arms share. *path* is resolved once and
+    reported RESOLVED, because the measured trigger is a relative default
+    (``./data/reconciliation/escalations``) that, echoed back verbatim, tells
+    an operator nothing about which directory was consulted. *what* names the
+    store in operator words; *remedy* is the corrective invocation, the part
+    an operator acts on.
     """
     resolved = Path(path).expanduser().resolve()
-    if resolved.exists():
+    state = classify(resolved)
+    if state in (_StoreState.POPULATED, _StoreState.UNDETERMINED):
         return
+    if state is _StoreState.MISSING:
+        raise TargetStoreMissing(
+            f'Refusing to begin {operation!r}: {what} does not exist at '
+            f'{str(resolved)!r}. Proceeding would CREATE it empty and report a '
+            f'clean run — both the escalation queue and tasks.db auto-create '
+            f'silently, so a wrong target is indistinguishable from a quiet one. '
+            f'Remedy: {remedy}'
+        )
     raise TargetStoreMissing(
-        f'Refusing to begin {operation!r}: {what} does not exist at '
-        f'{str(resolved)!r}. Proceeding would CREATE it empty and report a '
-        f'clean run — both the escalation queue and tasks.db auto-create '
-        f'silently, so a wrong target is indistinguishable from a quiet one. '
-        f'Remedy: {remedy}'
+        f'Refusing to begin {operation!r}: {what} at {str(resolved)!r} exists '
+        f'but holds nothing. That is exactly what the store a run aimed at the '
+        f'wrong location auto-creates looks like, so a scan could only report '
+        f'a clean run it cannot vouch for; if it is leftover from such a run, '
+        f'remove it. Remedy: {remedy}'
     )
+
+
+def _classify_queue_dir(queue_dir: Path) -> _StoreState:
+    if not queue_dir.exists():
+        return _StoreState.MISSING
+    try:
+        first = next(queue_dir.iterdir(), None)
+    except OSError:
+        return _StoreState.UNDETERMINED
+    return _StoreState.EMPTY if first is None else _StoreState.POPULATED
+
+
+def _classify_task_store(db: Path) -> _StoreState:
+    # exists() must come first: a missing path and a directory both raise
+    # OperationalError on open, so the exception cannot tell them apart.
+    if not db.exists():
+        return _StoreState.MISSING
+    try:
+        connection = sqlite3.connect(f'{db.as_uri()}?mode=ro', uri=True)
+        try:
+            has_table = connection.execute(
+                'SELECT 1 FROM sqlite_master WHERE type = ? AND name = ?',
+                ('table', _TASKS_TABLE),
+            ).fetchone() is not None
+            has_row = has_table and connection.execute(
+                f'SELECT EXISTS (SELECT 1 FROM {_TASKS_TABLE})',
+            ).fetchone()[0] == 1
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return _StoreState.UNDETERMINED
+    return _StoreState.POPULATED if has_row else _StoreState.EMPTY
 
 
 _TASK_STORE_WHAT = 'the project task store (tasks.db)'
@@ -271,43 +332,45 @@ _QUEUE_DIR_REMEDY = (
 )
 
 
-def assert_task_store_exists(project_root: Path | str, *, operation: str) -> None:
-    """Refuse *operation* unless ``<project_root>``'s tasks.db already exists.
+def assert_task_store_populated(project_root: Path | str, *, operation: str) -> None:
+    """Refuse *operation* unless ``<project_root>``'s tasks.db already holds a task.
 
     The entry point the four task-store scripts in ``fused-memory/scripts/``
     actually call. Only ``operation`` varies between them: the target
-    derivation, the ``what`` and the twelve-line ``remedy`` are constant across
-    the whole family, so they live here once rather than six times. The same
-    SPOT argument :func:`task_store_path` already makes about the path applies
-    with more force to the prose — a remedy copied per script is a remedy that
+    derivation, the ``what`` and the ``remedy`` are constant across the whole
+    family, so they live here once rather than once per script. The same SPOT
+    argument :func:`task_store_path` already makes about the path applies with
+    more force to the prose — a remedy copied per script is a remedy that
     drifts per script, and it is the sentence an operator actually acts on.
 
     Deliberately does NOT log. The refusal carries the operation, the RESOLVED
     target, why it matters and the remedy; a ``logger.error`` restating that
     beside the traceback puts the same paragraph on stderr twice, and the
     per-script ones it replaces interpolated the UNRESOLVED path — the exact
-    verbatim echo :func:`assert_target_store_exists` resolves the path to
-    avoid. A caller wanting a run-log record should catch and log the
-    exception, whose message is already the better line.
+    verbatim echo the refusal resolves the path to avoid. A caller wanting a
+    run-log record should catch and log the exception, whose message is
+    already the better line.
     """
-    assert_target_store_exists(
+    _refuse_unless_populated(
         task_store_path(project_root),
+        _classify_task_store,
         operation=operation,
         what=_TASK_STORE_WHAT,
         remedy=_TASK_STORE_REMEDY,
     )
 
 
-def assert_queue_dir_exists(queue_dir: Path | str, *, operation: str) -> None:
-    """Refuse *operation* unless the escalation queue directory already exists.
+def assert_queue_dir_populated(queue_dir: Path | str, *, operation: str) -> None:
+    """Refuse *operation* unless the escalation queue directory holds an entry.
 
-    The queue-side twin of :func:`assert_task_store_exists`, and the entry
-    point both escalation scripts call. See that docstring for why the
+    The queue-side twin of :func:`assert_task_store_populated`, and the entry
+    point the escalation scripts call. See that docstring for why the
     family-constant text and the absence of logging live here rather than at
     each call site.
     """
-    assert_target_store_exists(
-        Path(queue_dir),
+    _refuse_unless_populated(
+        queue_dir,
+        _classify_queue_dir,
         operation=operation,
         what=_QUEUE_DIR_WHAT,
         remedy=_QUEUE_DIR_REMEDY,

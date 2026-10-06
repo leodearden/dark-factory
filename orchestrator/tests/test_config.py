@@ -351,12 +351,12 @@ class TestDefaults:
             'RELOADABLE_FIELDS'
         )
         # task 4755: how old the in-flight fleet-redeploy lease may get before
-        # its readers stop believing it. DERIVED from the drain busy-grace
-        # (worst legitimate sweep ~6270s), not picked, and deliberately far
+        # its readers stop believing it. DERIVED from the --drain verify-wait cap
+        # (worst legitimate sweep ~13,300s), not picked, and deliberately far
         # below the 8h min-interval so a lease leaked by a SIGKILLed sweep
         # delays at most one window. Red-tier / restart-only like its
         # siblings — captured at coordinator construction.
-        assert config.orchestrator_restart_lease_max_age_secs == 7200.0
+        assert config.orchestrator_restart_lease_max_age_secs == 14400.0
         assert (
             'orchestrator_restart_lease_max_age_secs' not in RELOADABLE_FIELDS
         ), (
@@ -372,8 +372,8 @@ class TestDefaults:
         """Bare OrchestratorConfig() exposes the fused-memory force-fire default.
 
         The force-fire escape lets a pending fused-memory restart still fire
-        under chronic fleet saturation (when the run-loop idle branch is
-        starved) after a bounded owed-age window — mirroring the orchestrator
+        under chronic fleet saturation (when agents are never idle) after a
+        bounded owed-age window — mirroring the orchestrator
         coordinator's own force_fire_after_secs (task 2817). Like its
         orchestrator_restart_* siblings it is captured once at coordinator
         construction (_build_service_restart_coordinator), so it is
@@ -2196,6 +2196,50 @@ class TestParkBackfillConfig:
             f"'{leaf}' must be in RELOADABLE_FIELDS (green-tier hot-reloadable, "
             'alongside fairness.skip_threshold in the scheduler-tuning slice)'
         )
+
+
+class TestPinReservationConfig:
+    """The three pin reservation knobs (task 6040).
+
+    Flat ``OrchestratorConfig`` leaves beside the ``backfill_*`` block, read
+    from ``self.config`` at tick time, so green-tier membership alone makes
+    them hot-reloadable.
+    """
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_defaults(self):
+        cfg = OrchestratorConfig()
+        assert cfg.pin_reservations_enabled is True
+        assert cfg.pin_reservation_max_active == 1
+        assert cfg.pin_blocked_emit_interval_secs == 3600.0
+
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_max_active_rejects_below_one(self, bad):
+        """ge=1: the kill switch is the single "off" lever, not max_active=0."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(pin_reservation_max_active=bad)
+
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_emit_interval_rejects_non_positive(self, bad):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(pin_blocked_emit_interval_secs=bad)
+
+    @pytest.mark.parametrize('leaf', [
+        'pin_reservations_enabled',
+        'pin_reservation_max_active',
+        'pin_blocked_emit_interval_secs',
+    ])
+    def test_pin_reservation_leaves_are_green_tier_reloadable(self, leaf):
+        assert leaf in RELOADABLE_FIELDS
+
+    def test_reloading_the_kill_switch_flips_the_live_config(self):
+        live = OrchestratorConfig()
+        assert live.pin_reservations_enabled is True, 'premise: enabled before the reload'
+
+        report = apply_reload(live, OrchestratorConfig(pin_reservations_enabled=False))
+
+        assert 'pin_reservations_enabled' in report['applied']
+        assert live.pin_reservations_enabled is False
 
 
 class TestTransientRequeueBackoffConfig:

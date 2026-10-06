@@ -1,10 +1,13 @@
-"""Non-fixture test helpers for fused-memory tests.
+"""Shared test helpers for fused-memory tests, imported by name.
 
 Lives outside conftest.py to avoid the `sys.modules['conftest']` collision
 that arises when root-level pytest loads multiple subprojects' conftests in
 the same process.  Each subproject exports its helpers under a unique
 module name so test files can `from _fm_helpers import X` without
 colliding with sibling subprojects' helpers.
+
+An opt-in fixture defined here applies only to the modules that import it
+by name (see `lease_dir_fixture`).
 """
 
 import asyncio
@@ -16,6 +19,7 @@ import json
 import os
 import pathlib
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -39,6 +43,7 @@ from fused_memory.backends.graphiti_client import (
     INCOMPLETE_STRUCTURAL_KINDS,
     PagedRead,
 )
+from fused_memory.utils.target_store_preflight import task_store_path
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
@@ -635,6 +640,12 @@ async def submit_and_resolve(
         f'submit_and_resolve: ticket {ticket!r} resolved with no result_json '
         f'(resolve_result={resolve_result!r})'
     )
+
+
+#: The documented-safe MCP tool-response size, in serialised chars. Derived in
+#: test_get_statuses_pagination.py::test_auto_page_limit_fits_documented_safe_envelope
+#: (see also server/tools.py::_STATUSES_AUTO_PAGE_LIMIT).
+MCP_SAFE_RESPONSE_CHARS = 62_000
 
 
 # ---------------------------------------------------------------------------
@@ -1960,6 +1971,96 @@ def load_script_module(
         _LOADED_SCRIPT_MODULE_NAMES.discard(name)
         raise
     return module
+
+
+def make_populated_task_store(project_root: pathlib.Path) -> pathlib.Path:
+    """Create the tasks.db *project_root* resolves to, holding one task row.
+
+    This is the shape ``target_store_preflight``'s guard reads -- a ``tasks``
+    table with at least one row -- NOT the backend schema. The suites using it
+    patch ``SqliteTaskBackend`` out, so the guard is the only reader of the
+    file; agreement with the real backend is pinned once, in
+    tests/test_target_store_preflight.py.
+    """
+    db = task_store_path(project_root)
+    db.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute('CREATE TABLE tasks (id INTEGER PRIMARY KEY)')
+        connection.execute('INSERT INTO tasks (id) VALUES (1)')
+        connection.commit()
+    finally:
+        connection.close()
+    return db
+
+
+def make_zero_byte_task_store(project_root: pathlib.Path) -> pathlib.Path:
+    """Create the tasks.db *project_root* resolves to as an EMPTY file.
+
+    The residue shape ``target_store_preflight``'s guard must refuse, and the
+    counterpart of :func:`make_populated_task_store`.
+    """
+    db = task_store_path(project_root)
+    db.parent.mkdir(parents=True)
+    db.touch()
+    return db
+
+
+_CLEANUP_TEST_COLLECTIONS_SCRIPT = (
+    pathlib.Path(__file__).parent.parent / 'scripts' / 'cleanup_test_collections.py'
+)
+
+
+@functools.cache
+def _lease_dir_env() -> str:
+    """The env var name, read from the reaper that defines it.
+
+    Read rather than spelled out here so a rename of the constant cannot
+    leave `lease_dir_fixture` setting a variable nothing consults any more —
+    which would look exactly like isolation while every test fell through to
+    the real machine-global directory.
+
+    Loaded lazily and cached, because conftest.py and most test modules
+    import this module and an eager load would charge every pytest session.
+    Only the resulting STRING is kept: the modules that import the fixture
+    load the reaper through their own loaders, and holding a second reference
+    to a module object they may replace is a hazard with nothing to buy it.
+    """
+    return load_script_module(_CLEANUP_TEST_COLLECTIONS_SCRIPT).LEASE_DIR_ENV
+
+
+@pytest.fixture(autouse=True, name='lease_dir')
+def lease_dir_fixture(tmp_path, monkeypatch):
+    """Point ``DF_EPHEMERAL_COLLECTION_LEASE_DIR`` at a per-test directory.
+
+    A hard isolation boundary, not a convenience.  The lease directory
+    ``cleanup_test_collections.lease_dir()`` returns by default is a
+    HARDCODED machine-global absolute path (that is the property the guard's
+    correctness rests on — see the design note on that function), and it is
+    the very directory the live 6-hourly cron reads.  A test that wrote a
+    lease into it would hold a real sweep off this host; a test that reaped
+    it would unlink the lease of a live bake-off running in another checkout.
+
+    Autouse, and applied to EVERY test in an importing module rather than
+    only its lease tests, for exactly that reason: a test that forgets to
+    request the isolation must not be able to fall through silently to the
+    real directory.  Tests that need the path can still request this fixture
+    by name; the directory is not created here, because a lease-dir-absent
+    case is one of the behaviours under test.
+
+    Activation is by import, per module
+    (``from _fm_helpers import lease_dir_fixture  # noqa: F401``), and NEVER
+    from conftest.py: an autouse fixture there would apply to every test in
+    the package, redirecting the ``-m integration`` lane away from the
+    directory the live cron reads and silently disabling the guard task 4775
+    built.  The attribute is ``lease_dir_fixture`` while the fixture NAME
+    stays ``lease_dir`` because a module-level ``lease_dir`` binding would be
+    shadowed by every ``def test_x(self, lease_dir)`` parameter, which ruff
+    reports as F811 once per test.
+    """
+    directory = tmp_path / 'ephemeral-collection-leases'
+    monkeypatch.setenv(_lease_dir_env(), str(directory))
+    return directory
 
 
 def as_async_run_git(side_effect):

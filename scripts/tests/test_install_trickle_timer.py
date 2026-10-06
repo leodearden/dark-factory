@@ -21,24 +21,19 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Resolved via scripts/tests/conftest.py's sys.path insertion (scripts/ AND
-# scripts/legibility/ are both on sys.path; no package __init__ needed) --
-# same idiom as test_legibility_coder.py's `import coder as mod`.
-import coder
-
 SCRIPT = Path(__file__).parent.parent / "legibility" / "install-trickle-timer.sh"
 TEMPLATES_DIR = Path(__file__).parent.parent  # scripts/tests/../ = scripts/
 
-# The unit names the PRODUCTION checkout absolutely -- systemd resolves
+# The unit names the PRODUCTION install absolutely -- systemd resolves
 # Environment= absolutely and the installed unit is a byte copy of the
-# committed one -- so this must NOT be derived from a REPO_ROOT, which is a
+# committed one -- so neither may be derived from a REPO_ROOT, which is a
 # .worktrees/<id> path when the suite runs in a lane. Precedent + rationale:
 # scripts/tests/test_install_reclaim_orphaned_worktrees_timer.py::test_install_copies_units_enables_timer_and_kicks_drain,
 # which asserts that byte-copy directly.
-PRODUCTION_CLAUDE_BIN = "/home/leo/.local/bin/claude"
-# Same reasoning: the unit names the production checkout absolutely, so the
-# account tokens it reads come from THAT .env, never a worktree's.
-PRODUCTION_ENV_FILE = "/home/leo/src/dark-factory/.env"
+PRODUCTION_CLAUDE_DIR = "/home/leo/.local/bin"
+# The account tokens the unit reads come from THE production checkout's .env,
+# never a worktree's. The leading "-" makes it optional to systemd.
+PRODUCTION_ENV_FILE = "-/home/leo/src/dark-factory/.env"
 
 
 # ---------------------------------------------------------------------------
@@ -260,15 +255,14 @@ def _service_environment(service_text):
     return env
 
 
-def test_service_template_pins_claude_bin():
+def test_service_template_pins_a_path_that_finds_claude():
     """Template-content invariant (NOT install behavior): the committed
-    @.service must pin LEGIBILITY_CLAUDE_BIN to an ABSOLUTE `claude` path.
+    @.service must pin PATH to an absolute list that reaches ``claude``.
 
-    Root cause this guards (2026-08-18): coder.py resolves the CLI as
-    `claude_bin or os.environ.get(_CLAUDE_BIN_ENV_VAR) or "claude"`, so
-    without this pin the bare name is execvp-resolved against whatever PATH
-    the `systemd --user` manager happens to hold. That manager started at
-    boot with NO ~/.local/bin on PATH -- the graphical login that imports
+    The shared runner spawns the BARE name ``claude``, resolved against the
+    child env's PATH, which it inherits from this unit (task 6042). Root cause
+    this guards (2026-08-18): the ``systemd --user`` manager started at boot
+    with NO ~/.local/bin on PATH -- the graphical login that imports
     ~/.profile came 84 minutes later -- and the timer's Persistent=true
     catch-up run fired into exactly that window, ENOENT'ing 6/6 selected
     digests on reify and 38/38 on dark_factory in about one second. The pin
@@ -277,33 +271,31 @@ def test_service_template_pins_claude_bin():
     service_text = (TEMPLATES_DIR / "legibility-trickle@.service").read_text()
     env = _service_environment(service_text)
 
-    # Read the env-var NAME from coder rather than hardcoding the literal:
-    # the pin is only useful because coder.py reads that exact variable, so
-    # a rename there must fail HERE instead of leaving a live unit setting a
-    # var nothing reads.
-    assert coder._CLAUDE_BIN_ENV_VAR in env, (
-        f"The trickle @.service must pin {coder._CLAUDE_BIN_ENV_VAR}= so the "
-        f"coder survives a systemd --user manager whose PATH lacks "
-        f"~/.local/bin; parsed [Service] Environment={env!r}"
+    assert "PATH" in env, (
+        f"The trickle @.service must pin PATH= so claude resolves under a "
+        f"systemd --user manager whose PATH lacks ~/.local/bin; parsed "
+        f"[Service] Environment={env!r}"
     )
-    value = env[coder._CLAUDE_BIN_ENV_VAR]
-    assert value == PRODUCTION_CLAUDE_BIN, (
-        f"Expected {coder._CLAUDE_BIN_ENV_VAR}={PRODUCTION_CLAUDE_BIN!r}, "
-        f"got {value!r}"
+    entries = env["PATH"].split(":")
+    assert all(os.path.isabs(entry) for entry in entries), (
+        f"every PATH entry must be ABSOLUTE -- a relative one resolves "
+        f"against the unit's cwd; got {entries!r}"
     )
-    # Asserted independently of the literal above: the entire point of the
-    # fix is surviving a PATH gap, so an edit back to a bare `claude` must
-    # fail even if someone also changes PRODUCTION_CLAUDE_BIN.
-    assert os.path.isabs(value), (
-        f"{coder._CLAUDE_BIN_ENV_VAR} must be an ABSOLUTE path (a bare name "
-        f"would be PATH-resolved, which is the failure being fixed); "
-        f"got {value!r}"
+    assert PRODUCTION_CLAUDE_DIR in entries, entries
+    assert "/usr/bin" in entries, entries
+    assert entries.index(PRODUCTION_CLAUDE_DIR) < entries.index("/usr/bin"), (
+        f"{PRODUCTION_CLAUDE_DIR} must come ahead of /usr/bin, so the "
+        f"operator's claude wins over any system copy; got {entries!r}"
     )
 
-    # Adding a second Environment= line must not displace the first.
+    assert "LEGIBILITY_CLAUDE_BIN" not in env, (
+        "nothing reads LEGIBILITY_CLAUDE_BIN any more -- the shared runner "
+        "resolves claude on PATH -- so a unit still setting it is a pin that "
+        "silently does nothing"
+    )
     assert "PYTHONPATH" in env, (
-        f"The pre-existing PYTHONPATH assignment must survive alongside the "
-        f"claude-bin pin; parsed [Service] Environment={env!r}"
+        f"The PYTHONPATH assignment must survive alongside the PATH pin; "
+        f"parsed [Service] Environment={env!r}"
     )
 
 
@@ -344,14 +336,17 @@ def test_service_template_carries_the_account_pool_and_pins_no_account():
     assert env_files == [PRODUCTION_ENV_FILE], (
         f"The trickle @.service must name the project .env as the source of "
         f"the CLAUDE_OAUTH_TOKEN_* pool (build_pool loads it in-process too; "
-        f"the unit is where the dependency is stated); got EnvironmentFile="
-        f"{env_files!r}"
+        f"the unit is where the dependency is stated), OPTIONALLY: a missing "
+        f".env must not stop the unit starting, because build_pool turns an "
+        f"empty pool into a recorded deferral (task 5635); got "
+        f"EnvironmentFile={env_files!r}"
     )
 
-    # The literal, not a constant read from coder: this asserts what systemd
-    # must UNSET, and coder.child_env's matching removal is a separate
-    # mechanism for a separate child. Two independent guards of one policy is
-    # the intent (docs/code-quality.md heuristic 10), not a duplication.
+    # The literal, not a constant read from shared: this asserts what systemd
+    # must UNSET, and the shared runner's matching strip
+    # (shared/src/shared/cli_invoke.py::_invoke_claude) is a separate
+    # mechanism for a separate process. Two independent guards of one policy
+    # is the intent (docs/code-quality.md heuristic 10), not a duplication.
     assert _service_directive(service_text, "UnsetEnvironment") == [
         "ANTHROPIC_API_KEY"
     ], (

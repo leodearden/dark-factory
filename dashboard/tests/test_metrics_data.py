@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
+import httpx
 import pytest
 
 from dashboard.data.metrics import (
@@ -292,6 +293,120 @@ async def test_merge_active_series_per_project_filter(metrics_db_path: Path):
         await db.close()
     assert agg['values'] == [5]
     assert scoped['values'] == [4]
+
+
+_EVENTS_SCHEMA = """
+CREATE TABLE events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    task_id TEXT,
+    event_type TEXT NOT NULL,
+    phase TEXT,
+    role TEXT,
+    data TEXT DEFAULT '{}',
+    cost_usd REAL,
+    duration_ms INTEGER
+);
+"""
+
+
+def _refusing_transport() -> httpx.MockTransport:
+    """Every fused-memory sampler fails fast, so only the merge sampler writes."""
+    def _refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError('refused', request=request)
+    return httpx.MockTransport(_refuse)
+
+
+@pytest.mark.asyncio
+async def test_the_merge_sampler_records_the_live_probe(tmp_path: Path, monkeypatch):
+    """merge_snapshots is the history of the reading the In-queue-now tile shows.
+
+    Only a reachable probe is a measurement: the unreachable project and the
+    project with no probe get no row. proj-a's runs.db holds fresh
+    merge_queued events, so a sampler still counting the events table would
+    record 5, not the probe's 2.
+    """
+    import dashboard.data.metrics as metrics_mod
+    from dashboard.config import DashboardConfig
+    from dashboard.data.memory import reset_sessions
+    from dashboard.data.metrics import collect_metrics_snapshot
+
+    roots = {name: tmp_path / name for name in ('proj-a', 'proj-b', 'proj-c')}
+    for root in roots.values():
+        root.mkdir()
+    escalation_urls = {'proj-a': 'http://127.0.0.1:9/mcp', 'proj-b': 'http://127.0.0.1:10/mcp'}
+    config = DashboardConfig(
+        project_root=roots['proj-a'],
+        known_project_roots=[roots['proj-b'], roots['proj-c']],
+        fused_memory_urls=['http://127.0.0.1:11'],
+        escalation_urls=escalation_urls,
+    )
+
+    probed: list[dict] = []
+
+    async def _live(client, urls, **_kwargs):
+        probed.append(dict(urls))
+        entry = {'task_id': '1', 'branch': 'task/1', 'state': 'queued',
+                 'age_secs': 3.0, 'position': 0, 'waiter_alive': True}
+        return {
+            'proj-a': {'entries': [entry, {**entry, 'task_id': '2'}],
+                       'reachable': True, 'metrics': None},
+            'proj-b': {'entries': [], 'reachable': False, 'error': 'connect refused',
+                       'metrics': None},
+        }
+
+    monkeypatch.setattr(metrics_mod, 'fetch_live_merge_queues', _live)
+    monkeypatch.setattr(metrics_mod, 'find_running_orchestrators', lambda: [])
+
+    runs_path = tmp_path / 'runs.db'
+    runs_sync = sqlite3.connect(str(runs_path))
+    runs_sync.executescript(_EVENTS_SCHEMA)
+    queued_at = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+    runs_sync.executemany(
+        "INSERT INTO events (timestamp, run_id, task_id, event_type) VALUES (?, ?, ?, 'merge_queued')",
+        [(queued_at, f'run-{i}', str(i)) for i in range(5)],
+    )
+    runs_sync.commit()
+    runs_sync.close()
+
+    metrics_conn = await aiosqlite.connect(str(tmp_path / 'metrics.db'))
+    await metrics_conn.executescript(METRICS_SCHEMA)
+    await metrics_conn.commit()
+    reset_sessions()
+    try:
+        async with httpx.AsyncClient(transport=_refusing_transport()) as http_client:
+            runs_conn = await aiosqlite.connect(str(runs_path))
+            runs_conn.row_factory = aiosqlite.Row
+            try:
+                await collect_metrics_snapshot(
+                    conn=metrics_conn,
+                    config=config,
+                    http_client=http_client,
+                    recon_db=None,
+                    merge_dbs=[
+                        (str(roots['proj-a']), runs_conn),
+                        (str(roots['proj-b']), None),
+                        (str(roots['proj-c']), None),
+                    ],
+                )
+            finally:
+                await runs_conn.close()
+
+        async with metrics_conn.execute(
+            'SELECT project_id, active_count FROM merge_snapshots'
+        ) as cur:
+            rows = [tuple(row) for row in await cur.fetchall()]
+        series = await get_merge_active_series(
+            metrics_conn, project_id=str(roots['proj-a']), now=datetime.now(UTC),
+        )
+    finally:
+        await metrics_conn.close()
+        reset_sessions()
+
+    assert probed == [escalation_urls], 'one probe, over the configured URLs'
+    assert rows == [(str(roots['proj-a']), 2)]
+    assert series['values'][-1] == 2
 
 
 # ---------------------------------------------------------------------------

@@ -23,6 +23,14 @@ must not start naming existing offenders twice.
 ``find_trailing_slash_mcp_urls(source, *, filename)`` returns
 ``list[tuple[int, str]]`` — the 1-based line number and the stripped source
 line — so the sweep guard can name offenders precisely.
+
+``sweep_source(source, *, filename)`` layers the inline
+``# mcp-url-sweep: allow <reason>`` marker policy over that raw detector and
+returns a ``SweepFindings``: the hits no well-formed marker exempts, the
+markers that exempt nothing, and the markers that are not well-formed. The
+ALLOW MARKERS cases below pin that policy; the raw-detector cases above stay
+marker-unaware on purpose, because staleness is only checkable against the
+unfiltered hits.
 """
 
 from __future__ import annotations
@@ -30,12 +38,17 @@ from __future__ import annotations
 import textwrap
 
 import pytest
-from _mcp_url_scan import find_trailing_slash_mcp_urls
+from _mcp_url_scan import SweepFindings, find_trailing_slash_mcp_urls, sweep_source
 
 
 def _scan(source: str) -> list[tuple[int, str]]:
     """Dedent a snippet and scan it, so cases can be written as indented literals."""
     return find_trailing_slash_mcp_urls(textwrap.dedent(source), filename='<snippet>')
+
+
+def _sweep(source: str) -> SweepFindings:
+    """Dedent a snippet and sweep it under the allow-marker policy."""
+    return sweep_source(textwrap.dedent(source), filename='<snippet>')
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +260,189 @@ def test_unparseable_source_fails_loudly():
     with pytest.raises(AssertionError) as excinfo:
         find_trailing_slash_mcp_urls(
             'def broken(:\n    pass\n', filename='orchestrator/src/orchestrator/nope.py'
+        )
+
+    assert 'orchestrator/src/orchestrator/nope.py' in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# ALLOW MARKERS — sweep_source
+# ---------------------------------------------------------------------------
+
+
+def test_reasoned_marker_on_the_hit_line_exempts_it():
+    """A well-formed marker on the reported line is the one sanctioned exemption."""
+    findings = _sweep("""\
+        cfg = {'url': f'{base}/mcp/'}  # mcp-url-sweep: allow CLI config entry; its client follows redirects
+        """)
+
+    assert findings == SweepFindings()
+
+
+def test_unmarked_hit_is_an_offender():
+    findings = _sweep("""\
+        resp = await client.post(f'{base}/mcp/', json=p)
+        """)
+
+    assert findings.offenders == ((1, "resp = await client.post(f'{base}/mcp/', json=p)"),)
+    assert findings.stale_markers == ()
+    assert findings.malformed_markers == ()
+
+
+@pytest.mark.parametrize(
+    ('comment', 'reported_as'),
+    [
+        ('# mcp-url-sweep: allow', '# mcp-url-sweep: allow'),
+        ('# mcp-url-sweep: allow   ', '# mcp-url-sweep: allow'),
+        ('# mcp-url-sweep:allow', '# mcp-url-sweep:allow'),
+    ],
+    ids=['bare', 'whitespace-only-reason', 'no-space-no-reason'],
+)
+def test_bare_marker_never_exempts(comment, reported_as):
+    """A marker without a reason cannot be a silent mute: the hit stays an offender.
+
+    It is also reported in its own bucket, so the failure names the marker
+    that needs a reason rather than leaving the reader to wonder why a marked
+    line still fails.
+    """
+    line = f"resp = client.post(f'{{b}}/mcp/')  {comment}"
+
+    findings = _sweep(line + '\n')
+
+    assert findings.offenders == ((1, line.strip()),)
+    assert findings.malformed_markers == ((1, reported_as),)
+    assert findings.stale_markers == ()
+
+
+def test_misspelled_marker_verb_is_malformed_and_does_not_exempt():
+    findings = _sweep("""\
+        resp = client.post(f'{b}/mcp/')  # mcp-url-sweep: alow redirects ok
+        """)
+
+    assert findings.offenders == (
+        (1, "resp = client.post(f'{b}/mcp/')  # mcp-url-sweep: alow redirects ok"),
+    )
+    assert findings.malformed_markers == ((1, '# mcp-url-sweep: alow redirects ok'),)
+    assert findings.stale_markers == ()
+
+
+def test_reasoned_marker_on_a_line_with_no_slashed_url_is_stale():
+    """A marker that outlived its defect is a hole waiting for the next one."""
+    findings = _sweep("""\
+        x = f'{base}/mcp'  # mcp-url-sweep: allow was a log string
+        """)
+
+    assert findings.stale_markers == ((1, '# mcp-url-sweep: allow was a log string'),)
+    assert findings.offenders == ()
+    assert findings.malformed_markers == ()
+
+
+@pytest.mark.parametrize(
+    ('source', 'hit_line', 'marker_line'),
+    [
+        ("# mcp-url-sweep: allow covers it\nresp = client.post(f'{b}/mcp/')\n", 2, 1),
+        ("resp = client.post(f'{b}/mcp/')\n# mcp-url-sweep: allow covers it\n", 1, 2),
+    ],
+    ids=['line-above', 'line-below'],
+)
+def test_marker_on_a_neighbouring_line_does_not_exempt(source, hit_line, marker_line):
+    """A marker exempts only the expression it sits on, never a neighbouring line's."""
+    findings = _sweep(source)
+
+    assert findings.offenders == ((hit_line, "resp = client.post(f'{b}/mcp/')"),)
+    assert findings.stale_markers == ((marker_line, '# mcp-url-sweep: allow covers it'),)
+    assert findings.malformed_markers == ()
+
+
+def test_marker_after_a_multiline_triple_quoted_literal_exempts_it():
+    """A string spanning lines can only carry a comment after its closing quotes.
+
+    The guard reports the line the string OPENS on, and that line ends inside
+    the string, so a rule demanding the marker on exactly the reported line
+    would leave this site impossible to exempt.
+    """
+    unmarked = _sweep('''\
+        url = """http://host
+        /mcp/"""
+        ''')
+    marked = _sweep('''\
+        url = """http://host
+        /mcp/"""  # mcp-url-sweep: allow fixture text, never fetched
+        ''')
+
+    assert unmarked.offenders == ((1, 'url = """http://host'),)
+    assert marked == SweepFindings()
+
+
+@pytest.mark.parametrize('marked_line', [1, 2], ids=['opening-line', 'literal-line'])
+def test_marker_on_any_line_of_a_multiline_slashed_expression_exempts_it(marked_line):
+    """``base +\\n '/mcp/'`` is reported where the ``+`` expression begins.
+
+    That is the ``base`` line, not the literal's, so the policy accepts a
+    marker on any line the flagged expression spans rather than making the
+    author guess which of them the guard means.
+    """
+    lines = ['url = (base +', "       '/mcp/')"]
+    unmarked = _sweep('\n'.join(lines) + '\n')
+    lines[marked_line - 1] += '  # mcp-url-sweep: allow fixture text, never fetched'
+    marked = _sweep('\n'.join(lines) + '\n')
+
+    assert unmarked.offenders == ((1, 'url = (base +'),)
+    assert marked == SweepFindings()
+
+
+def test_marker_text_inside_a_string_or_docstring_is_not_a_marker():
+    """Markers are comment TOKENS, not substrings of the line text.
+
+    A substring search would let a string argument mute its own call's hit,
+    and would report a docstring that merely documents the convention as a
+    stale marker.
+    """
+    in_a_string = _sweep("""\
+        resp = client.post(f'{b}/mcp/', note='# mcp-url-sweep: allow sneaky')
+        """)
+    in_a_docstring = _sweep('''\
+        def documented():
+            """Exempt a line with ``# mcp-url-sweep: allow <reason>``."""
+            return None
+        ''')
+
+    assert in_a_string.offenders == (
+        (1, "resp = client.post(f'{b}/mcp/', note='# mcp-url-sweep: allow sneaky')"),
+    )
+    assert in_a_string.stale_markers == ()
+    assert in_a_string.malformed_markers == ()
+    assert in_a_docstring == SweepFindings()
+
+
+def test_prose_mentioning_the_convention_mid_comment_is_not_a_marker():
+    """A marker must BEGIN the comment, like ``# type:`` and ``# pragma:``."""
+    findings = _sweep("""\
+        y = 1  # see the mcp-url-sweep: allow convention
+        """)
+
+    assert findings == SweepFindings()
+
+
+def test_marker_on_a_multiline_call_belongs_on_the_literal_line():
+    """The ``server/main.py::run_server`` shape: the literal opens on line 2, not 1."""
+    findings = _sweep("""\
+        logger.info(
+            '  Recon Report Endpoint: http://%s:%d/mcp/',  # mcp-url-sweep: allow log string, never fetched
+            host,
+            port,
+        )
+        """)
+
+    assert findings == SweepFindings()
+
+
+def test_sweep_source_still_fails_loudly_on_unparseable_source():
+    """The marker layer must not swallow the raw detector's parse failure."""
+    with pytest.raises(AssertionError) as excinfo:
+        sweep_source(
+            'def broken(:\n    pass  # mcp-url-sweep: allow x\n',
+            filename='orchestrator/src/orchestrator/nope.py',
         )
 
     assert 'orchestrator/src/orchestrator/nope.py' in str(excinfo.value)

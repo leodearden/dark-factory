@@ -29,13 +29,18 @@ only as good as that one.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from _dashboard_helpers import build_dual_escalation_tree, write_escalation_record
 
-from dashboard.data.escalations import build_escalation_queues
+from dashboard.data.escalation_corpus import corpus_queues, measure_corpus
+from dashboard.data.escalations import build_escalation_queues, card_datums
 from dashboard.data.redux_api import shape_escalations
+
+NOW = datetime(2026, 10, 1, 12, 0, 0, tzinfo=UTC)
+"""The instant the ESCALATIONS side's corpus walk is measured at."""
 
 # ---------------------------------------------------------------------------
 # The checker
@@ -94,7 +99,7 @@ def collect_escalation_id_violations(
         memory_evals_payload: what ``build_memory_evals`` returns (the
             MEMORY_EVALS block itself, unwrapped).
         escalations_payload: the ``ESCALATIONS`` block —
-            ``shape_escalations(build_escalation_queues(config), {})['ESCALATIONS']``.
+            ``_build_escalations(config)`` — ``shape_escalations(...)['ESCALATIONS']``.
             Rows live under ``subsections[k]['escalations']``; the key is
             ``escalations``, NOT ``rows`` (``rows`` is only ``shape_escalations``'
             local name for the list it is accumulating).
@@ -215,7 +220,10 @@ def _build_memory_evals(config) -> dict[str, Any]:
 
 def _build_escalations(config) -> dict[str, Any]:
     """The ESCALATIONS block, built from the SAME config the payload above used."""
-    return shape_escalations(build_escalation_queues(config), {})['ESCALATIONS']
+    queues = build_escalation_queues(
+        measure_corpus(corpus_queues(config), now=NOW), active_rows={},
+    )
+    return shape_escalations(queues, card_datums(queues, {}), served_at=NOW)['ESCALATIONS']
 
 
 def _reach_kind(path: str) -> str:
@@ -326,13 +334,16 @@ def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monke
     #     hand-rolled `json.dumps`: a fourth spelling of the record would drift
     #     from `escalation.models.Escalation`, and dropping `sort_keys` /
     #     `ensure_ascii` would stop this file being byte-shaped like a real one.
+    #
+    #     The file is renamed to the queue's own `esc-*.json` spelling, because
+    #     ESCALATIONS reads the corpus walk, which globs only that.
     numeric_id = 4242
     esc_dir = config.reconciliation_escalations_dir
     write_escalation_record(
         esc_dir, numeric_id,
         summary='numeric-id escalation',
         dedupe_fingerprint='eval:no-such-eval|metric:no-such-metric',
-    )
+    ).rename(esc_dir / f'esc-{numeric_id}.json')
 
     escalations_with_numeric = _build_escalations(config)
     assert any(

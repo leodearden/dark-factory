@@ -53,8 +53,8 @@ in every mutating queue path, taken outside any handler). A capability probe
 would also be actively misleading for them: their measured failure is
 MIS-TARGETING, where the target directory is writable and a probe passes
 exactly when the danger is present. They get a different guard for that,
-``target_store_preflight.py::assert_target_store_exists`` -- an existence
-assertion rather than a probe.
+``fused_memory/utils/target_store_preflight.py`` -- a read-only check that the
+target already holds records, rather than a capability probe.
 
 The consequence, which is the point of writing this down: an audit counting
 "shared production store" mutators will legitimately return a LARGER number

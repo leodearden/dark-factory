@@ -434,7 +434,7 @@ class TestTopicPinScoreContract:
     async def test_injected_anchor_carries_no_store_score_at_all(self, service):
         """ABSENT is not the same as 0.0 — and only absent is safe.
 
-        ``near_duplicate_guard._cosine_of`` treats a missing cosine as "not
+        ``near_duplicate_guard.cosine_of`` treats a missing cosine as "not
         comparable", which can never qualify at ANY threshold; a measured 0.0
         would still be a measurement, and a low threshold could clear it. This
         assertion is what stops a future refactor 'helpfully' copying a score

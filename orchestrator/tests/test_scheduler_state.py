@@ -531,14 +531,14 @@ class TestEffectivePrioritiesCache:
 _SNAPSHOT_KEYS = frozenset({
     'skip_counts', 'parks', 'park_stacks', 'effective_priorities',
     'pin_queue', 'overrides', 'current_holders', 'lock_depth', 'snapshot_at',
-    'is_paused', 'pause_reason', 'requeue_cooldowns',
+    'is_paused', 'pause_reason', 'requeue_cooldowns', 'pin_reservations',
 })
 
 
 class TestGetStateSnapshotShape:
-    """get_state_snapshot() returns the correct twelve-key dict."""
+    """get_state_snapshot() returns the correct thirteen-key dict."""
 
-    def test_snapshot_returns_twelve_top_level_keys(self):
+    def test_snapshot_returns_thirteen_top_level_keys(self):
         scheduler = Scheduler(OrchestratorConfig(max_per_module=1))
         scheduler.finish_startup()
         snap = scheduler.get_state_snapshot()
@@ -556,6 +556,7 @@ class TestGetStateSnapshotShape:
         assert snap['overrides'] == {}
         assert snap['current_holders'] == {}
         assert snap['requeue_cooldowns'] == {}
+        assert snap['pin_reservations'] == {}
         # snapshot_at must be an ISO8601 string.
         datetime.fromisoformat(snap['snapshot_at'])
         # Pause state defaults — scheduler is not paused at construction.

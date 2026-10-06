@@ -353,14 +353,18 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 def _make_worker(
     git_ops: GitOps, *, verifier: VerifyPort = merge_queue.PRODUCTION_VERIFIER,
+    queue: asyncio.Queue | None = None,
 ) -> SpeculativeMergeWorker:
     """Build a bare SpeculativeMergeWorker for unit tests (no harness wiring).
 
     *verifier* is the lane's injected ``VerifyPort``.  It defaults to the
     production one, so a caller that states no verdict of its own is
-    byte-identical to before the parameter existed.
+    byte-identical to before the parameter existed.  *queue* is the worker's
+    outer queue, fresh when omitted.
     """
-    return SpeculativeMergeWorker(git_ops, asyncio.Queue(), verifier=verifier)
+    return SpeculativeMergeWorker(
+        git_ops, asyncio.Queue() if queue is None else queue, verifier=verifier,
+    )
 
 
 def _verifier_with_scoped(scoped) -> ProductionVerifier:
@@ -1608,10 +1612,11 @@ class _GateScene:
     pool state stay REAL while the call ledgers stay observable.
     """
 
-    def __init__(self, git_ops, config, worker, repo, store, db_path) -> None:
+    def __init__(self, git_ops, config, worker, repo, store, db_path, queue) -> None:
         self.git_ops = git_ops
         self.config = config
         self.worker = worker
+        self.queue: asyncio.Queue = queue
         self.repo = repo
         self.store = store
         self.db_path = db_path
@@ -1657,9 +1662,7 @@ class _GateScene:
 
         for tid in task_ids:
             self.reqs[tid] = _make_req(tid, tid, self.config, self.repo)
-            await enqueue_merge_request(
-                self.worker._queue, self.reqs[tid], self.store,
-            )
+            await enqueue_merge_request(self.queue, self.reqs[tid], self.store)
         self.worker._drain_queue_into_lanes()
 
     async def round_(
@@ -2190,11 +2193,13 @@ async def _make_gate_scene(
     # to be settled before the worker exists; `verdict_log` is the ledger the
     # `verdict=` arm records onto, handed to the scene below.
     verdict_log: list[dict] = []
+    queue: asyncio.Queue = asyncio.Queue()
     worker = _make_worker(
         git_ops, verifier=_scene_verifier(verdict, real_local, verdict_log),
+        queue=queue,
     )
     worker._event_store = store
-    scene = _GateScene(git_ops, config, worker, repo, store, db_path)
+    scene = _GateScene(git_ops, config, worker, repo, store, db_path, queue)
     scene.verdicts = verdict_log
 
     if remote:
@@ -3352,28 +3357,28 @@ class TestRow8DeepFailsNeverFeedTheThrashLadder:
             f'the followers left their submission order: {queued!r}'
         )
 
-        # The head trailing them TWICE is the FIXTURE, not the code, so it is
+        # The head trailing them is the FIXTURE, not the code, so it is
         # asserted on its own rather than folded into the expected list above:
         # each red round requeues its dispatching request onto the outer queue,
         # and `_pair` re-dispatches the same object on round 2 by design (its
         # docstring says why) instead of consuming round 1's requeue, so the
-        # one request is queued twice over.  Split, a `_pair` cleanup that
-        # consumed the requeue reddens only this claim, and a genuine leak
-        # producing a THIRD requeue is distinguishable from the fixture's own
-        # noise instead of reading as the same failure as a reorder.
+        # one request is queued twice over.  snapshot() renders it once (task
+        # 4582); the outer queue, read raw below, still holds both copies, so
+        # a genuine leak producing a THIRD requeue is told apart from the
+        # fixture's own noise.
         tail = queued[len(followers):]
-        assert tail.count('101') == 2, (
-            f'the dispatching head must trail the followers exactly twice — '
-            f'once per red round, `_pair` re-dispatching the same object; '
-            f'got {tail!r}'
-        )
-        assert set(tail) == {'101'}, (
-            f'nothing but the requeued head may sit behind the followers; '
-            f'got {tail!r}'
+        assert tail == ['101'], (
+            f'only the requeued head may sit behind the followers, rendered '
+            f'once; got {tail!r}'
         )
         assert queued_in_lane(worker, 'high') == [], (
             f'nothing was ever enqueued high; got '
             f'{queued_in_lane(worker, "high")!r}'
+        )
+        outer = [scene.queue.get_nowait().task_id for _ in range(scene.queue.qsize())]
+        assert outer == ['101', '101'], (
+            f'the outer queue must hold the head exactly twice — once per red '
+            f'round, `_pair` re-dispatching the same object; got {outer!r}'
         )
 
     async def test_the_pair_leaves_the_shipped_thrash_ladder_byte_identical(

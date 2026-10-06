@@ -60,11 +60,6 @@ from dashboard.data.costs import (
     aggregate_cost_trend,
 )
 from dashboard.data.db import DbPool
-from dashboard.data.escalation_analytics import (
-    archive_scan_succeeded,
-    build_escalation_analytics,
-)
-from dashboard.data.escalations import fetch_pins_recovery
 from dashboard.data.load import get_load_metrics
 from dashboard.data.mcp_fanout import (
     FANOUT_FAILURE_EXCEPTIONS,
@@ -82,11 +77,8 @@ from dashboard.data.metrics import (
 )
 from dashboard.data.model_role import aggregate_model_role_rollup
 from dashboard.data.performance import (
-    aggregate_completion_paths,
-    aggregate_escalation_rates,
-    aggregate_loop_histograms,
+    aggregate_performance_cards,
     aggregate_performance_history,
-    aggregate_time_centiles,
 )
 from dashboard.data.reconciliation import (
     get_buffer_stats,
@@ -97,18 +89,9 @@ from dashboard.data.reconciliation import (
     partition_burst_state,
 )
 from dashboard.data.scheduler import get_scheduler_snapshot
-from dashboard.data.tasks import (
-    _FETCH_TASKS_TTL_SECONDS,
-    _CompleteRead,
-    _fetch_tasks_cache,
-    _TasksRead,
-    fetch_tasks,
-)
+from dashboard.data.tasks import fetch_tasks
 from dashboard.data.utils import safe_gather_result
-from dashboard.data.write_journal import (
-    get_memory_timeseries,
-    get_operations_breakdown,
-)
+from dashboard.data.write_journal import empty_memory_ops, get_memory_ops
 from dashboard.http_pool import reaper_loop
 from dashboard.loops import _burndown_loop, _BurndownStore, _metrics_loop, _MetricsStore
 from dashboard.project_dbs import _cost_dbs
@@ -477,44 +460,33 @@ _HEALTHZ_TOTAL_BUDGET = 3.0
 #
 # NOTHING WAS WIDENED to make room: _DB_PROBE_TIMEOUT and _HEALTHZ_TOTAL_BUDGET
 # are untouched. 0.2s is sufficient precisely BECAUSE the probe never needs to
-# see a healthy fetch FINISH -- it either finds warmth or grace for free, or it
-# leaves a background task running for the NEXT /healthz to observe. See
+# see a healthy fetch FINISH -- it either finds grace for free, or it leaves a
+# background task running for the NEXT /healthz to observe. See
 # _probe_mcp_fanout.
 _MCP_PROBE_TIMEOUT = 0.2
 
 # How long a single observed fan-out COMPLETION answers for.
 #
-# Must be at least one ``tasks._FETCH_TASKS_TTL_SECONDS`` (20.0) wide: the warm
-# signal below goes stale every TTL by construction, so a grace narrower than
-# the TTL would let an ordinary expiry between two 3s browser polls read as a
-# wedge. 30.0 gives 1.5 TTLs, which also absorbs the journal's routine ~2.0s
+# A lapsed grace is cheap rather than alarming: the next /healthz starts a
+# probe, and a probe younger than _MCP_PROBE_OUTSTANDING_LIMIT reports
+# 'probing', never 'timeout'. So this window only decides how often /healthz
+# spends an MCP traversal. 30.0 also absorbs the journal's routine ~2.0s
 # ReadTimeout/recovered cycles against localhost:8002 without flipping the
 # verdict.
 _MCP_FANOUT_OK_GRACE_SECONDS = 30.0
 
 # How long a LIVE probe may be outstanding before it is reported as a wedge.
 #
-# WHAT THIS CLOSES, and why it is not a widening of anything. Nothing
-# SERVER-side refreshes the primary root's full-tree cache key: the only
-# steady-state writer is the browser's 3 s
-# ``/api/v2/dashboard/orchestrators`` poll. On an UNATTENDED dashboard the
-# warm signal (one TTL) and the grace (30.0 s) therefore BOTH lapse, so
-# without this bound every later /healthz would launch a probe it cannot
-# possibly observe inside a 0.2 s budget and report ``'timeout'`` — a strict
-# 503/200 alternation on an idle but perfectly healthy dashboard, which is a
-# false alarm on the very signal this check adds.
-#
-# So a probe that is merely YOUNG reports ``'probing'``, not ``'timeout'``: a
-# fan-out started a moment ago has demonstrated nothing yet, and saying
-# otherwise is the same unknown-reported-as-fact the ``degraded`` vs
-# ``offline`` split exists to prevent. Once a probe has been outstanding for a
-# WHOLE TTL without landing it is no longer young — a healthy cold fetch of
-# the largest measured tree costs ~6 s — and the wedge is reported for as long
-# as it lasts, which is the 19.8 h fact nothing reported.
-#
-# Bound to the TTL BY REFERENCE rather than restated: the window this must
-# outlast is exactly the one a stored value is trusted for.
-_MCP_PROBE_OUTSTANDING_LIMIT = _FETCH_TASKS_TTL_SECONDS
+# Only a completed probe stamps the grace, so an unattended dashboard's grace
+# lapses every 30.0 s and the next /healthz launches a probe it cannot observe
+# inside 0.2 s. Younger than this, that probe reports 'probing' -- it has shown
+# nothing yet -- rather than a false 'timeout'. Older, it has outlived
+# tasks.DEFAULT_WHOLE_OPERATION_BUDGET (the cap on a healthy cold whole-tree
+# fetch) nearly three times over, and the wedge is reported for as long as it
+# lasts. Invariant (machine-checked by
+# test_healthz_data_plane_budget_is_structurally_deliverable):
+#   _MCP_PROBE_OUTSTANDING_LIMIT >= tasks.DEFAULT_WHOLE_OPERATION_BUDGET
+_MCP_PROBE_OUTSTANDING_LIMIT = 20.0
 
 
 def _healthz_db_targets(config: DashboardConfig) -> list[tuple[str, Path]]:
@@ -622,8 +594,7 @@ async def _probe_db(pool: DbPool, db_path: Path, budget: float) -> str:
 #
 # The single-flight probe, and the loop time at which a fan-out last
 # COMPLETED. Module state rather than app.state because /healthz is the only
-# reader and a test hook resets both; _mcp_probe_state_clear mirrors
-# _task_cards_cache_clear.
+# reader and a test hook resets both: _mcp_probe_state_clear.
 
 
 class _LiveProbe(NamedTuple):
@@ -709,29 +680,27 @@ async def _probe_mcp_fanout(
     closes. Conversely a probe keyed on the fetch SUCCEEDING false-alarms: the
     journal's routine ReadTimeout/recovered cycles return the
     ``{'offline': True, ...}`` marker after ~2.0s, longer than any budget that
-    fits inside _HEALTHZ_TOTAL_BUDGET. Only "could a caller get THROUGH the
-    cache in front of the substrate, inside a bound" separates the two, and
-    that is the property the incident actually violated. So a COMPLETED
-    fan-out is 'ok' whatever it returned, the offline marker included.
+    fits inside _HEALTHZ_TOTAL_BUDGET. Only "could a caller get THROUGH to
+    the substrate, inside a bound" separates the two, and that is the property
+    the incident actually violated. So a COMPLETED fan-out is 'ok' whatever it
+    returned, the offline marker included.
 
-    Three signals, cheapest first:
+    Two signals, cheapest first:
 
-    1. WARM -- a fresh entry in ``tasks._fetch_tasks_cache`` for the routes'
-       own key. Free, and conclusive: a stored value proves a refresh COMPLETED
-       inside the TTL. ``get_or_refresh``'s own docstring records that during
-       the incident "nothing was ever stored for the wedged key", which is why
-       this is the right signal rather than a proxy for one. With the browser
-       polling every 3s this is the steady state, so /healthz normally costs
-       ZERO MCP calls.
-    2. GRACE -- a fan-out completion observed within
+    1. GRACE -- a completion of THIS probe observed within
        _MCP_FANOUT_OK_GRACE_SECONDS. This is what keeps an occasional 2.0s
-       ReadTimeout, or one expired cache entry between polls, from flipping the
-       verdict.
-    3. PROBE -- start, or JOIN if one is already live, a single-flight
+       ReadTimeout from flipping the verdict.
+    2. PROBE -- start, or JOIN if one is already live, a single-flight
        background ``fetch_tasks`` and wait at most *budget* using
        ``asyncio.wait({task}, timeout=...)`` (NOT ``wait_for``, which awaits
        the cancelled operation's unwinding -- the same reason _probe_db uses
        this idiom).
+
+    The probe is deliberately the RAW, uncached ``fetch_tasks``, and nothing
+    another caller stored is consulted: a stored value must never answer for a
+    traversal (one-datum-one-path PRD decision 17), because a read that
+    completed before a wedge began says nothing about whether a caller can get
+    through now.
 
     The task is NOT cancelled on expiry and NOT relaunched while live. That is
     what makes the two cases distinguishable at all: a healthy-but-COLD system
@@ -743,24 +712,12 @@ async def _probe_mcp_fanout(
     watchdog tick, and single-flight is what stops three /healthz calls costing
     three.
 
-    WHAT WARMTH DOES NOT DO, stated because an earlier version of this
-    docstring claimed the opposite: warmth does NOT carry an unattended
-    dashboard. Nothing server-side refreshes the primary root's key -- the only
-    steady-state writer is the browser's 3s poll -- so with no browser attached
-    both warmth and grace lapse on a healthy system, and the 'probing' verdict
-    is what stops that lapse reading as a wedge. See
+    The grace lapses on a healthy but unattended dashboard too, and the
+    'probing' verdict is what stops that lapse reading as a wedge. See
     _MCP_PROBE_OUTSTANDING_LIMIT.
     """
     global _mcp_probe, _mcp_fanout_last_ok
     loop = asyncio.get_running_loop()
-
-    # The SAME read record _fanout_probe_completion's own unnarrowed
-    # ``fetch_tasks(client, config, config.project_root)`` builds (task 5018
-    # made the cache key a structured record): whole tree, no status
-    # narrowing, one unpaginated request.
-    key = _TasksRead(str(config.project_root), None, _CompleteRead(None))
-    if _fetch_tasks_cache.get_fresh(key) is not None:
-        return 'ok'
 
     last_ok = _mcp_fanout_last_ok
     if last_ok is not None and (loop.time() - last_ok) < _MCP_FANOUT_OK_GRACE_SECONDS:
@@ -914,8 +871,8 @@ async def healthz(request: Request) -> JSONResponse:
         checks['mcp_fanout'] = status
         # 'probing' is NOT a claim of ill-health, exactly as the DB loop's
         # 'unavailable' is not: a fan-out started moments ago has demonstrated
-        # nothing yet, and an unattended dashboard reaches that state on every
-        # cache expiry. Folding it into the verdict would 503 an idle but
+        # nothing yet, and an unattended dashboard reaches that state every
+        # time the grace lapses. Folding it into the verdict would 503 an idle but
         # perfectly healthy dashboard on a fixed cadence forever — a false
         # alarm on the exact signal this check adds. See
         # _MCP_PROBE_OUTSTANDING_LIMIT for the bound that keeps 'probing' from
@@ -967,22 +924,16 @@ async def _performance_resources(
 
 @app.get('/api/v2/dashboard/memory-graphs')
 async def api_memory_graphs(request: Request) -> JSONResponse:
-    """MEMORY_TIMESERIES + MEMORY_OPS_BREAKDOWN from the write journal."""
+    """MEMORY_OPS from the write journal."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     db = await pool.get(config.write_journal_db)
-    ts_r, ops_r = await asyncio.gather(
-        get_memory_timeseries(db),
-        get_operations_breakdown(db),
-        return_exceptions=True,
-    )
-    timeseries = safe_gather_result(
-        ts_r, {'labels': [], 'reads': [], 'writes': []}, 'memory-graphs/ts'
-    )
-    ops = cast(
-        ChartData, safe_gather_result(ops_r, {'labels': [], 'values': []}, 'memory-graphs/ops')
-    )
-    return JSONResponse(redux_api.shape_memory_graphs(timeseries, ops))
+    try:
+        ops = await get_memory_ops(db)
+    except Exception:
+        logger.warning('memory-graphs: memory ops read failed', exc_info=True)
+        ops = empty_memory_ops()
+    return JSONResponse(redux_api.shape_memory_graphs(ops))
 
 
 @app.get('/api/v2/dashboard/recon')
@@ -1066,25 +1017,21 @@ async def api_costs(request: Request) -> JSONResponse:
 
 @app.get('/api/v2/dashboard/performance')
 async def api_performance(request: Request) -> JSONResponse:
-    """PERFORMANCE — completion paths / escalation / loop histograms / TTC."""
+    """PERFORMANCE + served_at — per-project cards Datum and sparkline histories."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     dbs, esc_dirs = await _performance_resources(config, pool)
     window = _parse_window(request.query_params, default='7d')
-    paths_r, esc_r, hist_r, ttc_r, history_r = await asyncio.gather(
-        aggregate_completion_paths(dbs, esc_dirs),
-        aggregate_escalation_rates(dbs, esc_dirs),
-        aggregate_loop_histograms(dbs),
-        aggregate_time_centiles(dbs),
-        aggregate_performance_history(dbs, days=window.days),
+    now = datetime.now(UTC)  # clock-exempt: single-capture route
+    cards_r, history_r = await asyncio.gather(
+        aggregate_performance_cards(dbs, esc_dirs, days=window.days, now=now),
+        aggregate_performance_history(dbs, days=window.days, now=now),
         return_exceptions=True,
     )
     shaped = redux_api.shape_performance(
-        paths=safe_gather_result(paths_r, {}, 'perf/paths'),
-        escalations=safe_gather_result(esc_r, {}, 'perf/escalations'),
-        histograms=safe_gather_result(hist_r, {}, 'perf/histograms'),
-        ttc=safe_gather_result(ttc_r, {}, 'perf/ttc'),
+        cards=safe_gather_result(cards_r, {}, 'perf/cards'),
         history=safe_gather_result(history_r, {}, 'perf/history'),
+        served_at=now,
     )
     return JSONResponse(with_window(shaped, window))
 
@@ -1669,116 +1616,7 @@ async def api_load(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# Escalation-analytics TTL cache
-# (mirrors dashboard/api/escalations.py::_task_cards_cache)
-# ---------------------------------------------------------------------------
-
-_ANALYTICS_TTL_SECONDS = 60.0
-_analytics_cache: TTLCache[dict] = TTLCache(ttl_seconds=lambda: _ANALYTICS_TTL_SECONDS)
-
-
-def _analytics_cache_clear() -> None:
-    """Clear the escalation-analytics TTL cache (test hook)."""
-    _analytics_cache.clear()
-
-
-def _analytics_project_dirs(config: DashboardConfig) -> list[tuple[str, Path, Path]]:
-    """Escalation-analytics project dirs: primary root first, then known_project_roots.
-
-    Mirrors build_escalation_queues' primary-first, de-duped root iteration
-    (label=root.name). The primary entry is built from config.escalations_dir /
-    config.runs_db (rather than hand-building `config.project_root / 'data' / ...`)
-    so a DASHBOARD_PROJECT_ROOT env override is honored automatically.
-    """
-    seen: set[Path] = {config.project_root}
-    dirs: list[tuple[str, Path, Path]] = [
-        (config.project_root.name, config.escalations_dir, config.runs_db),
-    ]
-    for root in config.known_project_roots:
-        if root not in seen:
-            seen.add(root)
-            dirs.append((
-                root.name,
-                root / 'data' / 'escalations',
-                root / 'data' / 'orchestrator' / 'runs.db',
-            ))
-    return dirs
-
-
-@app.get('/api/v2/dashboard/escalation-analytics')
-async def api_escalation_analytics(request: Request) -> JSONResponse:
-    """ESCALATION_ANALYTICS — origin/lifespan/workflow aggregates over the escalation archive.
-
-    The archive walk (potentially ~10k records across all project roots) runs
-    in a worker thread via asyncio.to_thread behind a ~60s single-flight TTL
-    cache, so a cold scan never blocks the event loop and repeated polls
-    within the TTL window are free. No clock read here — the aggregator
-    resolves `now` once internally via resolve_now (clock-discipline guard
-    scans dashboard/data/*.py + app.py; resolve_now is the sanctioned site).
-
-    A scan that reached NO archive at all is served but NOT cached
-    (cache_ok=archive_scan_succeeded), matching api_memory_evals'
-    root_scan_succeeded gate — the two routes are one idiom and are kept so
-    deliberately. Both decline to cache a build that walked nothing: it is
-    O(1) to re-derive (one negative is_dir stat per project), while caching it
-    keeps the tab reporting an empty archive for a full TTL window after the
-    volume mounts, and the archive is the thing most likely to appear on the
-    next poll. The only asymmetry is that memory-evals has ONE root, so
-    "reached nothing" and "reached not everything" coincide there.
-
-    A PARTIAL scan IS cached, and archives_present: false rides along in the
-    payload as the diagnostic. That is not a concession — keyed on
-    archives_present (all) instead, this cache is dead in the installed
-    config: measured 2026-08-01 against the unit's own
-    DASHBOARD_KNOWN_PROJECT_ROOTS (9 roots), 2 roots have no data/escalations
-    dir while the other 7 hold ~9.1k records, so the predicate never passes,
-    the 60s TTL never stores anything, and every 3s poll re-runs the whole
-    multi-second walk. Trade-off actually being accepted: an archive that
-    disappears mid-life leaves that project's panel up to one TTL window
-    stale — the right side of it, since the alternative costs the full
-    re-walk on every poll, forever, for every ordinary multi-project config.
-
-    Deliberately NOT keyed on parse_failures: that counts unparseable records
-    and is permanent for a corrupt file, so gating on it would defeat the
-    cache forever in front of the very walk it protects.
-    """
-    config: DashboardConfig = request.app.state.config
-    http_client: httpx.AsyncClient = request.app.state.http_client
-    project_dirs = _analytics_project_dirs(config)
-    key = str(project_dirs)
-
-    async def _refresh() -> dict:
-        # The pins_recovery fan-out is async and MUST stay on this side of the
-        # to_thread boundary: build_escalation_analytics is the pure-sync
-        # archive walker, and an MCP round-trip inside it would block a worker
-        # thread on the network. It runs inside _refresh (not per request) so
-        # it is paid only on a cache miss, giving the annotation the same ~60s
-        # freshness as the payload it rides in — a fresher annotation could not
-        # be shown anyway, since the cache serves the whole dict.
-        #
-        # fetch_pins_recovery already isolates per-project failures (an
-        # unreachable orchestrator maps to None, i.e. unknown, and never sinks
-        # its siblings). This guard covers only the unexpected: whatever the
-        # cause, the analytics tab must still render, one annotation short.
-        try:
-            pins = await fetch_pins_recovery(http_client, config.escalation_urls)
-        except Exception as exc:  # noqa: BLE001 — the tab must survive this
-            logger.warning(
-                'pins_recovery fan-out failed (analytics served unannotated): %s', exc,
-            )
-            pins = None
-        return await asyncio.to_thread(
-            build_escalation_analytics, project_dirs, pins_by_project=pins,
-        )
-
-    result = await _analytics_cache.get_or_refresh(
-        key, _refresh, cache_ok=archive_scan_succeeded,
-    )
-    return JSONResponse({'ESCALATION_ANALYTICS': result})
-
-
-# ---------------------------------------------------------------------------
-# Memory-evals TTL cache (mirrors _analytics_cache above)
+# Memory-evals TTL cache
 # ---------------------------------------------------------------------------
 
 _MEMORY_EVALS_TTL_SECONDS = 60.0
@@ -1803,8 +1641,7 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     resolve_now is the sanctioned site).
 
     A scan that never REACHED the tree is served but NOT cached (cache_ok=
-    root_scan_succeeded), mirroring how _load_task_cards declines to cache an
-    offline marker: an absent root and an unwalkable one are both O(1) to
+    root_scan_succeeded): an absent root and an unwalkable one are both O(1) to
     re-derive, so re-checking each poll costs nothing, while caching them
     would keep reporting "no evals have ever run" for a full TTL window after
     the tree lands. A build-ABORTING bug (a top-level internal_error, carrying
@@ -1816,10 +1653,12 @@ async def api_memory_evals(request: Request) -> JSONResponse:
     to prevent. The issue rides the payload either way, so which side of that
     line a degradation falls on costs the operator no visibility.
 
-    Same idiom as api_escalation_analytics' archive_scan_succeeded: both
-    routes decline to cache only a scan that reached NOTHING. The asymmetry
-    is that memory-evals has ONE root, so "reached nothing" and "reached not
-    everything" coincide here; analytics has N and must distinguish them.
+    Same idiom as the escalation corpus cache
+    (dashboard/src/dashboard/data/escalation_corpus.py::acquire_corpus): both
+    decline to cache only a scan that reached NOTHING. The asymmetry is that
+    memory-evals has ONE root, so "reached nothing" and "reached not
+    everything" coincide here; the corpus has N queues and must distinguish
+    them.
 
     The escalation source is config.reconciliation_escalations_dir: memory-eval
     regressions are filed onto the 8103 recon queue (memory-eval-program.md
@@ -1844,6 +1683,5 @@ __all__: Sequence[str] = (
     'lifespan',
     '_performance_resources',
     '_mcp_probe_state_clear',
-    '_analytics_cache_clear',
     '_memory_evals_cache_clear',
 )

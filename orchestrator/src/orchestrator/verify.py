@@ -796,6 +796,24 @@ def _is_worker_death_truncated_session(output: str) -> bool:
     return _worker_death_truncation_evidence(output) is not None
 
 
+def _shows_xdist_worker_death(output: str) -> bool:
+    """Return True when *output* carries ANY xdist worker-death marker.
+
+    Deliberately WIDER than ``_is_worker_death_truncated_session``: under
+    ``--max-worker-restart=0`` every worker death aborts the session, and the
+    ``-q`` witness reads only the FINAL progress line, which
+    ``_aggregate_results``'s per-module join can hand to a later, completed
+    module. The accepted costs, both keeping the merge red (the safe
+    direction): a crash xdist recovered from (cap > 0) is refused, and so is
+    a session whose assertion diff or captured output merely quotes a marker,
+    since the search spans all of *output*. The first is pinned in
+    test_flake_discriminator.py::TestTruncatedSessionIsUnconfirmable.
+    """
+    if not output:
+        return False
+    return bool(_XDIST_WORKER_CRASH_RE.search(output) or _XDIST_SESSION_ABORTED_RE.search(output))
+
+
 def _crash_attributed_nodeids(output: str) -> set[str]:
     """Return the node-ids *output* attributes to a dead worker, not to a verdict.
 
@@ -1914,10 +1932,10 @@ def _with_junitxml_str(cmd: str | None, junit_path: str) -> str | None:
     or does not parse into a structured PYTEST command.
 
     **Why this logs (task 3218).** The no-op is not always benign. The caller
-    only injects when ``role=='merge'`` and ``breadth=='full'``, i.e. exactly
-    when a junit report WAS expected: it drives
-    ``_extract_failing_test_ids_from_junit``, the α flake-confirmation gate
-    and the per-test timeout floor. Silently skipping it there degrades those
+    only injects when a junit report WAS expected: at a full-breadth merge
+    verify it drives ``_extract_failing_test_ids_from_junit``, the α
+    flake-confirmation gate and the per-test timeout floor, and on a task
+    leg with an archive it is the leg's cost record (task 5671). Silently skipping it there degrades those
     downstream capabilities with no record anywhere — the failure mode the
     reverse-dependency widening already avoids by logging its own no-op
     (see the ``logger.warning`` in ``reverse_dependent_test_targets``'s
@@ -2225,7 +2243,13 @@ def _summarize_checks(
     return passed, category, cause_hint, summary, per_check_categories
 
 
-def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> dict:
+def _build_summary_payload(
+    runs: list[dict],
+    category: str,
+    cause_hint: str,
+    *,
+    role: Literal['merge', 'task', 'background'],
+) -> dict:
     """Build the summary.json payload dict from a list of run dicts.
 
     Extracted from ``_persist_attempt_logs`` so both the task-path summary
@@ -2239,7 +2263,9 @@ def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> 
     signal for the outermost process, while category conveys semantic severity
     across tools that may use different rc scales.  Downstream readers should
     treat top-level metadata as "the loudest raw exit code" and 'category' as
-    "the highest-severity classification".
+    "the highest-severity classification". ``label`` (task 5671) names which
+    leg those fields describe, so a reader never has to assume it is the test
+    leg.
 
     Each ``commands`` entry also carries ``segments`` (task 3338): the
     per-segment execution facts when that check ran as a SEGMENTED `&&` chain,
@@ -2257,6 +2283,12 @@ def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> 
     column, which is the defect above repeated on the deliverable whose entire
     purpose is that column.
 
+    ``role`` (task 5671) is the verify role that produced the record, as
+    structured data. The census used to infer it from a ``.worktrees/<lane>``
+    path, and the archive has no such path, so every archived record was
+    role-less. It is a required keyword so no writer can emit a record
+    without it.
+
     A NEGATIVE rc is not a quiet outcome — it is asyncio reporting that the
     process was terminated by signal ``-rc`` and never got to exit at all, so
     it is the LOUDEST possible outcome and sorts above every non-negative rc
@@ -2269,12 +2301,14 @@ def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> 
     if active_runs:
         worst = max(active_runs, key=lambda r: (r['rc'] < 0, r['rc'], r['timed_out']))
     else:
-        worst = {'rc': 0, 'timed_out': False, 'cmd': None,
+        worst = {'label': None, 'rc': 0, 'timed_out': False, 'cmd': None,
                  'started_at': '', 'duration_secs': 0.0}
 
     return {
+        'role': role,
         'category': category,
         'cause_hint': cause_hint,
+        'label': worst['label'],
         'rc': worst['rc'],
         'timed_out': worst['timed_out'],
         'cmd': worst['cmd'],
@@ -2290,6 +2324,7 @@ def _build_summary_payload(runs: list[dict], category: str, cause_hint: str) -> 
                 'duration_secs': r['duration_secs'],
                 'segments': r.get('segments'),
                 'load': r.get('load'),
+                'slot_wait_secs': r.get('slot_wait_secs'),
             }
             for r in active_runs
         ],
@@ -2353,6 +2388,138 @@ def _prepare_junit_report_path(
     except OSError:
         return None
     return report
+
+
+def _task_junit_report_path(
+    worktree: Path,
+    attempt_id: int,
+    module_prefix: 'str | None',
+    *,
+    segment_label: 'str | None' = None,
+) -> 'Path | None':
+    """Build a task-path junit report path under the gitignored ``.task/verify/``.
+
+    The ONE owner of that filename:
+    ``attempt-{N}[.{safe_prefix}].test[.{segment_label}].junit.xml``, the
+    attempt-log naming beside it, so per-module fan-out and per-segment runs
+    never share a path. ``.task/verify/`` rather than ``.df-verify-junit/``
+    because the latter is not gitignored and would be an untracked dir in a
+    live task tree.
+
+    Absolute with an unresolved final component, as
+    :func:`_prepare_junit_report_path` returns. ``None`` without creating
+    anything when ``.task/`` is absent (review checkpoints, merge worktrees),
+    and ``None`` when the directory cannot be created.
+    """
+    task_dir = worktree / '.task'
+    if not task_dir.is_dir():
+        return None
+    verify_dir = task_dir / 'verify'
+    segment = f'.{segment_label}' if segment_label is not None else ''
+    try:
+        verify_dir.mkdir(exist_ok=True)
+        return verify_dir.resolve() / (
+            f'attempt-{attempt_id}{_make_infix(module_prefix)}.test{segment}.junit.xml'
+        )
+    except OSError:
+        return None
+
+
+@dataclass(frozen=True)
+class _JunitReportPlan:
+    """Which junit report a verify's test leg writes, and what it is FOR.
+
+    The one place that is decided: the injection, segment, parse and archive
+    sites all read ``kind`` rather than re-deriving it (task 5671).
+
+    - ``'attributing'``: a merge verify at full breadth. One leg-level report,
+      parsed into ``VerifyResult.failing_test_ids`` and archived. Never
+      written per segment (task 3478).
+    - ``'cost'``: a task verify with an archive destination. Archived, never
+      parsed, so task-path attribution is unchanged. A segmented leg writes
+      one per segment instead, at :meth:`segment_path`.
+    - ``None``: no report, because nothing would consume it.
+
+    ``leg_path`` is set exactly when ``kind`` is: a report directory that
+    cannot be prepared makes the plan "no report".
+    """
+
+    kind: Literal['attributing', 'cost'] | None
+    leg_path: 'Path | None'
+    worktree: Path
+    attempt_id: 'int | None'
+    module_prefix: 'str | None'
+
+    def __post_init__(self) -> None:
+        if (self.kind is None) != (self.leg_path is None):
+            raise ValueError(f'junit plan kind {self.kind!r} with leg_path {self.leg_path!r}')
+        if self.kind == 'cost' and self.attempt_id is None:
+            raise ValueError('a cost-record junit plan needs an attempt_id to name its reports')
+
+    @classmethod
+    def for_leg(
+        cls,
+        worktree: Path,
+        module_prefix: 'str | None',
+        *,
+        role: str,
+        merge_breadth_full: bool,
+        attempt_id: 'int | None',
+        task_id: 'str | None',
+        archive_root: 'Path | None',
+    ) -> '_JunitReportPlan':
+        kind: Literal['attributing', 'cost'] | None = None
+        leg_path: Path | None = None
+        if role == 'merge' and merge_breadth_full:
+            kind = 'attributing'
+            # Shape-2 husk guard (task 2922): None, rather than re-creating a
+            # torn-down worktree as an empty husk for a late writer.
+            leg_path = _prepare_junit_report_path(worktree, module_prefix)
+        elif (
+            role == 'task'
+            and attempt_id is not None
+            and task_id is not None
+            and archive_root is not None
+        ):
+            kind = 'cost'
+            leg_path = _task_junit_report_path(worktree, attempt_id, module_prefix)
+        return cls(
+            kind=kind if leg_path is not None else None,
+            leg_path=leg_path,
+            worktree=worktree,
+            attempt_id=attempt_id,
+            module_prefix=module_prefix,
+        )
+
+    def segment_path(self, segment_label: str) -> 'Path | None':
+        """One segment's own report path for a cost record, else ``None``."""
+        if self.kind != 'cost':
+            return None
+        assert self.attempt_id is not None  # __post_init__ requires it for 'cost'
+        return _task_junit_report_path(
+            self.worktree, self.attempt_id, self.module_prefix,
+            segment_label=segment_label,
+        )
+
+    def reports_to_archive(
+        self, segments: 'list[dict] | None',
+    ) -> 'list[tuple[Path, str | None]]':
+        """``(report, segment_label)`` for each report this leg's run owns.
+
+        Unsegmented, the one leg report. Segmented, each segment that ran: a
+        not_run segment cleared nothing, so its path may still hold a
+        predecessor pass's report, which is not this run's cost.
+        """
+        if self.leg_path is None:
+            return []
+        if segments is None:
+            return [(self.leg_path, None)]
+        owned: list[tuple[Path, str | None]] = []
+        for segment in segments:
+            report = self.segment_path(segment['label'])
+            if report is not None and segment['status'] != 'not_run':
+                owned.append((report, segment['label']))
+        return owned
 
 
 def _clear_junit_report(junit_path: Path) -> None:
@@ -2429,8 +2596,7 @@ def _persist_attempt_logs(
     worktree: Path,
     attempt_id: int,
     runs: list[dict],
-    category: str,
-    cause_hint: str,
+    summary_record: dict,
     *,
     module_prefix: 'str | None' = None,
 ) -> list[Path]:
@@ -2462,9 +2628,9 @@ def _persist_attempt_logs(
 
     Writes:
     - ``attempt-{N}[.{safe_prefix}].{label}.log`` for every run where ``cmd is not None``
-    - ``attempt-{N}[.{safe_prefix}].summary.json`` with the summary shape described in the
-      task description: top-level keys are from the worst-failing run plus a
-      ``commands`` list containing all per-run sub-dicts.
+    - ``attempt-{N}[.{safe_prefix}].summary.json`` holding *summary_record*, the
+      ``_build_summary_payload`` record the caller built once and also hands
+      to ``_archive_attempt_summary``, so the two copies are one record.
 
     Returns the list of log paths actually written (summary.json excluded
     so callers can pass the list straight to ``_archive_attempt_log``).
@@ -2498,12 +2664,9 @@ def _persist_attempt_logs(
         if path is not None:
             written.append(path)
 
-    # Build summary.json via the shared helper (same shape as merge-path summary).
-    summary_payload = _build_summary_payload(runs, category, cause_hint)
-
     _write_json_artifact(
         verify_dir / f'attempt-{attempt_id}{infix}.summary.json',
-        summary_payload, '_persist_attempt_logs',
+        summary_record, '_persist_attempt_logs',
     )
 
     return written
@@ -2515,10 +2678,15 @@ def _archive_attempt_log(
     task_id: str,
     attempt_id: int,
     category: str,
+    *,
+    stamp: str,
 ) -> list[Path]:
     """Copy worktree logs to the durable archive when ``category`` warrants it.
 
-    Archive target: ``<archive_root>/<task_id>/attempt-{N}-<utc_ts>.log``.
+    Archive target: ``<archive_root>/<task_id>/<worktree log stem>-<stamp>.log``,
+    e.g. ``attempt-{N}[.{safe_prefix}].test-<stamp>.log``.  *stamp* is the
+    attempt's ``_archive_stamp()``, shared with its archived summary so a
+    reader joins a run's logs to its summary by stamp.
 
     Early-returns ``[]`` when:
     - ``archive_root`` is ``None``
@@ -2544,14 +2712,13 @@ def _archive_attempt_log(
         logger.warning('_archive_attempt_log: could not create %s: %s', target_dir, exc)
         return []
 
-    utc_ts = datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')
     archived: list[Path] = []
     for src in worktree_log_paths:
         src = Path(src)
         # Preserve the source stem to avoid collisions when multiple log files
         # share the same suffix (e.g. attempt-1.test.log and attempt-1.lint.log
         # would both resolve to attempt-1-TS.log without the stem).
-        dest = target_dir / f'{src.stem}-{utc_ts}{src.suffix}'
+        dest = target_dir / f'{src.stem}-{stamp}{src.suffix}'
         try:
             shutil.copy2(src, dest)
             archived.append(dest)
@@ -2591,6 +2758,7 @@ def _archive_junit_report(
     attempt_id: int,
     *,
     module_prefix: 'str | None' = None,
+    segment_label: 'str | None' = None,
 ) -> 'Path | None':
     """Gzip one leg's junit report into the durable archive, GREEN OR RED.
 
@@ -2601,6 +2769,10 @@ def _archive_junit_report(
     start evicting the failure logs.  A missing report is normal — nothing
     injected ``--junitxml`` — so it returns ``None`` quietly; every other
     failure warns, because observability may not fail a verify.
+
+    *segment_label* names one segment of a segmented task leg (task 5671),
+    whose segments each write their own report; omitted, the name is the
+    per-leg one.
     """
     dest: Path | None = None
     try:
@@ -2608,14 +2780,14 @@ def _archive_junit_report(
             return None
         target_dir = archive_root / task_id
         target_dir.mkdir(parents=True, exist_ok=True)
+        segment = f'.{segment_label}' if segment_label is not None else ''
         dest = target_dir / (
-            f'attempt-{attempt_id}{_make_infix(module_prefix)}'
+            f'attempt-{attempt_id}{_make_infix(module_prefix)}{segment}'
             f'.junit-{_archive_stamp()}.xml.gz'
         )
-        # compresslevel 6, not gzip's default 9: this runs synchronously on
-        # the event loop that also carries the scheduler, the MCP server and
-        # the merge worker, and 9 costs twice the wall-clock for half a
-        # percent of size (measured on a 6MB report: 0.429s vs 0.214s).
+        # compresslevel 6, not gzip's default 9: 9 costs twice the wall-clock
+        # for half a percent of size (measured on a 6MB report: 0.429s vs
+        # 0.214s).
         with junit_path.open('rb') as report, gzip.open(dest, 'wb', 6) as archived:
             shutil.copyfileobj(report, archived)
     except Exception:  # noqa: BLE001 — observability may not fail a verify
@@ -2680,6 +2852,36 @@ def _persist_verify_plan(
         )
 
 
+def _archive_attempt_summary(
+    summary_record: dict,
+    archive_root: 'Path | None',
+    task_id: str,
+    attempt_id: int,
+    *,
+    module_prefix: 'str | None',
+    stamp: str,
+) -> 'Path | None':
+    """Write one attempt's summary, green or red, directly into the durable archive.
+
+    Ungated on category and on ``passed``: the summary is the record of why an
+    attempt passed, failed or ran a narrower scope, and it is small.  *stamp*
+    keeps a re-run of the same attempt and prefix from overwriting the earlier
+    record.  The name is the one ``scripts/verify_budget_census.py::ARCHIVE_GLOB``
+    selects.  The task path hands this and ``_persist_attempt_logs`` the same
+    *summary_record*, so while the worktree lives the census counts the two
+    copies as one record (``scripts/verify_budget_census.py::load_records``).
+    """
+    if archive_root is None:
+        return None
+    return _write_json_artifact(
+        archive_root / task_id / (
+            f'attempt-{attempt_id}{_make_infix(module_prefix)}.summary-{stamp}.json'
+        ),
+        summary_record,
+        '_archive_attempt_summary',
+    )
+
+
 def _archive_merge_verify_logs(
     runs: list[dict],
     archive_root: 'Path | None',
@@ -2708,7 +2910,8 @@ def _archive_merge_verify_logs(
 
     Filename convention mirrors ``_archive_attempt_log``:
         ``attempt-{N}[.{safe_prefix}].{label}-{utc_ts}.log``
-        ``attempt-{N}[.{safe_prefix}].summary-{utc_ts}.json``
+    The summary is written by ``_archive_attempt_summary``, the single owner
+    of its archived name, with the same ``utc_ts`` so a run's logs join it.
 
     Returns the list of paths actually written (both .log and .json).
     Returns ``[]`` when ``archive_root`` is ``None``.
@@ -2740,11 +2943,10 @@ def _archive_merge_verify_logs(
         if path is not None:
             archived.append(path)
 
-    # Write summary.json using the shared payload builder.
-    summary_path = _write_json_artifact(
-        target_dir / f'attempt-{attempt_id}{infix}.summary-{utc_ts}.json',
-        _build_summary_payload(runs, category, cause_hint),
-        '_archive_merge_verify_logs',
+    summary_path = _archive_attempt_summary(
+        _build_summary_payload(runs, category, cause_hint, role='merge'),
+        archive_root, task_id, attempt_id,
+        module_prefix=module_prefix, stamp=utc_ts,
     )
     if summary_path is not None:
         archived.append(summary_path)
@@ -3705,8 +3907,8 @@ class CheckRun:
     # documents, and the reason the two are adjacent.
     #
     # THE SHAPE, stated once and only here:
-    #     {'start': {cpu_some10, cpu_some60, runqueue_ratio},
-    #      'end':   {cpu_some10, cpu_some60, runqueue_ratio},
+    #     {'start': {cpu_some10, cpu_some60, runqueue_ratio, loadavg1},
+    #      'end':   {cpu_some10, cpu_some60, runqueue_ratio, loadavg1},
     #      'xdist': {n_flag, auto_num_workers}}
     # ``start``/``end`` are ``_load_sample()`` records taken around the
     # command's own execution, and ``xdist`` is ``_xdist_workers()``. A null
@@ -3718,6 +3920,12 @@ class CheckRun:
     # written straight into JSON, so anything needing its own serialisation
     # step is a second place for the shape to drift.
     load: 'dict | None' = None
+    # Seconds this check spent acquiring its admission slot (task 5671), the
+    # queueing half of its wall time that ``duration_secs`` and ``load``
+    # deliberately exclude. ``None`` when it competed for no slot (admission
+    # off, a lint/type leg, or an ungated role such as merge), never 0.0.
+    # LAST field, for the rule ``segments`` and ``load`` state above.
+    slot_wait_secs: 'float | None' = None
 
     @classmethod
     def skipped(cls, label: str) -> 'CheckRun':
@@ -3735,9 +3943,9 @@ class CheckRun:
     def to_dict(self) -> dict:
         """Serialise to the runs-dict schema consumed by ``_persist_attempt_logs``/
         ``_build_summary_payload``/``_verify_duration_secs``/``_archive_merge_verify_logs``
-        (all take ``list[dict]``) — the exact 9-key shape (label/cmd/rc/output/
-        timed_out/started_at/duration_secs/segments/load), 7 of which were
-        previously hand-built inline in ``run_verification``.
+        (all take ``list[dict]``) — the exact 10-key shape (label/cmd/rc/output/
+        timed_out/started_at/duration_secs/segments/load/slot_wait_secs), 7 of
+        which were previously hand-built inline in ``run_verification``.
 
         ``started_at`` is normalised via ``or ''``: a skipped check's
         ``None`` serialises as ``''``, matching the pre-refactor
@@ -3755,6 +3963,9 @@ class CheckRun:
         that reason: the budget census's hardest records to classify are the
         historical ones, and "absent" vs "null" is the distinction that tells
         it whether a run predates load stamping or merely went unstamped.
+
+        ``slot_wait_secs`` (task 5671) is emitted unconditionally too: absent
+        means the run predates it, ``None`` means it queued for no slot.
         """
         return {
             'label': self.label,
@@ -3766,6 +3977,7 @@ class CheckRun:
             'duration_secs': self.duration_secs,
             'segments': self.segments,
             'load': self.load,
+            'slot_wait_secs': self.slot_wait_secs,
         }
 
 
@@ -4903,6 +5115,7 @@ class _ScopeKw(TypedDict, total=False):
 
     use_cgroup_scope: bool
     scope_tag: str
+    cpu_weight: int
 
 
 class _ClockKw(TypedDict, total=False):
@@ -5054,6 +5267,18 @@ def _clock_stop_reason(*, kind: str, limit: float, elapsed: float, remaining: fl
     )
 
 
+def _scope_launch_argv(scope_unit: str, cpu_weight: int | None) -> list[str]:
+    """The systemd-run prefix for a verify scope; CPUWeight is the between-cgroup
+    share (nice only orders threads inside the scope)."""
+    argv = [
+        'systemd-run', '--user', '--scope', '--quiet', '--collect',
+        f'--unit={scope_unit}',
+    ]
+    if cpu_weight is not None:
+        argv += ['-p', f'CPUWeight={cpu_weight}']
+    return argv
+
+
 async def _run_cmd(
     cmd: str,
     cwd: Path,
@@ -5063,6 +5288,7 @@ async def _run_cmd(
     *,
     use_cgroup_scope: bool = False,
     scope_tag: str = '',
+    cpu_weight: int | None = None,
     clock_stop: ClockStopConfig | None = None,
 ) -> tuple[int, str, bool]:
     """Run a shell command, return (returncode, combined output, timed_out).
@@ -5080,7 +5306,9 @@ async def _run_cmd(
     defeated post-merge verify strand live ``cargo`` for up to 30 minutes.
     Falls back to the plain ``start_new_session`` + ``killpg`` path when the
     flag is off or ``systemd-run`` is missing, so the default behaviour and the
-    existing test suite are unchanged.
+    existing test suite are unchanged. When *cpu_weight* is not None the scope
+    is created with ``-p CPUWeight=<cpu_weight>``; None omits the property
+    (systemd default).
 
     When *log_path* is provided, subprocess output is streamed (read in 4 KiB
     chunks and flushed) to that file as it arrives, so a timeout-killed child
@@ -5165,8 +5393,7 @@ async def _run_cmd(
             # forwarding stdio to our pipe; --collect auto-removes the scope when
             # it exits (no unit leak on the normal-completion path).
             proc = await asyncio.create_subprocess_exec(
-                'systemd-run', '--user', '--scope', '--quiet', '--collect',
-                f'--unit={scope_unit}',
+                *_scope_launch_argv(scope_unit, cpu_weight),
                 '/bin/bash', '-c', cmd,
                 cwd=str(cwd),
                 stdout=asyncio.subprocess.PIPE,
@@ -5410,7 +5637,8 @@ async def _run_segmented(
       `infra_timeout`; see the loop's ``chain_broken`` guard and the comment on
       the return statement.
     * ``segments`` is one flat JSON-native dict per segment
-      (index/label/cwd/cmd/status/rc/timed_out/duration_secs/skip_reason),
+      (index/label/cwd/cmd/status/rc/timed_out/duration_secs/skip_reason;
+      ``run_verification`` adds each segment's ``xdist`` at its call site),
       which rides on ``CheckRun.segments`` into the persisted
       ``.task/verify/attempt-N[.<prefix>].summary.json`` (via ``to_dict`` ->
       ``_build_summary_payload``'s per-command entries) and into the aggregated
@@ -5536,8 +5764,9 @@ async def _run_segmented(
     # Load-bearing, not an edge case: removing the `&&` short-circuit (the whole
     # point of task 3338) makes budget exhaustion strictly MORE likely, since
     # all 8 segments now always run where the shell previously stopped at the
-    # first red — and the committed config's own measured table already records
-    # five of seven segments costing 1838.60s. So red-plus-exhausted is the
+    # first red — and the measured fleet-chain floor
+    # (tests/scripts/test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS)
+    # is a lower bound, not the whole chain. So red-plus-exhausted is the
     # COMMON shape of a red fallback verify. Under the old `&&` chain the shell
     # short-circuited at the red and the check finished fast with
     # rc=1/timed_out=False/`test_failure`; without this conditional, segmenting
@@ -5731,6 +5960,26 @@ def _resolve_verify_timeout(
     return warm
 
 
+def merge_verify_command_budget_secs(
+    config: OrchestratorConfig, module_configs: list[ModuleConfig],
+) -> float:
+    """The longest per-command timeout a merge verify of *module_configs* can be granted.
+
+    The max of :func:`_resolve_verify_timeout`'s warm and merge-cold resolutions
+    over the global fallback and every module the merge verify covers, so it is
+    never shorter than the command timeout that would actually kill the verify.
+    Consumer: the restart drain's in-flight deadlines (task 5371).
+    """
+    covered: list[ModuleConfig | None] = [
+        None, *verify_plan.effective_merge_module_configs(config, module_configs),
+    ]
+    return max(
+        _resolve_verify_timeout(config, module, is_cold=is_cold, is_merge_verify=True)
+        for module in covered
+        for is_cold in (False, True)
+    )
+
+
 def _resolve_concurrent_verify(
     config: OrchestratorConfig,
     module_config: ModuleConfig | None,
@@ -5829,15 +6078,13 @@ def _govern_cpu_str(cmd: 'str | None', exec_path: 'str | None') -> 'str | None':
     ``use_cgroup_scope=True`` to ``_run_cmd``.  ``_run_cmd`` in turn launches
     the already-wrapped command inside a ``systemd-run --user --scope``
     (outer ``df-verify`` scope).  ``cpu-governed-exec.sh``, on its governed
-    path, tries to create an *inner* ``systemd-run --user --scope`` scope —
-    a nested transient scope inside the outer ``df-verify`` scope.  Nested
-    ``--user --scope`` invocations are allowed by systemd (each creates a
-    distinct cgroup slice), so this is not a correctness or leak bug; the
-    outer scope's cgroup kill still reaps the entire subtree regardless.
-    The live reify deployment currently sets ``verify_use_cgroup_scope=False``,
-    so this combination does not occur in practice.  ``cpu-governed-exec.sh``
-    also has a runtime probe + fail-open, so a nested-scope failure degrades
-    gracefully.
+    path, creates an *inner* ``systemd-run --user --scope --slice=...``
+    scope.  The inner scope MOVES the governed workload out of the outer
+    ``df-verify`` scope into its own scope under that slice, so neither the
+    outer scope's CPUWeight nor its cgroup kill reaches that workload —
+    ``cpu-governed-exec.sh`` sets the workload's weight itself.
+    ``cpu-governed-exec.sh`` also has a runtime probe + fail-open, so a
+    nested-scope failure degrades gracefully.
     """
     if cmd is None or not exec_path:
         return cmd
@@ -5865,6 +6112,22 @@ def _resolve_nice_prefix(config: OrchestratorConfig, role: str) -> list[str]:
     if override:
         return shlex.split(override)
     return nice_prefix(role)
+
+
+def _resolve_scope_cpu_weight(
+    config: OrchestratorConfig, role: Literal['merge', 'task', 'background'],
+) -> int:
+    """Return the cgroup CPUWeight a verify scope for *role* is spawned with.
+
+    Reads ``verify_cgroup_cpu_weight_{merge,task,background}`` at each spawn.
+    """
+    match role:
+        case 'merge':
+            return config.verify_cgroup_cpu_weight_merge
+        case 'task':
+            return config.verify_cgroup_cpu_weight_task
+        case 'background':
+            return config.verify_cgroup_cpu_weight_background
 
 
 def _verify_admission_active(config: OrchestratorConfig) -> bool:
@@ -6139,9 +6402,10 @@ async def run_verification(
     cannot collide) and — since task 3478 — the ``verify_admission_pytest_n``
     ``-n`` worker cap. ``CheckRun.cmd`` stays the operator's configured
     chain throughout; all of the above are execution details layered onto
-    the segment, not rewrites of what was configured. Per-segment junitxml
-    is deliberately NOT among them: see the guard and the CheckRun comment
-    at the construction site.
+    the segment, not rewrites of what was configured. Since task 5671 a
+    cost-record junit report is among them too, one per segment at its own
+    path; the junit that ATTRIBUTES failures is not: see the guard and the
+    CheckRun comment at the construction site.
 
     When *module_config* is provided, a ``None`` command means "skip that check"
     (the subproject doesn't define it).  When *module_config* is ``None``,
@@ -6193,28 +6457,33 @@ async def run_verification(
     # because only then does a passing verify mean "this module's suite is
     # genuinely clean" (λ, task 2589); under 'scoped' a pass says nothing
     # about the rest of main, so seeding an empty baseline would be wrong.
+    # A task verify with an archive destination also gets a report, as an
+    # archive-only cost record that is never parsed (task 5671); see
+    # _JunitReportPlan.
     #
-    # junit_path is computed here whenever role+breadth match, independent
+    # The plan's path is computed here whenever the leg qualifies, independent
     # of whether test_cmd is actually a structured pytest command — deciding
     # eligibility is left entirely to with_junitxml's own no-op guard
     # (OPAQUE / raw-retained chain / non-pytest tool / cmd is None all leave
     # the flag uninjected), so this never duplicates that check. When
     # nothing ever injects the flag, pytest never writes the report, and
-    # _extract_failing_test_ids_from_junit(junit_path) below degrades to
-    # None (file not found) — the same B3 degrade signal as an unreadable
-    # report.
+    # _extract_failing_test_ids_from_junit below degrades to None (file not
+    # found) — the same B3 degrade signal as an unreadable report.
     #
     # The path is worktree-internal (merge worktrees lack `.task/` —
     # git_ops.py scrubs it) and per-module_prefix (mirrors _stream_log_path's
     # infix immediately below) so concurrent per-module fan-out within one
     # worktree can't collide. Absolute: module commands may `cd <prefix>`,
     # so a relative --junitxml would land in the wrong directory.
-    junit_path: Path | None = None
-    if role == 'merge' and verify_plan._merge_breadth_is_full(config):
-        # Shape-2 husk guard (task 2922): _prepare_junit_report_path returns
-        # None WITHOUT re-creating a torn-down worktree as an empty husk when a
-        # late merge-role verify writer fires after teardown.
-        junit_path = _prepare_junit_report_path(worktree, module_prefix)
+    junit = _JunitReportPlan.for_leg(
+        worktree,
+        module_prefix,
+        role=role,
+        merge_breadth_full=verify_plan._merge_breadth_is_full(config),
+        attempt_id=attempt_id,
+        task_id=task_id,
+        archive_root=archive_root,
+    )
 
     if is_merge_verify:
         # Merge worktrees are freshly created per merge — cargo caches are
@@ -6307,9 +6576,20 @@ async def run_verification(
         # to _run_cmd, so persisted logs and _summarize_checks see the same
         # command they always have.
         config_cmd = cmd
+        # Segmented test leg (task 3338 / esc-3062-2). Segment from
+        # `config_cmd`, the pre-junitxml, pre-governance capture. Resolved
+        # before the junitxml injection because a segmented leg never runs
+        # `cmd` as one command: its reports are per segment, and offering the
+        # whole chain the leg path would only log a false "no report will be
+        # collected" (task 5671).
+        chain_segments = (
+            split_and_chain_segments(config_cmd)
+            if segment_chained_test and label == 'test'
+            else None
+        )
         # junitxml injection (task μ, verify-scope-inversion-prd.md): only
-        # the 'test' leg, only when junit_path was computed above (role
-        # =='merge' and breadth=='full'). _with_junitxml_str keeps the
+        # the 'test' leg, only when it runs as one command and the junit plan
+        # above gave it a path. _with_junitxml_str keeps the
         # identity-check semantics this site always had — with_junitxml
         # no-ops for OPAQUE/raw-retained/non-pytest commands, so the
         # parse->render round-trip is skipped and a no-op stays
@@ -6319,13 +6599,13 @@ async def run_verification(
         # before the cpu-governance wrap immediately below: once governed,
         # cmd is an opaque outer `<exec> -- /bin/bash -c '...'` string that
         # parse_config_command can no longer see as pytest.
-        if junit_path is not None and label == 'test':
+        if junit.leg_path is not None and label == 'test' and chain_segments is None:
             # THE chokepoint: every test-leg invocation in this call reaches
             # here — all three branches of the retry loop and the env-recovery
             # re-run — so clearing here is once per pytest run, which is the
             # granularity the report's ownership actually has.
-            _clear_junit_report(junit_path)
-            cmd = _with_junitxml_str(cmd, str(junit_path))
+            _clear_junit_report(junit.leg_path)
+            cmd = _with_junitxml_str(cmd, str(junit.leg_path))
             assert cmd is not None  # None only when the input is None; guarded above
         # Admission gate (task 2390 T2): only the pytest ('test') leg is
         # gated by the shared.verify_admission flock semaphore + role nice
@@ -6347,10 +6627,12 @@ async def run_verification(
         # below applies the same cap per segment: a second copy of this
         # predicate could drift, letting role/admission/knob eligibility
         # disagree between the segmented and unsegmented paths.
+        #
+        # `slot_gated` is the one predicate for "this leg competes for a
+        # slot"; the slot-wait stamp below reads it too (task 5671).
+        slot_gated = admission and is_gated_role(role)
         pytest_n_capped = (
-            admission
-            and is_gated_role(role)
-            and config.verify_admission_pytest_n not in {'', 'auto'}
+            slot_gated and config.verify_admission_pytest_n not in {'', 'auto'}
         )
         # _with_pytest_numprocesses_str identity-checks the mutation before
         # rendering (mirrors _govern_cpu_str's `governed is parsed` guard
@@ -6388,7 +6670,10 @@ async def run_verification(
             prefix = _resolve_nice_prefix(config, role)
             if prefix:
                 cmd = f'{shlex.join(prefix)} /bin/bash -c {shlex.quote(cmd)}'
+        slot_requested = time.monotonic()
         async with (_admission_slot(role, config) if admission else contextlib.nullcontext()):
+            # The queueing half of the leg, which `load_start` below excludes.
+            slot_wait_secs = time.monotonic() - slot_requested if slot_gated else None
             started_at = datetime.now(UTC).isoformat()
             t0 = time.monotonic()
             # INSIDE the admission slot, beside the clock it belongs to: the
@@ -6402,6 +6687,7 @@ async def run_verification(
                 {
                     'use_cgroup_scope': True,
                     'scope_tag': _scope_tag_for(config.project_root),
+                    'cpu_weight': _resolve_scope_cpu_weight(config, role),
                 }
                 if config.verify_use_cgroup_scope
                 else {}
@@ -6421,26 +6707,20 @@ async def run_verification(
                 if config.verify_clock_stop_enabled
                 else {}
             )
-            # Segmented test leg (task 3338 / esc-3062-2). Segment from
-            # `config_cmd` — the pre-junitxml, pre-governance capture — so
-            # `_with_junitxml_str`'s suppressed-injection INFO log (task 3218)
-            # still fires on the WHOLE chain exactly as today. The admission
-            # slot is already held ONCE around this whole block, so
+            # A segmented leg (chain_segments, resolved above) runs inside the
+            # admission slot held ONCE around this whole block, so
             # slot-counting semantics are unchanged no matter how many
             # segments run.
-            chain_segments = (
-                split_and_chain_segments(config_cmd)
-                if segment_chained_test and label == 'test'
-                else None
-            )
-            # Co-occurrence guard (task 3478). These two are mutually
-            # exclusive by construction today: junit_path is computed only
-            # when role=='merge' and breadth=='full', while segmentation is
-            # opted into only as `segment_chained_test=role != 'merge'`. So
-            # per-segment junitxml is deliberately UNWIRED — with no writer
-            # and no consumer it would be dead code, and node-id attribution
-            # on this path comes from _extract_failing_test_ids over the
-            # aggregated segment stdout instead.
+            #
+            # Co-occurrence guard (task 3478). An ATTRIBUTING junit report
+            # and segmentation are mutually exclusive by construction today:
+            # the former requires role=='merge' and breadth=='full', the
+            # latter `segment_chained_test=role != 'merge'`. So per-segment
+            # attribution junit is deliberately UNWIRED, and node-id
+            # attribution on this path comes from _extract_failing_test_ids
+            # over the aggregated segment stdout instead. The task-path COST
+            # record is per segment, each at its own path (task 5671), so it
+            # does not warn.
             #
             # If a future change ever relaxes either gate, the tempting
             # "fix" is to hand every segment the SAME --junitxml path, which
@@ -6449,12 +6729,12 @@ async def run_verification(
             # becomes observable rather than letting it look like it worked.
             # Storm-safe without extra machinery: at most once per test leg,
             # and only in a configuration that does not exist today.
-            if chain_segments is not None and junit_path is not None:
+            if chain_segments is not None and junit.kind == 'attributing':
                 logger.warning(
                     'Segmented verify (%d segments) co-occurs with a junit report '
-                    'path at %s, which will NOT be written: per-segment junitxml is '
-                    'deliberately unwired (task 3478). These two were mutually '
-                    'exclusive by construction — junit_path requires role==\'merge\' '
+                    'path at %s, which will NOT be written: per-segment attribution '
+                    'junitxml is deliberately unwired (task 3478). These two were mutually '
+                    'exclusive by construction — attribution requires role==\'merge\' '
                     'with merge_verify_breadth==\'full\', segmentation requires '
                     'role!=\'merge\' — so reaching here means one of those gates '
                     'changed. Do NOT resolve this by injecting one shared '
@@ -6463,10 +6743,14 @@ async def run_verification(
                     'for THIS run remains available via _extract_failing_test_ids '
                     'over the aggregated segment stdout.',
                     len(chain_segments),
-                    junit_path,
+                    junit.leg_path,
                     len(chain_segments),
                 )
             if chain_segments is not None:
+                # Each segment's own xdist facts (task 5671), keyed by label and
+                # attached to its segment dict once _run_segmented returns.
+                segment_xdist: dict[str, dict] = {}
+
                 async def _run_one_segment(
                     segment_cmd: str,
                     segment_cwd: Path,
@@ -6502,12 +6786,23 @@ async def run_verification(
                     # cannot make one path honour the operator's cap while the
                     # other silently discards it (the asymmetry task 3478
                     # exists to remove).
-                    capped = segment_cmd
+                    # The cost-record junit (task 5671) comes first, in the
+                    # unsegmented site's order: junit, cap, xdist, governance.
+                    reported = segment_cmd
+                    segment_report = junit.segment_path(segment_label)
+                    if segment_report is not None:
+                        _clear_junit_report(segment_report)
+                        reported = _with_junitxml_str(segment_cmd, str(segment_report))
+                        assert reported is not None  # None only for a None input
+                    capped = reported
                     if pytest_n_capped:
                         capped = _with_pytest_numprocesses_str(
-                            segment_cmd, config.verify_admission_pytest_n,
+                            reported, config.verify_admission_pytest_n,
                         )
                         assert capped is not None  # None only for a None input
+                    # Read at the unsegmented stamp's point, post-cap and
+                    # pre-governance, for the same opaque-after-governance reason.
+                    segment_xdist[segment_label] = _xdist_workers(capped, verify_env)
                     governed = _govern_cpu_str(
                         capped, _resolve_governed_exec_path(config, worktree, role),
                     )
@@ -6539,6 +6834,11 @@ async def run_verification(
                     # preserving today's total wall-clock contract exactly.
                     budget_secs=timeout,
                 )
+                # A not_run segment was never rendered, so it ran with nothing.
+                segment_dicts = [
+                    {**seg, 'xdist': segment_xdist.get(seg['label'])}
+                    for seg in segment_dicts
+                ]
             else:
                 segment_dicts = None
                 rc, out, timed_out_flag = await _run_cmd(
@@ -6626,14 +6926,12 @@ async def run_verification(
             # Task 3478 settled the two dispositions task 3338 recorded here
             # as follow-ups:
             #
-            # - junitxml is NOT wired per segment, and not because it is a
-            #   harmless no-op: junit_path requires role=='merge' while
-            #   segmentation requires role!='merge', so it is unreachable by
-            #   construction — dead code with no writer and no consumer
-            #   (_extract_failing_test_ids_from_junit runs only `if junit_path
-            #   is not None`). Node-id attribution here comes from
-            #   _extract_failing_test_ids over the aggregated segment stdout.
-            #   The guard above warns if either gate ever relaxes.
+            # - ATTRIBUTION junit is NOT wired per segment: it requires
+            #   role=='merge' while segmentation requires role!='merge', so it
+            #   is unreachable by construction. Node-id attribution here comes
+            #   from _extract_failing_test_ids over the aggregated segment
+            #   stdout, and the guard above warns if either gate ever relaxes.
+            #   The cost-record junit IS per segment (task 5671).
             #
             # - apply_pytest_numprocesses IS now applied per segment, inside
             #   _run_one_segment. Its gate's roles (the admission-gated ones)
@@ -6664,6 +6962,7 @@ async def run_verification(
             # removed). The stamp attaches to the CheckRun, and both branches
             # return through this single construction.
             load={'start': load_start, 'end': load_end, 'xdist': xdist},
+            slot_wait_secs=slot_wait_secs,
         )
 
     # Cold-verify shared-venv pre-provision (task 2997, esc-2913-3): populate
@@ -6952,16 +7251,25 @@ async def run_verification(
                     'run_verification: merge archival error (non-fatal): %s', exc,
                 )
     elif attempt_id is not None and task_id is not None:
-        # Task path: persist to worktree/.task/verify/ then optionally copy
-        # to the durable archive when category warrants it.
+        # Task path: one summary record and one archive stamp per attempt.
+        # The summary is archived first, green or red, so a failure persisting
+        # to worktree/.task/verify/ cannot suppress it; the logs follow it
+        # into the archive only when the category warrants it.
         try:
+            summary_record = _build_summary_payload(
+                runs, category, cause_hint, role=role,
+            )
+            stamp = _archive_stamp()
+            _archive_attempt_summary(
+                summary_record, archive_root, task_id, attempt_id,
+                module_prefix=module_prefix, stamp=stamp,
+            )
             wt_paths = _persist_attempt_logs(
-                worktree, attempt_id, runs, category, cause_hint,
-                module_prefix=module_prefix,
+                worktree, attempt_id, runs, summary_record, module_prefix=module_prefix,
             )
             worktree_log_paths = [str(p) for p in wt_paths]
             arch_paths = _archive_attempt_log(
-                wt_paths, archive_root, task_id, attempt_id, category,
+                wt_paths, archive_root, task_id, attempt_id, category, stamp=stamp,
             )
             archive_log_paths = [str(p) for p in arch_paths]
         except Exception as exc:  # noqa: BLE001
@@ -6976,18 +7284,23 @@ async def run_verification(
         _wall_secs = _verify_duration_secs(runs)
 
     # Task μ: parse the junit report written (if any) by the injection above.
-    # None when junit_path was never computed (role != 'merge', breadth !=
-    # 'full') or the report is missing/unparseable (nothing ever injected
+    # None when the report does not attribute failures (not a full-breadth
+    # merge verify) or is missing/unparseable (nothing ever injected
     # the flag, or the test leg was skipped/crashed before writing it) — the
     # B3 degrade signal. See _extract_failing_test_ids_from_junit's docstring.
     failing_test_ids: list[str] | None = None
-    if junit_path is not None:
-        failing_test_ids = _extract_failing_test_ids_from_junit(junit_path)
-        # The report dies with the merge worktree; the LOG archival above is
-        # gated on `not passed`, this deliberately is not.
-        _archive_junit_report(
-            junit_path, archive_root, task_id, _archive_attempt_id(attempt_id),
-            module_prefix=module_prefix,
+    if junit.kind == 'attributing':
+        assert junit.leg_path is not None  # _JunitReportPlan pairs them
+        failing_test_ids = _extract_failing_test_ids_from_junit(junit.leg_path)
+    # The report dies with its worktree; the LOG archival above is gated on
+    # `not passed`, this deliberately is not. The gzip runs off the event
+    # loop, which also carries the scheduler, the MCP server and the merge
+    # worker: ~0.2s per 6MB report, and a segmented task leg archives several.
+    for report, segment_label in junit.reports_to_archive(attempt.test.segments):
+        await asyncio.to_thread(
+            _archive_junit_report,
+            report, archive_root, task_id, _archive_attempt_id(attempt_id),
+            module_prefix=module_prefix, segment_label=segment_label,
         )
     failing_test_ids_by_module = (
         {module_prefix: failing_test_ids}
@@ -8348,14 +8661,15 @@ async def run_scoped_verification(
                     # an unrelated red unrelated — but a merge failure goes
                     # straight to a human, who has the whole chain anyway. Cost:
                     # a merge verify whose first subproject goes red would now
-                    # run the remaining seven suites, up to the full resolved
+                    # run the remaining seven segments, up to the full resolved
                     # budget, with the queue blocked behind it — on the one path
                     # this module already treats as latency-critical (see the
                     # `-n`-cap comment in _run_or_skip_timed: 'merge' is never
                     # -n-capped for exactly this reason). Budget exhaustion is
                     # strictly MORE likely once every segment always runs; the
-                    # yaml's measured table already has five of seven segments
-                    # costing 1838.60s.
+                    # measured fleet-chain floor (tests/scripts/
+                    # test_fallback_verify_config.py::MEASURED_FLEET_SEGMENT_SECS)
+                    # is a lower bound, not the whole chain.
                     segment_chained_test=role != 'merge',
                 )
                 fallback_result.plan = plan_dict
@@ -9709,10 +10023,11 @@ class _RerunPolicy:
     INV-5 (no-lockstep-duplication) is about one IMPLEMENTATION of "passes in
     isolation", NOT one set of tuning constants. The two gates differ in five
     genuine, deliberately-calibrated ways — re-run engine, timeout constant,
-    log label, success log level, and the other-leg precondition — and every
-    one of those is pinned by an existing assertion. Capturing them as a
-    ``call_site -> policy`` table gives exactly ONE body to drift from while
-    keeping each site's calibration independent and visible in one place.
+    log label, success log level, and the partially-measured-session refusal
+    — and every one of those is pinned by an existing assertion. Capturing
+    them as a ``call_site -> policy`` table gives exactly ONE body to drift
+    from while keeping each site's calibration independent and visible in one
+    place.
 
     Shape note (operator ruling 2026-08-12, task-3786 suggestion): the
     verbatim-log-preservation fields are deliberate while only two call
@@ -9728,10 +10043,13 @@ class _RerunPolicy:
     #: Per-test timeout injected into the isolated re-run command. SEPARATE
     #: per site by design — the two are retuned on different signals.
     timeout_secs: int
-    #: Whether a non-clean lint/type leg on the failing result bails the whole
-    #: gate before any work (main_probe only — see the discriminator's
-    #: docstring for why it must NOT apply to the merge gate).
-    requires_clean_other_legs: bool
+    #: Whether a failing session that left tests unmeasured is
+    #: ``unconfirmable`` before any re-run: a failing leg that reached no test
+    #: verdict (task 6247), or an xdist worker death (task 5492). See
+    #: ``_unmeasured_session_reason``; merge_gate only — the precondition block
+    #: in confirm_isolated_rerun_verdict says why it must NOT apply to the
+    #: main probe.
+    refuses_partially_measured_sessions: bool
     #: Verdict-vocabulary tail of the "mapping yielded nothing usable" line;
     #: the caller's alone (the shared helper only knows 'unconfirmable').
     unmapped_log_tail: str
@@ -9748,15 +10066,21 @@ class _RerunPolicy:
     log_group_not_confirmed: Callable[[str, _RerunObservation], None] | None = None
 
 
-def _load_sample(*, read: Callable[[], 'PsiSample'] = read_psi_sample) -> dict:
+def _load_sample(
+    *,
+    read: Callable[[], 'PsiSample'] = read_psi_sample,
+    loadavg: Callable[[], tuple[float, float, float]] = os.getloadavg,
+) -> dict:
     """Host load at THIS instant, as one flat JSON-native record.
 
     Ruling D17 (task 3353) stamps this on every verify command, at its start
     and at its end, so the production corpus is itself the load-vs-duration
     measurement rather than something to be reproduced later on a quiet host.
 
-    Three keys: the host CPU ``some`` pressure over 10 s and 60 s, and the
-    runqueue ratio. Flat rather than nested, because the value is written
+    Four keys: the host CPU ``some`` pressure over 10 s and 60 s, the
+    runqueue ratio, and the one-minute load average (task 5671), which makes
+    the record comparable with the host's sar loadavg series. Flat rather
+    than nested, because the value is written
     STRAIGHT into summary.json — anything needing its own serialisation step
     would be a second place for the shape to drift.
 
@@ -9771,19 +10095,26 @@ def _load_sample(*, read: Callable[[], 'PsiSample'] = read_psi_sample) -> dict:
 
     Degradation is PER COMPONENT, because ``shared.psi`` reads the components
     independently: a host-PSI failure must not discard a runqueue reading that
-    succeeded (INV-11).
+    succeeded (INV-11). The load average is a separate read again, so neither
+    half's failure discards the other's reading.
 
     Never raises into a caller (INV-1: a telemetry read may not change a
-    gate's verdict). The reader already fails open by value, so reaching the
-    handler means the telemetry path broke in a way it does not itself model —
-    WARNING, not DEBUG, since a column going quietly null is the
-    silent-degradation shape the tree-wide gate exists to catch.
+    gate's verdict). The PSI reader already fails open by value, so reaching
+    its handler means the telemetry path broke in a way it does not itself
+    model — WARNING, not DEBUG, since a column going quietly null is the
+    silent-degradation shape the tree-wide gate exists to catch. The load
+    average's only documented failure is ``OSError``, which reads ``None``.
     """
+    return {**_psi_load_components(read), 'loadavg1': _loadavg1_or_none(loadavg)}
+
+
+def _psi_load_components(read: Callable[[], 'PsiSample']) -> dict:
+    """``_load_sample``'s three PSI keys, each ``None`` when its read degraded."""
     try:
         sample = read()
     except Exception:
         logger.warning(
-            '_load_sample: PSI read failed; recording an all-null load record '
+            '_load_sample: PSI read failed; recording null PSI load fields '
             'for this command',
             exc_info=True,
         )
@@ -9795,6 +10126,14 @@ def _load_sample(*, read: Callable[[], 'PsiSample'] = read_psi_sample) -> dict:
             sample.runqueue_ratio if sample.runqueue_read_ok else None
         ),
     }
+
+
+def _loadavg1_or_none(loadavg: Callable[[], tuple[float, float, float]]) -> 'float | None':
+    """The one-minute load average, or ``None`` when the host cannot report it."""
+    try:
+        return float(loadavg()[0])
+    except OSError:
+        return None
 
 
 # The spellings of the xdist WORKER-COUNT flag this stamp must recognise.
@@ -9952,6 +10291,43 @@ def _psi_cpu_some10_or_none() -> float | None:
     return sample.cpu_some10 if sample.read_ok else None
 
 
+#: The only failing-leg categories verify_classify.py::classify_failure
+#: assigns after the leg's tests ran to a verdict: a FAILED line, or the
+#: ladder's fall-through, where an ERROR-only session (a fixture-setup
+#: timeout) lands while still naming its node-ids. Every other category means
+#: the leg was stopped, or failed before any test was judged. Residual: the
+#: fall-through also holds a leg that named no test (pytest rc=5, a lint leg
+#: that printed nothing), which the aggregated list cannot tell apart. Why
+#: anything else refuses suppression:
+#: test_flake_discriminator.py::TestLegWithoutVerdictIsUnconfirmable.
+_VERDICT_BEARING_LEG_CATEGORIES: frozenset[FailureCategory] = frozenset({
+    FailureCategory.TEST_FAILURE, FailureCategory.UNKNOWN_TEST_FAILURE,
+})
+
+
+def _unmeasured_session_reason(failing_result: VerifyResult) -> str | None:
+    """Why the failing session left tests that no isolated re-run of its named
+    failures can vouch for, or ``None`` when it did not.
+
+    Reads EVERY failing leg's category: the aggregated list carries no leg
+    identity, and a stopped lint leg that printed nothing leaves
+    ``lint_output`` empty. An unrecorded list (``None`` or ``[]``) is never a
+    licence (the contract on ``VerifyResult.failing_leg_categories``), and
+    ranks last because it is an absence of evidence.
+    """
+    recorded = failing_result.failing_leg_categories
+    without_verdict = next(
+        (c for c in recorded or () if c not in _VERDICT_BEARING_LEG_CATEGORIES), None,
+    )
+    if without_verdict is not None:
+        return f'leg_without_verdict:{without_verdict}'
+    if _shows_xdist_worker_death(failing_result.test_output):
+        return 'session_truncated'
+    if not recorded:
+        return 'leg_categories_unrecorded'
+    return None
+
+
 def _unconfirmable_rerun_reason(observation: _RerunObservation) -> str:
     """Name WHY an isolated re-run produced no verdict, for the ledger row.
 
@@ -10054,6 +10430,13 @@ async def confirm_isolated_rerun_verdict(
     ``type_check_command`` nulled, so only the named tests run, serially,
     without pyproject ``addopts`` or its 60s per-test default.
 
+    At the merge gate (``policy.refuses_partially_measured_sessions``) no
+    re-run is attempted when the failing session left tests unmeasured: a
+    failing leg that reached no test verdict is
+    ``unconfirmable('leg_without_verdict:<category>')`` (task 6247), and an
+    xdist worker death is ``unconfirmable('session_truncated')`` (task 5492),
+    because no re-run of the named tests can vouch for the ones never judged.
+
     That command is one WE BUILD, which is why pytest REJECTING it
     (``FailureCategory.PYTEST_USAGE_ERROR``) is ``unconfirmable`` rather than
     a red: no test ran, so nothing in the result is evidence about the code,
@@ -10131,24 +10514,31 @@ async def confirm_isolated_rerun_verdict(
         )
 
     try:
-        # PRECONDITION, main_probe only: bail before ANY work when another leg
-        # is known non-clean. ``run_verification``'s
-        # ``_summarize_checks``/``_worst_category`` picks ONE category across up
-        # to three legs, so a matched (category, cause_hint) signature does NOT
-        # prove the lint/type legs were clean — a genuine, co-occurring
-        # lint/type break can lose the "worst" contest to the test leg's
-        # category and still be real. Re-running just the named TEST node-ids
-        # would then wrongly downgrade a genuinely red main.
+        # INV-1 (task 2883): a merge gate that resolved to "nothing to run"
+        # judged nothing. Named for itself, because its summary rides in
+        # type_output and the next check would misreport a failed type leg.
+        if failing_result.category == _MERGE_NO_EVIDENCE_CATEGORY:
+            return _observe(
+                FlakeVerdict.unconfirmable, (),
+                call_site=coerced_site, runner=runner,
+                reason=_MERGE_NO_EVIDENCE_CATEGORY, now=now,
+            )
+
+        # PRECONDITION, both gates: bail before ANY work when another leg is
+        # known non-clean, because re-running the named TEST node-ids is no
+        # evidence about it. At the main probe, ``_summarize_checks``/
+        # ``_worst_category`` picks ONE category across the legs, so a
+        # co-occurring lint/type break can hide behind the test leg's category
+        # and a pass would wrongly downgrade a genuinely red main. At the merge
+        # gate a pass replaces the WHOLE result and lands the tree, and the
+        # post-suppression unscoped gate re-checks types but not lint. See
+        # test_flake_discriminator.py::TestFailingLintOrTypeLegIsUnconfirmableAtBothGates.
         # ``lint_output``/``type_output`` are populated ONLY when that leg's
         # return code was non-zero, so a non-empty value is a precise, free
-        # signal. Promoting today's bare ``return None`` to
-        # ``unconfirmable('other_leg_failed')`` is INV-2 applied to a third
-        # dropped fact. Deliberately NOT applied to the merge gate: it has no
-        # such bail today, PRD §3 does not ask for one, and adding it would
-        # newly refuse to suppress merges carrying any lint output.
-        if policy.requires_clean_other_legs and (
-            failing_result.lint_output or failing_result.type_output
-        ):
+        # signal; a leg that failed while printing nothing is caught only if
+        # its category is not verdict-bearing (see
+        # ``_VERDICT_BEARING_LEG_CATEGORIES``).
+        if failing_result.lint_output or failing_result.type_output:
             return _observe(
                 FlakeVerdict.unconfirmable, (),
                 call_site=coerced_site, runner=runner,
@@ -10156,6 +10546,31 @@ async def confirm_isolated_rerun_verdict(
             )
 
         node_ids = _extract_failing_test_ids(failing_result.test_output)
+        # PRECONDITION, merge_gate only: a leg that reached no test verdict, or
+        # a worker death, means the named failures are not the only unmeasured
+        # tests. At the merge gate a passes_in_isolation LANDS the tree, and no
+        # re-run of the named ids can speak for the tests left without a
+        # verdict (INV-1). At the
+        # main probe the same verdict only downgrades "main is broken" to
+        # "task-own red", so nothing lands; refusing there would declare main
+        # broken on no evidence, and task 3597's ground truth (esc-3514-2) is
+        # an aborted xdist run. The ids are still named so the ledger counts
+        # them.
+        unmeasured_reason = (
+            _unmeasured_session_reason(failing_result)
+            if policy.refuses_partially_measured_sessions else None
+        )
+        if unmeasured_reason is not None:
+            logger.info(
+                '%s: failing session left tests unmeasured (%s) — '
+                'unconfirmable, not re-running %s',
+                policy.log_label, unmeasured_reason, node_ids[:10],
+            )
+            return _observe(
+                FlakeVerdict.unconfirmable, node_ids,
+                call_site=coerced_site, runner=runner,
+                reason=unmeasured_reason, now=now,
+            )
         if not node_ids:
             # We examined NOTHING — an opaque/lint/type-only failure names no
             # test. test_ids is empty, which §8 permits only on `unconfirmable`.
@@ -10294,7 +10709,7 @@ _CALL_SITE_POLICY: dict[FlakeCallSite, _RerunPolicy] = {
     FlakeCallSite.merge_gate: _RerunPolicy(
         log_label='confirm_merge_verify_flake_suppressible',
         timeout_secs=_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS,
-        requires_clean_other_legs=False,
+        refuses_partially_measured_sessions=True,
         unmapped_log_tail='not suppressing',
         error_log_tail='failing closed to red',
         engine=_merge_gate_isolated_rerun,
@@ -10304,9 +10719,9 @@ _CALL_SITE_POLICY: dict[FlakeCallSite, _RerunPolicy] = {
     FlakeCallSite.main_probe: _RerunPolicy(
         log_label='verify_failure_is_preexisting_on_main confirm gate',
         timeout_secs=_MAIN_PROBE_CONFIRM_TIMEOUT_SECS,
-        # See the precondition block in confirm_isolated_rerun_verdict for why
-        # this is main_probe's alone.
-        requires_clean_other_legs=True,
+        # See the partially-measured-session precondition block for why this
+        # is False here.
+        refuses_partially_measured_sessions=False,
         unmapped_log_tail='keeping the preexisting verdict',
         error_log_tail='keeping the preexisting verdict',
         # The BOUNDED _SWEEP_CONFIRM_MAX_ATTEMPTS loop, which passes only
@@ -10355,9 +10770,15 @@ async def confirm_merge_verify_flake_suppressible(
     verdict onto a shared ``None``, which made the extraction provably
     behaviour-preserving but discarded the observation at exactly the point it
     became knowable: ``fails_in_isolation`` (a REAL red) and ``unconfirmable``
-    (we could not tell — no recoverable node-id from an opaque/lint/type
+    (we could not tell — a merge gate that ran nothing, ``merge_no_evidence``;
+    a co-occurring lint/type failure,
+    ``other_leg_failed``; no recoverable node-id from an opaque
     failure; a node-id mapping to no given subproject; an infra-sentinel re-run
-    category, which is never trusted as confirmation) are different facts, and
+    category, which is never trusted as confirmation; a session an xdist worker
+    death truncated, ``session_truncated``; a session with a failing leg that
+    reached no test verdict, ``leg_without_verdict:<category>``; a
+    failing result whose per-leg categories were never recorded,
+    ``leg_categories_unrecorded``) are different facts, and
     θ's class-1 health check is an unconfirmable RATE that cannot be computed
     from a ``None``. The caller — ``apply_merge_flake_suppression`` — still
     suppresses on ``passes_in_isolation`` alone, so the GATE's behaviour is
@@ -10427,9 +10848,9 @@ async def _main_probe_failure_is_isolated_flake(
     contract. The main_probe entry in ``_CALL_SITE_POLICY`` carries this site's
     calibration — the bounded ``_SWEEP_CONFIRM_MAX_ATTEMPTS`` re-run engine,
     ``_MAIN_PROBE_CONFIRM_TIMEOUT_SECS`` (a constant SEPARATE from the merge
-    gate's by design; the two are retuned on different signals), and the
-    "another leg is not clean on main" precondition that is deliberately this
-    site's alone. That precondition's rationale, the node-id -> subproject
+    gate's by design; the two are retuned on different signals), and no
+    partially-measured-session refusal. The "another leg is not clean"
+    precondition's rationale, the node-id -> subproject
     mapping rules, and the *module_configs* provenance are all documented on
     the discriminator so they are stated ONCE (PRD §8.1, INV-5) — the merge
     gate and this gate can no longer drift into different notions of "passes

@@ -23,16 +23,17 @@ from _briefing_helpers import (
     _result,
     _search_arguments,
     briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
+    memory_transport,
 )
 from shared.capability_manifest import DeliveredCheckMeta
 from test_roles_ancestry_check import _tool_is_granted
 
 from orchestrator.agents.briefing import (
     DELIVERED_CHECK_BULLET_LIMIT,
-    MEMORY_CONTEXT_CAVEAT,
     BriefingAssembler,
     _format_delivered_checks,
 )
+from orchestrator.agents.memory_recall import MEMORY_CONTEXT_CAVEAT
 from orchestrator.agents.roles import ARCHITECT
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import plan_tools
@@ -1097,7 +1098,7 @@ class TestPerRoleMemoryTable:
     async def test_the_merger_asks_memory_nothing(self, briefing: BriefingAssembler):
         mcp = AsyncMock(return_value=_memory_reply())
 
-        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+        with memory_transport(mcp):
             prompt = await briefing.build_merger_prompt('CONFLICT TEXT', 'THE INTENT')
 
         assert mcp.await_args_list == [], 'the merger fires no memory query at all'
@@ -1116,7 +1117,7 @@ class TestPerRoleMemoryTable:
             'metadata': {'files': ['orchestrator/src/orchestrator/merge_worker.py']},
         }
 
-        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+        with memory_transport(mcp):
             prompt = await briefing.build_reviewer_prompt(
                 'reviewer_comprehensive', 'DIFF', task=task,
             )
@@ -1142,7 +1143,7 @@ class TestPerRoleMemoryTable:
         """
         mcp = AsyncMock(return_value=_memory_reply())
 
-        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+        with memory_transport(mcp):
             prompt = await briefing.build_reviewer_prompt('reviewer_comprehensive', 'DIFF')
 
         assert '## Conventions & Gotchas' in prompt
@@ -1159,7 +1160,7 @@ class TestPerRoleMemoryTable:
         context from its initial briefing."""
         mcp = AsyncMock(return_value=_memory_reply())
 
-        with patch('orchestrator.agents.briefing.mcp_call', new=mcp):
+        with memory_transport(mcp):
             prompt = await briefing.build_steward_continuation_prompt(
                 {'id': '4242', 'title': 'A task'},
                 {'id': 'esc-4242-1', 'summary': 'Something blocked'},

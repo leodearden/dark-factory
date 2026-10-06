@@ -13,6 +13,7 @@ import httpx
 import pytest
 import pytest_asyncio
 from qdrant_client.http.exceptions import UnexpectedResponse
+from shared.config_dir import TaskConfigDir
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -25,6 +26,7 @@ from fused_memory.models.reconciliation import (
     StageReport,
 )
 from fused_memory.models.scope import ProjectId, ProjectRoot, ProjectScope
+from fused_memory.reconciliation.cli_stage_runner import recon_config_base_dir
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.harness import BacklogIterator
 from fused_memory.reconciliation.journal import ReconciliationJournal
@@ -5413,7 +5415,7 @@ async def _drive_cancelling_first_stage_report_write(
 ):
     """Drive `make_task()` under a second cancellation injected from inside
     `journal.update_run_stage_reports`'s first call — the shared rig behind
-    the three task-4431 tests below, which differ only in which driver
+    the second-cancellation tests below, which differ in which driver
     `make_task` invokes (`run_full_cycle` vs `_run_remediation_pass`) and in
     their post-hoc assertions. Mirrors
     `TestStage2CycleSummaryHarnessBackstop._drive_degraded_arm_cancelling_first_identity_read`
@@ -5478,6 +5480,44 @@ async def _drive_cancelling_first_stage_report_write(
     return outer_task, not first_call[0]
 
 
+def _slow_stage(stage, stage_entered, *, on_enter=None):
+    """Fake for `stage.run` that calls `on_enter(run_id)` if given, sets
+    `stage_entered`, then blocks until cancelled — the slowed stage the
+    second-cancellation rig above cancels mid-flight."""
+
+    async def slow_stage_run(events, watermark, prior_reports, run_id, model=None):
+        if on_enter is not None:
+            on_enter(run_id)
+        stage_entered.set()
+        await asyncio.sleep(999)
+        return StageReport(
+            stage=stage.stage_id,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            items_flagged=[],
+            stats={},
+            llm_calls=0,
+            tokens_used=0,
+        )
+
+    return slow_stage_run
+
+
+def _config_dir_creator(journal, created_dirs):
+    """`on_enter` for `_slow_stage`: creates the run's per-run CLI config dir
+    the way `stages/base.py::BaseStage.run` does and records its path in
+    `created_dirs`, so a test can assert the driver's `finally` GC'd (or
+    kept) the real dir."""
+
+    def create_config_dir(run_id):
+        config_dir = TaskConfigDir(
+            task_id=run_id, base_dir=recon_config_base_dir(journal.data_dir),
+        )
+        created_dirs.append(config_dir.path)
+
+    return create_config_dir
+
+
 @pytest.mark.asyncio
 async def test_run_full_cycle_finally_persists_stage_reports_despite_a_second_cancellation(
     journal, event_buffer, mock_memory_service,
@@ -5516,26 +5556,11 @@ async def test_run_full_cycle_finally_persists_stage_reports_despite_a_second_ca
     # matching test_cancellation_cleanup_shielded_from_second_cancel above.
     harness.config.resume_after_restart = False
 
-    # Event set by slow_stage_run when it starts — ensures the first cancel
+    # Event set by the slowed stage when it starts — ensures the first cancel
     # fires inside the try block, not during pre-try setup.
     stage_entered = asyncio.Event()
 
-    async def slow_stage_run(
-        events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0],
-    ):
-        stage_entered.set()
-        await asyncio.sleep(999)
-        return StageReport(
-            stage=_s.stage_id,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={},
-            llm_calls=0,
-            tokens_used=0,
-        )
-
-    harness.stages[0].run = slow_stage_run
+    harness.stages[0].run = _slow_stage(harness.stages[0], stage_entered)
     _mock_stage_run(harness.stages[1])
     _mock_stage_run(harness.stages[2])
 
@@ -5608,27 +5633,12 @@ async def test_remediation_pass_finally_persists_stage_reports_despite_a_second_
 
     _mock_stage_run(harness.stages[0])
 
-    # Event set by slow_stage_run when it starts — ensures the first cancel
+    # Event set by the slowed stage when it starts — ensures the first cancel
     # fires inside the stage loop (Stage 2), after Stage 1 has recorded its
     # real report into run.stage_reports.
     stage_entered = asyncio.Event()
 
-    async def slow_stage_run(
-        events, watermark, prior_reports, run_id, model=None, _s=harness.stages[1],
-    ):
-        stage_entered.set()
-        await asyncio.sleep(999)
-        return StageReport(
-            stage=_s.stage_id,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={},
-            llm_calls=0,
-            tokens_used=0,
-        )
-
-    harness.stages[1].run = slow_stage_run
+    harness.stages[1].run = _slow_stage(harness.stages[1], stage_entered)
     _mock_stage_run(harness.stages[2])
 
     _outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
@@ -5676,6 +5686,128 @@ async def test_remediation_pass_finally_persists_stage_reports_despite_a_second_
         'the _error breadcrumb the except asyncio.CancelledError handler '
         "stamped must survive the second cancellation through the finally's "
         'shielded update_run_stage_reports'
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_finally_gcs_config_dir_despite_a_second_cancellation(
+    journal, event_buffer, mock_memory_service,
+):
+    """Task 5128: a second cancellation landing while run_full_cycle's
+    finally awaits its shielded stage_reports write must not make the
+    per-run config-dir GC unreachable — and must still propagate."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.resume_after_restart = False
+
+    stage_entered = asyncio.Event()
+    created_dirs: list = []
+    harness.stages[0].run = _slow_stage(
+        harness.stages[0], stage_entered,
+        on_enter=_config_dir_creator(journal, created_dirs),
+    )
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    await event_buffer.push(_make_event())
+
+    outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
+        harness, journal, stage_entered,
+        lambda: harness.run_full_cycle('test-project', 'buffer_size:1'),
+    )
+
+    assert injection_fired, (
+        'self_cancelling_update never ran — no second cancellation was '
+        'delivered, so this test would pass vacuously'
+    )
+    assert len(created_dirs) == 1
+    assert outer_task.cancelled(), (
+        'the second cancellation must still propagate out of run_full_cycle'
+    )
+    assert not created_dirs[0].exists(), (
+        'gc_run_config_dir must still run when a second cancellation raises '
+        "at the finally's shielded stage_reports await"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_keeps_interrupted_runs_config_dir_under_a_second_cancellation(
+    journal, event_buffer, mock_memory_service,
+):
+    """Passes before and after task 5128 by design: guards the interrupted
+    gate against a fix that hoists the GC out of it (task σ — an interrupted
+    run's transcript must survive for the startup --resume pass)."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.config.resume_after_restart = True
+
+    stage_entered = asyncio.Event()
+    created_dirs: list = []
+    harness.stages[0].run = _slow_stage(
+        harness.stages[0], stage_entered,
+        on_enter=_config_dir_creator(journal, created_dirs),
+    )
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+
+    await event_buffer.push(_make_event())
+
+    outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
+        harness, journal, stage_entered,
+        lambda: harness.run_full_cycle('test-project', 'buffer_size:1'),
+    )
+
+    assert injection_fired, (
+        'self_cancelling_update never ran — no second cancellation was '
+        'delivered, so this test would pass vacuously'
+    )
+    assert len(created_dirs) == 1
+    assert outer_task.cancelled()
+    assert created_dirs[0].exists(), (
+        "an interrupted run's config dir must survive for the --resume pass"
+    )
+
+
+@pytest.mark.asyncio
+async def test_remediation_pass_finally_gcs_config_dir_despite_a_second_cancellation(
+    journal, event_buffer, mock_memory_service,
+):
+    """Task 5128: the remediation mirror of
+    test_run_full_cycle_finally_gcs_config_dir_despite_a_second_cancellation —
+    the GC must be reached and the cancellation must still propagate."""
+    from fused_memory.reconciliation.harness import TierConfig
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+
+    stage_entered = asyncio.Event()
+    created_dirs: list = []
+    _mock_stage_run(harness.stages[0])
+    harness.stages[1].run = _slow_stage(
+        harness.stages[1], stage_entered,
+        on_enter=_config_dir_creator(journal, created_dirs),
+    )
+    _mock_stage_run(harness.stages[2])
+
+    outer_task, injection_fired = await _drive_cancelling_first_stage_report_write(
+        harness, journal, stage_entered,
+        lambda: harness._run_remediation_pass(
+            'test-project',
+            'parent-run-id',
+            [_make_s3_findings()[0]],
+            TierConfig(model='sonnet', episode_limit=100, memory_limit=200),
+            scope=_scope('test-project', '/tmp/test-project'),
+        ),
+    )
+
+    assert injection_fired, (
+        'self_cancelling_update never ran — no second cancellation was '
+        'delivered, so this test would pass vacuously'
+    )
+    assert len(created_dirs) == 1
+    assert outer_task.cancelled(), (
+        'the second cancellation must still propagate out of _run_remediation_pass'
+    )
+    assert not created_dirs[0].exists(), (
+        'gc_run_config_dir must still run when a second cancellation raises '
+        "at the remediation finally's shielded stage_reports await"
     )
 
 
@@ -6162,22 +6294,7 @@ async def test_shielded_stage_report_persistence_still_propagates_cancellation(
 
     stage_entered = asyncio.Event()
 
-    async def slow_stage_run(
-        events, watermark, prior_reports, run_id, model=None, _s=harness.stages[0],
-    ):
-        stage_entered.set()
-        await asyncio.sleep(999)
-        return StageReport(
-            stage=_s.stage_id,
-            started_at=datetime.now(UTC),
-            completed_at=datetime.now(UTC),
-            items_flagged=[],
-            stats={},
-            llm_calls=0,
-            tokens_used=0,
-        )
-
-    harness.stages[0].run = slow_stage_run
+    harness.stages[0].run = _slow_stage(harness.stages[0], stage_entered)
     _mock_stage_run(harness.stages[1])
     _mock_stage_run(harness.stages[2])
 
@@ -15574,7 +15691,7 @@ class TestIntegrityGateInputParityWithRenderer:
 
     | consumer                       | status | task_kind | pure_gate | corroborated |
     |--------------------------------|--------|-----------|-----------|--------------|
-    | _render_live_workflow_section   |  yes   |    yes    |    yes    |     yes      |
+    | render_live_workflow_section    |  yes   |    yes    |    yes    |     yes      |
     | recon_write_policy Gate 2       |  yes   |    yes    |    yes    |  NO -> yes   |
     | this integrity gate             |  yes   |    yes    |  NO->yes  |  NO -> yes   |
 
@@ -15840,7 +15957,7 @@ class TestIntegrityGateInputParityWithRenderer:
     # ----- pure_gate (task 3751 rule 5 -> this consumer) -----
     #
     # The last remaining harness-vs-renderer input gap. Task 3751 wired
-    # `pure_gate` into _render_live_workflow_section AND into
+    # `pure_gate` into render_live_workflow_section AND into
     # recon_write_policy.check(), but not into this gate — so a cited PENDING
     # deterministic PURE GATE still disagreed with Live-Workflow Signals, the
     # same class of divergence this task exists to close.
@@ -16117,7 +16234,7 @@ class TestIntegrityGateIsAsyncAndNonBlocking:
         self, journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
     ):
         """The whole-repo `git worktree list` is invariant across the pass, so
-        the harness hoists it exactly as `_render_live_workflow_section` does
+        the harness hoists it exactly as `render_live_workflow_section` does
         and threads it to every probe — one worktree list per pass, not one per
         cited task. `worktree_index_kwargs`'s bare `{}` means *unknown*: the
         kwarg is then omitted and each probe falls back to its own list, so the
@@ -21188,6 +21305,65 @@ def _wire_remediation_tree(harness, task_ids):
     return tree
 
 
+def _orch_finding_b() -> dict:
+    """A second, DISTINCT finding on the same task as `_orch_finding()`."""
+    return _orch_finding(
+        finding_id='f-4458-b',
+        category='stale_reference',
+        affected_ids=['4458', 'mem-77'],
+        description='Memory mem-77 still describes the pre-4458 schema',
+    )
+
+
+def _promote_like_orphan_reaper(queue, esc_id) -> str:
+    """Simulate `orchestrator/harness.py::Harness._reap_orphan_l0_escalations` promotion.
+
+    orchestrator is not a fused-memory dependency, so the record it builds is
+    reproduced here: a NEW L1 with a prefixed summary and a suffixed detail,
+    and the original L0 dismissed.
+    """
+    from escalation.models import Escalation  # type: ignore[import-untyped]
+
+    esc = queue.get(esc_id)
+    promoted_id = queue.make_id(esc.task_id)
+    queue.submit(Escalation(
+        id=promoted_id,
+        task_id=esc.task_id,
+        agent_role='harness-orphan-reaper',
+        severity=esc.severity,
+        category=esc.category,
+        summary=f'Orphan L0 (900s old, no active workflow): {esc.summary}',
+        detail=(
+            (esc.detail or '')
+            + '\n\n[note] originating worktree may be reaped; branch=task/'
+            + esc.task_id
+        ),
+        suggested_action='manual_intervention',
+        level=1,
+    ))
+    queue.resolve(
+        esc_id,
+        f'Auto-promoted to level 1 — orphan L0 for task_id={esc.task_id}',
+        dismiss=True,
+        resolved_by='harness-orphan-reaper',
+    )
+    return promoted_id
+
+
+def _dismiss_as_covered_like_orphan_reaper(queue, esc_id) -> None:
+    """Simulate the `has_open_l1` dismiss branch of `orchestrator/harness.py::Harness._reap_orphan_l0_escalations`.
+
+    orchestrator is not a fused-memory dependency, hence the simulation.
+    """
+    esc = queue.get(esc_id)
+    queue.resolve(
+        esc_id,
+        f'Dismissed by orphan reaper — open L1 already covers this task (task_id={esc.task_id})',
+        dismiss=True,
+        resolved_by='harness-orphan-reaper',
+    )
+
+
 def test_file_finding_task_escalation_lands_a_record_on_the_real_task(
     journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
 ):
@@ -21427,28 +21603,13 @@ def test_promoted_record_folds_the_next_cycle(
 ):
     """file -> promote-to-L1 -> refile must NOT produce a second record.
 
-    This is the unbounded-churn regression (esc-4821 amendment pass). The
-    filer writes at level 0, and
-    `orchestrator/harness.py::Harness._reap_orphan_l0_escalations` promotes an
-    aged pending L0 to L1 — with no category filter, and gated on the task
-    having NO live workflow, which is the very condition under which this filer
-    fires at all. So every record it writes is born eligible for promotion.
-
-    Under the earlier `level == 0 and category == ...` dedupe scan, promotion
-    broke the fold: the next reconciliation cycle saw no matching L0 and filed
-    a fresh one, which the reaper then DISMISSED as a duplicate of the open L1
-    (its `has_open_l1` branch). One born-and-dismissed record per cycle,
-    forever, on a task already represented by an open L1.
-
-    Making the scan level-BLIND folds onto the promoted record instead — the
-    L1 *is* this finding, escalated. The promotion is simulated here by
-    rewriting the record's level in place, exactly as the reaper does.
+    The unbounded-churn regression (esc-4821 amendment pass): the orphan reaper
+    promotes an aged routed L0 by filing a NEW L1 and dismissing the original,
+    and a refiled L0 behind that L1 would only be dismissed as covered, every
+    cycle. The promotion here reproduces the reaper's real record shape (see
+    `_promote_like_orphan_reaper`), not an in-place level rewrite.
     """
     from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
-
-    from fused_memory.reconciliation.finding_task_escalation import (
-        FINDING_TASK_ESCALATION_CATEGORY,
-    )
 
     harness = _make_test_harness(journal, event_buffer, mock_memory_service)
     queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
@@ -21456,14 +21617,8 @@ def test_promoted_record_folds_the_next_cycle(
     first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
     assert first, 'the first filing must land'
 
-    # Simulate the orphan reaper promoting it: same record, level 1, still
-    # pending. (The reaper mutates level via its own escalate path; what the
-    # dedupe scan sees is only the stored level, so rewriting it is faithful.)
     queue = EscalationQueue(queue_dir)
-    promoted = queue.get_by_task('4458', status='pending')
-    assert len(promoted) == 1
-    promoted[0].level = 1
-    (queue_dir / f'{first}.json').write_text(promoted[0].to_json())
+    promoted = _promote_like_orphan_reaper(queue, first)
     assert queue.has_open_l1('4458') is True, 'promotion must be visible as an open L1'
 
     second = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding(), 5)
@@ -21473,14 +21628,103 @@ def test_promoted_record_folds_the_next_cycle(
         f'is the unbounded churn loop (the reaper dismisses it, next cycle '
         f'files another). Got {second!r}'
     )
-    routed = [
-        e for e in EscalationQueue(queue_dir).get_pending()
-        if e.category == FINDING_TASK_ESCALATION_CATEGORY
-    ]
-    assert [e.id for e in routed] == [first], (
-        f'exactly one routed record must survive promotion, got '
-        f'{[(e.id, e.level) for e in routed]}'
+    routed = _routed_records(queue_dir)
+    assert [(e.id, e.level) for e in routed] == [(promoted, 1)], (
+        f'exactly the promoted L1 must survive, got {[(e.id, e.level) for e in routed]}'
     )
+
+
+def test_distinct_findings_on_one_task_file_distinct_records(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """Two DISTINCT findings on one task each reach the ladder (item 3)."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    second = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding_b(), 4)
+
+    assert first and second and first != second, (first, second)
+    assert sorted(e.id for e in _routed_records(queue_dir)) == sorted([first, second])
+
+
+def test_same_finding_with_a_fresh_finding_id_still_folds_across_cycles(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """Guards against keying the fold on `finding_id`, which `recon_report.py::ReconReportState.add_finding` mints fresh every call."""
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    first = harness._file_finding_task_escalation(
+        'test-project', 'run-1', _orch_finding(finding_id=str(uuid.uuid4())), 4,
+    )
+    second = harness._file_finding_task_escalation(
+        'test-project', 'run-2',
+        _orch_finding(
+            finding_id=str(uuid.uuid4()),
+            description='reworded prose about the same contradiction',
+        ),
+        5,
+    )
+
+    assert first
+    assert second is None, f'the same persistent finding must fold, got {second!r}'
+
+
+def test_distinct_finding_behind_a_promoted_routed_l1_is_not_filed(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """An open routed L1 suppresses further routed filings only while it is open."""
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+    queue = EscalationQueue(queue_dir)
+
+    first = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    assert first
+    promoted = _promote_like_orphan_reaper(queue, first)
+
+    behind = harness._file_finding_task_escalation('test-project', 'run-2', _orch_finding_b(), 4)
+    assert behind is None, (
+        f'the reaper would dismiss an L0 filed behind the open routed L1, got {behind!r}'
+    )
+
+    queue.resolve(promoted, 'adjudicated by operator')
+    after = harness._file_finding_task_escalation('test-project', 'run-3', _orch_finding_b(), 5)
+    assert after and after not in (first, promoted), (
+        f'once the routed L1 is adjudicated the distinct finding must file, got {after!r}'
+    )
+
+
+def test_reaper_dismissed_sibling_is_not_refiled_while_the_routed_l1_is_open(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """The item-(4) churn bound for two findings on one task.
+
+    The reaper promotes A and dismisses B as covered by A's L1; the next cycle
+    must not refile either, or B would be filed and dismissed every cycle.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+    queue = EscalationQueue(queue_dir)
+
+    a = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding(), 4)
+    b = harness._file_finding_task_escalation('test-project', 'run-1', _orch_finding_b(), 4)
+    assert a and b and a != b, (a, b)
+
+    promoted = _promote_like_orphan_reaper(queue, a)
+    _dismiss_as_covered_like_orphan_reaper(queue, b)
+
+    assert harness._file_finding_task_escalation(
+        'test-project', 'run-2', _orch_finding(), 5,
+    ) is None
+    assert harness._file_finding_task_escalation(
+        'test-project', 'run-2', _orch_finding_b(), 5,
+    ) is None
+    assert [e.id for e in _routed_records(queue_dir)] == [promoted]
 
 
 def test_resolved_prior_record_does_not_suppress_a_refile(
@@ -21566,6 +21810,37 @@ def test_unregistered_project_files_nothing(
     assert not _orch_queue_dir(tmp_path).exists()
 
 
+@pytest.mark.parametrize(
+    ('finding', 'supplied_task_id'),
+    [
+        (_orch_finding(), '../escape'),
+        (_orch_finding(task_id='../../4458', affected_ids=['4458']), None),
+    ],
+    ids=['pre-resolved-target', 'resolver-target'],
+)
+def test_unroutable_target_files_nothing_and_touches_no_queue_directory(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+    finding, supplied_task_id,
+):
+    """An id unsafe as a queue key is refused BEFORE any I/O.
+
+    A caller-supplied ``task_id`` need not have come from the resolver, so the
+    filer enforces `finding_task_escalation.py::is_routable_task_id` again at
+    the point of use; the resolver branch pins that the check also holds when
+    the filer resolves the target itself.
+    """
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+
+    result = harness._file_finding_task_escalation(
+        'test-project', 'run-1', finding, 4, task_id=supplied_task_id,
+    )
+
+    assert result is None
+    assert not _orch_queue_dir(tmp_path).exists()
+    assert list(tmp_path.rglob('esc-*')) == []
+
+
 def test_queue_submit_failure_is_swallowed_and_warned(
     journal, event_buffer, mock_memory_service, tmp_path, monkeypatch, caplog,
 ):
@@ -21592,8 +21867,8 @@ def test_queue_submit_failure_is_swallowed_and_warned(
     )
 
 
-async def _drive_cycle(harness, journal, event_buffer, finding, *, n_seed):
-    """Seed *n_seed* prior completed runs flagging *finding*, then run a cycle."""
+async def _drive_cycle(harness, journal, event_buffer, *findings, n_seed):
+    """Seed *n_seed* prior completed runs flagging *findings*, then run a cycle."""
     import uuid as _uuid
 
     base_time = datetime.now(UTC) - timedelta(minutes=n_seed + 1)
@@ -21609,7 +21884,7 @@ async def _drive_cycle(harness, journal, event_buffer, finding, *, n_seed):
             status=RunStatus.running,
         ))
         await journal.update_run_stage_reports(run_id, {
-            'integrity_check': {'items_flagged': [finding]},
+            'integrity_check': {'items_flagged': list(findings)},
         })
         await journal.complete_run(run_id, 'completed')
 
@@ -21620,7 +21895,7 @@ async def _drive_cycle(harness, journal, event_buffer, finding, *, n_seed):
             stage=_s.stage_id,
             started_at=datetime.now(UTC),
             completed_at=datetime.now(UTC),
-            items_flagged=[finding],
+            items_flagged=list(findings),
             stats={},
             llm_calls=0,
             tokens_used=0,
@@ -21735,6 +22010,46 @@ async def test_persistent_finding_naming_a_task_lands_on_both_queues(
     # The two records are on genuinely different queues, under different ids.
     assert integrity[0].task_id != esc.task_id
     assert orch_queue_dir != recon_queue.queue_dir
+
+
+@pytest.mark.asyncio
+async def test_two_persistent_findings_on_one_task_in_one_cycle_yield_two_records(
+    journal, event_buffer, mock_memory_service, tmp_path, monkeypatch,
+):
+    """Distinct persistent findings on one task each land, keyed on the recon identity.
+
+    The routed `finding_fingerprint` values must EQUAL the recon queue's
+    `dedupe_fingerprint` values: the routed identity is the persistence
+    identity, which is what correlates the two queues.
+    """
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    from fused_memory.reconciliation.harness import (
+        _INTEGRITY_FINDING_RECURRENCE_THRESHOLD,
+    )
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    recon_queue = EscalationQueue(tmp_path / 'recon-esc')
+    harness._escalation_queue = recon_queue
+    orch_queue_dir = _wire_orchestrator_queue(harness, tmp_path, monkeypatch)
+    _wire_remediation_tree(harness, ['4458'])
+
+    await _drive_cycle(
+        harness, journal, event_buffer, _orch_finding(), _orch_finding_b(),
+        n_seed=max(1, _INTEGRITY_FINDING_RECURRENCE_THRESHOLD - 2),
+    )
+
+    routed = [e for e in _routed_records(orch_queue_dir) if e.task_id == '4458']
+    assert len(routed) == 2, f'expected two routed records, got {[e.id for e in routed]}'
+    routed_fps = {json.loads(e.detail)['finding_fingerprint'] for e in routed}
+    assert len(routed_fps) == 2, routed_fps
+
+    recon_fps = {
+        e.dedupe_fingerprint for e in recon_queue.get_pending()
+        if e.category == 'recon_integrity_issue'
+        and e.summary.startswith('Persistently unresolved after remediation')
+    }
+    assert routed_fps == recon_fps, (routed_fps, recon_fps)
 
 
 # The four tests below are the VOLUME-PARITY guarantee made executable. Each

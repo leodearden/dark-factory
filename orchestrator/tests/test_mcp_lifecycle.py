@@ -21,6 +21,10 @@ TestVerdictToolsLaunchFastStart/DirectInterpreter/MetaRoot —
 verdict_tools_mcp_server() launch-dict factory, modeled on
 plan_tools_mcp_server (task 2482, PRD mcp-verdict-servers-prd.md task β,
 step-1/step-2).
+
+TestToolErrorText / TestToolTextBlocks — tool_error_text() and
+tool_text_blocks(), the one reader of FastMCP's tool-result envelope, shared
+by the scheduler and briefing memory recall (task 6031).
 """
 
 from __future__ import annotations
@@ -33,7 +37,12 @@ import pytest
 from _orch_helpers import pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.mcp_lifecycle import plan_tools_mcp_server, verdict_tools_mcp_server
+from orchestrator.mcp_lifecycle import (
+    plan_tools_mcp_server,
+    tool_error_text,
+    tool_text_blocks,
+    verdict_tools_mcp_server,
+)
 
 # ---------------------------------------------------------------------------
 # Step-1/Step-2: apply_mcp_startup_env + MCP_STARTUP_TIMEOUT_MS
@@ -952,3 +961,80 @@ class TestManagedSpawnEnvInjection:
         env = captured_kwargs.get('env')
         assert env is not None
         assert env['RECONCILIATION_DATA_DIR'] == '/custom/r'
+
+
+# ---------------------------------------------------------------------------
+# Task 6031: tool_error_text() — the one isError envelope reader
+# ---------------------------------------------------------------------------
+
+
+class TestToolErrorText:
+    """A tool reports its own failure in a well-formed body carrying isError;
+    tool_error_text() is the single reader that tells that apart from a result."""
+
+    def test_a_reply_without_is_error_is_not_a_failure(self):
+        assert tool_error_text({'content': [{'type': 'text', 'text': 'ok'}]}) is None
+
+    def test_is_error_false_is_not_a_failure(self):
+        reply = {'isError': False, 'content': [{'type': 'text', 'text': 'ok'}]}
+        assert tool_error_text(reply) is None
+
+    def test_is_error_returns_the_text_block(self):
+        reply = {'isError': True, 'content': [{'type': 'text', 'text': 'Error: boom'}]}
+        assert tool_error_text(reply) == 'Error: boom'
+
+    def test_the_first_text_block_wins_past_non_dict_and_non_text_blocks(self):
+        reply = {
+            'isError': True,
+            'content': [
+                'not a block',
+                {'type': 'image', 'data': '...'},
+                {'type': 'text', 'text': 'first'},
+                {'type': 'text', 'text': 'second'},
+            ],
+        }
+        assert tool_error_text(reply) == 'first'
+
+    @pytest.mark.parametrize(
+        'reply',
+        [
+            {'isError': True, 'content': [{'type': 'image', 'data': '...'}]},
+            {'isError': True},
+            {'isError': True, 'content': None},
+            {'isError': True, 'content': 7},
+        ],
+        ids=['no-text-block', 'content-missing', 'content-none', 'content-not-a-list'],
+    )
+    def test_a_silent_failure_is_empty_text_not_none(self, reply):
+        assert tool_error_text(reply) == ''
+
+    def test_a_non_str_text_value_is_coerced(self):
+        reply = {'isError': True, 'content': [{'type': 'text', 'text': 42}]}
+        assert tool_error_text(reply) == '42'
+
+
+class TestToolTextBlocks:
+    """tool_text_blocks() is the one reader of an envelope's text content, so
+    the success path and tool_error_text() cannot disagree on its shape."""
+
+    def test_every_text_block_in_order_past_non_dict_and_non_text_blocks(self):
+        reply = {
+            'content': [
+                {'type': 'text', 'text': 'first'},
+                'not a block',
+                {'type': 'image', 'data': '...'},
+                {'type': 'text', 'text': 'second'},
+            ],
+        }
+        assert tool_text_blocks(reply) == ('first', 'second')
+
+    @pytest.mark.parametrize(
+        'reply',
+        [{}, {'content': None}, {'content': []}, {'content': 7}],
+        ids=['content-missing', 'content-none', 'content-empty', 'content-not-a-list'],
+    )
+    def test_an_envelope_without_a_content_list_has_no_text(self, reply):
+        assert tool_text_blocks(reply) == ()
+
+    def test_a_non_str_text_value_is_coerced(self):
+        assert tool_text_blocks({'content': [{'type': 'text', 'text': 42}]}) == ('42',)

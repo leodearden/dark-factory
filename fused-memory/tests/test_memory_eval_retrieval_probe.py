@@ -484,12 +484,19 @@ class TestCommittedRegistryFixture:
 # ---------------------------------------------------------------------------
 # step-5: offline registry derivation
 #
-# Every source here is COMMITTED, so derivation needs no Qdrant, no embedder
-# and no OPENAI_API_KEY — a reviewer can re-run it to audit any fixture entry.
+# The calibration file and guard clusters are COMMITTED sources and the census
+# is a synthetic topic table, so derivation needs no Qdrant, no embedder and no
+# OPENAI_API_KEY. The committed census artifact itself is checked only by
+# tests/test_memory_metadata_census_artifacts.py.
 # ---------------------------------------------------------------------------
 
 CALIBRATION_PATH = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
-CENSUS_PATH = Path(__file__).parents[2] / 'plans' / 'memory-metadata-census-report.json'
+_CENSUS_TOPIC_ROWS = (
+    {'value': 'census-multi-alpha', 'count': 5},
+    {'value': 'census_multi_beta', 'count': 2},
+    {'value': 'census-singleton-gamma', 'count': 1},
+    {'value': 'census-singleton-delta', 'count': 1},
+)
 
 
 @pytest.fixture(scope='module')
@@ -503,7 +510,10 @@ def calibration_rows() -> list[dict]:
 
 @pytest.fixture(scope='module')
 def census_report() -> dict:
-    return json.loads(CENSUS_PATH.read_text(encoding='utf-8'))
+    return {'grand_total': {'topic': {
+        'distinct_total': len(_CENSUS_TOPIC_ROWS),
+        'entries': [dict(row) for row in _CENSUS_TOPIC_ROWS],
+    }}}
 
 
 @pytest.fixture(scope='module')
@@ -605,23 +615,12 @@ class TestDeriveFromCuratorGates:
 class TestDeriveFromCensus:
     """Multi-entry census topics, with the skipped long tail DISCLOSED."""
 
-    def test_emits_multi_entry_topics_only(self, derived, census_report):
-        multi = {
-            e['value'] for e in census_report['grand_total']['topic']['entries']
-            if e['count'] > 1
-        }
+    def test_emits_multi_entry_topics_only(self, derived):
         emitted = {c['topic'] for c in _of(derived, 'census_topic')}
-        assert emitted
-        assert emitted <= multi
+        assert emitted == {'census-multi-alpha', 'census_multi_beta'}
 
-    def test_skipped_singletons_are_disclosed_not_silently_dropped(
-        self, derived, census_report,
-    ):
-        singletons = [
-            e for e in census_report['grand_total']['topic']['entries'] if e['count'] <= 1
-        ]
-        assert singletons, 'census no longer has a count-1 tail'
-        assert derived.disclosures['census_topics_skipped_singleton'] == len(singletons)
+    def test_skipped_singletons_are_disclosed_not_silently_dropped(self, derived):
+        assert derived.disclosures['census_topics_skipped_singleton'] == 2
 
     def test_census_forward_compat_extra_key(self, calibration_rows, guard_clusters):
         payload = {
@@ -667,13 +666,6 @@ class TestDeriveFromCensus:
         assert result.disclosures['census_topics_skipped_singleton'] == 1
         assert result.disclosures['census_rows_malformed_value'] == 3
         assert result.disclosures['census_rows_malformed_count'] == 2
-
-    def test_the_committed_census_is_well_formed(self, derived):
-        """Both malformed counters read zero today — pinned so they stop
-        reading zero loudly rather than quietly re-tagging rows as
-        singletons."""
-        assert derived.disclosures['census_rows_malformed_value'] == 0
-        assert derived.disclosures['census_rows_malformed_count'] == 0
 
 
 class TestDeriveFromGuardClusters:

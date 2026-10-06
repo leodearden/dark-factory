@@ -21,10 +21,11 @@ checkout's ``.mcp.json`` and passed with ``--strict-mcp-config``. The
 allowlisted reads therefore never depend on the ambient project config being
 approved for a headless run, and no other server starts.
 
-The account comes from the shared pool through ``account_pool.subprocess_env``
-and inherits its known limit: the lease is handed straight back, so this run's
-spend is invisible to the gate. With no lease the child inherits this process's
-environment. ``ANTHROPIC_API_KEY`` is stripped on both paths (OPERATIONS.md §12,
+The account comes from the shared pool (``account_pool.build_pool``): one
+lease, read and handed straight back before the run, because nothing in the
+child can settle a slot. The known cost is that this run's spend is invisible
+to the gate. With no lease the child inherits this process's environment.
+``ANTHROPIC_API_KEY`` is stripped on both paths (OPERATIONS.md §12,
 "Legibility trickle accounts (03:00)").
 
 Exit codes: 0 the run completed; 1 it failed, timed out or hit a usage limit,
@@ -103,6 +104,7 @@ NIGHTLY_DENIED_TOOLS: tuple[str, ...] = (
     'mcp__escalation__stamp_triage',
     'mcp__escalation__promote_to_l2',
     'mcp__escalation__declare_pin',
+    'mcp__escalation__amend_escalation',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__add_dependency',
     'mcp__fused-memory__submit_task',
@@ -218,11 +220,18 @@ def _mcp_config(path: Path) -> dict[str, Any]:
 
 
 def _child_env(gate: Any) -> dict[str, str]:
-    env = account_pool.subprocess_env(gate)
-    inherited = dict(os.environ) if env is None else env
-    inherited.pop('ANTHROPIC_API_KEY', None)
-    inherited[NIGHTLY_CONFINEMENT_ENV] = '1'
-    return inherited
+    env = dict(os.environ)
+    env.pop('ANTHROPIC_API_KEY', None)
+    env[NIGHTLY_CONFINEMENT_ENV] = '1'
+    lease = gate.try_lease(reverse=True)
+    if lease is None:
+        _log('no pool account available; the run inherits this environment')
+        return env
+    try:
+        env['CLAUDE_CODE_OAUTH_TOKEN'] = lease.token
+        return env
+    finally:
+        gate.release_probe_slot(lease.token)
 
 
 def _run_bounded(argv: list[str], env: dict[str, str], timeout_secs: float) -> Completed:

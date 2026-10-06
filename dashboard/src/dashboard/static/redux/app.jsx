@@ -6,9 +6,12 @@ const { OrchTab, PerfTab, MemoryTab, ReconTab, MergeTab, CostsTab, BurnTab, Esca
 const { TasksTab } = window.DF_TASKS;
 const { CuratorTab } = window.DF_CURATOR;
 const { SchedulerTab } = window.DF_SCHEDULER;
-const { staleNoticesForTab } = window.DF_ENDPOINT_STALENESS;
+const { staleNoticesForTab, loadingNoticeForTab } = window.DF_ENDPOINT_STALENESS;
+const { scopePollingToTab } = window.DF_DATA_LOADER;
 const { reconRunCounts, reconAttentionCount } = window.DF_RECON_STATUS;
 const { censusOver, runningOfInFlight, inFlightCount: inFlightCountReading } = window.DF_TASK_SNAPSHOT;
+const { inQueueOver } = window.DF_MERGE_QUEUE;
+const { writeQueue } = window.DF_MEMORY_READINGS;
 const { DEFAULT_WINDOW: CHIP_DEFAULT_WINDOW, TAB_WINDOWS: CHIP_TAB_WINDOWS, windowForTab, windowEcho, highlightedWindow, pendingWindow } = window.DF_WINDOW_CHIP;
 const DD = window.DF_DATA;
 
@@ -42,6 +45,20 @@ function LiveClock({ live }) {
     return () => clearInterval(t);
   }, [live]);
   return <>{now.toLocaleTimeString('en-GB', { hour12: false })}</>;
+}
+
+// The staleness and loading notices' shared look; only the left edge says which kind.
+function noticeBannerStyle(edgeColor) {
+  return {
+    padding: '8px 12px',
+    border: '1px solid var(--line)',
+    borderLeft: `3px solid ${edgeColor}`,
+    borderRadius: 4,
+    background: 'var(--bg-2)',
+    color: 'var(--fg-3)',
+    fontFamily: 'var(--mono)',
+    fontSize: 11,
+  };
 }
 
 function App() {
@@ -83,10 +100,18 @@ function App() {
     window.__DF_PAUSE = !!tw.pauseLive;
   }, [tw.pauseLive]);
 
-  // Re-validate the window on every tab switch, whichever path switched it: a
-  // chip tab that does not offer the current window resets it.
+  // On every tab switch, whichever path switched it: re-validate the window (a
+  // chip tab that does not offer the current one resets it), then tell the
+  // poll loop which tab is open AND at which window, so it polls this tab's
+  // endpoints plus the always-on chrome (data.js::pollSetFor) and fetches
+  // anything newly needed at once, already at the window the tab will show.
+  // One effect, so the announcement cannot run ahead of the reset. Declared
+  // before the chip effect below, so the mount-time DF_REFRESH(win) already
+  // runs against the scoped set.
   uE(() => {
-    setWin(w => windowForTab(tab, w));
+    const tabWin = windowForTab(tab, win);
+    setWin(tabWin);
+    scopePollingToTab(tab, tabWin);
   }, [tab]);
 
   // Re-fetch with the new window when the chip changes. Unwindowed endpoints
@@ -123,7 +148,7 @@ function App() {
     orchRunning: DD.ORCHESTRATORS.filter(o => o.running).length,
     orchTotal: DD.ORCHESTRATORS.length,
     tasks: <DatumReading datum={tasksCensus} format={runningOfInFlight} />,
-    queue: DD.MEMORY_STATUS.queue.counts.pending,
+    queue: <DatumReading datum={writeQueue(DD)} format={q => q.pending} />,
     spend24h: DD.COSTS?.summary?.today ?? 0,
   };
 
@@ -137,7 +162,7 @@ function App() {
     // the badge permanently nonzero on a healthy system. In-flight runs get
     // their own tile on the tab rather than inflating this number.
     recon: reconAttentionCount(reconRunCounts(DD.RECON_STATE.runs)),
-    merge: Object.values(DD.MERGE_QUEUE).reduce((s, d) => s + d.active.length, 0),
+    merge: <DatumReading datum={inQueueOver(DD, null)} />,
     esc: DD.ESCALATIONS?.summary?.by_status?.pending ?? 0,
   };
 
@@ -156,7 +181,12 @@ function App() {
   // already re-renders every poll cycle, so the reported age advances on its
   // own. The wall clock is deliberately NOT a second source of App renders —
   // it lives in LiveClock, whose 1s tick re-renders the timestamp alone.
+  //
+  // TAB_ENDPOINTS plus CHROME_ENDPOINTS now also decide what is POLLED, so a
+  // tab opened for the first time may show its pre-fetch seed until its
+  // endpoints answer: the one loading notice names every path with no receipt yet.
   const staleNotices = staleNoticesForTab({ tab, stale: DD.__stale || {}, now: Date.now() });
+  const loadingNotice = loadingNoticeForTab({ tab, receipt: DD.__receipt || {}, stale: DD.__stale || {} });
 
   function renderTab() {
     switch (tab) {
@@ -243,19 +273,17 @@ function App() {
           {staleNotices.map(notice => (
             <div key={notice.path} className="col-span-12"
                  data-testid="endpoint-stale-banner"
-                 style={{
-                   padding: '8px 12px',
-                   border: '1px solid var(--line)',
-                   borderLeft: '3px solid var(--warn)',
-                   borderRadius: 4,
-                   background: 'var(--bg-2)',
-                   color: 'var(--fg-3)',
-                   fontFamily: 'var(--mono)',
-                   fontSize: 11,
-                 }}>
+                 style={noticeBannerStyle('var(--warn)')}>
               {notice.text}
             </div>
           ))}
+          {loadingNotice && (
+            <div className="col-span-12"
+                 data-testid="endpoint-loading-banner"
+                 style={noticeBannerStyle('var(--fg-3)')}>
+              {loadingNotice.text}
+            </div>
+          )}
           {renderTab()}
         </div>
       </div>

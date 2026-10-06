@@ -7,17 +7,12 @@ import logging
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any
 
-from shared.briefing_queries import (
-    BriefingQuerySpec,
-    BriefingScope,
-    queries_for,
-)
+from shared.briefing_queries import BriefingScope
 
+from orchestrator.agents.memory_recall import MemoryRecall
 from orchestrator.agents.roles import WAIT_PATTERN_REMINDER
 from orchestrator.config import OrchestratorConfig
-from orchestrator.mcp_lifecycle import is_timeout_failure, mcp_call
 
 logger = logging.getLogger(__name__)
 
@@ -230,697 +225,6 @@ def _delivered_check_field(check: dict, name: str) -> str:
     return f'{name}: {", ".join(str(v) for v in items) or _DELIVERED_CHECK_LIST_FIELDS[name]}'
 
 
-FOREIGN_PROJECT_TAG_KEYS = ('src_project', 'project_id', 'group_id', 'project')
-"""Metadata keys, in precedence order, that name a memory result's owning project.
-
-``src_project`` is FIRST: the task-2273 CGL-eta rehome
-(``fused-memory/src/fused_memory/maintenance/rehome_scope_tag.py``, kind
-``cgl_eta_cross_target_rehome``) wrote Mem0 entries that physically live in
-``dst_project``'s collection but reference ``src_project``'s task numbers —
-``src_project`` is the authoritative origin project, so it must win over any
-co-present ``project_id``/``group_id`` on the same entry. ``dst_project`` is
-deliberately ABSENT from this tuple: consulting it would falsely certify a
-rehomed foreign fact as local, since it names where the fact was relocated
-TO, not where it came from.
-"""
-
-
-GROUPED_CHILD_KEYS = ('amendments', 'matched_children')
-"""The keys under which fused-memory nests CHILD bodies inside a kept result.
-
-``fused_memory.server.grouped_read.group_search_results`` collapses an
-amendment/sighting hit into its parent and hangs the child data off the
-surviving parent entry at ``entry['grouped']``: truncated bodies under
-``amendments`` (bounded digests) and FULL bodies under ``matched_children``
-(``MATCHED_CHILDREN_KEY`` — where a swallowed matched child is pinned so its
-text stays reachable). Both render verbatim into the ``# Context`` block, so
-both must be walked.
-
-``grouped['parent']`` is deliberately ABSENT from this tuple: it is produced
-only by ``group_memory_document``, which serves the ``get_memory_by_id`` tool,
-and this module never calls that tool (verified — briefing.py contains no
-``get_memory_by_id`` reference; its only memory-tool call is ``search``, in
-:meth:`BriefingAssembler._mcp_search`). A branch for it would be unreachable
-code.
-"""
-
-
-def _canonical_project(value: str) -> str:
-    """Canonicalise a project identifier for comparison.
-
-    Mirrors fused-memory's ``canonicalize_project_id`` semantics
-    (``fused_memory/utils/validation.py``; see the divergent-spelling
-    contract in ``plans/cross-graph-entity-leak-prd.md`` decision 1 / S1) —
-    strip, lowercase, ``'-'`` -> ``'_'`` — so a tag spelled ``dark-factory``
-    is not mistaken for a project distinct from ``dark_factory``.
-
-    Re-implemented locally rather than imported: orchestrator declares no
-    runtime dependency on fused-memory (it appears only in
-    ``orchestrator/pyproject.toml``'s ``[tool.pyright] extraPaths``, a
-    type-checking-only reference), so importing it here would risk an
-    ``ImportError`` in any deployment where fused-memory is not co-installed.
-    """
-    return value.strip().lower().replace('-', '_')
-
-
-def _result_project(entry: dict) -> tuple[str, str] | None:
-    """Read a result's owning-project tag from its metadata, if any.
-
-    Walks :data:`FOREIGN_PROJECT_TAG_KEYS` in precedence order and returns
-    the ``(key, value)`` pair of the first present, non-empty **string**
-    value found in ``entry['metadata']``. A non-string value (e.g. an int)
-    is treated as absent rather than crashing the comparison. Returns
-    ``None`` — i.e. untagged — when ``entry['metadata']`` is missing, not a
-    dict, or carries none of the recognised keys.
-
-    The matched key is returned alongside the value (not just the value) so
-    a drop can be logged with enough context — which key fired, and what it
-    said — to diagnose a false-positive filter from the logs alone.
-    """
-    metadata = entry.get('metadata')
-    if not isinstance(metadata, dict):
-        return None
-    for key in FOREIGN_PROJECT_TAG_KEYS:
-        tag = metadata.get(key)
-        if isinstance(tag, str) and tag.strip():
-            return key, tag
-    return None
-
-
-def _foreign_tag(entry: dict, target: str) -> tuple[str, str] | None:
-    """The ``(key, value)`` of *entry*'s project tag when it names a FOREIGN project.
-
-    THE single spelling of the drop decision, shared by the top-level result
-    loop in :func:`filter_foreign_project_results` and the nested-child loop in
-    :func:`_filter_grouped_children`. The whole value of the descent is that a
-    nested child is judged by the SAME rule as a top-level result; two
-    independent copies of "read the tag, canonicalise, compare" would be
-    exactly the silent-divergence class this module otherwise works hard to
-    prevent — a later change to the comparison (a project whitelist, an
-    allow-empty-tag rule) applied to only one site would leave the other
-    quietly stricter, and a nested-only divergence surfaces as ``dropped == 0``,
-    indistinguishable from "nothing foreign found".
-
-    ``target`` must ALREADY be canonicalised by :func:`_canonical_project`: it
-    is loop-invariant, so it is normalised once by the caller rather than once
-    per entry.
-
-    Returns ``None`` — i.e. KEEP — both when the entry carries no readable tag
-    (the deliberate keep-untagged policy documented on
-    :func:`filter_foreign_project_results`) and when its tag canonicalises
-    equal to ``target``. The two are not distinguished here because neither
-    caller acts on the difference; each only needs to know whether to drop.
-
-    The firing key rides along with the value so a caller can log WHICH key
-    fired and WHAT it said, and so diagnose a false-positive filter from the
-    logs alone.
-    """
-    match = _result_project(entry)
-    if match is None:
-        return None
-    key, tag = match
-    if _canonical_project(tag) == target:
-        return None
-    return key, tag
-
-
-def _filter_grouped_children(entry: dict, target: str) -> int:
-    """Drop cross-project CHILD entries nested inside a KEPT result's block.
-
-    Walks :data:`GROUPED_CHILD_KEYS` inside ``entry['grouped']`` and applies
-    the SAME rule the top-level loop applies — literally the same predicate,
-    :func:`_foreign_tag`, so the ``src_project`` precedence order, the
-    canonicalisation and the keep-untagged policy exist in ONE place and
-    cannot drift apart between the two call sites. Returns the number of
-    nested entries dropped, which the caller reports SEPARATELY from its own
-    top-level drops — see :func:`filter_foreign_project_results`.
-
-    SURGICAL. Only the child LISTS are rewritten, and only when something was
-    actually dropped. ``amendment_count`` / ``sighting_count`` are NEVER
-    recomputed: they are the EXACT values ``_read_grouped_document``
-    (``fused_memory/server/grouped_read.py``:292-327) got from
-    ``count_memories_by_metadata``, deliberately independent of what the
-    bounded digest list happens to contain — the block already reports a
-    short list via ``truncated`` rather than by shrinking the count. A
-    briefing that "fixed" the apparent inconsistency between a shortened list
-    and its count would be fabricating a number the store never returned.
-    ``truncated``, ``children_unavailable`` and every other ``grouped`` key
-    are likewise left exactly as the server sent them.
-
-    FAILS OPEN, like the rest of this module: a ``grouped`` value or a child
-    collection of an unexpected TYPE is left untouched (and logged at WARNING,
-    since a shape surprise means the safeguard did not run on that entry)
-    rather than raising, and a nested entry that is not a dict is KEPT — the
-    same treatment the top-level loop gives a stray non-dict result.
-    """
-    grouped = entry.get('grouped')
-    if grouped is None:
-        # The overwhelmingly common shape: a canonical with no child records
-        # gets no grouped block at all.
-        return 0
-    if not isinstance(grouped, dict):
-        logger.warning(
-            f'filter_foreign_project_results: entry {entry.get("id")!r} has a '
-            f"'grouped' value of type {type(grouped).__name__}, not a dict; "
-            'nested children left unfiltered'
-        )
-        return 0
-    dropped = 0
-    for key in GROUPED_CHILD_KEYS:
-        children = grouped.get(key)
-        if children is None:
-            continue
-        if not isinstance(children, list):
-            logger.warning(
-                f'filter_foreign_project_results: entry {entry.get("id")!r} has '
-                f'grouped[{key!r}] of type {type(children).__name__}, not a list; '
-                'left unfiltered'
-            )
-            continue
-        kept = []
-        for child in children:
-            # A non-dict nested entry is unclassifiable, not foreign — kept,
-            # exactly as an untagged child is. (``_result_project``, reached
-            # through ``_foreign_tag``, already tolerates a non-dict
-            # ``metadata`` on a well-formed one.)
-            if isinstance(child, dict) and (foreign := _foreign_tag(child, target)) is not None:
-                tag_key, tag = foreign
-                dropped += 1
-                logger.debug(
-                    f'filter_foreign_project_results: dropped nested '
-                    f'{child.get("id")!r} under {entry.get("id")!r} '
-                    f'({tag_key}={tag!r})'
-                )
-                continue
-            kept.append(child)
-        if len(kept) != len(children):
-            grouped[key] = kept
-    return dropped
-
-
-def filter_foreign_project_results(
-    payload_text: str, project_id: str
-) -> tuple[str, int, int]:
-    """Drop cross-project results from a fused-memory ``search`` JSON payload.
-
-    ``payload_text`` is the JSON-serialised ``{'results': [...]}`` dict that
-    FastMCP returns as the ``search`` tool's text block (see
-    :meth:`BriefingAssembler._mcp_search`). Each result's project tag is read
-    via :func:`_result_project` (see :data:`FOREIGN_PROJECT_TAG_KEYS`); the
-    entry is dropped when a tag is present and, after
-    :func:`_canonical_project` normalisation, differs from ``project_id``,
-    and kept otherwise — including when ``metadata`` is missing, empty, or
-    not a dict.
-
-    GROUPED CHILDREN (task 4008). Reading only each result's TOP-LEVEL tag is
-    not enough: ``fused_memory.server.grouped_read.group_search_results``
-    nests child bodies inside a KEPT parent's entry (see
-    :data:`GROUPED_CHILD_KEYS`), and ``_get_memory_context`` appends this
-    payload verbatim, so a mis-tagged child hanging off a correctly-tagged
-    canonical would render as raw JSON in the agent's ``# Context`` block
-    having bypassed the safeguard entirely. :func:`_filter_grouped_children`
-    therefore descends into every KEPT entry and applies the same rule
-    (:func:`_foreign_tag`) to its children. This depends on grouped_read.py's
-    ``_origin_tags`` projection actually emitting ``metadata`` on nested
-    entries — without it every nested entry is untagged and the descent is a
-    safeguard that never fires.
-
-    Nested drops are returned SEPARATELY from top-level drops rather than
-    summed into one number. A dropped child is not a dropped result: the two
-    have different blast radii (a dropped result removes a whole recalled
-    fact; a dropped child only shortens a kept fact's amendment list), and
-    ``_get_memory_context`` renders these counts to an operator as the ONLY
-    signal that a leak was blocked, so the arithmetic has to say which kind
-    happened. Both still gate the no-op fast path below, so a nested-only
-    drop can never be swallowed by it.
-
-    Untagged results are deliberately kept rather than dropped: every
-    Graphiti-sourced result has ``metadata == {}`` today (verified at
-    ``fused-memory/src/fused_memory/services/memory_service.py:3332-3407``,
-    ``_search_graphiti``, which only ever adds a ``planned`` key), so
-    dropping untagged results would empty the ``# Context`` block for most
-    queries. Only Mem0-sourced results can carry a project tag today.
-
-    Returns ``(payload_text, dropped, nested_dropped)``: the re-serialised
-    payload — sibling top-level keys such as
-    ``degraded``/``failed_stores``/``failed_store_diagnostics`` are preserved
-    verbatim — then the number of top-level RESULTS dropped, then the number
-    of nested CHILDREN dropped from inside results that survived. Returns
-    ``('', dropped, nested_dropped)`` when nothing survives, so the existing
-    ``if section:`` guards in ``_get_memory_context`` skip an all-foreign
-    section the same way they skip an empty one. (``nested_dropped`` is
-    necessarily 0 in that case: a dropped parent is never descended into.)
-
-    When nothing is dropped (the common case — see above), ``payload_text``
-    is returned unchanged rather than re-serialised: this preserves the
-    upstream formatting byte-for-byte and avoids the cost of a needless
-    round-trip. When something IS dropped, the re-serialisation uses
-    ``ensure_ascii=False`` so non-ASCII content (dark-factory memory text is
-    dense with em dashes and accented characters) is not escaped into
-    ``\\uXXXX`` sequences in the rendered ``# Context`` block.
-
-    Fails OPEN on a malformed payload — non-JSON text, JSON that is not an
-    object, or a missing/non-list ``results`` — returning ``(payload_text,
-    0, 0)`` unchanged and logging a WARNING. Blanking the ``# Context`` block on
-    a serialisation surprise would be a silent capability loss across every
-    prompt builder; preserving today's (unfiltered) behaviour with a loud
-    warning is the safer failure direction. A stray non-dict entry, or a
-    non-dict ``metadata`` on an otherwise-well-formed entry, is kept rather
-    than raising — treated the same as an untagged result.
-    """
-    try:
-        payload = json.loads(payload_text)
-    except (json.JSONDecodeError, TypeError, ValueError) as e:
-        logger.warning(f'filter_foreign_project_results: payload is not valid JSON ({e}); keeping unfiltered')
-        return payload_text, 0, 0
-
-    if not isinstance(payload, dict):
-        logger.warning(
-            f'filter_foreign_project_results: payload is a {type(payload).__name__}, '
-            'not a JSON object; keeping unfiltered'
-        )
-        return payload_text, 0, 0
-
-    results = payload.get('results')
-    if not isinstance(results, list):
-        logger.warning(
-            f"filter_foreign_project_results: payload['results'] is a "
-            f'{type(results).__name__}, not a list; keeping unfiltered'
-        )
-        return payload_text, 0, 0
-
-    target = _canonical_project(project_id)
-    kept = []
-    dropped = 0
-    nested_dropped = 0
-    for entry in results:
-        if not isinstance(entry, dict):
-            kept.append(entry)
-            continue
-        if (foreign := _foreign_tag(entry, target)) is not None:
-            key, tag = foreign
-            dropped += 1
-            logger.debug(
-                f'filter_foreign_project_results: dropped {entry.get("id")!r} '
-                f'({key}={tag!r})'
-            )
-            continue
-        # Only for a KEPT entry: a dropped parent takes its whole subtree with
-        # it, so descending into one would double-count what is already gone.
-        nested_dropped += _filter_grouped_children(entry, target)
-        kept.append(entry)
-
-    if not kept:
-        return '', dropped, nested_dropped
-
-    if dropped == 0 and nested_dropped == 0:
-        # No-op: nothing was filtered, so avoid re-serialising a payload
-        # that is byte-for-byte unchanged — this is the overwhelmingly
-        # common case, since every Graphiti-sourced result is untagged
-        # today and the filter never fires on it. Gated on BOTH counters:
-        # a nested-only drop mutated a child list in place, so returning
-        # the original text here would silently un-drop it.
-        return payload_text, 0, 0
-
-    payload = dict(payload)
-    payload['results'] = kept
-    return json.dumps(payload, indent=2, ensure_ascii=False), dropped, nested_dropped
-
-
-UNCATEGORIZED = 'uncategorized'
-UNDATED = 'undated'
-UNKNOWN_STORE = 'unknown'
-"""Placeholders for the three tag fields a result may not carry.
-
-Measured live, not assumed: Graphiti-sourced results carry ``category:
-null`` and ``created_at: null``, and every edge of a queried task node came
-back with ``temporal: null``. The tag is therefore best-effort and the
-content is not — a missing field renders as one of these words rather than
-as ``None``, and never suppresses the entry it describes.
-"""
-
-
-def _entry_category(entry: dict) -> str:
-    """Label an entry: its own category, else its metadata copy, else its kind."""
-    metadata = entry.get('metadata')
-    metadata_category = metadata.get('category') if isinstance(metadata, dict) else None
-    for value in (entry.get('category'), metadata_category, entry.get('kind')):
-        if isinstance(value, str) and value:
-            return value
-    return UNCATEGORIZED
-
-
-def _entry_date(entry: dict) -> str:
-    """Date an entry: its ``created_at``, else the date its fact became valid.
-
-    Rendered date-only. A memory's usefulness turns on how old it is, not on
-    what second it was written, and the full ISO timestamp is envelope.
-    """
-    temporal = entry.get('temporal')
-    valid_at = temporal.get('valid_at') if isinstance(temporal, dict) else None
-    for value in (entry.get('created_at'), valid_at):
-        if isinstance(value, str) and len(value) >= 10:
-            return value[:10]
-    return UNDATED
-
-
-def _memory_bullet(entry: dict, store: str, indent: str = '') -> str | None:
-    """Render one recalled entry as ``- [category · date · store] content``.
-
-    Returns ``None`` for an entry carrying no text at all: a bullet with an
-    empty body would spend tokens telling an agent that something it cannot
-    read exists. Content is rendered WHOLE (D5) with continuation lines
-    indented so a multi-paragraph memory stays inside its own bullet.
-    """
-    if not isinstance(entry, dict):
-        return None
-    content = entry.get('content') or entry.get('digest')
-    if not isinstance(content, str) or not content.strip():
-        return None
-    body = content.strip().replace('\n', '\n' + indent + '  ')
-    return f'{indent}- [{_entry_category(entry)} · {_entry_date(entry)} · {store}] {body}'
-
-
-def _is_search_reply(text: str) -> bool:
-    """False only for text that parses as JSON yet is no ``{"results": [...]}`` reply.
-
-    The server reports a rejected search (``{"error": ..., "error_type": ...}``)
-    as a normal, non-``isError`` document, which recalled nothing. Text that
-    does not parse at all is left to the renderers' fail-open path, which
-    keeps the multi-text-block limitation :meth:`BriefingAssembler._scoped_search`
-    documents.
-    """
-    try:
-        payload = json.loads(text)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return True
-    return isinstance(payload, dict) and isinstance(payload.get('results'), list)
-
-
-def render_memory_results(payload_text: str) -> str:
-    """Distil a filtered ``search`` payload into markdown bullets (D5).
-
-    One bullet per surviving result, plus one nested bullet per grouped child
-    (:data:`GROUPED_CHILD_KEYS`) — those children carry an amendment's digest
-    or a pinned body, which reach the prompt today as nested JSON and would
-    otherwise vanish silently, making the nested-drop note announce blocking
-    a leak of content nobody renders.
-
-    Fails OPEN on a malformed payload, exactly as
-    :func:`filter_foreign_project_results` does and for the same reason: a
-    serialisation surprise must not blank a section that has real facts in
-    it. The raw text is returned unchanged and a WARNING is logged. Returns
-    ``''`` when the payload is well-formed but holds nothing renderable, so
-    the caller skips the section the same way it skips an empty one.
-    """
-    try:
-        payload = json.loads(payload_text)
-        results = payload['results']
-    except (json.JSONDecodeError, TypeError, ValueError, KeyError) as e:
-        logger.warning(
-            f'render_memory_results: payload is not a renderable search reply ({e}); '
-            'rendering it unfiltered'
-        )
-        return payload_text
-    if not isinstance(results, list):
-        logger.warning(
-            f"render_memory_results: payload['results'] is a {type(results).__name__}, "
-            'not a list; rendering it unfiltered'
-        )
-        return payload_text
-
-    bullets: list[str] = []
-    for entry in results:
-        if not isinstance(entry, dict):
-            continue
-        store = entry.get('source_store')
-        store = store if isinstance(store, str) and store else UNKNOWN_STORE
-        bullet = _memory_bullet(entry, store)
-        if bullet is None:
-            continue
-        bullets.append(bullet)
-        grouped = entry.get('grouped')
-        if not isinstance(grouped, dict):
-            continue
-        for key in GROUPED_CHILD_KEYS:
-            children = grouped.get(key)
-            if not isinstance(children, list):
-                continue
-            bullets.extend(
-                child_bullet
-                for child in children
-                if (child_bullet := _memory_bullet(child, store, indent='  ')) is not None
-            )
-    return '\n'.join(bullets)
-
-
-def render_entity_block(payload_text: str, expected_name: str) -> str:
-    """Render a ``get_entity`` reply, but ONLY for an exactly-named node (D3).
-
-    ``get_entity`` tries an exact name match and then falls back to fuzzy /
-    semantic matching, so a task node that does not exist is answered with a
-    NEIGHBOURING task's node — measured — whose facts would then be read as
-    this task's own. Admitting a reply only when the node's name equals
-    *expected_name* character-for-character is what makes the channel safe to
-    render. The guard is client-side by decision: the PRD puts server-side
-    fuzzy-path changes out of scope, and a consumer that cannot tolerate a
-    wrong neighbour should not depend on the server to stop sending one.
-
-    An edge's date is best-effort: measured live, every edge of a queried
-    task node carried ``temporal: null`` (the exact-match path builds edges
-    from an EdgeDict that has no ``valid_at`` at all), so a dated edge is the
-    exception and a date is never required.
-
-    Returns ``''`` — never raises — for a missing, mis-shaped, empty or
-    wrong-named reply.
-    """
-    try:
-        payload = json.loads(payload_text)
-    except (json.JSONDecodeError, TypeError, ValueError) as e:
-        logger.warning(f'render_entity_block: reply for {expected_name!r} is not JSON ({e})')
-        return ''
-    if not isinstance(payload, dict):
-        return ''
-
-    nodes = payload.get('nodes')
-    nodes = nodes if isinstance(nodes, list) else []
-    node = next(
-        (n for n in nodes if isinstance(n, dict) and n.get('name') == expected_name),
-        None,
-    )
-    if node is None:
-        # A degraded reply makes "no such node" unanswerable — the store that
-        # would have held it is the one that failed — so the same empty
-        # render means two different things and only the level separates them.
-        degraded = bool(payload.get('degraded'))
-        logger.log(
-            logging.WARNING if degraded else logging.DEBUG,
-            f'render_entity_block: no node named exactly {expected_name!r} in '
-            f'the reply; nothing rendered (degraded={degraded})',
-        )
-        return ''
-
-    summary = node.get('summary')
-    heading = f'**{expected_name}**'
-    if isinstance(summary, str) and summary.strip():
-        heading += f' — {summary.strip()}'
-
-    lines = [heading]
-    edges = payload.get('edges')
-    for edge in edges if isinstance(edges, list) else []:
-        if not isinstance(edge, dict):
-            continue
-        fact = edge.get('fact')
-        if not isinstance(fact, str) or not fact.strip():
-            continue
-        temporal = edge.get('temporal')
-        valid_at = temporal.get('valid_at') if isinstance(temporal, dict) else None
-        dated = f' ({valid_at[:10]})' if isinstance(valid_at, str) and len(valid_at) >= 10 else ''
-        lines.append(f'- {fact.strip()}{dated}')
-    return '\n'.join(lines)
-
-
-MEMORY_FAILURE_TIMEOUT = 'timeout'
-MEMORY_FAILURE_TRANSPORT = 'transport'
-MEMORY_FAILURE_MALFORMED = 'malformed'
-"""Why a memory query produced nothing, when the answer is "it broke".
-
-Three classes, because they call for three different operator responses: a
-timeout says the service is alive and slow, a transport failure says it is
-unreachable, and a malformed reply says it answered with something that is
-not a USABLE tool result. "The corpus holds nothing" is NOT one of them —
-that is an empty outcome carrying no failure at all, and conflating the two
-is the defect this vocabulary exists to end.
-
-``malformed`` covers two reply shapes, because both leave the caller with no
-facts and send an operator to the same place — the server: a JSON-RPC error
-envelope (no ``result`` dict at all; see ``mcp_lifecycle._raw_call``) and a
-tool-level failure, which FastMCP returns as a well-formed envelope carrying
-``isError: True`` and the error prose in a text block. The second is the
-dangerous one: its text block reads exactly like a recalled result, so
-without the flag it renders into the prompt as remembered fact.
-"""
-
-MEMORY_EMPTY_NOTICE = '_No memory context available._'
-MEMORY_OUTAGE_NOTICE = '_Memory unavailable ({reasons}) — proceed with codebase exploration._'
-"""The two "nothing recalled" outcomes, deliberately worded apart.
-
-Measured over live briefings, 234 said "no memory context available" because
-the service was failing and 77 because the corpus genuinely had nothing to
-say — in byte-identical prose. An operator reading one could not tell which
-had happened, so neither number was actionable.
-"""
-
-MEMORY_OUTAGE_STREAK_THRESHOLD = 5
-"""Consecutive dispatches recalling NOTHING before the outage is escalated.
-
-INV-4. The per-query WARNING and the in-block notice report one dispatch;
-neither can say "this has now failed five running", which is the difference
-between one flaky call and a memory service nobody has noticed is down. Five
-is a judgement, not a measurement: low enough that a real outage is named
-within a few minutes of dispatch traffic, high enough that a single restart
-of the memory container does not page anyone.
-
-CODE, not a config knob (D7). The threshold is revisited on evidence like
-the query table beside it; hot-reload buys nothing for a module constant,
-and a per-project knob would let "what counts as an outage" drift between
-projects for no stated reason.
-
-Deliberately NOT ``shared.storm_counter.StormCounter``, which is a rolling
-TIME-WINDOW burst detector: it would fire on N failures inside a window even
-with successes interleaved, and would fall silent on a permanent outage once
-dispatches slowed below the window rate — the exact opposite of what a
-consecutive-failure streak must report. The house precedent for a streak is
-a plain counter attribute (``shared/api_health.py``'s
-``consecutive_successes``, ``usage_gate``'s ``consecutive_cap_hits``), and
-there is no shared streak primitive to reuse.
-"""
-
-MEMORY_SECTION_FAILURE_NOTICE = (
-    '_The **{section}** section is missing: the memory query failed ({reason})._'
-)
-MEMORY_DEGRADED_STORES_NOTICE = (
-    '_Partial recall for **{section}**: the {stores} store(s) failed._'
-)
-
-
-@dataclass(frozen=True)
-class MemoryQueryOutcome:
-    """What one memory query produced: facts, or a named reason there are none.
-
-    ``text`` is the reply payload (filtered, once it has passed
-    :func:`filter_foreign_project_results`); ``failure`` names one of the
-    reason classes above. Both being absent is the honest empty answer —
-    the query worked and the corpus had nothing.
-    """
-
-    text: str | None = None
-    failure: str | None = None
-    dropped: int = 0
-    nested_dropped: int = 0
-    failed_stores: tuple[str, ...] = ()
-
-
-def _section_notices(section: str, outcome: MemoryQueryOutcome) -> list[str]:
-    """The lines a dispatch owes its reader about one query's health (D6).
-
-    Both notices name their *section*, because a reader looking at a block
-    with one section missing needs to know WHICH question went unanswered —
-    "memory degraded" alone leaves them unable to tell a missing convention
-    from a missing task history. Takes the title rather than the spec it
-    usually comes from: one section can be answered by more than one channel
-    (D3's dual-channel Task Context), and each channel names itself.
-    """
-    notices = []
-    if outcome.failure:
-        notices.append(MEMORY_SECTION_FAILURE_NOTICE.format(
-            section=section, reason=outcome.failure,
-        ))
-    if outcome.failed_stores:
-        notices.append(MEMORY_DEGRADED_STORES_NOTICE.format(
-            section=section, stores=', '.join(outcome.failed_stores),
-        ))
-    return notices
-
-
-ENTITY_CHANNEL_SUFFIX = ' (knowledge graph)'
-"""Distinguishes D3's graph channel from the semantic one in a notice.
-
-Both answer the same SECTION, so an unqualified notice would name "Task
-Context" twice — identical prose, no way to tell which of the two corpora
-went missing, and a duplicated line when both fail together.
-"""
-
-
-def _failed_stores(payload_text: str) -> tuple[str, ...]:
-    """Which stores the server reported failing on this query.
-
-    ``degraded``/``failed_stores`` are emitted FAULT-ONLY — a healthy reply
-    carries neither key — so their presence is itself the signal. Read from
-    the RAW reply rather than the filtered one: the filter preserves these
-    sibling keys, but it returns ``''`` when every result was foreign, and a
-    partial store outage is worth reporting even when nothing survived the
-    cross-project filter.
-
-    Silent on a payload that will not parse: the caller has already run it
-    through :func:`filter_foreign_project_results`, which logs that WARNING
-    once. A second copy of the same diagnosis is noise.
-    """
-    try:
-        payload = json.loads(payload_text)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return ()
-    if not isinstance(payload, dict) or not payload.get('degraded'):
-        return ()
-    stores = payload.get('failed_stores')
-    if not isinstance(stores, list):
-        return ()
-    return tuple(store for store in stores if isinstance(store, str) and store)
-
-
-def _tool_error_text(reply: dict) -> str | None:
-    """The error prose of a tool-level failure, or None if the tool succeeded.
-
-    An MCP tool reports its own failure IN the response body rather than by
-    breaking the transport: FastMCP answers with a well-formed
-    ``{'isError': True, 'content': [{'type': 'text', 'text': 'Error: ...'}]}``.
-    Nothing about that envelope's SHAPE says it failed, so a reader that
-    checks only the shape extracts the error prose and renders it as recalled
-    memory — and, worse, counts it as a successful recall that resets the
-    outage streak.
-
-    Spelled as ``orchestrator/src/orchestrator/scheduler.py``'s reader of the
-    same envelope spells it (see its ``update_task`` call site and the
-    ``extract_rejection`` docstring), so the two cannot drift apart on what
-    "the tool errored" looks like on the wire.
-    """
-    if not reply.get('isError'):
-        return None
-    for block in reply.get('content', []) or []:
-        if isinstance(block, dict) and block.get('type') == 'text':
-            return str(block.get('text', ''))
-    return ''
-
-
-MEMORY_CONTEXT_CAVEAT = (
-    "_This context was recalled from the `{project_id}` project's memory — "
-    'it is NOT a description of this worktree. It may name tasks, repos, '
-    'crates, or file paths that do not exist here. Do not assume a recalled '
-    'path is real: verify it exists before reading it or `cd`-ing into it._'
-)
-"""Standing provenance caveat rendered right after the ``# Context`` heading.
-
-Covers the leak channel :func:`filter_foreign_project_results` cannot reach:
-every Graphiti-sourced memory result has ``metadata == {}`` today (see that
-function's docstring), so an untagged foreign fact — e.g. a path belonging
-to a different project's repo — survives the filter unclassified and
-renders verbatim. The tag filter is the permanent chokepoint for taggable
-(Mem0) results; this caveat is what actually converts "agent `cd`'s/reads
-into a recalled foreign path" into "agent verifies the path first" for the
-untagged majority. Interpolated with ``self.project_id`` via ``.format()``.
-"""
-
-
 def _caller_agent_id(task_id: str | None, role: str) -> str:
     """The agent-id a dispatch is known by, in its prompt and in the journal.
 
@@ -981,26 +285,8 @@ class BriefingAssembler:
 
     def __init__(self, config: OrchestratorConfig):
         self.config = config
-        self.memory_url = config.fused_memory.url
         self.project_id = config.fused_memory.project_id
-        self._memory_outage_streak = 0
-        """Consecutive dispatches whose memory recall produced nothing at all.
-
-        Lives on the assembler because the harness holds exactly one for the
-        life of the process and hands it to every workflow, so the count is
-        per-process dispatch history — which is the thing INV-4 asks about.
-
-        "Consecutive" therefore means consecutive across INTERLEAVED
-        dispatches from up to ``max_concurrent_tasks`` unrelated workflows,
-        not consecutive within one task. That is deliberate — the question
-        INV-4 asks is about the SERVICE, which is shared — and it is
-        deliberately conservative in one direction: because any dispatch
-        that recalled something resets the count, a partial outage that
-        still lets some queries through stays below the threshold rather
-        than escalating. The escalation is a floor on how loud a TOTAL
-        outage gets, never a detector for a flaky one; the per-query WARNING
-        and the in-block notices are what report those, once per dispatch.
-        """
+        self._memory_recall = MemoryRecall(config.fused_memory.url, self.project_id)
 
     def _agent_identity(self, task_id: str | None, role: str) -> str:
         agent_id = _caller_agent_id(task_id, role)
@@ -1009,6 +295,21 @@ class BriefingAssembler:
             f'- **agent_id:** `{agent_id}`\n'
             f'- **project_id:** `{self.project_id}`\n'
         )
+
+    async def _task_preamble(
+        self,
+        task: dict,
+        role: str,
+        context: str | None,
+        *,
+        include_files: bool = True,
+    ) -> str:
+        """The memory, identity and ``# Task`` header a task-scoped briefing opens with."""
+        if context is None:
+            context = await self._get_memory_context(BriefingScope.from_task(task), role)
+        identity = self._agent_identity(task.get('id'), role)
+        task_block = self._format_task(task, include_files=include_files)
+        return f'{context}\n\n{identity}\n\n# Task\n\n{task_block}'
 
     async def build_architect_prompt(
         self,
@@ -1039,13 +340,9 @@ class BriefingAssembler:
                 byte-identical to the pre-γ baseline, so nothing is added on
                 the common path.
         """
-        if context is None:
-            context = await self._get_memory_context(
-                BriefingScope.from_task(task), 'architect',
-            )
-
-        task_block = self._format_task(task, include_files=False)
-        identity = self._agent_identity(task.get('id'), 'architect')
+        preamble = await self._task_preamble(
+            task, 'architect', context, include_files=False,
+        )
 
         prior_proposal_section = ''
         if include_prior_proposals:
@@ -1093,13 +390,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
 """
 
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 {prior_proposal_section}{committed_section}
 # Action
@@ -1130,13 +421,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         merged).  The architect reviews the existing plan against the changes
         and either confirms, updates, or recreates it.
         """
-        if context is None:
-            context = await self._get_memory_context(
-                BriefingScope.from_task(task), 'architect',
-            )
-
-        task_block = self._format_task(task)
-        identity = self._agent_identity(task.get('id'), 'architect')
+        preamble = await self._task_preamble(task, 'architect', context)
         prior_proposal_section = self._format_prior_proposal(task)
 
         plan_files = set(existing_plan.get('files', []))
@@ -1168,13 +453,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         plan_json = json.dumps(existing_plan, indent=2)
 
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 {prior_proposal_section}
 # Plan Revalidation
@@ -1227,13 +506,7 @@ and either confirm it, update it, or recreate it from scratch.
         partial entirely (``create_plan`` overwrites it) if it reflects a
         flawed approach.
         """
-        if context is None:
-            context = await self._get_memory_context(
-                BriefingScope.from_task(task), 'architect',
-            )
-
-        task_block = self._format_task(task)
-        identity = self._agent_identity(task.get('id'), 'architect')
+        preamble = await self._task_preamble(task, 'architect', context)
 
         existing_steps = [
             s for s in partial_plan.get('steps', []) if isinstance(s, dict)
@@ -1241,13 +514,7 @@ and either confirm it, update it, or recreate it from scratch.
         plan_json = json.dumps(partial_plan, indent=2)
 
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 # Plan Completion — Finish an Interrupted Plan
 
@@ -1317,26 +584,14 @@ to start over from nothing.
         a post-pass subset check rejects any plan that added entries
         beyond the current ``plan.files`` set.
         """
-        if context is None:
-            context = await self._get_memory_context(
-                BriefingScope.from_task(task), 'architect',
-            )
-
-        task_block = self._format_task(task)
-        identity = self._agent_identity(task.get('id'), 'architect')
+        preamble = await self._task_preamble(task, 'architect', context)
 
         current_files = list(plan.get('files', []))
         files_list = '\n'.join(f'- `{f}`' for f in current_files) or '_(empty)_'
         not_touched_list = '\n'.join(f'- `{f}`' for f in not_touched) or '_(none)_'
 
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 # Plan Tightening — Architect Narrowing Pass
 
@@ -1401,6 +656,86 @@ remains, that is option (b): call `confirm_plan()` and let the escalation
 triage it.
 """
 
+    async def build_plan_schema_repair_prompt(
+        self,
+        task: dict,
+        context: str | None = None,
+    ) -> str:
+        """Architect pass that restructures an on-disk plan missing ``steps``.
+
+        The plan is never copied into the prompt: plan.json is its single home,
+        read through the lane's ``.task/plan.json``. Completeness is attested
+        only by the architect's own ``confirm_plan()``.
+        """
+        preamble = await self._task_preamble(task, 'architect', context)
+
+        return f"""\
+{preamble}
+
+# Plan Schema Repair
+
+The plan for this task is on disk at `.task/plan.json` (a symlink into the
+durable `<worktree_base>/.task-meta/<worktree-name>/plan.json`), but it has no
+non-empty top-level `steps` array, so it cannot advance. It is NOT reproduced
+here — read the file in full.
+
+## Action
+
+1. Read `.task/plan.json` in full.
+2. Record its existing step content with the plan-tools:
+   `add_prerequisite(prereq_id, description)` for setup work and
+   `add_plan_step(step_id, step_type, description)` for each TDD step, in the
+   plan's own order, carrying each description across unchanged. If `files`
+   is missing or empty, set it with `update_plan_metadata(files=[...])`.
+3. Restructure only: do not redesign the plan or explore beyond what
+   restructuring needs. Do not call `create_plan` — it replaces the document
+   wholesale and would discard the analysis and decisions you are
+   restructuring.
+4. Call `confirm_plan()` as your FINAL action. Without it the repaired plan is
+   treated as incomplete and will not advance.
+
+If the file holds no step content to restructure, do not invent steps: stop
+without calling `confirm_plan()` and the task will be re-planned.
+"""
+
+    async def build_replan_prompt(
+        self,
+        task: dict,
+        review_feedback: str,
+        context: str | None = None,
+    ) -> str:
+        """Architect pass that extends the plan to answer blocking review issues.
+
+        The plan is never copied into the prompt: plan.json is its single home,
+        read through the lane's ``.task/plan.json``, so a replayed prompt cannot
+        show stale steps.
+        """
+        preamble = await self._task_preamble(task, 'architect', context)
+
+        return f"""\
+{preamble}
+
+# Re-Plan After Review
+
+The implementation was reviewed and blocking issues were found.
+
+{review_feedback}
+
+## Action
+
+1. Read `.task/plan.json` (a symlink into the durable
+   `<worktree_base>/.task-meta/<worktree-name>/plan.json`) for the current plan
+   and each step's status — it is not reproduced here.
+2. Add the steps that address the blocking issues with
+   `add_plan_step(step_id, step_type, description)`, using step ids not
+   already in the plan. New steps are recorded as pending.
+3. If those steps touch files the plan does not list, call
+   `update_plan_metadata(files=[...])` with the full widened list.
+4. Keep every existing step in place, in order: do not remove or reorder
+   steps, and do not call `create_plan` — it replaces the plan wholesale and
+   would discard completed steps.
+"""
+
     async def build_simple_task_prompt(
         self,
         task: dict,
@@ -1414,15 +749,9 @@ triage it.
         ``mark_step_done`` and stop. The orchestrator then advances to VERIFY
         without invoking the implementer.
         """
-        if context is None:
-            context = await self._get_memory_context(
-                BriefingScope.from_task(task), 'simple_task',
-            )
+        preamble = await self._task_preamble(task, 'simple_task', context)
 
-        task_block = self._format_task(task)
-        identity = self._agent_identity(task.get('id'), 'simple_task')
-
-        files = (task.get('metadata') or {}).get('files') or []
+        files =(task.get('metadata') or {}).get('files') or []
         if files:
             files_list = '\n'.join(f'- `{f}`' for f in files)
             files_section = f'## Listed files\n\n{files_list}'
@@ -1433,13 +762,7 @@ triage it.
         # substantial architectural thought") mirrors _COMPLEXITY_RUBRIC in roles.py.
         # Update both in lockstep if the rubric changes.
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 # Action
 
@@ -1528,23 +851,37 @@ Review any overlap with your plan steps before continuing — file contents may 
             # No limit: _detect_tip_wip_commits is bounded by the contiguous
             # WIP run at HEAD, unlike the architect's whole-branch detector.
             commits_list = _format_commit_bullets(wip_notice)
+            # Attribution protocol and why (task 5177): orchestrator/tests/test_harness_wip_step_detection.py::TestWipSectionStepAttribution
             wip_section = f"""
 ## Already-Committed WIP — Verify Before Re-Implementing
 
 The harness auto-commits uncommitted work as a safety net before a
 rebase/requeue/reclaim. The commit(s) below landed at branch HEAD this way,
-which means the next pending step's implementation may already be sitting
+which means one or more pending steps' implementation may already be sitting
 there, complete, waiting on `mark_step_done`.
 
 {commits_list}
 
-Before writing any new code:
+A step's recorded commit is the commit whose diff carries that step's change.
+Passing tests alone do not identify it: they pass just the same when the
+change was committed earlier on this branch, below the commit(s) above.
+
+Before writing any new code, walk the pending steps in plan order:
 
 1. Run `git show <sha>` for each commit above to see what it contains.
-2. Run the next pending step's tests.
-3. If they already pass, call `mark_step_done(step_id, commit_sha)` with the
-   WIP commit's SHA instead of re-implementing the step.
-4. Only write new code if the step is genuinely unsatisfied by this commit.
+2. For each step, run `git log --oneline {self.config.git.main_branch}..HEAD -- <path>`
+   over the files it changes to find the commit on this branch that carries
+   its change, and run its tests. Only a step whose tests behave as its spec
+   says counts as carried.
+   - **Carried by an earlier, non-WIP commit:** call
+     `mark_step_done(step_id, <that commit's sha>)` and move to the next step.
+   - **Carried by a WIP commit above:** call
+     `mark_step_done(step_id, <that WIP sha>)` and move to the next step.
+     Several steps citing one WIP sha is correct when its diff carries each of
+     them. Do not split, amend or rewrite a WIP commit, and do not make an
+     empty commit to get a distinct sha.
+   - **Only partly carried, or not carried:** the walk ends here. Finish the
+     step normally, commit, and cite that new commit.
 """
 
         return f"""\
@@ -1948,11 +1285,7 @@ from where the previous agent left off.
         Includes memory context, task details, escalation info, and action
         instructions.  Used for the initial session and after cap-hit resets.
         """
-        context = await self._get_memory_context(
-            BriefingScope.from_task(task), 'steward',
-        )
-        identity = self._agent_identity(task.get('id'), 'steward')
-        task_block = self._format_task(task)
+        preamble = await self._task_preamble(task, 'steward', None)
         esc_block = self._format_escalation(escalation)
 
         pending_block = ''
@@ -1965,13 +1298,7 @@ from where the previous agent left off.
             pending_block = f'\n## Other Pending Escalations\n\n{items}\n'
 
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 # Escalation
 
@@ -2029,361 +1356,8 @@ Handle this escalation, then call `resolve_issue` with a summary.
         return chr(10).join(lines)
 
     async def _get_memory_context(self, scope: BriefingScope, role: str) -> str:
-        """Recall memory for one dispatch and render it as the ``# Context`` block.
-
-        *scope* says what this dispatch is about and *role* says who is
-        asking. WHAT is asked belongs to :mod:`shared.briefing_queries` — the
-        single home the memory-eval registry pins its phrasings against
-        (D9/INV-5) — so this method only fires the table, filters each reply
-        for cross-project leaks and renders what survives.
-        """
-        caller_agent_id = _caller_agent_id(scope.task_id, role)
-        recalled_sections: list[str] = []
-        notices: list[str] = []
-        outcomes: list[MemoryQueryOutcome] = []
-        loop_failure: str | None = None
-
-        try:
-            for spec, query in queries_for(scope):
-                outcome = await self._scoped_search(
-                    spec, query,
-                    caller_agent_id=caller_agent_id,
-                    caller_task_id=scope.task_id,
-                )
-                outcomes.append(outcome)
-                notices.extend(_section_notices(spec.section_title, outcome))
-
-                blocks = [render_memory_results(outcome.text)] if outcome.text else []
-                if spec.wants_entity_block and scope.task_id:
-                    # The graph channel reports its own health but is kept out
-                    # of `outcomes`: that list answers "did the SEARCH table
-                    # work", which is what the outage streak and the drop
-                    # note's query arithmetic are both counting.
-                    entity = await self._task_entity_block(scope.task_id)
-                    notices.extend(_section_notices(
-                        spec.section_title + ENTITY_CHANNEL_SUFFIX, entity,
-                    ))
-                    blocks.append(entity.text or '')
-                body = '\n\n'.join(block for block in blocks if block)
-                if body:
-                    recalled_sections.append(f'## {spec.section_title}\n\n{body}')
-
-        except Exception as e:
-            # The loop itself broke — a filter or renderer surprise, not a
-            # per-query fault, so no section can name it. It still counts as
-            # an outage for the notice below.
-            logger.warning(f'Failed to fetch memory context: {e}')
-            loop_failure = MEMORY_FAILURE_TRANSPORT
-
-        foreign_dropped = sum(outcome.dropped for outcome in outcomes)
-        nested_dropped = sum(outcome.nested_dropped for outcome in outcomes)
-        queries_fired = len(outcomes)
-        failures = [outcome.failure for outcome in outcomes if outcome.failure]
-        reasons = list(dict.fromkeys(failures + ([loop_failure] if loop_failure else [])))
-        # An outage is "nothing worked", not "something didn't": one failed
-        # query among two is a partial recall, already named section by
-        # section in `notices` above. Gated on `recalled_sections` as well as
-        # on the reasons, because the loop can break AFTER a section was
-        # genuinely recalled — and a dispatch that recalled something has not
-        # suffered an outage, however badly its remaining queries went.
-        outage = (
-            not recalled_sections
-            and bool(reasons)
-            and (loop_failure is not None or len(failures) == queries_fired)
-        )
-        self._note_memory_outage(outage)
-
-        # Compute (and log) the filtered-result summary BEFORE any early
-        # return below: an all-foreign result set and a partial failure are
-        # both "no facts survived" outcomes, and the fact that a leak was
-        # caught and blocked must never be discarded along with them — see
-        # filter_foreign_project_results' loud-over-silent fail-open stance.
-        # foreign_dropped sums per-query drops over the SAME corpus (every
-        # query can match one distinct foreign memory), so the note names
-        # both numbers rather than implying `foreign_dropped` distinct facts
-        # were found.
-        #
-        # Top-level and NESTED drops are named as separate quantities (task
-        # 4008 amendment). A nested drop removed an amendment digest or a
-        # pinned body from INSIDE a result that survived — it did not vacate
-        # a result slot — so folding the two into one "result slot(s)" figure
-        # would show an operator a number that does not match what they can
-        # see in the block. This note is the only signal a human gets that a
-        # leak was blocked; its arithmetic has to be legible.
-        drop_note = ''
-        if foreign_dropped > 0 or nested_dropped > 0:
-            query_word = 'query' if queries_fired == 1 else 'queries'
-            counted = []
-            if foreign_dropped > 0:
-                counted.append(f'{foreign_dropped} memory result slot(s)')
-            if nested_dropped > 0:
-                counted.append(f'{nested_dropped} nested memory record(s)')
-            drop_note = (
-                f'{" and ".join(counted)} across {queries_fired} '
-                f'{query_word} were tagged to another project and filtered out'
-            )
-            logger.info(
-                f'_get_memory_context: {drop_note} of the context assembled for '
-                f'{self.project_id!r}'
-            )
-
-        if not recalled_sections:
-            # The per-section notices are owed to the reader whether or not
-            # some OTHER query happened to render: D6 conditions the failure
-            # line on a per-query failure, and `_failed_stores` promises a
-            # partial store outage is reported "even when nothing survived
-            # the cross-project filter". Dropping them here made a broken
-            # dispatch read as a healthy empty corpus — byte-identically.
-            #
-            # The family line stays FIRST: scripts/legibility/digest.py
-            # recognises this block by leading substring, and `outage` keeps
-            # meaning "nothing worked" (the streak predicate above is
-            # untouched), so a partial failure still leads with
-            # MEMORY_EMPTY_NOTICE and a total one with MEMORY_OUTAGE_NOTICE.
-            notice = (
-                MEMORY_OUTAGE_NOTICE.format(reasons=', '.join(reasons))
-                if outage else MEMORY_EMPTY_NOTICE
-            )
-            body = '\n\n'.join([notice, *notices])
-            if drop_note:
-                body += f'\n\n_Note: {drop_note}._'
-            return f'# Context\n\n{body}'
-
-        # recalled_sections is non-empty: gate the provenance caveat on that
-        # fact alone, NOT on memory_unavailable — a later query failing must
-        # not suppress the caveat (the untagged-leak mitigation) for
-        # sections that were already genuinely recalled. The failure, if
-        # any, is appended afterwards as its own section rather than
-        # silently dropped.
-        caveat = MEMORY_CONTEXT_CAVEAT.format(project_id=self.project_id)
-        if drop_note:
-            caveat += f'\n\n_In total, {drop_note}._'
-
-        rendered_sections = list(recalled_sections)
-        if loop_failure is not None:
-            notices.append(
-                '_Memory unavailable for the remaining queries — proceed with '
-                'codebase exploration for anything not covered above._'
-            )
-        if notices:
-            rendered_sections.append('\n'.join(notices))
-
-        return '# Context\n\n' + caveat + '\n\n' + '\n\n---\n\n'.join(rendered_sections)
-
-    def _note_memory_outage(self, outage: bool) -> None:
-        """Track the consecutive-outage streak and escalate once per crossing.
-
-        Re-alarms on every further multiple of the threshold rather than
-        once and then never again: a permanent outage must keep saying so,
-        and an operator who missed the first line still gets another without
-        one line per dispatch.
-        """
-        if not outage:
-            self._memory_outage_streak = 0
-            return
-        self._memory_outage_streak += 1
-        if self._memory_outage_streak % MEMORY_OUTAGE_STREAK_THRESHOLD == 0:
-            logger.error(
-                f'_get_memory_context: {self._memory_outage_streak} consecutive '
-                f'dispatches recalled no memory at all for {self.project_id!r} — '
-                'the memory service looks unavailable, and every briefing since '
-                'the streak began was assembled without it'
-            )
-
-    async def _task_entity_block(self, task_id: str) -> MemoryQueryOutcome:
-        """The knowledge-graph half of D3's dual-channel task context.
-
-        The semantic search answers "what memory reads like this task"; this
-        answers "what the graph records ABOUT this task", which is a
-        different question and a different corpus. Asked only when there is a
-        task id to name — an entity called ``Task None`` matches nothing, and
-        the fuzzy fallback would answer that miss with a stranger.
-
-        Returns the RENDERED block as its ``text``, and carries the channel's
-        health in the same shape the search channel uses: ``get_entity``
-        answers a Graphiti fault with the very same fault-only
-        ``degraded``/``failed_stores`` keys
-        (``fused_memory/services/memory_service.py``), so a graph outage here
-        would otherwise be indistinguishable from "the graph holds nothing
-        about this task" — the exact defect the search half of D6 closes.
-        """
-        expected_name = f'Task {task_id}'
-        reply = await self._mcp_get_entity(expected_name)
-        if not reply.text:
-            return reply
-        return replace(
-            reply,
-            text=render_entity_block(reply.text, expected_name),
-            failed_stores=_failed_stores(reply.text),
-        )
-
-    async def _mcp_get_entity(self, name: str) -> MemoryQueryOutcome:
-        """Look one entity up over fused-memory's MCP HTTP endpoint.
-
-        Named failures rather than a bare ``None``, for the reason
-        :meth:`_mcp_search` documents: this channel's reader cannot tell an
-        empty graph from an unreachable one, and only the caller can say so
-        in the prompt.
-        """
-        try:
-            result = await mcp_call(
-                f'{self.memory_url}/mcp',
-                'tools/call',
-                {'name': 'get_entity', 'arguments': {'name': name, 'project_id': self.project_id}},
-                timeout=10,
-            )
-        except Exception as e:
-            failure = (
-                MEMORY_FAILURE_TIMEOUT if is_timeout_failure(e)
-                else MEMORY_FAILURE_TRANSPORT
-            )
-            logger.warning(f'MCP get_entity failed for {name!r} ({failure}): {e}')
-            return MemoryQueryOutcome(failure=failure)
-
-        reply = result.get('result') if isinstance(result, dict) else None
-        if not isinstance(reply, dict):
-            logger.warning(f'MCP get_entity for {name!r} answered with no tool result: {result!r}')
-            return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
-
-        error_text = _tool_error_text(reply)
-        if error_text is not None:
-            logger.warning(f'MCP get_entity for {name!r} returned a tool error: {error_text!r}')
-            return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
-
-        texts = [
-            block['text']
-            for block in reply.get('content', [])
-            if isinstance(block, dict) and block.get('type') == 'text'
-        ]
-        return MemoryQueryOutcome(text='\n'.join(texts) if texts else None)
-
-    async def _scoped_search(
-        self,
-        spec: BriefingQuerySpec,
-        query: str,
-        *,
-        caller_agent_id: str,
-        caller_task_id: str | None,
-    ) -> MemoryQueryOutcome:
-        """Search fused-memory and drop cross-project results from the reply.
-
-        Thin wrapper over :meth:`_mcp_search` that applies
-        :func:`filter_foreign_project_results` to the raw text before it
-        reaches :meth:`_get_memory_context`, and carries the reply's
-        ``failed_stores`` alongside. A failed or empty search passes through
-        with its outcome intact — there is nothing to filter, and the reason
-        it produced nothing must survive to the renderer.
-
-        Assumes :meth:`_mcp_search` answers with a single JSON document: it
-        joins every MCP response text block with ``'\\n'`` before returning.
-        If the search tool ever replies with more than one text block, the
-        joined text is not valid JSON and the filter fails open (unfiltered,
-        WARNING logged) for that query — see
-        ``test_briefing_project_scope.py``'s ``TestScopedSearch`` for the
-        pinned limitation.
-        """
-        reply = await self._mcp_search(
-            spec, query,
-            caller_agent_id=caller_agent_id,
-            caller_task_id=caller_task_id,
-        )
-        if not reply.text:
-            return reply
-        text, dropped, nested_dropped = filter_foreign_project_results(reply.text, self.project_id)
-        return replace(
-            reply,
-            text=text,
-            dropped=dropped,
-            nested_dropped=nested_dropped,
-            failed_stores=_failed_stores(reply.text),
-        )
-
-    async def _mcp_search(
-        self,
-        spec: BriefingQuerySpec,
-        query: str,
-        *,
-        caller_agent_id: str,
-        caller_task_id: str | None,
-    ) -> MemoryQueryOutcome:
-        """Ask one query of fused-memory over its MCP HTTP endpoint.
-
-        The spec supplies the retrieval scoping — which stores, which
-        categories, how many results — and the caller identity is declared
-        for the journal (D8). An empty ``stores``/``categories`` tuple is
-        omitted rather than sent empty, so the server applies its own routing
-        instead of being handed a filter that matches nothing.
-
-        A failure is NAMED (see the reason classes above) and logged at
-        WARNING, never swallowed at DEBUG: an unreachable memory service used
-        to be indistinguishable here from an empty corpus, which left the
-        caller's honest outage branch unreachable and masked a live transient
-        server error for 234 briefings.
-        """
-        arguments: dict[str, Any] = {
-            'query': query,
-            'project_id': self.project_id,
-            'limit': spec.limit,
-            'caller_agent_id': caller_agent_id,
-        }
-        if spec.stores:
-            arguments['stores'] = list(spec.stores)
-        if spec.categories:
-            arguments['categories'] = list(spec.categories)
-        if caller_task_id:
-            arguments['caller_task_id'] = caller_task_id
-
-        try:
-            result = await mcp_call(
-                f'{self.memory_url}/mcp',
-                'tools/call',
-                {'name': 'search', 'arguments': arguments},
-                timeout=10,
-            )
-        except Exception as e:
-            # One handler, because the TYPE raised here says nothing: on retry
-            # exhaustion `mcp_call` re-raises a plain RuntimeError that keeps
-            # the original only as `__cause__`, so an `except TimeoutError`
-            # branch could never fire and every timeout was reported as a
-            # transport failure. `is_timeout_failure` does the unwrap, in the
-            # module that does the wrap.
-            failure = (
-                MEMORY_FAILURE_TIMEOUT if is_timeout_failure(e)
-                else MEMORY_FAILURE_TRANSPORT
-            )
-            logger.warning(f'Memory search failed for {query!r} ({failure}): {e}')
-            return MemoryQueryOutcome(failure=failure)
-
-        reply = result.get('result') if isinstance(result, dict) else None
-        if not isinstance(reply, dict):
-            logger.warning(
-                f'Memory search for {query!r} answered with no tool result: {result!r}'
-            )
-            return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
-
-        error_text = _tool_error_text(reply)
-        if error_text is not None:
-            logger.warning(
-                f'Memory search for {query!r} returned a tool error: {error_text!r}'
-            )
-            return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
-
-        texts = [
-            block['text']
-            for block in reply.get('content', [])
-            if isinstance(block, dict) and block.get('type') == 'text'
-        ]
-        # No text blocks is an honest empty answer, not a fault: the tool
-        # replied, it simply recalled nothing.
-        if not texts:
-            return MemoryQueryOutcome(text=None)
-        text = '\n'.join(texts)
-        if not _is_search_reply(text):
-            logger.warning(
-                f'Memory search for {query!r} answered without a results list: {text!r}'
-            )
-            return MemoryQueryOutcome(failure=MEMORY_FAILURE_MALFORMED)
-        return MemoryQueryOutcome(text=text)
+        """The ``# Context`` block for a dispatch about *scope* by *role*."""
+        return await self._memory_recall.context_block(scope, _caller_agent_id(scope.task_id, role))
 
     def _format_prior_proposal(self, task: dict) -> str:
         """Format the most recent dry-run block-time proposal, if any.

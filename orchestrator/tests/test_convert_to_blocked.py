@@ -1829,7 +1829,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         async def fake_check(*a, **k):  # noqa: ARG001
             return PlanFilesTouchedResult(not_touched=['a.py'])
         monkeypatch.setattr(
-            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
             fake_check, )
 
         emits: list = []
@@ -2014,7 +2014,7 @@ class TestSubmitToMergeQueueAlreadyLanded:
         async def passing_check(*a, **k):  # noqa: ARG001
             return PlanFilesTouchedResult()
         monkeypatch.setattr(
-            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
             passing_check, )
 
         # A healthy branch runs off the end of the gate and into the real
@@ -2111,7 +2111,7 @@ class TestAlreadyLandedLadderWithRealMarkBlocked:
         async def fake_check(*a, **k):  # noqa: ARG001
             return PlanFilesTouchedResult(not_touched=['a.py'])
         monkeypatch.setattr(
-            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
             fake_check, )
         monkeypatch.setattr(
             'orchestrator.merge_queue._emit_merge_attempt',
@@ -2307,7 +2307,7 @@ class TestLandedButPinnedZombieLoop:
             # test_merge_gates_plan_files_rename.py already owns).
             return PlanFilesTouchedResult(not_touched=list(self._PLAN_FILES))
         monkeypatch.setattr(
-            'orchestrator.merge_queue._check_plan_files_touched_in_branch',
+            'orchestrator.merge_lane.gates._check_plan_files_touched_in_branch',
             fake_check, )
 
         emits: list = []

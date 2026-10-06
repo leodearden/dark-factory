@@ -37,7 +37,8 @@ Incoming-framing amendments (default-empty; task 3997):
               entry count alone bounds nothing when one field is unbounded free
               text, so the two counters together are what make the list's size
               envelope assertable from the record.
-  SOLE WRITER: `queue.add_members_to_l2`.
+  APPEND-AND-TRIM POLICY: `queue._append_amendment_capped`, the single home
+  every writer of these three fields goes through.
 
 Over-fold evidence (default-empty; task 3998):
   root_cause_variants:
@@ -195,8 +196,11 @@ class Amendment(TypedDict):
     When `promote_to_l2` folds a new promote into an existing pending L2, the
     incoming root_cause/evidence/options/summary used to be dropped on the floor
     (measured: 336,875 characters lost).  Each such fold now appends one of these
-    to `Escalation.amendments`.  The record's OWN framing is never overwritten —
-    both the original and every incoming reframing survive, which is the point.
+    to `Escalation.amendments`.  An explicit `queue.EscalationQueue.amend`
+    (task 4886) appends one too, with no fold behind it; the two sources are
+    distinguishable by `agent_role`.  The record's OWN framing is never
+    overwritten — both the original and every incoming reframing survive, which
+    is the point.
 
     `detail` holds `promote_to_l2`'s ``evidence`` ARGUMENT — the same argument the
     create path writes into the record's own `detail` — so a reader can diff an
@@ -553,9 +557,10 @@ class Escalation:
     # Preserved incoming framing (task 3997).  APPEND-ONLY: an amendment NEVER
     # overwrites this record's own root_cause / detail / options / summary — the
     # original human-facing framing is immutable and every incoming reframing is
-    # kept alongside it.  `queue.add_members_to_l2` is the SOLE writer and also
-    # the sole trimmer (it sheds the OLDEST past `queue._MAX_AMENDMENTS`,
-    # counting each drop in amendments_truncated).  Zero migration, same pattern
+    # kept alongside it.  Every writer appends through
+    # `queue._append_amendment_capped`, the single home of the append-and-trim
+    # policy (it sheds the OLDEST past `queue._MAX_AMENDMENTS`, counting each
+    # drop in amendments_truncated).  Zero migration, same pattern
     # as members / evidence / train_state / the triage quad / granted_files /
     # filing_claimant_run_id above: legacy JSON without these keys deserialises
     # to the defaults via the from_dict __dataclass_fields__ filter below,

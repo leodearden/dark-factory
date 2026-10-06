@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import ast
+import contextlib
 import json
 import logging
 import sqlite3
-from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -14,7 +13,8 @@ from unittest.mock import patch
 import aiosqlite
 import pytest
 
-from dashboard.data import performance
+from dashboard.data import performance, redux_api
+from dashboard.data.datum import DatumState, validate_datum
 from dashboard.data.performance import (
     _HISTORY_CACHE,
     _cutoff,
@@ -23,6 +23,7 @@ from dashboard.data.performance import (
     aggregate_completion_paths,
     aggregate_escalation_rates,
     aggregate_loop_histograms,
+    aggregate_performance_cards,
     aggregate_performance_history,
     aggregate_time_centiles,
     get_completion_paths,
@@ -1150,7 +1151,7 @@ class TestAggregateLoopHistograms:
         """
         call_count = 0
 
-        async def _fake_get_loop_histograms(db, *, days):  # noqa: ARG001
+        async def _fake_get_loop_histograms(db, *, days, now, projects):  # noqa: ARG001
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -1223,7 +1224,7 @@ class TestAggregateLoopHistograms:
         """
         call_count = 0
 
-        async def _fake_get_loop_histograms(db, *, days):  # noqa: ARG001
+        async def _fake_get_loop_histograms(db, *, days, now, projects):  # noqa: ARG001
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -1297,7 +1298,7 @@ class TestAggregateLoopHistograms:
         """
         call_count = 0
 
-        async def _fake_get_loop_histograms(db, *, days):  # noqa: ARG001
+        async def _fake_get_loop_histograms(db, *, days, now, projects):  # noqa: ARG001
             nonlocal call_count
             call_count += 1
             canonical_inner = {
@@ -1378,7 +1379,7 @@ class TestAggregateLoopHistograms:
             'values': [1, 1, 1, 1, 1, 1],
         }
 
-        async def _fake_get_loop_histograms(db, *, days):  # noqa: ARG001
+        async def _fake_get_loop_histograms(db, *, days, now, projects):  # noqa: ARG001
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -2109,234 +2110,460 @@ class TestAggregatePerformanceHistoryWindowBoundary:
         )
 
 
-def _iter_non_docstring_string_literals(tree: ast.AST) -> Iterator[tuple[int, str]]:
-    """Yield ``(lineno, value)`` for every string-literal ``ast.Constant`` node
-    in *tree*, excluding module/class/function docstrings.
-
-    Used to restrict a source-scanning guard to string content that could
-    actually reach SQLite as a query, rather than every physical source
-    line. Comments are never part of the AST at all, so walking the tree
-    already excludes them; explicitly excluding docstring nodes here closes
-    the other gap -- a naive whole-file substring scan flags both, which is
-    why prose in performance.py previously had to avoid spelling out the
-    forbidden pattern literally.
-
-    Yielding the already-narrowed ``str`` value rather than the node carries
-    the "value is a `str`" invariant across the yield boundary in the type.
-    pyright infers `ast.Constant.value` as a union and this generator's
-    internal `isinstance` check does not survive yielding the node itself,
-    so every call site would otherwise have to re-narrow it defensively.
-    """
-    docstring_ids: set[int] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-            body = node.body
-            if (
-                body
-                and isinstance(body[0], ast.Expr)
-                and isinstance(body[0].value, ast.Constant)
-                and isinstance(body[0].value.value, str)
-            ):
-                docstring_ids.add(id(body[0].value))
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Constant)
-            and isinstance(node.value, str)
-            and id(node) not in docstring_ids
-        ):
-            yield node.lineno, node.value
-
-
-# Both spellings of the forbidden SQL-side clock read, in one place: the
-# detection below and the remediation message both derive from this tuple.
-_SQL_CLOCK_READ_PATTERNS = ("datetime('now'", 'datetime("now"')
-
-
-def _sql_clock_read_violations(source: str, label: str) -> list[str]:
-    """Return one ``'<label>:<lineno>: <excerpt>'`` entry per non-docstring
-    string literal in *source* whose value contains a
-    `_SQL_CLOCK_READ_PATTERNS` spelling.
-
-    A match is reported straight off the AST literal -- its start line and
-    its folded value -- and never off a physical source line. Python folds
-    implicitly-concatenated adjacent literals into ONE `ast.Constant` whose
-    value can contain the pattern while no single line does, so re-deriving
-    the violation by re-scanning lines silently misses exactly the
-    multi-line SQL style the module under guard is written in (task 4624
-    review finding).
-
-    Interior whitespace in the excerpt is collapsed so that a triple-quoted
-    multi-line SQL literal cannot emit embedded newlines, which would garble
-    the joined failure message into unattributable fragments.
-    """
-    violations: list[str] = []
-    for lineno, value in _iter_non_docstring_string_literals(ast.parse(source, filename=label)):
-        if any(pattern in value for pattern in _SQL_CLOCK_READ_PATTERNS):
-            excerpt = ' '.join(value.split())[:120]
-            violations.append(f'{label}:{lineno}: {excerpt}')
-    return violations
-
-
 # ---------------------------------------------------------------------------
-# Detection-helper unit tests for the data-layer SQL clock-read guard
+# Cards and sparklines share one wall-clock window (task 5594)
 # ---------------------------------------------------------------------------
 
-# Implicit concatenation folds these three adjacent fragments into ONE
-# `ast.Constant` (lineno=4, end_lineno=6) whose value contains the forbidden
-# pattern while no single physical line does. This is the SQL style already
-# used in the module under guard.
-_FOLDED_SQL_SOURCE = '''
-def q():
+CARDS_NOW = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
+CARDS_DAYS = 7
+# The hour buckets of a1-a3 in _active_and_idle_rows(CARDS_NOW); a4's
+# '2026-09-23T11:00' falls before the cutoff.
+ACTIVE_IN_WINDOW_HOURS = ['2026-09-30T09:00', '2026-09-30T10:00', '2026-09-30T11:00']
+
+
+def _task_row(
+    task_id: str,
+    project_id: str,
+    completed_at: datetime,
+    *,
+    outcome: str = 'done',
+    duration_ms: int = 1000,
+    verify_attempts: int = 0,
+    review_cycles: int = 0,
+) -> tuple:
     return (
-        "SELECT project_id FROM task_results "
-        "WHERE completed_at >= datetime("
-        "'now', ? || ' days')"
+        f'run-{project_id}', task_id, project_id, None, outcome, 0.0, duration_ms,
+        0, 0, verify_attempts, review_cycles, 0.0, 0, completed_at.isoformat(),
     )
-'''
-
-_SINGLE_QUOTED_NOW_SOURCE = '''
-def q():
-    return "SELECT 1 FROM t WHERE completed_at >= datetime('now', ? || ' days')"
-'''
-
-_DOUBLE_QUOTED_NOW_SOURCE = """
-def q():
-    return 'SELECT 1 FROM t WHERE completed_at >= datetime("now", ? || " days")'
-"""
-
-_PROSE_DOCSTRING_SOURCE = '''
-"""Module prose explaining why datetime('now', ...) must not reach SQLite."""
 
 
-def q():
-    """Function prose naming datetime("now", ...) the same way."""
-    return 'SELECT 1'
-'''
+def _drop_task_results_column(db_path: Path, column: str) -> Path:
+    """Give *db_path* one column of schema drift: the card families reading
+    *column* fail open, while discovery (project_id, completed_at) still reads."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(f'ALTER TABLE task_results DROP COLUMN {column}')
+        conn.commit()
+    finally:
+        conn.close()
+    return db_path
 
-_PROSE_COMMENT_SOURCE = '''
-# Comment naming datetime('now', ? || ' days') in prose.
-def q():
-    return 'SELECT 1'  # and datetime("now", ...) named again here
-'''
+
+def _active_and_idle_rows(now: datetime) -> list[tuple]:
+    """'active' completes three tasks inside the 7d window ending at *now*,
+    plus one done row at now - 7d - 30m: outside the wall-clock window but
+    inside the window anchored to its latest completion (latest - 7d =
+    now - 7d - 1h). 'idle' last completed anything 20 days before *now*."""
+    return [
+        _task_row('a1', 'active', now - timedelta(hours=1), duration_ms=1000),
+        _task_row('a2', 'active', now - timedelta(hours=2), duration_ms=3000, verify_attempts=1),
+        _task_row('a3', 'active', now - timedelta(hours=3), outcome='blocked'),
+        _task_row('a4', 'active', now - timedelta(days=7, minutes=30), duration_ms=9000),
+        _task_row('i1', 'idle', now - timedelta(days=20), duration_ms=5000),
+        _task_row('i2', 'idle', now - timedelta(days=20, hours=1), duration_ms=6000),
+    ]
 
 
-class TestSqlClockReadGuard:
-    """Unit tests for `_sql_clock_read_violations`, the detection helper behind
-    `test_no_sql_side_clock_reads_in_data_layer`.
+@pytest.fixture()
+async def active_idle_conn(tmp_path):
+    db_path = _make_runs_db(tmp_path, 'active_idle.db', _active_and_idle_rows(CARDS_NOW))
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        yield conn
 
-    That guard asserts `assert not violations`, which is vacuous on its own:
-    detection broken to return `[]` for everything would keep it green
-    forever. These tests pin the end-to-end detection contract directly, so
-    both halves are exercised -- SQL that must be flagged, and prose that must
-    not be.
-    """
 
-    def test_implicitly_concatenated_literal_is_flagged(self):
-        """A folded multi-line SQL literal is flagged, reported off the AST node.
+class TestCardsShareTheWallClockWindow:
+    """The four card families count the rows of the wall-clock window
+    ``[now - days, now]`` that the sparklines count, never a window anchored
+    to each project's latest completion."""
 
-        Regression test for the task-4624 review finding: Python folds
-        implicitly-concatenated adjacent literals into one `ast.Constant`
-        whose value contains the pattern while no single physical line does,
-        so re-deriving the violation by re-scanning physical source lines
-        silently misses it.
-        """
-        violations = _sql_clock_read_violations(_FOLDED_SQL_SOURCE, 'fake.py')
+    @pytest.fixture(autouse=True)
+    def _clear_history_cache(self):
+        _HISTORY_CACHE.clear()
 
-        assert len(violations) == 1, f'expected exactly one violation, got {violations!r}'
-        assert violations[0].startswith('fake.py:4: '), (
-            f'expected the violation to report the line where the implicit '
-            f'concatenation starts, got {violations[0]!r}'
+    @pytest.mark.asyncio
+    async def test_completion_paths(self, active_idle_conn, empty_escalations_dir):
+        result = await aggregate_completion_paths(
+            [active_idle_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
         )
-        assert "datetime('now'" in violations[0], (
-            f'expected the excerpt to carry the folded literal value, '
-            f'got {violations[0]!r}'
+        assert sum(entry['count'] for entry in result['active']) == 3
+        assert result['idle'] == []
+
+    @pytest.mark.asyncio
+    async def test_escalation_rates(self, active_idle_conn, empty_escalations_dir):
+        result = await aggregate_escalation_rates(
+            [active_idle_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
         )
-        assert not any(
-            "datetime('now'" in line for line in _FOLDED_SQL_SOURCE.splitlines()
-        ), (
-            'fixture is no longer a folded literal -- some physical line now '
-            'contains the pattern, so this test would pass under the very '
-            'line re-scan it exists to forbid'
+        assert result['active']['total_tasks'] == 3
+        assert result['idle']['total_tasks'] == 0
+
+    @pytest.mark.asyncio
+    async def test_loop_histograms(self, active_idle_conn):
+        result = await aggregate_loop_histograms([active_idle_conn], days=CARDS_DAYS, now=CARDS_NOW)
+        assert sum(result['active']['outer']['values']) == 2
+        assert sum(result['active']['inner']['values']) == 2
+        assert result['idle'] == {
+            'outer': {'labels': ['0', '1', '2', '3+'], 'values': [0, 0, 0, 0]},
+            'inner': {'labels': ['0', '1', '2', '3', '4', '5+'], 'values': [0, 0, 0, 0, 0, 0]},
+        }
+
+    @pytest.mark.asyncio
+    async def test_time_centiles(self, active_idle_conn):
+        result = await aggregate_time_centiles([active_idle_conn], days=CARDS_DAYS, now=CARDS_NOW)
+        assert result['active']['count'] == 2
+        assert result['idle']['count'] == 0
+        assert result['idle']['p50'] == 0
+
+    @pytest.mark.asyncio
+    async def test_cards_and_sparkline_both_exclude_the_row_before_the_cutoff(
+        self, active_idle_conn, empty_escalations_dir,
+    ):
+        """a4 sits 30 minutes before the shared cutoff: the cards count only
+        a1-a3, and the sparkline buckets only their three hours."""
+        paths = await aggregate_completion_paths(
+            [active_idle_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+        history = await aggregate_performance_history(
+            [active_idle_conn], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+        assert sum(entry['count'] for entry in paths['active']) == 3
+        assert history['active']['time_centiles_history']['labels'] == ACTIVE_IN_WINDOW_HOURS
+
+    @pytest.mark.asyncio
+    async def test_default_now_is_the_wall_clock(self, tmp_path, empty_escalations_dir):
+        """With no ``now``, an idle project's 20-day-old rows are outside the
+        window ending at the current clock, whatever its latest completion."""
+        db_path = _make_runs_db(tmp_path, 'idle_only.db', [
+            _task_row('i1', 'idle', datetime.now(UTC) - timedelta(days=20)),
+            _task_row('i2', 'idle', datetime.now(UTC) - timedelta(days=20, hours=1)),
+        ])
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            paths = await get_completion_paths(conn, empty_escalations_dir, days=CARDS_DAYS)
+            ttc = await get_time_centiles(conn, days=CARDS_DAYS)
+        assert paths['idle'] == []
+        assert ttc['idle']['count'] == 0
+
+
+# ---------------------------------------------------------------------------
+# One served Datum per project's cards (task 5594)
+# ---------------------------------------------------------------------------
+
+
+async def _cards_of(tmp_path, escalations_dir, rows: list[tuple]) -> dict:
+    db_path = _make_runs_db(tmp_path, 'cards.db', rows)
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        return await aggregate_performance_cards(
+            [conn], [escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
         )
 
-    @pytest.mark.parametrize(
-        'source',
-        [
-            pytest.param(_SINGLE_QUOTED_NOW_SOURCE, id='single-quoted-now'),
-            pytest.param(_DOUBLE_QUOTED_NOW_SOURCE, id='double-quoted-now'),
-        ],
-    )
-    def test_single_line_literal_is_flagged(self, source: str):
-        """Both spellings of an ordinary one-line SQL clock read are flagged."""
-        violations = _sql_clock_read_violations(source, 'fake.py')
 
-        assert len(violations) == 1, f'expected exactly one violation, got {violations!r}'
-        assert violations[0].startswith('fake.py:3: '), (
-            f'expected the violation to report the literal\'s line, '
-            f'got {violations[0]!r}'
+class TestPerformanceCardsDatum:
+    """Each project's card block is one Datum whose as_of is the project's
+    latest completion and whose freshness bound is the served window, so an
+    idle project is stale by the envelope's own bound."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_history_cache(self):
+        _HISTORY_CACHE.clear()
+
+    @pytest.mark.asyncio
+    async def test_active_project_is_fresh_and_carries_the_window_tally(
+        self, active_idle_conn, empty_escalations_dir,
+    ):
+        conns, dirs = [active_idle_conn], [empty_escalations_dir]
+        window = {'days': CARDS_DAYS, 'now': CARDS_NOW}
+        datum = (await aggregate_performance_cards(conns, dirs, **window))['active']
+
+        assert datum.state is DatumState.FRESH
+        assert datum.reason is None
+        assert datum.as_of == CARDS_NOW - timedelta(hours=1)
+        assert datum.freshness_bound_seconds == 7 * 86400
+        assert datum.value is not None
+        histograms = (await aggregate_loop_histograms(conns, **window))['active']
+        assert datum.value.to_wire() == {
+            'paths': (await aggregate_completion_paths(conns, dirs, **window))['active'],
+            'escalation': (await aggregate_escalation_rates(conns, dirs, **window))['active'],
+            'hist_outer': histograms['outer'],
+            'hist_inner': histograms['inner'],
+            'ttc': (await aggregate_time_centiles(conns, **window))['active'],
+        }
+        validate_datum(datum, CARDS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_idle_project_is_stale_by_its_last_completion(
+        self, active_idle_conn, empty_escalations_dir,
+    ):
+        cards = await aggregate_performance_cards(
+            [active_idle_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+        datum = cards['idle']
+
+        assert datum.state is DatumState.STALE
+        assert datum.as_of is not None
+        assert datum.reason is not None
+        assert datum.value is not None
+        assert datum.as_of == CARDS_NOW - timedelta(days=20)
+        assert '7d' in datum.reason
+        assert 'last completion' in datum.reason
+        wire = datum.value.to_wire()
+        assert wire['paths'] == []
+        ttc = wire['ttc']
+        assert isinstance(ttc, dict)
+        assert ttc['count'] == 0
+        validate_datum(datum, CARDS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_window_start_is_inclusive_for_state_and_tally(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        cards = await _cards_of(tmp_path, empty_escalations_dir, [
+            _task_row('e1', 'edge', CARDS_NOW - timedelta(days=CARDS_DAYS)),
+        ])
+        datum = cards['edge']
+        assert datum.state is DatumState.FRESH
+        assert sum(entry['count'] for entry in datum.value.to_wire()['paths']) == 1
+
+    @pytest.mark.asyncio
+    async def test_completion_after_the_serving_instant_is_clock_skew(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        cards = await _cards_of(tmp_path, empty_escalations_dir, [
+            _task_row('s1', 'skewed', CARDS_NOW + timedelta(hours=1)),
+        ])
+        datum = cards['skewed']
+        assert datum.state is DatumState.STALE
+        assert 'clock skew' in datum.reason
+        validate_datum(datum, CARDS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_unreadable_latest_completion_is_stale_at_the_serving_instant(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        unreadable = (*_task_row('u1', 'unreadable', CARDS_NOW)[:-1], 'not-a-time')
+        datum = (await _cards_of(tmp_path, empty_escalations_dir, [unreadable]))['unreadable']
+        assert datum.state is DatumState.STALE
+        assert datum.as_of == CARDS_NOW
+        assert 'could not be read' in datum.reason
+        validate_datum(datum, CARDS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_as_of_is_the_latest_completion_across_dbs(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        db_a = _make_runs_db(tmp_path, 'a.db', [
+            _task_row('a1', 'shared', CARDS_NOW - timedelta(hours=2)),
+        ])
+        db_b = _make_runs_db(tmp_path, 'b.db', [
+            _task_row('b1', 'shared', CARDS_NOW - timedelta(minutes=30)),
+        ])
+        async with aiosqlite.connect(str(db_a)) as a, aiosqlite.connect(str(db_b)) as b:
+            a.row_factory = aiosqlite.Row
+            b.row_factory = aiosqlite.Row
+            cards = await aggregate_performance_cards(
+                [a, b], [empty_escalations_dir, empty_escalations_dir],
+                days=CARDS_DAYS, now=CARDS_NOW,
+            )
+        assert cards['shared'].as_of == CARDS_NOW - timedelta(minutes=30)
+
+    @pytest.mark.asyncio
+    async def test_no_completions_lists_no_projects(self, empty_runs_conn, empty_escalations_dir):
+        window = {'days': CARDS_DAYS, 'now': CARDS_NOW}
+        assert await aggregate_performance_cards(
+            [empty_runs_conn], [empty_escalations_dir], **window,
+        ) == {}
+        assert await aggregate_performance_cards([None], [empty_escalations_dir], **window) == {}
+
+    @pytest.mark.asyncio
+    async def test_a_family_that_raises_leaves_its_projects_unknown_naming_it(
+        self, active_idle_conn, empty_escalations_dir,
+    ):
+        async def _raising_histograms(*_args, **_kwargs):
+            raise RuntimeError('histogram read failed')
+
+        with patch('dashboard.data.performance.aggregate_loop_histograms', _raising_histograms):
+            cards = await aggregate_performance_cards(
+                [active_idle_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+            )
+        assert set(cards) == {'active', 'idle'}
+        for datum in cards.values():
+            assert datum.state is DatumState.UNKNOWN
+            assert datum.reason == 'the loop histograms of this project could not be read'
+            validate_datum(datum, CARDS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_a_family_whose_query_fails_open_leaves_the_project_unknown(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        """A runs.db without ``verify_attempts`` fails only the loop-histogram
+        query; its project is served UNKNOWN naming that family, not dropped."""
+        db_path = _drop_task_results_column(
+            _make_runs_db(tmp_path, 'drifted.db', [
+                _task_row('t1', 'drifted', CARDS_NOW - timedelta(hours=1)),
+            ]),
+            'verify_attempts',
+        )
+        async with aiosqlite.connect(str(db_path)) as conn:
+            cards = await aggregate_performance_cards(
+                [conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+            )
+        datum = cards['drifted']
+        assert datum.state is DatumState.UNKNOWN
+        assert datum.reason == 'the loop histograms of this project could not be read'
+
+    @pytest.mark.asyncio
+    async def test_query_count_does_not_grow_with_the_project_count(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        async def statements_for(project_count: int) -> list[str]:
+            db_path = _make_runs_db(tmp_path, f'{project_count}-projects.db', [
+                _task_row(f't{i}', f'p{i}', CARDS_NOW - timedelta(hours=1))
+                for i in range(project_count)
+            ])
+            statements: list[str] = []
+            async with aiosqlite.connect(str(db_path)) as conn:
+                await conn.set_trace_callback(statements.append)
+                await aggregate_performance_cards(
+                    [conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+                )
+            return statements
+
+        one_project, six_projects = await statements_for(1), await statements_for(6)
+        assert len(six_projects) == len(one_project)
+        assert sum('MAX(completed_at)' in sql for sql in six_projects) == 1
+
+    @pytest.mark.asyncio
+    async def test_shaped_payload_serves_both_states_under_one_now(
+        self, active_idle_conn, empty_escalations_dir,
+    ):
+        conns = [active_idle_conn]
+        shaped = redux_api.shape_performance(
+            cards=await aggregate_performance_cards(
+                conns, [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+            ),
+            history=await aggregate_performance_history(conns, days=CARDS_DAYS, now=CARDS_NOW),
+            served_at=CARDS_NOW,
+        )
+        performance_by_label = shaped['PERFORMANCE']
+
+        assert shaped['served_at'] == CARDS_NOW.isoformat()
+
+        active = performance_by_label['active']
+        assert active['cards']['state'] == 'fresh'
+        assert sum(entry['count'] for entry in active['cards']['value']['paths']) == 3
+        assert active['time_centiles_history']['labels'] == ACTIVE_IN_WINDOW_HOURS
+
+        idle = performance_by_label['idle']
+        assert idle['cards']['state'] == 'stale'
+        assert idle['cards']['as_of'] == (CARDS_NOW - timedelta(days=20)).isoformat()
+        assert idle['time_centiles_history'] == {'labels': [], 'p50': [], 'p95': []}
+        assert idle['one_pass_history'] == {'labels': [], 'values': []}
+        assert idle['escalation_history'] == {'labels': [], 'values': []}
+
+
+# ---------------------------------------------------------------------------
+# Each runs.db tallies only the projects it holds (task 5594)
+# ---------------------------------------------------------------------------
+
+
+async def _cards_across(db_paths: list[Path], escalations_dir: Path) -> dict:
+    async with contextlib.AsyncExitStack() as stack:
+        conns: list[aiosqlite.Connection | None] = [
+            await stack.enter_async_context(aiosqlite.connect(str(db_path)))
+            for db_path in db_paths
+        ]
+        return await aggregate_performance_cards(
+            conns, [escalations_dir] * len(conns), days=CARDS_DAYS, now=CARDS_NOW,
         )
 
-    def test_docstring_mention_is_not_flagged(self):
-        """Module and function docstrings naming the pattern in prose are not queries.
 
-        performance.py's own docstring depends on this exclusion, so the
-        detection must not over-correct into flagging prose.
-        """
-        assert _sql_clock_read_violations(_PROSE_DOCSTRING_SOURCE, 'fake.py') == []
+class TestCardsAcrossRunsDbs:
+    """A project is served a value only when every runs.db holding it tallied
+    every family; a healthy runs.db never fills in a project it does not hold."""
 
-    def test_comment_mention_is_not_flagged(self):
-        """A `#` comment naming the pattern is not a query.
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('dropped', 'unread'), [
+        ('verify_attempts', 'loop histograms'),
+        ('duration_ms', 'time centiles'),
+        ('steward_invocations', 'completion paths and escalation rates'),
+    ])
+    async def test_a_failed_family_on_one_db_leaves_its_projects_unknown(
+        self, tmp_path, empty_escalations_dir, dropped, unread,
+    ):
+        healthy = _make_runs_db(tmp_path, 'a.db', [
+            _task_row('a1', 'alpha', CARDS_NOW - timedelta(hours=1)),
+        ])
+        drifted = _drop_task_results_column(
+            _make_runs_db(tmp_path, 'b.db', [
+                _task_row('b1', 'beta', CARDS_NOW - timedelta(hours=1)),
+            ]),
+            dropped,
+        )
 
-        Comments are absent from the AST entirely, so this documents an
-        invariant the implementation gets for free and must not lose.
-        """
-        assert _sql_clock_read_violations(_PROSE_COMMENT_SOURCE, 'fake.py') == []
+        cards = await _cards_across([healthy, drifted], empty_escalations_dir)
 
+        beta = cards['beta']
+        assert beta.state is DatumState.UNKNOWN
+        assert beta.value is None
+        assert beta.reason == f'the {unread} of this project could not be read'
+        alpha = cards['alpha']
+        assert alpha.state is DatumState.FRESH
+        assert alpha.value is not None
+        wire = alpha.value.to_wire()
+        ttc, paths = wire['ttc'], wire['paths']
+        assert isinstance(ttc, dict) and isinstance(paths, list)
+        assert ttc['count'] == 1
+        assert sum(entry['count'] for entry in paths) == 1
+        validate_datum(alpha, CARDS_NOW)
+        validate_datum(beta, CARDS_NOW)
 
-def test_no_sql_side_clock_reads_in_data_layer():
-    """No `dashboard/src/dashboard/data/*.py` module computes a cutoff via a
-    SQL-side `datetime('now', ...)` call (task 4624 -- its 4th recorded
-    sighting of this defect class).
+    @pytest.mark.asyncio
+    async def test_a_project_one_holder_could_not_tally_is_unknown(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        healthy = _make_runs_db(tmp_path, 'a.db', [
+            _task_row('a1', 'shared', CARDS_NOW - timedelta(hours=1)),
+        ])
+        drifted = _drop_task_results_column(
+            _make_runs_db(tmp_path, 'b.db', [
+                _task_row('b1', 'shared', CARDS_NOW - timedelta(hours=2)),
+            ]),
+            'verify_attempts',
+        )
 
-    Modelled on test_clock_discipline.py:157-175's source-scanning guard,
-    but restricted to non-docstring string literals (via
-    `_iter_non_docstring_string_literals`) rather than every physical
-    source line -- so a comment or docstring *naming* the forbidden pattern
-    in prose (as performance.py's do) cannot trip a false positive; only
-    string literals that could actually reach SQLite as a query are
-    inspected. Does not fire on `_project_cutoffs` (performance.py), which
-    uses `datetime(MAX(completed_at), ...)` and is deliberately out of
-    scope for this task (see design decision).
+        shared = (await _cards_across([healthy, drifted], empty_escalations_dir))['shared']
 
-    Detection lives in `_sql_clock_read_violations`, which reports a match
-    directly off the AST literal -- file, the literal's start line, and the
-    folded value. Reporting off a physical source line instead silently
-    misses implicitly-concatenated SQL, which is the style already used in
-    the module under guard; `TestSqlClockReadGuard` above pins both that
-    regression and the prose exclusions, so `assert not violations` below
-    cannot pass vacuously on broken detection.
+        assert shared.state is DatumState.UNKNOWN
+        assert shared.reason == 'the loop histograms of this project could not be read'
+        validate_datum(shared, CARDS_NOW)
 
-    Placement note: this guard belongs conceptually next to
-    `test_clock_discipline.py::test_no_bare_clock_reads_in_data_modules`,
-    which already owns the `_DATA_DIR` scan root this test re-derives. It
-    stays here rather than being relocated because `test_clock_discipline.py`
-    is not one of the modules this task holds a lock on
-    (`dashboard/src/dashboard/data/performance.py` and this file only); the
-    move is filed as a follow-up instead of being done here --
-    tkt_0RTY030WB80YZK4EZ5JBJ6EB0T (a fused-memory ticket; the curator
-    converts it to a task_id asynchronously).
-    """
-    data_dir = Path(__file__).resolve().parent.parent / 'src' / 'dashboard' / 'data'
-    violations: list[str] = []
-    for path in sorted(data_dir.glob('*.py')):
-        rel = path.relative_to(data_dir.parent.parent)
-        violations.extend(_sql_clock_read_violations(path.read_text(), str(rel)))
+    @pytest.mark.asyncio
+    async def test_healthy_dbs_each_tally_their_own_projects_with_one_discovery_query(
+        self, tmp_path, empty_escalations_dir,
+    ):
+        db_a = _make_runs_db(tmp_path, 'a.db', [
+            _task_row('a1', 'alpha', CARDS_NOW - timedelta(hours=1)),
+        ])
+        db_b = _make_runs_db(tmp_path, 'b.db', [
+            _task_row('b1', 'beta', CARDS_NOW - timedelta(hours=1)),
+        ])
+        statements_a: list[str] = []
+        statements_b: list[str] = []
+        async with aiosqlite.connect(str(db_a)) as a, aiosqlite.connect(str(db_b)) as b:
+            await a.set_trace_callback(statements_a.append)
+            await b.set_trace_callback(statements_b.append)
+            cards = await aggregate_performance_cards(
+                [a, b], [empty_escalations_dir, empty_escalations_dir],
+                days=CARDS_DAYS, now=CARDS_NOW,
+            )
 
-    assert not violations, (
-        'SQL-side clock read(s) found ('
-        + ' / '.join(f'{pattern}, ...)' for pattern in _SQL_CLOCK_READ_PATTERNS)
-        + ') -- compute the cutoff in Python instead via a module-local '
-        '`_cutoff(days, *, now=None)` helper routed through '
-        'dashboard.data.utils.resolve_now '
-        '(see dashboard.data.performance._cutoff):\n' + '\n'.join(violations)
-    )
+        for project_id in ('alpha', 'beta'):
+            datum = cards[project_id]
+            assert datum.state is DatumState.FRESH
+            assert datum.value is not None
+            ttc = datum.value.to_wire()['ttc']
+            assert isinstance(ttc, dict)
+            assert ttc['count'] == 1
+        for statements in (statements_a, statements_b):
+            assert sum('MAX(completed_at)' in sql for sql in statements) == 1

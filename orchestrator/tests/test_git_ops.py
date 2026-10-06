@@ -6854,13 +6854,10 @@ async def _assert_child_reaped(
 # had to do both jobs at once and was tuned down to 0/40 misses on one box
 # rather than eliminated (task 4109).
 #
-# One narrow parent-side window is covered probabilistically rather than by
-# construction: the child's pid can land on disk while _run's own coroutine
-# is still inside create_subprocess_exec's pipe/transport setup rather than
-# the try block that owns kill+reap. That window is covered by
-# _wait_for_child_pid's 0.1s poll interval giving the parent time to reach
-# the owning await point before cancellation lands, not eliminated
-# structurally.
+# A cancel landing while _run is still inside create_subprocess_exec's
+# post-fork setup is closed structurally (task 6346):
+# shared/src/shared/git_async.py::_spawn_session_leader shields the spawn and
+# kills what it forked.
 _CANCEL_TIMEOUT = 0.05
 
 
@@ -14000,7 +13997,7 @@ class TestDisableSharedRepoAutoMaintenance:
         self, git_ops: GitOps,
     ):
         """Both keys are set repo-locally, and a second call is a no-op-in-effect
-        (git config overwrites in place → naturally idempotent)."""
+        (it leaves identical values)."""
         await git_ops.disable_shared_repo_auto_maintenance()
 
         rc_gc, gc_val, _ = await _run(
@@ -14014,7 +14011,7 @@ class TestDisableSharedRepoAutoMaintenance:
         assert rc_mt == 0
         assert mt_val.strip() == 'false'
 
-        # Idempotency: a second call overwrites in place, leaving identical values.
+        # Idempotency: a second call leaves identical values.
         await git_ops.disable_shared_repo_auto_maintenance()
         rc_gc2, gc_val2, _ = await _run(
             ['git', 'config', '--get', 'gc.auto'], cwd=git_ops.project_root,
@@ -14026,6 +14023,31 @@ class TestDisableSharedRepoAutoMaintenance:
         assert gc_val2.strip() == '0'
         assert rc_mt2 == 0
         assert mt_val2.strip() == 'false'
+
+    @pytest.mark.parametrize(
+        ('key', 'value', 'stale'),
+        [('gc.auto', '0', '1'), ('maintenance.auto', 'false', 'true')],
+    )
+    async def test_disable_shared_repo_auto_maintenance_converges_duplicated_key(
+        self, git_ops: GitOps, key: str, value: str, stale: str,
+    ):
+        """A key already holding multiple values (manual ``git config --add``)
+        is converged to exactly one value; a plain ``git config`` would be
+        refused with exit 5 and leave it duplicated."""
+        cwd = git_ops.project_root
+        rc_set, _, _ = await _run(['git', 'config', key, stale], cwd=cwd)
+        rc_add, _, _ = await _run(['git', 'config', '--add', key, value], cwd=cwd)
+        assert rc_set == 0
+        assert rc_add == 0
+        rc_pre, out_pre, _ = await _run(['git', 'config', '--get-all', key], cwd=cwd)
+        assert rc_pre == 0
+        assert out_pre.splitlines() == [stale, value]
+
+        await git_ops.disable_shared_repo_auto_maintenance()
+
+        rc, out, _ = await _run(['git', 'config', '--get-all', key], cwd=cwd)
+        assert rc == 0
+        assert out.splitlines() == [value]
 
     async def test_disable_shared_repo_auto_maintenance_degrades_loudly_on_rc(
         self, git_ops: GitOps, caplog,
@@ -14195,6 +14217,7 @@ class TestRunDelegatesToSharedGitAsync:
         spawned: list[str] = []
 
         class _Blocking:
+            pid = -1
             returncode = 0
 
             def __init__(self, tag: str) -> None:

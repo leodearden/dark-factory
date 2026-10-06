@@ -7,7 +7,9 @@ import logging
 import uuid as uuid_mod
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
+
+from shared.task_claimant import has_live_claimant
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.memory_metadata import normalize_supersedes
@@ -36,6 +38,7 @@ from fused_memory.reconciliation.task_filter import (
     is_proposed_resolution_framing,
 )
 from fused_memory.reconciliation.verify import CodebaseVerifier
+from fused_memory.services.live_workflow_detector import DEFAULT_HEARTBEAT_TTL
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
 from fused_memory.utils.task_dependency_ids import task_dependency_ids
@@ -71,6 +74,10 @@ _PARENT_CANCELLED_REOPEN_PREFIX = 'parent_cancelled:'
 # Default location of the per-project escalation queue.  Matches the
 # convention used by scope_violation_escalator.py and ticket_janitor.py.
 _ESCALATION_QUEUE_DIRNAME = 'data/escalations'
+
+# What the dependent-unblock claimant clear did, carried on the action as
+# ``claimant_clear`` (see TargetedReconciler._clear_claimant_before_unblock).
+ClaimantClearOutcome = Literal['cleared', 'not_needed', 'claimant_live', 'rejected', 'failed']
 
 # Metadata `source` value stamped on the completion-echo memory written by
 # _on_task_done's fast path.  Single-sourced so _is_authoritative_resolution
@@ -193,10 +200,9 @@ def _write_error_code(resp: object) -> str:
     carrying neither key, and the non-dict shapes, collapse to
     ``'unknown'`` so a queryable code is always recorded.
 
-    Sole owner of that precedence and that fallback: six call sites across
-    _on_task_blocked, _sweep_cancel_orphan, _sweep_block_orphan and
-    _unblock_dependent route through here, and hand-rolled copies had
-    already drifted apart on the fallback (task 4977 review).
+    Sole owner of that precedence and that fallback: every classified
+    interceptor write in this module routes through here, and hand-rolled
+    copies had already drifted apart on the fallback (task 4977 review).
     """
     code = (resp.get('error_type') or resp.get('error')) if isinstance(resp, dict) else None
     return str(code) if code else 'unknown'
@@ -691,6 +697,11 @@ class TargetedReconciler:
         #      event happens to match it — there is no periodic/fallback sweep that
         #      re-evaluates lingering withheld episodes independent of search
         #      recall. Acceptable for this task's scope; flagged as a follow-up.
+        #
+        #      `anchor_topics=False` (task 4656): this window is a post-filtered
+        #      candidate set and a topic pin promotes rather than adds, so it can
+        #      only evict a genuine planned hit — worsening the recall limitation
+        #      above. Policy: services/memory_service.py::MemoryService.search.
         if self.planned_episode_registry is not None:
             try:
                 planned_related = await self.memory.search(
@@ -699,6 +710,7 @@ class TargetedReconciler:
                     limit=10,
                     causation_id=run_id,
                     include_planned=True,
+                    anchor_topics=False,
                 )
                 ep_uuids = {
                     ep
@@ -847,8 +859,7 @@ class TargetedReconciler:
                         # double-count it.  The escalation's durable records
                         # are its own JSON file plus the outcome row already
                         # written above; the run-level signal is the
-                        # result['actions'] entry.  _sweep_escalate_l1 sets the
-                        # same precedent — it journals nothing.
+                        # result['actions'] entry.
                     written = await self._fenced_add_memory(
                         content=_VERDICT_MEMORY_TEMPLATES[verification.verdict].format(
                             title=title, summary=verification.summary,
@@ -1393,12 +1404,13 @@ class TargetedReconciler:
                         'parent_id': parent_id_str,
                     }
                 elif orchestrator_live:
-                    action = self._sweep_escalate_l1(
+                    action = await self._sweep_escalate_l1(
                         task_id=tid,
                         parent_id=parent_id_str,
                         escalation_id=escalation_id,
                         is_dependent=is_dependent,
                         project_root=project_root,
+                        run_id=run_id,
                     )
                 else:
                     action = await self._sweep_block_orphan(
@@ -1420,23 +1432,32 @@ class TargetedReconciler:
 
         Called at most once per sweep (lazy-memoized by the caller) to detect
         co-cancelled siblings whose status DB write landed after the initial
-        snapshot was taken.  Fails open: any exception logs a warning and
-        returns {}, so the ambiguous branch falls through to the existing
-        escalate/block path rather than silently dropping a genuine orphan.
+        snapshot was taken.  Fails open to {} (see :meth:`_live_task_rows`),
+        so the ambiguous branch falls through to the existing escalate/block
+        path rather than silently dropping a genuine orphan.
+        """
+        return {
+            task_id: str(row.get('status', '') or '')
+            for task_id, row in (await self._live_task_rows(project_root)).items()
+        }
+
+    async def _live_task_rows(self, project_root: ProjectRoot) -> dict[str, dict]:
+        """Return a fresh {str(task_id): task row} map for the project.
+
+        Fails open: any exception logs a warning and returns {}.
         """
         try:
             tasks_data = await self.taskmaster.get_tasks(project_root=project_root)
         except Exception as e:
             logger.warning(
-                'sweep: live status re-check failed for parent sweep at %s: %s',
-                project_root, e,
+                'sweep: live task re-read failed at %s: %s', project_root, e,
             )
             return {}
         all_tasks = tasks_data.get('tasks', []) if isinstance(tasks_data, dict) else []
         if not isinstance(all_tasks, list):
             return {}
         return {
-            str(t.get('id', '') or ''): str(t.get('status', '') or '')
+            str(t.get('id', '') or ''): t
             for t in all_tasks
             if isinstance(t, dict)
         }
@@ -1664,7 +1685,7 @@ class TargetedReconciler:
             )
         return action
 
-    def _sweep_escalate_l1(
+    async def _sweep_escalate_l1(
         self,
         *,
         task_id: str,
@@ -1672,8 +1693,14 @@ class TargetedReconciler:
         escalation_id: str | None,
         is_dependent: bool,
         project_root: ProjectRoot,
+        run_id: str,
     ) -> dict | None:
-        """File an L1 escalation for an ambiguous descendant when orch is live."""
+        """File an L1 escalation for an ambiguous descendant when orch is live.
+
+        Journals the filing as write/skip under ``escalation``/``submit``,
+        symmetric with :meth:`_sweep_cancel_orphan` and
+        :meth:`_sweep_block_orphan`.
+        """
         # is-None narrows the optional types for pyright (mirrors
         # stage1_stall_detector.py:241).  HAS_ESCALATION is informational.
         if not _HAS_ESCALATION or Escalation is None or EscalationQueue is None:
@@ -1717,7 +1744,27 @@ class TargetedReconciler:
                 'sweep: L1 escalate failed for orphan %s (parent %s): %s',
                 task_id, parent_id, e,
             )
+            await self.journal.add_run_action(
+                run_id, 'skip', 'escalation', 'submit',
+                {
+                    'task_id': task_id,
+                    'parent_id': parent_id,
+                    'type': 'descendant_escalated',
+                    'error': str(e)[:200],
+                },
+                causation_id=run_id,
+            )
             return None
+        await self.journal.add_run_action(
+            run_id, 'write', 'escalation', 'submit',
+            {
+                'task_id': task_id,
+                'parent_id': parent_id,
+                'type': 'descendant_escalated',
+                'escalation_id': esc_id,
+            },
+            causation_id=run_id,
+        )
         return {
             'type': 'descendant_escalated',
             'task_id': task_id,
@@ -1948,11 +1995,11 @@ class TargetedReconciler:
         #   instead of one get_by_task glob-and-parse per dependent, which
         #   made the veto a D x E filesystem scan on the reconciliation hot
         #   path for a task with D blocked dependents and E open escalations.
-        # live_memo: a fresh {task_id: status} re-read, used to confirm a
-        #   dependent is STILL 'blocked' at write time (see
-        #   targeted.py::_unblock_dependent).
+        # live_memo: a fresh {task_id: task row} re-read, used to confirm a
+        #   dependent is STILL 'blocked' at write time and to read its
+        #   current claimant (see targeted.py::_unblock_dependent).
         queue_memo: list[Any] = []
-        live_memo: list[dict[str, str]] = []
+        live_memo: list[dict[str, dict]] = []
 
         actions: list[dict] = []
         for t in all_tasks:
@@ -2067,8 +2114,10 @@ class TargetedReconciler:
         Checks run cheapest-first, before any write is attempted: the
         interceptor-wired guard (above) -> ``_unblock_veto_reason`` (pure,
         no I/O) -> the escalation-pin veto (one memoized store scan per
-        sweep, via :meth:`_escalation_pin_index_for`) -> the live status
-        re-read (one memoized ``get_tasks`` per sweep) -> the write itself.
+        sweep, via :meth:`_escalation_pin_index_for`) -> the live re-read
+        (one memoized ``get_tasks`` per sweep) -> the claimant clear
+        (:meth:`_clear_claimant_before_unblock`, gated on that re-read's
+        claimant columns) -> the status write itself.
 
         The live re-read closes a TOCTOU window. The decision to flip comes
         from the caller's ``get_tasks`` snapshot, but ``reconcile_task`` is
@@ -2083,7 +2132,7 @@ class TargetedReconciler:
         standing between a stale snapshot and a live task -- the same
         staleness class ``targeted.py::_sweep_cancelled_descendants`` guards
         with ``_live_status_map``. It is placed last, immediately before the
-        write, to keep the window as small as possible.
+        writes, to keep the window as small as possible.
 
         Everything past the interceptor guard — the veto checks, the re-read,
         the write, and classifying its response — runs inside one try/except
@@ -2093,6 +2142,11 @@ class TargetedReconciler:
         read is classified as its own outcome (``escalation_store_unavailable``
         / ``live_status_unavailable``) rather than falling through to the
         generic ``dependent_unblock_failed``.
+
+        Every action that reached the claimant clear carries its outcome as
+        ``claimant_clear`` -- a ``dependent_unblock_failed`` too, since a
+        clear can land on a task whose flip then fails, leaving it blocked
+        with no claimant.
         """
         dep_id = str(dependent.get('id') or '')
         if self.task_interceptor is None:
@@ -2108,6 +2162,7 @@ class TargetedReconciler:
                 'satisfied_by': satisfied_by,
             }
 
+        claimant_clear: ClaimantClearOutcome | None = None
         try:
             veto_reason = _unblock_veto_reason(dependent)
             if veto_reason is not None:
@@ -2149,10 +2204,10 @@ class TargetedReconciler:
             # method's docstring. Memoized per sweep: one get_tasks for the
             # whole sweep, not one per dependent.
             if not live_memo:
-                live_memo.append(await self._live_status_map(project_root))
+                live_memo.append(await self._live_task_rows(project_root))
             live = live_memo[0]
             if not live:
-                # _live_status_map fails open to {}, and an empty map cannot
+                # _live_task_rows fails open to {}, and an empty map cannot
                 # prove the dependent is still blocked. Same fail-safe
                 # direction as the escalation arm: leave it blocked.
                 # Under-unblocking is self-healing (the orchestrator's own
@@ -2165,7 +2220,8 @@ class TargetedReconciler:
                     'satisfied_by': satisfied_by,
                     'reason': 'live_status_unavailable',
                 }
-            live_status = live.get(dep_id)
+            live_row = live.get(dep_id) or {}
+            live_status = live_row.get('status')
             if live_status != 'blocked':
                 return {
                     'type': 'dependent_unblock_skipped',
@@ -2175,6 +2231,21 @@ class TargetedReconciler:
                     'reason': 'status_changed',
                     'live_status': live_status,
                 }
+
+            # A re-pended task must not keep a stale claimant that no longer
+            # owns it -- the clear
+            # orchestrator/src/orchestrator/scheduler.py::Scheduler._phase_redispatch_stranded_blocked
+            # also makes. Before the flip, so a late-landing clear cannot
+            # clobber a fresh dispatch stamp; after the re-read, because
+            # clearing an in-progress task's claimant is the incident-2588
+            # un-claim class.
+            claimant_clear = await self._clear_claimant_before_unblock(
+                live_row=live_row,
+                dep_id=dep_id,
+                satisfied_by=satisfied_by,
+                project_root=project_root,
+                run_id=run_id,
+            )
 
             resp = await self.task_interceptor.set_task_status(
                 task_id=dep_id,
@@ -2220,6 +2291,7 @@ class TargetedReconciler:
                     'satisfied_by': satisfied_by,
                     'error': error_code,
                     'actual_status': actual_status,
+                    'claimant_clear': claimant_clear,
                 }
 
             no_op = bool(isinstance(resp, dict) and resp.get('no_op'))
@@ -2245,6 +2317,7 @@ class TargetedReconciler:
                 'task_id': dep_id,
                 'title': dependent.get('title'),
                 'satisfied_by': satisfied_by,
+                'claimant_clear': claimant_clear,
             }
             # A same-status race (something else already re-pended this task
             # between the snapshot and this write) lands here too -- the
@@ -2352,12 +2425,96 @@ class TargetedReconciler:
                 'sweep: unblock failed for dependent %s (satisfied by %s): %s',
                 dep_id, satisfied_by, e,
             )
-            return {
+            failed: dict[str, Any] = {
                 'type': 'dependent_unblock_failed',
                 'task_id': dep_id,
                 'satisfied_by': satisfied_by,
                 'error': str(e)[:200],
             }
+            if claimant_clear is not None:
+                failed['claimant_clear'] = claimant_clear
+            return failed
+
+    async def _clear_claimant_before_unblock(
+        self,
+        *,
+        live_row: dict,
+        dep_id: str,
+        satisfied_by: str,
+        project_root: ProjectRoot,
+        run_id: str,
+    ) -> ClaimantClearOutcome:
+        """Clear *dep_id*'s stale claimant ahead of its blocked->pending flip.
+
+        Gated on *live_row*, the dependent's fresh re-read. With no claimant
+        to clear it writes nothing (``'not_needed'``). A claimant still live
+        per ``shared/task_claimant.py::has_live_claimant`` is left in place
+        (``'claimant_live'``, a skip row): clearing it would switch off the
+        scheduler's live-claimant dispatch gate under a running workflow.
+        ``DEFAULT_HEARTBEAT_TTL`` is longer than the scheduler's default
+        ``claimant_liveness_ttl_secs``, so a claimant that gate treats as live
+        is never cleared here.
+
+        Otherwise it clears both columns and journals a write/skip row under
+        ``taskmaster``/``set_task_claimant``: ``'cleared'``, ``'rejected'``
+        for a classified refusal, or ``'failed'`` for a raise. It never
+        raises, and no outcome vetoes the flip.
+        """
+        assert self.task_interceptor is not None  # narrowed by caller
+        if not live_row.get('claimant_run_id') and not live_row.get('heartbeat_at'):
+            return 'not_needed'
+        detail = {
+            'task_id': dep_id,
+            'satisfied_by': satisfied_by,
+            'type': 'unblock_claimant_clear',
+        }
+        if has_live_claimant(live_row, datetime.now(UTC), DEFAULT_HEARTBEAT_TTL):
+            logger.info(
+                'sweep: leaving the live claimant on dependent %s (satisfied by %s)',
+                dep_id, satisfied_by,
+            )
+            await self.journal.add_run_action(
+                run_id, 'skip', 'taskmaster', 'set_task_claimant',
+                {**detail, 'reason': 'claimant_live'},
+                causation_id=run_id,
+            )
+            return 'claimant_live'
+        try:
+            resp = await self.task_interceptor.set_task_claimant(
+                task_id=dep_id,
+                project_root=project_root,
+                claimant_run_id=None,
+                heartbeat_at=None,
+            )
+        except Exception as e:
+            logger.warning(
+                'sweep: claimant clear failed for dependent %s (satisfied by %s): %s',
+                dep_id, satisfied_by, e,
+            )
+            await self.journal.add_run_action(
+                run_id, 'skip', 'taskmaster', 'set_task_claimant',
+                {**detail, 'error': str(e)[:200]},
+                causation_id=run_id,
+            )
+            return 'failed'
+        if not interceptor_write_succeeded(resp):
+            error_code = _write_error_code(resp)
+            logger.warning(
+                'sweep: claimant clear rejected for dependent %s (satisfied by %s): '
+                'error=%r',
+                dep_id, satisfied_by, error_code,
+            )
+            await self.journal.add_run_action(
+                run_id, 'skip', 'taskmaster', 'set_task_claimant',
+                {**detail, 'error': error_code},
+                causation_id=run_id,
+            )
+            return 'rejected'
+        await self.journal.add_run_action(
+            run_id, 'write', 'taskmaster', 'set_task_claimant', detail,
+            causation_id=run_id,
+        )
+        return 'cleared'
 
     async def _on_task_deferred(
         self, task_id: str, scope: ProjectScope, task_before: dict, run_id: str

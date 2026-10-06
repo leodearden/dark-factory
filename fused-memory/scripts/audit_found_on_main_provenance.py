@@ -60,12 +60,12 @@ Usage
 WHY THIS SCRIPT PREFLIGHTS ITS TARGET (a decision, task 4319)
 -------------------------------------------------------------
 :func:`_run` refuses, before it constructs a backend, unless ``--project-root``
-names a checkout whose ``.taskmaster/tasks/tasks.db`` ALREADY exists.  A task
-worktree has none, and merely reaching ``get_tasks`` would create one empty and
-print a clean, empty report -- indistinguishable from a project with nothing
-flagged.
+names a checkout whose ``.taskmaster/tasks/tasks.db`` ALREADY exists and holds
+tasks.  A task worktree has none, and merely reaching ``get_tasks`` would
+create one empty and print a clean, empty report -- indistinguishable from a
+project with nothing flagged.
 
-See ``fused_memory/utils/target_store_preflight.py::assert_task_store_exists``
+See ``fused_memory/utils/target_store_preflight.py::assert_task_store_populated``
 for the mechanism, the probe-vs-existence argument, the prior art and the
 placement rules -- that module is the single normative copy, and this note
 deliberately does not restate it.
@@ -85,7 +85,7 @@ from typing import Any
 
 from shared.task_metadata import parse_metadata
 
-from fused_memory.utils.target_store_preflight import assert_task_store_exists
+from fused_memory.utils.target_store_preflight import assert_task_store_populated
 
 logger = logging.getLogger('audit_found_on_main_provenance')
 
@@ -102,6 +102,13 @@ logger = logging.getLogger('audit_found_on_main_provenance')
 # MY task", never "extract every id") applied to the commit SUBJECT only
 # (git_ops.py) or immediately after the conventional-commit type word
 # (merge_gates.py), never to the whole commit MESSAGE this script scans.
+# The conventional-commit type vocabulary diverges too: task 5190 widened
+# this copy past `build`, but these hand-maintained siblings still stop there —
+# orchestrator/git_ops.py::DEFAULT_COMMIT_CITATION_PATTERN,
+# orchestrator/merge_gates.py::ALREADY_LANDED_CITATION_PATTERN, the
+# citation-gate `--grep` in
+# orchestrator/agents/briefing.py::BriefingAssembler.build_steward_initial_prompt,
+# and skills/_shared/deriving-landed-sha.md.
 # NOT imported from there — orchestrator.git_ops pulls in the whole GitOps
 # stack, and a fused-memory -> orchestrator runtime import is architecturally
 # backwards (see task 2645 design decisions). This local pattern is
@@ -209,7 +216,8 @@ logger = logging.getLogger('audit_found_on_main_provenance')
 # an analogous subject-anchoring fix for git_ops.py's own citation regex,
 # but not for this script's independent copy.
 CITATION_PATTERN = re.compile(
-    r'^(?:merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build)'
+    r'^(?:merge|impl|amend|fix|test|feat|chore|docs|refactor|style|build'
+    r'|config|perf|revert|pre|prereq)'
     r'\(\s*(?P<conv_tid>\d+)\s*[):]'
     r'|\btask/(?P<branch_tid>\d+)\b'
     r'|\(#(?P<paren_tid>\d+)\)'
@@ -978,7 +986,7 @@ async def _run(args: argparse.Namespace) -> int:
         level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
     )
 
-    assert_task_store_exists(args.project_root, operation='audit_found_on_main_provenance')
+    assert_task_store_populated(args.project_root, operation='audit_found_on_main_provenance')
 
     import os  # noqa: PLC0415
 

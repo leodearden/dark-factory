@@ -35,9 +35,11 @@ import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
 const {
   STALE_FAILURE_THRESHOLD,
   TAB_ENDPOINTS,
+  CHROME_ENDPOINTS,
   staleEntryFor,
   formatAge,
   staleNoticesForTab,
+  loadingNoticeForTab,
 } = staleness;
 
 const REDUX_DIR = path.resolve(
@@ -158,6 +160,19 @@ test('formatAge renders seconds, minutes and hours distinguishably', () => {
   // 19.8h — the incident's own duration — must not render as a bare minute
   // count that an operator has to divide in their head.
   assert.ok(/h/.test(formatAge(19.8 * 3600 * 1000)), formatAge(19.8 * 3600 * 1000));
+});
+
+test('formatAge renders an age of a day or more in days, then whole hours', () => {
+  // An idle project's cards are weeks old; '480h' is a number an operator has
+  // to divide in their head.
+  assert.equal(formatAge(20 * 86_400_000), '20d');
+  assert.equal(formatAge(27 * 3_600_000), '1d 3h');
+  assert.equal(formatAge(48 * 3_600_000), '2d');
+});
+
+test('formatAge keeps hours and minutes for an age under a day', () => {
+  assert.equal(formatAge(19.8 * 3_600_000), '19h 48m');
+  assert.equal(formatAge(23 * 3_600_000 + 59 * 60_000), '23h 59m');
 });
 
 // ── (d) never-succeeded must not fabricate a zero age ──────────────────────
@@ -405,4 +420,163 @@ test('data.js prefers THIS module\'s threshold over its own fallback', async () 
       'data.js took its own fallback instead of the loaded module\'s value, ' +
       'so the two can drift apart silently in the browser',
   );
+});
+
+// ── CHROME_ENDPOINTS: what the rail, topbar and toolbar read on EVERY tab ───
+//
+// data.js polls CHROME_ENDPOINTS ∪ TAB_ENDPOINTS[activeTab] (task 5825), so
+// both maps now decide what is FETCHED, not merely what is monitored.
+
+const DASH = '/api/v2/dashboard';
+
+test('CHROME_ENDPOINTS is an exported, frozen, duplicate-free array', () => {
+  assert.ok(Array.isArray(CHROME_ENDPOINTS), `got ${typeof CHROME_ENDPOINTS}`);
+  assert.ok(Object.isFrozen(CHROME_ENDPOINTS), 'CHROME_ENDPOINTS must be frozen');
+  assert.equal(new Set(CHROME_ENDPOINTS).size, CHROME_ENDPOINTS.length,
+    `CHROME_ENDPOINTS has a duplicate: ${CHROME_ENDPOINTS.join(', ')}`);
+});
+
+test('every CHROME_ENDPOINTS entry is a real endpointsFor() path', () => {
+  const { endpointsFor, pollKey } = loadDataJs();
+  const real = new Set(Object.keys(endpointsFor('24h')).map(pollKey));
+  for (const p of CHROME_ENDPOINTS) {
+    assert.ok(real.has(p),
+      `CHROME_ENDPOINTS names ${p}, which is not a pollKey of any ` +
+      `endpointsFor('24h') key: ${[...real].join(', ')}`);
+  }
+});
+
+test('CHROME_ENDPOINTS is exactly the chrome\'s seven endpoints', () => {
+  // A literal, not a derivation: test_app_poll_scope.py proves the chrome
+  // READS exactly this set; this pins the set itself.
+  assert.deepEqual(
+    [...CHROME_ENDPOINTS].sort(),
+    [
+      `${DASH}/orchestrators`, `${DASH}/tasks`, `${DASH}/recon`, `${DASH}/merge-queue`,
+      `${DASH}/escalations`, `${DASH}/memory`, `${DASH}/costs`,
+    ].sort(),
+  );
+});
+
+// ── the two TAB_ENDPOINTS gaps that become silent freezes once the map polls ─
+
+const WEDGED = { failures: 3, lastSuccessAt: NOW - 120_000 };
+
+test('the Orchestrators tab watches /scheduler — its Deps/Locks cells read DF.SCHEDULER', () => {
+  const notices = staleNoticesForTab({
+    tab: 'orch', stale: staleMap({ [`${DASH}/scheduler`]: WEDGED }), now: NOW,
+  });
+  assert.equal(notices.length, 1, JSON.stringify(notices));
+  assert.equal(notices[0].path, `${DASH}/scheduler`);
+});
+
+test('the Overview tab watches /merge-queue — its LiveFeed reads MERGE_QUEUE', () => {
+  const notices = staleNoticesForTab({
+    tab: 'overview', stale: staleMap({ [MERGE_PATH]: WEDGED }), now: NOW,
+  });
+  assert.equal(notices.length, 1, JSON.stringify(notices));
+  assert.equal(notices[0].path, MERGE_PATH);
+});
+
+// ── loadingNoticeForTab: the tab paths that have never delivered since page load ─
+
+test('loadingNoticeForTab is ONE notice naming every tab path with no receipt yet', () => {
+  const notice = loadingNoticeForTab({ tab: 'tasks', receipt: {}, stale: {} });
+  assert.deepEqual(Object.keys(notice).sort(), ['kind', 'paths', 'text']);
+  assert.equal(notice.kind, 'loading');
+  assert.deepEqual(notice.paths, TAB_ENDPOINTS.tasks);
+  for (const path of TAB_ENDPOINTS.tasks) {
+    assert.ok(notice.text.includes(path),
+      `the loading notice must name ${path}, got: ${notice.text}`);
+  }
+});
+
+test('loadingNoticeForTab names only the paths that have not delivered', () => {
+  const receipt = { [TASKS_PATH]: { servedAt: null, receivedAt: NOW, window: null } };
+  const notice = loadingNoticeForTab({ tab: 'tasks', receipt, stale: {} });
+  const pending = TAB_ENDPOINTS.tasks.filter(p => p !== TASKS_PATH);
+  assert.deepEqual(notice.paths, pending);
+  assert.ok(!notice.text.includes(TASKS_PATH), `a delivered path is not loading: ${notice.text}`);
+});
+
+test('loadingNoticeForTab is null once every tab path has delivered', () => {
+  const receipt = Object.fromEntries(TAB_ENDPOINTS.tasks.map(p => [p, { receivedAt: NOW }]));
+  assert.equal(loadingNoticeForTab({ tab: 'tasks', receipt, stale: {} }), null);
+});
+
+test('loadingNoticeForTab defers to the stale notice once an endpoint is stale', () => {
+  // A path that has failed STALE_FAILURE_THRESHOLD times is already named by
+  // staleNoticesForTab ("has never delivered data"); a second banner for the
+  // same fact would only be noise.
+  const stale = staleMap({ [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD, lastSuccessAt: 0 } });
+  assert.equal(loadingNoticeForTab({ tab: 'merge', receipt: {}, stale }), null);
+  const below = staleMap({ [MERGE_PATH]: { failures: STALE_FAILURE_THRESHOLD - 1, lastSuccessAt: 0 } });
+  assert.deepEqual(loadingNoticeForTab({ tab: 'merge', receipt: {}, stale: below }).paths, [MERGE_PATH]);
+});
+
+test('loadingNoticeForTab reads one pending path in the singular', () => {
+  const notice = loadingNoticeForTab({ tab: 'merge', receipt: {}, stale: {} });
+  assert.equal(notice.text, `${MERGE_PATH} has not delivered data yet — loading`);
+});
+
+test('loadingNoticeForTab tolerates every missing input', () => {
+  assert.equal(loadingNoticeForTab({ tab: 'not-a-tab', receipt: {}, stale: {} }), null);
+  assert.equal(loadingNoticeForTab(), null);
+  assert.equal(loadingNoticeForTab({}), null);
+  assert.equal(loadingNoticeForTab({ tab: 'merge' }), null);
+  assert.equal(loadingNoticeForTab({ receipt: {}, stale: {} }), null);
+});
+
+// ── loadingNoticeForTab over the real data.js ──────────────────────────────
+
+function liveLoadingNotices(win) {
+  return Object.fromEntries(Object.keys(TAB_ENDPOINTS).map(tab => [
+    tab,
+    loadingNoticeForTab({ tab, receipt: win.DF_DATA.__receipt, stale: win.DF_DATA.__stale }),
+  ]));
+}
+
+function quietDeps(fetchImpl) {
+  return {
+    fetchImpl,
+    now: () => NOW,
+    random: () => 0,
+    sleep: () => Promise.resolve(),
+    setTimeoutImpl: () => 0,
+    clearTimeoutImpl: () => {},
+  };
+}
+
+test('over the real data.js: every tab is loading before the first refresh, none after it', async () => {
+  const api = loadDataJs();
+  for (const [tab, notice] of Object.entries(liveLoadingNotices(globalThis.window))) {
+    assert.deepEqual(notice?.paths, TAB_ENDPOINTS[tab], `${tab}: ${JSON.stringify(notice)}`);
+  }
+
+  const ok = () => Promise.resolve({ ok: true, json: async () => ({}) });
+  await api.refreshDFData(undefined, {
+    state: api.createPollState(), jitterMaxMs: 0, deps: quietDeps(ok),
+  });
+
+  for (const [tab, notice] of Object.entries(liveLoadingNotices(globalThis.window))) {
+    assert.equal(notice, null, `${tab} still claims to be loading after a full refresh`);
+  }
+});
+
+test('over the real data.js: an endpoint that failed its first poll leaves only its own tab loading', async () => {
+  const api = loadDataJs();
+  const curator = `${DASH}/curator`;
+  const fetchImpl = url => (
+    url.split('?')[0] === curator
+      ? Promise.resolve({ ok: false, json: async () => ({}) })
+      : Promise.resolve({ ok: true, json: async () => ({}) })
+  );
+  await api.refreshDFData(undefined, {
+    state: api.createPollState(), jitterMaxMs: 0, deps: quietDeps(fetchImpl),
+  });
+
+  const loading = Object.entries(liveLoadingNotices(globalThis.window))
+    .filter(([, notice]) => notice !== null);
+  assert.deepEqual(loading.map(([tab]) => tab), ['curator']);
+  assert.deepEqual(loading[0][1].paths, [curator]);
 });
