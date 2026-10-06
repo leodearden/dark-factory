@@ -31,6 +31,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 # Self-bootstrap for standalone `python scripts/legibility/nightly.py` runs
 # (and the systemd ExecStart, which invokes this file directly) -- must run
@@ -48,6 +49,7 @@ from legibility import (  # noqa: E402
     digest,
     inventory,
     sampling,
+    session_ledger,
     session_runner,
     trickle_state,
     unlanded,
@@ -877,6 +879,52 @@ class NightlyResult:
     Set only on the commit-failure branch; a structured fact rather than the
     escalation prose that also carries it."""
 
+    ledger_rows_written: int = 0
+    """Coded sessions this run added to the session ledger."""
+
+    ledger_rows_failed: int = 0
+    """Coded sessions this run failed to ledger — counted, so a ledger fault
+    is a structured fact and not only a journal line (the next census
+    re-mines them)."""
+
+
+class _LedgerWrite(NamedTuple):
+    written: int
+    failed: int
+    error: str | None
+
+
+def _ledger_coded_sessions(
+    cfg: LegibilityConfig, records, target_date: date, now: datetime | None,
+) -> _LedgerWrite:
+    """Record every merged coding in the session ledger so the census skips
+    those sessions. A ledger fault is logged and counted, never raised."""
+    rows = session_ledger.rows_for(
+        records,
+        coded_by=session_ledger.CodedBy.TRICKLE,
+        run_ref=f'trickle-{cfg.project_id}-{target_date:%Y%m%d}',
+        instrument_version=digest.DIGEST_INSTRUMENT_VERSION,
+        coded_at=now if now is not None else datetime.now(UTC),
+    )
+    try:
+        written = session_ledger.record_codings(
+            session_ledger.ledger_path(cfg.project_id), rows,
+        )
+    except session_ledger.LedgerError as exc:
+        outcome = _LedgerWrite(written=0, failed=len(rows), error=str(exc))
+        logger.warning(
+            'legibility trickle ledger: project=%s date=%s rows_written=%d '
+            'rows_failed=%d error=%s',
+            cfg.project_id, target_date.isoformat(), outcome.written,
+            outcome.failed, outcome.error,
+        )
+        return outcome
+    logger.info(
+        'legibility trickle ledger: project=%s date=%s rows_written=%d rows_failed=%d',
+        cfg.project_id, target_date.isoformat(), written, 0,
+    )
+    return _LedgerWrite(written=written, failed=0, error=None)
+
 
 def _report_sample_outcome(
     cfg: LegibilityConfig,
@@ -1460,6 +1508,7 @@ def run_nightly(
         applied = 0
         conflicts = 0
         deletion_skipped: list[str] = []
+        merged_records = []
         for record in run.records:
             try:
                 cb, stats = codebook.apply_coding_record(cb, record)
@@ -1482,6 +1531,7 @@ def run_nightly(
                 )
                 deletion_skipped.append(detail)
                 continue
+            merged_records.append(record)
             conflicts += stats['candidate_disposition_conflicts']
             # A conflict-appended sighting IS a codebook mutation (a
             # recurrence appended to an already-adjudicated candidate), so it
@@ -1598,6 +1648,15 @@ def run_nightly(
                 'legibility trickle: no-change night: nothing committed (applied=%d)', applied,
             )
 
+        # Before the census step: it may launch the census synchronously, and
+        # that census must skip what this night coded.
+        ledger = _ledger_coded_sessions(cfg, merged_records, target_date, now)
+        ledger_reason = (
+            f'legibility trickle: {ledger.failed} coded session(s) not ledgered, '
+            f'the next census re-mines them ({ledger.error})'
+            if ledger.error is not None else None
+        )
+
         # Task 4148. The decision was computed and returned on NightlyResult
         # below, but never LOGGED -- so only the census's failure modes
         # (census_trigger's own WARNINGs, FIRE-WITHOUT-LAUNCH, 4085's
@@ -1633,7 +1692,9 @@ def run_nightly(
             # never-delete contract violation would survive only as a WARNING
             # line in the journal -- `escalated` False, `reason` empty, every
             # other field identical to a clean run.
-            reason=deletion_reason,
+            reason='; '.join(filter(None, (deletion_reason, ledger_reason))) or None,
+            ledger_rows_written=ledger.written,
+            ledger_rows_failed=ledger.failed,
         )
         return result
     finally:
