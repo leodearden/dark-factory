@@ -34,7 +34,6 @@ import math
 import re
 import sys
 from collections.abc import Callable, Sequence
-from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -288,10 +287,12 @@ def peek_session_id(path: Path) -> str | None:
     cheaply skip a session it already holds before paying for a full scan.
     Unreadable input yields ``None``."""
     try:
-        with closing(iter_json_lines(path)) as records:
-            return next(filter(None, map(_record_session_id, records)), None)
+        for record in iter_json_lines(path):
+            if session_id := _record_session_id(record):
+                return session_id
     except OSError:
         return None
+    return None
 
 
 def scan_transcript(path: Path) -> TranscriptScan:
