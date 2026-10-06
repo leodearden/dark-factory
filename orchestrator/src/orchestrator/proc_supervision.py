@@ -189,23 +189,16 @@ def _submit_child_setenv_args() -> list[str]:
 def _warn_if_submit_module_unimportable(transient_unit: str | None) -> None:
     """Registration-time canary for the RP-4 on-failure submit child.
 
-    IMPORTS ``escalation.submit``, executing its whole transitive chain under
-    the interpreter the child will run (``EscalationSpec.to_submit_argv`` is
-    given ``sys.executable``). The child's ``sys.path`` is not identical: it
-    comes from the ``--setenv=PYTHONPATH`` roots (:func:`_submit_child_pythonpath`)
-    plus interpreter defaults. So a pass is strong evidence, not proof, and the
+    Really imports ``escalation.submit`` in this interpreter and WARNs if that
+    fails. An ``Exception`` or ``SystemExit`` from the import is reported,
+    never raised, so the restart is never blocked. A pass is not proof: the
     wrapper's fire-time exit :data:`RP4_ESCALATION_SUBMIT_FAILED_RC` stays
-    authoritative. Cost: a ``sys.modules`` lookup after the first success, at
-    most once per scheduled restart. The real-child preflight of the same
-    invariant is
+    authoritative. Real-child preflight:
     ``orchestrator/tests/test_deterministic_runner.py::_assert_submit_cli_invokable``.
-
-    Never raises: importing runs arbitrary module code, and the canary reports
-    on the restart without ever blocking it.
     """
     try:
         importlib.import_module('escalation.submit')
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         logger.warning(
             'proc_supervision: `escalation.submit` FAILED TO IMPORT in this '
             'process (%s): %s — the deferred /bin/sh -c on-failure branch for '

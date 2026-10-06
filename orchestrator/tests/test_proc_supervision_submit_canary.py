@@ -27,14 +27,24 @@ from orchestrator.proc_supervision import RestartDisposition
 _LOGGER = 'orchestrator.proc_supervision'
 
 
-def _exploding_module(module_name: str) -> types.ModuleType:
+def _exploding_module(
+    module_name: str, exc_type: type[BaseException],
+) -> types.ModuleType:
     module = types.ModuleType(module_name)
 
     def __getattr__(name: str) -> object:
-        raise RuntimeError(f'simulated import-time failure reading {module_name}.{name}')
+        if name.startswith('__'):
+            raise AttributeError(name)
+        raise exc_type(f'simulated import-time failure reading {module_name}.{name}')
 
     module.__getattr__ = __getattr__
     return module
+
+
+_EXPLODING_TIMESTAMPS: dict[str, type[BaseException]] = {
+    'transitive_raises_at_import': RuntimeError,
+    'transitive_exits_at_import': SystemExit,
+}
 
 
 def _break_submit_import(monkeypatch: pytest.MonkeyPatch, how: str) -> None:
@@ -45,9 +55,10 @@ def _break_submit_import(monkeypatch: pytest.MonkeyPatch, how: str) -> None:
     monkeypatch.delitem(sys.modules, 'escalation.queue', raising=False)
     if how == 'transitive_import_error':
         monkeypatch.setitem(sys.modules, 'shared.timestamps', None)
-    elif how == 'transitive_raises_at_import':
+    elif how in _EXPLODING_TIMESTAMPS:
         monkeypatch.setitem(
-            sys.modules, 'shared.timestamps', _exploding_module('shared.timestamps'),
+            sys.modules, 'shared.timestamps',
+            _exploding_module('shared.timestamps', _EXPLODING_TIMESTAMPS[how]),
         )
     else:
         raise ValueError(f'unknown simulation {how!r}')
@@ -71,6 +82,7 @@ class TestRegistrationTimeSubmitImportCanary:
             ('transitive_import_error', ModuleNotFoundError,
              ['shared.timestamps', 'ModuleNotFoundError']),
             ('transitive_raises_at_import', RuntimeError, ['RuntimeError']),
+            ('transitive_exits_at_import', SystemExit, ['SystemExit']),
         ],
     )
     async def test_failed_submit_import_warns_and_still_schedules(
