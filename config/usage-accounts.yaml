@@ -8,9 +8,13 @@
 # reserve. Evals have NO dedicated account: they share this same pool
 # and must be robust to cap/429 events (ruling 2026-08-30, task 4741).
 
-# max-b, max-c and max-h are org-disabled (billing) as of 2026-09-29, so they
-# are listed last until restored. The legibility trickle does not fail over on
-# that 403 before task 5947 lands (esc-legibility-trickle-dark_factory-9).
+# max-b and max-h are switched off on the Anthropic side by Leo's deliberate
+# choice (ruling 2026-10-06, task 5944). They stay listed, last, so switching
+# them back on there is the whole restore: a long-running gate re-probes an
+# auth-failed account (usage_cap.auth_reprobe_secs) and re-admits it once a
+# probe is served, and the nightly legibility trickle starts each run afresh.
+# Do not comment them out. max-c was off too on 2026-09-29 and was measured
+# served again on 2026-09-30.
 accounts:
   - name: max-d
     oauth_token_env: CLAUDE_OAUTH_TOKEN_D
