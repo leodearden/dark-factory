@@ -8,14 +8,16 @@ Covers four tools, none of which emits a memory write:
 
 The three write tools used to mint a durable Graphiti edge per call via
 ``add_memory(category='decisions_and_rationale')``.  Task 3853 (the esc-3834-1
-ruling) deleted that audit side effect outright: the edges went stale within the
-hour and duplicated state already recorded structurally in
-``data/orchestrator/runs.db`` (``priority_override_set`` /
+ruling) deleted that audit side effect: pin order, pinned status, boost tier,
+reserve_now and TTL churn and are cleared without any corresponding write, so
+the edges went stale within the hour, and extraction produced facts naming no
+task at all.  No audit value was lost — the structural per-change trail lives
+in ``data/orchestrator/runs.db`` (``priority_override_set`` /
 ``priority_override_cleared`` / ``task_pinned`` / ``task_unpinned`` /
 ``pin_queue_reordered``, surfaced by the ``get_scheduler_events`` MCP tool).
-Non-emission is a permanent regression lock here, asserted through
-``_assert_no_graphiti_write`` — do NOT "restore" the audit, and do not substitute
-a Mem0-category write (the ruling rejects that too).
+Do not restore the audit, and do not substitute a Mem0-category write: the
+ruling rejects that too.  ``test_override_write_tools_emit_no_memory_write`` is
+the regression lock.
 
 All tools open ``<project_root>/data/orchestrator/scheduler_overrides.db``
 via aiosqlite; these tests use a ``tmp_path``-rooted project_root with the
@@ -32,7 +34,6 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from fused_memory.models.enums import GRAPHITI_PRIMARY
 from fused_memory.server.tools import create_mcp_server
 
 # ---------------------------------------------------------------------------
@@ -129,26 +130,8 @@ async def test_get_pin_queue_empty_returns_empty_list(tmp_path, mcp_server, memo
 
 
 # ===========================================================================
-# task 3853 (esc-3834-1): override tools mint no Graphiti write
+# override write tools emit no memory write (task 3853, esc-3834-1)
 # ===========================================================================
-
-
-def _assert_no_graphiti_write(memory_service):
-    """No durable Graphiti write escaped an override tool (esc-3834-1)."""
-    graphiti_cats = {c.value for c in GRAPHITI_PRIMARY}
-    offenders = [
-        kw.get('category') for _, kw in memory_service.add_memory.call_args_list
-        if kw.get('category') in graphiti_cats
-    ]
-    assert not offenders, (
-        f'override tool reached add_memory with GRAPHITI_PRIMARY category(s) {offenders}'
-    )
-    # Stronger than the acceptance criterion, and deliberately so: also forbids
-    # the Mem0-category substitution the esc-3834-1 ruling rejects.
-    memory_service.add_memory.assert_not_called()
-    # add_episode is the other Graphiti write path; the stage1 prompt warns
-    # against using it as a snapshot workaround, so close it here too.
-    memory_service.add_episode.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -161,17 +144,9 @@ def _assert_no_graphiti_write(memory_service):
 async def test_override_write_tools_emit_no_memory_write(
     tmp_path, mcp_server, memory_service, tool_name, tool_kwargs, pre_pins,
 ):
-    """Each override WRITE tool completes its happy path minting no Graphiti edge.
-
-    Seam-level lock on the esc-3834-1 ruling: asserted on the ``memory_service``
-    mock itself, not merely "the call raised no exception".  The structural audit
-    trail these tools used to duplicate lives in data/orchestrator/runs.db and is
-    read via ``get_scheduler_events``.
-    """
+    """Each override write tool's happy path reaches neither add_memory nor add_episode."""
     if pre_pins:
         await _populate_pins(mcp_server, tmp_path, pre_pins)
-    # Reset AFTER setup — _populate_pins drives set_task_priority_override itself,
-    # so its own calls must not be counted against the tool under test.
     memory_service.add_memory.reset_mock()
     memory_service.add_episode.reset_mock()
 
@@ -181,11 +156,12 @@ async def test_override_write_tools_emit_no_memory_write(
     )
     assert 'error' not in result
 
-    _assert_no_graphiti_write(memory_service)
+    memory_service.add_memory.assert_not_called()
+    memory_service.add_episode.assert_not_called()
 
 
 # ===========================================================================
-# set_task_priority_override — write, no memory write (esc-3834-1)
+# set_task_priority_override — write
 # ===========================================================================
 
 
@@ -199,7 +175,6 @@ async def test_set_task_priority_override_writes_row(
     tmp_path, mcp_server, memory_service, extra_kwargs, extra_row_checks,
 ):
     """Happy-path: a row is written to SQLite."""
-    memory_service.add_memory.reset_mock()
     result = await mcp_server._tool_manager.call_tool(
         'set_task_priority_override',
         {'project_root': str(tmp_path), 'task_id': '5', 'boost_tier': 'high', **extra_kwargs},
@@ -223,8 +198,6 @@ async def test_set_task_priority_override_writes_row(
     for col, val in extra_row_checks.items():
         idx = {'pinned': 3, 'reserve_now': 4}[col]
         assert row[idx] == val, f'{col} mismatch: expected {val}, got {row[idx]}'
-
-    _assert_no_graphiti_write(memory_service)
 
 
 # ===========================================================================
@@ -314,8 +287,6 @@ async def test_set_task_priority_override_ttl_secs_converts_to_absolute_iso(
     low = before + timedelta(seconds=3600) - timedelta(seconds=5)
     high = after + timedelta(seconds=3600) + timedelta(seconds=5)
     assert low <= parsed <= high
-
-    _assert_no_graphiti_write(memory_service)
 
 
 @pytest.mark.asyncio
@@ -499,7 +470,6 @@ async def test_clear_task_priority_override_field_none_deletes_row(
         'set_task_priority_override',
         {'project_root': str(tmp_path), 'task_id': '5', 'boost_tier': 'high'},
     )
-    memory_service.add_memory.reset_mock()
 
     result = await mcp_server._tool_manager.call_tool(
         'clear_task_priority_override',
@@ -516,8 +486,6 @@ async def test_clear_task_priority_override_field_none_deletes_row(
         assert row is None
     finally:
         conn.close()
-
-    _assert_no_graphiti_write(memory_service)
 
 
 @pytest.mark.asyncio
@@ -543,7 +511,6 @@ async def test_clear_task_priority_override_field_specific_clears_one_column(
             'ttl_secs': 3600,
         },
     )
-    memory_service.add_memory.reset_mock()
 
     result = await mcp_server._tool_manager.call_tool(
         'clear_task_priority_override',
@@ -574,8 +541,6 @@ async def test_clear_task_priority_override_field_specific_clears_one_column(
             assert cols[col] == expected, f'{col}: expected {expected}, got {cols[col]}'
         else:
             assert cols[col] == expected, f'{col}: expected {expected!r}, got {cols[col]!r}'
-
-    _assert_no_graphiti_write(memory_service)
 
 
 @pytest.mark.asyncio
@@ -653,7 +618,6 @@ async def test_reorder_pin_queue_rewrites_pin_order(
 ):
     """reorder_pin_queue with a list rewrites pin_order columns."""
     await _populate_pins(mcp_server, tmp_path, ['A', 'B', 'C'])
-    memory_service.add_memory.reset_mock()
 
     result = await mcp_server._tool_manager.call_tool(
         'reorder_pin_queue',
@@ -664,8 +628,6 @@ async def test_reorder_pin_queue_rewrites_pin_order(
     orders = _pin_orders(tmp_path, ['A', 'B', 'C'])
     assert orders == {'A': 2, 'B': 3, 'C': 1}
 
-    _assert_no_graphiti_write(memory_service)
-
 
 @pytest.mark.asyncio
 async def test_reorder_pin_queue_accepts_csv_string(
@@ -673,7 +635,6 @@ async def test_reorder_pin_queue_accepts_csv_string(
 ):
     """reorder_pin_queue also accepts a CSV string."""
     await _populate_pins(mcp_server, tmp_path, ['A', 'B', 'C'])
-    memory_service.add_memory.reset_mock()
 
     result = await mcp_server._tool_manager.call_tool(
         'reorder_pin_queue',
@@ -683,8 +644,6 @@ async def test_reorder_pin_queue_accepts_csv_string(
 
     orders = _pin_orders(tmp_path, ['A', 'B', 'C'])
     assert orders == {'A': 2, 'B': 3, 'C': 1}
-
-    _assert_no_graphiti_write(memory_service)
 
 
 @pytest.mark.asyncio
