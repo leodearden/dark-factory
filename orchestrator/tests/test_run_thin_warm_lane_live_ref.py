@@ -4,8 +4,9 @@ Task 5307.  The script now refuses to thin a lane a live process references
 (its T4 gate; ``orchestrator/scripts/warm-lane/README.md`` "Delta 12") with the
 same exit 75 it uses for a held flock.  This pins the wrapper's side of that
 contract end to end: the refusal stays a benign DEBUG skip (never WARNING,
-inv.11), and dark-factory's log can still tell WHICH gate refused, because the
-script's ``LANE_LIVE_REF:`` token reaches it.
+inv.11), dark-factory's log can still tell WHICH gate refused, because the
+script's ``LANE_LIVE_REF:`` token reaches it, and the same lane thins once the
+reference clears.
 
 Driven through ``_run_thin_warm_lane`` rather than ``release_warm_lane``, which
 composes it as its last step and passes its rc through unchanged: the public
@@ -67,13 +68,13 @@ def holder(lane: Path) -> Iterator[subprocess.Popen[bytes]]:
         proc.wait()
 
 
-async def test_live_reference_is_a_benign_debug_skip_attributed_to_the_live_ref_gate(
+async def test_a_live_reference_is_an_attributed_benign_skip_until_it_clears(
     git_ops: GitOps, lane: Path, holder: subprocess.Popen[bytes], caplog,
 ) -> None:
     with caplog.at_level(logging.DEBUG, logger='orchestrator.git_ops'):
-        rc = await git_ops._run_thin_warm_lane(lane)
+        refused_rc = await git_ops._run_thin_warm_lane(lane)
 
-    assert rc == 75
+    assert refused_rc == 75
     assert (lane / 'target' / 'DIVERGENT_MARKER').exists()
     warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert warnings == [], f'a live-reference skip must never WARN: {warnings}'
@@ -83,14 +84,9 @@ async def test_live_reference_is_a_benign_debug_skip_attributed_to_the_live_ref_
         f'gate, so it reads as a flock refusal: {debug}'
     )
 
-
-async def test_once_the_reference_clears_the_lane_thins(
-    git_ops: GitOps, lane: Path, holder: subprocess.Popen[bytes],
-) -> None:
     holder.kill()
     holder.wait()
+    thinned_rc = await git_ops._run_thin_warm_lane(lane)
 
-    rc = await git_ops._run_thin_warm_lane(lane)
-
-    assert rc == 0
+    assert thinned_rc == 0
     assert not (lane / 'target').exists()
