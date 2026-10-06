@@ -1536,7 +1536,7 @@ def red_module_prefixes_of(result: 'VerifyResult') -> frozenset[str] | None:
     by_module = result.failing_test_ids_by_module
     if not isinstance(by_module, dict) or result.failing_test_ids is None:
         return None
-    if frozenset().union(*by_module.values()) != frozenset(result.failing_test_ids):
+    if _module_attribution_mismatch(result.failing_test_ids, by_module):
         return None
     return frozenset(prefix for prefix, ids in by_module.items() if ids)
 
@@ -3836,6 +3836,15 @@ class VerifyAttempt:
         return self._by_label('type')
 
 
+def _module_attribution_mismatch(
+    failing_test_ids: list[str] | None, by_module: Mapping[str, list[str]] | None,
+) -> frozenset[str]:
+    """Ids in only one of *failing_test_ids* and *by_module*; empty when the map is None or exact."""
+    if by_module is None:
+        return frozenset()
+    return frozenset().union(*by_module.values()) ^ frozenset(failing_test_ids or ())
+
+
 @dataclass
 class VerifyResult:
     passed: bool
@@ -3898,7 +3907,8 @@ class VerifyResult:
     # Task 5627: module prefix -> the junit-derived failing ids of the module
     # run that produced them. Plain JSON-native, like `failing_test_ids`.
     # None = no module attribution; the ids are then unattributable. When
-    # non-None it covers exactly `failing_test_ids`.
+    # non-None it covers exactly `failing_test_ids`, checked by
+    # `_module_attribution_mismatch` at construction and wherever it is read.
     failing_test_ids_by_module: dict[str, list[str]] | None = None
     # Task 3173: one FailureCategory per FAILING leg, in test/lint/type order,
     # exactly as `_summarize_checks` classified them (its fifth return
@@ -3974,6 +3984,16 @@ class VerifyResult:
     # compare=False a failing CLI verify that produced an `unconfirmable` observation
     # would break test_cli test_verify_merge_cli_wrapper_transparency.
     flake_suppression: FlakeSuppression | None = field(default=None, compare=False)
+
+    def __post_init__(self) -> None:
+        mismatch = _module_attribution_mismatch(
+            self.failing_test_ids, self.failing_test_ids_by_module,
+        )
+        if mismatch:
+            logger.warning(
+                'VerifyResult: failing_test_ids_by_module does not cover exactly '
+                'failing_test_ids; ids in only one of them: %s', sorted(mismatch),
+            )
 
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""

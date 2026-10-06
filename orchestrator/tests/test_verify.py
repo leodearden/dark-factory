@@ -2391,6 +2391,58 @@ class TestScopedVerificationAggregatesModuleAttribution:
         assert result.failing_test_ids_by_module == {'A': ['a1']}
 
 
+class TestModuleAttributionInvariantIsNamedWhereResultsAreBuilt:
+    """A failing_test_ids_by_module that does not cover exactly failing_test_ids
+    is reported when the VerifyResult is built, naming the ids that disagree."""
+
+    @staticmethod
+    def _result(**fields: Any) -> VerifyResult:
+        return VerifyResult(
+            passed=False, test_output='', lint_output='', type_output='', summary='x', **fields,
+        )
+
+    @staticmethod
+    def _invariant_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+        return [
+            r.getMessage() for r in caplog.records
+            if r.levelno == logging.WARNING and 'failing_test_ids_by_module' in r.getMessage()
+        ]
+
+    def test_an_exact_map_reports_nothing(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            self._result(failing_test_ids=['a1'], failing_test_ids_by_module={'A': ['a1'], 'B': []})
+            self._result(failing_test_ids=['a1'])
+
+        assert self._invariant_warnings(caplog) == []
+
+    def test_an_id_no_module_owns_is_named(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            self._result(failing_test_ids=['a1', 'zz'], failing_test_ids_by_module={'A': ['a1']})
+
+        [message] = self._invariant_warnings(caplog)
+        assert "'zz'" in message and "'a1'" not in message, message
+
+    def test_a_map_without_collected_ids_is_named(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            self._result(failing_test_ids=None, failing_test_ids_by_module={'B': ['b1']})
+
+        [message] = self._invariant_warnings(caplog)
+        assert "'b1'" in message, message
+
+    def test_filtering_ids_through_replace_alone_is_named(
+        self, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        attributed = self._result(
+            failing_test_ids=['a1', 'b1'], failing_test_ids_by_module={'A': ['a1'], 'B': ['b1']},
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            replace(attributed, failing_test_ids=['a1'])
+
+        [message] = self._invariant_warnings(caplog)
+        assert "'b1'" in message, message
+
+
 class TestExtractCauseHint:
     """Tests for the ``_extract_cause_hint(output: str) -> str`` helper.
 
