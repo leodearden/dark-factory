@@ -348,7 +348,7 @@ class TestResolveClusterPaths:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(metrics, 'CLUSTER_PATHS', ('gone/missing.py',))
-        with pytest.raises(source_measures.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.resolve_cluster_paths(tmp_path)
         assert 'gone/missing.py' in str(excinfo.value)
 
@@ -359,7 +359,7 @@ class TestResolveClusterPaths:
         # silently dropped from an otherwise plausible-looking result.
         (tmp_path / 'a.py').write_text('x = 1\n', encoding='utf-8')
         monkeypatch.setattr(metrics, 'CLUSTER_PATHS', ('a.py', 'gone/missing.py'))
-        with pytest.raises(source_measures.MetricsError):
+        with pytest.raises(metrics.RatchetError):
             metrics.resolve_cluster_paths(tmp_path)
 
     def test_literal_path_that_is_a_directory_raises(
@@ -367,7 +367,7 @@ class TestResolveClusterPaths:
     ) -> None:
         (tmp_path / 'adir.py').mkdir()
         monkeypatch.setattr(metrics, 'CLUSTER_PATHS', ('adir.py',))
-        with pytest.raises(source_measures.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.resolve_cluster_paths(tmp_path)
         assert 'adir.py' in str(excinfo.value)
 
@@ -1117,7 +1117,7 @@ class TestTestTreeSweep:
         block = metrics._report_enumeration(cluster, sweep.unreadable, sweep.test_tree)
         assert block['complete'] is False
         assert block['unreadable'] == ['orchestrator/tests/test_broken.py']
-        with pytest.raises(source_measures.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics._require_complete_enumeration({'enumeration': block})
         assert 'orchestrator/tests/test_broken.py' in str(excinfo.value)
 
@@ -1203,7 +1203,7 @@ class TestAliasModules:
                 {**metrics.ALIAS_MODULES, 'orchestrator.merge_unlisted': 'x'}
             ),
         )
-        with pytest.raises(source_measures.MetricsError, match='orchestrator.merge_unlisted'):
+        with pytest.raises(metrics.RatchetError, match='orchestrator.merge_unlisted'):
             metrics._require_aliases_in_cluster()
 
 
@@ -1499,7 +1499,7 @@ class TestExternalImporterSweep:
         )
         block = metrics._report_enumeration(cluster, sweep.unreadable, sweep.test_tree)
         assert block['complete'] is False
-        with pytest.raises(source_measures.MetricsError, match='app/broken.py'):
+        with pytest.raises(metrics.RatchetError, match='app/broken.py'):
             metrics._require_complete_enumeration({'enumeration': block})
 
     def test_a_tracked_file_that_is_gone_from_disk_is_recorded(
@@ -1787,21 +1787,21 @@ class TestBaselineIO:
         # INV-11: a missing baseline is never an empty-baseline PASS, which
         # would silently disarm the ratchet for every downstream task.
         missing = tmp_path / 'nope.json'
-        with pytest.raises(source_measures.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.load_baseline(missing)
         assert 'nope.json' in str(excinfo.value)
 
     def test_malformed_baseline_is_a_named_hard_failure(self, tmp_path: Path) -> None:
         target = tmp_path / 'baseline.json'
         target.write_text('{"files": ', encoding='utf-8')
-        with pytest.raises(source_measures.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.load_baseline(target)
         assert 'baseline.json' in str(excinfo.value)
 
     def test_non_object_baseline_is_a_named_hard_failure(self, tmp_path: Path) -> None:
         target = tmp_path / 'baseline.json'
         target.write_text('[]', encoding='utf-8')
-        with pytest.raises(source_measures.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.load_baseline(target)
         assert 'baseline.json' in str(excinfo.value)
 
@@ -1990,6 +1990,12 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         # main() maps every MetricsError to 2, so a refusal that subclassed it
         # would report a real regression as a broken tool.
         assert not issubclass(metrics.UnauthorizedRaise, source_measures.MetricsError)
+
+    def test_a_ratchet_fault_is_an_instrument_failure(self) -> None:
+        # The ratchet names its own faults, but they are still exit 2: every
+        # boundary catches the measure layer's MetricsError for both layers.
+        assert issubclass(metrics.RatchetError, source_measures.MetricsError)
+        assert issubclass(metrics.AppendOnlyViolation, metrics.RatchetError)
 
     # CEILINGS ARE A HOLE OF THE SAME SHAPE, and the reason is subtle: the two
     # ceilings apply only to keys ABSENT from the baseline. So a blind
@@ -2222,7 +2228,7 @@ class TestCompareBaselineFiles:
         previous = _baseline_image(tmp_path, 'previous.json', synthetic_report())
         absent = tmp_path / 'gone.json'
 
-        with pytest.raises(source_measures.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.compare_baseline_files(previous, absent)
 
         assert str(absent) in str(excinfo.value)
@@ -2232,7 +2238,7 @@ class TestCompareBaselineFiles:
         broken = tmp_path / 'broken.json'
         broken.write_text('{"files": {', encoding='utf-8')
 
-        with pytest.raises(source_measures.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.compare_baseline_files(previous, broken)
 
         message = str(excinfo.value)
@@ -2564,7 +2570,7 @@ class TestAuthorizedRaise:
         # whether the report it accompanied happened to raise anything -- a
         # blank --reason over a lowering run would pass unremarked, and the
         # ledger's whole purpose is to answer WHO and WHY (heuristic 10).
-        with pytest.raises(source_measures.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.RaiseAuthorization(task_id=task_id, reason=reason)
 
         assert field in str(excinfo.value)
@@ -2575,7 +2581,7 @@ class TestAuthorizedRaise:
         target, ledger = self._seeded(tmp_path)
         before = target.read_text(encoding='utf-8')
 
-        with pytest.raises(source_measures.MetricsError):
+        with pytest.raises(metrics.RatchetError):
             metrics.write_baseline(
                 target,
                 self._raised(),
@@ -2637,7 +2643,7 @@ class TestAuthorizedRaiseLedger:
 
         assert metrics.load_ledger(missing)['raises'] == []
 
-        with pytest.raises(source_measures.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.load_baseline(missing)
         assert 'nope.json' in str(excinfo.value)
 
@@ -2658,7 +2664,7 @@ class TestAuthorizedRaiseLedger:
         # absence -- fails hard and names the file.
         target = tmp_path / 'ledger.json'
         target.write_text(content, encoding='utf-8')
-        with pytest.raises(source_measures.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.load_ledger(target)
         assert 'ledger.json' in str(excinfo.value), why
 
@@ -2770,7 +2776,7 @@ class TestLedgerAppendedEntries:
     def test_dropping_a_historical_entry_is_refused_by_name(self) -> None:
         history = [_ledger_record('5485'), _ledger_record('5675')]
 
-        with pytest.raises(source_measures.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.ledger_appended_entries(_ledger(*history), _ledger(history[0]))
 
         message = str(excinfo.value)
@@ -2786,13 +2792,13 @@ class TestLedgerAppendedEntries:
         history = _ledger_record('5485')
         forged = _ledger_record('5485', reason='actually it was a refactor')
 
-        with pytest.raises(source_measures.MetricsError):
+        with pytest.raises(metrics.RatchetError):
             metrics.ledger_appended_entries(_ledger(history), _ledger(forged))
 
     def test_reordering_history_is_refused(self) -> None:
         first, second = _ledger_record('5485'), _ledger_record('5675')
 
-        with pytest.raises(source_measures.MetricsError):
+        with pytest.raises(metrics.RatchetError):
             metrics.ledger_appended_entries(
                 _ledger(first, second), _ledger(second, first)
             )
@@ -3483,7 +3489,7 @@ class TestComparatorPreconditions:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         current['params']['complexipy_version'] = '7.0.1'
-        with pytest.raises(source_measures.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.check_against_baseline(current, baseline)
         assert '7.0.1' in str(excinfo.value)
         assert '6.2.0' in str(excinfo.value)
@@ -3494,7 +3500,7 @@ class TestComparatorPreconditions:
         baseline['params']['cluster_paths'] = [
             p for p in metrics.CLUSTER_PATHS if p != _GIT_OPS
         ] + ['orchestrator/src/orchestrator/ghost.py']
-        with pytest.raises(source_measures.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.check_against_baseline(current, baseline)
         message = str(excinfo.value)
         assert _GIT_OPS in message
@@ -3508,7 +3514,7 @@ class TestComparatorPreconditions:
         current = copy.deepcopy(baseline)
         current['enumeration']['complete'] = False
         current['enumeration']['unreadable'] = ['orchestrator/tests/test_broken.py']
-        with pytest.raises(source_measures.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.check_against_baseline(current, baseline)
         assert 'test_broken.py' in str(excinfo.value)
 
@@ -3520,7 +3526,7 @@ class TestComparatorPreconditions:
         current = copy.deepcopy(baseline)
         current['enumeration']['complete'] = False
         current['files'][_MQ]['lines'] += 5000
-        with pytest.raises(source_measures.MetricsError):
+        with pytest.raises(metrics.RatchetError):
             metrics.check_against_baseline(current, baseline)
 
 

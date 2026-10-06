@@ -36,7 +36,8 @@ neighbours. Those guards measure OTHER people's files; this one measures a
 fixed, named cluster where a path it cannot read IS the finding. Concretely:
 
 * a ``CLUSTER_PATHS`` LITERAL that is missing, unreadable or unparseable ->
-  ``source_measures.MetricsError`` naming the path and the cause;
+  ``RatchetError`` (missing, unreadable) or ``source_measures.MetricsError``
+  (unparseable) naming the path and the cause;
 * a ``CLUSTER_PATHS`` GLOB expanding to zero -> fine (that is
   ``merge_lane/**`` until PRD task zeta1 lands);
 * complexipy absent, or resolving outside ``source_measures.COMPLEXIPY_REQUIRED`` ->
@@ -74,7 +75,8 @@ Exit codes
    ``--write-baseline`` REFUSING to absorb one for want of an
    ``--authorize-raise`` (``UnauthorizedRaise``, which deliberately does not
    subclass ``MetricsError`` so it cannot be reclassified as a broken tool).
-2  instrument failure (``MetricsError``) -- an unparseable cluster file,
+2  instrument failure (``source_measures.MetricsError``, or its ``RatchetError``
+   subclass for the ratchet's own faults) -- an unparseable cluster file,
    complexipy missing or out of range, a missing/malformed baseline, or a
    baseline whose recorded parameters no longer match this tree. Deliberately
    distinct from 1 so a broken instrument is never mistaken either for a clean
@@ -97,10 +99,22 @@ import source_measures
 from shared import safe_io
 
 
-class AppendOnlyViolation(source_measures.MetricsError):
+class RatchetError(source_measures.MetricsError):
+    """The ratchet could not do its job: its cluster spec, baseline, ledger,
+    an authorization, or the params a comparison rests on is missing,
+    malformed or inconsistent.
+
+    A ``source_measures.MetricsError`` subclass because both are instrument
+    failures (exit 2) and every boundary catches them together; a type of its
+    own so the ratchet's faults are named by the ratchet, not by the layer it
+    measures with.
+    """
+
+
+class AppendOnlyViolation(RatchetError):
     """The ledger's recorded history was REWRITTEN -- a verdict, not a fault.
 
-    A ``source_measures.MetricsError`` subclass, so nothing that already catches one changes
+    A ``RatchetError`` subclass, so nothing that already catches one changes
     behaviour; a DISTINCT type, because the two are read differently at a
     boundary. ``scripts/check_staged_ratchet_raise.py`` exits 1 for this (the
     committer did something the ratchet forbids and can fix) and 2 for its
@@ -251,7 +265,7 @@ class TestTreeCoverage:
 def resolve_cluster_paths(root: Path) -> Enumeration:
     """Resolve ``CLUSTER_PATHS`` against *root* into a complete Enumeration.
 
-    Raises ``MetricsError`` naming the path when a LITERAL entry is missing, is
+    Raises ``RatchetError`` naming the path when a LITERAL entry is missing, is
     not a regular file, or cannot be read. A GLOB entry expanding to zero paths
     is accepted (that is ``merge_lane/**`` until PRD task zeta1).
     """
@@ -264,20 +278,20 @@ def resolve_cluster_paths(root: Path) -> Enumeration:
             continue
         candidate = root / entry
         if not candidate.exists():
-            raise source_measures.MetricsError(
+            raise RatchetError(
                 f'cluster path {entry!r} does not exist under {root} -- '
                 'CLUSTER_PATHS is the SPOT source of PRD Appendix A; if the '
                 'file was renamed or removed, update CLUSTER_PATHS and '
                 'regenerate the baseline in the same commit'
             )
         if not candidate.is_file():
-            raise source_measures.MetricsError(
+            raise RatchetError(
                 f'cluster path {entry!r} is not a regular file under {root}'
             )
         try:
             candidate.read_text(encoding='utf-8')
         except (OSError, UnicodeDecodeError) as exc:
-            raise source_measures.MetricsError(
+            raise RatchetError(
                 f'cluster path {entry!r} could not be read: {exc.__class__.__name__}: {exc}'
             ) from exc
         resolved.append(entry)
@@ -528,7 +542,7 @@ def _require_aliases_in_cluster() -> None:
     """
     missing = sorted(set(ALIAS_MODULES) - lane_module_names())
     if missing:
-        raise source_measures.MetricsError(
+        raise RatchetError(
             f'ALIAS_MODULES names {missing}, which no CLUSTER_PATHS literal '
             'carries -- each old module must stay in the cluster so its '
             'external_importers has a files entry to be recorded on'
@@ -1093,7 +1107,7 @@ def write_baseline(
     and neither sees a raise replayed by a rebase or landed by the merge
     worker's hook-free ``update-ref``.
 
-    A MALFORMED destination propagates ``load_baseline``'s ``MetricsError``
+    A MALFORMED destination propagates ``load_baseline``'s ``RatchetError``
     rather than being overwritten: a previous baseline you cannot read is one
     whose raises you cannot see.
     """
@@ -1127,24 +1141,24 @@ def load_baseline(path: Path) -> dict:
     try:
         text = target.read_text(encoding='utf-8')
     except FileNotFoundError as exc:
-        raise source_measures.MetricsError(
+        raise RatchetError(
             f'ratchet baseline {target} does not exist -- a missing baseline is '
             'a hard failure, never an empty-baseline pass; regenerate it with '
             '--write-baseline if this is the commit that introduces it'
         ) from exc
     except (OSError, UnicodeDecodeError) as exc:
-        raise source_measures.MetricsError(
+        raise RatchetError(
             f'ratchet baseline {target} could not be read: '
             f'{exc.__class__.__name__}: {exc}'
         ) from exc
     try:
         loaded = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise source_measures.MetricsError(
+        raise RatchetError(
             f'ratchet baseline {target} is not valid JSON: {exc}'
         ) from exc
     if not isinstance(loaded, dict):
-        raise source_measures.MetricsError(
+        raise RatchetError(
             f'ratchet baseline {target} holds a '
             f'{type(loaded).__name__} at top level, expected a JSON object'
         )
@@ -1164,7 +1178,7 @@ def load_baseline(path: Path) -> dict:
 def _require_non_blank(authorization: RaiseAuthorization, field: str) -> None:
     value = getattr(authorization, field)
     if not isinstance(value, str) or not value.strip():
-        raise source_measures.MetricsError(
+        raise RatchetError(
             f'authorized raise is missing {field}: {value!r}. An authorization '
             f'with no {field} is not an authorization -- the ledger entry exists '
             'to tell a reviewer WHO raised a measure and WHY, and an entry that '
@@ -1342,23 +1356,23 @@ def load_ledger(path: Path) -> dict:
     except FileNotFoundError:
         return empty_ledger()
     except (OSError, UnicodeDecodeError) as exc:
-        raise source_measures.MetricsError(
+        raise RatchetError(
             f'authorized-raise ledger {target} could not be read: '
             f'{exc.__class__.__name__}: {exc}'
         ) from exc
     try:
         loaded = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise source_measures.MetricsError(
+        raise RatchetError(
             f'authorized-raise ledger {target} is not valid JSON: {exc}'
         ) from exc
     if not isinstance(loaded, dict):
-        raise source_measures.MetricsError(
+        raise RatchetError(
             f'authorized-raise ledger {target} holds a '
             f'{type(loaded).__name__} at top level, expected a JSON object'
         )
     if not isinstance(loaded.get('raises'), list):
-        raise source_measures.MetricsError(
+        raise RatchetError(
             f'authorized-raise ledger {target} has no "raises" list -- a ledger '
             'whose entries cannot be read is one whose history cannot be '
             'audited, which must never read as "nothing was authorized"'
@@ -1409,7 +1423,7 @@ def ledger_appended_entries(previous: dict, current: dict) -> list[dict]:
     *previous* must be a PREFIX of *current* -- length equality is not prefix
     equality, so an entry rewritten in place is refused exactly like a dropped
     one, and a reorder like both. The refusal is an ``AppendOnlyViolation``
-    rather than a bare ``MetricsError`` so a caller can tell this VERDICT apart
+    rather than a bare ``RatchetError`` so a caller can tell this VERDICT apart
     from an instrument failure at its own exit boundary.
 
     Pure: two loaded dicts in, the suffix out. The caller decides where the two
@@ -1576,7 +1590,7 @@ def _section(report: dict, name: str) -> dict:
 def _params(report: dict, which: str) -> dict:
     params = report.get('params')
     if not isinstance(params, dict):
-        raise source_measures.MetricsError(
+        raise RatchetError(
             f'{which} report has no "params" block -- it was not produced by '
             'build_report, so there is nothing to state how it was measured'
         )
@@ -1586,14 +1600,14 @@ def _params(report: dict, which: str) -> dict:
 def _require_complete_enumeration(current: dict) -> None:
     enumeration = current.get('enumeration')
     if not isinstance(enumeration, dict):
-        raise source_measures.MetricsError(
+        raise RatchetError(
             'current report has no "enumeration" block -- completeness must be '
             'legible in the RESULT, not only in a log line (INV-11)'
         )
     if enumeration.get('complete') is True:
         return
     unreadable = list(enumeration.get('unreadable', ()))
-    raise source_measures.MetricsError(
+    raise RatchetError(
         'refusing to compare a PARTIAL measurement against the baseline: '
         f'{len(unreadable)} path(s) were skipped -- {unreadable}. A sweep that '
         'skipped files measures LOWER than the truth, so comparing it would '
@@ -1606,7 +1620,7 @@ def _require_matching_params(current: dict, baseline: dict) -> None:
     current_version = _params(current, 'current').get('complexipy_version')
     baseline_version = _params(baseline, 'baseline').get('complexipy_version')
     if current_version != baseline_version:
-        raise source_measures.MetricsError(
+        raise RatchetError(
             f'complexipy version drift: the baseline was measured with '
             f'{baseline_version!r}, this run used {current_version!r}. Cognitive '
             'numbers are version-dependent -- the same merge_queue.py measures '
@@ -1627,7 +1641,7 @@ def _require_matching_params(current: dict, baseline: dict) -> None:
     if recorded != live:
         added = [p for p in recorded if p not in live]
         removed = [p for p in live if p not in recorded]
-        raise source_measures.MetricsError(
+        raise RatchetError(
             'the baseline\'s recorded cluster_paths no longer match '
             f'CLUSTER_PATHS. Recorded but no longer in the cluster: {added}. '
             f'In the cluster but not recorded: {removed}. Editing PRD Appendix A '
@@ -1779,7 +1793,7 @@ def check_against_baseline(current: dict, baseline: dict) -> list[Violation]:
     """Compare a fresh report against the committed baseline. Pure.
 
     Order of operations is deliberate. The three hard-failure preconditions run
-    FIRST and raise ``MetricsError``, so a wrong-version or partial measurement
+    FIRST and raise ``RatchetError``, so a wrong-version or partial measurement
     reports its own named cause instead of a wall of downstream violations that
     would send the reader hunting a regression which does not exist.
 
@@ -2082,7 +2096,7 @@ def _resolve_authorization(
         )
     try:
         return RaiseAuthorization(task_id=args.authorize_raise, reason=args.reason)
-    except source_measures.MetricsError as exc:
+    except RatchetError as exc:
         parser.error(str(exc))
 
 
