@@ -1155,6 +1155,13 @@ def campaign(
         async with campaign_usage_gate(load_config(config_path) if pool else None) as usage_gate:
             if usage_gate is not None:
                 await usage_gate.check_at_startup()
+            elif pool:
+                raise click.ClickException(
+                    '--pool was requested but no account-pool gate could be built from '
+                    f'{config_path} (usage_cap disabled, the gate failed to construct, or '
+                    'no accounts resolved; see the log). Pass --no-pool to run on the CLI '
+                    'default login instead.'
+                )
 
             click.echo(click.style(
                 f'Campaign: {len(variants)} arms x {len(corpus.diffs)} diffs ({split}) x {trials} trials, '
