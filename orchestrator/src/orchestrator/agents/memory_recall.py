@@ -214,10 +214,10 @@ UNDATED = 'undated'
 UNKNOWN_STORE = 'unknown'
 """Placeholders for the three tag fields a result may not carry.
 
-Graphiti-sourced results carry no category, their ``created_at`` is the edge's
-creation time, and graph edges usually carry no ``temporal``. The tag is
-best-effort and the content is not: a missing field renders as one of these
-words, never as ``None``, and never suppresses the entry it describes.
+Graphiti-sourced results carry no category, and a Graphiti row is undated only
+when it carries neither the edge's ``created_at`` nor ``temporal.valid_at``.
+The tag is best-effort and the content is not: a missing field renders as one
+of these words, never as ``None``, and never suppresses the entry it describes.
 """
 
 
@@ -232,7 +232,12 @@ def _entry_category(entry: dict) -> str:
 
 
 def _entry_date(entry: dict) -> str:
-    """Date an entry, date-only: its ``created_at``, else the date its fact became valid."""
+    """Date an entry, date-only, by when it entered memory: its ``created_at``.
+
+    One meaning for every store, so a Graphiti edge shows its birth even when it
+    also carries ``temporal.valid_at``; the date its fact became valid is only
+    the fallback for a hit with no ``created_at``.
+    """
     temporal = entry.get('temporal')
     valid_at = temporal.get('valid_at') if isinstance(temporal, dict) else None
     for value in (entry.get('created_at'), valid_at):

@@ -1365,7 +1365,6 @@ class TestSearch:
         )
         created = {r.id: r.created_at for r in results}
         assert created['edge-offset'] == '2026-08-22T04:30:00+00:00'
-        assert created['edge-offset'].endswith('+00:00')
         assert created['edge-naive'] == '2026-08-22T09:30:00+00:00'
 
     @pytest.mark.asyncio
