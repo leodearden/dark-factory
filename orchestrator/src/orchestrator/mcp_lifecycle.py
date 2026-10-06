@@ -574,6 +574,11 @@ def tool_text_blocks(reply: Mapping[str, Any]) -> tuple[str, ...]:
     )
 
 
+# The orchestrator's one self-identification spelling. clientInfo reaches only
+# a stateful session; a stateless-HTTP server sees this identity only when a
+# tool call's arguments carry it (Scheduler.set_task_status does).
+ORCHESTRATOR_MCP_IDENTITY: str = 'orchestrator'
+
 # Mutating task tools that must carry a client-supplied idempotency key so a
 # transport-level retry (after an ambiguous timeout/reset) dedupes server-side
 # instead of double-applying (task 2712). Reads/initialize are untouched.
@@ -634,7 +639,7 @@ class McpSession:
             {
                 'protocolVersion': '2025-03-26',
                 'capabilities': {},
-                'clientInfo': {'name': 'orchestrator', 'version': '0.1.0'},
+                'clientInfo': {'name': ORCHESTRATOR_MCP_IDENTITY, 'version': '0.1.0'},
             },
         )
         logger.debug(f'MCP initialize response: {json.dumps(result)[:200]}')

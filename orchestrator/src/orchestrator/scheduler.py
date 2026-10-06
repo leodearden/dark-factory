@@ -47,7 +47,7 @@ from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
 from orchestrator.guard_state import PersistentSet, guard_path
 from orchestrator.hold_history import HoldHistory
-from orchestrator.mcp_lifecycle import mcp_call, tool_error_text
+from orchestrator.mcp_lifecycle import ORCHESTRATOR_MCP_IDENTITY, mcp_call, tool_error_text
 from orchestrator.module_charter import derive_modules, sanitize_files_for_persist
 from orchestrator.overrides import OverrideRow, OverrideStore
 from orchestrator.park_eviction_requests import ParkEvictionRequestStore
@@ -3116,11 +3116,25 @@ class Scheduler:
         so every existing caller's wire payload is unaffected. Injected into
         ``arguments`` before the retry loop so a transient retry resends the
         same claimant stamp rather than silently dropping it.
+
+        **Caller identity.** Every write sends ``agent_id`` =
+        ``ORCHESTRATOR_MCP_IDENTITY``, placed before the retry loop for the
+        same reason as ``claimant_run_id``. fused-memory serves stateless
+        HTTP, where clientInfo never reaches a tools/call, so the identity
+        must travel in the arguments. Without it, fused-memory's
+        ``deterministic-*`` caller bar
+        (``fused-memory/src/fused_memory/middleware/done_provenance_authz.py``)
+        refuses the write as unidentified. The done-write journal row records
+        this value. These writes now classify as ORCHESTRATOR rather than
+        HUMAN in ``shared/src/shared/task_transitions.py::derive_actor_class``.
+        Both classes map to the same ``_UNION``, so no legality verdict
+        changes.
         """
         arguments: dict = {
             'id': task_id,
             'status': status,
             'project_root': self._project_root,
+            'agent_id': ORCHESTRATOR_MCP_IDENTITY,
         }
         if done_provenance is not None:
             arguments['done_provenance'] = done_provenance
