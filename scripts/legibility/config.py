@@ -187,7 +187,7 @@ class LegibilityConfig(BaseModel):
     def _project_root_must_be_absolute(cls, value: str) -> str:
         """Reject a relative ``project_root`` at config-load time.
 
-        Every consumer (sampling.py, census.py's ``default_batch_source``,
+        Every consumer (sampling.py, census_window.py's ``WindowBatchSource``,
         digest.py, ...) resolves ``cfg.project_root`` against its OWN
         process cwd. ``scripts/legibility-trickle@.service`` pins
         ``WorkingDirectory=/home/leo/src/dark-factory`` for every ``%i``

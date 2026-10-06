@@ -62,13 +62,12 @@ import functools
 import json
 import logging
 import os
-import random
 import subprocess
 import sys
 import tempfile
 import traceback
 from dataclasses import dataclass, field, replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 # Self-bootstrap for standalone `python scripts/legibility/census.py` runs
@@ -97,11 +96,14 @@ if str(_SHARED_SRC) not in sys.path:
 
 import codebook  # noqa: E402
 import coder  # noqa: E402
-import digest  # noqa: E402
 import filing_policy  # noqa: E402
-import inventory  # noqa: E402
-import sampling  # noqa: E402
-from legibility import census_trigger, session_runner, unlanded  # noqa: E402
+from legibility import (  # noqa: E402
+    census_trigger,
+    census_window,
+    session_ledger,
+    session_runner,
+    unlanded,
+)
 
 # The banner marker list itself lives in shared.cap_markers and is never
 # restated here -- this module only asks the question, via the predicate.
@@ -296,7 +298,7 @@ def mine_to_saturation(
     telling 20 identical ENOENTs apart from 20 distinct model errors, and
     any canonicalization is a guess that can collapse precisely that
     distinction. Output stays bounded without a cap on distinct reasons
-    because a batch has at most ``_DEFAULT_CENSUS_BATCH_SIZE`` digests, so
+    because a batch has at most ``census_window.DEFAULT_BATCH_SIZE`` digests, so
     the worst case is one long line rather than N lines.
 
     The aggregate does not merely ADD to the flood: the
@@ -2978,117 +2980,6 @@ DEFAULT_HARNESS_CONFIG_PATH = (
 own components can be a confusion's fix surface. Its project_root names the
 MAIN checkout even when the census runs from a worktree."""
 
-_DEFAULT_CENSUS_LOOKBACK_DAYS = 30
-"""Fallback mining-window length (days) when a project has never been
-censused before (no last_census_at anchor to start the window from) -- a
-first-ever census must not attempt to mine the dawn of time."""
-
-_DEFAULT_CENSUS_BATCH_SIZE = 20
-"""Sessions per mine_to_saturation batch for the real batch_source."""
-
-
-def _census_window_dates(project_root, *, now: datetime) -> list[date]:
-    """The list of calendar dates to enumerate sessions for: from the last
-    census's `last_census_at` (read via census_trigger.load_census_state)
-    through *now*, inclusive -- falling back to a fixed
-    `_DEFAULT_CENSUS_LOOKBACK_DAYS`-day lookback when never censused or the
-    state is malformed/unparseable (fail-safe: a bounded window, never an
-    unbounded one)."""
-    state_path = Path(project_root) / "docs" / "legibility" / "census-state.json"
-    status, state = census_trigger.load_census_state(state_path)
-
-    start_date = None
-    if status == "ok" and state and state.get("last_census_at"):
-        try:
-            start_date = datetime.fromisoformat(state["last_census_at"]).date()
-        except (TypeError, ValueError):
-            start_date = None
-    if start_date is None:
-        start_date = (now - timedelta(days=_DEFAULT_CENSUS_LOOKBACK_DAYS)).date()
-
-    end_date = now.date()
-    span_days = (end_date - start_date).days
-    if span_days < 0:
-        return [end_date]
-    return [start_date + timedelta(days=offset) for offset in range(span_days + 1)]
-
-
-def _stratified_random_order(by_stratum: dict, *, rng: random.Random) -> list:
-    """Interleave *by_stratum* (``{stratum: [ScoredRecord, ...]}``)
-    round-robin, each stratum's own list independently shuffled first, so
-    every batch mine_to_saturation draws is a representative random
-    cross-section of every active stratum rather than front-loading one
-    stratum's sessions ahead of another's (the "stratified-RANDOM"
-    sampling this task's design decisions call for)."""
-    queues = [list(records) for records in by_stratum.values()]
-    for queue in queues:
-        rng.shuffle(queue)
-
-    order = []
-    while any(queues):
-        for queue in queues:
-            if queue:
-                order.append(queue.pop())
-    return order
-
-
-def default_batch_source(cfg, *, projects_root, now: datetime,
-                          batch_size: int = _DEFAULT_CENSUS_BATCH_SIZE, rng=None):
-    """Real stratified-RANDOM batch_source: enumerate every session across
-    the census window's inclusive ``[start, end]`` date range
-    (:func:`_census_window_dates` first/last) in ONE walk via
-    :func:`inventory.enumerate_sessions_in_range` — O(total_files), not
-    O(window_days × files) — under *projects_root* matching *cfg*'s
-    ``cwd_prefixes``, score + classify each (mirrors
-    ``nightly.select_scored_records``'s one-pass loop), interleave into a
-    random cross-stratum order, and lazily render each session to a digest
-    via ``digest.build_digest`` one ``batch_size``-sized batch at a time.
-
-    A generator: NOTHING here executes until the mining loop actually
-    iterates it, so a caller than never reaches the happy path (e.g. a
-    headroom-preflight defer) never enumerates a single session. A single
-    session whose digest fails to render is logged and skipped -- it never
-    aborts the whole batch (mirrors ``nightly.build_digests``'s per-record
-    isolation).
-    """
-    rng = rng if rng is not None else random.Random()
-
-    # _census_window_dates always returns a non-empty list (even its span<0
-    # branch returns [end_date]), so window[0]/window[-1] are always safe.
-    # The inclusive [start, end] range predicate yields the same record set as
-    # the per-date union — each file matches at most one date — but walks the
-    # tree ONCE (O(total_files), not O(window_days × files)).
-    window = _census_window_dates(cfg.project_root, now=now)
-    start_date, end_date = window[0], window[-1]
-    scored = [
-        sampling.score_session(session)
-        for session in inventory.enumerate_sessions_in_range(
-            projects_root, cfg.cwd_prefixes, start_date, end_date,
-            agent_transcript_roots=inventory.resolve_agent_transcript_roots(
-                cfg.project_root, cfg.agent_transcript_roots
-            ),
-        )
-    ]
-
-    by_stratum: dict[str, list] = {}
-    for record in scored:
-        by_stratum.setdefault(record.stratum, []).append(record)
-    ordered = _stratified_random_order(by_stratum, rng=rng)
-
-    for start in range(0, len(ordered), batch_size):
-        chunk = ordered[start:start + batch_size]
-        digests = []
-        for record in chunk:
-            try:
-                digests.append(
-                    digest.build_digest(record.path, agent_class_override=record.stratum)
-                )
-            except Exception as exc:  # noqa: BLE001 - isolate one bad transcript, keep mining
-                logger.warning("census: failed to build digest for %s: %s", record.path, exc)
-        if digests:
-            yield digests
-
-
 def _verify_prompt(cluster: dict, *, project_root: str) -> str:
     """Prompt for the real Sonnet verify_fn: confirm-or-refute one novel
     cluster against *project_root*'s current main via targeted file reads.
@@ -3684,6 +3575,35 @@ def _project_identity_mismatch(project_root: Path, cfg, config_path: Path) -> st
     )
 
 
+@dataclass(frozen=True)
+class PriorCensus:
+    """What census-state.json records about the previous run. A field is
+    ``None`` when the state is missing, malformed, or predates it."""
+
+    last_census_at: date | None = None
+    run_id: str | None = None
+    as_of_sha: str | None = None
+
+
+def _state_text(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def prior_census(status: str, state: dict | None) -> PriorCensus:
+    """Read :func:`census_trigger.load_census_state`'s result, which has
+    already validated ``last_census_at``."""
+    if status != "ok" or state is None:
+        return PriorCensus()
+    last_census_at = _state_text(state.get("last_census_at"))
+    return PriorCensus(
+        last_census_at=(
+            datetime.fromisoformat(last_census_at).date() if last_census_at else None
+        ),
+        run_id=_state_text(state.get("last_census_run_id")),
+        as_of_sha=_state_text(state.get("last_census_as_of_sha")),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint.
 
@@ -3698,7 +3618,7 @@ def main(argv: list[str] | None = None) -> int:
     Otherwise builds the real default seams (headless-CLI ``invoke`` for
     mining/verify/synthesis, MCP posters for ``submit_fn``/``escalate_fn``,
     ``census_trigger.default_status_fetcher`` for the done-count baseline,
-    a stratified-random ``batch_source`` over the mining window, a
+    a :class:`census_window.WindowBatchSource` over the mining window, a
     scoped git-commit helper, and the ``unlanded.roll_back`` that puts
     back a commit that did not land) and runs the full pipeline via
     ``run_census``. ``--harness-config`` (default ``DEFAULT_HARNESS_CONFIG_PATH``)
@@ -3891,6 +3811,7 @@ def main(argv: list[str] | None = None) -> int:
 
     codebook_path = project_root / "docs" / "legibility" / "confusion-codebook.yaml"
     census_state_path = project_root / "docs" / "legibility" / "census-state.json"
+    prior = prior_census(*census_trigger.load_census_state(census_state_path))
     report_path = project_root / "plans" / f"confusion-census-{date_str}.md"
     # Derived from report_path.parent so the human-review payload file stays
     # co-located with the dated report even if the report location moves.
@@ -3924,8 +3845,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         try:
             outcome = run_census(
-                batch_source=default_batch_source(
-                    cfg, projects_root=DEFAULT_PROJECTS_ROOT, now=now,
+                batch_source=census_window.WindowBatchSource(
+                    cfg,
+                    projects_root=DEFAULT_PROJECTS_ROOT,
+                    now=now,
+                    ledger_path=session_ledger.ledger_path(cfg.project_id),
+                    last_census_at=prior.last_census_at,
                 ),
                 invoke=mining_invoke,
                 # The in-verify re-probe rides the SAME cwd-scoped invoke as the
