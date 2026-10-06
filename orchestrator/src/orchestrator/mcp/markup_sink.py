@@ -51,6 +51,10 @@ MARKUP_UNATTRIBUTED_SUBJECT = 'unattributed'
 MARKUP_RESIDUE_ERROR_TYPE = 'mcp_markup_unrepairable'
 MARKUP_STORM_ERROR_TYPE = 'mcp_markup_storm'
 
+#: The ERROR line for a record the queue could not take: why, what it cost
+#: (:func:`_loss_account`), and whose call it was.
+_LOSS_LOG_FORMAT = 'markup guard: %s, so %s (subject %r)'
+
 #: The burst alarm's OWN category and level, because the middleware's storm
 #: record declares neither — unlike the residue record, which carries both and
 #: whose vocabulary is therefore never re-decided here (INV-7).
@@ -622,6 +626,27 @@ def file_storm(
     return esc_id
 
 
+def _loss_account(record: dict[str, Any]) -> str:
+    """What a record the queue could not take cost, in its OWN kind's terms.
+
+    A burst alarm carries no payload and no caller is waiting to resend one,
+    so the payload kinds' size-and-resend account would be false for it.
+    """
+    if record.get('error_type') == MARKUP_STORM_ERROR_TYPE:
+        return (
+            f'the burst alarm ({record.get("count")} {record.get("outcome")} '
+            f'outcome(s) in {record.get("window_seconds")}s) was NOT QUEUED; '
+            'the leak is active and the queue does not say so'
+        )
+    return (
+        f'the {record.get("error_type")!r} record for '
+        f'{record.get("tool")}.{record.get("field")} '
+        f'({len(record.get("raw_value") or "")}-char raw value) was preserved '
+        'NOWHERE; the caller is told nothing was preserved and to resend from '
+        'its own copy'
+    )
+
+
 def make_escalation_sink(
     *,
     worktree: Path,
@@ -629,13 +654,20 @@ def make_escalation_sink(
     subject_task_id: Callable[[], str],
     resolve_root: Callable[[Path], Path | None] = resolve_project_root,
     open_channel: Callable[[Path], tuple[Any, Any] | None] = open_escalation_channel,
-    last_resort: Callable[[dict[str, Any]], str | None] | None = None,
 ) -> Callable[[dict[str, Any]], Awaitable[str | None]]:
     """Build the emitter a boundary guard files its records through.
 
     Returns the id of the queued record, which the middleware folds into the
     caller-facing refusal so the payload can be looked up — or ``None`` when
-    filing was impossible AND no *last_resort* landed either.
+    the queue could not take it.
+
+    THE FLOOR IS THE QUEUE OR NOTHING, for every boundary on this sink. A
+    record the queue cannot take is logged once at ERROR and answered with
+    ``None``, which is what makes the middleware tell the caller — the one
+    party still holding the payload — that nothing was preserved and to resend
+    from its own copy. A worktree-local copy was tried and retired (task 4584):
+    it died with the lane unread, while its filename bought the caller a false
+    "preserved verbatim".
 
     *subject_task_id* is a THUNK, not a value: the middleware cannot resolve
     the leaking task (``MarkupGuardMiddleware._identity`` reads its identity
@@ -650,15 +682,6 @@ def make_escalation_sink(
     on this server — a per-agent stdio subprocess's stderr is consumed by the
     spawning CLI and never reaches journald — so the storm branch reads the
     same thunk, and this is the axis that resolves for it.
-
-    *last_resort* is the FLOOR under a queue that cannot be opened at all — an
-    unwritable project root, a missing escalation package. It receives the same
-    record and returns whatever locator it managed to write, or ``None``. It is
-    deliberately not the primary channel: a locator inside a task worktree dies
-    with that worktree at ``git worktree remove --force``, so it preserves the
-    payload only until teardown and nothing ever proactively reads it. That is
-    strictly better than losing the payload immediately and strictly worse than
-    a queued escalation, which is exactly what a last resort should be.
 
     ASYNC, with every blocking step on a worker thread. The middleware calls
     this from inside the server's event loop, and one record can run a
@@ -680,26 +703,8 @@ def make_escalation_sink(
     project_root: Path | None = None
     channel: tuple[Any, Any] | None = None
 
-    def fall_back(record: dict[str, Any], why: str) -> str | None:
-        if last_resort is None:
-            return None
-        try:
-            locator = last_resort(record)
-        except Exception:
-            logger.exception(
-                'markup guard: the last-resort residue writer failed after %s; '
-                'the payload for %s.%s is lost',
-                why, record.get('tool'), record.get('field'),
-            )
-            return None
-        if locator:
-            logger.warning(
-                'markup guard: %s, so the payload for %s.%s was written to the '
-                'worktree-local %s instead — it dies with this worktree, so '
-                'recover it before the lane is reaped',
-                why, record.get('tool'), record.get('field'), locator,
-            )
-        return locator
+    def report_lost(record: dict[str, Any], why: str) -> None:
+        logger.error(_LOSS_LOG_FORMAT, why, _loss_account(record), _subject())
 
     def file_record(record: dict[str, Any]) -> str | None:
         """The blocking body, run on a worker thread."""
@@ -707,13 +712,15 @@ def make_escalation_sink(
         if project_root is None:
             project_root = resolve_root(worktree)
             if project_root is None:
-                return fall_back(record, 'the project root could not be resolved')
+                report_lost(record, 'the project root could not be resolved')
+                return None
         if channel is None:
             # Memoised alongside project_root so a queue directory is opened
             # (and mkdir'd) once per server rather than once per record.
             channel = open_channel(project_root)
             if channel is None:
-                return fall_back(record, 'the escalation queue could not be opened')
+                report_lost(record, 'the escalation queue could not be opened')
+                return None
         escalation_cls, queue = channel
 
         error_type = record.get('error_type')
@@ -736,12 +743,11 @@ def make_escalation_sink(
                 escalation_cls, queue, worktree, _subject(), record, spec,
             )
         except Exception:
-            logger.exception(
-                'markup guard: failed to file the %r record for %s.%s; the '
-                'refusal stands',
-                record.get('error_type'), record.get('tool'), record.get('field'),
+            logger.error(
+                _LOSS_LOG_FORMAT, 'the escalation could not be submitted',
+                _loss_account(record), _subject(), exc_info=True,
             )
-            return fall_back(record, 'the escalation could not be submitted')
+            return None
 
     def _subject() -> str:
         return resolve_subject(subject_task_id, worktree, what='record')

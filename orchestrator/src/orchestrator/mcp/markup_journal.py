@@ -278,8 +278,7 @@ def make_fact_journal(
     *resolve_root* defaults to ``--git-common-dir`` resolution, which from a
     task worktree names the MAIN checkout. That is the point: a worktree-local
     artifact dies with the lane at ``git worktree remove --force`` and nothing
-    ever reads it — the documented reason ``TaskArtifacts.write_markup_residue``
-    is wired only as a last resort and never as a channel.
+    ever reads it.
 
     ASYNC, with the blocking work on a worker thread: the middleware calls this
     from inside the server's event loop, and one record can run a
