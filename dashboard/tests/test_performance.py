@@ -2641,3 +2641,20 @@ class TestCancelOutcomesAreNotCounted:
         assert rates['total_tasks'] == 2
         assert rates['steward_count'] == 0
         assert rates['steward_rate'] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_history_counts_no_cancel(self, cancels_conn):
+        """The 07:00 hour holds only the cancel c3, so it gets no label; the
+        11:00 cancels neither dilute d1 nor add c1's steward; 'drained' holds
+        only a cancel, so discovery does not find it."""
+        history = await aggregate_performance_history(
+            [cancels_conn], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+        proj = history['proj']
+        assert proj['one_pass_history'] == {
+            'labels': ['2026-09-30T10:00', '2026-09-30T11:00'], 'values': [0.0, 100.0],
+        }
+        assert proj['escalation_history'] == {
+            'labels': ['2026-09-30T10:00', '2026-09-30T11:00'], 'values': [0.0, 0.0],
+        }
+        assert 'drained' not in history
