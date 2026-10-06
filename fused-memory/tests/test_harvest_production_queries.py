@@ -41,6 +41,7 @@ from shared.briefing_queries import (
     CONVENTIONS_AREA,
     CONVENTIONS_GENERIC,
     QUERY_SPECS,
+    TASK_SEMANTIC,
     BriefingQuerySpec,
     BriefingScope,
     queries_for,
@@ -167,11 +168,16 @@ def _build_journal(
     return path
 
 
-def _search_rows(text: str, n: int, *, limit: int = 5) -> list[tuple[str, str, str]]:
+def _search_rows(
+    text: str, n: int, *, limit: int = 5, caller: str | None = None
+) -> list[tuple[str, str, str]]:
+    """`n` search ops, journalled with `caller_agent_id` when `caller` is set."""
     import json  # noqa: PLC0415
 
-    params = json.dumps({'query': text, 'limit': limit})
-    return [('search', 'read', params)] * n
+    params: dict[str, object] = {'query': text, 'limit': limit}
+    if caller is not None:
+        params['caller_agent_id'] = caller
+    return [('search', 'read', json.dumps(params))] * n
 
 
 def _standard_journal(tmp_path: Path) -> Path:
@@ -562,6 +568,136 @@ class TestCurrentTemplatesAreRenderedFromSource:
         assert isinstance(exc.value, mod.HarvestError)
         assert 'free-text' in str(exc.value)
         assert '{title} {area}' in str(exc.value)
+
+
+IMPLEMENTER = 'claude-task-5502-implementer'
+
+
+def _briefing_rows(
+    scope: BriefingScope, *, caller: str | None, limit: int = 5
+) -> list[tuple[str, str, str]]:
+    """One dispatch's briefing searches, in the order `queries_for` fires them."""
+    rows: list[tuple[str, str, str]] = []
+    for _, text in queries_for(scope):
+        rows += _search_rows(text, 1, limit=limit, caller=caller)
+    return rows
+
+
+def _query_of(row: tuple[str, str, str]) -> str:
+    import json  # noqa: PLC0415
+
+    return json.loads(row[2])['query']
+
+
+def _companion(result):
+    return _class_for(result, TASK_SEMANTIC.text)
+
+
+class TestTheTaskChannelIsPairedByCaller:
+    """'{title} {area}' has no literal anchor, so it is recognised by pairing.
+
+    It is the next unmatched search from the caller whose area-scoped
+    conventions query came just before it.
+    """
+
+    def test_the_task_query_after_its_area_query_is_the_companion(self, tmp_path):
+        mod = _mod()
+        rows = _briefing_rows(AREA_SCOPES[0], caller=IMPLEMENTER)
+        assert [_query_of(r) for r in rows] == [
+            _rendered(CONVENTIONS_AREA, AREA_SCOPES[0]),
+            _rendered(TASK_SEMANTIC, AREA_SCOPES[0]),
+        ]
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        companion = _companion(result)
+        assert (companion.match, companion.era) == ('companion', 'current')
+        assert companion.observed_count == 1
+        assert companion.text == _rendered(TASK_SEMANTIC, AREA_SCOPES[0])
+        assert result.tail_count == 0
+
+    def test_a_task_query_with_no_preceding_area_query_stays_tail(self, tmp_path):
+        mod = _mod()
+        task_query = _rendered(TASK_SEMANTIC, AREA_SCOPES[0])
+        rows = _search_rows(task_query, 1, caller=IMPLEMENTER)
+        rows += _search_rows(task_query, 1)
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _companion(result).observed_count == 0
+        assert result.tail_count == 2
+
+    def test_an_area_query_with_no_caller_anchors_nothing(self, tmp_path):
+        mod = _mod()
+        rows = _search_rows(_rendered(CONVENTIONS_AREA, AREA_SCOPES[0]), 1)
+        rows += _search_rows(_rendered(TASK_SEMANTIC, AREA_SCOPES[0]), 1)
+        rows += _search_rows(_rendered(TASK_SEMANTIC, AREA_SCOPES[0]), 1, caller=IMPLEMENTER)
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _class_for(result, CONVENTIONS_AREA.text).observed_count == 1
+        assert _companion(result).observed_count == 0
+        assert result.tail_count == 2
+
+    def test_interleaved_dispatches_under_one_caller_each_pair(self, tmp_path):
+        """Parallel reviewers share one caller id, so their pairs interleave."""
+        mod = _mod()
+        reviewer = 'claude-task-7-reviewer'
+        a, b = AREA_SCOPES[0], AREA_SCOPES[1]
+        rows = _search_rows(_rendered(CONVENTIONS_AREA, a), 1, caller=reviewer)
+        rows += _search_rows(_rendered(CONVENTIONS_AREA, b), 1, caller=reviewer)
+        rows += _search_rows(_rendered(TASK_SEMANTIC, a), 1, caller=reviewer)
+        rows += _search_rows(_rendered(TASK_SEMANTIC, b), 1, caller=reviewer)
+        rows += _search_rows('how does the merge lane park a lock', 1, caller=reviewer)
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _companion(result).observed_count == 2
+        assert _companion(result).distinct_instances == 2
+        assert result.tail_count == 1
+
+    def test_each_area_query_pairs_exactly_one_later_search(self, tmp_path):
+        mod = _mod()
+        rows = _briefing_rows(AREA_SCOPES[0], caller=IMPLEMENTER)
+        rows += _search_rows('an own search', 1, caller=IMPLEMENTER)
+        rows += _search_rows('another own search', 1, caller=IMPLEMENTER)
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _companion(result).observed_count == 1
+        assert result.tail_count == 2
+
+    def test_another_callers_search_does_not_consume_the_anchor(self, tmp_path):
+        mod = _mod()
+        other = 'claude-task-9-debugger'
+        rows = _search_rows(_rendered(CONVENTIONS_AREA, AREA_SCOPES[0]), 1, caller=IMPLEMENTER)
+        rows += _search_rows('a search of somebody else', 1, caller=other)
+        rows += _search_rows(_rendered(TASK_SEMANTIC, AREA_SCOPES[0]), 1, caller=IMPLEMENTER)
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _companion(result).observed_count == 1
+        tail = [r for r in result.rows if r['source'] == 'production_tail']
+        assert [r['text'] for r in tail] == ['a search of somebody else']
+
+    def test_limits_are_measured_from_the_ops_each_side_counted(self, tmp_path):
+        """The same text paired at 5 and re-run by the agent at 20 splits cleanly."""
+        mod = _mod()
+        task_query = _rendered(TASK_SEMANTIC, AREA_SCOPES[0])
+        rows = _briefing_rows(AREA_SCOPES[0], caller=IMPLEMENTER, limit=5)
+        rows += _search_rows(task_query, 1, limit=20, caller=IMPLEMENTER)
+        rows += _search_rows('an own search', 1, limit=20, caller=IMPLEMENTER)
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+
+        assert _companion(result).observed_limits == {'5': 1}
+        tail = {r['text']: r for r in result.rows if r['source'] == 'production_tail'}
+        assert tail[task_query]['observed_limits'] == {'20': 1}
+        assert tail[task_query]['observed_limit'] == 20
+        assert tail['an own search']['observed_limit'] == 20
+
+    def test_every_spec_in_the_source_is_fired_and_classified(self, tmp_path):
+        """A spec added to shared that the harvester cannot classify fails here."""
+        mod = _mod()
+        scopes = (*AREA_SCOPES, BriefingScope())
+        fired = {spec.slug for scope in scopes for spec, _ in queries_for(scope)}
+        assert fired == {spec.slug for spec in QUERY_SPECS}
+
+        rows: list[tuple[str, str, str]] = []
+        for scope in scopes:
+            rows += _briefing_rows(scope, caller=IMPLEMENTER)
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert result.tail_count == 0
+        observed = {t.template for t in result.templates if t.observed_count}
+        assert observed == {spec.text for spec in QUERY_SPECS}
+
 
 
 class TestTrafficShares:
