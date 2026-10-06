@@ -84,11 +84,13 @@ _NOT_A_CANCEL = "outcome NOT IN ('cancelled', 'soft-cancelled')"
 
 async def _latest_completions(db: aiosqlite.Connection) -> dict[str, str]:
     """Return ``{project_id: MAX(completed_at)}`` for every project with a
-    recorded completion — the projects a card family tallies by default."""
+    recorded completion, a cancel not counting (see ``_NOT_A_CANCEL``) —
+    the projects a card family tallies by default."""
     rows = await db.execute_fetchall(
         'SELECT project_id, MAX(completed_at) '
         '  FROM task_results '
         " WHERE completed_at IS NOT NULL AND completed_at != '' "
+        f'   AND {_NOT_A_CANCEL} '
         ' GROUP BY project_id',
     )
     return {row[0]: row[1] for row in rows}
