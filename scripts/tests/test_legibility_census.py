@@ -34,6 +34,7 @@ from legibility import (
     account_pool,
     census_trigger,
     census_window,
+    check_census_report,
     session_ledger,
     session_runner,
     trickle_state,
@@ -223,6 +224,11 @@ class _TrackingBatchSource:
         for i, batch in enumerate(self._batches):
             self.pulled.append(i)
             yield batch
+
+
+def _no_selection():
+    """The ``selection_of`` seam of a batch source with no mining window."""
+    return None
 
 
 def _poison(name):
@@ -1348,6 +1354,7 @@ _SAMPLE_METHOD: dict[str, Any] = {
         "inputs_consumed_note": "no other instrument's report is read yet",
         "ledger_created_this_run": False,
         "ledger_state": "ok",
+        "ledger_pruned": 0,
         "ledger_error": None,
     },
 }
@@ -1392,6 +1399,7 @@ extra:
   inputs_consumed_note: no other instrument's report is read yet
   ledger_created_this_run: false
   ledger_state: ok
+  ledger_pruned: 0
   ledger_error: null
 ```
 
@@ -1958,11 +1966,12 @@ _METHOD_WINDOW = census_window.MiningWindow(
 )
 
 
-def _selection(tmp_path, state, *, rows=None, error=None):
+def _selection(tmp_path, state, *, rows=None, pruned=None, error=None):
     snapshot = session_ledger.LedgerSnapshot(
         path=tmp_path / "coded-sessions.sqlite",
         state=state,
         rows_by_coded_by=rows or {},
+        pruned=pruned,
         error=error,
     )
     return census_window.SessionSelection(
@@ -1994,18 +2003,27 @@ def _method(**overrides):
     return mod.build_method(**kwargs)
 
 
-def test_build_method_carries_the_seven_contract_keys_then_extra():
-    assert mod.METHOD_KEYS == (
-        "run_id", "as_of_sha", "since", "evidence", "verification", "cost",
-        "inputs_consumed",
-    )
+_ORACLE_REPORT = check_census_report.Report(
+    date="2026-07-14", suffix=None, record=None, rendering=None,
+)
+"""The report identity the independent checker matches ``run_id`` against."""
 
-    method = _method()
 
-    assert list(method) == [*mod.METHOD_KEYS, "extra"]
-    assert method["run_id"] == "census-dark_factory-20260714"
-    assert method["as_of_sha"] == "a" * 40
-    assert json.loads(json.dumps(method)) == method
+@pytest.mark.parametrize(
+    "state", [None, session_ledger.LedgerState.OK, session_ledger.LedgerState.UNREADABLE],
+)
+def test_build_method_conforms_to_the_independent_report_checker(tmp_path, state):
+    """``check_census_report`` imports nothing from census.py, so it holds
+    the contract §5 key set independently of ``build_method``."""
+    selection = None if state is None else _selection(tmp_path, state)
+    record = json.loads(json.dumps(_census_record(method=_method(selection=selection))))
+
+    assert check_census_report.check_record_method(record, _ORACLE_REPORT) == []
+    assert check_census_report.check_rendered_method(
+        mod.render_report(record), _ORACLE_REPORT,
+    ) == []
+    assert record["method"]["run_id"] == "census-dark_factory-20260714"
+    assert record["method"]["as_of_sha"] == "a" * 40
 
 
 def test_build_method_since_is_none_text_without_a_prior_census():
@@ -2034,7 +2052,7 @@ def test_build_method_verification_cost_and_inputs_consumed():
 def test_build_method_evidence_comes_from_the_selection(tmp_path):
     selection = _selection(
         tmp_path, session_ledger.LedgerState.OK,
-        rows={session_ledger.CodedBy.TRICKLE: 3},
+        rows={session_ledger.CodedBy.TRICKLE: 3}, pruned=4,
     )
 
     method = _method(selection=selection)
@@ -2049,6 +2067,7 @@ def test_build_method_evidence_comes_from_the_selection(tmp_path):
     }
     assert method["extra"]["ledger_created_this_run"] is False
     assert method["extra"]["ledger_state"] == "ok"
+    assert method["extra"]["ledger_pruned"] == 4
 
 
 def test_build_method_names_a_ledger_created_this_run(tmp_path):
@@ -2068,6 +2087,7 @@ def test_build_method_unreadable_ledger_counts_null_never_zero(tmp_path):
     method = _method(selection=selection)
 
     assert method["evidence"]["ledger_rows"] is None
+    assert method["extra"]["ledger_pruned"] is None
     assert method["extra"]["ledger_state"] == "unreadable"
     assert str(path) in method["extra"]["ledger_error"]
     assert method["extra"]["ledger_created_this_run"] is False
@@ -2086,6 +2106,7 @@ def test_build_method_without_a_selection_reports_null_evidence():
     }
     assert method["extra"]["ledger_created_this_run"] is None
     assert method["extra"]["ledger_state"] is None
+    assert method["extra"]["ledger_pruned"] is None
 
 
 def test_census_report_sections_flagless_key_set_and_order():
@@ -2224,6 +2245,7 @@ def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
     # single annotation cleared 337 of the 350 errors this file carried.
     kwargs: dict[str, Any] = dict(
         batch_source=None,
+        selection_of=_no_selection,
         invoke=_make_fake_invoke(default="pong"),
         verify_fn=_poison("verify_fn"),
         synthesize_fn=_poison("synthesize_fn"),
@@ -5430,7 +5452,7 @@ def test_main_hands_run_census_a_window_source_over_the_project_ledger(tmp_path,
     def fake_run_census(**kwargs):
         source = kwargs["batch_source"]
         list(source)
-        sources.append(source)
+        sources.append((source, kwargs["selection_of"]()))
         return mod.CensusOutcome(
             status="done", report_path="plans/r.md", filed_ticket_ids=[],
             stop_reason="exhausted",
@@ -5440,9 +5462,10 @@ def test_main_hands_run_census_a_window_source_over_the_project_ledger(tmp_path,
 
     assert mod.main(["--project-root", str(tmp_path), "--force"]) == 0
 
-    (source,) = sources
+    ((source, selected),) = sources
     assert isinstance(source, census_window.WindowBatchSource)
     assert source.selection is not None
+    assert selected is source.selection
     assert source.selection.window.start == datetime.combine(last_census, time(), UTC)
     assert source.selection.ledger.path == session_ledger.ledger_path("dark_factory")
     assert source.selection.ledger.state is session_ledger.LedgerState.CREATED

@@ -184,7 +184,8 @@ class LedgerSnapshot:
     )
     oldest_coded_at: datetime | None = None
     newest_coded_at: datetime | None = None
-    pruned: int = 0
+    pruned: int | None = None
+    """Rows :func:`open_for_census` pruned; ``None`` when no prune ran."""
     error: str | None = None
 
     @property
@@ -222,7 +223,7 @@ def _immediate_transaction(conn: sqlite3.Connection) -> Iterator[None]:
 
 
 def _read_snapshot(
-    conn: sqlite3.Connection, path: Path, state: LedgerState, *, pruned: int = 0,
+    conn: sqlite3.Connection, path: Path, state: LedgerState, *, pruned: int | None = None,
 ) -> LedgerSnapshot:
     rows = conn.execute(_SELECT).fetchall()
     by_coded_by = {member: 0 for member in CodedBy}

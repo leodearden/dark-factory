@@ -21,7 +21,7 @@ back to HEAD and quarantined; see ``run_census``).
 Every LLM / MCP / git side effect in this module is an INJECTED seam
 (``invoke``, ``verify_fn``, ``synthesize_fn``, ``submit_fn``,
 ``escalate_fn``, ``status_fetcher``, ``commit``, ``roll_back``,
-``batch_source``) --
+``batch_source``, ``selection_of``) --
 mirrors delta's ``coder.code_digests(invoke=)`` and zeta's
 ``census_trigger(status_fetcher=)``. The scripts/ test env (``uv run
 --project shared``) has no live models. Every seam is ALWAYS faked in this
@@ -67,7 +67,7 @@ import sys
 import tempfile
 import time
 import traceback
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -1172,12 +1172,6 @@ class ReportSection:
         return "\n".join(self.lines)
 
 
-METHOD_KEYS = (
-    "run_id", "as_of_sha", "since", "evidence", "verification", "cost", "inputs_consumed",
-)
-"""The seven ``## Method`` keys of the quality-findings contract §5, in
-order; :func:`build_method` adds ``extra`` after them."""
-
 CENSUS_RECORD_VERSION = 1
 
 _INPUTS_CONSUMED_NOTE = (
@@ -1190,23 +1184,38 @@ _INPUTS_CONSUMED_NOTE = (
 def _selection_evidence(
     selection: census_window.SessionSelection | None, *, mined: int,
 ) -> dict[str, Any]:
-    ledger = selection.ledger if selection is not None else None
+    if selection is None:
+        return {
+            "window": None,
+            "sessions_enumerated": None,
+            "skipped_coded": None,
+            "skipped_zero_signal": None,
+            "mined": mined,
+            "ledger_rows": None,
+        }
     return {
-        "window": selection.window.to_record() if selection is not None else None,
-        "sessions_enumerated": selection.sessions_enumerated if selection is not None else None,
-        "skipped_coded": selection.skipped_coded if selection is not None else None,
-        "skipped_zero_signal": selection.skipped_zero_signal if selection is not None else None,
+        "window": selection.window.to_record(),
+        "sessions_enumerated": selection.sessions_enumerated,
+        "skipped_coded": selection.skipped_coded,
+        "skipped_zero_signal": selection.skipped_zero_signal,
         "mined": mined,
-        "ledger_rows": ledger.total_rows if ledger is not None else None,
+        "ledger_rows": selection.ledger.total_rows,
     }
 
 
-def _ledger_extra(ledger: session_ledger.LedgerSnapshot | None) -> dict[str, Any]:
-    if ledger is None:
-        return {"ledger_created_this_run": None, "ledger_state": None, "ledger_error": None}
+def _ledger_extra(selection: census_window.SessionSelection | None) -> dict[str, Any]:
+    if selection is None:
+        return {
+            "ledger_created_this_run": None,
+            "ledger_state": None,
+            "ledger_pruned": None,
+            "ledger_error": None,
+        }
+    ledger = selection.ledger
     return {
         "ledger_created_this_run": ledger.state == session_ledger.LedgerState.CREATED,
         "ledger_state": ledger.state.value,
+        "ledger_pruned": ledger.pruned,
         "ledger_error": ledger.error,
     }
 
@@ -1227,12 +1236,12 @@ def build_method(
     probe_calls: int,
     wall_clock_secs: float,
 ) -> dict[str, Any]:
-    """The JSON-safe ``## Method`` block: :data:`METHOD_KEYS` then
-    ``extra`` (plans/census-incremental-prd.md §4.3). *selection* is
-    ``None`` for a run with no mining window, which nulls the evidence and
-    ledger fields it would have supplied; an unreadable ledger counts
-    ``ledger_rows`` as ``None``, never 0."""
-    ledger = selection.ledger if selection is not None else None
+    """The JSON-safe ``## Method`` block: the seven keys of the
+    quality-findings contract §5, then ``extra``
+    (plans/census-incremental-prd.md §4.3). *selection* is ``None`` for a
+    run with no mining window, which nulls the evidence and ledger fields it
+    would have supplied; an unreadable ledger counts ``ledger_rows`` and
+    ``ledger_pruned`` as ``None``, never 0."""
     return {
         "run_id": run_id,
         "as_of_sha": as_of_sha,
@@ -1250,7 +1259,7 @@ def build_method(
             "wall_clock_secs": wall_clock_secs,
         },
         "inputs_consumed": [],
-        "extra": {"inputs_consumed_note": _INPUTS_CONSUMED_NOTE, **_ledger_extra(ledger)},
+        "extra": {"inputs_consumed_note": _INPUTS_CONSUMED_NOTE, **_ledger_extra(selection)},
     }
 
 
@@ -2329,6 +2338,7 @@ def _unlanded(
 def run_census(
     *,
     batch_source,
+    selection_of: Callable[[], census_window.SessionSelection | None],
     invoke,
     verify_fn,
     synthesize_fn,
@@ -2361,6 +2371,14 @@ def run_census(
     them. *config* is a ``config.LegibilityConfig`` (``config.census.
     saturation`` drives the mining stop condition; ``config.models.*``
     drives the ratified static model routing).
+
+    *selection_of* is called once, as soon as mining has drained
+    *batch_source*, and reports which sessions that source selected
+    (``census_window.WindowBatchSource.selection``): the Method evidence, the
+    census-state ``session_watermark`` and the ledger the coded sessions are
+    written to all come from it. A source with no mining window declares so
+    by returning ``None``; the run then ledgers nothing and records null
+    evidence and a null watermark.
 
     Order: ``preflight_headroom`` first (PRD decision 5 -- one tiny probe,
     Haiku-tier per ``config.models.trickle``). A failed probe DEFERS the
@@ -2593,6 +2611,7 @@ def run_census(
         invoke=invoke,
         max_batches=max_batches,
     )
+    selection = selection_of()
 
     novel_clusters = _novel_clusters(mining_result.records)
     if max_verify_clusters is None:
@@ -2961,10 +2980,6 @@ def run_census(
             f"{storm_batch_indices} (>50% coding failures -- degraded dup-rate "
             "signal, excluded from the saturation decision)"
         )
-    selection = (
-        batch_source.selection
-        if isinstance(batch_source, census_window.WindowBatchSource) else None
-    )
     method = build_method(
         run_id=run_id,
         as_of_sha=as_of_sha,
@@ -4070,6 +4085,13 @@ def main(argv: list[str] | None = None) -> int:
     # defer and hard-failure escalations share one census escalation source
     # and one never-mask-the-exit contract.
     escalate_fn = _build_default_escalate_fn(cfg)
+    batch_source = census_window.WindowBatchSource(
+        cfg,
+        projects_root=DEFAULT_PROJECTS_ROOT,
+        now=now,
+        ledger_path=session_ledger.ledger_path(cfg.project_id),
+        last_census_at=prior.last_census_at,
+    )
 
     # ONE pooled session runner for the whole census: every stage and every
     # headroom probe rotates over the shared account pool per invocation
@@ -4082,13 +4104,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         try:
             outcome = run_census(
-                batch_source=census_window.WindowBatchSource(
-                    cfg,
-                    projects_root=DEFAULT_PROJECTS_ROOT,
-                    now=now,
-                    ledger_path=session_ledger.ledger_path(cfg.project_id),
-                    last_census_at=prior.last_census_at,
-                ),
+                batch_source=batch_source,
+                selection_of=lambda: batch_source.selection,
                 invoke=mining_invoke,
                 # The in-verify re-probe rides the SAME cwd-scoped invoke as the
                 # verifier it guards (so it fails exactly when the verifier would)

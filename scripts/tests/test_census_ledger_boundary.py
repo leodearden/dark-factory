@@ -127,9 +127,13 @@ class _Census:
     def report_path(self, basename: str = f"confusion-census-{_DATE}") -> Path:
         return self.root / "plans" / f"{basename}.md"
 
-    def kwargs(self, **overrides) -> dict[str, Any]:
+    def kwargs(self, *, source=None, **overrides) -> dict[str, Any]:
+        """``run_census`` keywords mining *source* (a fresh window source by
+        default), whose selection ``selection_of`` reports."""
+        source = source if source is not None else self.source()
         kwargs: dict[str, Any] = dict(
-            batch_source=self.source(),
+            batch_source=source,
+            selection_of=lambda: source.selection,
             invoke=_Invoke(),
             verify_fn=lambda clusters, *, model: {"verified": [], "rejected": [], "fixed": []},
             synthesize_fn=lambda verified, *, model: "No novel clusters this census.",
@@ -193,7 +197,7 @@ def test_the_method_records_the_selection_and_the_state_its_watermark(census):
     census.session("S-tango")
     source = census.source()
 
-    mod.run_census(**census.kwargs(batch_source=source))
+    mod.run_census(**census.kwargs(source=source))
 
     _, record = _record_of(census.report_path())
     selection = source.selection
@@ -208,8 +212,23 @@ def test_the_method_records_the_selection_and_the_state_its_watermark(census):
         "ledger_rows": 0,
     }
     assert record["method"]["extra"]["ledger_created_this_run"] is True
+    assert record["method"]["extra"]["ledger_pruned"] == 0
     state = json.loads(census.state_path.read_text(encoding="utf-8"))
     assert state["session_watermark"] == selection.window.end.isoformat()
+
+
+def test_any_source_whose_selection_is_declared_is_ledgered(census):
+    census.session("S-tango")
+    window_source = census.source()
+    pre_rendered = list(window_source)
+
+    outcome = mod.run_census(**census.kwargs(source=window_source, batch_source=pre_rendered))
+
+    assert outcome.ledger_rows_written == 1
+    assert census.ledger_rows() == [("S-tango", "census", _RUN_ID)]
+    state = json.loads(census.state_path.read_text(encoding="utf-8"))
+    assert window_source.selection is not None
+    assert state["session_watermark"] == window_source.selection.window.end.isoformat()
 
 
 def test_row1_a_trickle_coded_session_is_skipped_and_the_rest_ledgered(census):
@@ -237,7 +256,7 @@ def test_row2_a_capped_run_is_resumed_by_the_next(census):
         census.session(sid)
 
     first = mod.run_census(**census.kwargs(
-        batch_source=census.source(batch_size=2), max_batches=1,
+        source=census.source(batch_size=2), max_batches=1,
     ))
 
     assert first.stop_reason == "capped"
@@ -248,7 +267,7 @@ def test_row2_a_capped_run_is_resumed_by_the_next(census):
     second_invoke = _Invoke()
     second_report = census.report_path(f"confusion-census-{_DATE}-2")
     mod.run_census(**census.kwargs(
-        batch_source=census.source(batch_size=2),
+        source=census.source(batch_size=2),
         invoke=second_invoke,
         report_path=second_report,
         run_id=f"{_RUN_ID}-2",

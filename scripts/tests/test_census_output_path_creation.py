@@ -73,6 +73,7 @@ def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
     """
     kwargs: dict[str, Any] = dict(
         batch_source=[],
+        selection_of=lambda: None,
         invoke=lambda prompt, model: "pong",
         verify_fn=lambda clusters, *, model: {"verified": [], "rejected": [], "fixed": []},
         synthesize_fn=lambda verified, *, model: "No novel clusters this census.",

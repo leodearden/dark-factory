@@ -213,7 +213,7 @@ def test_read_ledger_counts_rows_by_producer(tmp_path):
     assert snapshot.rows_by_coded_by == {CodedBy.TRICKLE: 2, CodedBy.CENSUS: 1}
     assert snapshot.has_census_rows is True
     assert snapshot.total_rows == 3
-    assert snapshot.pruned == 0
+    assert snapshot.pruned is None
     assert snapshot.error is None
 
 
@@ -284,6 +284,7 @@ def test_open_for_census_leaves_a_corrupt_file_untouched(tmp_path):
     assert snapshot.error is not None
     assert str(path) in snapshot.error
     assert snapshot.total_rows is None
+    assert snapshot.pruned is None
     assert snapshot.has_census_rows is False
     assert path.read_bytes() == _GARBAGE
 
