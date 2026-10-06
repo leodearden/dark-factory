@@ -71,6 +71,7 @@ const EXPECTED_WINDOW_GLOBALS = {
   'window_chip.js': 'DF_WINDOW_CHIP',
   'merge_queue.js': 'DF_MERGE_QUEUE',
   'escalation_views.js': 'DF_ESCALATION_VIEWS',
+  'escalation_focus.js': 'DF_ESCALATION_FOCUS',
   'memory_readings.js': 'DF_MEMORY_READINGS',
 };
 

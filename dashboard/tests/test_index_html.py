@@ -1709,6 +1709,65 @@ def test_memory_readings_js_load_order(
 
 
 # ---------------------------------------------------------------------------
+# Regression guard: dependency-free classic modules are served, versioned, and
+# load before every .jsx that reads them (task 5743)
+#
+# A module in this table reads no window.DF_* global, so its only load-order
+# edges are to its consumers, each of which destructures the module's global
+# at module scope with no fallback. One row per module; each consumer is its
+# own case because each blanks a different surface.
+# ---------------------------------------------------------------------------
+
+_DEPENDENCY_FREE_MODULES = {
+    'escalation_focus.js': ('tab_escalations.jsx',),
+}
+_DEPENDENCY_FREE_CONSUMER_CASES = [
+    (module, consumer)
+    for module, consumers in _DEPENDENCY_FREE_MODULES.items()
+    for consumer in consumers
+]
+
+
+@pytest.mark.parametrize('module', list(_DEPENDENCY_FREE_MODULES))
+def test_dependency_free_module_is_served(client, module: str) -> None:
+    """The module is reachable at runtime, not merely tagged in index.html."""
+    resp = client.get(f'/static/redux/{module}')
+    assert resp.status_code == 200, (
+        f'expected 200 for /static/redux/{module}, got {resp.status_code} — '
+        'the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+@pytest.mark.parametrize('module', list(_DEPENDENCY_FREE_MODULES))
+def test_dependency_free_module_has_cache_buster(index_html_body: str, module: str) -> None:
+    """The module is present among the VERSIONED redux assets."""
+    assert re.search(rf'/static/redux/{re.escape(module)}\?v=\d+', index_html_body), (
+        f'{module} is not present among the versioned /static/redux/* assets in '
+        f'index.html — {", ".join(_DEPENDENCY_FREE_MODULES[module])} destructure its '
+        'global at top level with no fallback. Bump all /static/redux/* ?v= uniformly.'
+    )
+
+
+@pytest.mark.parametrize(
+    'module, consumer',
+    _DEPENDENCY_FREE_CONSUMER_CASES,
+    ids=[f'{module}-before-{consumer}' for module, consumer in _DEPENDENCY_FREE_CONSUMER_CASES],
+)
+def test_dependency_free_module_loads_before_its_consumers(
+    index_html_body: str, module: str, consumer: str,
+) -> None:
+    """The module defines its global before any consumer destructures it."""
+    assert_script_loads_before(
+        index_html_body,
+        f'/static/redux/{module}',
+        f'/static/redux/{consumer}',
+        before_label=module,
+        after_label=consumer,
+        consumer_note=f'{consumer} ' + _READS_AT_MODULE_SCOPE.format(before=module),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression guard: all /static/redux/* cache-busters share one bumped version
 # ---------------------------------------------------------------------------
 
