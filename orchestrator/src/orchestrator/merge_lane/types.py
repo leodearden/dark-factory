@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import dataclasses
+import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -28,6 +29,8 @@ from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
+
+logger = logging.getLogger(__name__)
 
 
 class MainHealthAutoHealRegistry:
@@ -1485,6 +1488,23 @@ class VerifyWorktreeHandle:
     spec_warm: bool = False
 
 
+@dataclass(frozen=True)
+class VerifyBaseFacts:
+    """The dispatch-time base facts a verify's merge-skew classifier attributes
+    a failure against (task 2383 β).
+
+    ``main_sha`` is the item's FROZEN merge-time ``base_sha``, never a fresh
+    read of main (task 2357) — or, when a variable-depth probe fires, the
+    deeper cumulative tip it probed (task 2359), a relabel that never touches
+    the item.  ``merge_base_sha`` is ``git merge-base`` of ``main_sha`` and
+    the item's ``merged_branch_tip``; ``None`` (unresolvable) skips
+    classification, degrading to INDETERMINATE (I3, fail-open).
+    """
+
+    main_sha: str
+    merge_base_sha: str | None
+
+
 @dataclass
 class InflightEntry:
     """An in-flight verify entry held in SpeculativeMergeWorker._inflight deque.
@@ -1563,6 +1583,10 @@ class InflightEntry:
                      "Head-fail + tip-pass" boundary row).  Never set on a
                      chain LINK — links are landed by the walk and never had
                      an ``InflightEntry`` at all.
+    verify_base    : the :class:`VerifyBaseFacts` this entry's verify forwarded
+                     to classification, published by the verify itself
+                     through :class:`InflightEntrySlot` (task 5447).  ``None``
+                     until resolved, and always ``None`` for passthroughs.
     """
 
     item: SpeculativeItem
@@ -1579,6 +1603,7 @@ class InflightEntry:
     chain_adopted: bool = False             # δ (task 3186): this HEAD lands on a green tip's authority
     verify_wt: VerifyWorktreeHandle | None = None  # δ (task 3186): the verify's POST-swap worktree
     spec_warm: bool = False                 # δ (task 3186): warmth of an ADOPTED head's published merge_wt
+    verify_base: VerifyBaseFacts | None = None
 
     @property
     def vacated(self) -> bool:
@@ -1607,11 +1632,27 @@ class InflightEntrySlot:
 
     Built empty before the verify task for the reason
     :class:`VerifyWorktreeHandle` gives, and filled by ``_dispatch_item`` once
-    the entry exists, so a verify that requeues or drops its request vacates
-    its OWN entry.
+    the entry exists, before the verify first runs, so a verify that requeues
+    or drops its request vacates its OWN entry, and publishes its base facts
+    onto it.
     """
 
     entry: InflightEntry | None = None
+
+    def publish_verify_base(self, facts: VerifyBaseFacts) -> None:
+        """Record *facts* on the entry for ``snapshot()`` (task 5447).
+
+        An empty slot means the fill-before-the-verify-runs ordering broke:
+        warn, as ``_vacate_inflight_entry`` does, rather than leave
+        ``verify_base`` silently ``None``.
+        """
+        if self.entry is None:
+            logger.warning(
+                'verify_base %s not published: _dispatch_item never filled '
+                'the entry slot before the verify ran', facts,
+            )
+            return
+        self.entry.verify_base = facts
 
 
 class VerifyInFlightKind(StrEnum):

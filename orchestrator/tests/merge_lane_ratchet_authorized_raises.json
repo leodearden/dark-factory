@@ -1929,6 +1929,102 @@
       ]
     },
     {
+      "task_id": "5447",
+      "reason": "task 5447: publishes _run_inflight_verify's dispatch-time base facts (VerifyBaseFacts) on snapshot()['entries'][*]['verify_base'] so the task-2357 frozen-main claim is pinned at a public seam; net-additive observation, not a failed refactor",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2152,
+          "current": 2156
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_run_inflight_verify",
+          "baseline": 101,
+          "current": 103
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::snapshot",
+          "baseline": 58,
+          "current": 60
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 1720,
+          "current": 1742
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 21813,
+          "current": 21815
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 921,
+          "current": 935
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4784,
+          "current": 4788
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 56987,
+          "current": 57011
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31829,
+          "current": 31834
+        }
+      ]
+    },
+    {
+      "task_id": "5447",
+      "reason": "amend (reviewer_comprehensive robustness): InflightEntrySlot.publish_verify_base names the dispatch-fills-the-slot-before-the-verify-runs invariant with a warning, as _vacate_inflight_entry does, instead of _run_inflight_verify silently skipping an empty slot; types.py gains the method and a module logger (+19 lines, +7 prose, +1 cognitive) while _run_inflight_verify drops its compound guard (-1 cognitive).",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 63,
+          "current": 64
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 1742,
+          "current": 1761
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 935,
+          "current": 942
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57011,
+          "current": 57030
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31834,
+          "current": 31841
+        }
+      ]
+    },
+    {
       "task_id": "5371",
       "reason": "net-additive restart-drain support: the lane gains an admission halt (halt_admission/resume_admission, gated at the merger pick and pre-dispatch) and an in-flight verify view (_verifies_in_flight, VerifyInFlight) surfaced as snapshot()['restart_drain']; no existing behaviour is refactored",
       "measures": [
@@ -2141,6 +2237,72 @@
           "key": "<cluster>",
           "baseline": 31904,
           "current": 31936
+        }
+      ]
+    },
+    {
+      "task_id": "5447",
+      "reason": "merge main (task 5371 restart-drain) into task/5447: re-absorbs 5447's own net-additive observation -- VerifyBaseFacts on types.py and its publication on snapshot()['entries'][*]['verify_base'] from _run_inflight_verify -- on top of 5371's baseline; the raises are exactly 5447's recorded deltas replayed over main, no new production behaviour",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 65,
+          "current": 66
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2189,
+          "current": 2192
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_run_inflight_verify",
+          "baseline": 101,
+          "current": 102
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::snapshot",
+          "baseline": 59,
+          "current": 61
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 1786,
+          "current": 1827
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22055,
+          "current": 22057
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 941,
+          "current": 962
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4823,
+          "current": 4827
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57293,
+          "current": 57336
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31934,
+          "current": 31946
         }
       ]
     }
