@@ -12,6 +12,7 @@ directory it shares.
 """
 from __future__ import annotations
 
+import argparse
 import sqlite3
 import sys
 from collections.abc import Iterable, Iterator, Mapping
@@ -29,6 +30,10 @@ if __name__ == '__main__':
 from legibility import trickle_state
 
 LEDGER_FILENAME = 'coded-sessions.sqlite'
+
+EXIT_OK = 0
+EXIT_UNREADABLE = 1
+EXIT_NO_LEDGER = 3
 
 _CONNECT_TIMEOUT_SECS = 30.0
 _UNUSABLE_SESSIONS = frozenset({'', 'unknown'})
@@ -78,7 +83,7 @@ VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(session) DO NOTHING
 """
 
-_SELECT = 'SELECT session, coded_by FROM coded_sessions'
+_SELECT = 'SELECT session, coded_by, outcome, coded_at FROM coded_sessions'
 _PRUNE = 'DELETE FROM coded_sessions WHERE coded_at < ?'
 
 
@@ -174,6 +179,11 @@ class LedgerSnapshot:
     rows_by_coded_by: Mapping[CodedBy, int] = field(
         default_factory=lambda: MappingProxyType({}),
     )
+    rows_by_outcome: Mapping[Outcome, int] = field(
+        default_factory=lambda: MappingProxyType({}),
+    )
+    oldest_coded_at: datetime | None = None
+    newest_coded_at: datetime | None = None
     pruned: int = 0
     error: str | None = None
 
@@ -215,14 +225,20 @@ def _read_snapshot(
     conn: sqlite3.Connection, path: Path, state: LedgerState, *, pruned: int = 0,
 ) -> LedgerSnapshot:
     rows = conn.execute(_SELECT).fetchall()
-    counts = {member: 0 for member in CodedBy}
-    for _, coded_by in rows:
-        counts[CodedBy(coded_by)] += 1
+    by_coded_by = {member: 0 for member in CodedBy}
+    by_outcome = {member: 0 for member in Outcome}
+    for _, coded_by, outcome, _ in rows:
+        by_coded_by[CodedBy(coded_by)] += 1
+        by_outcome[Outcome(outcome)] += 1
+    coded_ats = sorted(datetime.fromisoformat(row[3]) for row in rows)
     return LedgerSnapshot(
         path=path,
         state=state,
-        sessions=frozenset(session for session, _ in rows),
-        rows_by_coded_by=MappingProxyType(counts),
+        sessions=frozenset(row[0] for row in rows),
+        rows_by_coded_by=MappingProxyType(by_coded_by),
+        rows_by_outcome=MappingProxyType(by_outcome),
+        oldest_coded_at=coded_ats[0] if coded_ats else None,
+        newest_coded_at=coded_ats[-1] if coded_ats else None,
         pruned=pruned,
     )
 
@@ -277,3 +293,45 @@ def record_codings(path: str | Path, rows: Iterable[LedgerRow]) -> int:
             return conn.executemany(_INSERT, params).rowcount
     except (sqlite3.Error, OSError) as exc:
         raise LedgerError(f'session ledger {path}: {exc}') from exc
+
+
+def _stats_lines(snapshot: LedgerSnapshot) -> list[str]:
+    def moment(value: datetime | None) -> str:
+        return value.isoformat() if value is not None else 'none'
+
+    return [
+        f'ledger: {snapshot.path}',
+        f'rows: {snapshot.total_rows}',
+        *(f'{coded_by}: {count}' for coded_by, count in snapshot.rows_by_coded_by.items()),
+        *(f'{outcome}: {count}' for outcome, count in snapshot.rows_by_outcome.items()),
+        f'oldest coded_at: {moment(snapshot.oldest_coded_at)}',
+        f'newest coded_at: {moment(snapshot.newest_coded_at)}',
+    ]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog='session_ledger.py',
+        description='Inspect the host-local coded-session ledger (read-only).',
+    )
+    commands = parser.add_subparsers(dest='command', required=True)
+    stats = commands.add_parser('stats', help='Row counts for one project ledger.')
+    stats.add_argument('--project-id', required=True)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    snapshot = read_ledger(ledger_path(args.project_id))
+    if snapshot.state is LedgerState.ABSENT:
+        print(f'no ledger yet - no producer has written ({snapshot.path})')
+        return EXIT_NO_LEDGER
+    if snapshot.state is LedgerState.UNREADABLE:
+        print(f'ledger unreadable: {snapshot.error}')
+        return EXIT_UNREADABLE
+    print('\n'.join(_stats_lines(snapshot)))
+    return EXIT_OK
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
