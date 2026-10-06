@@ -93,6 +93,11 @@ def _iter_memory_eval_escalations(
             yield (f'unmatched_escalations[{index}]', escalation)
 
 
+def _is_usable_focus_part(value: Any) -> bool:
+    """``escalation_focus.js::isUsableFocusPart``: a focus queue or id is a non-empty string."""
+    return isinstance(value, str) and value != ''
+
+
 def collect_escalation_id_violations(
     memory_evals_payload: dict[str, Any],
     escalations_payload: dict[str, Any],
@@ -115,21 +120,22 @@ def collect_escalation_id_violations(
     Returns a list of ``{path, id, kind, detail}`` records, empty when every
     link resolves.  ``kind`` is, in the order checked:
 
-    * ``unusable_id``   — the emitted id is ``None``.  Checked FIRST, and a
-      violation regardless of what it collides with: `_escalation_projection`
-      does a bare ``record.get('id')``, so a queue file with no ``id`` field
-      projects ``id: None`` and the link's focus carries an undefined id.
-      `findEscalationRow` refuses such a focus, so the link resolves to no row
-      and the tab shows its miss notice rather than opening an arbitrary row.
-      It is still a violation: no row can make the link work.
-    * ``unscoped``      — the payload names no ``escalation_queue``.  The link
-      renders disabled, so nothing resolves.
+    * ``unusable_id``   — the emitted id is not a non-empty string
+      (``_is_usable_focus_part``, the browser's own test).  Checked FIRST, and
+      a violation regardless of what it collides with: `findEscalationRow`
+      refuses such a focus, so the link resolves to no row and the tab shows
+      its miss notice rather than opening an arbitrary row.  No row can make
+      the link work, not even one carrying the same number at the same type.
+      `_escalation_projection` does a bare ``record.get('id')``, so a queue
+      file with no ``id`` field projects ``id: None``.
+    * ``unscoped``      — the payload names no usable ``escalation_queue``.
+      The link renders disabled, or its focus is refused, so nothing resolves.
     * ``absent``        — no row of the named subsection carries this id.  The
       link dead-ends, even when another subsection carries it.
     * ``ambiguous``     — more than one row of the named subsection carries
       this id.  `findEscalationRow` elects none and the tab opens nothing.
     * ``type_mismatch`` — the one row carries the same id VALUE but at a
-      different Python type (``4242`` vs ``'4242'``).  Distinguished from
+      different Python type (``'4242'`` vs ``4242``).  Distinguished from
       ``absent`` because it is the failure a `==` check cannot see and the
       browser cannot survive: `findEscalationRow` uses `row.id === id` with no
       `String()` coercion, so a str/int drift renders "escalation not found"
@@ -141,9 +147,6 @@ def collect_escalation_id_violations(
       ``type()`` and not ``==``: both payloads read the same JSON, so a future
       one-sided coercion is invisible to a value comparison and would look
       like a clean id space right up until the browser stopped resolving it.
-      A numeric id carried at the same type on both sides reports clean here,
-      although `findEscalationRow` refuses any non-string id; no queue file
-      carried one when this was measured (0 of 14,807, 2026-10-06).
 
     Directionality is deliberate and asserted separately by
     `test_the_id_space_subset_direction_is_asymmetric_by_design`: this checks
@@ -179,30 +182,28 @@ def collect_escalation_id_violations(
     violations: list[dict[str, Any]] = []
     for path, escalation in _iter_memory_eval_escalations(memory_evals_payload):
         emitted = escalation.get('id')
-        if emitted is None:
+        if not _is_usable_focus_part(emitted):
             violations.append({
                 'path': path,
-                'id': None,
+                'id': emitted,
                 'kind': 'unusable_id',
                 'detail': (
-                    f'MEMORY_EVALS {path} carries escalation id None — the queue '
-                    'record has no `id` and `_escalation_projection` passes that '
-                    'through verbatim. findEscalationRow refuses a focus with no '
-                    'usable id, so the link resolves to no row and shows the miss '
-                    'notice. No row can make this id usable; the record itself is '
-                    'the bug.'
+                    f'MEMORY_EVALS {path} carries escalation id {emitted!r}, which is '
+                    'not a non-empty string. findEscalationRow refuses such a focus, '
+                    'so the link resolves to no row and shows the miss notice. No row '
+                    'can make this id usable; the record itself is the bug.'
                 ),
             })
             continue
-        if queue is None:
+        if not _is_usable_focus_part(queue):
             violations.append({
                 'path': path,
                 'id': emitted,
                 'kind': 'unscoped',
                 'detail': (
                     f'MEMORY_EVALS {path} links escalation id {emitted!r}, but the '
-                    'payload names no escalation_queue, so the link renders disabled '
-                    'and resolves nothing.'
+                    f'payload names no usable escalation_queue ({queue!r}), so the '
+                    'link resolves nothing.'
                 ),
             })
             continue
@@ -313,6 +314,9 @@ def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monke
         side and would keep reporting a clean id space after the browser
         stopped resolving it.
 
+    (2') A NON-STRING id that both sides carry at the same type: no drift for
+        a type comparison to see, yet the browser refuses it.
+
     (3) An UNUSABLE id — a queue record with no `id` field at all, which
         `record.get('id')` projects as `None`.  Not a mutation of the producer:
         this arm runs the REAL projection and only writes a degenerate record,
@@ -416,6 +420,22 @@ def test_the_id_space_check_catches_a_divergent_projection(tmp_path: Path, monke
     assert type_violations[0]['id'] == str(numeric_id), (
         f'the violation must carry the EMITTED id, not the on-disk one: {type_violations}'
     )
+
+    # (2') A NON-STRING id at the SAME type on both sides.  Under the REAL
+    #      projection the numeric record reaches MEMORY_EVALS as 4242 and its
+    #      row carries 4242 too, so a type comparison sees no drift.  But
+    #      findEscalationRow refuses any focus id that is not a non-empty
+    #      string, so the link opens nothing, and the mirror must refuse it too.
+    numeric_violations = collect_escalation_id_violations(
+        _build_memory_evals(config), escalations_with_numeric
+    )
+    assert [(v['kind'], v['id']) for v in numeric_violations] == [('unusable_id', numeric_id)], (
+        'a numeric id carried at the same type on both sides must be reported as '
+        'exactly one unusable_id violation: findEscalationRow refuses a non-string '
+        f'id however well the two payloads agree. Got: {numeric_violations}'
+    )
+    # Removed again, so arm (3) sees only its own degenerate record.
+    (esc_dir / f'esc-{numeric_id}.json').unlink()
 
     # (3) UNUSABLE id: a queue record with NO `id` key.  `_escalation_projection`
     #     reads `record.get('id')`, so the projection emits `id: None` and the
