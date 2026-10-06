@@ -867,14 +867,20 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
     (
         # The producer end of the escalation-link contract, and the exact site
-        # `test_memory_evals_escalation_id_contract.py` is built around: the id
-        # handed to `onNavigate` is what `tab_escalations.jsx` resolves with
-        # `row.id === id`.  Not comment-answered today, but the .jsx prose does
-        # discuss the navigation handoff, so one sentence naming the call is all
-        # it would take — which is the latent false pass this entry closes.
-        'escalation link navigates by id',
-        r"onNavigate\(\s*'esc'\s*,\s*escalation\.id\s*\)",
-        (r"onNavigate\(\s*'esc'\s*,\s*escalation\.id\s*\)",),
+        # `test_memory_evals_escalation_id_contract.py` is built around: the
+        # `(queue, id)` descriptor handed to `onNavigate` is what
+        # `escalation_focus.js::findEscalationRow` resolves.  A bare
+        # `escalation.id` second argument does not satisfy it.  The .jsx prose
+        # discusses the navigation handoff, so one sentence naming the call is
+        # all it would take to answer a raw-body grep.
+        'escalation link navigates by queue and id',
+        r"onNavigate\(\s*'esc'\s*,\s*\{\s*queue\s*:\s*payload\.escalation_queue\s*,\s*id\s*:\s*escalation\.id\s*,?\s*\}\s*\)",
+        (r"onNavigate\(\s*'esc'\s*,\s*\{\s*queue\s*:\s*payload\.escalation_queue\s*,\s*id\s*:\s*escalation\.id\s*,?\s*\}\s*\)",),
+    ),
+    (
+        'escalation link opens through its callback',
+        r'onOpenEscalation\(\s*escalation\s*\)',
+        (r'onOpenEscalation\(\s*escalation\s*\)',),
     ),
     (
         # The `MEDF\.` disjunct is a spelling pin that nothing matches today
@@ -3122,7 +3128,7 @@ def test_escalation_link_navigation_is_wired(
     and threads a handler down.
     """
     # (a) the handler wired to <MemoryTab onNavigate={...}> must switch the tab
-    #     AND record the focus id into the SAME state <EscalationsTab focusId=
+    #     AND record the focus into the SAME state <EscalationsTab focus=
     #     {...}> reads.
     #
     #     Every identifier below is DERIVED from the cross-file prop contract,
@@ -3137,16 +3143,16 @@ def test_escalation_link_navigation_is_wired(
     assert handler is not None, (
         'app.jsx must pass a named handler to <MemoryTab onNavigate={...}>.'
     )
-    focus_state = re.search(r'<EscalationsTab[^>]*focusId=\{(\w+)\}', app_jsx_body)
+    focus_state = re.search(r'<EscalationsTab[^>]*\bfocus=\{(\w+)\}', app_jsx_body)
     assert focus_state is not None, (
-        'app.jsx must pass a state variable to <EscalationsTab focusId={...}>.'
+        'app.jsx must pass a state variable to <EscalationsTab focus={...}>.'
     )
     setter = re.search(
         r'const\s*\[\s*' + re.escape(focus_state.group(1)) + r'\s*,\s*(\w+)\s*\]\s*=\s*uS\(',
         app_jsx_body,
     )
     assert setter is not None, (
-        f'the id passed to <EscalationsTab focusId must be React state, but no '
+        f'the focus passed to <EscalationsTab focus must be React state, but no '
         f'`const [{focus_state.group(1)}, set...] = uS(` declaration exists.'
     )
     nav = re.search(
@@ -3160,23 +3166,23 @@ def test_escalation_link_navigation_is_wired(
     )
     nav_body = nav.group(1)
     assert setter.group(1) + '(' in nav_body, (
-        f'`{handler.group(1)}` must record the focus id via `{setter.group(1)}(`, '
+        f'`{handler.group(1)}` must record the focus via `{setter.group(1)}(`, '
         'the same state <EscalationsTab reads. Writing it anywhere else means '
         f'the link switches tab and lands on an unfocused list. Body: {nav_body!r}'
     )
     assert set(re.findall(r'\b(set\w+)\s*\(', nav_body)) - {setter.group(1)}, (
-        f'`{handler.group(1)}` records the focus id but never switches the tab, '
+        f'`{handler.group(1)}` records the focus but never switches the tab, '
         f'so the link highlights an escalation the operator cannot see. '
         f'Body: {nav_body!r}'
     )
 
-    # (b)/(c) the handler reaches MemoryTab and the focus id reaches EscalationsTab.
+    # (b)/(c) the handler reaches MemoryTab and the focus reaches EscalationsTab.
     assert re.search(r'<MemoryTab[^>]*onNavigate=\{', app_jsx_body), (
         'app.jsx must pass onNavigate to <MemoryTab at the `case \'memory\':` '
         'branch — otherwise the section renders its link disabled.'
     )
-    assert re.search(r'<EscalationsTab[^>]*focusId=\{', app_jsx_body), (
-        'app.jsx must pass the focus id into <EscalationsTab.'
+    assert re.search(r'<EscalationsTab[^>]*\bfocus=\{', app_jsx_body), (
+        'app.jsx must pass the focus into <EscalationsTab.'
     )
     assert re.search(r'<EscalationsTab[^>]*onFocusConsumed=\{', app_jsx_body), (
         'app.jsx must pass onFocusConsumed into <EscalationsTab so the focus '
@@ -3193,18 +3199,18 @@ def test_escalation_link_navigation_is_wired(
 
     # (e) tab_escalations.jsx consumes the focus and clears it.
     assert re.search(
-        r'function\s+EscalationsTab\s*\(\s*\{[^}]*\bfocusId\b', tab_escalations_jsx_body
-    ), 'EscalationsTab must accept a `focusId` prop.'
+        r'function\s+EscalationsTab\s*\(\s*\{[^}]*\bfocus\b', tab_escalations_jsx_body
+    ), 'EscalationsTab must accept a `focus` prop.'
     assert re.search(
         r'function\s+EscalationsTab\s*\(\s*\{[^}]*\bonFocusConsumed\b',
         tab_escalations_jsx_body,
     ), 'EscalationsTab must accept an `onFocusConsumed` prop.'
     effect = re.search(
-        r'uE\(\(\)\s*=>\s*\{([\s\S]{0,900}?)\n\s*\},\s*\[[^\]]*focusId[^\]]*\]\)',
+        r'uE\(\(\)\s*=>\s*\{([\s\S]{0,900}?)\n\s*\},\s*\[[^\]]*\bfocus\b[^\]]*\]\)',
         tab_escalations_jsx_body,
     )
     assert effect is not None, (
-        'EscalationsTab must run a `uE` effect keyed on `focusId`.'
+        'EscalationsTab must run a `uE` effect keyed on `focus`.'
     )
     eff = effect.group(1)
     assert 'setSelected(' in eff, (
@@ -3221,14 +3227,76 @@ def test_escalation_link_navigation_is_wired(
 
     # (f) the producer end of the contract, re-asserted here — over
     #     COMMENT-STRIPPED source, and through `_PRESENCE_CONTRACTS` so the
-    #     mutation guard covers it.  The id this call passes is what
-    #     tab_escalations.jsx resolves with `row.id === id`, which is the
-    #     contract `test_memory_evals_escalation_id_contract.py` checks on the
-    #     payload side; a sentence in the .jsx prose naming the call must not be
-    #     able to stand in for the call.
+    #     mutation guard covers it.  The descriptor this call passes is what
+    #     escalation_focus.js::findEscalationRow resolves by `(queue, id)`, which
+    #     is the contract `test_memory_evals_escalation_id_contract.py` checks on
+    #     the payload side; a sentence in the .jsx prose naming the call must not
+    #     be able to stand in for the call.
     code = tab_memory_evals_jsx_code
     assert re.search(
-        _presence_pattern('escalation link navigates by id', code), code, re.MULTILINE
+        _presence_pattern('escalation link navigates by queue and id', code), code, re.MULTILINE
     ), (
-        "tab_memory_evals.jsx's link must call onNavigate('esc', escalation.id)."
+        "tab_memory_evals.jsx's link must call "
+        "onNavigate('esc', { queue: payload.escalation_queue, id: escalation.id })."
     )
+
+
+def test_memory_eval_links_open_through_one_queue_bound_callback(
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """The section binds the payload's queue once; every link opens through it.
+
+    The queue is a payload-level fact (`MEMORY_EVALS.escalation_queue`), so
+    `MemoryEvalsSection` reads it where it reads the payload and hands the inner
+    components one `onOpenEscalation(escalation)` callback.  The leaf never
+    learns the `'esc'` tab id or the descriptor's shape.  With no queue named
+    there is no callback, so the link renders disabled rather than matching
+    across queues.
+    """
+    code = tab_memory_evals_jsx_code
+    section = extract_function_body(code, 'MemoryEvalsSection')
+
+    # (a) the descriptor is built in the section, from the payload's queue.
+    assert re.search(
+        _presence_pattern('escalation link navigates by queue and id', code), section
+    ), 'MemoryEvalsSection must build the (queue, id) descriptor it hands onNavigate.'
+
+    # (b) no queue, no callback: the descriptor is gated on the queue.
+    assert re.search(r'&&\s*payload\.escalation_queue\b|payload\.escalation_queue\s*\?', section), (
+        'the bound callback must exist only when the payload names its queue; '
+        'without one the link has nothing to scope its lookup by.'
+    )
+
+    # (c) onNavigate never leaves the section, so no leaf knows the tab id.
+    signature = re.compile(r'function\s+MemoryEvalsSection\s*\(\s*\{[^}]*\}\s*\)')
+    outside = signature.sub('', code.replace(section, ''))
+    assert 'onNavigate' not in outside, (
+        'onNavigate is referenced outside MemoryEvalsSection. The inner components '
+        'take the queue-bound onOpenEscalation callback instead.'
+    )
+
+    # (d) every inner component that renders a link receives the bound callback.
+    for component in ('StormBanner', 'MemoryEvalCard', 'UnmatchedEscalations'):
+        assert re.search(rf'<{component}\b[^>]*\bonOpenEscalation=\{{', section), (
+            f'MemoryEvalsSection must pass onOpenEscalation to <{component}>.'
+        )
+    card = extract_function_body(code, 'MemoryEvalCard')
+    assert re.search(r'<MemoryEvalMetricRow\b[^>]*\bonOpenEscalation=\{', card), (
+        'MemoryEvalCard must pass onOpenEscalation on to <MemoryEvalMetricRow>.'
+    )
+
+    # (e) the link opens through the callback, and is disabled without it.
+    signature_props = re.search(r'function\s+EscalationLink\s*\(\s*\{([^}]*)\}', code)
+    assert signature_props is not None and re.search(
+        r'\bonOpenEscalation\b', signature_props.group(1)
+    ), 'EscalationLink must take an `onOpenEscalation` prop.'
+    link = extract_function_body(code, 'EscalationLink')
+    assert re.search(
+        _presence_pattern('escalation link opens through its callback', code), link
+    ), 'EscalationLink must call onOpenEscalation(escalation).'
+    disabled = re.search(r'disabled=\{\s*!\s*(\w+)\s*\}', link)
+    assert disabled is not None, 'EscalationLink must render `disabled={!...}`.'
+    gate = disabled.group(1)
+    assert gate == 'onOpenEscalation' or re.search(
+        rf'const\s+{re.escape(gate)}\s*=\s*!!\s*onOpenEscalation\b', link
+    ), f'EscalationLink is disabled on `{gate}`, which is not derived from onOpenEscalation.'

@@ -16,6 +16,7 @@ from _dashboard_helpers import (
     extract_function_body,
     find_script_position,
     strip_js_comments,
+    walk_balanced,
 )
 
 # ---------------------------------------------------------------------------
@@ -933,13 +934,13 @@ def test_focus_handoff_retries_then_reports_a_miss(
 
     Two halves of one defect in the focus effect:
 
-    (1) It consumes `focusId` UNCONDITIONALLY.  On a miss the operator — who
+    (1) It consumes `focus` UNCONDITIONALLY.  On a miss the operator — who
         just clicked an escalation link over in the memory-evals section —
         lands on the Escalations tab with nothing selected and no explanation.
         A dead click with zero feedback is exactly the silent degradation this
         repo's loud-over-silent norm exists to prevent.
 
-    (2) It is keyed only on `[focusId]`, so the lookup runs ONCE.  `DF.ESCALATIONS`
+    (2) It is keyed only on `[focus]`, so the lookup runs ONCE.  `DF.ESCALATIONS`
         starts as data.js's seed (`subsections: []`) and `applyKey` replaces the
         reference wholesale on the first successful poll — ESCALATIONS is
         deliberately not in STABLE_ARRAY_KEYS (data.js:96-105).  So on a cold
@@ -951,32 +952,51 @@ def test_focus_handoff_retries_then_reports_a_miss(
     """
     code = tab_escalations_jsx_code
 
-    # (a) module-scope helpers exist AND are called. Naming a helper and then
-    #     never calling it is the dead-code failure the `trendGaps` precedent
-    #     in test_tab_memory_evals.py:1311-1318 guards against.
-    for helper in ('findEscalationRow', 'escalationsLoaded'):
-        assert re.search(rf'\bfunction\s+{helper}\s*\(', code), (
-            f'tab_escalations.jsx must define `function {helper}(`. Lifting the '
-            'row search and the payload-arrival check to module scope is what '
-            'keeps the focus effect small enough to stay under the 900-char cap '
-            'the cross-tab contract test (test_tab_memory_evals.py) matches on.'
-        )
-        assert len(re.findall(rf'\b{helper}\s*\(', code)) >= 2, (
-            f'`{helper}` is defined but never called.'
-        )
+    # (a) the payload-arrival check is a module-scope helper AND is called.
+    #     Naming a helper and then never calling it is the dead-code failure the
+    #     `trendGaps` precedent in test_tab_memory_evals.py guards against.
+    #     Lifting it out is what keeps the focus effect under the 900-char cap
+    #     the cross-tab contract test (test_tab_memory_evals.py) matches on.
+    assert re.search(r'\bfunction\s+escalationsLoaded\s*\(', code), (
+        'tab_escalations.jsx must define `function escalationsLoaded(`.'
+    )
+    assert len(re.findall(r'\bescalationsLoaded\s*\(', code)) >= 2, (
+        '`escalationsLoaded` is defined but never called.'
+    )
+
+    # (a') the row lookup is escalation_focus.js's, never a local copy: that
+    #      module is the one home of the (queue, id) rule and its node tests.
+    assert not re.search(r'\bfunction\s+findEscalationRow\s*\(', code), (
+        'tab_escalations.jsx defines its own `function findEscalationRow(`, which '
+        'would shadow the (queue, id) lookup in escalation_focus.js.'
+    )
+    assert re.search(
+        r'const\s*\{[^}]*\bfindEscalationRow\b[^}]*\}\s*=\s*window\.DF_ESCALATION_FOCUS\s*;',
+        code,
+    ), 'tab_escalations.jsx must destructure findEscalationRow from window.DF_ESCALATION_FOCUS.'
 
     # Extract the focus effect the same way the cross-tab contract test does,
     # so the two cannot drift apart on what "the focus effect" means.
     effect = re.search(
-        r'uE\(\(\)\s*=>\s*\{([\s\S]{0,900}?)\n\s*\},\s*\[([^\]]*focusId[^\]]*)\]\)',
+        r'uE\(\(\)\s*=>\s*\{([\s\S]{0,900}?)\n\s*\},\s*\[([^\]]*\bfocus\b[^\]]*)\]\)',
         code,
     )
     assert effect is not None, (
-        'no `uE` effect keyed on `focusId` found within the 900-char body cap. '
+        'no `uE` effect keyed on `focus` found within the 900-char body cap. '
         'If the effect body outgrew the cap, the cross-tab handoff contract '
         'test in test_tab_memory_evals.py has silently stopped matching too.'
     )
     eff, deps = effect.group(1), effect.group(2)
+
+    # (a'') the effect resolves the focus through the module and reads BOTH
+    #       outcomes it reports: the elected row and every candidate.
+    assert re.search(r'\bfindEscalationRow\s*\(', eff), (
+        'the focus effect must resolve the focus with findEscalationRow.'
+    )
+    for member in ('row', 'candidates'):
+        assert re.search(rf'\.{member}\b', eff), (
+            f'the focus effect must read the lookup\'s `.{member}`.'
+        )
 
     # (b) the effect DECLINES to decide before the payload arrives.
     assert re.search(r'if\s*\(\s*!\s*escalationsLoaded\s*\([^)]*\)\s*\)\s*\{?\s*return', eff), (
@@ -1018,7 +1038,7 @@ def test_focus_handoff_retries_then_reports_a_miss(
         'take a distinct path, not fall through to the one a hit takes.'
     )
     branch = no_row_branch.group(1)
-    miss_state = None
+    miss_state = miss_setter = None
     for decl in re.finditer(r'const\s*\[\s*(\w+)\s*,\s*(\w+)\s*\]\s*=\s*uS\(', code):
         state, setter = decl.group(1), decl.group(2)
         if not re.search(r'\b' + re.escape(setter) + r'\s*\(', branch):
@@ -1030,7 +1050,7 @@ def test_focus_handoff_retries_then_reports_a_miss(
             code,
         ):
             continue
-        miss_state = state
+        miss_state, miss_setter = state, setter
         break
     assert miss_state is not None, (
         'no `uS` state is both written by the focus effect\'s no-row branch and '
@@ -1043,17 +1063,76 @@ def test_focus_handoff_retries_then_reports_a_miss(
     #     `pending` needs its own state because with the endpoint in backoff the
     #     payload never leaves the seed: a miss-only fix leaves precisely the
     #     cold-load case silent, which is half the defect.
-    for testid in ('esc-focus-miss', 'esc-focus-pending'):
+    for testid in ('esc-focus-miss', 'esc-focus-pending', 'esc-focus-ambiguous'):
         assert f'data-testid="{testid}"' in code, (
             f'the tab must render a `data-testid="{testid}"` notice.'
         )
 
-    # (f) the stale-drawer invariant survives: the focus is still consumed.
-    assert 'onFocusConsumed' in eff, (
+    # Both name the id the operator followed: the miss records `focus.id`, and
+    # the pending notice renders it directly.
+    assert re.search(re.escape(miss_setter) + r'\(\s*focus\.id\s*\)', branch), (
+        f'the no-row branch must record the followed id, `{miss_setter}(focus.id)`.'
+    )
+    assert re.search(
+        r'\{\s*focus\s*&&[\s\S]{0,200}?data-testid="esc-focus-pending"[\s\S]{0,300}?\{\s*focus\.id\s*\}',
+        code,
+    ), 'the pending notice must be gated on `focus` and name `focus.id`.'
+
+    # (f) the stale-drawer invariant survives: the focus is consumed on EVERY
+    #     path, so the call sits outside the branches, at the effect's top level.
+    consumed = re.search(r'\bonFocusConsumed\s*\(', eff)
+    assert consumed is not None, (
         'the focus effect must still call onFocusConsumed() once a decision is '
         'reachable — leaving the focus set would reopen a stale drawer on every '
         'later visit to this tab.'
     )
+    prefix = eff[:consumed.start()]
+    assert prefix.count('{') == prefix.count('}'), (
+        'onFocusConsumed() is called inside a branch of the focus effect, so some '
+        'outcome leaves the focus set. Call it once, after the branches.'
+    )
+
+    # (g) a TIE is its own outcome. The ambiguity notice is gated on a state
+    #     that only the `candidates.length > 1` branch sets to a value: the
+    #     lookup never elects a row, and nothing else may claim ambiguity.
+    many = re.search(r'candidates\.length\s*>\s*1\s*\)\s*\{', eff)
+    assert many is not None, (
+        'the focus effect has no `candidates.length > 1` branch for a tie.'
+    )
+    many_block = walk_balanced(eff, many.end() - 1)
+    many_span = (many.end() - 1, many.end() - 1 + len(many_block))
+    ambiguous = None
+    for decl in re.finditer(r'const\s*\[\s*(\w+)\s*,\s*(\w+)\s*\]\s*=\s*uS\(', code):
+        gate = re.search(
+            r'\{\s*' + re.escape(decl.group(1)) + r'\s*&&[\s\S]{0,400}?data-testid="esc-focus-ambiguous"',
+            code,
+        )
+        if gate:
+            ambiguous = (decl.group(1), decl.group(2), gate.start())
+            break
+    assert ambiguous is not None, (
+        'no `uS` state gates the `data-testid="esc-focus-ambiguous"` notice.'
+    )
+    _state, amb_setter, gate_at = ambiguous
+    valued = [
+        call for call in re.finditer(re.escape(amb_setter) + r'\(\s*([^)]*?)\s*\)', eff)
+        if call.group(1) != 'null'
+    ]
+    assert valued, f'the focus effect never sets `{amb_setter}` to a value.'
+    for call in valued:
+        assert many_span[0] <= call.start() < many_span[1], (
+            f'`{amb_setter}({call.group(1)})` is reached outside the '
+            '`candidates.length > 1` branch, so the notice could claim a tie '
+            'that the lookup did not report.'
+        )
+        assert 'focus.id' in call.group(1) and 'candidates.length' in call.group(1), (
+            f'the ambiguity notice must name the followed id and the count: '
+            f'`{amb_setter}({call.group(1)})`.'
+        )
+    notice = code[gate_at:gate_at + 1200]
+    assert re.search(
+        r'<button[\s\S]{0,300}?' + re.escape(amb_setter) + r'\(\s*null\s*\)', notice
+    ), 'the ambiguity notice must carry a dismiss control that clears it.'
 
 
 def test_payload_arrival_read_from_a_first_success_marker_not_object_identity(
