@@ -38,14 +38,16 @@ read-only doctor mode that prints a per-unit staleness table and performs
 no mutating systemctl calls.
 
 Each tick also runs scripts/check_dashboard_unit_parity.py, read-only and at
-most hourly (unit_parity_pass()), and logs a WARNING when the installed
-dashboard units have drifted from their committed copies.
+most hourly (unit_parity_pass()), and logs a WARNING when the checker reports
+the installed dashboard units drifted, overridden by a drop-in, or missing a
+committed counterpart.
 
 Invoked by scripts/orchestrator-watchdog.service (launched via
 scripts/orchestrator-watchdog.timer).
 """
 
 import contextlib
+import enum
 import json
 import math
 import os
@@ -505,11 +507,29 @@ except (KeyError, ValueError):
 
 UNIT_PARITY_TIMEOUT_SECS = 30
 
+
+class UnitParityVerdict(enum.StrEnum):
+    """What unit_parity_verdict() concluded; its value is the --report row's word.
+
+    DRIFT is the checker's exit 1, which covers three findings its report tags
+    apart: [drift], [override] (a drop-in) and [vanished] (a committed unit).
+    """
+
+    PARITY = "parity"
+    DRIFT = "drift"
+    ABSENT = "absent"
+    UNKNOWN = "unknown"
+
+
 # The checker's documented exit codes, believed only once DASHBOARD_PARITY_TAG
 # shows it reported: exit 2 is also python3's can't-open-file and argparse's
 # usage-error status, and an uncaught traceback exits 1. Any other code is
-# not a parity claim and reads as 'unknown'.
-UNIT_PARITY_VERDICTS = {0: "parity", 1: "drift", 2: "absent"}
+# not a parity claim and reads as UNKNOWN.
+UNIT_PARITY_VERDICTS: dict[int, UnitParityVerdict] = {
+    0: UnitParityVerdict.PARITY,
+    1: UnitParityVerdict.DRIFT,
+    2: UnitParityVerdict.ABSENT,
+}
 
 
 def log(msg: str) -> None:
@@ -1940,16 +1960,16 @@ def _within_unit_parity_min_interval() -> bool:
     return _within_min_interval(UNIT_PARITY_MIN_INTERVAL_SECS, _read_last_unit_parity_epoch)
 
 
-def unit_parity_verdict() -> tuple[str, str]:
+def unit_parity_verdict() -> tuple[UnitParityVerdict, str]:
     """Run the dashboard unit-parity checker; return ``(verdict, report)``.
 
-    *verdict* is one of 'parity' / 'drift' / 'absent' (the checker's own exit
-    codes 0/1/2, see UNIT_PARITY_VERDICTS) or 'unknown' when the checker could
-    not run, ran but produced no DASHBOARD_PARITY_TAG report of its own, or
-    exited with anything else. The tag is checked FIRST, as
+    *verdict* is PARITY / DRIFT / ABSENT (the checker's own exit codes 0/1/2,
+    see UNIT_PARITY_VERDICTS) or UNKNOWN when the checker could not run, ran
+    but produced no DASHBOARD_PARITY_TAG report of its own, or exited with
+    anything else. The tag is checked FIRST, as
     scripts/setup-host.sh::_parity_verdict does. *report* is the checker's
-    combined stdout and stderr — how an operator learns WHICH directive
-    drifted, or why the checker did not report.
+    combined stdout and stderr — how an operator learns WHICH finding it
+    made, or why the checker did not report.
 
     ``--installed-dir`` is deliberately not passed: the checker's own default
     is the one setup-host.sh gates against, and re-deriving it here would be a
@@ -1967,18 +1987,18 @@ def unit_parity_verdict() -> tuple[str, str]:
             timeout=UNIT_PARITY_TIMEOUT_SECS,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        return "unknown", f"{type(exc).__name__}: {exc}"
+        return UnitParityVerdict.UNKNOWN, f"{type(exc).__name__}: {exc}"
     report = "\n".join(
         part.strip() for part in (result.stdout, result.stderr) if part and part.strip()
     )
     if DASHBOARD_PARITY_TAG not in report:
-        return "unknown", (
+        return UnitParityVerdict.UNKNOWN, (
             f"checker produced no {DASHBOARD_PARITY_TAG} report "
             f"(exit {result.returncode}): {report or 'no output'}"
         )
     verdict = UNIT_PARITY_VERDICTS.get(result.returncode)
     if verdict is None:
-        return "unknown", f"checker exited {result.returncode}: {report}"
+        return UnitParityVerdict.UNKNOWN, f"checker exited {result.returncode}: {report}"
     return verdict, report
 
 
@@ -1991,7 +2011,7 @@ def unit_parity_pass() -> None:
 
     The clock is stamped on ATTEMPT, before the checker runs, so a
     persistently broken checker is retried hourly rather than on every tick.
-    Only 'drift' is a WARNING. 'absent' is silent: the dashboard units are not
+    Only DRIFT is a WARNING. ABSENT is silent: the dashboard units are not
     installed on this host, which setup-host.sh already treats as benign. A
     checker that could not run gets one plain line, so a broken gate stays
     distinguishable from a green one.
@@ -2003,12 +2023,13 @@ def unit_parity_pass() -> None:
             return
         _stamp_clock(UNIT_PARITY_CLOCK_PATH)
         verdict, report = unit_parity_verdict()
-        if verdict == "drift":
+        if verdict == UnitParityVerdict.DRIFT:
             log(
-                "WARNING: dashboard unit parity: the installed dashboard units "
-                f"have drifted from their committed copies:\n{report}"
+                "WARNING: dashboard unit parity: directive drift, a drop-in "
+                "override, or a vanished committed unit — the checker's "
+                f"[drift] / [override] / [vanished] report says which:\n{report}"
             )
-        elif verdict == "unknown":
+        elif verdict == UnitParityVerdict.UNKNOWN:
             log(f"dashboard unit parity: checker could not run, parity unknown: {report}")
     except Exception as exc:  # noqa: BLE001
         log(f"dashboard unit parity pass error: {exc!r}")
@@ -3148,22 +3169,22 @@ def _print_unit_parity() -> None:
     writes no clock, so running --report never shifts the timer path's
     cadence.
 
-    On 'drift' the checker's own report follows the row, naming the drifted
-    directive without a second command; on 'unknown' the reason the checker
-    could not run follows it instead.
+    On DRIFT the checker's own tagged report follows the row, naming the
+    finding without a second command; on UNKNOWN the reason the checker could
+    not run follows it instead.
 
     Informational only, like the fm row: never alters report()'s exit code.
-    An unexpected failure degrades the verdict to a logged 'unknown' rather
+    An unexpected failure degrades the verdict to a logged UNKNOWN rather
     than crashing --report after report() has already computed its exit code.
     """
     try:
         verdict, detail = unit_parity_verdict()
     except Exception as exc:  # noqa: BLE001
         log(f"watchdog error printing the dashboard unit parity row: {exc}")
-        verdict, detail = "unknown", ""
+        verdict, detail = UnitParityVerdict.UNKNOWN, ""
     checker = os.path.relpath(DASHBOARD_PARITY_SCRIPT, REPO_DIR)
     print(f"dashboard unit parity: {verdict} | CHECKER: {checker}")
-    if verdict in ("drift", "unknown") and detail:
+    if verdict in (UnitParityVerdict.DRIFT, UnitParityVerdict.UNKNOWN) and detail:
         print(detail)
 
 

@@ -1662,9 +1662,9 @@ throttle), gated by its own clock `ORCH_UNIT_PARITY_CLOCK` (default
 `data/orchestrator/last_unit_parity_check.json`). That clock is independent
 of every deploy clock, and it is stamped on each *attempt*, so a broken
 checker is retried hourly rather than on every tick. The pass logs a
-`WARNING` only on drift, one plain line when the checker could not run or
-did not report, and nothing on parity or when the dashboard units are not
-installed on the host:
+`WARNING` only on the checker's exit 1 (the `drift` verdict below), one
+plain line when the checker could not run or did not report, and nothing on
+parity or when the dashboard units are not installed on the host:
 
 ```bash
 journalctl --user -t orchestrator-watchdog | grep 'unit parity'
@@ -1684,8 +1684,9 @@ guards that set for completeness: every directive a committed unit declares
 must be compared or explicitly waived with a reason. Other `ExecStart`
 tokens, such as `uv run --no-sync`, are not compared.
 
-**Remediation.** The check is detection only; there is no `--fix`. On
-drift, take one of two safe paths:
+**Remediation.** The check is detection only; there is no `--fix`.
+`[override]` and `[vanished]` findings name their own fix in the checker's
+report. On a `[drift]` finding, take one of two safe paths:
 
 - Re-run `scripts/setup-host.sh`. Since task 4793 it renders the dashboard
   unit through `scripts/render_systemd_unit.py`, which preserves this host's
@@ -1759,8 +1760,11 @@ one of:
 
 - **`parity`** — the installed units match their committed copies on every
   registered directive.
-- **`drift`** — one or more compared directives disagree. The checker's own
-  report follows the row, naming the directive.
+- **`drift`** — the checker exited 1, which covers three findings: a
+  compared directive disagrees (`[drift]`), an installed unit carries a
+  drop-in override (`[override]`), or a committed unit was not found
+  (`[vanished]`). The checker's own report follows the row; its tag says
+  which, and each tag's block names its own remediation.
 - **`absent`** — the dashboard units are not installed on this host. This is
   benign, the same reading `setup-host.sh` gives a *tagged* exit 2 from the
   checker.

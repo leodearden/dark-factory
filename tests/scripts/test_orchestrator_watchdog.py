@@ -12502,6 +12502,9 @@ def test_unit_parity_verdict_classifies_the_checkers_exit_code(
     got_verdict, report = wdog.unit_parity_verdict()
 
     assert got_verdict == verdict
+    assert isinstance(got_verdict, wdog.UnitParityVerdict), (
+        f"verdicts are a closed type so a misspelled comparison fails pyright: {got_verdict!r}"
+    )
     assert "SuccessExitStatus" in report, f"stdout must reach the report: {report!r}"
     assert "checker stderr line" in report, f"stderr must reach the report: {report!r}"
 
@@ -12685,6 +12688,32 @@ def test_unit_parity_pass_warns_once_on_drift_with_the_checkers_report(
     assert "WARNING" in line, line
     assert "unit parity" in line, line
     assert "REPORT-TEXT naming [Service] SuccessExitStatus" in line, line
+
+
+@pytest.mark.parametrize("tag", ["[drift]", "[override]", "[vanished]"])
+def test_unit_parity_pass_warning_headline_names_every_exit_1_case(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, tag: str
+) -> None:
+    """The checker exits 1 for three findings, so the headline must not name only one.
+
+    A drop-in override or a vanished committed unit is not a directive diff,
+    and a headline asserting drift would send the operator to the wrong fix.
+    End to end through a faked checker, so it is the real verdict that reaches
+    the headline.
+    """
+    wdog = _load_watchdog()
+    _isolate_unit_parity(wdog, monkeypatch, tmp_path)
+    lines: list[str] = []
+    monkeypatch.setattr(wdog, "log", lines.append)
+    report = f"[dashboard_unit_parity] {tag} finding\n"
+    monkeypatch.setattr(subprocess, "run", _checker_run([], returncode=1, stdout=report))
+
+    wdog.unit_parity_pass()
+
+    assert len(lines) == 1, lines
+    headline = lines[0].split("\n", 1)[0]
+    assert "WARNING" in headline, headline
+    assert tag in headline, f"the headline must name the {tag} case: {headline!r}"
 
 
 @pytest.mark.parametrize("verdict", ["parity", "absent"])
