@@ -5263,13 +5263,14 @@ class ReconciliationHarness:
             # sensitivity to a mixed burst (see this task's plan
             # design_decisions), and a genuinely sustained single-cause outage
             # still fires its own alarm at the same threshold as before the
-            # split. test_maybe_remediate_mixed_drop_causes_below_threshold_neither_storm_escalates
-            # (test_harness.py) pins the current, reduced-coverage-on-mixed-
-            # bursts behaviour so a future reader sees it as a decision, not a
-            # bug. If mixed-cause bursts under each per-cause threshold prove to
-            # matter operationally, the fix is a THIRD StormCounter fed by BOTH
-            # loops below, whose escalation names both per-cause counts — not
-            # raising these two thresholds, which would blunt each alarm's own
+            # split.
+            # fused-memory/tests/test_harness.py::test_maybe_remediate_mixed_phantom_and_placeholder_drops_below_threshold_neither_storm_escalates
+            # pins the current, reduced-coverage-on-mixed-bursts behaviour so a
+            # future reader sees it as a decision, not a bug. If mixed-cause
+            # bursts under each per-cause threshold prove to matter
+            # operationally, the fix is a THIRD StormCounter fed by BOTH loops
+            # below, whose escalation names both per-cause counts — not raising
+            # these two thresholds, which would blunt each alarm's own
             # single-cause sensitivity instead of restoring aggregate coverage.
             for finding in dropped_phantom_cited:
                 logger.warning(
