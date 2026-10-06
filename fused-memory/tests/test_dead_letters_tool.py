@@ -16,6 +16,7 @@ from fused_memory.models.reconciliation import (
     EventType,
     ReconciliationEvent,
 )
+from fused_memory.reconciliation.event_journal import EventJournal
 from fused_memory.reconciliation.event_queue import EventQueue
 from fused_memory.server.tools import (
     _DEAD_LETTER_PAYLOAD_MAX_BYTES,
@@ -854,15 +855,22 @@ class TestReplayEventDeadLettersTool:
     @pytest.mark.asyncio
     async def test_replays_dead_lettered_events_back_into_queue(self, tmp_path):
         """With dead-lettered recon events present, the tool returns
-        {'status':'replayed','replayed':N,'failed':0} and the events re-enter
-        the queue (drainer commits them to the buffer; file is cleared)."""
+        {'status':'replayed','replayed':3,'failed':0}, every replayed event is
+        durably back in the queue (journaled, observed with the drainer held
+        parked so the state is settled rather than raced), and the dead-letter
+        file no longer holds them.
+
+        The drainer's commit of replayed events is covered by
+        fused-memory/tests/test_event_queue.py::test_replay_dead_letters_reenqueues_and_clears.
+        """
         dl = tmp_path / 'dl.jsonl'
+        ej = tmp_path / 'ej.db'
         released = asyncio.Event()
         buf = _make_parked_buf(released)
         eq = EventQueue(
             buf,
             dead_letter_path=dl,
-            journal_path=tmp_path / 'ej.db',
+            journal_path=ej,
             maxsize=100,
             retry_initial_seconds=0.01,
             retry_max_seconds=0.05,
@@ -871,10 +879,9 @@ class TestReplayEventDeadLettersTool:
         await eq.start()
         try:
             # Seed 3 dead-letter records for proj-a directly.
-            for _ in range(3):
-                eq._write_dead_letter(
-                    _make_recon_event('proj-a'), reason='non_retriable', attempts=1,
-                )
+            seeded = [_make_recon_event('proj-a') for _ in range(3)]
+            for event in seeded:
+                eq._write_dead_letter(event, reason='non_retriable', attempts=1)
             assert len(dl.read_text().strip().splitlines()) == 3
 
             svc = AsyncMock()
@@ -888,8 +895,15 @@ class TestReplayEventDeadLettersTool:
             assert result == {'status': 'replayed', 'replayed': 3, 'failed': 0}, (
                 f'Unexpected replay result: {result}'
             )
-            # Drainer commits the replayed events to the buffer.
-            await asyncio.wait_for(eq._queue.join(), timeout=2.0)
+            reader = EventJournal(ej)
+            try:
+                journaled_ids = {e.id for e in reader.load_unprocessed()}
+            finally:
+                reader.close()
+            seeded_ids = {e.id for e in seeded}
+            assert journaled_ids == seeded_ids, (
+                f'journaled ids {journaled_ids} != replayed ids {seeded_ids}'
+            )
             # The dead-letter file no longer holds the replayed records.
             assert (dl.read_text().strip() if dl.exists() else '') == ''
         finally:
@@ -958,7 +972,6 @@ class TestReplayEventDeadLettersTool:
                 'put_nowait was invoked off the event-loop thread during replay: '
                 f'loop={loop_thread_id} put_threads={put_threads}'
             )
-            await asyncio.wait_for(eq._queue.join(), timeout=2.0)
         finally:
             released.set()
             await eq.close()
