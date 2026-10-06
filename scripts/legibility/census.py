@@ -105,6 +105,7 @@ import filing_policy  # noqa: E402
 from legibility import (  # noqa: E402
     census_trigger,
     census_window,
+    digest,
     session_ledger,
     session_runner,
     unlanded,
@@ -1045,15 +1046,12 @@ class VerifyCoverage:
     records, not verified clusters), so ``_find_pending_candidate_id`` can
     still find them.
 
-    That pickup is CONDITIONAL, not automatic, and the report says so:
-    pending candidates are absent from ``coder.build_codebook_index``
-    (entries only), so a recurrence does re-emerge as a novel cluster and
-    gets promoted against the pending id -- but the sightings that produced
-    the deferred cluster in THIS window are never re-mined, because
-    ``advance_census_state`` re-anchors the next window at this run's
-    ``last_census_at``. A deferred cluster is therefore re-adjudicated only
-    if the same confusion RECURS; a one-off deferred by the cap sits pending
-    until a human adjudicates it.
+    That pickup is CONDITIONAL, not automatic, and the report says so: the
+    sessions behind a deferred cluster were coded, so they are ledgered and
+    never re-mined. Pending candidates are absent from
+    ``coder.build_codebook_index`` (entries only), so a RECURRENCE re-emerges
+    as a novel cluster and is promoted against the pending id; a one-off
+    deferred by the cap sits pending until a human adjudicates it.
 
     ``offered``, deliberately, and NOT ``verified``: this is a COST
     record, counting verify_fn calls made, and a cluster handed to the
@@ -2132,9 +2130,8 @@ class CensusOutcome:
     """How many novel clusters were left unadjudicated by a ``"verify"``
     deferral -- the hitting cluster plus every one never attempted.
 
-    NOT a loss count: because the abort happens before
-    ``advance_census_state``, ``last_census_at`` is untouched and these
-    sightings are re-mined by the next run. It is the size of the work the
+    NOT a loss count: a deferred run persists and ledgers nothing, so these
+    sessions are re-mined by the next run. It is the size of the work the
     cap interrupted, which is what makes a defer legible next to an
     ordinary run in which the verifier genuinely rejected everything."""
 
@@ -2180,6 +2177,19 @@ class CensusOutcome:
     released_entry_ids: tuple[str, ...] = ()
     """Withheld codebook entries filed this run because they recurred, each
     now marked ``filing: filed``."""
+
+    run_id: str | None = None
+    record_path: str | None = None
+    """The JSON record the report was rendered from; ``None`` exactly when
+    ``report_path`` is."""
+
+    ledger_rows_written: int | None = None
+    """Sessions this run newly ledgered as coded; ``None`` when it ledgered
+    nothing (no mining window, an unlanded commit, or a failed write)."""
+
+    ledger_write_error: str | None = None
+    """Why a landed run's codings could not be ledgered, naming the ledger
+    path; those sessions are re-mined by the next census."""
 
 
 def _defer(
@@ -2311,7 +2321,9 @@ def _unlanded(
         escalate_fn(category="infra_issue", severity="info", summary=summary, detail=detail)
     except Exception as exc:  # noqa: BLE001 - best-effort; the error line above is the real signal
         logger.warning("census: unlanded-commit escalation failed (best-effort): %s", exc)
-    return replace(landed, status="unlanded", report_path=None, rollback=rollback)
+    return replace(
+        landed, status="unlanded", report_path=None, record_path=None, rollback=rollback,
+    )
 
 
 def run_census(
@@ -2367,9 +2379,8 @@ def run_census(
     INSIDE verification surfaces as ``CensusHeadroomExhausted`` and lands
     on this same path. Both defer through ``_defer``, so all three aborts
     emit an identical log/escalation/outcome shape, and all three return
-    BEFORE any persistence -- crucially before ``advance_census_state``,
-    so ``last_census_at`` is untouched and the window is re-mined. The
-    outcome's ``deferred_stage``/``unverified_clusters`` tell the two
+    BEFORE any persistence -- nothing is ledgered, so every session is
+    re-mined by the next run. The outcome's ``deferred_stage``/``unverified_clusters`` tell the two
     apart. Otherwise falls through to the
     happy path: ``mine_to_saturation`` (Sonnet miners, ``census_miner``) ->
     split records into duplicates vs novel clusters -> ``verify_fn``
@@ -2394,10 +2405,13 @@ def run_census(
     per payload, best-effort (a genuine ticket for a withheld entry marks it
     filed, so it is never filed twice; a raised exception, or a result
     carrying no ticket id, is logged and excluded from ``filed_ticket_ids``
-    rather than aborting the run or inflating the filed count) ->
-    ``render_report`` -> write the report to *report_path* ->
-    ``codebook.dump`` -> ``advance_census_state`` (done-count from
-    *status_fetcher*) -> *commit* of report + codebook + state. A *commit*
+    rather than aborting the run or inflating the filed count) -> write the
+    JSON record beside *report_path* (``build_census_record``) and the
+    report rendered from it -> ``codebook.dump`` -> ``advance_census_state``
+    (done-count from *status_fetcher*, watermark from the mining window) ->
+    *commit* of report + record + codebook + state -> ledger every coded
+    session (``session_ledger``, only once the commit has landed; a failed
+    write is ``CensusOutcome.ledger_write_error``, never a crash). A *commit*
     that raises (e.g. refused by the target repo's pre-commit hook) hands
     every one of those paths to *roll_back*, which quarantines them and
     restores them to HEAD -- census-state included, so ``last_census_at``
@@ -2436,14 +2450,10 @@ def run_census(
     PARTIAL coverage and never pretends otherwise: the report states the
     cap and says so in as many words, and ``CensusOutcome.stop_reason``
     is ``"capped"`` -- distinct from the ``"exhausted"`` a source that
-    genuinely ran dry produces. PARTIAL here does NOT mean "the rest is
-    picked up next time": this run still calls ``advance_census_state``,
-    and ``_census_window_dates`` anchors the next window at
-    ``last_census_at``, so the capped-away sessions fall outside every
-    future window and are never re-enumerated. Sweeping them means rolling
-    ``last_census_at`` back in ``docs/legibility/census-state.json`` first;
-    the report bullet says exactly that, so a bounded run cannot be read as
-    a deferred-but-recoverable one. A cap below 1 raises ``ValueError``
+    genuinely ran dry produces. Only coded sessions are ledgered, so the
+    capped-away ones are RESUMED by the next run while they remain inside
+    its retention window, and the report says so. A cap below 1 raises
+    ``ValueError``
     (see ``mine_to_saturation``) rather than degrading into a half-applied
     cap.
 
@@ -2457,13 +2467,9 @@ def run_census(
     the raw ``mining_result.records``, not the verified clusters, so a
     deferred cluster still lands as a ``pending`` candidate that
     ``_find_pending_candidate_id`` can resolve later. That later pickup is
-    CONDITIONAL, though, and the report says so: this run advances
-    ``last_census_at``, so this window's sightings are never re-mined, and
-    a deferred cluster is re-adjudicated only if the same confusion RECURS
-    in a later window (pending candidates are absent from
-    ``coder.build_codebook_index``, so a recurrence does re-emerge as novel
-    and promote against the pending id). A one-off deferred by the cap sits
-    pending until a human adjudicates it. What a deferred cluster
+    CONDITIONAL (see ``VerifyCoverage``): its sessions are ledgered as coded,
+    so a deferred cluster is re-adjudicated only if the same confusion
+    RECURS. What a deferred cluster
     unconditionally forgoes is this run's adjudication: the matrix and the
     synthesis necessarily cover only the VERIFIED subset, and the report's
     ``## Verification`` section states that split rather than letting a
@@ -2490,10 +2496,10 @@ def run_census(
 
     A dry run is consequently NOT resumable by re-running: the mining, the
     codebook merge, the promotions, ``codebook.dump`` and
-    ``advance_census_state`` all really happened, so a later census codes
-    these same confusions as ``matches`` (no novel clusters, empty
-    payloads) over a window that has re-anchored at this run's
-    ``last_census_at``. The payload file is the sole remaining handle on
+    ``advance_census_state`` all really happened and its sessions are
+    ledgered as coded, so a later census neither re-mines them nor files
+    these confusions (they now code as ``matches``). The payload file is
+    the sole remaining handle on
     the remediation work, which is why it is never overwritten: a
     colliding path is left untouched and the payloads go to a numbered
     sibling instead (see ``_free_payloads_path``), so ``dry_run.path`` --
@@ -2605,9 +2611,8 @@ def run_census(
                 "census: operator verify cap (--max-verify-clusters=%d) reached -- "
                 "%d of %d novel cluster(s) DEFERRED, not verified this run; they still "
                 "merge into the codebook as pending candidates (deferred, never "
-                "dropped), but a later census re-adjudicates them only if the same "
-                "confusion RECURS -- this run advances last_census_at, so these "
-                "sightings are not re-mined",
+                "dropped), but their sessions are ledgered as coded, so a later "
+                "census re-adjudicates them only if the same confusion RECURS",
                 max_verify_clusters, deferred_count, len(novel_clusters),
             )
 
@@ -2868,21 +2873,18 @@ def run_census(
             json.dumps(task_payloads, indent=2) + "\n", encoding="utf-8",
         )
         # The WARNING deliberately does NOT offer a repeat census as the
-        # recovery path, because that path is dead: this run merges the
-        # candidates into the codebook and dumps it, so the same confusions
-        # code as `matches` next time, _novel_clusters() comes back empty and
-        # build_task_payloads() returns [] -- and advance_census_state() moves
-        # last_census_at, which _census_window_dates() anchors on, so the
-        # window these payloads came from is never enumerated again. Hand
-        # filing is the only remaining handle on the work; do not reintroduce
-        # the "just run it again without the flag" guidance.
+        # recovery path, because that path is dead: the same confusions code
+        # as `matches` against the dumped codebook, and the sessions are
+        # ledgered as coded, so no later census mines them again. Hand filing
+        # is the only remaining handle on the work; do not reintroduce the
+        # "just run it again without the flag" guidance.
         logger.warning(
             "census: --dry-run-filing -- %d task payload(s) written to %s; "
             "NOTHING was filed into a live task tree. This run HAS ALREADY "
             "advanced the codebook and census-state, so filing those payloads "
             "by hand is the only remaining way to land the work: a later "
             "census will NOT re-file them (these confusions now code as "
-            "matches, not candidates, and the census window has re-anchored).",
+            "matches, not candidates, and their sessions are ledgered as coded).",
             len(task_payloads), resolved_path,
         )
         withheld_offered = sum(
@@ -2959,11 +2961,15 @@ def run_census(
             f"{storm_batch_indices} (>50% coding failures -- degraded dup-rate "
             "signal, excluded from the saturation decision)"
         )
+    selection = (
+        batch_source.selection
+        if isinstance(batch_source, census_window.WindowBatchSource) else None
+    )
     method = build_method(
         run_id=run_id,
         as_of_sha=as_of_sha,
         since=since,
-        selection=None,
+        selection=selection,
         mined=len(mining_result.records),
         confirmed=len(verified),
         refuted=len(rejected),
@@ -2991,13 +2997,15 @@ def run_census(
         withheld=withheld,
         cross_project_tickets=tuple(cross_project_tickets),
     )
-    report_md = render_report(record)
-    # Written BEFORE codebook.dump()/advance_census_state() below -- a
-    # failure here (e.g. a disk-full write_text) leaves nothing but this one
-    # file touched (no codebook write, no state advance), so a re-run starts
-    # clean rather than resuming from a partially-persisted pipeline
+    # The record is written FIRST and the report rendered from that very text,
+    # so the markdown can only ever say what the record holds. Both precede
+    # codebook.dump()/advance_census_state(): a failure here leaves at most
+    # these two files touched, and a re-run starts clean
     # (reviewer_comprehensive finding #4).
-    Path(report_path).write_text(report_md, encoding="utf-8")
+    record_path = Path(report_path).with_suffix(".json")
+    record_text = json.dumps(record, indent=2) + "\n"
+    record_path.write_text(record_text, encoding="utf-8")
+    Path(report_path).write_text(render_report(json.loads(record_text)), encoding="utf-8")
 
     # An unobservable done-count degrades ONLY the next window's condition-(b)
     # baseline -- it must never abandon a run whose mining has already been
@@ -3039,13 +3047,15 @@ def run_census(
         run_id=run_id,
         report_path=report_relpath,
         as_of_sha=as_of_sha,
-        session_watermark=None,
+        session_watermark=selection.window.end.isoformat() if selection is not None else None,
         done_count=done_count,
     )
 
     landed = CensusOutcome(
         status="done",
         report_path=str(report_path),
+        run_id=run_id,
+        record_path=str(record_path),
         filed_ticket_ids=filed_ticket_ids,
         stop_reason=mining_result.stop_reason,
         dry_run=dry_run_filing,
@@ -3055,7 +3065,9 @@ def run_census(
         cross_project_tickets=tuple(cross_project_tickets),
         released_entry_ids=tuple(released_tickets),
     )
-    commit_paths = [str(report_path), str(codebook_path), str(census_state_path)]
+    commit_paths = [
+        str(report_path), str(record_path), str(codebook_path), str(census_state_path),
+    ]
     if dry_run_filing is not None:
         commit_paths.append(dry_run_filing.path)
     try:
@@ -3068,7 +3080,39 @@ def run_census(
             escalate_fn=escalate_fn,
             project_id=project_id,
         )
-    return landed
+    if selection is None:
+        return landed
+    return _ledger_census_codings(
+        landed, mining_result.records, run_id=run_id, ledger=selection.ledger,
+    )
+
+
+def _ledger_census_codings(
+    landed: CensusOutcome,
+    records: list[dict],
+    *,
+    run_id: str,
+    ledger: session_ledger.LedgerSnapshot,
+) -> CensusOutcome:
+    """Ledger every session this landed run coded, so the next census skips
+    it. A failure costs only a re-mine of those sessions, so it is reported
+    on the outcome rather than raised."""
+    rows = session_ledger.rows_for(
+        records,
+        coded_by=session_ledger.CodedBy.CENSUS,
+        run_ref=run_id,
+        instrument_version=digest.DIGEST_INSTRUMENT_VERSION,
+        coded_at=datetime.now(UTC),
+    )
+    try:
+        written = session_ledger.record_codings(ledger.path, rows)
+    except session_ledger.LedgerError as exc:
+        logger.warning(
+            "census: %d coded session(s) NOT ledgered, the next census re-mines them: %s",
+            len(rows), exc,
+        )
+        return replace(landed, ledger_write_error=str(exc))
+    return replace(landed, ledger_rows_written=written)
 
 
 # ---------------------------------------------------------------------------
@@ -3747,24 +3791,22 @@ def main(argv: list[str] | None = None) -> int:
     either one omitted when set to null). census.py itself never reads that
     block, so these flags remain the single cap mechanism.
     ``--max-batches N`` bounds mining (the
-    capped-away sessions are NOT re-mined by a later census -- this run
-    still advances ``last_census_at``, so the next window starts here),
+    capped-away sessions are not ledgered, so the next census resumes them),
     ``--max-verify-clusters N`` bounds per-cluster verification (a deferred
-    cluster is re-adjudicated only if that confusion RECURS in a later
-    window), and ``--dry-run-filing`` writes every would-be task payload to
-    ``plans/confusion-census-<date>-payloads.json`` (alongside the dated
-    report) for human review instead of filing it -- those payloads must
-    then be filed by hand, since this run still advances the codebook and
-    census-state and a later census will not re-file them. They are composable
+    cluster is re-adjudicated only if that confusion RECURS), and
+    ``--dry-run-filing`` writes every would-be task payload to
+    ``plans/<report basename>-payloads.json`` beside the report for human
+    review instead of filing it -- those payloads must then be filed by
+    hand, since this run still advances the codebook and ledgers its
+    sessions, and a later census will not re-file them. They are composable
     and reusable, not first-census-only, though an attended FIRST census
     against an empty codebook is where all three matter most: saturation
     cannot bound that run, since every batch's dup_rate then only
     measures "the miner found nothing to match". Both numeric caps take
     ``type=_positive_int``, so a nonsense value (0 or negative) exits 2 at
     the CLI boundary instead of being half-applied. None of the three lets
-    a bounded run masquerade as a complete one, or as one whose remainder
-    is automatically picked up later -- see ``run_census`` and
-    ``render_report``.
+    a bounded run masquerade as a complete one -- see ``run_census`` and
+    ``census_report_sections``.
 
     Returns non-zero only on a genuine fail-loud error (a config-load
     failure, an uncaught exception from ``run_census``, or an
@@ -3825,8 +3867,8 @@ def main(argv: list[str] | None = None) -> int:
         "for no cap). Omit for today's behavior -- mine until novelty saturates "
         "or the source runs out. A capped run is deliberately PARTIAL coverage "
         "and says so in the report; its stop_reason is 'capped', not "
-        "'exhausted'. The capped-away sessions are NOT re-mined later: this run "
-        "still advances last_census_at, so the next census window starts here.",
+        "'exhausted'. The capped-away sessions are not ledgered as coded, so the "
+        "next census resumes them.",
     )
     parser.add_argument(
         "--max-verify-clusters", type=_positive_int, default=None,
@@ -3834,18 +3876,18 @@ def main(argv: list[str] | None = None) -> int:
         "Sonnet call each), taken in mining order (N >= 1; omit for no cap). "
         "Omit to verify every novel cluster. The deferred remainder still "
         "merges into the codebook as pending candidates -- deferred, never "
-        "dropped -- but is re-adjudicated only if the same confusion RECURS in "
-        "a later window; this window's sightings are not re-mined.",
+        "dropped -- but is re-adjudicated only if the same confusion RECURS; "
+        "its sessions are ledgered as coded and not re-mined.",
     )
     parser.add_argument(
         "--dry-run-filing", action="store_true",
         help="Operator cost control: write every would-be task payload to "
-        "plans/confusion-census-<date>-payloads.json for human review and "
-        "file NOTHING. Everything else (codebook update, promotions, report, "
-        "census-state advance) proceeds normally -- and because the codebook "
-        "and census-state DO advance, the payloads must be filed by hand; a "
-        "later census will not re-file them. An existing payload file is "
-        "never overwritten (the payloads go to a numbered sibling instead).",
+        "plans/<report basename>-payloads.json for human review and file "
+        "NOTHING. Everything else (codebook update, promotions, report, "
+        "census-state advance, session ledger) proceeds normally -- so the "
+        "payloads must be filed by hand; a later census will not re-file them. "
+        "An existing payload file is never overwritten (the payloads go to a "
+        "numbered sibling instead).",
     )
     args = parser.parse_args(argv)
 
@@ -4044,6 +4086,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    # Appended ONLY when set, so a normal run's summary line stays
+    # byte-identical: the clause appears exactly when it carries information.
+    # Same reasoning as the report's coverage-shortfall gating -- a line
+    # trained to be ignored is a line that will be ignored.
+    ledger_failed = (
+        f" ledger_write_failed: {outcome.ledger_write_error}"
+        if outcome.ledger_write_error else ""
+    )
     if outcome.dry_run is not None:
         # A bare filed_tickets=0 here would read as "a normal run that had
         # nothing to file" -- name the review file and the count instead.
@@ -4051,14 +4101,10 @@ def main(argv: list[str] | None = None) -> int:
             f"census: done -- report={outcome.report_path} "
             f"dry-run-filing: {outcome.dry_run.payload_count} payload(s) -> "
             f"{outcome.dry_run.path} (nothing filed) "
-            f"stop_reason={outcome.stop_reason}"
+            f"stop_reason={outcome.stop_reason}{ledger_failed}"
         )
         return 0
 
-    # Appended ONLY when non-zero, so a normal run's summary line stays
-    # byte-identical: the clause appears exactly when it carries information.
-    # Same reasoning as render_report's coverage-shortfall gating -- a line
-    # trained to be ignored is a line that will be ignored.
     unresolved = (
         f" unresolved_verdicts={outcome.unresolved_verdicts}"
         if outcome.unresolved_verdicts else ""
@@ -4066,7 +4112,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         f"census: done -- report={outcome.report_path} "
         f"filed_tickets={len(outcome.filed_ticket_ids)} "
-        f"stop_reason={outcome.stop_reason}{unresolved}"
+        f"stop_reason={outcome.stop_reason}{unresolved}{ledger_failed}"
     )
     return 0
 
