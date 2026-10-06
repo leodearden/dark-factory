@@ -215,9 +215,9 @@ UNKNOWN_STORE = 'unknown'
 """Placeholders for the three tag fields a result may not carry.
 
 Graphiti-sourced results carry no category, their ``created_at`` is the edge's
-creation time, and graph edges usually carry no ``temporal``. The tag is best-effort and the content is not: a
-missing field renders as one of these words, never as ``None``, and never
-suppresses the entry it describes.
+creation time, and graph edges usually carry no ``temporal``. The tag is
+best-effort and the content is not: a missing field renders as one of these
+words, never as ``None``, and never suppresses the entry it describes.
 """
 
 
