@@ -197,7 +197,9 @@ for the whole fleet. Entry: `fused-memory/src/fused_memory/server/main.py`
   hours (shared clock file `data/orchestrator/last_redeploy_orchestrator.json`,
   plus an in-flight lease), delegating to
   `scripts/restart-all-orchestrators.sh --drain`, a two-stage drain that
-  restarts a unit only when no merge verify is in flight. Full
+  halts merge admission and holds each unit's restart while a merge verify is
+  in flight, until it ends or passes its own deadline (a sweep-wide cap bounds
+  the wait; units on pre-5371 code keep the old merge-idle gate). Full
   redeploy story (liveness vs. staleness vs. coordinator) in
   [OPERATIONS.md](OPERATIONS.md).
 

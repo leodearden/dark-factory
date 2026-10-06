@@ -1298,8 +1298,9 @@ restart:
   delegating the actual restart to
   `scripts/restart-all-orchestrators.sh --drain` — a two-stage drain (task
   5371, see [Reading a drain](#reading-a-drain)) that halts merge admission
-  fleet-wide and restarts a unit only once no merge verify is in flight on any
-  host. Units still on pre-5371 code, and units that refuse the request, keep
+  fleet-wide and holds each unit's restart while a merge verify is in flight
+  on any host, until it ends or passes its own deadline (a sweep-wide cap
+  bounds the wait). Units still on pre-5371 code, and units that refuse the request, keep
   the legacy merge-idle gate: defer while busy, then force-restart after
   `ORCH_RESTART_FORCE_FIRE_AFTER_SECS` (10 minutes since 2026-08-26, 75
   minutes before that). The script stamps the clock only
@@ -1380,12 +1381,14 @@ inside one 8-hour window.** Two corrections measured 2026-08-24/25:
   the one exit no trap can catch — costs at most one delayed window rather
   than wedging the fleet.
 
-  **Still not guaranteed.** The 14400s bound is derived from the worst
-  *legitimate* `--drain` sweep (~13,300s: the whole 11400s
+  **Still not guaranteed.** The 14400s bound is derived from the common
+  long `--drain` sweep (~13,300s: the whole 11400s
   `ORCH_DRAIN_VERIFY_MAX_WAIT_SECS` verify-wait cap, plus 7 x (30s verify +
   120s grace) and 7 x 120s unknown-grace); it was 7200s while the worst sweep
-  was one busy unit burning the 600s-to-4500s busy grace. A sweep that
-  overruns it loses its lease
+  was one busy unit burning the 600s-to-4500s busy grace. Units on the legacy
+  merge-idle gate (pre-5371 code, or a refused request) still add up to the
+  600s busy grace each, so two of them on top of a capped verify wait overrun
+  it. A sweep that overruns it loses its lease
   mid-sweep and degrades to exactly the pre-4755 collision. And the
   **fused-memory tier has no lease at all** — `fused_memory_staleness_pass`
   can still collide with its own in-flight `restart-fused-memory.sh`, because
@@ -1432,13 +1435,18 @@ first drained restart where the new behaviour applies is the second one.
   arrived with verifies still in flight) or `abandoned` (the request went away
   without a restart, e.g. the sweep died).
 
-**A stranded halt cannot exist by construction.** The request is re-evaluated
-on every heartbeat pass, so once the sweep pid is dead (or the request has
-expired or been removed) the next pass lifts the halt, within about 15 s. If
-`restart_drain.admission_halted` stays true, check that the sweep pid is
-still alive (`--report`'s `FLEET-LEASE:` line names it). The `--report`
-MERGE-IDLE columns are unchanged: the watchdog classifies without a drain
-request.
+**A stranded halt is bounded, not impossible.** The request is re-evaluated
+on every heartbeat pass and honoured only while the `sweep_pid` recorded IN
+the request file is alive and the request is younger than
+`orchestrator_restart_lease_max_age_secs` (4 h). Once the sweep dies, the next
+pass lifts the halt within about 15 s — unless the dead sweep's pid has been
+reused by another process, which reads as alive and keeps the halt until the
+age bound. If `restart_drain.admission_halted` stays true while no sweep is
+running (`--report`'s `FLEET-LEASE:` line shows none, and no
+`restart-all-orchestrators.sh` process exists), remove
+`data/fleet/<unit>.drain.json`: the next pass resumes admission. The
+`--report` MERGE-IDLE columns are unchanged: the watchdog classifies without a
+drain request.
 
 ### Reading a staleness redeploy's registration
 

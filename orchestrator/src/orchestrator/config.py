@@ -3989,13 +3989,17 @@ class OrchestratorConfig(BaseSettings):
     # scripts/restart-all-orchestrators.sh is mid-sweep it holds that lease and
     # the coordinator stands down; the bound is what keeps a lease stranded by
     # a SIGKILLed sweep (whose EXIT trap cannot run, by construction) from
-    # wedging the fleet. DERIVED, not picked: the worst LEGITIMATE --drain sweep
+    # wedging the fleet. DERIVED, not picked: the common long --drain sweep
     # (task 5371) is the whole 11400s ORCH_DRAIN_VERIFY_MAX_WAIT_SECS verify-wait
     # cap, plus 7 x (verify 30 + grace 120) restart verification, plus 7 x 120s
     # stale/absent grace = ~13,300s ~= 3.7h, so 14400 (4h) clears it with
     # headroom while staying far below the 8h
     # orchestrator_restart_min_interval_secs — a leaked lease therefore delays at
-    # most ONE redeploy window. Deliberately NOT in RELOADABLE_FIELDS:
+    # most ONE redeploy window. NOT a worst case: each unit left on the legacy
+    # merge-idle gate (pre-5371 code, or a refused request) can add its 600s
+    # busy grace, so two of them on top of a capped verify wait overrun it and
+    # the sweep degrades, bounded, to the pre-4755 collision. Deliberately NOT
+    # in RELOADABLE_FIELDS:
     # red-tier / restart-only, matching its siblings
     # orchestrator_restart_merge_phase_grace_secs /
     # orchestrator_restart_force_fire_after_secs /
@@ -4006,11 +4010,11 @@ class OrchestratorConfig(BaseSettings):
         description=(
             'Max age of the in-flight fleet-redeploy lease before the '
             'orchestrator coordinator stops honouring it and redeploys anyway. '
-            'Derived from the worst legitimate --drain sweep (~13,300s: the '
+            'Derived from the common long --drain sweep (~13,300s: the '
             '11400s verify-wait cap plus per-unit restart verification and '
-            'stale-heartbeat grace) and kept far below the 8h min-interval, so '
-            'a lease stranded by a SIGKILLed sweep delays at most one window. '
-            '4h default.'
+            'stale-heartbeat grace; legacy-gate units can add 600s each) and '
+            'kept far below the 8h min-interval, so a lease stranded by a '
+            'SIGKILLed sweep delays at most one window. 4h default.'
         ),
     )
 
