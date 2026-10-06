@@ -1309,6 +1309,35 @@ class TestSearch:
         )
 
     @pytest.mark.asyncio
+    async def test_search_graphiti_result_carries_created_at(self, service):
+        """A Graphiti hit with no temporal context still carries its edge's creation time."""
+        from _fm_helpers import MockEdge, MockNode
+
+        service.graphiti.search = AsyncMock(return_value=[
+            MockEdge(
+                fact='Service C owns the ledger',
+                uuid='edge-created-1',
+                source_node=MockNode(name='Service C'),
+                valid_at=None,
+                invalid_at=None,
+                created_at=datetime(2026, 8, 22, 9, 30, 0, tzinfo=UTC),
+            ),
+        ])
+        service.mem0.search = AsyncMock(return_value={'results': []})
+
+        results = await service.search(
+            query='Service C',
+            project_id='test',
+            categories=['entities_and_relations'],
+        )
+        assert len(results) == 1
+        assert results[0].temporal is None
+        assert results[0].created_at == '2026-08-22T09:30:00+00:00', (
+            'a Graphiti hit must carry a recency tiebreaker (esc-3578-5); created_at '
+            'is dropped at memory_service.py::MemoryService._search_graphiti'
+        )
+
+    @pytest.mark.asyncio
     async def test_search_category_false_negative_regression_task_1083(self, service):
         """E2E regression: category-scoped search must return the matching low-similarity
         memory even when higher-similarity non-matching memories exist.
