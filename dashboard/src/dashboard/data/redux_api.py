@@ -1420,8 +1420,9 @@ def shape_memory_evals(
     issues: list[dict] | None = None,
     issue_count: int = 0,
     unmatched_escalations: list[dict] | None = None,
+    escalation_queue: str | None = None,
 ) -> dict[str, Any]:
-    """Return ``{MEMORY_EVALS: {generated_at, root_present, storm_escape, evals, issues, issue_count, unmatched_escalations}}``.
+    """Return ``{MEMORY_EVALS: {generated_at, root_present, storm_escape, evals, issues, issue_count, unmatched_escalations, escalation_queue}}``.
 
     Pure, I/O-free — mirrors ``shape_curator`` / ``shape_scheduler`` style.
     The route calls this with ``**build_memory_evals(...)``; all disk access
@@ -1441,6 +1442,9 @@ def shape_memory_evals(
     UI never has to elect a row to read it from and it survives a root with
     zero eval dirs.
 
+    ``escalation_queue`` is the ESCALATIONS subsection id where every
+    escalation this payload links lives, ``None`` in the default body.
+
     Shallow-copies top-level containers only (``list(evals)``); the inner eval
     /issue /escalation dicts stay aliased to the builder's objects, which is
     benign because the builder constructs them fresh per call.  Defaults are
@@ -1458,5 +1462,6 @@ def shape_memory_evals(
             'issues': list(issues) if issues else [],
             'issue_count': issue_count,
             'unmatched_escalations': list(unmatched_escalations) if unmatched_escalations else [],
+            'escalation_queue': escalation_queue,
         }
     }

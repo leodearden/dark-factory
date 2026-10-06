@@ -278,6 +278,7 @@ window.DF_DATA = {
     issues: [],
     issue_count: 0,
     unmatched_escalations: [],
+    escalation_queue: null,
   },
   // Per-key FIRST-SUCCESS markers: `__loaded[KEY]` flips true the first time a
   // real server value for that key is applied, and never back.
