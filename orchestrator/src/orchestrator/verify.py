@@ -1416,12 +1416,14 @@ def is_wholly_preexisting(branch: Iterable[str], baseline: Iterable[str]) -> boo
 
 
 # Process-wide per-main-SHA failing-test-id BASELINE (task μ,
-# verify-scope-inversion-prd.md, B2). Keyed by an immutable SHA, so an entry
-# is valid for as long as that SHA can be main's tip; the cache is bounded by
-# recency of write/use instead of by wall-clock (task 5627). _PROBE_CACHE
-# above keeps its TTL on purpose: its value is a scoped role='task' verdict
-# about one failure signature, which can be load-flaky, so expiry there is a
-# re-probe chance rather than a staleness guard.
+# verify-scope-inversion-prd.md, B2). An entry is determined by its SHA (and,
+# per module, by that module's registered command), so it stays valid for as
+# long as that SHA can be main's tip; the cache is bounded by recency of
+# write/use instead of by wall-clock (task 5627). _PROBE_CACHE above is not
+# keyed on everything that shapes its value (the requesting task's files scope
+# its probe), so it keeps its TTL. Neither is immune to flakes: each probe is
+# one unretried run, so a flaky red here stays known until main moves past the
+# SHA or the entry is evicted; known_failing_ids_on_main states what that costs.
 @dataclass(frozen=True)
 class _MainShaBaseline:
     """What is known to fail at one main SHA. Rebuilt, never mutated."""
@@ -1709,6 +1711,12 @@ def known_failing_ids_on_main(main_sha: str) -> frozenset[str]:
 
     A lower bound: empty means none known, not green. It answers "is main known
     red?" (the task-2823 trivial-pass gate) and must never be diffed against.
+
+    A known red lasts as long as its SHA's baseline. A probe is one unretried
+    run, so a flaky red withholds config-only trivial passes at this SHA until
+    main moves past it (a trivial pass cannot move it) or the entry is evicted.
+    That is the accepted price of the gate staying armed for as long as a
+    genuinely red SHA stays main's tip.
     """
     _cached = _recall_main_baseline(main_sha, touch=False)
     return _cached.known_failing() if _cached is not None else frozenset()
