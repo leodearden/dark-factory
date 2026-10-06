@@ -15395,12 +15395,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
     async def _stand_down_train(self, req: GroupMergeRequest, main_sha: str) -> None:
         """Keep a dequeued train from starting its verify under an admission halt (task 5371).
 
-        A train verifies inline in the merger, past the pick-time admission
-        gate, so this is the train's own gate. A coalesce train is dissolved
-        (:meth:`_dissolve_coalesce_train`); a declared train is requeued, its
-        request still pending, since its tip workflow submits it again if a
-        restart drops it (the contract the 1867 re-drive hooks in
-        :meth:`_merger_loop` rely on).
+        A train verifies inline, past the pick-time gate, so this is its own
+        gate. A coalesce train is dissolved (:meth:`_dissolve_coalesce_train`);
+        a declared train is requeued like any queued one. Its tip workflow awaits it within one process
+        (``orchestrator/src/orchestrator/workflow.py::TaskWorkflow._maybe_enqueue_group_merge``);
+        across a restart that workflow dies and recovery is the tip task's
+        re-dispatch after boot, pre-existing behaviour this does not add.
         """
         self._speculation_controller.on_abort()
         self._drift_base.pop(req.request_id, None)

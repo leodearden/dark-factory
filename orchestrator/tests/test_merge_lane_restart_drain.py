@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -563,6 +563,52 @@ async def test_a_halt_dissolves_a_coalesce_train_waiting_in_its_buffer(
             label='train dissolved and its members re-driven',
         )
         assert lane.unfrozen_suffix() == ()
+        assert _entries(lane) == []
+
+    assert sorted(hooks.redriven) == [(name, False, None) for name in _SINGLES]
+
+
+class _WaitWatchingQueue(asyncio.Queue[Any]):
+    """The lane's input queue, noting when the merger starts its blocking get.
+
+    The merger calls ``get()`` only to block on the next arrival, right before
+    its wait with no await in between, so once ``getting`` is set and the test
+    runs again the merger is parked in that wait.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.getting = asyncio.Event()
+
+    def get(self) -> Coroutine[Any, Any, Any]:  # type: ignore[override]
+        self.getting.set()
+        return super().get()
+
+
+async def test_a_halt_wakes_an_idle_merger_to_dissolve_its_buffered_coalesce_train(
+    coalesce_scene: _Scene,
+) -> None:
+    """R9: the heartbeat halts an IDLE merger, parked waiting for an arrival;
+    the halt itself must wake it, or the buffered train survives until the
+    next arrival and a restart arriving first strands its members."""
+    hooks = _CoalesceHooks()
+    queue = _WaitWatchingQueue()
+    lane = make_lane(coalesce_scene.git_ops, queue, train_callback_factory=hooks.factory)
+    singles = [await _request(coalesce_scene, name) for name in _SINGLES]
+    lane.halt_lane('normal', 'hold the formed train in its buffer')
+    for single in singles:
+        await queue.put(single)
+
+    async with running_lane(lane):
+        await wait_responsive(queue.getting.wait(), label='merger parked in its wait')
+        assert all(single.result.done() for single in singles)
+        assert _entries(lane) == [(_SINGLES[-1], 'queued')]
+
+        lane.halt_admission('restart drain test')
+        await wait_responsive(
+            _until(lambda: len(hooks.redriven) == len(_SINGLES)),
+            label='the halt woke the merger to dissolve the buffered train',
+        )
         assert _entries(lane) == []
 
     assert sorted(hooks.redriven) == [(name, False, None) for name in _SINGLES]
