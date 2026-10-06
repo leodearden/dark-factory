@@ -3800,14 +3800,13 @@ async def _run_post_merge_verify(
     # config-only 5247/5249 landed over #5120's red main and re-persisted it).
     #
     # CACHE-ONLY peek (known_failing_ids_on_main): never a probe on the
-    # critical path (G4, task 2564). It names any ids known red at this SHA,
-    # from a seed, a whole-tree probe or a narrowed module probe; empty (none
-    # known) fails OPEN, matching the task's "known-red" scope. Keyed strictly
-    # on verify.trivial: a NON-trivial pass means the
-    # full suite ran on the merged tree and passed, which legitimately heals a
-    # red main and must NOT be blocked (else main-recovery merges would stall).
-    # Mirrors the failure-path idiom above (get_main_sha in a try/except, then
-    # a cache-only baseline read).
+    # critical path (G4, task 2564). It names every id known red at this SHA
+    # (seed, whole-tree or narrowed module probe); none known fails OPEN,
+    # matching the task's "known-red" scope. Keyed strictly on verify.trivial:
+    # a NON-trivial pass means the full suite ran on the merged tree and
+    # passed, which legitimately heals a red main and must NOT be blocked
+    # (else main-recovery merges would stall). Mirrors the failure-path idiom
+    # above (get_main_sha in a try/except, then a cache-only baseline read).
     #
     # getattr default False mirrors the VerifyResult dataclass default
     # (verify.py: ``trivial: bool = False``): a result object lacking the field
