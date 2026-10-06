@@ -58,10 +58,11 @@ def llm_spec(*, base_url: str = UNREACHABLE_BASE_URL, **overrides) -> LlmArmSpec
 
 
 def incumbent_control_spec(**overrides) -> LlmArmSpec:
-    """The metered incumbent control arm (stack 'openai', priced, no prereg sha)."""
+    """The metered incumbent control arm (stack 'openai', priced, no prereg sha, default client)."""
     data = {
         'arm_id': 'incumbent-ctrl-a',
         'model_id': 'gpt-4.1-mini',
+        'client_class': 'openai',
         'serving': {'stack': 'openai', 'base_url': 'https://api.openai.com/v1'},
         'pricing': {'usd_per_mtok_input': 0.4, 'usd_per_mtok_output': 1.6},
         'preregistration_sha': None,

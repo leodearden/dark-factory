@@ -6,11 +6,13 @@ import urllib.request
 
 import openai
 import pytest
-from _mock_openai_server import chat_completion_body, mock_openai_server
+from _mock_openai_server import chat_completion_body, mock_openai_server, responses_body
+from graphiti_core.llm_client import LLMClient, LLMConfig
+from graphiti_core.llm_client.openai_base_client import BaseOpenAIClient
 from graphiti_core.prompts.models import Message
 from pydantic import BaseModel, ValidationError
 
-from arm_harness._fakes import UNREACHABLE_BASE_URL, llm_spec
+from arm_harness._fakes import UNREACHABLE_BASE_URL, incumbent_control_spec, llm_spec
 from fused_memory.arm_harness.arm_config import llm_arm_config
 from fused_memory.arm_harness.conformance import (
     ConformanceLedger,
@@ -22,6 +24,7 @@ from fused_memory.backends.llm_clients import (
     ForceJsonObjectOpenAIGenericClient,
     TokenRecordingOpenAIGenericClient,
 )
+from fused_memory.backends.llm_token_usage import measure_llm_tokens
 
 
 class _Entity(BaseModel):
@@ -232,3 +235,101 @@ def test_install_refuses_a_client_without_the_per_attempt_seam():
 
     with pytest.raises(TypeError, match='_generate_response'):
         install_conformance_audit(NoSeam(), ConformanceLedger())  # type: ignore[arg-type]
+
+
+# --- the production-default client class: BaseOpenAIClient's tuple-returning attempt --------
+
+
+def _incumbent_client(mock_config, base_url: str) -> BaseOpenAIClient:
+    spec = incumbent_control_spec(serving={'stack': 'openai', 'base_url': base_url})
+    client = build_llm_client(llm_arm_config(spec, mock_config))
+    assert isinstance(client, BaseOpenAIClient)
+    return client
+
+
+def _audited_incumbent(mock_config, base_url: str):
+    client = _incumbent_client(mock_config, base_url)
+    ledger = ConformanceLedger()
+    install_conformance_audit(client, ledger)
+    return client, ledger
+
+
+def test_the_incumbent_control_arm_runs_on_the_base_openai_client(mock_config):
+    client = build_llm_client(llm_arm_config(incumbent_control_spec(), mock_config))
+
+    assert isinstance(client, BaseOpenAIClient)
+
+
+@pytest.mark.asyncio
+async def test_base_openai_valid_response_is_counted_and_its_tokens_still_recorded(mock_config):
+    with mock_openai_server() as server:
+        server.set_response('/responses', responses_body(VALID, input_tokens=3, output_tokens=4))
+        client, ledger = _audited_incumbent(mock_config, server.base_url)
+
+        async with measure_llm_tokens(client) as measurement:
+            result = await client.generate_response(_messages(), response_model=_Entities)
+
+    counts = ledger.snapshot()
+    usage = measurement.usage
+    assert result == {'entities': [{'name': 'Alice'}]}
+    assert (counts.calls, counts.schema_valid) == (1, 1)
+    assert usage is not None
+    assert (usage.input_tokens, usage.output_tokens, usage.total_tokens) == (3, 4, 7)
+
+
+@pytest.mark.asyncio
+async def test_base_openai_off_schema_is_detected_on_every_retried_attempt(mock_config):
+    with mock_openai_server() as server:
+        server.set_response('/responses', responses_body(OFF_SCHEMA))
+        client, ledger = _audited_incumbent(mock_config, server.base_url)
+        attempts = type(client).MAX_RETRIES + 1
+
+        with pytest.raises(ValidationError):
+            await client.generate_response(_messages(), response_model=_Entities)
+
+    counts = ledger.snapshot()
+    assert counts.schema_invalid == counts.calls == attempts
+    assert dict(counts.invalid_by_error_class) == {'ValidationError': attempts}
+
+
+@pytest.mark.asyncio
+async def test_base_openai_off_schema_then_valid_counts_both_attempts(mock_config):
+    with mock_openai_server() as server:
+        server.set_response_sequence(
+            '/responses', [(200, responses_body(OFF_SCHEMA)), (200, responses_body(VALID))]
+        )
+        client, ledger = _audited_incumbent(mock_config, server.base_url)
+
+        await client.generate_response(_messages(), response_model=_Entities)
+
+    counts = ledger.snapshot()
+    metric = conformance_rate_metric(counts)
+    assert (counts.schema_valid, counts.schema_invalid) == (1, 1)
+    assert metric is not None
+    assert (metric.value, metric.denominator) == (0.5, 2)
+
+
+@pytest.mark.asyncio
+async def test_base_openai_json_object_response_without_response_model_counts_valid(mock_config):
+    with mock_openai_server() as server:
+        server.chat_content = '{"ok": true}'
+        client, ledger = _audited_incumbent(mock_config, server.base_url)
+
+        result = await client.generate_response(_messages())
+        request = server.requests_to('/chat/completions')[0]['json_body']
+
+    assert result == {'ok': True}
+    assert request['response_format'] == {'type': 'json_object'}
+    assert ledger.snapshot().schema_valid == 1
+
+
+class _ForeignFamilyClient(LLMClient):
+    async def _generate_response(self, messages, response_model=None, max_tokens=0, model_size=None):
+        return {}
+
+
+def test_install_refuses_an_attempt_seam_of_an_unknown_client_family():
+    client = _ForeignFamilyClient(LLMConfig(api_key='x'))
+
+    with pytest.raises(TypeError, match='_ForeignFamilyClient'):
+        install_conformance_audit(client, ConformanceLedger())

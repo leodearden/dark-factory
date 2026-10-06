@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from _mock_openai_server import mock_openai_server
+from _mock_openai_server import mock_openai_server, responses_body
 from redis.exceptions import ResponseError
 from shared.memory_eval_metrics import Metric
 
@@ -114,6 +114,30 @@ async def test_an_unreachable_endpoint_fails_the_smoke_as_a_transport_error(mock
     assert verdict.passed is False
     assert 'APIConnectionError' in verdict.positive.detail
     assert verdict.counts.transport_errors >= 1
+
+
+def _incumbent_on(server):
+    return incumbent_control_spec(serving={'stack': 'openai', 'base_url': server.base_url})
+
+
+@pytest.mark.asyncio
+async def test_smoke_passes_on_the_incumbent_control_arm(mock_config):
+    with mock_openai_server() as server:
+        server.set_response('/responses', responses_body(VALID_ENTITIES))
+        verdict = await smoke_endpoint(_incumbent_on(server), mock_config)
+
+    assert verdict.passed is True
+    assert verdict.counts.schema_valid >= 1
+
+
+@pytest.mark.asyncio
+async def test_smoke_detects_off_schema_json_on_the_incumbent_control_arm(mock_config):
+    with mock_openai_server() as server:
+        server.set_response('/responses', responses_body(OFF_SCHEMA))
+        verdict = await smoke_endpoint(_incumbent_on(server), mock_config)
+
+    assert verdict.passed is False
+    assert 'ValidationError' in verdict.positive.detail
 
 
 # --- boundary row 6: index-configuration reality -------------------------------------
