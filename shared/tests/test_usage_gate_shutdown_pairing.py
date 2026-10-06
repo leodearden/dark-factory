@@ -10,7 +10,8 @@ so the pairing is enforced here rather than remembered.
 
 THE RULE. A module that CONSTRUCTS a gate (a call whose callee is the name or
 attribute ``UsageGate``) must REFERENCE a teardown: an attribute ``shutdown``
-on a receiver whose source text mentions ``gate``.
+on a receiver whose source text has ``gate`` as a whole word between
+non-alphanumerics (``self.usage_gate``, ``self._gate``; not ``self.delegate``).
 
 * MODULE granularity: the reconciliation harness builds its gate in
   ``__init__`` and tears it down in ``run_loop``, which a per-function rule
@@ -34,6 +35,7 @@ is recorded in :data:`ALLOWLIST` with where its callers tear the gate down;
 from __future__ import annotations
 
 import ast
+import re
 from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
@@ -42,6 +44,7 @@ import pytest
 from silent_fallthrough_scan import ParsedFile
 
 _GATE_CLASS = 'UsageGate'
+_RECEIVER_WORD_SEPARATOR = re.compile(r'[^a-z0-9]+')
 
 ALLOWLIST: dict[str, str] = {
     'scripts/legibility/account_pool.py': (
@@ -73,7 +76,7 @@ def _references_a_gate_teardown(node: ast.AST) -> bool:
     return (
         isinstance(node, ast.Attribute)
         and node.attr == 'shutdown'
-        and 'gate' in ast.unparse(node.value).lower()
+        and 'gate' in _RECEIVER_WORD_SEPARATOR.split(ast.unparse(node.value).lower())
     )
 
 
@@ -146,13 +149,25 @@ class TestScanner:
         )
         assert pairing.unpaired == frozenset()
 
-    def test_an_unrelated_shutdown_does_not_pair(self):
+    @pytest.mark.parametrize(
+        'receiver', ['server', 'self.delegate', 'self.aggregates', 'navigator_gateway'],
+    )
+    def test_an_unrelated_shutdown_does_not_pair(self, receiver):
         pairing = _scan_one(
-            'async def run(cfg, server):\n'
+            'async def run(self, cfg, server, navigator_gateway):\n'
             '    gate = UsageGate(cfg)\n'
-            '    await server.shutdown()\n'
+            f'    await {receiver}.shutdown()\n'
         )
         assert pairing.unpaired == frozenset({'pkg/mod.py'})
+
+    @pytest.mark.parametrize('receiver', ['self._gate', 'curator_usage_gate', 'self._get_gate()'])
+    def test_a_receiver_naming_gate_as_a_word_pairs(self, receiver):
+        pairing = _scan_one(
+            'async def run(self, cfg, curator_usage_gate):\n'
+            '    self._gate = UsageGate(cfg)\n'
+            f'    await {receiver}.shutdown()\n'
+        )
+        assert pairing.unpaired == frozenset()
 
     def test_a_teardown_passed_as_a_callable_pairs(self):
         pairing = _scan_one(
@@ -212,7 +227,7 @@ class TestGateSelfIntegrity:
     """The gate must not pass vacuously."""
 
     def test_the_scan_finds_the_known_constructors(self, pairing):
-        assert len(pairing.constructors) >= 4, (
+        assert len(pairing.constructors) >= 5, (
             f'Only {len(pairing.constructors)} UsageGate-constructing module(s) '
             f'found: {sorted(pairing.constructors)}. At least five are known, so '
             'a trip means the SCAN is broken (enumeration, prefilter or matcher), '
