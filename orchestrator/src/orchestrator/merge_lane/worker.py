@@ -2762,8 +2762,8 @@ async def _run_post_merge_verify(
     # seed-warm-lane.sh / thin-warm-lane.sh / warm-lane-gc.sh and DF's own
     # ``_seed_warm_lane`` take (see ``GitOps.merge_verify_lease``) — but
     # ONLY for a LOCAL in-process verify (runner is None) on the persistent
-    # warm lane (``git.persistent_merge_worktree`` on AND *merge_wt*
-    # resolves to ``persistent_merge_worktree_path``). Every other
+    # warm lane (``git.persistent_merge_worktree`` on AND
+    # ``GitOps.is_persistent_merge_lane(merge_wt)``). Every other
     # combination (remote runner, ephemeral worktree, knob off) leaves the
     # AsyncExitStack empty — no lease recorded, byte-identical to before.
     # Holding this lease lets :meth:`GitOps.reset_persistent_merge_worktree`
@@ -2779,7 +2779,7 @@ async def _run_post_merge_verify(
         if (
             runner is None
             and req.config.git.persistent_merge_worktree
-            and merge_wt.resolve() == git_ops.persistent_merge_worktree_path.resolve()
+            and git_ops.is_persistent_merge_lane(merge_wt)
         ):
             await stack.enter_async_context(git_ops.merge_verify_lease())
 
