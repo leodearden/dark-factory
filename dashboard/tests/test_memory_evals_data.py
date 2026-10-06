@@ -4138,6 +4138,7 @@ class TestMemoryEvalsEndpoint:
         from unittest.mock import patch
 
         from _canned_mcp import CannedMCP
+
         from dashboard.app import _memory_evals_cache_clear
         from dashboard.data import escalation_corpus
 
