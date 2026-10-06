@@ -161,16 +161,30 @@ class MatchKind(StrEnum):
 
     LITERAL = 'literal'
     PARAMETERIZED = 'parameterized'
+    COMPANION = 'companion'
 
 
 @dataclass(frozen=True)
 class BriefingClass:
-    """One briefing query class: its template and how an op is matched to it."""
+    """One briefing query class: its template and how an op is matched to it.
+
+    A COMPANION class has no pattern. It names instead the template of the
+    `anchor` class whose op, from the same caller, comes just before it.
+    """
 
     template: str
     match: MatchKind
     era: BriefingEra
-    pattern: re.Pattern[str]
+    pattern: re.Pattern[str] | None
+    anchor: str | None = None
+
+    def __post_init__(self) -> None:
+        is_companion = self.match is MatchKind.COMPANION
+        if is_companion != (self.pattern is None) or is_companion != (self.anchor is not None):
+            raise ValueError(
+                f'{self.template!r}: a companion class has an anchor and no '
+                'pattern; every other class has a pattern and no anchor'
+            )
 
 
 #: Field patterns narrower than "anything".
@@ -221,22 +235,46 @@ def build_current_classes(
 ) -> tuple[BriefingClass, ...]:
     """One current-era class per spec, in `specs` order.
 
-    `companion_anchors` maps a spec slug to the slug of the spec it is fired
-    beside. A template with no literal text cannot be told apart from an
-    agent's own search by pattern, so it must be named there.
+    `companion_anchors` maps a spec slug to the slug of the spec fired just
+    before it by the same caller. A template with no literal text cannot be
+    told apart from an agent's own search by pattern, so it must be named
+    there and is matched as that anchor's companion instead.
     """
+    specs = tuple(specs)
+    by_slug = {spec.slug: spec for spec in specs}
     classes: list[BriefingClass] = []
     for spec in specs:
-        if spec.slug in companion_anchors:
+        anchor_slug = companion_anchors.get(spec.slug)
+        if anchor_slug is None:
+            classes.append(_current_pattern_class(spec))
             continue
-        if not _template_literal_text(spec.text).strip():
+        anchor = by_slug.get(anchor_slug)
+        if anchor is None or anchor.slug in companion_anchors:
             raise UnmatchableTemplateError(
-                f'briefing spec {spec.slug!r} has template {spec.text!r}, which '
-                'has no literal text to match on; declare the spec it is fired '
-                'beside in companion_anchors'
+                f'briefing spec {spec.slug!r} ({spec.text!r}) is declared the '
+                f'companion of {anchor_slug!r}, which is not a pattern-matched '
+                'spec in the table'
             )
-        classes.append(_pattern_class(spec.text, BriefingEra.CURRENT))
+        classes.append(
+            BriefingClass(
+                template=spec.text,
+                match=MatchKind.COMPANION,
+                era=BriefingEra.CURRENT,
+                pattern=None,
+                anchor=anchor.text,
+            )
+        )
     return tuple(classes)
+
+
+def _current_pattern_class(spec: BriefingQuerySpec) -> BriefingClass:
+    if not _template_literal_text(spec.text).strip():
+        raise UnmatchableTemplateError(
+            f'briefing spec {spec.slug!r} has template {spec.text!r}, which '
+            'has no literal text to match on; declare the spec it is fired '
+            'beside in companion_anchors'
+        )
+    return _pattern_class(spec.text, BriefingEra.CURRENT)
 
 
 RETIRED_CLASSES: tuple[BriefingClass, ...] = tuple(
@@ -244,7 +282,7 @@ RETIRED_CLASSES: tuple[BriefingClass, ...] = tuple(
     for template in (*RETIRED_LITERAL_TEMPLATES, RETIRED_TASK_TEMPLATE)
 )
 
-#: The free-text task channel is fired right after the area-scoped
+#: The free-text task query is fired right after the area-scoped
 #: conventions query, by the same caller.
 _COMPANION_ANCHORS: dict[str, str] = {TASK_SEMANTIC.slug: CONVENTIONS_AREA.slug}
 
@@ -451,25 +489,24 @@ def _connect_readonly(db_path: Path | str) -> sqlite3.Connection:
     return con
 
 
-def _classify(text: str) -> BriefingClass | None:
-    """The briefing class `text` belongs to, or None if it is tail.
+@dataclass(frozen=True)
+class _SearchOp:
+    """One parsed ``search`` op from the journal."""
 
-    A parameterized class is matched by PATTERN. Matching it literally
-    would scatter one class across thousands of singletons.
-    """
-    return next(
-        (cls for cls in BRIEFING_CLASSES if cls.pattern.fullmatch(text)), None
-    )
+    text: str
+    limit: int | None
+    caller: str | None
 
 
-def _query_op(params: str | None) -> tuple[str, int | None] | None:
-    """Pull ``(query_text, limit)`` out of a ``write_ops.params`` JSON blob.
+def _search_op(params: str | None) -> _SearchOp | None:
+    """Parse a ``write_ops.params`` JSON blob, or None when it carries no query.
 
     The limit rides in the SAME already-parsed dict as the text, so reading
     it costs nothing and discarding it is what forced the old fabricated
     ``observed_limit``.  ``None`` for the limit means the op recorded no
     usable integer one — ``bool`` is excluded explicitly because
-    ``isinstance(True, int)`` is ``True`` in Python.
+    ``isinstance(True, int)`` is ``True`` in Python.  ``None`` for the
+    caller means the op recorded no ``caller_agent_id``.
     """
     if not params:
         return None
@@ -488,13 +525,39 @@ def _query_op(params: str | None) -> tuple[str, int | None] | None:
         if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit > 0
         else None
     )
-    return text, limit
+    raw_caller = parsed.get('caller_agent_id')
+    caller = raw_caller if isinstance(raw_caller, str) and raw_caller else None
+    return _SearchOp(text=text, limit=limit, caller=caller)
 
 
-def _query_text(params: str | None) -> str | None:
-    """The text half of :func:`_query_op`, kept as the narrow reader."""
-    op = _query_op(params)
-    return None if op is None else op[0]
+class _Classifier:
+    """Classifies search ops read in journal order, for ONE `harvest` call.
+
+    A pattern class claims every op its pattern fullmatches. A companion
+    class claims the next op no pattern claims from a caller whose anchor op
+    is still unpaired. Unpaired anchors are COUNTED per caller, because
+    parallel dispatches can share one caller id and interleave their pairs.
+    """
+
+    def __init__(self, classes: tuple[BriefingClass, ...]) -> None:
+        self._patterns = [(c, c.pattern) for c in classes if c.pattern is not None]
+        self._companions = {c.anchor: c for c in classes if c.anchor is not None}
+        self._unpaired: Counter[tuple[str, str]] = Counter()
+
+    def classify(self, op: _SearchOp) -> BriefingClass | None:
+        """The class `op` belongs to, or None if it is tail."""
+        for cls, pattern in self._patterns:
+            if pattern.fullmatch(op.text):
+                if op.caller is not None and cls.template in self._companions:
+                    self._unpaired[(op.caller, cls.template)] += 1
+                return cls
+        if op.caller is None:
+            return None
+        for anchor, companion in self._companions.items():
+            if self._unpaired[(op.caller, anchor)] > 0:
+                self._unpaired[(op.caller, anchor)] -= 1
+                return companion
+        return None
 
 
 def _limit_histogram(counter: Counter[int | None]) -> dict[str, int]:
@@ -576,16 +639,14 @@ class _ClassTally:
         self.tail_instances: Counter[str] = Counter()
         self.tail_limits: dict[str, Counter[int | None]] = {}
 
-    def add(
-        self, cls: BriefingClass | None, text: str, limit: int | None, n: int = 1
-    ) -> None:
-        """Count `n` ops of `text` at `limit` in `cls`, or in the tail for None."""
+    def add(self, cls: BriefingClass | None, text: str, limit: int | None) -> None:
+        """Count one op of `text` at `limit` in `cls`, or in the tail for None."""
         if cls is None:
-            self.tail_instances[text] += n
-            self.tail_limits.setdefault(text, Counter())[limit] += n
+            self.tail_instances[text] += 1
+            self.tail_limits.setdefault(text, Counter())[limit] += 1
         else:
-            self._instances[cls][text] += n
-            self._limits[cls][limit] += n
+            self._instances[cls][text] += 1
+            self._limits[cls][limit] += 1
 
     def template_classes(self, total: int) -> list[TemplateClass]:
         return [
@@ -681,11 +742,9 @@ def harvest(
         tail_top = max(1, tail_sample // 2)
     tail_top = min(tail_top, tail_sample)
 
-    counts: Counter[str] = Counter()
-    # The limit rides in the same params blob as the text, so it is
-    # accumulated in the same pass.  Discarding it is what produced the
-    # fabricated `observed_limit` this keying replaces.
-    limits: dict[str, Counter[int | None]] = {}
+    classifier = _Classifier(BRIEFING_CLASSES)
+    tally = _ClassTally(BRIEFING_CLASSES)
+    total = 0
     unparsed = 0
 
     con = _connect_readonly(db_path)
@@ -725,16 +784,19 @@ def harvest(
             # multi-hundred-MB allocation, and `fetchmany()` chunking is not
             # an improvement: it would cap memory identically without
             # releasing the snapshot any earlier.
+            #
+            # In journal (rowid) order, because a companion op is recognised
+            # by its position after its anchor.
             for (params,) in con.execute(
-                "SELECT params FROM write_ops WHERE operation = 'search'"
+                "SELECT params FROM write_ops WHERE operation = 'search' "
+                "ORDER BY rowid"
             ):
-                op = _query_op(params)
+                op = _search_op(params)
                 if op is None:
                     unparsed += 1
                     continue
-                text, limit = op
-                counts[text] += 1
-                limits.setdefault(text, Counter())[limit] += 1
+                total += 1
+                tally.add(classifier.classify(op), op.text, op.limit)
         # Deliberately wrapped around the WHOLE loop, not just the
         # `execute()`: streaming moves the point of failure, so a `disk I/O
         # error` can now surface on any `next()` mid-scan.  Narrowing this
@@ -751,13 +813,6 @@ def harvest(
     finally:
         con.close()
 
-    total = sum(counts.values())
-
-    tally = _ClassTally(BRIEFING_CLASSES)
-    for text, text_limits in limits.items():
-        cls = _classify(text)
-        for limit, n in text_limits.items():
-            tally.add(cls, text, limit, n)
     templates = tally.template_classes(total)
     tail_counts = tally.tail_instances
 

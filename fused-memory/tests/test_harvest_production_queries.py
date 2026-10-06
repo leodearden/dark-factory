@@ -569,6 +569,19 @@ class TestCurrentTemplatesAreRenderedFromSource:
         assert 'free-text' in str(exc.value)
         assert '{title} {area}' in str(exc.value)
 
+    @pytest.mark.parametrize(
+        'anchors',
+        [
+            {TASK_SEMANTIC.slug: 'no-such-spec'},
+            {TASK_SEMANTIC.slug: CONVENTIONS_AREA.slug, CONVENTIONS_AREA.slug: TASK_SEMANTIC.slug},
+        ],
+        ids=['unknown-anchor', 'anchor-is-a-companion'],
+    )
+    def test_a_companion_needs_a_pattern_matched_anchor(self, anchors):
+        mod = _mod()
+        with pytest.raises(mod.UnmatchableTemplateError, match=TASK_SEMANTIC.slug):
+            mod.build_current_classes(QUERY_SPECS, companion_anchors=anchors)
+
 
 IMPLEMENTER = 'claude-task-5502-implementer'
 
