@@ -3262,12 +3262,12 @@ class TestTheProductionTrafficSharesAreTheMeasuredOnes:
 
         assert report['production_queries']['templates']
 
-    def test_all_four_briefing_templates_are_carried(self):
+    def test_the_committed_pre_3659_report_carries_the_four_retired_templates(self):
         harvest = _harvest_mod()
         report = _committed_selection_json()
 
         carried = {t['template'] for t in report['production_queries']['templates']}
-        assert carried == {*harvest.LITERAL_TEMPLATES, harvest.TASK_TEMPLATE}
+        assert carried == {*harvest.RETIRED_LITERAL_TEMPLATES, harvest.RETIRED_TASK_TEMPLATE}
 
     def test_every_share_matches_the_committed_sample_exactly(self):
         """Not "close to": the report copies the fixture, so any drift means

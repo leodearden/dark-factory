@@ -12,26 +12,38 @@ traffic beside the authored set.
 
 WHAT IT MEASURES
 ----------------
-The orchestrator's briefing assembler fires a fixed family of four queries
-per dispatched task (``orchestrator/src/orchestrator/agents/briefing.py``):
+The orchestrator's briefing assembler asks memory a small fixed set of
+queries per dispatched agent. Each is one CLASS here, tagged with its era:
 
-  * three literals   — ``project overview architecture goals`` (:1266),
-    ``coding conventions and project norms`` (:1273),
-    ``recent decisions and rationale`` (:1280)
-  * one PARAMETERIZED family — ``task {task_id} context and related
-    decisions`` (:1288-1290), which must be matched as a TEMPLATE. Matching
-    it literally would scatter one high-traffic class across thousands of
-    singleton tail entries and understate it to nearly zero.
+  * CURRENT classes are rendered from
+    ``shared/src/shared/briefing_queries.py::QUERY_SPECS``, so a reworded
+    template moves the harvester with it. A template with literal text is
+    matched by PATTERN: ``conventions and gotchas for {area}`` is ONE class
+    however many areas it is rendered for. Matching it literally would
+    scatter one high-traffic class across thousands of singleton tail
+    entries and understate it to nearly zero.
+  * The free-text task query ``{title} {area}`` has no literal text, so its
+    pattern would match nearly every query. It is matched as a COMPANION
+    instead: the next search from the same ``caller_agent_id`` after that
+    caller's conventions-area query, within ``COMPANION_WINDOW`` of it. The
+    caller is threaded by
+    ``orchestrator/src/orchestrator/agents/memory_recall.py::MemoryRecall._search``
+    (PRD D8). A spec with no literal text and no declared anchor is refused
+    when the classes are built.
+  * RETIRED classes are the four queries task 3659 retired, kept
+    hand-spelled in ``RETIRED_LITERAL_TEMPLATES`` and
+    ``RETIRED_TASK_TEMPLATE`` for journal rows written before it: their
+    source no longer exists.
 
-All four fire at ``limit=5`` (briefing.py:1376), not the E2 default of 10.
+Every briefing query fires at ``limit=5``, not the E2 default of 10.
 
-Everything that is not one of those four is the residual long tail, which
-is sampled — frequency-led head plus a seeded random remainder — so the
-committed fixture is small, representative and exactly regenerable.
+Everything no class claims is the residual long tail, which is sampled —
+frequency-led head plus a seeded random remainder — so the committed
+fixture is small, representative and exactly regenerable.
 
 THE LIMIT IS MEASURED, NOT ASSUMED
 ----------------------------------
-``briefing.py``:1376 governs the four briefing queries and NOTHING else.
+``BriefingQuerySpec.limit`` governs the briefing queries and NOTHING else.
 The residual tail comes from arbitrary other callers, and the journal shows
 those callers run at 3, 4, 5, 6, 8, 10, 15, 20, 30 and 50 — only about a
 third of tail traffic is at 5. Stamping ``BRIEFING_SEARCH_LIMIT`` onto a
@@ -49,8 +61,9 @@ text:
     never a defaulted or modal guess; a reader who wants a modal value can
     take it from the histogram and own that choice explicitly.
 
-Even the briefing literals are not unanimous (each has one or two stray
-instances at 10/20 out of ~75k at 5), so they too report ``None`` with a
+Even the retired briefing literals were not unanimous in the committed
+harvest (each has one or two stray instances at 10/20 out of ~75k at 5),
+so they too report ``None`` with a
 histogram that makes the 99.99% concentration at 5 visible. The scoring
 window downstream is consequently a stated CHOICE, not a reading.
 
@@ -89,39 +102,226 @@ import json
 import random
 import re
 import sqlite3
+import string
 import sys
-from collections import Counter
+from collections import Counter, defaultdict, deque
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from shared.briefing_queries import (
+    CONVENTIONS_AREA,
+    QUERY_SPECS,
+    TASK_SEMANTIC,
+    BriefingQuerySpec,
+)
+
 from fused_memory.models.scope import resolve_main_checkout
 
+
+class HarvestError(RuntimeError):
+    """Base class for every loud refusal in this module."""
+
+
+class JournalUnavailableError(HarvestError):
+    """The journal is absent, unreadable, or is not a write journal.
+
+    Raised INSTEAD of returning an empty harvest, so a missing file can
+    never be mistaken downstream for "production issues no searches".
+    """
+
+
+class EmptyHarvestError(HarvestError):
+    """The journal is readable but carries no parseable search traffic."""
+
+
+class UnmatchableTemplateError(HarvestError):
+    """A briefing query spec cannot be recognised in the journal.
+
+    Its template has no literal text, so its pattern would match nearly
+    every query, and no anchor class was declared to pair it with instead.
+    """
+
+
 # --------------------------------------------------------------------------
-# The briefing-assembler query family
+# The briefing-assembler query classes
 # --------------------------------------------------------------------------
-#: The three literal briefing queries, in the order briefing.py fires them.
-LITERAL_TEMPLATES: tuple[str, ...] = (
+#: The three literal briefing queries task 3659 retired, in their old firing
+#: order. Their source is gone, so this is now their only home.
+RETIRED_LITERAL_TEMPLATES: tuple[str, ...] = (
     'project overview architecture goals',
     'coding conventions and project norms',
     'recent decisions and rationale',
 )
 
-#: The parameterized fourth query, kept in `str.format` shape so the
+#: The retired parameterized query, kept in `str.format` shape so the
 #: template string itself is what lands in the fixture and the report.
-TASK_TEMPLATE = 'task {task_id} context and related decisions'
+RETIRED_TASK_TEMPLATE = 'task {task_id} context and related decisions'
 
-#: The pattern the parameterized family is matched by. The task id is any
-#: run of non-space characters: ids in this repo are numeric ('4004') but
-#: subtask ids carry a dot ('3.1'), so the class must not assume \d+.
-TASK_TEMPLATE_RE = re.compile(r'^task (?P<task_id>\S+) context and related decisions$')
 
-#: briefing.py:1376 fires the family at limit=5, not the E2 default of 10.
+class BriefingEra(StrEnum):
+    """Whether a class is fired by today's briefing or only by older journal rows."""
+
+    RETIRED = 'retired'
+    CURRENT = 'current'
+
+
+class MatchKind(StrEnum):
+    """How a class recognises its ops."""
+
+    LITERAL = 'literal'
+    PARAMETERIZED = 'parameterized'
+    COMPANION = 'companion'
+
+
+@dataclass(frozen=True)
+class BriefingClass:
+    """One briefing query class: its template and how an op is matched to it.
+
+    A COMPANION class has no pattern. It names instead the template of the
+    `anchor` class whose op, from the same caller, comes just before it.
+    """
+
+    template: str
+    match: MatchKind
+    era: BriefingEra
+    pattern: re.Pattern[str] | None
+    anchor: str | None = None
+
+    def __post_init__(self) -> None:
+        is_companion = self.match is MatchKind.COMPANION
+        if is_companion != (self.pattern is None) or is_companion != (self.anchor is not None):
+            raise ValueError(
+                f'{self.template!r}: a companion class has an anchor and no '
+                'pattern; every other class has a pattern and no anchor'
+            )
+
+
+#: Field patterns narrower than "anything".
+#:
+#: * A task id is any run of non-space characters: ids are numeric ('4004')
+#:   but subtask ids carry a dot ('3.1'), so the class must not assume \d+.
+#: * An area is what `shared/src/shared/briefing_queries.py::derive_area_terms`
+#:   yields: lowercase alphanumeric terms joined by single spaces.
+_FIELD_PATTERNS: dict[str, str] = {
+    'task_id': r'\S+',
+    'area': r'[a-z0-9]+(?: [a-z0-9]+)*',
+}
+_ANY_FIELD_PATTERN = '.+'
+
+#: Fields that can render to nothing. `shared.briefing_queries.render_query`
+#: drops every word already earlier in the query, so an area made only of the
+#: template's own words vanishes together with the space before it.
+_VANISHING_FIELDS: frozenset[str] = frozenset({'area'})
+
+
+def _template_fields(template: str) -> tuple[str, ...]:
+    return tuple(
+        name for _, name, _, _ in string.Formatter().parse(template) if name is not None
+    )
+
+
+def _template_literal_text(template: str) -> str:
+    return ''.join(literal for literal, _, _, _ in string.Formatter().parse(template))
+
+
+def _template_pattern(template: str) -> re.Pattern[str]:
+    """Render a `str.format` template into the pattern its instances fullmatch."""
+    parts: list[str] = []
+    for literal, name, _, _ in string.Formatter().parse(template):
+        if name is None:
+            parts.append(re.escape(literal))
+            continue
+        field_pattern = f'(?P<{name}>{_FIELD_PATTERNS.get(name, _ANY_FIELD_PATTERN)})'
+        if name in _VANISHING_FIELDS and literal.endswith(' '):
+            parts.append(f'{re.escape(literal[:-1])}(?: {field_pattern})?')
+        else:
+            parts.append(re.escape(literal) + field_pattern)
+    return re.compile(''.join(parts))
+
+
+def _pattern_class(template: str, era: BriefingEra) -> BriefingClass:
+    return BriefingClass(
+        template=template,
+        match=MatchKind.PARAMETERIZED if _template_fields(template) else MatchKind.LITERAL,
+        era=era,
+        pattern=_template_pattern(template),
+    )
+
+
+def build_current_classes(
+    specs: Iterable[BriefingQuerySpec],
+    companion_anchors: Mapping[str, str],
+) -> tuple[BriefingClass, ...]:
+    """One current-era class per spec, in `specs` order.
+
+    `companion_anchors` maps a spec slug to the slug of the spec fired just
+    before it by the same caller. A template with no literal text cannot be
+    told apart from an agent's own search by pattern, so it must be named
+    there and is matched as that anchor's companion instead.
+    """
+    specs = tuple(specs)
+    by_slug = {spec.slug: spec for spec in specs}
+    classes: list[BriefingClass] = []
+    for spec in specs:
+        anchor_slug = companion_anchors.get(spec.slug)
+        if anchor_slug is None:
+            classes.append(_current_pattern_class(spec))
+            continue
+        anchor = by_slug.get(anchor_slug)
+        if anchor is None or anchor.slug in companion_anchors:
+            raise UnmatchableTemplateError(
+                f'briefing spec {spec.slug!r} ({spec.text!r}) is declared the '
+                f'companion of {anchor_slug!r}, which is not a pattern-matched '
+                'spec in the table'
+            )
+        classes.append(
+            BriefingClass(
+                template=spec.text,
+                match=MatchKind.COMPANION,
+                era=BriefingEra.CURRENT,
+                pattern=None,
+                anchor=anchor.text,
+            )
+        )
+    return tuple(classes)
+
+
+def _current_pattern_class(spec: BriefingQuerySpec) -> BriefingClass:
+    if not _template_literal_text(spec.text).strip():
+        raise UnmatchableTemplateError(
+            f'briefing spec {spec.slug!r} has template {spec.text!r}, which '
+            'has no literal text to match on; declare the spec it is fired '
+            'beside in companion_anchors'
+        )
+    return _pattern_class(spec.text, BriefingEra.CURRENT)
+
+
+RETIRED_CLASSES: tuple[BriefingClass, ...] = tuple(
+    _pattern_class(template, BriefingEra.RETIRED)
+    for template in (*RETIRED_LITERAL_TEMPLATES, RETIRED_TASK_TEMPLATE)
+)
+
+#: The free-text task query is fired right after the area-scoped
+#: conventions query, by the same caller.
+_COMPANION_ANCHORS: dict[str, str] = {TASK_SEMANTIC.slug: CONVENTIONS_AREA.slug}
+
+CURRENT_CLASSES: tuple[BriefingClass, ...] = build_current_classes(
+    QUERY_SPECS, _COMPANION_ANCHORS
+)
+
+BRIEFING_CLASSES: tuple[BriefingClass, ...] = RETIRED_CLASSES + CURRENT_CLASSES
+
+#: The limit every briefing query fires at (``BriefingQuerySpec.limit`` in
+#: ``shared/src/shared/briefing_queries.py``), not the E2 default of 10.
 #: This is a fact about the BRIEFING ASSEMBLER only. It is never stamped onto
 #: a row as an observation — see "THE LIMIT IS MEASURED, NOT ASSUMED" above.
 #: It survives as the documented default scoring window and as the sidecar's
-#: ``scored_limit``, which is labelled a choice.
+#: ``scored_limit``, which is labelled a choice and pinned to the source's
+#: limit by a test, so drift there forces a decision here.
 BRIEFING_SEARCH_LIMIT = 5
 
 #: Histogram key used when a search op recorded no usable integer ``limit``.
@@ -147,22 +347,6 @@ DEFAULT_TAIL_SAMPLE = 40
 DEFAULT_SEED = 4004
 
 
-class HarvestError(RuntimeError):
-    """Base class for every loud refusal in this module."""
-
-
-class JournalUnavailableError(HarvestError):
-    """The journal is absent, unreadable, or is not a write journal.
-
-    Raised INSTEAD of returning an empty harvest, so a missing file can
-    never be mistaken downstream for "production issues no searches".
-    """
-
-
-class EmptyHarvestError(HarvestError):
-    """The journal is readable but carries no parseable search traffic."""
-
-
 # --------------------------------------------------------------------------
 # Result shapes
 # --------------------------------------------------------------------------
@@ -173,16 +357,21 @@ class TemplateClass:
     text: str
     """The concrete query text this class contributes to the fixture.
 
-    For a literal this IS the template. For the parameterized family it is
-    the most-frequently-observed concrete instance, so the fixture carries
-    real production text rather than a formatting placeholder.
+    The most-frequently-observed instance, so a parameterized or companion
+    class carries real production text rather than a formatting
+    placeholder; for a literal that IS the template. A class nobody fired
+    reports its template, and contributes no fixture row.
     """
 
     template: str
     """The template the class was matched by (== `text` for literals)."""
 
-    match: str
-    """``'literal'`` or ``'parameterized'``."""
+    match: MatchKind
+    """``'literal'``, ``'parameterized'`` (by pattern) or ``'companion'``
+    (by following its anchor class's op from the same caller)."""
+
+    era: BriefingEra
+    """``'retired'`` or ``'current'``."""
 
     observed_count: int
     """Search ops in this class, summed across every instance."""
@@ -216,17 +405,18 @@ class HarvestResult:
     tail_distinct: int
     tail_share: float | None
     literal_share: float | None
-    family_share: float | None
-    """Share of all four BRIEFING TEMPLATES: the 3 literals PLUS the family.
+    """Share of every LITERAL-matched briefing class, in either era."""
 
-    The numerator is `literal_total + family_total`, i.e. the UNION -- not
-    the parameterized `task {task_id} ...` family alone.  The two are far
-    apart and the name invites the wrong reading: in the committed sidecar
-    this is 0.645536 while the parameterized family by itself is 0.125334
-    (its `TemplateClass.traffic_share`).  The CLI prints it under the label
-    `4-template family`, which is the union, and `read_transform_selection`
-    publishes the same union under the same name -- computed independently
-    as the sum of the four template shares.
+    family_share: float | None
+    """Share of EVERY briefing class, in either era: the whole briefing family.
+
+    Not the share of a parameterized class, which the name suggests. In the
+    committed sidecar the union is 0.645536, while the retired
+    `task {task_id} ...` class alone is 0.125334 (its
+    `TemplateClass.traffic_share`).  The CLI prints the union as
+    `briefing family`.  The field keeps its name because
+    `read_transform_selection` publishes the same union, summed
+    independently from the template shares, as `family_share`.
     """
 
     journal_path: str
@@ -234,7 +424,7 @@ class HarvestResult:
     tail_top: int
     seed: int
     briefing_observed_limits: dict[str, int] = field(default_factory=dict)
-    """Measured ``{limit: count}`` across all four briefing classes."""
+    """Measured ``{limit: count}`` across every briefing class."""
 
     tail_observed_limits: dict[str, int] = field(default_factory=dict)
     """Measured ``{limit: count}`` across the WHOLE residual tail.
@@ -261,14 +451,15 @@ class HarvestResult:
             'tail_sample': self.tail_sample,
             'tail_top': self.tail_top,
             'seed': self.seed,
-            # NOT an observation: briefing.py:1376 governs the four briefing
+            # NOT an observation: the briefing's limit governs the briefing
             # queries only.  The measured distributions sit beside it so the
             # difference between the choice and the reading is legible.
             'scored_limit': BRIEFING_SEARCH_LIMIT,
             'scored_limit_is_a_choice': True,
             'scored_limit_basis': (
-                'briefing.py:1376 fires the four briefing-assembler queries '
-                'at limit=5. It governs nothing else. The residual tail is '
+                'BriefingQuerySpec.limit (shared/src/shared/briefing_queries.py) '
+                'fires every briefing-assembler query at limit=5. It governs '
+                'nothing else. The residual tail is '
                 'arbitrary other callers running at 3-50, so scoring the '
                 'tail at 5 is a CHOICE made for comparability with the '
                 'briefing half, not a limit observed on those queries. Per-'
@@ -281,6 +472,7 @@ class HarvestResult:
                     'text': t.text,
                     'template': t.template,
                     'match': t.match,
+                    'era': t.era,
                     'observed_count': t.observed_count,
                     'traffic_share': t.traffic_share,
                     'distinct_instances': t.distinct_instances,
@@ -325,27 +517,41 @@ def _connect_readonly(db_path: Path | str) -> sqlite3.Connection:
     return con
 
 
-def _classify(text: str) -> tuple[str, str] | None:
-    """Return (template, match_kind) for `text`, or None if it is tail.
+@dataclass(frozen=True)
+class _SearchOp:
+    """One parsed ``search`` op from the journal."""
 
-    The parameterized family is matched by PATTERN. Matching it literally
-    would scatter one class across thousands of singletons.
+    text: str
+    limit: int | None
+    caller: str | None
+    at: datetime | None
+
+
+def _journal_time(created_at: object) -> datetime | None:
+    """A ``write_ops.created_at`` value as an aware datetime, or None if it is not one.
+
+    The journal stamps ``datetime.now(UTC).isoformat()``; a value without a
+    zone is unreadable rather than guessed to be UTC.
     """
-    if text in LITERAL_TEMPLATES:
-        return text, 'literal'
-    if TASK_TEMPLATE_RE.match(text):
-        return TASK_TEMPLATE, 'parameterized'
-    return None
+    if not isinstance(created_at, str):
+        return None
+    try:
+        at = datetime.fromisoformat(created_at)
+    except ValueError:
+        return None
+    return at if at.tzinfo is not None else None
 
 
-def _query_op(params: str | None) -> tuple[str, int | None] | None:
-    """Pull ``(query_text, limit)`` out of a ``write_ops.params`` JSON blob.
+def _search_op(params: str | None, created_at: object) -> _SearchOp | None:
+    """Parse a ``write_ops.params`` JSON blob, or None when it carries no query.
 
     The limit rides in the SAME already-parsed dict as the text, so reading
     it costs nothing and discarding it is what forced the old fabricated
     ``observed_limit``.  ``None`` for the limit means the op recorded no
     usable integer one — ``bool`` is excluded explicitly because
-    ``isinstance(True, int)`` is ``True`` in Python.
+    ``isinstance(True, int)`` is ``True`` in Python.  ``None`` for the
+    caller means the op recorded no ``caller_agent_id``, and ``None`` for
+    ``at`` an unreadable ``created_at``; either way the op cannot be paired.
     """
     if not params:
         return None
@@ -364,13 +570,62 @@ def _query_op(params: str | None) -> tuple[str, int | None] | None:
         if isinstance(raw_limit, int) and not isinstance(raw_limit, bool) and raw_limit > 0
         else None
     )
-    return text, limit
+    raw_caller = parsed.get('caller_agent_id')
+    caller = raw_caller if isinstance(raw_caller, str) and raw_caller else None
+    return _SearchOp(text=text, limit=limit, caller=caller, at=_journal_time(created_at))
 
 
-def _query_text(params: str | None) -> str | None:
-    """The text half of :func:`_query_op`, kept as the narrow reader."""
-    op = _query_op(params)
-    return None if op is None else op[0]
+#: Longest a companion op may be journalled after its anchor op.
+#:
+#: A search is journalled when it completes, and the briefing fires its task
+#: query as soon as the area query returns, so a real pair is one search
+#: apart. An anchor older than this is an orphan: its companion was never
+#: journalled, and pairing it would claim an unrelated later search.
+COMPANION_WINDOW = timedelta(seconds=60)
+
+
+class _Classifier:
+    """Classifies search ops read in journal order, for ONE `harvest` call.
+
+    A pattern class claims every op its pattern fullmatches. A companion
+    class claims the next op no pattern claims from a caller with an
+    unpaired anchor op at most `COMPANION_WINDOW` older. Unpaired anchors
+    are QUEUED per caller, because parallel dispatches can share one caller
+    id and interleave their pairs.
+    """
+
+    def __init__(self, classes: tuple[BriefingClass, ...]) -> None:
+        self._patterns = [(c, c.pattern) for c in classes if c.pattern is not None]
+        self._companions = {c.anchor: c for c in classes if c.anchor is not None}
+        self._unpaired: defaultdict[tuple[str, str], deque[datetime]] = defaultdict(deque)
+
+    def classify(self, op: _SearchOp) -> BriefingClass | None:
+        """The class `op` belongs to, or None if it is tail."""
+        for cls, pattern in self._patterns:
+            if pattern.fullmatch(op.text):
+                if (
+                    op.caller is not None
+                    and op.at is not None
+                    and cls.template in self._companions
+                ):
+                    self._unpaired[(op.caller, cls.template)].append(op.at)
+                return cls
+        if op.caller is None or op.at is None:
+            return None
+        for anchor, companion in self._companions.items():
+            if self._claim_anchor(op.caller, anchor, op.at):
+                return companion
+        return None
+
+    def _claim_anchor(self, caller: str, anchor: str, at: datetime) -> bool:
+        """Consume `caller`'s oldest `anchor` op still inside the window at `at`."""
+        pending = self._unpaired[(caller, anchor)]
+        while pending and at - pending[0] > COMPANION_WINDOW:
+            pending.popleft()
+        if not pending:
+            return False
+        pending.popleft()
+        return True
 
 
 def _limit_histogram(counter: Counter[int | None]) -> dict[str, int]:
@@ -407,6 +662,95 @@ def _share(count: int, total: int) -> float | None:
     if total <= 0:
         return None
     return round(count / total, 6)
+
+
+def _template_class(
+    cls: BriefingClass,
+    instances: Counter[str],
+    limits: Counter[int | None],
+    total: int,
+) -> TemplateClass:
+    """Measure one class from its per-text instance counts and its limits."""
+    observed = sum(instances.values())
+    # The fixture text is the most-frequent real instance, so a parameterized
+    # class carries production text rather than a '{field}' placeholder.
+    text = (
+        min(instances.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+        if instances
+        else cls.template
+    )
+    return TemplateClass(
+        text=text,
+        template=cls.template,
+        match=cls.match,
+        era=cls.era,
+        observed_count=observed,
+        traffic_share=_share(observed, total),
+        distinct_instances=len(instances),
+        observed_limits=_limit_histogram(limits),
+        observed_limit=_unanimous_limit(limits),
+    )
+
+
+class _ClassTally:
+    """Search ops split into briefing classes and the residual tail.
+
+    Lives for exactly one `harvest` call.
+    """
+
+    def __init__(self, classes: tuple[BriefingClass, ...]) -> None:
+        self._classes = classes
+        self._instances: dict[BriefingClass, Counter[str]] = {c: Counter() for c in classes}
+        self._limits: dict[BriefingClass, Counter[int | None]] = {
+            c: Counter() for c in classes
+        }
+        self._tail_instances: Counter[str] = Counter()
+        self._tail_limits: dict[str, Counter[int | None]] = {}
+
+    def add(self, cls: BriefingClass | None, text: str, limit: int | None) -> None:
+        """Count one op of `text` at `limit` in `cls`, or in the tail for None."""
+        if cls is None:
+            self._tail_instances[text] += 1
+            self._tail_limits.setdefault(text, Counter())[limit] += 1
+        else:
+            self._instances[cls][text] += 1
+            self._limits[cls][limit] += 1
+
+    def template_classes(self, total: int) -> list[TemplateClass]:
+        return [
+            _template_class(cls, self._instances[cls], self._limits[cls], total)
+            for cls in self._classes
+        ]
+
+    def briefing_limits(self) -> Counter[int | None]:
+        return sum(self._limits.values(), Counter())
+
+    def tail_counts(self) -> Counter[str]:
+        """Tail ops per distinct query text."""
+        return Counter(self._tail_instances)
+
+    def tail_limits_of(self, text: str) -> Counter[int | None]:
+        """The limits the tail ops of `text` ran at."""
+        return Counter(self._tail_limits.get(text, Counter()))
+
+    def tail_limits(self) -> Counter[int | None]:
+        return sum(self._tail_limits.values(), Counter())
+
+
+def _briefing_row(tpl: TemplateClass) -> dict[str, Any]:
+    return {
+        'query_id': _query_id(tpl.text, 'briefing_template'),
+        'text': tpl.text,
+        'source': 'briefing_template',
+        'template': tpl.template,
+        'match': tpl.match,
+        'era': tpl.era,
+        'observed_count': tpl.observed_count,
+        'observed_limit': tpl.observed_limit,
+        'observed_limits': tpl.observed_limits,
+        'traffic_share': tpl.traffic_share,
+        'distinct_instances': tpl.distinct_instances,
+    }
 
 
 def _main_checkout_root() -> Path:
@@ -467,6 +811,11 @@ def harvest(
 ) -> HarvestResult:
     """Measure the production query distribution in one read-only pass.
 
+    Every search op is classified in journal order into a briefing class
+    (`BRIEFING_CLASSES`) or the residual tail. `templates` lists every class,
+    a measured zero included; fixture rows are emitted for observed classes
+    and for the tail sample.
+
     The tail sample is deterministic given (journal contents, tail_sample,
     tail_top, seed): a frequency-led head (sorted by -count then text, so
     ties break stably) plus a seeded random draw over the sorted remainder.
@@ -477,11 +826,9 @@ def harvest(
         tail_top = max(1, tail_sample // 2)
     tail_top = min(tail_top, tail_sample)
 
-    counts: Counter[str] = Counter()
-    # The limit rides in the same params blob as the text, so it is
-    # accumulated in the same pass.  Discarding it is what produced the
-    # fabricated `observed_limit` this keying replaces.
-    limits: dict[str, Counter[int | None]] = {}
+    classifier = _Classifier(BRIEFING_CLASSES)
+    tally = _ClassTally(BRIEFING_CLASSES)
+    total = 0
     unparsed = 0
 
     con = _connect_readonly(db_path)
@@ -521,16 +868,19 @@ def harvest(
             # multi-hundred-MB allocation, and `fetchmany()` chunking is not
             # an improvement: it would cap memory identically without
             # releasing the snapshot any earlier.
-            for (params,) in con.execute(
-                "SELECT params FROM write_ops WHERE operation = 'search'"
+            #
+            # In journal (rowid) order, because a companion op is recognised
+            # by its position and time after its anchor.
+            for params, created_at in con.execute(
+                "SELECT params, created_at FROM write_ops WHERE operation = 'search' "
+                "ORDER BY rowid"
             ):
-                op = _query_op(params)
+                op = _search_op(params, created_at)
                 if op is None:
                     unparsed += 1
                     continue
-                text, limit = op
-                counts[text] += 1
-                limits.setdefault(text, Counter())[limit] += 1
+                total += 1
+                tally.add(classifier.classify(op), op.text, op.limit)
         # Deliberately wrapped around the WHOLE loop, not just the
         # `execute()`: streaming moves the point of failure, so a `disk I/O
         # error` can now surface on any `next()` mid-scan.  Narrowing this
@@ -547,64 +897,13 @@ def harvest(
     finally:
         con.close()
 
-    total = sum(counts.values())
+    templates = tally.template_classes(total)
+    tail_counts = tally.tail_counts()
 
-    # Fold every observed query into its class.
-    literal_counts: dict[str, int] = {t: 0 for t in LITERAL_TEMPLATES}
-    family_counts: Counter[str] = Counter()
-    tail_counts: Counter[str] = Counter()
-    literal_limits: dict[str, Counter[int | None]] = {
-        t: Counter() for t in LITERAL_TEMPLATES
-    }
-    family_limits: Counter[int | None] = Counter()
-    tail_limits: Counter[int | None] = Counter()
-    for text, n in counts.items():
-        classified = _classify(text)
-        seen_limits = limits.get(text, Counter())
-        if classified is None:
-            tail_counts[text] += n
-            tail_limits.update(seen_limits)
-        elif classified[1] == 'literal':
-            literal_counts[text] += n
-            literal_limits[text].update(seen_limits)
-        else:
-            family_counts[text] += n
-            family_limits.update(seen_limits)
-
-    templates: list[TemplateClass] = [
-        TemplateClass(
-            text=text,
-            template=text,
-            match='literal',
-            observed_count=literal_counts[text],
-            traffic_share=_share(literal_counts[text], total),
-            observed_limits=_limit_histogram(literal_limits[text]),
-            observed_limit=_unanimous_limit(literal_limits[text]),
-        )
-        for text in LITERAL_TEMPLATES
-    ]
-    family_total = sum(family_counts.values())
-    # The family's fixture text is its most-frequent real instance, so the
-    # fixture carries production text rather than a '{task_id}' placeholder.
-    family_text = (
-        min(family_counts.items(), key=lambda kv: (-kv[1], kv[0]))[0]
-        if family_counts
-        else TASK_TEMPLATE.format(task_id='0000')
+    literal_total = sum(
+        t.observed_count for t in templates if t.match is MatchKind.LITERAL
     )
-    templates.append(
-        TemplateClass(
-            text=family_text,
-            template=TASK_TEMPLATE,
-            match='parameterized',
-            observed_count=family_total,
-            traffic_share=_share(family_total, total),
-            distinct_instances=len(family_counts),
-            observed_limits=_limit_histogram(family_limits),
-            observed_limit=_unanimous_limit(family_limits),
-        )
-    )
-
-    literal_total = sum(literal_counts.values())
+    briefing_total = sum(t.observed_count for t in templates)
     tail_total = sum(tail_counts.values())
 
     # --- deterministic tail sample -------------------------------------
@@ -641,24 +940,13 @@ def harvest(
         [*head, *drawn], key=lambda kv: kv[0]
     ) # emitted rows are text-sorted so the fixture diffs cleanly
 
-    fixture_rows: list[dict[str, Any]] = []
-    for tpl in templates:
-        fixture_rows.append(
-            {
-                'query_id': _query_id(tpl.text, 'briefing_template'),
-                'text': tpl.text,
-                'source': 'briefing_template',
-                'template': tpl.template,
-                'match': tpl.match,
-                'observed_count': tpl.observed_count,
-                'observed_limit': tpl.observed_limit,
-                'observed_limits': tpl.observed_limits,
-                'traffic_share': tpl.traffic_share,
-                'distinct_instances': tpl.distinct_instances,
-            }
-        )
+    # A class nobody fired has no production text to score; its measured
+    # zero stays visible in `templates` and the sidecar.
+    fixture_rows: list[dict[str, Any]] = [
+        _briefing_row(tpl) for tpl in templates if tpl.observed_count > 0
+    ]
     for text, n in sampled:
-        seen_limits = limits.get(text, Counter())
+        seen_limits = tally.tail_limits_of(text)
         row = {
             'query_id': _query_id(text, 'production_tail'),
             'text': text,
@@ -685,17 +973,13 @@ def harvest(
         tail_distinct=len(tail_counts),
         tail_share=_share(tail_total, total),
         literal_share=_share(literal_total, total),
-        # The UNION of all four briefing templates, not the parameterized
-        # family alone -- see `HarvestResult.family_share`.
-        family_share=_share(literal_total + family_total, total),
+        family_share=_share(briefing_total, total),
         journal_path=_repo_relative(db_path),
         tail_sample=tail_sample,
         tail_top=tail_top,
         seed=seed,
-        briefing_observed_limits=_limit_histogram(
-            sum(literal_limits.values(), Counter()) + family_limits
-        ),
-        tail_observed_limits=_limit_histogram(tail_limits),
+        briefing_observed_limits=_limit_histogram(tally.briefing_limits()),
+        tail_observed_limits=_limit_histogram(tally.tail_limits()),
         harvested_at=datetime.now(UTC).isoformat(),
     )
 
@@ -773,10 +1057,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     out = write_fixture(result, args.out)
     print(f'wrote {len(result.rows)} rows -> {out}')
-    print(f'  total search ops : {result.total_search_ops}')
-    print(f'  3 literals       : {result.literal_share}')
-    print(f'  4-template family: {result.family_share}')
-    print(f'  residual tail    : {result.tail_share} over {result.tail_distinct} distinct')
+    print(f'  total search ops  : {result.total_search_ops}')
+    print(f'  literal templates : {result.literal_share}')
+    print(f'  briefing family   : {result.family_share}')
+    print(f'  residual tail     : {result.tail_share} over {result.tail_distinct} distinct')
     return 0
 
 
