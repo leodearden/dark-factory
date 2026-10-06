@@ -51,6 +51,10 @@ MARKUP_UNATTRIBUTED_SUBJECT = 'unattributed'
 MARKUP_RESIDUE_ERROR_TYPE = 'mcp_markup_unrepairable'
 MARKUP_STORM_ERROR_TYPE = 'mcp_markup_storm'
 
+#: The ERROR line for a record the queue could not take: why, what it cost
+#: (:func:`_loss_account`), and whose call it was.
+_LOSS_LOG_FORMAT = 'markup guard: %s, so %s (subject %r)'
+
 #: The burst alarm's OWN category and level, because the middleware's storm
 #: record declares neither — unlike the residue record, which carries both and
 #: whose vocabulary is therefore never re-decided here (INV-7).
@@ -699,13 +703,8 @@ def make_escalation_sink(
     project_root: Path | None = None
     channel: tuple[Any, Any] | None = None
 
-    def report_lost(
-        record: dict[str, Any], why: str, *, exc_info: bool = False,
-    ) -> None:
-        logger.error(
-            'markup guard: %s, so %s (subject %r)',
-            why, _loss_account(record), _subject(), exc_info=exc_info,
-        )
+    def report_lost(record: dict[str, Any], why: str) -> None:
+        logger.error(_LOSS_LOG_FORMAT, why, _loss_account(record), _subject())
 
     def file_record(record: dict[str, Any]) -> str | None:
         """The blocking body, run on a worker thread."""
@@ -744,8 +743,9 @@ def make_escalation_sink(
                 escalation_cls, queue, worktree, _subject(), record, spec,
             )
         except Exception:
-            report_lost(
-                record, 'the escalation could not be submitted', exc_info=True,
+            logger.error(
+                _LOSS_LOG_FORMAT, 'the escalation could not be submitted',
+                _loss_account(record), _subject(), exc_info=True,
             )
             return None
 
