@@ -894,31 +894,42 @@ class _LedgerWrite(NamedTuple):
     error: str | None
 
 
+def _ledger_fault(
+    cfg: LegibilityConfig, target_date: date, *, failed: int, error: Exception,
+) -> _LedgerWrite:
+    outcome = _LedgerWrite(written=0, failed=failed, error=str(error))
+    logger.warning(
+        'legibility trickle ledger: project=%s date=%s rows_written=%d '
+        'rows_failed=%d error=%s',
+        cfg.project_id, target_date.isoformat(), outcome.written,
+        outcome.failed, outcome.error,
+    )
+    return outcome
+
+
 def _ledger_coded_sessions(
     cfg: LegibilityConfig, records, target_date: date, now: datetime | None,
 ) -> _LedgerWrite:
     """Record every merged coding in the session ledger so the census skips
-    those sessions. A ledger fault is logged and counted, never raised."""
-    rows = session_ledger.rows_for(
-        records,
-        coded_by=session_ledger.CodedBy.TRICKLE,
-        run_ref=f'trickle-{cfg.project_id}-{target_date:%Y%m%d}',
-        instrument_version=digest.DIGEST_INSTRUMENT_VERSION,
-        coded_at=now if now is not None else datetime.now(UTC),
-    )
+    those sessions. A ledger fault -- rows that will not build (e.g. a naive
+    *now*) or a write that fails -- is logged and counted, never raised."""
+    records = list(records)
+    try:
+        rows = session_ledger.rows_for(
+            records,
+            coded_by=session_ledger.CodedBy.TRICKLE,
+            run_ref=f'trickle-{cfg.project_id}-{target_date:%Y%m%d}',
+            instrument_version=digest.DIGEST_INSTRUMENT_VERSION,
+            coded_at=now if now is not None else datetime.now(UTC),
+        )
+    except ValueError as exc:
+        return _ledger_fault(cfg, target_date, failed=len(records), error=exc)
     try:
         written = session_ledger.record_codings(
             session_ledger.ledger_path(cfg.project_id), rows,
         )
     except session_ledger.LedgerError as exc:
-        outcome = _LedgerWrite(written=0, failed=len(rows), error=str(exc))
-        logger.warning(
-            'legibility trickle ledger: project=%s date=%s rows_written=%d '
-            'rows_failed=%d error=%s',
-            cfg.project_id, target_date.isoformat(), outcome.written,
-            outcome.failed, outcome.error,
-        )
-        return outcome
+        return _ledger_fault(cfg, target_date, failed=len(rows), error=exc)
     logger.info(
         'legibility trickle ledger: project=%s date=%s rows_written=%d rows_failed=%d',
         cfg.project_id, target_date.isoformat(), written, 0,

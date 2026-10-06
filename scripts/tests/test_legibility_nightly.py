@@ -3758,7 +3758,7 @@ _BRANCH_NEEDS_MONKEYPATCH = (
 def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
                      branch=None, recorder=None, budget_bytes=None,
                      invoke=_fake_invoke_known_cause, committer=None, poster=None,
-                     transcript=True):
+                     transcript=True, now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)):
     """Run ``run_nightly`` end to end on a real temp git repo + transcript and
     return ``(result, repo)``.
 
@@ -3812,7 +3812,7 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
         config_path=config_path,
         projects_root=projects_root,
         target_date=date(2026, 7, 13),
-        now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+        now=now,
         invoke=invoke,
         status_fetcher=None,
         poster=poster if poster is not None else (lambda url, envelope: None),
@@ -5131,6 +5131,23 @@ class TestRunNightlyLedgersCodedSessions:
             if r.levelno == logging.WARNING and str(path) in r.getMessage()
         ]
         assert len(naming_the_path) == 1, [r.getMessage() for r in naming_the_path]
+
+    def test_rows_that_will_not_build_are_counted_and_never_fail_the_night(
+        self, tmp_path, caplog,
+    ):
+        naive_now = datetime(2026, 7, 14, 3, 0, 0)
+
+        with caplog.at_level(logging.WARNING, logger='legibility.nightly'):
+            result, _repo = _run_e2e_nightly(tmp_path, now=naive_now)
+
+        assert result.exit_code == 0
+        assert result.commit_made is True
+        assert result.census_line is not None
+        assert result.ledger_rows_written == 0
+        assert result.ledger_rows_failed == 1
+        assert result.reason is not None
+        assert 'coded_at' in result.reason
+        assert _ledger().sessions == frozenset()
 
     def test_rerunning_the_night_ledgers_nothing_twice(self, tmp_path):
         (tmp_path / 'first').mkdir()
