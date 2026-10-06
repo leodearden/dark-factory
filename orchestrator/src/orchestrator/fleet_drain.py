@@ -1,4 +1,4 @@
-"""The restart-drain request: reader, honour decision and event tracker (task 5371).
+"""The restart-drain request and one unit's part in the drain (task 5371).
 
 ``scripts/restart-all-orchestrators.sh --drain`` asks each orchestrator unit to
 stop starting merge verifies by writing ``<fleet_dir>/<unit>.drain.json``; each
@@ -6,8 +6,10 @@ unit's merge-heartbeat pass reads its own request, decides whether to honour
 it, halts or resumes merge admission accordingly, and acknowledges in its
 heartbeat.  This module owns the reader's half of that contract: the request
 path, its parse, the closed refusal vocabulary, the honour decision and the
-one-``fleet_drain``-event-per-request bookkeeping.  The writer is the script;
-the full contract is the 5371 spec's Contracts 1 and 2 and its Event section.
+one-``fleet_drain``-event-per-request bookkeeping, composed into
+:class:`DrainParticipant`, the unit-side driver a harness wires to its merge
+lane.  The writer is the script; the full contract is the 5371 spec's
+Contracts 1 and 2 and its Event section.
 
 Like ``orchestrator.fleet_heartbeat``, kept dependency-free of ``Harness``:
 every ambient fact (environment, clock, process liveness) is passed in.
@@ -15,13 +17,15 @@ every ambient fact (environment, clock, process liveness) is passed in.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from orchestrator.fleet_heartbeat import is_bare_unit_name
 
@@ -352,3 +356,113 @@ class DrainEventTracker:
         self._ended_key = pending.request.key
         self._pending = None
         return pending.end(outcome, now=now, killed=killed, refused=refused)
+
+
+class AdmissionPort(Protocol):
+    """The merge lane as a :class:`DrainParticipant` drives it.
+
+    ``snapshot()`` must carry ``depth`` and the lane's ``restart_drain`` view
+    (``admission_halted``, ``verifies_in_flight``); a key it lacks reads as
+    not halted, nothing in flight.
+    """
+
+    def halt_admission(self, reason: str) -> None: ...
+
+    def resume_admission(self) -> None: ...
+
+    def snapshot(self) -> Mapping[str, Any]: ...
+
+
+@dataclass(frozen=True)
+class DrainPass:
+    """What one heartbeat pass needs from the drain: its two heartbeat fields
+    and the lane depth read in the same snapshot (``None``: no lane)."""
+
+    drain: dict[str, Any] | None
+    verifies_in_flight: list[dict[str, Any]]
+    depth: int | None
+
+
+class DrainParticipant:
+    """One orchestrator unit's side of the restart drain.
+
+    :meth:`on_heartbeat_pass` reads this unit's request, halts the lane's
+    admission while it is honoured and resumes it the moment it is not,
+    reads the lane once, and ends an honoured request with its single
+    ``fleet_drain`` event; :meth:`on_shutdown` ends one still open with what
+    the stop is about to kill.  Every source is injected and read on each
+    call, so the owner's environment, fleet dir and lane may come and go.
+    """
+
+    def __init__(
+        self,
+        *,
+        lane: Callable[[], AdmissionPort | None],
+        fleet_dir: Callable[[], Path],
+        identity: Callable[[], DrainIdentity],
+        emit: Callable[[FleetDrainEvent], None],
+        clock: Callable[[], float] = time.time,
+        pid_alive: Callable[[int], bool] = sweep_alive,
+    ) -> None:
+        self._lane = lane
+        self._fleet_dir = fleet_dir
+        self._identity = identity
+        self._emit = emit
+        self._clock = clock
+        self._pid_alive = pid_alive
+        self._events = DrainEventTracker()
+
+    async def on_heartbeat_pass(self) -> DrainPass:
+        identity = self._identity()
+        request = await asyncio.to_thread(
+            read_drain_request, drain_request_path(self._fleet_dir(), identity.unit),
+        )
+        verdict = evaluate_drain_request(
+            request, identity, now=self._clock(), pid_alive=self._pid_alive,
+        )
+        honoured = verdict.request if verdict is not None and verdict.honoured else None
+        lane = self._lane()
+        if lane is None:
+            depth, admission_halted, in_flight = None, honoured is not None, []
+        else:
+            depth, admission_halted, in_flight = _steer(lane, honoured)
+        self._emit_all(self._events.observe(verdict, in_flight, now=self._clock()))
+        return DrainPass(
+            drain=(
+                None if verdict is None
+                else verdict.heartbeat_block(admission_halted=admission_halted)
+            ),
+            verifies_in_flight=in_flight,
+            depth=depth,
+        )
+
+    def on_shutdown(self) -> None:
+        lane = self._lane()
+        in_flight = [] if lane is None else _drain_view(lane.snapshot())[1]
+        self._emit_all(self._events.shutdown(in_flight, now=self._clock()))
+
+    def _emit_all(self, events: Iterable[FleetDrainEvent]) -> None:
+        for event in events:
+            self._emit(event)
+
+
+def _steer(
+    lane: AdmissionPort, honoured: DrainRequest | None,
+) -> tuple[int, bool, list[dict[str, Any]]]:
+    """Halt or resume *lane* for *honoured*, then read it once.
+
+    ``admission_halted`` is read BACK from the lane, so a heartbeat never
+    claims a halt the lane does not hold.
+    """
+    if honoured is not None:
+        lane.halt_admission(f'fleet restart drain requested_ts={honoured.requested_ts}')
+    else:
+        lane.resume_admission()
+    snapshot = lane.snapshot()
+    admission_halted, in_flight = _drain_view(snapshot)
+    return int(snapshot.get('depth', 1)), admission_halted, in_flight
+
+
+def _drain_view(snapshot: Mapping[str, Any]) -> tuple[bool, list[dict[str, Any]]]:
+    view = snapshot.get('restart_drain', {})
+    return bool(view.get('admission_halted', False)), list(view.get('verifies_in_flight', []))

@@ -15,7 +15,7 @@ import os
 import re
 import time
 from collections import Counter, deque
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -73,15 +73,7 @@ from orchestrator.deterministic_runner import (
     build_milestone_gate_escalation_fields,
 )
 from orchestrator.event_store import EventStore, EventType
-from orchestrator.fleet_drain import (
-    DrainEventTracker,
-    DrainIdentity,
-    DrainVerdict,
-    FleetDrainEvent,
-    drain_request_path,
-    evaluate_drain_request,
-    read_drain_request,
-)
+from orchestrator.fleet_drain import DrainIdentity, DrainParticipant, FleetDrainEvent
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
 from orchestrator.git_ops import GitOps, classify_worktree_entry
 from orchestrator.landed_outbox import MergeProvenance
@@ -1670,17 +1662,6 @@ def _already_landed_gate_shape(*, has_open_escalation: bool | None) -> str:
     return render_shape('pending', None, None, has_open_escalation, None)
 
 
-@dataclass(frozen=True)
-class _MergeLaneReading:
-    """What one merge-heartbeat pass read off the merge lane (task 5371)."""
-
-    merge_idle: bool
-    depth: int
-    queue_empty: bool
-    admission_halted: bool
-    verifies_in_flight: list[dict[str, Any]]
-
-
 class Harness:
     """Top-level orchestration loop."""
 
@@ -2154,9 +2135,17 @@ class Harness:
         self._merge_inflight_registry: InFlightMergeRegistry = InFlightMergeRegistry()
         self._merge_worker: SpeculativeMergeWorker | None = None
         self._merge_worker_task: asyncio.Task | None = None
-        # One fleet_drain event per honoured restart-drain request (task 5371),
-        # fed by the merge-heartbeat pass and by _stop_merge_worker.
-        self._drain_events = DrainEventTracker()
+        # This unit's side of the restart drain (task 5371): steers the merge
+        # worker's admission from the heartbeat pass, reports at stop.
+        self._drain_participant = DrainParticipant(
+            lane=lambda: self._merge_worker,
+            fleet_dir=resolve_fleet_dir,
+            identity=lambda: DrainIdentity.from_environ(
+                os.environ,
+                max_age_secs=self.config.orchestrator_restart_lease_max_age_secs,
+            ),
+            emit=self._emit_fleet_drain,
+        )
         # Durable journal for in-flight merge requests (task 1772).
         # Persisted at data/orchestrator/merge_queue.json; recovered on restart
         # by _recover_pending_merges (called from run() after _rehydrate_merge_halt).
@@ -12151,7 +12140,10 @@ class Harness:
         in flight now is what the stop kills (task 5371).
         """
         if self._merge_worker_task is not None and self._merge_worker is not None:
-            self._report_drain_at_shutdown(self._merge_worker)
+            try:
+                self._drain_participant.on_shutdown()
+            except Exception:
+                logger.warning('fleet_drain shutdown report failed (fail-open)', exc_info=True)
             await self._merge_worker.stop()
             self._merge_worker_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -12721,15 +12713,13 @@ class Harness:
     async def _write_merge_heartbeat(self) -> None:
         """Write this unit's fleet-common merge heartbeat (task 2395, α).
 
-        Each pass first reads this unit's restart-drain request and halts or
-        resumes merge admission to match (``_apply_drain_and_read_lane``,
-        task 5371), then publishes the five legacy fields plus the ``drain``
-        acknowledgement and the merge verifies in flight from a SINGLE
-        ``self._merge_worker.snapshot()`` read. ``merge_idle`` keeps the exact
-        formula ``_merge_pipeline_idle`` uses (``queue_empty and depth == 0``,
-        a missing ``'depth'`` treated as ``1``). The file read and the
-        serialize+atomic-write run in a thread (``asyncio.to_thread``); every
-        in-memory read happens on the loop.
+        The drain participant first steers merge admission from this unit's
+        restart-drain request and reads the lane once (task 5371); its
+        reading supplies ``depth`` and the ``drain`` / ``verifies_in_flight``
+        fields. ``merge_idle`` keeps the exact formula ``_merge_pipeline_idle``
+        uses (``queue_empty and depth == 0``); with no worker it is
+        ``_merge_pipeline_idle()`` itself. The serialize+atomic-write runs in
+        a thread (``asyncio.to_thread``).
 
         The ``pass_fn`` of the merge-heartbeat service, so it refreshes on
         its own cadence whatever the dispatch loop is doing (task 5344).
@@ -12738,89 +12728,32 @@ class Harness:
         """
         try:
             unit = os.environ.get('ORCH_UNIT', '')
-            fleet_dir = resolve_fleet_dir()
-            request = await asyncio.to_thread(
-                read_drain_request, drain_request_path(fleet_dir, unit),
-            )
-            verdict = evaluate_drain_request(
-                request,
-                DrainIdentity.from_environ(
-                    os.environ,
-                    max_age_secs=self.config.orchestrator_restart_lease_max_age_secs,
-                ),
-                now=time.time(),
-            )
-            lane = self._apply_drain_and_read_lane(verdict)
-            ts_epoch = time.time()
-            self._emit_drain_events(
-                self._drain_events.observe(verdict, lane.verifies_in_flight, now=ts_epoch),
-            )
+            reading = await self._drain_participant.on_heartbeat_pass()
+            queue_empty = self._merge_queue.empty()
+            if reading.depth is None:
+                depth, merge_idle = 0, self._merge_pipeline_idle()
+            else:
+                depth, merge_idle = reading.depth, queue_empty and reading.depth == 0
             payload = build_heartbeat_payload(
                 unit=unit,
-                merge_idle=lane.merge_idle,
-                depth=lane.depth,
-                queue_empty=lane.queue_empty,
-                ts_epoch=ts_epoch,
-                drain=(
-                    None if verdict is None
-                    else verdict.heartbeat_block(admission_halted=lane.admission_halted)
-                ),
-                verifies_in_flight=lane.verifies_in_flight,
+                merge_idle=merge_idle,
+                depth=depth,
+                queue_empty=queue_empty,
+                ts_epoch=time.time(),
+                drain=reading.drain,
+                verifies_in_flight=reading.verifies_in_flight,
             )
-            await asyncio.to_thread(write_heartbeat, fleet_dir, unit, payload)
+            await asyncio.to_thread(write_heartbeat, resolve_fleet_dir(), unit, payload)
         except Exception:
             logger.warning(
                 'merge heartbeat write failed; continuing (fail-open)',
                 exc_info=True,
             )
 
-    def _report_drain_at_shutdown(self, worker: SpeculativeMergeWorker) -> None:
-        """Emit the open drain request's ``verifies_killed`` (or ``drained``) event.
-
-        Fail-open: a shutdown must never be held up by its own telemetry.
-        """
-        try:
-            in_flight = worker.snapshot()['restart_drain']['verifies_in_flight']
-            self._emit_drain_events(self._drain_events.shutdown(in_flight, now=time.time()))
-        except Exception:
-            logger.warning('fleet_drain shutdown report failed (fail-open)', exc_info=True)
-
-    def _emit_drain_events(self, events: Iterable[FleetDrainEvent]) -> None:
-        for event in events:
-            logger.info('fleet_drain: %s', event.as_payload())
-            if self.event_store is not None:
-                self.event_store.emit(EventType.fleet_drain, data=event.as_payload())
-
-    def _apply_drain_and_read_lane(self, verdict: DrainVerdict | None) -> _MergeLaneReading:
-        """Set or clear the merge worker's admission halt for *verdict*, then
-        read the lane once (task 5371).
-
-        A drain halts admission only while its request is honoured, so a
-        request that goes away or stops being honoured releases the lane on
-        this same pass. ``admission_halted`` is read back from the worker, so
-        the heartbeat never claims a halt the worker does not hold. With no
-        worker there is nothing to halt and nothing in flight.
-        """
-        queue_empty = self._merge_queue.empty()
-        honoured = verdict.request if verdict is not None and verdict.honoured else None
-        worker = self._merge_worker
-        if worker is None:
-            return _MergeLaneReading(
-                merge_idle=self._merge_pipeline_idle(), depth=0, queue_empty=queue_empty,
-                admission_halted=honoured is not None, verifies_in_flight=[],
-            )
-        if honoured is not None:
-            worker.halt_admission(f'fleet restart drain requested_ts={honoured.requested_ts}')
-        else:
-            worker.resume_admission()
-        snapshot = worker.snapshot()
-        depth = int(snapshot.get('depth', 1))
-        drain_view = snapshot.get('restart_drain', {})
-        return _MergeLaneReading(
-            merge_idle=queue_empty and depth == 0, depth=depth, queue_empty=queue_empty,
-            admission_halted=bool(drain_view.get('admission_halted', False)),
-            verifies_in_flight=list(drain_view.get('verifies_in_flight', [])),
-        )
+    def _emit_fleet_drain(self, event: FleetDrainEvent) -> None:
+        logger.info('fleet_drain: %s', event.as_payload())
+        if self.event_store is not None:
+            self.event_store.emit(EventType.fleet_drain, data=event.as_payload())
 
     def _build_task_status_lookup(self) -> Callable[[str], Awaitable[str | None]]:
         """Return an async callable (task_id) -> str|None backed by the scheduler.

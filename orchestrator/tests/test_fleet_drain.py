@@ -18,8 +18,11 @@ from orchestrator.fleet_drain import (
     DrainEventTracker,
     DrainIdentity,
     DrainOutcome,
+    DrainParticipant,
+    DrainPass,
     DrainRefusal,
     DrainRequest,
+    FleetDrainEvent,
     MalformedDrainRequest,
     drain_request_path,
     evaluate_drain_request,
@@ -285,3 +288,141 @@ class TestDrainEventTracker:
         assert tracker.observe(refused, [], now=REQUESTED_TS + 1.0) == ()
         assert tracker.observe(None, [], now=REQUESTED_TS + 2.0) == ()
         assert tracker.shutdown([_verify('a')], now=REQUESTED_TS + 3.0) == ()
+
+
+class _FakeLane:
+    """An ``AdmissionPort`` whose snapshot reports what it was told to hold."""
+
+    def __init__(
+        self, *, in_flight: list[dict[str, object]] | None = None, depth: int = 0,
+        obeys: bool = True,
+    ) -> None:
+        self.in_flight = in_flight or []
+        self.depth = depth
+        self.obeys = obeys
+        self.halted = False
+        self.halt_reasons: list[str] = []
+
+    def halt_admission(self, reason: str) -> None:
+        self.halt_reasons.append(reason)
+        self.halted = self.obeys
+
+    def resume_admission(self) -> None:
+        self.halted = False
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            'depth': self.depth,
+            'restart_drain': {
+                'admission_halted': self.halted, 'verifies_in_flight': list(self.in_flight),
+            },
+        }
+
+
+@pytest.mark.asyncio
+class TestDrainParticipant:
+    """The unit side of the drain, driven through its two public calls."""
+
+    NOW = REQUESTED_TS + 30.0
+
+    def _participant(
+        self, tmp_path: Path, lane: _FakeLane | None, events: list[FleetDrainEvent],
+        *, pid_alive=_alive,
+    ) -> DrainParticipant:
+        return DrainParticipant(
+            lane=lambda: lane,
+            fleet_dir=lambda: tmp_path,
+            identity=lambda: IDENTITY,
+            emit=events.append,
+            clock=lambda: self.NOW,
+            pid_alive=pid_alive,
+        )
+
+    async def test_an_honoured_request_halts_admission_and_drains_once(self, tmp_path: Path) -> None:
+        lane, events = _FakeLane(depth=3), []
+        participant = self._participant(tmp_path, lane, events)
+        _write_request(tmp_path, _request_fields())
+
+        reading = await participant.on_heartbeat_pass()
+        await participant.on_heartbeat_pass()
+
+        assert reading == DrainPass(
+            drain={'requested_ts': REQUESTED_TS, 'admission_halted': True, 'refused': None},
+            verifies_in_flight=[], depth=3,
+        )
+        assert lane.halted is True
+        assert lane.halt_reasons[0] == f'fleet restart drain requested_ts={REQUESTED_TS}'
+        assert [(e.outcome, e.waited_secs) for e in events] == [(DrainOutcome.DRAINED, 30.0)]
+
+    async def test_the_acknowledgement_is_read_back_from_the_lane(self, tmp_path: Path) -> None:
+        lane = _FakeLane(obeys=False)
+        _write_request(tmp_path, _request_fields())
+
+        reading = await self._participant(tmp_path, lane, []).on_heartbeat_pass()
+
+        assert reading.drain == {
+            'requested_ts': REQUESTED_TS, 'admission_halted': False, 'refused': None,
+        }
+
+    async def test_a_refused_request_halts_nothing_and_emits_nothing(self, tmp_path: Path) -> None:
+        lane, events = _FakeLane(), []
+        _write_request(tmp_path, _request_fields(invocation_id='the-previous-incarnation'))
+
+        reading = await self._participant(tmp_path, lane, events).on_heartbeat_pass()
+
+        assert lane.halt_reasons == []
+        assert reading.drain == {
+            'requested_ts': REQUESTED_TS, 'admission_halted': False,
+            'refused': 'invocation_mismatch',
+        }
+        assert events == []
+
+    async def test_a_withdrawn_request_resumes_admission_on_the_next_pass(
+        self, tmp_path: Path,
+    ) -> None:
+        lane, events = _FakeLane(in_flight=[_verify('a')]), []
+        participant = self._participant(tmp_path, lane, events)
+        path = _write_request(tmp_path, _request_fields())
+        await participant.on_heartbeat_pass()
+        assert lane.halted is True
+
+        path.unlink()
+        reading = await participant.on_heartbeat_pass()
+
+        assert lane.halted is False
+        assert reading.drain is None
+        assert [(e.outcome, e.refused) for e in events] == [(DrainOutcome.ABANDONED, None)]
+
+    async def test_with_no_lane_an_honoured_request_is_trivially_halted(
+        self, tmp_path: Path,
+    ) -> None:
+        _write_request(tmp_path, _request_fields())
+
+        reading = await self._participant(tmp_path, None, []).on_heartbeat_pass()
+
+        assert reading == DrainPass(
+            drain={'requested_ts': REQUESTED_TS, 'admission_halted': True, 'refused': None},
+            verifies_in_flight=[], depth=None,
+        )
+
+    async def test_shutdown_mid_verify_reports_what_it_kills(self, tmp_path: Path) -> None:
+        lane, events = _FakeLane(in_flight=[_verify('held')]), []
+        participant = self._participant(tmp_path, lane, events)
+        _write_request(tmp_path, _request_fields())
+        reading = await participant.on_heartbeat_pass()
+        assert reading.verifies_in_flight == [_verify('held')]
+
+        participant.on_shutdown()
+
+        (event,) = events
+        assert event.outcome is DrainOutcome.VERIFIES_KILLED
+        assert event.as_payload()['merge_verifies_killed'] == [_verify('held')]
+
+    async def test_a_blank_unit_names_no_request(self, tmp_path: Path) -> None:
+        participant = DrainParticipant(
+            lane=lambda: None, fleet_dir=lambda: tmp_path,
+            identity=lambda: DrainIdentity(unit='', invocation_id=INVOCATION, max_age_secs=1.0),
+            emit=lambda _event: None,
+        )
+        with pytest.raises(ValueError, match='drain request'):
+            await participant.on_heartbeat_pass()

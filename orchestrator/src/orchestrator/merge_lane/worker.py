@@ -5501,6 +5501,9 @@ class _TrainMergeHost(Protocol):
     def unhalt_wip(self, reason: str | None = None) -> None: ...
     def _abandon_outcome(self, task_id: str, count: int) -> MergeOutcome: ...
 
+    # ── restart drain (task 5371) ─────────────────────────────────────────
+    def _note_verify_started(self, request_id: str) -> None: ...
+
 
 async def reverify_member_solo(
     git_ops: GitOps,
@@ -7145,7 +7148,7 @@ async def _do_train_merge(
     # builds for role='merge': merge_verify_breadth=='full' fans out to
     # every REGISTERED module's full suite per-module; =='scoped' (the
     # shipped default) stays the pre-λ opaque global workspace command.
-    train_verify = functools.partial(
+    verify_once = functools.partial(
         _run_post_merge_verify,
         timeouts=worker._post_merge_verify_timeouts,
         enospc_retries=worker._post_merge_verify_enospc_retries,
@@ -7157,6 +7160,13 @@ async def _do_train_merge(
         escalation_queue=getattr(worker, '_escalation_queue', None),
         task_client=getattr(worker, '_flake_task_client', None),
     )
+
+    async def train_verify(*args: Any, **kwargs: Any) -> MergeOutcome | None:
+        # Every train verify, the CAS-retry re-verifies included, restarts
+        # the restart drain's deadline clock (task 5371).
+        worker._note_verify_started(req.request_id)
+        return await verify_once(*args, **kwargs)
+
     verify_outcome = await train_verify(git_ops, req, merge_wt, merge_sha=merge_commit)
     if verify_outcome is not None:
         return _derail_on_train_verify_failure(
@@ -8169,6 +8179,7 @@ _LEGAL_TRANSITIONS: dict[ItemLifecycleState, frozenset[ItemLifecycleState]] = {
         ItemLifecycleState.AWAITING_VERIFY,
         ItemLifecycleState.REDISPATCH_PARKED,
         ItemLifecycleState.DISPATCHING,
+        ItemLifecycleState.QUEUED,
         ItemLifecycleState.TERMINAL,
     }),
     ItemLifecycleState.AWAITING_VERIFY: frozenset({
@@ -8233,7 +8244,10 @@ result Future intact. Since task 3204 those sites all run through the single
 enumerates them. Unlike the forward edges above, the re-arm is wired via the
 dynamic-current-state helper :meth:`SpeculativeMergeWorker._note_requeue`
 rather than a hardcoded *from_state*, so a registered item legally lands back
-at QUEUED regardless of which of the two states it was requeued from.
+at QUEUED regardless of which of the two states it was requeued from. Task
+5371 adds MERGING -> QUEUED for the third: a train the merger dequeued but
+whose verify an admission halt forbids it to start
+(``SpeculativeMergeWorker._defer_train_for_admission_halt``).
 
 kappa also adds the DISPATCHING <-> MERGING pair for the dispatch-time
 staleness/chain-invalidation remerge inside ``_dispatch_item`` (Mechanism 2):
@@ -8502,6 +8516,10 @@ def _alarm_coalesce_live_original(
 # Registry states in which the lane holds an item with no in-flight entry
 # for it: the restart drain counts these as in flight (task 5371).
 _HELD_STATES = frozenset({ItemLifecycleState.MERGING, ItemLifecycleState.DISPATCHING})
+# Registry states whose every entry starts fresh work a restart would kill —
+# a gate re-verify is a whole new verify — so the restart drain measures a
+# deadline from the LATEST entry into one, never the first dispatch.
+_RESTAMPED_STATES = _HELD_STATES | {ItemLifecycleState.GATE_REVERIFY, ItemLifecycleState.FINALIZING}
 
 _REGISTRY_STATE_TO_WIRE: dict[ItemLifecycleState, str] = {
     ItemLifecycleState.QUEUED: 'queued',
@@ -9537,10 +9555,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         # verify starts and nothing in flight is aborted. Never an escalation
         # halt — see halt_admission.
         self._admission_halt_reason: str | None = None
-        # When each item the lane holds mid-merge or mid-dispatch got there
-        # (restamped as a train's inline verify starts), for the restart
-        # drain's deadlines.
-        self._held_since: dict[str, float] = {}
+        # When each item last entered a _RESTAMPED_STATES state, restamped as
+        # each of a train's inline verifies starts: where the restart drain
+        # measures a verify's deadline from.
+        self._phase_started: dict[str, float] = {}
         # Cross-workflow auto-heal attempt counter; shared via
         # self.merge_worker on TaskWorkflow instances.
         self.auto_heal_registry: MainHealthAutoHealRegistry = MainHealthAutoHealRegistry()
@@ -9978,10 +9996,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 event_store=self._event_store,
             )
             return
-        if to_state in _HELD_STATES:
-            self._held_since[request_id] = self._clock.now()
-        elif from_state in _HELD_STATES:
-            self._held_since.pop(request_id, None)
+        if to_state in _RESTAMPED_STATES:
+            self._note_verify_started(request_id)
+        elif from_state in _RESTAMPED_STATES:
+            self._phase_started.pop(request_id, None)
         if live_obj is not None:
             self._live_items[request_id] = live_obj
 
@@ -10094,10 +10112,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         test_merge_queue_lifecycle_registry.py's
         ``TestRequeueRecipeHasASingleChokepoint``, which fails if any
         ``_queue.put_nowait`` or ``on_requeued`` call site appears outside this
-        method. Its seven callers are the head-failure cascade's downstream
+        method. Its eight callers are the head-failure cascade's downstream
         self-requeue, the operator-halt mid-verify abort, the dead-verify
         no-progress abort, the ``MergeVerifyLeaseContended`` defer, the
-        pre-dispatch operator halt in :meth:`_dispatch_item`, and — task 3185,
+        pre-dispatch operator/admission halt in :meth:`_dispatch_item`, the
+        admission-halted train in :meth:`_defer_train_for_admission_halt`
+        (the one MERGING -> QUEUED caller, task 5371), and — task 3185,
         PRD γ, narrowed by task 3186, PRD δ — the deep-tip verify's two
         NON-ADOPTING exits in :meth:`_run_inflight_verify`: the tip-FAIL exit
         and (review fix 3) the chain-arm ``except Exception`` exit. Those last
@@ -13390,6 +13410,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self._admission_halt_reason = None
         self._signal_resume()
 
+    def _note_verify_started(self, request_id: str) -> None:
+        """Stamp now as the start of *request_id*'s current verify (task 5371).
+
+        Called on every entry into a ``_RESTAMPED_STATES`` state and before
+        each verify a train runs inline, so a deadline is always measured
+        from the verify actually running.
+        """
+        self._phase_started[request_id] = self._clock.now()
+
     def _verifies_in_flight(self, now: float) -> list[VerifyInFlight]:
         """Every merge verify a restart would kill now, on any host (task 5371).
 
@@ -13405,7 +13434,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 entry.item.request,
                 host=entry.lease.name if entry.lease is not None else None,
                 kind=VerifyInFlightKind.for_phase(self._entry_phase(entry)),
-                started_ts=entry.started_at if entry.started_at is not None else now,
+                started_ts=self._phase_started.get(
+                    entry.item.request.request_id,
+                    entry.started_at if entry.started_at is not None else now,
+                ),
             )
             for entry in held
         ]
@@ -13419,7 +13451,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 request,
                 host=LocalRunner.name if is_train else None,
                 kind=VerifyInFlightKind.held(state.value, is_train=is_train),
-                started_ts=self._held_since.get(rid, now),
+                started_ts=self._phase_started.get(rid, now),
             ))
         return found
 
@@ -15344,6 +15376,21 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 return f'recent_terminal_{rec["state"]}'
         return None
 
+    def _defer_train_for_admission_halt(self, req: GroupMergeRequest) -> None:
+        """Put a dequeued train back on the queue rather than start its verify (task 5371).
+
+        A train verifies inline in the merger, past the pick-time admission
+        gate, so this is the train's own gate: under :meth:`halt_admission`
+        no new merge verify starts anywhere. Its request stays pending and
+        it re-enters through the normal drain once admission resumes.
+        """
+        logger.warning(
+            'Train %s: admission halted before its verify started; requeued', req.train_id,
+        )
+        self._speculation_controller.on_abort()
+        self._drift_base.pop(req.request_id, None)
+        self._requeue_request(req)
+
     async def _await_unadvanced_predecessor(self, train_id: str) -> bool:
         """Park a dequeued train until the previous merge has finalized.
 
@@ -15382,10 +15429,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         while (
             self._running
             and not pred.result.done()
+            and not self.is_admission_halted
             and self._clock.monotonic() < deadline
         ):
             await self._clock.sleep(_TRAIN_PREDECESSOR_SETTLE_POLL_SECS)
-        if not pred.result.done():
+        if self.is_admission_halted:
+            logger.info(
+                'Train %s: admission halted while parked behind %s', train_id, pred.task_id,
+            )
+        elif not pred.result.done():
             logger.warning(
                 'Train %s: predecessor %s still unfinalized after %.1fs — '
                 'proceeding anyway; the train may have to re-verify its rebased tip',
@@ -15896,7 +15948,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             # the train's DecidedItem base_sha and the
                             # _redrive_coalesce_members is-ancestor checks.
                             actual_main = await self._git_ops.get_main_sha()
-                        self._held_since[req.request_id] = self._clock.now()
+                        if self.is_admission_halted:
+                            self._defer_train_for_admission_halt(req)
+                            continue
                         outcome = await _do_train_merge(self, req)
                         # 1867: coalesce-train derail recovery.
                         # Both hooks below are gated on the coalesce prefix so

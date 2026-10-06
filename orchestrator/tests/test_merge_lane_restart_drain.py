@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -26,7 +27,8 @@ from _merge_lane_fakes import (
     make_lane,
     running_lane,
 )
-from _orch_helpers import wait_responsive
+from _orch_helpers import git_env_with_ceiling, wait_responsive
+from df_pytest_isolation import git_redirect_env
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
@@ -296,3 +298,124 @@ async def test_the_budget_is_the_longest_merge_command_timeout(tmp_path: Path) -
     )
     assert merge_verify_command_budget_secs(warm_heavy, []) == 9000.0
 
+
+
+def _green() -> VerifyResult:
+    return VerifyResult(
+        passed=True, test_output='', lint_output='', type_output='', summary='ok',
+    )
+
+
+class _HeldVerify:
+    """``run_scoped_verification`` stand-in for the verifies the lane runs
+    outside its injected ``VerifyPort`` (a train's, a gate re-verify): counts
+    its calls and holds each until released."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self, *_args: Any, **_kwargs: Any) -> VerifyResult:
+        self.calls += 1
+        self.entered.set()
+        await self.release.wait()
+        return _green()
+
+
+async def test_a_train_parked_behind_its_predecessor_does_not_start_its_verify_under_a_halt(
+    scene: _Scene,
+) -> None:
+    """R1: the train's own verify is a verify start the merger makes past the
+    pick-time gate; a halt while it is parked sends it back to the queue."""
+    release_pred = asyncio.Event()
+    verifier = FakeVerifier(scripts={'pred': hangs_until(release_pred)})
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    # The production clock: the park polls every 50 ms against a ~2 h
+    # deadline, which a fake clock's free sleeps would exhaust at once.
+    lane = MergeLane(scene.git_ops, queue, verifier=verifier)
+    pred = await _request(scene, 'pred')
+    train = await _stacked_train(scene)
+    train_verify = _HeldVerify()
+    train_verify.release.set()
+
+    with patch(_TRAIN_VERIFY_TARGET, side_effect=train_verify.run):
+        async with running_lane(lane) as run:
+            await queue.put(pred)
+            await wait_responsive(verifier.await_entry(1), label='predecessor verify under way')
+            await queue.put(train)
+            await wait_responsive(
+                _until(lambda: _state(lane, train) == 'merging'),
+                label='train dequeued and parked behind its predecessor',
+            )
+
+            lane.halt_admission('restart drain test')
+            await wait_responsive(
+                _until(lambda: _state(lane, train) == 'queued'),
+                label='train requeued instead of verifying',
+            )
+            assert train_verify.calls == 0
+            in_flight = _drain_view(lane)['verifies_in_flight']
+            assert [(v['task_id'], v['kind']) for v in in_flight] == [('pred', 'verify')]
+
+            release_pred.set()
+            assert (await run.outcome(pred)).status == 'done'
+            assert train_verify.calls == 0
+
+            lane.resume_admission()
+            outcome = await run.outcome(train)
+
+    assert outcome.status == 'done', outcome
+    assert train_verify.calls == 1
+
+
+def _git(cwd: Path, *args: str) -> str:
+    env = git_env_with_ceiling(cwd)
+    for key in git_redirect_env(env):
+        del env[key]
+    return subprocess.run(
+        ['git', *args], cwd=cwd, env=env, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+async def test_a_gate_reverify_deadline_runs_from_the_reverify_start(tmp_path: Path) -> None:
+    """R2: a main that moves under a head's verify costs a gate re-verify, a
+    whole new verify; its deadline is measured from ITS start, not the first
+    verify's dispatch."""
+    repo = seed_repo(tmp_path / 'repo', _SEED)
+    scene = _Scene(
+        repo=repo, git_ops=GitOps(_GIT, repo),
+        config=lane_scene_config(repo, _GIT, merge_verify_breadth='full'),
+    )
+    release_first = asyncio.Event()
+    clock = _writing_clock()
+    verifier = FakeVerifier(scripts={'head': hangs_until(release_first)})
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(scene.git_ops, queue, verifier=verifier, clock=clock)
+    head = await _request(scene, 'head')
+    budget = merge_verify_command_budget_secs(scene.config, [])
+    reverify = _HeldVerify()
+
+    with patch(_TRAIN_VERIFY_TARGET, side_effect=reverify.run):
+        async with running_lane(lane) as run:
+            await queue.put(head)
+            await wait_responsive(verifier.await_entry(1), label='head verify under way')
+            (first,) = _drain_view(lane)['verifies_in_flight']
+            (repo / 'drift.txt').write_text('moved under the verify\n')
+            _git(repo, 'add', '--', 'drift.txt')
+            _git(repo, 'commit', '-m', 'drift: direct commit')
+            clock.time += 5_000.0
+
+            release_first.set()
+            await wait_responsive(reverify.entered.wait(), label='gate re-verify under way')
+            (gate,) = _drain_view(lane)['verifies_in_flight']
+
+            reverify.release.set()
+            outcome = await run.outcome(head)
+
+    assert first['kind'] == 'verify'
+    assert gate['kind'] == 'gate_reverify'
+    assert gate['started_ts'] >= first['started_ts'] + 5_000.0
+    assert gate['deadline_ts'] - gate['started_ts'] == budget
+    assert outcome.status == 'done', outcome
+    assert reverify.calls == 1

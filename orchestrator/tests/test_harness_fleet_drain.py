@@ -1,12 +1,11 @@
-"""The harness's half of the restart drain (task 5371).
+"""The harness wiring of the restart drain (task 5371).
 
-Each merge-heartbeat pass reads this unit's drain request, halts or resumes
-the merge worker's admission to match, acknowledges in the heartbeat and
-feeds the ``fleet_drain`` event tracker; ``_stop_merge_worker`` closes an
-open request with what the stop kills.  Driven through
-``Harness._write_merge_heartbeat`` / ``_stop_merge_worker`` on a real merge
-lane, with the fleet dir and the unit's identity set through the environment
-exactly as systemd sets them.
+The drain itself is ``orchestrator.fleet_drain.DrainParticipant``, pinned in
+``test_fleet_drain.py``.  This one test proves the harness wires it: a
+merge-heartbeat pass halts a real merge lane mid-verify and publishes the
+acknowledgement, and stopping the merge worker reports the verify it kills.
+The fleet dir and the unit's identity are set through the environment exactly
+as systemd sets them.
 """
 
 from __future__ import annotations
@@ -81,82 +80,7 @@ def _drain_events(harness: Harness) -> list[dict[str, Any]]:
     return [record['data'] for name, record in store.events if name == 'fleet_drain']
 
 
-async def test_a_request_for_this_incarnation_halts_admission_and_is_acknowledged(
-    harness: Harness, fleet_dir: Path,
-) -> None:
-    lane = make_lane(harness.git_ops)
-    harness._merge_worker = lane
-    requested_ts = _request_drain(fleet_dir)
-
-    await harness._write_merge_heartbeat()
-
-    assert lane.is_admission_halted is True
-    heartbeat = _heartbeat(fleet_dir)
-    assert heartbeat['drain'] == {
-        'requested_ts': requested_ts, 'admission_halted': True, 'refused': None,
-    }
-    assert heartbeat['verifies_in_flight'] == []
-    assert heartbeat['merge_idle'] is True
-
-    await harness._write_merge_heartbeat()
-
-    (event,) = _drain_events(harness)
-    assert event['outcome'] == 'drained'
-    assert event['requested_ts'] == requested_ts
-    assert event['unit'] == UNIT
-    assert event['merge_verifies_awaited'] == []
-    assert event['merge_verifies_killed'] == []
-
-
-async def test_a_request_for_another_incarnation_is_refused_and_halts_nothing(
-    harness: Harness, fleet_dir: Path,
-) -> None:
-    lane = make_lane(harness.git_ops)
-    harness._merge_worker = lane
-    requested_ts = _request_drain(fleet_dir, invocation_id='the-previous-incarnation')
-
-    await harness._write_merge_heartbeat()
-
-    assert lane.is_admission_halted is False
-    assert _heartbeat(fleet_dir)['drain'] == {
-        'requested_ts': requested_ts, 'admission_halted': False,
-        'refused': 'invocation_mismatch',
-    }
-    assert _drain_events(harness) == []
-
-
-async def test_removing_the_request_resumes_admission_on_the_next_pass(
-    harness: Harness, fleet_dir: Path,
-) -> None:
-    lane = make_lane(harness.git_ops)
-    harness._merge_worker = lane
-    _request_drain(fleet_dir)
-    await harness._write_merge_heartbeat()
-    assert lane.is_admission_halted is True
-
-    (fleet_dir / f'{UNIT}.drain.json').unlink()
-    await harness._write_merge_heartbeat()
-
-    assert lane.is_admission_halted is False
-    assert _heartbeat(fleet_dir)['drain'] is None
-    assert [e['outcome'] for e in _drain_events(harness)] == ['drained']
-
-
-async def test_with_no_merge_worker_an_honoured_request_is_trivially_halted(
-    harness: Harness, fleet_dir: Path,
-) -> None:
-    requested_ts = _request_drain(fleet_dir)
-
-    await harness._write_merge_heartbeat()
-
-    heartbeat = _heartbeat(fleet_dir)
-    assert heartbeat['drain'] == {
-        'requested_ts': requested_ts, 'admission_halted': True, 'refused': None,
-    }
-    assert heartbeat['verifies_in_flight'] == []
-
-
-async def test_stopping_mid_verify_reports_the_verifies_it_kills(
+async def test_the_heartbeat_halts_the_lane_and_the_stop_reports_what_it_kills(
     harness: Harness, fleet_dir: Path, tmp_path: Path,
 ) -> None:
     repo = seed_repo(tmp_path / 'repo', RepoSeed(files=(('README.md', '# Test\n'),), message='init'))
@@ -184,7 +108,12 @@ async def test_stopping_mid_verify_reports_the_verifies_it_kills(
         await wait_responsive(verifier.await_entry(1), label='held verify under way')
         requested_ts = _request_drain(fleet_dir)
         await harness._write_merge_heartbeat()
-        assert [v['task_id'] for v in _heartbeat(fleet_dir)['verifies_in_flight']] == ['held']
+        heartbeat = _heartbeat(fleet_dir)
+        assert lane.is_admission_halted is True
+        assert heartbeat['drain'] == {
+            'requested_ts': requested_ts, 'admission_halted': True, 'refused': None,
+        }
+        assert [v['task_id'] for v in heartbeat['verifies_in_flight']] == ['held']
         assert _drain_events(harness) == []
 
         await harness._stop_merge_worker()

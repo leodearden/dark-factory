@@ -1648,8 +1648,11 @@ class VerifyInFlightKind(StrEnum):
 class VerifyInFlight:
     """One merge verify a restart would kill, as the restart drain sees it (task 5371).
 
-    ``deadline_ts`` is ``started_ts`` plus the longest command timeout the
-    request's merge verify can be granted
+    ``started_ts`` is when the verify running NOW began: a dispatch, the latest
+    entry into a gate re-verify or finalize, or a train's latest inline verify
+    (``orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._note_verify_started``).
+    ``deadline_ts`` adds the longest command timeout the request's merge
+    verify can be granted
     (``orchestrator/src/orchestrator/verify.py::merge_verify_command_budget_secs``),
     so a verify still running past it is one its own timeout would kill.
     """

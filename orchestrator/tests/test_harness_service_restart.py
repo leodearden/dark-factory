@@ -192,13 +192,6 @@ class TestBuildDashboardRestartCoordinator:
 
         assert coord._require_idle is False
 
-    def test_orchestrator_coordinator_script_args_pass_drain(self, harness: Harness):
-        """The orchestrator coordinator's own script_args carry --drain (task 5371),
-        the same value its systemd-run executor passes (asserted end to end in
-        TestOrchestratorCoordinatorEndToEnd)."""
-        coord = harness._build_orchestrator_restart_coordinator()
-        assert coord._script_args == ['--drain']
-
     def test_dashboard_coordinator_has_empty_script_args(self, harness: Harness):
         """Dashboard coordinator has script_args=[] (no --drain)."""
         coord = harness._build_dashboard_restart_coordinator()

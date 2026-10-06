@@ -2023,6 +2023,72 @@
           "current": 6667
         }
       ]
+    },
+    {
+      "task_id": "5371",
+      "reason": "review fixes R1/R2: an admission halt now also stops a dequeued train before its inline verify (park-loop exit + requeue, the one MERGING->QUEUED edge) and restarts the drain deadline at every gate re-verify, finalize and train verify; test private reads fell 14 -> 5 with the DrainParticipant extraction",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2165,
+          "current": 2169
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_await_unadvanced_predecessor",
+          "baseline": 6,
+          "current": 7
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_merger_loop",
+          "baseline": 86,
+          "current": 89
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 1783,
+          "current": 1786
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 21907,
+          "current": 21961
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 938,
+          "current": 941
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12470,
+          "current": 12491
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4799,
+          "current": 4803
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57144,
+          "current": 57201
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31880,
+          "current": 31904
+        }
+      ]
     }
   ]
 }
