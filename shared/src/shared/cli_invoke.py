@@ -3044,6 +3044,17 @@ async def invoke_with_cap_retry(
     result.account_name = account_name
     result.resume_fallbacks = resume_fallbacks
     result.resume_fallback_session_ids = tuple(resume_fallback_session_ids)
+    # 'account' outranks a ceiling reason: an unattributed usage cap ends the
+    # run before any configured ceiling could have been reached.  `model` stays
+    # the caller's lineage alias so existing GROUP BY model consumers
+    # (dashboard/src/dashboard/data/model_role.py, orchestrator digest) are
+    # unaffected; the exact served version goes in `model_id` beside it.
+    ceiling_reason = classify_cap_kill(
+        result,
+        budget_usd=invoke_kwargs.get('max_budget_usd'),
+        max_turns=invoke_kwargs.get('max_turns'),
+    )
+    capped_reason = 'account' if unattributed_cap else ceiling_reason
     if cost_store:
         try:
             await cost_store.save_invocation(
@@ -3059,7 +3070,9 @@ async def invoke_with_cap_retry(
                 cache_read_tokens=result.cache_read_tokens,
                 cache_create_tokens=result.cache_create_tokens,
                 duration_ms=result.duration_ms,
-                capped=unattributed_cap,
+                capped=capped_reason is not None,
+                capped_reason=capped_reason,
+                model_id=result.model_id,
                 started_at=started_at,
                 completed_at=completed_at,
             )
