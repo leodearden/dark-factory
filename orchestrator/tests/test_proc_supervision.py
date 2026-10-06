@@ -5,52 +5,21 @@ EscalationSpec, FreshPidVerify, RestartOutcome/RestartDisposition, and one
 async execute() honoring 5 invariants (RP-1..5, PRD Sec 5.1).
 
 Prerequisite-1: shared test scaffolding (no behaviour assertions here) —
-FakeRunner (records every (argv, kwargs) call, returns a configurable-
-returncode fake proc), fake_inspector (configurable inspect-result async
-callable), tmp_queue_dir fixture, and read_escalations() helper. Mirrors the
-fake-runner pattern in test_service_restart.py:1042+ (patch of
-asyncio.create_subprocess_exec / injected `runner=`) and the injected-
-inspector pattern in test_deterministic_runner.py (AsyncMock unit_inspector).
+fake_inspector (configurable inspect-result async callable), tmp_queue_dir
+fixture, and read_escalations() helper; FakeRunner and the canonical detached
+RP-4 plan live in _proc_supervision_doubles, shared with the other
+proc_supervision test files. Mirrors the injected-inspector pattern in
+test_deterministic_runner.py (AsyncMock unit_inspector).
 """
 
 from __future__ import annotations
 
 import shlex
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _proc_supervision_doubles import FakeRunner, detached_rp4_plan
 from escalation.queue import EscalationQueue
-
-
-class FakeRunner:
-    """Async callable matching ``asyncio.create_subprocess_exec``'s signature.
-
-    Records every ``(argv, kwargs)`` call in ``self.calls`` so tests can
-    assert on exact positional argv and keyword args (cwd=, stdout=, ...).
-    Returns a ``MagicMock`` proc whose ``communicate()`` is an
-    ``AsyncMock(return_value=(stdout, None))`` and whose ``returncode`` is
-    configurable (default 0) — mirroring the ``fake_proc`` idiom already used
-    throughout test_service_restart.py and test_deterministic_runner.py.
-    """
-
-    def __init__(self, returncode: int = 0, stdout: bytes = b'') -> None:
-        self.returncode = returncode
-        self.stdout = stdout
-        self.calls: list[tuple[tuple, dict]] = []
-        # Every fake proc this runner has handed back, in call order — lets a
-        # test assert on a spawned proc's post-return state (e.g. that
-        # .communicate() was never awaited on a fire-and-forget leaf spawn)
-        # without execute() needing to hand the proc back to the caller.
-        self.procs: list[MagicMock] = []
-
-    async def __call__(self, *args: object, **kwargs: object):
-        self.calls.append((args, kwargs))
-        proc = MagicMock()
-        proc.communicate = AsyncMock(return_value=(self.stdout, None))
-        proc.returncode = self.returncode
-        self.procs.append(proc)
-        return proc
 
 
 def make_fake_inspector(state: dict):
@@ -1607,33 +1576,6 @@ class TestDetachedLeafPlainSpawn:
 # ---------------------------------------------------------------------------
 
 
-def _detached_plan_with_spec(tmp_queue_dir: Path, spec):
-    """The canonical detached RP-4 plan used by the task-3453 cells."""
-    from orchestrator.proc_supervision import RestartPlan
-
-    return RestartPlan(
-        script=Path('/proj/scripts/restart-orchestrator.sh'),
-        args=['--foo'],
-        cwd=Path('/proj'),
-        target_unit='orch.service',
-        own_unit='orch.service',
-        on_failure_escalation=spec,
-        verify=None,
-        transient_unit='orch-redeploy-restart-99.service',
-        on_active_secs=10,
-    )
-
-
-def _make_spec(tmp_queue_dir: Path):
-    from orchestrator.proc_supervision import EscalationSpec
-
-    return EscalationSpec(
-        queue_dir=str(tmp_queue_dir),
-        task_id='task-99',
-        summary='Self-restart fire-time failure',
-    )
-
-
 def _setenv_pythonpath_tokens(argv) -> list[str]:
     """Every ``--setenv=PYTHONPATH=`` token on a built systemd-run argv."""
     return [t for t in argv if isinstance(t, str) and t.startswith('--setenv=PYTHONPATH=')]
@@ -1660,7 +1602,7 @@ class TestSubmitChildPythonPathIsExplicit:
     ) -> None:
         monkeypatch.delenv('PYTHONPATH', raising=False)
         runner = FakeRunner(returncode=0)
-        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+        plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
 
         await plan.execute(runner=runner)
 
@@ -1705,7 +1647,7 @@ class TestSubmitChildPythonPathIsExplicit:
         monkeypatch.setenv('PYTHONPATH', sentinel)
 
         runner = FakeRunner(returncode=0)
-        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+        plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
         await plan.execute(runner=runner)
 
         argv, _kwargs = runner.calls[0]
@@ -1724,7 +1666,7 @@ class TestSubmitChildPythonPathIsExplicit:
         # still make the guarantee non-empty.
         monkeypatch.delenv('PYTHONPATH', raising=False)
         runner2 = FakeRunner(returncode=0)
-        plan2 = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+        plan2 = detached_rp4_plan(tmp_queue_dir, with_spec=True)
         await plan2.execute(runner=runner2)
 
         argv2, _kwargs2 = runner2.calls[0]
@@ -1827,7 +1769,7 @@ class TestSubmitChildPythonPathDegradesLoudly:
         _stub_find_spec(monkeypatch, set(_SUBMIT_CHILD_PACKAGES))
 
         runner = FakeRunner(returncode=0)
-        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+        plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.proc_supervision'):
             outcome = await plan.execute(runner=runner)
@@ -1865,7 +1807,7 @@ class TestSubmitChildPythonPathDegradesLoudly:
         _stub_find_spec(monkeypatch, {'shared'})
 
         runner = FakeRunner(returncode=0)
-        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+        plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.proc_supervision'):
             outcome = await plan.execute(runner=runner)
@@ -1921,7 +1863,7 @@ class TestSubmitChildInterpreterGuarantee:
         import sys
 
         runner = FakeRunner(returncode=0)
-        plan = _detached_plan_with_spec(tmp_queue_dir, _make_spec(tmp_queue_dir))
+        plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
 
         await plan.execute(runner=runner)
 

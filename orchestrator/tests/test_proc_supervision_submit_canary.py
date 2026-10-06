@@ -18,43 +18,13 @@ import logging
 import sys
 import types
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _proc_supervision_doubles import FakeRunner, detached_rp4_plan
 
-from orchestrator.proc_supervision import (
-    EscalationSpec,
-    RestartDisposition,
-    RestartPlan,
-)
+from orchestrator.proc_supervision import RestartDisposition
 
 _LOGGER = 'orchestrator.proc_supervision'
-
-
-async def _ok_runner(*args: object, **kwargs: object) -> MagicMock:
-    proc = MagicMock()
-    proc.communicate = AsyncMock(return_value=(b'', None))
-    proc.returncode = 0
-    return proc
-
-
-def _detached_plan(queue_dir: Path, *, with_spec: bool) -> RestartPlan:
-    spec = EscalationSpec(
-        queue_dir=str(queue_dir),
-        task_id='task-99',
-        summary='Self-restart fire-time failure',
-    )
-    return RestartPlan(
-        script=Path('/proj/scripts/restart-orchestrator.sh'),
-        args=['--foo'],
-        cwd=Path('/proj'),
-        target_unit='orch.service',
-        own_unit='orch.service',
-        on_failure_escalation=spec if with_spec else None,
-        verify=None,
-        transient_unit='orch-redeploy-restart-99.service',
-        on_active_secs=10,
-    )
 
 
 def _exploding_module(module_name: str) -> types.ModuleType:
@@ -123,8 +93,8 @@ class TestRegistrationTimeSubmitImportCanary:
             )
 
         with caplog.at_level(logging.WARNING, logger=_LOGGER):
-            outcome = await _detached_plan(tmp_path, with_spec=True).execute(
-                runner=_ok_runner,
+            outcome = await detached_rp4_plan(tmp_path, with_spec=True).execute(
+                runner=FakeRunner(),
             )
 
         warnings = _submit_warnings(caplog)
@@ -140,7 +110,7 @@ class TestRegistrationTimeSubmitImportCanary:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ) -> None:
         with caplog.at_level(logging.WARNING, logger=_LOGGER):
-            await _detached_plan(tmp_path, with_spec=True).execute(runner=_ok_runner)
+            await detached_rp4_plan(tmp_path, with_spec=True).execute(runner=FakeRunner())
 
         noisy = _submit_warnings(caplog)
         assert not noisy, f'the canary must stay silent when the import is healthy: {noisy!r}'
@@ -154,8 +124,8 @@ class TestRegistrationTimeSubmitImportCanary:
         _break_submit_import(monkeypatch, 'transitive_import_error')
 
         with caplog.at_level(logging.WARNING, logger=_LOGGER):
-            outcome = await _detached_plan(tmp_path, with_spec=False).execute(
-                runner=_ok_runner,
+            outcome = await detached_rp4_plan(tmp_path, with_spec=False).execute(
+                runner=FakeRunner(),
             )
 
         noisy = _submit_warnings(caplog)
