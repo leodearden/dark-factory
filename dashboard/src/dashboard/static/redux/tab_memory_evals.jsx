@@ -44,6 +44,8 @@ const MEDF = window.DF_DATA;
 // dashboard/tests/js/classic_script_scope.test.mjs, which enforces the one
 // clash a .jsx binding can have, before "fixing" this.
 const { useState: MEuS } = React;
+// The storage policy for UI preferences — persisted_state.js.
+const { readPersisted, writePersisted } = window.DF_PERSISTED_STATE;
 
 // The pure, JSX-free helpers live in memory_evals_fmt.js (task 3481); their
 // behavioural suite is dashboard/tests/js/memory_evals_fmt.test.mjs.
@@ -387,17 +389,11 @@ function provOpenKey(evalId) {
 // The key is a PARAMETER, not a closed-over module constant: that is what
 // makes one global key shared by every card structurally unrepresentable.
 function readProvOpen(key) {
-  try {
-    return localStorage.getItem(key) === '1';
-  } catch (e) {
-    return false;
-  }
+  return !!readPersisted(key, false);
 }
 
 function writeProvOpen(key, open) {
-  try {
-    localStorage.setItem(key, open ? '1' : '0');
-  } catch (e) { /* private mode — the toggle simply does not persist */ }
+  writePersisted(key, !!open, false);
 }
 
 function LimitsProvenance({ ev }) {

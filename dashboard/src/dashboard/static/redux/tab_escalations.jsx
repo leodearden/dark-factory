@@ -29,6 +29,8 @@ const {
 } = window.DF_ESCALATION_VIEWS;
 // The cross-tab focus lookup, keyed on (queue, id) — escalation_focus.js.
 const { findEscalationRow } = window.DF_ESCALATION_FOCUS;
+// The storage policy for UI preferences — persisted_state.js.
+const { readPersisted, writePersisted } = window.DF_PERSISTED_STATE;
 
 // Every number this tab renders arrives on one endpoint, and the path is the
 // lookup key into DF_DATA.__receipt (data.js keys one receipt per polled
@@ -76,10 +78,7 @@ function escalationsLoaded() {
 
 function useOpenSet(ids, defaultOpen = true, storageKey = null) {
   const [openMap, setOpenMap] = uS(() => {
-    let stored = {};
-    if (storageKey) {
-      try { stored = JSON.parse(localStorage.getItem(storageKey) || '{}') || {}; } catch (e) {}
-    }
+    const stored = readPersisted(storageKey, {}) || {};
     const init = {};
     for (const id of ids) init[id] = id in stored ? !!stored[id] : defaultOpen;
     return init;
@@ -96,24 +95,15 @@ function useOpenSet(ids, defaultOpen = true, storageKey = null) {
       return patch ? { ...m, ...patch } : m;
     });
   }, [idsKey]); // eslint-disable-line react-hooks/exhaustive-deps
-  uE(() => {
-    if (storageKey) {
-      try { localStorage.setItem(storageKey, JSON.stringify(openMap)); } catch (e) {}
-    }
-  }, [storageKey, openMap]);
+  uE(() => { writePersisted(storageKey, openMap, {}); }, [storageKey, openMap]);
   const toggle = id => setOpenMap(m => ({ ...m, [id]: !m[id] }));
   const setAll = v => setOpenMap(Object.fromEntries(ids.map(id => [id, v])));
   return [openMap, toggle, setAll];
 }
 
 function usePersistedState(storageKey, defaultValue) {
-  const [v, setV] = uS(() => {
-    try {
-      const raw = localStorage.getItem(storageKey);
-      return raw === null ? defaultValue : JSON.parse(raw);
-    } catch (e) { return defaultValue; }
-  });
-  uE(() => { try { localStorage.setItem(storageKey, JSON.stringify(v)); } catch (e) {} }, [storageKey, v]);
+  const [v, setV] = uS(() => readPersisted(storageKey, defaultValue));
+  uE(() => { writePersisted(storageKey, v, defaultValue); }, [storageKey, v]);
   return [v, setV];
 }
 
