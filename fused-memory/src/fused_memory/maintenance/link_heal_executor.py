@@ -36,6 +36,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+from shared.safe_io import atomic_write_text
+
 from fused_memory.maintenance.link_heal import (
     COMPLETION_ACTIONS,
     LinkBasis,
@@ -297,9 +299,11 @@ async def run_plan(
     limits: RunLimits,
     projects: Sequence[str],
     source: RunSource,
-    plan_path: Path,
+    plan_path_for: Callable[[str], Path],
 ) -> RunReport:
     """A non-writing run: ledger the plan, write its document, report what would escape.
+
+    The document goes, atomically, to ``plan_path_for(run_id)``.
 
     Every read is made before the run row exists, so a read that raises leaves no
     run. The new heals are committed only once their document is written: a
@@ -308,6 +312,7 @@ async def run_plan(
     """
     plan = await build_plan(bases, store=store, census=census, projects=projects)
     run_id = ledger.start_run(source, writes=False)
+    plan_path = plan_path_for(run_id)
     staged = _stage(plan.actions, ledger)
     counts = replace(
         plan.counts,
@@ -319,7 +324,7 @@ async def run_plan(
     try:
         with ledger.publishing_planned(run_id, staged.new, source) as pending:
             document = render_plan_document(pending)
-            await asyncio.to_thread(plan_path.write_bytes, document)
+            await asyncio.to_thread(atomic_write_text, plan_path, document.decode('utf-8'))
     except OSError as failure:
         logger.error('link-heal plan %s: cannot write %s: %s', run_id[:8], plan_path, failure)
         counts = replace(counts, stopped_by=PLAN_DOCUMENT_STOP)

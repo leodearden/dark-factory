@@ -32,7 +32,7 @@ import logging
 import sys
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -79,7 +79,6 @@ EXIT_FAILED = 1
 EXIT_REFUSED = 2
 
 NO_WRITING_RUN = 'no link-heal run has written here'
-PLAN_STAGING_FILENAME = 'link-heal-plan.partial.json'
 STATUS_COUNTS = ('planned', 'applied', 'failed', 'skipped_stale', 'skipped_cap')
 
 
@@ -246,17 +245,17 @@ def _load_corpus(path: Path) -> tuple[LinkBasis, ...]:
         raise Refused(f'cannot read the corpus {path}: {exc}') from exc
 
 
-def _plan_path(out: Path | None, ledger_dir: Path) -> Path:
+def _plan_path_for(out: Path | None, ledger_dir: Path) -> Callable[[str], Path]:
     if out is None:
-        return ledger_dir / PLAN_STAGING_FILENAME
+        return lambda run_id: ledger_dir / f'link-heal-plan-{run_id[:8]}.json'
     if not out.parent.is_dir():
         raise Refused(f'cannot write the plan to {out}: {out.parent} is not a directory')
-    return out
+    return lambda _run_id: out
 
 
 async def _plan(args: argparse.Namespace, session: _Session) -> RunReport:
     bases = _load_corpus(args.from_corpus)
-    plan_path = _plan_path(args.out, session.ledger_dir)
+    plan_path_for = _plan_path_for(args.out, session.ledger_dir)
     projects = list(dict.fromkeys(basis.project_id for basis in bases))
     await session.probe(projects[0] if projects else None)
     async with session.env.census_for(session.config) as census:
@@ -268,12 +267,9 @@ async def _plan(args: argparse.Namespace, session: _Session) -> RunReport:
             limits=session.limits,
             projects=projects,
             source=RunSource.CORPUS,
-            plan_path=plan_path,
+            plan_path_for=plan_path_for,
         )
-    if args.out is not None or report.plan_path is None:
-        return report
-    named = session.ledger_dir / f'link-heal-plan-{report.run_id[:8]}.json'
-    return replace(report, plan_path=plan_path.replace(named))
+    return report
 
 
 async def _apply(args: argparse.Namespace, session: _Session) -> RunReport:

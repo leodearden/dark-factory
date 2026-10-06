@@ -351,7 +351,7 @@ async def run_corpus_plan(
         limits=limits,
         projects=PROJECTS,
         source=RunSource.CORPUS,
-        plan_path=plan_path,
+        plan_path_for=lambda _run_id: plan_path,
     )
 
 

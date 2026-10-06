@@ -474,7 +474,7 @@ class TestRunPlanLeavesNothingHalfDone:
                 limits=DEFAULT_LIMITS,
                 projects=PROJECTS,
                 source=RunSource.CORPUS,
-                plan_path=tmp_path / 'plan.json',
+                plan_path_for=lambda _run_id: tmp_path / 'plan.json',
             )
 
         assert ledger.recent_runs(10) == []
