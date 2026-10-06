@@ -1508,11 +1508,15 @@ def run_nightly(
             # night whose ONLY effect is conflict sightings ends with
             # applied == 0, `if applied > 0` skips dump(), and the merged `cb`
             # is discarded as a "no-change night", destroying the exact signal
-            # the elif-branch exists to preserve.
+            # the elif-branch exists to preserve. An applied correction is the
+            # same shape: it rewrites an entry's framing in place, and losing
+            # it to a "no-change night" is the failure the op exists to
+            # prevent.
             applied += (
                 stats['matched']
                 + stats['candidates_applied']
                 + stats['candidate_disposition_conflicts']
+                + stats['corrections_applied']
             )
 
         if conflicts:
