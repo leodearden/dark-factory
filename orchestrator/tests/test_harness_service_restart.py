@@ -18,6 +18,7 @@ Asserts:
 from __future__ import annotations
 
 import logging
+import shlex
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -190,6 +191,13 @@ class TestBuildDashboardRestartCoordinator:
         coord = harness._build_dashboard_restart_coordinator()
 
         assert coord._require_idle is False
+
+    def test_orchestrator_coordinator_script_args_pass_drain(self, harness: Harness):
+        """The orchestrator coordinator's own script_args carry --drain (task 5371),
+        the same value its systemd-run executor passes (asserted end to end in
+        TestOrchestratorCoordinatorEndToEnd)."""
+        coord = harness._build_orchestrator_restart_coordinator()
+        assert coord._script_args == ['--drain']
 
     def test_dashboard_coordinator_has_empty_script_args(self, harness: Harness):
         """Dashboard coordinator has script_args=[] (no --drain)."""
@@ -1069,7 +1077,9 @@ class TestOrchestratorCoordinatorEndToEnd:
         assert pos_args[0] == 'systemd-run'
         assert '--on-active=10' in pos_args
         assert '--unit=orch-selfrestart-on-merge-0.service' in pos_args
-        assert expected_script in pos_args
+        # task 5371: the script runs drained; with an argument, the payload is
+        # one shell command line.
+        assert pos_args[-3:] == ('/bin/sh', '-c', shlex.join([expected_script, '--drain']))
         assert orch_coord.is_pending is False
 
         # Second merge + fire: the executor closure's itertools counter must

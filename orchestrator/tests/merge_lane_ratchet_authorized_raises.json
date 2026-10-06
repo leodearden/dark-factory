@@ -2011,6 +2011,18 @@
           "current": 31880
         }
       ]
+    },
+    {
+      "task_id": "5371",
+      "reason": "new harness-side restart-drain tests drive Harness._write_merge_heartbeat/_stop_merge_worker and set _merge_worker, the same private seams test_harness_merge_heartbeat.py already uses; Harness exposes no public seam for these",
+      "measures": [
+        {
+          "measure": "total:private_reads",
+          "key": "<cluster>",
+          "baseline": 6653,
+          "current": 6667
+        }
+      ]
     }
   ]
 }

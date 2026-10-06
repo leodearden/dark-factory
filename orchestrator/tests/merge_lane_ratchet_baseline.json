@@ -997,6 +997,7 @@
     "orchestrator/tests/test_harness.py": {"patch_targets": ["SpeculativeMergeWorker.run", "liveness.TOUCH_MISS_TOLERANCE"], "private_reads": 39},
     "orchestrator/tests/test_harness_already_landed_gate_wiring.py": {"patch_targets": [], "private_reads": 262},
     "orchestrator/tests/test_harness_claimant_clear.py": {"patch_targets": [], "private_reads": 16},
+    "orchestrator/tests/test_harness_fleet_drain.py": {"patch_targets": [], "private_reads": 14},
     "orchestrator/tests/test_harness_infra_resume_truthful.py": {"patch_targets": [], "private_reads": 8},
     "orchestrator/tests/test_harness_interactive_reaper.py": {"patch_targets": [], "private_reads": 21},
     "orchestrator/tests/test_harness_merge_registry_wiring.py": {"patch_targets": ["SpeculativeMergeWorker", "liveness.enforce_merge_liveness_margin"], "private_reads": 22},

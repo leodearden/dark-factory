@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -54,13 +54,23 @@ def build_heartbeat_payload(
     depth: int,
     queue_empty: bool,
     ts_epoch: float,
+    *,
+    drain: Mapping[str, Any] | None,
+    verifies_in_flight: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     """Build the on-disk heartbeat payload.
 
-    Returns a dict with exactly the five fields ``{unit, merge_idle, depth,
-    queue_empty, ts_epoch}`` in that key order, with values passed through
-    unchanged (no coercion) — this is the single definition of the on-disk
-    contract shared with the future readers (γ drain gate, ε ``--report``).
+    Returns a dict with exactly the seven fields ``{unit, merge_idle, depth,
+    queue_empty, ts_epoch, drain, verifies_in_flight}`` in that key order,
+    with values passed through unchanged (no coercion) — this is the single
+    definition of the on-disk contract shared with the readers
+    (``scripts/drain_check.py``, the watchdog's ``--report``).
+
+    ``drain`` and ``verifies_in_flight`` are the restart-drain additions
+    (task 5371): the acknowledgement of this unit's drain request (``None``
+    when there is none) and the merge verifies in flight.  They are
+    keyword-only and required so no producer can omit them; their element
+    shapes are defined in ``orchestrator.fleet_drain``.
     """
     return {
         'unit': unit,
@@ -68,7 +78,25 @@ def build_heartbeat_payload(
         'depth': depth,
         'queue_empty': queue_empty,
         'ts_epoch': ts_epoch,
+        'drain': None if drain is None else dict(drain),
+        'verifies_in_flight': [dict(v) for v in verifies_in_flight],
     }
+
+
+def is_bare_unit_name(unit: str) -> bool:
+    """True iff *unit* is non-blank and a single path component.
+
+    The one rule for a unit name interpolated into a file name in the fleet
+    directory (``<unit>.json`` here, ``<unit>.drain.json`` in
+    ``orchestrator.fleet_drain``): a separator, a ``..`` or an absolute path
+    would escape the directory.
+    """
+    return (
+        bool(unit.strip())
+        and unit not in {os.curdir, os.pardir}
+        and unit == Path(unit).name
+        and (os.altsep is None or os.altsep not in unit)
+    )
 
 
 def write_heartbeat(fleet_dir: Path, unit: str, payload: Mapping[str, Any]) -> Path:
@@ -131,12 +159,7 @@ def write_heartbeat(fleet_dir: Path, unit: str, payload: Mapping[str, Any]) -> P
             'calling. Writing anyway would put an unattributable file in a '
             'machine-global, cross-project fleet directory.'
         )
-    is_bare_component = (
-        unit not in {os.curdir, os.pardir}
-        and unit == Path(unit).name
-        and (os.altsep is None or os.altsep not in unit)
-    )
-    if not is_bare_component:
+    if not is_bare_unit_name(unit):
         raise ValueError(
             f'refusing to write a heartbeat with a unit name that is not a single '
             f'path component (unit={unit!r}) into {fleet_dir}. The name is '

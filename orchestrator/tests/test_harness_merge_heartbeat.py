@@ -79,6 +79,8 @@ class TestWriteMergeHeartbeat:
             'depth': 0,
             'queue_empty': True,
             'ts_epoch': payload['ts_epoch'],
+            'drain': None,
+            'verifies_in_flight': [],
         }
         assert isinstance(payload['ts_epoch'], float)
 

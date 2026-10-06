@@ -40,6 +40,7 @@ forced on locally rather than grafted from the committed value — see
 from __future__ import annotations
 
 import pathlib
+import shlex
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -259,7 +260,9 @@ class TestOrchestratorCoordinatorCommittedConfigComposition:
         # hardcoded literal), matching the watch-prefixes assertion above.
         assert f'--on-active={committed.orchestrator_restart_on_active_secs}' in pos_args
         assert '--unit=orch-selfrestart-on-merge-0.service' in pos_args
-        assert expected_script in pos_args
+        # task 5371: the fleet script runs DRAINED, so the merge-landed
+        # coordinator waits out every unit's in-flight merge verifies too.
+        assert pos_args[-3:] == ('/bin/sh', '-c', shlex.join([expected_script, '--drain']))
         assert orch_coord.is_pending is False
 
 
