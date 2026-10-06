@@ -410,13 +410,13 @@ class HarvestResult:
     family_share: float | None
     """Share of EVERY briefing class, in either era: the whole briefing family.
 
-    The UNION -- not any one parameterized class alone.  The two are far
-    apart and the name invites the wrong reading: in the committed sidecar
-    this is 0.645536 while the retired `task {task_id} ...` class by itself
-    is 0.125334 (its `TemplateClass.traffic_share`).  The CLI prints it under
-    the label `briefing family`, and `read_transform_selection` publishes the
-    same union under the same name -- computed independently as the sum of
-    the template shares.
+    Not the share of a parameterized class, which the name suggests. In the
+    committed sidecar the union is 0.645536, while the retired
+    `task {task_id} ...` class alone is 0.125334 (its
+    `TemplateClass.traffic_share`).  The CLI prints the union as
+    `briefing family`.  The field keeps its name because
+    `read_transform_selection` publishes the same union, summed
+    independently from the template shares, as `family_share`.
     """
 
     journal_path: str
@@ -903,7 +903,7 @@ def harvest(
     literal_total = sum(
         t.observed_count for t in templates if t.match is MatchKind.LITERAL
     )
-    family_total = sum(t.observed_count for t in templates)
+    briefing_total = sum(t.observed_count for t in templates)
     tail_total = sum(tail_counts.values())
 
     # --- deterministic tail sample -------------------------------------
@@ -973,9 +973,7 @@ def harvest(
         tail_distinct=len(tail_counts),
         tail_share=_share(tail_total, total),
         literal_share=_share(literal_total, total),
-        # The UNION of every briefing class, not the parameterized family
-        # alone -- see `HarvestResult.family_share`.
-        family_share=_share(family_total, total),
+        family_share=_share(briefing_total, total),
         journal_path=_repo_relative(db_path),
         tail_sample=tail_sample,
         tail_top=tail_top,
