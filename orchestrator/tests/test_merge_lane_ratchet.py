@@ -144,20 +144,23 @@ def live_measurement() -> LiveMeasurement:
 
     The recording wrapper RECORDS AND DELEGATES, so the report is a real
     measurement and the call list is real work rather than a simulation of it.
+    It wraps the public `source_measures.file_cognitive_measures`, which takes
+    ONE complexipy measurement per call (tests/scripts/test_source_measures.py
+    pins that), so each recorded call is one complexipy run.
     `test_each_cluster_file_is_measured_by_complexipy_once` reads that list, so
     the per-file-once guarantee costs no measurement of its own. The builtin
     `monkeypatch` fixture is function-scoped and cannot be requested here,
     hence `pytest.MonkeyPatch.context()`.
     """
     calls: list[Path] = []
-    original = source_measures._file_complexity
+    original = source_measures.file_cognitive_measures
 
     def recording(path: Path):
         calls.append(path)
         return original(path)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(source_measures, '_file_complexity', recording)
+        patch.setattr(source_measures, 'file_cognitive_measures', recording)
         report = metrics.build_report(_REPO_ROOT)
     return LiveMeasurement(report=report, complexipy_calls=tuple(calls))
 
@@ -452,9 +455,36 @@ def _names_rebound_from(
     )
 
 
+def _names_from_imported(source: str, provider: str) -> list[str]:
+    return sorted(
+        alias.asname or alias.name
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.ImportFrom) and node.module == provider
+        for alias in node.names
+    )
+
+
 class TestTheRatchetReExportsNoMeasure:
-    def test_the_ratchet_binds_nothing_source_measures_defines(self) -> None:
+    def test_the_ratchet_binds_no_object_source_measures_defines(self) -> None:
         assert _names_rebound_from(vars(metrics), source_measures) == []
+
+    def test_the_ratchet_from_imports_nothing_from_source_measures(self) -> None:
+        # Identity cannot see an interned atom: `from source_measures import
+        # COMPLEXIPY_REQUIRED` would rebind a str the check above skips.
+        source = Path(metrics.__file__).read_text(encoding='utf-8')
+        assert _names_from_imported(source, source_measures.__name__) == []
+
+    def test_a_from_import_is_found_at_any_depth_under_its_bound_name(self) -> None:
+        source = (
+            'import source_measures\n'
+            'from source_measures import COMPLEXIPY_REQUIRED\n'
+            'def f():\n'
+            '    from source_measures import parse_source as parse\n'
+        )
+        assert _names_from_imported(source, 'source_measures') == [
+            'COMPLEXIPY_REQUIRED',
+            'parse',
+        ]
 
     def test_a_rebinding_under_any_name_is_found(self) -> None:
         namespace: dict[str, object] = {
@@ -952,7 +982,7 @@ class TestBuildReport:
         self, live_measurement: LiveMeasurement
     ) -> None:
         # build_report wants two cognitive projections per cluster file, and
-        # used to fetch each from its own `_file_complexity` call -- 50 runs
+        # used to fetch each from its own complexipy run -- 50 runs
         # over the 25 files CLUSTER_PATHS' 23 entries resolve to (two are
         # globs), half of them redundant.
         #
