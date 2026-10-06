@@ -570,7 +570,8 @@ async def get_escalation_rates(
             db,
             'SELECT project_id, task_id, steward_invocations '
             '  FROM task_results '
-            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? ',
+            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? '
+            f'  AND {_NOT_A_CANCEL} ',
             since,
             projects,
         )
