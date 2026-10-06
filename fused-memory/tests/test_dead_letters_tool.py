@@ -860,8 +860,9 @@ class TestReplayEventDeadLettersTool:
         parked so the state is settled rather than raced), and the dead-letter
         file no longer holds them.
 
-        The drainer's commit of replayed events is covered by
-        fused-memory/tests/test_event_queue.py::test_replay_dead_letters_reenqueues_and_clears.
+        Replayed events re-enter through the ordinary enqueue path, whose drainer
+        commit is covered by
+        fused-memory/tests/test_event_queue.py::test_drainer_marks_processed_on_commit.
         """
         dl = tmp_path / 'dl.jsonl'
         ej = tmp_path / 'ej.db'
