@@ -25,7 +25,8 @@ queries per dispatched agent. Each is one CLASS here, tagged with its era:
   * The free-text task query ``{title} {area}`` has no literal text, so its
     pattern would match nearly every query. It is matched as a COMPANION
     instead: the next search from the same ``caller_agent_id`` after that
-    caller's conventions-area query. The caller is threaded by
+    caller's conventions-area query, within ``COMPANION_WINDOW`` of it. The
+    caller is threaded by
     ``orchestrator/src/orchestrator/agents/memory_recall.py::MemoryRecall._search``
     (PRD D8). A spec with no literal text and no declared anchor is refused
     when the classes are built.
@@ -103,10 +104,10 @@ import re
 import sqlite3
 import string
 import sys
-from collections import Counter
+from collections import Counter, defaultdict, deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -523,9 +524,25 @@ class _SearchOp:
     text: str
     limit: int | None
     caller: str | None
+    at: datetime | None
 
 
-def _search_op(params: str | None) -> _SearchOp | None:
+def _journal_time(created_at: object) -> datetime | None:
+    """A ``write_ops.created_at`` value as an aware datetime, or None if it is not one.
+
+    The journal stamps ``datetime.now(UTC).isoformat()``; a value without a
+    zone is unreadable rather than guessed to be UTC.
+    """
+    if not isinstance(created_at, str):
+        return None
+    try:
+        at = datetime.fromisoformat(created_at)
+    except ValueError:
+        return None
+    return at if at.tzinfo is not None else None
+
+
+def _search_op(params: str | None, created_at: object) -> _SearchOp | None:
     """Parse a ``write_ops.params`` JSON blob, or None when it carries no query.
 
     The limit rides in the SAME already-parsed dict as the text, so reading
@@ -533,7 +550,8 @@ def _search_op(params: str | None) -> _SearchOp | None:
     ``observed_limit``.  ``None`` for the limit means the op recorded no
     usable integer one — ``bool`` is excluded explicitly because
     ``isinstance(True, int)`` is ``True`` in Python.  ``None`` for the
-    caller means the op recorded no ``caller_agent_id``.
+    caller means the op recorded no ``caller_agent_id``, and ``None`` for
+    ``at`` an unreadable ``created_at``; either way the op cannot be paired.
     """
     if not params:
         return None
@@ -554,37 +572,60 @@ def _search_op(params: str | None) -> _SearchOp | None:
     )
     raw_caller = parsed.get('caller_agent_id')
     caller = raw_caller if isinstance(raw_caller, str) and raw_caller else None
-    return _SearchOp(text=text, limit=limit, caller=caller)
+    return _SearchOp(text=text, limit=limit, caller=caller, at=_journal_time(created_at))
+
+
+#: Longest a companion op may be journalled after its anchor op.
+#:
+#: A search is journalled when it completes, and the briefing fires its task
+#: query as soon as the area query returns, so a real pair is one search
+#: apart. An anchor older than this is an orphan: its companion was never
+#: journalled, and pairing it would claim an unrelated later search.
+COMPANION_WINDOW = timedelta(seconds=60)
 
 
 class _Classifier:
     """Classifies search ops read in journal order, for ONE `harvest` call.
 
     A pattern class claims every op its pattern fullmatches. A companion
-    class claims the next op no pattern claims from a caller whose anchor op
-    is still unpaired. Unpaired anchors are COUNTED per caller, because
-    parallel dispatches can share one caller id and interleave their pairs.
+    class claims the next op no pattern claims from a caller with an
+    unpaired anchor op at most `COMPANION_WINDOW` older. Unpaired anchors
+    are QUEUED per caller, because parallel dispatches can share one caller
+    id and interleave their pairs.
     """
 
     def __init__(self, classes: tuple[BriefingClass, ...]) -> None:
         self._patterns = [(c, c.pattern) for c in classes if c.pattern is not None]
         self._companions = {c.anchor: c for c in classes if c.anchor is not None}
-        self._unpaired: Counter[tuple[str, str]] = Counter()
+        self._unpaired: defaultdict[tuple[str, str], deque[datetime]] = defaultdict(deque)
 
     def classify(self, op: _SearchOp) -> BriefingClass | None:
         """The class `op` belongs to, or None if it is tail."""
         for cls, pattern in self._patterns:
             if pattern.fullmatch(op.text):
-                if op.caller is not None and cls.template in self._companions:
-                    self._unpaired[(op.caller, cls.template)] += 1
+                if (
+                    op.caller is not None
+                    and op.at is not None
+                    and cls.template in self._companions
+                ):
+                    self._unpaired[(op.caller, cls.template)].append(op.at)
                 return cls
-        if op.caller is None:
+        if op.caller is None or op.at is None:
             return None
         for anchor, companion in self._companions.items():
-            if self._unpaired[(op.caller, anchor)] > 0:
-                self._unpaired[(op.caller, anchor)] -= 1
+            if self._claim_anchor(op.caller, anchor, op.at):
                 return companion
         return None
+
+    def _claim_anchor(self, caller: str, anchor: str, at: datetime) -> bool:
+        """Consume `caller`'s oldest `anchor` op still inside the window at `at`."""
+        pending = self._unpaired[(caller, anchor)]
+        while pending and at - pending[0] > COMPANION_WINDOW:
+            pending.popleft()
+        if not pending:
+            return False
+        pending.popleft()
+        return True
 
 
 def _limit_histogram(counter: Counter[int | None]) -> dict[str, int]:
@@ -818,12 +859,12 @@ def harvest(
             # releasing the snapshot any earlier.
             #
             # In journal (rowid) order, because a companion op is recognised
-            # by its position after its anchor.
-            for (params,) in con.execute(
-                "SELECT params FROM write_ops WHERE operation = 'search' "
+            # by its position and time after its anchor.
+            for params, created_at in con.execute(
+                "SELECT params, created_at FROM write_ops WHERE operation = 'search' "
                 "ORDER BY rowid"
             ):
-                op = _search_op(params)
+                op = _search_op(params, created_at)
                 if op is None:
                     unparsed += 1
                     continue

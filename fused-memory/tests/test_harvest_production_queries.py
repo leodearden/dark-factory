@@ -33,6 +33,8 @@ import functools
 import shutil
 import subprocess
 import types
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -146,21 +148,27 @@ RETIRED_TEMPLATES = frozenset(
 )
 
 
+JOURNAL_START = datetime(2026, 8, 12, tzinfo=UTC)
+
+JournalRow = tuple[str, str, str] | tuple[str, str, str, str]
+"""(operation, kind, params[, created_at]); created_at defaults to JOURNAL_START."""
+
+
 def _build_journal(
     path: Path,
-    rows: list[tuple[str, str, str]],
+    rows: Sequence[JournalRow],
 ) -> Path:
-    """Write a synthetic journal at `path`. Rows are (operation, kind, params)."""
+    """Write a synthetic journal at `path`."""
     import sqlite3  # noqa: PLC0415
 
     con = sqlite3.connect(str(path))
     try:
         con.execute(WRITE_OPS_DDL)
-        for i, (operation, kind, params) in enumerate(rows):
+        for i, (operation, kind, params, *at) in enumerate(rows):
             con.execute(
                 'INSERT INTO write_ops (id, operation, kind, params, created_at)'
                 ' VALUES (?, ?, ?, ?, ?)',
-                (f'op-{i:06d}', operation, kind, params, '2026-08-12T00:00:00Z'),
+                (f'op-{i:06d}', operation, kind, params, at[0] if at else _seconds_in(0)),
             )
         con.commit()
     finally:
@@ -178,6 +186,16 @@ def _search_rows(
     if caller is not None:
         params['caller_agent_id'] = caller
     return [('search', 'read', json.dumps(params))] * n
+
+
+def _seconds_in(seconds: float) -> str:
+    """The journal's `created_at` spelling for `seconds` after JOURNAL_START."""
+    return (JOURNAL_START + timedelta(seconds=seconds)).isoformat()
+
+
+def _at(seconds: float, rows: list[tuple[str, str, str]]) -> list[JournalRow]:
+    """`rows`, journalled `seconds` after JOURNAL_START."""
+    return [(*row, _seconds_in(seconds)) for row in rows]
 
 
 def _standard_journal(tmp_path: Path) -> Path:
@@ -684,6 +702,70 @@ class TestTheTaskChannelIsPairedByCaller:
         assert _companion(result).observed_count == 1
         tail = [r for r in result.rows if r['source'] == 'production_tail']
         assert [r['text'] for r in tail] == ['a search of somebody else']
+
+    def test_an_orphaned_area_query_does_not_claim_a_much_later_search(self, tmp_path):
+        """An area query whose task query was never journalled pairs with nothing."""
+        mod = _mod()
+        area = _rendered(CONVENTIONS_AREA, AREA_SCOPES[0])
+        rows = [
+            *_at(0, _search_rows(area, 1, caller=IMPLEMENTER)),
+            *_at(3600, _search_rows('an own search an hour later', 1, caller=IMPLEMENTER)),
+        ]
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _companion(result).observed_count == 0
+        assert result.tail_count == 1
+
+    def test_a_retried_dispatch_pairs_its_own_area_query_not_an_orphan(self, tmp_path):
+        """The orphan expires, so the agent's own search after the retry stays tail."""
+        mod = _mod()
+        area = _rendered(CONVENTIONS_AREA, AREA_SCOPES[0])
+        rows = [
+            *_at(0, _search_rows(area, 1, caller=IMPLEMENTER)),
+            *_at(600, _briefing_rows(AREA_SCOPES[0], caller=IMPLEMENTER)),
+            *_at(605, _search_rows('an own search', 1, caller=IMPLEMENTER)),
+        ]
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _companion(result).observed_count == 1
+        tail = [r['text'] for r in result.rows if r['source'] == 'production_tail']
+        assert tail == ['an own search']
+
+    @pytest.mark.parametrize(
+        ('delay_of', 'paired'),
+        [
+            (lambda window: 0, 1),
+            (lambda window: window, 1),
+            (lambda window: window + 1, 0),
+        ],
+        ids=['at-once', 'at-the-window', 'past-the-window'],
+    )
+    def test_a_task_query_is_paired_only_inside_the_window(
+        self, tmp_path, delay_of, paired
+    ):
+        mod = _mod()
+        delay = delay_of(mod.COMPANION_WINDOW.total_seconds())
+        area, task = _briefing_rows(AREA_SCOPES[0], caller=IMPLEMENTER)
+        rows = [*_at(0, [area]), *_at(delay, [task])]
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _companion(result).observed_count == paired
+        assert result.tail_count == 1 - paired
+
+    @pytest.mark.parametrize(
+        'unreadable', ['not a time', '2026-08-12T00:00:01'], ids=['garbage', 'no-zone']
+    )
+    @pytest.mark.parametrize('side', [0, 1], ids=['anchor', 'companion'])
+    def test_an_op_without_a_readable_time_is_counted_but_never_paired(
+        self, tmp_path, unreadable, side
+    ):
+        mod = _mod()
+        area, task = _briefing_rows(AREA_SCOPES[0], caller=IMPLEMENTER)
+        times = [_seconds_in(0), _seconds_in(1)]
+        times[side] = unreadable
+        rows = [(*area, times[0]), (*task, times[1])]
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert result.total_search_ops == 2
+        assert _class_for(result, CONVENTIONS_AREA.text).observed_count == 1
+        assert _companion(result).observed_count == 0
+        assert result.tail_count == 1
 
     def test_limits_are_measured_from_the_ops_each_side_counted(self, tmp_path):
         """The same text paired at 5 and re-run by the agent at 20 splits cleanly."""
