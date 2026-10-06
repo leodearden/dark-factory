@@ -67,6 +67,10 @@ def _make_workflow(
     cfg.steward_completion_timeout = 300.0
     cfg.timeouts.working_idle_secs = _WORKING_IDLE_SECS_SENTINEL
     cfg.invocation_timeout = _INVOCATION_TIMEOUT_SENTINEL
+    # Numeric ceilings: _invoke compares a failed run's cost/turns against
+    # them (classify_cap_kill), which a MagicMock ceiling cannot support.
+    cfg.budgets.implementer = _BUDGET_CEILING
+    cfg.max_turns.implementer = _TURN_CEILING
     # These tests pass a plain tmp_path as cwd (not a real linked worktree) and
     # do not assert on sandbox wiring; disable the sandbox block so _invoke does
     # not call compute_write_set(cwd) on a non-worktree path (task 2905 α3).
