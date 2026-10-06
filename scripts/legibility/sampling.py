@@ -34,6 +34,7 @@ import math
 import re
 import sys
 from collections.abc import Callable, Sequence
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -277,6 +278,22 @@ class TranscriptScan:
     session_id: str | None
 
 
+def _record_session_id(record: dict[str, Any]) -> str | None:
+    return record.get('sessionId') or None
+
+
+def peek_session_id(path: Path) -> str | None:
+    """The ``session_id`` :func:`scan_transcript` reports for *path*, read
+    only as far as the first record that carries one, so a caller can
+    cheaply skip a session it already holds before paying for a full scan.
+    Unreadable input yields ``None``."""
+    try:
+        with closing(iter_json_lines(path)) as records:
+            return next(filter(None, map(_record_session_id, records)), None)
+    except OSError:
+        return None
+
+
 def scan_transcript(path: Path) -> TranscriptScan:
     """Read *path* once, producing everything the sampler needs from it.
 
@@ -321,8 +338,8 @@ def scan_transcript(path: Path) -> TranscriptScan:
                 and not record.get('isMeta')
             ):
                 first_turn = record
-            if session_id is None and record.get('sessionId'):
-                session_id = record['sessionId']
+            if session_id is None:
+                session_id = _record_session_id(record)
     except OSError:
         return TranscriptScan(SignalCounts(), None, None)
 

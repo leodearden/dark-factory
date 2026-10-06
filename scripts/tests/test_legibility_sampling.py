@@ -441,6 +441,39 @@ class TestScanTranscript:
         assert scan.session_id is None
 
 
+class TestPeekSessionId:
+    """peek_session_id is scan_transcript's session_id, read only up to the
+    first record that carries one."""
+
+    @pytest.mark.parametrize('records', [
+        pytest.param([_queue_operation_record(), _with_session(_clean_record(0), 'sess-a')],
+                     id='leading-record-without-one'),
+        pytest.param([_clean_record(0), _tool_error_record()], id='none-carries-one'),
+        pytest.param([{**_with_session(_clean_record(0), 'parent'), 'isSidechain': True}],
+                     id='all-sidechain'),
+        pytest.param([_with_session(_clean_record(0), ''), _with_session(_clean_record(1), 'sess-b')],
+                     id='empty-id-skipped'),
+    ])
+    def test_agrees_with_the_full_scan(self, tmp_path, records):
+        path = _write_transcript(tmp_path / 's.jsonl', records)
+        assert mod.peek_session_id(path) == mod.scan_transcript(path).session_id
+
+    def test_unreadable_path_is_none(self, tmp_path):
+        assert mod.peek_session_id(tmp_path / 'missing.jsonl') is None
+
+    def test_stops_at_the_first_record_carrying_one(self, tmp_path):
+        """Bytes no full read can decode, placed well past the first decode
+        chunk, fail the scan but never reach the peek."""
+        path = _write_transcript(tmp_path / 's.jsonl', [
+            _with_session(_clean_record(0), 'sess-c'),
+            {'type': 'padding', 'text': 'x' * 65536},
+        ])
+        with path.open('ab') as f:
+            f.write(b'\xff\xfe not utf-8\n')
+        assert mod.scan_transcript(path).session_id is None
+        assert mod.peek_session_id(path) == 'sess-c'
+
+
 class TestScoreSession:
     """score_session is the one scan + classify + first-turn-text step every
     consumer of enumerated sessions shares."""

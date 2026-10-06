@@ -3,12 +3,21 @@ census run mines (plans/census-incremental-prd.md §4.2)."""
 from __future__ import annotations
 
 import json
+import logging
 import random
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
 import pytest
-from legibility import census_window, coder, config, inventory, session_ledger, trickle_state
+from legibility import (
+    census_window,
+    coder,
+    config,
+    inventory,
+    sampling,
+    session_ledger,
+    trickle_state,
+)
 from legibility.census_window import MiningWindow
 from legibility.session_ledger import CodedBy, LedgerRow, LedgerState, Outcome
 
@@ -27,14 +36,6 @@ def test_retention_window_is_the_utc_days_before_today():
     assert window.first_day == date(2026, 9, 6)
     assert window.last_day == date(2026, 10, 5)
     assert window.is_empty is False
-
-
-def test_window_contains_exactly_its_days():
-    window = census_window.retention_window(_NOW, 30)
-    assert window.contains(date(2026, 9, 6))
-    assert window.contains(date(2026, 10, 5))
-    assert not window.contains(date(2026, 10, 6))
-    assert not window.contains(date(2026, 9, 5))
 
 
 def test_window_record_is_its_half_open_iso_bounds():
@@ -60,7 +61,6 @@ def test_a_census_already_run_today_leaves_an_empty_window():
     assert moved.start == moved.end == _END
     assert moved.is_empty is True
     assert moved.last_day < moved.first_day
-    assert not moved.contains(date(2026, 10, 5))
 
 
 def test_mining_window_rejects_naive_bounds():
@@ -191,7 +191,24 @@ def test_a_ledgered_session_is_never_mined(fx):
     assert selection.sessions_enumerated == 2
     assert selection.skipped_coded == 1
     assert selection.skipped_zero_signal == 0
-    assert selection.eligible == 1
+
+
+def test_a_ledgered_session_costs_no_full_transcript_scan(fx, monkeypatch):
+    fx.session('S')
+    t_path = fx.session('T')
+    fx.ledger_row('S')
+    scanned = []
+    score_session = sampling.score_session
+
+    def recording_score_session(session):
+        scanned.append(session.path)
+        return score_session(session)
+
+    monkeypatch.setattr(sampling, 'score_session', recording_score_session)
+
+    list(fx.source())
+
+    assert scanned == [t_path]
 
 
 def test_a_zero_signal_session_is_never_digested(fx):
@@ -214,7 +231,7 @@ def test_an_absent_ledger_is_created(fx):
     assert fx.ledger_path.is_file()
 
 
-def test_an_unreadable_ledger_excludes_nothing_and_takes_the_transition_window(fx):
+def test_an_unreadable_ledger_excludes_nothing_and_takes_the_transition_window(fx, caplog):
     fx.ledger_path.parent.mkdir(parents=True)
     garbage = b'not an sqlite database\n' * 8
     fx.ledger_path.write_bytes(garbage)
@@ -222,7 +239,12 @@ def test_an_unreadable_ledger_excludes_nothing_and_takes_the_transition_window(f
     fx.session('NEW', days_ago=1)
 
     source = fx.source(last_census_at=_days_ago(2))
-    assert _mined_sessions(list(source)) == ['NEW']
+    with caplog.at_level(logging.WARNING, logger='legibility.census_window'):
+        assert _mined_sessions(list(source)) == ['NEW']
+
+    [warning] = [r for r in caplog.records if r.name == 'legibility.census_window']
+    assert warning.levelno == logging.WARNING
+    assert str(fx.ledger_path) in warning.getMessage()
 
     selection = source.selection
     assert selection is not None

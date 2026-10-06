@@ -60,9 +60,6 @@ class MiningWindow:
     def is_empty(self) -> bool:
         return self.start == self.end
 
-    def contains(self, day: date) -> bool:
-        return self.first_day <= day <= self.last_day
-
     def to_record(self) -> list[str]:
         return [self.start.isoformat(), self.end.isoformat()]
 
@@ -102,10 +99,6 @@ class SessionSelection:
                 f'skipped_zero_signal={self.skipped_zero_signal}',
             )
 
-    @property
-    def eligible(self) -> int:
-        return self.sessions_enumerated - self.skipped_coded - self.skipped_zero_signal
-
 
 def _stratified_random_order(by_stratum: dict, *, rng: random.Random) -> list:
     """Interleave *by_stratum* (``{stratum: [ScoredRecord, ...]}``)
@@ -144,7 +137,9 @@ class WindowBatchSource:
     Lazy: nothing is opened, enumerated or rendered until the first
     iteration, so a run deferred before mining touches nothing. The first
     iteration opens (creating or pruning) the ledger and publishes
-    :attr:`selection`.
+    :attr:`selection`. A ledgered session is recognised from its first
+    ``sessionId`` (:func:`sampling.peek_session_id`), so it costs no full
+    transcript scan.
     """
 
     def __init__(
@@ -189,23 +184,30 @@ class WindowBatchSource:
             full if snapshot.has_census_rows
             else transition_window(full, last_census_at=self._last_census_at)
         )
-        scored = [] if window.is_empty else [
-            sampling.score_session(session)
-            for session in inventory.enumerate_sessions_in_range(
-                self._projects_root, self._cfg.cwd_prefixes,
-                window.first_day, window.last_day,
-                agent_transcript_roots=inventory.resolve_agent_transcript_roots(
-                    self._cfg.project_root, self._cfg.agent_transcript_roots,
-                ),
+        if snapshot.state is session_ledger.LedgerState.UNREADABLE:
+            logger.warning(
+                'census: session ledger unreadable, so no already-coded session is '
+                'skipped this run: %s',
+                snapshot.error,
             )
+        sessions = [] if window.is_empty else inventory.enumerate_sessions_in_range(
+            self._projects_root, self._cfg.cwd_prefixes,
+            window.first_day, window.last_day,
+            agent_transcript_roots=inventory.resolve_agent_transcript_roots(
+                self._cfg.project_root, self._cfg.agent_transcript_roots,
+            ),
+        )
+        uncoded = [
+            session for session in sessions
+            if sampling.peek_session_id(session.path) not in snapshot.sessions
         ]
-        uncoded = [record for record in scored if record.session_id not in snapshot.sessions]
-        eligible = [record for record in uncoded if record.score > 0]
+        scored = [sampling.score_session(session) for session in uncoded]
+        eligible = [record for record in scored if record.score > 0]
         self._selection = SessionSelection(
             window=window,
             ledger=snapshot,
-            sessions_enumerated=len(scored),
-            skipped_coded=len(scored) - len(uncoded),
-            skipped_zero_signal=len(uncoded) - len(eligible),
+            sessions_enumerated=len(sessions),
+            skipped_coded=len(sessions) - len(uncoded),
+            skipped_zero_signal=len(scored) - len(eligible),
         )
         return eligible
