@@ -37,6 +37,14 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import _init_git_repo, load_script_module
+from shared.briefing_queries import (
+    CONVENTIONS_AREA,
+    CONVENTIONS_GENERIC,
+    QUERY_SPECS,
+    BriefingQuerySpec,
+    BriefingScope,
+    queries_for,
+)
 
 SCRIPT_PATH = (
     Path(__file__).parent.parent / 'scripts' / 'harvest_production_queries.py'
@@ -167,7 +175,11 @@ def _search_rows(text: str, n: int, *, limit: int = 5) -> list[tuple[str, str, s
 
 
 def _standard_journal(tmp_path: Path) -> Path:
-    """A journal whose shares are hand-computable.
+    return _build_journal(tmp_path / 'journal.db', _standard_rows())
+
+
+def _standard_rows() -> list[tuple[str, str, str]]:
+    """Retired-era traffic whose shares are hand-computable.
 
     200 search ops total:
       overview      60  -> 30%
@@ -188,7 +200,7 @@ def _standard_journal(tmp_path: Path) -> Path:
     # Noise that must never be counted.
     rows += [('add_memory', 'write', '{"content": "not a query"}')] * 20
     rows += [('get_task', 'read', '{"task_id": "4004"}')] * 5
-    return _build_journal(tmp_path / 'journal.db', rows)
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -416,6 +428,140 @@ class TestTheRetiredBranchIsExplicit:
             RETIRED_OVERVIEW, RETIRED_CONVENTIONS, RETIRED_DECISIONS,
         }
         assert mod.RETIRED_TASK_TEMPLATE == RETIRED_TASK_TEMPLATE
+
+
+# Scopes with declared files, so each fires the area-scoped conventions query
+# and a distinct area. Journal rows are rendered from these through
+# `queries_for`, never hand-copied, so a reworded template keeps these honest.
+AREA_SCOPES = (
+    BriefingScope(
+        task_id='5502',
+        title='Re-point the production-query harvester',
+        files=('fused-memory/scripts/harvest_production_queries.py',),
+    ),
+    BriefingScope(
+        task_id='4856',
+        title='Re-key the memory-eval registry',
+        files=('fused-memory/tests/fixtures/memory_eval_topic_registry.json',),
+    ),
+    BriefingScope(
+        task_id='3659',
+        title='Rescope the briefing memory block',
+        files=('orchestrator/src/orchestrator/agents/briefing.py',),
+    ),
+)
+
+
+def _rendered(spec: BriefingQuerySpec, scope: BriefingScope) -> str:
+    """The query `queries_for(scope)` fires for `spec`."""
+    fired = {fired_spec.slug: text for fired_spec, text in queries_for(scope)}
+    return fired[spec.slug]
+
+
+def _class_for(result, template: str):
+    (cls,) = [t for t in result.templates if t.template == template]
+    return cls
+
+
+class TestCurrentTemplatesAreRenderedFromSource:
+    """The current classes come from `shared.briefing_queries`, not a copy."""
+
+    def test_the_generic_conventions_query_is_a_current_literal(self, tmp_path):
+        mod = _mod()
+        ((_, generic),) = queries_for(BriefingScope())
+        db = _build_journal(tmp_path / 'j.db', _search_rows(generic, 7))
+        result = mod.harvest(db)
+        cls = _class_for(result, CONVENTIONS_GENERIC.text)
+        assert (cls.match, cls.era) == ('literal', 'current')
+        assert cls.observed_count == 7
+        assert result.tail_count == 0
+
+    def test_area_queries_for_different_scopes_collapse_into_one_class(self, tmp_path):
+        mod = _mod()
+        rows: list[tuple[str, str, str]] = []
+        for n, scope in enumerate(AREA_SCOPES, start=1):
+            rows += _search_rows(_rendered(CONVENTIONS_AREA, scope), n)
+        db = _build_journal(tmp_path / 'j.db', rows)
+        result = mod.harvest(db)
+        cls = _class_for(result, CONVENTIONS_AREA.text)
+        assert (cls.match, cls.era) == ('parameterized', 'current')
+        assert cls.distinct_instances == 3
+        assert cls.observed_count == 6
+        assert result.tail_count == 0
+
+    def test_near_misses_of_the_area_query_stay_tail(self, tmp_path):
+        mod = _mod()
+        rendered = _rendered(CONVENTIONS_AREA, AREA_SCOPES[0])
+        near_misses = (
+            'conventions and gotchas for',
+            'coding conventions and gotchas for x',
+            f'{rendered}, and what changed there since August?',
+        )
+        rows = _search_rows(rendered, 2)
+        for text in near_misses:
+            rows += _search_rows(text, 1)
+        db = _build_journal(tmp_path / 'j.db', rows)
+        result = mod.harvest(db)
+        assert _class_for(result, CONVENTIONS_AREA.text).observed_count == 2
+        assert result.tail_count == len(near_misses)
+
+    def test_a_mixed_era_journal_counts_each_class_once_in_its_own_era(self, tmp_path):
+        """200 retired-era ops plus 20 generic and 30 area ops: 250 in all."""
+        mod = _mod()
+        ((_, generic),) = queries_for(BriefingScope())
+        rows = _standard_rows() + _search_rows(generic, 20)
+        for scope in AREA_SCOPES:
+            rows += _search_rows(_rendered(CONVENTIONS_AREA, scope), 10)
+        db = _build_journal(tmp_path / 'j.db', rows)
+        result = mod.harvest(db)
+
+        counts = {(t.template, t.era): t.observed_count for t in result.templates}
+        assert counts[(RETIRED_OVERVIEW, 'retired')] == 60
+        assert counts[(RETIRED_CONVENTIONS, 'retired')] == 40
+        assert counts[(RETIRED_DECISIONS, 'retired')] == 20
+        assert counts[(RETIRED_TASK_TEMPLATE, 'retired')] == 40
+        assert counts[(CONVENTIONS_GENERIC.text, 'current')] == 20
+        assert counts[(CONVENTIONS_AREA.text, 'current')] == 30
+        assert len(counts) == len(result.templates), 'each template is one class'
+
+        assert result.family_share == 0.84  # (160 + 50) / 250
+        assert result.literal_share == 0.56  # (120 + 20) / 250
+        assert result.tail_share == 0.16
+        total = sum(t.traffic_share for t in result.templates) + result.tail_share
+        assert abs(total - 1.0) < 1e-9
+
+    def test_an_unobserved_class_emits_no_row_and_reports_its_template(self, tmp_path):
+        mod = _mod()
+        ((_, generic),) = queries_for(BriefingScope())
+        rows = _search_rows(generic, 5)
+        rows += _search_rows(_rendered(CONVENTIONS_AREA, AREA_SCOPES[0]), 5)
+        db = _build_journal(tmp_path / 'j.db', rows)
+        result = mod.harvest(db)
+
+        briefing = [r for r in result.rows if r['source'] == 'briefing_template']
+        assert {r['template'] for r in briefing} == {
+            CONVENTIONS_GENERIC.text, CONVENTIONS_AREA.text,
+        }
+        assert all(r['era'] == 'current' for r in briefing)
+        unobserved = [t for t in result.templates if t.observed_count == 0]
+        assert {t.template for t in unobserved} >= RETIRED_TEMPLATES
+        assert all(t.text == t.template for t in unobserved)
+
+    def test_the_scoring_window_equals_every_spec_limit(self):
+        """Drift in the source's limit forces a decision about the window."""
+        mod = _mod()
+        assert {spec.limit for spec in QUERY_SPECS} == {mod.BRIEFING_SEARCH_LIMIT}
+
+    def test_an_anchorless_spec_without_a_companion_anchor_is_refused(self):
+        mod = _mod()
+        free_text = BriefingQuerySpec(
+            slug='free-text', section_title='X', text='{title} {area}'
+        )
+        with pytest.raises(mod.UnmatchableTemplateError) as exc:
+            mod.build_current_classes((free_text,), companion_anchors={})
+        assert isinstance(exc.value, mod.HarvestError)
+        assert 'free-text' in str(exc.value)
+        assert '{title} {area}' in str(exc.value)
 
 
 class TestTrafficShares:
