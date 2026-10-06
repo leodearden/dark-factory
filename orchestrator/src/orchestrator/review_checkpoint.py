@@ -9,7 +9,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AllAccountsCappedException,
+    classify_cap_kill,
+    invoke_with_cap_retry,
+)
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import DEEP_REVIEWER, submit_only_instructions
@@ -256,7 +260,12 @@ class ReviewCheckpoint:
             try:
                 # Report the RESOLVED model (task η) — diverges from raw
                 # config.models.deep_reviewer under a policy rule / override.
+                # `model` is that routing-resolved lineage alias; `model_id` is
+                # the exact version the CLI actually served (task 4826).
                 model_name = decision.model
+                capped_reason = classify_cap_kill(
+                    result, budget_usd=decision.budget_usd, max_turns=decision.max_turns,
+                )
                 await self.cost_store.save_invocation(
                     run_id=self.run_id,
                     task_id=None,
@@ -270,7 +279,9 @@ class ReviewCheckpoint:
                     cache_read_tokens=result.cache_read_tokens,
                     cache_create_tokens=result.cache_create_tokens,
                     duration_ms=elapsed_ms,
-                    capped=False,
+                    capped=capped_reason is not None,
+                    capped_reason=capped_reason,
+                    model_id=result.model_id,
                     started_at=started_at,
                     completed_at=completed_at,
                 )
