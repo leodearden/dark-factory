@@ -809,6 +809,22 @@ def test_control_check_refuses_two_runs_of_one_arm(harness, live, tmp_path):
     assert code == harness.EXIT_REFUSED
 
 
+def test_control_check_refuses_a_limited_run_against_a_full_one(harness, live, tmp_path, capsys):
+    spec_a, spec_b = _control('ctrl-a', 'evalmem_ctrl_a'), _control('ctrl-b', 'evalmem_ctrl_b')
+    limited = run_manifest_for(spec_b, episode_ids=('e1',))
+    run_a = _write_run(tmp_path / 'a', run_manifest_for(spec_a), _accounted(spec_a))
+    run_b = _write_run(tmp_path / 'b', limited, _accounted(spec_b))
+
+    code = harness.main(
+        ['control-check', '--run', str(run_a), '--run', str(run_b)], deps=live.factory(harness)
+    )
+
+    assert code == harness.EXIT_REFUSED
+    captured = capsys.readouterr()
+    assert "lacks ['e2', 'e3']" in captured.err
+    assert captured.out == ''
+
+
 def test_control_check_needs_at_least_two_runs(harness, live, tmp_path):
     spec = _control('ctrl-a', 'evalmem_ctrl_a')
     run_a = _write_run(tmp_path / 'a', run_manifest_for(spec), _accounted(spec))

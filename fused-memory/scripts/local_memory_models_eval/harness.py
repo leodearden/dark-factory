@@ -43,7 +43,7 @@ from fused_memory.arm_harness.checks import (
     control_variance_check,
     smoke_endpoint,
 )
-from fused_memory.arm_harness.comparison import ParityPreconditionError, client_class_parity
+from fused_memory.arm_harness.comparison import RunComparabilityError, client_class_parity
 from fused_memory.arm_harness.conformance import ConformanceLedger
 from fused_memory.arm_harness.corpus import (
     CorpusIntegrityError,
@@ -392,10 +392,6 @@ def _cmd_parity_check(args: argparse.Namespace, deps: DepsFactory) -> int:
 
 def _cmd_control_check(args: argparse.Namespace, deps: DepsFactory) -> int:
     loaded = [_load_run(run_dir) for run_dir in args.run]
-    arm_ids = [run.spec.arm_id for run, _ in loaded]
-    repeated = sorted({arm_id for arm_id in arm_ids if arm_ids.count(arm_id) > 1})
-    if repeated:
-        raise _Refusal(EXIT_REFUSED, f'control runs repeat arm ids {repeated}; one run per arm')
     reference = None if args.reference_outcomes is None else load_outcomes(args.reference_outcomes)
     results = control_variance_check(
         [run for run, _ in loaded],
@@ -515,7 +511,7 @@ def main(argv: list[str] | None = None, *, deps: DepsFactory = build_live_deps) 
         return _report(refusal.exit_code, str(refusal))
     except ScratchGuardError as error:
         return _report(EXIT_SCRATCH_GUARD, _named(error))
-    except (PreRunCheckError, ParityPreconditionError) as error:
+    except (PreRunCheckError, RunComparabilityError) as error:
         return _report(EXIT_REFUSED, _named(error))
     except (CorpusIntegrityError, build_corpus.CorpusBuildError) as error:
         return _report(EXIT_CORPUS_INTEGRITY, _named(error))

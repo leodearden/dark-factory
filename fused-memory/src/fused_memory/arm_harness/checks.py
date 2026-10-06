@@ -19,7 +19,11 @@ from redis.exceptions import ResponseError
 from fused_memory.arm_harness.arm_backend import audited_arm_client
 from fused_memory.arm_harness.arm_config import llm_arm_config
 from fused_memory.arm_harness.arm_spec import LlmArmSpec
-from fused_memory.arm_harness.comparison import check_arm_config_symmetry, check_single_code_sha
+from fused_memory.arm_harness.comparison import (
+    check_arm_config_symmetry,
+    check_single_code_sha,
+    require_comparable_runs,
+)
 from fused_memory.arm_harness.conformance import (
     ConformanceCounts,
     ResponseValidator,
@@ -199,7 +203,12 @@ def control_variance_check(
     *,
     reference: Sequence[EpisodeOutcome] | None = None,
 ) -> tuple[CheckResult, ...]:
-    """Symmetry and one code sha across the control runs, token accounting per arm, and the reference."""
+    """Symmetry and one code sha across the control runs, token accounting per arm, and the reference.
+
+    ``records_by_arm`` is keyed by arm id, so the runs must be comparable, one per arm,
+    before any record is looked up (``RunComparabilityError`` otherwise).
+    """
+    require_comparable_runs(runs)
     per_arm = tuple(
         check_token_cost_accounting(_llm_spec(run), records_by_arm.get(run.spec.arm_id, ()))
         for run in runs

@@ -23,6 +23,7 @@ from fused_memory.arm_harness.checks import (
     control_variance_check,
     smoke_endpoint,
 )
+from fused_memory.arm_harness.comparison import RunComparabilityError
 from fused_memory.arm_harness.instrument_checks import InstrumentCheckId
 from fused_memory.arm_harness.metrics_record import (
     IndexConfiguration,
@@ -361,3 +362,30 @@ def test_an_arm_without_records_fails_its_token_accounting():
     token_checks = [r for r in results if r.check_id is InstrumentCheckId.TOKEN_COST_ACCOUNTING]
     assert [check.passed for check in token_checks] == [True, False]
     assert 'ctrl-b' in token_checks[1].detail
+
+
+def test_two_runs_of_one_arm_are_refused_before_their_records_collapse():
+    spec = _control('ctrl-a', 'evalmem_ctrl_a')
+    runs = [run_manifest_for(spec), run_manifest_for(spec)]
+
+    with pytest.raises(RunComparabilityError, match='repeat arm ids'):
+        control_variance_check(runs, {'ctrl-a': _accounted(spec)})
+
+
+@pytest.mark.parametrize(
+    ('overrides', 'message'),
+    [
+        ({'episode_ids': ('e1', 'e2')}, "lacks ['e3']"),
+        ({'incomplete': True}, 'incomplete'),
+    ],
+    ids=['a-limited-run', 'an-incomplete-run'],
+)
+def test_control_runs_that_are_not_comparable_are_refused(overrides, message):
+    spec_a, spec_b = _control('ctrl-a', 'evalmem_ctrl_a'), _control('ctrl-b', 'evalmem_ctrl_b')
+    runs = [run_manifest_for(spec_a), run_manifest_for(spec_b, **overrides)]
+    records = {'ctrl-a': _accounted(spec_a), 'ctrl-b': _accounted(spec_b)}
+
+    with pytest.raises(RunComparabilityError) as raised:
+        control_variance_check(runs, records)
+
+    assert message in str(raised.value)

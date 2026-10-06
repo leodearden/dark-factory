@@ -13,10 +13,11 @@ from arm_harness._fakes import (
     run_manifest_for,
 )
 from fused_memory.arm_harness.comparison import (
-    ParityPreconditionError,
+    RunComparabilityError,
     check_arm_config_symmetry,
     check_single_code_sha,
     client_class_parity,
+    require_comparable_runs,
 )
 from fused_memory.arm_harness.instrument_checks import InstrumentCheckId
 from fused_memory.arm_harness.metrics_record import DeltaOf, LlmMetricId, MetricsRecord, record_for
@@ -103,6 +104,57 @@ def test_symmetry_names_the_values_it_compared():
 def test_symmetry_needs_at_least_two_runs():
     with pytest.raises(ValueError, match='two'):
         check_arm_config_symmetry((run_manifest_for(llm_spec()),))
+
+
+# --- comparability: the precondition every cross-arm comparison shares -----------------
+
+_ABORT_B = ArmAbort(arm_id='qwen3-8b-b', item_ids=('e1',), error_classes=('X',))
+_INCOMPARABLE_SECOND_RUN = {
+    'one arm twice': (lambda: run_manifest_for(llm_spec()), 'repeat arm ids'),
+    'a limited run': (
+        lambda: run_manifest_for(llm_spec(**_ARM_B), episode_ids=('e1', 'e2')),
+        r"lacks \['e3'\]",
+    ),
+    'an extra episode': (
+        lambda: run_manifest_for(llm_spec(**_ARM_B), episode_ids=('e1', 'e2', 'e3', 'e9')),
+        r"adds \['e9'\]",
+    ),
+    'an aborted run': (
+        lambda: run_manifest_for(llm_spec(**_ARM_B), incomplete=True, abort=_ABORT_B),
+        'incomplete',
+    ),
+    'an incomplete run': (
+        lambda: run_manifest_for(llm_spec(**_ARM_B), incomplete=True),
+        'incomplete',
+    ),
+}
+
+
+@pytest.mark.parametrize('case', sorted(_INCOMPARABLE_SECOND_RUN))
+@pytest.mark.parametrize('check', [check_arm_config_symmetry, check_single_code_sha])
+def test_incomparable_runs_are_refused_not_passed(check, case):
+    second_run, message = _INCOMPARABLE_SECOND_RUN[case]
+
+    with pytest.raises(RunComparabilityError, match=message):
+        check((run_manifest_for(llm_spec()), second_run()))
+
+
+def test_an_episode_set_difference_names_each_differing_arm():
+    runs = (
+        run_manifest_for(llm_spec()),
+        run_manifest_for(llm_spec(**_ARM_B)),
+        run_manifest_for(
+            llm_spec(arm_id='qwen3-8b-c', scratch_group_id='evalmem_c'), episode_ids=('e1',)
+        ),
+    )
+
+    with pytest.raises(RunComparabilityError) as raised:
+        require_comparable_runs(runs)
+
+    message = str(raised.value)
+    assert 'qwen3-8b-c' in message
+    assert 'qwen3-8b-b' not in message
+    assert "lacks ['e2', 'e3']" in message
 
 
 # --- single code sha -----------------------------------------------------------------
@@ -217,7 +269,7 @@ def test_parity_ignores_episode_order():
 def test_parity_refuses_an_incomplete_run():
     spec_a, spec_b = _parity_specs()
 
-    with pytest.raises(ParityPreconditionError, match='incumbent-openai.*incomplete'):
+    with pytest.raises(RunComparabilityError, match='incumbent-openai.*incomplete'):
         client_class_parity(
             run_manifest_for(spec_a, incomplete=True), run_manifest_for(spec_b), (), ()
         )
@@ -227,7 +279,7 @@ def test_parity_refuses_an_aborted_run():
     spec_a, spec_b = _parity_specs()
     abort = ArmAbort(arm_id='incumbent-generic', item_ids=('e1',), error_classes=('X',))
 
-    with pytest.raises(ParityPreconditionError, match='incumbent-generic'):
+    with pytest.raises(RunComparabilityError, match='incumbent-generic'):
         client_class_parity(
             run_manifest_for(spec_a),
             run_manifest_for(spec_b, incomplete=True, abort=abort),
@@ -239,7 +291,7 @@ def test_parity_refuses_an_aborted_run():
 def test_parity_refuses_different_episode_sets_naming_the_difference():
     spec_a, spec_b = _parity_specs()
 
-    with pytest.raises(ParityPreconditionError, match=r"e3.*e4|e4.*e3") as raised:
+    with pytest.raises(RunComparabilityError, match=r"e3.*e4|e4.*e3") as raised:
         client_class_parity(
             run_manifest_for(spec_a, episode_ids=('e1', 'e2', 'e3')),
             run_manifest_for(spec_b, episode_ids=('e1', 'e2', 'e4')),
@@ -254,7 +306,7 @@ def test_parity_refuses_different_episode_sets_naming_the_difference():
 def test_parity_refuses_records_of_another_arm():
     spec_a, spec_b = _parity_specs()
 
-    with pytest.raises(ParityPreconditionError, match='incumbent-generic'):
+    with pytest.raises(RunComparabilityError, match='incumbent-generic'):
         client_class_parity(
             run_manifest_for(spec_a),
             run_manifest_for(spec_b),
@@ -270,5 +322,5 @@ def test_parity_refuses_a_metric_reported_twice_by_one_arm():
         _record(spec_a, _scalar(LlmMetricId.TOKENS_PER_EPISODE, 61.0)),
     )
 
-    with pytest.raises(ParityPreconditionError, match='tokens-per-episode'):
+    with pytest.raises(RunComparabilityError, match='tokens-per-episode'):
         client_class_parity(run_manifest_for(spec_a), run_manifest_for(spec_b), twice, ())

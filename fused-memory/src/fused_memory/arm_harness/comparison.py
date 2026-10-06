@@ -1,11 +1,13 @@
 """Cross-arm instrument checks over run manifests, and the client-class parity delta.
 
-Arms are comparable only if they ran under symmetric settings at one code SHA.
-``client_class_parity`` is boundary row 3's harness logic. It records each shared
-metric's difference between two complete runs over one episode set as a delta
-MetricsRecord.
+Every cross-arm comparison first requires ``require_comparable_runs``: two or more
+complete runs, of distinct arms, over one episode set. Comparable arms are then
+checked for symmetric settings and one code SHA. ``client_class_parity`` is boundary
+row 3's harness logic. It records each shared metric's difference between two runs
+as a delta MetricsRecord.
 """
 
+from collections import Counter
 from collections.abc import Mapping, Sequence
 
 from shared.memory_eval_metrics import Metric
@@ -26,8 +28,53 @@ from fused_memory.arm_harness.metrics_record import (
 from fused_memory.arm_harness.run_manifest import RunManifest
 
 
-class ParityPreconditionError(ValueError):
-    """Two runs cannot be compared for client-class parity."""
+class RunComparabilityError(ValueError):
+    """Runs, or the records read with them, cannot be compared at all."""
+
+
+def require_comparable_runs(runs: Sequence[RunManifest]) -> None:
+    """Two or more complete runs, one per arm, over one episode set; else RunComparabilityError."""
+    if len(runs) < 2:
+        raise RunComparabilityError(
+            f'a cross-arm comparison needs at least two runs, got {len(runs)}'
+        )
+    _require_distinct_arms(runs)
+    for run in runs:
+        _require_complete(run)
+    _require_one_episode_set(runs)
+
+
+def _require_distinct_arms(runs: Sequence[RunManifest]) -> None:
+    counts = Counter(run.spec.arm_id for run in runs)
+    repeated = sorted(arm_id for arm_id, count in counts.items() if count > 1)
+    if repeated:
+        raise RunComparabilityError(
+            f'runs repeat arm ids {repeated}; a comparison takes one run per arm'
+        )
+
+
+def _require_complete(run: RunManifest) -> None:
+    if run.incomplete or run.abort is not None:
+        raise RunComparabilityError(
+            f'arm {run.spec.arm_id!r} is incomplete (abort: {run.abort}); only complete '
+            'runs are comparable'
+        )
+
+
+def _require_one_episode_set(runs: Sequence[RunManifest]) -> None:
+    first = runs[0]
+    expected = set(first.episode_ids)
+    differences = [
+        f'{run.spec.arm_id!r} lacks {sorted(expected - set(run.episode_ids))} '
+        f'and adds {sorted(set(run.episode_ids) - expected)}'
+        for run in runs[1:]
+        if set(run.episode_ids) != expected
+    ]
+    if differences:
+        raise RunComparabilityError(
+            f'runs must cover one episode set; against {first.spec.arm_id!r}: '
+            + '; '.join(differences)
+        )
 
 
 def _symmetric_values(run: RunManifest) -> dict[str, object]:
@@ -45,13 +92,8 @@ def _symmetric_values(run: RunManifest) -> dict[str, object]:
     }
 
 
-def _require_two_or_more(runs: Sequence[RunManifest]) -> None:
-    if len(runs) < 2:
-        raise ValueError(f'a cross-arm check needs at least two runs, got {len(runs)}')
-
-
 def check_arm_config_symmetry(runs: Sequence[RunManifest]) -> CheckResult:
-    _require_two_or_more(runs)
+    require_comparable_runs(runs)
     check_id = InstrumentCheckId.ARM_CONFIG_SYMMETRY
     values = [(run.spec.arm_id, _symmetric_values(run)) for run in runs]
     first = values[0][1]
@@ -69,7 +111,7 @@ def check_arm_config_symmetry(runs: Sequence[RunManifest]) -> CheckResult:
 
 
 def check_single_code_sha(runs: Sequence[RunManifest]) -> CheckResult:
-    _require_two_or_more(runs)
+    require_comparable_runs(runs)
     check_id = InstrumentCheckId.SINGLE_CODE_SHA
     shas = sorted({run.spec.code_sha for run in runs})
     if len(shas) > 1:
@@ -88,9 +130,7 @@ def client_class_parity(
     records_b: Sequence[MetricsRecord],
 ) -> tuple[MetricsRecord, ...]:
     """One scalar delta (a − b) per metric both arms report, carrying a's identity."""
-    for run in (run_a, run_b):
-        _require_complete(run)
-    _require_same_episodes(run_a, run_b)
+    require_comparable_runs((run_a, run_b))
     keyed_a = _keyed(run_a, records_a)
     keyed_b = _keyed(run_b, records_b)
     delta_of = DeltaOf(minuend_arm_id=run_a.spec.arm_id, subtrahend_arm_id=run_b.spec.arm_id)
@@ -100,24 +140,6 @@ def client_class_parity(
     )
 
 
-def _require_complete(run: RunManifest) -> None:
-    if run.incomplete or run.abort is not None:
-        raise ParityPreconditionError(
-            f'arm {run.spec.arm_id!r} is incomplete (abort: {run.abort}); parity compares '
-            'complete runs only'
-        )
-
-
-def _require_same_episodes(run_a: RunManifest, run_b: RunManifest) -> None:
-    only_a = sorted(set(run_a.episode_ids) - set(run_b.episode_ids))
-    only_b = sorted(set(run_b.episode_ids) - set(run_a.episode_ids))
-    if only_a or only_b:
-        raise ParityPreconditionError(
-            f'parity needs one episode set: only in {run_a.spec.arm_id!r}: {only_a}; '
-            f'only in {run_b.spec.arm_id!r}: {only_b}'
-        )
-
-
 def _keyed(
     run: RunManifest, records: Sequence[MetricsRecord]
 ) -> Mapping[_RecordKey, MetricsRecord]:
@@ -125,11 +147,11 @@ def _keyed(
     for record in records:
         key = (record.metric.metric_id, record.index_configuration)
         if record.arm_id != run.spec.arm_id:
-            raise ParityPreconditionError(
+            raise RunComparabilityError(
                 f'record {key} belongs to arm {record.arm_id!r}, not to run {run.spec.arm_id!r}'
             )
         if key in keyed:
-            raise ParityPreconditionError(f'arm {run.spec.arm_id!r} reports {key} twice')
+            raise RunComparabilityError(f'arm {run.spec.arm_id!r} reports {key} twice')
         keyed[key] = record
     return keyed
 
