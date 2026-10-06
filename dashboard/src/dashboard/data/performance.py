@@ -77,6 +77,11 @@ def _cutoff(days: int, *, now: datetime | None = None) -> str:
     return (resolve_now(now) - timedelta(days=days)).isoformat()
 
 
+# A cancel ends an attempt from outside (shutdown drain, operator cancel, takeover); the resumed attempt
+# records its own row, so no reading counts one. Values of orchestrator/src/orchestrator/workflow_types.py::WorkflowOutcome.
+_NOT_A_CANCEL = "outcome NOT IN ('cancelled', 'soft-cancelled')"
+
+
 async def _latest_completions(db: aiosqlite.Connection) -> dict[str, str]:
     """Return ``{project_id: MAX(completed_at)}`` for every project with a
     recorded completion — the projects a card family tallies by default."""
@@ -128,7 +133,8 @@ async def get_completion_paths(
 
     Returns {project_id: [{path: str, count: int, pct: float}, ...]} for each
     of *projects* (default: every project with a recorded completion).
-    Paths: one-pass, multi-pass, via-steward, via-interactive, blocked.
+    Paths: one-pass, multi-pass, via-steward, via-interactive, blocked; a
+    cancel outcome is no path and is not counted (see ``_NOT_A_CANCEL``).
     """
     escalations = _load_escalations(escalations_dir)
 
@@ -147,7 +153,8 @@ async def get_completion_paths(
             'SELECT project_id, task_id, outcome, review_cycles, '
             '       steward_invocations '
             '  FROM task_results '
-            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? ',
+            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? '
+            f'  AND {_NOT_A_CANCEL} ',
             since,
             projects,
         )
