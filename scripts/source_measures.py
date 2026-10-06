@@ -683,20 +683,6 @@ def private_reads_in_tree(tree: ast.Module) -> int:
     return count
 
 
-def src_module_name(path: str) -> str | None:
-    """The dotted import name of a ``<package>/src/<dotted path>.py`` file.
-
-    None for any other path -- a glob, a test file, a script -- which has no
-    import name this repo's packages would resolve.
-    """
-    if not path.endswith('.py'):
-        return None
-    parts = path[: -len('.py')].split('/')
-    if 'src' not in parts:
-        return None
-    return '.'.join(parts[parts.index('src') + 1:])
-
-
 # ---------------------------------------------------------------------------
 # The tracked-file listing.
 
@@ -792,10 +778,20 @@ class MemberRoots:
 
         A package's ``__init__.py`` is named by its package.
         """
-        if self.src_root is None or self.kind_of(path) is not FileKind.SRC:
+        if (
+            self.src_root is None
+            or not path.endswith('.py')
+            or self.kind_of(path) is not FileKind.SRC
+        ):
             return None
         dotted = path[len(self.src_root) + 1:].removesuffix('.py').replace('/', '.')
         return dotted.removesuffix('.__init__')
+
+
+def src_module_name(path: str) -> str | None:
+    """The import name of *path* as a source file of the member its first
+    segment names, by ``MemberRoots.import_name``; None outside a ``<member>/src/``."""
+    return MemberRoots.declared(path.partition('/')[0]).import_name(path)
 
 
 @dataclasses.dataclass(frozen=True)

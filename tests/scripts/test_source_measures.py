@@ -881,6 +881,37 @@ class TestWorkspaceDomain:
         assert script_kinds.count(source_measures.FileKind.TESTS) >= 50
 
 
+class TestSrcModuleName:
+    """A ``<member>/src/`` path's import name, by the rule the domain names files by."""
+
+    @pytest.mark.parametrize(
+        ('path', 'name'),
+        [
+            ('pkg/src/pkg/mod.py', 'pkg.mod'),
+            ('pkg/src/pkg/sub/leaf.py', 'pkg.sub.leaf'),
+            ('pkg/src/pkg/__init__.py', 'pkg'),
+            ('pkg/src/pkg/sub/__init__.py', 'pkg.sub'),
+            ('pkg/tests/test_mod.py', None),
+            ('pkg/src/pkg/data.json', None),
+            ('pkg/vendored/src/lib.py', None),
+            ('scripts/tool.py', None),
+            ('tool.py', None),
+        ],
+    )
+    def test_the_name_a_path_imports_as(self, path: str, name: str | None) -> None:
+        assert source_measures.src_module_name(path) == name
+
+    def test_it_agrees_with_the_domain_on_every_declared_members_file(
+        self, tmp_path: Path
+    ) -> None:
+        members = source_measures.workspace_domain(_domain_repo(tmp_path / 'repo'))
+        declared = [f for member in members if not member.pseudo for f in member.files]
+        assert len(declared) >= 5
+        assert [source_measures.src_module_name(f.path) for f in declared] == [
+            f.import_name for f in declared
+        ]
+
+
 def _workspace(*members: str) -> str:
     return '[tool.uv.workspace]\nmembers = [{}]\n'.format(
         ', '.join(f'"{member}"' for member in members)
