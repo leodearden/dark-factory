@@ -9990,24 +9990,8 @@ def create_mcp_server(
     #   (1) delegation wiring — task_interceptor.set_task_status.assert_called_once()
     #   (2) cross-store separation — override row survives the status transition.
     #
-    # These tools intentionally emit NO memory write of any kind.  Until task
-    # 3853 (the esc-3834-1 ruling) the three write tools each awaited an
-    # ``_emit_override_audit`` helper that called
-    # ``add_memory(category='decisions_and_rationale')`` — a GRAPHITI_PRIMARY
-    # category, so every call was LLM-extracted into durable graph edges.  That
-    # helper and its three call sites were deleted outright: pin order, pinned
-    # status, boost tier, reserve_now and TTL all churn and are cleared without
-    # any corresponding write, so the edges went stale within the hour, and
-    # extraction produced unattributable facts naming no task at all.
-    #
-    # No audit value was lost.  The structural per-change trail already lives in
-    # ``data/orchestrator/runs.db`` (``priority_override_set``,
-    # ``priority_override_cleared``, ``task_pinned``, ``task_unpinned``,
-    # ``pin_queue_reordered``) and is surfaced by the ``get_scheduler_events``
-    # MCP tool; live override state is read via ``get_pin_queue`` below.  Do NOT
-    # reinstate a memory write here — including under a Mem0-primary category,
-    # which the ruling rejects for the same reason.  Locked by
-    # tests/test_scheduler_overrides_tools.py::_assert_no_graphiti_write.
+    # These tools emit no memory write of any kind (task 3853, esc-3834-1 ruling);
+    # rationale and lock: tests/test_scheduler_overrides_tools.py::test_override_write_tools_emit_no_memory_write.
     # ------------------------------------------------------------------
 
     @mcp.tool()

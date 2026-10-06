@@ -27,12 +27,9 @@ edges.  The extraction was non-deterministic in three separate ways:
 
 The result was an edge population the periodic sweep structurally cannot drain.
 This script drains it once.  Preventing recurrence was the code-side half of the
-gate ruling and was never this script's job; that half landed as task 3853 —
-``_emit_override_audit`` and its three call sites were deleted, so the MCP
-override tools no longer mint this edge class at all.  What remains for this
-script is therefore purely historical: a one-shot drain for graphs that still
-carry legacy edges written before task 3853.  (The dark_factory and reify graphs
-were both already drained and re-scan to 0 targets.)
+gate ruling and landed as task 3853, which deleted the audit write, so this
+script only drains legacy edges written before it.  (The dark_factory and reify
+graphs were both already drained and re-scan to 0 targets.)
 
 Selection (recomputed live on every run — no hard-coded uuids)
 --------------------------------------------------------------
@@ -86,7 +83,7 @@ from fused_memory.utils.store_mutation_preflight import (
 
 logger = logging.getLogger('cleanup_pin_queue_edges')
 
-# Audit-episode prefixes emitted by server/tools.py::_emit_override_audit.
+# Audit-episode prefixes the pre-task-3853 override audit wrote (helper since deleted).
 _AUDIT_PREFIXES = (
     'Set priority override',
     'Reordered pin queue',

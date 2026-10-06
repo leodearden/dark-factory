@@ -529,10 +529,9 @@ write, so a persisted edge goes stale within the hour while still reading as cur
 Extraction also produces facts that name no task at all (e.g. "Pin order is set to \
 10."), which no sweep can attribute to a task or drain.
 
-**Note who the remaining writer is**: the MCP override tools themselves were changed \
-(task 3853, the esc-3834-1 ruling) to emit no such write, and their audit helper was \
-deleted. An edge of this class appearing now can only originate from a \
-reconciliation-stage write — that is, from you, the reader of this prompt.
+**Do not be the writer**: since task 3853 (the esc-3834-1 ruling) this edge class no \
+longer originates from the MCP override tools, which emit no memory write at all. Do \
+not re-mint it from a pin-queue observation.
 
 ### Stale task-count snapshot edges — do NOT emit correction findings
 
