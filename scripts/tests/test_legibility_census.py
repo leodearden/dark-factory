@@ -29,6 +29,7 @@ import coder
 import digest as digest_mod
 import filing_policy
 import pytest
+import yaml
 from legibility import (
     account_pool,
     census_trigger,
@@ -1284,6 +1285,7 @@ def test_render_report_carries_each_piece_in_its_own_section():
     # spell `"--force" not in report`.
     assert [section.key for section in sections] == [
         mod.SECTION_HEADER,
+        mod.SECTION_METHOD,
         mod.SECTION_SATURATION,
         mod.SECTION_MATRIX,
         mod.SECTION_SYNTHESIS,
@@ -1317,23 +1319,81 @@ def test_render_report_carries_each_piece_in_its_own_section():
 
 
 def test_render_report_is_deterministic_no_clock():
-    kwargs: dict[str, Any] = dict(
-        date="2026-07-14",
-        project_id="dark_factory",
-        force=False,
-        matrix_md="matrix",
-        mining_result=_sample_mining_result(),
-        synthesis_md="prose",
-        filed_ticket_ids=["tkt_1"],
-        cost_note="cost",
-    )
-    assert mod.render_report(**kwargs) == mod.render_report(**kwargs)
+    assert mod.render_report(_census_record()) == mod.render_report(_census_record())
+
+
+_SAMPLE_METHOD: dict[str, Any] = {
+    "run_id": "census-dark_factory-20260714",
+    "as_of_sha": "a" * 40,
+    "since": "none",
+    "evidence": {
+        "window": ["2026-06-14T00:00:00+00:00", "2026-07-14T00:00:00+00:00"],
+        "sessions_enumerated": 25,
+        "skipped_coded": 3,
+        "skipped_zero_signal": 2,
+        "mined": 20,
+        "ledger_rows": 3,
+    },
+    "verification": {"confirmed": 0, "weakened": 0, "refuted": 0, "unverified": 0},
+    "cost": {
+        "miner_calls": 20,
+        "verify_calls": 0,
+        "synthesis_calls": 1,
+        "probe_calls": 1,
+        "embedding_calls": 0,
+        "wall_clock_secs": 12.5,
+    },
+    "inputs_consumed": [],
+    "extra": {
+        "inputs_consumed_note": "no other instrument's report is read yet",
+        "ledger_created_this_run": False,
+        "ledger_state": "ok",
+        "ledger_error": None,
+    },
+}
+"""A fixed ``## Method`` block, as ``build_method`` shapes it, so the report
+fixtures do not depend on a clock or a ledger."""
 
 
 _GOLDEN_FLAGLESS_REPORT = """\
 # confusion census 2026-07-14
 
 Project: dark_factory
+
+## Method
+
+```yaml
+run_id: census-dark_factory-20260714
+as_of_sha: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+since: none
+evidence:
+  window:
+  - '2026-06-14T00:00:00+00:00'
+  - '2026-07-14T00:00:00+00:00'
+  sessions_enumerated: 25
+  skipped_coded: 3
+  skipped_zero_signal: 2
+  mined: 20
+  ledger_rows: 3
+verification:
+  confirmed: 0
+  weakened: 0
+  refuted: 0
+  unverified: 0
+cost:
+  miner_calls: 20
+  verify_calls: 0
+  synthesis_calls: 1
+  probe_calls: 1
+  embedding_calls: 0
+  wall_clock_secs: 12.5
+inputs_consumed: []
+extra:
+  inputs_consumed_note: no other instrument's report is read yet
+  ledger_created_this_run: false
+  ledger_state: ok
+  ledger_error: null
+```
 
 ## Saturation
 
@@ -1488,6 +1548,7 @@ def _render_kwargs(**overrides) -> dict[str, Any]:
     dict whose inferred value union would otherwise be re-reported once per
     union member per render_report parameter."""
     kwargs: dict[str, Any] = dict(
+        method=_SAMPLE_METHOD,
         date="2026-07-14",
         project_id="dark_factory",
         force=False,
@@ -1501,12 +1562,16 @@ def _render_kwargs(**overrides) -> dict[str, Any]:
     return kwargs
 
 
+def _census_record(**overrides):
+    return mod.build_census_record(**_render_kwargs(**overrides))
+
+
 def _render(**overrides):
-    return mod.render_report(**_render_kwargs(**overrides))
+    return mod.render_report(_census_record(**overrides))
 
 
 def _sections(**overrides):
-    return mod.census_report_sections(**_render_kwargs(**overrides))
+    return mod.census_report_sections(_census_record(**overrides))
 
 
 def test_render_report_capped_run_names_cap_and_partial_coverage():
@@ -1525,7 +1590,7 @@ def test_render_report_capped_run_names_cap_and_partial_coverage():
     assert "operator batch cap = 2 batch(es)" in coverage_line
     # The partial-coverage disclosure is its own line, and a capped run is the
     # only run that carries it (see ..._no_cap_renders_no_coverage_line).
-    assert len(_saturation_lines(sections, "- NOT PICKED UP LATER:")) == 1
+    assert len(_saturation_lines(sections, "- RESUMED NEXT RUN:")) == 1
 
 
 def test_render_report_capped_coverage_states_coded_digests_not_drawn_digests():
@@ -1554,8 +1619,8 @@ def test_render_report_capped_coverage_states_coded_digests_not_drawn_digests():
 def test_render_report_capped_coverage_names_the_uncoded_digests_when_coding_fell_short():
     # The storm's shortfall must be LOUD on the coverage line itself, not
     # merely inferable by subtracting the per-batch bullets rendered below
-    # it -- an operator deciding whether to roll last_census_at back reads
-    # THIS line, and it is the one line whose job is the coverage claim.
+    # it -- an operator judging what this run covered reads THIS line, and it
+    # is the one line whose job is the coverage claim.
     coverage_line = _coverage_line(_sections(mining_result=_storm_capped_mining_result()))
     # The shortfall COUNT attached to the claim it qualifies, not a bare "6":
     # the line legitimately carries 14 and 20, each of which a bare digit check
@@ -1584,35 +1649,29 @@ def test_render_report_capped_coverage_omits_the_shortfall_clause_when_every_dig
     )
 
 
-def test_render_report_capped_run_says_the_skipped_sessions_are_not_re_mined():
-    # PARTIAL coverage must not read as "the rest gets picked up next time".
-    # run_census always advances last_census_at and _census_window_dates
-    # anchors the NEXT window there, so the capped-away sessions fall outside
-    # every future window -- the same dead-recovery-path hazard the dry-run
-    # WARNING is written to avoid.
+def test_render_report_capped_run_says_the_skipped_sessions_resume_next_run():
+    # The capped-away sessions were never ledgered as coded, so the next
+    # census mines them while they remain inside its retention window. The
+    # old disclosure told the operator to roll last_census_at back; with the
+    # ledger that advice is wrong, and it must not survive.
     sections = _sections(
         mining_result=_capped_mining_result(stop_reason="capped", max_batches=2),
     )
 
-    disclosure = _saturation_lines(sections, "- NOT PICKED UP LATER:")
+    disclosure = _saturation_lines(sections, "- RESUMED NEXT RUN:")
     assert len(disclosure) == 1, "the disclosure is one line of its own"
-    # The two IDENTIFIERS an operator needs to act: the field that re-anchors
-    # the window, and the file holding it. Asserted because they are machine
-    # names a reader can look up, not because of the prose around them.
-    assert "last_census_at" in disclosure[0], "the re-anchoring mechanism must be named"
-    assert "docs/legibility/census-state.json" in disclosure[0], (
-        "the one real recovery lever is named, so a plain re-run is not read as it"
-    )
+    assert "last_census_at" not in disclosure[0], "no rollback advice"
+    assert _saturation_lines(sections, "- NOT PICKED UP LATER:") == []
 
 
-def test_render_report_cap_not_reached_makes_no_re_anchor_claim():
-    # The re-anchor disclosure belongs to the CAPPED branch only: a cap that
-    # was set but never reached mined exactly what an uncapped run would.
+def test_render_report_cap_not_reached_makes_no_resume_claim():
+    # The resume disclosure belongs to the CAPPED branch only: a cap that was
+    # set but never reached mined exactly what an uncapped run would.
     sections = _sections(
         mining_result=_capped_mining_result(stop_reason="saturated", max_batches=99),
     )
 
-    assert _saturation_lines(sections, "- NOT PICKED UP LATER:") == []
+    assert _saturation_lines(sections, "- RESUMED NEXT RUN:") == []
     assert _saturation_lines(sections, "- coverage:") == []
 
 
@@ -1629,7 +1688,7 @@ def test_render_report_cap_set_but_not_reached_is_reported_distinctly():
     assert "not reached -- mining stopped by: saturated" in not_reached[0]
     # No partial-coverage claim: the run stopped on its own terms.
     assert _saturation_lines(sections, "- coverage:") == []
-    assert _saturation_lines(sections, "- NOT PICKED UP LATER:") == []
+    assert _saturation_lines(sections, "- RESUMED NEXT RUN:") == []
 
 
 def test_render_report_no_cap_renders_no_coverage_line():
@@ -1642,7 +1701,7 @@ def test_render_report_no_cap_renders_no_coverage_line():
     # plus the per-batch bullets, so no cap text can appear anywhere in it.
     assert _saturation_lines(sections, "- coverage:") == []
     assert _saturation_lines(sections, "- operator batch cap:") == []
-    assert _saturation_lines(sections, "- NOT PICKED UP LATER:") == []
+    assert _saturation_lines(sections, "- RESUMED NEXT RUN:") == []
     assert _section(sections, mod.SECTION_SATURATION).lines == (
         "",
         "## Saturation",
@@ -1685,6 +1744,11 @@ def test_render_report_verify_cap_states_verified_of_novel_and_deferred():
     assert "662 deferred" in bullets[0], (
         "the deferred remainder must be STATED, not left to the reader's arithmetic"
     )
+    # The caveat follows the ledger: the deferred clusters' sessions were
+    # coded, so they are ledgered and not re-mined; last_census_at no longer
+    # anchors anything.
+    assert "last_census_at" not in bullets[1]
+    assert "ledger" in bullets[1]
     # Placement is asserted structurally by
     # test_census_report_sections_verification_is_gated_and_positioned.
 
@@ -1843,7 +1907,7 @@ _REPORT_FLAG_CASES: dict[str, dict[str, Any]] = {
 
 
 def test_census_report_sections_returns_keyed_sections_of_lines():
-    sections = mod.census_report_sections(**_render_kwargs())
+    sections = _sections()
 
     assert isinstance(sections, tuple)
     assert sections, "a report always carries at least a header"
@@ -1863,16 +1927,171 @@ def test_render_report_is_the_pure_join_of_its_sections(case):
 
     Asserted across every gated flag combination -- a branch that rendered
     outside the structure would pass on the flagless case alone."""
-    kwargs = _render_kwargs(**_REPORT_FLAG_CASES[case])
+    record = _census_record(**_REPORT_FLAG_CASES[case])
 
-    assert mod.render_report(**kwargs) == mod.join_report_sections(
-        mod.census_report_sections(**kwargs)
+    assert mod.render_report(record) == mod.join_report_sections(
+        mod.census_report_sections(record)
     )
+
+
+@pytest.mark.parametrize("case", sorted(_REPORT_FLAG_CASES))
+def test_render_report_renders_from_the_json_record_alone(case):
+    """The record is the source (contract §5): it survives a JSON round trip
+    and renders the same report from the parsed copy."""
+    record = _census_record(**_REPORT_FLAG_CASES[case])
+
+    parsed = json.loads(json.dumps(record))
+
+    assert mod.render_report(parsed) == mod.render_report(record)
+
+
+def test_build_census_record_carries_identity_and_method():
+    record = _census_record()
+
+    assert record["record_version"] == 1
+    assert record["run_id"] == _SAMPLE_METHOD["run_id"]
+    assert record["method"] == _SAMPLE_METHOD
+
+
+_METHOD_WINDOW = census_window.MiningWindow(
+    start=datetime(2026, 6, 14, tzinfo=UTC), end=datetime(2026, 7, 14, tzinfo=UTC),
+)
+
+
+def _selection(tmp_path, state, *, rows=None, error=None):
+    snapshot = session_ledger.LedgerSnapshot(
+        path=tmp_path / "coded-sessions.sqlite",
+        state=state,
+        rows_by_coded_by=rows or {},
+        error=error,
+    )
+    return census_window.SessionSelection(
+        window=_METHOD_WINDOW,
+        ledger=snapshot,
+        sessions_enumerated=25,
+        skipped_coded=3,
+        skipped_zero_signal=2,
+    )
+
+
+def _method(**overrides):
+    kwargs: dict[str, Any] = dict(
+        run_id="census-dark_factory-20260714",
+        as_of_sha="a" * 40,
+        since=None,
+        selection=None,
+        mined=20,
+        confirmed=2,
+        refuted=1,
+        unverified=4,
+        miner_calls=20,
+        verify_calls=3,
+        synthesis_calls=1,
+        probe_calls=2,
+        wall_clock_secs=12.5,
+    )
+    kwargs.update(overrides)
+    return mod.build_method(**kwargs)
+
+
+def test_build_method_carries_the_seven_contract_keys_then_extra():
+    assert mod.METHOD_KEYS == (
+        "run_id", "as_of_sha", "since", "evidence", "verification", "cost",
+        "inputs_consumed",
+    )
+
+    method = _method()
+
+    assert list(method) == [*mod.METHOD_KEYS, "extra"]
+    assert method["run_id"] == "census-dark_factory-20260714"
+    assert method["as_of_sha"] == "a" * 40
+    assert json.loads(json.dumps(method)) == method
+
+
+def test_build_method_since_is_none_text_without_a_prior_census():
+    assert _method(since=None)["since"] == "none"
+    assert _method(since="b" * 40)["since"] == "b" * 40
+
+
+def test_build_method_verification_cost_and_inputs_consumed():
+    method = _method()
+
+    assert method["verification"] == {
+        "confirmed": 2, "weakened": 0, "refuted": 1, "unverified": 4,
+    }
+    assert method["cost"] == {
+        "miner_calls": 20,
+        "verify_calls": 3,
+        "synthesis_calls": 1,
+        "probe_calls": 2,
+        "embedding_calls": 0,
+        "wall_clock_secs": 12.5,
+    }
+    assert method["inputs_consumed"] == []
+    assert method["extra"]["inputs_consumed_note"]
+
+
+def test_build_method_evidence_comes_from_the_selection(tmp_path):
+    selection = _selection(
+        tmp_path, session_ledger.LedgerState.OK,
+        rows={session_ledger.CodedBy.TRICKLE: 3},
+    )
+
+    method = _method(selection=selection)
+
+    assert method["evidence"] == {
+        "window": _METHOD_WINDOW.to_record(),
+        "sessions_enumerated": 25,
+        "skipped_coded": 3,
+        "skipped_zero_signal": 2,
+        "mined": 20,
+        "ledger_rows": 3,
+    }
+    assert method["extra"]["ledger_created_this_run"] is False
+    assert method["extra"]["ledger_state"] == "ok"
+
+
+def test_build_method_names_a_ledger_created_this_run(tmp_path):
+    method = _method(selection=_selection(tmp_path, session_ledger.LedgerState.CREATED))
+
+    assert method["extra"]["ledger_created_this_run"] is True
+    assert method["evidence"]["ledger_rows"] == 0
+
+
+def test_build_method_unreadable_ledger_counts_null_never_zero(tmp_path):
+    path = tmp_path / "coded-sessions.sqlite"
+    selection = _selection(
+        tmp_path, session_ledger.LedgerState.UNREADABLE,
+        error=f"{path}: file is not a database",
+    )
+
+    method = _method(selection=selection)
+
+    assert method["evidence"]["ledger_rows"] is None
+    assert method["extra"]["ledger_state"] == "unreadable"
+    assert str(path) in method["extra"]["ledger_error"]
+    assert method["extra"]["ledger_created_this_run"] is False
+
+
+def test_build_method_without_a_selection_reports_null_evidence():
+    method = _method(selection=None)
+
+    assert method["evidence"] == {
+        "window": None,
+        "sessions_enumerated": None,
+        "skipped_coded": None,
+        "skipped_zero_signal": None,
+        "mined": 20,
+        "ledger_rows": None,
+    }
+    assert method["extra"]["ledger_created_this_run"] is None
+    assert method["extra"]["ledger_state"] is None
 
 
 def test_census_report_sections_flagless_key_set_and_order():
     assert _section_keys() == [
         mod.SECTION_HEADER,
+        mod.SECTION_METHOD,
         mod.SECTION_SATURATION,
         mod.SECTION_MATRIX,
         mod.SECTION_SYNTHESIS,
@@ -1888,6 +2107,17 @@ def test_census_report_sections_force_marker_is_gated_and_positioned():
 
     forced = _section_keys(force=True)
     assert forced.index(mod.SECTION_FORCE_MARKER) == forced.index(mod.SECTION_HEADER) + 1
+    assert forced.index(mod.SECTION_METHOD) == forced.index(mod.SECTION_FORCE_MARKER) + 1
+
+
+def test_census_report_method_section_is_a_yaml_fence_of_the_record_method():
+    record = _census_record()
+
+    lines = _section(mod.census_report_sections(record), mod.SECTION_METHOD).lines
+
+    assert lines[:4] == ("", "## Method", "", "```yaml")
+    assert lines[-1] == "```"
+    assert yaml.safe_load("\n".join(lines[4:-1])) == record["method"]
 
 
 def test_census_report_sections_verification_is_gated_and_positioned():
@@ -1947,7 +2177,7 @@ def test_section_text_names_the_key_and_the_keys_present_when_absent():
     """The helper's own failure mode is part of what this workstream buys: an
     absent section fails naming what was looked for AND what was there,
     instead of raising a bare IndexError from a string split."""
-    sections = mod.census_report_sections(**_render_kwargs())
+    sections = _sections()
 
     with pytest.raises(AssertionError) as excinfo:
         _section_text(sections, mod.SECTION_VERIFICATION)
@@ -1962,13 +2192,12 @@ def test_census_report_sections_joined_are_byte_identical_to_the_golden():
     views cannot drift: whatever
     test_render_report_flagless_output_is_byte_identical_golden pins for the
     prose, this pins for the partition."""
-    assert mod.join_report_sections(
-        mod.census_report_sections(**_render_kwargs())
-    ) == _GOLDEN_FLAGLESS_REPORT
+    assert mod.join_report_sections(_sections()) == _GOLDEN_FLAGLESS_REPORT
 
 
 def test_render_report_flagless_output_is_byte_identical_golden():
-    report = mod.render_report(
+    report = mod.render_report(mod.build_census_record(
+        method=_SAMPLE_METHOD,
         date="2026-07-14",
         project_id="dark_factory",
         force=False,
@@ -1977,7 +2206,7 @@ def test_render_report_flagless_output_is_byte_identical_golden():
         synthesis_md="prose",
         filed_ticket_ids=["tkt_1"],
         cost_note="cost",
-    )
+    ))
     assert report == _GOLDEN_FLAGLESS_REPORT
 
 
@@ -3723,13 +3952,11 @@ def test_run_census_max_batches_caps_mining_and_reports_it(tmp_path):
     assert "operator batch cap = 1" in lowered
     assert "partial" in lowered, "a capped run must never read as full coverage"
     assert "not mined" in lowered
-    # ...and PARTIAL must not read as "the remainder comes next run": this
-    # very run advanced census-state, so the next window starts here.
-    assert "last_census_at" in lowered
-    assert "never re-enumerated" in lowered
-    assert kwargs["census_state_path"].exists(), (
-        "the report's re-anchor claim is only honest because state really advanced"
-    )
+    # ...and the unmined remainder is resumed by the next run: it was never
+    # ledgered as coded.
+    assert "resumed next run" in lowered
+    assert "never re-enumerated" not in lowered
+    assert kwargs["census_state_path"].exists()
 
     # The rest of the pipeline still ran to completion on the mined batch.
     assert outcome.status == "done"
@@ -4321,7 +4548,7 @@ def test_run_census_all_three_cost_control_flags_interact_end_to_end(tmp_path, c
 
     # (b) the capped coverage line reports the CODED count for the one mined
     # batch (steps 2/4 above, now observed through the real pipeline rather
-    # than a hand-built MiningResult), and the PARTIAL / never-re-enumerated
+    # than a hand-built MiningResult), and the PARTIAL / resumed-next-run
     # disclosures still fire. _happy_batch's 3 digests all code successfully
     # (none configured to fail to parse), so coded == drawn == 3 here -- no
     # shortfall clause is expected from THIS combination; step-5's extension
@@ -4331,7 +4558,7 @@ def test_run_census_all_three_cost_control_flags_interact_end_to_end(tmp_path, c
     assert "operator batch cap = 1" in coverage_line
     assert "failed to code" not in coverage_line.lower()
     assert "partial" in lowered
-    assert "never re-enumerated" in lowered
+    assert "resumed next run" in lowered
 
     # (c) the verify cap bit only on the clusters capped mining actually
     # produced. A single _happy_batch always yields exactly two novel
@@ -4362,8 +4589,7 @@ def test_run_census_all_three_cost_control_flags_interact_end_to_end(tmp_path, c
     assert len(payloads) == 1
     assert "Silent no-op subagent contract" in payloads[0]["title"]
 
-    # (e) census-state still advanced under three caps at once, so the
-    # report's re-anchor claim ("NOT PICKED UP LATER") stays honest.
+    # (e) census-state still advanced under three caps at once.
     assert kwargs["census_state_path"].exists()
     assert outcome.status == "done"
 
@@ -6802,17 +7028,7 @@ def test_render_report_flagless_golden_is_untouched_by_the_new_parameter():
     """`mass_rejection=None` must leave the module's byte-identical-flagless
     invariant exactly as it was — that property is deliberate and documented,
     and must not be spent to buy an anomaly signal."""
-    report = mod.render_report(
-        date="2026-07-14",
-        project_id="dark_factory",
-        force=False,
-        matrix_md="matrix",
-        mining_result=_sample_mining_result(),
-        synthesis_md="prose",
-        filed_ticket_ids=["tkt_1"],
-        cost_note="cost",
-        mass_rejection=None,
-    )
+    report = mod.render_report(_census_record(mass_rejection=None))
     assert report == _GOLDEN_FLAGLESS_REPORT
 
 
