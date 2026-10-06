@@ -481,6 +481,10 @@ FM_LIVENESS_RESTART_CLOCK_PATH = os.environ.get(
 # instead: this unit executes the script FROM THE REPO CHECKOUT on an
 # already-armed timer, so the gate is live on merge with no install action.
 DASHBOARD_PARITY_SCRIPT = os.path.join(REPO_DIR, "scripts", "check_dashboard_unit_parity.py")
+# Every line the checker prints carries this tag (its LOG_TAG), so without it the
+# checker did not report, whatever its exit code says — the rule
+# scripts/setup-host.sh::_parity_verdict applies.
+DASHBOARD_PARITY_TAG = "[dashboard_unit_parity]"
 
 # The parity check's OWN clock, independent of every deploy and restart clock
 # above, so a redeploy never resets the parity cadence and a parity check
@@ -501,8 +505,10 @@ except (KeyError, ValueError):
 
 UNIT_PARITY_TIMEOUT_SECS = 30
 
-# The checker's documented exit codes, the same 0/1/2 setup-host.sh branches
-# on. Any other code is not a parity claim and reads as 'unknown'.
+# The checker's documented exit codes, believed only once DASHBOARD_PARITY_TAG
+# shows it reported: exit 2 is also python3's can't-open-file and argparse's
+# usage-error status, and an uncaught traceback exits 1. Any other code is
+# not a parity claim and reads as 'unknown'.
 UNIT_PARITY_VERDICTS = {0: "parity", 1: "drift", 2: "absent"}
 
 
@@ -1939,8 +1945,11 @@ def unit_parity_verdict() -> tuple[str, str]:
 
     *verdict* is one of 'parity' / 'drift' / 'absent' (the checker's own exit
     codes 0/1/2, see UNIT_PARITY_VERDICTS) or 'unknown' when the checker could
-    not run or exited with anything else. *report* is the checker's combined
-    stdout and stderr — how an operator learns WHICH directive drifted.
+    not run, ran but produced no DASHBOARD_PARITY_TAG report of its own, or
+    exited with anything else. The tag is checked FIRST, as
+    scripts/setup-host.sh::_parity_verdict does. *report* is the checker's
+    combined stdout and stderr — how an operator learns WHICH directive
+    drifted, or why the checker did not report.
 
     ``--installed-dir`` is deliberately not passed: the checker's own default
     is the one setup-host.sh gates against, and re-deriving it here would be a
@@ -1962,6 +1971,11 @@ def unit_parity_verdict() -> tuple[str, str]:
     report = "\n".join(
         part.strip() for part in (result.stdout, result.stderr) if part and part.strip()
     )
+    if DASHBOARD_PARITY_TAG not in report:
+        return "unknown", (
+            f"checker produced no {DASHBOARD_PARITY_TAG} report "
+            f"(exit {result.returncode}): {report or 'no output'}"
+        )
     verdict = UNIT_PARITY_VERDICTS.get(result.returncode)
     if verdict is None:
         return "unknown", f"checker exited {result.returncode}: {report}"

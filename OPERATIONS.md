@@ -1662,8 +1662,9 @@ throttle), gated by its own clock `ORCH_UNIT_PARITY_CLOCK` (default
 `data/orchestrator/last_unit_parity_check.json`). That clock is independent
 of every deploy clock, and it is stamped on each *attempt*, so a broken
 checker is retried hourly rather than on every tick. The pass logs a
-`WARNING` only on drift, one plain line when the checker could not run, and
-nothing on parity or when the dashboard units are not installed on the host:
+`WARNING` only on drift, one plain line when the checker could not run or
+did not report, and nothing on parity or when the dashboard units are not
+installed on the host:
 
 ```bash
 journalctl --user -t orchestrator-watchdog | grep 'unit parity'
@@ -1761,9 +1762,11 @@ one of:
 - **`drift`** — one or more compared directives disagree. The checker's own
   report follows the row, naming the directive.
 - **`absent`** — the dashboard units are not installed on this host. This is
-  benign, the same reading `setup-host.sh` gives the checker's exit 2.
-- **`unknown`** — the checker could not be run, and the reason follows the
-  row. This is a tooling problem, not a parity claim.
+  benign, the same reading `setup-host.sh` gives a *tagged* exit 2 from the
+  checker.
+- **`unknown`** — the checker could not be run, or ran but produced no report
+  of its own (a moved or renamed script, a rejected flag, a crash). The
+  reason follows the row. This is a tooling problem, not a parity claim.
 
 Run `--report` before manually restarting a unit, to check whether an
 upcoming fleet deploy is likely to be held up by an in-flight merge, to
