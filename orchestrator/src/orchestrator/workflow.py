@@ -13536,7 +13536,9 @@ Update the plan to address the blocking issues. You may add new steps to the `st
             },
         )
 
-        capped_reason = classify_cap_kill(result, budget_usd=budget, max_turns=max_turns_val)
+        capped_reason = classify_cap_kill(
+            result, budget_usd=budget, max_turns=max_turns_val, backend=backend_val,
+        )
         capped = capped_reason is not None
 
         if self.event_store:
@@ -13573,11 +13575,10 @@ Update the plan to address the blocking issues. You may add new steps to the `st
                     # false-positive rate computable from runs.db, since a
                     # True-only key leaves the denominator unknowable.
                     'ended_awaiting_background': result.ended_awaiting_background,
-                    # Same present-and-false rationale (task 4826): capped was
-                    # hardcoded False here, so capped=0 held across all 27,320
-                    # measured invocations rows and ceiling saturation was
-                    # uncomputable.  model_id is the exact CLI-served version,
-                    # beside the routing alias in `model`; None means unknown.
+                    # Same present-and-false rationale for the cap pair, so
+                    # ceiling saturation is computable.  model_id is the exact
+                    # CLI-served version beside the alias in `model`; None
+                    # means unknown.
                     'model_id': result.model_id,
                     'capped': capped,
                     'capped_reason': capped_reason,

@@ -71,6 +71,8 @@ def _make_workflow(
     # them (classify_cap_kill), which a MagicMock ceiling cannot support.
     cfg.budgets.implementer = _BUDGET_CEILING
     cfg.max_turns.implementer = _TURN_CEILING
+    # classify_cap_kill applies its numeric fallback only to the claude backend.
+    cfg.backends.implementer = 'claude'
     # These tests pass a plain tmp_path as cwd (not a real linked worktree) and
     # do not assert on sandbox wiring; disable the sandbox block so _invoke does
     # not call compute_write_set(cwd) on a non-worktree path (task 2905 α3).
@@ -206,10 +208,8 @@ class TestInvocationRecordsModelIdAndCeilingKills:
     ceiling (if any) ended the run — in BOTH the ``invocation_end`` event and
     the ``invocations`` row (task 4826).
 
-    ``capped`` was hardcoded False at this site, so ``capped=0`` held across
-    every one of 27,320 measured rows: the same shape of blindness the
-    task-3639 note on ``ended_awaiting_background`` describes.  Both new event
-    keys are therefore asserted PRESENT on a normal run, not only when true.
+    Like ``ended_awaiting_background``, both cap keys are asserted PRESENT on
+    a normal run, not only when true, so the saturation rate is computable.
 
     Routing is pinned to a real ``RoutingDecision`` (the
     ``test_workflow_routing_decision.py`` idiom): this module's config double
@@ -226,12 +226,15 @@ class TestInvocationRecordsModelIdAndCeilingKills:
         rule_id=None,
     )
 
-    async def _drive(self, tmp_path: Path, result: AgentResult) -> tuple[dict, dict]:
-        """Run ``_invoke`` once returning *result*; give back
+    async def _drive(
+        self, tmp_path: Path, result: AgentResult, *, backend: str = 'claude',
+    ) -> tuple[dict, dict]:
+        """Run ``_invoke`` once on *backend* returning *result*; give back
         ``(invocation_end data, save_invocation kwargs)``."""
         rec = _RecordingEventStore()
         cost_store = _recording_cost_store()
         wf = _make_workflow(event_store=rec, cost_store=cost_store)
+        wf.config.backends.implementer = backend
         mock_invoke = AsyncMock(return_value=result)
 
         with (
@@ -319,6 +322,24 @@ class TestInvocationRecordsModelIdAndCeilingKills:
         )
         assert data['capped_reason'] == 'budget'
         assert save_kw['capped_reason'] == 'budget'
+
+    async def test_non_claude_failed_run_past_the_budget_is_not_capped(
+        self, tmp_path: Path,
+    ) -> None:
+        """codex enforces no budget ceiling, so a failed run whose estimated
+        cost passed the routed budget was not ended by one."""
+        data, save_kw = await self._drive(
+            tmp_path,
+            AgentResult(
+                success=False, output='', subtype='',
+                turns=1, cost_usd=_BUDGET_CEILING + 2.0,
+            ),
+            backend='codex',
+        )
+        assert data['capped'] is False
+        assert data['capped_reason'] is None
+        assert save_kw['capped'] is False
+        assert save_kw['capped_reason'] is None
 
 
 @pytest.mark.asyncio

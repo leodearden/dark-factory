@@ -44,6 +44,7 @@ from shared.cli_invoke import (
     read_transcript_records,
     transcript_model_id_for_session,
 )
+from shared.cost_store import CapReason
 from shared.invocation_outcome import classify_invocation
 from shared.testing import make_gate_mock
 from shared.testing_stdin import (
@@ -4160,7 +4161,7 @@ class TestRunSubprocessWatchdog:
     async def test_working_regime_survives_grace_killed_at_ceiling(self, tmp_path):
         """B6 long-synchronous-tool survival: ≥1 turn seen → no fast kill at grace, only ceiling.
 
-        A proc that has made progress (count_transcript_turns=5) must NOT be killed
+        A proc that has made progress (5 assistant turns on disk) must NOT be killed
         at the startup_grace_secs bound.  Liveness is proven (seen_turn=True); the
         working regime applies and only the absolute ceiling triggers the kill.
         Wall-clock must be >= ~0.25s (past the 0.05s grace) and result.transcript_turns==5.
@@ -4169,7 +4170,7 @@ class TestRunSubprocessWatchdog:
 
         sid = str(uuid.uuid4())
         cfg_dir = tmp_path / 'cfg'
-        cfg_dir.mkdir()
+        _write_model_transcript(cfg_dir, sid, [{'type': 'assistant'}] * 5)
 
         proc, _ = self._make_hanging_proc()
         terminate_pg_mock = AsyncMock()
@@ -4180,7 +4181,6 @@ class TestRunSubprocessWatchdog:
         with (
             patch('shared.cli_invoke.asyncio.create_subprocess_exec', side_effect=fake_exec),
             patch('shared.cli_invoke.terminate_process_group', terminate_pg_mock),
-            patch('shared.cli_invoke.count_transcript_turns', return_value=5),
         ):
             t0 = _time.monotonic()
             result = await _run_subprocess(
@@ -5449,13 +5449,7 @@ class TestDetectTranscriptModelId:
         assert detect_transcript_model_id(records) == 'claude-sonnet-5'
 
     def test_skips_the_synthetic_sentinel(self):
-        """``<synthetic>`` is not a model — the nearest real id is returned.
-
-        Measured: a 2026-09-11 scan of 14 days of transcripts found 8
-        occurrences of ``"model":"<synthetic>"`` alongside the real ids.
-        Recording it would poison the very column this exists to make
-        trustworthy.
-        """
+        """``<synthetic>`` is not a model — the nearest real id is returned."""
         records = [
             {'type': 'assistant', 'message': {'model': 'claude-opus-5'}},
             {'type': 'assistant', 'message': {'model': '<synthetic>'}},
@@ -5856,12 +5850,31 @@ def _cap_result(**overrides: Any) -> AgentResult:
 
 
 class TestClassifyCapKill:
-    """``classify_cap_kill(result, *, budget_usd, max_turns)`` names which
-    configured ceiling ended a run — ``'budget'`` | ``'turns'`` — or None.
+    """``classify_cap_kill(result, *, budget_usd, max_turns, backend)`` names
+    which configured ceiling ended a run — ``'budget'`` | ``'turns'`` — or None.
 
     The CLI subtype is authoritative; the numeric comparison is only a
-    fallback for a FAILED run whose subtype is inconclusive.
+    fallback for a FAILED claude run whose subtype is inconclusive.
     """
+
+    @pytest.mark.parametrize(
+        'subtype,expected',
+        [('error_max_budget_usd', CapReason.BUDGET), ('error_max_turns', CapReason.TURNS)],
+    )
+    def test_returns_the_cap_reason_vocabulary(self, subtype, expected):
+        reason = classify_cap_kill(_cap_result(subtype=subtype), budget_usd=5.0, max_turns=50)
+        assert reason is expected
+
+    @pytest.mark.parametrize('backend', ['codex', 'gemini', 'pi'])
+    def test_non_claude_failed_run_past_both_ceilings_is_not_a_cap_kill(self, backend):
+        """codex/gemini/pi enforce neither ceiling, so no ceiling ended a run of
+        theirs however far its (estimated) cost or turn count went past one."""
+        result = _cap_result(subtype='', cost_usd=9.0, turns=80)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50, backend=backend) is None
+
+    def test_claude_is_the_default_backend(self):
+        result = _cap_result(subtype='', cost_usd=9.0, turns=3)
+        assert classify_cap_kill(result, budget_usd=5.0, max_turns=50) == CapReason.BUDGET
 
     def test_budget_subtype_is_budget(self):
         result = _cap_result(subtype='error_max_budget_usd', cost_usd=5.01)

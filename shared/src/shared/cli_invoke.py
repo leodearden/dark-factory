@@ -17,13 +17,14 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any, TypeGuard
+from typing import IO, TYPE_CHECKING, Any, TypeGuard, TypeVar
+
+from shared.cost_store import CapReason
+from shared.proc_group import snapshot_process_group, terminate_process_group
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
 # that never set ANTHROPIC_BASE_URL can still import shared.cli_invoke.
-from shared.proc_group import snapshot_process_group, terminate_process_group
-
 try:
     from shared.vllm_bridge import VllmBridge as _VllmBridgeRuntime
 except ImportError:  # pragma: no cover - exercised only when aiohttp absent
@@ -539,10 +540,9 @@ class AgentResult:
     resume_fallback_session_ids: tuple[str, ...] = ()
     transcript_turns: int | None = None
     """Number of assistant turns found in the on-disk JSONL transcript, or None
-    when the transcript could not be read or located.  Stamped on the
-    SIGTERM/SIGKILL timeout path (via count_transcript_turns) AND on the
-    normal-exit path (task 2761 — derived from the same records read for the
-    ended_awaiting_background check, at no extra I/O)."""
+    when the transcript could not be read or located.  Stamped on both the
+    SIGTERM/SIGKILL timeout path and the normal-exit path, each time derived
+    from that path's single transcript read alongside its other signals."""
     model_id: str | None = None
     """The exact model id the CLI actually served (e.g. ``claude-opus-5``),
     read from the on-disk transcript via ``detect_transcript_model_id``; None
@@ -639,6 +639,11 @@ def count_transcript_turns(
     records = read_transcript_records(config_dir, session_id)
     if records is None:
         return None
+    return _assistant_turn_count(records)
+
+
+def _assistant_turn_count(records: list[dict]) -> int:
+    """The number of ``type == 'assistant'`` records in parsed *records*."""
     return sum(1 for r in records if r.get('type') == 'assistant')
 
 
@@ -801,30 +806,48 @@ _BG_LOG_PATH_RE = re.compile(r'Output is being written to:\s*(\S+?)\.?(?=\s|$)')
 _MIN_BG_TOKEN_LEN = 6
 
 
-def _content_blocks(record: object) -> list:
-    """Return *record*'s content blocks, tolerating both transcript nestings.
+_FieldT = TypeVar('_FieldT')
 
-    The real CLI shape nests blocks under ``record['message']['content']``;
-    a flat ``record['content']`` is also accepted (older records and the
-    ``nested=False`` half of the detector's parametrized fixtures).  Anything
-    else — a non-dict record, a missing key, a non-list content — yields an
-    empty list rather than raising.
 
-    SOLE expression of that tolerance rule: both ``_iter_result_texts`` and
-    ``detect_ended_awaiting_background`` route through here, so a future CLI
-    nesting change is a one-line fix in one place rather than two copies that
-    can drift (reviewer_comprehensive amendment, task 3639 — previously the
-    same cascade was inlined in each).
+def _record_field(
+    record: object,
+    key: str,
+    accepts: Callable[[object], TypeGuard[_FieldT]],
+) -> _FieldT | None:
+    """Return *record*'s *key* field, tolerating both transcript nestings.
+
+    The real CLI shape nests fields under ``record['message'][key]``; a flat
+    ``record[key]`` is also accepted (older records and the ``nested=False``
+    half of the detectors' parametrized fixtures).  The nested value wins when
+    *accepts* it, else the flat one; anything else — a non-dict record, a
+    missing key, a value *accepts* rejects — yields None rather than raising.
+
+    SOLE expression of that tolerance rule (task 3639): ``_content_blocks`` and
+    ``detect_transcript_model_id`` both route through here, so a future CLI
+    nesting change is a one-line fix in one place.
     """
     if not isinstance(record, dict):
-        return []
+        return None
     message = record.get('message')
-    if isinstance(message, dict) and isinstance(message.get('content'), list):
-        return message['content']
-    content = record.get('content')
-    if isinstance(content, list):
-        return content
-    return []
+    if isinstance(message, dict) and accepts(nested := message.get(key)):
+        return nested
+    flat = record.get(key)
+    return flat if accepts(flat) else None
+
+
+def _is_list(value: object) -> TypeGuard[list]:
+    return isinstance(value, list)
+
+
+def _is_non_empty_str(value: object) -> TypeGuard[str]:
+    return isinstance(value, str) and bool(value)
+
+
+def _content_blocks(record: object) -> list:
+    """Return *record*'s content blocks (via ``_record_field``), or an empty
+    list when it carries none.  Shared by ``_iter_result_texts`` and
+    ``detect_ended_awaiting_background``."""
+    return _record_field(record, 'content', _is_list) or []
 
 
 def _iter_result_texts(record: dict):
@@ -1038,56 +1061,31 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
 
 
 # The CLI writes this in place of a model name on records it synthesised
-# itself rather than received from a model.  Measured, not hypothetical: a
-# 2026-09-11 scan of 14 days of transcripts found 8 occurrences alongside the
-# real ids (`claude-sonnet-5` x78, `claude-opus-5` x45), and an earlier scan
-# found a stub transcript in which it was the ONLY model value present.
+# itself rather than received from a model.
 _SYNTHETIC_MODEL_SENTINEL = '<synthetic>'
 
 
 def detect_transcript_model_id(records: list[dict]) -> str | None:
     """Return the exact model id the CLI actually served, from *records*.
 
-    Reads ``model`` off each ``type == 'assistant'`` record, tolerating both
-    transcript nestings exactly as :func:`_content_blocks` does for content:
-    the real CLI shape nests it under ``record['message']['model']``, a flat
-    ``record['model']`` is also accepted, and anything else — a non-dict
-    record, a missing key, a non-string or empty value — is skipped rather
-    than raised.
+    Reads the non-empty string ``model`` field (via ``_record_field``) of each
+    ``type == 'assistant'`` record, skipping malformed records rather than
+    raising, and discards :data:`_SYNTHETIC_MODEL_SENTINEL` as absent.
 
     Returns the LAST surviving id, or None when no record carries one.  Last
     over first because a run that fails over or is downgraded mid-flight ends
-    on the model that actually produced its final output, which is the one a
-    cost or capability analysis needs to attribute the run to.
+    on the model that actually produced its final output.
 
-    :data:`_SYNTHETIC_MODEL_SENTINEL` is discarded and treated as absent:
-    recording it would poison the very column this exists to make trustworthy.
-
-    Why the transcript and NOT the CLI stdout result envelope: the envelope is
-    an unverified source here.  :func:`_parse_claude_output` reads no ``model``
-    or ``modelUsage`` key and neither string appears anywhere in this repo, so
-    an envelope-based implementation would rest on an assumption about CLI
-    output shape with no real fixture to test it against.  The transcript is
-    measured (see :data:`_SYNTHETIC_MODEL_SENTINEL`) and is already
-    load-bearing for ``transcript_turns`` and ``ended_awaiting_background`` on
-    this exact code path.
-
-    Pure and total — operates on already-parsed records, so it is unit-testable
-    with no filesystem and costs no I/O at the seam that has already read them.
+    Pure and total — operates on already-parsed records, so it costs no I/O at
+    a seam that has already read them.
     """
     found: str | None = None
     for record in records:
         if not isinstance(record, dict) or record.get('type') != 'assistant':
             continue
-        message = record.get('message')
-        model = message.get('model') if isinstance(message, dict) else None
-        if not isinstance(model, str) or not model:
-            model = record.get('model')
-        if not isinstance(model, str) or not model:
-            continue
-        if model == _SYNTHETIC_MODEL_SENTINEL:
-            continue
-        found = model
+        model = _record_field(record, 'model', _is_non_empty_str)
+        if model is not None and model != _SYNTHETIC_MODEL_SENTINEL:
+            found = model
     return found
 
 
@@ -1265,10 +1263,8 @@ def transcript_model_id_for_session(
     unattributable run records NULL, which reads correctly as "not recorded",
     rather than failing the invocation over telemetry.
 
-    This wrapper is for the paths that have NOT already read the transcript
-    (the timeout path).  The normal-exit path derives the same value from its
-    existing single read via the pure detector instead — see the task-2761
-    comment in ``_run_subprocess``.
+    ``_run_subprocess`` does not call this: it already holds the parsed
+    records and applies the pure detector to them directly.
     """
     records = read_transcript_records(config_dir, session_id)
     if records is None:
@@ -1879,45 +1875,41 @@ def classify_cap_kill(
     *,
     budget_usd: float | None,
     max_turns: int | None,
-) -> str | None:
-    """Return which configured ceiling ended *result* — ``'budget'`` or
-    ``'turns'`` — or None when no ceiling did.
+    backend: str = 'claude',
+) -> CapReason | None:
+    """Return which configured ceiling ended *result* — ``CapReason.BUDGET``
+    or ``CapReason.TURNS`` — or None when no ceiling did.
 
-    Answers "was this run ended by a configured ceiling, and which one?".
-    That is deliberately narrower than :func:`classify_agent_failure`'s "why
-    did this fail?" ladder, which has no budget kind at all.
+    Deliberately narrower than :func:`classify_agent_failure`'s "why did this
+    fail?" ladder, which has no budget kind at all.  ``CapReason.ACCOUNT`` is
+    not this function's business: an account usage cap is not a configured
+    ceiling.
 
     The CLI subtype is authoritative and is checked first, ungated on
     ``success`` (a schema-salvaged run is reported successful yet was still
     ended at the turn ceiling).  The numeric comparison against *budget_usd* /
     *max_turns* is only a fallback for a FAILED run whose subtype is
     inconclusive: a healthy run that spends its whole budget or uses its last
-    turn finished on its own terms and is not a cap kill.  When both fallbacks
-    fire, ``'budget'`` is reported.  A None ceiling disables its fallback.
-    Total — never raises.
+    turn finished on its own terms.  When both fallbacks fire, budget is
+    reported.  A None ceiling disables its fallback, and so does any
+    *backend* other than ``'claude'``: the others enforce neither ceiling
+    natively (see ``orchestrator/src/orchestrator/agents/invoke.py``), so no
+    ceiling can have ended their runs.  Total — never raises.
 
-    The return value is the ``invocations.capped_reason`` vocabulary.  Its
-    third value, ``'account'``, is produced by ``invoke_with_cap_retry``'s
-    unattributed-account-cap path and is intentionally not this function's
-    business: an account usage cap is not a configured ceiling.
-
-    The two subtype literals are the ones already read as authoritative by
-    ``shared/src/shared/usage_gate.py`` (the ``error_max_budget_usd`` check)
-    and by :func:`classify_agent_failure` (``error_max_turns`` →
-    ``MAX_TURNS``).  A third spelling of the budget one lives in
-    ``orchestrator/src/orchestrator/dry_run_unblock.py::_BUDGET_SUBTYPES`` —
-    the place to start if these are ever consolidated.
+    The subtype literals match ``shared/src/shared/usage_gate.py`` and
+    :func:`classify_agent_failure`; a third spelling of the budget one lives
+    at ``orchestrator/src/orchestrator/dry_run_unblock.py::_BUDGET_SUBTYPES``.
     """
     if result.subtype == 'error_max_budget_usd':
-        return 'budget'
+        return CapReason.BUDGET
     if result.subtype == 'error_max_turns':
-        return 'turns'
-    if result.success:
+        return CapReason.TURNS
+    if result.success or backend != 'claude':
         return None
     if budget_usd is not None and result.cost_usd >= budget_usd:
-        return 'budget'
+        return CapReason.BUDGET
     if max_turns is not None and result.turns >= max_turns:
-        return 'turns'
+        return CapReason.TURNS
     return None
 
 
@@ -3053,8 +3045,9 @@ async def invoke_with_cap_retry(
         result,
         budget_usd=invoke_kwargs.get('max_budget_usd'),
         max_turns=invoke_kwargs.get('max_turns'),
+        backend=backend,
     )
-    capped_reason = 'account' if unattributed_cap else ceiling_reason
+    capped_reason = CapReason.ACCOUNT if unattributed_cap else ceiling_reason
     if cost_store:
         try:
             await cost_store.save_invocation(
@@ -3844,12 +3837,12 @@ async def _run_subprocess(
             comm_task = asyncio.ensure_future(proc.communicate())
 
             # ── INVARIANT (task 3925): every transcript read below is OFF-LOOP ─
-            # THE authoritative statement of this invariant.  The five call
+            # THE authoritative statement of this invariant.  The four call
             # sites below point back here with one-liners instead of restating
             # it; keep it that way — duplicated prose drifts independently.
             #
-            # WHAT.  All five transcript reads in _run_subprocess (the two
-            # watchdog polls in this loop, the two one-shot re-reads in the
+            # WHAT.  All four transcript reads in _run_subprocess (the two
+            # watchdog polls in this loop, the one-shot re-read in the
             # except-TimeoutError handler, and the normal-exit read after it) go
             # through `await asyncio.to_thread(...)`.
             #
@@ -3863,7 +3856,7 @@ async def _run_subprocess(
             # The deliberate COUNTER-example is the `archive_task_transcripts`
             # hook in workflow.py's `_invoke` finally, kept synchronous on
             # purpose: it is a WRITE whose in-flight transcripts a cancellation
-            # point would lose.  These five are side-effect-free READS, so that
+            # point would lose.  These four are side-effect-free READS, so that
             # argument does not transfer.
             #
             # HOW TO SPELL IT.  Bare positional reference —
@@ -3889,7 +3882,7 @@ async def _run_subprocess(
             # logged at warning past _WATCHDOG_SLOW_READ_WARN_SECS.  A dedicated
             # ThreadPoolExecutor for transcript reads was considered and NOT
             # adopted: a small private pool trades contention with unrelated
-            # offloads for contention among these five reads (the normal-exit one
+            # offloads for contention among these four reads (the normal-exit one
             # is paid by every completing agent) and adds a process-global pool
             # with no shutdown path.  Revisit if that warning ever fires.
             while True:
@@ -4178,19 +4171,9 @@ async def _run_subprocess(
             # `except asyncio.CancelledError:` below, which cancels comm_task and
             # reaps the process group — the same treatment a cancel landing
             # anywhere else in the outer try receives.  No new leak path.
-            tt = (
-                await asyncio.to_thread(count_transcript_turns, config_dir, session_id)
-                if (config_dir and session_id)
-                else None
-            )
-            # A SECOND read rather than one shared with the turn count above, by
-            # design: TestTimeoutPathRereadOffLoop (test_cli_invoke_transcript_
-            # offloop.py) patches `count_transcript_turns` BY NAME and asserts its
-            # value lands, so folding both into one `read_transcript_records`
-            # call would defeat the suite that polices this seam.  The extra read
-            # is confined to the rare timeout path and is OFF-LOOP like the rest.
-            served_model_id = (
-                await asyncio.to_thread(transcript_model_id_for_session, config_dir, session_id)
+            # ONE read feeds both stamped signals, as on the normal-exit path.
+            killed_records = (
+                await asyncio.to_thread(read_transcript_records, config_dir, session_id)
                 if (config_dir and session_id)
                 else None
             )
@@ -4201,8 +4184,12 @@ async def _run_subprocess(
                 duration_ms=duration_ms,
                 timed_out=True,
                 proc_tree=proc_tree,
-                transcript_turns=tt,
-                model_id=served_model_id,
+                transcript_turns=(
+                    None if killed_records is None else _assistant_turn_count(killed_records)
+                ),
+                model_id=(
+                    None if killed_records is None else detect_transcript_model_id(killed_records)
+                ),
             )
     except asyncio.CancelledError:
         # Orchestrator shutdown path: the awaiting task was cancelled. Kill the
@@ -4251,17 +4238,14 @@ async def _run_subprocess(
     #     silently abandoned the work.  Symmetric to the timeout path's
     #     transcript re-read above; _parse_claude_output owns the actual
     #     success→failure downgrade.
-    #   • model_id — the exact CLI-served model id (task 4826), which the
-    #     caller's alias cannot tell apart across versions.  Pure in-memory
-    #     work on the already-read list, so it adds no I/O and keeps both the
-    #     single-read property and the OFF-LOOP invariant intact.  A cap-killed
-    #     run exits normally (subtype error_max_budget_usd), so it reaches here.
+    #   • model_id — the exact CLI-served model id, which the caller's alias
+    #     cannot tell apart across versions.
     # All fail safe when the transcript can't be located (records None →
     # transcript_turns None, ended_awaiting_background False, model_id None).
     # OFF-LOOP — see the task-3925 INVARIANT block above the poll loop.  This is
-    # the largest of the five reads: it parses the FULL record list, and every
+    # the largest of the four reads: it parses the FULL record list, and every
     # successful run pays it.
-    # Site-specific cancellation note: unlike the other four this read sits
+    # Site-specific cancellation note: unlike the other three this read sits
     # OUTSIDE both try blocks, so a CancelledError here is NOT caught by the
     # `except asyncio.CancelledError:` handler above and propagates directly.
     # That is safe and needs no asyncio.shield: comm_task has already completed
@@ -4279,7 +4263,7 @@ async def _run_subprocess(
         ended_awaiting_background = False
         model_id = None
     else:
-        transcript_turns = sum(1 for r in transcript_records if r.get('type') == 'assistant')
+        transcript_turns = _assistant_turn_count(transcript_records)
         ended_awaiting_background = detect_ended_awaiting_background(transcript_records)
         model_id = detect_transcript_model_id(transcript_records)
 

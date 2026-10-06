@@ -289,15 +289,16 @@ class TestReviewCheckpointInvocationRecord:
     ``model_id`` and which configured ceiling, if any, ended the run (task 4826).
 
     This path emits no ``invocation_end`` event, so its ``invocations`` row is
-    the ONLY durable record of a reviewer cap kill — and the task-3543
-    investigation measured 5.3% of ``reviewer_comprehensive`` invocations
-    hitting the budget cap, carrying 29.5% of reviewer spend.
+    the ONLY durable record of a reviewer cap kill.
     """
 
-    async def _drive(self, monkeypatch, result: AgentResult) -> tuple[dict, dict]:
-        """Run one focused review returning *result*; give back
+    async def _drive(
+        self, monkeypatch, result: AgentResult, *, backend: str = 'claude',
+    ) -> tuple[dict, dict]:
+        """Run one focused review on *backend* returning *result*; give back
         ``(save_invocation kwargs, invoke_with_cap_retry kwargs)``."""
         checkpoint = _make_checkpoint()
+        checkpoint.config.backends.deep_reviewer = backend
         cost_store = MagicMock()
         cost_store.save_invocation = AsyncMock()
         cost_store.model_cost_in_window = AsyncMock(return_value=0.0)
@@ -380,3 +381,17 @@ class TestReviewCheckpointInvocationRecord:
         assert save_kw['capped_reason'] is None
         assert 'model_id' in save_kw
         assert save_kw['model_id'] is None
+
+    async def test_non_claude_failed_review_past_the_budget_is_not_capped(self, monkeypatch):
+        """The deep_reviewer backend reaches the classifier as well as the
+        invoke: a backend that enforces no budget ceiling is never budget-capped."""
+        save_kw, invoke_kw = await self._drive(
+            monkeypatch,
+            AgentResult(
+                success=False, output='', subtype='', cost_usd=12.0, turns=3,
+            ),
+            backend='codex',
+        )
+        assert invoke_kw['backend'] == 'codex'
+        assert save_kw['capped'] is False
+        assert save_kw['capped_reason'] is None

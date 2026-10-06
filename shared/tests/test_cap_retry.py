@@ -2751,6 +2751,21 @@ class TestSaveInvocationCeilingAndModelId:
         assert kw['capped'] is False
         assert kw['capped_reason'] is None
 
+    async def test_non_claude_backend_past_its_budget_is_not_capped(self):
+        """The dispatched backend reaches the classifier: codex enforces no
+        budget ceiling, so a failed run past its estimated budget was not ended
+        by one."""
+        result = make_result(
+            success=False, subtype='',
+            cost_usd=7.5, turns=12, duration_ms=900_000,
+        )
+        kw = await self._save_kwargs(
+            result, invoke_fn=AsyncMock(return_value=result), backend='codex',
+            model='gpt-5', max_budget_usd=5.0, max_turns=100,
+        )
+        assert kw['capped'] is False
+        assert kw['capped_reason'] is None
+
     async def test_exact_model_id_is_recorded_beside_the_alias(self):
         """The crux of task 4826: ``model`` keeps the lineage alias the caller
         routed on, while ``model_id`` carries the exact version that served the

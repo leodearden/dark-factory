@@ -210,6 +210,7 @@ class ReviewCheckpoint:
             event_store=self.event_store,
             cost_store=self.cost_store,
         )
+        backend = getattr(self.config.backends, 'deep_reviewer', 'claude')
         try:
             result = await invoke_with_cap_retry(
                 usage_gate=self.usage_gate,
@@ -225,7 +226,7 @@ class ReviewCheckpoint:
                 disallowed_tools=DEEP_REVIEWER.disallowed_tools or None,
                 mcp_config=mcp_config,
                 effort=decision.effort,
-                backend=getattr(self.config.backends, 'deep_reviewer', 'claude'),
+                backend=backend,
             )
         except AllAccountsCappedException as e:
             # BD-1: the reason text is single-sourced from the SAME
@@ -265,6 +266,7 @@ class ReviewCheckpoint:
                 model_name = decision.model
                 capped_reason = classify_cap_kill(
                     result, budget_usd=decision.budget_usd, max_turns=decision.max_turns,
+                    backend=backend,
                 )
                 await self.cost_store.save_invocation(
                     run_id=self.run_id,
