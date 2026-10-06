@@ -24,7 +24,7 @@ from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, TypeVar
 
 if TYPE_CHECKING:
     from shared.psi import PsiSample
@@ -1541,14 +1541,44 @@ def red_module_prefixes_of(result: 'VerifyResult') -> frozenset[str] | None:
     return frozenset(prefix for prefix, ids in by_module.items() if ids)
 
 
+_ProbeOutcome = TypeVar('_ProbeOutcome')
+
+
+async def _on_main_probe_worktree(
+    git_ops: object,
+    main_sha: str,
+    body: Callable[[Path], Awaitable[_ProbeOutcome]],
+) -> _ProbeOutcome | None:
+    """*body*'s answer in a MAIN_PROBE worktree of *main_sha*; None when the worktree or *body* raised.
+
+    warm_seed=True: the probe shares the rolling warm-lane CoW base with the
+    ordinary task verifies it adjudicates, so any warm-base artifact bias is
+    common-mode across both sides of the comparison; the COLD ground truth
+    stays with MAIN_SWEEP and the '_mainsweepconfirm-' confirm worktree
+    (operator sign-off 2026-08-12, task-2567 suggestion).
+    """
+    from orchestrator.git_ops import EphemeralWorktreeError, WorktreeKind
+
+    try:
+        async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
+            WorktreeKind.MAIN_PROBE, main_sha, warm_seed=True,
+        ) as worktree:
+            return await body(worktree)
+    except EphemeralWorktreeError as e:
+        logger.warning(
+            'main_baseline_failing_ids: %s — baseline probe disabled for this attempt', e,
+        )
+    except Exception:
+        logger.warning('main_baseline_failing_ids: probe raised', exc_info=True)
+    return None
+
+
 async def _whole_tree_main_baseline(
     config: 'OrchestratorConfig',
     module_configs: 'list[ModuleConfig]',
     git_ops: object,
     main_sha: str,
 ) -> 'frozenset[str] | None':
-    from orchestrator.git_ops import EphemeralWorktreeError, WorktreeKind
-
     _cached = _recall_main_baseline(main_sha, touch=True)
     _hit = _cached.complete_for(None) if _cached is not None else None
     if _hit is not None:
@@ -1558,51 +1588,26 @@ async def _whole_tree_main_baseline(
         )
         return _hit
 
-    try:
-        # warm_seed=True: this probe shares the rolling warm-lane CoW base
-        # with the ordinary task verifies it adjudicates, so any warm-base
-        # artifact bias is common-mode across both sides of the comparison;
-        # the COLD ground truth stays with MAIN_SWEEP and the
-        # '_mainsweepconfirm-' confirm worktree (operator sign-off
-        # 2026-08-12, task-2567 suggestion).
-        async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
-            WorktreeKind.MAIN_PROBE, main_sha, warm_seed=True,
-        ) as tmp_path:
-            try:
-                probe_result = await run_scoped_verification(
-                    tmp_path, config, module_configs,
-                    task_files=None,
-                    max_retries=0,
-                    role='merge',
-                )
-            except Exception:
-                logger.warning(
-                    'main_baseline_failing_ids: probe verify raised', exc_info=True,
-                )
-                return None
-
-            if probe_result.failing_test_ids is None:
-                # OPAQUE / non-pytest / probe-side failure to collect a junit
-                # report — degrade (B3). Deliberately not cached: a transient
-                # probe hiccup shouldn't pin "no baseline" for the SHA's life.
-                logger.debug(
-                    'main_baseline_failing_ids: probe collected no junit ids '
-                    '(main_sha=%.8s) — degrading to None (B3)', main_sha,
-                )
-                return None
-
-            ids = frozenset(probe_result.failing_test_ids)
-            seed_main_baseline(main_sha, ids)
-            return ids
-
-    except EphemeralWorktreeError as e:
-        logger.warning(
-            'main_baseline_failing_ids: %s — baseline probe disabled for this attempt', e,
+    probe_result = await _on_main_probe_worktree(
+        git_ops, main_sha,
+        lambda worktree: run_scoped_verification(
+            worktree, config, module_configs, task_files=None, max_retries=0, role='merge',
+        ),
+    )
+    if probe_result is None:
+        return None
+    if probe_result.failing_test_ids is None:
+        # OPAQUE / non-pytest / probe-side failure to collect a junit
+        # report — degrade (B3). Deliberately not cached: a transient
+        # probe hiccup shouldn't pin "no baseline" for the SHA's life.
+        logger.debug(
+            'main_baseline_failing_ids: probe collected no junit ids '
+            '(main_sha=%.8s) — degrading to None (B3)', main_sha,
         )
         return None
-    except Exception:
-        logger.warning('main_baseline_failing_ids: unexpected error', exc_info=True)
-        return None
+    ids = frozenset(probe_result.failing_test_ids)
+    seed_main_baseline(main_sha, ids)
+    return ids
 
 
 async def _red_module_main_baseline(
@@ -1656,30 +1661,20 @@ async def _probe_modules_on_main(
     A module whose run collected no junit is absent from the result; the
     whole answer is ``None`` when the worktree or any run raised.
     """
-    from orchestrator.git_ops import EphemeralWorktreeError, WorktreeKind
-
-    sem = asyncio.Semaphore(max(1, config.merge_verify_max_concurrent_modules))
+    sem = _module_fanout_semaphore(config, 'merge')
 
     async def _probe(worktree: Path, mc: 'ModuleConfig') -> VerifyResult:
         async with sem:
             return await run_verification(worktree, config, mc, max_retries=0, role='merge')
 
-    try:
-        # warm_seed=True for the reason given in _whole_tree_main_baseline.
-        async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
-            WorktreeKind.MAIN_PROBE, main_sha, warm_seed=True,
-        ) as tmp_path:
-            # return_exceptions: no sibling may outlive the worktree it runs in.
-            results = await asyncio.gather(
-                *(_probe(tmp_path, mc) for mc in module_configs), return_exceptions=True,
-            )
-    except EphemeralWorktreeError as e:
-        logger.warning(
-            'main_baseline_failing_ids: %s — baseline probe disabled for this attempt', e,
+    async def _probe_each(worktree: Path) -> list[VerifyResult | BaseException]:
+        # return_exceptions: no sibling may outlive the worktree it runs in.
+        return await asyncio.gather(
+            *(_probe(worktree, mc) for mc in module_configs), return_exceptions=True,
         )
-        return None
-    except Exception:
-        logger.warning('main_baseline_failing_ids: unexpected error', exc_info=True)
+
+    results = await _on_main_probe_worktree(git_ops, main_sha, _probe_each)
+    if results is None:
         return None
 
     collected: dict[str, frozenset[str]] = {}
@@ -7722,6 +7717,34 @@ def _reverse_dependency_module_configs(
     return widened
 
 
+def _module_fanout_semaphore(
+    config: OrchestratorConfig, role: Literal['merge', 'task'],
+) -> asyncio.Semaphore:
+    """Bound one call's per-module fan-out into a single worktree.
+
+    A large (or accidentally polluted) module set must never launch an
+    unbounded number of full builds into one worktree at once. Create one per
+    call; it is a no-op when only one module runs. (Root cause of the 226-way
+    merge-verify storm: a polluted module set turned the no-match fan-out into
+    226 concurrent `cargo` pipelines in one `_merge-*` worktree.)
+
+    The cap is role-aware (task 2393, T5): merge-role pytests bypass the T2
+    counting admission slot (`_admission_slot` no-ops for role='merge' — the
+    anti-livelock/C-merge-priority guarantee), so merge's internal fan-out
+    needs its OWN bound (`merge_verify_max_concurrent_modules`), orthogonal to
+    `verify_admission_task_slots`. The 'task' role keeps the general
+    `max_concurrent_module_verifies` — its pytests are additionally bounded by
+    the admission slot, so the general knob mostly just caps burst concurrency
+    for it.
+    """
+    cap = (
+        config.merge_verify_max_concurrent_modules
+        if role == 'merge'
+        else config.max_concurrent_module_verifies
+    )
+    return asyncio.Semaphore(max(1, cap))
+
+
 async def run_scoped_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -7768,29 +7791,7 @@ async def run_scoped_verification(
     call sites so post-merge verifies get the cold timeout.
     """
     scope_cargo_enabled = config.scope_cargo
-
-    # Bound the per-subproject fan-out so a large (or accidentally polluted)
-    # module set can never launch an unbounded number of full builds into one
-    # worktree at once.  Created per call; a no-op when only one module runs.
-    # (Root cause of the 226-way merge-verify storm: a polluted module set
-    # turned the no-match fan-out into 226 concurrent `cargo` pipelines in one
-    # `_merge-*` worktree.)
-    #
-    # The cap is role-aware (task 2393, T5): merge-role pytests bypass the T2
-    # counting admission slot (`_admission_slot` no-ops for role='merge' — the
-    # anti-livelock/C-merge-priority guarantee), so merge's internal fan-out
-    # needs its OWN bound (`merge_verify_max_concurrent_modules`), orthogonal
-    # to `verify_admission_task_slots`. The 'task' role (this function's only
-    # other role — see the `Literal['merge', 'task']` signature above) keeps
-    # the general `max_concurrent_module_verifies` — its pytests are
-    # additionally bounded by the admission slot, so the general knob mostly
-    # just caps burst concurrency for it.
-    _fanout_cap = (
-        config.merge_verify_max_concurrent_modules
-        if role == 'merge'
-        else config.max_concurrent_module_verifies
-    )
-    _fanout_sem = asyncio.Semaphore(max(1, _fanout_cap))
+    _fanout_sem = _module_fanout_semaphore(config, role)
 
     async def _verify_module(mc: ModuleConfig) -> 'VerifyResult':
         async with _fanout_sem:
