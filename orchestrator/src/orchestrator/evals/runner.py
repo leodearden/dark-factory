@@ -259,13 +259,9 @@ async def campaign_usage_gate(
 ) -> AsyncIterator[UsageGate | None]:
     """Own ONE account-failover gate for a whole eval campaign (task 4427).
 
-    A campaign is any loop that runs several cells in ONE process: the four
-    methodology stages here (:func:`run_ofat_stage` / :func:`run_matrix_stage` /
-    :func:`run_confirm_stage` / :func:`run_eval_matrix`, each expanding
-    ``fixtures × candidates × trials``), ``cli._run_single_eval``'s config
-    loop, and the reviewer-trial ``campaign`` command
-    (``reviewer_trial/__main__.py::campaign``). Each of those needs
-    build-once + tear-down-exactly-once, and six hand-rolled copies is precisely the shape :func:`_build_eval_usage_gate`
+    A campaign is any loop that runs several cells in ONE process, and each
+    one needs build-once + tear-down-exactly-once. A hand-rolled copy of that
+    lifecycle per campaign is precisely the shape :func:`_build_eval_usage_gate`
     itself was extracted to avoid, so the lifecycle lives here in one place.
 
     WHY ``base_config`` IS THE RIGHT THING TO BUILD FROM.
