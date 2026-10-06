@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 from datetime import UTC, date, datetime, timedelta
@@ -30,6 +31,7 @@ from legibility import (
     codebook,
     digest,
     nightly,
+    session_ledger,
     session_runner,
     trickle_state,
     unlanded,
@@ -5024,3 +5026,119 @@ def test_deletion_directive_aggregate_journals_once_at_warning(tmp_path, caplog)
         'no escalation on this path flips the exit code, so none of them '
         'belongs in `journalctl -p err`'
     )
+
+
+# ---------------------------------------------------------------------------
+# task 6397: the trickle ledgers every session it coded and merged, before
+# the census it may launch reads the ledger
+# ---------------------------------------------------------------------------
+
+def _ledger():
+    return session_ledger.read_ledger(session_ledger.ledger_path('testproj'))
+
+
+def _ledger_rows():
+    """Every stored row, read from the sqlite file the ledger owns."""
+    path = session_ledger.ledger_path('testproj')
+    if not path.exists():
+        return []
+    with contextlib.closing(sqlite3.connect(path)) as conn:
+        return conn.execute(
+            'SELECT session, instrument_version, coded_by, run_ref, outcome, coded_at '
+            'FROM coded_sessions',
+        ).fetchall()
+
+
+class TestRunNightlyLedgersCodedSessions:
+
+    def test_a_merged_coding_is_ledgered_as_trickle(self, tmp_path):
+        result, _repo = _run_e2e_nightly(tmp_path)
+
+        assert result.exit_code == 0
+        assert result.commit_made is True
+        coded = json.loads(_fake_invoke_known_cause('', ''))
+        assert _ledger_rows() == [(
+            'session-1',
+            digest.DIGEST_INSTRUMENT_VERSION,
+            'trickle',
+            'trickle-testproj-20260713',
+            session_ledger.outcome_of(coded).value,
+            '2026-07-14T03:00:00+00:00',
+        )]
+        assert result.ledger_rows_written == 1
+        assert result.ledger_rows_failed == 0
+
+    def test_the_row_is_ledgered_before_the_census_step_runs(self, tmp_path, monkeypatch):
+        seen_by_census_step = []
+
+        def _spy(cfg, **kwargs):
+            seen_by_census_step.append(_ledger().sessions)
+            return 'census: spy', False
+
+        monkeypatch.setattr(nightly, 'evaluate_census_step', _spy)
+        result, _repo = _run_e2e_nightly(tmp_path)
+
+        assert result.census_line == 'census: spy'
+        assert seen_by_census_step == [frozenset({'session-1'})]
+
+    @pytest.mark.parametrize(
+        'branch', ['extractor', 'storm', 'capped', 'validation', 'commit'],
+    )
+    def test_a_night_that_did_not_land_its_coding_ledgers_nothing(
+        self, tmp_path, monkeypatch, branch,
+    ):
+        result, _repo = _run_e2e_nightly(tmp_path, monkeypatch=monkeypatch, branch=branch)
+
+        assert result.commit_made is False
+        assert _ledger().sessions == frozenset()
+        assert result.ledger_rows_written == 0
+        assert result.ledger_rows_failed == 0
+
+    def test_a_quiet_night_ledgers_nothing_and_fails_nothing(self, tmp_path):
+        result, _repo = _run_e2e_nightly(tmp_path, transcript=False)
+
+        assert result.exit_code == 0
+        assert _ledger().sessions == frozenset()
+        assert result.ledger_rows_written == 0
+        assert result.ledger_rows_failed == 0
+
+    def test_a_deletion_directive_record_is_not_ledgered(self, tmp_path):
+        result, _repo = _run_e2e_nightly(tmp_path, invoke=_fake_invoke_deletion_directive)
+
+        assert result.exit_code == 0
+        assert _ledger().sessions == frozenset()
+        assert result.ledger_rows_written == 0
+
+    def test_an_unwritable_ledger_is_counted_and_never_fails_the_night(
+        self, tmp_path, caplog,
+    ):
+        path = session_ledger.ledger_path('testproj')
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b'not an sqlite database\n' * 8)
+
+        with caplog.at_level(logging.INFO, logger='legibility.nightly'):
+            result, _repo = _run_e2e_nightly(tmp_path)
+
+        assert result.exit_code == 0
+        assert result.commit_made is True
+        assert result.ledger_rows_written == 0
+        assert result.ledger_rows_failed == 1
+        assert result.reason is not None
+        assert 'ledger' in result.reason
+        assert str(path) in result.reason
+        naming_the_path = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and str(path) in r.getMessage()
+        ]
+        assert len(naming_the_path) == 1, [r.getMessage() for r in naming_the_path]
+
+    def test_rerunning_the_night_ledgers_nothing_twice(self, tmp_path):
+        (tmp_path / 'first').mkdir()
+        (tmp_path / 'second').mkdir()
+        first, _repo = _run_e2e_nightly(tmp_path / 'first')
+        second, _repo2 = _run_e2e_nightly(tmp_path / 'second')
+
+        assert first.ledger_rows_written == 1
+        assert second.ledger_rows_written == 0
+        assert second.ledger_rows_failed == 0
+        assert [row[0] for row in _ledger_rows()] == ['session-1']
