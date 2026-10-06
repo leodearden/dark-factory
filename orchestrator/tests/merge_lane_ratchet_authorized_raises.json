@@ -2089,6 +2089,60 @@
           "current": 31904
         }
       ]
+    },
+    {
+      "task_id": "5371",
+      "reason": "review fixes R6/R7: a train no longer parks on a predecessor a halt sent back to the queue; under an admission halt no coalesce train forms and an unstarted one (buffered or dequeued) is dissolved through the 1867 member re-drive instead of left for the restart to drop",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2169,
+          "current": 2189
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_acquire_next_request",
+          "baseline": 16,
+          "current": 18
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker::_maybe_coalesce_waiting_singles",
+          "baseline": 62,
+          "current": 63
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 21961,
+          "current": 22055
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12491,
+          "current": 12523
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4803,
+          "current": 4823
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57201,
+          "current": 57295
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31904,
+          "current": 31936
+        }
+      ]
     }
   ]
 }

@@ -33,6 +33,7 @@ from df_pytest_isolation import git_redirect_env
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import GroupMergeRequest, MergeLane, MergeRequest, QueuedBranch
+from orchestrator.merge_lane.types import TrainCallbacks
 from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
 
 pytestmark = pytest.mark.asyncio
@@ -65,7 +66,7 @@ async def _branch(scene: _Scene, name: str) -> Path:
     return worktree
 
 
-async def _request(scene: _Scene, name: str) -> MergeRequest:
+async def _request(scene: _Scene, name: str, *, lane: str = 'normal') -> MergeRequest:
     return MergeRequest(
         task_id=name,
         branch=QueuedBranch.parse(name, _GIT.branch_prefix),
@@ -75,6 +76,7 @@ async def _request(scene: _Scene, name: str) -> MergeRequest:
         module_configs=[],
         config=scene.config,
         result=asyncio.get_running_loop().create_future(),
+        lane='high' if lane == 'high' else 'normal',
     )
 
 
@@ -419,3 +421,189 @@ async def test_a_gate_reverify_deadline_runs_from_the_reverify_start(tmp_path: P
     assert gate['deadline_ts'] - gate['started_ts'] == budget
     assert outcome.status == 'done', outcome
     assert reverify.calls == 1
+
+
+# ─── R6: a requeued predecessor is not waited for ───────────────────────────
+
+
+async def test_a_train_does_not_park_on_a_predecessor_the_halt_sent_back_to_the_queue(
+    scene: _Scene,
+) -> None:
+    """A halt requeues both a parked train T and the predecessor A it waited
+    on, T ahead of A. Once admission resumes T must not park on A, which can
+    only move after T: that would stall the merger for the whole park."""
+    release_head = asyncio.Event()
+    verifier = FakeVerifier(scripts={'head': hangs_until(release_head)})
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = MergeLane(scene.git_ops, queue, verifier=verifier, speculation_depth=2)
+    train = await _stacked_train(scene)
+    head = await _request(scene, 'head')
+    pred = await _request(scene, 'pred')
+    train_verify = _HeldVerify()
+    train_verify.release.set()
+
+    with patch(_TRAIN_VERIFY_TARGET, side_effect=train_verify.run):
+        async with running_lane(lane) as run:
+            await queue.put(head)
+            await wait_responsive(verifier.await_entry(1), label='head verify under way')
+            await queue.put(pred)
+            await wait_responsive(
+                _until(lambda: _state(lane, pred) in {'awaiting_verify', 'awaiting_host'}),
+                label='predecessor merged, waiting for the one host',
+            )
+            await queue.put(train)
+            await wait_responsive(
+                _until(lambda: _state(lane, train) == 'merging'),
+                label='train parked behind the predecessor',
+            )
+
+            lane.halt_admission('restart drain test')
+            release_head.set()
+            assert (await run.outcome(head)).status == 'done'
+            await wait_responsive(
+                _until(lambda: (_state(lane, train), _state(lane, pred)) == ('queued', 'queued')),
+                label='train and predecessor both requeued',
+            )
+
+            lane.resume_admission()
+            train_outcome = await wait_responsive(
+                asyncio.shield(train.result), label='train lands without parking on pred',
+            )
+            pred_outcome = await run.outcome(pred)
+
+    assert train_outcome.status == 'done', train_outcome
+    assert pred_outcome.status == 'done', pred_outcome
+    assert train_verify.calls == 1
+
+
+# ─── R7: the drain never strands a coalesce train's members ─────────────────
+
+
+class _CoalesceHooks:
+    """The train callbacks a coalesce train is built with, recording re-drives."""
+
+    def __init__(self) -> None:
+        self.redriven: list[tuple[str, bool, str | None]] = []
+
+    def factory(self, train_id: str) -> TrainCallbacks:
+        async def _all_deferred(ids: list[str]) -> dict[str, str]:
+            return dict.fromkeys(ids, 'merge-deferred')
+
+        return TrainCallbacks(
+            status_check=_all_deferred,
+            mark_member_done=AsyncMock(),
+            redrive_member=self._redrive,
+        )
+
+    async def _redrive(self, member: str, on_main: bool, sha: str | None) -> None:
+        self.redriven.append((member, on_main, sha))
+
+
+_SINGLES = ('cs-a', 'cs-b')
+
+
+@pytest.fixture
+def coalesce_scene(tmp_path: Path) -> _Scene:
+    repo = seed_repo(tmp_path / 'repo', _SEED)
+    return _Scene(
+        repo=repo, git_ops=GitOps(_GIT, repo),
+        config=lane_scene_config(repo, _GIT, merge_train_coalesce_enabled=True),
+    )
+
+
+def _entries(lane: MergeLane) -> list[tuple[str, str]]:
+    return [(e['task_id'], e['state']) for e in lane.snapshot()['entries']]
+
+
+async def test_a_halt_forms_no_coalesce_train(coalesce_scene: _Scene) -> None:
+    """The coalescing pass runs at the top of every merger iteration, the
+    first one included; under a halt it forms nothing, so after resume the
+    singles merge solo."""
+    hooks = _CoalesceHooks()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(coalesce_scene.git_ops, queue, train_callback_factory=hooks.factory)
+    singles = [await _request(coalesce_scene, name) for name in _SINGLES]
+    lane.halt_admission('restart drain test')
+    for single in singles:
+        await queue.put(single)
+
+    async with running_lane(lane) as run:
+        await wait_responsive(
+            _until(lambda: lane.unfrozen_suffix() == tuple(r.request_id for r in singles)),
+            label='both singles buffered',
+        )
+        lane.resume_admission()
+        outcomes = [await run.outcome(single) for single in singles]
+
+    assert [o.status for o in outcomes] == ['done', 'done'], outcomes
+    assert hooks.redriven == []
+
+
+async def test_a_halt_dissolves_a_coalesce_train_waiting_in_its_buffer(
+    coalesce_scene: _Scene,
+) -> None:
+    hooks = _CoalesceHooks()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    lane = make_lane(coalesce_scene.git_ops, queue, train_callback_factory=hooks.factory)
+    singles = [await _request(coalesce_scene, name) for name in _SINGLES]
+    lane.halt_lane('normal', 'hold the formed train in its buffer')
+    for single in singles:
+        await queue.put(single)
+
+    async with running_lane(lane):
+        await wait_responsive(
+            _until(lambda: all(single.result.done() for single in singles)),
+            label='singles coalesced into a buffered train',
+        )
+        assert _entries(lane) == [(_SINGLES[-1], 'queued')]
+
+        lane.halt_admission('restart drain test')
+        await wait_responsive(
+            _until(lambda: len(hooks.redriven) == len(_SINGLES)),
+            label='train dissolved and its members re-driven',
+        )
+        assert lane.unfrozen_suffix() == ()
+        assert _entries(lane) == []
+
+    assert sorted(hooks.redriven) == [(name, False, None) for name in _SINGLES]
+
+
+async def test_a_halt_dissolves_a_dequeued_coalesce_train_instead_of_requeuing_it(
+    coalesce_scene: _Scene,
+) -> None:
+    release_head = asyncio.Event()
+    verifier = FakeVerifier(scripts={'head': hangs_until(release_head)})
+    hooks = _CoalesceHooks()
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    # The production clock, as for R1: the train parks behind the head.
+    lane = MergeLane(
+        coalesce_scene.git_ops, queue, verifier=verifier, train_callback_factory=hooks.factory,
+    )
+    head = await _request(coalesce_scene, 'head', lane='high')
+    singles = [await _request(coalesce_scene, name) for name in _SINGLES]
+    train_verify = _HeldVerify()
+    train_verify.release.set()
+
+    with patch(_TRAIN_VERIFY_TARGET, side_effect=train_verify.run):
+        async with running_lane(lane) as run:
+            for request in (head, *singles):
+                await queue.put(request)
+            await wait_responsive(verifier.await_entry(1), label='head verify under way')
+            await wait_responsive(
+                _until(lambda: (_SINGLES[-1], 'merging') in _entries(lane)),
+                label='coalesce train dequeued and parked behind the head',
+            )
+
+            lane.halt_admission('restart drain test')
+            await wait_responsive(
+                _until(lambda: len(hooks.redriven) == len(_SINGLES)),
+                label='dequeued train dissolved and its members re-driven',
+            )
+            assert _entries(lane) == [('head', 'verifying')]
+            assert lane.unfrozen_suffix() == ()
+
+            release_head.set()
+            assert (await run.outcome(head)).status == 'done'
+
+    assert sorted(hooks.redriven) == [(name, False, None) for name in _SINGLES]
+    assert train_verify.calls == 0

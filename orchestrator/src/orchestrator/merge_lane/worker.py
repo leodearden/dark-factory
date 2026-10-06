@@ -8247,7 +8247,7 @@ rather than a hardcoded *from_state*, so a registered item legally lands back
 at QUEUED regardless of which of the two states it was requeued from. Task
 5371 adds MERGING -> QUEUED for the third: a train the merger dequeued but
 whose verify an admission halt forbids it to start
-(``SpeculativeMergeWorker._defer_train_for_admission_halt``).
+(``SpeculativeMergeWorker._stand_down_train``).
 
 kappa also adds the DISPATCHING <-> MERGING pair for the dispatch-time
 staleness/chain-invalidation remerge inside ``_dispatch_item`` (Mechanism 2):
@@ -8520,6 +8520,14 @@ _HELD_STATES = frozenset({ItemLifecycleState.MERGING, ItemLifecycleState.DISPATC
 # a gate re-verify is a whole new verify — so the restart drain measures a
 # deadline from the LATEST entry into one, never the first dispatch.
 _RESTAMPED_STATES = _HELD_STATES | {ItemLifecycleState.GATE_REVERIFY, ItemLifecycleState.FINALIZING}
+# Registry states of a request back on the queue, waiting for the merger: not
+# in flight, so nothing should wait for it to settle (task 5371).
+_REQUEUED_STATES = frozenset({ItemLifecycleState.QUEUED, ItemLifecycleState.LANE_BUFFERED})
+# Outcome of a coalesce train dissolved, unstarted, by an admission halt.
+_COALESCE_DISSOLVED_REASON = (
+    'Coalesce train dissolved before its verify started (restart-drain '
+    'admission halt); its members were re-driven to solo merges'
+)
 
 _REGISTRY_STATE_TO_WIRE: dict[ItemLifecycleState, str] = {
     ItemLifecycleState.QUEUED: 'queued',
@@ -10116,7 +10124,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         self-requeue, the operator-halt mid-verify abort, the dead-verify
         no-progress abort, the ``MergeVerifyLeaseContended`` defer, the
         pre-dispatch operator/admission halt in :meth:`_dispatch_item`, the
-        admission-halted train in :meth:`_defer_train_for_admission_halt`
+        admission-halted declared train in :meth:`_stand_down_train`
         (the one MERGING -> QUEUED caller, task 5371), and — task 3185,
         PRD γ, narrowed by task 3186, PRD δ — the deep-tip verify's two
         NON-ADOPTING exits in :meth:`_run_inflight_verify`: the tip-FAIL exit
@@ -13305,6 +13313,10 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # Lane buffers empty — check shutdown before blocking.
             if self._shutdown_signaled:
                 return None
+            # Checked with no await before the resume-signal clear below, so a
+            # halt_admission arriving during the awaits above is never lost.
+            if await self._dissolve_coalesce_trains_if_halted():
+                continue
 
             # Nothing pickable — start (or reuse) the persistent queue getter
             # and wait for EITHER a new arrival OR a lane resume.
@@ -13396,11 +13408,15 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         item reaching dispatch is requeued as under :meth:`operator_halt`,
         but unlike that halt no in-flight verify is aborted, no lane reads
         WIP-halted and no escalation owns it: :meth:`resume_admission` alone
-        reverses it. Idempotent.
+        reverses it. No coalesce train forms, and one that has not started is
+        dissolved rather than left for a restart to drop; the merger is woken
+        to do that. Idempotent.
         """
-        if self._admission_halt_reason is None:
-            logger.warning('Merge admission halted: %s', reason)
+        was_halted = self.is_admission_halted
         self._admission_halt_reason = reason
+        if not was_halted:
+            logger.warning('Merge admission halted: %s', reason)
+            self._signal_resume()
 
     def resume_admission(self) -> None:
         """Reverse :meth:`halt_admission` and wake the merger. Idempotent."""
@@ -15376,20 +15392,79 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 return f'recent_terminal_{rec["state"]}'
         return None
 
-    def _defer_train_for_admission_halt(self, req: GroupMergeRequest) -> None:
-        """Put a dequeued train back on the queue rather than start its verify (task 5371).
+    async def _stand_down_train(self, req: GroupMergeRequest, main_sha: str) -> None:
+        """Keep a dequeued train from starting its verify under an admission halt (task 5371).
 
         A train verifies inline in the merger, past the pick-time admission
-        gate, so this is the train's own gate: under :meth:`halt_admission`
-        no new merge verify starts anywhere. Its request stays pending and
-        it re-enters through the normal drain once admission resumes.
+        gate, so this is the train's own gate. A coalesce train is dissolved
+        (:meth:`_dissolve_coalesce_train`); a declared train is requeued, its
+        request still pending, since its tip workflow submits it again if a
+        restart drops it (the contract the 1867 re-drive hooks in
+        :meth:`_merger_loop` rely on).
         """
+        self._speculation_controller.on_abort()
+        self._drift_base.pop(req.request_id, None)
+        if req.train_id.startswith(_COALESCE_TRAIN_ID_PREFIX):
+            await self._dissolve_coalesce_train(req, main_sha)
+            return
         logger.warning(
             'Train %s: admission halted before its verify started; requeued', req.train_id,
         )
-        self._speculation_controller.on_abort()
-        self._drift_base.pop(req.request_id, None)
         self._requeue_request(req)
+
+    async def _dissolve_coalesce_trains_if_halted(self) -> bool:
+        """Under an admission halt, dissolve every coalesce train waiting in a
+        lane buffer (task 5371).
+
+        Returns whether there was one; returns False without suspending.
+        """
+        if not self.is_admission_halted:
+            return False
+        trains = [
+            req for lane in MERGE_LANES for req in self._lane_buffers[lane]
+            if isinstance(req, GroupMergeRequest)
+            and req.train_id.startswith(_COALESCE_TRAIN_ID_PREFIX)
+        ]
+        if not trains:
+            return False
+        self._assert_single_writer(self._merger_task, '_lane_buffers')
+        dissolved = {train.request_id for train in trains}
+        for lane in MERGE_LANES:
+            self._lane_buffers[lane] = collections.deque(
+                req for req in self._lane_buffers[lane] if req.request_id not in dissolved
+            )
+        main_sha = await self._git_ops.get_main_sha()
+        for train in trains:
+            await self._dissolve_coalesce_train(train, main_sha)
+        return True
+
+    async def _dissolve_coalesce_train(self, train: GroupMergeRequest, main_sha: str) -> None:
+        """Re-drive an unstarted coalesce train's members solo, then retire it (task 5371).
+
+        Nothing journals a train and its absorbed singles have already left
+        the journal, so a restart that drops an unstarted coalesce train
+        strands every member merge-deferred (task 4737 owns that in general).
+        Under an admission halt such a train can never start before the
+        restart, so it is dissolved first through the 1867 derail-recovery
+        re-drive: each still-deferred member goes done when already on main
+        and back to pending otherwise. Not a derail: no one-strike mark and
+        no derail event.
+        """
+        logger.warning(
+            'Coalesce train %s: admission halted before its verify started; '
+            'dissolving it and re-driving members %s to solo merges',
+            train.train_id, train.member_task_ids,
+        )
+        try:
+            await self._redrive_coalesce_members(train, main_sha)
+        except Exception:
+            logger.exception(
+                'Coalesce train %s: _redrive_coalesce_members raised unexpectedly '
+                '— members may remain stranded', train.train_id,
+            )
+        if not train.result.done():
+            train.result.set_result(MergeOutcome('superseded', reason=_COALESCE_DISSOLVED_REASON))
+        self._retire_item(train.request_id)
 
     async def _await_unadvanced_predecessor(self, train_id: str) -> bool:
         """Park a dequeued train until the previous merge has finalized.
@@ -15413,7 +15488,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         re-verify rather than stalling the merger forever.
         """
         pred = self._last_merged_request
-        if pred is None or pred.result.done():
+        if pred is None or not self._still_unadvanced(pred):
             return False
         timeout = float(
             getattr(pred.config, 'verify_command_timeout_secs', None)
@@ -15428,27 +15503,45 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         deadline = t_wait + timeout
         while (
             self._running
-            and not pred.result.done()
+            and self._still_unadvanced(pred)
             and not self.is_admission_halted
             and self._clock.monotonic() < deadline
         ):
             await self._clock.sleep(_TRAIN_PREDECESSOR_SETTLE_POLL_SECS)
+        self._log_park_end(train_id, pred, self._clock.monotonic() - t_wait)
+        return True
+
+    def _still_unadvanced(self, pred: MergeRequest) -> bool:
+        """Whether a train should still wait for *pred*: pending and in flight.
+
+        A predecessor requeued by a halt is pending but back in the queue,
+        behind the very train that would wait for it, so waiting would only
+        stall the merger for the full park timeout (task 5371).
+        """
+        return (
+            not pred.result.done()
+            and self._lifecycle.current(pred.request_id) not in _REQUEUED_STATES
+        )
+
+    def _log_park_end(self, train_id: str, pred: MergeRequest, waited_secs: float) -> None:
         if self.is_admission_halted:
+            logger.info('Train %s: admission halted while parked behind %s', train_id, pred.task_id)
+        elif pred.result.done():
             logger.info(
-                'Train %s: admission halted while parked behind %s', train_id, pred.task_id,
+                'Train %s: predecessor %s finalized after %.1fs — proceeding',
+                train_id, pred.task_id, waited_secs,
             )
-        elif not pred.result.done():
+        elif not self._still_unadvanced(pred):
+            logger.info(
+                'Train %s: predecessor %s went back to the queue after %.1fs — proceeding',
+                train_id, pred.task_id, waited_secs,
+            )
+        else:
             logger.warning(
                 'Train %s: predecessor %s still unfinalized after %.1fs — '
                 'proceeding anyway; the train may have to re-verify its rebased tip',
-                train_id, pred.task_id, self._clock.monotonic() - t_wait,
+                train_id, pred.task_id, waited_secs,
             )
-        else:
-            logger.info(
-                'Train %s: predecessor %s finalized after %.1fs — proceeding',
-                train_id, pred.task_id, self._clock.monotonic() - t_wait,
-            )
-        return True
 
     async def _maybe_coalesce_waiting_singles(self) -> bool:
         """Attempt to coalesce waiting single MergeRequests into one GroupMergeRequest.
@@ -15475,8 +15568,9 @@ class SpeculativeMergeWorker(_WipHaltMixin):
         Config is read from the first candidate MergeRequest's .config field
         (OrchestratorConfig), mirroring the pattern in _do_train_merge (req.config).
         """
-        # Guard: factory required to build callbacks.
-        if self._train_callback_factory is None:
+        # Guard: factory required to build callbacks; no train forms while
+        # admission is halted (task 5371), since none could start.
+        if self._train_callback_factory is None or self.is_admission_halted:
             return False
 
         # Drain any newly arrived items so the candidate list is current.
@@ -15949,7 +16043,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                             # _redrive_coalesce_members is-ancestor checks.
                             actual_main = await self._git_ops.get_main_sha()
                         if self.is_admission_halted:
-                            self._defer_train_for_admission_halt(req)
+                            await self._stand_down_train(req, actual_main)
                             continue
                         outcome = await _do_train_merge(self, req)
                         # 1867: coalesce-train derail recovery.
