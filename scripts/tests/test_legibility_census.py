@@ -1093,23 +1093,46 @@ def test_retire_entry_sets_status_retained():
 
 
 # ---------------------------------------------------------------------------
-# step-13: RED — advance_census_state() (zeta/2579 MUST-persist contract)
+# advance_census_state() -- the six-key census-state (zeta/2579 MUST-persist
+# contract for last_census_done_count; PRD census-incremental §4.2)
 # ---------------------------------------------------------------------------
 
-def test_advance_census_state_writes_all_three_fields(tmp_path):
-    path = tmp_path / "census-state.json"
+_STATE_KEYS = [
+    "last_census_at",
+    "last_census_run_id",
+    "last_census_report",
+    "last_census_as_of_sha",
+    "session_watermark",
+    "last_census_done_count",
+]
 
-    mod.advance_census_state(
-        path,
-        now_iso="2026-07-14T12:00:00+00:00",
+
+def _advance(path, **overrides):
+    kwargs: dict[str, Any] = dict(
+        census_at="2026-07-14",
+        run_id="census-dark_factory-20260714",
         report_path="plans/confusion-census-2026-07-14.md",
+        as_of_sha="a" * 40,
+        session_watermark="2026-07-14T00:00:00+00:00",
         done_count=42,
     )
+    kwargs.update(overrides)
+    mod.advance_census_state(path, **kwargs)
+
+
+def test_advance_census_state_writes_exactly_the_six_keys_in_order(tmp_path):
+    path = tmp_path / "census-state.json"
+
+    _advance(path)
 
     data = json.loads(path.read_text(encoding="utf-8"))
+    assert list(data) == _STATE_KEYS
     assert data == {
-        "last_census_at": "2026-07-14T12:00:00+00:00",
+        "last_census_at": "2026-07-14",
+        "last_census_run_id": "census-dark_factory-20260714",
         "last_census_report": "plans/confusion-census-2026-07-14.md",
+        "last_census_as_of_sha": "a" * 40,
+        "session_watermark": "2026-07-14T00:00:00+00:00",
         "last_census_done_count": 42,
     }
 
@@ -1117,9 +1140,7 @@ def test_advance_census_state_writes_all_three_fields(tmp_path):
 def test_advance_census_state_done_count_zero_is_written_as_integer_zero(tmp_path):
     path = tmp_path / "census-state.json"
 
-    mod.advance_census_state(
-        path, now_iso="2026-07-14T12:00:00+00:00", report_path="plans/x.md", done_count=0,
-    )
+    _advance(path, done_count=0)
 
     data = json.loads(path.read_text(encoding="utf-8"))
     assert "last_census_done_count" in data, "must never be dropped as falsy"
@@ -1136,14 +1157,24 @@ def test_advance_census_state_writes_none_done_count_as_json_null(tmp_path):
     present -- while being truthful about the state being unknown."""
     path = tmp_path / "census-state.json"
 
-    mod.advance_census_state(
-        path, now_iso="2026-07-31T12:00:00+00:00", report_path="plans/x.md", done_count=None,
-    )
+    _advance(path, done_count=None)
 
     data = json.loads(path.read_text(encoding="utf-8"))
     assert "last_census_done_count" in data, "MUST-persist contract: key is never dropped"
     assert data["last_census_done_count"] is None
     assert '"last_census_done_count": null' in path.read_text(encoding="utf-8")
+
+
+def test_advance_census_state_writes_none_session_watermark_as_json_null(tmp_path):
+    """A run with no mining window (an injected batch source) has no
+    watermark; the key is still written, as null."""
+    path = tmp_path / "census-state.json"
+
+    _advance(path, session_watermark=None)
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert list(data) == _STATE_KEYS
+    assert data["session_watermark"] is None
 
 
 def test_null_done_count_baseline_makes_condition_b_fail_safe(tmp_path, caplog):
@@ -1155,9 +1186,7 @@ def test_null_done_count_baseline_makes_condition_b_fail_safe(tmp_path, caplog):
     `null` baseline instead routes into the existing absent-baseline branch:
     one WARNING, `None`, no fire."""
     path = tmp_path / "census-state.json"
-    mod.advance_census_state(
-        path, now_iso="2026-07-31T12:00:00+00:00", report_path="plans/x.md", done_count=None,
-    )
+    _advance(path, census_at="2026-07-31", done_count=None)
 
     # A null baseline is UNKNOWN, not malformed -- the state file still loads.
     status, data = census_trigger.load_census_state(path)
@@ -1196,21 +1225,20 @@ def test_null_done_count_baseline_makes_condition_b_fail_safe(tmp_path, caplog):
     assert decision.fire is False
 
 
-def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path):
+@pytest.mark.parametrize("watermark", ["2026-07-14T00:00:00+00:00", None])
+def test_advance_census_state_round_trips_through_census_trigger_load(tmp_path, watermark):
     path = tmp_path / "census-state.json"
 
-    mod.advance_census_state(
-        path,
-        now_iso="2026-07-14T12:00:00+00:00",
-        report_path="plans/confusion-census-2026-07-14.md",
-        done_count=7,
-    )
+    _advance(path, done_count=7, session_watermark=watermark)
 
     status, data = census_trigger.load_census_state(path)
     assert status == "ok"
     assert data is not None  # tuple[str, dict | None]; None only for missing/malformed
-    assert data["last_census_at"] == "2026-07-14T12:00:00+00:00"
+    assert data["last_census_at"] == "2026-07-14"
+    assert data["last_census_run_id"] == "census-dark_factory-20260714"
     assert data["last_census_report"] == "plans/confusion-census-2026-07-14.md"
+    assert data["last_census_as_of_sha"] == "a" * 40
+    assert data["session_watermark"] == watermark
     assert data["last_census_done_count"] == 7
 
 
@@ -1218,9 +1246,7 @@ def test_advance_census_state_atomic_replace_no_partial_left_behind(tmp_path):
     path = tmp_path / "census-state.json"
     path.write_text(json.dumps({"stale": "data"}), encoding="utf-8")
 
-    mod.advance_census_state(
-        path, now_iso="2026-07-14T12:00:00+00:00", report_path="plans/x.md", done_count=3,
-    )
+    _advance(path, done_count=3)
 
     data = json.loads(path.read_text(encoding="utf-8"))
     assert data["last_census_done_count"] == 3
@@ -1990,6 +2016,9 @@ def _run_census_kwargs(tmp_path, **overrides) -> dict[str, Any]:
         census_state_path=tmp_path / "census-state.json",
         report_path=tmp_path / "confusion-census-2026-07-14.md",
         date="2026-07-14",
+        run_id="census-dark_factory-20260714",
+        as_of_sha="a" * 40,
+        since=None,
         force=False,
     )
     kwargs.update(overrides)
@@ -2290,6 +2319,53 @@ def test_run_census_happy_path_full_seam_wiring(tmp_path):
     assert outcome.stop_reason == "exhausted"
 
 
+def test_run_census_persists_run_identity_and_repo_relative_report(tmp_path):
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=_make_fake_invoke(_happy_invoke_response),
+        batch_source=[[_hand_digest("dup-1", "nothing new here")]],
+        verify_fn=_make_fake_verify_fn(),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        status_fetcher=_make_fake_status_fetcher(5),
+        commit=_make_fake_commit(),
+        run_id="census-dark_factory-20260714-2",
+        as_of_sha="c" * 40,
+        since="d" * 40,
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    state = json.loads(kwargs["census_state_path"].read_text(encoding="utf-8"))
+    assert state == {
+        "last_census_at": "2026-07-14",
+        "last_census_run_id": "census-dark_factory-20260714-2",
+        "last_census_report": "confusion-census-2026-07-14.md",
+        "last_census_as_of_sha": "c" * 40,
+        "session_watermark": None,
+        "last_census_done_count": 5,
+    }
+
+
+def test_run_census_rejects_a_report_path_outside_project_root_before_any_spend(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    outside = tmp_path / "elsewhere" / "confusion-census-2026-07-14.md"
+    kwargs = _run_census_kwargs(
+        root,
+        invoke=_poison("invoke"),
+        batch_source=_poison("batch_source"),
+        report_path=outside,
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        mod.run_census(**kwargs)
+
+    assert str(outside) in str(excinfo.value)
+    assert str(root) in str(excinfo.value)
+    assert not outside.parent.exists()
+
+
 # ---------------------------------------------------------------------------
 # task 5780: a census whose commit does not land (e.g. refused by the target
 # repo's pre-commit hook) rolls every written path back to HEAD, quarantines
@@ -2410,8 +2486,11 @@ def test_run_census_never_advances_census_state_when_the_commit_does_not_land(tm
     census_state_path = legibility_dir / "census-state.json"
     mod.advance_census_state(
         census_state_path,
-        now_iso="2026-06-01",
+        census_at="2026-06-01",
+        run_id="census-dark_factory-20260601",
         report_path="plans/confusion-census-2026-06-01.md",
+        as_of_sha="b" * 40,
+        session_watermark=None,
         done_count=0,
     )
     _git(repo, "add", ".")

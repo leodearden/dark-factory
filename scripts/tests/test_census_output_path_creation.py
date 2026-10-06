@@ -96,6 +96,9 @@ def _run_census_kwargs(root, **overrides) -> dict[str, Any]:
         census_state_path=root / "docs" / "legibility" / "census-state.json",
         report_path=root / "plans" / f"confusion-census-{_DATE}.md",
         date=_DATE,
+        run_id="census-target_project-20260803",
+        as_of_sha="a" * 40,
+        since=None,
         force=False,
     )
     kwargs.update(overrides)
@@ -208,13 +211,19 @@ def test_advance_census_state_creates_its_own_parent_dir(tmp_path):
 
     mod.advance_census_state(
         state_path,
-        now_iso="2026-08-03T00:00:00+00:00",
+        census_at="2026-08-03",
+        run_id="census-target_project-20260803",
         report_path="plans/confusion-census-2026-08-03.md",
+        as_of_sha="a" * 40,
+        session_watermark=None,
         done_count=7,
     )
 
     assert json.loads(state_path.read_text(encoding="utf-8")) == {
-        "last_census_at": "2026-08-03T00:00:00+00:00",
+        "last_census_at": "2026-08-03",
+        "last_census_run_id": "census-target_project-20260803",
         "last_census_report": "plans/confusion-census-2026-08-03.md",
+        "last_census_as_of_sha": "a" * 40,
+        "session_watermark": None,
         "last_census_done_count": 7,
     }
