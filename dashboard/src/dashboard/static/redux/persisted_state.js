@@ -77,13 +77,60 @@ function writePersisted(key, value, defaultValue, storage = persistedStateStorag
   return { action: isDefault ? 'removed' : 'written', error: null };
 }
 
+// The families that grew one key per rendered entity: ChipList's deps and
+// locks chips (tabs.jsx, tab_curator.jsx) and tab_memory_evals.jsx's
+// provenance toggles. Every one holds a boolean open/expanded flag.
+const PERSISTED_ENTITY_KEY_PREFIXES = Object.freeze([
+  'df.deps.',
+  'df.locks.',
+  'df.curator.files.',
+  'df.memevals.prov.',
+]);
+
+// Removes every key under `prefixes` whose value reads falsy or undecodable,
+// and returns how many went. readPersisted decides, so a legacy '1'/'0' reads
+// as the number it encodes. Keys are collected before any is removed, because
+// a removal reindexes storage.key(i); each removal is guarded on its own, so
+// one failure does not end the sweep.
+function prunePersistedBooleans(prefixes, storage = persistedStateStorage()) {
+  if (!storage) return 0;
+  const stale = [];
+  for (let i = 0; i < storage.length; i += 1) {
+    const key = storage.key(i);
+    if (!key || !prefixes.some(prefix => key.startsWith(prefix))) continue;
+    if (!readPersisted(key, false, storage)) stale.push(key);
+  }
+  let removed = 0;
+  for (const key of stale) {
+    try {
+      storage.removeItem(key);
+      removed += 1;
+    } catch (error) {
+      console.warn(`DF_PERSISTED_STATE: could not remove '${key}'`, error);
+    }
+  }
+  return removed;
+}
+
 // Module-unique export const, never a bare `API` — the CANONICAL note in
 // datum.js's header, enforced at runtime by classic_script_scope.test.mjs.
-const PERSISTED_STATE_API = { readPersisted, writePersisted };
+const PERSISTED_STATE_API = {
+  readPersisted,
+  writePersisted,
+  prunePersistedBooleans,
+  PERSISTED_ENTITY_KEY_PREFIXES,
+};
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = PERSISTED_STATE_API;
 }
 if (typeof window !== 'undefined') {
   window.DF_PERSISTED_STATE = PERSISTED_STATE_API;
+}
+
+// Clears the keys the old mount-time writes already left in operators'
+// browsers. New growth is prevented by writePersisted, not by this sweep. The
+// `document` guard keeps it inert under node, as data.js's polling start is.
+if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+  prunePersistedBooleans(PERSISTED_ENTITY_KEY_PREFIXES);
 }
