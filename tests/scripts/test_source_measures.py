@@ -7,6 +7,7 @@ anti-vacuity anchors, not definitions.
 """
 from __future__ import annotations
 
+import ast
 import dataclasses
 import os
 import subprocess
@@ -445,6 +446,67 @@ class TestMaintainabilityIndex:
 
 
 # ---------------------------------------------------------------------------
+# Patch calls: every patch-shaped call, in either form a target is named in.
+
+
+def _patch_calls(source: str) -> tuple[source_measures.PatchCall, ...]:
+    return source_measures.patch_calls_in_tree(ast.parse(source))
+
+
+def _shape(call: source_measures.PatchCall) -> tuple[str | None, str | None, str | None]:
+    receiver = None if call.receiver is None else ast.unparse(call.receiver)
+    return call.target, receiver, call.attribute
+
+
+class TestPatchCalls:
+    @pytest.mark.parametrize(
+        'source',
+        ["patch('a.b._c')", "mock.patch('a.b._c')", "monkeypatch.setattr('a.b._c', v)"],
+    )
+    def test_a_string_path_target_is_the_first_argument(self, source: str) -> None:
+        assert [_shape(call) for call in _patch_calls(source)] == [('a.b._c', None, None)]
+
+    @pytest.mark.parametrize(
+        ('source', 'receiver', 'attribute'),
+        [
+            ("patch.object(mod, '_x')", 'mod', '_x'),
+            ("mock.patch.object(Cls, '_y')", 'Cls', '_y'),
+            ("monkeypatch.setattr(worker, '_z', v)", 'worker', '_z'),
+        ],
+    )
+    def test_an_object_path_sets_the_receiver_and_attribute(
+        self, source: str, receiver: str, attribute: str
+    ) -> None:
+        assert [_shape(call) for call in _patch_calls(source)] == [(None, receiver, attribute)]
+
+    def test_a_decorator_patch_is_found_from_the_function_node(self) -> None:
+        function = ast.parse("@patch('a._b')\ndef test_it():\n    pass\n").body[0]
+        assert [_shape(call) for call in source_measures.patch_calls_in_tree(function)] == [
+            ('a._b', None, None)
+        ]
+
+    @pytest.mark.parametrize(
+        'source',
+        [
+            "setattr(obj, '_x', v)",
+            "patch.dict(os.environ, {'A': '1'})",
+            'patch()',
+            'patch.object(mod, name_var)',
+        ],
+    )
+    def test_a_call_that_is_not_patch_shaped_is_not_found(self, source: str) -> None:
+        assert _patch_calls(source) == ()
+
+    def test_order_follows_the_walk_and_duplicates_are_kept(self) -> None:
+        calls = _patch_calls("patch('a._one')\npatch('a._one')\npatch.object(mod, '_two')\n")
+        assert [_shape(call) for call in calls] == [
+            ('a._one', None, None),
+            ('a._one', None, None),
+            (None, 'mod', '_two'),
+        ]
+
+
+# ---------------------------------------------------------------------------
 # Patch targets: (module, leaf) pairs patched through a module in a given set.
 
 MODULES = ('pkg.mod', 'pkg.lane')
@@ -699,6 +761,17 @@ class TestTheTreeAndSourceFormsAgree:
 
 # ---------------------------------------------------------------------------
 # The tracked-file listing: no listing means no measurement, never an empty one.
+
+
+class TestTrackedFiles:
+    def test_only_tracked_files_matching_the_pathspecs_are_listed(
+        self, tmp_path: Path
+    ) -> None:
+        root = _indexed_repo(
+            tmp_path / 'repo', {'a.py': '\n', 'sub/b.rs': '\n', 'sub/c.py': '\n', 'z.rs': '\n'}
+        )
+        (root / 'sub' / 'untracked.rs').write_text('\n', encoding='utf-8')
+        assert source_measures.tracked_files(root, '*.rs') == ('sub/b.rs', 'z.rs')
 
 
 class TestTrackedPythonFilesFailsHard:
