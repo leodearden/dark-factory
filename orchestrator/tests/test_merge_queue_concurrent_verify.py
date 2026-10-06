@@ -29,6 +29,7 @@ import asyncio
 import collections
 import contextlib
 import dataclasses
+import inspect
 import logging
 import math
 import traceback
@@ -63,6 +64,7 @@ from _orch_helpers import (
 
 from orchestrator.config import GitConfig, OrchestratorConfig, VerifyRunnerConfig
 from orchestrator.git_ops import GitOps, MergeResult, _run
+from orchestrator.merge_lane.worker import MERGE_WORKER_SHUTDOWN_REASON
 from orchestrator.merge_queue import (
     MergeOutcome,
     MergeRequest,
@@ -5629,6 +5631,289 @@ class TestVerifyTeardownHelper:
         verify_task.cancel()
         with contextlib.suppress(BaseException):
             await verify_task
+
+
+# ---------------------------------------------------------------------------
+# task 4164: stop()'s shutdown-drain teardowns must pass shutdown_defensive=True
+# ---------------------------------------------------------------------------
+
+_MQ_SHUTDOWN_DRAIN_METHODS: tuple[str, ...] = ('stop',)
+_MQ_SHUTDOWN_DEFENSIVE_KWARG = 'shutdown_defensive'
+_MQ_SHUTDOWN_DRAIN_SITE_FLOOR = 2
+
+
+def _shutdown_drain_teardown_calls(tree: ast.Module) -> list[tuple[str, ast.Call]]:
+    """Every ``<x>._teardown_verify_task(...)`` call lexically inside one of
+    the ``_MQ_SHUTDOWN_DRAIN_METHODS`` defined directly on
+    ``SpeculativeMergeWorker``, paired with that method's name, in source order.
+    """
+    teardown_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == _MQ_TEARDOWN_CHOKEPOINT
+    ]
+    drain_calls = [
+        (method, call)
+        for method in _MQ_SHUTDOWN_DRAIN_METHODS
+        for start, end in _chokepoint_ranges(tree, _MQ_CHOKEPOINT_CLASS, method)
+        for call in teardown_calls
+        if start <= call.lineno <= end
+    ]
+    return sorted(drain_calls, key=lambda pair: pair[1].lineno)
+
+
+def _passes_literal_shutdown_defensive(call: ast.Call) -> bool:
+    """True only for a literal ``shutdown_defensive=True`` keyword — the one
+    spelling whose value is provable from source text alone.
+    """
+    return any(
+        kw.arg == _MQ_SHUTDOWN_DEFENSIVE_KWARG
+        and isinstance(kw.value, ast.Constant)
+        and kw.value.value is True
+        for kw in call.keywords
+    )
+
+
+def _undefended_shutdown_teardown_offenders(source: str) -> list[str]:
+    """Every shutdown-drain teardown call that does not pass a literal
+    ``shutdown_defensive=True``, as ``'<method>:<lineno> <call_src>'``.
+
+    Pure (takes source text, not a path) like
+    :func:`_teardown_chokepoint_offenders`, so the self-tests can drive it on
+    synthetic modules; returns ``[]`` rather than raising on unparseable source.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    return [
+        f'{method}:{call.lineno} {ast.unparse(call)}'
+        for method, call in _shutdown_drain_teardown_calls(tree)
+        if not _passes_literal_shutdown_defensive(call)
+    ]
+
+
+class TestShutdownDrainTeardownIsDefensive:
+    """Every ``_teardown_verify_task`` call inside ``SpeculativeMergeWorker.stop``
+    passes ``shutdown_defensive=True`` (task 4164). Without it a SIGTERM-driven
+    CancelledError escaping ``_abort_remote_verify`` aborts the drain loop and
+    leaves the remaining ``_inflight`` entries un-drained — the task-1757
+    orphaned-remote-verify class. The helper's two arms are pinned separately
+    by :class:`TestVerifyTeardownHelper`, and the drain behaviour end to end by
+    :class:`TestStopDrainSurvivesARaisingRemoteAbort`; this scan is the cheap
+    signal that names the offending site. Sync-only for the same reason as
+    :class:`TestVerifyTeardownChokepoint`.
+    """
+
+    # ── scanner self-tests: the ratchet must never pass vacuously ──────────
+
+    def test_scanner_accepts_drain_sites_that_pass_the_flag(self) -> None:
+        """POSITIVE control: both drain sites pass the flag -> no offenders,
+        and both calls were actually seen.
+        """
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def stop(self):\n'
+            '        if self.head is not None:\n'
+            '            await self._teardown_verify_task(a, b, c, shutdown_defensive=True)\n'
+            '        for entry in self.inflight:\n'
+            '            await self._teardown_verify_task(a, b, c, shutdown_defensive=True)\n'
+        )
+        assert _undefended_shutdown_teardown_offenders(src) == []
+        assert len(_shutdown_drain_teardown_calls(ast.parse(src))) == 2
+
+    def test_scanner_flags_a_drain_site_that_omits_the_flag(self) -> None:
+        """SYNTHETIC BYPASS: the flagless second call (line 6) is the one flagged."""
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def stop(self):\n'
+            '        if self.head is not None:\n'
+            '            await self._teardown_verify_task(a, b, c, shutdown_defensive=True)\n'
+            '        for entry in self.inflight:\n'
+            '            await self._teardown_verify_task(a, b, c)\n'
+        )
+        offenders = _undefended_shutdown_teardown_offenders(src)
+        assert len(offenders) == 1, offenders
+        assert offenders[0].startswith('stop:6 '), offenders
+
+    def test_scanner_flags_anything_but_a_literal_true(self) -> None:
+        """LITERAL-ONLY: ``False``, a variable, or a ``**kwargs`` splat cannot be
+        proven True from source text, so each is an offender.
+        """
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def stop(self, defensive, kwargs):\n'
+            '        await self._teardown_verify_task(a, b, c, shutdown_defensive=False)\n'
+            '        await self._teardown_verify_task(a, b, c, shutdown_defensive=defensive)\n'
+            '        await self._teardown_verify_task(a, b, c, **kwargs)\n'
+        )
+        offenders = _undefended_shutdown_teardown_offenders(src)
+        assert len(offenders) == 3, offenders
+
+    def test_scanner_sees_a_teardown_nested_in_a_wrapper_call(self) -> None:
+        """NESTING: a teardown wrapped in shield/wait_for is still a drain site."""
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def stop(self):\n'
+            '        await asyncio.wait_for('
+            'asyncio.shield(self._teardown_verify_task(a, b, c)), timeout=1)\n'
+        )
+        offenders = _undefended_shutdown_teardown_offenders(src)
+        assert len(offenders) == 1, offenders
+
+    def test_scanner_ignores_teardown_calls_outside_the_drain_path(self) -> None:
+        """SCOPE: the cascade and abort triggers deliberately propagate by
+        default (see ``test_default_lets_a_raising_abort_propagate``).
+        """
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def _verifier_loop(self):\n'
+            '        await self._teardown_verify_task(a, b, c)\n'
+            '\n'
+            '    async def _run_inflight_verify(self):\n'
+            '        await self._teardown_verify_task(a, b, c)\n'
+        )
+        assert _undefended_shutdown_teardown_offenders(src) == []
+
+    def test_scanner_ignores_a_stop_on_another_class(self) -> None:
+        """CLASS-QUALIFICATION: only ``SpeculativeMergeWorker.stop`` is scanned."""
+        src = (
+            'class SomethingElse:\n'
+            '    async def stop(self):\n'
+            '        await self._teardown_verify_task(a, b, c)\n'
+        )
+        assert _undefended_shutdown_teardown_offenders(src) == []
+        assert _shutdown_drain_teardown_calls(ast.parse(src)) == []
+
+    def test_scanner_returns_empty_on_unparseable_source(self) -> None:
+        """SYNTAX ERROR: return [] rather than raising."""
+        assert _undefended_shutdown_teardown_offenders('async def broken(:\n') == []
+
+    # ── the ratchet ────────────────────────────────────────────────────────
+
+    def test_stop_drain_teardowns_all_pass_shutdown_defensive(self) -> None:
+        """STRUCTURAL: deleting the flag at either stop() drain site must fail
+        here, not pass silently.
+        """
+        source_file = inspect.getsourcefile(SpeculativeMergeWorker)
+        assert source_file is not None
+        src = Path(source_file).read_text()
+
+        drain_calls = _shutdown_drain_teardown_calls(ast.parse(src))
+        assert len(drain_calls) >= _MQ_SHUTDOWN_DRAIN_SITE_FLOOR, (
+            f'expected at least {_MQ_SHUTDOWN_DRAIN_SITE_FLOOR} '
+            f'`{_MQ_TEARDOWN_CHOKEPOINT}` calls inside {_MQ_SHUTDOWN_DRAIN_METHODS!r} '
+            f'on `{_MQ_CHOKEPOINT_CLASS}`, found {len(drain_calls)}. If a drain '
+            'site moved out of stop(), add its method to '
+            '`_MQ_SHUTDOWN_DRAIN_METHODS`, or this ratchet goes vacuous.'
+        )
+
+        offenders = _undefended_shutdown_teardown_offenders(src)
+        assert offenders == [], (
+            f'every `{_MQ_TEARDOWN_CHOKEPOINT}` call on the shutdown drain path '
+            f'must pass `{_MQ_SHUTDOWN_DEFENSIVE_KWARG}=True`: otherwise a '
+            'SIGTERM-driven CancelledError escaping the remote abort aborts the '
+            'drain loop and leaves the remaining in-flight verifies un-drained, '
+            'orphaning their remote verify-merge processes (task 1757). Pass '
+            f'`{_MQ_SHUTDOWN_DEFENSIVE_KWARG}=True` literally. '
+            f'Offenders: {offenders!r}'
+        )
+
+
+def _remote_whose_abort_raises(
+    name: str, *, entered: asyncio.Event, reaped: asyncio.Event,
+) -> MagicMock:
+    """A fake remote whose verify hangs until cancelled and whose
+    ``cancel_verify`` raises ``CancelledError``, as when a SIGTERM lands
+    mid-shutdown. *entered* is set when its verify starts, *reaped* when that
+    verify exits by any route.
+    """
+
+    async def _verify_until_cancelled(*args: Any, **kwargs: Any) -> VerifyResult:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+            return _mock_verify_result(True)
+        finally:
+            reaped.set()
+
+    runner = _make_fake_remote(name)
+    runner.run_merge_verify = AsyncMock(side_effect=_verify_until_cancelled)
+    runner.cancel_verify = AsyncMock(side_effect=asyncio.CancelledError)
+    return runner
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)
+class TestStopDrainSurvivesARaisingRemoteAbort:
+    """BEHAVIOUR behind :class:`TestShutdownDrainTeardownIsDefensive` (task
+    4164 amend): when every remote abort raises ``CancelledError``, stop()
+    still drains EVERY in-flight verify. Driven through the worker's public
+    surface: two remote hosts under ``prefer_remote`` put both in-flight
+    entries on remote leases, so both stop() drain sites, the finalizing head
+    and then the ``_inflight`` loop, meet a raising abort.
+    """
+
+    async def test_stop_drains_every_inflight_verify_when_remote_aborts_raise(
+        self,
+        git_ops: GitOps,
+        git_repo: Path,
+        git_config: GitConfig,
+    ) -> None:
+        entered_a, reaped_a = asyncio.Event(), asyncio.Event()
+        entered_b, reaped_b = asyncio.Event(), asyncio.Event()
+        remote_a = _remote_whose_abort_raises('remote-a', entered=entered_a, reaped=reaped_a)
+        remote_b = _remote_whose_abort_raises('remote-b', entered=entered_b, reaped=reaped_b)
+
+        class _AlsoManagesRemoteB(HostAllocator):
+            def __init__(self, remote_runners: list, *, quarantine: set[str] | None = None) -> None:
+                super().__init__([*remote_runners, remote_b], quarantine=quarantine)
+
+        config = lane_scene_config(git_repo, git_config, verify_host_policy='prefer_remote')
+        wt_a = await _make_branch_with_file(git_ops, 'task/drain-a', 'drain_a.py', 'a = 1\n')
+        wt_b = await _make_branch_with_file(git_ops, 'task/drain-b', 'drain_b.py', 'b = 2\n')
+        req_a = _make_request('drain-a', 'task/drain-a', wt_a, config)
+        req_b = _make_request('drain-b', 'task/drain-b', wt_b, config)
+
+        q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        worker = SpeculativeMergeWorker(git_ops, q)
+        _inject_two_host_allocator(worker, remote_a, allocator_cls=_AlsoManagesRemoteB)
+        worker_task = asyncio.create_task(worker.run())
+
+        try:
+            await q.put(req_a)
+            await q.put(req_b)
+            await wait_responsive(
+                entered_a.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='drain-a: remote verify entered',
+            )
+            await wait_responsive(
+                entered_b.wait(),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT,
+                label='drain-b: remote verify entered',
+            )
+        finally:
+            await _stop_worker(worker, worker_task)
+
+        remote_a.cancel_verify.assert_awaited()
+        remote_b.cancel_verify.assert_awaited()
+        shutdown = MergeOutcome('blocked', reason=MERGE_WORKER_SHUTDOWN_REASON)
+        outcomes = {
+            req.task_id: req.result.result() if req.result.done() else 'PENDING'
+            for req in (req_a, req_b)
+        }
+        assert outcomes == {'drain-a': shutdown, 'drain-b': shutdown}, (
+            f'stop() must resolve every in-flight request with the shutdown '
+            f'outcome even when the remote abort raises; got {outcomes!r}'
+        )
+        assert reaped_a.is_set() and reaped_b.is_set(), (
+            f'stop() must cancel every in-flight remote verify even when the '
+            f'remote abort raises; reaped: a={reaped_a.is_set()}, '
+            f'b={reaped_b.is_set()}'
+        )
 
 
 # ---------------------------------------------------------------------------
