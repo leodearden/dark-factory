@@ -89,6 +89,7 @@ async def probe_retrieval_utility(
     require_scratch_name(spec.scratch_group_id, checkpoint=GuardCheckpoint.REPLAY)
     ok = [outcome for outcome in outcomes if outcome.ok]
     content_by_id = _content_for(ok, {item.episode_id: item for item in items})
+    target_by_id = _replay_uuids_for(ok)
     ranks: list[Rank] = []
     for outcome in ok:
         results = await graph.search(
@@ -96,7 +97,7 @@ async def probe_retrieval_utility(
             group_ids=[spec.scratch_group_id],
             num_results=k,
         )
-        ranks.append(known_item_rank(results, provenance_matcher(str(outcome.replay_episode_uuid))))
+        ranks.append(known_item_rank(results, provenance_matcher(target_by_id[outcome.episode_id])))
     return tuple(ranks)
 
 
@@ -107,3 +108,12 @@ def _content_for(
     if missing:
         raise ValueError(f'ok outcomes without a replay item to query by: {missing}')
     return {o.episode_id: items_by_id[o.episode_id].content for o in outcomes}
+
+
+def _replay_uuids_for(outcomes: Sequence[EpisodeOutcome]) -> dict[str, str]:
+    """Each ok outcome's replayed episode uuid, the known item its search must find."""
+    uuids = {o.episode_id: o.replay_episode_uuid for o in outcomes}
+    missing = sorted(episode_id for episode_id, uuid in uuids.items() if uuid is None)
+    if missing:
+        raise ValueError(f'ok outcomes without a replay_episode_uuid to match: {missing}')
+    return {episode_id: uuid for episode_id, uuid in uuids.items() if uuid is not None}

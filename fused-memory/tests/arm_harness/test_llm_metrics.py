@@ -9,7 +9,6 @@ from arm_harness._fakes import (
     CODE_SHA,
     CORPUS_SHA,
     PREREG_SHA,
-    embedding_spec,
     incumbent_control_spec,
     llm_spec,
 )
@@ -418,17 +417,5 @@ def test_the_composer_surfaces_a_token_accounting_failure():
     with pytest.raises(TokenAccountingError):
         llm_axis_records(
             llm_spec(), result, CONFORMANCE, reference=None, retrieval_ranks=None,
-            measured_at=MEASURED_AT,
-        )
-
-
-def test_an_embedding_spec_is_refused():
-    with pytest.raises(TypeError, match='embedding'):
-        llm_axis_records(
-            embedding_spec(),
-            _complete_result(),
-            CONFORMANCE,
-            reference=None,
-            retrieval_ranks=None,
             measured_at=MEASURED_AT,
         )

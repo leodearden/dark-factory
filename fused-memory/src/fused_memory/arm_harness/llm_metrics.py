@@ -12,7 +12,7 @@ from types import MappingProxyType
 
 from shared.memory_eval_metrics import Metric
 
-from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec, TokenPricing
+from fused_memory.arm_harness.arm_spec import LlmArmSpec, TokenPricing
 from fused_memory.arm_harness.conformance import ConformanceCounts, conformance_rate_metric
 from fused_memory.arm_harness.frozen_model import FrozenModel
 from fused_memory.arm_harness.metrics_record import LlmMetricId, MetricsRecord, record_for
@@ -196,7 +196,7 @@ def graph_sameness_metric(
 
 
 def llm_axis_records(
-    spec: LlmArmSpec | EmbeddingArmSpec,
+    spec: LlmArmSpec,
     result: ArmRunResult,
     conformance: ConformanceCounts,
     *,
@@ -204,10 +204,6 @@ def llm_axis_records(
     retrieval_ranks: Sequence[Rank] | None,
     measured_at: datetime,
 ) -> tuple[MetricsRecord, ...]:
-    if not isinstance(spec, LlmArmSpec):
-        raise TypeError(
-            f'arm {spec.arm_id!r} is a {spec.axis} arm; LLM-axis metrics need an LlmArmSpec'
-        )
     metrics = (
         episode_failure_rate_metric(result),
         conformance_rate_metric(conformance),

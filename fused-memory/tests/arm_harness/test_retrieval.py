@@ -174,3 +174,14 @@ async def test_probe_refuses_an_outcome_without_its_replay_item():
         await probe_retrieval_utility(graph, llm_spec(), [_outcome('ep-9')], items=[_item('ep-0')])
 
     assert graph.search_calls == []
+
+
+@pytest.mark.asyncio
+async def test_probe_refuses_an_ok_outcome_without_a_replay_uuid_rather_than_matching_none():
+    graph = FakeArmGraph(search_results=lambda query: [_edge('None')])
+    no_uuid = _outcome('ep-0').model_copy(update={'replay_episode_uuid': None})
+
+    with pytest.raises(ValueError, match='replay_episode_uuid.*ep-0'):
+        await probe_retrieval_utility(graph, llm_spec(), [no_uuid], items=[_item('ep-0')])
+
+    assert graph.search_calls == []
