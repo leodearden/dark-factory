@@ -9,11 +9,11 @@ the count-snapshot class.
 
 Why this class needs a one-shot sweep at all
 --------------------------------------------
-``_emit_override_audit`` (server/tools.py) writes every
+``_emit_override_audit`` (server/tools.py) wrote every
 ``set_task_priority_override`` / ``reorder_pin_queue`` call to Graphiti via
-``add_memory(category='decisions_and_rationale')``.  That category is in
-``GRAPHITI_PRIMARY``, so each audit line is LLM-extracted into per-task fact
-edges.  The extraction is non-deterministic in three separate ways:
+``add_memory(category='decisions_and_rationale')``.  That category was in
+``GRAPHITI_PRIMARY``, so each audit line was LLM-extracted into per-task fact
+edges.  The extraction was non-deterministic in three separate ways:
 
   * **phrasing** — roughly a fifth of pin-order facts omit the literal
     ``priority override`` phrase, which is the gate
@@ -25,9 +25,11 @@ edges.  The extraction is non-deterministic in three separate ways:
     "Task X is reordered with task Y" edges plus 23 "Task X is pinned before
     task Y" edges, and zero per-task pin_order assertions.
 
-The result is an edge population the periodic sweep structurally cannot drain.
-This script drains it once.  Preventing recurrence is the code-side half of
-the gate ruling and is NOT this script's job.
+The result was an edge population the periodic sweep structurally cannot drain.
+This script drains it once.  Preventing recurrence was the code-side half of the
+gate ruling and landed as task 3853, which deleted the audit write, so this
+script only drains legacy edges written before it.  (The dark_factory and reify
+graphs were both already drained and re-scan to 0 targets.)
 
 Selection (recomputed live on every run — no hard-coded uuids)
 --------------------------------------------------------------
@@ -81,7 +83,7 @@ from fused_memory.utils.store_mutation_preflight import (
 
 logger = logging.getLogger('cleanup_pin_queue_edges')
 
-# Audit-episode prefixes emitted by server/tools.py::_emit_override_audit.
+# Audit-episode prefixes the pre-task-3853 override audit wrote (helper since deleted).
 _AUDIT_PREFIXES = (
     'Set priority override',
     'Reordered pin queue',
