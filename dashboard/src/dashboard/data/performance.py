@@ -786,7 +786,7 @@ async def _hour_bucketed_history(
     # strftime appears only in the SELECT/ORDER BY, not the WHERE clause, so
     # it does not defeat the index either.
     rows = await db.execute_fetchall(
-        """
+        f"""
         SELECT strftime('%Y-%m-%dT%H:00', completed_at) AS bucket,
                duration_ms,
                outcome,
@@ -797,6 +797,7 @@ async def _hour_bucketed_history(
            AND completed_at >= ?
            AND completed_at IS NOT NULL
            AND completed_at != ''
+           AND {_NOT_A_CANCEL}
          ORDER BY bucket
         """,
         (project_id, _cutoff(days, now=now)),
@@ -959,7 +960,7 @@ async def aggregate_performance_history(
         try:
             rows = await db.execute_fetchall(
                 'SELECT DISTINCT project_id FROM task_results '
-                'WHERE completed_at >= ?',
+                f'WHERE completed_at >= ? AND {_NOT_A_CANCEL}',
                 (since,),
             )
             pid_sets.append({r[0] for r in rows if r[0]})
