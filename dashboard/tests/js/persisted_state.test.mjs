@@ -17,25 +17,37 @@ import { createRequire } from 'node:module';
 const SPECIFIER = '../../src/dashboard/static/redux/persisted_state.js';
 
 // Requires the module fresh against `win` as the browser global. No `document`
-// is installed: that is the node path, on which nothing runs at load.
-function loadPersistedState(win = {}) {
+// is installed unless asked for: without one is the node path, on which
+// nothing runs at load. One asked for is removed again once the module loads.
+function loadPersistedState(win = {}, { withDocument = false } = {}) {
   globalThis.window = win;
-  const require = createRequire(import.meta.url);
-  delete require.cache[require.resolve(SPECIFIER)];
-  return { api: require(SPECIFIER), window: win };
+  if (withDocument) globalThis.document = {};
+  try {
+    const require = createRequire(import.meta.url);
+    delete require.cache[require.resolve(SPECIFIER)];
+    return { api: require(SPECIFIER), window: win };
+  } finally {
+    delete globalThis.document;
+  }
 }
 
 const { api: persistedApi, window: loadedWindow } = loadPersistedState();
-const { readPersisted, writePersisted } = persistedApi;
+const {
+  readPersisted,
+  writePersisted,
+  prunePersistedBooleans,
+  PERSISTED_ENTITY_KEY_PREFIXES,
+} = persistedApi;
 
 // A Storage double holding string values, recording every call by method name.
-// `failOn` names methods that throw `failure` instead of acting.
-function fakeStorage(entries = {}, { failOn = [], failure = quotaError() } = {}) {
+// A call for which `failWhen(method, ...args)` is true throws `failure` instead
+// of acting.
+function fakeStorage(entries = {}, { failWhen = () => false, failure = quotaError() } = {}) {
   const items = new Map(Object.entries(entries));
   const calls = [];
   const act = (method, fn) => (...args) => {
     calls.push([method, ...args]);
-    if (failOn.includes(method)) throw failure;
+    if (failWhen(method, ...args)) throw failure;
     return fn(...args);
   };
   return {
@@ -74,9 +86,13 @@ const NOT_WRITTEN = Object.freeze({ error: null });
 // ── The module ──────────────────────────────────────────────────────────────
 
 test('exports: the module publishes exactly its API, on module.exports and window.DF_PERSISTED_STATE', () => {
-  assert.deepEqual(Object.keys(persistedApi), ['readPersisted', 'writePersisted']);
+  assert.deepEqual(
+    Object.keys(persistedApi).sort(),
+    ['PERSISTED_ENTITY_KEY_PREFIXES', 'prunePersistedBooleans', 'readPersisted', 'writePersisted'],
+  );
   assert.equal(typeof readPersisted, 'function');
   assert.equal(typeof writePersisted, 'function');
+  assert.equal(typeof prunePersistedBooleans, 'function');
   // The browser half of the dual export: four .jsx files destructure this
   // global at module scope with no fallback.
   assert.equal(loadedWindow.DF_PERSISTED_STATE, persistedApi);
@@ -101,7 +117,10 @@ test('readPersisted: unparseable JSON returns the default', () => {
 });
 
 test('readPersisted: a throwing getItem returns the default and does not throw', () => {
-  const storage = fakeStorage({ k: 'true' }, { failOn: ['getItem'], failure: new Error('SecurityError') });
+  const storage = fakeStorage({ k: 'true' }, {
+    failWhen: method => method === 'getItem',
+    failure: new Error('SecurityError'),
+  });
   assert.equal(readPersisted('k', false, storage), false);
 });
 
@@ -162,7 +181,7 @@ test('writePersisted: a value differing from its default is written as JSON', ()
 for (const [method, value] of [['setItem', true], ['removeItem', false]]) {
   test(`writePersisted: a ${method} quota failure is returned as failed and warned with its key, never swallowed`, () => {
     const failure = quotaError();
-    const storage = fakeStorage({ 'df.deps.101': 'true' }, { failOn: [method], failure });
+    const storage = fakeStorage({ 'df.deps.101': 'true' }, { failWhen: called => called === method, failure });
     let result;
     const warned = capturingWarn(() => {
       result = writePersisted('df.deps.101', value, false, storage);
@@ -198,4 +217,87 @@ test('omitted storage: a localStorage getter that throws (storage disabled) read
   };
   assert.equal(readPersisted('k', 7), 7);
   assert.equal(writePersisted('k', 1, 0).action, 'unavailable');
+});
+
+// ── The legacy sweep ────────────────────────────────────────────────────────
+//
+// Keys the mount-time writes already left in operators' browsers. writePersisted
+// stops new growth; this clears what accumulated.
+
+test('PERSISTED_ENTITY_KEY_PREFIXES: the four families measured to grow one key per rendered entity', () => {
+  assert.deepEqual(
+    [...PERSISTED_ENTITY_KEY_PREFIXES],
+    ['df.deps.', 'df.locks.', 'df.curator.files.', 'df.memevals.prov.'],
+  );
+});
+
+// Every per-entity family in its legacy encoding, a truthy survivor, and keys
+// outside the families. 'df.memevals.prov.' was written as '1'/'0' by
+// tab_memory_evals.jsx::writeProvOpen; the others as JSON booleans.
+function legacyStore(extra = {}, options = {}) {
+  return fakeStorage({
+    'df.deps.101': 'false',
+    'df.locks.102': 'false',
+    'df.curator.files.tkt_x': 'false',
+    'df.memevals.prov.e1': '0',
+    'df.deps.103': 'true',
+    'df.open.orch': '{"1":true}',
+    'some.other.key': 'false',
+    ...extra,
+  }, options);
+}
+
+const LEGACY_SURVIVORS = ['df.deps.103', 'df.open.orch', 'some.other.key'];
+
+test('prunePersistedBooleans: removes exactly the falsy per-entity keys and returns how many', () => {
+  const storage = legacyStore();
+  assert.equal(prunePersistedBooleans(PERSISTED_ENTITY_KEY_PREFIXES, storage), 4);
+  assert.deepEqual([...storage.items.keys()].sort(), LEGACY_SURVIVORS);
+});
+
+test('prunePersistedBooleans: a legacy truthy encoding survives', () => {
+  const storage = legacyStore({ 'df.memevals.prov.e2': '1' });
+  prunePersistedBooleans(PERSISTED_ENTITY_KEY_PREFIXES, storage);
+  assert.equal(storage.getItem('df.memevals.prov.e2'), '1');
+});
+
+test('prunePersistedBooleans: a key under a listed prefix holding undecodable garbage is removed too', () => {
+  const storage = legacyStore({ 'df.locks.9': '{garbage' });
+  assert.equal(prunePersistedBooleans(PERSISTED_ENTITY_KEY_PREFIXES, storage), 5);
+  assert.equal(storage.getItem('df.locks.9'), null);
+});
+
+test('prunePersistedBooleans: a removeItem that throws does not abort the sweep', () => {
+  const storage = legacyStore({}, { failWhen: (method, key) => method === 'removeItem' && key === 'df.deps.101' });
+  let removed;
+  capturingWarn(() => {
+    removed = prunePersistedBooleans(PERSISTED_ENTITY_KEY_PREFIXES, storage);
+  });
+  assert.equal(removed, 3, 'the three removals that succeeded are counted; the one that threw is not');
+  assert.deepEqual([...storage.items.keys()].sort(), ['df.deps.101', ...LEGACY_SURVIVORS].sort());
+});
+
+test('prunePersistedBooleans: a null storage removes nothing', () => {
+  assert.equal(prunePersistedBooleans(PERSISTED_ENTITY_KEY_PREFIXES, null), 0);
+});
+
+test('load: in a browser-like document the module sweeps window.localStorage once', () => {
+  const storage = legacyStore();
+  loadPersistedState({ localStorage: storage }, { withDocument: true });
+  assert.deepEqual([...storage.items.keys()].sort(), LEGACY_SURVIVORS);
+});
+
+test('load: with no document (the node path data.js also guards on) the module sweeps nothing', () => {
+  const storage = legacyStore();
+  loadPersistedState({ localStorage: storage });
+  assert.equal(storage.items.size, LEGACY_SURVIVORS.length + 4);
+  assert.deepEqual(storage.calls, []);
+});
+
+test('load: a throwing localStorage getter neither throws nor withholds window.DF_PERSISTED_STATE', () => {
+  const win = {
+    get localStorage() { throw new Error('SecurityError: access is denied for this document'); },
+  };
+  const { api, window: loaded } = loadPersistedState(win, { withDocument: true });
+  assert.equal(loaded.DF_PERSISTED_STATE, api);
 });
