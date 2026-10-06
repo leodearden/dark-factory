@@ -16,9 +16,11 @@ import asyncio
 import dataclasses
 import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 from _merge_lane_fakes import (
+    FakeClock,
     FakeVerifier,
     fails,
     lane_entry,
@@ -30,7 +32,7 @@ from _orch_helpers import MERGE_GATE_BARRIER_TIMEOUT, MERGE_RESULT_TIMEOUT, wait
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
-from orchestrator.merge_lane import MergeRequest, QueuedBranch
+from orchestrator.merge_lane import MergeOutcome, MergeRequest, QueuedBranch
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -92,6 +94,50 @@ def _make_request(
     )
 
 
+async def _branch_with_one_commit(git_ops: GitOps, task_id: str) -> Path:
+    """A task worktree forked at current main, one commit ahead; its path."""
+    branch_wt = (await git_ops.create_worktree(task_id)).path
+    (branch_wt / f'{task_id}.py').write_text('x = 1\n')
+    await git_ops.commit(branch_wt, f'Add {task_id}.py')
+    return branch_wt
+
+
+async def _entry_while_verifying(
+    git_ops: GitOps, req: MergeRequest,
+) -> tuple[dict[str, Any] | None, MergeOutcome]:
+    """Submit *req* to a lane over *git_ops*, read its ``snapshot()`` entry
+    while its verify is parked in ``run_scoped``, then release the verify RED
+    so no ``advance_main`` runs; return that entry and the outcome.
+
+    Each abort-poll of the parked verify charges the lane's clock a full
+    poll interval, so ``FakeClock``'s default ``wait_cap`` grants the verify
+    only ~11s of real time before the no-progress budget calls it dead -- a
+    loaded host spends that on the merge's git work alone, and the requeued
+    item then re-merges onto whatever main has become. A 1s cap keeps that
+    window far past the barrier timeouts.
+    """
+    gate = asyncio.Event()
+    verifier = FakeVerifier(
+        default=dataclasses.replace(
+            fails(category='test_failure', summary='red'), release=gate,
+        ),
+    )
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    lane = make_lane(git_ops, queue, verifier=verifier, clock=FakeClock(wait_cap=1.0))
+
+    async with running_lane(lane) as run:
+        await queue.put(req)
+        await wait_responsive(
+            verifier.await_entry(1),
+            timeout=MERGE_GATE_BARRIER_TIMEOUT,
+            label=f'{req.task_id}: verify parked in run_scoped',
+        )
+        entry = lane_entry(lane, req.request_id)
+        gate.set()
+        outcome = await run.outcome(req, timeout=MERGE_RESULT_TIMEOUT)
+    return entry, outcome
+
+
 class _OutsideLandingDuringWarmSwap(GitOps):
     """Real ``GitOps`` that lands one outside commit on main mid-verify.
 
@@ -121,8 +167,9 @@ class TestVerifyBaseOnTheSnapshot:
 
     ``main_sha`` is the item's base SHA as captured when it merged, never a
     fresh read of main at verify time, and ``merge_base_sha`` is the
-    merge-base of that SHA with the merged branch tip. Read off the public
-    ``snapshot()`` census rather than a stubbed ``_run_post_merge_verify``.
+    merge-base of that SHA with the merged branch tip, or ``None`` when that
+    cannot be resolved. Read off the public ``snapshot()`` census rather than
+    a stubbed ``_run_post_merge_verify``.
 
     Companion pins of the same claim's downstream composition:
     test_merge_queue_disposition_wiring.py::TestRunPostMergeVerifyRealMainHeadFilter
@@ -154,31 +201,12 @@ class TestVerifyBaseOnTheSnapshot:
         config = lane_scene_config(git_repo, git_config)
 
         fork = _git(git_repo, 'rev-parse', 'HEAD')
-        branch_wt = (await git_ops.create_worktree('frozen')).path
-        (branch_wt / 'frozen.py').write_text('x = 1\n')
-        await git_ops.commit(branch_wt, 'Add frozen.py')
+        branch_wt = await _branch_with_one_commit(git_ops, 'frozen')
         base = _commit_empty_on_main(git_repo, 'C1')
 
-        req = _make_request('frozen', branch_wt, config)
-        gate = asyncio.Event()
-        verifier = FakeVerifier(
-            default=dataclasses.replace(
-                fails(category='test_failure', summary='red'), release=gate,
-            ),
+        entry, outcome = await _entry_while_verifying(
+            git_ops, _make_request('frozen', branch_wt, config),
         )
-        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, verifier=verifier)
-
-        async with running_lane(lane) as run:
-            await queue.put(req)
-            await wait_responsive(
-                verifier.await_entry(1),
-                timeout=MERGE_GATE_BARRIER_TIMEOUT,
-                label='frozen: verify parked in run_scoped',
-            )
-            entry = lane_entry(lane, req.request_id)
-            gate.set()
-            outcome = await run.outcome(req, timeout=MERGE_RESULT_TIMEOUT)
 
         assert git_ops.outside_landing is not None
         assert await git_ops.get_main_sha() == git_ops.outside_landing != base, (
@@ -193,4 +221,31 @@ class TestVerifyBaseOnTheSnapshot:
             f'verify re-read main -- and merge_base_sha its merge-base {fork} '
             f'with the merged branch tip'
         )
+        assert outcome.status == 'blocked', outcome
+
+    @pytest.mark.asyncio
+    async def test_an_unresolvable_merge_base_publishes_none(
+        self, git_repo: Path, tmp_path: Path,
+    ) -> None:
+        """``merge_base_sha`` degrades to ``None`` (I3, fail-open) when
+        ``git merge-base`` cannot resolve the pair, and ``main_sha`` is still
+        the frozen base. The request's project root -- where the merge-base
+        runs -- is an unrelated repo that holds neither SHA.
+        """
+        git_config = _git_config(persistent_merge_worktree=False)
+        git_ops = GitOps(git_config, git_repo)
+        branch_wt = await _branch_with_one_commit(git_ops, 'nobase')
+        base = _git(git_repo, 'rev-parse', 'HEAD')
+        unrelated = tmp_path / 'unrelated'
+        unrelated.mkdir()
+        _git(unrelated, 'init', '-q', '-b', 'main')
+        config = lane_scene_config(unrelated, git_config)
+
+        entry, outcome = await _entry_while_verifying(
+            git_ops, _make_request('nobase', branch_wt, config),
+        )
+
+        assert entry is not None
+        assert entry['state'] == 'verifying'
+        assert entry['verify_base'] == {'main_sha': base, 'merge_base_sha': None}
         assert outcome.status == 'blocked', outcome
