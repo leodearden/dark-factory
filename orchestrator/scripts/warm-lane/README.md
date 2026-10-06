@@ -1226,11 +1226,8 @@ whose Pass-1 per-lane live-reference gate takes it once the reference clears.
 Over-preserving costs one cycle of held disk; under-preserving corrupts a live
 build.
 
-**Cost.** One negative `live_ref_present` (the release-path common case, which
-cannot short-circuit) measured ~1.35s at ~1632 `/proc` entries on 2026-10-05,
-and 2.2–5.3s the same day at ~1440 entries under a load average of ~131 on 32
-cores. Thin pays exactly one call per release-thin, on a never-raise tail that
-already removes a multi-GB `target/`. Accepted.
+**Cost.** One full `/proc` walk per release-thin, since the release-path common
+case is a negative that cannot short-circuit, paid on a never-raise tail.
 
 **Residuals.**
 

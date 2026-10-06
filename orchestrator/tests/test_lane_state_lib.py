@@ -1656,40 +1656,11 @@ class TestProtectGlobFallbackDrift:
 
 
 class TestProtectGlobFallbackIsAVerbatimRender:
-    """``LANE_PROTECT_GLOB_FALLBACK`` must EQUAL the render, byte for byte.
+    """``LANE_PROTECT_GLOB_FALLBACK`` must equal the registry render byte for byte.
 
-    The fallback has two consumers with two contracts, and this class gates
-    the stricter one.
-
-    The production python3-outage backstop needs fallback ⊇ render and must
-    never protect an owned pool band.  :class:`TestProtectGlobFallbackDrift`
-    gates that; under-coverage there is a PRODUCTION hazard, since a live
-    managed worktree becomes reclaimable during an outage.
-
-    Both gc suites (``test_warm_lane_gc.sh`` ``_run_gc`` pin mode and
-    ``test_warm_lane_gc_sweep.sh`` ``run_sweep``) pin
-    ``REIFY_WARM_LANE_GC_PROTECT_GLOB`` to the fallback to skip the
-    per-invocation python render.  That pin is behaviour-neutral only if
-    fallback == render, so any difference is a TEST-FIDELITY hazard: a band
-    removed from the registry, an exact-name band an existing glob already
-    covers, and a fallback-only band all pass containment while the suites
-    exercise ``warm-lane-gc.sh`` with a protect set production never renders.
-
-    Folding equality into the containment gate would merge those two
-    severities into one message and lose the production-hazard one, so
-    containment stays the looser production contract and this class is the
-    separate, stricter one the pins depend on.  The dangerous direction trips
-    both.
-
-    Byte equality, not set equality: ``lib_lane_state.sh`` documents the
-    fallback as a verbatim render an operator can diff against
-    ``lane_protect_glob`` output directly, and the report hands over the exact
-    replacement, so an order-only failure costs one paste.
-
-    The comparison is against the PYTHON render rather than a bash subprocess.
-    ``TestLaneProtectGlobBridge.test_owned_pool_bands_render_exactly_as_python_computes_them``
-    already pins bash == python for these owned bands, and the python render
-    keeps the gate monkeypatch-seedable and free of an interpreter start.
+    Both gc suites pin ``REIFY_WARM_LANE_GC_PROTECT_GLOB`` to the fallback, which
+    is behaviour-neutral only under that equality; production's python3-outage
+    backstop needs only :class:`TestProtectGlobFallbackDrift`'s containment.
     """
 
     @staticmethod
