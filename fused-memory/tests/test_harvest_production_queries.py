@@ -126,10 +126,15 @@ CREATE TABLE write_ops (
 )
 """
 
-OVERVIEW = 'project overview architecture goals'
-CONVENTIONS = 'coding conventions and project norms'
-DECISIONS = 'recent decisions and rationale'
-TASK_TEMPLATE = 'task {task_id} context and related decisions'
+# The four briefing queries task 3659 retired, hand-spelled on purpose: their
+# source is gone, so this is the independent oracle for the historical branch.
+RETIRED_OVERVIEW = 'project overview architecture goals'
+RETIRED_CONVENTIONS = 'coding conventions and project norms'
+RETIRED_DECISIONS = 'recent decisions and rationale'
+RETIRED_TASK_TEMPLATE = 'task {task_id} context and related decisions'
+RETIRED_TEMPLATES = frozenset(
+    {RETIRED_OVERVIEW, RETIRED_CONVENTIONS, RETIRED_DECISIONS, RETIRED_TASK_TEMPLATE}
+)
 
 
 def _build_journal(
@@ -173,11 +178,11 @@ def _standard_journal(tmp_path: Path) -> Path:
     Plus 25 non-search ops that must be ignored entirely.
     """
     rows: list[tuple[str, str, str]] = []
-    rows += _search_rows(OVERVIEW, 60)
-    rows += _search_rows(CONVENTIONS, 40)
-    rows += _search_rows(DECISIONS, 20)
+    rows += _search_rows(RETIRED_OVERVIEW, 60)
+    rows += _search_rows(RETIRED_CONVENTIONS, 40)
+    rows += _search_rows(RETIRED_DECISIONS, 20)
     for task_id in ('4004', '3560', '3111', '3.1'):
-        rows += _search_rows(TASK_TEMPLATE.format(task_id=task_id), 10)
+        rows += _search_rows(RETIRED_TASK_TEMPLATE.format(task_id=task_id), 10)
     for i in range(40):
         rows += _search_rows(f'one off question number {i:02d}', 1)
     # Noise that must never be counted.
@@ -319,7 +324,7 @@ class TestHarvestSelectsOnlySearchOps:
         self, tmp_path
     ):
         mod = _mod()
-        rows = _search_rows(OVERVIEW, 10)
+        rows = _search_rows(RETIRED_OVERVIEW, 10)
         rows += [('search', 'read', '{"limit": 5}')] * 7 # no `query` key
         rows += [('search', 'read', 'not json at all')] * 3
         db = _build_journal(tmp_path / 'j.db', rows)
@@ -329,34 +334,40 @@ class TestHarvestSelectsOnlySearchOps:
 
     def test_query_text_is_parsed_out_of_the_params_json(self, tmp_path):
         mod = _mod()
-        db = _build_journal(tmp_path / 'j.db', _search_rows(OVERVIEW, 3))
+        db = _build_journal(tmp_path / 'j.db', _search_rows(RETIRED_OVERVIEW, 3))
         result = mod.harvest(db)
-        assert [t.text for t in result.templates if t.observed_count] == [OVERVIEW]
+        assert [t.text for t in result.templates if t.observed_count] == [RETIRED_OVERVIEW]
 
 
-class TestTemplateClassification:
-    """The four briefing-assembler templates, three literal and one parameterized."""
+def _retired_family(result) -> list:
+    return [
+        t for t in result.templates if t.match == 'parameterized' and t.era == 'retired'
+    ]
+
+
+class TestRetiredTemplateClassification:
+    """The retired branch: three literals and one parameterized family."""
 
     def test_the_three_literals_are_classified(self, tmp_path):
         mod = _mod()
         result = mod.harvest(_standard_journal(tmp_path))
         by_text = {t.text: t for t in result.templates}
-        assert by_text[OVERVIEW].observed_count == 60
-        assert by_text[CONVENTIONS].observed_count == 40
-        assert by_text[DECISIONS].observed_count == 20
-        for text in (OVERVIEW, CONVENTIONS, DECISIONS):
+        assert by_text[RETIRED_OVERVIEW].observed_count == 60
+        assert by_text[RETIRED_CONVENTIONS].observed_count == 40
+        assert by_text[RETIRED_DECISIONS].observed_count == 20
+        for text in (RETIRED_OVERVIEW, RETIRED_CONVENTIONS, RETIRED_DECISIONS):
             assert by_text[text].match == 'literal'
 
     def test_the_task_family_is_matched_as_a_template_not_a_literal(self, tmp_path):
         mod = _mod()
         result = mod.harvest(_standard_journal(tmp_path))
-        family = [t for t in result.templates if t.match == 'parameterized']
-        assert len(family) == 1, 'exactly one parameterized family'
+        family = _retired_family(result)
+        assert len(family) == 1, 'exactly one retired parameterized family'
         fam = family[0]
         # All four distinct task ids collapse into ONE class.
         assert fam.observed_count == 40
         assert fam.distinct_instances == 4
-        assert fam.template == TASK_TEMPLATE
+        assert fam.template == RETIRED_TASK_TEMPLATE
 
     def test_a_parameterized_instance_is_not_counted_in_the_long_tail(self, tmp_path):
         mod = _mod()
@@ -366,14 +377,45 @@ class TestTemplateClassification:
 
     def test_a_near_miss_does_not_join_the_family(self, tmp_path):
         mod = _mod()
-        rows = _search_rows(TASK_TEMPLATE.format(task_id='4004'), 5)
+        rows = _search_rows(RETIRED_TASK_TEMPLATE.format(task_id='4004'), 5)
         rows += _search_rows('task context and related decisions', 5) # no id
         rows += _search_rows('task 4004 context and related choices', 5) # wrong tail
         db = _build_journal(tmp_path / 'j.db', rows)
         result = mod.harvest(db)
-        fam = next(t for t in result.templates if t.match == 'parameterized')
+        (fam,) = _retired_family(result)
         assert fam.observed_count == 5
         assert result.tail_count == 10
+
+
+class TestTheRetiredBranchIsExplicit:
+    """Every retired class says so, in the result, the rows and the sidecar."""
+
+    def test_every_retired_template_class_is_tagged_retired(self, tmp_path):
+        mod = _mod()
+        result = mod.harvest(_standard_journal(tmp_path))
+        retired = [t for t in result.templates if t.template in RETIRED_TEMPLATES]
+        assert {t.template for t in retired} == RETIRED_TEMPLATES
+        assert all(t.era == 'retired' for t in retired)
+
+    def test_every_retired_briefing_row_carries_its_era(self, tmp_path):
+        mod = _mod()
+        rows = mod.harvest(_standard_journal(tmp_path), tail_sample=3).rows
+        briefing = [r for r in rows if r['source'] == 'briefing_template']
+        assert {r['template'] for r in briefing} == RETIRED_TEMPLATES
+        assert all(r['era'] == 'retired' for r in briefing)
+
+    def test_every_provenance_template_entry_carries_an_era(self, tmp_path):
+        mod = _mod()
+        prov = mod.harvest(_standard_journal(tmp_path)).provenance()
+        assert prov['templates']
+        assert all('era' in entry for entry in prov['templates'])
+
+    def test_the_retired_templates_are_named_as_retired(self):
+        mod = _mod()
+        assert set(mod.RETIRED_LITERAL_TEMPLATES) == {
+            RETIRED_OVERVIEW, RETIRED_CONVENTIONS, RETIRED_DECISIONS,
+        }
+        assert mod.RETIRED_TASK_TEMPLATE == RETIRED_TASK_TEMPLATE
 
 
 class TestTrafficShares:
@@ -383,9 +425,9 @@ class TestTrafficShares:
         mod = _mod()
         result = mod.harvest(_standard_journal(tmp_path))
         by_text = {t.text: t.traffic_share for t in result.templates}
-        assert by_text[OVERVIEW] == 0.30
-        assert by_text[CONVENTIONS] == 0.20
-        assert by_text[DECISIONS] == 0.10
+        assert by_text[RETIRED_OVERVIEW] == 0.30
+        assert by_text[RETIRED_CONVENTIONS] == 0.20
+        assert by_text[RETIRED_DECISIONS] == 0.10
 
     def test_the_three_literals_and_the_family_are_reported_separately(self, tmp_path):
         mod = _mod()
@@ -428,7 +470,7 @@ class TestDeterministicTailSample:
 
     def test_the_frequency_led_portion_is_seed_independent(self, tmp_path):
         mod = _mod()
-        rows = _search_rows(OVERVIEW, 10)
+        rows = _search_rows(RETIRED_OVERVIEW, 10)
         # A tail with an unambiguous frequency order.
         for i in range(20):
             rows += _search_rows(f'tail query {i:02d}', 20 - i)
@@ -511,7 +553,7 @@ class TestFixtureRowShape:
         selection gate reads.
         """
         mod = _mod()
-        rows = _search_rows(OVERVIEW, 10)
+        rows = _search_rows(RETIRED_OVERVIEW, 10)
         rows += _search_rows('a tail query some other caller fires', 7, limit=20)
         db = _build_journal(tmp_path / 'j.db', rows)
         harvested = mod.harvest(db, tail_sample=3).rows
@@ -528,7 +570,7 @@ class TestFixtureRowShape:
         value takes it from the measurement and owns that choice explicitly.
         """
         mod = _mod()
-        rows = _search_rows(OVERVIEW, 10)
+        rows = _search_rows(RETIRED_OVERVIEW, 10)
         rows += _search_rows('mixed limit tail query', 6, limit=10)
         rows += _search_rows('mixed limit tail query', 2, limit=50)
         db = _build_journal(tmp_path / 'j.db', rows)
@@ -541,7 +583,7 @@ class TestFixtureRowShape:
     def test_the_sidecar_reports_the_scored_limit_as_a_choice(self, tmp_path):
         """The scoring window is named a choice and sits beside the readings."""
         mod = _mod()
-        rows = _search_rows(OVERVIEW, 10)
+        rows = _search_rows(RETIRED_OVERVIEW, 10)
         rows += _search_rows('a tail query', 4, limit=30)
         db = _build_journal(tmp_path / 'j.db', rows)
         prov = mod.harvest(db, tail_sample=3).provenance()
@@ -556,7 +598,7 @@ class TestFixtureRowShape:
         import json  # noqa: PLC0415
 
         mod = _mod()
-        rows = _search_rows(OVERVIEW, 10)
+        rows = _search_rows(RETIRED_OVERVIEW, 10)
         rows += [('search', 'read', json.dumps({'query': 'no limit recorded'}))] * 3
         db = _build_journal(tmp_path / 'j.db', rows)
         tail = [r for r in mod.harvest(db, tail_sample=3).rows
@@ -577,7 +619,7 @@ class TestPinnedTail:
 
     def test_a_pin_holds_the_tail_query_set_fixed(self, tmp_path):
         mod = _mod()
-        rows = _search_rows(OVERVIEW, 10)
+        rows = _search_rows(RETIRED_OVERVIEW, 10)
         rows += _search_rows('pinned tail query', 4, limit=10)
         rows += _search_rows('newly arrived tail query', 9, limit=8)
         db = _build_journal(tmp_path / 'j.db', rows)
@@ -591,7 +633,7 @@ class TestPinnedTail:
     def test_pinning_to_a_query_the_journal_lacks_raises(self, tmp_path):
         """Emitting a pinned row with no observations would fabricate it."""
         mod = _mod()
-        db = _build_journal(tmp_path / 'j.db', _search_rows(OVERVIEW, 10))
+        db = _build_journal(tmp_path / 'j.db', _search_rows(RETIRED_OVERVIEW, 10))
         with pytest.raises(mod.EmptyHarvestError, match='pinned tail'):
             mod.harvest(db, pin_tail_texts=['a query nobody ever ran'])
 
