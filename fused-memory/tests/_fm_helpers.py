@@ -155,6 +155,7 @@ class MockEdge:
     episodes: list[str] = field(default_factory=list)
     valid_at: Any = None
     invalid_at: Any = None
+    created_at: Any = None
 
 
 @dataclass
