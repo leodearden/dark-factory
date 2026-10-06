@@ -214,6 +214,30 @@ class TestTrickleCensusCaps:
         assert caps.max_batches == 50
 
 
+class TestLedgerRetentionDays:
+    """``census.ledger_retention_days`` — the census mining window's length,
+    which is also how long a coded session stays in the ledger."""
+
+    def test_default_is_thirty_days(self):
+        assert mod.Census().ledger_retention_days == 30
+
+    def test_yaml_without_the_key_keeps_the_default(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {floor_days: 5}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.ledger_retention_days == 30
+
+    def test_yaml_value_round_trips(self, tmp_path):
+        text = MINIMAL_YAML + 'census: {ledger_retention_days: 14}\n'
+        cfg = mod.load_config(_write(tmp_path, text))
+        assert cfg.census.ledger_retention_days == 14
+
+    @pytest.mark.parametrize('bad_value', ['0', '-1', "'30'"])
+    def test_non_positive_or_quoted_value_raises(self, tmp_path, bad_value):
+        text = MINIMAL_YAML + f'census: {{ledger_retention_days: {bad_value}}}\n'
+        with pytest.raises(ValidationError):
+            mod.load_config(_write(tmp_path, text))
+
+
 class TestFullConfigOverridesDefaults:
     """A fully-populated §7.4 YAML round-trips every explicit value."""
 
