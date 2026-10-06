@@ -183,21 +183,52 @@ def _sweep_stale_probe_dirs_once() -> int:
     )
 
 
-def _probe_hit_local_budget_cap(stdout_bytes: bytes) -> bool:
-    """Return True iff the probe stdout is a CLI JSON result reporting that
-    the local ``--max-budget-usd`` cap was hit.
+def _load_probe_result(stdout_bytes: bytes) -> dict[str, object] | None:
+    """Return the probe's CLI JSON result object, or None when stdout is
+    empty, not JSON, or not a JSON object."""
+    if not stdout_bytes:
+        return None
+    try:
+        obj = json.loads(stdout_bytes.decode(errors='replace'))
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _probe_hit_local_budget_cap(result: dict[str, object] | None) -> bool:
+    """Return True iff the probe's CLI JSON result reports that the local
+    ``--max-budget-usd`` cap was hit.
 
     This indicates the Anthropic API accepted the request and consumed real
     tokens — the account is NOT capped. Distinct from account-level cap hits
     (which surface as text prefixes in stderr, not JSON subtypes).
     """
-    if not stdout_bytes:
-        return False
-    try:
-        obj = json.loads(stdout_bytes.decode(errors='replace'))
-    except (json.JSONDecodeError, ValueError):
-        return False
-    return isinstance(obj, dict) and obj.get('subtype') == 'error_max_budget_usd'
+    return result is not None and result.get('subtype') == 'error_max_budget_usd'
+
+
+def _probe_succeeded(returncode: int | None, result: dict[str, object] | None) -> bool:
+    """Return True iff the probe's CLI result is POSITIVE evidence that the
+    API served the request: exit 0, subtype ``success``, no ``is_error`` and
+    no ``api_error_status``.
+
+    The absence of recognised failure text is never enough — an org-disabled
+    account answers with a ``success``-subtype result carrying ``is_error``
+    and a 403 (task 5944).
+    """
+    return (
+        result is not None
+        and returncode == 0
+        and result.get('subtype') == 'success'
+        and not result.get('is_error', False)
+        and result.get('api_error_status') is None
+    )
+
+
+def _probe_result_snippet(result: dict[str, object] | None) -> str:
+    """One line of the probe's ``result`` text, cut to 120 characters."""
+    if result is None:
+        return '<no JSON result>'
+    return ' '.join(str(result.get('result', '')).split())[:120]
 
 
 class AccountPhase(StrEnum):
@@ -1092,12 +1123,12 @@ class UsageGate:
         Settle the returned lease through :class:`InvokeSlot` so the claim is
         always released.
 
-        *reverse* walks the roster from the END (max-h → max-b rather than
-        max-b → max-h). It is an ordering PREFERENCE, not a different
+        *reverse* walks the roster from the END (last → first rather than
+        first → last). It is an ordering PREFERENCE, not a different
         admission rule: the same skip predicate, the same probe claim, the
         same lease. The trickle's 33 haiku one-shots drain from the end so
-        they do not contend with the orchestrator's first-available b → h
-        order; the two orders meet only when the pool is nearly exhausted,
+        they do not contend with the orchestrator's first-available
+        first → last order; the two orders meet only when the pool is nearly exhausted,
         which is exactly when contention is unavoidable anyway. Opt-in, and
         that matters: ``before_invoke`` never passes it, so every existing
         caller keeps the order it has always had. The knob lives HERE, in the
@@ -2553,8 +2584,10 @@ class UsageGate:
     async def _run_probe(self, acct: AccountState) -> bool:
         """Fire a minimal Claude invocation to test if *acct* has capacity.
 
-        Returns ``True`` if the invocation succeeded (no cap hit), ``False``
-        otherwise.  Uses haiku to minimise cost (~$0.001 per probe).
+        Returns ``True`` only when the CLI result proves the API served the
+        request — a success result, or the local budget cap after real spend —
+        and ``False`` otherwise.  Uses haiku to minimise cost (~$0.001 per
+        probe).
 
         Raises:
             ProbeSpawnError: The probe could not be SPAWNED (task 4512) — the
@@ -2722,27 +2755,34 @@ class UsageGate:
                 )
             return False
 
-        if proc.returncode != 0:
-            # Distinguish the probe's own $0.01 budget exhaustion from real
-            # Anthropic-side failures. A non-zero exit with subtype
-            # ``error_max_budget_usd`` means the API accepted the request and
-            # consumed real tokens — the account has capacity; the probe
-            # simply can't spend more than $0.01 per run. Cache-creation on a
-            # fresh session easily pushes total_cost past $0.01, so this is a
-            # routine outcome, not a cap hit.
-            if _probe_hit_local_budget_cap(stdout_bytes):
-                logger.info(
-                    f'Account {acct.name}: probe hit local $0.01 budget '
-                    f'cap (API accepted request) — treating as success',
-                )
-                return True
-            logger.warning(
-                f'Account {acct.name}: probe exited {proc.returncode}',
+        # The probe's own $0.01 budget exhaustion means the API accepted the
+        # request and consumed real tokens — the account has capacity. Cache
+        # creation on a fresh session easily pushes total_cost past $0.01, so
+        # this is a routine outcome, not a cap hit.
+        probe_result = _load_probe_result(stdout_bytes)
+        result_fields = probe_result or {}
+        if (
+            _probe_hit_local_budget_cap(probe_result)
+            and result_fields.get('api_error_status') is None
+        ):
+            logger.info(
+                f'Account {acct.name}: probe hit local $0.01 budget '
+                f'cap (API accepted request) — treating as success',
             )
-            return False
-
-        logger.info(f'Account {acct.name}: probe succeeded')
-        return True
+            return True
+        if _probe_succeeded(proc.returncode, probe_result):
+            logger.info(f'Account {acct.name}: probe succeeded')
+            return True
+        logger.warning(
+            'Account %s: probe did not succeed — exit %s, subtype=%r, '
+            'api_error_status=%s: %s — account stays blocked',
+            acct.name,
+            proc.returncode,
+            result_fields.get('subtype'),
+            result_fields.get('api_error_status'),
+            _probe_result_snippet(probe_result),
+        )
+        return False
 
     async def shutdown(self) -> None:
         """Cancel all resume probe tasks and drain in-flight background cost-event tasks."""

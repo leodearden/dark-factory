@@ -351,12 +351,12 @@ class TestDefaults:
             'RELOADABLE_FIELDS'
         )
         # task 4755: how old the in-flight fleet-redeploy lease may get before
-        # its readers stop believing it. DERIVED from the drain busy-grace
-        # (worst legitimate sweep ~6270s), not picked, and deliberately far
+        # its readers stop believing it. DERIVED from the --drain verify-wait cap
+        # (worst legitimate sweep ~13,300s), not picked, and deliberately far
         # below the 8h min-interval so a lease leaked by a SIGKILLed sweep
         # delays at most one window. Red-tier / restart-only like its
         # siblings — captured at coordinator construction.
-        assert config.orchestrator_restart_lease_max_age_secs == 7200.0
+        assert config.orchestrator_restart_lease_max_age_secs == 14400.0
         assert (
             'orchestrator_restart_lease_max_age_secs' not in RELOADABLE_FIELDS
         ), (

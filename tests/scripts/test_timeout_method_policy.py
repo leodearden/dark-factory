@@ -74,6 +74,7 @@ import pathlib
 import re
 import subprocess
 import sys
+import types
 
 import pytest
 
@@ -92,14 +93,18 @@ THREAD_TIMEOUT_METHOD_CONFIGS = frozenset({'orchestrator', 'fused-memory'})
 PROBE_WORKERS = 2
 PROBE_TIMEOUT_SECS = 2
 
+# The pytest11 entry-point names of the only plugins the probe child may load.
+# pytest's `plugins:` header shows the same names for the two distributions.
+PROBE_PLUGINS = ('xdist', 'timeout')
+
 # Every probe test except the blocking one overrides the ini cap with this, so
 # that only the blocking test races PROBE_TIMEOUT_SECS. On a loaded host a
 # trivial test can take longer than 2s, and the tally must not depend on that.
 NON_BLOCKING_TIMEOUT_SECS = 60
 
-# Below each probe's @pytest.mark.timeout, so a wedged child surfaces as a
-# TimeoutExpired carrying its captured output rather than as pytest's axe.
-PROBE_SUBPROCESS_TIMEOUT_SECS = 100
+# Strictly below the per-test axe the probes run under (300 under verify), as
+# test_the_probes_take_this_runs_per_test_timeout_and_the_child_budget_sits_below_it enforces.
+PROBE_SUBPROCESS_TIMEOUT_SECS = 240
 
 # Keeps the two probes on one worker wherever --dist loadgroup is in force, so
 # two nested pytest sessions never run at once on an already-loaded host.
@@ -158,12 +163,21 @@ def _write_probe_suite(tmp_path: pathlib.Path, method: str) -> _ProbeSuite:
     return _ProbeSuite(root=root, ini=ini)
 
 
-def _run_probe_suite(suite: _ProbeSuite, *extra: str) -> subprocess.CompletedProcess[str]:
+def _run_probe_suite(
+    suite: _ProbeSuite,
+    *extra: str,
+    budget_secs: float = PROBE_SUBPROCESS_TIMEOUT_SECS,
+) -> subprocess.CompletedProcess[str]:
     """Run *suite* at ``-n PROBE_WORKERS --dist loadgroup -rA`` plus *extra*.
+
+    A child still running after *budget_secs* is killed and fails the calling
+    test with whatever it had printed.
 
     ``PYTEST_*`` is scrubbed from the child's environment, so an inherited
     ``PYTEST_ADDOPTS``, ``PYTEST_TIMEOUT`` or ``PYTEST_XDIST_WORKER`` cannot
-    change what the child runs or suppress the literals asserted on.
+    change what the child runs or suppress the literals asserted on. Only
+    ``PYTEST_DISABLE_PLUGIN_AUTOLOAD`` is then set, so the child loads exactly
+    ``PROBE_PLUGINS`` and nothing else installed in the venv.
     """
     missing = [
         plugin for plugin in ('xdist', 'pytest_timeout')
@@ -174,31 +188,67 @@ def _run_probe_suite(suite: _ProbeSuite, *extra: str) -> subprocess.CompletedPro
         'run; this is a missing plugin, not a measurement.'
     )
     env = {key: value for key, value in os.environ.items() if not key.startswith('PYTEST_')}
-    return subprocess.run(
-        [
-            sys.executable, '-m', 'pytest',
-            '-c', str(suite.ini),
-            '-p', 'no:cacheprovider',
-            '-n', str(PROBE_WORKERS),
-            '--dist', 'loadgroup',
-            '-rA',
-            *extra,
-        ],
-        cwd=str(suite.root),
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=PROBE_SUBPROCESS_TIMEOUT_SECS,
-        check=False,
+    env['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
+    try:
+        result = subprocess.run(
+            [
+                sys.executable, '-m', 'pytest',
+                '-c', str(suite.ini),
+                '-p', 'no:cacheprovider',
+                *(arg for name in PROBE_PLUGINS for arg in ('-p', name)),
+                '-n', str(PROBE_WORKERS),
+                '--dist', 'loadgroup',
+                '-rA',
+                *extra,
+            ],
+            cwd=str(suite.root),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=budget_secs,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(
+            f'the probe child did not finish within its budget of {budget_secs}s. '
+            'A starved child and a wedged one look the same here; the partial '
+            'output shows how far it got: the header alone means it was stuck '
+            'in startup, and progress characters without an F mean '
+            f'{BLOCKING_TEST} never timed out.\n'
+            f'{_captured(exc)}',
+            pytrace=False,
+        )
+    loaded = _header_plugins(result.stdout)
+    assert loaded == set(PROBE_PLUGINS), (
+        f'the probe child loaded the plugins {loaded!r}, not exactly xdist and '
+        'pytest-timeout. The probe measures only those two, so any other plugin '
+        f'can change its result.\n{_captured(result)}'
     )
+    return result
 
 
-def _captured(result: subprocess.CompletedProcess[str]) -> str:
-    return f'stdout:\n{result.stdout}\nstderr:\n{result.stderr}'
+def _header_plugins(output: str) -> set[str] | None:
+    """The plugin names on pytest's ``plugins:`` header line, versions stripped."""
+    header = re.search(r'^plugins: (.*)$', output, re.MULTILINE)
+    if header is None:
+        return None
+    return {entry.rsplit('-', 1)[0] for entry in header.group(1).split(', ')}
+
+
+def _captured(result: subprocess.CompletedProcess[str] | subprocess.TimeoutExpired) -> str:
+    return f'stdout:\n{_text(result.stdout)}\nstderr:\n{_text(result.stderr)}'
+
+
+def _text(stream: str | bytes | None) -> str:
+    """*stream* as text: a TimeoutExpired holds bytes or None even under ``text=True``."""
+    if stream is None:
+        return ''
+    if isinstance(stream, bytes):
+        return stream.decode('utf-8', errors='replace')
+    return stream
 
 
 @pytest.mark.xdist_group(TIMEOUT_METHOD_PROBE_GROUP)
-@pytest.mark.timeout(120)
 def test_signal_timeout_fails_the_test_and_the_xdist_worker_survives(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -241,7 +291,6 @@ def test_signal_timeout_fails_the_test_and_the_xdist_worker_survives(
 
 
 @pytest.mark.xdist_group(TIMEOUT_METHOD_PROBE_GROUP)
-@pytest.mark.timeout(120)
 def test_thread_timeout_kills_the_xdist_worker(tmp_path: pathlib.Path) -> None:
     """THE PAIRED CONTROL: the same suite under thread, as orchestrator and fused-memory run.
 
@@ -273,6 +322,130 @@ def test_thread_timeout_kills_the_xdist_worker(tmp_path: pathlib.Path) -> None:
     )
     assert 'worker restarting disabled' in output, (
         f'xdist did not report that restarting was disabled.\n{_captured(result)}'
+    )
+
+
+def test_a_timed_out_probe_child_reports_its_partial_output() -> None:
+    partial = 'bringing up nodes...\n........'
+    timed_out = subprocess.TimeoutExpired(
+        ['python', '-m', 'pytest'], 240, output=partial.encode(), stderr=None
+    )
+
+    report = _captured(timed_out)
+
+    assert partial in report, (
+        "a TimeoutExpired carries the child's streams as bytes, even under "
+        f'text=True; they must be decoded, not shown as a repr.\n{report}'
+    )
+    assert 'stdout:' in report and 'stderr:' in report, report
+    assert "b'" not in report, report
+
+
+def test_a_probe_child_that_outlives_its_budget_fails_the_calling_test(
+    tmp_path: pathlib.Path,
+) -> None:
+    budget_secs = 0.5
+    # --timeout=0 lifts the cap on BLOCKING_TEST, so the child can never finish;
+    # -n 0 runs it in the child itself, so the kill leaves no xdist worker behind.
+    never_finishes = ('--timeout=0', '-n', '0')
+
+    with pytest.raises(pytest.fail.Exception) as failure:
+        _run_probe_suite(
+            _write_probe_suite(tmp_path, SIGNAL_METHOD),
+            *never_finishes,
+            budget_secs=budget_secs,
+        )
+
+    report = str(failure.value)
+    assert f'within its budget of {budget_secs}s' in report, report
+    assert 'stdout:' in report and 'stderr:' in report, report
+
+
+@pytest.mark.parametrize(
+    ('output', 'plugins'),
+    [
+        (
+            'rootdir: /suite\nplugins: xdist-3.8.0, timeout-2.4.0\ncollected 9 items\n',
+            {'xdist', 'timeout'},
+        ),
+        ('plugins: rerun-failures-16.1\n', {'rerun-failures'}),
+        ('rootdir: /suite\ncollected 9 items\n', None),
+    ],
+    ids=['measured-pair', 'hyphenated-name', 'no-header'],
+)
+def test_header_plugins_names_each_plugin_without_its_version(
+    output: str, plugins: set[str] | None,
+) -> None:
+    assert _header_plugins(output) == plugins
+
+
+def _timeout_marks(module: types.ModuleType) -> list[tuple[str, float]]:
+    """``(marked name, seconds)`` for every timeout mark in *module* that sets a timeout.
+
+    Read off the module's own objects rather than its collected items, so a test
+    that -k deselected still counts and nothing is collected a second time.
+    """
+    carriers = [(module.__name__, module)] + [
+        (name, obj) for name, obj in vars(module).items() if name.startswith(('test_', 'Test'))
+    ]
+    found: list[tuple[str, float]] = []
+    for name, carrier in carriers:
+        marks = getattr(carrier, 'pytestmark', [])
+        for mark in marks if isinstance(marks, list) else [marks]:
+            if mark.name != 'timeout':
+                continue
+            secs = mark.args[0] if mark.args else mark.kwargs.get('timeout')
+            if secs is not None:
+                found.append((name, secs))
+    return found
+
+
+def test_timeout_marks_finds_every_mark_that_sets_a_timeout() -> None:
+    @pytest.mark.timeout(120)
+    def test_positional() -> None: ...
+
+    @pytest.mark.timeout(timeout=90)
+    def test_keyword() -> None: ...
+
+    @pytest.mark.timeout(method=THREAD_METHOD)
+    def test_method_only() -> None: ...
+
+    @pytest.mark.timeout(5)
+    def helper() -> None: ...
+
+    module = types.ModuleType('marked')
+    vars(module).update(
+        {fn.__name__: fn for fn in (test_positional, test_keyword, test_method_only, helper)},
+        pytestmark=pytest.mark.timeout(30),
+    )
+
+    assert sorted(_timeout_marks(module)) == [
+        ('marked', 30), ('test_keyword', 90), ('test_positional', 120),
+    ]
+
+
+def test_the_probes_take_this_runs_per_test_timeout_and_the_child_budget_sits_below_it(
+    request: pytest.FixtureRequest,
+) -> None:
+    pytest_timeout = pytest.importorskip('pytest_timeout')
+    axe = pytest_timeout.get_env_settings(request.config).timeout
+    if not axe:
+        pytest.skip('no per-test timeout configured, nothing can truncate a probe')
+
+    tightening = [(name, secs) for name, secs in _timeout_marks(request.module) if secs < axe]
+    assert not tightening, (
+        f'{tightening!r} carry a timeout mark below this run\'s per-test timeout '
+        f'of {axe}s. A pytest-timeout mark REPLACES the run\'s budget in both '
+        'directions (precedence recorded at '
+        'orchestrator/tests/_orch_helpers.py::VERIFY_CLI_PER_TEST_TIMEOUT), so '
+        'such a mark tightens the budget verify grants this leg and takes a slow '
+        "probe child's time away before it can report."
+    )
+    assert axe > PROBE_SUBPROCESS_TIMEOUT_SECS, (
+        f'PROBE_SUBPROCESS_TIMEOUT_SECS={PROBE_SUBPROCESS_TIMEOUT_SECS} is not '
+        f'below this run\'s per-test timeout of {axe}s, so a wedged probe child '
+        'would be cut off by the per-test axe instead of reporting its partial '
+        'output.'
     )
 
 

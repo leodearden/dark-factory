@@ -304,6 +304,7 @@ _DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
             'contention',
             'plan',
             'failing_test_ids',
+            'failing_test_ids_by_module',
             'failing_leg_categories',
             'trivial',
             'duration_secs',

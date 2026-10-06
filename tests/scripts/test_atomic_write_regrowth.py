@@ -302,6 +302,18 @@ _ALLOWED_RENAMERS = {
         'own docstring says the mechanism is copied \'(β does the same)\' — '
         'same shared artifact root, same mkstemp + os.replace, same candidacy. '
         'Migrate the two together or the copy-from-a-neighbour habit survives.',
+    ('fused-memory/scripts/run_write_triage_population_arms.py', '_write_staged'):
+        'MULTI-FILE STAGING, a semantic atomic_write_text (one path per call) '
+        'cannot express: `publish` writes the population artifact and the '
+        'pairs-to-rate file it pins by sha256, and stages BOTH bodies before '
+        'replacing EITHER, so a body that cannot be written leaves the '
+        'committed pair as it was rather than an artifact naming a pairs sha '
+        'that does not match. Two sequential atomic_write_text calls would '
+        're-open exactly that window. Pinned by test_run_write_triage_'
+        'population_arms.py::TestThePublishCommand. Its fixed `<name>.tmp` '
+        'temp name is not per-writer unique; harmless for a one-shot operator '
+        'CLI with a single writer, and the gap to close if it ever gains a '
+        'second one. Added by task 6151.',
     ('scripts/dashboard-watchdog.py', 'save_state'):
         'STDLIB-ONLY STANDALONE ENTRYPOINT — the same constraint already '
         'recorded above for session_registry._atomic_write_text, so that '

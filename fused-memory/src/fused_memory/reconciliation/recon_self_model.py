@@ -539,7 +539,7 @@ def render_investigation_outcome_section() -> str:
 
 def render_cycle_summary_section() -> str:
     """Render the per-cycle summary metadata convention, faithful to
-    reconciliation/prompts/stage2.py:236-302, interpolating the
+    reconciliation/prompts/stage2.py::STAGE2_SYSTEM_PROMPT, interpolating the
     stage->recon_pool tags from recon_pool_map (task 2140) so the pool tag
     strings stay single-sourced rather than re-hardcoded.
 
@@ -549,10 +549,9 @@ def render_cycle_summary_section() -> str:
     mirror, producing two cycle_summary Mem0 records per run_id (the
     memory_duplicate finding, run f2bb55b4). The section now tells the
     agent that Python owns that write and it must NOT duplicate it. The
-    metadata convention below is retained because it still documents (a)
-    the shape of Python's deterministic mirror and (b) the distinct,
-    legitimately-surviving LLM-authored reconstruction/self-heal write (see
-    stage2.py's "Re-Verify Reconstruction Writes Before Carry-Forward").
+    metadata convention below is retained because it still documents the
+    shape of Python's deterministic mirror. Task 3734 retired the LLM-authored
+    reconstruction write, and the section now forbids it.
     """
     pool_lines = '\n'.join(
         f"  - stage='{stage}' -> recon_pool='{pool}'"
@@ -611,14 +610,12 @@ def render_cycle_summary_section() -> str:
         'days. Widening tombstone coverage to the paths above is tracked as '
         'task 4422 — treat this as a point-in-time scope, not a closed '
         'set.\n\n'
-        "The `record_type` metadata key discriminates cycle_summary writers by "
-        "purpose, not by shape: `'ledger_stamp'` marks Python's deterministic "
-        "code mirror described above; `'narrative'` marks the distinct "
-        'LLM-authored reconstruction/self-heal write (see "Re-Verify '
-        'Reconstruction Writes Before Carry-Forward") that you make when '
-        "repairing a PRIOR run's missing summary — that write is still yours to "
-        'author and is unrelated to the normal-flow write this section '
-        'describes.\n\n'
+        "`record_type='ledger_stamp'` marks Python's deterministic code mirror "
+        "described above, and every cycle_summary Mem0 record is Python's. Never "
+        'author one yourself — neither on the normal flow nor to repair a PRIOR '
+        "run's missing summary: a Mem0 write cannot restore the authoritative "
+        'ledger row, so that case is decided under `## Carry-Forward '
+        'Missing-Summary Findings` instead.\n\n'
         'The summary is deterministically findable by a metadata-keyed lookup — '
         f"count_memories_by_metadata(project_id, {{'kind': '{CYCLE_SUMMARY_KIND}', "
         "'run_id': <run_id>, 'stage': <stage_name>}) — which downstream stages "

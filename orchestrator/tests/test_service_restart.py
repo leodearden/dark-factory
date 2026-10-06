@@ -2298,6 +2298,21 @@ def test_lease_gate_defaults_stored_on_coordinator(tmp_path: Path) -> None:
     assert coord2._lease_max_age_secs == 1234.0
 
 
+def test_coordinator_lease_max_age_default_matches_the_config_default() -> None:
+    """The coordinator's own default and the config field's are one bound.
+
+    The harness always passes the config value, so a drift here would show
+    only in a coordinator built without it -- the copy task 5371 left at 7200
+    while the config moved to 14400 for the --drain verify-wait cap.
+    """
+    from orchestrator.config import OrchestratorConfig
+
+    config_default = OrchestratorConfig.model_fields[
+        'orchestrator_restart_lease_max_age_secs'
+    ].default
+    assert config_default == DEFAULT_FLEET_LEASE_MAX_AGE_SECS
+
+
 @pytest.mark.asyncio
 async def test_live_lease_defers_the_polite_path(tmp_path: Path) -> None:
     """(b) A live lease defers an otherwise-ready POLITE fire.

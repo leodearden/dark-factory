@@ -20,6 +20,7 @@ import socket
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 
 def sse_frame(payload):
@@ -57,6 +58,9 @@ class FakeEscalationMcp:
     `initialize_reply` / `tool_call_reply` each override one step of that
     exchange with a literal (status, headers, body) triple, which is how the
     transport-fault cases below are built without restating the handshake.
+    `tool_call_delay` holds the authenticated `tools/call` reply back that many
+    seconds (released early at exit), modelling a tool that outlives the
+    client's read timeout.
     """
 
     SESSION_ID = "sess-5379-fake"
@@ -71,10 +75,13 @@ class FakeEscalationMcp:
         }),
     )
 
-    def __init__(self, report=None, *, initialize_reply=None, tool_call_reply=None):
+    def __init__(self, report=None, *, initialize_reply=None, tool_call_reply=None,
+                 tool_call_delay=0.0):
         self.report = report
         self.initialize_reply = initialize_reply
         self.tool_call_reply = tool_call_reply
+        self.tool_call_delay = tool_call_delay
+        self._release = threading.Event()
         self.received = []
         outer = self
 
@@ -126,6 +133,8 @@ class FakeEscalationMcp:
             )
         if method == "notifications/initialized":
             return (202, {}, "")
+        if self.tool_call_delay > 0:
+            self._release.wait(self.tool_call_delay)
         return self.tool_call_reply or (
             200,
             {"Content-Type": "text/event-stream"},
@@ -162,6 +171,7 @@ class FakeEscalationMcp:
         return self
 
     def __exit__(self, *exc):
+        self._release.set()
         self._httpd.shutdown()
         self._httpd.server_close()
         self._thread.join(timeout=5)
@@ -250,10 +260,23 @@ class ClosedPort:
 #
 # Measured on 2026-09-12: the system interpreter (/usr/bin/python3, 3.12.3)
 # lacks httpx and pydantic, both of which the reload transport needs, while
-# every venv in this tree has them.
+# every venv in this tree has them. Whether an interpreter lacks the transport
+# is decided by running the gate's own import step under it, so the premise a
+# test skips on is the very branch the gate takes.
 # ---------------------------------------------------------------------------
 
 SYSTEM_PYTHON = "/usr/bin/python3"
+
+_LACKS_THE_TRANSPORT = 3
+_TRANSPORT_PROBE = f"""
+import sys
+sys.path.insert(0, sys.argv[1])
+from _config_reload_gate import load_transport
+try:
+    load_transport()
+except ImportError:
+    sys.exit({_LACKS_THE_TRANSPORT})
+"""
 
 
 def system_python_without_the_transport():
@@ -261,17 +284,24 @@ def system_python_without_the_transport():
 
     Returns (interpreter, "") or (None, reason). An interpreter that CAN
     import the transport would make an interpreter-resolution test pass while
-    proving nothing, so the premise is checked rather than assumed.
+    proving nothing, so the premise is checked rather than assumed. A probe
+    that breaks any other way raises: misreading it as "lacks the transport"
+    would run those tests on a false premise.
     """
     if not os.path.exists(SYSTEM_PYTHON):
         return None, f"{SYSTEM_PYTHON} is absent"
+    scripts_dir = Path(__file__).resolve().parent.parent
     probe = subprocess.run(
-        [SYSTEM_PYTHON, "-c", "import httpx, pydantic"],
+        [SYSTEM_PYTHON, "-c", _TRANSPORT_PROBE, str(scripts_dir)],
         capture_output=True, text=True,
     )
     if probe.returncode == 0:
         return None, f"{SYSTEM_PYTHON} can import the transport, so it proves nothing"
-    return SYSTEM_PYTHON, ""
+    if probe.returncode == _LACKS_THE_TRANSPORT:
+        return SYSTEM_PYTHON, ""
+    raise RuntimeError(
+        f"the transport probe broke under {SYSTEM_PYTHON} (rc={probe.returncode}): {probe.stderr}"
+    )
 
 
 def venvless_checkout_copy(tmp_path, script):
@@ -290,10 +320,20 @@ def venvless_checkout_copy(tmp_path, script):
 
 def path_python3_shimmed_to(tmp_path, interpreter):
     """An env whose PATH `python3` is *interpreter*."""
+    return _path_python3_running(tmp_path, f'exec {interpreter} "$@"')
+
+
+def path_python3_that_cannot_run(tmp_path):
+    """An env whose PATH `python3` exits 1 without running anything."""
+    return _path_python3_running(tmp_path, "exit 1")
+
+
+def _path_python3_running(tmp_path, shell_body):
+    """An env whose PATH `python3` is a /bin/sh shim executing *shell_body*."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     shim = bin_dir / "python3"
-    shim.write_text(f'#!/bin/sh\nexec {interpreter} "$@"\n')
+    shim.write_text(f"#!/bin/sh\n{shell_body}\n")
     shim.chmod(0o755)
     env = dict(os.environ)
     env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"

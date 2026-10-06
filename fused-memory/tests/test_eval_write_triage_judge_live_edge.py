@@ -457,3 +457,43 @@ class TestTheRetrievedCli:
         assert (row['attach_target_cluster_id'], row['attach_target_label']) == (
             'b-canon', 'duplicate',
         )
+
+
+def _wording() -> types.ModuleType:
+    return load_script_module(
+        SCRIPT_PATH.parent / 'write_triage_judge_wording.py', 'write_triage_judge_wording',
+    )
+
+
+class TestTheWordingCli:
+    """`main()` on a live seeded `--limit` run: `--wording` reaches the shipped call."""
+
+    @staticmethod
+    def _instructions(tmp_path: Path, monkeypatch, *extra: str) -> list[str]:
+        """The system prompt every Responses call carried, for one live seeded run."""
+        fixture = tmp_path / 'corpus.jsonl'
+        fixture.write_text(''.join(json.dumps(record) + '\n' for record in _CORPUS))
+        monkeypatch.setattr(sys, 'argv', [
+            'eval_write_triage_judge.py', '--fixture', str(fixture),
+            '--report-path', str(tmp_path / 'r.json'),
+            '--limit', '3', '--distractors', '2', *extra,
+        ])
+        client = _openai('amends')
+        with patch('openai.AsyncOpenAI', return_value=client):
+            assert _mod().main() == 0
+        create = client.responses.create
+        assert create.await_count > 0, 'precondition: the shipped judge was reached'
+        return [call.kwargs['instructions'] for call in create.await_args_list]
+
+    def test_a_pre_psi_run_sends_the_pre_psi_prompt_and_restores_the_shipped_one(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from fused_memory.server import write_triage_judge  # noqa: PLC0415
+
+        sent = self._instructions(tmp_path, monkeypatch, '--wording', 'pre-psi')
+        assert set(sent) == {_wording().PRE_PSI_JUDGE_SYSTEM_PROMPT}
+        assert write_triage_judge.JUDGE_SYSTEM_PROMPT is _wording().system_prompt('shipped')
+
+    def test_the_default_is_the_shipped_wording(self, tmp_path: Path, monkeypatch) -> None:
+        sent = self._instructions(tmp_path, monkeypatch)
+        assert set(sent) == {_wording().system_prompt('shipped')}

@@ -719,6 +719,14 @@ class EventType(StrEnum):
     # whose landed diff touched fused-memory/src/).
     service_restart = 'service_restart'
 
+    # Restart drain (task 5371) — one per honoured drain request, emitted by
+    # orchestrator/src/orchestrator/fleet_drain.py::DrainEventTracker via the
+    # harness. data keys: unit, requested_ts, sweep_pid, waited_secs, outcome
+    # ('drained' | 'verifies_killed' | 'abandoned'), refused (the refusal that
+    # abandoned it, else null), merge_verifies_awaited, merge_verifies_killed
+    # (each a list of {task_id, host, kind, started_ts, deadline_ts}).
+    fleet_drain = 'fleet_drain'
+
     # Cross-project external-dep gate held — emitted when a pending task's
     # external deps have been holding dispatch for ``threshold`` consecutive
     # ticks.  Makes the hold DASHBOARD-VISIBLE (telemetry) without escalating

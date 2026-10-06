@@ -402,7 +402,7 @@ def _targets(cmd: str, keyword: str, *, value_flags: frozenset[str] = frozenset(
     side alone is precisely what must fail. Appending the flags to the root
     fleet chain's trailing segment so the phantoms matched on both sides would
     parallelise the fleet fallback as a side effect of a parsing workaround,
-    against a chain whose members do not all declare pytest-xdist.
+    against a chain whose members did not then all declare pytest-xdist.
     """
     return vci.positional_targets(_segment(cmd, keyword), keyword, value_flags=value_flags)
 

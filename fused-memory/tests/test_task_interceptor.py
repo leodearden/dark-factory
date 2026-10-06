@@ -24,6 +24,7 @@ from fused_memory.config.schema import CuratorConfig, FusedMemoryConfig
 from fused_memory.middleware import scope_violation_escalator as sve_mod
 from fused_memory.middleware.curator_escalator import CuratorEscalator
 from fused_memory.middleware.curator_zot_duplicate_sweep import DuplicateFinding
+from fused_memory.middleware.done_provenance_authz import DETERMINISTIC_PROVENANCE_KINDS
 from fused_memory.middleware.task_curator import (
     CandidateTask,
     CuratorDecision,
@@ -4200,6 +4201,7 @@ async def test_reopen_freshness_exempts_commitless_kind(
         result = await interceptor.set_task_status(
             '1', 'done', project_root,
             done_provenance={'kind': 'deterministic-deploy'},
+            agent_id='orchestrator',
         )
 
         assert 'error' not in result, result
@@ -4766,7 +4768,9 @@ async def test_done_provenance_accepts_deterministic_deploy_with_pid(
     PID evidence in the persisted provenance blob.
     """
     # No git repo needed — deterministic-deploy carries no commit.
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+    )
 
     result = await interceptor.set_task_status(
         '1',
@@ -4778,6 +4782,7 @@ async def test_done_provenance_accepts_deterministic_deploy_with_pid(
             'unit': 'orchestrator-reify.service',
             'active_enter_timestamp': 'Mon 2026-06-23 20:09:00 UTC',
         },
+        agent_id='orchestrator',
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
@@ -4800,7 +4805,9 @@ async def test_done_provenance_accepts_deterministic_deploy_resume_shape(
     The runner emits this shape on the resume-after-human-resolution path
     (before_done_ran_at already set, escalation cleared by operator).
     """
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+    )
 
     result = await interceptor.set_task_status(
         '1',
@@ -4811,6 +4818,7 @@ async def test_done_provenance_accepts_deterministic_deploy_resume_shape(
             'note': 'resumed after human resolution',
             'unit': 'orchestrator-reify.service',
         },
+        agent_id='orchestrator',
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
@@ -4825,15 +4833,24 @@ async def test_done_provenance_accepts_deterministic_deploy_resume_shape(
 async def test_done_provenance_accepts_deterministic_gate(
     taskmaster, reconciler, event_buffer, tmp_path
 ):
-    """kind='deterministic-gate' with note only (no pid, no unit, no commit) is accepted.
+    """kind='deterministic-gate' with note+escalation_id (no pid, no unit, no
+    commit) is accepted.
 
     The runner emits this shape on a pure gate's resolved->done path
     (before_done is None; the escalation was the only work). No git commit
     or deploy evidence is available, so this kind must pass the provenance
     gate commit-less and pid-less.
+
+    `escalation_id` became REQUIRED for this kind in task 5241 (it cites the
+    resolving gate escalation), so the minimal accepted blob now carries one.
+    What this test still owns, and its escalation_id sibling below does not,
+    is the commit-less/pid-less acceptance and the persistence ROUTE — the
+    atomic set_status_and_stamp_audit call rather than update_task.
     """
     # No git repo needed — deterministic-gate carries no commit.
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+    )
 
     result = await interceptor.set_task_status(
         '1',
@@ -4842,7 +4859,9 @@ async def test_done_provenance_accepts_deterministic_gate(
         done_provenance={
             'kind': 'deterministic-gate',
             'note': 'pure gate resolved',
+            'escalation_id': 'esc-2331-gate',
         },
+        agent_id='orchestrator',
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
@@ -4871,7 +4890,9 @@ async def test_done_provenance_deterministic_gate_persists_escalation_id(
     Stage-2 audit and any operator reading the stored blob rely on it to
     find the gate record.
     """
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+    )
 
     result = await interceptor.set_task_status(
         '1',
@@ -4882,6 +4903,7 @@ async def test_done_provenance_deterministic_gate_persists_escalation_id(
             'note': 'pure gate resolved',
             'escalation_id': 'esc-4064-gate',
         },
+        agent_id='orchestrator',
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
@@ -4906,7 +4928,9 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled(
     its scheduling evidence in the persisted provenance blob.
     """
     # No git repo needed — deterministic-deploy-scheduled carries no commit.
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+    )
 
     result = await interceptor.set_task_status(
         '1',
@@ -4918,6 +4942,7 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled(
             'transient_unit': 'orch-redeploy-restart-1.service',
             'fire_delay_secs': 60,
         },
+        agent_id='orchestrator',
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
@@ -4941,7 +4966,9 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled_resume_sha
     write landed; a later re-dispatch resumes and drives the task to done
     with this note-only shape.
     """
-    interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+    )
 
     result = await interceptor.set_task_status(
         '1',
@@ -4952,6 +4979,7 @@ async def test_done_provenance_accepts_deterministic_deploy_scheduled_resume_sha
             'note': 'resumed after self-restart scheduled (crash before done write)',
             'unit': 'orchestrator-dark-factory.service',
         },
+        agent_id='orchestrator',
     )
 
     assert 'error' not in result, f'expected acceptance but got: {result}'
@@ -5086,7 +5114,11 @@ async def test_validate_done_provenance_accepts_every_declared_kind(tmp_path):
         },
         'deterministic-deploy': {'kind': 'deterministic-deploy'},
         'deterministic-deploy-scheduled': {'kind': 'deterministic-deploy-scheduled'},
-        'deterministic-gate': {'kind': 'deterministic-gate'},
+        # escalation_id is REQUIRED for this kind (task 5241) — it cites the
+        # resolving gate escalation. This table's lockstep assertion is the
+        # repo's own guard that it tracks the contract, so it is corrected
+        # here rather than the requirement being relaxed.
+        'deterministic-gate': {'kind': 'deterministic-gate', 'escalation_id': 'esc-123'},
         'deterministic-milestone': {'kind': 'deterministic-milestone'},
         'operational-verified': {
             'kind': 'operational-verified',
@@ -5105,10 +5137,410 @@ async def test_validate_done_provenance_accepts_every_declared_kind(tmp_path):
     for kind in declared_kinds:
         err, resolved = await _validate_done_provenance(
             '1', minimal_payloads[kind], str(tmp_path), require=True,
+            # An AUTHORIZED caller (task 5241): the deterministic-* kinds are
+            # accepted only from an allowlisted, non-recon-stage identity, so
+            # this table tests the SHAPE contract rather than the caller bar,
+            # which TestDeterministicProvenanceCallerBar owns.
+            agent_id='orchestrator', config=FusedMemoryConfig(),
         )
         assert err is None, f'kind={kind!r} minimal payload rejected: {err}'
         assert resolved is not None, f'kind={kind!r} resolved to None with no error'
         assert resolved['kind'] == kind
+
+
+# ── Task 5241: the `deterministic-*` caller bar (PRD C5 / D11) ──────────
+#
+# Two factors, evaluated in this order at BOTH validator seams (the fresh
+# `done` transition and the same-status repair): a `recon-stage-` caller is
+# refused UNCONDITIONALLY — config-free, so no operator edit can grant it —
+# and every other caller must match a prefix in
+# `reconciliation.deterministic_provenance_allowed_agent_prefixes`
+# (default `['orchestrator']`, an EMPTY list being the kill switch). Both
+# refusals carry `error_type='DeterministicProvenanceCallerNotPermitted'`.
+#
+# Driven end-to-end through `interceptor.set_task_status(...)`, which is
+# where the contract is phrased: the sibling `operational-verified` recon
+# refusal is covered only by direct `_validate_done_provenance` calls, so
+# nothing previously proved the bar actually holds at the MCP-facing seam.
+#
+# The identity is SELF-REPORTED (whatever `agent_id` the caller sends), so
+# this is a misuse deterrent, not a boundary — see
+# `middleware/done_provenance_authz.py`'s docstring.
+
+_DETERMINISTIC_KINDS = sorted(DETERMINISTIC_PROVENANCE_KINDS)
+
+
+def _gate_provenance(**overrides) -> dict:
+    """A minimal VALID `deterministic-gate` blob from the runner's own shape."""
+    return {
+        'kind': 'deterministic-gate',
+        'note': 'pure gate resolved',
+        'escalation_id': 'esc-5241-1',
+        **overrides,
+    }
+
+
+def _assert_caller_refusal(result: dict) -> None:
+    """The shared shape of both caller refusals (one error_type, two reasons)."""
+    assert result.get('error') == 'done_provenance_invalid', result
+    assert result.get('error_type') == 'DeterministicProvenanceCallerNotPermitted', result
+
+
+class TestDeterministicProvenanceCallerBar:
+    """PRD C5 / D11 at the `set_task_status` seam."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kind', _DETERMINISTIC_KINDS)
+    async def test_recon_stage_caller_is_refused_for_every_deterministic_kind(
+        self, taskmaster, reconciler, event_buffer, tmp_path, kind,
+    ):
+        """The exact incident-5156 shape: reconciliation Stage 2 self-authorizing
+        a runner-stamped close. No write of any kind may be attempted."""
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(kind=kind),
+            agent_id='recon-stage-task_knowledge_sync',
+        )
+
+        _assert_caller_refusal(result)
+        assert 'recon' in result['reason'].lower(), result
+        taskmaster.set_status_and_stamp_audit.assert_not_called()
+        taskmaster.set_task_status.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_recon_stage_is_still_refused_when_the_prefix_is_granted(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """D11: the recon-stage branch is CONFIG-FREE. Granting `recon-stage-`
+        on the allowlist must not defeat it — the two factors catch different
+        failure classes and the incident's class must not be buyable."""
+        cfg = FusedMemoryConfig()
+        cfg.reconciliation.deterministic_provenance_allowed_agent_prefixes = ['recon-stage-']
+        interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, config=cfg)
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='recon-stage-task_knowledge_sync',
+        )
+
+        _assert_caller_refusal(result)
+        assert 'recon' in result['reason'].lower(), result
+        taskmaster.set_status_and_stamp_audit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unlisted_client_is_refused_and_told_the_bar(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """'dashboard' stands for any non-allowlisted caller identity — the
+        wrong-caller class the allowlist catches."""
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='dashboard',
+        )
+
+        _assert_caller_refusal(result)
+        assert "'orchestrator'" in result['reason'], result
+        assert 'deterministic_provenance_allowed_agent_prefixes' in result['reason'], result
+        taskmaster.set_status_and_stamp_audit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_is_accepted_and_the_blob_survives(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='orchestrator',
+        )
+
+        assert 'error' not in result, result
+        taskmaster.set_status_and_stamp_audit.assert_called_once()
+        persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs[
+            'audit_fields'
+        ]['done_provenance']
+        assert persisted['kind'] == 'deterministic-gate'
+        assert persisted['note'] == 'pure gate resolved'
+        assert persisted['escalation_id'] == 'esc-5241-1'
+
+    @pytest.mark.asyncio
+    async def test_empty_allowlist_denies_even_the_orchestrator(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """The operator's live kill switch for the whole provenance family."""
+        cfg = FusedMemoryConfig()
+        cfg.reconciliation.deterministic_provenance_allowed_agent_prefixes = []
+        interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, config=cfg)
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='orchestrator',
+        )
+
+        _assert_caller_refusal(result)
+        taskmaster.set_status_and_stamp_audit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_real_reload_flips_the_bar_with_no_reconstruction(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """Green-tier end to end, not merely at the diff layer: the REAL
+        `apply_reload` mutates the very config object the interceptor holds,
+        and the next identical call is accepted."""
+        from fused_memory.config.reload import apply_reload
+
+        cfg = FusedMemoryConfig()
+        interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer, config=cfg)
+
+        refused = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='dashboard',
+        )
+        _assert_caller_refusal(refused)
+
+        fresh = FusedMemoryConfig()
+        fresh.reconciliation.deterministic_provenance_allowed_agent_prefixes = [
+            'orchestrator', 'dashboard',
+        ]
+        report = apply_reload(cfg, fresh)
+        assert report['reloaded'] is True, report
+        assert (
+            'reconciliation.deterministic_provenance_allowed_agent_prefixes'
+            in report['applied']
+        ), report
+
+        accepted = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='dashboard',
+        )
+        assert 'error' not in accepted, accepted
+        taskmaster.set_status_and_stamp_audit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_an_interceptor_with_no_config_denies(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """DENY-ON-MISSING includes the config object itself: a construction
+        path that forgets `config=` must not quietly evaporate the bar."""
+        interceptor = TaskInterceptor(taskmaster, reconciler, event_buffer)
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='orchestrator',
+        )
+
+        _assert_caller_refusal(result)
+        taskmaster.set_status_and_stamp_audit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_repair_seam_is_not_a_bypass(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """Already-`done` task: the sanctioned same-status repair seam must
+        close against the same caller, exactly as it already does for
+        `operational-verified`."""
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '1', 'status': 'done', 'title': 'Test Task'},
+        )
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='recon-stage-2',
+        )
+
+        _assert_caller_refusal(result)
+        taskmaster.stamp_audit_metadata.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_the_repair_seam_accepts_an_allowlisted_caller(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '1', 'status': 'done', 'title': 'Test Task'},
+        )
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(),
+            agent_id='orchestrator',
+        )
+
+        assert result.get('done_provenance_repaired') is True, result
+        taskmaster.stamp_audit_metadata.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_non_deterministic_kinds_are_untouched_by_the_bar(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """Regression fence: the new bar is scoped to the deterministic family.
+        `merged` / `found_on_main` / `operational-verified` still clear it with
+        no allowlist entry for their callers."""
+        sha = _init_git_repo(tmp_path)
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+
+        for provenance in (
+            {'kind': 'merged', 'commit': sha},
+            {'kind': 'found_on_main', 'commit': sha, 'note': 'sibling task 99 landed this'},
+            {
+                'kind': 'operational-verified',
+                'escalation_id': 'esc-123',
+                'note': 'restarted fused-memory',
+            },
+        ):
+            taskmaster.set_status_and_stamp_audit.reset_mock()
+            result = await interceptor.set_task_status(
+                '1', 'done', str(tmp_path),
+                done_provenance=provenance,
+                agent_id='claude-interactive',
+            )
+            assert 'error' not in result, (provenance, result)
+            taskmaster.set_status_and_stamp_audit.assert_called_once()
+
+    # ── The `deterministic-gate` → `escalation_id` requirement (task 5241) ──
+    #
+    # A SHAPE deterrent stacked on the caller bar above: a hand-passer must at
+    # minimum name a record, and that id lands in the audit trail where a
+    # reader can check it. Recorded VERBATIM with no cross-service lookup —
+    # the same no-lookup contract `operational-verified` already has.
+    #
+    # Every case below uses an ALLOWLISTED caller, so only the shape is under
+    # test. The refusal is a plain `done_provenance_invalid` with NO
+    # `error_type`: it is a shape defect from an authorized caller, and
+    # conflating it with the caller error type would tell an operator to fix
+    # an allowlist when they need to fix a payload.
+
+    @pytest.mark.asyncio
+    async def test_gate_without_escalation_id_is_refused(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance={'kind': 'deterministic-gate', 'note': 'pure gate resolved'},
+            agent_id='orchestrator',
+        )
+
+        assert result.get('error') == 'done_provenance_invalid', result
+        assert 'escalation_id' in result['reason'], result
+        assert 'error_type' not in result, (
+            'a shape defect from an authorized caller must not be reported as '
+            'a caller refusal', result,
+        )
+        taskmaster.set_status_and_stamp_audit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_gate_escalation_id_survives_verbatim(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(escalation_id='esc-5241-verbatim'),
+            agent_id='orchestrator',
+        )
+
+        assert 'error' not in result, result
+        persisted = taskmaster.set_status_and_stamp_audit.call_args.kwargs[
+            'audit_fields'
+        ]['done_provenance']
+        assert persisted['escalation_id'] == 'esc-5241-verbatim'
+
+    @pytest.mark.asyncio
+    async def test_whitespace_only_escalation_id_is_refused(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """The validator already strips to None, so a blank id must not read as
+        satisfying the requirement."""
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance=_gate_provenance(escalation_id='   '),
+            agent_id='orchestrator',
+        )
+
+        assert result.get('error') == 'done_provenance_invalid', result
+        assert 'escalation_id' in result['reason'], result
+        taskmaster.set_status_and_stamp_audit.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'kind',
+        [k for k in _DETERMINISTIC_KINDS if k != 'deterministic-gate'],
+    )
+    async def test_the_requirement_is_gate_scoped(
+        self, taskmaster, reconciler, event_buffer, tmp_path, kind,
+    ):
+        """The other three deterministic kinds carry their own evidence (PID,
+        transient unit, predicate verdict) and never cited an escalation."""
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance={'kind': kind},
+            agent_id='orchestrator',
+        )
+
+        assert 'error' not in result, result
+        taskmaster.set_status_and_stamp_audit.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_the_repair_seam_enforces_the_requirement_too(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """A legacy blob must not be re-stamped around the requirement."""
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '1', 'status': 'done', 'title': 'Test Task'},
+        )
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+
+        result = await interceptor.set_task_status(
+            '1', 'done', str(tmp_path),
+            done_provenance={'kind': 'deterministic-gate', 'note': 'pure gate resolved'},
+            agent_id='orchestrator',
+        )
+
+        assert result.get('error') == 'done_provenance_invalid', result
+        assert 'escalation_id' in result['reason'], result
+        taskmaster.stamp_audit_metadata.assert_not_called()
 
 
 # ── Task 3455: honest git-probe rejection wording ───────────────────────
@@ -5467,7 +5899,12 @@ async def test_validate_done_provenance_does_not_stamp_merged(tmp_path, frozen_p
     [
         {'kind': 'deterministic-deploy', 'pid': 4242, 'unit': 'fused-memory.service'},
         {'kind': 'deterministic-deploy-scheduled', 'unit': 'fused-memory.service'},
-        {'kind': 'deterministic-gate', 'note': 'pure gate resolved'},
+        # escalation_id is required for the gate kind (task 5241).
+        {
+            'kind': 'deterministic-gate',
+            'note': 'pure gate resolved',
+            'escalation_id': 'esc-123',
+        },
         {'kind': 'deterministic-milestone'},
         {'kind': 'operational-verified', 'escalation_id': 'esc-123', 'note': 'restarted'},
     ],
@@ -5485,6 +5922,8 @@ async def test_validate_done_provenance_does_not_stamp_other_kinds(
         str(tmp_path),
         require=False,
         is_recon_stage=False,
+        agent_id='orchestrator',
+        config=FusedMemoryConfig(),
     )
 
     assert err is None, f'expected acceptance but got: {err}'
@@ -12316,6 +12755,232 @@ async def test_client_op_id_failure_result_not_pinned(
         assert await journal.get_idempotent_result('op-fail') is None
     finally:
         await journal.close()
+
+
+# ── Task 5241: a done write's journal row names the CALLER ──────────────
+#
+# Incident 5156's row said agent_id='task-interceptor' — the component that
+# WROTE the row, not the caller that asked for the write — so the caller was
+# unrecoverable from the audit trail. On a DONE write the row now carries the
+# RESOLVED caller (NULL when none was supplied, which reads honestly as "the
+# caller supplied no identity") plus `params['done_provenance_kind']`, for
+# the accepted and the REFUSED write alike. The refused row is the load-
+# bearing one: it is the only surface on which a spoofing caller — the
+# residual the self-reported identity cannot prevent — becomes visible.
+#
+# Every non-done row keeps the literal and carries no `done_provenance_kind`
+# key, so no existing consumer changes meaning.
+#
+# Rows are read back through the PUBLIC readers. The `journal._db` sqlite
+# reads elsewhere in this file are the pattern to improve on, not to copy:
+# reaching a module's internals from a test is an interface smell.
+
+
+@contextlib.asynccontextmanager
+async def _wired_journal(interceptor, path):
+    """A real WriteJournal at *path*, wired into *interceptor* and closed."""
+    from fused_memory.services.write_journal import WriteJournal
+
+    journal = WriteJournal(path)
+    await journal.initialize()
+    try:
+        interceptor.set_write_journal(journal)
+        yield journal
+    finally:
+        await journal.close()
+
+
+async def _only_row(journal, operation: str) -> dict:
+    """The single write_ops row for *operation*, via the public reader."""
+    rows = [
+        row for row in await journal.get_ops_since('1970-01-01')
+        if row['operation'] == operation
+    ]
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+class TestDoneWriteJournalNamesTheCaller:
+    """PRD C5's audit half: the caller must be recoverable from the row alone."""
+
+    @pytest.mark.asyncio
+    async def test_refused_done_write_journals_the_caller_and_the_kind(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """The B11 signal, and the exact 5156 shape: a refused recon-stage gate
+        close leaves an intent row naming who asked."""
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+        async with _wired_journal(interceptor, tmp_path / 'wj_refused') as journal:
+            result = await interceptor.set_task_status(
+                '1', 'done', str(tmp_path),
+                done_provenance=_gate_provenance(),
+                agent_id='recon-stage-task_knowledge_sync',
+            )
+            assert result.get('error') == 'done_provenance_invalid', result
+
+            row = await _only_row(journal, 'set_task_status')
+            assert row['agent_id'] == 'recon-stage-task_knowledge_sync'
+            assert row['success'] == 0
+            assert row['error'], 'a refusal row must carry the refusal'
+            assert json.loads(row['params'])['done_provenance_kind'] == 'deterministic-gate'
+            # Nothing was attempted, so there is no backend row to explain.
+            assert await journal.get_backend_ops_for_write_op(row['id']) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('provenance', 'expected_kind'),
+        [
+            ({'kind': 'nonsense'}, 'nonsense'),
+            ('not-even-a-dict', None),
+            ({'note': 'no kind at all'}, None),
+        ],
+        ids=['unknown-kind', 'non-dict', 'kindless'],
+    )
+    async def test_a_malformed_claim_still_leaves_an_audit_row(
+        self, taskmaster, reconciler, event_buffer, tmp_path, provenance, expected_kind,
+    ):
+        """An unparseable claim must not silently skip the audit row — the row
+        records whatever the caller claimed, None when it is unreadable."""
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+        async with _wired_journal(interceptor, tmp_path / 'wj_malformed') as journal:
+            result = await interceptor.set_task_status(
+                '1', 'done', str(tmp_path),
+                done_provenance=provenance,
+                agent_id='dashboard',
+            )
+            assert result.get('error') == 'done_provenance_invalid', result
+
+            row = await _only_row(journal, 'set_task_status')
+            assert row['agent_id'] == 'dashboard'
+            assert row['success'] == 0
+            assert json.loads(row['params'])['done_provenance_kind'] == expected_kind
+
+    @pytest.mark.asyncio
+    async def test_accepted_done_write_journals_the_caller_and_the_kind(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+        async with _wired_journal(interceptor, tmp_path / 'wj_accepted') as journal:
+            result = await interceptor.set_task_status(
+                '1', 'done', str(tmp_path),
+                done_provenance=_gate_provenance(),
+                agent_id='orchestrator',
+            )
+            assert 'error' not in result, result
+
+            row = await _only_row(journal, 'set_task_status')
+            assert row['agent_id'] == 'orchestrator'
+            assert row['success'] == 1
+            assert json.loads(row['params'])['done_provenance_kind'] == 'deterministic-gate'
+            assert await journal.get_backend_ops_for_write_op(row['id']) != []
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_caller_reads_as_unknown_not_as_the_component(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """NULL, never the literal 'task-interceptor': recording the component
+        for an unknown caller is precisely the unrecoverability 5241 closes."""
+        sha = _init_git_repo(tmp_path)
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+        async with _wired_journal(interceptor, tmp_path / 'wj_anon') as journal:
+            result = await interceptor.set_task_status(
+                '1', 'done', str(tmp_path),
+                done_provenance={'kind': 'merged', 'commit': sha},
+                agent_id=None,
+            )
+            assert 'error' not in result, result
+
+            row = await _only_row(journal, 'set_task_status')
+            assert row['agent_id'] is None
+            assert json.loads(row['params'])['done_provenance_kind'] == 'merged'
+
+    @pytest.mark.asyncio
+    async def test_the_repair_seam_journals_its_caller(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """This seam had no journal row at all before — a repair of an
+        already-`done` task was invisible to the audit trail."""
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '1', 'status': 'done', 'title': 'Test Task'},
+        )
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+        async with _wired_journal(interceptor, tmp_path / 'wj_repair') as journal:
+            result = await interceptor.set_task_status(
+                '1', 'done', str(tmp_path),
+                done_provenance=_gate_provenance(),
+                agent_id='orchestrator',
+            )
+            assert result.get('done_provenance_repaired') is True, result
+
+            row = await _only_row(journal, 'set_task_status')
+            assert row['agent_id'] == 'orchestrator'
+            assert row['success'] == 1
+            assert json.loads(row['params'])['done_provenance_kind'] == 'deterministic-gate'
+
+    @pytest.mark.asyncio
+    async def test_a_refused_repair_journals_a_failure_row(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        taskmaster.get_task = AsyncMock(
+            return_value={'id': '1', 'status': 'done', 'title': 'Test Task'},
+        )
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+        async with _wired_journal(interceptor, tmp_path / 'wj_repair_no') as journal:
+            result = await interceptor.set_task_status(
+                '1', 'done', str(tmp_path),
+                done_provenance=_gate_provenance(),
+                agent_id='recon-stage-2',
+            )
+            assert result.get('error') == 'done_provenance_invalid', result
+
+            row = await _only_row(journal, 'set_task_status')
+            assert row['agent_id'] == 'recon-stage-2'
+            assert row['success'] == 0
+            assert row['error']
+
+    @pytest.mark.asyncio
+    async def test_a_non_done_status_row_is_byte_unchanged(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        """The override is scoped to done writes: everything else keeps the
+        literal and carries no done_provenance_kind key."""
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+        async with _wired_journal(interceptor, tmp_path / 'wj_inprog') as journal:
+            await interceptor.set_task_status(
+                '1', 'in-progress', str(tmp_path), agent_id='dashboard',
+            )
+
+            row = await _only_row(journal, 'set_task_status')
+            assert row['agent_id'] == 'task-interceptor'
+            assert 'done_provenance_kind' not in json.loads(row['params'])
+
+    @pytest.mark.asyncio
+    async def test_an_update_task_row_is_byte_unchanged(
+        self, taskmaster, reconciler, event_buffer, tmp_path,
+    ):
+        interceptor = TaskInterceptor(
+            taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        )
+        async with _wired_journal(interceptor, tmp_path / 'wj_update') as journal:
+            await interceptor.update_task('1', str(tmp_path), prompt='tweak')
+
+            row = await _only_row(journal, 'update_task')
+            assert row['agent_id'] == 'task-interceptor'
+            assert 'done_provenance_kind' not in json.loads(row['params'])
 
 
 # ── Tests for update_task status-kwarg rejection (defence-in-depth) ─────────

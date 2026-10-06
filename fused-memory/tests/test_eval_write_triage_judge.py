@@ -65,6 +65,13 @@ def _mod() -> types.ModuleType:
 
 
 @functools.cache
+def _wording() -> types.ModuleType:
+    return _load_module(
+        SCRIPT_PATH.parent / 'write_triage_judge_wording.py', 'write_triage_judge_wording',
+    )
+
+
+@functools.cache
 def _calib() -> types.ModuleType:
     """Leaf alpha's script, loaded INDEPENDENTLY of the eval's own import.
 
@@ -1544,6 +1551,7 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
             'judge_candidate_count': None,
             'cases_path': None,
             'canonical_aliases': None,
+            'wording': 'shipped',
             **overrides,
         })
         assert _mod()._run(args) == 0
@@ -1676,6 +1684,16 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
         assert recorded == hashlib.sha256(JUDGE_SYSTEM_PROMPT.encode('utf-8')).hexdigest()
         assert len(recorded) == 64 and set(recorded) <= set('0123456789abcdef')
 
+    def test_a_pre_psi_run_records_the_pre_psi_prompt_it_measured(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        recorded = self._captured(tmp_path, monkeypatch, wording='pre-psi')[
+            'judge_system_prompt_sha256'
+        ]
+        assert recorded == hashlib.sha256(
+            _wording().PRE_PSI_JUDGE_SYSTEM_PROMPT.encode('utf-8'),
+        ).hexdigest()
+
 
 class TestADotMdReportPathIsRejectedAtArgumentTime:
     """`--report-path foo.md` is a bad ARGUMENT, so `_run` refuses it up front.
@@ -1703,6 +1721,7 @@ class TestADotMdReportPathIsRejectedAtArgumentTime:
             judge_candidate_count=None,
             cases_path=None,
             canonical_aliases=None,
+            wording='shipped',
         )
 
     def test_run_refuses_it_before_it_even_reads_the_fixture(
@@ -1832,6 +1851,24 @@ class TestGuardCommittedReport:
                 committed, dry_run=False, limit=None, slate_mode=_mod().SLATE_RETRIEVED)
         assert got == committed
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_a_non_shipped_wording_cannot_overwrite_the_arbiter(self) -> None:
+        with pytest.raises(ValueError, match='--report-path'):
+            _mod().guard_committed_report(
+                _mod()._DEFAULT_REPORT_PATH, dry_run=False, limit=None,
+                slate_mode=_mod().SLATE_RETRIEVED, wording='pre-psi')
+
+    def test_the_shipped_wording_may_write_the_arbiter(self) -> None:
+        committed = _mod()._DEFAULT_REPORT_PATH
+        assert _mod().guard_committed_report(
+            committed, dry_run=False, limit=None,
+            slate_mode=_mod().SLATE_RETRIEVED, wording='shipped') == committed
+
+    def test_a_pre_psi_run_elsewhere_is_untouched(self, tmp_path: Path) -> None:
+        target = str(tmp_path / 'fixture-pre-psi.json')
+        assert _mod().guard_committed_report(
+            target, dry_run=False, limit=None,
+            slate_mode=_mod().SLATE_RETRIEVED, wording='pre-psi') == target
 
 
 class TestABareDryRunCannotReachTheCommittedArtifact:
