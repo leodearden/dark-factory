@@ -5,8 +5,12 @@ The audit wraps the client's ``_generate_response``, the seam upstream's
 is validated against its ``response_model``. A mismatch is counted and raised, so
 upstream re-prompts and finally fails, and off-schema JSON never reaches the
 caller. Transport failures are tallied outside the conformance denominator.
+Upstream has two per-attempt return shapes, chosen by client family at install:
+``BaseOpenAIClient``'s ``(payload, input_tokens, output_tokens)`` and
+``OpenAIGenericClient``'s bare payload; a client of any other family is refused.
 """
 
+import inspect
 import json
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping
@@ -15,6 +19,8 @@ from types import MappingProxyType
 from typing import Any
 
 from graphiti_core.llm_client import LLMClient
+from graphiti_core.llm_client.openai_base_client import BaseOpenAIClient
+from graphiti_core.llm_client.openai_generic_client import OpenAIGenericClient
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from shared.memory_eval_metrics import Metric
 
@@ -25,6 +31,27 @@ _SEAM = '_generate_response'
 
 ResponseValidator = Callable[[object, type[BaseModel] | None], None]
 """Raises ``ValidationError`` (or ``JSONDecodeError``) when a response is off-schema."""
+
+
+def _payload_of_token_tuple(result: Any) -> object:
+    payload, _input_tokens, _output_tokens = result
+    return payload
+
+
+def _payload_itself(result: Any) -> object:
+    return result
+
+
+@dataclass(frozen=True)
+class _AttemptShape:
+    family: type[LLMClient]
+    payload: Callable[[Any], object]
+
+
+_ATTEMPT_SHAPES: tuple[_AttemptShape, ...] = (
+    _AttemptShape(BaseOpenAIClient, _payload_of_token_tuple),
+    _AttemptShape(OpenAIGenericClient, _payload_itself),
+)
 
 
 @dataclass(frozen=True)
@@ -88,19 +115,43 @@ def install_conformance_audit(
             'per-attempt seam of graphiti_core llm_client/client.py::LLMClient.generate_response, '
             'and auditing without it would be silently inert'
         )
+    shape = _attempt_shape_of(client)
+    signature = inspect.signature(attempt)
+    if 'response_model' not in signature.parameters:
+        raise TypeError(
+            f'{type(client).__name__}.{_SEAM}{signature} takes no response_model: '
+            'the conformance audit cannot validate an attempt without it'
+        )
     # Instance attribute shadows the class method: upstream's retry loop calls self._generate_response.
-    setattr(client, _SEAM, _audited(attempt, ledger, validator))
+    setattr(client, _SEAM, _audited(attempt, signature, shape, ledger, validator))
+
+
+def _attempt_shape_of(client: LLMClient) -> _AttemptShape:
+    for shape in _ATTEMPT_SHAPES:
+        if isinstance(client, shape.family):
+            return shape
+    families = ', '.join(shape.family.__name__ for shape in _ATTEMPT_SHAPES)
+    raise TypeError(
+        f'{type(client).__name__} is in none of the attempt-shape families the conformance '
+        f'audit supports ({families}): it refuses rather than run inert on a {_SEAM} '
+        'return value whose shape it does not know'
+    )
 
 
 def _audited(
-    attempt: Callable[..., Any], ledger: ConformanceLedger, validator: ResponseValidator
-) -> Callable[..., Awaitable[dict[str, Any]]]:
-    async def audited_attempt(
-        messages: Any, response_model: type[BaseModel] | None = None, **kwargs: Any
-    ) -> dict[str, Any]:
+    attempt: Callable[..., Any],
+    signature: inspect.Signature,
+    shape: _AttemptShape,
+    ledger: ConformanceLedger,
+    validator: ResponseValidator,
+) -> Callable[..., Awaitable[Any]]:
+    async def audited_attempt(*args: Any, **kwargs: Any) -> Any:
+        call = signature.bind(*args, **kwargs)
+        call.apply_defaults()
+        response_model = call.arguments['response_model']
         try:
-            result = await attempt(messages, response_model, **kwargs)
-            validator(result, response_model)
+            result = await attempt(*args, **kwargs)
+            validator(shape.payload(result), response_model)
         except (json.JSONDecodeError, ValidationError) as error:
             ledger.record_invalid(error)
             raise
