@@ -6639,15 +6639,7 @@ def test_main_deferred_output_names_the_stage_and_the_unverified_count(tmp_path,
     distinguishable by field -- printing neither hides it from the one person
     watching the run.
     """
-    (tmp_path / "docs" / "legibility").mkdir(parents=True)
-    (tmp_path / "docs" / "legibility" / "legibility.yaml").write_text(
-        "project_id: dark_factory\n"
-        f"project_root: {tmp_path}\n"
-        "escalation_port: 8103\n"
-        "cwd_prefixes:\n"
-        f"  - {tmp_path}\n",
-        encoding="utf-8",
-    )
+    _census_project(tmp_path)
 
     def fake_run_census(**kwargs):
         return mod.CensusOutcome(
