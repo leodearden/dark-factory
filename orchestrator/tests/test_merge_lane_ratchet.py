@@ -47,13 +47,14 @@ can never masquerade as a clean tree.
 """
 from __future__ import annotations
 
+import ast
 import copy
 import dataclasses
 import json
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, ModuleType
 
 import pytest
 from _git_fixtures import RepoSeed, build_repo
@@ -418,6 +419,61 @@ class TestEnumerationRoundTrip:
 # ---------------------------------------------------------------------------
 # The per-file measures live in scripts/source_measures.py, and the ratchet
 # reaches them through that module rather than re-exporting them.
+
+_INTERNABLE_ATOMS = (str, bytes, int, float, type(None))
+
+
+def _is_defined_by(module: ModuleType, name: str, value: object) -> bool:
+    if name.startswith('__') and name.endswith('__'):
+        return False
+    if isinstance(value, (ModuleType, *_INTERNABLE_ATOMS)):
+        return False
+    if isinstance(value, (tuple, frozenset)) and not value:
+        return False
+    return getattr(value, '__module__', module.__name__) == module.__name__
+
+
+def _objects_defined_in(module: ModuleType) -> list[object]:
+    return [
+        value
+        for name, value in vars(module).items()
+        if _is_defined_by(module, name, value)
+    ]
+
+
+def _names_rebound_from(
+    namespace: Mapping[str, object], provider: ModuleType
+) -> list[str]:
+    owned = _objects_defined_in(provider)
+    return sorted(
+        name
+        for name, value in namespace.items()
+        if any(value is own for own in owned)
+    )
+
+
+class TestTheRatchetReExportsNoMeasure:
+    def test_the_ratchet_binds_nothing_source_measures_defines(self) -> None:
+        assert _names_rebound_from(vars(metrics), source_measures) == []
+
+    def test_a_rebinding_under_any_name_is_found(self) -> None:
+        namespace: dict[str, object] = {
+            'ast': ast,
+            'Path': Path,
+            'Mapping': Mapping,
+            'source_measures': source_measures,
+            'alias': source_measures.file_size_measures,
+            'Err': source_measures.MetricsError,
+            'LIMIT': source_measures.COMPLEXIPY_MIN,
+            'ROOTS': source_measures.PSEUDO_MEMBERS,
+        }
+        assert _names_rebound_from(namespace, source_measures) == [
+            'Err',
+            'LIMIT',
+            'ROOTS',
+            'alias',
+        ]
+
 
 _MOVED_PUBLIC_NAMES = (
     'MetricsError',
