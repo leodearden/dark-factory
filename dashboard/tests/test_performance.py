@@ -2130,10 +2130,12 @@ def _task_row(
     duration_ms: int = 1000,
     verify_attempts: int = 0,
     review_cycles: int = 0,
+    steward_invocations: int = 0,
 ) -> tuple:
     return (
         f'run-{project_id}', task_id, project_id, None, outcome, 0.0, duration_ms,
-        0, 0, verify_attempts, review_cycles, 0.0, 0, completed_at.isoformat(),
+        0, 0, verify_attempts, review_cycles, 0.0, steward_invocations,
+        completed_at.isoformat(),
     )
 
 
@@ -2567,3 +2569,35 @@ class TestCardsAcrossRunsDbs:
             assert ttc['count'] == 1
         for statements in (statements_a, statements_b):
             assert sum('MAX(completed_at)' in sql for sql in statements) == 1
+
+
+# ---------------------------------------------------------------------------
+# Cancel outcomes are attempts stopped from outside, not task outcomes (task 6424)
+# ---------------------------------------------------------------------------
+
+
+def _rows_with_cancels(now: datetime) -> list[tuple]:
+    """'proj' finishes d1 one-pass and blocks b1 among four cancels, the latest
+    of which (c2) is newer than d1. 'redeployed-idle' last completed 20 days
+    ago, then had a slot cancelled at shutdown. 'drained' holds only a cancel."""
+    return [
+        _task_row('d1', 'proj', now - timedelta(hours=1)),
+        _task_row('b1', 'proj', now - timedelta(hours=2), outcome='blocked'),
+        _task_row(
+            'c1', 'proj', now - timedelta(minutes=50), outcome='cancelled', steward_invocations=1,
+        ),
+        _task_row('s1', 'proj', now - timedelta(minutes=45), outcome='soft-cancelled'),
+        _task_row('c2', 'proj', now - timedelta(minutes=30), outcome='cancelled'),
+        _task_row('c3', 'proj', now - timedelta(hours=5), outcome='cancelled'),
+        _task_row('i1', 'redeployed-idle', now - timedelta(days=20)),
+        _task_row('r1', 'redeployed-idle', now - timedelta(minutes=10), outcome='cancelled'),
+        _task_row('x1', 'drained', now - timedelta(minutes=10), outcome='cancelled'),
+    ]
+
+
+@pytest.fixture()
+async def cancels_conn(tmp_path):
+    db_path = _make_runs_db(tmp_path, 'cancels.db', _rows_with_cancels(CARDS_NOW))
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        yield conn
