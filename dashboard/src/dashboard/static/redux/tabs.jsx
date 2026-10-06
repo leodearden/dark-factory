@@ -1,5 +1,5 @@
 /* Remaining tabs: orchestrators, performance, memory, recon, merge, costs, burndown */
-const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarChart: HBC, Donut: DN, StatTile: ST, PALETTE: CP, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds, SMOOTHING_OPTIONS, formatCountTick } = window.DF_CHARTS;
+const { Sparkline: SP, LineChart: LC, StackedAreaChart: SA, BarChart: BC, HBarChart: HBC, Donut: DN, StatTile: ST, PALETTE: CP, deriveVelocitySeries, defaultSmoothingForWindow, smoothingLabelToSeconds, SMOOTHING_OPTIONS, formatCountTick, niceCountMax } = window.DF_CHARTS;
 const { Glyph: GL, ProjectGroup, Pip, DatumReading, Segmented, ChipGroup } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const { rtCell, rtAge } = window.DF_RUNTIME_FMT;
@@ -664,7 +664,7 @@ function MemoryTab({ projectFilter, onNavigate }) {
             <LC labels={DF.MEMORY_OPS.labels} series={[
               { values: DF.MEMORY_OPS.reads, color: CP.accent },
               { values: DF.MEMORY_OPS.writes, color: CP.ok },
-            ]} height={240} formatY={formatCountTick} formatX={window.DF_SHELL.fmtDateTime} />
+            ]} height={240} formatY={formatCountTick} snapMax={niceCountMax} formatX={window.DF_SHELL.fmtDateTime} />
           </div>
         </div>
       </div>
@@ -956,7 +956,7 @@ function MergeTab({ projectFilter }) {
               <div className="grid cols-12" style={{ gap: 12 }}>
                 <div className="col-span-7 panel">
                   <div className="panel-head"><span className="title">Merge attempts · 15-min buckets</span></div>
-                  <div className="panel-body"><LC labels={d.depth.labels.map(String)} series={[{ values: d.depth.values, color: CP.accent }]} height={180} formatY={formatCountTick} formatX={window.DF_SHELL.fmtDateTime} /></div>
+                  <div className="panel-body"><LC labels={d.depth.labels.map(String)} series={[{ values: d.depth.values, color: CP.accent }]} height={180} formatY={formatCountTick} snapMax={niceCountMax} formatX={window.DF_SHELL.fmtDateTime} /></div>
                 </div>
 
                 <div className="col-span-5 panel">
@@ -1296,7 +1296,7 @@ function BurnTab({ projectFilter, displayWindow }) {
                 <span key={l} style={{ color: 'var(--fg-2)' }}><span style={{ display: 'inline-block', width: 10, height: 10, background: c, marginRight: 5, verticalAlign: 'middle', borderRadius: 2 }}></span>{l}</span>
               ))}
             </div>
-            <SA labels={b.labels} stacks={burndownStacks(b, CP)} height={300} formatX={window.DF_SHELL.fmtDateTime} />
+            <SA labels={b.labels} stacks={burndownStacks(b, CP)} height={300} snapMax={niceCountMax} formatX={window.DF_SHELL.fmtDateTime} />
           </div>
         </div>
       )}
@@ -1361,7 +1361,7 @@ function BurnTab({ projectFilter, displayWindow }) {
                     {/* Bands must be indexed by THIS project's own snapshot row: b.labels is
                         the sorted union across all projects (redux_api.py shape_burndown), so
                         pairing it with pb.* both overruns and index-shifts them. */}
-                    <SA labels={pb.labels} stacks={burndownStacks(pb, CP)} height={220} formatX={window.DF_SHELL.fmtDateTime} />
+                    <SA labels={pb.labels} stacks={burndownStacks(pb, CP)} height={220} snapMax={niceCountMax} formatX={window.DF_SHELL.fmtDateTime} />
                   </div>
                 </div>
 

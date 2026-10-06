@@ -529,7 +529,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._maybe_remediate',
-        '82d9ae32fa2a',
+        '8c9728223345',
         'filed',
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
@@ -592,14 +592,14 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._run_remediation_pass',
-        'dbf8ae2eb1dc',
+        '920dc9ba5dbb',
         'filed',
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),
     (
         'fused-memory/src/fused_memory/reconciliation/harness.py',
         'ReconciliationHarness._run_remediation_pass',
-        '1812aa52aaca',
+        'ec953752e2f1',
         'filed',
         _ESCALATE_ARCHIVE_SCAN_WHY,
     ),

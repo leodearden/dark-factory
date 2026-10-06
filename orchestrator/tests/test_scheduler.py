@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from _recording_event_store import _RecordingEventStore
 from shared.locking import directory_locks
+from shared.task_metadata_wire import coerce_task_metadata
 
 from orchestrator.config import (
     TIER_BASE,
@@ -585,7 +586,9 @@ class TestNormalizeTaskMetadataLoudness:
         )
         assert task['metadata'] == {'foo': 1}
 
-    @pytest.mark.parametrize('task', [{'id': '3', 'metadata': None}, {'id': '4'}])
+    @pytest.mark.parametrize(
+        'task', [{'id': '3', 'metadata': None}, {'id': '4'}, {'id': '6', 'metadata': ''}]
+    )
     def test_absent_or_none_metadata_is_silent(self, task, caplog):
         """Most tasks carry no metadata — warning here would be pure noise."""
         caplog.set_level(logging.WARNING, logger=self.LOGGER)
@@ -609,6 +612,27 @@ class TestNormalizeTaskMetadataLoudness:
         assert len(message) < 1000, (
             f'the discarded repr must be truncated; got a {len(message)}-char message'
         )
+
+    @pytest.mark.parametrize(
+        'raw',
+        [None, '', '{"a": 1}', '{not json', '[1,2]', '"x"', '   ', [1], 42, False, {'a': 1}],
+    )
+    def test_collapse_matches_shared_wire_rule(self, raw, caplog):
+        """The wire-boundary collapse is the shared rule's, with unreadable -> {} made loud."""
+        caplog.set_level(logging.WARNING, logger=self.LOGGER)
+        task = {'id': '77', 'metadata': raw}
+        expected = coerce_task_metadata(raw)
+
+        Scheduler._normalize_task_metadata(task)
+
+        assert task['metadata'] == (expected if expected is not None else {})
+        warnings = self._warnings(caplog)
+        assert bool(warnings) == (expected is None), (
+            f'metadata={raw!r}: must warn exactly when the shared rule says unreadable; '
+            f'got {warnings!r}'
+        )
+        if warnings:
+            assert '77' in ' '.join(warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -3749,6 +3773,76 @@ class TestSetTaskStatusForwarding:
         mcp_mock.assert_called_once()
         arguments = mcp_mock.call_args[0][2]['arguments']
         assert 'reopen_reason' not in arguments
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('status', 'done_provenance'),
+        [
+            ('in-progress', None),
+            ('done', {
+                'kind': 'deterministic-gate',
+                'note': 'pure gate resolved',
+                'escalation_id': 'esc-5241-wire',
+            }),
+        ],
+        ids=['non-done', 'deterministic-done'],
+    )
+    async def test_names_the_orchestrator_in_the_arguments(
+        self, scheduler: Scheduler, monkeypatch, status, done_provenance,
+    ):
+        """Task 5241: fused-memory serves stateless HTTP, where clientInfo never
+        reaches a tools/call, so the caller identity must travel in the
+        arguments or the deterministic-* caller bar refuses every runner close.
+
+        Asserts the LITERAL rather than the orchestrator's constant: the
+        spelling is the cross-package contract with fused-memory's default
+        ``reconciliation.deterministic_provenance_allowed_agent_prefixes``.
+        """
+        mcp_mock = AsyncMock(return_value={})
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', mcp_mock)
+
+        await scheduler.set_task_status('1', status, done_provenance=done_provenance)
+
+        mcp_mock.assert_called_once()
+        arguments = mcp_mock.call_args[0][2]['arguments']
+        assert arguments.get('agent_id') == 'orchestrator'
+
+    @pytest.mark.asyncio
+    async def test_a_transient_retry_resends_the_identity(
+        self, scheduler: Scheduler, monkeypatch,
+    ):
+        """The identity is in ``arguments`` before the retry loop, so a retry
+        cannot drop it. Each attempt's arguments are snapshotted at send time:
+        the same dict object is passed every attempt, so reading
+        ``call_args_list`` afterwards would show only its final state."""
+        monkeypatch.setattr(
+            'orchestrator.scheduler.fm_retry_backoffs', lambda *a, **kw: [0.0],
+        )
+        transient = {
+            'result': {'structuredContent': {
+                'error': "TimeoutError('ensure_connected timed out')",
+                'error_type': 'TimeoutError',
+            }},
+        }
+        success = {
+            'result': {'structuredContent': {
+                'message': 'ok', 'tasks': [{'success': True}],
+            }},
+        }
+        responses = iter([transient, success])
+        sent: list[dict] = []
+
+        def _send(url, method, params, **kwargs):
+            sent.append(dict(params['arguments']))
+            return next(responses)
+
+        monkeypatch.setattr('orchestrator.scheduler.mcp_call', AsyncMock(side_effect=_send))
+
+        await scheduler.set_task_status('5', 'in-progress')
+
+        assert [arguments.get('agent_id') for arguments in sent] == [
+            'orchestrator', 'orchestrator',
+        ]
 
     @pytest.mark.asyncio
     async def test_persistent_mcp_exception_raises_after_retries(

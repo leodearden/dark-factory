@@ -32,6 +32,7 @@ except ImportError:
 
 import shared.deploy_state  # noqa: F401  # populate W3 metadata registry with the deploy_state sub-model (DS shared-visible registration; §5.2)
 from shared.task_metadata import DoneProvenance, SchemaWarning, parse_metadata
+from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TERMINAL as TERMINAL_STATUSES
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import derive_actor_class, is_legal_transition
@@ -50,6 +51,11 @@ from fused_memory.middleware.curator_zot_duplicate_sweep import (
     CorpusSearcher,
     build_duplicate_metadata,
     sweep_zot_duplicate,
+)
+from fused_memory.middleware.done_provenance_authz import (
+    DETERMINISTIC_CALLER_ERROR_TYPE,
+    DETERMINISTIC_PROVENANCE_KINDS,
+    resolve_deterministic_provenance_authorization,
 )
 from fused_memory.middleware.live_task_write_guard import (
     FileFindingFn,
@@ -158,47 +164,25 @@ _DELIVERABLE_SIGNAL_KEYS = ('files', 'files_to_modify')
 
 
 def _parse_metadata_value(metadata: Any) -> tuple[dict | None, list[SchemaWarning]]:
-    """Best-effort parse of *metadata* into a raw dict.
+    """Resolve *metadata* by ``shared.task_metadata_wire.coerce_task_metadata``.
 
-    Returns ``(None, warnings)`` when *metadata* is non-None but cannot be
-    resolved to a JSON object at all — *warnings* then carries
-    ``shared.task_metadata.parse_metadata``'s diagnosis
-    (``direction='read'``). Returns ``(None, [])`` for ``None`` and for an
-    empty string (both benign-absent — mirrors the pre-collapse
-    ``isinstance(raw, str) and raw`` guard so a blank string is never a
-    discard), and ``(dict, [])`` for anything already resolvable to a dict.
+    Returns ``(dict, [])`` for absent metadata (a fresh ``{}``) and for
+    readable metadata, and ``(None, warnings)`` for present-but-unreadable
+    metadata. *warnings* then carries
+    ``shared.task_metadata.parse_metadata``'s diagnosis (``direction='read'``);
+    its ``unparseable_json`` / ``not_an_object`` codes cover every value
+    ``coerce_task_metadata`` rejects, so the list is never empty.
 
-    The returned dict — when not ``None`` — is always independently
-    re-derived from *metadata*, never ``parse_metadata(...).model_dump()``,
-    so unknown/curator-internal keys round-trip byte-for-value (I1) instead
-    of gaining ``TaskMetadata``'s typed-field defaults.
-
-    A string is parsed with a local ``json.loads`` first; ``parse_metadata``
-    is only invoked on the failure path to obtain its diagnosis. The two
-    discard codes this function surfaces (``unparseable_json`` /
-    ``not_an_object``) are fully determined by that same
-    loads-then-isinstance check, so a string that already parses to a dict
-    never pays for ``parse_metadata``'s ``apply_migrations`` /
-    submodel-validation / ``TaskMetadata`` construction — none of that
-    output is used here.
+    ``parse_metadata`` runs only on that failure path, for its diagnosis.
+    The returned dict is never ``parse_metadata(...).model_dump()``, so
+    unknown/curator-internal keys round-trip byte-for-value (I1) instead of
+    gaining ``TaskMetadata``'s typed-field defaults.
     """
-    if metadata is None:
-        return None, []
-    if isinstance(metadata, dict):
-        return metadata, []
-    if isinstance(metadata, str):
-        if not metadata:
-            return None, []
-        try:
-            parsed = json.loads(metadata)
-        except ValueError:
-            _, warnings = parse_metadata(metadata, direction='read')
-            return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
-        if isinstance(parsed, dict):
-            return parsed, []
-        _, warnings = parse_metadata(metadata, direction='read')
-        return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
-    return None, []
+    meta = coerce_task_metadata(metadata)
+    if meta is not None:
+        return meta, []
+    _, warnings = parse_metadata(metadata, direction='read')
+    return None, [w for w in warnings if w.code in _METADATA_DISCARD_CODES]
 
 
 def _warn_metadata_discard(source: str, metadata: Any, warnings: list[SchemaWarning]) -> None:
@@ -818,12 +802,52 @@ class TaskInterceptor:
             message=verdict.message,
         )
 
+    async def _log_write_op_row(
+        self,
+        operation: str,
+        project_root: str | None,
+        params: dict[str, Any],
+        *,
+        agent_id: str | None,
+        success: bool = True,
+        error: str | None = None,
+    ) -> str:
+        """Mint a ``write_op_id`` and write the Layer-1 intent row for it.
+
+        THE single writer of that row. :meth:`_journal_around` calls it and
+        reuses the returned id for its ``backend_op`` rows; a REFUSED done
+        write calls it directly with ``success=False`` so the refusal leaves
+        exactly the same row shape rather than inventing a second row kind.
+
+        No-ops (but still returns a fresh id) when :meth:`set_write_journal`
+        was never called, and swallows-and-debug-logs a journal failure — the
+        audit trail must never be able to fail a write.
+        """
+        write_op_id = str(uuid_mod.uuid4())
+        ji = self._write_journal
+        if ji is not None:
+            try:
+                await ji.log_write_op(
+                    write_op_id=write_op_id,
+                    operation=operation,
+                    project_id=resolve_project_id(project_root) if project_root else None,
+                    agent_id=agent_id,
+                    params=params,
+                    success=success,
+                    error=error,
+                )
+            except Exception:
+                logger.debug('write_journal: log_write_op failed', exc_info=True)
+        return write_op_id
+
     async def _journal_around(
         self,
         operation: str,
         project_root: str | None,
         params: dict[str, Any],
         body,
+        *,
+        agent_id: str | None = 'task-interceptor',
     ) -> Any:
         """Wrap *body* (an awaitable) with write_op + backend_op journaling.
 
@@ -832,23 +856,19 @@ class TaskInterceptor:
         or failure with ``backend=`` resolved from the configured task
         backend.
 
+        ``agent_id`` defaults to the historical ``'task-interceptor'``
+        literal, so every call site that omits it is byte-identical. The done
+        write passes the RESOLVED CALLER instead (task 5241) — including an
+        explicit ``None``, which needs no sentinel because "the caller
+        supplied no identity" is itself the fact worth recording.
+
         No-ops when :meth:`set_write_journal` was never called.
         """
         ji = self._write_journal
-        write_op_id = str(uuid_mod.uuid4())
         backend_label = _resolve_backend_label(self.taskmaster)
-        project_id = resolve_project_id(project_root) if project_root else None
-        if ji is not None:
-            try:
-                await ji.log_write_op(
-                    write_op_id=write_op_id,
-                    operation=operation,
-                    project_id=project_id,
-                    agent_id='task-interceptor',
-                    params=params,
-                )
-            except Exception:
-                logger.debug('write_journal: log_write_op failed', exc_info=True)
+        write_op_id = await self._log_write_op_row(
+            operation, project_root, params, agent_id=agent_id,
+        )
         try:
             result = await body
         except BaseException as exc:
@@ -1284,16 +1304,53 @@ class TaskInterceptor:
                 if verdict.is_rejection:
                     return verdict.to_error_dict()
 
+            # Task 5241: ONE params dict and ONE journal identity for every
+            # write_op row this method writes — the accepted write, the
+            # refused-provenance row, and the same-status repair row — so
+            # those three can never disagree about what was asked or who
+            # asked. Both extras are scoped to a DONE write: a non-done row's
+            # params and agent_id stay byte-identical to their pre-5241
+            # shape, so no existing consumer of the 'task-interceptor'
+            # literal changes meaning.
+            _journal_params: dict[str, Any] = {
+                'task_id': task_id,
+                'status': status,
+                'tag': tag,
+            }
+            _journal_agent_id = 'task-interceptor'
+            if status == 'done':
+                _journal_params['done_provenance_kind'] = _provenance_kind(done_provenance)
+                _journal_agent_id = agent_id
+
             if status == old_status:
                 if status == 'done' and done_provenance:
-                    return await _repair_done_provenance_same_status(
+                    repair = await _repair_done_provenance_same_status(
                         tm,
                         task_id,
                         done_provenance,
                         project_root,
                         tag,
                         is_recon_stage=is_recon_stage_write,
+                        agent_id=agent_id,
+                        config=self._config,
                     )
+                    # This seam had NO journal row at all before 5241: a
+                    # repair of an already-`done` task was invisible to the
+                    # audit trail, which is exactly where a hand-passed blob
+                    # would go to get re-stamped. Classified with the shared
+                    # `interceptor_write_succeeded` rather than a hand-rolled
+                    # `'error' in result` check, so the journal agrees with
+                    # every other internal consumer about what counts as a
+                    # successful write.
+                    await self._log_write_op_row(
+                        'set_task_status',
+                        project_root,
+                        _journal_params,
+                        agent_id=_journal_agent_id,
+                        success=interceptor_write_succeeded(repair),
+                        error=_journal_error_text(repair),
+                    )
+                    return repair
                 return {'success': True, 'no_op': True, 'task_id': task_id}
 
             # 2a-pre. Bulk-reset circuit-breaker (task 918, refined task 1016):
@@ -1394,8 +1451,28 @@ class TaskInterceptor:
                     project_root,
                     require=self._require_done_provenance(),
                     is_recon_stage=is_recon_stage_write,
+                    agent_id=agent_id,
+                    config=self._config,
                 )
                 if validation_err is not None:
+                    # Task 5241: the done-provenance VERDICT is journaled with
+                    # the caller — this refusal, and the acceptance below.
+                    # SCOPE, deliberately: the other done-write refusals
+                    # (terminal-exit, phantom-done, bulk-reset, backlog policy,
+                    # pre-done hook) keep their own existing surfaces. PRD C5's
+                    # promise is about the PROVENANCE write, which is the one
+                    # seam where the caller identity was the missing fact
+                    # (incident 5156 recorded 'task-interceptor' and so lost
+                    # the caller); widening to six unrelated early returns
+                    # would add surface and no new fact.
+                    await self._log_write_op_row(
+                        'set_task_status',
+                        project_root,
+                        _journal_params,
+                        agent_id=_journal_agent_id,
+                        success=False,
+                        error=_journal_error_text(validation_err),
+                    )
                     return validation_err
 
                 # 2b-bis. Reopen-freshness gate (task 2674, PRD task alpha):
@@ -1555,8 +1632,9 @@ class TaskInterceptor:
                 return await self._journal_around(
                     'set_task_status',
                     project_root,
-                    {'task_id': task_id, 'status': status, 'tag': tag},
+                    _journal_params,
                     write_body,
+                    agent_id=_journal_agent_id,
                 )
 
             # Task 2624: code-enforced before/after live-task-write
@@ -1849,28 +1927,21 @@ class TaskInterceptor:
     def _parse_metadata(kwargs: dict[str, Any]) -> dict:
         """Parse and normalise ``kwargs['metadata']`` to a plain dict.
 
-        Accepts a pre-parsed dict, a JSON string, or missing / non-dict values.
-        Always returns a dict (empty on failure or missing input) so callers
-        can read keys without additional guarding.
+        Always returns a dict (empty for absent or unreadable input) so
+        callers such as :meth:`_extract_meta_files` and
+        :meth:`_build_candidate` can read keys without additional guarding.
 
-        Single source of truth for the get / json.loads / isinstance-dict
-        dance shared by :meth:`_extract_meta_files` and :meth:`_build_candidate`.
-
-        Delegates the malformed-string-policy to
-        :func:`shared.task_metadata.parse_metadata` (``direction='read'``)
-        and emits a ``task_metadata.schema_warning`` WARNING when a
-        non-empty string is a genuine whole-metadata discard (unparseable
-        JSON / non-object) — I4: this replaces a silent ``{}`` coercion.
+        The absent/readable/unreadable rule is
+        ``shared.task_metadata_wire.coerce_task_metadata``'s, via
+        :func:`_parse_metadata_value`. Unreadable metadata emits a
+        ``task_metadata.schema_warning`` WARNING before collapsing to ``{}``
+        — I4: this replaces a silent ``{}`` coercion.
         """
-        meta = kwargs.get('metadata') or {}
-        if isinstance(meta, str):
-            parsed, warnings = _parse_metadata_value(meta)
-            if warnings:
-                _warn_metadata_discard('TaskInterceptor._parse_metadata', meta, warnings)
-            meta = parsed if parsed is not None else {}
-        if not isinstance(meta, dict):
-            meta = {}
-        return meta
+        metadata = kwargs.get('metadata')
+        parsed, warnings = _parse_metadata_value(metadata)
+        if warnings:
+            _warn_metadata_discard('TaskInterceptor._parse_metadata', metadata, warnings)
+        return parsed if parsed is not None else {}
 
     @staticmethod
     def _extract_meta_files_from_meta(meta: dict) -> list[str]:
@@ -3015,7 +3086,7 @@ class TaskInterceptor:
             # decision itself is unchanged either way. Re-checks the SAME
             # `target_metadata` the condition above consulted, deliberately.
             target_meta, _target_warnings = _parse_metadata_value(target_metadata)
-            if target_metadata and target_meta is None:
+            if target_meta is None:
                 target_reason = 'the target metadata could not be read (corrupt/unparseable)'
             else:
                 target_reason = 'the target does not declare a gate'
@@ -3159,18 +3230,40 @@ class TaskInterceptor:
 
     @staticmethod
     def _extract_metadata_dict(metadata) -> dict | None:
-        """Best-effort parse of ``metadata`` into a dict, or None.
+        """Resolve ``metadata`` to ``{}`` (absent: None / ``''``), a dict, or None.
 
-        Delegates the malformed-string policy to
-        :func:`shared.task_metadata.parse_metadata` (``direction='read'``)
-        and emits a ``task_metadata.schema_warning`` WARNING when a non-None
-        *metadata* cannot be resolved to a dict — I4: this replaces a silent
-        ``None`` coercion.
+        None means present-but-unreadable, and in that case the
+        ``task_metadata.schema_warning`` census WARNING has already been
+        emitted — I4: this replaces a silent ``None`` coercion. The rule is
+        ``shared.task_metadata_wire.coerce_task_metadata``'s, via
+        :func:`_parse_metadata_value`.
         """
         parsed, warnings = _parse_metadata_value(metadata)
         if warnings:
             _warn_metadata_discard('TaskInterceptor._extract_metadata_dict', metadata, warnings)
         return parsed
+
+    @staticmethod
+    def _fresh_metadata_copy(metadata: Any, site: str) -> dict:
+        """Return a mutable dict resolved from *metadata* by :meth:`_extract_metadata_dict`.
+
+        Absent metadata gives a fresh ``{}``, and a readable dict is
+        shallow-copied, so the caller's dict is never mutated. Unreadable
+        metadata is DISCARDED for a fresh ``{}``. On top of the census line
+        :meth:`_extract_metadata_dict` already emitted, a second WARNING
+        prefixed with *site* is logged: two log lines for one failure, so the
+        discard can be grepped by caller.
+        """
+        meta = TaskInterceptor._extract_metadata_dict(metadata)
+        if meta is None:
+            logger.warning(
+                '%s: non-dict metadata discarded (type=%s); using fresh dict. Original value: %r',
+                site,
+                type(metadata).__name__,
+                metadata,
+            )
+            return {}
+        return dict(meta)
 
     @staticmethod
     def _is_gate_metadata(metadata: Any) -> bool:
@@ -3204,12 +3297,11 @@ class TaskInterceptor:
     def _inject_routing_override(metadata: Any, reason: str) -> dict:
         """Return a metadata dict with ``routing_override_reason`` set to *reason*.
 
-        Builds on :meth:`_extract_metadata_dict` to normalise the incoming
-        shape (None / JSON-string / dict / unparseable → fresh dict when None
-        or unparseable) before writing the key, so the result is always a
-        plain dict ready for JSON serialisation.
+        Builds on :meth:`_fresh_metadata_copy` to normalise the incoming
+        shape (absent or unreadable → fresh dict) before writing the key, so
+        the result is always a plain dict ready for JSON serialisation.
 
-        **Data loss note**: when *metadata* is non-None but cannot be parsed
+        **Data loss note**: when *metadata* is present but cannot be parsed
         as a JSON-object (e.g. a bare list, an unparseable string), the
         original value is discarded and a fresh dict is used.  A WARNING is
         emitted in that case so the loss is visible in logs and greppable.
@@ -3217,18 +3309,7 @@ class TaskInterceptor:
         the ticket blob, so enabling an override would otherwise silently
         change behaviour for such inputs.
         """
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
-        if meta is None:
-            if metadata is not None:
-                logger.warning(
-                    'routing-override: non-dict metadata discarded (type=%s); '
-                    'using fresh dict. Original value: %r',
-                    type(metadata).__name__,
-                    metadata,
-                )
-            meta = {}
-        else:
-            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta = TaskInterceptor._fresh_metadata_copy(metadata, 'routing-override')
         meta['routing_override_reason'] = reason
         return meta
 
@@ -3236,11 +3317,10 @@ class TaskInterceptor:
     def _inject_deterministic_pure_gate(metadata: Any) -> dict:
         """Return a metadata dict stamped as a deterministic PURE-GATE.
 
-        Builds on :meth:`_extract_metadata_dict` to normalise the incoming
-        shape (None / JSON-string / dict / unparseable → fresh dict when None
-        or unparseable) before writing the keys, so the result is always a
-        plain dict ready for JSON serialisation — mirrors
-        :meth:`_inject_routing_override`.
+        Builds on :meth:`_fresh_metadata_copy` to normalise the incoming
+        shape (absent or unreadable → fresh dict) before writing the keys, so
+        the result is always a plain dict ready for JSON serialisation —
+        mirrors :meth:`_inject_routing_override`.
 
         Unconditionally sets ``task_kind='deterministic'`` and
         ``always_escalates=True``, and DELETES any ``before_done`` key so the
@@ -3250,25 +3330,7 @@ class TaskInterceptor:
         ill-formed no-op. This holds regardless of what task_kind/before_done
         the recon LLM originally supplied in metadata.
         """
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
-        if meta is None:
-            if metadata is not None:
-                # NOTE: _extract_metadata_dict() already emitted a WARNING
-                # (via _warn_metadata_discard) when it failed to parse this
-                # non-None metadata. This second WARNING is intentional, not
-                # a duplicate bug — it names *this* call site
-                # (deterministic-pure-gate stamping) so the discard is
-                # greppable by caller, mirroring the identical double-log in
-                # _inject_routing_override above. Two log lines, one failure.
-                logger.warning(
-                    'deterministic-pure-gate: non-dict metadata discarded (type=%s); '
-                    'using fresh dict. Original value: %r',
-                    type(metadata).__name__,
-                    metadata,
-                )
-            meta = {}
-        else:
-            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta = TaskInterceptor._fresh_metadata_copy(metadata, 'deterministic-pure-gate')
         meta['task_kind'] = 'deterministic'
         meta['always_escalates'] = True
         meta.pop('before_done', None)
@@ -3284,11 +3346,11 @@ class TaskInterceptor:
         """Attach a ``possible_scope_mismatch`` advisory marker to ``kwargs['metadata']``.
 
         Task 2206: the PROSE-ADVISORY counterpart to :meth:`_inject_routing_override`
-        — normalises the existing ``kwargs['metadata']`` (None / JSON-string /
-        dict / unparseable, via :meth:`_extract_metadata_dict`; malformed input
-        is discarded with a WARNING, same as the override path) into a plain
-        dict, sets ``possible_scope_mismatch``, and writes the result back into
-        ``kwargs['metadata']`` in place.
+        — normalises the existing ``kwargs['metadata']`` (via
+        :meth:`_fresh_metadata_copy`: absent or unreadable → fresh dict,
+        unreadable input discarded with a WARNING, same as the override path)
+        into a plain dict, sets ``possible_scope_mismatch``, and writes the
+        result back into ``kwargs['metadata']`` in place.
 
         Called from :meth:`_path_guard_or_skip`, which runs BEFORE
         ``submit_task`` pops ``kwargs['metadata']`` and serialises it into the
@@ -3310,19 +3372,9 @@ class TaskInterceptor:
         added — so a second marker key would be silently un-clearable there,
         and would force every consumer to read two keys where one suffices.
         """
-        metadata = kwargs.get('metadata')
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
-        if meta is None:
-            if metadata is not None:
-                logger.warning(
-                    'scope-mismatch-advisory: non-dict metadata discarded (type=%s); '
-                    'using fresh dict. Original value: %r',
-                    type(metadata).__name__,
-                    metadata,
-                )
-            meta = {}
-        else:
-            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta = TaskInterceptor._fresh_metadata_copy(
+            kwargs.get('metadata'), 'scope-mismatch-advisory'
+        )
         meta['possible_scope_mismatch'] = {
             'matched_paths': list(verdict.matched_paths),
             'suggested_project': verdict.suggested_project,
@@ -3339,9 +3391,9 @@ class TaskInterceptor:
         the task's own branch is legitimately empty because the deliverable
         lands on *owner*'s branch, so this is NOT a scope error.  Mirrors
         :meth:`_attach_possible_scope_mismatch`'s in-place metadata
-        normalisation (None / JSON-string / dict / unparseable via
-        :meth:`_extract_metadata_dict`; malformed input discarded with a
-        WARNING) and, like it, runs inside :meth:`_path_guard_or_skip` BEFORE
+        normalisation (via :meth:`_fresh_metadata_copy`: absent or unreadable
+        → fresh dict, unreadable input discarded with a WARNING) and, like
+        it, runs inside :meth:`_path_guard_or_skip` BEFORE
         ``submit_task`` serialises ``kwargs['metadata']`` into the ticket blob,
         so the in-place write carries the marker with no new plumbing.
 
@@ -3350,19 +3402,7 @@ class TaskInterceptor:
         ``OutcomeKind.plan_files_cross_repo`` instead of flagging 'files not
         touched'.
         """
-        metadata = kwargs.get('metadata')
-        meta = TaskInterceptor._extract_metadata_dict(metadata)
-        if meta is None:
-            if metadata is not None:
-                logger.warning(
-                    'cross-repo-marker: non-dict metadata discarded (type=%s); '
-                    'using fresh dict. Original value: %r',
-                    type(metadata).__name__,
-                    metadata,
-                )
-            meta = {}
-        else:
-            meta = dict(meta)  # shallow copy — don't mutate the caller's dict
+        meta = TaskInterceptor._fresh_metadata_copy(kwargs.get('metadata'), 'cross-repo-marker')
         meta['cross_repo'] = True
         meta['cross_repo_project'] = owner
         kwargs['metadata'] = meta
@@ -5956,6 +5996,25 @@ class _AncestorCheckFailure(NamedTuple):
     detail: str
 
 
+def _provenance_kind(raw: object) -> str | None:
+    """The ``kind`` a raw ``done_provenance`` payload CLAIMS, for the journal.
+
+    Pure and total: a non-dict payload, a missing key, a non-``str`` value or
+    a blank one all read as ``None``. It reports the CLAIM, not a validated
+    kind — a refused write's row must still say what the caller asserted, and
+    an unreadable claim must not be able to skip the audit row by raising.
+
+    Shared by every journal site so an accepted and a refused row report the
+    kind identically (SPOT).
+    """
+    if not isinstance(raw, dict):
+        return None
+    kind = raw.get('kind')
+    if not isinstance(kind, str):
+        return None
+    return kind.strip() or None
+
+
 def _provenance_stamp_now() -> str:
     """Wall-clock for ``done_provenance.stamped_at`` (task 3576).
 
@@ -5976,6 +6035,8 @@ async def _validate_done_provenance(
     *,
     require: bool,
     is_recon_stage: bool = False,
+    agent_id: str | None = None,
+    config: Any = None,
 ) -> tuple[dict | None, dict | None]:
     """Validate + resolve done_provenance for set_task_status(done).
 
@@ -5995,10 +6056,39 @@ async def _validate_done_provenance(
             "active_enter_timestamp": <str>,     # deterministic-deploy: new AET string
             "transient_unit": <str>,             # deterministic-deploy-scheduled: scheduled restart unit
             "fire_delay_secs": <int>,            # deterministic-deploy-scheduled: --on-active delay
-            "escalation_id": <str>,              # required for "operational-verified";
-                                                 # optional for "deterministic-gate" (cites
-                                                 # the resolving gate escalation)
+            "escalation_id": <str>,              # required for "operational-verified"
+                                                 # and for "deterministic-gate" (which
+                                                 # cites the resolving gate escalation)
         }
+
+    CALLER BAR FOR THE `deterministic-*` FAMILY (PRD C5 / D11, task 5241).
+    Those four kinds assert a MACHINE observation — a restart with fresh PID
+    evidence, a predicate that exited 0, a gate escalation that resolved — and
+    DeterministicRunner is their only live producer. Two factors gate them,
+    evaluated in this order and both surfacing
+    ``error_type='DeterministicProvenanceCallerNotPermitted'``:
+
+    1. ``is_recon_stage=True`` is refused UNCONDITIONALLY. Config-free by
+       design: a recon stage may not self-authorize a runner-stamped close,
+       and no operator edit may grant it (incident 5156).
+    2. Otherwise ``agent_id`` must match a prefix in
+       ``reconciliation.deterministic_provenance_allowed_agent_prefixes``
+       (default ``['orchestrator']``; an EMPTY list denies everyone, the live
+       kill switch). DENY-ON-MISSING: a missing/corrupt leaf, or a missing
+       *config* object entirely, refuses — see
+       ``middleware/done_provenance_authz.py``.
+
+    That module also carries the honest caveat, repeated here because this is
+    where the refusal is issued: the identity is SELF-REPORTED. Under
+    stateless HTTP a tool call carries no clientInfo for
+    ``server/tools.py::_resolve_identity`` to fall back to, so a caller that
+    sends no ``agent_id`` arrives as ``None`` and is refused; the orchestrator
+    therefore sends ``agent_id='orchestrator'`` explicitly
+    (``orchestrator/src/orchestrator/scheduler.py::Scheduler.set_task_status``).
+    The bar DETERS a cooperating
+    caller; it is not a security boundary. The residual is made visible rather
+    than prevented — every done write, accepted or refused, leaves a
+    write-journal row naming the resolved caller and the provenance kind.
 
     - ``kind="merged"``: the work landed on main via a merge commit. ``commit``
       is required and must resolve via ``git rev-parse``; the resolved SHA is
@@ -6030,9 +6120,18 @@ async def _validate_done_provenance(
       with no ``before_done`` action) resolved. There is no deploy evidence
       and no ``commit`` — the kind exists precisely so such a close passes
       ``require_done_provenance`` without claiming a deploy happened (task
-      2331). ``note`` carries the gate-resolution text and ``escalation_id``
-      may cite the resolving gate escalation. Stamped by DeterministicRunner
-      (deterministic_runner.py), never supplied by hand.
+      2331). ``note`` carries the gate-resolution text. ``escalation_id`` is
+      REQUIRED (task 5241): it cites the resolving gate escalation and is
+      recorded VERBATIM, with no cross-service lookup — the same no-lookup
+      contract ``operational-verified`` has. It is a deliberate SHAPE
+      DETERRENT stacked on the caller bar above: a hand-passer must at
+      minimum name a record, and that id lands in the audit trail where a
+      reader can check it. NOTE the asymmetry: the requirement is enforced
+      HERE only, not in ``shared.task_metadata.DoneProvenance``, because the
+      bar exists against callers who hand-build a dict and never touch the
+      shared model — this server is the one chokepoint every producer
+      crosses. Stamped by DeterministicRunner (deterministic_runner.py),
+      never supplied by hand.
     - ``kind="deterministic-milestone"``: a ``before_done`` ``kind="predicate"``
       milestone check exited 0. No ``commit`` is required or expected; ``note``
       carries a bounded structured verdict summarizing the predicate's stdout.
@@ -6063,8 +6162,13 @@ async def _validate_done_provenance(
 
     ``is_recon_stage`` mirrors ``_apply_status_transition``'s
     ``is_recon_stage_write`` classification (``agent_id.startswith(
-    'recon-stage-')``); it is currently consulted only by the
-    ``kind="operational-verified"`` branch above.
+    'recon-stage-')``); it is consulted by the ``kind="operational-verified"``
+    branch and by factor 1 of the `deterministic-*` caller bar above. It is
+    passed SEPARATELY from ``agent_id`` rather than re-derived here so this
+    function and the transition gate can never disagree about who is a recon
+    stage. ``agent_id`` and ``config`` feed factor 2; both default to the
+    denying value, so a caller that forgets to thread them refuses rather
+    than silently opening the bar.
     """
     if raw is None or raw == {}:
         if require:
@@ -6125,6 +6229,48 @@ async def _validate_done_provenance(
             task_id,
             f'done_provenance.kind must be {_DONE_PROVENANCE_KINDS_TEXT} (got {kind!r})',
         ), None
+
+    if kind in DETERMINISTIC_PROVENANCE_KINDS:
+        # Factor 1 (PRD D11): config-free, and FIRST. A recon stage may not
+        # self-authorize a runner-stamped close, and an operator who adds
+        # 'recon-stage-' to the allowlist must not thereby reopen incident
+        # 5156. Same shape as the 'operational-verified' branch below, so a
+        # reader sees one rule applied twice rather than two rules.
+        if is_recon_stage:
+            return _done_provenance_error(
+                task_id,
+                f'done_provenance with kind={kind!r} cannot be recorded by a '
+                'recon-stage caller — a recon stage may not self-authorize a '
+                'close that asserts a DeterministicRunner observation. This '
+                'refusal is config-free: granting the caller prefix does not '
+                'lift it.',
+                error_type=DETERMINISTIC_CALLER_ERROR_TYPE,
+            ), None
+        # Factor 2: the configured caller allowlist, read live so the leaf
+        # stays green-tier hot-reloadable.
+        decision = resolve_deterministic_provenance_authorization(config, agent_id=agent_id)
+        if not decision.allowed:
+            return _done_provenance_error(
+                task_id,
+                decision.error or '',
+                error_type=decision.error_type,
+            ), None
+        # AFTER the caller bar, deliberately: an unauthorized caller is
+        # refused on identity, not handed a shape hint first. And this
+        # refusal keeps the plain `done_provenance_invalid` with NO
+        # error_type — a shape defect from an AUTHORIZED caller is a
+        # different proposition, and conflating it under the caller error
+        # type would tell an operator to fix an allowlist when they need to
+        # fix a payload.
+        if kind == 'deterministic-gate' and escalation_id is None:
+            return _done_provenance_error(
+                task_id,
+                'done_provenance with kind="deterministic-gate" requires '
+                'escalation_id=<resolving gate escalation id>, recorded '
+                'verbatim. DeterministicRunner supplies it from the task\'s '
+                'milestone_gate record; a hand-built blob must at minimum '
+                'name the record it is closing against.',
+            ), None
 
     if kind == 'merged' and commit_input is None:
         return _done_provenance_error(
@@ -6208,9 +6354,11 @@ async def _validate_done_provenance(
     if note is not None:
         resolved['note'] = note
     if kind in ('operational-verified', 'deterministic-gate') and escalation_id is not None:
-        # Required (and already validated non-None above) for
-        # 'operational-verified'; optional for 'deterministic-gate', which
-        # may cite the resolving gate escalation but need not (task 2331).
+        # Required — and already validated non-None above — for BOTH kinds
+        # (task 5241 made it so for 'deterministic-gate', which cites the
+        # resolving gate escalation). The `is not None` guard is retained as
+        # the uniform shape this block shares with every other conditional
+        # copy below, not because either kind can reach here without one.
         resolved['escalation_id'] = escalation_id
 
     if kind in ('deterministic-deploy', 'deterministic-deploy-scheduled'):
@@ -6730,6 +6878,8 @@ async def _repair_done_provenance_same_status(
     tag: str | None,
     *,
     is_recon_stage: bool = False,
+    agent_id: str | None = None,
+    config: Any = None,
 ) -> dict:
     """Sanctioned done->done repair path for a legacy ``done_provenance`` blob.
 
@@ -6760,6 +6910,9 @@ async def _repair_done_provenance_same_status(
     :func:`_validate_done_provenance` so a recon-stage caller cannot use this
     sanctioned repair seam to record ``kind="operational-verified"`` either
     (closing the loophole a fresh-transition-only rejection would leave open).
+    ``agent_id`` and ``config`` travel the same way and for the same reason:
+    the `deterministic-*` caller bar (task 5241) must close BOTH seams, or a
+    legacy blob could be re-stamped around it on an already-``done`` task.
     """
     validation_err, resolved = await _validate_done_provenance(
         task_id,
@@ -6767,6 +6920,8 @@ async def _repair_done_provenance_same_status(
         project_root,
         require=False,
         is_recon_stage=is_recon_stage,
+        agent_id=agent_id,
+        config=config,
     )
     if validation_err is not None:
         return validation_err
@@ -6860,6 +7015,28 @@ def interceptor_write_succeeded(resp: object) -> bool:
     )
 
 
+def _journal_error_text(resp: object) -> str | None:
+    """The refusal text a ``write_ops`` row should carry for *resp*.
+
+    ``None`` when :func:`interceptor_write_succeeded` classifies *resp* as a
+    success — a successful row carries no error, matching
+    ``_journal_around``'s own success path.
+
+    Otherwise the structured ``error`` token PLUS the human-readable
+    ``reason``/``hint`` when one is present: the token alone says only
+    ``done_provenance_invalid``, which cannot tell an operator WHICH of that
+    error's many branches fired. Bounded at 500 chars, the same ceiling
+    ``log_backend_op``'s error column already uses.
+    """
+    if interceptor_write_succeeded(resp):
+        return None
+    if not isinstance(resp, dict):
+        return str(resp)[:500]
+    detail = resp.get('reason') or resp.get('hint')
+    error = resp.get('error')
+    return (f'{error}: {detail}' if detail else str(error))[:500]
+
+
 def _done_provenance_missing_error(task_id: str) -> dict:
     return {
         'success': False,
@@ -6877,13 +7054,29 @@ def _done_provenance_missing_error(task_id: str) -> dict:
     }
 
 
-def _done_provenance_error(task_id: str, reason: str) -> dict:
-    return {
+def _done_provenance_error(
+    task_id: str,
+    reason: str,
+    *,
+    error_type: str | None = None,
+) -> dict:
+    """The single builder for every ``done_provenance_invalid`` refusal.
+
+    ``error_type`` names a machine-readable refusal CLASS for the caller-bar
+    rejections (task 5241). The key is included only when supplied, so every
+    pre-existing refusal payload stays byte-identical — a consumer keying on
+    its absence is unaffected, and one that keys on its presence learns
+    something no ``reason`` substring match could tell it reliably.
+    """
+    payload = {
         'success': False,
         'error': 'done_provenance_invalid',
         'task_id': task_id,
         'reason': reason,
     }
+    if error_type is not None:
+        payload['error_type'] = error_type
+    return payload
 
 
 def _extract_task_dict(raw: Any) -> dict | None:

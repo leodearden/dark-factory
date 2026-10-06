@@ -296,6 +296,21 @@ class BriefingAssembler:
             f'- **project_id:** `{self.project_id}`\n'
         )
 
+    async def _task_preamble(
+        self,
+        task: dict,
+        role: str,
+        context: str | None,
+        *,
+        include_files: bool = True,
+    ) -> str:
+        """The memory, identity and ``# Task`` header a task-scoped briefing opens with."""
+        if context is None:
+            context = await self._get_memory_context(BriefingScope.from_task(task), role)
+        identity = self._agent_identity(task.get('id'), role)
+        task_block = self._format_task(task, include_files=include_files)
+        return f'{context}\n\n{identity}\n\n# Task\n\n{task_block}'
+
     async def build_architect_prompt(
         self,
         task: dict,
@@ -325,13 +340,9 @@ class BriefingAssembler:
                 byte-identical to the pre-γ baseline, so nothing is added on
                 the common path.
         """
-        if context is None:
-            context = await self._get_memory_context(
-                BriefingScope.from_task(task), 'architect',
-            )
-
-        task_block = self._format_task(task, include_files=False)
-        identity = self._agent_identity(task.get('id'), 'architect')
+        preamble = await self._task_preamble(
+            task, 'architect', context, include_files=False,
+        )
 
         prior_proposal_section = ''
         if include_prior_proposals:
@@ -379,13 +390,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
 """
 
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 {prior_proposal_section}{committed_section}
 # Action
@@ -416,13 +421,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         merged).  The architect reviews the existing plan against the changes
         and either confirms, updates, or recreates it.
         """
-        if context is None:
-            context = await self._get_memory_context(
-                BriefingScope.from_task(task), 'architect',
-            )
-
-        task_block = self._format_task(task)
-        identity = self._agent_identity(task.get('id'), 'architect')
+        preamble = await self._task_preamble(task, 'architect', context)
         prior_proposal_section = self._format_prior_proposal(task)
 
         plan_files = set(existing_plan.get('files', []))
@@ -454,13 +453,7 @@ pending: an unnecessary implementer turn is cheap, a false green is not.
         plan_json = json.dumps(existing_plan, indent=2)
 
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 {prior_proposal_section}
 # Plan Revalidation
@@ -513,13 +506,7 @@ and either confirm it, update it, or recreate it from scratch.
         partial entirely (``create_plan`` overwrites it) if it reflects a
         flawed approach.
         """
-        if context is None:
-            context = await self._get_memory_context(
-                BriefingScope.from_task(task), 'architect',
-            )
-
-        task_block = self._format_task(task)
-        identity = self._agent_identity(task.get('id'), 'architect')
+        preamble = await self._task_preamble(task, 'architect', context)
 
         existing_steps = [
             s for s in partial_plan.get('steps', []) if isinstance(s, dict)
@@ -527,13 +514,7 @@ and either confirm it, update it, or recreate it from scratch.
         plan_json = json.dumps(partial_plan, indent=2)
 
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 # Plan Completion — Finish an Interrupted Plan
 
@@ -603,26 +584,14 @@ to start over from nothing.
         a post-pass subset check rejects any plan that added entries
         beyond the current ``plan.files`` set.
         """
-        if context is None:
-            context = await self._get_memory_context(
-                BriefingScope.from_task(task), 'architect',
-            )
-
-        task_block = self._format_task(task)
-        identity = self._agent_identity(task.get('id'), 'architect')
+        preamble = await self._task_preamble(task, 'architect', context)
 
         current_files = list(plan.get('files', []))
         files_list = '\n'.join(f'- `{f}`' for f in current_files) or '_(empty)_'
         not_touched_list = '\n'.join(f'- `{f}`' for f in not_touched) or '_(none)_'
 
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 # Plan Tightening — Architect Narrowing Pass
 
@@ -687,6 +656,86 @@ remains, that is option (b): call `confirm_plan()` and let the escalation
 triage it.
 """
 
+    async def build_plan_schema_repair_prompt(
+        self,
+        task: dict,
+        context: str | None = None,
+    ) -> str:
+        """Architect pass that restructures an on-disk plan missing ``steps``.
+
+        The plan is never copied into the prompt: plan.json is its single home,
+        read through the lane's ``.task/plan.json``. Completeness is attested
+        only by the architect's own ``confirm_plan()``.
+        """
+        preamble = await self._task_preamble(task, 'architect', context)
+
+        return f"""\
+{preamble}
+
+# Plan Schema Repair
+
+The plan for this task is on disk at `.task/plan.json` (a symlink into the
+durable `<worktree_base>/.task-meta/<worktree-name>/plan.json`), but it has no
+non-empty top-level `steps` array, so it cannot advance. It is NOT reproduced
+here — read the file in full.
+
+## Action
+
+1. Read `.task/plan.json` in full.
+2. Record its existing step content with the plan-tools:
+   `add_prerequisite(prereq_id, description)` for setup work and
+   `add_plan_step(step_id, step_type, description)` for each TDD step, in the
+   plan's own order, carrying each description across unchanged. If `files`
+   is missing or empty, set it with `update_plan_metadata(files=[...])`.
+3. Restructure only: do not redesign the plan or explore beyond what
+   restructuring needs. Do not call `create_plan` — it replaces the document
+   wholesale and would discard the analysis and decisions you are
+   restructuring.
+4. Call `confirm_plan()` as your FINAL action. Without it the repaired plan is
+   treated as incomplete and will not advance.
+
+If the file holds no step content to restructure, do not invent steps: stop
+without calling `confirm_plan()` and the task will be re-planned.
+"""
+
+    async def build_replan_prompt(
+        self,
+        task: dict,
+        review_feedback: str,
+        context: str | None = None,
+    ) -> str:
+        """Architect pass that extends the plan to answer blocking review issues.
+
+        The plan is never copied into the prompt: plan.json is its single home,
+        read through the lane's ``.task/plan.json``, so a replayed prompt cannot
+        show stale steps.
+        """
+        preamble = await self._task_preamble(task, 'architect', context)
+
+        return f"""\
+{preamble}
+
+# Re-Plan After Review
+
+The implementation was reviewed and blocking issues were found.
+
+{review_feedback}
+
+## Action
+
+1. Read `.task/plan.json` (a symlink into the durable
+   `<worktree_base>/.task-meta/<worktree-name>/plan.json`) for the current plan
+   and each step's status — it is not reproduced here.
+2. Add the steps that address the blocking issues with
+   `add_plan_step(step_id, step_type, description)`, using step ids not
+   already in the plan. New steps are recorded as pending.
+3. If those steps touch files the plan does not list, call
+   `update_plan_metadata(files=[...])` with the full widened list.
+4. Keep every existing step in place, in order: do not remove or reorder
+   steps, and do not call `create_plan` — it replaces the plan wholesale and
+   would discard completed steps.
+"""
+
     async def build_simple_task_prompt(
         self,
         task: dict,
@@ -700,15 +749,9 @@ triage it.
         ``mark_step_done`` and stop. The orchestrator then advances to VERIFY
         without invoking the implementer.
         """
-        if context is None:
-            context = await self._get_memory_context(
-                BriefingScope.from_task(task), 'simple_task',
-            )
+        preamble = await self._task_preamble(task, 'simple_task', context)
 
-        task_block = self._format_task(task)
-        identity = self._agent_identity(task.get('id'), 'simple_task')
-
-        files = (task.get('metadata') or {}).get('files') or []
+        files =(task.get('metadata') or {}).get('files') or []
         if files:
             files_list = '\n'.join(f'- `{f}`' for f in files)
             files_section = f'## Listed files\n\n{files_list}'
@@ -719,13 +762,7 @@ triage it.
         # substantial architectural thought") mirrors _COMPLEXITY_RUBRIC in roles.py.
         # Update both in lockstep if the rubric changes.
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 # Action
 
@@ -1248,11 +1285,7 @@ from where the previous agent left off.
         Includes memory context, task details, escalation info, and action
         instructions.  Used for the initial session and after cap-hit resets.
         """
-        context = await self._get_memory_context(
-            BriefingScope.from_task(task), 'steward',
-        )
-        identity = self._agent_identity(task.get('id'), 'steward')
-        task_block = self._format_task(task)
+        preamble = await self._task_preamble(task, 'steward', None)
         esc_block = self._format_escalation(escalation)
 
         pending_block = ''
@@ -1265,13 +1298,7 @@ from where the previous agent left off.
             pending_block = f'\n## Other Pending Escalations\n\n{items}\n'
 
         return f"""\
-{context}
-
-{identity}
-
-# Task
-
-{task_block}
+{preamble}
 
 # Escalation
 

@@ -59,8 +59,8 @@ asyncio_mode = "auto"
 # command as `cd sampler && uv run pytest ... -n 8 tests/`.
 # The choice is the same one, on the same evidence, as every other config here:
 # signal measured green under xdist (task 5408). The signal-vs-thread trade is
-# not reopened here; it lives once, in fused-memory/pyproject.toml's own
-# timeout_method block.
+# not reopened here; it lives once, in
+# tests/scripts/test_timeout_method_policy.py.
 # Value provenance: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 # Rationale for the setting: shared/pyproject.toml. Neither is restated here.
 timeout = 540
@@ -72,5 +72,7 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.4.0",
+    # verify's injected -n; see tests/scripts/test_merge_gate_parallelism_config.py::RULED_SERIAL_MEMBERS
+    "pytest-xdist>=3.5.0",
     "ruff>=0.7.1",
 ]

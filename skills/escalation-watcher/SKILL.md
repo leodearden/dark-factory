@@ -1425,13 +1425,15 @@ own framing.** The two are different things and the distinction is the whole poi
 - The record's OWN `root_cause` / `detail` / `options` / `summary` are the **original** framing,
   from the promote that minted the L2. They are immutable — a fold never overwrites them, so the
   decision context a human started reading cannot shift under them.
-- `amendments` is an append-only list of what **later folds** carried in, oldest first, each with
-  the `agent_role` that submitted it and a queue-stamped `timestamp`. The **last** entry is the
-  most recent read of the cluster; if it disagrees with the record's own framing, that disagreement
-  is the signal — either the cluster drifted, or root-cause matching folded in something that does
-  not belong.
-- Framing byte-identical to what the record already says is **not** re-recorded, so every entry
-  present is a genuine reframing rather than a re-promote echo.
+- `amendments` is an append-only list of what **later folds** carried in — or what an explicit
+  `amend_escalation` wrote (a ruling made elsewhere) — oldest first, each with the `agent_role` that
+  submitted it, which is how the two sources are told apart, and a queue-stamped `timestamp`. The
+  **last** entry is the most recent read of the record. When a fold entry disagrees with the
+  record's own framing, that disagreement is the signal — either the cluster drifted, or root-cause
+  matching folded in something that does not belong. An explicit amend that disagrees is usually a
+  ruling: read it as the answer to the question, not as drift.
+- Framing byte-identical to what the record already says is **not** re-recorded, from a fold or an
+  explicit amend alike, so every entry present is a genuine reframing rather than an echo.
 
 A set of counters says what was NOT kept — check them before treating any of these lists as
 complete. Each is a durable record field you can read straight off `get_escalation(id)`, so the
@@ -1851,7 +1853,8 @@ rotations that revisit the parked set, re-verify with **world-facing** probes on
 triage-ack annotation" and the "Ruled-elsewhere check" above) — never a predicate about the
 record's own pending status. If a probe fires, the ask flips from "human must decide" to "human
 must ratify and propagate": recover the ruling, present it for ratification, and propagate it into
-the record via amendment. This applies equally to `risk_identified` parks below.
+the record with `amend_escalation` (an append-only amendment; it changes no status, severity or
+level). This applies equally to `risk_identified` parks below.
 
 <!-- scope-not-delivered:begin the two closure forms and the worked example live in the policy
      document named below and are deliberately NOT copied here: that document is their authority,
@@ -2253,10 +2256,17 @@ them for shared files, summaries, or task IDs and handle related ones together, 
 relationship in your resolution text.
 
 **At every resolve, look sideways before moving on.** The ruling you write reaches only the record
-you name (plus its downward member cascade — never sibling L2s). Run
-`get_pending_escalations(task_id=...)` for the subject task and scan for other pending L2s sharing
-any member id; disposition them in the same sitting — close them against the same ruling, or park
-them with a world-facing predicate naming where the ruling lives. A ruling recorded on one twin
+you name (plus its downward member cascade — never sibling L2s). The `resolve_issue` response
+carries that census as `related_pending`: the records still pending after your resolve that share
+its task, or are L2s sharing a member with it (or clustering it). If the key is ABSENT, the census
+could not be computed — fall back to running `get_pending_escalations(task_id=...)` for the subject
+task and scanning for other pending L2s sharing any member id. Either way, disposition them in the
+same sitting — close them against the same ruling, or park them with a world-facing predicate
+naming where the ruling lives. Never auto-close from the census alone: it reports candidates, and
+a pin looks exactly like an answered question on member evidence. An entry with `same_task: true`
+and `shared_member: null` under a synthetic anchor task id (a slug such as
+`l2-amendment-truncation`, not a task number) is the same KIND of alarm, not necessarily the same
+incident — read it before applying your ruling to it. A ruling recorded on one twin
 while another survives is the answered-but-unrecorded class (see "Ruled-elsewhere check" above);
 all five measured instances were minted exactly this way, in sittings that ruled the record in
 front of them and never looked sideways.

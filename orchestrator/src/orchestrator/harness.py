@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import errno
 import fcntl
+import functools
 import itertools
 import json
 import logging
@@ -72,6 +73,7 @@ from orchestrator.deterministic_runner import (
     build_milestone_gate_escalation_fields,
 )
 from orchestrator.event_store import EventStore, EventType
+from orchestrator.fleet_drain import DrainIdentity, DrainParticipant, FleetDrainEvent
 from orchestrator.fleet_heartbeat import build_heartbeat_payload, resolve_fleet_dir, write_heartbeat
 from orchestrator.git_ops import GitOps, classify_worktree_entry
 from orchestrator.landed_outbox import MergeProvenance
@@ -1920,8 +1922,14 @@ class Harness:
             ReviewCheckpoint(config, self.mcp, self.usage_gate)
             if config.review.enabled else None
         )
-        self._review_running = False
-        self._pending_review_task: asyncio.Task | None = None
+        # The running focused review checkpoint, if any; dispatch pauses while set.
+        self._review_task: asyncio.Task | None = None
+        # Slot and review-checkpoint tasks still running.  Each task removes
+        # itself from its done-callback, so the set is never rebound.
+        self._live_tasks: set[asyncio.Task] = set()
+        # True only while the run-forever idle branch sleeps between polls:
+        # the one quiet window a polite service restart may use.
+        self._idle_poll_sleeping = False
         self._task_modules: dict[str, list[str]] = {}  # task_id -> modules
 
         # Escalation support
@@ -1949,8 +1957,8 @@ class Harness:
         self._ground_truth: TaskGroundTruth | None = None
 
         # Unified lifecycle seam (task 2241, W10-η — PRD §5.3 LR-1/2/3):
-        # the eleven background-loop/service lifecycles below register into
-        # ONE ordered LifecycleRegistry instead of eleven hand-rolled
+        # every background-loop/service lifecycle registers into
+        # ONE ordered LifecycleRegistry instead of hand-rolled
         # _start_*/_stop_*/_*_loop triplets.  None until
         # _build_lifecycle_registry() first runs (lazily, at the top of
         # run() — idempotent, so a test may pre-build + monkeypatch it
@@ -2127,6 +2135,17 @@ class Harness:
         self._merge_inflight_registry: InFlightMergeRegistry = InFlightMergeRegistry()
         self._merge_worker: SpeculativeMergeWorker | None = None
         self._merge_worker_task: asyncio.Task | None = None
+        # This unit's side of the restart drain (task 5371): steers the merge
+        # worker's admission from the heartbeat pass, reports at stop.
+        self._drain_participant = DrainParticipant(
+            lane=lambda: self._merge_worker,
+            fleet_dir=resolve_fleet_dir,
+            identity=lambda: DrainIdentity.from_environ(
+                os.environ,
+                max_age_secs=self.config.orchestrator_restart_lease_max_age_secs,
+            ),
+            emit=self._emit_fleet_drain,
+        )
         # Durable journal for in-flight merge requests (task 1772).
         # Persisted at data/orchestrator/merge_queue.json; recovered on restart
         # by _recover_pending_merges (called from run() after _rehydrate_merge_halt).
@@ -2298,7 +2317,7 @@ class Harness:
         self._last_digest_window_end_iso: str = ''
 
     def _build_lifecycle_registry(self) -> None:
-        """Build ``self._lifecycle`` in the canonical eleven-service order.
+        """Build ``self._lifecycle`` in the canonical service order.
 
         Idempotent — a no-op once ``self._lifecycle`` is already set, so a
         test may pre-build (and monkeypatch) the registry before driving
@@ -2309,12 +2328,14 @@ class Harness:
         escalation-server, merge-worker, offline-lane, orphan-l0-reaper,
         terminal-status-watcher, watcher-supervisor, stranded-reconcile,
         main-tip-sweep, no-landings-breaker, deterministic-recon-sweep,
-        warm-lane-gc. escalation-server and merge-worker start first so the
-        recovery block (which runs immediately after ``start_all()``
-        returns) can depend on both being live. The seven sweeps are
-        conditionally registered on their own ``config.X_enabled`` gate —
-        ``BackgroundService`` itself has no ``enabled`` field (PRD §5.3
-        shape); a disabled sweep is simply absent from the registry.
+        warm-lane-gc, stale-service-restart, merge-heartbeat.
+        escalation-server and merge-worker start first so the recovery block
+        (which runs immediately after ``start_all()`` returns) can depend on
+        both being live. The seven sweeps are conditionally registered on
+        their own ``config.X_enabled`` gate — ``BackgroundService`` itself has
+        no ``enabled`` field (PRD §5.3 shape); a disabled sweep is simply
+        absent from the registry. The last two always run: they must keep
+        their cadence whatever the dispatch loop is doing (task 5344).
         """
         if self._lifecycle is not None:
             return
@@ -2408,6 +2429,22 @@ class Harness:
                 stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
                 max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
             ))
+        registry.register(BackgroundService(
+            name='stale-service-restart',
+            pass_fn=self._run_stale_service_restart_pass,
+            interval_secs=self.config.stale_service_restart_interval_secs,
+            backoff=sweep_backoff,
+            stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+            max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+        ))
+        registry.register(BackgroundService(
+            name='merge-heartbeat',
+            pass_fn=self._write_merge_heartbeat,
+            interval_secs=self.config.merge_heartbeat_interval_secs,
+            backoff=sweep_backoff,
+            stop_timeout_secs=_LIFECYCLE_SWEEP_STOP_TIMEOUT_SECS,
+            max_failure_logs=_BG_LOOP_MAX_FAILURE_LOGS,
+        ))
         self._lifecycle = registry
 
     async def _run_orphan_l0_reaper_pass(self) -> None:
@@ -2440,6 +2477,20 @@ class Harness:
         """
         await self._reconcile_stranded_in_progress(mid_run=True)
         await self._reconcile_terminal_lanes()
+
+    async def _run_stale_service_restart_pass(self) -> None:
+        """``pass_fn`` for the stale-service-restart service.
+
+        ``agents_idle`` is True only while the idle branch sleeps with nothing
+        live — never during startup recovery, a full review, a dispatch tick
+        or a mid-run reconcile.  An owed force-fire ignores it (see
+        ``StaleServiceRestartCoordinator.maybe_restart``).  Nothing fires once
+        shutdown has begun.
+        """
+        if self._draining:
+            return
+        agents_idle = self._idle_poll_sleeping and not self._live_tasks
+        await self._maybe_restart_stale_service(agents_idle=agents_idle)
 
     async def run(
         self,
@@ -2555,10 +2606,8 @@ class Harness:
             # post-construction attribute-wiring pattern above.
             self.review_checkpoint.event_store = self.event_store
 
-        # Hoisted out of the try block so the finally clause can cancel
-        # in-flight workflow tasks even if an exception fires before the
-        # main loop creates them.
-        active: set[asyncio.Task] = set()
+        # Hoisted out of the try block so the finally clause can tally the
+        # reports of slots cancelled at shutdown.
         task_reports: list[TaskReport] = []
 
         try:
@@ -2568,7 +2617,7 @@ class Harness:
 
             # 1b. Start every background-loop/service lifecycle in one
             # ordered ladder (task 2241, W10-η — PRD §5.3 LR-1/2/3):
-            # escalation-server, merge-worker, offline-lane, then the seven
+            # escalation-server, merge-worker, offline-lane, then the
             # sleep-first sweeps. escalation-server + merge-worker start
             # first (canonical order), so the recovery block immediately
             # below — which depends on both being live — is unaffected by
@@ -2843,20 +2892,12 @@ class Harness:
             sem = asyncio.Semaphore(self.config.max_concurrent_tasks)
 
             while True:
-                # Pick up any pending review task spawned by _collect_done_reports
-                if self._pending_review_task is not None:
-                    active.add(self._pending_review_task)
-                    self._pending_review_task = None
-
                 # If a review checkpoint is running, don't acquire new tasks —
-                # wait for in-flight tasks (and the review) to complete.
-                if self._review_running:
-                    if not active:
-                        break  # shouldn't happen — review task is in active
-                    done, active = await asyncio.wait(
-                        active, return_when=asyncio.FIRST_COMPLETED
+                # wait for in-flight tasks (and the review, itself live) to end.
+                if self._review_task is not None:
+                    await asyncio.wait(
+                        set(self._live_tasks), return_when=asyncio.FIRST_COMPLETED,
                     )
-                    self._collect_done_reports(done, task_reports)
                     continue
 
                 # Check daily cost ceilings before dispatching the next task.
@@ -2868,7 +2909,7 @@ class Harness:
                 assignment = await self.scheduler.acquire_next()
 
                 if assignment is None:
-                    if not active:
+                    if not self._live_tasks:
                         if self.scheduler.is_paused:
                             # Paused ≠ done.  acquire_next() returns None while
                             # paused (task-1322); treating that as completion
@@ -2877,7 +2918,7 @@ class Harness:
                             # service.  Idle in-process instead so an in-process
                             # resume_scheduler() (via the still-running
                             # escalation MCP) resumes dispatch without a restart.
-                            # The six background loops keep running while we idle.
+                            # The background services keep running while we idle.
                             now = time.monotonic()
                             if (
                                 now - self._last_paused_idle_log
@@ -2918,10 +2959,9 @@ class Harness:
                         # Idle and re-poll the tree so tasks scheduled after
                         # startup get picked up.
                         #
-                        # Invariant: this branch is only reachable with `active`
-                        # empty and no focused review in flight — _review_running
-                        # / _pending_review_task serialize at the loop top, so a
-                        # full-review-on-idle here can't race a focused review.
+                        # Invariant: this branch is only reachable with no slot
+                        # or focused review live, so a full-review-on-idle here
+                        # can't race a focused review.
                         now = time.monotonic()
                         self._compute_tallies(task_reports)
                         if self.report.completed > 0 or task_reports:
@@ -2936,8 +2976,8 @@ class Harness:
                                     and self.review_checkpoint.should_run_full(now)):
                                 await self._run_full_review_and_tag()
                             # Reset per-cycle aggregates.  Safe to drop the old
-                            # task_reports list here (see invariant above: no
-                            # report is still being collected).  Recompute
+                            # task_reports list here: no live slot still holds
+                            # it (see invariant above).  Recompute
                             # total_tasks cheaply so completed/total stays honest.
                             task_reports = []
                             self.report = HarnessReport(
@@ -2954,40 +2994,19 @@ class Harness:
                                 self.config.idle_poll_secs,
                             )
                             self._last_idle_poll_log = now
-                        # Post-merge staleness hook: restart fused-memory.service
-                        # if a code-touching merge has been debounced and the
-                        # orchestrator is idle (no dispatched agents = quiet window).
-                        await self._maybe_restart_stale_service(agents_idle=True)
-                        # Fleet-common merge-idle heartbeat (task 2395, α): written
-                        # in both rest branches so a saturated unit (steady-state
-                        # busy-wait branch below) still heartbeats.  Does NOT cover
-                        # a unit that is continuously dispatching with spare
-                        # semaphore headroom (never idle, never busy-waiting) — see
-                        # the docstring of _write_merge_heartbeat for why that gap
-                        # is accepted rather than closed with an unconditional
-                        # per-tick call.
-                        await self._write_merge_heartbeat()
-                        await asyncio.sleep(self.config.idle_poll_secs)
+                        self._idle_poll_sleeping = True
+                        try:
+                            await asyncio.sleep(self.config.idle_poll_secs)
+                        finally:
+                            self._idle_poll_sleeping = False
                         continue
-                    # Wait for any active task to complete, then retry.
+                    # Wait for any live task to complete, then retry.
                     # Timeout ensures newly-added tasks are discovered
                     # within 15s even when no running task completes.
-                    done, active = await asyncio.wait(
-                        active, return_when=asyncio.FIRST_COMPLETED,
+                    await asyncio.wait(
+                        set(self._live_tasks), return_when=asyncio.FIRST_COMPLETED,
                         timeout=15,
                     )
-                    self._collect_done_reports(done, task_reports)
-                    # Leaf services (dashboard, require_idle=False) restart
-                    # promptly after their diff lands even while agents are
-                    # dispatching.  fused-memory (require_idle=True) no-ops here
-                    # and is reserved for the idle branch above — the two
-                    # branches are mutually exclusive per tick and maybe_restart
-                    # clears pending on fire, so there is no double-fire.
-                    await self._maybe_restart_stale_service(agents_idle=False)
-                    # Fleet-common merge-idle heartbeat (task 2395, α): a
-                    # saturated unit steady-states in this busy-wait branch, so
-                    # it must heartbeat here too — see the idle branch above.
-                    await self._write_merge_heartbeat()
                     continue
 
                 await sem.acquire()
@@ -3002,8 +3021,10 @@ class Harness:
                     self._run_slot(assignment, sem),
                     name=f'workflow-{assignment.task_id}',
                 )
-                active.add(task)
-                task.add_done_callback(active.discard)
+                self._live_tasks.add(task)
+                task.add_done_callback(
+                    functools.partial(self._collect_slot_report, task_reports)
+                )
                 # Guard against the narrow resource-leak window where the slot
                 # task is cancelled before _run_slot's body begins executing
                 # (e.g. hard_cancel_workflow or shutdown sweeping pending tasks
@@ -3019,11 +3040,6 @@ class Harness:
                 task.add_done_callback(
                     lambda _t, tid=_tid: self._escalation_events.pop(tid, None)
                 )
-
-            # Drain remaining
-            if active:
-                done, _ = await asyncio.wait(active)
-                self._collect_done_reports(done, task_reports)
 
             self._compute_tallies(task_reports)
 
@@ -3048,24 +3064,26 @@ class Harness:
             # usage_gate — otherwise a cap-hit in a still-running agent can
             # spawn a fresh probe task via _handle_cap_detected AFTER
             # usage_gate.shutdown() has drained the existing ones, leaving
-            # the event loop alive forever.
-            if active:
-                logger.info(f'Cancelling {len(active)} active workflow task(s)')
-                for t in active:
+            # the event loop alive forever.  Each slot's done-callback
+            # collects its synthetic CANCELLED report.
+            if self._live_tasks:
+                live = set(self._live_tasks)
+                logger.info(f'Cancelling {len(live)} active workflow task(s)')
+                for t in live:
                     t.cancel()
                 try:
                     await asyncio.wait_for(
-                        asyncio.gather(*active, return_exceptions=True),
+                        asyncio.gather(*live, return_exceptions=True),
                         timeout=15.0,
                     )
                 except TimeoutError:
                     logger.error('Workflow tasks did not drain within 15s')
-                active.clear()
+            self._compute_tallies(task_reports)
 
             self.report.completed_at = datetime.now(UTC).isoformat()
 
             # Finalize run metrics in SQLite (task_results were written
-            # incrementally in _collect_done_reports; this updates the
+            # incrementally by _collect_slot_report; this updates the
             # runs row with final aggregates).
             if self._run_store and self._run_id:
                 try:
@@ -10458,7 +10476,7 @@ class Harness:
             # consecutive polls.  Catch here (before `except Exception`) so the
             # wrapper asyncio.Task completes normally (returns a result rather than
             # entering CANCELLED state).  A synthetic TaskReport(outcome=CANCELLED)
-            # propagates through _collect_done_reports' normal append path and is
+            # propagates through _collect_slot_report's normal append path and is
             # persisted by _run_store.save_task_result — symmetric with the BLOCKED
             # report from `except Exception`.  The `finally` block still runs
             # unconditionally (lock release, registry cleanup, scheduler.release).
@@ -11759,54 +11777,58 @@ class Harness:
                 'recovery veto-streak release failed (non-fatal): %s', exc,
             )
 
-    def _collect_done_reports(
-        self, done: set[asyncio.Task], task_reports: list[TaskReport]
+    def _collect_slot_report(
+        self, task_reports: list[TaskReport], t: asyncio.Task,
     ) -> None:
-        """Extract TaskReports from completed asyncio.Tasks and track merges for review."""
-        for t in done:
-            # Handle review checkpoint completion
-            if t.get_name() == 'review-checkpoint':
-                self._review_running = False
-                try:
-                    t.result()  # propagate exceptions
-                except Exception as e:
-                    logger.error(f'Review checkpoint error: {e}')
-                continue
+        """Done-callback of a slot task: record its TaskReport the moment it ends.
 
+        ``task_reports`` is the list of the cycle that dispatched the slot.  A
+        task that ends cancelled (before ``_run_slot``'s body ran, or during
+        its cleanup) has no report.
+        """
+        self._live_tasks.discard(t)
+        if t.cancelled():
+            logger.warning(
+                '%s was cancelled without returning a report', t.get_name(),
+            )
+            return
+        error = t.exception()
+        if error is not None:
+            logger.error('%s raised: %s', t.get_name(), error, exc_info=error)
+            return
+        report = t.result()
+        if not report:
+            return
+        try:
+            self._record_slot_report(report, task_reports)
+        except Exception:
+            logger.exception('Recording the report of task %s failed', report.task_id)
+
+    def _record_slot_report(
+        self, report: TaskReport, task_reports: list[TaskReport],
+    ) -> None:
+        """Append, persist, and feed a finished slot's report to review checkpoints."""
+        task_reports.append(report)
+        if self._run_store and self._run_id:
             try:
-                report = t.result()
-                if report:
-                    task_reports.append(report)
-                    # Persist task result immediately so it survives crashes
-                    if self._run_store and self._run_id:
-                        try:
-                            self._run_store.save_task_result(
-                                self._run_id, report,
-                                self.config.fused_memory.project_id,
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                f'Failed to persist task result '
-                                f'{report.task_id}: {e}'
-                            )
-                    # Track module merges for review checkpoints
-                    if (report.outcome == WorkflowOutcome.DONE
-                            and self.review_checkpoint):
-                        modules = self._task_modules.pop(report.task_id, [])
-                        self.review_checkpoint.record_merge(modules)
-                        # Check if review should trigger
-                        if (self.review_checkpoint.should_trigger()
-                                and not self._review_running):
-                            self._trigger_review_checkpoint()
+                self._run_store.save_task_result(
+                    self._run_id, report, self.config.fused_memory.project_id,
+                )
             except Exception as e:
-                logger.error(f'Workflow slot error: {e}')
+                logger.warning(f'Failed to persist task result {report.task_id}: {e}')
+        if report.outcome == WorkflowOutcome.DONE and self.review_checkpoint:
+            self.review_checkpoint.record_merge(self._task_modules.pop(report.task_id, []))
+            if (self.review_checkpoint.should_trigger()
+                    and self._review_task is None
+                    and not self._draining):
+                self._trigger_review_checkpoint()
 
     def _compute_tallies(self, task_reports: list[TaskReport]) -> None:
         """Fill ``self.report`` aggregates from the collected task reports.
 
-        Shared by the post-loop (exit / --until-idle) block and the
-        run-forever idle branch, which recomputes per-cycle before logging the
-        cycle summary.
+        Shared by the post-loop (exit / --until-idle) block, the run-forever
+        idle branch, which recomputes per-cycle before logging the cycle
+        summary, and the ``finally``, which counts slots cancelled at shutdown.
         """
         self.report.task_reports = task_reports
         self.report.completed = sum(
@@ -11860,22 +11882,23 @@ class Harness:
     def _trigger_review_checkpoint(self) -> None:
         """Spawn a review checkpoint as a concurrent task.
 
-        The main loop will pause task acquisition while the review runs
-        (``_review_running`` flag) but in-flight tasks continue in their
-        worktrees.
+        The main loop will pause task acquisition while ``_review_task`` is
+        set, but in-flight tasks continue in their worktrees.
         """
-        self._review_running = True
-        # We can't add to active here — the caller's done set is immutable.
-        # Instead, the review task is spawned and tracked; the main loop checks
-        # _review_running and waits on active (which includes this task after
-        # the next iteration adds it).
-
-        # Actually, we need the task in `active` for the main loop's asyncio.wait.
-        # The caller iterates `done`, so we store the task on self for the loop
-        # to pick up.
-        self._pending_review_task = asyncio.create_task(
+        task = asyncio.create_task(
             self._run_review_checkpoint(), name='review-checkpoint',
         )
+        self._review_task = task
+        self._live_tasks.add(task)
+        task.add_done_callback(self._finish_review_checkpoint)
+
+    def _finish_review_checkpoint(self, t: asyncio.Task) -> None:
+        """Done-callback of the review task: let the loop dispatch again."""
+        self._live_tasks.discard(t)
+        self._review_task = None
+        error = None if t.cancelled() else t.exception()
+        if error is not None:
+            logger.error(f'Review checkpoint error: {error}')
 
     async def _run_review_checkpoint(self) -> None:
         """Execute a focused review checkpoint."""
@@ -12111,8 +12134,16 @@ class Harness:
         logger.info('Speculative merge worker started')
 
     async def _stop_merge_worker(self) -> None:
-        """Stop the merge worker gracefully."""
+        """Stop the merge worker gracefully.
+
+        First closes any honoured restart-drain request still open: what is
+        in flight now is what the stop kills (task 5371).
+        """
         if self._merge_worker_task is not None and self._merge_worker is not None:
+            try:
+                self._drain_participant.on_shutdown()
+            except Exception:
+                logger.warning('fleet_drain shutdown report failed (fail-open)', exc_info=True)
             await self._merge_worker.stop()
             self._merge_worker_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -12440,22 +12471,16 @@ class Harness:
         """Construct a StaleServiceRestartCoordinator from the current config.
 
         Called once from _start_merge_worker (where git_ops, event_store, and
-        config are all live).  The coordinator is stored on self so the
-        run-forever idle branch can call maybe_restart(agents_idle=True).
+        config are all live); the stale-service-restart service polls it.
 
         require_idle stays at its True default: a fused-memory ``--drain``
-        restart disrupts in-flight reconciliation, so the polite idle
-        quiet-window is preferred.  But ``force_fire_after_secs`` is wired
-        from config as the anti-starvation backstop (task 2817) — under
-        chronic fleet saturation the run-loop idle branch never runs, so a
-        pending restart armed by ``note_merge`` would otherwise starve
-        forever (the operator then has to restart fused-memory by hand, cf.
-        esc-2814-1).  Once the pending restart is owed past the bound it
-        force-fires on the busy-wait branch anyway (bypassing agents_idle +
-        the debounce).  fused-memory keeps no min_interval rate cap
-        (state_path=None), so nothing throttles that force-fire.  See
-        service_restart.StaleServiceRestartCoordinator.maybe_restart and
-        config.fused_memory_restart_force_fire_after_secs.
+        restart disrupts in-flight reconciliation, so a quiet window with no
+        live agents is preferred.  ``force_fire_after_secs`` is the
+        anti-starvation backstop (task 2817): under chronic fleet saturation
+        there may be no such window, so once owed past the bound the restart
+        fires anyway (bypassing agents_idle + the debounce).  No min_interval
+        cap (state_path=None) throttles it.  See
+        ``StaleServiceRestartCoordinator.maybe_restart``.
         """
         return StaleServiceRestartCoordinator(
             git_ops=self.git_ops,
@@ -12525,21 +12550,14 @@ class Harness:
           restart has been owed for ``orchestrator_restart_force_fire_after_secs``
           (fleet-redeploy PRD task delta), ``maybe_restart`` force-fires and
           bypasses ``agents_idle``, the debounce, AND this precondition —
-          though it never bypasses ``min_interval_secs`` below. This
-          in-process force-fire path is NOT covered by
-          ``restart-all-orchestrators.sh``'s ``--drain`` merge-drain gate
-          (task gamma, ``drain_check.py``) — that gate only guards the
-          separate operator/deploy-triggered script path (e.g. a
-          ``task_kind='deterministic'`` deploy task's ``before_done.script``),
-          which this coordinator never invokes. The executor below always
-          runs ``scripts/restart-orchestrator.sh`` directly via
-          ``schedule_detached_systemd_restart``, and that script's own
-          ``--drain`` is an accepted-and-ignored no-op (see its header):
-          graceful shutdown is SIGTERM → cancel-main-task (``cli.py``'s
-          ``_make_cancel_handler``, bounded by ``TimeoutStopSec=90s``), and a
-          merge interrupted mid-verify by that shutdown is recovered from the
-          merge queue's durable, crash-safe journal (task 1772/2153) on the
-          next startup — not from a merge-drain gate at restart time.
+          though it never bypasses ``min_interval_secs`` below. Whichever
+          path fires, the executor below runs
+          ``config.orchestrator_restart_script`` with ``--drain`` (task 5371):
+          the committed yaml points it at ``restart-all-orchestrators.sh``,
+          whose drain halts every unit's merge admission and waits out each
+          unit's in-flight merge verifies before restarting it; the field
+          default ``scripts/restart-orchestrator.sh`` accepts and ignores
+          ``--drain``.
         - ``merge_phase_hold`` / ``merge_phase_grace_secs`` (task 2753): the
           PRE-enqueue MERGE-phase window (Phase-1 rebase + scoped re-verify,
           before ``merge_queued``) is NOT yet on that durable journal, so it is
@@ -12569,10 +12587,10 @@ class Harness:
           The fused-memory and dashboard builders pass neither, leaving their
           gate disabled and their behaviour byte-identical.
 
-        ``require_idle=True`` and ``script_args=[]`` mirror the fused-memory
-        coordinator (idle-only; restart-orchestrator.sh takes no positional
-        args). Called once from _start_merge_worker alongside the other two
-        builders.
+        ``require_idle=True`` mirrors the fused-memory coordinator (idle-only).
+        ``script_args`` is the one local ``['--drain']`` both the coordinator
+        and its executor are given, so the two cannot drift. Called once from
+        _start_merge_worker alongside the other two builders.
 
         ``on_active_secs`` is clamped to a minimum of 5 (mirroring
         ``DeterministicRunner``'s ``max(int(...), 5)`` clamp on the
@@ -12582,6 +12600,7 @@ class Harness:
         ``--on-active=`` argument at registration.
         """
         counter = itertools.count()
+        script_args = ['--drain']
 
         async def _systemd_run_restart_executor() -> None:
             # transient_unit is computed once and reused below (both for the
@@ -12605,7 +12624,7 @@ class Harness:
             )
             await schedule_detached_systemd_restart(
                 script=self.config.orchestrator_restart_script,
-                script_args=[],
+                script_args=script_args,
                 project_root=self.config.project_root,
                 transient_unit=transient_unit,
                 on_active_secs=max(self.config.orchestrator_restart_on_active_secs, 5),
@@ -12635,7 +12654,7 @@ class Harness:
             project_root=self.config.project_root,
             service_name='orchestrator',
             require_idle=True,
-            script_args=[],
+            script_args=script_args,
             restart_precondition=self._merge_pipeline_idle,
             restart_executor=_systemd_run_restart_executor,
             min_interval_secs=self.config.orchestrator_restart_min_interval_secs,
@@ -12679,11 +12698,11 @@ class Harness:
     async def _maybe_restart_stale_service(self, *, agents_idle: bool) -> bool:
         """Delegate to all service-restart coordinators in the list.
 
-        Called from the run-forever idle branch (agents_idle=True) and the
-        busy-wait branch (agents_idle=False).  Iterates every coordinator in
-        self._service_restart_coordinators and fires each whose gate conditions
-        are satisfied.  Returns True if at least one coordinator fired a restart,
-        False otherwise.  No-op (returns False) when the list is empty.
+        Called by ``_run_stale_service_restart_pass``.  Iterates every
+        coordinator in self._service_restart_coordinators and fires each whose
+        gate conditions are satisfied.  Returns True if at least one
+        coordinator fired a restart, False otherwise.  No-op (returns False)
+        when the list is empty.
         """
         any_fired = False
         for coord in self._service_restart_coordinators:
@@ -12692,64 +12711,37 @@ class Harness:
         return any_fired
 
     async def _write_merge_heartbeat(self) -> None:
-        """Write this unit's fleet-common merge-idle heartbeat (task 2395, α).
+        """Write this unit's fleet-common merge heartbeat (task 2395, α).
 
-        Gathers ON the event loop: ``ORCH_UNIT`` (self-identification, same
-        env convention as ``deterministic_runner._default_resolve_own_unit``),
-        and ``merge_idle``/``queue_empty``/``depth`` from a SINGLE
-        ``self._merge_worker.snapshot()`` read (when a worker exists) using
-        the exact idle formula and fallback ``_merge_pipeline_idle`` uses
-        (``queue_empty and depth == 0``, missing ``'depth'`` treated as ``1``
-        i.e. active) — so idle-truth and the reported depth are always
-        mutually consistent and the worker is polled at most once per tick,
-        rather than once via ``_merge_pipeline_idle()`` and again here.
-        Offloads only the serialize+atomic-write to a thread
-        (``asyncio.to_thread``), mirroring
-        ``Scheduler._write_snapshot_best_effort``'s loop/thread split — all
-        asyncio/in-memory reads happen here, before the thread hop.
+        The drain participant first steers merge admission from this unit's
+        restart-drain request and reads the lane once (task 5371); its
+        reading supplies ``depth`` and the ``drain`` / ``verifies_in_flight``
+        fields. ``merge_idle`` keeps the exact formula ``_merge_pipeline_idle``
+        uses (``queue_empty and depth == 0``); with no worker it is
+        ``_merge_pipeline_idle()`` itself. The serialize+atomic-write runs in
+        a thread (``asyncio.to_thread``).
 
-        Called from BOTH run-loop rest branches (idle + busy-wait) so a
-        saturated unit — which steady-states in the busy-wait branch — still
-        heartbeats.  Fail-open: any exception (state read or disk write) is
-        swallowed and logged — a heartbeat write must never stop the run loop.
-
-        Known gap: a unit that is continuously dispatching with spare
-        semaphore headroom (an assignment ready every tick, ``sem`` never
-        full) loops through neither rest branch and will not refresh its
-        heartbeat while that lasts.  Closing this with an unconditional
-        per-outer-loop-iteration call was evaluated and reverted: it makes
-        every ``run()`` invocation write to the fleet-common path on its very
-        first tick, and several existing tests drive ``run()`` for real
-        without sandboxing ``ORCH_UNIT``/``ORCH_FLEET_DIR`` — verified to
-        clobber this host's real ``data/fleet/orchestrator-dark-factory.
-        service.json`` when this shell inherits ``ORCH_UNIT`` from the
-        systemd unit.  Fixing that would require test-isolation changes
-        outside this task's locked scope (harness.py only).  Readers (γ
-        drain gate, ε ``--report``) must therefore treat a stale/absent
-        heartbeat conservatively — i.e. NOT idle / restart-eligible only
-        after a grace period — the same fail-safe stance
-        ``_merge_pipeline_idle`` already takes on a read error.
+        The ``pass_fn`` of the merge-heartbeat service, so it refreshes on
+        its own cadence whatever the dispatch loop is doing (task 5344).
+        Fail-open: any exception (state read or disk write) is swallowed and
+        logged.
         """
         try:
             unit = os.environ.get('ORCH_UNIT', '')
+            reading = await self._drain_participant.on_heartbeat_pass()
             queue_empty = self._merge_queue.empty()
-            worker = self._merge_worker
-            if worker is None:
-                # No pipeline to drain (bare / unit-test harness) — mirrors
-                # _merge_pipeline_idle's own worker-is-None short-circuit;
-                # no snapshot() call is involved on this branch.
-                merge_idle = self._merge_pipeline_idle()
-                depth = 0
+            if reading.depth is None:
+                depth, merge_idle = 0, self._merge_pipeline_idle()
             else:
-                depth = int(worker.snapshot().get('depth', 1))
-                merge_idle = queue_empty and depth == 0
-            ts_epoch = time.time()
+                depth, merge_idle = reading.depth, queue_empty and reading.depth == 0
             payload = build_heartbeat_payload(
                 unit=unit,
                 merge_idle=merge_idle,
                 depth=depth,
                 queue_empty=queue_empty,
-                ts_epoch=ts_epoch,
+                ts_epoch=time.time(),
+                drain=reading.drain,
+                verifies_in_flight=reading.verifies_in_flight,
             )
             await asyncio.to_thread(write_heartbeat, resolve_fleet_dir(), unit, payload)
         except Exception:
@@ -12757,6 +12749,11 @@ class Harness:
                 'merge heartbeat write failed; continuing (fail-open)',
                 exc_info=True,
             )
+
+    def _emit_fleet_drain(self, event: FleetDrainEvent) -> None:
+        logger.info('fleet_drain: %s', event.as_payload())
+        if self.event_store is not None:
+            self.event_store.emit(EventType.fleet_drain, data=event.as_payload())
 
     def _build_task_status_lookup(self) -> Callable[[str], Awaitable[str | None]]:
         """Return an async callable (task_id) -> str|None backed by the scheduler.

@@ -187,7 +187,7 @@ async def _drive_merge_boundary(
             event_store=event_store,
             escalation_queue=escalation_queue,
             merge_sha=_MERGE_SHA,
-            verifier=_BoundaryVerifier(_failing_scoped_result(failing_node_id)),
+            verifier=FakeVerifier(VerifyScript(result=_failing_scoped_result(failing_node_id))),
         )
 
 
@@ -195,30 +195,6 @@ async def _drive_merge_boundary(
 #: shipped streak threshold (flake_recorder), which this file deliberately does
 #: not read: the contract under test is "one escalation, then reset".
 _STORM_DRIVE_CAP = 50
-
-
-class _BoundaryVerifier(FakeVerifier):
-    """The lane's verify port, recording the module set it was handed.
-
-    ``run_scoped``'s third argument is the effective set the merge boundary
-    resolved, so a test reads the LOCAL consumer's set here rather than off a
-    ``LocalRunner`` constructor spy.  *result* is what the scoped verify
-    renders — a red naming a specific node id, for the gate scenarios.
-
-    Only the arguments this double actually READS are named; the rest of
-    ``VerifyPort.run_scoped``'s signature travels as ``*args``/``**options`` --
-    the shape ``orchestrator/merge_lane/ports.py::ProductionVerifier`` uses
-    too -- so a port-signature change lands in the port and its one fake, not
-    in every double that wraps them.
-    """
-
-    def __init__(self, result: VerifyResult | None = None) -> None:
-        super().__init__(None if result is None else VerifyScript(result=result))
-        self.module_sets: list[list[ModuleConfig]] = []
-
-    async def run_scoped(self, worktree, config, module_configs, *args, **options):
-        self.module_sets.append(list(module_configs))
-        return await super().run_scoped(worktree, config, module_configs, *args, **options)
 
 
 def _suppression_events(store: _FakeEventStore) -> list[tuple]:
@@ -535,15 +511,13 @@ async def _capture_boundary_consumers(
     req = _make_req(task_id, task_wt, config)
     req.module_configs = list(touched)
 
-    # The LOCAL consumer's module set is read off the verify port: it is
-    # `run_scoped`'s third argument, which is the very list `LocalRunner` was
+    # The LOCAL consumer's module set is read off `FakeVerifier.verify_calls`:
+    # the set `run_scoped` was handed is the very list `LocalRunner` was
     # constructed with (verify_runner.py::LocalRunner.run_merge_verify), so the
     # observation needs no constructor spy.  The WIRE spec's set has no port —
     # `build_merge_verify_spec` is a module function — so that one stays spied.
-    verifier = _BoundaryVerifier()
-    captured: dict = {
-        'verified': verifier.module_sets, 'config': config, 'merge_wt': merge_wt,
-    }
+    verifier = FakeVerifier()
+    captured: dict = {'config': config, 'merge_wt': merge_wt}
 
     real_build = merge_queue_module.build_merge_verify_spec
 
@@ -562,6 +536,7 @@ async def _capture_boundary_consumers(
             verifier=verifier,
         )
 
+    captured['verified'] = [list(call.module_configs) for call in verifier.verify_calls]
     return captured
 
 

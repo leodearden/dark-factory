@@ -13,11 +13,6 @@ import pytest
 from _dashboard_helpers import extract_function_body, strip_js_comments, walk_balanced
 
 
-@pytest.fixture(scope='module')
-def tab_overview_jsx_body(_client):
-    return _client.get('/static/redux/tab_overview.jsx').text
-
-
 class TestOverviewTabCurrentTaskRemoved:
     """The 'Current task' column must not appear in the Overview tab."""
 

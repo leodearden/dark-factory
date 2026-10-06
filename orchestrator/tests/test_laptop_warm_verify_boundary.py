@@ -137,7 +137,7 @@ def write_verify_config(
     is deliberately left UNSET (defaults to False -- see config.py) so the
     sleeper build stays on the plain ``start_new_session`` path that
     ``collect_descendants``/``killpg`` reproduction depends on being faithful
-    to production (the live reify deployment also runs with this knob False).
+    to production.
     """
     dirs = reap_build_artifact_dirs if reap_build_artifact_dirs is not None else ['target']
     dirs_yaml = ', '.join(dirs)

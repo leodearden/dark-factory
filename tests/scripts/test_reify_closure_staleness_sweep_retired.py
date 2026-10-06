@@ -65,6 +65,13 @@ ALLOWED_UNCONDITIONALLY = {
         'metadata_files as measured 2026-07-30. Rewriting it would falsify a '
         'past measurement, so it is allowlisted rather than edited'
     ),
+    'fused-memory/calibration/write_triage_pairs_to_rate.jsonl': (
+        'FROZEN measurement artifact — task 6151\'s blind rater input, quoting '
+        'Mem0 write texts verbatim as frozen 2026-10-05 and pinned by sha256 '
+        'in calibration/write_triage_population.json. A quoted memory that '
+        'names the retired wiring is data, not a live reference; editing it '
+        'would break the pinned sha and falsify what the raters see'
+    ),
 }
 
 # A second allowlist, merged into the same exclusion set as the dict above:

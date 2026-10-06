@@ -54,8 +54,9 @@ from fused_memory.server.grouped_read import PARENT_ID_KEY
 # A second copy does not raise when task 3658's
 # ``relevance_score → metadata['store_score']`` move happens again: it scores
 # every candidate as uncomparable, which empties the judge's slate and reads
-# exactly like a genuinely novel corpus.
-from fused_memory.server.near_duplicate_guard import _cosine_of
+# exactly like a genuinely novel corpus. Public name (task 4734): renamed
+# from the underscore-prefixed ``_cosine_of``.
+from fused_memory.server.near_duplicate_guard import cosine_of
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
@@ -332,25 +333,18 @@ _ELIDED_MARKER = '…[elided]'
 #:
 #: WHY THE SLACK STAYS SMALL. What has to stay small is the SLACK, budget minus
 #: the measured worst case, which is what a future addition could spend
-#: without anyone having to come here. That slack is 58 chars. The four worked
-#: examples presently rendered cost 157 to 192 chars apiece including the
-#: blank line between them, so even the cheapest fifth one does not fit and
-#: its author has to either make room or make the case here. A ceiling that
-#: admitted another example would have stopped bounding anything.
-#:
-#: Measured at task 6076, PRODUCTION-SHAPED and with the elision marker
-#: counted: the worst case is 27_142 chars — system 2_468, plus a 24_674-char
-#: render of six fields at 4_009 chars each and 620 chars of scaffold. The ids
-#: are not slop: every stored record's id is a 36-char uuid — all 104 in
-#: ``tests/fixtures/write_triage_calibration.jsonl`` are — and
-#: :func:`build_judge_prompt` renders ``- id: {candidate.id}`` UN-elided, so a
-#: full slate costs 155 chars more than 5-char stand-in ids suggest.
+#: without anyone having to come here. It stays under the cost of one more
+#: worked example, so that example's author has to either make room or make
+#: the case here: a ceiling that admitted another example would have stopped
+#: bounding anything.
+#: fused-memory/tests/server/test_write_triage_judge.py::TestJudgeExemplars::test_the_budget_admits_no_further_worked_example
+#: holds it there, measuring both sides afresh on every run.
 #:
 #: Note "over" the cap, not "at": `_elide` returns a field of exactly the cap
 #: unchanged and cuts a longer one to the cap plus `_ELIDED_MARKER`, so the
 #: widest render is 9 chars per field — 54 across the six — wider than a slate
 #: built at the cap.
-_PROMPT_CHAR_BUDGET = 27_200
+JUDGE_PROMPT_CHAR_BUDGET = 27_000
 
 
 def _elide(text: object, field_chars: int) -> str:
@@ -376,7 +370,7 @@ def select_judge_candidates(
     that reads them.
 
     Ordered by DESCENDING per-store cosine, read through
-    ``near_duplicate_guard._cosine_of`` — the SAME reader ``decide_band``
+    ``near_duplicate_guard.cosine_of`` — the SAME reader ``decide_band``
     uses, imported rather than re-implemented (INV-5). A second copy is
     precisely how task 3658's ``relevance_score → metadata['store_score']``
     move would go wrong again, and it would not raise: it would score every
@@ -404,7 +398,7 @@ def select_judge_candidates(
     """
     scored: list[tuple[float, MemoryResult]] = []
     for result in results or ():
-        cosine = _cosine_of(result)
+        cosine = cosine_of(result)
         if cosine is not None:
             scored.append((cosine, result))
     if not scored:
@@ -439,7 +433,7 @@ def select_judge_candidates(
 
 # --- prompt -----------------------------------------------------------------
 
-def _render_exemplars(exemplars: Sequence[JudgeExemplar]) -> str:
+def render_judge_exemplars(exemplars: Sequence[JudgeExemplar]) -> str:
     """The EXAMPLES section of the system prompt: one block per exemplar.
 
     A FUNCTION OF THE TUPLE ALONE — pure, total, and walking the sequence in
@@ -475,6 +469,8 @@ JUDGE_REPLY_SHAPE = json.dumps({
 #: code-reading and cross-checking the synchronous ``add_memory`` write path
 #: cannot do. So the instruction says what ``contests`` MEANS — a detection
 #: that routes the entry onward — and says the judge is not deciding truth.
+#: The `contests` clause is Leo's 2026-09-30 ruling,
+#: plans/write-triage-flip-readiness-prd.md §11.3 C1''.
 JUDGE_SYSTEM_PROMPT = f"""\
 You classify the RELATIONSHIP between a new memory entry and a small set of \
 existing entries retrieved as its closest matches. You do not decide which \
@@ -488,25 +484,22 @@ Shared wording alone neither makes a match nor rules one out.
 nothing new. A paraphrase restates.
 - "amends" — the new entry asserts what a candidate asserts AND adds \
 something the candidate does not have: a detail, a scope, a later \
-observation, a correction of degree.
-- "contests" — the new entry asserts something that CANNOT be true at the \
-same time as a candidate. Use this only for a genuine incompatibility, not \
-for a difference in emphasis, scope, or point in time — two entries \
-describing different situations, or the same situation at different times, \
-are not in conflict. You are DETECTING a contradiction so a human or a \
+observation — without saying the candidate is wrong.
+- "contests" — the new entry addresses the same claim or subject as a \
+candidate and says it is wrong, outdated or different, explicitly or \
+implicitly — not when it merely restates it, and not when it agrees and \
+only adds to it. You are DETECTING a contradiction so a human or a \
 downstream gate can adjudicate it; you are NOT deciding which side is true, \
 and nothing you say here deletes or edits anything.
 
 Find the candidate whose core claim the new entry shares (or, for \
 "contests", contradicts), answer about THAT candidate, and name it by its \
 id: the verdict is filed against the candidate you name and no other. \
-Answer "distinct", naming none, only when no candidate qualifies. Between \
-"amends" and "contests", prefer "amends" — a genuine incompatibility is a \
-last resort, not a default reading.
+Answer "distinct", naming none, only when no candidate qualifies.
 
 Worked examples:
 
-{_render_exemplars(JUDGE_EXEMPLARS)}
+{render_judge_exemplars(JUDGE_EXEMPLARS)}
 
 Reply with a bare JSON object and nothing else:
 

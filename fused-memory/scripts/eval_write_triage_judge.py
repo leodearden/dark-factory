@@ -162,6 +162,22 @@ def load_retrieval() -> types.ModuleType:
     """
     return _load_script(_RETRIEVAL_PATH, 'eval_write_triage_retrieval')
 
+
+_WORDING_PATH = _PACKAGE_ROOT / 'scripts' / 'write_triage_judge_wording.py'
+
+
+def load_wording() -> types.ModuleType:
+    """Load the judge-wording knob (PRD §11 D16), the same by-path way.
+
+    Loaded at import, unlike the retrieval edge: it pulls in only the judge
+    module, and the guard's default wording is one of its names.
+    """
+    return _load_script(_WORDING_PATH, 'write_triage_judge_wording')
+
+
+_wording = load_wording()
+
+
 # Alpha's vocabulary and fixture handling, re-exported rather than re-spelled.
 LABEL_CANONICAL = _calibrate.LABEL_CANONICAL
 LABEL_DUPLICATE = _calibrate.LABEL_DUPLICATE
@@ -219,6 +235,8 @@ PROVENANCE_KEYS: tuple[str, ...] = (
     'fixture_path',
     'judge_provider',
     'judge_model',
+    # The system prompt wording the verdicts came from (PRD C2'').
+    'judge_system_prompt_sha256',
     'limit',
     'canonical_aliases_path',
     'canonical_aliases_count',
@@ -1150,6 +1168,76 @@ def caveats_for(slate_mode: Any) -> list[str]:
     return [*CAVEATS, *MODE_CAVEATS.get(str(slate_mode), MODE_CAVEATS[SLATE_SEEDED])]
 
 
+def _judged_share(label: str, production_shape: Mapping[str, Any] | None) -> str:
+    """How many *label* cases reached the judge, where the run measured a band split."""
+    band_split = (production_shape or {}).get('band_split') or {}
+    if label not in band_split:
+        return ''
+    return f' (of the {band_split[label][OUTCOME_JUDGE]} the judge saw)'
+
+
+def pseudo_contradiction_caveat(
+    scored: Mapping[str, Any], production_shape: Mapping[str, Any] | None,
+) -> str:
+    """How the pseudo_contradiction class read under the shipped `contests` definition.
+
+    Derived from the scored confusion row, and from the band split where the
+    run measured one, so the counts have one source. It reports the reading
+    and asserts nothing about whether it is right: the records keep the labels
+    they were adjudicated under and are still scored against them.
+    """
+    label = LABEL_PSEUDO_CONTRADICTION
+    row = scored['confusion'][label]
+    n = scored['per_class'][label]['n']
+    breakdown = ', '.join(f'`{outcome}` {row[outcome]}' for outcome in EVAL_OUTCOMES)
+    return (
+        'Under the shipped `contests` definition — the entry says a candidate '
+        "is wrong, outdated or different (Leo's ruling 2026-09-30, "
+        "plans/write-triage-flip-readiness-prd.md §11.3 C1'') — the judge "
+        f'answered `contested` on {row[OUTCOME_CONTESTED]} of {n} {label} '
+        f'cases{_judged_share(label, production_shape)}; all outcomes: '
+        f'{breakdown}. These records were '
+        'adjudicated NOT contradictions under the EARLIER definition ("cannot '
+        'be true at the same time"), and this report still scores `contested` '
+        'on them as wrong and counts it in false_contested. The fixture is '
+        'deliberately not relabelled, so this reports how the new definition '
+        'reads them without asserting which reading is right.'
+    )
+
+
+def duplicate_contested_caveat(
+    scored: Mapping[str, Any],
+    production_shape: Mapping[str, Any] | None,
+    judge_model: Any,
+) -> str:
+    """How often a duplicate read as `contested`, and on which judge.
+
+    Derived from the scored confusion row like
+    :func:`pseudo_contradiction_caveat`. Every one of these is a write the
+    run's judge would flag for a human, so this is the false-alarm figure the
+    flip operator reads, and it is only as general as the judge that
+    produced it.
+    """
+    label = LABEL_DUPLICATE
+    contested = scored['confusion'][label][OUTCOME_CONTESTED]
+    n = scored['per_class'][label]['n']
+    return (
+        f'The judge, `{judge_model}`, answered `contested` on {contested} of '
+        f'{n} {label} cases{_judged_share(label, production_shape)}. The '
+        'curator labelled each duplicate the same claim as its canonical, so '
+        'this report scores `contested` on one as wrong; with triage enabled, '
+        'each is a write this judge would flag `contested` for a human to '
+        'read. The `contests` definition was settled on a frontier reasoning '
+        'judge: its live boundary test, '
+        'fused-memory/tests/server/test_write_triage_judge.py::TestTheShippedWordingLive, '
+        "pins one, because gpt-4o-mini answers that test's outdated cases "
+        '`contested` under the earlier wording too. Where this judge is not '
+        'the model that test pins, the figure measures the wording on a judge '
+        'it was not settled on: read it beside a run on that model before '
+        'deciding which judge the flip ships.'
+    )
+
+
 def build_report(
     *,
     scored: Mapping[str, Any],
@@ -1207,7 +1295,13 @@ def build_report(
             'available': False,
             'reason': CONTESTED_GROUND_TRUTH_REASON,
         },
-        'caveats': caveats_for(run_provenance.get('slate_mode')),
+        'caveats': [
+            *caveats_for(run_provenance.get('slate_mode')),
+            pseudo_contradiction_caveat(scored, production_shape),
+            duplicate_contested_caveat(
+                scored, production_shape, run_provenance['judge_model'],
+            ),
+        ],
         'provenance': run_provenance,
     }
 
@@ -1516,6 +1610,7 @@ def _is_committed_report(report_path: str) -> bool:
 
 def guard_committed_report(
     report_path: str, *, dry_run: bool, limit: int | None, slate_mode: str,
+    wording: str = _wording.WORDING_SHIPPED,
 ) -> str:
     """Keep a non-measurement run from publishing itself as the measurement.
 
@@ -1533,6 +1628,8 @@ def guard_committed_report(
       a temp path — the documented "prove the pipeline" invocation keeps
       working and still prints its report, it just cannot overwrite the
       committed one.
+    - a non-shipped ``--wording`` measures a prompt production does not
+      send, so it is refused outright beside the slate-mode refusal.
     - ``--limit N`` measures REALLY, just partially. Its numbers are the
       judge's own, and ``provenance.limit`` records the truncation in the
       artifact itself, so an operator (and
@@ -1561,6 +1658,12 @@ def guard_committed_report(
         raise ValueError(
             f"the committed artifact is the retrieved-slate arbiter (PRD C2'); pass "
             f'--report-path for a {slate_mode} run',
+        )
+
+    if wording != _wording.WORDING_SHIPPED:
+        raise ValueError(
+            f'the committed artifact measures the shipped wording; pass '
+            f'--report-path for a {wording} run',
         )
 
     if limit is not None:
@@ -1914,7 +2017,7 @@ def _run(args: Any) -> int:
     # artifacts with fixed-answer numbers.
     report_path = guard_committed_report(
         args.report_path, dry_run=args.dry_run, limit=args.limit,
-        slate_mode=args.slate_mode,
+        slate_mode=args.slate_mode, wording=args.wording,
     )
     aliases = load_canonical_aliases(args.canonical_aliases) if args.canonical_aliases else {}
 
@@ -1966,31 +2069,36 @@ def _run(args: Any) -> int:
             else build_judge_fn(config)
         )
 
-    report = run_judge_eval(
-        plan=plan,
-        judge_fn=judge_fn,
-        report_path=report_path,
-        cases_path=args.cases_path,
-        provenance={
-            'fixture_path': package_relative(args.fixture),
-            'judge_provider': provider,
-            'judge_model': model,
-            # Present on EVERY run, `None` on a full one. An absent key
-            # would be indistinguishable from an artifact predating the
-            # field, and this is the one field that says a committed
-            # report is a partial smoke rather than the corpus-wide
-            # measurement the task-3169 flip gate reads it as.
-            'limit': args.limit,
-            'canonical_aliases_path': (
-                package_relative(args.canonical_aliases) if args.canonical_aliases else None
-            ),
-            'canonical_aliases_count': len(aliases),
-            'cases_path': package_relative(args.cases_path) if args.cases_path else None,
-            'field_chars': field_chars,
-            'judge_candidate_count': judge_candidate_count,
-            'judge_enabled': judge_enabled,
-        },
-    )
+    with _wording.judge_wording(args.wording) as prompt_sha256:
+        report = run_judge_eval(
+            plan=plan,
+            judge_fn=judge_fn,
+            report_path=report_path,
+            cases_path=args.cases_path,
+            provenance={
+                'fixture_path': package_relative(args.fixture),
+                'judge_provider': provider,
+                'judge_model': model,
+                'judge_system_prompt_sha256': prompt_sha256,
+                # Present on EVERY run, `None` on a full one. An absent key
+                # would be indistinguishable from an artifact predating the
+                # field, and this is the one field that says a committed
+                # report is a partial smoke rather than the corpus-wide
+                # measurement the task-3169 flip gate reads it as.
+                'limit': args.limit,
+                'canonical_aliases_path': (
+                    package_relative(args.canonical_aliases)
+                    if args.canonical_aliases else None
+                ),
+                'canonical_aliases_count': len(aliases),
+                'cases_path': (
+                    package_relative(args.cases_path) if args.cases_path else None
+                ),
+                'field_chars': field_chars,
+                'judge_candidate_count': judge_candidate_count,
+                'judge_enabled': judge_enabled,
+            },
+        )
     print(json.dumps(report, indent=2))
     return 0
 
@@ -2046,6 +2154,13 @@ def main() -> int:
                              'slate, band winner, the candidate the verdict '
                              'named, attach target, band, verdict, outcome and '
                              'elision flags (default: no per-case dump)')
+    parser.add_argument('--wording', default=_wording.WORDING_SHIPPED,
+                        choices=_wording.WORDINGS,
+                        help='the judge system prompt the run is made under; '
+                             'pre-psi is the pre-psi wording as an eval-side '
+                             'override. Recorded as '
+                             'provenance.judge_system_prompt_sha256 '
+                             '(default: shipped)')
     return _run(parser.parse_args())
 
 

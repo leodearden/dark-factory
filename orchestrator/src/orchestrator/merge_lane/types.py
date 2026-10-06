@@ -24,7 +24,7 @@ from shared.branch_names import canonical_queued_branch_name
 
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
-from orchestrator.verify import VerifyResult
+from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -1280,12 +1280,13 @@ class InflightStatus(StrEnum):
     """Sentinel status values for :class:`InflightEntry` / :class:`InflightVerifyResult`.
 
     A single str-compatible Enum (task 1990 / MQ-invariants ε) shared by both
-    dataclasses' ``status`` fields — ``InflightEntry.status`` may carry any of
-    the five members; ``InflightVerifyResult.status`` carries only the first
-    three (DROPPED / REQUEUED / RUNNER_UNAVAILABLE).  Members are ``str``
-    instances (mirrors ``event_store.EventType`` / ``verify_runner.DriftVerdict``),
-    so every existing ``==`` / ``in`` comparison against the raw sentinel
-    strings keeps working unchanged.
+    dataclasses' ``status`` fields — ``InflightEntry.status`` carries the two
+    PREDISPATCH members, or DROPPED / REQUEUED once a verify has vacated the
+    entry (see :attr:`InflightEntry.vacated`); ``InflightVerifyResult.status``
+    carries only the first three (DROPPED / REQUEUED / RUNNER_UNAVAILABLE).
+    Members are ``str`` instances (mirrors ``event_store.EventType`` /
+    ``verify_runner.DriftVerdict``), so every existing ``==`` / ``in``
+    comparison against the raw sentinel strings keeps working unchanged.
     """
 
     DROPPED = 'DROPPED'
@@ -1532,8 +1533,9 @@ class InflightEntry:
                          that are enqueued without a real verify task so finalize can deliver
                          them in submission order
     verify_result  : set when the verify has completed (pass=None; fail=VerifyResult)
-    status         : optional sentinel string ('DROPPED', 'REQUEUED', 'RUNNER_UNAVAILABLE')
-                     returned by _run_inflight_verify to signal special handling by _finalize_inflight
+    status         : optional sentinel.  ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH are
+                     set by _dispatch_item; DROPPED / REQUEUED by the entry's own verify
+                     when it vacates the entry (see :attr:`vacated`, task 4582).
     chain          : the :class:`ChainResult` this dispatch's verify was
                      REDIRECTED onto (task 3185, PRD γ), or ``None`` on the
                      ordinary adjacent-verify path.  Its READER is
@@ -1578,6 +1580,12 @@ class InflightEntry:
     verify_wt: VerifyWorktreeHandle | None = None  # δ (task 3186): the verify's POST-swap worktree
     spec_warm: bool = False                 # δ (task 3186): warmth of an ADOPTED head's published merge_wt
 
+    @property
+    def vacated(self) -> bool:
+        """True once the verify dropped or requeued this entry's request and
+        released its lease; only the head-of-line finalize remains."""
+        return self.status in (InflightStatus.REQUEUED, InflightStatus.DROPPED)
+
     def __post_init__(self) -> None:
         """Enforce the I2-shadow invariant (task 1990 / MQ-invariants ε).
 
@@ -1591,6 +1599,85 @@ class InflightEntry:
                 f'passthrough_outcome={self.passthrough_outcome!r} on an item of type '
                 f'{type(self.item).__name__}',
             )
+
+
+@dataclass
+class InflightEntrySlot:
+    """The :class:`InflightEntry` wrapping a verify, handed to that verify (task 4582).
+
+    Built empty before the verify task for the reason
+    :class:`VerifyWorktreeHandle` gives, and filled by ``_dispatch_item`` once
+    the entry exists, so a verify that requeues or drops its request vacates
+    its OWN entry.
+    """
+
+    entry: InflightEntry | None = None
+
+
+class VerifyInFlightKind(StrEnum):
+    """What a :class:`VerifyInFlight` is doing; the heartbeat's ``kind`` vocabulary.
+
+    ``verify``: a dispatched verify (ordinary or speculative); ``gate_reverify``
+    and ``finalizing``: the finalize head's re-verify and landing;
+    ``train``: a coalesce/declared train held by the merger, whose verify runs
+    inline there; ``merging`` and ``dispatching``: any other item the lane
+    holds mid-merge or mid-dispatch, about to start a verify.
+    """
+
+    VERIFY = 'verify'
+    GATE_REVERIFY = 'gate_reverify'
+    FINALIZING = 'finalizing'
+    TRAIN = 'train'
+    MERGING = 'merging'
+    DISPATCHING = 'dispatching'
+
+    @classmethod
+    def for_phase(cls, phase: str) -> VerifyInFlightKind:
+        """The kind of a dispatched entry in lifecycle *phase*."""
+        if phase in (cls.GATE_REVERIFY, cls.FINALIZING):
+            return cls(phase)
+        return cls.VERIFY
+
+    @classmethod
+    def held(cls, state: str, *, is_train: bool) -> VerifyInFlightKind:
+        """The kind of an item held in lifecycle *state* with no in-flight entry."""
+        return cls.TRAIN if is_train else cls(state)
+
+
+@dataclass(frozen=True)
+class VerifyInFlight:
+    """One merge verify a restart would kill, as the restart drain sees it (task 5371).
+
+    ``started_ts`` is when the verify running NOW began: a dispatch, the latest
+    entry into a gate re-verify or finalize, or a train's latest inline verify
+    (``orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._note_verify_started``).
+    ``deadline_ts`` adds the longest command timeout the request's merge
+    verify can be granted
+    (``orchestrator/src/orchestrator/verify.py::merge_verify_command_budget_secs``),
+    so a verify still running past it is one its own timeout would kill.
+    """
+
+    task_id: str
+    host: str | None
+    kind: VerifyInFlightKind
+    started_ts: float
+    deadline_ts: float
+
+    @classmethod
+    def for_request(
+        cls, request: MergeRequest, *, host: str | None, kind: VerifyInFlightKind, started_ts: float,
+    ) -> VerifyInFlight:
+        budget = merge_verify_command_budget_secs(request.config, request.module_configs)
+        return cls(
+            task_id=request.task_id, host=host, kind=kind,
+            started_ts=started_ts, deadline_ts=started_ts + budget,
+        )
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            'task_id': self.task_id, 'host': self.host, 'kind': str(self.kind),
+            'started_ts': self.started_ts, 'deadline_ts': self.deadline_ts,
+        }
 
 
 @dataclass

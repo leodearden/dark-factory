@@ -4380,6 +4380,30 @@ def _observe_lease(args):
     return obs
 
 
+def _observe_drain_requests():
+    """Snapshot every drain request in the fleet dir as of THIS call (task 5371).
+
+    The same vantage point as _observe_lease: this fake runs mid-sweep, so it
+    is the only place a test can see which requests the sweep holds at the
+    moment each unit is restarted. {filename: parsed body (None if unparseable)}.
+    """
+    fleet_dir = os.environ.get("ORCH_FLEET_DIR", "")
+    seen = {}
+    try:
+        names = sorted(os.listdir(fleet_dir))
+    except OSError:
+        return seen
+    for name in names:
+        if not name.endswith(".drain.json"):
+            continue
+        try:
+            with open(os.path.join(fleet_dir, name)) as f:
+                seen[name] = json.load(f)
+        except (OSError, ValueError):
+            seen[name] = None
+    return seen
+
+
 def main(argv):
     args = [a for a in argv[1:] if a != "--user"]
     if not args:
@@ -4389,6 +4413,9 @@ def main(argv):
     state = _load()
     state.setdefault("calls", []).append(argv[1:])
     state.setdefault("lease_observations", []).append(_observe_lease(args))
+    state.setdefault("drain_request_observations", []).append(
+        {"args": args, "requests": _observe_drain_requests()}
+    )
 
     if verb == "list-units":
         for unit in state.get("running_units", []):
@@ -4417,12 +4444,16 @@ def main(argv):
     if verb == "show":
         fields = None
         unit = None
+        value_only = False
         i = 0
         while i < len(rest):
             tok = rest[i]
             if tok == "-p":
                 fields = rest[i + 1]
                 i += 2
+            elif tok == "--value":
+                value_only = True
+                i += 1
             elif tok.startswith("--property="):
                 fields = tok.split("=", 1)[1]
                 i += 1
@@ -4446,10 +4477,11 @@ def main(argv):
             "ActiveState": ustate.get("ActiveState", "active"),
             "ActiveEnterTimestamp": ustate.get("ActiveEnterTimestamp", "baseline"),
             "ActiveEnterTimestampMonotonic": str(ustate.get("ActiveEnterTimestampMonotonic", 0)),
+            "InvocationID": ustate.get("InvocationID", "0" * 32),
         }
         keys = fields.split(",") if fields else list(current.keys())
         for k in keys:
-            print(f"{k}={current.get(k, '')}")
+            print(current.get(k, "") if value_only else f"{k}={current.get(k, '')}")
         _save(state)
         return 0
 
@@ -12128,7 +12160,7 @@ def test_fleet_lease_max_age_matches_config_default(monkeypatch: pytest.MonkeyPa
 
     Modelled on test_orch_restart_min_interval_secs_matches_config_default
     above. The bound is what makes a SIGKILLed sweep cost at most one delayed
-    window, and its 7200s value is DERIVED (worst legitimate sweep ~= 6270s),
+    window, and its 14400s value is DERIVED (worst legitimate sweep ~= 13,300s),
     not chosen — so a tier drifting off it is a silent correctness change, not
     a cosmetic one.
 

@@ -366,6 +366,7 @@ _SHARED_ASSET_FIXTURES = {
     'charts_jsx_body': '/static/redux/charts.jsx',
     'tab_analytics_jsx_body': '/static/redux/tab_escalation_analytics.jsx',
     'tab_escalations_jsx_body': '/static/redux/tab_escalations.jsx',
+    'tab_overview_jsx_body': '/static/redux/tab_overview.jsx',
     'tab_tasks_jsx_body': '/static/redux/tab_tasks.jsx',
 }
 

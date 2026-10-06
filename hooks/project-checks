@@ -131,6 +131,12 @@ PYRIGHT_PACKAGES=(fused-memory orchestrator dashboard shared escalation sampler 
 # all PYRIGHT_PACKAGES instead of just its own. See task 2551.
 DEP_PACKAGES=(shared escalation)
 
+# Every tests/ directory the merge gate's check_bare_magicmock_config.py tail leg
+# scans, in the order of dark-factory-orchestrator.yaml::lint_command. That leg is
+# the source of truth: tests/scripts/test_hook_magicmock_test_dirs_drift.py fails
+# when this list and the leg disagree, so widen both together.
+MAGICMOCK_TEST_DIRS=(shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests sampler/tests cockpit/tests)
+
 RUFF_PATHS=()
 for target in "${RUFF_TARGETS[@]}"; do
     [ -e "$ROOT/$target" ] && RUFF_PATHS+=("$ROOT/$target")
@@ -165,7 +171,7 @@ fi
 # Script is stdlib-only (ast/argparse/pathlib/re/sys) — invoked via plain python3 to skip uv env-resolution overhead.
 echo "pre-commit: bare-magicmock-config check (staged)..."
 staged_mm="$(cd "$ROOT" && git diff --cached --name-only --diff-filter=ACMR -- \
-    shared/tests escalation/tests fused-memory/tests orchestrator/tests dashboard/tests \
+    "${MAGICMOCK_TEST_DIRS[@]}" \
     | grep -E '\.py$' || true)"
 if [ -n "$staged_mm" ]; then
     if ! (cd "$ROOT" && printf '%s\n' "$staged_mm" | xargs python3 fused-memory/scripts/check_bare_magicmock_config.py); then

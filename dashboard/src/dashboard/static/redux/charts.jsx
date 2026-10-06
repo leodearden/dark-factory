@@ -29,6 +29,7 @@ const {
   plottableMax,
   axisY,
   formatCountTick,
+  niceCountMax,
   axisPaths,
   barFractions,
   stackedAreaPaths,
@@ -127,7 +128,11 @@ function StepSpark({ values, width = 100, height = 28, color = PALETTE.bad, stro
 // explicitly with `formatY={formatCountTick}` (spark_path.js, where its
 // blank-don't-round rule is behaviourally tested). Do not "align" these two
 // defaults without redoing that audit.
-function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v }) {
+//
+// `snapMax` (task 5121) is opt-in for the same caller-audit reason: count
+// callers pass niceCountMax, and fraction axes must not, because 1 would snap
+// to 4. The rationale lives at spark_path.js::niceCountMax.
+function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => String(v), formatX = (v) => v, snapMax = (dataMax) => dataMax }) {
   const ref = useRef(null);
   const [w, setW] = useState(600);
   useEffect(() => {
@@ -147,7 +152,8 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
   // minV = 0: switching to a `Math.min(...)` fold would newly bring negative
   // samples in-range and silently re-frame every LineChart on the dashboard.
   // This is a null-handling fix, not a re-scaling.
-  const maxV = plottableMax(all, 1);
+  const ticks = 4;
+  const maxV = snapMax(plottableMax(all, 1), ticks);
   const minV = 0;
   const range = maxV - minV || 1;
   const n = labels.length;
@@ -170,7 +176,6 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
   // reads as "no data in this window"), so the x-mapping is taken from a builder
   // call either way — never recomputed here.
   const { stepX } = built[0] ?? axisPaths([], geom);
-  const ticks = 4;
   const yTicks = Array.from({ length: ticks + 1 }, (_, i) => minV + (range * i) / ticks);
   return (
     <div ref={ref} style={{ width: '100%', height }}>
@@ -212,7 +217,7 @@ function LineChart({ series, labels, height = 220, yLabel, formatY = (v) => Stri
   );
 }
 
-function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(Math.round(v)), formatX = v => v }) {
+function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(Math.round(v)), formatX = v => v, snapMax = (dataMax) => dataMax }) {
   // stacks: [{ key, color, values }]
   const ref = useRef(null);
   const [w, setW] = useState(600);
@@ -239,7 +244,8 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
   // label row: one x-mapping, so the labels can never drift out of line with
   // the bands they name.
   const geom = { x0: padL, y0: padT, width: chartW, height: chartH, count: n };
-  const { max: maxV, paths, stepX } = stackedAreaPaths(stacks, geom);
+  const ticks = 4;
+  const { max: maxV, paths, stepX } = stackedAreaPaths(stacks, geom, (foldedMax) => snapMax(foldedMax, ticks));
 
   // The value axis the builder scaled every band against: 0..maxV.
   const tickGeom = { y0: padT, height: chartH, min: 0, range: maxV };
@@ -255,7 +261,6 @@ function StackedAreaChart({ stacks, labels, height = 220, formatY = v => String(
   // integer count axes instead of gaining 2.5 / 7.5 labels. LineChart
   // already passed the raw tick and is deliberately left alone (see the note
   // at its signature: only the two formatY DEFAULTS differ).
-  const ticks = 4;
   const yTicks = Array.from({ length: ticks + 1 }, (_, i) => (maxV * i) / ticks);
 
   return (
@@ -633,4 +638,4 @@ function deriveVelocitySeries(series, labels, smoothingWindowSeconds) {
   return result;
 }
 
-window.DF_CHARTS = { PALETTE, DATUM_AGE_STYLE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries, formatCountTick };
+window.DF_CHARTS = { PALETTE, DATUM_AGE_STYLE, Sparkline, StepSpark, LineChart, StackedAreaChart, BarChart, HBarChart, Donut, StatTile, Heatmap, HistBar, SMOOTHING_OPTIONS, smoothingLabelToSeconds, defaultSmoothingForWindow, deriveVelocitySeries, formatCountTick, niceCountMax };

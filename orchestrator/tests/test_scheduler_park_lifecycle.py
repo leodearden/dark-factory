@@ -13,37 +13,21 @@ at any ``lock_depth``.
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import NamedTuple
 from unittest.mock import AsyncMock
 
 import pytest
-from _park_test_helpers import event_data_for, event_index, event_payloads, make_task
+from _park_test_helpers import (
+    event_data_for,
+    event_index,
+    event_payloads,
+    make_task,
+    park_world,
+)
 from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import PRIORITY_RANK, OrchestratorConfig
-from orchestrator.overrides import OverrideStore
+from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.scheduler import Scheduler
-
-
-class _World(NamedTuple):
-    scheduler: Scheduler
-    store: _RecordingEventStore
-    overrides: OverrideStore
-    root: str
-
-
-def _world(tmp_path: Path, *, pinned: tuple[str, ...] = ()) -> _World:
-    config = OrchestratorConfig(max_per_module=1, lock_depth=2, project_root=tmp_path)
-    config.fairness.skip_threshold = 1
-    root = str(config.project_root)
-    overrides = OverrideStore(tmp_path / 'o.db')
-    for tid in pinned:
-        overrides.set_override(root, tid, pinned=True)
-    store = _RecordingEventStore()
-    scheduler = Scheduler(config, event_store=store, override_store=overrides)  # type: ignore[arg-type]
-    scheduler.finish_startup()
-    return _World(scheduler, store, overrides, root)
 
 
 def _stack_owners(scheduler: Scheduler) -> set[str]:
@@ -61,7 +45,7 @@ def _stack_owners(scheduler: Scheduler) -> set[str]:
 
 @pytest.mark.asyncio
 async def test_a_pin_dispatch_clears_its_own_park_and_restores_the_shadow(tmp_path):
-    w = _world(tmp_path, pinned=('P',))
+    w = park_world(tmp_path, pinned=('P',))
     w.scheduler.lock_table.install_parks('L', ['p1.py'], 'low')
     w.scheduler.lock_table.install_parks('P', ['p1.py', 'p2.py'], 'high')
     tasks = [
@@ -81,7 +65,7 @@ async def test_a_pin_dispatch_clears_its_own_park_and_restores_the_shadow(tmp_pa
     assert len(used) == 1, 'pin dispatch: exactly one reservation_used for P'
     assert used[0]['priority'] == 'high', 'pin dispatch: reservation_used priority'
     restored = [e['data'] for e in event_payloads(w.store, 'reservation_restored')]
-    assert restored == [{'restored_owner': 'L', 'modules': ['p1.py']}], (
+    assert restored == [{'restored_owner': 'L', 'modules': ['p1.py'], 'source': 'fairness'}], (
         "pin dispatch: clearing P's park restores L on p1"
     )
     assert event_index(w.store, 'reservation_used', 'P') < event_index(
@@ -91,7 +75,7 @@ async def test_a_pin_dispatch_clears_its_own_park_and_restores_the_shadow(tmp_pa
 
 @pytest.mark.asyncio
 async def test_a_non_top_scored_dispatch_clears_its_own_park(tmp_path):
-    w = _world(tmp_path)
+    w = park_world(tmp_path)
     assert w.scheduler.lock_table.try_acquire('seed', ['t1.py'])
     w.scheduler.lock_table.install_parks('N', ['n1.py'], 'medium')
     tasks = [make_task('T', 'critical', ['t1.py']), make_task('N', 'medium', ['n1.py'])]
@@ -102,7 +86,7 @@ async def test_a_non_top_scored_dispatch_clears_its_own_park(tmp_path):
     assert result is not None and result.task_id == 'N', 'non-top dispatch: N dispatches'
     assert 'N' not in _stack_owners(w.scheduler), 'non-top dispatch: N keeps no park entry'
     assert event_data_for(w.store, 'reservation_used', 'N') == [
-        {'modules': ['n1.py'], 'priority': 'medium'},
+        {'modules': ['n1.py'], 'priority': 'medium', 'source': 'fairness'},
     ], 'non-top dispatch: reservation_used for N'
     assert len(event_data_for(w.store, 'task_skipped', 'T')) == 1, (
         'non-top dispatch: the passed-over top T is bumped'
@@ -111,7 +95,7 @@ async def test_a_non_top_scored_dispatch_clears_its_own_park(tmp_path):
 
 @pytest.mark.asyncio
 async def test_the_dispatched_tasks_park_no_longer_starves_the_top_in_the_same_tick(tmp_path):
-    w = _world(tmp_path)
+    w = park_world(tmp_path)
     assert w.scheduler.lock_table.try_acquire('seed', ['a.py'])
     w.scheduler.lock_table.install_parks('N', ['b.py'], 'critical')
     tasks = [make_task('T', 'critical', ['a.py', 'b.py']), make_task('N', 'high', ['b.py'])]
@@ -131,7 +115,7 @@ async def test_the_dispatched_tasks_park_no_longer_starves_the_top_in_the_same_t
 
 @pytest.mark.asyncio
 async def test_a_dispatch_restarts_the_blocked_install_streak(tmp_path):
-    w = _world(tmp_path)
+    w = park_world(tmp_path)
     lock_table = w.scheduler.lock_table
     tasks = [
         make_task('T', 'high', ['a.py', 'b.py']),
@@ -168,7 +152,7 @@ async def test_a_dispatch_restarts_the_blocked_install_streak(tmp_path):
 
 @pytest.mark.asyncio
 async def test_release_clears_a_park_armed_on_a_running_task_and_restores_the_shadow(tmp_path):
-    w = _world(tmp_path)
+    w = park_world(tmp_path)
     low = make_task('L', 'low', ['r1.py'])
     w.scheduler.get_tasks = AsyncMock(return_value=[make_task('R', 'medium', ['r1.py']), low])
     result = await w.scheduler.acquire_next()
@@ -188,7 +172,7 @@ async def test_release_clears_a_park_armed_on_a_running_task_and_restores_the_sh
 
     assert 'R' not in _stack_owners(w.scheduler), 'post-dispatch park: release clears R'
     assert [e['data'] for e in event_payloads(w.store, 'reservation_restored')] == [
-        {'restored_owner': 'L', 'modules': ['r1.py']},
+        {'restored_owner': 'L', 'modules': ['r1.py'], 'source': 'fairness'},
     ], 'post-dispatch park: release restores L on r1'
 
 
@@ -207,7 +191,7 @@ MEDIUM = '4700'
 
 @pytest.mark.asyncio
 async def test_4541_replay_the_starved_top_keeps_cfg_from_the_medium_task(tmp_path):
-    w = _world(tmp_path, pinned=(PIN_OWNER,))
+    w = park_world(tmp_path, pinned=(PIN_OWNER,))
     lock_table = w.scheduler.lock_table
     assert lock_table.try_acquire('H', ['x.py'])
     assert lock_table.try_acquire('Y', ['y.py'])
@@ -267,7 +251,7 @@ def _a_entries(scheduler: Scheduler, module: str) -> list[dict]:
 
 @pytest.mark.asyncio
 async def test_reserve_now_parks_at_the_boosted_tier(tmp_path):
-    w = _world(tmp_path)
+    w = park_world(tmp_path)
     assert w.scheduler.lock_table.try_acquire('seed', ['r1.py', 'r2.py'])
     w.overrides.set_override(w.root, 'A', boost_tier='critical', reserve_now=True)
     w.scheduler.get_tasks = AsyncMock(return_value=[make_task('A', 'medium', ['r1.py', 'r2.py'])])
@@ -288,7 +272,7 @@ async def test_reserve_now_parks_at_the_boosted_tier(tmp_path):
 
 @pytest.mark.asyncio
 async def test_reserve_now_never_duplicates_a_park_the_owner_already_holds(tmp_path):
-    w = _world(tmp_path)
+    w = park_world(tmp_path)
     assert w.scheduler.lock_table.try_acquire('seed', ['r1.py', 'r2.py'])
     w.scheduler.lock_table.install_parks('A', ['r1.py'], 'critical')
     w.overrides.set_override(w.root, 'A', boost_tier='critical', reserve_now=True)
@@ -307,7 +291,7 @@ async def test_reserve_now_never_duplicates_a_park_the_owner_already_holds(tmp_p
 
 @pytest.mark.asyncio
 async def test_reserve_now_raises_a_lower_tier_park_to_the_boosted_rank(tmp_path):
-    w = _world(tmp_path)
+    w = park_world(tmp_path)
     assert w.scheduler.lock_table.try_acquire('seed', ['r1.py', 'r2.py'])
     w.scheduler.lock_table.install_parks('A', ['r1.py'], 'medium')
     w.overrides.set_override(w.root, 'A', boost_tier='critical', reserve_now=True)
@@ -324,3 +308,80 @@ async def test_reserve_now_raises_a_lower_tier_park_to_the_boosted_rank(tmp_path
     ], 'reserve_now upgrade: the re-ranked r1 is reported with the new r2'
     installed, _ = w.scheduler.lock_table.install_parks('C', ['r1.py'], 'high')
     assert installed == [], 'reserve_now upgrade: a high competitor cannot shadow A on r1'
+
+
+# ---------------------------------------------------------------------------
+# Every reservation_* event names its source (task 6040)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_completion_events_carry_the_fairness_source(tmp_path):
+    w = park_world(tmp_path)
+    lock_table = w.scheduler.lock_table
+    assert lock_table.try_acquire('seed', ['s.py'])
+    lock_table.install_parks('L', ['s.py'], 'low')
+    lock_table.install_parks('F', ['f.py'], 'critical')
+    w.scheduler.get_tasks = AsyncMock(return_value=[
+        make_task('T', 'critical', ['s.py', 'f.py']),
+        make_task('L', 'low', ['s.py'], status='in-progress'),
+        make_task('F', 'critical', ['f.py'], status='in-progress'),
+    ])
+
+    assert await w.scheduler.acquire_next() is None, 'source: T is held off'
+
+    shadowed = event_data_for(w.store, 'reservation_shadowed', 'T')
+    assert [(d['victim'], d['source']) for d in shadowed] == [('L', 'fairness')]
+    installed = event_data_for(w.store, 'reservation_installed', 'T')
+    assert [d['source'] for d in installed] == ['fairness']
+    blocked = event_data_for(w.store, 'reservation_install_blocked', 'T')
+    assert [(d['blocked'], d['source']) for d in blocked] == [(['f.py'], 'fairness')]
+
+
+@pytest.mark.asyncio
+async def test_park_gc_expiry_and_restore_carry_the_fairness_source(tmp_path):
+    w = park_world(tmp_path)
+    w.scheduler.lock_table.install_parks('L', ['g.py'], 'low')
+    w.scheduler.lock_table.install_parks('D', ['g.py'], 'high')
+    w.scheduler.get_tasks = AsyncMock(return_value=[
+        make_task('D', 'high', ['g.py'], status='done'),
+        make_task('L', 'low', ['g.py'], status='in-progress'),
+    ])
+
+    await w.scheduler.acquire_next()
+
+    assert event_data_for(w.store, 'reservation_expired', 'D') == [
+        {'reason': 'terminal:done', 'source': 'fairness'},
+    ]
+    assert [e['data'] for e in event_payloads(w.store, 'reservation_restored')] == [
+        {'restored_owner': 'L', 'modules': ['g.py'], 'source': 'fairness'},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_park_eviction_drain_carries_the_fairness_source(tmp_path):
+    config = OrchestratorConfig(max_per_module=1, lock_depth=2, project_root=tmp_path)
+    evictions = ParkEvictionRequestStore(tmp_path / 'park_eviction_requests.db')
+    store = _RecordingEventStore()
+    scheduler = Scheduler(
+        config,
+        event_store=store,  # type: ignore[arg-type]
+        park_eviction_store=evictions,
+    )
+    scheduler.finish_startup()
+    scheduler.lock_table.install_parks('L', ['e.py'], 'low')
+    scheduler.lock_table.install_parks('X', ['e.py'], 'high')
+    evictions.enqueue('X', str(config.project_root))
+    scheduler.get_tasks = AsyncMock(return_value=[
+        make_task('X', 'high', ['e.py'], status='cancelled'),
+        make_task('L', 'low', ['e.py'], status='in-progress'),
+    ])
+
+    await scheduler.acquire_next()
+
+    assert event_data_for(store, 'reservation_force_evicted', 'X') == [
+        {'owner': 'X', 'modules': ['e.py'], 'source': 'fairness'},
+    ]
+    assert [e['data'] for e in event_payloads(store, 'reservation_restored')] == [
+        {'restored_owner': 'L', 'modules': ['e.py'], 'source': 'fairness'},
+    ]

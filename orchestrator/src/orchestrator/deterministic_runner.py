@@ -338,6 +338,19 @@ Phase γ adds the **before_done blocking cross-unit deploy** path
    downstream (``_format_outcome_echo``, task 3286) — the same constraint
    section 2's predicate subsection documents, so both note-writing sites in
    this module read consistently.
+
+   BOTH gate closes cite the resolving ``milestone_gate`` record through
+   ``done_provenance.escalation_id`` (task 5241, PRD C5): the curator close
+   since task 3341, the PLAIN pure-gate close as of 5241, via the one shared
+   rule in ``_cite_gate_escalation_id``. The two notes still differ — that
+   discriminator is deliberate and load-bearing — but neither close is
+   uncitable any more, and fused-memory now REFUSES a
+   ``kind='deterministic-gate'`` blob that names no record. Ordering note for
+   a fleet redeploy: a unit still carrying pre-5241 code has its pure-gate
+   closes refused until it restarts. The failure is self-healing — the gate
+   task simply stays blocked and re-resolves on the next dispatch — and no
+   state is lost, which is why the PRD ratifies landing the two halves
+   together.
 """
 
 from __future__ import annotations
@@ -916,6 +929,43 @@ def _build_done_provenance(kind: str, **fields: object) -> dict:
     validation happens at runtime, in the model itself.
     """
     return DoneProvenance(kind=kind, **fields).model_dump(exclude_none=True)  # type: ignore[arg-type]
+
+
+def _cite_gate_escalation_id(own_records: list) -> str | None:
+    """Pick the escalation a `deterministic-gate` close should CITE.
+
+    Cite the GATE record — NOT merely the newest own-role one (reviewer
+    amendment, task 3341).  The standard curator remediation round-trip
+    leaves TWO own-role records behind:
+      (A) the original `milestone_gate`, resolved WITHOUT a stamp — the
+          record that proves rung one, and
+      (B) the `curator_adjudication_missing` re-ask the guard filed,
+          resolved once the human finally stamped.
+    ``escalation_id`` is rung-ONE evidence, and both the module docstring and
+    docs/task-authoring.md promise it names the gate record.  Taking the
+    newest own record would cite (B), the re-ask — the one record that proves
+    nothing about the gate — quietly mis-aiming the audit trail this citation
+    exists to sharpen.  So filter to the gate category first and take the
+    newest of those; fall back to the newest own record only when no
+    gate-category record survives (e.g. a gate filed under an older
+    category), and return ``None`` for an empty list (an empty list must
+    never be indexed; ``_build_done_provenance``'s ``exclude_none=True`` then
+    simply drops the key).
+
+    BOTH gate arms call this — the curator close and, since task 5241, the
+    pure-gate close.  The rule must not exist twice: its whole value is being
+    uniform, and a second copy would strand this rationale on one of them.
+    Neither arm can actually reach the ``None`` return: both run only after
+    the zero-record strand branch has re-filed the gate and returned BLOCKED.
+
+    Pinned by test_curator_gate_remediation_round_trip_cites_the_gate_record
+    and test_pure_gate_resume_cites_the_gate_record_not_the_newest.
+    """
+    gate_records = [e for e in own_records if e.category == 'milestone_gate']
+    citable = gate_records or own_records
+    if not citable:
+        return None
+    return sorted(citable, key=lambda e: e.timestamp)[-1].id
 
 
 # The payload budget.  Sits safely inside the 500-char `max_note_chars` cap
@@ -3527,34 +3577,6 @@ class DeterministicRunner:
                         if len(_raw_stamp) <= _CURATOR_STAMP_NOTE_MAX_CHARS
                         else _raw_stamp[:_CURATOR_STAMP_NOTE_MAX_CHARS] + '…'
                     )
-                    # Cite the GATE record — NOT merely the newest own-role one
-                    # (reviewer amendment).  The standard remediation round-trip
-                    # this very guard creates leaves TWO own-role records behind:
-                    #   (A) the original `milestone_gate`, resolved WITHOUT a
-                    #       stamp — the record that proves rung one, and
-                    #   (B) the `curator_adjudication_missing` re-ask this guard
-                    #       filed, resolved once the human finally stamped.
-                    # `escalation_id` is rung-ONE evidence, and both the module
-                    # docstring and docs/task-authoring.md promise it names the
-                    # gate record.  Taking the newest own record would cite (B),
-                    # the re-ask — the one record that proves nothing about the
-                    # gate — quietly mis-aiming the audit trail this whole change
-                    # exists to sharpen.  So filter to the gate category first
-                    # and take the newest of those; fall back to the newest own
-                    # record only when no gate-category record survives (e.g. a
-                    # gate filed under an older category), and to omitting the
-                    # key when `own_records` is empty (unreachable — the strand
-                    # branch already returned — but an empty list must never be
-                    # indexed; `exclude_none=True` then simply drops the key).
-                    # Pinned by test_curator_gate_remediation_round_trip_cites_the_gate_record.
-                    _gate_records = [
-                        e for e in own_records if e.category == 'milestone_gate'
-                    ]
-                    _citable = _gate_records or own_records
-                    _gate_esc_id = (
-                        sorted(_citable, key=lambda e: e.timestamp)[-1].id
-                        if _citable else None
-                    )
                     await self.scheduler.set_task_status(
                         task_id,
                         'done',
@@ -3564,7 +3586,7 @@ class DeterministicRunner:
                                 'human curator gate: per-entry content '
                                 f'adjudication confirmed at {_stamp_for_note}'
                             ),
-                            escalation_id=_gate_esc_id,
+                            escalation_id=_cite_gate_escalation_id(own_records),
                         ),
                     )
                 else:
@@ -3572,12 +3594,19 @@ class DeterministicRunner:
                     # deploy/unit/pid evidence — stamp a dedicated gate-kind
                     # provenance so the done write passes require_done_provenance
                     # without lying about a deploy having happened (task 2331).
+                    #
+                    # The gate record is cited through the SAME rule the curator
+                    # arm uses (task 5241): `escalation_id` is now REQUIRED for
+                    # this kind server-side, and this arm is reached only with a
+                    # non-empty `own_records` — the zero-record case re-files the
+                    # gate and returns BLOCKED above, never arriving here.
                     await self.scheduler.set_task_status(
                         task_id,
                         'done',
                         done_provenance=_build_done_provenance(
                             'deterministic-gate',
                             note='pure gate resolved',
+                            escalation_id=_cite_gate_escalation_id(own_records),
                         ),
                     )
                 return WorkflowOutcome.DONE

@@ -91,13 +91,6 @@ class TestFetchTasksPagination:
     have produced.
     """
 
-    @pytest.fixture(autouse=True)
-    def reset_fetch_tasks_cache(self):
-        import dashboard.data.tasks as tasks_mod
-        tasks_mod._fetch_tasks_cache_clear()
-        yield
-        tasks_mod._fetch_tasks_cache_clear()
-
     async def test_pages_are_assembled_in_order(self, dummy_client, dummy_config):
         """7 tasks at page_size=3 → 3 requests, all 7 rows, original order."""
         from dashboard.data.tasks import fetch_tasks
@@ -652,25 +645,14 @@ class TestFetchTasksPagination:
             f'total; issued {len(calls)} request(s), expected {expected}'
         )
 
-    async def test_the_truncation_marker_is_not_cached(
+    async def test_a_truncation_marker_is_not_retained(
         self, dummy_client, dummy_config,
     ):
-        """A truncation marker is refused by the POSITIVE cache.
+        """A truncated walk's marker answers only the call that met it.
 
-        Restated for main's negative cache (task 3857).  The original claim —
-        "must return real rows on the very next call" — is no longer the
-        contract: a marker IS held by ``_fetch_tasks_negative_cache`` for
-        ``_FETCH_TASKS_NEGATIVE_TTL_SECONDS`` (5 s), deliberately, so a broken
-        root stops being the expensive path.  What must still hold, and what
-        this test now checks, is the two-part property the finding actually
-        cared about: the marker is never admitted to the POSITIVE cache
-        (``cache_ok=lambda v: isinstance(v, list)``), and it is not retained
-        beyond the short negative TTL — past it, a healthy server yields real
-        rows.  The 5 s window is unreachable by the only caller that walks:
-        ``burndown.collect_snapshot`` runs once per ``_SAMPLE_INTERVAL_SECONDS``
-        (600 s).
+        Nothing holds it (task 5598 retired both ``fetch_tasks`` caches), so
+        the very next call against a healthy server returns real rows.
         """
-        from dashboard.data import tasks as tasks_mod
         from dashboard.data.tasks import fetch_tasks
 
         tasks = [_paged_task_raw(i) for i in range(1, 8)]
@@ -706,63 +688,15 @@ class TestFetchTasksPagination:
             )
             assert isinstance(first, dict) and first.get('offline') is True, first
 
-            # The marker was refused by the POSITIVE cache.  Asserted on the
-            # walk's own key, so a mis-keyed entry cannot pass this by hiding
-            # under a different key.
-            key = tasks_mod._TasksRead(
-                '/proj/flaky', None, tasks_mod._CompleteRead(3),
-            )
-            assert tasks_mod._fetch_tasks_cache.get_fresh(key) is None, (
-                'the offline marker must never enter the positive cache'
-            )
-
             healthy[0] = True
-            # Expire the NEGATIVE entry rather than sleeping out its 5 s TTL.
-            # Retention past that window is what the finding forbids; retention
-            # inside it is main's deliberate retry suppression.
-            tasks_mod._fetch_tasks_negative_cache.clear()
             second = await fetch_tasks(
                 dummy_client, dummy_config, '/proj/flaky', chunk_size=3,
             )
 
         assert isinstance(second, list), (
-            f'the marker must not outlive the negative TTL; got {second!r}'
+            f'the marker must not outlive the call that met it; got {second!r}'
         )
         assert [t['id'] for t in second] == list(range(1, 8)), second
-
-    async def test_the_assembled_list_is_what_gets_cached(
-        self, dummy_client, dummy_config,
-    ):
-        """The cache holds the ASSEMBLED list, under the walk's own key.
-
-        Caching per PAGE would break the documented ~20 s TTL contract and
-        re-issue the whole fan-out on every render.  The key is the whole
-        `_TasksRead` record, and its `mode` being a `_CompleteRead` rather
-        than an `_OnePage` is what keeps this assembled entry from being
-        served to a caller that asked for one page of the same size (and
-        vice versa).
-        """
-        from dashboard.data.tasks import fetch_tasks
-
-        tasks = [_paged_task_raw(i) for i in range(1, 8)]
-        calls: list[dict] = []
-        with patch(
-            'dashboard.data.tasks.mcp_tool_call',
-            new=AsyncMock(side_effect=_paging_mcp(tasks, calls)),
-        ):
-            first = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/cached', chunk_size=3,
-            )
-            assert len(calls) == 3
-            second = await fetch_tasks(
-                dummy_client, dummy_config, '/proj/cached', chunk_size=3,
-            )
-
-        assert len(calls) == 3, (
-            f'the second call must be served from cache; got {calls!r}'
-        )
-        assert first == second
-        assert [t['id'] for t in second] == list(range(1, 8))
 
     async def test_statuses_and_timeout_reach_every_page_of_a_walk(
         self, dummy_client, dummy_config,
@@ -1186,12 +1120,6 @@ class TestPublicReadContracts:
     class pins that they can no longer be confused, at the public surface.
     """
 
-    @pytest.fixture(autouse=True)
-    def reset_fetch_tasks_cache(self):
-        tasks_mod._fetch_tasks_cache_clear()
-        yield
-        tasks_mod._fetch_tasks_cache_clear()
-
     # -- (a) the partial read announces itself -----------------------------
 
     @pytest.mark.parametrize('omitted', ['page_size', 'offset'])
@@ -1300,14 +1228,13 @@ class TestPublicReadContracts:
 
     # -- (e) statuses order-insensitivity, end to end -----------------------
 
-    async def test_reordered_statuses_hit_one_cache_entry(
+    async def test_reordered_statuses_send_one_wire_request(
         self, dummy_client, dummy_config
     ):
         """The second measured defect, closed at the public surface.
 
         `['a','b']` and `['b','a']` are the same SQL `IN` list, so they must be
-        the same read. They used to mint `s=a\\x1fb` and `s=b\\x1fa` — two
-        entries, two round trips, one answer.
+        the same read, and the same bytes on the wire.
         """
         mock_mcp = AsyncMock(return_value=canned_get_tasks_result())
         with patch('dashboard.data.tasks.mcp_tool_call', new=mock_mcp):
@@ -1320,10 +1247,11 @@ class TestPublicReadContracts:
                 statuses=['in-progress', 'pending'],
             )
 
-        assert mock_mcp.call_count == 1, (
-            f'an order-only difference must reuse the entry, got '
-            f'{mock_mcp.call_count} call(s)'
+        sent = [call.args[3] for call in mock_mcp.call_args_list]
+        assert len(sent) == 2 and sent[0] == sent[1], (
+            f'an order-only difference must send identical arguments, got {sent}'
         )
+        assert sent[0]['statuses'] == ['in-progress', 'pending']
         assert first == second
 
     async def test_genuinely_different_statuses_still_key_separately(

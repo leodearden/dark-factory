@@ -9,7 +9,7 @@ import logging
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, assert_never, cast
 
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
@@ -67,6 +67,7 @@ from escalation.models import (
 from escalation.pins import classify_pins
 from escalation.queue import AmendmentOutcome, EscalationQueue, ResolveOutcome
 from escalation.queue import observed_submit_response as _observed_submit_response
+from escalation.related_pending import related_pending
 from escalation.server_instructions import ESCALATION_SERVER_INSTRUCTIONS
 
 logger = logging.getLogger(__name__)
@@ -252,6 +253,18 @@ def _eval_lane_refusal(subject: str) -> dict[str, str]:
             'production task_id.'
         ),
         'code': 'eval_lane_contained',
+    }
+
+
+def _amend_not_pending_refusal(escalation_id: str, status: str) -> dict[str, str]:
+    """The ``amend_escalation`` refusal for a record that exists but is *status*."""
+    return {
+        'error': (
+            f'Escalation {escalation_id} is {status}, not pending; only a pending '
+            'record can be amended. Nothing was recorded.'
+        ),
+        'code': 'not_pending',
+        'status': status,
     }
 
 
@@ -1318,24 +1331,26 @@ def create_server(
     async def _report_amendment_truncation_storm(l2_id: str) -> None:
         """File ONE info escalation when amendment truncation BURSTS.
 
-        ``queue.add_members_to_l2`` already counts every dropped amendment on
-        the record itself (``amendments_truncated``) and logs a WARNING.  The
+        Called by both amendment writers' tools — a ``promote_to_l2`` fold and
+        an explicit ``amend_escalation`` — whenever their write shed entries.
+        ``queue._append_amendment_capped`` already counts every dropped
+        amendment on the record itself (``amendments_truncated``) and logs a
+        WARNING.  The
         counter stays the PRIMARY structured fact — the contract is assertable
         from the record, never by log-scrape (INV-8) — but a WARNING has no
         audience.  This is the rate-thresholded NOTIFICATION layered on top,
         which is what INV-4 asks for: a hearer, at a threshold.
 
         Deliberately lives here and not in ``queue.py``.  That module is a pure
-        storage leaf, and a self-file from inside ``add_members_to_l2`` would
+        storage leaf, and a self-file from inside a locked amendment write would
         re-enter ``make_id``/``submit``/``_atomic_write`` while still holding
-        ``escalation_id_lock``.  ``promote_to_l2`` already calls ``queue.submit``
-        on its create path and runs outside that flock.
+        ``escalation_id_lock``.  Both callers await this outside that flock.
 
         PURELY ADDITIVE, NEVER FATAL, mirroring the house analogues
         ``emit_markup_storm_escalation`` and
         ``emit_residual_candidate_key_escalation``: nothing raised in here may
-        fail the promote that triggered it.  A dropped report costs a
-        notification; a raised one would cost the fold.
+        fail the write that triggered it.  A dropped report costs a
+        notification; a raised one would cost the fold or the amend.
 
         Filed under ``_AMENDMENT_TRUNCATION_ANCHOR_TASK_ID``, following the same
         analogues, because the condition is system-scoped rather than a property
@@ -1963,6 +1978,28 @@ def create_server(
 
     # --- Handler-side tools ---
 
+    def _attach_related_pending(
+        payload: dict[str, Any], resolved: Escalation,
+    ) -> dict[str, Any]:
+        """Add ``resolve_issue``'s sideways census to *payload*, or leave it ABSENT.
+
+        A census that cannot be computed must never fail the resolve that has
+        already happened, and must never read as ``[]`` ("no pending twins"):
+        on any failure the key stays absent, which is the contract's UNKNOWN —
+        the same seam guard as the ``pins_recovery`` annotation in
+        ``get_pending_escalations``.
+        """
+        try:
+            payload['related_pending'] = related_pending(
+                queue.get_pending(), resolved=resolved,
+            )
+        except Exception:
+            logger.exception(
+                'related_pending census failed after resolving %s; the response '
+                'reports UNKNOWN (key absent)', resolved.id,
+            )
+        return payload
+
     @mcp.tool()
     def resolve_issue(
         escalation_id: str,
@@ -2054,6 +2091,18 @@ def create_server(
         ``_COMPACT_ESCALATION_FIELDS`` is a fixed ALLOWLIST and is deliberately
         NOT widened by any of this — ``late_resolutions`` is forensic detail for
         a full-record read, not triage-facing.
+
+        **Sideways census (``related_pending``)** (task 4886).  Both success
+        returns — ``park`` and resolve/dismiss — carry ``related_pending``: the
+        PENDING records that may carry the same question, one entry per record
+        (shape: ``escalation/related_pending.py::RelatedPendingEntry``) — another
+        record on the same task, or a pending L2 sharing a member with this
+        record or clustering it.  REPORT-ONLY: nothing is closed or changed;
+        disposing of each twin is the caller's call.  PENDING-ONLY, so ``[]``
+        means "no pending twins".  Computed AFTER the mutation, so this record's
+        own cascade-closed members are not listed.  The key is ABSENT when the
+        census could not be computed — absent means UNKNOWN, never "none".
+        Error returns carry no census: they changed nothing.
 
         ``escalate_model`` (task μ, adaptive-routing trigger 3): when True and
         the action leads to a *next dispatch* (``resume`` / ``restart``), the
@@ -2324,7 +2373,7 @@ def create_server(
             )
             if esc is None:
                 return {'error': f'Escalation {escalation_id} not found'}
-            return esc.to_dict()
+            return _attach_related_pending(esc.to_dict(), esc)
 
         # DECLARED-PIN GATE (task 4377) — see the "Declared-pin gate" section of
         # this docstring.  Its POSITION is load-bearing in two ways.  It sits
@@ -2457,7 +2506,7 @@ def create_server(
                     if corrected else '.'
                 )
             )
-        return payload
+        return _attach_related_pending(payload, esc)
 
     @mcp.tool()
     async def get_pending_escalations(
@@ -2919,6 +2968,97 @@ def create_server(
                 }
             return {'error': f'Escalation {escalation_id} not found or not pending'}
         return esc.to_dict()
+
+    @mcp.tool()
+    async def amend_escalation(
+        escalation_id: str,
+        summary: str = '',
+        detail: str = '',
+        options: list[str] | None = None,
+        root_cause: str = '',
+        agent_role: str = '',
+    ) -> dict[str, Any]:
+        """Append one framing amendment to a pending escalation (task 4886).
+
+        Writes a ruling made elsewhere onto the record it rules on, without
+        the side effects of the only other amendment writer, a
+        ``promote_to_l2`` fold.  APPEND-ONLY and PENDING-ONLY (parked records
+        included) via ``queue.amend``, which carries the full contract: the
+        amendment caps and repeat suppression are the fold's, but there is NO
+        severity floor, it is category-agnostic, and it never touches
+        ``status`` / ``severity`` / ``level`` / ``members``, the resolution
+        fields, the triage quad, the record's own framing or
+        ``root_cause_variants``.
+
+        Deliberately NOT gated by the connection-capability level check, for
+        ``stamp_triage``'s reason: an annotation is not a state transition, so
+        an L0/L1-capped connection may amend an L2 it cannot resolve.
+
+        *agent_role* attribution: an X-Escalation-Identity header overrides
+        the arg, mirroring ``triaged_by`` / ``resolved_by``.  Attribution only,
+        never a deny path.
+
+        A recorded amendment bumps ``updated_at``, the watcher's re-assess
+        trigger (``updated_at > triaged_at``).
+
+        Returns:
+
+        - the full record dict plus ``amendment_recorded: True``;
+        - the full record dict plus ``amendment_recorded: False`` and
+          ``no_op_reason: 'repeat_framing'`` when the framing repeats what the
+          record already says (a success: nothing new to record);
+        - ``{'error', 'code': 'empty_amendment'}`` when every framing arg is
+          empty;
+        - ``{'error', 'code': 'not_pending', 'status'}`` when the record exists
+          (archive included) but is not pending;
+        - ``{'error', 'code': 'not_found'}`` otherwise.
+
+        Queue I/O hops off the event loop: this server shares the
+        ORCHESTRATOR's loop, and ``queue.amend`` fires no loop-affine callback,
+        so the reason flock'd writes elsewhere stay inline (stated beside
+        ``dedupe.py::submit_or_dedupe_off_loop``) does not apply.
+        """
+        identity = get_http_headers().get(_IDENTITY_HEADER)
+        if identity is not None:
+            agent_role = identity
+
+        result = await asyncio.to_thread(
+            queue.amend, escalation_id, root_cause=root_cause, summary=summary,
+            detail=detail, options=options, agent_role=agent_role,
+        )
+        match result['status']:
+            case 'amended':
+                # An alarm whose census excluded a truncation source would
+                # under-report exactly the cap pressure it exists to detect.
+                if result['dropped'] > 0:
+                    await _report_amendment_truncation_storm(escalation_id)
+                return {**result['escalation'].to_dict(), 'amendment_recorded': True}
+            case 'repeat_framing':
+                return {
+                    **result['escalation'].to_dict(),
+                    'amendment_recorded': False,
+                    'no_op_reason': 'repeat_framing',
+                }
+            case 'not_pending':
+                return _amend_not_pending_refusal(escalation_id, result['escalation'].status)
+            case 'no_framing':
+                return {
+                    'error': (
+                        f'amend_escalation on {escalation_id} carries no framing: pass '
+                        'at least one of summary / detail / options / root_cause. '
+                        'Nothing was recorded.'
+                    ),
+                    'code': 'empty_amendment',
+                }
+            case 'not_found':
+                # queue.amend reads the queue root only, and a closed record
+                # lives in the archive.  Read-only, so it resurrects nothing.
+                archived = await asyncio.to_thread(queue.get, escalation_id)
+                if archived is not None and archived.status != 'pending':
+                    return _amend_not_pending_refusal(escalation_id, archived.status)
+                return {'error': f'Escalation {escalation_id} not found', 'code': 'not_found'}
+            case unhandled:
+                assert_never(unhandled)
 
     # --- L2 promotion tool ---
 

@@ -161,7 +161,8 @@ to wake itself on new escalation files — don't conflate the two.
 The **restart coordinator** (`service_restart.py`,
 `StaleServiceRestartCoordinator`) also lives inside the harness, not as a
 separate process — it arms on merge-landed events and fires detached
-restart scripts for fused-memory and the dashboard (see
+restart scripts for fused-memory, the dashboard and the orchestrator fleet
+itself (the last passes `--drain`; see
 [OPERATIONS.md](OPERATIONS.md)).
 
 ### 2.2 fused-memory (shared, one process, three ports)
@@ -192,9 +193,13 @@ for the whole fleet. Entry: `fused-memory/src/fused_memory/server/main.py`
 - **`scripts/orchestrator-watchdog.py`** — a systemd-timer oneshot
   (`OnBootSec=30`, `OnUnitActiveSec=60`). Its liveness pass TCP-probes each
   orchestrator's escalation port and revives a wedged unit immediately; its
-  separate staleness pass allows at most one fleet-wide redeploy per 8
-  hours (shared clock file `data/orchestrator/last_redeploy_orchestrator.json`),
-  delegating to `scripts/restart-all-orchestrators.sh --drain`. Full
+  separate staleness pass *intends* at most one fleet-wide redeploy per 8
+  hours (shared clock file `data/orchestrator/last_redeploy_orchestrator.json`,
+  plus an in-flight lease), delegating to
+  `scripts/restart-all-orchestrators.sh --drain`, a two-stage drain that
+  halts merge admission and holds each unit's restart while a merge verify is
+  in flight, until it ends or passes its own deadline (a sweep-wide cap bounds
+  the wait; units on pre-5371 code keep the old merge-idle gate). Full
   redeploy story (liveness vs. staleness vs. coordinator) in
   [OPERATIONS.md](OPERATIONS.md).
 

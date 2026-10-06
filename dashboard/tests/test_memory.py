@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
@@ -16,6 +17,7 @@ from _dashboard_helpers import (
     mcp_notify_response,
     mcp_tool_response,
 )
+from shared.testing_virtual_clock import virtual_clock_test
 
 from dashboard.data.datum import Datum, DatumState, unknown_datum, validate_datum
 from dashboard.data.memory import get_curator_state
@@ -995,6 +997,20 @@ class TestAggregatingLoopsLogFailuresAtWarning:
         )
 
 
+def _stall_host_before(port, seconds, handler):
+    """Wrap *handler* so a request to *port* first blocks the loop THREAD for *seconds*.
+
+    Models a starved xdist worker: the wall clock moves while the event loop cannot run.
+    """
+
+    async def stalled(request: httpx.Request) -> httpx.Response:
+        if request.url.port == port:
+            time.sleep(seconds)
+        return await handler(request)
+
+    return stalled
+
+
 # ── one hung url must not starve the hand-rolled per-URL loops ──
 
 
@@ -1008,17 +1024,23 @@ class TestHandRolledLoopsBoundEachUrl:
     ``call_with_deadline`` bound, after which the hung url is logged,
     invalidated and skipped.
 
-    The outer ``asyncio.wait_for(..., 5)`` is mandatory: without it a
-    regression is SIGALRM-killed at the suite's 60s pytest-timeout with no
-    traceback instead of failing fast.
+    Both run on shared/src/shared/testing_virtual_clock.py::virtual_clock_test.
+    The outer ``asyncio.wait_for(..., 5)`` is mandatory: without it a regression
+    parks until pytest-timeout kills the worker with no traceback.
     """
+
+    DEADLINE_SECONDS = 0.05
+    HOST_STALL_SECONDS = 2 * DEADLINE_SECONDS
 
     @pytest.fixture(autouse=True)
     def _short_deadline(self, monkeypatch):
         from dashboard.data import mcp_fanout
 
-        monkeypatch.setattr(mcp_fanout, '_DEFAULT_PER_URL_DEADLINE_SECONDS', 0.05)
+        monkeypatch.setattr(
+            mcp_fanout, '_DEFAULT_PER_URL_DEADLINE_SECONDS', self.DEADLINE_SECONDS,
+        )
 
+    @virtual_clock_test
     async def test_get_queue_stats_skips_the_hung_url_and_aggregates_the_rest(
         self, two_url_config,
     ):
@@ -1027,7 +1049,9 @@ class TestHandRolledLoopsBoundEachUrl:
         hung = 'http://localhost:9000'
         _get_session(hung)
         handler = _SessionAwareHandler(_QUEUE_STATS_PAYLOAD, hang_port=9000)
-        transport = httpx.MockTransport(handler)
+        transport = httpx.MockTransport(
+            _stall_host_before(9001, self.HOST_STALL_SECONDS, handler),
+        )
 
         async with httpx.AsyncClient(transport=transport) as client:
             result = await asyncio.wait_for(
@@ -1043,6 +1067,7 @@ class TestHandRolledLoopsBoundEachUrl:
         assert 9001 in handler.ports_seen, 'the loop must reach the second url'
         assert hung not in _sessions, "the hung url's session must be evicted"
 
+    @virtual_clock_test
     async def test_get_wal_status_skips_the_hung_url_and_reports_the_rest(
         self, two_url_config,
     ):
@@ -1052,7 +1077,9 @@ class TestHandRolledLoopsBoundEachUrl:
         _get_session(hung)
         stores = {'graphiti': {'busy': 0}}
         handler = _SessionAwareHandler({'stores': stores}, hang_port=9000)
-        transport = httpx.MockTransport(handler)
+        transport = httpx.MockTransport(
+            _stall_host_before(9001, self.HOST_STALL_SECONDS, handler),
+        )
 
         async with httpx.AsyncClient(transport=transport) as client:
             result = await asyncio.wait_for(

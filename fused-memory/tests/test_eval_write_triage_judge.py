@@ -21,8 +21,11 @@ and traceability — never about whether a number is large enough.
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
+import os
+import re
 import types
 from pathlib import Path
 
@@ -59,6 +62,13 @@ def _load_module(path: Path, mod_name: str) -> types.ModuleType:
 @functools.cache
 def _mod() -> types.ModuleType:
     return _load_module(SCRIPT_PATH, 'eval_write_triage_judge')
+
+
+@functools.cache
+def _wording() -> types.ModuleType:
+    return _load_module(
+        SCRIPT_PATH.parent / 'write_triage_judge_wording.py', 'write_triage_judge_wording',
+    )
 
 
 @functools.cache
@@ -773,6 +783,18 @@ def _run(
     )
 
 
+def _inserted_span(longer: str, shorter: str) -> str:
+    """The one contiguous span *longer* inserts into *shorter*.
+
+    Fails unless inserting that span is the ONLY difference, so a caller can
+    check what a clause says without the rest of the prose answering for it.
+    """
+    head = len(os.path.commonprefix([longer, shorter]))
+    tail = len(os.path.commonprefix([longer[head:][::-1], shorter[head:][::-1]]))
+    assert longer[:head] + longer[len(longer) - tail:] == shorter, (longer, shorter)
+    return longer[head:len(longer) - tail]
+
+
 class TestBuildReport:
     """The report is the deliverable — D10 makes it the operator's input."""
 
@@ -895,6 +917,96 @@ class TestBuildReport:
         caveats = self._report()['caveats']
         assert isinstance(caveats, list) and caveats
         assert all(isinstance(c, str) and c for c in caveats)
+
+    def test_the_prompt_hash_is_provenance_vocabulary(self) -> None:
+        assert 'judge_system_prompt_sha256' in _mod().PROVENANCE_KEYS
+
+    @staticmethod
+    def _answering(
+        cases: list[dict], label: str, answers, *,
+        production_shape=None, judge_model=None,
+    ) -> dict:
+        """*cases* scored with the *label* cases answering in turn from
+        *answers* and every other case answering `restated`."""
+        answer = iter(answers)
+        verdicts = [
+            next(answer) if case['expected_class'] == label else OUTCOME_RESTATED
+            for case in cases
+        ]
+        provenance = dict(_PROVENANCE)
+        if judge_model is not None:
+            provenance['judge_model'] = judge_model
+        return _mod().build_report(
+            scored=_mod().score_cases(cases, verdicts),
+            provenance=provenance,
+            production_shape=production_shape,
+        )
+
+    @staticmethod
+    def _caveat_counting(report: dict, label: str) -> str:
+        """The one caveat naming how many *label* cases answered `contested`."""
+        k = report['confusion'][label][OUTCOME_CONTESTED]
+        n = report['per_class'][label]['n']
+        count = f'{k} of {n} {label}'
+        naming = [caveat for caveat in report['caveats'] if count in caveat]
+        assert len(naming) == 1, (count, report['caveats'])
+        return naming[0]
+
+    _COUNTED_LABELS = ('LABEL_PSEUDO_CONTRADICTION', 'LABEL_DUPLICATE')
+
+    @pytest.mark.parametrize('label_name', _COUNTED_LABELS)
+    def test_a_caveat_counts_the_contested_answers_in_the_class(
+        self, label_name: str,
+    ) -> None:
+        label = getattr(_mod(), label_name)
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        report = self._answering(cases, label, [OUTCOME_CONTESTED] * len(cases))
+        assert report['per_class'][label]['n'] > 0, f'the corpus lost its {label} cases'
+        self._caveat_counting(report, label)
+
+    @pytest.mark.parametrize('label_name', _COUNTED_LABELS)
+    def test_the_count_follows_the_verdicts(self, label_name: str) -> None:
+        label = getattr(_mod(), label_name)
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        contested = self._answering(cases, label, [OUTCOME_CONTESTED] * len(cases))
+        amended = self._answering(cases, label, [OUTCOME_AMENDED] * len(cases))
+        assert (
+            self._caveat_counting(contested, label)
+            != self._caveat_counting(amended, label)
+        )
+
+    @pytest.mark.parametrize('label_name', _COUNTED_LABELS)
+    def test_the_judged_share_is_named_when_the_band_split_is_known(
+        self, label_name: str,
+    ) -> None:
+        label = getattr(_mod(), label_name)
+        cases = _cases(*((f'c{i}', label) for i in range(6)))
+        answers = [
+            OUTCOME_RESTATED, OUTCOME_CONTESTED, OUTCOME_CONTESTED,
+            OUTCOME_AMENDED, OUTCOME_AMENDED, OUTCOME_AMENDED,
+        ]
+        judged = 5
+        shape = {'band_split': {label: {
+            OUTCOME_RESTATED: 1, OUTCOME_JUDGE: judged, OUTCOME_STORED: 0,
+        }}}
+
+        with_split = self._caveat_counting(
+            self._answering(cases, label, answers, production_shape=shape), label,
+        )
+        without_split = self._caveat_counting(
+            self._answering(cases, label, answers), label,
+        )
+        added = _inserted_span(with_split, without_split)
+        assert str(judged) in re.findall(r'\d+', added), added
+
+    def test_the_duplicate_caveat_names_the_judge_it_measured(self) -> None:
+        label = _mod().LABEL_DUPLICATE
+        cases = _mod().build_judge_cases(_corpus(), distractors=2)
+        report = self._answering(
+            cases, label, [OUTCOME_CONTESTED] * len(cases),
+            judge_model='judge-under-test',
+        )
+        assert 'judge-under-test' in self._caveat_counting(report, label)
 
 
 class TestRenderMarkdown:
@@ -1439,6 +1551,7 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
             'judge_candidate_count': None,
             'cases_path': None,
             'canonical_aliases': None,
+            'wording': 'shipped',
             **overrides,
         })
         assert _mod()._run(args) == 0
@@ -1560,6 +1673,27 @@ class TestRunResolvesTheJudgeConfigIntoProvenance:
             _mod().PROVENANCE_KEYS,
         )
 
+    def test_provenance_records_the_system_prompt_it_measured(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+            JUDGE_SYSTEM_PROMPT,
+        )
+
+        recorded = self._captured(tmp_path, monkeypatch)['judge_system_prompt_sha256']
+        assert recorded == hashlib.sha256(JUDGE_SYSTEM_PROMPT.encode('utf-8')).hexdigest()
+        assert len(recorded) == 64 and set(recorded) <= set('0123456789abcdef')
+
+    def test_a_pre_psi_run_records_the_pre_psi_prompt_it_measured(
+        self, tmp_path: Path, monkeypatch,
+    ) -> None:
+        recorded = self._captured(tmp_path, monkeypatch, wording='pre-psi')[
+            'judge_system_prompt_sha256'
+        ]
+        assert recorded == hashlib.sha256(
+            _wording().PRE_PSI_JUDGE_SYSTEM_PROMPT.encode('utf-8'),
+        ).hexdigest()
+
 
 class TestADotMdReportPathIsRejectedAtArgumentTime:
     """`--report-path foo.md` is a bad ARGUMENT, so `_run` refuses it up front.
@@ -1587,6 +1721,7 @@ class TestADotMdReportPathIsRejectedAtArgumentTime:
             judge_candidate_count=None,
             cases_path=None,
             canonical_aliases=None,
+            wording='shipped',
         )
 
     def test_run_refuses_it_before_it_even_reads_the_fixture(
@@ -1716,6 +1851,24 @@ class TestGuardCommittedReport:
                 committed, dry_run=False, limit=None, slate_mode=_mod().SLATE_RETRIEVED)
         assert got == committed
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_a_non_shipped_wording_cannot_overwrite_the_arbiter(self) -> None:
+        with pytest.raises(ValueError, match='--report-path'):
+            _mod().guard_committed_report(
+                _mod()._DEFAULT_REPORT_PATH, dry_run=False, limit=None,
+                slate_mode=_mod().SLATE_RETRIEVED, wording='pre-psi')
+
+    def test_the_shipped_wording_may_write_the_arbiter(self) -> None:
+        committed = _mod()._DEFAULT_REPORT_PATH
+        assert _mod().guard_committed_report(
+            committed, dry_run=False, limit=None,
+            slate_mode=_mod().SLATE_RETRIEVED, wording='shipped') == committed
+
+    def test_a_pre_psi_run_elsewhere_is_untouched(self, tmp_path: Path) -> None:
+        target = str(tmp_path / 'fixture-pre-psi.json')
+        assert _mod().guard_committed_report(
+            target, dry_run=False, limit=None,
+            slate_mode=_mod().SLATE_RETRIEVED, wording='pre-psi') == target
 
 
 class TestABareDryRunCannotReachTheCommittedArtifact:
@@ -2124,6 +2277,28 @@ class TestCommittedJudgeAccuracyReportIsTraceable:
         _block, report, _resolved = self._committed()
         assert report is not None
         assert report['provenance']['slate_mode'] == _mod().SLATE_RETRIEVED
+
+    def test_the_committed_report_measured_the_shipped_system_prompt(self) -> None:
+        """The prompt is source, not a hot-reloadable knob, so an artifact that
+        measured another prompt does not describe production (PRD C2').
+
+        Unlike `judge_candidate_count`, which the sibling test above
+        deliberately leaves unbound to the shipped config.
+        """
+        from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+            JUDGE_SYSTEM_PROMPT,
+        )
+
+        _block, report, _resolved = self._committed()
+        assert report is not None
+        shipped = hashlib.sha256(JUDGE_SYSTEM_PROMPT.encode('utf-8')).hexdigest()
+        measured = report['provenance'].get('judge_system_prompt_sha256')
+        assert measured == shipped, (
+            f'the committed report measured system prompt {measured!r}, but the '
+            f'shipped JUDGE_SYSTEM_PROMPT hashes to {shipped!r} — re-run the '
+            f'committed arbiter command from the module docstring of '
+            f'scripts/eval_write_triage_judge.py'
+        )
 
     def test_every_duplicate_is_in_the_attach_population(self, records) -> None:
         """Recounted from the fixture rather than hardcoded (75 today; gate Γ1 reads it)."""

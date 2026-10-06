@@ -3156,6 +3156,15 @@ class OrchestratorConfig(BaseSettings):
     # separate from the paused-idle constant (_PAUSED_IDLE_POLL_SECS) so the
     # poll cadence can be tuned independently of the pause-recovery cadence.
     idle_poll_secs: float = Field(default=15.0)
+    # Cadences of the merge-heartbeat and stale-service-restart background
+    # services, which run whatever the dispatch loop is doing (task 5344).
+    # The heartbeat must refresh well inside the drain gate's fresh window
+    # (ORCH_DRAIN_FRESH_WINDOW_SECS, scripts/drain_check.py --fresh-window);
+    # the restart interval bounds how late an owed force-fire can be.
+    # Restart-only (not in RELOADABLE_FIELDS): captured once by
+    # Harness._build_lifecycle_registry.
+    merge_heartbeat_interval_secs: float = Field(default=15.0, gt=0)
+    stale_service_restart_interval_secs: float = Field(default=15.0, gt=0)
 
     # Iteration limits
     max_execute_iterations: int = Field(default=10)
@@ -3699,6 +3708,15 @@ class OrchestratorConfig(BaseSettings):
     # the existing test suite are unchanged; opt in per project where
     # `systemd-run --user` is available.
     verify_use_cgroup_scope: bool = Field(default=False)
+    # Per-role cgroup v2 cpu.weight each verify scope is spawned with
+    # (`systemd-run -p CPUWeight=`), only when verify_use_cgroup_scope is on.
+    # nice orders threads only INSIDE one cgroup, so without a weight the role
+    # tiers are inert across sibling scopes. task/background are lowered rather than merge raised, so the
+    # merge scope stays at parity (100) with each orchestrator unit and the
+    # operator's terminals under app.slice; 33/10 keep the 3:1 merge:task intent.
+    verify_cgroup_cpu_weight_merge: int = Field(default=100, ge=1, le=10000)
+    verify_cgroup_cpu_weight_task: int = Field(default=33, ge=1, le=10000)
+    verify_cgroup_cpu_weight_background: int = Field(default=10, ge=1, le=10000)
 
     # ── Verify admission control (task 2390 T2; PRD
     # plans/verify-oversubscription-control-prd.md) ────────────────────────
@@ -3837,23 +3855,14 @@ class OrchestratorConfig(BaseSettings):
     fused_memory_restart_script: str = Field(
         default='scripts/restart-fused-memory.sh'
     )
-    # Force-fire escape for the fused-memory coordinator (task 2817): once a
-    # restart is pending, the coordinator normally only fires from the polite
-    # idle path (agents_idle + debounce). Under chronic fleet saturation
-    # agents_idle is rarely true, so that path can starve indefinitely and the
-    # armed restart never fires (fire-once-or-never) — the operator then has to
-    # restart fused-memory by hand (born-at-L2 esc-2814-1). Once a pending
-    # restart has been owed for this many seconds, maybe_restart bypasses
-    # agents_idle and the debounce and force-fires even on the busy-wait branch,
-    # while still preferring the polite idle path for the common (healthy) case.
-    # fused-memory keeps no min_interval rate cap, so nothing throttles the
-    # force-fire. 0 disables force-fire (byte-identical prior behaviour); the
-    # 15-min default caps the worst-case stale-bytecode window under saturation
-    # (far below the orchestrator's 4500s bound — a `--drain` fused-memory
-    # restart is far cheaper than a full orchestrator fleet redeploy).
-    # Deliberately NOT in RELOADABLE_FIELDS: red-tier / restart-only, captured
-    # once at coordinator construction (_build_service_restart_coordinator),
-    # matching its orchestrator_restart_force_fire_after_secs sibling.
+    # Force-fire escape for the fused-memory coordinator (task 2817): the
+    # polite path needs agents_idle, which chronic fleet saturation can deny
+    # indefinitely (esc-2814-1). Once a restart has been owed this long,
+    # maybe_restart bypasses agents_idle and the debounce; the
+    # stale-service-restart service evaluates it whatever the dispatch loop
+    # is doing (task 5344). 0 disables. No
+    # min_interval cap throttles it. Restart-only (not in RELOADABLE_FIELDS),
+    # like orchestrator_restart_force_fire_after_secs.
     fused_memory_restart_force_fire_after_secs: float = Field(
         default=900.0,
         description=(
@@ -3980,25 +3989,32 @@ class OrchestratorConfig(BaseSettings):
     # scripts/restart-all-orchestrators.sh is mid-sweep it holds that lease and
     # the coordinator stands down; the bound is what keeps a lease stranded by
     # a SIGKILLed sweep (whose EXIT trap cannot run, by construction) from
-    # wedging the fleet. DERIVED, not picked: the worst LEGITIMATE sweep is one
-    # permanently-busy unit burning the whole 4500s drain busy-grace, plus ~6
-    # stale/absent units at 120s each, plus 7 x (verify 30 + grace 120) =
-    # 6270s ~= 1.74h, so 7200 clears it with headroom while staying far below
-    # the 8h orchestrator_restart_min_interval_secs — a leaked lease therefore
-    # delays at most ONE redeploy window. Deliberately NOT in RELOADABLE_FIELDS:
+    # wedging the fleet. DERIVED, not picked: the common long --drain sweep
+    # (task 5371) is the whole 11400s ORCH_DRAIN_VERIFY_MAX_WAIT_SECS verify-wait
+    # cap, plus 7 x (verify 30 + grace 120) restart verification, plus 7 x 120s
+    # stale/absent grace = ~13,300s ~= 3.7h, so 14400 (4h) clears it with
+    # headroom while staying far below the 8h
+    # orchestrator_restart_min_interval_secs — a leaked lease therefore delays at
+    # most ONE redeploy window. NOT a worst case: each unit left on the legacy
+    # merge-idle gate (pre-5371 code, or a refused request) can add its 600s
+    # busy grace, so two of them on top of a capped verify wait overrun it and
+    # the sweep degrades, bounded, to the pre-4755 collision. Deliberately NOT
+    # in RELOADABLE_FIELDS:
     # red-tier / restart-only, matching its siblings
     # orchestrator_restart_merge_phase_grace_secs /
     # orchestrator_restart_force_fire_after_secs /
     # orchestrator_restart_min_interval_secs (captured at coordinator
     # construction).
     orchestrator_restart_lease_max_age_secs: float = Field(
-        default=7200.0,
+        default=14400.0,
         description=(
             'Max age of the in-flight fleet-redeploy lease before the '
             'orchestrator coordinator stops honouring it and redeploys anyway. '
-            'Derived from the worst legitimate --drain sweep (~6270s) and kept '
-            'far below the 8h min-interval, so a lease stranded by a SIGKILLed '
-            'sweep delays at most one window. 2h default.'
+            'Derived from the common long --drain sweep (~13,300s: the '
+            '11400s verify-wait cap plus per-unit restart verification and '
+            'stale-heartbeat grace; legacy-gate units can add 600s each) and '
+            'kept far below the 8h min-interval, so a lease stranded by a '
+            'SIGKILLed sweep delays at most one window. 4h default.'
         ),
     )
 
@@ -4445,6 +4461,46 @@ class OrchestratorConfig(BaseSettings):
             'substantial fraction of an era while still admitting backfill in '
             'the fresh window where most grants occur. Green-tier, so a replay '
             'can retune it from production data without a deploy.'
+        ),
+    )
+
+    # Pin reservations (task 6040): the head lock-blocked pin(s) hold a
+    # reservation on their modules — see orchestrator/pin_reservation.py.
+    # Flat top-level fields beside backfill_*, read from self.config at tick
+    # time, so green-tier membership is the whole reload story.
+    pin_reservations_enabled: bool = Field(
+        default=True,
+        description=(
+            'Kill switch for pin reservations. When False the pin loop behaves '
+            'as before task 6040: a lock-blocked pinned task is granted no '
+            'reservation and emits no pin_blocked event, and any pin '
+            'reservations left over from before the switch flipped are released '
+            'once, on the next tick (reservation_expired reason '
+            "'pin_reservations_disabled')."
+        ),
+    )
+    pin_reservation_max_active: int = Field(
+        default=1,
+        ge=1,
+        description=(
+            'How many of the lowest-pin_order, eligible, lock-blocked pins may '
+            'hold a pin reservation at once. The default of 1 is the EASY-'
+            'backfill head reservation: one operator-chosen reservation cannot '
+            'gridlock with itself, its idle cost is one footprint, and backfill '
+            'still borrows through it. Raising it moves toward the general '
+            'below-rank-1 park installation that '
+            'plans/scheduler-dispatch-scoring-and-lock-layer-prd.md section 7 '
+            'measured as harmful. ge=1 because pin_reservations_enabled is the '
+            'single off lever.'
+        ),
+    )
+    pin_blocked_emit_interval_secs: float = Field(
+        default=3600.0,
+        gt=0,
+        description=(
+            'pin_blocked is emitted when a pinned task becomes blocked, then at '
+            'most once per this many seconds while it stays blocked. A dispatch, '
+            'or the task leaving the pin queue, resets it.'
         ),
     )
 
@@ -5830,6 +5886,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'backfill_safety_factor',
         'backfill_min_samples',
         'backfill_max_park_age_secs',
+        # Pin reservations (task 6040).  Explicit literals for the same reason
+        # as the backfill_* group: FLAT top-level fields.  Read from
+        # self.config at tick time, so no reload hook is needed.
+        'pin_reservations_enabled',
+        'pin_reservation_max_active',
+        'pin_blocked_emit_interval_secs',
         # Digest + EWA breaker knobs (task 4559).  Explicit literals for the
         # same reason as the backfill_* group above: these are FLAT top-level
         # fields, not a submodel, so _submodel_leaf_paths does not apply.
@@ -5947,6 +6009,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         'verify_admission_nice_task',
         'verify_admission_nice_background',
         'verify_admission_pytest_n',
+        # Per-role verify scope CPUWeight (task 5205): read at each verify scope
+        # spawn (verify.py::_resolve_scope_cpu_weight), so a reload applies from
+        # the next spawn; a scope already running keeps the weight it started with.
+        'verify_cgroup_cpu_weight_merge',
+        'verify_cgroup_cpu_weight_task',
+        'verify_cgroup_cpu_weight_background',
         # Merge-role internal-fanout cap (task 2393, T5) — same knob family:
         # read fresh per run_scoped_verification call, so a live reload
         # lowers the merge fan-out without a restart.

@@ -539,6 +539,12 @@ class _BriefingLike(Protocol):
         self, task: dict, plan: dict, not_touched: list[str],
         worktree: Path | None = ..., context: str | None = ...,
     ) -> str: ...
+    async def build_plan_schema_repair_prompt(
+        self, task: dict, context: str | None = ...,
+    ) -> str: ...
+    async def build_replan_prompt(
+        self, task: dict, review_feedback: str, context: str | None = ...,
+    ) -> str: ...
     async def build_simple_task_prompt(
         self, task: dict, worktree: Path | None = ...,
         context: str | None = ...,
@@ -5712,52 +5718,21 @@ class TaskWorkflow:
         return None
 
     async def _repair_plan_schema(self) -> bool:
-        """One-shot attempt to fix a plan that is missing ``steps``.
+        """One-shot architect pass that restructures a plan missing ``steps``.
 
-        Sends the broken plan back to the architect with a focused repair
-        prompt.  Returns True if the repaired plan now has a ``steps`` array.
+        The architect reads the plan from ``.task/plan.json``. Completeness is
+        attested only by its own ``confirm_plan``, enforced by the
+        ``_finalized_at`` gate in :meth:`_plan` — this method never stamps it.
         """
         assert self.artifacts is not None  # caller guarantees
         assert self.worktree is not None
 
-        broken_plan = self.artifacts.read_plan()
-        if not broken_plan:
+        if not self.artifacts.read_plan():
             return False
 
-        plan_path = str(self.artifacts.root / 'plan.json')
-        plan_dump = json.dumps(broken_plan, indent=2)[:6000]
-
-        repair_prompt = (
-            'The architect produced a plan that is structurally invalid — '
-            'it is missing the required top-level "steps" array.\n\n'
-            f'Here is the broken plan content:\n\n```json\n{plan_dump}\n```\n\n'
-            'The required schema is:\n'
-            '```json\n'
-            '{\n'
-            '  "task_id": "<task id>",\n'
-            '  "title": "<task title>",\n'
-            '  "files": ["path/to/file1.py"],\n'
-            '  "analysis": "<analysis>",\n'
-            '  "prerequisites": [\n'
-            '    {"id": "pre-1", "description": "...", "status": "pending", "commit": null}\n'
-            '  ],\n'
-            '  "steps": [\n'
-            '    {"id": "step-1", "type": "test", "description": "...", "status": "pending", "commit": null},\n'
-            '    {"id": "step-2", "type": "impl", "description": "...", "status": "pending", "commit": null}\n'
-            '  ],\n'
-            '  "design_decisions": [\n'
-            '    {"decision": "...", "rationale": "..."}\n'
-            '  ]\n'
-            '}\n'
-            '```\n\n'
-            'Your job: restructure the existing plan content into the required '
-            'schema.  Do NOT explore the codebase or redesign the plan.  Simply '
-            'reorganize the existing keys and values into the correct shape and '
-            f'write the result to `{plan_path}` using the Write tool.'
-        )
-
+        prompt = await self.briefing.build_plan_schema_repair_prompt(self.task)
         try:
-            await self._invoke(ARCHITECT, repair_prompt, self.worktree)
+            await self._invoke(ARCHITECT, prompt, self.worktree)
         except Exception as e:
             logger.warning(
                 'Task %s: repair prompt invocation failed: %s',
@@ -5767,18 +5742,16 @@ class TaskWorkflow:
 
         repaired_plan = self.artifacts.read_plan()
         if repaired_plan.get('steps'):
-            # The repair restructures an existing complete plan into valid
-            # schema (the architect was told not to redesign), so the repaired
-            # plan is complete by construction.  Stamp the completeness marker
-            # — the repair prompt writes plan.json via the Write tool rather
-            # than confirm_plan, so the _finalized_at gate would otherwise
-            # reject this plan.
-            repaired_plan.setdefault('_finalized_at', datetime.now(UTC).isoformat())
-            self.artifacts.write_plan(repaired_plan)
             logger.info(
                 'Task %s: repair prompt succeeded — plan now has %d steps',
                 self.task_id, len(repaired_plan['steps']),
             )
+            if not repaired_plan.get('_finalized_at'):
+                logger.warning(
+                    'Task %s: repaired plan has steps but the architect did '
+                    'not call confirm_plan — it is not finalized',
+                    self.task_id,
+                )
             return True
 
         logger.warning(
@@ -10863,24 +10836,10 @@ class TaskWorkflow:
     async def _replan(self, reviews) -> None:
         """Feed review feedback back to architect for re-planning."""
         assert self.worktree is not None and self.artifacts is not None
-        feedback = reviews.format_for_replan()
         self.plan = self.artifacts.read_plan()
-
-        prompt = f"""\
-The implementation was reviewed and blocking issues were found.
-
-{feedback}
-
-# Current Plan
-
-```json
-{json.dumps(self.plan, indent=2)}
-```
-
-# Action
-
-Update the plan to address the blocking issues. You may add new steps to the `steps` array, but do NOT remove or reorder existing steps. Set new steps to status "pending". Write the updated plan to `.task/plan.json`.
-"""
+        prompt = await self.briefing.build_replan_prompt(
+            self.task, reviews.format_for_replan(),
+        )
         await self._invoke(ARCHITECT, prompt, self.worktree)
         self.plan = self.artifacts.read_plan()
 

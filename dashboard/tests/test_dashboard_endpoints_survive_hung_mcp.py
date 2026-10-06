@@ -115,7 +115,6 @@ def hung_mcp(monkeypatch, tmp_path, client):
         orchestrator,
         task_lookup,
         task_snapshot,
-        tasks,
     )
     from dashboard.data.escalation_corpus import QueueKind, QueueRef
 
@@ -170,7 +169,6 @@ def hung_mcp(monkeypatch, tmp_path, client):
     monkeypatch.setattr(active_tasks, '_TASKS_TOTAL_BUDGET', _TINY_BUDGET)
 
     def _clear_caches() -> None:
-        tasks._fetch_tasks_cache_clear()
         task_snapshot._snapshot_cache_clear()
         task_lookup._lookup_cache_clear()
         escalation_corpus._corpus_cache_clear()

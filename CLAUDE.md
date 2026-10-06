@@ -59,6 +59,16 @@ Review, refactor and PRD work cite those heuristics by name from that file.
 Do not restate them elsewhere (INV-9). The `CONTRIBUTING.md` §4 gates are
 the floor, not the bar.
 
+`docs/quality-findings-contract.md` is the single normative contract for
+the instruments that produce quality findings (`/review`,
+`/hotspot-survey`, `/census`, `/review-all`): finding key, area and
+severity vocabularies, what a report pins, the dedup protocol before
+filing, where a disposition lives (the task store, never a new ledger), and
+the task-completion trigger chain that schedules the next run. Skills point
+at it and do not restate it. `/review-all` (`skills/review-all/SKILL.md`) is
+the whole-project instrument built on it, human-attended and launched by
+the contract §11 human-gate task.
+
 ## Prerequisites
 
 ```bash
@@ -134,10 +144,25 @@ Any workspace member works; `shared` is used because it is the one member every
 resolves to its OWN tree, an un-synced one to the main checkout — both are
 correct, and knowing which you are in is the whole point of asking.
 
+**Never `find .`, nor `Glob` with no `path`, from the main checkout root to
+locate a first-party file.** That root holds a full copy of the tree per
+worktree under `.worktrees/`, `.worktrees-orphaned/`, `.eval-worktrees/` and
+`.claude/worktrees/`, all four in the root `.gitignore`, so a walk times out
+printing every copy. `Glob` passes `--no-ignore` and fails the same way;
+`Grep` honours `.gitignore`. Ask git's index instead:
+`git ls-files -- '*<name>'`, adding `--others --exclude-standard` for untracked
+files. Inside a task worktree both walks are fine.
+
 ### Anchoring ad-hoc paths
 
-The Bash working directory PERSISTS across calls, and any earlier `cd` moved it
-— including one buried in a compound command several turns ago. Your own
+In an interactive session the Bash working directory PERSISTS across calls, and
+any earlier `cd` moved it — including one buried in a compound command several
+turns ago. An orchestrator-dispatched Claude session is launched with
+`CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1`
+(`orchestrator/src/orchestrator/agents/invoke.py::apply_bash_cwd_reset_env`),
+which the CLI reads as a request to put its shell back at the dispatch root,
+silently, after every call. The anchor below is correct whether or not that
+happens; use it regardless. Your own
 command text does not show where the command will run: in the transcript behind
 `plans/confusion-census-2026-09-20.md` §1.4, two adjacent Bash calls in one
 session carried different tracked cwds.
@@ -184,13 +209,15 @@ the probe.
 Prefixing a probe this way puts every path inside it on repo-relative footing
 no matter which directory the call started in — including inside a
 `python3 - <<'PY'` heredoc, which is exactly where the sighting behind this
-subsection failed. The `cd` is scoped to that one command, it does not have to
-be re-derived per path, and it is cheaper than reasoning about where you
-currently are.
+subsection failed. It does not have to be re-derived per path, and it is
+cheaper than reasoning about where you currently are.
 
-Reach for it only when you need a Bash probe at all: the `Read`, `Glob` and
-`Grep` tools take repo-anchored paths and are not affected by the Bash cwd, so
-when they can answer there is nothing to anchor.
+The `Read`, `Glob` and `Grep` tools need the same care: give them an ABSOLUTE
+path. `Read` with one is unaffected by the Bash cwd, but a relative or omitted
+`path` given to `Grep` or `Glob` resolves against that same drifted cwd —
+measured 2026-09-27 (CLI 2.1.283), `Grep` answered "Path does not exist:
+orchestrator/src/orchestrator. Note: your current working directory is
+.../orchestrator/src".
 
 ## Memory Usage
 
@@ -366,9 +393,9 @@ column reference, and the soak signal to watch:
 **`OPERATIONS.md` §"Fleet redeploy & watchdog"**.
 
 Two things that section used to claim, and that measurement disproved on
-2026-08-24/25: only the **staleness** tier passes `--drain` (the coordinator
-passes no arguments, so it restarts mid-merge units ungated), and the two
-tiers **can** both redeploy inside one 8h window — the clock is stamped only
+2026-08-24/25: only the **staleness** tier passes `--drain` (historical: the
+coordinator passed no arguments then; since task **5371** both tiers pass it),
+and the two tiers **can** both redeploy inside one 8h window — the clock is stamped only
 when a sweep completes, so a long sweep leaves it reading the previous deploy
 throughout. Tasks **4754** and **4755** have since closed this: a sweep now
 holds an in-flight lease that the backstop, the coordinator and (for its
@@ -376,6 +403,13 @@ holds an in-flight lease that the backstop, the coordinator and (for its
 sweep overrunning `orchestrator_restart_lease_max_age_secs` loses the lease
 and degrades to the old collision, and the fused-memory tier has no lease at
 all — so read `--report`'s `FLEET-LEASE:` line rather than assuming.
+
+`--drain` (task 5371) is a two-stage drain: Stage A halts merge admission on
+every unit up front, Stage B restarts a unit only once no merge verify is in
+flight on any host (bounded by each verify's own timeout and
+`ORCH_DRAIN_VERIFY_MAX_WAIT_SECS`). Pre-5371 units and refused requests keep
+the old 600s merge-idle gate. The first sweep after a deploy of that code still
+meets old-code units. Detail: `OPERATIONS.md` §"Reading a drain".
 
 ## Working in the main checkout
 

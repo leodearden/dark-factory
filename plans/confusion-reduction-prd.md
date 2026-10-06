@@ -70,6 +70,8 @@ Haiku for trickle coding; Sonnet for census mining/verification; **Fable ONLY fo
 9. **Census files tasks through the curator** (normal `submit_task`), never `planning_mode` — dedup against already-filed remediation is the point. Filed tasks follow the routing rules (`task_kind`, no prose-routing intent — lesson: `prose-routing-intent`).
 10. **Deploy/liveness via the deterministic task kind** (install script as `before_done` deploy; liveness as delayed-milestone predicate) — no LLM pipeline for host operations. Stub scripts are committed with this PRD (executable, fail-loud) because `submit_task` validates `before_done.script` existence at filing; task ε replaces them with the real implementations before any deploy task can run (deps gate it).
 
+**Superseded for trigger semantics (2026-10-05):** the census trigger in these decisions is now owned by `plans/census-incremental-prd.md` L8a/L8b (its C7).
+
 ## 7. Contracts
 
 ### 7.1 Codebook v2 (extends the committed v1 in place; migration keeps all v1 fields)
@@ -178,9 +180,13 @@ census:
 models: {trickle: haiku, census_miner: sonnet, census_verify: sonnet, census_synthesis: fable}
 ```
 
+**Superseded for trigger semantics (2026-10-05):** the `census:` trigger keys are now owned by `plans/census-incremental-prd.md` L8a/L8b (its C7).
+
 ### 7.5 Census state (`<root>/docs/legibility/census-state.json`)
 
 `{"last_census_at": <iso>, "last_census_report": "plans/confusion-census-<date>.md"}` — committed by the census; the trigger reads it plus fused-memory done-counts plus candidate `first_seen` dates.
+
+**Superseded for trigger semantics (2026-10-05):** the state shape and how the trigger reads it are now owned by `plans/census-incremental-prd.md` (its C2, and L8a/L8b for C7).
 
 ## 8. Boundary-test sketch
 
@@ -194,6 +200,8 @@ models: {trickle: haiku, census_miner: sonnet, census_verify: sonnet, census_syn
 | 6 | Coder failure storm | >50% of a night's codings fail schema validation | Info escalation filed, non-zero exit, codebook untouched by failed records |
 | 7 | Census saturation stop | Fixture digest stream reaching 90% duplicates two consecutive batches | Mining stops; matrix + report emitted; state advanced |
 | 8 | Deploy verify | Install script run for dark_factory | `systemctl --user list-timers` lists the trickle timer; deterministic runner stamps `deployed-and-verified` |
+
+**Superseded for trigger semantics (2026-10-05):** row 5's trigger conditions are now owned by `plans/census-incremental-prd.md` L8a/L8b (its C7 and §4.8 row 13).
 
 ## 9. Pre-conditions for activating
 
@@ -212,6 +220,7 @@ All verified on main 2026-07-13:
 |---|---|---|---|---|
 | Tasks 2549/2558 (emission-time reason codes / structured evidence, from the survey batch) | consumes | Better-structured failure facts eventually make digests richer; no interface change needed here | **2549/2558** | wired (independent; trickle reads transcripts either way) |
 | Design-invariants gate PRD (sibling session, authoring 2026-07-13) | produces | Optional `invariant_violated` field on sightings/candidates (§7.1/§7.3) | **this PRD** owns the schema field; the sibling owns its gate/consumption | queued (field ships in γ) |
+| `plans/census-incremental-prd.md` | supersedes | Population of `invariant_violated` and its slug check | **`plans/census-incremental-prd.md` L9** (as of 2026-10-05) | queued |
 | `/hotspot-survey` skill | none | Disjoint: hotspot-survey mines *bug history* (git/fix-tasks/postmortems); this mines *agent confusion* (transcripts). Neither replaces the other | — | n/a |
 | Adaptive-model-routing PRD (tasks 2531-2546) | none | Model choice here is static ratified policy (§5), not `resolve_route`; no shared code | — | n/a |
 | verify-plan-prd (W7) | none | Census may *observe* verify-manifested confusion; it files tasks, never edits verify code | — | n/a |

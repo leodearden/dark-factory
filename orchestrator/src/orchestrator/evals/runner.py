@@ -60,6 +60,7 @@ from .metrics import (
     resolve_terminal_kind,
 )
 from .profile import apply_eval_profile
+from .replay_frame import REPLAY_FRAME_ID, ReplayFramedBriefingAssembler
 from .snapshots import create_eval_worktree, read_python_pin
 
 logger = logging.getLogger(__name__)
@@ -839,7 +840,8 @@ async def run_architect_eval(
     (implementer/debugger/reviewer/verify) is FROZEN (decision 8: noise
     isolation + token savings). The architect runs with THIS candidate's
     model/backend/effort/env_overrides, not the hardcoded opus-high the
-    implementer path pins.
+    implementer path pins. Its prompt ends with the replay frame, and the cell
+    is stamped ``replay_frame`` (docs/eval-replay-frame.md).
 
     The produced plan is scored two ways: :func:`judge_plan_quality` (the LLM
     judge, against the REAL landed reference diff
@@ -949,7 +951,6 @@ async def run_architect_eval(
     its ambiguity direction. The artifacts are read in the ``finally`` block
     below, which is the last moment they exist.
     """
-    from orchestrator.agents.briefing import BriefingAssembler
     from orchestrator.agents.invoke import invoke_agent
     from orchestrator.agents.roles import ARCHITECT
     from orchestrator.artifacts import TaskArtifacts
@@ -1099,7 +1100,7 @@ async def run_architect_eval(
 
         # 4. Build the architect prompt and invoke the architect LIVE with THIS
         #    candidate's model/backend/effort/env_overrides.
-        briefing = BriefingAssembler(orch_config)
+        briefing = ReplayFramedBriefingAssembler(orch_config, base_commit=pre)
         prompt = await briefing.build_architect_prompt(task_def, worktree=worktree)
         # Wire plan-tools MCP via the SAME production seam real dispatch uses
         # (workflow._invoke): relocated meta_root + direct-interpreter launch.
@@ -1591,6 +1592,7 @@ async def run_architect_eval(
         # correct refusal, reported ALONGSIDE plan_steps rather than folded into
         # it, so both facts survive on a plan-then-decline cell.
         terminal_kind=terminal_kind,
+        replay_frame=REPLAY_FRAME_ID,
         # NO test signal exists for a plan-only cell (task 3099): this path
         # freezes implementer/debugger/reviewer/verify, so verification never
         # runs. ``None`` is the documented "unknown" sentinel; the dataclass
@@ -1715,7 +1717,9 @@ async def run_end_to_end(
 
     The result's ``config_name`` encodes the ``(architect, implementer)`` combo
     and its metrics carry ``role_under_test='end_to_end'``. Mirrors run_eval's
-    timeout / exception handling and persists via :func:`save_result`.
+    timeout / exception handling and persists via :func:`save_result`. Its
+    architect is briefed in the replay frame, and the cell is stamped
+    ``replay_frame`` (docs/eval-replay-frame.md).
     """
     task = load_task(task_path)
     task_id = task['id']
@@ -1753,7 +1757,11 @@ async def run_end_to_end(
     # 4. Workflow dependencies (mirrors run_eval).
     git_ops = GitOps(orch_config.git, orch_config.project_root)
     scheduler, _ = _build_eval_scheduler(orch_config, task_id, list(modules))
-    briefing = BriefingAssembler(orch_config)
+    # TaskWorkflow's PLAN phase briefs the live architect through this; see
+    # docs/eval-replay-frame.md.
+    briefing = ReplayFramedBriefingAssembler(
+        orch_config, base_commit=task['pre_task_commit'],
+    )
     mcp = _EvalMcpStub(orch_config.fused_memory.url)
 
     # Owned only when the caller supplied nothing — see :data:`InjectedGate`.
@@ -1804,6 +1812,7 @@ async def run_end_to_end(
             logger.warning(f'Metric collection failed: {e}')
             metrics_dict = {}
         metrics_dict['role_under_test'] = 'end_to_end'
+        metrics_dict['replay_frame'] = REPLAY_FRAME_ID
 
         result = EvalResult(
             task_id=task_id,

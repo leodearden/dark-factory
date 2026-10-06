@@ -18,13 +18,13 @@ import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict
+from typing import TYPE_CHECKING, Literal, TypedDict, TypeVar
 
 if TYPE_CHECKING:
     from shared.psi import PsiSample
@@ -1433,30 +1433,69 @@ def is_wholly_preexisting(branch: Iterable[str], baseline: Iterable[str]) -> boo
     return not diff_new_failures(branch_set, baseline)
 
 
-# Process-wide cache for the per-main-SHA failing-test-id BASELINE (task μ,
-# verify-scope-inversion-prd.md, B2): distinct from _PROBE_CACHE above (that
-# one caches a bool — "is THIS specific failure preexisting"; this one caches
-# the FULL SET of ids already failing on a given main tip). Seeded for free
-# on every successful merge+full gate run (merge_queue.py's
-# _run_post_merge_verify pass path — see seed_main_baseline's docstring) so
-# steady-state lookups never pay for a probe; a probe only runs on a genuine
-# cold-start miss. Same TTL discipline as _PROBE_CACHE (mirrors its
-# docstring/shape) so a long-idle orchestrator doesn't pin a stale baseline
-# forever.
-# Key: main_sha; Value: (seeded_or_probed_at, failing_test_ids frozenset).
-_BASELINE_FAILING_IDS_CACHE: dict[str, tuple[float, frozenset[str]]] = {}
+# Process-wide per-main-SHA failing-test-id BASELINE (task μ,
+# verify-scope-inversion-prd.md, B2). An entry is determined by its SHA (and,
+# per module, by that module's registered command), so it stays valid for as
+# long as that SHA can be main's tip; the cache is bounded by recency of
+# write/use instead of by wall-clock (task 5627). _PROBE_CACHE above is not
+# keyed on everything that shapes its value (the requesting task's files scope
+# its probe), so it keeps its TTL. Neither is immune to flakes: each probe is
+# one unretried run, so a flaky red here stays known until main moves past the
+# SHA or the entry is evicted; known_failing_ids_on_main states what that costs.
+@dataclass(frozen=True)
+class _MainShaBaseline:
+    """What is known to fail at one main SHA. Rebuilt, never mutated."""
+
+    # The whole tree's failing ids, from a gate-pass seed or a full probe.
+    every_module: frozenset[str] | None = None
+    # Module prefix -> that module's failing ids, from narrowed probes.
+    by_module: Mapping[str, frozenset[str]] = field(default_factory=dict)
+
+    def complete_for(self, prefixes: frozenset[str] | None) -> frozenset[str] | None:
+        """Main's failing ids, complete for the scope *prefixes* (None: whole tree), or None."""
+        if self.every_module is not None:
+            return self.every_module
+        if prefixes is None or not prefixes <= self.by_module.keys():
+            return None
+        return frozenset().union(*(self.by_module[p] for p in prefixes))
+
+    def known_failing(self) -> frozenset[str]:
+        """Every id known to fail; a lower bound, so empty is not evidence of green."""
+        if self.every_module is not None:
+            return self.every_module
+        return frozenset().union(*self.by_module.values())
+
+
+_BASELINE_CACHE_MAX_SHAS = 16
+_BASELINE_FAILING_IDS_CACHE: OrderedDict[str, _MainShaBaseline] = OrderedDict()
+
+
+def _remember_main_baseline(main_sha: str, record: _MainShaBaseline) -> None:
+    _BASELINE_FAILING_IDS_CACHE[main_sha] = record
+    _BASELINE_FAILING_IDS_CACHE.move_to_end(main_sha)
+    while len(_BASELINE_FAILING_IDS_CACHE) > _BASELINE_CACHE_MAX_SHAS:
+        _BASELINE_FAILING_IDS_CACHE.popitem(last=False)
+
+
+def _recall_main_baseline(main_sha: str, *, touch: bool) -> _MainShaBaseline | None:
+    record = _BASELINE_FAILING_IDS_CACHE.get(main_sha)
+    if record is not None and touch:
+        _BASELINE_FAILING_IDS_CACHE.move_to_end(main_sha)
+    return record
 
 
 def seed_main_baseline(main_sha: str, ids: Iterable[str]) -> None:
     """Seed (or refresh) the per-main-SHA failing-id baseline cache for free.
 
-    Called from the PASS path of a merge+full gate run (merge_sha IS the
-    merged tree that is about to CAS-advance to become the next main tip —
-    see merge_queue.py's ``_run_post_merge_verify``), so in steady state
-    ``main_baseline_failing_ids`` below is always a cache hit and never pays
-    for a probe (B2).
+    *ids* is the whole tree's failing set at *main_sha*; ``frozenset()``
+    means every module is green there. Called from the PASS path of a
+    merge+full gate run (merge_sha IS the merged tree that is about to
+    CAS-advance to become the next main tip — see merge_queue.py's
+    ``_run_post_merge_verify``), so in steady state
+    ``main_baseline_failing_ids`` below is a cache hit for as long as that
+    SHA is main's tip and never pays for a probe (B2).
     """
-    _BASELINE_FAILING_IDS_CACHE[main_sha] = (time.monotonic(), frozenset(ids))
+    _remember_main_baseline(main_sha, _MainShaBaseline(every_module=frozenset(ids)))
 
 
 async def main_baseline_failing_ids(
@@ -1464,114 +1503,241 @@ async def main_baseline_failing_ids(
     module_configs: 'list[ModuleConfig]',
     git_ops: object,
     main_sha: str,
+    *,
+    red_module_prefixes: frozenset[str] | None = None,
 ) -> 'frozenset[str] | None':
     """Return the set of test ids already failing on *main_sha*, cache-first.
 
-    Cache hit (seeded by a prior gate pass, or a prior probe of this same sha
-    within the TTL window): returned immediately — no probe, no worktree.
+    *red_module_prefixes* names the modules holding the caller's red ids.
+    ``None`` asks about the whole tree. A set asks only about those modules:
+    each one the cache does not know yet is probed with its registered
+    merge-role command, the identical per-module run a whole-tree probe
+    makes, so its selection context is unchanged. It is never narrowed to
+    single test ids, because module granularity keeps the identical command
+    and selection context (task 4585 measured selection-dependent failures).
+    An empty set needs no probe. A prefix outside
+    ``verify_plan.effective_merge_module_configs`` falls back to the whole
+    tree.
 
-    Cache miss: runs exactly ONE full-suite, merge-role probe of bare main,
-    reusing the same ``ephemeral_worktree(WorktreeKind.MAIN_PROBE, ...,
-    warm_seed=True)`` + ``run_scoped_verification`` lifecycle
-    :func:`verify_failure_is_preexisting_on_main` uses for its own probe —
+    Cache hit: a whole-tree entry (a gate-pass seed or a whole-tree probe of
+    this sha) answers any request; per-module entries answer the modules
+    they cover. No probe, no worktree.
+
+    Cache miss: probes bare main inside ONE
+    ``ephemeral_worktree(WorktreeKind.MAIN_PROBE, ..., warm_seed=True)`` —
     a leaseless, local-only probe that NEVER routes through
     :class:`~orchestrator.verify_runner.HostAllocator` or
-    :class:`~orchestrator.verify_runner.RemoteRunner` (see that function's
-    docstring for the full LEASE-SAFETY & HOST-AFFINITY rationale, which
-    applies identically here). The probe passes no ``task_files`` — full
-    suite, no scoping — so its id-set is apples-to-apples with a merge+full
-    branch verify's id-set.
+    :class:`~orchestrator.verify_runner.RemoteRunner` (see
+    :func:`verify_failure_is_preexisting_on_main`'s docstring for the full
+    LEASE-SAFETY & HOST-AFFINITY rationale, which applies identically here).
+    The whole-tree probe is one ``run_scoped_verification`` with no
+    ``task_files``; the narrowed probe is one ``run_verification`` per
+    missing red module.
 
-    A probe that doesn't yield a junit-derived id set
-    (``failing_test_ids is None`` — OPAQUE/non-pytest command, or the probe
-    itself errored) returns ``None`` (B3 degrade) and is deliberately **not**
-    cached, so the next caller retries rather than being stuck with a
-    falsely-empty baseline for the whole TTL window.
+    B3: when the whole tree, or any requested module, yields no junit-derived
+    id set (``failing_test_ids is None`` — OPAQUE/non-pytest command, or the
+    probe itself errored), the answer is ``None`` and that part is
+    deliberately **not** cached, so the next caller retries rather than
+    being stuck with a falsely-empty baseline for the life of the SHA.
 
-    Does not alter deferred-probe scheduling/transport (G4, task 2564) — the
-    probe body reused here is exactly the one that function already owns.
+    Does not alter deferred-probe scheduling/transport (G4, task 2564).
+    """
+    if not main_sha:
+        return None
+    if red_module_prefixes is None:
+        return await _whole_tree_main_baseline(config, module_configs, git_ops, main_sha)
+    return await _red_module_main_baseline(
+        config, module_configs, git_ops, main_sha, red_module_prefixes,
+    )
+
+
+def red_module_prefixes_of(result: 'VerifyResult') -> frozenset[str] | None:
+    """The modules holding *result*'s red ids; None when they are not all attributed."""
+    by_module = result.failing_test_ids_by_module
+    if not isinstance(by_module, dict) or result.failing_test_ids is None:
+        return None
+    if _module_attribution_mismatch(result.failing_test_ids, by_module):
+        return None
+    return frozenset(prefix for prefix, ids in by_module.items() if ids)
+
+
+_ProbeOutcome = TypeVar('_ProbeOutcome')
+
+
+async def _on_main_probe_worktree(
+    git_ops: object,
+    main_sha: str,
+    body: Callable[[Path], Awaitable[_ProbeOutcome]],
+) -> _ProbeOutcome | None:
+    """*body*'s answer in a MAIN_PROBE worktree of *main_sha*; None when the worktree or *body* raised.
+
+    warm_seed=True: the probe shares the rolling warm-lane CoW base with the
+    ordinary task verifies it adjudicates, so any warm-base artifact bias is
+    common-mode across both sides of the comparison; the COLD ground truth
+    stays with MAIN_SWEEP and the '_mainsweepconfirm-' confirm worktree
+    (operator sign-off 2026-08-12, task-2567 suggestion).
     """
     from orchestrator.git_ops import EphemeralWorktreeError, WorktreeKind
 
-    if not main_sha:
-        return None
-
-    _now = time.monotonic()
-    _cached = _BASELINE_FAILING_IDS_CACHE.get(main_sha)
-    if _cached is not None:
-        _cached_at, _cached_ids = _cached
-        if _now - _cached_at < _PROBE_CACHE_TTL:
-            logger.debug(
-                'main_baseline_failing_ids: cache hit (main_sha=%.8s, %d id(s))',
-                main_sha, len(_cached_ids),
-            )
-            return _cached_ids
-
     try:
-        # warm_seed=True: this probe shares the rolling warm-lane CoW base
-        # with the ordinary task verifies it adjudicates, so any warm-base
-        # artifact bias is common-mode across both sides of the comparison;
-        # the COLD ground truth stays with MAIN_SWEEP and the
-        # '_mainsweepconfirm-' confirm worktree (operator sign-off
-        # 2026-08-12, task-2567 suggestion).
         async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
             WorktreeKind.MAIN_PROBE, main_sha, warm_seed=True,
-        ) as tmp_path:
-            try:
-                probe_result = await run_scoped_verification(
-                    tmp_path, config, module_configs,
-                    task_files=None,
-                    max_retries=0,
-                    role='merge',
-                )
-            except Exception:
-                logger.warning(
-                    'main_baseline_failing_ids: probe verify raised', exc_info=True,
-                )
-                return None
-
-            if probe_result.failing_test_ids is None:
-                # OPAQUE / non-pytest / probe-side failure to collect a junit
-                # report — degrade (B3). Deliberately not cached: a transient
-                # probe hiccup shouldn't pin "no baseline" for the TTL window.
-                logger.debug(
-                    'main_baseline_failing_ids: probe collected no junit ids '
-                    '(main_sha=%.8s) — degrading to None (B3)', main_sha,
-                )
-                return None
-
-            ids = frozenset(probe_result.failing_test_ids)
-            seed_main_baseline(main_sha, ids)
-            return ids
-
+        ) as worktree:
+            return await body(worktree)
     except EphemeralWorktreeError as e:
         logger.warning(
             'main_baseline_failing_ids: %s — baseline probe disabled for this attempt', e,
         )
-        return None
     except Exception:
-        logger.warning('main_baseline_failing_ids: unexpected error', exc_info=True)
+        logger.warning('main_baseline_failing_ids: probe raised', exc_info=True)
+    return None
+
+
+async def _whole_tree_main_baseline(
+    config: 'OrchestratorConfig',
+    module_configs: 'list[ModuleConfig]',
+    git_ops: object,
+    main_sha: str,
+) -> 'frozenset[str] | None':
+    _cached = _recall_main_baseline(main_sha, touch=True)
+    _hit = _cached.complete_for(None) if _cached is not None else None
+    if _hit is not None:
+        logger.debug(
+            'main_baseline_failing_ids: cache hit (main_sha=%.8s, %d id(s))',
+            main_sha, len(_hit),
+        )
+        return _hit
+
+    probe_result = await _on_main_probe_worktree(
+        git_ops, main_sha,
+        lambda worktree: run_scoped_verification(
+            worktree, config, module_configs, task_files=None, max_retries=0, role='merge',
+        ),
+    )
+    if probe_result is None:
         return None
+    if probe_result.failing_test_ids is None:
+        # OPAQUE / non-pytest / probe-side failure to collect a junit
+        # report — degrade (B3). Deliberately not cached: a transient
+        # probe hiccup shouldn't pin "no baseline" for the SHA's life.
+        logger.debug(
+            'main_baseline_failing_ids: probe collected no junit ids '
+            '(main_sha=%.8s) — degrading to None (B3)', main_sha,
+        )
+        return None
+    ids = frozenset(probe_result.failing_test_ids)
+    seed_main_baseline(main_sha, ids)
+    return ids
 
 
-def cached_main_baseline_failing_ids(main_sha: str) -> 'frozenset[str] | None':
-    """Cache-ONLY peek at the per-main-SHA failing-id baseline — never probes.
+async def _red_module_main_baseline(
+    config: 'OrchestratorConfig',
+    module_configs: 'list[ModuleConfig]',
+    git_ops: object,
+    main_sha: str,
+    prefixes: frozenset[str],
+) -> 'frozenset[str] | None':
+    if not prefixes:
+        return frozenset()
+    registered = {
+        mc.prefix: mc
+        for mc in verify_plan.effective_merge_module_configs(config, module_configs)
+    }
+    unresolved = prefixes - registered.keys()
+    if unresolved:
+        logger.info(
+            'main_baseline_failing_ids: red module(s) %s are not merge modules '
+            '(main_sha=%.8s) — probing the whole tree', sorted(unresolved), main_sha,
+        )
+        return await _whole_tree_main_baseline(config, module_configs, git_ops, main_sha)
 
-    Pure, synchronous, side-effect-free: returns the cached id set for
-    *main_sha* when present and within :data:`_PROBE_CACHE_TTL`, else
-    ``None``.  Used by the synchronous branch-block reason enrichment in
-    ``merge_queue._run_post_merge_verify`` (task μ, verify-scope-inversion-
-    prd.md), which must NEVER trigger a probe on the critical path (G4, task
-    2564) — unlike :func:`main_baseline_failing_ids` (cache-first, THEN
-    probes on a miss), this helper only ever reads.
+    known = _recall_main_baseline(main_sha, touch=True) or _MainShaBaseline()
+    hit = known.complete_for(prefixes)
+    if hit is not None:
+        return hit
+    missing = prefixes - known.by_module.keys()
+    probed = await _probe_modules_on_main(
+        config, git_ops, main_sha, [registered[p] for p in sorted(missing)],
+    )
+    if probed:
+        current = _recall_main_baseline(main_sha, touch=False) or _MainShaBaseline()
+        _remember_main_baseline(
+            main_sha, replace(current, by_module={**current.by_module, **probed}),
+        )
+    if probed is None:
+        return None
+    learned = _recall_main_baseline(main_sha, touch=False) or _MainShaBaseline()
+    return learned.complete_for(prefixes)
+
+
+async def _probe_modules_on_main(
+    config: 'OrchestratorConfig',
+    git_ops: object,
+    main_sha: str,
+    module_configs: 'list[ModuleConfig]',
+) -> dict[str, frozenset[str]] | None:
+    """Each module's failing ids on bare *main_sha*, keyed by prefix.
+
+    A module whose run collected no junit is absent from the result; the
+    whole answer is ``None`` when the worktree or any run raised.
     """
-    _cached = _BASELINE_FAILING_IDS_CACHE.get(main_sha)
-    if _cached is None:
+    sem = _module_fanout_semaphore(config, 'merge')
+
+    async def _probe(worktree: Path, mc: 'ModuleConfig') -> VerifyResult:
+        async with sem:
+            return await run_verification(worktree, config, mc, max_retries=0, role='merge')
+
+    async def _probe_each(worktree: Path) -> list[VerifyResult | BaseException]:
+        # return_exceptions: no sibling may outlive the worktree it runs in.
+        return await asyncio.gather(
+            *(_probe(worktree, mc) for mc in module_configs), return_exceptions=True,
+        )
+
+    results = await _on_main_probe_worktree(git_ops, main_sha, _probe_each)
+    if results is None:
         return None
-    _cached_at, _cached_ids = _cached
-    if time.monotonic() - _cached_at >= _PROBE_CACHE_TTL:
-        return None
-    return _cached_ids
+
+    collected: dict[str, frozenset[str]] = {}
+    for mc, result in zip(module_configs, results, strict=True):
+        if isinstance(result, BaseException):
+            logger.warning(
+                'main_baseline_failing_ids: probe of module %s raised', mc.prefix,
+                exc_info=result,
+            )
+            return None
+        if result.failing_test_ids is not None:
+            collected[mc.prefix] = frozenset(result.failing_test_ids)
+    return collected
+
+
+def cached_main_baseline_failing_ids(
+    main_sha: str, *, red_module_prefixes: frozenset[str] | None = None,
+) -> 'frozenset[str] | None':
+    """Cache-ONLY peek at main's failing ids for a scope — never probes (G4, task 2564).
+
+    *red_module_prefixes* means what it means to ``main_baseline_failing_ids``:
+    ``None`` is the whole tree, a set is just those modules. The answer is
+    COMPLETE for that scope or ``None``, never partial, so a caller may diff a
+    branch's ids against it. Side-effect-free: it never reorders the recency bound.
+    """
+    _cached = _recall_main_baseline(main_sha, touch=False)
+    return _cached.complete_for(red_module_prefixes) if _cached is not None else None
+
+
+def known_failing_ids_on_main(main_sha: str) -> frozenset[str]:
+    """The ids KNOWN to fail at *main_sha*, from any probe or seed — never probes.
+
+    A lower bound: empty means none known, not green. It answers "is main known
+    red?" (the task-2823 trivial-pass gate) and must never be diffed against.
+
+    A known red lasts as long as its SHA's baseline. A probe is one unretried
+    run, so a flaky red withholds config-only trivial passes at this SHA until
+    main moves past it (a trivial pass cannot move it) or the entry is evicted.
+    That is the accepted price of the gate staying armed for as long as a
+    genuinely red SHA stays main's tip.
+    """
+    _cached = _recall_main_baseline(main_sha, touch=False)
+    return _cached.known_failing() if _cached is not None else frozenset()
 
 
 def _worst_category(categories: list[str]) -> str:
@@ -3885,6 +4051,15 @@ class VerifyAttempt:
         return self._by_label('type')
 
 
+def _module_attribution_mismatch(
+    failing_test_ids: list[str] | None, by_module: Mapping[str, list[str]] | None,
+) -> frozenset[str]:
+    """Ids in only one of *failing_test_ids* and *by_module*; empty when the map is None or exact."""
+    if by_module is None:
+        return frozenset()
+    return frozenset().union(*by_module.values()) ^ frozenset(failing_test_ids or ())
+
+
 @dataclass
 class VerifyResult:
     passed: bool
@@ -3944,6 +4119,12 @@ class VerifyResult:
     # collected, zero failing" (main/branch genuinely clean under this
     # run) and must NOT be conflated with None.
     failing_test_ids: list[str] | None = None
+    # Task 5627: module prefix -> the junit-derived failing ids of the module
+    # run that produced them. Plain JSON-native, like `failing_test_ids`.
+    # None = no module attribution; the ids are then unattributable. When
+    # non-None it covers exactly `failing_test_ids`, checked by
+    # `_module_attribution_mismatch` at construction and wherever it is read.
+    failing_test_ids_by_module: dict[str, list[str]] | None = None
     # Task 3173: one FailureCategory per FAILING leg, in test/lint/type order,
     # exactly as `_summarize_checks` classified them (its fifth return
     # element). Deliberately a plain JSON-native `list[str] | None` (mirrors
@@ -4018,6 +4199,16 @@ class VerifyResult:
     # compare=False a failing CLI verify that produced an `unconfirmable` observation
     # would break test_cli test_verify_merge_cli_wrapper_transparency.
     flake_suppression: FlakeSuppression | None = field(default=None, compare=False)
+
+    def __post_init__(self) -> None:
+        mismatch = _module_attribution_mismatch(
+            self.failing_test_ids, self.failing_test_ids_by_module,
+        )
+        if mismatch:
+            logger.warning(
+                'VerifyResult: failing_test_ids_by_module does not cover exactly '
+                'failing_test_ids; ids in only one of them: %s', sorted(mismatch),
+            )
 
     def failure_report(self) -> str:
         """Format all failures into a single report for the debugger."""
@@ -4924,6 +5115,7 @@ class _ScopeKw(TypedDict, total=False):
 
     use_cgroup_scope: bool
     scope_tag: str
+    cpu_weight: int
 
 
 class _ClockKw(TypedDict, total=False):
@@ -5075,6 +5267,18 @@ def _clock_stop_reason(*, kind: str, limit: float, elapsed: float, remaining: fl
     )
 
 
+def _scope_launch_argv(scope_unit: str, cpu_weight: int | None) -> list[str]:
+    """The systemd-run prefix for a verify scope; CPUWeight is the between-cgroup
+    share (nice only orders threads inside the scope)."""
+    argv = [
+        'systemd-run', '--user', '--scope', '--quiet', '--collect',
+        f'--unit={scope_unit}',
+    ]
+    if cpu_weight is not None:
+        argv += ['-p', f'CPUWeight={cpu_weight}']
+    return argv
+
+
 async def _run_cmd(
     cmd: str,
     cwd: Path,
@@ -5084,6 +5288,7 @@ async def _run_cmd(
     *,
     use_cgroup_scope: bool = False,
     scope_tag: str = '',
+    cpu_weight: int | None = None,
     clock_stop: ClockStopConfig | None = None,
 ) -> tuple[int, str, bool]:
     """Run a shell command, return (returncode, combined output, timed_out).
@@ -5101,7 +5306,9 @@ async def _run_cmd(
     defeated post-merge verify strand live ``cargo`` for up to 30 minutes.
     Falls back to the plain ``start_new_session`` + ``killpg`` path when the
     flag is off or ``systemd-run`` is missing, so the default behaviour and the
-    existing test suite are unchanged.
+    existing test suite are unchanged. When *cpu_weight* is not None the scope
+    is created with ``-p CPUWeight=<cpu_weight>``; None omits the property
+    (systemd default).
 
     When *log_path* is provided, subprocess output is streamed (read in 4 KiB
     chunks and flushed) to that file as it arrives, so a timeout-killed child
@@ -5186,8 +5393,7 @@ async def _run_cmd(
             # forwarding stdio to our pipe; --collect auto-removes the scope when
             # it exits (no unit leak on the normal-completion path).
             proc = await asyncio.create_subprocess_exec(
-                'systemd-run', '--user', '--scope', '--quiet', '--collect',
-                f'--unit={scope_unit}',
+                *_scope_launch_argv(scope_unit, cpu_weight),
                 '/bin/bash', '-c', cmd,
                 cwd=str(cwd),
                 stdout=asyncio.subprocess.PIPE,
@@ -5754,6 +5960,26 @@ def _resolve_verify_timeout(
     return warm
 
 
+def merge_verify_command_budget_secs(
+    config: OrchestratorConfig, module_configs: list[ModuleConfig],
+) -> float:
+    """The longest per-command timeout a merge verify of *module_configs* can be granted.
+
+    The max of :func:`_resolve_verify_timeout`'s warm and merge-cold resolutions
+    over the global fallback and every module the merge verify covers, so it is
+    never shorter than the command timeout that would actually kill the verify.
+    Consumer: the restart drain's in-flight deadlines (task 5371).
+    """
+    covered: list[ModuleConfig | None] = [
+        None, *verify_plan.effective_merge_module_configs(config, module_configs),
+    ]
+    return max(
+        _resolve_verify_timeout(config, module, is_cold=is_cold, is_merge_verify=True)
+        for module in covered
+        for is_cold in (False, True)
+    )
+
+
 def _resolve_concurrent_verify(
     config: OrchestratorConfig,
     module_config: ModuleConfig | None,
@@ -5852,15 +6078,13 @@ def _govern_cpu_str(cmd: 'str | None', exec_path: 'str | None') -> 'str | None':
     ``use_cgroup_scope=True`` to ``_run_cmd``.  ``_run_cmd`` in turn launches
     the already-wrapped command inside a ``systemd-run --user --scope``
     (outer ``df-verify`` scope).  ``cpu-governed-exec.sh``, on its governed
-    path, tries to create an *inner* ``systemd-run --user --scope`` scope —
-    a nested transient scope inside the outer ``df-verify`` scope.  Nested
-    ``--user --scope`` invocations are allowed by systemd (each creates a
-    distinct cgroup slice), so this is not a correctness or leak bug; the
-    outer scope's cgroup kill still reaps the entire subtree regardless.
-    The live reify deployment currently sets ``verify_use_cgroup_scope=False``,
-    so this combination does not occur in practice.  ``cpu-governed-exec.sh``
-    also has a runtime probe + fail-open, so a nested-scope failure degrades
-    gracefully.
+    path, creates an *inner* ``systemd-run --user --scope --slice=...``
+    scope.  The inner scope MOVES the governed workload out of the outer
+    ``df-verify`` scope into its own scope under that slice, so neither the
+    outer scope's CPUWeight nor its cgroup kill reaches that workload —
+    ``cpu-governed-exec.sh`` sets the workload's weight itself.
+    ``cpu-governed-exec.sh`` also has a runtime probe + fail-open, so a
+    nested-scope failure degrades gracefully.
     """
     if cmd is None or not exec_path:
         return cmd
@@ -5888,6 +6112,22 @@ def _resolve_nice_prefix(config: OrchestratorConfig, role: str) -> list[str]:
     if override:
         return shlex.split(override)
     return nice_prefix(role)
+
+
+def _resolve_scope_cpu_weight(
+    config: OrchestratorConfig, role: Literal['merge', 'task', 'background'],
+) -> int:
+    """Return the cgroup CPUWeight a verify scope for *role* is spawned with.
+
+    Reads ``verify_cgroup_cpu_weight_{merge,task,background}`` at each spawn.
+    """
+    match role:
+        case 'merge':
+            return config.verify_cgroup_cpu_weight_merge
+        case 'task':
+            return config.verify_cgroup_cpu_weight_task
+        case 'background':
+            return config.verify_cgroup_cpu_weight_background
 
 
 def _verify_admission_active(config: OrchestratorConfig) -> bool:
@@ -6447,6 +6687,7 @@ async def run_verification(
                 {
                     'use_cgroup_scope': True,
                     'scope_tag': _scope_tag_for(config.project_root),
+                    'cpu_weight': _resolve_scope_cpu_weight(config, role),
                 }
                 if config.verify_use_cgroup_scope
                 else {}
@@ -7061,6 +7302,11 @@ async def run_verification(
             report, archive_root, task_id, _archive_attempt_id(attempt_id),
             module_prefix=module_prefix, segment_label=segment_label,
         )
+    failing_test_ids_by_module = (
+        {module_prefix: failing_test_ids}
+        if module_prefix is not None and failing_test_ids is not None
+        else None
+    )
 
     result = VerifyResult(
         passed=attempt.passed,
@@ -7075,6 +7321,7 @@ async def run_verification(
         archive_log_paths=archive_log_paths,
         duration_secs=_wall_secs,
         failing_test_ids=failing_test_ids,
+        failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
     )
 
@@ -7111,6 +7358,22 @@ async def run_verification(
             else:
                 logger.info('Verification failed: %s%s', summary, detail_tail)
     return result
+
+
+def _aggregate_failing_ids_by_module(
+    results: list[VerifyResult],
+) -> dict[str, list[str]] | None:
+    """Merge the children's module attribution; None unless every collecting child has one."""
+    collecting = [r for r in results if r.failing_test_ids is not None]
+    if not collecting:
+        return None
+    merged: dict[str, set[str]] = {}
+    for r in collecting:
+        if r.failing_test_ids_by_module is None:
+            return None
+        for prefix, ids in r.failing_test_ids_by_module.items():
+            merged.setdefault(prefix, set()).update(ids)
+    return {prefix: sorted(ids) for prefix, ids in merged.items()}
 
 
 def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
@@ -7187,6 +7450,9 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
     failing_test_ids = (
         sorted({fid for ids in _child_failing_ids for fid in ids}) if _child_failing_ids else None
     )
+    # Same None-child rule, but fail closed on an unattributed collecting
+    # child — see VerifyResult.failing_test_ids_by_module.
+    failing_test_ids_by_module = _aggregate_failing_ids_by_module(results)
 
     # Task 3173 review amendment: union the per-leg categories across FAILING
     # children only, order-preserved and de-duplicated (same deterministic
@@ -7224,6 +7490,7 @@ def _aggregate_results(results: list[VerifyResult]) -> VerifyResult:
         # tasks hit the len==1 fast path above and carry the exact value.
         duration_secs=max((r.duration_secs for r in results), default=0.0),
         failing_test_ids=failing_test_ids,
+        failing_test_ids_by_module=failing_test_ids_by_module,
         failing_leg_categories=failing_leg_categories,
     )
 
@@ -7771,6 +8038,34 @@ def _reverse_dependency_module_configs(
     return widened
 
 
+def _module_fanout_semaphore(
+    config: OrchestratorConfig, role: Literal['merge', 'task'],
+) -> asyncio.Semaphore:
+    """Bound one call's per-module fan-out into a single worktree.
+
+    A large (or accidentally polluted) module set must never launch an
+    unbounded number of full builds into one worktree at once. Create one per
+    call; it is a no-op when only one module runs. (Root cause of the 226-way
+    merge-verify storm: a polluted module set turned the no-match fan-out into
+    226 concurrent `cargo` pipelines in one `_merge-*` worktree.)
+
+    The cap is role-aware (task 2393, T5): merge-role pytests bypass the T2
+    counting admission slot (`_admission_slot` no-ops for role='merge' — the
+    anti-livelock/C-merge-priority guarantee), so merge's internal fan-out
+    needs its OWN bound (`merge_verify_max_concurrent_modules`), orthogonal to
+    `verify_admission_task_slots`. The 'task' role keeps the general
+    `max_concurrent_module_verifies` — its pytests are additionally bounded by
+    the admission slot, so the general knob mostly just caps burst concurrency
+    for it.
+    """
+    cap = (
+        config.merge_verify_max_concurrent_modules
+        if role == 'merge'
+        else config.max_concurrent_module_verifies
+    )
+    return asyncio.Semaphore(max(1, cap))
+
+
 async def run_scoped_verification(
     worktree: Path,
     config: OrchestratorConfig,
@@ -7817,29 +8112,7 @@ async def run_scoped_verification(
     call sites so post-merge verifies get the cold timeout.
     """
     scope_cargo_enabled = config.scope_cargo
-
-    # Bound the per-subproject fan-out so a large (or accidentally polluted)
-    # module set can never launch an unbounded number of full builds into one
-    # worktree at once.  Created per call; a no-op when only one module runs.
-    # (Root cause of the 226-way merge-verify storm: a polluted module set
-    # turned the no-match fan-out into 226 concurrent `cargo` pipelines in one
-    # `_merge-*` worktree.)
-    #
-    # The cap is role-aware (task 2393, T5): merge-role pytests bypass the T2
-    # counting admission slot (`_admission_slot` no-ops for role='merge' — the
-    # anti-livelock/C-merge-priority guarantee), so merge's internal fan-out
-    # needs its OWN bound (`merge_verify_max_concurrent_modules`), orthogonal
-    # to `verify_admission_task_slots`. The 'task' role (this function's only
-    # other role — see the `Literal['merge', 'task']` signature above) keeps
-    # the general `max_concurrent_module_verifies` — its pytests are
-    # additionally bounded by the admission slot, so the general knob mostly
-    # just caps burst concurrency for it.
-    _fanout_cap = (
-        config.merge_verify_max_concurrent_modules
-        if role == 'merge'
-        else config.max_concurrent_module_verifies
-    )
-    _fanout_sem = asyncio.Semaphore(max(1, _fanout_cap))
+    _fanout_sem = _module_fanout_semaphore(config, role)
 
     async def _verify_module(mc: ModuleConfig) -> 'VerifyResult':
         async with _fanout_sem:
@@ -8575,26 +8848,21 @@ async def verify_failure_is_preexisting_on_main(
         # failing_test_ids=None (today's callers, e.g. task-verify at
         # workflow.py) always takes that legacy path too.
         #
-        # Cost note (reviewer_comprehensive finding 2, task 2590): on a cold
-        # cache, main_baseline_failing_ids below pays for a FULL-SUITE
-        # merge-role probe (task_files=None) rather than the cheaper scoped
-        # role='task' probe further down this function — this applies to
-        # every caller that reaches here with a non-None failing_test_ids,
-        # sync (train/merge_gates/solo-reverify, via _classify_main_health_red)
-        # and deferred alike. This is confirmed acceptable, not an oversight:
-        # (1) it is opt-in — failing_test_ids is only ever non-None under
-        # merge_verify_breadth='full' (default remains 'scoped', so every
-        # caller that hasn't opted in pays exactly zero extra cost, byte-
-        # identical to pre-μ behaviour); (2) it is required for correctness
-        # — a full-suite branch id-set is only meaningfully diffable against
-        # an equally full-suite baseline id-set, a scoped signature
-        # comparison would not be apples-to-apples here; and (3) steady-state
-        # cost is amortized to a cache read by the pass-path seeding (B2,
-        # see seed_main_baseline) — a cold probe only happens on the first
-        # gate run against a given main tip, or after a TTL expiry / restart.
+        # Cost (task 5627): DF runs merge_verify_breadth='full', so every red
+        # merge gate takes this fork. A cold baseline probes only the modules
+        # holding the branch's red ids, each with its unchanged full-suite
+        # command. Each module is its own pytest invocation, so its failing
+        # set on main does not depend on the others running: exactly as
+        # apples-to-apples as a whole-tree probe. It is never narrowed to
+        # single test ids (task 4585 measured selection-dependent failures;
+        # that would false-halt the queue). Unattributable ids fall back to
+        # the whole-tree probe. Baselines live for the SHA's lifetime (see
+        # _BASELINE_FAILING_IDS_CACHE), so a gate-pass seed or an earlier
+        # probe at the same tip answers without probing.
         if failing_result.failing_test_ids is not None:
             baseline = await main_baseline_failing_ids(
                 config, module_configs, git_ops, main_sha,
+                red_module_prefixes=red_module_prefixes_of(failing_result),
             )
             if baseline is not None:
                 branch_ids = frozenset(failing_result.failing_test_ids)

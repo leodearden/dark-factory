@@ -500,6 +500,16 @@ class FakeBriefing:
     ) -> str:
         return f'Tighten plan for: {task.get("title", "")}'
 
+    async def build_plan_schema_repair_prompt(
+        self, task: dict, context: str | None = None,
+    ) -> str:
+        return f'Repair plan schema: {task.get("title", "")}'
+
+    async def build_replan_prompt(
+        self, task: dict, review_feedback: str, context: str | None = None,
+    ) -> str:
+        return f'Replan: {review_feedback[:100]}'
+
     async def build_simple_task_prompt(
         self, task: dict, worktree=None, context: str | None = None,
     ) -> str:

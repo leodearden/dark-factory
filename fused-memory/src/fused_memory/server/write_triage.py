@@ -75,9 +75,14 @@ from fused_memory.server.grouped_read import (
 # from a genuinely novel corpus. If that module is ever deleted rather than
 # left dormant, this import fails LOUDLY at import time, which is the right
 # way to be told to hoist the helper. (Hoisting it into a shared home is the
-# better end state and is deliberately NOT done here: near_duplicate_guard.py
-# is outside this task's lock set.)
-from fused_memory.server.near_duplicate_guard import _cosine_of
+# better end state and is still NOT done. Task 3127, which added this import,
+# did not hold near_duplicate_guard.py in its lock set; task 4734 did, and
+# took the cheaper move instead — renaming ``_cosine_of`` to the public
+# ``cosine_of`` in place, so this cross-module import no longer reaches into
+# another module's private surface — because that module is dormant rather
+# than deleted, and one home for the reader beats a third file to keep in
+# sync.)
+from fused_memory.server.near_duplicate_guard import cosine_of
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -508,7 +513,7 @@ def decide_band(
     scored = [
         (cosine, r)
         for r in results
-        if (cosine := _cosine_of(r)) is not None
+        if (cosine := cosine_of(r)) is not None
     ]
     if not scored:
         return BandDecision(OUTCOME_STORED, None, None, t_high, t_low)

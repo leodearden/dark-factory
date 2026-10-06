@@ -1,5 +1,6 @@
 """System prompt for Stage 1: Memory Consolidator."""
 
+from fused_memory.memory_metadata import render_metadata_vocabulary_guidance
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
 )
@@ -384,6 +385,8 @@ more recently than that is NOT stalled and must not be reported as such. This ch
 needs no escalation read at all: the stamp lives on the task record, which you do hold.
 
 {REFERENT_DECLARATION_GUIDANCE}
+
+{render_metadata_vocabulary_guidance()}
 
 ## Verifying Writes
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \

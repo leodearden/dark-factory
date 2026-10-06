@@ -38,17 +38,14 @@ def _canned(pairs=_PAIRS) -> CannedMCP:
 
 @pytest.fixture(autouse=True)
 def _isolate_caches():
-    """No unit, last good, row cache or rotation offset may cross a test."""
+    """No unit, last good or rotation offset may cross a test."""
     import dashboard.data.active_tasks as active_tasks_mod
     import dashboard.data.task_snapshot as snapshot_mod
-    import dashboard.data.tasks as tasks_mod
 
     snapshot_mod._snapshot_cache_clear()
-    tasks_mod._fetch_tasks_cache_clear()
     active_tasks_mod._reset_root_rotation()
     yield
     snapshot_mod._snapshot_cache_clear()
-    tasks_mod._fetch_tasks_cache_clear()
 
 
 @pytest.fixture()
