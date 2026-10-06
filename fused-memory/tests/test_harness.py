@@ -14,6 +14,7 @@ import pytest
 import pytest_asyncio
 from qdrant_client.http.exceptions import UnexpectedResponse
 from shared.config_dir import TaskConfigDir
+from shared.testing import make_gate_mock
 
 from fused_memory.models.reconciliation import (
     AssembledPayload,
@@ -4488,6 +4489,125 @@ async def test_notify_judge_halt_falls_back_to_generic_reason_when_none(
     args = harness._backlog_policy.on_judge_halt.call_args.args
     assert args[0] == 'test-project'
     assert args[1] == 'judge halted reconciliation'
+
+
+class TestRunLoopTearsDownUsageGate:
+    """run_loop tears down the usage gate the harness built in ``__init__`` on
+    every exit, so its probe tasks, background cost-event saves and probe dirs
+    do not outlive the loop (task 3288).
+
+    The main-loop drives witness ``_recover_stale_runs``, the first await
+    inside the main loop; the prologue drive cancels before it is ever reached.
+    """
+
+    @staticmethod
+    def _stub_collaborators(harness) -> asyncio.Event:
+        harness._recover_stale_runs = AsyncMock(return_value=None)
+        harness._start_escalation_server = AsyncMock()
+        harness._stop_escalation_server = AsyncMock()
+        return _witness(harness, '_recover_stale_runs')
+
+    @staticmethod
+    async def _retire_factory_gate(harness) -> None:
+        gate = harness.usage_gate
+        assert gate is not None, 'precondition: usage_cap.enabled defaults to True'
+        await gate.shutdown()
+
+    @staticmethod
+    async def _cancel_once_entered(
+        harness, entered: asyncio.Event, timeout: float = 10.0,
+    ) -> asyncio.Task:
+        """Start run_loop, wait for *entered* (or the loop dying early), then
+        cancel it and hand back the task UNAWAITED, so the caller can assert
+        how it ended — which _drive_until deliberately suppresses."""
+        loop_task = asyncio.create_task(harness.run_loop())
+        waiter = asyncio.ensure_future(entered.wait())
+        await asyncio.wait(
+            {waiter, loop_task}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+        )
+        waiter.cancel()
+        loop_task.cancel()
+        return loop_task
+
+    @pytest.mark.asyncio
+    async def test_run_loop_shutdown_awaits_the_usage_gate_teardown(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        gate = harness.usage_gate
+        assert gate is not None, 'precondition: usage_cap.enabled defaults to True'
+        entered = self._stub_collaborators(harness)
+        shutdown = AsyncMock(side_effect=gate.shutdown)
+        gate.shutdown = shutdown
+
+        await _drive_run_loop_until(harness, entered)
+
+        assert entered.is_set(), 'run_loop never reached its main loop; the drive measured nothing.'
+        shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_failing_gate_teardown_leaves_the_loop_task_cancelled(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """Fails a bare ``await self.usage_gate.shutdown()``: the task would end in RuntimeError."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        await self._retire_factory_gate(harness)
+        shutdown = AsyncMock(side_effect=RuntimeError('boom'))
+        harness.usage_gate = make_gate_mock(shutdown=shutdown)
+        entered = self._stub_collaborators(harness)
+
+        loop_task = await self._cancel_once_entered(harness, entered)
+
+        with pytest.raises(asyncio.CancelledError):
+            await loop_task
+        assert entered.is_set(), 'run_loop never reached its main loop; the drive measured nothing.'
+        shutdown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_disabled_pool_shuts_the_loop_down_cleanly(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        """Fails an unguarded teardown: ``usage_cap.enabled=False`` leaves ``usage_gate`` None."""
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        await self._retire_factory_gate(harness)
+        harness.usage_gate = None
+        entered = self._stub_collaborators(harness)
+        stop_escalation_server = AsyncMock()
+        harness._stop_escalation_server = stop_escalation_server
+
+        loop_task = await self._cancel_once_entered(harness, entered)
+
+        with pytest.raises(asyncio.CancelledError):
+            await loop_task
+        assert entered.is_set(), 'run_loop never reached its main loop; the drive measured nothing.'
+        stop_escalation_server.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_a_cancel_during_the_startup_prologue_still_tears_the_gate_down(
+        self, journal, event_buffer, mock_memory_service,
+    ):
+        harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+        await self._retire_factory_gate(harness)
+        shutdown = AsyncMock()
+        harness.usage_gate = make_gate_mock(shutdown=shutdown)
+        recover_stale_runs = AsyncMock(return_value=None)
+        harness._recover_stale_runs = recover_stale_runs
+        harness._stop_escalation_server = AsyncMock()
+        in_prologue = asyncio.Event()
+
+        async def start_and_hang() -> None:
+            in_prologue.set()
+            await asyncio.Event().wait()
+
+        harness._start_escalation_server = AsyncMock(side_effect=start_and_hang)
+
+        loop_task = await self._cancel_once_entered(harness, in_prologue)
+
+        with pytest.raises(asyncio.CancelledError):
+            await loop_task
+        assert in_prologue.is_set(), 'run_loop never reached its prologue; the drive measured nothing.'
+        recover_stale_runs.assert_not_awaited()
+        shutdown.assert_awaited_once()
 
 
 class TestNotifyJudgeHaltDedupeToken:

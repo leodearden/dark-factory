@@ -2845,6 +2845,15 @@ class ReconciliationHarness:
             self._escalation_task = None
             logger.info('Reconciliation escalation server stopped')
 
+    async def _shutdown_usage_gate(self) -> None:
+        """Tear down the usage gate built in ``__init__``, best-effort."""
+        if self.usage_gate is None:
+            return
+        try:
+            await self.usage_gate.shutdown()
+        except Exception as e:
+            logger.warning(f'usage_gate.shutdown() at harness shutdown failed: {e}')
+
     def _escalate(
         self,
         category: str,
@@ -3135,8 +3144,9 @@ class ReconciliationHarness:
 
     # ── Main loop ──────────────────────────────────────────────────────
 
-    async def run_loop(self) -> None:
-        """Management loop — discover active projects, spawn per-project loops."""
+    async def _start_up(self) -> None:
+        """Startup prologue: readiness wait, gate and judge init, escalation
+        server, then the one-shot recovery passes."""
         logger.info('Reconciliation harness background loop started')
         # Reviewer finding race_condition: wait for the recon-report server to be
         # accepting connections before the first stage subprocess is launched.  This
@@ -3213,8 +3223,16 @@ class ReconciliationHarness:
         except Exception as e:
             logger.warning(f'_check_index_health_at_startup at startup failed: {e}')
 
+    async def run_loop(self) -> None:
+        """Management loop — discover active projects, spawn per-project loops.
+
+        The startup prologue runs inside the shutdown ``finally``, so a cancel
+        or raise at any point still releases what startup and ``__init__``
+        acquired.
+        """
         loop_count = 0
         try:
+            await self._start_up()
             while True:
                 try:
                     await self._recover_stale_runs()
@@ -3282,6 +3300,8 @@ class ReconciliationHarness:
             # is silently dropped by the shutdown.
             await self._drain_judge_tasks()
             await self._stop_escalation_server()
+            # Last: the project loops and the judge invoke through this gate.
+            await self._shutdown_usage_gate()
 
     def auto_resume_pending(self, project_id: str) -> bool:
         """True iff a currently-halted ``project_id`` will auto-resume on the
