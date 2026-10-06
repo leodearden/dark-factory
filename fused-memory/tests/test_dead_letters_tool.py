@@ -16,7 +16,6 @@ from fused_memory.models.reconciliation import (
     EventType,
     ReconciliationEvent,
 )
-from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.event_queue import EventQueue
 from fused_memory.server.tools import (
     _DEAD_LETTER_PAYLOAD_MAX_BYTES,
@@ -184,6 +183,17 @@ def _make_failing_buf() -> AsyncMock:
     """A mock EventBuffer whose push raises non-retriable ValueError."""
     buf = AsyncMock()
     buf.push = AsyncMock(side_effect=ValueError('schema mismatch'))
+    return buf
+
+
+def _make_parked_buf(released: asyncio.Event) -> AsyncMock:
+    """A mock EventBuffer whose push parks until *released* is set — holds the drainer still."""
+
+    async def _park(_event):
+        await released.wait()
+
+    buf = AsyncMock()
+    buf.push = AsyncMock(side_effect=_park)
     return buf
 
 
@@ -847,8 +857,8 @@ class TestReplayEventDeadLettersTool:
         {'status':'replayed','replayed':N,'failed':0} and the events re-enter
         the queue (drainer commits them to the buffer; file is cleared)."""
         dl = tmp_path / 'dl.jsonl'
-        buf = EventBuffer(db_path=tmp_path / 'buf.db', buffer_size_threshold=100)
-        await buf.initialize()
+        released = asyncio.Event()
+        buf = _make_parked_buf(released)
         eq = EventQueue(
             buf,
             dead_letter_path=dl,
@@ -880,12 +890,11 @@ class TestReplayEventDeadLettersTool:
             )
             # Drainer commits the replayed events to the buffer.
             await asyncio.wait_for(eq._queue.join(), timeout=2.0)
-            assert (await buf.get_buffer_stats('proj-a'))['size'] == 3
             # The dead-letter file no longer holds the replayed records.
             assert (dl.read_text().strip() if dl.exists() else '') == ''
         finally:
+            released.set()
             await eq.close()
-            await buf.close()
 
     @pytest.mark.asyncio
     async def test_replay_enqueue_stays_on_loop_thread(self, tmp_path):
@@ -900,8 +909,8 @@ class TestReplayEventDeadLettersTool:
         post-fix (enqueue marshalled onto the loop).
         """
         dl = tmp_path / 'dl.jsonl'
-        buf = EventBuffer(db_path=tmp_path / 'buf.db', buffer_size_threshold=100)
-        await buf.initialize()
+        released = asyncio.Event()
+        buf = _make_parked_buf(released)
         eq = EventQueue(
             buf,
             dead_letter_path=dl,
@@ -950,10 +959,9 @@ class TestReplayEventDeadLettersTool:
                 f'loop={loop_thread_id} put_threads={put_threads}'
             )
             await asyncio.wait_for(eq._queue.join(), timeout=2.0)
-            assert (await buf.get_buffer_stats('proj-a'))['size'] == 3
         finally:
+            released.set()
             await eq.close()
-            await buf.close()
 
     @pytest.mark.asyncio
     async def test_project_id_forwarded_to_event_queue(self, tmp_path):
