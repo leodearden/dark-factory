@@ -7,6 +7,7 @@ each outcome.  Nothing here patches the equivalence or pyright gates out.
 from __future__ import annotations
 
 import asyncio
+import logging
 import subprocess
 import time
 from pathlib import Path
@@ -21,14 +22,18 @@ from df_pytest_isolation import git_redirect_env
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.git_ops import GitOps
+from orchestrator.merge_lane import gates
 from orchestrator.merge_lane.gates import (
     POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+    Gate,
+    GateVerdict,
     _finalize_advanced_merge,
 )
 from orchestrator.merge_lane.types import MergeOutcome, MergeRequest, OutcomeKind, QueuedBranch
 
 TASK_ID = '6411'
 TASK_BRANCH = f'task/{TASK_ID}'
+GATES_LOGGER = 'orchestrator.merge_queue'
 
 
 class Scene(NamedTuple):
@@ -263,3 +268,82 @@ async def test_blocked_landing_records_the_gate_outcome_row(
 
     assert outcome.status == 'blocked'
     _assert_single_train_tagged_row(event_store, OutcomeKind.post_merge_equivalence_failed)
+
+
+@pytest.mark.asyncio
+async def test_unlabelled_finalize_names_the_bare_task_in_its_gate_run_line(
+    repo: Path, tmp_path: Path, git_ops: GitOps, lane_config: OrchestratorConfig,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Without a log label the gate-run line names the task alone, then lists every gate run."""
+    scene = _merge_landing(repo, tmp_path)
+
+    with caplog.at_level(logging.INFO, logger=GATES_LOGGER):
+        await _finalize(
+            git_ops, _request(lane_config, scene.worktree),
+            advanced_sha=scene.landed, base_sha=scene.base,
+        )
+
+    gate_run_lines = [
+        record for record in caplog.records
+        if record.getMessage() == f'Task {TASK_ID}: post-advance gates run: equivalence, pyright'
+    ]
+    assert len(gate_run_lines) == 1, [record.getMessage() for record in caplog.records]
+
+
+@pytest.mark.asyncio
+async def test_log_label_reaches_the_equivalence_failure_warning(
+    repo: Path, tmp_path: Path, git_ops: GitOps, lane_config: OrchestratorConfig,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The caller's log label follows the task id in the equivalence gate's failure warning."""
+    scene = _linear_landing_with_drifted_worktree(repo, tmp_path)
+
+    with caplog.at_level(logging.INFO, logger=GATES_LOGGER):
+        await _finalize(
+            git_ops, _request(lane_config, scene.worktree, snapshot_tip=scene.branch_tip),
+            advanced_sha=scene.landed, base_sha=scene.base,
+            log_label=' (speculative)',
+        )
+
+    warnings = [
+        record.getMessage() for record in caplog.records if record.levelno == logging.WARNING
+    ]
+    assert any(
+        message.startswith(f'Task {TASK_ID} (speculative): post-merge equivalence failed')
+        for message in warnings
+    ), warnings
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('reason', 'emit_subtype'),
+    [
+        (None, OutcomeKind.post_merge_equivalence_failed),
+        ('hand-built reason', None),
+    ],
+    ids=['reason-unset', 'emit-subtype-unset'],
+)
+async def test_a_gate_returning_a_hand_built_blocked_verdict_is_refused_loudly(
+    reason: str | None,
+    emit_subtype: OutcomeKind | None,
+    repo: Path, tmp_path: Path, git_ops: GitOps, lane_config: OrchestratorConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A blocked verdict missing either its reason or its outcome kind stops finalize outright.
+
+    Only ``GateVerdict.block()`` guarantees both; a registered gate that builds
+    the verdict by hand must fail loudly, naming itself, rather than land a
+    row or an outcome with a hole in it.
+    """
+    async def run(_ctx: object) -> GateVerdict:
+        return GateVerdict(passed=False, reason=reason, emit_subtype=emit_subtype)
+
+    monkeypatch.setattr(gates, 'POST_ADVANCE_GATES', [Gate('misbuilt', run)])
+    scene = _merge_landing(repo, tmp_path)
+
+    with pytest.raises(AssertionError, match=r"gate 'misbuilt' returned a blocked GateVerdict"):
+        await _finalize(
+            git_ops, _request(lane_config, scene.worktree),
+            advanced_sha=scene.landed, base_sha=scene.base,
+        )
