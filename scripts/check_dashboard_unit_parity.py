@@ -383,12 +383,14 @@ class UnitSpec:
     unchecked_directives: tuple[tuple[str, str, str], ...] = ()
 
     def covered_directives(self) -> frozenset[tuple[str, str]]:
-        """Every ``(section, key)`` some comparison branch actually checks.
+        """Every ``(section, key)`` a compare_unit branch checks as a whole directive.
 
-        The single enumeration of the branches in compare_unit that compare a
-        directive. The completeness guard and ``__post_init__`` both read it
-        rather than re-deriving the list, so a future comparison branch added
-        here cannot leave either of them silently behind.
+        compare_unit reads the spec's fields itself, so this is a second
+        enumeration of its directive-level branches, held in step with them by
+        tests/scripts/test_check_dashboard_unit_parity.py::test_covered_directives_is_exactly_what_compare_unit_checks.
+        The completeness guard and ``__post_init__`` both read it rather than
+        re-deriving the list. exec_start_flags and env_matches_directive cover
+        no directive of their own: they reach tokens inside one, or relate two.
         """
         covered = {*self.compared, *self.present_only, *self.override_directives}
         if self.environment_section is not None:

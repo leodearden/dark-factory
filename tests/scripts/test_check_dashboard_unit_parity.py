@@ -18,6 +18,7 @@ loaded via importlib.util.spec_from_file_location, mirroring
 tests/scripts/test_check_fused_memory_unit_parity.py::_load_checker.
 """
 
+import dataclasses
 import importlib.util
 import os
 import pathlib
@@ -1442,6 +1443,70 @@ def test_unchecked_directive_that_is_also_covered_is_rejected():
     assert "contradictory waiver" in message, message
 
 
+# Every UnitSpec field, sorted by what compare_unit does with it. A field added
+# to UnitSpec fails the cross-check below until it is placed in one of these.
+_PROBE_DIRECTIVE_FIELDS = {
+    "compared": (("Service", "Compared"),),
+    "present_only": (("Service", "PresentOnly"),),
+    "override_directives": (("Service", "Override"),),
+    "environment_section": "Service",
+}
+_CONTENT_FIELDS = {"exec_start_flags", "env_matches_directive"}
+_NON_COMPARISON_FIELDS = {"name", "repo_relpath", "unchecked_directives"}
+
+
+def test_covered_directives_is_exactly_what_compare_unit_checks():
+    """covered_directives() and compare_unit's branches cannot drift apart.
+
+    compare_unit reads the spec's fields itself, so covered_directives() is a
+    second enumeration of its directive-level branches. Were the two to
+    disagree, the completeness guard would accept a directive nothing compares,
+    or demand a waiver for one that is compared.
+
+    A probe spec registers one directive on every directive-level field. Each
+    directive is then declared in one copy only, in both directions. It must
+    drift exactly when covered_directives() names it, and an unregistered
+    control directive must never drift. The content fields reach tokens inside
+    a directive, or relate two, so they cover no directive of their own.
+    """
+    mod = _load_checker()
+    assert {field.name for field in dataclasses.fields(mod.UnitSpec)} == (
+        set(_PROBE_DIRECTIVE_FIELDS) | _CONTENT_FIELDS | _NON_COMPARISON_FIELDS
+    ), (
+        "UnitSpec gained or lost a field: give it a probe value in "
+        "_PROBE_DIRECTIVE_FIELDS if compare_unit compares it as a whole "
+        "directive, otherwise classify it in _CONTENT_FIELDS or "
+        "_NON_COMPARISON_FIELDS"
+    )
+    spec = mod.UnitSpec(
+        name="probe.service", repo_relpath="dashboard/probe.service", **_PROBE_DIRECTIVE_FIELDS
+    )
+    covered = spec.covered_directives()
+
+    def drifts_from_either_side(section: str, key: str) -> bool:
+        declared = f"[{section}]\n{key}=PROBE=1\n"
+        bare = f"[{section}]\n"
+        return bool(mod.compare_unit(spec, declared, bare)) and bool(
+            mod.compare_unit(spec, bare, declared)
+        )
+
+    # Listed outright rather than read back from covered, so a branch that
+    # covered_directives() forgets still gets probed.
+    candidates = covered | {
+        ("Service", "Compared"),
+        ("Service", "PresentOnly"),
+        ("Service", "Override"),
+        ("Service", "Environment"),
+        ("Service", "Unregistered"),
+    }
+    drifting = {directive for directive in candidates if drifts_from_either_side(*directive)}
+
+    assert drifting == covered, (
+        f"compare_unit drifts on {sorted(drifting)} but covered_directives() "
+        f"names {sorted(covered)}"
+    )
+
+
 def test_registry_env_matches_directive_entries_are_declared_in_the_committed_units():
     """STALENESS GUARD, intra-copy-relation edition.
 
@@ -1581,7 +1646,7 @@ def test_installed_copy_missing_success_exit_status_is_drift():
     (drift,) = drifts
     assert drift.key == "SuccessExitStatus"
     assert drift.repo_value == "143"
-    assert drift.installed_value == mod._ABSENT
+    assert "absent from the installed copy" in drift.reason, drift.reason
 
 
 def test_dashboard_service_spec_pins_the_project_root_env_contract():
