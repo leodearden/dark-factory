@@ -41,7 +41,7 @@ from fused_memory.arm_harness.metrics_record import (
     record_for,
     write_metrics_record,
 )
-from fused_memory.arm_harness.replay import ArmAbort, EpisodeOutcome, ReplaySettings
+from fused_memory.arm_harness.replay_types import ArmAbort, EpisodeOutcome, ReplaySettings
 from fused_memory.arm_harness.run import (
     ABORT_FILENAME,
     RUN_MANIFEST_FILENAME,

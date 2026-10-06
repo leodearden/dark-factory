@@ -26,7 +26,7 @@ from fused_memory.arm_harness.llm_metrics import (
     usd_per_episode_metric,
 )
 from fused_memory.arm_harness.metrics_record import LlmMetricId, MetricsRecord
-from fused_memory.arm_harness.replay import ArmAbort, ArmRunResult, EpisodeOutcome
+from fused_memory.arm_harness.replay_types import ArmAbort, ArmRunResult, EpisodeOutcome
 from fused_memory.arm_harness.retrieval import RETRIEVAL_UTILITY_K
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
 

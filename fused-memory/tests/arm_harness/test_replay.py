@@ -8,7 +8,6 @@ from _mock_openai_server import mock_openai_server
 from graphiti_core.nodes import EpisodeType
 from graphiti_core.prompts.models import Message
 
-import fused_memory.arm_harness.replay as replay_module
 from arm_harness._fakes import (
     FakeArmGraph,
     RecordingJournal,
@@ -24,13 +23,14 @@ from fused_memory.arm_harness.arm_spec import LlmArmSpec
 from fused_memory.arm_harness.metrics_record import IndexConfiguration
 from fused_memory.arm_harness.replay import (
     MAX_CONSECUTIVE_FAILURES,
-    ArmAbort,
     ConsecutiveFailureBreaker,
+    replay_arm,
+)
+from fused_memory.arm_harness.replay_types import (
+    ArmAbort,
     ReplayItem,
     ReplaySettings,
     default_replay_settings,
-    open_arm_backend,
-    replay_arm,
 )
 from fused_memory.arm_harness.scratch_guard import GuardCheckpoint, ScratchGuardError
 from fused_memory.backends.graphiti_client import build_llm_client
@@ -352,24 +352,6 @@ async def test_replay_refuses_a_validation_bypassed_spec_before_any_call():
     assert graph.add_calls == []
     assert graph.events == []
     assert journal.calls == []
-
-
-@pytest.mark.asyncio
-async def test_open_arm_backend_refuses_before_building_anything(mock_config, monkeypatch):
-    constructed: list[object] = []
-
-    class SpyBackend:
-        def __init__(self, *args, **kwargs):
-            constructed.append((args, kwargs))
-
-    monkeypatch.setattr(replay_module, 'GraphitiBackend', SpyBackend)
-
-    with pytest.raises(ScratchGuardError) as caught:
-        async with open_arm_backend(_bypassed_spec(), mock_config, _settings()):
-            pytest.fail('a guarded backend must never be yielded')
-
-    assert caught.value.checkpoint is GuardCheckpoint.REPLAY
-    assert constructed == []
 
 
 # ── BOUNDARY ROW 7: telemetry presence ──

@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from fused_memory.arm_harness.replay import ReplayItem
+from fused_memory.arm_harness.replay_types import ReplayItem
 
 
 def corpus_sha(manifest_bytes: bytes) -> str:

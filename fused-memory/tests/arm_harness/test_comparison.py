@@ -20,7 +20,7 @@ from fused_memory.arm_harness.comparison import (
 )
 from fused_memory.arm_harness.instrument_checks import InstrumentCheckId
 from fused_memory.arm_harness.metrics_record import DeltaOf, LlmMetricId, MetricsRecord, record_for
-from fused_memory.arm_harness.replay import ArmAbort
+from fused_memory.arm_harness.replay_types import ArmAbort
 
 EARLIER = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
 LATER = datetime(2026, 10, 5, 14, 0, tzinfo=UTC)

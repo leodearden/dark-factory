@@ -14,7 +14,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Literal, Self
 
-from pydantic import AfterValidator, AwareDatetime, BaseModel, ConfigDict, model_validator
+from pydantic import AfterValidator, AwareDatetime, model_validator
 from shared.memory_eval_metrics import Metric, canonical_json_text
 from shared.safe_io import atomic_write_text
 
@@ -28,6 +28,7 @@ from fused_memory.arm_harness.arm_spec import (
     LlmArmSpec,
     require_preregistration_matches_role,
 )
+from fused_memory.arm_harness.frozen_model import FrozenModel
 
 METRICS_SCHEMA_VERSION = 1
 METRICS_DIRNAME = 'metrics'
@@ -70,9 +71,7 @@ class IndexConfiguration(StrEnum):
     EMBEDDING_ONLY = 'embedding-only'
 
 
-class DeltaOf(BaseModel):
-    model_config = ConfigDict(extra='forbid', frozen=True)
-
+class DeltaOf(FrozenModel):
     minuend_arm_id: ArmId
     subtrahend_arm_id: ArmId
 
@@ -86,9 +85,7 @@ class DeltaOf(BaseModel):
 UtcDatetime = Annotated[AwareDatetime, AfterValidator(lambda value: value.astimezone(UTC))]
 
 
-class MetricsRecord(BaseModel):
-    model_config = ConfigDict(extra='forbid', frozen=True)
-
+class MetricsRecord(FrozenModel):
     schema_version: Literal[1]
     arm_id: ArmId
     axis: ArmAxis

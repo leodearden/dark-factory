@@ -10,13 +10,17 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from types import MappingProxyType
 
-from pydantic import BaseModel, ConfigDict
 from shared.memory_eval_metrics import Metric
 
 from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec, TokenPricing
 from fused_memory.arm_harness.conformance import ConformanceCounts, conformance_rate_metric
+from fused_memory.arm_harness.frozen_model import FrozenModel
 from fused_memory.arm_harness.metrics_record import LlmMetricId, MetricsRecord, record_for
-from fused_memory.arm_harness.replay import ArmRunResult, EpisodeOutcome, normalize_entity_name
+from fused_memory.arm_harness.replay_types import (
+    ArmRunResult,
+    EpisodeOutcome,
+    normalize_entity_name,
+)
 from fused_memory.arm_harness.retrieval import RETRIEVAL_UTILITY_K, Rank, recall_metric
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
 
@@ -123,11 +127,7 @@ def usd_per_episode_metric(
     )
 
 
-class _Frozen(BaseModel):
-    model_config = ConfigDict(extra='forbid', frozen=True)
-
-
-class EpisodeSameness(_Frozen):
+class EpisodeSameness(FrozenModel):
     episode_id: str
     arm_entity_count: int
     ref_entity_count: int
@@ -137,7 +137,7 @@ class EpisodeSameness(_Frozen):
     edge_triple_jaccard: float
 
 
-class GraphSamenessDetails(_Frozen):
+class GraphSamenessDetails(FrozenModel):
     episodes: tuple[EpisodeSameness, ...]
     excluded_arm_ids: tuple[str, ...]
     excluded_reference_ids: tuple[str, ...]

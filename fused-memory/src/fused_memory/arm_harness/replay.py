@@ -8,76 +8,31 @@ stops, in-flight work is cancelled and listed, and the result is incomplete
 """
 
 import asyncio
-import contextlib
-import time
 import uuid
 from collections import Counter
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, NamedTuple, Protocol
 
-from graphiti_core.llm_client import LLMClient
 from graphiti_core.nodes import EpisodeType
-from pydantic import BaseModel, ConfigDict
 
-from fused_memory.arm_harness.arm_config import llm_arm_config
 from fused_memory.arm_harness.arm_spec import LlmArmSpec
-from fused_memory.arm_harness.conformance import (
-    ConformanceLedger,
-    ResponseValidator,
-    install_conformance_audit,
-    validate_response,
+from fused_memory.arm_harness.replay_types import (
+    ArmAbort,
+    ArmRunResult,
+    EpisodeOutcome,
+    ReplayItem,
+    ReplaySettings,
+    normalize_entity_name,
 )
-from fused_memory.arm_harness.metrics_record import IndexConfiguration
 from fused_memory.arm_harness.scratch_guard import GuardCheckpoint, require_scratch_name
-from fused_memory.backends.falkor_indices import IndexSpec
-from fused_memory.backends.graphiti_client import GraphitiBackend, build_llm_client
 from fused_memory.backends.llm_token_usage import LlmTokenUsage, TokenMeasurement
-from fused_memory.config.schema import FusedMemoryConfig
 
 MAX_CONSECUTIVE_FAILURES = 5
 OVER_BUDGET_ERROR_CLASS = 'EpisodeOverBudget'
 JOURNAL_SOURCE = 'arm_harness'
 JOURNAL_OPERATION = 'arm_replay_episode'
-
-
-@dataclass(frozen=True)
-class ReplayItem:
-    episode_id: str
-    name: str
-    content: str
-    source_description: str
-    reference_time: datetime
-
-
-@dataclass(frozen=True)
-class ReplaySettings:
-    concurrency: int
-    episode_timeout_s: float
-    index_configuration: IndexConfiguration
-    clock: Callable[[], float] = time.perf_counter
-
-    def __post_init__(self) -> None:
-        if self.concurrency < 1:
-            raise ValueError(f'concurrency must be >= 1, got {self.concurrency}')
-        if self.episode_timeout_s <= 0:
-            raise ValueError(f'episode_timeout_s must be > 0, got {self.episode_timeout_s}')
-
-
-def default_replay_settings(
-    base_config: FusedMemoryConfig,
-    *,
-    concurrency: int,
-    index_configuration: IndexConfiguration,
-) -> ReplaySettings:
-    """Settings whose episode budget is the production write timeout, read rather than re-declared."""
-    return ReplaySettings(
-        concurrency=concurrency,
-        episode_timeout_s=base_config.queue.backend_write_timeout_seconds,
-        index_configuration=index_configuration,
-    )
 
 
 class ArmGraph(Protocol):
@@ -130,39 +85,6 @@ class ReplayJournal(Protocol):
     ) -> None: ...
 
 
-class _Frozen(BaseModel):
-    model_config = ConfigDict(extra='forbid', frozen=True)
-
-
-class EpisodeOutcome(_Frozen):
-    episode_id: str
-    ok: bool
-    error_class: str | None
-    duration_ms: float
-    tokens: LlmTokenUsage | None
-    replay_episode_uuid: str | None
-    entity_names: tuple[str, ...]
-    edge_triples: tuple[tuple[str, str, str], ...]
-
-
-class ArmAbort(_Frozen):
-    arm_id: str
-    item_ids: tuple[str, ...]
-    error_classes: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class ArmRunResult:
-    arm_id: str
-    outcomes: tuple[EpisodeOutcome, ...]
-    cancelled_ids: tuple[str, ...]
-    abort: ArmAbort | None
-
-    @property
-    def incomplete(self) -> bool:
-        return self.abort is not None
-
-
 class ConsecutiveFailureBreaker:
     """Trips once ``limit`` failures arrive in a row; any success resets the streak."""
 
@@ -185,10 +107,6 @@ class ConsecutiveFailureBreaker:
             item_ids=tuple(episode_id for episode_id, _ in self._streak),
             error_classes=tuple(error_class for _, error_class in self._streak),
         )
-
-
-def normalize_entity_name(name: str) -> str:
-    return ' '.join(name.lower().split())
 
 
 async def replay_arm(
@@ -379,58 +297,3 @@ async def _journal(
         duration_ms=outcome.duration_ms,
         llm_tokens=outcome.tokens,
     )
-
-
-class IndexBuildError(RuntimeError):
-    """The explicit scratch-graph index build left specs unbuilt."""
-
-    def __init__(self, group_id: str, failed: tuple[tuple[IndexSpec, str], ...]) -> None:
-        self.group_id = group_id
-        self.failed = failed
-        reasons = '; '.join(f'{spec}: {reason}' for spec, reason in failed)
-        super().__init__(f'index build on {group_id!r} failed for {len(failed)} spec(s): {reasons}')
-
-
-@contextlib.asynccontextmanager
-async def open_arm_backend(
-    spec: LlmArmSpec, base_config: FusedMemoryConfig, settings: ReplaySettings
-) -> AsyncIterator[tuple[GraphitiBackend, ConformanceLedger]]:
-    """The arm's real GraphitiBackend, built with its audited client.
-
-    ``registered_graph_ids`` is empty on purpose. Production first-write provisioning
-    absorbs failures, so it must never be the index path here. The with-indices
-    configuration builds the scratch graph's indices explicitly and loudly instead.
-    """
-    require_scratch_name(spec.scratch_group_id, checkpoint=GuardCheckpoint.REPLAY)
-    cfg = llm_arm_config(spec, base_config)
-    client, ledger = audited_arm_client(spec, cfg)
-    backend = GraphitiBackend(cfg, registered_graph_ids=frozenset())
-    try:
-        await backend.initialize(skip_maintenance=True, llm_client=client)
-        if settings.index_configuration is IndexConfiguration.WITH_INDICES:
-            await _build_scratch_indices(backend, spec.scratch_group_id)
-        yield backend, ledger
-    finally:
-        await backend.close()
-
-
-def audited_arm_client(
-    spec: LlmArmSpec,
-    arm_config: FusedMemoryConfig,
-    *,
-    validator: ResponseValidator = validate_response,
-) -> tuple[LLMClient, ConformanceLedger]:
-    """The arm's client, built by β's seam from its arm config, with the conformance audit on."""
-    client = build_llm_client(arm_config)
-    if client is None:
-        raise RuntimeError(f'arm {spec.arm_id!r}: build_llm_client built no client (no api_key)')
-    ledger = ConformanceLedger()
-    install_conformance_audit(client, ledger, validator=validator)
-    return client, ledger
-
-
-async def _build_scratch_indices(backend: GraphitiBackend, group_id: str) -> None:
-    require_scratch_name(group_id, checkpoint=GuardCheckpoint.INDEX_BUILD)
-    result = await backend.ensure_indices(group_id=group_id)
-    if result.failed:
-        raise IndexBuildError(group_id, result.failed)

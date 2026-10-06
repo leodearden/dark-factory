@@ -36,6 +36,7 @@ from redis.exceptions import RedisError
 from shared.cli_boundary import LoudArgumentParser, run_cli
 from shared.memory_eval_metrics import run_stamp
 
+from fused_memory.arm_harness.arm_backend import IndexBuildError, open_arm_backend
 from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec, load_arm_spec
 from fused_memory.arm_harness.checks import (
     check_index_configuration,
@@ -56,15 +57,12 @@ from fused_memory.arm_harness.metrics_record import (
     load_metrics_records,
     write_metrics_record,
 )
-from fused_memory.arm_harness.replay import (
-    ArmGraph,
+from fused_memory.arm_harness.replay import ArmGraph, ReplayJournal
+from fused_memory.arm_harness.replay_types import (
     EpisodeOutcome,
-    IndexBuildError,
     ReplayItem,
-    ReplayJournal,
     ReplaySettings,
     default_replay_settings,
-    open_arm_backend,
 )
 from fused_memory.arm_harness.run import (
     RUN_MANIFEST_FILENAME,

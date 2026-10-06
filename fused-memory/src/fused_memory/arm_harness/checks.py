@@ -16,6 +16,7 @@ from graphiti_core.prompts.models import Message
 from pydantic import BaseModel, ValidationError
 from redis.exceptions import ResponseError
 
+from fused_memory.arm_harness.arm_backend import audited_arm_client
 from fused_memory.arm_harness.arm_config import llm_arm_config
 from fused_memory.arm_harness.arm_spec import LlmArmSpec
 from fused_memory.arm_harness.comparison import check_arm_config_symmetry, check_single_code_sha
@@ -33,7 +34,7 @@ from fused_memory.arm_harness.instrument_checks import (
     check_token_cost_accounting,
 )
 from fused_memory.arm_harness.metrics_record import IndexConfiguration, MetricsRecord
-from fused_memory.arm_harness.replay import EpisodeOutcome, audited_arm_client
+from fused_memory.arm_harness.replay_types import EpisodeOutcome
 from fused_memory.arm_harness.run_manifest import RunManifest
 from fused_memory.arm_harness.scratch_guard import GuardCheckpoint, require_scratch_name
 from fused_memory.config.schema import FusedMemoryConfig

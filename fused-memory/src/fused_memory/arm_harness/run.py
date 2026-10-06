@@ -35,14 +35,12 @@ from fused_memory.arm_harness.llm_metrics import (
     llm_axis_records,
 )
 from fused_memory.arm_harness.metrics_record import MetricsRecord, write_metrics_record
-from fused_memory.arm_harness.replay import (
-    ArmGraph,
+from fused_memory.arm_harness.replay import ArmGraph, ReplayJournal, replay_arm
+from fused_memory.arm_harness.replay_types import (
     ArmRunResult,
     EpisodeOutcome,
     ReplayItem,
-    ReplayJournal,
     ReplaySettings,
-    replay_arm,
 )
 from fused_memory.arm_harness.retrieval import Rank, probe_retrieval_utility
 from fused_memory.arm_harness.run_manifest import (

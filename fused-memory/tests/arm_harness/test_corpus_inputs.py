@@ -12,7 +12,7 @@ from fused_memory.arm_harness.corpus import (
     corpus_sha,
     select_replay_items,
 )
-from fused_memory.arm_harness.replay import ReplayItem
+from fused_memory.arm_harness.replay_types import ReplayItem
 from fused_memory.arm_harness.transcript_queries import iter_transcript_queries
 
 FUSED_MEMORY_ROOT = Path(__file__).parents[2]

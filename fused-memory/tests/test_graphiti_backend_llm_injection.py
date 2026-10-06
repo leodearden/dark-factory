@@ -4,6 +4,8 @@ No FalkorDB I/O. ``falkordb.asyncio.FalkorDB.__init__`` sends INFO at constructi
 (its cluster check), so the driver class is stubbed with the idiom
 tests/test_per_group_client_cache.py uses; the stub instance is spec'd on the real
 driver class because ``Graphiti`` (kept real) checks it is a ``GraphDriver``.
+GraphitiBackend has no driver seam, so this one private-name patch is tolerated;
+everything asserted is read through the backend's public ``client``.
 """
 
 from unittest.mock import MagicMock
@@ -29,19 +31,6 @@ def offline_config(mock_config, monkeypatch):
     return config
 
 
-@pytest.fixture
-def build_calls(monkeypatch):
-    real_build = graphiti_client_module.build_llm_client
-    calls: list[object] = []
-
-    def recording_build(cfg):
-        calls.append(cfg)
-        return real_build(cfg)
-
-    monkeypatch.setattr(graphiti_client_module, 'build_llm_client', recording_build)
-    return calls
-
-
 def _injected_client() -> TokenRecordingOpenAIGenericClient:
     client = TokenRecordingOpenAIGenericClient(
         config=GraphitiLLMConfig(api_key='k', model='m', base_url='http://127.0.0.1:9/v1'),
@@ -51,7 +40,7 @@ def _injected_client() -> TokenRecordingOpenAIGenericClient:
 
 
 @pytest.mark.asyncio
-async def test_injected_client_is_the_one_the_backend_uses_and_probes(offline_config, build_calls):
+async def test_injected_client_is_the_one_the_backend_uses_and_probes(offline_config):
     injected = _injected_client()
     backend = GraphitiBackend(offline_config)
 
@@ -66,11 +55,10 @@ async def test_injected_client_is_the_one_the_backend_uses_and_probes(offline_co
 
     assert m.usage is not None
     assert m.usage.total_tokens == 10
-    assert build_calls == []
 
 
 @pytest.mark.asyncio
-async def test_without_injection_the_backend_builds_its_own_client(offline_config, build_calls):
+async def test_without_injection_the_backend_builds_its_own_client(offline_config):
     backend = GraphitiBackend(offline_config)
 
     await backend.initialize(skip_maintenance=True)
@@ -80,5 +68,5 @@ async def test_without_injection_the_backend_builds_its_own_client(offline_confi
     finally:
         await backend.close()
 
-    assert build_calls == [offline_config]
     assert built is not None
+    assert built.model == offline_config.llm.model

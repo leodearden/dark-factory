@@ -30,7 +30,7 @@ from fused_memory.arm_harness.metrics_record import (
     MetricsRecord,
     record_for,
 )
-from fused_memory.arm_harness.replay import EpisodeOutcome
+from fused_memory.arm_harness.replay_types import EpisodeOutcome
 from fused_memory.arm_harness.scratch_guard import GuardCheckpoint, ScratchGuardError
 from fused_memory.backends.llm_clients import TokenRecordingOpenAIGenericClient
 

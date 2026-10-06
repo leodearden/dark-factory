@@ -26,7 +26,7 @@ from fused_memory.arm_harness.instrument_checks import (
     check_token_cost_accounting,
 )
 from fused_memory.arm_harness.metrics_record import LlmMetricId, record_for
-from fused_memory.arm_harness.replay import ArmAbort, EpisodeOutcome
+from fused_memory.arm_harness.replay_types import ArmAbort, EpisodeOutcome
 from fused_memory.arm_harness.run_manifest import (
     RunManifest,
     load_run_manifest,

@@ -27,8 +27,8 @@ from fused_memory.arm_harness.metrics_record import (
     LlmMetricId,
     load_metrics_record,
 )
-from fused_memory.arm_harness.replay import (
-    MAX_CONSECUTIVE_FAILURES,
+from fused_memory.arm_harness.replay import MAX_CONSECUTIVE_FAILURES
+from fused_memory.arm_harness.replay_types import (
     ArmAbort,
     EpisodeOutcome,
     ReplayItem,

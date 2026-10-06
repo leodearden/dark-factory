@@ -22,14 +22,11 @@ from _mock_openai_server import MockOpenAIServer, mock_openai_server
 from falkordb.asyncio import FalkorDB
 
 from arm_harness._fakes import PROTECTED_GRAPHS, PreregRepo, llm_spec, make_prereg_repo
+from fused_memory.arm_harness.arm_backend import open_arm_backend
 from fused_memory.arm_harness.arm_spec import LlmArmSpec
 from fused_memory.arm_harness.checks import check_index_configuration
 from fused_memory.arm_harness.metrics_record import IndexConfiguration
-from fused_memory.arm_harness.replay import (
-    ReplayItem,
-    default_replay_settings,
-    open_arm_backend,
-)
+from fused_memory.arm_harness.replay_types import ReplayItem, default_replay_settings
 from fused_memory.arm_harness.run import OUTCOMES_FILENAME, load_outcomes, run_llm_arm
 from fused_memory.arm_harness.run_manifest import RunManifest
 from fused_memory.arm_harness.teardown import teardown_arm

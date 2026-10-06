@@ -10,33 +10,30 @@ from collections import Counter
 from pathlib import Path
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, Field, model_validator
 from shared.memory_eval_metrics import canonical_json_text
 
 from fused_memory.arm_harness.arm_spec import ArmSpec
+from fused_memory.arm_harness.frozen_model import FrozenModel
 from fused_memory.arm_harness.instrument_checks import CheckResult
 from fused_memory.arm_harness.metrics_record import IndexConfiguration, UtcDatetime
-from fused_memory.arm_harness.replay import ArmAbort
+from fused_memory.arm_harness.replay_types import ArmAbort
 
 RUN_MANIFEST_SCHEMA_VERSION = 1
 
 
-class _Frozen(BaseModel):
-    model_config = ConfigDict(extra='forbid', frozen=True)
-
-
-class SettingsSummary(_Frozen):
+class SettingsSummary(FrozenModel):
     concurrency: int = Field(ge=1)
     index_configuration: IndexConfiguration
     episode_timeout_s: float = Field(gt=0)
 
 
-class EffectiveEmbedder(_Frozen):
+class EffectiveEmbedder(FrozenModel):
     model: str = Field(min_length=1)
     dimensions: int = Field(gt=0)
 
 
-class RunManifest(_Frozen):
+class RunManifest(FrozenModel):
     schema_version: Literal[1]
     spec: ArmSpec
     settings_summary: SettingsSummary

@@ -12,7 +12,8 @@ from shared.memory_eval_metrics import Metric
 
 from fused_memory.arm_harness.arm_spec import LlmArmSpec
 from fused_memory.arm_harness.metrics_record import EmbeddingMetricId
-from fused_memory.arm_harness.replay import ArmGraph, EpisodeOutcome, ReplayItem
+from fused_memory.arm_harness.replay import ArmGraph
+from fused_memory.arm_harness.replay_types import EpisodeOutcome, ReplayItem
 from fused_memory.arm_harness.scratch_guard import GuardCheckpoint, require_scratch_name
 
 RETRIEVAL_UTILITY_K = 10

@@ -7,7 +7,7 @@ import pytest
 
 from arm_harness._fakes import FakeArmGraph, llm_spec
 from fused_memory.arm_harness.arm_spec import LlmArmSpec
-from fused_memory.arm_harness.replay import EpisodeOutcome, ReplayItem
+from fused_memory.arm_harness.replay_types import EpisodeOutcome, ReplayItem
 from fused_memory.arm_harness.retrieval import (
     RETRIEVAL_UTILITY_K,
     known_item_rank,

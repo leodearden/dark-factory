@@ -15,14 +15,13 @@ from urllib.parse import urlsplit
 
 from pydantic import (
     AfterValidator,
-    BaseModel,
-    ConfigDict,
     Field,
     TypeAdapter,
     field_validator,
     model_validator,
 )
 
+from fused_memory.arm_harness.frozen_model import FrozenModel
 from fused_memory.arm_harness.scratch_guard import GuardCheckpoint, require_scratch_name
 
 GIT_SHA_PATTERN = re.compile(r'[0-9a-f]{40}')
@@ -77,28 +76,24 @@ def require_preregistration_matches_role(
         )
 
 
-class _Frozen(BaseModel):
-    model_config = ConfigDict(extra='forbid', frozen=True)
-
-
-class ServingSpec(_Frozen):
+class ServingSpec(FrozenModel):
     stack: ServingStack
     base_url: Annotated[str, AfterValidator(_http_url)]
     quant: str | None = None
     unit_name: str | None = None
 
 
-class LlmParams(_Frozen):
+class LlmParams(FrozenModel):
     temperature: float = Field(ge=0)
     max_tokens: int = Field(gt=0)
 
 
-class TokenPricing(_Frozen):
+class TokenPricing(FrozenModel):
     usd_per_mtok_input: float = Field(ge=0)
     usd_per_mtok_output: float = Field(ge=0)
 
 
-class _ArmSpecBase(_Frozen):
+class _ArmSpecBase(FrozenModel):
     arm_id: ArmId
     model_id: str = Field(min_length=1)
     serving: ServingSpec

@@ -13,7 +13,7 @@ from pathlib import Path
 
 from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec
 from fused_memory.arm_harness.metrics_record import LlmMetricId, MetricsRecord
-from fused_memory.arm_harness.replay import EpisodeOutcome
+from fused_memory.arm_harness.replay_types import EpisodeOutcome
 
 PREREGISTRATION_DOC_PATH = 'plans/local-memory-models-eval-preregistration.md'
 
