@@ -738,7 +738,7 @@ async def get_time_centiles(
 # table.  /api/v2/dashboard/performance is hit every 3s, so the per-DB
 # query is wrapped in a tiny self-invalidating cache keyed by
 # (project_id, days, max(completed_at)) — bucketing only changes when a new
-# task_results row arrives, so the key is deterministic.
+# counted (non-cancel) task_results row arrives, so the key is deterministic.
 
 _HISTORY_CACHE: dict[tuple, dict] = {}
 _HISTORY_CACHE_MAX = 64
@@ -748,9 +748,10 @@ async def _project_max_completed(
     db: aiosqlite.Connection,
     project_id: str,
 ) -> str:
-    """Return the most recent completed_at for *project_id* (empty string if none)."""
+    """Return the most recent completed_at for *project_id* (empty string if none),
+    a cancel not counting (see ``_NOT_A_CANCEL``), as ``_hour_bucketed_history`` counts none."""
     async with db.execute(
-        "SELECT MAX(completed_at) FROM task_results WHERE project_id = ?",
+        f'SELECT MAX(completed_at) FROM task_results WHERE project_id = ? AND {_NOT_A_CANCEL}',
         (project_id,),
     ) as cur:
         row = await cur.fetchone()
@@ -860,7 +861,7 @@ async def _per_db_history(
 ) -> dict[str, list]:
     """Cached wrapper for ``_hour_bucketed_history`` keyed by max(completed_at).
 
-    The bucket layout only changes when a new task_results row arrives, so
+    The bucket layout only changes when a new counted task_results row arrives, so
     the cache is deterministic and self-invalidating. LRU-trim at
     ``_HISTORY_CACHE_MAX`` keeps memory bounded across many projects.
 

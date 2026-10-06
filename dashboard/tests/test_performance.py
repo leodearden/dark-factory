@@ -2660,6 +2660,27 @@ class TestCancelOutcomesAreNotCounted:
         assert 'drained' not in history
 
     @pytest.mark.asyncio
+    async def test_a_later_cancel_keeps_the_history_cache(self, cancels_conn):
+        """The history it buckets counts no cancel, so a redeploy's cancel
+        must not invalidate the cached per-project hour buckets."""
+        await aggregate_performance_history([cancels_conn], days=CARDS_DAYS, now=CARDS_NOW)
+        cached_keys = set(_HISTORY_CACHE)
+        assert cached_keys
+
+        await cancels_conn.execute(
+            'INSERT INTO task_results '
+            '(run_id, task_id, project_id, title, outcome, cost_usd, duration_ms, '
+            ' agent_invocations, execute_iterations, verify_attempts, review_cycles, '
+            ' steward_cost_usd, steward_invocations, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            _task_row('c4', 'proj', CARDS_NOW - timedelta(minutes=5), outcome='cancelled'),
+        )
+        await cancels_conn.commit()
+        await aggregate_performance_history([cancels_conn], days=CARDS_DAYS, now=CARDS_NOW)
+
+        assert set(_HISTORY_CACHE) == cached_keys
+
+    @pytest.mark.asyncio
     async def test_cards_age_and_list_by_completions_not_cancels(
         self, cancels_conn, empty_escalations_dir,
     ):
