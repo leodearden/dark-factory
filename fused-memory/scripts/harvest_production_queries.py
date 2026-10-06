@@ -704,14 +704,14 @@ class _ClassTally:
         self._limits: dict[BriefingClass, Counter[int | None]] = {
             c: Counter() for c in classes
         }
-        self.tail_instances: Counter[str] = Counter()
-        self.tail_limits: dict[str, Counter[int | None]] = {}
+        self._tail_instances: Counter[str] = Counter()
+        self._tail_limits: dict[str, Counter[int | None]] = {}
 
     def add(self, cls: BriefingClass | None, text: str, limit: int | None) -> None:
         """Count one op of `text` at `limit` in `cls`, or in the tail for None."""
         if cls is None:
-            self.tail_instances[text] += 1
-            self.tail_limits.setdefault(text, Counter())[limit] += 1
+            self._tail_instances[text] += 1
+            self._tail_limits.setdefault(text, Counter())[limit] += 1
         else:
             self._instances[cls][text] += 1
             self._limits[cls][limit] += 1
@@ -724,6 +724,17 @@ class _ClassTally:
 
     def briefing_limits(self) -> Counter[int | None]:
         return sum(self._limits.values(), Counter())
+
+    def tail_counts(self) -> Counter[str]:
+        """Tail ops per distinct query text."""
+        return Counter(self._tail_instances)
+
+    def tail_limits_of(self, text: str) -> Counter[int | None]:
+        """The limits the tail ops of `text` ran at."""
+        return Counter(self._tail_limits.get(text, Counter()))
+
+    def tail_limits(self) -> Counter[int | None]:
+        return sum(self._tail_limits.values(), Counter())
 
 
 def _briefing_row(tpl: TemplateClass) -> dict[str, Any]:
@@ -887,7 +898,7 @@ def harvest(
         con.close()
 
     templates = tally.template_classes(total)
-    tail_counts = tally.tail_instances
+    tail_counts = tally.tail_counts()
 
     literal_total = sum(
         t.observed_count for t in templates if t.match is MatchKind.LITERAL
@@ -935,7 +946,7 @@ def harvest(
         _briefing_row(tpl) for tpl in templates if tpl.observed_count > 0
     ]
     for text, n in sampled:
-        seen_limits = tally.tail_limits[text]
+        seen_limits = tally.tail_limits_of(text)
         row = {
             'query_id': _query_id(text, 'production_tail'),
             'text': text,
@@ -970,9 +981,7 @@ def harvest(
         tail_top=tail_top,
         seed=seed,
         briefing_observed_limits=_limit_histogram(tally.briefing_limits()),
-        tail_observed_limits=_limit_histogram(
-            sum(tally.tail_limits.values(), Counter())
-        ),
+        tail_observed_limits=_limit_histogram(tally.tail_limits()),
         harvested_at=datetime.now(UTC).isoformat(),
     )
 
