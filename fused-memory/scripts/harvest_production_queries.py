@@ -92,13 +92,46 @@ import sqlite3
 import string
 import sys
 from collections import Counter
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from shared.briefing_queries import (
+    CONVENTIONS_AREA,
+    QUERY_SPECS,
+    TASK_SEMANTIC,
+    BriefingQuerySpec,
+)
+
 from fused_memory.models.scope import resolve_main_checkout
+
+
+class HarvestError(RuntimeError):
+    """Base class for every loud refusal in this module."""
+
+
+class JournalUnavailableError(HarvestError):
+    """The journal is absent, unreadable, or is not a write journal.
+
+    Raised INSTEAD of returning an empty harvest, so a missing file can
+    never be mistaken downstream for "production issues no searches".
+    """
+
+
+class EmptyHarvestError(HarvestError):
+    """The journal is readable but carries no parseable search traffic."""
+
+
+class UnmatchableTemplateError(HarvestError):
+    """A briefing query spec cannot be recognised in the journal.
+
+    Its template has no literal text, so its pattern would match nearly
+    every query, and no anchor class was declared to pair it with instead.
+    """
+
 
 # --------------------------------------------------------------------------
 # The briefing-assembler query classes
@@ -140,10 +173,16 @@ class BriefingClass:
     pattern: re.Pattern[str]
 
 
-#: Field patterns narrower than "anything". A task id is any run of
-#: non-space characters: ids are numeric ('4004') but subtask ids carry a
-#: dot ('3.1'), so the class must not assume \d+.
-_FIELD_PATTERNS: dict[str, str] = {'task_id': r'\S+'}
+#: Field patterns narrower than "anything".
+#:
+#: * A task id is any run of non-space characters: ids are numeric ('4004')
+#:   but subtask ids carry a dot ('3.1'), so the class must not assume \d+.
+#: * An area is what `shared/src/shared/briefing_queries.py::derive_area_terms`
+#:   yields: lowercase alphanumeric terms joined by single spaces.
+_FIELD_PATTERNS: dict[str, str] = {
+    'task_id': r'\S+',
+    'area': r'[a-z0-9]+(?: [a-z0-9]+)*',
+}
 _ANY_FIELD_PATTERN = '.+'
 
 
@@ -151,6 +190,10 @@ def _template_fields(template: str) -> tuple[str, ...]:
     return tuple(
         name for _, name, _, _ in string.Formatter().parse(template) if name is not None
     )
+
+
+def _template_literal_text(template: str) -> str:
+    return ''.join(literal for literal, _, _, _ in string.Formatter().parse(template))
 
 
 def _template_pattern(template: str) -> re.Pattern[str]:
@@ -172,12 +215,44 @@ def _pattern_class(template: str, era: BriefingEra) -> BriefingClass:
     )
 
 
+def build_current_classes(
+    specs: Iterable[BriefingQuerySpec],
+    companion_anchors: Mapping[str, str],
+) -> tuple[BriefingClass, ...]:
+    """One current-era class per spec, in `specs` order.
+
+    `companion_anchors` maps a spec slug to the slug of the spec it is fired
+    beside. A template with no literal text cannot be told apart from an
+    agent's own search by pattern, so it must be named there.
+    """
+    classes: list[BriefingClass] = []
+    for spec in specs:
+        if spec.slug in companion_anchors:
+            continue
+        if not _template_literal_text(spec.text).strip():
+            raise UnmatchableTemplateError(
+                f'briefing spec {spec.slug!r} has template {spec.text!r}, which '
+                'has no literal text to match on; declare the spec it is fired '
+                'beside in companion_anchors'
+            )
+        classes.append(_pattern_class(spec.text, BriefingEra.CURRENT))
+    return tuple(classes)
+
+
 RETIRED_CLASSES: tuple[BriefingClass, ...] = tuple(
     _pattern_class(template, BriefingEra.RETIRED)
     for template in (*RETIRED_LITERAL_TEMPLATES, RETIRED_TASK_TEMPLATE)
 )
 
-BRIEFING_CLASSES: tuple[BriefingClass, ...] = RETIRED_CLASSES
+#: The free-text task channel is fired right after the area-scoped
+#: conventions query, by the same caller.
+_COMPANION_ANCHORS: dict[str, str] = {TASK_SEMANTIC.slug: CONVENTIONS_AREA.slug}
+
+CURRENT_CLASSES: tuple[BriefingClass, ...] = build_current_classes(
+    QUERY_SPECS, _COMPANION_ANCHORS
+)
+
+BRIEFING_CLASSES: tuple[BriefingClass, ...] = RETIRED_CLASSES + CURRENT_CLASSES
 
 #: briefing.py:1376 fires the family at limit=5, not the E2 default of 10.
 #: This is a fact about the BRIEFING ASSEMBLER only. It is never stamped onto
@@ -207,22 +282,6 @@ JOURNAL_CONNECT_TIMEOUT = 30.0
 
 DEFAULT_TAIL_SAMPLE = 40
 DEFAULT_SEED = 4004
-
-
-class HarvestError(RuntimeError):
-    """Base class for every loud refusal in this module."""
-
-
-class JournalUnavailableError(HarvestError):
-    """The journal is absent, unreadable, or is not a write journal.
-
-    Raised INSTEAD of returning an empty harvest, so a missing file can
-    never be mistaken downstream for "production issues no searches".
-    """
-
-
-class EmptyHarvestError(HarvestError):
-    """The journal is readable but carries no parseable search traffic."""
 
 
 # --------------------------------------------------------------------------
@@ -281,17 +340,18 @@ class HarvestResult:
     tail_distinct: int
     tail_share: float | None
     literal_share: float | None
-    family_share: float | None
-    """Share of all four BRIEFING TEMPLATES: the 3 literals PLUS the family.
+    """Share of every LITERAL-matched briefing class, in either era."""
 
-    The numerator is `literal_total + family_total`, i.e. the UNION -- not
-    the parameterized `task {task_id} ...` family alone.  The two are far
+    family_share: float | None
+    """Share of EVERY briefing class, in either era: the whole briefing family.
+
+    The UNION -- not any one parameterized class alone.  The two are far
     apart and the name invites the wrong reading: in the committed sidecar
-    this is 0.645536 while the parameterized family by itself is 0.125334
-    (its `TemplateClass.traffic_share`).  The CLI prints it under the label
-    `4-template family`, which is the union, and `read_transform_selection`
-    publishes the same union under the same name -- computed independently
-    as the sum of the four template shares.
+    this is 0.645536 while the retired `task {task_id} ...` class by itself
+    is 0.125334 (its `TemplateClass.traffic_share`).  The CLI prints it under
+    the label `briefing family`, and `read_transform_selection` publishes the
+    same union under the same name -- computed independently as the sum of
+    the template shares.
     """
 
     journal_path: str
@@ -299,7 +359,7 @@ class HarvestResult:
     tail_top: int
     seed: int
     briefing_observed_limits: dict[str, int] = field(default_factory=dict)
-    """Measured ``{limit: count}`` across all four briefing classes."""
+    """Measured ``{limit: count}`` across every briefing class."""
 
     tail_observed_limits: dict[str, int] = field(default_factory=dict)
     """Measured ``{limit: count}`` across the WHOLE residual tail.
@@ -501,6 +561,58 @@ def _template_class(
     )
 
 
+class _ClassTally:
+    """Search ops split into briefing classes and the residual tail.
+
+    Lives for exactly one `harvest` call.
+    """
+
+    def __init__(self, classes: tuple[BriefingClass, ...]) -> None:
+        self._classes = classes
+        self._instances: dict[BriefingClass, Counter[str]] = {c: Counter() for c in classes}
+        self._limits: dict[BriefingClass, Counter[int | None]] = {
+            c: Counter() for c in classes
+        }
+        self.tail_instances: Counter[str] = Counter()
+        self.tail_limits: dict[str, Counter[int | None]] = {}
+
+    def add(
+        self, cls: BriefingClass | None, text: str, limit: int | None, n: int = 1
+    ) -> None:
+        """Count `n` ops of `text` at `limit` in `cls`, or in the tail for None."""
+        if cls is None:
+            self.tail_instances[text] += n
+            self.tail_limits.setdefault(text, Counter())[limit] += n
+        else:
+            self._instances[cls][text] += n
+            self._limits[cls][limit] += n
+
+    def template_classes(self, total: int) -> list[TemplateClass]:
+        return [
+            _template_class(cls, self._instances[cls], self._limits[cls], total)
+            for cls in self._classes
+        ]
+
+    def briefing_limits(self) -> Counter[int | None]:
+        return sum(self._limits.values(), Counter())
+
+
+def _briefing_row(tpl: TemplateClass) -> dict[str, Any]:
+    return {
+        'query_id': _query_id(tpl.text, 'briefing_template'),
+        'text': tpl.text,
+        'source': 'briefing_template',
+        'template': tpl.template,
+        'match': tpl.match,
+        'era': tpl.era,
+        'observed_count': tpl.observed_count,
+        'observed_limit': tpl.observed_limit,
+        'observed_limits': tpl.observed_limits,
+        'traffic_share': tpl.traffic_share,
+        'distinct_instances': tpl.distinct_instances,
+    }
+
+
 def _main_checkout_root() -> Path:
     """The MAIN checkout's root, even when this file runs from a lane.
 
@@ -641,29 +753,13 @@ def harvest(
 
     total = sum(counts.values())
 
-    # Fold every observed query into its class.
-    class_instances: dict[BriefingClass, Counter[str]] = {
-        cls: Counter() for cls in BRIEFING_CLASSES
-    }
-    class_limits: dict[BriefingClass, Counter[int | None]] = {
-        cls: Counter() for cls in BRIEFING_CLASSES
-    }
-    tail_counts: Counter[str] = Counter()
-    tail_limits: Counter[int | None] = Counter()
-    for text, n in counts.items():
+    tally = _ClassTally(BRIEFING_CLASSES)
+    for text, text_limits in limits.items():
         cls = _classify(text)
-        seen_limits = limits.get(text, Counter())
-        if cls is None:
-            tail_counts[text] += n
-            tail_limits.update(seen_limits)
-        else:
-            class_instances[cls][text] += n
-            class_limits[cls].update(seen_limits)
-
-    templates = [
-        _template_class(cls, class_instances[cls], class_limits[cls], total)
-        for cls in BRIEFING_CLASSES
-    ]
+        for limit, n in text_limits.items():
+            tally.add(cls, text, limit, n)
+    templates = tally.template_classes(total)
+    tail_counts = tally.tail_instances
 
     literal_total = sum(
         t.observed_count for t in templates if t.match is MatchKind.LITERAL
@@ -705,25 +801,13 @@ def harvest(
         [*head, *drawn], key=lambda kv: kv[0]
     ) # emitted rows are text-sorted so the fixture diffs cleanly
 
-    fixture_rows: list[dict[str, Any]] = []
-    for tpl in templates:
-        fixture_rows.append(
-            {
-                'query_id': _query_id(tpl.text, 'briefing_template'),
-                'text': tpl.text,
-                'source': 'briefing_template',
-                'template': tpl.template,
-                'match': tpl.match,
-                'era': tpl.era,
-                'observed_count': tpl.observed_count,
-                'observed_limit': tpl.observed_limit,
-                'observed_limits': tpl.observed_limits,
-                'traffic_share': tpl.traffic_share,
-                'distinct_instances': tpl.distinct_instances,
-            }
-        )
+    # A class nobody fired has no production text to score; its measured
+    # zero stays visible in `templates` and the sidecar.
+    fixture_rows: list[dict[str, Any]] = [
+        _briefing_row(tpl) for tpl in templates if tpl.observed_count > 0
+    ]
     for text, n in sampled:
-        seen_limits = limits.get(text, Counter())
+        seen_limits = tally.tail_limits[text]
         row = {
             'query_id': _query_id(text, 'production_tail'),
             'text': text,
@@ -757,10 +841,10 @@ def harvest(
         tail_sample=tail_sample,
         tail_top=tail_top,
         seed=seed,
-        briefing_observed_limits=_limit_histogram(
-            sum(class_limits.values(), Counter())
+        briefing_observed_limits=_limit_histogram(tally.briefing_limits()),
+        tail_observed_limits=_limit_histogram(
+            sum(tally.tail_limits.values(), Counter())
         ),
-        tail_observed_limits=_limit_histogram(tail_limits),
         harvested_at=datetime.now(UTC).isoformat(),
     )
 
@@ -838,10 +922,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     out = write_fixture(result, args.out)
     print(f'wrote {len(result.rows)} rows -> {out}')
-    print(f'  total search ops : {result.total_search_ops}')
-    print(f'  3 literals       : {result.literal_share}')
-    print(f'  4-template family: {result.family_share}')
-    print(f'  residual tail    : {result.tail_share} over {result.tail_distinct} distinct')
+    print(f'  total search ops  : {result.total_search_ops}')
+    print(f'  literal templates : {result.literal_share}')
+    print(f'  briefing family   : {result.family_share}')
+    print(f'  residual tail     : {result.tail_share} over {result.tail_distinct} distinct')
     return 0
 
 
