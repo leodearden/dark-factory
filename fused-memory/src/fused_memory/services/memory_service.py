@@ -1615,7 +1615,7 @@ def _decode_referents(
 
 
 def _created_at_to_utc_iso(created_at: datetime | None) -> str | None:
-    """Serialize an episode's created_at to canonical UTC ISO-8601, or None.
+    """Serialize an episode's or edge's created_at to canonical UTC ISO-8601, or None.
 
     str(created_at) preserves the stored UTC offset (and uses a space
     separator), so emitted-string order can diverge from instant order
@@ -7813,7 +7813,6 @@ class MemoryService:
                 continue
 
             temporal = _serialize_temporal(valid_at, invalid_at)
-            created_at = getattr(edge, 'created_at', None)
 
             # Extract entity names from source/target nodes
             entities = []
@@ -7857,7 +7856,7 @@ class MemoryService:
                 temporal=temporal,
                 entities=entities,
                 metadata=metadata,
-                created_at=created_at.isoformat() if created_at is not None else None,
+                created_at=_created_at_to_utc_iso(getattr(edge, 'created_at', None)),
             ))
         # Truncate to the original limit (over-fetch may have produced extras).
         return results[:limit]
