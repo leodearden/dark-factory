@@ -65,10 +65,15 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import traceback
-from dataclasses import dataclass, field, replace
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Any
+
+import yaml
 
 # Self-bootstrap for standalone `python scripts/legibility/census.py` runs
 # -- must run BEFORE the `legibility.*` imports below, since a direct
@@ -1120,6 +1125,7 @@ class CrossProjectTicket:
 
 SECTION_HEADER = "header"
 SECTION_FORCE_MARKER = "force-marker"
+SECTION_METHOD = "method"
 SECTION_SATURATION = "saturation"
 SECTION_VERIFICATION = "verification"
 SECTION_UNRESOLVED_VERDICTS = "unresolved-verdicts"
@@ -1168,8 +1174,95 @@ class ReportSection:
         return "\n".join(self.lines)
 
 
-def census_report_sections(
+METHOD_KEYS = (
+    "run_id", "as_of_sha", "since", "evidence", "verification", "cost", "inputs_consumed",
+)
+"""The seven ``## Method`` keys of the quality-findings contract §5, in
+order; :func:`build_method` adds ``extra`` after them."""
+
+CENSUS_RECORD_VERSION = 1
+
+_INPUTS_CONSUMED_NOTE = (
+    "this census reads no other instrument's report yet; matching sightings "
+    "against /review, /hotspot-survey and /review-all findings arrives with "
+    "the pre-screen (plans/census-incremental-prd.md leaf L6)"
+)
+
+
+def _selection_evidence(
+    selection: census_window.SessionSelection | None, *, mined: int,
+) -> dict[str, Any]:
+    ledger = selection.ledger if selection is not None else None
+    return {
+        "window": selection.window.to_record() if selection is not None else None,
+        "sessions_enumerated": selection.sessions_enumerated if selection is not None else None,
+        "skipped_coded": selection.skipped_coded if selection is not None else None,
+        "skipped_zero_signal": selection.skipped_zero_signal if selection is not None else None,
+        "mined": mined,
+        "ledger_rows": ledger.total_rows if ledger is not None else None,
+    }
+
+
+def _ledger_extra(ledger: session_ledger.LedgerSnapshot | None) -> dict[str, Any]:
+    if ledger is None:
+        return {"ledger_created_this_run": None, "ledger_state": None, "ledger_error": None}
+    return {
+        "ledger_created_this_run": ledger.state == session_ledger.LedgerState.CREATED,
+        "ledger_state": ledger.state.value,
+        "ledger_error": ledger.error,
+    }
+
+
+def build_method(
     *,
+    run_id: str,
+    as_of_sha: str,
+    since: str | None,
+    selection: census_window.SessionSelection | None,
+    mined: int,
+    confirmed: int,
+    refuted: int,
+    unverified: int,
+    miner_calls: int,
+    verify_calls: int,
+    synthesis_calls: int,
+    probe_calls: int,
+    wall_clock_secs: float,
+) -> dict[str, Any]:
+    """The JSON-safe ``## Method`` block: :data:`METHOD_KEYS` then
+    ``extra`` (plans/census-incremental-prd.md §4.3). *selection* is
+    ``None`` for a run with no mining window, which nulls the evidence and
+    ledger fields it would have supplied; an unreadable ledger counts
+    ``ledger_rows`` as ``None``, never 0."""
+    ledger = selection.ledger if selection is not None else None
+    return {
+        "run_id": run_id,
+        "as_of_sha": as_of_sha,
+        "since": since or "none",
+        "evidence": _selection_evidence(selection, mined=mined),
+        "verification": {
+            "confirmed": confirmed, "weakened": 0, "refuted": refuted, "unverified": unverified,
+        },
+        "cost": {
+            "miner_calls": miner_calls,
+            "verify_calls": verify_calls,
+            "synthesis_calls": synthesis_calls,
+            "probe_calls": probe_calls,
+            "embedding_calls": 0,
+            "wall_clock_secs": wall_clock_secs,
+        },
+        "inputs_consumed": [],
+        "extra": {"inputs_consumed_note": _INPUTS_CONSUMED_NOTE, **_ledger_extra(ledger)},
+    }
+
+
+def _optional_asdict(value) -> dict | None:
+    return asdict(value) if value is not None else None
+
+
+def build_census_record(
+    *,
+    method: dict[str, Any],
     date: str,
     project_id: str,
     force: bool,
@@ -1184,55 +1277,97 @@ def census_report_sections(
     mass_rejection: MassRejection | None = None,
     withheld: tuple[filing_policy.WithheldCluster, ...] = (),
     cross_project_tickets: tuple[CrossProjectTicket, ...] = (),
-) -> tuple[ReportSection, ...]:
-    """The dated census report, decomposed -- see :func:`render_report` for
-    the markdown an operator reads.
+) -> dict[str, Any]:
+    """The run's JSON record: everything :func:`census_report_sections`
+    renders, as plain JSON-safe values. The mining records themselves are
+    not carried; the codebook holds what they merged."""
+    return {
+        "record_version": CENSUS_RECORD_VERSION,
+        "run_id": method["run_id"],
+        "date": date,
+        "project_id": project_id,
+        "force": force,
+        "method": method,
+        "mining": {
+            "batch_stats": [asdict(stats) for stats in mining_result.batch_stats],
+            "stop_reason": mining_result.stop_reason,
+            "max_batches": mining_result.max_batches,
+        },
+        "verify_coverage": _optional_asdict(verify_coverage),
+        "mass_rejection": _optional_asdict(mass_rejection),
+        "dropped_verdicts": [asdict(record) for record in dropped_verdicts],
+        "matrix_md": matrix_md,
+        "synthesis_md": synthesis_md,
+        "filed_ticket_ids": list(filed_ticket_ids),
+        "cross_project_tickets": [asdict(ticket) for ticket in cross_project_tickets],
+        "dry_run": _optional_asdict(dry_run),
+        "withheld": [asdict(cluster) for cluster in withheld],
+        "cost_note": cost_note,
+    }
 
-    THE single source of both: :func:`render_report` joins what this returns,
-    so a section present here is present there by construction and the two
-    cannot drift into disagreeing about what the run disclosed.
+
+def _from_record(cls, value: Mapping[str, Any] | None):
+    return cls(**value) if value is not None else None
+
+
+def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ...]:
+    """The census report, decomposed, rendered from *record*
+    (:func:`build_census_record`) alone: the record is the source and the
+    markdown is never edited by hand (quality-findings contract §5).
+    :func:`render_report` joins what this returns, so the two cannot drift.
 
     NO SILENT CAPS: when the operator bounded this run, the report says so in
-    as many words. The batch-cap coverage lines in ``## Saturation`` are
-    emitted ONLY when ``mining_result.max_batches`` is not None, so a FLAGLESS
-    run's output is byte-identical to what it was before the operator
-    cost-control flags existed (locked by
-    ``test_render_report_flagless_output_is_byte_identical_golden``). The same
-    gating applies to every other cost-control rendering here.
-
-    ``## Verification`` is emitted when EITHER *verify_coverage* or
-    *mass_rejection* is present. The second path is an ANOMALY, not a cost
-    control: an uncapped run in which every offered cluster was rejected used
-    to commit a report byte-identical to a clean census, so the only trace was
-    an ephemeral log line and an info escalation. On a flagless run the mere
-    presence of the section is now itself the signal. A flagless run that did
-    NOT mass-reject still renders byte-identically, so the invariant above is
-    preserved rather than spent.
+    as many words. Every cost-control rendering is gated on its flag being
+    set, so a FLAGLESS run renders exactly the golden lock
+    (``test_render_report_flagless_output_is_byte_identical_golden``).
+    ``## Verification`` also renders, uncapped, when every offered cluster
+    was rejected (*mass_rejection*): that anomaly must not commit a report
+    indistinguishable from a clean census.
     """
+    mining = record["mining"]
+    batch_stats = [BatchStats(**stats) for stats in mining["batch_stats"]]
+    stop_reason = mining["stop_reason"]
+    max_batches = mining["max_batches"]
+    verify_coverage = _from_record(VerifyCoverage, record["verify_coverage"])
+    mass_rejection = _from_record(MassRejection, record["mass_rejection"])
+    dry_run = _from_record(DryRunFiling, record["dry_run"])
+    dropped_verdicts = [DroppedVerdict(**item) for item in record["dropped_verdicts"]]
+    withheld = [filing_policy.WithheldCluster(**item) for item in record["withheld"]]
+    cross_project_tickets = [
+        CrossProjectTicket(**item) for item in record["cross_project_tickets"]
+    ]
+    filed_ticket_ids = record["filed_ticket_ids"]
+
     sections: list[ReportSection] = []
 
     def emit(key: str, lines: list[str]) -> None:
         sections.append(ReportSection(key=key, lines=tuple(lines)))
 
-    emit(SECTION_HEADER, [f"# confusion census {date}", "", f"Project: {project_id}"])
+    emit(
+        SECTION_HEADER,
+        [f"# confusion census {record['date']}", "", f"Project: {record['project_id']}"],
+    )
 
-    if force:
+    if record["force"]:
         emit(SECTION_FORCE_MARKER, ["", "_--force: operator-initiated run._"])
+
+    method_yaml = yaml.safe_dump(record["method"], sort_keys=False, default_flow_style=False)
+    emit(SECTION_METHOD, ["", "## Method", "", "```yaml", *method_yaml.splitlines(), "```"])
 
     saturation = [
         "",
         "## Saturation",
         "",
-        f"- batches: {len(mining_result.batch_stats)}",
-        f"- stop reason: {mining_result.stop_reason}",
+        f"- batches: {len(batch_stats)}",
+        f"- stop reason: {stop_reason}",
     ]
-    if mining_result.max_batches is not None:
+    if max_batches is not None:
         # Deliberately states only counts this function was actually handed:
         # the total number of ENUMERATED sessions is not knowable here
         # (batch_source is a generic injected iterable), and claiming
         # "X of Y (enumerated)" would assert a number the code never
         # measured.
-        if mining_result.stop_reason == "capped":
+        if stop_reason == "capped":
             # Reports `succeeded`, not `total`, as the coverage count:
             # `total` counts digests DRAWN into a batch, including any that
             # failed to code and so contributed no signal to the codebook (a
@@ -1241,12 +1376,12 @@ def census_report_sections(
             # alongside it, labelled, so nothing previously visible is lost.
             # Computed here, not at the outer `max_batches is not None`
             # scope, because the "not reached" branch below never uses them.
-            coded = sum(stats.succeeded for stats in mining_result.batch_stats)
-            drawn = sum(stats.total for stats in mining_result.batch_stats)
+            coded = sum(stats.succeeded for stats in batch_stats)
+            drawn = sum(stats.total for stats in batch_stats)
             coverage_line = (
                 f"- coverage: coded {coded} of {drawn} session digest(s) drawn across "
-                f"{len(mining_result.batch_stats)} batch(es); operator batch cap = "
-                f"{mining_result.max_batches} batch(es) -- mining was BOUNDED BY THE CAP, "
+                f"{len(batch_stats)} batch(es); operator batch cap = "
+                f"{max_batches} batch(es) -- mining was BOUNDED BY THE CAP, "
                 "not run to saturation: sessions beyond the cap were NOT mined, so this "
                 "census is PARTIAL coverage, not a full sweep."
             )
@@ -1266,23 +1401,19 @@ def census_report_sections(
                     "signal (see the per-batch tallies below)."
                 )
             saturation.append(coverage_line)
-            # PARTIAL is not the same as "the rest comes later" -- say which
-            # one this is. run_census always calls advance_census_state, and
-            # _census_window_dates anchors the NEXT window at last_census_at,
-            # so the capped-away sessions fall outside every future window.
+            # Only coded sessions are ledgered, so the capped-away ones are
+            # still eligible next run.
             saturation.append(
-                "- NOT PICKED UP LATER: this run still advances last_census_at, so the "
-                "next census window starts here -- the capped-away sessions fall outside "
-                "it and are never re-enumerated. Sweeping them means rolling "
-                "last_census_at back in docs/legibility/census-state.json before the "
-                "next run; a plain re-run will not reach them."
+                "- RESUMED NEXT RUN: the capped-away sessions were not mined, so they "
+                "were not ledgered as coded; the next census mines them while they "
+                "remain inside its retention window. No rollback is needed."
             )
         else:
             saturation.append(
-                f"- operator batch cap: {mining_result.max_batches} batch(es) "
-                f"(not reached -- mining stopped by: {mining_result.stop_reason})"
+                f"- operator batch cap: {max_batches} batch(es) "
+                f"(not reached -- mining stopped by: {stop_reason})"
             )
-    for stats in mining_result.batch_stats:
+    for stats in batch_stats:
         saturation.append(
             f"  - batch {stats.index}: dup_rate={stats.dup_rate:.2f} "
             f"(total={stats.total}, succeeded={stats.succeeded}, failed={stats.failed}, "
@@ -1326,14 +1457,12 @@ def census_report_sections(
                 f"{deferred} deferred as pending candidates -- merged into the codebook "
                 "by this run but NOT verified; adjudication deferred to a later census."
             )
-            # Mirrors the batch-cap disclosure above: "a later census" is
-            # conditional, not automatic. This window's sightings are not
-            # re-mined (last_census_at re-anchors), so a deferred cluster is
-            # re-adjudicated only when the same confusion shows up again.
+            # "a later census" is conditional, not automatic: the deferred
+            # clusters' sessions were coded, so they are ledgered and skipped.
             verification.append(
                 "- a deferred candidate is re-adjudicated only if the same confusion "
-                "RECURS in a later window: this run advances last_census_at, so these "
-                "sightings are never re-mined. A one-off deferred by the cap stays "
+                "RECURS: its sessions were coded this run and are ledgered as coded, "
+                "so they are not re-mined. A one-off deferred by the cap stays "
                 "pending until it is adjudicated by hand."
             )
         else:
@@ -1370,14 +1499,14 @@ def census_report_sections(
         )
         emit(SECTION_UNRESOLVED_VERDICTS, unresolved)
 
-    emit(SECTION_MATRIX, ["", "## Origin x Manifestation Matrix", "", matrix_md])
+    emit(SECTION_MATRIX, ["", "## Origin x Manifestation Matrix", "", record["matrix_md"]])
 
     # NO leading blank line, deliberately: `matrix_md` is embedded verbatim and
     # carries its own trailing newline, so `## Synthesis` follows it
     # immediately. The golden pins `matrix\n## Synthesis`; normalising this
     # during a refactor is the one plausible way to break byte-identity while
     # every structural assertion still passes.
-    emit(SECTION_SYNTHESIS, ["## Synthesis", "", synthesis_md])
+    emit(SECTION_SYNTHESIS, ["## Synthesis", "", record["synthesis_md"]])
 
     filed_tasks = ["", "## Filed Tasks", ""]
     if dry_run is not None:
@@ -1430,7 +1559,7 @@ def census_report_sections(
 
     # The trailing "" is the report's final newline, which the join would
     # otherwise not supply.
-    emit(SECTION_COST, ["", "## Cost", "", cost_note, ""])
+    emit(SECTION_COST, ["", "## Cost", "", record["cost_note"], ""])
 
     return tuple(sections)
 
@@ -1444,49 +1573,11 @@ def join_report_sections(sections: tuple[ReportSection, ...]) -> str:
     return "\n".join(line for section in sections for line in section.lines)
 
 
-def render_report(
-    *,
-    date: str,
-    project_id: str,
-    force: bool,
-    matrix_md: str,
-    mining_result: MiningResult,
-    synthesis_md: str,
-    filed_ticket_ids: list[str],
-    cost_note: str,
-    verify_coverage: VerifyCoverage | None = None,
-    dry_run: DryRunFiling | None = None,
-    dropped_verdicts: tuple[DroppedVerdict, ...] = (),
-    mass_rejection: MassRejection | None = None,
-    withheld: tuple[filing_policy.WithheldCluster, ...] = (),
-    cross_project_tickets: tuple[CrossProjectTicket, ...] = (),
-) -> str:
-    """Assemble the dated census report as markdown, purely from the
-    pieces passed in -- no clock, no model call, no I/O. *date* and every
-    piece of LLM-produced prose (*synthesis_md*, *matrix_md*) are inputs,
-    so the same inputs always render byte-identical output.
-
-    A pure join of :func:`census_report_sections`, which is the single source
-    of what the report contains and in what order -- including every
-    NO-SILENT-CAPS gating rule. Read that function for the structure; this one
-    exists so callers who only want the text do not have to.
-    """
-    return join_report_sections(census_report_sections(
-        date=date,
-        project_id=project_id,
-        force=force,
-        matrix_md=matrix_md,
-        mining_result=mining_result,
-        synthesis_md=synthesis_md,
-        filed_ticket_ids=filed_ticket_ids,
-        cost_note=cost_note,
-        verify_coverage=verify_coverage,
-        dry_run=dry_run,
-        dropped_verdicts=dropped_verdicts,
-        mass_rejection=mass_rejection,
-        withheld=withheld,
-        cross_project_tickets=cross_project_tickets,
-    ))
+def render_report(record: Mapping[str, Any]) -> str:
+    """The census report markdown for *record*: a pure join of
+    :func:`census_report_sections`, which owns the structure and every
+    NO-SILENT-CAPS gate. No clock, no model call, no I/O."""
+    return join_report_sections(census_report_sections(record))
 
 
 # ---------------------------------------------------------------------------
@@ -2409,6 +2500,7 @@ def run_census(
     not the requested path -- is what the report, the commit paths and
     ``CensusOutcome`` name.
     """
+    started = time.monotonic()
     # Validated BEFORE the headroom probe spends anything: a nonsense cap on a
     # flag whose entire purpose is to be an explicit, legible bound must be
     # rejected outright, never half-applied. Left unchecked,
@@ -2867,7 +2959,23 @@ def run_census(
             f"{storm_batch_indices} (>50% coding failures -- degraded dup-rate "
             "signal, excluded from the saturation decision)"
         )
-    report_md = render_report(
+    method = build_method(
+        run_id=run_id,
+        as_of_sha=as_of_sha,
+        since=since,
+        selection=None,
+        mined=len(mining_result.records),
+        confirmed=len(verified),
+        refuted=len(rejected),
+        unverified=len(novel_clusters) - len(clusters_to_verify),
+        miner_calls=sum(s.total for s in mining_result.batch_stats),
+        verify_calls=len(clusters_to_verify),
+        synthesis_calls=1,
+        probe_calls=probe_count[0],
+        wall_clock_secs=round(time.monotonic() - started, 3),
+    )
+    record = build_census_record(
+        method=method,
         date=date,
         project_id=project_id,
         force=force,
@@ -2883,6 +2991,7 @@ def run_census(
         withheld=withheld,
         cross_project_tickets=tuple(cross_project_tickets),
     )
+    report_md = render_report(record)
     # Written BEFORE codebook.dump()/advance_census_state() below -- a
     # failure here (e.g. a disk-full write_text) leaves nothing but this one
     # file touched (no codebook write, no state advance), so a re-run starts
