@@ -73,9 +73,8 @@ AND `expected: true` (`reason: 'missing'`). `expected: false` (`reason: \
 INCONCLUSIVE, never a definitive absence — `expired` means the run is past the ledger's \
 retention window, so the row would have been reaped whether or not it was ever written. \
 `run_status` is DIAGNOSTIC context for a finding's evidence line and must NEVER itself \
-decide whether to flag. Use this as the PRIMARY \
-cycle-summary presence authority before reconstructing a carry-forward finding (see \
-## Re-Verify Reconstruction Writes Before Carry-Forward below).
+decide whether to flag. This is the authority that DECIDES a carry-forward \
+missing-summary finding (see ## Carry-Forward Missing-Summary Findings below).
 
 ## Creating Tasks
 Task creation is a two-phase operation:
@@ -391,82 +390,32 @@ it was actually processed.
 
 {render_cycle_summary_section()}
 
-## Re-Verify Reconstruction Writes Before Carry-Forward (report-before-write ordering)
+## Carry-Forward Missing-Summary Findings (decided by the ledger, never reconstructed)
+A carry-forward finding from Stage 1 or Stage 3 claiming that a PRIOR run's Stage 2 \
+summary is missing (most commonly `missing_stage2_summary`) is decided ONLY by the \
+AUTHORITATIVE ledger — never by a Mem0 write, whatever remedy the finding suggests (see \
+the prohibition in `## Per-Cycle Summary` above). `get_cycle_summary_presence` reads the \
+ReconLedgerStore row, and no `add_memory` call can create that row. Call \
+`mcp__fused-memory__get_cycle_summary_presence(project_id=..., run_id=<that run's full \
+UUID>, stage='task_knowledge_sync')` with the full run_id UUID exactly as given in the \
+finding — never a truncated short/8-character prefix.
 
-### PRIMARY — Ledger presence check (authoritative), before you reconstruct
-Before reconstructing ANY memory to resolve a carry-forward finding flagged by Stage 1 or \
-Stage 3 — most commonly a `missing_stage2_summary` finding where a prior run's per-cycle \
-summary is claimed absent — consult the AUTHORITATIVE ledger FIRST to confirm the finding \
-is still real: \
-`mcp__fused-memory__get_cycle_summary_presence(project_id=..., run_id=<reconstructed \
-run's full UUID>, stage='task_knowledge_sync')`
-
-- `ledger_available: true` and `present: true` → the authoritative summary ALREADY \
-EXISTS. The carry-forward finding is stale — do NOT reconstruct. Emit the finding as \
-RESOLVED (or omit it) and note in your cycle report, e.g. "Stage 2 summary for \
-run_id=<reconstructed run's full UUID> already present per ledger — skipping \
-reconstruction."
-- `present: false` and `expected: true` (`reason: 'missing'`) → the authoritative row \
-is genuinely lost. Proceed to reconstruct and re-verify exactly as described below.
+- `ledger_available: true` and `present: true` → the summary exists, so the finding is \
+stale. Emit it as RESOLVED (or omit it) and note this in your cycle report.
 - `present: false` and `expected: false` (`reason: 'stage_not_run'`) → that run never \
-reached Stage 2. The carry-forward finding is stale: there was no Stage 2 work to \
-summarise, so do NOT reconstruct — doing so would fabricate a summary for work that \
-never happened. Emit the finding as RESOLVED (or omit it) and say so in your cycle \
-report.
+reached Stage 2, so no summary was ever owed and the finding is stale. Emit it as \
+RESOLVED (or omit it) — writing a summary would describe work that never happened.
+- `present: false` and `expected: true` (`reason: 'missing'`) → a genuine ledger-write \
+gap that only the harness write path could have closed. Carry the finding forward \
+UNRESOLVED, citing `run_status` as evidence. Do not escalate it yourself: the \
+**Escalation scope** rule below already leaves its persistence-gated escalation to the \
+harness.
 - `present: false` and `expected: null` (`reason: 'expired'`, `'run_unknown'` or \
-`'ledger_unavailable'`), or the tool returns an error → INCONCLUSIVE. Proceed to \
-reconstruct as below (unchanged behavior) — the post-write re-check remains your \
-fallback verification.
+`'ledger_unavailable'`), or the tool returns an error → INCONCLUSIVE. Leave the finding \
+as it stands and note the reason in your cycle report.
 - `run_status` is DIAGNOSTIC ONLY — cite it as evidence in a finding you have already \
 decided to emit, never as a condition for deciding. A `failed` or `interrupted` run may \
 well have run the stage and lost only the ledger write.
-
-### Reconstruction and post-write re-check (fallback verification, kept verbatim)
-When you reconstruct a memory to resolve a carry-forward finding flagged by Stage 1 or \
-Stage 3 — most commonly a `missing_stage2_summary` finding where a prior run's per-cycle \
-summary is absent — you MUST re-run the Path-2 existence check AFTER your reconstruction \
-`add_memory` write, never before. \
-The reconstruction `add_memory` MUST carry \
-`metadata={{'kind': 'cycle_summary', 'stage': 'task_knowledge_sync', \
-'run_id': <reconstructed run's full UUID>, 'recon_pool': 'stage2_cycle_summary', \
-'record_type': 'narrative'}}` — \
-where `run_id` is the TOP-LEVEL metadata key set to the reconstructed run's full UUID \
-(the prior run whose summary is being reconstructed, NOT the current run_id). \
-This matches the canonical cycle_summary metadata convention \
-so the retroactive write is deterministically findable by metadata-keyed lookup and \
-subject to the stage2_cycle_summary pool cap. \
-`record_type='narrative'` marks this write as your LLM-authored reconstruction \
-summary, distinct from the harness's own code-driven `record_type='ledger_stamp'` \
-mirror written deterministically every cycle by `summary_pool.write_cycle_summary` — \
-never use `'ledger_stamp'` here. \
-\
-Concretely: AFTER your reconstruction `add_memory` write returns, call \
-`mcp__fused-memory__count_memories_by_metadata(project_id, \
-{{'kind': 'cycle_summary', 'run_id': <run_id>, 'stage': 'task_knowledge_sync'}})` AGAIN. \
-Use the full run_id UUID of the run being reconstructed, exactly as provided in the \
-carry-forward finding — never a truncated short/8-character prefix. \
-Never construct IDs from truncated sources: a prefix will miss the written memory \
-and cause the count to return 0, falsely triggering re-carry-forward. \
-If the count is now > 0, the write succeeded — emit the finding as RESOLVED (or omit it). \
-If the count is STILL 0, treat the reconstruction write as FAILED: retry the \
-reconstruction `add_memory` once, this time PREPENDING a deterministic `retry_nonce` line \
-as a new first line of the content (metadata unchanged) to defeat Mem0's ~0.92 \
-cosine-similarity dedup — retrying with identical content re-triggers dedup (the same \
-mechanism that silently lost write 74b902f8). \
-Construct the `retry_nonce` value from available payload context using the pattern \
-`RETRY_<reconstructed_run_id_UUID>_1_<iso_timestamp_with_seconds>` \
-(e.g. `retry_nonce: RETRY_3d8f9a1c-...-abcd_1_2026-05-26T11:59:25+00:00`); \
-do NOT generate an arbitrary or random token — low-entropy strings \
-embed nearly identically and re-trigger the same ~0.92 cosine dedup. \
-Re-run the count check after the nonce retry. \
-Only propagate (carry forward) the finding as unresolved if the count is STILL 0 after the nonce retry. \
-\
-Failure mode: drafting the carry-forward finding from the pre-write count (0 by definition, \
-since that is why you are reconstructing) re-emits an already-resolved finding as unresolved \
-next cycle — the report-before-write ordering bug \
-(flag_type=stage2_report_before_write_ordering_bug; run 401766c4, know_live, 2026-06-12). \
-This is the same report-before-write ordering principle applied to carry-forward \
-reconstruction writes.
 
 ## Verifying Task Operations
 After `mcp__fused-memory__resolve_ticket` returns `status="created"` or \

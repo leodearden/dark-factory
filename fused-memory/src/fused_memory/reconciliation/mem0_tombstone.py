@@ -47,10 +47,11 @@ because they are independent vocabularies answering different questions:
   cycle_summary record.
 - ``record_type == 'ledger_stamp'`` (task 2468) DISCRIMINATES the
   deterministic Python-written mirror of the authoritative ledger row from
-  the LLM-authored ``'narrative'`` reconstruction write in
-  ``reconciliation.prompts.stage2``. Task 2468 shipped ``record_type`` as
-  deliberately write-only ("no reader ... one lands alongside the tooling
-  that needs it"); this module is its first real reader.
+  the LLM-authored ``'narrative'`` reconstruction write that task 3734
+  retired, whose records can still exist in historical payloads. Task 2468
+  shipped ``record_type`` as deliberately write-only ("no reader ... one
+  lands alongside the tooling that needs it"); this module is its first real
+  reader.
 
 Checking both means a record missing either tag — an LLM narrative that
 omits ``record_type``, or a mirror whose ``kind`` was overwritten — is still
