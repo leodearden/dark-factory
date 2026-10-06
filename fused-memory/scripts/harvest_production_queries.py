@@ -12,26 +12,37 @@ traffic beside the authored set.
 
 WHAT IT MEASURES
 ----------------
-The orchestrator's briefing assembler fires a fixed family of four queries
-per dispatched task (``orchestrator/src/orchestrator/agents/briefing.py``):
+The orchestrator's briefing assembler asks memory a small fixed set of
+queries per dispatched agent. Each is one CLASS here, tagged with its era:
 
-  * three literals   — ``project overview architecture goals`` (:1266),
-    ``coding conventions and project norms`` (:1273),
-    ``recent decisions and rationale`` (:1280)
-  * one PARAMETERIZED family — ``task {task_id} context and related
-    decisions`` (:1288-1290), which must be matched as a TEMPLATE. Matching
-    it literally would scatter one high-traffic class across thousands of
-    singleton tail entries and understate it to nearly zero.
+  * CURRENT classes are rendered from
+    ``shared/src/shared/briefing_queries.py::QUERY_SPECS``, so a reworded
+    template moves the harvester with it. A template with literal text is
+    matched by PATTERN: ``conventions and gotchas for {area}`` is ONE class
+    however many areas it is rendered for. Matching it literally would
+    scatter one high-traffic class across thousands of singleton tail
+    entries and understate it to nearly zero.
+  * The free-text task query ``{title} {area}`` has no literal text, so its
+    pattern would match nearly every query. It is matched as a COMPANION
+    instead: the next search from the same ``caller_agent_id`` after that
+    caller's conventions-area query. The caller is threaded by
+    ``orchestrator/src/orchestrator/agents/memory_recall.py::MemoryRecall._search``
+    (PRD D8). A spec with no literal text and no declared anchor is refused
+    when the classes are built.
+  * RETIRED classes are the four queries task 3659 retired, kept
+    hand-spelled in ``RETIRED_LITERAL_TEMPLATES`` and
+    ``RETIRED_TASK_TEMPLATE`` for journal rows written before it: their
+    source no longer exists.
 
-All four fire at ``limit=5`` (briefing.py:1376), not the E2 default of 10.
+Every briefing query fires at ``limit=5``, not the E2 default of 10.
 
-Everything that is not one of those four is the residual long tail, which
-is sampled — frequency-led head plus a seeded random remainder — so the
-committed fixture is small, representative and exactly regenerable.
+Everything no class claims is the residual long tail, which is sampled —
+frequency-led head plus a seeded random remainder — so the committed
+fixture is small, representative and exactly regenerable.
 
 THE LIMIT IS MEASURED, NOT ASSUMED
 ----------------------------------
-``briefing.py``:1376 governs the four briefing queries and NOTHING else.
+``BriefingQuerySpec.limit`` governs the briefing queries and NOTHING else.
 The residual tail comes from arbitrary other callers, and the journal shows
 those callers run at 3, 4, 5, 6, 8, 10, 15, 20, 30 and 50 — only about a
 third of tail traffic is at 5. Stamping ``BRIEFING_SEARCH_LIMIT`` onto a
@@ -49,8 +60,9 @@ text:
     never a defaulted or modal guess; a reader who wants a modal value can
     take it from the histogram and own that choice explicitly.
 
-Even the briefing literals are not unanimous (each has one or two stray
-instances at 10/20 out of ~75k at 5), so they too report ``None`` with a
+Even the retired briefing literals were not unanimous in the committed
+harvest (each has one or two stray instances at 10/20 out of ~75k at 5),
+so they too report ``None`` with a
 histogram that makes the 99.99% concentration at 5 visible. The scoring
 window downstream is consequently a stated CHOICE, not a reading.
 
@@ -292,11 +304,13 @@ CURRENT_CLASSES: tuple[BriefingClass, ...] = build_current_classes(
 
 BRIEFING_CLASSES: tuple[BriefingClass, ...] = RETIRED_CLASSES + CURRENT_CLASSES
 
-#: briefing.py:1376 fires the family at limit=5, not the E2 default of 10.
+#: The limit every briefing query fires at (``BriefingQuerySpec.limit`` in
+#: ``shared/src/shared/briefing_queries.py``), not the E2 default of 10.
 #: This is a fact about the BRIEFING ASSEMBLER only. It is never stamped onto
 #: a row as an observation — see "THE LIMIT IS MEASURED, NOT ASSUMED" above.
 #: It survives as the documented default scoring window and as the sidecar's
-#: ``scored_limit``, which is labelled a choice.
+#: ``scored_limit``, which is labelled a choice and pinned to the source's
+#: limit by a test, so drift there forces a decision here.
 BRIEFING_SEARCH_LIMIT = 5
 
 #: Histogram key used when a search op recorded no usable integer ``limit``.
@@ -332,16 +346,18 @@ class TemplateClass:
     text: str
     """The concrete query text this class contributes to the fixture.
 
-    For a literal this IS the template. For the parameterized family it is
-    the most-frequently-observed concrete instance, so the fixture carries
-    real production text rather than a formatting placeholder.
+    The most-frequently-observed instance, so a parameterized or companion
+    class carries real production text rather than a formatting
+    placeholder; for a literal that IS the template. A class nobody fired
+    reports its template, and contributes no fixture row.
     """
 
     template: str
     """The template the class was matched by (== `text` for literals)."""
 
     match: MatchKind
-    """``'literal'`` or ``'parameterized'``."""
+    """``'literal'``, ``'parameterized'`` (by pattern) or ``'companion'``
+    (by following its anchor class's op from the same caller)."""
 
     era: BriefingEra
     """``'retired'`` or ``'current'``."""
@@ -424,14 +440,15 @@ class HarvestResult:
             'tail_sample': self.tail_sample,
             'tail_top': self.tail_top,
             'seed': self.seed,
-            # NOT an observation: briefing.py:1376 governs the four briefing
+            # NOT an observation: the briefing's limit governs the briefing
             # queries only.  The measured distributions sit beside it so the
             # difference between the choice and the reading is legible.
             'scored_limit': BRIEFING_SEARCH_LIMIT,
             'scored_limit_is_a_choice': True,
             'scored_limit_basis': (
-                'briefing.py:1376 fires the four briefing-assembler queries '
-                'at limit=5. It governs nothing else. The residual tail is '
+                'BriefingQuerySpec.limit (shared/src/shared/briefing_queries.py) '
+                'fires every briefing-assembler query at limit=5. It governs '
+                'nothing else. The residual tail is '
                 'arbitrary other callers running at 3-50, so scoring the '
                 'tail at 5 is a CHOICE made for comparability with the '
                 'briefing half, not a limit observed on those queries. Per-'
@@ -731,6 +748,11 @@ def harvest(
     pin_tail_texts: list[str] | None = None,
 ) -> HarvestResult:
     """Measure the production query distribution in one read-only pass.
+
+    Every search op is classified in journal order into a briefing class
+    (`BRIEFING_CLASSES`) or the residual tail. `templates` lists every class,
+    a measured zero included; fixture rows are emitted for observed classes
+    and for the tail sample.
 
     The tail sample is deterministic given (journal contents, tail_sample,
     tail_top, seed): a frequency-led head (sorted by -count then text, so
