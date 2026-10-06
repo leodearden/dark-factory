@@ -7,6 +7,7 @@ interrupted run. A failed post-run instrument check is recorded in ``run.json``,
 not raised; the caller decides what that run is worth.
 """
 
+import asyncio
 import json
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -81,7 +82,7 @@ async def run_llm_arm(
     reference: Sequence[EpisodeOutcome] | None,
     base_config: FusedMemoryConfig,
 ) -> RunManifest:
-    pre_run = require_pre_run_checks(spec, repo_root)
+    pre_run = await asyncio.to_thread(require_pre_run_checks, spec, repo_root)
     started_at = datetime.now(UTC)
     result = await replay_arm(spec, items, graph=graph, journal=journal, settings=settings)
     ranks = await _retrieval_ranks(graph, spec, result, items)
