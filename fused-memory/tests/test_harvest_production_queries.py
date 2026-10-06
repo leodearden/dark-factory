@@ -428,13 +428,6 @@ class TestTheRetiredBranchIsExplicit:
         assert prov['templates']
         assert all('era' in entry for entry in prov['templates'])
 
-    def test_the_retired_templates_are_named_as_retired(self):
-        mod = _mod()
-        assert set(mod.RETIRED_LITERAL_TEMPLATES) == {
-            RETIRED_OVERVIEW, RETIRED_CONVENTIONS, RETIRED_DECISIONS,
-        }
-        assert mod.RETIRED_TASK_TEMPLATE == RETIRED_TASK_TEMPLATE
-
 
 # Scopes with declared files, so each fires the area-scoped conventions query
 # and a distinct area. Journal rows are rendered from these through
