@@ -499,7 +499,7 @@ class TestCurrentTemplatesAreRenderedFromSource:
         mod = _mod()
         rendered = _rendered(CONVENTIONS_AREA, AREA_SCOPES[0])
         near_misses = (
-            'conventions and gotchas for',
+            'conventions and gotchas',
             'coding conventions and gotchas for x',
             f'{rendered}, and what changed there since August?',
         )
@@ -510,6 +510,17 @@ class TestCurrentTemplatesAreRenderedFromSource:
         result = mod.harvest(db)
         assert _class_for(result, CONVENTIONS_AREA.text).observed_count == 2
         assert result.tail_count == len(near_misses)
+
+    def test_an_area_of_only_template_words_still_anchors_its_task_query(self, tmp_path):
+        """The renderer drops repeated words, so such an area renders as nothing."""
+        mod = _mod()
+        scope = BriefingScope(task_id='77', title='Conventions and gotchas')
+        assert _rendered(CONVENTIONS_AREA, scope) == 'conventions and gotchas for'
+        rows = _briefing_rows(scope, caller=IMPLEMENTER)
+        result = mod.harvest(_build_journal(tmp_path / 'j.db', rows))
+        assert _class_for(result, CONVENTIONS_AREA.text).observed_count == 1
+        assert _companion(result).observed_count == 1
+        assert result.tail_count == 0
 
     def test_a_mixed_era_journal_counts_each_class_once_in_its_own_era(self, tmp_path):
         """200 retired-era ops plus 20 generic and 30 area ops: 250 in all."""

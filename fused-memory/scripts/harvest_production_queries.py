@@ -211,6 +211,11 @@ _FIELD_PATTERNS: dict[str, str] = {
 }
 _ANY_FIELD_PATTERN = '.+'
 
+#: Fields that can render to nothing. `shared.briefing_queries.render_query`
+#: drops every word already earlier in the query, so an area made only of the
+#: template's own words vanishes together with the space before it.
+_VANISHING_FIELDS: frozenset[str] = frozenset({'area'})
+
 
 def _template_fields(template: str) -> tuple[str, ...]:
     return tuple(
@@ -226,9 +231,14 @@ def _template_pattern(template: str) -> re.Pattern[str]:
     """Render a `str.format` template into the pattern its instances fullmatch."""
     parts: list[str] = []
     for literal, name, _, _ in string.Formatter().parse(template):
-        parts.append(re.escape(literal))
-        if name is not None:
-            parts.append(f'(?P<{name}>{_FIELD_PATTERNS.get(name, _ANY_FIELD_PATTERN)})')
+        if name is None:
+            parts.append(re.escape(literal))
+            continue
+        field_pattern = f'(?P<{name}>{_FIELD_PATTERNS.get(name, _ANY_FIELD_PATTERN)})'
+        if name in _VANISHING_FIELDS and literal.endswith(' '):
+            parts.append(f'{re.escape(literal[:-1])}(?: {field_pattern})?')
+        else:
+            parts.append(re.escape(literal) + field_pattern)
     return re.compile(''.join(parts))
 
 
