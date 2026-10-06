@@ -270,6 +270,7 @@ def test_read_ledger_reports_a_corrupt_file_unreadable(tmp_path):
     path = _garbage_ledger(tmp_path)
     snapshot = session_ledger.read_ledger(path)
     assert snapshot.state is LedgerState.UNREADABLE
+    assert snapshot.error is not None
     assert str(path) in snapshot.error
     assert snapshot.total_rows is None
     assert snapshot.sessions == frozenset()
@@ -280,6 +281,7 @@ def test_open_for_census_leaves_a_corrupt_file_untouched(tmp_path):
     path = _garbage_ledger(tmp_path)
     snapshot = session_ledger.open_for_census(path, prune_before=_NOW)
     assert snapshot.state is LedgerState.UNREADABLE
+    assert snapshot.error is not None
     assert str(path) in snapshot.error
     assert snapshot.total_rows is None
     assert snapshot.has_census_rows is False
