@@ -5769,6 +5769,26 @@ def _resolve_verify_timeout(
     return warm
 
 
+def merge_verify_command_budget_secs(
+    config: OrchestratorConfig, module_configs: list[ModuleConfig],
+) -> float:
+    """The longest per-command timeout a merge verify of *module_configs* can be granted.
+
+    The max of :func:`_resolve_verify_timeout`'s warm and merge-cold resolutions
+    over the global fallback and every module the merge verify covers, so it is
+    never shorter than the command timeout that would actually kill the verify.
+    Consumer: the restart drain's in-flight deadlines (task 5371).
+    """
+    covered: list[ModuleConfig | None] = [
+        None, *verify_plan.effective_merge_module_configs(config, module_configs),
+    ]
+    return max(
+        _resolve_verify_timeout(config, module, is_cold=is_cold, is_merge_verify=True)
+        for module in covered
+        for is_cold in (False, True)
+    )
+
+
 def _resolve_concurrent_verify(
     config: OrchestratorConfig,
     module_config: ModuleConfig | None,

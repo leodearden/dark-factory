@@ -24,7 +24,7 @@ from shared.branch_names import canonical_queued_branch_name
 
 from orchestrator.git_ops import MergeResult
 from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
-from orchestrator.verify import VerifyResult
+from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
 
 if TYPE_CHECKING:
     from orchestrator.config import ModuleConfig, OrchestratorConfig
@@ -1612,6 +1612,72 @@ class InflightEntrySlot:
     """
 
     entry: InflightEntry | None = None
+
+
+class VerifyInFlightKind(StrEnum):
+    """What a :class:`VerifyInFlight` is doing; the heartbeat's ``kind`` vocabulary.
+
+    ``verify``: a dispatched verify (ordinary or speculative); ``gate_reverify``
+    and ``finalizing``: the finalize head's re-verify and landing;
+    ``train``: a coalesce/declared train held by the merger, whose verify runs
+    inline there; ``merging`` and ``dispatching``: any other item the lane
+    holds mid-merge or mid-dispatch, about to start a verify.
+    """
+
+    VERIFY = 'verify'
+    GATE_REVERIFY = 'gate_reverify'
+    FINALIZING = 'finalizing'
+    TRAIN = 'train'
+    MERGING = 'merging'
+    DISPATCHING = 'dispatching'
+
+    @classmethod
+    def for_phase(cls, phase: str) -> VerifyInFlightKind:
+        """The kind of a dispatched entry in lifecycle *phase*."""
+        if phase in (cls.GATE_REVERIFY, cls.FINALIZING):
+            return cls(phase)
+        return cls.VERIFY
+
+    @classmethod
+    def held(cls, state: str, *, is_train: bool) -> VerifyInFlightKind:
+        """The kind of an item held in lifecycle *state* with no in-flight entry."""
+        return cls.TRAIN if is_train else cls(state)
+
+
+@dataclass(frozen=True)
+class VerifyInFlight:
+    """One merge verify a restart would kill, as the restart drain sees it (task 5371).
+
+    ``started_ts`` is when the verify running NOW began: a dispatch, the latest
+    entry into a gate re-verify or finalize, or a train's latest inline verify
+    (``orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._note_verify_started``).
+    ``deadline_ts`` adds the longest command timeout the request's merge
+    verify can be granted
+    (``orchestrator/src/orchestrator/verify.py::merge_verify_command_budget_secs``),
+    so a verify still running past it is one its own timeout would kill.
+    """
+
+    task_id: str
+    host: str | None
+    kind: VerifyInFlightKind
+    started_ts: float
+    deadline_ts: float
+
+    @classmethod
+    def for_request(
+        cls, request: MergeRequest, *, host: str | None, kind: VerifyInFlightKind, started_ts: float,
+    ) -> VerifyInFlight:
+        budget = merge_verify_command_budget_secs(request.config, request.module_configs)
+        return cls(
+            task_id=request.task_id, host=host, kind=kind,
+            started_ts=started_ts, deadline_ts=started_ts + budget,
+        )
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            'task_id': self.task_id, 'host': self.host, 'kind': str(self.kind),
+            'started_ts': self.started_ts, 'deadline_ts': self.deadline_ts,
+        }
 
 
 @dataclass

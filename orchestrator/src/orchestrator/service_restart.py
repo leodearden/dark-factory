@@ -111,16 +111,13 @@ FLEET_DEPLOY_CLOCK_RELPATH = 'data/orchestrator/last_redeploy_orchestrator.json'
 # test_fleet_lease_path_matches_across_tiers.
 FLEET_LEASE_RELPATH = 'data/orchestrator/fleet_redeploy_lease.json'
 
-# How old a lease may be before its readers stop believing it. DERIVED, not
-# picked: the worst LEGITIMATE sweep is one permanently-busy unit burning the
-# whole ORCH_RESTART_FORCE_FIRE_AFTER_SECS busy grace (4500s), plus ~6
-# stale/absent units at ORCH_DRAIN_UNKNOWN_GRACE_SECS 120s each, plus 7 x
-# (RESTART_VERIFY_TIMEOUT 30 + RESTART_VERIFY_GRACE_SECS 120) — 6270s ≈ 1.74h.
-# 7200 clears that with headroom while staying far below the 8h
-# min_interval_secs, so a lease leaked by a SIGKILLed sweep (whose EXIT trap
-# cannot run, by construction) delays at most ONE redeploy window and can
-# never wedge the fleet.
-DEFAULT_FLEET_LEASE_MAX_AGE_SECS = 7200.0
+# How old a lease may be before its readers stop believing it. The default of
+# orchestrator.config's orchestrator_restart_lease_max_age_secs, where its
+# derivation from the worst legitimate --drain sweep lives (task 5371: the
+# verify-wait cap made that ~13,300s, so 4h). A lease leaked by a SIGKILLed
+# sweep (whose EXIT trap cannot run, by construction) therefore delays at most
+# ONE redeploy window and can never wedge the fleet.
+DEFAULT_FLEET_LEASE_MAX_AGE_SECS = 14400.0
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ Asserts:
 from __future__ import annotations
 
 import logging
+import shlex
 from pathlib import Path
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1069,7 +1070,9 @@ class TestOrchestratorCoordinatorEndToEnd:
         assert pos_args[0] == 'systemd-run'
         assert '--on-active=10' in pos_args
         assert '--unit=orch-selfrestart-on-merge-0.service' in pos_args
-        assert expected_script in pos_args
+        # task 5371: the script runs drained; with an argument, the payload is
+        # one shell command line.
+        assert pos_args[-3:] == ('/bin/sh', '-c', shlex.join([expected_script, '--drain']))
         assert orch_coord.is_pending is False
 
         # Second merge + fire: the executor closure's itertools counter must
