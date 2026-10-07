@@ -446,6 +446,50 @@ def test_a_merge_created_on_main_puts_main_at_caret_1(tmp_path: Path) -> None:
     )
 
 
+def test_a_stacked_branch_that_merged_main_first_hides_the_landing_merge(
+    tmp_path: Path,
+) -> None:
+    """A sync merge on a branch stacked on ``task/T`` sorts older than the landing.
+
+    ``task/S`` is stacked on ``task/T``, merges main into itself (Y, as a
+    conflict-resolution "merge main into" commit does), then lands via Z
+    made on main.  ``tail -1`` returns Y, whose ``^1`` already contains the
+    branch, so the arm exits rc=0 to the citation gate: Z is skipped, but
+    nothing is wrongly stamped.  Dark-factory produces this shape (a carry
+    branch stacked on a task branch that merged main in).
+    """
+    root = tmp_path / 'repo'
+    _new_repo(root)
+
+    _commit(root, 'base', 'base.txt')
+    _git(root, 'checkout', '-b', f'task/{TASK_ID}')
+    _commit(root, 'work', 'work.txt')
+    _git(root, 'checkout', '-b', 'task/S')
+    _commit(root, 'swork', 's.txt')
+
+    _git(root, 'checkout', 'main')
+    _commit(root, 'mainadv', 'm.txt')
+    _git(root, 'checkout', 'task/S')
+    _git(root, 'merge', '--no-ff', 'main', '-m', 'Y')
+    y = _git(root, 'rev-parse', 'HEAD')
+
+    _git(root, 'checkout', 'main')
+    _commit(root, 'mainadv2', 'm2.txt')
+    _git(root, 'merge', '--no-ff', 'task/S', '-m', 'Z')
+    z = _git(root, 'rev-parse', 'HEAD')
+
+    assert _candidate_topo(root, TASK_ID) == y, (
+        'the oldest descendant merge is the stacked branch\'s sync merge, not the landing'
+    )
+    assert _contained_before(root, TASK_ID, f'{y}^1') == 0, (
+        'Y\'s first parent already contains the branch, so the arm takes its do-not-stamp '
+        'exit to the citation gate -- safe, no wrong stamp'
+    )
+    assert _contained_before(root, TASK_ID, f'{z}^1') == 1, (
+        'Z was the stampable landing merge the arm skips'
+    )
+
+
 def test_an_already_landed_branch_yields_the_arms_legitimate_rc0_verdict(
     tmp_path: Path,
 ) -> None:
