@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 from shared.cli_invoke import AgentResult, AllAccountsCappedException, invoke_with_cap_retry
 
+from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES
 from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
 from fused_memory.reconciliation.sandbox_guard import (
     RemediationSandboxUnavailable,
@@ -336,7 +337,7 @@ FINDING_ITEM_SCHEMA: dict[str, Any] = {
         },
         'severity': {
             'type': 'string',
-            'enum': ['minor', 'moderate', 'serious'],
+            'enum': list(FINDING_SEVERITY_VALUES),
             'description': 'Severity level of the finding',
         },
         'actionable': {
