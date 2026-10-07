@@ -1408,20 +1408,24 @@ def default_status_fetcher(project_root: str | Path):
 # decide_for_project — high-level assembly (config + state + codebook signal)
 # ---------------------------------------------------------------------------
 
-def _floor_anchor(
+def _trigger_anchors(
     state: dict | None, *, never_censused: bool, earliest_codebook_date: datetime | None
-) -> FloorAnchor | None:
+) -> tuple[datetime | None, FloorAnchor | None]:
+    """The instant max-interval and tasks-landed measure from, and the floor's anchor."""
     if never_censused:
         if earliest_codebook_date is None:
-            return None
-        return FloorAnchor(FloorAnchorKind.EARLIEST_CODEBOOK_DATE, earliest_codebook_date)
-    watermark = _parse_date((state or {}).get("session_watermark"))
+            return None, None
+        return earliest_codebook_date, FloorAnchor(
+            FloorAnchorKind.EARLIEST_CODEBOOK_DATE, earliest_codebook_date
+        )
+    state = state or {}
+    last_census_at = _parse_date(state.get("last_census_at"))
+    watermark = _parse_date(state.get("session_watermark"))
     if watermark is not None:
-        return FloorAnchor(FloorAnchorKind.SESSION_WATERMARK, watermark)
-    last_census_at = _parse_date((state or {}).get("last_census_at"))
+        return last_census_at, FloorAnchor(FloorAnchorKind.SESSION_WATERMARK, watermark)
     if last_census_at is None:
-        return None
-    return FloorAnchor(FloorAnchorKind.LAST_CENSUS_AT, last_census_at)
+        return None, None
+    return last_census_at, FloorAnchor(FloorAnchorKind.LAST_CENSUS_AT, last_census_at)
 
 
 def decide_for_project(
@@ -1484,10 +1488,7 @@ def decide_for_project(
         logger.warning("codebook at %s is unreadable: %s", codebook_path, exc)
         earliest_sighting, candidate_first_seens = None, []
 
-    last_census_at = (
-        earliest_sighting if never_censused else _parse_date((state or {}).get("last_census_at"))
-    )
-    floor_anchor = _floor_anchor(
+    last_census_at, floor_anchor = _trigger_anchors(
         state, never_censused=never_censused, earliest_codebook_date=earliest_sighting
     )
 
