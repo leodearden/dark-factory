@@ -1544,8 +1544,8 @@ async def _run_shadow_compare(
 # build-STAGE categories only (a compile/CLI/tree-sitter/npm build break, where
 # zero test lines is EXPECTED); TEST_FAILURE-class categories with an empty map
 # stay inconclusive since a genuine test failure normally DOES emit parseable
-# lines and an empty map there is more likely a transport/parse hiccup.  Derived
-# from FailureCategory so a new build-stage category can't drift out of the set.
+# lines and an empty map there is more likely a transport/parse hiccup.  Hand-enumerated:
+# lint_error/type_error/infra_abort are not build-STAGE failures and stay inconclusive.
 _COARSE_BUILD_FAILURE_CATEGORIES: frozenset[str] = frozenset({
     FailureCategory.COMPILE_ERROR.value,
     FailureCategory.CARGO_CLI_ERROR.value,

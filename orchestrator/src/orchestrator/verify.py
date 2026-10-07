@@ -10800,10 +10800,11 @@ def _psi_cpu_some10_or_none() -> float | None:
 #: assigns after the leg's tests ran to a verdict: a FAILED line, or the
 #: ladder's fall-through, where an ERROR-only session (a fixture-setup
 #: timeout) lands while still naming its node-ids. Every other category means
-#: the leg was stopped, or failed before any test was judged. Residual: the
-#: fall-through also holds a leg that named no test (pytest rc=5, a lint leg
-#: that printed nothing), which the aggregated list cannot tell apart. Why
-#: anything else refuses suppression:
+#: the leg was stopped, or failed before any test was judged; a red lint or
+#: type leg lands lint_error/type_error and a verdictless pytest exit lands
+#: infra_abort, all refused. Residual: the fall-through also holds a TEST leg
+#: that named no test (pytest rc=5), which the aggregated list cannot tell
+#: apart. Why anything else refuses suppression:
 #: test_flake_discriminator.py::TestLegWithoutVerdictIsUnconfirmable.
 _VERDICT_BEARING_LEG_CATEGORIES: frozenset[FailureCategory] = frozenset({
     FailureCategory.TEST_FAILURE, FailureCategory.UNKNOWN_TEST_FAILURE,

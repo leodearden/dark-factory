@@ -484,6 +484,9 @@ confirmed task faults in both modes — see
 #   unknown_test_failure: ambiguous signal; may be flaky
 #   infra_timeout:        infra problem; auto-spawning cannot fix infra
 #   flock_error:          transient lock contention; auto-spawning cannot fix
+#   lint_error:           held out pending production evidence; was unknown_test_failure
+#   type_error:           held out pending production evidence; was unknown_test_failure
+#   infra_abort:          infra problem; auto-spawning cannot fix infra
 AUTO_HEAL_MECHANICAL_CATEGORIES: frozenset[str] = frozenset({'compile_error'})
 
 
