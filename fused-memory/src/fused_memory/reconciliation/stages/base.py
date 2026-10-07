@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Awaitable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -277,13 +278,18 @@ class BaseStage:
         # The config dir is derived deterministically from (data_dir, run_id) so
         # all three stages of a run share it and the harness GCs the same path;
         # attempt auto-increments per launch as durable history for task σ (resume).
+        # Both snapshot writes are best-effort (task 5561).
         session_id = str(uuid4())
         config_dir = TaskConfigDir(
             task_id=run_id,
             base_dir=recon_config_base_dir(self.journal.data_dir),
         )
-        await self.journal.record_run_session(
-            run_id, session_id=session_id, stage_cursor=self.stage_id.value
+        await self._write_session_snapshot_best_effort(
+            'record_run_session',
+            run_id,
+            self.journal.record_run_session(
+                run_id, session_id=session_id, stage_cursor=self.stage_id.value
+            ),
         )
 
         # Task σ resume seam: when the startup adopt-and-resume pass supplies the
@@ -340,7 +346,9 @@ class BaseStage:
             raise
         finally:
             if not cancelled:
-                await self.journal.clear_run_session(run_id)
+                await self._write_session_snapshot_best_effort(
+                    'clear_run_session', run_id, self.journal.clear_run_session(run_id),
+                )
 
         completed = datetime.now(UTC)
 
@@ -530,6 +538,27 @@ class BaseStage:
             )
 
         return stage_report
+
+    async def _write_session_snapshot_best_effort(
+        self, op: str, run_id: str, write: Awaitable[None],
+    ) -> None:
+        """Await one session-snapshot journal write, logging rather than raising on failure.
+
+        The snapshot is advisory: the task-σ resume gate
+        (``harness.py::ReconciliationHarness._resume_guard_reason`` and the
+        transcript check in ``run``) validates the transcript on disk instead
+        of trusting it. Cancellation propagates.
+        """
+        try:
+            await write
+        except Exception as exc:
+            logger.warning(
+                'Stage %s run_id=%s: %s failed; continuing without the session '
+                'snapshot: %r (sqlite_errorname=%s sqlite_errorcode=%s)',
+                self.stage_id.value, run_id, op, exc,
+                getattr(exc, 'sqlite_errorname', None),
+                getattr(exc, 'sqlite_errorcode', None),
+            )
 
     def _build_recovery_prompt(self, run_id: str, stage_payload: str) -> str:
         """Build the continuation prompt delivered to a ``--resume``d stage (task σ).
