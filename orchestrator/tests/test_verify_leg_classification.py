@@ -292,6 +292,18 @@ def _rewrite(text: str, old: str, new: str) -> str:
 # The group-kill log ends in its unterminated partial progress line.
 _GROUP_KILL_TAIL = ' [ 18%]\n.......'
 
+# pytest -v outcome lines, verbatim from pytest 9.0.3 / xdist 3.8.0 runs of
+# `pytest -v` and `pytest -v -n 2` (2026-10-07). A parametrised node-id may
+# carry a space.
+_VERBOSE_SERIAL_FAILED = 'tests/test_a.py::test_bad FAILED'.ljust(73) + '[ 40%]'
+_VERBOSE_SERIAL_ERROR = 'tests/test_a.py::test_setup_error ERROR'.ljust(73) + '[ 60%]'
+_VERBOSE_SERIAL_PARAM_FAILED = 'tests/test_a.py::test_param[a b] FAILED'.ljust(73) + '[ 80%]'
+_VERBOSE_SERIAL_PASSED = 'tests/test_a.py::test_ok PASSED'.ljust(73) + '[ 20%]'
+_VERBOSE_XDIST_FAILED = '[gw0] [100%] FAILED tests/test_a.py::test_bad '
+_VERBOSE_XDIST_ERROR = '[gw1] [ 40%] ERROR tests/test_a.py::test_setup_error '
+_VERBOSE_XDIST_PARAM_FAILED = '[gw1] [ 60%] FAILED tests/test_a.py::test_param[a b] '
+_VERBOSE_XDIST_PASSED = '[gw0] [ 20%] PASSED tests/test_a.py::test_ok '
+
 
 def _xdist_test_leg(rc: int, output: str, *, timed_out: bool = False):
     """(category, failing_leg_categories) for a red test leg, lint/type green."""
@@ -498,6 +510,43 @@ class TestVerdictlessXdistExitIsInfraAbort:
         output = _rewrite(text, _GROUP_KILL_TAIL, f' [ 18%]\n...{status_char}...')
         category, _ = _xdist_test_leg(143, output)
         assert category == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    @pytest.mark.parametrize('rc', [143, 1])
+    @pytest.mark.parametrize(
+        'verbose_line',
+        [
+            pytest.param(_VERBOSE_SERIAL_FAILED, id='serial_failed'),
+            pytest.param(_VERBOSE_SERIAL_ERROR, id='serial_error'),
+            pytest.param(_VERBOSE_SERIAL_PARAM_FAILED, id='serial_param_with_space'),
+            pytest.param(_VERBOSE_XDIST_FAILED, id='xdist_failed'),
+            pytest.param(_VERBOSE_XDIST_ERROR, id='xdist_error'),
+            pytest.param(_VERBOSE_XDIST_PARAM_FAILED, id='xdist_param_with_space'),
+        ],
+    )
+    def test_verbose_failure_outcome_vetoes_the_abort(self, verbose_line, rc):
+        """Rule: under -v each finished test prints its outcome on its own
+        line, and a killed session prints no short summary, so a FAILED or
+        ERROR outcome there is failure evidence and must veto."""
+        output = _with_line(
+            _xdist_abort_log('shape1_controller_sigterm.log'), verbose_line,
+        )
+        category, _ = _xdist_test_leg(rc, output)
+        assert category == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    @pytest.mark.parametrize(
+        'verbose_line',
+        [
+            pytest.param(_VERBOSE_SERIAL_PASSED, id='serial_passed'),
+            pytest.param(_VERBOSE_XDIST_PASSED, id='xdist_passed'),
+        ],
+    )
+    def test_verbose_passed_outcome_does_not_veto(self, verbose_line):
+        """The discriminating twin: a PASSED outcome is no failure evidence."""
+        output = _with_line(
+            _xdist_abort_log('shape1_controller_sigterm.log'), verbose_line,
+        )
+        category, _ = _xdist_test_leg(143, output)
+        _assert_infra_abort(category)
 
     @pytest.mark.parametrize(
         'evidence',

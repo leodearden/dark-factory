@@ -701,6 +701,13 @@ _PYTEST_PROGRESS_FAILURE_RE = re.compile(
     rf'(?:[ \t]+{_PYTEST_PERCENT_FIELD}|[A-Z/].*)?$',
     re.MULTILINE,
 )
+# pytest -v prints each finished test's outcome on its own line: serially
+# `<nodeid> FAILED  [ 40%]`, under xdist `[gw0] [ 40%] FAILED <nodeid>`.
+_PYTEST_VERBOSE_FAILURE_RE = re.compile(
+    rf'^(?:\[gw\d+\] (?:{_PYTEST_PERCENT_FIELD} )?(?:FAILED|ERROR) '
+    r'|\S+::.*? (?:FAILED|ERROR)\b)',
+    re.MULTILINE,
+)
 
 
 # Bare pytest-xdist worker-crash signature (task 2365). Grounded in
@@ -1045,12 +1052,16 @@ def _pytest_session_aborted_without_verdict(rc: int, output: str) -> bool:
     ``_run_cmd``'s ``/bin/bash`` wrapper, directly or as ``_run_segmented``'s
     first nonzero rc, so verify knows the shell is its own.
 
-    Any failure evidence vetoes both arms, including an ``F`` or ``E`` in a
-    progress line, including the unterminated final one, whatever another
-    writer glued onto it, because a killed ``-q`` session prints no short
-    summary.
+    Any failure evidence vetoes both arms, because a killed session prints no
+    short summary: an ``F`` or ``E`` in a progress line, including the
+    unterminated final one whatever another writer glued onto it, or a
+    ``FAILED``/``ERROR`` outcome on a ``-v`` line.
     """
-    if _carries_pytest_failure_verdict(output) or _PYTEST_PROGRESS_FAILURE_RE.search(output):
+    if (
+        _carries_pytest_failure_verdict(output)
+        or _PYTEST_PROGRESS_FAILURE_RE.search(output)
+        or _PYTEST_VERBOSE_FAILURE_RE.search(output)
+    ):
         return False
     return is_shell_reported_external_kill(rc) or bool(_XDIST_CHANNEL_COLLAPSE_RE.search(output))
 
