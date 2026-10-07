@@ -477,16 +477,13 @@ confirmed task faults in both modes — see
 # Conservative allowlist of verify.py category strings that are mechanical
 # (small diff, deterministic cause) and therefore safe to auto-spawn a fix
 # task for.  The category strings are those emitted by
-# ``verify_classify.classify_failure``; compile_error covers the tsc/type/lint class.
+# ``verify_classify.classify_failure``; compile_error covers the rustc/tsc class.
 #
 # Deliberately EXCLUDED — not eligible for auto-heal:
 #   test_failure:         multi-file; needs human judgement on test expectations
 #   unknown_test_failure: ambiguous signal; may be flaky
 #   infra_timeout:        infra problem; auto-spawning cannot fix infra
 #   flock_error:          transient lock contention; auto-spawning cannot fix
-#   lint_error:           held out pending production evidence; was unknown_test_failure
-#   type_error:           held out pending production evidence; was unknown_test_failure
-#   infra_abort:          infra problem; auto-spawning cannot fix infra
 AUTO_HEAL_MECHANICAL_CATEGORIES: frozenset[str] = frozenset({'compile_error'})
 
 
