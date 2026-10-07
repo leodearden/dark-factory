@@ -40,6 +40,7 @@ const {
   resolutionSegments,
   windowedClassSplit,
   taskCard,
+  levelCount,
 } = escalationViews;
 const { isDatum, datumView, EM_DASH } = loadedWindow.DF_DATUM;
 
@@ -124,6 +125,7 @@ test('the module exposes its readers and assigns window.DF_ESCALATION_VIEWS', ()
     Object.keys(escalationViews).sort(),
     [
       'corpusAgeCaption',
+      'levelCount',
       'openInHistoryOver',
       'queuePending',
       'resolutionSegments',
@@ -403,4 +405,54 @@ test('taskCard: a card older than its bound keeps its fields and badges its age'
   assert.equal(card.isHole, false);
   assert.equal(card.task.title, 'One corpus walk');
   assert.equal(card.age, '1m');
+});
+
+// ── levelCount: the header's per-level counts, gated on the /escalations receipt ─
+
+// data.js's seed: the server's healthy empty shape, before any fetch.
+function seededEscalations(receiptOpts, byLevel = { 0: 0, 1: 0, 2: 0 }) {
+  return {
+    ESCALATIONS: { subsections: [], summary: { by_level: byLevel }, views: views(0, 0) },
+    __receipt: receiptOpts === null ? {} : receipts(receiptOpts),
+  };
+}
+
+test('levelCount: before the first /escalations payload, the seed zero never renders', () => {
+  for (const level of [0, 1, 2]) {
+    const count = levelCount(seededEscalations(null), level);
+    assert.equal(count.state, 'unknown', `L${level}`);
+    assert.equal(count.reason, 'not yet fetched', `L${level}`);
+    assert.equal(datumView(count, { now: RECEIVED_AT }).text, EM_DASH, `L${level}`);
+  }
+});
+
+test('levelCount: a delivered count is a reading stamped with the receipt; a measured zero is one too', () => {
+  const data = seededEscalations({}, { 0: 4, 1: 3, 2: 0 });
+
+  const l1 = levelCount(data, 1);
+  const l2 = levelCount(data, 2);
+
+  assert.equal(isDatum(l1), true);
+  assert.equal(l1.value, 3);
+  assert.equal(l1.state, 'fresh');
+  assert.equal(l1._served_at, ESC_SERVED_AT);
+  assert.equal(l1._received_at, RECEIVED_AT);
+  assert.equal(l2.state, 'fresh');
+  assert.equal(l2.value, 0);
+});
+
+test('levelCount: a delivered summary that lacks the level is a hole, not a zero', () => {
+  const count = levelCount(seededEscalations({}, { 0: 4 }), 2);
+  assert.equal(count.state, 'unknown');
+  assert.equal(count.reason, 'no value in the payload');
+});
+
+test('levelCount: a payload with no ESCALATIONS or summary does not throw', () => {
+  for (const data of [{ __receipt: receipts() }, { ESCALATIONS: {}, __receipt: receipts() }, undefined]) {
+    let count;
+    assert.doesNotThrow(() => {
+      count = levelCount(data, 1);
+    });
+    assert.equal(count.state, 'unknown');
+  }
 });
