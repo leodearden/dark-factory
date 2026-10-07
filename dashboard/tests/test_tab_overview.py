@@ -392,3 +392,91 @@ class TestOverviewReadsTheMemoryReadings:
             r'<DatumReading\s+datum=\{\s*opsTotals\(\s*D\s*\)\s*\}\s+format=\{\s*opsCaption\s*\}',
             panel,
         ), f'the Activity timeline meta does not render opsCaption over opsTotals(D):\n{panel}'
+
+
+def _health_rows_const(code):
+    """The one const array holding the System health rows: (name, array text)."""
+    bound = []
+    for match in re.finditer(r'\bconst\s+(\w+)\s*=\s*\[', code):
+        array = walk_balanced(code, match.end() - 1, '[', ']')
+        if re.search(r"\bl:\s*'Graphiti'", array):
+            bound.append((match.group(1), array))
+    assert len(bound) == 1, f'expected the health rows bound to ONE const array, found {len(bound)}'
+    return bound[0]
+
+
+def _health_rows_map(panel, rows):
+    """The ``<rows>.map(<param> => ...)`` call in the System health panel: (param, call text)."""
+    match = re.search(rf'\b{rows}\.map\(\s*(\w+)\s*=>', panel)
+    assert match, f'the System health panel does not draw its rows with {rows}.map(...)'
+    return match.group(1), walk_balanced(panel, panel.index('(', match.start()), '(', ')')
+
+
+class TestSystemHealthIsDerived:
+    """Every System health row and the header are derived, never hardcoded (task 6309).
+
+    Before: the header read a literal 'all ok'; the Graphiti and Mem0 rows were
+    `ok: true` over counts get_status never serves; the Taskmaster row was the
+    literal 'mcp v0.18 · responsive'; the fused-memory row was green before
+    /memory had ever arrived. The decisions now live in system_health.js and are
+    executed in dashboard/tests/js/system_health.test.mjs; these pins cover only
+    the wiring.
+    """
+
+    _HELPERS = {'graphitiHealth', 'mem0Health', 'taskStoreHealth', 'fusedMemoryHealth', 'healthTone', 'healthSummary'}
+
+    def test_destructures_the_health_decisions_without_fallback(self, tab_overview_jsx_code):
+        destructure = re.search(
+            r'const\s*\{([^}]*)\}\s*=\s*window\.DF_SYSTEM_HEALTH\s*;', tab_overview_jsx_code,
+        )
+        assert destructure, 'tab_overview.jsx does not destructure window.DF_SYSTEM_HEALTH at module scope.'
+        assert not re.search(r'window\.DF_SYSTEM_HEALTH\s*(\|\||&&|\?\?)', tab_overview_jsx_code)
+        bound = set(re.findall(r'\w+', destructure.group(1)))
+        assert self._HELPERS <= bound, f'tab_overview.jsx reads {sorted(self._HELPERS - bound)} without binding them'
+
+    def test_the_header_summarises_exactly_the_rows_drawn(self, overview_code):
+        rows, _ = _health_rows_const(overview_code)
+        panel = _panel(overview_code, 'System health')
+        assert re.search(rf'<span className="meta">\s*\{{\s*healthSummary\(\s*{rows}\s*\)\s*\}}\s*</span>', panel), (
+            f'the System health header is not healthSummary({rows}):\n{panel}'
+        )
+        _health_rows_map(panel, rows)
+
+    def test_no_hardcoded_verdict_remains(self, overview_code):
+        assert not re.search(r'\ball ok\b', overview_code), "OverviewTab still hardcodes 'all ok'."
+        assert 'v0.18' not in overview_code, 'OverviewTab still hardcodes the Taskmaster version.'
+
+    @pytest.mark.parametrize(
+        'label, helper, retired',
+        [
+            ('Graphiti', 'graphitiHealth', 'node_count'),
+            ('Mem0', 'mem0Health', 'memory_count'),
+            ('Taskmaster', 'taskStoreHealth', 'mcp v'),
+            ('fused-memory', 'fusedMemoryHealth', None),
+        ],
+    )
+    def test_the_row_spreads_its_derived_health(self, overview_code, label, helper, retired):
+        _, rows_array = _health_rows_const(overview_code)
+        row = _health_row(rows_array, label)
+        assert re.search(rf'\.\.\.\s*{helper}\(\s*D\s*\)', row), f'the {label} row does not spread {helper}(D):\n{row}'
+        assert not re.search(r'\bok\s*:', row), f'the {label} row still sets its own `ok:`:\n{row}'
+        if retired:
+            assert retired not in row, f'the {label} row still reads {retired!r}:\n{row}'
+
+    def test_the_dot_and_badge_read_one_tone(self, overview_code):
+        rows, _ = _health_rows_const(overview_code)
+        panel = _panel(overview_code, 'System health')
+        param, call = _health_rows_map(panel, rows)
+        tone = rf'healthTone\(\s*{param}\s*\)'
+        assert re.search(rf'className=\{{`dot \$\{{{tone}\}}`\}}', call), f'the row dot is not healthTone({param}):\n{call}'
+        assert re.search(rf'className=\{{`badge \$\{{{tone}\}}`\}}>\{{{tone}\}}</span>', call), (
+            f'the row badge class and text are not healthTone({param}):\n{call}'
+        )
+        assert not re.search(r'\.ok\s*\?', panel), f'the System health panel still inlines a tone ternary:\n{panel}'
+
+    def test_the_row_renders_its_title(self, overview_code):
+        rows, _ = _health_rows_const(overview_code)
+        param, call = _health_rows_map(_panel(overview_code, 'System health'), rows)
+        assert re.search(rf'\btitle=\{{\s*{param}\.title\b', call), (
+            f'the health row never renders {param}.title, so a hole reason never reaches the operator:\n{call}'
+        )
