@@ -34,6 +34,7 @@ from _merge_lane_fakes import (
 )
 from _merge_queue_harness import drive_verify_and_advance
 from _orch_helpers import (
+    MERGE_GATE_BARRIER_TIMEOUT,
     MERGE_RESULT_TIMEOUT,
     VERIFY_CLI_PER_TEST_TIMEOUT,
     make_placeholder_future,
@@ -5889,6 +5890,48 @@ def _mock_verify_timeout():
         result.failure_report = lambda: '## Verify Timed Out\n\n(mock)'
         return result
     return _fake
+
+
+@pytest.mark.asyncio
+class TestLaneSceneClockIsLoadSafe:
+    async def test_a_verify_slower_than_the_default_fake_clock_slack_is_not_called_dead(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ):
+        """A lane merging through real git must not call a slow verify dead.
+
+        The lane's in-flight abort poll charges its no-progress budget on the
+        FakeClock, which grants a parked verify only ``budget / poll *
+        wait_cap`` of real time. Shrunk here to ten polls, a verify that
+        takes one real second must still finish once, not be requeued.
+        """
+        wt = await _make_branch_with_file(git_ops, 'slow-verify', 'sv.py', 'x = 1\n')
+        gate = asyncio.Event()
+        verifier = FakeVerifier(default=dataclasses.replace(passes(), release=gate))
+        queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        lane = make_lane(git_ops, queue, verifier=verifier)
+        lane.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 10 * lane.VERIFY_ABANDON_POLL_SECS
+
+        async with running_lane(lane) as run:
+            req = _make_request('slow-verify', 'slow-verify', wt, config)
+            await queue.put(req)
+            await wait_responsive(
+                verifier.await_entry(1),
+                timeout=MERGE_GATE_BARRIER_TIMEOUT, label='slow-verify: verify parked',
+            )
+            await asyncio.sleep(1.0)
+            gate.set()
+            outcome = await wait_responsive(
+                run.outcome(req), label='slow-verify: MergeOutcome',
+            )
+
+        assert outcome.status == 'done', (
+            f'a healthy verify was called dead and the request requeued; '
+            f'got {outcome.status!r}: {outcome.reason!r}'
+        )
+        assert verifier.entered_count == 1, (
+            f'a healthy verify must run once, not be called dead and re-run; '
+            f'it was entered {verifier.entered_count} times'
+        )
 
 
 @pytest.mark.asyncio
