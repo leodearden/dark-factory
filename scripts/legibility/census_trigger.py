@@ -1,10 +1,12 @@
 """scripts/legibility/census_trigger.py — periodic legibility census trigger
 evaluator + census-state reader.
 
-See plans/confusion-reduction-prd.md §6 (task ζ: fire logic + hard floor),
-§7.4 (per-project census config block), §7.5 (census state contract),
-§8.5 (boundary-test matrix — day-9-no-spike/day-7+130-landed/
-day-6+4-candidates-in-72h/day-4+spike -> no-fire/fire/fire/no-fire(floor)).
+See plans/confusion-reduction-prd.md §6 (task ζ: fire logic), §7.4
+(per-project census config block), §7.5 (census state contract) and §8.5
+(boundary-test matrix). The novelty-spike and floor contract lives in
+plans/census-incremental-prd.md §4.7, superseding §8.5's
+day-6+4-candidates-in-72h row: the spike is relative to a trailing baseline,
+and the floor is anchored on the session watermark.
 
 Evaluated at the end of each nightly trickle run (wired by PRD task ε) and
 via the standalone `evaluate` CLI subcommand below.
@@ -1387,6 +1389,9 @@ def _floor_anchor(
         if earliest_codebook_date is None:
             return None
         return FloorAnchor(FloorAnchorKind.EARLIEST_CODEBOOK_DATE, earliest_codebook_date)
+    watermark = _parse_date((state or {}).get("session_watermark"))
+    if watermark is not None:
+        return FloorAnchor(FloorAnchorKind.SESSION_WATERMARK, watermark)
     last_census_at = _parse_date((state or {}).get("last_census_at"))
     if last_census_at is None:
         return None
