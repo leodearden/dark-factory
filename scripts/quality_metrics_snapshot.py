@@ -14,11 +14,13 @@ stderr. The PRD holds the rationale for every choice made here.
 from __future__ import annotations
 
 import argparse
+import ast
 import dataclasses
 import json
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections import Counter
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -50,14 +52,293 @@ _COMMON_FIELDS = frozenset({
     'cognitive_total', 'cognitive_max', 'cognitive_max_function', 'functions',
 })
 _KIND_FIELDS: Mapping[str, frozenset[str]] = {
-    _SRC: frozenset({'module', 'package_init', 'function_local_imports', 'reexport_names'}),
+    _SRC: frozenset({
+        'module', 'package_init', 'function_local_imports', 'reexport_names',
+        'reach_back_imports', 'fan_out', 'fan_in_src', 'fan_in_tests',
+    }),
     _TESTS: frozenset(),
 }
 _INTEGER_FIELDS = frozenset({
     'lines', 'prose_lines', 'cognitive_total', 'cognitive_max', 'functions',
-    'function_local_imports',
+    'function_local_imports', 'reach_back_imports', 'fan_out', 'fan_in_src', 'fan_in_tests',
 })
 _IMPORT_GRAPH_KEYS = ('edges', 'reach_back', 'deferred', 'cycles')
+
+
+# ---------------------------------------------------------------------------
+# The import graph: pure functions over module names and parsed statements.
+
+
+@dataclasses.dataclass(frozen=True)
+class _ImportStatement:
+    node: ast.Import | ast.ImportFrom
+    line: int
+    runtime: bool  # False inside an `if TYPE_CHECKING:` body
+    deferred: bool  # inside a function body
+
+
+@dataclasses.dataclass(frozen=True)
+class _FileImports:
+    """One readable domain file's import statements; ``module`` is None for a tests file."""
+
+    module: str | None
+    is_package: bool
+    statements: tuple[_ImportStatement, ...]
+
+
+def _is_type_checking(test: ast.expr) -> bool:
+    return (isinstance(test, ast.Name) and test.id == 'TYPE_CHECKING') or (
+        isinstance(test, ast.Attribute) and test.attr == 'TYPE_CHECKING'
+    )
+
+
+def _nested_bodies(node: ast.stmt) -> Iterator[list[ast.stmt]]:
+    """The statement lists directly inside *node*, in source order."""
+    for _field, value in ast.iter_fields(node):
+        if not isinstance(value, list) or not value:
+            continue
+        if isinstance(value[0], ast.stmt):
+            yield value
+        elif isinstance(value[0], ast.ExceptHandler | ast.match_case):
+            for clause in value:
+                yield clause.body
+
+
+def _statements_in(
+    body: Sequence[ast.stmt], *, runtime: bool, deferred: bool
+) -> Iterator[_ImportStatement]:
+    for node in body:
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            yield _ImportStatement(node, node.lineno, runtime=runtime, deferred=deferred)
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            yield from _statements_in(node.body, runtime=runtime, deferred=True)
+        elif isinstance(node, ast.If) and _is_type_checking(node.test):
+            yield from _statements_in(node.body, runtime=False, deferred=deferred)
+            yield from _statements_in(node.orelse, runtime=runtime, deferred=deferred)
+        else:
+            for nested in _nested_bodies(node):
+                yield from _statements_in(nested, runtime=runtime, deferred=deferred)
+
+
+def _import_statements(tree: ast.Module) -> tuple[_ImportStatement, ...]:
+    """Every import statement in *tree*, in source order, with its context."""
+    return tuple(_statements_in(tree.body, runtime=True, deferred=False))
+
+
+def _from_base(importer: str, is_package: bool, level: int, module: str | None) -> str | None:
+    """The absolute module a relative import names; None above the top package."""
+    package = importer.split('.') if is_package else importer.split('.')[:-1]
+    keep = len(package) - (level - 1)
+    if keep <= 0:
+        return None
+    base = '.'.join(package[:keep])
+    return f'{base}.{module}' if module else base
+
+
+def _from_module(node: ast.ImportFrom, source: _FileImports) -> str | None:
+    """The absolute module *node* imports from; a tests file's relative imports never resolve."""
+    if node.level == 0:
+        return node.module
+    if source.module is None:
+        return None
+    return _from_base(source.module, source.is_package, node.level, node.module)
+
+
+def _from_targets(node: ast.ImportFrom, resolved: str | None, known: frozenset[str]) -> list[str]:
+    if resolved is None:
+        return []
+    found = []
+    for alias in node.names:
+        submodule = f'{resolved}.{alias.name}'
+        if alias.name != '*' and submodule in known:
+            found.append(submodule)
+        elif resolved in known:
+            found.append(resolved)
+    return found
+
+
+def _targets(
+    statement: _ImportStatement, source: _FileImports, known: frozenset[str]
+) -> tuple[str, ...]:
+    """The first-party src modules *statement* imports, its own module excluded."""
+    node = statement.node
+    if isinstance(node, ast.Import):
+        found = [alias.name for alias in node.names if alias.name in known]
+    else:
+        found = _from_targets(node, _from_module(node, source), known)
+    return tuple(dict.fromkeys(target for target in found if target != source.module))
+
+
+def _ancestor_packages(module: str, known: frozenset[str]) -> frozenset[str]:
+    parts = module.split('.')
+    prefixes = ('.'.join(parts[:count]) for count in range(1, len(parts)))
+    return frozenset(prefix for prefix in prefixes if prefix in known)
+
+
+def _reach_back(
+    statement: _ImportStatement, module: str, source: _FileImports, known: frozenset[str]
+) -> dict[str, Any] | None:
+    """A from-import of names (not submodules) out of an ancestor package, or None."""
+    node = statement.node
+    if not isinstance(node, ast.ImportFrom):
+        return None
+    resolved = _from_module(node, source)
+    if resolved is None or resolved not in _ancestor_packages(module, known):
+        return None
+    names = sorted({alias.name for alias in node.names if f'{resolved}.{alias.name}' not in known})
+    if not names:
+        return None
+    return {'from': module, 'to': resolved, 'names': names, 'line': statement.line}
+
+
+def _imported_names(statement: _ImportStatement, source: _FileImports) -> list[str]:
+    """The dotted names *statement* imports, as resolved as they can be."""
+    node = statement.node
+    if isinstance(node, ast.Import):
+        return [alias.name for alias in node.names]
+    resolved = _from_module(node, source)
+    if resolved is not None:
+        return [f'{resolved}.{alias.name}' for alias in node.names]
+    prefix = '.' * node.level + (f'{node.module}.' if node.module else '')
+    return [f'{prefix}{alias.name}' for alias in node.names]
+
+
+def _deferred_entry(
+    statement: _ImportStatement, module: str, source: _FileImports
+) -> dict[str, Any]:
+    return {
+        'from': module,
+        'line': statement.line,
+        'imports': sorted(_imported_names(statement, source)),
+    }
+
+
+def _postorder(successors: Mapping[str, Sequence[str]]) -> list[str]:
+    """Every node in DFS finishing order, iteratively: the real graph is deep."""
+    seen: set[str] = set()
+    order: list[str] = []
+    for start in sorted(successors):
+        if start in seen:
+            continue
+        seen.add(start)
+        work = [(start, iter(successors[start]))]
+        while work:
+            node, children = work[-1]
+            child = next((child for child in children if child not in seen), None)
+            if child is None:
+                work.pop()
+                order.append(node)
+            else:
+                seen.add(child)
+                work.append((child, iter(successors[child])))
+    return order
+
+
+def _reachable(adjacency: Mapping[str, Sequence[str]], start: str, excluded: set[str]) -> set[str]:
+    found = {start}
+    frontier = [start]
+    while frontier:
+        for neighbour in adjacency[frontier.pop()]:
+            if neighbour not in found and neighbour not in excluded:
+                found.add(neighbour)
+                frontier.append(neighbour)
+    return found
+
+
+def _cycles(edges: Iterable[tuple[str, str]]) -> tuple[tuple[str, ...], ...]:
+    """Strongly connected components of size > 1 (Kosaraju), each sorted, sorted."""
+    successors: dict[str, list[str]] = {}
+    predecessors: dict[str, list[str]] = {}
+    for source, target in sorted(set(edges)):
+        for node in (source, target):
+            successors.setdefault(node, [])
+            predecessors.setdefault(node, [])
+        successors[source].append(target)
+        predecessors[target].append(source)
+    assigned: set[str] = set()
+    components: list[tuple[str, ...]] = []
+    for node in reversed(_postorder(successors)):
+        if node in assigned:
+            continue
+        component = _reachable(predecessors, node, assigned)
+        assigned |= component
+        if len(component) > 1:
+            components.append(tuple(sorted(component)))
+    return tuple(sorted(components))
+
+
+def _module_edges(
+    module: str, source: _FileImports, known: frozenset[str], *, runtime_only: bool
+) -> set[tuple[str, str]]:
+    return {
+        (module, target)
+        for statement in source.statements
+        if not runtime_only or (statement.runtime and not statement.deferred)
+        for target in _targets(statement, source, known)
+    }
+
+
+@dataclasses.dataclass(frozen=True)
+class _ImportGraph:
+    edges: tuple[tuple[str, str], ...]
+    reach_back: tuple[Mapping[str, Any], ...]
+    deferred: tuple[Mapping[str, Any], ...]
+    cycles: tuple[tuple[str, ...], ...]
+    field_counts: Mapping[str, Mapping[str, int]]  # src record field -> module -> count
+
+    def file_fields(self, module: str) -> dict[str, int]:
+        """The graph fields of src *module*'s file record."""
+        return {field: counts.get(module, 0) for field, counts in self.field_counts.items()}
+
+    def to_json(self) -> dict[str, list[Any]]:
+        return {
+            'edges': [list(edge) for edge in self.edges],
+            'reach_back': [dict(entry) for entry in self.reach_back],
+            'deferred': [dict(entry) for entry in self.deferred],
+            'cycles': [list(cycle) for cycle in self.cycles],
+        }
+
+
+def _tests_importers(sources: Iterable[_FileImports], known: frozenset[str]) -> dict[str, int]:
+    """How many distinct tests files import each src module (absolute imports only)."""
+    importers: Counter[str] = Counter()
+    for source in sources:
+        if source.module is None:
+            importers.update(
+                {target for statement in source.statements for target in _targets(statement, source, known)}
+            )
+    return dict(importers)
+
+
+def _import_graph(sources: Sequence[_FileImports], known: frozenset[str]) -> _ImportGraph:
+    """The graph over src modules; tests files only count toward fan_in_tests."""
+    edges: set[tuple[str, str]] = set()
+    runtime_edges: set[tuple[str, str]] = set()
+    reach_back: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+    for source in sources:
+        module = source.module
+        if module is None:
+            continue
+        edges |= _module_edges(module, source, known, runtime_only=False)
+        runtime_edges |= _module_edges(module, source, known, runtime_only=True)
+        for statement in source.statements:
+            if (entry := _reach_back(statement, module, source, known)) is not None:
+                reach_back.append(entry)
+            if statement.deferred:
+                deferred.append(_deferred_entry(statement, module, source))
+    return _ImportGraph(
+        edges=tuple(sorted(edges)),
+        reach_back=tuple(sorted(reach_back, key=lambda e: (e['from'], e['line'], e['to']))),
+        deferred=tuple(sorted(deferred, key=lambda e: (e['from'], e['line']))),
+        cycles=_cycles(runtime_edges),
+        field_counts={
+            'reach_back_imports': Counter(entry['from'] for entry in reach_back),
+            'fan_out': Counter(source for source, _target in edges),
+            'fan_in_src': Counter(target for _source, target in edges),
+            'fan_in_tests': _tests_importers(sources, known),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -82,19 +363,32 @@ def _cognitive_max(per_function: Mapping[str, int]) -> tuple[int, str | None]:
     return top, min(name for name, score in per_function.items() if score == top)
 
 
-def _src_fields(domain_file: source_measures.DomainFile, tree: Any) -> dict[str, Any]:
+def _is_package_init(path: str) -> bool:
+    return path.endswith('/__init__.py')
+
+
+def _src_fields(domain_file: source_measures.DomainFile, tree: ast.Module) -> dict[str, Any]:
     return {
         'module': domain_file.import_name,
-        'package_init': domain_file.path.endswith('/__init__.py'),
+        'package_init': _is_package_init(domain_file.path),
         'function_local_imports': source_measures.function_local_imports_in_tree(tree),
         'reexport_names': sorted(source_measures.reexport_names_in_tree(tree)),
     }
 
 
+@dataclasses.dataclass(frozen=True)
+class _FileMeasure:
+    """One file's record before the graph fields, its function scores, and its imports."""
+
+    record: Mapping[str, Any]
+    per_function: Mapping[str, int]
+    imports: _FileImports
+
+
 def _measure_file(
     root: Path, member: str, domain_file: source_measures.DomainFile
-) -> tuple[dict[str, Any], Mapping[str, int]]:
-    """One file's record and its per-function scores, from one read and one parse."""
+) -> _FileMeasure:
+    """One file's measures, from one read and one parse."""
     path = domain_file.path
     source = source_measures.read_source(root, path)
     tree = source_measures.parse_source(source, path=path)
@@ -116,11 +410,35 @@ def _measure_file(
     }
     if domain_file.kind is source_measures.FileKind.SRC:
         record.update(_src_fields(domain_file, tree))
-    return record, per_function
+    imports = _FileImports(
+        module=domain_file.import_name,
+        is_package=_is_package_init(path),
+        statements=_import_statements(tree),
+    )
+    return _FileMeasure(record=record, per_function=per_function, imports=imports)
 
 
-def _empty_import_graph() -> dict[str, list[Any]]:
-    return {key: [] for key in _IMPORT_GRAPH_KEYS}
+def _file_records(
+    measured: Mapping[str, _FileMeasure], graph: _ImportGraph
+) -> dict[str, Mapping[str, Any]]:
+    """Every record in path order, a src record completed with its graph fields."""
+    return {
+        path: (
+            measure.record
+            if measure.imports.module is None
+            else {**measure.record, **graph.file_fields(measure.imports.module)}
+        )
+        for path, measure in sorted(measured.items())
+    }
+
+
+def _src_functions(measured: Mapping[str, _FileMeasure]) -> dict[str, int]:
+    return dict(sorted(
+        (f'{path}::{name}', score)
+        for path, measure in measured.items()
+        if measure.imports.module is not None
+        for name, score in measure.per_function.items()
+    ))
 
 
 def _require_unique_module_names(domain: Sequence[source_measures.DomainMember]) -> None:
@@ -148,26 +466,26 @@ def measure_domain(
     ``unreadable`` (its reason on stderr) and has no record.
     """
     _require_unique_module_names(domain)
-    files: dict[str, Mapping[str, Any]] = {}
-    functions: dict[str, int] = {}
+    known = frozenset(
+        domain_file.import_name
+        for member in domain
+        for domain_file in member.files
+        if domain_file.import_name is not None
+    )
+    measured: dict[str, _FileMeasure] = {}
     unreadable: list[str] = []
     for member in domain:
         for domain_file in member.files:
             try:
-                record, per_function = _measure_file(root, member.name, domain_file)
+                measured[domain_file.path] = _measure_file(root, member.name, domain_file)
             except source_measures.MetricsError as exc:
                 unreadable.append(domain_file.path)
                 print(f'unreadable: {domain_file.path}: {exc}', file=sys.stderr)
-                continue
-            files[domain_file.path] = record
-            if domain_file.kind is source_measures.FileKind.SRC:
-                functions.update(
-                    (f'{domain_file.path}::{name}', score) for name, score in per_function.items()
-                )
+    graph = _import_graph([measure.imports for measure in measured.values()], known)
     return Measurement(
-        files=dict(sorted(files.items())),
-        functions=dict(sorted(functions.items())),
-        import_graph=_empty_import_graph(),
+        files=_file_records(measured, graph),
+        functions=_src_functions(measured),
+        import_graph=graph.to_json(),
         unreadable=tuple(sorted(unreadable)),
     )
 
