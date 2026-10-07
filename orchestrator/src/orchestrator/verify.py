@@ -9060,15 +9060,18 @@ async def run_main_tip_sweep(
     before.
 
     Retry-on-flake: when the first ``run_full_verification`` call fails (and its
-    category is NOT one of the infra sentinels above, and the pre-filter did not
-    short-circuit), the function re-runs it ONCE in the same pinned worktree
-    (idempotent; no second ``git worktree add``).  **The retry reuses first-pass
-    worktree state by design** — no cleanup of temp files, partially-written
-    DBs, or caches is performed before the re-run.  This is intentional: the
+    category is NOT one of the infra sentinels above, NOT ``INFRA_TIMEOUT``, and
+    the pre-filter did not short-circuit), the function re-runs it ONCE in the
+    same pinned worktree (idempotent; no second ``git worktree add``).  **The
+    retry reuses first-pass worktree state by design** — no cleanup of temp
+    files, partially-written DBs, or caches is performed before the re-run.  This is intentional: the
     purpose is a fast flake-vs-drift heuristic, not a hermetic isolation
     guarantee.  A first run that fails partway may leave residue that makes the
     retry non-representative in either direction; the single-retry bound and the
-    two-failure-escalates rule limit the blast radius.
+    two-failure-escalates rule limit the blast radius.  Host CPU is the
+    throughput bottleneck (task 5812), so both passes run with
+    ``max_retries=0`` and an ``INFRA_TIMEOUT`` first pass is returned as-is,
+    never retried in full: the harness adjudicates it like any failing sweep.
 
     - Retry PASSES → emit a WARNING, append a record to
       ``verify._suppressed_flake_records`` (durable in-process audit trail), and
@@ -9146,7 +9149,10 @@ async def run_main_tip_sweep(
             # role='background' (lowest nice tier — task 2391/PRD T3): the sweep is a
             # background asyncio.Task with no dispatch/merge/deploy path awaiting it, so
             # its fan-out should never contend with real task/merge lane verifies.
-            result = await run_full_verification(tmp_path, config, role='background')  # type: ignore[arg-type]
+            # max_retries=0 (task 5812): no pure-timeout re-runs on either pass.
+            result = await run_full_verification(  # type: ignore[arg-type]
+                tmp_path, config, role='background', max_retries=0,
+            )
 
             # pytest INTERNALERROR means the test infrastructure itself crashed (e.g. an
             # xdist worker was killed by os._exit).  env_transient means a concurrent
@@ -9175,6 +9181,15 @@ async def run_main_tip_sweep(
                 return None
 
             if not result.passed:
+                _sha_prefix = main_sha[:12] if main_sha else '?'
+                if result.category == FailureCategory.INFRA_TIMEOUT:
+                    logger.warning(
+                        'run_main_tip_sweep: first-pass sweep timed out at %s '
+                        '(cause_hint=%r) — returning the timeout verdict '
+                        'without a full-suite retry (task 5812)',
+                        _sha_prefix, result.cause_hint,
+                    )
+                    return (main_sha, result)
                 # First pass failed (not an INTERNALERROR).  Re-run once in the same
                 # pinned worktree to distinguish a transient load-sensitive flake from
                 # deterministic drift.  A second worktree add is NOT needed — the
@@ -9182,7 +9197,6 @@ async def run_main_tip_sweep(
                 # NOTE: worktree state (temp files, partially-written DBs, caches) from
                 # the first run is NOT reset before the retry — this is intentional (fast
                 # heuristic, not hermetic isolation; see docstring for tradeoff discussion).
-                _sha_prefix = main_sha[:12] if main_sha else '?'
                 logger.warning(
                     'run_main_tip_sweep: first-pass verification failed at %s '
                     '(category=%r, cause_hint=%r) — retrying once in the same '
@@ -9231,7 +9245,9 @@ async def run_main_tip_sweep(
                     )
                     return (main_sha, result)
 
-                retry = await run_full_verification(tmp_path, config, role='background')  # type: ignore[arg-type]
+                retry = await run_full_verification(  # type: ignore[arg-type]
+                    tmp_path, config, role='background', max_retries=0,
+                )
 
                 if retry.category in INFRA_TRANSIENT_CATEGORIES:
                     logger.warning(
