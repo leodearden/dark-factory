@@ -544,6 +544,88 @@ class TestNeutralCwdExemption:
         assert not is_violation(sites[0]), f'got {sites[0]!r}'
         assert sites[0].exemption == EXEMPT_STRICT_MCP, f'got {sites[0]!r}'
 
+
+class TestRegistryFilterSites:
+    """An ``available_tools`` call emits ``--tools <list>``, a registry filter
+    that never filters MCP, exactly like the ``--tools ''`` of the wildcard
+    substitution. So it is a site whether or not a schema rides along.
+    """
+
+    def test_a_registry_filter_without_mcp_scoping_is_one_violation(self) -> None:
+        sites = _scan('''
+            def call_the_model(root):
+                return invoke_with_cap_retry(
+                    available_tools=['Read'],
+                    output_schema=S,
+                    cwd=root,
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert sites[0].exemption == NOT_EXEMPT, f'got {sites[0]!r}'
+        assert is_violation(sites[0]), f'got {sites[0]!r}'
+
+    def test_a_registry_passed_by_name_is_a_site(self) -> None:
+        """Real callers pass it by name; only a literal ``None`` is not a site."""
+        sites = _scan('''
+            def call_the_model(root, names):
+                return invoke_with_cap_retry(
+                    available_tools=names,
+                    output_schema=S,
+                    cwd=root,
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert is_violation(sites[0]), f'got {sites[0]!r}'
+
+    def test_a_registry_filter_needs_no_schema_to_be_a_site(self) -> None:
+        sites = _scan('''
+            def call_the_model(root):
+                return invoke_with_cap_retry(
+                    available_tools=['Read'],
+                    cwd=root,
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert is_violation(sites[0]), f'got {sites[0]!r}'
+
+    def test_strict_mcp_scoping_makes_a_registry_filter_compliant(self) -> None:
+        sites = _scan('''
+            def call_the_model(root):
+                return invoke_with_cap_retry(
+                    available_tools=['Read'],
+                    output_schema=S,
+                    mcp_config=no_mcp_servers_config(),
+                    strict_mcp_config=True,
+                    cwd=root,
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert sites[0].exemption == EXEMPT_STRICT_MCP, f'got {sites[0]!r}'
+        assert not is_violation(sites[0]), f'got {sites[0]!r}'
+
+    def test_a_literal_none_registry_is_not_a_site(self) -> None:
+        assert _scan('''
+            def call_the_model(root):
+                return invoke_with_cap_retry(
+                    available_tools=None,
+                    output_schema=S,
+                    cwd=root,
+                )
+        ''') == []
+
+    def test_the_other_target_name_is_matched(self) -> None:
+        sites = _scan('''
+            def call_the_model(root):
+                return invoke_claude_agent(
+                    available_tools=['Read'],
+                    cwd=root,
+                )
+        ''')
+        assert len(sites) == 1, f'got {sites!r}'
+        assert sites[0].callee == 'invoke_claude_agent', f'got {sites[0]!r}'
+        assert is_violation(sites[0]), f'got {sites[0]!r}'
+
+
 # --------------------------------------------------------------------------- #
 # The whole-tree gate
 # --------------------------------------------------------------------------- #
