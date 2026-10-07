@@ -74,7 +74,9 @@ from shared.testing_timeout_markers import (
     SiteKind,
     TimeoutSite,
     inverts,
+    scan_python_tree,
     timeout_marker_sites,
+    verify_cli_timeout,
 )
 
 # This module is ITSELF a whole-tree AST scanner -- it rglob()s every *.py
@@ -139,13 +141,6 @@ _DEEP_LANDING_MARKER_SITES = 9
 #: the verdict's blind-seam branch and fail by construction.
 _SPAWN_BUDGET_FIXTURE = '_within_spawn_budget'
 
-#: Same spelling as tests/scripts/test_fallback_verify_config.py, which pins
-#: the FLEET-chain side of this same budget (``--timeout > 60`` on every
-#: pytest segment of dark-factory-orchestrator.yaml, and ``--timeout >= 300``
-#: on every per-module orchestrator.yaml).  Both the ``--timeout=300`` and
-#: ``--timeout 300`` spellings are accepted, exactly as it does.
-_TIMEOUT_FLAG_RE = re.compile(r'--timeout[=\s](\d+)')
-
 #: Names a ``pytest.mark.timeout(...)`` argument may resolve to, and the
 #: seconds each one carries.  A literal MAP rather than an import, because none
 #: of the three is importable from ``_orch_helpers``: two are defined
@@ -182,14 +177,12 @@ _SANCTIONED_TIMEOUT_NAMES: dict[str, float] = {
     'DEEP_LANDING_SCENE_TEST_TIMEOUT': float(DEEP_LANDING_SCENE_TEST_TIMEOUT),
 }
 
+
 def _parse(source: str) -> ast.Module | None:
     """*source* as a tree, or None when it does not parse.
 
-    FAIL-SOFT by design: :func:`_tree_scan` reads every ``*.py`` under this
-    directory, deliberately-malformed fixtures included, and a parse failure
-    must not turn a TIMEOUT-COVERAGE guard red for a reason unrelated to
-    timeout coverage -- the very class of misattributed failure this module
-    exists to prevent.
+    Every caller asserts on None, so a module a pin reads that stops parsing
+    fails BY NAME rather than as a bare ``SyntaxError`` from inside a helper.
     """
     try:
         return ast.parse(source)
@@ -575,8 +568,8 @@ class TestVerifyCliBudgetConstant:
         """
         test_command = yaml.safe_load(_ORCH_YAML.read_text(encoding='utf-8'))['test_command']
 
-        match = _TIMEOUT_FLAG_RE.search(test_command)
-        assert match, (
+        configured = verify_cli_timeout(test_command)
+        assert configured is not None, (
             f'{_ORCH_YAML} test_command carries no --timeout override '
             f'(got: {test_command!r}). VERIFY_CLI_PER_TEST_TIMEOUT models that '
             'flag, so without it the constant models nothing -- and every test '
@@ -585,7 +578,6 @@ class TestVerifyCliBudgetConstant:
             'tests/scripts/test_fallback_verify_config.py::'
             'test_per_module_merge_verify_raises_per_test_timeout.'
         )
-        configured = int(match.group(1))
         assert configured == VERIFY_CLI_PER_TEST_TIMEOUT, (
             f'VERIFY_CLI_PER_TEST_TIMEOUT ({VERIFY_CLI_PER_TEST_TIMEOUT}) no '
             f'longer mirrors --timeout={configured} in {_ORCH_YAML}. Update the '
@@ -2037,37 +2029,26 @@ def _tree_scan() -> _TreeScan:
     Under xdist the tests may land on different workers, so the win is partial;
     it is never negative.
 
-    Parsing dominates, which is why each file is parsed once here and the tree
-    handed to BOTH extractors, rather than each extractor re-reading the file.
-
-    Fail-soft on the READ for the same reason :func:`_parse` fails soft on the
-    PARSE: a non-UTF-8 source, a deliberately-malformed encoding fixture or a
-    broken symlink under this directory would otherwise raise straight out of a
-    TIMEOUT-COVERAGE check. Skipped files are surfaced to the caller, so a
-    sweep that silently stops reading anything cannot hide here.
+    Parsing dominates, which is why each file is parsed once and its tree
+    handed to BOTH extractors in one ``scan_python_tree`` callback, rather than
+    each extractor paying for its own pass.  The read and parse are fail-soft
+    there, with skipped files surfaced, so a sweep that silently stops reading
+    cannot hide.
     """
-    sites: list[tuple[str, TimeoutSite]] = []
-    bindings: list[_Binding] = []
-    unreadable: list[str] = []
-    examined = 0
 
-    for py_file in sorted(_TESTS_DIR.rglob('*.py')):
-        module = py_file.relative_to(_TESTS_DIR).as_posix()
-        try:
-            source = py_file.read_text(encoding='utf-8')
-        except (UnicodeDecodeError, OSError):
-            unreadable.append(module)
-            continue
-        examined += 1
-        tree = _parse(source)
-        if tree is None:
-            continue
-        sites.extend(
-            (module, site) for site in timeout_marker_sites(tree, _SANCTIONED_TIMEOUT_NAMES)
+    def per_module(module: str, tree: ast.Module):
+        yield (
+            tuple((module, site) for site in timeout_marker_sites(tree, _SANCTIONED_TIMEOUT_NAMES)),
+            tuple(_sanctioned_bindings_in(tree, module)),
         )
-        bindings.extend(_sanctioned_bindings_in(tree, module))
 
-    return _TreeScan(tuple(sites), tuple(bindings), examined, tuple(unreadable))
+    scan = scan_python_tree(_TESTS_DIR, per_module)
+    return _TreeScan(
+        sites=tuple(pair for sites, _ in scan.items for pair in sites),
+        bindings=tuple(binding for _, bindings in scan.items for binding in bindings),
+        examined=scan.examined,
+        unreadable=scan.unreadable,
+    )
 
 
 def _in_band_sites() -> tuple[tuple[str, TimeoutSite], ...]:

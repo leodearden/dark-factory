@@ -7,9 +7,12 @@ registered as such in ``shared/tests/test_pure_stdlib_leaves.py``.
 from __future__ import annotations
 
 import ast
-from collections.abc import Mapping
+import re
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from enum import StrEnum
-from typing import NamedTuple
+from pathlib import Path
+from typing import Generic, NamedTuple, TypeVar
 
 from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
 
@@ -17,9 +20,14 @@ __all__ = [
     'DELIBERATE_TIGHT_BOUND_CEILING',
     'SiteKind',
     'TimeoutSite',
+    'TreeScan',
     'inverts',
+    'scan_python_tree',
     'timeout_marker_sites',
+    'verify_cli_timeout',
 ]
+
+T = TypeVar('T')
 
 #: The band's LOWER edge: the largest N that still reads as a DELIBERATE tight
 #: bound rather than a slow test's opt-out.
@@ -36,6 +44,8 @@ DELIBERATE_TIGHT_BOUND_CEILING = 60
 
 _MODULE_QUALNAME = '<module>'
 _PYTESTMARK_QUALNAME = '<pytestmark>'
+
+_TIMEOUT_FLAG = re.compile(r'--timeout[=\s](\d+)')
 
 
 class SiteKind(StrEnum):
@@ -187,3 +197,64 @@ def inverts(seconds: float | None, *, verify_cli_budget: int) -> bool:
             'marker could ever invert and every sweep would pass vacuously.'
         )
     return seconds is not None and DELIBERATE_TIGHT_BOUND_CEILING < seconds < verify_cli_budget
+
+
+def verify_cli_timeout(test_command: str) -> int | None:
+    """The per-test ``--timeout`` *test_command* passes pytest, else None.
+
+    Reads both ``--timeout=300`` and ``--timeout 300``, the spelling
+    ``tests/scripts/test_fallback_verify_config.py`` pins on the fleet chain.
+    In a chained command the FIRST flag wins.
+    """
+    match = _TIMEOUT_FLAG.search(test_command)
+    return None if match is None else int(match.group(1))
+
+
+@dataclass(frozen=True)
+class TreeScan(Generic[T]):
+    """One pass over a tree's ``*.py`` files, with the counters that prove it read them.
+
+    ``items`` is everything the extract callback yielded, in sorted-path order.
+    ``examined`` counts the files that decoded, parseable or not.
+    ``unreadable`` names, relative to the root, the files that did not, so a
+    sweep that silently stops reading cannot pass as a clean tree.  Frozen,
+    because callers memoise one scan and share it.
+    """
+
+    items: tuple[T, ...]
+    examined: int
+    unreadable: tuple[str, ...]
+
+
+def scan_python_tree(
+    root: Path, extract: Callable[[str, ast.Module], Iterable[T]]
+) -> TreeScan[T]:
+    """Read and parse every ``*.py`` under *root* once, handing each tree to *extract*.
+
+    *extract* receives the module's POSIX path relative to *root* (never its
+    basename, which nested modules share) and its parsed tree; one callback can
+    therefore feed several extractions from a single parse.  No tree outlives
+    its callback.
+
+    FAIL-SOFT: a file that does not decode as UTF-8 or cannot be read is
+    ``unreadable``; one that does not parse is examined but never extracted.  A
+    test tree holds deliberately malformed fixtures, and they must not turn a
+    census red for a reason unrelated to what it counts.
+    """
+    items: list[T] = []
+    unreadable: list[str] = []
+    examined = 0
+    for py_file in sorted(root.rglob('*.py')):
+        module = py_file.relative_to(root).as_posix()
+        try:
+            source = py_file.read_text(encoding='utf-8')
+        except (UnicodeDecodeError, OSError):
+            unreadable.append(module)
+            continue
+        examined += 1
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError):
+            continue
+        items.extend(extract(module, tree))
+    return TreeScan(tuple(items), examined, tuple(unreadable))
