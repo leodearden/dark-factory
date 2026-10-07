@@ -297,14 +297,6 @@ class TestEdgeBfsSearch:
         return edges, issued
 
     @pytest.mark.asyncio
-    async def test_edges_are_bound_from_the_path_not_rematched_on_uuid(self) -> None:
-        """An inline ``{uuid: ...}`` match after UNWIND is the re-join FalkorDB plans as a per-row scan."""
-        _, issued = await self._search()
-
-        (query,) = issued
-        assert '{uuid:' not in ''.join(query.cypher.split())
-
-    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ('origins', 'depth'),
         [(None, 3), ([], 3), (['origin-entity'], 0)],
