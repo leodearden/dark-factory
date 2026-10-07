@@ -2188,7 +2188,8 @@ would have shown it.
 is tracked separately from landing it. The adjacent precedent:
 `legibility-transcript-check@.{service,timer}` and its installer shipped under
 task 2901 ("wire the transcript-persistence detector to run periodically"),
-that task is `done`, and the timer is **still** not installed on this host.
+and that task went `done` while the timer stayed uninstalled on this host
+until deterministic deploy tasks 5855/5856 installed it on 2026-09-24.
 Once the timer below is installed for a project, the "nothing runs the
 probes" claim becomes historical **for that project only** — a second project
 without the timer is back to the pre-4514 state.
@@ -2226,6 +2227,15 @@ checkout without `check_trickle_health.py` goes `Result=failed` nightly):
 ```bash
 scripts/legibility/install-trickle-health-timer.sh <project_id>
 ```
+
+An agent session cannot run the installer: `~/.config/systemd/user/` is
+outside the sandbox write-set
+(`orchestrator/src/orchestrator/agents/write_set.py::compute_write_set`), so
+each project's deploy is a `task_kind='deterministic'` `before_done` task.
+dark_factory's is task 6205; reify's is task 6312. A project's deploy is
+done when `systemctl --user list-timers --all` lists
+`legibility-trickle-health@<project_id>.timer`, not when the installer lands
+on main.
 
 **Reading the verdict.** Each door has its own remedy, and conflating them
 is how an operator ends up tuning the sampler for a crashed coder:
