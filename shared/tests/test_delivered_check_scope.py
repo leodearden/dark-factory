@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 import pytest
 
+from shared.delivered_check_polarity import lint_delivered_checks, polarity_error
 from shared.delivered_check_scope import (
     STALE_PATH_CODES,
     SYS_MODULES_SHIM_PATTERN,
@@ -307,3 +308,204 @@ class TestStaleScopePolicy:
             PathState.SYS_MODULES_SHIM: 'shim_path',
             PathState.REMOVED: 'removed_path',
         }
+
+
+@pytest.fixture
+def stale_repo(tmp_path) -> tuple[Path, str]:
+    """main carries a shim, a live module, and a module a later commit deleted.
+    Returns the repo and the deleting commit's short sha."""
+    repo = _init_git_repo(
+        tmp_path / 'repo',
+        {
+            'src/new_mod.py': 'def real():\n    return 1\n',
+            'src/old_mod.py': _SHIM_BODY,
+            'src/gone.py': 'def legacy():\n    return 0\n',
+        },
+    )
+    sha = _commit(repo, 'retire the gone module', delete=('src/gone.py',))
+    return repo, _short(repo, sha)
+
+
+def _check(**fields: object) -> dict[str, object]:
+    check: dict[str, object] = {
+        'name': 'cap',
+        'kind': 'grep',
+        'pattern': 'brand_new_symbol',
+        'expect': 'present',
+    }
+    check.update(fields)
+    return check
+
+
+def _codes(findings) -> list[tuple[str, str]]:
+    return [(f.check_name, f.code) for f in findings]
+
+
+#: Argv elements only the scope axis's git probes carry: the shim probe's
+#: pattern and the mainline deletion walk's ``--first-parent``.
+_SCOPE_PROBE_MARKERS = (SYS_MODULES_SHIM_PATTERN, '--first-parent')
+
+
+class TestLintFlagsStaleScope:
+    def test_grep_scoped_to_a_shim_is_rejected_as_shim_path(self, stale_repo):
+        repo, _ = stale_repo
+
+        findings = lint_delivered_checks(
+            [_check(paths=['src/old_mod.py'])], files=[], repo_root=repo
+        )
+
+        assert len(findings) == 1
+        finding = findings[0]
+        assert (finding.severity, finding.code, finding.detail) == (
+            'reject',
+            'shim_path',
+            ('src/old_mod.py',),
+        )
+        assert 'src/old_mod.py' in finding.message
+        assert 'sys.modules' in finding.message
+        assert 'alias' in finding.message.lower()
+        assert 'repath' in finding.message.lower()
+
+    def test_grep_scoped_to_a_removed_file_names_the_removing_commit(self, stale_repo):
+        repo, short_sha = stale_repo
+
+        findings = lint_delivered_checks(
+            [_check(paths=['src/gone.py'])], files=[], repo_root=repo
+        )
+
+        assert [(f.severity, f.code, f.detail) for f in findings] == [
+            ('reject', 'removed_path', ('src/gone.py',)),
+        ]
+        assert short_sha in findings[0].message
+        assert 'repath' in findings[0].message.lower()
+
+    def test_path_check_naming_a_removed_file_is_rejected(self, stale_repo):
+        repo, _ = stale_repo
+
+        findings = lint_delivered_checks(
+            [_check(kind='path', pattern=None, paths=['src/gone.py'])],
+            files=[],
+            repo_root=repo,
+        )
+
+        assert [(f.severity, f.code) for f in findings] == [('reject', 'removed_path')]
+
+    def test_forward_looking_paths_get_no_finding(self, stale_repo):
+        """A missing path is the normal pre-delivery state."""
+        repo, _ = stale_repo
+
+        findings = lint_delivered_checks(
+            [
+                _check(name='grep-new', paths=['src/never_created.py']),
+                _check(
+                    name='path-new', kind='path', pattern=None, paths=['src/never_created.py']
+                ),
+            ],
+            files=[],
+            repo_root=repo,
+        )
+
+        assert findings == []
+
+    @pytest.mark.parametrize('scope', ['src/old_mod.py', 'src/gone.py'])
+    def test_absent_checks_are_left_to_the_polarity_axis(self, stale_repo, scope):
+        repo, _ = stale_repo
+
+        findings = lint_delivered_checks(
+            [_check(expect='absent', pattern='def ', paths=[scope])],
+            files=[],
+            repo_root=repo,
+        )
+
+        assert not {'shim_path', 'removed_path'} & {f.code for f in findings}
+
+    def test_a_vacuous_shim_scoped_check_carries_both_axes(self, stale_repo):
+        repo, _ = stale_repo
+
+        findings = lint_delivered_checks(
+            [_check(pattern='sys.modules', paths=['src/old_mod.py'])],
+            files=[],
+            repo_root=repo,
+        )
+
+        assert sorted(_codes(findings)) == [('cap', 'shim_path'), ('cap', 'vacuous_present')]
+
+    def test_non_repo_root_reports_only_unevaluable(self, tmp_path):
+        not_a_repo = tmp_path / 'plain'
+        not_a_repo.mkdir()
+
+        findings = lint_delivered_checks(
+            [_check(paths=['src/old_mod.py'])], files=[], repo_root=not_a_repo
+        )
+
+        assert [(f.severity, f.code) for f in findings] == [('errored', 'unevaluable')]
+
+    def test_unlinted_checks_cost_no_git_call(self, stale_repo):
+        repo, _ = stale_repo
+
+        with patch(
+            'shared.delivered_check_scope.subprocess.run',
+            side_effect=AssertionError('the scope axis must not shell out here'),
+        ):
+            findings = lint_delivered_checks(
+                [
+                    {'name': 'cap', 'kind': 'script', 'script': 'scripts/x.sh'},
+                    _check(name=None, paths=['src/old_mod.py']),
+                    _check(name='', kind='path', pattern=None, paths=['src/gone.py']),
+                ],
+                files=[],
+                repo_root=repo,
+            )
+
+        assert findings == []
+
+    def test_pathless_and_absent_checks_run_no_scope_probe(self, stale_repo):
+        """The polarity axis still evaluates these; the scope axis must not."""
+        repo, _ = stale_repo
+        real_run = subprocess.run
+        argvs: list[list[str]] = []
+
+        def recording_run(argv, *args, **kwargs):
+            argvs.append(list(argv))
+            return real_run(argv, *args, **kwargs)
+
+        with patch('shared.delivered_check_scope.subprocess.run', side_effect=recording_run):
+            lint_delivered_checks(
+                [
+                    _check(name='pathless', paths=[]),
+                    _check(
+                        name='absent',
+                        expect='absent',
+                        pattern='def ',
+                        paths=['src/new_mod.py', 'src/never_created.py'],
+                    ),
+                ],
+                files=[],
+                repo_root=repo,
+            )
+
+        assert argvs, 'the polarity axis should still have evaluated the checks'
+        assert [
+            argv for argv in argvs if any(m in argv for m in _SCOPE_PROBE_MARKERS)
+        ] == []
+
+    def test_runtime_diagnosis_call_shape_without_files_still_flags(self, stale_repo):
+        repo, _ = stale_repo
+
+        findings = lint_delivered_checks(
+            [_check(paths=['src/old_mod.py'])], files=None, repo_root=repo
+        )
+
+        assert _codes(findings) == [('cap', 'shim_path')]
+
+    def test_polarity_error_lists_the_stale_check_and_hints_at_repathing(self, stale_repo):
+        repo, _ = stale_repo
+        findings = lint_delivered_checks(
+            [_check(paths=['src/old_mod.py'])], files=[], repo_root=repo
+        )
+
+        payload = polarity_error(findings, task_id='42')
+
+        assert [(c['name'], c['code']) for c in payload['checks']] == [('cap', 'shim_path')]
+        assert 'sys.modules' in payload['hint']
+        assert 'repath' in payload['hint'].lower()
