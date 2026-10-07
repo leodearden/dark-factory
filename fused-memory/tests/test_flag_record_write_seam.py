@@ -8,6 +8,7 @@ mirror written by ``flag_dedup.write_suppression_record`` must keep landing.
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -51,12 +52,12 @@ def service(mock_config):
     return svc
 
 
-def _persisted_add_metadata(svc: MemoryService) -> dict:
+def _persisted_add_metadata(svc: Any) -> dict:
     svc.mem0.add.assert_awaited_once()
     return svc.mem0.add.await_args.kwargs['metadata']
 
 
-def _persisted_system_record_metadata(svc: MemoryService) -> dict:
+def _persisted_system_record_metadata(svc: Any) -> dict:
     svc.mem0.add_system_record.assert_awaited_once()
     return svc.mem0.add_system_record.await_args.kwargs['metadata']
 
