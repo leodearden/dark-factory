@@ -392,12 +392,13 @@ class TestAllProjectsDeadlineWarning:
         handler = _PerPortHandler(
             {8100: TaskRuntimeSnapshot().model_dump(mode='json')},
             slow_ports={8105: 0.5},
+            stall_ports={8100: _HOST_STALL_SECONDS},
         )
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             with caplog.at_level('WARNING'):
                 result = await fetch_task_runtime(
-                    client, _urls(8100, 8105), per_call_timeout=0.05,
+                    client, _urls(8100, 8105), per_call_timeout=_PROBE_DEADLINE_SECONDS,
                 )
 
         assert self._aggregate_records(caplog) == []
@@ -408,12 +409,16 @@ class TestAllProjectsDeadlineWarning:
         """Every project failing but for DIFFERENT reasons is not the
         starvation signature — one of them really is unreachable."""
         from dashboard.data.task_runtime import fetch_task_runtime
-        handler = _PerPortHandler(slow_ports={8105: 0.5}, fail_ports={8102})
+        handler = _PerPortHandler(
+            slow_ports={8105: 0.5},
+            fail_ports={8102},
+            stall_ports={8102: _HOST_STALL_SECONDS},
+        )
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             with caplog.at_level('WARNING'):
                 result = await fetch_task_runtime(
-                    client, _urls(8102, 8105), per_call_timeout=0.05,
+                    client, _urls(8102, 8105), per_call_timeout=_PROBE_DEADLINE_SECONDS,
                 )
 
         assert self._aggregate_records(caplog) == []
