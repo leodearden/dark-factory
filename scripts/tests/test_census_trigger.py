@@ -1578,6 +1578,31 @@ def test_decide_for_project_null_or_absent_watermark_falls_back_to_last_census_a
     assert "floor: 12.0d since last_census_at (no watermark yet) (floor 5d)" in decision.reasons
 
 
+@pytest.mark.parametrize(
+    "state",
+    [
+        {},
+        {"last_census_report": "plans/confusion-census-prior.md"},
+        {"last_census_at": None, "session_watermark": None},
+    ],
+    ids=["empty", "report-only", "null-timestamps"],
+)
+def test_decide_for_project_ok_state_without_timestamps_blocks_on_no_anchor(tmp_path, state):
+    _write_spike_codebook(tmp_path)
+    _write_census_state(tmp_path, **state)
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert any(
+        r.startswith("novelty-spike:") and r.endswith("-> FIRE") for r in decision.reasons
+    )
+    assert decision.fire is False
+    assert (
+        "floor: no anchor (no session watermark, last_census_at or codebook date)"
+        " -> BLOCKS all conditions" in decision.reasons
+    )
+
+
 def test_decide_for_project_row2_day9_no_spike_low_delta_no_fire(tmp_path):
     _write_codebook(tmp_path)
     _write_census_state(
