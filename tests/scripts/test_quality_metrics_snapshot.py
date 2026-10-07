@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Iterable
@@ -305,6 +306,189 @@ class TestTheCommandLine:
         with pytest.raises(SystemExit) as raised:
             snapshot.main(argv)
         assert raised.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# Refusals: exit 2, the cause named on stderr, nothing written.
+
+
+def _refused(root: Path, capsys: pytest.CaptureFixture[str], *extra: str) -> str:
+    """Run against *root*, assert the refusal wrote nothing, and return stderr."""
+    out = root.parent / 'never' / 'snapshot.json'
+    assert _run(root, out, *extra) == 2
+    assert not out.parent.exists()
+    return capsys.readouterr().err
+
+
+_FAKE_GIT = '''#!{python}
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+real = os.environ['REAL_GIT']
+marker = Path(os.environ['SHIM_MARKER'])
+if 'status' in sys.argv[1:] and not marker.exists():
+    subprocess.run(
+        [real, '-C', os.environ['SHIM_ROOT'], '-c', 'user.name=f', '-c', 'user.email=f@e.invalid',
+         'commit', '--allow-empty', '--no-verify', '-q', '-m', 'moved'],
+        check=True,
+    )
+    marker.write_text('moved', encoding='utf-8')
+completed = subprocess.run([real, *sys.argv[1:]], capture_output=True)
+sys.stdout.buffer.write(completed.stdout)
+sys.stderr.buffer.write(completed.stderr)
+sys.exit(completed.returncode)
+'''
+
+
+class TestADirtyDomainIsRefused:
+    def test_a_modified_member_file(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        root = _repo(tmp_path, _BASE)
+        _write(root, {'alpha/src/alpha/mod.py': 'CHANGED = 1\n'})
+        assert 'alpha/src/alpha/mod.py' in _refused(root, capsys)
+
+    def test_a_staged_deletion(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        root = _repo(tmp_path, _BASE)
+        git(root, 'rm', '-q', 'beta/src/beta/b.py')
+        assert 'beta/src/beta/b.py' in _refused(root, capsys)
+
+    def test_untracked_files_and_files_outside_the_domain_are_not_dirt(
+        self, tmp_path: Path
+    ) -> None:
+        root = _repo(tmp_path, _BASE)
+        _write(root, {'alpha/src/alpha/untracked.py': 'U = 1\n', 'hooks/h.py': 'H = 2\n'})
+        out = tmp_path / 'out' / 'snapshot.json'
+        assert _run(root, out) == 0
+        assert out.is_file()
+
+
+class TestAMovedHeadIsRefused:
+    def test_a_commit_landing_during_the_measurement(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # A merge landing mid-run, simulated by a git that commits on its first
+        # `status`: the dirty check precedes measuring, the HEAD check follows it.
+        root = _repo(tmp_path, _BASE)
+        before = git(root, 'rev-parse', 'HEAD').strip()
+        real_git = shutil.which('git')
+        assert real_git is not None
+        shim_bin = tmp_path / 'bin'
+        shim_bin.mkdir()
+        shim = shim_bin / 'git'
+        shim.write_text(_FAKE_GIT.format(python=sys.executable), encoding='utf-8')
+        shim.chmod(0o755)
+        monkeypatch.setenv('REAL_GIT', real_git)
+        monkeypatch.setenv('SHIM_ROOT', str(root))
+        monkeypatch.setenv('SHIM_MARKER', str(tmp_path / 'moved.marker'))
+        monkeypatch.setenv('PATH', f'{shim_bin}{os.pathsep}{os.environ["PATH"]}')
+        err = _refused(root, capsys)
+        after = git(root, 'rev-parse', 'HEAD').strip()
+        assert before != after
+        assert before in err
+        assert after in err
+
+
+class TestToolFaultsAreRefused:
+    def test_no_workspace_members(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        root = _repo(tmp_path, {**_BASE, 'pyproject.toml': '[project]\nname = "x"\n'})
+        assert 'tool.uv.workspace' in _refused(root, capsys)
+
+    def test_git_absent(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root = _repo(tmp_path, _BASE)
+        empty_bin = tmp_path / 'empty-bin'
+        empty_bin.mkdir()
+        monkeypatch.setenv('PATH', str(empty_bin))
+        assert 'could not run git' in _refused(root, capsys)
+
+    def test_complexipy_outside_the_pin(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # complexipy_version is the seam require_complexipy documents for
+        # seeding a version; no measure is patched.
+        root = _repo(tmp_path, _BASE)
+        monkeypatch.setattr(source_measures, 'complexipy_version', lambda: '7.0.1')
+        err = _refused(root, capsys)
+        assert '7.0.1' in err
+        assert source_measures.COMPLEXIPY_REQUIRED in err
+
+    def test_no_head_commit(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        root = tmp_path / 'repo'
+        root.mkdir()
+        git(root, 'init', '-q')
+        _write(root, {'pyproject.toml': _PYPROJECT, **_BASE})
+        git(root, 'add', '-A')
+        assert 'HEAD' in _refused(root, capsys)
+
+
+class TestABadPreviousSnapshotIsRefusedBeforeMeasuring:
+    def test_a_missing_file(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        root = _repo(tmp_path, _BASE)
+        previous = tmp_path / 'missing.json'
+        assert str(previous) in _refused(root, capsys, '--diff', str(previous))
+
+    def test_a_file_that_is_not_json(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        root = _repo(tmp_path, _BASE)
+        previous = tmp_path / 'previous.json'
+        previous.write_text('not json\n', encoding='utf-8')
+        assert str(previous) in _refused(root, capsys, '--diff', str(previous))
+
+    def test_another_instruments_json(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        root = _repo(tmp_path, _BASE)
+        previous = tmp_path / 'previous.json'
+        previous.write_text(
+            json.dumps({'schema_version': 1, 'instrument': 'merge-lane-ratchet'}), encoding='utf-8'
+        )
+        err = _refused(root, capsys, '--diff', str(previous))
+        assert str(previous) in err
+        assert 'instrument' in err
+
+    def test_another_schema_version(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        root = _repo(tmp_path, _BASE)
+        measured = tmp_path / 'measured.json'
+        assert _run(root, measured) == 0
+        previous = tmp_path / 'previous.json'
+        previous.write_text(
+            json.dumps({**json.loads(measured.read_text(encoding='utf-8')), 'schema_version': 2}),
+            encoding='utf-8',
+        )
+        capsys.readouterr()
+        err = _refused(root, capsys, '--diff', str(previous))
+        assert str(previous) in err
+        assert 'schema_version' in err
+
+
+def test_two_src_files_importing_as_one_module_name_are_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The import graph is keyed by module name, so an ambiguous one would be a
+    # wrong graph.
+    root = _repo(tmp_path, {**_BASE, 'alpha/src/x.py': 'Y = 1\n'})
+    err = _refused(root, capsys)
+    assert 'alpha/src/x.py' in err
+    assert 'scripts/x.py' in err
 
 
 def test_importing_the_snapshot_never_loads_the_ratchet() -> None:
