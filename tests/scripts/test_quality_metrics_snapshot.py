@@ -6,6 +6,7 @@ patched. The one real-tree test (cluster agreement) is the PRD's row 12.
 """
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import os
@@ -709,6 +710,102 @@ class TestRenames:
         for header in _DIFF_SECTIONS:
             if header != 'files renamed (same blob):':
                 assert _section(diff, header) == ['  (none)'], header
+
+    @pytest.mark.parametrize(
+        ('source', 'destination'),
+        [
+            ('scripts/x.py', 'scripts/tests/x.py'),
+            ('scripts/tests/test_x.py', 'scripts/trivial.py'),
+        ],
+        ids=['src-to-tests', 'tests-to-src'],
+    )
+    def test_a_move_between_kinds_is_a_removal_and_an_addition(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], source: str, destination: str
+    ) -> None:
+        def move(root: Path) -> None:
+            _commit(root, 'move', moves=[(source, destination)])
+
+        diff = _diff_of(tmp_path, capsys, _BASE, move)
+        assert _section(diff, 'files renamed (same blob):') == ['  (none)']
+        assert _section(diff, 'files added:') == [f'  {destination}']
+        assert _section(diff, 'files removed:') == [f'  {source}']
+        for header in _DIFF_SECTIONS:
+            if header not in ('files renamed (same blob):', 'files added:', 'files removed:'):
+                assert _section(diff, header) == ['  (none)'], header
+
+    def test_an_empty_file_moved_between_a_src_and_a_tests_root_is_not_a_rename(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        def swap(root: Path) -> None:
+            _commit(
+                root,
+                'swap',
+                remove=['alpha/src/alpha/__init__.py'],
+                write={'alpha/tests/__init__.py': ''},
+            )
+
+        diff = _diff_of(tmp_path, capsys, _BASE, swap)
+        assert _section(diff, 'files renamed (same blob):') == ['  (none)']
+        assert _section(diff, 'files added:') == ['  alpha/tests/__init__.py']
+        assert _section(diff, 'files removed:') == ['  alpha/src/alpha/__init__.py']
+
+    def test_an_empty_file_is_never_a_rename(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        def swap(root: Path) -> None:
+            _commit(
+                root,
+                'swap',
+                remove=['alpha/src/alpha/__init__.py'],
+                write={'beta/src/beta/__init__.py': ''},
+            )
+
+        diff = _diff_of(tmp_path, capsys, _BASE, swap)
+        assert _section(diff, 'files renamed (same blob):') == ['  (none)']
+        assert _section(diff, 'files added:') == ['  beta/src/beta/__init__.py']
+        assert _section(diff, 'files removed:') == ['  alpha/src/alpha/__init__.py']
+
+    def test_a_blob_that_left_or_arrived_at_several_paths_is_not_paired(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        base = {**_BASE, 'alpha/src/alpha/c1.py': 'C = 1\n', 'alpha/src/alpha/c2.py': 'C = 1\n'}
+
+        def move(root: Path) -> None:
+            _commit(root, 'move', moves=[
+                ('alpha/src/alpha/c1.py', 'alpha/src/alpha/z2.py'),
+                ('alpha/src/alpha/c2.py', 'alpha/src/alpha/a9.py'),
+            ])
+
+        diff = _diff_of(tmp_path, capsys, base, move)
+        assert _section(diff, 'files renamed (same blob):') == ['  (none)']
+        assert _section(diff, 'files added:') == [
+            '  alpha/src/alpha/a9.py',
+            '  alpha/src/alpha/z2.py',
+        ]
+        assert _section(diff, 'files removed:') == [
+            '  alpha/src/alpha/c1.py',
+            '  alpha/src/alpha/c2.py',
+        ]
+
+    def test_a_path_whose_kind_changed_is_compared_within_one_kind(self, tmp_path: Path) -> None:
+        path = tmp_path / 'out' / 'snapshot.json'
+        assert _run(_repo(tmp_path, _BASE), path) == 0
+        previous = _load(path)
+        edited = copy.deepcopy(previous)
+        edited['files']['scripts/x.py'] = {
+            **previous['files']['scripts/tests/test_x.py'],
+            'private_patch_targets': ['pkg._p'],
+        }
+        snapshot.validate_snapshot(edited, origin='edited')
+        tests_header = 'test files (private patch targets, private reads):'
+
+        forward = snapshot.diff_lines(edited, previous)
+        assert _section(forward, tests_header) == ['  scripts/x.py: +pkg._p']
+        assert _section(forward, 'import graph:') == ['  (none)']
+
+        backward = snapshot.diff_lines(previous, edited)
+        assert _section(backward, tests_header) == ['  scripts/x.py: -pkg._p']
+        assert _section(backward, 'import graph:') == ['  (none)']
 
 
 _GRAPH_BASE: dict[str, str] = {
