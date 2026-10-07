@@ -52,6 +52,8 @@ from audit_delivered_checks import (
     load_manifest_checks,
     load_open_dependents,
     load_task_index,
+    stale_path_findings,
+    stale_path_is_actionable,
 )
 from shared.delivered_check_polarity import CheckOutcome
 
@@ -976,6 +978,229 @@ class TestMainExitCodes:
         assert 'SUPERSEDED' in result.stdout
         assert 'gzip-gone' in result.stdout
         assert '3578' in result.stdout
+
+
+_SHIM_BODY = 'import sys\n\nfrom src import new_mod as target\n\nsys.modules[__name__] = target\n'
+
+#: main carries a sys.modules shim, a live module, and (after _stale_project's
+#: delete commit) no longer src/gone.py.
+_STALE_TREE = {
+    'src/new_mod.py': 'def real():\n    return 1\n',
+    'src/old_mod.py': _SHIM_BODY,
+    'src/gone.py': 'def legacy():\n    return 0\n',
+}
+
+
+def _delete(root, message, rel):
+    """Commit the deletion of *rel* alone; the untracked tasks.db stays out."""
+    subprocess.run(['git', '-C', str(root), 'rm', '-q', rel], check=True, capture_output=True)
+    subprocess.run(
+        ['git', '-C', str(root), '-c', 'user.email=t@e', '-c', 'user.name=t',
+         'commit', '-q', '-m', message],
+        check=True, capture_output=True,
+    )
+
+
+def _stale_project(tmp_path, make_tasks_db, project_root_with_tasks_db, *, tasks,
+                   files=None):
+    root = _make_project(
+        tmp_path, make_tasks_db, project_root_with_tasks_db,
+        tasks=tasks, files={**_STALE_TREE, **(files or {})},
+    )
+    _delete(root, 'retire the gone module', 'src/gone.py')
+    return root
+
+
+def _shim_grep(name, pattern='BrandNewSymbol'):
+    return _grep(name, pattern, paths=('src/old_mod.py',))
+
+
+def _section(stdout, header, next_header):
+    return stdout.split(header, 1)[1].split(next_header, 1)[0]
+
+
+class TestStalePaths:
+    """The STALE PATHS sweep: an expect=present check whose `paths` name a
+    sys.modules shim or a mainline-removed path can never go green."""
+
+    def test_sweep_flags_shim_and_removed_paths_only(self, tmp_path):
+        root = _init_repo(tmp_path / 'repo', _STALE_TREE)
+        _delete(root, 'retire the gone module', 'src/gone.py')
+        rows = [
+            _row(task_id=1, name='grep-shim', paths=('src/old_mod.py',)),
+            _row(task_id=2, name='grep-gone', paths=('src/gone.py',)),
+            _row(task_id=3, name='path-gone', kind='path', pattern=None,
+                 paths=('src/gone.py',)),
+            _row(task_id=4, name='grep-new', paths=('src/never_created.py',)),
+            _row(task_id=5, name='absent-shim', expect='absent', paths=('src/old_mod.py',)),
+            _row(task_id=6, name='absent-gone', expect='absent', paths=('src/gone.py',)),
+            _row(task_id=7, name='path-shim', kind='path', pattern=None,
+                 paths=('src/old_mod.py',)),
+            _row(task_id=8, name='grep-live', paths=('src/new_mod.py',)),
+        ]
+
+        sweep = stale_path_findings(rows, repo_root=str(root), ref='main')
+
+        assert {(f.row.task_id, f.row.name, f.scope.path, f.code) for f in sweep.findings} == {
+            (1, 'grep-shim', 'src/old_mod.py', 'shim_path'),
+            (2, 'grep-gone', 'src/gone.py', 'removed_path'),
+            (3, 'path-gone', 'src/gone.py', 'removed_path'),
+        }
+        removed = [f for f in sweep.findings if f.code == 'removed_path']
+        assert all(
+            f.scope.removed_in and 'retire the gone module' in f.scope.removed_in
+            for f in removed
+        )
+        assert sweep.paths_unclassified == 0
+
+    @pytest.mark.parametrize(
+        ('status', 'open_dependents', 'actionable'),
+        [
+            ('pending', (), True),
+            ('in-progress', (), True),
+            ('blocked', (), True),
+            ('deferred', (), True),
+            ('done', (), False),
+            ('done', (77,), True),
+            ('cancelled', (77,), False),
+            (None, (77,), False),
+        ],
+    )
+    def test_actionability_follows_who_is_held(self, status, open_dependents, actionable):
+        assert stale_path_is_actionable(status, open_dependents) is actionable
+
+    def test_live_producer_with_a_shim_scoped_check_exits_1(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = _stale_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            tasks=[{'id': 50, 'status': 'pending', 'metadata': _checks(_shim_grep('cap'))}],
+        )
+
+        result = _run_cli('--project-root', str(root))
+
+        assert result.returncode == 1, result.stdout + result.stderr
+        assert 'STALE PATHS (1)' in result.stdout
+        section = _section(result.stdout, 'STALE PATHS (1)', '  BROKEN (')
+        lines = section.splitlines()
+        [row_at] = [i for i, line in enumerate(lines) if 'task_id=' in line]
+        row_line = lines[row_at]
+        assert 'task_id=50' in row_line
+        assert 'path=src/old_mod.py' in row_line
+        assert 'code=shim_path' in row_line
+        assert 'open_dependents=' in row_line
+        assert lines[row_at + 1].strip().startswith('reason:')
+
+    def test_done_producer_without_open_dependents_is_report_only(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = _stale_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            tasks=[{'id': 51, 'status': 'done',
+                    'metadata': _checks(_shim_grep('cap', pattern='sys.modules'))}],
+        )
+
+        result = _run_cli('--project-root', str(root))
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert 'STALE PATHS (0)' in result.stdout
+        assert 'STALE PATHS, report-only (1)' in result.stdout
+        report_only = result.stdout.split('STALE PATHS, report-only (1)', 1)[1]
+        assert 'task_id=51' in report_only
+
+    def test_done_producer_with_an_open_dependent_exits_1(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = _stale_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            tasks=[
+                {'id': 51, 'status': 'done',
+                 'metadata': _checks(_shim_grep('cap', pattern='sys.modules'))},
+                {'id': 77, 'status': 'blocked'},
+            ],
+        )
+        _seed_dependencies(root, [(77, 51)])
+
+        result = _run_cli('--project-root', str(root))
+
+        assert result.returncode == 1, result.stdout + result.stderr
+        section = _section(result.stdout, 'STALE PATHS (1)', '  BROKEN (')
+        assert 'open_dependents=77' in section
+
+    def test_both_halves_are_swept_without_dedupe(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """A stale sidecar is re-stamped over a repaired record on
+        re-decompose, so each half is its own artifact to repair."""
+        sidecar = (
+            'prd: plans/x-prd.md\n'
+            'schema_version: 1\n'
+            'tasks:\n'
+            '  - label: α\n'
+            '    task_id: 52\n'
+            '    capabilities:\n'
+            '      - name: cap\n'
+            '        binding: b\n'
+            '        verdict: FAIL\n'
+            '        delivered_check:\n'
+            '          kind: grep\n'
+            '          pattern: BrandNewSymbol\n'
+            '          expect: present\n'
+            '          paths: [src/old_mod.py]\n'
+        )
+        root = _stale_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            files={'plans/x-prd.capability-manifest.yaml': sidecar},
+            tasks=[{'id': 52, 'status': 'pending', 'metadata': _checks(_shim_grep('cap'))}],
+        )
+
+        audit = audit_project(str(root))
+
+        assert sorted((f.row.source, f.row.name, f.code) for f in audit.stale_paths) == [
+            ('manifest', 'cap', 'shim_path'),
+            ('metadata', 'cap', 'shim_path'),
+        ]
+
+    def test_json_carries_stale_paths_and_their_coverage(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = _stale_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            tasks=[
+                {'id': 53, 'status': 'pending', 'metadata': _checks(
+                    _grep('gone', 'BrandNewSymbol', paths=('src/gone.py',)))},
+                {'id': 78, 'status': 'pending'},
+            ],
+        )
+        _seed_dependencies(root, [(78, 53)])
+
+        result = _run_cli('--project-root', str(root), '--json')
+        project = json.loads(result.stdout)['projects'][0]
+
+        [entry] = project['stale_paths']
+        assert entry['task_id'] == 53
+        assert entry['path'] == 'src/gone.py'
+        assert entry['code'] == 'removed_path'
+        assert 'retire the gone module' in entry['removed_in']
+        assert entry['actionable'] is True
+        assert entry['open_dependents'] == [78]
+        assert project['coverage']['scope_paths_unclassified'] == 0
+
+    def test_an_unanswerable_classifier_is_counted_never_read_as_clean(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = _stale_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            tasks=[{'id': 54, 'status': 'pending', 'metadata': _checks(
+                _shim_grep('shim'),
+                _grep('gone', 'BrandNewSymbol', paths=('src/gone.py', 'src/old_mod.py')),
+            )}],
+        )
+
+        audit = audit_project(str(root), ref='nope')
+
+        assert audit.stale_paths == ()
+        assert audit.coverage.scope_paths_unclassified == 2
 
 
 class TestReportShape:
