@@ -24,7 +24,7 @@ import assert from 'node:assert/strict';
 
 import banner from '../../src/dashboard/static/redux/tasks_offline_banner.js';
 
-const { tasksBannerNotices } = banner;
+const { tasksBannerNotices, tasksBannerNoticesFor } = banner;
 
 // The real-outage wording, preserved VERBATIM from the pre-change JSX
 // (tab_tasks.jsx). The global case was never the bug — it was the only case,
@@ -291,5 +291,59 @@ test('a missing countUnknownProjects key produces no notice', () => {
   assert.deepEqual(
     tasksBannerNotices({ offline: false, countUnknownProjects: undefined, totalProjects: 3 }),
     []
+  );
+});
+
+// ── tasksBannerNoticesFor: the ONE mapping from DF_DATA's /tasks keys ────────
+// The Tasks-tab banner and the System health Taskmaster row both read the
+// /tasks fan-out through it, so they cannot disagree about it.
+
+test('tasksBannerNoticesFor: a global outage reads TASKS_OFFLINE and names the failed root', () => {
+  const notices = tasksBannerNoticesFor({
+    TASKS_OFFLINE: true,
+    TASKS_OFFLINE_PROJECTS: ['a'],
+    TASKS_PROJECT_COUNT: 2,
+  });
+
+  assert.deepEqual(kinds(notices), ['global']);
+  assert.ok(notices[0].text.endsWith(' (a)'), notices[0].text);
+});
+
+test('tasksBannerNoticesFor: each per-root list maps to its own notice, counted against TASKS_PROJECT_COUNT', () => {
+  const notices = tasksBannerNoticesFor({
+    TASKS_OFFLINE: false,
+    TASKS_OFFLINE_PROJECTS: ['a'],
+    TASKS_DEGRADED_PROJECTS: ['b'],
+    TASKS_COUNT_UNKNOWN_PROJECTS: ['c'],
+    TASKS_PROJECT_COUNT: 9,
+  });
+
+  assert.deepEqual(kinds(notices), ['partial', 'degraded', 'count-unknown']);
+  for (const notice of notices) assert.ok(notice.text.includes('1 of 9'), notice.text);
+});
+
+test('tasksBannerNoticesFor: a DF_DATA with every /tasks key absent produces no notice', () => {
+  // The pre-fetch seed and the poll-scope driver's proxy both look like this.
+  assert.deepEqual(tasksBannerNoticesFor({}), []);
+});
+
+test('tasksBannerNoticesFor is tasksBannerNotices over the same keys', () => {
+  const data = {
+    TASKS_OFFLINE: false,
+    TASKS_OFFLINE_PROJECTS: ['a', 'b'],
+    TASKS_DEGRADED_PROJECTS: ['c'],
+    TASKS_COUNT_UNKNOWN_PROJECTS: [],
+    TASKS_PROJECT_COUNT: 5,
+  };
+
+  assert.deepEqual(
+    tasksBannerNoticesFor(data),
+    tasksBannerNotices({
+      offline: false,
+      offlineProjects: ['a', 'b'],
+      degradedProjects: ['c'],
+      countUnknownProjects: [],
+      totalProjects: 5,
+    }),
   );
 });
