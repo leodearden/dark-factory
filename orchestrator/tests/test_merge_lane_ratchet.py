@@ -47,13 +47,14 @@ can never masquerade as a clean tree.
 """
 from __future__ import annotations
 
+import ast
 import copy
 import dataclasses
 import json
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, ModuleType
 
 import pytest
 from _git_fixtures import RepoSeed, build_repo
@@ -117,6 +118,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: E402
+import source_measures  # type: ignore[import-not-found]  # noqa: E402
 
 _REPO_ROOT = Path(__file__).parents[2]
 
@@ -142,20 +144,23 @@ def live_measurement() -> LiveMeasurement:
 
     The recording wrapper RECORDS AND DELEGATES, so the report is a real
     measurement and the call list is real work rather than a simulation of it.
+    It wraps the public `source_measures.file_cognitive_measures`, which takes
+    ONE complexipy measurement per call (tests/scripts/test_source_measures.py
+    pins that), so each recorded call is one complexipy run.
     `test_each_cluster_file_is_measured_by_complexipy_once` reads that list, so
     the per-file-once guarantee costs no measurement of its own. The builtin
     `monkeypatch` fixture is function-scoped and cannot be requested here,
     hence `pytest.MonkeyPatch.context()`.
     """
     calls: list[Path] = []
-    original = metrics._file_complexity
+    original = source_measures.file_cognitive_measures
 
     def recording(path: Path):
         calls.append(path)
         return original(path)
 
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(metrics, '_file_complexity', recording)
+        patch.setattr(source_measures, 'file_cognitive_measures', recording)
         report = metrics.build_report(_REPO_ROOT)
     return LiveMeasurement(report=report, complexipy_calls=tuple(calls))
 
@@ -185,7 +190,7 @@ def no_private_tree_scan(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     `main(['--check'])` legitimately reads the baseline .json, which lives in
     the swept directory and must not trip the guard.
 
-    Parses are NOT scoped that way and cannot be: `metrics._parse` calls
+    Parses are NOT scoped that way and cannot be: `source_measures.parse_source` calls
     `ast.parse(source)` with no filename, so every parse a sweep makes records
     as '<unknown>' (measured) and a path-scoped parse counter would witness
     nothing at all for the regrowth this fixture exists to catch. Broad is also
@@ -346,7 +351,7 @@ class TestResolveClusterPaths:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(metrics, 'CLUSTER_PATHS', ('gone/missing.py',))
-        with pytest.raises(metrics.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.resolve_cluster_paths(tmp_path)
         assert 'gone/missing.py' in str(excinfo.value)
 
@@ -357,7 +362,7 @@ class TestResolveClusterPaths:
         # silently dropped from an otherwise plausible-looking result.
         (tmp_path / 'a.py').write_text('x = 1\n', encoding='utf-8')
         monkeypatch.setattr(metrics, 'CLUSTER_PATHS', ('a.py', 'gone/missing.py'))
-        with pytest.raises(metrics.MetricsError):
+        with pytest.raises(metrics.RatchetError):
             metrics.resolve_cluster_paths(tmp_path)
 
     def test_literal_path_that_is_a_directory_raises(
@@ -365,7 +370,7 @@ class TestResolveClusterPaths:
     ) -> None:
         (tmp_path / 'adir.py').mkdir()
         monkeypatch.setattr(metrics, 'CLUSTER_PATHS', ('adir.py',))
-        with pytest.raises(metrics.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.resolve_cluster_paths(tmp_path)
         assert 'adir.py' in str(excinfo.value)
 
@@ -415,96 +420,101 @@ class TestEnumerationRoundTrip:
 
 
 # ---------------------------------------------------------------------------
-# file_size_measures -- lines and prose lines.
-#
-# Pinned against INLINE synthetic snippets, never against a real repo file, so
-# these tests cannot drift when the cluster changes. The one real-tree
-# assertion below is an explicit anti-vacuity anchor, not a definition.
+# The per-file measures live in scripts/source_measures.py, and the ratchet
+# reaches them through that module rather than re-exporting them.
+
+_INTERNABLE_ATOMS = (str, bytes, int, float, type(None))
 
 
-class TestFileSizeMeasures:
-    def test_lines_counts_physical_lines(self) -> None:
-        source = 'a = 1\nb = 2\nc = 3\n'
-        assert metrics.file_size_measures(source, path='t.py').lines == 3
+def _is_defined_by(module: ModuleType, name: str, value: object) -> bool:
+    if name.startswith('__') and name.endswith('__'):
+        return False
+    if isinstance(value, (ModuleType, *_INTERNABLE_ATOMS)):
+        return False
+    if isinstance(value, (tuple, frozenset)) and not value:
+        return False
+    return getattr(value, '__module__', module.__name__) == module.__name__
 
-    def test_lines_counts_a_final_line_without_a_trailing_newline(self) -> None:
-        assert metrics.file_size_measures('a = 1\nb = 2', path='t.py').lines == 2
 
-    def test_blank_lines_are_lines_but_not_prose(self) -> None:
-        measures = metrics.file_size_measures('a = 1\n\n\nb = 2\n', path='t.py')
-        assert measures.lines == 4
-        assert measures.prose_lines == 0
+def _objects_defined_in(module: ModuleType) -> list[object]:
+    return [
+        value
+        for name, value in vars(module).items()
+        if _is_defined_by(module, name, value)
+    ]
 
-    def test_module_docstring_counts_as_prose(self) -> None:
-        measures = metrics.file_size_measures('"""Doc."""\na = 1\n', path='t.py')
-        assert measures.prose_lines == 1
 
-    def test_function_and_class_docstrings_count_as_prose(self) -> None:
+def _names_rebound_from(
+    namespace: Mapping[str, object], provider: ModuleType
+) -> list[str]:
+    owned = _objects_defined_in(provider)
+    return sorted(
+        name
+        for name, value in namespace.items()
+        if any(value is own for own in owned)
+    )
+
+
+def _names_from_imported(source: str, provider: str) -> list[str]:
+    return sorted(
+        alias.asname or alias.name
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.ImportFrom) and node.module == provider
+        for alias in node.names
+    )
+
+
+class TestTheRatchetReExportsNoMeasure:
+    def test_the_ratchet_binds_no_object_source_measures_defines(self) -> None:
+        assert _names_rebound_from(vars(metrics), source_measures) == []
+
+    def test_the_ratchet_from_imports_nothing_from_source_measures(self) -> None:
+        # Identity cannot see an interned atom: `from source_measures import
+        # COMPLEXIPY_REQUIRED` would rebind a str the check above skips.
+        source = Path(metrics.__file__).read_text(encoding='utf-8')
+        assert _names_from_imported(source, source_measures.__name__) == []
+
+    def test_a_from_import_is_found_at_any_depth_under_its_bound_name(self) -> None:
         source = (
-            'class C:\n'
-            '    """Class doc."""\n'
-            '\n'
-            '    def m(self):\n'
-            '        """Method doc."""\n'
-            '        return 1\n'
+            'import source_measures\n'
+            'from source_measures import COMPLEXIPY_REQUIRED\n'
+            'def f():\n'
+            '    from source_measures import parse_source as parse\n'
         )
-        assert metrics.file_size_measures(source, path='t.py').prose_lines == 2
+        assert _names_from_imported(source, 'source_measures') == [
+            'COMPLEXIPY_REQUIRED',
+            'parse',
+        ]
 
-    def test_async_function_docstring_counts_as_prose(self) -> None:
-        source = 'async def f():\n    """Doc."""\n    return 1\n'
-        assert metrics.file_size_measures(source, path='t.py').prose_lines == 1
+    def test_a_rebinding_under_any_name_is_found(self) -> None:
+        namespace: dict[str, object] = {
+            'ast': ast,
+            'Path': Path,
+            'Mapping': Mapping,
+            'source_measures': source_measures,
+            'alias': source_measures.file_size_measures,
+            'Err': source_measures.MetricsError,
+            'LIMIT': source_measures.COMPLEXIPY_MIN,
+            'ROOTS': source_measures.PSEUDO_MEMBERS,
+        }
+        assert _names_rebound_from(namespace, source_measures) == [
+            'Err',
+            'LIMIT',
+            'ROOTS',
+            'alias',
+        ]
 
-    def test_multiline_docstring_counts_once_per_line_it_spans(self) -> None:
-        source = '"""Line one.\n\nLine three.\n"""\na = 1\n'
-        measures = metrics.file_size_measures(source, path='t.py')
-        assert measures.lines == 5
-        assert measures.prose_lines == 4
 
-    def test_standalone_comment_lines_count_as_prose(self) -> None:
-        source = '# one\n# two\na = 1\n'
-        assert metrics.file_size_measures(source, path='t.py').prose_lines == 2
+# ---------------------------------------------------------------------------
+# The per-file measures over the REAL cluster.
+#
+# Their unit tests live in tests/scripts/test_source_measures.py, pinned on
+# inline synthetic snippets. What stays here is the anti-vacuity half: each
+# measure, run over the real cluster, returns a real number. None of these pins
+# the tree's current state.
 
-    def test_trailing_inline_comment_makes_its_code_line_prose(self) -> None:
-        source = 'a = 1  # why\nb = 2\n'
-        assert metrics.file_size_measures(source, path='t.py').prose_lines == 1
 
-    def test_a_line_that_is_both_docstring_and_comment_counts_once(self) -> None:
-        # The two line-number sets are unioned, not summed.
-        source = '"""Doc."""  # trailing\na = 1\n'
-        assert metrics.file_size_measures(source, path='t.py').prose_lines == 1
-
-    def test_a_string_literal_mentioning_hash_is_not_a_comment(self) -> None:
-        # THE tokenize-vs-regex discriminator: no regex over source text gets
-        # this right, and getting it wrong would inflate prose_lines on any file
-        # that formats a '#'-bearing string.
-        source = "url = 'http://x/#frag'\nheading = '# not a comment'\n"
-        assert metrics.file_size_measures(source, path='t.py').prose_lines == 0
-
-    def test_a_non_docstring_string_expression_is_not_prose(self) -> None:
-        # Only the FIRST body element of a module/class/function is a docstring.
-        source = '"""Doc."""\n"""Not a docstring."""\na = 1\n'
-        assert metrics.file_size_measures(source, path='t.py').prose_lines == 1
-
-    def test_unparseable_source_raises_naming_the_path(self) -> None:
-        with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.file_size_measures('def (:\n', path='broken.py')
-        message = str(excinfo.value)
-        assert 'broken.py' in message
-        assert 'SyntaxError' in message
-
-    def test_unparseable_source_never_returns_a_zero_measure(self) -> None:
-        # INV-11: an unmeasurable cluster file is the finding, not a 0 that
-        # silently satisfies every ratchet comparison.
-        with pytest.raises(metrics.MetricsError):
-            metrics.file_size_measures('class ???:\n', path='broken.py')
-
-    def test_measures_are_frozen(self) -> None:
-        import dataclasses
-
-        measures = metrics.file_size_measures('a = 1\n', path='t.py')
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            measures.lines = 99  # type: ignore[misc]
-
+class TestTheMeasuresOverTheRealCluster:
     def test_real_merge_queue_line_count_anchor(self) -> None:
         # Anti-vacuity anchor: proves the measure is wired to the REAL tree
         # and returns a real number. It deliberately does NOT pin the tree's
@@ -523,72 +533,10 @@ class TestFileSizeMeasures:
         source = (_REPO_ROOT / 'orchestrator/src/orchestrator/merge_lane/worker.py').read_text(
             encoding='utf-8'
         )
-        measures = metrics.file_size_measures(source, path='merge_queue.py')
+        measures = source_measures.file_size_measures(source, path='merge_queue.py')
         assert measures.lines >= 10000
         assert measures.prose_lines > 0
 
-
-# ---------------------------------------------------------------------------
-# Structural import measures: function-local (reach-back) imports, and
-# re-export shim names.
-
-
-class TestFunctionLocalImports:
-    def test_import_from_inside_a_def_is_counted(self) -> None:
-        source = 'def f():\n    from x import y\n    return y\n'
-        assert metrics.function_local_imports(source, path='t.py') == 1
-
-    def test_plain_import_inside_a_def_is_counted(self) -> None:
-        source = 'def f():\n    import x\n    return x\n'
-        assert metrics.function_local_imports(source, path='t.py') == 1
-
-    def test_import_inside_an_async_def_is_counted(self) -> None:
-        source = 'async def f():\n    from x import y\n    return y\n'
-        assert metrics.function_local_imports(source, path='t.py') == 1
-
-    def test_import_inside_a_nested_def_is_counted_once(self) -> None:
-        # Walking from each function node would visit the inner import twice
-        # (once from the outer function, once from the inner); dedupe by node
-        # identity keeps this at 1.
-        source = (
-            'def outer():\n'
-            '    def inner():\n'
-            '        from x import y\n'
-            '        return y\n'
-            '    return inner\n'
-        )
-        assert metrics.function_local_imports(source, path='t.py') == 1
-
-    def test_module_level_import_is_not_counted(self) -> None:
-        source = 'from x import y\nimport z\n\n\ndef f():\n    return y\n'
-        assert metrics.function_local_imports(source, path='t.py') == 0
-
-    def test_import_in_a_class_body_outside_any_function_is_not_counted(self) -> None:
-        source = 'class C:\n    from x import y\n'
-        assert metrics.function_local_imports(source, path='t.py') == 0
-
-    def test_import_in_a_method_body_is_counted(self) -> None:
-        source = 'class C:\n    def m(self):\n        from x import y\n        return y\n'
-        assert metrics.function_local_imports(source, path='t.py') == 1
-
-    def test_a_docstring_quoting_an_import_is_not_counted(self) -> None:
-        # AST, not regex. The satellite modules' reach-back notes quote exactly
-        # this string in prose; counting them would inflate the measure.
-        source = (
-            'def f():\n'
-            '    """Resolves via ``from orchestrator.merge_queue import X``."""\n'
-            '    return 1\n'
-        )
-        assert metrics.function_local_imports(source, path='t.py') == 0
-
-    def test_each_import_statement_counts_once_regardless_of_names(self) -> None:
-        source = 'def f():\n    from x import a, b, c\n    return a\n'
-        assert metrics.function_local_imports(source, path='t.py') == 1
-
-    def test_unparseable_source_raises_naming_the_path(self) -> None:
-        with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.function_local_imports('def (:\n', path='broken.py')
-        assert 'broken.py' in str(excinfo.value)
 
     def test_cluster_total_is_positive_anchor(self) -> None:
         # Anti-vacuity: the PRD's ceilings row counts the function-local imports
@@ -596,186 +544,9 @@ class TestFunctionLocalImports:
         total = 0
         for relpath in metrics.resolve_cluster_paths(_REPO_ROOT).resolved:
             source = (_REPO_ROOT / relpath).read_text(encoding='utf-8')
-            total += metrics.function_local_imports(source, path=relpath)
+            total += source_measures.function_local_imports(source, path=relpath)
         assert total > 0
 
-
-class TestReexportNames:
-    def test_unreferenced_module_level_import_from_names_are_reexports(self) -> None:
-        source = 'from a import (B, C)\n'
-        assert metrics.reexport_names(source, path='t.py') == ['B', 'C']
-
-    def test_a_referenced_binding_is_not_a_reexport(self) -> None:
-        source = 'from a import B\n\nx = B()\n'
-        assert metrics.reexport_names(source, path='t.py') == []
-
-    def test_an_alias_is_reported_under_the_bound_name(self) -> None:
-        source = 'from a import B as C\n'
-        assert metrics.reexport_names(source, path='t.py') == ['C']
-
-    def test_a_used_alias_is_not_a_reexport(self) -> None:
-        source = 'from a import B as C\n\nx = C()\n'
-        assert metrics.reexport_names(source, path='t.py') == []
-
-    def test_a_name_referenced_only_in_a_docstring_still_counts(self) -> None:
-        # AST, not regex: prose mentioning the name does not make it used.
-        source = '"""Re-exports B for consumers."""\nfrom a import B\n# B lives here\n'
-        assert metrics.reexport_names(source, path='t.py') == ['B']
-
-    def test_a_name_referenced_inside_a_nested_function_counts_as_used(self) -> None:
-        source = (
-            'from a import B\n'
-            '\n'
-            '\n'
-            'def outer():\n'
-            '    def inner():\n'
-            '        return B\n'
-            '    return inner\n'
-        )
-        assert metrics.reexport_names(source, path='t.py') == []
-
-    def test_a_function_local_import_from_is_not_a_reexport(self) -> None:
-        # Only MODULE-LEVEL ImportFrom bindings form the module's public
-        # surface; a deferred import inside a function is the reach-back
-        # measure's business, not this one's.
-        source = 'def f():\n    from a import B\n    return 1\n'
-        assert metrics.reexport_names(source, path='t.py') == []
-
-    def test_a_plain_import_is_not_counted(self) -> None:
-        # The PRD's measure is the `from X import (...)` shim block; a bare
-        # `import x` binds a module, not a re-exported name.
-        source = 'import a\n'
-        assert metrics.reexport_names(source, path='t.py') == []
-
-    def test_a_future_import_is_not_a_reexport(self) -> None:
-        # `from __future__ import annotations` is a compiler directive, not a
-        # name a downstream module could import, and ruff's F401 -- the
-        # predicate this measure claims to agree with -- explicitly never flags
-        # it. Counting it inflated 19 of 22 baseline paths by one and made the
-        # ratchet REWARD deleting a future import, which silently changes
-        # runtime annotation semantics (esc-5021-6).
-        source = 'from __future__ import annotations\nimport os\nx = 1\n'
-        assert metrics.reexport_names(source, path='t.py') == []
-
-    def test_a_future_import_does_not_mask_a_real_shim(self) -> None:
-        # Excluding __future__ must not swallow the genuine shims beside it.
-        source = 'from __future__ import annotations\nfrom a import B\n'
-        assert metrics.reexport_names(source, path='t.py') == ['B']
-
-    def test_star_import_is_not_reported_as_a_name(self) -> None:
-        source = 'from a import *\n'
-        assert metrics.reexport_names(source, path='t.py') == []
-
-    def test_names_are_returned_sorted_and_deduped(self) -> None:
-        source = 'from a import Z\nfrom b import A\n'
-        assert metrics.reexport_names(source, path='t.py') == ['A', 'Z']
-
-    def test_unparseable_source_raises_naming_the_path(self) -> None:
-        with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.reexport_names('def (:\n', path='broken.py')
-        assert 'broken.py' in str(excinfo.value)
-
-    def test_deleting_the_noqa_comment_does_not_change_the_measure(self) -> None:
-        # THE ungameable property, pinned directly. A comment-scanning detector
-        # would zero out on this purely cosmetic edit; the structural one cannot
-        # see comments at all.
-        source = 'from a import (  # noqa: F401  re-export shim\n    B,\n    C,\n)\n'
-        stripped = source.replace('  # noqa: F401  re-export shim', '')
-        assert metrics.reexport_names(source, path='t.py') == ['B', 'C']
-        assert metrics.reexport_names(stripped, path='t.py') == ['B', 'C']
-
-
-# ---------------------------------------------------------------------------
-# The complexipy adapter, and its version contract (INV-11 for tools).
-
-_TINY_SOURCE = (
-    'def f(a):\n'
-    '    if a:\n'
-    '        for i in range(3):\n'
-    '            if i:\n'
-    '                return i\n'
-    '    return 0\n'
-    '\n'
-    '\n'
-    'class C:\n'
-    '    def m(self):\n'
-    '        return 1\n'
-)
-
-
-class TestCognitiveComplexity:
-    def test_keyed_by_complexipy_qualname(self, tmp_path: Path) -> None:
-        target = tmp_path / 'tiny.py'
-        target.write_text(_TINY_SOURCE, encoding='utf-8')
-        scores = metrics.file_cognitive_measures(target).per_function
-        assert scores == {'f': 6, 'C::m': 0}
-
-    def test_module_with_no_functions_returns_an_empty_map(self, tmp_path: Path) -> None:
-        target = tmp_path / 'empty.py'
-        target.write_text('X = 1\n', encoding='utf-8')
-        assert metrics.file_cognitive_measures(target).per_function == {}
-
-    def test_file_total_is_reported_separately(self, tmp_path: Path) -> None:
-        target = tmp_path / 'tiny.py'
-        target.write_text(_TINY_SOURCE, encoding='utf-8')
-        assert metrics.file_cognitive_measures(target).total == 6
-
-    def test_both_projections_come_from_one_complexipy_measurement(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # The file total and the per-function map are two VIEWS of one
-        # complexipy result, not two measurements. build_report asked each
-        # cluster file for both and so paid complexipy 50 times over the 25
-        # resolved files; this counter forbids that shape from growing back.
-        #
-        # The counter RECORDS AND DELEGATES rather than stubbing, so the
-        # equalities below are still checked against a real measurement.
-        target = tmp_path / 'tiny.py'
-        target.write_text(_TINY_SOURCE, encoding='utf-8')
-        raw = metrics._file_complexity(target)
-        expected_total = int(raw.complexity)
-        expected_per_function = {f.name: f.complexity for f in raw.functions}
-        # Anti-vacuity: a module measuring 0 with no functions would satisfy
-        # the equalities below while witnessing nothing.
-        assert expected_total > 0
-        assert expected_per_function
-
-        calls: list[Path] = []
-        original = metrics._file_complexity
-
-        def counting(path: Path):
-            calls.append(path)
-            return original(path)
-
-        monkeypatch.setattr(metrics, '_file_complexity', counting)
-        measures = metrics.file_cognitive_measures(target)
-
-        assert calls == [target], calls
-        assert measures.total == expected_total
-        assert measures.per_function == expected_per_function
-
-    def test_missing_complexipy_raises_naming_the_tool(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # Never a skipped measure and never a 0: a tool the instrument cannot
-        # run is an instrument failure with a named cause (INV-11).
-        monkeypatch.setitem(sys.modules, 'complexipy', None)
-        target = tmp_path / 'tiny.py'
-        target.write_text(_TINY_SOURCE, encoding='utf-8')
-        with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.file_cognitive_measures(target)
-        message = str(excinfo.value)
-        assert 'complexipy' in message
-        assert 'dev' in message
-
-    def test_unparseable_file_raises_naming_the_path(self, tmp_path: Path) -> None:
-        # INV-11's polarity: a file the instrument cannot measure is the
-        # FINDING, never a silent 0 and never a skip.
-        target = tmp_path / 'broken.py'
-        target.write_text('def (:\n', encoding='utf-8')
-        with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.file_cognitive_measures(target)
-        assert 'broken.py' in str(excinfo.value)
 
     def test_merge_queue_anchor_reproduces_the_prd_background_numbers(self) -> None:
         # Anti-vacuity anchor: complexipy really ran over the real file and
@@ -799,80 +570,11 @@ class TestCognitiveComplexity:
         # comparator's params.complexipy_version check already hard-block every
         # other major with a named failure.
         target = _REPO_ROOT / 'orchestrator/src/orchestrator/merge_lane/worker.py'
-        measures = metrics.file_cognitive_measures(target)
+        measures = source_measures.file_cognitive_measures(target)
         assert measures.per_function['SpeculativeMergeWorker::_verifier_loop'] >= 100
         assert measures.per_function['SpeculativeMergeWorker::stop'] >= 50
         assert measures.total >= 1000
 
-
-class TestComplexipyVersionContract:
-    def test_required_specifier_is_the_measured_range(self) -> None:
-        assert metrics.COMPLEXIPY_REQUIRED == '>=6.2,<7'
-
-    def test_installed_version_satisfies_the_requirement(self) -> None:
-        # The executable form of the measured pin.
-        metrics.require_complexipy()
-        assert metrics.satisfies_complexipy_requirement(metrics.complexipy_version())
-
-    def test_pyproject_pin_matches_the_scripts_requirement(self) -> None:
-        # Goes RED the moment someone relaxes the dependency to 7.x. The pin and
-        # the runtime check are two halves of one contract; letting them drift
-        # would leave the ratchet silently measuring with the wrong engine.
-        pyproject = (_REPO_ROOT / 'orchestrator/pyproject.toml').read_text(encoding='utf-8')
-        assert f'"complexipy{metrics.COMPLEXIPY_REQUIRED}"' in pyproject
-
-    def test_version_out_of_range_raises_naming_both_versions(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(metrics, 'complexipy_version', lambda: '7.0.1')
-        with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.require_complexipy()
-        message = str(excinfo.value)
-        assert '7.0.1' in message
-        assert metrics.COMPLEXIPY_REQUIRED in message
-
-    def test_version_below_the_floor_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(metrics, 'complexipy_version', lambda: '6.1.0')
-        with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.require_complexipy()
-        assert '6.1.0' in str(excinfo.value)
-
-    @pytest.mark.parametrize(
-        ('version', 'ok'),
-        [
-            ('6.2.0', True),
-            ('6.2', True),
-            ('6.9.9', True),
-            ('6.1.9', False),
-            ('6.0.0', False),
-            ('5.0.0', False),
-            ('7.0.0', False),
-            ('7.0.1', False),
-            ('8.0.0', False),
-        ],
-    )
-    def test_specifier_boundaries(self, version: str, ok: bool) -> None:
-        assert metrics.satisfies_complexipy_requirement(version) is ok
-
-    def test_missing_complexipy_distribution_raises_naming_the_tool(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import importlib.metadata
-
-        def _boom(name: str) -> str:
-            raise importlib.metadata.PackageNotFoundError(name)
-
-        monkeypatch.setattr(importlib.metadata, 'version', _boom)
-        with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.complexipy_version()
-        assert 'complexipy' in str(excinfo.value)
-
-
-class TestMaintainabilityIndex:
-    def test_returns_a_float_for_a_tiny_module(self) -> None:
-        value = metrics.maintainability_index(_TINY_SOURCE, path='tiny.py')
-        assert isinstance(value, float)
-        assert 0.0 <= value <= 100.0
 
     def test_merge_queue_anchor_is_zero(self) -> None:
         # The PRD Background table's "Maintainability index (radon) | 0" row.
@@ -881,139 +583,79 @@ class TestMaintainabilityIndex:
         source = (_REPO_ROOT / 'orchestrator/src/orchestrator/merge_lane/worker.py').read_text(
             encoding='utf-8'
         )
-        assert metrics.maintainability_index(source, path='merge_queue.py') == 0.0
-
-    def test_missing_radon_raises_naming_the_tool(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setitem(sys.modules, 'radon.metrics', None)
-        with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.maintainability_index(_TINY_SOURCE, path='tiny.py')
-        assert 'radon' in str(excinfo.value)
-
-    def test_unparseable_source_raises_naming_the_path(self) -> None:
-        with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.maintainability_index('def (:\n', path='broken.py')
-        assert 'broken.py' in str(excinfo.value)
+        assert source_measures.maintainability_index(source, path='merge_queue.py') == 0.0
 
 
 # ---------------------------------------------------------------------------
-# Test-suite patch targets into lane internals.
-#
-# The two detector shapes are ported from
-# test_merge_queue_reachback_patch_guard.py -- this measure subsumes that
-# guard's allowlist as a COUNT, so PRD task delta can delete the guard once the
-# count reaches zero. Two deliberate generalisations there: the prefix set is
-# `orchestrator.merge_queue.` AND `orchestrator.merge_lane.`, and the guard's
-# `forbidden` filter is dropped so all leaves count, not only the private ones.
+# Test-suite patch targets into lane internals: the ratchet's binding of the
+# patch-target measure to ``LANE_PATCH_MODULES``, driven through its public
+# seam. Every snippet imports a lane module, so it is in the measure's domain.
+
+_LANE_IMPORT = 'from orchestrator.merge_queue import W\n'
 
 
-class TestPatchTargets:
-    def test_string_path_patch_is_detected(self) -> None:
-        source = "patch('orchestrator.merge_queue.run_scoped_verification', x)\n"
-        assert metrics.patch_targets(source) == {'run_scoped_verification'}
-
-    def test_dotted_patch_is_detected(self) -> None:
-        source = "mock.patch('orchestrator.merge_queue.advance_main', x)\n"
-        assert metrics.patch_targets(source) == {'advance_main'}
-
-    def test_string_path_setattr_is_detected(self) -> None:
-        source = "monkeypatch.setattr('orchestrator.merge_queue.foo', x)\n"
-        assert metrics.patch_targets(source) == {'foo'}
-
-    def test_merge_lane_prefix_is_measured_too(self) -> None:
-        # Measured before the package exists, deliberately: without it, PRD task
-        # zeta2's `git mv` would move every patch target out from under the
-        # measure and the count would read 0 by RELOCATION rather than by the
-        # migration gamma1..gamma10 actually performs.
-        source = "monkeypatch.setattr('orchestrator.merge_lane.foo', x)\n"
-        assert metrics.patch_targets(source) == {'foo'}
-
-    def test_merge_lane_submodule_path_is_measured(self) -> None:
-        source = "patch('orchestrator.merge_lane.worker.spin', x)\n"
-        assert metrics.patch_targets(source) == {'worker.spin'}
-
-    def test_object_path_setattr_via_from_import_alias(self) -> None:
-        source = (
-            'from orchestrator import merge_queue\n'
-            '\n'
-            '\n'
-            'def t(monkeypatch):\n'
-            "    monkeypatch.setattr(merge_queue, 'x', 1)\n"
-        )
-        assert metrics.patch_targets(source) == {'x'}
-
-    def test_object_path_setattr_via_import_as_alias(self) -> None:
-        source = (
-            'import orchestrator.merge_queue as mq\n'
-            '\n'
-            '\n'
-            'def t(monkeypatch):\n'
-            "    monkeypatch.setattr(mq, 'y', 1)\n"
-        )
-        assert metrics.patch_targets(source) == {'y'}
-
-    def test_patch_object_on_the_bare_attribute_chain(self) -> None:
-        source = "patch.object(orchestrator.merge_queue, 'x', 1)\n"
-        assert metrics.patch_targets(source) == {'x'}
-
-    def test_patch_object_on_a_merge_lane_alias(self) -> None:
-        source = (
-            'from orchestrator import merge_lane\n'
-            '\n'
-            '\n'
-            "p = patch.object(merge_lane, 'z', 1)\n"
-        )
-        assert metrics.patch_targets(source) == {'z'}
-
-    def test_patch_object_on_a_satellite_is_not_counted(self) -> None:
-        # Already repointed to the defining satellite -- that is the END STATE
-        # this measure is driving towards, so counting it would penalise the fix.
-        source = (
-            'from orchestrator import merge_gates\n'
-            '\n'
-            '\n'
-            "p = patch.object(merge_gates, 'x', 1)\n"
-        )
-        assert metrics.patch_targets(source) == set()
-
-    def test_an_unrelated_attribute_named_merge_queue_is_not_counted(self) -> None:
-        source = "patch.object(workflow.merge_queue, 'x', 1)\n"
-        assert metrics.patch_targets(source) == set()
-
-    def test_a_docstring_quoting_the_dotted_path_is_not_counted(self) -> None:
-        source = '"""Patches orchestrator.merge_queue.foo at the lookup site."""\n'
-        assert metrics.patch_targets(source) == set()
-
-    def test_a_comment_quoting_the_dotted_path_is_not_counted(self) -> None:
-        source = "# patch('orchestrator.merge_queue.foo')\nx = 1\n"
-        assert metrics.patch_targets(source) == set()
-
-    def test_distinct_names_not_call_sites(self) -> None:
-        source = (
-            "patch('orchestrator.merge_queue.foo', a)\n"
-            "patch('orchestrator.merge_queue.foo', b)\n"
-            "patch('orchestrator.merge_queue.bar', c)\n"
-        )
-        assert metrics.patch_targets(source) == {'foo', 'bar'}
-
-    def test_a_bare_module_patch_with_no_leaf_is_not_counted(self) -> None:
-        source = "patch('orchestrator.merge_queue', x)\n"
-        assert metrics.patch_targets(source) == set()
-
-    def test_a_non_string_second_arg_is_not_counted(self) -> None:
-        source = (
-            'from orchestrator import merge_queue\n'
-            '\n'
-            '\n'
-            'p = patch.object(merge_queue, NAME, 1)\n'
-        )
-        assert metrics.patch_targets(source) == set()
-
-    def test_unparseable_source_raises_naming_the_path(self) -> None:
-        with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.patch_targets('def (:\n', path='broken.py')
-        assert 'broken.py' in str(excinfo.value)
+class TestLanePatchTargets:
+    @pytest.mark.parametrize(
+        ('body', 'expected'),
+        [
+            pytest.param(
+                "patch('orchestrator.merge_queue.run_scoped_verification', x)\n",
+                ['run_scoped_verification'],
+                id='merge-queue-string-path',
+            ),
+            # Measured before the package existed, deliberately: without it, PRD
+            # task zeta2's `git mv` would move every patch target out from under
+            # the measure and the count would read 0 by RELOCATION rather than by
+            # the migration gamma1..gamma10 actually performs.
+            pytest.param(
+                "monkeypatch.setattr('orchestrator.merge_lane.foo', x)\n",
+                ['foo'],
+                id='merge-lane-prefix',
+            ),
+            pytest.param(
+                "patch('orchestrator.merge_lane.worker.spin', x)\n",
+                ['worker.spin'],
+                id='merge-lane-submodule-leaf',
+            ),
+            pytest.param(
+                "from orchestrator import merge_queue\nmonkeypatch.setattr(merge_queue, 'x', 1)\n",
+                ['x'],
+                id='from-import-binding',
+            ),
+            pytest.param(
+                "import orchestrator.merge_queue as mq\nmonkeypatch.setattr(mq, 'y', 1)\n",
+                ['y'],
+                id='import-as-binding',
+            ),
+            pytest.param(
+                "from orchestrator import merge_lane\np = patch.object(merge_lane, 'z', 1)\n",
+                ['z'],
+                id='merge-lane-binding',
+            ),
+            pytest.param(
+                "patch.object(orchestrator.merge_queue, 'x', 1)\n",
+                ['x'],
+                id='bare-attribute-chain',
+            ),
+            # Already repointed to the defining satellite -- that is the END
+            # STATE this measure is driving towards, so counting it would
+            # penalise the fix.
+            pytest.param(
+                "from orchestrator import merge_gates\np = patch.object(merge_gates, 'x', 1)\n",
+                [],
+                id='satellite-not-counted',
+            ),
+            pytest.param(
+                "patch.object(workflow.merge_queue, 'x', 1)\n",
+                [],
+                id='unrelated-attribute-sharing-the-leaf-not-counted',
+            ),
+        ],
+    )
+    def test_the_lane_binding(self, body: str, expected: list[str]) -> None:
+        measures = metrics.test_file_measures(_LANE_IMPORT + body, path='t.py')
+        assert measures is not None
+        assert measures['patch_targets'] == expected
 
     def test_real_tree_union_anchor(
         self, live_report: dict, no_private_tree_scan: None
@@ -1053,7 +695,7 @@ class TestPatchTargets:
 
 
 # ---------------------------------------------------------------------------
-# Private-attribute reads from tests.
+# Lane-importing test files.
 
 
 class TestImportsLaneModule:
@@ -1085,53 +727,8 @@ class TestImportsLaneModule:
         assert 'orchestrator.workflow' not in metrics.lane_module_names()
 
 
-class TestPrivateReads:
-    def test_a_single_private_attribute_read_counts_one(self) -> None:
-        assert metrics.private_reads('worker._inflight\n', path='t.py') == 1
-
-    def test_a_chained_private_read_counts_each_hop(self) -> None:
-        # Both hops reach into internals.
-        assert metrics.private_reads('worker._a._b\n', path='t.py') == 2
-
-    def test_a_dunder_is_not_a_private_read(self) -> None:
-        # Dunders are Python protocol, not lane internals.
-        assert metrics.private_reads('obj.__dict__\nobj.__class__\n', path='t.py') == 0
-
-    def test_self_and_cls_receivers_are_excluded(self) -> None:
-        # A test class's own helpers are not lane internals. This is a
-        # STRUCTURAL predicate, not a name list.
-        source = (
-            'class T:\n'
-            '    def t(self):\n'
-            '        self._helper()\n'
-            '        return cls._x\n'
-        )
-        assert metrics.private_reads(source, path='t.py') == 0
-
-    def test_a_public_attribute_is_not_counted(self) -> None:
-        assert metrics.private_reads('worker.snapshot()\n', path='t.py') == 0
-
-    def test_a_docstring_quoting_a_private_read_is_not_counted(self) -> None:
-        assert metrics.private_reads('"""Reads worker._inflight."""\n', path='t.py') == 0
-
-    def test_a_private_read_off_self_dot_something_is_counted(self) -> None:
-        # `self.worker._x` reaches into a lane object even though the chain
-        # starts at self -- only the BARE `self`/`cls` receiver is excluded.
-        assert metrics.private_reads('self.worker._x\n', path='t.py') == 1
-
-    def test_a_private_write_counts_too(self) -> None:
-        # Writes are reads of the internal surface for this measure's purpose:
-        # both couple the test to an internal name.
-        assert metrics.private_reads('worker._inflight = 1\n', path='t.py') == 1
-
-    def test_unparseable_source_raises_naming_the_path(self) -> None:
-        with pytest.raises(metrics.MetricsError) as excinfo:
-            metrics.private_reads('def (:\n', path='broken.py')
-        assert 'broken.py' in str(excinfo.value)
-
-
 class TestTheTreeAndSourceFormsAgree:
-    """Each measure has a source-taking form and a tree-taking one.
+    """Each lane measure has a source-taking form and a tree-taking one.
 
     The sweeps parse once and call the tree form; everything else calls the
     source form, which is a parse plus a call of the tree form. They are one
@@ -1154,33 +751,6 @@ class TestTheTreeAndSourceFormsAgree:
         ('from_source', 'from_tree'),
         [
             pytest.param(
-                lambda src: metrics.file_size_measures(src, path='t.py'),
-                lambda src, tree: metrics.file_size_measures_in_tree(
-                    src, tree, path='t.py'
-                ),
-                id='file_size_measures',
-            ),
-            pytest.param(
-                lambda src: metrics.function_local_imports(src, path='t.py'),
-                lambda src, tree: metrics.function_local_imports_in_tree(tree),
-                id='function_local_imports',
-            ),
-            pytest.param(
-                lambda src: metrics.reexport_names(src, path='t.py'),
-                lambda src, tree: metrics.reexport_names_in_tree(tree),
-                id='reexport_names',
-            ),
-            pytest.param(
-                lambda src: metrics.patch_targets(src, path='t.py'),
-                lambda src, tree: metrics.patch_targets_in_tree(tree),
-                id='patch_targets',
-            ),
-            pytest.param(
-                lambda src: metrics.private_reads(src, path='t.py'),
-                lambda src, tree: metrics.private_reads_in_tree(tree),
-                id='private_reads',
-            ),
-            pytest.param(
                 lambda src: metrics.imports_lane_module(src, path='t.py'),
                 lambda src, tree: metrics.imports_lane_module_in_tree(tree),
                 id='imports_lane_module',
@@ -1198,7 +768,7 @@ class TestTheTreeAndSourceFormsAgree:
         ],
     )
     def test_the_two_forms_return_the_same_measure(self, from_source, from_tree) -> None:
-        tree = metrics._parse(self._SOURCE, path='t.py')
+        tree = source_measures.parse_source(self._SOURCE, path='t.py')
         expected = from_source(self._SOURCE)
         assert from_tree(self._SOURCE, tree) == expected
         # ANTI-VACUITY: the snippet exercises every measure, so none is trivially
@@ -1332,7 +902,7 @@ class TestBuildReport:
 
     def test_params_records_how_the_measurement_was_taken(self, report: dict) -> None:
         params = report['params']
-        assert params['complexipy_version'] == metrics.complexipy_version()
+        assert params['complexipy_version'] == source_measures.complexipy_version()
         assert params['cluster_paths'] == list(metrics.CLUSTER_PATHS)
         assert params['file_line_ceiling'] == metrics.FILE_LINE_CEILING
         assert params['new_function_cognitive_ceiling'] == (
@@ -1412,7 +982,7 @@ class TestBuildReport:
         self, live_measurement: LiveMeasurement
     ) -> None:
         # build_report wants two cognitive projections per cluster file, and
-        # used to fetch each from its own `_file_complexity` call -- 50 runs
+        # used to fetch each from its own complexipy run -- 50 runs
         # over the 25 files CLUSTER_PATHS' 23 entries resolve to (two are
         # globs), half of them redundant.
         #
@@ -1577,7 +1147,7 @@ class TestTestTreeSweep:
         block = metrics._report_enumeration(cluster, sweep.unreadable, sweep.test_tree)
         assert block['complete'] is False
         assert block['unreadable'] == ['orchestrator/tests/test_broken.py']
-        with pytest.raises(metrics.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics._require_complete_enumeration({'enumeration': block})
         assert 'orchestrator/tests/test_broken.py' in str(excinfo.value)
 
@@ -1663,7 +1233,7 @@ class TestAliasModules:
                 {**metrics.ALIAS_MODULES, 'orchestrator.merge_unlisted': 'x'}
             ),
         )
-        with pytest.raises(metrics.MetricsError, match='orchestrator.merge_unlisted'):
+        with pytest.raises(metrics.RatchetError, match='orchestrator.merge_unlisted'):
             metrics._require_aliases_in_cluster()
 
 
@@ -1862,7 +1432,7 @@ class TestReferencedAliasModules:
         assert metrics.referenced_alias_modules(source) == frozenset()
 
     def test_unparseable_source_raises_naming_the_path(self) -> None:
-        with pytest.raises(metrics.MetricsError) as excinfo:
+        with pytest.raises(source_measures.MetricsError) as excinfo:
             metrics.referenced_alias_modules('def (:\n', path='pkg/broken.py')
         assert 'pkg/broken.py' in str(excinfo.value)
 
@@ -1959,7 +1529,7 @@ class TestExternalImporterSweep:
         )
         block = metrics._report_enumeration(cluster, sweep.unreadable, sweep.test_tree)
         assert block['complete'] is False
-        with pytest.raises(metrics.MetricsError, match='app/broken.py'):
+        with pytest.raises(metrics.RatchetError, match='app/broken.py'):
             metrics._require_complete_enumeration({'enumeration': block})
 
     def test_a_tracked_file_that_is_gone_from_disk_is_recorded(
@@ -1978,14 +1548,6 @@ class TestExternalImporterSweep:
             tmp_path, {**_IMPORTER_TREE, 'app/silent_but_broken.py': 'def (:\n'}
         )
         assert metrics.sweep_repo(root).unreadable == ()
-
-    def test_parsing_remembers_nothing_between_calls(self) -> None:
-        # Two callers of one source must not share a tree: a measure that
-        # mutated it would corrupt the other, and the only guard would be prose.
-        source = 'import json\n'
-        assert metrics._parse(source, path='a.py') is not metrics._parse(
-            source, path='a.py'
-        )
 
     def test_a_string_path_dependent_counts_and_a_logger_name_does_not(
         self, tmp_path: Path
@@ -2052,53 +1614,6 @@ class TestExternalImporterSweep:
         assert metrics.alias_importer_measure(
             'orchestrator/src/orchestrator/merge_lane/**/*.py', counts
         ) == {}
-
-
-class TestTheImporterDomainFailsHard:
-    """No tracked-file list means no measurement, never a measurement of zero."""
-
-    def test_a_missing_git_is_a_named_hard_failure(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        root = _committed_tree(tmp_path, _IMPORTER_TREE)
-        empty_bin = tmp_path / 'empty-bin'
-        empty_bin.mkdir()
-        monkeypatch.setenv('PATH', str(empty_bin))
-        with pytest.raises(metrics.MetricsError, match='could not run git'):
-            metrics.tracked_python_files(root)
-
-    def test_a_directory_that_is_not_a_repository_is_a_named_hard_failure(
-        self, tmp_path: Path
-    ) -> None:
-        plain = tmp_path / 'plain'
-        plain.mkdir()
-        with pytest.raises(metrics.MetricsError, match='git'):
-            metrics.tracked_python_files(plain)
-
-    def test_a_subdirectory_of_a_repository_is_refused_not_listed(
-        self, tmp_path: Path
-    ) -> None:
-        # Listing from inside a repo yields only that subtree's files, so the
-        # sweep would run happily and report zero importers of everything.
-        root = _committed_tree(tmp_path, _IMPORTER_TREE)
-        with pytest.raises(metrics.MetricsError, match='not the top of a git work tree'):
-            metrics.tracked_python_files(root / 'app')
-
-    def test_the_listing_is_repo_relative_sorted_and_python_only(
-        self, tmp_path: Path
-    ) -> None:
-        root = _committed_tree(
-            tmp_path, {'b/z.py': '\n', 'a.py': '\n', 'notes.md': 'x\n', 'c/d/e.py': '\n'}
-        )
-        assert metrics.tracked_python_files(root) == ('a.py', 'b/z.py', 'c/d/e.py')
-
-    def test_the_real_checkout_is_listed_whole(self) -> None:
-        # ANTI-VACUITY for every importer count: a listing that collapsed to a
-        # few files would report zero importers and read as a finished migration.
-        # A floor, in this module's idiom (2,192 when this landed).
-        tracked = metrics.tracked_python_files(_REPO_ROOT)
-        assert len(tracked) >= 1500
-        assert 'scripts/merge_lane_metrics.py' in tracked
 
 
 # ---------------------------------------------------------------------------
@@ -2302,21 +1817,21 @@ class TestBaselineIO:
         # INV-11: a missing baseline is never an empty-baseline PASS, which
         # would silently disarm the ratchet for every downstream task.
         missing = tmp_path / 'nope.json'
-        with pytest.raises(metrics.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.load_baseline(missing)
         assert 'nope.json' in str(excinfo.value)
 
     def test_malformed_baseline_is_a_named_hard_failure(self, tmp_path: Path) -> None:
         target = tmp_path / 'baseline.json'
         target.write_text('{"files": ', encoding='utf-8')
-        with pytest.raises(metrics.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.load_baseline(target)
         assert 'baseline.json' in str(excinfo.value)
 
     def test_non_object_baseline_is_a_named_hard_failure(self, tmp_path: Path) -> None:
         target = tmp_path / 'baseline.json'
         target.write_text('[]', encoding='utf-8')
-        with pytest.raises(metrics.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.load_baseline(target)
         assert 'baseline.json' in str(excinfo.value)
 
@@ -2504,7 +2019,13 @@ class TestWriteBaselineRefusesAnUnauthorizedRaise:
         # The exit ladder: 1 is "a measure rose", 2 is "the instrument broke".
         # main() maps every MetricsError to 2, so a refusal that subclassed it
         # would report a real regression as a broken tool.
-        assert not issubclass(metrics.UnauthorizedRaise, metrics.MetricsError)
+        assert not issubclass(metrics.UnauthorizedRaise, source_measures.MetricsError)
+
+    def test_a_ratchet_fault_is_an_instrument_failure(self) -> None:
+        # The ratchet names its own faults, but they are still exit 2: every
+        # boundary catches the measure layer's MetricsError for both layers.
+        assert issubclass(metrics.RatchetError, source_measures.MetricsError)
+        assert issubclass(metrics.AppendOnlyViolation, metrics.RatchetError)
 
     # CEILINGS ARE A HOLE OF THE SAME SHAPE, and the reason is subtle: the two
     # ceilings apply only to keys ABSENT from the baseline. So a blind
@@ -2737,7 +2258,7 @@ class TestCompareBaselineFiles:
         previous = _baseline_image(tmp_path, 'previous.json', synthetic_report())
         absent = tmp_path / 'gone.json'
 
-        with pytest.raises(metrics.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.compare_baseline_files(previous, absent)
 
         assert str(absent) in str(excinfo.value)
@@ -2747,7 +2268,7 @@ class TestCompareBaselineFiles:
         broken = tmp_path / 'broken.json'
         broken.write_text('{"files": {', encoding='utf-8')
 
-        with pytest.raises(metrics.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.compare_baseline_files(previous, broken)
 
         message = str(excinfo.value)
@@ -3079,7 +2600,7 @@ class TestAuthorizedRaise:
         # whether the report it accompanied happened to raise anything -- a
         # blank --reason over a lowering run would pass unremarked, and the
         # ledger's whole purpose is to answer WHO and WHY (heuristic 10).
-        with pytest.raises(metrics.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.RaiseAuthorization(task_id=task_id, reason=reason)
 
         assert field in str(excinfo.value)
@@ -3090,7 +2611,7 @@ class TestAuthorizedRaise:
         target, ledger = self._seeded(tmp_path)
         before = target.read_text(encoding='utf-8')
 
-        with pytest.raises(metrics.MetricsError):
+        with pytest.raises(metrics.RatchetError):
             metrics.write_baseline(
                 target,
                 self._raised(),
@@ -3152,7 +2673,7 @@ class TestAuthorizedRaiseLedger:
 
         assert metrics.load_ledger(missing)['raises'] == []
 
-        with pytest.raises(metrics.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.load_baseline(missing)
         assert 'nope.json' in str(excinfo.value)
 
@@ -3173,7 +2694,7 @@ class TestAuthorizedRaiseLedger:
         # absence -- fails hard and names the file.
         target = tmp_path / 'ledger.json'
         target.write_text(content, encoding='utf-8')
-        with pytest.raises(metrics.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.load_ledger(target)
         assert 'ledger.json' in str(excinfo.value), why
 
@@ -3285,7 +2806,7 @@ class TestLedgerAppendedEntries:
     def test_dropping_a_historical_entry_is_refused_by_name(self) -> None:
         history = [_ledger_record('5485'), _ledger_record('5675')]
 
-        with pytest.raises(metrics.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.ledger_appended_entries(_ledger(*history), _ledger(history[0]))
 
         message = str(excinfo.value)
@@ -3301,13 +2822,13 @@ class TestLedgerAppendedEntries:
         history = _ledger_record('5485')
         forged = _ledger_record('5485', reason='actually it was a refactor')
 
-        with pytest.raises(metrics.MetricsError):
+        with pytest.raises(metrics.RatchetError):
             metrics.ledger_appended_entries(_ledger(history), _ledger(forged))
 
     def test_reordering_history_is_refused(self) -> None:
         first, second = _ledger_record('5485'), _ledger_record('5675')
 
-        with pytest.raises(metrics.MetricsError):
+        with pytest.raises(metrics.RatchetError):
             metrics.ledger_appended_entries(
                 _ledger(first, second), _ledger(second, first)
             )
@@ -3998,7 +3519,7 @@ class TestComparatorPreconditions:
         baseline = _ratchet_baseline()
         current = copy.deepcopy(baseline)
         current['params']['complexipy_version'] = '7.0.1'
-        with pytest.raises(metrics.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.check_against_baseline(current, baseline)
         assert '7.0.1' in str(excinfo.value)
         assert '6.2.0' in str(excinfo.value)
@@ -4009,7 +3530,7 @@ class TestComparatorPreconditions:
         baseline['params']['cluster_paths'] = [
             p for p in metrics.CLUSTER_PATHS if p != _GIT_OPS
         ] + ['orchestrator/src/orchestrator/ghost.py']
-        with pytest.raises(metrics.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.check_against_baseline(current, baseline)
         message = str(excinfo.value)
         assert _GIT_OPS in message
@@ -4023,7 +3544,7 @@ class TestComparatorPreconditions:
         current = copy.deepcopy(baseline)
         current['enumeration']['complete'] = False
         current['enumeration']['unreadable'] = ['orchestrator/tests/test_broken.py']
-        with pytest.raises(metrics.MetricsError) as excinfo:
+        with pytest.raises(metrics.RatchetError) as excinfo:
             metrics.check_against_baseline(current, baseline)
         assert 'test_broken.py' in str(excinfo.value)
 
@@ -4035,7 +3556,7 @@ class TestComparatorPreconditions:
         current = copy.deepcopy(baseline)
         current['enumeration']['complete'] = False
         current['files'][_MQ]['lines'] += 5000
-        with pytest.raises(metrics.MetricsError):
+        with pytest.raises(metrics.RatchetError):
             metrics.check_against_baseline(current, baseline)
 
 
@@ -4354,7 +3875,7 @@ class TestAuthorizeRaiseCli:
         assert not ledger.exists()
 
         def explode(root: Path) -> dict:
-            raise metrics.MetricsError('complexipy 7.0.1 is outside >=6.2,<7')
+            raise source_measures.MetricsError('complexipy 7.0.1 is outside >=6.2,<7')
 
         monkeypatch.setattr(metrics, 'build_report', explode)
         assert metrics.main(['--write-baseline', str(target)]) == 2
@@ -4488,7 +4009,7 @@ class TestCliContract:
         # a broken instrument is never mistaken for a clean tree or for a real
         # regression.
         def explode(root: Path) -> dict:
-            raise metrics.MetricsError('complexipy 7.0.1 is outside >=6.2,<7')
+            raise source_measures.MetricsError('complexipy 7.0.1 is outside >=6.2,<7')
 
         monkeypatch.setattr(metrics, 'build_report', explode)
         assert metrics.main(['--report']) == 2

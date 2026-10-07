@@ -42,12 +42,14 @@ from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 
 # Same import of the metrics script as test_merge_lane_ratchet.py: its
-# ALIAS_MODULES is the single list of alias paths.
+# ALIAS_MODULES is the single list of alias paths, and source_measures lists
+# the tracked files.
 _SCRIPTS = Path(__file__).parents[2] / 'scripts'
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 import merge_lane_metrics as metrics  # type: ignore[import-not-found]  # noqa: E402
+import source_measures  # type: ignore[import-not-found]  # noqa: E402
 
 _REPO_ROOT = Path(__file__).parents[2]
 
@@ -195,7 +197,7 @@ def test_no_tracked_file_reaches_a_missing_name_through_an_alias(
 ) -> None:
     scanned = 0
     stale: list[str] = []
-    for relpath in metrics.tracked_python_files(_REPO_ROOT):
+    for relpath in source_measures.tracked_python_files(_REPO_ROOT):
         if not metrics.is_external_importer_source(relpath):
             continue
         source = (_REPO_ROOT / relpath).read_text(encoding='utf-8')

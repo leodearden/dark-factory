@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 
-from merge_lane_metrics import (
+from source_measures import (
     MetricsError,
     PatchCall,
     file_size_measures_in_tree,
@@ -82,7 +82,7 @@ class _FirstParty:
         for path in tracked:
             name = src_module_name(path)
             if name is not None:
-                modules[name.removesuffix('.__init__')] = path
+                modules[name] = path
             elif path.rpartition('/')[0] in _SCRIPT_DIRS:
                 modules[path.rpartition('/')[2].removesuffix('.py')] = path
         roots = {
