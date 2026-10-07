@@ -34,10 +34,6 @@ logger = logging.getLogger(__name__)
 DISALLOW_BUILTIN = ['Bash', 'Edit', 'Write', 'NotebookEdit']
 
 # Task write tools (disallowed in Stage 1 and Stage 3; Stage 2 files tasks).
-# commit_planning is load-bearing for Stage 2's planning_mode -> add_dependency ->
-# commit_planning batch path (prompts/stage2.py). set_task_claimant is reached
-# in-process by reconciliation/targeted.py through the interceptor, not via this
-# MCP tool, so denying the tool does not touch that path.
 DISALLOW_TASK_WRITES = [
     'mcp__fused-memory__set_task_status',
     'mcp__fused-memory__submit_task',
@@ -69,9 +65,6 @@ DISALLOW_TASK_WRITES = [
 DISALLOW_MEMORY_WRITES = [
     'mcp__fused-memory__add_episode',
     'mcp__fused-memory__add_memory',
-    # Parity with add_memory. The recon cycle-summary mirror calls
-    # MemoryService.add_system_record IN-PROCESS (reconciliation/summary_pool.py),
-    # so this MCP-level deny does not touch it.
     'mcp__fused-memory__add_system_record',
     'mcp__fused-memory__delete_memory',
     'mcp__fused-memory__update_memory',
@@ -159,22 +152,9 @@ DISALLOW_RECON_REPORT_JOURNAL_WRITES = [
     'mcp__recon-report__repair_memory_citation',
 ]
 
-# fused-memory CONTROL-PLANE mutators (disallowed in every stage — task 3250).
-#
-# These mutate the machinery running a stage, not the data it curates:
-# trigger_reconciliation from inside a run is a re-entrancy hazard, reload_config
-# rewrites the config of the server executing the stage, and the rest steer the
-# scheduler, dead-letter queues and indexes. No recon prompt or stage references
-# any of them. A new list because neither incumbent reaches every stage:
-# DISALLOW_MEMORY_WRITES is folded by Stage 3 only, DISALLOW_TASK_WRITES misses
-# Stage 2 and would misname these, and
-# test_stages.py::test_stage2_disallows_builtins_and_retains_write_access pins that
-# neither of those reaches Stage 2.
-#
-# Known asymmetry, kept on purpose: replay_dead_letters stays in
-# DISALLOW_MEMORY_WRITES (Stage 3 only) while its dead-letter siblings land here.
-# Moving it would newly deny it to Stages 1 and 2, a behaviour change outside a
-# classification task.
+# fused-memory CONTROL-PLANE mutators (disallowed in every stage — task 3250):
+# tools that mutate the machinery running a stage — reconciliation, config, the
+# scheduler, dead-letter queues and indexes — rather than the data it curates.
 #
 # Every registered fused-memory tool must be in a deny bucket or reviewed as
 # read-only — see
