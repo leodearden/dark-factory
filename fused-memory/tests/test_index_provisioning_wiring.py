@@ -371,7 +371,7 @@ class TestFirstWriteProvisioning:
         bound equal to the write budget would let the outer one cancel the write.
         """
         config = mock_config.model_copy(deep=True)
-        config.queue.backend_read_timeout_seconds = 0.05
+        config.queue.backend_read_timeout_seconds = provision_budget = 0.05
         config.queue.backend_write_timeout_seconds = 0.5
         config.queue.write_timeout_seconds = 0.5
         write_budget = config.queue.write_timeout_seconds
@@ -391,7 +391,10 @@ class TestFirstWriteProvisioning:
         graph.ro_query = AsyncMock(side_effect=_ro_query)
         events = self._wire(backend, graph, listing=['reg'])
 
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         await asyncio.wait_for(self._write(backend), write_budget)
+        assert loop.time() - started == pytest.approx(provision_budget)
         assert events == ['upstream'], 'the write must proceed past a hung provisioning read'
 
         await asyncio.wait_for(self._write(backend), write_budget)
