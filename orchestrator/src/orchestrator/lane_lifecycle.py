@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING
 from shared import safe_io
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     from escalation.queue import EscalationQueue
 
 logger = logging.getLogger(__name__)
@@ -654,6 +656,36 @@ class LaneLifecycle:
         """
         rec = self.read(lane)
         return self._best_effort_step(lane, rec, LaneState.IN_USE, LaneState.ASSIGNED)
+
+    def reset_stale_in_use(self, skip: Iterable[str] = ()) -> list[str]:
+        """Step every IN_USE record whose lane is not in *skip* back to ASSIGNED.
+
+        A crash mid-span leaves a record IN_USE forever, which after leaf ε
+        makes the lane permanently unreclaimable and re-creates the
+        2026-07-10 ENOSPC accretion. Run it at startup, or at any time with
+        *skip* naming the lanes that hold a live in-process span. Never
+        raises; returns the names of the lanes it reset, in lane-name order.
+        """
+        try:
+            records = self.all_records()
+        except OSError:
+            logger.warning(
+                'lane_lifecycle: could not scan %s for stale IN_USE records',
+                self.state_dir, exc_info=True,
+            )
+            return []
+        skipped = set(skip)
+        reset: list[str] = []
+        for lane_name, rec in records.items():
+            if rec.state is not LaneState.IN_USE or lane_name in skipped:
+                continue
+            if self.note_idle(lane_name):
+                logger.info(
+                    'lane_lifecycle: reset stale IN_USE lane %s (task_id=%s) to assigned',
+                    lane_name, rec.task_id,
+                )
+                reset.append(lane_name)
+        return reset
 
     def _best_effort_step(
         self, lane: Path | str, rec: LaneRecord | None, origin: LaneState, to: LaneState,
