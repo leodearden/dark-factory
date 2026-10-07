@@ -1156,8 +1156,10 @@ async def test_cli_run_requires_the_terminal_tool():
     mock_invoke.assert_not_called()
 
 
-_CLI_FAILURE_CASES = [
-    pytest.param(
+# (case id, CLI result, the origin the run must report)
+_CLI_FAILURES: list[tuple[str, AgentResult, str]] = [
+    (
+        'refusal',
         AgentResult(
             success=False,
             output=_MEASURED_REFUSAL_OUTPUT,
@@ -1166,26 +1168,28 @@ _CLI_FAILURE_CASES = [
             session_id='sess-r',
         ),
         'api_refusal',
-        id='refusal',
     ),
-    pytest.param(
+    (
+        'max_turns',
         AgentResult(success=False, output='', subtype='error_max_turns'),
         'cli_max_turns',
-        id='max_turns',
     ),
-    pytest.param(
+    (
+        'unparseable',
         _verdict_result(structured_output='not valid json {'),
         'cli_output_unparseable',
-        id='unparseable',
     ),
-    pytest.param(_verdict_result(structured_output=None), 'cli_output_empty', id='none'),
-    pytest.param(_verdict_result(structured_output={}), 'cli_output_empty', id='empty_dict'),
-    pytest.param(_verdict_result(structured_output='null'), 'cli_output_empty', id='json_null'),
+    ('none', _verdict_result(structured_output=None), 'cli_output_empty'),
+    ('empty_dict', _verdict_result(structured_output={}), 'cli_output_empty'),
+    ('json_null', _verdict_result(structured_output='null'), 'cli_output_empty'),
 ]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(('result', 'origin'), _CLI_FAILURE_CASES)
+@pytest.mark.parametrize(
+    ('result', 'origin'),
+    [pytest.param(result, origin, id=case_id) for case_id, result, origin in _CLI_FAILURES],
+)
 async def test_cli_failures_end_the_run_with_a_closed_origin(result, origin, caplog):
     """Each recognised CLI failure ends the run as an audited no-tool-call exit
     whose ``warning_origin`` is a closed-vocabulary census token, so verify()
@@ -1210,8 +1214,7 @@ async def test_cli_warning_origins_is_exactly_what_the_cli_path_emits():
     emitted by some failure.
     """
     emitted = set()
-    for case in _CLI_FAILURE_CASES:
-        result, _origin = case.values
+    for _case_id, result, _origin in _CLI_FAILURES:
         (payload, _journal), _mock = await _run_cli(_cli_agent(), result)
         emitted.add(payload['warning_origin'])
     assert emitted == set(CLI_WARNING_ORIGINS)

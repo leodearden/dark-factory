@@ -78,7 +78,7 @@ async def _verify_cli_kwargs(git_root) -> dict:
             codebase_root=git_root,
         )
     mock_invoke.assert_called_once()
-    return mock_invoke.call_args.kwargs
+    return dict(mock_invoke.call_args.kwargs)
 
 
 @pytest.mark.asyncio
