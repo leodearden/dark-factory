@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json as _json
 import logging
+import re
 import subprocess
 from importlib import resources as pkg_resources
 from pathlib import Path
@@ -2579,8 +2580,8 @@ class _TaskDocScheduler:
         return dict(self._task_doc)
 
 
-async def _capture_investigation_prompt(tmp_path, scheduler) -> str:
-    """Run one investigation and return the prompt handed to the agent."""
+async def _capture_investigation_call(tmp_path, scheduler) -> dict:
+    """Run one investigation and return the kwargs handed to the agent."""
     from orchestrator.dry_run_unblock import run_dry_run_unblock
 
     agent_result = _make_agent_result(structured_output={
@@ -2599,7 +2600,12 @@ async def _capture_investigation_prompt(tmp_path, scheduler) -> str:
             mcp=MagicMock(),
             config=_make_config(),
         )
-    return mock_invoke.call_args.kwargs['prompt']
+    return mock_invoke.call_args.kwargs
+
+
+async def _capture_investigation_prompt(tmp_path, scheduler) -> str:
+    """Run one investigation and return the prompt handed to the agent."""
+    return (await _capture_investigation_call(tmp_path, scheduler))['prompt']
 
 
 class TestPromptCarriesTaskContext:
@@ -2935,3 +2941,56 @@ class TestContentlessTaskRecordIsAlsoDegraded:
         assert 'Rebase the verify lane' in prompt, prompt
         assert entry.get('status') != 'investigation_failed', entry
         assert entry['task_context_unavailable'] is False, entry
+
+
+class TestSkillPromptExplainsEveryTaskBlockState:
+    """The investigator reads ``skills/unblock-auto/SKILL.md`` — its system
+    prompt — to interpret the task block ``dry_run_unblock.py::_task_context``
+    renders into its user prompt, so the two must stay aligned.  This guard is
+    that alignment mechanism.  ``agents/briefing.py::_format_task``'s
+    similar-looking labels have no such reader and are deliberately NOT
+    coupled to these (task 5538).
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('state', 'make_scheduler', 'state_phrase'), [
+        pytest.param(
+            'healthy', lambda: _TaskDocScheduler(), None,
+            id='healthy',
+        ),
+        pytest.param(
+            'fetch_failed', lambda: _TaskDocScheduler(returns_none=True),
+            '**Task record:** unavailable',
+            id='fetch_failed',
+        ),
+        pytest.param(
+            'record_empty',
+            lambda: _TaskDocScheduler(
+                task_doc=TestContentlessTaskRecordIsAlsoDegraded._CONTENTLESS,
+            ),
+            '**Task record:** fetched but empty',
+            id='record_empty',
+        ),
+    ])
+    async def test_system_prompt_explains_the_task_block(
+        self, tmp_path, state, make_scheduler, state_phrase,
+    ):
+        kwargs = await _capture_investigation_call(tmp_path, make_scheduler())
+        user, system = kwargs['prompt'], kwargs['system_prompt']
+
+        labels = set(re.findall(r'\*\*[^*\n]+?:\*\*', user))
+        assert labels, f'{state}: no bold label in the user prompt\n{user}'
+        for label in sorted(labels):
+            assert label in system, (
+                f'{state}: the user prompt carries {label!r} but the '
+                f'unblock-auto system prompt never explains it'
+            )
+
+        if state_phrase is not None:
+            assert state_phrase in user, (
+                f'{state}: the renderer no longer emits {state_phrase!r}\n{user}'
+            )
+            assert state_phrase in system, (
+                f'{state}: the user prompt carries {state_phrase!r} but the '
+                f'unblock-auto system prompt never explains it'
+            )
