@@ -20,7 +20,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from shared.task_statuses import TERMINAL
 
@@ -31,12 +31,18 @@ __all__ = [
     'ROTATE_TARGET_BYTES',
     'HISTORY_KEEP',
     'HISTORY_MAX',
+    'ARCHIVE_AGENT_ID',
     'ARCHIVE_MAX_BYTES',
     'ARCHIVE_SOURCE',
     'ROLLUP_KEY',
     'STANDING_INSTRUCTION',
+    'AuditTrailArchive',
+    'AuditTrailCommit',
+    'RotationOutcome',
     'RotationPlan',
     'TaskRewrite',
+    'bound_audit_trail',
+    'memory_service_archive',
     'near_duplicate_key',
     'plan_rotation',
     'task_fingerprint',
@@ -57,6 +63,8 @@ ARCHIVE_MAX_BYTES = 16_000
 ROLLUP_KEY = 'audit_trail_rotation'
 # The archive memory's blessed Mem0 'source'; it carries no 'kind' (KIND_REGISTRY is closed).
 ARCHIVE_SOURCE = 'audit_trail_rotation'
+# A recon-stage id, so reconciliation/internal_writers.py::is_internal_writer recognises it.
+ARCHIVE_AGENT_ID = 'recon-stage-audit_trail_rotation'
 STANDING_INSTRUCTION = (
     'Append each new cycle record to the arrays named in history_keys, newest first, '
     'instead of minting a dated top-level metadata key. The harness trims each array '
@@ -589,15 +597,147 @@ def plan_rotation(task: Mapping[str, Any], *, now: datetime) -> RotationPlan | N
 
 def unrotatable_reason(task: Mapping[str, Any], *, now: datetime) -> dict[str, Any] | None:
     """Why ``plan_rotation(task, now=now)`` is None for a task over the threshold."""
-    payload = task_payload_bytes(task)
+    plan = _plan_or_refusal(task, now)
+    return None if isinstance(plan, RotationPlan) else _unrotatable_report(task, plan)
+
+
+def _unrotatable_report(task: Mapping[str, Any], refusal: Refusal) -> dict[str, Any] | None:
+    columns = _column_bytes(task)
+    payload = sum(columns.values())
     if payload <= ROTATE_THRESHOLD_BYTES:
         return None
-    plan = _plan_or_refusal(task, now)
-    if isinstance(plan, RotationPlan):
-        return None
     return {
-        'reason': plan,
+        'reason': refusal,
         'payload_bytes': payload,
         'threshold_bytes': ROTATE_THRESHOLD_BYTES,
-        'column_bytes': _column_bytes(task),
+        'column_bytes': columns,
     }
+
+
+class AuditTrailArchive(Protocol):
+    """Where rotated-out text goes; ``read`` must return exactly what ``write`` stored."""
+
+    async def write(
+        self, *, project_id: str, content: str, metadata: dict[str, Any]
+    ) -> str | None: ...
+
+    async def read(self, *, project_id: str, memory_id: str) -> str | None: ...
+
+
+class AuditTrailCommit(Protocol):
+    """Writes the rewrite iff the task still has ``expected_fingerprint``; else returns None."""
+
+    async def __call__(
+        self, *, expected_fingerprint: str, description: str | None, metadata: dict[str, Any]
+    ) -> Mapping[str, Any] | None: ...
+
+
+RotationStatus = Literal['rotated', 'folded', 'archive_unconfirmed', 'superseded', 'unrotatable']
+
+
+@dataclass(frozen=True)
+class RotationOutcome:
+    status: RotationStatus
+    task_id: str
+    bytes_before: int
+    bytes_after: int | None = None
+    archive_memory_id: str | None = None
+    over_threshold_after: bool | None = None
+    unrotatable: Mapping[str, Any] | None = None
+    committed_task: Mapping[str, Any] | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        """The wire form; the committed task travels separately as ``updated_task``."""
+        return {
+            'status': self.status,
+            'task_id': self.task_id,
+            'bytes_before': self.bytes_before,
+            'bytes_after': self.bytes_after,
+            'archive_memory_id': self.archive_memory_id,
+            'over_threshold_after': self.over_threshold_after,
+            'unrotatable': None if self.unrotatable is None else dict(self.unrotatable),
+        }
+
+
+async def bound_audit_trail(
+    task: Mapping[str, Any],
+    *,
+    project_id: str,
+    now: datetime,
+    archive: AuditTrailArchive,
+    commit: AuditTrailCommit,
+) -> RotationOutcome | None:
+    """Rotate ``task``: archive and confirm the read-back first, then commit by fingerprint.
+
+    None when there is nothing to bound.  Nothing leaves the task unless the
+    archive read back byte-identical (docs §10 step 1).
+    """
+    plan = _plan_or_refusal(task, now)
+    task_id = str(task.get('id'))
+    if not isinstance(plan, RotationPlan):
+        report = _unrotatable_report(task, plan)
+        if report is None:
+            return None
+        return RotationOutcome('unrotatable', task_id, report['payload_bytes'], unrotatable=report)
+    archive_memory_id = None
+    if plan.archive_text is not None:
+        archive_memory_id = await archive.write(
+            project_id=project_id, content=plan.archive_text, metadata=plan.archive_metadata
+        )
+        landed = archive_memory_id is not None and plan.archive_text == await archive.read(
+            project_id=project_id, memory_id=archive_memory_id
+        )
+        if not landed:
+            return RotationOutcome(
+                'archive_unconfirmed', task_id, plan.bytes_before, archive_memory_id=archive_memory_id
+            )
+    rewrite = plan.render(archive_memory_id)
+    committed = await commit(
+        expected_fingerprint=task_fingerprint(task),
+        description=rewrite.description,
+        metadata=rewrite.metadata,
+    )
+    if committed is None:
+        return RotationOutcome(
+            'superseded', task_id, plan.bytes_before, archive_memory_id=archive_memory_id
+        )
+    bytes_after = task_payload_bytes(committed)
+    return RotationOutcome(
+        'folded' if archive_memory_id is None else 'rotated',
+        task_id,
+        plan.bytes_before,
+        bytes_after=bytes_after,
+        archive_memory_id=archive_memory_id,
+        over_threshold_after=bytes_after > ROTATE_THRESHOLD_BYTES,
+        committed_task=committed,
+    )
+
+
+@dataclass(frozen=True)
+class _MemoryServiceArchive:
+    memory_service: Any
+
+    async def write(self, *, project_id: str, content: str, metadata: dict[str, Any]) -> str | None:
+        response = await self.memory_service.add_memory(
+            content=content,
+            category='observations_and_summaries',
+            project_id=project_id,
+            agent_id=ARCHIVE_AGENT_ID,
+            metadata=dict(metadata),
+            _source=ARCHIVE_SOURCE,
+        )
+        return response.memory_ids[0] if response.memory_ids else None
+
+    async def read(self, *, project_id: str, memory_id: str) -> str | None:
+        record = await self.memory_service.get_memory_by_id(project_id, memory_id)
+        return None if record is None else record['content']
+
+
+def memory_service_archive(memory_service: Any) -> AuditTrailArchive:
+    """The archive port over a duck-typed MemoryService.
+
+    add_memory reports a mem0 failure as empty ``memory_ids``, so ``write``
+    returns None for it.  ``get_memory_by_id`` takes ``project_id`` FIRST and
+    positionally; its TimeoutError propagates rather than reading as a miss.
+    """
+    return _MemoryServiceArchive(memory_service)
