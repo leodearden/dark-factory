@@ -301,23 +301,24 @@ The containment check on `$c`'s **first parent** decides — but read the caveat
 
 **`$c^1` is main-just-before-the-merge only when `$c` was created ON main.**
 `orchestrator/src/orchestrator/git_ops.py::GitOps.merge_to_main` merges with `git merge --no-ff`
-*from* main, so that holds for every dark-factory landing. It is **not** guaranteed for a target
-project reached via [`orchestrate/SKILL.md`](../orchestrate/SKILL.md)'s call site, where the
-project's own merge convention decides parent order: a merge built on the branch side (e.g. an
-integration branch cut from the task branch, then fast-forwarded onto main) has the **task tip**
-at `$c^1`, the containment check exits 0 trivially, and this arm falsely concludes "unrelated
-later merge, do not stamp" — discarding a merge sha you were already holding. On a project whose
-merge direction you do not know, confirm the parent order before trusting the rc:
-`git rev-list --parents -n 1 "$c"` (or `git log --format=%P -n 1 "$c"`) — the first parent listed
-must itself be on main *before* `$c`; if it is the branch side, read `$c^2` instead.
+*from* main, so that holds for every dark-factory landing. On a target project reached via
+[`orchestrate/SKILL.md`](../orchestrate/SKILL.md)'s call site whose merge direction you do not
+know, parent order is **not recoverable**: git records no merge direction. A merge built on the
+branch side and fast-forwarded onto main is the same commit graph, sha for sha, as a
+fast-forward landing followed by an unrelated merge made on main, so no parent-order,
+first-parent or containment check can tell them apart. On such a project read
+`contained-before rc=0` as **undecided** rather than as "unrelated later merge", and take the
+same exit: do not stamp `$c`, continue to the citation gate.
+(`orchestrator/tests/test_group_merge_candidate_ordering.py` pins the identity against real git.)
 
 - **contained-before rc=1** → the branch was not in main before `$c`, so `$c` **is** the merge
   that brought it in. Stamp `{"kind": "<merged|found_on_main>", "commit": "$c", "note": "absorbed
   into group merge; sha verified by ancestry containment"}` — `$c` is a merge commit that brought
   this branch in, so the same `kind` rule as [step 2](#step-2) applies. Carry the note here too.
-- **contained-before rc=0** (or `$c` empty) → the branch was already in main before `$c`, so
-  `$c` is an unrelated later merge. No merge commit exists for this branch. **Do not stamp
-  yet** — continue to the citation gate below, whose only stampable sha is the citing commit.
+- **contained-before rc=0** (or `$c` empty) → **do not stamp `$c`**. Where `$c` was created on
+  main, the branch was already in main before it and `$c` is an unrelated later merge; where
+  merge direction is unknown, rc=0 is undecided. Either way, continue to the citation gate
+  below, whose only stampable sha is the citing commit.
 
 **The citation gate (phantom-branch check).** rc=0 does not by itself prove this branch carries
 any work: a branch that never advanced past its creation point has main's own old base commit as
