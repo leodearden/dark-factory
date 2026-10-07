@@ -15,6 +15,7 @@ from _dashboard_helpers import (
     mcp_tool_response,
 )
 from shared.task_runtime_state import TaskRuntimeEntry, TaskRuntimeSnapshot
+from shared.testing_virtual_clock import virtual_clock_test
 
 
 class _PerPortHandler:
@@ -186,6 +187,7 @@ class TestFetchTaskRuntime:
             offline=True, offline_reason='unreachable',
         )
 
+    @virtual_clock_test
     async def test_timeout_yields_offline_snapshot_for_slow_project_only(self):
         from dashboard.data.task_runtime import fetch_task_runtime
         handler = _PerPortHandler(
