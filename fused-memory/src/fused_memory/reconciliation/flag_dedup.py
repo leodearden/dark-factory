@@ -5083,13 +5083,13 @@ async def acknowledge_flag_marker(
         )
         return 0
 
-    probe = await ledger.get_by_identity(project_id, 'stage1_flag_marker', tid, ftype, '')
+    probe = await ledger.get_by_identity(project_id, STAGE1_FLAG_MARKER_KIND, tid, ftype, '')
     if probe is None:
         return 0
 
     await ledger.mark_addressed(
         project_id,
-        'stage1_flag_marker',
+        STAGE1_FLAG_MARKER_KIND,
         tid,
         ftype,
         '',
