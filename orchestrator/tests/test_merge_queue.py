@@ -12921,11 +12921,9 @@ class _AnswerListVerifier(FakeVerifier):
     an exhausted script repeats rather than raising, so an over-eager caller
     is caught by the call-count assertion the test already makes.
 
-    Scoped ``answers`` ride the parent's ``sequence=``/``default=``, so
-    ``verified``, ``entered_count``, ``verify_calls`` and ``await_entry`` are
-    the parent's. ``gates`` and ``disk_reasons`` are consumed the same way
-    here, and ``scoped_calls``/``disk_guard_calls`` record what each step was
-    asked.
+    Scoped ``answers`` ride the parent's ``sequence=``/``default=``, so the
+    scoped entry recording is the parent's own — see
+    ``orchestrator/tests/_merge_lane_fakes.py::FakeVerifier``.
     """
 
     def __init__(
