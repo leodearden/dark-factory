@@ -398,8 +398,14 @@ class ClaudeShardAsker:
         return _shard_reply(result)
 
 
+_FAILED_OUTPUT_CHARS = 200
+
+
 def _shard_reply(result: AgentResult) -> ShardReply:
-    detail = '' if result.success else f'subtype={result.subtype!r} timed_out={result.timed_out}'
+    detail = '' if result.success else (
+        f'subtype={result.subtype!r} timed_out={result.timed_out} '
+        f'output={result.output[:_FAILED_OUTPUT_CHARS]!r}'
+    )
     return ShardReply(
         success=result.success,
         structured_output=result.structured_output,
