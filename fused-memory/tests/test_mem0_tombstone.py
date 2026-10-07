@@ -779,3 +779,77 @@ class TestSweepDeletionGuardReadsRealTombstones:
             'deleting_run_id': 'ea597ad1-f634-4b33-a074-0aa755c40b4a',
             'classification': 'undocumented_deleter',
         }]
+
+
+class TestFindMem0DeletionTombstones:
+    """Tombstones reachable from a uuid PREFIX, over the real ledger (task 5323).
+
+    The tombstone store is keyed by the full memory id, so a prefix-shaped
+    get_memory_by_id miss needs a listing. Each hit is decoded by the existing
+    get_mem0_deletion_tombstone, so the two answers cannot drift apart.
+    """
+
+    _PROJECT = 'reify'
+    _FIRST = 'bff81530-0000-4000-8000-00000000000a'
+    _SECOND = 'bff81530-0000-4000-8000-00000000000b'
+
+    @pytest.mark.asyncio
+    async def test_each_match_is_the_exact_id_decode_plus_its_memory_id(
+        self, tmp_path, mock_config,
+    ):
+        from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
+        from fused_memory.services.memory_service import MemoryService
+
+        store = ReconLedgerStore(tmp_path / 'reconciliation.db')
+        await store.initialize()
+        try:
+            service = MemoryService(mock_config)
+            service.set_recon_ledger(store)
+            written = await record_mem0_deletion_tombstones(
+                service,
+                self._PROJECT,
+                [
+                    {'id': memory_id, 'metadata': _VICTIM_METADATA, 'created_at': None}
+                    for memory_id in (self._SECOND, self._FIRST, 'cafe0000-0000-4000-8000-000000000001')
+                ],
+                deleter='stage1_cycle_summary_trim',
+                deleting_run_id='ea597ad1-f634-4b33-a074-0aa755c40b4a',
+            )
+            assert written == 3
+
+            found = await service.find_mem0_deletion_tombstones(self._PROJECT, 'bff81530')
+            expected = [
+                {'memory_id': memory_id, **(await service.get_mem0_deletion_tombstone(self._PROJECT, memory_id))}
+                for memory_id in (self._FIRST, self._SECOND)
+            ]
+        finally:
+            await store.close()
+
+        assert found == expected
+        assert found[0]['deleter'] == 'stage1_cycle_summary_trim'
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_wired_returns_empty(self, mock_config):
+        from fused_memory.services.memory_service import MemoryService
+
+        service = MemoryService(mock_config)
+
+        assert await service.find_mem0_deletion_tombstones(self._PROJECT, 'bff81530') == []
+
+    @pytest.mark.asyncio
+    async def test_a_raising_listing_returns_empty_and_warns_once(self, mock_config, caplog):
+        """Fail-safe like the exact-id read: a tombstone's absence proves nothing."""
+        from fused_memory.services.memory_service import MemoryService
+
+        service = MemoryService(mock_config)
+        ledger = AsyncMock()
+        ledger.mem0_tombstone_ids_with_prefix = AsyncMock(side_effect=RuntimeError('sqlite locked'))
+        service.set_recon_ledger(ledger)
+
+        with caplog.at_level(logging.WARNING, logger='fused_memory.services.memory_service'):
+            found = await service.find_mem0_deletion_tombstones(self._PROJECT, 'bff81530')
+
+        assert found == []
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings!r}'
+        assert warnings[0].exc_info is not None
