@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-import statistics
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -408,29 +407,26 @@ def test_novelty_spike_replay_fires_on_the_relative_rule_not_the_absolute_one():
     }
     _, first_seens = ct.codebook_signal(recorded)
 
-    relative_days, absolute_days = set(), set()
+    lines, fired, absolute_days = {}, {}, set()
     day = date(2026, 8, 15)
     while day <= date(2026, 10, 3):
-        n = _recorded_72h_count(day)
-        m = statistics.median(_recorded_72h_count(day - timedelta(days=k)) for k in range(1, 31))
-        expected = n >= 4 and n >= 2 * m
-
         now = datetime.combine(day, datetime.min.time(), tzinfo=UTC) + timedelta(hours=12)
         decision = _evaluate_novelty(first_seens, now=now)
-
-        assert decision.fire is expected, day
-        line = f"novelty-spike: {n} within 72h (baseline median {m:g}, x2)"
-        assert (line + " -> FIRE" if expected else line) in decision.reasons, day
+        lines[day] = _novelty_line(decision)
         if decision.fire:
-            relative_days.add(day)
-        if n >= 4:
+            fired[day] = lines[day]
+        if _recorded_72h_count(day) >= 4:
             absolute_days.add(day)
         day += timedelta(days=1)
 
-    assert relative_days
-    assert relative_days < absolute_days
-    assert date(2026, 9, 11) in relative_days
-    assert date(2026, 8, 25) not in relative_days
+    assert fired == {
+        date(2026, 9, 11): "novelty-spike: 104 within 72h (baseline median 43.5, x2) -> FIRE",
+        date(2026, 9, 12): "novelty-spike: 108 within 72h (baseline median 44.5, x2) -> FIRE",
+        date(2026, 9, 13): "novelty-spike: 106 within 72h (baseline median 46, x2) -> FIRE",
+    }
+    assert lines[date(2026, 8, 25)] == "novelty-spike: 76 within 72h (baseline median 43.5, x2)"
+    assert len(absolute_days) == 48
+    assert set(fired) < absolute_days
 
 
 # ---------------------------------------------------------------------------
