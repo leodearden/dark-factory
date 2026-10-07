@@ -224,7 +224,7 @@ Run these strictly in order. Stop and ABORT at the first step that is not cleanl
      while state ∈ {queued, verifying, gate, finalizing} and now() < deadline:
      # merge-state-vocab:end
          wait = clamp(eta_seconds if eta_seconds else 30, min=15, max=60)
-         sleep(wait)
+         sleep(wait)   # unattended: realise per skills/merge-queue/SKILL.md#waiting-between-polls, its FOREGROUND form only -- a bare sleep 60 is blocked by the harness
          result = mcp__escalation__merge_status(request_id)
      # merge-state-vocab:begin partition=LIVE_STATES
      #   Mirrors shared/src/shared/merge_state.py::LIVE_STATES (second copy).

@@ -520,7 +520,7 @@ The merge procedure is iterative — don't assume one pass will be enough:
                                    # not more polling).
 
      loop:
-         sleep(poll_interval)
+         sleep(poll_interval)  # realise per skills/merge-queue/SKILL.md#waiting-between-polls -- a bare sleep 60 is blocked by the harness
          poll = mcp__escalation__merge_status(**poll_kwargs)
          if poll["state"] in terminal and accept_terminal(poll):
              break
