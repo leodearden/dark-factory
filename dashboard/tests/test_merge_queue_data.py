@@ -1966,13 +1966,20 @@ class TestNormalizeLiveEntry:
         result = _normalize_entry(raw)
         assert set(result.keys()) == {'task_id', 'branch', 'state', 'age_secs', 'position', 'waiter_alive'}
 
-    def test_missing_age_secs_defaults_zero(self):
-        """Missing age_secs defaults to 0.0 (defensive)."""
+    def test_missing_age_is_none_not_zero(self):
+        """An entry that omits its age has no age; 0.0 would read as 'queued just now'."""
         from dashboard.data.merge_queue import _normalize_entry
 
         raw = {'task_id': '5', 'branch': 'b', 'state': 'queued'}
         result = _normalize_entry(raw)
-        assert result['age_secs'] == 0.0
+        assert result['age_secs'] is None
+
+    def test_none_age_is_none(self):
+        from dashboard.data.merge_queue import _normalize_entry
+
+        raw = {'task_id': '5', 'branch': 'b', 'state': 'queued', 'age_secs': None}
+        result = _normalize_entry(raw)
+        assert result['age_secs'] is None
 
 
 # ---------------------------------------------------------------------------
