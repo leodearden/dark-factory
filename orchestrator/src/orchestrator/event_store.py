@@ -933,6 +933,10 @@ class _MergeFinalizedKey(Enum):
     branch = "json_extract(data, '$.branch') = ?"
     task_id = 'task_id = ?'
     superseded_by = "json_extract(data, '$.superseded_by') = ?"
+    absorbs = (
+        "EXISTS (SELECT 1 FROM json_each(events.data, '$.absorbed_request_ids') "
+        'WHERE json_each.value = ?)'
+    )
 
 
 class EventStore:
@@ -1079,6 +1083,29 @@ class EventStore:
             cross_run=cross_run,
             latest_only=False,
         )
+
+    def merge_finalized_absorbing(
+        self, request_id: str, *, cross_run: bool = False,
+    ) -> dict | None:
+        """Return the newest primary row whose absorbed_request_ids lists *request_id*.
+
+        Resolves an attach or door-coalesced loser, which never gets a row of
+        its own, to the primary's outcome: the durable, restart-surviving
+        replacement for TerminalOutcomeRetention.record_alias
+        (plans/merge-status-durable-non-landed-prd.md D6/D7).  Kept apart from
+        latest_merge_finalized so a caller can tell an alias hit from a direct
+        one.  Whole-id match; same projection, run scope and fire-safe policy.
+        """
+        if not request_id:
+            return None
+        rows = self._select_merge_finalized(
+            'merge_finalized_absorbing',
+            _MergeFinalizedKey.absorbs,
+            request_id,
+            cross_run=cross_run,
+            latest_only=True,
+        )
+        return rows[0] if rows else None
 
     def _select_merge_finalized(
         self,
