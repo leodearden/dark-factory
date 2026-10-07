@@ -3016,6 +3016,64 @@ class TestBudgetExhaustedSubtype:
         assert BUDGET_EXHAUSTED_SUBTYPE == 'error_max_budget_usd'
 
 
+class TestClassifyAgentFailureBudget:
+    """A run ended by the CLI's own ``--max-budget-usd`` ceiling classifies
+    BUDGET, ranked like MAX_TURNS: below the wall-clock rule, above every
+    status heuristic, because a budget abort proves the API accepted the
+    request and billed real tokens."""
+
+    def test_kind_value_is_the_census_token(self):
+        assert AgentFailureKind.BUDGET == 'budget'
+
+    def test_budget_abort_classifies_budget(self):
+        result = AgentResult(
+            success=False, output='', subtype=BUDGET_EXHAUSTED_SUBTYPE,
+            turns=40, cost_usd=5.01,
+        )
+        cls = classify_agent_failure(result)
+        assert cls.kind is AgentFailureKind.BUDGET
+        assert '5.01' in cls.summary
+        assert '40' in cls.summary
+        assert not cls.summary.startswith('agent API error: HTTP')
+        assert 'no specific failure signal' not in cls.summary
+
+    def test_success_still_short_circuits(self):
+        result = AgentResult(
+            success=True, output='done', subtype=BUDGET_EXHAUSTED_SUBTYPE,
+            turns=40, cost_usd=5.01,
+        )
+        assert classify_agent_failure(result).kind is AgentFailureKind.SUCCESS
+
+    def test_timed_out_outranks_budget(self):
+        result = AgentResult(
+            success=False, output='', subtype=BUDGET_EXHAUSTED_SUBTYPE,
+            timed_out=True, duration_ms=600_000, transcript_turns=0,
+        )
+        assert classify_agent_failure(result).kind is AgentFailureKind.TIMED_OUT
+
+    def test_budget_outranks_404_model_not_found(self):
+        result = AgentResult(
+            success=False, output='', subtype=BUDGET_EXHAUSTED_SUBTYPE,
+            cost_usd=1.0, api_error_status=404,
+        )
+        assert classify_agent_failure(result).kind is AgentFailureKind.BUDGET
+
+    @pytest.mark.parametrize('status', [401, 429])
+    def test_budget_outranks_non_5xx_api_error_status(self, status):
+        result = AgentResult(
+            success=False, output='', subtype=BUDGET_EXHAUSTED_SUBTYPE,
+            cost_usd=1.0, api_error_status=status,
+        )
+        assert classify_agent_failure(result).kind is AgentFailureKind.BUDGET
+
+    def test_agrees_with_classify_cap_kill(self):
+        result = AgentResult(
+            success=False, output='', subtype=BUDGET_EXHAUSTED_SUBTYPE, cost_usd=1.0,
+        )
+        assert classify_cap_kill(result, budget_usd=None, max_turns=None) is CapReason.BUDGET
+        assert classify_agent_failure(result).kind is AgentFailureKind.BUDGET
+
+
 class TestBuildFailureMessage:
     """Tests for the build_failure_message formatting helper."""
 
