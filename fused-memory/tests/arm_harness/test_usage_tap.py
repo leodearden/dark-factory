@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 
 from _mock_openai_server import chat_completion_body, mock_openai_server
+
 from fused_memory.arm_harness.usage_tap import (
     ERROR_EXCERPT_CHARS,
     CallRecord,
@@ -29,7 +30,7 @@ REQUEST = {
 
 def _post(base_url: str, path: str, body: bytes, headers: dict[str, str] | None = None):
     parts = urlsplit(base_url)
-    connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=30)
+    connection = http.client.HTTPConnection(parts.hostname or '', parts.port, timeout=30)
     try:
         connection.request(
             'POST', path, body=body, headers={'Content-Type': 'application/json', **(headers or {})}
@@ -113,7 +114,7 @@ def test_a_rejected_call_passes_through_and_records_an_excerpt_without_usage(tmp
     assert record.completion_tokens is None
     assert record.request_model == 'qwen3.5-9b'
     assert record.error_excerpt == body.decode()[:ERROR_EXCERPT_CHARS]
-    assert len(record.error_excerpt) == ERROR_EXCERPT_CHARS
+    assert len(body.decode()) > ERROR_EXCERPT_CHARS
 
 
 def test_a_success_without_usage_passes_through_with_no_token_counts(tmp_path):
