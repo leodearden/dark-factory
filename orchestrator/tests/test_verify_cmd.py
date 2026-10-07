@@ -2192,9 +2192,11 @@ class TestGovernCpu:
         command for role=='merge' regardless of shape; OPAQUE (arbitrary/
         unparseable shell) is exactly the case that safe bash-wrap exists
         for. Dropping merge cpu-governance for OPAQUE would silently starve
-        dark_factory's real lint_command/type_check_command chains (which
-        parse OPAQUE — see TestParseChain) of the merge-weighted cgroup
-        scope every other merge verify command gets.
+        any unrecognised command shape of the merge-weighted cgroup scope
+        every other merge verify command gets. (dark_factory's own lint/type
+        chains now resolve RUFF/PYRIGHT with raw retained — see
+        TestParseChainRecoversLintTypeIdentity — and are covered by the
+        sibling test below.)
         """
         cmd = parse_config_command('mypy src/')
         assert cmd.tool is ToolKind.OPAQUE
@@ -2208,16 +2210,16 @@ class TestGovernCpu:
 
         the real dark_factory.orchestrator.config.yaml lint_command/
         type_check_command shape: multi-clause, non-pytest/non-cargo, so
-        parse_config_command classifies it OPAQUE (_parse_chain only
-        recognises pytest/cargo chains). It must still be cpu-governed on
-        merge, matching the historical unconditional bash-wrap.
+        parse_config_command resolves it RUFF with raw retained (identity
+        only — task 4843). It must still be cpu-governed on merge, matching
+        the historical unconditional bash-wrap.
         """
         raw = (
             'uv run ruff check shared escalation && '
             'python3 fused-memory/scripts/check_bare_magicmock_config.py shared/tests'
         )
         cmd = parse_config_command(raw)
-        assert cmd.tool is ToolKind.OPAQUE
+        assert cmd.tool is ToolKind.RUFF
         assert cmd.raw == raw
 
         result = render(govern_cpu(cmd, self._EXEC))

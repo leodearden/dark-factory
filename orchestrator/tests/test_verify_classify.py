@@ -2878,12 +2878,12 @@ class TestSummarizeChecksThreadsToolIdentity:
         assert not passed
         assert category == FailureCategory.TEST_FAILURE
 
-    def test_lint_chain_dispatches_opaque_generic_ladder(self):
-        """A lint command that is a raw-retained `&&`-chain (neither pytest
-        nor a cargo test/clippy chain) resolves to ToolKind.OPAQUE via
-        `_tool_for_cmd` — `_summarize_checks` still classifies its failure
-        through the full legacy generic ladder, byte-identical to today's
-        tool-blind `_classify_failure`."""
+    def test_ruff_lint_chain_human_text_falls_through_to_generic_ladder(self):
+        """A lint command that is a raw-retained `&&`-chain with one argv-head
+        `ruff check` resolves to ToolKind.RUFF via `_tool_for_cmd` (task 4843;
+        it was OPAQUE before). Its human-text failure is not ruff JSON, so it
+        still falls through to the full legacy generic ladder: no category
+        moves for human-text output."""
         lint_cmd = 'ruff check . && mypy src/'
         lint_out = 'flock: failed to acquire lock on /var/lock/mylock\n'
         passed, category, cause_hint, summary = _summarize(
