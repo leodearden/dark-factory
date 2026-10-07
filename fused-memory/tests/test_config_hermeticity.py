@@ -73,13 +73,17 @@ INTERPOLATED_PATH_LEAVES = (
     ),
 )
 
-#: Each YAML interpolation variable paired with one leaf it drives.
+#: Each YAML interpolation variable paired with one leaf it drives, as ONE
+#: ``(name, reader)`` value per case: a fixture's ``params`` binds a single
+#: name, so a two-value ``pytest.param`` would not fit both consumers.
 INTERPOLATION_VAR_LEAVES = (
-    ('PROJECT_ROOT', lambda config: config.taskmaster.project_root),
-    ('QUEUE_DATA_DIR', lambda config: config.queue.data_dir),
-    ('RECONCILIATION_DATA_DIR', lambda config: config.reconciliation.data_dir),
+    pytest.param(('PROJECT_ROOT', lambda config: config.taskmaster.project_root), id='project-root'),
+    pytest.param(('QUEUE_DATA_DIR', lambda config: config.queue.data_dir), id='queue-data-dir'),
+    pytest.param(
+        ('RECONCILIATION_DATA_DIR', lambda config: config.reconciliation.data_dir),
+        id='reconciliation-data-dir',
+    ),
 )
-INTERPOLATION_VAR_IDS = ('project-root', 'queue-data-dir', 'reconciliation-data-dir')
 
 
 def test_config_resolution_is_independent_of_the_process_cwd(monkeypatch, tmp_path):
@@ -135,9 +139,29 @@ def test_the_pin_anchors_every_path_leaf_in_the_tests_tmp_path(
     assert before_resolved.is_relative_to(tmp_path.resolve())
 
 
-@pytest.mark.parametrize(('name', 'read_leaf'), INTERPOLATION_VAR_LEAVES, ids=INTERPOLATION_VAR_IDS)
+@pytest.mark.parametrize('interpolation', INTERPOLATION_VAR_LEAVES)
+def test_the_pin_lays_out_tmp_path_as_the_tracked_config_does(interpolation, monkeypatch, tmp_path):
+    """Each pinned variable sits where the YAML's own ``${VAR:default}`` puts it.
+
+    ``fused-memory/config/config.yaml`` is the home of that layout and
+    ``conftest.py::_isolate_fm_config`` mirrors it under ``tmp_path``.  Read
+    with the pin removed, the leaf is the YAML default, relative to the CWD;
+    read with it, the same relative path under ``tmp_path``.  A default edited
+    in one place and not the other fails here instead of drifting silently.
+    """
+    name, read_leaf = interpolation
+    pinned = Path(read_leaf(FusedMemoryConfig())).relative_to(tmp_path)
+
+    monkeypatch.delenv(name)
+    unpinned = FusedMemoryConfig()
+
+    assert unpinned.taskmaster is not None
+    assert Path(read_leaf(unpinned)) == pinned
+
+
+@pytest.mark.parametrize('interpolation', INTERPOLATION_VAR_LEAVES)
 def test_a_test_local_interpolation_override_still_reaches_the_config(
-    name, read_leaf, monkeypatch, tmp_path
+    interpolation, monkeypatch, tmp_path
 ):
     """A test-body setenv of an interpolation variable still beats the pin.
 
@@ -145,6 +169,7 @@ def test_a_test_local_interpolation_override_still_reaches_the_config(
     (``TASKMASTER__PROJECT_ROOT`` and friends) instead: the env layer outranks
     the YAML, so such a pin would override this test's own value.
     """
+    name, read_leaf = interpolation
     mine = str(tmp_path / 'mine')
     monkeypatch.setenv(name, mine)
 
@@ -178,12 +203,7 @@ class TestAmbientInterpolationCannotRedirectTheConfig:
     pins.
     """
 
-    @pytest.fixture(
-        scope='class',
-        autouse=True,
-        params=INTERPOLATION_VAR_LEAVES,
-        ids=INTERPOLATION_VAR_IDS,
-    )
+    @pytest.fixture(scope='class', autouse=True, params=INTERPOLATION_VAR_LEAVES)
     def redirected_leaf(self, request):
         """Plant one interpolation variable ambiently; hand back its leaf reader."""
         name, read_leaf = request.param
@@ -192,12 +212,20 @@ class TestAmbientInterpolationCannotRedirectTheConfig:
         yield read_leaf
         ambient.undo()
 
-    def test_an_inherited_interpolation_var_cannot_redirect_the_config(self, redirected_leaf):
-        """The planted directory must not reach the leaf it interpolates into."""
+    def test_an_inherited_interpolation_var_cannot_redirect_the_config(
+        self, redirected_leaf, tmp_path
+    ):
+        """The planted directory must not reach the leaf; this test's tmp does.
+
+        The second assertion is the stronger one: it also fails if the leaf
+        falls back to the YAML's relative default, which ``!= PWNED`` would
+        pass.
+        """
         config = FusedMemoryConfig()
 
         assert config.taskmaster is not None
         assert redirected_leaf(config) != PWNED
+        assert Path(redirected_leaf(config)).is_relative_to(tmp_path)
 
 
 def test_code_default_config_yields_pure_code_defaults(code_default_config):

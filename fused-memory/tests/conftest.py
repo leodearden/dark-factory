@@ -152,12 +152,12 @@ FM_CONFIG_PATH = Path(_tests_dir).parent / 'config' / 'config.yaml'
 _FM_CONFIG_FIELDS = frozenset(FusedMemoryConfig.model_fields)
 
 #: The variables the TRACKED config interpolates into its PATH-VALUED leaves,
-#: each mapped to its layout under a test's ``tmp_path`` — the same layout as
-#: the YAML's own ``${VAR:default}``: ``${PROJECT_ROOT:.}``
-#: (``taskmaster.project_root``, ``reconciliation.explore_codebase_root``),
-#: ``${QUEUE_DATA_DIR:./data/queue}`` (``queue.data_dir``) and
-#: ``${RECONCILIATION_DATA_DIR:./data/reconciliation}``
-#: (``reconciliation.data_dir``, ``reconciliation.escalation_queue_dir``).  A
+#: each mapped to its layout under a test's ``tmp_path``.  The layout's home is
+#: the ``${VAR:default}`` in ``fused-memory/config/config.yaml``; it is mirrored
+#: here so config-driven stores stay out of the tmp root a test uses for its
+#: own files, and
+#: ``test_config_hermeticity.py::test_the_pin_lays_out_tmp_path_as_the_tracked_config_does``
+#: fails if the mirror drifts from that home.  A
 #: THIRD env surface, reached through the YAML's own interpolation rather than
 #: through pydantic's env layer, so the derived names above cannot see it:
 #: measured with ``CONFIG_PATH`` already pinned at the canonical file,
