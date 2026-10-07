@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS adjudications (
     run_id TEXT NOT NULL,
     at TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS adjudications_by_texts
+    ON adjudications (project_id, child_id, parent_id, child_sha256, parent_sha256);
 CREATE TABLE IF NOT EXISTS run_adjudications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL,
