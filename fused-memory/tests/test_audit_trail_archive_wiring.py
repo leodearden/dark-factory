@@ -32,7 +32,7 @@ class _RecordingInterceptor:
 
 
 class _RecordingMemoryService:
-    """The two ``MemoryService`` methods the archive uses, recording each call.
+    """The three ``MemoryService`` methods the archive uses, recording each call.
 
     ``get_memory_by_id`` takes ``project_id`` FIRST and positionally, so a
     transposition in the adapter would read the wrong scope as a miss.
@@ -53,6 +53,13 @@ class _RecordingMemoryService:
     async def get_memory_by_id(self, project_id, memory_id):
         self.calls.append(('get_memory_by_id', (project_id, memory_id), {}))
         return self.record
+
+    async def delete_memory(self, memory_id, store, project_id='main', **kwargs):
+        self.calls.append(
+            ('delete_memory', (), {'memory_id': memory_id, 'store': store,
+                                   'project_id': project_id, **kwargs})
+        )
+        return {'status': 'deleted'}
 
 
 def _wire(memory_service):
@@ -104,3 +111,15 @@ class TestAuditTrailArchiveWiring:
     async def test_read_of_a_missing_record_is_none(self):
         archive = _wire(_RecordingMemoryService(record=None)).archive
         assert await archive.read(project_id='dark_factory', memory_id='m') is None
+
+    @pytest.mark.asyncio
+    async def test_discard_deletes_the_mem0_record_in_the_project(self):
+        svc = _RecordingMemoryService()
+        archive = _wire(svc).archive
+        await archive.discard(project_id='dark_factory', memory_id='m')
+        [(method, args, kwargs)] = svc.calls
+        assert (method, args) == ('delete_memory', ())
+        assert kwargs['memory_id'] == 'm'
+        assert kwargs['store'] == 'mem0'
+        assert kwargs['project_id'] == 'dark_factory'
+        assert kwargs['agent_id'] == ARCHIVE_AGENT_ID

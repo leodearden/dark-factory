@@ -5555,7 +5555,7 @@ class TaskInterceptor:
                 'audit_trail_rotation: rotating task %s failed after the recon write landed',
                 task_id, exc_info=True,
             )
-            return {**result, 'audit_trail_rotation': {'status': 'error', 'error': str(e)}}, None
+            outcome = RotationOutcome.failed(task_id, e)
         if outcome is None:
             return result, None
         bounded = {**result, 'audit_trail_rotation': outcome.as_dict()}

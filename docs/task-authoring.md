@@ -1924,16 +1924,18 @@ reports its outcome in the response's `audit_trail_rotation` field:
 
 - **On the pattern, at any size:** a family of dated `<stem>_YYYY_MM_DD`
   metadata keys is folded verbatim into one newest-first `<stem>_history`
-  array. An array the harness created is trimmed to `HISTORY_KEEP`
-  entries once it passes `HISTORY_MAX`, and so is
-  `memory_hints.queries`, without ever shedding the queries the context
-  assembler executes.
+  array. An array the harness owns (listed in the rollup's
+  `history_keys`, or made only of its own entries) is trimmed to
+  `HISTORY_KEEP` entries once it passes `HISTORY_MAX`. So is
+  `memory_hints.queries`: the queries the context assembler executes are
+  never shed, and of near-duplicate queries only the newest stays.
 - **On the size:** above `ROTATE_THRESHOLD_BYTES` it sheds toward
   `ROTATE_TARGET_BYTES`. Description rotation keeps the first block and
   the newest blocks, archives the middle verbatim, and leaves a pointer
   block listing the first line of each block it moved.
 - Whatever leaves is archived and read back byte-identical first, and the
-  `audit_trail_rotation` rollup records where it went. A task whose bulk is
+  `audit_trail_rotation` rollup records where it went. An archive that
+  no committed rewrite points at is deleted again. A task whose bulk is
   `details`, or an array the harness did not create, is reported
   `unrotatable` rather than trimmed.
 

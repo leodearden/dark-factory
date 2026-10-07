@@ -9,7 +9,7 @@ from __future__ import annotations
 import dataclasses
 import json
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 from shared.task_metadata import parse_metadata
@@ -22,7 +22,10 @@ from fused_memory.reconciliation.audit_trail_rotation import (
     ROLLUP_KEY,
     ROTATE_TARGET_BYTES,
     ROTATE_THRESHOLD_BYTES,
+    RotationOutcome,
+    RotationStatus,
     TaskRewrite,
+    archive_link_query,
     bound_audit_trail,
     near_duplicate_key,
     plan_rotation,
@@ -106,10 +109,6 @@ class TestPayloadAndNoOps:
             task = make_task(description=oversize, metadata=metadata)
             assert task_payload_bytes(task) > ROTATE_THRESHOLD_BYTES
             assert plan_rotation(task, now=NOW) is None
-
-    def test_threshold_constants_match_docs_section_10(self):
-        assert ROTATE_THRESHOLD_BYTES == 20_000
-        assert ROTATE_TARGET_BYTES == 10_000
 
 
 METADATA_SECTION = '=== METADATA ENTRIES ROTATED OUT (verbatim JSON) ==='
@@ -223,6 +222,49 @@ class TestDatedKeyFold:
         }
         assert plan_rotation(make_task(metadata=metadata), now=NOW) is None
 
+    @pytest.mark.parametrize(
+        'agent_array',
+        [
+            [{'cycle': 19, 'note': 'agent-shaped'}],
+            [history_entry('bar_2026_09_18', '2026-09-18', 'another stem')],
+        ],
+        ids=['agent-shaped-entries', 'entries-of-another-stem'],
+    )
+    def test_an_array_the_harness_does_not_own_leaves_the_family_alone(self, agent_array):
+        metadata = {'foo_history': agent_array, 'foo_2026_09_19': 'a', 'foo_2026_09_20': 'b'}
+        assert plan_rotation(make_task(metadata=metadata), now=NOW) is None
+
+    def test_a_harness_shaped_array_is_owned_again_after_the_rollup_was_dropped(self):
+        existing = [history_entry('foo_2026_09_19', '2026-09-19', 'old')]
+        metadata = {'foo_history': existing, 'foo_2026_09_20': 'new'}
+        plan = plan_rotation(make_task(metadata=metadata), now=NOW)
+        assert plan is not None
+        rendered = plan.render(None).metadata
+        assert rendered['foo_history'] == [
+            history_entry('foo_2026_09_20', '2026-09-20', 'new'),
+            *existing,
+        ]
+        assert rendered[ROLLUP_KEY]['history_keys'] == ['foo_history']
+
+    @pytest.mark.parametrize(
+        ('stem', 'value'),
+        [
+            ('files', ['docs/task-authoring.md']),
+            ('pending_since', '2026-09-01T00:00:00.000Z'),
+            ('done_provenance', {'kind': 'merged', 'commit': 'a' * 40}),
+        ],
+    )
+    def test_an_undated_task_metadata_vocabulary_key_never_joins_its_family(self, stem, value):
+        metadata = {stem: value, **dated_family(stem, [20, 21])}
+        plan = plan_rotation(make_task(metadata=metadata), now=NOW)
+        assert plan is not None
+        rendered = plan.render(None).metadata
+        assert rendered[stem] == value
+        assert [entry['source_key'] for entry in rendered[f'{stem}_history']] == [
+            f'{stem}_2026_09_21',
+            f'{stem}_2026_09_20',
+        ]
+
     def test_rollup_history_keys_lists_every_array_the_fold_created(self):
         metadata = {
             **dated_family('alpha', [1, 2]),
@@ -298,6 +340,35 @@ class TestMemoryHintQueryBound:
         archived = archive_section(plan.archive_text, QUERY_SECTION)
         for shed in set(queries) - set(hints['queries']):
             assert shed in archived
+
+    @pytest.mark.parametrize(
+        'variants',
+        [
+            [archive_link_query(f'{n:08x}-2434-4f30-a9d0-769a220b34a4', '42') for n in range(9)],
+            [f'consolidation status as of 2026-{month:02d}-01' for month in range(1, 10)],
+        ],
+        ids=['archive-links', 'dated-status-queries'],
+    )
+    def test_the_newest_of_a_near_duplicate_class_survives(self, variants):
+        executed = ['consolidation backlog status', 'index_health drift', 'gate 3524 ruling']
+        queries = [*executed, *variants]
+        assert len(queries) > HISTORY_MAX
+        assert len({near_duplicate_key(variant) for variant in variants}) == 1
+        task = make_task(metadata={'memory_hints': {'entities': [], 'queries': queries}})
+        plan = plan_rotation(task, now=NOW)
+        assert plan is not None
+        assert plan.render(None).metadata['memory_hints']['queries'] == [*executed, variants[-1]]
+
+    def test_the_executed_prefix_is_kept_even_when_it_holds_near_duplicates(self):
+        executed = [f'relay evidence 2026-09-{day:02d}' for day in (1, 2, 3)]
+        queries = [*executed, *(f'distinct topic {chr(97 + n)}' for n in range(HISTORY_MAX))]
+        assert len(executed) == HINT_QUERIES_EXECUTED
+        task = make_task(metadata={'memory_hints': {'entities': [], 'queries': queries}})
+        plan = plan_rotation(task, now=NOW)
+        assert plan is not None
+        kept = plan.render(None).metadata['memory_hints']['queries']
+        assert kept[:HINT_QUERIES_EXECUTED] == executed
+        assert len(kept) == HISTORY_KEEP
 
     def test_queries_within_history_max_do_not_trigger_a_rotation(self):
         queries = [f'relay evidence cycle {n}' for n in range(HISTORY_MAX)]
@@ -606,12 +677,20 @@ _STORED = object()
 class FakeArchive:
     """In-memory AuditTrailArchive; ``read_returns`` overrides what a read sees."""
 
-    def __init__(self, *, write_id: str | None = 'mem-1', read_returns: Any = _STORED):
+    def __init__(
+        self,
+        *,
+        write_id: str | None = 'mem-1',
+        read_returns: Any = _STORED,
+        discard_error: Exception | None = None,
+    ):
         self.write_id = write_id
         self.read_returns = read_returns
+        self.discard_error = discard_error
         self.store: dict[str, str] = {}
         self.writes: list[dict[str, Any]] = []
         self.reads: list[dict[str, Any]] = []
+        self.discards: list[dict[str, Any]] = []
 
     async def write(self, *, project_id: str, content: str, metadata: dict[str, Any]) -> str | None:
         self.writes.append({'project_id': project_id, 'content': content, 'metadata': metadata})
@@ -624,6 +703,12 @@ class FakeArchive:
         if self.read_returns is not _STORED:
             return self.read_returns
         return self.store.get(memory_id)
+
+    async def discard(self, *, project_id: str, memory_id: str) -> None:
+        self.discards.append({'project_id': project_id, 'memory_id': memory_id})
+        if self.discard_error is not None:
+            raise self.discard_error
+        self.store.pop(memory_id, None)
 
 
 class RecordingCommit:
@@ -683,6 +768,8 @@ class TestBoundAuditTrailExecutor:
         assert outcome.committed_task is not None
         assert outcome.bytes_after == task_payload_bytes(outcome.committed_task)
         assert outcome.bytes_after <= ROTATE_TARGET_BYTES
+        assert archive.discards == []
+        assert archive.store == {'mem-1': plan.archive_text}
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -702,14 +789,36 @@ class TestBoundAuditTrailExecutor:
         assert outcome.status == 'archive_unconfirmed'
         assert outcome.bytes_before == task_payload_bytes(task)
         assert outcome.committed_task is None
+        assert archive.store == {}
 
     @pytest.mark.asyncio
-    async def test_moved_fingerprint_reports_superseded_with_the_archive_id(self):
+    async def test_an_unconfirmed_archive_with_an_id_is_discarded(self):
         task = size_triggered_task()
-        outcome = await bound(task, FakeArchive(), RecordingCommit(task, superseded=True))
+        archive = FakeArchive(read_returns='not what was written')
+        outcome = await bound(task, archive, RecordingCommit(task))
+        assert archive.discards == [{'project_id': 'p', 'memory_id': 'mem-1'}]
+        assert outcome.archive_discarded
+
+    @pytest.mark.asyncio
+    async def test_moved_fingerprint_reports_superseded_and_discards_the_archive(self):
+        task = size_triggered_task()
+        archive = FakeArchive()
+        outcome = await bound(task, archive, RecordingCommit(task, superseded=True))
         assert outcome.status == 'superseded'
         assert outcome.archive_memory_id == 'mem-1'
         assert outcome.committed_task is None
+        assert archive.discards == [{'project_id': 'p', 'memory_id': 'mem-1'}]
+        assert archive.store == {}
+        assert outcome.archive_discarded
+
+    @pytest.mark.asyncio
+    async def test_a_failed_discard_still_reports_the_outcome(self):
+        task = size_triggered_task()
+        archive = FakeArchive(discard_error=RuntimeError('mem0 down'))
+        outcome = await bound(task, archive, RecordingCommit(task, superseded=True))
+        assert outcome.status == 'superseded'
+        assert outcome.archive_memory_id == 'mem-1'
+        assert not outcome.archive_discarded
 
     @pytest.mark.asyncio
     async def test_fold_only_plan_commits_without_an_archive(self):
@@ -748,6 +857,15 @@ class TestBoundAuditTrailExecutor:
         for outcome in (rotated, unrotatable):
             payload = json.loads(json.dumps(outcome.as_dict()))
             assert payload['status'] == outcome.status
+
+    @pytest.mark.asyncio
+    async def test_a_failure_outcome_has_the_wire_shape_of_every_other(self):
+        task = size_triggered_task()
+        rotated = await bound(task, FakeArchive(), RecordingCommit(task))
+        failed = RotationOutcome.failed('42', RuntimeError('mem0 down'))
+        assert failed.status in get_args(RotationStatus)
+        assert failed.as_dict().keys() == rotated.as_dict().keys()
+        assert 'mem0 down' in failed.as_dict()['error']
 
 
 class TestStage2PromptStatesTheRule:

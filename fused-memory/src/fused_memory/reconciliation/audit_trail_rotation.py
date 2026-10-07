@@ -16,15 +16,19 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Literal, Protocol, get_args
 
+from shared.task_metadata import is_known_metadata_key
 from shared.task_statuses import TERMINAL
 
 from fused_memory.reconciliation.context_assembler import HINT_QUERIES_EXECUTED
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     'ROTATE_THRESHOLD_BYTES',
@@ -40,7 +44,9 @@ __all__ = [
     'AuditTrailCommit',
     'RotationOutcome',
     'RotationPlan',
+    'RotationStatus',
     'TaskRewrite',
+    'archive_link_query',
     'bound_audit_trail',
     'memory_service_archive',
     'near_duplicate_key',
@@ -138,6 +144,9 @@ def archive_link_query(archive_memory_id: str, task_id: str) -> str:
     return f'audit-trail rotation archive memory {archive_memory_id} (task {task_id})'
 
 
+_HISTORY_ENTRY_FIELDS = frozenset({'source_key', 'recorded_on', 'value'})
+
+
 @dataclass(frozen=True)
 class _FamilyMember:
     key: str
@@ -173,6 +182,22 @@ def _dated_families(metadata: Mapping[str, Any]) -> dict[str, list[_FamilyMember
     return families
 
 
+def _family_stem(key: str) -> str:
+    parsed = _parse_dated_key(key)
+    return key if parsed is None else parsed[0]
+
+
+def _is_harness_history(stem: str, entries: Any) -> bool:
+    """Every entry is one the fold wrote for ``stem``: ownership recognised by shape."""
+    return isinstance(entries, list) and all(
+        isinstance(entry, dict)
+        and entry.keys() == _HISTORY_ENTRY_FIELDS
+        and isinstance(entry['source_key'], str)
+        and _family_stem(entry['source_key']) == stem
+        for entry in entries
+    )
+
+
 @dataclass(frozen=True)
 class _Fold:
     metadata: dict[str, Any]
@@ -184,20 +209,26 @@ def _fold_dated_families(metadata: Mapping[str, Any], owned: tuple[str, ...]) ->
     """Fold each dated-key family into its '<stem>_history' array, newest first.
 
     A family folds once it has two dated members, or one when its array is
-    already harness-owned.  A '<stem>_history' key the harness does not own is
-    never written to, so the family stays where it is.
+    already harness-owned.  An array is owned when the rollup lists it or every
+    entry is harness-shaped for its stem; any other '<stem>_history' key is
+    never written to, so the family stays where it is.  An undated '<stem>' key
+    joins its family unless it is task-metadata vocabulary.
     """
     folded = dict(metadata)
     history_keys = set(owned)
     folded_keys: list[str] = []
     for stem, dated in _dated_families(metadata).items():
         history_key = stem + _HISTORY_SUFFIX
-        is_owned = history_key in owned and isinstance(metadata.get(history_key), list)
+        existing = metadata.get(history_key)
+        is_owned = isinstance(existing, list) and (
+            history_key in owned or _is_harness_history(stem, existing)
+        )
         if history_key in metadata and not is_owned:
             continue
         if len(dated) < 2 and not is_owned:
             continue
-        members = dated + ([_FamilyMember(stem, None)] if stem in metadata else [])
+        joins_undated = stem in metadata and not is_known_metadata_key(stem)
+        members = dated + ([_FamilyMember(stem, None)] if joins_undated else [])
         members.sort(key=lambda member: member.age_order, reverse=True)
         entries = [member.history_entry(metadata) for member in members]
         folded[history_key] = entries + list(metadata.get(history_key, []))
@@ -469,17 +500,16 @@ def _hint_queries(metadata: Mapping[str, Any]) -> list[str] | None:
 
 
 def _bounded_query_indexes(queries: list[str]) -> set[int]:
-    """First occurrences only; the executed prefix plus the newest, up to HISTORY_KEEP."""
-    seen: set[str] = set()
-    unique: list[int] = []
-    for index, query in enumerate(queries):
-        key = near_duplicate_key(query)
-        if key not in seen:
-            seen.add(key)
-            unique.append(index)
-    executed, rest = unique[:HINT_QUERIES_EXECUTED], unique[HINT_QUERIES_EXECUTED:]
+    """The executed prefix as-is, then the newest of each near-duplicate class, up to HISTORY_KEEP."""
+    executed = range(min(HINT_QUERIES_EXECUTED, len(queries)))
+    newest_of_each = {
+        near_duplicate_key(query): index
+        for index, query in enumerate(queries)
+        if index >= HINT_QUERIES_EXECUTED
+    }
+    candidates = sorted(newest_of_each.values())
     room = max(HISTORY_KEEP - len(executed), 0)
-    return {*executed, *rest[max(len(rest) - room, 0):]}
+    return {*executed, *candidates[max(len(candidates) - room, 0):]}
 
 
 _ShedOne = Callable[[RotationPlan], RotationPlan | None]
@@ -616,13 +646,18 @@ def _unrotatable_report(task: Mapping[str, Any], refusal: Refusal) -> dict[str, 
 
 
 class AuditTrailArchive(Protocol):
-    """Where rotated-out text goes; ``read`` must return exactly what ``write`` stored."""
+    """Where rotated-out text goes; ``read`` must return exactly what ``write`` stored.
+
+    ``discard`` removes an archive that no committed rewrite points at.
+    """
 
     async def write(
         self, *, project_id: str, content: str, metadata: dict[str, Any]
     ) -> str | None: ...
 
     async def read(self, *, project_id: str, memory_id: str) -> str | None: ...
+
+    async def discard(self, *, project_id: str, memory_id: str) -> None: ...
 
 
 class AuditTrailCommit(Protocol):
@@ -633,20 +668,29 @@ class AuditTrailCommit(Protocol):
     ) -> Mapping[str, Any] | None: ...
 
 
-RotationStatus = Literal['rotated', 'folded', 'archive_unconfirmed', 'superseded', 'unrotatable']
+RotationStatus = Literal[
+    'rotated', 'folded', 'archive_unconfirmed', 'superseded', 'unrotatable', 'error'
+]
 
 
 @dataclass(frozen=True)
 class RotationOutcome:
     status: RotationStatus
     task_id: str
-    bytes_before: int
+    bytes_before: int | None
     bytes_after: int | None = None
     archive_memory_id: str | None = None
+    archive_discarded: bool = False
     over_threshold_after: bool | None = None
     unrotatable: Mapping[str, Any] | None = None
     description_rewritten: bool = False
+    error: str | None = None
     committed_task: Mapping[str, Any] | None = None
+
+    @classmethod
+    def failed(cls, task_id: str, error: Exception) -> RotationOutcome:
+        """A rotation that raised; the task may or may not have been bounded."""
+        return cls('error', task_id, None, error=f'{type(error).__name__}: {error}')
 
     def as_dict(self) -> dict[str, Any]:
         """The wire form; the committed task travels separately as ``updated_task``."""
@@ -656,10 +700,29 @@ class RotationOutcome:
             'bytes_before': self.bytes_before,
             'bytes_after': self.bytes_after,
             'archive_memory_id': self.archive_memory_id,
+            'archive_discarded': self.archive_discarded,
             'over_threshold_after': self.over_threshold_after,
             'unrotatable': None if self.unrotatable is None else dict(self.unrotatable),
             'description_rewritten': self.description_rewritten,
+            'error': self.error,
         }
+
+
+async def _with_orphan_discarded(
+    outcome: RotationOutcome, *, archive: AuditTrailArchive, project_id: str
+) -> RotationOutcome:
+    """Best-effort removal of an archive that no committed rewrite points at."""
+    if outcome.archive_memory_id is None:
+        return outcome
+    try:
+        await archive.discard(project_id=project_id, memory_id=outcome.archive_memory_id)
+    except Exception:
+        logger.warning(
+            'audit_trail_rotation: could not discard orphan archive %s of task %s',
+            outcome.archive_memory_id, outcome.task_id, exc_info=True,
+        )
+        return outcome
+    return dataclasses.replace(outcome, archive_discarded=True)
 
 
 async def bound_audit_trail(
@@ -673,7 +736,9 @@ async def bound_audit_trail(
     """Rotate ``task``: archive and confirm the read-back first, then commit by fingerprint.
 
     None when there is nothing to bound.  Nothing leaves the task unless the
-    archive read back byte-identical (docs §10 step 1).
+    archive read back byte-identical (docs §10 step 1).  An archive is
+    discarded again only when the commit was definitely not made (unconfirmed
+    or superseded); a port that raises leaves it in place.
     """
     plan = _plan_or_refusal(task, now)
     task_id = str(task.get('id'))
@@ -691,8 +756,12 @@ async def bound_audit_trail(
             project_id=project_id, memory_id=archive_memory_id
         )
         if not landed:
-            return RotationOutcome(
-                'archive_unconfirmed', task_id, plan.bytes_before, archive_memory_id=archive_memory_id
+            return await _with_orphan_discarded(
+                RotationOutcome(
+                    'archive_unconfirmed', task_id, plan.bytes_before,
+                    archive_memory_id=archive_memory_id,
+                ),
+                archive=archive, project_id=project_id,
             )
     rewrite = plan.render(archive_memory_id)
     committed = await commit(
@@ -701,8 +770,11 @@ async def bound_audit_trail(
         metadata=rewrite.metadata,
     )
     if committed is None:
-        return RotationOutcome(
-            'superseded', task_id, plan.bytes_before, archive_memory_id=archive_memory_id
+        return await _with_orphan_discarded(
+            RotationOutcome(
+                'superseded', task_id, plan.bytes_before, archive_memory_id=archive_memory_id
+            ),
+            archive=archive, project_id=project_id,
         )
     bytes_after = task_payload_bytes(committed)
     return RotationOutcome(
@@ -736,6 +808,15 @@ class _MemoryServiceArchive:
         record = await self.memory_service.get_memory_by_id(project_id, memory_id)
         return None if record is None else record['content']
 
+    async def discard(self, *, project_id: str, memory_id: str) -> None:
+        await self.memory_service.delete_memory(
+            memory_id=memory_id,
+            store='mem0',
+            project_id=project_id,
+            agent_id=ARCHIVE_AGENT_ID,
+            _source=ARCHIVE_SOURCE,
+        )
+
 
 def memory_service_archive(memory_service: Any) -> AuditTrailArchive:
     """The archive port over a duck-typed MemoryService.
@@ -743,6 +824,7 @@ def memory_service_archive(memory_service: Any) -> AuditTrailArchive:
     add_memory reports a mem0 failure as empty ``memory_ids``, so ``write``
     returns None for it.  ``get_memory_by_id`` takes ``project_id`` FIRST and
     positionally; its TimeoutError propagates rather than reading as a miss.
+    ``discard`` is a mem0 ``delete_memory`` of the archive record.
     """
     return _MemoryServiceArchive(memory_service)
 
@@ -759,9 +841,13 @@ def render_audit_trail_rotation_section() -> str:
         f'`{ROLLUP_KEY}` reports the outcome ({statuses}), and the task\'s '
         f'`metadata.{ROLLUP_KEY}` records what left and where it went. Keep tasks small '
         'so that backstop rarely fires:\n'
-        '- Do NOT mint a dated top-level metadata key per cycle (`<stem>_YYYY_MM_DD`). '
-        'Append the cycle record to the existing `<stem>_history` array, newest first; '
-        f'the harness keeps the newest {HISTORY_KEEP} once it passes {HISTORY_MAX}.\n'
+        '- Do NOT mint a dated top-level metadata key per cycle (`<stem>_YYYY_MM_DD`) for a '
+        'stem that already has an array: append the cycle record, newest first, to the '
+        f'arrays named in `metadata.{ROLLUP_KEY}.history_keys`; the harness keeps the '
+        f'newest {HISTORY_KEEP} once one passes {HISTORY_MAX}. Never create a '
+        '`<stem>_history` array yourself, because the harness only trims arrays it owns. '
+        'For a stem with no array yet, record the cycle under a dated key and the harness '
+        'folds that stem\'s dated keys into an array it owns.\n'
         '- To extend a description, rewrite it as a rolling summary (what the task is, '
         'its scope items with each one\'s current state, the open questions) instead of '
         'appending narrative. Factor a value repeated across entries into one sibling key.\n'
