@@ -105,6 +105,8 @@ from orchestrator.merge_lane.worker import (
     _verify_worktree_contention_sentinel,
 )
 from orchestrator.verify_cancel import (  # noqa: F401 -- reused by row tests
+    WATCHDOG_FIRE_TRIGGER_TOKEN,
+    WatchdogTrigger,
     collect_descendants,
     kill_process_tree,
     lane_lock_path,
@@ -2699,6 +2701,58 @@ def test_drain_exited_stderr_refuses_a_live_process():
         if proc.stderr is not None:
             with contextlib.suppress(OSError):
                 proc.stderr.close()
+
+
+def test_assert_watchdog_fire_trigger_discriminates_the_branch():
+    """The trigger assertion passes only on exactly the expected token.
+
+    This is the non-vacuity guard for every row that asserts a trigger: a
+    helper that always passed would make all of those rows vacuous.  Each
+    failing case strips the helper's echo of the (short) text from the
+    message before checking it, so the reported and expected values must be
+    named in the diagnosis itself, not just in the echoed input.
+    """
+    noise = 'INFO verify: building mod\nINFO verify: still running\n'
+
+    def token_line(trigger: WatchdogTrigger) -> str:
+        return f'{WATCHDOG_FIRE_TRIGGER_TOKEN}={trigger.value}\n'
+
+    def diagnosis(text: str, expected: WatchdogTrigger, source: str) -> str:
+        with pytest.raises(AssertionError) as exc_info:
+            assert_watchdog_fire_trigger(text, expected, source=source)
+        message = str(exc_info.value)
+        assert repr(text) in message, f'the text is not echoed: {message!r}'
+        return message.replace(repr(text), '')
+
+    eof_token = f'{WATCHDOG_FIRE_TRIGGER_TOKEN}={WatchdogTrigger.EOF.value}'
+    starvation_token = f'{WATCHDOG_FIRE_TRIGGER_TOKEN}={WatchdogTrigger.HEARTBEAT_STARVATION.value}'
+
+    assert assert_watchdog_fire_trigger(
+        noise + token_line(WatchdogTrigger.EOF) + noise, WatchdogTrigger.EOF, source='matching case'
+    ) is None
+
+    wrong_branch = diagnosis(
+        noise + token_line(WatchdogTrigger.HEARTBEAT_STARVATION) + noise,
+        WatchdogTrigger.EOF,
+        'wrong-branch case',
+    )
+    assert WatchdogTrigger.HEARTBEAT_STARVATION.value in wrong_branch, wrong_branch
+    assert eof_token in wrong_branch, wrong_branch
+    assert 'wrong-branch case' in wrong_branch, wrong_branch
+
+    unattributable = diagnosis(
+        noise + 'TAIL-MARKER\n', WatchdogTrigger.HEARTBEAT_STARVATION, 'no-token case'
+    )
+    assert 'unattributable' in unattributable, unattributable
+    assert starvation_token in unattributable, unattributable
+    assert 'no-token case' in unattributable, unattributable
+
+    both = diagnosis(
+        token_line(WatchdogTrigger.EOF) + token_line(WatchdogTrigger.HEARTBEAT_STARVATION),
+        WatchdogTrigger.EOF,
+        'both-tokens case',
+    )
+    assert WatchdogTrigger.HEARTBEAT_STARVATION.value in both, both
 
 
 #: A child that stays alive but is never waited on -- killed by the test that
