@@ -16,7 +16,47 @@ import pytest
 from audit_delivered_checks import StalePathSweep, load_manifest_checks, stale_path_findings
 from git_checkout_root import checkout_root_or_skip
 
-_KNOWN_STALE: frozenset[tuple[str, int, str, str]] = frozenset()
+# Every row below was stranded by task 5036's move of the merge lane into
+# orchestrator/merge_lane/ (ce8a05ab3c "Merge task/6174 into main"), which
+# left these modules as sys.modules shims over the moved code.
+_MERGE_QUEUE = "orchestrator/src/orchestrator/merge_queue.py"
+_LANDING_EVIDENCE = "orchestrator/src/orchestrator/landing_evidence.py"
+_MERGE_DRIFT = "orchestrator/src/orchestrator/merge_drift.py"
+_MERGE_DISPOSITION = "orchestrator/src/orchestrator/merge_disposition.py"
+_MERGE_GATES = "orchestrator/src/orchestrator/merge_gates.py"
+
+_LANDED_NOT_DONE = "docs/prds/landed-not-done-recovery.capability-manifest.yaml"
+_LIVE_SHADOW = "plans/live-shadow-eval-prd.capability-manifest.yaml"
+_DURABLE_NON_LANDED = "plans/merge-status-durable-non-landed-prd.capability-manifest.yaml"
+_VERDICT_INTEGRITY = "plans/merge-verdict-integrity-prd.capability-manifest.yaml"
+_AMENDMENT_DELIVERY = "plans/task-amendment-delivery-prd.capability-manifest.yaml"
+
+_KNOWN_STALE: frozenset[tuple[str, int, str, str]] = frozenset({
+    (_LANDED_NOT_DONE, 4646, "parked-disposition-label-distinct-from-pruned", _MERGE_QUEUE),
+    (_LANDED_NOT_DONE, 4646, "tally-key-pre-registered-or-the-label-is-swallowed", _MERGE_QUEUE),
+    (_LANDED_NOT_DONE, 4646, "terminal-status-set-exists-and-is-importable", _MERGE_QUEUE),
+    (_LANDED_NOT_DONE, 4647, "degenerate-branch-check-already-implemented", _LANDING_EVIDENCE),
+    (_LANDED_NOT_DONE, 4647, "landing-evidence-module-already-exists-delta-extends-it",
+     _LANDING_EVIDENCE),
+    (_LANDED_NOT_DONE, 4647, "landing-verdict-dataclass-does-not-collide", _LANDING_EVIDENCE),
+    (_LANDED_NOT_DONE, 4647, "no-op-rejection-reason-in-the-closed-vocabulary",
+     _LANDING_EVIDENCE),
+    (_LANDED_NOT_DONE, 4647, "patch-id-containment-helper-exists-and-is-reusable",
+     _LANDING_EVIDENCE),
+    (_LANDED_NOT_DONE, 4647, "reason-codes-must-be-registered-in-reason-explanations",
+     _LANDING_EVIDENCE),
+    (_LANDED_NOT_DONE, 4648, "branch-work-landed-contract-from-delta", _LANDING_EVIDENCE),
+    (_LANDED_NOT_DONE, 4651, "landed-outbox-row-survives-for-parked-statuses-upstream",
+     _MERGE_QUEUE),
+    (_LANDED_NOT_DONE, 4651, "landing-contract-available-upstream", _LANDING_EVIDENCE),
+    (_LANDED_NOT_DONE, 4652, "b9-needs-gammas-parked-vs-pruned-label", _MERGE_QUEUE),
+    (_LIVE_SHADOW, 5388, "merge-landing-hook-wired", _MERGE_QUEUE),
+    (_DURABLE_NON_LANDED, 4830, "finalize-payload-carries-superseded-by", _MERGE_QUEUE),
+    (_VERDICT_INTEGRITY, 2886, "drift-counter-persisted", _MERGE_DRIFT),
+    (_VERDICT_INTEGRITY, 2887, "foreign-drift-disposition", _MERGE_DISPOSITION),
+    (_AMENDMENT_DELIVERY, 4033, "commit-ownership-gate-at-the-sibling-gate-site", _MERGE_GATES),
+    (_AMENDMENT_DELIVERY, 4033, "gate-reads-the-descope-record", _MERGE_GATES),
+})
 
 _REMEDY = (
     "repath BOTH halves (this sidecar, and the task record via update_task) to "
