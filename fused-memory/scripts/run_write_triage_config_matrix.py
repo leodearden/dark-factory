@@ -38,10 +38,12 @@ Run from ``fused-memory/``::
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import importlib.util
 import json
 import math
+import os
 import sys
 import types
 from collections.abc import Iterable, Mapping, Sequence
@@ -51,6 +53,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.server.write_triage_judge import (
     resolve_judge_candidate_count,
     resolve_judge_field_chars,
@@ -60,6 +63,7 @@ from fused_memory.server.write_triage_judge import (
 )
 
 _SCRIPTS = Path(__file__).resolve().parent
+_PACKAGE_ROOT = _SCRIPTS.parent
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -479,3 +483,114 @@ def _scored_row(arm: PiArm, iota: Mapping[str, Any]) -> dict[str, Any]:
         'paired_vs_reference': iota['paired_vs_reference'],
     }
 
+
+# --- CLI -----------------------------------------------------------------------
+
+MATRIX_NAME = 'write_triage_config_matrix.json'
+BEST_CONFIG_NAME = 'write_triage_best_config.json'
+_CALIBRATION = _PACKAGE_ROOT / 'calibration'
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        '--population', type=Path, default=_CALIBRATION / 'write_triage_population.json',
+        help="π's published population artifact",
+    )
+    parser.add_argument(
+        '--verdicts', type=Path, default=_CALIBRATION / 'write_triage_pair_verdicts.jsonl',
+        help="λ's verdict corpus",
+    )
+    parser.add_argument(
+        '--data-root', type=Path, required=True,
+        help="the checkout whose gitignored data/ holds π's arm files, e.g. the main checkout",
+    )
+    parser.add_argument(
+        '--require', action='append', nargs=3, required=True,
+        metavar=('PATH', 'OP', 'VALUE'),
+        help="one Γ3 bound: copy each `--require best …` of task 5808's before_done.args"
+             " without the 'best' handle; repeat for every bound",
+    )
+    parser.add_argument(
+        '--out-dir', type=Path, default=_CALIBRATION,
+        help='where both artifacts are written (default: calibration/)',
+    )
+    return parser
+
+
+def _compute(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
+    population = Population.from_artifact(json.loads(args.population.read_text(encoding='utf-8')))
+    matrix = build_matrix(
+        population,
+        read_arm_cases(population, args.data_root),
+        _read_jsonl(args.verdicts),
+        shipped=shipped_settings(types.SimpleNamespace(config=FusedMemoryConfig())),
+        bounds=[Bound(*spec) for spec in args.require],
+    ) | {'inputs': _inputs(args.population, args.verdicts)}
+    return matrix, best_config(matrix)
+
+
+def _inputs(population: Path, verdicts: Path) -> dict[str, str]:
+    return {
+        'population_path': _repo_relative(population),
+        'population_sha256': hashlib.sha256(population.read_bytes()).hexdigest(),
+        'verdicts_path': _repo_relative(verdicts),
+        'verdicts_sha256': hashlib.sha256(verdicts.read_bytes()).hexdigest(),
+    }
+
+
+def _repo_relative(path: Path) -> str:
+    """*path* relative to the checkout that holds it (the first parent with ``.git``)."""
+    resolved = Path(path).resolve()
+    for parent in resolved.parents:
+        if (parent / '.git').exists():
+            return resolved.relative_to(parent).as_posix()
+    raise ValueError(f'{path} is not inside a git checkout')
+
+
+def _json_body(doc: Mapping[str, Any]) -> str:
+    return json.dumps(doc, indent=2, ensure_ascii=False) + '\n'
+
+
+def _write_staged(bodies: Mapping[Path, str]) -> None:
+    """Write every body beside its path before moving any into place.
+
+    A body that cannot be written therefore replaces none of the files.
+    """
+    staged = {path: path.with_name(f'{path.name}.tmp') for path in bodies}
+    try:
+        for path, body in bodies.items():
+            staged[path].write_text(body, encoding='utf-8')
+        for path, temporary in staged.items():
+            os.replace(temporary, path)
+    finally:
+        for temporary in staged.values():
+            temporary.unlink(missing_ok=True)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    try:
+        matrix, best = _compute(args)
+    except (OSError, ValueError) as refusal:
+        print(refusal, file=sys.stderr)
+        return 1
+    matrix_out = args.out_dir / MATRIX_NAME
+    best_out = args.out_dir / BEST_CONFIG_NAME
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    _write_staged({matrix_out: _json_body(matrix), best_out: _json_body(best)})
+    print(json.dumps({
+        'winner': matrix['winner'],
+        'reference_arm': matrix['reference_arm'],
+        'meets_every_bound': best['provenance']['meets_every_bound'],
+        'fallback_applied': matrix['selection_rule']['fallback_applied'],
+        'matrix_out': str(matrix_out),
+        'best_config_out': str(best_out),
+    }, ensure_ascii=False))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
