@@ -591,6 +591,10 @@ half-done tree that is falsely recorded as a completed, successful run.
 # invocation_timeout (7200s), a real operational change that belongs in its own
 # task rather than riding along in a prompt-wording one.
 # (Task 3607 review rounds 1 and 5, reviewer_comprehensive.)
+# Task 5969 (refile of reify #7907/#7915) rewrote the `Monitor` bullet to lead
+# with what Monitor is NOT: cold calls kept guessing a join-on-an-id shape
+# despite the ToolSearch-first clause.  It states no cap figure because the
+# harness cap churns; the measurements are in that commit's message.
 WAIT_PATTERN_GUIDANCE = """
 ## CRITICAL: How to wait for something
 
@@ -650,12 +654,24 @@ SANCTIONED
   though the job had finished long before. Reading something you launched is
   NOT the ad-hoc wait prohibited below: you have a real completion signal, and
   you stay until you have it.
-- `Monitor` streams ONE notification per matching output line, so it fits a
-  recurring event feed, not a single "tell me when this finishes" — for that,
-  background a command that exits when done. If you do reach for it, load its
-  schema with `ToolSearch("select:Monitor")` FIRST: it is a deferred tool, and
-  calling it cold is rejected client-side with `InputValidationError` for
-  invented parameter names.
+- `Monitor` is NOT a way to wait for something you launched: it takes no task
+  or shell id to join on. It runs a shell command of its own and turns each
+  line that command prints into a notification, so it fits a recurring event
+  feed. Cold calls to it almost all guessed a wait-for-this-id shape
+  (`target`, `shellId`, `taskId`) and were rejected with
+  `InputValidationError`. To await your own background command, `Read` its
+  output file as above. When a harness message (the `Bash` tool description,
+  or the sleep guard's block) says to "use Monitor with an until-loop", run
+  that until-loop as a `run_in_background` `Bash` command and read its output
+  file instead; the loaded Monitor description itself steers a
+  one-notification wait there too. If you do need a feed: Monitor is DEFERRED,
+  so load its schema with `ToolSearch("select:Monitor")` BEFORE the first
+  call, and take every parameter name from that schema, never from memory —
+  its parameters have changed within a month. Even loaded, it cannot hold a
+  wait for you: every Monitor expires at a deadline the harness caps, and the
+  loaded schema states that cap. Its notifications reach you only while you
+  are still working, so ending your turn to await one exits this session,
+  exactly as a pending background command does.
 
 NEVER — each of these cost a real session a turn or an entire wait
 - `sleep N; tail ...` / `sleep N && cat ...` chained to poll background output.
@@ -745,9 +761,9 @@ BACKGROUND_WAIT_GUIDANCE = (
 # that for ~8% of the block's bytes.
 #
 # THE ONLY SIZE FIGURES IN THIS FEATURE LIVE HERE.  Measured on this revision:
-# BACKGROUND_WAIT_GUIDANCE 9128 B (= BACKGROUND_TASK_WARNING 1193 +
-# WAIT_PATTERN_GUIDANCE 5517 + EXTERNAL_KILL_GUIDANCE 2418),
-# WAIT_PATTERN_REMINDER 766 B -> 766/9128 = 8.4%.
+# BACKGROUND_WAIT_GUIDANCE 10022 B (= BACKGROUND_TASK_WARNING 1193 +
+# WAIT_PATTERN_GUIDANCE 6411 + EXTERNAL_KILL_GUIDANCE 2418),
+# WAIT_PATTERN_REMINDER 766 B -> 766/10022 = 7.6%.
 # Re-derive rather than trust these after any edit to the strings:
 #   python -c "from orchestrator.agents.roles import *; \
 #              print(len(BACKGROUND_WAIT_GUIDANCE), len(WAIT_PATTERN_REMINDER))"
