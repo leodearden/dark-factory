@@ -1404,7 +1404,7 @@ class TestBuildPerProjectMergeQueue:
         assert data['latency'] == ZERO_LATENCY
         assert data['recent'] == []
         assert data['recent_total'] == 0
-        assert data['speculative'] == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
+        assert data['speculative'].state is DatumState.UNKNOWN
         assert 'active' not in data, (
             'the live probe is the one source of the queue; the route reads it'
         )

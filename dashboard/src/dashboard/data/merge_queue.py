@@ -56,6 +56,23 @@ def _ts_sort_key(entry: dict) -> datetime:
 # from 7d — which is when "showing N of M" carries information.
 RECENT_MERGES_CAP = 200
 
+LIVE_QUEUE_FRESHNESS_BOUND_SECONDS = 30
+"""How long a live queue reading stays fresh.
+
+Equal to ``task_snapshot.FRESHNESS_BOUND_SECONDS`` and for the same reason:
+it must outlast the route's own worst-case fan-out — the probes, then the
+task lookup's deadline — so the routine slow path does not serve its own
+probe stale. Ageing in the browser is the client's age badge's job.
+"""
+
+RUNS_DB_READ_FRESHNESS_BOUND_SECONDS = LIVE_QUEUE_FRESHNESS_BOUND_SECONDS
+"""How long a runs.db window read stays fresh.
+
+A window read is stamped at the route's ``render_at``, the same instant the
+live probe is stamped, so it must outlast the same fan-out — hence the same
+number, held once.
+"""
+
 # ---------------------------------------------------------------------------
 # Adaptive bucket ladder: (max_hours | None, bucket_minutes)
 # None as max_hours means "catch-all / no upper bound".
@@ -444,22 +461,27 @@ async def speculative_stats(
     *,
     hours: int = 24,
     now: datetime | None = None,
-) -> dict:
+) -> Datum[dict]:
     """Hit/discard counts and hit rate for speculative merge events.
 
-    Returns {'hit_count': int, 'discard_count': int, 'total': int,
-             'hit_rate': float}.
-
     Args:
-        db: aiosqlite connection, or None (returns all-zeros dict).
+        db: aiosqlite connection, or None (no runs.db is open for the project).
         hours: Look-back window in hours (default 24).
         now: Reference timestamp for the cutoff. When None, ``datetime.now(UTC)``
             is used. Pass an explicit value to share a timestamp with sibling calls.
-    """
-    if db is None:
-        return {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
 
-    async def _query(conn: aiosqlite.Connection) -> dict:
+    Returns:
+        One ``Datum`` over ``{'hit_count', 'discard_count', 'total',
+        'hit_rate'}``, FRESH at *now* when the window was read. ``hit_rate`` is
+        None for a zero-attempt window, which has no rate. With no runs.db, or
+        when the read fails, the Datum is UNKNOWN with a reason saying which —
+        never measured-looking zeros.
+    """
+    bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
+    if db is None:
+        return unknown_datum('no runs.db is open for this project', bound)
+
+    async def _query(conn: aiosqlite.Connection) -> Datum[dict]:
         since = _cutoff_iso(hours, now=now)
         rows = await conn.execute_fetchall(
             "SELECT event_type, COUNT(*) AS cnt "
@@ -477,15 +499,18 @@ async def speculative_stats(
             else:
                 discard_count = row['cnt']
         total = hit_count + discard_count
-        hit_rate = hit_count / total if total > 0 else 0.0
-        return {
+        stats = {
             'hit_count': hit_count,
             'discard_count': discard_count,
             'total': total,
-            'hit_rate': hit_rate,
+            'hit_rate': hit_count / total if total > 0 else None,
         }
+        return Datum(stats, resolve_now(now), DatumState.FRESH, None, bound)
 
-    return await with_db(db, _query, {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0})
+    return await with_db(
+        db, _query,
+        unknown_datum('the speculative-merge events could not be read from runs.db', bound),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -857,16 +882,6 @@ async def fetch_live_merge_queues(
         return_exceptions=False,
     )
     return dict(zip(labels, results, strict=True))
-
-
-LIVE_QUEUE_FRESHNESS_BOUND_SECONDS = 30
-"""How long a live queue reading stays fresh.
-
-Equal to ``task_snapshot.FRESHNESS_BOUND_SECONDS`` and for the same reason:
-it must outlast the route's own worst-case fan-out — the probes, then the
-task lookup's deadline — so the routine slow path does not serve its own
-probe stale. Ageing in the browser is the client's age badge's job.
-"""
 
 
 @dataclass(frozen=True, slots=True)
