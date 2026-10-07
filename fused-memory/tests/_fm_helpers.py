@@ -39,6 +39,7 @@ from openai import RateLimitError
 from pydantic import BaseModel
 from shared.project_layout import tasks_db
 
+from fused_memory.backends.falkor_indices import IndexHeaderShapeError, resolve_header_positions
 from fused_memory.backends.graphiti_client import (
     INCOMPLETE_KINDS,
     PagedRead,
@@ -1487,12 +1488,16 @@ class LoopFreedomProbe:
 # ---------------------------------------------------------------------------
 
 class IndexHeaderError(AssertionError):
-    """``CALL db.indexes()`` did not expose a ``status`` column.
+    """``CALL db.indexes()`` returned a header the barrier cannot read.
+
+    Two shapes: no ``status`` column, or a header entry that is not a
+    ``(type, name)`` pair. Wraps the production
+    ``falkor_indices.IndexHeaderShapeError`` and carries its message.
 
     A distinct type from the timeout AssertionError because the two failure
     modes mean different things and call for different operator actions: a
-    timeout is a slow or wedged index build, whereas a missing ``status``
-    column means FalkorDB changed its result shape and the barrier cannot be
+    timeout is a slow or wedged index build, whereas a header shape surprise
+    means FalkorDB changed its result shape and the barrier cannot be
     trusted at all. Collapsing the second into a generic timeout message would
     hide a silent no-op behind a plausible-looking timeout.
 
@@ -1520,7 +1525,9 @@ async def await_index_operational(graph, timeout_s: float = 10.0) -> None:
     The ``status`` column is resolved **by name** from ``result.header`` rather
     than hardcoded to its current position (7 of 9), so a FalkorDB column
     reorder fails loudly here instead of silently reading the wrong column and
-    turning the barrier into a no-op.
+    turning the barrier into a no-op. Resolution goes through
+    ``falkor_indices.resolve_header_positions``, the single home shared with
+    ``GraphitiBackend.list_indices``.
 
     Readiness is an **exact** match on ``'OPERATIONAL'`` for every row, never a
     substring test for ``'UNDER CONSTRUCTION'``: the live not-ready value
@@ -1552,8 +1559,9 @@ async def await_index_operational(graph, timeout_s: float = 10.0) -> None:
             budget inside it.
 
     Raises:
-        IndexHeaderError: ``CALL db.indexes()`` exposed no ``status`` column —
-            raised on the first poll, never retried until the deadline.
+        IndexHeaderError: ``CALL db.indexes()`` exposed no ``status`` column,
+            or a header entry that is not a ``(type, name)`` pair — raised on
+            the first poll, never retried until the deadline.
         AssertionError: Not every index became ``OPERATIONAL`` within
             *timeout_s*; the message carries the last-seen status strings.
     """
@@ -1562,14 +1570,14 @@ async def await_index_operational(graph, timeout_s: float = 10.0) -> None:
     async def _all_operational() -> bool:
         nonlocal last_statuses
         result = await graph.query('CALL db.indexes()')
-        header_names = [col[1] for col in result.header]
-        if 'status' not in header_names:
+        try:
+            positions = resolve_header_positions(result.header, {'status': 'status'})
+        except IndexHeaderShapeError as exc:
             raise IndexHeaderError(
-                'CALL db.indexes() has no "status" column; FalkorDB changed its '
-                f'result shape (header={header_names}). The index-readiness '
-                'barrier cannot be trusted until this is re-verified.'
-            )
-        status_idx = header_names.index('status')
+                f'{exc} The index-readiness barrier cannot be trusted until this '
+                'is re-verified.'
+            ) from exc
+        status_idx = positions['status']
         last_statuses = [row[status_idx] for row in result.result_set]
         return bool(last_statuses) and all(s == 'OPERATIONAL' for s in last_statuses)
 
