@@ -11,6 +11,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
 from shared.task_metadata import parse_metadata
 
 from fused_memory import memory_metadata
@@ -22,8 +23,10 @@ from fused_memory.reconciliation.audit_trail_rotation import (
     ROTATE_TARGET_BYTES,
     ROTATE_THRESHOLD_BYTES,
     TaskRewrite,
+    bound_audit_trail,
     near_duplicate_key,
     plan_rotation,
+    task_fingerprint,
     task_payload_bytes,
     unrotatable_reason,
 )
@@ -590,3 +593,153 @@ class TestRollupRecord:
         _, plan = self._size_rotated()
         _, warnings = parse_metadata(plan.render('mem-1').metadata, direction='read')
         assert [w for w in warnings if w.code == 'unknown_key' and w.field == ROLLUP_KEY] == []
+
+
+_STORED = object()
+
+
+class FakeArchive:
+    """In-memory AuditTrailArchive; ``read_returns`` overrides what a read sees."""
+
+    def __init__(self, *, write_id: str | None = 'mem-1', read_returns: Any = _STORED):
+        self.write_id = write_id
+        self.read_returns = read_returns
+        self.store: dict[str, str] = {}
+        self.writes: list[dict[str, Any]] = []
+        self.reads: list[dict[str, Any]] = []
+
+    async def write(self, *, project_id: str, content: str, metadata: dict[str, Any]) -> str | None:
+        self.writes.append({'project_id': project_id, 'content': content, 'metadata': metadata})
+        if self.write_id is not None:
+            self.store[self.write_id] = content
+        return self.write_id
+
+    async def read(self, *, project_id: str, memory_id: str) -> str | None:
+        self.reads.append({'project_id': project_id, 'memory_id': memory_id})
+        if self.read_returns is not _STORED:
+            return self.read_returns
+        return self.store.get(memory_id)
+
+
+class RecordingCommit:
+    def __init__(self, task: dict[str, Any], *, superseded: bool = False):
+        self.task = task
+        self.superseded = superseded
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(
+        self, *, expected_fingerprint: str, description: str | None, metadata: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        self.calls.append(
+            {
+                'expected_fingerprint': expected_fingerprint,
+                'description': description,
+                'metadata': metadata,
+            }
+        )
+        if self.superseded:
+            return None
+        new_description = self.task['description'] if description is None else description
+        return {**self.task, 'description': new_description, 'metadata': metadata}
+
+
+def size_triggered_task() -> dict[str, Any]:
+    description = '\n\n'.join(cycle_blocks(30, filler_repeats=35))
+    return make_task(description=description, details='Ruling: none yet.', metadata=dict(GATE_MARKERS))
+
+
+async def bound(task: dict[str, Any], archive: FakeArchive, commit: RecordingCommit) -> Any:
+    return await bound_audit_trail(task, project_id='p', now=NOW, archive=archive, commit=commit)
+
+
+class TestBoundAuditTrailExecutor:
+    @pytest.mark.asyncio
+    async def test_size_rotation_archives_confirms_then_commits(self):
+        task = size_triggered_task()
+        plan = plan_rotation(task, now=NOW)
+        assert plan is not None
+        archive, commit = FakeArchive(), RecordingCommit(task)
+        outcome = await bound(task, archive, commit)
+        assert archive.writes == [
+            {'project_id': 'p', 'content': plan.archive_text, 'metadata': plan.archive_metadata}
+        ]
+        assert archive.reads == [{'project_id': 'p', 'memory_id': 'mem-1'}]
+        rewrite = plan.render('mem-1')
+        assert commit.calls == [
+            {
+                'expected_fingerprint': task_fingerprint(task),
+                'description': rewrite.description,
+                'metadata': rewrite.metadata,
+            }
+        ]
+        assert outcome.status == 'rotated'
+        assert outcome.archive_memory_id == 'mem-1'
+        assert outcome.bytes_before == task_payload_bytes(task)
+        assert outcome.committed_task is not None
+        assert outcome.bytes_after == task_payload_bytes(outcome.committed_task)
+        assert outcome.bytes_after <= ROTATE_TARGET_BYTES
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'archive',
+        [
+            FakeArchive(write_id=None),
+            FakeArchive(read_returns='not what was written'),
+            FakeArchive(read_returns=None),
+        ],
+        ids=['write-returned-no-id', 'read-back-differs', 'read-back-missing'],
+    )
+    async def test_unconfirmed_archive_never_commits(self, archive: FakeArchive):
+        task = size_triggered_task()
+        commit = RecordingCommit(task)
+        outcome = await bound(task, archive, commit)
+        assert commit.calls == []
+        assert outcome.status == 'archive_unconfirmed'
+        assert outcome.bytes_before == task_payload_bytes(task)
+        assert outcome.committed_task is None
+
+    @pytest.mark.asyncio
+    async def test_moved_fingerprint_reports_superseded_with_the_archive_id(self):
+        task = size_triggered_task()
+        outcome = await bound(task, FakeArchive(), RecordingCommit(task, superseded=True))
+        assert outcome.status == 'superseded'
+        assert outcome.archive_memory_id == 'mem-1'
+        assert outcome.committed_task is None
+
+    @pytest.mark.asyncio
+    async def test_fold_only_plan_commits_without_an_archive(self):
+        task = make_task(metadata=dated_family('x_relay', [20, 21]))
+        archive, commit = FakeArchive(), RecordingCommit(task)
+        outcome = await bound(task, archive, commit)
+        assert archive.writes == []
+        assert len(commit.calls) == 1
+        assert commit.calls[0]['description'] is None
+        assert outcome.status == 'folded'
+        assert outcome.archive_memory_id is None
+
+    @pytest.mark.asyncio
+    async def test_nothing_to_do_returns_none(self):
+        task = make_task()
+        archive, commit = FakeArchive(), RecordingCommit(task)
+        assert await bound(task, archive, commit) is None
+        assert archive.writes == [] and commit.calls == []
+
+    @pytest.mark.asyncio
+    async def test_unrotatable_task_reports_column_sizes_without_side_effects(self):
+        task = make_task(description='One block only.', details='d' * 41_000)
+        archive, commit = FakeArchive(), RecordingCommit(task)
+        outcome = await bound(task, archive, commit)
+        assert outcome.status == 'unrotatable'
+        assert outcome.unrotatable == unrotatable_reason(task, now=NOW)
+        assert archive.writes == [] and commit.calls == []
+
+    @pytest.mark.asyncio
+    async def test_outcome_as_dict_is_json_serialisable(self):
+        task = size_triggered_task()
+        rotated = await bound(task, FakeArchive(), RecordingCommit(task))
+        unrotatable = await bound(
+            make_task(details='d' * 41_000), FakeArchive(), RecordingCommit(task)
+        )
+        for outcome in (rotated, unrotatable):
+            payload = json.loads(json.dumps(outcome.as_dict()))
+            assert payload['status'] == outcome.status
