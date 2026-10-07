@@ -990,8 +990,9 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
         Mirrors shared/src/shared/merge_state.py::SUBMIT_NON_TERMINAL. Pinned by
         scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
         and this list goes red until it matches. -->
-   A timeout yields a non-terminal queued shape: `{status: 'queued'|'attached', request_id,
-   snapshot_tip, generation, position, queue_depth, eta_seconds}`.
+   A timeout yields a non-terminal shape with `status: 'queued'|'attached'` and a
+   `request_id` to poll; its full key set is stated in `merge_request`'s own docstring
+   (`escalation/src/escalation/server.py::merge_request`), not restated here.
    <!-- merge-state-vocab:end -->
    Both are a **successful, durable submission** — the entry survives disconnect (PRD D2);
    intent persists even if the MCP session drops mid-bounded-wait.
