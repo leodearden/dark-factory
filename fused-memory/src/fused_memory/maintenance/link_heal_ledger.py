@@ -1,6 +1,7 @@
-"""The link-heal ledger and run lock (plans/write-triage-link-healing-prd.md H1).
+"""The link-heal ledger and run lock (plans/write-triage-link-healing-prd.md H1, H2).
 
-``link_heal.db`` is the one home of heal history. Every table keys on an
+``link_heal.db`` is the one home of heal history and of the link adjudicator's
+verdicts: an adjudication is stored nowhere else (D8). Every table keys on an
 AUTOINCREMENT id, so a ``sqlite_sequence`` row proves something has written
 here (INV-13). Detail and counts are stored as JSON.
 
@@ -18,7 +19,7 @@ import os
 import re
 import sqlite3
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -30,6 +31,7 @@ from fused_memory.maintenance.link_heal import (
     HealAction,
     LinkImage,
     PlannedAction,
+    Verdict,
 )
 
 LEDGER_FILENAME = 'link_heal.db'
@@ -164,6 +166,32 @@ class ActionRow:
     detail: Mapping[str, Any] | None
     executed_run_id: str | None
     undone_run_id: str | None
+
+
+@dataclass(frozen=True)
+class AdjudicationRecord:
+    """The adjudicator's verdict on one (child, parent) pair, at the text hashes it judged."""
+
+    project_id: str
+    child_id: str
+    parent_id: str
+    child_sha256: str
+    parent_sha256: str
+    verdict: Verdict
+    reason: str
+    model: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.verdict, Verdict):
+            raise TypeError(f'adjudication verdict {self.verdict!r} is not a Verdict')
+
+
+@dataclass(frozen=True)
+class AdjudicationRow:
+    adjudication_id: int
+    run_id: str
+    at: str
+    record: AdjudicationRecord
 
 
 @dataclass(frozen=True)
@@ -382,6 +410,51 @@ class LinkHealLedger:
         ).fetchone()
         return None if row is None else _undo_step_row(row)
 
+    def add_adjudications(
+        self, run_id: str, records: Sequence[AdjudicationRecord],
+    ) -> list[int]:
+        at = _now()
+        with self._conn:
+            return [
+                _lastrowid(self._conn.execute(
+                    'INSERT INTO adjudications (project_id, child_id, parent_id, child_sha256, '
+                    'parent_sha256, verdict, reason, model, run_id, at) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    (
+                        record.project_id, record.child_id, record.parent_id,
+                        record.child_sha256, record.parent_sha256, record.verdict.value,
+                        record.reason, record.model, run_id, at,
+                    ),
+                ))
+                for record in records
+            ]
+
+    def adjudication_at(
+        self,
+        project_id: str,
+        child_id: str,
+        parent_id: str,
+        child_sha256: str,
+        parent_sha256: str,
+    ) -> AdjudicationRow | None:
+        """The newest adjudication of this pair at exactly these text hashes."""
+        row = self._conn.execute(
+            'SELECT * FROM adjudications WHERE project_id = ? AND child_id = ? AND parent_id = ? '
+            'AND child_sha256 = ? AND parent_sha256 = ? ORDER BY id DESC LIMIT 1',
+            (project_id, child_id, parent_id, child_sha256, parent_sha256),
+        ).fetchone()
+        return None if row is None else _adjudication_row(row)
+
+    def adjudication_verdicts(self, run_ids: Iterable[str]) -> list[Verdict]:
+        """The verdict of every adjudication the runs *run_ids* made."""
+        wanted = sorted(set(run_ids))
+        placeholders = ', '.join('?' for _ in wanted)
+        rows = self._conn.execute(
+            f'SELECT verdict FROM adjudications WHERE run_id IN ({placeholders}) ORDER BY id',
+            wanted,
+        )
+        return [Verdict(verdict) for (verdict,) in rows]
+
     def _action_rows(self, sql: str, params: Sequence[Any]) -> list[ActionRow]:
         return [_action_row(row) for row in self._conn.execute(sql, params)]
 
@@ -424,6 +497,24 @@ def _action_row(row: sqlite3.Row) -> ActionRow:
         detail=_loads_or_none(row['detail']),
         executed_run_id=row['executed_run_id'],
         undone_run_id=row['undone_run_id'],
+    )
+
+
+def _adjudication_row(row: sqlite3.Row) -> AdjudicationRow:
+    return AdjudicationRow(
+        adjudication_id=row['id'],
+        run_id=row['run_id'],
+        at=row['at'],
+        record=AdjudicationRecord(
+            project_id=row['project_id'],
+            child_id=row['child_id'],
+            parent_id=row['parent_id'],
+            child_sha256=row['child_sha256'],
+            parent_sha256=row['parent_sha256'],
+            verdict=Verdict(row['verdict']),
+            reason=row['reason'],
+            model=row['model'],
+        ),
     )
 
 
