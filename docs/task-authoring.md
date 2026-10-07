@@ -570,7 +570,7 @@ unguarded. The opposite failure is worse — a check that can *never* go green
 blocks its dependent forever, and at runtime that is indistinguishable from a
 genuinely undelivered capability.
 
-**Reject codes** (all five block; the `_self_referential` and `_comment_only`
+**Reject codes** (all seven block; the `_self_referential` and `_comment_only`
 entries are diagnostic refinements of `vacuous_present` for grep, not separate
 gates):
 
@@ -581,6 +581,8 @@ gates):
 | `vacuous_present_comment_only` | the only matches are comments, not code | task **2792**'s `archive_task_transcripts`, matching one fossil comment in `git_ops.py` |
 | `vacuous_absent` | `expect: absent` check already passes at authoring (the pattern does not match, or no listed path exists) | the mirror cell: nothing to remove, so the check is green before any work starts |
 | `filename_shaped` | `kind: grep`, `expect: present` pattern has zero content matches and either names a tracked **filename**, or is exactly the basename or stem of a file the task declares in `metadata.files` inside the check's `paths` (the file need not exist yet) | task **3536**'s `test_workflow_merge_gating_strand` — authored before 3536 created that module, and a test module does not mention its own name, so `git grep` (which reads *contents*) could never see it. The rejection names the `kind: "path"` descriptor that says what was meant (see *Choosing a descriptor*) |
+| `shim_path` | a `kind: grep`, `expect: present` check whose `paths` names a `.py` file that rebinds `sys.modules[__name__]`: an alias shim, so the code it asserts lives elsewhere | task **5036** left `orchestrator/src/orchestrator/merge_queue.py`, `landing_evidence.py`, `merge_gates.py` and others as 12-line shims over `orchestrator/merge_lane/`, stranding checks of 2886, 2887, 4033, 4646–4648, 4651, 4652, 4830 and 5388 |
+| `removed_path` | an `expect: present` grep or path check naming a path a mainline (first-parent) commit deleted or moved away; the message names that commit | the move-shaped twin of `shim_path`: the path can never reappear unless someone re-creates it |
 
 **Warn code** (reported, never blocking):
 
@@ -595,6 +597,20 @@ files this task actually writes. That is the shape all three measured repairs
 took, and it is the only shape the gate can observe going green. When the
 capability IS a file's existence, use `kind: "path"` naming the file the task
 creates (or, with `expect: absent`, deletes).
+
+**Stale scope paths.** Every `paths` entry of an `expect: present` check must
+name live code at `main`. A path that never existed is the normal
+forward-looking state and is not flagged; only a `sys.modules` shim or a path
+the mainline removed is (`shared/src/shared/delivered_check_scope.py`). A path
+check on a shim is not stale, since the file exists. `expect: absent` checks are
+left to the 2x2 and the audit's `vacuous_live_gate`: a dead scope makes them
+pass, not wedge. Three enforcement points: the authoring lint (reject, also
+named in the runtime `AUTHORING DIAGNOSIS`); the audit's STALE PATHS section
+(below); and `scripts/tests/test_sidecar_delivered_check_scope.py`, a tripwire
+over every tracked sidecar at `HEAD` that fails the mover's own verify. The
+tripwire sees sidecars only; metadata-only descriptors are the audit's. Repair:
+repath BOTH halves (sidecar and task record), or drop the descriptor; a task
+that genuinely re-creates a removed file scopes a grep to its parent directory.
 
 **Two enforcement points, deliberately different contracts:**
 
@@ -636,10 +652,13 @@ evaluating a descriptor against main yields a *bit*, not a verdict —
 "`expect: present` and it matches" is the success state of a landed producer
 *and* a never-fires gate on a live one, and a status-blind rule flags 313 of
 548 descriptors (57%), overwhelmingly correctly delivered work. Exit 1 keys
-only on `broken` (a done producer whose capability is nowhere on main) and
-`vacuous_live_gate` (an open producer whose check already passes);
-`superseded` — a correct descriptor that later work legitimately undid — is
-reported and never actionable. A separate report-only section lists sidecar
+only on `broken` (a done producer whose capability is nowhere on main),
+`vacuous_live_gate` (an open producer whose check already passes),
+`unwired_live_gate` (an open producer never stamped with its sound sidecar
+check) and an actionable stale path (a live producer, or a done one with open
+dependents; the rest are listed report-only); `superseded` — a correct
+descriptor that later work legitimately undid — is reported and never
+actionable. A separate report-only section lists sidecar
 descriptors carrying a structural code (`vacuous_present_self_referential`,
 `vacuous_present_comment_only`, `filename_shaped`). Those codes are measured
 against today's tree, and a reworded comment or a later file flips them, so
