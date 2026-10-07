@@ -33,11 +33,18 @@ logger = logging.getLogger(__name__)
 # Non-MCP built-in tools that stages should never use
 DISALLOW_BUILTIN = ['Bash', 'Edit', 'Write', 'NotebookEdit']
 
-# Task write tools (disallowed in Stage 1 — memory consolidation only)
+# Task write tools (disallowed in Stage 1 and Stage 3; Stage 2 files tasks).
+# commit_planning is load-bearing for Stage 2's planning_mode -> add_dependency ->
+# commit_planning batch path (prompts/stage2.py). set_task_claimant is reached
+# in-process by reconciliation/targeted.py through the interceptor, not via this
+# MCP tool, so denying the tool does not touch that path.
 DISALLOW_TASK_WRITES = [
     'mcp__fused-memory__set_task_status',
     'mcp__fused-memory__submit_task',
     'mcp__fused-memory__resolve_ticket',
+    'mcp__fused-memory__cancel_ticket',
+    'mcp__fused-memory__commit_planning',
+    'mcp__fused-memory__set_task_claimant',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__remove_task',
     'mcp__fused-memory__add_dependency',
@@ -62,6 +69,10 @@ DISALLOW_TASK_WRITES = [
 DISALLOW_MEMORY_WRITES = [
     'mcp__fused-memory__add_episode',
     'mcp__fused-memory__add_memory',
+    # Parity with add_memory. The recon cycle-summary mirror calls
+    # MemoryService.add_system_record IN-PROCESS (reconciliation/summary_pool.py),
+    # so this MCP-level deny does not touch it.
+    'mcp__fused-memory__add_system_record',
     'mcp__fused-memory__delete_memory',
     'mcp__fused-memory__update_memory',
     # consolidate_memories (task 3133) is classified in the SAME change that
@@ -148,6 +159,39 @@ DISALLOW_RECON_REPORT_JOURNAL_WRITES = [
     'mcp__recon-report__repair_memory_citation',
 ]
 
+# fused-memory CONTROL-PLANE mutators (disallowed in every stage — task 3250).
+#
+# These mutate the machinery running a stage, not the data it curates:
+# trigger_reconciliation from inside a run is a re-entrancy hazard, reload_config
+# rewrites the config of the server executing the stage, and the rest steer the
+# scheduler, dead-letter queues and indexes. No recon prompt or stage references
+# any of them. A new list because neither incumbent reaches every stage:
+# DISALLOW_MEMORY_WRITES is folded by Stage 3 only, DISALLOW_TASK_WRITES misses
+# Stage 2 and would misname these, and
+# test_stages.py::test_stage2_disallows_builtins_and_retains_write_access pins that
+# neither of those reaches Stage 2.
+#
+# Known asymmetry, kept on purpose: replay_dead_letters stays in
+# DISALLOW_MEMORY_WRITES (Stage 3 only) while its dead-letter siblings land here.
+# Moving it would newly deny it to Stages 1 and 2, a behaviour change outside a
+# classification task.
+#
+# Every registered fused-memory tool must be in a deny bucket or reviewed as
+# read-only — see
+# tests/test_recon_stage_fused_memory_tool_classification.py::test_every_fused_memory_server_tool_is_classified.
+DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES = [
+    'mcp__fused-memory__trigger_reconciliation',
+    'mcp__fused-memory__unhalt_reconciliation',
+    'mcp__fused-memory__reload_config',
+    'mcp__fused-memory__rebuild_candidate_key_index',
+    'mcp__fused-memory__replay_event_dead_letters',
+    'mcp__fused-memory__delete_dead_letters',
+    'mcp__fused-memory__set_task_priority_override',
+    'mcp__fused-memory__clear_task_priority_override',
+    'mcp__fused-memory__reorder_pin_queue',
+    'mcp__fused-memory__request_park_eviction',
+]
+
 # Escalation READ tools (disallowed in every stage — task 3163,
 # plans/escalation-store-ambiguity-prd.md task α).
 #
@@ -230,18 +274,22 @@ DISALLOW_ESCALATION_WRITES = [
 STAGE1_DISALLOWED = (
     DISALLOW_TASK_WRITES
     + DISALLOW_RECON_REPORT_LEDGER_WRITES
+    + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
     + DISALLOW_ESCALATION_READS
     + DISALLOW_ESCALATION_WRITES
     + DISALLOW_BUILTIN
 )
-# Stage 2 keeps full memory + task write access; only built-ins and the
-# escalation reads are blocked.
-STAGE2_DISALLOWED = DISALLOW_ESCALATION_READS + DISALLOW_BUILTIN
+# Stage 2 keeps full memory + task write access; only built-ins, the escalation
+# reads and the fused-memory control-plane mutators are blocked.
+STAGE2_DISALLOWED = (
+    DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES + DISALLOW_ESCALATION_READS + DISALLOW_BUILTIN
+)
 STAGE3_DISALLOWED = (
     DISALLOW_TASK_WRITES
     + DISALLOW_MEMORY_WRITES
     + DISALLOW_RECON_REPORT_LEDGER_WRITES
     + DISALLOW_RECON_REPORT_JOURNAL_WRITES
+    + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
     + DISALLOW_ESCALATION_READS
     + DISALLOW_ESCALATION_WRITES
     + DISALLOW_BUILTIN
