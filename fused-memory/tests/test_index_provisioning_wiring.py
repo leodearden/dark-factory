@@ -361,7 +361,7 @@ class TestFirstWriteProvisioning:
 
         assert graph.ro_query.await_count == 2, 'an uncached graph must be retried'
 
-    @pytest.mark.asyncio
+    @virtual_clock_test
     async def test_a_hung_provisioning_read_leaves_the_write_its_budget_and_releases_the_lock(
         self, mock_config, make_backend, make_graph_mock,
     ):
