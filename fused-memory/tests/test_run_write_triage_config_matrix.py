@@ -25,6 +25,7 @@ from _fm_helpers import load_script_module
 SCRIPTS = Path(__file__).parent.parent / 'scripts'
 SCRIPT_PATH = SCRIPTS / 'run_write_triage_config_matrix.py'
 IOTA_PATH = SCRIPTS / 'score_write_triage_pairs.py'
+GATE_PATH = Path(__file__).resolve().parents[2] / 'scripts' / 'check_write_triage_readiness_gate.py'
 
 SNAPSHOT = 'snap'
 REFERENCE = 'gpt-4o-mini@5'
@@ -40,6 +41,11 @@ def _mod() -> types.ModuleType:
 @functools.cache
 def _mod_iota() -> types.ModuleType:
     return load_script_module(IOTA_PATH, mod_name='score_write_triage_pairs')
+
+
+@functools.cache
+def _mod_gate() -> types.ModuleType:
+    return load_script_module(GATE_PATH, mod_name='check_write_triage_readiness_gate')
 
 
 # --- synthetic fixtures ---------------------------------------------------------
@@ -129,9 +135,10 @@ def _three_arm_cases() -> dict[str, list[dict[str, Any]]]:
     """Four writes under three arms that differ in misfiles and contested-decision errors.
 
     The reference misses the w2 contradiction, misfiles w3 and contests the
-    agreeing w4 (2 contested-decision errors, 1 misfile). pre-ψ gets the
-    contest right but still misfiles w3 (0 errors, 1 misfile). sol gets every
-    write right (0 errors, 0 misfiles) at a higher price and latency.
+    agreeing w4 (2 contested-decision errors, 1 misfile). pre-ψ contests w2
+    rightly but still misfiles w3 and contests w4 (1 error, 1 misfile). sol
+    gets every write right (0 errors, 0 misfiles) at a higher price and
+    latency.
     """
     def parent(memory_id: str) -> str:
         return 'p1' if memory_id in ('w1', 'w2') else 'p2'
@@ -147,7 +154,7 @@ def _three_arm_cases() -> dict[str, list[dict[str, Any]]]:
         ]),
         PRE_PSI: arm_rows(PRE_PSI, [
             ('w1', 'restated', 't1'), ('w2', 'contested', 't2'),
-            ('w3', 'amended', 't3'), ('w4', 'amended', 't4'),
+            ('w3', 'amended', 't3'), ('w4', 'contested', 't4'),
         ]),
         SOL: arm_rows(SOL, [
             ('w1', 'restated', 't1'), ('w2', 'contested', 't2'),
@@ -253,3 +260,121 @@ def test_shipped_settings_resolve_through_the_shipped_resolvers() -> None:
     assert _mod().shipped_settings(service) == _mod().ArmSettings(
         'openai', 'gpt-4o-mini', 'low', 20, 'shipped', 4000,
     )
+
+
+# --- step 3: Γ3's bounds and the winner rule --------------------------------------
+
+#: Above gpt-4o-mini's $0.000021 per write and below sol's $0.006.
+CHEAP = '0.001'
+
+
+def _gate_checks(row: dict[str, Any], matrix: dict[str, Any], bounds: list[Any]) -> list[dict]:
+    doc = {
+        'quality': row['quality'], 'selection': row['selection'],
+        'population': matrix['population'],
+    }
+    return [
+        _mod_gate().check_require({'best': doc}, 'best', b.path, b.op, b.value) for b in bounds
+    ]
+
+
+def test_every_arm_is_checked_against_the_bounds_the_way_gamma3_checks_them() -> None:
+    bounds = [
+        _bound('quality.misfile_rate_of_attaches', '<=', '0.3'),
+        _bound('selection.cost_per_write_usd', '<=', CHEAP),
+        _bound('population.n_judge_band', '>=', '4'),
+    ]
+    matrix = _build(bounds=bounds)
+
+    met = {}
+    for row in _scored_rows(matrix):
+        checks = _gate_checks(row, matrix, bounds)
+        assert row['bounds'] == {'met': all(c['ok'] for c in checks), 'checks': checks}
+        met[row['arm']] = row['bounds']['met']
+    assert met == {REFERENCE: True, PRE_PSI: True, SOL: False}
+
+
+def test_a_metric_that_is_none_fails_its_bound() -> None:
+    no_contradiction = [
+        _vote(v['entry_id'], v['target_id'], 'SAME') if v['verdict'] == 'CORRECTS' else v
+        for v in VERDICTS
+    ]
+    bounds = [_bound('quality.contradiction_recall', '>=', '0')]
+    matrix = _build(verdicts=no_contradiction, bounds=bounds)
+
+    for row in _scored_rows(matrix):
+        assert row['quality']['contradiction_recall'] is None
+        [check] = row['bounds']['checks']
+        assert check['ok'] is False
+        assert row['bounds']['met'] is False
+
+
+def test_winner_is_the_qualifying_arm_with_fewest_contested_decision_errors() -> None:
+    bounds = [
+        _bound('quality.misfile_rate_of_attaches', '<=', '0.3'),
+        _bound('selection.cost_per_write_usd', '<=', CHEAP),
+    ]
+    matrix = _build(bounds=bounds)
+
+    errors = {row['arm']: row['quality']['contested_decision_errors'] for row in _scored_rows(matrix)}
+    assert errors == {REFERENCE: 2, PRE_PSI: 1, SOL: 0}
+    assert matrix['winner'] == PRE_PSI
+    rule = matrix['selection_rule']
+    assert set(rule) == {'bounds', 'rule', 'fallback_applied'}
+    assert rule['bounds'] == [
+        {'path': b.path, 'op': b.op, 'value': b.value} for b in bounds
+    ]
+    assert isinstance(rule['rule'], str) and rule['rule']
+    assert rule['fallback_applied'] is False
+
+
+def _ranked(arm: str, errors: int, cost: float | None, met: bool = True) -> dict[str, Any]:
+    return {
+        'arm': arm, 'status': 'scored', 'bounds': {'met': met, 'checks': []},
+        'quality': {'contested_decision_errors': errors},
+        'selection': {'cost_per_write_usd': cost},
+    }
+
+
+def test_winner_ties_break_to_lower_cost_then_arm_name() -> None:
+    select = _mod().select_winner
+    skipped = {'arm': 'aaa', 'status': 'skipped', 'provider': 'anthropic', 'reason': 'no route'}
+
+    assert select([_ranked('a', 3, 0.002), _ranked('b', 3, 0.001)]) == ('b', False)
+    assert select([_ranked('a', 3, None), _ranked('b', 3, 0.5)]) == ('b', False)
+    assert select([_ranked('z', 3, 0.001), _ranked('a', 3, 0.001)]) == ('a', False)
+    assert select([skipped, _ranked('z', 3, 0.001)]) == ('z', False)
+    with pytest.raises(ValueError):
+        select([skipped])
+
+
+def test_no_qualifying_arm_falls_back_to_fewest_errors() -> None:
+    matrix = _build(bounds=[_bound('population.n_judge_band', '>=', '5')])
+
+    assert not any(row['bounds']['met'] for row in _scored_rows(matrix))
+    assert matrix['winner'] == SOL
+    assert matrix['selection_rule']['fallback_applied'] is True
+
+
+def test_empty_bounds_are_refused() -> None:
+    with pytest.raises(ValueError, match='--require'):
+        _build(bounds=[])
+
+
+def test_skipped_arms_are_recorded_with_reasons() -> None:
+    skipped_arms = _mod().SKIPPED_ARMS
+    assert skipped_arms
+    matrix = _build()
+
+    assert matrix['arms'][len(THREE_ARMS):] == [
+        {'arm': s.arm, 'status': 'skipped', 'provider': s.provider, 'reason': s.reason}
+        for s in skipped_arms
+    ]
+    assert all(s.reason.strip() for s in skipped_arms)
+
+    taken = skipped_arms[0].arm
+    arms = [*THREE_ARMS[:2], dict(THREE_ARMS[2], arm=taken)]
+    cases = _three_arm_cases()
+    cases[taken] = [dict(row, arm=taken) for row in cases.pop(SOL)]
+    with pytest.raises(ValueError, match='skipped'):
+        _build(arms=arms, cases_by_arm=cases)
