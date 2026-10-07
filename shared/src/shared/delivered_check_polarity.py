@@ -305,10 +305,11 @@ class CheckFinding:
     ranking of confidence — they are three different contracts:
 
     ``'reject'``
-        A measured defect. The check is green at the authoring tree, so
-        landing its producer cannot change its verdict and it gates
-        nothing. ``commit_planning`` refuses the batch; the stamper
-        refuses to copy the check.
+        A measured defect. Either the check is green at the authoring tree,
+        so landing its producer cannot change its verdict and it gates
+        nothing, or its scope is stale, so it can never go green.
+        ``commit_planning`` refuses the batch; the stamper refuses to copy
+        the check.
     ``'warn'``
         Reported, never blocking. Reserved for classes that are genuinely
         undecidable at authoring time (an over-broad ``expect='absent'``
