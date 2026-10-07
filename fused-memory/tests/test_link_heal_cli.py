@@ -1,10 +1,10 @@
-"""The link-heal CLI (task 6181, plans/write-triage-link-healing-prd.md H1).
+"""The link-heal CLI (tasks 6181, 6184; plans/write-triage-link-healing-prd.md H1, H2).
 
 ``scripts/link_heal.py`` is driven through ``await run(argv, env)``. The env
 swaps in the in-process server from ``_link_heal_harness`` as the transport,
-its ``FakeMem0`` as the census, and tmp directories for the ledger and the
-escalation queue. Config is read from a tmp YAML by the script's own loader,
-at every run.
+its ``FakeMem0`` as the census, a ``FakeAdjudicator`` as the link adjudicator,
+and tmp directories for the ledger and the escalation queue. Config is read
+from a tmp YAML by the script's own loader, at every run.
 """
 
 from __future__ import annotations
@@ -25,21 +25,26 @@ from _fm_helpers import load_script_module
 from _link_heal_harness import (
     ALL_LINK_HEAL_PREFIXES,
     DF,
+    REIFY,
     WITHOUT_LINK_HEAL_PREFIX,
+    Answer,
     FailingCensus,
+    FakeAdjudicator,
     LinkHealHarness,
     assert_store_invariants,
     build_harness,
 )
 
-from fused_memory.maintenance.link_heal import RunCounts
-from fused_memory.maintenance.link_heal_executor import RunReport
+from fused_memory.maintenance.link_adjudicator import AdjudicationFailure
+from fused_memory.maintenance.link_heal import RunCounts, Verdict
+from fused_memory.maintenance.link_heal_executor import SHARE_STOP, RunReport
 from fused_memory.maintenance.link_heal_ledger import (
     LEDGER_FILENAME,
     LOCK_FILENAME,
     LinkHealLedger,
     RunLock,
     RunRow,
+    RunSource,
 )
 from fused_memory.maintenance.link_heal_store import (
     READ_TOOL,
@@ -108,6 +113,20 @@ class Workspace:
         finally:
             ledger.close()
 
+    def pending(self, source: RunSource) -> int:
+        ledger = LinkHealLedger(self.ledger_path)
+        try:
+            return len(ledger.pending_actions(source))
+        finally:
+            ledger.close()
+
+    def adjudication_count(self, run_id: str) -> int:
+        ledger = LinkHealLedger(self.ledger_path)
+        try:
+            return len(ledger.adjudication_verdicts({run_id}))
+        finally:
+            ledger.close()
+
 
 @pytest.fixture
 def workspace(tmp_path) -> Workspace:
@@ -136,6 +155,10 @@ async def unadmitted(mock_config, tmp_path):
         yield built
 
 
+def _never_asked(text: str) -> Answer:
+    raise AssertionError(f'the adjudicator was asked about {text!r}')
+
+
 def env_for(
     harness: LinkHealHarness,
     workspace: Workspace,
@@ -143,9 +166,14 @@ def env_for(
     tool_caller: ToolCaller | None = None,
     server_urls: list[str] | None = None,
     census: LinkCensus | None = None,
+    adjudicator: FakeAdjudicator | None = None,
 ) -> Any:
-    """The CLI env over *harness*, with the ledger and the home project under *workspace*."""
+    """The CLI env over *harness*, with the ledger and the home project under *workspace*.
+
+    The adjudicator defaults to one that fails any test that asks it anything.
+    """
     caller = tool_caller or harness.tool_caller()
+    adjudicate = adjudicator or FakeAdjudicator(_never_asked)
 
     def tool_caller_for(server_url: str):
         if server_urls is not None:
@@ -157,6 +185,7 @@ def env_for(
         census_for=lambda _config: contextlib.nullcontext(census or harness.mem0),
         ledger_dir_for=lambda _config: workspace.ledger_dir,
         home_root_for=lambda _config: str(workspace.home_root),
+        adjudicator_for=lambda _config: adjudicate,
     )
 
 
@@ -504,6 +533,177 @@ class TestExitCodes:
         (RunCounts(failed=1), 1),
         (RunCounts(read_failed=1), 1),
         (RunCounts(failed=3, not_attempted=4, stopped_by='write_failure_streak'), 1),
+        (RunCounts(adjudication_failed=1), 1),
     ])
     def test_exit_code_maps_the_report(self, counts, expected):
         assert cli.exit_code(RunReport(run_id='0' * 32, counts=counts)) == expected
+
+
+def seed_unrated_sightings(
+    harness: LinkHealHarness, count: int, *, project: str = DF, first: int = 100,
+) -> None:
+    """*count* sightings no corpus rates, child texts ``cli sighting <n>`` from *first*."""
+    for index in range(first, first + count):
+        child, parent = _sighting_ids(index)
+        harness.seed_link(
+            kind=SIGHTING_KIND, child=child, parent=parent, project=project,
+            child_text=f'cli sighting {index}', parent_text=f'cli parent {index}',
+        )
+
+
+def always(answer: Answer) -> FakeAdjudicator:
+    return FakeAdjudicator(lambda _text: answer)
+
+
+async def plan_adjudicated(env: Any, workspace: Workspace, capsys, *argv: str) -> tuple[int, dict[str, Any]]:
+    code = await run_cli(env, workspace, 'plan', '--from-adjudicator', *argv)
+    return code, printed_report(capsys)
+
+
+class TestPlanFromAdjudicator:
+    @pytest.mark.asyncio
+    async def test_plan_ledgers_an_adjudicator_run_its_verdicts_and_its_document(
+        self, harness, workspace, capsys,
+    ):
+        seed_unrated_sightings(harness, 2)
+        fake = always(Verdict.EXTENDS)
+
+        code, report = await plan_adjudicated(
+            env_for(harness, workspace, adjudicator=fake), workspace, capsys, '--project', DF,
+        )
+
+        assert code == 0
+        assert report['counts']['planned_by_action'] == {'relabel': 2}
+        assert report['counts']['adjudication_failed'] == 0
+        assert report['outcome'] == 'complete'
+        (run,) = workspace.runs()
+        assert (run.run_id, run.source, run.writes) == (report['run_id'], RunSource.ADJUDICATOR, False)
+        assert workspace.adjudication_count(run.run_id) == 2
+        document = json.loads(Path(report['plan_path']).read_text())
+        assert {action['basis_source'] for action in document['actions']} == {'adjudicator'}
+        assert hashlib.sha256(Path(report['plan_path']).read_bytes()).hexdigest() == report['plan_sha256']
+        assert harness.mem0.write_count == 0
+
+    @pytest.mark.parametrize(
+        'source_args',
+        [
+            pytest.param(['--from-corpus', 'corpus.jsonl', '--from-adjudicator'], id='both'),
+            pytest.param([], id='neither'),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_exactly_one_plan_source_is_required(self, harness, workspace, source_args):
+        with pytest.raises(SystemExit) as exited:
+            await run_cli(env_for(harness, workspace), workspace, 'plan', *source_args)
+
+        assert exited.value.code == 2
+        assert workspace.runs() == []
+
+    @pytest.mark.asyncio
+    async def test_project_is_repeatable(self, harness, workspace, capsys):
+        seed_unrated_sightings(harness, 1, project=DF, first=100)
+        seed_unrated_sightings(harness, 1, project=REIFY, first=200)
+        fake = always(Verdict.EXTENDS)
+
+        code, _report = await plan_adjudicated(
+            env_for(harness, workspace, adjudicator=fake), workspace, capsys,
+            '--project', DF, '--project', REIFY,
+        )
+
+        assert code == 0
+        assert sorted(pair.child_text for pair in fake.pairs) == ['cli sighting 100', 'cli sighting 200']
+
+    @pytest.mark.asyncio
+    async def test_project_defaults_to_the_home_project(self, harness, workspace, capsys):
+        home = resolve_project_id(str(workspace.home_root))
+        seed_unrated_sightings(harness, 1, project=home, first=300)
+        seed_unrated_sightings(harness, 1, project=DF, first=100)
+        fake = always(Verdict.EXTENDS)
+
+        code, _report = await plan_adjudicated(
+            env_for(harness, workspace, adjudicator=fake), workspace, capsys,
+        )
+
+        assert code == 0
+        assert [pair.key.split(':')[0] for pair in fake.pairs] == [home]
+
+    @pytest.mark.asyncio
+    async def test_status_lists_the_adjudicator_run_as_non_writing(self, harness, workspace, capsys):
+        seed_unrated_sightings(harness, 1)
+        env = env_for(harness, workspace, adjudicator=always(Verdict.EXTENDS))
+        _code, report = await plan_adjudicated(env, workspace, capsys, '--project', DF)
+
+        assert await run_cli(env, workspace, 'status') == 0
+
+        lines = capsys.readouterr().out.splitlines()
+        (run_line,) = [line for line in lines if report['run_id'][:8] in line]
+        assert 'adjudicator  writes no' in run_line
+
+    @pytest.mark.asyncio
+    async def test_a_partly_failed_adjudication_exits_1(self, harness, workspace, capsys):
+        seed_unrated_sightings(harness, 2)
+        fake = FakeAdjudicator(
+            lambda text: AdjudicationFailure.PARSE_FAILURE if text.endswith('100') else Verdict.EXTENDS,
+        )
+
+        code, report = await plan_adjudicated(
+            env_for(harness, workspace, adjudicator=fake), workspace, capsys, '--project', DF,
+        )
+
+        assert code == 1
+        assert report['counts']['adjudication_failed'] == 1
+        assert report['outcome'] == 'partial'
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_server_is_refused_before_any_adjudication(
+        self, harness, workspace, capsys,
+    ):
+        seed_unrated_sightings(harness, 1)
+        fake = always(Verdict.EXTENDS)
+        env = env_for(harness, workspace, tool_caller=refusing_tool_caller(), adjudicator=fake)
+
+        code = await run_cli(env, workspace, 'plan', '--from-adjudicator', '--project', DF)
+
+        assert code == 2
+        assert DEFAULT_SERVER_URL in capsys.readouterr().err
+        assert fake.calls == []
+        assert workspace.runs() == []
+
+
+class TestApplyFromAdjudicator:
+    @pytest.mark.asyncio
+    async def test_each_apply_drains_only_its_own_sources_heals(self, harness, workspace, capsys):
+        env = env_for(harness, workspace, adjudicator=always(Verdict.EXTENDS))
+        await plan_from(env, workspace, seed_corpus(harness, workspace, 1), capsys)
+        seed_unrated_sightings(harness, 1)
+        await plan_adjudicated(env, workspace, capsys, '--project', DF)
+
+        code, adjudicated = await apply(env, workspace, capsys, '--from-adjudicator')
+
+        assert code == 0
+        assert adjudicated['counts']['applied'] == 1
+        assert workspace.pending(RunSource.CORPUS) == 1
+        assert workspace.pending(RunSource.ADJUDICATOR) == 0
+
+        code, corpus = await apply(env, workspace, capsys)
+
+        assert code == 0
+        assert corpus['counts']['applied'] == 1
+        assert workspace.pending(RunSource.CORPUS) == 0
+
+    @pytest.mark.asyncio
+    async def test_a_share_refused_apply_exits_1(self, harness, workspace, capsys):
+        seed_unrated_sightings(harness, 20)
+        misfiled = {f'cli sighting {index}' for index in range(100, 106)}
+        fake = FakeAdjudicator(
+            lambda text: Verdict.RELATED if text in misfiled else Verdict.EXTENDS,
+        )
+        env = env_for(harness, workspace, adjudicator=fake)
+        await plan_adjudicated(env, workspace, capsys, '--project', DF)
+
+        code, applied = await apply(env, workspace, capsys, '--from-adjudicator')
+
+        assert code == 1
+        assert applied['counts']['stopped_by'] == SHARE_STOP
+        assert applied['counts']['applied'] == 0
+        assert harness.mem0.write_count == 0
