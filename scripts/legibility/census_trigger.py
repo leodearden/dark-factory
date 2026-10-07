@@ -136,6 +136,7 @@ import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import overload
 
@@ -328,22 +329,51 @@ class Decision:
     reasons: list[str]
 
 
+class FloorAnchorKind(Enum):
+    SESSION_WATERMARK = "session watermark"
+    LAST_CENSUS_AT = "last_census_at (no watermark yet)"
+    EARLIEST_CODEBOOK_DATE = "earliest codebook date (never censused)"
+
+
+@dataclass(frozen=True)
+class FloorAnchor:
+    """The instant the census floor is measured from, and where it came from."""
+
+    kind: FloorAnchorKind
+    at: datetime
+
+
+def _floor_condition(
+    now_utc: datetime, anchor: FloorAnchor | None, config: CensusConfig
+) -> tuple[bool, str]:
+    if anchor is None:
+        return True, (
+            "floor: no anchor (no session watermark, last_census_at or codebook date)"
+            " -> BLOCKS all conditions"
+        )
+    days = (now_utc - _as_utc(anchor.at)).total_seconds() / 86400.0
+    blocks = days < config.floor_days
+    line = f"floor: {days:.1f}d since {anchor.kind.value} (floor {config.floor_days}d)"
+    return blocks, line + (" -> BLOCKS all conditions" if blocks else "")
+
+
 def evaluate(
     *,
     now: datetime,
     last_census_at: datetime | None,
-    never_censused: bool,
+    floor_anchor: FloorAnchor | None,
     tasks_landed: int | None,
     candidate_first_seens: list[datetime],
     config: CensusConfig,
 ) -> Decision:
-    """Pure decision core for the §6/§8.5 fire logic. Fires at the earliest
+    """Pure decision core for the census fire logic. Fires at the earliest
     of condition (a) max_interval_days, (b) tasks_landed_min_days +
-    tasks_landed_threshold, (c) novelty_spike — all three, and the
-    floor_days hard floor that overrides them, are implemented in the body
-    below (`cond_a`, `cond_b`, `cond_c`, `floor_blocks`). No I/O:
-    all inputs are plain values so the full §8.5 matrix is testable without
-    a filesystem or a live get_statuses call.
+    tasks_landed_threshold, (c) novelty_spike, subject to a floor measured
+    from `floor_anchor` (plans/census-incremental-prd.md §4.7 Floor): inside
+    floor_days of the anchor nothing fires. The floor never fires by itself,
+    and its reason line always names its anchor. No I/O: all inputs are
+    plain values so the full matrix is testable without a filesystem or a
+    live get_statuses call.
     """
     now_utc = _as_utc(now)
     last_utc = _as_utc(last_census_at)
@@ -396,19 +426,10 @@ def evaluate(
         )
     )
 
-    triggered = cond_a or cond_b or cond_c
+    floor_blocks, floor_line = _floor_condition(now_utc, floor_anchor, config)
+    reasons.append(floor_line)
 
-    floor_blocks = (
-        not never_censused and days_since is not None and days_since < config.floor_days
-    )
-    if floor_blocks:
-        reasons.append(
-            f"floor: only {days_since:.1f}d since last census (floor {config.floor_days}d) -> BLOCKS all conditions"
-        )
-    elif never_censused:
-        reasons.append("floor: never censused -> exempt")
-
-    fire = triggered and not floor_blocks
+    fire = (cond_a or cond_b or cond_c) and not floor_blocks
 
     return Decision(fire=fire, reasons=reasons)
 
@@ -505,7 +526,7 @@ def codebook_signal(codebook: dict) -> tuple[datetime | None, list[datetime]]:
     """Extract the census-trigger signal from a `codebook.load()`-shaped
     dict (task γ / 2575's schema): the earliest structured sighting or
     candidate `first_seen`/sighting date across the WHOLE codebook (used to
-    anchor condition (a) when `never_censused`), and every candidate's
+    anchor condition (a) and the floor when never censused), and every candidate's
     `first_seen` date on its own (used for condition (c)'s novelty-spike
     window count). Unparseable dates are skipped rather than raising.
 
@@ -1359,6 +1380,19 @@ def default_status_fetcher(project_root: str | Path):
 # decide_for_project — high-level assembly (config + state + codebook signal)
 # ---------------------------------------------------------------------------
 
+def _floor_anchor(
+    state: dict | None, *, never_censused: bool, earliest_codebook_date: datetime | None
+) -> FloorAnchor | None:
+    if never_censused:
+        if earliest_codebook_date is None:
+            return None
+        return FloorAnchor(FloorAnchorKind.EARLIEST_CODEBOOK_DATE, earliest_codebook_date)
+    last_census_at = _parse_date((state or {}).get("last_census_at"))
+    if last_census_at is None:
+        return None
+    return FloorAnchor(FloorAnchorKind.LAST_CENSUS_AT, last_census_at)
+
+
 def decide_for_project(
     project_root: str | Path,
     *,
@@ -1419,13 +1453,12 @@ def decide_for_project(
         logger.warning("codebook at %s is unreadable: %s", codebook_path, exc)
         earliest_sighting, candidate_first_seens = None, []
 
-    if never_censused:
-        last_census_at = earliest_sighting
-    else:
-        raw_last_census_at = (state or {}).get("last_census_at")
-        last_census_at = (
-            datetime.fromisoformat(raw_last_census_at) if raw_last_census_at else None
-        )
+    last_census_at = (
+        earliest_sighting if never_censused else _parse_date((state or {}).get("last_census_at"))
+    )
+    floor_anchor = _floor_anchor(
+        state, never_censused=never_censused, earliest_codebook_date=earliest_sighting
+    )
 
     try:
         tasks_landed = compute_tasks_landed(state=state, status_fetcher=status_fetcher)
@@ -1452,7 +1485,7 @@ def decide_for_project(
     return evaluate(
         now=now,
         last_census_at=last_census_at,
-        never_censused=never_censused,
+        floor_anchor=floor_anchor,
         tasks_landed=tasks_landed,
         candidate_first_seens=candidate_first_seens,
         config=config,
