@@ -42,6 +42,8 @@ census:
   novelty_spike:
     count: 4
     window_hours: 72
+    multiple: 2
+    baseline_days: 30
   floor_days: 5
   saturation:
     dup_rate: 0.9

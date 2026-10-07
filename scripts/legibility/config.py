@@ -46,12 +46,17 @@ class Sampling(BaseModel):
 
 
 class NoveltySpike(BaseModel):
-    """``census.novelty_spike`` — the (c) census-trigger condition (PRD §5.2 point 6)."""
+    """``census.novelty_spike`` — the relative novelty-spike trigger condition
+    (plans/census-incremental-prd.md §4.7 (b)): ``count`` is the absolute
+    minimum, and ``multiple`` x the median of the daily window counts over
+    the trailing ``baseline_days`` is the relative bar."""
 
     model_config = ConfigDict(extra='allow')
 
-    count: int = 4
-    window_hours: int = 72
+    count: int = Field(default=4, ge=0, strict=True)
+    window_hours: int = Field(default=72, ge=0, strict=True)
+    multiple: int = Field(default=2, ge=0, strict=True)
+    baseline_days: int = Field(default=30, ge=0, strict=True)
 
 
 class Saturation(BaseModel):

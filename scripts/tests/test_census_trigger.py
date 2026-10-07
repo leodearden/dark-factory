@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -22,6 +22,10 @@ from legibility import census_trigger as ct
 from legibility.config import Census as LegibilityCensus
 
 NOW = datetime(2026, 7, 14, 12, 0, 0, tzinfo=UTC)
+
+
+def _anchor(kind, days_ago):
+    return ct.FloorAnchor(kind=kind, at=NOW - timedelta(days=days_ago))
 
 
 # ---------------------------------------------------------------------------
@@ -35,15 +39,19 @@ def test_census_config_defaults_match_prd_section_7_4():
     assert config.tasks_landed_min_days == 7
     assert config.novelty_spike_count == 4
     assert config.novelty_spike_window_hours == 72
+    assert config.novelty_spike_multiple == 2
+    assert config.novelty_spike_baseline_days == 30
     assert config.floor_days == 5
 
 
 def test_census_config_from_mapping_merges_partial_overrides_over_defaults():
     config = ct.CensusConfig.from_mapping(
-        {"max_interval_days": 3, "novelty_spike": {"count": 9}}
+        {"max_interval_days": 3, "novelty_spike": {"count": 9, "baseline_days": 14}}
     )
     assert config.max_interval_days == 3
     assert config.novelty_spike_count == 9
+    assert config.novelty_spike_baseline_days == 14
+    assert config.novelty_spike_multiple == 2
     # untouched fields keep their §7.4 defaults
     assert config.tasks_landed_threshold == 120
     assert config.tasks_landed_min_days == 7
@@ -83,6 +91,8 @@ def test_census_config_from_mapping_empty_dict_returns_defaults():
         ("floor_days", "floor_days", None),
         ("novelty_spike_count", "count", "novelty_spike"),
         ("novelty_spike_window_hours", "window_hours", "novelty_spike"),
+        ("novelty_spike_multiple", "multiple", "novelty_spike"),
+        ("novelty_spike_baseline_days", "baseline_days", "novelty_spike"),
     ],
 )
 @pytest.mark.parametrize("bad", ["10", "", 10.0, 1.5, True, False, -1, None, [10], {"n": 10}])
@@ -137,7 +147,7 @@ def test_census_config_from_mapping_reports_every_bad_value_in_one_warning(caplo
                 "max_interval_days": "10",
                 "floor_days": -1,
                 "tasks_landed_threshold": 200,  # the one good override
-                "novelty_spike": {"window_hours": None},
+                "novelty_spike": {"window_hours": None, "multiple": "2"},
             }
         )
 
@@ -145,11 +155,12 @@ def test_census_config_from_mapping_reports_every_bad_value_in_one_warning(caplo
     assert config.max_interval_days == ct.CensusConfig().max_interval_days
     assert config.floor_days == ct.CensusConfig().floor_days
     assert config.novelty_spike_window_hours == ct.CensusConfig().novelty_spike_window_hours
+    assert config.novelty_spike_multiple == ct.CensusConfig().novelty_spike_multiple
 
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     message = warnings[0].getMessage()
-    for named in ("max_interval_days", "floor_days", "window_hours"):
+    for named in ("max_interval_days", "floor_days", "window_hours", "multiple"):
         assert named in message
     assert "tasks_landed_threshold" not in message
 
@@ -163,7 +174,9 @@ def test_census_config_from_mapping_accepts_every_valid_int_silently(caplog):
                 "max_interval_days": 0,
                 "floor_days": 0,
                 "tasks_landed_threshold": 10_000,
-                "novelty_spike": {"count": 0, "window_hours": 1},
+                "novelty_spike": {
+                    "count": 0, "window_hours": 1, "multiple": 0, "baseline_days": 0,
+                },
             }
         )
 
@@ -174,6 +187,8 @@ def test_census_config_from_mapping_accepts_every_valid_int_silently(caplog):
     assert config.tasks_landed_threshold == 10_000
     assert config.novelty_spike_count == 0
     assert config.novelty_spike_window_hours == 1
+    assert config.novelty_spike_multiple == 0
+    assert config.novelty_spike_baseline_days == 0
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +208,8 @@ def test_census_config_defaults_match_legibility_config_census_model():
     assert config.tasks_landed_min_days == beta_defaults.tasks_landed_min_days
     assert config.novelty_spike_count == beta_defaults.novelty_spike.count
     assert config.novelty_spike_window_hours == beta_defaults.novelty_spike.window_hours
+    assert config.novelty_spike_multiple == beta_defaults.novelty_spike.multiple
+    assert config.novelty_spike_baseline_days == beta_defaults.novelty_spike.baseline_days
     assert config.floor_days == beta_defaults.floor_days
 
 
@@ -206,7 +223,7 @@ def _evaluate_a(*, last_census_at, tasks_landed=None, candidate_first_seens=None
     return ct.evaluate(
         now=NOW,
         last_census_at=last_census_at,
-        never_censused=False,
+        floor_anchor=ct.FloorAnchor(ct.FloorAnchorKind.SESSION_WATERMARK, last_census_at),
         tasks_landed=tasks_landed,
         candidate_first_seens=candidate_first_seens or [],
         config=config or ct.CensusConfig(),
@@ -256,91 +273,255 @@ def test_evaluate_condition_b_delta_unavailable_no_fire():
 
 
 # ---------------------------------------------------------------------------
-# step-7: RED — evaluate() condition (c): novelty spike
+# relative novelty spike against a trailing baseline
+# (plans/census-incremental-prd.md §4.7 (b), §4.8 row 13)
 # ---------------------------------------------------------------------------
 
-def _evaluate_c(*, candidate_first_seens):
-    """last_census_at=now-6d: > floor(5), < max_interval(10), < min_days(7)
-    -- so only condition (c) can possibly fire. first_seen values are
-    passed as YYYY-MM-DD date strings, exactly as the codebook writes them
-    (§7.1 candidates[].first_seen), parsed to datetimes here (evaluate()
-    itself takes already-parsed datetimes)."""
+_TODAY = datetime.combine(NOW.date(), datetime.min.time(), tzinfo=UTC)
+
+
+def _first_seens_over_a_baseline_of_40(current_72h):
+    """35 days of history whose every 72h window holds exactly 40 candidates
+    (period-3 daily counts 13, 13, 14), then today topped up so the window
+    ending at NOW holds `current_72h`."""
+    daily = {days_ago: (13, 13, 14)[days_ago % 3] for days_ago in range(1, 36)}
+    daily[0] = daily[3] + (current_72h - 40)
+    return [_TODAY - timedelta(days=days_ago) for days_ago, n in daily.items() for _ in range(n)]
+
+
+def _quiet_history():
+    return [NOW - timedelta(days=40)]
+
+
+def _evaluate_novelty(first_seens, config=None, now=NOW):
+    return ct.evaluate(
+        now=now,
+        last_census_at=now - timedelta(days=6),
+        floor_anchor=ct.FloorAnchor(ct.FloorAnchorKind.SESSION_WATERMARK, now - timedelta(days=6)),
+        tasks_landed=None,
+        candidate_first_seens=first_seens,
+        config=config or ct.CensusConfig(),
+    )
+
+
+def _novelty_line(decision):
+    (line,) = [r for r in decision.reasons if r.startswith("novelty-spike:")]
+    return line
+
+
+def test_novelty_spike_43_against_baseline_median_40_does_not_fire():
+    decision = _evaluate_novelty(_first_seens_over_a_baseline_of_40(43))
+    assert decision.fire is False
+    assert _novelty_line(decision) == "novelty-spike: 43 within 72h (baseline median 40, x2)"
+
+
+def test_novelty_spike_90_against_baseline_median_40_fires():
+    decision = _evaluate_novelty(_first_seens_over_a_baseline_of_40(90))
+    assert decision.fire is True
+    assert (
+        _novelty_line(decision) == "novelty-spike: 90 within 72h (baseline median 40, x2) -> FIRE"
+    )
+
+
+def test_novelty_spike_needs_the_absolute_minimum_too():
+    three = _evaluate_novelty(_quiet_history() + [_TODAY] * 3)
+    assert three.fire is False
+    assert _novelty_line(three) == "novelty-spike: 3 within 72h (baseline median 0, x2)"
+
+    four = _evaluate_novelty(_quiet_history() + [_TODAY] * 4)
+    assert four.fire is True
+    assert _novelty_line(four).endswith("-> FIRE")
+
+
+def test_novelty_spike_is_na_with_less_than_baseline_days_of_history():
+    ten_days = [_TODAY - timedelta(days=i % 11) for i in range(90)]
+    decision = _evaluate_novelty(ten_days)
+    assert decision.fire is False
+    line = _novelty_line(decision)
+    assert "N/A" in line
+    assert "30d" in line
+    assert "10.5d" in line
+
+
+def test_novelty_spike_window_counts_72h_inclusive():
+    # 2026-07-11 is 84h before NOW (excluded); NOW - 72h exactly is included.
+    dated = [
+        datetime.fromisoformat(d) for d in ("2026-07-14", "2026-07-13", "2026-07-12", "2026-07-11")
+    ]
+    decision = _evaluate_novelty(_quiet_history() + dated + [NOW - timedelta(hours=72)])
+    assert _novelty_line(decision).startswith("novelty-spike: 4 within 72h")
+
+
+def test_novelty_spike_baseline_days_zero_degenerates_to_the_absolute_rule():
+    decision = _evaluate_novelty(
+        [_TODAY] * 4, config=ct.CensusConfig(novelty_spike_baseline_days=0)
+    )
+    assert decision.fire is True
+    assert "baseline median 0" in _novelty_line(decision)
+
+
+def test_novelty_spike_multiple_is_honoured():
+    decision = _evaluate_novelty(
+        _first_seens_over_a_baseline_of_40(90), config=ct.CensusConfig(novelty_spike_multiple=3)
+    )
+    assert decision.fire is False
+    assert _novelty_line(decision).endswith("(baseline median 40, x3)")
+
+
+# Histogram of candidates[].first_seen in docs/legibility/confusion-codebook.yaml
+# at 92af0716e8 (1,132 candidates).
+_RECORDED_DAILY_NEW_CANDIDATES = {
+    "2026-07-13": 4, "2026-07-14": 4, "2026-07-15": 5, "2026-07-16": 2, "2026-07-17": 2,
+    "2026-07-18": 1, "2026-07-19": 6, "2026-07-20": 11, "2026-07-21": 6, "2026-07-22": 35,
+    "2026-07-23": 5, "2026-07-24": 2, "2026-07-25": 3, "2026-07-26": 1, "2026-07-28": 3,
+    "2026-07-29": 7, "2026-07-30": 32, "2026-07-31": 24, "2026-08-01": 8, "2026-08-02": 23,
+    "2026-08-03": 20, "2026-08-04": 9, "2026-08-05": 17, "2026-08-06": 15, "2026-08-07": 16,
+    "2026-08-08": 15, "2026-08-09": 16, "2026-08-10": 17, "2026-08-11": 7, "2026-08-12": 20,
+    "2026-08-13": 2, "2026-08-15": 18, "2026-08-16": 18, "2026-08-17": 1, "2026-08-18": 24,
+    "2026-08-19": 22, "2026-08-21": 11, "2026-08-22": 23, "2026-08-23": 20, "2026-08-24": 28,
+    "2026-08-25": 28, "2026-08-26": 14, "2026-08-27": 23, "2026-08-28": 24, "2026-08-29": 16,
+    "2026-08-31": 16, "2026-09-01": 8, "2026-09-02": 7, "2026-09-03": 20, "2026-09-04": 15,
+    "2026-09-05": 12, "2026-09-06": 13, "2026-09-07": 21, "2026-09-08": 31, "2026-09-09": 21,
+    "2026-09-10": 20, "2026-09-11": 63, "2026-09-12": 25, "2026-09-13": 18, "2026-09-14": 1,
+    "2026-09-15": 21, "2026-09-16": 18, "2026-09-17": 22, "2026-09-18": 20, "2026-09-19": 3,
+    "2026-09-20": 16, "2026-09-21": 25, "2026-09-22": 12, "2026-09-23": 15, "2026-09-24": 6,
+    "2026-09-25": 21, "2026-09-26": 11, "2026-09-27": 18, "2026-09-28": 1, "2026-10-02": 15,
+    "2026-10-03": 9,
+}
+
+
+def _recorded_72h_count(day):
+    return sum(
+        _RECORDED_DAILY_NEW_CANDIDATES.get((day - timedelta(days=back)).isoformat(), 0)
+        for back in range(3)
+    )
+
+
+def test_novelty_spike_replay_fires_on_the_relative_rule_not_the_absolute_one():
+    recorded = {
+        "version": 2,
+        "entries": [],
+        "candidates": _candidates_from_dates(
+            [day for day, n in _RECORDED_DAILY_NEW_CANDIDATES.items() for _ in range(n)]
+        ),
+    }
+    _, first_seens = ct.codebook_signal(recorded)
+
+    lines, fired, absolute_days = {}, {}, set()
+    day = date(2026, 8, 15)
+    while day <= date(2026, 10, 3):
+        now = datetime.combine(day, datetime.min.time(), tzinfo=UTC) + timedelta(hours=12)
+        decision = _evaluate_novelty(first_seens, now=now)
+        lines[day] = _novelty_line(decision)
+        if decision.fire:
+            fired[day] = lines[day]
+        if _recorded_72h_count(day) >= 4:
+            absolute_days.add(day)
+        day += timedelta(days=1)
+
+    assert fired == {
+        date(2026, 9, 11): "novelty-spike: 104 within 72h (baseline median 43.5, x2) -> FIRE",
+        date(2026, 9, 12): "novelty-spike: 108 within 72h (baseline median 44.5, x2) -> FIRE",
+        date(2026, 9, 13): "novelty-spike: 106 within 72h (baseline median 46, x2) -> FIRE",
+    }
+    assert lines[date(2026, 8, 25)] == "novelty-spike: 76 within 72h (baseline median 43.5, x2)"
+    assert len(absolute_days) == 48
+    assert set(fired) < absolute_days
+
+
+# ---------------------------------------------------------------------------
+# hard floor: measured from its anchor, blocks a/b/c, always reported
+# (plans/census-incremental-prd.md §4.7 Floor)
+# ---------------------------------------------------------------------------
+
+def _evaluate_floor(*, last_census_days_ago, floor_anchor, tasks_landed=None, config=None):
     return ct.evaluate(
         now=NOW,
-        last_census_at=NOW - timedelta(days=6),
-        never_censused=False,
-        tasks_landed=None,
-        candidate_first_seens=[datetime.fromisoformat(s) for s in candidate_first_seens],
-        config=ct.CensusConfig(),
+        last_census_at=NOW - timedelta(days=last_census_days_ago),
+        floor_anchor=floor_anchor,
+        tasks_landed=tasks_landed,
+        candidate_first_seens=[],
+        config=config or ct.CensusConfig(),
     )
 
 
-def test_evaluate_condition_c_four_within_72h_fires():
-    # 2026-07-14/13/12 (twice) are 0h/0h/36h/60h before NOW -- all <= 72h.
-    decision = _evaluate_c(
-        candidate_first_seens=["2026-07-14", "2026-07-14", "2026-07-13", "2026-07-12"]
-    )
-    assert decision.fire is True
-    assert any("novelty-spike" in r and "4" in r for r in decision.reasons)
+def _floor_lines(decision):
+    return [r for r in decision.reasons if r.startswith("floor:")]
 
 
-def test_evaluate_condition_c_only_three_within_72h_no_fire():
-    decision = _evaluate_c(candidate_first_seens=["2026-07-14", "2026-07-13", "2026-07-12"])
-    assert decision.fire is False
-
-
-def test_evaluate_condition_c_four_but_one_outside_window_counts_as_three_no_fire():
-    # 2026-07-11 is 84h before NOW -- outside the 72h window, so only 3
-    # of these 4 candidates count.
-    decision = _evaluate_c(
-        candidate_first_seens=["2026-07-14", "2026-07-13", "2026-07-12", "2026-07-11"]
+def test_evaluate_floor_blocks_inside_floor_days_of_its_anchor():
+    decision = _evaluate_floor(
+        last_census_days_ago=12,
+        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 3),
     )
     assert decision.fire is False
+    assert _floor_lines(decision) == [
+        "floor: 3.0d since session watermark (floor 5d) -> BLOCKS all conditions"
+    ]
 
 
-# ---------------------------------------------------------------------------
-# step-9: RED — hard floor (blocks a/b/c) + never-censused exemption
-# ---------------------------------------------------------------------------
-
-_SPIKE_4_IN_72H = ["2026-07-14", "2026-07-14", "2026-07-13", "2026-07-12"]
-
-
-def test_evaluate_floor_blocks_spike_when_censused():
-    decision = ct.evaluate(
-        now=NOW,
-        last_census_at=NOW - timedelta(days=4),
-        never_censused=False,
-        tasks_landed=None,
-        candidate_first_seens=[datetime.fromisoformat(s) for s in _SPIKE_4_IN_72H],
-        config=ct.CensusConfig(),
-    )
-    assert decision.fire is False
-    assert any("floor" in r for r in decision.reasons)
-
-
-def test_evaluate_floor_blocks_tasks_landed_and_spike_when_censused():
-    decision = ct.evaluate(
-        now=NOW,
-        last_census_at=NOW - timedelta(days=4),
-        never_censused=False,
+def test_evaluate_floor_blocks_tasks_landed_too():
+    decision = _evaluate_floor(
+        last_census_days_ago=8,
+        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 4),
         tasks_landed=999,
-        candidate_first_seens=[datetime.fromisoformat(s) for s in _SPIKE_4_IN_72H],
-        config=ct.CensusConfig(),
     )
     assert decision.fire is False
-    assert any("floor" in r for r in decision.reasons)
+    assert any("BLOCKS" in line for line in _floor_lines(decision))
 
 
-def test_evaluate_floor_exempt_when_never_censused():
-    decision = ct.evaluate(
-        now=NOW,
-        last_census_at=NOW - timedelta(days=2),
-        never_censused=True,
-        tasks_landed=None,
-        candidate_first_seens=[datetime.fromisoformat(s) for s in _SPIKE_4_IN_72H],
-        config=ct.CensusConfig(),
+def test_evaluate_floor_clear_still_names_its_anchor():
+    decision = _evaluate_floor(
+        last_census_days_ago=12,
+        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 6),
     )
     assert decision.fire is True
+    assert _floor_lines(decision) == ["floor: 6.0d since session watermark (floor 5d)"]
+
+
+@pytest.mark.parametrize(
+    "kind,label",
+    [
+        (ct.FloorAnchorKind.LAST_CENSUS_AT, "since last_census_at (no watermark yet)"),
+        (ct.FloorAnchorKind.EARLIEST_CODEBOOK_DATE, "since earliest codebook date (never censused)"),
+        (ct.FloorAnchorKind.SESSION_WATERMARK, "since session watermark"),
+    ],
+)
+def test_evaluate_floor_line_names_each_anchor_kind(kind, label):
+    decision = _evaluate_floor(last_census_days_ago=12, floor_anchor=_anchor(kind, 3))
+    floor_lines = _floor_lines(decision)
+    assert len(floor_lines) == 1
+    assert label in floor_lines[0]
+    assert "BLOCKS" in floor_lines[0]
+
+
+def test_evaluate_floor_applies_to_a_never_censused_project():
+    decision = _evaluate_floor(
+        last_census_days_ago=3,
+        floor_anchor=_anchor(ct.FloorAnchorKind.EARLIEST_CODEBOOK_DATE, 3),
+        config=ct.CensusConfig(max_interval_days=1),
+    )
+    assert decision.fire is False
+    (floor_line,) = _floor_lines(decision)
+    assert "earliest codebook date (never censused)" in floor_line
+
+
+def test_evaluate_floor_without_an_anchor_blocks_and_says_so():
+    decision = _evaluate_floor(last_census_days_ago=12, floor_anchor=None)
+    assert decision.fire is False
+    (floor_line,) = _floor_lines(decision)
+    assert floor_line.startswith("floor: no anchor")
+    assert "BLOCKS" in floor_line
+
+
+def test_evaluate_floor_never_fires_by_itself():
+    decision = _evaluate_floor(
+        last_census_days_ago=9,
+        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 100),
+    )
+    assert decision.fire is False
+    (floor_line,) = _floor_lines(decision)
+    assert "BLOCKS" not in floor_line
 
 
 # ---------------------------------------------------------------------------
@@ -1283,6 +1464,143 @@ def test_decide_for_project_row1_missing_state_fires_from_earliest_sighting(tmp_
 
     assert decision.fire is True
     assert any("max-interval" in r for r in decision.reasons)
+    assert (
+        "floor: 12.5d since earliest codebook date (never censused) (floor 5d)"
+        in decision.reasons
+    )
+
+
+def _write_legibility_yaml(project_root, text):
+    legibility_dir = project_root / "docs" / "legibility"
+    legibility_dir.mkdir(parents=True, exist_ok=True)
+    (legibility_dir / "legibility.yaml").write_text(text, encoding="utf-8")
+
+
+def test_decide_for_project_legacy_state_floor_falls_back_to_last_census_at(tmp_path):
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path,
+        last_census_at=(NOW - timedelta(days=3)).isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+    )
+    _write_legibility_yaml(tmp_path, "census:\n  max_interval_days: 1\n")
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert decision.fire is False
+    assert (
+        "floor: 3.0d since last_census_at (no watermark yet) (floor 5d) -> BLOCKS all conditions"
+        in decision.reasons
+    )
+
+
+def test_decide_for_project_never_censused_floor_blocks_from_the_earliest_codebook_date(
+    tmp_path,
+):
+    _write_codebook(
+        tmp_path,
+        entries=[
+            {
+                "id": "entry-a",
+                "title": "t",
+                "severity": "low",
+                "status": "open",
+                "origin_phase": "unknown",
+                "manifested_phase": "unknown",
+                "sightings": [_sighting((NOW - timedelta(days=3)).date().isoformat())],
+            }
+        ],
+    )
+    _write_legibility_yaml(tmp_path, "census:\n  max_interval_days: 1\n")
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert decision.fire is False
+    floor_lines = [r for r in decision.reasons if r.startswith("floor:")]
+    assert len(floor_lines) == 1
+    assert "since earliest codebook date (never censused)" in floor_lines[0]
+    assert "BLOCKS" in floor_lines[0]
+
+
+def _watermarked_state(*, last_census_days_ago, watermark_days_ago) -> dict[str, str | None]:
+    return {
+        "last_census_at": (NOW - timedelta(days=last_census_days_ago)).isoformat(),
+        "last_census_report": "plans/confusion-census-prior.md",
+        "last_census_run_id": "census-dark_factory-20260702",
+        "session_watermark": (NOW - timedelta(days=watermark_days_ago)).isoformat(),
+    }
+
+
+def test_decide_for_project_floor_reads_the_session_watermark_not_last_census_at(tmp_path):
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path, **_watermarked_state(last_census_days_ago=12, watermark_days_ago=3)
+    )
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert "max-interval: 12.0d since last census (threshold 10d) -> FIRE" in decision.reasons
+    assert decision.fire is False
+    assert (
+        "floor: 3.0d since session watermark (floor 5d) -> BLOCKS all conditions"
+        in decision.reasons
+    )
+
+
+def test_decide_for_project_floor_clears_on_an_old_watermark(tmp_path):
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path, **_watermarked_state(last_census_days_ago=12, watermark_days_ago=12)
+    )
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert decision.fire is True
+    assert any(r.startswith("max-interval:") and "-> FIRE" in r for r in decision.reasons)
+    assert "floor: 12.0d since session watermark (floor 5d)" in decision.reasons
+
+
+@pytest.mark.parametrize("watermark_present", [True, False], ids=["null", "absent"])
+def test_decide_for_project_null_or_absent_watermark_falls_back_to_last_census_at(
+    tmp_path, watermark_present
+):
+    state = _watermarked_state(last_census_days_ago=12, watermark_days_ago=12)
+    if watermark_present:
+        state["session_watermark"] = None
+    else:
+        del state["session_watermark"]
+    _write_codebook(tmp_path)
+    _write_census_state(tmp_path, **state)
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert decision.fire is True
+    assert "floor: 12.0d since last_census_at (no watermark yet) (floor 5d)" in decision.reasons
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {},
+        {"last_census_report": "plans/confusion-census-prior.md"},
+        {"last_census_at": None, "session_watermark": None},
+    ],
+    ids=["empty", "report-only", "null-timestamps"],
+)
+def test_decide_for_project_ok_state_without_timestamps_blocks_on_no_anchor(tmp_path, state):
+    _write_spike_codebook(tmp_path)
+    _write_census_state(tmp_path, **state)
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert any(
+        r.startswith("novelty-spike:") and r.endswith("-> FIRE") for r in decision.reasons
+    )
+    assert decision.fire is False
+    assert (
+        "floor: no anchor (no session watermark, last_census_at or codebook date)"
+        " -> BLOCKS all conditions" in decision.reasons
+    )
 
 
 def test_decide_for_project_row2_day9_no_spike_low_delta_no_fire(tmp_path):
@@ -1318,32 +1636,42 @@ def test_decide_for_project_row3_day7_130_landed_fires(tmp_path):
     assert any("tasks-landed" in r for r in decision.reasons)
 
 
-def test_decide_for_project_row4_day6_novelty_spike_fires(tmp_path):
-    _write_codebook(tmp_path, candidates=_candidates_from_dates(_SPIKE_4_IN_72H))
+def _write_spike_codebook(project_root):
+    _write_codebook(
+        project_root,
+        candidates=_candidates_from_dates(
+            [fs.date().isoformat() for fs in _first_seens_over_a_baseline_of_40(90)]
+        ),
+    )
+
+
+def test_decide_for_project_row4_novelty_spike_fires(tmp_path):
+    _write_spike_codebook(tmp_path)
     _write_census_state(
-        tmp_path,
-        last_census_at=(NOW - timedelta(days=6)).isoformat(),
-        last_census_report="plans/confusion-census-prior.md",
+        tmp_path, **_watermarked_state(last_census_days_ago=6, watermark_days_ago=6)
     )
 
     decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
 
     assert decision.fire is True
-    assert any("novelty-spike" in r for r in decision.reasons)
+    assert any(
+        r.startswith("novelty-spike:") and r.endswith("-> FIRE") for r in decision.reasons
+    )
 
 
-def test_decide_for_project_row5_day4_floor_blocks_spike_no_fire(tmp_path):
-    _write_codebook(tmp_path, candidates=_candidates_from_dates(_SPIKE_4_IN_72H))
+def test_decide_for_project_row5_floor_blocks_novelty_spike_no_fire(tmp_path):
+    _write_spike_codebook(tmp_path)
     _write_census_state(
-        tmp_path,
-        last_census_at=(NOW - timedelta(days=4)).isoformat(),
-        last_census_report="plans/confusion-census-prior.md",
+        tmp_path, **_watermarked_state(last_census_days_ago=6, watermark_days_ago=3)
     )
 
     decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
 
     assert decision.fire is False
-    assert any("floor" in r for r in decision.reasons)
+    assert (
+        "floor: 3.0d since session watermark (floor 5d) -> BLOCKS all conditions"
+        in decision.reasons
+    )
 
 
 def test_decide_for_project_row6_malformed_state_no_fire_one_warning(tmp_path, caplog):
@@ -1542,6 +1870,37 @@ def test_cli_evaluate_malformed_state_never_crashes_and_exits_0(tmp_path, capsys
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "DECISION:" in captured.out
+
+
+def _cli_floor_line(tmp_path, capsys):
+    exit_code = ct.main(["evaluate", "--project-root", str(tmp_path)])
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    (floor_line,) = [
+        line for line in captured.out.splitlines() if line.startswith("floor:")
+    ]
+    return floor_line
+
+
+def test_cli_evaluate_prints_a_floor_line_naming_its_anchor(tmp_path, capsys):
+    six_days_ago = datetime.now(UTC) - timedelta(days=6)
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path,
+        last_census_at=six_days_ago.date().isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+    )
+
+    assert "since last_census_at (no watermark yet)" in _cli_floor_line(tmp_path, capsys)
+
+    _write_census_state(
+        tmp_path,
+        last_census_at=six_days_ago.date().isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+        session_watermark=six_days_ago.isoformat(),
+    )
+
+    assert "since session watermark" in _cli_floor_line(tmp_path, capsys)
 
 
 # ---------------------------------------------------------------------------
