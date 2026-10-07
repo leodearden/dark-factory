@@ -28,7 +28,7 @@ _MEM0_TEXT_KEYS = (_MEM0_TEXT_KEY, 'memory', 'content')
 _EXCERPT_LEN = 240
 
 
-def _extract_payload_text(payload: dict[str, Any]) -> str | None:
+def extract_payload_text(payload: dict[str, Any]) -> str | None:
     """Return a Qdrant payload's memory text, in canonical key order."""
     for key in _MEM0_TEXT_KEYS:
         value = payload.get(key)
@@ -1175,10 +1175,10 @@ class Mem0Backend:
                 async for point in pages:
                     scanned += 1
                     payload: dict[str, Any] = dict(point.payload) if point.payload else {}
-                    hits = find_toolcall_xml_leak(_extract_payload_text(payload))
+                    hits = find_toolcall_xml_leak(extract_payload_text(payload))
                     if not hits:
                         continue
-                    text = _extract_payload_text(payload) or ''
+                    text = extract_payload_text(payload) or ''
                     matches.append({
                         'id': point.id,
                         'created_at': payload.get('created_at'),
