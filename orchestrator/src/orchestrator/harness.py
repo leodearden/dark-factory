@@ -4126,6 +4126,10 @@ class Harness:
         top_pool = self.git_ops.warm_lane_pool
         if top_pool is not None:
             top_pool.set_lane_lifecycle(self.git_ops._lane_lifecycle)
+        # Leaf δ: no dark-factory child survives the restart that led here,
+        # so every IN_USE record is a crash fossil; left alone it would make
+        # its lane unreclaimable once ε lands.
+        self.git_ops.reset_stale_lane_in_use_records()
 
         for entry in worktree_base.iterdir():
             if not entry.is_dir():
