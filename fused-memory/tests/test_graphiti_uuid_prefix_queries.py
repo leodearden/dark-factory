@@ -106,8 +106,10 @@ class TestPrefixIsBoundNeverInterpolated:
         calls = graph.ro_query.await_args_list
         assert len(calls) >= 2, 'a census and at least one page are expected'
         for call in calls:
-            assert _params_of(call) == {'prefix': 'deadbeef'}
-            assert 'deadbeef' not in _cypher_of(call)
+            params = _params_of(call)
+            assert isinstance(params, dict) and params['prefix'] == 'deadbeef'
+            cypher = _cypher_of(call)
+            assert all(str(value) not in cypher for value in params.values())
 
 
 class TestOutagePropagates:
@@ -129,6 +131,33 @@ class TestOutagePropagates:
 # ---------------------------------------------------------------------------
 # Live FalkorDB: the queries run against the indexed uuid property
 # ---------------------------------------------------------------------------
+
+
+class _RecordingGraph:
+    """Delegates ro_query to a live graph and records each (cypher, params) it was sent."""
+
+    def __init__(self, graph) -> None:
+        self._graph = graph
+        self.queries: list[tuple[str, object]] = []
+
+    async def ro_query(self, cypher, params=None, *args, **kwargs):
+        self.queries.append((cypher, params))
+        return await self._graph.ro_query(cypher, params, *args, **kwargs)
+
+
+async def _seed(graph) -> None:
+    await graph.query(range_create_statement(('Entity', 'NODE', 'uuid', 'RANGE')))
+    await graph.query(range_create_statement(('RELATES_TO', 'RELATIONSHIP', 'uuid', 'RANGE')))
+    await graph.query(
+        'CREATE (a:Entity {uuid: $a, name: $a_name}), '
+        '(b:Entity {uuid: $b, name: $b_name}), '
+        '(a)-[:RELATES_TO {uuid: $e, fact: $fact}]->(b)',
+        {
+            'a': _NODE_UUID, 'a_name': 'first node',
+            'b': _NEIGHBOUR_UUID, 'b_name': 'neighbour',
+            'e': _EDGE_UUID, 'fact': 'first node relates to neighbour',
+        },
+    )
 
 
 @pytest_asyncio.fixture
@@ -158,18 +187,7 @@ class TestPrefixReadsLiveFalkorDB:
         self, mock_config, make_backend, prefix_live_graph,
     ):
         graph = prefix_live_graph
-        await graph.query(range_create_statement(('Entity', 'NODE', 'uuid', 'RANGE')))
-        await graph.query(range_create_statement(('RELATES_TO', 'RELATIONSHIP', 'uuid', 'RANGE')))
-        await graph.query(
-            'CREATE (a:Entity {uuid: $a, name: $a_name}), '
-            '(b:Entity {uuid: $b, name: $b_name}), '
-            '(a)-[:RELATES_TO {uuid: $e, fact: $fact}]->(b)',
-            {
-                'a': _NODE_UUID, 'a_name': 'first node',
-                'b': _NEIGHBOUR_UUID, 'b_name': 'neighbour',
-                'e': _EDGE_UUID, 'fact': 'first node relates to neighbour',
-            },
-        )
+        await _seed(graph)
         backend = make_backend(mock_config)
         _wire(backend, graph)
 
@@ -182,3 +200,28 @@ class TestPrefixReadsLiveFalkorDB:
         assert await backend.entity_uuids_with_prefix(_NODE_UUID, group_id='test') == [
             (_NODE_UUID, 'first node'),
         ]
+
+    @pytest.mark.parametrize(('method', 'prefix'), [
+        ('entity_uuids_with_prefix', 'bff81530'),
+        ('edge_uuids_with_prefix', 'abcd1234'),
+    ])
+    @pytest.mark.asyncio
+    async def test_every_query_is_served_by_the_uuid_index(
+        self, method, prefix, mock_config, make_backend, prefix_live_graph,
+    ):
+        """A bare STARTS WITH is planned as a full label/node scan (measured on
+        live reify: ~13ms nodes, ~110ms edges); the reads must reach the
+        uuid RANGE index instead.
+        """
+        graph = prefix_live_graph
+        await _seed(graph)
+        recorder = _RecordingGraph(graph)
+        backend = make_backend(mock_config)
+        _wire(backend, recorder)
+
+        await getattr(backend, method)(prefix, group_id='test')
+
+        assert len(recorder.queries) >= 2
+        for cypher, params in recorder.queries:
+            plan = str(await graph.explain(cypher, params))
+            assert 'Index Scan' in plan, f'{cypher!r} is not index-served:\n{plan}'
