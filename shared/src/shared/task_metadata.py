@@ -1315,6 +1315,10 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # stays countable instead of invisible.
         'pending_since',
         'pending_since_backfilled',
+        # The harness's audit-trail rotation rollup (task 5771, docs/task-authoring.md
+        # §10): written and read back only by
+        # `fused-memory/src/fused_memory/reconciliation/audit_trail_rotation.py`.
+        'audit_trail_rotation',
     }
 )
 

@@ -32,7 +32,9 @@ __all__ = [
     'HISTORY_KEEP',
     'HISTORY_MAX',
     'ARCHIVE_MAX_BYTES',
+    'ARCHIVE_SOURCE',
     'ROLLUP_KEY',
+    'STANDING_INSTRUCTION',
     'RotationPlan',
     'TaskRewrite',
     'near_duplicate_key',
@@ -53,6 +55,14 @@ HISTORY_MAX = 2 * HISTORY_KEEP
 # so budget a conservative 2 bytes/token.
 ARCHIVE_MAX_BYTES = 16_000
 ROLLUP_KEY = 'audit_trail_rotation'
+# The archive memory's blessed Mem0 'source'; it carries no 'kind' (KIND_REGISTRY is closed).
+ARCHIVE_SOURCE = 'audit_trail_rotation'
+STANDING_INSTRUCTION = (
+    'Append each new cycle record to the arrays named in history_keys, newest first, '
+    'instead of minting a dated top-level metadata key. The harness trims each array '
+    f'from {HISTORY_MAX} to {HISTORY_KEEP} entries and archives what it sheds verbatim '
+    '(docs/task-authoring.md §10).'
+)
 
 _TEXT_COLUMNS = ('title', 'description', 'details')
 
@@ -288,9 +298,34 @@ class RotationPlan:
 
     @property
     def changes_task(self) -> bool:
-        return bool(
-            self.folded_keys or self.shed_history or self.shed_queries or self.description.shed
-        )
+        return bool(self.folded_keys or self._sheds_content)
+
+    @property
+    def trigger(self) -> Literal['size', 'pattern']:
+        return 'size' if self.bytes_before > ROTATE_THRESHOLD_BYTES else 'pattern'
+
+    @property
+    def _sheds_content(self) -> bool:
+        return bool(self.shed_history or self.shed_queries or self.description.shed)
+
+    @property
+    def _shed_rotations(self) -> tuple[Any, ...]:
+        """Prior rotation records that make room for this rotation's own record."""
+        return self.prior_rotations[HISTORY_KEEP - 1 :] if self._sheds_content else ()
+
+    @property
+    def archive_metadata(self) -> dict[str, Any]:
+        """Mem0 metadata for the archive: blessed keys plus the x_ namespace, no 'kind'."""
+        previous = self.prior_rotations[0] if self.prior_rotations else None
+        return {
+            'source': ARCHIVE_SOURCE,
+            'task_id': self.task_id,
+            'x_rotated_at': self.rotated_at,
+            'x_bytes_before': self.bytes_before,
+            'x_previous_archive_memory_id': (
+                previous.get('archive_memory_id') if isinstance(previous, dict) else None
+            ),
+        }
 
     @property
     def archive_text(self) -> str | None:
@@ -298,8 +333,10 @@ class RotationPlan:
         sections = []
         if self.description.shed:
             sections.append(f'{_DESCRIPTION_SECTION}\n{self.description.shed_span}')
-        if self.shed_history:
-            shed = {key: list(entries) for key, entries in self.shed_history.items()}
+        shed: dict[str, Any] = {key: list(entries) for key, entries in self.shed_history.items()}
+        if self._shed_rotations:
+            shed[ROLLUP_KEY] = {'rotations': list(self._shed_rotations)}
+        if shed:
             sections.append(f'{_METADATA_SECTION}\n{_verbatim_json(shed)}')
         if self.shed_queries:
             sections.append('\n'.join([_QUERY_SECTION, *self.shed_queries]))
@@ -329,14 +366,46 @@ class RotationPlan:
         metadata = dict(self.metadata)
         if archive_memory_id is not None:
             metadata = _with_archive_link(metadata, archive_link_query(archive_memory_id, self.task_id))
-        metadata[ROLLUP_KEY] = {
-            'history_keys': list(self.history_keys),
-            'rotations': list(self.prior_rotations),
-        }
         description = None
         if self.description.shed:
             description = self.description.render(self._pointer_block(archive_memory_id))
-        return TaskRewrite(description=description, metadata=metadata)
+        if not self._sheds_content:
+            return TaskRewrite(description, {**metadata, ROLLUP_KEY: self._rollup(self.prior_rotations)})
+        kept = self.prior_rotations[: len(self.prior_rotations) - len(self._shed_rotations)]
+
+        def with_record(bytes_after: int) -> TaskRewrite:
+            record = self._rotation_record(archive_memory_id, bytes_after)
+            return TaskRewrite(description, {**metadata, ROLLUP_KEY: self._rollup((record, *kept))})
+
+        return _settle_bytes_after(with_record, self._rewrite_bytes)
+
+    def _rollup(self, rotations: tuple[Any, ...]) -> dict[str, Any]:
+        return {
+            'standing_instruction': STANDING_INSTRUCTION,
+            'history_keys': list(self.history_keys),
+            'rotations': list(rotations),
+        }
+
+    def _rotation_record(self, archive_memory_id: str | None, bytes_after: int) -> dict[str, Any]:
+        cut = self.description
+        return {
+            'rotated_at': self.rotated_at,
+            'trigger': self.trigger,
+            'archive_memory_id': archive_memory_id,
+            'bytes_before': self.bytes_before,
+            'bytes_after': bytes_after,
+            'description_blocks_kept': len(cut.blocks) - cut.shed,
+            'description_blocks_shed': cut.shed,
+            'shed_block_leads': cut.shed_leads,
+            'history_entries_kept': {
+                key: len(self.metadata[key])
+                for key in self.history_keys
+                if isinstance(self.metadata.get(key), list)
+            },
+            'history_entries_shed': {key: len(shed) for key, shed in self.shed_history.items()},
+            'folded_keys': list(self.folded_keys),
+            'memory_hint_queries_shed': len(self.shed_queries),
+        }
 
     def _pointer_block(self, archive_memory_id: str | None) -> str:
         cut = self.description
@@ -351,6 +420,23 @@ class RotationPlan:
         description = self.description.text if rewrite.description is None else rewrite.description
         rewritten = {'description': description, 'metadata': rewrite.metadata}
         return self.untouched_bytes + task_payload_bytes(rewritten)
+
+
+def _settle_bytes_after(
+    with_record: Callable[[int], TaskRewrite], measure: Callable[[TaskRewrite], int]
+) -> TaskRewrite:
+    """The rewrite whose recorded bytes_after equals its own measured size.
+
+    The record's digits count toward the size they report; the count settles
+    within one change of digit width.
+    """
+    bytes_after = 0
+    while True:
+        rewrite = with_record(bytes_after)
+        measured = measure(rewrite)
+        if measured == bytes_after:
+            return rewrite
+        bytes_after = measured
 
 
 def _verbatim_json(value: Any) -> str:
