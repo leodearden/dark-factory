@@ -129,8 +129,8 @@ sums. The tap forwards bytes unchanged and refuses streamed requests. It logs on
 `CallRecord` per call, and the record is written before the reply is sent.
 
 The tap's per-call `duration_ms` times the whole upstream exchange as the tap saw it.
-The shortest phi-4-14b call took 518 ms end to end and its median call 2507 ms, against
-an episode-latency p50 of 29050 ms. Whatever the tap adds is therefore a small fraction
+The shortest phi-4-14b call took 518 ms end to end, and its per-call p50 was 2489 ms (the
+verdict's nearest-rank figure), against an episode-latency p50 of 29050 ms. Whatever the tap adds is therefore a small fraction
 of even the shortest call. Tap overhead was not measured separately.
 
 When the harness cancels a client mid-call, the tap's reply finds a closed socket. The
