@@ -829,6 +829,153 @@ class TestCompleteness:
 
 
 # ---------------------------------------------------------------------------
+# --summary: one row per member in name order, then the domain's totals.
+
+_SUMMARY_HEADER = (
+    '| member | pseudo | src files | src lines | src prose lines | src cognitive max / total '
+    '| tests files | tests lines | tests cognitive total | files >= 1500 lines '
+    '| files >= 2000 lines | function-local imports | re-export names | reach-back imports '
+    '| private patch targets | private reads |'
+)
+
+_SUMMARY_FILES: dict[str, str] = {
+    # Declared out of name order, so name order is what is pinned.
+    'pyproject.toml': '[tool.uv.workspace]\nmembers = ["beta", "alpha"]\n',
+    'alpha/src/alpha/__init__.py': 'THING = 1\n',
+    'alpha/src/alpha/mod.py': _MOD_BEFORE,
+    'alpha/src/alpha/big.py': _assignments(2010),
+    'alpha/src/alpha/shim.py': 'from alpha.mod import f\n',
+    'alpha/src/alpha/late.py': 'def g():\n    import alpha.mod\n    return alpha.mod\n',
+    'alpha/src/alpha/rb.py': 'from alpha import THING\nY = THING\n',
+    'alpha/tests/test_mod.py': (
+        'from unittest.mock import patch\nfrom alpha import mod\n\ndef test_it():\n'
+        "    with patch('alpha.mod._x'):\n        assert mod._y\n"
+    ),
+    'beta/src/beta/b.py': 'B = 1\n',
+    'beta/tests/test_b.py': _TRIVIAL_TEST,
+    'scripts/x.py': 'X = 1\n',
+    'scripts/tests/test_x.py': _TRIVIAL_TEST,
+    'tests/test_y.py': _TRIVIAL_TEST,
+}
+
+
+def _summary_of(path: Path, capsys: pytest.CaptureFixture[str]) -> list[str]:
+    capsys.readouterr()
+    assert snapshot.main(['--summary', str(path)]) == 0
+    return capsys.readouterr().out.splitlines()
+
+
+def _cells(row: str) -> list[str]:
+    return [cell.strip() for cell in row.strip().strip('|').split('|')]
+
+
+def _table(summary: list[str]) -> tuple[list[str], list[list[str]]]:
+    """The header cells and the data rows' cells, after the separator row."""
+    start = summary.index(_SUMMARY_HEADER)
+    rows = []
+    for line in summary[start + 2:]:
+        if not line.startswith('|'):
+            break
+        rows.append(_cells(line))
+    return _cells(summary[start]), rows
+
+
+def _expected_cells(records: list[dict[str, Any]]) -> list[str]:
+    """One row's cells after member and pseudo, recomputed from the file records."""
+    src = [record for record in records if record['kind'] == 'src']
+    tests = [record for record in records if record['kind'] == 'tests']
+    return [str(value) for value in (
+        len(src),
+        sum(record['lines'] for record in src),
+        sum(record['prose_lines'] for record in src),
+    )] + [
+        f'{max((record["cognitive_max"] for record in src), default=0)} / '
+        f'{sum(record["cognitive_total"] for record in src)}',
+    ] + [str(value) for value in (
+        len(tests),
+        sum(record['lines'] for record in tests),
+        sum(record['cognitive_total'] for record in tests),
+        sum(record['lines'] >= 1500 for record in records),
+        sum(record['lines'] >= 2000 for record in records),
+        sum(record['function_local_imports'] for record in src),
+        sum(len(record['reexport_names']) for record in src),
+        sum(record['reach_back_imports'] for record in src),
+        sum(len(record['private_patch_targets']) for record in tests),
+        sum(record['private_reads'] for record in tests),
+    )]
+
+
+class TestTheSummary:
+    @pytest.fixture
+    def measured(self, tmp_path: Path) -> Path:
+        path = tmp_path / 'out' / 'snapshot.json'
+        assert _run(_repo(tmp_path, _SUMMARY_FILES), path) == 0
+        return path
+
+    def test_the_header_lines(self, measured: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        taken = _load(measured)
+        graph = taken['import_graph']
+        summary = _summary_of(measured, capsys)
+        table_at = summary.index(_SUMMARY_HEADER)
+        assert summary.index(f'run: run-1 as_of {taken["as_of_sha"]} since none') < table_at
+        assert summary.index('files: 12/12 measured, complete=true') < table_at
+        assert summary.index(
+            f'import graph: {len(graph["edges"])} edges, {len(graph["reach_back"])} reach-backs, '
+            f'{len(graph["deferred"])} deferred imports, {len(graph["cycles"])} cycles'
+        ) < table_at
+        assert 'unreadable (measures unknown, never zero):' not in summary
+
+    def test_an_incomplete_snapshot_names_its_unreadable_paths(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        path = tmp_path / 'out' / 'snapshot.json'
+        assert _run(_repo(tmp_path, {**_BASE, 'alpha/src/alpha/broken.py': 'def (:\n'}), path) == 0
+        summary = _summary_of(path, capsys)
+        assert 'files: 8/9 measured, complete=false' in summary
+        at = summary.index('unreadable (measures unknown, never zero):')
+        assert summary[at + 1] == '  alpha/src/alpha/broken.py'
+
+    def test_one_row_per_member_in_name_order_then_the_domain(
+        self, measured: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        header, rows = _table(_summary_of(measured, capsys))
+        assert len(header) == 16
+        names = [row[0] for row in rows]
+        assert names == [*sorted(['alpha', 'beta', 'scripts', 'tests']), '(domain)']
+        assert [row[1] for row in rows] == ['false', 'false', 'true', 'true', '']
+
+    def test_each_cell_is_a_count_a_total_or_the_pair(
+        self, measured: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        taken = _load(measured)
+        _header, rows = _table(_summary_of(measured, capsys))
+        by_member: dict[str, list[dict[str, Any]]] = {}
+        for record in taken['files'].values():
+            by_member.setdefault(record['member'], []).append(record)
+        for row in rows[:-1]:
+            assert row[2:] == _expected_cells(by_member.get(row[0], [])), row[0]
+        assert rows[-1][2:] == _expected_cells(list(taken['files'].values()))
+        tests_row = next(row for row in rows if row[0] == 'tests')
+        assert (tests_row[2], tests_row[5]) == ('0', '0 / 0')
+
+    def test_nothing_is_averaged(self, measured: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        header, rows = _table(_summary_of(measured, capsys))
+        assert not [cell for row in rows for cell in row[1:] if '.' in cell]
+        for word in ('mean', 'avg', 'average', 'ratio'):
+            assert not [cell for cell in header if word in cell.lower()], word
+
+    @pytest.mark.parametrize('content', [None, '{"instrument": "other"}'], ids=['missing', 'foreign'])
+    def test_a_bad_snapshot_is_refused_naming_it(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], content: str | None
+    ) -> None:
+        path = tmp_path / 'given.json'
+        if content is not None:
+            path.write_text(content, encoding='utf-8')
+        assert snapshot.main(['--summary', str(path)]) == 2
+        assert str(path) in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
 # Refusals: exit 2, the cause named on stderr, nothing written.
 
 
