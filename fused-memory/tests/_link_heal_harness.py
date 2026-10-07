@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,11 @@ from _fm_helpers import install_identity_mocks
 
 from fused_memory.backends.mem0_client import split_managed_metadata
 from fused_memory.config.schema import Mem0UpdateConfig
+from fused_memory.maintenance.link_adjudicator import (
+    AdjudicationFailure,
+    LinkPair,
+    LinkVerdict,
+)
 from fused_memory.maintenance.link_heal import LINK_KEYS, BasisSource, LinkBasis, Verdict
 from fused_memory.maintenance.link_heal_executor import (
     Escape,
@@ -383,6 +389,49 @@ async def run_corpus_apply(
         source=RunSource.CORPUS,
         approved_plan_sha256=approved_plan_sha256,
     )
+
+
+Answer = Verdict | AdjudicationFailure
+
+FAKE_ADJUDICATOR_MODEL = 'fake-model'
+
+
+class FakeAdjudicator:
+    """A ``LinkAdjudicator`` answering ``answer_for(child text)`` and remembering every pair.
+
+    A *storm* summary, when given, is handed to the run's storm hook on every call.
+    """
+
+    def __init__(
+        self,
+        answer_for: Callable[[str], Answer],
+        *,
+        storm: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.calls: list[list[LinkPair]] = []
+        self._answer_for = answer_for
+        self._storm = storm
+
+    @property
+    def pairs(self) -> list[LinkPair]:
+        return [pair for call in self.calls for pair in call]
+
+    async def __call__(
+        self,
+        pairs: Sequence[LinkPair],
+        *,
+        on_failure_storm: Callable[[Mapping[str, Any]], None] | None = None,
+    ) -> list[LinkVerdict]:
+        self.calls.append(list(pairs))
+        if self._storm is not None and on_failure_storm is not None:
+            on_failure_storm(self._storm)
+        return [self._verdict(pair) for pair in pairs]
+
+    def _verdict(self, pair: LinkPair) -> LinkVerdict:
+        answer = self._answer_for(pair.child_text)
+        if isinstance(answer, AdjudicationFailure):
+            return LinkVerdict(pair.key, FAKE_ADJUDICATOR_MODEL, failure=answer, detail='scripted')
+        return LinkVerdict(pair.key, FAKE_ADJUDICATOR_MODEL, verdict=answer, reason=f'scripted {answer}')
 
 
 def assert_store_invariants(harness: LinkHealHarness) -> None:
