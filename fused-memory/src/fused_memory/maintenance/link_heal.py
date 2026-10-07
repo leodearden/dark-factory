@@ -61,6 +61,7 @@ MISFILE_VERDICTS = frozenset({Verdict.RELATED, Verdict.UNRELATED})
 BELONGS_VERDICTS = frozenset(
     {Verdict.SAME, Verdict.EXTENDS, Verdict.SUBSUMED, Verdict.CORRECTS},
 )
+AGREEING_VERDICTS = BELONGS_VERDICTS - {Verdict.CORRECTS}
 
 
 class KindClass(StrEnum):
