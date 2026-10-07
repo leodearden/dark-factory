@@ -160,6 +160,7 @@ from fused_memory.server.near_duplicate_guard import (
     resolve_topic_cluster_autoseed_enabled,
     resolve_topic_guard_clusters,
 )
+from fused_memory.server.resolve_prefix_route import register_resolve_prefix_route
 from fused_memory.server.tool_errors import mcp_tool_errors
 from fused_memory.server.topic_cluster_store import TopicClusterStore, seed_topic_cluster
 from fused_memory.server.write_triage import (
@@ -201,6 +202,7 @@ from fused_memory.services.consolidation_ops import (
     patch_memory_metadata,
     read_topic_closure,
 )
+from fused_memory.services.id_resolver import IdResolver
 from fused_memory.services.memory_service import MemoryService, metadata_row_text
 from fused_memory.services.read_telemetry import (
     fallback_search_summary,
@@ -1196,10 +1198,12 @@ def create_mcp_server(
     curator_usage_gate: UsageGate | None = None,
     known_projects: dict[str, str] | None = None,
     topic_cluster_store: TopicClusterStore | None = None,
+    id_resolver: IdResolver | None = None,
 ) -> FastMCP:
     """Create and configure the FastMCP server with all tools."""
 
     mcp = FastMCP('Fused Memory', instructions=FUSED_MEMORY_INSTRUCTIONS)
+    id_resolver = id_resolver or IdResolver.for_memory_service(memory_service)
     _taskmaster_configured = task_interceptor is not None
 
     async def _backlog_gate(project_id: str) -> dict | None:
@@ -1452,6 +1456,9 @@ def create_mcp_server(
         # all IS the signal; the body is a fixed constant so nothing dynamic
         # can creep in and turn this back into a state read.
         return JSONResponse(_ALIVE_BODY, status_code=200)
+
+    # POST /resolve-prefix: the uuid-prefix resolver for out-of-process callers (PRD C5).
+    register_resolve_prefix_route(mcp, id_resolver.resolve_prefix, known_projects=_kp)
 
     # ------------------------------------------------------------------
     # Write tools
