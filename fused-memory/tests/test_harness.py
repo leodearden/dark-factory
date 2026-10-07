@@ -6531,6 +6531,94 @@ async def test_run_full_cycle_post_completion_cancellation_keeps_run_completed(
     assert _pending_recon_failures(esc_queue) == []
 
 
+def _lock_restore_drained(event_buffer) -> None:
+    async def restore_drained(project_id, run_id=None, *, include_unattributed=False):
+        raise _sqlite_busy_error()
+
+    event_buffer.restore_drained = restore_drained
+
+
+def _make_failing_harness(journal, event_buffer, mock_memory_service, tmp_path):
+    """A harness whose Stage 1 raises, with a real escalation queue."""
+    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    esc_queue = EscalationQueue(tmp_path / 'esc')
+    harness._escalation_queue = esc_queue
+    harness.stages[0].run = _raising_stage_run(lambda: RuntimeError('stage exploded'))
+    _mock_stage_run(harness.stages[1])
+    _mock_stage_run(harness.stages[2])
+    return harness, esc_queue
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('lock_write', 'failed_write_prefix', 'row_status', 'buffered_after'),
+    [
+        pytest.param(
+            lambda journal, event_buffer: _lock_complete_run(journal, 'failed'),
+            'complete_run(failed) failed after run failure', 'running', 1,
+            id='complete_run_failed',
+        ),
+        pytest.param(
+            lambda journal, event_buffer: _lock_restore_drained(event_buffer),
+            'restore_drained failed after run failure', 'failed', 0,
+            id='restore_drained',
+        ),
+    ],
+)
+async def test_run_full_cycle_failure_escalates_even_when_failure_bookkeeping_raises(
+    journal, event_buffer, mock_memory_service, caplog, tmp_path,
+    lock_write, failed_write_prefix, row_status, buffered_after,
+):
+    """esc-5545-1: a failing bookkeeping write in the failure handler neither
+    skips the recon_failure escalation, nor skips the OTHER bookkeeping write,
+    nor replaces the stage's own exception."""
+    harness, esc_queue = _make_failing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    await event_buffer.push(_make_event())
+    lock_write(journal, event_buffer)
+
+    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match='stage exploded'):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    [escalation] = _pending_recon_failures(esc_queue)
+    assert 'memory_consolidator' in escalation.summary
+    _assert_one_classified_failure_line(
+        caplog, failed_write_prefix,
+        run_id=row.id, errorname='SQLITE_BUSY', errorcode=5,
+    )
+    assert row.status == row_status
+    assert await event_buffer.count_buffered('test-project') == buffered_after
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_failure_escalates_even_when_failure_bookkeeping_is_cancelled(
+    journal, event_buffer, mock_memory_service, tmp_path,
+):
+    """esc-5545-1 / F4: shutdown cancelling the failure handler mid-bookkeeping
+    still leaves the recon_failure escalation filed."""
+    harness, esc_queue = _make_failing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    await event_buffer.push(_make_event())
+    original_complete_run = journal.complete_run
+
+    async def complete_run(run_id, status):
+        if status == 'failed':
+            raise asyncio.CancelledError()
+        return await original_complete_run(run_id, status)
+
+    journal.complete_run = complete_run
+
+    with pytest.raises(asyncio.CancelledError):
+        await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    assert len(_pending_recon_failures(esc_queue)) == 1
+
+
 @pytest.mark.asyncio
 async def test_remediation_pass_failed_write_failure_still_reaches_escalate(
     journal, event_buffer, mock_memory_service, caplog,
