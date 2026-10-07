@@ -170,6 +170,13 @@ async def ops_conn(tmp_path):
         yield conn
 
 
+async def _ops_value(conn, **kwargs):
+    """The MemoryOps a successful get_memory_ops read measured."""
+    from dashboard.data.write_journal import get_memory_ops
+
+    return (await get_memory_ops(conn, **kwargs)).value
+
+
 def _empty_ops():
     from dashboard.data.write_journal import MemoryOps
 
@@ -188,9 +195,7 @@ class TestGetMemoryOps:
 
     @pytest.mark.asyncio
     async def test_series_and_breakdown_reconcile(self, ops_conn):
-        from dashboard.data.write_journal import get_memory_ops
-
-        ops = await get_memory_ops(ops_conn, hours=24, now=_OPS_NOW)
+        ops = await _ops_value(ops_conn, hours=24, now=_OPS_NOW)
 
         series_total = sum(ops.reads) + sum(ops.writes) + sum(ops.other)
         assert series_total == sum(count for _, count in ops.by_operation)
@@ -198,9 +203,7 @@ class TestGetMemoryOps:
 
     @pytest.mark.asyncio
     async def test_kind_outside_read_write_counts_as_other(self, ops_conn):
-        from dashboard.data.write_journal import get_memory_ops
-
-        ops = await get_memory_ops(ops_conn, hours=24, now=_OPS_NOW)
+        ops = await _ops_value(ops_conn, hours=24, now=_OPS_NOW)
 
         maintenance_at = datetime(2026, 10, 3, 6, 15, tzinfo=UTC)
         assert ops.other[_ops_bucket(maintenance_at)] == 1
@@ -209,9 +212,7 @@ class TestGetMemoryOps:
 
     @pytest.mark.asyncio
     async def test_labels_are_the_24_hour_keys_oldest_first(self, ops_conn):
-        from dashboard.data.write_journal import get_memory_ops
-
-        ops = await get_memory_ops(ops_conn, hours=24, now=_OPS_NOW)
+        ops = await _ops_value(ops_conn, hours=24, now=_OPS_NOW)
 
         assert ops.labels == _OPS_LABELS
         assert ops.labels[0] == '13:00'
@@ -220,9 +221,7 @@ class TestGetMemoryOps:
 
     @pytest.mark.asyncio
     async def test_window_is_hour_aligned_and_bounded_above(self, ops_conn):
-        from dashboard.data.write_journal import get_memory_ops
-
-        ops = await get_memory_ops(ops_conn, hours=24, now=_OPS_NOW)
+        ops = await _ops_value(ops_conn, hours=24, now=_OPS_NOW)
 
         # The window-start row is the first bucket's only read; the row a
         # minute before it and the future row are in no view.
@@ -234,9 +233,7 @@ class TestGetMemoryOps:
 
     @pytest.mark.asyncio
     async def test_hourly_buckets_hold_their_rows(self, ops_conn):
-        from dashboard.data.write_journal import get_memory_ops
-
-        ops = await get_memory_ops(ops_conn, hours=24, now=_OPS_NOW)
+        ops = await _ops_value(ops_conn, hours=24, now=_OPS_NOW)
 
         assert ops.reads[_ops_bucket(datetime(2026, 10, 3, 11, tzinfo=UTC))] == 2
         assert ops.reads[-1] == 1
@@ -247,9 +244,7 @@ class TestGetMemoryOps:
     async def test_by_operation_count_desc_ties_by_label_and_null_is_unknown(
         self, ops_conn,
     ):
-        from dashboard.data.write_journal import get_memory_ops
-
-        ops = await get_memory_ops(ops_conn, hours=24, now=_OPS_NOW)
+        ops = await _ops_value(ops_conn, hours=24, now=_OPS_NOW)
 
         assert ops.by_operation == (
             ('search', 3),
@@ -261,12 +256,44 @@ class TestGetMemoryOps:
         )
 
     @pytest.mark.asyncio
-    async def test_empty_db_returns_zero_buckets(self, empty_journal_conn):
-        from dashboard.data.write_journal import get_memory_ops
+    async def test_a_readable_empty_journal_is_a_fresh_quiet_window(
+        self, empty_journal_conn,
+    ):
+        """A journal that answers with no rows is a measured quiet day, kept
+        distinct from a dead journal (TestDataLayerErrorHandling)."""
+        from dashboard.data import write_journal
+        from dashboard.data.datum import DatumState, validate_datum
 
-        ops = await get_memory_ops(empty_journal_conn, hours=24, now=_OPS_NOW)
+        result = await write_journal.get_memory_ops(
+            empty_journal_conn, hours=24, now=_OPS_NOW,
+        )
 
-        assert ops == _empty_ops()
+        assert result.state is DatumState.FRESH
+        assert result.as_of == _OPS_NOW
+        assert result.reason is None
+        assert (
+            result.freshness_bound_seconds
+            == write_journal.MEMORY_OPS_FRESHNESS_BOUND_SECONDS
+        )
+        assert result.value == _empty_ops()
+        validate_datum(result, served_at=_OPS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_a_populated_read_is_fresh_as_of_the_passed_now(self, ops_conn):
+        from dashboard.data import write_journal
+        from dashboard.data.datum import DatumState, validate_datum
+
+        result = await write_journal.get_memory_ops(ops_conn, hours=24, now=_OPS_NOW)
+
+        assert result.state is DatumState.FRESH
+        assert result.as_of == _OPS_NOW
+        assert result.reason is None
+        assert (
+            result.freshness_bound_seconds
+            == write_journal.MEMORY_OPS_FRESHNESS_BOUND_SECONDS
+        )
+        assert sum(result.value.reads) == 4
+        validate_datum(result, served_at=_OPS_NOW)
 
 
 class TestGetAgentBreakdown:
@@ -316,14 +343,33 @@ async def no_table_conn(tmp_path):
         yield conn
 
 
+def _assert_unknown_memory_ops(result, *reason_fragments):
+    """*result* is an unmeasured window: an unknown Datum naming why, never a
+    zero window that would read as a quiet day."""
+    from dashboard.data import write_journal
+    from dashboard.data.datum import DatumState, validate_datum
+
+    assert result.state is DatumState.UNKNOWN
+    assert result.value is None
+    assert result.as_of is None
+    assert result.reason and result.reason.strip()
+    for fragment in reason_fragments:
+        assert fragment in result.reason, (fragment, result.reason)
+    assert (
+        result.freshness_bound_seconds
+        == write_journal.MEMORY_OPS_FRESHNESS_BOUND_SECONDS
+    )
+    validate_datum(result, served_at=_OPS_NOW)
+
+
 class TestDataLayerErrorHandling:
     """Verify both write_journal functions handle errors at data layer."""
 
     @pytest.mark.asyncio
-    async def test_memory_ops_returns_empty_on_none_db(self):
+    async def test_memory_ops_is_unknown_on_none_db(self):
         from dashboard.data.write_journal import get_memory_ops
         result = await get_memory_ops(None, now=_OPS_NOW)
-        assert result == _empty_ops()
+        _assert_unknown_memory_ops(result, 'write journal')
 
     @pytest.mark.asyncio
     async def test_agents_returns_default_on_none_db(self):
@@ -332,14 +378,12 @@ class TestDataLayerErrorHandling:
         assert result == {'labels': [], 'values': []}
 
     @pytest.mark.asyncio
-    async def test_memory_ops_returns_empty_on_operational_error(self, no_table_conn):
+    async def test_memory_ops_is_unknown_naming_the_operational_error(
+        self, no_table_conn,
+    ):
         from dashboard.data.write_journal import get_memory_ops
         result = await get_memory_ops(no_table_conn, now=_OPS_NOW)
-        assert result == _empty_ops()
-
-    def test_empty_memory_ops_is_the_window_a_failed_read_returns(self):
-        from dashboard.data.write_journal import empty_memory_ops
-        assert empty_memory_ops(now=_OPS_NOW) == _empty_ops()
+        _assert_unknown_memory_ops(result, 'OperationalError', 'no such table')
 
     @pytest.mark.asyncio
     async def test_agents_returns_default_on_operational_error(self, no_table_conn):
@@ -348,7 +392,7 @@ class TestDataLayerErrorHandling:
         assert result == {'labels': [], 'values': []}
 
     @pytest.mark.asyncio
-    async def test_memory_ops_returns_empty_on_os_error(self, tmp_path):
+    async def test_memory_ops_is_unknown_naming_the_os_error(self, tmp_path):
         from dashboard.data.write_journal import get_memory_ops
         db_path = tmp_path / 'test.db'
         sqlite3.connect(str(db_path)).close()
@@ -360,7 +404,7 @@ class TestDataLayerErrorHandling:
             mock_cursor.fetchall = AsyncMock(side_effect=OSError('disk I/O error'))
             with patch.object(conn, 'execute', return_value=mock_cursor):
                 result = await get_memory_ops(conn, now=_OPS_NOW)
-        assert result == _empty_ops()
+        _assert_unknown_memory_ops(result, 'OSError', 'disk I/O error')
 
     @pytest.mark.asyncio
     async def test_agents_returns_default_on_os_error(self, tmp_path):
@@ -426,7 +470,7 @@ class TestNowThreading:
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            result = await get_memory_ops(conn, now=self.FIXED_NOW)
+            result = (await get_memory_ops(conn, now=self.FIXED_NOW)).value
         assert sum(result.reads) == 1
         assert result.by_operation == (('search', 1),)
 
@@ -446,7 +490,7 @@ class TestNowThreading:
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            result = await get_memory_ops(conn)
+            result = (await get_memory_ops(conn)).value
         assert sum(result.reads) == 1
 
     @pytest.mark.asyncio
@@ -564,7 +608,7 @@ async def _memory_ops_with_sql(conn, sql, monkeypatch, **kwargs):
     from dashboard.data import write_journal
 
     monkeypatch.setattr(write_journal, 'MEMORY_OPS_SQL', sql)
-    return await write_journal.get_memory_ops(conn, **kwargs)
+    return (await write_journal.get_memory_ops(conn, **kwargs)).value
 
 
 class TestMemoryOpsResultEquivalence:
@@ -656,7 +700,7 @@ class TestMemoryOpsMissingIndexFallback:
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            indexed = await get_memory_ops(conn, now=now)
+            indexed = (await get_memory_ops(conn, now=now)).value
 
         # WRITE_OPS_SCHEMA minus idx_wo_created — the coupling breaks here.
         setup_conn = sqlite3.connect(str(db_path))
@@ -667,7 +711,7 @@ class TestMemoryOpsMissingIndexFallback:
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
             with caplog.at_level(logging.ERROR, logger='dashboard.data.write_journal'):
-                fallback = await get_memory_ops(conn, now=now)
+                fallback = (await get_memory_ops(conn, now=now)).value
 
         assert fallback == indexed
         assert dict(fallback.by_operation) == {'search': 1, 'add_memory': 1}, (
