@@ -712,6 +712,24 @@ _EDGES_IN_VALID_AT_WINDOW_PAGE_TEMPLATE = (
 )
 _EDGES_IN_VALID_AT_WINDOW_CENSUS = _EDGES_IN_VALID_AT_WINDOW_MATCH + 'RETURN count(*)'
 
+# Ids starting with a uuid prefix, for services/id_resolver.py (task 5323).
+# `$prefix` is bound, never interpolated. No invalid_at filter: a superseded
+# edge's uuid is still an id a prefix can cite. The edge pattern is DIRECTED
+# for the one-row-per-edge reason given at _EMBEDDED_EDGES_MATCH.
+_ENTITY_UUID_PREFIX_MATCH = 'MATCH (n:Entity) WHERE n.uuid STARTS WITH $prefix '
+_ENTITY_UUID_PREFIX_PAGE_TEMPLATE = (
+    _ENTITY_UUID_PREFIX_MATCH
+    + 'RETURN n.uuid, n.name ORDER BY n.uuid SKIP {skip} LIMIT {limit}'
+)
+_ENTITY_UUID_PREFIX_CENSUS = _ENTITY_UUID_PREFIX_MATCH + 'RETURN count(*)'
+
+_EDGE_UUID_PREFIX_MATCH = 'MATCH ()-[e:RELATES_TO]->() WHERE e.uuid STARTS WITH $prefix '
+_EDGE_UUID_PREFIX_PAGE_TEMPLATE = (
+    _EDGE_UUID_PREFIX_MATCH
+    + 'RETURN e.uuid, e.fact ORDER BY e.uuid SKIP {skip} LIMIT {limit}'
+)
+_EDGE_UUID_PREFIX_CENSUS = _EDGE_UUID_PREFIX_MATCH + 'RETURN count(*)'
+
 
 @dataclass(frozen=True)
 class PagedRead:
@@ -2535,6 +2553,74 @@ class GraphitiBackend:
             ),
         )
         return stale
+
+    @_canonicalize_group_args
+    async def entity_uuids_with_prefix(
+        self, prefix: str, *, group_id: str
+    ) -> list[tuple[str, str]]:
+        """Return (uuid, name) for every Entity node whose uuid starts with *prefix*.
+
+        Read by ``services/id_resolver.py::IdResolver`` to classify a uuid
+        prefix; paginated, and a structurally incomplete read raises
+        ``IncompleteEnumerationError`` rather than returning a short list.
+        """
+        return await self._uuids_with_prefix(
+            prefix,
+            group_id=group_id,
+            page_template=_ENTITY_UUID_PREFIX_PAGE_TEMPLATE,
+            census_cypher=_ENTITY_UUID_PREFIX_CENSUS,
+            method='entity_uuids_with_prefix',
+            noun='entity nodes',
+        )
+
+    @_canonicalize_group_args
+    async def edge_uuids_with_prefix(
+        self, prefix: str, *, group_id: str
+    ) -> list[tuple[str, str]]:
+        """Return (uuid, fact) for every RELATES_TO edge whose uuid starts with *prefix*.
+
+        The edge counterpart of ``entity_uuids_with_prefix``, read by the same
+        ``services/id_resolver.py::IdResolver``.
+        """
+        return await self._uuids_with_prefix(
+            prefix,
+            group_id=group_id,
+            page_template=_EDGE_UUID_PREFIX_PAGE_TEMPLATE,
+            census_cypher=_EDGE_UUID_PREFIX_CENSUS,
+            method='edge_uuids_with_prefix',
+            noun='edges',
+        )
+
+    async def _uuids_with_prefix(
+        self,
+        prefix: str,
+        *,
+        group_id: str,
+        page_template: str,
+        census_cypher: str,
+        method: str,
+        noun: str,
+    ) -> list[tuple[str, str]]:
+        """Page (uuid, label) rows matching *prefix*; the one body of the two prefix reads."""
+        graph = self._graph_for(group_id)
+        paged = await _paged_ro_query(
+            graph, page_template, census_cypher, params={'prefix': prefix},
+        )
+        matches = [
+            (row[0], row[1] or '')
+            for row in _first_row_per_uuid(paged.rows, reader=method)
+        ]
+        apply_incompleteness_policy(
+            paged,
+            method=method,
+            group_id=group_id,
+            returned_count=len(matches),
+            noun=noun,
+            consequence=(
+                f'must not be read as the full set of ids starting with {prefix!r}'
+            ),
+        )
+        return matches
 
     @_canonicalize_group_args
     async def query_edges_by_time_range(
