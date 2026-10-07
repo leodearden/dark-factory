@@ -2250,13 +2250,19 @@ class TestGetByTaskRecoversRecordRelocatedMidScan:
             f'{[r.getMessage() for r in warnings]}'
         )
 
-    def test_get_by_task_does_not_reprobe_an_archive_tier_record_pruned_mid_scan(
+
+class TestGetByTaskLeavesAnArchiveTierVanishUnrecovered:
+    """The other side of the mid-scan recovery gate in
+    ``queue.py::EscalationQueue.get_by_task``: only a ROOT-tier vanish is
+    re-located.
+    """
+
+    def test_an_archive_copy_pruned_mid_scan_costs_no_extra_archive_walk(
         self, tmp_path: Path,
     ):
-        """An ARCHIVE-tier ``'vanished'`` — ``archive.prune_archive``
-        rmtree-ing a dated subdir mid-scan — costs zero extra archive I/O:
-        no targeted re-probe, per the root-tier gate in
-        ``queue.py::get_by_task``.  GREEN on arrival; RED shown by mutation.
+        """An archive copy rmtree'd mid-scan, as ``archive.prune_archive``
+        does, is dropped without raising, and the scan walks the archive no
+        more often than the same scan run undisturbed.
         """
         queue = EscalationQueue(tmp_path / 'queue')
         queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
@@ -2264,12 +2270,13 @@ class TestGetByTaskRecoversRecordRelocatedMidScan:
         queue.resolve('esc-4176-2', 'resolved before the scan')
         (archive_copy,) = (queue.queue_dir / 'archive').rglob('esc-4176-2.json')
 
+        with patch.object(Path, 'rglob', autospec=True, side_effect=Path.rglob) as undisturbed:
+            queue.get_by_task('4176', status=None)
         with (
             patch.object(Path, 'read_text', pruning_read_text(archive_copy)),
-            patch.object(Path, 'rglob', autospec=True, side_effect=Path.rglob) as rglob_spy,
+            patch.object(Path, 'rglob', autospec=True, side_effect=Path.rglob) as disturbed,
         ):
             results = queue.get_by_task('4176', status=None)
-        patterns = [c.args[1] for c in rglob_spy.call_args_list]
 
         assert [e.id for e in results] == ['esc-4176-1'], (
             f'Expected only the surviving record after the archive copy was '
@@ -2277,14 +2284,15 @@ class TestGetByTaskRecoversRecordRelocatedMidScan:
         )
         assert not archive_copy.parent.exists(), (
             f'Expected the interposition to have pruned {archive_copy.parent}; '
-            f'without that the pin below is vacuous'
+            f'without that the walk count below is vacuous'
         )
-        assert 'esc-*.json' in patterns, (
-            f"Expected the spy to see the scan's own archive-tier glob; got {patterns}"
+        assert undisturbed.call_count > 0, (
+            'Expected the spy to observe the undisturbed scan walking the archive; '
+            'without that the walk count below is vacuous'
         )
-        assert 'esc-4176-2.json' not in patterns, (
-            f'Expected no targeted archive re-probe for an archive-tier vanish; '
-            f'got rglob patterns {patterns}'
+        assert disturbed.call_count == undisturbed.call_count, (
+            f'Expected no extra archive walk for an archive-tier vanish; undisturbed '
+            f'walks {undisturbed.call_args_list}, disturbed walks {disturbed.call_args_list}'
         )
 
 
