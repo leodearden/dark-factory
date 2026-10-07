@@ -1051,17 +1051,16 @@ async def poll_until_dead(
     *,
     group_id: str | None = None,
     expected_dead: int,
-    timeout: float = 5.0,
+    timeout: float = 20.0,
 ) -> None:
     """Poll queue stats until at least *expected_dead* items have status='dead'.
 
     Poll-based, never a fixed sleep: the suites run under ``-n auto`` with a
     60s per-test timeout that kills the whole worker, so a fixed window either
-    wastes time on a fast host or races on a loaded one. Shared by
-    test_durable_queue.py, test_durable_queue_selfref_classifier.py and
-    test_queue_stats_tool.py. last_counts is a side-channel capture so the
-    timeout message can still report the latest observed counts, since
-    poll_until's message is static.
+    wastes time on a fast host or races on a loaded one. The 20s default
+    absorbs that load while staying well under the per-test timeout.
+    last_counts is a side-channel capture so the timeout message can still
+    report the latest observed counts, since poll_until's message is static.
     """
     last_counts: dict = {}
 

@@ -391,7 +391,7 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
                 group_id='proj1', operation=_IDENTITY_OP,
                 payload={'uuid': u, 'name': 'ep', 'content': 'c', 'group_id': 'proj1'},
             )
-            await poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
             dead = await q.get_dead_items()
             assert len(dead) == 1
@@ -430,7 +430,7 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
                     'name': 'ep', 'content': 'c', 'group_id': 'proj1',
                 },
             )
-            await poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
             dead = await q.get_dead_items()
             assert dead[0]['attempts'] == 5, (
@@ -454,7 +454,7 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
                 group_id='proj1', operation=_IDENTITY_OP,
                 payload={'uuid': u, 'name': 'ep', 'content': 'c', 'group_id': 'proj1'},
             )
-            await poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
             dead = await q.get_dead_items()
             assert dead[0]['attempts'] == 5, (
@@ -477,7 +477,7 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
                 group_id='proj1', operation='add_memory_graphiti',
                 payload={'uuid': u, 'content': 'c', 'group_id': 'proj1'},
             )
-            await poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
             dead = await q.get_dead_items()
             assert dead[0]['attempts'] == 5, (
@@ -543,9 +543,7 @@ class TestDeadLetterLogNamesOperationAndGroup:
                     group_id='proj-alpha', operation='add_episode',
                     payload={'content': 'c', 'group_id': 'proj-alpha', 'name': 'ep'},
                 )
-                await poll_until_dead(
-                    q, group_id='proj-alpha', expected_dead=1, timeout=20.0
-                )
+                await poll_until_dead(q, group_id='proj-alpha', expected_dead=1)
 
             warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
             assert any(
@@ -585,9 +583,7 @@ class TestDeadLetterLogNamesOperationAndGroup:
                     group_id='proj-alpha', operation=_IDENTITY_OP,
                     payload={'uuid': u, 'content': 'c', 'group_id': 'proj-alpha'},
                 )
-                await poll_until_dead(
-                    q, group_id='proj-alpha', expected_dead=1, timeout=20.0
-                )
+                await poll_until_dead(q, group_id='proj-alpha', expected_dead=1)
 
             warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
             assert any('permanent' in r.getMessage() for r in warnings), (

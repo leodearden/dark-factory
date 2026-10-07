@@ -110,7 +110,7 @@ class TestGetQueueStatsConsistencyWithDeadLetters:
                 group_id='proj_b', operation='add_episode',
                 payload={'content': 'b0', 'group_id': 'proj_b', 'name': 'b0'},
             )
-            await poll_until_dead(q, expected_dead=3, timeout=20.0)
+            await poll_until_dead(q, expected_dead=3)
 
             svc = AsyncMock()
             svc.durable_queue = q
@@ -240,7 +240,7 @@ class TestGetQueueStatsDeadByOperation:
                 group_id='proj_b', operation='add_memory_graphiti',
                 payload={'content': 'b0', 'group_id': 'proj_b'},
             )
-            await poll_until_dead(q, expected_dead=3, timeout=20.0)
+            await poll_until_dead(q, expected_dead=3)
 
             svc = AsyncMock()
             svc.durable_queue = q

@@ -921,7 +921,7 @@ class TestPollUntil:
 # ---------------------------------------------------------------------------
 # Tests for the shared poll_until_dead() dead-letter waiter (task 4847)
 # ---------------------------------------------------------------------------
-# One waiter for the three durable-queue suites. A scripted get_stats stands in
+# One waiter shared by the durable-queue suites. A scripted get_stats stands in
 # for the queue, so these pin call counts and the timeout message only.
 
 class _ScriptedStatsQueue:
