@@ -102,9 +102,11 @@ class TestModuleLevelAll:
             'TranscriptEvidence',
             'build_failure_message',
             'classify_agent_failure',
+            'classify_cap_kill',
             'count_transcript_turns',
             'detect_ended_awaiting_background',
             'detect_resumable_progress',
+            'detect_transcript_model_id',
             'ended_awaiting_background_for_session',
             'invoke_claude_agent',
             'invoke_with_cap_retry',
@@ -119,6 +121,7 @@ class TestModuleLevelAll:
             'transcript_evidence',
             'transcript_evidence_for_session',
             'transcript_exists',
+            'transcript_model_id_for_session',
         }
 
     def test_usage_gate_all(self):

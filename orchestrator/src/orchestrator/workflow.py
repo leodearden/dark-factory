@@ -32,6 +32,7 @@ from shared.cli_invoke import (
     AgentFailureKind,
     AllAccountsCappedException,
     classify_agent_failure,
+    classify_cap_kill,
     invoke_with_cap_retry,
     is_server_error_status,
     is_timed_out_with_progress,
@@ -14079,6 +14080,11 @@ class TaskWorkflow:
             },
         )
 
+        capped_reason = classify_cap_kill(
+            result, budget_usd=budget, max_turns=max_turns_val, backend=backend_val,
+        )
+        capped = capped_reason is not None
+
         if self.event_store:
             self.event_store.emit(
                 EventType.invocation_end,
@@ -14113,6 +14119,13 @@ class TaskWorkflow:
                     # false-positive rate computable from runs.db, since a
                     # True-only key leaves the denominator unknowable.
                     'ended_awaiting_background': result.ended_awaiting_background,
+                    # Same present-and-false rationale for the cap pair, so
+                    # ceiling saturation is computable.  model_id is the exact
+                    # CLI-served version beside the alias in `model`; None
+                    # means unknown.
+                    'model_id': result.model_id,
+                    'capped': capped,
+                    'capped_reason': capped_reason,
                 },
             )
 
@@ -14142,7 +14155,9 @@ class TaskWorkflow:
                     cache_read_tokens=result.cache_read_tokens,
                     cache_create_tokens=result.cache_create_tokens,
                     duration_ms=result.duration_ms,
-                    capped=False,
+                    capped=capped,
+                    capped_reason=capped_reason,
+                    model_id=result.model_id,
                     started_at=started_at,
                     completed_at=completed_at,
                 )

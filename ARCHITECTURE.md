@@ -972,7 +972,7 @@ design is in [RECONCILIATION_PLAN.md](RECONCILIATION_PLAN.md).
 |---|---|---|
 | Event store | `data/orchestrator/runs.db`, table `events` | Append-only structured events: invocation start/end, routing decisions, phase enter/exit, escalation created/resolved, merge events, train events, scheduler paused/resumed, worktree quarantined/reaped, retry-cap-exhausted, external-dep-gate-held, config-reload, and more |
 | Run/task results | same DB, tables `runs`/`task_results`/`scheduler_state` | Per-run rollups, per-task outcome/cost/duration, persisted scheduler pause state |
-| Cost ledger | same DB, tables `invocations`/`account_events` | Per-LLM-call cost, tokens, model, role, account; enforces daily cost ceilings |
+| Cost ledger | same DB, tables `invocations`/`account_events` | Per-LLM-call cost, tokens, role, account; `model` is the routing lineage alias (`opus`), `model_id` the exact CLI-served version (`claude-opus-5`, NULL when unknown); `capped`/`capped_reason` record which ceiling ended a run (`shared/src/shared/cost_store.py::CapReason`). Enforces daily cost ceilings |
 | Merge queue (live) | `mcp__escalation__get_merge_queue` | In-flight/queued requests, conflict graph, frozen prefix, metrics — the blind spot the event store alone misses |
 | Task runtime snapshot | `mcp__escalation__get_task_runtime_state` | Live per-task phase/loop/attempt projection |
 | Escalations | `data/escalations/` + `get_pending_escalations`/`get_escalation` | Open L0/L1/L2 escalations, categories, resolution history |
