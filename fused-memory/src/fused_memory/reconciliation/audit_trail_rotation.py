@@ -644,6 +644,7 @@ class RotationOutcome:
     archive_memory_id: str | None = None
     over_threshold_after: bool | None = None
     unrotatable: Mapping[str, Any] | None = None
+    description_rewritten: bool = False
     committed_task: Mapping[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -656,6 +657,7 @@ class RotationOutcome:
             'archive_memory_id': self.archive_memory_id,
             'over_threshold_after': self.over_threshold_after,
             'unrotatable': None if self.unrotatable is None else dict(self.unrotatable),
+            'description_rewritten': self.description_rewritten,
         }
 
 
@@ -709,6 +711,7 @@ async def bound_audit_trail(
         bytes_after=bytes_after,
         archive_memory_id=archive_memory_id,
         over_threshold_after=bytes_after > ROTATE_THRESHOLD_BYTES,
+        description_rewritten=rewrite.description is not None,
         committed_task=committed,
     )
 
