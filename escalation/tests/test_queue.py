@@ -17,7 +17,12 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from _scan_race_helpers import pruning_read_text, relocating_read_text, unreadable_read_text
+from _scan_race_helpers import (
+    deleting_read_text,
+    pruning_read_text,
+    relocating_read_text,
+    unreadable_read_text,
+)
 
 from escalation.classify import effective_benign
 from escalation.models import Escalation
@@ -2048,14 +2053,8 @@ class TestGetRetriesRelocationBetweenLocateAndRead:
         queue.submit(_make_escalation('esc-1-1', task_id='1'))
 
         doomed = queue.queue_dir / 'esc-1-1.json'
-        original_read_text = Path.read_text
 
-        def deleting_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
-            if self == doomed and doomed.exists():
-                doomed.unlink()
-            return original_read_text(self, *args, **kwargs)
-
-        with patch.object(Path, 'read_text', deleting_read_text):
+        with patch.object(Path, 'read_text', deleting_read_text(doomed)):
             result = queue.get('esc-1-1')
 
         assert result is None
@@ -2194,14 +2193,8 @@ class TestGetByTaskRecoversRecordRelocatedMidScan:
         queue.submit(_make_escalation('esc-4176-2', task_id='4176', status='resolved'))
 
         doomed = queue.queue_dir / 'esc-4176-2.json'
-        original_read_text = Path.read_text
 
-        def deleting_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
-            if self == doomed and doomed.exists():
-                doomed.unlink()
-            return original_read_text(self, *args, **kwargs)
-
-        with patch.object(Path, 'read_text', deleting_read_text):
+        with patch.object(Path, 'read_text', deleting_read_text(doomed)):
             results = queue.get_by_task('4176', status=None)
 
         assert [e.id for e in results] == ['esc-4176-1'], (
