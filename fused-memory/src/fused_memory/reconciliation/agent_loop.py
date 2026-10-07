@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import uuid as uuid_mod
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,7 +18,6 @@ if TYPE_CHECKING:
 
 from shared.cli_invoke import (
     AgentFailureKind,
-    AgentResult,
     build_failure_message,
     classify_agent_failure,
     invoke_with_cap_retry,
@@ -31,54 +30,49 @@ from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SE
 
 logger = logging.getLogger(__name__)
 
-# The CLOSED vocabulary of CLI-failure origins run() will propagate as
-# `warning_origin` (task 4343).  All three members are synthesised by
-# _call_claude_cli below ('api_refusal' since task 6022); nothing else may
-# enter, because the value lands in VerificationResult.failure_token and from
-# there in the reconciliation.db `verify/codebase` audit row that operators
-# GROUP BY.  An unbounded or agent-controlled token there would make that
-# census unqueryable.
-CLI_WARNING_ORIGINS = frozenset({'cli_output_unparseable', 'cli_output_empty', 'api_refusal'})
-
-# No free-text or reasoning property: a required "thinking" field got verify
-# refused by the API's reasoning_extraction classifier (task 6022).  The
-# measurements live in fused-memory/scripts/probe_schema_max_turns.py's docstring.
-CLAUDE_CLI_RESPONSE_SCHEMA = {
-    'type': 'object',
-    'properties': {
-        'tool_calls': {
-            'type': 'array',
-            'items': {
-                'type': 'object',
-                'properties': {
-                    'id': {'type': 'string'},
-                    'name': {'type': 'string'},
-                    'input': {'type': 'object'},
-                },
-                'required': ['id', 'name', 'input'],
-            },
-        },
-    },
-    'required': ['tool_calls'],
+# CLI failure kinds that end a claude_cli run as an audited agent failure
+# instead of raising, each mapped to its census token.  'api_refusal' since
+# task 6022; 'cli_max_turns' since task 4344, when one invocation came to carry
+# the whole investigation.  Every other failure kind still raises.
+_CLI_FAILURE_ORIGINS = {
+    AgentFailureKind.API_REFUSAL: 'api_refusal',
+    AgentFailureKind.MAX_TURNS: 'cli_max_turns',
 }
 
-# max_turns for ONE reconciliation-agent CLI invocation.  It caps a single
-# assistant round-trip, not the conversation: AgentLoop.run() drives multi-turn
-# externally, one _call_claude_cli per outer step (bounded by
-# ``agent_max_steps``), threaded with ``resume_session_id``.
+# The CLOSED vocabulary of CLI-failure origins run() reports as
+# `warning_origin` (task 4343).  All four members are synthesised by
+# _call_claude_cli; nothing else may enter, because the value lands in
+# VerificationResult.failure_token and from there in the reconciliation.db
+# `verify/codebase` audit row that operators GROUP BY.  An unbounded or
+# agent-controlled token there would make that census unqueryable.
+CLI_WARNING_ORIGINS = frozenset({
+    'cli_output_unparseable',
+    'cli_output_empty',
+    *_CLI_FAILURE_ORIGINS.values(),
+})
+
+# max_turns for the claude_cli provider's ONE invocation, which carries the
+# WHOLE investigation: the CLI runs its own built-in tools turn by turn and
+# ends with StructuredOutput.
 #
 # Never 1.  With --json-schema the model emits a prose turn before it calls
 # ``StructuredOutput``, and a cap of 1 leaves no room for it: the CLI returns
 # ``error_max_turns``, which in the measured runs carried no structured payload,
 # so schema salvage had nothing to recover and the call failed.  That is
-# measured CLI behaviour, not a guarantee — the rates, sample sizes and CLI
-# versions are recorded only in fused-memory/scripts/probe_schema_max_turns.py;
-# re-run it rather than trusting a number copied elsewhere.
+# measured CLI behaviour, not a guarantee.
 #
-# 10 over-provisions deliberately: max_turns is a ceiling, not a target, and
-# spend stays bounded by cli_invoke's ``max_budget_usd`` and
-# ``agent_cli_timeout_seconds``.
-_AGENT_CLI_MAX_TURNS = 10
+# 20 is the measured configuration, a ceiling rather than a target; spend stays
+# bounded by cli_invoke's ``max_budget_usd`` and ``agent_cli_timeout_seconds``.
+# The rates, turn counts and CLI versions are recorded only in
+# fused-memory/scripts/probe_schema_max_turns.py's docstring; re-run it rather
+# than trusting a number copied elsewhere.
+_AGENT_CLI_MAX_TURNS = 20
+
+
+def _cli_failure_payload(origin: str, text: str) -> dict:
+    """The single constructor of a CLI no-tool-call exit carrying *origin*."""
+    assert origin in CLI_WARNING_ORIGINS, origin
+    return {'warning': 'no_tool_calls', 'text': text, 'warning_origin': origin}
 
 
 class CircuitBreakerError(Exception):
@@ -106,7 +100,17 @@ class ToolDefinition:
 
 
 class AgentLoop:
-    """Runs an LLM agent with tool access until it signals completion."""
+    """Runs an LLM agent with tool access until it signals completion.
+
+    Two transports:
+
+    * The in-process providers (anthropic/openai) dispatch ``tools`` step by
+      step until ``terminal_tool`` is called.
+    * The claude_cli provider runs the whole loop inside ONE CLI invocation
+      that uses the CLI's own built-in ``cli_tools``.  There ``tools``
+      contributes only the terminal tool's ``parameters``, used as the CLI
+      output schema.
+    """
 
     def __init__(
         self,
@@ -116,22 +120,17 @@ class AgentLoop:
         terminal_tool: str = 'stage_complete',
         usage_gate=None,
         cwd: Path | None = None,
+        cli_tools: Sequence[str] = (),
     ):
-        # NOTE: for recon stages running via the CLI path (production), the effective
-        # terminal action is `mcp__recon-report__complete` — the stage agent calls that
-        # tool to signal completion and the assembled ReconReportState is the authoritative
-        # output channel.  `terminal_tool` here gates the in-process anthropic/openai path
-        # only; the CLI path terminates on the agent's own stop signal after the last tool
-        # result, so the default 'stage_complete' value is not exercised in that path.
         self.config = config
         self.system_prompt = system_prompt
         self.tools = tools
         self.terminal_tool = terminal_tool
+        self.cli_tools: tuple[str, ...] = tuple(cli_tools)
         self._journal_entries: list[JournalEntry] = []
         self._mutation_count: int = 0
         self.llm_call_count: int = 0
         self.token_count: int = 0
-        self._cli_session_id: str | None = None
         self._usage_gate = usage_gate
         # Task 4722 / PRD D5: the codebase root this agent runs in.  The
         # verifier now supplies the TASK's own project root per call; every
@@ -142,6 +141,11 @@ class AgentLoop:
 
     async def run(self, initial_payload: str) -> tuple[dict, list[JournalEntry]]:
         """Execute agent loop. Returns (terminal_tool_args, journal_entries)."""
+        if self.config.agent_llm_provider == 'claude_cli':
+            # Nothing executes in-process on this transport, so the journal
+            # stays empty.
+            return await self._call_claude_cli(initial_payload), self._journal_entries
+
         messages: list[dict[str, Any]] = [
             {'role': 'user', 'content': initial_payload},
         ]
@@ -159,35 +163,7 @@ class AgentLoop:
             if not tool_use_blocks:
                 # No tool calls — agent stopped
                 text = ' '.join(b.text for b in text_blocks) if text_blocks else ''
-                payload: dict = {'warning': 'no_tool_calls', 'text': text}
-                # Task 4343: surface the SPECIFIC failure origin additively.
-                # `warning` stays generic unconditionally — extract_agent_verdict
-                # derives its 'agent-failed:<token>' sentinel from it — while
-                # `warning_origin` carries the actionable diagnosis when one
-                # exists.  getattr with a default (not a bare read) is required:
-                # only _CLIResponseAdapter has `.warning`; the anthropic and
-                # OpenAI adapters do not.  The key is omitted entirely when
-                # there is no origin, rather than emitting an empty string that
-                # would read like a measured value.
-                #
-                # The membership test is load-bearing, not belt-and-braces:
-                # _CLIResponseAdapter.warning is structured_output['warning'],
-                # which is only OUR synthesised token when _call_claude_cli built
-                # the dict — on a real turn it is whatever the agent's own JSON
-                # happened to put there.  Propagating that unchecked would let
-                # agent-controlled content (or a non-str) reach
-                # VerificationResult.failure_token, which is a closed-vocabulary
-                # census column an operator groups by.  Unknown values are
-                # dropped: the generic 'no_tool_calls' still travels in
-                # `warning`, so nothing is silently lost.
-                # isinstance before the membership test: an unhashable value
-                # (a dict from agent-authored JSON) makes `in frozenset` raise
-                # TypeError, which would escape run() and turn a recoverable
-                # no-tool-call exit into a crash.
-                origin = getattr(response, 'warning', '')
-                if isinstance(origin, str) and origin in CLI_WARNING_ORIGINS:
-                    payload['warning_origin'] = origin
-                return payload, self._journal_entries
+                return {'warning': 'no_tool_calls', 'text': text}, self._journal_entries
 
             tool_results = []
             terminal_result = None
@@ -297,10 +273,6 @@ class AgentLoop:
             return response
         elif provider == 'openai':
             return await self._call_openai(messages, tool_schemas)
-        elif provider == 'claude_cli':
-            content = messages[-1]['content']
-            prompt = content if isinstance(content, str) else self._serialize_tool_results(content)
-            return await self._call_claude_cli(prompt=prompt, tools=tool_schemas)
         else:
             raise ValueError(f'Unsupported agent LLM provider: {provider}')
 
@@ -368,153 +340,72 @@ class AgentLoop:
         # Convert OpenAI response to Anthropic-like structure
         return _OpenAIResponseAdapter(response)
 
-    def _build_cli_system_prompt(self, tool_schemas: list[ToolParam]) -> str:
-        """Build system prompt that includes tool schemas for CLI-based tool dispatch."""
-        tools_section = []
-        for t in tool_schemas:
-            tools_section.append(
-                f"### {t['name']}\n"
-                f"{t.get('description', '')}\n"
-                f"Parameters: {json.dumps(t['input_schema'], indent=2)}"
+    def _cli_system_prompt(self) -> str:
+        """The caller's system prompt plus how to finish on the CLI transport.
+
+        Names only the CLI's own tools and StructuredOutput: any in-process
+        tool name reaching the CLI, the terminal tool's included, is one the
+        model may try to call natively, and the CLI rejects every such call.
+        """
+        if self.cli_tools:
+            tools_line = (
+                f'Investigate with your {", ".join(self.cli_tools)} tools; they work '
+                'inside your working directory and no other tool is available.'
             )
+        else:
+            tools_line = 'No tool is available to you for investigation.'
         return (
-            f"{self.system_prompt}\n\n"
-            "## Available Tools\n"
-            "Respond with a JSON object matching the provided schema.\n"
-            "Use the tool_calls array to invoke tools. Each tool call needs:\n"
-            '- "id": a unique string identifier\n'
-            '- "name": the tool name from the list below\n'
-            '- "input": an object matching the tool\'s parameters\n\n'
-            "If you have no more tool calls to make, return an empty tool_calls array.\n\n"
-            + "\n\n".join(tools_section)
+            f'{self.system_prompt}\n\n## Tools and finishing\n'
+            f'{tools_line} When you are done, call StructuredOutput once with your '
+            'findings. That call is your final answer.'
         )
 
-    @staticmethod
-    def _serialize_tool_results(tool_results: list[dict]) -> str:
-        """Format tool results as text for the next CLI turn."""
-        parts = []
-        for tr in tool_results:
-            if isinstance(tr, dict) and tr.get('type') == 'tool_result':
-                status = 'ERROR' if tr.get('is_error') else 'OK'
-                parts.append(
-                    f"[Tool Result: {tr['tool_use_id']}] ({status})\n{tr['content']}"
-                )
-        return '\n\n'.join(parts)
+    async def _call_claude_cli(self, prompt: str) -> dict:
+        """Run the whole investigation as ONE Claude CLI invocation.
 
-    async def _call_claude_cli(self, prompt: str, tools: list[ToolParam]) -> _CLIResponseAdapter:
-        """Delegate to shared.cli_invoke.invoke_with_cap_retry.
-
-        Multi-turn is handled by passing ``resume_session_id`` on subsequent
-        calls; ``_call_llm`` is responsible for serialising tool results into
-        the next turn's prompt before calling this method. ``resume_delivers_prompt=True``
-        is what actually gets that serialised prompt to the CLI on turn >= 2 —
-        without it, ``invoke_with_cap_retry`` overwrites ``prompt`` with the
-        short crash-recovery continuation string before ever making the call.
-
-        ``_cli_session_id`` is cleared to ``None`` before any exception propagates
-        out of this method — whether from ``invoke_with_cap_retry`` itself (e.g.
-        ``AllAccountsCappedException`` after the retry loop gives up) or from the
-        ``not result.success`` failure guard below — so that a subsequent
-        reconciliation retry on the same ``AgentLoop`` instance does not attempt to
-        ``--resume`` an abandoned or capped session.  An API usage-policy refusal
-        is the one failure that returns instead of raising (see
-        ``_api_refusal_response``); it clears the session id too.
+        Returns the terminal tool's payload, or a ``_cli_failure_payload`` for
+        a CLI failure in ``_CLI_FAILURE_ORIGINS`` or a structured output that
+        is unparseable or empty.  Every other failure raises RuntimeError.
         """
-        try:
-            result: AgentResult = await invoke_with_cap_retry(
-                usage_gate=self._usage_gate,
-                label=f'Reconciliation agent ({self.config.agent_llm_model})',
-                prompt=prompt,
-                system_prompt=self._build_cli_system_prompt(tools),
-                output_schema=CLAUDE_CLI_RESPONSE_SCHEMA,
-                disallowed_tools=['*'],
-                # Closes MCP separately from the wildcard deny above, which the
-                # schema turns into --tools '' (no MCP filter). Must stay truthy, or
-                # --strict-mcp-config is never emitted (build_claude_argv gates it
-                # on `if mcp_config:`).
-                mcp_config=no_mcp_servers_config(),
-                strict_mcp_config=True,
-                model=self.config.agent_llm_model,
-                # See _AGENT_CLI_MAX_TURNS for why this is not 1.
-                max_turns=_AGENT_CLI_MAX_TURNS,
-                permission_mode='bypassPermissions',
-                timeout_seconds=float(self.config.agent_cli_timeout_seconds),
-                resume_session_id=self._cli_session_id,
-                # This loop's --resume is its NORMAL operating mode, not crash
-                # recovery: each turn's prompt is _serialize_tool_results(...),
-                # computed in Python and never replayed in the CLI transcript
-                # (disallowed_tools=['*'] above), so it exists nowhere else.
-                # Without resume_delivers_prompt=True, cli_invoke.py would
-                # replace it with CRASH_RECOVERY_RESUME_PROMPT and the turn's
-                # tool results would be silently and unrecoverably lost.
-                # Passed unconditionally (not gated on _cli_session_id): it is
-                # already inert on turn 1 since cli_invoke only reads it inside
-                # `if invoke_kwargs.get('resume_session_id'):`.
-                resume_delivers_prompt=True,
-                # Robustness caveat (not a live bug): resume_delivers_prompt=True
-                # makes this a "live continuation" caller per invoke_with_cap_retry's
-                # own contract (cli_invoke.py:1600-1603, 1703-1706, 2071-2074) — its
-                # original_prompt (the bare _serialize_tool_results(...) string, with
-                # no conversation context) is only meaningful *inside* the resumed
-                # session. If that session is lost, the gated retry loop's
-                # rebuild_prompt hook is what reconstructs a self-contained prompt for
-                # the fresh session it starts instead; this call passes none. That is
-                # harmless today ONLY because AgentLoop's sole production caller
-                # (verify.py) never supplies a real usage_gate, so this call always
-                # takes the gate-less fast path (cli_invoke.py:1507) and never reaches
-                # the resume-to-fresh fallback, auth-failover, or zero-output-wedge
-                # branches that would invoke rebuild_prompt. If AgentLoop is ever
-                # constructed with a real usage_gate, add a rebuild_prompt hook here
-                # at the same time.
-                # Task 1989 (sweep verdict): kept at the CODEBASE root (now the
-                # per-call one, task 4722) rather than a neutral cwd. This is a
-                # multi-turn agent that actively adjudicates memory-vs-codebase
-                # discrepancies, and the auto-loaded CLAUDE.md is plausibly its
-                # main passive codebase signal.
-                #
-                # This cwd is a project root and may hold a live .mcp.json, which
-                # bypassPermissions would otherwise let the CLI ambient-merge and
-                # expose unreviewed. disallowed_tools=['*'] above does NOT cover
-                # that: with output_schema set, cli_invoke turns the wildcard
-                # into --tools '', which removes built-in and deferred tools but
-                # does not filter MCP. MCP tools are closed SEPARATELY,
-                # by the mcp_config=no_mcp_servers_config() + strict_mcp_config=True
-                # pair above — which must stay truthy, since --strict-mcp-config is
-                # emitted only inside build_claude_argv's `if mcp_config:` block.
-                # Both kwargs survive every cap-retry resume: _reset_for_fresh_retry
-                # touches only resume_session_id/prompt/session_id, and the `if
-                # mcp_config:` argv block sits outside the resume conditional.
-                # Confirmed by reading shared/cli_invoke.py, but NOT independently
-                # pinned by a resume-path test at that layer — a future refactor
-                # that moved the mcp_config handling into build_claude_argv's
-                # `elif session_id:` branch would silently reopen this for every
-                # turn >= 2 with a green suite here. Tracked as a follow-up test
-                # in shared/tests/test_build_claude_argv.py (out of this task's
-                # locked-module scope).
-                cwd=self.cwd,
-                cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+        terminal = self.tools.get(self.terminal_tool)
+        if terminal is None:
+            raise ValueError(
+                f'the claude_cli provider needs the terminal tool {self.terminal_tool!r} '
+                'in tools: its parameters are the CLI output schema'
             )
-            # Counted before the failure guard: a failed or refused result still
-            # reached the model and was billed.
-            self.llm_call_count += 1
-            self.token_count += (result.input_tokens or 0) + (result.output_tokens or 0)
+        result = await invoke_with_cap_retry(
+            usage_gate=self._usage_gate,
+            label=f'Reconciliation agent ({self.config.agent_llm_model})',
+            prompt=prompt,
+            system_prompt=self._cli_system_prompt(),
+            output_schema=terminal.parameters,
+            available_tools=list(self.cli_tools),
+            # No allow rules: under dontAsk the CLI's built-in read tools stay
+            # confined to cwd (measured; see the probe script's docstring).
+            permission_mode='dontAsk',
+            # --tools does not filter MCP, so MCP is closed by the strict empty
+            # config.  cwd is the codebase root (tasks 1989/4722), which may
+            # hold a live .mcp.json.
+            mcp_config=no_mcp_servers_config(),
+            strict_mcp_config=True,
+            model=self.config.agent_llm_model,
+            # See _AGENT_CLI_MAX_TURNS for why this is not 1.
+            max_turns=_AGENT_CLI_MAX_TURNS,
+            timeout_seconds=float(self.config.agent_cli_timeout_seconds),
+            cwd=self.cwd,
+            cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS,
+        )
+        # Counted before the failure guard: a failed or refused result still
+        # reached the model and was billed.
+        self.llm_call_count += 1
+        self.token_count += (result.input_tokens or 0) + (result.output_tokens or 0)
 
-            if not result.success:
-                # schema_salvaged=True implies success=True (see the
-                # ``schema_salvaged`` assignment in cli_invoke's CLI result
-                # parser), so `not result.success` is the complete failure guard.
-                # Salvage is not the backstop here (see _AGENT_CLI_MAX_TURNS):
-                # this guard is what fires on an ``error_max_turns`` failure.
-                failure = classify_agent_failure(result)
-                if failure.kind == AgentFailureKind.API_REFUSAL:
-                    return self._api_refusal_response(result)
+        if not result.success:
+            origin = _CLI_FAILURE_ORIGINS.get(classify_agent_failure(result).kind)
+            if origin is None:
                 raise RuntimeError(build_failure_message('Claude CLI agent', result))
-        except Exception:
-            # Clear stale session id so callers that retry don't --resume an abandoned session.
-            self._cli_session_id = None
-            raise
-
-        self._cli_session_id = result.session_id or self._cli_session_id
+            logger.warning('%s: Claude CLI agent failed. Output: %s', origin, result.output[:500])
+            return _cli_failure_payload(origin, result.output)
 
         structured = result.structured_output
         if isinstance(structured, str):
@@ -523,42 +414,17 @@ class AgentLoop:
             except json.JSONDecodeError:
                 logger.warning(
                     'cli_output_unparseable: Claude CLI reported success but structured_output'
-                    ' was unparseable JSON; treating as empty tool-call turn. Raw prefix: %s',
+                    ' was unparseable JSON. Raw prefix: %s',
                     structured[:200],
                 )
-                # Token must stay a member of CLI_WARNING_ORIGINS (top of file)
-                # or run() will drop it as unknown.
-                structured = {'text': structured, 'tool_calls': [], 'warning': 'cli_output_unparseable'}
-        if not structured:
+                return _cli_failure_payload('cli_output_unparseable', structured)
+        if not structured or not isinstance(structured, dict):
             logger.warning(
                 'cli_output_empty: Claude CLI reported success but structured_output'
-                ' was empty/missing; treating as empty tool-call turn.',
+                ' was empty, missing or not an object.',
             )
-            # Token must stay a member of CLI_WARNING_ORIGINS (top of file)
-            # or run() will drop it as unknown.
-            structured = {'text': '', 'tool_calls': [], 'warning': 'cli_output_empty'}
-
-        return _CLIResponseAdapter(structured, session_id=result.session_id)
-
-    def _api_refusal_response(self, result: AgentResult) -> _CLIResponseAdapter:
-        """End the turn with no tool calls because the API refused the call (task 6022).
-
-        Returning instead of raising lets run() carry the 'api_refusal' origin
-        through to verify()'s failure_token, which gives an audited agent_failed
-        row rather than a prose-only error row.  The CLI says a refused session
-        cannot be continued, so the session is never resumed.
-        """
-        logger.warning(
-            'api_refusal: Claude CLI agent was refused by API usage-policy safeguards;'
-            ' treating as empty tool-call turn. Output: %s',
-            result.output[:500],
-        )
-        self._cli_session_id = None
-        # Token must stay a member of CLI_WARNING_ORIGINS (top of file)
-        # or run() will drop it as unknown.
-        return _CLIResponseAdapter(
-            {'text': result.output, 'tool_calls': [], 'warning': 'api_refusal'}
-        )
+            return _cli_failure_payload('cli_output_empty', '')
+        return structured
 
 
 class _OpenAIResponseAdapter:
@@ -581,72 +447,6 @@ class _OpenAIResponseAdapter:
                         input=json.loads(tc.function.arguments),
                     )
                 )
-
-
-class _CLIResponseAdapter:
-    """Adapts Claude CLI structured output to look like Anthropic Messages response.
-
-    Exposes both the legacy ``.content`` list (for drop-in compatibility with
-    the anthropic/openai branches) and direct attribute access (for
-    delegation-level tests and future callers that don't need the block list):
-    ``.text``, ``.tool_calls``, ``.session_id``, ``.warning``.
-
-    ``.text`` carries only the diagnostic text of the dicts ``_call_claude_cli``
-    synthesises itself.  ``CLAUDE_CLI_RESPONSE_SCHEMA`` deliberately declares
-    no free-text property, so a real turn never fills it (task 6022).
-
-    Note on ``.warning``: this attribute surfaces the specific CLI-failure
-    token (``'cli_output_unparseable'`` — the CLI returned junk —
-    ``'cli_output_empty'`` — the CLI returned nothing — or ``'api_refusal'``
-    — the API's usage-policy safeguards refused the call) to the log and to
-    delegation-level tests.  Task 4343 is the revisit this docstring used to
-    invite: ``AgentLoop.run()`` now **does** propagate the token, under the
-    separate ``warning_origin`` key.  ``warning`` itself stays generic
-    (``'no_tool_calls'``) unconditionally, so site-22's
-    ``extract_agent_verdict`` still converts it into the loud
-    ``'agent-failed:no_tool_calls'`` sentinel and the adapter-independent
-    tests that pin that shape stay green — the additive key was chosen
-    precisely to avoid renegotiating either contract.
-
-    The downstream consumer that needed the distinction is targeted.py's
-    ``verify/codebase`` audit row: it stores the token in
-    ``VerificationResult.failure_token`` so an operator reading
-    ``reconciliation.db`` can tell an empty CLI response from an unparseable
-    one without re-running anything.
-
-    Because this attribute is just ``structured_output['warning']``, it holds
-    OUR synthesised token only when ``_call_claude_cli`` built the dict; on a real
-    turn it is whatever the agent's own JSON put under that key.  ``run()``
-    therefore propagates it only if it is a member of ``CLI_WARNING_ORIGINS``.
-    """
-
-    def __init__(self, structured_output: dict, session_id: str = ''):
-        self.content = []
-        self.usage = _CLIUsage()
-
-        # Direct attribute access
-        self.text: str = structured_output.get('text', '')
-        self.tool_calls: list = structured_output.get('tool_calls', [])
-        self.session_id: str = session_id
-        self.warning: str = structured_output.get('warning', '')
-
-        if self.text:
-            self.content.append(_TextBlock(self.text))
-
-        for tc in self.tool_calls:
-            self.content.append(
-                _ToolUseBlock(
-                    id=tc.get('id', str(uuid_mod.uuid4())),
-                    name=tc['name'],
-                    input=tc.get('input', {}),
-                )
-            )
-
-
-@dataclass
-class _CLIUsage:
-    input_tokens: int = 0
-    output_tokens: int = 0
 
 
 @dataclass

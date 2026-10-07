@@ -1511,7 +1511,14 @@ class ReconciliationConfig(BaseModel):
     agent_llm_provider: str = Field(default='claude_cli')
     agent_llm_model: str = Field(default='sonnet')
     agent_max_tokens: int = Field(default=8192)
-    agent_max_steps: int = Field(default=50)
+    agent_max_steps: int = Field(
+        default=50,
+        description=(
+            'Outer tool-dispatch steps for the in-process agent providers '
+            '(anthropic/openai). The claude_cli provider runs its loop inside one '
+            'CLI invocation capped by agent_loop.py::_AGENT_CLI_MAX_TURNS instead.'
+        ),
+    )
 
     # Judge settings
     judge_enabled: bool = Field(default=True)
@@ -1631,7 +1638,8 @@ class ReconciliationConfig(BaseModel):
         default=180,
         gt=0,
         description=(
-            'Wall-clock budget for a single agent_loop._call_claude_cli invocation. '
+            'Wall-clock budget for a single agent_loop._call_claude_cli invocation, '
+            'which carries the whole verification (task 4344). '
             'Distinct from stage_timeout_seconds (outer stage guard). '
             'Restores the pre-881 hard-coded 180s ceiling.'
         ),
