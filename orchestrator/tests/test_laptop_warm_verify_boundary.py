@@ -313,6 +313,22 @@ def drain_exited_stderr(
     return b''.join(chunks)
 
 
+def assert_watchdog_fire_trigger(text: str, expected: WatchdogTrigger, *, source: str) -> None:
+    """Assert *text* reports exactly the *expected* watchdog trigger and no other.
+
+    *source* names where *text* came from (a leader's stderr, a
+    RunnerUnavailable reason, a log record) in the failure message.
+    """
+    reported = sorted(
+        t.value for t in WatchdogTrigger if f'{WATCHDOG_FIRE_TRIGGER_TOKEN}={t.value}' in text
+    )
+    assert reported == [expected.value], (
+        f'{source}: expected exactly {WATCHDOG_FIRE_TRIGGER_TOKEN}={expected.value}, '
+        f'reported {reported or "no watchdog trigger (self-kill unattributable)"}; '
+        f'tail: {text[-2000:]!r}'
+    )
+
+
 def apply_dispatcher_env(monkeypatch) -> None:
     """Patch THIS process's os.environ for a direct (in-process) real-dispatcher call.
 
