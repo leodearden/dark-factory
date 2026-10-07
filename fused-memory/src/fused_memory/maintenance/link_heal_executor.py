@@ -106,6 +106,7 @@ PLAN_FORMAT = 'link-heal-plan/1'
 
 CAP_BIT = 'max_actions_per_run'
 STREAK_STOP = 'write_failure_streak'
+SHARE_STOP = 'adjudicated_share_ceiling'
 PLAN_DOCUMENT_STOP = 'plan_document_unwritten'
 
 
@@ -795,7 +796,9 @@ async def run_apply(
     """A writing run: heal the pending rows of *source*, oldest first.
 
     Raises :class:`ApprovalMismatch` before any run row when an approved sha
-    is not the pending plan's.
+    is not the pending plan's. When the adjudications behind the pending heals
+    trip a share ceiling, it files each share escape and writes nothing,
+    attended or not.
     """
     pending = ledger.pending_actions(source)
     attended = approved_plan_sha256 is not None
@@ -803,6 +806,13 @@ async def run_apply(
         _check_approval(approved_plan_sha256, pending)
     run_id = ledger.start_run(source, writes=True)
     projects = _projects(pending)
+    refusal = _share_refusal(
+        pending, ledger=ledger, limits=limits, filer=filer, projects=projects,
+        approved_plan_sha256=approved_plan_sha256,
+    )
+    if refusal is not None:
+        ledger.finish_run(run_id, counts=refusal.as_json())
+        return RunReport(run_id=run_id, counts=refusal)
     escaped = () if attended else _file(
         filer, backlog_escape(len(pending), limits, projects=projects),
     )
@@ -821,6 +831,30 @@ async def run_apply(
     )
     ledger.finish_run(run_id, counts=counts.as_json())
     return RunReport(run_id=run_id, counts=counts)
+
+
+def _share_refusal(
+    pending: Sequence[ActionRow],
+    *,
+    ledger: LinkHealLedger,
+    limits: RunLimits,
+    filer: EscapeFiler,
+    projects: Sequence[str],
+    approved_plan_sha256: str | None,
+) -> RunCounts | None:
+    """File the share escapes the plan runs behind *pending* trip; ``None`` when none does."""
+    verdicts = ledger.adjudication_verdicts({row.run_id for row in pending})
+    escapes = share_escapes(verdicts, limits, projects=projects)
+    if not escapes:
+        return None
+    return RunCounts(
+        planned=len(pending),
+        planned_by_action=Counter(row.planned.action.value for row in pending),
+        not_attempted=len(pending),
+        escaped=tuple(entry for escape in escapes for entry in _file(filer, escape)),
+        stopped_by=SHARE_STOP,
+        approved_plan_sha256=approved_plan_sha256,
+    )
 
 
 def _drain_counts(
