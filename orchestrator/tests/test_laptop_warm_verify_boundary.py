@@ -62,7 +62,6 @@ import fcntl
 import math
 import os
 import re
-import select
 import shlex
 import signal
 import socket
@@ -80,16 +79,17 @@ from typing import Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from _leader_stderr import assert_watchdog_fire_trigger, drain_exited_stderr
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
 from click.testing import CliRunner
 from df_pytest_isolation import load_scaled_grace
 from escalation.queue import EscalationQueue
 from shared.proc_group import StatFields, read_stat_fields
 from test_cli import _setup_verify_repo  # noqa: F401 -- reused cross-module
-from test_merge_queue_multihost_wiring import (  # noqa: F401 -- reused cross-module
+from test_merge_queue_multihost_wiring import (
     _drive_runner_unavailable as _mq_drive_runner_unavailable,
 )
-from test_merge_queue_multihost_wiring import (
+from test_merge_queue_multihost_wiring import (  # noqa: F401 -- reused cross-module
     _make_config as _mq_make_config,
 )
 from test_merge_queue_multihost_wiring import (
@@ -108,7 +108,6 @@ from orchestrator.merge_lane.worker import (
     _verify_worktree_contention_sentinel,
 )
 from orchestrator.verify_cancel import (  # noqa: F401 -- reused by row tests
-    WATCHDOG_FIRE_TRIGGER_TOKEN,
     WatchdogTrigger,
     collect_descendants,
     kill_process_tree,
@@ -283,55 +282,6 @@ def stderr_tail(raw: bytes, *, limit: int = 2000) -> str:
     mask the real failure being reported.
     """
     return raw.decode(errors='replace')[-limit:]
-
-
-#: How long :func:`drain_exited_stderr` keeps reading before it gives up on EOF.
-STDERR_DRAIN_CEILING_SECS: float = 2.0
-
-
-def drain_exited_stderr(
-    proc: subprocess.Popen, *, ceiling_secs: float = STDERR_DRAIN_CEILING_SECS
-) -> bytes:
-    """Return the raw bytes still unread on an EXITED *proc*'s stderr pipe.
-
-    Reads until EOF or *ceiling_secs*, whichever comes first.  A buffered
-    ``.read()`` is wrong here because it blocks until EOF: ``poll()`` reports
-    only *proc*'s own exit, and a helper it spawned with inherited fds can
-    still hold the pipe's write end open.  A live *proc* is refused, because
-    any snapshot of a still-running writer is racy.
-    """
-    if proc.poll() is None:
-        raise AssertionError(f'pid {proc.pid} has not exited; its stderr is still being written')
-    if proc.stderr is None:
-        raise AssertionError(f'pid {proc.pid} was not spawned with stderr=PIPE')
-    chunks = []
-    read_deadline = time.monotonic() + ceiling_secs
-    fd = proc.stderr.fileno()
-    while True:
-        remaining = read_deadline - time.monotonic()
-        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
-            break
-        chunk = os.read(fd, 65536)
-        if not chunk:
-            break
-        chunks.append(chunk)
-    return b''.join(chunks)
-
-
-def assert_watchdog_fire_trigger(text: str, expected: WatchdogTrigger, *, source: str) -> None:
-    """Assert *text* reports exactly the *expected* watchdog trigger and no other.
-
-    *source* names where *text* came from (a leader's stderr, a
-    RunnerUnavailable reason, a log record) in the failure message.
-    """
-    reported = sorted(
-        t.value for t in WatchdogTrigger if f'{WATCHDOG_FIRE_TRIGGER_TOKEN}={t.value}' in text
-    )
-    assert reported == [expected.value], (
-        f'{source}: expected exactly {WATCHDOG_FIRE_TRIGGER_TOKEN}={expected.value}, '
-        f'reported {reported or "no watchdog trigger (self-kill unattributable)"}; '
-        f'tail: {text[-2000:]!r}'
-    )
 
 
 def apply_dispatcher_env(monkeypatch) -> None:
@@ -2676,145 +2626,6 @@ def test_discovery_wait_timeout_reports_rc_none_and_omits_stderr_for_a_live_lead
         if proc.stderr is not None:
             with contextlib.suppress(OSError):
                 proc.stderr.close()
-
-
-def test_drain_exited_stderr_returns_everything_an_exited_process_wrote():
-    """An exited writer's whole stderr comes back, first line to last.
-
-    The payload stays far below one 64 KiB pipe buffer, so the writer can
-    never block on a full pipe before this test reads it.
-    """
-    script = (
-        'import sys\n'
-        'sys.stderr.write("FIRST-LINE\\n")\n'
-        'for i in range(200):\n'
-        '    sys.stderr.write(f"filler-{i}\\n")\n'
-        'sys.stderr.write("LAST-LINE\\n")\n'
-    )
-    proc = subprocess.Popen([sys.executable, '-c', script], stderr=subprocess.PIPE)
-    try:
-        proc.wait()
-
-        drained = drain_exited_stderr(proc)
-
-        assert drained.startswith(b'FIRST-LINE\n'), drained[:200]
-        assert drained.endswith(b'LAST-LINE\n'), drained[-200:]
-    finally:
-        if proc.stderr is not None:
-            with contextlib.suppress(OSError):
-                proc.stderr.close()
-
-
-def test_drain_exited_stderr_returns_while_a_survivor_still_holds_the_pipe():
-    """The ceiling, not EOF, ends the drain when a survivor holds the write end.
-
-    The child spawns a session-escaped grandchild with DEFAULT stdio, so the
-    grandchild inherits the stderr write end and keeps it open after the
-    child exits.  EOF is then impossible, so a drain that returns with the
-    grandchild still alive proves it stopped at its ceiling.  The proof is
-    structural, with no elapsed-time assertion: an unbounded read never
-    returns at all, and the test dies at pytest-timeout instead.
-    """
-    script = (
-        'import subprocess, sys\n'
-        'subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"],'
-        ' start_new_session=True)\n'
-        'sys.stderr.write("LAST-LINE\\n")\n'
-    )
-    proc = TaggedPopen([sys.executable, '-c', script], stderr=subprocess.PIPE)
-    try:
-        proc.wait()
-
-        drained = drain_exited_stderr(proc, ceiling_secs=0.5)
-
-        assert b'LAST-LINE' in drained, drained[-2000:]
-        assert tagged_pids(proc.tag), (
-            'the stderr-holding grandchild is gone, so the drain may have ended at '
-            'EOF rather than at its ceiling -- this test proves nothing about the '
-            'bound unless the write end is still held when the drain returns'
-        )
-    finally:
-        sweep_tagged(proc.tag)
-        if proc.stderr is not None:
-            with contextlib.suppress(OSError):
-                proc.stderr.close()
-
-
-def test_drain_exited_stderr_refuses_a_live_process():
-    """A still-running writer is refused, naming its pid.
-
-    Any snapshot of a live writer's stderr is racy, so a token assertion on
-    it would be a flaky false negative rather than a finding.
-    """
-    proc = subprocess.Popen(
-        [sys.executable, '-c', 'import time; time.sleep(300)'],
-        stderr=subprocess.PIPE,
-    )
-    try:
-        with pytest.raises(AssertionError) as exc_info:
-            drain_exited_stderr(proc)
-
-        message = str(exc_info.value)
-        assert str(proc.pid) in message, message
-        assert 'has not exited' in message, message
-    finally:
-        proc.kill()
-        proc.wait()
-        if proc.stderr is not None:
-            with contextlib.suppress(OSError):
-                proc.stderr.close()
-
-
-def test_assert_watchdog_fire_trigger_discriminates_the_branch():
-    """The trigger assertion passes only on exactly the expected token.
-
-    This is the non-vacuity guard for every row that asserts a trigger: a
-    helper that always passed would make all of those rows vacuous.  Each
-    failing case strips the helper's echo of the (short) text from the
-    message before checking it, so the reported and expected values must be
-    named in the diagnosis itself, not just in the echoed input.
-    """
-    noise = 'INFO verify: building mod\nINFO verify: still running\n'
-
-    def token_line(trigger: WatchdogTrigger) -> str:
-        return f'{WATCHDOG_FIRE_TRIGGER_TOKEN}={trigger.value}\n'
-
-    def diagnosis(text: str, expected: WatchdogTrigger, source: str) -> str:
-        with pytest.raises(AssertionError) as exc_info:
-            assert_watchdog_fire_trigger(text, expected, source=source)
-        message = str(exc_info.value)
-        assert repr(text) in message, f'the text is not echoed: {message!r}'
-        return message.replace(repr(text), '')
-
-    eof_token = f'{WATCHDOG_FIRE_TRIGGER_TOKEN}={WatchdogTrigger.EOF.value}'
-    starvation_token = f'{WATCHDOG_FIRE_TRIGGER_TOKEN}={WatchdogTrigger.HEARTBEAT_STARVATION.value}'
-
-    assert assert_watchdog_fire_trigger(
-        noise + token_line(WatchdogTrigger.EOF) + noise, WatchdogTrigger.EOF, source='matching case'
-    ) is None
-
-    wrong_branch = diagnosis(
-        noise + token_line(WatchdogTrigger.HEARTBEAT_STARVATION) + noise,
-        WatchdogTrigger.EOF,
-        'wrong-branch case',
-    )
-    assert WatchdogTrigger.HEARTBEAT_STARVATION.value in wrong_branch, wrong_branch
-    assert eof_token in wrong_branch, wrong_branch
-    assert 'wrong-branch case' in wrong_branch, wrong_branch
-
-    unattributable = diagnosis(
-        noise + 'TAIL-MARKER\n', WatchdogTrigger.HEARTBEAT_STARVATION, 'no-token case'
-    )
-    assert 'unattributable' in unattributable, unattributable
-    assert starvation_token in unattributable, unattributable
-    assert 'no-token case' in unattributable, unattributable
-
-    both = diagnosis(
-        token_line(WatchdogTrigger.EOF) + token_line(WatchdogTrigger.HEARTBEAT_STARVATION),
-        WatchdogTrigger.EOF,
-        'both-tokens case',
-    )
-    assert WatchdogTrigger.HEARTBEAT_STARVATION.value in both, both
 
 
 #: A child that stays alive but is never waited on -- killed by the test that
@@ -5376,8 +5187,9 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
 # Task 5556 -- trigger attribution, end to end.  A real RemoteRunner dispatches
 # a real verify-merge through the real heartbeat dispatcher, starves it, and
 # follows the watchdog's trigger token through every hop that relays it: the
-# dispatcher's stderr capture, the RunnerUnavailable reason, and the merge
-# worker's elided `remote runner unavailable` WARNING.
+# dispatcher's stderr capture and the RunnerUnavailable reason, live; then the
+# merge worker's elided `remote runner unavailable` WARNING, by replaying that
+# captured reason through the real worker rather than a live dispatch.
 # ---------------------------------------------------------------------------
 
 #: Heads the RunnerUnavailable reason this row's dispatch produces.
@@ -5390,7 +5202,7 @@ STARVED_HEARTBEAT_INTERVAL_SECS: float = 3600.0
 
 
 @pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)
-def test_starvation_self_kill_is_attributable_through_the_real_remote_dispatch_chain(
+def test_starvation_trigger_survives_real_remote_dispatch_and_replayed_worker_warning(
     tmp_path, monkeypatch, caplog
 ):
     """A starved remote self-kill stays attributable all the way to the worker's log.
@@ -5399,10 +5211,11 @@ def test_starvation_self_kill_is_attributable_through_the_real_remote_dispatch_c
     ssh that is a transparent pipe, so the leader's stdin is the real
     heartbeat pipe and its stderr comes back exactly as ssh relays it.  The
     reason must carry the watchdog's controlled rc 1 at its head and the
-    starvation token at its tail; that real reason is then fed to the real
-    merge worker, whose elided WARNING must still name the token.  The EOF
-    trigger is pinned at Row 2 instead, because the real dispatcher closes
-    the heartbeat pipe only after its child has exited.
+    starvation token at its tail.  That captured reason is then replayed,
+    through a runner double, into the real merge worker, whose elided
+    WARNING must still name the token.  The EOF trigger is pinned at Row 2
+    instead, because the real dispatcher closes the heartbeat pipe only
+    after its child has exited.
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     cfg_file = write_verify_config(tmp_path / 'config.yaml', repo, persistent_merge_worktree=False)
