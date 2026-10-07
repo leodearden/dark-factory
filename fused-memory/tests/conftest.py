@@ -151,13 +151,16 @@ FM_CONFIG_PATH = Path(_tests_dir).parent / 'config' / 'config.yaml'
 #: survive in one subproject after being fixed in the other.
 _FM_CONFIG_FIELDS = frozenset(FusedMemoryConfig.model_fields)
 
-#: The variables the TRACKED config interpolates into its PATH-VALUED leaves:
-#: ``${PROJECT_ROOT:.}`` (``taskmaster.project_root``,
-#: ``reconciliation.explore_codebase_root``), ``${QUEUE_DATA_DIR:./data/queue}``
-#: and ``${RECONCILIATION_DATA_DIR:./data/reconciliation}``.  A THIRD env
-#: surface, reached through the YAML's own interpolation rather than through
-#: pydantic's env layer, so the derived names above cannot see it: measured
-#: with ``CONFIG_PATH`` already pinned at the canonical file,
+#: The variables the TRACKED config interpolates into its PATH-VALUED leaves,
+#: each mapped to its layout under a test's ``tmp_path`` — the same layout as
+#: the YAML's own ``${VAR:default}``: ``${PROJECT_ROOT:.}``
+#: (``taskmaster.project_root``, ``reconciliation.explore_codebase_root``),
+#: ``${QUEUE_DATA_DIR:./data/queue}`` (``queue.data_dir``) and
+#: ``${RECONCILIATION_DATA_DIR:./data/reconciliation}``
+#: (``reconciliation.data_dir``, ``reconciliation.escalation_queue_dir``).  A
+#: THIRD env surface, reached through the YAML's own interpolation rather than
+#: through pydantic's env layer, so the derived names above cannot see it:
+#: measured with ``CONFIG_PATH`` already pinned at the canonical file,
 #: ``PROJECT_ROOT=/pwned-by-env`` still rewrote both of its leaves, and this
 #: repo's operator scripts do export ``PROJECT_ROOT``
 #: (``scripts/memory-metadata-coverage-census.sh`` and two siblings).
@@ -165,7 +168,11 @@ _FM_CONFIG_FIELDS = frozenset(FusedMemoryConfig.model_fields)
 #: interpolation surface from the file would sweep in ``${OPENAI_API_KEY}`` and
 #: ``${FALKORDB_URI:...}``, which the config reads from the environment BY
 #: DESIGN.  Only path-valued names belong here.
-_FM_CONFIG_PATH_INTERPOLATIONS = ('PROJECT_ROOT', 'QUEUE_DATA_DIR', 'RECONCILIATION_DATA_DIR')
+_FM_CONFIG_PATH_INTERPOLATIONS = {
+    'PROJECT_ROOT': Path('.'),
+    'QUEUE_DATA_DIR': Path('data', 'queue'),
+    'RECONCILIATION_DATA_DIR': Path('data', 'reconciliation'),
+}
 
 
 def _reads_as_a_config_override(env_name):
@@ -191,9 +198,10 @@ def _reads_as_a_config_override(env_name):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_fm_config(monkeypatch):
+def _isolate_fm_config(monkeypatch, tmp_path):
     """Pin ``CONFIG_PATH`` at the canonical config so config resolution does
-    not depend on the process CWD (task 5444).
+    not depend on the process CWD (task 5444), and its path leaves at this
+    test's ``tmp_path`` (task 5481).
 
     ``FusedMemoryConfig`` is a pydantic-settings ``BaseSettings``, not a plain
     ``BaseModel``: ``fused_memory.config.schema::FusedMemoryConfig.settings_customise_sources``
@@ -225,22 +233,15 @@ def _isolate_fm_config(monkeypatch):
     ``orchestrator/``").  That hardening was applied subproject-locally and
     never propagated; this is the propagation.
 
-    THE HALF DELIBERATELY NOT PROPAGATED.  ``_isolate_orch_config`` also pins
-    ``ORCH_PROJECT_ROOT`` at ``tmp_path`` — "the other load-bearing part" in
-    its own words — which rewrites the config's path leaves.  The tracked
-    fused-memory config's path leaves are RELATIVE: measured under this pin
-    they are ``taskmaster.project_root='.'``,
-    ``reconciliation.explore_codebase_root='.'``,
-    ``queue.data_dir='./data/queue'`` and
-    ``reconciliation.data_dir='./data/reconciliation'``.  So what this fixture
-    buys is that config RESOLUTION is CWD-independent — same layers, same
-    strings, from any CWD — while those four STRINGS still denote the
-    directory pytest was launched from.  Pointing them at tmp would change the
-    value ~19.8k currently-green tests read, which is the behaviour change this
-    task's zero-collateral design decision rules out; it is recorded in the RCA
-    and filed as a follow-up rather than done here.  What IS closed is the
-    ambient half of it: the variables that redirect those leaves are scrubbed
-    below, so the leaves denote the launching CWD and nothing else.
+    THE PATH-LEAF HALF.  The tracked file's path leaves interpolate the
+    variables in ``_FM_CONFIG_PATH_INTERPOLATIONS``; this fixture points them
+    at this test's ``tmp_path``, so a write through a bare config lands in tmp
+    — the mirror of ``ORCH_PROJECT_ROOT`` in
+    ``orchestrator/tests/conftest.py::_isolate_orch_config``.  It pins the
+    YAML's own variables, not pydantic's nested ``TASKMASTER__PROJECT_ROOT``
+    names: the env layer outranks the YAML, so those would override a test's
+    OWN config file.  A test-body ``setenv`` of one of the three still wins.
+    The measurement is in ``plans/fused-memory-config-cwd-leak-rca-2026-09-13.md``;
     ``test_config_hermeticity.py`` states both halves executably.
 
     ``monkeypatch.setenv`` restores the pre-existing value at teardown, so this
@@ -263,16 +264,15 @@ def _isolate_fm_config(monkeypatch):
     ``orchestrator/src/orchestrator/verify.py``'s reason for scrubbing the
     whole ``ORCH_`` prefix: so a variable added later cannot reintroduce the
     class.  The comprehension snapshots the names before the loop deletes any,
-    since mutating ``os.environ`` while iterating it raises.
-    ``_FM_CONFIG_PATH_INTERPOLATIONS`` is the same treatment for the YAML's own
-    interpolation surface, which pydantic never sees and the derived names
-    therefore miss.
+    since mutating ``os.environ`` while iterating it raises.  The YAML's own
+    interpolation surface, which pydantic never sees, is covered by the
+    path-leaf pin above: ``setenv`` overwrites an inherited value.
     """
     for inherited in [name for name in os.environ if _reads_as_a_config_override(name)]:
         monkeypatch.delenv(inherited, raising=False)
 
-    for interpolated in _FM_CONFIG_PATH_INTERPOLATIONS:
-        monkeypatch.delenv(interpolated, raising=False)
+    for name, layout in _FM_CONFIG_PATH_INTERPOLATIONS.items():
+        monkeypatch.setenv(name, str(tmp_path / layout))
 
     monkeypatch.setenv('CONFIG_PATH', str(FM_CONFIG_PATH))
 
@@ -289,10 +289,9 @@ def _no_inherited_project_registry(monkeypatch):
     attempt provisioning against mock drivers.  A test that sets it itself still
     wins, because its ``monkeypatch.setenv`` runs after this fixture.
 
-    The project_root half stays as ``_isolate_fm_config`` leaves it, ``'.'``,
-    which registers the launching CWD's basename.  MEASURED 2026-10-01 with
-    both halves live (the variable set to the dark-factory checkout, run from
-    ``fused-memory/``): the whole suite passes, 24106 passed, 0 failed.
+    The project_root half is ``_isolate_fm_config``'s pin, this test's
+    ``tmp_path``, so the derived registry registers that tmp dir's basename,
+    never the launching checkout.
     """
     monkeypatch.delenv(KNOWN_PROJECT_ROOTS_ENV, raising=False)
 
