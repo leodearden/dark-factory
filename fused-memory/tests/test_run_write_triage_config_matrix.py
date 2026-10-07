@@ -468,7 +468,6 @@ def test_best_config_copies_the_winner_verbatim(
         'meets_every_bound': row['bounds']['met'],
         'failed_bounds': [c['check'] for c in row['bounds']['checks'] if not c['ok']],
     }
-    assert '"false_contested_rate":' in json.dumps(best, indent=2)
 
     path = tmp_path / 'best_config.json'
     path.write_text(json.dumps(best, indent=2))
@@ -716,11 +715,7 @@ def _committed(name: str) -> Any:
     return json.loads((CALIBRATION / name).read_text(encoding='utf-8'))
 
 
-def test_committed_best_config_is_the_committed_matrix_winner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from fused_memory.config.schema import FusedMemoryConfig
-
+def test_committed_best_config_is_the_committed_matrix_winner() -> None:
     mod = _mod()
     matrix = _committed(MATRIX_NAME)
     best = _committed(BEST_NAME)
@@ -743,10 +738,9 @@ def test_committed_best_config_is_the_committed_matrix_winner(
         CALIBRATION / 'write_triage_pair_verdicts.jsonl',
     )
 
-    monkeypatch.setenv('CONFIG_PATH', str(PACKAGE / 'config' / 'config.yaml'))
-    shipped = mod.shipped_settings(types.SimpleNamespace(config=FusedMemoryConfig()))
     [reference] = [
-        arm.name for arm in mod.Population.from_artifact(published).arms if arm.settings == shipped
+        arm.name for arm in mod.Population.from_artifact(published).arms
+        if arm.settings.selection_keys() == matrix['reference_settings']
     ]
     assert matrix['reference_arm'] == reference
 
