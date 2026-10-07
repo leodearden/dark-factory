@@ -2594,6 +2594,93 @@ def test_discovery_wait_timeout_reports_rc_none_and_omits_stderr_for_a_live_lead
                 proc.stderr.close()
 
 
+def test_drain_exited_stderr_returns_everything_an_exited_process_wrote():
+    """An exited writer's whole stderr comes back, first line to last.
+
+    The payload stays far below one 64 KiB pipe buffer, so the writer can
+    never block on a full pipe before this test reads it.
+    """
+    script = (
+        'import sys\n'
+        'sys.stderr.write("FIRST-LINE\\n")\n'
+        'for i in range(200):\n'
+        '    sys.stderr.write(f"filler-{i}\\n")\n'
+        'sys.stderr.write("LAST-LINE\\n")\n'
+    )
+    proc = subprocess.Popen([sys.executable, '-c', script], stderr=subprocess.PIPE)
+    try:
+        proc.wait()
+
+        drained = drain_exited_stderr(proc)
+
+        assert drained.startswith(b'FIRST-LINE\n'), drained[:200]
+        assert drained.endswith(b'LAST-LINE\n'), drained[-200:]
+    finally:
+        if proc.stderr is not None:
+            with contextlib.suppress(OSError):
+                proc.stderr.close()
+
+
+def test_drain_exited_stderr_returns_while_a_survivor_still_holds_the_pipe():
+    """The ceiling, not EOF, ends the drain when a survivor holds the write end.
+
+    The child spawns a session-escaped grandchild with DEFAULT stdio, so the
+    grandchild inherits the stderr write end and keeps it open after the
+    child exits.  EOF is then impossible, so a drain that returns with the
+    grandchild still alive proves it stopped at its ceiling.  The proof is
+    structural, with no elapsed-time assertion: an unbounded read never
+    returns at all, and the test dies at pytest-timeout instead.
+    """
+    script = (
+        'import subprocess, sys\n'
+        'subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"],'
+        ' start_new_session=True)\n'
+        'sys.stderr.write("LAST-LINE\\n")\n'
+    )
+    proc = TaggedPopen([sys.executable, '-c', script], stderr=subprocess.PIPE)
+    try:
+        proc.wait()
+
+        drained = drain_exited_stderr(proc, ceiling_secs=0.5)
+
+        assert b'LAST-LINE' in drained, drained[-2000:]
+        assert tagged_pids(proc.tag), (
+            'the stderr-holding grandchild is gone, so the drain may have ended at '
+            'EOF rather than at its ceiling -- this test proves nothing about the '
+            'bound unless the write end is still held when the drain returns'
+        )
+    finally:
+        sweep_tagged(proc.tag)
+        if proc.stderr is not None:
+            with contextlib.suppress(OSError):
+                proc.stderr.close()
+
+
+def test_drain_exited_stderr_refuses_a_live_process():
+    """A still-running writer is refused, naming its pid.
+
+    Any snapshot of a live writer's stderr is racy, so a token assertion on
+    it would be a flaky false negative rather than a finding.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, '-c', 'import time; time.sleep(300)'],
+        stderr=subprocess.PIPE,
+    )
+    try:
+        with pytest.raises(AssertionError) as exc_info:
+            drain_exited_stderr(proc)
+
+        message = str(exc_info.value)
+        assert str(proc.pid) in message, message
+        assert 'has not exited' in message, message
+    finally:
+        proc.kill()
+        proc.wait()
+        if proc.stderr is not None:
+            with contextlib.suppress(OSError):
+                proc.stderr.close()
+
+
 #: A child that stays alive but is never waited on -- killed by the test that
 #: spawns it.  ``sys.executable`` rather than ``sleep`` so nothing depends on
 #: PATH; the probe only needs the fork, not a finished exec.
