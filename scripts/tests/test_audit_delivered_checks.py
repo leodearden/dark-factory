@@ -49,6 +49,7 @@ from audit_delivered_checks import (
     classify_descriptor,
     evaluate_row,
     format_report,
+    load_manifest_checks,
     load_open_dependents,
     load_task_index,
 )
@@ -264,6 +265,45 @@ class TestLoadTaskIndex:
 
         assert index.metadata_rows == ()
         assert index.stamped_names == {(11, 'c')}
+
+    def test_path_descriptors_are_loaded_for_the_stale_path_sweep(self, make_tasks_db):
+        db = make_tasks_db([
+            {
+                'id': 16,
+                'status': 'pending',
+                'metadata': {
+                    'delivered_checks': [
+                        {'name': 'p', 'kind': 'path', 'expect': 'present',
+                         'paths': ['src/b.py']},
+                    ]
+                },
+            },
+        ])
+
+        rows = load_task_index(str(db)).metadata_rows
+
+        assert [(r.task_id, r.name, r.kind, r.pattern, r.paths) for r in rows] == [
+            (16, 'p', 'path', None, ('src/b.py',)),
+        ]
+
+    @pytest.mark.parametrize('paths', [None, [], [42, None]])
+    def test_a_path_descriptor_without_usable_paths_is_skipped(self, make_tasks_db, paths):
+        db = make_tasks_db([
+            {
+                'id': 17,
+                'status': 'pending',
+                'metadata': {
+                    'delivered_checks': [
+                        {'name': 'p', 'kind': 'path', 'expect': 'present', 'paths': paths},
+                    ]
+                },
+            },
+        ])
+
+        index = load_task_index(str(db))
+
+        assert index.metadata_rows == ()
+        assert index.stamped_names == {(17, 'p')}
 
     def test_malformed_metadata_is_skipped_not_raised(self, make_tasks_db):
         # A single undecodable row must not abort a whole-project sweep.
@@ -487,6 +527,47 @@ class TestAuditProject:
         assert audit.coverage.sidecars_unloadable == 0
         assert from_sidecar == {'cap-y': DISPOSITION_UNWIRED_LIVE_GATE}
 
+    def test_path_descriptors_get_no_polarity_disposition(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        """Path rows are loaded for the stale-path sweep only: the supersession
+        pickaxe has no path counterpart, so they are never given a disposition.
+        The grep row is the positive control that the project was swept."""
+        path_only = {'delivered_checks': [
+            {'name': 'p', 'kind': 'path', 'expect': 'present', 'paths': ['src/b.py']}]}
+        root = _init_repo(tmp_path / 'proj', {'src/a.py': 'pass\n'})
+        project_root_with_tasks_db(root)
+        make_tasks_db(
+            [{'id': 30, 'status': 'done', 'metadata': path_only}],
+            directory=root / '.taskmaster' / 'tasks',
+        )
+
+        audit = audit_project(str(root))
+
+        assert audit.findings == []
+        assert audit.coverage.descriptors_total == 0
+
+    def test_a_grep_row_beside_path_rows_is_still_classified(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = _init_repo(tmp_path / 'proj', {'src/a.py': 'pass\n'})
+        project_root_with_tasks_db(root)
+        make_tasks_db(
+            [{'id': 31, 'status': 'done', 'metadata': {'delivered_checks': [
+                {'name': 'p', 'kind': 'path', 'expect': 'present', 'paths': ['src/b.py']},
+                {'name': 'g', 'kind': 'grep', 'pattern': 'NeverBuilt',
+                 'expect': 'present', 'paths': ['src/']},
+            ]}}],
+            directory=root / '.taskmaster' / 'tasks',
+        )
+
+        audit = audit_project(str(root))
+
+        assert [(f.row.name, f.disposition) for f in audit.findings] == [
+            ('g', DISPOSITION_BROKEN),
+        ]
+        assert audit.coverage.descriptors_total == 1
+
     def test_report_renders_supersession_in_its_own_section(self):
         # A superseded row must not sit in the DEFECTS section: it is a
         # correctly-authored descriptor that later work legitimately undid, and
@@ -517,6 +598,37 @@ class TestAuditProject:
         assert '3578' in report
         assert superseded_at != broken_at
         assert 'COVERAGE' in report
+
+
+def test_load_manifest_checks_carries_sidecar_path_capabilities(tmp_path):
+    root = _init_repo(
+        tmp_path / 'proj',
+        {
+            'src/a.py': 'pass\n',
+            'plans/x-prd.capability-manifest.yaml': (
+                'prd: plans/x-prd.md\n'
+                'schema_version: 1\n'
+                'tasks:\n'
+                '  - label: α\n'
+                '    task_id: 40\n'
+                '    capabilities:\n'
+                '      - name: file-lands\n'
+                '        binding: b\n'
+                '        verdict: FAIL\n'
+                '        delivered_check:\n'
+                '          kind: path\n'
+                '          paths: [src/b.py]\n'
+                '          expect: present\n'
+            ),
+        },
+    )
+
+    rows, unloadable = load_manifest_checks(str(root), {40: ('master', 'pending')})
+
+    assert unloadable == 0
+    assert [(r.task_id, r.name, r.kind, r.pattern, r.paths, r.source) for r in rows] == [
+        (40, 'file-lands', 'path', None, ('src/b.py',), 'manifest'),
+    ]
 
 
 # ---------------------------------------------------------------------------
