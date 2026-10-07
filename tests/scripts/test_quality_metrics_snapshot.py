@@ -309,6 +309,133 @@ class TestTheCommandLine:
 
 
 # ---------------------------------------------------------------------------
+# The import graph: nodes are module import names.
+
+_GRAPH: dict[str, str] = {
+    'alpha/src/pkg/__init__.py': 'THING = 1\n',
+    'alpha/src/pkg/a.py': 'from pkg import THING\n',
+    'alpha/src/pkg/b.py': 'from pkg import c\n',
+    'alpha/src/pkg/c.py': 'X = 1\n',
+    'alpha/src/a.py': 'import b\n',
+    'alpha/src/b.py': 'import a\n',
+    'alpha/src/c.py': 'from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import d\n',
+    'alpha/src/d.py': 'from typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    import c\n',
+    'alpha/src/e.py': 'import os\n\n\ndef f():\n    import a\n    return a\n',
+    'beta/src/beta/b.py': 'import pkg.c\n',
+    'alpha/tests/test_pkg.py': 'from pkg import a\nimport pkg.c\n',
+    'scripts/x.py': 'import legibility.y\n',
+    'scripts/legibility/y.py': 'Y = 1\n',
+}
+
+_RELATIVE: dict[str, str] = {
+    'alpha/src/rel/__init__.py': 'NAME = 1\n',
+    'alpha/src/rel/other.py': 'y = 1\n',
+    'alpha/src/rel/sub/__init__.py': 'from .. import NAME\n',
+    'alpha/src/rel/sub/n.py': 'thing = 1\n',
+    'alpha/src/rel/sub/m.py': (
+        'import rel\nfrom . import n\nfrom .n import thing\nfrom ..other import y\n'
+    ),
+    'beta/src/beta/b.py': 'B = 1\n',
+    'scripts/z.py': 'from . import q\n',
+}
+
+
+class TestTheImportGraph:
+    @pytest.fixture
+    def measured(self, tmp_path: Path) -> dict[str, Any]:
+        return _measured(tmp_path, _GRAPH)
+
+    def test_it_has_exactly_the_four_sections(self, measured: dict[str, Any]) -> None:
+        assert set(measured['import_graph']) == {'edges', 'reach_back', 'deferred', 'cycles'}
+
+    def test_edges_are_explicit_first_party_src_imports(self, measured: dict[str, Any]) -> None:
+        # Module-level, TYPE_CHECKING and function-local imports all count; no
+        # implicit parent package, no stdlib, nothing from a tests file.
+        assert measured['import_graph']['edges'] == [
+            ['a', 'b'],
+            ['b', 'a'],
+            ['beta.b', 'pkg.c'],
+            ['c', 'd'],
+            ['d', 'c'],
+            ['e', 'a'],
+            ['pkg.a', 'pkg'],
+            ['pkg.b', 'pkg.c'],
+            ['x', 'legibility.y'],
+        ]
+
+    def test_cycles_are_over_runtime_module_level_edges_only(
+        self, measured: dict[str, Any]
+    ) -> None:
+        # c <-> d exists only under TYPE_CHECKING, and e -> a is function-local.
+        assert measured['import_graph']['cycles'] == [['a', 'b']]
+
+    def test_a_name_from_the_package_init_is_a_reach_back_and_a_submodule_is_not(
+        self, measured: dict[str, Any]
+    ) -> None:
+        assert measured['import_graph']['reach_back'] == [
+            {'from': 'pkg.a', 'to': 'pkg', 'names': ['THING'], 'line': 1},
+        ]
+
+    def test_deferred_imports_are_listed_by_site(self, measured: dict[str, Any]) -> None:
+        deferred = measured['import_graph']['deferred']
+        assert deferred == [{'from': 'e', 'line': 5, 'imports': ['a']}]
+        assert (
+            len([entry for entry in deferred if entry['from'] == 'e'])
+            == measured['files']['alpha/src/e.py']['function_local_imports']
+        )
+
+    def test_the_per_file_graph_fields(self, measured: dict[str, Any]) -> None:
+        files = measured['files']
+        assert files['alpha/src/pkg/a.py']['reach_back_imports'] == 1
+        assert files['alpha/src/pkg/b.py']['reach_back_imports'] == 0
+        assert files['alpha/src/pkg/b.py']['fan_out'] == 1
+        assert files['alpha/src/e.py']['fan_out'] == 1
+        assert files['alpha/src/pkg/c.py']['fan_in_src'] == 2
+        assert files['alpha/src/a.py']['fan_in_src'] == 2
+        assert files['alpha/src/pkg/c.py']['fan_in_tests'] == 1
+        assert files['alpha/src/pkg/a.py']['fan_in_tests'] == 1
+        assert files['alpha/src/b.py']['fan_in_tests'] == 0
+
+    def test_a_src_record_has_exactly_the_contract_fields(
+        self, measured: dict[str, Any]
+    ) -> None:
+        assert set(measured['files']['alpha/src/pkg/a.py']) == {
+            'member', 'kind', 'blob', 'lines', 'prose_lines', 'prose_ratio',
+            'cognitive_total', 'cognitive_max', 'cognitive_max_function', 'functions',
+            'module', 'package_init', 'function_local_imports', 'reexport_names',
+            'reach_back_imports', 'fan_out', 'fan_in_src', 'fan_in_tests',
+        }
+
+    def test_relative_imports_resolve(self, tmp_path: Path) -> None:
+        graph = _measured(tmp_path, _RELATIVE)['import_graph']
+        edges = graph['edges']
+        for edge in (
+            ['rel.sub', 'rel'],
+            ['rel.sub.m', 'rel'],
+            ['rel.sub.m', 'rel.other'],
+            ['rel.sub.m', 'rel.sub.n'],
+        ):
+            assert edges.count(edge) == 1, edge
+        # An __init__ importing a name from an ancestor package is a reach-back;
+        # a bare `import rel` and a lateral `from ..other import y` are not, and
+        # scripts/z.py's unresolvable relative import is neither edge nor error.
+        assert graph['reach_back'] == [
+            {'from': 'rel.sub', 'to': 'rel', 'names': ['NAME'], 'line': 1},
+        ]
+        assert not [edge for edge in edges if edge[0] == 'z']
+
+    def test_an_unreadable_module_is_still_a_node(self, tmp_path: Path) -> None:
+        measured = _measured(
+            tmp_path,
+            {**_BASE, 'alpha/src/broken.py': 'def (:\n', 'alpha/src/user.py': 'import broken\n'},
+        )
+        assert ['user', 'broken'] in measured['import_graph']['edges']
+        assert 'alpha/src/broken.py' in measured['evidence']['unreadable']
+        assert 'alpha/src/broken.py' not in measured['files']
+        assert measured['files']['alpha/src/user.py']['fan_out'] == 1
+
+
+# ---------------------------------------------------------------------------
 # Refusals: exit 2, the cause named on stderr, nothing written.
 
 
