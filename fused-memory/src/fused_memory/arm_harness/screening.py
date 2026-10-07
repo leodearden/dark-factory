@@ -133,15 +133,20 @@ def vram_gate(evidence: ArmEvidence) -> GateResult:
     )
 
 
-def _unreported_detail(model_id: str, unreported: Sequence[CallRecord], own: int) -> str:
+def _unreported_detail(
+    model_id: str, unreported: Sequence[CallRecord], own: Sequence[CallRecord]
+) -> str:
     kinds = sorted(Counter((call.status, call.error_excerpt or '') for call in unreported).items())
     listed = '; '.join(
         f'{count}x status {status}: {excerpt}'
         for (status, excerpt), count in kinds[:_LISTED_REJECTIONS]
     )
+    reported = [call.prompt_tokens for call in own if call.prompt_tokens is not None]
+    longest = f'{max(reported)} tokens' if reported else 'none'
     return (
-        f'{len(unreported)} of {own} {model_id!r} calls report no prompt length, so the '
-        f'longest prompt is unknown: {listed}'
+        f'{len(unreported)} of {len(own)} {model_id!r} calls report no prompt length, so the '
+        f'longest prompt is unknown (longest of the {len(reported)} reported: {longest}): '
+        f'{listed}'
     )
 
 
@@ -154,7 +159,7 @@ def context_gate(evidence: ArmEvidence) -> GateResult:
     own = evidence.own_model_calls
     unreported = [call for call in own if not call.succeeded or call.prompt_tokens is None]
     if unreported:
-        detail = _unreported_detail(model_id, unreported, len(own))
+        detail = _unreported_detail(model_id, unreported, own)
         return _gate(gate, GateVerdict.UNMEASURED, detail, bound=bound, unit=GateUnit.TOKENS)
     if not own:
         detail = f'no {model_id!r} call reported a prompt length'

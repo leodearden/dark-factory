@@ -178,6 +178,7 @@ def test_a_rejected_own_model_call_leaves_the_longest_prompt_unknown():
     assert result.verdict is GateVerdict.UNMEASURED
     assert '400' in result.detail
     assert 'maximum context length is 32768 tokens' in result.detail
+    assert 'longest of the 1 reported: 500 tokens' in result.detail
 
 
 def test_a_served_own_model_call_without_usage_leaves_the_longest_prompt_unknown():
