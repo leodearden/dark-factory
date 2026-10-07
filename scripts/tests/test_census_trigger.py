@@ -24,6 +24,10 @@ from legibility.config import Census as LegibilityCensus
 NOW = datetime(2026, 7, 14, 12, 0, 0, tzinfo=UTC)
 
 
+def _anchor(kind, days_ago):
+    return ct.FloorAnchor(kind=kind, at=NOW - timedelta(days=days_ago))
+
+
 # ---------------------------------------------------------------------------
 # step-1: RED — CensusConfig defaults + from_mapping merge
 # ---------------------------------------------------------------------------
@@ -219,7 +223,7 @@ def _evaluate_a(*, last_census_at, tasks_landed=None, candidate_first_seens=None
     return ct.evaluate(
         now=NOW,
         last_census_at=last_census_at,
-        never_censused=False,
+        floor_anchor=ct.FloorAnchor(ct.FloorAnchorKind.SESSION_WATERMARK, last_census_at),
         tasks_landed=tasks_landed,
         candidate_first_seens=candidate_first_seens or [],
         config=config or ct.CensusConfig(),
@@ -281,7 +285,7 @@ def _evaluate_c(*, candidate_first_seens):
     return ct.evaluate(
         now=NOW,
         last_census_at=NOW - timedelta(days=6),
-        never_censused=False,
+        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 6),
         tasks_landed=None,
         candidate_first_seens=[datetime.fromisoformat(s) for s in candidate_first_seens],
         config=ct.CensusConfig(),
@@ -312,48 +316,101 @@ def test_evaluate_condition_c_four_but_one_outside_window_counts_as_three_no_fir
 
 
 # ---------------------------------------------------------------------------
-# step-9: RED — hard floor (blocks a/b/c) + never-censused exemption
+# hard floor: measured from its anchor, blocks a/b/c, always reported
+# (plans/census-incremental-prd.md §4.7 Floor)
 # ---------------------------------------------------------------------------
 
 _SPIKE_4_IN_72H = ["2026-07-14", "2026-07-14", "2026-07-13", "2026-07-12"]
 
 
-def test_evaluate_floor_blocks_spike_when_censused():
-    decision = ct.evaluate(
+def _evaluate_floor(*, last_census_days_ago, floor_anchor, tasks_landed=None, config=None):
+    return ct.evaluate(
         now=NOW,
-        last_census_at=NOW - timedelta(days=4),
-        never_censused=False,
-        tasks_landed=None,
-        candidate_first_seens=[datetime.fromisoformat(s) for s in _SPIKE_4_IN_72H],
-        config=ct.CensusConfig(),
+        last_census_at=NOW - timedelta(days=last_census_days_ago),
+        floor_anchor=floor_anchor,
+        tasks_landed=tasks_landed,
+        candidate_first_seens=[],
+        config=config or ct.CensusConfig(),
+    )
+
+
+def _floor_lines(decision):
+    return [r for r in decision.reasons if r.startswith("floor:")]
+
+
+def test_evaluate_floor_blocks_inside_floor_days_of_its_anchor():
+    decision = _evaluate_floor(
+        last_census_days_ago=12,
+        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 3),
     )
     assert decision.fire is False
-    assert any("floor" in r for r in decision.reasons)
+    assert _floor_lines(decision) == [
+        "floor: 3.0d since session watermark (floor 5d) -> BLOCKS all conditions"
+    ]
 
 
-def test_evaluate_floor_blocks_tasks_landed_and_spike_when_censused():
-    decision = ct.evaluate(
-        now=NOW,
-        last_census_at=NOW - timedelta(days=4),
-        never_censused=False,
+def test_evaluate_floor_blocks_tasks_landed_too():
+    decision = _evaluate_floor(
+        last_census_days_ago=8,
+        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 4),
         tasks_landed=999,
-        candidate_first_seens=[datetime.fromisoformat(s) for s in _SPIKE_4_IN_72H],
-        config=ct.CensusConfig(),
     )
     assert decision.fire is False
-    assert any("floor" in r for r in decision.reasons)
+    assert any("BLOCKS" in line for line in _floor_lines(decision))
 
 
-def test_evaluate_floor_exempt_when_never_censused():
-    decision = ct.evaluate(
-        now=NOW,
-        last_census_at=NOW - timedelta(days=2),
-        never_censused=True,
-        tasks_landed=None,
-        candidate_first_seens=[datetime.fromisoformat(s) for s in _SPIKE_4_IN_72H],
-        config=ct.CensusConfig(),
+def test_evaluate_floor_clear_still_names_its_anchor():
+    decision = _evaluate_floor(
+        last_census_days_ago=12,
+        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 6),
     )
     assert decision.fire is True
+    assert _floor_lines(decision) == ["floor: 6.0d since session watermark (floor 5d)"]
+
+
+@pytest.mark.parametrize(
+    "kind,label",
+    [
+        (ct.FloorAnchorKind.LAST_CENSUS_AT, "since last_census_at (no watermark yet)"),
+        (ct.FloorAnchorKind.EARLIEST_CODEBOOK_DATE, "since earliest codebook date (never censused)"),
+        (ct.FloorAnchorKind.SESSION_WATERMARK, "since session watermark"),
+    ],
+)
+def test_evaluate_floor_line_names_each_anchor_kind(kind, label):
+    decision = _evaluate_floor(last_census_days_ago=12, floor_anchor=_anchor(kind, 3))
+    floor_lines = _floor_lines(decision)
+    assert len(floor_lines) == 1
+    assert label in floor_lines[0]
+    assert "BLOCKS" in floor_lines[0]
+
+
+def test_evaluate_floor_applies_to_a_never_censused_project():
+    decision = _evaluate_floor(
+        last_census_days_ago=3,
+        floor_anchor=_anchor(ct.FloorAnchorKind.EARLIEST_CODEBOOK_DATE, 3),
+        config=ct.CensusConfig(max_interval_days=1),
+    )
+    assert decision.fire is False
+    (floor_line,) = _floor_lines(decision)
+    assert "earliest codebook date (never censused)" in floor_line
+
+
+def test_evaluate_floor_without_an_anchor_blocks_and_says_so():
+    decision = _evaluate_floor(last_census_days_ago=12, floor_anchor=None)
+    assert decision.fire is False
+    (floor_line,) = _floor_lines(decision)
+    assert floor_line.startswith("floor: no anchor")
+    assert "BLOCKS" in floor_line
+
+
+def test_evaluate_floor_never_fires_by_itself():
+    decision = _evaluate_floor(
+        last_census_days_ago=9,
+        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 100),
+    )
+    assert decision.fire is False
+    (floor_line,) = _floor_lines(decision)
+    assert "BLOCKS" not in floor_line
 
 
 # ---------------------------------------------------------------------------
@@ -1296,6 +1353,62 @@ def test_decide_for_project_row1_missing_state_fires_from_earliest_sighting(tmp_
 
     assert decision.fire is True
     assert any("max-interval" in r for r in decision.reasons)
+    assert (
+        "floor: 12.5d since earliest codebook date (never censused) (floor 5d)"
+        in decision.reasons
+    )
+
+
+def _write_legibility_yaml(project_root, text):
+    legibility_dir = project_root / "docs" / "legibility"
+    legibility_dir.mkdir(parents=True, exist_ok=True)
+    (legibility_dir / "legibility.yaml").write_text(text, encoding="utf-8")
+
+
+def test_decide_for_project_legacy_state_floor_falls_back_to_last_census_at(tmp_path):
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path,
+        last_census_at=(NOW - timedelta(days=3)).isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+    )
+    _write_legibility_yaml(tmp_path, "census:\n  max_interval_days: 1\n")
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert decision.fire is False
+    assert (
+        "floor: 3.0d since last_census_at (no watermark yet) (floor 5d) -> BLOCKS all conditions"
+        in decision.reasons
+    )
+
+
+def test_decide_for_project_never_censused_floor_blocks_from_the_earliest_codebook_date(
+    tmp_path,
+):
+    _write_codebook(
+        tmp_path,
+        entries=[
+            {
+                "id": "entry-a",
+                "title": "t",
+                "severity": "low",
+                "status": "open",
+                "origin_phase": "unknown",
+                "manifested_phase": "unknown",
+                "sightings": [_sighting((NOW - timedelta(days=3)).date().isoformat())],
+            }
+        ],
+    )
+    _write_legibility_yaml(tmp_path, "census:\n  max_interval_days: 1\n")
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert decision.fire is False
+    floor_lines = [r for r in decision.reasons if r.startswith("floor:")]
+    assert len(floor_lines) == 1
+    assert "since earliest codebook date (never censused)" in floor_lines[0]
+    assert "BLOCKS" in floor_lines[0]
 
 
 def test_decide_for_project_row2_day9_no_spike_low_delta_no_fire(tmp_path):
