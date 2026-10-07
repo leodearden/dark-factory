@@ -949,7 +949,8 @@ class TestBoundedScopeAndReadEconomy:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        'task_id', [None, '', 0, -5, '0', '-5', [], {'nested': 'dict'}],
+        'task_id',
+        [None, '', 0, -5, '0', '-5', [], {'nested': 'dict'}, True, False, 3105.0],
     )
     async def test_unusable_task_id_is_kept_without_reads(self, task_id):
         """(f) A flag with no resolvable task is kept, never a junk backend query.
