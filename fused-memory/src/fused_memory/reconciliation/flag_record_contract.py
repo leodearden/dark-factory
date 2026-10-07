@@ -14,6 +14,13 @@ Enforcement points, all of which call this module:
   ``::MemoryService.add_system_record`` refuse and normalize every write.
 - ``fused_memory/reconciliation/flag_dedup.py`` builds its marker and
   suppression payloads through the same normalizer.
+
+Deliberately outside the contract: ``MemoryService.update_memory`` (and its
+tool), whose ``metadata_patch`` or ``metadata_mode='replace'`` can still give
+an existing record a flag-family kind or a non-canonical flag-type spelling,
+and ``add_episode``, which mints no kind-classified records. The contract
+governs record creation only; a Mem0 suppression record has no gate effect
+either way, because ``flag_dedup.filter_suppressed`` reads only the ledger.
 """
 
 from __future__ import annotations
@@ -139,7 +146,9 @@ def normalize_flag_record_metadata(metadata: Mapping[str, Any]) -> dict[str, Any
 
 def _reconcile_kind_keys(metadata: dict[str, Any], kind: str, kind_keys: tuple[str, ...]) -> None:
     for key in kind_keys:
-        value = metadata.setdefault(key, kind)
+        if metadata.get(key) is None:
+            metadata[key] = kind
+        value = metadata[key]
         if value != kind:
             raise FlagRecordSchemaError(
                 f'every record-kind key of a {kind!r} record must name {kind!r}; '

@@ -45,6 +45,11 @@ class TestRecordKindKeys:
         assert result['kind'] == STAGE1_FLAG_MARKER_KIND
         assert result['source'] == STAGE1_FLAG_MARKER_KIND
 
+    def test_marker_explicit_none_kind_key_is_filled_like_an_absent_one(self):
+        result = normalize_flag_record_metadata({'kind': STAGE1_FLAG_MARKER_KIND, 'source': None})
+
+        assert result['source'] == STAGE1_FLAG_MARKER_KIND
+
     def test_marker_kind_with_foreign_source_is_rejected(self):
         with pytest.raises(FlagRecordSchemaError) as excinfo:
             normalize_flag_record_metadata(
