@@ -6,19 +6,23 @@ Task dicts are built in the backend's ``get_task`` shape: ``id``, ``title``,
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import UTC, datetime
 from typing import Any
 
 from fused_memory.reconciliation.audit_trail_rotation import (
+    ARCHIVE_MAX_BYTES,
     HISTORY_KEEP,
     HISTORY_MAX,
     ROLLUP_KEY,
     ROTATE_TARGET_BYTES,
     ROTATE_THRESHOLD_BYTES,
+    TaskRewrite,
     near_duplicate_key,
     plan_rotation,
     task_payload_bytes,
+    unrotatable_reason,
 )
 from fused_memory.reconciliation.context_assembler import HINT_QUERIES_EXECUTED
 
@@ -321,3 +325,130 @@ class TestMemoryHintQueryBound:
         assert hints['entities'] == []
         assert len(hints['queries']) == 1
         assert 'abc-uuid' in hints['queries'][0]
+
+
+DESCRIPTION_SECTION = '=== DESCRIPTION BLOCKS ROTATED OUT (verbatim) ==='
+
+
+def cycle_blocks(count: int, *, filler_repeats: int) -> list[str]:
+    return [
+        f'Cycle {index:02d} relay summary.\n' + 'evidence unchanged; ' * filler_repeats
+        for index in range(count)
+    ]
+
+
+def rewritten(task: dict[str, Any], rewrite: Any) -> dict[str, Any]:
+    description = task['description'] if rewrite.description is None else rewrite.description
+    return {**task, 'description': description, 'metadata': rewrite.metadata}
+
+
+def split_rendered_description(original: str, rendered: str, first: str) -> tuple[str, str, str]:
+    """(pointer, shed span, kept remainder) of a rotated description."""
+    assert rendered.startswith(first + '\n\n')
+    pointer, remainder = rendered[len(first) + 2 :].split('\n\n', 1)
+    assert original.endswith(remainder)
+    shed_span = original[len(first) + 2 : len(original) - len(remainder) - 2]
+    return pointer, shed_span, remainder
+
+
+class TestSizeTrigger:
+    def test_description_middle_is_archived_verbatim_behind_a_pointer_block(self):
+        blocks = cycle_blocks(30, filler_repeats=35)
+        description = '\n\n'.join(blocks)
+        task = make_task(description=description, details='Ruling: none yet.', metadata=dict(GATE_MARKERS))
+        assert task_payload_bytes(task) > ROTATE_THRESHOLD_BYTES
+        plan = plan_rotation(task, now=NOW)
+        assert plan is not None
+        assert plan.bytes_before == task_payload_bytes(task)
+        rewrite = plan.render('mem-1')
+        assert rewrite.description is not None
+        assert rewrite.description.endswith(blocks[-1])
+        pointer, shed_span, _ = split_rendered_description(description, rewrite.description, blocks[0])
+        shed_blocks = shed_span.split('\n\n')
+        assert shed_blocks == blocks[1 : 1 + len(shed_blocks)]
+        assert 'mem-1' in pointer
+        assert str(len(shed_blocks)) in pointer
+        assert f'{len(shed_span.encode()):,}' in pointer
+        for block in shed_blocks:
+            assert block.splitlines()[0] in pointer
+        assert plan.archive_text is not None
+        assert shed_span in description
+        assert archive_section(plan.archive_text, DESCRIPTION_SECTION) == shed_span
+        assert task_payload_bytes(rewritten(task, rewrite)) <= ROTATE_TARGET_BYTES
+        assert not plan.over_threshold_after
+
+    def test_owned_arrays_are_trimmed_to_history_keep_under_the_size_trigger(self):
+        existing = [
+            history_entry(f'foo_2026_08_{day:02d}', f'2026-08-{day:02d}', {'day': day})
+            for day in range(HISTORY_KEEP + 3, 0, -1)
+        ]
+        metadata = {'foo_history': existing, ROLLUP_KEY: {'history_keys': ['foo_history']}}
+        description = '\n\n'.join(cycle_blocks(30, filler_repeats=35))
+        plan = plan_rotation(make_task(description=description, metadata=metadata), now=NOW)
+        assert plan is not None
+        assert plan.render('mem-1').metadata['foo_history'] == existing[:HISTORY_KEEP]
+        assert plan.archive_text is not None
+        shed = json.loads(archive_section(plan.archive_text, METADATA_SECTION))
+        assert shed['foo_history'] == existing[HISTORY_KEEP:]
+
+    def test_archive_budget_stops_shedding_oldest_first(self):
+        blocks = cycle_blocks(60, filler_repeats=50)
+        description = '\n\n'.join(blocks)
+        task = make_task(description=description)
+        assert task_payload_bytes(task) > 3 * ROTATE_THRESHOLD_BYTES
+        plan = plan_rotation(task, now=NOW)
+        assert plan is not None
+        assert plan.archive_text is not None
+        assert len(plan.archive_text.encode()) <= ARCHIVE_MAX_BYTES
+        rewrite = plan.render('mem-1')
+        assert rewrite.description is not None
+        _, shed_span, remainder = split_rendered_description(
+            description, rewrite.description, blocks[0]
+        )
+        assert shed_span.startswith(blocks[1])
+        assert remainder.startswith(blocks[1 + len(shed_span.split('\n\n'))])
+        assert blocks[-2] in remainder
+        assert plan.over_threshold_after
+
+    def test_details_dominated_task_is_unrotatable_with_column_sizes(self):
+        details = 'd' * 41_000
+        task = make_task(description='One block only.', details=details, metadata=dict(GATE_MARKERS))
+        assert plan_rotation(task, now=NOW) is None
+        report = unrotatable_reason(task, now=NOW)
+        assert report is not None
+        assert report['reason'] == 'nothing_sheddable'
+        assert report['payload_bytes'] == task_payload_bytes(task)
+        assert report['column_bytes']['details'] == len(details)
+        assert sum(report['column_bytes'].values()) == task_payload_bytes(task)
+
+    def test_unrotatable_reason_is_none_under_threshold_or_when_a_plan_exists(self):
+        assert unrotatable_reason(make_task(), now=NOW) is None
+        description = '\n\n'.join(cycle_blocks(30, filler_repeats=35))
+        assert unrotatable_reason(make_task(description=description), now=NOW) is None
+
+    def test_terminal_over_threshold_task_reports_its_status_as_the_reason(self):
+        task = make_task(status='done', details='d' * 41_000)
+        report = unrotatable_reason(task, now=NOW)
+        assert report is not None
+        assert report['reason'] == 'terminal_status'
+
+    def test_description_of_fewer_than_three_blocks_is_never_rewritten(self):
+        description = 'a' * 11_000 + '\n\n' + 'b' * 11_000
+        assert plan_rotation(make_task(description=description), now=NOW) is None
+        task = make_task(description=description, metadata=dated_family('x_relay', [1, 2]))
+        plan = plan_rotation(task, now=NOW)
+        assert plan is not None
+        assert plan.render(None).description is None
+
+    def test_rewrite_carries_only_description_and_metadata(self):
+        assert {field.name for field in dataclasses.fields(TaskRewrite)} == {
+            'description',
+            'metadata',
+        }
+        metadata = {**GATE_MARKERS, 'x_note': {'kept': True}, 'priority_hint': 'high'}
+        description = '\n\n'.join(cycle_blocks(30, filler_repeats=35))
+        plan = plan_rotation(make_task(description=description, metadata=metadata), now=NOW)
+        assert plan is not None
+        rendered = plan.render('mem-1').metadata
+        for key, value in metadata.items():
+            assert rendered[key] == value
