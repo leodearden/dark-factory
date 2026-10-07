@@ -564,3 +564,112 @@ def test_wording_attribution_pairs_each_non_shipped_wording_arm_with_its_shipped
     [at20_pre_psi] = [row for row in _scored_rows(matrix) if row['arm'] == AT20_PRE_PSI]
     assert attribution[AT20_PRE_PSI]['paired'] != at20_pre_psi['paired_vs_reference']
     assert attribution[LUNA_PRE_PSI] == {'shipped_twin': None, 'paired': None}
+
+
+# --- step 11: the CLI ---------------------------------------------------------------
+
+MATRIX_NAME = 'write_triage_config_matrix.json'
+BEST_NAME = 'write_triage_best_config.json'
+CLI_BOUNDS = [('quality.unrated_pairs', '<=', '0'), ('population.n_judge_band', '>=', '4')]
+
+
+@pytest.fixture
+def cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
+    """A fake checkout holding π's arm files, the two committed inputs and an out dir.
+
+    The fused-memory config it points CONFIG_PATH at ships gpt-4o-mini@5.
+    """
+    (tmp_path / '.git').mkdir()
+    cases = _three_arm_cases()
+    doc = _publish(tmp_path, cases)
+    population = tmp_path / 'population.json'
+    population.write_text(json.dumps(doc, indent=2))
+    verdicts = tmp_path / 'verdicts.jsonl'
+    _write_rows(verdicts, VERDICTS)
+    out = tmp_path / 'out'
+    out.mkdir()
+    config = tmp_path / 'config.yaml'
+    config.write_text(
+        'llm:\n  provider: openai\n  model: gpt-4o-mini\n'
+        'write_triage:\n  judge_candidate_count: 5\n  judge_field_chars: 4000\n'
+    )
+    monkeypatch.setenv('CONFIG_PATH', str(config))
+    return types.SimpleNamespace(
+        root=tmp_path, cases=cases, doc=doc, population=population, verdicts=verdicts, out=out,
+    )
+
+
+def _main(cli: types.SimpleNamespace, bounds: list[tuple[str, str, str]] = CLI_BOUNDS) -> Any:
+    argv = [
+        '--population', str(cli.population), '--verdicts', str(cli.verdicts),
+        '--data-root', str(cli.root), '--out-dir', str(cli.out),
+        *[arg for bound in bounds for arg in ('--require', *bound)],
+    ]
+    try:
+        return _mod().main(argv)
+    except SystemExit as exit_:
+        return exit_.code
+
+
+def test_main_writes_both_artifacts(
+    cli: types.SimpleNamespace, capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _main(cli) == 0
+
+    expected = _mod().build_matrix(
+        _mod().Population.from_artifact(cli.doc), cli.cases, VERDICTS,
+        shipped=_shipped(), bounds=[_bound(*bound) for bound in CLI_BOUNDS],
+    )
+    matrix = json.loads((cli.out / MATRIX_NAME).read_text())
+    assert matrix == expected | {'inputs': {
+        'population_path': 'population.json',
+        'population_sha256': _sha256(cli.population),
+        'verdicts_path': 'verdicts.jsonl',
+        'verdicts_sha256': _sha256(cli.verdicts),
+    }}
+    best = json.loads((cli.out / BEST_NAME).read_text())
+    assert best == _mod().best_config(expected)
+
+    summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert summary['winner'] == expected['winner']
+    assert summary['meets_every_bound'] == best['provenance']['meets_every_bound']
+    assert {str(cli.out / MATRIX_NAME), str(cli.out / BEST_NAME)} <= set(summary.values())
+
+
+def _written(cli: types.SimpleNamespace) -> list[str]:
+    return sorted(path.name for path in cli.out.iterdir())
+
+
+def test_main_refuses_an_incomplete_corpus_and_writes_nothing(
+    cli: types.SimpleNamespace, capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_rows(cli.verdicts, [
+        v for v in VERDICTS if (v['entry_id'], v['target_id']) != ('w3', 't3')
+    ])
+    stale = cli.out / BEST_NAME
+    stale.write_bytes(b'{"stale": true}\n')
+
+    assert _main(cli) == 1
+
+    err = capsys.readouterr().err
+    assert any('w3' in line and 't3' in line for line in err.splitlines())
+    assert _written(cli) == [BEST_NAME]
+    assert stale.read_bytes() == b'{"stale": true}\n'
+
+
+def test_main_refuses_a_drifted_arm_file_and_writes_nothing(
+    cli: types.SimpleNamespace, capsys: pytest.CaptureFixture[str],
+) -> None:
+    with (cli.root / THREE_ARMS[2]['cases_path']).open('a') as handle:
+        handle.write('\n')
+
+    assert _main(cli) == 1
+
+    err = capsys.readouterr().err
+    assert SOL in err and 'sha256' in err
+    assert _written(cli) == []
+
+
+def test_main_requires_at_least_one_bound(cli: types.SimpleNamespace) -> None:
+    assert _main(cli, bounds=[]) not in (0, None)
+    assert _written(cli) == []
