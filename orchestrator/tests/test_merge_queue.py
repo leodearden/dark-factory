@@ -12910,26 +12910,22 @@ def _infra_category_verify_result(category: str = 'semaphore_timeout') -> Verify
 
 
 class _ScriptedVerifier(FakeVerifier):
-    """A :class:`FakeVerifier` that answers per CALL instead of per task id.
+    """A :class:`FakeVerifier` whose every step answers from a call-ordered
+    list whose last entry repeats.
 
     The direct ``_run_post_merge_verify`` tests each drive ONE task, and most
     of them are about what the SECOND answer does — an infra-transient
     failure that clears on the bounded retry, a narrowed retry budget running
-    out, a disk guard that relents after a prune. ``answers`` and
-    ``disk_reasons`` are consumed one entry per call and the last entry
-    repeats once exhausted, so a test scripts only the calls whose answer it
-    cares about.
+    out, a disk guard that relents after a prune — so a test scripts only the
+    calls whose answer it cares about. Unlike a mock's ``side_effect`` list,
+    an exhausted script repeats rather than raising, so an over-eager caller
+    is caught by the call-count assertion the test already makes.
 
-    Unlike a mock's ``side_effect`` list, an exhausted script repeats rather
-    than raising, so an over-eager caller is caught by the call-count
-    assertion the test already makes rather than by an opaque StopIteration.
-
-    ``scoped_calls`` and ``disk_guard_calls`` record what each step was asked,
-    the way the parent records ``verified`` and ``investigations``.
-
-    Per-CALL and the parent's per-TASK-ID scripting are mutually exclusive:
-    the parent resolves ``scripts[task_id]`` first, so a caller that supplied
-    both would silently never run its ``answers``.
+    Scoped ``answers`` ride the parent's ``sequence=``/``default=``, so
+    ``verified``, ``entered_count``, ``verify_calls`` and ``await_entry`` are
+    the parent's. ``gates`` and ``disk_reasons`` are consumed the same way
+    here, and ``scoped_calls``/``disk_guard_calls`` record what each step was
+    asked.
     """
 
     def __init__(
@@ -12938,22 +12934,16 @@ class _ScriptedVerifier(FakeVerifier):
         answers: Sequence[VerifyScript] = (),
         gates: Sequence[Any] = (),
         disk_reasons: Sequence[str | None] = (None,),
-        **kwargs: Any,
     ) -> None:
-        if answers and 'scripts' in kwargs:
-            raise TypeError(
-                '_ScriptedVerifier answers per call: `answers` and the parent '
-                "FakeVerifier's per-task `scripts` cannot both be supplied, "
-                'because the task-id script wins and no answer would ever run.'
-            )
         if not disk_reasons:
             raise ValueError(
                 '`disk_reasons` must name at least one outcome — the last entry '
                 'is what repeats once the script is exhausted. Omit the argument '
                 'for the always-free default.'
             )
-        super().__init__(**kwargs)
-        self.answers = list(answers)
+        super().__init__(
+            default=answers[-1] if answers else None, sequence=answers[:-1],
+        )
         self.gates = list(gates)
         self.disk_reasons = list(disk_reasons)
         self.scoped_calls: list[dict[str, Any]] = []
@@ -12963,9 +12953,9 @@ class _ScriptedVerifier(FakeVerifier):
     def _consume(script: list[Any]) -> Any:
         """Take the next entry, or keep answering with the last one.
 
-        Every caller guarantees a non-empty script — ``answers`` and ``gates``
-        at their call sites, ``disk_reasons`` in ``__init__`` — so this says so
-        by name rather than letting an empty list surface as an IndexError from
+        Every caller guarantees a non-empty script — ``gates`` at its call
+        sites, ``disk_reasons`` in ``__init__`` — so this says so by name
+        rather than letting an empty list surface as an IndexError from
         somewhere inside the step it was scripting.
         """
         assert script, '_consume called with an empty script'
@@ -12973,15 +12963,7 @@ class _ScriptedVerifier(FakeVerifier):
 
     async def run_scoped(self, *args: Any, **options: Any) -> VerifyResult:
         self.scoped_calls.append(options)
-        if not self.answers:
-            return await super().run_scoped(*args, **options)
-        # This call's answer is played through a parent instance holding it as
-        # its only script: how a VerifyScript resolves (release / error /
-        # result) stays defined in exactly one place, and `self.default` is
-        # never rewritten to smuggle the answer down into the parent.
-        self.verified.append(options.get('task_id'))  # recorded as the parent would
-        answer = FakeVerifier(default=self._consume(self.answers))
-        return await answer.run_scoped(*args, **options)
+        return await super().run_scoped(*args, **options)
 
     async def run_unscoped_typechecks(self, *args: Any, **options: Any) -> Any:
         if not self.gates:
