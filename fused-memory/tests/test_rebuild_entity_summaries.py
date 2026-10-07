@@ -358,8 +358,8 @@ class TestDetectStaleSummaries:
         ], edges={})
         result = await backend.detect_stale_summaries(group_id='test')
         assert result == []
-        # get_all_valid_edges still called once (before the loop), even if no edges
-        backend.get_all_valid_edges.assert_awaited_once()
+        # the edge read is still issued once (before the loop), even if no edges
+        backend.enumerate_all_valid_edges.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_no_entities_returns_empty(self, mock_config, make_backend, make_edge_backend):
@@ -1643,15 +1643,15 @@ class TestRebuildSummariesManager:
 
 
 # ---------------------------------------------------------------------------
-# N+1 fix step-7: detect_stale_summaries uses bulk get_all_valid_edges
+# N+1 fix step-7: detect_stale_summaries uses the bulk enumerate_all_valid_edges
 # ---------------------------------------------------------------------------
 
 class TestDetectStaleSummariesBulk:
-    """detect_stale_summaries uses get_all_valid_edges (one query) not N per-entity queries."""
+    """detect_stale_summaries uses enumerate_all_valid_edges (one read) not N per-entity queries."""
 
     @pytest.mark.asyncio
-    async def test_calls_get_all_valid_edges_once_not_per_entity(self, mock_config, make_backend, make_edge_backend):
-        """detect_stale_summaries calls get_all_valid_edges exactly once (not N times)."""
+    async def test_calls_enumerate_all_valid_edges_once_not_per_entity(self, mock_config, make_backend, make_edge_backend):
+        """detect_stale_summaries reads the bulk edge corpus exactly once (not N times)."""
         backend = make_edge_backend(make_backend(mock_config), nodes=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'factA'},
             {'uuid': 'uuid-2', 'name': 'Bob', 'summary': 'factB'},
@@ -1661,7 +1661,7 @@ class TestDetectStaleSummariesBulk:
         })
         backend.get_valid_edges_for_node = AsyncMock()
         await backend.detect_stale_summaries(group_id='test')
-        backend.get_all_valid_edges.assert_awaited_once()
+        backend.enumerate_all_valid_edges.assert_awaited_once()
         backend.get_valid_edges_for_node.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -1701,14 +1701,14 @@ def two_entity_backend(mock_config, make_backend, make_edge_backend):
 
     Provides:
       - make_backend(mock_config) instantiation (GraphitiBackend with mocked client)
-      - list_entity_nodes returning Alice (uuid-1/stale1) and Bob (uuid-2/stale2)
-      - get_all_valid_edges returning current1/current2 edges for each entity
+      - enumerate_entity_nodes returning Alice (uuid-1/stale1) and Bob (uuid-2/stale2)
+      - enumerate_all_valid_edges returning current1/current2 edges for each entity
 
     Function-scoped (pytest default) so each test gets a fresh backend with fresh
     AsyncMock.await_count counters — important for await_count assertions in both
     TestRebuildEntitySummariesParallel and TestRebuildEntitySummariesCancellation.
 
-    The list_entity_nodes and get_all_valid_edges mocks are exercised by force=True
+    The enumerate_entity_nodes and enumerate_all_valid_edges mocks are exercised by force=True
     consumers (TestRebuildEntitySummariesParallel.test_partial_failure_in_update_does_not_cancel_others
     and all TestRebuildEntitySummariesCancellation tests except test_cancelled_error_propagates_force_false).
     force=False consumers may intentionally supersede those lower-level mocks by stubbing

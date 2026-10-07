@@ -13,7 +13,7 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _fm_helpers import make_rebuild_detail
+from _fm_helpers import complete_paged_read, make_rebuild_detail
 
 from fused_memory.backends.graphiti_client import (
     EdgeDict,
@@ -124,15 +124,17 @@ class TestStaleSummaryResult:
     async def test_detect_stale_summaries_returns_named_result(self, mock_config, make_backend):
         """detect_stale_with_edges returns StaleSummaryResult with named access."""
         backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(
-            return_value=[
-                {'uuid': 'u1', 'name': 'Alice', 'summary': 'stale summary'},
-            ]
+        backend.enumerate_entity_nodes = AsyncMock(
+            return_value=(
+                [{'uuid': 'u1', 'name': 'Alice', 'summary': 'stale summary'}],
+                complete_paged_read(),
+            )
         )
-        backend.get_all_valid_edges = AsyncMock(
-            return_value={
-                'u1': [{'fact': 'fresh fact'}],
-            }
+        backend.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'u1': [{'fact': 'fresh fact'}]},
+                complete_paged_read(),
+            )
         )
         result = await backend.detect_stale_with_edges(group_id='test')
 
@@ -805,20 +807,22 @@ class TestCanonicalFactsStalenessRegression:
 
         The total_count assertion (added in task-492) strengthens this regression
         guard: stale==[] alone could pass trivially if the entity loop never ran
-        (e.g. if list_entity_nodes returned zero entities).  total_count=1 pins
+        (e.g. if the node read returned zero entities).  total_count=1 pins
         that exactly one entity was scanned and _canonical_facts was actually
         exercised on its edges.
         """
         backend = make_backend(mock_config)
-        backend.list_entity_nodes = AsyncMock(
-            return_value=[
-                {'uuid': 'u1', 'name': 'Alice', 'summary': 'A knows B'},
-            ]
+        backend.enumerate_entity_nodes = AsyncMock(
+            return_value=(
+                [{'uuid': 'u1', 'name': 'Alice', 'summary': 'A knows B'}],
+                complete_paged_read(),
+            )
         )
-        backend.get_all_valid_edges = AsyncMock(
-            return_value={
-                'u1': [{'fact': '   '}, {'fact': 'A knows B'}],
-            }
+        backend.enumerate_all_valid_edges = AsyncMock(
+            return_value=(
+                {'u1': [{'fact': '   '}, {'fact': 'A knows B'}]},
+                complete_paged_read(),
+            )
         )
 
         result = await backend.detect_stale_with_edges(group_id='test')
