@@ -288,9 +288,12 @@ when one exists, and an unrelated later merge only when the branch was already i
 
 **`--topo-order` is REQUIRED, not decoration.** `git rev-list` orders by **commit date** by
 default, *not* topologically, so the "oldest" claim above holds only while dates happen to agree
-with topology. A merge whose committer date is skewed or was rewritten — a rebase, a replayed
-patch, a clock-skewed machine — can sort out of position, and `tail -1` then returns a *later*
-merge instead of the one that brought this branch in. Dropping `--topo-order` fails **silently**:
+with topology. Two things break that: commits that share one committer-date second (the
+realistic single-machine case — scripted commits and a busy merge lane land several per second;
+no skew involved), and a committer clock skewed across machines, which can date a commit older
+than the commit it descends from. Either can sort a merge out of position, and `tail -1` then
+returns a *later* merge instead of the one that brought this branch in.
+Dropping `--topo-order` fails **silently**:
 `$c^1` is then that later merge's parent, which already contains the branch, so the check reports
 `contained-before rc=0`, the arm reads "unrelated later merge, do not stamp", and the real group
 merge is skipped — the procedure degrades to the citation gate below and stamps a citing commit
