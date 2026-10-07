@@ -23,6 +23,7 @@ from _merge_lane_fakes import (
     VerifyScript,
     fails,
     hangs_until,
+    healthy_verify_clock,
     lane_scene_config,
     main_health_probe_spawned,
     make_lane,
@@ -1329,7 +1330,7 @@ class TestMergeLaneSingleRequest:
         await git_ops.commit(worktree, 'Add queued file')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
         req = _make_request('1', 'queue-basic', worktree, config)
         result = await merge_through_lane(lane, queue, req)
 
@@ -1367,7 +1368,7 @@ class TestMergeLaneSingleRequest:
         })
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
 
         async def _fake_drop_check(*_args, **_kwargs):
             return DropGuardResult(dropped=['dropped.py'])
@@ -1420,7 +1421,7 @@ class TestMergeLaneSingleRequest:
         })
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
 
         # The "merge commit" merges the task tip into main but keeps the tree
         # of a task-branch commit that predates dropped.py. The real detector
@@ -1497,7 +1498,7 @@ class TestMergeLaneSingleRequest:
 
         # req.snapshot_tip = SNAP (the already-merged tip)
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
 
         req = MergeRequest(
             task_id='snap-am-test',
@@ -1536,7 +1537,7 @@ class TestMergeLaneSingleRequest:
         # snapshot_tip=None — the check should use worktree HEAD
         # HEAD is a non-ancestor of main (branch not yet merged) → proceed to merge
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
 
         req = MergeRequest(
             task_id='snap-bc-none',
@@ -1568,7 +1569,7 @@ class TestMergeLaneSingleRequest:
         event_store = EventStore(db_path=db_path, run_id='test-run')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, event_store=event_store)
+        lane = make_lane(git_ops, queue, event_store=event_store, clock=healthy_verify_clock())
 
         # 'ghost-4011' was never created here — no task/ghost-4011 ref exists.
         req = _make_request(
@@ -1611,7 +1612,7 @@ class TestMergeLaneSingleRequest:
         await git_ops.commit(worktree, 'Add prefixed file')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
 
         # Submit with the PREFIXED branch string, not the bare id
         req = _make_request('4778', 'task/queue-prefixed', worktree, config)
@@ -1652,7 +1653,7 @@ class TestMergeLaneSingleRequest:
         assert await git_ops.resolve_branch_sha('task/orphan-merge-test') is None
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
 
         req = _make_request('orphan-merge', 'orphan-merge-test', wt, config)
         outcome = await merge_through_lane(lane, queue, req)
@@ -1693,7 +1694,7 @@ class TestMergeLaneSingleRequest:
         assert await git_ops.resolve_branch_sha('task/misroute-test') is None
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
 
         req = _make_request('misroute', 'misroute-test', wt, config)
 
@@ -5911,7 +5912,7 @@ class TestLaneSceneVerifyIsNotCalledDead:
         gate = asyncio.Event()
         verifier = FakeVerifier(default=dataclasses.replace(passes(), release=gate))
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, verifier=verifier)
+        lane = make_lane(git_ops, queue, verifier=verifier, clock=healthy_verify_clock())
         lane.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 10 * lane.VERIFY_ABANDON_POLL_SECS
 
         async with running_lane(lane) as run:
@@ -6008,7 +6009,7 @@ class TestMergeVerifyTimeoutLoopBreaker:
         )
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         verifier = FakeVerifier(default=fails(category='test_failure', summary='tests failed'))
-        lane = make_lane(git_ops, queue, verifier=verifier)
+        lane = make_lane(git_ops, queue, verifier=verifier, clock=healthy_verify_clock())
 
         async with running_lane(lane) as run:
             # More submissions than the abandon threshold: none may abandon.
@@ -6046,7 +6047,7 @@ class TestMergeVerifyTimeoutLoopBreaker:
         )
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
         verifier = FakeVerifier()
-        lane = make_lane(git_ops, queue, verifier=verifier)
+        lane = make_lane(git_ops, queue, verifier=verifier, clock=healthy_verify_clock())
         assert lane.MAX_POST_MERGE_VERIFY_TIMEOUTS == 2
 
         async with running_lane(lane) as run:
@@ -7532,7 +7533,7 @@ class TestCasRetryStaysInLane:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, event_store=event_store)
+        lane = make_lane(git_ops, queue, event_store=event_store, clock=healthy_verify_clock())
 
         original_advance = git_ops.advance_main
         call_count = 0
@@ -7841,7 +7842,7 @@ class TestPushHook:
         )
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
 
         push_mock = AsyncMock(return_value='error')
         with patch.object(git_ops, 'push_main', push_mock):
@@ -9863,7 +9864,7 @@ class TestGroupMergeRequestHappyPath:
         req = await _make_stacked_train(git_ops, config)
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
 
         # Count merge commits on main before the train lands
         _, before_log, _ = await _run(
@@ -9935,7 +9936,7 @@ class TestGroupMergeRequestTrainIncomplete:
         main_before = main_before.strip()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
 
         # Spy on merge_to_main: should NOT be called
         with patch.object(git_ops, 'merge_to_main', wraps=git_ops.merge_to_main) as spy_merge:
@@ -9997,7 +9998,7 @@ class TestGroupMergeRequestRebaseConflict:
         main_sha_after = main_sha_after.strip()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
 
         with patch.object(git_ops, 'merge_to_main', wraps=git_ops.merge_to_main) as spy_merge:
             outcome = await merge_through_lane(lane, queue, req)
@@ -10060,7 +10061,7 @@ class TestGroupMergeRequestMainAdvancedClean:
         external_sha = external_sha_out.strip()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
 
         outcome = await merge_through_lane(lane, queue, req)
 
@@ -10383,7 +10384,7 @@ class TestGroupMergeRequestPartialMemberFlipFailure:
         merge_commits_before = int(before_log.strip())
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
 
         outcome = await merge_through_lane(lane, queue, req)
 
@@ -12748,7 +12749,7 @@ class TestTrainLifecycleEvents:
         event_store = EventStore(db_path=db_path, run_id='train-lifecycle-run')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, event_store=event_store)
+        lane = make_lane(git_ops, queue, event_store=event_store, clock=healthy_verify_clock())
 
         outcome = await merge_through_lane(lane, queue, req)
 
@@ -12854,7 +12855,7 @@ class TestTrainLifecycleEvents:
         await _run(['git', 'commit', '-m', 'Conflicting commit on main'], cwd=git_ops.project_root)
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, event_store=event_store)
+        lane = make_lane(git_ops, queue, event_store=event_store, clock=healthy_verify_clock())
 
         outcome = await merge_through_lane(lane, queue, req)
         assert outcome is not None
@@ -12896,7 +12897,7 @@ class TestTrainLifecycleEvents:
         event_store = EventStore(db_path=db_path, run_id='train-member-deferred-run')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue, event_store=event_store)
+        lane = make_lane(git_ops, queue, event_store=event_store, clock=healthy_verify_clock())
 
         outcome = await merge_through_lane(lane, queue, req)
         assert outcome is not None
@@ -18275,7 +18276,7 @@ class TestLaneGenerationChain:
         branch_head_sha = branch_head_out.strip()
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
         req = _make_request('wt-1', 'chain-wt', wt, config)
         finalize_mock = AsyncMock(return_value=MergeOutcome('done', merge_sha='adv-sha'))
 
@@ -18478,7 +18479,7 @@ class TestTrainEquivalenceNeverAutoChains:
         """
         req = await _make_stacked_train(git_ops, config)
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
 
         finalize_mock = AsyncMock(return_value=MergeOutcome('done', merge_sha='adv-sha'))
 
@@ -18597,7 +18598,7 @@ class TestBoundaryTableWorkerEntry:
         assert len(_bt9_entry.waiters) == 2, 'must have 2 waiters'
 
         queue: asyncio.Queue = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
         outcome_primary = await merge_through_lane(lane, queue, req, timeout=30.0)
         outcome_wf = await asyncio.wait_for(wf_future, timeout=5.0)
 
@@ -18769,7 +18770,7 @@ class TestBoundaryTableWorkerEntry:
             return await _real_finalize(*args, **kwargs)
 
         queue: asyncio.Queue = asyncio.Queue()
-        lane = make_lane(git_ops, queue)
+        lane = make_lane(git_ops, queue, clock=healthy_verify_clock())
 
         with patch('orchestrator.merge_queue._finalize_advanced_merge', _spy_finalize):
             outcome = await merge_through_lane(lane, queue, req, timeout=30.0)
@@ -20788,7 +20789,7 @@ class TestDoTrainMergeTrainScope:
         db_path = tmp_path / 'train_scope.db'
         event_store = EventStore(db_path=db_path, run_id='test-train-scope')
         queue: asyncio.Queue = asyncio.Queue()
-        lane = make_lane(git_ops, queue, event_store=event_store)
+        lane = make_lane(git_ops, queue, event_store=event_store, clock=healthy_verify_clock())
 
         outcome = await merge_through_lane(lane, queue, req)
 
