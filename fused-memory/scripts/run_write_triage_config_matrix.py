@@ -275,6 +275,30 @@ def candidate_doc(row: Mapping[str, Any], population: Mapping[str, Any]) -> dict
     return {'quality': row['quality'], 'selection': row['selection'], 'population': population}
 
 
+def best_config(matrix: Mapping[str, Any]) -> dict[str, Any]:
+    """The winner's :func:`candidate_doc`, the doc its bounds were checked on, plus provenance.
+
+    Γ3 reads ``quality``, ``selection`` and ``population``; ``provenance``
+    names the arm and the bounds it failed, which are the checks Γ3 will fail.
+    """
+    winners = [
+        row for row in matrix['arms']
+        if row['status'] == 'scored' and row['arm'] == matrix['winner']
+    ]
+    if len(winners) != 1:
+        raise ValueError(f'the matrix winner {matrix["winner"]!r} names no single scored arm')
+    [row] = winners
+    checks = row['bounds']['checks']
+    return candidate_doc(row, matrix['population']) | {
+        'provenance': {
+            'arm': row['arm'],
+            'reference_arm': matrix['reference_arm'],
+            'meets_every_bound': row['bounds']['met'],
+            'failed_bounds': [check['check'] for check in checks if not check['ok']],
+        },
+    }
+
+
 def select_winner(rows: Sequence[Mapping[str, Any]]) -> tuple[str, bool]:
     """The winning arm by :data:`WINNER_RULE`, and whether no arm met every bound.
 
