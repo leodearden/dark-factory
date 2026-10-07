@@ -1267,7 +1267,12 @@ def create_mcp_server(
     """Create and configure the FastMCP server with all tools."""
 
     mcp = FastMCP('Fused Memory', instructions=FUSED_MEMORY_INSTRUCTIONS)
-    id_resolver = id_resolver or IdResolver.for_memory_service(memory_service)
+
+    def _resolver() -> IdResolver:
+        # Built per use: the resolver is stateless and its factory reads the
+        # service's CURRENT config, so a hot reload of the read timeout or
+        # collection prefix applies to the next resolution.
+        return id_resolver or IdResolver.for_memory_service(memory_service)
     _taskmaster_configured = task_interceptor is not None
 
     async def _backlog_gate(project_id: str) -> dict | None:
@@ -1522,7 +1527,11 @@ def create_mcp_server(
         return JSONResponse(_ALIVE_BODY, status_code=200)
 
     # POST /resolve-prefix: the uuid-prefix resolver for out-of-process callers (PRD C5).
-    register_resolve_prefix_route(mcp, id_resolver.resolve_prefix, known_projects=_kp)
+    register_resolve_prefix_route(
+        mcp,
+        lambda project_id, prefix: _resolver().resolve_prefix(project_id, prefix),
+        known_projects=_kp,
+    )
 
     # ------------------------------------------------------------------
     # Write tools
@@ -4998,7 +5007,7 @@ def create_mcp_server(
             return err
         resolved_from_prefix: str | None = None
         if is_uuid_prefix(memory_id):
-            answer = await _answer_prefix_read(id_resolver, project_id, memory_id, serves='mem0')
+            answer = await _answer_prefix_read(_resolver(), project_id, memory_id, serves='mem0')
             if isinstance(answer, dict):
                 return answer
             resolved_from_prefix, memory_id = memory_id, answer
@@ -5209,7 +5218,7 @@ def create_mcp_server(
         resolved_from_prefix: str | None = None
         if is_uuid_prefix(entity_uuid):
             answer = await _answer_prefix_read(
-                id_resolver, project_id, entity_uuid, serves='graphiti_node',
+                _resolver(), project_id, entity_uuid, serves='graphiti_node',
             )
             if isinstance(answer, dict):
                 await _log_read(
