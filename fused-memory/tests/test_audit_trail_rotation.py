@@ -11,6 +11,9 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from shared.task_metadata import parse_metadata
+
+from fused_memory import memory_metadata
 from fused_memory.reconciliation.audit_trail_rotation import (
     ARCHIVE_MAX_BYTES,
     HISTORY_KEEP,
@@ -452,3 +455,138 @@ class TestSizeTrigger:
         rendered = plan.render('mem-1').metadata
         for key, value in metadata.items():
             assert rendered[key] == value
+
+
+def prior_record(index: int) -> dict[str, Any]:
+    return {
+        'rotated_at': f'2026-09-{index + 1:02d}T00:00:00+00:00',
+        'trigger': 'pattern',
+        'archive_memory_id': f'prior-archive-{index}',
+        'bytes_before': 21_000,
+        'bytes_after': 9_000,
+    }
+
+
+class TestRollupRecord:
+    def _size_rotated(self) -> tuple[dict[str, Any], Any]:
+        existing = [
+            history_entry(f'foo_2026_08_{day:02d}', f'2026-08-{day:02d}', {'day': day})
+            for day in range(HISTORY_KEEP + 2, 0, -1)
+        ]
+        queries = [f'distinct topic {chr(97 + n)}' for n in range(HISTORY_KEEP + 2)]
+        metadata = {
+            **GATE_MARKERS,
+            **dated_family('x_relay', [20, 21]),
+            'foo_history': existing,
+            'memory_hints': {'entities': [], 'queries': queries},
+            ROLLUP_KEY: {'history_keys': ['foo_history']},
+        }
+        description = '\n\n'.join(cycle_blocks(30, filler_repeats=35))
+        task = make_task(description=description, details='Ruling: none yet.', metadata=metadata)
+        plan = plan_rotation(task, now=NOW)
+        assert plan is not None
+        return task, plan
+
+    def test_rollup_records_what_left_and_where_it_went(self):
+        task, plan = self._size_rotated()
+        rewrite = plan.render('mem-1')
+        rollup = rewrite.metadata[ROLLUP_KEY]
+        assert isinstance(rollup['standing_instruction'], str)
+        assert 'history_keys' in rollup['standing_instruction']
+        assert set(rollup['history_keys']) == {'foo_history', 'x_relay_history'}
+        record = rollup['rotations'][0]
+        assert record['rotated_at'] == NOW.isoformat()
+        assert record['trigger'] == 'size'
+        assert record['archive_memory_id'] == 'mem-1'
+        assert record['bytes_before'] == task_payload_bytes(task)
+        assert record['bytes_after'] == task_payload_bytes(rewritten(task, rewrite))
+        assert record['description_blocks_shed'] > 0
+        assert record['description_blocks_kept'] + record['description_blocks_shed'] == 30
+        assert len(record['shed_block_leads']) == record['description_blocks_shed']
+        assert record['shed_block_leads'][0] == 'Cycle 01 relay summary.'
+        assert record['history_entries_kept'] == {'foo_history': HISTORY_KEEP, 'x_relay_history': 2}
+        assert record['history_entries_shed'] == {'foo_history': 2}
+        assert set(record['folded_keys']) == {'x_relay_2026_09_20', 'x_relay_2026_09_21'}
+        assert record['memory_hint_queries_shed'] == 2
+
+    def test_pattern_rotation_is_recorded_as_pattern(self):
+        existing = [
+            history_entry(f'foo_2026_08_{day:02d}', f'2026-08-{day:02d}', day)
+            for day in range(HISTORY_MAX + 1, 0, -1)
+        ]
+        metadata = {'foo_history': existing, ROLLUP_KEY: {'history_keys': ['foo_history']}}
+        plan = plan_rotation(make_task(metadata=metadata), now=NOW)
+        assert plan is not None
+        record = plan.render('mem-1').metadata[ROLLUP_KEY]['rotations'][0]
+        assert record['trigger'] == 'pattern'
+        assert record['history_entries_shed'] == {'foo_history': HISTORY_MAX + 1 - HISTORY_KEEP}
+
+    def test_rotation_records_are_capped_and_the_oldest_is_archived(self):
+        prior = [prior_record(index) for index in range(HISTORY_KEEP)]
+        existing = [
+            history_entry(f'foo_2026_08_{day:02d}', f'2026-08-{day:02d}', day)
+            for day in range(HISTORY_MAX + 1, 0, -1)
+        ]
+        metadata = {
+            'foo_history': existing,
+            ROLLUP_KEY: {'history_keys': ['foo_history'], 'rotations': prior},
+        }
+        plan = plan_rotation(make_task(metadata=metadata), now=NOW)
+        assert plan is not None
+        rotations = plan.render('mem-1').metadata[ROLLUP_KEY]['rotations']
+        assert len(rotations) == HISTORY_KEEP
+        assert rotations[0]['archive_memory_id'] == 'mem-1'
+        assert rotations[1:] == prior[: HISTORY_KEEP - 1]
+        assert plan.archive_text is not None
+        shed = json.loads(archive_section(plan.archive_text, METADATA_SECTION))
+        assert shed[ROLLUP_KEY] == {'rotations': prior[HISTORY_KEEP - 1 :]}
+
+    def test_archive_metadata_uses_blessed_and_experimental_keys_only(self):
+        prior = [prior_record(index) for index in range(2)]
+        existing = [
+            history_entry(f'foo_2026_08_{day:02d}', f'2026-08-{day:02d}', day)
+            for day in range(HISTORY_MAX + 1, 0, -1)
+        ]
+        metadata = {
+            'foo_history': existing,
+            ROLLUP_KEY: {'history_keys': ['foo_history'], 'rotations': prior},
+        }
+        task = make_task(metadata=metadata)
+        plan = plan_rotation(task, now=NOW)
+        assert plan is not None
+        assert plan.archive_metadata == {
+            'source': 'audit_trail_rotation',
+            'task_id': '42',
+            'x_rotated_at': NOW.isoformat(),
+            'x_bytes_before': task_payload_bytes(task),
+            'x_previous_archive_memory_id': 'prior-archive-0',
+        }
+        assert memory_metadata.classify_unknown_keys(dict(plan.archive_metadata)) == []
+        assert (
+            memory_metadata.validate_memory_metadata(
+                dict(plan.archive_metadata), enforce_kind_registry=True
+            )
+            == []
+        )
+
+    def test_first_archive_has_no_previous_archive(self):
+        _, plan = self._size_rotated()
+        assert plan.archive_metadata['x_previous_archive_memory_id'] is None
+
+    def test_fold_only_plan_updates_history_keys_without_a_rotation_record(self):
+        prior = [prior_record(index) for index in range(2)]
+        metadata = {
+            **dated_family('x_relay', [20, 21]),
+            ROLLUP_KEY: {'history_keys': [], 'rotations': prior},
+        }
+        plan = plan_rotation(make_task(metadata=metadata), now=NOW)
+        assert plan is not None
+        assert plan.archive_text is None
+        rollup = plan.render(None).metadata[ROLLUP_KEY]
+        assert rollup['history_keys'] == ['x_relay_history']
+        assert rollup['rotations'] == prior
+
+    def test_rollup_key_is_a_blessed_task_metadata_key(self):
+        _, plan = self._size_rotated()
+        _, warnings = parse_metadata(plan.render('mem-1').metadata, direction='read')
+        assert [w for w in warnings if w.code == 'unknown_key' and w.field == ROLLUP_KEY] == []
