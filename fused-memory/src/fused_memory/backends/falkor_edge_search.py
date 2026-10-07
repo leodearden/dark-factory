@@ -59,15 +59,16 @@ _BFS_ORIGIN_LABELS = ('Entity', 'Episodic')
 
 
 def _bfs_reached_edges(depth: int) -> str:
-    """Every edge on a path of 1..*depth* hops from a BFS origin, once, bound as ``e``.
+    """Every fact edge on a path of 1..*depth* hops from a BFS origin, once, bound as ``e``.
 
-    One leg per origin label, so each looks its origins up through that label's
-    uuid index; UNION dedupes edges reached along several paths.
+    Paths also cross MENTIONS edges, which are traversed but not returned.  One
+    leg per origin label, so each looks its origins up through that label's uuid
+    index; UNION dedupes edges reached along several paths.
     """
     legs = (
         f'MATCH path = (origin:{label})-[:RELATES_TO|MENTIONS*1..{depth}]->(:Entity)'
         ' WHERE origin.uuid IN $bfs_origin_node_uuids'
-        ' UNWIND relationships(path) AS e RETURN e'
+        " UNWIND relationships(path) AS e WITH e WHERE type(e) = 'RELATES_TO' RETURN e"
         for label in _BFS_ORIGIN_LABELS
     )
     return f'CALL {{ {" UNION ".join(legs)} }}'
@@ -171,8 +172,6 @@ class FalkorEdgeSearch(SearchInterface):
         filter_queries, filter_params = edge_search_filter_query_constructor(
             search_filter, driver.provider
         )
-        # Paths also cross MENTIONS edges; stock returns only the RELATES_TO ones.
-        filter_queries.insert(0, "type(e) = 'RELATES_TO'")
         if group_ids is not None:
             filter_queries.append('e.group_id IN $group_ids')
             filter_params['group_ids'] = group_ids
