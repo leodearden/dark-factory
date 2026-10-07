@@ -23,6 +23,7 @@ import pytest
 from shared.cli_invoke import (
     _CAP_HIT_COOLDOWN_SECS,
     _MAX_CAP_COOLDOWN_SECS,
+    BUDGET_EXHAUSTED_SUBTYPE,
     CAP_HIT_RESUME_PROMPT,
     AgentFailureKind,
     AgentResult,
@@ -3006,6 +3007,13 @@ class TestClassifyAgentFailureOutcomeProjection:
         )
         cls = classify_agent_failure(result)
         assert cls.kind is AgentFailureKind.TIMED_OUT
+
+
+class TestBudgetExhaustedSubtype:
+    """The CLI wire value every package compares a budget abort against."""
+
+    def test_is_the_claude_cli_wire_value(self):
+        assert BUDGET_EXHAUSTED_SUBTYPE == 'error_max_budget_usd'
 
 
 class TestBuildFailureMessage:
