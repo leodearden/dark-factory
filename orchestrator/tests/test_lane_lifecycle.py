@@ -73,6 +73,11 @@ class TestStaticContract:
     def test_legal_transitions_excludes_illegal_edge(self):
         assert (LaneState.RELEASED, LaneState.IN_USE) not in LEGAL_TRANSITIONS
 
+    def test_in_use_returns_to_assigned_when_last_child_exits(self):
+        # Leaf δ (task 3076): IN_USE is a liveness marker over an ASSIGNED
+        # lane, so the last live child exiting must be able to step it back.
+        assert (LaneState.IN_USE, LaneState.ASSIGNED) in LEGAL_TRANSITIONS
+
     def test_quarantined_has_exactly_one_sanctioned_recycle_edge(self):
         # The ONE sanctioned exit from QUARANTINED: recycle a quarantined slot
         # back into service (QUARANTINED -> RELEASED) once its bad worktree was
@@ -140,6 +145,31 @@ class TestLegalRoundtrip:
         assert record.title is None
         assert record.branch == 'task/foo'  # branch is NOT cleared
         assert lifecycle.read(lane) == record
+
+    def test_in_use_round_trips_back_to_assigned_keeping_the_assignment(
+        self, tmp_path: Path,
+    ):
+        lifecycle = _lifecycle(tmp_path)
+        lane = tmp_path / '_lane-0'
+        lifecycle.transition(lane, LaneState.SEED, seeded_from_sha='abc123')
+        lifecycle.transition(lane, LaneState.REGISTERED, branch='task/2254')
+        lifecycle.transition(lane, LaneState.ASSIGNED, task_id='2254', title='demo')
+        in_use = lifecycle.transition(lane, LaneState.IN_USE)
+
+        record = lifecycle.transition(lane, LaneState.ASSIGNED)
+
+        assert record.state == LaneState.ASSIGNED
+        assert lifecycle.read(lane) == record
+        assert (record.task_id, record.title, record.branch) == (
+            in_use.task_id, in_use.title, in_use.branch,
+        ) == ('2254', 'demo', 'task/2254')
+        assert datetime.fromisoformat(record.updated_at) > datetime.fromisoformat(
+            in_use.updated_at,
+        )
+
+        released = lifecycle.transition(lane, LaneState.RELEASED)
+        assert released.state == LaneState.RELEASED
+        assert released.task_id is None
 
     def test_record_file_path_and_json_shape(self, tmp_path: Path):
         lifecycle = _lifecycle(tmp_path)
