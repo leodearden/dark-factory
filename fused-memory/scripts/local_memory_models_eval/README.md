@@ -239,6 +239,8 @@ Live endpoints come from `FusedMemoryConfig()` (honours `CONFIG_PATH`).
 | `integrity --reference G --candidate G` | ι | Re-embed integrity verdict over two scratch topologies (`topology.py`) |
 | `parity-check --run-a A --run-b B` | ζ | Client-class parity deltas (a − b) into `A/parity/<arm b>/metrics/` (`comparison.py`) |
 | `control-check --run A --run B [--run …] [--reference-outcomes F]` | ζ | Symmetry, one code sha, token/cost and reference checks (`checks.py`) |
+| `preregister --run-a A --run-b B --out F` | ζ | The incumbent control pair's margins, latency envelope and calls-per-episode profile, written to `F`; B must have run with `--reference-outcomes` A (`preregistration.py`, `margins.py`) |
+| `topology --graph G` | ζ, ι | A scratch graph's node and edge counts and topology hash: ζ freezes the reference graph, ι re-runs it to verify the graph is unchanged (`topology.py`) |
 | `teardown --arm-spec S [--collection]` | ι | Deletes the arm's scratch graph and, with `--collection`, its Qdrant replica (`teardown.py`) |
 
 `run` refuses before touching any store unless the spec's `code_sha` is the
@@ -253,7 +255,7 @@ population.
 |---|---|
 | 0 | ok |
 | 1 | the run could not complete (store unreachable, index build failed, the index probe could not remove its seeded node — the error names it — or a traceback) |
-| 2 | refused: invalid spec or input, a pre-run instrument check failed, a run dir is not fresh or not complete |
+| 2 | refused: invalid spec or input, a pre-run instrument check failed, a run dir is not fresh or not complete, a control pair yields no valid pre-registration |
 | 3 | an instrument check failed (post-run, smoke, index-check, integrity, control-check) |
 | 4 | INV-4 abort: consecutive episode failures stopped the run |
 | 5 | scratch guard: a non-`evalmem_` name reached a guarded checkpoint |

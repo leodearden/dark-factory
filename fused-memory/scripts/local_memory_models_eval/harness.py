@@ -11,6 +11,8 @@ Argument wiring and live dependencies only; every behaviour lives in
   integrity      whether a re-embedded scratch graph kept the reference topology
   parity-check   client-class parity deltas between two complete runs
   control-check  symmetry, code sha, token/cost and reference checks over control runs
+  preregister    the pre-registration inputs (margins, envelope, call profile) of a control pair
+  topology       a scratch graph's node/edge counts and topology hash
   teardown       delete the arm's scratch graph and, with --collection, its replica
 
 Exit codes, run-directory layout and the live check:
@@ -34,7 +36,8 @@ from falkordb.asyncio import FalkorDB
 from qdrant_client import AsyncQdrantClient
 from redis.exceptions import RedisError
 from shared.cli_boundary import LoudArgumentParser, run_cli
-from shared.memory_eval_metrics import run_stamp
+from shared.memory_eval_metrics import canonical_json_text, run_stamp
+from shared.safe_io import atomic_write_text
 
 from fused_memory.arm_harness.arm_backend import IndexBuildError, open_arm_backend
 from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec, load_arm_spec
@@ -52,11 +55,23 @@ from fused_memory.arm_harness.corpus import (
     select_replay_items,
 )
 from fused_memory.arm_harness.instrument_checks import CheckResult
+from fused_memory.arm_harness.llm_metrics import (
+    GRAPH_SAMENESS_DETAILS_FILENAME,
+    GraphSamenessDetails,
+    TokenAccountingError,
+)
+from fused_memory.arm_harness.margins import MarginDerivationError
 from fused_memory.arm_harness.metrics_record import (
     IndexConfiguration,
     MetricsRecord,
     load_metrics_records,
     write_metrics_record,
+)
+from fused_memory.arm_harness.preregistration import (
+    PreregistrationError,
+    PreregistrationInputs,
+    derive_preregistration_inputs,
+    serialize_preregistration_inputs,
 )
 from fused_memory.arm_harness.replay import ArmGraph, ReplayJournal
 from fused_memory.arm_harness.replay_types import (
@@ -66,6 +81,7 @@ from fused_memory.arm_harness.replay_types import (
     default_replay_settings,
 )
 from fused_memory.arm_harness.run import (
+    OUTCOMES_FILENAME,
     RUN_MANIFEST_FILENAME,
     PreRunCheckError,
     load_outcomes,
@@ -81,8 +97,10 @@ from fused_memory.arm_harness.scratch_guard import (
 from fused_memory.arm_harness.teardown import CollectionClient, teardown_arm
 from fused_memory.arm_harness.topology import (
     IntegrityVerdict,
+    Topology,
     check_reembed_integrity,
     read_topology,
+    topology_hash,
 )
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.services.write_journal import WriteJournal
@@ -275,18 +293,34 @@ def _load_control_run(run_dir: Path) -> tuple[RunManifest, tuple[MetricsRecord, 
     if not isinstance(run.spec, LlmArmSpec):
         raise _Refusal(
             EXIT_REFUSED,
-            f'control-check compares LLM control runs; {run_dir} is a {run.spec.axis} arm',
+            f'control runs are LLM arm runs; {run_dir} is a {run.spec.axis} arm',
         )
     return run, records
 
 
 def _load_reference(path: Path | None) -> tuple[EpisodeOutcome, ...] | None:
-    if path is None:
-        return None
+    return None if path is None else _read_outcomes(path)
+
+
+def _read_outcomes(path: Path) -> tuple[EpisodeOutcome, ...]:
     try:
         return load_outcomes(path)
     except (OSError, ValueError) as error:
         raise _Refusal(EXIT_REFUSED, f'{path} is not a readable outcomes file: {error}') from error
+
+
+def _load_sameness(run_dir: Path) -> GraphSamenessDetails:
+    path = run_dir / GRAPH_SAMENESS_DETAILS_FILENAME
+    if not path.is_file():
+        raise _Refusal(
+            EXIT_REFUSED,
+            f'{run_dir} has no {GRAPH_SAMENESS_DETAILS_FILENAME}: run B with '
+            "--reference-outcomes <A's outcomes.jsonl> so its graph-sameness is measured",
+        )
+    try:
+        return GraphSamenessDetails.model_validate_json(path.read_text())
+    except (OSError, ValueError) as error:
+        raise _Refusal(EXIT_REFUSED, f'{path} is not readable sameness details: {error}') from error
 
 
 def _scratch_graph(
@@ -426,6 +460,64 @@ def _cmd_control_check(args: argparse.Namespace, deps: DepsFactory) -> int:
     return _checks_exit_code(results)
 
 
+def _cmd_preregister(args: argparse.Namespace, deps: DepsFactory) -> int:
+    run_a, records_a = _load_control_run(args.run_a)
+    run_b, records_b = _load_control_run(args.run_b)
+    inputs = derive_preregistration_inputs(
+        run_a,
+        records_a,
+        _read_outcomes(args.run_a / OUTCOMES_FILENAME),
+        run_b,
+        records_b,
+        _read_outcomes(args.run_b / OUTCOMES_FILENAME),
+        _load_sameness(args.run_b),
+    )
+    atomic_write_text(args.out, serialize_preregistration_inputs(inputs), mkdir=True)
+    _print_preregistration(inputs)
+    print(f'wrote: {args.out}')
+    return EXIT_OK
+
+
+def _print_preregistration(inputs: PreregistrationInputs) -> None:
+    for entry in inputs.margins:
+        configuration = f' [{entry.index_configuration}]' if entry.index_configuration else ''
+        print(
+            f'margin {entry.metric_id}{configuration}: reference {entry.reference_value} '
+            f'sigma {entry.sigma} ({entry.sigma_source}) floor {entry.floor} '
+            f'margin {entry.margin} ({entry.direction})'
+        )
+    envelope, profile = inputs.envelope, inputs.call_profile
+    print(
+        f'envelope: warm p95 under load < {envelope.p95_bound_ms} ms '
+        f'(timeout {envelope.episode_timeout_s} s / headroom {envelope.headroom}); '
+        f'incumbent p95 {inputs.incumbent_latency_p95_ms} ms, '
+        f'max {inputs.incumbent_latency_max_ms} ms'
+    )
+    print(
+        f'calls/episode: p50 {profile.calls_p50} p95 {profile.calls_p95} '
+        f'max {profile.calls_max} over {profile.n_episodes} ok episodes'
+    )
+
+
+def _cmd_topology(args: argparse.Namespace, deps: DepsFactory) -> int:
+    require_scratch_name(args.graph, checkpoint=GuardCheckpoint.TOPOLOGY_READ)
+    topology = asyncio.run(_topology(deps(), args.graph))
+    summary = {
+        'graph': args.graph,
+        'node_count': len(topology.nodes),
+        'edge_count': len(topology.edges),
+        'topology_hash': topology_hash(*topology),
+    }
+    print(canonical_json_text(summary), end='')
+    return EXIT_OK
+
+
+async def _topology(live: HarnessDeps, graph_name: str) -> Topology:
+    async with live.open_falkordb() as client:
+        graph = _scratch_graph(client, graph_name, GuardCheckpoint.TOPOLOGY_READ)
+        return await read_topology(graph, graph_name)
+
+
 def _cmd_teardown(args: argparse.Namespace, deps: DepsFactory) -> int:
     spec = _load_spec(args.arm_spec)
     asyncio.run(_teardown(deps(), spec, collection=args.collection))
@@ -507,6 +599,20 @@ def _build_parser() -> argparse.ArgumentParser:
     control.add_argument('--reference-outcomes', type=Path)
     control.set_defaults(handler=_cmd_control_check)
 
+    preregister = commands.add_parser(
+        'preregister', help='derive the pre-registration inputs from two control runs'
+    )
+    preregister.add_argument('--run-a', type=Path, required=True, help='the reference control')
+    preregister.add_argument(
+        '--run-b', type=Path, required=True, help="the control run with A's reference outcomes"
+    )
+    preregister.add_argument('--out', type=Path, required=True, help='the inputs JSON to write')
+    preregister.set_defaults(handler=_cmd_preregister)
+
+    topology = commands.add_parser('topology', help="a scratch graph's topology hash")
+    topology.add_argument('--graph', required=True, help='scratch graph name')
+    topology.set_defaults(handler=_cmd_topology)
+
     teardown = commands.add_parser('teardown', help="delete the arm's scratch graph")
     _add_arm_spec(teardown)
     teardown.add_argument('--collection', action='store_true', help='also its Qdrant replica')
@@ -535,7 +641,13 @@ def main(argv: list[str] | None = None, *, deps: DepsFactory = build_live_deps) 
         return _report(refusal.exit_code, str(refusal))
     except ScratchGuardError as error:
         return _report(EXIT_SCRATCH_GUARD, _named(error))
-    except (PreRunCheckError, RunComparabilityError) as error:
+    except (
+        PreRunCheckError,
+        RunComparabilityError,
+        PreregistrationError,
+        MarginDerivationError,
+        TokenAccountingError,
+    ) as error:
         return _report(EXIT_REFUSED, _named(error))
     except (CorpusIntegrityError, build_corpus.CorpusBuildError) as error:
         return _report(EXIT_CORPUS_INTEGRITY, _named(error))
