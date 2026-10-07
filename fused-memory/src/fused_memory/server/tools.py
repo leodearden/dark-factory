@@ -1026,11 +1026,11 @@ def _truncate_payload(payload: Any) -> tuple[Any, bool]:
 #
 # RESERVED VALUE: '__unset__' is reserved and can never be stamped — a
 # caller that passed it literally as claimant_run_id would be silently
-# treated as "omitted" rather than stamped. This cannot happen today because
-# claimant_run_id is always machine-composed by
+# treated as "omitted" rather than stamped. The orchestrator's producer is
 # shared.task_claimant.compose_claimant_run_id() (format 'run/session/pid=N'),
-# never freeform text, but keep the reservation in mind before relaxing that
-# producer or introducing a new one.
+# but the wire accepts any string and freeform claimants exist in the corpus
+# (reify task 5225 carries 'agent-esc-5053-2-docs-fix' with heartbeat_at
+# NULL), so the reservation is a real constraint on every producer.
 _CLAIMANT_WIRE_UNSET = '__unset__'
 
 
@@ -1459,18 +1459,14 @@ def create_mcp_server(
     # to shared.task_statuses.TaskStatus is automatically accepted here without
     # a separate edit to this file.
     #
-    # Cross-package ordering note (task 2171 / rho1a): this union now includes
-    # 'infra-hold', so add_task/set_task_status accept it from ANY caller as
-    # of this change — not just a future orchestrator writer. orchestrator/
-    # src/orchestrator/task_status.py's own ACTIVE_TASK_STATUSES is a separate
-    # 6-member literal (out of this task's fused-memory-only scope) and has
-    # NOT been migrated to shared.task_statuses.ACTIVE yet, so it still does
-    # not recognize 'infra-hold'. Until that orchestrator-side migration
-    # lands (tracked as follow-up omega2/omega3 work), a task externally set
-    # to 'infra-hold' is classified active here but would not be recognized
-    # as such by the orchestrator scheduler. No current writer emits
-    # 'infra-hold', so this is inert today; do not treat its acceptance here
-    # as evidence the orchestrator side is also ready.
+    # Cross-package note (task 2171 / rho1a): this union includes
+    # 'infra-hold', so add_task/set_task_status accept it from ANY caller.
+    # The orchestrator emits it: orchestrator/src/orchestrator/workflow.py::
+    # TaskWorkflow._mark_blocked takes a block_status (default 'blocked'), and
+    # TaskWorkflow._execute_verify_review_loop passes 'infra-hold'. Its
+    # orchestrator/src/orchestrator/task_status.py::ACTIVE_TASK_STATUSES is
+    # deliberately ACTIVE - {TaskStatus.INFRA_HOLD}, so the scheduler's
+    # active fetch excludes a row this set classifies active.
     _VALID_TASK_STATUSES = ACTIVE_TASK_STATUSES | TERMINAL_STATUSES
     _VALID_STORES = frozenset(v.value for v in SourceStore)
     _VALID_CATEGORIES = frozenset(v.value for v in MemoryCategory)

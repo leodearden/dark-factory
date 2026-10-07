@@ -83,6 +83,12 @@ from fused_memory.middleware.path_scope_guard import (
 )
 from fused_memory.middleware.pre_done_hook import run_hook as _run_hook
 from fused_memory.middleware.project_prefix_registry import ProjectPrefixRegistry
+from fused_memory.middleware.recurrence_mint import (
+    RECURRENCE_MINT_SOURCE,
+    MintOutcomeKind,
+    mint_successor,
+    mints_successor,
+)
 from fused_memory.middleware.scope_violation_escalator import ScopeViolationEscalator
 from fused_memory.middleware.soft_scope_signals import (
     SoftScopeFinding,
@@ -262,6 +268,42 @@ def _maybe_kwargs(sentinel: object, **pairs: object) -> dict:
     (JSON cannot carry Python's ``_UNSET`` object across the wire).
     """
     return {k: v for k, v in pairs.items() if v is not sentinel}
+
+
+def _status_write_claimant_kwargs(
+    status: str, claimant_run_id: object, heartbeat_at: object,
+) -> dict[str, Any]:
+    """Claimant kwargs a status write forwards to the backend writer.
+
+    docs/prds/claimant-invariant-enforcement.md C4-E2: a terminal target whose
+    caller supplied no claimant (unsupplied or explicit None) clears BOTH
+    columns, so a heartbeat never outlives its claimant on a terminal row. A
+    supplied non-NULL claimant is honoured verbatim. C4-E3: every non-terminal
+    write keeps the plain tri-state forwarding.
+    """
+    if status in TERMINAL_STATUSES and (claimant_run_id is _UNSET or claimant_run_id is None):
+        return dict(claimant_run_id=None, heartbeat_at=None)
+    return _maybe_kwargs(_UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at)
+
+
+def _claimant_exception_entry(
+    status: str, claimant_run_id: object, *, agent_id: str | None, tag: str | None,
+) -> dict[str, Any] | None:
+    """Ledger entry for a terminal write that honours an explicit non-NULL claimant.
+
+    docs/prds/claimant-invariant-detection.md D-5/E-2: the sanctioned C4-E2
+    exception leaves its name in ``metadata.claimant_exception``. Every other
+    write (non-terminal, unsupplied or explicit-NULL claimant) gets None.
+    """
+    if status not in TERMINAL_STATUSES or claimant_run_id is _UNSET or claimant_run_id is None:
+        return None
+    return {
+        'claimant_run_id': claimant_run_id,
+        'target_status': status,
+        'agent_id': agent_id,
+        'tag': tag,
+        'stamped_at': datetime.now(UTC).isoformat(),
+    }
 
 
 def _is_ticket_id(value: object) -> bool:
@@ -1617,12 +1659,16 @@ class TaskInterceptor:
 
             # 3. Execute status change. Convert the typed DTO to a plain
             # dict so callers can tack on the reconciliation key below.
-            # claimant_kwargs carries claimant_run_id/heartbeat_at only when
-            # explicitly supplied (task 2182) — _UNSET params are omitted so
-            # the default call stays byte-identical to every existing caller.
-            claimant_kwargs: dict[str, Any] = _maybe_kwargs(
-                _UNSET, claimant_run_id=claimant_run_id, heartbeat_at=heartbeat_at,
+            # Sits after the same-status no-op (C4-E5) and feeds both writers:
+            # a terminal target clears an unsupplied claimant (task 4866).
+            claimant_kwargs: dict[str, Any] = _status_write_claimant_kwargs(
+                status, claimant_run_id, heartbeat_at,
             )
+            claimant_exception = _claimant_exception_entry(
+                status, claimant_run_id, agent_id=agent_id, tag=tag,
+            )
+            if claimant_exception is not None:
+                audit_fields['claimant_exception'] = claimant_exception
             # Same tri-state forwarding shape, one more kwarg: omitted unless
             # a batch clock was supplied, so the single-id call stays
             # byte-identical to a pre-3816 one (task 3816).
@@ -1671,8 +1717,8 @@ class TaskInterceptor:
                         tag=tag,
                         before_task=before,
                         requested_status=status,
-                        requested_claimant_write=claimant_run_id is not _UNSET,
-                        requested_heartbeat_write=heartbeat_at is not _UNSET,
+                        requested_claimant_write='claimant_run_id' in claimant_kwargs,
+                        requested_heartbeat_write='heartbeat_at' in claimant_kwargs,
                     )
                 )
             else:
@@ -1694,6 +1740,18 @@ class TaskInterceptor:
         if result.get('success') is False and result.get('error') == 'status_write_not_persisted':
             return result
 
+        if (persisted_exception := audit_fields.get('claimant_exception')) is not None:
+            logger.warning(
+                'claimant_exception: terminal write honoured an explicit claimant — '
+                'task_id=%s target_status=%s claimant_run_id=%s agent_id=%s tag=%s stamped_at=%s',
+                task_id,
+                persisted_exception['target_status'],
+                persisted_exception['claimant_run_id'],
+                persisted_exception['agent_id'],
+                persisted_exception['tag'],
+                persisted_exception['stamped_at'],
+            )
+
         # 5. Emit event
         payload: dict[str, Any] = {
             'task_id': task_id,
@@ -1711,6 +1769,18 @@ class TaskInterceptor:
             payload,
         )
         await self._journal(event)
+
+        # 5b. A recurrence carrier completed done mints its successor inline,
+        # so the caller's next read sees it (task 4866 r2). The mint takes the
+        # project write lock itself, so it stays outside the transition's
+        # (non-reentrant) lock.
+        if mints_successor(status, before):
+            await self._mint_recurrence_successor(
+                task_id=task_id,
+                project_root=project_root,
+                tag=tag,
+                project_id=project_id,
+            )
 
         # 6. Targeted reconciliation for trigger statuses (fire-and-forget)
         if status in self.STATUS_TRIGGERS and self.reconciler:
@@ -1735,6 +1805,50 @@ class TaskInterceptor:
             result['reconciliation'] = {'status': 'async', 'task_id': task_id}
 
         return result
+
+    async def _mint_recurrence_successor(
+        self, *, task_id: str, project_root: str, tag: str | None, project_id: str,
+    ) -> None:
+        """Mint a completed carrier's successor link, surviving the request's cancellation.
+
+        The status write has already committed, so the mint runs as a tracked
+        background task behind ``asyncio.shield``: a cancelled request leaves
+        it running to completion, and ``drain()`` awaits it at close, instead
+        of silently leaving the link done with no successor.
+        """
+        mint = asyncio.create_task(
+            self._mint_and_journal(
+                task_id=task_id, project_root=project_root, tag=tag, project_id=project_id,
+            ),
+            name=f'recurrence-mint-{task_id}',
+        )
+        self._background_tasks.add(mint)
+        mint.add_done_callback(self._background_tasks.discard)
+        await asyncio.shield(mint)
+
+    async def _mint_and_journal(
+        self, *, task_id: str, project_root: str, tag: str | None, project_id: str,
+    ) -> None:
+        tm = await self._ensure_taskmaster()
+        outcome = await mint_successor(
+            tm,
+            write_lock=self._write_lock(project_id),
+            predecessor_id=task_id,
+            project_root=project_root,
+            tag=tag,
+        )
+        if outcome.kind is MintOutcomeKind.MINTED:
+            event = self._make_event(
+                EventType.task_created,
+                project_root,
+                {
+                    'operation': 'add_task',
+                    'task_id': outcome.successor_id,
+                    'source': RECURRENCE_MINT_SOURCE,
+                    'minted_from': task_id,
+                },
+            )
+            await self._journal(event)
 
     # ── Claimant-only writes (no status-FSM gate) ───────────────────────
 
