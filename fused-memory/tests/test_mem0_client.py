@@ -701,6 +701,35 @@ class TestMem0BackendScrollCollectionPages:
         assert kwargs['scroll_filter'] == given_filter
 
     @pytest.mark.asyncio
+    async def test_payload_is_read_by_default(self, backend):
+        """Every existing caller reads payloads; the default must keep that."""
+        client = _paging_client([([], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            await _drain(backend.scroll_collection_pages('c', page_size=10))
+
+        assert client.scroll.await_args_list[0].kwargs['with_payload'] is True
+
+    @pytest.mark.asyncio
+    async def test_ids_only_walk_skips_payload_on_every_page(self, backend):
+        """with_payload=False reaches EVERY page request, and points still stream in order.
+
+        The uuid-prefix resolver enumerates ids only; a payload read on any
+        page would widen its data access for nothing.
+        """
+        p1, p2, p3 = (self._make_mock_point(f'id-{i}') for i in range(1, 4))
+        client = _paging_client([([p1, p2], 'off-1'), ([p3], None)])
+
+        with patch.object(backend, '_get_async_qdrant', AsyncMock(return_value=client)):
+            got = await _drain(
+                backend.scroll_collection_pages('fused_reify', with_payload=False, page_size=2)
+            )
+
+        assert got == [p1, p2, p3]
+        assert client.scroll.await_count == 2
+        assert [c.kwargs['with_payload'] for c in client.scroll.await_args_list] == [False, False]
+
+    @pytest.mark.asyncio
     async def test_empty_collection_yields_nothing(self, backend):
         client = _paging_client([([], None)])
 
