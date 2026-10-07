@@ -991,15 +991,17 @@ def _normalize_entry(raw: dict) -> dict:
     KeyError on partially-populated entries:
       - position  defaults to 0   (unknown position)
       - waiter_alive defaults to True  (assume waiter alive when unknown)
-      - age_secs  defaults to 0.0
+      - age_secs  is None when the snapshot omits it: an absent age is not
+        "queued just now"
     """
     waiter_alive = raw.get('waiter_alive')
     position = raw.get('position')
+    age_secs = raw.get('age_secs')
     return {
         'task_id': raw.get('task_id'),
         'branch': raw.get('branch'),
         'state': raw.get('state'),
-        'age_secs': float(raw.get('age_secs') or 0.0),
+        'age_secs': float(age_secs) if age_secs is not None else None,
         'position': int(position) if position is not None else 0,
         'waiter_alive': bool(waiter_alive) if waiter_alive is not None else True,
     }
