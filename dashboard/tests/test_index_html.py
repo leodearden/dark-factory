@@ -1774,6 +1774,55 @@ def test_memory_readings_js_load_order(
 
 
 # ---------------------------------------------------------------------------
+# Regression guard: system_health.js (task 6309) destructures window.DF_DATUM
+# and window.DF_TASKS_OFFLINE_BANNER at module scope, and tab_overview.jsx
+# destructures window.DF_SYSTEM_HEALTH — none with a fallback.
+# ---------------------------------------------------------------------------
+
+_SYSTEM_HEALTH_PREFIX = '/static/redux/system_health.js'
+
+
+def test_system_health_js_is_served(client) -> None:
+    """The module is reachable at runtime, not merely tagged in index.html."""
+    resp = client.get(_SYSTEM_HEALTH_PREFIX)
+    assert resp.status_code == 200, f'expected 200 for {_SYSTEM_HEALTH_PREFIX}, got {resp.status_code}'
+
+
+def test_system_health_js_has_cache_buster(index_html_body: str) -> None:
+    """system_health.js is present among the VERSIONED redux assets."""
+    assert re.search(r'/static/redux/system_health\.js\?v=\d+', index_html_body), (
+        'system_health.js is not among the versioned /static/redux/* assets in index.html. '
+        'Bump all /static/redux/* ?v= uniformly.'
+    )
+
+
+_SYSTEM_HEALTH_ORDER_CASES = [
+    (_DATUM_PREFIX, 'datum.js', _SYSTEM_HEALTH_PREFIX, 'system_health.js'),
+    ('/static/redux/tasks_offline_banner.js', 'tasks_offline_banner.js', _SYSTEM_HEALTH_PREFIX, 'system_health.js'),
+    (_SYSTEM_HEALTH_PREFIX, 'system_health.js', _TAB_OVERVIEW_PREFIX, 'tab_overview.jsx'),
+]
+
+
+@pytest.mark.parametrize(
+    'before_prefix, before_label, after_prefix, after_label',
+    _SYSTEM_HEALTH_ORDER_CASES,
+    ids=[f'{before}-before-{after}' for _, before, _, after in _SYSTEM_HEALTH_ORDER_CASES],
+)
+def test_system_health_js_load_order(
+    index_html_body: str, before_prefix: str, before_label: str, after_prefix: str, after_label: str,
+) -> None:
+    """system_health.js loads after what it reads and before what reads it."""
+    assert_script_loads_before(
+        index_html_body,
+        before_prefix,
+        after_prefix,
+        before_label=before_label,
+        after_label=after_label,
+        consumer_note=f'{after_label} ' + _READS_AT_MODULE_SCOPE.format(before=before_label),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Regression guard: dependency-free classic modules are served, versioned, and
 # load before every .jsx that reads them (task 5743)
 #
