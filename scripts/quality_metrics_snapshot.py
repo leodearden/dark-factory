@@ -642,7 +642,7 @@ def _invalid(origin: str, where: str, found: object, expected: object) -> source
     )
 
 
-def _section(snapshot: Mapping[str, Any], key: str, origin: str) -> dict[str, Any]:
+def _object_at(snapshot: Mapping[str, Any], key: str, origin: str) -> dict[str, Any]:
     value = snapshot[key]
     if not isinstance(value, dict):
         raise _invalid(origin, key, type(value).__name__, 'a JSON object')
@@ -679,15 +679,232 @@ def validate_snapshot(snapshot: object, *, origin: str) -> dict[str, Any]:
         raise _invalid(origin, 'schema_version', version, SCHEMA_VERSION)
     if tuple(snapshot) != _TOP_LEVEL_KEYS:
         raise _invalid(origin, 'the top-level key order', list(snapshot), list(_TOP_LEVEL_KEYS))
-    evidence = _section(snapshot, 'evidence', origin)
+    evidence = _object_at(snapshot, 'evidence', origin)
     if tuple(evidence) != _EVIDENCE_KEYS:
         raise _invalid(origin, 'evidence keys', list(evidence), list(_EVIDENCE_KEYS))
-    for path, record in _section(snapshot, 'files', origin).items():
+    for path, record in _object_at(snapshot, 'files', origin).items():
         _validate_record(path, record, origin)
-    graph = _section(snapshot, 'import_graph', origin)
+    graph = _object_at(snapshot, 'import_graph', origin)
     if set(graph) != set(_IMPORT_GRAPH_KEYS):
         raise _invalid(origin, 'import_graph keys', sorted(graph), sorted(_IMPORT_GRAPH_KEYS))
     return snapshot
+
+
+# ---------------------------------------------------------------------------
+# --diff: what moved between two validated snapshots, in the contract's order.
+
+#: The quality doc's two readings of a complexity pair (docs/code-quality.md §What to measure).
+_PAIR_MOVED = (
+    '; max down, total flat or down: complexity moved, per docs/code-quality.md §What to measure'
+)
+_PAIR_ADDED = '; total up: complexity added'
+_CROSSING_LABEL = 'measure per heuristic 14, not a target'
+
+
+@dataclasses.dataclass(frozen=True)
+class _Pairing:
+    """How the two snapshots' domain paths correspond."""
+
+    added: tuple[str, ...]
+    removed: tuple[str, ...]
+    renamed: tuple[tuple[str, str], ...]
+    compared: tuple[tuple[str, str], ...]  # (previous, current), measured on both sides
+
+
+def _domain_paths(snapshot: Mapping[str, Any]) -> set[str]:
+    return set(snapshot['files']) | set(snapshot['evidence']['unreadable'])
+
+
+def _renames(
+    gone: Iterable[str], arrived: Iterable[str], previous: Mapping[str, Any], current: Mapping[str, Any]
+) -> tuple[tuple[str, str], ...]:
+    """Measured paths that left and arrived with one blob, paired in sorted order."""
+    gone_by_blob: dict[str, list[str]] = {}
+    for path in sorted(gone):
+        gone_by_blob.setdefault(previous['files'][path]['blob'], []).append(path)
+    arrived_by_blob: dict[str, list[str]] = {}
+    for path in sorted(arrived):
+        arrived_by_blob.setdefault(current['files'][path]['blob'], []).append(path)
+    pairs = [
+        pair
+        for blob in gone_by_blob.keys() & arrived_by_blob.keys()
+        for pair in zip(gone_by_blob[blob], arrived_by_blob[blob], strict=False)
+    ]
+    return tuple(sorted(pairs))
+
+
+def _pairing(current: Mapping[str, Any], previous: Mapping[str, Any]) -> _Pairing:
+    current_domain, previous_domain = _domain_paths(current), _domain_paths(previous)
+    renamed = _renames(
+        (path for path in previous['files'] if path not in current_domain),
+        (path for path in current['files'] if path not in previous_domain),
+        previous,
+        current,
+    )
+    both = [(path, path) for path in set(previous['files']) & set(current['files'])]
+    return _Pairing(
+        added=tuple(sorted(current_domain - previous_domain - {new for _old, new in renamed})),
+        removed=tuple(sorted(previous_domain - current_domain - {old for old, _new in renamed})),
+        renamed=renamed,
+        compared=tuple(sorted([*both, *renamed], key=lambda pair: pair[1])),
+    )
+
+
+_RecordPair = tuple[str, Mapping[str, Any] | None, Mapping[str, Any] | None]
+
+
+def _record_pairs(
+    pairing: _Pairing, current: Mapping[str, Any], previous: Mapping[str, Any]
+) -> list[_RecordPair]:
+    """(path, previous record, current record) in path order; None for an absent side.
+
+    A path unreadable on either side has no pair: its measures are unknown.
+    """
+    now, before = current['files'], previous['files']
+    pairs: list[_RecordPair] = [(new, before[old], now[new]) for old, new in pairing.compared]
+    pairs += [(path, None, now[path]) for path in pairing.added if path in now]
+    pairs += [(path, before[path], None) for path in pairing.removed if path in before]
+    return sorted(pairs, key=lambda pair: pair[0])
+
+
+def _header(label: str, snapshot: Mapping[str, Any]) -> str:
+    complete = json.dumps(snapshot['evidence']['complete'])
+    return f'{label}: {snapshot["run_id"]} as_of {snapshot["as_of_sha"]} complete={complete}'
+
+
+def _unreadable_entries(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
+    return [
+        *(f'current: {path}' for path in current['evidence']['unreadable']),
+        *(f'previous: {path}' for path in previous['evidence']['unreadable']),
+    ]
+
+
+def _pair_entry(path: str, before: Mapping[str, Any], after: Mapping[str, Any]) -> str | None:
+    old_max, old_total = before['cognitive_max'], before['cognitive_total']
+    new_max, new_total = after['cognitive_max'], after['cognitive_total']
+    if (old_max, old_total) == (new_max, new_total):
+        return None
+    if new_max < old_max and new_total <= old_total:
+        reading = _PAIR_MOVED
+    elif new_total > old_total:
+        reading = _PAIR_ADDED
+    else:
+        reading = ''
+    return f'{path}: max {old_max} -> {new_max}, total {old_total} -> {new_total}{reading}'
+
+
+def _pair_entries(pairs: Sequence[_RecordPair]) -> list[str]:
+    entries = (
+        _pair_entry(path, before, after)
+        for path, before, after in pairs
+        if before is not None and after is not None
+    )
+    return [entry for entry in entries if entry is not None]
+
+
+def _crossing_entries(pairs: Sequence[_RecordPair]) -> list[str]:
+    entries = []
+    for path, before, after in pairs:
+        old = before['lines'] if before is not None else 0
+        new = after['lines'] if after is not None else 0
+        for mark, prefix in ((H14_SOFT_CEILING_LINES, ''), (H14_ALARM_LINES, 'ALARM ')):
+            if (old >= mark) != (new >= mark):
+                direction = 'up' if new >= mark else 'down'
+                entries.append(
+                    f'{path}: {old} -> {new} lines, {prefix}crossed {mark} {direction}; '
+                    f'{_CROSSING_LABEL}'
+                )
+    return entries
+
+
+#: (label, import_graph list, comparison key without line numbers, rendering of a key).
+_GRAPH_KINDS: tuple[tuple[str, str, Any, Any], ...] = (
+    ('edge', 'edges', lambda edge: tuple(edge), lambda key: f'{key[0]} -> {key[1]}'),
+    (
+        'reach-back',
+        'reach_back',
+        lambda entry: (entry['from'], entry['to'], tuple(entry['names'])),
+        lambda key: f'{key[0]} -> {key[1]} ({", ".join(key[2])})',
+    ),
+    (
+        'deferred',
+        'deferred',
+        lambda entry: (entry['from'], tuple(entry['imports'])),
+        lambda key: f'{key[0]}: {", ".join(key[1])}',
+    ),
+    ('cycle', 'cycles', lambda cycle: tuple(cycle), lambda key: ', '.join(key)),
+)
+
+
+def _graph_change_entries(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
+    entries = []
+    for label, name, key_of, render in _GRAPH_KINDS:
+        before = Counter(key_of(item) for item in previous['import_graph'][name])
+        after = Counter(key_of(item) for item in current['import_graph'][name])
+        entries += [f'{label} added: {render(key)}' for key in sorted((after - before).elements())]
+        entries += [f'{label} removed: {render(key)}' for key in sorted((before - after).elements())]
+    return entries
+
+
+def _change_parts(old: Iterable[str], new: Iterable[str]) -> list[str]:
+    old_set, new_set = set(old), set(new)
+    return [*(f'+{name}' for name in sorted(new_set - old_set)), *(f'-{name}' for name in sorted(old_set - new_set))]
+
+
+def _reexport_entries(pairs: Sequence[_RecordPair]) -> list[str]:
+    entries = []
+    for path, before, after in pairs:
+        if before is None or after is None or 'reexport_names' not in before:
+            continue
+        parts = _change_parts(before['reexport_names'], after['reexport_names'])
+        if parts:
+            entries.append(f're-export names: {path}: {", ".join(parts)}')
+    return entries
+
+
+_NO_COUPLING: Mapping[str, Any] = {'private_patch_targets': [], 'private_reads': 0}
+
+
+def _test_file_entries(pairs: Sequence[_RecordPair]) -> list[str]:
+    entries = []
+    for path, before, after in pairs:
+        if _TESTS not in ((before or {}).get('kind'), (after or {}).get('kind')):
+            continue
+        old, new = before or _NO_COUPLING, after or _NO_COUPLING
+        parts = []
+        if targets := _change_parts(old['private_patch_targets'], new['private_patch_targets']):
+            parts.append(', '.join(targets))
+        if old['private_reads'] != new['private_reads']:
+            parts.append(f'private reads {old["private_reads"]} -> {new["private_reads"]}')
+        if parts:
+            entries.append(f'{path}: {"; ".join(parts)}')
+    return entries
+
+
+def _diff_section(header: str, entries: Sequence[str]) -> list[str]:
+    """A header, then its entries indented; an empty section says so."""
+    return [header, *(f'  {entry}' for entry in entries or ['(none)'])]
+
+
+def diff_lines(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
+    """What moved from *previous* to *current*: measures and their changes, never a verdict."""
+    pairing = _pairing(current, previous)
+    pairs = _record_pairs(pairing, current, previous)
+    return [
+        _header('current', current),
+        _header('previous', previous),
+        *_diff_section('unreadable (measures unknown, never zero):', _unreadable_entries(current, previous)),
+        *_diff_section('files added:', pairing.added),
+        *_diff_section('files removed:', pairing.removed),
+        *_diff_section('files renamed (same blob):', [f'{old} -> {new}' for old, new in pairing.renamed]),
+        *_diff_section('complexity pair (max per function, module total):', _pair_entries(pairs)),
+        *_diff_section('heuristic-14 crossings (measure, not fix):', _crossing_entries(pairs)),
+        *_diff_section(
+            'import graph:',
+            [*_graph_change_entries(current, previous), *_reexport_entries(pairs)],
+        ),
+        *_diff_section('test files (private patch targets, private reads):', _test_file_entries(pairs)),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -756,6 +973,15 @@ def _measure(args: argparse.Namespace) -> int:
     )
     if previous is None:
         print(NO_PREVIOUS_LINE)
+    else:
+        print('\n'.join(diff_lines(snapshot, previous)))
+    return 0
+
+
+def _compare(args: argparse.Namespace) -> int:
+    current = load_snapshot(Path(args.current))
+    previous = load_snapshot(Path(args.diff))
+    print('\n'.join(diff_lines(current, previous)))
     return 0
 
 
@@ -765,6 +991,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _require_one_mode(parser, args)
     try:
+        if args.current is not None:
+            return _compare(args)
         return _measure(args)
     except source_measures.MetricsError as exc:
         print(f'quality_metrics_snapshot: {exc}', file=sys.stderr)
