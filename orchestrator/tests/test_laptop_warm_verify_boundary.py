@@ -5220,9 +5220,10 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
 
     Asserts within a bounded T that the verify-merge process itself
     self-exits non-zero (the watchdog's controlled ``os._exit(1)``, not an
-    external kill signal), and that every pid snapshotted from the leader's
-    tree while it was alive -- the leader and the start_new_session build --
-    has exited (see :func:`assert_pre_kill_tree_exited`).
+    external kill signal) with the ``eof`` trigger, and only that trigger, on
+    its stderr, and that every pid snapshotted from the leader's tree while
+    it was alive -- the leader and the start_new_session build -- has exited
+    (see :func:`assert_pre_kill_tree_exited`).
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
     cfg_file = tmp_path / 'config.yaml'
@@ -5258,6 +5259,11 @@ def test_ssh_dropped_mid_build_tree_killed_via_eof_dispatcher_alive(tmp_path):
             )
         assert child.returncode != 0, (
             f'expected non-zero exit (watchdog self-kill), got {child.returncode}'
+        )
+        assert_watchdog_fire_trigger(
+            drain_exited_stderr(child).decode(errors='replace'),
+            WatchdogTrigger.EOF,
+            source='Row 2 leader stderr',
         )
 
         assert_pre_kill_tree_exited(
@@ -5302,9 +5308,10 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     here is ~15s rather than production's ~95s; see ROW_WATCHDOG_ENV's comment
     above for the pin rationale and the honest cliff-moved caveat.
 
-    Asserts the leader self-exits non-zero, and that every pid snapshotted
-    from the leader's tree while it was alive -- the leader and the
-    start_new_session build -- has exited (see
+    Asserts the leader self-exits non-zero with the ``heartbeat_starvation``
+    trigger, and only that trigger, on its stderr, and that every pid
+    snapshotted from the leader's tree while it was alive -- the leader and
+    the start_new_session build -- has exited (see
     :func:`assert_pre_kill_tree_exited`).
     """
     repo, head_sha = _setup_verify_repo(tmp_path)
@@ -5345,6 +5352,11 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
             )
         assert child.returncode != 0, (
             f'expected non-zero exit (watchdog self-kill), got {child.returncode}'
+        )
+        assert_watchdog_fire_trigger(
+            drain_exited_stderr(child).decode(errors='replace'),
+            WatchdogTrigger.HEARTBEAT_STARVATION,
+            source='Row 3 leader stderr',
         )
 
         assert_pre_kill_tree_exited(
