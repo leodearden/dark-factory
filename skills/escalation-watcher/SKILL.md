@@ -1411,6 +1411,18 @@ cannot be spoofed by the caller — the identical non-spoofable attribution cont
 already documents for `resolved_by` (see "Recognizing the supervised auto-watcher's resolutions"
 below).
 
+### Refuting a premise: the claim's execution context, or it is not a refutation
+
+A check that does not reproduce an escalation's premise refutes it only if it ran in the premise's
+execution context; anywhere else it is a non-reproduction. The rule covers the probes you re-run and
+the resolution text you write. It also covers spawn briefs: never hand a spawned session a premise
+marked disproved, or marked "do not re-derive", unless the refuting check ran in that context, and
+state the context each cited check ran in. Specimen: on esc-legibility-trickle-reify-3 a brief
+refuted a boot-time timer's PATH premise from a post-login interactive shell. The premise was right,
+and the auto-watcher's triage note had said its probe did not verify the job's own PATH. Single
+normative statement of the rule:
+`orchestrator/src/orchestrator/agents/premise_refutation_guidance.py::PREMISE_REFUTATION_GUIDANCE`.
+
 ### Reading preserved framing (`amendments`)
 
 A pending L2 is a **cluster**, and `escalation-watcher-auto` re-promotes the same cluster every

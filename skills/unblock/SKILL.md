@@ -215,6 +215,8 @@ This is where you determine the nature and severity of each issue. The goal is t
 - Blocker: can't safely merge or continue without resolving this
 - Nice-for-later: real issue, but safe to defer to the backlog
 
+**Is the premise contested?** A check in this session, or in an Explore agent's session, that does not reproduce an issue's premise is a non-reproduction, not a refutation, unless it ran in the premise's execution context. Say which context each check ran in. Single normative statement of the rule: `orchestrator/src/orchestrator/agents/premise_refutation_guidance.py::PREMISE_REFUTATION_GUIDANCE`.
+
 ---
 
 ## Step 3: Present findings
