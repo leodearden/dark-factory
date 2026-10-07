@@ -181,7 +181,7 @@ class TestAddMemoryIntentBracketing:
     async def test_digest_failure_still_journals_intent_without_digest(
         self, recovery_service, recovery_journal
     ):
-        """Losing the digest costs only the fingerprint, never the write-ahead intent."""
+        """Nested mixed-type keys break only the sorted digest; the journal still stores the intent."""
         svc = recovery_service
         content = 'always pin dependencies exactly'
 

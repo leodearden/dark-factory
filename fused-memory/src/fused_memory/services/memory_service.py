@@ -2830,10 +2830,8 @@ class MemoryService:
         dead-lettered intent carries a stable fingerprint of exactly what
         would have been written, for audit and manual replay.
 
-        Fail-open, never raises (the same contract as
-        ``WriteJournal.log_mem0_intent``): it runs after add_memory's Graphiti
-        leg is already enqueued, so on failure it logs at ERROR and returns
-        None rather than stranding that twin.
+        Never raises, like ``WriteJournal.log_mem0_intent``: on failure it logs
+        at ERROR and returns None.
         """
         try:
             canonical = json.dumps(
@@ -6917,13 +6915,8 @@ class MemoryService:
         - only FAILED mem0 backend_op(s) → ``add()`` raised. In the common
           (clean, pre-persist) failure mem0 did not land, so re-issue is safe
           (0 prior writes + 1 = 1): rebuild ``Scope`` + metadata and call
-          ``mem0.add``; ``completed`` on success, ``dead`` on error. The
-          re-issue goes through ``_journaled_backend_call`` under the intent's
-          own ``write_op_id``, so a crash after a successful re-issue leaves a
-          SUCCESS mem0 backend_op and the next startup reconciles the intent
-          ``completed`` instead of re-issuing again; the only remaining window
-          is the instant between ``mem0.add`` returning and its backend_op
-          committing — the same window add_memory's own leg has.
+          ``mem0.add``; ``completed`` on success, ``dead`` on error. Crash
+          after re-issue: ``fused-memory/tests/test_mem0_intent_recovery.py::TestRecoverMem0Intents::test_crash_after_successful_reissue_is_reconciled_not_reissued_again``.
           RESIDUAL DUPLICATE RISK (accepted, documented): a failure raised
           AFTER mem0 committed but at/near the response (e.g. a read-timeout
           on an otherwise-successful add) ALSO records a FAILED backend_op
