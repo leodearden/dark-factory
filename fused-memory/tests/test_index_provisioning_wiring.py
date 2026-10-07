@@ -31,6 +31,7 @@ from _falkor_index_doubles import (
     statements_read,
     statements_written,
 )
+from shared.testing_virtual_clock import virtual_clock_test
 from test_falkor_indices import _TRAP_PRESENT, LIVE_HEADER
 
 from fused_memory.backends.falkor_indices import expected_index_set, plan_index_statements
@@ -140,7 +141,7 @@ class TestStartupSweep:
             for r in caplog.records
         ), 'a graph whose provisioning raised must be named in a WARNING'
 
-    @pytest.mark.asyncio
+    @virtual_clock_test
     async def test_a_hung_falkordb_delays_the_sweep_by_one_budget_not_one_per_graph(
         self, mock_config, make_backend, make_graph_mock, caplog,
     ):
