@@ -74,6 +74,7 @@ PURE_STDLIB_LEAVES = (
     'proc_group',
     'psi',
     'pytest_jobserver',
+    'pytest_mark_grammar',
     'ratchet',
     'reify_checkout',
     'safe_io',

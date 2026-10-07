@@ -35,6 +35,8 @@ import shlex
 import tomllib
 from collections.abc import Callable, Iterator, Sequence
 
+from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
+
 
 class _Unsupported(Exception):
     """A marker-expression node outside this module's deliberately tiny grammar."""
@@ -87,7 +89,8 @@ def _addopts_tokens(pyproject_text: str | None) -> list[str] | None:
 
 #: Shell chain operators that terminate one clause of a chained command.
 #: Mirrors ``verify_cmd._CHAIN_OPERATOR_TOKENS`` by value, duplicated rather
-#: than imported to keep this module dependency-free (see the module docstring).
+#: than imported to keep this module free of orchestrator imports (see the
+#: module docstring); its one import is the stdlib-only shared mark grammar.
 _CHAIN_OPERATOR_TOKENS = frozenset({'&&', '||', ';', '|'})
 
 
@@ -171,48 +174,6 @@ def resolve_marker_expression(
     return _marker_expr_from_tokens(tokens)
 
 
-def _is_pytestmark_target(node: ast.expr) -> bool:
-    """True iff *node* is the bare name ``pytestmark``."""
-    return isinstance(node, ast.Name) and node.id == 'pytestmark'
-
-
-def _pytestmark_value(statement: ast.stmt) -> ast.expr | None:
-    """The value *statement* binds to ``pytestmark``, else None.
-
-    Covers both the plain ``pytestmark = ...`` and the annotated
-    ``pytestmark: list = ...`` spellings; an annotation with no value binds
-    nothing.
-    """
-    if isinstance(statement, ast.Assign):
-        if any(_is_pytestmark_target(target) for target in statement.targets):
-            return statement.value
-        return None
-    if isinstance(statement, ast.AnnAssign) and _is_pytestmark_target(statement.target):
-        return statement.value
-    return None
-
-
-def _marker_name(element: ast.expr) -> str | None:
-    """The marker name in a ``pytest.mark.NAME`` / ``pytest.mark.NAME(...)`` element.
-
-    Anything else — a bare constant, a local name, an unrelated attribute chain —
-    yields None and is skipped silently, without suppressing its siblings.
-    """
-    if isinstance(element, ast.Call):
-        element = element.func
-    if not isinstance(element, ast.Attribute):
-        return None
-    owner = element.value
-    if (
-        isinstance(owner, ast.Attribute)
-        and owner.attr == 'mark'
-        and isinstance(owner.value, ast.Name)
-        and owner.value.id == 'pytest'
-    ):
-        return element.attr
-    return None
-
-
 def _pytestmark_marker_names(body: Sequence[ast.stmt]) -> frozenset[str]:
     """Marker names the ``pytestmark`` binding in *body* names, else an empty set.
 
@@ -231,21 +192,22 @@ def _pytestmark_marker_names(body: Sequence[ast.stmt]) -> frozenset[str]:
     ``pytestmark`` bound inside an ``if`` is not the enclosing scope's marker.
     Accepted value shapes: a bare ``pytest.mark.NAME``, a
     ``pytest.mark.NAME(...)`` call, or a list/tuple of either.  A non-marker
-    element yields None from :func:`_marker_name` and is skipped silently,
-    without suppressing its siblings.  If the scope rebinds ``pytestmark`` more
-    than once, the LAST binding wins, mirroring Python's own semantics.
+    element yields None from ``shared.pytest_mark_grammar.marker_name`` and is
+    skipped silently, without suppressing its siblings.  If the scope rebinds
+    ``pytestmark`` more than once, the LAST binding wins, mirroring Python's
+    own semantics.  The element grammar itself is ``shared.pytest_mark_grammar``.
     """
     value: ast.expr | None = None
     for statement in body:
-        bound = _pytestmark_value(statement)
+        bound = pytestmark_value(statement)
         if bound is not None:
             value = bound
     if value is None:
         return frozenset()
 
-    elements = list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
     return frozenset(
-        name for name in (_marker_name(element) for element in elements) if name is not None
+        name for name in (marker_name(element) for element in mark_elements(value))
+        if name is not None
     )
 
 
@@ -313,12 +275,12 @@ def _class_marker_names(node: ast.ClassDef) -> frozenset[str]:
 
     A non-marker element (e.g. the ``qdrant_skipif()`` call heading the real
     shape at ``fused-memory/tests/test_mem0_client.py``) yields None from
-    :func:`_marker_name` and is skipped silently, without suppressing its
-    siblings.
+    ``shared.pytest_mark_grammar.marker_name`` and is skipped silently, without
+    suppressing its siblings.
     """
     markers = {
         name
-        for name in (_marker_name(decorator) for decorator in node.decorator_list)
+        for name in (marker_name(decorator) for decorator in node.decorator_list)
         if name is not None
     }
 
@@ -739,7 +701,7 @@ def per_item_marker_names(source: str | None) -> tuple[frozenset[str], ...] | No
             continue
         decorator_markers = frozenset(
             name
-            for name in (_marker_name(decorator) for decorator in node.decorator_list)
+            for name in (marker_name(decorator) for decorator in node.decorator_list)
             if name is not None
         )
         items.append(module_markers | decorator_markers)

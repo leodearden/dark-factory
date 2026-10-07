@@ -87,7 +87,7 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 def _marker_name(element: ast.expr) -> str | None:
     """The marker name in a ``pytest.mark.NAME`` / ``pytest.mark.NAME(...)`` element.
 
-    Mirrors ``orchestrator.pytest_markers._marker_name`` BY CONSTRUCTION, not
+    Mirrors ``shared.pytest_mark_grammar.marker_name`` BY CONSTRUCTION, not
     by import — see the module docstring's note on the two modules'
     deliberately opposite fail-safe polarities. Anything else — a bare
     constant, a local name, an unrelated attribute chain — yields None and is
@@ -416,44 +416,20 @@ class TestAppliedMarkerNames:
             _applied_marker_names('def f(:\n    pass\n')
 
 
-class TestMirrorsPytestMarkersByConstruction:
+class TestMirrorsPytestMarkGrammarByConstruction:
     """Cross-checks that ``_marker_name``, ``_is_pytestmark_target`` and
-    ``_pytestmark_value`` above have not silently DRIFTED from
-    ``orchestrator.pytest_markers``' same-named originals they were mirrored
-    from BY CONSTRUCTION rather than by import (module docstring; reviewer
-    finding, task 3532 amendment pass).
+    ``_pytestmark_value`` above have not silently DRIFTED from the public
+    originals in ``shared.pytest_mark_grammar`` they mirror BY CONSTRUCTION
+    rather than by import (reviewer finding, task 3532 amendment pass).
 
-    WHY NOT JUST IMPORT THEM, addressing the finding directly: the three
-    functions here ARE pure, polarity-neutral AST-shape predicates — nothing
-    about them raises or swallows — so the module docstring's "opposite
-    fail-safe polarity" rationale genuinely does not cover them; that
-    rationale is about ``_applied_marker_names``/``_unregistered_markers``
-    (loud) versus ``module_level_marker_names`` (swallows ``SyntaxError``
-    into ``frozenset()``) — the SWEEP layer, not this shape-recognition
-    layer. But ``orchestrator.pytest_markers``'s module docstring separately
-    declares "This module's sole consumer is
-    ``verify_plan._derive_module_runs``" (a design decision this task's plan
-    weighed and kept), and even that module's own dedicated test,
-    test_pytest_marker_deselection.py, only ever imports its PUBLIC names
-    (``deselecting_expression_for_targets``, ``module_level_marker_names``,
-    etc.) — never these underscore-prefixed helpers. Importing the private
-    names here for production use would make this file the source module's
-    second real consumer while its docstring still claims one, and updating
-    that claim is outside this task's locked scope (pytest_markers.py is not
-    a file this task holds a lock on). A plain import was therefore not the
-    right fix to land unilaterally in this pass.
-
-    So instead: this class imports the source module's private predicates
-    LOCALLY, inside each test, for comparison ONLY — never for the guard's
-    own operation, which keeps mirroring them by construction as designed —
-    and asserts the two implementations agree on every shape below. This
-    converts the exact risk the finding named (a future fix to the source,
-    e.g. recognising an aliased ``import pytest as _pytest`` — a gap both
-    modules' docstrings already flag — landing there without a matching
-    update here) from a SILENT divergence into a LOUD, immediate test
-    failure, which is the same guarantee an import would have bought,
-    without relocating the "sole consumer" question to a file this task
-    cannot edit.
+    The guard's own operation keeps using the local mirrors; the originals are
+    imported LOCALLY, inside each test, for comparison ONLY.  A future fix to
+    the source (e.g. recognising an aliased ``import pytest as _pytest`` -- a
+    gap both modules' docstrings already flag) that lands there without a
+    matching update here is thereby a LOUD, immediate failure rather than a
+    silent divergence.  ``_is_pytestmark_target`` is compared through
+    ``pytestmark_value``, the public function it serves: the shared module
+    keeps that predicate private.
     """
 
     @pytest.mark.parametrize('source_expr', [
@@ -465,31 +441,25 @@ class TestMirrorsPytestMarkersByConstruction:
         'pytest.raises',
     ])
     def test_marker_name_matches_the_source_module(self, source_expr):
-        from orchestrator.pytest_markers import _marker_name as upstream_marker_name
+        from shared.pytest_mark_grammar import marker_name as upstream_marker_name
 
         element = ast.parse(source_expr, mode='eval').body
         assert _marker_name(element) == upstream_marker_name(element)
-
-    @pytest.mark.parametrize('name_expr', ['pytestmark', 'not_pytestmark', 'x'])
-    def test_is_pytestmark_target_matches_the_source_module(self, name_expr):
-        from orchestrator.pytest_markers import _is_pytestmark_target as upstream
-
-        node = ast.parse(name_expr, mode='eval').body
-        assert _is_pytestmark_target(node) == upstream(node)
 
     @pytest.mark.parametrize('source', [
         'pytestmark = pytest.mark.slow\n',
         'pytestmark: list = [pytest.mark.slow]\n',
         'pytestmark: list\n',
+        'not_pytestmark = pytest.mark.slow\n',
         'x = 1\n',
         'x: int = 1\n',
     ])
     def test_pytestmark_value_matches_the_source_module(self, source):
-        from orchestrator.pytest_markers import _pytestmark_value as upstream
+        from shared.pytest_mark_grammar import pytestmark_value as upstream
 
         statement = ast.parse(source).body[0]
         # Both implementations, given the SAME statement object, either
-        # return None or hand back the identical `statement.value` child —
+        # return None or hand back the identical `statement.value` child --
         # `is`, not `==`, is the precise check (ast nodes have no structural
         # equality).
         assert _pytestmark_value(statement) is upstream(statement)

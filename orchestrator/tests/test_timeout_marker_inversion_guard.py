@@ -69,8 +69,7 @@ from _orch_helpers import (
     VERIFY_CLI_PER_TEST_TIMEOUT,
     WHOLE_TREE_SCAN_TEST_TIMEOUT,
 )
-
-from orchestrator.pytest_markers import _marker_name, _pytestmark_value
+from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
 
 # This module is ITSELF a whole-tree AST scanner -- it rglob()s every *.py
 # under this directory and ast.parse()s each one -- so it is a member of the
@@ -290,7 +289,7 @@ def _timeout_sites_in(elements: list[ast.expr], qualname: str, kind: str) -> lis
     """
     sites: list[_Site] = []
     for element in elements:
-        if not isinstance(element, ast.Call) or _marker_name(element) != 'timeout':
+        if not isinstance(element, ast.Call) or marker_name(element) != 'timeout':
             continue
         arg = _timeout_call_arg(element)
         sites.append(
@@ -303,11 +302,6 @@ def _timeout_sites_in(elements: list[ast.expr], qualname: str, kind: str) -> lis
             )
         )
     return sites
-
-
-def _mark_elements(value: ast.expr) -> list[ast.expr]:
-    """A ``pytestmark`` binding's marks, unwrapping the list/tuple form."""
-    return list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
 
 
 def _timeout_marker_sites(source: str) -> tuple[_Site, ...]:
@@ -339,8 +333,8 @@ def _timeout_marker_sites(source: str) -> tuple[_Site, ...]:
     a decorator on a function defined INSIDE another function is not a
     collected pytest item, so it is not a site.
 
-    ``_marker_name`` and ``_pytestmark_value`` are imported from
-    :mod:`orchestrator.pytest_markers` rather than re-derived, for the same
+    ``marker_name`` and ``pytestmark_value`` are imported from
+    :mod:`shared.pytest_mark_grammar` rather than re-derived, for the same
     reason test_whole_tree_scan_timeout_guard.py imports them: the grammar of a
     ``pytest.mark.NAME`` element and of a ``pytestmark`` binding (``Assign`` vs
     ``AnnAssign``, list/tuple element forms) belongs in exactly one place, and
@@ -366,11 +360,11 @@ def _timeout_marker_sites_in(tree: ast.Module) -> tuple[_Site, ...]:
 
     def walk(body: list[ast.stmt], prefix: str) -> None:
         for statement in body:
-            bound = _pytestmark_value(statement)
+            bound = pytestmark_value(statement)
             if bound is not None:
                 qualname = f'{prefix}{_PYTESTMARK_QUALNAME}' if prefix else _MODULE_QUALNAME
                 kind = 'class-pytestmark' if prefix else 'module-pytestmark'
-                sites.extend(_timeout_sites_in(_mark_elements(bound), qualname, kind))
+                sites.extend(_timeout_sites_in(mark_elements(bound), qualname, kind))
             if isinstance(statement, ast.ClassDef):
                 qualname = f'{prefix}{statement.name}'
                 sites.extend(
@@ -547,14 +541,14 @@ def _usefixtures_names(node: ast.ClassDef) -> frozenset[str]:
     """
     marks: list[ast.expr] = list(node.decorator_list)
     for statement in node.body:
-        bound = _pytestmark_value(statement)
+        bound = pytestmark_value(statement)
         if bound is not None:
-            marks.extend(_mark_elements(bound))
+            marks.extend(mark_elements(bound))
 
     return frozenset(
         argument.value
         for mark in marks
-        if isinstance(mark, ast.Call) and _marker_name(mark) == 'usefixtures'
+        if isinstance(mark, ast.Call) and marker_name(mark) == 'usefixtures'
         for argument in mark.args
         if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
     )
