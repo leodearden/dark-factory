@@ -804,8 +804,7 @@ only ever as a report-only note per the audit rule above — never as a finding.
 **Tool error handling**: if `count_memories_by_metadata` returns an error (e.g. backend \
 unavailable), treat as inconclusive and do NOT reconstruct — the documented harm is \
 false-positive reconstruction (wasteful duplicate summaries), so bias toward skipping \
-reconstruction on uncertainty. Note the tool error in your cycle report instead. \
-This mirrors the Flag Suppression Check's conservative handling of search failures.
+reconstruction on uncertainty. Note the tool error in your cycle report instead.
 
 Rationale: back-to-back remediation passes otherwise trigger double-reconstruction of \
 the same Stage 2 summary, producing duplicate per-cycle entries a later cycle must clean \
@@ -824,14 +823,13 @@ search Mem0 for a completion summary written by TaskInterceptor / TargetedReconc
   project_id=..., categories=['observations_and_summaries'], stores=['mem0'], limit=20)
 
 Including `task_id=<task_id>` in the query biases the vector ranking toward the specific \
-task's entry (mirroring the Flag Suppression Check which uses \
-`query="stage1_flag_suppression task_id=<N>"`); without it a generic query risks ranking \
+task's entry; without it a generic query risks ranking \
 the relevant entry out of the top-20 when many tasks have completion summaries.
 
 Inspect each result: if any result satisfies BOTH of the following, do NOT emit the \
 missing-completion-summary finding for that task:
   1. `str(result.metadata.get('task_id')) == str(task_id)` (both sides coerced to str \
-to handle legacy int vs str task_id — consistent with the Flag Suppression Check)
+to handle legacy int vs str task_id)
   2. `result.metadata.get('source') == 'targeted_reconciliation'` \
 OR the result content contains "completed"
 
@@ -853,62 +851,19 @@ through can be cleaned up in a later consolidation cycle.
 ## Flag Suppression Check
 **The deterministic suppression gate is enforced in code** by \
 `flag_dedup.filter_suppressed`, which runs as the first step of the post-processor \
-before any flag reaches the signature-dedup loop.  You do not need to perform this \
-check yourself — suppressed flags are dropped automatically.
+before any flag reaches the signature-dedup loop and reads ONLY `recon_ledger` rows.  \
+You do not need to perform this check yourself — suppressed flags are dropped automatically.
 
-As an optimisation you *may* skip emitting a flag for a task that you know is \
-suppressed, but the code gate is the authoritative enforcement point; any flag you \
-emit for a suppressed task_id (and, for a scoped record, matching flag_type — see \
-below) will be dropped by the post-processor regardless.
+Do NOT withhold a flag because you believe it is suppressed: emit it. The code gate \
+is the only authority on what is suppressed, and it drops every flag matched by an \
+active suppression row (for a scoped row, only a matching flag_type — see below).
 
 {render_suppression_schema_section()}
-
-Producing a suppression record: operators and remediation hooks should call \
-`fused_memory.reconciliation.flag_dedup.write_suppression_record(memory_service, \
-project_id=..., task_id=N, flag_types=[...])` rather than constructing the \
-canonical schema by hand. The helper coerces `task_id` to a string (accepting a \
-single numeric id or a comma-joined composite signature), sorts/dedupes \
-`flag_types`, and pins the metadata.kind/content shape so future schema changes \
-touch one location. **Prefer a scoped record** (explicit `flag_types`) over the \
-legacy blanket form: scoping to the specific flag_type(s) you intend to suppress \
-means a newly-relevant flag_type for the same task is NOT silently blanket-blocked. \
-This is not hypothetical — an unscoped record once let an unrelated flag_type's \
-blanket suppression hide a genuinely recurring \
-`live_workflow_recurrence_counter_needed` flag for 6+ cycles with no tracking task. \
-Omit `flag_types` only when you deliberately want to silence every flag_type for \
-that task.
-
-If you do choose to check: call \
-`search(query="stage1_flag_suppression task_id=<N>", project_id=..., \
-categories=['observations_and_summaries'], stores=['mem0'], limit=50)`. \
-`task_id=<N>` in the query biases vector ranking; `limit=50` overrides the \
-default `limit=10` so a busy project doesn't drop the record; `limit=50` is \
-intentionally smaller than `filter_suppressed`'s bulk-sweep `limit=501` because \
-the `task_id=<N>` bias makes 50 sufficient for a single-task lookup. \
-Historical/legacy suppression records were written with `task_id` as either \
-`int` or `str`; new records are pinned to `int` by `build_suppression_payload`, \
-but readers MUST coerce both sides via `str(...)` to remain compatible with \
-legacy data: a result is a valid suppression record ONLY when BOTH \
-`metadata.kind == "stage1_flag_suppression"` AND \
-`str(result.metadata.get('task_id')) == str(target_task_id)`. When the matched \
-record also carries a non-empty `metadata.flag_types`, it is in effect for your \
-candidate flag ONLY if `str(candidate_flag_type)` also appears in that list \
-(str-coerced, same convention as task_id); an empty/absent `flag_types` means the \
-record is blanket and applies regardless of flag_type. Do NOT rely on \
-semantic/vector proximity alone — a result that fails either metadata field, or \
-an empty result set, means "no suppression in effect"; proceed normally.
-
-If the suppression search returns an error or times out, treat suppression as \
-not-in-effect and proceed with normal flag emission; record the search failure \
-in your cycle summary so operators can re-check. This mirrors the conservative \
-pass-through that the post-processor's `filter_suppressed` already performs in \
-code, keeping prompt-driven and code-driven outcomes aligned.
 
 Suppression is distinct from the post-processor dedup described in the next section. \
 Dedup collapses repeated emissions of the same (task_id, flag_type) pair across runs; \
 suppression authoritatively forbids flag emission for a task_id — either for every \
-flag_type (legacy blanket record) or for a scoped subset of flag_types (a record \
-carrying a non-empty `flag_types`). \
+flag_type (blanket rows) or for a scoped subset of flag_types (scoped rows). \
 The contamination cycle motivating this gate: Stage 1 writes a violating flag → Stage 3 \
 detects it → remediation deletes it → next cycle Stage 1 writes it again. \
 `flag_dedup.filter_suppressed` breaks this cycle deterministically in code.

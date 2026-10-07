@@ -78,6 +78,9 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
 )
 from fused_memory.models.scope import Scope
+from fused_memory.reconciliation.flag_record_contract import (
+    enforce_flag_record_write_contract,
+)
 from fused_memory.reconciliation.recon_pool_map import (
     CYCLE_SUMMARY_KIND as _CYCLE_SUMMARY_KIND,
 )
@@ -6613,6 +6616,9 @@ class MemoryService:
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         write_op_id = str(uuid_mod.uuid4())
 
+        # Stage-1 flag-record write contract: flag_record_contract.py.
+        meta = enforce_flag_record_write_contract(metadata, agent_id=agent_id)
+
         # Resolve category
         if category is None:
             classification = await self.classifier.classify(content)
@@ -6624,7 +6630,6 @@ class MemoryService:
 
         memory_ids: list[str] = []
         stores_written: list[SourceStore] = []
-        meta = dict(metadata or {})
         meta['category'] = resolved_category.value
         _stamp_unverified_claim(meta, unverified_claim)
 
@@ -7046,9 +7051,11 @@ class MemoryService:
         scope = Scope(project_id=project_id, agent_id=agent_id, session_id=session_id)
         write_op_id = str(uuid_mod.uuid4())
 
+        # Stage-1 flag-record write contract: flag_record_contract.py.
+        meta = enforce_flag_record_write_contract(metadata, agent_id=agent_id)
+
         resolved_category = MemoryCategory(category) if isinstance(category, str) else category
 
-        meta = dict(metadata or {})
         meta['category'] = resolved_category.value
         # No completion-claim gate runs on this path, so it never tags.
         _stamp_unverified_claim(meta, False)

@@ -46,6 +46,7 @@ from fused_memory.reconciliation.flag_dedup import (
     filter_false_phantom_task_creation_flags,
     safe_get_task,
 )
+from fused_memory.reconciliation.flag_record_contract import STAGE1_FLAG_MARKER_KIND
 from fused_memory.reconciliation.live_workflow_section import (
     render_live_workflow_section,
 )
@@ -1081,16 +1082,17 @@ _STAGE2_PERSISTENCE_MARKER_GC_SWEEP_SOURCE = 'stage2_persistence_marker_gc_sweep
 # under {'source': 'stage1_flag_marker'} vs 1 under
 # {'kind': 'stage1_flag_marker'} — marker a5732b3b, agent_id
 # 'recon-stage-task_knowledge_sync', 37 days old at measurement time).
-# That write is now REJECTED outright by the task-2596 add_memory gate
-# (server/tools.py:2978-2993, error flag_marker_write_blocked) for any
-# 'recon-stage-*' agent_id — the leaked marker predates that gate rather
-# than evidencing a live bypass; the only residual write hole is a
-# non-'recon-stage-*' agent_id, which the gate's prefix check does not
-# reach. See _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS below. 14 days
+# That write is now REJECTED outright for any 'recon-stage-*' agent_id
+# (flag_record_contract.py::recon_stage_flag_kind_refusal, error
+# flag_marker_write_blocked), and any other new marker write is normalized
+# to carry both keys at the MemoryService seam
+# (flag_record_contract.py::normalize_flag_record_metadata, task 4863) — the
+# leaked marker predates both rather than evidencing a live bypass. See
+# _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS below. 14 days
 # reuses the STAGE2_PERSISTENCE_MARKER_MAX_AGE_DAYS / task-1944 convention
 # as a conservative, consistent aging cutoff rather than deleting
 # immediately.
-_STAGE1_FLAG_MARKER_MEM0_SOURCE = 'stage1_flag_marker'
+_STAGE1_FLAG_MARKER_MEM0_SOURCE = STAGE1_FLAG_MARKER_KIND
 STAGE1_FLAG_MARKER_MEM0_MAX_AGE_DAYS: int = 14
 _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE = 'stage1_flag_marker_gc_sweep'
 
@@ -1102,12 +1104,13 @@ _STAGE1_FLAG_MARKER_GC_SWEEP_SOURCE = 'stage1_flag_marker_gc_sweep'
 # agent via the add_memory MCP tool, which set 'kind' but omitted 'source'
 # entirely — the same un-normalized-LLM-metadata failure class task 2966
 # already documented for flag_for_stage2 (see the type-drift note below).
-# That specific write shape now predates the task-2596 add_memory gate
-# (server/tools.py:2978-2993), which rejects it outright for any
-# 'recon-stage-*' agent_id; the residual write hole is a
-# non-'recon-stage-*' agent_id, which nothing at the add_memory boundary
-# normalizes. A {'source': ...}-only filter therefore silently misses that
-# cohort forever: measured live counts are know_live: 0 under
+# That write shape is now refused for any 'recon-stage-*' agent_id, and
+# every other new write is normalized to carry both keys at the
+# MemoryService seam (flag_record_contract.py::normalize_flag_record_metadata,
+# task 4863). Records written before that normalization still carry only one
+# key, so this dual-spelling union remains the safety net for them: a
+# {'source': ...}-only filter would silently miss that legacy cohort
+# forever: measured live counts are know_live: 0 under
 # {'source': 'stage1_flag_marker'} vs 1 under {'kind': 'stage1_flag_marker'}.
 # Qdrant payload filters are AND-only within one dict, so a
 # source=X OR kind=X predicate cannot be expressed in a single call — each
