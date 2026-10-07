@@ -82,6 +82,13 @@ CREATE TABLE IF NOT EXISTS adjudications (
     run_id TEXT NOT NULL,
     at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS run_adjudications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    adjudication_id INTEGER NOT NULL REFERENCES adjudications (id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS run_adjudications_by_run
+    ON run_adjudications (run_id, adjudication_id);
 CREATE TABLE IF NOT EXISTS actions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id TEXT NOT NULL,
@@ -413,9 +420,10 @@ class LinkHealLedger:
     def add_adjudications(
         self, run_id: str, records: Sequence[AdjudicationRecord],
     ) -> list[int]:
+        """Ledger *records* as made by *run_id*, which rests on each; their ids, in order."""
         at = _now()
         with self._conn:
-            return [
+            ids = [
                 _lastrowid(self._conn.execute(
                     'INSERT INTO adjudications (project_id, child_id, parent_id, child_sha256, '
                     'parent_sha256, verdict, reason, model, run_id, at) '
@@ -428,6 +436,19 @@ class LinkHealLedger:
                 ))
                 for record in records
             ]
+            self._rest_on(run_id, ids)
+        return ids
+
+    def reuse_adjudications(self, run_id: str, adjudication_ids: Iterable[int]) -> None:
+        """Record that *run_id* rests on adjudications an earlier run made."""
+        with self._conn:
+            self._rest_on(run_id, adjudication_ids)
+
+    def _rest_on(self, run_id: str, adjudication_ids: Iterable[int]) -> None:
+        self._conn.executemany(
+            'INSERT OR IGNORE INTO run_adjudications (run_id, adjudication_id) VALUES (?, ?)',
+            [(run_id, adjudication_id) for adjudication_id in adjudication_ids],
+        )
 
     def adjudication_at(
         self,
@@ -446,11 +467,12 @@ class LinkHealLedger:
         return None if row is None else _adjudication_row(row)
 
     def adjudication_verdicts(self, run_ids: Iterable[str]) -> list[Verdict]:
-        """The verdict of every adjudication the runs *run_ids* made."""
+        """The verdict of every adjudication the runs *run_ids* rest on, made or reused, once each."""
         wanted = sorted(set(run_ids))
         placeholders = ', '.join('?' for _ in wanted)
         rows = self._conn.execute(
-            f'SELECT verdict FROM adjudications WHERE run_id IN ({placeholders}) ORDER BY id',
+            'SELECT verdict FROM adjudications WHERE id IN (SELECT adjudication_id FROM '
+            f'run_adjudications WHERE run_id IN ({placeholders})) ORDER BY id',
             wanted,
         )
         return [Verdict(verdict) for (verdict,) in rows]

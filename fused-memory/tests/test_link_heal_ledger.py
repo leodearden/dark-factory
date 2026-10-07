@@ -78,7 +78,7 @@ class TestSchema:
             tables = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table'"))
         finally:
             conn.close()
-        for name in ('runs', 'adjudications', 'actions'):
+        for name in ('runs', 'adjudications', 'run_adjudications', 'actions'):
             assert re.search(
                 r'\bid INTEGER PRIMARY KEY AUTOINCREMENT\b', tables[name],
             ), tables[name]
@@ -455,6 +455,29 @@ class TestAdjudications:
         ledger.add_adjudications(run_id, [_record(1)])
 
         assert ledger.adjudication_verdicts(set()) == []
+
+    def test_a_run_that_reuses_adjudications_rests_on_them(self, ledger):
+        first = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        same, _related = ledger.add_adjudications(
+            first, [_record(1, verdict=Verdict.SAME), _record(2, verdict=Verdict.RELATED)],
+        )
+        second = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+
+        ledger.reuse_adjudications(second, [same])
+
+        assert ledger.adjudication_verdicts({second}) == [Verdict.SAME]
+
+    def test_an_adjudication_two_named_runs_rest_on_counts_once(self, ledger):
+        first = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        ids = ledger.add_adjudications(
+            first, [_record(1, verdict=Verdict.SAME), _record(2, verdict=Verdict.RELATED)],
+        )
+        second = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        ledger.reuse_adjudications(second, ids)
+
+        verdicts = ledger.adjudication_verdicts({first, second})
+
+        assert sorted(verdicts) == sorted([Verdict.SAME, Verdict.RELATED])
 
     def test_a_record_whose_verdict_is_not_a_verdict_cannot_be_built(self):
         with pytest.raises((TypeError, ValueError), match='MAYBE'):

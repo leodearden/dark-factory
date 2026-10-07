@@ -51,7 +51,7 @@ from fused_memory.maintenance.link_heal_executor import (
 )
 from fused_memory.maintenance.link_heal_ledger import ActionState, LinkHealLedger, RunSource
 from fused_memory.maintenance.link_heal_store import text_sha256
-from fused_memory.server.grouped_read import SIGHTING_KIND
+from fused_memory.server.grouped_read import AMENDMENT_KIND, SIGHTING_KIND
 
 LIMITS = RunLimits(
     max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=3,
@@ -408,6 +408,54 @@ class TestApplyRefusesAdjudicatedHealsPastAShareCeiling:
         assert filer.escapes == []
         assert report.counts.applied == 20
         assert report.counts.stopped_by is None
+
+
+async def replan_on_reused_verdicts(
+    harness: LinkHealHarness, ledger: LinkHealLedger, plan_path: Path,
+) -> RunReport:
+    """A re-plan whose every heal rests on verdicts an earlier plan run made.
+
+    30 sightings are judged, 12 of them misfile. Their children are relabelled to
+    amendments at unchanged texts, so an apply at a raised ceiling finds every heal
+    stale. The re-plan reuses all 30 verdicts and stages 12 new detaches.
+    """
+    children = seed_sightings(harness, 30)
+    await adjudicated_plan(harness, ledger, scripted({n: Verdict.RELATED for n in range(12)}), plan_path)
+    for child in children:
+        harness.mem0.payload(DF, child)['kind'] = AMENDMENT_KIND
+    stale = await run_apply(
+        store=harness.store(), ledger=ledger,
+        limits=dataclasses.replace(LIMITS, misfile_share_ceiling=1.0),
+        filer=RecordingFiler(), source=RunSource.ADJUDICATOR,
+    )
+    assert stale.counts.skipped_stale == 30
+    never_asked = always(Verdict.EXTENDS)
+    report = await adjudicated_plan(harness, ledger, never_asked, plan_path)
+    assert never_asked.pairs == []
+    assert report.counts.adjudications_reused == 30
+    assert dict(report.counts.planned_by_action) == {HealAction.DETACH.value: 12}
+    return report
+
+
+class TestHealsPlannedOnReusedVerdictsMeetTheSameCeilings:
+    @pytest.mark.asyncio
+    async def test_the_replan_forecasts_the_misfile_share_escape(self, harness, ledger, tmp_path):
+        report = await replan_on_reused_verdicts(harness, ledger, tmp_path / 'p.json')
+
+        assert report.counts.would_escape == (MISFILE_SHARE_ANCHOR,)
+        assert report.counts.escaped == ()
+
+    @pytest.mark.asyncio
+    async def test_apply_refuses_its_heals_and_escalates_once(self, harness, ledger, tmp_path):
+        await replan_on_reused_verdicts(harness, ledger, tmp_path / 'p.json')
+        filer = RecordingFiler()
+
+        report = await adjudicated_apply(harness, ledger, filer)
+
+        assert_refused(harness, ledger, report, pending=12)
+        (escape,) = filer.escapes
+        assert escape.anchor == MISFILE_SHARE_ANCHOR
+        assert (escape.detail['n'], escape.detail['count']) == (30, 12)
 
 
 class TestEveryExecutorAnchorHasARoute:

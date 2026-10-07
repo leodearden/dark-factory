@@ -205,6 +205,19 @@ def share_escapes(
     return tuple(escape for escape in escapes if escape is not None)
 
 
+def adjudicated_share_escapes(
+    heals: Sequence[ActionRow],
+    ledger: LinkHealLedger,
+    limits: RunLimits,
+    *,
+    projects: Sequence[str],
+) -> tuple[Escape, ...]:
+    """The share escapes of the adjudications behind *heals*: every one, made or reused,
+    that the plan runs which staged them rest on. A plan run forecasts with it; apply gates on it."""
+    verdicts = ledger.adjudication_verdicts({row.run_id for row in heals})
+    return share_escapes(verdicts, limits, projects=projects)
+
+
 def _share_escape(
     verdicts: Sequence[Verdict],
     counted: frozenset[Verdict],
@@ -451,7 +464,8 @@ async def _publish_plan(
 ) -> RunReport:
     """Stage *plan* against the ledger, write its document, and finish *run_id*.
 
-    *escapes*, and the backlog escape, are recorded as ``would_escape``.
+    *escapes*, and the backlog and share escapes an apply of *source*'s pending
+    heals would raise now, are recorded as ``would_escape``.
     """
     staged = _stage(plan.actions, ledger)
     counts = replace(
@@ -472,7 +486,10 @@ async def _publish_plan(
         return RunReport(run_id=run_id, counts=counts)
     sha = plan_sha256(document)
     backlog = backlog_escape(len(pending), limits, projects=projects)
-    would_escape = tuple(escape.anchor for escape in (backlog, *escapes) if escape is not None)
+    shares = adjudicated_share_escapes(pending, ledger, limits, projects=projects)
+    would_escape = tuple(
+        escape.anchor for escape in (backlog, *shares, *escapes) if escape is not None
+    )
     counts = replace(counts, would_escape=would_escape)
     ledger.finish_run(run_id, counts=counts.as_json(), plan_sha256=sha)
     return RunReport(run_id=run_id, counts=counts, plan_sha256=sha, plan_path=plan_path)
@@ -547,13 +564,8 @@ class _Adjudicated:
     failed: int
     storms: tuple[Mapping[str, Any], ...]
 
-    def escapes(self, limits: RunLimits, projects: Sequence[str]) -> tuple[Escape, ...]:
-        """The share escapes over this run's new verdicts, then its failure storms."""
-        verdicts = [record.verdict for record in self.records]
-        return (
-            *share_escapes(verdicts, limits, projects=projects),
-            *(adjudicator_storm_escape(storm, projects=projects) for storm in self.storms),
-        )
+    def storm_escapes(self, projects: Sequence[str]) -> tuple[Escape, ...]:
+        return tuple(adjudicator_storm_escape(storm, projects=projects) for storm in self.storms)
 
 
 async def _adjudicate(
@@ -598,14 +610,16 @@ async def run_adjudicator_plan(
 
     The adjudicator is asked only about the links the verdict rows decide and
     that the ledger holds no adjudication of at their current texts. Every read
-    and every question is made before the run row exists. A failed verdict is
-    counted, never ledgered; a share over its ceiling and a failure storm are
-    recorded as ``would_escape``, never filed.
+    and every question is made before the run row exists. The run rests on the
+    adjudications it makes and on those it reuses. A failed verdict is counted,
+    never ledgered; a share over its ceiling and a failure storm are recorded as
+    ``would_escape``, never filed.
     """
     reads = await read_links(store, census, projects)
     adjudicated = await _adjudicate(_candidates(reads), ledger, adjudicate)
     run_id = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
     new_ids = ledger.add_adjudications(run_id, adjudicated.records)
+    ledger.reuse_adjudications(run_id, [row.adjudication_id for row in adjudicated.reused])
     bases = [
         *(_adjudicator_basis(row.adjudication_id, row.record) for row in adjudicated.reused),
         *(
@@ -622,7 +636,7 @@ async def run_adjudicator_plan(
     return await _publish_plan(
         replace(plan, counts=counts), run_id,
         ledger=ledger, limits=limits, projects=projects, source=RunSource.ADJUDICATOR,
-        plan_path=plan_path_for(run_id), escapes=adjudicated.escapes(limits, projects),
+        plan_path=plan_path_for(run_id), escapes=adjudicated.storm_escapes(projects),
     )
 
 
@@ -842,9 +856,8 @@ def _share_refusal(
     projects: Sequence[str],
     approved_plan_sha256: str | None,
 ) -> RunCounts | None:
-    """File the share escapes the plan runs behind *pending* trip; ``None`` when none does."""
-    verdicts = ledger.adjudication_verdicts({row.run_id for row in pending})
-    escapes = share_escapes(verdicts, limits, projects=projects)
+    """File the share escapes the adjudications behind *pending* trip; ``None`` when none does."""
+    escapes = adjudicated_share_escapes(pending, ledger, limits, projects=projects)
     if not escapes:
         return None
     return RunCounts(
