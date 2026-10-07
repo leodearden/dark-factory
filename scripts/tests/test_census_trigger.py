@@ -1411,6 +1411,62 @@ def test_decide_for_project_never_censused_floor_blocks_from_the_earliest_codebo
     assert "BLOCKS" in floor_lines[0]
 
 
+def _watermarked_state(*, last_census_days_ago, watermark_days_ago):
+    return {
+        "last_census_at": (NOW - timedelta(days=last_census_days_ago)).isoformat(),
+        "last_census_report": "plans/confusion-census-prior.md",
+        "last_census_run_id": "census-dark_factory-20260702",
+        "session_watermark": (NOW - timedelta(days=watermark_days_ago)).isoformat(),
+    }
+
+
+def test_decide_for_project_floor_reads_the_session_watermark_not_last_census_at(tmp_path):
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path, **_watermarked_state(last_census_days_ago=12, watermark_days_ago=3)
+    )
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert "max-interval: 12.0d since last census (threshold 10d) -> FIRE" in decision.reasons
+    assert decision.fire is False
+    assert (
+        "floor: 3.0d since session watermark (floor 5d) -> BLOCKS all conditions"
+        in decision.reasons
+    )
+
+
+def test_decide_for_project_floor_clears_on_an_old_watermark(tmp_path):
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path, **_watermarked_state(last_census_days_ago=12, watermark_days_ago=12)
+    )
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert decision.fire is True
+    assert any(r.startswith("max-interval:") and "-> FIRE" in r for r in decision.reasons)
+    assert "floor: 12.0d since session watermark (floor 5d)" in decision.reasons
+
+
+@pytest.mark.parametrize("watermark_present", [True, False], ids=["null", "absent"])
+def test_decide_for_project_null_or_absent_watermark_falls_back_to_last_census_at(
+    tmp_path, watermark_present
+):
+    state = _watermarked_state(last_census_days_ago=12, watermark_days_ago=12)
+    if watermark_present:
+        state["session_watermark"] = None
+    else:
+        del state["session_watermark"]
+    _write_codebook(tmp_path)
+    _write_census_state(tmp_path, **state)
+
+    decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
+
+    assert decision.fire is True
+    assert "floor: 12.0d since last_census_at (no watermark yet) (floor 5d)" in decision.reasons
+
+
 def test_decide_for_project_row2_day9_no_spike_low_delta_no_fire(tmp_path):
     _write_codebook(tmp_path)
     _write_census_state(
@@ -1668,6 +1724,37 @@ def test_cli_evaluate_malformed_state_never_crashes_and_exits_0(tmp_path, capsys
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "DECISION:" in captured.out
+
+
+def _cli_floor_line(tmp_path, capsys):
+    exit_code = ct.main(["evaluate", "--project-root", str(tmp_path)])
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    (floor_line,) = [
+        line for line in captured.out.splitlines() if line.startswith("floor:")
+    ]
+    return floor_line
+
+
+def test_cli_evaluate_prints_a_floor_line_naming_its_anchor(tmp_path, capsys):
+    six_days_ago = datetime.now(UTC) - timedelta(days=6)
+    _write_codebook(tmp_path)
+    _write_census_state(
+        tmp_path,
+        last_census_at=six_days_ago.date().isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+    )
+
+    assert "since last_census_at (no watermark yet)" in _cli_floor_line(tmp_path, capsys)
+
+    _write_census_state(
+        tmp_path,
+        last_census_at=six_days_ago.date().isoformat(),
+        last_census_report="plans/confusion-census-prior.md",
+        session_watermark=six_days_ago.isoformat(),
+    )
+
+    assert "since session watermark" in _cli_floor_line(tmp_path, capsys)
 
 
 # ---------------------------------------------------------------------------
