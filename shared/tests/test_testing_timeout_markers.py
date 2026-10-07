@@ -1,10 +1,11 @@
-"""Contract of shared/src/shared/testing_timeout_markers.py, over inline fixtures."""
+"""Contract of shared/src/shared/testing_timeout_markers.py."""
 
 from __future__ import annotations
 
 import ast
 import textwrap
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from pathlib import Path
 from types import MappingProxyType
 
 import pytest
@@ -14,7 +15,9 @@ from shared.testing_timeout_markers import (
     SiteKind,
     TimeoutSite,
     inverts,
+    scan_python_tree,
     timeout_marker_sites,
+    verify_cli_timeout,
 )
 
 _NO_SANCTIONED_NAMES: Mapping[str, float] = MappingProxyType({})
@@ -296,3 +299,131 @@ def test_a_budget_that_empties_the_band_is_refused(budget: int) -> None:
 
     assert str(DELIBERATE_TIGHT_BOUND_CEILING) in str(refused.value)
     assert str(budget) in str(refused.value)
+
+
+# ---------------------------------------------------------------------------
+# verify_cli_timeout -- the budget a package's verify test_command passes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(('test_command', 'expected'), [
+    ('uv run --directory fused-memory pytest tests/ --tb=short -q --timeout=300', 300),
+    ('uv run --directory shared pytest tests/ -q --timeout 300', 300),
+    ('uv run --directory shared pytest tests/ -q', None),
+    (
+        'uv run --directory a pytest tests/ --timeout=300 '
+        '&& uv run --directory b pytest tests/ --timeout=600',
+        300,
+    ),
+])
+def test_verify_cli_timeout_reads_the_first_timeout_flag(test_command, expected) -> None:
+    assert verify_cli_timeout(test_command) == expected
+
+
+# ---------------------------------------------------------------------------
+# scan_python_tree -- one fail-soft pass over a real directory tree.
+# ---------------------------------------------------------------------------
+
+_MARKED_SOURCE = """\
+import pytest
+
+
+@pytest.mark.timeout(120)
+def test_a() -> None:
+    pass
+"""
+
+
+@pytest.fixture
+def scanned_root(tmp_path: Path) -> Path:
+    (tmp_path / 'test_z.py').write_text(_MARKED_SOURCE, encoding='utf-8')
+    (tmp_path / 'sub').mkdir()
+    (tmp_path / 'sub' / 'test_b.py').write_text(_MARKED_SOURCE, encoding='utf-8')
+    (tmp_path / 'sub' / 'not_utf8.py').write_bytes(b'\xff\xfe pytestmark = 1\n')
+    (tmp_path / 'a_broken.py').write_text('def test_a(:\n', encoding='utf-8')
+    (tmp_path / 'notes.txt').write_text(_MARKED_SOURCE, encoding='utf-8')
+    return tmp_path
+
+
+def _sites_by_module(module: str, tree: ast.Module) -> Iterator[tuple[str, TimeoutSite]]:
+    for site in timeout_marker_sites(tree, _NO_SANCTIONED_NAMES):
+        yield module, site
+
+
+def test_scan_hands_extract_each_module_keyed_by_its_relative_posix_path(
+    scanned_root: Path,
+) -> None:
+    scan = scan_python_tree(scanned_root, _sites_by_module)
+
+    assert [(module, site.qualname) for module, site in scan.items] == [
+        ('sub/test_b.py', 'test_a'),
+        ('test_z.py', 'test_a'),
+    ]
+
+
+def test_scan_visits_modules_in_sorted_path_order(scanned_root: Path) -> None:
+    visited: list[str] = []
+
+    def record(module: str, tree: ast.Module) -> Iterator[str]:
+        visited.append(module)
+        yield module
+
+    scan = scan_python_tree(scanned_root, record)
+
+    assert visited == sorted(visited)
+    assert scan.items == tuple(visited)
+
+
+def test_an_unparseable_module_is_examined_but_never_extracted(scanned_root: Path) -> None:
+    visited: list[str] = []
+
+    def record(module: str, tree: ast.Module) -> Iterator[str]:
+        visited.append(module)
+        return iter(())
+
+    scan = scan_python_tree(scanned_root, record)
+
+    assert 'a_broken.py' not in visited
+    assert scan.examined == 3
+
+
+def test_an_undecodable_module_is_counted_unreadable_not_examined(scanned_root: Path) -> None:
+    scan = scan_python_tree(scanned_root, _sites_by_module)
+
+    assert scan.unreadable == ('sub/not_utf8.py',)
+    assert scan.examined == 3
+
+
+def test_a_file_that_is_not_python_is_ignored(scanned_root: Path) -> None:
+    scan = scan_python_tree(scanned_root, lambda module, tree: iter((module,)))
+
+    assert 'notes.txt' not in scan.items
+    assert scan.items == ('sub/test_b.py', 'test_z.py')
+
+
+def test_one_pass_can_feed_several_extractions_per_module(scanned_root: Path) -> None:
+    """Orchestrator extracts marker sites AND constant bindings from each single parse."""
+
+    def sites_and_names(
+        module: str, tree: ast.Module
+    ) -> Iterator[tuple[str, int, frozenset[str]]]:
+        names = frozenset(
+            node.name for node in tree.body if isinstance(node, ast.FunctionDef)
+        )
+        yield module, len(timeout_marker_sites(tree, _NO_SANCTIONED_NAMES)), names
+
+    scan = scan_python_tree(scanned_root, sites_and_names)
+
+    assert scan.items == (
+        ('sub/test_b.py', 1, frozenset({'test_a'})),
+        ('test_z.py', 1, frozenset({'test_a'})),
+    )
+
+
+def test_a_scan_result_is_immutable(scanned_root: Path) -> None:
+    scan = scan_python_tree(scanned_root, _sites_by_module)
+
+    assert isinstance(scan.items, tuple)
+    assert isinstance(scan.unreadable, tuple)
+    with pytest.raises(AttributeError):
+        scan.examined = 0  # pyright: ignore[reportAttributeAccessIssue]
