@@ -37,8 +37,9 @@ of task 5808's metadata.before_done.args (two are shown)::
         --require quality.misfile_rate_of_attaches '<=' 0.08 \\
         --require quality.unrated_pairs '<=' 0
 
-An unrated or tied pair, or an arm file that differs from what π published,
-exits 1 with the reason on stderr and writes neither artifact.
+An unrated or tied pair, an arm file that differs from what π published, or
+a population artifact that lacks a key μ reads exits 1 with the reason on
+stderr and writes neither artifact. A failure writing them exits 1 too.
 """
 from __future__ import annotations
 
@@ -56,6 +57,8 @@ from itertools import chain
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+
+from shared.cli_boundary import LoudArgumentParser, run_cli
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.server.write_triage_judge import (
@@ -171,20 +174,24 @@ class Population:
 
     @classmethod
     def from_artifact(cls, doc: Mapping[str, Any]) -> Population:
-        arms = tuple(
-            PiArm(
-                name=row['arm'],
-                settings=ArmSettings.from_provenance(row),
-                cases_path=row['cases_path'],
-                cases_sha256=row['cases_sha256'],
-            )
-            for row in doc['arms']
-        )
+        """π's artifact, refused as a :class:`MatrixInputError` if it lacks a key μ reads."""
+        try:
+            arms = tuple(_pi_arm(index, row) for index, row in enumerate(doc['arms']))
+            block = MappingProxyType(dict(doc['population']))
+        except KeyError as missing:
+            raise MatrixInputError(f'the population artifact lacks key {missing}') from None
+        except TypeError as malformed:
+            raise MatrixInputError(
+                f'the population artifact is not shaped as π publishes it: {malformed}'
+            ) from None
+        absent = [key for key in POPULATION_KEYS if key not in block]
+        if absent:
+            raise MatrixInputError(f'the population artifact\'s population block lacks {absent}')
         names = [arm.name for arm in arms]
         repeated = sorted({name for name in names if names.count(name) > 1})
         if repeated:
             raise ValueError(f'the population artifact names arms more than once: {repeated}')
-        return cls(block=MappingProxyType(dict(doc['population'])), arms=arms)
+        return cls(block=block, arms=arms)
 
     @property
     def names(self) -> list[str]:
@@ -192,6 +199,20 @@ class Population:
 
     def c2_block(self) -> dict[str, Any]:
         return {key: self.block[key] for key in POPULATION_KEYS}
+
+
+def _pi_arm(index: int, row: Mapping[str, Any]) -> PiArm:
+    try:
+        return PiArm(
+            name=row['arm'],
+            settings=ArmSettings.from_provenance(row),
+            cases_path=row['cases_path'],
+            cases_sha256=row['cases_sha256'],
+        )
+    except KeyError as missing:
+        raise MatrixInputError(
+            f'the population artifact\'s arms[{index}] lacks key {missing}'
+        ) from None
 
 
 def read_arm_cases(population: Population, data_root: Path) -> dict[str, list[dict[str, Any]]]:
@@ -500,8 +521,8 @@ BEST_CONFIG_NAME = 'write_triage_best_config.json'
 _CALIBRATION = _PACKAGE_ROOT / 'calibration'
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+def _build_parser() -> LoudArgumentParser:
+    parser = LoudArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -566,7 +587,10 @@ def _json_body(doc: Mapping[str, Any]) -> str:
 def _write_staged(bodies: Mapping[Path, str]) -> None:
     """Write every body beside its path before moving any into place.
 
-    A body that cannot be written therefore replaces none of the files.
+    A body that cannot be written therefore replaces none of the files. The
+    moves run one after another, so a move that fails after the first leaves
+    the earlier files replaced and the later ones not: the artifacts then
+    disagree until the next successful run.
     """
     staged = {path: path.with_name(f'{path.name}.tmp') for path in bodies}
     try:
@@ -588,8 +612,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     matrix_out = args.out_dir / MATRIX_NAME
     best_out = args.out_dir / BEST_CONFIG_NAME
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-    _write_staged({matrix_out: _json_body(matrix), best_out: _json_body(best)})
+    try:
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        _write_staged({matrix_out: _json_body(matrix), best_out: _json_body(best)})
+    except OSError as failure:
+        print(f'cannot write the artifacts under {args.out_dir}: {failure}', file=sys.stderr)
+        return 1
     print(json.dumps({
         'winner': matrix['winner'],
         'reference_arm': matrix['reference_arm'],
@@ -602,4 +630,4 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    sys.exit(run_cli(main))

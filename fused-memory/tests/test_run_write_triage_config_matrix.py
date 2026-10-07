@@ -549,6 +549,48 @@ def test_read_arm_cases_refuses_rows_of_another_arm_or_snapshot(
     assert value in message
 
 
+def _without(row: dict[str, Any], key: str) -> dict[str, Any]:
+    return {name: value for name, value in row.items() if name != key}
+
+
+def _with_arm(doc: dict[str, Any], index: int, arm: Any) -> dict[str, Any]:
+    return dict(doc, arms=[arm if at == index else row for at, row in enumerate(doc['arms'])])
+
+
+#: Each way of breaking a population doc, and the words its refusal must name.
+MALFORMED_POPULATIONS: dict[str, tuple[Any, list[str]]] = {
+    'arm-lacks-cases-path': (
+        lambda doc: _with_arm(doc, 1, _without(doc['arms'][1], 'cases_path')),
+        ['arms[1]', 'cases_path'],
+    ),
+    'arm-lacks-width': (
+        lambda doc: _with_arm(doc, 0, _without(doc['arms'][0], 'width')), ['arms[0]', 'width'],
+    ),
+    'block-lacks-snapshot': (
+        lambda doc: dict(doc, population=_without(doc['population'], 'snapshot_sha256')),
+        ['snapshot_sha256'],
+    ),
+    'no-arms': (lambda doc: _without(doc, 'arms'), ['arms']),
+    'arm-not-an-object': (lambda doc: _with_arm(doc, 2, SOL), ['population artifact']),
+    'not-an-object': (lambda doc: [doc], ['population artifact']),
+}
+
+
+def _malformed_population(case: str) -> tuple[Any, list[str]]:
+    breaks, named = MALFORMED_POPULATIONS[case]
+    return breaks(_population(THREE_ARMS, 4)), named
+
+
+@pytest.mark.parametrize('case', MALFORMED_POPULATIONS)
+def test_population_from_artifact_refuses_a_malformed_doc_naming_what_is_wrong(case: str) -> None:
+    doc, named = _malformed_population(case)
+
+    with pytest.raises(_mod().MatrixInputError) as refusal:
+        _mod().Population.from_artifact(doc)
+    message = str(refusal.value)
+    assert all(word in message for word in named), message
+
+
 def test_build_matrix_refuses_an_arm_whose_judge_band_disagrees_with_the_population() -> None:
     with pytest.raises(_mod().MatrixInputError) as refusal:
         _build(n_judge_band=5)
@@ -707,6 +749,43 @@ def test_main_refuses_a_drifted_arm_file_and_writes_nothing(
 def test_main_requires_at_least_one_bound(cli: types.SimpleNamespace) -> None:
     assert _main(cli, bounds=[]) not in (0, None)
     assert _written(cli) == []
+
+
+def test_main_refuses_a_malformed_population_and_writes_nothing(
+    cli: types.SimpleNamespace, capsys: pytest.CaptureFixture[str],
+) -> None:
+    doc, named = _malformed_population('arm-lacks-cases-path')
+    cli.population.write_text(json.dumps(doc))
+
+    assert _main(cli) == 1
+
+    err = capsys.readouterr().err
+    assert all(word in err for word in named)
+    assert _written(cli) == []
+
+
+def test_main_reports_an_out_dir_it_cannot_create(
+    cli: types.SimpleNamespace, capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli.out = cli.population / 'out'
+
+    assert _main(cli) == 1
+
+    err = capsys.readouterr().err
+    assert str(cli.out) in err
+
+
+def test_main_reports_a_failed_write_and_leaves_no_staged_file(
+    cli: types.SimpleNamespace, capsys: pytest.CaptureFixture[str],
+) -> None:
+    (cli.out / MATRIX_NAME).mkdir()
+
+    assert _main(cli) == 1
+
+    err = capsys.readouterr().err
+    assert str(cli.out) in err
+    assert _written(cli) == [MATRIX_NAME]
+    assert (cli.out / MATRIX_NAME).is_dir()
 
 
 # --- step 13: the committed artifacts ---------------------------------------------------
