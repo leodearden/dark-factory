@@ -7,6 +7,7 @@ import json
 import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from collections.abc import Mapping
 from pathlib import Path
 from unittest.mock import patch
 
@@ -23,6 +24,7 @@ from dashboard.data.performance import (
     aggregate_completion_paths,
     aggregate_escalation_rates,
     aggregate_loop_histograms,
+    PerformanceListing,
     aggregate_performance_cards,
     aggregate_performance_history,
     aggregate_time_centiles,
@@ -2252,13 +2254,14 @@ class TestCardsShareTheWallClockWindow:
 # ---------------------------------------------------------------------------
 
 
-async def _cards_of(tmp_path, escalations_dir, rows: list[tuple]) -> dict:
+async def _cards_of(tmp_path, escalations_dir, rows: list[tuple]) -> Mapping:
     db_path = _make_runs_db(tmp_path, 'cards.db', rows)
     async with aiosqlite.connect(str(db_path)) as conn:
         conn.row_factory = aiosqlite.Row
-        return await aggregate_performance_cards(
+        listing = await aggregate_performance_cards(
             [conn], [escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
         )
+    return listing.cards
 
 
 class TestPerformanceCardsDatum:
@@ -2276,7 +2279,7 @@ class TestPerformanceCardsDatum:
     ):
         conns, dirs = [active_idle_conn], [empty_escalations_dir]
         window = {'days': CARDS_DAYS, 'now': CARDS_NOW}
-        datum = (await aggregate_performance_cards(conns, dirs, **window))['active']
+        datum = (await aggregate_performance_cards(conns, dirs, **window)).cards['active']
 
         assert datum.state is DatumState.FRESH
         assert datum.reason is None
@@ -2297,9 +2300,9 @@ class TestPerformanceCardsDatum:
     async def test_idle_project_is_stale_by_its_last_completion(
         self, active_idle_conn, empty_escalations_dir,
     ):
-        cards = await aggregate_performance_cards(
+        cards = (await aggregate_performance_cards(
             [active_idle_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
-        )
+        )).cards
         datum = cards['idle']
 
         assert datum.state is DatumState.STALE
@@ -2363,19 +2366,11 @@ class TestPerformanceCardsDatum:
         async with aiosqlite.connect(str(db_a)) as a, aiosqlite.connect(str(db_b)) as b:
             a.row_factory = aiosqlite.Row
             b.row_factory = aiosqlite.Row
-            cards = await aggregate_performance_cards(
+            cards = (await aggregate_performance_cards(
                 [a, b], [empty_escalations_dir, empty_escalations_dir],
                 days=CARDS_DAYS, now=CARDS_NOW,
-            )
+            )).cards
         assert cards['shared'].as_of == CARDS_NOW - timedelta(minutes=30)
-
-    @pytest.mark.asyncio
-    async def test_no_completions_lists_no_projects(self, empty_runs_conn, empty_escalations_dir):
-        window = {'days': CARDS_DAYS, 'now': CARDS_NOW}
-        assert await aggregate_performance_cards(
-            [empty_runs_conn], [empty_escalations_dir], **window,
-        ) == {}
-        assert await aggregate_performance_cards([None], [empty_escalations_dir], **window) == {}
 
     @pytest.mark.asyncio
     async def test_a_family_that_raises_leaves_its_projects_unknown_naming_it(
@@ -2385,9 +2380,9 @@ class TestPerformanceCardsDatum:
             raise RuntimeError('histogram read failed')
 
         with patch('dashboard.data.performance.aggregate_loop_histograms', _raising_histograms):
-            cards = await aggregate_performance_cards(
+            cards = (await aggregate_performance_cards(
                 [active_idle_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
-            )
+            )).cards
         assert set(cards) == {'active', 'idle'}
         for datum in cards.values():
             assert datum.state is DatumState.UNKNOWN
@@ -2407,9 +2402,9 @@ class TestPerformanceCardsDatum:
             'verify_attempts',
         )
         async with aiosqlite.connect(str(db_path)) as conn:
-            cards = await aggregate_performance_cards(
+            cards = (await aggregate_performance_cards(
                 [conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
-            )
+            )).cards
         datum = cards['drifted']
         assert datum.state is DatumState.UNKNOWN
         assert datum.reason == 'the loop histograms of this project could not be read'
@@ -2441,9 +2436,9 @@ class TestPerformanceCardsDatum:
     ):
         conns = [active_idle_conn]
         shaped = redux_api.shape_performance(
-            cards=await aggregate_performance_cards(
+            cards=(await aggregate_performance_cards(
                 conns, [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
-            ),
+            )).cards,
             history=await aggregate_performance_history(conns, days=CARDS_DAYS, now=CARDS_NOW),
             served_at=CARDS_NOW,
         )
@@ -2469,15 +2464,111 @@ class TestPerformanceCardsDatum:
 # ---------------------------------------------------------------------------
 
 
-async def _cards_across(db_paths: list[Path], escalations_dir: Path) -> dict:
+async def _listing_across(db_paths: list[Path | None], escalations_dir: Path) -> PerformanceListing:
     async with contextlib.AsyncExitStack() as stack:
         conns: list[aiosqlite.Connection | None] = [
-            await stack.enter_async_context(aiosqlite.connect(str(db_path)))
+            None if db_path is None
+            else await stack.enter_async_context(aiosqlite.connect(str(db_path)))
             for db_path in db_paths
         ]
         return await aggregate_performance_cards(
             conns, [escalations_dir] * len(conns), days=CARDS_DAYS, now=CARDS_NOW,
         )
+
+
+async def _cards_across(db_paths: list[Path], escalations_dir: Path) -> Mapping:
+    return (await _listing_across(db_paths, escalations_dir)).cards
+
+
+def _tableless_runs_db(tmp_path, name: str) -> Path:
+    """A sqlite file with no task_results table: discovery fails inside with_db."""
+    db_path = Path(tmp_path) / name
+    sqlite3.connect(str(db_path)).close()
+    return db_path
+
+
+class TestPerformanceListing:
+    """The listing says whether its projects were read: an empty PERFORMANCE is
+    "no project completed anything" only when every runs.db was read."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_history_cache(self):
+        _HISTORY_CACHE.clear()
+
+    @pytest.mark.asyncio
+    async def test_readable_dbs_list_their_projects_fresh(self, active_idle_conn, empty_escalations_dir):
+        listing = await aggregate_performance_cards(
+            [active_idle_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+
+        assert listing.listed.state is DatumState.FRESH
+        assert listing.listed.value == len(listing.cards) == 2
+        assert listing.listed.as_of == CARDS_NOW
+        assert listing.listed.freshness_bound_seconds == 7 * 86400
+        validate_datum(listing.listed, CARDS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_a_readable_empty_db_is_a_measured_empty_listing(
+        self, empty_runs_conn, empty_escalations_dir,
+    ):
+        listing = await aggregate_performance_cards(
+            [empty_runs_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+
+        assert listing.cards == {}
+        assert listing.listed.state is DatumState.FRESH
+        assert listing.listed.value == 0
+        validate_datum(listing.listed, CARDS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_no_runs_db_is_an_unknown_listing_not_an_empty_one(self, empty_escalations_dir):
+        listing = await aggregate_performance_cards(
+            [None], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+
+        assert listing.cards == {}
+        assert listing.listed.state is DatumState.UNKNOWN
+        assert 'no runs.db' in (listing.listed.reason or '')
+        assert '1 of 1' in (listing.listed.reason or '')
+        validate_datum(listing.listed, CARDS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_discovery_query_is_an_unknown_listing(self, tmp_path, empty_escalations_dir):
+        listing = await _listing_across([_tableless_runs_db(tmp_path, 'bare.db')], empty_escalations_dir)
+
+        assert listing.cards == {}
+        assert listing.listed.state is DatumState.UNKNOWN
+        validate_datum(listing.listed, CARDS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_some_unread_dbs_make_the_listing_a_lower_bound(self, tmp_path, empty_escalations_dir):
+        healthy = _make_runs_db(tmp_path, 'healthy.db', [
+            _task_row('a1', 'alpha', CARDS_NOW - timedelta(hours=1)),
+            _task_row('b1', 'beta', CARDS_NOW - timedelta(hours=2)),
+        ])
+
+        listing = await _listing_across(
+            [healthy, _tableless_runs_db(tmp_path, 'bare.db')], empty_escalations_dir,
+        )
+
+        assert set(listing.cards) == {'alpha', 'beta'}
+        assert listing.listed.state is DatumState.LOWER_BOUND
+        assert listing.listed.value == 2
+        assert '1 of 2' in (listing.listed.reason or '')
+        validate_datum(listing.listed, CARDS_NOW)
+
+    @pytest.mark.asyncio
+    async def test_a_db_of_only_cancels_is_a_measured_empty_listing(self, tmp_path, empty_escalations_dir):
+        cancels_only = _make_runs_db(tmp_path, 'cancels_only.db', [
+            _task_row('c1', 'drained', CARDS_NOW - timedelta(hours=1), outcome='cancelled'),
+            _task_row('c2', 'drained', CARDS_NOW - timedelta(hours=2), outcome='soft-cancelled'),
+        ])
+
+        listing = await _listing_across([cancels_only], empty_escalations_dir)
+
+        assert listing.cards == {}
+        assert listing.listed.state is DatumState.FRESH
+        assert listing.listed.value == 0
 
 
 class TestCardsAcrossRunsDbs:
@@ -2555,10 +2646,10 @@ class TestCardsAcrossRunsDbs:
         async with aiosqlite.connect(str(db_a)) as a, aiosqlite.connect(str(db_b)) as b:
             await a.set_trace_callback(statements_a.append)
             await b.set_trace_callback(statements_b.append)
-            cards = await aggregate_performance_cards(
+            cards = (await aggregate_performance_cards(
                 [a, b], [empty_escalations_dir, empty_escalations_dir],
                 days=CARDS_DAYS, now=CARDS_NOW,
-            )
+            )).cards
 
         for project_id in ('alpha', 'beta'):
             datum = cards[project_id]
@@ -2686,9 +2777,9 @@ class TestCancelOutcomesAreNotCounted:
     ):
         """Fresh exactly when the window's tally counts a completion: a
         redeploy's cancel alone neither lists a project nor freshens one."""
-        cards = await aggregate_performance_cards(
+        cards = (await aggregate_performance_cards(
             [cancels_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
-        )
+        )).cards
         assert set(cards) == {'proj', 'redeployed-idle'}
         assert cards['proj'].state is DatumState.FRESH
         assert cards['proj'].as_of == CARDS_NOW - timedelta(hours=1)
