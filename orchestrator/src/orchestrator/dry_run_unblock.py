@@ -219,7 +219,12 @@ def _task_context(task: dict[str, Any] | None) -> _TaskContext:
     serving a different purpose, and the two have already diverged exactly
     where the purposes do — ``**Declared files:**`` here against ``**Files:**``
     there, because this reader is asked to judge a fix against the scope the
-    architect DECLARED.  Nothing keeps the two aligned and nothing needs to.
+    architect DECLARED.  Nothing needs to keep the two aligned, and extracting
+    a shared renderer was considered and declined (task 5538).  The alignment
+    that DOES need a mechanism is these labels against
+    ``skills/unblock-auto/SKILL.md``, which tells the investigator how to read
+    them; it is guarded by
+    ``orchestrator/tests/test_dry_run_unblock.py::TestSkillPromptExplainsEveryTaskBlockState``.
 
     ``metadata.files`` IS included here even though ``build_architect_prompt``
     passes ``include_files=False`` to omit it.  Anti-anchoring applies to
