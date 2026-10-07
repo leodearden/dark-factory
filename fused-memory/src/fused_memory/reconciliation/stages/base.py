@@ -34,6 +34,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     recon_config_base_dir,
     run_stage_via_cli,
 )
+from fused_memory.reconciliation.sqlite_failures import await_best_effort
 from fused_memory.utils.validation import require_project_id, require_run_id
 
 if TYPE_CHECKING:
@@ -549,16 +550,11 @@ class BaseStage:
         transcript check in ``run``) validates the transcript on disk instead
         of trusting it. Cancellation propagates.
         """
-        try:
-            await write
-        except Exception as exc:
-            logger.warning(
-                'Stage %s run_id=%s: %s failed; continuing without the session '
-                'snapshot: %r (sqlite_errorname=%s sqlite_errorcode=%s)',
-                self.stage_id.value, run_id, op, exc,
-                getattr(exc, 'sqlite_errorname', None),
-                getattr(exc, 'sqlite_errorcode', None),
-            )
+        await await_best_effort(
+            write,
+            what=f'Stage {self.stage_id.value} session-snapshot write {op}',
+            run_id=run_id, logger=logger, level=logging.WARNING,
+        )
 
     def _build_recovery_prompt(self, run_id: str, stage_payload: str) -> str:
         """Build the continuation prompt delivered to a ``--resume``d stage (task σ).

@@ -6556,12 +6556,12 @@ _LOCKED_FAILURE_BOOKKEEPING_WRITE = pytest.mark.parametrize(
     [
         pytest.param(
             lambda journal, event_buffer: _lock_complete_run(journal, 'failed'),
-            'complete_run(failed) failed after run failure', 'running', 1,
+            'complete_run(failed) failed:', 'running', 1,
             id='complete_run_failed',
         ),
         pytest.param(
             lambda journal, event_buffer: _lock_restore_drained(event_buffer),
-            'restore_drained failed after run failure', 'failed', 0,
+            'restore_drained failed:', 'failed', 0,
             id='restore_drained',
         ),
     ],
