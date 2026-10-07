@@ -30,22 +30,25 @@ def _on_disk(worktree_base: Path, lane_name: str = LANE_NAME) -> dict:
     return json.loads(_record_path(worktree_base, lane_name).read_text())
 
 
-_LEGAL_LADDER: list[tuple[LaneState, dict[str, str]]] = [
-    (LaneState.SEED, {'seeded_from_sha': 'abc123'}),
-    (LaneState.REGISTERED, {'branch': 'task/42'}),
-    (LaneState.ASSIGNED, {'task_id': '42', 'title': 'demo'}),
-    (LaneState.IN_USE, {}),
-    (LaneState.RELEASED, {}),
-]
+def _legal_ladder(task_id: str) -> list[tuple[LaneState, dict[str, str]]]:
+    return [
+        (LaneState.SEED, {'seeded_from_sha': 'abc123'}),
+        (LaneState.REGISTERED, {'branch': f'task/{task_id}'}),
+        (LaneState.ASSIGNED, {'task_id': task_id, 'title': f'demo-{task_id}'}),
+        (LaneState.IN_USE, {}),
+        (LaneState.RELEASED, {}),
+    ]
 
 
-def _drive_to(lifecycle: LaneLifecycle, lane: Path, target: LaneState) -> None:
+def _drive_to(
+    lifecycle: LaneLifecycle, lane: Path, target: LaneState, task_id: str = '42',
+) -> None:
     """Bring *lane*'s record to *target* through public, legal transitions only."""
     if target is LaneState.QUARANTINED:
-        _drive_to(lifecycle, lane, LaneState.ASSIGNED)
+        _drive_to(lifecycle, lane, LaneState.ASSIGNED, task_id)
         lifecycle.transition(lane, LaneState.QUARANTINED)
         return
-    for state, fields in _LEGAL_LADDER:
+    for state, fields in _legal_ladder(task_id):
         lifecycle.transition(lane, state, **fields)
         if state is target:
             return
@@ -73,7 +76,7 @@ class TestNoteInUseAndIdle:
         assert in_use['state'] == 'in_use'
         assert (in_use['task_id'], in_use['title'], in_use['branch']) == (
             assigned['task_id'], assigned['title'], assigned['branch'],
-        ) == ('42', 'demo', 'task/42')
+        ) == ('42', 'demo-42', 'task/42')
 
         assert lifecycle.note_idle(lane) is True
         idle = _on_disk(tmp_path)
@@ -192,3 +195,68 @@ class TestNeverRaises:
         self._assert_swallowed(
             tmp_path, caplog, lambda: lifecycle.note_idle(lane), 'in_use',
         )
+
+
+class TestResetStaleInUse:
+    """A crash mid-span leaves IN_USE fossils; the sweep steps them back."""
+
+    STALE = {'_lane-0': '42', '_lane-1': '43'}
+    UNTOUCHED = ('_lane-2', '_lane-3', '_lane-4', '_lane-5')
+
+    @pytest.fixture
+    def queue(self, tmp_path: Path) -> EscalationQueue:
+        return EscalationQueue(tmp_path / 'escalations')
+
+    @pytest.fixture
+    def swept(self, tmp_path: Path, queue: EscalationQueue) -> LaneLifecycle:
+        lifecycle = LaneLifecycle(worktree_base=tmp_path, escalation_queue=queue)
+        for lane_name, task_id in self.STALE.items():
+            _drive_to(lifecycle, tmp_path / lane_name, LaneState.IN_USE, task_id)
+        _drive_to(lifecycle, tmp_path / '_lane-2', LaneState.ASSIGNED, '44')
+        _drive_to(lifecycle, tmp_path / '_lane-3', LaneState.RELEASED, '45')
+        _drive_to(lifecycle, tmp_path / '_lane-4', LaneState.QUARANTINED, '46')
+        _record_path(tmp_path, '_lane-5').write_text('{not valid json')
+        return lifecycle
+
+    def _snapshot(self, tmp_path: Path, lane_names) -> dict[str, bytes]:
+        return {name: _record_path(tmp_path, name).read_bytes() for name in lane_names}
+
+    def test_resets_exactly_the_in_use_lanes_keeping_their_assignments(
+        self, tmp_path: Path, swept: LaneLifecycle, queue: EscalationQueue, caplog,
+    ):
+        before = {name: _on_disk(tmp_path, name) for name in self.STALE}
+        untouched = self._snapshot(tmp_path, self.UNTOUCHED)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.lane_lifecycle'):
+            reset = swept.reset_stale_in_use()
+
+        assert reset == ['_lane-0', '_lane-1']
+        for name, task_id in self.STALE.items():
+            after = _on_disk(tmp_path, name)
+            assert after['state'] == 'assigned'
+            assert (after['task_id'], after['title'], after['branch']) == (
+                before[name]['task_id'], before[name]['title'], before[name]['branch'],
+            ) == (task_id, f'demo-{task_id}', f'task/{task_id}')
+            assert [
+                r for r in caplog.records
+                if r.levelno == logging.INFO
+                and name in r.getMessage() and task_id in r.getMessage()
+            ], f'expected an INFO line naming the reset of {name} (task {task_id})'
+        assert self._snapshot(tmp_path, self.UNTOUCHED) == untouched
+        assert queue.get_pending() == []
+
+    def test_a_lane_in_the_skip_set_keeps_its_live_in_use_record(
+        self, tmp_path: Path, swept: LaneLifecycle,
+    ):
+        reset = swept.reset_stale_in_use(skip=['_lane-1'])
+
+        assert reset == ['_lane-0']
+        assert _on_disk(tmp_path, '_lane-1')['state'] == 'in_use'
+
+    def test_a_second_sweep_is_a_no_op(self, tmp_path: Path, swept: LaneLifecycle):
+        swept.reset_stale_in_use()
+        settled = self._snapshot(tmp_path, [*self.STALE, *self.UNTOUCHED])
+
+        assert swept.reset_stale_in_use() == []
+
+        assert self._snapshot(tmp_path, [*self.STALE, *self.UNTOUCHED]) == settled
