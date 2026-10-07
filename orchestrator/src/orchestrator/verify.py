@@ -76,6 +76,7 @@ from orchestrator.verify_classify import (
     classify_failure,
     is_external_kill_rc,
     is_interpreter_missing_workspace_packages,
+    is_shell_reported_external_kill,
     unresolved_top_level_modules,
 )
 from orchestrator.verify_cmd import (
@@ -669,7 +670,7 @@ _PYTEST_INTERNALERROR_RE = re.compile(r'^INTERNALERROR>.+$', re.MULTILINE)
 # Two consumers, both of which benefit — kept as ONE constant deliberately, a
 # parallel undecorated-only pattern would recreate the very
 # two-places-that-must-stay-in-sync drift task 4066 exists to fix:
-#   * _is_bare_xdist_worker_crash's veto set, where a wider match strictly
+#   * _carries_pytest_failure_verdict's veto set, where a wider match strictly
 #     INCREASES strictness (it can only flip True -> False, never mask more).
 #   * _extract_cause_hint's ladder rung 3, where it upgrades an undecorated
 #     tally from the generic last-non-blank-line fallback to a real rung-3
@@ -690,6 +691,11 @@ _PYTEST_PROGRESS_FILE_RE = re.compile(
 # Captures a progress line's percentage for _crashed_session_stop_percent.
 _PYTEST_PROGRESS_PERCENT_RE = re.compile(
     rf'^(?:\S+\.py )?{_PYTEST_STATUS_CHAR_CLASS}*[ \t]*{_PYTEST_PERCENT_FIELD}$',
+    re.MULTILINE,
+)
+_PYTEST_PROGRESS_FAILURE_RE = re.compile(
+    rf'^(?:\S+\.py )?{_PYTEST_STATUS_CHAR_CLASS}*[FE]{_PYTEST_STATUS_CHAR_CLASS}*'
+    rf'(?:[ \t]+{_PYTEST_PERCENT_FIELD})?$',
     re.MULTILINE,
 )
 
@@ -730,6 +736,15 @@ _XDIST_WORKER_CRASH_RE = re.compile(
 _XDIST_SESSION_ABORTED_RE = re.compile(
     r"worker gw\d+ crashed and worker restarting disabled"
     r"|maximum crashed workers reached: \d+",
+)
+
+
+# xdist workers outliving a signalled controller each fail to send at
+# pytest_sessionfinish (esc-4071-1, esc-4808-1). Requiring the two lines to be
+# adjacent keeps prose that merely quotes either one out.
+_XDIST_CHANNEL_COLLAPSE_RE = re.compile(
+    r'^Plugin: \S+, Hook: pytest_sessionfinish\nOSError: cannot send \(already closed\?\)$',
+    re.MULTILINE,
 )
 
 
@@ -929,16 +944,14 @@ def _first_surviving_failure_line(output: str) -> str | None:
     return None
 
 
-def _is_bare_xdist_worker_crash(output: str) -> bool:
-    """Return True when *output* is a bare xdist worker crash with no real failure.
+def _carries_pytest_failure_verdict(output: str) -> bool:
+    """Return True when *output* shows pytest reached a failure verdict.
 
-    A hard ``os._exit()`` worker kill (task 2361) produces no assertion
-    traceback, so ANY genuine pytest failure surface alongside the crash
-    signature means a real failure occurred and this returns ``False`` —
-    never mask a real failure. The surfaces are one flat veto set: a
-    ``^FAILED `` line, an ``^E   `` traceback line, a failure summary, an
-    ``INTERNALERROR>`` line, or either ``ERROR`` short-summary form (node-id
-    or bare-file).
+    The surfaces are one flat veto set: a ``^FAILED `` line, an ``^E   ``
+    traceback line, a failure summary, an ``INTERNALERROR>`` line, or either
+    ``ERROR`` short-summary form (node-id or bare-file). It is the single
+    veto set of every verdictless-exit recogniser
+    (``_is_bare_xdist_worker_crash``, ``_pytest_session_aborted_without_verdict``).
 
     The set is flat on purpose. It used to be two branches keyed on whether
     a ``FAILED`` line was present, and they drifted (task 4066): verify-log
@@ -957,6 +970,31 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
     flaky. It stays strict: a second ``FAILED`` line for the same node-id,
     a ``FAILED`` line for any other test, an ``^E   `` traceback line, and
     every INTERNALERROR / ERROR surface still veto.
+    """
+    surviving_failed_lines = _failed_lines_not_crash_attributed(output)
+    only_crash_artefacts_failed = (
+        not surviving_failed_lines and _PYTEST_FAILED_LINE_RE.search(output) is not None
+    )
+    return bool(
+        surviving_failed_lines
+        or _PYTEST_TRACEBACK_E_RE.search(output)
+        or (
+            _PYTEST_FAILURE_SUMMARY_RE.search(output)
+            and not only_crash_artefacts_failed
+        )
+        or _PYTEST_INTERNALERROR_RE.search(output)
+        or _ERROR_LINE_NODEID_RE.search(output)
+        or _ERROR_LINE_FILE_RE.search(output)
+    )
+
+
+def _is_bare_xdist_worker_crash(output: str) -> bool:
+    """Return True when *output* is a bare xdist worker crash with no real failure.
+
+    A hard ``os._exit()`` worker kill (task 2361) produces no assertion
+    traceback, so ANY genuine pytest failure surface alongside the crash
+    signature (``_carries_pytest_failure_verdict``) means a real failure
+    occurred and this returns ``False`` — never mask a real failure.
 
     Accepted tradeoff, deliberately taken by task 4066: the
     ``INTERNALERROR>`` veto keys on a surface the worker crash can itself
@@ -992,21 +1030,24 @@ def _is_bare_xdist_worker_crash(output: str) -> bool:
         return False
     if not _XDIST_WORKER_CRASH_RE.search(output):
         return False
-    surviving_failed_lines = _failed_lines_not_crash_attributed(output)
-    only_crash_artefacts_failed = (
-        not surviving_failed_lines and _PYTEST_FAILED_LINE_RE.search(output) is not None
-    )
-    return not (
-        surviving_failed_lines
-        or _PYTEST_TRACEBACK_E_RE.search(output)
-        or (
-            _PYTEST_FAILURE_SUMMARY_RE.search(output)
-            and not only_crash_artefacts_failed
-        )
-        or _PYTEST_INTERNALERROR_RE.search(output)
-        or _ERROR_LINE_NODEID_RE.search(output)
-        or _ERROR_LINE_FILE_RE.search(output)
-    )
+    return not _carries_pytest_failure_verdict(output)
+
+
+def _pytest_session_aborted_without_verdict(rc: int, output: str) -> bool:
+    """Return True when a pytest leg was torn down before reaching any verdict.
+
+    Two arms: a shell-reported SIGTERM/SIGINT/SIGHUP exit status, or the
+    channel-collapse signature (``_XDIST_CHANNEL_COLLAPSE_RE``). Decoding
+    ``128 + N`` is sound only here: every rc a leg classifier sees comes from
+    ``_run_cmd``'s ``/bin/bash`` wrapper, directly or as ``_run_segmented``'s
+    first nonzero rc, so verify knows the shell is its own.
+
+    Any failure evidence vetoes both arms, including an ``F`` or ``E`` in a
+    progress line, because a killed ``-q`` session prints no short summary.
+    """
+    if _carries_pytest_failure_verdict(output) or _PYTEST_PROGRESS_FAILURE_RE.search(output):
+        return False
+    return is_shell_reported_external_kill(rc) or bool(_XDIST_CHANNEL_COLLAPSE_RE.search(output))
 
 
 # Pytest node-id extraction for the main-tip-sweep isolated-rerun confirm gate
@@ -2313,13 +2354,16 @@ def _classify_leg(
     label: str, rc: int, output: str, timed_out: bool, cmd: str | None,
 ) -> FailureCategory:
     """The ONE per-leg classifier. ``classify_failure`` answers what the tool's
-    OUTPUT says; this adds what only verify knows, the leg's slot. It rewrites
-    only the UNKNOWN_TEST_FAILURE fall-through, so every more specific
-    diagnosis survives.
+    OUTPUT says; this adds what only verify knows: the leg's slot, and that
+    verify interposed the shell. It rewrites only the UNKNOWN_TEST_FAILURE
+    fall-through, so every more specific diagnosis survives.
     """
-    category = classify_failure(_tool_for_cmd(cmd), rc, output, timed_out)
+    tool = _tool_for_cmd(cmd)
+    category = classify_failure(tool, rc, output, timed_out)
     if category != FailureCategory.UNKNOWN_TEST_FAILURE:
         return category
+    if tool is ToolKind.PYTEST and _pytest_session_aborted_without_verdict(rc, output):
+        return FailureCategory.INFRA_ABORT
     return _LEG_FALLBACK_CATEGORY[label]
 
 
