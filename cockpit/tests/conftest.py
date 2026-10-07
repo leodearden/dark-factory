@@ -1,4 +1,4 @@
-"""pytest configuration for the cockpit suite — suite-wide git isolation.
+"""pytest configuration for the cockpit suite — git isolation and the Hypothesis settings profile.
 
 This subproject has no git-invoking test today.  It is wired anyway: task 3355
 exists to close a defect CLASS, not today's instances, and the anti-drift guard
@@ -37,9 +37,6 @@ def pytest_configure(config):
     reject_unsafe_basetemp(config)
 
 
-# Hypothesis's stock 200ms per-example deadline measures host scheduling, not the
-# code under test: the property tests exercise pure arithmetic, and under a
-# CPU-oversubscribed xdist verify run they trip DeadlineExceeded on a 0.09ms body.
-# One suite-wide profile covers every current and future @given row.
+# The stock 200ms deadline measures host load, not these pure-arithmetic properties (esc-5449-2).
 settings.register_profile("cockpit", deadline=None)
 settings.load_profile("cockpit")
