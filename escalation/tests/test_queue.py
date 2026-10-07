@@ -17,7 +17,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from _scan_race_helpers import relocating_read_text, unreadable_read_text
+from _scan_race_helpers import pruning_read_text, relocating_read_text, unreadable_read_text
 
 from escalation.classify import effective_benign
 from escalation.models import Escalation
@@ -2255,6 +2255,43 @@ class TestGetByTaskRecoversRecordRelocatedMidScan:
         assert any('re-glob after vanish' in r.getMessage() for r in warnings), (
             f'Expected a WARNING naming the re-glob-after-vanish context; got: '
             f'{[r.getMessage() for r in warnings]}'
+        )
+
+    def test_get_by_task_does_not_reprobe_an_archive_tier_record_pruned_mid_scan(
+        self, tmp_path: Path,
+    ):
+        """An ARCHIVE-tier ``'vanished'`` — ``archive.prune_archive``
+        rmtree-ing a dated subdir mid-scan — costs zero extra archive I/O:
+        no targeted re-probe, per the root-tier gate in
+        ``queue.py::get_by_task``.  GREEN on arrival; RED shown by mutation.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176'))
+        queue.resolve('esc-4176-2', 'resolved before the scan')
+        (archive_copy,) = (queue.queue_dir / 'archive').rglob('esc-4176-2.json')
+
+        with (
+            patch.object(Path, 'read_text', pruning_read_text(archive_copy)),
+            patch.object(Path, 'rglob', autospec=True, side_effect=Path.rglob) as rglob_spy,
+        ):
+            results = queue.get_by_task('4176', status=None)
+        patterns = [c.args[1] for c in rglob_spy.call_args_list]
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving record after the archive copy was '
+            f'pruned mid-scan (no raise), got {[e.id for e in results]}'
+        )
+        assert not archive_copy.parent.exists(), (
+            f'Expected the interposition to have pruned {archive_copy.parent}; '
+            f'without that the pin below is vacuous'
+        )
+        assert 'esc-*.json' in patterns, (
+            f"Expected the spy to see the scan's own archive-tier glob; got {patterns}"
+        )
+        assert 'esc-4176-2.json' not in patterns, (
+            f'Expected no targeted archive re-probe for an archive-tier vanish; '
+            f'got rglob patterns {patterns}'
         )
 
 
