@@ -30,7 +30,7 @@ import weakref
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -44,6 +44,9 @@ from fused_memory.backends.graphiti_client import (
     PagedRead,
     ReadCompleteness,
 )
+
+if TYPE_CHECKING:
+    from fused_memory.services.durable_queue import DurableWriteQueue
 
 # Constants for the process lifetime — lifted out of pydantic_spec (task 1426)
 # to avoid re-computing BaseModel reflection on every call.
@@ -969,11 +972,12 @@ def resolve_xdist_worker_id(request_or_session: pytest.FixtureRequest | pytest.S
 # ---------------------------------------------------------------------------
 #
 # Generalizes the local poll-then-assert precedents in test_durable_queue.py
-# (_poll_until_dead and the inline deadline loop) into a single shared
-# helper. Converts fixed "sleep(N) then assert background work is done"
-# sites — fragile under host CPU oversubscription, since the hardcoded
-# window may elapse before the background drainer/worker/watchdog is even
-# scheduled — into a bounded poll on the same post-condition. A genuinely
+# (the dead-letter waiter, now poll_until_dead below, and the inline deadline
+# loop) into a single shared helper. Converts fixed "sleep(N) then assert
+# background work is done" sites — fragile under host CPU oversubscription,
+# since the hardcoded window may elapse before the background
+# drainer/worker/watchdog is even scheduled — into a bounded poll on the same
+# post-condition. A genuinely
 # stuck background task still surfaces as a clear AssertionError once the
 # (generous) deadline passes.
 # ---------------------------------------------------------------------------
@@ -995,9 +999,9 @@ async def poll_until(
 
     Checks *before* sleeping, so an already-true predicate returns on the
     first call with no sleep at all. Uses the asyncio event-loop monotonic
-    clock (mirrors the ``_poll_until_dead`` precedent in
-    test_durable_queue.py) rather than wall-clock/perf_counter, to avoid the
-    same class of timing fragility this helper exists to remove.
+    clock (see :func:`poll_until_dead` below) rather than
+    wall-clock/perf_counter, to avoid the same class of timing fragility
+    this helper exists to remove.
 
     Args:
         predicate: Zero-arg sync or async callable evaluated each iteration.
@@ -1029,6 +1033,78 @@ async def poll_until(
         if loop.time() >= deadline:
             raise AssertionError(message or f'poll_until: condition not met within {timeout}s')
         await asyncio.sleep(interval)
+
+
+# ---------------------------------------------------------------------------
+# Shared durable-queue waiter and retry-budget factory (task 4847)
+# ---------------------------------------------------------------------------
+
+class SupportsQueueStats(Protocol):
+    """The one DurableWriteQueue member poll_until_dead reads."""
+
+    async def get_stats(self, group_id: str | None = None) -> dict[str, Any]: ...
+
+
+async def poll_until_dead(
+    q: SupportsQueueStats,
+    *,
+    group_id: str | None = None,
+    expected_dead: int,
+    timeout: float = 5.0,
+) -> None:
+    """Poll queue stats until at least *expected_dead* items have status='dead'.
+
+    Poll-based, never a fixed sleep: the suites run under ``-n auto`` with a
+    60s per-test timeout that kills the whole worker, so a fixed window either
+    wastes time on a fast host or races on a loaded one. Shared by
+    test_durable_queue.py, test_durable_queue_selfref_classifier.py and
+    test_queue_stats_tool.py. last_counts is a side-channel capture so the
+    timeout message can still report the latest observed counts, since
+    poll_until's message is static.
+    """
+    last_counts: dict = {}
+
+    async def _dead_count_reached():
+        stats = await q.get_stats(group_id=group_id)
+        last_counts.update(stats['counts'])
+        return stats['counts'].get('dead', 0) >= expected_dead
+
+    try:
+        await poll_until(_dead_count_reached, timeout=timeout, interval=0.05)
+    except AssertionError as exc:
+        raise AssertionError(
+            f'Timed out waiting for {expected_dead} dead item(s) '
+            f'(group_id={group_id!r}); last counts={last_counts}'
+        ) from exc
+
+
+def make_retry_budget_queue(tmp_path, execute, **overrides) -> 'DurableWriteQueue':
+    """A DurableWriteQueue with plain budget 5, extended transient budget 12,
+    sub-second backoff, and no ``transient_error_names=`` override, so the
+    shipped DEFAULT_TRANSIENT_ERROR_NAMES decides which budget applies.
+
+    The single definition that keeps task 3585's and task 3586's attempt
+    counts comparable. *overrides* replace any constructor keyword.
+    """
+    # Lazy: the fused_memory.services package eagerly loads MemoryService
+    # (~4s in a fresh process), and conftest imports this module every session.
+    from fused_memory.services.durable_queue import DurableWriteQueue
+
+    # Annotated: without it pyright joins the heterogeneous literal values into
+    # a single narrow type and rejects the ** unpacking below.
+    kwargs: dict[str, Any] = dict(
+        data_dir=tmp_path / 'queue',
+        execute_write=execute,
+        workers_per_group=1,
+        semaphore_limit=5,
+        max_attempts=5,
+        retry_base_seconds=0.01,
+        retry_max_delay_seconds=0.05,
+        write_timeout_seconds=2.0,
+        transient_max_attempts=12,
+    )
+    kwargs.update(overrides)
+    return DurableWriteQueue(**kwargs)
 
 
 # ---------------------------------------------------------------------------
