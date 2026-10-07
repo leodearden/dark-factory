@@ -20,7 +20,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, get_args
 
 from shared.task_statuses import TERMINAL
 
@@ -45,6 +45,7 @@ __all__ = [
     'memory_service_archive',
     'near_duplicate_key',
     'plan_rotation',
+    'render_audit_trail_rotation_section',
     'task_fingerprint',
     'task_payload_bytes',
     'unrotatable_reason',
@@ -744,3 +745,29 @@ def memory_service_archive(memory_service: Any) -> AuditTrailArchive:
     positionally; its TimeoutError propagates rather than reading as a miss.
     """
     return _MemoryServiceArchive(memory_service)
+
+
+def render_audit_trail_rotation_section() -> str:
+    """The Stage 2 prompt's statement of this rule, rendered from the enforced constants."""
+    statuses = ', '.join(f'`{status}`' for status in get_args(RotationStatus))
+    return (
+        '**Bounded audit trails.** After each `update_task` you make, the harness bounds '
+        'the task: dated-key families are folded on sight, and once the whole-task payload '
+        f'(title + description + details + metadata) exceeds {ROTATE_THRESHOLD_BYTES:,} '
+        'bytes the oldest material is archived verbatim to a mem0 observation and the task '
+        f'is rotated down toward {ROTATE_TARGET_BYTES:,} bytes. The response field '
+        f'`{ROLLUP_KEY}` reports the outcome ({statuses}), and the task\'s '
+        f'`metadata.{ROLLUP_KEY}` records what left and where it went. Keep tasks small '
+        'so that backstop rarely fires:\n'
+        '- Do NOT mint a dated top-level metadata key per cycle (`<stem>_YYYY_MM_DD`). '
+        'Append the cycle record to the existing `<stem>_history` array, newest first; '
+        f'the harness keeps the newest {HISTORY_KEEP} once it passes {HISTORY_MAX}.\n'
+        '- To extend a description, rewrite it as a rolling summary (what the task is, '
+        'its scope items with each one\'s current state, the open questions) instead of '
+        'appending narrative. Factor a value repeated across entries into one sibling key.\n'
+        '- Do not add a `memory_hints.queries` entry that differs from an existing one '
+        'only by a date, id or number.\n'
+        '- Rotation is not adjudication: never change a task\'s status, its `details` or '
+        'its substantive question while bounding it.\n'
+        '`docs/task-authoring.md` §10 is the normative rule.'
+    )

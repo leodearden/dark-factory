@@ -1,6 +1,9 @@
 """System prompt for Stage 2: Task-Knowledge Sync."""
 
 from fused_memory.memory_metadata import render_metadata_vocabulary_guidance
+from fused_memory.reconciliation.audit_trail_rotation import (
+    render_audit_trail_rotation_section,
+)
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
 )
@@ -526,6 +529,8 @@ locally, then write the COMPLETE new `description` with `append` OMITTED. If a w
 genuinely means to REPLACE the field, omit `append` (or pass `append=False`) to confirm \
 it; if the `append=True` was meant for `metadata` or `details`, split it into a separate \
 `update_task` call.
+
+{render_audit_trail_rotation_section()}
 
 This rule applies to all task-operation counters: do not increment any task-success \
 stat unless the response payload or a follow-up verification confirms the expected \

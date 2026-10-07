@@ -1915,6 +1915,32 @@ were prose.
 `description` and `metadata` only. Its status, its ruling in `details`,
 and its substantive question are out of scope.
 
+### Enforcement
+
+`fused-memory/src/fused_memory/reconciliation/audit_trail_rotation.py` is
+the harness side of this rule. It runs after every reconciliation-stage
+`update_task` lands, touches only `description` and `metadata`, and
+reports its outcome in the response's `audit_trail_rotation` field:
+
+- **On the pattern, at any size:** a family of dated `<stem>_YYYY_MM_DD`
+  metadata keys is folded verbatim into one newest-first `<stem>_history`
+  array. An array the harness created is trimmed to `HISTORY_KEEP`
+  entries once it passes `HISTORY_MAX`, and so is
+  `memory_hints.queries`, without ever shedding the queries the context
+  assembler executes.
+- **On the size:** above `ROTATE_THRESHOLD_BYTES` it sheds toward
+  `ROTATE_TARGET_BYTES`. Description rotation keeps the first block and
+  the newest blocks, archives the middle verbatim, and leaves a pointer
+  block listing the first line of each block it moved.
+- Whatever leaves is archived and read back byte-identical first, and the
+  `audit_trail_rotation` rollup records where it went. A task whose bulk is
+  `details`, or an array the harness did not create, is reported
+  `unrotatable` rather than trimmed.
+
+It leaves two things to the Stage 2 prompt, because code cannot judge
+them: writing the description as a rolling summary, and the
+description-append pattern trigger.
+
 Worked precedents: `autopilot_video` 648 (mem0
 `971d0b38-426d-41f8-be8f-9515ec01cae5`) for the bounded-array trim;
 `solar_challenge_platform` 166/167 for the retain-and-tag shape;
