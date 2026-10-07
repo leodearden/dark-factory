@@ -20,12 +20,24 @@ import pytest
 from escalation.queue import EscalationQueue
 from shared.config_dir import TaskConfigDir
 
-# Reused read-only, as test_task_verify_lease.py::_build_task_workflow does:
+# Reused read-only: the real-git warm-lane writer -> crash-recovery reader
+# harness wiring, and (as test_task_verify_lease.py::_build_task_workflow does)
 # the factory that builds a TaskWorkflow with every collaborator mocked.
+from test_lane_lifecycle_integration import (  # noqa: F401 -- ig_git_repo is a fixture used by name
+    _acquire_lane,
+    _add_warm_lane_scripts,
+    _build_harness,
+    _get_head,
+    _make_orch_config,
+    _make_plan,
+    _wire_recovery_scheduler,
+    ig_git_repo,
+)
 from test_workflow_verify_retry import _make_workflow
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import SIMPLE_TASK
+from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.lane_lifecycle import LaneLifecycle, LaneState
@@ -668,3 +680,65 @@ class TestWorkflowSpawnSitesHoldTheSpan:
             'inside lane_in_use'
         )
         assert _lane_state(git_ops, lane) == 'assigned'
+
+
+# ---------------------------------------------------------------------------
+# Crash recovery: the startup sweep, through the REAL writer and reader.
+# ---------------------------------------------------------------------------
+
+
+async def _crashed_in_flight_lane(repo: Path) -> tuple[Path, Path]:
+    """Acquire a lane for live task 42 with progress on disk, as a run that
+    then dies would leave it. Returns (worktree_base, lane)."""
+    await _add_warm_lane_scripts(repo)
+    git_ops = _build_harness(_make_orch_config(repo)).git_ops
+    lane = await _acquire_lane(git_ops, '42', await _get_head(repo))
+    artifacts = TaskArtifacts(
+        lane, TaskArtifacts.meta_root_for(git_ops.worktree_base, lane.name),
+    )
+    artifacts.init('42', 'crashed task', 'd')
+    artifacts.write_plan(_make_plan(3, 5, '42'))
+    return git_ops.worktree_base, lane
+
+
+async def _restart_and_recover(repo: Path) -> None:
+    restarted = _build_harness(_make_orch_config(repo))
+    _wire_recovery_scheduler(restarted)
+    await restarted._recover_crashed_tasks()
+
+
+def _reset_lines(caplog, lane: Path) -> list[logging.LogRecord]:
+    return [
+        r for r in caplog.records
+        if r.levelno == logging.INFO and r.name == 'orchestrator.lane_lifecycle'
+        and lane.name in r.getMessage() and '42' in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+class TestCrashRecoveryResetsInUseFossils:
+    async def test_a_record_left_in_use_by_a_crash_is_reset_to_assigned(
+        self, ig_git_repo: Path, caplog,
+    ):
+        worktree_base, lane = await _crashed_in_flight_lane(ig_git_repo)
+        # The shape a SIGKILL mid-span leaves behind.
+        assert LaneLifecycle(worktree_base).note_in_use(lane) is True
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.lane_lifecycle'):
+            await _restart_and_recover(ig_git_repo)
+
+        record = _on_disk(worktree_base, lane.name)
+        assert (record['state'], record['task_id']) == ('assigned', '42')
+        assert _reset_lines(caplog, lane), 'the startup reset must be logged'
+
+    async def test_an_assigned_record_stays_assigned_and_is_not_reset(
+        self, ig_git_repo: Path, caplog,
+    ):
+        worktree_base, lane = await _crashed_in_flight_lane(ig_git_repo)
+
+        with caplog.at_level(logging.INFO, logger='orchestrator.lane_lifecycle'):
+            await _restart_and_recover(ig_git_repo)
+
+        record = _on_disk(worktree_base, lane.name)
+        assert (record['state'], record['task_id']) == ('assigned', '42')
+        assert _reset_lines(caplog, lane) == []
