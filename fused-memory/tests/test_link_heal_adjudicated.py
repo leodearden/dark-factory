@@ -28,20 +28,29 @@ from _link_heal_harness import (
     Answer,
     FakeAdjudicator,
     LinkHealHarness,
+    RecordingFiler,
     build_harness,
+    corpus_basis,
+    run_corpus_apply,
+    run_corpus_plan,
 )
 
+from fused_memory.maintenance import link_heal_executor
 from fused_memory.maintenance.link_adjudicator import AdjudicationFailure, LinkPair
 from fused_memory.maintenance.link_heal import BasisSource, HealAction, Verdict
 from fused_memory.maintenance.link_heal_executor import (
     ADJUDICATOR_ANCHOR,
     CORRECTS_SHARE_ANCHOR,
     MISFILE_SHARE_ANCHOR,
+    SHARE_STOP,
+    Escape,
+    FoldedEscapeFiler,
     RunLimits,
     RunReport,
     run_adjudicator_plan,
+    run_apply,
 )
-from fused_memory.maintenance.link_heal_ledger import LinkHealLedger, RunSource
+from fused_memory.maintenance.link_heal_ledger import ActionState, LinkHealLedger, RunSource
 from fused_memory.maintenance.link_heal_store import text_sha256
 from fused_memory.server.grouped_read import SIGHTING_KIND
 
@@ -279,3 +288,141 @@ class TestAPlanRunRecordsEscapesAndFilesNone:
         report = await adjudicated_plan(harness, ledger, fake, tmp_path / 'p.json')
 
         assert report.counts.would_escape == (CORRECTS_SHARE_ANCHOR,)
+
+
+async def adjudicated_apply(
+    harness: LinkHealHarness,
+    ledger: LinkHealLedger,
+    filer: RecordingFiler,
+    *,
+    approved_plan_sha256: str | None = None,
+) -> RunReport:
+    return await run_apply(
+        store=harness.store(),
+        ledger=ledger,
+        limits=LIMITS,
+        filer=filer,
+        source=RunSource.ADJUDICATOR,
+        approved_plan_sha256=approved_plan_sha256,
+    )
+
+
+def assert_refused(
+    harness: LinkHealHarness, ledger: LinkHealLedger, report: RunReport, pending: int,
+) -> None:
+    """The apply wrote nothing and left every heal pending, as planned."""
+    assert harness.mem0.write_count == 0
+    assert harness.journal_rows() == []
+    rows = ledger.pending_actions(RunSource.ADJUDICATOR)
+    assert len(rows) == pending
+    assert {row.state for row in rows} == {ActionState.PLANNED}
+    assert report.counts.planned == pending
+    assert report.counts.not_attempted == pending
+    assert report.counts.applied == 0
+    assert report.counts.stopped_by == SHARE_STOP
+    assert report.counts.complete is False
+
+
+class TestApplyRefusesAdjudicatedHealsPastAShareCeiling:
+    @pytest.mark.asyncio
+    async def test_a_misfile_share_past_its_ceiling_writes_nothing_and_escalates_once(
+        self, harness, ledger, tmp_path,
+    ):
+        seed_sightings(harness, 30)
+        await adjudicated_plan(
+            harness, ledger, scripted({n: Verdict.RELATED for n in range(12)}), tmp_path / 'p.json',
+        )
+        filer = RecordingFiler()
+
+        report = await adjudicated_apply(harness, ledger, filer)
+
+        assert_refused(harness, ledger, report, pending=30)
+        (escape,) = filer.escapes
+        assert escape.anchor == MISFILE_SHARE_ANCHOR
+        assert (escape.detail['n'], escape.detail['count']) == (30, 12)
+        assert report.counts.escaped == (
+            {'anchor': MISFILE_SHARE_ANCHOR, 'escalation_id': 'esc-recorded-1'},
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_approved_plan_sha_does_not_lift_the_ceiling(
+        self, harness, ledger, tmp_path,
+    ):
+        seed_sightings(harness, 30)
+        plan = await adjudicated_plan(
+            harness, ledger, scripted({n: Verdict.RELATED for n in range(12)}), tmp_path / 'p.json',
+        )
+        filer = RecordingFiler()
+
+        report = await adjudicated_apply(
+            harness, ledger, filer, approved_plan_sha256=plan.plan_sha256,
+        )
+
+        assert_refused(harness, ledger, report, pending=30)
+        assert [escape.anchor for escape in filer.escapes] == [MISFILE_SHARE_ANCHOR]
+        assert report.counts.approved_plan_sha256 == plan.plan_sha256
+
+    @pytest.mark.asyncio
+    async def test_a_corrects_share_past_its_ceiling_escalates_under_its_own_anchor(
+        self, harness, ledger, tmp_path,
+    ):
+        seed_sightings(harness, 30)
+        await adjudicated_plan(
+            harness, ledger, scripted({n: Verdict.CORRECTS for n in range(19)}), tmp_path / 'p.json',
+        )
+        filer = RecordingFiler()
+
+        report = await adjudicated_apply(harness, ledger, filer)
+
+        assert_refused(harness, ledger, report, pending=30)
+        assert [escape.anchor for escape in filer.escapes] == [CORRECTS_SHARE_ANCHOR]
+
+    @pytest.mark.asyncio
+    async def test_under_both_ceilings_an_adjudicated_heal_applies_and_verifies(
+        self, harness, ledger, tmp_path,
+    ):
+        harness.seed_link(kind=SIGHTING_KIND)
+        await adjudicated_plan(harness, ledger, always(Verdict.EXTENDS), tmp_path / 'p.json')
+        filer = RecordingFiler()
+
+        report = await adjudicated_apply(harness, ledger, filer)
+
+        assert filer.escapes == []
+        assert report.counts.applied == 1
+        assert report.counts.complete is True
+        assert harness.mem0.payload(DF, CHILD)['kind'] == 'amendment'
+        (journal_row,) = harness.journal_rows()
+        assert journal_row['agent_id'] == f'link-heal-{report.run_id[:8]}'
+
+    @pytest.mark.asyncio
+    async def test_a_corpus_apply_has_no_adjudications_behind_it(self, harness, ledger, tmp_path):
+        children = seed_sightings(harness, 20)
+        bases = tuple(
+            corpus_basis(
+                'RELATED' if n < 12 else 'EXTENDS',
+                child=child, child_text=f'sighting {n}', key=f'H{n:03d}',
+            )
+            for n, child in enumerate(children)
+        )
+        await run_corpus_plan(harness, ledger, tmp_path / 'p.json', bases, LIMITS)
+        filer = RecordingFiler()
+
+        report = await run_corpus_apply(harness, ledger, limits=LIMITS, filer=filer)
+
+        assert filer.escapes == []
+        assert report.counts.applied == 20
+        assert report.counts.stopped_by is None
+
+
+class TestEveryExecutorAnchorHasARoute:
+    def test_the_folded_filer_routes_every_exported_anchor(self):
+        anchors = {
+            value
+            for name, value in vars(link_heal_executor).items()
+            if name.endswith('_ANCHOR') and isinstance(value, str)
+        }
+        assert {MISFILE_SHARE_ANCHOR, CORRECTS_SHARE_ANCHOR, ADJUDICATOR_ANCHOR} <= anchors
+        filer = FoldedEscapeFiler(project_root=None)
+
+        for anchor in sorted(anchors):
+            assert filer(Escape(anchor=anchor, summary='s', detail={})) is None
