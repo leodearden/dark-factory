@@ -507,7 +507,7 @@ class TestWriteThrough:
 
             # add_finding — null/null (description-hash dedup)
             result_null = state.add_finding(
-                run_id=run_id, severity='low', category='other',
+                run_id=run_id, severity='minor', category='other',
                 description='null null observation', suggested_action='note',
                 actionable=False,
             )
@@ -666,7 +666,7 @@ class TestHydrateReadback:
                 actionable=True, task_id='42', flag_type='orphaned_knowledge',
             )['finding_id']
             fid_s1_null = state_a.add_finding(
-                run_id=run_id, severity='low', category='other',
+                run_id=run_id, severity='minor', category='other',
                 description=null_desc, suggested_action='note', actionable=False,
             )['finding_id']
             # Citations on the real stage-1 finding (cite_entity + cite_task).
@@ -677,7 +677,7 @@ class TestHydrateReadback:
             # Stage 2 (task_knowledge_sync) — becomes the ACTIVE stage.
             state_a.start_report(run_id=run_id, stage=s2, project_id='dark_factory')
             state_a.add_finding(
-                run_id=run_id, severity='high', category='systemic_pattern',
+                run_id=run_id, severity='serious', category='systemic_pattern',
                 description='stage2 finding', suggested_action='fix',
                 actionable=True, task_id='99', flag_type='systemic',
             )
@@ -685,7 +685,7 @@ class TestHydrateReadback:
             # fold anchor in _run_cited_task_index (a run-level index that must be
             # rebuilt on hydrate).
             fid_s2_anchor = state_a.add_finding(
-                run_id=run_id, severity='low', category='other',
+                run_id=run_id, severity='minor', category='other',
                 description='stage2 anchor observation', suggested_action='note',
             )['finding_id']
             assert 'error' not in await state_a.cite_task(
@@ -751,7 +751,7 @@ class TestHydrateReadback:
             #      stages: a null/null finding repeating stage-1's description
             #      folds onto the original stage-1 finding.
             dup_desc = state_b.add_finding(
-                run_id=run_id, severity='low', category='other',
+                run_id=run_id, severity='minor', category='other',
                 description=null_desc, suggested_action='note', actionable=False,
             )
             assert dup_desc.get('error') == 'duplicate_finding'
@@ -761,7 +761,7 @@ class TestHydrateReadback:
             #      a new null-task finding citing the hydrated anchor's task
             #      folds onto the original anchor finding.
             fid_new_anchor = state_b.add_finding(
-                run_id=run_id, severity='low', category='other',
+                run_id=run_id, severity='minor', category='other',
                 description='post-restart anchor restatement',
                 suggested_action='note',
             )['finding_id']
@@ -805,7 +805,7 @@ class TestStoreGC:
 
     def _add(self, state, run_id, desc):
         return state.add_finding(
-            run_id=run_id, severity='low', category='other',
+            run_id=run_id, severity='minor', category='other',
             description=desc, suggested_action='note', actionable=False,
         )['finding_id']
 
@@ -970,7 +970,7 @@ class TestSupersedeAcrossEviction:
 
     def _supersede(self, state, stage1_fid):
         return state.add_finding(
-            run_id=self._RUN, severity='low', category='memory_stale',
+            run_id=self._RUN, severity='minor', category='memory_stale',
             description='mechanism X was fixed', suggested_action='none',
             actionable=True, task_id='999',
             flag_type='memory_mechanism_contradiction_resolved',
@@ -1257,7 +1257,7 @@ class TestByteIdenticalFreshRun:
             task_id='42', flag_type='orphaned_knowledge',
         )['finding_id']
         fid_null = state.add_finding(
-            run_id=run_id, severity='low', category='other',
+            run_id=run_id, severity='minor', category='other',
             description='null null observation', suggested_action='note',
             actionable=False,
         )['finding_id']
@@ -1620,7 +1620,7 @@ class TestHydrateReanchorEviction:
                 run_id=run_id, stage=stage, project_id='dark_factory'
             )
             fid = state_a.add_finding(
-                run_id=run_id, severity='low', category='other',
+                run_id=run_id, severity='minor', category='other',
                 description='old-process finding', suggested_action='note',
                 actionable=False,
             )['finding_id']
@@ -1706,7 +1706,7 @@ class TestSupersededByPersistence:
 
         state.start_report(run_id=self._RUN, stage=self._S2, project_id='dark_factory')
         stage2_fid = state.add_finding(
-            run_id=self._RUN, severity='low', category='memory_stale',
+            run_id=self._RUN, severity='minor', category='memory_stale',
             description='mechanism X was fixed', suggested_action='none',
             actionable=True, task_id='42',
             flag_type='memory_mechanism_contradiction_resolved',
