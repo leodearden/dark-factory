@@ -74,6 +74,9 @@ LEGAL_TRANSITIONS: frozenset[tuple[LaneState | None, LaneState]] = frozenset(
         (LaneState.REGISTERED, LaneState.ASSIGNED),
         (LaneState.RELEASED, LaneState.ASSIGNED),
         (LaneState.ASSIGNED, LaneState.IN_USE),
+        # leaf δ's return edge: the last live dark-factory child in the lane
+        # exited. IN_USE is a liveness marker; it never re-keys the assignment.
+        (LaneState.IN_USE, LaneState.ASSIGNED),
         (LaneState.IN_USE, LaneState.RELEASED),
         (LaneState.ASSIGNED, LaneState.RELEASED),
         # recycle a quarantined slot back into service after its bad worktree
