@@ -220,7 +220,10 @@ queue dir included, because the YAML stays the one place each leaf is tied to it
 test-body `setenv` of one of the three still wins.
 `fused-memory/tests/test_config_hermeticity.py::test_the_pin_anchors_every_path_leaf_in_the_tests_tmp_path`
 asserts it for all five leaves, and
-`::test_a_test_local_interpolation_override_still_reaches_the_config` pins the override.
+`::test_a_test_local_interpolation_override_still_reaches_the_config` pins the override. The tmp
+layout copies the YAML defaults so config-driven stores stay out of the tmp root a test uses for its
+own files. `fused-memory/config/config.yaml` stays the layout's home, and
+`::test_the_pin_lays_out_tmp_path_as_the_tracked_config_does` fails if the copy drifts from it.
 
 **Measurement**, with the registered module command
 `uv run --directory fused-memory pytest tests/ --tb=short -q --timeout=300`:
@@ -235,8 +238,8 @@ asserts it for all five leaves, and
   `test_config_reload.py::TestDiffConfigOptionalSubmodels::test_opposite_toggles_bucket_whole_without_crash`).
   One failed because env outranks the YAML, so the pin beat `test_link_heal_cli.py`'s OWN config
   file's `reconciliation.data_dir`. M2 was rejected for that structural reason.
-- M1 as committed, inverted test included (`46ac82a768`): `26571 passed, 12 skipped, 4 xfailed`,
-  0 failed, in 576.04s.
+- M1 as committed on the task 5481 branch, inverted test included: `26571 passed, 12 skipped,
+  4 xfailed`, 0 failed, in 576.04s.
 
 **What remains.** Under the opt-in `code_default_config` no YAML is loaded, so the leaves are the
 schema's relative defaults (`.`, `./data/queue`, …). Pinning them would need the env layer, which is
