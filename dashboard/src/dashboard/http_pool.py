@@ -155,38 +155,6 @@ class PoolCensus:
 # invisible for 32 hours.
 POOL_HIGH_WATER_FRACTION = 0.8
 
-_saturation_alarm = _LatchedWarning()
-
-
-def reset_saturation_guard() -> None:
-    """Re-arm the saturation alarm. For tests."""
-    _saturation_alarm.clear()
-
-
-def _report_occupancy(reading: PoolCensus) -> None:
-    """Report pool occupancy at or above :data:`POOL_HIGH_WATER_FRACTION`.
-
-    RE-ARMS ON THE WAY BACK DOWN, which is the only thing distinguishing this
-    report from the shape guard's. A pool that saturates, recovers, and
-    saturates again has had two incidents, and the second matters at least as
-    much as the first; a latch that only ever fell one way would report the
-    first episode a process saw and nothing after it.
-
-    The whole census goes in the line, not just the ratio: "80 of 100" does not
-    say whether those are healthy in-flight requests or orphans this module
-    failed to reclaim, and that is the first question an operator asks.
-    """
-    if reading.total < reading.max_connections * POOL_HIGH_WATER_FRACTION:
-        _saturation_alarm.clear()
-        return
-    _saturation_alarm.fire(
-        'httpx connection pool at or above its high-water mark (%.0f%% of capacity): '
-        '%s. Sustained saturation ends in httpx.PoolTimeout, which the dashboard '
-        'renders as an "offline" pill on a healthy orchestrator.',
-        POOL_HIGH_WATER_FRACTION * 100,
-        reading,
-    )
-
 
 @dataclass(frozen=True)
 class _UnresolvedPool:
@@ -374,13 +342,15 @@ async def _reap(pool: httpcore.AsyncConnectionPool) -> int:
 class OrphanReaper:
     """Sweeps ONE client's pool: reclaims its orphans and reports on that pool.
 
-    Its warn-once latch is its own, not the process's, so the reports it
-    throttles are this reaper's alone.
+    Its warn-once latches are its own, not the process's, so each pool's
+    reports hear only that pool. Pinned by
+    ``dashboard/tests/test_http_pool.py::TestPoolSaturationAlarm::test_a_healthy_pools_sweep_does_not_re_arm_a_saturated_pools_alarm``.
     """
 
     def __init__(self, client: httpx.AsyncClient) -> None:
         self._client = client
         self._shape_guard = _LatchedWarning()
+        self._saturation_alarm = _LatchedWarning()
 
     async def sweep(self) -> None:
         """Reap the pool once, then report on what the reap left."""
@@ -400,7 +370,32 @@ class OrphanReaper:
             logger.warning(
                 'Reaped %d orphaned pool connection(s); pool now %s', reaped, reading
             )
-        _report_occupancy(reading)
+        self._report_occupancy(reading)
+
+    def _report_occupancy(self, reading: PoolCensus) -> None:
+        """Report pool occupancy at or above :data:`POOL_HIGH_WATER_FRACTION`.
+
+        RE-ARMS ON THE WAY BACK DOWN, which is the only thing distinguishing
+        this report from the shape guard's. A pool that saturates, recovers,
+        and saturates again has had two incidents, and the second matters at
+        least as much as the first; a latch that only ever fell one way would
+        report the first episode this reaper saw and nothing after it.
+
+        The whole census goes in the line, not just the ratio: "80 of 100" does
+        not say whether those are healthy in-flight requests or orphans this
+        module failed to reclaim, and that is the first question an operator
+        asks.
+        """
+        if reading.total < reading.max_connections * POOL_HIGH_WATER_FRACTION:
+            self._saturation_alarm.clear()
+            return
+        self._saturation_alarm.fire(
+            'httpx connection pool at or above its high-water mark (%.0f%% of '
+            'capacity): %s. Sustained saturation ends in httpx.PoolTimeout, which '
+            'the dashboard renders as an "offline" pill on a healthy orchestrator.',
+            POOL_HIGH_WATER_FRACTION * 100,
+            reading,
+        )
 
 
 # How often the background sweep runs, and the arithmetic that sized it.
