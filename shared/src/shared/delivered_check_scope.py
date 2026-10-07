@@ -21,15 +21,18 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 
 __all__ = [
     'GIT_PROBE_FAILURES',
     'GIT_TIMEOUT_SECS',
+    'STALE_PATH_CODES',
     'SYS_MODULES_SHIM_PATTERN',
     'PathState',
     'ScopePath',
     'classify_scope_paths',
     'resolve_commit',
+    'stale_scope_paths',
 ]
 
 #: Wall-clock ceiling for ONE authoring-time git probe (``grep``,
@@ -69,6 +72,36 @@ class ScopePath:
     path: str
     state: PathState
     removed_in: str | None = None
+
+
+#: The finding code each stale state is reported under, by the lint and the
+#: audit alike.
+STALE_PATH_CODES = MappingProxyType({
+    PathState.SYS_MODULES_SHIM: 'shim_path',
+    PathState.REMOVED: 'removed_path',
+})
+
+_STALE_STATES_BY_KIND: dict[str, frozenset[PathState]] = {
+    'grep': frozenset({PathState.SYS_MODULES_SHIM, PathState.REMOVED}),
+    'path': frozenset({PathState.REMOVED}),
+}
+
+
+def stale_scope_paths(
+    kind: object, expect: object, scope: Iterable[ScopePath]
+) -> tuple[ScopePath, ...]:
+    """The entries of *scope* that leave a ``kind``/``expect`` check unable to
+    go green, in input order.
+
+    Only ``expect='present'`` is subject: a dead scope makes an absent check
+    PASS, which the polarity 2x2 and the audit's ``vacuous_live_gate`` already
+    report (``docs/task-authoring.md`` §3.3). A path check is not stale on a
+    shim, because the shim file exists.
+    """
+    stale_states = _STALE_STATES_BY_KIND.get(kind) if isinstance(kind, str) else None
+    if expect != 'present' or stale_states is None:
+        return ()
+    return tuple(entry for entry in scope if entry.state in stale_states)
 
 
 def _git(
