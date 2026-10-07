@@ -39,6 +39,7 @@ Run from ``fused-memory/``::
 from __future__ import annotations
 
 import importlib.util
+import math
 import sys
 import types
 from collections.abc import Iterable, Mapping, Sequence
@@ -57,6 +58,7 @@ from fused_memory.server.write_triage_judge import (
 )
 
 _SCRIPTS = Path(__file__).resolve().parent
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _load_script(path: Path, mod_name: str) -> types.ModuleType:
@@ -79,6 +81,10 @@ def _load_script(path: Path, mod_name: str) -> types.ModuleType:
 
 _scorer = _load_script(_SCRIPTS / 'score_write_triage_pairs.py', 'score_write_triage_pairs')
 _wording = _load_script(_SCRIPTS / 'write_triage_judge_wording.py', 'write_triage_judge_wording')
+_gate = _load_script(
+    _REPO_ROOT / 'scripts' / 'check_write_triage_readiness_gate.py',
+    'check_write_triage_readiness_gate',
+)
 
 POPULATION_KEYS: tuple[str, ...] = (
     'n_writes', 'n_judge_band', 'projects', 'frozen_at', 'snapshot_sha256',
@@ -183,6 +189,39 @@ class Bound:
     value: str
 
 
+@dataclass(frozen=True)
+class SkippedArm:
+    """A judge arm the PRD names that no route reached, so π never ran it."""
+
+    arm: str
+    provider: str
+    reason: str
+
+    def row(self) -> dict[str, Any]:
+        return {'arm': self.arm, 'status': 'skipped', 'provider': self.provider,
+                'reason': self.reason}
+
+
+SKIPPED_ARMS: tuple[SkippedArm, ...] = (
+    SkippedArm(
+        'claude-haiku', 'anthropic',
+        "no route today: the deployment's ANTHROPIC_API_KEY is rejected (401), PRD §11.1;"
+        ' dropped from μ by §11.6',
+    ),
+    SkippedArm(
+        'local-model', 'local',
+        "no route today: σ dropped from μ's deps by PRD §11.6; π ran no local endpoint",
+    ),
+)
+"""The PRD's arms that are recorded as skipped rather than silently omitted."""
+
+WINNER_RULE = (
+    'meets every bound (scripts/check_write_triage_readiness_gate.py::check_require);'
+    ' fewest quality.contested_decision_errors; ties to lower'
+    ' selection.cost_per_write_usd, then arm name'
+)
+
+
 def build_matrix(
     population: Population,
     cases_by_arm: Mapping[str, Sequence[Mapping[str, Any]]],
@@ -191,20 +230,72 @@ def build_matrix(
     shipped: ArmSettings,
     bounds: Sequence[Bound],
 ) -> dict[str, Any]:
-    """Score every π arm with ι, in π's order, paired against the shipped arm."""
+    """Score every π arm with ι, check it against *bounds*, and name the winner.
+
+    Every arm is paired against the π arm whose settings are *shipped*. An arm
+    meets a bound exactly when Γ3's ``check_require`` passes on the arm's
+    :func:`candidate_doc`, so the winner's best_config passes Γ3 exactly when
+    it met every bound here.
+    """
+    if not bounds:
+        raise ValueError(
+            "no bounds given: pass Γ3's bounds as --require PATH OP VALUE; an empty"
+            ' list would let every arm qualify'
+        )
     reference = _reference_arm(population, shipped)
     _refuse_unmatched_cases(population, cases_by_arm)
+    _refuse_scored_and_skipped(population)
     scores = _scorer.score_pairs(
         chain.from_iterable(cases_by_arm.values()), verdicts, reference_arm=reference.name,
     )
+    block = population.c2_block()
+    scored = [
+        _with_bounds(_scored_row(arm, scores['arms'][arm.name]), block, bounds)
+        for arm in population.arms
+    ]
+    winner, fallback_applied = select_winner(scored)
     return {
         'reference_arm': reference.name,
         'reference_settings': shipped.selection_keys(),
-        'population': population.c2_block(),
+        'population': block,
         'verdict_corpus': scores['verdict_corpus'],
         'list_prices': scores['list_prices'],
-        'arms': [_scored_row(arm, scores['arms'][arm.name]) for arm in population.arms],
+        'arms': scored + [skipped.row() for skipped in SKIPPED_ARMS],
+        'selection_rule': {
+            'bounds': [{'path': b.path, 'op': b.op, 'value': b.value} for b in bounds],
+            'rule': WINNER_RULE,
+            'fallback_applied': fallback_applied,
+        },
+        'winner': winner,
     }
+
+
+def candidate_doc(row: Mapping[str, Any], population: Mapping[str, Any]) -> dict[str, Any]:
+    """The doc Γ3 reads for one scored arm; the one builder of it."""
+    return {'quality': row['quality'], 'selection': row['selection'], 'population': population}
+
+
+def select_winner(rows: Sequence[Mapping[str, Any]]) -> tuple[str, bool]:
+    """The winning arm by :data:`WINNER_RULE`, and whether no arm met every bound.
+
+    When no scored arm meets every bound, the same ranking runs over every
+    scored arm and the fallback flag is True. Skipped rows are never chosen.
+    """
+    scored = [row for row in rows if row['status'] == 'scored']
+    if not scored:
+        raise ValueError('no scored arm to choose a winner from')
+    qualified = [row for row in scored if row['bounds']['met']]
+    pool = qualified or scored
+    return min(pool, key=_rank)['arm'], not qualified
+
+
+def _rank(row: Mapping[str, Any]) -> tuple[int, float, str]:
+    cost = row['selection']['cost_per_write_usd']
+    return (
+        row['quality']['contested_decision_errors'],
+        math.inf if cost is None else cost,
+        row['arm'],
+    )
 
 
 def _reference_arm(population: Population, shipped: ArmSettings) -> PiArm:
@@ -229,6 +320,20 @@ def _refuse_unmatched_cases(
             f'case rows are given for arms {sorted(cases_by_arm)} but the population'
             f' publishes {sorted(population.names)}'
         )
+
+
+def _refuse_scored_and_skipped(population: Population) -> None:
+    both = sorted(set(population.names) & {skipped.arm for skipped in SKIPPED_ARMS})
+    if both:
+        raise ValueError(f'arms {both} are both run by π and recorded as skipped')
+
+
+def _with_bounds(
+    row: dict[str, Any], population: Mapping[str, Any], bounds: Sequence[Bound],
+) -> dict[str, Any]:
+    doc = {'best': candidate_doc(row, population)}
+    checks = [_gate.check_require(doc, 'best', b.path, b.op, b.value) for b in bounds]
+    return row | {'bounds': {'met': all(check['ok'] for check in checks), 'checks': checks}}
 
 
 def _scored_row(arm: PiArm, iota: Mapping[str, Any]) -> dict[str, Any]:
