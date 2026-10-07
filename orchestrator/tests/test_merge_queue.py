@@ -43,7 +43,12 @@ from _orch_helpers import (
     wait_responsive,
 )
 from _resolution_merges import resolution_merge
-from test_merge_queue_concurrent_verify import _fake_verify_result
+from test_merge_queue_concurrent_verify import (
+    _fake_verify_result,
+    _iter_test_methods,
+    _method_wait_budget,
+    _timeout_mark_offenders,
+)
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, ModuleConfig, OrchestratorConfig
@@ -23345,3 +23350,64 @@ def test_verify_and_advance_shim_removed() -> None:
         'drive_verify_and_advance from _merge_queue_harness, so the production '
         'class must no longer carry the test-only shim.'
     )
+
+
+class TestTimeoutMarkCoverage:
+    """Every test in THIS module runs under a timeout that clears its
+    computed worst-case wait budget.
+
+    Checked per METHOD, not per class as in the sibling guards: this module
+    carries method-level ``@pytest.mark.timeout`` marks, and pytest applies
+    the closest mark, so a method's own mark REPLACES its class's. The audit
+    engine is imported from test_merge_queue_concurrent_verify unchanged;
+    only the lookup of which object holds the effective mark is local.
+    """
+
+    def test_a_method_mark_replaces_its_class_mark(self) -> None:
+        @pytest.mark.timeout(600)
+        class _Marked:
+            @pytest.mark.timeout(300)
+            def test_tight(self) -> None: ...
+
+            def test_inherits(self) -> None: ...
+
+        resolve = _effective_timeout_mark_resolver({'_Marked': _Marked})
+        offenders = _timeout_mark_offenders(
+            {'_Marked::test_tight': 360.0, '_Marked::test_inherits': 360.0}, resolve,
+        )
+
+        assert len(offenders) == 1, f'expected exactly one offender, got {offenders!r}'
+        assert offenders[0].startswith('_Marked::test_tight'), (
+            f'the method-level 300 replaces the class-level 600, so only '
+            f'test_tight is short of its 360s bill; got {offenders!r}'
+        )
+
+        unresolved = _timeout_mark_offenders({'_Missing::test_x': 360.0}, resolve)
+        assert len(unresolved) == 1 and 'could not be resolved' in unresolved[0], (
+            f'an unknown class must be a loud offender, not a silent skip; got {unresolved!r}'
+        )
+
+    def test_every_test_method_runs_under_a_timeout_clearing_its_wait_budget(self) -> None:
+        source = Path(__file__).read_text()
+        budgets = {
+            f'{class_name}::{method.name}': _method_wait_budget(method)
+            for class_name, method in _iter_test_methods(source)
+        }
+        offenders = _timeout_mark_offenders(
+            budgets, _effective_timeout_mark_resolver(globals()),
+        )
+
+        assert not offenders, (
+            'These tests have a computed worst-case wait budget that the '
+            'timeout they actually run under (their own mark if they have '
+            'one, else their class mark, else the ambient budget) does not '
+            'clear:\n'
+            + '\n'.join(f'  - {offender}' for offender in offenders)
+            + '\n\nConsequence: pytest-timeout\'s thread method os._exit()s '
+            'the xdist worker under --max-worker-restart=0, so a '
+            'slow-but-correct run reports as a worker death instead of a '
+            'clean per-test failure. Mark the offending class with '
+            '@pytest.mark.timeout(STACKED_MERGE_WAIT_TEST_TIMEOUT) or '
+            '@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT), and do not '
+            'leave a tighter method-level mark under it.'
+        )
