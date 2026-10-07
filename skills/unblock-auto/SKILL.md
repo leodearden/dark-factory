@@ -41,6 +41,11 @@ If the orchestrator could not fetch the task record, you get an explicit
 silently missing block. When you see it you are investigating with neither the task
 text nor its declared scope — label scope conservatively.
 
+If the fetch succeeded but the record carries no title, description, details or
+declared files, you get `**Task record:** fetched but empty` instead. Treat it the
+same way: there is no task text and no declared scope to judge against, so label
+scope conservatively.
+
 ---
 
 ## Step 1: Gather context (read-only)
