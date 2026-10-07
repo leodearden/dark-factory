@@ -27,6 +27,12 @@ _MAX_FAILURE_TOKEN_LEN = 64
 # through _as_failure_token precisely because the agent can influence those.
 CODEBASE_ROOT_UNRESOLVED = 'codebase_root_unresolved'
 
+# The claude_cli provider's read-only equivalents of the in-process tools in
+# verify().  Git history stays in-process only: a git-scoped CLI Bash rule is
+# not read-only (fused-memory/scripts/probe_schema_max_turns.py's docstring
+# records the measured `git log --output` write).
+_EXPLORE_CLI_TOOLS = ('Read', 'Grep', 'Glob')
+
 
 # Sub-reasons for a refused root.  They discriminate the populations hiding
 # behind the single CODEBASE_ROOT_UNRESOLVED token: 'no_dot_git' is a real
@@ -109,7 +115,6 @@ codebase. You are strictly read-only and have no access to memory systems or tas
 - Be neutral: report what the code says, don't speculate.
 - Every claim must cite specific evidence: file paths, line ranges, code snippets.
 - If you can't find evidence either way, say "inconclusive" — don't guess.
-- Check git history when the claim involves changes over time.
 - Focus your search on the scope hints provided, but expand if needed.
 - Your `summary` becomes a PERMANENT project-memory record. It will be retrieved \
 months from now by semantic search, by people and agents who never see this \
@@ -132,7 +137,7 @@ Neither is readable without the evidence that justifies it, so put that evidence
 the summary regardless of which verdict you reach.
 
 ## Output
-When done, call `verification_complete` with your findings:
+Report your findings with these fields:
 - verdict: "confirmed" | "contradicted" | "inconclusive"
 - confidence: 0.0-1.0
 - evidence: list of {file_path, line_range, snippet, relevance}
@@ -342,7 +347,10 @@ class CodebaseVerifier:
 
         tools['git_log'] = ToolDefinition(
             name='git_log',
-            description='View git commit history, optionally filtered to a file path.',
+            description=(
+                'View git commit history, optionally filtered to a file path. '
+                'Use it when the claim involves changes over time.'
+            ),
             parameters={
                 'type': 'object',
                 'properties': {
@@ -387,7 +395,10 @@ class CodebaseVerifier:
         # Terminal tool
         tools['verification_complete'] = ToolDefinition(
             name='verification_complete',
-            description='Signal verification is complete with your findings.',
+            description=(
+                'Deliver your findings. Call this exactly once, when you are done; '
+                'it ends the verification.'
+            ),
             parameters={
                 'type': 'object',
                 'properties': {
@@ -433,7 +444,7 @@ class CodebaseVerifier:
 ### Codebase Root
 {codebase_root}
 
-Investigate this claim against the codebase and call `verification_complete` with your findings.
+Investigate this claim against the codebase and report your findings.
 """
 
         agent = AgentLoop(
@@ -441,6 +452,7 @@ Investigate this claim against the codebase and call `verification_complete` wit
             system_prompt=EXPLORE_AGENT_SYSTEM_PROMPT,
             tools=tools,
             terminal_tool='verification_complete',
+            cli_tools=_EXPLORE_CLI_TOOLS,
             # The agent explores the TARGET project (task 4722): its cwd, and
             # so the CLAUDE.md the CLI auto-loads, must be that project's.
             cwd=codebase_root,
