@@ -17,20 +17,20 @@ from pathlib import Path
 from types import MappingProxyType
 
 from source_measures import (
+    DomainMember,
     MetricsError,
     PatchCall,
     file_size_measures_in_tree,
     patch_calls_in_tree,
     private_reads_in_tree,
-    src_module_name,
     tracked_files,
+    workspace_domain,
 )
 
 _PROSE_MIN_WORDS = 6
 _QUOTE_MIN_CHARS = 3
 _PROSE_COMPARE_OPS = (ast.In, ast.NotIn, ast.Eq, ast.NotEq)
 _UNREADABLE = (SyntaxError, ValueError, MetricsError, OSError)
-_SCRIPT_DIRS = ('scripts', 'scripts/legibility')
 _TOTAL = 'total'
 
 _ADDITIVE = (
@@ -77,22 +77,16 @@ class _FirstParty:
     modules: MappingProxyType[str, str]
 
     @classmethod
-    def of(cls, tracked: Sequence[str]) -> _FirstParty:
-        modules: dict[str, str] = {}
-        for path in tracked:
-            name = src_module_name(path)
-            if name is not None:
-                modules[name] = path
-            elif path.rpartition('/')[0] in _SCRIPT_DIRS:
-                modules[path.rpartition('/')[2].removesuffix('.py')] = path
-        roots = {
-            name.split('.', 1)[0] for name, path in modules.items()
-            if path.endswith('/__init__.py') and '.' not in name
+    def of(cls, domain: Iterable[DomainMember]) -> _FirstParty:
+        modules = {
+            file.import_name: file.path
+            for member in domain for file in member.files
+            if file.import_name is not None
         }
-        roots.update(
-            name for name, path in modules.items() if path.rpartition('/')[0] in _SCRIPT_DIRS
+        return cls(
+            roots=frozenset(name.split('.', 1)[0] for name in modules),
+            modules=MappingProxyType(modules),
         )
-        return cls(roots=frozenset(roots), modules=MappingProxyType(modules))
 
     def owns(self, dotted: str) -> bool:
         return dotted.split('.', 1)[0] in self.roots
@@ -406,8 +400,9 @@ def _in_test_tree(path: str) -> bool:
 
 
 def measure_python_tree(tree_root: Path) -> PythonPinningCensus:
+    domain = workspace_domain(tree_root)
+    first_party = _FirstParty.of(domain)
     tracked = tracked_files(tree_root, '*.py')
-    first_party = _FirstParty.of(tracked)
     prose = _ProseIndex(tree_root, first_party)
     by_package: defaultdict[str, list[_FileMeasures]] = defaultdict(list)
     unreadable: set[str] = set()
