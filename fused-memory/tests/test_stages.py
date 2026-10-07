@@ -36,6 +36,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_BUILTIN,
     DISALLOW_ESCALATION_READS,
     DISALLOW_ESCALATION_WRITES,
+    DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES,
     DISALLOW_MEMORY_WRITES,
     DISALLOW_TASK_WRITES,
     STAGE1_DISALLOWED,
@@ -323,7 +324,9 @@ class TestDisallowedToolLists:
 
     def test_all_disallowed_have_mcp_prefix(self):
         """All MCP tools in disallowed lists should use the mcp__ naming convention."""
-        for tool in DISALLOW_TASK_WRITES + DISALLOW_MEMORY_WRITES:
+        for tool in (
+            DISALLOW_TASK_WRITES + DISALLOW_MEMORY_WRITES + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
+        ):
             assert tool.startswith('mcp__fused-memory__'), f'{tool} missing MCP prefix'
 
     def test_builtin_disallowed_are_claude_native(self):
