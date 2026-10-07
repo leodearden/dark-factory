@@ -241,8 +241,9 @@ class TestLedgerRetentionDays:
 
 
 class TestNoveltySpikeBaseline:
-    """``census.novelty_spike.multiple`` / ``baseline_days`` — the relative
-    (b) condition of plans/census-incremental-prd.md §4.7."""
+    """``census.novelty_spike`` — the relative (b) condition of
+    plans/census-incremental-prd.md §4.7, every field an unquoted
+    non-negative int."""
 
     def test_yaml_values_round_trip(self, tmp_path):
         text = MINIMAL_YAML + 'census: {novelty_spike: {multiple: 3, baseline_days: 14}}\n'
@@ -259,13 +260,13 @@ class TestNoveltySpikeBaseline:
         assert cfg.census.novelty_spike.multiple == 2
         assert cfg.census.novelty_spike.baseline_days == 30
 
-    def test_zero_is_legal(self, tmp_path):
-        text = MINIMAL_YAML + 'census: {novelty_spike: {multiple: 0, baseline_days: 0}}\n'
+    @pytest.mark.parametrize('field', ['count', 'window_hours', 'multiple', 'baseline_days'])
+    def test_zero_is_legal(self, tmp_path, field):
+        text = MINIMAL_YAML + f'census: {{novelty_spike: {{{field}: 0}}}}\n'
         cfg = mod.load_config(_write(tmp_path, text))
-        assert cfg.census.novelty_spike.multiple == 0
-        assert cfg.census.novelty_spike.baseline_days == 0
+        assert getattr(cfg.census.novelty_spike, field) == 0
 
-    @pytest.mark.parametrize('field', ['multiple', 'baseline_days'])
+    @pytest.mark.parametrize('field', ['count', 'window_hours', 'multiple', 'baseline_days'])
     @pytest.mark.parametrize('bad_value', ["'2'", '-1', 'true', '2.5'])
     def test_non_int_or_negative_value_raises(self, tmp_path, field, bad_value):
         text = MINIMAL_YAML + f'census: {{novelty_spike: {{{field}: {bad_value}}}}}\n'

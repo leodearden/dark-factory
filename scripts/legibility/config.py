@@ -53,8 +53,8 @@ class NoveltySpike(BaseModel):
 
     model_config = ConfigDict(extra='allow')
 
-    count: int = 4
-    window_hours: int = 72
+    count: int = Field(default=4, ge=0, strict=True)
+    window_hours: int = Field(default=72, ge=0, strict=True)
     multiple: int = Field(default=2, ge=0, strict=True)
     baseline_days: int = Field(default=30, ge=0, strict=True)
 
