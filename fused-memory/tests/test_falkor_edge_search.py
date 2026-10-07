@@ -90,9 +90,6 @@ FALLBACK_LEGS: dict[str, SearchLeg] = {
     'community_similarity_search': lambda driver: search_utils.community_similarity_search(
         driver, [0.1, 0.2, 0.3], ['g']
     ),
-    'edge_bfs_search': lambda driver: search_utils.edge_bfs_search(
-        driver, ['origin'], 2, SearchFilters(), ['g']
-    ),
     'episode_mentions_reranker': lambda driver: search_utils.episode_mentions_reranker(
         driver, [['a', 'b']]
     ),
