@@ -5578,17 +5578,21 @@ class TaskInterceptor:
                 # relay copied the gate list forward from the previous relay's
                 # prose instead of re-deriving it.
                 #
-                # The `dependencies` kwarg takes precedence over `before`: one
-                # call may legitimately rewire the array and relay that change
-                # in the same write, and the invariant is about the array the
-                # write LEAVES BEHIND, so judging the prose against the
-                # pre-write row would reject that correct write. `before` is
-                # reused rather than re-read (see the comment block above).
+                # The prose is judged against the array the write LEAVES
+                # BEHIND. A non-None `dependencies` kwarg is that array, so it
+                # takes precedence over `before`. `None` means the write leaves
+                # the array untouched — the backend's own contract
+                # (backends/sqlite_task_backend.py::TaskBackend.update_task) —
+                # and server/tools.py::update_task always forwards the key, so
+                # a presence test would never fall back to `before`. `[]`
+                # clears the array and is enforced as such. `before` is reused
+                # rather than re-read (see the comment block above).
+                incoming_dependencies = kwargs.get('dependencies')
                 if err := stale_gate_citation_error(
                     kwargs.get('details'),
                     agent_id,
                     live_dependencies=(
-                        kwargs['dependencies'] if 'dependencies' in kwargs
+                        incoming_dependencies if incoming_dependencies is not None
                         else (before or {}).get('dependencies')
                     ),
                 ):

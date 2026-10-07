@@ -570,7 +570,9 @@ def update_task_tool(interceptor):
     default exactly as a live call does.
     """
     server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
-    return server._tool_manager.get_tool('update_task').fn
+    tool = server._tool_manager.get_tool('update_task')
+    assert tool is not None
+    return tool.fn
 
 
 class TestUpdateTaskMcpTool:
