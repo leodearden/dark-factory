@@ -404,3 +404,109 @@ class TestLaneInUseSpan:
 
         assert inside == released
         assert record_path.read_bytes() == released
+
+
+@pytest.mark.asyncio
+class TestLaneInUseNesting:
+    """Several live children in one lane: only the last one out steps it back."""
+
+    async def test_nested_spans_hold_in_use_until_the_outer_one_exits(
+        self, tmp_path: Path,
+    ):
+        git_ops = _git_ops(tmp_path, pool_size=1)
+        lane = await _assigned_lane(git_ops)
+
+        async with git_ops.lane_in_use(lane):
+            outer_stamp = _on_disk(git_ops.worktree_base, lane.name)['updated_at']
+            async with git_ops.lane_in_use(lane):
+                inner = _on_disk(git_ops.worktree_base, lane.name)
+            after_inner = _lane_state(git_ops, lane)
+
+        assert (inner['state'], inner['updated_at']) == ('in_use', outer_stamp), (
+            'the inner enter must not write again'
+        )
+        assert after_inner == 'in_use', 'a child is still live after the inner exit'
+        assert _lane_state(git_ops, lane) == 'assigned'
+
+    async def test_a_raise_in_the_inner_span_unwinds_both_to_assigned(
+        self, tmp_path: Path,
+    ):
+        git_ops = _git_ops(tmp_path, pool_size=1)
+        lane = await _assigned_lane(git_ops)
+
+        with pytest.raises(RuntimeError, match='inner child failed'):
+            async with git_ops.lane_in_use(lane), git_ops.lane_in_use(lane):
+                raise RuntimeError('inner child failed')
+
+        assert _lane_state(git_ops, lane) == 'assigned'
+
+    async def test_spans_on_different_lanes_are_independent(self, tmp_path: Path):
+        git_ops = _git_ops(tmp_path, pool_size=2)
+        lane_a = await _assigned_lane(git_ops, '42')
+        lane_b = await _assigned_lane(git_ops, '43')
+
+        async with git_ops.lane_in_use(lane_a):
+            only_a = (_lane_state(git_ops, lane_a), _lane_state(git_ops, lane_b))
+            async with git_ops.lane_in_use(lane_b):
+                both = (_lane_state(git_ops, lane_a), _lane_state(git_ops, lane_b))
+            b_exited = (_lane_state(git_ops, lane_a), _lane_state(git_ops, lane_b))
+
+        assert only_a == ('in_use', 'assigned')
+        assert both == ('in_use', 'in_use')
+        assert b_exited == ('in_use', 'assigned')
+        assert (_lane_state(git_ops, lane_a), _lane_state(git_ops, lane_b)) == (
+            'assigned', 'assigned',
+        )
+
+    async def test_a_fresh_span_after_a_full_unwind_writes_in_use_again(
+        self, tmp_path: Path,
+    ):
+        git_ops = _git_ops(tmp_path, pool_size=1)
+        lane = await _assigned_lane(git_ops)
+        async with git_ops.lane_in_use(lane), git_ops.lane_in_use(lane):
+            pass
+        assert _lane_state(git_ops, lane) == 'assigned'
+
+        async with git_ops.lane_in_use(lane):
+            again = _lane_state(git_ops, lane)
+
+        assert again == 'in_use'
+        assert _lane_state(git_ops, lane) == 'assigned'
+
+    async def test_every_enter_re_marks_a_lane_reassigned_under_a_long_span(
+        self, tmp_path: Path,
+    ):
+        git_ops = _git_ops(tmp_path, pool_size=1)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        lane = await _assigned_lane(git_ops, '42')
+
+        async with git_ops.lane_in_use(lane):
+            await pool.release(lane)
+            assert await _assigned_lane(git_ops, '43') == lane
+            reassigned = _on_disk(git_ops.worktree_base, lane.name)
+            async with git_ops.lane_in_use(lane):
+                second = _lane_state(git_ops, lane)
+            after_second = _lane_state(git_ops, lane)
+
+        assert (reassigned['state'], reassigned['task_id']) == ('assigned', '43')
+        assert second == 'in_use'
+        assert after_second == 'in_use', (
+            'the outer span is still live: over-reporting is the safe direction'
+        )
+        assert _lane_state(git_ops, lane) == 'assigned'
+        assert _assignment(git_ops, lane)[0] == '43'
+
+    async def test_the_sweep_spares_a_lane_held_by_a_live_span(self, tmp_path: Path):
+        git_ops = _git_ops(tmp_path, pool_size=2)
+        live = await _assigned_lane(git_ops, '42')
+        fossil = await _assigned_lane(git_ops, '43')
+        assert LaneLifecycle(git_ops.worktree_base).note_in_use(fossil) is True
+
+        async with git_ops.lane_in_use(live):
+            reset = git_ops.reset_stale_lane_in_use_records()
+            live_inside = _lane_state(git_ops, live)
+
+        assert reset == [fossil.name]
+        assert live_inside == 'in_use'
+        assert _lane_state(git_ops, fossil) == 'assigned'
