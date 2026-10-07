@@ -26,11 +26,16 @@ from fused_memory.reconciliation.audit_trail_rotation import (
     bound_audit_trail,
     near_duplicate_key,
     plan_rotation,
+    render_audit_trail_rotation_section,
     task_fingerprint,
     task_payload_bytes,
     unrotatable_reason,
 )
 from fused_memory.reconciliation.context_assembler import HINT_QUERIES_EXECUTED
+from fused_memory.reconciliation.prompts.stage2 import (
+    STAGE2_SYSTEM_PROMPT,
+    build_stage2_system_prompt,
+)
 
 NOW = datetime(2026, 10, 7, 12, 0, tzinfo=UTC)
 
@@ -743,3 +748,26 @@ class TestBoundAuditTrailExecutor:
         for outcome in (rotated, unrotatable):
             payload = json.loads(json.dumps(outcome.as_dict()))
             assert payload['status'] == outcome.status
+
+
+class TestStage2PromptStatesTheRule:
+    """Prompt-assembly drift checks: what Stage 2 is told matches what the code enforces."""
+
+    @pytest.mark.parametrize('project_id', ['dark_factory', 'autopilot_video'])
+    def test_the_section_is_in_every_assembled_stage2_prompt(self, project_id):
+        section = render_audit_trail_rotation_section()
+        assert section in STAGE2_SYSTEM_PROMPT
+        assert section in build_stage2_system_prompt(project_id)
+
+    def test_the_numbers_come_from_the_enforced_constants(self):
+        section = render_audit_trail_rotation_section()
+        assert f'{ROTATE_THRESHOLD_BYTES:,}' in section
+        assert f'{ROTATE_TARGET_BYTES:,}' in section
+        assert str(HISTORY_KEEP) in section
+        assert ROLLUP_KEY in section
+
+    def test_the_section_sits_under_verifying_task_operations(self):
+        heading = STAGE2_SYSTEM_PROMPT.index('## Verifying Task Operations')
+        next_heading = STAGE2_SYSTEM_PROMPT.index('\n## ', heading + 1)
+        section = STAGE2_SYSTEM_PROMPT.index(render_audit_trail_rotation_section())
+        assert heading < section < next_heading
