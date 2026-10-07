@@ -24,7 +24,6 @@ from _orch_helpers import (
     stamp_stock_routing_config,
 )
 from shared.cli_invoke import (
-    BUDGET_EXHAUSTED_SUBTYPE,
     AgentFailureKind,
     AllAccountsCappedException,
     classify_agent_failure,
@@ -434,6 +433,7 @@ class TestBudgetExhaustedFallback:
             output='',
             structured_output=None,
         )
+        assert classify_agent_failure(agent_result).kind is AgentFailureKind.BUDGET
 
         scheduler = MagicMock()
         scheduler.update_task = AsyncMock(return_value=True)
@@ -464,38 +464,6 @@ class TestBudgetExhaustedFallback:
         assert 'session_id' in entry
         assert 'stderr_tail' in entry
         assert 'duration_ms' in entry
-
-    @pytest.mark.asyncio
-    async def test_budget_kind_is_budget_exhausted_never_infra_failure(self, tmp_path):
-        from orchestrator.dry_run_unblock import run_dry_run_unblock
-
-        agent_result = _make_agent_result(
-            success=False,
-            cost_usd=5.0,
-            subtype=BUDGET_EXHAUSTED_SUBTYPE,
-            output='',
-            structured_output=None,
-        )
-        assert classify_agent_failure(agent_result).kind is AgentFailureKind.BUDGET
-
-        scheduler = MagicMock()
-        scheduler.update_task = AsyncMock(return_value=True)
-
-        with patch('orchestrator.dry_run_unblock.invoke_agent',
-                   new=AsyncMock(return_value=agent_result)):
-            await run_dry_run_unblock(
-                task_id='89',
-                worktree=str(tmp_path),
-                reason='review failed',
-                detail='',
-                scheduler=scheduler,
-                mcp=MagicMock(),
-                config=_make_config(budget_usd=5.0),
-            )
-
-        _assert_one_proposal_persist(scheduler)
-        entry = scheduler.update_task.call_args.args[1]['dry_run_proposals'][0]
-        assert entry.get('status') == 'budget_exhausted'
 
 
 # ---------------------------------------------------------------------------

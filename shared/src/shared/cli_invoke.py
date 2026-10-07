@@ -1734,6 +1734,15 @@ class AgentFailureClass:
     diagnostic_detail: str
 
 
+def _ceiling_reported_by_subtype(result: AgentResult) -> CapReason | None:
+    """The configured ceiling that *result*'s CLI subtype says ended the run, or None."""
+    if result.subtype == BUDGET_EXHAUSTED_SUBTYPE:
+        return CapReason.BUDGET
+    if result.subtype == 'error_max_turns':
+        return CapReason.TURNS
+    return None
+
+
 def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
     """Classify an ``AgentResult`` for the steward / escalation layer.
 
@@ -1758,33 +1767,29 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
        requeue lane keys on was never produced. The summary's prefix is that
        verbatim marker; a free-form kill-context suffix is appended only when
        ``result.timed_out``, so the non-timed-out summary is unchanged.
-       This rule outranks rule 4 ONLY — four negative guards keep it from
-       shadowing the rules that sit below rule 4 in source order but ABOVE
-       it in precedence, i.e. it behaves as rule "3.5":
-       ``is_timed_out_with_progress`` (defers to rule 4's productive-kill
-       branch), ``subtype`` in {``'error_max_turns'``,
-       ``BUDGET_EXHAUSTED_SUBTYPE``} (defers to rule 5) and
-       ``ModelNotFound`` (defers to rule 6, matching
-       ``classify_invocation``'s ModelNotFound > ServerError ranking —
-       INV-5).
+       This rule outranks rule 4 ONLY: it yields to rule 4's productive-kill
+       branch and to rules 5 and 6, which sit below rule 4 in source order
+       but ABOVE this rule in precedence (each says why), so it behaves as
+       rule "3.5".
     4. ``result.timed_out`` → ``TIMED_OUT`` (summary distinguishes a
        PRODUCTIVE kill — ``transcript_turns > 0`` — from a no-progress wedge;
        see ``is_timed_out_with_progress``/reify-4827). A productive kill
-       keeps this kind even when a 5xx status rode along (rule 3's first
-       guard): the wall-clock ceiling, not the provider, is what ended a run
+       keeps this kind even when a 5xx status rode along (rule 3 defers to
+       it): the wall-clock ceiling, not the provider, is what ended a run
        that did real agentic work, and downstream consumers key on
        ``TIMED_OUT`` for that (``dry_run_unblock``'s infra-failure kinds,
        the scheduler's genuine — not transient — requeue lane).
-    5. A configured ceiling ended the run:
-       ``result.subtype == 'error_max_turns'`` → ``MAX_TURNS``
+    5. ``_ceiling_reported_by_subtype`` names a configured ceiling:
+       ``CapReason.TURNS`` (subtype ``'error_max_turns'``) → ``MAX_TURNS``
        (high ``turns`` + non-zero ``output_tokens`` but empty ``output``), or
-       ``result.subtype == BUDGET_EXHAUSTED_SUBTYPE`` → ``BUDGET`` (the CLI's
-       own ``--max-budget-usd`` ceiling). The two subtypes are mutually
-       exclusive, so their relative order is immaterial. BUDGET ranks above
+       ``CapReason.BUDGET`` (subtype ``BUDGET_EXHAUSTED_SUBTYPE``, the CLI's
+       own ``--max-budget-usd`` ceiling) → ``BUDGET``. BUDGET ranks above
        rules 6 and 7 because a budget abort proves the API accepted the
        request, so the model resolved and the account was live.
-       Rule 3 defers to this so a saturated run carrying an incidental 5xx
-       is still detectable as saturation (workflow ``_stamp_simple_saturated``).
+       Rule 3 defers to this because the ceiling, not the provider, ended a
+       run the API had accepted, so either kind survives an incidental 5xx
+       — which keeps saturation detectable (workflow
+       ``_stamp_simple_saturated``).
     6. the outcome is ``ModelNotFound`` → ``MODEL_NOT_FOUND`` (TERMINAL —
        no cross-account retry; placed ABOVE the ``api_error_status`` rule
        below because a 404 also sets ``api_error_status`` and would
@@ -1792,7 +1797,8 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
        this for the same reason: a ModelNotFound marker alongside a 5xx
        status is terminal for ``invoke_with_cap_retry``, so emitting the
        transient marker for it would tell the scheduler to requeue a run
-       the retry loop already gave up on).
+       the retry loop already gave up on — and the deferral matches
+       ``classify_invocation``'s ModelNotFound > ServerError ranking, INV-5).
     7. ``result.api_error_status`` set, OR the outcome is ``AuthFailed`` →
        ``API_ERROR`` (includes status code in the summary; transient — worth
        retrying against another account). ``AuthFailed`` ({401, 403}) is a
@@ -1845,6 +1851,7 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
     from shared.invocation_outcome import OK, AuthFailed, ModelNotFound, classify_invocation
 
     outcome = classify_invocation(result, strict_confirm=True)
+    ceiling = _ceiling_reported_by_subtype(result)
 
     tail_out = result.output[-500:] if result.output else ''
     tail_err = result.stderr[-500:] if result.stderr else ''
@@ -1892,33 +1899,18 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
     # timed-out path, which keeps the non-timed-out summary byte-identical to
     # what callers already assert on.
     #
-    # The four guards make this rule outrank the timeout rule ONLY. Source
-    # order alone would also put it above max_turns, budget and ModelNotFound, which
-    # sit BELOW the timeout rule but ABOVE this one in precedence:
-    # - is_timed_out_with_progress: a PRODUCTIVE kill (transcript_turns > 0)
-    #   is a wall-clock timeout that happened to carry a 5xx, not a
-    #   pre-first-token outage. Claiming otherwise both mis-phrases the
-    #   summary and routes a productive kill into the transient-requeue lane
-    #   / out of dry_run_unblock's infra-failure kinds. The 5xx is still in
-    #   diagnostic_detail. NOTE this is a deliberate, benign divergence from
-    #   classify_invocation, which still returns ServerError for that shape:
-    #   in invoke_with_cap_retry the ServerError branch and the
-    #   progress-timeout guard below it both confirm the slot and break, so
-    #   the retry loop's behaviour is identical either way.
-    # - error_max_turns: saturation detection (workflow's
-    #   _stamp_simple_saturated) must survive an incidental 5xx.
-    # - BUDGET_EXHAUSTED_SUBTYPE: the configured ceiling, not the provider,
-    #   ended a run the API had accepted, so BUDGET survives an incidental 5xx.
-    # - ModelNotFound: classify_invocation ranks ModelNotFound ABOVE
-    #   ServerError, and the cap-retry loop treats it as TERMINAL. Emitting
-    #   the transient marker here would have the scheduler requeue a run the
-    #   retry loop already gave up on — the exact mis-tagging rule 6's
-    #   placement exists to prevent (INV-5: the two classifiers agree).
+    # The guards confine this rule to outranking the timeout rule: each yields
+    # to a rule that sits below it in source order but above it in
+    # precedence, and the docstring entry for that rule says why. The
+    # progress guard is a deliberate, benign divergence from
+    # classify_invocation, which still returns ServerError for a productive
+    # kill: in invoke_with_cap_retry the ServerError branch and the
+    # progress-timeout guard below it both confirm the slot and break, so
+    # the retry loop's behaviour is identical either way.
     if (
         is_server_error_status(result.api_error_status)
         and not is_timed_out_with_progress(result)
-        and result.subtype != 'error_max_turns'
-        and result.subtype != BUDGET_EXHAUSTED_SUBTYPE
+        and ceiling is None
         and not isinstance(outcome, ModelNotFound)
     ):
         summary = f'agent API error: HTTP {result.api_error_status}'
@@ -1953,7 +1945,7 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
             summary=(f'agent timed out after {result.duration_ms}ms with {progress_desc}'),
             diagnostic_detail=diagnostic_detail,
         )
-    if result.subtype == 'error_max_turns':
+    if ceiling is CapReason.TURNS:
         return AgentFailureClass(
             kind=AgentFailureKind.MAX_TURNS,
             summary=(
@@ -1961,7 +1953,7 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
             ),
             diagnostic_detail=diagnostic_detail,
         )
-    if result.subtype == BUDGET_EXHAUSTED_SUBTYPE:
+    if ceiling is CapReason.BUDGET:
         return AgentFailureClass(
             kind=AgentFailureKind.BUDGET,
             summary=(
@@ -2069,10 +2061,9 @@ def classify_cap_kill(
     natively (see ``orchestrator/src/orchestrator/agents/invoke.py``), so no
     ceiling can have ended their runs.  Total — never raises.
     """
-    if result.subtype == BUDGET_EXHAUSTED_SUBTYPE:
-        return CapReason.BUDGET
-    if result.subtype == 'error_max_turns':
-        return CapReason.TURNS
+    ceiling = _ceiling_reported_by_subtype(result)
+    if ceiling is not None:
+        return ceiling
     if result.success or backend != 'claude':
         return None
     if budget_usd is not None and result.cost_usd >= budget_usd:
