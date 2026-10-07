@@ -11,6 +11,7 @@ gets nothing injected.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import os
 import shlex
@@ -37,6 +38,9 @@ _PAYLOAD_RC = 7
 # the AssertionError below rather than by an os._exit of the xdist worker
 # (same reasoning as test_deterministic_runner.py::_CHILD_TIMEOUT_SECS).
 _CHILD_TIMEOUT_SECS = 30
+# A strict subset of any real user manager's environment: a unit that works
+# here cannot be leaning on something only the caller's environment supplies.
+_USER_MANAGER_ENV = {'PATH': '/usr/bin:/bin', 'HOME': str(Path.home())}
 
 
 def _env_recording_stub(path: Path, record: Path, exit_code: int) -> Path:
@@ -54,10 +58,12 @@ def _systemd_run_env_and_cwd(options: tuple[str, ...]) -> tuple[dict[str, str], 
     """The environment and cwd systemd-run would give the unit for *options*.
 
     MEASURED in task 3453: ``systemd-run --user`` propagates none of the
-    caller's environment, so PYTHONPATH starts unset; ``--setenv=K=V`` options
-    then set it for the whole unit.
+    caller's environment; the unit starts from the user manager's own. That is
+    modelled as :data:`_USER_MANAGER_ENV`, so nothing of this process (its
+    PYTHONPATH, VIRTUAL_ENV or PATH) leaks in. ``--setenv=K=V`` options then
+    set a variable for the whole unit.
     """
-    env = {k: v for k, v in os.environ.items() if k != 'PYTHONPATH'}
+    env = dict(_USER_MANAGER_ENV)
     cwd = None
     for option in options:
         if option.startswith('--setenv='):
@@ -168,6 +174,17 @@ def _resolves(roots: list[str], package: str) -> bool:
     return any((Path(r) / package / '__init__.py').exists() for r in roots)
 
 
+def _import_roots(package: str) -> list[str]:
+    """The directories *package* is imported from, whatever the install layout."""
+    spec = importlib.util.find_spec(package)
+    assert spec is not None and spec.submodule_search_locations, (
+        f'{package!r} must resolve in the test interpreter'
+    )
+    return list(dict.fromkeys(
+        str(Path(loc).resolve().parent) for loc in spec.submodule_search_locations
+    ))
+
+
 def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
 
@@ -271,6 +288,7 @@ class TestSubmitChildPythonPathScope:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         monkeypatch.delenv('PYTHONPATH', raising=False)
+        escalation_roots = _import_roots('escalation')
         stub_find_spec(monkeypatch, {'shared'})
 
         with caplog.at_level(logging.WARNING, logger=_LOGGER):
@@ -280,8 +298,10 @@ class TestSubmitChildPythonPathScope:
         assert _resolves(roots, 'escalation'), (
             f'the root that DID resolve must still be supplied: {roots!r}'
         )
-        assert not _resolves(roots, 'shared'), (
-            f'the stubbed-unresolvable root must not appear (guards the stub): {roots!r}'
+        assert roots == escalation_roots, (
+            'only the escalation import root may be supplied; the stubbed-'
+            f'unresolvable `shared` contributes none of its own: {roots!r} '
+            f'!= {escalation_roots!r}'
         )
         assert any('shared' in m for m in _warnings(caplog)), _warnings(caplog)
         assert fired.outcome.disposition == RestartDisposition.SCHEDULED
