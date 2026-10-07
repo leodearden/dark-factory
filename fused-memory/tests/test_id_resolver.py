@@ -7,8 +7,6 @@ checked is never ``none`` — the resolver raises ResolverUnavailable(store).
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import httpx
 import pytest
 from _id_resolver_fakes import FakeGraphiti, FakeMem0, RecordingTombstones, make_resolver
@@ -18,6 +16,7 @@ from shared.uuid_prefix_guard import Candidate, Resolution, ResolverUnavailable
 from fused_memory.backends.graphiti_client import IncompleteEnumerationError
 from fused_memory.backends.mem0_client import ScrollPageBudgetExhausted
 from fused_memory.services.id_resolver import IdResolver
+from fused_memory.services.memory_service import MemoryService
 
 _PROJECT = 'reify'
 _FULL = 'bff81530-70e5-4ab6-939e-507299d1bcd2'
@@ -262,21 +261,19 @@ class TestMissReport:
 
 class TestForMemoryService:
     @pytest.mark.asyncio
-    async def test_wires_the_services_stores_collection_prefix_and_tombstones(self):
-        mem0, tombstones = FakeMem0({_FULL: _memory('x')}), RecordingTombstones()
-        service = SimpleNamespace(
-            mem0=mem0,
-            graphiti=FakeGraphiti(),
-            find_mem0_deletion_tombstones=tombstones,
-            config=SimpleNamespace(
-                mem0=SimpleNamespace(collection_prefix='df'),
-                queue=SimpleNamespace(backend_read_timeout_seconds=5.0),
-            ),
-        )
+    async def test_wires_the_services_stores_collection_prefix_and_tombstones(
+        self, mock_config, monkeypatch,
+    ):
+        mem0, graphiti, tombstones = FakeMem0({_FULL: _memory('x')}), FakeGraphiti(), RecordingTombstones()
+        service = MemoryService(mock_config)
+        monkeypatch.setattr(service, 'mem0', mem0)
+        monkeypatch.setattr(service, 'graphiti', graphiti)
+        monkeypatch.setattr(service, 'find_mem0_deletion_tombstones', tombstones)
         resolver = IdResolver.for_memory_service(service)
 
         resolution = await resolver.resolve_prefix(_PROJECT, 'bff81530')
         await resolver.miss_report(_PROJECT, 'bff81530', resolution)
 
-        assert mem0.scroll_calls[0][0] == 'df_reify'
+        assert mem0.scroll_calls[0][0] == f'{mock_config.mem0.collection_prefix}_reify'
+        assert [group_id for _, _, group_id in graphiti.calls] == [_PROJECT, _PROJECT]
         assert tombstones.calls == [(_PROJECT, 'bff81530')]

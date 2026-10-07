@@ -818,10 +818,11 @@ class TestFindMem0DeletionTombstones:
             assert written == 3
 
             found = await service.find_mem0_deletion_tombstones(self._PROJECT, 'bff81530')
-            expected = [
-                {'memory_id': memory_id, **(await service.get_mem0_deletion_tombstone(self._PROJECT, memory_id))}
-                for memory_id in (self._FIRST, self._SECOND)
-            ]
+            expected = []
+            for memory_id in (self._FIRST, self._SECOND):
+                decoded = await service.get_mem0_deletion_tombstone(self._PROJECT, memory_id)
+                assert decoded is not None
+                expected.append({'memory_id': memory_id, **decoded})
         finally:
             await store.close()
 
