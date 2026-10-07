@@ -14,8 +14,11 @@ from shared.testing_timeout_markers import (
     DELIBERATE_TIGHT_BOUND_CEILING,
     SiteKind,
     TimeoutSite,
+    grandfather_ratchet,
+    inversion_failure_message,
     inverts,
     scan_python_tree,
+    stale_grandfather_message,
     timeout_marker_sites,
     verify_cli_timeout,
 )
@@ -427,3 +430,119 @@ def test_a_scan_result_is_immutable(scanned_root: Path) -> None:
     assert isinstance(scan.unreadable, tuple)
     with pytest.raises(AttributeError):
         scan.examined = 0  # pyright: ignore[reportAttributeAccessIssue]
+
+
+# ---------------------------------------------------------------------------
+# inversion_failure_message -- what every package's guard prints.
+# ---------------------------------------------------------------------------
+
+_SLOW_IN_CLASS = ('test_z.py', TimeoutSite('TestB', SiteKind.CLASS_DECORATOR, 180.0, 12, '180'))
+_SLOW_IN_SUBDIR = ('sub/test_a.py', TimeoutSite('test_x', SiteKind.DECORATOR, 120.0, 5, '120'))
+_SLOW_TEST_MARKER = '@pytest.mark.timeout(600)   # slow test'
+
+
+def _message(verify_cli_budget: int = 600) -> str:
+    return inversion_failure_message(
+        [_SLOW_IN_CLASS, _SLOW_IN_SUBDIR],
+        verify_cli_budget=verify_cli_budget,
+        slow_test_marker=_SLOW_TEST_MARKER,
+    )
+
+
+def test_the_message_leads_with_the_offender_count() -> None:
+    assert _message().splitlines()[0].startswith('2 ')
+
+
+def test_the_message_states_the_band_for_the_budget_passed_in() -> None:
+    assert '(60 < N < 600)' in _message(600)
+    assert '(60 < N < 300)' in _message(300)
+
+
+def test_the_message_lists_each_offender_sorted_by_module_then_qualname() -> None:
+    message = _message()
+    in_subdir = 'sub/test_a.py::test_x (decorator, line 5) pins 120s'
+    in_class = 'test_z.py::TestB (class-decorator, line 12) pins 180s'
+
+    assert in_subdir in message
+    assert in_class in message
+    assert message.index(in_subdir) < message.index(in_class)
+
+
+def test_the_message_offers_both_remedies() -> None:
+    message = _message()
+
+    assert _SLOW_TEST_MARKER in message
+    assert 'N <= 60' in message
+
+
+def test_the_message_points_at_the_rationale_and_the_timeout_method_policy() -> None:
+    message = _message()
+
+    assert 'shared/src/shared/testing_timeout_markers.py' in message
+    assert 'tests/scripts/test_timeout_method_policy.py' in message
+
+
+# ---------------------------------------------------------------------------
+# grandfather_ratchet -- a per-site allowlist that may only shrink.
+# ---------------------------------------------------------------------------
+
+_SECOND_IN_SUBDIR = ('sub/test_a.py', TimeoutSite('test_y', SiteKind.DECORATOR, 90.0, 9, '90'))
+
+
+def test_a_grandfathered_site_is_not_a_new_offender() -> None:
+    ratchet = grandfather_ratchet(
+        [_SLOW_IN_CLASS, _SLOW_IN_SUBDIR], frozenset({('test_z.py', 'TestB')})
+    )
+
+    assert ratchet.new_offenders == (_SLOW_IN_SUBDIR,)
+    assert ratchet.stale == ()
+
+
+def test_grandfathering_one_site_does_not_admit_its_neighbour() -> None:
+    ratchet = grandfather_ratchet(
+        [_SLOW_IN_SUBDIR, _SECOND_IN_SUBDIR], frozenset({('sub/test_a.py', 'test_x')})
+    )
+
+    assert ratchet.new_offenders == (_SECOND_IN_SUBDIR,)
+
+
+def test_an_entry_naming_no_live_in_band_site_is_stale() -> None:
+    """A raised marker, a deleted marker and a renamed test all look the same here."""
+    ratchet = grandfather_ratchet(
+        [_SLOW_IN_CLASS],
+        frozenset({
+            ('test_z.py', 'TestB'),
+            ('test_z.py', 'TestRenamed'),
+            ('sub/test_a.py', 'test_raised_to_the_budget'),
+        }),
+    )
+
+    assert ratchet.new_offenders == ()
+    assert ratchet.stale == (
+        ('sub/test_a.py', 'test_raised_to_the_budget'),
+        ('test_z.py', 'TestRenamed'),
+    )
+
+
+def test_an_empty_allowlist_makes_every_in_band_site_new() -> None:
+    ratchet = grandfather_ratchet([_SLOW_IN_CLASS, _SLOW_IN_SUBDIR], frozenset())
+
+    assert ratchet.new_offenders == (_SLOW_IN_CLASS, _SLOW_IN_SUBDIR)
+    assert ratchet.stale == ()
+
+
+def test_a_ratchet_result_is_immutable() -> None:
+    ratchet = grandfather_ratchet([_SLOW_IN_CLASS], frozenset())
+
+    with pytest.raises(AttributeError):
+        ratchet.stale = ()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_the_stale_message_names_the_count_and_every_entry() -> None:
+    message = stale_grandfather_message(
+        (('sub/test_a.py', 'test_raised_to_the_budget'), ('test_z.py', 'TestRenamed'))
+    )
+
+    assert message.splitlines()[0].startswith('2 ')
+    assert 'sub/test_a.py::test_raised_to_the_budget' in message
+    assert 'test_z.py::TestRenamed' in message
