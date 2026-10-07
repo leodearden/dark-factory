@@ -1841,3 +1841,81 @@ class TestSupersededByPersistence:
             assert item['actionable'] is True
         finally:
             store_b.close()
+
+
+# ---------------------------------------------------------------------------
+# task-4429: the severity vocabulary is enforced at the add_finding write
+# boundary ONLY.  A row persisted before the guard existed may carry an
+# off-vocabulary severity, and it must keep hydrating verbatim — a guard
+# moved into _Finding or the hydrate path would turn that row into a boot
+# failure.
+# ---------------------------------------------------------------------------
+
+
+class TestLegacySeverityHydrates:
+    _RUN = 'legacy-sev-run-1'
+    _STAGE = 'memory_consolidator'
+
+    def _make_state(self, store):
+        from fused_memory.server.recon_report import ReconReportState
+
+        state = ReconReportState(
+            ttl_seconds=300,
+            clock=lambda: 0.0,
+            memory_service=_WTFakeMemoryService(),
+            task_interceptor=_WTFakeTaskInterceptor(),
+            store=store,
+        )
+        state.known_projects = {'dark_factory': '/home/leo/src/dark-factory'}
+        return state
+
+    def _rewrite_persisted_severity(self, store, finding_id, severity):
+        import json
+
+        (row,) = [r for r in store.load_all() if r['run_id'] == self._RUN]
+        payload = json.loads(row['entry_json'])
+        (fd,) = [f for f in payload['findings'] if f['finding_id'] == finding_id]
+        fd['severity'] = severity
+        store.upsert_entry(
+            run_id=row['run_id'], stage=row['stage'], project_id=row['project_id'],
+            is_active=row['is_active'], entry_json=json.dumps(payload),
+            updated_at=row['updated_at'],
+        )
+
+    def test_off_vocabulary_persisted_severity_hydrates_verbatim(self, tmp_path):
+        from fused_memory.server.recon_report_store import ReconReportStore
+
+        db = tmp_path / 'recon_report_state.db'
+        store_a = ReconReportStore(db)
+        store_a.open()
+        try:
+            state_a = self._make_state(store_a)
+            state_a.start_report(run_id=self._RUN, stage=self._STAGE, project_id='dark_factory')
+            legacy_fid = state_a.add_finding(
+                run_id=self._RUN, severity='minor', category='memory_stale',
+                description='filed before the vocabulary was enforced',
+                suggested_action='act', task_id='42', flag_type='orphaned_knowledge',
+            )['finding_id']
+            self._rewrite_persisted_severity(store_a, legacy_fid, 'low')
+        finally:
+            store_a.close()
+
+        store_b = ReconReportStore(db)
+        store_b.open()
+        try:
+            state_b = self._make_state(store_b)
+            state_b.hydrate_from_store()
+
+            report = state_b.get_assembled_report(self._RUN, self._STAGE)
+            assert report is not None, 'the legacy row did not hydrate'
+            (item,) = [i for i in report['flagged_items'] if i['finding_id'] == legacy_fid]
+            assert item['severity'] == 'low'
+
+            added = state_b.add_finding(
+                run_id=self._RUN, severity='moderate', category='memory_stale',
+                description='filed after the restart', suggested_action='act',
+                task_id='43', flag_type='orphaned_knowledge',
+            )
+            assert 'finding_id' in added, added
+        finally:
+            store_b.close()

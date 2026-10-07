@@ -4734,3 +4734,126 @@ class TestSupersedesViaFastMCP:
             'supersedes must be optional with a None default; every existing '
             'add_finding caller omits it.'
         )
+
+
+# ---------------------------------------------------------------------------
+# task-4429: add_finding enforces the closed FindingSeverity vocabulary at the
+# write boundary, atomically, before supersedes resolution and dedup.
+# ---------------------------------------------------------------------------
+
+
+_OFF_VOCABULARY_SEVERITIES = ['info', 'low', 'high', 'Minor', '', 'ok']
+
+
+class TestAddFindingSeverityIsValidated:
+    """An off-vocabulary severity is rejected with a structured error that
+    echoes the value and lists the legal ones, and the rejection mutates
+    nothing: no row, no dedup-index entry, no supersedes stamp.
+    """
+
+    def _make_state(self):
+        from fused_memory.server.recon_report import ReconReportState
+
+        t = [0.0]
+        state = ReconReportState(ttl_seconds=300, clock=lambda: t[0])
+        state.start_report(run_id='r1', stage='memory_consolidator', project_id='dark_factory')
+        return state
+
+    def _add(self, state, severity, *, run_id='r1', flag_type='f', supersedes=None):
+        return state.add_finding(
+            run_id=run_id,
+            severity=severity,
+            category='memory_stale',
+            description='d',
+            suggested_action='a',
+            task_id='42',
+            flag_type=flag_type,
+            supersedes=supersedes,
+        )
+
+    def _assert_invalid_severity(self, result, severity):
+        from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES
+
+        assert result.get('error') == 'invalid_severity', result
+        assert result['error_type'] == 'ReconReportInvalidSeverity'
+        assert result['severity'] == severity
+        assert result['known_severities'] == list(FINDING_SEVERITY_VALUES)
+        assert result['hint']
+        assert 'actionable' in result['hint']
+        assert 'finding_id' not in result
+
+    @pytest.mark.parametrize('severity', _OFF_VOCABULARY_SEVERITIES)
+    def test_off_vocabulary_severity_is_rejected(self, severity):
+        state = self._make_state()
+        self._assert_invalid_severity(self._add(state, severity), severity)
+
+    @pytest.mark.parametrize('severity', _OFF_VOCABULARY_SEVERITIES)
+    def test_rejection_stores_nothing_and_burns_no_dedup_signature(self, severity):
+        state = self._make_state()
+        self._add(state, severity)
+
+        assert _flagged_items(state, 'r1', 'memory_consolidator') == []
+        retry = self._add(state, 'minor')
+        assert 'finding_id' in retry, (
+            f'a corrected retry after an {severity!r} rejection was refused: {retry}'
+        )
+
+    def test_rejected_supersedes_call_leaves_the_target_unstamped(self):
+        state = self._make_state()
+        target = self._add(state, 'moderate', flag_type='claim')
+        assert 'finding_id' in target, target
+
+        result = self._add(
+            state, 'info', flag_type='claim_resolved', supersedes=target['finding_id'],
+        )
+
+        self._assert_invalid_severity(result, 'info')
+        items = _flagged_items(state, 'r1', 'memory_consolidator')
+        assert [i['finding_id'] for i in items] == [target['finding_id']]
+        assert items[0]['superseded_by'] is None
+
+    def test_every_vocabulary_member_is_accepted_and_round_trips(self):
+        from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES
+
+        state = self._make_state()
+        for severity in FINDING_SEVERITY_VALUES:
+            added = self._add(state, severity, flag_type=f'f_{severity}')
+            assert 'finding_id' in added, added
+
+        items = _flagged_items(state, 'r1', 'memory_consolidator')
+        assert [i['severity'] for i in items] == list(FINDING_SEVERITY_VALUES)
+
+    def test_unknown_run_id_still_reports_run_id_unknown(self):
+        state = self._make_state()
+        result = self._add(state, 'info', run_id='ghost')
+        assert result == {'error': 'run_id_unknown', 'error_type': 'ReconReportRunUnknown'}
+
+    def test_completed_report_still_reports_report_already_completed(self):
+        state = self._make_state()
+        state.complete('r1', 'summary')
+        result = self._add(state, 'info')
+        assert result['error'] == 'report_already_completed'
+        assert result['error_type'] == 'ReconReportAlreadyCompleted'
+
+    @pytest.mark.asyncio
+    async def test_mcp_tool_returns_the_same_structured_error(self):
+        from fused_memory.server.recon_report import ReconReportState, create_recon_report_server
+
+        state = ReconReportState(ttl_seconds=300, clock=lambda: 0.0)
+        tm = create_recon_report_server(state)._tool_manager
+        await tm.call_tool('start_report', {
+            'run_id': 'r1', 'stage': 'memory_consolidator', 'project_id': 'dark_factory',
+        })
+
+        result = await tm.call_tool('add_finding', {
+            'run_id': 'r1',
+            'severity': 'info',
+            'category': 'cat',
+            'description': 'd',
+            'suggested_action': 'a',
+            'task_id': '42',
+            'flag_type': 'f',
+        })
+
+        self._assert_invalid_severity(result, 'info')
+        assert _flagged_items(state, 'r1', 'memory_consolidator') == []
