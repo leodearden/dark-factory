@@ -7413,62 +7413,24 @@ async def run_verification(
     if timed_out:
         summary = f'Verification timed out after {max_retries} retries' if max_retries > 0 else 'Verification timed out'
 
-    # Bounded env-recovery retry: a shared-venv-mutation transient (a
-    # concurrent `uv sync` elsewhere vanishing xdist/pip mid-run) is an infra
-    # transient, not a code regression. Auto-recover with a single
-    # forced-serial retry of the test command — mirrors the pure-timeout
-    # retry loop above, but is gated on `category` rather than a timeout
-    # flag, and only re-runs the test command since lint/type do not
-    # exercise xdist/pip. Recovery passing means the env recovered -> GREEN;
-    # recovery still hitting env_transient means it stays environmental
-    # (NOT misattributed to test_failure/unknown_test_failure); recovery
-    # surfacing a different category means that real signal is reported.
+    # Bounded env-recovery retry: a shared-venv mutation (a concurrent `uv
+    # sync` elsewhere vanishing xdist/pip mid-run) is an infra transient of the
+    # TEST leg, not a code regression, so only the test command is re-run,
+    # once and forced serial. A green re-run means the env recovered; a re-run
+    # still ENV_TRANSIENT stays environmental; any other result is reported.
     #
-    # This branch can only fire when test_cmd resolves to ToolKind.PYTEST via
-    # _tool_for_cmd (see that function's docstring) — a test command wrapped
-    # such that the parser can't see a literal `pytest` token never produces
-    # ENV_TRANSIENT and so never reaches this retry, even on a genuine
-    # shared-venv mutation. True of every production test_cmd today.
+    # It fires on the test leg's OWN classification: guard 3 makes
+    # ENV_TRANSIENT reachable from lint/type legs, and the run-wide category
+    # is the worst across legs, so neither says whether the test leg needs
+    # recovery (task #4103).
     #
-    # This PYTEST-only narrowing is broader than just that wrapped-test-cmd
-    # case: the pre-δ tool-blind ladder also consulted these env_transient
-    # signatures against the LINT and TYPE check outputs (it classified
-    # whatever output it was handed, uniformly across all three checks),
-    # whereas the RUFF/PYRIGHT tables and the OPAQUE fallback never do now.
-    # A conscious tradeoff, not an unnoticed side effect: the signatures are
-    # pytest/xdist-specific text ruff/pyright would not emit, and this retry
-    # only ever re-runs the test command regardless (lint/type don't exercise
-    # xdist/pip — see above).
-    #
-    # RETIRED COROLLARY (task 3367): this block used to conclude from the above
-    # that "a lint or type-check failure cannot classify as env_transient by
-    # construction, only the test leg can". That is FALSE as of task 3367.
-    # `classify_failure` guard 3 (`_classify_environmental`) is tool-blind and
-    # now has three ToolKind-independent ENV_TRANSIENT producers — task 2756's
-    # broken `_merge-verify` worktree, task 2831's restart collateral, and task
-    # 3367's mis-resolved pyright interpreter (esc-3359-1) — any of which a TYPE
-    # or LINT leg can trip. The category therefore no longer implies the TEST
-    # leg was the failing one, so the gate below establishes that itself with an
-    # explicit `attempt.test.rc != 0`.
-    #
-    # THE RULE (task 3367): this recovery exists for the TEST leg's shared-venv
-    # mutation, and its only action is to re-run the TEST command serially. It
-    # therefore fires only when the TEST leg is the failing one. When the test
-    # leg already passed there is nothing to recover and the re-run cannot
-    # change the verdict — it just spends a full test-suite wall-clock (1320.9s
-    # in esc-3359-1, where test rc=0, lint rc=0, type rc=1) before returning the
-    # same red, under a "vanished xdist/pip" warning that misdescribes the
-    # actual failure. A lint/type env_transient is instead reported directly —
-    # loudly (see the per-check ERROR in _run_or_skip_timed) and
-    # infra-transient at the merge lane — with no pointless test re-run.
-    #
-    # The rc check is correct on its own terms, independent of task 3367's new
-    # classification: re-running a passing leg can never recover anything.
-    if (
-        category == FailureCategory.ENV_TRANSIENT
-        and attempt.test.cmd is not None
-        and attempt.test.rc != 0
-    ):
+    # The vanished-xdist/pip signatures and the serial rewrite apply only to
+    # a test command resolving to ToolKind.PYTEST; any other test command
+    # classified ENV_TRANSIENT is re-run unchanged (_serial_pytest_str).
+    if _classify_leg(
+        'test', attempt.test.rc, attempt.test.output, attempt.test.timed_out,
+        attempt.test.cmd,
+    ) == FailureCategory.ENV_TRANSIENT:
         recovered_test_cmd = _serial_pytest_str(attempt.test.cmd, invocation_dir=worktree)
         logger.warning(
             'Verification hit an environmental shared-venv transient '
