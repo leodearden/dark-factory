@@ -415,8 +415,9 @@ def verdict_outcome(kind: KindClass, verdict: Verdict) -> HealAction | Report:
     return _VERDICT_TABLE[(kind, verdict)]
 
 
-def healed_kind(kind: Any, verdict: Verdict) -> Any:
-    """The ``kind`` a childless link shows once the heal *verdict* earns has been written."""
+def healed_kind(kind: str | None, verdict: Verdict) -> str | None:
+    """The ``kind`` a childless link shows once the heal *verdict* earns has been written;
+    ``None`` is a link with no ``kind``, before or after."""
     outcome = verdict_outcome(kind_class(kind), verdict)
     if not isinstance(outcome, HealAction):
         return kind
