@@ -158,9 +158,12 @@ class TestStartupSweep:
             graph.ro_query = AsyncMock(side_effect=_hung_read)
         _route(backend, graphs, names)
 
+        loop = asyncio.get_running_loop()
+        started = loop.time()
         with caplog.at_level(logging.WARNING, logger=_LOGGER):
             await asyncio.wait_for(backend.provision_registered_graphs(), budget * 3)
 
+        assert loop.time() - started == pytest.approx(budget)
         assert any(
             r.name == _LOGGER and r.levelno == logging.WARNING and 'sweep' in r.getMessage()
             for r in caplog.records
