@@ -22,7 +22,7 @@ const { orchEmptyLabel } = window.DF_ORCH_FILTER || { orchEmptyLabel: () => 'No 
 const { strandBadgeState, agentCellState, locksCellState, schedulerLocksDatum } = window.DF_TASK_ROW_CELLS;
 // The Datum readers. Module scope, no fallback, bound under datum.js's own
 // names — see the CANONICAL note in datum.js's header.
-const { plainDatum, derivedDatum, servedDatum } = window.DF_DATUM;
+const { plainDatum, derivedDatum, servedDatum, datumView } = window.DF_DATUM;
 const { burndownStacks, burndownLegend, parityBannerState, burndownDatum, forecastText } = window.DF_BURNDOWN_BANDS;
 const { reconRunCounts, reconSuccessPct, reconStatusTone } = window.DF_RECON_STATUS;
 // Every OrchTab count is a named reading over the served census — task_snapshot.js.
@@ -31,7 +31,10 @@ const { projectCensus, censusOver, projectRows, viewRows, unrequestedTerminalRow
 const { ON_DEMAND_KEYS: LOADER_ON_DEMAND_KEYS } = window.DF_DATA_LOADER;
 // Windowed headers are labelled from the payload's served-window echo — window_chip.js.
 const { windowEcho, windowLabel, recentMergesCaption } = window.DF_WINDOW_CHIP;
-const { projectInQueue, inQueueOver, inQueueHistory, latencyCaption } = window.DF_MERGE_QUEUE;
+const {
+  projectInQueue, inQueueOver, inQueueHistory, latencyCaption,
+  queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
+} = window.DF_MERGE_QUEUE;
 const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalText } = window.DF_MEMORY_READINGS;
 const { useState: uS } = React;
 // The persisted UI-preference hooks — persisted_state.js.
@@ -866,9 +869,7 @@ function MergeTab({ projectFilter }) {
   const allOpen = projIds.every(p => openMap[p]);
   const totals = projects.reduce((acc, [_, d]) => ({
     count: acc.count + sumOf(d.outcomes.values),
-    hits: acc.hits + d.speculative.hit_count,
-    discards: acc.discards + d.speculative.discard_count,
-  }), { count: 0, hits: 0, discards: 0 });
+  }), { count: 0 });
   return (
     <div className="grid cols-12" style={{ gap: 12 }}>
       {(() => {
@@ -887,9 +888,7 @@ function MergeTab({ projectFilter }) {
         // Worst-case p95 across projects (max — informative for SLO).
         const p95s = projects.map(([, d]) => d.latency?.p95).filter(v => v != null && v > 0);
         const p95 = p95s.length ? Math.max(...p95s) : null;
-        const hitPct = totals.hits + totals.discards > 0
-          ? Math.round(totals.hits / (totals.hits + totals.discards) * 100)
-          : null;
+        const speculative = speculativeOver(DF, projIds);
         return (
           <div className="col-span-12 grid cols-4">
             <ST label="Merges (window)" datum={plainDatum(totals.count, EP.mergeQueue)}
@@ -897,8 +896,8 @@ function MergeTab({ projectFilter }) {
             <ST label="In queue now" datum={inQueueOver(DF, projIds)}
                 history={inQueueHistory(DF, projIds).slice(-30)} sparkColor={CP.warn} />
             <ST label="Speculative hit rate"
-                datum={derivedDatum(hitPct, EP.mergeQueue, 'no speculative attempts')} unit={hitPct != null ? '%' : ''}
-                hint={`${totals.hits}/${totals.hits + totals.discards} attempts`}
+                datum={speculative} format={hitRateText}
+                hint={datumView(speculative).isHole ? undefined : `${speculative.value.hit_count}/${speculative.value.total} attempts`}
                 history={[]} sparkColor={CP.ok} />
             <ST label="p95 latency · worst project"
                 datum={derivedDatum(p95, EP.mergeQueue, 'no merges in this window')} format={fmtMs}
@@ -911,14 +910,15 @@ function MergeTab({ projectFilter }) {
       <div className="col-span-12"><GroupAllToggle allOpen={allOpen} onSetAll={setAll} /></div>
 
       {projects.map(([pid, d]) => {
-        const hitPct = Math.round(d.speculative.hit_rate * 100);
+        const speculative = projectSpeculative(DF, pid);
+        const windowTotal = recentTotal(DF, pid);
         const summary = (
           <>
             <HaltPill halt={d.halt} />
             <Pip datum={plainDatum(sumOf(d.outcomes.values), EP.mergeQueue)} color={CP.accent} label="attempts" />
             <Pip datum={projectInQueue(DF, pid)} color={CP.warn} label="queued" />
             <Pip datum={plainDatum(d.latency.p50, EP.mergeQueue)} color={CP.ok} format={fmtMs} label="p50" />
-            <span style={{ color: 'var(--fg-3)' }}>· {hitPct}% spec hit</span>
+            <span style={{ color: 'var(--fg-3)' }}>· <DatumReading datum={speculative} format={hitRateText} /> spec hit</span>
           </>
         );
         return (
@@ -957,9 +957,9 @@ function MergeTab({ projectFilter }) {
                 <div className="col-span-6 panel">
                   <div className="panel-head"><span className="title">Speculative merge</span></div>
                   <div className="panel-body" style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 12 }}>
-                    <div><div className="mono" style={{ fontSize: 18, color: CP.ok }}>{d.speculative.hit_count}</div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>hits</div></div>
-                    <div><div className="mono" style={{ fontSize: 18, color: CP.warn }}>{d.speculative.discard_count}</div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>discards</div></div>
-                    <div><div className="mono" style={{ fontSize: 18 }}>{Math.round(d.speculative.hit_rate*100)}%</div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>hit rate</div></div>
+                    <div><div className="mono" style={{ fontSize: 18, color: CP.ok }}><DatumReading datum={speculative} format={c => c.hit_count} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>hits</div></div>
+                    <div><div className="mono" style={{ fontSize: 18, color: CP.warn }}><DatumReading datum={speculative} format={c => c.discard_count} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>discards</div></div>
+                    <div><div className="mono" style={{ fontSize: 18 }}><DatumReading datum={speculative} format={hitRateText} /></div><div style={{ fontSize: 10, color: 'var(--fg-3)' }}>hit rate</div></div>
                   </div>
                 </div>
 
@@ -996,18 +996,21 @@ function MergeTab({ projectFilter }) {
                     <div className="panel-body flush">
                       <table className="tbl"><thead><tr><th>Task</th><th>Title</th><th>State</th><th>Branch</th><th className="num">Age</th><th className="num">Pos</th><th>Waiter</th><th className="num">When</th></tr></thead>
                         <tbody>
-                          {d.active.map((row, i) => (
-                            <tr key={i}>
-                              <td className="mono">{row.task_id}</td>
-                              <td><DatumReading datum={servedDatum(row.title, EP.mergeQueue, 'this merge row carries no title Datum')} /></td>
-                              <td><span className={`badge ${row.state === 'in_flight' ? 'warn' : 'info'}`}>{row.state}</span></td>
-                              <td className="mono" style={{ color: 'var(--fg-3)', fontSize: 11 }}>{row.branch}</td>
-                              <td className="num" style={{ color: 'var(--fg-3)' }}>{row.age_secs != null ? fmtAgeSecs(row.age_secs) : '—'}</td>
-                              <td className="num">{row.position != null ? row.position : '—'}</td>
-                              <td>{row.waiter_alive != null ? (row.waiter_alive ? <span className="badge ok">alive</span> : <span className="badge bad">dead</span>) : '—'}</td>
-                              <td className="num" style={{ color: 'var(--fg-3)' }}>{row.timestamp ? window.DF_SHELL.fmtDateTime(row.timestamp) : '—'}</td>
-                            </tr>
-                          ))}
+                          {d.active.map((row, i) => {
+                            const since = queuedSince(d, row);
+                            return (
+                              <tr key={i}>
+                                <td className="mono">{row.task_id}</td>
+                                <td><DatumReading datum={servedDatum(row.title, EP.mergeQueue, 'this merge row carries no title Datum')} /></td>
+                                <td><span className={`badge ${row.state === 'in_flight' ? 'warn' : 'info'}`}>{row.state}</span></td>
+                                <td className="mono" style={{ color: 'var(--fg-3)', fontSize: 11 }}>{row.branch}</td>
+                                <td className="num" style={{ color: 'var(--fg-3)' }}>{row.age_secs != null ? fmtAgeSecs(row.age_secs) : '—'}</td>
+                                <td className="num">{row.position != null ? row.position : '—'}</td>
+                                <td>{row.waiter_alive != null ? (row.waiter_alive ? <span className="badge ok">alive</span> : <span className="badge bad">dead</span>) : '—'}</td>
+                                <td className="num" style={{ color: 'var(--fg-3)' }}>{since ? window.DF_SHELL.fmtDateTime(since) : '—'}</td>
+                              </tr>
+                            );
+                          })}
                         </tbody>
                       </table>
                     </div>
@@ -1015,7 +1018,7 @@ function MergeTab({ projectFilter }) {
                 )}
 
                 <div className={d.active.length > 0 ? 'col-span-6 panel' : 'col-span-12 panel'}>
-                  <div className="panel-head"><span className="title">Recent merges</span><span className="meta">{recentMergesCaption(d.recent.length, d.recent_total, windowEcho(DF.__receipt, EP.mergeQueue))}</span></div>
+                  <div className="panel-head"><span className="title">Recent merges</span><span className="meta" title={windowTotal.reason || undefined}>{recentMergesCaption(d.recent.length, windowTotal.value, windowEcho(DF.__receipt, EP.mergeQueue))}</span></div>
                   <div className="panel-body flush">
                     <table className="tbl"><thead><tr><th>Task</th><th>Title</th><th>Outcome</th><th className="num">Duration</th><th className="num">When</th></tr></thead>
                       <tbody>
