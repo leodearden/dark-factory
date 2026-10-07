@@ -6,8 +6,8 @@ import contextlib
 import json
 import logging
 import sqlite3
-from datetime import UTC, datetime, timedelta
 from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,13 +18,13 @@ from dashboard.data import performance, redux_api
 from dashboard.data.datum import DatumState, validate_datum
 from dashboard.data.performance import (
     _HISTORY_CACHE,
+    PerformanceListing,
     _cutoff,
     _hour_bucketed_history,
     _load_escalations,
     aggregate_completion_paths,
     aggregate_escalation_rates,
     aggregate_loop_histograms,
-    PerformanceListing,
     aggregate_performance_cards,
     aggregate_performance_history,
     aggregate_time_centiles,

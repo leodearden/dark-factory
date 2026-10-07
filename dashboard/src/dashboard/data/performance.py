@@ -23,7 +23,7 @@ import aiosqlite
 from escalation.queue import iter_all_escalation_paths
 from shared.timestamps import parse_timestamp_or_warn
 
-from dashboard.data.datum import Datum, DatumState
+from dashboard.data.datum import Datum, DatumState, unknown_datum
 from dashboard.data.db import with_db
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now, safe_gather_result
@@ -1155,35 +1155,79 @@ def _cards_datum(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class PerformanceListing:
+    """Every listed project's cards Datum, and how far the listing itself can be trusted.
+
+    ``listed`` counts the listed projects — FRESH when every runs.db was read;
+    LOWER_BOUND when some could not be, since their projects are missing;
+    UNKNOWN when none could be. Project ids come from ``task_results``, not
+    from a runs.db's path, so an unread runs.db cannot be keyed under the
+    project it would have listed: only the listing can say it is short.
+    """
+
+    cards: Mapping[str, Datum[PerformanceCards]]
+    listed: Datum[int]
+
+
+def unread_listing(reason: str, *, days: int) -> PerformanceListing:
+    """A listing nothing could be read for: no cards, and an UNKNOWN count saying why."""
+    return PerformanceListing(cards={}, listed=unknown_datum(reason, _window_bound_seconds(days)))
+
+
+def _listing_datum(
+    read_count: int, db_count: int, project_count: int, served_at: datetime, days: int,
+) -> Datum[int]:
+    """How many projects are listed, and whether every runs.db was read to list them."""
+    bound = _window_bound_seconds(days)
+    unread = db_count - read_count
+    if read_count == 0:
+        return unknown_datum(f'no runs.db could be read ({unread} of {db_count})', bound)
+    if unread:
+        return Datum(
+            project_count, served_at, DatumState.LOWER_BOUND,
+            f'{unread} of {db_count} runs.db could not be read; their projects are not listed',
+            bound,
+        )
+    return Datum(project_count, served_at, DatumState.FRESH, None, bound)
+
+
 async def aggregate_performance_cards(
     dbs: list[aiosqlite.Connection | None],
     escalations_dirs: list[Path],
     *,
     days: int = 7,
     now: datetime | None = None,
-) -> dict[str, Datum[PerformanceCards]]:
+) -> PerformanceListing:
     """Each project's card block for the window ``[now - days, now]``, as one Datum.
 
     The projects are discovered once per DB, and each DB tallies only the
-    projects it holds (a runs.db whose own discovery query fails lists none;
-    ``with_db`` logs the failure). A project is served a value only when
-    every DB holding it tallied every family; otherwise it is UNKNOWN, and
-    the reason names the families. The value is the project's window tally;
-    ``as_of`` is its newest contributing event, its latest completion. So
-    "fresh" means the last completion lies inside the window, and an idle
-    project (completions ever, none in the window) is stale by the
-    envelope's own bound.
+    projects it holds. A runs.db that is absent, or whose own discovery query
+    fails (``with_db`` logs the failure), lists none and makes the listing's
+    count a LOWER_BOUND — UNKNOWN when no runs.db was read — so an unread
+    fleet never reads as one that completed nothing. A project is served a
+    value only when every DB holding it tallied every family; otherwise it is
+    UNKNOWN, and the reason names the families. The value is the project's
+    window tally; ``as_of`` is its newest contributing event, its latest
+    completion. So "fresh" means the last completion lies inside the window,
+    and an idle project (completions ever, none in the window) is stale by
+    the envelope's own bound.
     """
     served_at = resolve_now(now)
-    per_db = await asyncio.gather(*(with_db(db, _latest_completions, {}) for db in dbs))
-    latest = _latest_instants(per_db)
+    per_db = await asyncio.gather(*(with_db(db, _latest_completions, None) for db in dbs))
+    read = [found for found in per_db if found is not None]
+    latest = _latest_instants(read)
+    listed = _listing_datum(len(read), len(dbs), len(latest), served_at, days)
     if not latest:
-        return {}
+        return PerformanceListing(cards={}, listed=listed)
     readings = await _read_card_families(
         dbs, escalations_dirs, days=days, now=served_at,
-        projects_by_db=[frozenset(found) for found in per_db],
+        projects_by_db=[frozenset(found or {}) for found in per_db],
     )
-    return {
-        project_id: _cards_datum(project_id, readings, latest[project_id], served_at, days)
-        for project_id in sorted(latest)
-    }
+    return PerformanceListing(
+        cards={
+            project_id: _cards_datum(project_id, readings, latest[project_id], served_at, days)
+            for project_id in sorted(latest)
+        },
+        listed=listed,
+    )
