@@ -76,7 +76,10 @@ PARENT = '22222222-2222-4222-8222-222222222222'
 CHILD_TEXT = 'the child note about link healing'
 PARENT_TEXT = 'the parent note about link healing'
 
-DEFAULT_LIMITS = RunLimits(max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=3)
+DEFAULT_LIMITS = RunLimits(
+    max_actions_per_run=25, backlog_multiplier=5, write_failure_streak=3,
+    misfile_share_ceiling=0.25, corrects_share_ceiling=0.60,
+)
 
 
 def corpus_basis(
