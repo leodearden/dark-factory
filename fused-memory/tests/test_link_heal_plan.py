@@ -580,7 +580,10 @@ class TestReportModeEscapes:
     async def test_a_backlog_over_cap_times_multiplier_would_escape_and_files_nothing(
         self, harness, ledger, tmp_path,
     ):
-        limits = RunLimits(max_actions_per_run=2, backlog_multiplier=1, write_failure_streak=3)
+        limits = RunLimits(
+            max_actions_per_run=2, backlog_multiplier=1, write_failure_streak=3,
+            misfile_share_ceiling=0.25, corrects_share_ceiling=0.60,
+        )
 
         report = await run_corpus_plan(
             harness, ledger, tmp_path / 'plan.json', seed_three_heals(harness), limits,
@@ -593,7 +596,10 @@ class TestReportModeEscapes:
     async def test_a_backlog_at_cap_times_multiplier_would_not_escape(
         self, harness, ledger, tmp_path,
     ):
-        limits = RunLimits(max_actions_per_run=3, backlog_multiplier=1, write_failure_streak=3)
+        limits = RunLimits(
+            max_actions_per_run=3, backlog_multiplier=1, write_failure_streak=3,
+            misfile_share_ceiling=0.25, corrects_share_ceiling=0.60,
+        )
 
         report = await run_corpus_plan(
             harness, ledger, tmp_path / 'plan.json', seed_three_heals(harness), limits,
@@ -605,7 +611,10 @@ class TestReportModeEscapes:
     async def test_a_non_writing_run_never_would_escape_a_write_failure(
         self, harness, ledger, tmp_path,
     ):
-        limits = RunLimits(max_actions_per_run=0, backlog_multiplier=1, write_failure_streak=1)
+        limits = RunLimits(
+            max_actions_per_run=0, backlog_multiplier=1, write_failure_streak=1,
+            misfile_share_ceiling=0.25, corrects_share_ceiling=0.60,
+        )
 
         report = await run_corpus_plan(
             harness, ledger, tmp_path / 'plan.json', seed_three_heals(harness), limits,

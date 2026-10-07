@@ -1,4 +1,4 @@
-"""The link-heal ledger and run lock (task 6181, PRD H1 "Ledger" and "One run at a time")."""
+"""The link-heal ledger and run lock (tasks 6181, 6184; PRD H1 "Ledger" and "One run at a time", H2)."""
 
 from __future__ import annotations
 
@@ -15,9 +15,11 @@ from fused_memory.maintenance.link_heal import (
     HealAction,
     LinkImage,
     PlannedAction,
+    Verdict,
 )
 from fused_memory.maintenance.link_heal_ledger import (
     ActionState,
+    AdjudicationRecord,
     AmbiguousRun,
     LinkHealLedger,
     RunLock,
@@ -76,7 +78,7 @@ class TestSchema:
             tables = dict(conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table'"))
         finally:
             conn.close()
-        for name in ('runs', 'adjudications', 'actions'):
+        for name in ('runs', 'adjudications', 'run_adjudications', 'actions'):
             assert re.search(
                 r'\bid INTEGER PRIMARY KEY AUTOINCREMENT\b', tables[name],
             ), tables[name]
@@ -360,6 +362,135 @@ class TestPublishingPlanned:
             assert reopened.run_actions(run_id) == []
         finally:
             reopened.close()
+
+
+def _record(
+    n: int = 1,
+    *,
+    verdict: Verdict = Verdict.EXTENDS,
+    parent: str = PARENT,
+    child_sha: str = CHILD_SHA,
+    parent_sha: str = PARENT_SHA,
+) -> AdjudicationRecord:
+    return AdjudicationRecord(
+        project_id=PROJECT,
+        child_id=_child(n),
+        parent_id=parent,
+        child_sha256=child_sha,
+        parent_sha256=parent_sha,
+        verdict=verdict,
+        reason=f'reason {n}',
+        model='opus',
+    )
+
+
+class TestAdjudications:
+    def test_add_adjudications_returns_increasing_ids_and_proves_a_producer(self, ledger):
+        run_id = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+
+        ids = ledger.add_adjudications(run_id, [_record(1), _record(2), _record(3)])
+
+        assert len(ids) == 3
+        assert ids == sorted(ids)
+        assert len(set(ids)) == 3
+        conn = sqlite3.connect(ledger.db_path)
+        try:
+            names = {name for (name,) in conn.execute('SELECT name FROM sqlite_sequence')}
+        finally:
+            conn.close()
+        assert 'adjudications' in names
+
+    def test_adjudication_at_returns_the_newest_verdict_at_exactly_those_hashes(self, ledger):
+        first = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        ledger.add_adjudications(first, [_record(1, verdict=Verdict.SAME)])
+        second = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        (newest,) = ledger.add_adjudications(second, [_record(1, verdict=Verdict.RELATED)])
+
+        row = ledger.adjudication_at(PROJECT, _child(1), PARENT, CHILD_SHA, PARENT_SHA)
+
+        assert row is not None
+        assert row.adjudication_id == newest
+        assert row.run_id == second
+        assert row.record == _record(1, verdict=Verdict.RELATED)
+        assert row.record.verdict is Verdict.RELATED
+        assert row.at
+
+    @pytest.mark.parametrize(
+        'changed',
+        [
+            {'child_sha256': 'd' * 64},
+            {'parent_sha256': 'q' * 64},
+            {'parent_id': '33333333-3333-3333-3333-333333333333'},
+        ],
+    )
+    def test_adjudication_at_misses_on_another_text_or_parent(self, ledger, changed):
+        run_id = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        ledger.add_adjudications(run_id, [_record(1)])
+        lookup = {
+            'project_id': PROJECT,
+            'child_id': _child(1),
+            'parent_id': PARENT,
+            'child_sha256': CHILD_SHA,
+            'parent_sha256': PARENT_SHA,
+            **changed,
+        }
+
+        assert ledger.adjudication_at(**lookup) is None
+
+    def test_adjudication_verdicts_are_those_of_the_named_runs(self, ledger):
+        first = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        ledger.add_adjudications(first, [_record(1, verdict=Verdict.SAME), _record(2, verdict=Verdict.RELATED)])
+        second = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        ledger.add_adjudications(second, [_record(3, verdict=Verdict.CORRECTS)])
+        third = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        ledger.add_adjudications(third, [_record(4, verdict=Verdict.UNRELATED)])
+
+        verdicts = ledger.adjudication_verdicts({first, second})
+
+        assert sorted(verdicts) == sorted([Verdict.SAME, Verdict.RELATED, Verdict.CORRECTS])
+        assert all(isinstance(verdict, Verdict) for verdict in verdicts)
+
+    def test_adjudication_verdicts_of_no_runs_are_none(self, ledger):
+        run_id = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        ledger.add_adjudications(run_id, [_record(1)])
+
+        assert ledger.adjudication_verdicts(set()) == []
+
+    def test_a_run_that_reuses_adjudications_rests_on_them(self, ledger):
+        first = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        same, _related = ledger.add_adjudications(
+            first, [_record(1, verdict=Verdict.SAME), _record(2, verdict=Verdict.RELATED)],
+        )
+        second = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+
+        ledger.reuse_adjudications(second, [same])
+
+        assert ledger.adjudication_verdicts({second}) == [Verdict.SAME]
+
+    def test_an_adjudication_two_named_runs_rest_on_counts_once(self, ledger):
+        first = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        ids = ledger.add_adjudications(
+            first, [_record(1, verdict=Verdict.SAME), _record(2, verdict=Verdict.RELATED)],
+        )
+        second = ledger.start_run(RunSource.ADJUDICATOR, writes=False)
+        ledger.reuse_adjudications(second, ids)
+
+        verdicts = ledger.adjudication_verdicts({first, second})
+
+        assert sorted(verdicts) == sorted([Verdict.SAME, Verdict.RELATED])
+
+    def test_a_record_whose_verdict_is_not_a_verdict_cannot_be_built(self):
+        with pytest.raises((TypeError, ValueError), match='MAYBE'):
+            AdjudicationRecord(
+                project_id=PROJECT,
+                child_id=_child(1),
+                parent_id=PARENT,
+                child_sha256=CHILD_SHA,
+                parent_sha256=PARENT_SHA,
+                verdict='MAYBE',  # pyright: ignore[reportArgumentType]
+                reason='r',
+                model='opus',
+            )
 
 
 class TestRunLock:

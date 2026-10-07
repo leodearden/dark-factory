@@ -796,7 +796,16 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
     values in this file would keep passing while production went silent.
     """
     from fused_memory.maintenance.link_heal_executor import (  # noqa: PLC0415
+        ADJUDICATOR_ANCHOR as LINK_HEAL_ADJUDICATOR_ANCHOR,
+    )
+    from fused_memory.maintenance.link_heal_executor import (
         BACKLOG_ANCHOR as LINK_HEAL_BACKLOG_ANCHOR,
+    )
+    from fused_memory.maintenance.link_heal_executor import (
+        CORRECTS_SHARE_ANCHOR as LINK_HEAL_CORRECTS_SHARE_ANCHOR,
+    )
+    from fused_memory.maintenance.link_heal_executor import (
+        MISFILE_SHARE_ANCHOR as LINK_HEAL_MISFILE_SHARE_ANCHOR,
     )
     from fused_memory.maintenance.link_heal_executor import (
         WRITE_FAILURE_ANCHOR as LINK_HEAL_WRITE_FAILURE_ANCHOR,
@@ -863,9 +872,12 @@ def _anchors_read_from_their_own_homes() -> dict[str, str]:
         #    its own rather than carrying a copy of the skeleton -------------
         'markup_guard storm': GUARD_STORM_ANCHOR,
         'markup_guard residue': GUARD_RESIDUE_ANCHOR,
-        # -- the link-heal executor's two run escapes (task 6181) -----------
+        # -- the link-heal executor's run escapes (tasks 6181, 6184) ----------
         'link_heal backlog': LINK_HEAL_BACKLOG_ANCHOR,
         'link_heal write-failure': LINK_HEAL_WRITE_FAILURE_ANCHOR,
+        'link_heal misfile-share': LINK_HEAL_MISFILE_SHARE_ANCHOR,
+        'link_heal corrects-share': LINK_HEAL_CORRECTS_SHARE_ANCHOR,
+        'link_heal adjudicator': LINK_HEAL_ADJUDICATOR_ANCHOR,
         # -- the non-member neighbours. They dedupe on content fingerprints
         #    via `submit_or_dedupe`, not on a pending anchor, so they are NOT
         #    migrating — but they write to the SAME queue, so they can still
@@ -956,12 +968,15 @@ class TestNoTwoFilersShareAnAnchor:
             'scope_violation_escalator',
             'link_heal backlog',
             'link_heal write-failure',
+            'link_heal misfile-share',
+            'link_heal corrects-share',
+            'link_heal adjudicator',
         ):
             assert required in anchors, (
                 f'{required!r} files into the same queue but is absent from '
                 'the anchor sweep'
             )
-        assert len(anchors) >= 17, (
+        assert len(anchors) >= 20, (
             f'the sweep shrank to {len(anchors)} entries; a filer was dropped '
             'rather than renamed'
         )
