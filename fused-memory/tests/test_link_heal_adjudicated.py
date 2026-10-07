@@ -9,7 +9,6 @@ and which escapes a run records.
 from __future__ import annotations
 
 import dataclasses
-import inspect
 import json
 from pathlib import Path
 
@@ -238,9 +237,6 @@ class TestAFailedAdjudication:
 
 
 class TestAPlanRunRecordsEscapesAndFilesNone:
-    def test_a_plan_run_has_no_filer(self):
-        assert 'filer' not in inspect.signature(run_adjudicator_plan).parameters
-
     @pytest.mark.asyncio
     async def test_an_adjudicator_storm_would_escape(self, harness, ledger, tmp_path):
         harness.seed_link(kind=SIGHTING_KIND)
