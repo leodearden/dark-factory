@@ -146,7 +146,7 @@ def test_scripts_root_patch():
 
 @pytest.fixture(scope='module')
 def tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    return git_tree(tmp_path_factory.mktemp('pinning'), {
+    root = git_tree(tmp_path_factory.mktemp('pinning'), {
         'pyproject.toml': '[tool.uv.workspace]\nmembers = ["pkga", "pkgb"]\n',
         'pkga/src/pkga/__init__.py': '',
         'pkga/src/pkga/mod.py': MOD,
@@ -157,7 +157,11 @@ def tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
         'scripts/tool.py': '_y = 1\n',
         'scripts/legibility/ledger.py': '_x = 1\n',
         'scripts/tests/test_scripts.py': SCRIPTS_TEST,
+        'tests/test_top.py': 'def test_top():\n    pass\n',
+        'hooks/tests/test_h.py': 'def test_h():\n    pass\n',
     })
+    (root / 'pkga/tests/test_untracked.py').write_text('def test_u():\n    pass\n')
+    return root
 
 
 @pytest.fixture(scope='module')
@@ -204,7 +208,12 @@ class TestPackageRow:
 
 class TestCensus:
     def test_rows_are_per_package_in_name_order(self, census):
-        assert [row.package for row in census.rows] == ['pkga', 'pkgb', 'scripts']
+        assert [row.package for row in census.rows] == ['pkga', 'pkgb', 'scripts', 'tests']
+
+    def test_each_member_row_counts_only_that_members_tracked_test_files(self, census):
+        assert {row.package: row.test_files for row in census.rows} == {
+            'pkga': 2, 'pkgb': 1, 'scripts': 1, 'tests': 1,
+        }
 
     def test_duplicates_are_never_grouped_across_packages(self, census):
         (pkgb,) = [row for row in census.rows if row.package == 'pkgb']
