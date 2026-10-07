@@ -1526,7 +1526,7 @@ def test_decide_for_project_never_censused_floor_blocks_from_the_earliest_codebo
     assert "BLOCKS" in floor_lines[0]
 
 
-def _watermarked_state(*, last_census_days_ago, watermark_days_ago):
+def _watermarked_state(*, last_census_days_ago, watermark_days_ago) -> dict[str, str | None]:
     return {
         "last_census_at": (NOW - timedelta(days=last_census_days_ago)).isoformat(),
         "last_census_report": "plans/confusion-census-prior.md",
