@@ -175,7 +175,7 @@ async def test_changing_files_is_refused(seeded):
     backend, root = seeded
     before_row = _stored_row(root)
     blob = _rotated_blob(json.loads(before_row['metadata']), files=['other.py'])
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"docs/task-authoring\.md.*other\.py"):
         await backend.rewrite_audit_trail('1', root, description='new', metadata=blob)
     assert _stored_row(root) == before_row
 

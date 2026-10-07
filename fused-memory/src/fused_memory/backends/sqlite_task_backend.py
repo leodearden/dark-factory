@@ -15,7 +15,7 @@ import sqlite3
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import aiosqlite
 from shared.async_sqlite_base import (
@@ -3553,20 +3553,30 @@ class SqliteTaskBackend:
                 (tag, tid),
             )
             refreshed = await refreshed_cursor.fetchone()
-        deps = (
-            await self._fetch_dependencies(
-                await self._get_connection(project_root), tag,
-            )
+        return await self._updated_task_response(
+            refreshed, task_id=task_id, project_root=project_root, tag=tag,
+            message=f'Task {task_id} updated',
         )
-        updated_task = (
-            _row_to_task(refreshed, deps.get(refreshed['id'], []), project_root=project_root)
-            if refreshed is not None else None
-        )
+
+    async def _updated_task_response(
+        self,
+        refreshed: aiosqlite.Row | None,
+        *,
+        task_id: str,
+        project_root: str,
+        tag: str,
+        message: str,
+    ) -> UpdateTaskResult:
+        """The reply of a writer that re-read its row inside its own transaction."""
+        deps = await self._fetch_dependencies(await self._get_connection(project_root), tag)
         return {
             'id': task_id,
-            'message': f'Task {task_id} updated',
+            'message': message,
             'updated': True,
-            'updated_task': updated_task,
+            'updated_task': (
+                _row_to_task(refreshed, deps.get(refreshed['id'], []), project_root=project_root)
+                if refreshed is not None else None
+            ),
         }
 
     async def stamp_audit_metadata(
@@ -3679,26 +3689,30 @@ class SqliteTaskBackend:
             if not isinstance(stored, dict):
                 raise TaskmasterError(
                     'TASKMASTER_TOOL_ERROR',
-                    f'Task {task_id} metadata is not a JSON object; rotation does not repair it',
+                    f'Task {task_id} metadata is not a JSON object; rotation does not repair it '
+                    f'(stored {(row["metadata"] or "")[:80]!r})',
                 )
             # A stored machine-authored value sent back unchanged is a carry, not a forgery.
-            incoming = strip_machine_authored_metadata(
+            # Given a dict, the strip hands back a dict.
+            incoming = cast(dict[str, Any], strip_machine_authored_metadata(
                 {
                     key: value for key, value in metadata.items()
                     if stored.get(key, absent) != value or key not in _MACHINE_AUTHORED_METADATA_KEYS
                 },
                 project_root=project_root, tag=tag, task_id=tid,
-            )
-            if not isinstance(incoming, dict):
-                raise TypeError(f'Task {task_id}: rotation metadata must be a JSON object')
+            ))
             _assert_done_provenance_passthrough(row['metadata'], incoming, task_id)
             new_blob = {
                 **incoming,
                 **{key: stored[key] for key in _MACHINE_AUTHORED_METADATA_KEYS if key in stored},
             }
             new_metadata = json.dumps(new_blob)
-            if _files_for_key(row['metadata']) != _files_for_key(new_metadata):
-                raise ValueError(f'Task {task_id}: an audit-trail rotation never changes files')
+            stored_files, new_files = _files_for_key(row['metadata']), _files_for_key(new_metadata)
+            if stored_files != new_files:
+                raise ValueError(
+                    f'Task {task_id}: an audit-trail rotation never changes files '
+                    f'(stored {stored_files!r}, rotation sent {new_files!r})'
+                )
             refuse_leaked_task_text(
                 {'title': None, 'description': description, 'details': None},
                 arguments=arguments_as_received,
@@ -3723,16 +3737,10 @@ class SqliteTaskBackend:
                 (tag, tid),
             )
             refreshed = await refreshed_cursor.fetchone()
-        deps = await self._fetch_dependencies(await self._get_connection(project_root), tag)
-        return {
-            'id': task_id,
-            'message': f'Rotated audit trail of task {task_id}',
-            'updated': True,
-            'updated_task': (
-                _row_to_task(refreshed, deps.get(refreshed['id'], []), project_root=project_root)
-                if refreshed is not None else None
-            ),
-        }
+        return await self._updated_task_response(
+            refreshed, task_id=task_id, project_root=project_root, tag=tag,
+            message=f'Rotated audit trail of task {task_id}',
+        )
 
     async def remove_tasks(
         self,
