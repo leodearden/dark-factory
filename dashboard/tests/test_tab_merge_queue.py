@@ -68,3 +68,17 @@ def test_no_surface_reads_a_retired_merge_queue_key(surface, code, retired_key):
         'emits — it renders undefined. Read the queue through merge_queue.js and '
         'the attempt count from the outcomes total.'
     )
+
+
+def _feed_code() -> str:
+    source = strip_js_comments((_REDUX_DIR / 'shell.jsx').read_text())
+    return extract_function_body(source, 'buildFeedEntries')
+
+
+def test_the_live_feed_dates_a_queued_row_through_queued_since():
+    """The live probe never emits a row ``timestamp``: reading one drops every queued merge."""
+    assert 'a.timestamp' not in _feed_code(), (
+        'shell.jsx::buildFeedEntries still reads `a.timestamp` on a queued row, a key '
+        'the live get_merge_queue probe never emits, so every queued merge is skipped. '
+        'Read the enqueue instant through merge_queue.js::queuedSince.'
+    )

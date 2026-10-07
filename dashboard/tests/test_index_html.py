@@ -1531,13 +1531,17 @@ _MERGE_QUEUE_ORDER_CASES = [
     (_DATUM_PREFIX, 'datum.js', _MERGE_QUEUE_PREFIX, 'merge_queue.js'),
     (_MERGE_QUEUE_PREFIX, 'merge_queue.js', _TABS_PREFIX, 'tabs.jsx'),
     (_MERGE_QUEUE_PREFIX, 'merge_queue.js', _APP_JSX_PREFIX, 'app.jsx'),
+    (_MERGE_QUEUE_PREFIX, 'merge_queue.js', _SHELL_PREFIX, 'shell.jsx'),
 ]
 
 
 @pytest.mark.parametrize(
     'before_prefix, before_label, after_prefix, after_label',
     _MERGE_QUEUE_ORDER_CASES,
-    ids=['datum-before-merge-queue', 'merge-queue-before-tabs', 'merge-queue-before-app'],
+    ids=[
+        'datum-before-merge-queue', 'merge-queue-before-tabs', 'merge-queue-before-app',
+        'merge-queue-before-shell',
+    ],
 )
 def test_merge_queue_js_load_order(
     index_html_body: str,
