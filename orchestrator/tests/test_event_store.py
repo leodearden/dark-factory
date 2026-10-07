@@ -885,6 +885,76 @@ class TestLatestMergeFinalized:
         assert row['absorbed_request_ids'] == ['mr-l1']
 
 
+class TestMergeFinalizedSupersededBy:
+    """EventStore.merge_finalized_superseded_by — the member rows a train or generation superseded."""
+
+    @staticmethod
+    def _stores_with_members(tmp_path: Path) -> EventStore:
+        db_path = tmp_path / 'runs.db'
+        store_a = EventStore(db_path, 'run-A')
+        store_b = EventStore(db_path, 'run-B')
+        _emit_finalized(
+            store_a, request_id='mr-m1', task_id='T1', branch='b1', state='superseded',
+            superseded_by='coalesce-abc123',
+        )
+        _emit_finalized(
+            store_b, request_id='mr-m2', task_id='T2', branch='b2', state='superseded',
+            superseded_by='coalesce-abc123',
+        )
+        _emit_finalized(
+            store_b, request_id='mr-x', task_id='T9', branch='b9', state='superseded',
+            superseded_by='coalesce-other',
+        )
+        _emit_finalized(
+            store_b, request_id='mr-m3', task_id='T3', branch='b3', state='superseded',
+            superseded_by='coalesce-abc123',
+        )
+        _emit_finalized(
+            store_b, request_id='mr-plain', task_id='T4', branch='b4', state='done',
+            superseded_by=None,
+        )
+        return store_b
+
+    def test_cross_run_returns_every_member_in_emission_order(self, tmp_path: Path) -> None:
+        store_b = self._stores_with_members(tmp_path)
+
+        rows = store_b.merge_finalized_superseded_by('coalesce-abc123', cross_run=True)
+
+        assert [
+            (r['request_id'], r['run_id'], r['is_current_run']) for r in rows
+        ] == [
+            ('mr-m1', 'run-A', False),
+            ('mr-m2', 'run-B', True),
+            ('mr-m3', 'run-B', True),
+        ]
+        assert rows[1] == store_b.latest_merge_finalized(request_id='mr-m2')
+
+    def test_default_is_run_scoped(self, tmp_path: Path) -> None:
+        store_b = self._stores_with_members(tmp_path)
+
+        rows = store_b.merge_finalized_superseded_by('coalesce-abc123')
+
+        assert [r['request_id'] for r in rows] == ['mr-m2', 'mr-m3']
+
+    def test_unknown_and_empty_ids_return_empty_list(self, tmp_path: Path) -> None:
+        store_b = self._stores_with_members(tmp_path)
+
+        assert store_b.merge_finalized_superseded_by('coalesce-nope', cross_run=True) == []
+        assert store_b.merge_finalized_superseded_by('', cross_run=True) == []
+
+    def test_resolves_a_generation_successor_request_id(self, tmp_path: Path) -> None:
+        """Auto-chain supersession uses the same key: gen-(n+1)'s request id."""
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+        _emit_finalized(
+            store, request_id='mr-gen1', task_id='T', branch='b', state='superseded',
+            superseded_by='mr-gen2',
+        )
+
+        rows = store.merge_finalized_superseded_by('mr-gen2', cross_run=True)
+
+        assert [r['request_id'] for r in rows] == ['mr-gen1']
+
+
 class TestFetchEventsByTypeAllRuns:
     """``fetch_events_by_type_all_runs`` is the restart-durable (run-agnostic)
     counterpart to ``fetch_events_by_type`` (task 2752).
