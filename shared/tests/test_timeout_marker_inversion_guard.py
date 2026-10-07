@@ -37,7 +37,15 @@ _ORCH_YAML = _TESTS_DIR.parent / 'orchestrator.yaml'
 #: the same stated limit as orchestrator's.
 _SANCTIONED: Mapping[str, float] = {}
 
-_GRANDFATHERED: frozenset[tuple[str, str]] = frozenset()
+#: In-band sites that predate this guard: 1, MEASURED on 2026-10-07 at main
+#: 1c6a52dbfd.  Entries may only ever be REMOVED; migration is follow-up
+#: tkt_0RVDQ479918XDV0C80NXAVT8HX.  Keyed per SITE on the path RELATIVE to
+#: tests/.  The site's own comment still reasons against a 60s ini default that
+#: is now 540, which is why 180 reads to its author as a loosening.
+_GRANDFATHERED: frozenset[tuple[str, str]] = frozenset({
+    # test_root_config_integration_deselection.py -- 1 site at 180s
+    ('test_root_config_integration_deselection.py', 'TestRootConfigIntegrationDeselection'),
+})
 
 #: Floors, not equalities (138 files and 38 sites measured on 2026-10-07): a
 #: broken sweep reports zero offenders, which is indistinguishable from a
