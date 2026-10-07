@@ -185,13 +185,15 @@ fi
 
 # Validate threshold integers (misconfiguration is a wiring bug, not transient pressure;
 # exit 2 = usage error so it is loud rather than fail-open or crash).
-# MIN_FREE_GIB feeds $(( MIN_FREE_GIB * 1024^3 )), so it is held to a canonical decimal of
-# at most 5 digits: a leading zero would be read as OCTAL (08/09 error out leaving the
-# variable unset, 010 silently means 8), and a huge value would wrap negative on 64-bit and
-# invert the comparison. 99999 GiB is ~9 orders of magnitude under 2^63 bytes.
+# Each GiB floor (MIN_FREE_GIB, and SOFT_FREE_GIB under --soft) feeds $(( N * 1024^3 )), so
+# it is held to GIB_FLOOR_PATTERN, a canonical decimal of at most 5 digits: a leading zero
+# would be read as OCTAL (08/09 error out leaving the variable unset, 010 silently means 8),
+# and a huge value would wrap negative on 64-bit and invert the comparison. 99999 GiB is
+# ~5 orders of magnitude under 2^63 bytes.
 # A non-integer MIN_FREE_INODES would make [ "$avail_inodes" -lt ... ] throw
 # 'integer expression expected', aborting with a non-75 code the orchestrator won't requeue.
-if ! printf '%s\n' "$MIN_FREE_GIB" | grep -qE '^(0|[1-9][0-9]{0,4})$'; then
+GIB_FLOOR_PATTERN='^(0|[1-9][0-9]{0,4})$'
+if ! printf '%s\n' "$MIN_FREE_GIB" | grep -qE "$GIB_FLOOR_PATTERN"; then
     err "REIFY_WARM_LANE_DISK_GUARD_MIN_FREE_GIB (or --min-free-gib) is not a valid integer (0-99999, no leading zeros): '$MIN_FREE_GIB'."
     err "Run '$(basename "$0") --help' for usage."
     exit 2
@@ -208,8 +210,8 @@ fi
 # measurement outcome — a VALID soft config still fail-closes to 75 on a
 # df failure (E3; see the fail-closed df read below).
 if [ "$SOFT_MODE" -eq 1 ]; then
-    if ! printf '%s\n' "$SOFT_FREE_GIB" | grep -qE '^[0-9]+$'; then
-        err "REIFY_WARM_LANE_DISK_GUARD_SOFT_FREE_GIB (or --soft-free-gib) is not a valid integer: '$SOFT_FREE_GIB'."
+    if ! printf '%s\n' "$SOFT_FREE_GIB" | grep -qE "$GIB_FLOOR_PATTERN"; then
+        err "REIFY_WARM_LANE_DISK_GUARD_SOFT_FREE_GIB (or --soft-free-gib) is not a valid integer (0-99999, no leading zeros): '$SOFT_FREE_GIB'."
         err "Run '$(basename "$0") --help' for usage."
         exit 2
     fi
