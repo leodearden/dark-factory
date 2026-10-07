@@ -525,10 +525,13 @@ class LaneLifecycle:
           (idempotent).
         * Already ``ASSIGNED``/``IN_USE`` for a DIFFERENT ``task_id`` (or any
           other state with no legal edge to ``ASSIGNED``): never steals,
-          never mutates — the final ``transition()`` call below raises
-          ``IllegalLaneTransition`` (propagated to the caller, NOT swallowed
-          — unlike the best-effort ``GitOps`` writer methods this mirrors)
-          and the durable record is left untouched.
+          never mutates — raises ``IllegalLaneTransition`` (propagated to the
+          caller, NOT swallowed — unlike the best-effort ``GitOps`` writer
+          methods this mirrors) and the durable record is left untouched.
+          The ``ASSIGNED`` half relies on the table (``ASSIGNED -> ASSIGNED``
+          is illegal); the ``IN_USE`` half is enforced by
+          ``_refuse_in_use_steal``, because leaf δ made ``IN_USE ->
+          ASSIGNED`` legal.
         * Current state ``QUARANTINED``: RECYCLED, not refused. Emits a LOUD
           ``WARNING`` (never silent-heal, PRD W11 I2), routes the ONE
           sanctioned ``QUARANTINED -> RELEASED`` recycle edge (which clears the
@@ -576,6 +579,7 @@ class LaneLifecycle:
             and rec.task_id == task_id
         ):
             return rec  # idempotent no-op; no I/O
+        self._refuse_in_use_steal(lane, rec, task_id)
 
         registered_fields = {'branch': branch} if branch is not None else {}
         if state is None:
@@ -612,6 +616,20 @@ class LaneLifecycle:
         if branch is not None:
             assigned_fields['branch'] = branch
         return self.transition(lane, LaneState.ASSIGNED, **assigned_fields)
+
+    def _refuse_in_use_steal(
+        self, lane: Path | str, rec: LaneRecord | None, task_id: str,
+    ) -> None:
+        """Raise, escalate and write nothing when *rec* is IN_USE for another task."""
+        if rec is None or rec.state is not LaneState.IN_USE or rec.task_id == task_id:
+            return
+        self._file_illegal_transition_escalation(
+            lane, LaneState.IN_USE, LaneState.ASSIGNED,
+        )
+        raise IllegalLaneTransition(
+            f'lane {Path(lane).name!r} is IN_USE for task {rec.task_id!r}; '
+            f'refusing to re-key it to task {task_id!r}'
+        )
 
     def pool_storage_present(self) -> bool:
         """True iff worktree_base is backed by live pool storage (task 2099).
