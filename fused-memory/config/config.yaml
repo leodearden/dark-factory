@@ -467,10 +467,12 @@ mem0_update:
   # storm_threshold: 20
   # storm_window_seconds: 3600.0
 
-# Link-heal executor caps (task 6181, plans/write-triage-link-healing-prd.md
-# H1). Read by fused-memory/scripts/link_heal.py at each run start, so an edit
-# takes effect on the next run with no restart. Every value below is the shipped
-# default, shown so the knobs are discoverable. Uncomment to change one.
+# Link-heal executor caps and link adjudicator knobs (tasks 6181, 6184;
+# plans/write-triage-link-healing-prd.md H1, H2). Read by
+# fused-memory/scripts/link_heal.py and scripts/eval_link_adjudicator.py at each
+# run start, so an edit takes effect on the next run with no restart. Every
+# value below is the shipped default, shown so the knobs are discoverable.
+# Uncomment to change one.
 # link_heal:
 #   # Write attempts per unattended run, oldest-planned first; the rest stay
 #   # pending as skipped_cap. 0 applies nothing unattended.
@@ -479,6 +481,18 @@ mem0_update:
 #   backlog_multiplier: 5
 #   # Consecutive failed actions that stop a run (link-heal-write-failure).
 #   write_failure_streak: 3
+#   # Claude CLI model alias the link adjudicator asks.
+#   adjudicator_model: opus
+#   # Pairs per adjudicator CLI call.
+#   shard_size: 40
+#   # Cap per text, with the rater brief's truncation marker.
+#   field_chars: 4000
+#   # Apply writes nothing past this adjudicated misfile share (link-heal-misfile-share).
+#   misfile_share_ceiling: 0.25
+#   # Apply writes nothing past this adjudicated CORRECTS share (link-heal-corrects-share).
+#   corrects_share_ceiling: 0.60
+#   # Consecutive failed adjudicator shards that stop adjudicating (link-heal-adjudicator).
+#   shard_failure_streak: 3
 
 # Entity-node minting (task 4932) — the ensure_entity_node MCP tool, which
 # CREATES a Graphiti Entity node so a dangling referent has something to point

@@ -3227,12 +3227,14 @@ class ConsolidationAutoConfig(BaseModel):
 
 
 class LinkHealConfig(BaseModel):
-    """Caps and storm escapes for the link-heal executor (task 6181).
+    """Caps, storm escapes and adjudicator knobs for link healing (tasks 6181, 6184).
 
     Contract: ``plans/write-triage-link-healing-prd.md`` H1, "Caps and storm
-    escapes". The only consumer is ``fused-memory/scripts/link_heal.py``, which
-    loads config afresh at each run start; the server holds no copy, so every
-    leaf is green-tier.
+    escapes", and H2, the link adjudicator. The consumers are
+    ``fused-memory/scripts/link_heal.py`` and
+    ``fused-memory/scripts/eval_link_adjudicator.py``, both of which load config
+    afresh at each run start; the server holds no copy, so every leaf is
+    green-tier.
     """
 
     max_actions_per_run: int = Field(
@@ -3258,6 +3260,53 @@ class LinkHealConfig(BaseModel):
         description=(
             'Consecutive failed actions that stop a run with a non-zero exit '
             'and escalate under link-heal-write-failure. PRD H1.'
+        ),
+    )
+    adjudicator_model: str = Field(
+        default='opus',
+        min_length=1,
+        description=(
+            'Claude CLI model alias for the link adjudicator; the δm/Γ_A '
+            'selection re-bases it. PRD H2.'
+        ),
+    )
+    shard_size: int = Field(
+        default=40,
+        ge=1,
+        description='Pairs per adjudicator CLI call. PRD H2.',
+    )
+    field_chars: int = Field(
+        default=4000,
+        ge=1,
+        description=(
+            "Cap per text, with the rater brief's truncation marker; the cap "
+            'the 359 hand-link ratings used. PRD H2.'
+        ),
+    )
+    misfile_share_ceiling: float = Field(
+        default=0.25,
+        ge=0,
+        le=1,
+        description=(
+            'A run whose adjudicated misfile share exceeds this writes nothing '
+            'and escalates under link-heal-misfile-share. PRD H2.'
+        ),
+    )
+    corrects_share_ceiling: float = Field(
+        default=0.60,
+        ge=0,
+        le=1,
+        description=(
+            'A run whose adjudicated CORRECTS share exceeds this writes nothing '
+            'and escalates under link-heal-corrects-share. PRD H2.'
+        ),
+    )
+    shard_failure_streak: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            'Consecutive failed adjudicator shards that escalate under '
+            'link-heal-adjudicator and stop adjudicating. PRD H2.'
         ),
     )
 
