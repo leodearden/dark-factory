@@ -8035,6 +8035,68 @@ class TestRunFullVerificationRole:
         )
 
 
+class TestRunFullVerificationMaxRetries:
+    """run_full_verification threads `max_retries` to every run_verification call.
+
+    Task 5812: the main-tip sweep passes max_retries=0 so a timeout reaches its
+    verdict without re-running; omitting it keeps config.verify_timeout_retries
+    in force for every other caller (e.g. review-checkpoint).
+    """
+
+    _PASSING = VerifyResult(
+        passed=True, test_output='', lint_output='', type_output='', summary='ok',
+    )
+
+    @pytest.mark.asyncio
+    async def test_threads_max_retries_to_each_subproject(self, tmp_path: Path):
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {
+            'dashboard': ModuleConfig(prefix='dashboard', test_command='echo dash'),
+            'api': ModuleConfig(prefix='api', test_command='echo api'),
+        }
+
+        mock_run_verification = AsyncMock(return_value=self._PASSING)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(
+                tmp_path, config, role='background', max_retries=0,
+            )
+
+        assert mock_run_verification.call_count == 2
+        for one_call in mock_run_verification.call_args_list:
+            assert one_call.kwargs['max_retries'] == 0, one_call.kwargs
+
+    @pytest.mark.asyncio
+    async def test_threads_max_retries_to_the_global_fallback(self, tmp_path: Path):
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {}  # discovered-empty → global fallback branch
+
+        mock_run_verification = AsyncMock(return_value=self._PASSING)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(tmp_path, config, max_retries=0)
+
+        assert mock_run_verification.call_count == 1
+        assert mock_run_verification.call_args_list[0].kwargs['max_retries'] == 0
+
+    @pytest.mark.asyncio
+    async def test_omitted_max_retries_leaves_config_default_in_force(
+        self, tmp_path: Path,
+    ):
+        """None reaches run_verification, which then uses config.verify_timeout_retries."""
+        config = OrchestratorConfig(project_root=tmp_path)
+        config._module_configs = {
+            'dashboard': ModuleConfig(prefix='dashboard', test_command='echo dash'),
+            'api': ModuleConfig(prefix='api', test_command='echo api'),
+        }
+
+        mock_run_verification = AsyncMock(return_value=self._PASSING)
+        with patch('orchestrator.verify.run_verification', new=mock_run_verification):
+            await run_full_verification(tmp_path, config)
+
+        assert mock_run_verification.call_count == 2
+        for one_call in mock_run_verification.call_args_list:
+            assert one_call.kwargs.get('max_retries') is None, one_call.kwargs
+
+
 class TestRunScopedVerificationForceWorkspace:
     """run_scoped_verification: force_workspace=True bypasses all scoping.
 
