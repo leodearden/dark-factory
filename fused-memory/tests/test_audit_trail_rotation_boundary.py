@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
@@ -44,19 +45,47 @@ RELAY_KEYS = {
 
 
 class FakeArchive:
-    def __init__(self, *, write_error: Exception | None = None):
+    """``after_write`` runs once the content is stored, before the read-back."""
+
+    def __init__(
+        self,
+        *,
+        write_error: Exception | None = None,
+        after_write: Callable[[], Awaitable[Any]] | None = None,
+    ):
         self.write_error = write_error
+        self.after_write = after_write
         self.store: dict[str, str] = {}
+        self.discarded: list[str] = []
 
     async def write(self, *, project_id: str, content: str, metadata: dict[str, Any]) -> str | None:
         if self.write_error is not None:
             raise self.write_error
         memory_id = str(uuid.uuid4())
         self.store[memory_id] = content
+        if self.after_write is not None:
+            await self.after_write()
         return memory_id
 
     async def read(self, *, project_id: str, memory_id: str) -> str | None:
         return self.store.get(memory_id)
+
+    async def discard(self, *, project_id: str, memory_id: str) -> None:
+        self.discarded.append(memory_id)
+        self.store.pop(memory_id, None)
+
+
+class RecordingCurator:
+    """The two TaskCurator methods an update_task re-embed and a close reach."""
+
+    def __init__(self):
+        self.reembedded: list[tuple[str, Any]] = []
+
+    async def reembed_task(self, task_id: str, candidate: Any, project_id: str) -> None:
+        self.reembedded.append((task_id, candidate))
+
+    async def close(self) -> None:
+        pass
 
 
 @pytest_asyncio.fixture
@@ -196,4 +225,72 @@ async def test_details_dominated_task_is_reported_unrotatable(stack):
     assert after['description'] == 'One block only.'
     assert after['details'] == 'd' * 41_000
     assert after['metadata']['x_note'] == 'cycle 9'
+    assert ROLLUP_KEY not in after['metadata']
+
+
+@pytest.mark.asyncio
+async def test_a_task_changed_between_planning_and_commit_is_left_alone(stack):
+    interceptor, backend, root = stack
+
+    async def concurrent_edit() -> None:
+        await backend.update_task('1', root, metadata=json.dumps({'x_concurrent': 'edit'}))
+
+    archive = FakeArchive(after_write=concurrent_edit)
+    interceptor.set_audit_trail_archive(archive)
+
+    result = await recon_cycle(interceptor, root, RECON_AGENT)
+
+    after = await backend.get_task('1', root)
+    outcome = result['audit_trail_rotation']
+    assert outcome['status'] == 'superseded'
+    assert outcome['archive_discarded'] is True
+    assert archive.discarded == [outcome['archive_memory_id']]
+    assert archive.store == {}
+    assert after['description'] == DESCRIPTION + '\n\n' + NEW_BLOCK
+    assert after['metadata']['x_concurrent'] == 'edit'
+    assert set(RELAY_KEYS) <= set(after['metadata'])
+    assert ROLLUP_KEY not in after['metadata']
+
+
+@pytest.mark.asyncio
+async def test_a_description_only_the_rotation_rewrote_is_re_embedded(stack):
+    interceptor, backend, root = stack
+    await backend.update_task('1', root, description=DESCRIPTION + '\n\n' + NEW_BLOCK)
+    curator = RecordingCurator()
+    interceptor._curator = curator  # type: ignore[assignment]
+    interceptor.set_audit_trail_archive(FakeArchive())
+
+    result = await interceptor.update_task(
+        '1', root, metadata=json.dumps({'x_note': 'cycle 21'}), agent_id=RECON_AGENT
+    )
+    await interceptor.drain()
+
+    after = await backend.get_task('1', root)
+    assert result['audit_trail_rotation']['description_rewritten'] is True
+    [(task_id, candidate)] = curator.reembedded
+    assert task_id == '1'
+    assert candidate.description == after['description']
+
+
+@pytest.mark.asyncio
+async def test_a_small_recon_write_comes_back_unchanged(stack):
+    interceptor, backend, root = stack
+    archive = FakeArchive()
+    interceptor.set_audit_trail_archive(archive)
+    await backend.add_task(
+        project_root=root,
+        title='A small task',
+        description='One block only.',
+        metadata=json.dumps(GATE_MARKERS),
+    )
+
+    result = await interceptor.update_task(
+        '2', root, metadata=json.dumps({'x_note': 'cycle 1'}), agent_id=RECON_AGENT
+    )
+
+    after = await backend.get_task('2', root)
+    assert interceptor_write_succeeded(result)
+    assert 'audit_trail_rotation' not in result
+    assert archive.store == {}
+    assert {**result['updated_task'], 'id': after['id']} == after
     assert ROLLUP_KEY not in after['metadata']
