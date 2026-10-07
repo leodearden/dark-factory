@@ -12,6 +12,8 @@ conftests hierarchically, so the smoke suite inherits everything below.
 import sys
 from pathlib import Path
 
+from hypothesis import settings
+
 # Suite-wide git isolation (task 3355, incident esc-3072-3).  The verify lane
 # runs `cd cockpit && uv run pytest tests/`, which makes rootdir the SUBPROJECT —
 # the repo-root conftest.py is never loaded, so each test-root conftest wires the
@@ -33,3 +35,11 @@ from df_pytest_isolation import (  # noqa: E402
 def pytest_configure(config):
     """Refuse a --basetemp aimed inside a live task worktree (esc-3072-3)."""
     reject_unsafe_basetemp(config)
+
+
+# Hypothesis's stock 200ms per-example deadline measures host scheduling, not the
+# code under test: the property tests exercise pure arithmetic, and under a
+# CPU-oversubscribed xdist verify run they trip DeadlineExceeded on a 0.09ms body.
+# One suite-wide profile covers every current and future @given row.
+settings.register_profile("cockpit", deadline=None)
+settings.load_profile("cockpit")
