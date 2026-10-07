@@ -41,9 +41,10 @@ from fused_memory.maintenance.link_heal import (
 )
 
 _WORD_BULLET = re.compile(r'^- \*\*([A-Z]+)\*\*:', re.MULTILINE)
-_CLASS_LINE = re.compile(r'^Belongs = (.*?)\. Wrong \(a misfile\) = (.*?)\.$', re.MULTILINE)
-_MARKER_EXAMPLE = re.compile(r'`(…\[truncated, [^`]*\])`')
+_CLAUSE_END = re.compile(r'[.;\n]')
 _UPPER_WORD = re.compile(r'\b[A-Z]{2,}\b')
+_MARKER_HEAD, _MARKER_TAIL = TRUNCATION_MARKER.split('{total}')
+_MARKER_SHOWN = re.compile(re.escape(_MARKER_HEAD) + r'\S+?' + re.escape(_MARKER_TAIL))
 
 
 def _brief() -> str:
@@ -54,14 +55,16 @@ def _brief_words() -> list[str]:
     return _WORD_BULLET.findall(_brief())
 
 
-def _class_line() -> tuple[str, str]:
-    match = _CLASS_LINE.search(_brief())
-    assert match is not None, 'the brief lost its Belongs/Wrong line'
-    return match.group(1), match.group(2)
-
-
-def _verdicts_named(fragment: str) -> frozenset[Verdict]:
-    return frozenset(Verdict(word) for word in _UPPER_WORD.findall(fragment))
+def _verdicts_where_named(label: str) -> frozenset[Verdict]:
+    """Every verdict word in a clause of the brief that names the class *label*."""
+    words = {verdict.value for verdict in Verdict}
+    clauses = [clause for clause in _CLAUSE_END.split(_brief()) if label in clause.lower()]
+    return frozenset(
+        Verdict(word)
+        for clause in clauses
+        for word in _UPPER_WORD.findall(clause)
+        if word in words
+    )
 
 
 class TestTheBriefIsTheScale:
@@ -72,20 +75,20 @@ class TestTheBriefIsTheScale:
     def test_the_brief_lists_the_verdict_words_in_order(self):
         assert _brief_words() == [verdict.value for verdict in Verdict]
 
-    def test_the_belongs_line_names_the_belongs_verdicts(self):
-        belongs, _ = _class_line()
-        assert _verdicts_named(belongs) == BELONGS_VERDICTS
+    def test_the_belongs_class_is_the_belongs_verdicts(self):
+        assert _verdicts_where_named('belongs') == BELONGS_VERDICTS
 
-    def test_the_misfile_line_names_the_misfile_verdicts(self):
-        _, misfile = _class_line()
-        assert _verdicts_named(misfile) == MISFILE_VERDICTS
+    def test_the_misfile_class_is_the_misfile_verdicts(self):
+        assert _verdicts_where_named('misfile') == MISFILE_VERDICTS
 
     def test_agreeing_is_belongs_without_corrects(self):
         assert BELONGS_VERDICTS - {Verdict.CORRECTS} == AGREEING_VERDICTS
 
-    def test_the_brief_marker_example_is_the_truncation_marker(self):
-        examples = _MARKER_EXAMPLE.findall(_brief())
-        assert examples == [TRUNCATION_MARKER.format(total='N')]
+    def test_every_truncation_marker_the_brief_shows_is_the_one_cap_text_writes(self):
+        brief = _brief()
+        shown = _MARKER_SHOWN.findall(brief)
+        assert shown, 'the brief no longer shows the truncation marker cap_text writes'
+        assert brief.count(_MARKER_HEAD) == len(shown)
 
 
 class TestVerdictOutputSchema:
