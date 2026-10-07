@@ -5189,8 +5189,13 @@ def create_mcp_server(
         want to confirm its identity without the fuzzy/semantic matching that
         can mask duplicate-node pathology.
 
+        An 8-31 lowercase-hex PREFIX naming exactly one Entity node is read
+        through to it (the result gains ``resolved_from_prefix``); any other
+        prefix returns get_memory_by_id's miss report, ambiguity refusal or
+        ``resolver_unavailable`` shape instead of a NodeNotFoundError.
+
         Args:
-            entity_uuid: UUID of the Entity node to look up
+            entity_uuid: UUID of the Entity node to look up, or a prefix of one
             project_id: Project scope (required)
             agent_id: Which agent is reading (optional, auto-derived from MCP context)
             session_id: Session context (optional, auto-derived from MCP context)
@@ -5201,6 +5206,25 @@ def create_mcp_server(
             return err
         if err := validate_project_id(project_id):
             return err
+        resolved_from_prefix: str | None = None
+        if is_uuid_prefix(entity_uuid):
+            answer = await _answer_prefix_read(
+                id_resolver, project_id, entity_uuid, serves='graphiti_node',
+            )
+            if isinstance(answer, dict):
+                await _log_read(
+                    operation='get_entity_by_uuid',
+                    project_id=project_id,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    params={'entity_uuid': entity_uuid},
+                    result_summary={
+                        'prefix_checked': answer['prefix_checked'],
+                        'outcome': answer.get('error_type', 'miss_report'),
+                    },
+                )
+                return answer
+            resolved_from_prefix, entity_uuid = entity_uuid, answer
         try:
             result = await memory_service.get_entity_by_uuid(
                 entity_uuid=entity_uuid, project_id=project_id
@@ -5217,6 +5241,8 @@ def create_mcp_server(
                     'has_summary': bool(result.get('summary')),
                 },
             )
+            if resolved_from_prefix is not None:
+                return {**result, 'resolved_from_prefix': resolved_from_prefix}
             return result
         except NodeNotFoundError as e:
             # Expected diagnostic outcome, not a backend failure — this tool
