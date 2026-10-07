@@ -15,9 +15,9 @@ and **D12**.
    the kind table's marker substrings drops the files that cannot hold a
    marker; the survivors are tokenized and only COMMENT tokens are read.
 2. *Consumer model* (D8).  Which tool, if any, actually honours this marker.
-3. *Classify.*  Owned by an inline disposition, ratified by class, or unowned
-   — decided in THAT fixed order, which is what makes a marker no tool reads
-   un-rescuable by either of the other two.
+3. *Classify.*  Consumer first, then ratified class, then inline disposition
+   — THAT fixed order is what makes a marker no tool reads un-rescuable by
+   either of the other two; a site none of them owns is unowned.
 4. *Ratchet.*  ``shared.ratchet`` does all the arithmetic and all the baseline
    I/O; this module supplies the keys and renders the violations.
 
@@ -33,10 +33,12 @@ argparse epilog:
 * **0** — clean.  A scoped run says ``partial``, and a run with no baseline yet
   says ``advisory``; both are green, and the label says which green it is.
 * **1** — violations, one per line: site, kind, codes, the reason, and the
-  accepted forms.  A refusal to act is still 1.
-* **2** — instrument failure.  A file that cannot be read or tokenized, a
-  baseline that exists but cannot be compared against, a config key this model
-  does not implement, or a missing import.  Never a finding.
+  accepted forms.
+* **2** — instrument failure or a refusal to act.  A file that cannot be read
+  or tokenized, a baseline that exists but cannot be compared against, a config
+  key this model does not implement, a missing import, a scope that matches no
+  tracked file, a scoped ``--seed`` or ``--tighten``, or ``--seed`` over an
+  existing baseline.  Never a finding.
 
 **What it deliberately does NOT do.**
 
@@ -365,7 +367,7 @@ KIND_SPECS: MappingProxyType[Kind, KindSpec] = MappingProxyType(
         ),
     }
 )
-"""The one table the prefilter, the token scan and the consumer model all read.
+"""The one table the prefilter and the token scan read.
 
 SPOT (heuristic 11), and the PRD's named extension point: ``pytest.mark.skip`` /
 ``xfail`` and ``shellcheck disable`` are out of scope for this batch and are
@@ -1994,10 +1996,12 @@ _EPILOG = """exit codes:
   0  clean. A scoped run says `partial`; a run with no baseline yet says
      `advisory`. All three are green, and the label says which green it is.
   1  violations, one per line on stderr: site, kind, codes, the reason and the
-     accepted disposition forms. A refusal to act is still 1.
-  2  instrument failure -- a file that could not be read or tokenized, a
-     baseline that exists but cannot be compared against, a config key this
-     model does not implement, or a missing import. Never a finding.
+     accepted disposition forms.
+  2  instrument failure or a refusal to act -- a file that could not be read
+     or tokenized, a baseline that exists but cannot be compared against, a
+     config key this model does not implement, a missing import, a scope that
+     matches no tracked file, a scoped --seed or --tighten, or --seed over an
+     existing baseline. Never a finding.
 """
 
 
