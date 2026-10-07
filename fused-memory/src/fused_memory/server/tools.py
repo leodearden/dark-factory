@@ -86,6 +86,9 @@ from fused_memory.reconciliation.citation_verifier import (
     is_concrete_memory_id,
     repoint_task_citations,
 )
+from fused_memory.reconciliation.flag_record_contract import (
+    recon_stage_flag_kind_refusal,
+)
 from fused_memory.reconciliation.mem0_tombstone import (
     record_mem0_deletion_tombstones,
 )
@@ -1501,13 +1504,21 @@ def create_mcp_server(
         'valid_at timestamps instead of one write describing both the prior and '
         'resulting task status'
     )
-    # Remediation hint returned alongside flag_marker_write_blocked (task 2596):
-    # stage1_flag_marker records are code-managed via the recon_ledger (task
-    # 2406 UPSERT-only path) — no legitimate add_memory call should persist one.
-    _FLAG_MARKER_WRITE_HINT = (
-        'stage1_flag_marker persistence is code-managed via the recon_ledger; '
-        'add_memory is not a valid write path for it'
-    )
+
+    def _flag_kind_refusal_block(
+        agent_id: str | None, content: str, metadata: object
+    ) -> dict[str, Any] | None:
+        refusal = recon_stage_flag_kind_refusal(agent_id, metadata)
+        if refusal is None:
+            return None
+        return {
+            'error': refusal.error,
+            'error_type': refusal.error_type,
+            'agent_id': agent_id,
+            'content_excerpt': content[:200],
+            'hint': refusal.hint,
+        }
+
     # Remediation hint returned alongside live_task_status_current_fact_write_blocked
     # (task 2628, Stage-1 reify finding 82c8a42a) so a blocked recon-stage agent can
     # self-correct instead of guessing why a liveness/status snapshot was rejected.
@@ -3590,22 +3601,8 @@ def create_mcp_server(
                     'conflicting_task_ids': sorted(conflicting_task_ids),
                     'hint': _CONFLICTING_TASK_STATUS_HINT,
                 }
-        if (
-            isinstance(agent_id, str)
-            and agent_id.startswith('recon-stage-')
-            and isinstance(metadata, dict)
-            and (
-                metadata.get('source') == 'stage1_flag_marker'
-                or metadata.get('kind') == 'stage1_flag_marker'
-            )
-        ):
-            return {
-                'error': 'flag_marker_write_blocked',
-                'error_type': 'ReconFlagMarkerWriteRejected',
-                'agent_id': agent_id,
-                'content_excerpt': content[:200],
-                'hint': _FLAG_MARKER_WRITE_HINT,
-            }
+        if (block := _flag_kind_refusal_block(agent_id, content, metadata)) is not None:
+            return block
         if (
             category in _LIVE_STATUS_GATED_CATEGORIES
             and isinstance(agent_id, str)
@@ -4123,6 +4120,8 @@ def create_mcp_server(
                 ),
                 'error_type': 'ValidationError',
             }
+        if (block := _flag_kind_refusal_block(agent_id, content, metadata)) is not None:
+            return block
         # LOAD-BEARING, unlike add_episode's defensive strip above: this tool
         # FORWARDS the cleaned metadata to the store (`metadata=cleaned_meta`
         # below), so without this the write-time control flag is persisted into

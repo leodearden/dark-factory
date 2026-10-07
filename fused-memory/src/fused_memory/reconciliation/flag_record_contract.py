@@ -75,7 +75,7 @@ RECON_STAGE_FLAG_KIND_REFUSALS: Final[Mapping[str, FlagKindRefusal]] = MappingPr
         error_type='ReconFlagMarkerWriteRejected',
         hint=(
             'stage1_flag_marker persistence is code-managed via the recon_ledger; '
-            'add_memory is not a valid write path for it'
+            'add_memory and add_system_record are not valid write paths for it'
         ),
     ),
     STAGE1_FLAG_SUPPRESSION_KIND: FlagKindRefusal(
