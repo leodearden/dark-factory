@@ -12,6 +12,7 @@ Argument wiring and live dependencies only; every behaviour lives in
   parity-check   client-class parity deltas between two complete runs
   control-check  symmetry, code sha, token/cost and reference checks over control runs
   preregister    the pre-registration inputs (margins, envelope, call profile) of a control pair
+  screen         η's screening verdict over one sweep's evidence root (offline post-processing)
   topology       a scratch graph's node/edge counts and topology hash
   teardown       delete the arm's scratch graph and, with --collection, its replica
 
@@ -67,6 +68,7 @@ from fused_memory.arm_harness.preregistration import (
     PreregistrationError,
     PreregistrationInputs,
     derive_preregistration_inputs,
+    load_preregistration_inputs,
     serialize_preregistration_inputs,
 )
 from fused_memory.arm_harness.replay import ArmGraph, ReplayJournal
@@ -90,6 +92,17 @@ from fused_memory.arm_harness.scratch_guard import (
     ScratchGuardError,
     require_scratch_name,
 )
+from fused_memory.arm_harness.screening import (
+    ScreeningVerdict,
+    derive_screening_verdict,
+    serialize_screening_verdict,
+)
+from fused_memory.arm_harness.screening_evidence import (
+    ArmEvidencePaths,
+    ScreeningEvidenceError,
+    load_arm_evidence,
+)
+from fused_memory.arm_harness.slate import SlateArm, load_llm_slate
 from fused_memory.arm_harness.teardown import CollectionClient, teardown_arm
 from fused_memory.arm_harness.topology import (
     IntegrityVerdict,
@@ -309,7 +322,7 @@ def _fresh_output(path: Path) -> Path:
     if path.exists():
         raise _Refusal(
             EXIT_REFUSED,
-            f'{path} already exists; pre-registered inputs are never overwritten, so write '
+            f'{path} already exists; derived artifacts are never overwritten, so write '
             'to a new path',
         )
     return path
@@ -491,6 +504,53 @@ def _print_preregistration(inputs: PreregistrationInputs) -> None:
     )
 
 
+def _cmd_screen(args: argparse.Namespace, deps: DepsFactory) -> int:
+    out = _fresh_output(args.out)
+    slate = _read_slate(args.arms_manifest)
+    evidence = {
+        arm.arm_id: load_arm_evidence(ArmEvidencePaths(args.evidence_root, arm.arm_id), arm)
+        for arm in slate
+    }
+    verdict = derive_screening_verdict(
+        slate,
+        evidence,
+        _read_preregistration_inputs(args.preregistration_inputs),
+        _read_outcomes(args.reference_outcomes),
+    )
+    atomic_write_text(out, serialize_screening_verdict(verdict), mkdir=True)
+    _print_screening(verdict)
+    print(f'wrote: {out}')
+    return EXIT_OK
+
+
+def _read_slate(path: Path) -> tuple[SlateArm, ...]:
+    try:
+        return load_llm_slate(path)
+    except (OSError, ValueError, LookupError, TypeError) as error:
+        raise _Refusal(EXIT_REFUSED, f'{path} is not a readable arms manifest: {error}') from error
+
+
+def _read_preregistration_inputs(path: Path) -> PreregistrationInputs:
+    try:
+        return load_preregistration_inputs(path)
+    except (OSError, ValueError) as error:
+        raise _Refusal(
+            EXIT_REFUSED, f'{path} is not a readable preregistration-inputs file: {error}'
+        ) from error
+
+
+def _print_screening(verdict: ScreeningVerdict) -> None:
+    for arm in verdict.arms:
+        for gate in arm.gates:
+            unit = f' ({gate.unit.value})' if gate.unit else ''
+            print(
+                f'gate {arm.arm_id} {gate.gate.value}: {gate.verdict.value} value {gate.value} '
+                f'bound {gate.bound} margin {gate.margin}{unit}'
+            )
+    print(f'survivors: {", ".join(verdict.survivors) or "none"}')
+    print(f'outcome: {verdict.outcome.value}')
+
+
 def _cmd_topology(args: argparse.Namespace, deps: DepsFactory) -> int:
     require_scratch_name(args.graph, checkpoint=GuardCheckpoint.TOPOLOGY_READ)
     topology = asyncio.run(_topology(deps(), args.graph))
@@ -603,6 +663,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     preregister.set_defaults(handler=_cmd_preregister)
 
+    screen = commands.add_parser(
+        'screen', help="derive η's screening verdict from a sweep's evidence root (offline)"
+    )
+    screen.add_argument('--evidence-root', type=Path, required=True, help="screen_slate's root")
+    screen.add_argument(
+        '--arms-manifest', type=Path, required=True, help='the arms.yaml the slate is read from'
+    )
+    screen.add_argument(
+        '--preregistration-inputs', type=Path, required=True, help="ζ's committed inputs"
+    )
+    screen.add_argument(
+        '--reference-outcomes', type=Path, required=True, help="control A's outcomes.jsonl"
+    )
+    screen.add_argument(
+        '--out', type=Path, required=True, help='the verdict JSON to write; never overwritten'
+    )
+    screen.set_defaults(handler=_cmd_screen)
+
     topology = commands.add_parser('topology', help="a scratch graph's topology hash")
     topology.add_argument('--graph', required=True, help='scratch graph name')
     topology.set_defaults(handler=_cmd_topology)
@@ -641,6 +719,7 @@ def main(argv: list[str] | None = None, *, deps: DepsFactory = build_live_deps) 
         PreregistrationError,
         MarginDerivationError,
         TokenAccountingError,
+        ScreeningEvidenceError,
     ) as error:
         return _report(EXIT_REFUSED, _named(error))
     except (CorpusIntegrityError, build_corpus.CorpusBuildError) as error:
