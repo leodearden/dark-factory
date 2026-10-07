@@ -631,6 +631,50 @@ class LaneLifecycle:
             f'refusing to re-key it to task {task_id!r}'
         )
 
+    def note_in_use(self, lane: Path | str) -> bool:
+        """Best-effort ``ASSIGNED -> IN_USE``: a dark-factory child is live in *lane*.
+
+        Returns True when the record reads IN_USE afterwards; one already
+        IN_USE is a success with no write. Any other state (a benign race,
+        e.g. the lane was released while a child was finishing), a corrupt
+        record, or a failed write returns False. Never raises: unlike
+        ``note_assigned``, which propagates, a liveness marker must never
+        abort the caller that is spawning the child.
+        """
+        rec = self.read(lane)
+        if rec is not None and rec.state is LaneState.IN_USE:
+            return True
+        return self._best_effort_step(lane, rec, LaneState.ASSIGNED, LaneState.IN_USE)
+
+    def note_idle(self, lane: Path | str) -> bool:
+        """Best-effort ``IN_USE -> ASSIGNED``: the last live child left *lane*.
+
+        Same never-raise contract as ``note_in_use``; a record in any state
+        other than IN_USE is left alone and False returned.
+        """
+        rec = self.read(lane)
+        return self._best_effort_step(lane, rec, LaneState.IN_USE, LaneState.ASSIGNED)
+
+    def _best_effort_step(
+        self, lane: Path | str, rec: LaneRecord | None, origin: LaneState, to: LaneState,
+    ) -> bool:
+        lane_name = Path(lane).name
+        if rec is None or rec.state is not origin:
+            logger.debug(
+                'lane_lifecycle: lane %s is not %s (record: %s); not marking it %s',
+                lane_name, origin.value, rec, to.value,
+            )
+            return False
+        try:
+            self.transition(lane, to)
+        except (IllegalLaneTransition, OSError):
+            logger.warning(
+                'lane_lifecycle: failed to mark lane %s %s (task_id=%s)',
+                lane_name, to.value, rec.task_id, exc_info=True,
+            )
+            return False
+        return True
+
     def pool_storage_present(self) -> bool:
         """True iff worktree_base is backed by live pool storage (task 2099).
 
