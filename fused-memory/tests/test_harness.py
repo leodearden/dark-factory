@@ -6678,7 +6678,9 @@ async def test_run_full_cycle_capped_deferral_survives_failing_bookkeeping(
         result = await harness.run_full_cycle('test-project', 'buffer_size:1')
 
     assert result.status == RunStatus.failed
-    assert result.stage_reports['_error']['deferred'] is True
+    err = result.stage_reports['_error']
+    assert isinstance(err, dict)
+    assert err['deferred'] is True
     [row] = await journal.get_recent_runs('test-project', limit=1)
     _assert_one_classified_failure_line(
         caplog, failed_write_prefix,
