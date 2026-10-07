@@ -640,25 +640,31 @@ def test_two_kinds_on_one_line_are_two_distinct_keys():
     }
 
 
-def test_a_rendered_key_is_a_string_and_the_interface_offers_no_way_back():
-    """``render()`` exists because JSON object keys are strings by the
-    format's definition; a reader that parsed one back would not.
+def test_a_rendered_key_is_a_string_that_no_other_key_shares():
+    """THE RENDERING CONTRACT ``SuppressionKey.render`` states.
 
-    ``shared.ratchet`` treats every key as an opaque identity token, so an
-    inverse would be exactly the ad-hoc parser of an internal value heuristic
-    12 forbids — and it would quietly make the rendering a wire format that
-    could never be changed again.  Pinned as an INTERFACE assertion: the public
-    surface of the key is its three fields and ``render``, nothing else.
+    A string, because JSON object keys are strings by the format's definition.
+    Distinct for two keys that differ only in their digest, because the digest
+    IS the line's identity and the unowned multiset the ratchet compares is
+    keyed by the rendering, so one that dropped it would merge two different
+    lines into one count.  And never
+    spelled like a ratified class key, so a reader cannot take one for the
+    other: the ``@`` that separates a class key's scope is checked present in a
+    real ``SuppressionClass`` rendering and absent from this one, so a change to
+    the separator on either side breaks this test.
     """
     key = inline_suppressions.key_for(_sites('a = 1  # noqa: E402')[0])
+    kind = inline_suppressions.Kind.NOQA
+    one = inline_suppressions.SuppressionKey(kind=kind, codes=('E402',), digest='abcdef012345')
+    other = inline_suppressions.SuppressionKey(kind=kind, codes=('E402',), digest='543210fedcba')
+    class_key = inline_suppressions.SuppressionClass(
+        kind=kind, code='E402', scope=inline_suppressions.Scope.ANY
+    )
 
     assert isinstance(key.render(), str)
-    assert {name for name in dir(key) if not name.startswith('_')} == {
-        'kind',
-        'codes',
-        'digest',
-        'render',
-    }
+    assert one.render() != other.render()
+    assert '@' in class_key.render()
+    assert '@' not in key.render()
 
 
 # ---------------------------------------------------------------------------
