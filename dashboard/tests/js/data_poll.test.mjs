@@ -15,7 +15,7 @@
 // target module body runs BEFORE the importing file's own body — so
 // `globalThis.window` would still be unset when data.js's top level runs,
 // throwing `ReferenceError: window is not defined`. Every test in this file
-// therefore goes through the `loadDataJs()` helper below, which shims
+// therefore goes through `_data_loader.mjs::loadDataJs()`, which shims
 // `globalThis.window` FIRST and only then loads the module via
 // `createRequire(import.meta.url)` (mirrors runtime_format.test.mjs:33-45).
 //
@@ -24,7 +24,7 @@
 // before even reaching the interval; but even with window/fetch shimmed it
 // would fire real (stubbed) fetches and leave a live timer holding the
 // process open — hanging `node --test`. loadDataJs() defends against that
-// unconditionally (see its comment below) so this suite can safely run
+// unconditionally (see its comment there) so this suite can safely run
 // against pre-seam data.js too, which is what step-1's RED depends on.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -39,10 +39,10 @@ import { fileURLToPath } from 'node:url';
 // browser global at load; its window assignment is typeof-guarded).
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
 
+import { loadDataJs, drain } from './_data_loader.mjs';
+
 const { staleNoticesForTab } = staleness;
 
-const MODULE_SPECIFIER = '../../src/dashboard/static/redux/data.js';
-const DATUM_MODULE_SPECIFIER = '../../src/dashboard/static/redux/datum.js';
 const EXPECTED_FUNCTION_NAMES = [
   'endpointsFor',
   'applyKey',
@@ -130,81 +130,6 @@ const SERVED_DATUM = Object.freeze({
   reason: 'window truncated at 500 rows',
   freshness_bound_seconds: 60,
 });
-
-// Loads data.js fresh against a shimmed browser-ish global. Installs
-// `globalThis.window` (a bare object recording dispatched events) and a
-// counting `globalThis.fetch` BEFORE requiring, then busts the require
-// cache so each call re-executes data.js's module body from scratch — the
-// module body only runs once per require otherwise, which would leave later
-// callers seeing a stale `window.DF_DATA` / stale flow-control singleton
-// from a previous test's shim (mirrors runtime_format.test.mjs:33-49).
-//
-// Deliberately does NOT set `globalThis.document`: index.html loads data.js
-// as a classic script where `document` always exists, but every test in
-// this file runs under node, so the auto-start guard must see no `document`
-// and stay inert, exactly like the real non-browser (node --test)
-// environment.
-//
-// Also wraps `globalThis.setInterval` for the duration of the require and
-// clears any interval it captures before returning. This is defensive
-// rather than load-bearing for the seamed implementation (which gates
-// auto-start on `document` and never calls setInterval here at all), but it
-// means step-1's RED run — against pre-seam data.js, which calls
-// setInterval unconditionally — cannot hang node --test: the interval is
-// recorded (so the "no live timer" assertion still fails honestly) and then
-// cleared immediately, regardless of what the caller asserts.
-function loadDataJs({ fetchStub } = {}) {
-  const events = [];
-  const fetchCalls = [];
-  const intervalCalls = [];
-  // DF_ENDPOINT_STALENESS is installed for datum.js, which destructures
-  // formatAge off it at module scope; datum.js is then loaded through the same
-  // shim so it can publish DF_DATUM, which data.js in turn destructures at
-  // module scope. index.html gives them exactly this order —
-  // endpoint_staleness.js -> datum.js -> data.js — and test_index_html.py pins
-  // both edges.
-  const win = { dispatchEvent: ev => events.push(ev), DF_ENDPOINT_STALENESS: staleness };
-  globalThis.window = win;
-  globalThis.fetch = (url, init) => {
-    fetchCalls.push({ url, init });
-    if (fetchStub) return fetchStub(url, init);
-    return Promise.resolve({ ok: true, json: async () => ({}) });
-  };
-
-  const require = createRequire(import.meta.url);
-  const datumResolved = require.resolve(DATUM_MODULE_SPECIFIER);
-  delete require.cache[datumResolved];
-  require(DATUM_MODULE_SPECIFIER);
-  const resolved = require.resolve(MODULE_SPECIFIER);
-  delete require.cache[resolved];
-
-  const originalSetInterval = globalThis.setInterval;
-  globalThis.setInterval = (...args) => {
-    const handle = originalSetInterval(...args);
-    intervalCalls.push(handle);
-    return handle;
-  };
-
-  let api;
-  try {
-    api = require(MODULE_SPECIFIER);
-  } finally {
-    globalThis.setInterval = originalSetInterval;
-    for (const handle of intervalCalls) clearInterval(handle);
-  }
-
-  return { api, window: win, events, fetchCalls, intervalCalls };
-}
-
-// Resolves after the entire pending microtask queue has drained (node
-// always fully drains microtasks before running the next macrotask/
-// immediate), regardless of how many .then()/await hops a chain needs — so
-// awaiting this once after a pollTick() call is enough to let every
-// non-held endpoint's fetch -> resp.json() -> applyKey chain run to
-// completion before the next tick fires.
-function drain() {
-  return new Promise(resolve => setImmediate(resolve));
-}
 
 // Pure, state-free — reused below so the test fixtures assert against
 // data.js's own key derivation rather than a hand-copied duplicate of the
@@ -965,37 +890,13 @@ test('jitter: passing jitterMaxMs: 0 issues no sleep at all', async () => {
 
 // ---------------------------------------------------------------------------
 // Preserved-behaviour contract — pins the things the task explicitly says
-// NOT to break: __DF_PAUSE, keep-prior-values-on-failure, applyKey
-// reference stability, the per-cycle df-data-refresh dispatch (including a
-// cycle where every endpoint got skipped), and the ?window= URL shape with
-// its path-keyed flow-control state. A later refactor cannot quietly drop
-// any of these without one of the tests below going red.
+// NOT to break: keep-prior-values-on-failure, applyKey reference stability,
+// the per-cycle df-data-refresh dispatch (including a cycle where every
+// endpoint got skipped), and the ?window= URL shape with its path-keyed
+// flow-control state. A later refactor cannot quietly drop any of these
+// without one of the tests below going red. __DF_PAUSE has its own file,
+// data_pause.test.mjs.
 // ---------------------------------------------------------------------------
-
-test('preserved behaviour: window.__DF_PAUSE = true stops pollTick from fetching; false resumes on the next tick', async () => {
-  const callCount = new Map();
-  const fetchImpl = url => {
-    const path = pollKey(url);
-    callCount.set(path, (callCount.get(path) || 0) + 1);
-    return Promise.resolve({ ok: true, json: async () => ({}) });
-  };
-  const { api, window: win } = loadDataJs({ fetchStub: fetchImpl });
-  const opts = { state: api.createPollState(), deps: { fetchImpl }, jitterMaxMs: 0 };
-
-  win.__DF_PAUSE = true;
-  api.pollTick(opts);
-  await drain();
-  assert.equal(callCount.size, 0, 'pollTick must issue zero fetches while __DF_PAUSE is true');
-
-  win.__DF_PAUSE = false;
-  api.pollTick(opts);
-  await drain();
-  assert.equal(
-    callCount.get(FLAKY_ENDPOINT_PATH),
-    1,
-    'pollTick must resume fetching once __DF_PAUSE is set back to false, on the very next tick',
-  );
-});
 
 test('preserved behaviour: a thrown fetch error keeps the prior DF_DATA value and still warns', async () => {
   const { api, window: win } = loadDataJs();

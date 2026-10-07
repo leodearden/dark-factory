@@ -149,14 +149,18 @@ def _orchestrator_queue(root: Path) -> QueueRef:
     )
 
 
-def corpus_queues(config: DashboardConfig) -> tuple[QueueRef, ...]:
-    """Every escalation queue: the primary root, the other known roots, reconciliation."""
-    roots = dict.fromkeys([config.project_root, *config.known_project_roots])
-    reconciliation = QueueRef(
+def reconciliation_queue(config: DashboardConfig) -> QueueRef:
+    """The fused-memory reconciliation queue, the one memory-eval regressions are filed onto."""
+    return QueueRef(
         id='reconciliation', label='fused-memory', kind=QueueKind.RECONCILIATION,
         directory=config.reconciliation_escalations_dir, runs_db=None,
     )
-    return (*(_orchestrator_queue(root) for root in roots), reconciliation)
+
+
+def corpus_queues(config: DashboardConfig) -> tuple[QueueRef, ...]:
+    """Every escalation queue: the primary root, the other known roots, reconciliation."""
+    roots = dict.fromkeys([config.project_root, *config.known_project_roots])
+    return (*(_orchestrator_queue(root) for root in roots), reconciliation_queue(config))
 
 
 def _scan(queue: QueueRef) -> QueueScan:

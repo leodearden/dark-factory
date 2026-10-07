@@ -27,6 +27,11 @@ const {
   windowedClassSplit,
   taskCard,
 } = window.DF_ESCALATION_VIEWS;
+// The cross-tab focus lookup, keyed on (queue, id) — escalation_focus.js.
+const { findEscalationRow } = window.DF_ESCALATION_FOCUS;
+// The persisted UI-preference hooks — persisted_state.js.
+const { createPersistedHooks } = window.DF_PERSISTED_STATE;
+const { usePersistedState, useOpenSet } = createPersistedHooks(React);
 
 // Every number this tab renders arrives on one endpoint, and the path is the
 // lookup key into DF_DATA.__receipt (data.js keys one receipt per polled
@@ -70,59 +75,7 @@ function escalationsLoaded() {
   return !!(DF.__loaded && DF.__loaded.ESCALATIONS);
 }
 
-function findEscalationRow(escalations, id) {
-  for (const sub of (escalations.subsections || [])) {
-    for (const row of (sub.escalations || [])) {
-      if (row.id === id) return row;
-    }
-  }
-  return null;
-}
-
-// ── Local helpers (tabs.jsx-compatible copies; not exported from any namespace) ──
-
-function useOpenSet(ids, defaultOpen = true, storageKey = null) {
-  const [openMap, setOpenMap] = uS(() => {
-    let stored = {};
-    if (storageKey) {
-      try { stored = JSON.parse(localStorage.getItem(storageKey) || '{}') || {}; } catch (e) {}
-    }
-    const init = {};
-    for (const id of ids) init[id] = id in stored ? !!stored[id] : defaultOpen;
-    return init;
-  });
-  // Backfill ids that arrive after mount (ESCALATIONS.subsections starts [] and
-  // is populated by the first poll, so groups would otherwise render collapsed).
-  const idsKey = ids.join('\0');
-  uE(() => {
-    setOpenMap(m => {
-      let patch = null;
-      for (const id of ids) {
-        if (!(id in m)) { if (!patch) patch = {}; patch[id] = defaultOpen; }
-      }
-      return patch ? { ...m, ...patch } : m;
-    });
-  }, [idsKey]); // eslint-disable-line react-hooks/exhaustive-deps
-  uE(() => {
-    if (storageKey) {
-      try { localStorage.setItem(storageKey, JSON.stringify(openMap)); } catch (e) {}
-    }
-  }, [storageKey, openMap]);
-  const toggle = id => setOpenMap(m => ({ ...m, [id]: !m[id] }));
-  const setAll = v => setOpenMap(Object.fromEntries(ids.map(id => [id, v])));
-  return [openMap, toggle, setAll];
-}
-
-function usePersistedState(storageKey, defaultValue) {
-  const [v, setV] = uS(() => {
-    try {
-      const raw = localStorage.getItem(storageKey);
-      return raw === null ? defaultValue : JSON.parse(raw);
-    } catch (e) { return defaultValue; }
-  });
-  uE(() => { try { localStorage.setItem(storageKey, JSON.stringify(v)); } catch (e) {} }, [storageKey, v]);
-  return [v, setV];
-}
+// ── Local helpers (a tabs.jsx-compatible copy; not exported from any namespace) ──
 
 function GroupAllToggle({ allOpen, onSetAll }) {
   return (
@@ -393,7 +346,7 @@ function EscalationStatStrip({ analytics, projectFilter }) {
 
 // ── EscalationsTab ──
 
-function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
+function EscalationsTab({ projectFilter, focus, onFocusConsumed }) {
   // ESC_EMPTY is hoisted to module scope; see the note at its declaration.
   // Note it is NOT a "loaded" signal: arrival is read from data.js's
   // first-success marker (escalationsLoaded), so falling back to this
@@ -461,13 +414,16 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
   // A focus id that matched no row. Held rather than dropped: the operator
   // clicked a link and is owed an answer either way.
   const [focusMiss, setFocusMiss] = uS(null);
+  // A focus that matched more than one row of its queue: `{id, count}`. The
+  // lookup never elects one, so this opens nothing and says why.
+  const [focusAmbiguous, setFocusAmbiguous] = uS(null);
 
   // Cross-tab focus handoff (from the memory-eval escalation links in
-  // tab_memory_evals.jsx, lifted through app.jsx). Search every subsection for
-  // the row and open the existing detail sidebar with it.
+  // tab_memory_evals.jsx, lifted through app.jsx). Resolve the `{queue, id}`
+  // focus to a row and open the existing detail sidebar with it.
   //
   // The focus is consumed once a DECISION is REACHABLE, never before. Keyed on
-  // `escalations` as well as `focusId`: while the payload is still the pre-fetch
+  // `escalations` as well as `focus`: while the payload is still the pre-fetch
   // seed the effect declines to decide, and the dep's per-poll identity change
   // (applyKey replaces the reference) is what re-runs it — so a cold load, or an
   // endpoint in backoff, no longer silently eats the focus.
@@ -478,13 +434,16 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
   // reopen a stale drawer on every later visit to this tab — but it is now
   // recorded and rendered rather than dropped in silence.
   uE(() => {
-    if (!focusId) return;
+    if (!focus) return;
     if (!escalationsLoaded()) return;
-    const found = findEscalationRow(escalations, focusId);
-    if (found) { setSelected(found); setFocusMiss(null); }
-    else { setFocusMiss(focusId); }
+    const found = findEscalationRow(escalations, focus);
+    if (found.row) { setSelected(found.row); setFocusMiss(null); setFocusAmbiguous(null); }
+    else if (found.candidates.length > 1) {
+      setFocusAmbiguous({ id: focus.id, count: found.candidates.length });
+      setFocusMiss(null);
+    } else { setFocusMiss(focus.id); setFocusAmbiguous(null); }
     if (onFocusConsumed) onFocusConsumed();
-  }, [focusId, escalations]);
+  }, [focus, escalations]);
 
   // Global summary from top-level data
   const gs = escalations.summary || {};
@@ -495,15 +454,15 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
     <div style={{ position: 'relative' }}>
       <EscalationStatStrip analytics={DF.ESCALATION_ANALYTICS} projectFilter={projectFilter} />
 
-      {/* Cross-tab focus feedback. Two states, not one: a click that lands
-          before the escalations payload does is WAITING, not a miss, and
-          saying "no longer in the queue" while the endpoint is still in
-          backoff would be a false claim. Both name the id, so the operator
-          can see which link they followed. */}
-      {focusId && !escalationsLoaded() && (
+      {/* Cross-tab focus feedback. A click that lands before the escalations
+          payload does is WAITING, not a miss, and saying "no longer in the
+          queue" while the endpoint is still in backoff would be a false
+          claim. A tie opens nothing rather than guessing. Each notice names
+          the id, so the operator can see which link they followed. */}
+      {focus && !escalationsLoaded() && (
         <div className="badge" data-testid="esc-focus-pending" style={{ marginBottom: 8 }}>
           waiting for the escalation queue to load — will open{' '}
-          <span className="mono">{focusId}</span> when it arrives
+          <span className="mono">{focus.id}</span> when it arrives
         </div>
       )}
       {focusMiss && (
@@ -515,6 +474,20 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
             className="chip"
             style={{ marginLeft: 8 }}
             onClick={() => setFocusMiss(null)}
+          >
+            dismiss
+          </button>
+        </div>
+      )}
+      {focusAmbiguous && (
+        <div className="badge warn" data-testid="esc-focus-ambiguous" style={{ marginBottom: 8 }}>
+          <span className="mono">{focusAmbiguous.id}</span> matches {focusAmbiguous.count} rows
+          in its queue — none was opened
+          <button
+            type="button"
+            className="chip"
+            style={{ marginLeft: 8 }}
+            onClick={() => setFocusAmbiguous(null)}
           >
             dismiss
           </button>

@@ -278,6 +278,7 @@ window.DF_DATA = {
     issues: [],
     issue_count: 0,
     unmatched_escalations: [],
+    escalation_queue: null,
   },
   // Per-key FIRST-SUCCESS markers: `__loaded[KEY]` flips true the first time a
   // real server value for that key is applied, and never back.
@@ -293,9 +294,10 @@ window.DF_DATA = {
   // this file: a `type="text/babel"` module is transpiled and evaluated after
   // DOMContentLoaded, while startPolling()'s immediate first fetch can resolve
   // BEFORE that — freezing a REAL payload as the "seed", and never unfreezing
-  // it while polling is paused (`__DF_PAUSE` skips every later pollTick) or the
-  // endpoint sits in backoff.  A consumer keyed on that comparison then claims
-  // "still loading" over a fully-populated table, indefinitely.
+  // it while polling is paused (`__DF_PAUSE` skips every later poll-set
+  // refresh) or the endpoint sits in backoff.  A consumer keyed on that
+  // comparison then claims "still loading" over a fully-populated table,
+  // indefinitely.
   //
   // Nested under DF_DATA rather than added as a second global so a consumer
   // holding `const DF = window.DF_DATA` reads it with no new capture.  It is
@@ -415,8 +417,8 @@ function datumFor(key) {
 
 // Flow-control state is keyed by endpoint PATH (query string stripped): four
 // of the 13 endpoints carry ?window=<chip>, whose URL changes on every chip
-// click (app.jsx:71 -> DF_REFRESH(win)). URL-keyed state would create a
-// fresh entry on every chip change, silently resetting the in-flight flag
+// click (app.jsx's [win] effect -> DF_REFRESH(win)). URL-keyed state would
+// create a fresh entry on every chip change, silently resetting the in-flight flag
 // (and, once backoff lands, its deadline) for those four endpoints.
 function pollKey(url) {
   return url.split('?')[0];
@@ -777,8 +779,9 @@ const DEFAULT_POLL_DEPS = {
 // Polls pollSetFor(currentTab, currentWin) — every endpoint until app.jsx
 // names a tab; see currentTab.
 //
-// A chip change (explicit non-empty `win`, app.jsx:71) bypasses backoff ONLY
-// for the windowed endpoints whose URL actually changes on that chip click —
+// A chip change (explicit non-empty `win`, from app.jsx's [win] effect)
+// bypasses backoff ONLY for the windowed endpoints whose URL actually changes
+// on that chip click —
 // every other endpoint has no bearing on the chip and must keep respecting
 // whatever backoff the TIMER path already accumulated for it, otherwise a chip
 // click during an outage would re-hammer every endpoint, recreating exactly
@@ -789,6 +792,9 @@ const DEFAULT_POLL_DEPS = {
 // check in refreshOne is unconditional regardless of ignoreBackoff, so a chip
 // change still cannot stack a second concurrent request for an endpoint
 // that's already running.
+//
+// While __DF_PAUSE is set a chip change fetches nothing (see refreshPollSet);
+// the window is recorded first, so the first tick after resume fetches it.
 async function refreshDFData(win, opts) {
   const isChipChange = typeof win === 'string' && win;
   if (isChipChange) currentWin = win;
@@ -812,8 +818,12 @@ async function refreshDFData(win, opts) {
 // downgrade fetches nothing: the full payload already holds the census, and
 // the next tick polls the narrowed form. Backoff and the in-flight guard are
 // honoured, so tab clicks during an outage cannot re-hammer a failing
-// endpoint. It does not check __DF_PAUSE: a user action fetches even while
-// paused, as a chip change does, and only pollTick is paused.
+// endpoint.
+//
+// While __DF_PAUSE is set, no poll-set fetch runs: not the timer, a chip change
+// or a tab switch. The change is recorded, window_chip.js::pendingWindow shows
+// a chosen window as pending until it is served, and only requestOnDemand
+// still fetches.
 //
 // An unchanged tab, or one that needs nothing newly, fetches and dispatches
 // nothing.
@@ -841,7 +851,11 @@ function isNewlyNeeded(url, before) {
 // (including pollIntervalMs, which arms slowness pacing) and the per-endpoint
 // flow control have one copy. `ignoreBackoffFor(url)` says which urls a user
 // action may force past their backoff. Dispatches df-data-refresh once.
+//
+// The ONE consultation of __DF_PAUSE: while it is set this fetches and
+// dispatches nothing, whichever caller asked.
 async function refreshPollSet(pollSet, opts, ignoreBackoffFor) {
+  if (typeof window !== 'undefined' && window.__DF_PAUSE) return;
   const o = opts || {};
   const state = o.state || DF_POLL_STATE;
   const baseDeps = {
@@ -988,7 +1002,7 @@ const DF_POLL_STATE = createPollState();
 const POLL_INTERVAL_MS = 3000;
 
 function pollTick(opts) {
-  if (!window.__DF_PAUSE) refreshDFData(undefined, opts);
+  refreshDFData(undefined, opts);
 }
 
 function startPolling(opts) {

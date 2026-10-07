@@ -439,8 +439,8 @@ def test_tab_analytics_jsx_served_and_exports(_client) -> None:
     )
     # Fold state persisted with the correct key
     assert 'useOpenSet(' in tab_body, (
-        'EscalationAnalyticsTab does not call useOpenSet( — add the local copy of '
-        "useOpenSet from tab_escalations.jsx and call it with project ids and 'df.open.escanalytics'."
+        "EscalationAnalyticsTab does not call useOpenSet( — call persisted_state.js's "
+        "useOpenSet with project ids and 'df.open.escanalytics'."
     )
     assert "'df.open.escanalytics'" in tab_body, (
         "EscalationAnalyticsTab does not reference the localStorage key "

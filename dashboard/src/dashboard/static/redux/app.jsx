@@ -64,10 +64,11 @@ function noticeBannerStyle(edgeColor) {
 function App() {
   const [tab, setTab] = uS('overview');
   // Cross-tab handoff for the memory-eval escalation links. The SPA has no
-  // router, so navigation is a state lift: record which escalation to focus,
-  // switch tabs, and let EscalationsTab clear the focus once it has consumed it.
+  // router, so navigation is a state lift: record which escalation to focus, as
+  // a `{queue, id}` descriptor (ids are unique only within one queue), switch
+  // tabs, and let EscalationsTab clear the focus once it has consumed it.
   const [escFocus, setEscFocus] = uS(null);
-  const navigate = (t, focusId = null) => { setTab(t); setEscFocus(focusId); };
+  const navigate = (t, focus = null) => { setTab(t); setEscFocus(focus); };
   const [tw, setTw] = useTweaks ? useTweaks(TWEAK_DEFAULTS) : [TWEAK_DEFAULTS, () => {}];
 
   // Filter state — per tab
@@ -201,7 +202,7 @@ function App() {
       case 'merge':    return <MergeTab projectFilter={projects} />;
       case 'cost':     return <CostsTab projectFilter={projects} />;
       case 'burn':     return <BurnTab projectFilter={projects} displayWindow={win} />;
-      case 'esc':      return <EscalationsTab projectFilter={projects} focusId={escFocus} onFocusConsumed={() => setEscFocus(null)} />;
+      case 'esc':      return <EscalationsTab projectFilter={projects} focus={escFocus} onFocusConsumed={() => setEscFocus(null)} />;
       case 'esc-analytics': return <EscalationAnalyticsTab projectFilter={projects} />;
       default: return null;
     }

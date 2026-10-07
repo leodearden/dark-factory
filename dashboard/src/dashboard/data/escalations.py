@@ -11,8 +11,8 @@ the tab's queues and names the task each row's card needs.
   owning project via worktree-prefix matching or an active-row probe.
 - ``card_task_refs`` / ``card_datums`` — the task each row's card names, and
   each row's card as a ``Datum`` once those have been looked up.
-- ``load_queue_escalations`` — the older root-only ``*.json`` reader of one
-  queue directory.  Its one consumer is ``dashboard.data.memory_evals``.
+- ``load_queue_escalations`` — the older root-only ``esc-*.json`` reader of
+  one queue directory.  Its one consumer is ``dashboard.data.memory_evals``.
 - ``fetch_pins_recovery`` — the one ASYNC function here: fans
   ``get_pending_escalations`` out across every configured escalation MCP and
   returns each project's per-record ``pins_recovery`` annotation.
@@ -50,17 +50,18 @@ def load_queue_escalations(
 ) -> list[dict]:
     """Load all escalation JSON files from *esc_dir* (root only, no archive).
 
-    Only ``*.json`` files directly inside *esc_dir* are read — subdirectories
+    Only ``esc-*.json`` files directly inside *esc_dir* are read — subdirectories
     (including ``archive/YYYY-MM-DD/``) are **not** traversed.  This is an
     intentional divergence from :func:`escalation.queue.iter_all_escalation_paths`,
     which also walks the archive subtree.
 
-    The glob pattern ``*.json`` (not ``esc-*.json``) is used deliberately: the
-    task PRD specifies ``*.json``, and the escalation queue directory is
-    single-writer (only the EscalationQueue producer writes there), so stray
-    non-escalation JSON files are not expected.  Bad JSON is already skipped
-    and logged, so a non-escalation file with valid JSON would pass through
-    unchanged — an acceptable trade-off given the controlled write environment.
+    Only ``esc-*.json`` names an escalation.  The queue directory has other
+    residents: ``orchestrator/src/orchestrator/b3_gate.py::STATE_REL_PATH``
+    keeps ``b3-state.json`` there, and a ``*.json`` glob read it as an id-less
+    escalation.  :func:`escalation.queue.iter_all_escalation_paths`, and so the
+    corpus walk the Escalations tab reads, globs ``esc-*.json`` for the same
+    reason; ``plans/escalation-watcher-queue-ops-hardening-prd.md`` invariant D6
+    names protecting that file as why the glob is never widened.
 
     A missing or non-directory *esc_dir* returns ``[]`` without raising.
     A file that cannot be read or parsed as JSON is skipped with a ``WARNING``
@@ -99,7 +100,7 @@ def load_queue_escalations(
         return []
 
     results: list[dict] = []
-    for path in esc_dir.glob('*.json'):
+    for path in esc_dir.glob('esc-*.json'):
         try:
             results.append(json.loads(path.read_text()))
         except (json.JSONDecodeError, OSError) as exc:
