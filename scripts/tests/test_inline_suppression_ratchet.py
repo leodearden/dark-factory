@@ -2163,10 +2163,10 @@ def test_a_missing_shared_import_is_exit_two_and_never_exit_one(tmp_path: Path):
 LIVE_BASELINE = REPO_ROOT / 'scripts' / _BASELINE_NAME
 
 
-def _live_report(capsys) -> dict:
+def _live_report(capsys, *extra: str) -> dict:
     """The ``--json`` report for THIS repository."""
     capsys.readouterr()
-    code = inline_suppressions.main(['--json', '--root', str(REPO_ROOT)])
+    code = inline_suppressions.main(['--json', '--root', str(REPO_ROOT), *extra])
     captured = capsys.readouterr()
     assert code == 0, captured.err
     return json.loads(captured.out)
@@ -2201,6 +2201,33 @@ def test_the_live_tree_reports_the_signal_this_scanner_exists_to_produce(capsys)
     assert 'nosec' in report['kind_totals']
     assert report['consumers']['none'] > 0
     assert report['ruff_config'] != []
+
+
+def test_the_live_tree_carries_no_disposition_faults(tmp_path: Path, capsys):
+    """THE OTHER HALF OF THE GATE, and the half no baseline can ever grandfather.
+
+    ``_verdict`` reports ``classification.violations`` on the ADVISORY path too:
+    a marker that does not parse, or a disposition on a line that suppresses
+    nothing, is a fault at its site whatever a baseline holds.  The ratchet
+    grandfathers KEYS and a fault is not a key, so seeding at κ1 cannot turn one
+    green — which is why this test carries none of the seeded guard's skip, and
+    why it is not one more line in the non-vacuity floor above: a named red says
+    which of the two subjects broke.
+
+    The run is pinned ADVISORY by pointing it at a baseline that cannot exist,
+    so the violations it reports are exactly the disposition faults, before κ1
+    and after it alike, and never ratchet excess.
+    """
+    report = _live_report(capsys, '--baseline', str(tmp_path / _BASELINE_NAME))
+
+    assert report['status'] == 'advisory'
+    assert report['violations'] == [], (
+        'disposition fault(s) in this repository:\n  '
+        + '\n  '.join(f'{fault["path"]}:{fault["line"]}: {fault["reason"]}' for fault in report['violations'])
+        + '\nA disposition marker quoted inside a `#` comment is a permanent violation that no '
+        'disposition can cover. Quote example markers in a DOCSTRING or another string '
+        'literal, which this scanner deliberately does not read, and never in a `#` comment.'
+    )
 
 
 def test_the_live_scan_tokenizes_exactly_the_marker_bearing_files(capsys):
