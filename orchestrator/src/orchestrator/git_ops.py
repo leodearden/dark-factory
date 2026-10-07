@@ -4251,6 +4251,31 @@ class GitOps:
             # unsuppressed TypeError from fcntl.flock(None, ...).
             self._release_lane_flock(fd)
 
+    @contextlib.asynccontextmanager
+    async def lane_in_use(self, lane_dir: Path | None):
+        """Hold a warm lane's durable record at IN_USE while a dark-factory
+        child runs in it (leaf δ, task 3076).
+
+        This is only the span: the ASSIGNED <-> IN_USE edges, and their
+        never-raise contract, live in ``LaneLifecycle.note_in_use`` /
+        ``note_idle``. Observable as ``<worktree_base>/.lane-state/<lane>.json``
+        reading ``"state": "in_use"`` inside the block and ``"assigned"``
+        after it, however the block exits. A no-op for ``None``, a pool-less
+        GitOps, or a worktree that is not a pool lane. Unrelated to
+        :meth:`pool_in_use`, which asks whether a warm-lane pool is enabled.
+        Which spawn sites hold it: plans/warm-lane-infra-repatriation-prd.md
+        §11 q2.
+        """
+        pool = self.warm_lane_pool
+        if lane_dir is None or pool is None or not pool.is_lane(lane_dir):
+            yield
+            return
+        self._lane_lifecycle.note_in_use(lane_dir)
+        try:
+            yield
+        finally:
+            self._lane_lifecycle.note_idle(lane_dir)
+
     async def _is_registered_worktree(self, path: Path) -> bool:
         """Check if *path* is a registered git worktree.
 
