@@ -4318,11 +4318,11 @@ class VerifyAttempt:
             and all(c.rc == 0 or c.timed_out for c in self.checks)
         )
 
-    def _by_label(self, label: str) -> CheckRun:
-        found = next((c for c in self.checks if c.label == label), None)
+    def _by_label(self, slot: LegSlot) -> CheckRun:
+        found = next((c for c in self.checks if c.label == slot), None)
         if found is None:
             raise KeyError(
-                f'no check labeled {label!r} in {[c.label for c in self.checks]}'
+                f'no check labeled {slot.value!r} in {[str(c.label) for c in self.checks]}'
             )
         return found
 
