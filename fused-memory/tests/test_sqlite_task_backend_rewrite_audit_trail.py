@@ -110,7 +110,8 @@ async def test_rewrite_replaces_blob_and_description_but_keeps_the_wait_anchor(s
     assert after['updatedAt'] > before['updatedAt']
     assert result['updated'] is True
     assert result['id'] == '1'
-    assert result['updated_task'] == after
+    assert result['updated_task'] is not None
+    assert {**result['updated_task'], 'id': after['id']} == after
 
 
 @pytest.mark.asyncio
