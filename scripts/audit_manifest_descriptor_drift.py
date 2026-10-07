@@ -5,13 +5,13 @@
 sidecar does not declare (task -> sidecar).
 
 READ-ONLY / REPORT-ONLY, in both directions: this module and its CLI never
-mutate a task record or a manifest file. Every database connection it opens is
-a read-only SQLite URI (``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``),
-so the sweep is structurally incapable of writing to the live WAL database the
-running orchestrator holds open. Manifest YAML on disk is only ever read. There
-is no ``--apply`` flag and no MCP client is ever constructed. RESYNCING A
-DRIFTED SIDECAR, OR FIXING AN UNBOUND LABEL, IS A SEPARATE, REVIEWED EDIT —
-never done from this report by this script.
+mutate a task record or a manifest file. Its one database connection, to the
+task store, goes through ``_task_db_scan.py::connect_ro``, a read-only SQLite
+URI (``mode=ro``), so the sweep is structurally incapable of writing to the live
+WAL database the running orchestrator holds open. Manifest YAML on disk is only
+ever read. There is no ``--apply`` flag and no MCP client is ever constructed.
+RESYNCING A DRIFTED SIDECAR, OR FIXING AN UNBOUND LABEL, IS A SEPARATE,
+REVIEWED EDIT — never done from this report by this script.
 
 THE DRIFT DIRECTION (task 4545). ``metadata.delivered_checks`` is copied
 exactly ONE WAY, sidecar -> task record, at ``commit_planning``
@@ -78,7 +78,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -100,6 +99,7 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
+    connect_ro,
     decode_metadata,
     format_coverage_block,
     format_kv_line,
@@ -330,20 +330,14 @@ def load_task_store_scan(tasks_db_path: str) -> TaskStoreScan:
     no tag, so an unpinned query would let an unrelated same-id row from another
     tag masquerade as the producer.
 
-    Opens the database via a read-only URI (``mode=ro``) so the load is
-    structurally incapable of mutating live task records even while fused-memory
-    holds the same file open in WAL mode. Closed in a ``try/finally`` and never
-    a ``with`` block — a sqlite3 ``with`` is a TRANSACTION, not a close.
-
-    Its own open rather than :func:`_task_db_scan.connect_ro`, deliberately:
-    that helper raises ``TaskDbUnreadable``, which is not a ``sqlite3.Error`` —
-    the only exception :func:`_task_db_scan.sweep_project_roots` catches — so
-    adopting it would turn a skipped unreadable project into an aborted sweep.
+    Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
+    refusals). Closed in a ``try/finally`` and never a ``with`` block — a
+    sqlite3 ``with`` is a TRANSACTION, not a close.
     """
     row_ids: set[int] = set()
     delivered_checks: dict[int, dict[str, dict]] = {}
     bindings: list[ManifestBinding] = []
-    conn = sqlite3.connect(f"file:{tasks_db_path}?mode=ro", uri=True)
+    conn = connect_ro(tasks_db_path)
     try:
         cursor = conn.execute("SELECT id, status, metadata FROM tasks WHERE tag = 'master'")
         for task_id, status, metadata in cursor:
@@ -409,8 +403,8 @@ def _expected_meta(capability_name: str, check: object) -> dict:
     that are free to diverge, and an unguarded ``ValidationError`` here would
     escape :func:`audit_project` into
     :func:`_task_db_scan.sweep_project_roots`, which catches only
-    ``sqlite3.Error`` — aborting every REMAINING project root over one bad
-    sidecar. That is the exact fail-loud-but-fail-everything mode the
+    ``UNREADABLE_STORE_ERRORS`` — aborting every REMAINING project root over one
+    bad sidecar. That is the exact fail-loud-but-fail-everything mode the
     ``git_discovery_failed`` handling was written to avoid, so this degrades to
     a coverage row instead.
     """
@@ -717,12 +711,13 @@ def audit_project(project_root: str, manifest_root: str | None = None) -> Projec
     *manifest_root* defaults to *project_root*, so a single-checkout run and a
     multi-project sweep behave exactly as they would without the flag.
 
-    Raises ``sqlite3.Error`` for an unreadable task store, which
-    :func:`_task_db_scan.sweep_project_roots` turns into a warn-and-skip.
-    :class:`ManifestDiscoveryUnavailable` is caught HERE and recorded as
-    ``git_discovery_failed`` rather than allowed to escape, because that helper
-    only catches ``sqlite3.Error`` and an escaping traceback would abort the
-    whole multi-root sweep over one bad manifest root.
+    Raises one of ``_task_db_scan.py::UNREADABLE_STORE_ERRORS`` for an
+    unreadable task store, which :func:`_task_db_scan.sweep_project_roots`
+    turns into a warn-and-skip. :class:`ManifestDiscoveryUnavailable` is caught
+    HERE and recorded as ``git_discovery_failed`` rather than allowed to
+    escape, because that helper only catches ``UNREADABLE_STORE_ERRORS`` and an
+    escaping traceback would abort the whole multi-root sweep over one bad
+    manifest root.
     """
     root = str(project_root)
     manifests_root = str(manifest_root) if manifest_root is not None else root
@@ -1290,10 +1285,10 @@ def _build_parser() -> argparse.ArgumentParser:
 def _audit_root(root: str, args: argparse.Namespace) -> ProjectAudit:
     """Audit ONE project root under the (possibly overridden) manifest root.
 
-    Raises ``sqlite3.Error`` for an unreadable task store, which
-    :func:`_task_db_scan.sweep_project_roots` turns into a warn-and-skip; every
-    other exception propagates. Returns exactly one audit, per that function's
-    one-audit-per-root contract.
+    Raises one of ``_task_db_scan.py::UNREADABLE_STORE_ERRORS`` for an
+    unreadable task store, which :func:`_task_db_scan.sweep_project_roots`
+    turns into a warn-and-skip; every other exception propagates. Returns
+    exactly one audit, per that function's one-audit-per-root contract.
     """
     return audit_project(root, args.manifest_root)
 

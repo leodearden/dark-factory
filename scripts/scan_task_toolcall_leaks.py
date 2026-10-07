@@ -2,8 +2,8 @@
 """Detect leaked serialized tool-call XML fragments in Taskmaster task text.
 
 READ-ONLY / DETECTION-ONLY: this module and its CLI never mutate task text.
-Every database connection it opens is a read-only SQLite URI
-(``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``),
+Every database connection it opens goes through
+``_task_db_scan.py::connect_ro``, a read-only SQLite URI (``mode=ro``),
 so the sweep is structurally incapable of the auto-mutation this tool is
 explicitly forbidden from doing. Remediation of any match this tool finds is
 a separate, manual, individually-reviewed follow-up (matching the
@@ -60,7 +60,6 @@ predicates over that one set rather than two independently spelled sets.
 from __future__ import annotations
 
 import argparse
-import sqlite3
 import sys
 from pathlib import Path
 from typing import NamedTuple
@@ -68,6 +67,7 @@ from typing import NamedTuple
 from _task_db_scan import (
     SCAN_EXIT_CODE_EPILOG,
     add_db_discovery_args,
+    connect_ro,
     format_json,
     group_matches_by_db,
     run_scan_cli,
@@ -149,14 +149,12 @@ class LeakMatch(NamedTuple):
 def scan_db(db_path: str) -> list[LeakMatch]:
     """Scan *db_path* read-only for leaked tool-call fragments.
 
-    Opens the database via a read-only SQLite URI (``mode=ro``) so the scan
-    is structurally incapable of mutating live task text — even while the
-    fused-memory server holds the same file open in WAL mode for concurrent
-    writers. Applies :func:`detect_leak` to each of ``SCANNED_COLUMNS`` per
+    Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
+    refusals). Applies :func:`detect_leak` to each of ``SCANNED_COLUMNS`` per
     row; ``metadata`` is deliberately never read (see module docstring).
     """
     matches: list[LeakMatch] = []
-    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = connect_ro(db_path)
     try:
         cursor = conn.execute(
             "SELECT tag, id, title, description, details, test_strategy FROM tasks"

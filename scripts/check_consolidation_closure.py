@@ -99,8 +99,9 @@ if str(_SHARED_SRC) not in sys.path:
 
 # `_task_db_scan` is a flat sibling in scripts/ and resolves solely because a
 # DIRECTLY-EXECUTED script puts its own directory at sys.path[0] — so never
-# invoke this via `python -m`. It is the single home for the tasks.db path.
-from _task_db_scan import tasks_db_path  # noqa: E402
+# invoke this via `python -m`. It is the single home for the tasks.db path and
+# its read-only open.
+from _task_db_scan import TaskDbUnreadable, connect_ro, tasks_db_path  # noqa: E402
 from fused_memory.middleware.task_interceptor import TaskInterceptor  # noqa: E402
 from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
     EXIT_CLOSED,
@@ -203,12 +204,17 @@ def render_human(verdict: Any, *, scroll: dict) -> str:
 
 
 def load_task_metadata(project_root: str, task_id: str, tag: str) -> Any:
-    """Read one task's raw metadata column from tasks.db, READ-ONLY."""
+    """Read one task's raw metadata column from tasks.db, READ-ONLY.
+
+    Opens through ``_task_db_scan.py::connect_ro``, whose refusal of a wrong
+    file already names the path and the remedy, so it becomes the UsageError
+    verbatim.
+    """
     db_path = tasks_db_path(project_root)
-    if not db_path.exists():
-        raise UsageError(f"no tasks.db at {db_path}")
     try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        con = connect_ro(db_path)
+    except TaskDbUnreadable as refusal:
+        raise UsageError(str(refusal)) from refusal
     except sqlite3.Error as exc:
         raise UsageError(f"could not open {db_path} read-only: {exc}") from exc
     try:

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sqlite3
 import sys
 import types
 from pathlib import Path
@@ -54,6 +55,8 @@ def _load_module() -> types.ModuleType:
 
 
 mod = _load_module()
+TaskDbUnreadable = mod.TaskDbUnreadable
+TaskDbProblem = sys.modules[mod.connect_ro.__module__].TaskDbProblem
 
 _TOPIC = 'cli-demo-topic'
 _PROJECT_ID = 'dark_factory'
@@ -354,3 +357,43 @@ class TestCliAndSeamAgree:
         )
         assert codes == ['absorbed_member_still_live']
         assert [c[1] for c in memory.point_reads] == [_uuid(42)]
+
+
+class TestLoadTaskMetadataSurfacesTheRefusal:
+    """load_task_metadata reads ONE named store, so connect_ro's structured
+    refusal must reach the operator as the UsageError's cause."""
+
+    def test_an_absent_store_is_refused_as_absent(self, tmp_path):
+        with pytest.raises(mod.UsageError) as raised:
+            mod.load_task_metadata(str(tmp_path), '1', 'master')
+
+        cause = raised.value.__cause__
+        assert isinstance(cause, TaskDbUnreadable)
+        assert cause.reason is TaskDbProblem.ABSENT
+
+    def test_a_zero_byte_store_is_refused_as_an_empty_stub(self, tmp_path):
+        db = tmp_path / '.taskmaster' / 'tasks' / 'tasks.db'
+        db.parent.mkdir(parents=True)
+        db.write_bytes(b'')
+
+        with pytest.raises(mod.UsageError) as raised:
+            mod.load_task_metadata(str(tmp_path), '1', 'master')
+
+        cause = raised.value.__cause__
+        assert isinstance(cause, TaskDbUnreadable)
+        assert cause.reason is TaskDbProblem.EMPTY_STUB
+
+    def test_a_real_store_returns_the_tasks_raw_metadata(self, tmp_path):
+        db = tmp_path / '.taskmaster' / 'tasks' / 'tasks.db'
+        db.parent.mkdir(parents=True)
+        con = sqlite3.connect(db)
+        try:
+            con.execute('CREATE TABLE tasks (tag TEXT, id INTEGER, metadata TEXT)')
+            con.execute(
+                'INSERT INTO tasks VALUES (?, ?, ?)', ('master', 1, '{"k": 1}')
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        assert mod.load_task_metadata(str(tmp_path), '1', 'master') == '{"k": 1}'

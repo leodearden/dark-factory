@@ -609,6 +609,9 @@ def enrich_from_task_db(
     Mirrors ``task_sampler.enrich_candidates_from_task_db``'s read-only access
     and best-effort degradation, extended to also read ``status`` (the
     cancelled / pending candidates need their own explicit curation decision).
+    Its own open rather than ``scripts/_task_db_scan.py::connect_ro``, kept in
+    lockstep with the sampler pass it mirrors; the degraded stub is refused
+    later, at the mint boundary.
     """
     db_path = Path(db_path)
     if not db_path.exists():

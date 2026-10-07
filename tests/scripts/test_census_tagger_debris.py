@@ -39,6 +39,8 @@ from _task_db_scan import (
     AUDIT_EXIT_NO_ROOT,
     AUDIT_EXIT_NOTHING_AUDITED,
     AUDIT_EXIT_OK,
+    TaskDbProblem,
+    TaskDbUnreadable,
 )
 from audit_wiped_metadata_files import (
     _EVENT_PLAN_SOURCES,
@@ -1214,18 +1216,20 @@ def test_an_unreadable_tasks_db_raises_rather_than_reporting_a_partial_result(tm
     """(d) THE ONE-AUDIT-PER-ROOT-OR-RAISE CONTRACT.
 
     sweep_project_roots documents that its callback returns exactly one result
-    per root or raises sqlite3.Error, because that equality is what makes "no
-    results but some unreadable" mean precisely "every root failed" — the gate
-    exit 3 rests on. Returning a partial or empty census here would re-open the
-    false green that exit code exists to close.
+    per root or raises one of UNREADABLE_STORE_ERRORS, because that equality is
+    what makes "no results but some unreadable" mean precisely "every root
+    failed" — the gate exit 3 rests on. Returning a partial or empty census here
+    would re-open the false green that exit code exists to close.
     """
     root = tmp_path / "corrupt"
     tasks_dir = root / ".taskmaster" / "tasks"
     tasks_dir.mkdir(parents=True)
     (tasks_dir / "tasks.db").write_bytes(b"this is not a database")
 
-    with pytest.raises(sqlite3.Error):
+    with pytest.raises(TaskDbUnreadable) as refused:
         census_project(str(root))
+
+    assert refused.value.reason is TaskDbProblem.NOT_A_DATABASE
 
 
 def test_coverage_is_always_reported_even_for_a_project_with_no_stamps(tmp_path):

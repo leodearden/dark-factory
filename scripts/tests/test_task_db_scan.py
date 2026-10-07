@@ -808,6 +808,24 @@ def test_sweep_databases_skips_unreadable_db_and_warns_on_stderr(capsys):
     assert "results below are incomplete" in err
 
 
+def test_sweep_databases_skips_a_store_connect_ro_refused_and_warns_on_stderr(capsys):
+    refusal = TaskDbUnreadable(Path("/db/stub.db"), TaskDbProblem.EMPTY_STUB)
+
+    def scan(db_path):
+        if db_path == "/db/stub.db":
+            raise refusal
+        return [_match(db_path=db_path)]
+
+    matches, unreadable = sweep_databases(["/db/stub.db", "/db/good.db"], scan)
+
+    assert [m.db_path for m in matches] == ["/db/good.db"]
+    assert unreadable == ["/db/stub.db"]
+
+    err = capsys.readouterr().err
+    assert f"warning: skipping unreadable database /db/stub.db: {refusal}" in err
+    assert "results below are incomplete" in err
+
+
 def test_sweep_databases_omits_the_aggregate_warning_when_all_readable(capsys):
     matches, unreadable = sweep_databases(["/db/a.db"], lambda db_path: [])
 
@@ -883,6 +901,25 @@ def test_run_scan_cli_exits_3_when_every_db_is_unreadable(tmp_path, capsys):
     assert captured.out.strip() == "rendered:0"
     assert "results below are incomplete" in captured.err
     assert "NOTHING was scanned" in captured.err
+
+
+def _scan_through_connect_ro(db_path):
+    connect_ro(db_path).close()
+    return []
+
+
+def test_run_scan_cli_exits_3_when_connect_ro_refuses_every_real_stub(tmp_path, capsys):
+    stub_a = tmp_path / "a.db"
+    stub_b = tmp_path / "b.db"
+    stub_a.write_bytes(b"")
+    stub_b.write_bytes(b"")
+
+    exit_code = _cli(["--db", str(stub_a), "--db", str(stub_b)], _scan_through_connect_ro)
+
+    assert exit_code == 3
+    err = capsys.readouterr().err
+    assert str(TaskDbUnreadable(stub_a.resolve(), TaskDbProblem.EMPTY_STUB)) in err
+    assert "NOTHING was scanned" in err
 
 
 def test_run_scan_cli_exits_0_when_some_dbs_unreadable_and_rest_clean(tmp_path, capsys):
@@ -1007,6 +1044,24 @@ def test_sweep_project_roots_skips_unreadable_root_and_warns_on_stderr(capsys):
     assert (
         "warning: skipping unreadable project /proj/bad: file is not a database" in err
     )
+
+
+def test_sweep_project_roots_skips_a_store_connect_ro_refused_and_warns_on_stderr(capsys):
+    refusal = TaskDbUnreadable(Path("/proj/stub"), TaskDbProblem.EMPTY_STUB)
+
+    def audit(root):
+        if root == "/proj/stub":
+            raise refusal
+        return f"audit:{root}"
+
+    audits, unreadable = sweep_project_roots(["/proj/stub", "/proj/good"], audit)
+
+    assert audits == ["audit:/proj/good"]
+    assert unreadable == ["/proj/stub"]
+
+    err = capsys.readouterr().err
+    assert f"warning: skipping unreadable project /proj/stub: {refusal}" in err
+    assert "results below are incomplete" in err
 
 
 def test_sweep_project_roots_warns_once_in_aggregate_that_results_are_incomplete(capsys):
@@ -1142,6 +1197,27 @@ def test_run_audit_cli_exits_3_when_every_root_is_unreadable(
     assert captured.out.strip() == "rendered:0"
     assert "results below are incomplete" in captured.err
     assert "NOTHING was audited (this is not a clean result)" in captured.err
+
+
+def test_run_audit_cli_exits_3_when_connect_ro_refuses_every_real_stub(
+    project_root_with_tasks_db, tmp_path, capsys
+):
+    root_a = tmp_path / "proj_a"
+    root_b = tmp_path / "proj_b"
+    stub_a = project_root_with_tasks_db(root_a)
+    project_root_with_tasks_db(root_b)
+
+    def audit(root, args):
+        connect_ro(tasks_db_path(root)).close()
+        return "audit"
+
+    exit_code = _audit_cli(
+        ["--project-root", str(root_a), "--project-root", str(root_b)], audit
+    )
+
+    assert exit_code == AUDIT_EXIT_NOTHING_AUDITED
+    err = capsys.readouterr().err
+    assert str(TaskDbUnreadable(stub_a.resolve(), TaskDbProblem.EMPTY_STUB)) in err
 
 
 def test_run_audit_cli_exits_0_when_some_roots_unreadable_and_rest_clean(

@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _task_db_scan import TaskDbProblem, TaskDbUnreadable
 from audit_delivered_checks import (
     _TASK_IN_SUBJECT_RE,
     DISPOSITION_BROKEN,
@@ -48,6 +49,7 @@ from audit_delivered_checks import (
     classify_descriptor,
     evaluate_row,
     format_report,
+    load_open_dependents,
     load_task_index,
 )
 from shared.delivered_check_polarity import CheckOutcome
@@ -295,6 +297,18 @@ class TestLoadTaskIndex:
                 conn.execute("UPDATE tasks SET status = 'cancelled'")
         finally:
             conn.close()
+
+
+def test_load_open_dependents_refuses_a_stub_instead_of_reading_nobody_blocked(tmp_path):
+    """Its `no such table` swallow is for a store lacking only the
+    dependencies table; a 0-byte stub has no tables at all."""
+    stub = tmp_path / 'tasks.db'
+    stub.write_bytes(b'')
+
+    with pytest.raises(TaskDbUnreadable) as refused:
+        load_open_dependents(str(stub))
+
+    assert refused.value.reason is TaskDbProblem.EMPTY_STUB
 
 
 # ---------------------------------------------------------------------------
