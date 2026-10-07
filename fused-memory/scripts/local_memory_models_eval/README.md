@@ -118,25 +118,26 @@ canonically by uuid (so the result does not depend on the order FalkorDB
 happens to return rows in, which is not guaranteed stable), permute under
 `Random(f'{seed}:{month}:{kind}')`, take the first `allocate()[cell]`.
 
-## N = 200 is provisional
+## N = 200 is final (ruled by ζ)
 
-200 is δ's choice: the midpoint of the PRD's 150–300 band, checked against the
-measured census so that all 16 non-empty cells receive at least one seat.
-**PRD Open Q4 defers the final corpus size to ζ**, to be settled from measured
-control variance and wall-clock.
+200 was δ's choice: the midpoint of the PRD's 150–300 band, checked against the
+measured census so that all 16 non-empty cells receive at least one seat. PRD
+Open Q4 deferred the final corpus size to ζ, and **ζ kept N = 200** after
+measuring control variance and wall-clock on this exact manifest. Every LLM
+gated margin derived from the two incumbent control replays is far inside the
+0.10 adequacy bound, and wall-clock does not constrain N. The ruling and its
+measured basis are in `plans/local-memory-models-eval-preregistration.md`
+§"Corpus N".
 
-Re-tuning is cheap by construction. Because each cell's take is a *prefix* of
-that cell's permutation, growing N only ever **appends** to a cell — so ζ can
-re-run the builder at a different N without invalidating replays ε has already
-completed at the smaller one. Note this is a **per-cell** guarantee, not a
-global one: largest-remainder allocation can move a single seat between cells
-as N changes, so a cell whose allocation *shrank* is the one case where an
-earlier pick is dropped.
+The controls, and every margin pre-registered from them, are bound to this
+manifest's `corpus_sha`. Re-running the builder at a different `--n` writes a
+different manifest with a different `corpus_sha`, which invalidates the
+controls. That would be a new pre-registration, not a re-tune.
 
-```bash
-# what ζ runs to re-tune
-uv run python fused-memory/scripts/local_memory_models_eval/build_corpus.py --n 300
-```
+The builder's prefix property still holds. Each cell's take is a prefix of that
+cell's seeded permutation, so growing N only ever **appends** to a cell. This
+is a **per-cell** guarantee, not a global one: largest-remainder allocation can
+move a single seat between cells as N changes.
 
 ## The binding hazard: no conditioning on the incumbent's outcome
 
