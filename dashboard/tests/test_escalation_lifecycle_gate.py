@@ -340,7 +340,7 @@ async def _build_every_class_archive(queue: EscalationQueue, server: Any) -> _Li
         ID_MOOT, SRC_MOOT, 1, 'resolved', 'moot-terminal-subject', 'stamped', resolved_by='interactive',
     ))
 
-    held = {r.cls for r in arch.records}
+    held = {r.cls for r in arch.records if r.cls is not None}
     for n, cls in enumerate(sorted(RESOLUTION_CLASSES - held), start=1):
         esc_id, source = f'esc-gx{n}-1', f'gate-src-{cls}'
         _submit_pending(queue, esc_id, f'gx{n}', source, level=0, filed_at=_BASE + timedelta(hours=8 + n))
