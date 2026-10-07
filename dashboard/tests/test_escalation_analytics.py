@@ -1635,11 +1635,17 @@ def _terminal(esc_id: str, *, now: datetime, status: str, resolution_class: str 
     }
 
 
+_INFERRED_CLASSES = frozenset({'benign', 'actionable'})
+
+
 def _one_terminal_per_class(esc_dir: Path, now: datetime) -> None:
-    """Stamped moot-terminal-subject and stale-strand, unstamped dismissed and resolved."""
+    """Unstamped dismissed and resolved, plus one stamp per other RESOLUTION_CLASSES member."""
+    stamped = [
+        _terminal(f'esc-{100 + n}-1', now=now, status='dismissed', resolution_class=cls)
+        for n, cls in enumerate(sorted(RESOLUTION_CLASSES - _INFERRED_CLASSES))
+    ]
     for record in (
-        _terminal('esc-1-1', now=now, status='dismissed', resolution_class='moot-terminal-subject'),
-        _terminal('esc-2-1', now=now, status='dismissed', resolution_class='stale-strand'),
+        *stamped,
         _terminal('esc-3-1', now=now, status='dismissed'),
         _terminal('esc-4-1', now=now, status='resolved', action='restart'),
     ):
@@ -1660,7 +1666,7 @@ class TestCompleteResolutionClasses:
         assert set(source['classes']) == set(RESOLUTION_CLASSES)
         for cls in RESOLUTION_CLASSES:
             assert source['classes'][cls] == 1
-        assert source['classified'] == sum(source['classes'].values()) == 4
+        assert source['classified'] == sum(source['classes'].values()) == len(RESOLUTION_CLASSES)
         assert source['benign_rate'] == source['classes']['benign'] / source['classified']
         assert 'benign' not in source and 'actionable' not in source
 
@@ -1690,7 +1696,7 @@ class TestCompleteResolutionClasses:
         (source,) = entry['origin']['sources']
 
         assert source['classes']['not-a-class'] == 1
-        assert source['classified'] == sum(source['classes'].values()) == 5
+        assert source['classified'] == sum(source['classes'].values()) == len(RESOLUTION_CLASSES) + 1
 
 
 class TestOneTerminalPopulation:
@@ -1710,8 +1716,8 @@ class TestOneTerminalPopulation:
         classified = sum(sum(s['classes'].values()) for s in entry['origin']['sources'])
         action_mix = entry['workflow']['action_mix']
 
-        assert entry['terminal'] == classified == sum(action_mix.values()) == 5
-        assert action_mix == {'restart': 1, 'unspecified': 4}
+        assert entry['terminal'] == classified == sum(action_mix.values()) == len(RESOLUTION_CLASSES) + 1
+        assert action_mix == {'restart': 1, 'unspecified': len(RESOLUTION_CLASSES)}
 
 
 def _write_pending(esc_dir: Path, esc_id: str, *, now: datetime, archived: bool) -> None:
