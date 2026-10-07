@@ -206,7 +206,9 @@ def _upstream_origin(upstream_url: str) -> SplitResult:
 def usage_tap(
     upstream_url: str, *, log_path: Path | str, host: str = '127.0.0.1', port: int = 0
 ) -> Iterator[str]:
-    handler = _handler_class(_upstream_origin(upstream_url), _CallLog(Path(log_path)))
+    call_log_path = Path(log_path)
+    call_log_path.touch()
+    handler = _handler_class(_upstream_origin(upstream_url), _CallLog(call_log_path))
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True, name='usage-tap')

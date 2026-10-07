@@ -241,3 +241,12 @@ def test_records_load_in_file_order_and_the_port_closes_on_exit(tmp_path):
     with socket.socket() as probe:
         probe.settimeout(2)
         assert probe.connect_ex(('127.0.0.1', port)) != 0
+
+
+def test_a_session_with_no_calls_still_leaves_its_empty_log(tmp_path):
+    log = tmp_path / 'calls.jsonl'
+    with mock_openai_server() as mock, usage_tap(_origin(mock), log_path=log):
+        pass
+
+    assert log.read_text() == ''
+    assert load_call_records(log) == ()

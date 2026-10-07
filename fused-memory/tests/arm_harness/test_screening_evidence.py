@@ -4,20 +4,6 @@ import json
 from pathlib import Path
 
 import pytest
-from fused_memory.arm_harness.screening_evidence import (
-    LMS_CTL_EXIT_CARD_HELD,
-    SCREENING_RUN_SHAPE,
-    ArmCommands,
-    ArmEvidencePaths,
-    ScreeningEvidenceError,
-    ScreeningStage,
-    TapBinding,
-    load_arm_commands,
-    load_arm_evidence,
-    load_vram_evidence,
-    write_arm_commands,
-    write_screening_spec,
-)
 from shared.memory_eval_metrics import canonical_json_text
 
 from arm_harness._fakes import (
@@ -33,6 +19,20 @@ from arm_harness._fakes import (
 )
 from fused_memory.arm_harness.arm_spec import load_arm_spec
 from fused_memory.arm_harness.metrics_record import IndexConfiguration, LlmMetricId
+from fused_memory.arm_harness.screening_evidence import (
+    LMS_CTL_EXIT_CARD_HELD,
+    SCREENING_RUN_SHAPE,
+    ArmCommands,
+    ArmEvidencePaths,
+    ScreeningEvidenceError,
+    ScreeningStage,
+    TapBinding,
+    load_arm_commands,
+    load_arm_evidence,
+    load_vram_evidence,
+    write_arm_commands,
+    write_screening_spec,
+)
 from fused_memory.arm_harness.slate import arm_endpoint
 
 QWEN = slate_arm()

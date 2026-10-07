@@ -11,6 +11,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec, LlmParams
+from fused_memory.arm_harness.conformance import ConformanceCounts
+from fused_memory.arm_harness.instrument_checks import PREREGISTRATION_DOC_PATH
+from fused_memory.arm_harness.llm_metrics import llm_axis_records
+from fused_memory.arm_harness.metrics_record import write_metrics_record
+from fused_memory.arm_harness.replay_types import ArmRunResult, EpisodeOutcome
+from fused_memory.arm_harness.run import RUN_MANIFEST_FILENAME, write_outcomes
+from fused_memory.arm_harness.run_manifest import RunManifest, serialize_run_manifest
 from fused_memory.arm_harness.screening_evidence import (
     SCREENING_RUN_SHAPE,
     ArmCommands,
@@ -21,15 +29,6 @@ from fused_memory.arm_harness.screening_evidence import (
     write_arm_commands,
     write_screening_spec,
 )
-
-from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec, LlmParams
-from fused_memory.arm_harness.conformance import ConformanceCounts
-from fused_memory.arm_harness.instrument_checks import PREREGISTRATION_DOC_PATH
-from fused_memory.arm_harness.llm_metrics import llm_axis_records
-from fused_memory.arm_harness.metrics_record import write_metrics_record
-from fused_memory.arm_harness.replay_types import ArmRunResult, EpisodeOutcome
-from fused_memory.arm_harness.run import RUN_MANIFEST_FILENAME, write_outcomes
-from fused_memory.arm_harness.run_manifest import RunManifest, serialize_run_manifest
 from fused_memory.arm_harness.slate import SlateArm, arm_endpoint, candidate_spec
 from fused_memory.arm_harness.usage_tap import CallRecord
 from fused_memory.backends.llm_token_usage import (
@@ -438,7 +437,8 @@ def screening_outcomes(duration_ms: float = 10000.0) -> tuple[EpisodeOutcome, ..
     )
 
 
-def screening_run_manifest(spec: LlmArmSpec, **overrides) -> RunManifest:
+def screening_run_manifest(spec: LlmArmSpec, /, **overrides) -> RunManifest:
+    """A screening-shaped run of ``spec``; override any field, ``spec`` included, by keyword."""
     data = {
         'settings_summary': {
             'concurrency': SCREENING_RUN_SHAPE.concurrency,
@@ -446,8 +446,8 @@ def screening_run_manifest(spec: LlmArmSpec, **overrides) -> RunManifest:
             'episode_timeout_s': 120.0,
         },
         'episode_ids': SCREENING_EPISODE_IDS,
-    }
-    return run_manifest_for(spec, **(data | overrides))
+    } | overrides
+    return run_manifest_for(data.pop('spec', spec), **data)
 
 
 def write_screening_run(
