@@ -18,11 +18,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import _init_git_repo
 
 from fused_memory.middleware.task_interceptor import TaskInterceptor
 from fused_memory.reconciliation import stale_gate_citation_guard
 from fused_memory.reconciliation.event_buffer import EventBuffer
 from fused_memory.reconciliation.stale_gate_citation_guard import find_gate_citation_ids
+from fused_memory.server.tools import create_mcp_server
 
 # --------------------------------------------------------------------------- #
 # Live relay excerpts (task 3708, tag=master, re-confirmed 2026-09-11)
@@ -508,6 +510,97 @@ class TestUpdateTaskBoundary:
 
         assert result.get('error_type') == 'ReconTerminalWriteRejected'
         taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_explicit_none_dependencies_is_judged_against_the_live_row(
+        self, interceptor, taskmaster, live_row,
+    ):
+        # The production call shape: server/tools.py::update_task always
+        # forwards the key, `None` when the write leaves the array untouched.
+        result = await interceptor.update_task(
+            '3708', '/project', details=STALE_A, append=True,
+            dependencies=None, agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconStaleGateCitationRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_explicit_none_dependencies_allows_a_correct_relay(
+        self, interceptor, taskmaster, live_row,
+    ):
+        result = await interceptor.update_task(
+            '3708', '/project', details=TRANSITIVE, append=True,
+            dependencies=None, agent_id=AGENT_ID,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+        assert result.get('error_type') is None
+
+    @pytest.mark.asyncio
+    async def test_explicit_empty_dependencies_is_a_rewrite_not_an_absence(
+        self, interceptor, taskmaster, live_row,
+    ):
+        # Regression guard, not a RED signal: `[]` clears the array, so it must
+        # not fall back to the live row the way `None` does.
+        result = await interceptor.update_task(
+            '3708', '/project', details=STALE_A, append=True,
+            dependencies=[], agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') == 'ReconStaleGateCitationRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+
+@pytest.fixture
+def project_root(tmp_path):
+    """A real git repo, so the MCP tool's project-root normalisation resolves
+    it as a main checkout without monkeypatching."""
+    _init_git_repo(tmp_path)
+    return str(tmp_path)
+
+
+@pytest.fixture
+def update_task_tool(interceptor):
+    """The `update_task` MCP tool's own closure over the real interceptor.
+
+    Called directly rather than through FastMCP's `call_tool`, whose injected
+    Context raises outside a live request; the caller-identity resolution then
+    sees no ctx, and an omitted `dependencies` still takes the tool's `None`
+    default exactly as a live call does.
+    """
+    server = create_mcp_server(AsyncMock(), task_interceptor=interceptor)
+    return server._tool_manager.get_tool('update_task').fn
+
+
+class TestUpdateTaskMcpTool:
+    """Drives the real `update_task` MCP tool, so the interceptor receives
+    exactly the kwargs a live Stage 2 call sends — including the
+    `dependencies=None` the tool always forwards when the array is untouched."""
+
+    @pytest.mark.asyncio
+    async def test_stale_relay_via_the_mcp_tool_is_rejected(
+        self, update_task_tool, taskmaster, live_row, project_root,
+    ):
+        result = await update_task_tool(
+            id='3708', project_root=project_root,
+            details=STALE_A, append=True, agent_id=AGENT_ID,
+        )
+
+        assert result['error_type'] == 'ReconStaleGateCitationRejected'
+        taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_correct_relay_via_the_mcp_tool_is_written(
+        self, update_task_tool, taskmaster, live_row, project_root,
+    ):
+        await update_task_tool(
+            id='3708', project_root=project_root,
+            details=TRANSITIVE, append=True, agent_id=AGENT_ID,
+        )
+
+        taskmaster.update_task.assert_awaited_once()
+        assert taskmaster.update_task.await_args.kwargs.get('dependencies') is None
 
 
 class TestGateCitationPromptSection:
