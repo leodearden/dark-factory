@@ -41,6 +41,7 @@ const {
   windowedClassSplit,
   taskCard,
   levelCount,
+  windowedEscPerDone,
 } = escalationViews;
 const { isDatum, datumView, EM_DASH } = loadedWindow.DF_DATUM;
 
@@ -132,6 +133,7 @@ test('the module exposes its readers and assigns window.DF_ESCALATION_VIEWS', ()
       'subsectionQueuePending',
       'taskCard',
       'windowedClassSplit',
+      'windowedEscPerDone',
     ],
   );
   for (const name of Object.keys(escalationViews)) {
@@ -455,4 +457,80 @@ test('levelCount: a payload with no ESCALATIONS or summary does not throw', () =
     });
     assert.equal(count.state, 'unknown');
   }
+});
+
+// ── windowedEscPerDone: the strip's esc/done reading and the churn tile's filings ─
+
+function epdRow(date, filings, done) {
+  return { date, filings, done, ratio: done ? filings / done : null };
+}
+
+const NO_COMPLETIONS = 'no tasks completed in this window';
+
+test('windowedEscPerDone: filings and done are summed across projects, date by date', () => {
+  const r = windowedEscPerDone([
+    { project: 'alpha', doneCountsRead: true, rows: [epdRow('2026-10-02', 2, 4), epdRow('2026-10-01', 1, 0)] },
+    {
+      project: 'beta',
+      doneCountsRead: true,
+      rows: [epdRow('2026-10-02', 2, 0), epdRow('2026-10-01', 3, 1), epdRow('2026-10-03', 0, 2)],
+    },
+  ]);
+
+  assert.equal(r.filings, 8);
+  assert.deepEqual(r.filingsByDate, { '2026-10-01': 4, '2026-10-02': 4, '2026-10-03': 0 });
+  assert.equal(r.ratio, 8 / 7);
+  assert.deepEqual(r.ratioDaily, [4, 1, 0]);
+  assert.equal(r.absentReason, NO_COMPLETIONS);
+});
+
+test('windowedEscPerDone: read projects that completed nothing have no ratio', () => {
+  const r = windowedEscPerDone([
+    { project: 'alpha', doneCountsRead: true, rows: [epdRow('2026-10-01', 3, 0)] },
+  ]);
+
+  assert.equal(r.filings, 3);
+  assert.equal(r.ratio, null);
+  assert.deepEqual(r.ratioDaily, []);
+  assert.equal(r.absentReason, NO_COMPLETIONS);
+});
+
+test('windowedEscPerDone: an unread project is a hole in the ratio that names it; filings still sum', () => {
+  const unread = rows => rows.map(row => ({ ...row, done: null, ratio: null }));
+  const r = windowedEscPerDone([
+    { project: 'alpha', doneCountsRead: true, rows: [epdRow('2026-10-01', 1, 2)] },
+    { project: 'beta', doneCountsRead: false, rows: unread([epdRow('2026-10-01', 2, 0)]) },
+    { project: 'gamma', doneCountsRead: false, rows: unread([epdRow('2026-10-02', 4, 0)]) },
+  ]);
+
+  assert.equal(r.ratio, null);
+  assert.deepEqual(r.ratioDaily, []);
+  assert.equal(r.absentReason, 'completed-task counts could not be read for beta, gamma');
+  assert.equal(r.filings, 7, 'churn needs every filing, read or not');
+  assert.deepEqual(r.filingsByDate, { '2026-10-01': 3, '2026-10-02': 4 });
+});
+
+test('windowedEscPerDone: an unread project with no rows is still a hole — the flag is the authority', () => {
+  const r = windowedEscPerDone([
+    { project: 'alpha', doneCountsRead: true, rows: [epdRow('2026-10-01', 1, 2)] },
+    { project: 'gamma', doneCountsRead: false, rows: [] },
+  ]);
+
+  assert.equal(r.ratio, null);
+  assert.match(r.absentReason, /gamma/);
+});
+
+test('windowedEscPerDone: a payload that does not say its counts were read has not shown it', () => {
+  const r = windowedEscPerDone([{ project: 'alpha', rows: [epdRow('2026-10-01', 1, 2)] }]);
+
+  assert.equal(r.ratio, null);
+  assert.match(r.absentReason, /alpha/);
+});
+
+test('windowedEscPerDone: no project has no filings and no ratio', () => {
+  const r = windowedEscPerDone([]);
+
+  assert.equal(r.filings, 0);
+  assert.equal(r.ratio, null);
+  assert.deepEqual(r.ratioDaily, []);
 });
