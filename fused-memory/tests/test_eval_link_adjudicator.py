@@ -1,19 +1,52 @@
 """The link adjudicator's eval against blind majority verdicts (task 6184, PRD H3).
 
 The pure core is tested through the script's public functions, loaded by path.
+The end-to-end cases drive ``run(argv, env)`` against the in-process server of
+``_link_heal_harness``, run the script as a subprocess over the committed λ
+fixtures, and feed its report to the readiness gate Γ_A runs.
 """
 
 from __future__ import annotations
 
+import contextlib
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 from _fm_helpers import load_script_module
+from _link_heal_harness import (
+    ALL_LINK_HEAL_PREFIXES,
+    DF,
+    LinkHealHarness,
+    build_harness,
+)
 
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.maintenance.link_adjudicator import AdjudicationFailure, LinkVerdict
 from fused_memory.maintenance.link_heal import Verdict
+from fused_memory.maintenance.link_heal_store import text_sha256
+from fused_memory.server.grouped_read import SIGHTING_KIND
 
-SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'eval_link_adjudicator.py'
+FUSED_MEMORY = Path(__file__).resolve().parent.parent
+SCRIPT_PATH = FUSED_MEMORY / 'scripts' / 'eval_link_adjudicator.py'
+GATE_SCRIPT = FUSED_MEMORY.parent / 'scripts' / 'check_write_triage_readiness_gate.py'
+TRIAGE_VERDICTS = FUSED_MEMORY / 'tests' / 'fixtures' / 'link_adjudicator_triage_verdicts.jsonl'
+TRIAGE_PAIRS = FUSED_MEMORY / 'tests' / 'fixtures' / 'link_adjudicator_triage_pairs.jsonl'
+
+#: Gate Γ_A's six bounds, copied verbatim from task 6186's metadata.before_done.args,
+#: which is their home.
+GAMMA_A_REQUIRES = (
+    ('r', 'selection.misfile_recall', '>=', '0.60'),
+    ('r', 'selection.false_detach_rate', '<=', '0.02'),
+    ('r', 'selection.corrects_recall', '>=', '0.60'),
+    ('r', 'selection.false_corrects_rate', '<=', '0.10'),
+    ('r', 'selection.parse_failure_rate', '<=', '0.05'),
+    ('r', 'population.n_pairs', '>=', '300'),
+)
 
 ev = load_script_module(SCRIPT_PATH, mod_name='eval_link_adjudicator')
 
@@ -281,3 +314,188 @@ class TestBuildReport:
         assert (provenance['field_chars'], provenance['shard_size']) == (4000, 40)
         assert provenance['text_keys'] == {'child': 'entry_text', 'parent': 'target_text'}
         assert 'write_triage_pairs_to_rate.jsonl' in provenance['text_key_basis']
+
+
+@pytest_asyncio.fixture
+async def harness(mock_config, tmp_path):
+    built = await build_harness(
+        mock_config, tmp_path, metadata_patch_prefixes=ALL_LINK_HEAL_PREFIXES,
+    )
+    yield built
+    await built.journal.close()
+
+
+def eval_env(harness: LinkHealHarness, monkeypatch, tmp_path: Path):
+    monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'missing.yaml'))
+    caller = harness.tool_caller()
+    return ev.EvalEnv(
+        config_loader=lambda _path: FusedMemoryConfig(),
+        tool_caller_for=lambda _url: contextlib.nullcontext(caller),
+    )
+
+
+def _hand_link_ids(index: int) -> tuple[str, str]:
+    return (f'{index:08x}-e1e1-4e1e-8e1e-{index:012x}', f'{index:08x}-f1f1-4f1f-8f1f-{index:012x}')
+
+
+def seed_hand_links(harness: LinkHealHarness, count: int) -> list[dict]:
+    """*count* rated sightings, live, and the corpus rows rating them at their live hashes."""
+    rows = []
+    for index in range(count):
+        child, parent = _hand_link_ids(index)
+        child_text, parent_text = f'eval child {index}', f'eval parent {index}'
+        harness.seed_link(
+            kind=SIGHTING_KIND, child=child, parent=parent,
+            child_text=child_text, parent_text=parent_text,
+        )
+        rows.append({
+            'item_id': f'H{index:03d}',
+            'project': DF,
+            'entry_id': child,
+            'target_id': parent,
+            'verdict': 'EXTENDS',
+            'kind_at_rating': SIGHTING_KIND,
+            'child_sha256': text_sha256(child_text),
+            'parent_sha256': text_sha256(parent_text),
+            'rated_text_matches_live': True,
+        })
+    return rows
+
+
+def write_jsonl(path: Path, rows: list[dict]) -> Path:
+    path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    return path
+
+
+class TestHandLinkMode:
+    @pytest.mark.asyncio
+    async def test_pairs_whose_live_texts_moved_on_are_excluded_by_reason(
+        self, harness, monkeypatch, tmp_path, capsys,
+    ):
+        rows = seed_hand_links(harness, 4)
+        rows[1]['rated_text_matches_live'] = False
+        corpus = write_jsonl(tmp_path / 'corpus.jsonl', rows)
+        edited_child, _parent = _hand_link_ids(0)
+        harness.mem0.payload(DF, edited_child)['data'] = 'eval child 0, edited after export'
+        _child, deleted_parent = _hand_link_ids(2)
+        del harness.mem0.points[(DF, deleted_parent)]
+        out = tmp_path / 'report.json'
+
+        code = await ev.run(
+            ['--corpus', str(corpus), '--arms', 'fake', '--out', str(out)],
+            eval_env(harness, monkeypatch, tmp_path),
+        )
+
+        assert code == 0
+        report = json.loads(out.read_text())
+        assert report == json.loads(capsys.readouterr().out)
+        population = report['population']
+        assert population['n_pairs'] == 1
+        assert population['excluded'] == 3
+        assert population['excluded_by_reason'] == {
+            'child_text_changed': 1, 'rated_text_mismatch': 1, 'parent_missing': 1,
+        }
+        (arm,) = report['arms']
+        assert arm['arm'] == 'fake'
+        assert arm['kind_agreement_den'] == 1
+        assert report['provenance']['mode'] == 'hand_link'
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_corpus_is_refused_with_exit_2(
+        self, harness, monkeypatch, tmp_path, capsys,
+    ):
+        corpus = tmp_path / 'corpus.jsonl'
+        corpus.write_text('not json\n')
+        out = tmp_path / 'report.json'
+
+        code = await ev.run(
+            ['--corpus', str(corpus), '--arms', 'fake', '--out', str(out)],
+            eval_env(harness, monkeypatch, tmp_path),
+        )
+
+        assert code == 2
+        assert 'line 1' in capsys.readouterr().err
+        assert not out.exists()
+
+
+class TestArmsArgument:
+    @pytest.mark.parametrize('arms', ['', ' , '])
+    def test_an_empty_arm_list_is_refused(self, arms):
+        with pytest.raises(SystemExit):
+            ev.build_parser().parse_args(['--corpus', 'c.jsonl', '--arms', arms])
+
+    def test_arms_are_split_and_de_duplicated_in_order(self):
+        args = ev.build_parser().parse_args(['--corpus', 'c.jsonl', '--arms', 'opus, fake,opus'])
+
+        assert args.arms == ['opus', 'fake']
+
+
+def run_triage_eval(out: Path, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable, 'scripts/eval_link_adjudicator.py',
+            '--corpus', str(TRIAGE_VERDICTS.relative_to(FUSED_MEMORY)),
+            '--pairs', str(TRIAGE_PAIRS.relative_to(FUSED_MEMORY)),
+            '--arms', 'fake',
+            '--out', str(out),
+        ],
+        cwd=FUSED_MEMORY,
+        env={**os.environ, 'CONFIG_PATH': str(tmp_path / 'missing.yaml')},
+        capture_output=True,
+        text=True,
+        timeout=240,
+    )
+
+
+@pytest.fixture
+def triage_report(tmp_path) -> Path:
+    out = tmp_path / 'triage-report.json'
+    completed = run_triage_eval(out, tmp_path)
+    assert completed.returncode == 0, completed.stderr
+    return out
+
+
+class TestTriageModeAsAUserRunsIt:
+    @pytest.mark.timeout(600)
+    def test_the_fake_arm_scores_the_committed_fixtures(self, triage_report):
+        report = json.loads(triage_report.read_text())
+
+        population = report['population']
+        assert type(population['n_pairs']) is int
+        assert population['n_pairs'] > 0
+        assert population['excluded_by_reason'] == {'no_texts': 2, 'tied': 1, 'unrated': 1}
+        assert population['excluded'] == 4
+        (arm,) = report['arms']
+        assert arm['arm'] == 'fake'
+        for name in FIGURES:
+            assert isinstance(arm[name], float), name
+            for suffix in ('_num', '_den', '_ci95'):
+                assert f'{name}{suffix}' in arm
+        assert report['selection'] == arm
+        assert report['provenance']['mode'] == 'triage'
+
+    @pytest.mark.timeout(600)
+    def test_the_fake_arm_is_deterministic(self, triage_report, tmp_path):
+        again = tmp_path / 'again.json'
+        assert run_triage_eval(again, tmp_path).returncode == 0
+
+        first = json.loads(triage_report.read_text())['arms']
+        second = json.loads(again.read_text())['arms']
+        assert first == second
+
+
+class TestTheReadinessGateReadsTheReport:
+    @pytest.mark.timeout(600)
+    def test_every_gamma_a_bound_resolves_to_a_number(self, triage_report):
+        argv = [sys.executable, str(GATE_SCRIPT), '--gate', 'Gamma-A', '--report', 'r', str(triage_report)]
+        for require in GAMMA_A_REQUIRES:
+            argv += ['--require', *require]
+
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+
+        verdict = json.loads(completed.stdout.strip().splitlines()[-2])
+        assert len(verdict['checks']) == 6
+        for check in verdict['checks']:
+            assert check['note'] is None, check
+            assert isinstance(check['actual'], (int, float)), check
+            assert not isinstance(check['actual'], bool), check
