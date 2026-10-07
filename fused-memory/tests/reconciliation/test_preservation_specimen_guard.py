@@ -45,6 +45,7 @@ from fused_memory.reconciliation.preservation_specimen_guard import (
     filter_preservation_specimen_flags,
     flag_asserts_stranded,
     maybe_escalate_preservation_suppression_storm,
+    preservation_mem0_filters,
 )
 
 # ── Live corroboration strings, copied verbatim from the base branch ─────────
@@ -487,6 +488,19 @@ class TestFilterPreservationSpecimenFlagsMem0Channel:
                 'actionable': False,
             },
         )
+
+    @pytest.mark.asyncio
+    async def test_the_query_is_the_filter_the_stage1_prompt_renders(self):
+        """The code path and Stage 1's directive ask for one filter, from one source."""
+        memory_service = _make_memory_service(rows={'3105': [LIVE_MEM0_ROW]})
+
+        await filter_preservation_specimen_flags(
+            memory_service=memory_service, project_id=PROJECT, flags=[_stranded_flag()],
+        )
+
+        assert memory_service.get_memories_by_metadata.await_args.kwargs[
+            'filters'
+        ] == preservation_mem0_filters('3105')
 
     @pytest.mark.asyncio
     async def test_row_without_preservation_prose_does_not_suppress(self):
