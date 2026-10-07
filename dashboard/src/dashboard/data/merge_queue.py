@@ -333,7 +333,7 @@ class RecentMerges(TypedDict):
     """The newest merge_attempt rows of a window, and how many the window holds."""
 
     rows: list[dict]
-    total: int
+    total: Datum[int]
 
 
 async def recent_merges(
@@ -351,7 +351,8 @@ async def recent_merges(
     construction — no second query can see a different window.
 
     Args:
-        db: Async SQLite connection, or None (returns no rows, total 0).
+        db: Async SQLite connection, or None (no runs.db is open for the
+            project: no rows, and an unknown total).
         limit: Maximum number of rows to return. Must be at least 1: with
             ``LIMIT 0`` no row carries the window total, so it would read 0.
         hours: Look-back window in hours. Only events with
@@ -359,18 +360,20 @@ async def recent_merges(
         now: Reference timestamp for the cutoff window (default:
             ``datetime.now(UTC)``).
 
-    Returns ``{'rows': [...], 'total': int}``, each row a
+    Returns ``{'rows': [...], 'total': Datum[int]}``, each row a
     ``{'task_id', 'run_id', 'outcome', 'duration_ms', 'timestamp'}`` dict,
-    newest first.
+    newest first. ``total`` is FRESH at *now* when the window was read — a
+    readable empty window is a measured zero — and UNKNOWN, beside no rows,
+    when there is no runs.db or the read fails.
 
     Raises:
         ValueError: ``limit`` is less than 1.
     """
     if limit < 1:
         raise ValueError(f'recent_merges limit must be at least 1, got {limit}')
-    empty: RecentMerges = {'rows': [], 'total': 0}
+    bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
     if db is None:
-        return empty
+        return {'rows': [], 'total': unknown_datum('no runs.db is open for this project', bound)}
 
     async def _query(conn: aiosqlite.Connection) -> RecentMerges:
         rows = list(await conn.execute_fetchall(
@@ -396,10 +399,16 @@ async def recent_merges(
                 }
                 for row in rows
             ],
-            'total': rows[0]['total'] if rows else 0,
+            'total': Datum(
+                rows[0]['total'] if rows else 0, resolve_now(now), DatumState.FRESH, None, bound,
+            ),
         }
 
-    return await with_db(db, _query, empty)
+    unread: RecentMerges = {
+        'rows': [],
+        'total': unknown_datum('the merge_attempt events could not be read from runs.db', bound),
+    }
+    return await with_db(db, _query, unread)
 
 
 async def recent_train_events(
@@ -748,6 +757,10 @@ async def build_per_project_merge_queue(
     the same ``hours`` window every other leg uses, and ``recent_total`` is
     how many that window holds (see :func:`recent_merges`).
 
+    ``speculative`` and ``recent_total`` are Datums: a leg that raises, or a
+    project whose whole build fails, serves them UNKNOWN with a reason rather
+    than zeros that read as measured.
+
     Args:
         project_dbs: List of ``(project_root_str, connection_or_None)`` tuples
             from :func:`_project_scoped_dbs_labeled`.
@@ -755,11 +768,11 @@ async def build_per_project_merge_queue(
         now: Shared reference timestamp captured once per request.
 
     Returns:
-        Dict ``{pid: {depth_timeseries, outcomes, latency, recent, recent_total, speculative, train_events, train_throughput}}``.
+        Dict ``{pid: {depth_timeseries, outcomes, latency, recent, recent_total, speculative, train_events, train_throughput}}``,
+        where ``speculative`` is a ``Datum[dict]`` and ``recent_total`` a ``Datum[int]``.
     """
     _DEFAULT_DEPTH: ChartData = {'labels': [], 'values': []}
-    _DEFAULT_SPEC = {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
-    _DEFAULT_RECENT: RecentMerges = {'rows': [], 'total': 0}
+    bound = RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
 
     async def _one_project(pid: str, db: aiosqlite.Connection | None) -> tuple[str, dict]:
         try:
@@ -774,8 +787,16 @@ async def build_per_project_merge_queue(
             )
             depth = safe_gather_result(depth_r, _DEFAULT_DEPTH, f'{pid}/depth')
             attempts = safe_gather_result(attempts_r, MergeAttempts(), f'{pid}/attempts')
-            recent = safe_gather_result(recent_r, _DEFAULT_RECENT, f'{pid}/recent')
-            spec = safe_gather_result(spec_r, _DEFAULT_SPEC, f'{pid}/speculative')
+            unread_recent: RecentMerges = {
+                'rows': [],
+                'total': unknown_datum(f'{pid} recent merges could not be read', bound),
+            }
+            recent = safe_gather_result(recent_r, unread_recent, f'{pid}/recent')
+            spec = safe_gather_result(
+                spec_r,
+                unknown_datum(f'{pid} speculative-merge stats could not be read', bound),
+                f'{pid}/speculative',
+            )
             train_events_list = safe_gather_result(train_r, [], f'{pid}/train_events')
             train_throughput = safe_gather_result(throughput_r, dict(_TRAIN_THROUGHPUT_DEFAULT), f'{pid}/train_throughput')
             return pid, {
@@ -794,13 +815,14 @@ async def build_per_project_merge_queue(
                 pid,
                 exc,
             )
+            unread = unknown_datum(f'the merge history of {pid} could not be read: {exc}', bound)
             return pid, {
                 'depth_timeseries': _DEFAULT_DEPTH,
                 'outcomes': MergeAttempts().outcome_chart(),
                 'latency': MergeAttempts().latency(),
                 'recent': [],
-                'recent_total': 0,
-                'speculative': _DEFAULT_SPEC,
+                'recent_total': unread,
+                'speculative': unread,
                 'train_events': [],
                 'train_throughput': dict(_TRAIN_THROUGHPUT_DEFAULT),
             }
