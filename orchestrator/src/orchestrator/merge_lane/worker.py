@@ -492,9 +492,9 @@ def is_auto_heal_eligible(
 ) -> bool:
     """Return True when the failure class is safe for automated fix spawning.
 
-    The allowlist is intentionally conservative — start with compile_error
-    (the tsc/type/lint class, typically a small bounded diff) and expand
-    only after production evidence of clean auto-heals for each new class.
+    The allowlist is intentionally conservative — compile_error (the rustc/tsc
+    class, a small bounded diff; lint_error/type_error are excluded) — and
+    expands only after production evidence of clean auto-heals per class.
 
     ``cause_hint`` is accepted for future per-hint filtering but is not
     currently used; the gate is purely category-based.

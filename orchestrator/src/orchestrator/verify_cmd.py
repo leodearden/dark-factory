@@ -1174,9 +1174,8 @@ def _identify_chain_tool(raw: str) -> ToolKind | None:
     ``check_pyright_config.py`` is the same shape.
 
     Exactly one, because a chain running two recognised tools has no dominant
-    tool. ``_segment_invokes_tool`` counts an undecodable segment as a match
-    for BOTH keywords, so it resolves None, the fail-safe answer. That is
-    unreachable today: ``parse_config_command`` has already shlex-split *raw*.
+    tool; ``_segment_invokes_tool`` counts an undecodable segment as a match
+    for both keywords, so such a chain resolves None too.
     """
     segments = split_top_level_and(raw)
     matched = {
