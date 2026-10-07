@@ -955,6 +955,91 @@ class TestMergeFinalizedSupersededBy:
         assert [r['request_id'] for r in rows] == ['mr-gen1']
 
 
+class TestMergeFinalizedAbsorbing:
+    """EventStore.merge_finalized_absorbing — a loser's request_id resolves to its primary's row."""
+
+    def test_cross_run_resolves_a_loser_to_the_primary_row(self, tmp_path: Path) -> None:
+        db_path = tmp_path / 'runs.db'
+        store_a = EventStore(db_path, 'run-A')
+        _emit_finalized(
+            store_a, request_id='mr-p1', task_id='T', branch='b', state='blocked',
+            absorbed_request_ids=['mr-l1', 'mr-l2'],
+        )
+        store_b = EventStore(db_path, 'run-B')
+
+        row = store_b.merge_finalized_absorbing('mr-l2', cross_run=True)
+
+        assert row is not None
+        assert row['request_id'] == 'mr-p1'
+        assert row['state'] == 'blocked'
+        assert row['run_id'] == 'run-A'
+        assert row['is_current_run'] is False
+        assert row['absorbed_request_ids'] == ['mr-l1', 'mr-l2']
+
+    def test_default_is_run_scoped(self, tmp_path: Path) -> None:
+        db_path = tmp_path / 'runs.db'
+        store_a = EventStore(db_path, 'run-A')
+        _emit_finalized(
+            store_a, request_id='mr-p1', task_id='T', branch='b', state='blocked',
+            absorbed_request_ids=['mr-l1'],
+        )
+        store_b = EventStore(db_path, 'run-B')
+
+        assert store_b.merge_finalized_absorbing('mr-l1') is None
+        own_run = store_a.merge_finalized_absorbing('mr-l1')
+        assert own_run is not None
+        assert own_run['request_id'] == 'mr-p1'
+
+    def test_most_recent_absorbing_row_wins(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+        _emit_finalized(
+            store, request_id='mr-p-old', task_id='T', branch='b', state='conflict',
+            absorbed_request_ids=['mr-l1'],
+        )
+        _emit_finalized(
+            store, request_id='mr-p-new', task_id='T', branch='b', state='done',
+            absorbed_request_ids=['mr-l1'],
+        )
+
+        row = store.merge_finalized_absorbing('mr-l1', cross_run=True)
+
+        assert row is not None
+        assert row['request_id'] == 'mr-p-new'
+
+    def test_matches_whole_ids_only_never_a_prefix(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+        _emit_finalized(
+            store, request_id='mr-p1', task_id='T', branch='b', state='done',
+            absorbed_request_ids=['mr-l1'],
+        )
+
+        assert store.merge_finalized_absorbing('mr-l', cross_run=True) is None
+
+    def test_rows_with_no_absorbed_ids_never_match(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+        _emit_finalized(store, request_id='mr-legacy', task_id='T', branch='b', state='done')
+        _emit_finalized(
+            store, request_id='mr-empty', task_id='T', branch='b', state='done',
+            absorbed_request_ids=[],
+        )
+        _emit_finalized(
+            store, request_id='mr-null', task_id='T', branch='b', state='done',
+            absorbed_request_ids=None,
+        )
+
+        assert store.merge_finalized_absorbing('mr-legacy', cross_run=True) is None
+        assert store.merge_finalized_absorbing('mr-l1', cross_run=True) is None
+
+    def test_empty_id_returns_none(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+        _emit_finalized(
+            store, request_id='mr-p1', task_id='T', branch='b', state='done',
+            absorbed_request_ids=[''],
+        )
+
+        assert store.merge_finalized_absorbing('', cross_run=True) is None
+
+
 class TestFetchEventsByTypeAllRuns:
     """``fetch_events_by_type_all_runs`` is the restart-durable (run-agnostic)
     counterpart to ``fetch_events_by_type`` (task 2752).
