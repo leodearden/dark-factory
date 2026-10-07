@@ -3,14 +3,10 @@
 `orchestrator/src/orchestrator/agents/roles.py::_BASH_CAPABLE_ROLE_PREAMBLE`
 splices `PREMISE_REFUTATION_GUIDANCE` into every role holding unqualified
 `Bash`. It is a leaf module, imported downward by roles.py, only so that
-already oversized file does not grow further. Provenance: reify #7937 via task
-5976 (plans/confusion-reduction-prd.md §6 decision 4); reify codebook
-entry-cand-20260819-24, where a brief declared a boot-time timer's PATH
-premise false from a post-login interactive shell, and the premise was right.
+already oversized file does not grow further.
 
-THIS CONSTANT IS THE SINGLE NORMATIVE STATEMENT OF THE RULE. The skills
-escalation-watcher-auto, escalation-watcher, recon-escalation-watcher, unblock
-and spawn carry a one-line headline and point here. Correct the rule here.
+THIS CONSTANT IS THE SINGLE NORMATIVE STATEMENT OF THE RULE. Skills that
+restate it point here; correct the rule here.
 
 `orchestrator/tests/test_roles_premise_refutation.py` checks the block's shape
 and its splice, never its wording.
