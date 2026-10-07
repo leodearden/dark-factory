@@ -1223,6 +1223,7 @@ class Mem0Backend:
         max_pages: int = DEFAULT_SCROLL_MAX_PAGES,
         max_points: int | None = None,
         with_vectors: bool = False,
+        with_payload: bool = True,
     ) -> AsyncGenerator[Any, None]:
         """Yield every Qdrant point in *collection_name*, paging on ``next_offset``.
 
@@ -1288,6 +1289,10 @@ class Mem0Backend:
                 only by pulling a point past the cap.
             with_vectors: Fetch each point's stored vector.  Costs bandwidth,
                 so it is opt-in.
+            with_payload: Fetch each point's payload.  ``False`` is an
+                ids-only walk, how id enumeration keeps its data access
+                minimal; it exists for ``services/id_resolver.py`` (PRD C2's
+                single substrate extension).
 
         Yields:
             Raw Qdrant point objects, in page order.  Annotated
@@ -1372,7 +1377,7 @@ class Mem0Backend:
                 client.scroll(
                     collection_name=collection_name,
                     scroll_filter=scroll_filter,
-                    with_payload=True,
+                    with_payload=with_payload,
                     with_vectors=with_vectors,
                     limit=page_limit,
                     offset=offset,
