@@ -158,6 +158,12 @@ entries:
     origin_phase: verify
     manifested_phase: verify
     note: Verifier agent attempted grep_search (turn 17 failed; turn 34 succeeded on retry), git_log (turn 19 failed), and verification_complete (turn 59 failed). Sub-agent launched for claim-verification cannot access tools (grep_search, verification_complete) promised in its verification contract. Matches entry's description of verifier prompts describing JSON tool shim that runtime cannot honor.
+  - date: '2026-10-06'
+    project: dark_factory
+    session: 48509796-8f62-44be-94c5-d4879cfbebbc
+    origin_phase: verify
+    manifested_phase: verify
+    note: 'Verification agent attempts to verify task completion by invoking grep_search (turns 17, 19 fail; turn 34 succeeds after retry) and verification_complete (turn 78 fails). The verifier is handed a contract specifying verification_complete as its final submission mechanism, but the tool is permanently unavailable in the runtime. Three recorded tool_error signals reflect failures at the contract boundary: grep_search initially missing, then verification_complete missing on final invocation.'
 - id: watcher-capability-envelope
   title: Autonomous watcher rotations never told their capability envelope — level-{0,1} cap, disabled Write/Edit, and git-write denials rediscovered by failure every rotation
   severity: high
@@ -1019,6 +1025,12 @@ entries:
     origin_phase: prd
     manifested_phase: architect
     note: Task 5431's factual premise—that an operator ruling (D17 decision) exists or would be available—was not verified at filing or dispatch time. Task metadata explicitly notes 'No ruling exists, so no plan can be written without choosing for the operator'; get_task_escalation_history(5431) returned 0.
+  - date: '2026-10-06'
+    project: dark_factory
+    session: f3ff6fb3-508d-44be-80bb-b32d2bca21b1
+    origin_phase: unknown
+    manifested_phase: implement
+    note: Orchestrated task dispatched with file/command premises that do not exist in target tree; 8 'no such file or directory', 'command not found', 'does not exist' signals across turns 27–568 with no corrective action; done_gate_missing_files guard blocked completion at turn 327, confirming completion artifacts also unverified.
 - id: warm-lane-cache-incoherence
   title: Warm-lane warmth transfer and shared caches violate source coherence; no disk GC — phantom compile errors and recurring ENOSPC
   severity: high
@@ -4410,6 +4422,12 @@ entries:
     origin_phase: ops
     manifested_phase: unknown
     note: Bash command with FIRST LINE 'git status --short | head -30' (skim-rewrite trigger) in orchestrated-task worktree; subsequent git commands attempting MERGE_HEAD; exit 128 with 'ambiguous argument MERGE_HEAD' error; output truncated at 'MERGE_HE...' consistent with host PreToolUse hook flattening newlines in multi-line Bash scripts
+  - date: '2026-10-06'
+    project: dark_factory
+    session: 5178db21-cd97-4bd9-a22d-62c3a94f71a3
+    origin_phase: ops
+    manifested_phase: unknown
+    note: 'Bash compound command starting with ''git status --short | head -30'' (triggers skim-rewrite hook) collapses embedded newlines, breaking multi-statement git command chain; git log receives malformed MERGE_HEAD argument (''fatal: ambiguous argument MERGE_HEAD''; exit 128).'
   cause: 'A host PreToolUse `skim rewrite` hook flattens a Bash command -- every newline to a single space, `skim` substituted onto the matched clause -- when and only when its FIRST LINE carries `git status`, `git log`, or `cat`/`head -N` on a source-file path. UMBRELLA entry for this family: file recurrences HERE, not on entry-cand-20260919-1 (heredoc-quoted git commit) or entry-cand-20260918-19 (`python3 -c` script), which record the same mechanism. That first-line discriminator is checkable against every sighting below. The chain is ~/.claude/settings.json PreToolUse matcher `Bash` -> ~/.claude/hooks/skim-rewrite.sh (skim-hook v2.1.0) -> `skim rewrite --hook`; re-measured against skim 2.3.1. Nothing is rejected and no static pre-check is involved -- the flattened one-liner is handed to the shell, which is why the symptom is an IndentationError, a `fatal: ambiguous argument`, or `syntax error near unexpected token` at exit 127, never a refusal. TWO QUALIFIERS an earlier framing of this cause omitted, both measured: (1) the target scan reads the FIRST LINE ONLY -- `echo a && git status\necho b` is flattened, but `echo a\ngit status && echo b` and `# comment\ngit status` are passed through byte-identical, so a multi-line script whose first line is plain is unaffected however many targets follow; (2) `git status`/`git log` match unconditionally, but `cat`/`head` match on the path''s EXTENSION and not on whether it exists -- a MISSING foo.md, foo.py, foo.rs, foo.ts, foo.json, foo.yaml or foo.toml is rewritten, while an EXISTING /etc/hostname and any .txt/.log/.sh/.csv/.xml/.html or extensionless path is not. Two further corollaries: the match is on the command WORD, not the text, so a quoted `echo "git status"` does NOT trigger it; and a TOP-LEVEL heredoc redirect (`python3 - <<''PY'' ... PY`) makes the hook decline the whole command even when a target IS present -- that is the safe way to pass a multi-line script. The cause is a third-party binary under the operator''s ~/.claude and is not fixable in this repository; the agent-facing rule is owned by task 5683.'
 - id: entry-cand-20260714-2
   title: resolve_ticket timeout gives no outcome signal, forcing redundant state polling
@@ -16627,6 +16645,36 @@ entries:
     origin_phase: unknown
     manifested_phase: unknown
     note: Orchestrated-task in worktree (.worktrees/5184) attempting MERGE_HEAD path lookup; Bash command fails with 'no such file or directory' on cat /home/leo/src/dark-factory/.git/worktrees/5184/MERGE_HEAD; only tool_error and not_found signals present, no other diagnostic
+  - date: '2026-10-06'
+    project: dark_factory
+    session: f3ff6fb3-508d-44be-80bb-b32d2bca21b1
+    origin_phase: unknown
+    manifested_phase: implement
+    note: 'Direct match to candidate pattern: orchestrated worktree task fires repeated ''no such file or directory'' with zero diagnostic signal (tool_error=0, self_correct=0, designed_outcome=0). Guard trip on done_gate_missing_files adds specificity: file-existence verification missing from both premise validation and completion gating.'
+  - date: '2026-10-06'
+    project: dark_factory
+    session: 7c5629d8-2ddb-4eb7-9bf1-3f25c6c396b7
+    origin_phase: unknown
+    manifested_phase: unknown
+    note: 5 file-not-found signals (turns 39, 73, 218, 593, 628) in orchestrated-task worktree. Edit tool_error at turn 124 (identical old_string/new_string) is secondary manifestation of file state confusion
+  - date: '2026-10-06'
+    project: dark_factory
+    session: 06dad50c-4b90-4f73-b081-dfeab9d46dd7
+    origin_phase: unknown
+    manifested_phase: implement
+    note: 'Session exhibits identical symptom: orchestrated-task worktree fires repeated ''no such file or directory'' errors at turns 88 and 195 with no other diagnostic signal (all other signal_counts zero).'
+  - date: '2026-10-06'
+    project: dark_factory
+    session: f8f1d4bb-7421-456f-8780-6574ef0ec95d
+    origin_phase: unknown
+    manifested_phase: implement
+    note: 'Exit code 1 from cat/json.tool/head-80 pipeline attempting to read .task/plan.json in orchestrated worktree .worktrees/3932, no diagnostic message shown; pattern matches: orchestrated-task + worktree cwd + tool_error + zero additional signal'
+  - date: '2026-10-06'
+    project: dark_factory
+    session: cb891dfb-0343-4e57-bad3-eb1cea84297e
+    origin_phase: unknown
+    manifested_phase: merge
+    note: Orchestrated-task in worktree encountered 'no such file or directory' errors on turns 22–23 during merge-phase thrash (counter=2); matches documented pattern of repeated not-found signals with no other diagnostic context
 - id: entry-cand-20260809-16
   title: Agent falls back to a whole-filesystem `find /` to locate an installed package's source, timing out the Bash call
   severity: medium
@@ -32755,3 +32803,29 @@ candidates:
       [detailed test brittleness critique with RetiredPythonName and modules_binding findings]
 
       [signal_counts: tool_error: 0, self_correct: 0, not_found: 0, df_guard: 0, interrupt: 0, designed_outcome: 0]'
+- id: cand-20261006-1
+  title: Orchestrated-task session truncates with unreferenced missing turns
+  cause: Session fails to generate or persist beyond initial turns, yet generates reference to expected subsequent turns (e.g., turn 60) that don't exist, without corresponding tool_error or interrupt signals to explain the gap
+  area: orchestrated-task session-lifecycle
+  first_seen: '2026-10-06'
+  disposition: pending
+  sightings:
+  - date: '2026-10-06'
+    project: dark_factory
+    session: 35259e65-b74e-4b4f-944d-283800cf8940
+    origin_phase: unknown
+    manifested_phase: unknown
+    evidence_quote: (turn 60) does not exist
+- id: cand-20261006-2
+  title: Exit code interpretation without output validation enables silent state misdiagnosis and reintroduces known-unsafe patterns
+  cause: Subprocess exit codes interpreted as definitive state indicators without checking required output tags/markers that sibling subsystems verify for safety
+  area: watchdog/health-check subsystems that diagnose state from subprocess exit codes
+  first_seen: '2026-10-06'
+  disposition: pending
+  sightings:
+  - date: '2026-10-06'
+    project: dark_factory
+    session: fa60107c-5bd3-4220-8ba4-ea1191827a13
+    origin_phase: implement
+    manifested_phase: ops
+    evidence_quote: The verdict comes from the exit code alone, so exit 2 always becomes the silent 'absent'. But exit 2 has three possible causes... That is why setup-host trusts no status unless the `[dashboard_unit_parity]` tag appears in the output... orchestrator-watchdog.py does not.
