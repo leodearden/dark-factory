@@ -6551,8 +6551,7 @@ def _make_failing_harness(journal, event_buffer, mock_memory_service, tmp_path):
     return harness, esc_queue
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
+_LOCKED_FAILURE_BOOKKEEPING_WRITE = pytest.mark.parametrize(
     ('lock_write', 'failed_write_prefix', 'row_status', 'buffered_after'),
     [
         pytest.param(
@@ -6567,6 +6566,10 @@ def _make_failing_harness(journal, event_buffer, mock_memory_service, tmp_path):
         ),
     ],
 )
+
+
+@pytest.mark.asyncio
+@_LOCKED_FAILURE_BOOKKEEPING_WRITE
 async def test_run_full_cycle_failure_escalates_even_when_failure_bookkeeping_raises(
     journal, event_buffer, mock_memory_service, caplog, tmp_path,
     lock_write, failed_write_prefix, row_status, buffered_after,
@@ -6617,6 +6620,93 @@ async def test_run_full_cycle_failure_escalates_even_when_failure_bookkeeping_is
         await harness.run_full_cycle('test-project', 'buffer_size:1')
 
     assert len(_pending_recon_failures(esc_queue)) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_failure_bookkeeping_lands_despite_a_second_cancellation(
+    journal, event_buffer, mock_memory_service, tmp_path,
+):
+    """Shutdown cancelling the failure handler mid-bookkeeping still lets both
+    writes land, as the cancellation handler's do: the row is not stranded
+    'running' and the drained events are re-buffered."""
+    harness, _ = _make_failing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    await event_buffer.push(_make_event())
+    outer_task_ref: list[asyncio.Task] = []
+    original_complete_run = journal.complete_run
+
+    async def shutdown_cancelling_complete_run(run_id, status):
+        if status == 'failed':
+            outer_task_ref[0].cancel()
+            await asyncio.sleep(0)
+        await original_complete_run(run_id, status)
+
+    journal.complete_run = shutdown_cancelling_complete_run
+
+    outer_task = asyncio.create_task(harness.run_full_cycle('test-project', 'buffer_size:1'))
+    outer_task_ref.append(outer_task)
+    with pytest.raises(asyncio.CancelledError):
+        await outer_task
+
+    async def bookkeeping_landed():
+        [row] = await journal.get_recent_runs('test-project', limit=1)
+        return row.status == 'failed' and await event_buffer.count_buffered('test-project') == 1
+
+    assert await _poll_until(bookkeeping_landed)
+
+
+@pytest.mark.asyncio
+@_LOCKED_FAILURE_BOOKKEEPING_WRITE
+async def test_run_full_cycle_capped_deferral_survives_failing_bookkeeping(
+    journal, event_buffer, mock_memory_service, caplog,
+    lock_write, failed_write_prefix, row_status, buffered_after,
+):
+    """The AllAccountsCapped deferral treats its bookkeeping as the failure
+    handler does: a failing write neither turns the deferral into a raise nor
+    skips the other write."""
+    from shared.cli_invoke import AllAccountsCappedException
+
+    harness = _make_test_harness(journal, event_buffer, mock_memory_service)
+    harness.stages[0].run = _raising_stage_run(
+        lambda: AllAccountsCappedException(retries=3, elapsed_secs=1.0, label='stage'),
+    )
+    await event_buffer.push(_make_event())
+    lock_write(journal, event_buffer)
+
+    with caplog.at_level(logging.ERROR):
+        result = await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    assert result.status == RunStatus.failed
+    assert result.stage_reports['_error']['deferred'] is True
+    [row] = await journal.get_recent_runs('test-project', limit=1)
+    _assert_one_classified_failure_line(
+        caplog, failed_write_prefix,
+        run_id=row.id, errorname='SQLITE_BUSY', errorcode=5,
+    )
+    assert row.status == row_status
+    assert await event_buffer.count_buffered('test-project') == buffered_after
+
+
+@pytest.mark.asyncio
+async def test_run_full_cycle_failed_stage_report_persist_skips_the_judge(
+    journal, event_buffer, mock_memory_service, tmp_path,
+):
+    """The judge reads the stage reports back from the journal, so a failed
+    persist skips it rather than have it review what never landed."""
+    harness, _ = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    assert harness.judge is not None
+    await event_buffer.push(_make_event())
+    _fail_first_call(journal, 'update_run_stage_reports', _sqlite_busy_error)
+    judge_marked_pending = AsyncMock(side_effect=journal.mark_judge_pending)
+    journal.mark_judge_pending = judge_marked_pending
+
+    result = await harness.run_full_cycle('test-project', 'buffer_size:1')
+
+    assert result.status == RunStatus.completed
+    judge_marked_pending.assert_not_awaited()
 
 
 @pytest.mark.asyncio
