@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 from _escalation_seed import seed_escalation
+from _merge_tool_calls import call_merge_cancel, call_merge_request, call_merge_status
 
 from escalation import server as escalation_server
 from escalation.canonical import canonical_root_cause
@@ -3747,12 +3748,6 @@ class TestPromoteToL2SentinelIdentity:
 # ---------------------------------------------------------------------------
 
 
-async def _call_merge_request(server, **kwargs: Any) -> dict[str, Any]:
-    """Invoke the merge_request MCP tool directly."""
-    tool = await server.get_tool('merge_request')
-    return await tool.fn(**kwargs)
-
-
 @pytest.mark.asyncio
 class TestMergeRequestDedup:
     """Server-level de-dup tests for merge_request.
@@ -3805,7 +3800,7 @@ class TestMergeRequestDedup:
         # Call merge_request for branch 'X' — should return in_flight immediately
         # (asyncio.wait_for with 2s proves it does NOT block on the future)
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='X',
                 branch='X',
@@ -3868,7 +3863,7 @@ class TestMergeRequestDedup:
             merge_inflight_registry=registry,
         )
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server, task_id='X', branch='X',
                 worktree=str(tmp_path / 'wt'), description='',
             ),
@@ -3910,7 +3905,7 @@ class TestMergeRequestDedup:
         )
         try:
             result = await asyncio.wait_for(
-                _call_merge_request(
+                call_merge_request(
                     server, task_id='X', branch='X',
                     worktree=str(tmp_path / 'wt'), description='',
                 ),
@@ -3962,7 +3957,7 @@ class TestMergeRequestDedup:
         )
         try:
             result = await asyncio.wait_for(
-                _call_merge_request(
+                call_merge_request(
                     server, task_id='X', branch='X',
                     worktree=str(tmp_path / 'wt'), description='',
                 ),
@@ -4004,7 +3999,7 @@ class TestMergeRequestDedup:
             merge_inflight_registry=registry,
         )
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server, task_id='D', branch='D',
                 worktree=str(tmp_path / 'wt'), description='',
             ),
@@ -4051,7 +4046,7 @@ class TestMergeRequestDedup:
         worker_task = asyncio.create_task(_worker())
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='Y',
                 branch='Y',
@@ -4110,7 +4105,7 @@ class TestMergeRequestDedup:
         worker_task = asyncio.create_task(_worker())
 
         result = await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='RFO',
                 branch='RFO',
@@ -4161,7 +4156,7 @@ class TestMergeRequestDedup:
         worker_task = asyncio.create_task(_worker())
 
         await asyncio.wait_for(
-            _call_merge_request(
+            call_merge_request(
                 server,
                 task_id='RFO2',
                 branch='RFO2',
@@ -4231,7 +4226,7 @@ class TestMergeRequestDedup:
         )
 
         # MCP merge_request for the same branch 'B' must coalesce
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='mcp-caller',
             branch='B',
@@ -4295,14 +4290,14 @@ class TestMergeRequestDedup:
             merge_queue=asyncio.Queue(),
         )
 
-        bare_result = await _call_merge_request(
+        bare_result = await call_merge_request(
             server,
             task_id='123',
             branch='123',
             worktree=str(tmp_path / 'wt-bare'),
             description='',
         )
-        prefixed_result = await _call_merge_request(
+        prefixed_result = await call_merge_request(
             server,
             task_id='123',
             branch='task/123',
@@ -4335,12 +4330,6 @@ class TestMergeRequestDedup:
 # can source from non-orchestrator submission pathways (/merge-queue,
 # /unblock, /do) — mirroring the orchestrator's own emission at
 # workflow.py:1724-1733 (task 2381 alpha / 2383 beta).
-
-
-async def _call_merge_cancel(server, **kwargs: Any) -> dict[str, Any]:
-    """Invoke the merge_cancel MCP tool directly."""
-    tool = await server.get_tool('merge_cancel')
-    return await tool.fn(**kwargs)
 
 
 @pytest.mark.asyncio
@@ -4409,7 +4398,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='777',
             branch='777',
@@ -4442,7 +4431,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             assert result.get('status') == 'queued', (
                 f'Expected status queued, got: {result}'
             )
-            await _call_merge_cancel(server, request_id=result['request_id'])
+            await call_merge_cancel(server, request_id=result['request_id'])
 
     async def test_default_verified_green_emits_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -4492,7 +4481,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='778',
             branch='778',
@@ -4508,7 +4497,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             assert result.get('status') == 'queued', (
                 f'Expected status queued, got: {result}'
             )
-            await _call_merge_cancel(server, request_id=result['request_id'])
+            await call_merge_cancel(server, request_id=result['request_id'])
 
     async def test_verified_green_false_explicit_emits_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -4557,7 +4546,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='779',
             branch='779',
@@ -4574,7 +4563,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             assert result.get('status') == 'queued', (
                 f'Expected status queued, got: {result}'
             )
-            await _call_merge_cancel(server, request_id=result['request_id'])
+            await call_merge_cancel(server, request_id=result['request_id'])
 
     async def test_verified_green_true_but_already_merged_emits_nothing(
         self, tmp_path: Path,
@@ -4608,7 +4597,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='780',
             branch='780',
@@ -4683,7 +4672,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        result = await _call_merge_request(
+        result = await call_merge_request(
             server,
             task_id='781',
             branch='781',
@@ -4699,7 +4688,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             )
         finally:
             if result.get('status') == 'queued':
-                await _call_merge_cancel(server, request_id=result['request_id'])
+                await call_merge_cancel(server, request_id=result['request_id'])
 
     async def test_verified_green_true_on_resubmit_attach_emits_second_row(
         self, tmp_path: Path,
@@ -4730,7 +4719,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             merge_queue=asyncio.Queue(),
         )
 
-        first = await _call_merge_request(
+        first = await call_merge_request(
             server,
             task_id='790',
             branch='790',
@@ -4744,7 +4733,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         )
 
         try:
-            second = await _call_merge_request(
+            second = await call_merge_request(
                 server,
                 task_id='790',
                 branch='790',
@@ -4773,7 +4762,7 @@ class TestMergeRequestWorkflowVerifyEmission:
                     f"Expected data['branch']=='task/790', got: {row}"
                 )
         finally:
-            await _call_merge_cancel(server, request_id=first['request_id'])
+            await call_merge_cancel(server, request_id=first['request_id'])
 
 
 # ---------------------------------------------------------------------------
@@ -5969,12 +5958,6 @@ class TestDowngradeDedupeCorrectness:
 # ---------------------------------------------------------------------------
 
 
-async def _call_merge_status(server, **kwargs) -> dict:
-    """Invoke the merge_status MCP tool (async tool)."""
-    tool = await server.get_tool('merge_status')
-    return await tool.fn(**kwargs)
-
-
 @pytest.mark.asyncio
 @pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestMergeStatus:
@@ -5987,7 +5970,7 @@ class TestMergeStatus:
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue)
 
-        result = await _call_merge_status(server)
+        result = await call_merge_status(server)
 
         assert isinstance(result, dict), f'Expected dict, got {type(result)}'
         assert 'error' in result, f'Expected error key, got: {result}'
@@ -5999,7 +5982,7 @@ class TestMergeStatus:
         esc_queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(esc_queue)  # standalone: no event_store, no harness
 
-        result = await _call_merge_status(server, request_id='mr-deadbeef')
+        result = await call_merge_status(server, request_id='mr-deadbeef')
 
         assert isinstance(result, dict), f'Expected dict, got {type(result)}'
         assert result.get('state') == 'unknown', f'Expected state=unknown, got: {result}'
@@ -6054,7 +6037,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, request_id='mr-statetest')
+        result = await call_merge_status(server, request_id='mr-statetest')
 
         assert result.get('state') == expected_coarse, (
             f'raw={raw_state!r}: expected coarse={expected_coarse!r}, got state={result.get("state")!r}'
@@ -6086,7 +6069,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, branch='feat-branch')
+        result = await call_merge_status(server, branch='feat-branch')
 
         assert result.get('state') == 'done', f'Expected done (most-recent), got: {result}'
         assert result.get('request_id') == 'mr-new', (
@@ -6109,7 +6092,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, task_id='T-tid')
+        result = await call_merge_status(server, task_id='T-tid')
 
         assert result.get('state') == 'done', f'Expected done (most-recent), got: {result}'
         assert result.get('request_id') == 'mr-later', (
@@ -6124,7 +6107,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, request_id='mr-nothere')
+        result = await call_merge_status(server, request_id='mr-nothere')
 
         assert result.get('state') == 'unknown', f'Expected unknown, got: {result}'
         assert 'hint' in result
@@ -6147,7 +6130,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, request_id='mr-aaaa1111')
+        result = await call_merge_status(server, request_id='mr-aaaa1111')
 
         assert result.get('state') == 'done', f'Expected done from ring, got: {result}'
         assert result.get('request_id') == 'mr-aaaa1111'
@@ -6180,7 +6163,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, request_id='mr-ringwin')
+        result = await call_merge_status(server, request_id='mr-ringwin')
 
         assert result.get('state') == 'blocked', (
             f'Expected ring value (blocked) to beat event store (done), got: {result}'
@@ -6203,7 +6186,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, request_id='mr-in-ev-only')
+        result = await call_merge_status(server, request_id='mr-in-ev-only')
 
         assert result.get('state') == 'conflict', (
             f'Expected conflict from event-store fallback, got: {result}'
@@ -6242,7 +6225,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result_ring = await _call_merge_status(server, request_id='mr-reason-ring')
+        result_ring = await call_merge_status(server, request_id='mr-reason-ring')
 
         assert result_ring.get('state') == 'blocked', (
             f'Expected state=blocked from ring, got: {result_ring}'
@@ -6275,7 +6258,7 @@ class TestMergeStatus:
             esc_queue2, harness=stub_harness2, event_store=event_store
         )
 
-        result_ev = await _call_merge_status(server2, request_id='mr-reason-ev')
+        result_ev = await call_merge_status(server2, request_id='mr-reason-ev')
 
         assert result_ev.get('state') == 'blocked', (
             f'Expected state=blocked from event store, got: {result_ev}'
@@ -6302,7 +6285,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, branch='branch-bylookup')
+        result = await call_merge_status(server, branch='branch-bylookup')
 
         assert result.get('state') == 'done', (
             f'Expected done from ring branch lookup, got: {result}'
@@ -6330,7 +6313,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, task_id='T-ltask')
+        result = await call_merge_status(server, task_id='T-ltask')
 
         assert result.get('state') == 'blocked', (
             f'Expected blocked from ring task_id lookup, got: {result}'
@@ -6361,7 +6344,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, branch='branch-ring-wins')
+        result = await call_merge_status(server, branch='branch-ring-wins')
 
         assert result.get('state') == 'blocked', (
             f'Expected ring value (blocked) to beat event store (done) on branch= poll, '
@@ -6384,7 +6367,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, request_id='mr-coalesced-alias')
+        result = await call_merge_status(server, request_id='mr-coalesced-alias')
 
         assert result.get('state') == 'done', (
             f'Expected done from coalesced-id alias resolution, got: {result}'
@@ -6417,7 +6400,7 @@ class TestMergeStatus:
 
         # Supply both request_id (ring-miss) and branch (ring-hit).
         # The ring tier must NOT resolve via branch because request_id is present.
-        result = await _call_merge_status(server, request_id='mr-miss', branch='prec-branch')
+        result = await call_merge_status(server, request_id='mr-miss', branch='prec-branch')
 
         # Should fall through to unknown (not 'done' from the ring's branch record)
         assert result.get('state') == 'unknown', (
@@ -6447,7 +6430,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=None, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, task_id='T-rtask')
+        result = await call_merge_status(server, task_id='T-rtask')
 
         assert result.get('state') == 'conflict', (
             f'Expected ring value (conflict) to beat event store (done) on task_id= poll, '
@@ -6484,7 +6467,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=worker)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, request_id=req.request_id)
+        result = await call_merge_status(server, request_id=req.request_id)
 
         assert result.get('state') == 'queued', f'Expected queued, got: {result}'
         assert result.get('request_id') == req.request_id
@@ -6513,7 +6496,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=worker)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, branch='branch-bylookup')
+        result = await call_merge_status(server, branch='branch-bylookup')
 
         assert result.get('state') == 'queued', f'Expected queued, got: {result}'
         assert result.get('request_id') == req.request_id, (
@@ -6538,7 +6521,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=worker)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, task_id='T-ltask')
+        result = await call_merge_status(server, task_id='T-ltask')
 
         assert result.get('state') == 'queued', f'Expected queued, got: {result}'
         assert result.get('request_id') == req.request_id, (
@@ -6580,7 +6563,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=worker, _terminal_retention=ring)
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
-        result = await _call_merge_status(server, request_id=req.request_id)
+        result = await call_merge_status(server, request_id=req.request_id)
 
         # Live snapshot is 'queued'; ring+event store have 'done'
         # Live must win
@@ -6670,7 +6653,7 @@ class TestMergeStatus:
         stub_harness = types.SimpleNamespace(_merge_worker=worker)
         server = create_server(esc_queue, harness=stub_harness)
 
-        result = await _call_merge_status(server, request_id=req.request_id)
+        result = await call_merge_status(server, request_id=req.request_id)
 
         assert result.get('state') == expected, (
             f'verify_phase={verify_phase!r}: expected {expected!r}, got {result.get("state")!r}'
@@ -6707,7 +6690,7 @@ class TestMergeStatus:
         server = create_server(esc_queue, harness=stub_harness, event_store=event_store)
 
         # Should NOT raise; should fall through to the event-store tier.
-        result = await _call_merge_status(server, request_id='mr-snapfail')
+        result = await call_merge_status(server, request_id='mr-snapfail')
 
         assert result.get('state') == 'done', (
             f'Expected durable-tier result after snapshot() failure, got: {result}'
@@ -6818,8 +6801,8 @@ async def _call_tool(server: Any, name: str, **kwargs: Any) -> Any:
 
     *server* is intentionally typed ``Any`` so pyright does not reach into
     FastMCP's ``Tool`` internals (``.fn``) — mirroring the ``_blocker`` /
-    ``_info`` / ``_call_merge_status`` helpers above, which the type-check gate
-    accepts for exactly this reason.
+    ``_info`` helpers above and ``_merge_tool_calls.py::call_merge_status``,
+    which the type-check gate accepts for exactly this reason.
     """
     tool = await server.get_tool(name)
     return await tool.fn(**kwargs)
