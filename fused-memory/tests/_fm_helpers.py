@@ -654,6 +654,28 @@ MCP_SAFE_RESPONSE_CHARS = 62_000
 
 
 # ---------------------------------------------------------------------------
+# Topic-guard note fixtures (task 3054)
+# ---------------------------------------------------------------------------
+# One note drives both the pure-matcher assertions in test_config_schema.py
+# and the whole-tool assertions in server/test_add_memory_near_duplicate_gate.py,
+# so an edit to it moves both suites and neither silently tests a stale note.
+# ---------------------------------------------------------------------------
+
+STRADDLING_WRITE_FIXTURE = (
+    'Warm-lane reseed gotcha: when a task is dispatched into a recycled warm '
+    'lane, the in-worktree .task/plan.json can be a DANGLING absolute symlink '
+    'whose target worktrees/.task-meta/<lane>/plan.json was never written or '
+    'was scrubbed. The architect then sees no plan and may wrongly call '
+    'report_task_already_done instead of replanning.'
+)
+
+MERGE_BASE_NEGATIVE_CONTROL_NOTE = (
+    'Use git merge-base --is-ancestor <sha> <branch> to test whether a '
+    'commit is an ancestor of a branch tip before cherry-picking.'
+)
+
+
+# ---------------------------------------------------------------------------
 # Shared Qdrant test scaffolding (task 2277)
 # ---------------------------------------------------------------------------
 #
