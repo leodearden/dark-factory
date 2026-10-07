@@ -1037,6 +1037,7 @@
     "orchestrator/tests/test_lane_lock_leak_guard.py": {"patch_targets": [], "private_reads": 30},
     "orchestrator/tests/test_lane_state_lib.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_laptop_warm_verify_boundary.py": {"patch_targets": [], "private_reads": 1},
+    "orchestrator/tests/test_main_tip_sweep_seed_mode.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_mcp_post_transport.py": {"patch_targets": [], "private_reads": 13},
     "orchestrator/tests/test_merge_attempt_disposition.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_boundary_effective_module_configs.py": {"patch_targets": ["build_merge_verify_spec", "effective_merge_module_configs"], "private_reads": 9},
