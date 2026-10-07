@@ -152,8 +152,8 @@ def _reconcile_flag_type_field(
 ) -> None:
     has_singular = 'flag_type' in metadata
     has_plural = 'flag_types' in metadata
-    singular = metadata.pop('flag_type', None)
-    plural = canonical_flag_types(_as_flag_type_list(metadata.pop('flag_types', None)))
+    singular = metadata.get('flag_type')
+    plural = canonical_flag_types(_as_flag_type_list(metadata.get('flag_types')))
     singular_as_list = [str(singular)] if singular not in (None, '') else []
     if has_singular and has_plural and singular_as_list != plural:
         raise FlagRecordSchemaError(
@@ -162,17 +162,19 @@ def _reconcile_flag_type_field(
         )
     flag_types = plural if has_plural else singular_as_list
     if canonical_field == 'flag_types':
+        metadata.pop('flag_type', None)
         if flag_types:
             metadata['flag_types'] = flag_types
+        else:
+            metadata.pop('flag_types', None)
         return
     if len(flag_types) > 1:
         raise FlagRecordSchemaError(
             f'a {kind!r} record carries exactly one flag_type; '
             f'flag_types={flag_types!r} cannot be narrowed without loss'
         )
-    if has_singular:
-        metadata['flag_type'] = singular
-    elif flag_types:
+    metadata.pop('flag_types', None)
+    if not has_singular and flag_types:
         metadata['flag_type'] = flag_types[0]
 
 
