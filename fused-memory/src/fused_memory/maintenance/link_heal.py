@@ -242,20 +242,42 @@ class CorpusFormatError(ValueError):
 _SHA256_HEX = re.compile(r'[0-9a-f]{64}')
 
 
-def load_corpus_bases(path: Path) -> tuple[LinkBasis, ...]:
+@dataclass(frozen=True)
+class CorpusRow:
+    """One hand-link corpus row: the basis it supports, and the kind its link showed when rated."""
+
+    basis: LinkBasis
+    kind_at_rating: str | None
+
+
+def load_corpus_rows(path: Path) -> tuple[CorpusRow, ...]:
     """Every row of the committed hand-link corpus, parsed strictly."""
-    bases: list[LinkBasis] = []
+    rows: list[CorpusRow] = []
     seen: set[tuple[str, str, str]] = set()
     for line_no, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
         if not line.strip():
             continue
-        basis = _corpus_basis(_corpus_row(line, line_no), line_no)
+        row = _corpus_entry(_corpus_row(line, line_no), line_no)
+        basis = row.basis
         link = (basis.project_id, basis.child_id, basis.parent_id)
         if link in seen:
             raise CorpusFormatError(f'{basis.key}: duplicate link {link}')
         seen.add(link)
-        bases.append(basis)
-    return tuple(bases)
+        rows.append(row)
+    return tuple(rows)
+
+
+def load_corpus_bases(path: Path) -> tuple[LinkBasis, ...]:
+    """The basis of every row of the committed hand-link corpus."""
+    return tuple(row.basis for row in load_corpus_rows(path))
+
+
+def _corpus_entry(row: dict[str, Any], line_no: int) -> CorpusRow:
+    basis = _corpus_basis(row, line_no)
+    kind = row.get('kind_at_rating')
+    if kind is not None and not isinstance(kind, str):
+        raise CorpusFormatError(f'{basis.key}: kind_at_rating is neither a string nor null')
+    return CorpusRow(basis=basis, kind_at_rating=kind)
 
 
 def _corpus_row(line: str, line_no: int) -> dict[str, Any]:

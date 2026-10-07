@@ -29,35 +29,74 @@ Two populations:
   ``calibration/write_triage_pairs_to_rate.jsonl``. A pairs row lacking either
   key is refused.
 
+Arm ``fake`` is a deterministic stand-in, pure in the texts, that runs the real
+sharding and parsing path with no CLI call. A real arm names a Claude CLI model
+alias. A storm of failed shards is recorded on its arm row, never filed: this is
+measurement.
+
 Usage, from ``fused-memory/``::
 
     uv run python scripts/eval_link_adjudicator.py \\
         --corpus calibration/hand_link_verdicts.jsonl --arms opus,sonnet
+
+The report goes to ``--out`` (default ``calibration/link_adjudicator_report.json``,
+or ``calibration/link_adjudicator_report_triage.json`` with ``--pairs``) and to
+stdout. Exit 0 when it is written; 2 when the corpus or pairs are refused.
 """
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import copy
+import hashlib
 import importlib.util
+import json
+import logging
 import math
 import sys
 import types
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
-from fused_memory.maintenance.link_adjudicator import LinkVerdict
+from shared.safe_io import atomic_write_text
+
+from fused_memory.config.schema import FusedMemoryConfig, LinkHealConfig
+from fused_memory.maintenance._utils import override_config_path
+from fused_memory.maintenance.link_adjudicator import (
+    RATER_BRIEF_PATH,
+    ClaudeShardAsker,
+    LinkPair,
+    LinkVerdict,
+    Shard,
+    ShardAsker,
+    ShardItem,
+    ShardReply,
+    adjudicate_links,
+)
 from fused_memory.maintenance.link_heal import (
     AGREEING_VERDICTS,
     MISFILE_VERDICTS,
+    CorpusRow,
     KindClass,
     Verdict,
     healed_kind,
     kind_class,
+    load_corpus_rows,
+)
+from fused_memory.maintenance.link_heal_store import (
+    LinkHealStore,
+    LiveRecord,
+    StoreReadFailed,
+    StoreUnreachable,
+    ToolCaller,
+    server_tool_caller,
 )
 from fused_memory.server.grouped_read import AMENDMENT_KIND
 
@@ -374,3 +413,256 @@ def build_report(
         'arms': [dict(row) for row in arms],
         'selection': select_arm(arms) if arms else None,
     }
+
+
+class EvalRefused(Exception):
+    """The eval refused its inputs before scoring anything."""
+
+
+REFUSALS = (EvalRefused, OSError, ValueError)
+
+EXIT_OK = 0
+EXIT_REFUSED = 2
+
+_CALIBRATION = _SCRIPTS.parent / 'calibration'
+DEFAULT_OUT: Mapping[Mode, Path] = MappingProxyType({
+    Mode.HAND_LINK: _CALIBRATION / 'link_adjudicator_report.json',
+    Mode.TRIAGE: _CALIBRATION / 'link_adjudicator_report_triage.json',
+})
+
+FAKE_ARM = 'fake'
+_FAKE_WORDS = tuple(Verdict)
+
+
+class FakeShardAsker:
+    """A deterministic arm, pure in the texts: each item's word is picked by the
+    sha256 of its child and parent, and answered through the real reply shape."""
+
+    async def __call__(self, shard: Shard) -> ShardReply:
+        return ShardReply(success=True, structured_output={
+            'verdicts': [
+                {'id': item.item_id, 'verdict': _fake_word(item), 'reason': 'fake arm: text hash'}
+                for item in shard.items
+            ],
+        })
+
+
+def _fake_word(item: ShardItem) -> str:
+    digest = hashlib.sha256(f'{item.child_text}\0{item.parent_text}'.encode()).digest()
+    return _FAKE_WORDS[digest[0] % len(_FAKE_WORDS)].value
+
+
+def default_ask_for(arm: str) -> ShardAsker:
+    return FakeShardAsker() if arm == FAKE_ARM else ClaudeShardAsker()
+
+
+class _CostMeter:
+    """A ShardAsker that sums what each reply cost."""
+
+    def __init__(self, ask: ShardAsker) -> None:
+        self._ask = ask
+        self.cost_usd = 0.0
+
+    async def __call__(self, shard: Shard) -> ShardReply:
+        reply = await self._ask(shard)
+        self.cost_usd += reply.cost_usd
+        return reply
+
+
+def load_config(config_path: str | None) -> FusedMemoryConfig:
+    """The config as its file reads now; ``$CONFIG_PATH`` when *config_path* is None."""
+    with override_config_path(config_path):
+        return FusedMemoryConfig()
+
+
+@dataclass(frozen=True)
+class EvalEnv:
+    """What the eval reaches beyond its arguments. The defaults are production's."""
+
+    config_loader: Callable[[str | None], FusedMemoryConfig] = load_config
+    tool_caller_for: Callable[[str], AbstractAsyncContextManager[ToolCaller]] = (
+        server_tool_caller
+    )
+    ask_for: Callable[[str], ShardAsker] = default_ask_for
+
+
+async def _live_pair(row: CorpusRow, store: LinkHealStore) -> tuple[LiveRecord, LiveRecord] | Exclusion:
+    """The rated pair's child and parent as they read now, while they still hash as rated."""
+    basis = row.basis
+    if not basis.rated_text_matches_live:
+        return Exclusion.RATED_TEXT_MISMATCH
+    try:
+        child = await store.read(basis.project_id, basis.child_id)
+        parent = await store.read(basis.project_id, basis.parent_id)
+    except StoreReadFailed:
+        return Exclusion.READ_FAILED
+    if child is None:
+        return Exclusion.CHILD_MISSING
+    if child.text_sha256 != basis.child_sha256:
+        return Exclusion.CHILD_TEXT_CHANGED
+    if parent is None:
+        return Exclusion.PARENT_MISSING
+    if parent.text_sha256 != basis.parent_sha256:
+        return Exclusion.PARENT_TEXT_CHANGED
+    return child, parent
+
+
+async def hand_link_population(rows: Sequence[CorpusRow], store: LinkHealStore) -> Population:
+    items: list[ScoredItem] = []
+    excluded: list[Exclusion] = []
+    for row in rows:
+        live = await _live_pair(row, store)
+        if isinstance(live, Exclusion):
+            excluded.append(live)
+            continue
+        child, parent = live
+        items.append(ScoredItem(
+            key=row.basis.key,
+            child_text=child.text,
+            parent_text=parent.text,
+            truth=truth_class(row.basis.verdict),
+            kind_at_rating=row.kind_at_rating,
+            majority=row.basis.verdict,
+        ))
+    return Population(items=tuple(items), excluded=Counter(excluded))
+
+
+async def _load_hand_links(
+    args: argparse.Namespace, config: FusedMemoryConfig, env: EvalEnv,
+) -> Population:
+    rows = load_corpus_rows(args.corpus)
+    server_url = args.server_url or f'http://127.0.0.1:{config.server.port}'
+    async with env.tool_caller_for(server_url) as tool_caller:
+        store = LinkHealStore(tool_caller)
+        if rows:
+            await _probe(store, rows[0].basis.project_id, server_url)
+        return await hand_link_population(rows, store)
+
+
+async def _probe(store: LinkHealStore, project_id: str, server_url: str) -> None:
+    try:
+        await store.probe(project_id)
+    except StoreUnreachable as failure:
+        raise EvalRefused(
+            f'the fused-memory server at {server_url} did not answer a read of {project_id} '
+            f'({failure.error_type}: {failure.detail})',
+        ) from failure
+
+
+def _jsonl(path: Path) -> list[dict[str, Any]]:
+    rows = []
+    for line_no, line in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError as exc:
+            raise EvalRefused(f'{path} line {line_no}: not JSON ({exc})') from exc
+    return rows
+
+
+async def _load_population(
+    args: argparse.Namespace, config: FusedMemoryConfig, env: EvalEnv, mode: Mode,
+) -> Population:
+    if mode is Mode.TRIAGE:
+        return triage_items(_jsonl(args.corpus), _jsonl(args.pairs))
+    return await _load_hand_links(args, config, env)
+
+
+async def score_arm_run(
+    arm: str,
+    population: Population,
+    *,
+    link_heal: LinkHealConfig,
+    ask: ShardAsker,
+    mode: Mode,
+) -> dict[str, Any]:
+    """One arm's row: its figures over *population*, its cost, and any failure storm."""
+    meter = _CostMeter(ask)
+    storms: list[Mapping[str, Any]] = []
+    verdicts = await adjudicate_links(
+        [LinkPair(item.key, item.child_text, item.parent_text) for item in population.items],
+        model=arm,
+        shard_size=link_heal.shard_size,
+        field_chars=link_heal.field_chars,
+        failure_streak=link_heal.shard_failure_streak,
+        ask=meter,
+        on_failure_storm=storms.append,
+    )
+    row: dict[str, Any] = {
+        'arm': arm,
+        'cost_usd': meter.cost_usd,
+        'failure_storm': dict(storms[0]) if storms else None,
+        **score_arm(population.items, verdicts),
+    }
+    if mode is Mode.HAND_LINK:
+        row.update(kind_agreement(population.items, verdicts))
+    return row
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _arm_list(text: str) -> list[str]:
+    arms = list(dict.fromkeys(part.strip() for part in text.split(',') if part.strip()))
+    if not arms:
+        raise argparse.ArgumentTypeError('names no arm')
+    return arms
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog='eval_link_adjudicator.py',
+        description='Score link-adjudicator arms against blind majority verdicts (PRD H3).',
+    )
+    parser.add_argument('--corpus', type=Path, required=True, metavar='PATH',
+                        help='the hand-link corpus, or with --pairs the per-rater verdict rows')
+    parser.add_argument('--arms', type=_arm_list, required=True, metavar='ARM,ARM',
+                        help=f'model aliases, or {FAKE_ARM!r}')
+    parser.add_argument('--pairs', type=Path, metavar='PATH',
+                        help='λ mode: the pairs file holding each rated pair\'s texts')
+    parser.add_argument('--out', type=Path, metavar='PATH', help='where to write the report')
+    parser.add_argument('--config', help='fused-memory config YAML (default: $CONFIG_PATH)')
+    parser.add_argument('--server-url',
+                        help='fused-memory server (default: http://127.0.0.1:<server.port>)')
+    return parser
+
+
+async def run(argv: Sequence[str], env: EvalEnv) -> int:
+    args = build_parser().parse_args(argv)
+    config = env.config_loader(args.config)
+    mode = Mode.HAND_LINK if args.pairs is None else Mode.TRIAGE
+    try:
+        population = await _load_population(args, config, env, mode)
+    except REFUSALS as refusal:
+        print(f'eval_link_adjudicator refused: {refusal}', file=sys.stderr)
+        return EXIT_REFUSED
+    arms = [
+        await score_arm_run(
+            arm, population, link_heal=config.link_heal, ask=env.ask_for(arm), mode=mode,
+        )
+        for arm in args.arms
+    ]
+    report = build_report(
+        population, arms,
+        mode=mode,
+        corpus_sha256=_sha256(args.corpus),
+        pairs_sha256=None if args.pairs is None else _sha256(args.pairs),
+        brief_sha256=_sha256(RATER_BRIEF_PATH),
+        field_chars=config.link_heal.field_chars,
+        shard_size=config.link_heal.shard_size,
+    )
+    document = json.dumps(report, indent=2, sort_keys=True) + '\n'
+    atomic_write_text(args.out or DEFAULT_OUT[mode], document)
+    print(document, end='')
+    return EXIT_OK
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+    return asyncio.run(run(sys.argv[1:], EvalEnv()))
+
+
+if __name__ == '__main__':
+    sys.exit(main())
