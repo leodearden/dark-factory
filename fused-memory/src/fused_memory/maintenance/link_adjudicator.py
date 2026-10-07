@@ -10,21 +10,34 @@ The adjudicator is pure in (child text, parent text). A :class:`LinkPair`
 carries nothing else, so ratings, kinds, the contested flag and the pair's
 source cannot reach the model. Of the maintenance package, it imports only
 ``link_heal``.
+
+The seam is :class:`ShardAsker`: a structured :class:`Shard` in, a
+:class:`ShardReply` out. :func:`adjudicate_links` owns sharding, id validation,
+parsing and the failed-shard streak, so every asker, fake or real, runs through
+them. :class:`ClaudeShardAsker` is the production asker, in the shape of
+``middleware/path_scope_adjudicator.py::PathScopeAdjudicator.adjudicate`` and
+``reconciliation/judge.py::Judge._call_judge_cli``: the Claude CLI over OAuth,
+schema-bound output, every tool denied, no MCP servers, a neutral cwd.
 """
 
 from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
+from shared.cli_invoke import AgentResult, invoke_with_cap_retry, no_mcp_servers_config
+from shared.neutral_cwd import neutral_cli_cwd
 from shared.storm_counter import StormCounter
 
 from fused_memory.maintenance.link_heal import Verdict
+
+if TYPE_CHECKING:
+    from fused_memory.config.schema import LinkHealConfig
 
 RATER_BRIEF_PATH = (
     Path(__file__).resolve().parents[3] / 'calibration' / 'write_triage_rater_brief.md'
@@ -166,15 +179,17 @@ async def adjudicate_links(
     shard_size: int,
     field_chars: int,
     failure_streak: int,
-    ask: ShardAsker,
+    ask: ShardAsker | None = None,
     on_failure_storm: StormHook | None = None,
 ) -> list[LinkVerdict]:
     """One :class:`LinkVerdict` per pair, in order; a failure is counted, never defaulted.
 
-    *failure_streak* consecutive failed shards stop the run: *on_failure_storm*
-    gets the storm summary, and every pair not yet asked fails as not_attempted.
+    *ask* defaults to a :class:`ClaudeShardAsker`. *failure_streak* consecutive
+    failed shards stop the run: *on_failure_storm* gets the storm summary, and
+    every pair not yet asked fails as not_attempted.
     """
     _refuse_duplicate_keys(pairs)
+    ask = ask if ask is not None else ClaudeShardAsker()
     chunks = _chunks(pairs, shard_size)
     streak = _ShardFailureStreak(failure_streak)
     verdicts: list[LinkVerdict] = []
@@ -328,3 +343,93 @@ class _ShardFailureStreak:
             label=outcome[0].value,
         )
         return None if storm is None else {**storm, 'shards_failed': self.shards_failed}
+
+
+#: Never 1; see reconciliation/judge.py::_JUDGE_CLI_MAX_TURNS for why.
+_MAX_TURNS = 3
+#: One shard is up to 40 pairs of two 4,000-character texts: ~80k input tokens.
+_SHARD_TIMEOUT_SECONDS = 900.0
+_SHARD_MAX_BUDGET_USD = 5.0
+#: An operator-run script waits out a usage cap for at most this long per shard.
+_CAP_WAIT_SANITY_SECONDS = 3600.0
+
+Invoke: TypeAlias = Callable[..., Awaitable[AgentResult]]
+
+
+class ClaudeShardAsker:
+    """Asks one shard of the Claude CLI, with the rater brief read afresh as its instructions."""
+
+    def __init__(
+        self,
+        *,
+        brief_path: Path = RATER_BRIEF_PATH,
+        invoke: Invoke = invoke_with_cap_retry,
+        timeout_seconds: float = _SHARD_TIMEOUT_SECONDS,
+        max_budget_usd: float = _SHARD_MAX_BUDGET_USD,
+        max_turns: int = _MAX_TURNS,
+    ) -> None:
+        self._brief_path = brief_path
+        self._invoke = invoke
+        self._timeout_seconds = timeout_seconds
+        self._max_budget_usd = max_budget_usd
+        self._max_turns = max_turns
+
+    async def __call__(self, shard: Shard) -> ShardReply:
+        try:
+            result = await self._invoke(
+                usage_gate=None,
+                label=f'link-adjudicator[{shard.model}]',
+                prompt=render_user_prompt(shard),
+                system_prompt=render_system_prompt(self._brief_path.read_text(encoding='utf-8')),
+                cwd=neutral_cli_cwd(),
+                model=shard.model,
+                max_turns=self._max_turns,
+                max_budget_usd=self._max_budget_usd,
+                disallowed_tools=['*'],
+                output_schema=VERDICT_OUTPUT_SCHEMA,
+                mcp_config=no_mcp_servers_config(),
+                strict_mcp_config=True,
+                permission_mode='bypassPermissions',
+                timeout_seconds=self._timeout_seconds,
+                cap_wait_sanity_secs=_CAP_WAIT_SANITY_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001 — a failed call is a failed shard
+            return ShardReply(success=False, detail=f'{type(exc).__name__}: {exc}')
+        return _shard_reply(result)
+
+
+def _shard_reply(result: AgentResult) -> ShardReply:
+    detail = '' if result.success else f'subtype={result.subtype!r} timed_out={result.timed_out}'
+    return ShardReply(
+        success=result.success,
+        structured_output=result.structured_output,
+        cost_usd=result.cost_usd,
+        detail=detail,
+    )
+
+
+class LinkAdjudicator(Protocol):
+    async def __call__(
+        self, pairs: Sequence[LinkPair], *, on_failure_storm: StormHook | None = None,
+    ) -> list[LinkVerdict]: ...
+
+
+def configured_adjudicator(
+    config: LinkHealConfig, *, ask: ShardAsker | None = None,
+) -> LinkAdjudicator:
+    """:func:`adjudicate_links` with the ``link_heal`` leaves bound, as read now."""
+
+    async def adjudicate(
+        pairs: Sequence[LinkPair], *, on_failure_storm: StormHook | None = None,
+    ) -> list[LinkVerdict]:
+        return await adjudicate_links(
+            pairs,
+            model=config.adjudicator_model,
+            shard_size=config.shard_size,
+            field_chars=config.field_chars,
+            failure_streak=config.shard_failure_streak,
+            ask=ask,
+            on_failure_storm=on_failure_storm,
+        )
+
+    return adjudicate

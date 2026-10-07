@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import pytest
@@ -357,7 +357,7 @@ class TestShardFailureStorm:
                 return ShardReply(success=False, detail='down')
             return ShardReply(success=True, structured_output=[])
 
-        storms: list[dict] = []
+        storms: list[Mapping[str, Any]] = []
         ask = FakeAsker(failing)
 
         verdicts = await _adjudicate(
@@ -383,7 +383,7 @@ class TestShardFailureStorm:
                 return ShardReply(success=False, detail='flaky')
             return _valid(call, shard)
 
-        storms: list[dict] = []
+        storms: list[Mapping[str, Any]] = []
         ask = FakeAsker(alternating)
 
         verdicts = await _adjudicate(
@@ -521,7 +521,7 @@ class TestConfiguredAdjudicator:
     @pytest.mark.asyncio
     async def test_the_streak_leaf_bounds_consecutive_failed_shards(self):
         ask = FakeAsker(lambda call, shard: ShardReply(success=False, detail='down'))
-        storms: list[dict] = []
+        storms: list[Mapping[str, Any]] = []
         adjudicate = configured_adjudicator(
             LinkHealConfig(shard_size=1, shard_failure_streak=2), ask=ask,
         )
