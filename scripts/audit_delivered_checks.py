@@ -148,9 +148,15 @@ DEFECT_DISPOSITIONS = (
     DISPOSITION_UNWIRED_LIVE_GATE,
 )
 
+#: The kinds given a polarity disposition. Not ``path``: the supersession
+#: pickaxe (:func:`find_superseding_task`) has no path counterpart, so a done
+#: path check that fails could not be told apart from a superseded one.
+POLARITY_SWEPT_KINDS = ("grep",)
+
 
 class DescriptorRow(NamedTuple):
-    """One ``kind: grep`` delivered_check, joined to its producer's status.
+    """One ``kind: grep`` or ``kind: path`` delivered_check, joined to its
+    producer's status. ``pattern`` is ``None`` on a path row.
 
     ``status`` is ``None`` when the descriptor came from a sidecar naming a
     task this project's tasks.db does not carry — the COVERAGE case, kept as a
@@ -333,7 +339,7 @@ def evaluate_row(row: DescriptorRow, *, repo_root: str, ref: str = GATE_REF) -> 
 # ---------------------------------------------------------------------------
 
 
-def _grep_rows_from_checks(
+def _mechanical_rows_from_checks(
     checks: list[dict],
     *,
     task_id: int,
@@ -343,38 +349,48 @@ def _grep_rows_from_checks(
     manifest: str | None = None,
     task_label: str | None = None,
 ) -> list[DescriptorRow]:
-    """Filter *checks* down to evaluable grep descriptors and shape them.
+    """Filter *checks* down to the grep and path descriptors and shape them.
 
-    Only ``kind == 'grep'`` survives: the sweep is a statement about grep
-    POLARITY against a tree, and a script check has no pattern to evaluate
-    (its own guard is TestCheckedInScriptCheckTargets). ``kind == 'path'`` is
-    not swept either: :func:`find_superseding_task` is a pickaxe over a
-    PATTERN and this tool has no path-history counterpart to it, so a done
-    path check that fails could not be told apart from a superseded one. A grep entry with
-    no pattern is a SCHEMA defect the corpus validator owns, not a delivery
-    one.
+    ``grep`` rows feed the polarity dispositions and the stale-path sweep;
+    ``path`` rows feed only the stale-path sweep (see
+    :data:`POLARITY_SWEPT_KINDS`). A script check has no tree predicate (its
+    own guard is TestCheckedInScriptCheckTargets). A grep entry with no
+    pattern, or a path entry with no usable paths, is a SCHEMA defect the
+    corpus validator owns, not a delivery one.
     """
     rows = []
     for check in checks:
-        if not isinstance(check, dict) or check.get("kind") != "grep":
+        if not isinstance(check, dict):
             continue
-        pattern = check.get("pattern")
+        kind = check.get("kind")
         name = check.get("name")
-        if not isinstance(pattern, str) or not pattern:
-            continue
+        pattern = check.get("pattern")
+        raw_paths = check.get("paths")
+        paths = tuple(
+            p for p in (raw_paths if isinstance(raw_paths, (list, tuple)) else [])
+            if isinstance(p, str)
+        )
         if not isinstance(name, str) or not name:
             continue
-        paths = check.get("paths")
+        if kind == "grep":
+            if not isinstance(pattern, str) or not pattern:
+                continue
+        elif kind == "path":
+            if not paths:
+                continue
+            pattern = None
+        else:
+            continue
         rows.append(
             DescriptorRow(
                 task_id=task_id,
                 tag=tag,
                 status=status,
                 name=name,
-                kind="grep",
+                kind=kind,
                 pattern=pattern,
                 expect=check.get("expect"),
-                paths=tuple(p for p in (paths or []) if isinstance(p, str)),
+                paths=paths,
                 source=source,
                 manifest=manifest,
                 task_label=task_label,
@@ -388,7 +404,7 @@ class TaskIndex(NamedTuple):
 
     ``metadata_rows`` and ``stamped_names`` are two views of ONE fact — what
     is stamped — derived from the same per-task extraction, so they cannot
-    drift apart. ``metadata_rows`` holds only the evaluable grep descriptors;
+    drift apart. ``metadata_rows`` holds the grep AND path descriptors;
     ``stamped_names`` holds ``(task_id, name)`` for EVERY stamped
     delivered_check, whatever its kind — the set a sidecar capability is
     deduplicated against.
@@ -425,7 +441,7 @@ def load_task_index(db_path: str) -> TaskIndex:
             stamps[task_id] = record["updated_at"]
             checks = extract_delivered_checks(record["metadata"])
             metadata_rows.extend(
-                _grep_rows_from_checks(
+                _mechanical_rows_from_checks(
                     checks,
                     task_id=task_id,
                     tag=record["tag"],
@@ -475,7 +491,8 @@ def manifest_paths(project_root: str) -> list[Path]:
 def load_manifest_checks(
     project_root: str, statuses: dict[int, tuple[str, str]]
 ) -> tuple[list[DescriptorRow], int]:
-    """Sidecar grep descriptors, joined to *statuses*; plus the unloadable count.
+    """Sidecar grep and path descriptors, joined to *statuses*; plus the
+    unloadable count.
 
     *statuses* maps ``task_id -> (tag, status)``. A capability whose task is
     absent gets ``status=None``, which :func:`classify_descriptor` renders as
@@ -506,15 +523,15 @@ def load_manifest_checks(
             tag, status = statuses.get(int(task_id), ("master", None))
             for cap in task.capabilities:
                 check = cap.delivered_check
-                if check is None or check.kind != "grep":
+                if check is None or check.kind not in ("grep", "path"):
                     continue
                 rows.extend(
-                    _grep_rows_from_checks(
+                    _mechanical_rows_from_checks(
                         [
                             {
                                 "name": cap.name,
-                                "kind": "grep",
-                                "pattern": check.pattern,
+                                "kind": check.kind,
+                                "pattern": check.pattern if check.kind == "grep" else None,
                                 "expect": check.expect,
                                 "paths": list(check.paths),
                             }
@@ -686,9 +703,13 @@ def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
     open_dependents = load_open_dependents(db)
     manifest_rows, unloadable = load_manifest_checks(project_root, index.statuses)
 
+    polarity_manifest_rows = [r for r in manifest_rows if r.kind in POLARITY_SWEPT_KINDS]
     rows = [
-        *index.metadata_rows,
-        *(r for r in manifest_rows if (r.task_id, r.name) not in index.stamped_names),
+        *(r for r in index.metadata_rows if r.kind in POLARITY_SWEPT_KINDS),
+        *(
+            r for r in polarity_manifest_rows
+            if (r.task_id, r.name) not in index.stamped_names
+        ),
     ]
 
     findings: list[Finding] = []
@@ -725,7 +746,9 @@ def audit_project(project_root: str, ref: str = GATE_REF) -> ProjectAudit:
     return ProjectAudit(
         project_root=project_root,
         findings=findings,
-        structural=structural_findings(manifest_rows, repo_root=project_root, ref=ref),
+        structural=structural_findings(
+            polarity_manifest_rows, repo_root=project_root, ref=ref
+        ),
         coverage=AuditCoverage(
             descriptors_total=len(findings),
             descriptors_without_task=sum(
