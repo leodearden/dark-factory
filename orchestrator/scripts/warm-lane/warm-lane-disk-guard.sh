@@ -185,11 +185,14 @@ fi
 
 # Validate threshold integers (misconfiguration is a wiring bug, not transient pressure;
 # exit 2 = usage error so it is loud rather than fail-open or crash).
-# A non-integer MIN_FREE_GIB would make $(( MIN_FREE_GIB * ... )) evaluate to 0 and pass
-# everything; a non-integer MIN_FREE_INODES would make [ "$avail_inodes" -lt ... ] throw
+# MIN_FREE_GIB feeds $(( MIN_FREE_GIB * 1024^3 )), so it is held to a canonical decimal of
+# at most 5 digits: a leading zero would be read as OCTAL (08/09 error out leaving the
+# variable unset, 010 silently means 8), and a huge value would wrap negative on 64-bit and
+# invert the comparison. 99999 GiB is ~9 orders of magnitude under 2^63 bytes.
+# A non-integer MIN_FREE_INODES would make [ "$avail_inodes" -lt ... ] throw
 # 'integer expression expected', aborting with a non-75 code the orchestrator won't requeue.
-if ! printf '%s\n' "$MIN_FREE_GIB" | grep -qE '^[0-9]+$'; then
-    err "REIFY_WARM_LANE_DISK_GUARD_MIN_FREE_GIB (or --min-free-gib) is not a valid integer: '$MIN_FREE_GIB'."
+if ! printf '%s\n' "$MIN_FREE_GIB" | grep -qE '^(0|[1-9][0-9]{0,4})$'; then
+    err "REIFY_WARM_LANE_DISK_GUARD_MIN_FREE_GIB (or --min-free-gib) is not a valid integer (0-99999, no leading zeros): '$MIN_FREE_GIB'."
     err "Run '$(basename "$0") --help' for usage."
     exit 2
 fi

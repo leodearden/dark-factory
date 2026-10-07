@@ -143,6 +143,19 @@ assert "A7: non-integer --min-free-gib writes error to stderr" \
 REIFY_WARM_LANE_DISK_GUARD_MIN_FREE_GIB=50G run_helper check --mount /tmp --min-free-inodes 100000
 assert "A8: non-integer env MIN_FREE_GIB exits 2" test "$RC" -eq 2
 
+# A9: leading-zero (octal-misread) and overflowing --min-free-gib values exit 2.
+# 08 would error out of $(( )) leaving the variable unset, 010 would silently
+# mean 8, and 9223372036854775807 would wrap negative on the 1024^3 multiply.
+for A9_BAD in 08 010 9223372036854775807; do
+    run_helper check --mount /tmp --min-free-gib "$A9_BAD" --min-free-inodes 100000
+    assert "A9: --min-free-gib $A9_BAD exits 2" test "$RC" -eq 2
+    assert "A9: --min-free-gib $A9_BAD writes error to stderr" \
+        bash -c 'printf "%s\n" "$1" | grep -qi "integer"' _ "$ERR_OUT"
+done
+
+REIFY_WARM_LANE_DISK_GUARD_MIN_FREE_GIB=010 run_helper check --mount /tmp --min-free-inodes 100000
+assert "A9: env MIN_FREE_GIB=010 exits 2" test "$RC" -eq 2
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Block B — happy path: ample bytes AND inodes → exits 0
 # ──────────────────────────────────────────────────────────────────────────────
