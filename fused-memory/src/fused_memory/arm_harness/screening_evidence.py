@@ -187,6 +187,15 @@ def _refuse(where: object, invariant: str, offending: object) -> NoReturn:
     raise ScreeningEvidenceError(f'{where}: {invariant}; got {offending!r}')
 
 
+RELEASE_RECORD_FILENAME = 'release.json'
+"""The sweep's one leading stop-all, under the evidence root beside specs/, arms/ and runs/."""
+
+
+def write_release_record(root: Path, record: CommandRecord) -> None:
+    text = canonical_json_text(record.model_dump(mode='json'))
+    atomic_write_text(root / RELEASE_RECORD_FILENAME, text, mkdir=True)
+
+
 def write_arm_commands(path: Path | str, commands: ArmCommands) -> None:
     atomic_write_text(Path(path), canonical_json_text(commands.model_dump(mode='json')), mkdir=True)
 

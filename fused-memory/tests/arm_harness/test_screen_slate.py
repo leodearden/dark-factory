@@ -15,6 +15,7 @@ from _fm_helpers import load_script_module
 from arm_harness._fakes import CODE_SHA, CORPUS_SHA, PREREG_SHA, SCREENING_PARAMS, slate_arm
 from fused_memory.arm_harness.arm_spec import load_arm_spec
 from fused_memory.arm_harness.screening_evidence import (
+    RELEASE_RECORD_FILENAME,
     SCREENING_RUN_SHAPE,
     ArmEvidencePaths,
     ScreeningStage,
@@ -123,7 +124,7 @@ def test_submit_resolves_every_payload_path_absolute(driver, tmp_path, monkeypat
 def test_the_pinned_harness_runs_from_its_own_fused_memory_dir(driver, tmp_path):
     spec = tmp_path / 'specs' / 'qwen3.5-9b.json'
 
-    argv = driver.harness_argv(UV, tmp_path / 'pinned', 'smoke', spec)
+    argv = driver.harness_argv(UV, 'smoke', spec)
 
     assert argv == [
         str(UV), 'run', '--no-sync', 'python', 'scripts/local_memory_models_eval/harness.py',
@@ -134,11 +135,12 @@ def test_the_pinned_harness_runs_from_its_own_fused_memory_dir(driver, tmp_path)
 
 def test_the_screening_run_takes_its_shape_from_the_one_constant(driver, tmp_path):
     pinned, evidence = tmp_path / 'pinned', tmp_path / 'evidence'
-    spec, manifest = evidence / 'specs' / 'qwen3.5-9b.json', pinned / 'corpus_manifest.json'
+    paths = ArmEvidencePaths(evidence, 'qwen3.5-9b')
+    manifest = pinned / 'corpus_manifest.json'
 
-    argv = driver.screening_run_argv(UV, pinned, spec, evidence, manifest)
+    argv = driver.screening_run_argv(UV, pinned, paths, manifest)
 
-    assert argv[:8] == driver.harness_argv(UV, pinned, 'run', spec)
+    assert argv[:8] == driver.harness_argv(UV, 'run', paths.spec)
     assert _flag(argv, '--manifest') == str(manifest)
     assert _flag(argv, '--out-root') == str(evidence / 'runs')
     assert _flag(argv, '--repo-root') == str(pinned)
@@ -160,7 +162,7 @@ def test_lms_commands_run_alphas_clis_through_the_shared_project(driver, tmp_pat
     tools = serving / 'scripts' / 'local-model-serving'
 
     assert driver.lms_argv(UV, serving, 'start', 'qwen3.5-9b') == [
-        str(UV), 'run', '--project', str(serving / 'shared'), 'python',
+        str(UV), 'run', '--no-sync', '--project', str(serving / 'shared'), 'python',
         str(tools / 'lms_ctl.py'), 'start', 'qwen3.5-9b',
     ]
     assert driver.lms_argv(UV, serving, 'stop-all')[-1] == 'stop-all'
@@ -168,7 +170,7 @@ def test_lms_commands_run_alphas_clis_through_the_shared_project(driver, tmp_pat
         'phi-4-14b', '--timeout', '60',
     ]
     assert driver.healthcheck_argv(UV, serving, 'phi-4-14b', tmp_path / 'health.json') == [
-        str(UV), 'run', '--project', str(serving / 'shared'), 'python',
+        str(UV), 'run', '--no-sync', '--project', str(serving / 'shared'), 'python',
         str(tools / 'lms_healthcheck.py'), '--arm', 'phi-4-14b', '--output',
         str(tmp_path / 'health.json'),
     ]
@@ -212,9 +214,9 @@ class Call:
 
 
 def _label(argv: Sequence[str]) -> tuple[str, str | None]:
-    if argv[5].endswith('lms_ctl.py'):
-        return argv[6], (argv[7] if len(argv) > 7 else None)
-    if argv[5].endswith('lms_healthcheck.py'):
+    if argv[6].endswith('lms_ctl.py'):
+        return argv[7], (argv[8] if len(argv) > 8 else None)
+    if argv[6].endswith('lms_healthcheck.py'):
         return 'healthcheck', _flag(argv, '--arm')
     return argv[5], Path(_flag(argv, '--arm-spec')).stem
 
@@ -294,7 +296,7 @@ def test_one_release_then_each_arm_through_every_stage_in_order(driver, tmp_path
         assert commands.tap.listen_url == 'http://127.0.0.1:8418'
         assert commands.tap.upstream_url == arm_endpoint(arm)
     assert sweep.failures == ()
-    release = json.loads((sweep.config.evidence_root / driver.RELEASE_RECORD_FILENAME).read_text())
+    release = json.loads((sweep.config.evidence_root / RELEASE_RECORD_FILENAME).read_text())
     assert release['stage'] == ScreeningStage.RELEASE.value
 
 
@@ -352,7 +354,9 @@ def test_a_failed_smoke_still_measures_the_other_three_gates(driver, tmp_path):
     ('failing', 'expected'),
     [('start', ['start', 'stop']), ('wait-ready', ['start', 'wait-ready', 'stop'])],
 )
-def test_an_unserved_arm_is_still_stopped_and_its_evidence_loads(driver, tmp_path, failing, expected):
+def test_an_unserved_arm_is_still_stopped_and_its_evidence_loads(
+    driver, tmp_path, failing, expected
+):
     sweep = _sweep(driver, tmp_path, slate=(QWEN,), exits={(failing, 'qwen3.5-9b'): 4})
 
     assert sweep.runner.verbs('qwen3.5-9b') == expected
@@ -417,7 +421,9 @@ def test_a_non_empty_evidence_root_is_refused_before_anything_runs(driver, tmp_p
 # --- the real runner ------------------------------------------------------------------
 
 
-def test_the_real_runner_strips_virtual_env_and_runs_in_the_given_cwd(driver, tmp_path, monkeypatch):
+def test_the_real_runner_strips_virtual_env_and_runs_in_the_given_cwd(
+    driver, tmp_path, monkeypatch
+):
     monkeypatch.setenv('VIRTUAL_ENV', '/somewhere/else/.venv')
     probe = 'import os,sys; print(os.environ.get("VIRTUAL_ENV")); print(os.getcwd()); sys.exit(3)'
 
