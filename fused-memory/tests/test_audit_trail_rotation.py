@@ -16,9 +16,11 @@ from fused_memory.reconciliation.audit_trail_rotation import (
     ROLLUP_KEY,
     ROTATE_TARGET_BYTES,
     ROTATE_THRESHOLD_BYTES,
+    near_duplicate_key,
     plan_rotation,
     task_payload_bytes,
 )
+from fused_memory.reconciliation.context_assembler import HINT_QUERIES_EXECUTED
 
 NOW = datetime(2026, 10, 7, 12, 0, tzinfo=UTC)
 
@@ -224,3 +226,98 @@ class TestDatedKeyFold:
         plan = plan_rotation(make_task(status='pending', metadata=metadata), now=NOW)
         assert plan is not None
         assert plan.render(None).metadata['done_provenance'] == provenance
+
+
+QUERY_SECTION = '=== MEMORY HINT QUERIES ROTATED OUT ==='
+
+
+class TestMemoryHintQueryBound:
+    def test_near_duplicate_key_ignores_case_spacing_dates_and_ids(self):
+        first = 'index_health reconfirmed 2026-09-10 run 6f0b5d50-2434-4f30-a9d0-769a220b34a4'
+        second = 'Index_health  reconfirmed 2026-09-11 run c820dde4-b716-4af8-bf63-abb8d5f9fc57'
+        assert near_duplicate_key(first) == near_duplicate_key(second)
+        assert near_duplicate_key('commit 4cb45448c3 landed') == near_duplicate_key(
+            'commit 055e9c15a0 landed'
+        )
+        assert near_duplicate_key('cycle 12 relay') == near_duplicate_key('cycle 13 relay')
+
+    def test_near_duplicate_key_keeps_different_queries_apart(self):
+        assert near_duplicate_key('index_health reconfirmed') != near_duplicate_key(
+            'consolidation backlog status'
+        )
+        assert near_duplicate_key('gate ruling effaced') != near_duplicate_key('gate ruling')
+
+    def test_queries_past_history_max_are_deduped_and_trimmed_after_executed_prefix(self):
+        executed = [
+            'consolidation backlog status',
+            'index_health drift on episodes',
+            'gate 3524 ruling',
+        ]
+        queries = [
+            *executed,
+            'relay evidence 2026-09-01 run 6f0b5d50-2434-4f30-a9d0-769a220b34a4',
+            'relay evidence 2026-09-02 run c820dde4-b716-4af8-bf63-abb8d5f9fc57',
+            'scheduler wait anchor',
+            'Consolidation  backlog status',
+            'merge lane verify slot',
+            'pending_since backfill',
+            'relay evidence 2026-09-03 run 0e1d2c3b-4a59-6877-8695-a4b3c2d1e0f9',
+            'curator drop decisions',
+            'archive chain for task 42',
+        ]
+        assert len(queries) > HISTORY_MAX
+        entities = ['task:42', 'gate']
+        task = make_task(metadata={'memory_hints': {'entities': entities, 'queries': queries}})
+        plan = plan_rotation(task, now=NOW)
+        assert plan is not None
+        hints = plan.render(None).metadata['memory_hints']
+        assert len(executed) == HINT_QUERIES_EXECUTED
+        assert hints['queries'] == [
+            *executed,
+            'curator drop decisions',
+            'archive chain for task 42',
+        ]
+        assert len(hints['queries']) == HISTORY_KEEP
+        assert hints['entities'] == entities
+        assert plan.archive_text is not None
+        archived = archive_section(plan.archive_text, QUERY_SECTION)
+        for shed in set(queries) - set(hints['queries']):
+            assert shed in archived
+
+    def test_queries_within_history_max_do_not_trigger_a_rotation(self):
+        queries = [f'relay evidence cycle {n}' for n in range(HISTORY_MAX)]
+        task = make_task(metadata={'memory_hints': {'entities': [], 'queries': queries}})
+        assert plan_rotation(task, now=NOW) is None
+
+    def test_legacy_list_memory_hints_are_left_untouched(self):
+        legacy = [{'entity': f'e{n}', 'query': f'topic {chr(97 + n)}'} for n in range(12)]
+        task = make_task(metadata={'memory_hints': legacy})
+        assert plan_rotation(task, now=NOW) is None
+        task = make_task(metadata={'memory_hints': legacy, **dated_family('x_relay', [1, 2])})
+        plan = plan_rotation(task, now=NOW)
+        assert plan is not None
+        assert plan.render('abc-uuid').metadata['memory_hints'] == legacy
+
+    def test_archive_link_query_is_appended_after_bounding(self):
+        queries = [f'distinct topic {chr(97 + n)}' for n in range(HISTORY_MAX + 2)]
+        task = make_task(metadata={'memory_hints': {'entities': [], 'queries': queries}})
+        plan = plan_rotation(task, now=NOW)
+        assert plan is not None
+        rendered = plan.render('abc-uuid').metadata['memory_hints']['queries']
+        assert len(rendered) == HISTORY_KEEP + 1
+        assert rendered[:-1] == plan.render(None).metadata['memory_hints']['queries']
+        assert 'abc-uuid' in rendered[-1]
+        assert '42' in rendered[-1]
+
+    def test_archive_link_creates_memory_hints_when_absent(self):
+        existing = [
+            history_entry(f'foo_2026_08_{day:02d}', f'2026-08-{day:02d}', day)
+            for day in range(HISTORY_MAX + 1, 0, -1)
+        ]
+        metadata = {'foo_history': existing, ROLLUP_KEY: {'history_keys': ['foo_history']}}
+        plan = plan_rotation(make_task(metadata=metadata), now=NOW)
+        assert plan is not None
+        hints = plan.render('abc-uuid').metadata['memory_hints']
+        assert hints['entities'] == []
+        assert len(hints['queries']) == 1
+        assert 'abc-uuid' in hints['queries'][0]
