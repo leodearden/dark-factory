@@ -7,8 +7,9 @@ an asserted ``<lane_dir>.lock`` lives in one place.
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
+
+from _git_fixtures import seed_repo
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import _run
@@ -47,15 +48,6 @@ exit 0
 """
 
 
-async def init_git_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 def warm_pool_git_config() -> GitConfig:
     return GitConfig(
         main_branch='main',
@@ -70,9 +62,7 @@ def warm_pool_git_config() -> GitConfig:
 
 def make_seed_test_repo(tmp_path: Path, *, warm_base: bool = True) -> Path:
     """A committed repo under ``tmp_path``, optionally with a resolvable warm base."""
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(init_git_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     if warm_base:
         base = repo / '.worktrees' / '_merge-verify' / 'target'
         base.mkdir(parents=True, exist_ok=True)
