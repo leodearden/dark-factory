@@ -2399,11 +2399,11 @@ class TestWriteSuppressionRecordPreWriteCheck:
 
 
 def test_write_suppression_record_importable_from_canonical_path():
-    """Smoke test: write_suppression_record is importable from the path stage1.py advertises.
+    """Smoke test: write_suppression_record, the operator entry point for
+    stage1_flag_suppression rows, stays importable from its canonical path.
 
-    If the helper is ever moved or renamed, this test fails CI rather than
-    silently drifting the prompt's operator instructions
-    (see STAGE1_SYSTEM_PROMPT ## Flag Suppression Check section).
+    Operators script against this path (recon_self_model.MARKER_LIFECYCLE
+    names it as the kind's only writer), so a move or rename must fail CI.
     """
     from fused_memory.reconciliation.flag_dedup import write_suppression_record  # noqa: F401
 

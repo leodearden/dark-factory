@@ -235,8 +235,8 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
     ),
     'stage1_flag_suppression': MarkerLifecycle(
         writer=(
-            'Operators / remediation hooks, via '
-            'flag_dedup.write_suppression_record'
+            'Operators only, via flag_dedup.write_suppression_record (scripted); '
+            'recon stages are refused at add_memory/add_system_record'
         ),
         deleter=DELETER_TTL,
     ),
@@ -436,25 +436,27 @@ def render_marker_lifecycle_section() -> str:
 
 
 def render_suppression_schema_section() -> str:
-    """Render the canonical suppression-record schema section, faithful to
-    reconciliation/prompts/stage1.py:498-560."""
+    """Render the suppression-record section spliced into the Stage-1 system
+    prompt (reconciliation/prompts/stage1.py::STAGE1_SYSTEM_PROMPT): suppressions
+    are operator-only recon_ledger rows (task 4863)."""
     return (
-        '## Suppression Schema\n'
-        'Canonical suppression record schema (Mem0, observations_and_summaries '
-        "category) — the producer's contract read by the Stage 1 post-processor:\n"
-        '  - `metadata.kind = "stage1_flag_suppression"`\n'
-        '  - `metadata.task_id = <N>` (str)\n'
-        '  - `metadata.flag_types = [<str>, ...]` (OPTIONAL scoping allowlist)\n'
-        '  - content: `"STAGE 1 FLAG SUPPRESSION task_id=<N>"`\n\n'
-        'Scoped vs. legacy/blanket suppression: a record WITH a non-empty '
-        '`metadata.flag_types` is a scoped record that suppresses ONLY those '
-        '(task_id, flag_type) pairs, leaving other flag_types for the same '
-        'task_id free to surface. A record WITHOUT `flag_types` (absent, None, '
-        'or empty — the legacy shape) is a blanket record that suppresses ALL '
-        'flag_types for that task_id. When both a scoped and a legacy/blanket '
-        'record exist for the same task_id, the blanket record wins (union '
-        'semantics) — a blanket suppression cannot be narrowed by a more '
-        'specific scoped record.'
+        '## Suppression Records\n'
+        'A suppression is a `recon_ledger` row with '
+        '`record_kind = "stage1_flag_suppression"`, keyed by `(task_id, flag_type)`; '
+        'a row with `flag_type = ""` is blanket. Operators write these rows '
+        'out-of-band. No reconciliation stage can create one: `add_memory` and '
+        '`add_system_record` refuse that kind from recon-stage agents. A Mem0 record '
+        'of that kind (an operator audit mirror or a legacy record) has no gate '
+        'effect and is not evidence that a flag is suppressed.\n\n'
+        'Scoped vs. blanket suppression: a scoped row suppresses ONLY its '
+        '(task_id, flag_type) pair, leaving other flag_types for the same task_id '
+        'free to surface. A blanket row suppresses ALL flag_types for that task_id. '
+        'When both a scoped and a blanket row exist for the same task_id, the '
+        'blanket row wins (union semantics) — a blanket suppression cannot be '
+        'narrowed by a more specific scoped row.\n\n'
+        'If a finding you consider settled re-derives every cycle, keep emitting it '
+        'and name its task_id, its flag_type and why you consider it settled in your '
+        'cycle report, so an operator can decide whether to suppress it.'
     )
 
 
