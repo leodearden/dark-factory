@@ -715,20 +715,27 @@ def _domain_paths(snapshot: Mapping[str, Any]) -> set[str]:
     return set(snapshot['files']) | set(snapshot['evidence']['unreadable'])
 
 
+def _nonempty_paths_by_blob_and_kind(
+    paths: Iterable[str], files: Mapping[str, Any]
+) -> dict[tuple[str, str], list[str]]:
+    grouped: dict[tuple[str, str], list[str]] = {}
+    for path in paths:
+        record = files[path]
+        if record['lines'] > 0:
+            grouped.setdefault((record['blob'], record['kind']), []).append(path)
+    return grouped
+
+
 def _renames(
     gone: Iterable[str], arrived: Iterable[str], previous: Mapping[str, Any], current: Mapping[str, Any]
 ) -> tuple[tuple[str, str], ...]:
-    """Measured paths that left and arrived with one blob, paired in sorted order."""
-    gone_by_blob: dict[str, list[str]] = {}
-    for path in sorted(gone):
-        gone_by_blob.setdefault(previous['files'][path]['blob'], []).append(path)
-    arrived_by_blob: dict[str, list[str]] = {}
-    for path in sorted(arrived):
-        arrived_by_blob.setdefault(current['files'][path]['blob'], []).append(path)
+    """A non-empty file is renamed when exactly one path left and exactly one arrived with its (blob, kind)."""
+    gone_by_key = _nonempty_paths_by_blob_and_kind(gone, previous['files'])
+    arrived_by_key = _nonempty_paths_by_blob_and_kind(arrived, current['files'])
     pairs = [
-        pair
-        for blob in gone_by_blob.keys() & arrived_by_blob.keys()
-        for pair in zip(gone_by_blob[blob], arrived_by_blob[blob], strict=False)
+        (gone_by_key[key][0], arrived_by_key[key][0])
+        for key in gone_by_key.keys() & arrived_by_key.keys()
+        if len(gone_by_key[key]) == len(arrived_by_key[key]) == 1
     ]
     return tuple(sorted(pairs))
 
@@ -851,12 +858,17 @@ def _change_parts(old: Iterable[str], new: Iterable[str]) -> list[str]:
     return [*(f'+{name}' for name in sorted(new_set - old_set)), *(f'-{name}' for name in sorted(old_set - new_set))]
 
 
+def _record_of_kind(record: Mapping[str, Any] | None, kind: str) -> Mapping[str, Any] | None:
+    return record if record is not None and record['kind'] == kind else None
+
+
 def _reexport_entries(pairs: Sequence[_RecordPair]) -> list[str]:
     entries = []
     for path, before, after in pairs:
-        if before is None or after is None or 'reexport_names' not in before:
+        old, new = _record_of_kind(before, _SRC), _record_of_kind(after, _SRC)
+        if old is None or new is None:
             continue
-        parts = _change_parts(before['reexport_names'], after['reexport_names'])
+        parts = _change_parts(old['reexport_names'], new['reexport_names'])
         if parts:
             entries.append(f're-export names: {path}: {", ".join(parts)}')
     return entries
@@ -868,9 +880,10 @@ _NO_COUPLING: Mapping[str, Any] = {'private_patch_targets': [], 'private_reads':
 def _test_file_entries(pairs: Sequence[_RecordPair]) -> list[str]:
     entries = []
     for path, before, after in pairs:
-        if _TESTS not in ((before or {}).get('kind'), (after or {}).get('kind')):
+        old, new = _record_of_kind(before, _TESTS), _record_of_kind(after, _TESTS)
+        if old is None and new is None:
             continue
-        old, new = before or _NO_COUPLING, after or _NO_COUPLING
+        old, new = old or _NO_COUPLING, new or _NO_COUPLING
         parts = []
         if targets := _change_parts(old['private_patch_targets'], new['private_patch_targets']):
             parts.append(', '.join(targets))
