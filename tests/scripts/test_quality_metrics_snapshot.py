@@ -510,6 +510,325 @@ class TestTheTestsKindMeasures:
 
 
 # ---------------------------------------------------------------------------
+# --diff: what moved between two snapshots, in the contract's order.
+
+_DIFF_SECTIONS = (
+    'unreadable (measures unknown, never zero):',
+    'files added:',
+    'files removed:',
+    'files renamed (same blob):',
+    'complexity pair (max per function, module total):',
+    'heuristic-14 crossings (measure, not fix):',
+    'import graph:',
+    'test files (private patch targets, private reads):',
+)
+
+#: The row-5 'after' source: g=1, h=1, f=0, file total 2 under complexipy 6.2.
+_MOD_SPLIT = (
+    '"""The row-5 fixture."""\n'
+    '# f holds two sequential ifs.\n'
+    'def g(a):\n'
+    '    if a:\n'
+    '        return 1\n'
+    '    return 0\n'
+    '\n\n'
+    'def h(b):\n'
+    '    if b:\n'
+    '        return 2\n'
+    '    return 0\n'
+    '\n\n'
+    'def f(a, b):\n'
+    '    g(a)\n'
+    '    h(b)\n'
+    '    return 0\n'
+)
+
+_MOD_ONE_MORE_IF = _MOD_BEFORE.replace('    return 0\n', '    if a:\n        x = 3\n    return 0\n')
+
+_MOVED = 'measure per heuristic 14, not a target'
+
+
+def _assignments(count: int) -> str:
+    return ''.join(f'x{number} = {number}\n' for number in range(count))
+
+
+def _load(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding='utf-8'))
+
+
+def _chain(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    base_files: dict[str, str],
+    *changes: Any,
+) -> list[tuple[dict[str, Any], list[str]]]:
+    """Measure the base commit, then each change in turn with --diff against the one before.
+
+    Each entry is (snapshot, the diff lines its measuring run printed after the
+    'wrote' line); the --current form is checked to print the same lines.
+    """
+    root = _repo(tmp_path, base_files)
+    previous = tmp_path / 's1.json'
+    assert snapshot.main(['--run-id', 'run-1', '--out', str(previous), '--root', str(root)]) == 0
+    results: list[tuple[dict[str, Any], list[str]]] = [(_load(previous), [])]
+    for number, change in enumerate(changes, start=2):
+        change(root)
+        current = tmp_path / f's{number}.json'
+        capsys.readouterr()
+        argv = ['--run-id', f'run-{number}', '--out', str(current), '--root', str(root)]
+        assert snapshot.main([*argv, '--diff', str(previous)]) == 0
+        printed = capsys.readouterr().out.splitlines()
+        assert printed[0].startswith('wrote '), printed
+        assert snapshot.main(['--current', str(current), '--diff', str(previous)]) == 0
+        assert capsys.readouterr().out.splitlines() == printed[1:]
+        results.append((_load(current), printed[1:]))
+        previous = current
+    return results
+
+
+def _diff_of(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], base_files: dict[str, str], change: Any
+) -> list[str]:
+    return _chain(tmp_path, capsys, base_files, change)[1][1]
+
+
+def _section(diff: list[str], header: str) -> list[str]:
+    start = diff.index(header) + 1
+    end = next(
+        (index for index in range(start, len(diff)) if not diff[index].startswith('  ')),
+        len(diff),
+    )
+    return diff[start:end]
+
+
+def _rewrite(relpath: str, text: str) -> Any:
+    return lambda root: _commit(root, f'rewrite {relpath}', write={relpath: text})
+
+
+class TestDiffLayout:
+    def test_the_sections_come_in_the_contract_order(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        diff = _diff_of(tmp_path, capsys, _BASE, _rewrite('alpha/src/alpha/mod.py', _MOD_SPLIT))
+        headers = [line for line in diff if not line.startswith('  ')]
+        assert headers[0].startswith('current: run-2 as_of ')
+        assert headers[1].startswith('previous: run-1 as_of ')
+        assert headers[2:] == list(_DIFF_SECTIONS)
+
+    def test_a_snapshot_against_itself_states_every_absence(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        path = tmp_path / 'out' / 'snapshot.json'
+        assert _run(_repo(tmp_path, _BASE), path) == 0
+        sha = _load(path)['as_of_sha']
+        capsys.readouterr()
+        assert snapshot.main(['--current', str(path), '--diff', str(path)]) == 0
+        assert capsys.readouterr().out.splitlines() == [
+            f'current: run-1 as_of {sha} complete=true',
+            f'previous: run-1 as_of {sha} complete=true',
+            *(line for header in _DIFF_SECTIONS for line in (header, '  (none)')),
+        ]
+
+
+class TestTheComplexityPair:
+    _PAIR = 'complexity pair (max per function, module total):'
+
+    def test_a_split_moves_complexity(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        diff = _diff_of(tmp_path, capsys, _BASE, _rewrite('alpha/src/alpha/mod.py', _MOD_SPLIT))
+        assert _section(diff, self._PAIR) == [
+            '  alpha/src/alpha/mod.py: max 2 -> 1, total 2 -> 2; max down, total flat or '
+            'down: complexity moved, per docs/code-quality.md §What to measure',
+        ]
+
+    def test_a_new_branch_adds_complexity(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        diff = _diff_of(
+            tmp_path, capsys, _BASE, _rewrite('alpha/src/alpha/mod.py', _MOD_ONE_MORE_IF)
+        )
+        [line] = _section(diff, self._PAIR)
+        assert line.startswith('  alpha/src/alpha/mod.py: max 2 -> ')
+        assert line.endswith('; total up: complexity added')
+
+    def test_a_merge_with_a_flat_total_carries_no_reading(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        base = {**_BASE, 'alpha/src/alpha/mod.py': _MOD_SPLIT}
+        diff = _diff_of(tmp_path, capsys, base, _rewrite('alpha/src/alpha/mod.py', _MOD_BEFORE))
+        assert _section(diff, self._PAIR) == ['  alpha/src/alpha/mod.py: max 1 -> 2, total 2 -> 2']
+
+
+class TestHeuristic14Crossings:
+    _CROSSINGS = 'heuristic-14 crossings (measure, not fix):'
+
+    def test_both_marks_in_both_directions_in_path_order(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        base = {
+            **_BASE,
+            'alpha/src/alpha/z_grow.py': _assignments(1490),
+            'alpha/src/alpha/a_shrink.py': _assignments(2010),
+        }
+
+        def resize(root: Path) -> None:
+            _commit(root, 'resize', write={
+                'alpha/src/alpha/z_grow.py': _assignments(2010),
+                'alpha/src/alpha/a_shrink.py': _assignments(1490),
+            })
+
+        assert _section(_diff_of(tmp_path, capsys, base, resize), self._CROSSINGS) == [
+            f'  alpha/src/alpha/a_shrink.py: 2010 -> 1490 lines, crossed 1500 down; {_MOVED}',
+            f'  alpha/src/alpha/a_shrink.py: 2010 -> 1490 lines, ALARM crossed 2000 down; {_MOVED}',
+            f'  alpha/src/alpha/z_grow.py: 1490 -> 2010 lines, crossed 1500 up; {_MOVED}',
+            f'  alpha/src/alpha/z_grow.py: 1490 -> 2010 lines, ALARM crossed 2000 up; {_MOVED}',
+        ]
+
+    def test_an_added_file_crosses_up_from_zero(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        diff = _diff_of(tmp_path, capsys, _BASE, _rewrite('alpha/src/alpha/big.py', _assignments(2010)))
+        assert _section(diff, self._CROSSINGS) == [
+            f'  alpha/src/alpha/big.py: 0 -> 2010 lines, crossed 1500 up; {_MOVED}',
+            f'  alpha/src/alpha/big.py: 0 -> 2010 lines, ALARM crossed 2000 up; {_MOVED}',
+        ]
+
+
+class TestRenames:
+    def test_a_pure_move_is_a_rename_and_nothing_else(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        def move(root: Path) -> None:
+            _commit(root, 'move', moves=[('alpha/src/alpha/mod.py', 'alpha/src/alpha/moved.py')])
+
+        diff = _diff_of(tmp_path, capsys, _BASE, move)
+        assert _section(diff, 'files renamed (same blob):') == [
+            '  alpha/src/alpha/mod.py -> alpha/src/alpha/moved.py',
+        ]
+        for header in _DIFF_SECTIONS:
+            if header != 'files renamed (same blob):':
+                assert _section(diff, header) == ['  (none)'], header
+
+
+_GRAPH_BASE: dict[str, str] = {
+    **_BASE,
+    'alpha/src/a.py': 'A = 1\n',
+    'alpha/src/b.py': 'B = 1\n',
+    'alpha/src/e.py': 'def f():\n    return 1\n',
+    'alpha/src/pkg/__init__.py': '',
+    'alpha/src/pkg/a.py': 'Y = 1\n',
+}
+
+_GRAPH_CHANGED: dict[str, str] = {
+    'alpha/src/a.py': 'import b\nA = 1\n',
+    'alpha/src/b.py': 'import a\nB = 1\n',
+    'alpha/src/e.py': 'def f():\n    import a\n    return a\n',
+    'alpha/src/pkg/__init__.py': 'THING = 1\n',
+    'alpha/src/pkg/a.py': 'from pkg import THING\nY = THING\n',
+}
+
+
+class TestImportGraphChanges:
+    _GRAPH = 'import graph:'
+
+    def test_additions_then_their_removals(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        reverted = {path: _GRAPH_BASE[path] for path in _GRAPH_CHANGED}
+        chain = _chain(
+            tmp_path,
+            capsys,
+            _GRAPH_BASE,
+            lambda root: _commit(root, 'couple', write=_GRAPH_CHANGED),
+            lambda root: _commit(root, 'decouple', write=reverted),
+        )
+        added = _section(chain[1][1], self._GRAPH)
+        for line in (
+            '  edge added: a -> b',
+            '  edge added: b -> a',
+            '  cycle added: a, b',
+            '  reach-back added: pkg.a -> pkg (THING)',
+            '  deferred added: e: a',
+        ):
+            assert line in added, (line, added)
+        removed = _section(chain[2][1], self._GRAPH)
+        for line in (
+            '  edge removed: a -> b',
+            '  edge removed: b -> a',
+            '  cycle removed: a, b',
+            '  reach-back removed: pkg.a -> pkg (THING)',
+            '  deferred removed: e: a',
+        ):
+            assert line in removed, (line, removed)
+
+    def test_line_numbers_are_not_compared(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        coupled = {**_GRAPH_BASE, **_GRAPH_CHANGED}
+        shifted = '\n' + _GRAPH_CHANGED['alpha/src/pkg/a.py']
+        diff = _diff_of(tmp_path, capsys, coupled, _rewrite('alpha/src/pkg/a.py', shifted))
+        assert _section(diff, self._GRAPH) == ['  (none)']
+
+
+_COUPLING_BEFORE = 'from pkg import mod\n\ndef test_it():\n    assert mod._y\n'
+_COUPLING_AFTER = (
+    'from unittest.mock import patch\nfrom pkg import mod\n\ndef test_it():\n'
+    "    with patch('pkg.mod._x'):\n        assert mod._y\n        assert mod._y\n"
+)
+
+
+class TestTestFileCoupling:
+    _TESTS = 'test files (private patch targets, private reads):'
+
+    def test_targets_added_and_removed_and_the_read_delta(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        base = {
+            **_BASE,
+            'alpha/src/pkg/__init__.py': '',
+            'alpha/src/pkg/mod.py': '_x = 1\n_y = 2\n',
+            'alpha/tests/test_mod.py': _COUPLING_BEFORE,
+        }
+        chain = _chain(
+            tmp_path, capsys, base, _rewrite('alpha/tests/test_mod.py', _COUPLING_AFTER)
+        )
+        before = source_measures.private_reads(_COUPLING_BEFORE, path='before.py')
+        after = source_measures.private_reads(_COUPLING_AFTER, path='after.py')
+        assert _section(chain[1][1], self._TESTS) == [
+            f'  alpha/tests/test_mod.py: +pkg.mod._x; private reads {before} -> {after}',
+        ]
+        reverse = snapshot.diff_lines(chain[0][0], chain[1][0])
+        assert _section(reverse, self._TESTS) == [
+            f'  alpha/tests/test_mod.py: -pkg.mod._x; private reads {after} -> {before}',
+        ]
+
+
+class TestCompleteness:
+    def test_an_unreadable_previous_file_is_unknown_not_added(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        base = {**_BASE, 'alpha/src/alpha/broken.py': 'def (:\n'}
+        diff = _diff_of(tmp_path, capsys, base, _rewrite('alpha/src/alpha/broken.py', 'X = 1\n'))
+        previous = next(line for line in diff if line.startswith('previous: '))
+        assert previous.endswith(' complete=false')
+        assert _section(diff, 'unreadable (measures unknown, never zero):') == [
+            '  previous: alpha/src/alpha/broken.py',
+        ]
+        assert _section(diff, 'files added:') == ['  (none)']
+        pair = _section(diff, 'complexity pair (max per function, module total):')
+        assert not [line for line in pair if 'broken.py' in line]
+
+    def test_a_measured_diff_records_since_and_no_first_run_line(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        chain = _chain(tmp_path, capsys, _BASE, _rewrite('alpha/src/alpha/mod.py', _MOD_SPLIT))
+        (first, _), (second, diff) = chain
+        assert second['since'] == first['as_of_sha']
+        assert not [line for line in diff if 'no previous snapshot given' in line]
+
+
+# ---------------------------------------------------------------------------
 # Refusals: exit 2, the cause named on stderr, nothing written.
 
 
