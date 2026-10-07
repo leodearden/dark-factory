@@ -283,7 +283,12 @@ fi
 `--ancestry-path task/<TASK_ID>..main` lists every merge that *descends from* this branch, so
 once the branch is on main it also lists every unrelated merge landed afterwards, and `tail -1`
 returns the **oldest** of them. That oldest descendant is the merge that brought this branch in
-when one exists, and an unrelated later merge only when the branch was already in main before it
+only when no other merge descends from the branch first. A merge made on a branch **stacked** on
+this one — dark-factory makes these, e.g. a carry branch that merged main in to resolve
+conflicts before landing — sorts older, so `tail -1` returns that sync merge; its `^1` already
+contains this branch, so the containment check exits 0 and the arm falls through to the citation
+gate instead of stamping it (safe: never a wrong stamp, at worst the citing commit instead of the
+landing merge). It is an unrelated later merge only when the branch was already in main before it
 — which is exactly the distinction the containment check below is there to make.
 
 **`--topo-order` is REQUIRED, not decoration.** `git rev-list` orders by **commit date** by
