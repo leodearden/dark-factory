@@ -227,11 +227,13 @@ def _shape_memory(status, queue=None, **kwargs):
 
 
 def test_shape_memory_offline_keeps_required_keys():
+    """fused-memory unreachable means its stores went unmeasured: neither
+    connected nor disconnected is honest, so ``connected`` is null."""
     body = _shape_memory(_OFFLINE_STATUS)
     ms = body['MEMORY_STATUS']
-    assert ms['graphiti']['connected'] is False
-    assert ms['mem0']['connected'] is False
-    assert ms['taskmaster']['connected'] is False
+    assert ms['graphiti']['connected'] is None
+    assert ms['mem0']['connected'] is None
+    assert 'taskmaster' not in ms, 'get_status serves no taskmaster key; any value is invented'
     assert ms['queue']['stats']['value']['pending'] == 0
     assert ms['offline'] is True
 
@@ -329,12 +331,31 @@ def test_shape_memory_online_passes_through_plus_defaults():
         _queue_datum(pending=4, oldest=12.5),
     )
     ms = body['MEMORY_STATUS']
-    assert ms['graphiti']['connected'] is True
     assert ms['graphiti']['node_count'] == 100
-    assert ms['mem0']['connected'] is True
     assert ms['queue']['stats']['value']['pending'] == 4
     assert ms['queue']['stats']['value']['oldest_pending_age_seconds'] == 12.5
     assert ms['projects']['dark_factory']['graphiti_nodes'] == 100
+
+
+def test_shape_memory_online_serves_connectivity_as_get_status_measured_it():
+    body = _shape_memory({
+        'graphiti': {'connected': True},
+        'mem0': {'connected': False, 'error': 'qdrant down'},
+    })
+    ms = body['MEMORY_STATUS']
+    assert ms['graphiti']['connected'] is True
+    assert ms['mem0']['connected'] is False
+    assert ms['mem0']['error'] == 'qdrant down'
+
+
+def test_shape_memory_online_never_invents_connectivity():
+    """An absent flag is unmeasured (null), never True; and get_status serves
+    no taskmaster key, so none is served."""
+    body = _shape_memory({'graphiti': {}, 'mem0': {}})
+    ms = body['MEMORY_STATUS']
+    assert ms['graphiti']['connected'] is None
+    assert ms['mem0']['connected'] is None
+    assert 'taskmaster' not in ms
 
 
 # ---------------------------------------------------------------------------

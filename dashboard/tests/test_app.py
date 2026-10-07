@@ -1396,8 +1396,9 @@ def test_memory_returns_memory_status(client):
     body = resp.json()
     assert 'MEMORY_STATUS' in body
     ms = body['MEMORY_STATUS']
-    for key in ('graphiti', 'mem0', 'taskmaster', 'queue'):
+    for key in ('graphiti', 'mem0', 'queue'):
         assert key in ms
+    assert 'taskmaster' not in ms
     # get_status offline, get_queue_stats online: the queue renders its own
     # measured state, not the offline branch's zeros.
     stats = ms['queue']['stats']
