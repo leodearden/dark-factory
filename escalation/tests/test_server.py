@@ -39,7 +39,7 @@ from escalation.server import (
 )
 
 # ---------------------------------------------------------------------------
-# Cross-package orchestrator imports — used by TestMergeStatus.
+# Cross-package orchestrator imports — used by the merge-tool test classes.
 # Guarded so the rest of the file is still collected when the orchestrator
 # package is absent (e.g. in an escalation-only install).
 # ---------------------------------------------------------------------------
@@ -3758,11 +3758,6 @@ class TestMergeRequestDedup:
     repo or worker is needed.
     """
 
-    def _make_orch_config(self, tmp_path: Path):
-        """Create a minimal OrchestratorConfig without a git remote."""
-        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
-        return OrchestratorConfig(project_root=tmp_path)
-
     def _make_registry(self):
         from orchestrator.merge_queue import (  # type: ignore[reportMissingImports]
             InFlightMergeRegistry,
@@ -3781,7 +3776,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         # Pre-seed the registry: acquire branch 'X' with a never-resolving future
@@ -3841,7 +3836,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         # The disk-scan arm needs a real git repo + worktree to reach, so return
@@ -3888,7 +3883,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         never_future: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -3943,7 +3938,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         never_future: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -3989,7 +3984,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         server = create_server(
@@ -4025,7 +4020,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         server = create_server(
@@ -4083,7 +4078,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         server = create_server(
@@ -4134,7 +4129,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         server = create_server(
@@ -4195,7 +4190,7 @@ class TestMergeRequestDedup:
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         registry = self._make_registry()
 
         # Simulate the workflow-path enqueue: build a MergeRequest inline
@@ -4281,7 +4276,7 @@ class TestMergeRequestDedup:
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None
         )
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
 
         server = create_server(
             esc_queue,
@@ -4336,11 +4331,6 @@ class TestMergeRequestDedup:
 class TestMergeRequestWorkflowVerifyEmission:
     """merge_request(verified_green=True) emits a workflow_verify row."""
 
-    def _make_orch_config(self, tmp_path: Path):
-        """Create a minimal OrchestratorConfig without a git remote."""
-        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
-        return OrchestratorConfig(project_root=tmp_path)
-
     async def test_verified_green_emits_workflow_verify(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -4387,7 +4377,7 @@ class TestMergeRequestWorkflowVerifyEmission:
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
         )
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify')
 
         server = create_server(
@@ -4470,7 +4460,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         stub_harness = types.SimpleNamespace(
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
         )
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify-default')
 
         server = create_server(
@@ -4535,7 +4525,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         stub_harness = types.SimpleNamespace(
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
         )
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify-explicit-false')
 
         server = create_server(
@@ -4586,7 +4576,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         stub_harness = types.SimpleNamespace(
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
         )
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify-already-merged')
 
         server = create_server(
@@ -4662,7 +4652,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         stub_harness = types.SimpleNamespace(
             git_ops=stub_git, _merge_worker=None, _terminal_retention=None,
         )
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
 
         server = create_server(
             EscalationQueue(tmp_path / 'esc'),
@@ -4705,7 +4695,7 @@ class TestMergeRequestWorkflowVerifyEmission:
         gracefully instead of the emission being skipped.
         """
         esc_queue = EscalationQueue(tmp_path / 'esc')
-        orch_config = self._make_orch_config(tmp_path / 'repo')
+        orch_config = OrchestratorConfig(project_root=tmp_path / 'repo')
         event_store = EventStore(tmp_path / 'runs.db', 'run-wf-verify-attach')
 
         server = create_server(
@@ -4780,10 +4770,6 @@ async def _call_get_merge_queue(server) -> dict[str, Any]:
 class TestGetMergeQueue:
     """Tests for the get_merge_queue escalation MCP tool."""
 
-    def _make_orch_config(self, tmp_path: Path):
-        from orchestrator.config import OrchestratorConfig  # type: ignore[reportMissingImports]
-        return OrchestratorConfig(project_root=tmp_path)
-
     def _make_finalize_fixture(
         self,
         tmp_path: Path,
@@ -4816,7 +4802,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
 
         merge_wt = tmp_path / 'merge'
@@ -4896,7 +4882,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
 
         req = MergeRequest(
             task_id='T1',
@@ -4954,7 +4940,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
 
         git_ops_stub = types.SimpleNamespace()
@@ -5006,7 +4992,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
 
         git_ops_stub = types.SimpleNamespace()
@@ -5066,7 +5052,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore[reportArgumentType]
@@ -5201,7 +5187,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
 
         merge_wt = tmp_path / 'merge'
@@ -5332,7 +5318,7 @@ class TestGetMergeQueue:
         )
 
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
 
         merge_wt = tmp_path / 'merge'
@@ -6442,13 +6428,10 @@ class TestMergeStatus:
 
     # ── step-11: live-snapshot tier ───────────────────────────────────────────
 
-    def _make_orch_config(self, tmp_path: Path):
-        return OrchestratorConfig(project_root=tmp_path)
-
     async def test_live_snapshot_state_mapping(self, tmp_path: Path) -> None:
         """Live snapshot states map to the public vocabulary."""
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(
@@ -6481,7 +6464,7 @@ class TestMergeStatus:
     async def test_live_snapshot_lookup_by_branch(self, tmp_path: Path) -> None:
         """branch= lookup resolves to the live entry's request_id."""
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
@@ -6506,7 +6489,7 @@ class TestMergeStatus:
     async def test_live_snapshot_lookup_by_task_id(self, tmp_path: Path) -> None:
         """task_id= lookup resolves to the live entry's request_id."""
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
@@ -6531,7 +6514,7 @@ class TestMergeStatus:
     async def test_live_snapshot_beats_ring_and_event_store(self, tmp_path: Path) -> None:
         """Live snapshot tier wins over ring and event store for the same request_id."""
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
@@ -6585,7 +6568,7 @@ class TestMergeStatus:
     ) -> None:
         """Live snapshot state mapping covers all documented phase values."""
         loop = asyncio.get_running_loop()
-        config = self._make_orch_config(tmp_path / 'repo')
+        config = OrchestratorConfig(project_root=tmp_path / 'repo')
         mq: asyncio.Queue = asyncio.Queue()
         git_ops_stub = types.SimpleNamespace()
         worker = SpeculativeMergeWorker(git_ops=git_ops_stub, queue=mq)  # type: ignore
