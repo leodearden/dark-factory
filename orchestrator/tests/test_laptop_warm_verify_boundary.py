@@ -87,6 +87,9 @@ from escalation.queue import EscalationQueue
 from shared.proc_group import StatFields, read_stat_fields
 from test_cli import _setup_verify_repo  # noqa: F401 -- reused cross-module
 from test_merge_queue_multihost_wiring import (  # noqa: F401 -- reused cross-module
+    _drive_runner_unavailable as _mq_drive_runner_unavailable,
+)
+from test_merge_queue_multihost_wiring import (
     _make_config as _mq_make_config,
 )
 from test_merge_queue_multihost_wiring import (
@@ -119,6 +122,8 @@ from orchestrator.verify_cancel import (  # noqa: F401 -- reused by row tests
 from orchestrator.verify_runner import (
     FLOCK_CONTENTION_CATEGORY,
     MergeVerifySpec,
+    RemoteRunner,
+    RunnerUnavailable,
     UnscopedTypecheckSpec,
     VerifyCommand,
     _default_ssh_heartbeat_run,
@@ -5312,6 +5317,94 @@ def test_heartbeat_starved_hard_partition_tree_killed_via_timeout(tmp_path):
     finally:
         heartbeat.stop_heartbeats()
         kill_holder_tree(child, timeout=ROW5_HOLDER_TEARDOWN_CEILING_SECS)
+
+
+# ---------------------------------------------------------------------------
+# Task 5556 -- trigger attribution, end to end.  A real RemoteRunner dispatches
+# a real verify-merge through the real heartbeat dispatcher, starves it, and
+# follows the watchdog's trigger token through every hop that relays it: the
+# dispatcher's stderr capture, the RunnerUnavailable reason, and the merge
+# worker's elided `remote runner unavailable` WARNING.
+# ---------------------------------------------------------------------------
+
+#: Heads the RunnerUnavailable reason this row's dispatch produces.
+LOOPBACK_SSH_HOST: str = 'loopback-verify-host'
+
+#: Far beyond any wait in this module.  run_stdin_heartbeat's first beat lands
+#: at t=interval, so no beat ever arrives and the leader's watchdog takes its
+#: select-timeout branch.
+STARVED_HEARTBEAT_INTERVAL_SECS: float = 3600.0
+
+
+@pytest.mark.timeout(ROW_PER_TEST_TIMEOUT_SECS)
+def test_starvation_self_kill_is_attributable_through_the_real_remote_dispatch_chain(
+    tmp_path, monkeypatch, caplog
+):
+    """A starved remote self-kill stays attributable all the way to the worker's log.
+
+    Drives a real RemoteRunner whose only doubles are ``git push`` and an
+    ssh that is a transparent pipe, so the leader's stdin is the real
+    heartbeat pipe and its stderr comes back exactly as ssh relays it.  The
+    reason must carry the watchdog's controlled rc 1 at its head and the
+    starvation token at its tail; that real reason is then fed to the real
+    merge worker, whose elided WARNING must still name the token.  The EOF
+    trigger is pinned at Row 2 instead, because the real dispatcher closes
+    the heartbeat pipe only after its child has exited.
+    """
+    repo, head_sha = _setup_verify_repo(tmp_path)
+    cfg_file = write_verify_config(tmp_path / 'config.yaml', repo, persistent_merge_worktree=False)
+    tag = uuid.uuid4().hex
+    # CLI startup, then one watchdog window plus load headroom: a wedge
+    # detector that costs nothing on the success path.
+    dispatch_ceiling = row_discovery_ceiling_secs() + ROW_TREE_KILL_CEILING_SECS
+
+    with monkeypatch.context() as env:
+        apply_dispatcher_env(env)
+        for key, value in ROW_WATCHDOG_ENV.items():
+            env.setenv(key, value)
+        env.setenv(HOLDER_TAG_ENV, tag)
+        runner = RemoteRunner(
+            'loopback',
+            LOOPBACK_SSH_HOST,
+            git_remote=str(repo),
+            cwd=repo,
+            config_path=str(cfg_file),
+            run=git_push_succeeds,
+            ssh_run=loopback_ssh_run(heartbeat_interval=STARVED_HEARTBEAT_INTERVAL_SECS),
+            id_factory=lambda: 'trigger-attribution-e2e',
+        )
+        try:
+            with pytest.raises(RunnerUnavailable) as excinfo:
+                asyncio.run(asyncio.wait_for(
+                    runner.run_merge_verify(head_sha, sleeper_spec(300.0)), dispatch_ceiling,
+                ))
+        except TimeoutError:
+            pytest.fail(
+                f'the remote dispatch did not end within {dispatch_ceiling}s: the starved '
+                f'leader\'s watchdog never fired, so its self-kill could not be attributed'
+            )
+        finally:
+            sweep_tagged(tag)
+
+    reason = str(excinfo.value)
+    assert reason.startswith(f'ssh {LOOPBACK_SSH_HOST} exited 1:'), (
+        f'expected the watchdog\'s controlled self-exit (rc 1), not a transport death; '
+        f'reason head: {reason[:300]!r}'
+    )
+    assert_watchdog_fire_trigger(
+        reason, WatchdogTrigger.HEARTBEAT_STARVATION, source='RunnerUnavailable reason'
+    )
+
+    consumer_dir = tmp_path / 'consumer'
+    consumer_dir.mkdir()
+    _, records = asyncio.run(_mq_drive_runner_unavailable(consumer_dir, caplog, reason))
+    assert len(records) == 1, [record.message for record in records]
+    assert 'exited 1' in records[0].message, records[0].message
+    assert_watchdog_fire_trigger(
+        records[0].message,
+        WatchdogTrigger.HEARTBEAT_STARVATION,
+        source='remote runner unavailable WARNING',
+    )
 
 
 # ---------------------------------------------------------------------------
