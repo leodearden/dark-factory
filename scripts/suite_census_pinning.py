@@ -73,6 +73,10 @@ class PythonPinningCensus:
 # ---------------------------------------------------------------------------
 # What is first-party, and where its modules live.
 
+def _importable(dotted: str) -> bool:
+    return all(segment.isidentifier() for segment in dotted.split('.'))
+
+
 @dataclass(frozen=True)
 class _FirstParty:
     roots: frozenset[str]
@@ -83,7 +87,7 @@ class _FirstParty:
         modules = {
             file.import_name: file.path
             for member in domain for file in member.files
-            if file.import_name is not None
+            if file.import_name is not None and _importable(file.import_name)
         }
         return cls(
             roots=frozenset(name.split('.', 1)[0] for name in modules),

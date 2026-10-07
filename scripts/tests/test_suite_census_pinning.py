@@ -141,6 +141,11 @@ def test_bare_legibility_name_patch():
 def test_scripts_root_patch():
     with patch('tool._y'):
         pass
+
+
+def test_unimportable_script_name_patch():
+    with patch('wait-for-port._z'):
+        pass
 '''
 
 
@@ -155,6 +160,7 @@ def tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
         'pkgb/tests/test_n.py': TEST_N,
         'pkgb/tests/fixtures/broken.py': 'def broken(:\n',
         'scripts/tool.py': '_y = 1\n',
+        'scripts/wait-for-port.py': '_z = 1\n',
         'scripts/legibility/ledger.py': '_x = 1\n',
         'scripts/tests/test_scripts.py': SCRIPTS_TEST,
         'tests/test_top.py': 'def test_top():\n    pass\n',
@@ -238,6 +244,9 @@ class TestFirstPartyIsTheDomain:
         """PRD decision 3 makes scripts/ the import root, so a bare legibility module name is not first-party."""
         assert scripts.distinct_private_targets == frozenset({'legibility.ledger._x', 'tool._y'})
         assert scripts.tests_with_private_patch == 3
+
+    def test_a_script_whose_name_is_not_an_identifier_is_never_first_party(self, scripts):
+        assert 'wait-for-port._z' not in scripts.distinct_private_targets
 
     def test_a_tree_whose_pyproject_declares_no_members_is_refused(self, tmp_path):
         tree = git_tree(tmp_path, {
