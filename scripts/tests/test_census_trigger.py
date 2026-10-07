@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime, timedelta
+import statistics
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -273,55 +274,169 @@ def test_evaluate_condition_b_delta_unavailable_no_fire():
 
 
 # ---------------------------------------------------------------------------
-# step-7: RED — evaluate() condition (c): novelty spike
+# relative novelty spike against a trailing baseline
+# (plans/census-incremental-prd.md §4.7 (b), §4.8 row 13)
 # ---------------------------------------------------------------------------
 
-def _evaluate_c(*, candidate_first_seens):
-    """last_census_at=now-6d: > floor(5), < max_interval(10), < min_days(7)
-    -- so only condition (c) can possibly fire. first_seen values are
-    passed as YYYY-MM-DD date strings, exactly as the codebook writes them
-    (§7.1 candidates[].first_seen), parsed to datetimes here (evaluate()
-    itself takes already-parsed datetimes)."""
+_TODAY = datetime.combine(NOW.date(), datetime.min.time(), tzinfo=UTC)
+
+
+def _first_seens_over_a_baseline_of_40(current_72h):
+    """35 days of history whose every 72h window holds exactly 40 candidates
+    (period-3 daily counts 13, 13, 14), then today topped up so the window
+    ending at NOW holds `current_72h`."""
+    daily = {days_ago: (13, 13, 14)[days_ago % 3] for days_ago in range(1, 36)}
+    daily[0] = daily[3] + (current_72h - 40)
+    return [_TODAY - timedelta(days=days_ago) for days_ago, n in daily.items() for _ in range(n)]
+
+
+def _quiet_history():
+    return [NOW - timedelta(days=40)]
+
+
+def _evaluate_novelty(first_seens, config=None, now=NOW):
     return ct.evaluate(
-        now=NOW,
-        last_census_at=NOW - timedelta(days=6),
-        floor_anchor=_anchor(ct.FloorAnchorKind.SESSION_WATERMARK, 6),
+        now=now,
+        last_census_at=now - timedelta(days=6),
+        floor_anchor=ct.FloorAnchor(ct.FloorAnchorKind.SESSION_WATERMARK, now - timedelta(days=6)),
         tasks_landed=None,
-        candidate_first_seens=[datetime.fromisoformat(s) for s in candidate_first_seens],
-        config=ct.CensusConfig(),
+        candidate_first_seens=first_seens,
+        config=config or ct.CensusConfig(),
     )
 
 
-def test_evaluate_condition_c_four_within_72h_fires():
-    # 2026-07-14/13/12 (twice) are 0h/0h/36h/60h before NOW -- all <= 72h.
-    decision = _evaluate_c(
-        candidate_first_seens=["2026-07-14", "2026-07-14", "2026-07-13", "2026-07-12"]
+def _novelty_line(decision):
+    (line,) = [r for r in decision.reasons if r.startswith("novelty-spike:")]
+    return line
+
+
+def test_novelty_spike_43_against_baseline_median_40_does_not_fire():
+    decision = _evaluate_novelty(_first_seens_over_a_baseline_of_40(43))
+    assert decision.fire is False
+    assert _novelty_line(decision) == "novelty-spike: 43 within 72h (baseline median 40, x2)"
+
+
+def test_novelty_spike_90_against_baseline_median_40_fires():
+    decision = _evaluate_novelty(_first_seens_over_a_baseline_of_40(90))
+    assert decision.fire is True
+    assert (
+        _novelty_line(decision) == "novelty-spike: 90 within 72h (baseline median 40, x2) -> FIRE"
+    )
+
+
+def test_novelty_spike_needs_the_absolute_minimum_too():
+    three = _evaluate_novelty(_quiet_history() + [_TODAY] * 3)
+    assert three.fire is False
+    assert _novelty_line(three) == "novelty-spike: 3 within 72h (baseline median 0, x2)"
+
+    four = _evaluate_novelty(_quiet_history() + [_TODAY] * 4)
+    assert four.fire is True
+    assert _novelty_line(four).endswith("-> FIRE")
+
+
+def test_novelty_spike_is_na_with_less_than_baseline_days_of_history():
+    ten_days = [_TODAY - timedelta(days=i % 11) for i in range(90)]
+    decision = _evaluate_novelty(ten_days)
+    assert decision.fire is False
+    line = _novelty_line(decision)
+    assert "N/A" in line
+    assert "30d" in line
+    assert "10.5d" in line
+
+
+def test_novelty_spike_window_counts_72h_inclusive():
+    # 2026-07-11 is 84h before NOW (excluded); NOW - 72h exactly is included.
+    dated = [
+        datetime.fromisoformat(d) for d in ("2026-07-14", "2026-07-13", "2026-07-12", "2026-07-11")
+    ]
+    decision = _evaluate_novelty(_quiet_history() + dated + [NOW - timedelta(hours=72)])
+    assert _novelty_line(decision).startswith("novelty-spike: 4 within 72h")
+
+
+def test_novelty_spike_baseline_days_zero_degenerates_to_the_absolute_rule():
+    decision = _evaluate_novelty(
+        [_TODAY] * 4, config=ct.CensusConfig(novelty_spike_baseline_days=0)
     )
     assert decision.fire is True
-    assert any("novelty-spike" in r and "4" in r for r in decision.reasons)
+    assert "baseline median 0" in _novelty_line(decision)
 
 
-def test_evaluate_condition_c_only_three_within_72h_no_fire():
-    decision = _evaluate_c(candidate_first_seens=["2026-07-14", "2026-07-13", "2026-07-12"])
-    assert decision.fire is False
-
-
-def test_evaluate_condition_c_four_but_one_outside_window_counts_as_three_no_fire():
-    # 2026-07-11 is 84h before NOW -- outside the 72h window, so only 3
-    # of these 4 candidates count.
-    decision = _evaluate_c(
-        candidate_first_seens=["2026-07-14", "2026-07-13", "2026-07-12", "2026-07-11"]
+def test_novelty_spike_multiple_is_honoured():
+    decision = _evaluate_novelty(
+        _first_seens_over_a_baseline_of_40(90), config=ct.CensusConfig(novelty_spike_multiple=3)
     )
     assert decision.fire is False
+    assert _novelty_line(decision).endswith("(baseline median 40, x3)")
+
+
+# Histogram of candidates[].first_seen in docs/legibility/confusion-codebook.yaml
+# at 92af0716e8 (1,132 candidates).
+_RECORDED_DAILY_NEW_CANDIDATES = {
+    "2026-07-13": 4, "2026-07-14": 4, "2026-07-15": 5, "2026-07-16": 2, "2026-07-17": 2,
+    "2026-07-18": 1, "2026-07-19": 6, "2026-07-20": 11, "2026-07-21": 6, "2026-07-22": 35,
+    "2026-07-23": 5, "2026-07-24": 2, "2026-07-25": 3, "2026-07-26": 1, "2026-07-28": 3,
+    "2026-07-29": 7, "2026-07-30": 32, "2026-07-31": 24, "2026-08-01": 8, "2026-08-02": 23,
+    "2026-08-03": 20, "2026-08-04": 9, "2026-08-05": 17, "2026-08-06": 15, "2026-08-07": 16,
+    "2026-08-08": 15, "2026-08-09": 16, "2026-08-10": 17, "2026-08-11": 7, "2026-08-12": 20,
+    "2026-08-13": 2, "2026-08-15": 18, "2026-08-16": 18, "2026-08-17": 1, "2026-08-18": 24,
+    "2026-08-19": 22, "2026-08-21": 11, "2026-08-22": 23, "2026-08-23": 20, "2026-08-24": 28,
+    "2026-08-25": 28, "2026-08-26": 14, "2026-08-27": 23, "2026-08-28": 24, "2026-08-29": 16,
+    "2026-08-31": 16, "2026-09-01": 8, "2026-09-02": 7, "2026-09-03": 20, "2026-09-04": 15,
+    "2026-09-05": 12, "2026-09-06": 13, "2026-09-07": 21, "2026-09-08": 31, "2026-09-09": 21,
+    "2026-09-10": 20, "2026-09-11": 63, "2026-09-12": 25, "2026-09-13": 18, "2026-09-14": 1,
+    "2026-09-15": 21, "2026-09-16": 18, "2026-09-17": 22, "2026-09-18": 20, "2026-09-19": 3,
+    "2026-09-20": 16, "2026-09-21": 25, "2026-09-22": 12, "2026-09-23": 15, "2026-09-24": 6,
+    "2026-09-25": 21, "2026-09-26": 11, "2026-09-27": 18, "2026-09-28": 1, "2026-10-02": 15,
+    "2026-10-03": 9,
+}
+
+
+def _recorded_72h_count(day):
+    return sum(
+        _RECORDED_DAILY_NEW_CANDIDATES.get((day - timedelta(days=back)).isoformat(), 0)
+        for back in range(3)
+    )
+
+
+def test_novelty_spike_replay_fires_on_the_relative_rule_not_the_absolute_one():
+    recorded = {
+        "version": 2,
+        "entries": [],
+        "candidates": _candidates_from_dates(
+            [day for day, n in _RECORDED_DAILY_NEW_CANDIDATES.items() for _ in range(n)]
+        ),
+    }
+    _, first_seens = ct.codebook_signal(recorded)
+
+    relative_days, absolute_days = set(), set()
+    day = date(2026, 8, 15)
+    while day <= date(2026, 10, 3):
+        n = _recorded_72h_count(day)
+        m = statistics.median(_recorded_72h_count(day - timedelta(days=k)) for k in range(1, 31))
+        expected = n >= 4 and n >= 2 * m
+
+        now = datetime.combine(day, datetime.min.time(), tzinfo=UTC) + timedelta(hours=12)
+        decision = _evaluate_novelty(first_seens, now=now)
+
+        assert decision.fire is expected, day
+        line = f"novelty-spike: {n} within 72h (baseline median {m:g}, x2)"
+        assert (line + " -> FIRE" if expected else line) in decision.reasons, day
+        if decision.fire:
+            relative_days.add(day)
+        if n >= 4:
+            absolute_days.add(day)
+        day += timedelta(days=1)
+
+    assert relative_days
+    assert relative_days < absolute_days
+    assert date(2026, 9, 11) in relative_days
+    assert date(2026, 8, 25) not in relative_days
 
 
 # ---------------------------------------------------------------------------
 # hard floor: measured from its anchor, blocks a/b/c, always reported
 # (plans/census-incremental-prd.md §4.7 Floor)
 # ---------------------------------------------------------------------------
-
-_SPIKE_4_IN_72H = ["2026-07-14", "2026-07-14", "2026-07-13", "2026-07-12"]
-
 
 def _evaluate_floor(*, last_census_days_ago, floor_anchor, tasks_landed=None, config=None):
     return ct.evaluate(
@@ -1500,32 +1615,42 @@ def test_decide_for_project_row3_day7_130_landed_fires(tmp_path):
     assert any("tasks-landed" in r for r in decision.reasons)
 
 
-def test_decide_for_project_row4_day6_novelty_spike_fires(tmp_path):
-    _write_codebook(tmp_path, candidates=_candidates_from_dates(_SPIKE_4_IN_72H))
+def _write_spike_codebook(project_root):
+    _write_codebook(
+        project_root,
+        candidates=_candidates_from_dates(
+            [fs.date().isoformat() for fs in _first_seens_over_a_baseline_of_40(90)]
+        ),
+    )
+
+
+def test_decide_for_project_row4_novelty_spike_fires(tmp_path):
+    _write_spike_codebook(tmp_path)
     _write_census_state(
-        tmp_path,
-        last_census_at=(NOW - timedelta(days=6)).isoformat(),
-        last_census_report="plans/confusion-census-prior.md",
+        tmp_path, **_watermarked_state(last_census_days_ago=6, watermark_days_ago=6)
     )
 
     decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
 
     assert decision.fire is True
-    assert any("novelty-spike" in r for r in decision.reasons)
+    assert any(
+        r.startswith("novelty-spike:") and r.endswith("-> FIRE") for r in decision.reasons
+    )
 
 
-def test_decide_for_project_row5_day4_floor_blocks_spike_no_fire(tmp_path):
-    _write_codebook(tmp_path, candidates=_candidates_from_dates(_SPIKE_4_IN_72H))
+def test_decide_for_project_row5_floor_blocks_novelty_spike_no_fire(tmp_path):
+    _write_spike_codebook(tmp_path)
     _write_census_state(
-        tmp_path,
-        last_census_at=(NOW - timedelta(days=4)).isoformat(),
-        last_census_report="plans/confusion-census-prior.md",
+        tmp_path, **_watermarked_state(last_census_days_ago=6, watermark_days_ago=3)
     )
 
     decision = ct.decide_for_project(tmp_path, now=NOW, status_fetcher=None)
 
     assert decision.fire is False
-    assert any("floor" in r for r in decision.reasons)
+    assert (
+        "floor: 3.0d since session watermark (floor 5d) -> BLOCKS all conditions"
+        in decision.reasons
+    )
 
 
 def test_decide_for_project_row6_malformed_state_no_fire_one_warning(tmp_path, caplog):
