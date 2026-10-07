@@ -114,6 +114,9 @@ class FakeStream(httpcore.AsyncNetworkStream):
     "closed" count from the set it unpools, and a close that suspends is the
     only window in which a concurrent request can unpool a connection the sweep
     is midway through closing.
+
+    ``peer_closed`` makes the stream report that its peer hung up, which is how
+    a test lowers one pool's occupancy by exactly one IDLE connection.
     """
 
     def __init__(self, read_gate: asyncio.Event | None = None) -> None:
@@ -123,6 +126,7 @@ class FakeStream(httpcore.AsyncNetworkStream):
         self.reached_close = False
         self.close_error: Exception | None = None
         self.close_gate: asyncio.Event | None = None
+        self.peer_closed = False
         self._read_gate = read_gate
 
     async def write(self, buffer: bytes, timeout: float | None = None) -> None:
@@ -146,10 +150,14 @@ class FakeStream(httpcore.AsyncNetworkStream):
         self.closed = True
 
     def get_extra_info(self, info: str) -> Any:
-        # None for every key, 'is_readable' included. has_expired()'s
-        # server_disconnected term is therefore never satisfied here — which is
-        # exactly the condition under which an orphan is unreclaimable, and the
-        # one task 3857's IDLE measurements could not observe.
+        # By default None for every key, 'is_readable' included, so
+        # has_expired()'s server_disconnected term never fires — exactly the
+        # condition under which an orphan is unreclaimable, and the one task
+        # 3857's IDLE measurements could not observe. Setting `peer_closed` on
+        # an IDLE connection reproduces 3857's case instead: httpcore expires
+        # it and removes it on the next request that enters the pool.
+        if info == 'is_readable' and self.peer_closed:
+            return True
         return None
 
 
@@ -897,6 +905,15 @@ _SMALL_MAX_CONNECTIONS = 5
 _AT_HIGH_WATER = 4
 _BELOW_HIGH_WATER = 3
 
+# The port of the first origin `_fill_pool` connects to; each further
+# connection takes the next port up.
+_FIRST_PORT = 9000
+
+
+async def _post_ok(client: httpx.AsyncClient, port: int) -> None:
+    response = await client.post(f'http://svc.local:{port}/mcp', content=b'{}')
+    assert response.status_code == 200
+
 
 async def _fill_pool(client: httpx.AsyncClient, connections: int) -> None:
     """Leave *connections* idle connections pooled, one per distinct origin.
@@ -904,32 +921,46 @@ async def _fill_pool(client: httpx.AsyncClient, connections: int) -> None:
     Distinct origins are the point: httpcore reuses a pooled connection for
     the same one, so N requests to a single host would occupy a single slot.
     """
-    for port in range(9000, 9000 + connections):
-        response = await client.post(f'http://svc.local:{port}/mcp', content=b'{}')
-        assert response.status_code == 200
+    for port in range(_FIRST_PORT, _FIRST_PORT + connections):
+        await _post_ok(client, port)
+
+
+def _total(harness: _Harness) -> int:
+    reading = http_pool.census(harness.client)
+    assert reading is not None, 'census could not resolve a pool the test built'
+    return reading.total
 
 
 @contextlib.asynccontextmanager
-async def _pool_holding(occupancy: int) -> AsyncIterator[httpx.AsyncClient]:
+async def _pool_holding(occupancy: int) -> AsyncIterator[_Harness]:
     """A small pool left holding exactly *occupancy* idle connections."""
     harness = _build_harness(max_connections=_SMALL_MAX_CONNECTIONS)
     try:
         await _fill_pool(harness.client, occupancy)
-        reading = http_pool.census(harness.client)
-        assert reading is not None and reading.total == occupancy, (
-            f'wanted a pool holding {occupancy} connections, got {reading}'
+        assert _total(harness) == occupancy, (
+            f'wanted a pool holding {occupancy} connections, got {_total(harness)}'
         )
-        yield harness.client
+        yield harness
     finally:
         with contextlib.suppress(Exception):
             await harness.client.aclose()
 
 
-async def _sweep_once(client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Run exactly one reaper sweep, through the real loop."""
-    monkeypatch.setattr(asyncio, 'sleep', FakeSleep(stop_after=1))
-    with contextlib.suppress(asyncio.CancelledError):
-        await http_pool.reaper_loop(client)
+async def _shed_one_connection(harness: _Harness) -> None:
+    """Lower the pool's occupancy by exactly one, through httpcore's own reclaim.
+
+    Task 3857's case: the peer of the first origin's IDLE connection hangs up,
+    and the next request into the pool, to an origin still pooled, expires
+    and removes it. Posting to :data:`_FIRST_PORT` again then brings the
+    occupancy back up.
+    """
+    before = _total(harness)
+    harness.backend.streams[0].peer_closed = True
+    await _post_ok(harness.client, _FIRST_PORT + 1)
+    assert _total(harness) == before - 1, (
+        f'wanted the pool to shed exactly one connection from {before}, '
+        f'got {_total(harness)}'
+    )
 
 
 class TestPoolSaturationAlarm:
@@ -943,9 +974,6 @@ class TestPoolSaturationAlarm:
 
     It is an OCCUPANCY reading, taken from the pool's own bookkeeping, so it
     does not reintroduce the socket census task 3857 correctly rejected.
-
-    XDIST: as with the shape guard, every test here re-arms the latch in its
-    own body and asserts any first/second-sweep pair within itself.
     """
 
     def test_the_fixture_occupancies_straddle_the_threshold(self) -> None:
@@ -959,12 +987,11 @@ class TestPoolSaturationAlarm:
         assert _BELOW_HIGH_WATER / _SMALL_MAX_CONNECTIONS < http_pool.POOL_HIGH_WATER_FRACTION
 
     async def test_a_sweep_at_the_high_water_mark_warns_with_the_census(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+        self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        http_pool.reset_saturation_guard()
-        async with _pool_holding(_AT_HIGH_WATER) as client:
+        async with _pool_holding(_AT_HIGH_WATER) as harness:
             with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
-                await _sweep_once(client, monkeypatch)
+                await http_pool.OrphanReaper(harness.client).sweep()
 
         warnings = _messages(caplog, logging.WARNING)
         assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings}'
@@ -977,12 +1004,11 @@ class TestPoolSaturationAlarm:
         )
 
     async def test_a_sweep_below_the_high_water_mark_says_nothing(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+        self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        http_pool.reset_saturation_guard()
-        async with _pool_holding(_BELOW_HIGH_WATER) as client:
+        async with _pool_holding(_BELOW_HIGH_WATER) as harness:
             with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
-                await _sweep_once(client, monkeypatch)
+                await http_pool.OrphanReaper(harness.client).sweep()
 
         assert _above_debug(caplog) == [], (
             'an ordinarily busy pool must be silent, or the alarm becomes noise and '
@@ -990,46 +1016,94 @@ class TestPoolSaturationAlarm:
         )
 
     async def test_sustained_saturation_warns_once_then_drops_to_debug(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+        self, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A wedged pool stays wedged; one line per minute forever is not a signal."""
-        http_pool.reset_saturation_guard()
-        async with _pool_holding(_AT_HIGH_WATER) as client:
+        async with _pool_holding(_AT_HIGH_WATER) as harness:
+            reaper = http_pool.OrphanReaper(harness.client)
             with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
-                await _sweep_once(client, monkeypatch)
+                await reaper.sweep()
                 assert len(_messages(caplog, logging.WARNING)) == 1
 
                 caplog.clear()
-                await _sweep_once(client, monkeypatch)
+                await reaper.sweep()
 
         assert _messages(caplog, logging.WARNING) == []
         assert _messages(caplog, logging.DEBUG), 'demoted, not discarded'
 
     async def test_falling_below_the_mark_re_arms_the_warning(
-        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+        self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Otherwise the alarm fires once per process and never again.
+        """Otherwise the alarm fires once per pool and never again.
 
         A pool that saturates, recovers, and saturates again has had two
         incidents, and the second one matters at least as much as the first.
+        All three readings are ONE pool's, watched by ONE reaper.
         """
-        http_pool.reset_saturation_guard()
-        with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
-            async with _pool_holding(_AT_HIGH_WATER) as client:
-                await _sweep_once(client, monkeypatch)
-            assert len(_messages(caplog, logging.WARNING)) == 1
+        async with _pool_holding(_AT_HIGH_WATER) as harness:
+            reaper = http_pool.OrphanReaper(harness.client)
+            with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+                await reaper.sweep()
+                assert len(_messages(caplog, logging.WARNING)) == 1
 
-            caplog.clear()
-            async with _pool_holding(_BELOW_HIGH_WATER) as client:
-                await _sweep_once(client, monkeypatch)
-            assert _above_debug(caplog) == [], 'recovery itself must be silent'
+                caplog.clear()
+                await _shed_one_connection(harness)
+                await reaper.sweep()
+                assert _above_debug(caplog) == [], 'recovery itself must be silent'
 
-            async with _pool_holding(_AT_HIGH_WATER) as client:
-                await _sweep_once(client, monkeypatch)
+                await _post_ok(harness.client, _FIRST_PORT)
+                assert _total(harness) == _AT_HIGH_WATER
+                await reaper.sweep()
 
         assert len(_messages(caplog, logging.WARNING)) == 1, (
             'saturating again after a recovery must warn again; a latch that never '
-            're-arms reports only the first incident a process ever sees'
+            're-arms reports only the first incident a pool ever has'
+        )
+
+    async def test_a_healthy_pools_sweep_does_not_re_arm_a_saturated_pools_alarm(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An episode belongs to a pool, so the alarm belongs to the reaper watching it.
+
+        Under one process-wide latch, the healthy pool's reading would re-arm
+        the saturated pool's alarm, which would then warn on every sweep.
+        """
+        async with (
+            _pool_holding(_AT_HIGH_WATER) as loud,
+            _pool_holding(_BELOW_HIGH_WATER) as quiet,
+        ):
+            loud_reaper = http_pool.OrphanReaper(loud.client)
+            quiet_reaper = http_pool.OrphanReaper(quiet.client)
+            with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+                await loud_reaper.sweep()
+                await quiet_reaper.sweep()
+                await loud_reaper.sweep()
+
+        warnings = _messages(caplog, logging.WARNING)
+        assert len(warnings) == 1, (
+            "a healthy pool's sweep re-armed a saturated pool's alarm; expected one "
+            f'WARNING for one saturation episode, got {warnings}'
+        )
+
+    async def test_each_saturated_pool_reports_its_own_onset(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An episode belongs to a pool, so the alarm belongs to the reaper watching it.
+
+        Under one process-wide latch, the first pool's episode would swallow
+        the second pool's onset entirely.
+        """
+        async with (
+            _pool_holding(_AT_HIGH_WATER) as first,
+            _pool_holding(_AT_HIGH_WATER) as second,
+        ):
+            with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+                await http_pool.OrphanReaper(first.client).sweep()
+                await http_pool.OrphanReaper(second.client).sweep()
+
+        warnings = _messages(caplog, logging.WARNING)
+        assert len(warnings) == 2, (
+            f'expected one WARNING per saturated pool, got {warnings}'
         )
 
 
