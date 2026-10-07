@@ -1,7 +1,8 @@
 // Module-contract tests for merge_queue.js, the CLIENT reader of the served
-// "In queue now" datum whose server half is dashboard/src/dashboard/data/merge_queue.py.
-// The MergeTab tile, its per-project "queued" pip and the rail badge all read
-// the queue through this module, so the decisions it makes are asserted here,
+// /merge-queue Datums (in_queue, speculative, recent_total) whose server half is
+// dashboard/src/dashboard/data/merge_queue.py, and of each queued row's enqueue
+// instant. The MergeTab tiles, its per-project pips, the live feed and the rail
+// badge all read the queue through this module, so the decisions it makes are asserted here,
 // where node can execute them. tabs.jsx and app.jsx are `type="text/babel"`
 // behind CDN Babel and cannot run under node; their WIRING is pinned
 // structurally in Python (test_tab_merge_queue.py).
@@ -32,7 +33,10 @@ function loadMergeQueue() {
 }
 
 const { api: mergeQueue, window: loadedWindow } = loadMergeQueue();
-const { projectInQueue, inQueueOver, inQueueHistory, latencyCaption } = mergeQueue;
+const {
+  projectInQueue, inQueueOver, inQueueHistory, latencyCaption,
+  queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
+} = mergeQueue;
 const { isDatum, datumView, EM_DASH } = loadedWindow.DF_DATUM;
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
@@ -87,12 +91,33 @@ const TWO_FRESH = () => mqData({
   b: entryWith(inQueue('fresh', 1)),
 });
 
+// A served runs.db reading (speculative, recent_total), honouring the unknown triad.
+function runsDbRead(state, value, overrides) {
+  const base =
+    state === 'unknown'
+      ? { value: null, as_of: null, state, reason: 'the merge_attempt events could not be read from runs.db', freshness_bound_seconds: 30 }
+      : { value, as_of: PROBED_AT, state, reason: state === 'fresh' ? null : 'measured 45s before it was served', freshness_bound_seconds: 30 };
+  return { ...base, ...overrides };
+}
+
+function counts(hits, discards) {
+  const total = hits + discards;
+  return { hit_count: hits, discard_count: discards, total, hit_rate: total > 0 ? hits / total : null };
+}
+
+function entryReading(spec, recent, served = inQueue('fresh', 0)) {
+  return { ...entryWith(served), speculative: spec, recent_total: recent };
+}
+
 // ── The module ──────────────────────────────────────────────────────────────
 
-test('the module exposes its four readers and assigns window.DF_MERGE_QUEUE', () => {
+test('the module exposes its readers and assigns window.DF_MERGE_QUEUE', () => {
   assert.deepEqual(
     Object.keys(mergeQueue).sort(),
-    ['inQueueHistory', 'inQueueOver', 'latencyCaption', 'projectInQueue'],
+    [
+      'hitRateText', 'inQueueHistory', 'inQueueOver', 'latencyCaption', 'projectInQueue',
+      'projectSpeculative', 'queuedSince', 'recentTotal', 'speculativeOver',
+    ],
   );
   for (const name of Object.keys(mergeQueue)) {
     assert.equal(typeof mergeQueue[name], 'function', `${name} should be a function`);
@@ -267,4 +292,154 @@ test('latencyCaption: the centiles say how many attempts they were computed over
 test('latencyCaption: a latency block without the split states nothing rather than a zero', () => {
   assert.equal(latencyCaption({}), '');
   assert.equal(latencyCaption(undefined), '');
+});
+
+// ── queuedSince: when a queued row joined, from the probe instant and its age ─
+
+test('queuedSince: the probe instant minus the row\'s age', () => {
+  const entry = entryWith(inQueue('fresh', 1));
+  assert.equal(queuedSince(entry, { task_id: '7', age_secs: 90 }), '2026-10-01T11:58:58.000Z');
+  assert.equal(queuedSince(entry, { task_id: '7', age_secs: 0 }), '2026-10-01T12:00:28.000Z');
+});
+
+test('queuedSince: a row with no usable age has no enqueue instant — never "just now"', () => {
+  const entry = entryWith(inQueue('fresh', 1));
+  for (const age of [null, undefined, Number.NaN, -1]) {
+    assert.equal(queuedSince(entry, { task_id: '7', age_secs: age }), null, String(age));
+  }
+});
+
+test('queuedSince: with no probe instant there is nothing to subtract from', () => {
+  const row = { task_id: '7', age_secs: 90 };
+  assert.equal(queuedSince(entryWith(inQueue('unknown')), row), null);
+  assert.equal(queuedSince({ active: [] }, row), null);
+  assert.equal(queuedSince(null, row), null);
+});
+
+test('queuedSince: reads its inputs and alters neither', () => {
+  const entry = entryWith(inQueue('fresh', 1));
+  const row = { task_id: '7', age_secs: 90 };
+  const pristine = structuredClone([entry, row]);
+
+  queuedSince(entry, row);
+
+  assert.deepEqual([entry, row], pristine);
+});
+
+// ── projectSpeculative / recentTotal: one project's runs.db readings, stamped ─
+
+for (const [field, reader, value] of [
+  ['speculative', projectSpeculative, counts(5, 3)],
+  ['recent_total', recentTotal, 228],
+]) {
+  test(`${field}: the served Datum, stamped with the /merge-queue receipt as a copy`, () => {
+    const data = mqData({ a: entryReading(runsDbRead('fresh', counts(5, 3)), runsDbRead('fresh', 228)) });
+    const wire = data.MERGE_QUEUE.a[field];
+    const pristine = structuredClone(wire);
+
+    const served = reader(data, 'a');
+
+    assert.equal(isDatum(served), true);
+    assert.deepEqual(served.value, value);
+    assert.equal(served.state, 'fresh');
+    assert.equal(served._served_at, SERVED_AT);
+    assert.equal(served._received_at, RECEIVED_AT);
+    assert.notEqual(served, wire, 'the stamp must land on a copy');
+    assert.deepEqual(wire, pristine, 'the wire datum was mutated');
+  });
+
+  test(`${field}: before the first /merge-queue payload, it is not yet fetched`, () => {
+    const served = reader(mqData({}, null), 'a');
+    assert.equal(served.state, 'unknown');
+    assert.equal(served.reason, 'not yet fetched');
+  });
+
+  test(`${field}: a missing project or a missing Datum is a hole naming the project`, () => {
+    const malformed = [
+      ['an absent project', {}],
+      ['an entry with no Datum', { hive: entryWith(inQueue('fresh', 0)) }],
+      ['a bare value', { hive: { ...entryWith(inQueue('fresh', 0)), [field]: 0 } }],
+    ];
+    for (const [label, entries] of malformed) {
+      const served = reader(mqData(entries), 'hive');
+      assert.equal(served.state, 'unknown', label);
+      assert.equal(served.value, null, label);
+      assert.match(served.reason, /hive/, `${label}: the reason must name the project`);
+    }
+  });
+
+  test(`${field}: an unread runs.db keeps the server's reason`, () => {
+    const unread = runsDbRead('unknown');
+    const served = reader(mqData({ a: entryReading(unread, unread) }), 'a');
+    assert.equal(served.state, 'unknown');
+    assert.equal(served.reason, unread.reason);
+  });
+}
+
+// ── speculativeOver: the cross-project speculative tile ────────────────────
+
+test('speculativeOver: sums the counts across every payload project, unprobed ones included', () => {
+  // live_probe_configured describes the live queue probe; speculative counts
+  // come from each project's runs.db whatever that probe can reach.
+  const data = mqData({
+    a: entryReading(runsDbRead('fresh', counts(3, 1)), runsDbRead('fresh', 4)),
+    c: { ...unprobedEntry('c'), speculative: runsDbRead('fresh', counts(2, 2)), recent_total: runsDbRead('fresh', 4) },
+  });
+
+  const total = speculativeOver(data, null);
+
+  assert.equal(total.state, 'fresh');
+  assert.deepEqual(total.value, { hit_count: 5, discard_count: 3, total: 8 });
+  assert.deepEqual(speculativeOver(data, ['a']).value, { hit_count: 3, discard_count: 1, total: 4 });
+});
+
+test('speculativeOver: a hole in any project is a hole in the total, naming that project', () => {
+  const data = mqData({
+    a: entryReading(runsDbRead('fresh', counts(3, 1)), runsDbRead('fresh', 4)),
+    b: entryReading(runsDbRead('unknown'), runsDbRead('unknown')),
+  });
+
+  const total = speculativeOver(data, null);
+
+  assert.equal(total.state, 'unknown');
+  assert.match(total.reason, /\bb: /);
+  assert.equal(speculativeOver(data, ['a', 'missing']).state, 'unknown');
+  assert.match(speculativeOver(data, ['a', 'missing']).reason, /missing/);
+});
+
+test('speculativeOver: a measured window with no attempts has no hit rate to show', () => {
+  const data = mqData({ a: entryReading(runsDbRead('fresh', counts(0, 0)), runsDbRead('fresh', 0)) });
+
+  const total = speculativeOver(data, null);
+
+  assert.equal(total.state, 'unknown');
+  assert.equal(total.reason, 'no speculative attempts in this window');
+});
+
+test('speculativeOver: before the first payload, the total is not yet fetched', () => {
+  const total = speculativeOver(mqData({}, null), null);
+  assert.equal(total.state, 'unknown');
+  assert.equal(total.reason, 'not yet fetched');
+});
+
+test('speculativeOver: a stale part makes the total stale', () => {
+  const data = mqData({
+    a: entryReading(runsDbRead('fresh', counts(1, 0)), runsDbRead('fresh', 1)),
+    b: entryReading(runsDbRead('stale', counts(1, 1)), runsDbRead('stale', 2)),
+  });
+
+  const total = speculativeOver(data, null);
+
+  assert.equal(total.state, 'stale');
+  assert.match(total.reason, /\bb: /);
+});
+
+// ── hitRateText ────────────────────────────────────────────────────────────
+
+test('hitRateText: hits over attempts, as a whole percentage', () => {
+  assert.equal(hitRateText({ hit_count: 3, total: 4 }), '75%');
+});
+
+test('hitRateText: zero attempts have no rate', () => {
+  assert.equal(hitRateText({ hit_count: 0, total: 0 }), EM_DASH);
 });

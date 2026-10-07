@@ -51,17 +51,21 @@ test('sketch #9: the recent-merges caption counts only its own window\'s merges,
   for (const win of ['7d', '24h']) {
     const { client, body, block, echo } = await mergeBlock(win);
     const { recentMergesCaption } = client.window.DF_WINDOW_CHIP;
-    const { latencyCaption } = client.window.DF_MERGE_QUEUE;
+    const { latencyCaption, recentTotal, projectSpeculative } = client.window.DF_MERGE_QUEUE;
+    const D = client.window.DF_DATA;
+    const windowTotal = recentTotal(D, 'dark-factory');
 
+    assert.equal(windowTotal.state, 'fresh', `${win}: a readable runs.db window total is measured`);
+    assert.equal(projectSpeculative(D, 'dark-factory').state, 'fresh', `${win}: so is its speculative count`);
     assert.equal(
-      recentMergesCaption(block.recent.length, block.recent_total.value, echo),
-      `showing ${block.recent.length} of ${block.recent_total.value} in ${win}`,
+      recentMergesCaption(block.recent.length, windowTotal.value, echo),
+      `showing ${block.recent.length} of ${windowTotal.value} in ${win}`,
     );
     const opensAt = Date.parse(body.served_at) - echo.days * DAY_MS;
     for (const row of block.recent) {
       assert.ok(Date.parse(row.timestamp) >= opensAt, `${win} counts a merge from ${row.timestamp}, outside it`);
     }
-    totals[win] = block.recent_total.value;
+    totals[win] = windowTotal.value;
 
     const attempts = sum(block.outcomes.values);
     const timed = block.latency.with_duration;
