@@ -386,6 +386,7 @@ class TestAllProjectsDeadlineWarning:
         assert set(result) == {'proj8105', 'proj8106', 'proj8107'}
         assert all(s.offline_reason == 'deadline_exceeded' for s in result.values())
 
+    @virtual_clock_test
     async def test_one_of_two_timing_out_does_not_warn(self, caplog):
         """One project down while the other answers IS a per-project outage."""
         from dashboard.data.task_runtime import fetch_task_runtime
@@ -405,6 +406,7 @@ class TestAllProjectsDeadlineWarning:
         assert result['proj8100'].offline is False
         assert result['proj8105'].offline_reason == 'deadline_exceeded'
 
+    @virtual_clock_test
     async def test_all_failing_with_mixed_reasons_does_not_warn(self, caplog):
         """Every project failing but for DIFFERENT reasons is not the
         starvation signature — one of them really is unreachable."""
