@@ -17,9 +17,16 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _fm_helpers import FALKOR_HOST, FALKOR_PORT, falkor_skipif
+from _fm_helpers import (
+    FALKOR_HOST,
+    FALKOR_PORT,
+    await_index_operational,
+    falkor_skipif,
+    unique_graph_name,
+)
 from _mock_openai_server import MockOpenAIServer, mock_openai_server
 from falkordb.asyncio import FalkorDB
+from falkordb.asyncio.graph import AsyncGraph
 
 from arm_harness._fakes import PROTECTED_GRAPHS, PreregRepo, llm_spec, make_prereg_repo
 from fused_memory.arm_harness.arm_backend import open_arm_backend
@@ -182,13 +189,39 @@ def _telemetry_rows(run_dir: Path) -> list[sqlite3.Row]:
     return [row for row in rows if row['operation'] == 'arm_replay_episode']
 
 
+async def _index_definitions(graph: AsyncGraph) -> list[Any]:
+    return (await graph.ro_query('CALL db.indexes()')).result_set
+
+
 async def _protected_indexes(client: FalkorDB, graphs: set[str]) -> dict[str, list[Any]]:
     """``CALL db.indexes()`` over GRAPH.RO_QUERY on every protected graph present on the host."""
     present = sorted(graphs & set(PROTECTED_GRAPHS))
-    return {
-        name: (await client.select_graph(name).ro_query('CALL db.indexes()')).result_set
-        for name in present
-    }
+    return {name: await _index_definitions(client.select_graph(name)) for name in present}
+
+
+# --- the index-definition seam --------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_index_definitions_ignore_statistics_and_see_definition_changes():
+    client = FalkorDB(host=FALKOR_HOST, port=FALKOR_PORT)
+    graph = client.select_graph(unique_graph_name('6452_index_definitions'))
+    try:
+        await graph.query('CREATE INDEX FOR (n:Entity) ON (n.uuid)')
+        await await_index_operational(graph)
+        raw_before = (await graph.ro_query('CALL db.indexes()')).result_set
+        before = await _index_definitions(graph)
+        await graph.query('CREATE (:Entity {uuid: $uuid})', {'uuid': str(uuid.uuid4())})
+        raw_after = (await graph.ro_query('CALL db.indexes()')).result_set
+        assert raw_after != raw_before, 'the write moved no index statistic, so this test proves nothing'
+        assert await _index_definitions(graph) == before
+        await graph.query('CREATE INDEX FOR (n:Entity) ON (n.name)')
+        await await_index_operational(graph)
+        assert await _index_definitions(graph) != before
+    finally:
+        with contextlib.suppress(Exception):
+            await graph.delete()
+        await client.aclose()
 
 
 # --- the live run ---------------------------------------------------------------------
