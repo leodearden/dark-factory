@@ -1,19 +1,24 @@
-"""Gate: a wildcard tool-deny under an ``output_schema`` must also close MCP.
+"""Gate: a call that reaches the CLI through a tool registry filter must also
+close MCP.
 
 The invariant
 -------------
-``shared/src/shared/cli_invoke.py::build_claude_argv`` does NOT forward a
-``disallowed_tools=['*']`` wildcard verbatim when an ``output_schema`` is also
-present.  It emits ``--tools ''`` instead, so the schema's synthetic
-``StructuredOutput`` tool survives.  That registry filter removes built-in and
-deferred tools but does NOT filter MCP, so MCP tools are still REACHABLE at
-such a call, even though the call reads as "deny everything".
+A registry filter (``--tools``) removes built-in and deferred tools but does
+NOT filter MCP.  Two call shapes emit one:
+
+* ``shared/src/shared/cli_invoke.py::build_claude_argv`` does NOT forward a
+  ``disallowed_tools=['*']`` wildcard verbatim when an ``output_schema`` is also
+  present.  It emits ``--tools ''`` instead, so the schema's synthetic
+  ``StructuredOutput`` tool survives.  MCP tools are still REACHABLE at such a
+  call, even though the call reads as "deny everything".
+* An ``available_tools`` argument emits ``--tools <list>``, with or without a
+  schema (task 4344).
 
 The CLI ambient-merges the ``.mcp.json`` found at ``cwd``, and this repo's root
 holds a live one (servers ``escalation``, ``fused-memory``).  Under
-``permission_mode='bypassPermissions'`` — which every one of these callers uses
-— that is unreviewed MCP **write** access, blast radius including
-``halt_scheduler`` and ``delete_memory``.
+``permission_mode='bypassPermissions'`` — which the wildcard callers use — that
+is unreviewed MCP **write** access, blast radius including ``halt_scheduler``
+and ``delete_memory``.
 
 A caller closes the hole in one of exactly two ways:
 
@@ -630,8 +635,9 @@ class TestRegistryFilterSites:
 # The whole-tree gate
 # --------------------------------------------------------------------------- #
 
-#: Every matching call site in the first-party tree, measured on 2026-09-27
-#: (task 3995): 5 matched, 0 violations. Four are protected by
+#: Every matching call site in the first-party tree, measured on 2026-10-07
+#: (task 4344): 5 matched, 0 violations; AgentLoop._call_claude_cli now
+#: matches through available_tools. Four are protected by
 #: ``no_mcp_servers_config()`` + ``strict_mcp_config=True``; only
 #: ``PathScopeAdjudicator.adjudicate`` relies on running at
 #: ``neutral_cli_cwd()``. Kept as an exact SET, not a count: a new
@@ -701,8 +707,9 @@ class TestWholeTreeGate:
             for site in offenders
         )
         raise AssertionError(
-            f"{len(offenders)} call site(s) pass disallowed_tools=['*'] with an "
-            f"output_schema, at a cwd whose ambient MCP servers are not closed:\n"
+            f"{len(offenders)} call site(s) pass available_tools, or "
+            f"disallowed_tools=['*'] with an output_schema, at a cwd whose "
+            f"ambient MCP servers are not closed:\n"
             f'{listing}\n'
             f'(~L is a hint for finding the call, never its identity — it drifts '
             f'on any edit above the site.)\n'
