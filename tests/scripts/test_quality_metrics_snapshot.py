@@ -13,7 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -1266,6 +1266,177 @@ class TestABadPreviousSnapshotIsRefusedBeforeMeasuring:
         err = _refused(root, capsys, '--diff', str(previous))
         assert str(previous) in err
         assert 'schema_version' in err
+
+
+_Edit = Callable[[dict[str, Any]], object]
+
+#: A src and a tests record of the summary fixture.
+_SRC_PATH = 'alpha/src/alpha/mod.py'
+_TESTS_PATH = 'alpha/tests/test_mod.py'
+
+
+def _setting(*keys: str | int, to: object) -> _Edit:
+    """An edit that sets the value at *keys* inside a snapshot to *to*."""
+
+    def edit(taken: dict[str, Any]) -> None:
+        *parents, last = keys
+        target: Any = taken
+        for key in parents:
+            target = target[key]
+        target[last] = to
+
+    return edit
+
+
+def _record(path: str, field: str, to: object) -> Any:
+    return pytest.param(
+        f'files[{path!r}].{field}', _setting('files', path, field, to=to), id=f'{path}.{field}'
+    )
+
+
+#: (what stderr names, the edit): one field of the wrong shape per row.
+_MISSHAPEN: list[Any] = [
+    pytest.param('run_id', _setting('run_id', to=5), id='run_id'),
+    pytest.param('as_of_sha', _setting('as_of_sha', to=None), id='as_of_sha'),
+    pytest.param('since', _setting('since', to=3), id='since'),
+    pytest.param('evidence.members', _setting('evidence', 'members', to={}), id='members'),
+    pytest.param(
+        'evidence.members[0].pseudo',
+        _setting('evidence', 'members', 0, 'pseudo', to='false'),
+        id='member.pseudo',
+    ),
+    pytest.param(
+        'evidence.members[0] keys',
+        lambda taken: taken['evidence']['members'][0].pop('domain_files'),
+        id='member-keys',
+    ),
+    pytest.param('evidence.unreadable', _setting('evidence', 'unreadable', to=None), id='unreadable'),
+    pytest.param(
+        'evidence.unreadable[0]', _setting('evidence', 'unreadable', to=[3]), id='unreadable-item'
+    ),
+    pytest.param('evidence.complete', _setting('evidence', 'complete', to='yes'), id='complete'),
+    pytest.param('cost', _setting('cost', to=None), id='cost'),
+    pytest.param(
+        'params.h14_alarm_lines', _setting('params', 'h14_alarm_lines', to='2000'), id='params'
+    ),
+    _record(_SRC_PATH, 'blob', None),
+    _record(_SRC_PATH, 'prose_ratio', '0.5'),
+    _record(_SRC_PATH, 'cognitive_max_function', 3),
+    _record(_SRC_PATH, 'module', None),
+    _record(_SRC_PATH, 'package_init', 'no'),
+    _record(_SRC_PATH, 'reexport_names', None),
+    _record(_SRC_PATH, 'fan_in_tests', 1.5),
+    _record(_TESTS_PATH, 'private_patch_targets', 'alpha.mod._x'),
+    _record(_TESTS_PATH, 'private_reads', None),
+    pytest.param('functions', _setting('functions', to=[]), id='functions'),
+    pytest.param(
+        f"functions['{_SRC_PATH}::f']",
+        _setting('functions', f'{_SRC_PATH}::f', to='2'),
+        id='function-score',
+    ),
+    pytest.param('import_graph.edges', _setting('import_graph', 'edges', to=None), id='edges'),
+    pytest.param(
+        'import_graph.edges[0]',
+        _setting('import_graph', 'edges', 0, to=['alpha.shim']),
+        id='edge',
+    ),
+    pytest.param(
+        'import_graph.reach_back[0].names',
+        _setting('import_graph', 'reach_back', 0, 'names', to='THING'),
+        id='reach-back-names',
+    ),
+    pytest.param(
+        'import_graph.deferred[0].imports[0]',
+        _setting('import_graph', 'deferred', 0, 'imports', to=[None]),
+        id='deferred-imports',
+    ),
+    pytest.param(
+        'import_graph.cycles[0][1]', _setting('import_graph', 'cycles', to=[['a', 1]]), id='cycles'
+    ),
+]
+
+
+def _bump(field: str, by: int = 1) -> _Edit:
+    return lambda taken: taken['evidence'].update({field: taken['evidence'][field] + by})
+
+
+#: (what stderr names, the edit): evidence that no longer describes the records.
+_DISAGREEING: list[Any] = [
+    pytest.param(
+        f'files[{_SRC_PATH!r}].member',
+        _setting('files', _SRC_PATH, 'member', to='gamma'),
+        id='member-not-in-evidence',
+    ),
+    pytest.param('evidence.domain_files', _bump('domain_files'), id='domain_files'),
+    pytest.param('evidence.measured_files', _bump('measured_files'), id='measured_files'),
+    pytest.param(
+        'evidence.unreadable',
+        lambda taken: taken['evidence']['unreadable'].append('alpha/src/alpha/gone.py'),
+        id='unreadable-count',
+    ),
+    pytest.param('evidence.complete', _setting('evidence', 'complete', to=False), id='complete'),
+]
+
+
+class TestAMalformedSnapshotIsRefused:
+    @pytest.fixture(scope='class')
+    def taken(self, tmp_path_factory: pytest.TempPathFactory) -> dict[str, Any]:
+        tmp_path = tmp_path_factory.mktemp('malformed')
+        path = tmp_path / 'out' / 'snapshot.json'
+        assert _run(_repo(tmp_path, _SUMMARY_FILES), path) == 0
+        return _load(path)
+
+    def _compared(
+        self, tmp_path: Path, current: dict[str, Any], previous: dict[str, Any]
+    ) -> tuple[int, Path]:
+        given, valid = tmp_path / 'given.json', tmp_path / 'valid.json'
+        given.write_text(json.dumps(current), encoding='utf-8')
+        valid.write_text(json.dumps(previous), encoding='utf-8')
+        return snapshot.main(['--current', str(given), '--diff', str(valid)]), given
+
+    def test_the_unedited_snapshot_is_accepted(
+        self, taken: dict[str, Any], tmp_path: Path
+    ) -> None:
+        assert self._compared(tmp_path, taken, taken)[0] == 0
+
+    def _refusal(
+        self,
+        taken: dict[str, Any],
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        edit: _Edit,
+    ) -> tuple[Path, str]:
+        edited = copy.deepcopy(taken)
+        edit(edited)
+        code, given = self._compared(tmp_path, edited, taken)
+        assert code == 2
+        return given, capsys.readouterr().err
+
+    @pytest.mark.parametrize(('where', 'edit'), _MISSHAPEN)
+    def test_a_field_of_the_wrong_shape_is_named(
+        self,
+        taken: dict[str, Any],
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        where: str,
+        edit: _Edit,
+    ) -> None:
+        given, err = self._refusal(taken, tmp_path, capsys, edit)
+        assert str(given) in err
+        assert f'{where} is ' in err
+
+    @pytest.mark.parametrize(('where', 'edit'), _DISAGREEING)
+    def test_evidence_that_disagrees_with_the_records_is_named(
+        self,
+        taken: dict[str, Any],
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        where: str,
+        edit: _Edit,
+    ) -> None:
+        given, err = self._refusal(taken, tmp_path, capsys, edit)
+        assert str(given) in err
+        assert where in err
 
 
 def test_two_src_files_importing_as_one_module_name_are_refused(

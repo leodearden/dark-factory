@@ -22,7 +22,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import source_measures
 
@@ -41,29 +41,6 @@ _DEFAULT_ROOT = Path(__file__).resolve().parents[1]
 
 _SRC = str(source_measures.FileKind.SRC)
 _TESTS = str(source_measures.FileKind.TESTS)
-
-_TOP_LEVEL_KEYS = (
-    'schema_version', 'instrument', 'run_id', 'as_of_sha', 'since',
-    'evidence', 'cost', 'params', 'files', 'functions', 'import_graph',
-)
-_EVIDENCE_KEYS = ('members', 'domain_files', 'measured_files', 'unreadable', 'complete')
-_COMMON_FIELDS = frozenset({
-    'member', 'kind', 'blob', 'lines', 'prose_lines', 'prose_ratio',
-    'cognitive_total', 'cognitive_max', 'cognitive_max_function', 'functions',
-})
-_KIND_FIELDS: Mapping[str, frozenset[str]] = {
-    _SRC: frozenset({
-        'module', 'package_init', 'function_local_imports', 'reexport_names',
-        'reach_back_imports', 'fan_out', 'fan_in_src', 'fan_in_tests',
-    }),
-    _TESTS: frozenset({'private_patch_targets', 'private_reads'}),
-}
-_INTEGER_FIELDS = frozenset({
-    'lines', 'prose_lines', 'cognitive_total', 'cognitive_max', 'functions',
-    'function_local_imports', 'reach_back_imports', 'fan_out', 'fan_in_src', 'fan_in_tests',
-    'private_reads',
-})
-_IMPORT_GRAPH_KEYS = ('edges', 'reach_back', 'deferred', 'cycles')
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +514,225 @@ def take_snapshot(root: Path, *, run_id: str, since: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# The snapshot file's shape: one declaration, checked by validate_snapshot.
+
+
+def _described(value: object) -> str:
+    """*value* as a refusal names it; a container by its kind, so the message stays one line."""
+    if isinstance(value, list):
+        return 'a JSON array'
+    if isinstance(value, dict):
+        return 'a JSON object'
+    return json.dumps(value, default=repr)
+
+
+def _invalid(origin: str, where: str, found: str, expected: str) -> source_measures.MetricsError:
+    return source_measures.MetricsError(
+        f'{origin}: {where} is {found}; schema {SCHEMA_VERSION} expects {expected}'
+    )
+
+
+def _json_object(value: object, where: str, origin: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise _invalid(origin, where, _described(value), 'a JSON object')
+    return value
+
+
+class _Shape(Protocol):
+    def check(self, value: object, where: str, origin: str) -> None:
+        """Raise MetricsError naming *where* at the first part of *value* not of this shape."""
+        ...
+
+
+@dataclasses.dataclass(frozen=True)
+class _Leaf:
+    accepts: Callable[[object], bool]
+    expected: str
+
+    def check(self, value: object, where: str, origin: str) -> None:
+        if not self.accepts(value):
+            raise _invalid(origin, where, _described(value), self.expected)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ListOf:
+    item: _Shape
+
+    def check(self, value: object, where: str, origin: str) -> None:
+        if not isinstance(value, list):
+            raise _invalid(origin, where, _described(value), 'a JSON array')
+        for index, item in enumerate(value):
+            self.item.check(item, f'{where}[{index}]', origin)
+
+
+@dataclasses.dataclass(frozen=True)
+class _MapOf:
+    """A JSON object with any keys, every value of one shape."""
+
+    value: _Shape
+
+    def check(self, value: object, where: str, origin: str) -> None:
+        for key, item in _json_object(value, where, origin).items():
+            self.value.check(item, f'{where}[{key!r}]', origin)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Object:
+    """A JSON object with exactly these fields, checked in this order; *ordered* pins the key order too.
+
+    ``where`` is empty for the top level, whose fields are named bare.
+    """
+
+    fields: Mapping[str, _Shape]
+    ordered: bool = False
+
+    def check(self, value: object, where: str, origin: str) -> None:
+        named = where or 'the top level'
+        found = _json_object(value, named, origin)
+        for key, shape in self.fields.items():
+            if key in found:
+                shape.check(found[key], f'{where}.{key}' if where else key, origin)
+        keys = list(found) if self.ordered else sorted(found)
+        expected = list(self.fields) if self.ordered else sorted(self.fields)
+        if keys != expected:
+            noun = 'key order' if self.ordered else 'keys'
+            raise _invalid(origin, f'{named} {noun}', json.dumps(keys), json.dumps(expected))
+
+
+@dataclasses.dataclass(frozen=True)
+class _ByKind:
+    """A JSON object whose ``kind`` adds that kind's own fields to the common ones."""
+
+    common: Mapping[str, _Shape]
+    kinds: Mapping[str, Mapping[str, _Shape]]
+
+    def check(self, value: object, where: str, origin: str) -> None:
+        kind = _json_object(value, where, origin).get('kind')
+        if not isinstance(kind, str) or kind not in self.kinds:
+            raise _invalid(
+                origin, f'{where}.kind', _described(kind), f'one of {json.dumps(sorted(self.kinds))}'
+            )
+        _Object({**self.common, **self.kinds[kind]}).check(value, where, origin)
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+def _is_edge(value: object) -> bool:
+    return isinstance(value, list) and len(value) == 2 and all(isinstance(end, str) for end in value)
+
+
+_INTEGER = _Leaf(_is_int, 'an integer')
+_NUMBER = _Leaf(_is_number, 'a number')
+_STRING = _Leaf(lambda value: isinstance(value, str), 'a string')
+_BOOLEAN = _Leaf(lambda value: isinstance(value, bool), 'a boolean')
+_STRINGS = _ListOf(_STRING)
+
+_RECORD = _ByKind(
+    common={
+        'member': _STRING,
+        'kind': _STRING,
+        'blob': _STRING,
+        'lines': _INTEGER,
+        'prose_lines': _INTEGER,
+        'prose_ratio': _Leaf(lambda value: value is None or _is_number(value), 'a number or null'),
+        'cognitive_total': _INTEGER,
+        'cognitive_max': _INTEGER,
+        'cognitive_max_function': _Leaf(
+            lambda value: value is None or isinstance(value, str), 'a string or null'
+        ),
+        'functions': _INTEGER,
+    },
+    kinds={
+        _SRC: {
+            'module': _STRING,
+            'package_init': _BOOLEAN,
+            'function_local_imports': _INTEGER,
+            'reexport_names': _STRINGS,
+            'reach_back_imports': _INTEGER,
+            'fan_out': _INTEGER,
+            'fan_in_src': _INTEGER,
+            'fan_in_tests': _INTEGER,
+        },
+        _TESTS: {'private_patch_targets': _STRINGS, 'private_reads': _INTEGER},
+    },
+)
+
+_IMPORT_GRAPH = _Object({
+    'edges': _ListOf(_Leaf(_is_edge, 'a [from, to] pair of module names')),
+    'reach_back': _ListOf(_Object({'from': _STRING, 'to': _STRING, 'names': _STRINGS, 'line': _INTEGER})),
+    'deferred': _ListOf(_Object({'from': _STRING, 'line': _INTEGER, 'imports': _STRINGS})),
+    'cycles': _ListOf(_STRINGS),
+})
+_IMPORT_GRAPH_KEYS = tuple(_IMPORT_GRAPH.fields)
+
+#: Schema 1 (plans/quality-metrics-snapshot-prd.md §Contract): every field the file holds.
+_SNAPSHOT = _Object(
+    {
+        'schema_version': _Leaf(lambda value: _is_int(value) and value == SCHEMA_VERSION, str(SCHEMA_VERSION)),
+        'instrument': _Leaf(lambda value: value == INSTRUMENT, json.dumps(INSTRUMENT)),
+        'run_id': _STRING,
+        'as_of_sha': _STRING,
+        'since': _STRING,
+        'evidence': _Object(
+            {
+                'members': _ListOf(_Object({'name': _STRING, 'pseudo': _BOOLEAN, 'domain_files': _INTEGER})),
+                'domain_files': _INTEGER,
+                'measured_files': _INTEGER,
+                'unreadable': _STRINGS,
+                'complete': _BOOLEAN,
+            },
+            ordered=True,
+        ),
+        'cost': _Object({'wall_clock_s': _NUMBER}),
+        'params': _Object({
+            'complexipy_version': _STRING,
+            'h14_soft_ceiling_lines': _INTEGER,
+            'h14_alarm_lines': _INTEGER,
+        }),
+        'files': _MapOf(_RECORD),
+        'functions': _MapOf(_INTEGER),
+        'import_graph': _IMPORT_GRAPH,
+    },
+    ordered=True,
+)
+
+
+def _require_evidence_agrees(snapshot: Mapping[str, Any], origin: str) -> None:
+    """The evidence block describes the records the snapshot holds."""
+    evidence, files = snapshot['evidence'], snapshot['files']
+    members = [member['name'] for member in evidence['members']]
+    for path, record in files.items():
+        if record['member'] not in members:
+            raise _invalid(
+                origin,
+                f'files[{path!r}].member',
+                json.dumps(record['member']),
+                f'one of evidence.members, {json.dumps(sorted(members))}',
+            )
+    domain, measured, unreadable = (
+        evidence['domain_files'], evidence['measured_files'], evidence['unreadable']
+    )
+    agreements = (
+        ('evidence.domain_files', domain, "the members' domain_files summed",
+         sum(member['domain_files'] for member in evidence['members'])),
+        ('evidence.measured_files', measured, 'the number of file records', len(files)),
+        ('the number of evidence.unreadable paths', len(unreadable),
+         'evidence.domain_files less evidence.measured_files', domain - measured),
+        ('evidence.complete', evidence['complete'], 'whether evidence.unreadable is empty',
+         not unreadable),
+    )
+    for where, found, meaning, expected in agreements:
+        if found != expected:
+            raise _invalid(origin, where, json.dumps(found), f'{meaning}, {json.dumps(expected)}')
+
+
+# ---------------------------------------------------------------------------
 # The snapshot file: rendering, loading, and the one shape check.
 
 
@@ -593,58 +789,12 @@ def load_snapshot(path: Path) -> dict[str, Any]:
     return validate_snapshot(parsed, origin=str(path))
 
 
-def _invalid(origin: str, where: str, found: object, expected: object) -> source_measures.MetricsError:
-    return source_measures.MetricsError(
-        f'{origin}: {where} is {found!r}; schema {SCHEMA_VERSION} expects {expected}'
-    )
-
-
-def _object_at(snapshot: Mapping[str, Any], key: str, origin: str) -> dict[str, Any]:
-    value = snapshot[key]
-    if not isinstance(value, dict):
-        raise _invalid(origin, key, type(value).__name__, 'a JSON object')
-    return value
-
-
-def _is_int(value: object) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _validate_record(path: str, record: object, origin: str) -> None:
-    where = f'files[{path!r}]'
-    if not isinstance(record, dict):
-        raise _invalid(origin, where, type(record).__name__, 'a JSON object')
-    kind = record.get('kind')
-    if not isinstance(kind, str) or kind not in _KIND_FIELDS:
-        raise _invalid(origin, f'{where}.kind', kind, sorted(_KIND_FIELDS))
-    expected = _COMMON_FIELDS | _KIND_FIELDS[kind]
-    if set(record) != expected:
-        raise _invalid(origin, f'{where} keys', sorted(record), sorted(expected))
-    for field in sorted(_INTEGER_FIELDS & expected):
-        if not _is_int(record[field]):
-            raise _invalid(origin, f'{where}.{field}', record[field], 'an integer')
-
-
 def validate_snapshot(snapshot: object, *, origin: str) -> dict[str, Any]:
-    """*snapshot*, once it is shown to have the schema-1 shape; else MetricsError naming *origin*."""
-    if not isinstance(snapshot, dict):
-        raise _invalid(origin, 'the top level', type(snapshot).__name__, 'a JSON object')
-    if snapshot.get('instrument') != INSTRUMENT:
-        raise _invalid(origin, 'instrument', snapshot.get('instrument'), repr(INSTRUMENT))
-    version = snapshot.get('schema_version')
-    if not _is_int(version) or version != SCHEMA_VERSION:
-        raise _invalid(origin, 'schema_version', version, SCHEMA_VERSION)
-    if tuple(snapshot) != _TOP_LEVEL_KEYS:
-        raise _invalid(origin, 'the top-level key order', list(snapshot), list(_TOP_LEVEL_KEYS))
-    evidence = _object_at(snapshot, 'evidence', origin)
-    if tuple(evidence) != _EVIDENCE_KEYS:
-        raise _invalid(origin, 'evidence keys', list(evidence), list(_EVIDENCE_KEYS))
-    for path, record in _object_at(snapshot, 'files', origin).items():
-        _validate_record(path, record, origin)
-    graph = _object_at(snapshot, 'import_graph', origin)
-    if set(graph) != set(_IMPORT_GRAPH_KEYS):
-        raise _invalid(origin, 'import_graph keys', sorted(graph), sorted(_IMPORT_GRAPH_KEYS))
-    return snapshot
+    """*snapshot*, once it has every schema-1 field and its evidence agrees; else MetricsError naming *origin*."""
+    top = _json_object(snapshot, 'the top level', origin)
+    _SNAPSHOT.check(top, '', origin)
+    _require_evidence_agrees(top, origin)
+    return top
 
 
 # ---------------------------------------------------------------------------
