@@ -1051,6 +1051,7 @@
     "orchestrator/tests/test_merge_gates_plan_files_rename.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_guard_pipeline.py": {"patch_targets": ["_check_plan_targets_in_tree"], "private_reads": 2},
     "orchestrator/tests/test_merge_item_union.py": {"patch_targets": [], "private_reads": 7},
+    "orchestrator/tests/test_merge_lane_absorbed_request_ids.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_lane_package.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_lane_restart_drain.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/test_merge_lane_verify_base.py": {"patch_targets": [], "private_reads": 0},
