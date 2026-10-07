@@ -133,6 +133,7 @@ __all__ = [
     'filter_preservation_specimen_flags',
     'flag_asserts_stranded',
     'maybe_escalate_preservation_suppression_storm',
+    'preservation_mem0_filters',
 ]
 
 
@@ -448,6 +449,22 @@ _GRAPHITI_CITATION_SOURCES: tuple[tuple[str, str], ...] = (
 )
 
 
+def preservation_mem0_filters(task_id: str) -> dict[str, Any]:
+    """The Mem0 metadata filter that finds *task_id*'s recorded not-actionable verdicts.
+
+    Qdrant ANDs equality conditions, so the ``actionable: False`` term is what
+    makes a retrieved row a RECORDED not-actionable adjudication rather than
+    any passing mention of the task.
+
+    The one source of this filter: :func:`_corroborate_preservation` queries
+    it, and Stage 1's ``## Preserved-Specimen Corroboration`` directive renders
+    it as the call the agent should run.  A fresh dict on every call.
+
+    Pure, sync, no I/O.
+    """
+    return {'kind': MEM0_KIND_INVESTIGATION_OUTCOME, 'task_id': task_id, 'actionable': False}
+
+
 def _mem0_row_text(row: dict[str, Any]) -> str:
     """The human-readable prose of one ``get_memories_by_metadata`` row.
 
@@ -617,9 +634,7 @@ async def _corroborate_preservation(
     Two channels, OR'd, cheapest-first.
 
     1. **Mem0** — a deterministic ``get_memories_by_metadata`` scroll filtered on
-       ``{kind, task_id, actionable: False}``.  Qdrant ANDs equality conditions,
-       so the ``actionable: False`` term is what makes a retrieved row a RECORDED
-       not-actionable adjudication rather than any passing mention of the task.
+       :func:`preservation_mem0_filters`.
     2. **Graphiti** — ``get_entity('Task <id>')``, consulted ONLY when channel 1
        produced no citation.
 
@@ -675,12 +690,7 @@ async def _corroborate_preservation(
 
     try:
         rows = await memory_service.get_memories_by_metadata(
-            project_id=project_id,
-            filters={
-                'kind': MEM0_KIND_INVESTIGATION_OUTCOME,
-                'task_id': task_id,
-                'actionable': False,
-            },
+            project_id=project_id, filters=preservation_mem0_filters(task_id),
         )
     except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
         raise
