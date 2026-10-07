@@ -1626,8 +1626,8 @@ class TestCompositeFlagTaskIds:
 
     ``filter_suppressed._keep`` has precisely this gap — it looks the flag
     task_id up verbatim while only the suppression ROW side is decomposed. This
-    guard must not inherit it. ``_flag_candidate_task_ids`` (task
-    3476) is the existing flag-side splitter and the precedent followed here.
+    guard must not inherit it. ``flag_task_ids.task_id_components`` is the
+    shared flag-side splitter it decomposes through.
     """
 
     @pytest.mark.asyncio

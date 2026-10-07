@@ -48,13 +48,15 @@ VERBATIM while only the suppression ROW side is decomposed (see
 ``_decompose_suppression_task_id``'s docstring, which scopes itself to that
 side), so a suppression row for ``'3105'`` still does not match a finding
 carrying ``'3105,4223'``.  Inheriting that gap would make this guard
-zero-recall on exactly the task it exists to protect.  The flag-side splitter
-followed here is ``_flag_candidate_task_ids`` (task 3476).
+zero-recall on exactly the task it exists to protect.  This guard and
+``flag_dedup._flag_candidate_task_ids`` both decompose a flag's own task_id
+through the one shared splitter, ``flag_task_ids.task_id_components``.
 
 LEAF CONTRACT.  This module imports only from
 ``standing_decision_constants`` (for the one genuinely shared fact, the
-``investigation_outcome`` mem0 kind) and ``services.memory_service`` (for the
-canonical raw-payload content extractor).  It reaches nothing in ``stages/``,
+``investigation_outcome`` mem0 kind), ``flag_task_ids`` (the shared flag
+task-id splitter) and ``services.memory_service`` (for the canonical
+raw-payload content extractor).  It reaches nothing in ``stages/``,
 ``middleware/`` or ``prompts/``; the consolidator calls in.  It performs
 detection only — it drops flags, never writes tasks or memories.
 
@@ -79,6 +81,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from fused_memory.reconciliation.flag_task_ids import task_id_components
 from fused_memory.reconciliation.standing_decision_constants import (
     MEM0_KIND_INVESTIGATION_OUTCOME,
 )
@@ -367,49 +370,20 @@ def _is_usable_task_id(component: str) -> bool:
 
 
 def _flag_task_ids(flag: dict[str, Any]) -> tuple[str, ...]:
-    """Every task id *flag* names, in order, deduped; ``()`` when none is usable.
+    """The usable component ids of *flag*'s OWN task_id, in order, deduped; ``()`` when none.
 
-    Stage 1 routinely emits COMPOSITE task_ids — a substantial minority of live
-    ``stage1_flag_marker`` ledger rows are comma-joined, and task 3105 has been
-    flagged as ``'3105,5080'`` and ``'3105,4223'`` among others — so a verbatim
-    lookup would find nothing for exactly the task this guard exists to protect.
-    Components are stripped, so an LLM-authored ``'3105, 4223'`` resolves too,
-    and a separator-only value (``','``) yields no candidates rather than a junk
-    id.
+    Decomposed by
+    :func:`~fused_memory.reconciliation.flag_task_ids.task_id_components` and
+    screened per component by :func:`_is_usable_task_id`.  Why decomposition is
+    required at all is the module docstring's COMPOSITE TASK IDS paragraph.
 
-    This follows :func:`~fused_memory.reconciliation.flag_dedup._flag_candidate_task_ids`
-    (task 3476), the existing FLAG-side splitter — deliberately not
-    ``_decompose_suppression_task_id``, whose docstring scopes it to the
-    suppression ROW side only.
-
-    Accepts the two value shapes ``items_flagged`` actually carries: a ``str``
-    (split on ``','``) and an ``int`` straight off a task dict.  Everything else
-    — ``None``, a list, a nested dict, a ``bool`` — is NOT a task id and yields
-    ``()``, so a malformed value can never be stringified into a backend query.
-
-    Every component is screened by :func:`_is_usable_task_id`, the SAME rule for
-    both shapes.  An earlier spelling rejected a non-positive ``int`` while
-    accepting the string ``'-5'`` — an invariant enforced on one input shape and
-    not the other, which leaves the next reader unable to tell which rule is the
-    real one.
+    The top-level ``task_id`` only, deliberately: ``cited_tasks`` is not read,
+    because a stranded flag for one task that merely CITES a specimen must not
+    be suppressed on the specimen's evidence.
 
     Pure, sync, no I/O.
     """
-    task_id = flag.get('task_id')
-    if isinstance(task_id, bool):
-        return ()
-    if isinstance(task_id, int):
-        task_id = str(task_id)
-    if not isinstance(task_id, str):
-        return ()
-    seen: set[str] = set()
-    components: list[str] = []
-    for part in task_id.split(','):
-        component = part.strip()
-        if _is_usable_task_id(component) and component not in seen:
-            seen.add(component)
-            components.append(component)
-    return tuple(components)
+    return tuple(c for c in task_id_components(flag.get('task_id')) if _is_usable_task_id(c))
 
 
 
