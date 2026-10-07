@@ -133,35 +133,44 @@ VERDICTS = [
 ]
 
 
+Answers = list[tuple[str, str, str | None]]
+
+#: Misses the w2 contradiction, misfiles w3, contests the agreeing w4: 2 errors, 1 misfile.
+MISSES: Answers = [
+    ('w1', 'restated', 't1'), ('w2', 'amended', 't2'),
+    ('w3', 'amended', 't3'), ('w4', 'contested', 't4'),
+]
+#: Contests w2 rightly but still misfiles w3 and contests w4: 1 error, 1 misfile.
+PARTLY: Answers = [
+    ('w1', 'restated', 't1'), ('w2', 'contested', 't2'),
+    ('w3', 'amended', 't3'), ('w4', 'contested', 't4'),
+]
+#: Every write right: 0 errors, 0 misfiles.
+RIGHT: Answers = [
+    ('w1', 'restated', 't1'), ('w2', 'contested', 't2'),
+    ('w3', 'restated', 't3b'), ('w4', 'amended', 't4'),
+]
+SOL_CALL = {'model': 'gpt-6.1-sol', 'seconds': 4.0, 'prompt': 2000, 'completion': 200}
+
+
+def _arm_rows(arm: str, answers: Answers, **call: Any) -> list[dict[str, Any]]:
+    """*arm*'s judge-band rows for writes w1..w4; w1, w2 share parent p1 and w3, w4 share p2."""
+    return [
+        _row(arm, write, outcome, judged, winner='p1' if write in ('w1', 'w2') else 'p2', **call)
+        for write, outcome, judged in answers
+    ]
+
+
 def _three_arm_cases() -> dict[str, list[dict[str, Any]]]:
-    """Four writes under three arms that differ in misfiles and contested-decision errors.
+    """Three arms that differ in misfiles and contested-decision errors.
 
-    The reference misses the w2 contradiction, misfiles w3 and contests the
-    agreeing w4 (2 contested-decision errors, 1 misfile). pre-ψ contests w2
-    rightly but still misfiles w3 and contests w4 (1 error, 1 misfile). sol
-    gets every write right (0 errors, 0 misfiles) at a higher price and
-    latency.
+    The reference MISSES, pre-ψ is PARTLY right, and sol is RIGHT at a higher
+    price and latency.
     """
-    def parent(memory_id: str) -> str:
-        return 'p1' if memory_id in ('w1', 'w2') else 'p2'
-
-    def arm_rows(arm: str, answers: list[tuple[str, str, str | None]], **extra: Any):
-        return [_row(arm, w, outcome, judged, winner=parent(w), **extra)
-                for w, outcome, judged in answers]
-
     return {
-        REFERENCE: arm_rows(REFERENCE, [
-            ('w1', 'restated', 't1'), ('w2', 'amended', 't2'),
-            ('w3', 'amended', 't3'), ('w4', 'contested', 't4'),
-        ]),
-        PRE_PSI: arm_rows(PRE_PSI, [
-            ('w1', 'restated', 't1'), ('w2', 'contested', 't2'),
-            ('w3', 'amended', 't3'), ('w4', 'contested', 't4'),
-        ]),
-        SOL: arm_rows(SOL, [
-            ('w1', 'restated', 't1'), ('w2', 'contested', 't2'),
-            ('w3', 'restated', 't3b'), ('w4', 'amended', 't4'),
-        ], model='gpt-6.1-sol', seconds=4.0, prompt=2000, completion=200),
+        REFERENCE: _arm_rows(REFERENCE, MISSES),
+        PRE_PSI: _arm_rows(PRE_PSI, PARTLY),
+        SOL: _arm_rows(SOL, RIGHT, **SOL_CALL),
     }
 
 
@@ -519,3 +528,39 @@ def test_build_matrix_propagates_iota_refusal() -> None:
 
     with pytest.raises(_mod_iota().IncompleteCorpusError, match='w3 t3'):
         _build(verdicts=verdicts)
+
+
+# --- step 9: wording attribution at matched width ------------------------------------
+
+AT20 = 'gpt-4o-mini@20'
+AT20_PRE_PSI = 'gpt-4o-mini@20+pre-psi'
+LUNA_PRE_PSI = 'gpt-6-luna:low@5+pre-psi'
+
+
+def test_wording_attribution_pairs_each_non_shipped_wording_arm_with_its_shipped_twin() -> None:
+    arms = [
+        *THREE_ARMS[:2],
+        _provenance(AT20, 'gpt-4o-mini', None, 20, 'shipped'),
+        _provenance(AT20_PRE_PSI, 'gpt-4o-mini', None, 20, 'pre-psi'),
+        THREE_ARMS[2],
+        _provenance(LUNA_PRE_PSI, 'gpt-6-luna', 'low', 5, 'pre-psi'),
+    ]
+    cases = _three_arm_cases() | {
+        AT20: _arm_rows(AT20, RIGHT),
+        AT20_PRE_PSI: _arm_rows(AT20_PRE_PSI, MISSES),
+        LUNA_PRE_PSI: _arm_rows(LUNA_PRE_PSI, PARTLY, model='gpt-6-luna'),
+    }
+    matrix = _build(arms=arms, cases_by_arm=cases)
+    attribution = matrix['wording_attribution']
+
+    assert set(attribution) == {PRE_PSI, AT20_PRE_PSI, LUNA_PRE_PSI}
+    for arm, twin in ((PRE_PSI, REFERENCE), (AT20_PRE_PSI, AT20)):
+        oracle = _mod_iota().score_pairs(
+            chain(cases[arm], cases[twin]), VERDICTS, reference_arm=twin,
+        )
+        assert attribution[arm] == {
+            'shipped_twin': twin, 'paired': oracle['arms'][arm]['paired_vs_reference'],
+        }
+    [at20_pre_psi] = [row for row in _scored_rows(matrix) if row['arm'] == AT20_PRE_PSI]
+    assert attribution[AT20_PRE_PSI]['paired'] != at20_pre_psi['paired_vs_reference']
+    assert attribution[LUNA_PRE_PSI] == {'shipped_twin': None, 'paired': None}
