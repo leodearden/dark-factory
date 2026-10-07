@@ -1643,14 +1643,17 @@ def test_performance_returns_performance(client):
     body = resp.json()
     assert 'PERFORMANCE' in body
     assert isinstance(body['PERFORMANCE'], dict)
+    assert 'PERFORMANCE_LISTING' in body
 
 
 def test_performance_route_threads_one_now_and_the_window_to_both_aggregates(client):
     """api_performance must hand the cards and the sparkline history the SAME
     `now` and the chip's `days`, so both count one window; and it serves that
     instant as served_at (mirrors test_costs_route_threads_shared_now_to_all_aggregates)."""
+    from dashboard.data.performance import unread_listing
+
     mocks = {
-        'aggregate_performance_cards': AsyncMock(return_value={}),
+        'aggregate_performance_cards': AsyncMock(return_value=unread_listing('fixture', days=30)),
         'aggregate_performance_history': AsyncMock(return_value={}),
     }
     with (
@@ -1672,6 +1675,22 @@ def test_performance_route_threads_one_now_and_the_window_to_both_aggregates(cli
         nows.append(now)
     assert nows[0] == nows[1]
     assert resp.json()['served_at'] == nows[0].isoformat()
+
+
+def test_performance_route_serves_an_unknown_listing_when_cards_raise(client):
+    """A cards read that raises is an unread listing naming the failure, never a silently empty one."""
+    with (
+        patch('dashboard.app.aggregate_performance_cards',
+              new=AsyncMock(side_effect=RuntimeError('boom'))),
+        patch('dashboard.app.aggregate_performance_history', new=AsyncMock(return_value={})),
+    ):
+        resp = client.get('/api/v2/dashboard/performance')
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body['PERFORMANCE'] == {}
+    assert body['PERFORMANCE_LISTING']['state'] == 'unknown'
+    assert 'boom' in body['PERFORMANCE_LISTING']['reason']
 
 
 def test_burndown_returns_aggregate_and_per_project(client):

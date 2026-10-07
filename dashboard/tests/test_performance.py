@@ -32,6 +32,7 @@ from dashboard.data.performance import (
     get_escalation_rates,
     get_loop_histograms,
     get_time_centiles,
+    unread_listing,
 )
 
 # ---------------------------------------------------------------------------
@@ -2435,16 +2436,19 @@ class TestPerformanceCardsDatum:
         self, active_idle_conn, empty_escalations_dir,
     ):
         conns = [active_idle_conn]
+        listing = await aggregate_performance_cards(
+            conns, [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+        )
         shaped = redux_api.shape_performance(
-            cards=(await aggregate_performance_cards(
-                conns, [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
-            )).cards,
+            listing=listing,
             history=await aggregate_performance_history(conns, days=CARDS_DAYS, now=CARDS_NOW),
             served_at=CARDS_NOW,
         )
         performance_by_label = shaped['PERFORMANCE']
 
         assert shaped['served_at'] == CARDS_NOW.isoformat()
+        assert shaped['PERFORMANCE_LISTING'] == listing.listed.to_wire()
+        validate_datum(listing.listed, CARDS_NOW)
 
         active = performance_by_label['active']
         assert active['cards']['state'] == 'fresh'
@@ -2457,6 +2461,15 @@ class TestPerformanceCardsDatum:
         assert idle['time_centiles_history'] == {'labels': [], 'p50': [], 'p95': []}
         assert idle['one_pass_history'] == {'labels': [], 'values': []}
         assert idle['escalation_history'] == {'labels': [], 'values': []}
+
+    def test_an_unknown_listing_is_served_as_the_unknown_wire_datum(self):
+        listing = unread_listing('no runs.db could be read (1 of 1)', days=CARDS_DAYS)
+
+        shaped = redux_api.shape_performance(listing=listing, served_at=CARDS_NOW)
+
+        assert shaped['PERFORMANCE'] == {}
+        assert shaped['PERFORMANCE_LISTING'] == listing.listed.to_wire()
+        assert shaped['PERFORMANCE_LISTING']['state'] == 'unknown'
 
 
 # ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@ from dashboard.data.datum import (
 )
 from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.memory import WRITE_QUEUE_FRESHNESS_BOUND_SECONDS, write_queue_datum
-from dashboard.data.performance import PerformanceCards
+from dashboard.data.performance import PerformanceCards, PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
 from dashboard.data.write_journal import MemoryOps
 
@@ -1020,6 +1020,12 @@ def _perf_cards(
     )
 
 
+def _perf_listing(cards: dict[str, Datum[PerformanceCards]]) -> PerformanceListing:
+    """*cards* as a listing every runs.db was read for."""
+    listed = Datum(len(cards), _PERF_SERVED_AT, DatumState.FRESH, None, _PERF_WINDOW_SECONDS)
+    return PerformanceListing(cards=cards, listed=listed)
+
+
 _PERF_HISTORY = {
     'time_centiles_history': {'labels': ['2026-09-30T11:00'], 'p50': [60_000], 'p95': [90_000]},
     'one_pass_history': {'labels': ['2026-09-30T11:00'], 'values': [100.0]},
@@ -1031,7 +1037,7 @@ def test_shape_performance_entry_is_the_cards_datum_beside_its_histories():
     plus_two = timezone(timedelta(hours=2))
     cards = _perf_cards((_PERF_SERVED_AT - timedelta(hours=1)).astimezone(plus_two))
     body = redux_api.shape_performance(
-        cards={'/home/leo/src/p1': cards},
+        listing=_perf_listing({'/home/leo/src/p1': cards}),
         history={'/home/leo/src/p1': _PERF_HISTORY},
         served_at=_PERF_SERVED_AT,
     )
@@ -1044,7 +1050,7 @@ def test_shape_performance_entry_is_the_cards_datum_beside_its_histories():
 
 def test_shape_performance_project_without_history_gets_empty_blocks():
     body = redux_api.shape_performance(
-        cards={'p1': _perf_cards(_PERF_SERVED_AT - timedelta(hours=1))},
+        listing=_perf_listing({'p1': _perf_cards(_PERF_SERVED_AT - timedelta(hours=1))}),
         served_at=_PERF_SERVED_AT,
     )
     entry = body['PERFORMANCE']['p1']
@@ -1055,13 +1061,13 @@ def test_shape_performance_project_without_history_gets_empty_blocks():
 
 def test_shape_performance_lists_exactly_the_projects_with_cards():
     body = redux_api.shape_performance(
-        cards={
+        listing=_perf_listing({
             'active': _perf_cards(_PERF_SERVED_AT - timedelta(hours=1)),
             'idle': _perf_cards(
                 _PERF_SERVED_AT - timedelta(days=20), DatumState.STALE,
                 'no completions in the 7d window; last completion 2026-09-10T12:00:00+00:00',
             ),
-        },
+        }),
         history={'active': _PERF_HISTORY, 'history-only': _PERF_HISTORY},
         served_at=_PERF_SERVED_AT,
     )
@@ -1074,7 +1080,7 @@ def test_shape_performance_lists_exactly_the_projects_with_cards():
 
 def test_shape_performance_serves_the_instant_it_validated_against():
     body = redux_api.shape_performance(
-        cards={'p1': _perf_cards(_PERF_SERVED_AT - timedelta(hours=1))},
+        listing=_perf_listing({'p1': _perf_cards(_PERF_SERVED_AT - timedelta(hours=1))}),
         served_at=_PERF_SERVED_AT,
     )
     assert body['served_at'] == '2026-09-30T12:00:00+00:00'
@@ -1086,7 +1092,7 @@ def test_shape_performance_serves_an_unread_project_as_an_unknown_cards_datum():
         value=None, as_of=None, state=DatumState.UNKNOWN, reason=reason,
         freshness_bound_seconds=_PERF_WINDOW_SECONDS,
     )
-    body = redux_api.shape_performance(cards={'p1': unread}, served_at=_PERF_SERVED_AT)
+    body = redux_api.shape_performance(listing=_perf_listing({'p1': unread}), served_at=_PERF_SERVED_AT)
     assert body['PERFORMANCE']['p1']['cards'] == {
         'value': None, 'as_of': None, 'state': 'unknown', 'reason': reason,
         'freshness_bound_seconds': _PERF_WINDOW_SECONDS,
@@ -1097,7 +1103,16 @@ def test_shape_performance_propagates_a_broken_cards_datum():
     """A FRESH Datum older than its own bound is a shaper bug, not a state."""
     overdue = _perf_cards(_PERF_SERVED_AT - timedelta(days=8))
     with pytest.raises(DatumContractError):
-        redux_api.shape_performance(cards={'p1': overdue}, served_at=_PERF_SERVED_AT)
+        redux_api.shape_performance(listing=_perf_listing({'p1': overdue}), served_at=_PERF_SERVED_AT)
+
+
+def test_a_bare_listing_count_is_a_wiring_bug():
+    listing = PerformanceListing(cards={}, listed=0)  # type: ignore[arg-type]
+    with pytest.raises(DatumContractError) as excinfo:
+        redux_api.shape_performance(listing=listing, served_at=_PERF_SERVED_AT)
+
+    assert excinfo.value.invariant is DatumInvariant.DATUM_REQUIRED
+    assert 'PERFORMANCE_LISTING' in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
