@@ -24,7 +24,9 @@ from typing import Any
 import pytest
 from _fm_helpers import load_script_module
 
-SCRIPTS = Path(__file__).parent.parent / 'scripts'
+PACKAGE = Path(__file__).resolve().parent.parent
+SCRIPTS = PACKAGE / 'scripts'
+CALIBRATION = PACKAGE / 'calibration'
 SCRIPT_PATH = SCRIPTS / 'run_write_triage_config_matrix.py'
 IOTA_PATH = SCRIPTS / 'score_write_triage_pairs.py'
 GATE_PATH = Path(__file__).resolve().parents[2] / 'scripts' / 'check_write_triage_readiness_gate.py'
@@ -673,3 +675,57 @@ def test_main_refuses_a_drifted_arm_file_and_writes_nothing(
 def test_main_requires_at_least_one_bound(cli: types.SimpleNamespace) -> None:
     assert _main(cli, bounds=[]) not in (0, None)
     assert _written(cli) == []
+
+
+# --- step 13: the committed artifacts ---------------------------------------------------
+
+def _committed(name: str) -> Any:
+    return json.loads((CALIBRATION / name).read_text(encoding='utf-8'))
+
+
+def test_committed_best_config_is_the_committed_matrix_winner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fused_memory.config.schema import FusedMemoryConfig
+
+    mod = _mod()
+    matrix = _committed(MATRIX_NAME)
+    best = _committed(BEST_NAME)
+    published = _committed('write_triage_population.json')
+    scored = _scored_rows(matrix)
+
+    assert [row['arm'] for row in scored] == [arm['arm'] for arm in published['arms']]
+    assert matrix['arms'][len(scored):] == [skipped.row() for skipped in mod.SKIPPED_ARMS]
+    assert all(row['reason'].strip() for row in matrix['arms'][len(scored):])
+    for row, provenance in zip(scored, published['arms'], strict=True):
+        settings = mod.ArmSettings.from_provenance(provenance).selection_keys()
+        assert {key: row['selection'][key] for key in settings} == settings
+    assert matrix['population'] == {
+        key: published['population'][key] for key in mod.POPULATION_KEYS
+    }
+    assert matrix['inputs']['population_sha256'] == _sha256(
+        CALIBRATION / 'write_triage_population.json',
+    )
+    assert matrix['inputs']['verdicts_sha256'] == _sha256(
+        CALIBRATION / 'write_triage_pair_verdicts.jsonl',
+    )
+
+    monkeypatch.setenv('CONFIG_PATH', str(PACKAGE / 'config' / 'config.yaml'))
+    shipped = mod.shipped_settings(types.SimpleNamespace(config=FusedMemoryConfig()))
+    [reference] = [
+        arm.name for arm in mod.Population.from_artifact(published).arms if arm.settings == shipped
+    ]
+    assert matrix['reference_arm'] == reference
+
+    rule = matrix['selection_rule']
+    bounds = [_bound(b['path'], b['op'], b['value']) for b in rule['bounds']]
+    for row in scored:
+        checks = _gate_checks(row, matrix, bounds)
+        assert row['bounds'] == {'met': all(c['ok'] for c in checks), 'checks': checks}
+        assert [c['note'] for c in checks] == [None] * len(checks)
+    assert mod.select_winner(matrix['arms']) == (matrix['winner'], rule['fallback_applied'])
+
+    assert best == mod.best_config(matrix)
+    assert best['quality']['unrated_pairs'] == 0
+    assert best['population']['n_judge_band'] >= 300
+    assert 'false_contested_rate' in best['quality']
