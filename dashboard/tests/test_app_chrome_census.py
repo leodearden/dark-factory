@@ -138,3 +138,54 @@ def test_the_topbar_queue_reads_the_write_queue_datum(app_jsx_body: str) -> None
         f'summary.queue is not a <DatumReading> over writeQueue(DD):\n{summary}'
     )
     assert 'queue.counts' not in _app_body(app_jsx_body)
+
+
+_COSTS_ENDPOINT = '/api/v2/dashboard/costs'
+
+
+def _endpoint_named_by(arg: str, code: str) -> str | None:
+    """The endpoint path *arg* names: a string literal, or ``<frozen const>.<key>``."""
+    literal = re.fullmatch(r"'([^']*)'", arg)
+    if literal:
+        return literal.group(1)
+    member = re.fullmatch(r'(\w+)\.(\w+)', arg)
+    if not member:
+        return None
+    frozen = re.search(rf'\bconst\s+{member.group(1)}\s*=\s*Object\.freeze\(\s*\{{', code)
+    if not frozen:
+        return None
+    entry = re.search(rf"\b{member.group(2)}\s*:\s*'([^']*)'", walk_balanced(code, frozen.end() - 1))
+    return entry.group(1) if entry else None
+
+
+def test_the_topbar_spend_reads_the_costs_datum(app_jsx_body: str) -> None:
+    """The topbar spend is a Datum reading, never a seeded $0.00.
+
+    ``DD.COSTS?.summary?.today ?? 0`` rendered a confident $0.00 before /costs
+    had ever delivered (data.js seeds today = 0). Through plainDatum keyed on
+    the /costs receipt, an undelivered spend is an em-dash saying so.
+    """
+    code = _app_code(app_jsx_body)
+    summary = _const_object(_app_body(app_jsx_body), 'summary')
+    spend = re.search(
+        r'\bspend24h\s*:\s*<DatumReading\s+datum=\{\s*plainDatum\(\s*DD\.COSTS\??\.summary\?\.today\s*,\s*([^)]*?)\s*\)',
+        summary,
+    )
+    assert spend, f'summary.spend24h is not a <DatumReading> over plainDatum(DD.COSTS.summary?.today, …):\n{summary}'
+    assert _endpoint_named_by(spend.group(1), code) == _COSTS_ENDPOINT, (
+        f'the spend reading is not keyed on the {_COSTS_ENDPOINT} receipt: {spend.group(1)!r}'
+    )
+    assert '?? 0' not in summary, f'the topbar summary still zero-fills a reading:\n{summary}'
+    assert re.search(r'\bconst\s*\{[^}]*\bplainDatum\b[^}]*\}\s*=\s*window\.DF_DATUM\s*;', code), (
+        'app.jsx does not destructure plainDatum from window.DF_DATUM at module scope.'
+    )
+    assert not re.search(r'window\.DF_DATUM\s*(\|\||&&|\?\?)', code)
+
+
+def test_stat_strip_renders_the_spend_node(shell_jsx_body: str) -> None:
+    """A spend hole reaches the operator as '—', not as a TypeError on ``.toFixed``."""
+    body = extract_function_body(strip_js_comments(shell_jsx_body), 'StatStrip')
+    assert re.search(r'\{\s*summary\.spend24h\s*\}', body), (
+        'StatStrip does not render {summary.spend24h}, the DatumReading node App builds.'
+    )
+    assert 'spend24h.toFixed' not in body, 'StatStrip still formats the spend as a bare number.'
