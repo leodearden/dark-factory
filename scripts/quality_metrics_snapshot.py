@@ -56,11 +56,12 @@ _KIND_FIELDS: Mapping[str, frozenset[str]] = {
         'module', 'package_init', 'function_local_imports', 'reexport_names',
         'reach_back_imports', 'fan_out', 'fan_in_src', 'fan_in_tests',
     }),
-    _TESTS: frozenset(),
+    _TESTS: frozenset({'private_patch_targets', 'private_reads'}),
 }
 _INTEGER_FIELDS = frozenset({
     'lines', 'prose_lines', 'cognitive_total', 'cognitive_max', 'functions',
     'function_local_imports', 'reach_back_imports', 'fan_out', 'fan_in_src', 'fan_in_tests',
+    'private_reads',
 })
 _IMPORT_GRAPH_KEYS = ('edges', 'reach_back', 'deferred', 'cycles')
 
@@ -376,6 +377,27 @@ def _src_fields(domain_file: source_measures.DomainFile, tree: ast.Module) -> di
     }
 
 
+def _below_top_level_is_private(dotted: str) -> bool:
+    """Any segment after the top-level package is single-underscore."""
+    return any(
+        segment.startswith('_') and not segment.startswith('__')
+        for segment in dotted.split('.')[1:]
+    )
+
+
+def _tests_fields(tree: ast.Module, known: frozenset[str]) -> dict[str, Any]:
+    patched = (
+        f'{target.module}.{target.leaf}'
+        for target in source_measures.patch_targets_in_tree(tree, known)
+    )
+    return {
+        'private_patch_targets': sorted(
+            {dotted for dotted in patched if _below_top_level_is_private(dotted)}
+        ),
+        'private_reads': source_measures.private_reads_in_tree(tree),
+    }
+
+
 @dataclasses.dataclass(frozen=True)
 class _FileMeasure:
     """One file's record before the graph fields, its function scores, and its imports."""
@@ -386,9 +408,9 @@ class _FileMeasure:
 
 
 def _measure_file(
-    root: Path, member: str, domain_file: source_measures.DomainFile
+    root: Path, member: str, domain_file: source_measures.DomainFile, known: frozenset[str]
 ) -> _FileMeasure:
-    """One file's measures, from one read and one parse."""
+    """One file's measures, from one read and one parse; *known* is every src module name."""
     path = domain_file.path
     source = source_measures.read_source(root, path)
     tree = source_measures.parse_source(source, path=path)
@@ -410,6 +432,8 @@ def _measure_file(
     }
     if domain_file.kind is source_measures.FileKind.SRC:
         record.update(_src_fields(domain_file, tree))
+    else:
+        record.update(_tests_fields(tree, known))
     imports = _FileImports(
         module=domain_file.import_name,
         is_package=_is_package_init(path),
@@ -477,7 +501,9 @@ def measure_domain(
     for member in domain:
         for domain_file in member.files:
             try:
-                measured[domain_file.path] = _measure_file(root, member.name, domain_file)
+                measured[domain_file.path] = _measure_file(
+                    root, member.name, domain_file, known
+                )
             except source_measures.MetricsError as exc:
                 unreadable.append(domain_file.path)
                 print(f'unreadable: {domain_file.path}: {exc}', file=sys.stderr)
