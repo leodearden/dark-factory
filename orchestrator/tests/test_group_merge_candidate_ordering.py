@@ -91,6 +91,8 @@ from _orch_helpers import assert_isolated_git_repo, git_env_with_ceiling
 
 TASK_ID = 'T'
 
+_PINNED_DATE = '2020-01-01T00:00:00 +0000'
+
 # Deterministic identity + no signing, so subjects and shas are stable and
 # the tests never depend on the developer's git config.
 _GIT_ENV_ARGS = [
@@ -182,8 +184,8 @@ def _new_repo(root: Path) -> None:
     assert_isolated_git_repo(root)
 
 
-def _candidate_documented(root: Path, tid: str) -> str:
-    """The rc=0 arm's candidate query WITHOUT ``--topo-order`` (the defect)."""
+def _candidate_date_ordered(root: Path, tid: str) -> str:
+    """The rc=0 arm's candidate query WITHOUT ``--topo-order``: date-ordered."""
     out = _git(root, 'rev-list', '--ancestry-path', '--merges', f'task/{tid}..main')
     return out.split('\n')[-1] if out else ''
 
@@ -201,7 +203,7 @@ def _contained_before(root: Path, tid: str, rev: str) -> int:
     return _git_rc(root, 'merge-base', '--is-ancestor', f'task/{tid}', rev)
 
 
-def test_date_skew_makes_the_documented_candidate_query_pick_the_wrong_merge(
+def test_clock_skew_makes_the_date_ordered_candidate_query_pick_the_wrong_merge(
     tmp_path: Path,
 ) -> None:
     """Without ``--topo-order``, ``tail -1`` can return a LATER unrelated merge.
@@ -252,21 +254,21 @@ def test_date_skew_makes_the_documented_candidate_query_pick_the_wrong_merge(
 
     assert len({x, mf1, mf2}) == 3, 'fixture must build three distinct merge commits'
 
-    # (1) The currently-documented form returns f1's merge, NOT X.
-    documented = _candidate_documented(root, TASK_ID)
-    assert documented == mf1, (
+    # (1) The date-ordered form returns f1's merge, NOT X.
+    date_ordered = _candidate_date_ordered(root, TASK_ID)
+    assert date_ordered == mf1, (
         'expected the date-ordered walk to put an unrelated LATER merge last; if this '
         'stops holding, git changed its default ordering and '
         'skills/_shared/deriving-landed-sha.md step 4 must be re-litigated'
     )
-    assert documented != x, (
-        'the whole defect is that the documented query does NOT return the merge that '
+    assert date_ordered != x, (
+        'the whole defect is that the date-ordered query does NOT return the merge that '
         'brought the branch in'
     )
 
     # (2) ...so the arm takes the "unrelated later merge, do not stamp" exit,
     #     silently skipping the true group merge.
-    assert _contained_before(root, TASK_ID, f'{documented}^1') == 0, (
+    assert _contained_before(root, TASK_ID, f'{date_ordered}^1') == 0, (
         'the wrong candidate yields contained-before rc=0, which the rc=0 arm reads as '
         '"unrelated later merge, do not stamp" -- the true group merge is skipped and '
         'the procedure degrades to the citation path'
@@ -284,7 +286,59 @@ def test_date_skew_makes_the_documented_candidate_query_pick_the_wrong_merge(
     )
 
 
-_PINNED_DATE = '2020-01-01T00:00:00 +0000'
+def test_same_second_commits_make_the_date_ordered_candidate_query_pick_the_wrong_merge(
+    tmp_path: Path,
+) -> None:
+    """Commits sharing one committer-date second reproduce the defect with NO skew.
+
+    This is the realistic single-machine cause.  The ``a`` and ``b`` commits
+    are load-bearing: with tied dates the walk is first-in-first-out, and X
+    is emitted before MF1 only when MF1 sits farther from the tip than X's
+    path through f2.  Drop them and the default order happens to be right,
+    so the pin would pass vacuously.
+    """
+    root = tmp_path / 'repo'
+    _new_repo(root)
+
+    _commit(root, 'base', 'base.txt', date=_PINNED_DATE)
+    _git(root, 'checkout', '-b', f'task/{TASK_ID}')
+    _commit(root, 'work', 'work.txt', date=_PINNED_DATE)
+
+    _git(root, 'checkout', 'main')
+    _git(
+        root, 'merge', '--no-ff', f'task/{TASK_ID}', '-m', f'Merge task/{TASK_ID} into main',
+        date=_PINNED_DATE,
+    )
+    x = _git(root, 'rev-parse', 'HEAD')
+
+    _git(root, 'checkout', '-b', 'f1', x)
+    _commit(root, 'f1work', 'f1.txt', date=_PINNED_DATE)
+    _git(root, 'checkout', '-b', 'f2', x)
+    _commit(root, 'f2work', 'f2.txt', date=_PINNED_DATE)
+
+    _git(root, 'checkout', 'main')
+    _git(root, 'merge', '--no-ff', 'f1', '-m', 'Merge f1 into main', date=_PINNED_DATE)
+    mf1 = _git(root, 'rev-parse', 'HEAD')
+    _commit(root, 'a', 'a.txt', date=_PINNED_DATE)
+    _commit(root, 'b', 'b.txt', date=_PINNED_DATE)
+    _git(root, 'merge', '--no-ff', 'f2', '-m', 'Merge f2 into main', date=_PINNED_DATE)
+
+    committer_dates = set(_git(root, 'log', '--all', '--format=%ct').split('\n'))
+    assert len(committer_dates) == 1, (
+        'every commit must share one committer-date second: this pin is about ties, not skew'
+    )
+
+    assert _candidate_date_ordered(root, TASK_ID) == mf1, (
+        'with tied dates the date-ordered walk puts an unrelated LATER merge last; if this '
+        'stops holding, git changed its tie-break order'
+    )
+    assert _contained_before(root, TASK_ID, f'{mf1}^1') == 0, (
+        'the wrong candidate takes the "do not stamp" exit, skipping the true group merge'
+    )
+    assert _candidate_topo(root, TASK_ID) == x, (
+        '--topo-order returns the merge that brought the branch in, ties or not'
+    )
+    assert _contained_before(root, TASK_ID, f'{x}^1') == 1
 
 
 def _build_branch_side_landing(root: Path) -> None:
