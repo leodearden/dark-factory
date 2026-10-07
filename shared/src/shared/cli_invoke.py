@@ -277,6 +277,7 @@ PromptBuilder = Callable[[], Awaitable[str | None]]
 
 
 __all__ = [
+    'BUDGET_EXHAUSTED_SUBTYPE',
     'CAP_HIT_RESUME_PROMPT',
     'CRASH_RECOVERY_RESUME_PROMPT',
     'AgentFailureClass',
@@ -561,6 +562,12 @@ class AgentResult:
     distinct from the caller-supplied lineage alias (``opus``/``sonnet``) that
     callers record as ``model`` — that alias names the routing choice, this
     names the version that answered."""
+
+
+# The ``AgentResult.subtype`` the Claude CLI stamps when its own
+# ``--max-budget-usd`` ceiling ends a run (note the ``_usd`` suffix).  It means
+# the API accepted the request and billed real tokens.
+BUDGET_EXHAUSTED_SUBTYPE = 'error_max_budget_usd'
 
 
 def _resolve_transcript_path(config_dir: Path, session_id: str) -> Path | None:
@@ -2040,12 +2047,8 @@ def classify_cap_kill(
     *backend* other than ``'claude'``: the others enforce neither ceiling
     natively (see ``orchestrator/src/orchestrator/agents/invoke.py``), so no
     ceiling can have ended their runs.  Total — never raises.
-
-    The subtype literals match ``shared/src/shared/usage_gate.py`` and
-    :func:`classify_agent_failure`; a third spelling of the budget one lives
-    at ``orchestrator/src/orchestrator/dry_run_unblock.py::_BUDGET_SUBTYPES``.
     """
-    if result.subtype == 'error_max_budget_usd':
+    if result.subtype == BUDGET_EXHAUSTED_SUBTYPE:
         return CapReason.BUDGET
     if result.subtype == 'error_max_turns':
         return CapReason.TURNS
