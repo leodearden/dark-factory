@@ -7501,6 +7501,7 @@ async def run_full_verification(
     *,
     force_rediscover: bool = False,
     role: Literal['merge', 'task', 'background'] = 'task',
+    max_retries: int | None = None,
 ) -> VerifyResult:
     """Run verification for ALL subprojects against the project root.
 
@@ -7520,6 +7521,10 @@ async def run_full_verification(
     Accepted trade-off (operator ruling 2026-08-12, task-2391 suggestion):
     one pool is the admission gate's entire point — a single bound on total
     concurrent pytest — and the inversion is per-leg-bounded and latency-only.
+
+    *max_retries* overrides ``config.verify_timeout_retries`` for every
+    internal :func:`run_verification`; ``None`` keeps the config default, and
+    ``run_main_tip_sweep`` passes ``0`` (task 5812).
 
     Discovery reuse: ``config._module_configs`` uses a sentinel of ``None`` to
     mean "discovery never ran".  When it holds any dict (including ``{}``,
@@ -7554,14 +7559,19 @@ async def run_full_verification(
         module_configs = _discover_module_configs(project_root)
     if not module_configs:
         logger.info('Full verification: no subproject configs — using global')
-        return await run_verification(project_root, config, role=role)
+        return await run_verification(
+            project_root, config, role=role, max_retries=max_retries,
+        )
 
     logger.info(
         'Full verification: running %d subprojects in parallel',
         len(module_configs),
     )
     results = await asyncio.gather(
-        *(run_verification(project_root, config, mc, role=role) for mc in module_configs.values())
+        *(
+            run_verification(project_root, config, mc, role=role, max_retries=max_retries)
+            for mc in module_configs.values()
+        )
     )
     return _aggregate_results(list(results))
 
