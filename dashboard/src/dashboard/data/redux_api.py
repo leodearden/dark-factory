@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -385,15 +385,13 @@ def shape_memory_graphs(ops: Datum[MemoryOps], *, served_at: datetime) -> dict[s
         totals = {'reads': reads, 'writes': writes, 'other': other, 'total': reads + writes + other}
         newest_hour_total = series['total'][-1]
 
-    def reading(value: object, field: str) -> dict[str, object]:
-        measured = Datum(value, ops.as_of, ops.state, ops.reason, ops.freshness_bound_seconds)
-        return _wire_served(measured, f'MEMORY_OPS {field}', served_at)
-
     return {
         'MEMORY_OPS': {
             **series,
-            'totals': reading(totals, 'totals'),
-            'newest_hour_total': reading(newest_hour_total, 'newest_hour_total'),
+            'totals': _wire_served(replace(ops, value=totals), 'MEMORY_OPS totals', served_at),
+            'newest_hour_total': _wire_served(
+                replace(ops, value=newest_hour_total), 'MEMORY_OPS newest_hour_total', served_at,
+            ),
         },
         'served_at': served_at.isoformat(),
     }
