@@ -3,14 +3,18 @@
 Imported by bare module name (``from _proc_supervision_doubles import ...``),
 like ``_orch_helpers`` -- ``orchestrator/tests/`` has no ``__init__.py``.
 
-One copy of the subprocess runner double and of the canonical detached RP-4
-restart plan, so every proc_supervision test file pins the same plan shape.
+One copy of the subprocess runner double, of the canonical detached RP-4
+restart plan and of the ``find_spec`` stub, so every proc_supervision test
+file pins the same plan shape and degrades import roots the same way.
 """
 
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from orchestrator.proc_supervision import EscalationSpec, RestartPlan
 
@@ -67,3 +71,19 @@ def detached_rp4_plan(queue_dir: Path, *, with_spec: bool) -> RestartPlan:
         transient_unit='orch-redeploy-restart-99.service',
         on_active_secs=10,
     )
+
+
+def stub_find_spec(monkeypatch: pytest.MonkeyPatch, unresolvable: set[str]) -> None:
+    """Make ``importlib.util.find_spec`` return None for *unresolvable* names.
+
+    Every other name delegates to the real resolver, so this isolates the
+    package under test without disturbing unrelated imports.
+    """
+    real = importlib.util.find_spec
+
+    def _fake(name: str, package: str | None = None):
+        if name in unresolvable:
+            return None
+        return real(name, package)
+
+    monkeypatch.setattr(importlib.util, 'find_spec', _fake)

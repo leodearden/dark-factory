@@ -18,7 +18,7 @@ import shlex
 from pathlib import Path
 
 import pytest
-from _proc_supervision_doubles import FakeRunner, detached_rp4_plan
+from _proc_supervision_doubles import FakeRunner, detached_rp4_plan, stub_find_spec
 from escalation.queue import EscalationQueue
 
 
@@ -1727,24 +1727,6 @@ class TestSubmitChildPythonPathIsExplicit:
 # ---------------------------------------------------------------------------
 
 
-def _stub_find_spec(monkeypatch: pytest.MonkeyPatch, unresolvable: set[str]) -> None:
-    """Make ``importlib.util.find_spec`` return None for *unresolvable* names.
-
-    Every other name delegates to the real resolver, so this isolates the
-    package under test without disturbing unrelated imports.
-    """
-    import importlib.util
-
-    real = importlib.util.find_spec
-
-    def _fake(name: str, package: str | None = None):
-        if name in unresolvable:
-            return None
-        return real(name, package)
-
-    monkeypatch.setattr(importlib.util, 'find_spec', _fake)
-
-
 @pytest.mark.asyncio
 class TestSubmitChildPythonPathDegradesLoudly:
     """A package whose import root cannot be resolved must produce a WARNING
@@ -1766,7 +1748,7 @@ class TestSubmitChildPythonPathDegradesLoudly:
         )
 
         monkeypatch.delenv('PYTHONPATH', raising=False)
-        _stub_find_spec(monkeypatch, set(_SUBMIT_CHILD_PACKAGES))
+        stub_find_spec(monkeypatch, set(_SUBMIT_CHILD_PACKAGES))
 
         runner = FakeRunner(returncode=0)
         plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
@@ -1804,7 +1786,7 @@ class TestSubmitChildPythonPathDegradesLoudly:
         from orchestrator.proc_supervision import RestartDisposition
 
         monkeypatch.delenv('PYTHONPATH', raising=False)
-        _stub_find_spec(monkeypatch, {'shared'})
+        stub_find_spec(monkeypatch, {'shared'})
 
         runner = FakeRunner(returncode=0)
         plan = detached_rp4_plan(tmp_queue_dir, with_spec=True)
