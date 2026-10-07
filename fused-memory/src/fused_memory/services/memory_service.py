@@ -2823,26 +2823,40 @@ class MemoryService:
         session_id: str | None,
         category: str | None,
         metadata: dict | None,
-    ) -> str:
+    ) -> str | None:
         """sha256 over the canonical mem0 write payload — audit/idempotency key.
 
         Used to stamp the write-ahead ``mem0_intent`` (task 2710) so a
         dead-lettered intent carries a stable fingerprint of exactly what
         would have been written, for audit and manual replay.
+
+        Fail-open, never raises (the same contract as
+        ``WriteJournal.log_mem0_intent``): it runs after add_memory's Graphiti
+        leg is already enqueued, so on failure it logs at ERROR and returns
+        None rather than stranding that twin.
         """
-        canonical = json.dumps(
-            {
-                'content': content,
-                'project_id': project_id,
-                'agent_id': agent_id,
-                'session_id': session_id,
-                'category': category,
-                'metadata': metadata or {},
-            },
-            sort_keys=True,
-            ensure_ascii=False,
-        )
-        return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+        try:
+            canonical = json.dumps(
+                {
+                    'content': content,
+                    'project_id': project_id,
+                    'agent_id': agent_id,
+                    'session_id': session_id,
+                    'category': category,
+                    'metadata': metadata or {},
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+        except Exception as e:
+            logger.error(
+                'mem0 payload digest could not be computed (%s: %s); the '
+                'mem0_intent is journaled without a digest',
+                type(e).__name__,
+                e,
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Durable queue: execute write dispatcher
