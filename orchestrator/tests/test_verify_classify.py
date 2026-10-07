@@ -800,14 +800,13 @@ class TestStructuredOutputParsingC2:
     is a `reason: compiler-message` / `level: error` record whose human text
     matches none of `_CARGO_PATTERNS`, so today it falls through to
     unknown_test_failure — only a JSON-aware parser that reads the
-    structured `level` field can classify it compile_error. The pyright/ruff
-    'preserved mapping' assertions and the non-JSON-fallback assertions
-    already hold today (PYRIGHT/RUFF have no dedicated text table yet, so
-    they fall through the shared OPAQUE placeholder to unknown_test_failure
-    regardless of JSON-awareness — see classify_failure's docstring); kept
-    here to pin the full JSON-first contract once step-8 adds the parsers,
-    per Invariant C2's "falls back to the text table otherwise" / exception-
-    safety requirements.
+    structured `level` field can classify it compile_error.
+
+    Task 4843 gave the pyright/ruff JSON parsers their own members: an
+    error-severity pyright diagnostic is TYPE_ERROR and a ruff violations
+    array is LINT_ERROR. Neither tool has a TEXT table, so human-text output,
+    a JSON payload carrying no error, and malformed JSON all still fall
+    through to the OPAQUE ladder unchanged (Invariant C1/C2), never raising.
     """
 
     def test_cargo_json_compiler_message_error_is_compile_error(self):
@@ -816,22 +815,54 @@ class TestStructuredOutputParsingC2:
             == FailureCategory.COMPILE_ERROR
         )
 
-    def test_pyright_json_error_diagnostic_is_unknown_test_failure(self):
-        """Preserved mapping: no dedicated PYRIGHT category exists (out of
-        scope for this task) — an error-severity generalDiagnostic still maps
-        to unknown_test_failure, matching today's on-the-wire category."""
+    def test_pyright_json_error_diagnostic_is_type_error(self):
         assert (
             _classify(ToolKind.PYRIGHT, _PYRIGHT_JSON_ERROR_DIAGNOSTIC, 1, False)
-            == FailureCategory.UNKNOWN_TEST_FAILURE
+            == FailureCategory.TYPE_ERROR
         )
 
-    def test_ruff_json_violation_is_unknown_test_failure(self):
-        """Preserved mapping: no dedicated RUFF category exists (out of scope
-        for this task) — a violations array still maps to
-        unknown_test_failure, matching today's on-the-wire category."""
+    def test_ruff_json_violation_is_lint_error(self):
         assert (
             _classify(ToolKind.RUFF, _RUFF_JSON_VIOLATIONS, 1, False)
-            == FailureCategory.UNKNOWN_TEST_FAILURE
+            == FailureCategory.LINT_ERROR
+        )
+
+    def test_ruff_empty_violations_array_takes_the_opaque_ladder(self):
+        """`[]` reports no violation, so the parser claims nothing and the
+        leg's category is whatever the OPAQUE ladder says, not LINT_ERROR."""
+        assert _classify(ToolKind.RUFF, '[]', 1, False) == _classify(
+            ToolKind.OPAQUE, '[]', 1, False
+        )
+        assert _classify(ToolKind.RUFF, '[]', 1, False) != FailureCategory.LINT_ERROR
+
+    def test_pyright_warning_only_payload_takes_the_opaque_ladder(self):
+        """Only an error-severity diagnostic is a type error; warnings and
+        information leave the parser silent and the OPAQUE ladder decides."""
+        output = json.dumps({
+            'version': '1.1.408',
+            'generalDiagnostics': [
+                {'file': '/workspace/a.py', 'severity': 'warning', 'message': 'w'},
+                {'file': '/workspace/a.py', 'severity': 'information', 'message': 'i'},
+            ],
+        })
+        assert _classify(ToolKind.PYRIGHT, output, 1, False) == _classify(
+            ToolKind.OPAQUE, output, 1, False
+        )
+        assert _classify(ToolKind.PYRIGHT, output, 1, False) != FailureCategory.TYPE_ERROR
+
+    @pytest.mark.parametrize(
+        ('tool', 'well_formed'),
+        [
+            (ToolKind.RUFF, _RUFF_JSON_VIOLATIONS),
+            (ToolKind.PYRIGHT, _PYRIGHT_JSON_ERROR_DIAGNOSTIC),
+        ],
+    )
+    def test_truncated_json_takes_the_opaque_ladder_without_raising(
+        self, tool, well_formed,
+    ):
+        truncated = well_formed[: len(well_formed) // 2]
+        assert _classify(tool, truncated, 1, False) == _classify(
+            ToolKind.OPAQUE, truncated, 1, False
         )
 
     def test_cargo_non_json_output_still_uses_text_table(self):
