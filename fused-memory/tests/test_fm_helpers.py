@@ -2091,6 +2091,38 @@ class TestAwaitIndexOperational:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('header', 'offending_entry'),
+        [
+            pytest.param([(1, 'label'), (7,), (1, 'status')], (7,), id='short-pair'),
+            pytest.param([(1, 'label'), None, (1, 'status')], None, id='non-sequence'),
+            pytest.param(['label', 'status'], 'label', id='bare-str'),
+        ],
+    )
+    async def test_malformed_header_entry_raises_index_header_error_on_first_query(
+        self, header, offending_entry
+    ):
+        """A header entry that is not a (type, name) pair must fail as the named
+        shape error, not as a raw IndexError/TypeError or a mangled
+        missing-column report.
+        """
+        from _fm_helpers import IndexHeaderError, await_index_operational
+
+        graph = _FakeIndexGraph([_FakeIndexResult(header, [['x', _OPERATIONAL]])])
+
+        with pytest.raises(IndexHeaderError) as excinfo:
+            await await_index_operational(graph, timeout_s=5.0)
+
+        message = str(excinfo.value)
+        assert graph.calls == 1, f'expected a raise on the first query, got {graph.calls}'
+        assert 'not OPERATIONAL' not in message, (
+            f'the header-shape failure must not be dressed up as a timeout: {message!r}'
+        )
+        assert repr(offending_entry) in message, (
+            f'the error must name the entry it saw, {offending_entry!r}: {message!r}'
+        )
+
+    @pytest.mark.asyncio
     async def test_never_operational_raises_with_last_seen_statuses(self):
         """An index that never becomes ready raises AssertionError naming its last statuses.
 
