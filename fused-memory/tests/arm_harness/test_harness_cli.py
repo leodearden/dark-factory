@@ -1,5 +1,6 @@
 """The thin arm-harness CLI: argument-to-call wiring, exit codes, and the scratch guard at its surface."""
 
+import asyncio
 import dataclasses
 import importlib
 import json
@@ -39,13 +40,22 @@ from fused_memory.arm_harness.metrics_record import (
     LlmMetricId,
     MetricsRecord,
     load_metrics_record,
+    load_metrics_records,
     record_for,
     write_metrics_record,
+)
+from fused_memory.arm_harness.preregistration import (
+    PREREGISTRATION_INPUTS_FILENAME,
+    derive_preregistration_inputs,
+    load_preregistration_inputs,
+    serialize_preregistration_inputs,
 )
 from fused_memory.arm_harness.replay_types import ArmAbort, EpisodeOutcome, ReplaySettings
 from fused_memory.arm_harness.run import (
     ABORT_FILENAME,
+    OUTCOMES_FILENAME,
     RUN_MANIFEST_FILENAME,
+    load_outcomes,
     write_outcomes,
 )
 from fused_memory.arm_harness.run_manifest import (
@@ -53,7 +63,7 @@ from fused_memory.arm_harness.run_manifest import (
     load_run_manifest,
     serialize_run_manifest,
 )
-from fused_memory.arm_harness.topology import EDGE_CYPHER, NODE_CYPHER
+from fused_memory.arm_harness.topology import EDGE_CYPHER, NODE_CYPHER, read_topology, topology_hash
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
 from fused_memory.config.schema import FusedMemoryConfig
 
@@ -980,3 +990,198 @@ def test_teardown_collection_also_deletes_the_same_named_replica(harness, live, 
         ('delete', spec.scratch_group_id),
     ]
     assert live.qdrant.deleted == [spec.scratch_group_id]
+
+
+# --- preregister ----------------------------------------------------------------------
+
+PREREG_EPISODES = ('e1', 'e2', 'e3', 'e4')
+
+
+def _prereg_outcomes(calls: tuple[int, ...]) -> list[EpisodeOutcome]:
+    return [
+        EpisodeOutcome(
+            episode_id=episode_id,
+            ok=True,
+            error_class=None,
+            duration_ms=5000.0,
+            tokens=LlmTokenUsage(input_tokens=1000 * n, output_tokens=100 * n, llm_calls=n),
+            replay_episode_uuid=f'replay-{episode_id}',
+            entity_names=('alice',),
+            edge_triples=(),
+        )
+        for episode_id, n in zip(PREREG_EPISODES, calls, strict=True)
+    ]
+
+
+def _prereg_records(
+    spec: LlmArmSpec, *, p95_ms: float, sameness: bool
+) -> list[MetricsRecord]:
+    def proportion(metric_id: LlmMetricId, hits: int, total: int, direction: Any) -> Metric:
+        return Metric(
+            metric_id=metric_id, kind='proportion', value=hits / total, n=total,
+            denominator=total, direction=direction,
+        )
+
+    metrics = [
+        proportion(LlmMetricId.CONFORMANCE_RATE, 26, 26, 'lower_is_worse'),
+        proportion(LlmMetricId.EPISODE_FAILURE_RATE, 0, 4, 'higher_is_worse'),
+        proportion(LlmMetricId.RETRIEVAL_UTILITY, 3, 4, 'lower_is_worse'),
+        Metric(metric_id=LlmMetricId.EPISODE_LATENCY_P95, kind='scalar', value=p95_ms, n=4),
+    ]
+    if sameness:
+        metrics.append(Metric(metric_id=LlmMetricId.GRAPH_SAMENESS, kind='scalar', value=1.0, n=4))
+    measured = [record_for(spec, m, measured_at=MEASURED_AT, incomplete=False) for m in metrics]
+    return measured + _accounted(spec)
+
+
+def _control_run_dir(
+    root: Path, spec: LlmArmSpec, calls: tuple[int, ...], *, p95_ms: float = 4000.0,
+    sameness: bool = False,
+) -> Path:
+    manifest = run_manifest_for(spec, episode_ids=PREREG_EPISODES)
+    run_dir = _write_run(root / spec.arm_id, manifest, _prereg_records(
+        spec, p95_ms=p95_ms, sameness=sameness
+    ))
+    write_outcomes(run_dir, _prereg_outcomes(calls))
+    return run_dir
+
+
+def _control_pair(tmp_path: Path, **b_overrides: Any) -> tuple[Path, Path]:
+    spec_a, spec_b = _control('ctrl-a', 'evalmem_ctrl_a'), _control('ctrl-b', 'evalmem_ctrl_b')
+    run_a = _control_run_dir(tmp_path, spec_a, (3, 5, 8, 10))
+    run_b = _control_run_dir(tmp_path, spec_b, (4, 4, 6, 6), **({'sameness': True} | b_overrides))
+    return run_a, run_b
+
+
+def _preregister_argv(run_a: Path, run_b: Path, out: Path) -> list[str]:
+    return ['preregister', '--run-a', str(run_a), '--run-b', str(run_b), '--out', str(out)]
+
+
+def test_preregister_writes_the_inputs_derived_from_the_control_pair(
+    harness, live, tmp_path, capsys
+):
+    run_a, run_b = _control_pair(tmp_path)
+    out = tmp_path / 'out' / PREREGISTRATION_INPUTS_FILENAME
+
+    code = harness.main(_preregister_argv(run_a, run_b, out), deps=live.factory(harness))
+
+    assert code == harness.EXIT_OK
+    expected = derive_preregistration_inputs(
+        load_run_manifest(run_a / RUN_MANIFEST_FILENAME),
+        load_metrics_records(run_a),
+        load_outcomes(run_a / OUTCOMES_FILENAME),
+        load_run_manifest(run_b / RUN_MANIFEST_FILENAME),
+        load_metrics_records(run_b),
+        load_outcomes(run_b / OUTCOMES_FILENAME),
+    )
+    assert load_preregistration_inputs(out) == expected
+    assert out.read_text() == serialize_preregistration_inputs(expected)
+    lines = capsys.readouterr().out.splitlines()
+    margin_lines = [line for line in lines if line.startswith('margin ')]
+    assert len(margin_lines) == len(expected.margins)
+    for entry, line in zip(expected.margins, margin_lines, strict=True):
+        assert entry.metric_id in line
+    assert any('60000.0' in line for line in lines)
+    assert live.log.factory_calls == 0
+
+
+def _refused_preregister(
+    harness: ModuleType, live: FakeLive, run_a: Path, run_b: Path, out: Path, capsys: Any
+) -> str:
+    code = harness.main(_preregister_argv(run_a, run_b, out), deps=live.factory(harness))
+
+    assert code == harness.EXIT_REFUSED
+    assert not out.exists()
+    assert live.log.factory_calls == 0
+    err = capsys.readouterr().err
+    assert err.startswith('error: ')
+    return err
+
+
+def test_preregister_refuses_a_run_b_without_graph_sameness(harness, live, tmp_path, capsys):
+    run_a, run_b = _control_pair(tmp_path, sameness=False)
+
+    err = _refused_preregister(harness, live, run_a, run_b, tmp_path / 'f.json', capsys)
+
+    assert 'graph-sameness' in err
+    assert '--reference-outcomes' in err
+
+
+def test_preregister_never_overwrites_existing_inputs(harness, live, tmp_path, capsys):
+    run_a, run_b = _control_pair(tmp_path)
+    out = tmp_path / PREREGISTRATION_INPUTS_FILENAME
+    out.write_text('pre-registered\n')
+
+    code = harness.main(_preregister_argv(run_a, run_b, out), deps=live.factory(harness))
+
+    assert code == harness.EXIT_REFUSED
+    assert out.read_text() == 'pre-registered\n'
+    err = capsys.readouterr().err
+    assert err.startswith('error: ')
+    assert str(out) in err
+
+
+def test_preregister_refuses_an_incumbent_outside_the_envelope(harness, live, tmp_path, capsys):
+    run_a, run_b = _control_pair(tmp_path, p95_ms=61000.0)
+
+    err = _refused_preregister(harness, live, run_a, run_b, tmp_path / 'f.json', capsys)
+
+    assert 'not a valid pre-registration' in err
+
+
+def test_preregister_refuses_a_run_dir_without_run_json(harness, live, tmp_path, capsys):
+    run_a, _ = _control_pair(tmp_path)
+    interrupted = tmp_path / 'interrupted'
+    interrupted.mkdir()
+
+    err = _refused_preregister(harness, live, run_a, interrupted, tmp_path / 'f.json', capsys)
+
+    assert RUN_MANIFEST_FILENAME in err
+
+
+def test_preregister_refuses_missing_outcomes(harness, live, tmp_path, capsys):
+    run_a, run_b = _control_pair(tmp_path)
+    (run_a / OUTCOMES_FILENAME).unlink()
+
+    err = _refused_preregister(harness, live, run_a, run_b, tmp_path / 'f.json', capsys)
+
+    assert OUTCOMES_FILENAME in err
+
+
+def test_preregister_refuses_an_embedding_arm_run(harness, live, tmp_path, capsys):
+    run_a, _ = _control_pair(tmp_path)
+    run_b = _write_run(tmp_path / 'emb', run_manifest_for(embedding_spec()), [])
+
+    err = _refused_preregister(harness, live, run_a, run_b, tmp_path / 'f.json', capsys)
+
+    assert 'embedding arm' in err
+
+
+# --- topology -------------------------------------------------------------------------
+
+
+def test_topology_prints_the_scratch_graphs_hash(harness, live, capsys):
+    live.falkor = FakeFalkor(rows=_topology_rows(None))
+
+    code = harness.main(['topology', '--graph', 'evalmem_x'], deps=live.factory(harness))
+
+    assert code == harness.EXIT_OK
+    expected = asyncio.run(
+        read_topology(FakeFalkor(rows=_topology_rows(None)).select_graph('evalmem_x'), 'evalmem_x')
+    )
+    assert json.loads(capsys.readouterr().out) == {
+        'graph': 'evalmem_x',
+        'node_count': 2,
+        'edge_count': 1,
+        'topology_hash': topology_hash(*expected),
+    }
+    assert {graph for _, graph in live.falkor.calls} == {'evalmem_x'}
+    assert {kind for kind, _ in live.falkor.calls} <= {'select_graph', 'ro_query'}
+
+
+def test_topology_refuses_a_protected_graph_before_any_dependency(harness, live, capsys):
+    code = harness.main(['topology', '--graph', 'dark_factory'], deps=live.factory(harness))
+
+    assert code == harness.EXIT_SCRATCH_GUARD
+    assert live.log.factory_calls == 0
+    assert live.falkor.calls == []

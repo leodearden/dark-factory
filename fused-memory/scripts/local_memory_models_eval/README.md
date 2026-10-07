@@ -118,25 +118,26 @@ canonically by uuid (so the result does not depend on the order FalkorDB
 happens to return rows in, which is not guaranteed stable), permute under
 `Random(f'{seed}:{month}:{kind}')`, take the first `allocate()[cell]`.
 
-## N = 200 is provisional
+## N = 200 is final (ruled by ζ)
 
-200 is δ's choice: the midpoint of the PRD's 150–300 band, checked against the
-measured census so that all 16 non-empty cells receive at least one seat.
-**PRD Open Q4 defers the final corpus size to ζ**, to be settled from measured
-control variance and wall-clock.
+200 was δ's choice: the midpoint of the PRD's 150–300 band, checked against the
+measured census so that all 16 non-empty cells receive at least one seat. PRD
+Open Q4 deferred the final corpus size to ζ, and **ζ kept N = 200** after
+measuring control variance and wall-clock on this exact manifest. Every LLM
+gated margin derived from the two incumbent control replays is far inside the
+0.10 adequacy bound, and wall-clock does not constrain N. The ruling and its
+measured basis are in `plans/local-memory-models-eval-preregistration.md`
+§"Corpus N".
 
-Re-tuning is cheap by construction. Because each cell's take is a *prefix* of
-that cell's permutation, growing N only ever **appends** to a cell — so ζ can
-re-run the builder at a different N without invalidating replays ε has already
-completed at the smaller one. Note this is a **per-cell** guarantee, not a
-global one: largest-remainder allocation can move a single seat between cells
-as N changes, so a cell whose allocation *shrank* is the one case where an
-earlier pick is dropped.
+The controls, and every margin pre-registered from them, are bound to this
+manifest's `corpus_sha`. Re-running the builder at a different `--n` writes a
+different manifest with a different `corpus_sha`, which invalidates the
+controls. That would be a new pre-registration, not a re-tune.
 
-```bash
-# what ζ runs to re-tune
-uv run python fused-memory/scripts/local_memory_models_eval/build_corpus.py --n 300
-```
+The builder's prefix property still holds. Each cell's take is a prefix of that
+cell's seeded permutation, so growing N only ever **appends** to a cell. This
+is a **per-cell** guarantee, not a global one: largest-remainder allocation can
+move a single seat between cells as N changes.
 
 ## The binding hazard: no conditioning on the incumbent's outcome
 
@@ -239,6 +240,8 @@ Live endpoints come from `FusedMemoryConfig()` (honours `CONFIG_PATH`).
 | `integrity --reference G --candidate G` | ι | Re-embed integrity verdict over two scratch topologies (`topology.py`) |
 | `parity-check --run-a A --run-b B` | ζ | Client-class parity deltas (a − b) into `A/parity/<arm b>/metrics/` (`comparison.py`) |
 | `control-check --run A --run B [--run …] [--reference-outcomes F]` | ζ | Symmetry, one code sha, token/cost and reference checks (`checks.py`) |
+| `preregister --run-a A --run-b B --out F` | ζ | The incumbent control pair's margins, latency envelope and calls-per-episode profile, written to a fresh `F` (an existing `F` is refused, never overwritten); B must have run with `--reference-outcomes` A, and its graph-sameness is recomputed from both runs' outcomes (`preregistration.py`, `margins.py`) |
+| `topology --graph G` | ζ, ι | A scratch graph's node and edge counts and topology hash: ζ freezes the reference graph, ι re-runs it to verify the graph is unchanged (`topology.py`) |
 | `teardown --arm-spec S [--collection]` | ι | Deletes the arm's scratch graph and, with `--collection`, its Qdrant replica (`teardown.py`) |
 
 `run` refuses before touching any store unless the spec's `code_sha` is the
@@ -253,7 +256,7 @@ population.
 |---|---|
 | 0 | ok |
 | 1 | the run could not complete (store unreachable, index build failed, the index probe could not remove its seeded node — the error names it — or a traceback) |
-| 2 | refused: invalid spec or input, a pre-run instrument check failed, a run dir is not fresh or not complete |
+| 2 | refused: invalid spec or input, a pre-run instrument check failed, a run dir is not fresh or not complete, a control pair yields no valid pre-registration |
 | 3 | an instrument check failed (post-run, smoke, index-check, integrity, control-check) |
 | 4 | INV-4 abort: consecutive episode failures stopped the run |
 | 5 | scratch guard: a non-`evalmem_` name reached a guarded checkpoint |
