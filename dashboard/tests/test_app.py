@@ -2224,14 +2224,27 @@ _LIVE_ENTRY_RETRY = {
 
 
 def _proj_raw(*roots: str) -> dict:
-    """A minimal build_per_project_merge_queue output for each root."""
+    """A minimal build_per_project_merge_queue output for each root.
+
+    Its runs.db readings are stamped just before the request, so they are
+    served fresh, as a readable runs.db's are.
+    """
+    from datetime import UTC
+
+    from dashboard.data.datum import Datum, DatumState
+
+    read_at = datetime.now(UTC)
     return {
         root: {
             'depth_timeseries': {'labels': [], 'values': []},
             'outcomes': {'labels': [], 'values': []},
             'latency': {},
             'recent': [],
-            'speculative': {},
+            'recent_total': Datum(0, read_at, DatumState.FRESH, None, 30),
+            'speculative': Datum(
+                {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None},
+                read_at, DatumState.FRESH, None, 30,
+            ),
             'train_events': [],
         }
         for root in roots or (_PROJ_ROOT,)
