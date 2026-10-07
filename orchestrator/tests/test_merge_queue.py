@@ -13029,6 +13029,45 @@ def _production_verifier_with(**steps: Any) -> VerifyPort:
 
 
 @pytest.mark.asyncio
+class TestAnswerListVerifier:
+    """The per-call verifier double keeps its parent's recording contract."""
+
+    async def test_answers_play_in_call_order_and_the_last_repeats(self) -> None:
+        verifier = _ScriptedVerifier(answers=[
+            fails(category='env_transient', summary='first'),
+            passes(summary='then'),
+        ])
+
+        results = [
+            await verifier.run_scoped(Path('wt'), None, [], task_id='t')
+            for _ in range(3)
+        ]
+
+        assert [r.summary for r in results] == ['first', 'then', 'then']
+
+    async def test_every_answered_call_is_a_recorded_entry(self) -> None:
+        verifier = _ScriptedVerifier(answers=[passes()])
+
+        await verifier.run_scoped(Path('wt'), None, [], task_id='a')
+        await verifier.run_scoped(Path('wt'), None, [], task_id='b')
+
+        assert verifier.verified == ['a', 'b']
+        assert verifier.entered_count == len(verifier.verified)
+        assert [c.task_id for c in verifier.verify_calls] == ['a', 'b']
+        await wait_responsive(
+            verifier.await_entry(2), label='second answered scoped verify entry',
+        )
+
+    async def test_no_answers_falls_back_to_a_passing_verify(self) -> None:
+        verifier = _ScriptedVerifier()
+
+        result = await verifier.run_scoped(Path('wt'), None, [], task_id='t')
+
+        assert result.passed is True
+        assert verifier.entered_count == 1
+
+
+@pytest.mark.asyncio
 class TestRunPostMergeVerify:
     """Direct unit tests for the _run_post_merge_verify module-level helper.
 
