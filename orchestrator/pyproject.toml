@@ -190,9 +190,9 @@ filterwarnings = [
 # actually governs a merge-gating run.
 # That inversion cost tasks 4176, 4384 and 4405. Write either N <= 60 (a
 # DELIBERATE tight bound, for a test asserting something happens FAST) or
-# @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT) from tests/_orch_helpers.py
-# — whose comment block on that constant is the SINGLE home of this rationale,
-# including why the marker beats this setting. Enforced by
+# @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT) from tests/_orch_helpers.py.
+# The SINGLE home of this rationale, including why the marker beats this
+# setting, is shared/src/shared/testing_timeout_markers.py. Enforced by
 # tests/test_timeout_marker_inversion_guard.py.
 # timeout_method: thread is RETAINED. Its original premise, that xdist worker
 # subprocesses run pytest in a thread so signal cannot reach the test, is

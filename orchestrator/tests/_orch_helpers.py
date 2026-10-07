@@ -262,23 +262,11 @@ WHOLE_TREE_SCAN_TEST_TIMEOUT = 540
 
 # task 5147: the per-test budget VERIFY actually passes -- the `--timeout=300`
 # token in `orchestrator/orchestrator.yaml`'s `test_command`, mirrored by every
-# pytest segment of the fleet chain in dark-factory-orchestrator.yaml.  This
-# comment is the SINGLE home of the INVERSION rationale; test modules and the
-# pyproject comment point HERE rather than restating it.
-#
-# WHY A MARKER IS AN OVERRIDE AND NEVER A FLOOR -- read verbatim from
-# `pytest_timeout.py::_get_item_settings` in the installed package:
-#
-#     if marker is not None:
-#         timeout = _validate_timeout(settings.timeout, "marker")
-#     if timeout is None:
-#         timeout = item.config._env_timeout
-#
-# The marker wins UNCONDITIONALLY.  `config._env_timeout` -- fed by CLI
-# `--timeout`, then `PYTEST_TIMEOUT`, then the ini `timeout` -- is consulted
-# ONLY when the marker yielded None.  So `@pytest.mark.timeout(N)` is a TWO-WAY
-# override: whatever budget is in force it REPLACES, raising it wherever the
-# ambient budget is smaller and LOWERING it under verify's `--timeout=300`.
+# pytest segment of the fleet chain in dark-factory-orchestrator.yaml.  It is
+# the upper edge of the inversion band, whose rationale lives in
+# shared/src/shared/testing_timeout_markers.py, and a slow test here loosens
+# safely by spelling it: `@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)`.
+# ENFORCED by tests/test_timeout_marker_inversion_guard.py.
 #
 # THE CLI BUDGET AND THE INI DEFAULT NO LONGER COINCIDE.  Both were 300 until
 # 2026-09-17, when task 5442's measurement raised the ini default to 540 and
@@ -289,24 +277,6 @@ WHOLE_TREE_SCAN_TEST_TIMEOUT = 540
 # merge-gating run.  That is exactly why it is a literal rather than derived
 # from PYPROJECT_DEFAULT_TIMEOUT: a mirror would have followed the ini default
 # up to 540 and silently widened the band past what verify actually passes.
-#
-# THE INVERSION BAND.  A marker at N falls in one of three regimes:
-#   * N <= DELIBERATE_TIGHT_BOUND_CEILING -- small enough that it reads as a
-#     deliberate tight bound rather than a slow test's opt-out
-#     (test_verify_clock_stop.py's 15s watchdog marks exist precisely to
-#     assert something fires FAST);
-#   * DELIBERATE_TIGHT_BOUND_CEILING < N < VERIFY_CLI_PER_TEST_TIMEOUT --
-#     INVERTS.  Too large to read as a deliberate fast bound, and below the
-#     budget verify passes, so the author's intended LOOSENING for a slow test
-#     silently becomes a TIGHTENING of the run that gates their merge: 300
-#     becomes N;
-#   * N >= VERIFY_CLI_PER_TEST_TIMEOUT -- loosens under both.  Safe.
-# Only the middle band contradicts its author's evident intent, and a breach
-# there is not a red test: `timeout_method = "thread"` makes pytest-timeout
-# `os._exit()` the xdist worker, and `--max-worker-restart=0` then truncates
-# the session and blames an innocent test that merely shared it (the same
-# mechanism spelled out for WHOLE_TREE_SCAN_TEST_TIMEOUT above).
-# ENFORCED by tests/test_timeout_marker_inversion_guard.py.
 #
 # A LITERAL, NOT AN EXPRESSION, and deliberately NOT `5 *
 # PYPROJECT_DEFAULT_TIMEOUT` despite equalling it today.  What is being named

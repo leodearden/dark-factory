@@ -7,29 +7,24 @@ meant for a slow test silently TIGHTENS the verify run that gates their merge,
 because a pytest-timeout marker is a two-way override and never a floor.
 
 The derivation -- the ``pytest_timeout._get_item_settings`` precedence it
-follows from, the three regimes the two budgets carve out, and why a breach
-costs a whole truncated session rather than one red test -- has ONE home: the
-``VERIFY_CLI_PER_TEST_TIMEOUT`` comment block in _orch_helpers.py.  Read it
+follows from and the three regimes the two budgets carve out -- has ONE home:
+the module docstring of shared/src/shared/testing_timeout_markers.py.  Read it
 there.  This module points at it rather than restating it, so a pytest-timeout
 upgrade that moves that precedence invalidates one copy and not five.  The sole
-deliberate exception is :func:`test_no_timeout_marker_sits_in_the_inversion_band`'s
-failure message, where the reader is looking at a traceback and not at the source.
+deliberate exception is the failure message,
+``shared.testing_timeout_markers.inversion_failure_message``, where the reader
+is looking at a traceback and not at the source.
 
 A SWEEP WITH NO ALLOWLIST: every in-band marker under this directory fails.
 
-SCOPE IS ``orchestrator/tests`` ONLY, and the sibling packages are KNOWINGLY
-UNGUARDED -- do not read this module as tree-wide coverage.  The defect is a
-property of the ``(ini timeout, verify --timeout)`` PAIR, not of this package,
-and all eight segments of dark-factory-orchestrator.yaml's fleet chain pass
-``--timeout=300``.  MEASURED by running this module's own extractor over the
-siblings: fused-memory has 15 in-band sites of 41, under the same
-``timeout_method = "thread"`` / ``-n auto`` settings that make a breach here
-cost a worker; shared has 1 of 21; escalation, dashboard,
-sampler and tests/scripts have none.  Covering them means lifting the extractor
-and :func:`_inverts` into a shared home -- orchestrator.pytest_markers already
-owns the marker grammar this module imports -- and instantiating the guard per
-package.  Filed as follow-up work rather than silently implied here:
-agent-followup ticket tkt_0RTGWEF0FDSZ9QFZZYDFZVYSF5.
+SCOPE.  The extractor (``timeout_marker_sites``), the band (``inverts``) and
+the message live in ``shared.testing_timeout_markers``.  This module
+instantiates them for ``orchestrator/tests`` and adds the orchestrator-only
+pins: the sanctioned-name mirrors, the deep-gate and deep-landing spellings,
+and the spawn budgets.  fused-memory and shared instantiate the same guard in
+their own ``tests/test_timeout_marker_inversion_guard.py``.  tests/,
+scripts/tests and escalation remain unguarded: follow-up ticket
+tkt_0RVDQ4R6X8T1H3EAEG855VPGCT.
 
 WHAT THIS DOES NOT DUPLICATE.  test_whole_tree_scan_timeout_guard.py polices a
 per-FILE family invariant using MODULE-LEVEL marks only; test_marker_

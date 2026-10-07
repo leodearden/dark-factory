@@ -1,5 +1,38 @@
 """Census of ``pytest.mark.timeout(...)`` markers, and the band in which one inverts a verify budget.
 
+A MARKER IS A TWO-WAY OVERRIDE, NEVER A FLOOR.  Read verbatim from
+``pytest_timeout.py::_get_item_settings`` in the installed package::
+
+    if marker is not None:
+        timeout = _validate_timeout(settings.timeout, "marker")
+    if timeout is None:
+        timeout = item.config._env_timeout
+
+The marker wins unconditionally.  ``config._env_timeout`` -- fed by CLI
+``--timeout``, then ``PYTEST_TIMEOUT``, then the ini ``timeout`` -- is consulted
+only when the marker yielded None.  So ``@pytest.mark.timeout(N)`` REPLACES
+whatever budget is in force: it raises the budget wherever the ambient one is
+smaller, and LOWERS it under verify's ``--timeout``.
+
+THE INVERSION BAND.  Against a verify budget B, a marker at N falls in one of
+three regimes:
+
+* N <= DELIBERATE_TIGHT_BOUND_CEILING -- small enough to read as a deliberate
+  tight bound rather than a slow test's opt-out;
+* DELIBERATE_TIGHT_BOUND_CEILING < N < B -- INVERTS.  Too large to read as a
+  deliberate fast bound, and below the budget verify passes, so the author's
+  intended LOOSENING for a slow test silently becomes a TIGHTENING of the run
+  that gates their merge: B becomes N;
+* N >= B -- loosens under both.  Safe.
+
+Only the middle band contradicts its author's evident intent.  What a breach
+there costs depends on the suite's ``timeout_method``; that trade lives in
+``tests/scripts/test_timeout_method_policy.py``.
+
+Each package instantiates the guard in its own
+``tests/test_timeout_marker_inversion_guard.py`` with its OWN B, read through
+:func:`verify_cli_timeout` from the ``test_command`` in its orchestrator.yaml.
+
 Pure stdlib and pytest-free, like every ``shared.testing_*`` module, and
 registered as such in ``shared/tests/test_pure_stdlib_leaves.py``.
 """
