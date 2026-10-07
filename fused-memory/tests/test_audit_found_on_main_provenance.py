@@ -2140,9 +2140,11 @@ class TestRunTargetStorePreflight:
         """A refusal is an exception, never 0 / 1 / 2.
 
         ``--fail-on-findings`` exists so a clean exit only ever means "nothing
-        flagged", and ``scripts/check_found_on_main_spurious_rate.py`` wraps
-        this script as a CI predicate reading that ladder. The guard must not
-        be confusable with "clean report" (0) or "findings present" (2).
+        flagged". ``scripts/check_found_on_main_spurious_rate.py`` reuses this
+        module's ``build_audit_report`` but not its exit-code ladder, and maps
+        its own store refusal onto a reserved exit 3. The guard must not be
+        confusable with "clean report" (0) or "findings present" (2) on THIS
+        script's ladder.
         """
         self._patch(monkeypatch)
 
