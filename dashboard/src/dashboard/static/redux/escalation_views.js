@@ -1,5 +1,6 @@
 // escalation_views.js — the CLIENT reader of the escalation corpus' served
-// views, its resolution-class split and each row's task card. The views are
+// views, its resolution-class split, each row's task card and the header's
+// per-level counts. The views are
 // counted once, server-side, over one walk of every queue's root and archive
 // (dashboard/src/dashboard/data/escalation_corpus.py); both escalation tabs read
 // them here, so the pill ("queue pending") and the strip ("open in history")
@@ -19,9 +20,9 @@
 // test has put DF_ENDPOINT_STALENESS on a window shim.
 //
 // THE CLIENT NEVER RE-COUNTS A SERVED VIEW. Each view is the server's Datum;
-// the only envelopes built here are datum.js's own: a receipt stamp, an
-// unknown placeholder, and a combined total over the project filter in which a
-// hole anywhere is a hole in the sum.
+// the only envelopes built here are datum.js's own: a receipt stamp, a
+// plain-wrapped payload count, an unknown placeholder, and a combined total
+// over the project filter in which a hole anywhere is a hole in the sum.
 
 // Module scope, no fallback, RENAMED — see the CANONICAL note in datum.js's
 // header. endpoint_staleness.js declares a top-level `function formatAge`.
@@ -31,6 +32,7 @@ const {
   combinedDatum: combineEscalationDatums,
   displayedAgeMs: displayedCorpusAgeMs,
   datumView: viewOfEscalationDatum,
+  plainDatum: plainEscalationDatum,
 } = window.DF_DATUM;
 const { formatAge: formatCorpusAge } = window.DF_ENDPOINT_STALENESS;
 
@@ -64,6 +66,17 @@ function subsectionQueuePending(sec, receipts) {
     ESCALATIONS_VIEWS_ENDPOINT,
     'the /escalations subsection ' + (s.label || s.id) + ' has no queue_pending view',
     receipts,
+  );
+}
+
+// ── The header's count of level-N records ──
+// A plain count in the /escalations summary, wrapped with that endpoint's
+// receipt. data.js seeds by_level with zeros, so before the first payload the
+// count is not yet fetched rather than a seed zero passed off as measured.
+function levelCount(data, level) {
+  const summary = (((data || {}).ESCALATIONS || {}).summary) || {};
+  return plainEscalationDatum(
+    (summary.by_level || {})[level], ESCALATIONS_VIEWS_ENDPOINT, escalationReceipts(data),
   );
 }
 
@@ -168,6 +181,7 @@ const ESCALATION_VIEWS_API = {
   resolutionSegments,
   windowedClassSplit,
   taskCard,
+  levelCount,
 };
 
 if (typeof module !== 'undefined' && module.exports) {

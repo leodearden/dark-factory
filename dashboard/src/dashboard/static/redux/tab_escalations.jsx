@@ -26,6 +26,7 @@ const {
   corpusAgeCaption,
   windowedClassSplit,
   taskCard,
+  levelCount,
 } = window.DF_ESCALATION_VIEWS;
 // The cross-tab focus lookup, keyed on (queue, id) — escalation_focus.js.
 const { findEscalationRow } = window.DF_ESCALATION_FOCUS;
@@ -447,7 +448,6 @@ function EscalationsTab({ projectFilter, focus, onFocusConsumed }) {
 
   // Global summary from top-level data
   const gs = escalations.summary || {};
-  const byLevel = gs.by_level || {};
   const pendingInQueue = queuePending(DF);
 
   return (
@@ -520,7 +520,7 @@ function EscalationsTab({ projectFilter, focus, onFocusConsumed }) {
         </button>
         {/* Summary pills */}
         <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--fg-3)' }}>
-          <DatumReading datum={pendingInQueue} /> queue pending · {byLevel[1] || 0} L1 · {byLevel[2] || 0} L2
+          <DatumReading datum={pendingInQueue} /> queue pending · <DatumReading datum={levelCount(DF, 1)} /> L1 · <DatumReading datum={levelCount(DF, 2)} /> L2
           {/* Global, like the pips beside it: read from the unfiltered top-level
               summary, so with a project filter active this can count files in
               queues that are not rendered below.  Titled rather than re-derived
