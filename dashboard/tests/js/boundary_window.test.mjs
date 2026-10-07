@@ -54,14 +54,14 @@ test('sketch #9: the recent-merges caption counts only its own window\'s merges,
     const { latencyCaption } = client.window.DF_MERGE_QUEUE;
 
     assert.equal(
-      recentMergesCaption(block.recent.length, block.recent_total, echo),
-      `showing ${block.recent.length} of ${block.recent_total} in ${win}`,
+      recentMergesCaption(block.recent.length, block.recent_total.value, echo),
+      `showing ${block.recent.length} of ${block.recent_total.value} in ${win}`,
     );
     const opensAt = Date.parse(body.served_at) - echo.days * DAY_MS;
     for (const row of block.recent) {
       assert.ok(Date.parse(row.timestamp) >= opensAt, `${win} counts a merge from ${row.timestamp}, outside it`);
     }
-    totals[win] = block.recent_total;
+    totals[win] = block.recent_total.value;
 
     const attempts = sum(block.outcomes.values);
     const timed = block.latency.with_duration;

@@ -506,13 +506,15 @@ def shape_merge_queue(
     ``speculative``, ``active`` (the live probe's entries), ``in_queue``,
     ``live_probe_configured`` (false keeps the project out of the client's
     multi-project in-queue totals), ``active_spark``, ``halt``,
-    ``train_events``. ``in_queue`` and ``live_probe_configured`` are required:
-    the route resolves both for every project.
+    ``train_events``. ``in_queue``, ``speculative``, ``recent_total`` and
+    ``live_probe_configured`` are required: the route resolves them for every
+    project.
 
-    ``in_queue`` and every ``recent``/``active`` row's ``title`` are Datums the
-    route resolved, each aged to *served_at*, validated against it and
-    rendered to the wire. A field that is not a Datum, or a Datum that breaks
-    its contract there, is a wiring or shaper bug, and the
+    ``in_queue``, ``speculative``, ``recent_total`` and every
+    ``recent``/``active`` row's ``title`` are Datums the route resolved, each
+    aged to *served_at*, validated against it and rendered to the wire. A
+    field that is not a Datum, or a Datum that breaks its contract there, is
+    a wiring or shaper bug, and the
     :class:`~dashboard.data.datum.DatumContractError` propagates.
 
     ``active_sparks`` (optional) is ``in_queue``'s sampled history, keyed by
@@ -543,8 +545,8 @@ def shape_merge_queue(
             'outcomes': _shape_outcomes(data.get('outcomes')),
             'latency': dict(data.get('latency') or {}),
             'recent': _titled(data.get('recent'), f'{label}.recent'),
-            'recent_total': int(data.get('recent_total') or 0),
-            'speculative': dict(data.get('speculative') or {}),
+            'recent_total': _served(data.get('recent_total'), f'{label}.recent_total'),
+            'speculative': _served(data.get('speculative'), f'{label}.speculative'),
             'active': _titled(data.get('active'), f'{label}.active'),
             'in_queue': _served(data.get('in_queue'), f'{label}.in_queue'),
             'live_probe_configured': bool(data['live_probe_configured']),
