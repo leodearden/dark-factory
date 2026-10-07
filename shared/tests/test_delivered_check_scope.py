@@ -12,12 +12,16 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from shared.delivered_check_scope import (
+    STALE_PATH_CODES,
     SYS_MODULES_SHIM_PATTERN,
     PathState,
     ScopePath,
     classify_scope_paths,
     resolve_commit,
+    stale_scope_paths,
 )
 
 _SHIM_BODY = 'import sys\n\nfrom src import new_mod as target\n\nsys.modules[__name__] = target\n'
@@ -251,3 +255,55 @@ class TestResolveCommit:
 
     def test_non_repo_dir_is_none(self, tmp_path):
         assert resolve_commit(tmp_path, 'main') is None
+
+
+_STALE_TABLE = [
+    ('grep', PathState.LIVE, False),
+    ('grep', PathState.SYS_MODULES_SHIM, True),
+    ('grep', PathState.REMOVED, True),
+    ('grep', PathState.NEVER_EXISTED, False),
+    ('path', PathState.LIVE, False),
+    ('path', PathState.SYS_MODULES_SHIM, False),
+    ('path', PathState.REMOVED, True),
+    ('path', PathState.NEVER_EXISTED, False),
+]
+
+
+class TestStaleScopePolicy:
+    """The single staleness policy: only expect='present' checks are subject;
+    a grep is stale on a shim or a removed path, a path check only on a removed
+    one (a shim is a real file, and deleting one is a legitimate capability)."""
+
+    @pytest.mark.parametrize(('kind', 'state', 'stale'), _STALE_TABLE)
+    def test_present_checks_follow_the_per_kind_table(self, kind, state, stale):
+        scope = ScopePath('src/x.py', state)
+
+        assert stale_scope_paths(kind, 'present', [scope]) == ((scope,) if stale else ())
+
+    @pytest.mark.parametrize('expect', ['absent', None, 'bogus'])
+    @pytest.mark.parametrize(('kind', 'state', '_stale'), _STALE_TABLE)
+    def test_non_present_expect_is_never_stale(self, kind, state, _stale, expect):
+        assert stale_scope_paths(kind, expect, [ScopePath('src/x.py', state)]) == ()
+
+    @pytest.mark.parametrize('kind', ['script', None, ['grep']])
+    def test_other_kinds_are_never_stale_and_never_raise(self, kind):
+        scope = ScopePath('src/x.py', PathState.REMOVED)
+
+        assert stale_scope_paths(kind, 'present', [scope]) == ()
+
+    def test_result_keeps_input_order_and_the_scope_objects_themselves(self):
+        gone = ScopePath('src/gone.py', PathState.REMOVED, 'abc1234 drop it')
+        live = ScopePath('src/live.py', PathState.LIVE)
+        shim = ScopePath('src/old_mod.py', PathState.SYS_MODULES_SHIM)
+
+        result = stale_scope_paths('grep', 'present', [shim, live, gone])
+
+        assert result == (shim, gone)
+        assert result[0] is shim
+        assert result[1] is gone
+
+    def test_stale_path_codes_name_exactly_the_two_stale_states(self):
+        assert dict(STALE_PATH_CODES) == {
+            PathState.SYS_MODULES_SHIM: 'shim_path',
+            PathState.REMOVED: 'removed_path',
+        }
