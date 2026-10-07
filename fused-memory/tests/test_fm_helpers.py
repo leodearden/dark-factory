@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 import json
+import subprocess
 import sys
 import types
 from unittest.mock import AsyncMock, MagicMock
@@ -2158,6 +2159,72 @@ class TestAwaitIndexOperational:
 
         with pytest.raises(AssertionError, match='not OPERATIONAL'):
             await await_index_operational(graph, timeout_s=0.05)
+
+
+# ---------------------------------------------------------------------------
+# Tests for the shared provenance git-repo builders (task 4847)
+# ---------------------------------------------------------------------------
+# Real git repos in tmp_path, read back through git itself, so the commit graph
+# test_stages.py's done-provenance tests rely on is pinned by observation.
+
+def _git_out(path, *args) -> str:
+    return subprocess.run(
+        ['git', '-C', str(path), *args], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+class TestProvenanceRepoBuilders:
+    """Unit tests for init_ab_commit_repo(path) and init_merge_history_repo(path)."""
+
+    def test_ab_commit_repo_is_one_root_commit_on_main_adding_a_and_b(self, tmp_path):
+        from _fm_helpers import init_ab_commit_repo
+
+        sha = init_ab_commit_repo(tmp_path)
+
+        assert sha == _git_out(tmp_path, 'rev-parse', 'main')
+        assert _git_out(tmp_path, 'rev-list', '--count', 'main') == '1'
+        assert _git_out(tmp_path, 'ls-tree', '-r', '--name-only', sha).splitlines() == [
+            'a.txt',
+            'b.txt',
+        ]
+        assert _git_out(tmp_path, 'config', '--get', 'commit.gpgsign') == 'false'
+
+    def test_merge_history_single_is_the_ab_commit_prefix(self, tmp_path):
+        from _fm_helpers import init_ab_commit_repo, init_merge_history_repo
+
+        merge_repo = tmp_path / 'm'
+        prefix_repo = tmp_path / 'p'
+        shas = init_merge_history_repo(merge_repo)
+        prefix_sha = init_ab_commit_repo(prefix_repo)
+
+        assert set(shas) == {'single', 'merge', 'conflict_merge'}
+        single = shas['single']
+        assert len(_git_out(merge_repo, 'rev-list', '--parents', '-n', '1', single).split()) == 1
+        assert _git_out(merge_repo, 'rev-parse', f'{single}^{{tree}}') == _git_out(
+            prefix_repo, 'rev-parse', f'{prefix_sha}^{{tree}}'
+        )
+
+    def test_merge_history_merges_report_full_first_parent_file_lists(self, tmp_path):
+        from _fm_helpers import init_merge_history_repo
+
+        shas = init_merge_history_repo(tmp_path)
+        merge, conflict_merge = shas['merge'], shas['conflict_merge']
+
+        for sha in (merge, conflict_merge):
+            parents = _git_out(tmp_path, 'rev-list', '--parents', '-n', '1', sha).split()[1:]
+            assert len(parents) == 2, f'{sha} must be a two-parent merge, got {parents}'
+        assert _git_out(tmp_path, 'rev-parse', f'{merge}^1') == shas['single']
+        merge_files = set(
+            _git_out(tmp_path, 'diff', '--name-only', f'{merge}^1', merge).splitlines()
+        )
+        assert merge_files == {'feature.py', *(f'extra_{i}.py' for i in range(1, 5))}
+        conflict_files = set(
+            _git_out(
+                tmp_path, 'diff', '--name-only', f'{conflict_merge}^1', conflict_merge
+            ).splitlines()
+        )
+        assert {'a.txt', 'conflict_only.py'} <= conflict_files
+        assert _git_out(tmp_path, 'rev-parse', 'main') == conflict_merge
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,8 @@ from _fm_helpers import (
     as_async_run_git,
     assert_id_title_pairing,
     complete_paged_read,
+    init_ab_commit_repo,
+    init_merge_history_repo,
     make_8df8_scenario,
 )
 from _fused_memory_tool_surface import (
@@ -1721,139 +1723,10 @@ class TestDoneProvenanceSection:
             'scope': _scope('test_project', '/tmp/test'),
         }
 
-    @staticmethod
-    def _init_repo(path):
-        import subprocess
-        subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
-        subprocess.run(
-            ['git', '-C', str(path), 'config', 'user.email', 't@e.example'], check=True,
-        )
-        subprocess.run(
-            ['git', '-C', str(path), 'config', 'user.name', 'T'], check=True,
-        )
-        (path / 'a.txt').write_text('a\n')
-        (path / 'b.txt').write_text('b\n')
-        subprocess.run(['git', '-C', str(path), 'add', '-A'], check=True)
-        subprocess.run(
-            ['git', '-C', str(path), 'commit', '-q', '-m', 'feat: ship a + b'],
-            check=True,
-        )
-        return subprocess.run(
-            ['git', '-C', str(path), 'rev-parse', 'HEAD'],
-            check=True, capture_output=True, text=True,
-        ).stdout.strip()
-
-    @staticmethod
-    def _init_repo_with_merge(path):
-        """Build a repo with a single-parent commit, a clean --no-ff merge,
-        and a --no-ff merge that resolves a real conflict.
-
-        Commit graph on ``main``:
-
-          1. ``single`` — adds a.txt + b.txt (a genuine single-parent commit,
-             used to pin ``--first-parent -m`` as a no-op on non-merge commits).
-          2. a ``feature`` branch off commit 1 adds feature.py plus
-             extra_1.py..extra_4.py (five files total, so max_files
-             truncation is reachable for merge provenance — see
-             test_merge_commit_file_list_respects_max_files_truncation);
-             main then merges it via ``git merge --no-ff`` — recorded as
-             ``merge``. Plain ``git show --name-only`` reports NOTHING for
-             this commit (git's combined diff is empty for a clean merge);
-             this is the fixture that reproduces the Stage-2 provenance bug.
-          3. a ``conflict`` branch off commit 1 edits a.txt and adds
-             conflict_only.py; main separately edits a.txt after ``merge``.
-             Merging ``conflict`` into main therefore CONFLICTS on a.txt —
-             resolved by hand and committed, recorded as ``conflict_merge``.
-             This pins the OTHER, worse symptom the task's analysis found:
-             plain ``git show --name-only`` on a merge that resolved a
-             conflict reports ONLY the conflict-resolution file(s), silently
-             omitting every non-conflicting file the branch also brought in
-             (measured on this repo's own history: commit a75568bd11 showed
-             1 file under the bare invocation vs. 6 real first-parent files,
-             none of which was that 1 file — see
-             test_merge_commit_with_resolved_conflict_reports_full_first_parent_file_list).
-             ``conflict_only.py`` deliberately does NOT reuse the
-             feature/extra_* names from scenario 2: this branch forks off
-             ``single`` (before the feature merge), so those names are free
-             to reuse on disk, but doing so would make feature.py conflict
-             too (both sides would have independently "added" it), muddying
-             the one conflict this scenario needs.
-
-        Mirrors the branch/merge sequence in
-        fused-memory/tests/test_audit_found_on_main_provenance.py::_build_test_repo,
-        including its defensive ``commit.gpgsign false`` + ``--no-verify`` on
-        every commit, so a developer's global gpgsign setting or a stray hook
-        can't hang or fail this throwaway repo.
-
-        Returns a dict of full 40-char SHAs:
-        ``{'single': ..., 'merge': ..., 'conflict_merge': ...}``.
-        Does NOT modify ``_init_repo`` — five pre-existing tests depend on its
-        exact linear shape and single-SHA return value.
-        """
-        import subprocess
-
-        def _git(*args):
-            return subprocess.run(
-                ['git', '-C', str(path), *args], check=True, capture_output=True, text=True,
-            ).stdout.strip()
-
-        subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
-        _git('config', 'user.email', 't@e.example')
-        _git('config', 'user.name', 'T')
-        _git('config', 'commit.gpgsign', 'false')
-
-        (path / 'a.txt').write_text('a\n')
-        (path / 'b.txt').write_text('b\n')
-        _git('add', '-A')
-        _git('commit', '-q', '--no-verify', '-m', 'feat: ship a + b')
-        single = _git('rev-parse', 'HEAD')
-
-        _git('checkout', '-q', '-b', 'feature')
-        (path / 'feature.py').write_text('feature = 1\n')
-        for i in range(1, 5):
-            (path / f'extra_{i}.py').write_text(f'extra_{i} = 1\n')
-        _git('add', '-A')
-        _git('commit', '-q', '--no-verify', '-m', 'feat: add feature')
-        _git('checkout', '-q', 'main')
-        _git('merge', '--no-ff', '--no-verify', '-q', '-m', 'Merge feature into main', 'feature')
-        merge = _git('rev-parse', 'HEAD')
-
-        # A second branch that edits a.txt independently of main's own later
-        # edit of the same file — merging it conflicts, exercising the
-        # (worse) symptom where a bare `git show` on a resolved-conflict
-        # merge reports only the conflicted path and hides everything else.
-        _git('checkout', '-q', '-b', 'conflict', single)
-        (path / 'a.txt').write_text('a-conflict-branch\n')
-        (path / 'conflict_only.py').write_text('conflict_only = 1\n')
-        _git('add', '-A')
-        _git('commit', '-q', '--no-verify', '-m', 'feat: edit a.txt on conflict branch')
-        _git('checkout', '-q', 'main')
-        (path / 'a.txt').write_text('a-main-edit\n')
-        _git('add', '-A')
-        _git('commit', '-q', '--no-verify', '-m', 'chore: edit a.txt on main after feature merge')
-
-        # Deliberately not using `_git` (check=True): a real conflict makes
-        # `git merge` exit 1 and leave conflict markers instead of a commit.
-        conflict_result = subprocess.run(
-            ['git', '-C', str(path), 'merge', '--no-ff', '--no-verify', '-q',
-             '-m', 'Merge conflict into main', 'conflict'],
-            capture_output=True, text=True,
-        )
-        assert conflict_result.returncode != 0, (
-            'expected a.txt to conflict (both branches edited it since the '
-            'common ancestor); merge unexpectedly succeeded cleanly'
-        )
-        (path / 'a.txt').write_text('a-resolved\n')
-        _git('add', 'a.txt')
-        _git('commit', '-q', '--no-verify', '-m', 'Merge conflict into main (resolved)')
-        conflict_merge = _git('rev-parse', 'HEAD')
-
-        return {'single': single, 'merge': merge, 'conflict_merge': conflict_merge}
-
     @pytest.mark.asyncio
     async def test_commit_provenance_renders_file_list(self, mock_deps, tmp_path):
         """Task with commit provenance → git show file list injected."""
-        sha = self._init_repo(tmp_path)
+        sha = init_ab_commit_repo(tmp_path)
         stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='p', project_root=str(tmp_path))
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [{
@@ -1916,7 +1789,7 @@ class TestDoneProvenanceSection:
     @pytest.mark.asyncio
     async def test_invalid_commit_gracefully_omits_file_list(self, mock_deps, tmp_path):
         """Unresolvable commit → section header emitted, no file list, no exception."""
-        self._init_repo(tmp_path)
+        init_ab_commit_repo(tmp_path)
         stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='p', project_root=str(tmp_path))
         bad = 'deadbeef' * 5  # 40 chars but not a real SHA
         mock_deps['taskmaster'].get_tasks.return_value = {
@@ -1958,7 +1831,7 @@ class TestDoneProvenanceSection:
         against a misleading conflict-only subset naming files the task
         never actually touched.
         """
-        shas = self._init_repo_with_merge(tmp_path)
+        shas = init_merge_history_repo(tmp_path)
 
         block = await _git_show_name_only(
             ProjectRoot(str(tmp_path)), shas['merge'], max_files=50, max_chars=2000,
@@ -2010,7 +1883,7 @@ class TestDoneProvenanceSection:
         (which does not conflict). The first-parent file list for the
         resolved merge must contain BOTH — not just the conflicted a.txt.
         """
-        shas = self._init_repo_with_merge(tmp_path)
+        shas = init_merge_history_repo(tmp_path)
 
         block = await _git_show_name_only(
             ProjectRoot(str(tmp_path)), shas['conflict_merge'], max_files=50, max_chars=2000,
@@ -2043,7 +1916,7 @@ class TestDoneProvenanceSection:
         ``-m``, which is exactly the change that would reintroduce
         per-parent diffs and duplicate/bogus paths.
         """
-        shas = self._init_repo_with_merge(tmp_path)
+        shas = init_merge_history_repo(tmp_path)
 
         block = await _git_show_name_only(
             ProjectRoot(str(tmp_path)), shas['merge'], max_files=50, max_chars=2000,
@@ -2080,7 +1953,7 @@ class TestDoneProvenanceSection:
         derived from it, so it kept passing regardless of what the helper's
         actual argv was and pinned nothing about the implementation.)
         """
-        shas = self._init_repo_with_merge(tmp_path)
+        shas = init_merge_history_repo(tmp_path)
 
         block = await _git_show_name_only(
             ProjectRoot(str(tmp_path)), shas['single'], max_files=50, max_chars=2000,
@@ -2103,7 +1976,7 @@ class TestDoneProvenanceSection:
         helper directly). Before the argv fix, this section rendered
         `commit: <sha>` with no `files:` entries at all for a clean merge.
         """
-        shas = self._init_repo_with_merge(tmp_path)
+        shas = init_merge_history_repo(tmp_path)
         stage = make_configured_task_knowledge_sync_stage(mock_deps, project_id='p', project_root=str(tmp_path))
         mock_deps['taskmaster'].get_tasks.return_value = {
             'tasks': [{
@@ -2131,7 +2004,7 @@ class TestDoneProvenanceSection:
         the test naturally — no pytest.raises is used because none should
         ever fire.
         """
-        shas = self._init_repo_with_merge(tmp_path)
+        shas = init_merge_history_repo(tmp_path)
         bad_sha = 'deadbeef' * 5  # 40 chars but not a real SHA
 
         # rc != 0 path — well-formed but unresolvable commit against a real repo.
@@ -2162,7 +2035,7 @@ class TestDoneProvenanceSection:
         `... (N more)` marker — pinning that the marker isn't silently
         dropped now that it can actually fire for a merge.
         """
-        shas = self._init_repo_with_merge(tmp_path)
+        shas = init_merge_history_repo(tmp_path)
 
         block = await _git_show_name_only(
             ProjectRoot(str(tmp_path)), shas['merge'], max_files=2, max_chars=2000,
