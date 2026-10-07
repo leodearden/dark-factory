@@ -20,7 +20,7 @@ import json
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -71,59 +71,12 @@ _IMPORT_GRAPH_KEYS = ('edges', 'reach_back', 'deferred', 'cycles')
 
 
 @dataclasses.dataclass(frozen=True)
-class _ImportStatement:
-    node: ast.Import | ast.ImportFrom
-    line: int
-    runtime: bool  # False inside an `if TYPE_CHECKING:` body
-    deferred: bool  # inside a function body
-
-
-@dataclasses.dataclass(frozen=True)
 class _FileImports:
     """One readable domain file's import statements; ``module`` is None for a tests file."""
 
     module: str | None
     is_package: bool
-    statements: tuple[_ImportStatement, ...]
-
-
-def _is_type_checking(test: ast.expr) -> bool:
-    return (isinstance(test, ast.Name) and test.id == 'TYPE_CHECKING') or (
-        isinstance(test, ast.Attribute) and test.attr == 'TYPE_CHECKING'
-    )
-
-
-def _nested_bodies(node: ast.stmt) -> Iterator[list[ast.stmt]]:
-    """The statement lists directly inside *node*, in source order."""
-    for _field, value in ast.iter_fields(node):
-        if not isinstance(value, list) or not value:
-            continue
-        if isinstance(value[0], ast.stmt):
-            yield value
-        elif isinstance(value[0], ast.ExceptHandler | ast.match_case):
-            for clause in value:
-                yield clause.body
-
-
-def _statements_in(
-    body: Sequence[ast.stmt], *, runtime: bool, deferred: bool
-) -> Iterator[_ImportStatement]:
-    for node in body:
-        if isinstance(node, ast.Import | ast.ImportFrom):
-            yield _ImportStatement(node, node.lineno, runtime=runtime, deferred=deferred)
-        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-            yield from _statements_in(node.body, runtime=runtime, deferred=True)
-        elif isinstance(node, ast.If) and _is_type_checking(node.test):
-            yield from _statements_in(node.body, runtime=False, deferred=deferred)
-            yield from _statements_in(node.orelse, runtime=runtime, deferred=deferred)
-        else:
-            for nested in _nested_bodies(node):
-                yield from _statements_in(nested, runtime=runtime, deferred=deferred)
-
-
-def _import_statements(tree: ast.Module) -> tuple[_ImportStatement, ...]:
-    """Every import statement in *tree*, in source order, with its context."""
-    return tuple(_statements_in(tree.body, runtime=True, deferred=False))
+    statements: tuple[source_measures.ImportStatement, ...]
 
 
 def _from_base(importer: str, is_package: bool, level: int, module: str | None) -> str | None:
@@ -159,7 +112,7 @@ def _from_targets(node: ast.ImportFrom, resolved: str | None, known: frozenset[s
 
 
 def _targets(
-    statement: _ImportStatement, source: _FileImports, known: frozenset[str]
+    statement: source_measures.ImportStatement, source: _FileImports, known: frozenset[str]
 ) -> tuple[str, ...]:
     """The first-party src modules *statement* imports, its own module excluded."""
     node = statement.node
@@ -177,7 +130,7 @@ def _ancestor_packages(module: str, known: frozenset[str]) -> frozenset[str]:
 
 
 def _reach_back(
-    statement: _ImportStatement, module: str, source: _FileImports, known: frozenset[str]
+    statement: source_measures.ImportStatement, module: str, source: _FileImports, known: frozenset[str]
 ) -> dict[str, Any] | None:
     """A from-import of names (not submodules) out of an ancestor package, or None."""
     node = statement.node
@@ -192,7 +145,7 @@ def _reach_back(
     return {'from': module, 'to': resolved, 'names': names, 'line': statement.line}
 
 
-def _imported_names(statement: _ImportStatement, source: _FileImports) -> list[str]:
+def _imported_names(statement: source_measures.ImportStatement, source: _FileImports) -> list[str]:
     """The dotted names *statement* imports, as resolved as they can be."""
     node = statement.node
     if isinstance(node, ast.Import):
@@ -205,7 +158,7 @@ def _imported_names(statement: _ImportStatement, source: _FileImports) -> list[s
 
 
 def _deferred_entry(
-    statement: _ImportStatement, module: str, source: _FileImports
+    statement: source_measures.ImportStatement, module: str, source: _FileImports
 ) -> dict[str, Any]:
     return {
         'from': module,
@@ -437,7 +390,7 @@ def _measure_file(
     imports = _FileImports(
         module=domain_file.import_name,
         is_package=_is_package_init(path),
-        statements=_import_statements(tree),
+        statements=source_measures.import_statements_in_tree(tree),
     )
     return _FileMeasure(record=record, per_function=per_function, imports=imports)
 

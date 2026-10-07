@@ -340,6 +340,26 @@ _RELATIVE: dict[str, str] = {
     'scripts/z.py': 'from . import q\n',
 }
 
+#: Six function-local imports, each in a different place inside a function; one class-level import.
+_DEFERRED_SHAPES = (
+    'from typing import TYPE_CHECKING\n'
+    'def outer():\n'
+    '    def inner():\n'
+    '        import os\n'
+    '    class Local:\n'
+    '        from alpha import mod\n'
+    '    try:\n'
+    '        import json\n'
+    '    except ImportError:\n'
+    '        from alpha import mod as m2\n'
+    '    if TYPE_CHECKING:\n'
+    '        import typing\n'
+    'class C:\n'
+    '    import sys\n'
+    '    def m(self):\n'
+    '        import re\n'
+)
+
 
 class TestTheImportGraph:
     @pytest.fixture
@@ -384,6 +404,16 @@ class TestTheImportGraph:
             len([entry for entry in deferred if entry['from'] == 'e'])
             == measured['files']['alpha/src/e.py']['function_local_imports']
         )
+
+    def test_each_src_records_function_local_imports_are_its_deferred_entries(
+        self, tmp_path: Path
+    ) -> None:
+        measured = _measured(tmp_path, {**_BASE, 'alpha/src/alpha/late.py': _DEFERRED_SHAPES})
+        deferred_from = [entry['from'] for entry in measured['import_graph']['deferred']]
+        src_records = [r for r in measured['files'].values() if r['kind'] == 'src']
+        for record in src_records:
+            assert record['function_local_imports'] == deferred_from.count(record['module'])
+        assert measured['files']['alpha/src/alpha/late.py']['function_local_imports'] == 6
 
     def test_the_per_file_graph_fields(self, measured: dict[str, Any]) -> None:
         files = measured['files']

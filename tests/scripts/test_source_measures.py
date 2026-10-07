@@ -184,6 +184,44 @@ class TestFunctionLocalImports:
         assert 'broken.py' in str(excinfo.value)
 
 
+class TestImportStatements:
+    def test_each_statement_carries_whether_it_runs_and_whether_it_is_deferred(self) -> None:
+        source = (
+            'import a\n'
+            'from typing import TYPE_CHECKING\n'
+            'if TYPE_CHECKING:\n'
+            '    import b\n'
+            'else:\n'
+            '    import c\n'
+            'class C:\n'
+            '    import d\n'
+            'def f():\n'
+            '    import e\n'
+            '    if typing.TYPE_CHECKING:\n'
+            '        import g\n'
+            '    class Local:\n'
+            '        import h\n'
+        )
+        statements = source_measures.import_statements_in_tree(ast.parse(source))
+        assert [(s.line, s.runtime, s.deferred) for s in statements] == [
+            (1, True, False),
+            (2, True, False),
+            (4, False, False),
+            (6, True, False),
+            (8, True, False),
+            (10, True, True),
+            (12, False, True),
+            (14, True, True),
+        ]
+
+    def test_the_function_local_count_is_the_deferred_statements(self) -> None:
+        source = 'import a\n\ndef f():\n    import b\n    def g():\n        from c import d\n'
+        tree = ast.parse(source)
+        deferred = [s for s in source_measures.import_statements_in_tree(tree) if s.deferred]
+        assert [s.line for s in deferred] == [4, 6]
+        assert source_measures.function_local_imports_in_tree(tree) == len(deferred)
+
+
 class TestReexportNames:
     def test_unreferenced_module_level_import_from_names_are_reexports(self) -> None:
         source = 'from a import (B, C)\n'
