@@ -1,8 +1,8 @@
 // Module-contract tests for system_health.js: the Overview's System health
 // panel status decisions. Each row's tone comes from a served field, and the
-// header comes from the rows. tab_overview.jsx only spreads these rows; its
-// WIRING is pinned structurally in Python (test_tab_overview.py
-// TestSystemHealthIsDerived).
+// header comes from the rows. tab_overview.jsx only spreads these rows (the
+// Write queue row's from memory_readings.js::queueHealth); its WIRING is
+// pinned structurally in Python (test_tab_overview.py TestSystemHealthIsDerived).
 //
 // Run via `node --test` (dashboard/tests/test_graph_layout_js.py's
 // `**/*.test.mjs` glob auto-discovers this file).
@@ -20,38 +20,46 @@ import { createRequire } from 'node:module';
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
 
 const REDUX = '../../src/dashboard/static/redux/';
-const LOAD_CHAIN = ['datum.js', 'data.js', 'tasks_offline_banner.js', 'system_health.js'].map(
-  name => REDUX + name,
-);
+const LOAD_CHAIN = [
+  'datum.js', 'data.js', 'tasks_offline_banner.js', 'memory_readings.js', 'system_health.js',
+].map(name => REDUX + name);
 
 function loadSystemHealth() {
   globalThis.window = { DF_ENDPOINT_STALENESS: staleness, dispatchEvent() {} };
   const require = createRequire(import.meta.url);
   for (const specifier of LOAD_CHAIN) delete require.cache[require.resolve(specifier)];
-  const [datumApi, , bannerApi, healthApi] = LOAD_CHAIN.map(specifier => require(specifier));
+  const [datumApi, , bannerApi, readingsApi, healthApi] = LOAD_CHAIN.map(specifier => require(specifier));
   const seed = globalThis.window.DF_DATA;
   delete globalThis.window;
-  return { datum: datumApi, banner: bannerApi, health: healthApi, seed };
+  return { datum: datumApi, banner: bannerApi, readings: readingsApi, health: healthApi, seed };
 }
 
-const { datum, banner, health, seed } = loadSystemHealth();
+const { datum, banner, readings, health, seed } = loadSystemHealth();
 const {
   graphitiHealth,
   mem0Health,
   taskStoreHealth,
   fusedMemoryHealth,
+  reconHealth,
+  walHealth,
   healthTone,
   healthSummary,
 } = health;
 const { EM_DASH } = datum;
 const { tasksBannerNoticesFor } = banner;
+const { writeQueue, queueHealth } = readings;
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
 const MEMORY_ENDPOINT = '/api/v2/dashboard/memory';
 const TASKS_ENDPOINT = '/api/v2/dashboard/tasks';
+const RECON_ENDPOINT = '/api/v2/dashboard/recon';
 const RECEIPT = Object.freeze({ servedAt: '2026-10-07T12:00:30+00:00', receivedAt: 1_800_000_000_000 });
-const DELIVERED = Object.freeze({ [MEMORY_ENDPOINT]: RECEIPT, [TASKS_ENDPOINT]: RECEIPT });
+const DELIVERED = Object.freeze({
+  [MEMORY_ENDPOINT]: RECEIPT,
+  [TASKS_ENDPOINT]: RECEIPT,
+  [RECON_ENDPOINT]: RECEIPT,
+});
 
 const UNMEASURED = Object.freeze({ sub: EM_DASH, ok: true, warn: true, title: 'not yet fetched' });
 
@@ -61,6 +69,21 @@ function memoryData(memoryStatus, receipts = DELIVERED) {
 
 function tasksData(tasksKeys, receipts = DELIVERED) {
   return { ...tasksKeys, __receipt: receipts };
+}
+
+function reconData(verdict, receipts = DELIVERED) {
+  return { RECON_STATE: { verdict }, __receipt: receipts };
+}
+
+function walData(wal, receipts = DELIVERED) {
+  return memoryData({ wal }, receipts);
+}
+
+function assertUnmeasuredWithReason(row) {
+  assert.equal(row.sub, EM_DASH);
+  assert.equal(healthTone(row), 'warn');
+  assert.equal(typeof row.title, 'string');
+  assert.ok(row.title.length > 0);
 }
 
 const STORE_HEALTH = [
@@ -212,6 +235,86 @@ test('fusedMemory: never returns a sub, so spreading it after the JSX\'s own sub
   for (const data of cases) assert.ok(!('sub' in fusedMemoryHealth(data)));
 });
 
+// ── reconHealth: the newest judge verdict ───────────────────────────────────
+
+test('recon: before /recon has delivered the row is unmeasured', () => {
+  assert.deepEqual(reconHealth(reconData(null, {})), UNMEASURED);
+});
+
+test('recon: a delivered payload with no verdict is unmeasured, not green', () => {
+  assertUnmeasuredWithReason(reconHealth(reconData(null)));
+});
+
+test('recon: a clean verdict is green and states the severity and action', () => {
+  assert.deepEqual(reconHealth(reconData({ severity: 'none', action_taken: 'none', is_phantom: false })), {
+    sub: 'verdict: none · none',
+    ok: true,
+    warn: false,
+  });
+});
+
+test('recon: a minor verdict is amber', () => {
+  const row = reconHealth(reconData({ severity: 'minor', action_taken: 'logged', is_phantom: false }));
+  assert.equal(row.sub, 'verdict: minor · logged');
+  assert.equal(healthTone(row), 'warn');
+});
+
+test('recon: a serious verdict is red', () => {
+  const row = reconHealth(reconData({ severity: 'serious', action_taken: 'halt', is_phantom: false }));
+  assert.equal(row.sub, 'verdict: serious · halt');
+  assert.equal(healthTone(row), 'bad');
+});
+
+test('recon: a phantom verdict is amber and says unreviewed, never "serious"', () => {
+  const row = reconHealth(reconData({ severity: 'serious', action_taken: 'halt', is_phantom: true }));
+  assert.equal(healthTone(row), 'warn');
+  assert.ok(row.sub.includes('unreviewed'), row.sub);
+  assert.ok(!row.sub.includes('serious'), row.sub);
+  assert.ok(row.sub.endsWith('· halt'), row.sub);
+});
+
+// ── walHealth: the SQLite WAL panel status /memory serves ───────────────────
+
+test('wal: before /memory has delivered the row is unmeasured', () => {
+  assert.deepEqual(walHealth(walData({ status: 'offline', reason: null, rows: [] }, {})), UNMEASURED);
+});
+
+test('wal: ok over measured stores is green and counts them', () => {
+  assert.deepEqual(walHealth(walData({ status: 'ok', reason: null, rows: [{}, {}] })), {
+    sub: '2 stores · all current',
+    ok: true,
+    warn: false,
+  });
+  assert.equal(walHealth(walData({ status: 'ok', reason: null, rows: [{}] })).sub, '1 store · all current');
+});
+
+test('wal: ok over no stores is unmeasured, not green', () => {
+  assertUnmeasuredWithReason(walHealth(walData({ status: 'ok', reason: null, rows: [] })));
+});
+
+test('wal: warn is amber and red is red, each stating the served reason', () => {
+  assert.deepEqual(walHealth(walData({ status: 'warn', reason: 'main: log=6000 frames', rows: [{}] })), {
+    sub: 'main: log=6000 frames',
+    ok: true,
+    warn: true,
+  });
+  assert.deepEqual(walHealth(walData({ status: 'red', reason: 'main: busy=1', rows: [{}] })), {
+    sub: 'main: busy=1',
+    ok: false,
+    warn: false,
+  });
+});
+
+test('wal: an unreachable WAL probe is unmeasured, never red, and the title carries why', () => {
+  const row = walHealth(walData({ status: 'offline', reason: 'ConnectError: refused', rows: [] }));
+  assertUnmeasuredWithReason(row);
+  assert.equal(row.title, 'ConnectError: refused');
+});
+
+test('wal: a MEMORY_STATUS lacking the wal block entirely does not throw', () => {
+  assertUnmeasuredWithReason(walHealth(memoryData({})));
+});
+
 // ── healthTone / healthSummary ──────────────────────────────────────────────
 
 test('healthTone: red outranks amber; amber needs ok; green needs neither fault', () => {
@@ -245,9 +348,17 @@ test('healthSummary: no rows is a hole, not "all ok"', () => {
   assert.equal(healthSummary([]), EM_DASH);
 });
 
-test('healthSummary: the pre-fetch seed is NOT "all ok" — nothing has been measured yet', () => {
+test('healthSummary: every row of the pre-fetch seed is amber — nothing has been measured yet', () => {
   assert.deepEqual(seed.__receipt, {}, 'precondition: the seed carries no receipt');
-  const rows = [graphitiHealth(seed), mem0Health(seed), taskStoreHealth(seed), fusedMemoryHealth(seed)];
+  const rows = [
+    graphitiHealth(seed),
+    mem0Health(seed),
+    taskStoreHealth(seed),
+    fusedMemoryHealth(seed),
+    queueHealth(writeQueue(seed)),
+    reconHealth(seed),
+    walHealth(seed),
+  ];
   for (const row of rows) assert.equal(healthTone(row), 'warn', JSON.stringify(row));
-  assert.notEqual(healthSummary(rows), 'all ok');
+  assert.equal(healthSummary(rows), rows.length + ' warn');
 });

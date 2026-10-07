@@ -1,6 +1,9 @@
-// system_health.js — the System health panel's status decisions: each row's
-// tone from a served field, and the header those rows imply. tab_overview.jsx
-// spreads these rows into its panel and decides none of them itself.
+// system_health.js — the System health panel's status decisions: the Graphiti,
+// Mem0, Taskmaster, fused-memory, Reconciliation and SQLite WAL rows, each
+// from a served field, and the header that every row implies. The Write queue
+// row is memory_readings.js::queueHealth's, and the fused-memory uptime sub is
+// formatted in tab_overview.jsx, since DF_SHELL.fmtUptime lives in JSX. Every
+// row follows one rule: unmeasured is amber.
 //
 // A PLAIN-JS CLASSIC SCRIPT, NOT A .jsx MODULE, so its decisions are
 // EXECUTABLE: dashboard/tests/js/system_health.test.mjs runs them.
@@ -22,6 +25,7 @@ const { tasksBannerNoticesFor: taskStoreNotices } = window.DF_TASKS_OFFLINE_BANN
 
 const HEALTH_MEMORY_ENDPOINT = '/api/v2/dashboard/memory';
 const HEALTH_TASKS_ENDPOINT = '/api/v2/dashboard/tasks';
+const HEALTH_RECON_ENDPOINT = '/api/v2/dashboard/recon';
 
 // Red first: the header names the worst news first.
 const HEALTH_FAULT_TONES = Object.freeze(['bad', 'warn']);
@@ -117,6 +121,48 @@ function fusedMemoryHealth(data) {
   return { ok: true, warn: false, title: status.started_at };
 }
 
+// ── Reconciliation: the newest judge verdict ──
+// A null verdict is a missing journal, a failed read or no review yet
+// (reconciliation.py::get_latest_verdict); none of those measured anything.
+// A phantom (shared.phantom_verdict) is the judge's placeholder for output it
+// could not parse, stored as 'serious': the run went unreviewed, which is amber,
+// but no judge found anything serious.
+
+function reconHealth(data) {
+  const hole = undeliveredHole(data, HEALTH_RECON_ENDPOINT);
+  if (hole) return unmeasuredRow(hole.reason);
+
+  const verdict = (data.RECON_STATE || {}).verdict;
+  if (!verdict) return unmeasuredRow('no judge verdict served: none recorded, or the verdict read failed');
+
+  const action = verdict.action_taken || 'none';
+  if (verdict.is_phantom) {
+    return { sub: 'verdict: unreviewed (unparseable judge output) · ' + action, ok: true, warn: true };
+  }
+  const severity = verdict.severity || 'none';
+  return { sub: 'verdict: ' + severity + ' · ' + action, ok: severity !== 'serious', warn: severity === 'minor' };
+}
+
+// ── SQLite WAL: the panel status redux_api.py::_shape_wal_status serves ──
+// 'offline' means the WAL probe went unanswered, and 'ok' over no stores
+// measured nothing: both are unmeasured.
+
+function storesCurrent(count) {
+  return count + (count === 1 ? ' store' : ' stores') + ' · all current';
+}
+
+function walHealth(data) {
+  const hole = undeliveredHole(data, HEALTH_MEMORY_ENDPOINT);
+  if (hole) return unmeasuredRow(hole.reason);
+
+  const wal = healthMemoryStatus(data).wal || {};
+  const storeCount = (wal.rows || []).length;
+  if (wal.status === 'red') return { sub: wal.reason, ok: false, warn: false };
+  if (wal.status === 'warn') return { sub: wal.reason, ok: true, warn: true };
+  if (wal.status === 'ok' && storeCount > 0) return { sub: storesCurrent(storeCount), ok: true, warn: false };
+  return unmeasuredRow(wal.reason || 'fused-memory reported no WAL stores');
+}
+
 // ── The one row -> tone mapping, read by the dot, the badge and the header ──
 
 function healthTone(row) {
@@ -141,6 +187,8 @@ const SYSTEM_HEALTH_API = {
   mem0Health,
   taskStoreHealth,
   fusedMemoryHealth,
+  reconHealth,
+  walHealth,
   healthTone,
   healthSummary,
 };
