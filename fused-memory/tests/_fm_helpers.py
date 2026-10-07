@@ -1667,62 +1667,53 @@ async def collection_vector_size(
 # ---------------------------------------------------------------------------
 
 
-def _init_git_repo(path) -> str:
-    """Create a minimal git repo at path with one commit; return full SHA.
+def git_stdout(path, *args) -> str:
+    """Run ``git -C <path> <args>``; return its stripped stdout.
 
-    Shared by test_task_interceptor.py and test_status_authority_gate.py: a
-    ``done_provenance={'kind': 'merged', 'commit': ...}`` write needs a real
-    ``main`` branch for the interceptor's ``_verify_commit_on_main`` ancestor
-    backstop (``git merge-base --is-ancestor <sha> main``) to resolve against.
+    Raises CalledProcessError on a non-zero exit.
     """
-    import subprocess
-
-    subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
-    subprocess.run(
-        ['git', '-C', str(path), 'config', 'user.email', 't@e.example'],
-        check=True,
-    )
-    subprocess.run(
-        ['git', '-C', str(path), 'config', 'user.name', 'T'],
-        check=True,
-    )
-    (path / 'seed.txt').write_text('seed\n')
-    subprocess.run(['git', '-C', str(path), 'add', '-A'], check=True)
-    subprocess.run(
-        ['git', '-C', str(path), 'commit', '-q', '-m', 'seed'],
-        check=True,
-    )
-    return subprocess.run(
-        ['git', '-C', str(path), 'rev-parse', 'HEAD'],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-
-
-def _run_git(path, *args) -> str:
     return subprocess.run(
         ['git', '-C', str(path), *args], check=True, capture_output=True, text=True,
     ).stdout.strip()
+
+
+def _init_single_commit_repo(path, files: dict[str, str], message: str) -> str:
+    """Create a repo at *path* whose ``main`` holds one commit writing *files*
+    (name -> content); return that commit's full SHA.
+
+    Signing is off and the commit skips hooks, so a developer's global
+    gpgsign setting or a stray hook cannot hang or fail a throwaway repo.
+    """
+    subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
+    git_stdout(path, 'config', 'user.email', 't@e.example')
+    git_stdout(path, 'config', 'user.name', 'T')
+    git_stdout(path, 'config', 'commit.gpgsign', 'false')
+    for name, content in files.items():
+        (path / name).write_text(content)
+    git_stdout(path, 'add', '-A')
+    git_stdout(path, 'commit', '-q', '--no-verify', '-m', message)
+    return git_stdout(path, 'rev-parse', 'HEAD')
+
+
+def _init_git_repo(path) -> str:
+    """Create a minimal git repo at path with one seed.txt commit; return full SHA.
+
+    A ``done_provenance={'kind': 'merged', 'commit': ...}`` write needs a real
+    ``main`` branch for the interceptor's ``_verify_commit_on_main`` ancestor
+    backstop (``git merge-base --is-ancestor <sha> main``) to resolve against.
+    """
+    return _init_single_commit_repo(path, {'seed.txt': 'seed\n'}, 'seed')
 
 
 def init_ab_commit_repo(path) -> str:
     """Create a repo at *path* whose ``main`` holds one commit adding a.txt and
     b.txt; return that commit's full SHA.
 
-    The single-parent prefix of :func:`init_merge_history_repo`. Signing is
-    off and every commit skips hooks, so a developer's global gpgsign setting
-    or a stray hook cannot hang or fail this throwaway repo.
+    The single-parent prefix of :func:`init_merge_history_repo`.
     """
-    subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
-    _run_git(path, 'config', 'user.email', 't@e.example')
-    _run_git(path, 'config', 'user.name', 'T')
-    _run_git(path, 'config', 'commit.gpgsign', 'false')
-    (path / 'a.txt').write_text('a\n')
-    (path / 'b.txt').write_text('b\n')
-    _run_git(path, 'add', '-A')
-    _run_git(path, 'commit', '-q', '--no-verify', '-m', 'feat: ship a + b')
-    return _run_git(path, 'rev-parse', 'HEAD')
+    return _init_single_commit_repo(
+        path, {'a.txt': 'a\n', 'b.txt': 'b\n'}, 'feat: ship a + b',
+    )
 
 
 class MergeHistoryShas(TypedDict):
@@ -1771,31 +1762,31 @@ def init_merge_history_repo(path) -> MergeHistoryShas:
     """
     single = init_ab_commit_repo(path)
 
-    _run_git(path, 'checkout', '-q', '-b', 'feature')
+    git_stdout(path, 'checkout', '-q', '-b', 'feature')
     (path / 'feature.py').write_text('feature = 1\n')
     for i in range(1, 5):
         (path / f'extra_{i}.py').write_text(f'extra_{i} = 1\n')
-    _run_git(path, 'add', '-A')
-    _run_git(path, 'commit', '-q', '--no-verify', '-m', 'feat: add feature')
-    _run_git(path, 'checkout', '-q', 'main')
-    _run_git(path, 'merge', '--no-ff', '--no-verify', '-q', '-m', 'Merge feature into main', 'feature')
-    merge = _run_git(path, 'rev-parse', 'HEAD')
+    git_stdout(path, 'add', '-A')
+    git_stdout(path, 'commit', '-q', '--no-verify', '-m', 'feat: add feature')
+    git_stdout(path, 'checkout', '-q', 'main')
+    git_stdout(path, 'merge', '--no-ff', '--no-verify', '-q', '-m', 'Merge feature into main', 'feature')
+    merge = git_stdout(path, 'rev-parse', 'HEAD')
 
     # A second branch that edits a.txt independently of main's own later
     # edit of the same file — merging it conflicts, exercising the
     # (worse) symptom where a bare `git show` on a resolved-conflict
     # merge reports only the conflicted path and hides everything else.
-    _run_git(path, 'checkout', '-q', '-b', 'conflict', single)
+    git_stdout(path, 'checkout', '-q', '-b', 'conflict', single)
     (path / 'a.txt').write_text('a-conflict-branch\n')
     (path / 'conflict_only.py').write_text('conflict_only = 1\n')
-    _run_git(path, 'add', '-A')
-    _run_git(path, 'commit', '-q', '--no-verify', '-m', 'feat: edit a.txt on conflict branch')
-    _run_git(path, 'checkout', '-q', 'main')
+    git_stdout(path, 'add', '-A')
+    git_stdout(path, 'commit', '-q', '--no-verify', '-m', 'feat: edit a.txt on conflict branch')
+    git_stdout(path, 'checkout', '-q', 'main')
     (path / 'a.txt').write_text('a-main-edit\n')
-    _run_git(path, 'add', '-A')
-    _run_git(path, 'commit', '-q', '--no-verify', '-m', 'chore: edit a.txt on main after feature merge')
+    git_stdout(path, 'add', '-A')
+    git_stdout(path, 'commit', '-q', '--no-verify', '-m', 'chore: edit a.txt on main after feature merge')
 
-    # Deliberately not using `_run_git` (check=True): a real conflict makes
+    # Deliberately not using `git_stdout` (check=True): a real conflict makes
     # `git merge` exit 1 and leave conflict markers instead of a commit.
     conflict_result = subprocess.run(
         ['git', '-C', str(path), 'merge', '--no-ff', '--no-verify', '-q',
@@ -1807,9 +1798,9 @@ def init_merge_history_repo(path) -> MergeHistoryShas:
         'common ancestor); merge unexpectedly succeeded cleanly'
     )
     (path / 'a.txt').write_text('a-resolved\n')
-    _run_git(path, 'add', 'a.txt')
-    _run_git(path, 'commit', '-q', '--no-verify', '-m', 'Merge conflict into main (resolved)')
-    conflict_merge = _run_git(path, 'rev-parse', 'HEAD')
+    git_stdout(path, 'add', 'a.txt')
+    git_stdout(path, 'commit', '-q', '--no-verify', '-m', 'Merge conflict into main (resolved)')
+    conflict_merge = git_stdout(path, 'rev-parse', 'HEAD')
 
     return {'single': single, 'merge': merge, 'conflict_merge': conflict_merge}
 
