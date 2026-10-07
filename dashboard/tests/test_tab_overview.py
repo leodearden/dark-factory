@@ -432,7 +432,8 @@ class TestSystemHealthIsDerived:
         assert destructure, 'tab_overview.jsx does not destructure window.DF_SYSTEM_HEALTH at module scope.'
         assert not re.search(r'window\.DF_SYSTEM_HEALTH\s*(\|\||&&|\?\?)', tab_overview_jsx_code)
         bound = set(re.findall(r'\w+', destructure.group(1)))
-        assert self._HELPERS <= bound, f'tab_overview.jsx reads {sorted(self._HELPERS - bound)} without binding them'
+        unbound = self._HELPERS - bound
+        assert not unbound, f'tab_overview.jsx reads {sorted(unbound)} without binding them'
 
     def test_the_header_summarises_exactly_the_rows_drawn(self, overview_code):
         rows, _ = _health_rows_const(overview_code)

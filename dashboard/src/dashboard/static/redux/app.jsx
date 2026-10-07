@@ -12,8 +12,13 @@ const { reconRunCounts, reconAttentionCount } = window.DF_RECON_STATUS;
 const { censusOver, runningOfInFlight, inFlightCount: inFlightCountReading } = window.DF_TASK_SNAPSHOT;
 const { inQueueOver } = window.DF_MERGE_QUEUE;
 const { writeQueue } = window.DF_MEMORY_READINGS;
+const { plainDatum } = window.DF_DATUM;
 const { DEFAULT_WINDOW: CHIP_DEFAULT_WINDOW, TAB_WINDOWS: CHIP_TAB_WINDOWS, windowForTab, windowEcho, highlightedWindow, pendingWindow } = window.DF_WINDOW_CHIP;
 const DD = window.DF_DATA;
+
+// The receipt key each plain topbar reading arrived on (data.js keys one
+// receipt per polled endpoint by its URL with the query stripped).
+const EP_TOPBAR = Object.freeze({ costs: '/api/v2/dashboard/costs' });
 
 // Tweaks helpers are attached directly to window
 const { TweaksPanel, useTweaks, TweakSection, TweakSlider, TweakToggle, TweakRadio, TweakSelect, TweakColor } = window;
@@ -144,13 +149,13 @@ function App() {
 
   // Topbar status summary — all derived from real data.  `spend24h` is the
   // current-day total from COSTS.summary.today (server-computed from the
-  // cost trend tail).  Falls back to 0 if cost data hasn't loaded yet.
+  // cost trend tail); before /costs delivers it is a hole, never $0.00.
   const summary = {
     orchRunning: DD.ORCHESTRATORS.filter(o => o.running).length,
     orchTotal: DD.ORCHESTRATORS.length,
     tasks: <DatumReading datum={tasksCensus} format={runningOfInFlight} />,
     queue: <DatumReading datum={writeQueue(DD)} format={q => q.pending} />,
-    spend24h: DD.COSTS?.summary?.today ?? 0,
+    spend24h: <DatumReading datum={plainDatum(DD.COSTS.summary?.today, EP_TOPBAR.costs)} format={spend => `$${spend.toFixed(2)}`} />,
   };
 
   const railCounts = {
