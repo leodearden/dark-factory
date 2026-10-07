@@ -20,7 +20,7 @@ import json
 import sys
 import time
 from collections import Counter
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -908,6 +908,96 @@ def diff_lines(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[
 
 
 # ---------------------------------------------------------------------------
+# --summary: per-member counts and totals, members in name order.
+
+_Records = Sequence[Mapping[str, Any]]
+
+
+def _sum_over(kind: str | None, value: Callable[[Mapping[str, Any]], int]) -> Callable[[_Records], str]:
+    """An aggregator summing *value* over the records of *kind* (every record when None)."""
+
+    def aggregate(records: _Records) -> str:
+        return str(sum(value(record) for record in records if kind in (None, record['kind'])))
+
+    return aggregate
+
+
+def _cognitive_pair(records: _Records) -> str:
+    src = [record for record in records if record['kind'] == _SRC]
+    highest = max((record['cognitive_max'] for record in src), default=0)
+    return f'{highest} / {sum(record["cognitive_total"] for record in src)}'
+
+
+#: Every column after member and pseudo, as (header, aggregator over file records).
+_SUMMARY_COLUMNS: tuple[tuple[str, Callable[[_Records], str]], ...] = (
+    ('src files', _sum_over(_SRC, lambda record: 1)),
+    ('src lines', _sum_over(_SRC, lambda record: record['lines'])),
+    ('src prose lines', _sum_over(_SRC, lambda record: record['prose_lines'])),
+    ('src cognitive max / total', _cognitive_pair),
+    ('tests files', _sum_over(_TESTS, lambda record: 1)),
+    ('tests lines', _sum_over(_TESTS, lambda record: record['lines'])),
+    ('tests cognitive total', _sum_over(_TESTS, lambda record: record['cognitive_total'])),
+    (
+        f'files >= {H14_SOFT_CEILING_LINES} lines',
+        _sum_over(None, lambda record: record['lines'] >= H14_SOFT_CEILING_LINES),
+    ),
+    (
+        f'files >= {H14_ALARM_LINES} lines',
+        _sum_over(None, lambda record: record['lines'] >= H14_ALARM_LINES),
+    ),
+    ('function-local imports', _sum_over(_SRC, lambda record: record['function_local_imports'])),
+    ('re-export names', _sum_over(_SRC, lambda record: len(record['reexport_names']))),
+    ('reach-back imports', _sum_over(_SRC, lambda record: record['reach_back_imports'])),
+    (
+        'private patch targets',
+        _sum_over(_TESTS, lambda record: len(record['private_patch_targets'])),
+    ),
+    ('private reads', _sum_over(_TESTS, lambda record: record['private_reads'])),
+)
+
+
+def _markdown_row(cells: Sequence[str]) -> str:
+    return '| ' + ' | '.join(cells) + ' |'
+
+
+def _summary_header(snapshot: Mapping[str, Any]) -> list[str]:
+    evidence, graph = snapshot['evidence'], snapshot['import_graph']
+    lines = [
+        f'run: {snapshot["run_id"]} as_of {snapshot["as_of_sha"]} since {snapshot["since"]}',
+        f'files: {evidence["measured_files"]}/{evidence["domain_files"]} measured, '
+        f'complete={json.dumps(evidence["complete"])}',
+        f'import graph: {len(graph["edges"])} edges, {len(graph["reach_back"])} reach-backs, '
+        f'{len(graph["deferred"])} deferred imports, {len(graph["cycles"])} cycles',
+    ]
+    if evidence['unreadable']:
+        lines.append('unreadable (measures unknown, never zero):')
+        lines += [f'  {path}' for path in evidence['unreadable']]
+    return lines
+
+
+def summary_table(snapshot: Mapping[str, Any]) -> str:
+    """Header lines, then one markdown row per member in name order and a (domain) row."""
+    records = list(snapshot['files'].values())
+    by_member: dict[str, list[Mapping[str, Any]]] = {}
+    for record in records:
+        by_member.setdefault(record['member'], []).append(record)
+    pseudo = {member['name']: member['pseudo'] for member in snapshot['evidence']['members']}
+    rows = [
+        [name, json.dumps(pseudo[name]), *(cell(by_member.get(name, [])) for _h, cell in _SUMMARY_COLUMNS)]
+        for name in sorted(pseudo)
+    ]
+    rows.append(['(domain)', '', *(cell(records) for _h, cell in _SUMMARY_COLUMNS)])
+    headers = ['member', 'pseudo', *(header for header, _cell in _SUMMARY_COLUMNS)]
+    return '\n'.join([
+        *_summary_header(snapshot),
+        '',
+        _markdown_row(headers),
+        '|' + '---|' * len(headers),
+        *(_markdown_row(row) for row in rows),
+    ])
+
+
+# ---------------------------------------------------------------------------
 # The command line.
 
 
@@ -991,6 +1081,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _require_one_mode(parser, args)
     try:
+        if args.summary is not None:
+            print(summary_table(load_snapshot(Path(args.summary))))
+            return 0
         if args.current is not None:
             return _compare(args)
         return _measure(args)
