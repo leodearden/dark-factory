@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 import suite_census_pinning as pinning
-from source_measures import private_reads_in_tree
+from source_measures import MetricsError, private_reads_in_tree
 from suite_census_fixtures import git_tree
 
 MOD = '''\
@@ -119,16 +119,44 @@ def test_n_dup():
     assert value == 9
 '''
 
+SCRIPTS_TEST = '''\
+from unittest.mock import patch
+from legibility import ledger
+
+
+def test_dotted_legibility_patch():
+    with patch('legibility.ledger._x'):
+        pass
+
+
+def test_object_legibility_patch(monkeypatch):
+    monkeypatch.setattr(ledger, '_x', 2)
+
+
+def test_bare_legibility_name_patch():
+    with patch('ledger._x'):
+        pass
+
+
+def test_scripts_root_patch():
+    with patch('tool._y'):
+        pass
+'''
+
 
 @pytest.fixture(scope='module')
 def tree(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return git_tree(tmp_path_factory.mktemp('pinning'), {
+        'pyproject.toml': '[tool.uv.workspace]\nmembers = ["pkga", "pkgb"]\n',
         'pkga/src/pkga/__init__.py': '',
         'pkga/src/pkga/mod.py': MOD,
         'pkga/tests/conftest.py': CONFTEST,
         'pkga/tests/test_m.py': TEST_M,
         'pkgb/tests/test_n.py': TEST_N,
         'pkgb/tests/fixtures/broken.py': 'def broken(:\n',
+        'scripts/tool.py': '_y = 1\n',
+        'scripts/legibility/ledger.py': '_x = 1\n',
+        'scripts/tests/test_scripts.py': SCRIPTS_TEST,
     })
 
 
@@ -140,6 +168,12 @@ def census(tree: Path) -> pinning.PythonPinningCensus:
 @pytest.fixture(scope='module')
 def pkga(census: pinning.PythonPinningCensus) -> pinning.PackageRow:
     (row,) = [row for row in census.rows if row.package == 'pkga']
+    return row
+
+
+@pytest.fixture(scope='module')
+def scripts(census: pinning.PythonPinningCensus) -> pinning.PackageRow:
+    (row,) = [row for row in census.rows if row.package == 'scripts']
     return row
 
 
@@ -170,7 +204,7 @@ class TestPackageRow:
 
 class TestCensus:
     def test_rows_are_per_package_in_name_order(self, census):
-        assert [row.package for row in census.rows] == ['pkga', 'pkgb']
+        assert [row.package for row in census.rows] == ['pkga', 'pkgb', 'scripts']
 
     def test_duplicates_are_never_grouped_across_packages(self, census):
         (pkgb,) = [row for row in census.rows if row.package == 'pkgb']
@@ -188,6 +222,21 @@ class TestCensus:
         assert totals.distinct_private_targets == frozenset().union(
             *(row.distinct_private_targets for row in census.rows)
         )
+
+
+class TestFirstPartyIsTheDomain:
+    def test_scripts_is_the_import_root_so_legibility_modules_are_dotted(self, scripts):
+        """PRD decision 3 makes scripts/ the import root, so a bare legibility module name is not first-party."""
+        assert scripts.distinct_private_targets == frozenset({'legibility.ledger._x', 'tool._y'})
+        assert scripts.tests_with_private_patch == 3
+
+    def test_a_tree_whose_pyproject_declares_no_members_is_refused(self, tmp_path):
+        tree = git_tree(tmp_path, {
+            'pyproject.toml': '[project]\nname = "x"\n',
+            'pkga/tests/test_m.py': 'def test_m():\n    pass\n',
+        })
+        with pytest.raises(MetricsError, match=r'\[tool\.uv\.workspace\]\.members'):
+            pinning.measure_python_tree(tree)
 
 
 def test_render_has_one_row_per_package_plus_totals_and_names_the_unreadable(census):
