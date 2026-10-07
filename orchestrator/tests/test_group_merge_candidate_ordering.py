@@ -1,85 +1,40 @@
-"""Root-cause-as-spec pins for the rc=0 group-merge candidate query (task 4926).
+"""Real-git pins for the rc=0 group-merge candidate query (tasks 4926, 5539).
 
-``skills/_shared/deriving-landed-sha.md``'s step 4, rc=0 arm, tells an
-agent to find the merge that brought a landed branch into main with::
+``skills/_shared/deriving-landed-sha.md``'s step 4, rc=0 arm, finds the merge
+that brought a landed branch into main with::
 
-    c=$(git rev-list --ancestry-path --merges task/<TASK_ID>..main | tail -1)
+    c=$(git rev-list --topo-order --ancestry-path --merges task/<TASK_ID>..main | tail -1)
     git merge-base --is-ancestor task/<TASK_ID> "$c^1"   # "contained-before"
 
-and then reads ``contained-before rc=1`` as "``$c`` IS the merge that
-brought it in -- stamp it" and rc=0 as "unrelated later merge, do not
-stamp".  Two premises hide in that pair, and this module makes both
-executable:
+and stamps ``$c`` only on ``contained-before rc=1``.  Each premise of that
+pair is pinned here:
 
-* **Ordering.** ``git rev-list`` orders by COMMIT DATE by default, not
-  topologically, so ``tail -1`` is only the *oldest descendant merge*
-  when dates happen to agree with topology.  With a skewed or rewritten
-  committer date the bringing-in merge can sort out of position and
-  ``tail -1`` returns a LATER, unrelated merge instead -- whose ``^1``
-  containment then exits 0, silently skipping the true group merge and
-  degrading the procedure to the citation path.  ``--topo-order`` is what
-  makes the "oldest" claim hold.
-* **First parent.** ``$c^1`` is "main just before that merge" only when
-  the merge was created ON main.  A merge created from the branch side
-  has the TASK tip as ``^1``, so the containment check exits 0 trivially
-  and the arm falsely concludes "unrelated later merge, do not stamp".
+* **Ordering.** Without ``--topo-order`` the walk is date-ordered, so clock
+  skew or commits sharing one committer-date second make ``tail -1`` a later,
+  unrelated merge whose rc=0 silently skips the real one.
+* **Merge direction.** Git records none: a branch-side landing is
+  byte-identical to a fast-forward landing plus an unrelated merge, so ``^1``
+  is main only where merges are made on main; elsewhere rc=0 is undecided.
+* **Stacked sync merge.** A branch stacked on this one that merged main in
+  sorts older than the landing, so the arm exits rc=0 to the citation gate.
+* **Legitimate rc=0.** A branch already in main yields a real candidate the
+  arm must NOT stamp.
+* **Reachability.** Only the no-op-rebase train member reaches rc=0; the
+  ordinary coalesce-absorbed member stays rc=1 (``skills/merge-queue/SKILL.md``
+  rule 3).
 
-Both of those are FALSE rc=0 verdicts, so a third pin covers the arm's
-mirror image: the LEGITIMATE rc=0 exit, where a real candidate exists,
-``contained-before`` correctly returns 0 because the branch was already in
-main before it, and the agent must NOT stamp.  Without it the suite would
-stay green if rc=0 stopped being reachable at all -- while the runbook
-began licensing a fabricated merge sha, the very risk the citation gate
-below the arm exists to close.
-
-A fourth pin covers the same arm's *rationale*: which train-member shape
-can actually REACH rc=0 at all (the no-op-rebase member), versus the
-ordinary coalesce-absorbed non-tip member whose shas the pre-merge rebase
-rewrites, which is permanently rc=1 -- ``skills/merge-queue/SKILL.md``
-rule 3's mechanism.
-
-These are characterization pins, EXPECTED TO PASS ON WRITE, exactly as
-``orchestrator/tests/test_citation_gate_positive_arm.py`` (task 4924, same
-shared doc) states of its own: they make the failure scenario executable
-so a future change to git's behaviour re-litigates this fix's premises
-instead of silently invalidating them.  A test failing here on write means
-a git-behaviour premise was mis-transcribed, not that the doc edit is
-pending.
-
-A test that grepped ``skills/_shared/deriving-landed-sha.md`` or
-``skills/*/SKILL.md`` for the corrected query or wording is deliberately
-ABSENT.  Per ``orchestrator/tests/test_roles_ancestry_check.py``'s module
-docstring, such a test "exercises no runtime behaviour; it only pins
-prose, which pressures the wording toward whatever passes the assertion
-rather than toward what is clearest to the reader", and it "would couple
-this suite to prose in two skill docs that legitimately get rewritten" --
-the same docs this task edits.  The real-git tests here are what actually
-protect the change.
+These are characterization pins, expected to pass on write: a failure means
+git's behaviour moved.  Prose greps of the runbook are deliberately absent;
+see ``orchestrator/tests/test_roles_ancestry_check.py``'s module docstring.
+Every fixture repo carries the esc-3072-3 isolation guards through
+:func:`_new_repo` and :func:`_git_env`.
 
 DELIBERATE DIVERGENCE, do not "restore" the agreement assertion.
-``orchestrator/src/orchestrator/git_ops.py::GitOps.landing_merge_for``
-runs the same query -- ``git rev-list --ancestry-path --merges --reverse
-{head}..{upstream}`` then the first element -- and its docstring makes the
-same "oldest merge commit on the ANCESTRY PATH" claim; ``--reverse`` only
-reverses the DATE-ordered list, so it carries the ordering defect
-identically.  It is orchestrator production code with a live caller
-(``orchestrator/src/orchestrator/landing_evidence.py::branch_work_landed``'s
-no-op guard) and is deliberately NOT fixed by task 4926, which is a
-runbook-wording change; it is filed as a separate follow-up.  So unlike
-``test_citation_gate_positive_arm.py``, this module must NOT assert that
-the runbook form and the production method AGREE: after this task they
-deliberately diverge (the doc gains ``--topo-order``, production does not)
-until that follow-up lands.
-
-Every synthetic repo carries the repo's standard git-isolation guards
-(esc-3072-3): ``assert_isolated_git_repo`` pre-flights each fixture root
-before any subprocess touches it, and ``git_env_with_ceiling`` caps git's
-upward repo discovery at that root -- the same pairing
-``orchestrator/tests/test_branch_work_landed.py`` and
-``orchestrator/tests/test_git_ops_no_op_landing.py`` apply.
-
-No sleeps, no network, no skips: if git is unavailable these fail loudly
-rather than silently skipping (the repo's no-silent-fail-soft invariant).
+``orchestrator/src/orchestrator/git_ops.py::GitOps.landing_merge_for`` runs the
+same query without ``--topo-order`` (its ``--reverse`` only reverses the
+date-ordered list), so it carries the ordering defect.  Task 5165 owns that
+fix (GitOps.landing_merge_for); until it lands, this module must not assert
+that the runbook form and production agree.
 """
 
 from __future__ import annotations
@@ -102,31 +57,20 @@ _GIT_ENV_ARGS = [
 ]
 
 # DUPLICATION, deliberately not extracted yet.  ``_GIT_ENV_ARGS``, ``_git``,
-# ``_git_rc``, ``_commit`` and ``_new_repo`` are near-verbatim twins of the same
-# five helpers in ``test_citation_gate_positive_arm.py`` (this copy generalises
-# ``_git`` with ``date=`` and ``_commit`` with a per-branch filename).  Per-file
-# ``_git`` helpers are the wider suite's norm, so two copies stay under the bar.
-# If a THIRD real-git module for this ladder appears, lift these five -- in the
-# generalised form below -- into a small shared fixture module beside
-# ``_orch_helpers.py`` and have all three import it, rather than adding a third
-# copy.
+# ``_git_rc``, ``_commit`` and ``_new_repo`` share their shape with the helpers
+# in ``test_citation_gate_positive_arm.py``, but that sibling has no date
+# pinning, writes one fixed file, and applies neither
+# ``_orch_helpers.py::git_env_with_ceiling`` nor
+# ``_orch_helpers.py::assert_isolated_git_repo``.  If a THIRD real-git module for
+# this ladder appears, lift these five -- in the form below -- into a shared
+# fixture module beside ``_orch_helpers.py`` rather than adding a third copy.
 
 
 def _git_env(root: Path, date: str | None = None) -> dict[str, str]:
-    """Subprocess environment for a git call in *root*.
+    """Env for git in *root*, discovery capped at *root* (esc-3072-3).
 
-    :func:`_orch_helpers.git_env_with_ceiling` caps git's upward repository
-    discovery at *root* (incident esc-3072-3), so a fixture command can never
-    retarget an ENCLOSING repository -- which is not hypothetical here, because
-    pytest's basetemp can sit inside a live task worktree.  The complementary
-    hazard -- an inherited ``GIT_DIR`` / ``GIT_WORK_TREE`` / ``GIT_INDEX_FILE``,
-    which SKIPS discovery outright rather than walking, so no ceiling can bound
-    it -- is stripped from ``os.environ`` for the duration of every test by
-    ``df_pytest_isolation.py::_df_git_env_hermetic`` (autouse), which is why the
-    ``os.environ`` copy this ceiling is built on is already clean.
-
-    *date* pins both committer and author date, which is how the date-skew
-    fixture below is built.
+    Rationale: ``_orch_helpers.py::git_env_with_ceiling``.  *date* pins both
+    committer and author date.
     """
     env = git_env_with_ceiling(root)
     if date is not None:
@@ -136,10 +80,9 @@ def _git_env(root: Path, date: str | None = None) -> dict[str, str]:
 
 
 def _git(root: Path, *args: str, date: str | None = None) -> str:
-    """Run git in *root* and return stripped stdout (raises on non-zero).
+    """Run git in *root*; return stripped stdout, raising on non-zero.
 
-    *date* pins both committer and author date for the invocation, which is
-    how the date-skew fixture below is built.
+    *date* as in :func:`_git_env`.
     """
     return subprocess.run(
         ['git', *_GIT_ENV_ARGS, *args],
@@ -169,15 +112,10 @@ def _commit(root: Path, subject: str, filename: str, date: str | None = None) ->
 
 
 def _new_repo(root: Path) -> None:
-    """Create *root* as a repository root, then assert the isolation contract.
+    """Create *root* as a repository root, then pre-flight it (esc-3072-3).
 
-    :func:`_orch_helpers.assert_isolated_git_repo` is a PURE-FILESYSTEM
-    pre-flight: it refuses a directory that merely sits inside some repo instead
-    of being one.  It runs immediately after ``git init`` -- the earliest moment
-    at which it can hold -- so every later fixture command in this module is
-    covered by the pre-flight as well as by the ceiling in :func:`_git_env`.
-    Asserting inside ``_new_repo`` rather than at each call site means a test
-    added later cannot forget it.
+    Rationale: ``_orch_helpers.py::assert_isolated_git_repo``; asserting here
+    means a test added later cannot forget it.
     """
     root.mkdir()
     _git(root, 'init', '-b', 'main')
