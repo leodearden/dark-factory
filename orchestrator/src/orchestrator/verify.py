@@ -693,9 +693,12 @@ _PYTEST_PROGRESS_PERCENT_RE = re.compile(
     rf'^(?:\S+\.py )?{_PYTEST_STATUS_CHAR_CLASS}*[ \t]*{_PYTEST_PERCENT_FIELD}$',
     re.MULTILINE,
 )
+# A killed session's final progress line is unterminated, so the next writer's
+# text is glued on (bash's `Terminated` or job report, a worker's warning path,
+# `Traceback`): all start uppercase or '/'; F/E-led prose continues lowercase.
 _PYTEST_PROGRESS_FAILURE_RE = re.compile(
     rf'^(?:\S+\.py )?{_PYTEST_STATUS_CHAR_CLASS}*[FE]{_PYTEST_STATUS_CHAR_CLASS}*'
-    rf'(?:[ \t]+{_PYTEST_PERCENT_FIELD})?$',
+    rf'(?:[ \t]+{_PYTEST_PERCENT_FIELD}|[A-Z/].*)?$',
     re.MULTILINE,
 )
 
@@ -1043,7 +1046,9 @@ def _pytest_session_aborted_without_verdict(rc: int, output: str) -> bool:
     first nonzero rc, so verify knows the shell is its own.
 
     Any failure evidence vetoes both arms, including an ``F`` or ``E`` in a
-    progress line, because a killed ``-q`` session prints no short summary.
+    progress line, including the unterminated final one, whatever another
+    writer glued onto it, because a killed ``-q`` session prints no short
+    summary.
     """
     if _carries_pytest_failure_verdict(output) or _PYTEST_PROGRESS_FAILURE_RE.search(output):
         return False
