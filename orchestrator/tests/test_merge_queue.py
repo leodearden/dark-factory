@@ -5893,16 +5893,19 @@ def _mock_verify_timeout():
 
 
 @pytest.mark.asyncio
-class TestLaneSceneClockIsLoadSafe:
-    async def test_a_verify_slower_than_the_default_fake_clock_slack_is_not_called_dead(
+class TestLaneSceneVerifyIsNotCalledDead:
+    async def test_a_verify_parked_for_real_seconds_is_not_called_dead(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
-        """A lane merging through real git must not call a slow verify dead.
+        """A lane merging through real git must not call a healthy verify dead.
 
-        The lane's in-flight abort poll charges its no-progress budget on the
-        FakeClock, which grants a parked verify only ``budget / poll *
-        wait_cap`` of real time. Shrunk here to ten polls, a verify that
-        takes one real second must still finish once, not be requeued.
+        The in-flight abort poll measures its no-progress budget off the
+        FakeClock's ``monotonic()``, which the lane's own periodic loops push
+        forward at event-loop speed, so that budget buys no dependable real
+        time. What keeps a verify alive is content progress under its merge
+        worktree, as a healthy verify shows. With the budget shrunk to ten
+        polls, a verify parked for a real second must still run once, not be
+        called dead and requeued.
         """
         wt = await _make_branch_with_file(git_ops, 'slow-verify', 'sv.py', 'x = 1\n')
         gate = asyncio.Event()
