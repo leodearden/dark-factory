@@ -56,7 +56,7 @@ import enum
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES
+from escalation.models import BORN_AT_L2_SEVERITIES, KNOWN_SEVERITIES, normalised_severity
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -67,6 +67,7 @@ __all__ = [
     'PinRecord',
     'PinReport',
     'classify_pins',
+    'is_queue_handoff',
     'pinned_only_by_human_parked',
 ]
 
@@ -246,9 +247,7 @@ def _classify_record(
     live_claimant_id: str | None,
 ) -> PinClass:
     """Map one open escalation to its :class:`PinClass` (see the chain above)."""
-    # Normalise once.  `or ''` is load-bearing: an `Escalation` rehydrated from
-    # JSON on disk can carry a null `severity` despite the `str` annotation.
-    sev = str(record.severity or '').strip().lower()
+    sev = normalised_severity(record.severity)
 
     # Link 1 — spec S6: an info record is an ANNOTATION, not a handoff.  Since
     # task 3976, `escalation.server.promote_to_l2`'s inherited
@@ -465,6 +464,18 @@ def pinned_only_by_human_parked(
         return False
     levels = {record.id: record.level for record in records}
     return all(_is_human_level(levels.get(esc_id)) for esc_id in report.queue_handoff)
+
+
+def is_queue_handoff(record: PinRecord) -> bool:
+    """Does this ONE open record gate a live run?
+
+    True iff the shared chain classifies *record* as ``QUEUE_HANDOFF``.
+    ``live_claimant=True`` with no live id makes an L0 fail safe to a handoff,
+    so in practice only info never gates.  Consumers:
+    ``orchestrator/src/orchestrator/workflow.py::_is_gating_escalation`` and
+    ``::TaskWorkflow._wait_for_resolution`` (task 5222 / PRD gamma).
+    """
+    return bool(classify_pins('', [record], live_claimant=True).queue_handoff)
 
 
 def _is_human_level(level: object) -> bool:

@@ -4056,6 +4056,39 @@ class OrchestratorConfig(BaseSettings):
     # Green-tier hot-reloadable (see RELOADABLE_FIELDS).
     orphan_l0_merge_phase_freshness_secs: float = Field(default=600.0)
 
+    # Info-L0 disposition router (plans/info-l0-disposition-router-prd.md
+    # D5/D9/D12, plus beta's reviewer block): routes info-severity L0s at
+    # workflow exit, in the orphan-L0 reaper, and at restart.  The kill switch
+    # disables routing; the ticket timeout bounds a D9 curator hold; the
+    # conversion cap bounds curator tickets per sweep (D12); the detail
+    # budget bounds each note shown to the reviewer.  All four are green-tier
+    # hot-reloadable (see RELOADABLE_FIELDS).
+    info_l0_router_enabled: bool = Field(
+        default=True,
+        description='Set to false to leave info-severity L0s on their pre-router paths.',
+    )
+    info_l0_router_ticket_timeout_secs: float = Field(
+        default=900.0,
+        gt=0,
+        description=(
+            'Max seconds a D9 hold waits on a curator ticket before promoting; '
+            'the default matches steward_completion_timeout.'
+        ),
+    )
+    info_l0_router_max_conversions_per_sweep: int = Field(
+        default=20,
+        ge=0,
+        description='Curator conversions per routing sweep (D12); overflow is promoted under D5.',
+    )
+    info_l0_note_detail_chars: int = Field(
+        default=1200,
+        ge=0,
+        description=(
+            "Detail prefix shown per note in the reviewer's notes block; the "
+            'full text stays reachable by escalation id.'
+        ),
+    )
+
     # Terminal-status watcher — periodically polls fused-memory for active
     # workflow tasks whose status has gone terminal out-of-band (typical
     # cause: a human marked a task ``done`` and removed its worktree while
@@ -5936,6 +5969,12 @@ RELOADABLE_FIELDS: frozenset[str] = frozenset().union(
         # hot-reloadable so the merge-phase FP-suppression window can be tuned
         # without a redeploy.
         'orphan_l0_merge_phase_freshness_secs',
+        # Siblings of orphan_l0_timeout_secs, read live on each sweep or exit:
+        # a retune lands on the next routing pass, and the kill switch must not need a restart.
+        'info_l0_router_enabled',
+        'info_l0_router_ticket_timeout_secs',
+        'info_l0_router_max_conversions_per_sweep',
+        'info_l0_note_detail_chars',
         'watcher_rotation_escalations',
         'watcher_rotation_hours',
         'watcher_max_crashloop_restarts',

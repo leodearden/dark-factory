@@ -43,6 +43,10 @@ from escalation.queue import (
 _UNSET: Any = object()
 
 
+#: The info-L0 disposition classes (plans/info-l0-disposition-router-prd.md D14).
+_INFO_L0_DISPOSITION_CLASSES = ('addressed', 'observation-consumed', 'converted', 'status-info')
+
+
 def _make_escalation(esc_id: str, task_id: str = '1', status: str = 'pending', level: int = 0) -> Escalation:
     esc = Escalation(
         id=esc_id,
@@ -980,6 +984,19 @@ class TestSubmitResolved:
         assert result.resolution_class == 'benign', (
             f"Expected resolution_class='benign', got: {result.resolution_class!r}"
         )
+
+    @pytest.mark.parametrize('cls', _INFO_L0_DISPOSITION_CLASSES)
+    def test_submit_resolved_accepts_info_l0_disposition_class(self, tmp_path: Path, cls: str):
+        """submit_resolved(..., resolution_class=<info-L0 disposition class>) stamps and
+        round-trips (plans/info-l0-disposition-router-prd.md D14)."""
+        queue = EscalationQueue(tmp_path / 'queue')
+        esc = _make_escalation('esc-1-1')
+
+        queue.submit_resolved(esc, 'text', resolved_by='info-l0-router', resolution_class=cls)
+
+        result = queue.get('esc-1-1')
+        assert result is not None
+        assert result.resolution_class == cls
 
     def test_submit_resolved_defaults_resolution_class_per_resolved_by(self, tmp_path: Path):
         """submit_resolved(..., resolved_by=<reaper-sweep resolver>, no explicit class)
@@ -5449,6 +5466,21 @@ class TestResolveResolutionClassExplicit:
         cls, provenance = effective_benign(updated)
         assert (cls, provenance) == ('moot-terminal-subject', 'stamped')
         assert cls not in ('benign', 'actionable')
+
+    @pytest.mark.parametrize('cls', _INFO_L0_DISPOSITION_CLASSES)
+    def test_resolve_accepts_info_l0_disposition_class(self, tmp_path: Path, cls: str):
+        """resolve(..., resolution_class=<info-L0 disposition class>) persists the stamp,
+        and effective_benign reads it back verbatim as a stamped class
+        (plans/info-l0-disposition-router-prd.md D14)."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        queue.submit(_make_escalation('esc-1-1'))
+
+        queue.resolve('esc-1-1', 'text', resolved_by='info-l0-router', resolution_class=cls)
+
+        record = queue.get('esc-1-1')
+        assert record is not None
+        assert record.resolution_class == cls
+        assert effective_benign(record) == (cls, 'stamped')
 
 
 class TestResolveResolutionClassDefaults:

@@ -341,6 +341,16 @@ BORN_AT_L2_SEVERITIES: frozenset[str] = frozenset({'critical', 'urgent'})
 # rather than silently misrouting escalations.
 KNOWN_SEVERITIES: frozenset[str] = frozenset({'info', 'blocking'}) | BORN_AT_L2_SEVERITIES
 
+
+def normalised_severity(severity: str | None) -> str:
+    """The form every severity classifier compares against KNOWN_SEVERITIES.
+
+    Case- and whitespace-insensitive.  A null reads as ``''`` because an
+    ``Escalation`` rehydrated from JSON on disk can carry a null ``severity``
+    despite the ``str`` annotation.
+    """
+    return str(severity or '').strip().lower()
+
 # Urgency ordering over KNOWN_SEVERITIES, used by every severity FOLD in the
 # system (dedupe-child promotion, L2 member inheritance, the L2 update-path
 # floor).  Alphabetical comparison is wrong ('blocking' < 'info'), so the rank
@@ -414,9 +424,20 @@ AGENT_FILABLE_LEVELS: frozenset[int] = frozenset({0, 1})
 # been pending ~90s — a genuine strand and an ordinary restart artifact.  The
 # old single 'benign' stamp made the two records indistinguishable, so the
 # only durable trace of a 20h strand read as routine restart noise.
-RESOLUTION_CLASSES: frozenset[str] = frozenset(
-    {'benign', 'actionable', 'moot-terminal-subject', 'stale-strand'}
-)
+#
+# 'addressed', 'observation-consumed', 'converted' and 'status-info' are the
+# info-L0 disposition classes (plans/info-l0-disposition-router-prd.md D14):
+# 'addressed' means a reviewer verified the note fixed; 'observation-consumed'
+# means a pure observation was closed at exit; 'converted' means a
+# curator-created task now carries the work; 'status-info' means a mechanical
+# notice was closed per class, with an aggregate L1.  Like
+# 'moot-terminal-subject' they are deliberately neither 'benign' nor
+# 'actionable'.  The decision vocabulary lives in
+# escalation/src/escalation/disposition.py.
+RESOLUTION_CLASSES: frozenset[str] = frozenset({
+    'benign', 'actionable', 'moot-terminal-subject', 'stale-strand',
+    'addressed', 'observation-consumed', 'converted', 'status-info',
+})
 
 
 @dataclass

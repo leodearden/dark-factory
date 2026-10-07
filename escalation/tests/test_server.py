@@ -1509,6 +1509,28 @@ class TestResolveIssueResolutionClass:
         )
 
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'cls', ['addressed', 'observation-consumed', 'converted', 'status-info'],
+    )
+    async def test_info_l0_disposition_class_round_trips(self, tmp_path: Path, cls: str):
+        """The info-L0 disposition classes (plans/info-l0-disposition-router-prd.md D14)
+        pass resolve_issue's validator and persist on the record."""
+        queue = EscalationQueue(tmp_path / 'esc')
+        server = create_server(queue)
+        esc = self._seed_pending(queue)
+
+        result = await _resolve_issue(
+            server, escalation_id=esc.id, resolution='done', action='close_only',
+            resolution_class=cls,
+        )
+
+        assert 'error' not in result, f"Expected {cls!r} to be accepted; got: {result}"
+        record = queue.get(esc.id)
+        assert record is not None
+        assert record.resolution_class == cls
+
+
 class TestResolveIssueGrantedFiles:
     """resolve_issue accepts an optional granted_files scope-expansion grant (task 2505)."""
 
