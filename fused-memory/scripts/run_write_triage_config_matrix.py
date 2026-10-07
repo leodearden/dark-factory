@@ -45,7 +45,7 @@ import math
 import sys
 import types
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import chain
 from pathlib import Path
 from types import MappingProxyType
@@ -321,6 +321,7 @@ def build_matrix(
         'verdict_corpus': scores['verdict_corpus'],
         'list_prices': scores['list_prices'],
         'arms': scored + [skipped.row() for skipped in SKIPPED_ARMS],
+        'wording_attribution': _wording_attribution(population, cases_by_arm, verdicts),
         'selection_rule': {
             'bounds': [{'path': b.path, 'op': b.op, 'value': b.value} for b in bounds],
             'rule': WINNER_RULE,
@@ -404,6 +405,39 @@ def _refuse_unmatched_cases(
             f'case rows are given for arms {sorted(cases_by_arm)} but the population'
             f' publishes {sorted(population.names)}'
         )
+
+
+def _wording_attribution(
+    population: Population,
+    cases_by_arm: Mapping[str, Sequence[Mapping[str, Any]]],
+    verdicts: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Each non-shipped-wording arm paired by ι against its shipped twin at matched settings."""
+    by_settings = {arm.settings: arm for arm in population.arms}
+    attribution: dict[str, Any] = {}
+    for arm in population.arms:
+        if arm.settings.wording == _wording.WORDING_SHIPPED:
+            continue
+        twin = by_settings.get(replace(arm.settings, wording=_wording.WORDING_SHIPPED))
+        attribution[arm.name] = (
+            {'shipped_twin': None, 'paired': None} if twin is None
+            else {'shipped_twin': twin.name,
+                  'paired': _paired_against(arm, twin, cases_by_arm, verdicts)}
+        )
+    return attribution
+
+
+def _paired_against(
+    arm: PiArm,
+    twin: PiArm,
+    cases_by_arm: Mapping[str, Sequence[Mapping[str, Any]]],
+    verdicts: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    scores = _scorer.score_pairs(
+        chain(cases_by_arm[arm.name], cases_by_arm[twin.name]), verdicts,
+        reference_arm=twin.name,
+    )
+    return scores['arms'][arm.name]['paired_vs_reference']
 
 
 def _refuse_judge_band_drift(population: Population, scored: Mapping[str, Any]) -> None:
