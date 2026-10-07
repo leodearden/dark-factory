@@ -1,0 +1,1571 @@
+{
+  "task": 6152,
+  "prd": "plans/write-triage-flip-readiness-prd.md task λ (amendment §11, D14)",
+  "generated_at": "2026-10-07T16:22:44+00:00",
+  "corpus": "fused-memory/calibration/write_triage_pair_verdicts.jsonl",
+  "corpus_row_rule": "one row per pair: {entry_id, target_id, verdict, rater, batch} with rater \"majority\" and batch \"lambda-2026-10-07\", plus reason (the chosen word's rater's reason) and raters (every vote: seat, verdict, reason)",
+  "n_pairs": 1216,
+  "n_pairs_rule": "every (entry_id, target_id) in fused-memory/calibration/write_triage_pairs_to_rate.jsonl; none is in ι seed (asserted)",
+  "unrated_pairs": 0,
+  "majority_rule": "Per pair, votes are primary (p seat), second (s seat) and, when consulted, third (t) and fourth (u). The resolution is score_write_triage_pairs.py::resolve_verdicts over all of the pair's votes (strict majority on belongs-vs-misfile, then on CORRECTS-vs-not, UNCLEAR abstaining). The word written is: (1) when no third rater was consulted, the primary word (first two agree on both binaries and neither is UNCLEAR; same rule as data/write-triage-stronger-models-2026-09-30/score_models.py::truth_l2); (2) otherwise the word cast by >= 2 raters if that word is consistent with the resolution; else the third rater's word if consistent; else the first consistent word in the order fourth, primary, second. Asserted: resolve_verdicts over the single written row equals the resolution over all votes for every pair, and no pair is TIED.",
+  "verdict_counts": {
+    "CORRECTS": 129,
+    "EXTENDS": 373,
+    "RELATED": 529,
+    "SAME": 138,
+    "SUBSUMED": 44,
+    "UNRELATED": 3
+  },
+  "verdict_counts_rule": "written (majority) word per pair, over all 1,216 pairs",
+  "resolution_counts": {
+    "agreeing": 555,
+    "corrects": 129,
+    "misfile": 532
+  },
+  "resolution_counts_rule": "score_write_triage_pairs.py::resolve_verdicts over each pair's votes",
+  "word_source_counts": {
+    "primary": 1124,
+    "third": 91,
+    "second": 1
+  },
+  "word_source_counts_rule": "which rater's word was written, per majority_rule",
+  "kappa": {
+    "corrects_vs_not": 0.856,
+    "belongs_vs_misfile": 0.888,
+    "n": 1216,
+    "observed_agreement_corrects_vs_not": 0.972,
+    "observed_agreement_belongs_vs_misfile": 0.945,
+    "exact_word_agreement": 0.858,
+    "rule": "Cohen kappa (each rater's own marginals) between the primary and second rater, over the pairs where neither said UNCLEAR; anchors excluded; same formula as data/write-triage-stronger-models-2026-09-30/make_third.py::kappa"
+  },
+  "first_rater_counts": {
+    "CORRECTS": 133,
+    "EXTENDS": 366,
+    "RELATED": 531,
+    "SAME": 138,
+    "SUBSUMED": 45,
+    "UNRELATED": 3
+  },
+  "second_rater_counts": {
+    "CORRECTS": 131,
+    "EXTENDS": 371,
+    "RELATED": 535,
+    "SAME": 122,
+    "SUBSUMED": 53,
+    "UNRELATED": 4
+  },
+  "three_rater_disputes": 93,
+  "three_rater_disputes_rule": "pairs where primary and second differ on CORRECTS-vs-not or belongs-vs-misfile, or either said UNCLEAR; each got a third Opus high-effort rater",
+  "dispute_kinds": {
+    "EXTENDS/RELATED": 31,
+    "RELATED/EXTENDS": 20,
+    "CORRECTS/EXTENDS": 17,
+    "EXTENDS/CORRECTS": 9,
+    "RELATED/CORRECTS": 7,
+    "SUBSUMED/RELATED": 4,
+    "RELATED/SUBSUMED": 3,
+    "RELATED/SAME": 1,
+    "CORRECTS/RELATED": 1
+  },
+  "dispute_kinds_rule": "primary/second word pair over the three-rater disputes",
+  "third_rater_binary_side": {
+    "sided_with_second": 38,
+    "sided_with_primary": 52,
+    "sided_with_neither": 3
+  },
+  "third_rater_binary_side_rule": "over disputes where primary and second differ on a binary (UNCLEAR-only disputes excluded): whose binaries the third rater matched",
+  "fourth_rater_pairs": 0,
+  "fourth_rater_pairs_rule": "pairs still TIED by resolve_verdicts after three votes (a third-rater UNCLEAR on a split pair); each got a fourth Opus high-effort rater",
+  "anchor_agreement": {
+    "overall": {
+      "n": 590,
+      "exact_word": 472,
+      "unclear": 0,
+      "belongs_vs_misfile_agree": 541,
+      "corrects_vs_not_agree": 555,
+      "n_decided": 590
+    },
+    "by_round": {
+      "primary": {
+        "n": 280,
+        "exact_word": 225,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 256,
+        "corrects_vs_not_agree": 265,
+        "n_decided": 280
+      },
+      "second": {
+        "n": 280,
+        "exact_word": 225,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 260,
+        "corrects_vs_not_agree": 262,
+        "n_decided": 280
+      },
+      "third": {
+        "n": 30,
+        "exact_word": 22,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 25,
+        "corrects_vs_not_agree": 28,
+        "n_decided": 30
+      }
+    },
+    "by_prior_verdict": {
+      "CORRECTS": {
+        "n": 118,
+        "exact_word": 95,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 115,
+        "corrects_vs_not_agree": 95,
+        "n_decided": 118
+      },
+      "EXTENDS": {
+        "n": 120,
+        "exact_word": 102,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 116,
+        "corrects_vs_not_agree": 116,
+        "n_decided": 120
+      },
+      "RELATED": {
+        "n": 177,
+        "exact_word": 137,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 137,
+        "corrects_vs_not_agree": 170,
+        "n_decided": 177
+      },
+      "SAME": {
+        "n": 111,
+        "exact_word": 89,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 111,
+        "corrects_vs_not_agree": 110,
+        "n_decided": 111
+      },
+      "SUBSUMED": {
+        "n": 64,
+        "exact_word": 49,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 62,
+        "corrects_vs_not_agree": 64,
+        "n_decided": 64
+      }
+    },
+    "by_seat": {
+      "p00": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "p01": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "p02": {
+        "n": 10,
+        "exact_word": 9,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "p03": {
+        "n": 10,
+        "exact_word": 7,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "p04": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "p05": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "p06": {
+        "n": 10,
+        "exact_word": 9,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "p07": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "p08": {
+        "n": 10,
+        "exact_word": 10,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "p09": {
+        "n": 10,
+        "exact_word": 10,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "p10": {
+        "n": 10,
+        "exact_word": 7,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 8,
+        "n_decided": 10
+      },
+      "p11": {
+        "n": 10,
+        "exact_word": 7,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "p12": {
+        "n": 10,
+        "exact_word": 9,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "p13": {
+        "n": 10,
+        "exact_word": 7,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "p14": {
+        "n": 10,
+        "exact_word": 9,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "p15": {
+        "n": 10,
+        "exact_word": 9,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "p16": {
+        "n": 10,
+        "exact_word": 10,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "p17": {
+        "n": 10,
+        "exact_word": 5,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 8,
+        "corrects_vs_not_agree": 8,
+        "n_decided": 10
+      },
+      "p18": {
+        "n": 10,
+        "exact_word": 9,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "p19": {
+        "n": 10,
+        "exact_word": 9,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "p20": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 8,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "p21": {
+        "n": 10,
+        "exact_word": 9,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "p22": {
+        "n": 10,
+        "exact_word": 6,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 8,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "p23": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "p24": {
+        "n": 10,
+        "exact_word": 5,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 8,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "p25": {
+        "n": 10,
+        "exact_word": 9,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "p26": {
+        "n": 10,
+        "exact_word": 7,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "p27": {
+        "n": 10,
+        "exact_word": 7,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "s00": {
+        "n": 10,
+        "exact_word": 9,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "s01": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "s02": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "s03": {
+        "n": 10,
+        "exact_word": 7,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 8,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "s04": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "s05": {
+        "n": 10,
+        "exact_word": 7,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "s06": {
+        "n": 10,
+        "exact_word": 7,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 8,
+        "n_decided": 10
+      },
+      "s07": {
+        "n": 10,
+        "exact_word": 10,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "s08": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "s09": {
+        "n": 10,
+        "exact_word": 7,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 8,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "s10": {
+        "n": 10,
+        "exact_word": 7,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 8,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "s11": {
+        "n": 10,
+        "exact_word": 9,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "s12": {
+        "n": 10,
+        "exact_word": 7,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "s13": {
+        "n": 10,
+        "exact_word": 10,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "s14": {
+        "n": 10,
+        "exact_word": 9,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "s15": {
+        "n": 10,
+        "exact_word": 7,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "s16": {
+        "n": 10,
+        "exact_word": 9,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "s17": {
+        "n": 10,
+        "exact_word": 9,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "s18": {
+        "n": 10,
+        "exact_word": 6,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "s19": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "s20": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "s21": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "s22": {
+        "n": 10,
+        "exact_word": 7,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "s23": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 8,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "s24": {
+        "n": 10,
+        "exact_word": 9,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "s25": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "s26": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 8,
+        "n_decided": 10
+      },
+      "s27": {
+        "n": 10,
+        "exact_word": 9,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 10,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "t00": {
+        "n": 10,
+        "exact_word": 6,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 8,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      },
+      "t01": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 9,
+        "corrects_vs_not_agree": 10,
+        "n_decided": 10
+      },
+      "t02": {
+        "n": 10,
+        "exact_word": 8,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 8,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 10
+      }
+    },
+    "contested_anchors": [
+      {
+        "entry_id": "0c0a1b52-6524-4c69-aadd-8738249e9480",
+        "target_id": "d2338c60-7bc2-47cc-864c-cdcf0d87e2a5",
+        "prior_verdict": "EXTENDS",
+        "n": 2,
+        "exact_word": 1,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 1,
+        "corrects_vs_not_agree": 2,
+        "n_decided": 2,
+        "words": {
+          "RELATED": 1,
+          "EXTENDS": 1
+        }
+      },
+      {
+        "entry_id": "1a265e20-6e4d-4c7c-a1dd-cdf880c865e4",
+        "target_id": "577c37be-cc1b-49dd-950c-a39b6488aa8e",
+        "prior_verdict": "RELATED",
+        "n": 9,
+        "exact_word": 3,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 3,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 9,
+        "words": {
+          "EXTENDS": 6,
+          "RELATED": 3
+        }
+      },
+      {
+        "entry_id": "1a265e20-6e4d-4c7c-a1dd-cdf880c865e4",
+        "target_id": "be25650f-3fab-45f0-97bb-9b145ac9b939",
+        "prior_verdict": "CORRECTS",
+        "n": 6,
+        "exact_word": 1,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 6,
+        "corrects_vs_not_agree": 1,
+        "n_decided": 6,
+        "words": {
+          "EXTENDS": 4,
+          "CORRECTS": 1,
+          "SAME": 1
+        }
+      },
+      {
+        "entry_id": "5115a184-07d7-4adf-a9e8-bf1eb8a51aca",
+        "target_id": "d2338c60-7bc2-47cc-864c-cdcf0d87e2a5",
+        "prior_verdict": "EXTENDS",
+        "n": 2,
+        "exact_word": 1,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 2,
+        "corrects_vs_not_agree": 1,
+        "n_decided": 2,
+        "words": {
+          "EXTENDS": 1,
+          "CORRECTS": 1
+        }
+      },
+      {
+        "entry_id": "524933e4-969c-4fa5-b166-29f00e33e934",
+        "target_id": "4c8b5fd0-b33d-40f3-b272-04b947907ea1",
+        "prior_verdict": "RELATED",
+        "n": 10,
+        "exact_word": 5,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 5,
+        "corrects_vs_not_agree": 5,
+        "n_decided": 10,
+        "words": {
+          "RELATED": 5,
+          "CORRECTS": 5
+        }
+      },
+      {
+        "entry_id": "58ba125e-d46a-4927-9890-a186826bfbb4",
+        "target_id": "3bf2119c-91e5-45e2-b6e5-9e2a983cc327",
+        "prior_verdict": "SUBSUMED",
+        "n": 2,
+        "exact_word": 1,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 1,
+        "corrects_vs_not_agree": 2,
+        "n_decided": 2,
+        "words": {
+          "RELATED": 1,
+          "SUBSUMED": 1
+        }
+      },
+      {
+        "entry_id": "69b7dfd9-f7d7-4cd5-824d-0740323662f3",
+        "target_id": "3bf2119c-91e5-45e2-b6e5-9e2a983cc327",
+        "prior_verdict": "RELATED",
+        "n": 9,
+        "exact_word": 0,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 0,
+        "corrects_vs_not_agree": 9,
+        "n_decided": 9,
+        "words": {
+          "EXTENDS": 8,
+          "SAME": 1
+        }
+      },
+      {
+        "entry_id": "80936e18-6a91-4b74-9bb8-cae79e6490b8",
+        "target_id": "44abf8dc-d271-4c9f-8845-cae0cded9600",
+        "prior_verdict": "EXTENDS",
+        "n": 2,
+        "exact_word": 1,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 2,
+        "corrects_vs_not_agree": 1,
+        "n_decided": 2,
+        "words": {
+          "CORRECTS": 1,
+          "EXTENDS": 1
+        }
+      },
+      {
+        "entry_id": "8b47b378-d154-4460-9cf6-0fa681a02ce1",
+        "target_id": "815353e6-61ec-42d5-b607-52ff0e9e3555",
+        "prior_verdict": "CORRECTS",
+        "n": 6,
+        "exact_word": 2,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 6,
+        "corrects_vs_not_agree": 2,
+        "n_decided": 6,
+        "words": {
+          "EXTENDS": 4,
+          "CORRECTS": 2
+        }
+      },
+      {
+        "entry_id": "8b47b378-d154-4460-9cf6-0fa681a02ce1",
+        "target_id": "9b01e961-e086-428a-ad7e-68323b22f21a",
+        "prior_verdict": "CORRECTS",
+        "n": 6,
+        "exact_word": 2,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 5,
+        "corrects_vs_not_agree": 2,
+        "n_decided": 6,
+        "words": {
+          "EXTENDS": 3,
+          "CORRECTS": 2,
+          "RELATED": 1
+        }
+      },
+      {
+        "entry_id": "9d229441-1fae-48df-a33c-51d87cd2de4b",
+        "target_id": "2e55fead-39ac-4c67-9db3-3cf3eb5ecac8",
+        "prior_verdict": "CORRECTS",
+        "n": 6,
+        "exact_word": 2,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 6,
+        "corrects_vs_not_agree": 2,
+        "n_decided": 6,
+        "words": {
+          "EXTENDS": 4,
+          "CORRECTS": 2
+        }
+      },
+      {
+        "entry_id": "c77d25d9-70b0-44f4-a6fd-b00c7a63118b",
+        "target_id": "88af8b4d-51cf-47e8-8c53-f4b5eba796f5",
+        "prior_verdict": "RELATED",
+        "n": 8,
+        "exact_word": 2,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 2,
+        "corrects_vs_not_agree": 8,
+        "n_decided": 8,
+        "words": {
+          "EXTENDS": 6,
+          "RELATED": 2
+        }
+      },
+      {
+        "entry_id": "d3a57bb8-8948-4344-88cd-4485419bcc2f",
+        "target_id": "6aca4125-c46a-42b8-8d2b-eee0638e19d9",
+        "prior_verdict": "SUBSUMED",
+        "n": 2,
+        "exact_word": 1,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 1,
+        "corrects_vs_not_agree": 2,
+        "n_decided": 2,
+        "words": {
+          "RELATED": 1,
+          "SUBSUMED": 1
+        }
+      },
+      {
+        "entry_id": "d3a57bb8-8948-4344-88cd-4485419bcc2f",
+        "target_id": "b245e24a-61d1-44ad-a78a-be75738261d1",
+        "prior_verdict": "EXTENDS",
+        "n": 2,
+        "exact_word": 1,
+        "unclear": 0,
+        "belongs_vs_misfile_agree": 1,
+        "corrects_vs_not_agree": 2,
+        "n_decided": 2,
+        "words": {
+          "EXTENDS": 1,
+          "RELATED": 1
+        }
+      }
+    ],
+    "contested_anchors_rule": "anchor pairs where at most half of this session's ratings agree with the seed verdict on belongs-vs-misfile or on CORRECTS-vs-not; the seed is one rater per pair, so these are pairs on which the seed rating itself is in question, not evidence of batch drift",
+    "seats_below_8_of_10_on_belongs_vs_misfile": [],
+    "distinct_anchor_pairs_used": 155
+  },
+  "anchor_agreement_rule": "each anchor rating vs that pair's single verdict in ι seed fused-memory/tests/fixtures/write_triage_pair_verdicts_seed.jsonl; binary agreement counted over ratings that are not UNCLEAR (n_decided); every seat got 10 anchors: 3 prior RELATED, 2 prior CORRECTS, 5 prior SAME/EXTENDS/SUBSUMED",
+  "shard_sizes": {
+    "p00": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "SAME": 2,
+        "EXTENDS": 3,
+        "CORRECTS": 2
+      }
+    },
+    "p01": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "SAME": 3,
+        "EXTENDS": 2,
+        "CORRECTS": 2
+      }
+    },
+    "p02": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "CORRECTS": 2,
+        "SUBSUMED": 1,
+        "EXTENDS": 2,
+        "RELATED": 3,
+        "SAME": 2
+      }
+    },
+    "p03": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "SUBSUMED": 2,
+        "RELATED": 3,
+        "EXTENDS": 2,
+        "CORRECTS": 2,
+        "SAME": 1
+      }
+    },
+    "p04": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "EXTENDS": 3,
+        "SAME": 1,
+        "SUBSUMED": 1,
+        "CORRECTS": 2
+      }
+    },
+    "p05": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "SUBSUMED": 1,
+        "SAME": 2,
+        "RELATED": 3,
+        "EXTENDS": 2,
+        "CORRECTS": 2
+      }
+    },
+    "p06": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "EXTENDS": 2,
+        "SAME": 2,
+        "CORRECTS": 2,
+        "SUBSUMED": 1
+      }
+    },
+    "p07": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "CORRECTS": 2,
+        "SAME": 4,
+        "EXTENDS": 1
+      }
+    },
+    "p08": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "SUBSUMED": 3,
+        "CORRECTS": 2,
+        "EXTENDS": 2
+      }
+    },
+    "p09": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "SAME": 2,
+        "RELATED": 3,
+        "SUBSUMED": 2,
+        "CORRECTS": 2,
+        "EXTENDS": 1
+      }
+    },
+    "p10": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "EXTENDS": 3,
+        "RELATED": 3,
+        "SAME": 1,
+        "SUBSUMED": 1,
+        "CORRECTS": 2
+      }
+    },
+    "p11": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "SUBSUMED": 2,
+        "RELATED": 3,
+        "EXTENDS": 2,
+        "SAME": 1,
+        "CORRECTS": 2
+      }
+    },
+    "p12": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "CORRECTS": 2,
+        "EXTENDS": 4,
+        "SAME": 1
+      }
+    },
+    "p13": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "EXTENDS": 2,
+        "SUBSUMED": 2,
+        "CORRECTS": 2,
+        "SAME": 1
+      }
+    },
+    "p14": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "SAME": 1,
+        "RELATED": 3,
+        "CORRECTS": 2,
+        "EXTENDS": 3,
+        "SUBSUMED": 1
+      }
+    },
+    "p15": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "EXTENDS": 1,
+        "SUBSUMED": 2,
+        "CORRECTS": 2,
+        "RELATED": 3,
+        "SAME": 2
+      }
+    },
+    "p16": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "SAME": 2,
+        "CORRECTS": 2,
+        "EXTENDS": 1,
+        "SUBSUMED": 2
+      }
+    },
+    "p17": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "CORRECTS": 2,
+        "EXTENDS": 3,
+        "RELATED": 3,
+        "SAME": 2
+      }
+    },
+    "p18": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "EXTENDS": 3,
+        "RELATED": 3,
+        "SAME": 1,
+        "CORRECTS": 2,
+        "SUBSUMED": 1
+      }
+    },
+    "p19": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "CORRECTS": 2,
+        "SAME": 2,
+        "RELATED": 3,
+        "EXTENDS": 1,
+        "SUBSUMED": 2
+      }
+    },
+    "p20": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "SAME": 4,
+        "SUBSUMED": 1,
+        "RELATED": 3,
+        "CORRECTS": 2
+      }
+    },
+    "p21": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "SUBSUMED": 1,
+        "SAME": 2,
+        "CORRECTS": 2,
+        "EXTENDS": 2,
+        "RELATED": 3
+      }
+    },
+    "p22": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "SAME": 3,
+        "RELATED": 3,
+        "CORRECTS": 2,
+        "EXTENDS": 2
+      }
+    },
+    "p23": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "CORRECTS": 2,
+        "EXTENDS": 2,
+        "SAME": 3
+      }
+    },
+    "p24": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "EXTENDS": 3,
+        "RELATED": 3,
+        "SAME": 2,
+        "CORRECTS": 2
+      }
+    },
+    "p25": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "SAME": 3,
+        "CORRECTS": 2,
+        "SUBSUMED": 1,
+        "EXTENDS": 1
+      }
+    },
+    "p26": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "CORRECTS": 2,
+        "SUBSUMED": 2,
+        "SAME": 1,
+        "EXTENDS": 2
+      }
+    },
+    "p27": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "SUBSUMED": 2,
+        "CORRECTS": 2,
+        "EXTENDS": 3
+      }
+    },
+    "s00": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "EXTENDS": 3,
+        "RELATED": 3,
+        "CORRECTS": 2,
+        "SAME": 2
+      }
+    },
+    "s01": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "EXTENDS": 1,
+        "SAME": 3,
+        "SUBSUMED": 1,
+        "CORRECTS": 2
+      }
+    },
+    "s02": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "EXTENDS": 1,
+        "SAME": 3,
+        "SUBSUMED": 1,
+        "CORRECTS": 2
+      }
+    },
+    "s03": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "CORRECTS": 2,
+        "SUBSUMED": 2,
+        "EXTENDS": 3,
+        "RELATED": 3
+      }
+    },
+    "s04": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "CORRECTS": 2,
+        "EXTENDS": 1,
+        "SUBSUMED": 2,
+        "SAME": 2
+      }
+    },
+    "s05": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "SUBSUMED": 2,
+        "EXTENDS": 2,
+        "SAME": 1,
+        "CORRECTS": 2
+      }
+    },
+    "s06": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "EXTENDS": 3,
+        "SAME": 1,
+        "CORRECTS": 2,
+        "RELATED": 3,
+        "SUBSUMED": 1
+      }
+    },
+    "s07": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "SAME": 1,
+        "EXTENDS": 3,
+        "RELATED": 3,
+        "CORRECTS": 2,
+        "SUBSUMED": 1
+      }
+    },
+    "s08": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "EXTENDS": 3,
+        "RELATED": 3,
+        "SAME": 1,
+        "CORRECTS": 2,
+        "SUBSUMED": 1
+      }
+    },
+    "s09": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "CORRECTS": 2,
+        "SUBSUMED": 1,
+        "SAME": 2,
+        "EXTENDS": 2
+      }
+    },
+    "s10": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "CORRECTS": 2,
+        "SUBSUMED": 2,
+        "EXTENDS": 1,
+        "SAME": 2
+      }
+    },
+    "s11": {
+      "items": 54,
+      "pairs": 44,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "SAME": 2,
+        "RELATED": 3,
+        "SUBSUMED": 2,
+        "CORRECTS": 2,
+        "EXTENDS": 1
+      }
+    },
+    "s12": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "CORRECTS": 2,
+        "RELATED": 3,
+        "SAME": 1,
+        "EXTENDS": 3,
+        "SUBSUMED": 1
+      }
+    },
+    "s13": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "SAME": 2,
+        "RELATED": 3,
+        "EXTENDS": 3,
+        "CORRECTS": 2
+      }
+    },
+    "s14": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "CORRECTS": 2,
+        "SUBSUMED": 3,
+        "RELATED": 3,
+        "SAME": 1,
+        "EXTENDS": 1
+      }
+    },
+    "s15": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "SAME": 4,
+        "EXTENDS": 1,
+        "RELATED": 3,
+        "CORRECTS": 2
+      }
+    },
+    "s16": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "CORRECTS": 2,
+        "SAME": 3,
+        "SUBSUMED": 1,
+        "EXTENDS": 1
+      }
+    },
+    "s17": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "EXTENDS": 3,
+        "SAME": 2,
+        "CORRECTS": 2
+      }
+    },
+    "s18": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "SAME": 3,
+        "EXTENDS": 2,
+        "RELATED": 3,
+        "CORRECTS": 2
+      }
+    },
+    "s19": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "CORRECTS": 2,
+        "RELATED": 3,
+        "SUBSUMED": 1,
+        "SAME": 2,
+        "EXTENDS": 2
+      }
+    },
+    "s20": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "SUBSUMED": 1,
+        "SAME": 3,
+        "CORRECTS": 2,
+        "EXTENDS": 1
+      }
+    },
+    "s21": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "CORRECTS": 2,
+        "SAME": 1,
+        "EXTENDS": 3,
+        "SUBSUMED": 1
+      }
+    },
+    "s22": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "EXTENDS": 2,
+        "CORRECTS": 2,
+        "RELATED": 3,
+        "SAME": 1,
+        "SUBSUMED": 2
+      }
+    },
+    "s23": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "EXTENDS": 3,
+        "RELATED": 3,
+        "CORRECTS": 2,
+        "SAME": 1,
+        "SUBSUMED": 1
+      }
+    },
+    "s24": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "CORRECTS": 2,
+        "SAME": 3,
+        "RELATED": 3,
+        "EXTENDS": 2
+      }
+    },
+    "s25": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "SUBSUMED": 2,
+        "RELATED": 3,
+        "SAME": 3,
+        "CORRECTS": 2
+      }
+    },
+    "s26": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "CORRECTS": 2,
+        "EXTENDS": 3,
+        "RELATED": 3,
+        "SUBSUMED": 1,
+        "SAME": 1
+      }
+    },
+    "s27": {
+      "items": 53,
+      "pairs": 43,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "CORRECTS": 2,
+        "SUBSUMED": 2,
+        "SAME": 1,
+        "EXTENDS": 2
+      }
+    },
+    "t00": {
+      "items": 41,
+      "pairs": 31,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "SAME": 4,
+        "EXTENDS": 1,
+        "CORRECTS": 2
+      }
+    },
+    "t01": {
+      "items": 41,
+      "pairs": 31,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "SAME": 1,
+        "EXTENDS": 4,
+        "CORRECTS": 2
+      }
+    },
+    "t02": {
+      "items": 41,
+      "pairs": 31,
+      "anchors": 10,
+      "anchor_prior_verdicts": {
+        "RELATED": 3,
+        "SAME": 3,
+        "EXTENDS": 1,
+        "CORRECTS": 2,
+        "SUBSUMED": 1
+      }
+    }
+  },
+  "shard_sizes_rule": "items per seat = pairs + anchors; every seat <= 55 items with 10 anchors; primary and second rounds are independent shuffles into 28 shards each",
+  "raters": {
+    "model": "opus (Claude Code alias; claude-opus-5-5 at session time)",
+    "effort": {
+      "primary": "medium",
+      "second": "medium",
+      "third": "high"
+    },
+    "seats": {
+      "primary": 28,
+      "second": 28,
+      "third": 3
+    },
+    "dispatch": "/team session, Workflow tool; one agent per seat; structured output {seat, judgments[{id, verdict, reason}]}"
+  },
+  "blindness": {
+    "seat_contents": "rater_brief.md (byte-identical to fused-memory/calibration/write_triage_rater_brief.md) and items/iNN.txt (CHILD, PARENT texts only); item ids are per-seat ordinals, and the key lives outside every seat",
+    "not_shown": "arm identity, judge outcome, entry/target ids, anchor status and prior verdicts",
+    "tool_call_audit": {
+      "seats_audited": 59,
+      "seats_with_access_outside_own_dir": []
+    },
+    "tool_call_audit_rule": "every tool call except StructuredOutput must be Bash or Read naming only paths under the seat's own directory"
+  },
+  "sources": {
+    "fused-memory/calibration/write_triage_pairs_to_rate.jsonl": "3f51509a110cc53acc0f8468fe61ada30198faba77fc7fd8d28b5b11485549e8",
+    "fused-memory/calibration/write_triage_rater_brief.md": "7f161b0ed8b8cd5d24592a926068c00d075efdc2106375d65cfe1879bbebed11",
+    "fused-memory/tests/fixtures/write_triage_pair_verdicts_seed.jsonl": "f24681fdf23ad200e57fd48e8add8e6a6e24c481b6c91d8b21a3cc6fc11d9098",
+    "fused-memory/tests/fixtures/write_triage_calibration.jsonl": "fa5958f3634ace98b846ac398cdfe28f2e105a746f0348fe48fb5ed08cd03fe3",
+    "data/write-triage-jev-trial-2026-09-29/inputs/snapshot.json": "11cf65f09d95902bf220f322ad14fd12ec68ecd551d259819e5cbd5ca87594ca"
+  },
+  "rating_bundle": "data/write-triage-lambda-rating-2026-10-07/ (gitignored, main checkout): lead/rating.py and lead/adjudicate.py (shard build, collection, majority), lead/key.json (seat item -> pair), lead/votes.jsonl (every vote incl. anchors), lead/audit.json, seats/<seat>/ (exactly what each rater saw), workflows/ (the two Workflow scripts)",
+  "text_cap": "pairs: texts verbatim from the pairs file; anchors: rating.py::capped (4,000 chars + \"…[truncated, N chars total]\"), the 09-29 make_rating.py cap"
+}
