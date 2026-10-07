@@ -140,14 +140,29 @@ class TestEnvTransientNonMisattributionWiring:
     absent from all three collections.
     """
 
-    def test_worst_category_ranks_env_transient_above_test_failure(self):
-        """A mixed-category run resolves to env_transient, not test_failure.
+    def test_worst_category_keeps_another_legs_test_failure_over_env_transient(self):
+        """Across legs, a test red is never masked by another leg's env_transient.
 
-        This mirrors how a xdist-death run whose output contains BOTH the
-        env_transient signature and collateral FAILED lines must resolve to
-        the infra category, not the test-drift category.
+        ``_worst_category`` only ever decides between DIFFERENT legs. Task
+        #4103: a genuine test red plus a guard-3 false env_transient type leg
+        must not be held by the merge lane as transient infra (task 4843
+        inverted task 2048's original pin). Task 2048's own case is WITHIN one
+        leg: xdist-death output carrying both the env_transient signature and
+        collateral FAILED lines. ``classify_failure`` decides that one by arm
+        order, pinned in
+        test_xdist_death_with_collateral_failed_line_is_env_transient_within_the_leg.
         """
-        assert verify._worst_category(['test_failure', 'env_transient']) == 'env_transient'
+        assert verify._worst_category(['test_failure', 'env_transient']) == 'test_failure'
+
+    def test_xdist_death_with_collateral_failed_line_is_env_transient_within_the_leg(self):
+        """Task 2048's property, pinned where it lives: inside ONE pytest leg,
+        the xdist-vanished usage error beats a collateral FAILED line."""
+        output = (
+            'usage: pytest [options] [file_or_dir] [file_or_dir] [...]\n'
+            'pytest: error: unrecognized arguments: -n --dist --max-worker-restart=0\n'
+            'FAILED orchestrator/tests/test_x.py::test_y - AssertionError\n'
+        )
+        assert classify_failure(ToolKind.PYTEST, 4, output, False) == 'env_transient'
 
     def test_env_transient_skips_preexisting_break_probe(self):
         """env_transient is non-deterministic to re-probe on main (like infra_timeout)."""
@@ -171,12 +186,18 @@ class TestEnvTransientNonMisattributionWiring:
         """
         assert verify._should_archive_category('env_transient') is True
 
-    def test_env_transient_ranked_above_test_failure_in_category_priority(self):
-        """env_transient must outrank test_failure in the severity list."""
+    def test_test_failure_ranked_above_env_transient_in_category_priority(self):
+        """test_failure must outrank env_transient in the severity list.
+
+        The list only decides between legs, and a host condition reported by
+        one leg must never mask another leg's verdict about the branch (task
+        #4103, task 4843). The within-leg xdist-death case task 2048 cared
+        about is decided by ``classify_failure``'s arm order instead.
+        """
         assert 'env_transient' in verify._CATEGORY_PRIORITY
         assert (
-            verify._CATEGORY_PRIORITY.index('env_transient')
-            < verify._CATEGORY_PRIORITY.index('test_failure')
+            verify._CATEGORY_PRIORITY.index('test_failure')
+            < verify._CATEGORY_PRIORITY.index('env_transient')
         )
 
 
