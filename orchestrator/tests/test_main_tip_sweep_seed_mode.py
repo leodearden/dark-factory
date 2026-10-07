@@ -2,7 +2,8 @@
 
 A WARM sweep must verify a tree CoW-seeded through task 4913's held-lane-lock
 path; a COLD sweep, and the default, must verify an unseeded tree; a warm sweep
-whose seed cannot happen still verifies, cold, and says so in the journal.
+whose seed cannot happen still verifies, cold, and says so in the journal, which
+the main-tip probe sharing that fallback does not.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from _seed_script_stubs import (
 
 from orchestrator import verify as verify_module
 from orchestrator.config import OrchestratorConfig
-from orchestrator.git_ops import GitOps, _run
+from orchestrator.git_ops import GitOps, WorktreeKind, _run
 from orchestrator.main_tip_sweep_cadence import SweepSeedMode
 from orchestrator.verify import VerifyResult
 
@@ -131,3 +132,22 @@ class TestMainTipSweepSeedMode:
             'a warm-requested sweep that ran cold for want of a warm base must '
             f'say so at INFO; got:\n{caplog.text}'
         )
+
+    async def test_warm_probe_without_a_warm_base_keeps_its_cold_fallback_at_debug(
+        self, seed_repo_without_warm_base: Path, caplog: pytest.LogCaptureFixture,
+    ):
+        """The contagion guard's main-tip probe shares the fallback line but runs
+        on a hot path; only the sweep needs it in the journal."""
+        repo = seed_repo_without_warm_base
+        await commit_seed_script(repo, CURRENT_LOCKING_SEED_SCRIPT)
+        git_ops = GitOps(warm_pool_git_config(), repo)
+        _, head, _ = await _run(['git', 'rev-parse', 'HEAD'], cwd=repo)
+
+        with caplog.at_level(logging.DEBUG, logger='orchestrator.git_ops'):
+            async with git_ops.ephemeral_worktree(
+                WorktreeKind.MAIN_PROBE, head.strip(), warm_seed=True,
+            ):
+                pass
+
+        assert any('COLD' in r.getMessage() for r in caplog.records), caplog.text
+        assert not _cold_fallback_logged(caplog), caplog.text
