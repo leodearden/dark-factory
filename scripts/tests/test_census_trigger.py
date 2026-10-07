@@ -35,15 +35,19 @@ def test_census_config_defaults_match_prd_section_7_4():
     assert config.tasks_landed_min_days == 7
     assert config.novelty_spike_count == 4
     assert config.novelty_spike_window_hours == 72
+    assert config.novelty_spike_multiple == 2
+    assert config.novelty_spike_baseline_days == 30
     assert config.floor_days == 5
 
 
 def test_census_config_from_mapping_merges_partial_overrides_over_defaults():
     config = ct.CensusConfig.from_mapping(
-        {"max_interval_days": 3, "novelty_spike": {"count": 9}}
+        {"max_interval_days": 3, "novelty_spike": {"count": 9, "baseline_days": 14}}
     )
     assert config.max_interval_days == 3
     assert config.novelty_spike_count == 9
+    assert config.novelty_spike_baseline_days == 14
+    assert config.novelty_spike_multiple == 2
     # untouched fields keep their §7.4 defaults
     assert config.tasks_landed_threshold == 120
     assert config.tasks_landed_min_days == 7
@@ -83,6 +87,8 @@ def test_census_config_from_mapping_empty_dict_returns_defaults():
         ("floor_days", "floor_days", None),
         ("novelty_spike_count", "count", "novelty_spike"),
         ("novelty_spike_window_hours", "window_hours", "novelty_spike"),
+        ("novelty_spike_multiple", "multiple", "novelty_spike"),
+        ("novelty_spike_baseline_days", "baseline_days", "novelty_spike"),
     ],
 )
 @pytest.mark.parametrize("bad", ["10", "", 10.0, 1.5, True, False, -1, None, [10], {"n": 10}])
@@ -137,7 +143,7 @@ def test_census_config_from_mapping_reports_every_bad_value_in_one_warning(caplo
                 "max_interval_days": "10",
                 "floor_days": -1,
                 "tasks_landed_threshold": 200,  # the one good override
-                "novelty_spike": {"window_hours": None},
+                "novelty_spike": {"window_hours": None, "multiple": "2"},
             }
         )
 
@@ -145,11 +151,12 @@ def test_census_config_from_mapping_reports_every_bad_value_in_one_warning(caplo
     assert config.max_interval_days == ct.CensusConfig().max_interval_days
     assert config.floor_days == ct.CensusConfig().floor_days
     assert config.novelty_spike_window_hours == ct.CensusConfig().novelty_spike_window_hours
+    assert config.novelty_spike_multiple == ct.CensusConfig().novelty_spike_multiple
 
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     message = warnings[0].getMessage()
-    for named in ("max_interval_days", "floor_days", "window_hours"):
+    for named in ("max_interval_days", "floor_days", "window_hours", "multiple"):
         assert named in message
     assert "tasks_landed_threshold" not in message
 
@@ -163,7 +170,9 @@ def test_census_config_from_mapping_accepts_every_valid_int_silently(caplog):
                 "max_interval_days": 0,
                 "floor_days": 0,
                 "tasks_landed_threshold": 10_000,
-                "novelty_spike": {"count": 0, "window_hours": 1},
+                "novelty_spike": {
+                    "count": 0, "window_hours": 1, "multiple": 0, "baseline_days": 0,
+                },
             }
         )
 
@@ -174,6 +183,8 @@ def test_census_config_from_mapping_accepts_every_valid_int_silently(caplog):
     assert config.tasks_landed_threshold == 10_000
     assert config.novelty_spike_count == 0
     assert config.novelty_spike_window_hours == 1
+    assert config.novelty_spike_multiple == 0
+    assert config.novelty_spike_baseline_days == 0
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +204,8 @@ def test_census_config_defaults_match_legibility_config_census_model():
     assert config.tasks_landed_min_days == beta_defaults.tasks_landed_min_days
     assert config.novelty_spike_count == beta_defaults.novelty_spike.count
     assert config.novelty_spike_window_hours == beta_defaults.novelty_spike.window_hours
+    assert config.novelty_spike_multiple == beta_defaults.novelty_spike.multiple
+    assert config.novelty_spike_baseline_days == beta_defaults.novelty_spike.baseline_days
     assert config.floor_days == beta_defaults.floor_days
 
 
