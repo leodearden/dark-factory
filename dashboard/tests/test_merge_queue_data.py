@@ -117,6 +117,7 @@ async def empty_merge_events_conn(empty_merge_events_db):
 # Imports under test (deferred so the test file fails gracefully before impl)
 # ---------------------------------------------------------------------------
 
+from dashboard.data import merge_queue  # noqa: E402
 from dashboard.data.datum import Datum, DatumState, validate_datum  # noqa: E402
 from dashboard.data.merge_queue import (  # noqa: E402
     RECENT_MERGES_CAP,
@@ -935,79 +936,107 @@ def test_recent_merges_cap_is_two_hundred():
 # TestSpeculativeStats
 # ---------------------------------------------------------------------------
 
+@pytest.fixture()
+async def tableless_runs_conn(tmp_path):
+    """A readable runs.db with NO ``events`` table: every query raises OperationalError."""
+    db_path = tmp_path / 'tableless_runs.db'
+    sqlite3.connect(str(db_path)).close()
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        yield conn
+
+
+async def _speculative_over(db_path, events, *, now):
+    conn_sync = sqlite3.connect(str(db_path))
+    for evt in events:
+        _insert_event(conn_sync, **evt)
+    conn_sync.commit()
+    conn_sync.close()
+    async with aiosqlite.connect(str(db_path)) as db:
+        db.row_factory = aiosqlite.Row
+        return await speculative_stats(db, hours=24, now=now)
+
+
+def _speculative_events(event_type, count, *, now, first_minutes_ago=1):
+    return [
+        {'event_type': event_type, 'timestamp': now - timedelta(minutes=i + first_minutes_ago)}
+        for i in range(count)
+    ]
+
+
 class TestSpeculativeStats:
     @pytest.mark.asyncio
     async def test_populated(self, merge_events_db):
-        """hit_count, discard_count, total, hit_rate computed correctly."""
+        """A readable window is one FRESH Datum carrying the counts and their rate."""
         now = datetime.now(UTC)
-        conn_sync = sqlite3.connect(str(merge_events_db))
-        for i in range(5):
-            _insert_event(conn_sync, event_type='speculative_merge',
-                          timestamp=now - timedelta(minutes=i + 1),
-                          data={'base_sha': f'abc{i}'})
-        for i in range(2):
-            _insert_event(conn_sync, event_type='speculative_discard',
-                          timestamp=now - timedelta(minutes=i + 10),
-                          data={'reason': 'previous_failed'})
-        conn_sync.commit()
-        conn_sync.close()
+        datum = await _speculative_over(
+            merge_events_db,
+            _speculative_events('speculative_merge', 5, now=now)
+            + _speculative_events('speculative_discard', 3, now=now, first_minutes_ago=10),
+            now=now,
+        )
 
-        async with aiosqlite.connect(str(merge_events_db)) as db:
-            db.row_factory = aiosqlite.Row
-            result = await speculative_stats(db, hours=24)
-
-        assert result['hit_count'] == 5
-        assert result['discard_count'] == 2
-        assert result['total'] == 7
-        assert result['hit_rate'] == pytest.approx(5 / 7, abs=1e-6)
-
-    @pytest.mark.asyncio
-    async def test_none_db(self):
-        result = await speculative_stats(None, hours=24)
-        assert result == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
+        assert isinstance(datum, Datum)
+        assert datum.state is DatumState.FRESH
+        assert datum.reason is None
+        assert datum.as_of == now
+        assert datum.freshness_bound_seconds == merge_queue.RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
+        assert datum.value == {'hit_count': 5, 'discard_count': 3, 'total': 8, 'hit_rate': 5 / 8}
+        validate_datum(datum, now)
 
     @pytest.mark.asyncio
     async def test_empty_db(self, empty_merge_events_conn):
-        result = await speculative_stats(empty_merge_events_conn, hours=24)
-        assert result == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
+        """A readable empty window is measured zeros, and a zero-attempt window has no rate."""
+        now = datetime.now(UTC)
+        datum = await speculative_stats(empty_merge_events_conn, hours=24, now=now)
+
+        assert datum.state is DatumState.FRESH
+        assert datum.as_of == now
+        assert datum.value == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None}
+        validate_datum(datum, now)
+
+    @pytest.mark.asyncio
+    async def test_none_db(self):
+        """A project with no runs.db open has no counts, not zero counts."""
+        now = datetime.now(UTC)
+        datum = await speculative_stats(None, hours=24, now=now)
+
+        assert datum.state is DatumState.UNKNOWN
+        assert datum.value is None
+        assert datum.as_of is None
+        assert 'no runs.db is open' in (datum.reason or '')
+        validate_datum(datum, now)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_read_is_unknown_not_zeros(self, tableless_runs_conn):
+        """with_db swallows the OperationalError; its default must still say the read failed."""
+        now = datetime.now(UTC)
+        datum = await speculative_stats(tableless_runs_conn, hours=24, now=now)
+
+        assert datum.state is DatumState.UNKNOWN
+        assert datum.value is None
+        assert 'speculative-merge events could not be read' in (datum.reason or '')
+        validate_datum(datum, now)
 
     @pytest.mark.asyncio
     async def test_all_hits(self, merge_events_db):
-        """All speculative_merge → hit_rate=1.0."""
         now = datetime.now(UTC)
-        conn_sync = sqlite3.connect(str(merge_events_db))
-        for i in range(3):
-            _insert_event(conn_sync, event_type='speculative_merge',
-                          timestamp=now - timedelta(minutes=i + 1),
-                          data={'base_sha': f'sha{i}'})
-        conn_sync.commit()
-        conn_sync.close()
+        datum = await _speculative_over(
+            merge_events_db, _speculative_events('speculative_merge', 3, now=now), now=now,
+        )
 
-        async with aiosqlite.connect(str(merge_events_db)) as db:
-            db.row_factory = aiosqlite.Row
-            result = await speculative_stats(db, hours=24)
-
-        assert result['hit_rate'] == pytest.approx(1.0)
-        assert result['discard_count'] == 0
+        assert datum.value['hit_rate'] == pytest.approx(1.0)
+        assert datum.value['discard_count'] == 0
 
     @pytest.mark.asyncio
     async def test_all_discards(self, merge_events_db):
-        """All speculative_discard → hit_rate=0.0."""
         now = datetime.now(UTC)
-        conn_sync = sqlite3.connect(str(merge_events_db))
-        for i in range(3):
-            _insert_event(conn_sync, event_type='speculative_discard',
-                          timestamp=now - timedelta(minutes=i + 1),
-                          data={'reason': 'chain_invalidated'})
-        conn_sync.commit()
-        conn_sync.close()
+        datum = await _speculative_over(
+            merge_events_db, _speculative_events('speculative_discard', 3, now=now), now=now,
+        )
 
-        async with aiosqlite.connect(str(merge_events_db)) as db:
-            db.row_factory = aiosqlite.Row
-            result = await speculative_stats(db, hours=24)
-
-        assert result['hit_rate'] == pytest.approx(0.0)
-        assert result['hit_count'] == 0
+        assert datum.value['hit_rate'] == pytest.approx(0.0)
+        assert datum.value['hit_count'] == 0
 
 
 # ---------------------------------------------------------------------------
