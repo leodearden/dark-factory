@@ -501,7 +501,7 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
                 group_id='proj1', operation='add_episode',
                 payload={'uuid': u, 'name': 'ep', 'content': 'c', 'group_id': 'proj1'},
             )
-            await poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1)
 
             dead = await q.get_dead_items()
             assert len(dead) == 1, f'expected one dead item, got {dead!r}'
