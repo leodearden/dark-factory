@@ -38,7 +38,9 @@ Run from ``fused-memory/``::
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+import json
 import math
 import sys
 import types
@@ -90,6 +92,10 @@ POPULATION_KEYS: tuple[str, ...] = (
     'n_writes', 'n_judge_band', 'projects', 'frozen_at', 'snapshot_sha256',
 )
 """The C2'' subset of π's population block that μ's artifacts carry."""
+
+
+class MatrixInputError(ValueError):
+    """An input does not match what π published, so nothing is scored."""
 
 
 @dataclass(frozen=True)
@@ -180,6 +186,59 @@ class Population:
         return {key: self.block[key] for key in POPULATION_KEYS}
 
 
+def read_arm_cases(population: Population, data_root: Path) -> dict[str, list[dict[str, Any]]]:
+    """Every π arm's case rows, refusing a file that is not the one π published."""
+    return {arm.name: _read_arm(arm, population, Path(data_root)) for arm in population.arms}
+
+
+def _read_arm(arm: PiArm, population: Population, data_root: Path) -> list[dict[str, Any]]:
+    path = data_root / arm.cases_path
+    try:
+        body = path.read_bytes()
+    except FileNotFoundError:
+        raise MatrixInputError(
+            f'arm {arm.name}: {path} does not exist; pass the checkout holding π\'s'
+            ' data/ (e.g. the main checkout) as --data-root'
+        ) from None
+    actual = hashlib.sha256(body).hexdigest()
+    if actual != arm.cases_sha256:
+        raise MatrixInputError(
+            f'arm {arm.name}: {path} has sha256 {actual}, but π published {arm.cases_sha256}'
+        )
+    rows = _read_jsonl(path)
+    _refuse_foreign_rows(arm, path, rows, 'arm', arm.name)
+    _refuse_foreign_rows(arm, path, rows, 'snapshot_sha256', population.block['snapshot_sha256'])
+    return rows
+
+
+def _refuse_foreign_rows(
+    arm: PiArm, path: Path, rows: Sequence[Mapping[str, Any]], key: str, expected: str,
+) -> None:
+    foreign = sorted({str(row.get(key)) for row in rows} - {expected})
+    if foreign:
+        raise MatrixInputError(
+            f'arm {arm.name}: {path} holds rows whose {key} is {foreign}, not {expected!r}'
+        )
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    with path.open(encoding='utf-8') as lines:
+        for number, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise MatrixInputError(f'{path}:{number}: not a JSON line ({exc.msg})') from exc
+            if not isinstance(row, dict):
+                raise MatrixInputError(
+                    f'{path}:{number}: not a JSON object line (got {type(row).__name__})'
+                )
+            rows.append(row)
+    return rows
+
+
 @dataclass(frozen=True)
 class Bound:
     """One Γ3 requirement on the best-config doc, spelled as the gate's ``--require``."""
@@ -248,6 +307,7 @@ def build_matrix(
     scores = _scorer.score_pairs(
         chain.from_iterable(cases_by_arm.values()), verdicts, reference_arm=reference.name,
     )
+    _refuse_judge_band_drift(population, scores['arms'])
     block = population.c2_block()
     scored = [
         _with_bounds(_scored_row(arm, scores['arms'][arm.name]), block, bounds)
@@ -340,10 +400,21 @@ def _refuse_unmatched_cases(
     population: Population, cases_by_arm: Mapping[str, Iterable[Mapping[str, Any]]],
 ) -> None:
     if sorted(cases_by_arm) != sorted(population.names):
-        raise ValueError(
+        raise MatrixInputError(
             f'case rows are given for arms {sorted(cases_by_arm)} but the population'
             f' publishes {sorted(population.names)}'
         )
+
+
+def _refuse_judge_band_drift(population: Population, scored: Mapping[str, Any]) -> None:
+    published = population.block['n_judge_band']
+    for arm in population.arms:
+        held = scored[arm.name]['population']['n_judge_band']
+        if held != published:
+            raise MatrixInputError(
+                f'arm {arm.name} holds {held} judge-band writes, but the population'
+                f' publishes n_judge_band {published}'
+            )
 
 
 def _refuse_scored_and_skipped(population: Population) -> None:
