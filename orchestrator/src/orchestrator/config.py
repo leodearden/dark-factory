@@ -4132,6 +4132,12 @@ class OrchestratorConfig(BaseSettings):
     # full builds when main hasn't advanced within the interval.
     main_tip_sweep_enabled: bool = Field(default=True)
     main_tip_sweep_interval_secs: float = Field(default=1800.0)
+    # The sweep builds WARM (CoW-seeded from the warm-lane base) by default and
+    # COLD, as the ground-truth control, at most once per this many seconds since
+    # the last cold sweep that reached a verdict (persisted in runs.db; task 5812,
+    # superseding task 2567's always-cold sweep).  0 = every sweep cold.
+    # Restart-only (not in RELOADABLE_FIELDS), like the rest of the family.
+    main_tip_sweep_cold_interval_secs: float = Field(default=86400.0, ge=0.0)
 
     # Periodic deterministic-strand reconciliation sweep (task 2074).
     # Defensive/non-blocking background recovery sweep for deterministic
