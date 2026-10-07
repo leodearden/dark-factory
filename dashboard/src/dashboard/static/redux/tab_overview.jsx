@@ -10,6 +10,10 @@ const {
 } = window.DF_TASK_SNAPSHOT;
 const { plainDatum } = window.DF_DATUM;
 const { writeQueue, queueCountsText, queueHealth, newestHourOps, opsTotals, opsCaption } = window.DF_MEMORY_READINGS;
+// The System health decisions (system_health.js); same CANONICAL note.
+const {
+  graphitiHealth, mem0Health, taskStoreHealth, fusedMemoryHealth, healthTone, healthSummary,
+} = window.DF_SYSTEM_HEALTH;
 const { useState, useEffect } = React;
 
 // Which endpoint each tile's number arrived on — plainDatum's provenance is
@@ -212,6 +216,45 @@ function OverviewTab({ paused }) {
   const costSpark = (D.COSTS.trend.values || []).slice(-30);
   const deltaPct = D.COSTS.summary?.delta_pct;
 
+  const healthRows = [
+    { l: 'Graphiti', ...graphitiHealth(D) },
+    { l: 'Mem0', ...mem0Health(D) },
+    { l: 'Taskmaster', ...taskStoreHealth(D) },
+    { l: 'fused-memory', sub: `up ${window.DF_SHELL.fmtUptime(D.MEMORY_STATUS.uptime_seconds)}`, ...fusedMemoryHealth(D) },
+    { l: 'Write queue', sub: <DatumReading datum={queue} format={queueCountsText} />, ...queueHealth(queue) },
+    (() => {
+      const v = D.RECON_STATE.verdict;
+      const sev = v?.severity || 'none';
+      const action = v?.action_taken || 'none';
+      // A PHANTOM verdict is a fabricated placeholder for a review
+      // that never happened — produced by Judge._parse_verdict's
+      // except block when the judge's own output could not be parsed,
+      // and classified by shared.phantom_verdict. It is stored with
+      // severity='serious', so without this branch the row below
+      // paints a red `bad` dot reading "verdict: serious · halt" for a
+      // finding no judge ever made. Rendered `warn` (yellow) rather
+      // than `bad`: the run genuinely went unreviewed, which is
+      // degraded, but nothing serious was actually found.
+      if (v?.is_phantom) {
+        return { l: 'Reconciliation', sub: `verdict: unreviewed (unparseable judge output) · ${action}`, ok: true, warn: true };
+      }
+      return { l: 'Reconciliation', sub: `verdict: ${sev} · ${action}`, ok: sev !== 'serious', warn: sev === 'minor' };
+    })(),
+    (() => {
+      const wal = D.MEMORY_STATUS.wal || { status: 'offline', rows: [] };
+      const rowCount = (wal.rows || []).length;
+      const sub = wal.reason
+        ? wal.reason
+        : (rowCount ? `${rowCount} store(s) · all current` : 'no data yet');
+      return {
+        l: 'SQLite WAL',
+        sub,
+        ok: wal.status === 'ok' || wal.status === 'warn',
+        warn: wal.status === 'warn',
+      };
+    })(),
+  ];
+
   return (
     <div className="grid cols-12" style={{ gridTemplateRows: 'auto auto 1fr', gap: 12, height: '100%' }}>
 
@@ -334,54 +377,17 @@ function OverviewTab({ paused }) {
       <div className="col-span-3 panel">
         <div className="panel-head">
           <span className="title">System health</span>
-          <span className="meta">all ok</span>
+          <span className="meta">{healthSummary(healthRows)}</span>
         </div>
         <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {[
-            { l: 'Graphiti', sub: `${D.MEMORY_STATUS.graphiti.node_count.toLocaleString()} nodes · ${D.MEMORY_STATUS.graphiti.edge_count.toLocaleString()} edges`, ok: true },
-            { l: 'Mem0',     sub: `${D.MEMORY_STATUS.mem0.memory_count.toLocaleString()} memories`, ok: true },
-            { l: 'Taskmaster', sub: 'mcp v0.18 · responsive', ok: true },
-            { l: 'fused-memory', sub: `up ${window.DF_SHELL.fmtUptime(D.MEMORY_STATUS.uptime_seconds)}`, ok: !D.MEMORY_STATUS.offline, title: D.MEMORY_STATUS.started_at || undefined },
-            { l: 'Write queue', sub: <DatumReading datum={queue} format={queueCountsText} />, ...queueHealth(queue) },
-            (() => {
-              const v = D.RECON_STATE.verdict;
-              const sev = v?.severity || 'none';
-              const action = v?.action_taken || 'none';
-              // A PHANTOM verdict is a fabricated placeholder for a review
-              // that never happened — produced by Judge._parse_verdict's
-              // except block when the judge's own output could not be parsed,
-              // and classified by shared.phantom_verdict. It is stored with
-              // severity='serious', so without this branch the row below
-              // paints a red `bad` dot reading "verdict: serious · halt" for a
-              // finding no judge ever made. Rendered `warn` (yellow) rather
-              // than `bad`: the run genuinely went unreviewed, which is
-              // degraded, but nothing serious was actually found.
-              if (v?.is_phantom) {
-                return { l: 'Reconciliation', sub: `verdict: unreviewed (unparseable judge output) · ${action}`, ok: true, warn: true };
-              }
-              return { l: 'Reconciliation', sub: `verdict: ${sev} · ${action}`, ok: sev !== 'serious', warn: sev === 'minor' };
-            })(),
-            (() => {
-              const wal = D.MEMORY_STATUS.wal || { status: 'offline', rows: [] };
-              const rowCount = (wal.rows || []).length;
-              const sub = wal.reason
-                ? wal.reason
-                : (rowCount ? `${rowCount} store(s) · all current` : 'no data yet');
-              return {
-                l: 'SQLite WAL',
-                sub,
-                ok: wal.status === 'ok' || wal.status === 'warn',
-                warn: wal.status === 'warn',
-              };
-            })(),
-          ].map(s => (
-            <div key={s.l} style={{ display: 'grid', gridTemplateColumns: 'auto 1fr auto', gap: 8, alignItems: 'center' }}>
-              <span className={`dot ${s.ok ? (s.warn ? 'warn' : 'ok') : 'bad'}`}></span>
+          {healthRows.map(s => (
+            <div key={s.l} title={s.title || undefined} style={{ display: 'grid', gridTemplateColumns: 'auto 1fr auto', gap: 8, alignItems: 'center' }}>
+              <span className={`dot ${healthTone(s)}`}></span>
               <div style={{ minWidth: 0 }}>
                 <div style={{ fontSize: 12, color: 'var(--fg-1)' }}>{s.l}</div>
                 <div style={{ fontSize: 10, color: 'var(--fg-3)' }}>{s.sub}</div>
               </div>
-              <span className={`badge ${s.ok ? (s.warn ? 'warn' : 'ok') : 'bad'}`}>{s.ok ? (s.warn ? 'warn' : 'ok') : 'bad'}</span>
+              <span className={`badge ${healthTone(s)}`}>{healthTone(s)}</span>
             </div>
           ))}
           <div style={{ marginTop: 4, paddingTop: 8, borderTop: '1px solid var(--line)' }}>
