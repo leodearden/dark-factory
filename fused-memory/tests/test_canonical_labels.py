@@ -34,6 +34,21 @@ from fused_memory.utils.canonical_labels import (
 ARABIC_INDIC_THREE = '\u0663'  # ARABIC-INDIC DIGIT THREE
 FULLWIDTH_THREE = '\uff13'  # FULLWIDTH DIGIT THREE — the same hazard, a second block
 
+# Unicode letters that case-fold onto ASCII 's' and 'k' under re.IGNORECASE —
+# same escape-spelling rationale as above: U+212A KELVIN SIGN renders as an
+# ordinary 'K' in most terminals, so a literal-character fixture would be
+# unreviewable and would look like a duplicate of the ASCII case.
+LATIN_SMALL_LETTER_LONG_S = '\u017f'  # folds onto ASCII 's' under re.IGNORECASE
+KELVIN_SIGN = '\u212a'  # folds onto ASCII 'k' under re.IGNORECASE
+
+# Whitespace that '\s' matches and '[ \t]' does not, WITHOUT being a line
+# break — same escape-spelling rationale again: NO-BREAK SPACE and EM SPACE
+# render as ordinary spaces, so literal-character fixtures would be
+# indistinguishable from the ASCII-space cases they exist to contrast with.
+NO_BREAK_SPACE = '\u00a0'
+EM_SPACE = '\u2003'
+FORM_FEED = '\x0c'  # matched by '\s'; neither a space, a tab, nor a newline
+
 
 class TestReferentNodeName:
     """``Referent.node_name`` renders the graph node name the referent denotes.
@@ -439,10 +454,11 @@ class TestUnicodeDigitsAreNotTaskNumbers:
     (the four colon-padding spellings) already run on every commit, and between
     them they are what proves this narrowing disturbed neither the separator
     alternation, the case-insensitivity, nor the colon padding — that padding
-    being a SEPARATE axis, tracked as task 4235 (duplicate filing 4239) and
-    scoped out here. A second copy of those lists inside this class would be
-    the very lockstep duplication INV-5 exists to prevent, reproduced in the
-    test suite: the next narrowing would touch one copy and the two would drift.
+    was a SEPARATE axis, scoped out here and closed later by task 4850 (which
+    coalesced task 4235; task 4239 was cancelled as a duplicate filing). A second
+    copy of those lists inside this class would be the very lockstep duplication
+    INV-5 exists to prevent, reproduced in the test suite: the next narrowing
+    would touch one copy and the two would drift.
     """
 
     @pytest.mark.parametrize(
@@ -545,6 +561,108 @@ class TestUnicodeDigitsAreNotTaskNumbers:
         assert scan.ambiguous == ()
 
 
+class TestTaskWordIsAsciiOnly:
+    """The literal word 'task(s)' is ASCII, meant to be matched
+    case-insensitively only across the ASCII 'a'-'z'/'A'-'Z' range. Python's
+    ``re`` performs FULL Unicode case folding under ``re.IGNORECASE`` on str
+    patterns, so a Unicode letter that case-folds onto an ASCII letter —
+    U+017F LATIN SMALL LETTER LONG S onto 's', U+212A KELVIN SIGN onto 'k' —
+    is accepted as if it were the ASCII letter itself, minting a referent
+    from a word that was never actually 'task'.
+
+    This is a false POSITIVE against :func:`scan_content`'s own
+    PRECISION-OVER-RECALL contract, the same direction as
+    :class:`TestUnicodeDigitsAreNotTaskNumbers` above but a DIFFERENT axis —
+    that class narrows the DIGITS, this one narrows the WORD.
+
+    It is WORSE than the digit case even though both are low likelihood: the
+    referent minted here carries a REAL ASCII number, so a lookalike
+    spelling of 'Task 5' names a task that EXISTS — a consumer doing
+    destructive edge surgery misattributes facts onto a LIVE node rather
+    than an obviously-junk one. And task 4174's digit narrowing does not
+    cover this: the number here was already ASCII: only the WORD was
+    spelled with a lookalike.
+
+    ONE thing the narrowing changes BEYOND refusing the lookalike, declared
+    because the module calls this direction dangerous elsewhere: removing a
+    bare mention also removes a CONTEST. ``_LOCAL_MENTION_PATTERN``'s
+    whitespace branch is deliberately left Unicode-broad precisely because
+    narrowing it would mean 'fewer bare mentions ... which means MORE
+    confident splits on prose that pre-3667 refused'. The same is true here —
+    and it is acceptable here only because the mention removed was never the
+    word 'task', so the contest it created was SPURIOUS, not a genuine
+    competing reading. ``test_a_lookalike_mention_no_longer_contests_a_``
+    ``foreign_ref`` pins the measured shape so a revert cannot silently
+    restore the phantom contest.
+
+    The standing ASCII regression guards are deliberately NOT copied into
+    this class, following the convention TestUnicodeDigitsAreNotTaskNumbers
+    documents for the same reason: TestParseNodeNameMatchesLocalForms and
+    TestScanContentFindsOwnProjectReferents already pin every ASCII spelling
+    ('task', 'tasks', 'Task', 'TASK', 'Tasks', 'TaSkS', 'task#5', 'task #5',
+    'Task: 5', ' tasks 9 ') and run on every commit; those ARE the proof
+    this narrowing disturbed nothing. A second copy here would be the very
+    lockstep duplication INV-5 exists to prevent.
+    """
+
+    def test_a_long_s_lookalike_mention_yields_no_referent(self):
+        content = 'ta' + LATIN_SMALL_LETTER_LONG_S + 'k 5'
+        scan = scan_content(content, group_id='reify')
+        assert scan.refs == ()
+
+    def test_a_kelvin_sign_lookalike_mention_yields_no_referent(self):
+        content = 'tas' + KELVIN_SIGN + ' 5'
+        scan = scan_content(content, group_id='reify')
+        assert scan.refs == ()
+
+    def test_a_lookalike_mention_in_prose_yields_no_referent(self):
+        content = 'blocked on ta' + LATIN_SMALL_LETTER_LONG_S + 'k 5 now'
+        scan = scan_content(content, group_id='reify')
+        assert scan.refs == ()
+
+    def test_a_lookalike_on_the_optional_trailing_s_yields_no_referent(self):
+        """The lookalike lands on the OPTIONAL trailing 's' of 'tasks?' here,
+        a distinct code path from the stem substitutions above — verified to
+        match today."""
+        content = 'task' + LATIN_SMALL_LETTER_LONG_S + ' 5'
+        scan = scan_content(content, group_id='reify')
+        assert scan.refs == ()
+
+    def test_a_long_s_lookalike_node_name_is_not_a_task_label(self):
+        assert parse_node_name('Ta' + LATIN_SMALL_LETTER_LONG_S + 'k 5') is None
+
+    def test_a_kelvin_sign_lookalike_node_name_is_not_a_task_label(self):
+        assert parse_node_name('Tas' + KELVIN_SIGN + ' 5') is None
+
+    def test_a_mixed_lookalike_substitution_is_not_a_task_label(self):
+        """Both lookalikes at once, replacing 's' and 'k' in the same word."""
+        name = 'ta' + LATIN_SMALL_LETTER_LONG_S + KELVIN_SIGN + ' 5'
+        assert parse_node_name(name) is None
+
+    def test_a_lookalike_mention_no_longer_contests_a_foreign_ref(self):
+        """The PARTITION axis, not just the refusal: a phantom bare mention
+        used to push a genuine foreign ref into ``.ambiguous``, and no longer
+        does.
+
+        MEASURED before the narrowing, with the pre-change pattern restored
+        in-memory: this content yielded ``refs == ()`` with
+        ``ambiguous == ['reify:5', 'Task 5']`` — a contested scan every
+        downstream consumer no-ops on. After it, the phantom 'Task 5' is gone
+        and the genuine foreign ref stands alone in ``.refs``, where a
+        consumer doing destructive edge surgery WILL act on it.
+
+        So this is not a pure precision win: it hands over a referent the
+        permissive scan withheld. Acceptable because the withholding rested on
+        a word that was never 'task' — see the class docstring. Pinned so a
+        revert of the narrowing fails HERE rather than silently reopening the
+        phantom contest, which no other test in the suite would notice.
+        """
+        content = 'reify:5 blocks ta' + LATIN_SMALL_LETTER_LONG_S + 'k 5'
+        scan = scan_content(content, group_id='dark_factory')
+        assert [r.node_name for r in scan.refs] == ['reify:5']
+        assert scan.ambiguous == ()
+
+
 class TestQualifiedRefNeverSpansALineBreak:
     """The PROJECT-QUALIFIED pattern's colon is padded with '[ \\t]', not '\\s',
     for the same measured reason as the mention pattern's above: '\\s' matches
@@ -607,6 +725,158 @@ class TestQualifiedRefNeverSpansALineBreak:
             assert [r.node_name for r in scan_content(content, group_id='reify').refs] == [
                 'dark_factory:2500'
             ], content
+
+
+class TestQualifiedNodeNameNeverSpansALineBreak:
+    """The ANCHORED twin of :class:`TestQualifiedRefNeverSpansALineBreak`
+    above: the same '[ \\t]'-not-'\\s' colon narrowing, applied to
+    :data:`_QUALIFIED_NODE_NAME_PATTERN` (used by :func:`parse_node_name`)
+    instead of :data:`_QUALIFIED_REF_PATTERN` (used by :func:`scan_content`).
+    Read the two classes together: that one pins the UNANCHORED (prose-scan)
+    half of the invariant, this one the ANCHORED (whole-name) half.
+
+    Direction of safety: this pattern mints ONLY foreign referents. Every
+    local spelling is already claimed earlier inside :func:`parse_node_name`
+    by :data:`_TASK_NODE_NAME_PATTERN`, which is tried first, so nothing that
+    reaches this pattern is ever a local task. For a consumer performing
+    destructive edge surgery on the referent this mints, a missed ref is
+    recoverable — the node is simply left untouched — while a misattributed
+    one is not: it renames or re-attaches edges on the WRONG node. So
+    narrowing what this pattern accepts is the safe direction, exactly as it
+    is for _QUALIFIED_REF_PATTERN above.
+    """
+
+    def test_colon_followed_by_newline_is_not_a_qualified_node_name(self):
+        """Measured RED before the fix: parse_node_name('reify:\\n132')
+        returned Referent(project_id='reify', number='132') — an entity NAME
+        containing a hard line break parsed as a project-qualified label."""
+        assert parse_node_name('reify:\n132') is None
+
+    def test_newline_before_the_colon_is_not_a_qualified_node_name(self):
+        """BOTH halves are narrowed: the '\\s*' preceding the colon spans a
+        newline exactly as the trailing one does, so fixing only the trailing
+        half would leave the stated invariant half-true. Measured RED:
+        parse_node_name('reify\\n:132') also returned
+        Referent(project_id='reify', number='132')."""
+        assert parse_node_name('reify\n:132') is None
+
+    def test_blank_line_between_qualifier_and_number_is_not_a_qualified_node_name(self):
+        """The paragraph-break shape: two newlines rather than one."""
+        assert parse_node_name('reify:\n\n132') is None
+
+    def test_same_line_spellings_are_unaffected(self):
+        """Regression guard, green before AND after: the padding still
+        tolerates the ASCII spaces and tabs humans actually write around a
+        colon. Asserts on ``.node_name``, not just non-None, so a referent
+        that parsed to the WRONG thing would still fail this.
+
+        Includes leading/trailing SPACE and TAB around the whole name
+        ('  reify:132  ', '\\treify:132\\t') alongside the colon-adjacent
+        spellings, so this guard also covers the ANCHORING padding that
+        :class:`TestQualifiedNodeNameAnchoringRejectsNewlines` below narrows.
+
+        SCOPE OF THE CLAIM, corrected: this proves only that ASCII space and
+        tab spelling survives. It does NOT prove the narrowing is confined to
+        line breaks — '[ \\t]' drops EVERY non-space/tab whitespace character,
+        so NBSP and form-feed padding stopped parsing too. That second axis is
+        a separate, measured consequence with its own guard; see
+        :class:`TestQualifiedNodeNamePaddingIsAsciiSpaceAndTabOnly` below."""
+        for name in (
+            'reify:132',
+            'reify: 132',
+            'reify :132',
+            'reify : 132',
+            'reify\t:\t132',
+            '  reify:132  ',
+            '\treify:132\t',
+        ):
+            referent = parse_node_name(name)
+            assert referent is not None, name
+            assert referent.node_name == 'reify:132', name
+
+
+class TestQualifiedNodeNameAnchoringRejectsNewlines:
+    """The ANCHORING padding of :data:`_QUALIFIED_NODE_NAME_PATTERN` —
+    ``^\\s*`` and ``\\s*$`` — must not span a line break either: a leading or
+    trailing newline means the string as a whole is not a task-node NAME,
+    even when the qualifier-colon-number core is otherwise well-formed.
+
+    CRITICAL, and the reason ``'reify:132\\n'`` gets its own fixture here:
+    Python's ``$`` (without ``re.MULTILINE``) matches at end-of-string AND
+    just before a single trailing newline. So the naive narrowing
+    ``[ \\t]*$`` would STILL accept ``'reify:132\\n'`` while rejecting
+    ``'reify:132\\n\\n'`` — an incoherent half-fix that refuses a doubled
+    trailing newline but accepts a single one. MEASURED on the candidate
+    pattern during planning. The terminator must be ``\\Z``, which refuses
+    both. Do not "simplify" ``\\Z`` back to ``$``: ``'reify:132\\n'`` is
+    precisely the fixture that would catch that regression reopening the gap
+    silently, with the rest of the suite still green.
+    """
+
+    @pytest.mark.parametrize(
+        'name',
+        [
+            '\nreify:132',
+            'reify:132\n',
+            'reify:132\n\n',
+            '\n\nreify:132\n\n',
+            # Trailing space THEN newline — catches a '[ \t]*$' spelling that
+            # would otherwise slip through even after the '$' -> '\Z' fix,
+            # since the space would be consumed by '[ \t]*' leaving only the
+            # newline for '$' to (wrongly) tolerate.
+            'reify:132 \n',
+        ],
+    )
+    def test_leading_or_trailing_newline_is_not_a_qualified_node_name(self, name):
+        assert parse_node_name(name) is None
+
+
+class TestQualifiedNodeNamePaddingIsAsciiSpaceAndTabOnly:
+    """The SECOND axis of the '\\s' -> '[ \\t]' narrowing, measured and pinned
+    rather than left implicit: '[ \\t]' drops every non-space/tab whitespace
+    character, not only the line breaks the change was motivated by.
+
+    MEASURED at HEAD before the narrowing, all three returning
+    Referent(project_id='reify', number='132'): ``'\\xa0reify:132'``,
+    ``'reify\\xa0:\\xa0132'`` and ``'\\x0creify:132'``. All return None now. So the
+    two sibling classes above understate what changed — their fixtures are all
+    ASCII space/tab plus newline, and nothing in them can see this axis.
+
+    ACCEPTED, not merely observed, and for the same direction-of-safety reason
+    the line-break narrowing rests on: this pattern mints ONLY foreign
+    referents, so a narrowing that REMOVES one is the recoverable direction,
+    while a misattribution is not. NBSP or form-feed padding around a
+    project-qualified node NAME is not a spelling any human or extraction path
+    writes on purpose, and unlike the '\\s' padding on
+    :data:`_TASK_NODE_NAME_PATTERN` — which stays Unicode-broad, and whose
+    breadth only ever costs an exotic SPELLING of an ASCII number — nothing
+    here reaches a consumer as data.
+    """
+
+    @pytest.mark.parametrize(
+        'name',
+        [
+            NO_BREAK_SPACE + 'reify:132',
+            'reify:132' + NO_BREAK_SPACE,
+            'reify' + NO_BREAK_SPACE + ':' + NO_BREAK_SPACE + '132',
+            EM_SPACE + 'reify:132',
+            FORM_FEED + 'reify:132',
+            'reify' + FORM_FEED + ':132',
+        ],
+    )
+    def test_non_ascii_whitespace_padding_is_not_a_qualified_node_name(self, name):
+        assert parse_node_name(name) is None
+
+    def test_the_task_node_pattern_keeps_its_broad_padding(self):
+        """The contrast that makes the acceptance above coherent rather than
+        arbitrary: the LOCAL pattern's '\\s' padding is deliberately NOT
+        narrowed, so the same NBSP spelling still parses there. Measured. This
+        also guards the module docstring's claim that '\\s' padding stays
+        Unicode-broad, which now points at _TASK_NODE_NAME_PATTERN because
+        _QUALIFIED_NODE_NAME_PATTERN no longer has any."""
+        referent = parse_node_name('task' + NO_BREAK_SPACE + '132')
+        assert referent is not None
+        assert referent.node_name == 'Task 132'
 
 
 class TestScanContentOrderingAndDedup:
@@ -767,6 +1037,126 @@ class TestScanContentAllowlist:
             known_project_ids={'dark_factory', '-home-leo-bad'},
         )
         assert [r.node_name for r in scan.refs] == ['dark_factory:2500']
+
+
+class TestNarrowingIsStrictlySubtractive:
+    """Dropping a foreign candidate may REMOVE a referent, never ADD one.
+
+    The allowlist narrows by dropping foreign candidates that name an unknown
+    project — but a dropped candidate is also the thing that was CONTESTING a
+    bare mention of the same number, and losing that contest PROMOTES the bare
+    mention out of ``.ambiguous`` and into ``.refs``. Narrowing would then MINT
+    a referent the permissive scan refused to mint: an episode body that
+    produces no referent set today — so every downstream consumer no-ops on it
+    — silently becomes one that produces a set a repair path will act on. That
+    is the opposite of what an allowlist is for, and the one way narrowing can
+    be a net regression rather than a precision win.
+
+    So the contest is decided against the PERMISSIVE candidate set while the
+    emitted refs stay NARROWED: a dropped junk qualifier leaves the output
+    entirely — it appears in neither ``.refs`` nor ``.ambiguous`` — and the
+    bare number it contested stays withheld from ``.refs``.
+    """
+
+    REGISTRY = {'dark_factory': '/src/dark-factory', 'reify': '/src/reify'}
+
+    # The measured incident shape: a host:port whose digits collide with a task
+    # number, which is why 'localhost:6379' reads as a foreign task ref at all.
+    PORT_COLLISION = 'Restarted redis at localhost:6379 while finishing task 6379.'
+
+    # Junk qualifiers from the measured episode corpus, each beside a bare
+    # mention of the number it collides on. Spelled as
+    # (content, bare node name, junk node name as the PERMISSIVE scan emits it)
+    # rather than derived from the content, so no test-local parser has to
+    # restate the scanner's own canonicalization ('INFO' -> 'info').
+    JUNK_SHAPES = [
+        ('saw localhost:6379 while finishing task 6379', 'Task 6379', 'localhost:6379'),
+        ('saw INFO:1234 while finishing task 1234', 'Task 1234', 'info:1234'),
+        ('saw redis:6379 while finishing task 6379', 'Task 6379', 'redis:6379'),
+        ('saw commit:4321 while finishing task 4321', 'Task 4321', 'commit:4321'),
+        ('saw pending:77 while finishing task 77', 'Task 77', 'pending:77'),
+    ]
+
+    def test_dropping_a_junk_qualifier_never_promotes_the_number_it_contested(self):
+        """MEASURED at HEAD: permissive yields refs=(), narrowed yields
+        refs=(Task 6379,). The EMPTY referent set is the property every
+        downstream consumer no-ops on, so narrowing turning it non-empty is
+        precisely the regression this pins."""
+        scan = scan_content(
+            self.PORT_COLLISION, group_id='dark_factory', known_project_ids=self.REGISTRY
+        )
+        assert scan.refs == ()
+        assert [r.node_name for r in scan.ambiguous] == ['Task 6379']
+
+    def test_the_dropped_qualifier_is_still_gone_from_the_output(self):
+        """Subtractive, not a revert: only the CONTEST survives the drop. The
+        junk qualifier itself appears in NEITHER partition — narrowing still
+        does the job it was wired for."""
+        scan = scan_content(
+            self.PORT_COLLISION, group_id='dark_factory', known_project_ids=self.REGISTRY
+        )
+        emitted = [r.node_name for r in (*scan.refs, *scan.ambiguous)]
+        assert 'localhost:6379' not in emitted
+
+    def test_a_genuine_in_registry_foreign_ref_survives_the_subtraction(self):
+        """Preserving the contest must not cost a real cross-project ref. Here
+        'reify:2500' is in the registry and uncontested, so it stays in
+        ``.refs``, while 'task 6379' stays contested out of them by the
+        dropped 'localhost:6379' it collides with."""
+        scan = scan_content(
+            'See reify:2500 and task 6379 and localhost:6379',
+            group_id='dark_factory',
+            known_project_ids=self.REGISTRY,
+        )
+        assert [r.node_name for r in scan.refs] == ['reify:2500']
+        assert [r.node_name for r in scan.ambiguous] == ['Task 6379']
+
+    @pytest.mark.parametrize(('content', 'bare_name', 'junk_name'), JUNK_SHAPES)
+    def test_every_measured_junk_shape_drops_without_promoting_its_bare_twin(
+        self, content, bare_name, junk_name
+    ):
+        scan = scan_content(content, group_id='dark_factory', known_project_ids=self.REGISTRY)
+        assert scan.refs == ()
+        assert [r.node_name for r in scan.ambiguous] == [bare_name]
+        assert junk_name not in [r.node_name for r in scan.ambiguous]
+
+    @pytest.mark.parametrize('allowlist', [None, {}, set()])
+    @pytest.mark.parametrize(
+        ('content', 'expected_refs', 'expected_ambiguous'),
+        [
+            (PORT_COLLISION, [], ['localhost:6379', 'Task 6379']),
+            (
+                'See reify:2500 and task 6379 and localhost:6379',
+                ['reify:2500'],
+                ['Task 6379', 'localhost:6379'],
+            ),
+            *[
+                (content, [], [junk_name, bare_name])
+                for content, bare_name, junk_name in JUNK_SHAPES
+            ],
+        ],
+    )
+    def test_permissive_mode_is_byte_identical_to_head(
+        self, allowlist, content, expected_refs, expected_ambiguous
+    ):
+        """The fix must be a provable NO-OP when nothing is dropped: with no
+        usable allowlist no candidate is ever skipped, so the extra
+        bookkeeping contributes nothing and every permissive result is the one
+        measured at HEAD."""
+        scan = scan_content(content, group_id='dark_factory', known_project_ids=allowlist)
+        assert [r.node_name for r in scan.refs] == expected_refs
+        assert [r.node_name for r in scan.ambiguous] == expected_ambiguous
+
+    def test_a_contest_from_an_in_registry_foreign_ref_is_unaffected(self):
+        """The ordinary contest — the one that never involved a drop — keeps
+        emitting BOTH sides into ``.ambiguous``, so the new bookkeeping did not
+        disturb the partition it rides alongside."""
+        content = 'reify:2500 blocks task 2500 here'
+        narrowed = scan_content(content, group_id='dark_factory', known_project_ids=self.REGISTRY)
+        permissive = scan_content(content, group_id='dark_factory')
+        assert narrowed == permissive
+        assert narrowed.refs == ()
+        assert [r.node_name for r in narrowed.ambiguous] == ['reify:2500', 'Task 2500']
 
 
 class TestAllPathShapedRegistryIsLoud:

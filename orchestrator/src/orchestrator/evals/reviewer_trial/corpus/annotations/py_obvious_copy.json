@@ -17,5 +17,29 @@
       "description": "The newly added _count_diff_changes() function is defined but never called anywhere in this diff or module. It appears to be dead code that duplicates existing functionality.",
       "mutation_type": "obvious_copy"
     }
-  ]
+  ],
+  "context": {
+    "task": {
+      "title": "Add a base-to-HEAD change-volume helper to evals/metrics.py",
+      "description": "Eval reporting wants the size of the change a run produced \u2014 total lines changed and number of files touched \u2014 between a base ref and the worktree's HEAD. Add an async helper to `orchestrator/src/orchestrator/evals/metrics.py` that takes a repo path and a base ref, runs `git diff --stat` against `HEAD` in that repo, and returns `(total_lines_changed, file_count)` read off the summary line. It must tolerate an empty diff (base == HEAD) without raising, so a run that changed nothing still reports a number rather than blowing up the metric collector.",
+      "test_strategy": "Unit-test the helper in `orchestrator/tests/test_metrics.py` against a temporary git repo with a known base commit and a controlled set of edits, asserting the returned line and file counts agree with what `git diff --stat` reports for that range. Include the zero-change case.",
+      "details": "",
+      "authored": true,
+      "id": null,
+      "record_source": {
+        "kind": "authored",
+        "authored_at": "2026-09-11",
+        "method": "reconstructed from the diff and the annotation description by an opus agent; states intent without naming the planted defect"
+      }
+    },
+    "changed_files": [
+      "orchestrator/src/orchestrator/evals/metrics.py"
+    ],
+    "base_sha": null,
+    "branch_sha": null,
+    "base_sha_reason": "Unrecoverable. The hunk's pre-image requires _git_diff_stats()'s body to end immediately (after 2 blank lines) before collect_metrics' signature, i.e. _git_diff_stats defined directly ABOVE collect_metrics ending at old-line 63. Tested against all 4 first-parent candidates touching orchestrator/src/orchestrator/evals/metrics.py before edf348e (597594951a, bdd3895f1e [merge], b40ba36f1f, d3b14de810) plus the pre-merge tip 86009d3726 -- git apply fails on every one ('corrupt patch' without --recount; 'patch failed: metrics.py:63 / does not apply' with --recount) because none of them has that adjacency: in every one of them collect_metrics is defined BEFORE _git_diff_stats, not after. Widened the search per method step 4 to the file's ENTIRE history: enumerated all 45 commits (git log --all) that ever touched metrics.py and grepped the line numbers of both `async def collect_metrics(` and `async def _git_diff_stats(` in each -- collect_metrics precedes _git_diff_stats in literally every one of the 45 revisions, from the file's introduction (d3b14de8, 2026-03-19) through the newest touch after edf348e (9eb2fa888a, 2026-04-12). The reverse ordering this hunk's pre-image assumes never existed at any point in the file's real history; the synthetic diff was hand-edited against a fictional version of the file.",
+    "plan": null,
+    "plan_reason": "hand-authored fixture: no orchestrator run produced it, so no plan ever existed",
+    "verification": null
+  }
 }

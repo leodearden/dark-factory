@@ -57,6 +57,7 @@ test_proc_supervision.py pending that conversion landing.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import importlib.util
 import logging
 import os
@@ -183,6 +184,31 @@ def _submit_child_setenv_args() -> list[str]:
         )
         return []
     return [f'--setenv=PYTHONPATH={pythonpath}']
+
+
+def _warn_if_submit_module_unimportable(transient_unit: str | None) -> None:
+    """Registration-time canary for the RP-4 on-failure submit child.
+
+    Really imports ``escalation.submit`` in this interpreter and WARNs if that
+    fails. An ``Exception`` or ``SystemExit`` from the import is reported,
+    never raised, so the restart is never blocked. A pass is not proof: the
+    wrapper's fire-time exit :data:`RP4_ESCALATION_SUBMIT_FAILED_RC` stays
+    authoritative. Real-child preflight:
+    ``orchestrator/tests/test_deterministic_runner.py::_assert_submit_cli_invokable``.
+    """
+    try:
+        importlib.import_module('escalation.submit')
+    except (Exception, SystemExit) as exc:
+        logger.warning(
+            'proc_supervision: `escalation.submit` FAILED TO IMPORT in this '
+            'process (%s): %s — the deferred /bin/sh -c on-failure branch for '
+            '%s will exit non-zero at fire time and file NO L2 escalation; the '
+            'wrapper will report that by exiting %d with an `RP-4: on-failure '
+            'escalation submit failed` line, but only into journald, long '
+            'after this deploy',
+            sys.executable, f'{type(exc).__name__}: {exc}', transient_unit,
+            RP4_ESCALATION_SUBMIT_FAILED_RC,
+        )
 
 
 @dataclass(frozen=True)
@@ -810,40 +836,7 @@ class RestartPlan:
         on_active_secs = max(int(self.on_active_secs), 5)
         payload = ' '.join(shlex.quote(p) for p in [str(self.script), *self.args])
         if self.on_failure_escalation is not None:
-            # Registration-time canary. A submit that dies on ImportError at
-            # fire time is NOT silent any more — the wrapper below exits
-            # RP4_ESCALATION_SUBMIT_FAILED_RC and prints an `RP-4:` line (task
-            # 3404) — but that evidence only ever lands in journald, minutes
-            # later, on a unit nobody is watching, and the L2 is still never
-            # filed. This process runs the same interpreter the child will, so
-            # it can prove the invariant here for free (find_spec on an
-            # already-imported package is a dict lookup, and this branch runs
-            # at most once per scheduled restart) and say so while a human is
-            # still watching the deploy. The two reports are complementary,
-            # not redundant: this one is early and in-process, the wrapper's is
-            # authoritative about what actually happened at fire time.  The
-            # test suite preflights the same invariant one layer out, against a
-            # real child interpreter, in
-            # test_deterministic_runner.py::_assert_submit_cli_invokable
-            # (task 3404).
-            try:
-                submit_spec = importlib.util.find_spec('escalation.submit')
-            except (ImportError, AttributeError, ValueError) as exc:
-                submit_spec = None
-                probe_detail = f'{type(exc).__name__}: {exc}'
-            else:
-                probe_detail = 'find_spec returned None'
-            if submit_spec is None:
-                logger.warning(
-                    'proc_supervision: `escalation.submit` is NOT importable '
-                    'from %s (%s) — the deferred /bin/sh -c on-failure branch '
-                    'for %s will exit non-zero at fire time and file NO L2 '
-                    'escalation; the wrapper will report that by exiting %d '
-                    'with an `RP-4: on-failure escalation submit failed` line, '
-                    'but only into journald, long after this deploy',
-                    sys.executable, probe_detail, self.transient_unit,
-                    RP4_ESCALATION_SUBMIT_FAILED_RC,
-                )
+            _warn_if_submit_module_unimportable(self.transient_unit)
             on_failure_argv = self.on_failure_escalation.to_submit_argv(sys.executable)
             on_failure = ' '.join(shlex.quote(p) for p in on_failure_argv)
             # This is the SINGLE source of truth for the RP-4 wrapper. Both

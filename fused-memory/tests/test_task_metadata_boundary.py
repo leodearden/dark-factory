@@ -373,9 +373,17 @@ async def test_done_provenance_malformed_write_warn_vs_enforce_staged_rollout(
     census = _schema_warning_messages(caplog)
     assert len(census) == 1, f'Expected exactly one census line; got {census}'
 
+    # The seed add_task landed in `pending`, so it carries the wait anchor
+    # (task 3816). stamp_audit_metadata merges, so the anchor is a sibling
+    # like any other and is asserted rather than scoped out — that keeps the
+    # whole blob pinned and pins sibling preservation across the privileged
+    # seam at the same time.
+    anchor = (await warn_backend.get_task(dto['id'], project_root=warn_root))[
+        'metadata'
+    ]['pending_since']
     await warn_backend.stamp_audit_metadata(dto['id'], warn_root, malformed)
     task = await warn_backend.get_task(dto['id'], project_root=warn_root)
-    assert task['metadata'] == malformed
+    assert task['metadata'] == {**malformed, 'pending_since': anchor}
 
     # (b) Enforce-mode: validator raises; nothing is staged for the
     # privileged seam to persist.
@@ -423,8 +431,12 @@ async def test_update_task_kind_deterministic_on_normal_task_rejected_post_merge
             metadata=json.dumps({'task_kind': 'deterministic'}),
         )
 
+    # The rolled-back txn leaves updated_at at the insert's own clock read,
+    # which a fresh pending insert also binds to the wait anchor (task 3816)
+    # — so spelling the anchor that way pins the rollback rather than merely
+    # scoping the new key out of the assertion.
     task = await enforce_backend.get_task(dto['id'], project_root=enforce_root)
-    assert task['metadata'] == {'files': ['a.py']}
+    assert task['metadata'] == {'files': ['a.py'], 'pending_since': task['updatedAt']}
 
     # (b) Warn-mode: does not raise; exactly one whole-metadata census line;
     # the merged write proceeds.
@@ -433,6 +445,11 @@ async def test_update_task_kind_deterministic_on_normal_task_rejected_post_merge
     dto2 = await warn_backend.add_task(
         project_root=warn_root, title='t', metadata=seed_metadata,
     )
+    # The seed insert stamped the wait anchor (task 3816); the merged update
+    # must carry it through untouched.
+    anchor = (await warn_backend.get_task(dto2['id'], project_root=warn_root))[
+        'metadata'
+    ]['pending_since']
 
     with caplog.at_level(logging.WARNING, logger='fused_memory.backends.sqlite_task_backend'):
         # Scope the census to exactly this write, not whatever the prior
@@ -449,7 +466,9 @@ async def test_update_task_kind_deterministic_on_normal_task_rejected_post_merge
     assert 'before_done' in census[0]
 
     task2 = await warn_backend.get_task(dto2['id'], project_root=warn_root)
-    assert task2['metadata'] == {'files': ['a.py'], 'task_kind': 'deterministic'}
+    assert task2['metadata'] == {
+        'files': ['a.py'], 'task_kind': 'deterministic', 'pending_since': anchor,
+    }
 
 
 # ── Row 7 — capstone: census code= token + vocabulary reconciliation ─
@@ -632,8 +651,13 @@ class TestCuratorGateContradictionAtWriteBoundary:
         assert 'human_curator_gate' in census[0]
 
         # The write proceeded, and I1 held through the durable round-trip.
+        # A fresh pending insert binds one clock read to both updated_at and
+        # the wait anchor (task 3816), so the anchor is asserted by that
+        # identity rather than scoped out of the whole-blob comparison.
         task = await backend.get_task(dto['id'], project_root=project_root)
-        assert task['metadata'] == self._CONTRADICTION
+        assert task['metadata'] == {
+            **self._CONTRADICTION, 'pending_since': task['updatedAt'],
+        }
 
     @pytest.mark.asyncio
     async def test_update_task_adding_only_the_marker_rejected(self, make_backend, tmp_path):
@@ -659,9 +683,13 @@ class TestCuratorGateContradictionAtWriteBoundary:
                 metadata=json.dumps({'human_curator_gate': True}),
             )
 
-        # Rolled back — the marker never landed on the deploy task.
+        # Rolled back — the marker never landed on the deploy task, and
+        # updated_at still reads the insert's own clock, which is also the
+        # wait anchor (task 3816).
         task = await backend.get_task(dto['id'], project_root=project_root)
-        assert task['metadata'] == self._VALID_DEPLOY
+        assert task['metadata'] == {
+            **self._VALID_DEPLOY, 'pending_since': task['updatedAt'],
+        }
 
     async def _land_a_contradictory_row(self, make_backend, project_root: str) -> str:
         """Write a row carrying BOTH keys the only way that is still possible.
@@ -714,9 +742,13 @@ class TestCuratorGateContradictionAtWriteBoundary:
         # the control: the identical write SUCCEEDS once the row is repaired.)
         assert 'human_curator_gate' in str(excinfo.value), str(excinfo.value)
 
-        # Rolled back — the unrelated edit did not land either.
+        # Rolled back — the unrelated edit did not land either, so
+        # updated_at still reads the landing insert's own clock, which is
+        # also the wait anchor (task 3816).
         task = await enforce_backend.get_task(task_id, project_root=project_root)
-        assert task['metadata'] == self._CONTRADICTION
+        assert task['metadata'] == {
+            **self._CONTRADICTION, 'pending_since': task['updatedAt'],
+        }
 
     @pytest.mark.asyncio
     async def test_contradictory_row_repaired_by_merging_a_falsy_marker(
@@ -891,8 +923,12 @@ class TestSliceCardinalityAtWriteBoundary:
                 metadata_mode='merge',
             )
 
+        # Rolled back, so updated_at still reads the insert's own clock,
+        # which is also the wait anchor (task 3816).
         task = await backend.get_task(dto['id'], project_root=project_root)
-        assert task['metadata'] == self._DICT_MILESTONE
+        assert task['metadata'] == {
+            **self._DICT_MILESTONE, 'pending_since': task['updatedAt'],
+        }
 
     @pytest.mark.asyncio
     async def test_well_shaped_dict_milestone_writes_clean(
@@ -913,8 +949,12 @@ class TestSliceCardinalityAtWriteBoundary:
 
         assert _schema_warning_messages(caplog) == []
 
+        # A fresh pending insert binds one clock read to both updated_at
+        # and the wait anchor (task 3816).
         task = await backend.get_task(dto['id'], project_root=project_root)
-        assert task['metadata'] == self._DICT_MILESTONE
+        assert task['metadata'] == {
+            **self._DICT_MILESTONE, 'pending_since': task['updatedAt'],
+        }
 
     async def _land_a_list_milestone_row(self, make_backend, project_root: str) -> str:
         """Write a row carrying the bad shape the only way that is still possible.
@@ -935,7 +975,9 @@ class TestSliceCardinalityAtWriteBoundary:
         # The warn-mode write really did land the bad shape (I1: the raw list
         # is retained unswapped) — otherwise (d)/(e) would prove nothing.
         landed = await warn_backend.get_task(dto['id'], project_root=project_root)
-        assert landed['metadata'] == self._LIST_MILESTONE
+        assert landed['metadata'] == {
+            **self._LIST_MILESTONE, 'pending_since': landed['updatedAt'],
+        }
         return dto['id']
 
     @pytest.mark.asyncio

@@ -19,11 +19,38 @@ drift is invisible until a destructive consumer acts on the stale half.
 
 The same rule governs the vocabulary's CAPTURE classes, which is why the digit
 captures are ASCII-explicit ('[0-9]', never '\\d') at this one normative site
-rather than re-narrowed per caller. Scoped to CAPTURES on purpose, and not to
-every class: the '\\s' padding and the '\\w' lookbehinds stay Unicode-broad (see
-the comment on _QUALIFIED_NODE_NAME_PATTERN). The vocabulary is ASCII-explicit
-exactly where a character reaches a consumer as DATA, and broad where it only
-decides whether to refuse. Before that,
+rather than re-narrowed per caller. Task 4850 extended the same rule to the
+literal task-vocabulary WORD (the _TASK_WORD constant,
+'[Tt][Aa][Ss][Kk][Ss]?', never 'tasks?' plus re.IGNORECASE — see the comment on
+_TASK_NODE_NAME_PATTERN), which decides whether the word 'task' was written at
+all rather than handing a character onward as data, so the rule is no longer
+scoped to captures alone. Still not every class: the '\\s' padding and the
+'\\w' lookbehinds stay Unicode-broad (see the comment on
+_TASK_NODE_NAME_PATTERN, whose padding is the one that actually still is —
+_QUALIFIED_NODE_NAME_PATTERN has no '\\s' padding LEFT since task 4850, so it
+cannot illustrate the rule it used to be cited for). The vocabulary is
+ASCII-explicit wherever a character reaches a consumer as DATA or decides that
+the task-vocabulary word was written, and broad only where it merely decides
+whether to refuse.
+
+That rule is SPELLED at two sites and GUARANTEED at a third — scoping a reader
+needs BEFORE "closing" the third. _TASK_VOCABULARY_QUALIFIER also decides
+whether the task-vocabulary word was written, and it is NOT ASCII-explicit: it
+fullmatches a qualifier its CALLER canonicalized with str.lower(), which does
+not fold U+017F, so is_task_vocabulary_qualifier('ta\u017fk') is False. MEASURED
+twice: that is unreachable on every live path, not a hole. The two in-module
+callers get a qualifier captured by '[A-Za-z][A-Za-z0-9_-]{2,}', so a non-ASCII
+letter can never be in the string; the third,
+referent_resolution._declared_referents, runs validate_project_id's ASCII-only
+allowlist on the line ABOVE its vocabulary guard, so
+{'id': 2500, 'project_id': 'ta\u017fk'} raises InputValidationError naming the
+CHARSET rather than minting a 'ta\u017fk:2500' node. Casefolding the predicate
+would add a branch no live input can reach AND fork validation.py's charset
+rule into a second site, the lockstep duplication INV-5 forbids. If a future
+caller ever hands this predicate an unvalidated qualifier, narrow it THERE or
+at canonicalize_project_id — not here.
+
+Before the digit and word narrowings above,
 utils/referent_resolution._is_task_number was the only guard enforcing "a
 Unicode digit is not a task id" — it does so with ``isascii() and isdigit()``
 (task 3668) — so the DECLARED path refused what this DERIVED path happily
@@ -89,6 +116,19 @@ _all_path_shaped_warned: bool = False
 #: this registry is where the LABEL lives, not a one-line extension point.
 _KIND_LABELS: dict[str, str] = {'task': 'Task'}
 
+#: The literal task-vocabulary WORD, as explicit ASCII case classes rather than
+#: 'tasks?' plus re.IGNORECASE. ONE spelling, interpolated into both patterns
+#: that need it (_TASK_NODE_NAME_PATTERN and _LOCAL_MENTION_PATTERN), because a
+#: case-class form does NOT read as the word at a glance: a transposed or
+#: dropped letter in one of two hand-written copies would be near-invisible in
+#: review while silently changing what parses, and the standing ASCII
+#: regression guards could not catch it — TestParseNodeNameMatchesLocalForms
+#: and TestScanContentFindsOwnProjectReferents reach the two patterns through
+#: DIFFERENT entry points, so a typo confined to one copy would leave the other
+#: suite green. Hoisted for exactly that reason (INV-5 / SPOT); WHY the spelling
+#: is case classes and not a flag is recorded on _TASK_NODE_NAME_PATTERN below.
+_TASK_WORD = r'[Tt][Aa][Ss][Kk][Ss]?'
+
 # ANCHORED (whole-string) task-node name: a bare 'task(s) N', optionally padded
 # with whitespace, case-insensitive. Anchoring means names that merely mention a
 # task ('Task 42 orchestrator', 'reify task 12') or resemble but aren't a
@@ -121,8 +161,28 @@ _KIND_LABELS: dict[str, str] = {'task': 'Task'}
 # digit is not a task id". Narrowing it HERE means no consumer has to re-narrow
 # it per caller. An explicit class rather than re.ASCII, which would silently
 # re-scope this pattern's '\s' too.
+#
+# The word 'tasks?' is interpolated from _TASK_WORD above — explicit ASCII case
+# classes, NOT 'tasks?' plus re.IGNORECASE. MEASURED, not
+# stylistic: Python's re performs FULL Unicode case folding under
+# re.IGNORECASE on str patterns, so U+017F LATIN SMALL LETTER LONG S folds
+# onto 's' and U+212A KELVIN SIGN folds onto 'k' — 'Ta\u017fk 5' and
+# 'Tas\u212a 5' (and any mixture of the two) matched and minted a
+# referent carrying a REAL ASCII number, worse than the digit case above
+# because the number names a task that actually exists, rather than obvious
+# junk. Dropping the flag changes nothing else: 'tasks?' was the only cased
+# literal in this pattern, so '\s', '[ \t]', '[#:]' and '[0-9]' are
+# unaffected, and every ASCII spelling ('task', 'TASK', 'Tasks', 'TaSkS',
+# 'task#1153', ...) is unchanged by construction — proven by the standing
+# regression guards in TestParseNodeNameMatchesLocalForms. This matches the
+# in-module precedent on _QUALIFIED_NODE_NAME_PATTERN below, whose comment
+# already spells case as an explicit class rather than a flag
+# ("Case-SENSITIVE start class with no IGNORECASE flag needed, since
+# [A-Za-z] already spans both cases") — this finishes that half-committed
+# convention. Not re.ASCII: it would silently re-scope this pattern's '\s'
+# padding too, an axis this task never measured.
 _TASK_NODE_NAME_PATTERN = re.compile(
-    r'^\s*tasks?(?:[ \t]*[#:][ \t]*|\s+)([0-9]+)\s*$', re.IGNORECASE
+    r'^\s*' + _TASK_WORD + r'(?:[ \t]*[#:][ \t]*|\s+)([0-9]+)\s*$'
 )
 
 # The ANCHORED twin of _QUALIFIED_REF_PATTERN: a whole-string cross-project node
@@ -132,26 +192,84 @@ _TASK_NODE_NAME_PATTERN = re.compile(
 # with no IGNORECASE flag needed, since [A-Za-z] already spans both cases.
 #
 # The digit class is '[0-9]', NOT '\d', for the reason recorded on
-# _TASK_NODE_NAME_PATTERN above. Measured: 'reify:\u0663' parsed to
-# Referent(project_id='reify', number='\u0663'). The qualifier class was already
+# _TASK_NODE_NAME_PATTERN above. Measured: 'reify:٣' parsed to
+# Referent(project_id='reify', number='٣'). The qualifier class was already
 # ASCII-explicit, so the digit capture was the last Unicode-permissive CAPTURE
-# class in the vocabulary — captures only, and deliberately so. Every pattern
-# here still pads with '\s', and the mention patterns' lookbehinds still use
-# '\w', both of which stay Unicode-broad: measured on this branch,
-# 'task\u00a0132' and 'reify\u00a0:\u00a0132' (NBSP; likewise U+2003 EM SPACE and
-# U+2007 FIGURE SPACE) still parse to number '132'. That breadth is safe here:
-# padding breadth costs at most an exotic SPELLING of a number that is itself
-# ASCII and names a real node, while a lookaround only ever REFUSES a match, so
-# its breadth is precision, never recall loss. Only a CAPTURE hands
-# the character onward as data, which is why the fix is an explicit class and
-# not re.ASCII: re.ASCII would re-scope '\d', '\s' and '\w' at once, three
-# separately-reasoned axes for the price of one.
-_QUALIFIED_NODE_NAME_PATTERN = re.compile(r'^\s*([A-Za-z][A-Za-z0-9_-]{2,})\s*:\s*([0-9]+)\s*$')
+# class in the vocabulary — captures only, and deliberately so. General
+# whitespace padding elsewhere in the vocabulary stays Unicode-broad by
+# design — measured on this branch, 'task 132' (NBSP) still parses via
+# _TASK_NODE_NAME_PATTERN's '\s+' branch — because a pad only ever costs an
+# exotic SPELLING of a number that is itself ASCII, never a recall loss. Only
+# a CAPTURE hands the character onward as data, which is why the digit fix is
+# an explicit class and not re.ASCII: re.ASCII would re-scope '\d', '\s' and
+# '\w' at once, three separately-reasoned axes for the price of one.
+#
+# This pattern's OWN padding is the deliberate exception to that breadth, for
+# a different reason entirely — not Unicode safety but LINE-BREAK safety
+# (task 4850). Line breaks are the MOTIVE; read the next-to-last paragraph for
+# what the narrowing actually does, which is broader. The colon is padded
+# '[ \t]', NOT '\s', on BOTH sides: MEASURED,
+# before this narrowing, parse_node_name('reify:\n132') and
+# parse_node_name('reify\n:132') each parsed to Referent(project_id='reify',
+# number='132') — an entity NAME containing a hard line break is not a
+# project-qualified node name. This was the LAST '\s'-padded colon in the
+# module: _TASK_NODE_NAME_PATTERN, _LOCAL_MENTION_PATTERN and
+# _QUALIFIED_REF_PATTERN already padded '#'/':' with '[ \t]' (task 4123); all
+# four patterns now agree, closing a vocabulary that would otherwise exist
+# twice and drift (INV-5).
+#
+# The ANCHORING padding narrows the same way, for the same reason: '^\s*'
+# becomes '^[ \t]*', and the terminator is '\Z', NOT '$'. '$' (without
+# re.MULTILINE) also matches just before a single trailing newline, so a
+# naive '[ \t]*$' would still accept 'reify:132\n' while rejecting
+# 'reify:132\n\n' — an incoherent half-fix. Do not simplify '\Z' back to '$'.
+#
+# _TASK_NODE_NAME_PATTERN's own anchoring ('^\s*...\s*$') is DELIBERATELY left
+# unnarrowed, and the resulting asymmetry is declared rather than converged:
+# this pattern mints ONLY foreign referents (parse_node_name tries the local
+# pattern first, so every local spelling is already claimed), and for a
+# consumer performing destructive edge surgery a narrowing that REMOVES a
+# foreign ref is the safe direction — a missed ref is recoverable, a
+# misattributed one is not. Narrowing the LOCAL pattern instead would remove
+# bare mentions, and so remove CONTESTS, the dangerous direction — the same
+# reasoning already recorded for _QUALIFIED_REF_PATTERN's colon versus
+# _LOCAL_MENTION_PATTERN's whitespace branch below.
+#
+# SECOND AXIS, declared because it is broader than the line-break motive above
+# and the tests for that motive cannot see it: '[ \t]' drops EVERY non-space,
+# non-tab whitespace character, not just '\n'. MEASURED at HEAD before the
+# narrowing, each returning Referent(project_id='reify', number='132'):
+# '\xa0reify:132', 'reify\xa0:\xa0132' and '\x0creify:132'. All return None
+# now. ACCEPTED rather than repaired, on the same direction-of-safety argument
+# as the line-break half — this pattern mints only foreign referents, so a
+# removal is recoverable and a misattribution is not — and because NBSP or
+# form-feed padding around a project-qualified node NAME is not a spelling any
+# human or extraction path writes on purpose. Note the asymmetry with the
+# '\s+' padding two paragraphs up: there the breadth costs only an exotic
+# SPELLING of an ASCII number and the character reaches a consumer as data,
+# which is why it stays. Pinned by
+# TestQualifiedNodeNamePaddingIsAsciiSpaceAndTabOnly, whose sibling case also
+# guards that _TASK_NODE_NAME_PATTERN's padding stayed broad.
+#
+# Live impact is NIL today: task_naming.canonicalize_task_node_name returns
+# None for any qualified referent and would equally return None if the name
+# stopped parsing. The value of closing this gap is coherence and protection
+# for a future direct consumer of qualified node names.
+_QUALIFIED_NODE_NAME_PATTERN = re.compile(
+    r'^[ \t]*([A-Za-z][A-Za-z0-9_-]{2,})[ \t]*:[ \t]*([0-9]+)[ \t]*\Z'
+)
 
 # Task-vocabulary words are never project ids. Matched with fullmatch() against
 # the CANONICALIZED qualifier, so every spelling ('Task', 'TASK', 'sub-task',
 # 'Sub-Tasks') collapses onto this one check, while a real project id that
 # merely starts with 'task' ('taskmaster') is not rejected.
+#
+# This is the THIRD site that decides whether the task-vocabulary word was
+# written, and the only one not spelled ASCII-explicitly — deliberately, and
+# measurably safe because every caller's qualifier is ASCII before it arrives.
+# Do not casefold it without reading the module docstring's scoping paragraph
+# first: the branch that would add is unreachable, and it forks validation.py's
+# charset rule.
 #
 # Moved verbatim from cross_project_refs, where it guards the ONE rejection the
 # split consumer's decisive 'episode touched a node named Task N' guard cannot
@@ -203,8 +321,30 @@ _TASK_VOCABULARY_QUALIFIER = re.compile(r'(sub_?)?tasks?')
 #   means fewer contests, which means MORE confident splits on prose that
 #   pre-3667 refused. A false positive here only ever adds ambiguity, which the
 #   consumer refuses; a false negative lets destructive surgery proceed.
+# - The word 'tasks?' is interpolated from the SAME _TASK_WORD constant this
+#   pattern shares with _TASK_NODE_NAME_PATTERN — explicit ASCII case classes,
+#   NOT 'tasks?' plus re.IGNORECASE, for the reason recorded there:
+#   re.IGNORECASE performs FULL Unicode case folding on str patterns, so
+#   'ta\u017fk 5' and 'tas\u212a 5' matched and minted a referent from a word
+#   that was never actually 'task'. Every other class in this pattern is
+#   untouched by dropping the flag — 'tasks?' was its only cased literal.
+#   BUT the EMITTED PARTITION is not untouched, and unlike the '\s+' branch two
+#   bullets above this narrowing DOES remove bare mentions, and so removes
+#   CONTESTS — declared here rather than left for a reader to discover, because
+#   the bullet above calls that the dangerous direction. MEASURED, group_id
+#   'dark_factory': 'reify:5 blocks ta\u017fk 5' yielded refs=() and
+#   ambiguous=('reify:5', 'Task 5') before this change and yields
+#   refs=('reify:5',), ambiguous=() after, so a foreign referent the permissive
+#   scan refused to hand to destructive edge surgery is now handed over. That is
+#   acceptable HERE and not there because the removed mention was never the word
+#   'task': the contest it created was SPURIOUS, and a contest is protection
+#   only when it reflects a genuine competing reading. The '\s+' branch's
+#   mentions, by contrast, are real mentions of the real word, merely wrapped —
+#   so narrowing THERE would suppress genuine contests. Pinned by
+#   TestTaskWordIsAsciiOnly so a future revert cannot silently restore the
+#   phantom contest.
 _LOCAL_MENTION_PATTERN = re.compile(
-    r'(?<![\w:-])tasks?(?:[ \t]*[#:][ \t]*|\s+)([0-9]+)(?!\d)', re.IGNORECASE
+    r'(?<![\w:-])' + _TASK_WORD + r'(?:[ \t]*[#:][ \t]*|\s+)([0-9]+)(?!\d)'
 )
 
 # A project-qualified task reference: '<qualifier>:<digits>'. Moved VERBATIM
@@ -235,17 +375,19 @@ _LOCAL_MENTION_PATTERN = re.compile(
 #   _LOCAL_MENTION_PATTERN whitespace branch two blocks above, deliberately
 #   left as '\s+' because narrowing THERE removes bare mentions and so removes
 #   contests, which is the dangerous direction.
-#   This also brings the last '\s'-padded colon in the module into line with
-#   _TASK_NODE_NAME_PATTERN and _LOCAL_MENTION_PATTERN, which already pad
+#   This also brought the last '\s'-padded colon in the module into line with
+#   _TASK_NODE_NAME_PATTERN and _LOCAL_MENTION_PATTERN, which already padded
 #   '#'/':' with '[ \t]' for exactly this reason. _QUALIFIED_NODE_NAME_PATTERN
-#   above is deliberately NOT changed here: it is out of task 4123's scope and
-#   is tracked as task 4235 (duplicate filing: 4239), which carries the
-#   measurement — parse_node_name('reify:\n132') still parses today. Behaviour
-#   is identical for every LIVE consumer either way, because the only
-#   production chain (task_naming.canonicalize_task_node_name) returns None for
-#   any qualified referent and would equally return None if the name stopped
-#   parsing; the value of closing it is coherence, before a consumer that acts
-#   on qualified node names lands.
+#   above was NOT changed by task 4123 — it was out of that task's scope. Its
+#   own colon AND anchoring padding were closed separately by task 4850 (task
+#   4235 coalesced into it; task 4239 was cancelled as a duplicate filing),
+#   which brought the fourth and last pattern into line — see the comment on
+#   that pattern for the measurement. Behaviour is identical for every LIVE
+#   consumer either way, because the only production chain
+#   (task_naming.canonicalize_task_node_name) returns None for any qualified
+#   referent and would equally return None if the name stopped parsing; the
+#   value of closing it was coherence, ahead of a consumer that acts on
+#   qualified node names.
 # - The digit class is '[0-9]', NOT '\d', for the reason recorded on
 #   _TASK_NODE_NAME_PATTERN above: '\d' matches Unicode decimal digits on a str
 #   pattern, so 'see reify:\u0663 now' scanned from another group yielded a
@@ -534,7 +676,14 @@ def scan_content(
     nothing rather than a truncated 'Task 12') — the deliberate, negligible
     recall loss that is the price of the ``[0-9]`` capture classes above, which
     exist because '\\d' matched those spellings and minted referents naming no
-    task at all. Recall is the consumer's problem; precision is this module's.
+    task at all. A mention whose WORD is spelled with a Unicode lookalike that
+    case-folds onto ASCII under re.IGNORECASE — U+017F LATIN SMALL LETTER LONG
+    S ('ta\u017fk 5') or U+212A KELVIN SIGN ('tas\u212a 5') — is likewise
+    invisible now that the word is matched with explicit ASCII case classes
+    instead of a flag (task 4850): the negligible recall loss that is the
+    price of refusing referents IGNORECASE would otherwise have minted with a
+    REAL ASCII task number. Recall is the consumer's problem; precision is
+    this module's.
 
     One blind spot was MEASURED and accepted rather than merely designed
     around: a genuine qualified ref split across lines by HARD WRAPPING is
@@ -566,6 +715,18 @@ def scan_content(
             canonicalization — the filter is PERMISSIVE; see
             :func:`_canonical_allowlist`.
 
+            Narrowing is STRICTLY SUBTRACTIVE: it can only ever remove a
+            referent from the result, never add one. Dropping a foreign
+            candidate removes it from both partitions but PRESERVES the
+            ambiguity contest it created, because the contest is decided
+            against the permissive candidate set. Without that, dropping the
+            junk qualifier in 'Restarted redis at localhost:6379 while
+            finishing task 6379.' would promote the bare 'task 6379' out of
+            ``ambiguous`` and into ``refs`` — turning an episode that produces
+            NO referent set today, which every consumer no-ops on, into one
+            that produces a set a repair path will act on. A narrowing that
+            mints referents is a net regression, not a precision win.
+
     Returns:
         A :class:`LabelScan`. ``refs`` is safe to act on; ``ambiguous`` must
         not be acted on silently. A number goes to ``ambiguous`` only when the
@@ -590,6 +751,13 @@ def scan_content(
     # referent came from an UNQUALIFIED mention, which is what the ambiguity
     # partition below is decided on.
     found: list[tuple[int, Referent, bool]] = []
+    # (kind, number) of every foreign candidate the allowlist DROPS. The
+    # candidate itself never reaches `found`, but the ambiguity CONTEST it
+    # created against a bare mention of the same number must survive it — see
+    # the subtractive guarantee below. Empty whenever `allowlist is None`,
+    # which is what makes the narrowing a provable no-op for permissive
+    # callers.
+    dropped_foreign_keys: set[tuple[str, str]] = set()
 
     for match in _LOCAL_MENTION_PATTERN.finditer(content):
         found.append((match.start(), Referent(kind='task', number=match.group(1)), True))
@@ -616,11 +784,13 @@ def scan_content(
             # drop that module wants.
             found.append((match.start(), Referent(kind='task', number=number), False))
             continue
+        foreign = Referent(kind='task', project_id=project_id, number=number)
         if allowlist is not None and project_id not in allowlist:
+            # Keyed off the candidate itself rather than a literal, so the key
+            # cannot drift from the kind the referent actually carries.
+            dropped_foreign_keys.add((foreign.kind, foreign.number))
             continue
-        found.append(
-            (match.start(), Referent(kind='task', project_id=project_id, number=number), False)
-        )
+        found.append((match.start(), foreign, False))
 
     # Merge the two passes by OFFSET rather than concatenating them, so the
     # result reads in the order a human reads the content. Sorting is stable,
@@ -674,8 +844,16 @@ def scan_content(
     # lose a genuine contest the content does contain. (Dedup still collapses
     # 'reify:5181 and task 5181' to one own-project referent; that pair simply
     # has no foreign side to contest.)
+    # The contest is decided against the PERMISSIVE candidate set while the
+    # emitted refs stay NARROWED, which is what makes narrowing STRICTLY
+    # SUBTRACTIVE. A dropped foreign candidate is gone from both partitions,
+    # but it was also the thing CONTESTING a bare mention of its number;
+    # letting the drop take the contest with it would PROMOTE that bare
+    # mention out of `.ambiguous` and into `.refs` — narrowing minting a
+    # referent the permissive scan refused to mint. Only the contest survives
+    # the drop, never the candidate.
     bare_keys = {(r.kind, r.number) for _offset, r, arrived_bare in found if arrived_bare}
-    foreign_keys = {(r.kind, r.number) for r in deduped if r.project_id}
+    foreign_keys = {(r.kind, r.number) for r in deduped if r.project_id} | dropped_foreign_keys
     contested = bare_keys & foreign_keys
 
     # Digits are compared as literals, never int-normalized, so '0250' and

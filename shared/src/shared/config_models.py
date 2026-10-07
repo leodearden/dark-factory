@@ -66,7 +66,26 @@ class UsageCapConfig(BaseModel):
         default=3600,
         description='Seconds between auth re-probes for auth_failed accounts.',
     )
+    auth_reprobe_enabled: bool = Field(
+        default=True,
+        description=(
+            'Re-probe an auth_failed account every auth_reprobe_secs (each '
+            'attempt reloads .env with override). False keeps it out for the '
+            'life of the gate, for a oneshot that must not reload .env or '
+            'spend calls on a rejected token (consumer: scripts/legibility, '
+            'task 6042).'
+        ),
+    )
     accounts: list[AccountConfig] = Field(default_factory=list)
+    fallback_to_default_credential: bool = Field(
+        default=True,
+        description=(
+            'When no configured account resolves a token, adopt the operator\'s '
+            'own ~/.claude login as a single "default" account. False leaves the '
+            'pool empty instead, so a caller never authenticates as that login '
+            '(consumer: scripts/legibility, task 6042).'
+        ),
+    )
     accounts_file: str | None = Field(
         default=None,
         description='Path to shared YAML file with accounts list (overrides inline accounts)',

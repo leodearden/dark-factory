@@ -21,15 +21,16 @@ supported a specific worker-count cap on this host.
 from __future__ import annotations
 
 import shlex
-from typing import Any
+from pathlib import Path
+from typing import Literal
 from unittest.mock import patch
 
 import pytest
+from _orch_helpers import ADMISSION_TEST_CMD, admission_leg_for_cmd, admission_module_config
 from pydantic import ValidationError
 
 from orchestrator.config import (
     RELOADABLE_FIELDS,
-    ModuleConfig,
     OrchestratorConfig,
     apply_reload,
     diff_config,
@@ -42,42 +43,6 @@ from orchestrator.verify_cmd import (
     render,
     serial_pytest,
 )
-
-# Module-local wiring-test fixtures (not conftest.py — a conftest.py edit
-# trips verify.py's has_conftest; mirrors test_verify_admission_wiring.py's
-# stated rationale). Deliberately duplicated rather than imported from that
-# module: each admission test file is self-contained.
-_TEST_CMD = 'pytest tests/'
-_LINT_CMD = 'ruff'
-_TYPE_CMD = 'pyright'
-
-
-def _leg_for_cmd(cmd: str) -> str:
-    """Label which leg *cmd* belongs to. Checks 'pytest'/'tests/' as two
-    separate substrings (not the single _TEST_CMD substring test_verify_
-    admission_wiring.py's version checks) because a `-n` injection splices
-    new flags between them (``pytest tests/`` -> ``pytest -n 16 tests/``),
-    breaking containment of the whole ``_TEST_CMD`` string.
-    """
-    if 'pytest' in cmd and 'tests/' in cmd:
-        return 'test'
-    if _LINT_CMD in cmd:
-        return 'lint'
-    if _TYPE_CMD in cmd:
-        return 'type'
-    return cmd
-
-
-def _module_config(**overrides: Any) -> ModuleConfig:
-    kwargs: dict[str, Any] = dict(
-        prefix='pkg',
-        test_command=_TEST_CMD,
-        lint_command=_LINT_CMD,
-        type_check_command=_TYPE_CMD,
-        concurrent_verify=False,
-    )
-    kwargs.update(overrides)
-    return ModuleConfig(**kwargs)
 
 
 class TestVerifyAdmissionPytestNConfigDefault:
@@ -277,11 +242,23 @@ class TestApplyPytestNumprocessesSerialRecoveryCollision:
         assert '-n 16' not in rendered
 
 
+def armed_admission_config(tmp_path: Path, pytest_n: str) -> OrchestratorConfig:
+    """A config with verify admission armed: ``verify_admission_enabled`` is
+    pinned, so an operator edit to the yaml cannot silently disarm the
+    ``-n`` injection site these wiring tests observe."""
+    return OrchestratorConfig(
+        verify_admission_enabled=True,
+        verify_admission_slots_dir=str(tmp_path / 'slots'),
+        verify_admission_task_slots=1,
+        verify_admission_pytest_n=pytest_n,
+    )
+
+
 class TestPytestNWiring:
     """Wiring into ``_run_or_skip_timed``: the test-leg-only, role-gated
     (task/background, not merge) `-n` rewrite, injected before the
     nice-prefix wrap. Mirrors test_verify_admission_wiring.py's spy/
-    _leg_for_cmd/_module_config pattern.
+    admission_leg_for_cmd/admission_module_config pattern.
     """
 
     @pytest.mark.real_verify_admission
@@ -294,12 +271,7 @@ class TestPytestNWiring:
             captured_cmds.append(cmd)
             return 0, '', False
 
-        slots_dir = tmp_path / 'slots'
-        config = OrchestratorConfig(
-            verify_admission_slots_dir=str(slots_dir),
-            verify_admission_task_slots=1,
-            verify_admission_pytest_n='16',
-        )
+        config = armed_admission_config(tmp_path, '16')
         worktree = tmp_path / 'wt'
         worktree.mkdir()
 
@@ -307,12 +279,12 @@ class TestPytestNWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role=role,
                 attempt_id=None,
             )
 
-        test_cmd = next(c for c in captured_cmds if _leg_for_cmd(c) == 'test')
+        test_cmd = next(c for c in captured_cmds if admission_leg_for_cmd(c) == 'test')
         assert '-n 16' in test_cmd, f'expected -n 16 injected for role={role!r}; got {test_cmd!r}'
 
     @pytest.mark.real_verify_admission
@@ -324,28 +296,33 @@ class TestPytestNWiring:
             captured_cmds.append(cmd)
             return 0, '', False
 
-        slots_dir = tmp_path / 'slots'
-        config = OrchestratorConfig(
-            verify_admission_slots_dir=str(slots_dir),
-            verify_admission_task_slots=1,
-            verify_admission_pytest_n='16',
-        )
+        config = armed_admission_config(tmp_path, '16')
         worktree = tmp_path / 'wt'
         worktree.mkdir()
 
-        with patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+        async def run_and_capture_test_leg(role: Literal['task', 'merge']) -> str:
+            captured_cmds.clear()
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
-                role='merge',
+                module_config=admission_module_config(),
+                role=role,
                 attempt_id=None,
             )
+            return next(c for c in captured_cmds if admission_leg_for_cmd(c) == 'test')
 
-        test_cmd = next(c for c in captured_cmds if _leg_for_cmd(c) == 'test')
-        assert '-n 16' not in test_cmd, (
+        with patch('orchestrator.verify._run_cmd', side_effect=spy_run_cmd):
+            gated_test_cmd = await run_and_capture_test_leg('task')
+            merge_test_cmd = await run_and_capture_test_leg('merge')
+
+        assert '-n 16' in gated_test_cmd, (
+            f'control: a gated role under this same config must be -n-capped, '
+            f'else the injection site was never armed and the merge absence '
+            f'below proves nothing; got {gated_test_cmd!r}'
+        )
+        assert '-n 16' not in merge_test_cmd, (
             f"merge's test leg must never be -n-capped (bypasses admission "
-            f'slot-counting, latency-critical); got {test_cmd!r}'
+            f'slot-counting, latency-critical); got {merge_test_cmd!r}'
         )
 
     @pytest.mark.real_verify_admission
@@ -357,12 +334,7 @@ class TestPytestNWiring:
             captured_cmds.append(cmd)
             return 0, '', False
 
-        slots_dir = tmp_path / 'slots'
-        config = OrchestratorConfig(
-            verify_admission_slots_dir=str(slots_dir),
-            verify_admission_task_slots=1,
-            verify_admission_pytest_n='auto',
-        )
+        config = armed_admission_config(tmp_path, 'auto')
         worktree = tmp_path / 'wt'
         worktree.mkdir()
 
@@ -370,12 +342,12 @@ class TestPytestNWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )
 
-        assert captured_cmds[0] == 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(_TEST_CMD), (
+        assert captured_cmds[0] == 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(ADMISSION_TEST_CMD), (
             "verify_admission_pytest_n='auto' must inject no -n rewrite — the "
             'test leg must be byte-identical to pre-T6 (nice-wrap only)'
         )
@@ -403,12 +375,12 @@ class TestPytestNWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )
 
-        assert captured_cmds[0] == _TEST_CMD, (
+        assert captured_cmds[0] == ADMISSION_TEST_CMD, (
             'disabled admission must never inject -n (or nice/bash-c wrap) the test leg'
         )
 
@@ -442,12 +414,7 @@ class TestPytestNWiring:
             captured_cmds.append(cmd)
             return 0, '', False
 
-        slots_dir = tmp_path / 'slots'
-        config = OrchestratorConfig(
-            verify_admission_slots_dir=str(slots_dir),
-            verify_admission_task_slots=1,
-            verify_admission_pytest_n='16',
-        )
+        config = armed_admission_config(tmp_path, '16')
         worktree = tmp_path / 'wt'
         worktree.mkdir()
 
@@ -455,12 +422,12 @@ class TestPytestNWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(test_command=test_command),
+                module_config=admission_module_config(test_command=test_command),
                 role='task',
                 attempt_id=None,
             )
 
-        test_cmd = next(c for c in captured_cmds if _leg_for_cmd(c) == 'test')
+        test_cmd = next(c for c in captured_cmds if admission_leg_for_cmd(c) == 'test')
         # role='task' also gets the nice-prefix bash-c wrap (T2); the inner
         # payload is what apply_pytest_numprocesses/render produced.
         expected = 'nice -n 15 ionice -c2 -n7 /bin/bash -c ' + shlex.quote(expected_inner)
@@ -482,12 +449,7 @@ class TestPytestNWiring:
             captured_cmds.append(cmd)
             return 0, '', False
 
-        slots_dir = tmp_path / 'slots'
-        config = OrchestratorConfig(
-            verify_admission_slots_dir=str(slots_dir),
-            verify_admission_task_slots=1,
-            verify_admission_pytest_n='16',
-        )
+        config = armed_admission_config(tmp_path, '16')
         worktree = tmp_path / 'wt'
         worktree.mkdir()
 
@@ -495,12 +457,12 @@ class TestPytestNWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(test_command=chained_cmd),
+                module_config=admission_module_config(test_command=chained_cmd),
                 role='task',
                 attempt_id=None,
             )
 
-        test_cmd = next(c for c in captured_cmds if _leg_for_cmd(c) == 'test')
+        test_cmd = next(c for c in captured_cmds if admission_leg_for_cmd(c) == 'test')
         assert test_cmd.count('-n 16') == 2, (
             f'expected -n 16 injected into both chained pytest invocations; got {test_cmd!r}'
         )
@@ -532,12 +494,7 @@ class TestPytestNWiring:
                 return 0, '', False
             return 0, '', False
 
-        slots_dir = tmp_path / 'slots'
-        config = OrchestratorConfig(
-            verify_admission_slots_dir=str(slots_dir),
-            verify_admission_task_slots=1,
-            verify_admission_pytest_n='16',
-        )
+        config = armed_admission_config(tmp_path, '16')
         worktree = tmp_path / 'wt'
         worktree.mkdir()
 
@@ -545,11 +502,17 @@ class TestPytestNWiring:
             await run_verification(
                 worktree=worktree,
                 config=config,
-                module_config=_module_config(),
+                module_config=admission_module_config(),
                 role='task',
                 attempt_id=None,
             )
 
+        original_test_cmd = next(c for c in captured_cmds if admission_leg_for_cmd(c) == 'test')
+        assert '-n 16' in original_test_cmd, (
+            f'control: the original test leg must be -n-capped, else the '
+            f'injection site was never armed and the absence on the recovery '
+            f're-run proves nothing; got {original_test_cmd!r}'
+        )
         # The recovery re-run is the (only) test-leg command carrying the
         # serial marker.
         recovered = next(c for c in captured_cmds if 'no:xdist' in c)

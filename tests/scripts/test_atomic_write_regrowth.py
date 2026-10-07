@@ -1,23 +1,25 @@
 """Repo-level guard: the consolidated atomic-write pattern cannot silently regrow.
 
-WHAT THIS IS.  An AST sweep over SIX first-party source trees — ``shared/src``,
-``orchestrator/src``, ``escalation/src``, ``fused-memory/src``,
-``fused-memory/scripts`` and ``scripts`` — asserting that every
+WHAT THIS IS.  An AST sweep over the first-party source trees named in
+``_SRC_TREES`` — the ``src`` of every workspace member, plus the flat
+``fused-memory/scripts`` and ``scripts`` operator trees — asserting that every
 rename-into-place (the tmp+``os.replace`` shape task 3223 consolidated into
 ``shared.safe_io.atomic_write_text``) is a known, individually-reasoned
 survivor rather than a fresh hand-rolled copy.
 
-WHY IT LIVES HERE AND NOT IN A PACKAGE SUITE (task 3388).  It was born in
-``shared/tests/test_safe_io.py``, beside the implementation it protects, and
-that was defensible while it scanned three trees and shared owned the blessed
-writer.  It stopped being defensible once the guard asserted on five packages
-shared does not own: a guard that asserts on five packages cannot live inside a
-sixth package's tests.  The concrete failure it created — not hypothetical, and
-recorded in the allowlist itself — is that
+WHY IT LIVES HERE AND NOT IN A PACKAGE SUITE (task 3388).  ``CONTRIBUTING.md``
+§2, "Where repo-wide gates live", places a gate by what it reads: one that walks
+the shared ``first_party_tree`` parse lives in ``shared/tests``, and a sweep
+that brings its own reader lives here.  This guard brings its own reader, and
+its ``_SRC_TREES`` is not ``shared/tests/silent_fallthrough_scan.py::SCOPE_ROOTS``:
+it adds ``fused-memory/scripts`` and scans the test directories inside
+``scripts``, which ``iter_first_party_files`` excludes.  So it cannot share
+that parse without changing what it detects.  It was born in
+``shared/tests/test_safe_io.py``, beside safe_io's own unit suite, and left
+because its allowlist couples it to sibling code — not hypothetically:
 ``orchestrator/src/orchestrator/digest.py::write_digest_entry`` is allowlisted
-AND flagged there as a prime migration candidate, so migrating it turned the
-SHARED suite red, at a site no orchestrator author would think to look.  Moving
-the guard to the repo level puts the failure where the fix is.
+AND flagged there as a prime migration candidate, so migrating it turned
+safe_io's unit suite red, at a site no orchestrator author would think to look.
 
 THE PLACEMENT IS THE ESTABLISHED PATTERN, not a stray file.  ``tests/scripts/``
 is a registered module config (``tests/scripts/orchestrator.yaml``) and already
@@ -33,19 +35,20 @@ holds this exact class of repo-wide structural sweep:
 Being repo-level is also what makes this module's two HARD assertions correct:
 ``assert root.is_dir()`` in ``_read_tree`` (which backs ``_iter_source_files``)
 and the stale-entry assertion in
-``test_no_unapproved_renamers_in_source_trees``.  At the repo root every SCANNED
-tree is guaranteed present, so neither needs the ``pytest.skip`` /
-warning-downgrade fallback that a package-local guard would have had to adopt.
-Both carry a comment saying so at their site.
+``test_no_unapproved_renamers_in_source_trees``.  At the repo root every
+tree this module reads is guaranteed present, so neither needs the
+``pytest.skip`` / warning-downgrade fallback that a package-local guard would
+have had to adopt.  Both carry a comment saying so at their site.
 
-That word SCANNED is load-bearing and was added by measurement, not by
-tidying.  The argument above — a missing tree means the fence silently covers
-less — holds only for trees the fence walks.  ``_POINTER_OPTIONAL_TREES`` names
-sibling packages this guard does NOT fence and reads only for
-documentation-pointer hygiene; those DO warn and skip, because an absent
-optional package there once turned this guard red for a reason with nothing to
-do with atomic writes.  The two dispositions are the same
-loud-over-silent rule applied to different stakes, not an inconsistency.
+That covers the pointer-swept tests dirs too, which became correct only when
+task 5261 fenced the ``src`` of every workspace member: each tests dir the
+pointer sweep reads now belongs to a fenced package (enforced by
+``test_every_fenced_package_tests_dir_is_a_required_pointer_tree``), so an
+absent one is a real defect.  Before that, a soft warn-and-skip tier read the
+tests dirs of UNfenced packages, because an absent optional package once
+turned this guard red for a reason with nothing to do with atomic writes.  That
+reason still binds: if a pointer-only tree for a package this guard does NOT
+fence is ever added, it must not hard-fail the guard.
 
 COLLECTED TWICE, DELIBERATELY.  ``tests/scripts/orchestrator.yaml`` collects
 this directory, and so does ``scripts/orchestrator.yaml``
@@ -54,14 +57,13 @@ runs the guard that scans ``scripts/``.  No yaml edit was needed to register
 this file: all three commands there are directory-wide.
 
 SCOPE LIMIT, stated because a green run here must not be over-read: relocating
-this guard did NOT make ``shared/tests`` standalone-runnable.  Five other
-cross-tree gates still live there; they are enumerated, with measured counts, in
-``test_atomic_write_guard_does_not_scan_sibling_package_trees`` below.
+this guard did NOT make ``shared/tests`` standalone-runnable, and was not meant
+to — ``shared/tests`` deliberately hosts the whole-tree source gates and
+presumes a full checkout (``CONTRIBUTING.md`` §2, "Where repo-wide gates live").
 """
 import ast
 import functools
 import re
-import warnings
 from collections.abc import Iterator
 from pathlib import Path
 from typing import NamedTuple
@@ -82,13 +84,16 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # by hand next month — the pattern is short enough to look harmless, which is
 # exactly how the first ten accumulated (two of them carried a docstring
 # saying they were copied because "there is no atomic writer in shared/ to
-# reuse").  These tests are the fence: a NEW rename-into-place inside the
-# SIX TREES LISTED BELOW fails loudly and points the author at this module.
+# reuse").  These tests are the fence: a NEW rename-into-place inside ANY
+# TREE IN ``_SRC_TREES`` BELOW fails loudly and points the author at this
+# module.
 #
 # SCOPE LIMIT — the fence is narrower than "the repo", and saying so matters
 # more than the fence looking complete.  Task 3388 widened ``_SRC_TREES`` from
 # three trees to six: ``shared/src``, ``orchestrator/src``, ``escalation/src``,
 # ``fused-memory/src``, ``fused-memory/scripts`` and ``scripts``.
+# ``cockpit/src``, ``dashboard/src`` and ``sampler/src`` complete the set: the
+# ``src`` of every workspace member is fenced.
 #
 # THE COUNT, CORRECTED BY MEASUREMENT.  Widening surfaced SEVENTEEN unmigrated
 # hand-rolled writers, not the six this block used to enumerate — and not the
@@ -98,24 +103,20 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 # included, and re-run it rather than re-trusting the sentence.  A fence sized
 # from stale prose is not a fence, which is the whole reason 3388 existed.
 #
-# STILL NOT SCANNED, stated with COUNTS rather than bare directory names so the
-# claim is falsifiable (measured at main 86db695984): ``cockpit/src`` 2
-# (priority.py::save_priorities, ui_config.py::save_ui_config), filed as a
-# follow-up; ``dashboard/src`` 0; ``sampler/src`` 0; ``skills`` 0; the
-# repo-root ``tests/`` 0.
+# STILL NOT SCANNED: ``skills``, the repo-root ``tests/``, and the tests dirs
+# of the ``*/src`` packages.  Run ``_find_renamers`` over one to learn what it
+# holds; no count is written here, for the reason given above.
 #
 # TEST DIRECTORIES.  ``fused-memory/scripts`` and ``scripts`` are scanned
 # WHOLESALE, tests included, rather than through an exclusion mirroring the
 # ``*/src`` convention: a flat operator directory has no ``src/`` boundary to
 # mirror, and the one place a regrown production writer could hide is precisely
-# a directory somebody decided not to look at.  That is free today — the test
-# dirs INSIDE the scanned trees are clean: ``shared/tests`` 0, ``fused-memory/
-# tests`` 0, ``scripts/tests`` 0.  Stated in that scoped form deliberately: the
-# general claim "test trees are clean" is FALSE at this base, because
-# ``orchestrator/tests`` carries 2 renamers and ``escalation/tests`` 1.  Neither
-# sits inside a scanned tree, so neither affects red/green — but they are live
-# evidence that test directories do accumulate this pattern over time, and so
-# that an exclusion would not have stayed harmless.
+# a directory somebody decided not to look at.  So a renamer in
+# ``scripts/tests`` needs an allowlist entry, as the ``_write_heartbeat``
+# fixture has.  The general claim "test trees are clean" is FALSE: the tests
+# dirs of the ``*/src`` packages, which sit OUTSIDE every scanned tree, have
+# accumulated hand-rolled renamers, so an exclusion would not have stayed
+# harmless.
 
 _SRC_TREES = (
     'shared/src',
@@ -124,12 +125,15 @@ _SRC_TREES = (
     'fused-memory/src',
     'fused-memory/scripts',
     'scripts',
+    'cockpit/src',
+    'dashboard/src',
+    'sampler/src',
 )
 
-# Every (module, function) in the six trees that renames a path into place,
-# with the reason it is not calling atomic_write_text.  Adding an entry is a
-# deliberate act that needs a reason; growing this set silently is the failure
-# mode the guard exists to prevent.
+# Every (module, function) in the ``_SRC_TREES`` trees that renames a path
+# into place, with the reason it is not calling atomic_write_text.  Adding an
+# entry is a deliberate act that needs a reason; growing this set silently is
+# the failure mode the guard exists to prevent.
 _ALLOWED_RENAMERS = {
     ('shared/src/shared/safe_io.py', 'atomic_write_text'):
         'THE consolidated implementation — the one blessed home for this pattern.',
@@ -250,13 +254,6 @@ _ALLOWED_RENAMERS = {
         'disjoint-path discipline, so two writers can never share a temp path '
         'even if they bypass _persist_lock), and the asyncio.to_thread offload '
         'that keeps the blocking I/O off the event loop under burst load.',
-    ('fused-memory/src/fused_memory/reconciliation/backlog_policy.py', 'BacklogPolicy._restore_policy_keys'):
-        'Out of task 3223 enumerated scope; left alone deliberately. Re-merges '
-        'the policy-only keys that closing a halt strips (project_id, '
-        'error_type, backlog, threshold) back onto the persisted record via '
-        'tmp.write_text + tmp.replace. Best-effort by construction — every '
-        'failure is logged and swallowed so a record that IS closed but lost '
-        'its forensic keys is never misreported as un-closed.',
     ('fused-memory/src/fused_memory/reconciliation/event_queue.py', 'EventQueue._rotate_dead_letter'):
         'MOVES existing files: cascade-rotates dead_letter.jsonl -> .1 -> .2 '
         '-> ... There is no content string, only os.replace(src, dst) per '
@@ -305,11 +302,18 @@ _ALLOWED_RENAMERS = {
         'own docstring says the mechanism is copied \'(β does the same)\' — '
         'same shared artifact root, same mkstemp + os.replace, same candidacy. '
         'Migrate the two together or the copy-from-a-neighbour habit survives.',
-    ('scripts/consume_redispatch_requests.py', 'archive_request'):
-        'MOVES an existing file: os.replace of an APPLIED request into the '
-        '``consumed/`` subdirectory, to keep an audit trail of what was '
-        'actioned that the snapshot directory cannot provide. Same class as '
-        'escalation sweep._atomic_move / queue._archive_resolved.',
+    ('fused-memory/scripts/run_write_triage_population_arms.py', '_write_staged'):
+        'MULTI-FILE STAGING, a semantic atomic_write_text (one path per call) '
+        'cannot express: `publish` writes the population artifact and the '
+        'pairs-to-rate file it pins by sha256, and stages BOTH bodies before '
+        'replacing EITHER, so a body that cannot be written leaves the '
+        'committed pair as it was rather than an artifact naming a pairs sha '
+        'that does not match. Two sequential atomic_write_text calls would '
+        're-open exactly that window. Pinned by test_run_write_triage_'
+        'population_arms.py::TestThePublishCommand. Its fixed `<name>.tmp` '
+        'temp name is not per-writer unique; harmless for a one-shot operator '
+        'CLI with a single writer, and the gap to close if it ever gains a '
+        'second one. Added by task 6151.',
     ('scripts/dashboard-watchdog.py', 'save_state'):
         'STDLIB-ONLY STANDALONE ENTRYPOINT — the same constraint already '
         'recorded above for session_registry._atomic_write_text, so that '
@@ -377,7 +381,7 @@ _ALLOWED_RENAMERS = {
     # scope" boilerplate, and none was migrated here — a source migration
     # folded into a merge resolution is an unreviewed change arriving on the
     # one path nobody diffs, which is the opposite of what this guard is for.
-    ('scripts/render_dashboard_unit.py', 'main'):
+    ('scripts/render_systemd_unit.py', 'main'):
         'STDLIB-ONLY STANDALONE ENTRYPOINT — the class of dashboard-watchdog.'
         'save_state and orchestrator-watchdog._atomic_write_json above, and of '
         'session_registry._atomic_write_text before them, but under a HARDER '
@@ -419,10 +423,10 @@ _ALLOWED_RENAMERS = {
         'shell function under test (restart-all-orchestrators.sh::'
         'stamp_fleet_deploy_clock) so the fixture publishes the heartbeat the '
         'way production does. The atomicity is load-bearing to the test rather '
-        'than decorative: _heartbeat_timeline calls this from a '
-        'threading.Timer WHILE the spawned script polls the same file, and '
+        'than decorative: the _rewrites_on_gate_polls watcher thread calls '
+        'this WHILE the spawned script polls the same file, and '
         'drain_check._read_heartbeat turns the ValueError from a partially '
-        'written file into "absent" — a verdict no timeline scheduled, i.e. a '
+        'written file into "absent" — a verdict no rewrite asked for, i.e. a '
         'flake. Stated plainly: there is NO semantic here beyond '
         'atomic_write_text\'s reach, so this is a migration candidate, held '
         'back only because whether the fixture should keep mirroring the shell '
@@ -552,62 +556,43 @@ def _find_write_helpers(source: str, tree: ast.AST) -> list[tuple[str, bool]]:
 
 
 @functools.cache
-def _read_tree(tree: str, missing_ok: bool) -> tuple[tuple[str, str], ...]:
+def _read_tree(tree: str) -> tuple[tuple[str, str], ...]:
     """Read every ``*.py`` under ONE tree — once per process, then cached.
 
     Cached PER TREE rather than per tuple-of-trees on purpose: ``_SRC_TREES``
     and the pointer sweep's tree list overlap, and a per-tuple cache would
-    re-read the six source trees for the sweep.
-
-    *missing_ok* decides what an absent tree MEANS, and the two answers are
-    genuinely different rather than a strictness knob — see the assert below.
-    Note the warning fires once per process, since a cache hit skips this body.
+    re-read every ``_SRC_TREES`` tree for the sweep.
     """
     root = _REPO_ROOT / tree
-    if not root.is_dir():
-        # HARD assert for a tree this guard SCANS, kept rather than downgraded
-        # to pytest.skip, and that is only correct BECAUSE this guard is now
-        # repo-level (task 3388): at the repo root every scanned tree is
-        # guaranteed present, so a missing one means the fence silently covers
-        # less.  The skip fallback was the price of NOT relocating; having
-        # relocated, do not also pay it.  Paired with
-        # test_every_declared_tree_contributes_scanned_files below, which
-        # catches the case this assert cannot: a tree that IS a directory and
-        # rglobs nothing.
-        assert missing_ok, (
-            f'{tree} not found under {_REPO_ROOT} — this guard walks fixed tree '
-            f'names, so a moved/renamed package must update its tree list rather '
-            f'than let the guard silently scan nothing.'
-        )
-        # SOFT for a tree this guard only READS (see _POINTER_OPTIONAL_TREES):
-        # absence costs some documentation coverage, not fence coverage, so it
-        # is reported rather than fatal.  Loud, not silent — and `assert
-        # pointers` still stops the sweep from covering nothing at all.
-        warnings.warn(
-            f'{tree} not found under {_REPO_ROOT}; skipping it. This tree is '
-            f'swept for stale documentation pointers only — it is not fenced '
-            f'by this guard — so its absence narrows a doc check rather than '
-            f'the atomic-write check. Update _POINTER_OPTIONAL_TREES if the '
-            f'package is gone for good.',
-            stacklevel=2,
-        )
-        return ()
+    # HARD assert for every tree this guard reads (scanned, or pointer-swept
+    # for a fenced package — see _POINTER_EXTRA_TREES), kept rather than
+    # downgraded to pytest.skip, and that is only correct BECAUSE this guard is
+    # now repo-level (task 3388): at the repo root every scanned tree is
+    # guaranteed present, so a missing one means the fence silently covers
+    # less.  The skip fallback was the price of NOT relocating; having
+    # relocated, do not also pay it.  Paired with
+    # test_every_declared_tree_contributes_scanned_files below, which catches
+    # the case this assert cannot: a tree that IS a directory and rglobs
+    # nothing.
+    assert root.is_dir(), (
+        f'{tree} not found under {_REPO_ROOT} — this guard walks fixed tree '
+        f'names, so a moved/renamed package must update its tree list rather '
+        f'than let the guard silently scan nothing.'
+    )
     return tuple(
         (py.relative_to(_REPO_ROOT).as_posix(), py.read_text(encoding='utf-8'))
         for py in sorted(root.rglob('*.py'))
     )
 
 
-def _walk_trees(
-    trees: tuple[str, ...], missing_ok: bool = False
-) -> tuple[tuple[str, str], ...]:
+def _walk_trees(trees: tuple[str, ...]) -> tuple[tuple[str, str], ...]:
     """``(relpath, source)`` for every ``*.py`` under *trees*, in tree order.
 
     Duplicates are NOT removed here — ``scripts/tests`` sits inside the
     ``scripts`` scan root — because only the pointer sweep spans overlapping
     trees and it dedupes by relpath itself.
     """
-    return tuple(item for tree in trees for item in _read_tree(tree, missing_ok))
+    return tuple(item for tree in trees for item in _read_tree(tree))
 
 
 class _ScannedModule(NamedTuple):
@@ -651,13 +636,7 @@ def _scan_source_trees() -> tuple[_ScannedModule, ...]:
 
 
 def _iter_source_files():
-    """Yield (repo-relative posix path, source text) for every scanned tree.
-
-    "Every scanned tree" means ``_SRC_TREES``, whatever that currently holds —
-    six at the time of writing.  Stated by reference rather than by count: the
-    count in this sentence used to say "the three src trees" and stayed there
-    through the widening to six, which is precisely the stale-prose failure
-    this module exists to prevent (task 3388).
+    """Yield (repo-relative posix path, source text) for every tree in ``_SRC_TREES``.
 
     A thin view over the cached ``_read_tree``, which carries the hard
     ``assert root.is_dir()`` and the argument for keeping it hard.  Kept as a
@@ -797,12 +776,7 @@ class TestNoRegrownAtomicWriters:
         assert _find_renamers(prose_only) == []
 
     def test_no_unapproved_renamers_in_source_trees(self):
-        """Every rename-into-place in the scanned trees is a known, reasoned survivor.
-
-        Scanned trees = ``_SRC_TREES`` (six at the time of writing).  Read the
-        tuple, not this sentence — see _iter_source_files on why no count is
-        written here.
-        """
+        """Every rename-into-place in a ``_SRC_TREES`` tree is a known, reasoned survivor."""
         actual = {
             (module.relpath, qualname)
             for module in _scan_source_trees()
@@ -887,8 +861,8 @@ class TestNoRegrownAtomicWriters:
         # the only one in the module without such a fence, and it is the one
         # that most needs it: its skip condition is membership in
         # _ALLOWED_RENAMERS, so every entry added there silences one more name,
-        # silently and by design.  Without this it could iterate all 509
-        # scanned files, collect nothing, and report green forever.
+        # silently and by design.  Without this it could iterate every
+        # scanned file, collect nothing, and report green forever.
         assert checked, (
             'The delegate check examined no helpers. Real ones exist '
             f'({_DELEGATE_CONTROL}), so an empty result means the walk or the '
@@ -987,6 +961,9 @@ _CONTROL_MODULES = {
     'fused-memory/src': 'fused-memory/src/fused_memory/reconciliation/event_queue.py',
     'fused-memory/scripts': 'fused-memory/scripts/bake_off_storage_shape.py',
     'scripts': 'scripts/legibility/codebook.py',
+    'cockpit/src': 'cockpit/src/cockpit/ui_config.py',
+    'dashboard/src': 'dashboard/src/dashboard/app.py',
+    'sampler/src': 'sampler/src/sampler/store.py',
 }
 
 
@@ -1014,49 +991,18 @@ def test_atomic_write_guard_does_not_scan_sibling_package_trees():
     down; a root assembled at runtime from innocent segments still evades it,
     and that residual is documented at the predicate rather than left implicit.
 
-    (b) This test pins ONE file, not ``shared/tests`` as a whole.  It does NOT establish that shared's
-    suite is standalone-runnable against a lone ``dark-factory-shared``
-    checkout, and after task 3388 that suite is **not** standalone-runnable.
-    The five OTHER cross-tree gates below live in ``shared/tests`` and are
-    deliberately NOT covered here; each carries its own comment arguing for its
-    cross-tree reach, so narrowing them is a design question this task did not
-    settle rather than an oversight it missed.  (Each would trip the broadened
-    predicate on its own literals — which is the point: they are real cross-tree
-    gates, just not ones this fence is scoped to move.)
+    (b) This test pins ONE file, not ``shared/tests`` as a whole.  It does NOT
+    establish that shared's suite is standalone-runnable, and it is not meant
+    to: ``shared/tests`` deliberately hosts the whole-tree source gates, which
+    name sibling trees by design, and presumes a full checkout
+    (``CONTRIBUTING.md`` §2, "Where repo-wide gates live").
 
-      * ``silent_fallthrough_scan.py`` — ``_SCOPE_ROOTS`` (7 roots:
-        orchestrator/src, fused-memory/src, dashboard/src, escalation/src,
-        shared/src, sampler/src, scripts) and a hard ``RuntimeError`` when the
-        ``shared/src``/``orchestrator/src`` sentinels are absent, paired with
-        ``silent_fallthrough_allowlist.py`` (13 sibling-path literals, as
-        ``(path, qualname, hash, reason)`` tuples).
-      * ``config_dir_archival_allowlist.py`` — 10 sibling-path literals, as
-        ``{'path': ..., 'qualname': ...}`` dicts.
-      * ``test_auth_failed.py`` — ``_PRODUCTION_SRC_ROOTS = ('shared/src',
-        'orchestrator/src')`` with a hard ``assert root.is_dir()``.
-      * ``test_silent_fallthrough_gate.py`` — 3 sibling-path literals,
-        hard-asserted (``assert candidate in files``).
-      * ``test_capability_manifest.py`` — 21 sibling-path literals; most are
-        synthetic fixtures, but it hard-asserts on REAL files in ``scripts/``
-        (``committed_file_mode('scripts/check_method_param_wiring.py') ==
-        '100755'``, and a superset assertion naming
-        ``scripts/gc_agent_transcripts.py``).
-
-    Counts measured first-hand at commit 6b68a87fd6 by an ast sweep of
-    ``shared/tests/**/*.py`` for non-docstring string constants ending in
-    ``.py`` and beginning with a sibling package directory — stated as a method
-    plus a number so the claim stays falsifiable rather than becoming the kind
-    of stale prose task 3388 exists to eliminate.  Re-run the sweep; do not
-    re-trust this sentence.
-
-    WHY THE NARROW FORM.  The plan specified a walk of ``shared/tests/**/*.py``
-    asserting the whole directory names no sibling tree.  Measured, that test
-    is red forever: the gates above are the falsifying evidence, they are
-    outside this task's file scope, and each is load-bearing where it sits.
-    Ticket ``tkt_0RT7TDAAH2TS88BR88TZ1E3QMP`` tracks the real question — where
-    this family of repo-wide gates should live, and what it should do when a
-    tree it names is absent.  Until that lands, this test is a fence around one
-    gate and must not be read as evidence about the others.
+    WHY THE NARROW FORM.  A walk of ``shared/tests/**/*.py`` asserting the
+    whole directory names no sibling tree would be red forever: the whole-tree
+    source gates that live there name sibling trees on purpose, and each is
+    load-bearing where it sits.  The fence's purpose is SPOT: the atomic-write
+    guard has one home, this module, so ``test_safe_io.py`` must not fork a
+    second sweep.
     """
     target = _REPO_ROOT / _GUARDED_FILE
     assert target.is_file(), (
@@ -1076,12 +1022,11 @@ def test_atomic_write_guard_does_not_scan_sibling_package_trees():
     assert not offenders, (
         f'{_GUARDED_FILE} names a bare path in a package shared does not own:\n  '
         + '\n  '.join(offenders)
-        + '\nA guard that walks sibling package trees cannot live inside one '
-        'package\'s suite: a refactor in that sibling (migrating the allowlisted '
-        'orchestrator digest.write_digest_entry, say) turns SHARED red, at a site '
-        'no orchestrator author would think to look. Move the cross-tree guard to '
-        'a repo-level suite — tests/scripts/test_atomic_write_regrowth.py is where '
-        'the atomic-write one lives — rather than widening this exception. If the '
+        + '\nThe atomic-write anti-regrowth guard lives in '
+        'tests/scripts/test_atomic_write_regrowth.py; extend it there rather than '
+        'forking a second sweep into safe_io\'s unit suite. A new gate over the '
+        'shared first_party_tree parse belongs beside that fixture in shared/tests '
+        '(CONTRIBUTING.md §2, "Where repo-wide gates live"). If the '
         'literal is genuinely PROSE rather than a scan root, write it as prose: '
         'the predicate only flags a bare path with no whitespace in it.'
     )
@@ -1164,6 +1109,28 @@ def test_every_declared_tree_contributes_scanned_files():
     )
 
 
+def test_every_fenced_package_tests_dir_is_a_required_pointer_tree():
+    """The tests dir of every package whose ``src`` this guard fences is swept, hard.
+
+    ``_POINTER_EXTRA_TREES`` states the rule; this asserts it, so the next
+    widening of ``_SRC_TREES`` cannot leave a fenced package's tests behind.
+    Flat trees with no ``/src`` suffix have no sibling ``tests`` to derive.
+    """
+    required: set[str] = set(_POINTER_EXTRA_TREES)
+    fenced_tests = sorted(
+        f'{tree.removesuffix("/src")}/tests'
+        for tree in _SRC_TREES
+        if tree.endswith('/src')
+        and (_REPO_ROOT / tree.removesuffix('/src') / 'tests').is_dir()
+    )
+    missing = [tests for tests in fenced_tests if tests not in required]
+    assert not missing, (
+        f'Tests dirs of fenced packages missing from _POINTER_EXTRA_TREES: {missing}. '
+        'Rule: the tests dir of every package whose src tree this guard FENCES is '
+        'a REQUIRED pointer tree, swept with a hard is_dir assertion.'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Pointer resolution (task 3388)
 # ---------------------------------------------------------------------------
@@ -1193,40 +1160,20 @@ _POINTER_RE = re.compile(r'_ALLOWED_RENAMERS`{0,2}[\s#]+in[\s#]+`{0,2}([\w./\-]+
 #: REQUIRED (hard ``assert root.is_dir()``): the tests dir of every package
 #: whose src tree this guard FENCES, plus the repo-root ``tests`` that hosts
 #: this module.  If one of those is absent, either a fenced package or the
-#: guard's own home is gone, and that is a real defect worth a red.
+#: guard's own home is gone, and that is a real defect worth a red.  Since task
+#: 5261 fenced every workspace member's src, that is every member's tests dir,
+#: and test_every_fenced_package_tests_dir_is_a_required_pointer_tree enforces
+#: the pairing.  A pointer-only tree for a package this guard does NOT fence
+#: does not belong here — see the module docstring.
 _POINTER_EXTRA_TREES = (
     'shared/tests',
     'orchestrator/tests',
     'escalation/tests',
     'fused-memory/tests',
-    'tests',
-)
-
-#: OPTIONAL (warn and skip): sibling packages this guard does NOT fence and
-#: reads only for documentation-pointer hygiene.
-#:
-#: WHY THESE THREE ARE SOFT WHILE _SRC_TREES STAYS HARD — the hard-assert
-#: argument at the top of this module does not transfer, and applying it here
-#: anyway was a real defect rather than a stylistic quibble.  That argument is
-#: "a missing tree means the fence silently scans less".  For a tree the fence
-#: never scans, a missing dir means only that fewer doc comments got checked —
-#: yet it produced the identical red, so deleting or renaming an optional
-#: sibling package turned the ATOMIC-WRITE REGROWTH GUARD red for a reason
-#: with nothing to do with atomic writes.  The repo does not treat every
-#: package as guaranteed either: ``dark-factory-orchestrator.yaml``'s
-#: test_command still wraps cockpit in ``( [ -d cockpit ] || exit 0; ... )``.
-#:
-#: Soft is not silent: ``_read_tree`` emits a ``warnings.warn`` naming the
-#: tree, and ``assert pointers`` in the sweep below still fails if the whole
-#: sweep ends up covering nothing.  MEASURED at this base, which is why the
-#: split falls here: the repo's three real pointers live in
-#: ``orchestrator/src``, ``shared/tests`` and ``orchestrator/tests`` — all in
-#: the required set — and these three trees carry zero.  Promote one to
-#: _POINTER_EXTRA_TREES if it ever starts carrying a pointer worth pinning.
-_POINTER_OPTIONAL_TREES = (
     'cockpit/tests',
     'dashboard/tests',
     'sampler/tests',
+    'tests',
 )
 
 
@@ -1240,10 +1187,7 @@ def _iter_pointer_candidates():
     scans costs nothing beyond the dedupe.
     """
     seen: set[str] = set()
-    for relpath, source in (
-        _walk_trees(_SRC_TREES + _POINTER_EXTRA_TREES)
-        + _walk_trees(_POINTER_OPTIONAL_TREES, missing_ok=True)
-    ):
+    for relpath, source in _walk_trees(_SRC_TREES + _POINTER_EXTRA_TREES):
         if relpath in seen:
             continue
         seen.add(relpath)

@@ -50,11 +50,9 @@ def make_gate_mock(**overrides) -> MagicMock:
     ``detect_cap_hit``, ``confirm``, ``settle``, ``report`` methods proxy back
     to the gate — so tests can still assert on ``gate.detect_cap_hit.call_args``,
     ``gate.confirm_account_ok.assert_called_with(...)``, etc.
-    ``detect_cap_hit(...)`` mirrors production :meth:`InvokeSlot.detect_cap_hit`'s
-    release/settle behaviour: on a truthy hit it calls ``release_probe_slot``
-    and then settles (task 4096). Its ``gate.detect_cap_hit(...)`` call does
-    NOT yet forward ``scope=slot.scope`` the way production does (task 4234
-    follow-up — see the comment in ``_slot_detect_cap_hit`` below).
+    ``detect_cap_hit(...)`` mirrors production :meth:`InvokeSlot.detect_cap_hit`:
+    it forwards ``scope=slot.scope`` (task 4969) and, on a truthy hit, calls
+    ``release_probe_slot`` and then settles (task 4096).
     ``report(outcome)``
     (task W4-ε, PRD §7.4) mirrors production :meth:`InvokeSlot.report`'s
     dispatch-then-settle contract: OK→``confirm_account_ok``,
@@ -89,9 +87,8 @@ def make_gate_mock(**overrides) -> MagicMock:
         # no args) and mirrored onto the slot so a caller can read
         # slot.scope. Forwarded into before_invoke() below for scope-aware
         # account selection (PRD task γ, task 2857) and from the slot into
-        # report()'s CapHit/NearCap arms (task 4234) — but NOT yet into the
-        # detect_cap_hit(...) proxy; see the comment in _slot_detect_cap_hit
-        # below.
+        # report()'s CapHit/NearCap arms (task 4234) and the
+        # detect_cap_hit(...) proxy (task 4969).
         _scope = _kw.get('scope')
 
         async def _aenter_impl(*_args, **_akw):
@@ -105,20 +102,12 @@ def make_gate_mock(**overrides) -> MagicMock:
             slot._settled = False
 
             def _slot_detect_cap_hit(stderr, output, backend='claude'):
-                # Deliberately omits scope=slot.scope, unlike production
-                # InvokeSlot.detect_cap_hit (task 4234 follow-up): adding it
-                # would change this call's shape, and
-                # test_cap_retry.py::test_detect_cap_hit_called_with_correct_args
-                # asserts gate.detect_cap_hit.call_args with no scope kwarg —
-                # that file is outside this task's locked scope, so the two
-                # edits would need to land together. Tracked as a follow-up
-                # rather than left silently inconsistent with the
-                # now-scope-forwarding report() arms above.
                 hit = gate.detect_cap_hit(
                     stderr,
                     output,
                     backend,
                     oauth_token=slot.token,
+                    scope=slot.scope,
                 )
                 if hit:
                     # Mirrors production InvokeSlot.detect_cap_hit (task 4096):

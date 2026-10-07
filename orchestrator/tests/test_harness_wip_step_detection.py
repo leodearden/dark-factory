@@ -481,7 +481,7 @@ class TestBuildImplementerPromptWipNotice:
         ]
 
         prompt = await briefing.build_implementer_prompt(
-            minimal_plan, [], context='', wip_notice=wip_notice,
+            minimal_plan, context='', wip_notice=wip_notice,
         )
 
         assert 'Verify Before Re-Implementing' in prompt
@@ -492,7 +492,7 @@ class TestBuildImplementerPromptWipNotice:
         self, briefing: BriefingAssembler, minimal_plan: dict,
     ):
         prompt = await briefing.build_implementer_prompt(
-            minimal_plan, [], context='', wip_notice=None,
+            minimal_plan, context='', wip_notice=None,
         )
 
         assert 'Verify Before Re-Implementing' not in prompt
@@ -501,7 +501,7 @@ class TestBuildImplementerPromptWipNotice:
         self, briefing: BriefingAssembler, minimal_plan: dict,
     ):
         prompt = await briefing.build_implementer_prompt(
-            minimal_plan, [], context='', wip_notice=[],
+            minimal_plan, context='', wip_notice=[],
         )
 
         assert 'Verify Before Re-Implementing' not in prompt
@@ -516,11 +516,96 @@ class TestBuildImplementerPromptWipNotice:
         }
 
         prompt = await briefing.build_implementer_prompt(
-            minimal_plan, [], context='', rebase_notice=rebase_notice, wip_notice=None,
+            minimal_plan, context='', rebase_notice=rebase_notice, wip_notice=None,
         )
 
         assert 'Rebase Notice' in prompt
         assert 'Verify Before Re-Implementing' not in prompt
+
+
+def _wip_section(prompt: str) -> str:
+    assert '## Already-Committed WIP' in prompt
+    after_heading = prompt.split('## Already-Committed WIP', 1)[1]
+    return after_heading.split('# Session Startup Protocol', 1)[0]
+
+
+_OUTCOME_LABELS = (
+    '**Carried by an earlier, non-WIP commit:**',
+    '**Carried by a WIP commit above:**',
+    '**Only partly carried, or not carried:**',
+)
+
+
+def _outcome_branches(section: str) -> list[str]:
+    for label in _OUTCOME_LABELS:
+        assert label in section, f'outcome branch {label} is missing'
+    starts = [section.index(label) for label in _OUTCOME_LABELS]
+    assert starts == sorted(starts), 'outcome branches are out of order'
+    return [section[s:e] for s, e in zip(starts, [*starts[1:], len(section)], strict=True)]
+
+
+@pytest.mark.asyncio
+class TestWipSectionStepAttribution:
+    """A step's ``commit`` names the commit whose diff carries the step's change.
+
+    Several steps citing one WIP safety-commit is truthful when its diff
+    carries each of them. Passing tests do not identify the carrying commit:
+    they pass just the same when the step's own commit sits below the WIP run.
+    An empty per-step commit is no fix either, because its sha passes the
+    unbacked-step check while carrying none of the step's change.
+    """
+
+    async def _render_wip_section(self, briefing: BriefingAssembler, plan: dict) -> str:
+        prompt = await briefing.build_implementer_prompt(
+            plan, context='', wip_notice=[
+                {'sha': 'abcdef1234567890', 'subject': 'chore: save WIP before inter-iteration rebase'},
+            ],
+        )
+        return _wip_section(prompt)
+
+    async def test_each_outcome_cites_the_commit_that_carries_the_step(
+        self, briefing: BriefingAssembler, minimal_plan: dict,
+    ):
+        section = await self._render_wip_section(briefing, minimal_plan)
+        earlier, wip, partial = _outcome_branches(section)
+
+        assert "mark_step_done(step_id, <that commit's sha>)" in earlier, (
+            'passing tests alone cite the WIP sha for a step whose own commit sits '
+            'below the WIP run (docs/legibility/confusion-codebook.yaml cand-20260918-15)'
+        )
+        assert 'mark_step_done(step_id, <that WIP sha>)' in wip, (
+            'a step carried by the WIP commit loses its sanctioned citation'
+        )
+        assert 'Several steps citing one WIP sha is correct' in wip, (
+            'agents improvise splitting or empty commits when sharing one WIP sha is not sanctioned'
+        )
+        assert 'cite that new commit' in partial, (
+            'a half-done step would be cited at a WIP sha that does not carry its whole change'
+        )
+
+    async def test_carrying_commit_is_searched_only_on_this_branch(
+        self, tmp_path: Path, minimal_plan: dict,
+    ):
+        trunk_briefing = BriefingAssembler(
+            OrchestratorConfig(project_root=tmp_path, git=GitConfig(main_branch='trunk')),
+        )
+
+        section = await self._render_wip_section(trunk_briefing, minimal_plan)
+
+        assert 'git log --oneline trunk..HEAD -- ' in section, (
+            'an unscoped log can surface a main-branch commit, which the '
+            'unbacked-step check rejects because it is not in base..HEAD'
+        )
+
+    async def test_walk_covers_every_pending_step(
+        self, briefing: BriefingAssembler, minimal_plan: dict,
+    ):
+        section = await self._render_wip_section(briefing, minimal_plan)
+
+        assert 'walk the pending steps in plan order' in section, (
+            'TaskWorkflow._detect_tip_wip_commits hides a WIP sha once any done step '
+            'cites it, so this notice may be the only sighting'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -540,7 +625,7 @@ class TestBuildImplementerPromptMandatoryPreflight:
         it must render even when there is no WIP notice at all, which is the
         common case for most implementer invocations."""
         prompt = await briefing.build_implementer_prompt(
-            minimal_plan, [], context='', wip_notice=None,
+            minimal_plan, context='', wip_notice=None,
         )
 
         assert 'git diff HEAD' in prompt
@@ -554,7 +639,7 @@ class TestBuildImplementerPromptMandatoryPreflight:
         ]
 
         prompt = await briefing.build_implementer_prompt(
-            minimal_plan, [], context='', wip_notice=wip_notice,
+            minimal_plan, context='', wip_notice=wip_notice,
         )
 
         assert 'git diff HEAD' in prompt

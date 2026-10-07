@@ -603,11 +603,11 @@ class TestProbeOneTimeoutBudget:
             TaskRuntimeSnapshot().model_dump(mode='json'), url,
         )
 
-        result = await _probe_one(mock_client, url, 0.05)
+        result = await _probe_one(mock_client, url, 5.0)
 
         assert result.offline is False, f'probe should have succeeded: {result}'
         timeouts = [c.kwargs['timeout'] for c in mock_client.post.call_args_list]
-        assert timeouts == [0.05, 0.05, 0.05], (
+        assert timeouts == [5.0, 5.0, 5.0], (
             f"the probe budget must reach every post, not httpx's 10s "
             f'default, got {timeouts}'
         )

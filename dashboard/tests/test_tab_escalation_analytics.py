@@ -7,133 +7,27 @@ TestClient-driven route test against the real FastAPI app.
 
 from __future__ import annotations
 
-import html.parser
 import json
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from _dashboard_helpers import extract_function_body
-
-# ---------------------------------------------------------------------------
-# Helper: extract a named seed block from window.DF_DATA (brace-aware).
-# Copied from test_tab_escalations.py — see that module for the full rationale
-# (brace-depth walk; does not skip braces inside JS string literals).
-# ---------------------------------------------------------------------------
-
-
-def _extract_df_data_block(src: str, key: str) -> str:
-    """Return the body of the ``<key>: { ... }`` seed object, braces included."""
-    m = re.search(rf'{re.escape(key)}\s*:\s*\{{', src)
-    if m is None:
-        return ''
-    start = m.end() - 1  # index of the opening `{`
-    depth = 0
-    for i in range(start, len(src)):
-        c = src[i]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : i + 1]
-    return ''
-
+import pytest
+from _dashboard_helpers import (
+    assert_script_loads_before,
+    extract_df_data_block,
+    extract_function_body,
+    find_script_position,
+    strip_js_comments,
+)
 
 # ---------------------------------------------------------------------------
 # Helper: extract a named JS/JSX function body (brace-aware).
-# Copied from test_tab_escalations.py — scopes token-presence checks to a
+# Imported from `_dashboard_helpers` — scopes token-presence checks to a
 # specific function body rather than searching the entire file (which would
 # give false confidence when a token appears in an unrelated context).
 # ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Load-order helpers (copied from test_tab_escalations.py / test_index_html.py)
-# ---------------------------------------------------------------------------
-
-
-class _ScriptTagCollector(html.parser.HTMLParser):
-    """Collects the attribute dicts for every <script> start-tag encountered."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.script_attrs: list[dict[str, str | None]] = []
-
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
-        if tag == 'script':
-            self.script_attrs.append(dict(attrs))
-
-
-def _find_script_position(
-    body: str, src_prefix: str
-) -> tuple[int, dict[str, str | None]] | None:
-    """Return ``(index, attrs)`` for the first <script> tag whose ``src``
-    starts with ``src_prefix``, or ``None`` if no such tag exists.
-    """
-    collector = _ScriptTagCollector()
-    collector.feed(body)
-    for i, attrs in enumerate(collector.script_attrs):
-        if (attrs.get('src') or '').startswith(src_prefix):
-            return i, attrs
-    return None
-
-
-def _assert_script_loads_before(
-    body: str,
-    before_src_prefix: str,
-    after_src_prefix: str,
-    before_label: str,
-    after_label: str,
-    consumer_note: str = '',
-) -> None:
-    """Assert that the script for ``before_src_prefix`` loads BEFORE the
-    script for ``after_src_prefix`` in ``body``.  Combines a
-    defer/async/type=module false-pass guard with the document-order
-    position comparison.
-    """
-    before_result = _find_script_position(body, before_src_prefix)
-    assert before_result is not None, (
-        f'No <script src="{before_src_prefix}..."> tag found in index.html. '
-        f'{consumer_note}'
-    )
-    before_pos, before_attrs = before_result
-    before_src = before_attrs.get('src')
-
-    after_result = _find_script_position(body, after_src_prefix)
-    assert after_result is not None, (
-        f'<script src="{after_src_prefix}..."> not found in index.html — '
-        f'cannot verify load-order invariant for {before_label}.'
-    )
-    after_pos, after_attrs = after_result
-
-    # Both tags must be classic synchronous scripts — otherwise document order
-    # diverges from execution order and the position comparison below is moot.
-    for _label, _attrs in [
-        (before_label, before_attrs),
-        (after_label, after_attrs),
-    ]:
-        assert 'defer' not in _attrs, (
-            f'{_label} has a defer attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert 'async' not in _attrs, (
-            f'{_label} has an async attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert (_attrs.get('type') or '').lower() != 'module', (
-            f'{_label} has type="module"; ES modules are deferred by default, '
-            f'so document order no longer implies execution order.'
-        )
-
-    assert before_pos < after_pos, (
-        f'{before_label} (position {before_pos}, src={before_src!r}) must load '
-        f'BEFORE {after_label} (position {after_pos}). '
-        f'{consumer_note}'
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +57,7 @@ def test_data_js_registers_escalation_analytics_endpoint(data_js_body: str) -> N
         'escalation-analytics must stay unwindowed (no ?window= query param) — the '
         'frontend windows client-side over samples/flow_daily (per the PRD).'
     )
-    seed_block = _extract_df_data_block(data_js_body, 'ESCALATION_ANALYTICS')
+    seed_block = extract_df_data_block(data_js_body, 'ESCALATION_ANALYTICS')
     assert seed_block, (
         'data.js does not contain an `ESCALATION_ANALYTICS: { ... }` seed block — '
         'add the initializer to the window.DF_DATA assignment so applyKey has '
@@ -177,12 +71,31 @@ def test_data_js_registers_escalation_analytics_endpoint(data_js_body: str) -> N
 
 
 # ---------------------------------------------------------------------------
-# step-19: GET /api/v2/dashboard/escalation-analytics — real config + tmp archive.
+# GET /api/v2/dashboard/escalation-analytics — real config + tmp archive.
 # Uses the module-level `client` fixture from conftest.py (function-scoped —
 # a fresh TestClient/lifespan per test) so each test can point app.state.config
 # at its own tmp project root, mirroring test_api_curator.py's _override_client
 # idiom without needing a local helper.
+#
+# The route lives in dashboard.api.escalations beside /escalations, and both
+# read the one escalation corpus. No autouse fixture clears its cache or the
+# analytics memo: every route test here requests ``analytics_caches``.
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def analytics_caches():
+    """Clear the corpus cache and the analytics memo before and after the test."""
+    from dashboard.api import escalations as escalation_routes
+    from dashboard.data import escalation_corpus
+
+    def _clear() -> None:
+        escalation_corpus._corpus_cache_clear()
+        escalation_routes._analytics_memo_clear()
+
+    _clear()
+    yield
+    _clear()
 
 
 def _write_esc(esc_dir: Path, esc: dict) -> None:
@@ -205,13 +118,17 @@ def _make_config(tmp_path: Path, *, known_project_roots: list[Path] | None = Non
     return DashboardConfig(project_root=tmp_path, known_project_roots=known_project_roots or [])
 
 
+def _analytics(client) -> dict:
+    resp = client.get('/api/v2/dashboard/escalation-analytics')
+    assert resp.status_code == 200
+    return resp.json()['ESCALATION_ANALYTICS']
+
+
 class TestEscalationAnalyticsRoute:
     """GET /api/v2/dashboard/escalation-analytics against the real app + a tmp archive."""
 
-    def test_returns_wrapped_contract_keys(self, client, tmp_path):
-        """200 + ESCALATION_ANALYTICS wrapping the four Seam-2 contract keys."""
-        from dashboard.app import _analytics_cache_clear
-
+    def test_returns_wrapped_contract_keys(self, client, tmp_path, analytics_caches):
+        """200 + ESCALATION_ANALYTICS wrapping the Seam-2 contract keys, and served_at."""
         now = datetime(2026, 7, 16, 18, 0, 0, tzinfo=UTC)
         esc_dir = tmp_path / 'data' / 'escalations'
         _write_esc(esc_dir, {
@@ -224,7 +141,6 @@ class TestEscalationAnalyticsRoute:
         })
 
         client.app.state.config = _make_config(tmp_path)
-        _analytics_cache_clear()
 
         resp = client.get('/api/v2/dashboard/escalation-analytics')
 
@@ -235,14 +151,17 @@ class TestEscalationAnalyticsRoute:
             "applyKey('ESCALATION_ANALYTICS', body['ESCALATION_ANALYTICS']) needs it, "
             'matching the ESCALATIONS/CURATOR_STATE/SCHEDULER envelope precedent.'
         )
+        assert isinstance(body['served_at'], str)
         analytics = body['ESCALATION_ANALYTICS']
         assert set(analytics) == {
             'generated_at', 'parse_failures', 'regime_markers', 'per_project',
             # The two archive-reach signals, and the only fields that can tell
             # an absent archive from an empty one: ``archives_present`` (all)
-            # is the completeness diagnostic, ``archives_reached`` (any) is the
-            # route's cacheability predicate.
+            # is the completeness diagnostic, ``archives_reached`` (any) is
+            # the corpus cache's own cacheability fact.
             'archives_present', 'archives_reached',
+            # The corpus' named views across every orchestrator queue.
+            'views',
         }
         assert isinstance(analytics['generated_at'], str) and analytics['generated_at']
         assert analytics['archives_present'] is True
@@ -250,27 +169,30 @@ class TestEscalationAnalyticsRoute:
         assert analytics['parse_failures'] == 0
         assert isinstance(analytics['regime_markers'], list)
         assert len(analytics['per_project']) == 1
-        assert analytics['per_project'][0]['project'] == tmp_path.name
+        entry = analytics['per_project'][0]
+        assert entry['project'] == tmp_path.name
+        for views in (analytics['views'], entry['views']):
+            assert set(views) == {'queue_pending', 'open_in_history'}
+            assert all(
+                datetime.fromisoformat(wired['as_of'])
+                == datetime.fromisoformat(analytics['generated_at'])
+                for wired in views.values()
+            )
 
-    def test_primary_root_ordered_first(self, client, tmp_path):
+    def test_primary_root_ordered_first(self, client, tmp_path, analytics_caches):
         """per_project lists the primary project_root before known_project_roots."""
-        from dashboard.app import _analytics_cache_clear
-
         primary = tmp_path / 'primary'
         secondary = tmp_path / 'secondary'
         (primary / 'data' / 'escalations').mkdir(parents=True)
         (secondary / 'data' / 'escalations').mkdir(parents=True)
 
         client.app.state.config = _make_config(primary, known_project_roots=[secondary])
-        _analytics_cache_clear()
 
-        resp = client.get('/api/v2/dashboard/escalation-analytics')
-
-        assert resp.status_code == 200
-        per_project = resp.json()['ESCALATION_ANALYTICS']['per_project']
+        per_project = _analytics(client)['per_project']
         assert [p['project'] for p in per_project] == ['primary', 'secondary']
 
-    def test_malformed_regime_markers_never_500s(self, client, tmp_path, monkeypatch):
+    def test_malformed_regime_markers_never_500s(self, client, tmp_path, monkeypatch,
+                                                 analytics_caches):
         """Row 9 (endpoint level): a broken regime-markers file degrades loudly.
 
         Mirrors load_regime_markers' own fail-soft contract (step-1) but pins it
@@ -278,234 +200,164 @@ class TestEscalationAnalyticsRoute:
         500 — only a counted parse_failures increment.
         """
         import dashboard.data.escalation_analytics as escalation_analytics_module
-        from dashboard.app import _analytics_cache_clear
+        from dashboard.api.escalations import _analytics_memo_clear
 
         (tmp_path / 'data' / 'escalations').mkdir(parents=True)
         client.app.state.config = _make_config(tmp_path)
-        _analytics_cache_clear()
 
-        resp1 = client.get('/api/v2/dashboard/escalation-analytics')
-        assert resp1.status_code == 200
-        assert resp1.json()['ESCALATION_ANALYTICS']['parse_failures'] == 0
+        assert _analytics(client)['parse_failures'] == 0
 
         bad_markers = tmp_path / 'bad-regime-markers.yaml'
         bad_markers.write_text('date: [unclosed')
         monkeypatch.setattr(
             escalation_analytics_module, '_DEFAULT_REGIME_MARKERS_PATH', bad_markers,
         )
-        _analytics_cache_clear()
+        _analytics_memo_clear()
 
-        resp2 = client.get('/api/v2/dashboard/escalation-analytics')
-        assert resp2.status_code == 200
-        assert resp2.json()['ESCALATION_ANALYTICS']['parse_failures'] >= 1
-
-
-def _analytics_payload(**overrides):
-    """A builder-shaped analytics payload, overridable one key at a time.
-
-    Shaped exactly as ``build_escalation_analytics`` returns it, so a stub
-    standing in for the builder cannot hand the route something the real
-    builder never would.
-    """
-    payload = {
-        'generated_at': '2026-07-16T18:00:00+00:00',
-        'parse_failures': 0,
-        'regime_markers': [],
-        'per_project': [],
-        'archives_present': True,
-        'archives_reached': True,
-    }
-    payload.update(overrides)
-    return payload
+        assert _analytics(client)['parse_failures'] >= 1
 
 
 class TestEscalationAnalyticsCacheability:
-    """A scan that reached NO archive must not be pinned for the TTL.
+    """The corpus cache is the one freshness authority; analytics derives from one generation.
 
-    Same rule the memory-evals route follows, applied here because the two
-    routes are written as one idiom and a fix to only one of them would leave
-    them silently divergent.  The signal differs — memory-evals already
-    carried ``root_present``, analytics needed ``archives_reached`` added —
-    but the reasoning is identical: an archive that was never reached is O(1)
-    to re-check (one negative ``is_dir`` stat per project), so re-checking
-    every poll costs nothing, while caching it keeps the tab reporting an
-    empty archive for a full TTL window after the volume mounts.
+    The route memoises its derivation per corpus GENERATION (queues + the
+    walk's instant), so the ~10k-record aggregation and the pins fan-out are
+    paid once per walk — and can never be served over a different walk than
+    the one /escalations reads. Whether a walk is cached at all is the corpus
+    cache's rule, asserted here through the route:
 
-    A PARTIAL scan IS cached, and that distinction is the whole point.  Keyed
-    on ``archives_present`` (``all``) instead, this cache would be dead in the
-    installed config: measured 2026-08-01 against the unit's own
-    ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (9 roots), 2 roots have no
-    ``data/escalations`` dir while the other 7 hold ~9.1k records, so ``all``
-    is permanently False, nothing is ever stored, and every 3s poll re-runs
-    the whole multi-second walk.  A root that has simply never escalated must
-    not delete the cache in front of the other seven.
+    * a walk that reached NO queue directory is served but not cached: it is
+      O(1) to repeat (one negative stat per queue), while caching it would
+      report an empty archive for a whole TTL after the volume mounts;
+    * a PARTIAL walk IS cached. Measured 2026-08-01 against the unit's own
+      ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (9 roots), 2 roots have no
+      ``data/escalations`` dir while the other 7 hold ~9.1k records, so a
+      rule keyed on "every root reached" would cache nothing, ever;
+    * unreadable files never gate caching: a corrupt record is permanent.
 
-    The trade-off actually being accepted: an archive that disappears
-    mid-life leaves that project's panel up to one TTL window stale.  That is
-    the right side of it — the alternative costs the full re-walk on every
-    poll, forever, for every ordinary multi-project config.
+    The builder is spied on with ``wraps=``, so the real payload is served
+    and the spy only counts derivations.
     """
 
-    def test_a_reached_archive_is_served_from_cache(self, client, monkeypatch, tmp_path):
-        """Gating the cache must not disable it — the ordinary payload still caches."""
-        import dashboard.app as app_module
-        from dashboard.app import _analytics_cache_clear
+    @staticmethod
+    def _spy(monkeypatch) -> MagicMock:
+        import dashboard.api.escalations as escalation_routes
 
-        client.app.state.config = _make_config(tmp_path)
-        _analytics_cache_clear()
         # SYNC, not AsyncMock: the route calls the builder through
         # asyncio.to_thread, which hands it a plain callable.
-        build = MagicMock(return_value=_analytics_payload())
-        monkeypatch.setattr(app_module, 'build_escalation_analytics', build)
+        build = MagicMock(wraps=escalation_routes.build_escalation_analytics)
+        monkeypatch.setattr(escalation_routes, 'build_escalation_analytics', build)
+        return build
 
-        assert client.get('/api/v2/dashboard/escalation-analytics').status_code == 200
-        assert client.get('/api/v2/dashboard/escalation-analytics').status_code == 200
+    def test_a_reached_archive_is_served_from_cache(self, client, monkeypatch, tmp_path,
+                                                    analytics_caches):
+        """The ordinary walk is derived once per TTL."""
+        (tmp_path / 'data' / 'escalations').mkdir(parents=True)
+        client.app.state.config = _make_config(tmp_path)
+        build = self._spy(monkeypatch)
+
+        _analytics(client)
+        _analytics(client)
 
         assert build.call_count == 1, f'expected 1 build call, got {build.call_count}'
 
-    def test_a_partial_scan_is_still_cached(self, client, monkeypatch, tmp_path):
+    def test_a_partial_scan_is_still_cached(self, client, monkeypatch, tmp_path,
+                                            analytics_caches):
         """THE regression test: one archive-less root must not defeat the cache.
 
         A real two-root config in the production shape — the primary root has
         ``data/escalations`` on disk, the secondary has never escalated and so
-        has no such dir.  That is the installed 9-root config in miniature (2
-        archive-less roots, 7 holding ~9.1k records between them; measured
-        2026-08-01).  Keyed on ``archives_present``, the second GET re-walks;
-        keyed on ``archives_reached``, it is served from cache — which is the
-        difference between a working 60s cache and none at all.
+        has no such dir: the installed 9-root config in miniature.
         """
-        import dashboard.app as app_module
-        from dashboard.app import _analytics_cache_clear
-
         primary = tmp_path / 'primary'
         secondary = tmp_path / 'secondary'
         (primary / 'data' / 'escalations').mkdir(parents=True)
         secondary.mkdir()
 
         client.app.state.config = _make_config(primary, known_project_roots=[secondary])
-        _analytics_cache_clear()
-        build = MagicMock(
-            return_value=_analytics_payload(archives_present=False, archives_reached=True),
-        )
-        monkeypatch.setattr(app_module, 'build_escalation_analytics', build)
+        build = self._spy(monkeypatch)
 
-        r1 = client.get('/api/v2/dashboard/escalation-analytics')
-        r2 = client.get('/api/v2/dashboard/escalation-analytics')
+        _analytics(client)
+        second = _analytics(client)
 
-        assert r1.status_code == r2.status_code == 200
-        assert r2.json()['ESCALATION_ANALYTICS']['archives_present'] is False
+        assert second['archives_present'] is False
         assert build.call_count == 1, f'expected 1 build call, got {build.call_count}'
 
-    def test_an_unreached_archive_is_not_pinned_for_the_ttl(self, client, monkeypatch, tmp_path):
-        """``archives_reached: False`` is re-checked every poll.
-
-        The rationale the ``all``-keyed predicate had right, preserved intact:
-        a build that walked nothing is free to redo and must not pin an empty
-        view past the moment the archive appears.
-        """
-        import dashboard.app as app_module
-        from dashboard.app import _analytics_cache_clear
-
+    def test_an_unreached_archive_is_not_pinned_for_the_ttl(self, client, monkeypatch,
+                                                            tmp_path, analytics_caches):
+        """A walk that reached nothing is re-walked every poll, so a new archive shows at once."""
         client.app.state.config = _make_config(tmp_path)
-        _analytics_cache_clear()
-        build = MagicMock(
-            return_value=_analytics_payload(archives_present=False, archives_reached=False),
-        )
-        monkeypatch.setattr(app_module, 'build_escalation_analytics', build)
+        build = self._spy(monkeypatch)
 
-        r1 = client.get('/api/v2/dashboard/escalation-analytics')
-        r2 = client.get('/api/v2/dashboard/escalation-analytics')
+        first = _analytics(client)
+        _write_esc(tmp_path / 'data' / 'escalations', {
+            'id': 'esc-t1-1', 'task_id': 't1', 'agent_role': 'implementer',
+            'severity': 'blocking', 'category': 'cleanup_needed', 'summary': 'x',
+            'timestamp': '2026-07-15T18:00:00+00:00', 'status': 'pending', 'level': 0,
+        })
+        second = _analytics(client)
 
-        assert r1.status_code == r2.status_code == 200
-        assert r2.json()['ESCALATION_ANALYTICS']['archives_reached'] is False
+        assert first['archives_reached'] is False
+        assert second['archives_reached'] is True
+        assert second['per_project'][0]['views']['open_in_history']['value'] == 1
         assert build.call_count == 2, f'expected 2 build calls, got {build.call_count}'
 
-    def test_a_payload_without_the_signal_is_not_cached(self, client, monkeypatch, tmp_path):
-        """An older-shaped or partially-built payload degrades to "re-derive".
+    def test_a_new_corpus_generation_is_derived_afresh(self, client, monkeypatch, tmp_path,
+                                                       analytics_caches):
+        """The memo answers for one walk only: a new walk inside its TTL is re-derived."""
+        from dashboard.data import escalation_corpus
 
-        The predicate runs inside the cache WRITE path, so the failure mode to
-        avoid is not just a wrong answer but a raise — which would surface as
-        a 500 on a 3s poll.  Missing key means don't cache, don't raise.
-        """
-        import dashboard.app as app_module
-        from dashboard.app import _analytics_cache_clear
-
-        payload = _analytics_payload()
-        del payload['archives_reached']
-
+        (tmp_path / 'data' / 'escalations').mkdir(parents=True)
         client.app.state.config = _make_config(tmp_path)
-        _analytics_cache_clear()
-        build = MagicMock(return_value=payload)
-        monkeypatch.setattr(app_module, 'build_escalation_analytics', build)
+        build = self._spy(monkeypatch)
 
-        r1 = client.get('/api/v2/dashboard/escalation-analytics')
-        r2 = client.get('/api/v2/dashboard/escalation-analytics')
+        first = _analytics(client)
+        escalation_corpus._corpus_cache_clear()
+        second = _analytics(client)
 
-        assert r1.status_code == r2.status_code == 200
+        assert second['generated_at'] != first['generated_at']
         assert build.call_count == 2, f'expected 2 build calls, got {build.call_count}'
 
-    def test_parse_failures_alone_never_defeats_the_cache(self, client, monkeypatch, tmp_path):
-        """The whole reason the predicate is not keyed on ``parse_failures``.
-
-        A corrupt record is permanent, so gating on it would re-run a ~10k
-        record walk on every poll, forever, to rediscover the same bad file.
-        The archive WAS reached; that is the question the cache asks.
-        """
-        import dashboard.app as app_module
-        from dashboard.app import _analytics_cache_clear
-
+    def test_parse_failures_alone_never_defeats_the_cache(self, client, monkeypatch,
+                                                          tmp_path, analytics_caches):
+        """A corrupt record is permanent; gating on it would re-walk on every poll, forever."""
+        esc_dir = tmp_path / 'data' / 'escalations'
+        esc_dir.mkdir(parents=True)
+        (esc_dir / 'esc-bad-1.json').write_text('{not json')
         client.app.state.config = _make_config(tmp_path)
-        _analytics_cache_clear()
-        build = MagicMock(return_value=_analytics_payload(parse_failures=7))
-        monkeypatch.setattr(app_module, 'build_escalation_analytics', build)
+        build = self._spy(monkeypatch)
 
-        assert client.get('/api/v2/dashboard/escalation-analytics').status_code == 200
-        r2 = client.get('/api/v2/dashboard/escalation-analytics')
+        _analytics(client)
+        second = _analytics(client)
 
-        assert r2.json()['ESCALATION_ANALYTICS']['parse_failures'] == 7
+        assert second['parse_failures'] == 1
         assert build.call_count == 1, f'expected 1 build call, got {build.call_count}'
 
-    def test_real_builder_partial_scan_is_cached_end_to_end(self, client, tmp_path):
-        """The binding test: NO stub anywhere, real builder through the real route.
+    def test_real_builder_partial_scan_is_cached_end_to_end(self, client, tmp_path,
+                                                            analytics_caches):
+        """The binding test: NO spy anywhere, real builder through the real route.
 
-        Every other test in this class hands the route a MagicMock payload, so
-        all of them would keep passing if the builder's ``any`` semantics and
-        the route's predicate drifted apart — a stub cannot notice that the
-        producer stopped producing what the consumer reads.  This one wires
-        them together: a real two-root tmp config (primary has a real, empty
-        ``data/escalations`` dir; secondary has none) driven through the real
-        ``build_escalation_analytics``.
-
-        Cache-hit proof without a spy: the builder stamps ``generated_at`` from
-        the live clock on every build (``resolve_now(None)`` ->
-        ``datetime.now(UTC)``, microsecond resolution), so two GETs that return
-        the SAME ``generated_at`` cannot be two builds — a re-walk would carry
-        a later stamp.
+        ``generated_at`` is the corpus walk's instant, stamped from the live
+        clock at microsecond resolution, so two GETs that return the SAME
+        ``generated_at`` were served from ONE walk — a re-walk would carry a
+        later stamp.
         """
-        from dashboard.app import _analytics_cache_clear
-
         primary = tmp_path / 'primary'
         secondary = tmp_path / 'secondary'
         (primary / 'data' / 'escalations').mkdir(parents=True)
         secondary.mkdir()
 
         client.app.state.config = _make_config(primary, known_project_roots=[secondary])
-        _analytics_cache_clear()
 
-        r1 = client.get('/api/v2/dashboard/escalation-analytics')
-        r2 = client.get('/api/v2/dashboard/escalation-analytics')
-
-        assert r1.status_code == r2.status_code == 200
-        first = r1.json()['ESCALATION_ANALYTICS']
-        second = r2.json()['ESCALATION_ANALYTICS']
+        first = _analytics(client)
+        second = _analytics(client)
 
         # The producer really does distinguish the two questions over a real tree.
         assert first['archives_present'] is False
         assert first['archives_reached'] is True
-        # ...and the consumer really does cache on the second one.
+        # ...and the partial walk really is cached.
         assert second['generated_at'] == first['generated_at'], (
-            'second GET re-ran the builder — the route predicate and the '
-            'builder signal have drifted apart'
+            'second GET walked again — a partial scan defeated the corpus cache'
         )
 
 
@@ -516,8 +368,13 @@ class TestEscalationAnalyticsCacheability:
 # The tests below consume the served-asset fixtures (tab_analytics_jsx_body,
 # app_jsx_body, shell_jsx_body, index_html_body) that now live in conftest.py
 # and `extract_function_body` from _dashboard_helpers (task 3549), plus the
-# load-order helpers still local to this file (_ScriptTagCollector,
-# _find_script_position, _assert_script_loads_before).
+# load-order helpers `find_script_position` and `assert_script_loads_before`,
+# which are ALSO imported from _dashboard_helpers rather than defined here:
+# task 4881 retired the byte-identical copy this module and four others each
+# carried, together with the `ScriptTagCollector` those two parse with (which
+# is why it is not in this module's import list — nothing here calls it
+# directly).  Their contract lives in
+# test_jsx_source_helpers.py::TestScriptOrderHelpers.
 
 
 # ---------------------------------------------------------------------------
@@ -582,8 +439,8 @@ def test_tab_analytics_jsx_served_and_exports(_client) -> None:
     )
     # Fold state persisted with the correct key
     assert 'useOpenSet(' in tab_body, (
-        'EscalationAnalyticsTab does not call useOpenSet( — add the local copy of '
-        "useOpenSet from tab_escalations.jsx and call it with project ids and 'df.open.escanalytics'."
+        "EscalationAnalyticsTab does not call useOpenSet( — call persisted_state.js's "
+        "useOpenSet with project ids and 'df.open.escanalytics'."
     )
     assert "'df.open.escanalytics'" in tab_body, (
         "EscalationAnalyticsTab does not reference the localStorage key "
@@ -621,7 +478,7 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     _TAB_ANALYTICS_PREFIX = '/static/redux/tab_escalation_analytics.jsx'
 
     # (a) tab_escalation_analytics.jsx script tag must exist
-    result = _find_script_position(index_html_body, _TAB_ANALYTICS_PREFIX)
+    result = find_script_position(index_html_body, _TAB_ANALYTICS_PREFIX)
     assert result is not None, (
         f'No <script src="{_TAB_ANALYTICS_PREFIX}..."> tag found in index.html — '
         'add it after tab_escalations.jsx and before app.jsx.'
@@ -642,7 +499,7 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     )
 
     # (b) Loads after data.js
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         '/static/redux/data.js',
         _TAB_ANALYTICS_PREFIX,
@@ -652,7 +509,7 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     )
 
     # (c) Loads after shell.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         '/static/redux/shell.jsx',
         _TAB_ANALYTICS_PREFIX,
@@ -662,7 +519,7 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     )
 
     # (d) Loads after tabs.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         '/static/redux/tabs.jsx',
         _TAB_ANALYTICS_PREFIX,
@@ -672,7 +529,7 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
     )
 
     # (e) Loads before app.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _TAB_ANALYTICS_PREFIX,
         '/static/redux/app.jsx',
@@ -700,16 +557,21 @@ def test_index_html_registers_tab_analytics_load_order(index_html_body: str) -> 
 
 def test_app_jsx_wires_analytics_tab(app_jsx_body: str) -> None:
     """app.jsx must destructure EscalationAnalyticsTab from window.DF_TABS,
-    add an 'esc-analytics' tab entry, handle it in renderTab, and configure
-    toolbarConfig with showWindow: false (the tab owns its own client-side
-    window toggle rather than the global server-side window chip).
+    add an 'esc-analytics' tab entry, handle it in renderTab, and give it a
+    toolbarConfig entry.
 
     Asserts four structural wiring contracts:
     (a) EscalationAnalyticsTab is destructured from window.DF_TABS.
     (b) tabs[] contains an entry with id 'esc-analytics' and label 'Analytics'.
     (c) renderTab switch has a `case 'esc-analytics':` branch returning
         <EscalationAnalyticsTab projectFilter={projects} />.
-    (d) toolbarConfig has an 'esc-analytics' entry with showWindow: false.
+    (d) toolbarConfig has an 'esc-analytics' entry.
+
+    That the tab carries no global window chip (it owns its own client-side
+    7d/28d toggle) is no longer a source grep here: it is executed by
+    dashboard/tests/js/window_chip.test.mjs (b), which asserts esc-analytics
+    has no window_chip.js::TAB_WINDOWS entry and windowForTab leaves the
+    window alone on it.
     """
     # (a) EscalationAnalyticsTab destructured from window.DF_TABS
     assert re.search(
@@ -739,17 +601,11 @@ def test_app_jsx_wires_analytics_tab(app_jsx_body: str) -> None:
         "app.jsx renderTab `case 'esc-analytics':` does not return "
         '<EscalationAnalyticsTab projectFilter={projects} /> — add it.'
     )
-    # (d) toolbarConfig esc-analytics entry with showWindow: false
+    # (d) toolbarConfig esc-analytics entry
     parts = app_jsx_body.split('toolbarConfig')
     assert len(parts) > 1 and "'esc-analytics'" in parts[1], (
         "app.jsx toolbarConfig does not have an 'esc-analytics' entry — add "
-        "`'esc-analytics': { showWindow: false, showAgents: false, search: false }` "
-        'to toolbarConfig.'
-    )
-    esc_analytics_entry = parts[1].split("'esc-analytics'", 1)[1][:200]
-    assert re.search(r'showWindow\s*:\s*false', esc_analytics_entry), (
-        "app.jsx toolbarConfig 'esc-analytics' entry does not set `showWindow: false` — "
-        'the tab owns its own client-side window toggle, not the global chip.'
+        "`'esc-analytics': { showAgents: false, search: false }` to toolbarConfig."
     )
 
 
@@ -877,9 +733,11 @@ def test_tab_analytics_origin_panel(tab_analytics_jsx_body: str) -> None:
     Asserts, scoped to the Origin panel's own function body:
     (a) A `StackedAreaChart` fed `daily_by_source`, with the long tail folded
         into an `'other'` bucket.
-    (b) A benign-rate table over `origin.sources` referencing `benign_rate`,
-        `stamped_share` (stamped-vs-inferred split), and `actionable`
-        (benign/actionable segmented bar).
+    (b) A benign-rate table over `origin.sources` referencing `benign_rate`
+        and `stamped_share` (stamped-vs-inferred split), whose segmented bar
+        draws one segment per served resolution class —
+        escalation_views.js::resolutionSegments over `s.classes` — rather than
+        a fixed benign/actionable pair that hides every other class.
     (c) A `predictably_benign` badge.
     (d) A per-source `Sparkline` fed by `daily_spark`.
     (e) Rows sorted by benign COUNT — a `.sort(` referencing `.benign`.
@@ -919,9 +777,15 @@ def test_tab_analytics_origin_panel(tab_analytics_jsx_body: str) -> None:
         'OriginPanel does not reference `stamped_share` — render the stamped-vs-'
         'inferred split.'
     )
-    assert 'actionable' in origin_body, (
-        'OriginPanel does not reference `actionable` — render the benign/actionable '
-        'segmented bar.'
+    assert re.search(r'resolutionSegments\(\s*s\.classes\s*\)\.map\(', origin_body), (
+        'OriginPanel does not draw its bar from `resolutionSegments(s.classes).map(` — '
+        'every served resolution class gets a segment, so the parts add up to the '
+        'whole the benign rate is a share of.'
+    )
+    origin_code = strip_js_comments(origin_body)
+    assert not re.search(r'\bs\.(benign|actionable)\b', origin_code), (
+        'OriginPanel still reads `s.benign`/`s.actionable` — the payload serves the '
+        'split as `s.classes`, keyed by every resolution class.'
     )
 
     # (c) predictably_benign badge.
@@ -1097,6 +961,16 @@ def test_tab_analytics_workflow_panel(tab_analytics_jsx_body: str) -> None:
         'WorkflowPanel does not render <C.Donut — the action-mix chart must use '
         'the Donut primitive.'
     )
+    # The donut states the population it divides: the project's `terminal`
+    # count, the one whole that origin's classes and action_mix both sum to.
+    assert re.search(r'of \{terminal\} terminal', workflow_body), (
+        'WorkflowPanel does not caption the action-mix donut `of {terminal} terminal` '
+        '— the donut must say which population its shares are of.'
+    )
+    tab_body = extract_function_body(body, 'EscalationAnalyticsTab')
+    assert re.search(r'<WorkflowPanel\b[^>]*\bterminal=\{p\.terminal\}', tab_body), (
+        'EscalationAnalyticsTab does not pass `terminal={p.terminal}` to WorkflowPanel.'
+    )
 
     # (d)/(e) churn + esc-per-done LineCharts (two distinct charts).
     assert 'churn_daily' in workflow_body, (
@@ -1232,3 +1106,33 @@ def test_charts_jsx_padding_matches_analytics_marker_overlay(charts_jsx_body: st
             'RegimeMarkers overlay (see that file) and must be updated to match, '
             'or charts.jsx should export the constant instead.'
         )
+
+
+# ---------------------------------------------------------------------------
+# task 5596 (PRD leaf eta): the analytics tab reads the corpus through
+# escalation_views.js and states the age of the walk it shows
+# ---------------------------------------------------------------------------
+
+
+def test_tab_analytics_reads_escalation_views_at_module_scope(tab_analytics_jsx_body: str) -> None:
+    """DF_ESCALATION_VIEWS is destructured at module scope, with no fallback."""
+    code = strip_js_comments(tab_analytics_jsx_body)
+    m = re.search(r'const\s*\{([^}]*)\}\s*=\s*window\.DF_ESCALATION_VIEWS\s*;', code)
+    assert m is not None, (
+        'tab_escalation_analytics.jsx does not destructure `window.DF_ESCALATION_VIEWS` '
+        'at module scope (`const { … } = window.DF_ESCALATION_VIEWS;`, no `|| {}`).'
+    )
+    names = {n.split(':')[-1].strip() for n in m.group(1).split(',') if n.strip()}
+    for name in ('resolutionSegments', 'corpusAgeCaption', 'openInHistoryOver'):
+        assert name in names, (
+            f'tab_escalation_analytics.jsx does not take `{name}` from DF_ESCALATION_VIEWS.'
+        )
+
+
+def test_tab_analytics_states_the_corpus_age(tab_analytics_jsx_body: str) -> None:
+    """The tab renders how old the corpus walk behind every panel is."""
+    tab_body = extract_function_body(strip_js_comments(tab_analytics_jsx_body), 'EscalationAnalyticsTab')
+    assert re.search(r'\{\s*corpusAgeCaption\(', tab_body), (
+        'EscalationAnalyticsTab renders no `{corpusAgeCaption(…)}` — the payload is '
+        'derived from a cached walk and must say when that walk was.'
+    )

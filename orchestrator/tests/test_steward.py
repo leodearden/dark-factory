@@ -63,7 +63,7 @@ def _attach_invoke_slot(gate: MagicMock) -> MagicMock:
     ``gate.release_probe_slot`` on the mock.
     """
     @contextlib.asynccontextmanager
-    async def _cm(scope=None):
+    async def _cm(scope=None, *, park=True):
         token = await gate.before_invoke()
         # gate.before_invoke() is mocked to return a bare token (task W4-δ
         # changed the real UsageGate.before_invoke to return an AccountLease

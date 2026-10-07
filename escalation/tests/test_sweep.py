@@ -1549,8 +1549,10 @@ class TestSweepSurvivesArchiveCopyFaults:
             resolved_at=self.RESOLVED_AT, resolved_by='steward',
         )
         # A second, unrelated terminal record with no archive copy at all: it
-        # proves the PASS CONTINUES rather than merely not raising.
-        _write_root_esc(tmp_path, 'esc-2-1', 'resolved', resolved_at=self.RESOLVED_AT)
+        # proves the PASS CONTINUES rather than merely not raising.  It resolves
+        # on a DIFFERENT day, so it archives into a dated subdir the pruning
+        # never touches whichever record the pass reaches first.
+        _write_root_esc(tmp_path, 'esc-2-1', 'resolved', resolved_at='2026-05-21T10:00:00+00:00')
 
         with patch.object(Path, 'read_text', pruning_read_text(archive_copy)):
             report = sweep.sweep(tmp_path, apply=True)
@@ -1558,7 +1560,7 @@ class TestSweepSurvivesArchiveCopyFaults:
         # Both root records left root for the archive.
         assert report.archived == 2, f'expected both records archived; got {report.archived}'
         assert (tmp_path / 'archive' / '2026-05-20' / 'esc-1-1.json').exists()
-        assert (tmp_path / 'archive' / '2026-05-20' / 'esc-2-1.json').exists()
+        assert (tmp_path / 'archive' / '2026-05-21' / 'esc-2-1.json').exists()
         assert not (tmp_path / 'esc-1-1.json').exists()
 
         # The ROOT files did not vanish and nothing was left in root for an

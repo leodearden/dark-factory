@@ -44,6 +44,10 @@ names: the scan reaches a foreign task ONLY through an explicit qualifier, so
 its silence about that project is silence rather than disagreement
 (:func:`_conflicting_referents`, choice 2).
 
+This module also owns the caller-facing teaching of the shape it enforces
+(:func:`render_referent_declaration_guidance`), so that the rule and the way it
+is taught stay in one place.
+
 This module is a dependency-free leaf — stdlib plus utils/canonical_labels and
 utils/validation, both themselves leaves — so leaf δ (``server/tools.py``) and
 leaf ε (``services/memory_service.py``) can each import it without a cycle.
@@ -53,6 +57,7 @@ canonical_labels whose shape it copies.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Literal, get_args
 
@@ -82,6 +87,29 @@ _DECLARED_REFERENT_HINT = (
     "'id' must be the task number's digits (an int, or a string of ASCII "
     'digits), never a label like "Task 3127" and never a bool.'
 )
+
+
+def render_referent_declaration_guidance() -> str:
+    """Teach a writing agent to declare referents, in the shape this module enforces.
+
+    Composes :data:`_DECLARED_REFERENT_HINT` verbatim, so the shape sentence an
+    agent is taught is the one its rejection would quote. Plain text built from
+    adjacent literals: consumers interpolate it into their own f-strings, so its
+    braces need no escaping there. ``fused-memory/tests/test_referent_declaration_examples.py``
+    runs its worked example through the live gate.
+    """
+    return (
+        '## Declaring What a Write Is About\n'
+        '`add_memory` and `add_episode` take an optional `entities` argument naming '
+        'the referents the write is about. It has three states: omitting it means you '
+        'never considered them, and they are inferred from metadata or the content; '
+        '`[]` records that you considered them and none apply; a list declares them. '
+        f'{_DECLARED_REFERENT_HINT}\n'
+        'Omitting `entities` always succeeds. A declaration that your own content '
+        'contradicts is REJECTED, so declare only what the content is actually about:\n'
+        '`add_memory(content="Task 3127\'s retry loop swallows the timeout", '
+        "category=..., project_id=..., agent_id=..., entities=[{'kind': 'task', 'id': 3127}])`"
+    )
 
 #: The complete set of keys a declared entry may carry. Closed deliberately:
 #: an unrecognized key ('projectId') would otherwise be silently ignored and
@@ -636,6 +664,7 @@ def resolve_referents(
     metadata: dict | None,
     content: str | None,
     group_id: str,
+    known_project_ids: Collection[str] | None = None,
 ) -> ReferentResolution:
     """Resolve which referents one write is about, and from which source.
 
@@ -666,18 +695,35 @@ def resolve_referents(
         group_id: The group the content belongs to (= the local project_id).
             Must be a str; there is no "no group" for a write. A non-str
             RAISES.
+        known_project_ids: Optional registry of known project ids, forwarded
+            verbatim to the single ``scan_content`` call below (any
+            collection; a ``{project_id: project_root}`` mapping works, since
+            iterating it yields its keys). Absent, empty, or wholly unusable,
+            the scan stays PERMISSIVE — that fallback belongs to
+            ``_canonical_allowlist`` and is not re-checked here. Populated, it
+            drops FOREIGN referents naming a project outside it, so a junk
+            qualifier ('localhost:6379', 'INFO:1234') stops minting one.
+            Narrowing is STRICTLY SUBTRACTIVE by the guarantee ``scan_content``
+            states: a dropped candidate keeps the ambiguity contest it created,
+            so this can only ever remove a referent, never add one.
 
     Raises:
         InputValidationError: On a malformed ``declared`` entry (see
             :func:`_declared_referents`), or on a non-str ``group_id`` /
             ``content``.
 
-    These are the PRD's exact four parameters and no more. In particular there
-    is deliberately no ``known_project_ids``: ``scan_content`` is called in its
-    documented PERMISSIVE mode, and threading a live project registry is a
-    wiring concern belonging to the leaf that owns the wiring (δ/ε). Adding an
-    unspecified fifth parameter here would fork, mid-batch, the signature those
-    siblings are being written against.
+    ``known_project_ids`` was deliberately ABSENT for the PRD's δ/ε batch,
+    which deferred it to "the leaf that owns the wiring". No leaf's decomposed
+    scope ever contained it, so the deferral orphaned the wiring; task 5262
+    closes it. The parameter is OPTIONAL and permissive-by-default precisely so
+    the four-parameter callers those siblings were written against still read
+    identically.
+
+    NOT every caller acquires a registry. ``server/entities_gate.py``'s call
+    stays at the permissive default on purpose: it holds no registry, and the
+    gate rejects on CONFLICT, never on absence — so narrowing it would only
+    drop junk-qualified conflicts it currently catches, with nothing gained.
+    That is a deliberate non-change, not wiring left half-finished.
     """
     # group_id and content are STRUCTURAL inputs the caller resolves for itself
     # (models.scope.resolve_project_id for the group, the write body for the
@@ -727,7 +773,7 @@ def resolve_referents(
     # `content or ''` only narrows the tolerated None to the empty body
     # scan_content is typed for; that call already short-circuits falsy content
     # to an empty scan, so this changes no behaviour for '' either.
-    scan = scan_content(content or '', group_id=group_id)
+    scan = scan_content(content or '', group_id=group_id, known_project_ids=known_project_ids)
 
     # `.ambiguous` is the scan's verbatim answer on every path. Ambiguous
     # referents are recorded, never guessed, and never promoted into

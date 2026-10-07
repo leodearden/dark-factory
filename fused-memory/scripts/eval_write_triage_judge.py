@@ -69,28 +69,37 @@ Usage
   # redirected away from the committed artifact — see `guard_committed_report`.
   python scripts/eval_write_triage_judge.py --dry-run
 
-  # A cheap live smoke over the first few cases.
-  python scripts/eval_write_triage_judge.py --limit 5
+  # A cheap live smoke over a few cases, kept off the committed artifact.
+  python scripts/eval_write_triage_judge.py --limit 5 --report-path /tmp/smoke.json
 
-  # The full measured pass, written to calibration/.
-  python scripts/eval_write_triage_judge.py
+  # The committed arbiter (plans/write-triage-flip-readiness-prd.md C2'):
+  # production's retrieval, bands and attach targets, every case dumped as it
+  # completes.
+  python scripts/eval_write_triage_judge.py --slate-mode retrieved --project-id reify \\
+      --canonical-aliases tests/fixtures/write_triage_calibration.canonical_aliases.json \\
+      --report-path calibration/write_triage_judge_accuracy_report.json \\
+      --cases-path calibration/write_triage_judge_accuracy_report.cases.jsonl
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import logging
 import types
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
     OUTCOME_CONTESTED,
+    OUTCOME_JUDGE,
     OUTCOME_RESTATED,
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
+    JudgeUsage,
 )
 
 logger = logging.getLogger(__name__)
@@ -108,24 +117,16 @@ _DEFAULT_REPORT_PATH = str(
 )
 
 
-def _load_calibrate() -> types.ModuleType:
-    """Load leaf alpha's script as a module.
-
-    ``scripts/`` is not an importable package, so the sibling is reached the
-    same way its own test suite reaches it. Importing it rather than copying
-    its four label constants and its fixture loader is the point: a fixture
-    format change or a fifth label lands in ONE place, and this script either
-    follows it or fails loudly at ``build_judge_cases``.
-    """
+def _load_script(path: Path, mod_name: str) -> types.ModuleType:
+    """Load a ``scripts/`` sibling by path, cached in ``sys.modules``."""
     import sys  # noqa: PLC0415
 
-    mod_name = 'calibrate_write_triage'
     cached = sys.modules.get(mod_name)
     if cached is not None:
         return cached
-    spec = importlib.util.spec_from_file_location(mod_name, _CALIBRATE_PATH)
+    spec = importlib.util.spec_from_file_location(mod_name, path)
     if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {_CALIBRATE_PATH}')
+        raise ImportError(f'Cannot load {path}')
     module = importlib.util.module_from_spec(spec)
     sys.modules[mod_name] = module
     try:
@@ -136,7 +137,46 @@ def _load_calibrate() -> types.ModuleType:
     return module
 
 
+def _load_calibrate() -> types.ModuleType:
+    """Load leaf alpha's script as a module.
+
+    ``scripts/`` is not an importable package, so the sibling is reached the
+    same way its own test suite reaches it. Importing it rather than copying
+    its four label constants and its fixture loader is the point: a fixture
+    format change or a fifth label lands in ONE place, and this script either
+    follows it or fails loudly at ``build_judge_cases``.
+    """
+    return _load_script(_CALIBRATE_PATH, 'calibrate_write_triage')
+
+
 _calibrate = _load_calibrate()
+
+_RETRIEVAL_PATH = _PACKAGE_ROOT / 'scripts' / 'eval_write_triage_retrieval.py'
+
+
+def load_retrieval() -> types.ModuleType:
+    """Load the live-store edge, the same by-path way the calibrator loads.
+
+    Deliberately NOT loaded at import: it pulls in the server's retrieval
+    stack, and the whole pure core below is testable without it.
+    """
+    return _load_script(_RETRIEVAL_PATH, 'eval_write_triage_retrieval')
+
+
+_WORDING_PATH = _PACKAGE_ROOT / 'scripts' / 'write_triage_judge_wording.py'
+
+
+def load_wording() -> types.ModuleType:
+    """Load the judge-wording knob (PRD §11 D16), the same by-path way.
+
+    Loaded at import, unlike the retrieval edge: it pulls in only the judge
+    module, and the guard's default wording is one of its names.
+    """
+    return _load_script(_WORDING_PATH, 'write_triage_judge_wording')
+
+
+_wording = load_wording()
+
 
 # Alpha's vocabulary and fixture handling, re-exported rather than re-spelled.
 LABEL_CANONICAL = _calibrate.LABEL_CANONICAL
@@ -144,7 +184,10 @@ LABEL_DUPLICATE = _calibrate.LABEL_DUPLICATE
 LABEL_DISTINCT = _calibrate.LABEL_DISTINCT
 LABEL_PSEUDO_CONTRADICTION = _calibrate.LABEL_PSEUDO_CONTRADICTION
 load_fixture = _calibrate.load_fixture
+load_canonical_aliases = _calibrate.load_canonical_aliases
 package_relative = _calibrate.package_relative
+
+_NO_ALIASES: Mapping[str, str] = types.MappingProxyType({})
 
 #: The control class, which is this script's own construct rather than one of
 #: alpha's labels — hence a separate constant, so nothing reads it back as a
@@ -161,6 +204,91 @@ EVAL_CLASSES: tuple[str, ...] = (
     LABEL_PSEUDO_CONTRADICTION,
     CLASS_DISTRACTOR,
 )
+
+#: The confusion table's OTHER axis, in report order — the same "one list,
+#: two consumers" shape as ``EVAL_CLASSES`` above, for the same reason.
+#: DERIVED rather than hand-written, so a fifth triage outcome added to
+#: ``write_triage`` joins this report automatically instead of becoming a
+#: second list to keep in sync.
+#:
+#: ``TRIAGE_OUTCOMES`` is a frozenset, whose iteration order is
+#: PYTHONHASHSEED-dependent, and this script's output is a COMMITTED artifact
+#: read by an operator at the task-3169 flip gate: iterating it directly makes
+#: two identical runs produce two differently-ordered reports, and makes the
+#: committed markdown stop being provably the render of the committed JSON.
+#: Measured 2026-08-27 — the committed pair disagreed on exactly this.
+EVAL_OUTCOMES: tuple[str, ...] = tuple(sorted(TRIAGE_OUTCOMES))
+
+#: Every provenance field the report is expected to carry, in report order —
+#: the same "one list, two consumers" shape as ``EVAL_CLASSES`` above, and for
+#: a sharper version of the same reason. :func:`build_report` backfills from
+#: THIS tuple and ``_run`` supplies its own subset of it, so a field added in
+#: one place cannot go missing from reports assembled through the other. Two
+#: hand-typed lists is exactly how ``candidate_count_min`` and
+#: ``distractor_count_requested`` — the pair that discloses a NARROWED slate —
+#: came to be absent from every report ``build_report`` backfilled.
+#:
+#: An ABSENT key cannot be told apart from an artifact predating the field, so
+#: an unmeasured one reads ``None`` rather than vanishing.
+PROVENANCE_KEYS: tuple[str, ...] = (
+    # Supplied by the caller — what was run, against what.
+    'fixture_path',
+    'judge_provider',
+    'judge_model',
+    # The system prompt wording the verdicts came from (PRD C2'').
+    'judge_system_prompt_sha256',
+    'limit',
+    'canonical_aliases_path',
+    'canonical_aliases_count',
+    'cases_path',
+    # How the slate reaching the judge was obtained, and how wide each field
+    # of it was rendered. Both change what the model saw without changing any
+    # other field in this block, so an artifact missing them is unreadable.
+    'slate_mode',
+    'field_chars',
+    # Measured by `run_judge_eval` — the population and the slate it BUILT.
+    'record_count',
+    'case_count',
+    'candidate_count',
+    'candidate_count_min',
+    'distractor_count',
+    'distractor_count_requested',
+    # Resolved from config — what the model could actually SEE, and whether
+    # it was asked at all. `judge_write` re-trims the slate to
+    # `judge_candidate_count`, and returns `stored` on its first line when
+    # `judge_enabled` is false.
+    'judge_candidate_count',
+    'judge_enabled',
+    # Measured by the RETRIEVED slate mode only, `None` under `seeded`. The
+    # bands and the width are what routed each case; the three counts are the
+    # corpus conditions a reader cannot recover from the accuracies.
+    'project_id',
+    't_high',
+    't_low',
+    'candidate_k',
+    'canonical_absent',
+    'degraded_retrievals',
+    'self_retrieved',
+)
+
+#: The bands :func:`decide_band` routes to, in report order. NOT
+#: :data:`EVAL_OUTCOMES`: ``judge`` is a routing decision rather than a triage
+#: outcome and is absent from ``TRIAGE_OUTCOMES``, while ``amended`` and
+#: ``contested`` are outcomes no band can reach on its own.
+EVAL_BANDS: tuple[str, ...] = (OUTCOME_RESTATED, OUTCOME_JUDGE, OUTCOME_STORED)
+
+#: The two ways a case's slate can be obtained. ``seeded`` is this script's
+#: original construction; ``retrieved`` is what production would have found.
+SLATE_SEEDED = 'seeded'
+SLATE_RETRIEVED = 'retrieved'
+SLATE_MODES: tuple[str, ...] = (SLATE_SEEDED, SLATE_RETRIEVED)
+
+#: The outcomes under which ``triage_write`` attaches the write at all.
+#: ``stored`` is the one that attaches to nothing
+#: (``write_triage.py::_apply_judge_verdict`` nulls its ``canonical_id``).
+ATTACH_OUTCOMES: frozenset[str] = frozenset({
+    OUTCOME_RESTATED, OUTCOME_AMENDED, OUTCOME_CONTESTED,
+})
 
 #: Curator label -> the verdicts that count as correct for it. See the module
 #: docstring for the rationale behind each entry; every one traces to a human
@@ -246,10 +374,72 @@ def _rotated(pool: list[str], offset: int, count: int) -> list[str]:
     return [pool[(start + i) % len(pool)] for i in range(take)]
 
 
+def _case(
+    record: Mapping[str, Any],
+    *,
+    candidates: list[str],
+    expected_class: str,
+    acceptable: frozenset[str],
+    band_winner_id: str | None,
+    band: str,
+    similarity: float | None,
+    canonical_present: bool | None,
+    canonical_alias_id: str | None,
+) -> dict[str, Any]:
+    """One judge case: what is submitted, what it is shown, how it routed.
+
+    Every routing field is explicit because the two slate modes disagree about
+    all of them, and a defaulted one would let a retrieved case silently
+    publish the seeded construction's answer.
+    """
+    return {
+        'memory_id': str(record['memory_id']),
+        'content': record['content'],
+        'category': record.get('category'),
+        'cluster_id': str(record['cluster_id']),
+        'candidates': candidates,
+        'expected_class': expected_class,
+        'acceptable_outcomes': acceptable,
+        'band_winner_id': band_winner_id,
+        'band': band,
+        'similarity': similarity,
+        'canonical_present': canonical_present,
+        'canonical_alias_id': canonical_alias_id,
+    }
+
+
+def _seeded_case(
+    record: Mapping[str, Any],
+    slate: list[str],
+    expected_class: str,
+    acceptable: frozenset[str],
+    canonical_alias_id: str | None,
+) -> dict[str, Any]:
+    """A case whose slate is CONSTRUCTED rather than retrieved.
+
+    The lead record is the band winner and the band is the middle one — the
+    only band that reaches a judge — because that is what `build_judge_fn`
+    synthesizes. Similarity and canonical liveness are unmeasured here, and
+    `None` says so rather than claiming a figure.
+    """
+    return _case(
+        record,
+        candidates=slate,
+        expected_class=expected_class,
+        acceptable=acceptable,
+        band_winner_id=slate[0] if slate else None,
+        band=OUTCOME_JUDGE,
+        similarity=None,
+        canonical_present=None,
+        canonical_alias_id=canonical_alias_id,
+    )
+
+
 def build_judge_cases(
     records: Sequence[Mapping[str, Any]],
     *,
     distractors: int,
+    aliases: Mapping[str, str] = _NO_ALIASES,
 ) -> list[dict[str, Any]]:
     """One judge call per case, with the ground truth its label implies.
 
@@ -284,14 +474,9 @@ def build_judge_cases(
         canonical_id = str(record['cluster_id'])
         pool = _distractor_pool(ordered, record['cluster_id'])
         slate = [canonical_id, *_rotated(pool, index, distractors)]
-        cases.append({
-            'memory_id': str(record['memory_id']),
-            'content': record['content'],
-            'category': record.get('category'),
-            'candidates': slate,
-            'expected_class': label,
-            'acceptable_outcomes': acceptable,
-        })
+        cases.append(_seeded_case(
+            record, slate, label, acceptable, aliases.get(canonical_id),
+        ))
 
     # The control set, appended after the labelled ones so a `--limit` smoke
     # run covers the classes the labels actually measure first.
@@ -304,21 +489,212 @@ def build_judge_cases(
         seen_clusters.add(record['cluster_id'])
         pool = _distractor_pool(ordered, record['cluster_id'])
         slate = _rotated(pool, index, distractors + 1)
-        cases.append({
-            'memory_id': str(record['memory_id']),
-            'content': record['content'],
-            'category': record.get('category'),
-            'candidates': slate,
-            'expected_class': CLASS_DISTRACTOR,
-            'acceptable_outcomes': _DISTRACTOR_ACCEPTABLE,
-        })
+        cases.append(_seeded_case(
+            record, slate, CLASS_DISTRACTOR, _DISTRACTOR_ACCEPTABLE,
+            aliases.get(str(record['cluster_id'])),
+        ))
 
     return cases
 
 
 # ---------------------------------------------------------------------------
+# The plan: what will be judged, and what its slates name
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class EvalPlan:
+    """The cases of one run, the records their slates name, and how they were built.
+
+    ``candidate_records`` is positional with ``cases``: entry *i* is case *i*'s
+    slate resolved to records, in slate order, because a judge handed a bare id
+    has no text to compare and is answering noise. Rows are never pooled across
+    cases: a retrieved row carries ITS query's cosine, which the shipped
+    selector re-sorts every slate by, so a borrowed row would hand one case
+    another query's order.
+
+    ``fixture_by_id`` is the curator fixture by memory id: the ground truth an
+    attach target's cluster and label are read from, wherever it was retrieved.
+
+    ``provenance`` is the plan's OWN disclosure — the fields that describe how
+    the slates were obtained. It is merged UNDER the caller's, so nothing here
+    can overwrite what the operator asked for.
+
+    Checked at construction, before anything is spent or written: each case's
+    records are exactly its slate, and a case routed to the judge shows it at
+    least one candidate.
+    """
+
+    cases: tuple[dict[str, Any], ...]
+    candidate_records: tuple[tuple[Mapping[str, Any], ...], ...]
+    fixture_by_id: Mapping[str, Mapping[str, Any]]
+    record_count: int
+    provenance: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        shown = [[str(r['memory_id']) for r in records] for records in self.candidate_records]
+        unresolved = [
+            f"{case['memory_id']} ({case['expected_class']})"
+            for index, case in enumerate(self.cases)
+            if index >= len(shown) or shown[index] != case['candidates']
+        ]
+        if unresolved or len(shown) != len(self.cases):
+            raise ValueError(
+                f'{len(self.cases)} case(s), {len(shown)} resolved slate(s); not shown '
+                f'exactly their own slate, in order: {", ".join(unresolved) or "none"}',
+            )
+        unseen = [
+            f"{case['memory_id']} ({case['expected_class']})"
+            for case in self.cases
+            if case['band'] == OUTCOME_JUDGE and not case['candidates']
+        ]
+        if unseen:
+            raise ValueError(
+                f'{len(unseen)} judge-band case(s) have an EMPTY slate: '
+                f'{", ".join(unseen)}. judge_write answers those `stored` with no '
+                'provider call, so the eval would count a verdict nobody gave. A '
+                'single-cluster run leaves the distractor control nothing to draw '
+                'from: widen --limit or the fixture.',
+            )
+
+
+def seeded_plan(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    distractors: int,
+    aliases: Mapping[str, str] = _NO_ALIASES,
+) -> EvalPlan:
+    """Today's construction: the cluster canonical seeded at slate position 0.
+
+    Each slate is resolved against the fixture HERE, so a dangling id raises
+    ``KeyError`` before anything is spent.
+    """
+    cases = tuple(build_judge_cases(records, distractors=distractors, aliases=aliases))
+    fixture = {str(r['memory_id']): r for r in records}
+    return EvalPlan(
+        cases=cases,
+        candidate_records=tuple(
+            tuple(fixture[cid] for cid in case['candidates']) for case in cases
+        ),
+        fixture_by_id=fixture,
+        record_count=len(records),
+        provenance={
+            'slate_mode': SLATE_SEEDED,
+            'distractor_count_requested': distractors,
+        },
+    )
+
+
+def plan_from_slates(
+    records: Sequence[Mapping[str, Any]],
+    slates: Sequence[Any],
+    *,
+    provenance: Mapping[str, Any],
+    aliases: Mapping[str, str] = _NO_ALIASES,
+    fixture: Sequence[Mapping[str, Any]] | None = None,
+) -> EvalPlan:
+    """Pair production-shaped slates with the curator labels they answer for.
+
+    One case per NON-canonical record, positional against *slates*. No control
+    class is constructed: a retrieved slate that carries no correct attach
+    target is the ordinary case here rather than something to build, and
+    ``distractor_count`` is ``None``.
+
+    Attach targets are described from *fixture*, the whole curator corpus
+    (default: *records*), so a ``--limit`` run describes a target exactly as
+    the full run does.
+
+    The expected class stays the fixture's label. The slate, the band winner
+    and the band come from the retrieval — including for a record whose
+    canonical is no longer in the corpus, which is kept in the population and
+    flagged rather than dropped.
+    """
+    labelled = [r for r in records if str(r['label']) != LABEL_CANONICAL]
+    if len(labelled) != len(slates):
+        raise ValueError(
+            f'{len(labelled)} labelled record(s) but {len(slates)} slate(s): a '
+            f'positional mismatch would score a case against another record\'s '
+            f'retrieval',
+        )
+    cases: list[dict[str, Any]] = []
+    for record, slate in zip(labelled, slates, strict=True):
+        cases.append(_case(
+            record,
+            candidates=[str(c['memory_id']) for c in slate.candidates],
+            expected_class=str(record['label']),
+            acceptable=_acceptable_for(str(record['label'])),
+            band_winner_id=slate.attach_target_id,
+            band=slate.band,
+            similarity=slate.similarity,
+            canonical_present=slate.canonical_present,
+            canonical_alias_id=aliases.get(str(record['cluster_id'])),
+        ))
+    return EvalPlan(
+        cases=tuple(cases),
+        candidate_records=tuple(tuple(slate.candidates) for slate in slates),
+        fixture_by_id={str(r['memory_id']): r for r in (records if fixture is None else fixture)},
+        record_count=len(records),
+        provenance={'slate_mode': SLATE_RETRIEVED, 'distractor_count': None, **dict(provenance)},
+    )
+
+
+# ---------------------------------------------------------------------------
+# One case's answer
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class JudgeAnswer:
+    """How one case resolved, and what the model was shown to resolve it.
+
+    ``outcome`` is what production would ACK; ``verdict`` is what the LLM said,
+    and is ``None`` when no call was made — a deterministic band and a
+    below-floor band are answered without one. The two are equal in seeded
+    mode, where every case is synthesized into the middle band.
+
+    The elision flags and ``usage`` are ``None`` for the same reason: nothing
+    was rendered and nothing was spent.
+
+    ``candidate_id`` is the slate id the verdict named, and ``None`` when no
+    judge was asked or its verdict named nothing.
+    """
+
+    outcome: str
+    verdict: str | None = None
+    entry_elided: bool | None = None
+    candidates_elided: Mapping[str, bool] | None = None
+    usage: Mapping[str, int | None] | None = None
+    candidate_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.candidate_id is None:
+            return
+        if self.verdict is None or self.outcome not in ATTACH_OUTCOMES:
+            raise ValueError(
+                f'candidate_id {self.candidate_id!r} named with verdict '
+                f'{self.verdict!r} and outcome {self.outcome!r}: only a judge '
+                f'verdict that attaches (one of {sorted(ATTACH_OUTCOMES)}) names '
+                f'a candidate',
+            )
+
+
+def _as_answer(value: Any) -> JudgeAnswer:
+    """Accept a bare verdict from a ``judge_fn`` that has nothing else to say."""
+    if isinstance(value, JudgeAnswer):
+        return value
+    return JudgeAnswer(outcome=str(value), verdict=str(value))
+
+
+# ---------------------------------------------------------------------------
 # Scoring
 # ---------------------------------------------------------------------------
+
+def _is_acceptable(case: Mapping[str, Any], outcome: str) -> bool:
+    """Did *outcome* satisfy the expectation *case* carries? The ONE reading.
+
+    Read by :func:`score_cases` and by the per-case dump, so the middle-band
+    accuracy computed from the dump cannot disagree with the headline one.
+    """
+    return outcome in case['acceptable_outcomes']
+
 
 def score_cases(
     cases: Sequence[Mapping[str, Any]],
@@ -333,6 +709,16 @@ def score_cases(
     mismatch RAISES rather than zipping to the shorter list, which would drop
     cases out of the denominator and report an accuracy over a population
     nobody chose.
+
+    An ``expected_class`` outside :data:`EVAL_CLASSES` and a verdict outside
+    :data:`EVAL_OUTCOMES` RAISE for the same reason, and the pre-seeded
+    ``per_class``/``confusion`` dicts are therefore never widened here. An
+    absorbed row inflates ``case_count`` in :func:`build_report` while
+    :func:`render_markdown` iterates only ``EVAL_CLASSES``/``EVAL_OUTCOMES``,
+    so it vanishes from the artifact entirely: the denominator moves and
+    nothing in the report says so. ``UnknownLabelError`` is reused rather than
+    re-invented so this boundary and :func:`_acceptable_for`'s
+    case-construction boundary agree about what an unknown label is.
 
     Returned shape, all of it JSON-serializable (it is written to disk
     verbatim):
@@ -360,19 +746,30 @@ def score_cases(
 
     per_class = {name: {'n': 0, 'correct': 0} for name in EVAL_CLASSES}
     confusion = {
-        name: dict.fromkeys(TRIAGE_OUTCOMES, 0) for name in EVAL_CLASSES
+        name: dict.fromkeys(EVAL_OUTCOMES, 0) for name in EVAL_CLASSES
     }
     duplicate_split = {OUTCOME_RESTATED: 0, OUTCOME_AMENDED: 0}
     false_contested = 0
 
     for case, verdict in zip(cases, verdicts, strict=True):
         name = str(case['expected_class'])
-        bucket = per_class.setdefault(name, {'n': 0, 'correct': 0})
+        if name not in per_class:
+            raise UnknownLabelError(
+                f'no report class for expected_class {name!r}; known classes '
+                f'are {sorted(EVAL_CLASSES)}. Add it to EVAL_CLASSES rather '
+                f'than bucketing it.',
+            )
+        if verdict not in EVAL_OUTCOMES:
+            raise ValueError(
+                f'verdict {verdict!r} is outside the closed triage vocabulary '
+                f'{sorted(EVAL_OUTCOMES)}: an absorbed verdict grows the '
+                f'confusion row a column render_markdown never emits',
+            )
+        bucket = per_class[name]
         bucket['n'] += 1
-        if verdict in case['acceptable_outcomes']:
+        if _is_acceptable(case, verdict):
             bucket['correct'] += 1
-        row = confusion.setdefault(name, dict.fromkeys(TRIAGE_OUTCOMES, 0))
-        row[verdict] = row.get(verdict, 0) + 1
+        confusion[name][verdict] += 1
         if name == LABEL_DUPLICATE and verdict in duplicate_split:
             duplicate_split[verdict] += 1
         if verdict == OUTCOME_CONTESTED:
@@ -399,6 +796,274 @@ def score_cases(
     }
 
 
+def _rate(hits: int, total: int) -> float | None:
+    """*hits*/*total*, or ``None`` when nothing was measured — never ``0.0``."""
+    return round(hits / total, 4) if total else None
+
+
+def score_attachments(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Count WHERE each case attached, not merely whether its class was right.
+
+    `score_cases` scores the verdict WORD against the curator label. This
+    scores the attach target, so a case can answer `amended` — correct for its
+    label — while attaching the write to an unrelated record.
+
+    The target scored is each row's `attach_target_id`, the record production
+    files the write against: for a middle-band attach, the candidate the judge
+    named, hoisted to its canonical; otherwise the band winner. Rows from a
+    judge that named no candidate (before task 5794) carry the band winner,
+    which is where production attached them then.
+
+    Pure counting over the per-case dump. Every rule is a field of a row;
+    nothing is recomputed from the cases here.
+    """
+    attached = [r for r in rows if r['outcome'] in ATTACH_OUTCOMES]
+    duplicates = [r for r in rows if r['expected_class'] == LABEL_DUPLICATE]
+    negatives = [
+        r for r in rows
+        if r['expected_class'] in (
+            LABEL_DISTINCT, LABEL_PSEUDO_CONTRADICTION, CLASS_DISTRACTOR,
+        )
+    ]
+    judged = [r for r in rows if r['verdict'] is not None]
+    middle = [r for r in rows if r['band'] == OUTCOME_JUDGE]
+    wrong = [r for r in attached if not r['attach_target_is_canonical']]
+    in_slate = [r for r in rows if r['canonical_in_slate']]
+    absent = [r for r in rows if r['canonical_present'] is False]
+
+    dup_strict = [
+        r for r in duplicates
+        if r['outcome'] in ATTACH_OUTCOMES and r['attach_target_is_canonical']
+    ]
+    dup_any = [r for r in duplicates if r['outcome'] in ATTACH_OUTCOMES]
+    false_attach = [r for r in negatives if r['outcome'] in ATTACH_OUTCOMES]
+    middle_correct = [r for r in middle if r['correct']]
+
+    return {
+        'attach_outcomes': sorted(ATTACH_OUTCOMES),
+        'duplicate_attach': {
+            'n': len(duplicates),
+            'strict': len(dup_strict),
+            'strict_rate': _rate(len(dup_strict), len(duplicates)),
+            'any': len(dup_any),
+            'any_rate': _rate(len(dup_any), len(duplicates)),
+        },
+        'wrong_record_attach': {
+            'n': len(wrong),
+            'attached': len(attached),
+            'rate_of_attaches': _rate(len(wrong), len(attached)),
+            'rate_of_cases': _rate(len(wrong), len(rows)),
+            'cases': [
+                {
+                    'memory_id': r['memory_id'],
+                    'expected_class': r['expected_class'],
+                    'outcome': r['outcome'],
+                    'attach_target_id': r['attach_target_id'],
+                    'attach_target_cluster_id': r['attach_target_cluster_id'],
+                    'attach_target_category': r['attach_target_category'],
+                    'attach_target_label': r['attach_target_label'],
+                }
+                for r in wrong
+            ],
+        },
+        'false_attach': {
+            'n': len(false_attach),
+            'denominator': len(negatives),
+            'rate': _rate(len(false_attach), len(negatives)),
+            'classes': [
+                LABEL_DISTINCT, LABEL_PSEUDO_CONTRADICTION, CLASS_DISTRACTOR,
+            ],
+        },
+        'band_split': {
+            name: _band_counts([r for r in rows if r['expected_class'] == name])
+            for name in EVAL_CLASSES
+        },
+        'band_split_all': _band_counts(rows),
+        'middle_band': {
+            'n': len(middle),
+            'correct': len(middle_correct),
+            'accuracy': _rate(len(middle_correct), len(middle)),
+        },
+        'canonical_in_slate': {
+            'n': len(rows),
+            'hits': len(in_slate),
+            'rate': _rate(len(in_slate), len(rows)),
+        },
+        'canonical_absent': len(absent),
+        'judge_calls': len(judged),
+        'judge_spend': _spend(rows),
+    }
+
+
+def _band_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+    """How many of *rows* each band answered, in :data:`EVAL_BANDS` order.
+
+    A band outside the vocabulary RAISES rather than widening the row, for the
+    same reason :func:`score_cases` refuses an absorbed verdict: the markdown
+    renders only the declared columns, so an absorbed band moves a denominator
+    and vanishes from the artifact.
+    """
+    counts = dict.fromkeys(EVAL_BANDS, 0)
+    for row in rows:
+        band = str(row['band'])
+        if band not in counts:
+            raise ValueError(
+                f'band {band!r} is outside {list(EVAL_BANDS)}: an absorbed band '
+                f'grows a row that render_markdown never emits',
+            )
+        counts[band] += 1
+    return counts
+
+
+def _spend(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Tokens billed across the run, or ``None`` where the provider reported none.
+
+    Usage arrives on the shipped judge's verdict (``TriageJudgeVerdict.usage``),
+    so every provider arm is priced; a dry run, an injected stub judge, or a
+    call whose usage could not be read reports ``None`` rather than zero.
+    """
+    used = [row['usage'] for row in rows if row['usage']]
+    if not used:
+        return {'calls_with_usage': 0, 'prompt_tokens': None,
+                'completion_tokens': None, 'total_tokens': None}
+    return {
+        'calls_with_usage': len(used),
+        'prompt_tokens': sum(u.get('prompt_tokens') or 0 for u in used),
+        'completion_tokens': sum(u.get('completion_tokens') or 0 for u in used),
+        'total_tokens': sum(u.get('total_tokens') or 0 for u in used),
+    }
+
+
+# ---------------------------------------------------------------------------
+# The per-case dump
+# ---------------------------------------------------------------------------
+
+def _attachable_id(record: Mapping[str, Any]) -> str:
+    """The id an attach against *record* would name — its canonical, hoisted.
+
+    Live rows carry the `_canonical_id_of` hoist the retrieval edge computed;
+    a fixture record is its own attach target.
+    """
+    return str(record.get('canonical_id') or record['memory_id'])
+
+
+def _judged_candidate_id(
+    case: Mapping[str, Any],
+    answer: JudgeAnswer,
+    shown: Mapping[str, Mapping[str, Any]],
+) -> str | None:
+    """The record the verdict named, hoisted as production attaches to it.
+
+    *shown* is the case's own slate by memory id. A named id off it RAISES
+    rather than being scored as an attach production never makes, or as the
+    `stored` production would fail it open to. Neither shipped edge can reach
+    it: each hands `judge_write` exactly these records, and
+    `parse_judge_verdict` refuses an id off what it rendered from them. So
+    reaching it means a `judge_fn` answered about records it was not shown, a
+    defect every later judged attach would repeat; stopping at the first costs
+    one call where failing open would buy a whole run of meaningless rows.
+    """
+    if answer.candidate_id is None:
+        return None
+    record = shown.get(answer.candidate_id)
+    if record is None:
+        raise ValueError(
+            f'case {case["memory_id"]!r}: the verdict named '
+            f'{answer.candidate_id!r}, which is not on its slate {sorted(shown)}',
+        )
+    return _attachable_id(record)
+
+
+def case_row(
+    index: int,
+    case: Mapping[str, Any],
+    answer: JudgeAnswer,
+    candidate_records: Sequence[Mapping[str, Any]],
+    fixture_by_id: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Everything about one case that the aggregate numbers cannot be reread from.
+
+    A function of this case and the curator fixture alone: *candidate_records*
+    are the rows ITS judge was shown. The attach target is described from its
+    fixture record, so a null cluster or label means it is not one, and
+    otherwise from its row on this slate.
+
+    The attach target is where production files the write: the candidate the
+    verdict named when it named one, otherwise ``band_winner_id``.
+    ``verdict_candidate_id`` is the raw slate id the verdict named and
+    ``judged_candidate_id`` is that id HOISTED (PRD
+    ``plans/write-triage-flip-readiness-prd.md`` §11 C2''), unlike
+    ``BandDecision.judged_candidate_id``, which is the raw id.
+
+    JSON-serializable verbatim: this is the line appended to the cases file as
+    each case completes, so a run interrupted partway keeps what it paid for.
+    """
+    shown = {str(record['memory_id']): record for record in candidate_records}
+    judged = _judged_candidate_id(case, answer, shown)
+    target_id = judged if judged is not None else case['band_winner_id']
+    target = (
+        (fixture_by_id.get(str(target_id)) or shown.get(str(target_id))) if target_id else None
+    )
+    cluster_id = case['cluster_id']
+    alias_id = case['canonical_alias_id']
+    canonical_ids = {str(cluster_id), *([str(alias_id)] if alias_id else [])}
+    return {
+        'index': index,
+        'memory_id': case['memory_id'],
+        'cluster_id': cluster_id,
+        'canonical_alias_id': alias_id,
+        'category': case.get('category'),
+        'expected_class': case['expected_class'],
+        'acceptable_outcomes': sorted(case['acceptable_outcomes']),
+        'candidates': list(case['candidates']),
+        'band_winner_id': case['band_winner_id'],
+        'verdict_candidate_id': answer.candidate_id,
+        'judged_candidate_id': judged,
+        'attach_target_id': target_id,
+        'attach_target_cluster_id': target.get('cluster_id') if target else None,
+        'attach_target_category': target.get('category') if target else None,
+        'attach_target_label': target.get('label') if target else None,
+        'attach_target_is_canonical': str(target_id) in canonical_ids,
+        'canonical_in_slate': any(
+            _attachable_id(record) in canonical_ids for record in candidate_records
+        ),
+        'canonical_present': case['canonical_present'],
+        'band': case['band'],
+        'similarity': case['similarity'],
+        'verdict': answer.verdict,
+        'outcome': answer.outcome,
+        'correct': _is_acceptable(case, answer.outcome),
+        'entry_elided': answer.entry_elided,
+        'candidates_elided': (
+            dict(answer.candidates_elided)
+            if answer.candidates_elided is not None else None
+        ),
+        'usage': dict(answer.usage) if answer.usage is not None else None,
+    }
+
+
+@contextlib.contextmanager
+def _case_sink(cases_path: str | Path | None) -> Iterator[Any]:
+    """A callable that appends one JSON line per case, flushed as it goes.
+
+    Flushed per line and not per run: a provider 429 partway through is
+    exactly when the rows already paid for matter most. ``None`` yields a
+    sink that discards, so the caller has no branch.
+    """
+    if cases_path is None:
+        yield lambda row: None
+        return
+    path = Path(cases_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('w') as handle:
+        def emit(row: Mapping[str, Any]) -> None:
+            handle.write(json.dumps(row) + '\n')
+            handle.flush()
+
+        yield emit
+    logger.info('Wrote %s', path)
+
+
 # ---------------------------------------------------------------------------
 # Report assembly
 # ---------------------------------------------------------------------------
@@ -417,6 +1082,11 @@ CONTESTED_GROUND_TRUTH_REASON = (
 #: Prose the operator at the task-3169 flip gate has to read BEFORE acting on
 #: any number above it. Held as data rather than inlined into the renderer so
 #: the JSON and the markdown cannot drift apart.
+#:
+#: These three hold whatever the slate came from. The two that do NOT are in
+#: :data:`MODE_CAVEATS`: the control class and the population statement are
+#: both properties of how the slate was obtained, and the seeded readings of
+#: them are FALSE of a retrieved run.
 CAVEATS: tuple[str, ...] = (
     'No accuracy floor is asserted anywhere in this script or its tests (PRD '
     'D10). This artifact is evidence for a human decision, not a gate.',
@@ -428,18 +1098,151 @@ CAVEATS: tuple[str, ...] = (
     'The duplicate class accepts BOTH `restated` and `amended`, because the '
     "curator's labels do not separate a verbatim restatement from a "
     'rediscovery carrying a novel fragment. The split between them is '
-    'reported as a distribution and is not scored as error.',
-    'The distractor class is a control this script constructs, not a curator '
-    'label: one case per cluster whose slate carries no correct attach target '
-    'at all. It is what distinguishes a judge that classifies from a judge '
-    'that attaches to whatever it is shown.',
+    'reported as a distribution and is not scored as error. NOT SCORED IS '
+    'NOT THE SAME AS NOT CONSEQUENTIAL: `_TRIAGE_ATTACH_KINDS` in '
+    '`server/tools.py` files a `restated` verdict as a SIGHTING, which '
+    '`grouped_read` only counts, and an `amended` one as an AMENDMENT, whose '
+    "text is digested into the canonical's grouped read. A swing between the "
+    'two therefore changes what an operator reads while leaving every '
+    'accuracy above unmoved, so read this split as a behaviour selector '
+    'rather than as noise.',
 )
+
+
+#: The two caveats that depend on where the slate came from, keyed by mode.
+#: An artifact whose provenance names neither reads as ``seeded``, which is
+#: the only thing this script could do before the retrieved mode existed.
+MODE_CAVEATS: dict[str, tuple[str, ...]] = {
+    SLATE_SEEDED: (
+        'The distractor class is a control this script constructs, not a curator '
+        'label: one case per cluster whose slate carries no correct attach target '
+        'at all. It is what distinguishes a judge that classifies from a judge '
+        'that attaches to whatever it is shown.',
+        'Every accuracy here is measured over the WHOLE labelled corpus, not over '
+        'the [t_low, t_high) middle band the production judge is actually '
+        'responsible for. `build_judge_cases` emits a case for every non-canonical '
+        'record and `run_judge_eval` calls the judge on each one directly — '
+        '`decide_band`, `t_high` and `t_low` never enter the picture, and the band '
+        'decision handed to `judge_write` is SYNTHESIZED as a middle-band one. So '
+        'these figures include records that in production are answered '
+        'deterministically without the judge ever seeing them, and whether the '
+        'middle band alone would score higher or lower is not measured here. '
+        'Filtering the cases to the band would need real per-record similarities '
+        'and is deliberately not done.',
+    ),
+    SLATE_RETRIEVED: (
+        'There is NO distractor control class in this mode. A retrieved slate '
+        'carrying no correct attach target is the ORDINARY case here rather '
+        'than one this script constructs, so the control would measure nothing '
+        'the population does not already show. '
+        '`production_shape.canonical_in_slate` is the measured equivalent — '
+        "the share of cases whose own canonical reached the prompt at all — and "
+        '`canonical_absent` counts the cases whose canonical is no longer in '
+        'the corpus. Those are KEPT in the population, because production '
+        'meets them.',
+        'Every figure here is measured over the population production would '
+        'actually route: the slate, the band winner and the band all come '
+        'from a live retrieval through `retrieve_candidates` / `decide_band` / '
+        '`select_judge_candidates` at this config\'s `candidate_k`, `t_high` '
+        'and `t_low`, and the judge was asked ONLY for the middle band. So '
+        '`per_class` MIXES bands — a deterministic `restated` and a below-floor '
+        '`stored` are counted there without an LLM having seen the case — and '
+        '`production_shape.middle_band` is the judge\'s own accuracy. '
+        'A verdict that is correct for its curator label can still attach to '
+        'ANOTHER RECORD, which `per_class` cannot show. '
+        '`production_shape.duplicate_attach.strict` and '
+        '`production_shape.wrong_record_attach` score `attach_target_id`, the '
+        'record production files the write against. For a middle-band attach '
+        'that is the candidate the judge NAMED, hoisted to its canonical '
+        '(`judged_candidate_id`); otherwise it is the band winner '
+        '(`band_winner_id`). So for the middle band `strict` is recall at '
+        '`judge_candidate_count`, not at 1. An artifact from a judge that named '
+        'no candidate (before task 5794) attached every judged write to the '
+        'band winner, and its rows carry no `judged_candidate_id`.',
+    ),
+}
+
+
+def caveats_for(slate_mode: Any) -> list[str]:
+    """The caveats a report assembled under *slate_mode* must carry."""
+    return [*CAVEATS, *MODE_CAVEATS.get(str(slate_mode), MODE_CAVEATS[SLATE_SEEDED])]
+
+
+def _judged_share(label: str, production_shape: Mapping[str, Any] | None) -> str:
+    """How many *label* cases reached the judge, where the run measured a band split."""
+    band_split = (production_shape or {}).get('band_split') or {}
+    if label not in band_split:
+        return ''
+    return f' (of the {band_split[label][OUTCOME_JUDGE]} the judge saw)'
+
+
+def pseudo_contradiction_caveat(
+    scored: Mapping[str, Any], production_shape: Mapping[str, Any] | None,
+) -> str:
+    """How the pseudo_contradiction class read under the shipped `contests` definition.
+
+    Derived from the scored confusion row, and from the band split where the
+    run measured one, so the counts have one source. It reports the reading
+    and asserts nothing about whether it is right: the records keep the labels
+    they were adjudicated under and are still scored against them.
+    """
+    label = LABEL_PSEUDO_CONTRADICTION
+    row = scored['confusion'][label]
+    n = scored['per_class'][label]['n']
+    breakdown = ', '.join(f'`{outcome}` {row[outcome]}' for outcome in EVAL_OUTCOMES)
+    return (
+        'Under the shipped `contests` definition — the entry says a candidate '
+        "is wrong, outdated or different (Leo's ruling 2026-09-30, "
+        "plans/write-triage-flip-readiness-prd.md §11.3 C1'') — the judge "
+        f'answered `contested` on {row[OUTCOME_CONTESTED]} of {n} {label} '
+        f'cases{_judged_share(label, production_shape)}; all outcomes: '
+        f'{breakdown}. These records were '
+        'adjudicated NOT contradictions under the EARLIER definition ("cannot '
+        'be true at the same time"), and this report still scores `contested` '
+        'on them as wrong and counts it in false_contested. The fixture is '
+        'deliberately not relabelled, so this reports how the new definition '
+        'reads them without asserting which reading is right.'
+    )
+
+
+def duplicate_contested_caveat(
+    scored: Mapping[str, Any],
+    production_shape: Mapping[str, Any] | None,
+    judge_model: Any,
+) -> str:
+    """How often a duplicate read as `contested`, and on which judge.
+
+    Derived from the scored confusion row like
+    :func:`pseudo_contradiction_caveat`. Every one of these is a write the
+    run's judge would flag for a human, so this is the false-alarm figure the
+    flip operator reads, and it is only as general as the judge that
+    produced it.
+    """
+    label = LABEL_DUPLICATE
+    contested = scored['confusion'][label][OUTCOME_CONTESTED]
+    n = scored['per_class'][label]['n']
+    return (
+        f'The judge, `{judge_model}`, answered `contested` on {contested} of '
+        f'{n} {label} cases{_judged_share(label, production_shape)}. The '
+        'curator labelled each duplicate the same claim as its canonical, so '
+        'this report scores `contested` on one as wrong; with triage enabled, '
+        'each is a write this judge would flag `contested` for a human to '
+        'read. The `contests` definition was settled on a frontier reasoning '
+        'judge: its live boundary test, '
+        'fused-memory/tests/server/test_write_triage_judge.py::TestTheShippedWordingLive, '
+        "pins one, because gpt-4o-mini answers that test's outdated cases "
+        '`contested` under the earlier wording too. Where this judge is not '
+        'the model that test pins, the figure measures the wording on a judge '
+        'it was not settled on: read it beside a run on that model before '
+        'deciding which judge the flip ships.'
+    )
 
 
 def build_report(
     *,
     scored: Mapping[str, Any],
     provenance: Mapping[str, Any],
+    production_shape: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Assemble the JSON-serializable accuracy report.
 
@@ -453,27 +1256,103 @@ def build_report(
     from already-scored cases still produces an artifact whose provenance
     block has every key, with ``None`` where nothing was measured. An ABSENT
     key cannot be told apart from an artifact predating the field.
+
+    The backfill iterates :data:`PROVENANCE_KEYS` rather than a literal, so
+    that promise covers the WHOLE vocabulary. It used to name three of its
+    members by hand, which left ``candidate_count_min`` and
+    ``distractor_count_requested`` — the two fields that disclose a narrowed
+    slate — absent from every report assembled here, so a report built from
+    already-scored cases read exactly like a full-width run.
     """
     per_class = dict(scored['per_class'])
     run_provenance = dict(provenance)
     run_provenance.setdefault(
         'case_count', sum(entry['n'] for entry in per_class.values()),
     )
-    for key in ('record_count', 'candidate_count', 'distractor_count'):
+    for key in PROVENANCE_KEYS:
         run_provenance.setdefault(key, None)
+    # Emitted in the VOCABULARY's order, not in whichever order the layers of
+    # caller happened to set the keys. Two runs of the same command must not
+    # produce two differently-ordered artifacts — the same property
+    # `EVAL_OUTCOMES` is sorted for. Anything outside the vocabulary keeps its
+    # own order, after.
+    run_provenance = {
+        **{key: run_provenance[key] for key in PROVENANCE_KEYS},
+        **{k: v for k, v in run_provenance.items() if k not in PROVENANCE_KEYS},
+    }
 
     return {
         'per_class': per_class,
         'confusion': dict(scored['confusion']),
         'duplicate_outcome_split': dict(scored['duplicate_outcome_split']),
         'false_contested': scored['false_contested'],
+        # WHERE each case attached and which band answered it — the half of
+        # the measurement `per_class` cannot carry, since a verdict word can
+        # be right for its label while the attach lands on another record.
+        # `None` means the run did not measure it, never that it measured zero.
+        'production_shape': dict(production_shape) if production_shape else None,
         'contested_ground_truth': {
             'available': False,
             'reason': CONTESTED_GROUND_TRUTH_REASON,
         },
-        'caveats': list(CAVEATS),
+        'caveats': [
+            *caveats_for(run_provenance.get('slate_mode')),
+            pseudo_contradiction_caveat(scored, production_shape),
+            duplicate_contested_caveat(
+                scored, production_shape, run_provenance['judge_model'],
+            ),
+        ],
         'provenance': run_provenance,
     }
+
+
+def _render_production_shape(report: Mapping[str, Any]) -> list[str]:
+    """The attach/band half of the report.
+
+    An EMPTY section means a run that assembled no attach accounting, and says
+    so rather than reading as a section nobody wrote.
+    """
+    shape = report['production_shape']
+    if not shape:
+        return ['', '## Where the writes attached', '',
+                '- not measured by this run.']
+    dup = shape['duplicate_attach']
+    wrong = shape['wrong_record_attach']
+    false_attach = shape['false_attach']
+    middle = shape['middle_band']
+    in_slate = shape['canonical_in_slate']
+    lines = [
+        '', '## Where the writes attached, and which band answered', '',
+        f'- duplicates attaching to their OWN canonical (strict): '
+        f'{dup["strict"]}/{dup["n"]} = `{dup["strict_rate"]}`',
+        f'- duplicates attaching to ANYTHING: {dup["any"]}/{dup["n"]} = '
+        f'`{dup["any_rate"]}`',
+        f'- attaches landing on a record that is NOT the case\'s canonical: '
+        f'{wrong["n"]}/{wrong["attached"]} of all attaches = '
+        f'`{wrong["rate_of_attaches"]}`',
+        f'- attaches on a `distinct`/`pseudo_contradiction`/`distractor` case: '
+        f'{false_attach["n"]}/{false_attach["denominator"]} = '
+        f'`{false_attach["rate"]}`',
+        f'- the case\'s canonical was ON the slate: {in_slate["hits"]}/'
+        f'{in_slate["n"]} = `{in_slate["rate"]}`',
+        f'- cases whose canonical is no longer in the corpus: '
+        f'`{shape["canonical_absent"]}`',
+        f'- judge accuracy restricted to the MIDDLE band: {middle["correct"]}/'
+        f'{middle["n"]} = `{middle["accuracy"]}`',
+        f'- LLM calls made: `{shape["judge_calls"]}`, tokens: '
+        f'`{shape["judge_spend"]["total_tokens"]}`',
+        '', '### Band split — expected class by the band that answered', '',
+        '| class | ' + ' | '.join(EVAL_BANDS) + ' |',
+        '|---' * (len(EVAL_BANDS) + 1) + '|',
+    ]
+    for name in EVAL_CLASSES:
+        row = shape['band_split'][name]
+        lines.append(
+            f'| {name} | ' + ' | '.join(
+                str(row.get(band, 0)) for band in EVAL_BANDS
+            ) + ' |',
+        )
+    return lines
 
 
 def render_markdown(report: Mapping[str, Any]) -> str:
@@ -492,7 +1371,7 @@ def render_markdown(report: Mapping[str, Any]) -> str:
             f'| {name} | {entry["n"]} | {entry["correct"]} | {entry["accuracy"]} |',
         )
 
-    outcomes = list(TRIAGE_OUTCOMES)
+    outcomes = list(EVAL_OUTCOMES)
     lines += [
         '', '## Confusion — expected class by observed verdict', '',
         '| class | ' + ' | '.join(outcomes) + ' |',
@@ -503,6 +1382,8 @@ def render_markdown(report: Mapping[str, Any]) -> str:
         lines.append(
             f'| {name} | ' + ' | '.join(str(row.get(o, 0)) for o in outcomes) + ' |',
         )
+
+    lines += _render_production_shape(report)
 
     split = report['duplicate_outcome_split']
     lines += [
@@ -531,71 +1412,152 @@ def render_markdown(report: Mapping[str, Any]) -> str:
 # The runner
 # ---------------------------------------------------------------------------
 
+def markdown_sibling(report_path: str | Path) -> Path:
+    """Where the markdown for *report_path* goes, or ``ValueError`` if nowhere.
+
+    COMPOSED from the stem, not derived by replacing the last suffix.
+    ``with_suffix('.md')`` maps ``foo.md`` back to ``foo.md``, so the markdown
+    overwrote the JSON that had just been written — every number the run paid
+    for, gone, with no error, on a script whose output is a committed
+    artifact.
+
+    A FUNCTION OF THE ARGUMENT ALONE, which is why it is one: nothing about
+    the collision depends on what the run measures, so it is knowable before
+    any work is done. It used to be evaluated at the bottom of
+    :func:`run_judge_eval`, after ``build_judge_cases``, after the whole
+    per-case ``judge_fn`` loop and after ``score_cases`` — which protected
+    the two FILES and nothing else. On a live run ``--report-path foo.md``
+    spent every LLM call for the corpus and then raised with no artifact
+    written at all, so the operator paid for the run and got nothing.
+    Callers evaluate it up front instead: :func:`run_judge_eval` at its first
+    statement, and :func:`_run` before it so much as reads the fixture.
+
+    ``guard_committed_report`` does not cover this: that guard addresses
+    dry-run/``--limit`` publishing and returns early for any non-committed
+    path, so ``--report-path foo.md`` sailed straight through it.
+    """
+    report_path = Path(report_path)
+    sibling = report_path.parent / (report_path.stem + '.md')
+    if sibling == report_path:
+        raise ValueError(
+            f'report_path {str(report_path)!r} composes the same path as its '
+            f'markdown sibling {str(sibling)!r}, so the markdown would '
+            f'overwrite the JSON report — pass a report_path whose stem+".md" '
+            f'differs from it (e.g. a .json suffix)',
+        )
+    return sibling
+
+
 def run_judge_eval(
     *,
-    records: Sequence[Mapping[str, Any]],
+    plan: EvalPlan,
     judge_fn: Any,
     report_path: str | Path,
     provenance: Mapping[str, Any],
-    distractors: int,
+    cases_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Build cases, ask *judge_fn* once each, score, write both artifacts.
+    """Ask *judge_fn* once per case of *plan*, score, dump, write both artifacts.
 
     ``judge_fn(case, candidates)`` receives the case and its slate RESOLVED to
     records — a judge handed bare ids has no text to compare and is answering
-    noise, which is the same defect the production seam's own tests pin.
+    noise, which is the same defect the production seam's own tests pin. It
+    returns a verdict word, or a :class:`JudgeAnswer` when it has more to
+    report: whether an LLM was called at all, what was elided, what was spent.
+
+    Every case is dumped to *cases_path* AS IT COMPLETES, before the next one
+    is asked. A provider failure mid-run therefore costs the remaining cases,
+    not the ones already bought.
 
     Nothing is caught. A judge error propagates exactly as ``run_calibration``
     lets an ``embed_fn`` error propagate: swallowing it would be
     indistinguishable from a genuine misclassification, so it would both
     shrink the measured population and depress the accuracy reported over it.
 
-    A dangling candidate id raises ``KeyError`` for the same reason — a
-    silently-skipped candidate narrows a slate the report claims was 5 wide.
+    A dangling candidate id already raised when *plan* was built: a
+    silently-skipped candidate would narrow a slate the report claims was 5 wide.
+
+    THE MARKDOWN SIBLING NEVER OVERWRITES THE REPORT. :func:`markdown_sibling`
+    composes it and RAISES on a *report_path* that composes back to itself —
+    resolved as this function's FIRST statement, before a single case is
+    built or a single verdict is bought, so the mistake costs nothing rather
+    than merely leaving the two files intact after a paid run.
     """
-    cases = build_judge_cases(records, distractors=distractors)
-    by_id = {str(r['memory_id']): r for r in records}
-    logger.info('Built %d case(s) from %d record(s)', len(cases), len(records))
+    report_path = Path(report_path)
+    markdown_path = markdown_sibling(report_path)
 
-    verdicts: list[str] = []
-    for index, case in enumerate(cases, 1):
-        candidates = [by_id[cid] for cid in case['candidates']]
-        verdicts.append(judge_fn(case, candidates))
-        if index % 10 == 0:
-            logger.info('Judged %d/%d case(s)', index, len(cases))
+    cases = list(plan.cases)
+    logger.info(
+        'Judging %d case(s) from %d record(s)', len(cases), plan.record_count,
+    )
 
-    scored = score_cases(cases, verdicts)
+    rows: list[dict[str, Any]] = []
+    with _case_sink(cases_path) as emit:
+        paired = zip(cases, plan.candidate_records, strict=True)
+        for index, (case, records) in enumerate(paired, 1):
+            answer = _as_answer(judge_fn(case, list(records)))
+            row = case_row(index, case, answer, records, plan.fixture_by_id)
+            emit(row)
+            rows.append(row)
+            if index % 10 == 0:
+                logger.info('Judged %d/%d case(s)', index, len(cases))
 
-    # MEASURED, not asserted. `_rotated` truncates when the pool is short, so
-    # `distractors + 1` is what was REQUESTED and can silently exceed what the
-    # slates actually carried — the failure this function's own docstring says
-    # the KeyError exists to prevent, arriving by the other door. A run whose
-    # slates all came out 1 wide must not publish `candidate_count: 5`.
-    widths = [len(case['candidates']) for case in cases]
-    run_provenance = dict(provenance)
-    run_provenance.setdefault('record_count', len(records))
+    scored = score_cases(cases, [row['outcome'] for row in rows])
+
+    run_provenance = {**dict(plan.provenance), **dict(provenance)}
+    run_provenance.setdefault('record_count', plan.record_count)
     run_provenance.setdefault('case_count', len(cases))
+    _record_slate_widths(run_provenance, cases)
+    report = build_report(
+        scored=scored,
+        provenance=run_provenance,
+        production_shape=score_attachments(rows),
+    )
+
+    # `markdown_path` was composed (and its collision with `report_path`
+    # rejected) at the top of this function — reused here rather than
+    # recomposed, so the path that was validated is the path that is written.
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, indent=2) + '\n')
+    markdown_path.write_text(render_markdown(report))
+    logger.info('Wrote %s and %s', report_path, markdown_path)
+
+    return report
+
+
+def _record_slate_widths(
+    run_provenance: dict[str, Any], cases: Sequence[Mapping[str, Any]],
+) -> None:
+    """Publish the width the run MEASURED, and warn when it is not the ask.
+
+    `_rotated` truncates when the pool is short, so `distractors + 1` is what
+    was REQUESTED and can silently exceed what the slates actually carried. A
+    run whose slates all came out 1 wide must not publish `candidate_count: 5`.
+    """
+    widths = [len(case['candidates']) for case in cases]
     run_provenance.setdefault('candidate_count', max(widths) if widths else 0)
     run_provenance.setdefault('candidate_count_min', min(widths) if widths else 0)
-    run_provenance.setdefault('distractor_count_requested', distractors)
     run_provenance.setdefault(
         'distractor_count', (max(widths) - 1) if widths else 0,
     )
-    if widths and min(widths) != distractors + 1:
+    requested = run_provenance.get('distractor_count_requested')
+    if widths and isinstance(requested, int) and min(widths) != requested + 1:
         logger.warning(
             'slate widths ran %d..%d against a requested %d — the report '
             'records what was measured, not what was asked for',
-            min(widths), max(widths), distractors + 1,
+            min(widths), max(widths), requested + 1,
         )
-    report = build_report(scored=scored, provenance=run_provenance)
-
-    report_path = Path(report_path)
-    report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(json.dumps(report, indent=2) + '\n')
-    report_path.with_suffix('.md').write_text(render_markdown(report))
-    logger.info('Wrote %s and its .md sibling', report_path)
-
-    return report
+    # The OTHER direction, and a different mechanism: `judge_write` re-trims
+    # the slate to `judge_candidate_count` before the prompt is built, so a
+    # slate built wider than that cap is measured narrower than it is
+    # published.
+    cap = run_provenance.get('judge_candidate_count')
+    if widths and isinstance(cap, int) and max(widths) > cap:
+        logger.warning(
+            'slate widths ran %d..%d but judge_candidate_count caps the '
+            'prompt at %d — the report records what the model was measured '
+            'on, not the wider slate that was built',
+            min(widths), max(widths), cap,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -608,7 +1570,7 @@ def run_judge_eval(
 #: one, so a slate carrying no scores would arrive at the model empty.
 #:
 #: Descending by slate position, which preserves the order
-#: ``build_judge_cases`` chose — the attach target first. These numbers never
+#: ``build_judge_cases`` chose — the band winner first. These numbers never
 #: reach the model: ``build_judge_prompt`` renders id and text only, no
 #: metadata at all (PRD C1). They exist solely to survive the selector.
 _SYNTHETIC_TOP_SCORE = 0.90
@@ -647,14 +1609,17 @@ def _is_committed_report(report_path: str) -> bool:
 
 
 def guard_committed_report(
-    report_path: str, *, dry_run: bool, limit: int | None,
+    report_path: str, *, dry_run: bool, limit: int | None, slate_mode: str,
+    wording: str = _wording.WORDING_SHIPPED,
 ) -> str:
     """Keep a non-measurement run from publishing itself as the measurement.
 
     The committed report is what ``write_triage.judge_accuracy_report_path``
     points at and, per D10, what the operator reads at the task-3169 flip
-    gate. Two kinds of run can reach it without having measured what it
-    claims, and they are NOT the same hazard, so they get different answers:
+    gate. It is the RETRIEVED-slate arbiter (flip-readiness PRD C2'), so a
+    measurement in any other slate mode aimed at it is refused outright. Two
+    more kinds of run can reach it without having measured what it claims,
+    and they are NOT the same hazard, so they get different answers:
 
     - ``--dry-run`` measures NOTHING. Every number in its report comes from a
       fixed-answer stub, so publishing it would put fabricated figures under
@@ -663,6 +1628,8 @@ def guard_committed_report(
       a temp path — the documented "prove the pipeline" invocation keeps
       working and still prints its report, it just cannot overwrite the
       committed one.
+    - a non-shipped ``--wording`` measures a prompt production does not
+      send, so it is refused outright beside the slate-mode refusal.
     - ``--limit N`` measures REALLY, just partially. Its numbers are the
       judge's own, and ``provenance.limit`` records the truncation in the
       artifact itself, so an operator (and
@@ -687,6 +1654,18 @@ def guard_committed_report(
         )
         return redirected
 
+    if slate_mode != SLATE_RETRIEVED:
+        raise ValueError(
+            f"the committed artifact is the retrieved-slate arbiter (PRD C2'); pass "
+            f'--report-path for a {slate_mode} run',
+        )
+
+    if wording != _wording.WORDING_SHIPPED:
+        raise ValueError(
+            f'the committed artifact measures the shipped wording; pass '
+            f'--report-path for a {wording} run',
+        )
+
     if limit is not None:
         logger.warning(
             'a --limit run is about to OVERWRITE the committed report at '
@@ -699,8 +1678,139 @@ def guard_committed_report(
     return report_path
 
 
+def apply_field_chars(config: Any, requested: int | None) -> int:
+    """Set this run's ``write_triage.judge_field_chars``; return the width to record.
+
+    Written on the run's own in-memory config, exactly as
+    ``--judge-candidate-count`` is: config.yaml is never written and nothing
+    module-global changes, and the shipped judge reads the leaf live per call.
+
+    ``0`` means NO elision. The leaf is a positive cap, so it is spelled there
+    as ``sys.maxsize``, while the returned provenance keeps ``0``. ``None``
+    writes nothing and returns the width the config already resolves to.
+
+    A negative width is refused: the resolver would silently read the default
+    instead, so the provenance would record a width the judge never used.
+    """
+    import sys  # noqa: PLC0415
+
+    from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        resolve_judge_field_chars,
+    )
+
+    if requested is None:
+        return resolve_judge_field_chars(types.SimpleNamespace(config=config))
+    if requested < 0:
+        raise ValueError(f'--field-chars must be 0 (no elision) or positive, got {requested}')
+    config.write_triage.judge_field_chars = sys.maxsize if requested == 0 else requested
+    return requested
+
+
+def _elision_flags(
+    content: str, slate: Sequence[Any], field_chars: int,
+) -> tuple[bool, dict[str, bool]]:
+    """Which rendered fields the judge's own ``_elide`` cut at *field_chars*.
+
+    Asked of the shipped function rather than re-derived from a length
+    comparison here, so the flags cannot disagree with the prompt.
+    """
+    from fused_memory.server.write_triage_judge import _elide  # noqa: PLC0415
+
+    return (
+        _elide(content, field_chars) != content,
+        {c.id: _elide(c.content, field_chars) != c.content for c in slate},
+    )
+
+
+def _usage_row(usage: JudgeUsage | None) -> dict[str, int] | None:
+    """The verdict's usage under the artifact's ESTABLISHED keys, or ``None``.
+
+    The key names are kept because ``_spend`` and
+    ``fused-memory/scripts/score_write_triage_pairs.py::JudgedCase.from_row``
+    read them, and the row carries nothing they do not read. The mapping is
+    exact: output (``completion_tokens``) already includes reasoning on both
+    OpenAI APIs.
+    """
+    if usage is None:
+        return None
+    return {
+        'prompt_tokens': usage.input_tokens,
+        'completion_tokens': usage.output_tokens,
+        'total_tokens': usage.input_tokens + usage.output_tokens,
+    }
+
+
+def _ask_judge(
+    service: Any,
+    content: str,
+    slate: Sequence[Any],
+    *,
+    outcome: str,
+    band_winner_id: str | None,
+    similarity: float | None,
+) -> JudgeAnswer:
+    """Drive the SHIPPED judge for one case, or restate a band that decided itself.
+
+    Only the middle band reaches an LLM, exactly as ``triage_write`` routes it:
+    a deterministic ``restated`` and a below-floor ``stored`` are returned with
+    no call, no rendered prompt and no spend, so none of the three is reported.
+
+    ``asyncio.run`` per case, which is why the runner is synchronous:
+    ``judge_write`` is the only awaitable in the pipeline and it needs no
+    initialized ``MemoryService``.
+    """
+    import asyncio  # noqa: PLC0415
+
+    from fused_memory.server.write_triage import BandDecision  # noqa: PLC0415
+    from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        judge_write,
+        resolve_judge_field_chars,
+    )
+
+    if outcome != OUTCOME_JUDGE:
+        return JudgeAnswer(outcome=outcome)
+
+    entry_elided, candidates_elided = _elision_flags(
+        content, slate, resolve_judge_field_chars(service),
+    )
+    verdict = asyncio.run(judge_write(
+        memory_service=service,
+        content=content,
+        project_id=_EVAL_PROJECT_ID,
+        decision=BandDecision(
+            outcome=OUTCOME_JUDGE,
+            canonical_id=band_winner_id,
+            similarity=similarity,
+            t_high=None,
+            t_low=None,
+        ),
+        candidates=list(slate),
+    ))
+    return JudgeAnswer(
+        outcome=verdict.outcome,
+        verdict=verdict.outcome,
+        entry_elided=entry_elided,
+        candidates_elided=candidates_elided,
+        usage=_usage_row(verdict.usage),
+        candidate_id=verdict.candidate_id,
+    )
+
+
+def _as_memory_result(record: Mapping[str, Any], metadata: Mapping[str, Any]) -> Any:
+    """One eval record as the ``MemoryResult`` the shipped judge consumes."""
+    from fused_memory.models.enums import SourceStore  # noqa: PLC0415
+    from fused_memory.models.memory import MemoryResult  # noqa: PLC0415
+
+    return MemoryResult(
+        id=str(record['memory_id']),
+        content=str(record['content']),
+        source_store=SourceStore.mem0,
+        metadata=dict(metadata),
+    )
+
+
 def build_judge_fn(config: Any) -> Any:
-    """The LIVE edge: drive the SHIPPED judge, not a re-implementation.
+    """The SEEDED live edge: drive the SHIPPED judge, not a re-implementation.
 
     ``server/write_triage_judge.judge_write`` is called with a duck-typed
     service exposing only ``config`` — which is all it reads — so this eval
@@ -713,47 +1823,56 @@ def build_judge_fn(config: Any) -> Any:
     names the cluster canonical, which is exactly what a correct retrieval
     would have found, and marks the middle band — the only band that reaches a
     judge at all.
-
-    ``asyncio.run`` per case, which is why ``_run`` below is synchronous:
-    ``judge_write`` is the only awaitable in the whole pipeline and it needs
-    no initialized ``MemoryService``, so an async ``_run`` would buy nothing
-    and would force a nested-loop bridge around every single call.
     """
-    import asyncio  # noqa: PLC0415
-
-    from fused_memory.models.enums import SourceStore  # noqa: PLC0415
-    from fused_memory.models.memory import MemoryResult  # noqa: PLC0415
-    from fused_memory.server.write_triage import OUTCOME_JUDGE, BandDecision  # noqa: PLC0415
-    from fused_memory.server.write_triage_judge import judge_write  # noqa: PLC0415
-
     service = types.SimpleNamespace(config=config)
 
-    def judge_fn(case: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]]) -> str:
+    def judge_fn(
+        case: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]],
+    ) -> JudgeAnswer:
         slate = [
-            MemoryResult(
-                id=str(record['memory_id']),
-                content=str(record['content']),
-                source_store=SourceStore.mem0,
-                metadata={
-                    'store_score': _SYNTHETIC_TOP_SCORE - index * _SYNTHETIC_SCORE_STEP,
-                },
-            )
+            _as_memory_result(record, {
+                'store_score': _SYNTHETIC_TOP_SCORE - index * _SYNTHETIC_SCORE_STEP,
+            })
             for index, record in enumerate(candidates)
         ]
-        decision = BandDecision(
+        return _ask_judge(
+            service,
+            str(case['content']),
+            slate,
             outcome=OUTCOME_JUDGE,
-            canonical_id=slate[0].id if slate else None,
+            band_winner_id=slate[0].id if slate else None,
             similarity=_SYNTHETIC_TOP_SCORE,
-            t_high=None,
-            t_low=None,
         )
-        return asyncio.run(judge_write(
-            memory_service=service,
-            content=str(case['content']),
-            project_id=_EVAL_PROJECT_ID,
-            decision=decision,
-            candidates=slate,
-        ))
+
+    return judge_fn
+
+
+def build_retrieved_judge_fn(config: Any) -> Any:
+    """The RETRIEVED live edge: the case already carries production's routing.
+
+    The slate, the band winner, the band and the similarity all came from
+    ``decide_band``/``select_judge_candidates`` over a real retrieval, so this
+    only rebuilds the records and defers to the same judge edge. The candidate
+    metadata is passed through whole because it carries the cosine the shipped
+    selector re-reads.
+    """
+    service = types.SimpleNamespace(config=config)
+
+    def judge_fn(
+        case: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]],
+    ) -> JudgeAnswer:
+        slate = [
+            _as_memory_result(record, record.get('metadata') or {})
+            for record in candidates
+        ]
+        return _ask_judge(
+            service,
+            str(case['content']),
+            slate,
+            outcome=str(case['band']),
+            band_winner_id=case['band_winner_id'],
+            similarity=case['similarity'],
+        )
 
     return judge_fn
 
@@ -766,11 +1885,117 @@ def _dry_run_judge_fn() -> Any:
     return judge_fn
 
 
+def _limited(
+    records: Sequence[Mapping[str, Any]], limit: int,
+) -> list[Mapping[str, Any]]:
+    """*limit* labelled records drawn ROUND-ROBIN across clusters, plus canonicals.
+
+    Truncating RECORDS rather than cases, because a bare head-N slice can cut a
+    cluster's canonical while keeping its members, whose slates then cannot resolve.
+
+    Round-robin and not a head slice: the fixture is grouped by cluster in file
+    order, so `records[:5]` is five records of ONE cluster, `_distractor_pool`
+    draws only from OTHER clusters and comes back empty, every slate collapses
+    to width 1, and the lone control case gets `candidates == []` — which
+    `judge_write` short-circuits to `stored` with no provider call at all.
+
+    Only NON-canonical records are drawn, since a canonical produces no
+    labelled case; the ones each drawn record's slate needs come along anyway.
+    """
+    by_cluster: dict[str, list[Mapping[str, Any]]] = {}
+    for record in records:
+        if str(record['label']) == LABEL_CANONICAL:
+            continue
+        by_cluster.setdefault(str(record['cluster_id']), []).append(record)
+    kept: list[Mapping[str, Any]] = []
+    for depth in range(max((len(v) for v in by_cluster.values()), default=0)):
+        if len(kept) >= limit:
+            break
+        for group in by_cluster.values():
+            if depth < len(group):
+                kept.append(group[depth])
+                if len(kept) >= limit:
+                    break
+
+    kept_ids = {id(r) for r in kept}
+    wanted = {str(r['cluster_id']) for r in kept}
+    canonicals = [
+        r for r in records
+        if str(r['memory_id']) in wanted and id(r) not in kept_ids
+    ]
+    logger.info(
+        '--limit %d: measuring %d record(s) across %d cluster(s) '
+        '(%d canonical(s) pulled in to keep every slate resolvable)',
+        limit, len(kept) + len(canonicals), len(wanted), len(canonicals),
+    )
+    return [*kept, *canonicals]
+
+
+def _retrieved_plan(
+    args: Any,
+    config: Any,
+    records: Sequence[Mapping[str, Any]],
+    *,
+    fixture: Sequence[Mapping[str, Any]],
+    judge_candidate_count: int,
+    aliases: Mapping[str, str],
+) -> EvalPlan:
+    """Retrieve, band and trim every labelled record exactly as production would.
+
+    The retrieval width and both band edges come from the SAME config the
+    shipped ``triage_write`` reads, so a re-calibration moves this eval with it.
+    """
+    import asyncio  # noqa: PLC0415
+
+    from fused_memory.server.write_triage import (  # noqa: PLC0415
+        resolve_bands,
+        resolve_candidate_k,
+    )
+    from fused_memory.services.memory_service import MemoryService  # noqa: PLC0415
+
+    retrieval = load_retrieval()
+    service = types.SimpleNamespace(config=config)
+    k = resolve_candidate_k(service)
+    t_high, t_low = resolve_bands(service)
+    labelled = [r for r in records if str(r['label']) != LABEL_CANONICAL]
+    logger.info(
+        'Retrieving %d slate(s) from project_id=%s at k=%d, bands t_high=%s '
+        't_low=%s', len(labelled), args.project_id, k, t_high, t_low,
+    )
+
+    async def prefetch() -> dict[str, dict[str, Any]]:
+        memory = MemoryService(config)
+        await memory.initialize()
+        try:
+            return await retrieval.prefetch_retrievals(
+                memory, labelled, project_id=args.project_id, k=k,
+            )
+        finally:
+            await memory.close()
+
+    slates = retrieval.retrieved_slates(
+        labelled, asyncio.run(prefetch()),
+        t_high=t_high, t_low=t_low,
+        judge_candidate_count=judge_candidate_count,
+    )
+    return plan_from_slates(records, slates, provenance={
+        'project_id': args.project_id,
+        't_high': t_high,
+        't_low': t_low,
+        'candidate_k': k,
+        'canonical_absent': sum(1 for s in slates if not s.canonical_present),
+        'degraded_retrievals': sum(1 for s in slates if s.degraded),
+        'self_retrieved': sum(1 for s in slates if s.self_retrieved),
+    }, aliases=aliases, fixture=fixture)
+
+
 def _run(args: Any) -> int:
     import os  # noqa: PLC0415
 
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
     from fused_memory.server.write_triage_judge import (  # noqa: PLC0415
+        resolve_judge_candidate_count,
+        resolve_judge_enabled,
         resolve_judge_model,
         resolve_judge_provider,
     )
@@ -779,74 +2004,57 @@ def _run(args: Any) -> int:
     if args.config:
         os.environ['CONFIG_PATH'] = str(args.config)
 
+    # FIRST, ahead of the fixture load and the config: `--report-path foo.md`
+    # is a bad ARGUMENT, and whether it collides with its markdown sibling is
+    # decided by the string alone. `run_judge_eval` re-resolves this on the
+    # path it is finally handed (which `guard_committed_report` may have
+    # redirected); rejecting here just means the operator is told now instead
+    # of after a corpus-wide run they paid for.
+    markdown_sibling(args.report_path)
+
     # BEFORE any work, and outside the --limit block: a bare --dry-run also
     # defaults to the committed path, and used to rewrite both committed
     # artifacts with fixed-answer numbers.
     report_path = guard_committed_report(
         args.report_path, dry_run=args.dry_run, limit=args.limit,
+        slate_mode=args.slate_mode, wording=args.wording,
     )
+    aliases = load_canonical_aliases(args.canonical_aliases) if args.canonical_aliases else {}
 
     config = FusedMemoryConfig()
+    # Mutated on the in-memory config only — config.yaml is never touched. The
+    # shipped resolvers read live per call, so this is the one place the cap
+    # has to move for both the slate this script builds and the re-trim
+    # `judge_write` applies to it.
+    if args.judge_candidate_count is not None:
+        config.write_triage.judge_candidate_count = args.judge_candidate_count
+    field_chars = apply_field_chars(config, args.field_chars)
     service = types.SimpleNamespace(config=config)
     provider = resolve_judge_provider(service)
     model = resolve_judge_model(service)
+    # Resolved from the SAME config the shipped judge reads, and recorded even
+    # on a --dry-run: the two facts the numbers cannot be read without.
+    # `judge_candidate_count` is the width `judge_write` trims the slate to,
+    # so it — not the width this script builds — is what the model saw.
+    # `judge_enabled` false makes `judge_write` return `stored` on its first
+    # line for every case, which scores the `distractor` control 1.0 and
+    # `duplicate` 0.0 while spending nothing and writing a report that is
+    # otherwise indistinguishable from a measurement.
+    judge_candidate_count = resolve_judge_candidate_count(service)
+    judge_enabled = resolve_judge_enabled(service)
 
-    records = load_fixture(args.fixture)
-    logger.info('Loaded %d labeled record(s) from %s', len(records), args.fixture)
+    fixture = load_fixture(args.fixture)
+    logger.info('Loaded %d labeled record(s) from %s', len(fixture), args.fixture)
+    records = fixture if args.limit is None else _limited(fixture, args.limit)
 
-    if args.limit is not None:
-        # Truncating RECORDS rather than cases, plus whatever canonicals those
-        # records point at. A bare head-N slice can cut a cluster's canonical
-        # while keeping its members, and the runner would then KeyError on an
-        # unresolvable slate partway through a paid run — the right behaviour
-        # for a dangling id in the real fixture, a useless one for a smoke.
-        # Drawn ROUND-ROBIN across clusters, not as a head slice. The fixture
-        # is grouped by cluster in file order, so `records[:5]` is five records
-        # of ONE cluster: `_distractor_pool` draws only from OTHER clusters, so
-        # it comes back empty, every slate collapses to width 1, and the lone
-        # control case gets `candidates == []` — which `judge_write`
-        # short-circuits to `stored` with no provider call at all. The
-        # documented `--limit 5` smoke would then score the distractor class
-        # 100% having asked the model nothing. Taking one record per cluster
-        # before taking a second from any keeps a real cross-cluster pool.
-        #
-        # Only NON-canonical records are drawn: a canonical produces no
-        # labelled case (it IS the attach target), so a slice of them would
-        # report `case_count: 0` and score nothing. The canonicals each drawn
-        # record needs are pulled in below regardless, so `--limit N` means N
-        # labelled cases rather than N lines of the file.
-        by_cluster: dict[str, list[Any]] = {}
-        for record in records:
-            if str(record['label']) == LABEL_CANONICAL:
-                continue
-            by_cluster.setdefault(str(record['cluster_id']), []).append(record)
-        kept: list[Any] = []
-        for depth in range(max((len(v) for v in by_cluster.values()), default=0)):
-            if len(kept) >= args.limit:
-                break
-            for group in by_cluster.values():
-                if depth < len(group):
-                    kept.append(group[depth])
-                    if len(kept) >= args.limit:
-                        break
-
-        # Whatever canonicals those records point at come along too. A slice
-        # that cuts a cluster's canonical while keeping its members would
-        # KeyError on an unresolvable slate partway through a PAID run — the
-        # right behaviour for a dangling id in the real fixture, a useless one
-        # for a smoke.
-        kept_ids = {id(r) for r in kept}
-        wanted = {str(r['cluster_id']) for r in kept}
-        canonicals = [
-            r for r in records
-            if str(r['memory_id']) in wanted and id(r) not in kept_ids
-        ]
-        records = [*kept, *canonicals]
-        logger.info(
-            '--limit %d: measuring %d record(s) across %d cluster(s) '
-            '(%d canonical(s) pulled in to keep every slate resolvable)',
-            args.limit, len(records), len(wanted), len(canonicals),
+    if args.slate_mode == SLATE_RETRIEVED:
+        plan = _retrieved_plan(
+            args, config, records, fixture=fixture,
+            judge_candidate_count=judge_candidate_count, aliases=aliases,
         )
+    else:
+        plan = seeded_plan(records, distractors=args.distractors, aliases=aliases)
+
     if args.dry_run:
         judge_fn = _dry_run_judge_fn()
         provider, model = 'dry-run', f'fixed:{_DRY_RUN_VERDICT}'
@@ -855,25 +2063,42 @@ def _run(args: Any) -> int:
         # Logged BEFORE the first call, so a mis-resolved model is visible
         # while the run is still free to abort.
         logger.info('Judge resolves to provider=%s model=%s', provider, model)
-        judge_fn = build_judge_fn(config)
+        judge_fn = (
+            build_retrieved_judge_fn(config)
+            if args.slate_mode == SLATE_RETRIEVED
+            else build_judge_fn(config)
+        )
 
-    report = run_judge_eval(
-        records=records,
-        judge_fn=judge_fn,
-        report_path=report_path,
-        provenance={
-            'fixture_path': package_relative(args.fixture),
-            'judge_provider': provider,
-            'judge_model': model,
-            # Present on EVERY run, `None` on a full one. An absent key would
-            # be indistinguishable from an artifact predating the field, and
-            # this is the one field that says a committed report is a partial
-            # smoke rather than the corpus-wide measurement the task-3169
-            # flip gate reads it as.
-            'limit': args.limit,
-        },
-        distractors=args.distractors,
-    )
+    with _wording.judge_wording(args.wording) as prompt_sha256:
+        report = run_judge_eval(
+            plan=plan,
+            judge_fn=judge_fn,
+            report_path=report_path,
+            cases_path=args.cases_path,
+            provenance={
+                'fixture_path': package_relative(args.fixture),
+                'judge_provider': provider,
+                'judge_model': model,
+                'judge_system_prompt_sha256': prompt_sha256,
+                # Present on EVERY run, `None` on a full one. An absent key
+                # would be indistinguishable from an artifact predating the
+                # field, and this is the one field that says a committed
+                # report is a partial smoke rather than the corpus-wide
+                # measurement the task-3169 flip gate reads it as.
+                'limit': args.limit,
+                'canonical_aliases_path': (
+                    package_relative(args.canonical_aliases)
+                    if args.canonical_aliases else None
+                ),
+                'canonical_aliases_count': len(aliases),
+                'cases_path': (
+                    package_relative(args.cases_path) if args.cases_path else None
+                ),
+                'field_chars': field_chars,
+                'judge_candidate_count': judge_candidate_count,
+                'judge_enabled': judge_enabled,
+            },
+        )
     print(json.dumps(report, indent=2))
     return 0
 
@@ -899,6 +2124,43 @@ def main() -> int:
                              'provenance.limit')
     parser.add_argument('--dry-run', dest='dry_run', action='store_true',
                         help='score a fixed-answer judge; makes no provider call')
+    parser.add_argument('--slate-mode', dest='slate_mode', default=SLATE_SEEDED,
+                        choices=SLATE_MODES,
+                        help='seeded: the cluster canonical is placed at slate '
+                             'position 0. retrieved: the slate, the band '
+                             'winner and the band all come from a real '
+                             'retrieval against the live store, as production '
+                             'would produce them (default: seeded)')
+    parser.add_argument('--project-id', dest='project_id', default='reify',
+                        help='the corpus retrieved against under '
+                             '--slate-mode retrieved (default: reify)')
+    parser.add_argument('--field-chars', dest='field_chars', type=int, default=None,
+                        help="override the judge's per-field prompt budget for "
+                             'this run; 0 renders every field UN-elided. '
+                             'Recorded as provenance.field_chars (default: '
+                             'write_triage.judge_field_chars as the config '
+                             'resolves it)')
+    parser.add_argument('--judge-candidate-count', dest='judge_candidate_count',
+                        type=int, default=None,
+                        help='override write_triage.judge_candidate_count for '
+                             'this run, in memory only — config.yaml is not '
+                             'written')
+    parser.add_argument('--canonical-aliases', dest='canonical_aliases', default=None,
+                        help='the {old_cluster_canonical_id: current_memory_id} sidecar: '
+                             "an attach to a rotated canonical's successor counts as an "
+                             'attach to the canonical (default: none)')
+    parser.add_argument('--cases-path', dest='cases_path', default=None,
+                        help='append one JSON line per case as it completes: '
+                             'slate, band winner, the candidate the verdict '
+                             'named, attach target, band, verdict, outcome and '
+                             'elision flags (default: no per-case dump)')
+    parser.add_argument('--wording', default=_wording.WORDING_SHIPPED,
+                        choices=_wording.WORDINGS,
+                        help='the judge system prompt the run is made under; '
+                             'pre-psi is the pre-psi wording as an eval-side '
+                             'override. Recorded as '
+                             'provenance.judge_system_prompt_sha256 '
+                             '(default: shipped)')
     return _run(parser.parse_args())
 
 

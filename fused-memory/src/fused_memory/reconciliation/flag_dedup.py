@@ -346,14 +346,24 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import cached_property
 from typing import Any, Literal, NamedTuple, NotRequired, TypedDict
 
 from shared.task_statuses import TaskStatus
 
 from fused_memory.models.memory import AddMemoryResponse
 from fused_memory.reconciliation.internal_writers import is_internal_writer
-from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord
+from fused_memory.reconciliation.recon_ledger import (
+    ReconLedgerRecord,
+    nonnegative_int_from_payload,
+)
+from fused_memory.reconciliation.standing_decision_constants import (
+    GROUNDS_TOKEN_FAMILIES,
+    STATE_ACTIVE,
+)
 from fused_memory.utils.async_utils import gather_collect
 
 logger = logging.getLogger(__name__)
@@ -419,7 +429,7 @@ def _decompose_suppression_task_id(tid: str) -> list[str]:
 
     Only the SUPPRESSION row's task_id is ever decomposed by this helper --
     a flag's own task_id is never split (see :func:`filter_suppressed`).
-    :func:`_cluster_growth_candidate_task_ids` (task 3476) is the separate
+    :func:`_flag_candidate_task_ids` (task 3476) is the separate
     splitter that DOES decompose a flag's own composite task_id, for its own
     task-resolution purposes; that claim above stays true of this helper.
 
@@ -486,6 +496,59 @@ def canonical_flag_type_family(flag_type: str) -> str:
     """
     tokens = _FLAG_TYPE_TOKEN_SPLIT_RE.split(flag_type.casefold())
     return '_'.join(sorted({t for t in tokens if t}))
+
+
+@dataclass(frozen=True)
+class FlagTypeFamily:
+    """The ``flag_type`` spellings of one Stage-1 finding that a filter acts on.
+
+    ``flag_type`` is LLM-authored with no committed schema entry, so a filter
+    keyed on it goes silently inert whenever Stage 1 coins a new spelling.
+    :meth:`matches` tolerates what :func:`canonical_flag_type_family`
+    collapses, and :meth:`log_drift` makes the rest observable.
+
+    ``name`` labels the family in the drift log; ``spellings`` are the
+    measured ones; ``drift_token`` marks a ``flag_type`` as probably meant for
+    this family.  A non-empty ``unseen_spelling_tokens`` also admits a
+    never-observed spelling whose tokens include all of them.
+    """
+
+    name: str
+    spellings: frozenset[str]
+    drift_token: str
+    unseen_spelling_tokens: frozenset[str] = frozenset()
+
+    @cached_property
+    def _canonical_spellings(self) -> frozenset[str]:
+        return frozenset(canonical_flag_type_family(s) for s in self.spellings)
+
+    def matches(self, flag_type: Any) -> bool:
+        """True iff *flag_type* is a spelling of this family; ``False`` for any non-``str``."""
+        if not isinstance(flag_type, str) or not flag_type:
+            return False
+        if canonical_flag_type_family(flag_type) in self._canonical_spellings:
+            return True
+        tokens = {t for t in _FLAG_TYPE_TOKEN_SPLIT_RE.split(flag_type.casefold()) if t}
+        return bool(self.unseen_spelling_tokens) and self.unseen_spelling_tokens <= tokens
+
+    def log_drift(self, flags: list[dict[str, Any]], *, log_event: str) -> None:
+        """Log as *log_event* each ``flag_type`` carrying ``drift_token`` that does not match."""
+        unmatched = [
+            ft
+            for flag in flags
+            if isinstance(ft := flag.get('flag_type'), str)
+            and self.drift_token in ft.casefold()
+            and not self.matches(ft)
+        ]
+        if unmatched:
+            logger.info(
+                '%s family=%s unmatched_flag_types=%s known_types=%s '
+                '— add the spelling to that FlagTypeFamily if drift confirmed',
+                log_event,
+                self.name,
+                unmatched,
+                sorted(self.spellings),
+            )
 
 
 #: ``(project_id, task_id, family)`` keys for which :func:`filter_suppressed`
@@ -718,6 +781,392 @@ async def filter_suppressed(
 
 
 # --------------------------------------------------------------------------- #
+# Entity-standing-decision match helpers (Hook A / γ, task 2896)
+#
+# Pure, sync building blocks for filter_entity_standing_decisions' FALLBACK
+# (stamps-omitted) match path: an LLM-emitted recon flag that omits the
+# structured entity_uuid/grounds stamps is matched to an active standing
+# decision by (a) recovering every UUID it cites anywhere in its free text and
+# (b) gating on whether its flag_type belongs to the decision's grounds→token
+# family. See filter_entity_standing_decisions (step-4/6) for the composition.
+# --------------------------------------------------------------------------- #
+
+#: Canonical 8-4-4-4-12 hex UUID, anchored on word boundaries so a UUID is only
+#: extracted when it stands alone (not as a substring of a longer alnum run). A
+#: DEDICATED constant rather than a reused splitter, mirroring the module's
+#: per-feature regex convention (_CONTENT_FP_RE, _FLAG_TYPE_TOKEN_SPLIT_RE, ...).
+_UUID_RE: re.Pattern[str] = re.compile(
+    r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+    r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b'
+)
+
+
+def _extract_uuids(text: str) -> set[str]:
+    """Return the set of lowercased canonical UUIDs appearing in *text*.
+
+    Case-insensitive extraction normalized to lowercase, so upper- and
+    lower-case spellings of the same UUID (and repeats) collapse to a single
+    distinct value. Text with no UUID (including empty/``None``-coerced) yields
+    an empty set. Pure, sync, no I/O.
+    """
+    if not text:
+        return set()
+    return {m.lower() for m in _UUID_RE.findall(text)}
+
+
+def _collect_str_values(value: Any, out: list[str]) -> None:
+    """Recursively append every ``str`` VALUE reachable in *value* to *out*.
+
+    Descends dicts (values only, not keys), lists, and tuples; every other
+    scalar type (int, float, bool, None, ...) is ignored rather than
+    stringified. Pure, sync, no I/O.
+    """
+    if isinstance(value, str):
+        out.append(value)
+    elif isinstance(value, dict):
+        for v in value.values():
+            _collect_str_values(v, out)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            _collect_str_values(v, out)
+    # Any other type (int/float/bool/None/...) is intentionally ignored: only
+    # LLM-authored free text can carry a cited UUID, and stringifying a numeric
+    # or structured value could mint spurious tokens.
+
+
+def _flag_text_blob(flag: dict[str, Any]) -> str:
+    """Return every ``str`` value in *flag* (recursively), space-joined.
+
+    FALLBACK match is exactly the stamps-omitted path, so a cited UUID may
+    appear in any free-text field (``description``/``summary``/nested
+    ``evidence``/list items). Collecting all string values finds it wherever
+    the LLM placed it while ignoring structured/numeric noise. Pure, sync, no
+    I/O.
+    """
+    parts: list[str] = []
+    _collect_str_values(flag, parts)
+    return ' '.join(parts)
+
+
+def extract_flag_uuids(flag: dict[str, Any]) -> set[str]:
+    """Every UUID *flag* names in any ``str`` value, lowercased.
+
+    Structured and free-text fields alike, at any nesting depth; non-``str``
+    values are ignored.  Pure, sync, no I/O.
+    """
+    return _extract_uuids(_flag_text_blob(flag))
+
+
+def _flag_type_in_grounds_family(flag_type: Any, grounds: Any) -> bool:
+    """Return True iff *flag_type* belongs to *grounds*' bound token family.
+
+    Guards a non-``str``/empty *flag_type* → ``False``. Looks up the token
+    family bound to *grounds* in
+    :data:`~fused_memory.reconciliation.standing_decision_constants.GROUNDS_TOKEN_FAMILIES`;
+    an unknown/empty grounds (no bound family) → ``False``. Otherwise returns
+    True when any family stem is a casefolded SUBSTRING of the whole
+    *flag_type*.
+
+    Substring, NOT ``_``-split token equality (unlike
+    :func:`canonical_flag_type_family`, whose splitter this deliberately does
+    not reuse): the family is a list of stems precisely so ``'conflat'`` can
+    match ``topic_conflation`` and ``'size'`` can match ``oversized_entity``,
+    neither of which is a whole ``_``-delimited token. Splitting first would
+    silently narrow the gate to the stems that happen to be complete words.
+
+    The safety of a substring test therefore rests entirely on the family
+    holding stems that appear in NO unrelated flag_type — the property
+    ``GROUNDS_TOKEN_FAMILIES``' own comment makes a precondition of adding one.
+    A stem that is a common word (``count``, ``scope``) matches unrelated
+    findings and, for an entity under an active decision, DROPS them. Pure,
+    sync, no I/O.
+    """
+    if not isinstance(flag_type, str) or not flag_type:
+        return False
+    family = GROUNDS_TOKEN_FAMILIES.get(grounds)
+    if not family:
+        return False
+    folded = flag_type.casefold()
+    return any(stem.casefold() in folded for stem in family)
+
+
+@dataclass(frozen=True)
+class EntityStandingSuppressionResult:
+    """Outcome of :func:`filter_entity_standing_decisions` (task 2896 γ).
+
+    - ``kept_flags`` — the flags that survived (input order preserved), to be
+      assigned back to ``report.items_flagged``.
+    - ``suppressed_by_decision`` — ``{entity_uuid(lower): count}`` of flags
+      suppressed, attributed per active standing decision; its ``values()`` sum
+      is the ``entity_standing_decision_suppressed`` per-cycle stat, and it
+      drives the storm escalation
+      (``standing_decision_storm_escape.py::maybe_escalate_suppression_storm``).
+    - ``grounds_by_decision`` — ``{entity_uuid(lower): grounds}`` for each
+      decision that suppressed at least one flag (observability + escalation
+      detail).
+    - ``suppression_evaluated`` — True when the active-decision index was
+      consulted and every flag was evaluated against it, so a decision absent
+      from ``suppressed_by_decision`` really did go quiet this cycle. False
+      marks a fail-open cycle that observed nothing; cross-cycle streak
+      accounting
+      (``standing_decision_storm_escape.py::update_suppression_streaks``)
+      must neither increment nor reset on it, because an unread ledger is not evidence that a
+      decision went quiet. An empty flag batch stays True: a cycle with
+      nothing to suppress is a cycle in which no decision drained anything.
+      It has no default, so a new fail-open return cannot forget it and pass
+      as an evaluated quiet cycle that wipes every established streak.
+    """
+
+    kept_flags: list[dict[str, Any]]
+    suppressed_by_decision: dict[str, int]
+    grounds_by_decision: dict[str, str]
+    suppression_evaluated: bool
+
+    @classmethod
+    def empty_batch(cls) -> EntityStandingSuppressionResult:
+        """The evaluated, nothing-suppressed outcome of an empty flag batch."""
+        return cls(
+            kept_flags=[],
+            suppressed_by_decision={},
+            grounds_by_decision={},
+            suppression_evaluated=True,
+        )
+
+
+def _match_entity_standing_decision(
+    flag: dict[str, Any], active_by_uuid: dict[str, ReconLedgerRecord]
+) -> str | None:
+    """Return the ``entity_uuid`` (lowercased) of the active standing decision
+    that suppresses *flag*, or ``None`` if none does.
+
+    Evaluated as independent OR conditions (strong OR fallback); STRONG wins
+    decision-attribution when both would fire.
+
+    STRONG: the flag carries a structured ``entity_uuid`` stamp matching an
+    active row AND its ``grounds`` stamp equals that row's grounds
+    (``row.flag_type`` — the α PK-slot mapping). A deliberate LLM-stamped
+    (entity, grounds) assertion is high-signal, so it is trusted even if the
+    flag text also cites another UUID (the second-UUID escape below is FALLBACK
+    -only).
+
+    FALLBACK (stamps omitted): the flag's free text cites exactly ONE distinct
+    UUID, that UUID names an active row, AND the flag's ``flag_type`` belongs to
+    that row's grounds token family. The exactly-one-UUID gate is the escape
+    hatch protecting this low-signal free-text guess — a second cited UUID
+    (≈ an edge/new-fact citation) means "never suppress via fallback". Together
+    with the active-row requirement and the token-family gate, this preserves
+    the under-suppression bias: a fallback miss costs one cycle of noise, never
+    a hidden finding.
+    """
+    stamped_uuid = flag.get('entity_uuid')
+    if isinstance(stamped_uuid, str) and stamped_uuid:
+        key = stamped_uuid.lower()
+        row = active_by_uuid.get(key)
+        if row is not None and flag.get('grounds') == row.flag_type:
+            return key
+
+    uuids = extract_flag_uuids(flag)
+    if len(uuids) == 1:
+        sole = next(iter(uuids))
+        row = active_by_uuid.get(sole)
+        if row is not None and _flag_type_in_grounds_family(
+            flag.get('flag_type'), row.flag_type
+        ):
+            return sole
+    return None
+
+
+def _index_active_standing_decisions(
+    rows: list[ReconLedgerRecord], project_id: str, now: str
+) -> dict[str, ReconLedgerRecord]:
+    """Index the ACTIVE standing-decision *rows* by lowercased ``entity_uuid``.
+
+    Two classes of row are dropped rather than indexed, each logged, because
+    suppressing on either would hide a finding on information this function
+    can see is unsound:
+
+    **TTL already lapsed** (``expires_at`` non-None and before *now*) — logged
+    INFO. ``state`` alone is not sufficient evidence that a decision is still
+    in force: the active→expired flip lives ONLY in ``ReconLedgerStore.gc()``,
+    whose sole caller is Stage 2's ``stages.task_knowledge_sync._gc_recon_markers``
+    — a different stage, running AFTER this one, which a deployment may skip
+    and whose gc pass may error. Trusting ``state`` alone would let a decision
+    past its 90-day TTL keep suppressing for at least one more cycle, and
+    indefinitely wherever that pass never runs, turning a deliberately
+    time-bounded hold into an unbounded one. The comparison is a plain string
+    ``<``, matching ``gc()``'s own semantics: both sides are the canonical
+    zero-padded UTC ISO-8601 form ``ReconLedgerRecord`` documents, so
+    lexicographic order is chronological order.
+
+    **Ambiguous entity** (more than one active row for one ``entity_uuid``) —
+    logged WARNING naming both grounds, and that entity suppresses NOTHING this
+    cycle. An entity can carry one row per grounds, so once ``GROUNDS_ENUM``
+    grows past its single seed value several can be ACTIVE at once. The shared
+    by-uuid lookup ``ReconLedgerStore.get_active_entity_standing_decision``
+    raises ``ValueError`` on exactly this state rather than picking one under an
+    unstated ordering; a plain ``{row.entity_uuid: row}`` comprehension here
+    would instead collapse them silently, last-row-wins in SELECT order — the
+    non-determinism that guard exists to prevent. Skipping is the fail-open
+    analogue of its raise: loud, deterministic, and under-suppressing.
+
+    Why γ indexes at all instead of calling that shared lookup per flag: Hook A
+    is a whole-batch filter, and one indexed read per cycle is what gives it the
+    same clean batch fail-open as :func:`filter_suppressed` (N per-flag queries
+    cannot fail as a unit mid-batch). INV-5's single source is α's ledger rows
+    and grounds constants, which both hooks read — not one Python call site.
+    """
+    by_uuid: dict[str, list[ReconLedgerRecord]] = {}
+    for row in rows:
+        if not row.entity_uuid:
+            continue
+        if row.expires_at is not None and row.expires_at < now:
+            logger.info(
+                'filter_entity_standing_decisions: skipping standing decision '
+                'entity_uuid=%s grounds=%s in project %s — still state=active but '
+                'expires_at=%s has lapsed (now=%s); the Stage-2 gc() TTL flip has '
+                'not run. Not suppressing on a lapsed decision.',
+                row.entity_uuid,
+                row.flag_type,
+                project_id,
+                row.expires_at,
+                now,
+            )
+            continue
+        by_uuid.setdefault(row.entity_uuid.lower(), []).append(row)
+
+    indexed: dict[str, ReconLedgerRecord] = {}
+    for entity_uuid, matches in by_uuid.items():
+        if len(matches) > 1:
+            logger.warning(
+                'filter_entity_standing_decisions: found more than one ACTIVE '
+                'entity_standing_decision for entity_uuid=%s in project %s '
+                '(grounds=%s) — suppressing nothing for that entity this cycle. '
+                'This lookup assumes at most one active grounds per entity; add an '
+                'explicit grounds argument before growing GROUNDS_ENUM past one '
+                'value (see ReconLedgerStore.get_active_entity_standing_decision).',
+                entity_uuid,
+                project_id,
+                sorted(match.flag_type for match in matches),
+            )
+            continue
+        indexed[entity_uuid] = matches[0]
+    return indexed
+
+
+async def filter_entity_standing_decisions(
+    memory_service: Any,
+    project_id: str,
+    flags: list[dict[str, Any]],
+    *,
+    now: str | None = None,
+) -> EntityStandingSuppressionResult:
+    """Drop recon flags already adjudicated by an ACTIVE ``entity_standing_decision``.
+
+    Hook A of the entity-standing-decision PRD (task 2896 γ). Does ONE indexed
+    ``recon_ledger.list_entity_standing_decisions(project_id, state=active)``
+    read per cycle, builds a ``{entity_uuid(lower): row}`` map, and suppresses
+    each flag matched by :func:`_match_entity_standing_decision`.
+
+    Whole-batch fail-open, mirroring :func:`filter_suppressed` exactly: when
+    *flags* is empty, or ``memory_service.recon_ledger`` is unset/``None``, or
+    the ledger read raises, NO suppression is applied this cycle (all flags
+    kept) — a ledger read failure must never hide a finding. The ledger-None
+    path logs DEBUG; the read-exception path logs WARNING. Those two ledger
+    fail-open returns carry ``suppression_evaluated=False``; the empty-flags
+    return does not (see :class:`EntityStandingSuppressionResult`).
+
+    A read row is not automatically a licence to suppress: rows whose TTL has
+    lapsed and entities carrying more than one active row are dropped from the
+    index (see :func:`_index_active_standing_decisions`). *now* — the
+    lapsed-TTL reference, a canonical UTC ISO-8601 string — defaults to
+    ``datetime.now(UTC).isoformat()``, the same spelling the β writer uses for
+    ``expires_at``, so the two are string-comparable; tests inject a fixed
+    value.
+
+    Returns an :class:`EntityStandingSuppressionResult`; the caller assigns
+    ``kept_flags`` back to ``items_flagged`` and reads ``suppressed_by_decision``
+    for the stat / storm escalation. Suppression is NOT resolution — the caller
+    excludes suppressed flags' signatures from marker acknowledgment so
+    recurrence history is preserved (see the consolidator wiring).
+    """
+    if not flags:
+        return EntityStandingSuppressionResult.empty_batch()
+
+    ledger = getattr(memory_service, 'recon_ledger', None)
+    if ledger is None:
+        logger.debug(
+            'filter_entity_standing_decisions: no recon_ledger on memory_service '
+            'for project %s; passing %d flag(s) through unfiltered',
+            project_id,
+            len(flags),
+        )
+        return EntityStandingSuppressionResult(
+            kept_flags=list(flags),
+            suppressed_by_decision={},
+            grounds_by_decision={},
+            suppression_evaluated=False,
+        )
+
+    try:
+        rows = await ledger.list_entity_standing_decisions(project_id, state=STATE_ACTIVE)
+    except Exception as e:
+        logger.warning(
+            'filter_entity_standing_decisions: recon_ledger.'
+            'list_entity_standing_decisions failed for project %s: %s (best-effort'
+            ' — treating as no standing decision in effect, passing %d flag(s)'
+            ' through unfiltered)',
+            project_id,
+            e,
+            len(flags),
+            exc_info=True,
+        )
+        return EntityStandingSuppressionResult(
+            kept_flags=list(flags),
+            suppressed_by_decision={},
+            grounds_by_decision={},
+            suppression_evaluated=False,
+        )
+
+    active_by_uuid = _index_active_standing_decisions(
+        rows, project_id, now if now is not None else datetime.now(UTC).isoformat()
+    )
+    if not active_by_uuid:
+        return EntityStandingSuppressionResult(
+            kept_flags=list(flags),
+            suppressed_by_decision={},
+            grounds_by_decision={},
+            suppression_evaluated=True,
+        )
+
+    kept: list[dict[str, Any]] = []
+    suppressed_by_decision: dict[str, int] = {}
+    grounds_by_decision: dict[str, str] = {}
+    for flag in flags:
+        matched_uuid = _match_entity_standing_decision(flag, active_by_uuid)
+        if matched_uuid is None:
+            kept.append(flag)
+            continue
+        row = active_by_uuid[matched_uuid]
+        suppressed_by_decision[matched_uuid] = suppressed_by_decision.get(matched_uuid, 0) + 1
+        grounds_by_decision[matched_uuid] = row.flag_type
+        logger.info(
+            'filter_entity_standing_decisions: suppressed flag_type=%r for project'
+            ' %s by active standing decision entity_uuid=%s grounds=%s',
+            flag.get('flag_type'),
+            project_id,
+            matched_uuid,
+            row.flag_type,
+        )
+
+    return EntityStandingSuppressionResult(
+        kept_flags=kept,
+        suppressed_by_decision=suppressed_by_decision,
+        grounds_by_decision=grounds_by_decision,
+        suppression_evaluated=True,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Deduped-against UUID extraction (task-2047 Gap 1)
 # --------------------------------------------------------------------------- #
 
@@ -929,21 +1378,10 @@ _MAX_DONE_FIX_TASK_SUPPRESSION_CYCLES: int = 8
 
 
 def _prior_done_suppression_count(prior_payload: Any) -> int:
-    """Read :data:`_DONE_SUPPRESSIONS_PAYLOAD_KEY` off a prior marker payload.
-
-    Returns 0 for anything that is not a positive ``int`` — an absent key (every
-    marker written before the task 4381 amendment), ``None``, a bool (``True``
-    is an ``int`` in Python and must not be read as the count 1), a string, or a
-    negative value.  Free-form JSON off a ledger row is never trusted for shape.
-
-    Pure, sync, no I/O — never raises.
-    """
-    if not isinstance(prior_payload, dict):
-        return 0
-    value = prior_payload.get(_DONE_SUPPRESSIONS_PAYLOAD_KEY)
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        return 0
-    return value
+    """Read :data:`_DONE_SUPPRESSIONS_PAYLOAD_KEY` off a prior marker payload;
+    0 when absent (every marker written before the task 4381 amendment) or
+    malformed."""
+    return nonnegative_int_from_payload(prior_payload, _DONE_SUPPRESSIONS_PAYLOAD_KEY)
 
 
 def _is_completion_flag(flag: dict[str, Any]) -> bool:
@@ -2501,7 +2939,7 @@ async def filter_terminal_metadata_flags(
     if not check_positions:
         return list(flags)
 
-    # Fails SAFE to None (KEEP the flag), NOT to _safe_get_task's error dict:
+    # Fails SAFE to None (KEEP the flag), NOT to safe_get_task's error dict:
     # this filter classifies a lookup by whether a task body came back.
     lookup_results: list[Any] = await asyncio.gather(
         *[
@@ -2782,7 +3220,7 @@ async def filter_false_absence_flags(
     async def _safe_get_task_for_root(task_id: Any) -> Any:
         """Fetch task with normalised exception handling, for THIS filter's root.
 
-        Delegates to the module-level :func:`_safe_get_task`, binding the
+        Delegates to the module-level :func:`safe_get_task`, binding the
         single fixed *project_root* this filter was called with (that binding
         is the only reason it remains a closure — task 4381 amendment
         superseded the former "keep the two in sync" NOTE by extracting the
@@ -2790,7 +3228,7 @@ async def filter_false_absence_flags(
         ``confirm_task_absent`` classifies can no longer drift between call
         sites).
         """
-        return await _safe_get_task(taskmaster, task_id, project_root)
+        return await safe_get_task(taskmaster, task_id, project_root)
 
     # Split flags into those requiring a get_task lookup and pass-throughs.
     # Track original position so the output list preserves input order.
@@ -3022,7 +3460,7 @@ _ABANDONED_TASK_STATUS_VALUES: frozenset[str] = frozenset(
 )
 
 
-async def _safe_get_task(taskmaster: Any, task_id: Any, project_root: str) -> Any:
+async def safe_get_task(taskmaster: Any, task_id: Any, project_root: str) -> Any:
     """Fetch ONE task with normalised exception handling.
 
     Returns the raw ``taskmaster.get_task`` result on success, or a normalised
@@ -3051,6 +3489,16 @@ async def _safe_get_task(taskmaster: Any, task_id: Any, project_root: str) -> An
     now survives — :func:`filter_false_absence_flags`' ``_safe_get_task_for_root``,
     which binds one fixed ``project_root`` for a whole filter and delegates
     here so the normalised shape cannot drift.
+
+    PUBLIC (no leading underscore) as of task 3051: the corroboration pass
+    :func:`~fused_memory.reconciliation.stages.task_knowledge_sync._corroborate_record_keys`
+    is a call site OUTSIDE this module, and one more private copy of the
+    normalised-exception shape is exactly what this helper exists to prevent.
+    Callers may rely on the contract pinned by
+    ``tests/test_flag_dedup.py::TestSafeGetTask``: the raw result through
+    untouched on success (task dict AND error dict alike), ANY exception
+    normalised to ``{'error': str(exc), 'error_type': type(exc).__name__}``,
+    and ``(task_id, project_root)`` forwarded positionally in that order.
     """
     try:
         return await taskmaster.get_task(task_id, project_root)
@@ -3067,7 +3515,7 @@ async def _safe_get_task_or_none(
 ) -> Any:
     """Fetch ONE task, failing SAFE to ``None`` and WARNing under *log_event*.
 
-    The sibling of :func:`_safe_get_task` for the filters that classify a
+    The sibling of :func:`safe_get_task` for the filters that classify a
     lookup by PRESENCE of a task body rather than by an error dict: a caller
     that cannot read a body cannot positively confirm anything, so it KEEPS the
     flag.  ``None`` says exactly that, where an ``{'error', 'error_type'}``
@@ -3315,11 +3763,11 @@ async def _resolve_live_cross_project_fix_task(
         pending[key] = (cited_task_id, root)
 
     if pending:
-        # PLAIN gather — _safe_get_task normalises every exception to an error
+        # PLAIN gather — safe_get_task normalises every exception to an error
         # dict (see tests/test_gather_convention_guard.py).
         fetched: list[Any] = await asyncio.gather(
             *(
-                _safe_get_task(taskmaster, cited_task_id, root)
+                safe_get_task(taskmaster, cited_task_id, root)
                 for cited_task_id, root in pending.values()
             )
         )
@@ -3468,7 +3916,7 @@ async def filter_false_phantom_task_creation_flags(
                 continue  # unresolvable project -> not corroborated -> skip lookup
             lookup_flag_indices.append(i)
             lookup_cited.append(cited)
-            lookup_coros.append(_safe_get_task(taskmaster, cited_task_id, root))
+            lookup_coros.append(safe_get_task(taskmaster, cited_task_id, root))
 
     if not lookup_coros:
         return list(flags)
@@ -4216,7 +4664,7 @@ async def _discover_foreign_fix_task_citations(
     not-found live-title read, and a missing/blank/non-``str`` live title all
     yield no citation for the affected candidate.
 
-    The live title is read back with :func:`_safe_get_task` rather than taken
+    The live title is read back with :func:`safe_get_task` rather than taken
     from the bulk listing, and a citation is only synthesised when that read
     positively confirms a titled record.  That is what makes a discovered
     citation corroborate BY CONSTRUCTION under
@@ -4387,7 +4835,7 @@ async def _discover_foreign_fix_task_citations(
             continue  # unresolvable project -> no citation (fail open)
         key = (str(match.project_id), str(match.task_id))
         if key not in get_task_cache:
-            get_task_cache[key] = await _safe_get_task(
+            get_task_cache[key] = await safe_get_task(
                 taskmaster, match.task_id, root,
             )
         live = get_task_cache[key]
@@ -5103,66 +5551,37 @@ async def filter_style_only_authorship_flags(
 # Accounted duplicate-cluster-growth guard (task-3476)
 # ---------------------------------------------------------------------------
 
-#: ``flag_type`` spellings OBSERVED on Stage-1 duplicate-cluster-growth findings
-#: (task 3476).  Deliberately NOT a closed set: these two are the spellings the
-#: run-df364849-21e9-4f54-b802-a126a49eba97 / finding-96a14765 incident actually
-#: produced, and ``flag_type`` is LLM-authored with no committed schema entry
-#: (``grep -rn cluster_growth fused-memory/`` returned zero hits before this
-#: change).  Kept as documentation and as the drift log's reference point;
-#: :func:`_is_cluster_growth_flag_type` also accepts unlisted spellings that
-#: carry both the ``cluster`` and ``growth`` tokens.
-CLUSTER_GROWTH_FLAG_TYPES: frozenset[str] = frozenset({
-    'procedural_knowledge_cluster_growth',
-    'duplicate_procedural_knowledge_cluster_growth',
-})
-
-#: Precomputed canonical-family keys for :data:`CLUSTER_GROWTH_FLAG_TYPES` so a
-#: reworded / reordered / re-cased LLM spelling of a KNOWN flag_type still
-#: matches (mirrors :data:`_STALE_BULK_GET_STATUSES_FAMILIES`).
-_CLUSTER_GROWTH_FAMILIES: frozenset[str] = frozenset(
-    canonical_flag_type_family(ft) for ft in CLUSTER_GROWTH_FLAG_TYPES
+#: The duplicate-cluster-growth finding (task 3476).  ``spellings`` are the two
+#: the run-df364849-21e9-4f54-b802-a126a49eba97 / finding-96a14765 incident
+#: produced; they are observed samples, not a closed set (``grep -rn
+#: cluster_growth fused-memory/`` returned zero hits before task 3476), so the
+#: family also admits any unseen spelling carrying both the ``cluster`` and
+#: ``growth`` tokens (``'mem0_duplicate_cluster_growth'``,
+#: ``'memory_cluster_growth_detected'``).
+#:
+#: That token arm is deliberately BROADER than the exact-family matching used
+#: by the sibling filters (:func:`filter_terminal_metadata_flags`,
+#: :func:`filter_stale_bulk_get_statuses_flags`,
+#: :func:`filter_style_only_authorship_flags`).  Over-matching is safe HERE in
+#: a way it is not for :func:`filter_suppressed`, whose family collisions can
+#: hide a genuinely-recurring finding for cycles: this family only ever admits
+#: a flag to :func:`filter_accounted_cluster_growth_flags`, which DROPS solely
+#: after positively confirming that EVERY cited memory UUID is already written
+#: into the referenced task's own description body.  A mis-classified
+#: flag_type can therefore only ever reclassify a finding that is, by
+#: construction, already accounted for -- never silence an unaccounted one.
+CLUSTER_GROWTH_FAMILY = FlagTypeFamily(
+    name='cluster_growth',
+    spellings=frozenset({
+        'procedural_knowledge_cluster_growth',
+        'duplicate_procedural_knowledge_cluster_growth',
+    }),
+    drift_token='cluster',
+    unseen_spelling_tokens=frozenset({'cluster', 'growth'}),
 )
 
 
-def _is_cluster_growth_flag_type(flag_type: Any) -> bool:
-    """True iff *flag_type* names a duplicate-cluster-growth finding (task 3476).
-
-    Two independent arms:
-
-    1. :func:`canonical_flag_type_family` membership in
-       :data:`_CLUSTER_GROWTH_FAMILIES` -- catches case, separator, whitespace
-       and word-order variants of a spelling we have actually seen.
-    2. The TOKEN PAIR test: the casefolded flag_type, tokenized with
-       :data:`_FLAG_TYPE_TOKEN_SPLIT_RE`, contains BOTH ``'cluster'`` and
-       ``'growth'`` -- catches spellings we have not seen
-       (``'mem0_duplicate_cluster_growth'``, ``'memory_cluster_growth_detected'``).
-
-    Arm 2 is deliberately BROADER than the exact-family-set matching used by
-    the sibling filters (:func:`filter_terminal_metadata_flags`,
-    :func:`filter_stale_bulk_get_statuses_flags`,
-    :func:`filter_style_only_authorship_flags`).  Over-matching is safe HERE in
-    a way it is not for :func:`filter_suppressed`, whose family collisions can
-    hide a genuinely-recurring finding for cycles: this predicate only ever
-    admits a flag to :func:`filter_accounted_cluster_growth_flags`, which DROPS
-    solely after positively confirming that EVERY cited memory UUID is already
-    written into the referenced task's own description body.  A mis-classified
-    flag_type can therefore only ever reclassify a finding that is, by
-    construction, already accounted for -- never silence an unaccounted one.
-
-    Total over malformed LLM-authored input: a non-``str`` (``None``, an int, a
-    list) returns ``False`` rather than raising.
-
-    Pure, sync, no I/O.
-    """
-    if not isinstance(flag_type, str) or not flag_type:
-        return False
-    if canonical_flag_type_family(flag_type) in _CLUSTER_GROWTH_FAMILIES:
-        return True
-    tokens = {t for t in _FLAG_TYPE_TOKEN_SPLIT_RE.split(flag_type.casefold()) if t}
-    return 'cluster' in tokens and 'growth' in tokens
-
-
-def _cluster_growth_cited_memory_ids(flag: dict[str, Any]) -> list[str]:
+def _flag_cited_memory_ids(flag: dict[str, Any]) -> list[str]:
     """Return the memory ids *flag* structurally cites, in citation order (task 3476).
 
     Reads ONLY ``flag['cited_memories'][].memory_id`` -- the schema-required,
@@ -5170,8 +5589,8 @@ def _cluster_growth_cited_memory_ids(flag: dict[str, Any]) -> list[str]:
     requires ``memory_id`` + ``store``; the ids are re-resolved by
     ``verify_cited_memories``).  Deliberately NOT a UUID regex over the
     finding's free text: Stage-1 prose routinely embeds NON-memory uuids (run
-    ids, finding ids, causation ids) that will never appear in a gate task's
-    cluster list, so a prose extractor would make the caller's all-present test
+    ids, finding ids, causation ids) that will never appear in the cited
+    task's text, so a prose extractor would make the caller's all-present test
     permanently unsatisfiable and the guard a silent no-op.
 
     Entries whose ``store`` is not ``'mem0'`` are INCLUDED, conservatively: an
@@ -5243,16 +5662,16 @@ def _is_discriminating_memory_id(memory_id: str) -> bool:
     )
 
 
-def _cluster_growth_unconfirmable_reason(
+def _accounting_unconfirmable_reason(
     memory_ids: list[str],
     task_ids: list[str],
 ) -> str | None:
-    """Why a cluster-growth flag cannot be confirmed accounted-for, or ``None``.
+    """Why a flag cannot be confirmed accounted-for in its task's text, or ``None``.
 
     ``None`` means the flag is a CANDIDATE: it cites something discriminating
     to look for and somewhere to look.  Every other result names a reason the
     guard must simply KEEP the flag, and exists to be LOGGED -- each is a way
-    :func:`filter_accounted_cluster_growth_flags` becomes a permanent silent
+    :func:`_drop_flags_accounted_in_task_text` becomes a permanent silent
     no-op that the drift log cannot see, because in all three the ``flag_type``
     matched perfectly well.
 
@@ -5270,7 +5689,7 @@ def _cluster_growth_unconfirmable_reason(
     return None
 
 
-def _cluster_growth_candidate_task_ids(flag: dict[str, Any]) -> list[str]:
+def _flag_candidate_task_ids(flag: dict[str, Any]) -> list[str]:
     """Return every task id *flag* points at, in resolution order (task 3476).
 
     Two channels, top-level first:
@@ -5316,6 +5735,156 @@ def _cluster_growth_candidate_task_ids(flag: dict[str, Any]) -> list[str]:
     return ids
 
 
+@dataclass(frozen=True)
+class _TaskTextAccountingGate:
+    """One flag family whose findings are moot once their task's live text records them.
+
+    Consumed by :func:`_drop_flags_accounted_in_task_text`.  Each field is one
+    way the gates built on it differ: which flags are candidates, which task
+    text is read, and the full name of each event the gate logs.
+    """
+
+    family: FlagTypeFamily
+    task_text: Callable[[dict[str, Any]], str]
+    drift_event: str
+    unconfirmable_event: str
+    get_task_error_event: str
+    dropped_event: str
+
+
+async def _drop_flags_accounted_in_task_text(
+    gate: _TaskTextAccountingGate,
+    taskmaster: Any,
+    project_root: str,
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop each *gate* candidate that ONE cited task's live text fully accounts for.
+
+    The shared mechanism of :func:`filter_accounted_cluster_growth_flags` and
+    :func:`filter_already_recorded_caveat_flags`; their docstrings own each
+    gate's rationale.  A candidate (family match, at least one cited memory id,
+    every one discriminating, at least one task id) is DROPPED iff some single
+    task's ``gate.task_text`` contains every cited id, case-insensitively.
+    Every other outcome KEEPS it.  Each distinct task id is looked up once per
+    call, and a batch with no candidates does no I/O.
+    """
+    if not taskmaster or not project_root:
+        # Degrade to a no-op pass-through -- mirrors filter_terminal_metadata_flags
+        # / filter_style_only_authorship_flags.  No text is readable, so nothing
+        # can be positively confirmed accounted for.
+        return list(flags)
+
+    candidate_positions: list[int] = []
+    cited_by_pos: dict[int, list[str]] = {}
+    task_ids_by_pos: dict[int, list[str]] = {}
+    unconfirmable: list[str] = []
+
+    for i, flag in enumerate(flags):
+        flag_type = flag.get('flag_type')
+        if not gate.family.matches(flag_type):
+            continue
+        memory_ids = _flag_cited_memory_ids(flag)
+        task_ids = _flag_candidate_task_ids(flag)
+        reason = _accounting_unconfirmable_reason(memory_ids, task_ids)
+        if reason is not None:
+            unconfirmable.append(
+                f'{reason} flag_type={flag_type} task_id={flag.get("task_id")}'
+            )
+            continue
+        candidate_positions.append(i)
+        cited_by_pos[i] = memory_ids
+        task_ids_by_pos[i] = task_ids
+
+    gate.family.log_drift(flags, log_event=gate.drift_event)
+
+    # The drift log above sees only ONE of the ways this guard goes silently
+    # no-op.  A flag whose flag_type matched perfectly well but that cites
+    # nothing usable is invisible to it, and if the family ever settles into
+    # putting the UUID only in prose (which this module deliberately refuses to
+    # parse) the guard is permanently ineffective with nothing in the logs
+    # saying so.  Same aggregate-per-call shape as the drift log.
+    if unconfirmable:
+        logger.info(
+            '%s skipped=%s — flag_type matched but the finding carries nothing '
+            'to confirm against; these flags are KEPT',
+            gate.unconfirmable_event,
+            unconfirmable,
+        )
+
+    if not candidate_positions:
+        # No candidates at all — skip every lookup, so a normal cycle (in which
+        # this family is rare) does zero I/O.
+        return list(flags)
+
+    # Resolve each distinct task id exactly ONCE per call, however many flags
+    # in the batch cite it.
+    wanted_task_ids: list[str] = []
+    seen_task_ids: set[str] = set()
+    for i in candidate_positions:
+        for tid in task_ids_by_pos[i]:
+            if tid not in seen_task_ids:
+                seen_task_ids.add(tid)
+                wanted_task_ids.append(tid)
+
+    # Fails SAFE to None (KEEP the flag), NOT to safe_get_task's error dict:
+    # a task whose text is unreadable can neither confirm a drop nor veto one.
+    lookup_results: list[Any] = await asyncio.gather(
+        *[
+            _safe_get_task_or_none(
+                taskmaster,
+                tid,
+                project_root,
+                log_event=gate.get_task_error_event,
+            )
+            for tid in wanted_task_ids
+        ]
+    )
+    text_by_task: dict[str, str] = {}
+    for tid, result in zip(wanted_task_ids, lookup_results, strict=True):
+        if not isinstance(result, dict):
+            continue
+        text_by_task[tid] = gate.task_text(result).casefold()
+
+    kept: list[dict[str, Any]] = []
+    for i, flag in enumerate(flags):
+        if i not in cited_by_pos:
+            kept.append(flag)
+            continue
+        memory_ids = [m.casefold() for m in cited_by_pos[i]]
+        matched_task_id = next(
+            (
+                tid
+                for tid in task_ids_by_pos[i]
+                if tid in text_by_task
+                and all(uid in text_by_task[tid] for uid in memory_ids)
+            ),
+            None,
+        )
+        if matched_task_id is None:
+            kept.append(flag)
+            continue
+        logger.info(
+            '%s task_id=%s matched_task_id=%s memory_ids=%s',
+            gate.dropped_event, flag.get('task_id'), matched_task_id, cited_by_pos[i],
+        )
+    return kept
+
+
+def _task_body_text(record: dict[str, Any]) -> str:
+    """A task's ``description`` and ``details``, newline-joined."""
+    return f"{record.get('description') or ''}\n{record.get('details') or ''}"
+
+
+_CLUSTER_GROWTH_ACCOUNTING_GATE = _TaskTextAccountingGate(
+    family=CLUSTER_GROWTH_FAMILY,
+    task_text=_task_body_text,
+    drift_event='reconciliation.accounted_cluster_growth_filter_possible_drift',
+    unconfirmable_event='reconciliation.accounted_cluster_growth_filter_unconfirmable_candidates',
+    get_task_error_event='reconciliation.accounted_cluster_growth_filter_get_task_error',
+    dropped_event='reconciliation.accounted_cluster_growth_flag_dropped',
+)
+
+
 async def filter_accounted_cluster_growth_flags(
     taskmaster: Any,
     project_root: str,
@@ -5339,7 +5908,7 @@ async def filter_accounted_cluster_growth_flags(
     test is ``description`` + ``details``.
 
     **The drop rule.**  A flag is a CANDIDATE iff
-    :func:`_is_cluster_growth_flag_type` accepts its ``flag_type`` AND it cites
+    :data:`CLUSTER_GROWTH_FAMILY` matches its ``flag_type`` AND it cites
     at least one memory id, EVERY one of them discriminating
     (:func:`_is_discriminating_memory_id`), AND at least one task id resolves.
     A candidate is DROPPED iff SOME single candidate task's current body
@@ -5383,124 +5952,78 @@ async def filter_accounted_cluster_growth_flags(
         A new list, in input order, with accounted-for growth flags removed.
         The input list is never mutated and surviving flags are unmodified.
     """
-    if not taskmaster or not project_root:
-        # Degrade to a no-op pass-through -- mirrors filter_terminal_metadata_flags
-        # / filter_style_only_authorship_flags.  No body is readable, so nothing
-        # can be positively confirmed accounted for.
-        return list(flags)
-
-    candidate_positions: list[int] = []
-    cited_by_pos: dict[int, list[str]] = {}
-    task_ids_by_pos: dict[int, list[str]] = {}
-    unconfirmable: list[str] = []
-
-    for i, flag in enumerate(flags):
-        flag_type = flag.get('flag_type')
-        if not _is_cluster_growth_flag_type(flag_type):
-            continue
-        memory_ids = _cluster_growth_cited_memory_ids(flag)
-        task_ids = _cluster_growth_candidate_task_ids(flag)
-        reason = _cluster_growth_unconfirmable_reason(memory_ids, task_ids)
-        if reason is not None:
-            unconfirmable.append(
-                f'{reason} flag_type={flag_type} task_id={flag.get("task_id")}'
-            )
-            continue
-        candidate_positions.append(i)
-        cited_by_pos[i] = memory_ids
-        task_ids_by_pos[i] = task_ids
-
-    # Detect potential LLM naming drift: flag_type strings that look like this
-    # family (contain 'cluster') but that _is_cluster_growth_flag_type does not
-    # match.  flag_type has no committed schema entry, so an unrecognised
-    # spelling would silently make the guard a no-op; this log makes that
-    # observable (the filter_terminal_metadata_flags drift-log precedent).
-    drift_candidates = [
-        ft
-        for flag in flags
-        if isinstance(ft := flag.get('flag_type'), str)
-        and 'cluster' in ft.casefold()
-        and not _is_cluster_growth_flag_type(ft)
-    ]
-    if drift_candidates:
-        logger.info(
-            'reconciliation.accounted_cluster_growth_filter_possible_drift '
-            'unmatched_flag_types=%s known_types=%s '
-            '— update CLUSTER_GROWTH_FLAG_TYPES if drift confirmed',
-            drift_candidates,
-            sorted(CLUSTER_GROWTH_FLAG_TYPES),
-        )
-
-    # The drift log above sees only ONE of the ways this guard goes silently
-    # no-op.  A flag whose flag_type matched perfectly well but that cites
-    # nothing usable is invisible to it, and if the family ever settles into
-    # putting the UUID only in prose (which this module deliberately refuses to
-    # parse) the guard is permanently ineffective with nothing in the logs
-    # saying so.  Same aggregate-per-call shape as the drift log.
-    if unconfirmable:
-        logger.info(
-            'reconciliation.accounted_cluster_growth_filter_unconfirmable_candidates '
-            'skipped=%s — flag_type matched but the finding carries nothing to '
-            'confirm against; these flags are KEPT',
-            unconfirmable,
-        )
-
-    if not candidate_positions:
-        # No candidates at all — skip every lookup, so a normal cycle (in which
-        # this family is rare) does zero I/O.
-        return list(flags)
-
-    # Resolve each distinct task id exactly ONCE per call, however many flags
-    # in the batch cite it.
-    wanted_task_ids: list[str] = []
-    seen_task_ids: set[str] = set()
-    for i in candidate_positions:
-        for tid in task_ids_by_pos[i]:
-            if tid not in seen_task_ids:
-                seen_task_ids.add(tid)
-                wanted_task_ids.append(tid)
-
-    # Fails SAFE to None (KEEP the flag), NOT to _safe_get_task's error dict:
-    # a task whose body is unreadable can neither confirm a drop nor veto one.
-    lookup_results: list[Any] = await asyncio.gather(
-        *[
-            _safe_get_task_or_none(
-                taskmaster,
-                tid,
-                project_root,
-                log_event='reconciliation.accounted_cluster_growth_filter_get_task_error',
-            )
-            for tid in wanted_task_ids
-        ]
+    return await _drop_flags_accounted_in_task_text(
+        _CLUSTER_GROWTH_ACCOUNTING_GATE, taskmaster, project_root, flags,
     )
-    body_by_task: dict[str, str] = {}
-    for tid, result in zip(wanted_task_ids, lookup_results, strict=True):
-        if not isinstance(result, dict):
-            continue
-        body = f"{result.get('description') or ''}\n{result.get('details') or ''}"
-        body_by_task[tid] = body.casefold()
 
-    kept: list[dict[str, Any]] = []
-    for i, flag in enumerate(flags):
-        if i not in cited_by_pos:
-            kept.append(flag)
-            continue
-        memory_ids = [m.casefold() for m in cited_by_pos[i]]
-        matched_task_id = next(
-            (
-                tid
-                for tid in task_ids_by_pos[i]
-                if tid in body_by_task
-                and all(uid in body_by_task[tid] for uid in memory_ids)
-            ),
-            None,
-        )
-        if matched_task_id is None:
-            kept.append(flag)
-            continue
-        logger.info(
-            'reconciliation.accounted_cluster_growth_flag_dropped '
-            'task_id=%s matched_task_id=%s memory_ids=%s',
-            flag.get('task_id'), matched_task_id, cited_by_pos[i],
-        )
-    return kept
+
+# ---------------------------------------------------------------------------
+# Already-recorded caveat guard (task 5271)
+# ---------------------------------------------------------------------------
+
+#: The Stage-1 "task N's metadata still lacks the evidence caveat" finding, as
+#: spelled in pump_web_ui run e8913eb1, finding 3b15dd73.
+PREMATURE_WIDENING_CAVEAT_FAMILY = FlagTypeFamily(
+    name='premature_widening_caveat',
+    spellings=frozenset({'premature_widening_evidence_caveat'}),
+    drift_token='caveat',
+)
+
+
+def _task_metadata_text(record: dict[str, Any]) -> str:
+    """Every ``str`` value under *record*'s ``metadata``, newline-joined (``''`` if none)."""
+    parts: list[str] = []
+    _collect_str_values(record.get('metadata'), parts)
+    return '\n'.join(parts)
+
+
+_ALREADY_RECORDED_CAVEAT_GATE = _TaskTextAccountingGate(
+    family=PREMATURE_WIDENING_CAVEAT_FAMILY,
+    task_text=_task_metadata_text,
+    drift_event='reconciliation.already_recorded_caveat_filter_possible_drift',
+    unconfirmable_event='reconciliation.already_recorded_caveat_filter_unconfirmable_candidates',
+    get_task_error_event='reconciliation.already_recorded_caveat_filter_get_task_error',
+    dropped_event='reconciliation.already_recorded_caveat_flag_dropped',
+)
+
+
+async def filter_already_recorded_caveat_flags(
+    taskmaster: Any,
+    project_root: str,
+    flags: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop premature-widening-caveat flags whose caveat the task's live metadata records.
+
+    A Mem0 memory's "caveat still needs appending" clause stays true only
+    until the caveat lands, yet Stage 1 kept re-flagging task 18 from it after
+    its ``metadata.memory_hints`` already carried the caveat (pump_web_ui run
+    e8913eb1, finding 3b15dd73).  A flag is DROPPED iff some cited task's
+    CURRENT ``metadata`` (every ``str`` value beneath it) contains EVERY memory
+    id the flag cites, each one discriminating.  The live entry paraphrases
+    its source memory, so the id is matched, not the caveat text.  Only
+    ``metadata`` is scanned, because the finding claims ``metadata`` lacks the
+    caveat.  Task ids resolve in the running *project_root* only, which is safe
+    because a Mem0 UUID is globally unique: a colliding id can only fail the
+    match.
+
+    **Fail direction is KEEP** on any erroring or inconclusive ``get_task``,
+    deliberately the opposite of the fail-closed
+    :func:`filter_false_absence_flags`.  That sibling guards an irreversible
+    ``delete_memory``; here a wrong KEEP costs one extra cycle, while a wrong
+    DROP would silence a genuinely missing caveat on every cycle.
+
+    **Known false-drop shape.**  The id's presence is taken as proof that the
+    caveat landed; the caveat itself is never read.  A task whose metadata
+    already named the caveat-source memory for another reason, such as being
+    filed from it before the caveat was written, is dropped on every cycle
+    even though the caveat is missing.  Only prose distinguishes the two
+    entries, and metadata entries carry no timestamp to compare with the
+    memory's ``created_at``, so the shape is accepted rather than parsed out.
+
+    Shares its drop rule with :func:`filter_accounted_cluster_growth_flags`
+    via :func:`_drop_flags_accounted_in_task_text`.  Returns a new list in
+    input order; the input list and surviving flags are never mutated.
+    """
+    return await _drop_flags_accounted_in_task_text(
+        _ALREADY_RECORDED_CAVEAT_GATE, taskmaster, project_root, flags,
+    )

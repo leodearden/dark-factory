@@ -53,8 +53,7 @@ from __future__ import annotations
 
 import ast
 import logging
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 # markup_override_requested / strip_markup_override are RE-EXPORTS, not local
 # callers: server/tools.py imports both from this module (the write-path guards
@@ -67,20 +66,7 @@ from shared.toolcall_markup import (  # noqa: F401
     strip_markup_override,
 )
 
-if TYPE_CHECKING:
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped]
-
-# Defensive import of the optional ``escalation`` workspace package, mirroring
-# middleware/candidate_key_escalation.py: when it is missing (minimal CI envs,
-# deployments that have not installed it) the storm escalation becomes a logged
-# no-op. This module sits on the MCP write path, so it must never make a write
-# fail — the rejection is already decided by the time escalation is attempted.
-try:
-    from escalation.models import Escalation  # type: ignore[import-untyped]
-    from escalation.queue import EscalationQueue  # type: ignore[import-untyped,no-redef]
-    HAS_ESCALATION = True
-except ImportError:  # pragma: no cover — exercised only in minimal envs
-    HAS_ESCALATION = False
+from fused_memory.middleware._folded_escalation import file_folded_escalation
 
 logger = logging.getLogger(__name__)
 
@@ -127,11 +113,10 @@ logger = logging.getLogger(__name__)
 _MARKUP_STORM_THRESHOLD = 3
 _MARKUP_STORM_WINDOW_SECONDS = 3600.0
 
-# Escalation wiring, copied shape-for-shape from
-# middleware/candidate_key_escalation.py. _ANCHOR_TASK_ID is a stable per-project
-# anchor (not a real task id) so the resulting ids form one greppable
-# ``esc-markup-tripwire-N`` series and the dedup check has something to key on.
-_QUEUE_DIRNAME: str = 'data/escalations'
+# Escalation wiring. _ANCHOR_TASK_ID is a stable per-project anchor (not a real
+# task id) so the resulting ids form one greppable ``esc-markup-tripwire-N``
+# series and the dedup check has something to key on. Anchors must be unique
+# across filers — see the ``middleware/_folded_escalation`` module docstring.
 _ANCHOR_TASK_ID: str = 'markup-tripwire'
 _AGENT_ROLE: str = 'fused-memory/markup-tripwire'
 _CATEGORY: str = 'mcp_markup_write_storm'
@@ -294,30 +279,6 @@ def emit_markup_storm_escalation(
     one (INV-5). The default is unchanged, so every existing caller behaves
     identically.
     """
-    if project_root is None:
-        logger.debug(
-            'markup_tripwire: no project_root resolved; storm %r will not be escalated',
-            storm,
-        )
-        return None
-    if not HAS_ESCALATION:
-        logger.debug(
-            'markup_tripwire: escalation package unavailable; storm %r in '
-            'project_root=%r will not be escalated',
-            storm, project_root,
-        )
-        return None
-
-    try:
-        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
-    except Exception:
-        logger.exception(
-            'markup_tripwire: failed to open the escalation queue for '
-            'project_root=%r; storm %r not escalated',
-            project_root, storm,
-        )
-        return None
-
     count = storm.get('count')
     window_seconds = storm.get('window_seconds')
     # isinstance-guarded rather than truthy-cast, for the reason the middleware
@@ -331,25 +292,14 @@ def emit_markup_storm_escalation(
     outcome = storm.get('outcome')
     outcome = outcome if isinstance(outcome, str) and outcome else None
 
-    # Best-effort dedup: a read failure falls THROUGH to filing rather than
-    # bailing out — losing duplicate-suppression is strictly better than losing
-    # the alarm for an actively running leak.
-    try:
-        existing = queue.get_by_task(anchor_task_id, status='pending')
-    except Exception:
-        logger.exception(
-            'markup_tripwire: failed to check for an existing open escalation '
-            'for project_root=%r; proceeding to file a new one',
-            project_root,
-        )
-        existing = []
-    if existing:
-        open_outcome = _recorded_outcome(existing[0])
+    def _on_fold(existing: Any) -> None:
+        """Log the fold, comparing this burst's outcome with the open record's."""
+        open_outcome = _recorded_outcome(existing)
         if open_outcome == outcome:
             logger.info(
                 'markup_tripwire: %s already open for project_root=%r (storm %r now); '
                 'not filing a duplicate',
-                existing[0].id, project_root, storm,
+                existing.id, project_root, storm,
             )
         else:
             # ERROR, not info: the queue is about to say nothing at all about
@@ -362,10 +312,10 @@ def emit_markup_storm_escalation(
                 'for project_root=%r naming outcome=%r, so this %r burst of %r '
                 'write(s) in %rs gets no record of its own; resolve that escalation '
                 'to let the next burst file. storm=%r',
-                existing[0].id, project_root, open_outcome, outcome, count,
+                existing.id, project_root, open_outcome, outcome, count,
                 window_seconds, storm,
             )
-        return existing[0].id
+
     # Conditional, because the sentence it feeds points AT the outcome line:
     # with no outcome measured that line reads `outcome=None`, and telling the
     # triager it "names what the guard did" points them at a value that names
@@ -458,64 +408,50 @@ def emit_markup_storm_escalation(
         'not against 3083.',
     ])
 
-    try:
-        esc = Escalation(  # type: ignore[possibly-unbound]
-            id=queue.make_id(anchor_task_id),
-            task_id=anchor_task_id,
-            agent_role=_AGENT_ROLE,
-            severity='blocking',
-            category=_CATEGORY,
-            # The summary is the ONLY field a compact consumer is projected
-            # besides suggested_action (see the docstring's compact-tier note),
-            # so it has to answer how many, of what, and for whom on its own.
-            summary=(
-                f'{count} MCP write(s) {outcome or "flagged"} for leaked '
-                f'envelope markup in this project in {window_seconds}s '
-                '(the FIRST burst observed; later bursts of any outcome fold '
-                'into this record until it is resolved) — serialization leak '
-                'active (see plans/toolcall-markup-containment-prd.md)'
-            ),
-            detail=detail,
-            # Compact-projected BESIDE the summary, so the outcome-fidelity
-            # rule and the live-grep-token rule both bind here — the docstring
-            # states both once. STATIC, never interpolated with the resolved
-            # outcome: an operator-facing hint whose text varies with the data
-            # cannot be grepped without already knowing the answer, and an
-            # unmeasured outcome would render `markup guard: None`.
-            suggested_action=(
-                'read the caller off this record: the detail names '
-                'crossing_agent_id, crossing_subject_task_id and '
-                'crossing_subject_agent_role for the call that crossed the '
-                'threshold, and callers for every distinct caller seen in the '
-                'window — then report it against '
-                'plans/toolcall-markup-containment-prd.md — DF task '
-                '3083 is done and closed to appends. The guard also logs each '
-                "event (grep 'markup_guard_storm' for the burst and 'markup "
-                "guard:' for the individual calls), but treat that as OPTIONAL "
-                'corroboration: a per-agent stdio server\'s stderr is consumed '
-                'by the spawning CLI and never reaches journald at all, and '
-                'journald --user retention on this host is roughly 72h while '
-                'these records are routinely read days later'
-            ),
-            level=1,
-        )
-        esc_id = queue.submit(esc)
-    except Exception:
-        # A queue I/O failure must not propagate: the write has already been
-        # rejected, and the ERROR log at the call site has already recorded the
-        # burst. The operator simply loses the queued heads-up.
-        logger.exception(
-            'markup_tripwire: failed to submit storm escalation for '
-            'project_root=%r (storm %r)',
-            project_root, storm,
-        )
-        return None
-
-    logger.warning(
-        'markup_tripwire: queued %s for project_root=%r (storm %r)',
-        esc_id, project_root, storm,
+    return file_folded_escalation(
+        project_root,
+        anchor_task_id=anchor_task_id,
+        agent_role=_AGENT_ROLE,
+        category=_CATEGORY,
+        severity='blocking',
+        # The summary is the ONLY field a compact consumer is projected
+        # besides suggested_action (see the docstring's compact-tier note),
+        # so it has to answer how many, of what, and for whom on its own.
+        summary=(
+            f'{count} MCP write(s) {outcome or "flagged"} for leaked '
+            f'envelope markup in this project in {window_seconds}s '
+            '(the FIRST burst observed; later bursts of any outcome fold '
+            'into this record until it is resolved) — serialization leak '
+            'active (see plans/toolcall-markup-containment-prd.md)'
+        ),
+        detail=detail,
+        # Compact-projected BESIDE the summary, so the outcome-fidelity
+        # rule and the live-grep-token rule both bind here — the docstring
+        # states both once. STATIC, never interpolated with the resolved
+        # outcome: an operator-facing hint whose text varies with the data
+        # cannot be grepped without already knowing the answer, and an
+        # unmeasured outcome would render `markup guard: None`.
+        suggested_action=(
+            'read the caller off this record: the detail names '
+            'crossing_agent_id, crossing_subject_task_id and '
+            'crossing_subject_agent_role for the call that crossed the '
+            'threshold, and callers for every distinct caller seen in the '
+            'window — then report it against '
+            'plans/toolcall-markup-containment-prd.md — DF task '
+            '3083 is done and closed to appends. The guard also logs each '
+            "event (grep 'markup_guard_storm' for the burst and 'markup "
+            "guard:' for the individual calls), but treat that as OPTIONAL "
+            'corroboration: a per-agent stdio server\'s stderr is consumed '
+            'by the spawning CLI and never reaches journald at all, and '
+            'journald --user retention on this host is roughly 72h while '
+            'these records are routinely read days later'
+        ),
+        logger=logger,
+        log_label='markup_tripwire',
+        context=f'storm {storm!r}',
+        level=1,
+        on_fold=_on_fold,
     )
-    return esc_id
 
 
 def emit_markup_residue_escalation(
@@ -555,30 +491,6 @@ def emit_markup_residue_escalation(
     decided by the time this runs, so every failure mode degrades to ``None``
     plus a log line rather than changing the call's outcome.
     """
-    if project_root is None:
-        logger.debug(
-            'markup_tripwire: no project_root resolved; residue %r will not be filed',
-            record.get('tool'),
-        )
-        return None
-    if not HAS_ESCALATION:
-        logger.debug(
-            'markup_tripwire: escalation package unavailable; residue of %r in '
-            'project_root=%r will not be filed',
-            record.get('tool'), project_root,
-        )
-        return None
-
-    try:
-        queue = EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)
-    except Exception:
-        logger.exception(
-            'markup_tripwire: failed to open the escalation queue for '
-            'project_root=%r; residue of %r not filed',
-            project_root, record.get('tool'),
-        )
-        return None
-
     raw_value = record.get('raw_value')
     detail = '\n'.join([
         f'tool={record.get("tool")!r}',
@@ -604,35 +516,24 @@ def emit_markup_residue_escalation(
         str(raw_value),
     ])
 
-    try:
-        esc = Escalation(  # type: ignore[possibly-unbound]
-            id=queue.make_id(anchor_task_id),
-            task_id=anchor_task_id,
-            agent_role=_RESIDUE_AGENT_ROLE,
-            severity='blocking',
-            category=str(record.get('category') or _RESIDUE_CATEGORY),
-            summary=str(
-                record.get('summary')
-                or f'Unrepairable MCP envelope markup in {record.get("tool")}'
-            ),
-            detail=detail,
-            suggested_action=str(record.get('suggested_action') or ''),
-            level=int(record.get('level') or _RESIDUE_LEVEL),
-        )
-        esc_id = queue.submit(esc)
-    except Exception:
-        logger.exception(
-            'markup_tripwire: failed to submit the residue escalation for '
-            'project_root=%r (tool=%r field=%r); the payload survives only in '
-            'the caller-facing log line',
-            project_root, record.get('tool'), record.get('field'),
-        )
-        return None
-
-    logger.warning(
-        'markup_tripwire: queued %s holding the unrepairable payload of %s.%s '
-        '(%d chars) for project_root=%r',
-        esc_id, record.get('tool'), record.get('field'),
-        len(raw_value or ''), project_root,
+    return file_folded_escalation(
+        project_root,
+        anchor_task_id=anchor_task_id,
+        agent_role=_RESIDUE_AGENT_ROLE,
+        category=str(record.get('category') or _RESIDUE_CATEGORY),
+        severity='blocking',
+        summary=str(
+            record.get('summary')
+            or f'Unrepairable MCP envelope markup in {record.get("tool")}'
+        ),
+        detail=detail,
+        suggested_action=str(record.get('suggested_action') or ''),
+        logger=logger,
+        log_label='markup_tripwire',
+        context=(
+            f'the unrepairable payload of {record.get("tool")}.'
+            f'{record.get("field")} ({len(raw_value or "")} chars)'
+        ),
+        level=int(record.get('level') or _RESIDUE_LEVEL),
+        dedupe=False,
     )
-    return esc_id

@@ -18,6 +18,7 @@ from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_queue_doubles import ResolvingMergeQueue
 from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
@@ -62,6 +63,7 @@ def _make(
     metadata: dict | None = None,
     tasks_by_train_return: list[dict] | None = None,
     get_statuses_return: tuple[dict[str, str], Exception | None] | None = None,
+    merge_outcome: MergeOutcome | None = None,
 ) -> _Fixture:
     assignment = MagicMock()
     assignment.task_id = task_id
@@ -118,7 +120,7 @@ def _make(
     esc_queue.submit = MagicMock()
     esc_queue.get_by_task = MagicMock(return_value=[])
 
-    merge_queue: asyncio.Queue = asyncio.Queue()
+    merge_queue: asyncio.Queue = ResolvingMergeQueue(merge_outcome)
 
     wf = TaskWorkflow(
         assignment=assignment,
@@ -188,7 +190,7 @@ class TestDetectionWiring:
             reason=f'{TRAIN_VERIFY_FAILED_REASON_PREFIX}: 3 tests failed',
             failure_category='cargo_test',
         )
-        f.wf._await_cancellable = AsyncMock(return_value=tagged_outcome)  # type: ignore[method-assign]
+        f.merge_queue.outcome = tagged_outcome  # type: ignore[attr-defined]
 
         attr_mock = AsyncMock(return_value=WorkflowOutcome.DONE)
         f.wf._attribute_train_failure = attr_mock  # type: ignore[method-assign]
@@ -223,14 +225,10 @@ class TestDetectionWiring:
             tasks_by_train_return=members,
         )
 
-        other_outcome = MergeOutcome(
+        f.merge_queue.outcome = MergeOutcome(  # type: ignore[attr-defined]
             'blocked',
             reason='Train merge advance failed: cas_failed',
         )
-        f.wf._await_cancellable = AsyncMock(return_value=other_outcome)  # type: ignore[method-assign]
-
-        attr_mock = AsyncMock(return_value=WorkflowOutcome.DONE)
-        f.wf._attribute_train_failure = attr_mock  # type: ignore[method-assign]
 
         # Add a fake merge_worker with is_wip_halted=False so the orphan-halt
         # probe doesn't fire (we want to confirm _mark_blocked is the fallback)
@@ -241,8 +239,10 @@ class TestDetectionWiring:
 
         await f.wf._maybe_enqueue_group_merge()
 
-        # _attribute_train_failure must NOT be called
-        attr_mock.assert_not_awaited()
+        # Attribution must NOT have run: materialize_member_solo is the first
+        # thing it does for every member (workflow.py::_reverify_one_member), so
+        # zero calls is the public observation that the tagged branch was not taken.
+        f.git_ops.materialize_member_solo.assert_not_called()
         # _mark_blocked IS called
         f.mark_blocked.assert_awaited_once()
 
@@ -257,19 +257,17 @@ class TestDetectionWiring:
             tasks_by_train_return=members,
         )
 
-        incomplete_outcome = MergeOutcome(
+        f.merge_queue.outcome = MergeOutcome(  # type: ignore[attr-defined]
             'blocked',
             reason=f'{TRAIN_INCOMPLETE_REASON_PREFIX}: member 101 is in-progress',
         )
-        f.wf._await_cancellable = AsyncMock(return_value=incomplete_outcome)  # type: ignore[method-assign]
-
-        attr_mock = AsyncMock(return_value=WorkflowOutcome.DONE)
-        f.wf._attribute_train_failure = attr_mock  # type: ignore[method-assign]
 
         result = await f.wf._maybe_enqueue_group_merge()
 
         assert result is None, f'train_incomplete should return None (park), got {result!r}'
-        attr_mock.assert_not_awaited()
+        # Neither attribution nor blocking ran — see the untagged test above for
+        # why materialize_member_solo is attribution's public tell.
+        f.git_ops.materialize_member_solo.assert_not_called()
         f.mark_blocked.assert_not_awaited()
 
 
@@ -600,22 +598,28 @@ class TestSomeFailAttribution:
         )
 
     async def test_exactly_n_solo_verifies(self) -> None:
-        """_reverify_one_member called exactly N=3 times (≤N+1 bound)."""
+        """Exactly N=3 solo verifies are attempted (≤N+1 bound), root→tip.
+
+        Observed on the real per-member ``git_ops.materialize_member_solo``
+        call rather than on a stubbed ``_reverify_one_member``: that call is
+        the first thing each solo verify does, and returning ``None`` from it
+        is the production "un-stackable" verdict, so all three members become
+        failers without any solo verify actually running.  The predecessor refs
+        additionally pin the root→tip stacking order.
+        """
         f = self._three_member_fixture()
         members = _train_members(train_id='T-bound', tip_id='103')
-        reverify_mock = AsyncMock(side_effect=[
-            _solo_fail('101'),
-            _solo_pass_wt('102'),
-            _solo_pass_wt('103'),
-        ])
-        f.wf._reverify_one_member = reverify_mock  # type: ignore[method-assign]
+        f.git_ops.materialize_member_solo = AsyncMock(return_value=None)
         f.wf.event_store = MagicMock()
 
         tagged = _make_tagged_result()
         await f.wf._attribute_train_failure(tagged, 'T-bound', members)
 
-        assert reverify_mock.await_count == 3, (
-            f'Expected exactly 3 _reverify_one_member calls, got {reverify_mock.await_count}'
+        solo_calls = [
+            tuple(c.args) for c in f.git_ops.materialize_member_solo.await_args_list
+        ]
+        assert solo_calls == [('101', 'main'), ('102', 'task/101'), ('103', 'task/102')], (
+            f'Expected exactly 3 solo verifies root→tip, got {solo_calls!r}'
         )
 
 

@@ -2132,3 +2132,267 @@ class TestRecoveryShapeStr:
         from orchestrator.task_ground_truth import _shape, recovery_shape_str
 
         assert recovery_shape_str(report) == render_shape(*_shape(report))
+
+
+# ---------------------------------------------------------------------------
+# task 3541 (eta) — the resolver seam becomes PIN-CLASS-AWARE.
+#
+# `_shape`'s escalation element stops being `bool(report.open_escalations)` and
+# becomes `classify_pins(...).vetoes_done_flip`.  That attribute, not `.pins`,
+# is deliberate and load-bearing: a DEAD_L0 must keep vetoing a done-flip (PRD
+# boundary #9 / D3 "any non-info open record still vetoes MARK_DONE"), while
+# `.pins`'s dead-L0 relaxation is consumed at the RECOVERY/REDISPATCH sites
+# instead.  The ONE disposition this seam changes is boundary #8: an
+# info-severity-only strand stops keying True and takes the plain
+# revert-to-pending path.
+# ---------------------------------------------------------------------------
+
+
+def _pin_report(
+    *,
+    db_status: str = 'in-progress',
+    branch_state: BranchState,
+    open_escalations: list[EscalationRef],
+    live_claimant: Claimant | None = None,
+    deploy_phase: DeployPhase | None = None,
+    escalation_store_unavailable: bool = False,
+) -> TruthReport:
+    return TruthReport(
+        db_status=db_status,
+        live_claimant=live_claimant,
+        branch_state=branch_state,
+        worktree_present=True,
+        open_escalations=open_escalations,
+        deploy_phase=deploy_phase,
+        escalation_store_unavailable=escalation_store_unavailable,
+    )
+
+
+def _info_ref(esc_id: str = 'esc-3541-info', *, level: int = 0) -> EscalationRef:
+    """An annotation, never a handoff — link 1 of the pins precedence chain."""
+    return EscalationRef(
+        id=esc_id, level=level, category='risk_identified', severity='info',
+    )
+
+
+def _dead_l0_ref(esc_id: str = 'esc-3541-l0') -> EscalationRef:
+    """A blocking L0 with an unknown filer.
+
+    At these fixtures' `live_claimant=None` the classifier's link 4 reaches its
+    identity-INDEPENDENT branch ("no incarnation is live at all, so the filing
+    one is necessarily dead"), so this is a genuine DEAD_L0 without needing a
+    composed identity on either side.
+    """
+    return EscalationRef(
+        id=esc_id, level=0, category='task_failure', severity='blocking',
+    )
+
+
+class TestResolverKeysOnVetoesDoneFlip:
+    """PRD boundary rows #7/#8/#9/#21 at the `_RECOVERY` seam."""
+
+    def test_info_only_off_main_strand_reverts_to_pending(self) -> None:
+        """Boundary #8 — the ONE disposition this seam changes.
+
+        Today an info record keys the escalation element True and lands row
+        (j)'s CONVERT_TO_BLOCKED.  An info record is an ANNOTATION: it must not
+        hold a strand out of the plain revert path.
+        """
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.EXISTS_OFF_MAIN),
+            open_escalations=[_info_ref()],
+        )
+        assert classify_recovery(report) == RecoveryAction.REVERT_TO_PENDING
+
+    def test_dead_l0_off_main_strand_still_converts_to_blocked(self) -> None:
+        """Boundary #7 — a dead-L0 pin does NOT relax the done-flip veto.
+
+        `.pins` would call this unpinned; `.vetoes_done_flip` (what the
+        resolver keys on) still says True, so the row rests in `blocked`
+        rather than being re-dispatched.
+        """
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.EXISTS_OFF_MAIN),
+            open_escalations=[_dead_l0_ref()],
+        )
+        assert classify_recovery(report) == RecoveryAction.CONVERT_TO_BLOCKED
+
+    def test_dead_l0_on_main_strand_never_marks_done(self) -> None:
+        """Boundary #9/#21 — the PROTECTIVE half of the veto family.
+
+        Keying the resolver on `.pins` instead would drop this shape into row
+        (a) and phantom-complete a task past an unconsumed handoff: the exact
+        inverse hazard the already-landed dispatch gate closed.
+        """
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-dead-l0'),
+            open_escalations=[_dead_l0_ref()],
+        )
+        action = classify_recovery(report)
+        assert action != RecoveryAction.MARK_DONE_WITH_PROVENANCE
+        assert action == RecoveryAction.CONVERT_TO_BLOCKED
+
+    def test_info_only_on_main_strand_marks_done(self) -> None:
+        """An annotation does not hold back landing evidence either."""
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-info'),
+            open_escalations=[_info_ref()],
+        )
+        assert classify_recovery(report) == RecoveryAction.MARK_DONE_WITH_PROVENANCE
+
+    def test_blank_severity_still_keys_true(self) -> None:
+        """`EscalationRef`'s `severity=''` default is UNKNOWN, which fails safe.
+
+        This is why EVERY pre-existing fixture in this file — all of which omit
+        `severity` — keeps its current disposition across this change.
+        """
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-blank'),
+            open_escalations=[EscalationRef(id='esc-blank', level=1)],
+        )
+        assert classify_recovery(report) == RecoveryAction.CONVERT_TO_BLOCKED
+
+    def test_mixed_info_and_blocking_keys_true(self) -> None:
+        """One non-info record is enough — `vetoes_done_flip` is an ANY, not an all."""
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-mixed'),
+            open_escalations=[_info_ref(), _dead_l0_ref()],
+        )
+        assert classify_recovery(report) == RecoveryAction.CONVERT_TO_BLOCKED
+
+    @pytest.mark.parametrize('level', [0, 1, 2])
+    def test_info_never_keys_true_at_any_level(self, level: int) -> None:
+        from orchestrator.task_ground_truth import _shape
+
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-any'),
+            open_escalations=[_info_ref(level=level)],
+        )
+        assert _shape(report)[3] is False
+
+
+class TestLeaveReasonIsPinClassAware:
+    """Link 3 reads the SAME answer `_shape` does — never a second derivation."""
+
+    @staticmethod
+    def _blocked_off_main(records: list[EscalationRef]) -> TruthReport:
+        """A shape absent from `_RECOVERY`, so it classifies LEAVE on its merits."""
+        return _pin_report(
+            db_status='blocked',
+            branch_state=BranchState(BranchStateKind.EXISTS_OFF_MAIN),
+            open_escalations=records,
+        )
+
+    def test_info_only_leave_is_not_labelled_escalation_pinned(self) -> None:
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = self._blocked_off_main([_info_ref()])
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.unmapped_shape
+
+    def test_dead_l0_leave_is_still_labelled_escalation_pinned(self) -> None:
+        """`vetoes_done_flip` keeps a dead-L0 on link 3, matching `_shape`."""
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = self._blocked_off_main([_dead_l0_ref()])
+        assert classify_recovery(report) == RecoveryAction.LEAVE
+        assert leave_reason(report) == LeaveReason.escalation_pinned
+
+    def test_l1_leave_is_still_labelled_escalation_pinned(self) -> None:
+        from orchestrator.task_ground_truth import LeaveReason, leave_reason
+
+        report = self._blocked_off_main(
+            [EscalationRef(id='esc-l1', level=1, severity='blocking')],
+        )
+        assert leave_reason(report) == LeaveReason.escalation_pinned
+
+
+class TestRecoveryTableIsUnchanged:
+    """TG-2 "one table": task eta adds NO rows and changes no key's alphabet."""
+
+    #: The ten rows the table shipped with before task eta — (a) (b) (c) (d)
+    #: (f) (i) (j) (k) (g) (h).  A COUNT alone would not catch a swap, so the
+    #: key SET is pinned too.
+    _EXPECTED_ROWS = 10
+
+    def test_row_count_is_untouched(self) -> None:
+        from orchestrator.task_ground_truth import _RECOVERY
+
+        assert len(_RECOVERY) == self._EXPECTED_ROWS, (
+            'task eta rewires the KEY ELEMENT, never the table: a new row here '
+            'means a disposition was added rather than reclassified'
+        )
+
+    def test_every_key_keeps_a_bool_escalation_element(self) -> None:
+        from orchestrator.task_ground_truth import _RECOVERY
+
+        for key in _RECOVERY:
+            assert isinstance(key[3], bool), key
+
+    def test_shape_still_produces_a_bool_for_the_escalation_element(self) -> None:
+        from orchestrator.task_ground_truth import _shape
+
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-bool'),
+            open_escalations=[_dead_l0_ref()],
+        )
+        assert isinstance(_shape(report)[3], bool)
+
+    def test_recovery_shape_str_still_renders_that_bool(self) -> None:
+        """The emitted shape alphabet is unchanged: still 'true' / 'false'.
+
+        An operator reading a `recovery_vetoed` row must see the same element
+        spelling after the rewiring as before it, and the two pin classes must
+        still be DISTINGUISHABLE there.
+        """
+        from orchestrator.task_ground_truth import _shape, recovery_shape_str
+
+        rendered = {}
+        for label, records in (('pinning', [_dead_l0_ref()]), ('info', [_info_ref()])):
+            report = _pin_report(
+                branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-render'),
+                open_escalations=records,
+            )
+            element = recovery_shape_str(report).split('|')[3]
+            assert element == str(_shape(report)[3]).lower()
+            assert element in {'true', 'false'}
+            rendered[label] = element
+
+        assert rendered == {'pinning': 'true', 'info': 'false'}
+
+
+class TestShapeNeverFakesAStoreOutage:
+    """`_shape` performs NO read, so it may never pass `records=None`.
+
+    `classify_pins`'s store-correctness obligation 2 binds a caller that
+    PERFORMED a failed read.  `_shape` is handed a report; the third state
+    travels separately on `report.escalation_store_unavailable` and is already
+    surfaced by `leave_reason` link 2.  Passing `records=None` here would
+    silently fold the outage into the table key — the disposition change task
+    eta deliberately declined.
+    """
+
+    @pytest.mark.parametrize('store_unavailable', [False, True])
+    def test_records_argument_is_always_the_report_list(
+        self, store_unavailable: bool,
+    ) -> None:
+        from unittest.mock import patch
+
+        from orchestrator.task_ground_truth import _shape
+
+        report = _pin_report(
+            branch_state=BranchState(BranchStateKind.ON_MAIN, 'sha-store'),
+            open_escalations=[],
+            escalation_store_unavailable=store_unavailable,
+        )
+        with patch(
+            'orchestrator.task_ground_truth.classify_pins', wraps=classify_pins,
+        ) as spy:
+            _shape(report)
+
+        assert spy.call_count == 1
+        records = spy.call_args.args[1] if len(spy.call_args.args) > 1 else (
+            spy.call_args.kwargs['records']
+        )
+        assert records is report.open_escalations
+        assert records is not None

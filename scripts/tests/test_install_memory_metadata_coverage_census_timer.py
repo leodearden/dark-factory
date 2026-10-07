@@ -4,11 +4,11 @@ systemd unit files it installs, and the wrapper their ExecStart names (task
 
 Drives the installer via subprocess with a FAKE `systemctl` shimmed onto PATH
 (records every invocation, minus `--user`, into a shared JSON state file) --
-mirroring test_install_reify_closure_staleness_sweep_timer.py. Real systemd is
+mirroring test_install_reclaim_orphaned_worktrees_timer.py. Real systemd is
 never touched.
 
 The wrapper half is driven with BOTH `*_CMD` seams pointed at fake recorder
-executables, mirroring test_reify_closure_staleness_sweep_wrapper.py, so the
+executables, mirroring test_flag_marker_sweep_wrapper.py, so the
 census never runs against live Qdrant and 3201's retro sweep never touches the
 live corpus.
 
@@ -291,12 +291,11 @@ def _values(directives, section, key) -> list[str]:
 
 
 def test_timer_fires_at_the_next_free_nightly_slot():
-    """05:00, after 03:00 legibility-trickle, 03:30 flag-marker-sweep, the
+    """05:00, after 03:00 legibility-trickle, 03:30 flag-marker-sweep and the
     already-double-booked 04:00 (reclaim-orphaned-worktrees +
-    legibility-transcript-check) and 04:30 reify-closure-staleness-sweep. The
-    stagger is deliberate: these jobs all touch the same machine and, in
-    several cases, the same backing stores -- this one scrolls every point in
-    both live Qdrant collections."""
+    legibility-transcript-check). The stagger is deliberate: these jobs all
+    touch the same machine and, in several cases, the same backing stores --
+    this one scrolls every point in both live Qdrant collections."""
     assert _values(_directives(TIMER_NAME), 'Timer', 'OnCalendar') == [
         '*-*-* 05:00:00']
 
@@ -1440,6 +1439,52 @@ def test_wrapper_cannot_commit_into_a_repo_named_only_by_ambient_git_dir(tmp_pat
     # POSITIVE CONTROL: the run must have done its real work in the sandbox.
     # Without this the assertion above passes just as well when the wrapper
     # dies on line 1 and touches nothing anywhere.
+    assert result.returncode == 0, (
+        f'stdout={result.stdout!r} stderr={result.stderr!r}')
+    assert [c['who'] for c in state] == ['CENSUS', 'STAMP'], state
+    sandbox_status = _git(repo, 'status', '--porcelain', '--', *_ARTIFACTS).stdout
+    assert sandbox_status.strip() == '', (
+        f'the sandbox commit did not happen, so the guard proved nothing: '
+        f'{sandbox_status!r} stdout={result.stdout!r}')
+
+
+def test_wrapper_commit_runs_no_hook_injected_by_ambient_git_config_parameters(
+        tmp_path):
+    """GIT_CONFIG_PARAMETERS is git's own `-c` channel, read at command-line
+    precedence, so an ambient one can name a core.hooksPath whose pre-commit
+    hook the wrapper's `commit --only` (no --no-verify) would run. Injected via
+    `extra_env`, AFTER the harness scrub, so the wrapper's own `unset` is what
+    is under test."""
+    hooks_dir = tmp_path / 'decoy-hooks'
+    hooks_dir.mkdir()
+    marker = tmp_path / 'hook-ran'
+    hook = hooks_dir / 'pre-commit'
+    hook.write_text(f'#!/bin/sh\ntouch {marker}\nexit 0\n')
+    hook.chmod(0o755)
+    poisoned = f"'core.hooksPath={hooks_dir}'"
+
+    # PREMISE CONTROL: this host's git really runs a hook injected this way,
+    # so the absence asserted below cannot be vacuous.
+    premise = _git_repo_harness(tmp_path / 'premise')
+    probe = subprocess.run(
+        ['git', '-C', str(premise), 'commit', '-q', '--allow-empty', '-m', 'probe'],
+        env={**_scrub_git_env(dict(os.environ)), 'GIT_CONFIG_PARAMETERS': poisoned},
+        capture_output=True, text=True, check=False,
+    )
+    assert marker.exists(), (
+        f'the injected hook did not run in the premise probe: {probe!r}')
+    marker.unlink()
+
+    repo = _git_repo_harness(tmp_path / 'sandbox')
+    result, state = _run_wrapper_in_git_repo(
+        tmp_path, repo, extra_env={'GIT_CONFIG_PARAMETERS': poisoned},
+    )
+
+    assert not marker.exists(), (
+        'the wrapper ran a pre-commit hook injected by an ambient '
+        f'GIT_CONFIG_PARAMETERS; stdout={result.stdout!r} stderr={result.stderr!r}')
+
+    # POSITIVE CONTROL: the commit really happened, so a hook had its chance.
     assert result.returncode == 0, (
         f'stdout={result.stdout!r} stderr={result.stderr!r}')
     assert [c['who'] for c in state] == ['CENSUS', 'STAMP'], state

@@ -7,14 +7,23 @@ Network errors are caught at the get_* level and returned as offline dicts.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from collections.abc import Mapping
+from datetime import datetime
+from typing import Any
 
+import anyio
 import httpx
 from shared.mcp_idempotency import maybe_inject_client_op_id
 
 from dashboard.config import DashboardConfig
+from dashboard.data.datum import Datum, DatumState, unknown_datum
 from dashboard.data.mcp_fanout import (
+    FANOUT_FAILURE_EXCEPTIONS,
+    call_with_deadline,
+    cancel_and_await,
     describe_exc,
     first_success,
     log_fanout_failure,
@@ -46,6 +55,66 @@ MCP_HEADERS = {
 # across attempts (or a retry loop must be added here); a fresh per-attempt
 # uuid4 would NOT trigger server-side dedup. Safe today only because reads
 # never dedup and a caller-supplied key is preserved.
+
+
+_exchanges: set[asyncio.Task[httpx.Response]] = set()
+
+
+async def _post(
+    client: httpx.AsyncClient, url: str, payload: dict, headers: dict, timeout: float,
+) -> httpx.Response:
+    """POST *payload* and read the response, in a task the caller cannot cancel.
+
+    The dashboard's only HTTP egress. A native cancel landing inside httpcore's
+    release path strands the connection (``dashboard/http_pool.py`` states how),
+    so a caller that gives up stops waiting while the exchange runs on to
+    completion under an anyio bound, which httpcore's shields do honour.
+    """
+    exchange = asyncio.create_task(
+        _bounded_post(client, url, payload, headers, timeout), name=f'MCP exchange {url}',
+    )
+    _exchanges.add(exchange)
+    exchange.add_done_callback(_settle)
+    return await asyncio.shield(exchange)
+
+
+def _settle(exchange: asyncio.Task[httpx.Response]) -> None:
+    """Forget *exchange*, consuming an error an abandoning caller never will.
+
+    Not logged: a caller still waiting reports the error itself, and one that
+    gave up has already reported its own deadline.
+    """
+    _exchanges.discard(exchange)
+    if not exchange.cancelled():
+        exchange.exception()
+
+
+async def _bounded_post(
+    client: httpx.AsyncClient, url: str, payload: dict, headers: dict, timeout: float,
+) -> httpx.Response:
+    # A whole-exchange ceiling: the sum of httpx's per-phase budgets. Those
+    # budgets are per socket operation, so a trickled or many-chunk response can
+    # outlive every one of them; this deliberately ends it.
+    phases = httpx.Timeout(timeout).as_dict().values()
+    with anyio.fail_after(sum(budget for budget in phases if budget is not None)):
+        return await client.post(url, json=payload, headers=headers, timeout=timeout)
+
+
+async def cancel_inflight_exchanges() -> None:
+    """Cancel and await every exchange still running on this loop.
+
+    For ``dashboard.app.lifespan`` teardown, so no exchange outlives the client
+    it runs on. Only this loop's tasks can be cancelled safely; one whose loop
+    has closed can never finish, so it is dropped.
+    """
+    loop = asyncio.get_running_loop()
+    running_here: dict[asyncio.Task[Any], str] = {}
+    for exchange in list(_exchanges):
+        if exchange.get_loop().is_closed():
+            _exchanges.discard(exchange)
+        elif exchange.get_loop() is loop:
+            running_here[exchange] = exchange.get_name()
+    await cancel_and_await(running_here, 'MCP exchange(s)')
 
 
 def _parse_mcp_response(resp: httpx.Response) -> dict:
@@ -158,9 +227,7 @@ class McpSession:
         if self._session_id:
             headers['Mcp-Session-Id'] = self._session_id
 
-        resp = await client.post(
-            self.mcp_endpoint, json=payload, headers=headers, timeout=timeout,
-        )
+        resp = await _post(client, self.mcp_endpoint, payload, headers, timeout)
         resp.raise_for_status()
 
         if sid := resp.headers.get('mcp-session-id'):
@@ -178,9 +245,7 @@ class McpSession:
         headers = dict(MCP_HEADERS)
         if self._session_id:
             headers['Mcp-Session-Id'] = self._session_id
-        resp = await client.post(
-            self.mcp_endpoint, json=payload, headers=headers, timeout=timeout,
-        )
+        resp = await _post(client, self.mcp_endpoint, payload, headers, timeout)
         if resp.status_code not in (200, 202, 204):
             logger.warning('MCP notify %s returned %s', method, resp.status_code)
 
@@ -245,9 +310,31 @@ async def mcp_tool_call(
     a hard whole-operation bound must still wrap this in
     ``asyncio.wait_for`` — every existing probe caller does, deliberately, and
     the two layers are complementary rather than redundant.
+
+    **A session that hangs is self-evicting** (task 4958). When that enclosing
+    ``wait_for`` fires — or the caller is cancelled for any other reason — the
+    cached ``McpSession`` is invalidated before the exception propagates, so
+    the next call re-initialises instead of reusing a wedged one. This is the
+    cache-aware layer: ``McpSession.call_tool`` is an instance method with no
+    knowledge of ``_sessions``, so it cannot evict itself, while every MCP
+    caller passes through here — which means callers in other modules are
+    covered too, notably ``task_runtime.py::_probe_one``, whose own ``wait_for``
+    cancels this call and which previously did not invalidate at all.
+
+    The guard catches ONLY the two hang-shaped exits (``asyncio.CancelledError``
+    and the builtin ``TimeoutError``) and always re-raises. It deliberately does
+    not catch ``httpx.HTTPStatusError`` / ``ValueError``: teardown policy for
+    those already belongs to the callers (``first_success``,
+    ``get_queue_stats``, ``get_wal_status`` each invalidate themselves), and a
+    blanket handler would force a cold three-post handshake on every 500 while
+    silently changing a policy those callers implement.
     """
     session = _get_session(base_url)
-    return await session.call_tool(client, tool_name, arguments, timeout=timeout)
+    try:
+        return await session.call_tool(client, tool_name, arguments, timeout=timeout)
+    except (asyncio.CancelledError, TimeoutError):
+        invalidate_session(base_url)
+        raise
 
 
 async def _first_success(
@@ -309,23 +396,37 @@ async def get_queue_stats(
     configured URLs, so the aggregate cost scales with N. Callers needing a
     hard bound must still wrap this in ``asyncio.wait_for`` — ``metrics.py``
     does.
+
+    Each URL's attempt additionally carries ``mcp_fanout.call_with_deadline``'s
+    default whole-operation deadline (resolved inside that helper at call time,
+    so this loop shares one policy with ``first_success`` instead of
+    re-implementing the fallback), so a server that accepts the request and
+    then goes silent no longer parks this loop before it reaches the remaining
+    URLs. The two bounds are complementary
+    rather than redundant: the caller's outer ``wait_for`` bounds the N-URL
+    aggregate, while this one stops any single URL from consuming all of it.
+    An expiry is an ordinary per-URL failure here — logged, invalidated, and
+    skipped, exactly like a ``ConnectError``.
     """
     merged_counts: dict[str, int] = {}
     oldest_age: float | None = None
     any_success = False
+    errors: list[str] = []
 
     for url in config.fused_memory_urls:
         try:
-            result = await mcp_tool_call(
-                client, url, 'get_queue_stats', {}, timeout=timeout,
+            result = await call_with_deadline(
+                url,
+                lambda u: mcp_tool_call(client, u, 'get_queue_stats', {},
+                                        timeout=timeout),
             )
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
-                ValueError) as e:
+        except FANOUT_FAILURE_EXCEPTIONS as e:
             # Same transition-only WARNING policy as first_success (task 3871):
             # this loop visits ALL N urls, so a partial outage used to
             # under-report queue counts at DEBUG with no journal trace at all.
             log_fanout_failure('get_queue_stats', url, e)
             invalidate_session(url)
+            errors.append(f'{url}: {describe_exc(e)}')
             continue
 
         note_fanout_success('get_queue_stats', url)
@@ -338,8 +439,47 @@ async def get_queue_stats(
             oldest_age = age
 
     if not any_success:
-        return {'offline': True, 'error': 'All servers unreachable'}
+        return {'offline': True, 'error': '; '.join(errors)}
     return {'counts': merged_counts, 'oldest_pending_age_seconds': oldest_age}
+
+
+WRITE_QUEUE_FRESHNESS_BOUND_SECONDS = 30
+"""How long a write-queue reading stays fresh.
+
+It must outlast the /memory route's own fan-out (each leg is bounded at 5 s),
+so the routine slow path does not serve its own probe stale — the same
+reasoning as ``merge_queue.py::LIVE_QUEUE_FRESHNESS_BOUND_SECONDS``.
+"""
+
+
+def write_queue_datum(
+    stats: Mapping[str, Any], *, measured_at: datetime,
+) -> Datum[dict[str, Any]]:
+    """The write queue as one Datum: the one normaliser of a get_queue_stats answer.
+
+    A reachable answer is a fresh ``{pending, retry, dead,
+    oldest_pending_age_seconds}``, a missing count reading 0. An offline one
+    is ``unknown`` carrying the probe's own error verbatim: an unmeasured
+    queue is a hole, never a row of zeros.
+    """
+    if stats.get('offline'):
+        return unknown_datum(
+            stats.get('error') or 'get_queue_stats reported offline without an error',
+            WRITE_QUEUE_FRESHNESS_BOUND_SECONDS,
+        )
+    counts = stats.get('counts') or {}
+    return Datum(
+        {
+            'pending': counts.get('pending', 0),
+            'retry': counts.get('retry', 0),
+            'dead': counts.get('dead', 0),
+            'oldest_pending_age_seconds': stats.get('oldest_pending_age_seconds'),
+        },
+        measured_at,
+        DatumState.FRESH,
+        None,
+        WRITE_QUEUE_FRESHNESS_BOUND_SECONDS,
+    )
 
 
 # Intentionally NOT converted to first_success: collects a per-URL entry from
@@ -362,16 +502,26 @@ async def get_wal_status(
     bound on this call: like ``get_queue_stats`` this visits ALL N configured
     URLs, so the aggregate cost scales with N. Callers needing a hard bound
     must still wrap this in ``asyncio.wait_for``.
+
+    Each URL's attempt additionally carries ``mcp_fanout.call_with_deadline``'s
+    default whole-operation deadline (resolved inside that helper at call time,
+    the same policy ``first_success`` gets), so one silent server no longer
+    costs every other server its WAL column. The
+    two bounds are complementary: the caller's outer ``wait_for`` bounds the
+    N-URL aggregate, this one stops any single URL from consuming all of it.
+    An expiry is an ordinary per-URL failure — logged, invalidated, recorded in
+    *errors*, and skipped.
     """
     per_server: dict[str, dict] = {}
     errors: list[str] = []
     for url in config.fused_memory_urls:
         try:
-            result = await mcp_tool_call(
-                client, url, 'get_wal_status', {}, timeout=timeout,
+            result = await call_with_deadline(
+                url,
+                lambda u: mcp_tool_call(client, u, 'get_wal_status', {},
+                                        timeout=timeout),
             )
-        except (httpx.ConnectError, httpx.TimeoutException, httpx.HTTPStatusError,
-                ValueError) as e:
+        except FANOUT_FAILURE_EXCEPTIONS as e:
             # Transition-only WARNING, as above — a per-server WAL column can
             # vanish from the UI badge and, at DEBUG, leave nothing behind.
             log_fanout_failure('get_wal_status', url, e)

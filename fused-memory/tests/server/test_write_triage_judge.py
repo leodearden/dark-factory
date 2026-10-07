@@ -24,15 +24,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
+import subprocess
+import sys
 import types
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
+from fused_memory.config.schema import FusedMemoryConfig, WriteTriageConfig
 from fused_memory.models.enums import MemoryCategory, SourceStore
 from fused_memory.models.memory import MemoryResult
-from fused_memory.server import write_triage
+from fused_memory.server import write_triage_judge as judge_module
 from fused_memory.server.grouped_read import AMENDMENT_KIND, PARENT_ID_KEY
 from fused_memory.server.write_triage import (
     OUTCOME_AMENDED,
@@ -42,43 +49,56 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
     BandDecision,
+    JudgeUsage,
     TriageFailOpenCounter,
+    TriageJudgeVerdict,
     triage_write,
 )
 from fused_memory.server.write_triage_judge import (
     _DEFAULT_JUDGE_CANDIDATE_COUNT,
     _DEFAULT_JUDGE_ENABLED,
+    _DEFAULT_JUDGE_FIELD_CHARS,
     _DEFAULT_JUDGE_MODEL,
     _DEFAULT_JUDGE_PROVIDER,
     _DEFAULT_JUDGE_TIMEOUT_SECONDS,
     _DEFAULT_MODEL_BY_PROVIDER,
     _ELIDED_MARKER,
+    _JUDGE_MAX_TOKENS,
     _KNOWN_PROVIDERS,
+    CANDIDATE_ID_KEY,
+    JUDGE_REPLY_SHAPE,
     JUDGE_SYSTEM_PROMPT,
     JUDGE_VERDICTS,
     VERDICT_KEY,
     JudgeOutputError,
     _call_llm,
+    _provider_credentials,
     build_judge_prompt,
     judge_write,
     parse_judge_verdict,
     resolve_judge_candidate_count,
     resolve_judge_enabled,
+    resolve_judge_field_chars,
     resolve_judge_model,
     resolve_judge_provider,
+    resolve_judge_reasoning_effort,
     resolve_judge_timeout,
     select_judge_candidates,
 )
 from fused_memory.services.memory_service import RRF_K, SearchResults
 
 
-def _payload(word: object) -> str:
-    """A well-formed verdict payload keyed off the module's own VERDICT_KEY.
+def _payload(word: object, candidate_id: object = None) -> str:
+    """A verdict payload keyed off the module's own VERDICT_KEY and CANDIDATE_ID_KEY.
 
-    Built rather than spelled, so a rename of the key is exercised by these
-    tests instead of silently bypassing them.
+    Built rather than spelled, so a rename of either key is exercised by these
+    tests instead of silently bypassing them. *candidate_id* is left out of the
+    payload entirely when not given.
     """
-    return json.dumps({VERDICT_KEY: word})
+    answer = {VERDICT_KEY: word}
+    if candidate_id is not None:
+        answer[CANDIDATE_ID_KEY] = candidate_id
+    return json.dumps(answer)
 
 
 # ---------------------------------------------------------------------------
@@ -119,12 +139,253 @@ class TestJudgeVerdictVocabulary:
         """Each judge word lands on the outcome the ack contract publishes."""
         assert JUDGE_VERDICTS[word] == outcome
 
-    def test_the_outcome_constants_come_from_write_triage(self) -> None:
-        """The values are the ones beta publishes, whatever they are spelled."""
-        assert JUDGE_VERDICTS['restates'] == write_triage.OUTCOME_RESTATED
-        assert JUDGE_VERDICTS['amends'] == write_triage.OUTCOME_AMENDED
-        assert JUDGE_VERDICTS['contests'] == write_triage.OUTCOME_CONTESTED
-        assert JUDGE_VERDICTS['distinct'] == write_triage.OUTCOME_STORED
+
+# ---------------------------------------------------------------------------
+# the worked examples that teach the vocabulary
+# ---------------------------------------------------------------------------
+
+#: The committed curator corpus the judge is MEASURED against. Named here so
+#: the leakage guard below can ask whether an exemplar was drawn from it.
+CALIBRATION_FIXTURE_PATH = (
+    Path(__file__).parent.parent / 'fixtures' / 'write_triage_calibration.jsonl'
+)
+
+
+@pytest.fixture(scope='module')
+def records() -> list[dict]:
+    """The committed curator corpus, parsed with the stdlib.
+
+    Parsed here rather than through the eval script's loader, so a loader bug
+    cannot mask a data defect (and vice versa) — the discipline the sibling
+    suite's own ``records`` fixture states.
+    """
+    assert CALIBRATION_FIXTURE_PATH.exists(), (
+        f'fixture missing: {CALIBRATION_FIXTURE_PATH}'
+    )
+    return [
+        json.loads(line)
+        for line in CALIBRATION_FIXTURE_PATH.read_text().splitlines()
+        if line.strip()
+    ]
+
+
+class TestJudgeExemplars:
+    """The vocabulary's worked examples, held as DATA rather than as prose.
+
+    Four words with no worked example is what the 2026-08-27 measurement
+    indicts: 31 of 75 duplicates were answered ``stored`` with the correct
+    canonical sitting in the slate, i.e. ``restates``/``amends`` were
+    under-produced. A vocabulary word the model has never seen USED is the one
+    it under-produces, so full verdict coverage is the invariant that targets
+    the defect rather than a tidiness rule.
+
+    Structured records, not a pre-formatted blob (heuristic 12): declaring
+    ``entry``/``candidate``/``verdict`` as separate fields is what lets
+    vocabulary closure, verdict coverage and corpus disjointness be CHECKED
+    here instead of grepped for in a string. The renderer owns the formatting.
+    """
+
+    def test_the_exemplars_are_structured_records(self) -> None:
+        """Three separate fields per record — the data carries no formatting.
+
+        A pre-formatted blob would reduce every assertion below to substring
+        grepping, and would move the prompt's layout out of the renderer and
+        into the data, where two exemplars can disagree about it.
+        """
+        exemplars = judge_module.JUDGE_EXEMPLARS
+        assert isinstance(exemplars, tuple), 'exemplars are an ordered, frozen tuple'
+        assert exemplars, 'an empty exemplar tuple teaches nothing'
+        for exemplar in exemplars:
+            fields = (exemplar.entry, exemplar.candidate, exemplar.verdict)
+            for field in fields:
+                assert isinstance(field, str) and field.strip(), (
+                    f'every field is a non-empty string: {exemplar!r}'
+                )
+                assert '\n' not in field, (
+                    f'line breaks are the renderer\'s business, not the data\'s: '
+                    f'{exemplar!r}'
+                )
+            assert len(set(fields)) == len(fields), (
+                f'the three fields are distinct values, not one blob repeated: '
+                f'{exemplar!r}'
+            )
+
+    def test_every_exemplar_verdict_is_in_the_closed_vocabulary(self) -> None:
+        """An out-of-vocabulary exemplar teaches a word the parser REJECTS.
+
+        ``parse_judge_verdict`` raises on anything outside ``JUDGE_VERDICTS``
+        and ``write_triage`` counts that raise as a fail-open — so the damage
+        surfaces as a storm escalation describing an outage, not as a bad
+        verdict anyone would trace back to a typo in a prompt example.
+        """
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            assert exemplar.verdict in JUDGE_VERDICTS, (
+                f'{exemplar.verdict!r} is not one of {sorted(JUDGE_VERDICTS)}'
+            )
+
+    def test_every_verdict_has_at_least_one_worked_example(self) -> None:
+        """Coverage is the invariant aimed at the measured defect.
+
+        Derived from ``JUDGE_VERDICTS`` rather than spelled as four literals,
+        so a fifth word added to the vocabulary arrives here already demanding
+        its example instead of shipping unexemplified.
+        """
+        covered = {exemplar.verdict for exemplar in judge_module.JUDGE_EXEMPLARS}
+        assert covered == set(JUDGE_VERDICTS), (
+            f'verdicts with no worked example: {sorted(set(JUDGE_VERDICTS) - covered)}'
+        )
+
+    def test_no_exemplar_text_is_drawn_from_the_eval_corpus(
+        self, records: list[dict],
+    ) -> None:
+        """Exemplars are prompt content; fixture records are a MEASUREMENT.
+
+        Hand-writing an exemplar is ordinary prompt engineering — nothing is
+        scored against it. Drawing one from the corpus the judge is scored on
+        is training on the test set, and would make the accuracy report
+        unreadable as evidence. This is the one way an exemplar can corrupt a
+        measurement, so it is asserted rather than remembered.
+        """
+        corpus = '\n'.join(str(record.get('content', '')) for record in records)
+        assert corpus.strip(), 'the corpus parsed empty — the guard would be vacuous'
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            for field_name in ('entry', 'candidate'):
+                text = getattr(exemplar, field_name)
+                assert text not in corpus, (
+                    f'exemplar {field_name} is drawn from the eval corpus — '
+                    f'that is training on the test set: {text!r}'
+                )
+
+    def test_each_exemplar_renders_as_an_answered_pair(self) -> None:
+        """The PAIRING is the property. The three fields separately are not.
+
+        A pair rendered without its verdict is a riddle, and a verdict
+        rendered without its pair is an assertion — so what has to hold is
+        that each exemplar's three fields reach the model AS ONE BLOCK.
+        Checking the fields individually cannot see that: all four verdict
+        words already appear in the vocabulary bullets above the examples, so
+        ``exemplar.verdict in prompt`` is true whatever the renderer emits.
+        Measured by simulation — a ``render_judge_exemplars`` that dropped its
+        ``answer:`` line entirely, shipping four unanswered riddles, left the
+        per-field version of this test green.
+
+        Asserted as the contiguous triple, which is executable structure and
+        not a wording pin. It restates ``render_judge_exemplars``' block layout on
+        purpose — that layout IS the contract between the tuple and the model
+        — while leaving the prompt's prose around the examples free to be
+        reworded. It subsumes the per-field presence check, so there is no
+        longer a separate one.
+        """
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            block = (
+                f'new entry: {exemplar.entry}\n'
+                f'candidate: {exemplar.candidate}\n'
+                f'answer: {exemplar.verdict}'
+            )
+            assert block in JUDGE_SYSTEM_PROMPT, (
+                f'exemplar does not reach the model as an ANSWERED pair — its '
+                f'fields may all be present but not together: {block!r}'
+            )
+
+    def test_the_exemplars_render_once_each_in_declaration_order(self) -> None:
+        """A REPRODUCIBLE measurement needs a prompt that does not move.
+
+        This suite has been bitten once already by an iteration order moving
+        between two processes — the committed `.json`/`.md` confusion-row
+        disagreement that
+        ``test_the_committed_markdown_is_the_render_of_the_committed_json``
+        now pins. A tuple cannot reorder itself, so what is left to check is
+        that the RENDERER walks it in order and does not double-render.
+
+        Asserted on ``entry``, which uniquely identifies an exemplar and
+        occurs nowhere else in the prompt. ``candidate`` and ``verdict``
+        deliberately recur — one candidate is shared by all four exemplars, so
+        the only variable is the relationship, and each verdict word already
+        appears three to five times in the vocabulary section above the
+        examples. Counting occurrences of either would measure the prompt's
+        prose, not the renderer's determinism.
+        """
+        prompt = JUDGE_SYSTEM_PROMPT
+        positions = []
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            assert prompt.count(exemplar.entry) == 1, (
+                f'exemplar rendered {prompt.count(exemplar.entry)} times, not '
+                f'once: {exemplar.entry!r}'
+            )
+            positions.append(prompt.index(exemplar.entry))
+        assert positions == sorted(positions), (
+            f'the render walks JUDGE_EXEMPLARS out of declaration order: '
+            f'{positions}'
+        )
+
+    def test_the_user_prompt_carries_no_exemplar_text(self) -> None:
+        """Exemplars are constant, so they are paid for ONCE, system-side.
+
+        Two reasons beyond the token bill. ``scripts/check_write_triage_attach_target.py``
+        is the behavioural gate probe for flip-predicate item 1; its
+        ``_echoes_argument`` / ``_swap_verdict`` controls attribute a
+        rendering difference to a SPECIFIC candidate in the user turn, and
+        constant example lines there would be extra material those controls
+        would have to reason around. And the system half is the half a
+        provider can cache — rendered per call, the exemplars would be paid
+        for on all 102 cases of an eval run instead of once.
+
+        Verdict WORDS are excluded: ``build_judge_prompt`` names the closed
+        vocabulary by design, which is a different thing from carrying an
+        example.
+        """
+        candidates = [
+            _result('mem-aaa', 0.9, content='first candidate body'),
+            _result('mem-bbb', 0.8, content='second candidate body'),
+        ]
+        prompt = build_judge_prompt('the new entry text', candidates)
+        for exemplar in judge_module.JUDGE_EXEMPLARS:
+            for field_name in ('entry', 'candidate'):
+                text = getattr(exemplar, field_name)
+                assert text not in prompt, (
+                    f'exemplar {field_name} leaked into the per-call user turn: '
+                    f'{text!r}'
+                )
+
+    def test_the_worst_case_prompt_stays_within_the_char_budget(self) -> None:
+        """PRD C1 bounds the whole call, and the exemplars spend against it.
+
+        The ceiling is a module constant, not a literal here, so the budget
+        has one home — raising it is an edit to the thing being budgeted,
+        made next to the C1 rationale, rather than a number quietly relaxed in
+        a test.
+        """
+        worst_case = _worst_case_call_chars()
+        assert worst_case <= judge_module.JUDGE_PROMPT_CHAR_BUDGET, (
+            f'worst-case prompt is {worst_case} chars against a budget of '
+            f'{judge_module.JUDGE_PROMPT_CHAR_BUDGET}'
+        )
+
+    def test_the_budget_admits_no_further_worked_example(self) -> None:
+        """The ceiling's slack stays under the cheapest further exemplar.
+
+        ``JUDGE_PROMPT_CHAR_BUDGET``'s rationale says a ceiling that admitted
+        another worked example would have stopped bounding anything. Asserted
+        so a prompt that SHRINKS — leaving the old ceiling roomy — fails here
+        instead of silently widening what a future addition may spend.
+
+        A further exemplar costs what the module's own renderer adds when it
+        is appended, joiner included, so the layout is not restated here.
+        """
+        budget = judge_module.JUDGE_PROMPT_CHAR_BUDGET
+        worst_case = _worst_case_call_chars()
+        slack = budget - worst_case
+        render = judge_module.render_judge_exemplars
+        shipped = judge_module.JUDGE_EXEMPLARS
+        cheapest = min(
+            len(render((*shipped, exemplar))) - len(render(shipped))
+            for exemplar in shipped
+        )
+        assert 0 <= slack < cheapest, (
+            f'budget {budget} against a measured worst case of {worst_case} '
+            f'leaves {slack} chars of slack; it must be at least 0 and under '
+            f'the cheapest further worked example ({cheapest} chars)'
+        )
 
 
 class TestParseJudgeVerdict:
@@ -136,44 +397,84 @@ class TestParseJudgeVerdict:
     ``triage_write`` counts a fail-open only for something that raises or
     returns out-of-vocabulary, and a silent default would make a broken judge
     read exactly like a healthy one answering "nothing matched".
+
+    An attach verdict names the candidate it is about, and that id is checked
+    against the slate the model was shown.
     """
 
-    def test_judge_output_error_is_an_exception_subclass(self) -> None:
-        """Module-local, so a caller can distinguish it from a transport error."""
-        assert issubclass(JudgeOutputError, Exception)
+    _SLATE = ('m1',)
+
+    @pytest.mark.parametrize(
+        ('word', 'candidate_id', 'expected'),
+        [
+            ('distinct', None, TriageJudgeVerdict(OUTCOME_STORED)),
+            ('restates', 'm1', TriageJudgeVerdict(OUTCOME_RESTATED, 'm1')),
+            ('amends', 'm1', TriageJudgeVerdict(OUTCOME_AMENDED, 'm1')),
+            ('contests', 'm1', TriageJudgeVerdict(OUTCOME_CONTESTED, 'm1')),
+        ],
+        ids=['distinct', 'restates', 'amends', 'contests'],
+    )
+    def test_a_bare_json_object_round_trips(
+        self, word: str, candidate_id: str | None, expected: TriageJudgeVerdict,
+    ) -> None:
+        """The happy path: exactly what `response_format=json_object` returns."""
+        assert parse_judge_verdict(_payload(word, candidate_id), self._SLATE) == expected
+
+    def test_distinct_may_name_its_candidate_as_an_explicit_null(self) -> None:
+        raw = json.dumps({VERDICT_KEY: 'distinct', CANDIDATE_ID_KEY: None})
+        assert parse_judge_verdict(raw, self._SLATE) == TriageJudgeVerdict(OUTCOME_STORED)
 
     @pytest.mark.parametrize(
         ('word', 'outcome'),
         [
-            ('distinct', OUTCOME_STORED),
-            ('restates', OUTCOME_RESTATED),
-            ('amends', OUTCOME_AMENDED),
-            ('contests', OUTCOME_CONTESTED),
+            ('Restates', OUTCOME_RESTATED),
+            (' restates ', OUTCOME_RESTATED),
+            ('RESTATES', OUTCOME_RESTATED),
+            ('\nAmends\n', OUTCOME_AMENDED),
+            ('  Contests', OUTCOME_CONTESTED),
+            ('Distinct\t', OUTCOME_STORED),
         ],
-        ids=['distinct', 'restates', 'amends', 'contests'],
+        ids=['title-case', 'padded', 'upper', 'newline-wrapped',
+             'leading-space', 'trailing-tab'],
     )
-    def test_a_bare_json_object_round_trips(self, word: str, outcome: str) -> None:
-        """The happy path: exactly what `response_format=json_object` returns."""
-        assert parse_judge_verdict(_payload(word)) == outcome
+    def test_case_and_whitespace_are_normalised(
+        self, word: str, outcome: str,
+    ) -> None:
+        """`.strip().lower()` is load-bearing, and nothing else pinned it.
+
+        Every other case in this class is already bare lowercase, so deleting
+        the normalisation left the whole suite green while turning a model
+        that answered `"Restates"` — an entirely reasonable thing for an LLM
+        to emit through a JSON schema that does not enumerate the casing —
+        into a `JudgeOutputError` on EVERY middle-band write. That is a
+        counted fail-open per write, which surfaces as a storm escalation
+        describing an outage that is not happening.
+        """
+        candidate_id = None if outcome == OUTCOME_STORED else 'm1'
+        assert parse_judge_verdict(
+            _payload(word, candidate_id), self._SLATE,
+        ) == TriageJudgeVerdict(outcome, candidate_id)
 
     def test_a_fenced_json_block_parses(self) -> None:
         """A model that ignores the JSON mode and fences its answer still parses."""
-        raw = f'```json\n{_payload("amends")}\n```'
-        assert parse_judge_verdict(raw) == OUTCOME_AMENDED
+        raw = f'```json\n{_payload("amends", "m1")}\n```'
+        assert parse_judge_verdict(raw, self._SLATE) == TriageJudgeVerdict(OUTCOME_AMENDED, 'm1')
 
     def test_json_surrounded_by_prose_parses(self) -> None:
         """`extract_json` brace-scans, so leading/trailing prose is tolerated."""
         raw = (
-            'Looking at candidate mem-1, the new entry adds a detail.\n'
-            f'{_payload("amends")}\n'
+            'Looking at candidate m1, the new entry adds a detail.\n'
+            f'{_payload("amends", "m1")}\n'
             'That is my answer.'
         )
-        assert parse_judge_verdict(raw) == OUTCOME_AMENDED
+        assert parse_judge_verdict(raw, self._SLATE) == TriageJudgeVerdict(OUTCOME_AMENDED, 'm1')
 
     def test_a_verdict_with_extra_keys_still_parses(self) -> None:
-        """Extra keys are ignored; only the verdict word is contractual."""
-        raw = json.dumps({VERDICT_KEY: 'restates', 'reasoning': 'same fact'})
-        assert parse_judge_verdict(raw) == OUTCOME_RESTATED
+        """Extra keys are ignored; only the verdict and the candidate are contractual."""
+        raw = json.dumps({
+            VERDICT_KEY: 'restates', CANDIDATE_ID_KEY: 'm1', 'reasoning': 'same fact',
+        })
+        assert parse_judge_verdict(raw, self._SLATE) == TriageJudgeVerdict(OUTCOME_RESTATED, 'm1')
 
     def test_an_array_wrapped_object_reads_as_that_object(self) -> None:
         """Pinned deliberately, because it is a behaviour and not an accident.
@@ -181,25 +482,23 @@ class TestParseJudgeVerdict:
         ``extract_json`` brace-scans for the first BALANCED OBJECT, so an
         answer wrapped in a list is read as the object inside it. That
         leniency is inherited from the repo's one JSON extractor rather than
-        chosen here, and it is safe at this seam for a specific reason: the
-        BAND names the attach target, not the judge, so a verdict is a single
-        word however it was wrapped. A model that answered with several
-        elements has its first taken — a bounded wrong-word risk against a
-        target that is fixed either way, with the canonical never mutated and
-        the attach always re-parentable (C1).
+        chosen here, and it stays bounded because the id the object names is
+        validated against the slate: whichever element is taken, the write can
+        only attach to a record the model was shown, the canonical is never
+        mutated, and the attach is always re-parentable (C1).
 
         Asserted so that a future change to ``extract_json`` surfaces here
         rather than silently changing what the judge is understood to have
         said.
         """
-        raw = f'[{_payload("restates")}]'
-        assert parse_judge_verdict(raw) == OUTCOME_RESTATED
+        raw = f'[{_payload("restates", "m1")}]'
+        assert parse_judge_verdict(raw, self._SLATE) == TriageJudgeVerdict(OUTCOME_RESTATED, 'm1')
 
     @pytest.mark.parametrize(
         ('raw', 'label'),
         [
-            (_payload('supersedes'), 'unrecognised-verdict-word'),
-            (_payload(OUTCOME_RESTATED), 'ack-word-not-judge-word'),
+            (_payload('supersedes', 'm1'), 'unrecognised-verdict-word'),
+            (_payload(OUTCOME_RESTATED, 'm1'), 'ack-word-not-judge-word'),
             (json.dumps({'answer': 'restates'}), 'missing-verdict-key'),
             (_payload(None), 'null-verdict'),
             (_payload(['restates']), 'non-string-verdict'),
@@ -208,8 +507,14 @@ class TestParseJudgeVerdict:
             ('', 'empty-text'),
             ('   \n\t  ', 'whitespace-only-text'),
             ('I cannot answer that request.', 'prose-with-no-json'),
-            (_payload('restates').rstrip('}'), 'unbalanced-json'),
+            (_payload('restates', 'm1').rstrip('}'), 'unbalanced-json'),
             (f'{{{VERDICT_KEY}: restates}}', 'unquoted-json'),
+            (_payload('restates'), 'attach-word-naming-no-candidate'),
+            (_payload('restates', 'm9'), 'id-not-on-the-slate'),
+            (_payload('restates', 7), 'non-string-id'),
+            (_payload('restates', ['m1']), 'list-id'),
+            (_payload('restates', ''), 'empty-id'),
+            (_payload('distinct', 'm1'), 'distinct-naming-a-candidate'),
         ],
         ids=[
             'unrecognised-verdict-word',
@@ -224,6 +529,12 @@ class TestParseJudgeVerdict:
             'prose-with-no-json',
             'unbalanced-json',
             'unquoted-json',
+            'attach-word-naming-no-candidate',
+            'id-not-on-the-slate',
+            'non-string-id',
+            'list-id',
+            'empty-id',
+            'distinct-naming-a-candidate',
         ],
     )
     def test_every_rejection_raises_rather_than_defaulting(
@@ -231,25 +542,31 @@ class TestParseJudgeVerdict:
     ) -> None:
         """A raise is what `triage_write`'s fail-open counter can SEE."""
         with pytest.raises(JudgeOutputError):
-            parse_judge_verdict(raw)
+            parse_judge_verdict(raw, self._SLATE)
 
     def test_the_rejection_message_quotes_the_offending_payload(self) -> None:
         """An operator reading the fail-open log needs the actual output."""
         with pytest.raises(JudgeOutputError) as excinfo:
-            parse_judge_verdict(_payload('supersedes'))
+            parse_judge_verdict(_payload('supersedes', 'm1'), self._SLATE)
         assert 'supersedes' in str(excinfo.value)
+
+    def test_an_off_slate_rejection_names_the_id_and_the_slate(self) -> None:
+        with pytest.raises(JudgeOutputError) as excinfo:
+            parse_judge_verdict(_payload('restates', 'm9'), self._SLATE)
+        assert 'm9' in str(excinfo.value)
+        assert 'm1' in str(excinfo.value), 'the slate it is not on is named too'
 
     def test_a_pathological_payload_is_truncated_in_the_message(self) -> None:
         """The judge output reaches a log line; an unbounded one is a hazard."""
         raw = 'x' * 20_000
         with pytest.raises(JudgeOutputError) as excinfo:
-            parse_judge_verdict(raw)
+            parse_judge_verdict(raw, self._SLATE)
         assert len(str(excinfo.value)) < 2_000
 
     def test_a_non_string_input_raises_rather_than_crashing(self) -> None:
         """An SDK that returned None for the body is a judge failure, not a TypeError."""
         with pytest.raises(JudgeOutputError):
-            parse_judge_verdict(None)  # type: ignore[arg-type]
+            parse_judge_verdict(None, self._SLATE)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +613,57 @@ def _result(
 def _decision(canonical_id: str | None, similarity: float | None = 0.80) -> BandDecision:
     """A middle-band decision naming *canonical_id* as the attach target."""
     return BandDecision(OUTCOME_JUDGE, canonical_id, similarity, 0.95, 0.70)
+
+
+def _worst_case_call_chars() -> int:
+    """Characters in the widest judge call the shipped defaults allow.
+
+    The worst case is not hypothetical: the calibration fixture holds a
+    ~9k-char canonical, so a full slate of over-long candidates plus an
+    over-long entry is what a real call looks like when the corpus is at its
+    largest. Built rather than arithmetic, so the scaffolding between the
+    fields is counted too.
+
+    BUILT THE WAY ``judge_write`` CALLS IT, which is the whole point — a
+    construction the production path never makes bounds nothing. The
+    candidate ids are the 36-char uuids every record actually carries (all
+    104 in ``tests/fixtures/write_triage_calibration.jsonl`` are, and
+    ``build_judge_prompt`` renders ``- id:`` UN-elided); a 5-char stand-in id
+    under-measures every candidate line, so the length is asserted rather
+    than assumed.
+
+    THE FIELDS ARE OVER THE DEFAULT FIELD CAP, NOT AT IT. ``_elide`` returns a
+    field of exactly the cap untouched and cuts a longer one to the cap PLUS
+    ``_ELIDED_MARKER`` — so the input that elides renders 9 chars wider per
+    field, 54 across a full slate, than the input that merely fills. A worst
+    case built at the cap is therefore not the worst case; it is the widest
+    input that never trips the behaviour the budget exists to bound.
+    """
+    maximal = 'x' * (_DEFAULT_JUDGE_FIELD_CHARS + 1)
+    candidates = [
+        _result(str(uuid.uuid4()), 0.9, content=maximal)
+        for _ in range(_DEFAULT_JUDGE_CANDIDATE_COUNT)
+    ]
+    assert {len(c.id) for c in candidates} == {36}, (
+        'the slate must carry the 36-char uuids production carries — a '
+        'shorter stand-in id under-measures every candidate line'
+    )
+    rendered = build_judge_prompt(
+        maximal, candidates, field_chars=_DEFAULT_JUDGE_FIELD_CHARS,
+    )
+    assert _ELIDED_MARKER in rendered, (
+        'the worst case must be an ELIDED render — otherwise it misses the '
+        'marker _elide appends, and under-measures the real ceiling'
+    )
+    return len(JUDGE_SYSTEM_PROMPT) + len(rendered)
+
+
+#: The repo root, reached from `<repo>/fused-memory/tests/server/`.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+#: The flip gate's own attach-target checker, and the tree it reads.
+_PROBE_PATH = _REPO_ROOT / 'scripts' / 'check_write_triage_attach_target.py'
+_JUDGE_SRC_ROOT = _REPO_ROOT / 'fused-memory' / 'src'
 
 
 class TestSelectJudgeCandidates:
@@ -378,14 +746,34 @@ class TestSelectJudgeCandidates:
         result set at all. The parent is what the attach targets, so when the
         hoisted id is absent the CHILD that carried the evidence must stay —
         dropping both would leave the judge with no view of the match at all.
+
+        The child is scored BELOW every peer on purpose. Scored above them it
+        is plain top-1, an unconditional `sorted(...)[:n]` returns the same
+        slate, and the branch this test names is never the reason it passes —
+        which is why deleting the `PARENT_ID_KEY` fallback outright used to
+        leave the whole suite green. At 0.55 against six records at
+        0.90..0.85 the rescue arm is the ONLY thing that can put it in.
+
+        The eviction victim is asserted too. The sibling
+        `test_the_bands_winner_is_always_present` checks membership and
+        `len <= n`, so a rescue that dropped the STRONGEST candidate instead
+        of the weakest would satisfy both it and a bare `in` check here.
         """
         child = _result(
-            'child-1', 0.97,
+            'child-1', 0.55,
             extra_metadata={'kind': AMENDMENT_KIND, PARENT_ID_KEY: 'parent-1'},
         )
-        results = [child, *[_result(f'm{i}', 0.90 - i / 100) for i in range(6)]]
-        selected = select_judge_candidates(results, 3, canonical_id='parent-1')
-        assert 'child-1' in [r.id for r in selected]
+        peers = [_result(f'm{i}', 0.90 - i / 100) for i in range(6)]
+        selected = select_judge_candidates(
+            [child, *peers], 3, canonical_id='parent-1',
+        )
+        ids = [r.id for r in selected]
+        assert 'child-1' in ids
+        # The rescue EVICTS rather than widens: still exactly n.
+        assert len(selected) == 3
+        # And it evicts the WEAKEST of the window (m2 at 0.88), not an
+        # arbitrary one — m0 and m1 are the two strongest and both survive.
+        assert ids == ['m0', 'm1', 'child-1']
 
     def test_an_empty_input_returns_empty_without_raising(self) -> None:
         """Nothing to compare is a decision, not a failure."""
@@ -438,8 +826,15 @@ class TestBuildJudgePrompt:
         assert VERDICT_KEY in prompt
         assert 'JSON' in prompt or 'json' in prompt
 
+    def test_both_halves_of_the_call_request_the_one_reply_shape(self) -> None:
+        """One spelling of the output contract, so the two halves cannot disagree."""
+        assert VERDICT_KEY in JUDGE_REPLY_SHAPE
+        assert CANDIDATE_ID_KEY in JUDGE_REPLY_SHAPE
+        assert JUDGE_REPLY_SHAPE in JUDGE_SYSTEM_PROMPT
+        assert JUDGE_REPLY_SHAPE in build_judge_prompt('new', [_result('m1', 0.9)])
+
     def test_a_long_candidate_is_truncated_and_marked(self) -> None:
-        """The fixture contains a ~9k-char canonical; the budget is ~2.5k tokens.
+        """The fixture contains a ~9k-char canonical; the default cap is 4,000 chars.
 
         Truncating silently would be worse than not truncating: a model told
         nothing would treat a severed sentence as the whole record. The elided
@@ -495,6 +890,51 @@ class TestBuildJudgePrompt:
         """Pure and total: rendering never raises, whatever it is handed."""
         assert isinstance(build_judge_prompt('new', []), str)
 
+    def test_the_width_is_a_parameter(self) -> None:
+        """A field at the width renders whole; one char over is cut there and marked."""
+        prompt = build_judge_prompt(
+            'e' * 10, [_result('m1', 0.9, content='c' * 11)], field_chars=10,
+        )
+        assert 'e' * 10 + '\n' in prompt
+        assert 'e' * 10 + _ELIDED_MARKER not in prompt
+        assert 'c' * 10 + _ELIDED_MARKER in prompt
+        assert 'c' * 11 not in prompt
+
+
+class TestAttachTargetGateProbe:
+    """The flip gate's own checker, run against this worktree's source.
+
+    `scripts/check_write_triage_flip_preconditions.sh` item 1 delegates to
+    `scripts/check_write_triage_attach_target.py`, which asserts the INVARIANT
+    (a verdict binds to a determinate candidate) rather than any mechanism.
+    Running the gate's own probe as the oracle is what keeps this suite and
+    the gate from ever disagreeing about whether item 1 is closed — nothing
+    about the invariant is re-implemented here.
+    """
+
+    def test_the_probe_reports_a_clean_pass(self) -> None:
+        """Exit 0, and NOT the `PASS-NEEDS-CONFIRMATION` downgrade.
+
+        The downgrade means the marker echoed its argument and was forgiven
+        only because the parameter is target-NAMED; it demands an operator
+        eyeball before the flip. A marker that matches against the slate earns
+        the clean pass instead.
+        """
+        if not _PROBE_PATH.exists():
+            pytest.skip(f'attach-target probe not present at {_PROBE_PATH}')
+        completed = subprocess.run(
+            [sys.executable, str(_PROBE_PATH), '--src-root', str(_JUDGE_SRC_ROOT)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert (
+            'PASS  the judge path binds a verdict to a determinate candidate'
+            in completed.stdout
+        ), completed.stdout
+        assert 'PASS-NEEDS-CONFIRMATION' not in completed.stdout, completed.stdout
+
 
 # ---------------------------------------------------------------------------
 # defensive config resolvers
@@ -540,9 +980,6 @@ class TestResolveJudgeEnabled:
     operator would turn `enabled` on, silently get stub behaviour, and read
     the resulting all-`stored` ack stream as evidence the corpus is novel.
     """
-
-    def test_the_default_is_on(self) -> None:
-        assert _DEFAULT_JUDGE_ENABLED is True
 
     @pytest.mark.parametrize('value', [True, False])
     def test_a_configured_bool_is_used(self, value: bool) -> None:
@@ -727,6 +1164,19 @@ class TestResolveJudgeTimeout:
     def test_the_default_is_bounded_well_under_the_sdk_default(self) -> None:
         assert 0 < _DEFAULT_JUDGE_TIMEOUT_SECONDS <= 60
 
+    def test_the_schema_default_is_the_fallback_and_what_config_yaml_ships(self) -> None:
+        """The schema field is the default's one home; its description says why.
+
+        The resolver's fallback derives from it, and the shipped config.yaml
+        (read here through the conftest's CONFIG_PATH pin) restates it, so the
+        yaml is the one copy that can drift.
+        """
+        schema_default = WriteTriageConfig.model_fields['judge_timeout_seconds'].default
+
+        assert schema_default == 15.0
+        assert resolve_judge_timeout(object()) == schema_default
+        assert FusedMemoryConfig().write_triage.judge_timeout_seconds == schema_default
+
     @pytest.mark.parametrize('value', [1, 2.5, 30, 0.01])
     def test_a_configured_positive_number_is_used(self, value: float) -> None:
         assert resolve_judge_timeout(_svc(judge_timeout_seconds=value)) == value
@@ -784,6 +1234,59 @@ class TestResolveJudgeCandidateCount:
         )
 
 
+class TestResolveJudgeFieldChars:
+    """The per-field character cap the judge reads each record through."""
+
+    def test_a_configured_int_is_used(self) -> None:
+        assert resolve_judge_field_chars(_svc(judge_field_chars=2_000)) == 2_000
+
+    @pytest.mark.parametrize(
+        ('label', 'service'), _MISSING_HOPS,
+        ids=[label for label, _ in _MISSING_HOPS],
+    )
+    def test_a_missing_hop_falls_back_to_the_default(
+        self, label: str, service: object,
+    ) -> None:
+        assert resolve_judge_field_chars(service) == _DEFAULT_JUDGE_FIELD_CHARS, label
+
+    @pytest.mark.parametrize('value', [0, -1, 2.5, '4000', True, False, [], None])
+    def test_a_non_positive_or_non_int_cap_falls_back(self, value: object) -> None:
+        """A zero cap would elide every field to nothing — empty records, every write."""
+        service = _svc(judge_field_chars=value)
+        assert resolve_judge_field_chars(service) == _DEFAULT_JUDGE_FIELD_CHARS
+
+    def test_the_shipped_config_resolves_to_the_fallback(self) -> None:
+        """config.yaml, read through the conftest's CONFIG_PATH pin, ships the default."""
+        shipped = types.SimpleNamespace(config=FusedMemoryConfig())
+
+        assert resolve_judge_field_chars(shipped) == _DEFAULT_JUDGE_FIELD_CHARS
+
+
+class TestResolveJudgeReasoningEffort:
+    """`judge_reasoning_effort` — sent only when set; ``None`` omits the parameter."""
+
+    @pytest.mark.parametrize('value', ['none', 'low', 'medium', 'high'])
+    def test_a_configured_effort_is_used(self, value: str) -> None:
+        assert resolve_judge_reasoning_effort(_svc(judge_reasoning_effort=value)) == value
+
+    @pytest.mark.parametrize(
+        ('label', 'service'), _MISSING_HOPS,
+        ids=[label for label, _ in _MISSING_HOPS],
+    )
+    def test_a_missing_hop_omits_the_parameter(
+        self, label: str, service: object,
+    ) -> None:
+        assert resolve_judge_reasoning_effort(service) is None, label
+
+    @pytest.mark.parametrize(
+        'value', ['minimal', 'LOW', 'xhigh', '', 1, True, None, []],
+    )
+    def test_an_out_of_set_effort_omits_the_parameter(self, value: object) -> None:
+        """A value the API would reject on every call is not sent at all."""
+        service = _svc(judge_reasoning_effort=value)
+        assert resolve_judge_reasoning_effort(service) is None
+
+
 class TestEveryResolverReadsLive:
     """Nothing is captured at import or construction.
 
@@ -806,8 +1309,13 @@ class TestEveryResolverReadsLive:
             (resolve_judge_model, 'judge_model', 'model-a', 'model-b'),
             (resolve_judge_timeout, 'judge_timeout_seconds', 5.0, 12.0),
             (resolve_judge_candidate_count, 'judge_candidate_count', 3, 4),
+            (resolve_judge_reasoning_effort, 'judge_reasoning_effort', 'low', 'high'),
+            (resolve_judge_field_chars, 'judge_field_chars', 1_200, 4_000),
         ],
-        ids=['enabled', 'provider', 'model', 'timeout', 'candidate_count'],
+        ids=[
+            'enabled', 'provider', 'model', 'timeout', 'candidate_count',
+            'reasoning_effort', 'field_chars',
+        ],
     )
     def test_a_mutation_is_observed_on_the_very_next_call(
         self, resolver, attr: str, first: object, second: object,
@@ -823,11 +1331,59 @@ class TestEveryResolverReadsLive:
 # ---------------------------------------------------------------------------
 
 
-def _openai_client(content: str | None) -> MagicMock:
-    """A fake ``AsyncOpenAI`` yielding *content* as the message body.
+def _client_double() -> MagicMock:
+    """A client double that is its own async context manager, like the SDKs.
+
+    `AsyncOpenAI.__aenter__` and `AsyncAnthropic.__aenter__` both `return
+    self` (read off openai 2.31.0 / anthropic 0.92.0), so `async with
+    client as c` binds the SAME object. A bare `MagicMock` instead returns a
+    FRESH child from `__aenter__`, which would make every `create` assertion
+    in this file inspect a different mock than the one `_call_llm` called —
+    passing or failing for reasons that have nothing to do with the code.
+
+    `__aexit__` returns False, because the real ones do: releasing a client
+    must not suppress an in-flight exception (see `TestTheClientIsReleased`).
+    """
+    client = MagicMock()
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    return client
+
+
+def _incomplete_openai_client(content: str, reason: str) -> MagicMock:
+    """A Responses answer the provider marked ``incomplete`` for *reason*."""
+    client = _openai_client(content, status='incomplete')
+    client.responses.create.return_value.incomplete_details = types.SimpleNamespace(
+        reason=reason,
+    )
+    return client
+
+
+def _openai_client(
+    content: str | None, usage: object = None, status: str = 'completed',
+) -> MagicMock:
+    """A fake ``AsyncOpenAI`` whose Responses API answers *content*.
+
+    The response is plain namespaces in the SDK ``Response``'s shape
+    (``output_text``, ``usage``, ``status``, ``incomplete_details``), so an
+    unset *usage* reports none rather than an auto-generated Mock. The chat
+    endpoint is a bare ``AsyncMock``, so a call on the wrong arm is visible.
+    """
+    client = _client_double()
+    client.responses.create = AsyncMock(return_value=types.SimpleNamespace(
+        output_text=content, usage=usage, status=status, incomplete_details=None,
+    ))
+    client.chat.completions.create = AsyncMock()
+    return client
+
+
+def _chat_client(content: str | None, usage: object = None) -> MagicMock:
+    """A fake ``AsyncOpenAI`` for an ``openai_generic`` endpoint: chat.completions only.
 
     Same construction shape as ``test_classifier.py::_make_mock_client`` — the
-    established openai double in this repo.
+    established openai double in this repo, plus the async-CM protocol the
+    client is used through. Without *usage* the response's ``usage`` is the
+    unspecced Mock's own auto-attribute, which reports no usable usage.
     """
     message = MagicMock()
     message.content = content
@@ -835,8 +1391,11 @@ def _openai_client(content: str | None) -> MagicMock:
     choice.message = message
     response = MagicMock()
     response.choices = [choice]
-    client = MagicMock()
+    if usage is not None:
+        response.usage = usage
+    client = _client_double()
     client.chat.completions.create = AsyncMock(return_value=response)
+    client.responses.create = AsyncMock()
     return client
 
 
@@ -857,7 +1416,7 @@ def _anthropic_client(blocks: list[FakeAnthropicTextBlock]) -> MagicMock:
     """A fake ``AsyncAnthropic`` whose ``messages.create`` yields *blocks*."""
     response = MagicMock()
     response.content = blocks
-    client = MagicMock()
+    client = _client_double()
     client.messages.create = AsyncMock(return_value=response)
     return client
 
@@ -874,6 +1433,253 @@ def _judge_svc(provider: str = 'openai', **write_triage) -> types.SimpleNamespac
     )
 
 
+def _compat_svc(**write_triage) -> types.SimpleNamespace:
+    """A judge service whose OpenAI endpoint serves chat.completions only."""
+    service = _judge_svc(**write_triage)
+    service.config.llm.client_class = 'openai_generic'
+    return service
+
+
+def _creds_svc(**providers: object) -> types.SimpleNamespace:
+    """A service double carrying an `llm.providers.<name>` section per kwarg."""
+    return types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            write_triage=types.SimpleNamespace(),
+            llm=types.SimpleNamespace(
+                provider='openai',
+                model='m',
+                providers=types.SimpleNamespace(**providers),
+            ),
+        ),
+    )
+
+
+class TestProviderCredentials:
+    """The config -> SDK-kwargs hop, which had no coverage at all.
+
+    Replacing the whole body of `_provider_credentials` with `return {}` left
+    the suite green, so neither the `api_url` -> `base_url` RENAME nor the
+    `api_key` passthrough was pinned by anything. The rename is the part that
+    matters: both SDKs take `base_url`, so forwarding `api_url` verbatim is a
+    `TypeError` inside `_call_llm` — landing in `triage_write`'s fail-open arm
+    as a counted failure on every middle-band write, for a deployment that
+    pins a local OpenAI-compatible endpoint.
+    """
+
+    def test_a_configured_section_maps_onto_the_sdk_kwarg_names(self) -> None:
+        """`api_url` becomes `base_url`; `api_key` keeps its name."""
+        service = _creds_svc(
+            openai=types.SimpleNamespace(
+                api_key='sk-pinned', api_url='http://localhost:8000/v1',
+            ),
+        )
+        assert _provider_credentials(service, 'openai').client_kwargs == {
+            'api_key': 'sk-pinned',
+            'base_url': 'http://localhost:8000/v1',
+        }
+
+    def test_either_leaf_alone_is_forwarded(self) -> None:
+        """Pinning a key without an endpoint (and vice versa) is a real config."""
+        key_only = _creds_svc(openai=types.SimpleNamespace(api_key='sk-only'))
+        assert _provider_credentials(key_only, 'openai').client_kwargs == {
+            'api_key': 'sk-only',
+        }
+        url_only = _creds_svc(anthropic=types.SimpleNamespace(api_url='http://h/v1'))
+        assert _provider_credentials(url_only, 'anthropic').client_kwargs == {
+            'base_url': 'http://h/v1',
+        }
+
+    @pytest.mark.parametrize(
+        ('label', 'service'),
+        [
+            ('no providers section', _svc(llm=types.SimpleNamespace(
+                provider='openai', model='m', providers=None,
+            ))),
+            ('no entry for this provider', _creds_svc(
+                anthropic=types.SimpleNamespace(api_key='sk-other'),
+            )),
+            ('entry with neither leaf', _creds_svc(
+                openai=types.SimpleNamespace(),
+            )),
+            ('no llm section', _svc()),
+            ('unspecced mock', Mock()),
+        ],
+        ids=['no-providers', 'other-provider-only', 'empty-entry',
+             'no-llm', 'unspecced-mock'],
+    )
+    def test_an_unconfigured_provider_yields_an_empty_dict(
+        self, label: str, service: object,
+    ) -> None:
+        """Empty is a FIRST-CLASS result: both SDKs fall back to the env.
+
+        That is how this deployment is actually configured (`OPENAI_API_KEY`
+        in the shell, nothing in config.yaml), so raising here would break the
+        shipped path rather than a misconfigured one. `other-provider-only`
+        also pins that a sibling provider's key is not handed to the arm that
+        was actually selected.
+        """
+        assert _provider_credentials(service, 'openai').client_kwargs == {}, label
+
+    @pytest.mark.parametrize('value', ['', None, 0, b'sk-bytes', object()])
+    def test_a_blank_or_non_string_leaf_is_not_forwarded(self, value: object) -> None:
+        """An empty string must not be sent as a credential.
+
+        `AsyncOpenAI(api_key='')` does NOT fall back to the environment — it
+        authenticates with an empty key and 401s, which reads as an outage
+        rather than as the empty-leaf config that caused it. Dropping it
+        restores the env fallback, which is the behaviour an operator who
+        cleared the leaf is asking for.
+        """
+        service = _creds_svc(
+            openai=types.SimpleNamespace(api_key=value, api_url=value),
+        )
+        assert _provider_credentials(service, 'openai').client_kwargs == {}
+
+    @pytest.mark.parametrize(
+        ('provider', 'client_class', 'serves_responses_api'),
+        [
+            ('openai', None, True),
+            ('openai', 'openai', True),
+            ('openai', 'openai_generic', False),
+            ('anthropic', None, False),
+            ('anthropic', 'openai', False),
+            ('anthropic', 'openai_generic', False),
+        ],
+        ids=[
+            'openai-absent', 'openai-openai', 'openai-generic',
+            'anthropic-absent', 'anthropic-openai', 'anthropic-generic',
+        ],
+    )
+    def test_the_capability_flag_follows_llm_client_class(
+        self, provider: str, client_class: str | None, serves_responses_api: bool,
+    ) -> None:
+        """`llm.client_class` is the deployment's declaration of what the endpoint speaks."""
+        service = _creds_svc(openai=types.SimpleNamespace(api_url='http://h/v1'))
+        if client_class is not None:
+            service.config.llm.client_class = client_class
+
+        creds = _provider_credentials(service, provider)
+
+        assert creds.serves_responses_api is serves_responses_api
+
+    def test_the_shipped_config_serves_the_responses_api_despite_its_base_url(
+        self,
+    ) -> None:
+        """The shipped config.yaml ALWAYS sets a base_url for openai.
+
+        `llm.providers.openai.api_url` is `${OPENAI_API_URL:https://api.openai.com/v1}`,
+        so a "base_url present => compat endpoint" rule would have routed
+        production to chat.completions and defeated the Responses arm.
+        """
+        service = types.SimpleNamespace(config=FusedMemoryConfig())
+
+        creds = _provider_credentials(service, 'openai')
+
+        assert creds.client_kwargs.get('base_url')
+        assert creds.serves_responses_api is True
+
+    @pytest.mark.asyncio
+    async def test_the_credentials_reach_the_sdk_constructor(self) -> None:
+        """The resolved kwargs are what the client is actually built with."""
+        service = _creds_svc(
+            openai=types.SimpleNamespace(api_key='sk-wire', api_url='http://h/v1'),
+        )
+        service.config.write_triage = types.SimpleNamespace(
+            judge_provider='openai', judge_model='test-model',
+        )
+        client = _openai_client(_payload('distinct'))
+        with patch('openai.AsyncOpenAI', return_value=client) as ctor:
+            await judge_write(
+                memory_service=service,
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert ctor.call_args.kwargs == {
+            'api_key': 'sk-wire', 'base_url': 'http://h/v1',
+        }
+
+
+class TestTheVerdictCarriesTheCallsUsage:
+    """The provider's per-call usage rides on the verdict, so a write can be priced.
+
+    Usage is metadata about a call that already succeeded: an unreadable usage
+    must never turn a good verdict into a fail-open.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_anthropic_arm_reports_its_usage(self) -> None:
+        client = _anthropic_client(
+            [FakeAnthropicTextBlock(text=_payload('contests', 'm1'))],
+        )
+        client.messages.create.return_value.usage = types.SimpleNamespace(
+            input_tokens=700, output_tokens=30,
+        )
+        with patch('anthropic.AsyncAnthropic', return_value=client):
+            verdict = await judge_write(
+                memory_service=_judge_svc('anthropic'),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert verdict.usage == JudgeUsage(700, 30, None)
+        assert (verdict.outcome, verdict.candidate_id) == (OUTCOME_CONTESTED, 'm1')
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'response_usage',
+        [
+            pytest.param({}, id='absent'),
+            pytest.param({'usage': None}, id='None'),
+            pytest.param({'usage': MagicMock()}, id='unspecced mock'),
+            pytest.param(
+                {'usage': types.SimpleNamespace(input_tokens=True, output_tokens=40)},
+                id='a bool count',
+            ),
+            pytest.param(
+                {'usage': types.SimpleNamespace(input_tokens='850', output_tokens=40)},
+                id='a str count',
+            ),
+        ],
+    )
+    async def test_an_unreadable_usage_leaves_the_verdict_unpriced(
+        self, response_usage: dict,
+    ) -> None:
+        """`int(MagicMock())` is 1: the reader checks `isinstance(int)`, never coerces."""
+        client = _client_double()
+        client.responses.create = AsyncMock(return_value=types.SimpleNamespace(
+            output_text=_payload('amends', 'm1'), status='completed',
+            incomplete_details=None, **response_usage,
+        ))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert verdict == TriageJudgeVerdict(OUTCOME_AMENDED, 'm1')
+        assert verdict.usage is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('write_triage', 'decision', 'candidates'),
+        [
+            pytest.param(
+                {'judge_enabled': False}, _decision('m1'), [_result('m1', 0.80)],
+                id='disabled',
+            ),
+            pytest.param({}, _decision(None), [], id='empty slate'),
+        ],
+    )
+    async def test_no_call_reports_no_usage(
+        self, write_triage: dict, decision: BandDecision, candidates: list,
+    ) -> None:
+        verdict = await judge_write(
+            memory_service=_judge_svc(**write_triage),
+            content='c', project_id='p',
+            decision=decision, candidates=candidates,
+        )
+        assert verdict.usage is None
+
+
 class TestJudgeWriteDecisionsThatAreNotFailures:
     """Two paths answer `stored` WITHOUT raising, and they must not be counted.
 
@@ -883,6 +1689,70 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
     would guarantee a storm escalation describing a failure that is not
     happening, which trains an operator to ignore the alarm.
     """
+
+    @pytest.mark.asyncio
+    async def test_the_disabled_branch_says_so_in_the_log(self, caplog) -> None:
+        """An unlogged kill switch is indistinguishable from a novel corpus.
+
+        This branch returns `stored` with no log line, no counter and nothing
+        on the ack to tell it apart — reproducing exactly the state
+        `_DEFAULT_JUDGE_ENABLED = True` is justified against in its own
+        comment: "the operator would flip `enabled`, get stub behaviour, and
+        read the all-`stored` ack stream as evidence the corpus is novel".
+        Defaulting the knob to True does not help the operator who sets it to
+        False and then reads the logs.
+
+        INFO, not a counter: the reviewer is right that counting this would be
+        wrong. It is a decision, not a failure, and routing it through the
+        fail-open counter would fire a storm escalation describing an outage
+        that is not happening.
+        """
+        with caplog.at_level(logging.INFO):
+            verdict = await judge_write(
+                memory_service=_judge_svc(judge_enabled=False),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert verdict == TriageJudgeVerdict(OUTCOME_STORED)
+        disabled = [
+            r for r in caplog.records
+            if r.levelno == logging.INFO and 'judge_enabled' in r.getMessage()
+        ]
+        assert disabled, [r.getMessage() for r in caplog.records]
+        message = disabled[0].getMessage()
+        assert OUTCOME_STORED in message, message
+
+    @pytest.mark.asyncio
+    async def test_the_enabled_path_emits_no_such_record(self, caplog) -> None:
+        """One line per write is affordable only while the switch is ENGAGED."""
+        client = _openai_client(_payload('restates', 'm1'))
+        with caplog.at_level(logging.INFO), \
+                patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert not [
+            r for r in caplog.records if 'judge_enabled' in r.getMessage()
+        ], [r.getMessage() for r in caplog.records]
+
+    @pytest.mark.asyncio
+    async def test_the_empty_slate_branch_stays_quiet(self, caplog) -> None:
+        """Deliberately NOT logged: it is per-write and would be noise.
+
+        The kill switch is an operator ACTION and is worth a line per write
+        while it is engaged; "this write matched nothing comparable" is the
+        ordinary case and would drown it.
+        """
+        with caplog.at_level(logging.INFO):
+            verdict = await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision(None), candidates=[],
+            )
+        assert verdict == TriageJudgeVerdict(OUTCOME_STORED)
+        assert not caplog.records, [r.getMessage() for r in caplog.records]
 
     @pytest.mark.asyncio
     async def test_a_disabled_judge_answers_stored_and_makes_no_call(self) -> None:
@@ -896,8 +1766,8 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
                 decision=_decision('m1'),
                 candidates=[_result('m1', 0.80)],
             )
-        assert verdict == OUTCOME_STORED
-        client.chat.completions.create.assert_not_awaited()
+        assert verdict == TriageJudgeVerdict(OUTCOME_STORED)
+        client.responses.create.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_an_empty_candidate_set_answers_stored_and_makes_no_call(self) -> None:
@@ -911,8 +1781,8 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
                 decision=_decision(None),
                 candidates=[],
             )
-        assert verdict == OUTCOME_STORED
-        client.chat.completions.create.assert_not_awaited()
+        assert verdict == TriageJudgeVerdict(OUTCOME_STORED)
+        client.responses.create.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_wholly_uncomparable_slate_answers_stored(self) -> None:
@@ -926,8 +1796,34 @@ class TestJudgeWriteDecisionsThatAreNotFailures:
                 decision=_decision('pin0'),
                 candidates=[_result('pin0', None, omit_store_score=True)],
             )
-        assert verdict == OUTCOME_STORED
-        client.chat.completions.create.assert_not_awaited()
+        assert verdict == TriageJudgeVerdict(OUTCOME_STORED)
+        client.responses.create.assert_not_awaited()
+
+
+class TestTheSlateIsShownWithoutAFavourite:
+    """The model names its own candidate, so the prompt must not steer it to top-1."""
+
+    @pytest.mark.asyncio
+    async def test_the_prompt_does_not_favour_the_bands_winner(self) -> None:
+        """Whichever record the band ranked first, the model is shown the same thing.
+
+        All three candidates sit inside the default window, so the selector's
+        winner rescue cannot change the slate between the two calls.
+        """
+        candidates = [_result('m0', 0.90), _result('m1', 0.89), _result('m2', 0.88)]
+        sent = []
+        for winner in ('m0', 'm2'):
+            client = _openai_client(_payload('restates', winner))
+            with patch('openai.AsyncOpenAI', return_value=client):
+                await judge_write(
+                    memory_service=_judge_svc(),
+                    content='c',
+                    project_id='p',
+                    decision=_decision(winner),
+                    candidates=candidates,
+                )
+            sent.append(client.responses.create.call_args.kwargs['input'])
+        assert sent[0] == sent[1]
 
 
 class TestJudgeWriteOpenAIArm:
@@ -935,17 +1831,19 @@ class TestJudgeWriteOpenAIArm:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ('word', 'outcome'),
+        ('word', 'candidate_id', 'expected'),
         [
-            ('distinct', OUTCOME_STORED),
-            ('restates', OUTCOME_RESTATED),
-            ('amends', OUTCOME_AMENDED),
-            ('contests', OUTCOME_CONTESTED),
+            ('distinct', None, TriageJudgeVerdict(OUTCOME_STORED)),
+            ('restates', 'm1', TriageJudgeVerdict(OUTCOME_RESTATED, 'm1')),
+            ('amends', 'm1', TriageJudgeVerdict(OUTCOME_AMENDED, 'm1')),
+            ('contests', 'm1', TriageJudgeVerdict(OUTCOME_CONTESTED, 'm1')),
         ],
         ids=['distinct', 'restates', 'amends', 'contests'],
     )
-    async def test_each_verdict_round_trips(self, word: str, outcome: str) -> None:
-        client = _openai_client(_payload(word))
+    async def test_each_verdict_round_trips(
+        self, word: str, candidate_id: str | None, expected: TriageJudgeVerdict,
+    ) -> None:
+        client = _openai_client(_payload(word, candidate_id))
         with patch('openai.AsyncOpenAI', return_value=client):
             verdict = await judge_write(
                 memory_service=_judge_svc(),
@@ -954,30 +1852,95 @@ class TestJudgeWriteOpenAIArm:
                 decision=_decision('m1'),
                 candidates=[_result('m1', 0.80)],
             )
-        assert verdict == outcome
+        assert verdict == expected
 
     @pytest.mark.asyncio
-    async def test_the_call_is_made_once_with_the_resolved_shape(self) -> None:
-        """Deterministic, bounded, and JSON-forced — one call, no retry loop."""
-        client = _openai_client(_payload('amends'))
+    async def test_the_verdict_names_the_candidate_the_model_chose(self) -> None:
+        """The band's winner is m0; the model's own choice is what comes back."""
+        client = _openai_client(_payload('amends', 'm2'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await judge_write(
+                memory_service=_judge_svc(),
+                content='c',
+                project_id='p',
+                decision=_decision('m0'),
+                candidates=[_result('m0', 0.90), _result('m1', 0.89), _result('m2', 0.88)],
+            )
+        assert verdict == TriageJudgeVerdict(OUTCOME_AMENDED, 'm2')
+
+    @pytest.mark.asyncio
+    async def test_an_id_trimmed_off_the_rendered_slate_is_refused(self) -> None:
+        """Retrieved is not enough: the model must have been SHOWN what it names."""
+        client = _openai_client(_payload('amends', 'm4'))
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(JudgeOutputError):
+            await judge_write(
+                memory_service=_judge_svc(judge_candidate_count=2),
+                content='c',
+                project_id='p',
+                decision=_decision('m0'),
+                candidates=[_result(f'm{i}', 0.90 - i / 100) for i in range(5)],
+            )
+
+    @pytest.mark.asyncio
+    async def test_the_call_is_made_once_on_the_responses_api(self) -> None:
+        """Bounded and JSON-forced, one call, no retry loop, pinned exactly.
+
+        With ``judge_reasoning_effort`` null the model is a non-reasoning
+        classifier, so it is pinned to ``temperature=0.0`` as on the other two
+        arms and sent no ``reasoning``. An extra parameter fails here.
+        """
+        candidates = [_result('m1', 0.80)]
+        client = _openai_client(_payload('amends', 'm1'))
         with patch('openai.AsyncOpenAI', return_value=client):
             await judge_write(
                 memory_service=_judge_svc(judge_model='pinned-model'),
                 content='c',
                 project_id='p',
                 decision=_decision('m1'),
-                candidates=[_result('m1', 0.80)],
+                candidates=candidates,
             )
-        client.chat.completions.create.assert_awaited_once()
-        kwargs = client.chat.completions.create.call_args.kwargs
-        assert kwargs['model'] == 'pinned-model'
-        assert kwargs['temperature'] == 0.0
-        assert 0 < kwargs['max_tokens'] <= 256
-        assert kwargs['response_format'] == {'type': 'json_object'}
-        assert kwargs['messages'][0] == {
-            'role': 'system', 'content': JUDGE_SYSTEM_PROMPT,
+        client.responses.create.assert_awaited_once()
+        client.chat.completions.create.assert_not_awaited()
+        assert client.responses.create.call_args.kwargs == {
+            'model': 'pinned-model',
+            'instructions': JUDGE_SYSTEM_PROMPT,
+            'input': build_judge_prompt('c', candidates),
+            'max_output_tokens': judge_module._JUDGE_MAX_OUTPUT_TOKENS,
+            'text': {'format': {'type': 'json_object'}},
+            'temperature': 0.0,
         }
-        assert kwargs['messages'][1]['role'] == 'user'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('effort', ['none', 'low', 'medium', 'high'])
+    async def test_a_configured_effort_reaches_the_wire(self, effort: str) -> None:
+        """A reasoning model rejects a ``temperature``, so a set effort replaces it."""
+        client = _openai_client(_payload('amends', 'm1'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(judge_reasoning_effort=effort),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        kwargs = client.responses.create.call_args.kwargs
+        assert kwargs['reasoning'] == {'effort': effort}
+        assert 'temperature' not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_the_responses_usage_rides_on_the_verdict(self) -> None:
+        usage = types.SimpleNamespace(
+            input_tokens=900, output_tokens=60,
+            output_tokens_details=types.SimpleNamespace(reasoning_tokens=40),
+        )
+        client = _openai_client(_payload('restates', 'm1'), usage=usage)
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert verdict.usage == JudgeUsage(900, 60, 40)
+        assert (verdict.outcome, verdict.candidate_id) == (OUTCOME_RESTATED, 'm1')
 
     @pytest.mark.asyncio
     async def test_at_most_the_configured_candidate_count_reaches_the_prompt(self) -> None:
@@ -992,8 +1955,175 @@ class TestJudgeWriteOpenAIArm:
                 decision=_decision('m0'),
                 candidates=candidates,
             )
-        rendered = client.chat.completions.create.call_args.kwargs['messages'][1]['content']
+        rendered = client.responses.create.call_args.kwargs['input']
         assert sum(1 for c in candidates if f'id: {c.id}\n' in rendered) == 3
+
+    @pytest.mark.asyncio
+    async def test_with_the_leaf_unset_fields_render_up_to_the_default_width(self) -> None:
+        """The user-observable change: a 4,000-char field now reaches the model whole."""
+        client = _openai_client(_payload('distinct'))
+        candidate_text = 'a' * _DEFAULT_JUDGE_FIELD_CHARS
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='b' * (_DEFAULT_JUDGE_FIELD_CHARS + 1),
+                project_id='p',
+                decision=_decision('m1'),
+                candidates=[_result('m1', 0.80, content=candidate_text)],
+            )
+        rendered = client.responses.create.call_args.kwargs['input']
+        assert candidate_text in rendered
+        assert candidate_text + _ELIDED_MARKER not in rendered
+        assert 'b' * _DEFAULT_JUDGE_FIELD_CHARS + _ELIDED_MARKER in rendered
+        assert 'b' * (_DEFAULT_JUDGE_FIELD_CHARS + 1) not in rendered
+
+    @pytest.mark.asyncio
+    async def test_fields_are_cut_at_the_configured_width(self) -> None:
+        client = _openai_client(_payload('distinct'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(judge_field_chars=50),
+                content='x' * 60,
+                project_id='p',
+                decision=_decision('m1'),
+                candidates=[_result('m1', 0.80, content='x' * 60)],
+            )
+        rendered = client.responses.create.call_args.kwargs['input']
+        assert 'x' * 50 + _ELIDED_MARKER in rendered
+        assert 'x' * 51 not in rendered
+
+    @pytest.mark.asyncio
+    async def test_a_reloaded_width_changes_the_next_call(self) -> None:
+        """The in-place mutation apply_reload performs, observed with no rebuild."""
+        service = _judge_svc(judge_field_chars=50)
+        rendered = []
+        for width in (50, 55):
+            service.config.write_triage.judge_field_chars = width
+            client = _openai_client(_payload('distinct'))
+            with patch('openai.AsyncOpenAI', return_value=client):
+                await judge_write(
+                    memory_service=service,
+                    content='x' * 60,
+                    project_id='p',
+                    decision=_decision('m1'),
+                    candidates=[_result('m1', 0.80, content='x' * 60)],
+                )
+            rendered.append(client.responses.create.call_args.kwargs['input'])
+        assert 'x' * 50 + _ELIDED_MARKER in rendered[0]
+        assert 'x' * 51 not in rendered[0]
+        assert 'x' * 55 + _ELIDED_MARKER in rendered[1]
+        assert 'x' * 56 not in rendered[1]
+
+
+class TestTheChatArmServesCompatEndpoints:
+    """An ``openai_generic`` endpoint (llama.cpp, vLLM, ...) serves chat.completions only.
+
+    It keeps main's chat request byte for byte; task 5277 C owns its compat
+    400s. Which arm runs is decided by ``llm.client_class``, never the model.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_call_is_mains_chat_request(self) -> None:
+        candidates = [_result('m1', 0.80)]
+        client = _chat_client(_payload('amends', 'm1'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await judge_write(
+                memory_service=_compat_svc(judge_model='pinned-model'),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=candidates,
+            )
+        assert verdict == TriageJudgeVerdict(OUTCOME_AMENDED, 'm1')
+        client.chat.completions.create.assert_awaited_once()
+        client.responses.create.assert_not_awaited()
+        assert client.chat.completions.create.call_args.kwargs == {
+            'model': 'pinned-model',
+            'messages': [
+                {'role': 'system', 'content': JUDGE_SYSTEM_PROMPT},
+                {'role': 'user', 'content': build_judge_prompt('c', candidates)},
+            ],
+            'temperature': 0.0,
+            'max_tokens': _JUDGE_MAX_TOKENS,
+            'response_format': {'type': 'json_object'},
+        }
+
+    @pytest.mark.asyncio
+    async def test_the_chat_arm_reports_its_usage(self) -> None:
+        usage = types.SimpleNamespace(
+            prompt_tokens=850, completion_tokens=40,
+            completion_tokens_details=types.SimpleNamespace(reasoning_tokens=0),
+        )
+        client = _chat_client(_payload('restates', 'm1'), usage=usage)
+        with patch('openai.AsyncOpenAI', return_value=client):
+            verdict = await judge_write(
+                memory_service=_compat_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert verdict.usage == JudgeUsage(850, 40, 0)
+        assert (verdict.outcome, verdict.candidate_id) == (OUTCOME_RESTATED, 'm1')
+
+
+#: The two arms that cannot send a reasoning effort, each with a configured one.
+_ARMS_WITHOUT_REASONING = [
+    pytest.param(
+        lambda: _judge_svc('anthropic', judge_reasoning_effort='low'),
+        'anthropic.AsyncAnthropic',
+        id='anthropic',
+    ),
+    pytest.param(
+        lambda: _compat_svc(judge_reasoning_effort='low'),
+        'openai.AsyncOpenAI',
+        id='openai_generic',
+    ),
+]
+
+
+class TestAReasoningEffortTheArmCannotSendRaises:
+    """A set effort the arm cannot send is refused, never silently dropped (INV-11).
+
+    Dropping it would let an operator believe the selected configuration runs
+    when it does not. The refusal lands in ``triage_write``'s fail-open arm, as
+    the unknown-provider raise does, so it is counted and logged naming the leaf.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('make_service', 'ctor'), _ARMS_WITHOUT_REASONING)
+    async def test_the_call_is_refused_before_any_client_is_built(
+        self, make_service, ctor: str,
+    ) -> None:
+        client = _client_double()
+        client.messages.create = AsyncMock()
+        client.chat.completions.create = AsyncMock()
+        client.responses.create = AsyncMock()
+        with patch(ctor, return_value=client) as built, \
+                pytest.raises(ValueError, match='judge_reasoning_effort'):
+            await judge_write(
+                memory_service=make_service(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert built.call_count == 0
+        client.messages.create.assert_not_awaited()
+        client.chat.completions.create.assert_not_awaited()
+        client.responses.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(('make_service', 'ctor'), _ARMS_WITHOUT_REASONING)
+    async def test_through_triage_it_stores_and_counts_one_fail_open(
+        self, make_service, ctor: str,
+    ) -> None:
+        counter = TriageFailOpenCounter()
+        service = make_service()
+        service.config.write_triage.t_high = 0.95
+        service.config.write_triage.t_low = 0.50
+        service.search = AsyncMock(return_value=SearchResults([_result('m1', 0.80)]))
+        with patch(ctor, return_value=_client_double()):
+            decision = await triage_write(
+                service, content='c', project_id='p',
+                counter=counter, judge=judge_write,
+            )
+        assert decision.outcome == OUTCOME_STORED
+        assert counter.live_count() == 1
 
 
 class TestJudgeWriteAnthropicArm:
@@ -1006,7 +2136,9 @@ class TestJudgeWriteAnthropicArm:
 
     @pytest.mark.asyncio
     async def test_a_verdict_round_trips_through_the_anthropic_arm(self) -> None:
-        client = _anthropic_client([FakeAnthropicTextBlock(text=_payload('contests'))])
+        client = _anthropic_client(
+            [FakeAnthropicTextBlock(text=_payload('contests', 'm1'))],
+        )
         with patch('anthropic.AsyncAnthropic', return_value=client):
             verdict = await judge_write(
                 memory_service=_judge_svc('anthropic'),
@@ -1015,12 +2147,12 @@ class TestJudgeWriteAnthropicArm:
                 decision=_decision('m1'),
                 candidates=[_result('m1', 0.80)],
             )
-        assert verdict == OUTCOME_CONTESTED
+        assert verdict == TriageJudgeVerdict(OUTCOME_CONTESTED, 'm1')
 
     @pytest.mark.asyncio
     async def test_the_system_prompt_goes_via_the_system_parameter(self) -> None:
         """Anthropic has no system ROLE — a system message would be a user turn."""
-        client = _anthropic_client([FakeAnthropicTextBlock(text=_payload('amends'))])
+        client = _anthropic_client([FakeAnthropicTextBlock(text=_payload('amends', 'm1'))])
         with patch('anthropic.AsyncAnthropic', return_value=client):
             await judge_write(
                 memory_service=_judge_svc('anthropic', judge_model='pinned-model'),
@@ -1032,15 +2164,40 @@ class TestJudgeWriteAnthropicArm:
         kwargs = client.messages.create.call_args.kwargs
         assert kwargs['system'] == JUDGE_SYSTEM_PROMPT
         assert kwargs['model'] == 'pinned-model'
-        assert 0 < kwargs['max_tokens'] <= 256
+        assert kwargs['max_tokens'] == _JUDGE_MAX_TOKENS
         assert [m['role'] for m in kwargs['messages']] == ['user']
+
+    @pytest.mark.asyncio
+    async def test_this_arm_is_pinned_deterministic_like_the_other(self) -> None:
+        """`temperature=0.0` on BOTH arms — the openai one already had it.
+
+        Omitting it here does not mean "unset": Anthropic's default is 1.0,
+        so this arm was sampling. `_call_llm`'s own docstring scopes only
+        `response_format` to one provider, so the asymmetry contradicts the
+        module's stated contract as well as the openai arm.
+
+        It is not cosmetic. This is a classifier answering from a closed
+        vocabulary under a tight token cap with no JSON mode on this arm,
+        so sampling buys nothing and raises the odds of a preamble or a
+        truncated payload — each of which is a `JudgeOutputError`, and
+        therefore a COUNTED fail-open on the write path rather than a bad
+        answer.
+        """
+        client = _anthropic_client([FakeAnthropicTextBlock(text=_payload('amends', 'm1'))])
+        with patch('anthropic.AsyncAnthropic', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc('anthropic'),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        assert client.messages.create.call_args.kwargs['temperature'] == 0.0
 
     @pytest.mark.asyncio
     async def test_a_non_text_first_block_does_not_crash_the_read(self) -> None:
         """A leading non-text block must not be read as the answer."""
         client = _anthropic_client([
             FakeAnthropicTextBlock(type='thinking', text=''),
-            FakeAnthropicTextBlock(text=_payload('restates')),
+            FakeAnthropicTextBlock(text=_payload('restates', 'm1')),
         ])
         with patch('anthropic.AsyncAnthropic', return_value=client):
             verdict = await judge_write(
@@ -1050,7 +2207,130 @@ class TestJudgeWriteAnthropicArm:
                 decision=_decision('m1'),
                 candidates=[_result('m1', 0.80)],
             )
-        assert verdict == OUTCOME_RESTATED
+        assert verdict == TriageJudgeVerdict(OUTCOME_RESTATED, 'm1')
+
+
+class TestTheClientIsReleased:
+    """The SDK client is built per middle-band write and must not be leaked.
+
+    `_call_llm` constructs `AsyncOpenAI`/`AsyncAnthropic` on every triaged
+    write. Neither defines `__del__` (verified against openai 2.31.0), so an
+    unclosed client abandons an `httpx` connection pool — sockets and TLS
+    state — to the garbage collector, on a path that runs once per write in a
+    single long-lived server process.
+
+    The per-call CONSTRUCTION is deliberate and stays: a cached client keyed
+    to a config that hot-reloads would pin a stale `model`/`api_url` past a
+    reload the operator was told had applied, silently turning a green-tier
+    knob into a restart-only one. That rationale is fully preserved by
+    closing the client at the end of the call, which is what these tests pin.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_openai_client_is_released_on_the_happy_path(self) -> None:
+        client = _openai_client(_payload('restates', 'm1'))
+        with patch('openai.AsyncOpenAI', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        client.__aexit__.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_anthropic_client_is_released_on_the_happy_path(self) -> None:
+        client = _anthropic_client(
+            [FakeAnthropicTextBlock(text=_payload('amends', 'm1'))],
+        )
+        with patch('anthropic.AsyncAnthropic', return_value=client):
+            await judge_write(
+                memory_service=_judge_svc('anthropic'),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        client.__aexit__.assert_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('provider', 'ctor', 'attr'),
+        [
+            ('openai', 'openai.AsyncOpenAI', 'responses'),
+            ('anthropic', 'anthropic.AsyncAnthropic', 'messages'),
+        ],
+        ids=['openai', 'anthropic'],
+    )
+    async def test_the_client_is_released_on_the_timeout_path(
+        self, provider: str, ctor: str, attr: str,
+    ) -> None:
+        """The WORST case, and the one an `await ...; close()` shape misses.
+
+        `asyncio.wait_for` CANCELS the in-flight request, so a close written
+        after the awaited call never runs — the pool is abandoned precisely
+        when the provider is slow, i.e. exactly when writes are piling up.
+        """
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(5)
+
+        client = _client_double()
+        if provider == 'openai':
+            client.responses.create = AsyncMock(side_effect=_hang)
+        else:
+            client.messages.create = AsyncMock(side_effect=_hang)
+        with patch(ctor, return_value=client), pytest.raises(TimeoutError):
+            await judge_write(
+                memory_service=_judge_svc(provider, judge_timeout_seconds=0.01),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        client.__aexit__.assert_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_client_is_released_when_the_transport_raises(self) -> None:
+        """A release must not depend on the call having succeeded."""
+        client = _client_double()
+        client.responses.create = AsyncMock(side_effect=RuntimeError('boom'))
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(RuntimeError):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+        client.__aexit__.assert_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('module_name', 'attr'),
+        [('openai', 'AsyncOpenAI'), ('anthropic', 'AsyncAnthropic')],
+        ids=['openai', 'anthropic'],
+    )
+    async def test_the_real_clients_exit_does_not_swallow_an_exception(
+        self, module_name: str, attr: str,
+    ) -> None:
+        """A NEW dependency the `async with` introduces, pinned against the SDKs.
+
+        `async with` delegates the suppression decision to the object: an
+        `__aexit__` returning True swallows the in-flight exception. That
+        would hand `triage_write` a silent success and destroy `_call_llm`'s
+        "NO try/except ANYWHERE" property — no `exc_info` log, no counted
+        fail-open, and a broken judge reading exactly like a healthy one
+        answering "nothing matched" (INV-4).
+
+        The doubles above cannot pin this, because a double asserts only what
+        it was told to return. So this asks the REAL client classes, which is
+        where the contract actually lives, and it is what would fail if an SDK
+        upgrade ever started suppressing. No network: `__aexit__` closes the
+        transport and returns.
+        """
+        module = pytest.importorskip(module_name)
+        client = getattr(module, attr)(api_key='sk-not-used')
+        suppressed = await client.__aexit__(
+            RuntimeError, RuntimeError('boom'), None,
+        )
+        assert not suppressed, (
+            f'{attr}.__aexit__ returned {suppressed!r}; a truthy value would '
+            f'make `async with` swallow a judge failure into a silent `stored`'
+        )
 
 
 class TestJudgeWriteFailuresRaise:
@@ -1064,8 +2344,8 @@ class TestJudgeWriteFailuresRaise:
 
     @pytest.mark.asyncio
     async def test_a_transport_error_propagates(self) -> None:
-        client = MagicMock()
-        client.chat.completions.create = AsyncMock(side_effect=RuntimeError('boom'))
+        client = _client_double()
+        client.responses.create = AsyncMock(side_effect=RuntimeError('boom'))
         with patch('openai.AsyncOpenAI', return_value=client), \
                 pytest.raises(RuntimeError):
             await judge_write(
@@ -1086,12 +2366,36 @@ class TestJudgeWriteFailuresRaise:
         async def _hang(*_args, **_kwargs):
             await asyncio.sleep(5)
 
-        client = MagicMock()
-        client.chat.completions.create = AsyncMock(side_effect=_hang)
+        client = _client_double()
+        client.responses.create = AsyncMock(side_effect=_hang)
         with patch('openai.AsyncOpenAI', return_value=client), \
                 pytest.raises(TimeoutError):
             await judge_write(
                 memory_service=_judge_svc(judge_timeout_seconds=0.01),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_hang_past_the_timeout_raises_on_the_anthropic_arm_too(
+        self,
+    ) -> None:
+        """The timeout is per-ARM, and only the openai arm was pinned.
+
+        `_call_llm` wraps each arm in its own `asyncio.wait_for`, so a bound
+        that was dropped from one of them would leave that deployment on the
+        SDK's 600s default while this suite stayed green — the wedge described
+        in the openai case above, reachable by flipping one config key.
+        """
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(5)
+
+        client = _client_double()
+        client.messages.create = AsyncMock(side_effect=_hang)
+        with patch('anthropic.AsyncAnthropic', return_value=client), \
+                pytest.raises(TimeoutError):
+            await judge_write(
+                memory_service=_judge_svc('anthropic', judge_timeout_seconds=0.01),
                 content='c', project_id='p',
                 decision=_decision('m1'), candidates=[_result('m1', 0.80)],
             )
@@ -1120,6 +2424,23 @@ class TestJudgeWriteFailuresRaise:
             )
 
     @pytest.mark.asyncio
+    async def test_an_incomplete_responses_answer_names_its_reason(self) -> None:
+        """INV-2: the logged exception must say the budget was exhausted.
+
+        An empty-body JudgeOutputError cannot be told apart from a model that
+        answered nothing. And an incomplete answer is not a verdict even when
+        its partial text happens to parse, as this one does.
+        """
+        client = _incomplete_openai_client(_payload('restates', 'm1'), 'max_output_tokens')
+        with patch('openai.AsyncOpenAI', return_value=client), \
+                pytest.raises(JudgeOutputError, match='max_output_tokens'):
+            await judge_write(
+                memory_service=_judge_svc(),
+                content='c', project_id='p',
+                decision=_decision('m1'), candidates=[_result('m1', 0.80)],
+            )
+
+    @pytest.mark.asyncio
     async def test_an_unresolvable_provider_raises_rather_than_guessing(self) -> None:
         """Silently picking an arm would bill an account the operator did not choose.
 
@@ -1130,7 +2451,7 @@ class TestJudgeWriteFailuresRaise:
         with pytest.raises(ValueError, match='provider'):
             await _call_llm(
                 provider='gemini', model='m', prompt='p',
-                memory_service=_judge_svc(), timeout=1.0,
+                memory_service=_judge_svc(), timeout=1.0, reasoning_effort=None,
             )
 
 
@@ -1158,8 +2479,9 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
             (None, RuntimeError('transport down'), 'transport-error'),
             ('I cannot answer that.', None, 'unparseable'),
             ('', None, 'empty-body'),
+            (_payload('amends', 'not-on-the-slate'), None, 'off-slate-id'),
         ],
-        ids=['transport-error', 'unparseable', 'empty-body'],
+        ids=['transport-error', 'unparseable', 'empty-body', 'off-slate-id'],
     )
     async def test_a_broken_judge_stores_and_counts_exactly_once(
         self, body: str | None, side_effect: Exception | None, label: str,
@@ -1168,7 +2490,7 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
         service = self._mid_band_service()
         client = _openai_client(body)
         if side_effect is not None:
-            client.chat.completions.create = AsyncMock(side_effect=side_effect)
+            client.responses.create = AsyncMock(side_effect=side_effect)
 
         with patch('openai.AsyncOpenAI', return_value=client):
             decision = await triage_write(
@@ -1187,8 +2509,8 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
 
         counter = TriageFailOpenCounter()
         service = self._mid_band_service(judge_timeout_seconds=0.01)
-        client = MagicMock()
-        client.chat.completions.create = AsyncMock(side_effect=_hang)
+        client = _client_double()
+        client.responses.create = AsyncMock(side_effect=_hang)
 
         with patch('openai.AsyncOpenAI', return_value=client):
             decision = await triage_write(
@@ -1197,6 +2519,22 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
             )
 
         assert decision.outcome == OUTCOME_STORED
+        assert counter.live_count() == 1
+
+    @pytest.mark.asyncio
+    async def test_an_incomplete_answer_stores_and_counts_exactly_once(self) -> None:
+        counter = TriageFailOpenCounter()
+        service = self._mid_band_service()
+        client = _incomplete_openai_client(_payload('restates', 'm1'), 'max_output_tokens')
+
+        with patch('openai.AsyncOpenAI', return_value=client):
+            decision = await triage_write(
+                service, content='c', project_id='p',
+                counter=counter, judge=judge_write,
+            )
+
+        assert decision.outcome == OUTCOME_STORED
+        assert decision.canonical_id is None
         assert counter.live_count() == 1
 
     @pytest.mark.asyncio
@@ -1223,7 +2561,7 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
         """The happy path end-to-end: a verdict becomes an ack, nothing counted."""
         counter = TriageFailOpenCounter()
         service = self._mid_band_service()
-        client = _openai_client(_payload('amends'))
+        client = _openai_client(_payload('amends', 'm1'))
 
         with patch('openai.AsyncOpenAI', return_value=client):
             decision = await triage_write(
@@ -1234,3 +2572,145 @@ class TestJudgeWriteInheritsBetasFailOpenApparatus:
         assert decision.outcome == OUTCOME_AMENDED
         assert decision.canonical_id == 'm1'
         assert counter.live_count() == 0
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.environ.get('OPENAI_API_KEY'),
+    reason='needs OPENAI_API_KEY for a live Responses API call',
+)
+@pytest.mark.timeout(120)
+class TestTheFrontierArmLive:
+    """The live edge: a frontier reasoning model judges a fixture write through triage."""
+
+    @pytest.mark.asyncio
+    async def test_a_middle_band_write_is_judged_by_a_reasoning_model(
+        self, records: list[dict],
+    ) -> None:
+        duplicate = next(r for r in records if r['label'] == 'duplicate')
+        canonical = next(r for r in records if r['memory_id'] == duplicate['cluster_id'])
+        distractors = [r for r in records if r['cluster_id'] != duplicate['cluster_id']][:2]
+        slate = [
+            _result(canonical['memory_id'], 0.80, content=canonical['content']),
+            *(
+                _result(r['memory_id'], 0.75 - index * 0.05, content=r['content'])
+                for index, r in enumerate(distractors)
+            ),
+        ]
+        config = FusedMemoryConfig()
+        write_triage = config.write_triage
+        write_triage.judge_enabled = True
+        write_triage.judge_provider = 'openai'
+        write_triage.judge_model = 'gpt-6.1-sol'
+        write_triage.judge_reasoning_effort = 'low'
+        write_triage.t_high = 0.95
+        write_triage.t_low = 0.50
+        service = types.SimpleNamespace(
+            config=config, search=AsyncMock(return_value=SearchResults(slate)),
+        )
+        verdicts: list[TriageJudgeVerdict] = []
+
+        async def recording_judge(**kwargs) -> TriageJudgeVerdict:
+            verdict = await judge_write(**kwargs)
+            verdicts.append(verdict)
+            return verdict
+
+        counter = TriageFailOpenCounter()
+        decision = await triage_write(
+            service, content=duplicate['content'], project_id='p',
+            counter=counter, judge=recording_judge,
+        )
+
+        assert counter.live_count() == 0
+        assert decision.outcome in TRIAGE_OUTCOMES
+        if decision.judged_candidate_id is not None:
+            assert decision.judged_candidate_id in {result.id for result in slate}
+        [verdict] = verdicts
+        usage = verdict.usage
+        assert usage is not None
+        assert isinstance(usage.input_tokens, int) and usage.input_tokens > 0
+        assert isinstance(usage.reasoning_tokens, int)
+        assert usage.reasoning_tokens <= usage.output_tokens
+
+
+def _contests_exemplar() -> judge_module.JudgeExemplar:
+    """The worked `contests` example, looked up through the public tuple."""
+    return next(
+        exemplar for exemplar in judge_module.JUDGE_EXEMPLARS
+        if exemplar.verdict == 'contests'
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not os.environ.get('OPENAI_API_KEY'),
+    reason='needs OPENAI_API_KEY for a live Responses API call',
+)
+@pytest.mark.timeout(120)
+class TestTheShippedWordingLive:
+    """Boundary row 3 (flip-readiness PRD §11.4): `contests` covers an outdated candidate.
+
+    Pinned to Sol: gpt-4o-mini labels both outdated entries `contested` under
+    the old wording too, so only Sol tells the two wordings apart.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('entry', 'expected'),
+        [
+            (_contests_exemplar().entry, OUTCOME_CONTESTED),
+            (
+                'The greenhouse thermostat was recalibrated to Celsius last '
+                'week, so it no longer reads in Fahrenheit.',
+                OUTCOME_CONTESTED,
+            ),
+            (
+                'Since the March firmware update, the greenhouse thermostat '
+                'is calibrated in Celsius.',
+                OUTCOME_CONTESTED,
+            ),
+            (
+                "The glasshouse thermostat's calibration uses the Fahrenheit scale.",
+                OUTCOME_RESTATED,
+            ),
+            (
+                'The greenhouse thermostat is calibrated in Fahrenheit and is '
+                'accurate to within half a degree.',
+                OUTCOME_AMENDED,
+            ),
+        ],
+        ids=[
+            'contests-exemplar',
+            'explicitly-outdated',
+            'implicitly-outdated',
+            'paraphrase-restates',
+            'agreeing-addition-amends',
+        ],
+    )
+    async def test_the_judge_reads_the_entry_against_the_thermostat_record(
+        self, entry: str, expected: str,
+    ) -> None:
+        candidate_id = str(uuid.uuid4())
+        slate = [
+            _result(candidate_id, 0.80, content=_contests_exemplar().candidate),
+            _result(
+                str(uuid.uuid4()), 0.60,
+                content='The irrigation pump in the greenhouse runs for ten '
+                        'minutes every morning at six.',
+            ),
+        ]
+        config = FusedMemoryConfig()
+        write_triage = config.write_triage
+        write_triage.judge_enabled = True
+        write_triage.judge_provider = 'openai'
+        write_triage.judge_model = 'gpt-6.1-sol'
+        write_triage.judge_reasoning_effort = 'low'
+        service = types.SimpleNamespace(config=config)
+
+        verdict = await judge_write(
+            memory_service=service, content=entry, project_id='p',
+            decision=_decision(candidate_id), candidates=slate,
+        )
+
+        assert verdict.outcome == expected
+        assert verdict.candidate_id == candidate_id

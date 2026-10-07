@@ -7,11 +7,17 @@ Follows the idiom established in test_tab_curator.py and test_index_html.py.
 
 from __future__ import annotations
 
-import html.parser
 import re
 
 import pytest
-from _dashboard_helpers import extract_function_body, strip_js_comments
+from _dashboard_helpers import (
+    assert_script_loads_before,
+    extract_df_data_block,
+    extract_function_body,
+    find_script_position,
+    strip_js_comments,
+    walk_balanced,
+)
 
 # ---------------------------------------------------------------------------
 # Module-scoped fixtures
@@ -32,130 +38,8 @@ def tab_escalations_jsx_code(tab_escalations_jsx_body):
 
 
 # ---------------------------------------------------------------------------
-# Helper: extract a named seed block from window.DF_DATA (brace-aware)
-# ---------------------------------------------------------------------------
-
-
-def _extract_df_data_block(src: str, key: str) -> str:
-    """Return the body of the ``<key>: { ... }`` seed object, braces included.
-
-    Locates ``<key>:`` followed by ``{`` (allowing arbitrary whitespace), then
-    walks forward counting ``{``/``}`` to find the matching close brace.
-    This is brace-aware: a simple regex ``[^}]*`` would stop at the first
-    nested ``}`` and miss later keys.
-    Returns the empty string if no matching block is found.
-
-    Note: the brace-depth walk does not skip ``{``/``}`` inside JS string
-    literals.  This is acceptable because the data.js seed block uses simple
-    numeric/array values and does not embed brace characters inside quoted
-    strings.
-    """
-    m = re.search(rf'{re.escape(key)}\s*:\s*\{{', src)
-    if m is None:
-        return ''
-    start = m.end() - 1  # index of the opening `{`
-    depth = 0
-    for i in range(start, len(src)):
-        c = src[i]
-        if c == '{':
-            depth += 1
-        elif c == '}':
-            depth -= 1
-            if depth == 0:
-                return src[start : i + 1]
-    return ''
-
-
-# ---------------------------------------------------------------------------
 # Helper: extract a named JS/JSX function body (brace-aware)
 # ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# Load-order helpers (copied from test_index_html.py)
-# ---------------------------------------------------------------------------
-
-
-class _ScriptTagCollector(html.parser.HTMLParser):
-    """Collects the attribute dicts for every <script> start-tag encountered."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.script_attrs: list[dict[str, str | None]] = []
-
-    def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]]
-    ) -> None:
-        if tag == 'script':
-            self.script_attrs.append(dict(attrs))
-
-
-def _find_script_position(
-    body: str, src_prefix: str
-) -> tuple[int, dict[str, str | None]] | None:
-    """Return ``(index, attrs)`` for the first <script> tag whose ``src``
-    starts with ``src_prefix``, or ``None`` if no such tag exists.
-    """
-    collector = _ScriptTagCollector()
-    collector.feed(body)
-    for i, attrs in enumerate(collector.script_attrs):
-        if (attrs.get('src') or '').startswith(src_prefix):
-            return i, attrs
-    return None
-
-
-def _assert_script_loads_before(
-    body: str,
-    before_src_prefix: str,
-    after_src_prefix: str,
-    before_label: str,
-    after_label: str,
-    consumer_note: str = '',
-) -> None:
-    """Assert that the script for ``before_src_prefix`` loads BEFORE the
-    script for ``after_src_prefix`` in ``body``.  Combines a
-    defer/async/type=module false-pass guard with the document-order
-    position comparison.
-    """
-    before_result = _find_script_position(body, before_src_prefix)
-    assert before_result is not None, (
-        f'No <script src="{before_src_prefix}..."> tag found in index.html. '
-        f'{consumer_note}'
-    )
-    before_pos, before_attrs = before_result
-    before_src = before_attrs.get('src')
-
-    after_result = _find_script_position(body, after_src_prefix)
-    assert after_result is not None, (
-        f'<script src="{after_src_prefix}..."> not found in index.html — '
-        f'cannot verify load-order invariant for {before_label}.'
-    )
-    after_pos, after_attrs = after_result
-
-    # Both tags must be classic synchronous scripts — otherwise document order
-    # diverges from execution order and the position comparison below is moot.
-    for _label, _attrs in [
-        (before_label, before_attrs),
-        (after_label, after_attrs),
-    ]:
-        assert 'defer' not in _attrs, (
-            f'{_label} has a defer attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert 'async' not in _attrs, (
-            f'{_label} has an async attribute; document order no longer implies '
-            f'execution order, so the load-order check below may give a false pass.'
-        )
-        assert (_attrs.get('type') or '').lower() != 'module', (
-            f'{_label} has type="module"; ES modules are deferred by default, '
-            f'so document order no longer implies execution order.'
-        )
-
-    assert before_pos < after_pos, (
-        f'{before_label} (position {before_pos}, src={before_src!r}) must load '
-        f'BEFORE {after_label} (position {after_pos}). '
-        f'{consumer_note}'
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +63,7 @@ def test_data_js_registers_escalations_endpoint(data_js_body: str) -> None:
         "data.js does not reference 'ESCALATIONS' — add it as the mapped key "
         "for '/api/v2/dashboard/escalations' in endpointsFor."
     )
-    seed_block = _extract_df_data_block(data_js_body, 'ESCALATIONS')
+    seed_block = extract_df_data_block(data_js_body, 'ESCALATIONS')
     assert seed_block, (
         'data.js does not contain an `ESCALATIONS: { ... }` seed block — '
         'add the initializer to the window.DF_DATA assignment so applyKey has '
@@ -195,9 +79,9 @@ def test_data_js_registers_escalations_endpoint(data_js_body: str) -> None:
         'add it to the window.DF_DATA ESCALATIONS initializer in data.js.'
     )
     # summary sub-block: check by_level and by_status are nested under summary.
-    summary_block = _extract_df_data_block(seed_block, 'summary')
+    summary_block = extract_df_data_block(seed_block, 'summary')
     assert summary_block, (
-        'ESCALATIONS seed summary block not found via _extract_df_data_block — '
+        'ESCALATIONS seed summary block not found via extract_df_data_block — '
         'ensure summary is an object, not a scalar.'
     )
     assert re.search(r'\bby_level\s*:', summary_block), (
@@ -260,8 +144,8 @@ def test_tab_escalations_jsx_served_and_exports_component(_client) -> None:
     )
     # Fold state persisted with the correct key
     assert "useOpenSet(" in body, (
-        "tab_escalations.jsx does not call useOpenSet( — add the local copy of "
-        "useOpenSet from tabs.jsx and call it with subsection ids and 'df.open.esc'."
+        "tab_escalations.jsx does not call useOpenSet( — call persisted_state.js's "
+        "useOpenSet with subsection ids and 'df.open.esc'."
     )
     assert "'df.open.esc'" in body, (
         "tab_escalations.jsx does not reference the localStorage key 'df.open.esc' — "
@@ -372,7 +256,7 @@ def test_index_html_registers_tab_escalations_load_order(index_html_body: str) -
     _TAB_ESC_PREFIX = '/static/redux/tab_escalations.jsx'
 
     # (a) tab_escalations.jsx script tag must exist
-    result = _find_script_position(index_html_body, _TAB_ESC_PREFIX)
+    result = find_script_position(index_html_body, _TAB_ESC_PREFIX)
     assert result is not None, (
         f'No <script src="{_TAB_ESC_PREFIX}..."> tag found in index.html — '
         'add it after tabs.jsx and before app.jsx.'
@@ -393,7 +277,7 @@ def test_index_html_registers_tab_escalations_load_order(index_html_body: str) -
     )
 
     # (b) Loads after data.js
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         '/static/redux/data.js',
         _TAB_ESC_PREFIX,
@@ -403,7 +287,7 @@ def test_index_html_registers_tab_escalations_load_order(index_html_body: str) -
     )
 
     # (c) Loads after shell.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         '/static/redux/shell.jsx',
         _TAB_ESC_PREFIX,
@@ -413,7 +297,7 @@ def test_index_html_registers_tab_escalations_load_order(index_html_body: str) -
     )
 
     # (d) Loads after tabs.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         '/static/redux/tabs.jsx',
         _TAB_ESC_PREFIX,
@@ -423,7 +307,7 @@ def test_index_html_registers_tab_escalations_load_order(index_html_body: str) -
     )
 
     # (e) Loads before app.jsx
-    _assert_script_loads_before(
+    assert_script_loads_before(
         index_html_body,
         _TAB_ESC_PREFIX,
         '/static/redux/app.jsx',
@@ -550,7 +434,9 @@ def test_tab_escalations_detail_sidebar(tab_escalations_jsx_body: str) -> None:
         level, category, severity, agent_role, workflow_state, worktree, resolution.
     (d) sidebar references linked task card fields: task.title, task.status, task.description.
     (e) renders the resolved project label.
-    (f) task_unresolved fallback branch present.
+    (f) the linked task is the row's served task Datum, read through
+        escalation_views.js::taskCard, and a card with no measurement renders
+        the server's reason rather than a local guess at one.
     """
     body = tab_escalations_jsx_body
 
@@ -596,11 +482,22 @@ def test_tab_escalations_detail_sidebar(tab_escalations_jsx_body: str) -> None:
         'add `{row.project}` display in the sidebar.'
     )
 
-    # (f) task_unresolved fallback branch
-    assert 'task_unresolved' in body, (
-        'tab_escalations.jsx sidebar does not have a `task_unresolved` fallback branch — '
-        'add `{row.task_unresolved ? <unresolved note> : <task card>}` to handle '
-        'escalations whose linked task could not be resolved.'
+    # (f) The card is the row's task Datum, read through taskCard, and a hole
+    # renders the reason the server gave for it.
+    sidebar = strip_js_comments(extract_function_body(body, 'EscalationSidebar'))
+    assert re.search(r'\btaskCard\(\s*row\b', sidebar), (
+        'EscalationSidebar does not read its linked task through '
+        '`taskCard(row, ...)` (escalation_views.js) — the card is the row\'s served '
+        'task Datum, and taskCard is its one reader.'
+    )
+    assert 'isHole' in sidebar and re.search(r'\.reason\b', sidebar), (
+        'EscalationSidebar does not branch on the card\'s `isHole` and render its '
+        '`.reason` — a task the server could not read must say why, not show a '
+        'blank card or a locally invented note.'
+    )
+    assert 'task_unresolved' not in strip_js_comments(body), (
+        'tab_escalations.jsx still reads `task_unresolved` — the payload no longer '
+        'carries it: an unknown task card is a Datum with its own reason.'
     )
 
 
@@ -854,8 +751,9 @@ def test_tab_escalations_strip_four_metrics(tab_escalations_jsx_body: str) -> No
     backend aggregator already emits, and render four labeled tiles.
 
     Asserts, scoped to the EscalationStatStrip body:
-    (a) benign-rate — references flow_daily, the 'benign'/'actionable' class
-        literals, and stamped_share (the hint).
+    (a) benign-rate — reads flow_daily through escalation_views.js's
+        windowedClassSplit, whose denominator is every resolution class, and
+        stamped_share (the hint).
     (b) 6h-breach — references open_items and breach_6h.
     (c) esc-per-done — references esc_per_done_daily.
     (d) churn — references churn_daily.
@@ -869,17 +767,22 @@ def test_tab_escalations_strip_four_metrics(tab_escalations_jsx_body: str) -> No
         'must be computed from workflow.flow_daily (the only per-day benign/'
         'actionable series in the payload).'
     )
-    assert "'benign'" in strip_fn, (
-        "EscalationStatStrip does not reference the 'benign' class literal — "
-        "sum flow_daily rows where class == 'benign'."
+    assert re.search(r'\bwindowedClassSplit\(', strip_fn), (
+        'EscalationStatStrip does not compute the benign rate through '
+        '`windowedClassSplit(` (escalation_views.js) — summing only the benign and '
+        'actionable rows divides by a narrower whole than origin\'s class split.'
     )
-    assert "'actionable'" in strip_fn, (
-        "EscalationStatStrip does not reference the 'actionable' class literal — "
-        "sum flow_daily rows where class == 'actionable'."
+    assert "'actionable'" not in strip_js_comments(strip_fn), (
+        "EscalationStatStrip still names the 'actionable' class — the benign "
+        'rate\'s denominator is every class the payload serves, not a fixed pair.'
     )
     assert 'stamped_share' in strip_fn, (
         'EscalationStatStrip does not reference stamped_share — add the all-time '
         'stamped-share hint computed from origin.sources[].'
+    )
+    assert re.search(r'\.classified\b', strip_fn) and not re.search(r'\bs\.(benign|actionable)\b', strip_fn), (
+        'the stamped-share hint must weight each source by its served `classified` '
+        'count — summing `s.benign + s.actionable` drops every other class.'
     )
 
     # (b) 6h-breach substrate
@@ -975,35 +878,45 @@ def test_tab_escalations_strip_window_anchored_7d(tab_escalations_jsx_body: str)
 
 def test_tab_escalations_strip_sparklines_and_churn_retained(tab_escalations_jsx_body: str) -> None:
     """The strip must feed trend sparklines for the three series-backed tiles
-    (benign-rate, esc-per-done, churn) via StatTile's spark prop, and
+    (benign-rate, esc-per-done, churn) via StatTile's history prop, and
     churn-24h must be RETAINED — not the first tile dropped — per the
     open-question-4 decision (all four tiles kept; responsive grid instead).
 
+    The prop was named `spark` until task 5588 renamed it `history`: the series
+    is the tile's PAST, and `spark` named the drawing rather than the data,
+    which reads badly beside the `datum` carrying the tile's present value.
+
     Asserts:
-    (1) at least three `spark=` props are passed to <C.StatTile within the
+    (1) at least three `history=` props are passed to <C.StatTile within the
         EscalationStatStrip body (one each for the series-backed tiles).
-    (2) churn-24h is retained: a `spark=` occurs within ~200 chars of a churn
+    (2) churn-24h is retained: a `history=` occurs within ~200 chars of a churn
         tile label / churn_daily reference (co-occurrence, not bare
-        presence — a stray spark= elsewhere wouldn't prove churn has one).
+        presence — a stray history= elsewhere wouldn't prove churn has one).
     """
     strip_fn = extract_function_body(tab_escalations_jsx_body, 'EscalationStatStrip')
 
-    # (1) at least three spark= props within <C.StatTile tiles
-    spark_count = len(re.findall(r'<C\.StatTile[^>]*\bspark=', strip_fn))
+    # (1) at least three history= props within <C.StatTile tiles.
+    #
+    # Split at each tile and read only as far as that tile's `/>`, rather than
+    # the `<C\.StatTile[^>]*` this used to be: every tile now carries a `format`
+    # callback, and an arrow function puts a `>` inside the tag, which truncated
+    # the old class mid-prop and read every tile as series-less.
+    tiles = re.split(r'(?=<C\.StatTile\b)', strip_fn)[1:]
+    spark_count = sum(1 for tile in tiles if 'history=' in tile.split('/>')[0])
     assert spark_count >= 3, (
-        f'EscalationStatStrip passes spark= to only {spark_count} <C.StatTile tiles, '
-        'expected >= 3 (benign rate, esc/done, and churn are series-backed).'
+        f'EscalationStatStrip passes history= to only {spark_count} <C.StatTile '
+        'tiles, expected >= 3 (benign rate, esc/done, and churn are series-backed).'
     )
 
-    # (2) churn-24h retained: spark= co-occurs near a churn reference
+    # (2) churn-24h retained: history= co-occurs near a churn reference
     found_churn_spark = False
     for m in re.finditer(r'churn', strip_fn, re.IGNORECASE):
         window = strip_fn[max(0, m.start() - 200): m.end() + 200]
-        if 'spark=' in window:
+        if 'history=' in window:
             found_churn_spark = True
             break
     assert found_churn_spark, (
-        'No `spark=` prop found within ~200 chars of a churn tile label / '
+        'No `history=` prop found within ~200 chars of a churn tile label / '
         'churn_daily reference — churn-24h must be RETAINED with its own '
         'sparkline per the open-question-4 decision (keep all four tiles).'
     )
@@ -1021,13 +934,13 @@ def test_focus_handoff_retries_then_reports_a_miss(
 
     Two halves of one defect in the focus effect:
 
-    (1) It consumes `focusId` UNCONDITIONALLY.  On a miss the operator — who
+    (1) It consumes `focus` UNCONDITIONALLY.  On a miss the operator — who
         just clicked an escalation link over in the memory-evals section —
         lands on the Escalations tab with nothing selected and no explanation.
         A dead click with zero feedback is exactly the silent degradation this
         repo's loud-over-silent norm exists to prevent.
 
-    (2) It is keyed only on `[focusId]`, so the lookup runs ONCE.  `DF.ESCALATIONS`
+    (2) It is keyed only on `[focus]`, so the lookup runs ONCE.  `DF.ESCALATIONS`
         starts as data.js's seed (`subsections: []`) and `applyKey` replaces the
         reference wholesale on the first successful poll — ESCALATIONS is
         deliberately not in STABLE_ARRAY_KEYS (data.js:96-105).  So on a cold
@@ -1039,32 +952,51 @@ def test_focus_handoff_retries_then_reports_a_miss(
     """
     code = tab_escalations_jsx_code
 
-    # (a) module-scope helpers exist AND are called. Naming a helper and then
-    #     never calling it is the dead-code failure the `trendGaps` precedent
-    #     in test_tab_memory_evals.py:1311-1318 guards against.
-    for helper in ('findEscalationRow', 'escalationsLoaded'):
-        assert re.search(rf'\bfunction\s+{helper}\s*\(', code), (
-            f'tab_escalations.jsx must define `function {helper}(`. Lifting the '
-            'row search and the payload-arrival check to module scope is what '
-            'keeps the focus effect small enough to stay under the 900-char cap '
-            'the cross-tab contract test (test_tab_memory_evals.py) matches on.'
-        )
-        assert len(re.findall(rf'\b{helper}\s*\(', code)) >= 2, (
-            f'`{helper}` is defined but never called.'
-        )
+    # (a) the payload-arrival check is a module-scope helper AND is called.
+    #     Naming a helper and then never calling it is the dead-code failure the
+    #     `trendGaps` precedent in test_tab_memory_evals.py guards against.
+    #     Lifting it out is what keeps the focus effect under the 900-char cap
+    #     the cross-tab contract test (test_tab_memory_evals.py) matches on.
+    assert re.search(r'\bfunction\s+escalationsLoaded\s*\(', code), (
+        'tab_escalations.jsx must define `function escalationsLoaded(`.'
+    )
+    assert len(re.findall(r'\bescalationsLoaded\s*\(', code)) >= 2, (
+        '`escalationsLoaded` is defined but never called.'
+    )
+
+    # (a') the row lookup is escalation_focus.js's, never a local copy: that
+    #      module is the one home of the (queue, id) rule and its node tests.
+    assert not re.search(r'\bfunction\s+findEscalationRow\s*\(', code), (
+        'tab_escalations.jsx defines its own `function findEscalationRow(`, which '
+        'would shadow the (queue, id) lookup in escalation_focus.js.'
+    )
+    assert re.search(
+        r'const\s*\{[^}]*\bfindEscalationRow\b[^}]*\}\s*=\s*window\.DF_ESCALATION_FOCUS\s*;',
+        code,
+    ), 'tab_escalations.jsx must destructure findEscalationRow from window.DF_ESCALATION_FOCUS.'
 
     # Extract the focus effect the same way the cross-tab contract test does,
     # so the two cannot drift apart on what "the focus effect" means.
     effect = re.search(
-        r'uE\(\(\)\s*=>\s*\{([\s\S]{0,900}?)\n\s*\},\s*\[([^\]]*focusId[^\]]*)\]\)',
+        r'uE\(\(\)\s*=>\s*\{([\s\S]{0,900}?)\n\s*\},\s*\[([^\]]*\bfocus\b[^\]]*)\]\)',
         code,
     )
     assert effect is not None, (
-        'no `uE` effect keyed on `focusId` found within the 900-char body cap. '
+        'no `uE` effect keyed on `focus` found within the 900-char body cap. '
         'If the effect body outgrew the cap, the cross-tab handoff contract '
         'test in test_tab_memory_evals.py has silently stopped matching too.'
     )
     eff, deps = effect.group(1), effect.group(2)
+
+    # (a'') the effect resolves the focus through the module and reads BOTH
+    #       outcomes it reports: the elected row and every candidate.
+    assert re.search(r'\bfindEscalationRow\s*\(', eff), (
+        'the focus effect must resolve the focus with findEscalationRow.'
+    )
+    for member in ('row', 'candidates'):
+        assert re.search(rf'\.{member}\b', eff), (
+            f'the focus effect must read the lookup\'s `.{member}`.'
+        )
 
     # (b) the effect DECLINES to decide before the payload arrives.
     assert re.search(r'if\s*\(\s*!\s*escalationsLoaded\s*\([^)]*\)\s*\)\s*\{?\s*return', eff), (
@@ -1106,7 +1038,7 @@ def test_focus_handoff_retries_then_reports_a_miss(
         'take a distinct path, not fall through to the one a hit takes.'
     )
     branch = no_row_branch.group(1)
-    miss_state = None
+    miss_state = miss_setter = None
     for decl in re.finditer(r'const\s*\[\s*(\w+)\s*,\s*(\w+)\s*\]\s*=\s*uS\(', code):
         state, setter = decl.group(1), decl.group(2)
         if not re.search(r'\b' + re.escape(setter) + r'\s*\(', branch):
@@ -1118,9 +1050,9 @@ def test_focus_handoff_retries_then_reports_a_miss(
             code,
         ):
             continue
-        miss_state = state
+        miss_state, miss_setter = state, setter
         break
-    assert miss_state is not None, (
+    assert miss_state is not None and miss_setter is not None, (
         'no `uS` state is both written by the focus effect\'s no-row branch and '
         'the gate on the `data-testid="esc-focus-miss"` subtree. A miss must be '
         'recorded by the branch that observed it AND displayed — the operator '
@@ -1131,17 +1063,67 @@ def test_focus_handoff_retries_then_reports_a_miss(
     #     `pending` needs its own state because with the endpoint in backoff the
     #     payload never leaves the seed: a miss-only fix leaves precisely the
     #     cold-load case silent, which is half the defect.
-    for testid in ('esc-focus-miss', 'esc-focus-pending'):
+    for testid in ('esc-focus-miss', 'esc-focus-pending', 'esc-focus-ambiguous'):
         assert f'data-testid="{testid}"' in code, (
             f'the tab must render a `data-testid="{testid}"` notice.'
         )
 
-    # (f) the stale-drawer invariant survives: the focus is still consumed.
-    assert 'onFocusConsumed' in eff, (
+    # The pending notice is shown only while a focus is held.
+    assert re.search(r'\{\s*focus\s*&&[\s\S]{0,200}?data-testid="esc-focus-pending"', code), (
+        'the pending notice must be gated on `focus`.'
+    )
+
+    # (f) the stale-drawer invariant survives: the focus is consumed on EVERY
+    #     path, so the call sits outside the branches, at the effect's top level.
+    consumed = re.search(r'\bonFocusConsumed\s*\(', eff)
+    assert consumed is not None, (
         'the focus effect must still call onFocusConsumed() once a decision is '
         'reachable — leaving the focus set would reopen a stale drawer on every '
         'later visit to this tab.'
     )
+    prefix = eff[:consumed.start()]
+    assert prefix.count('{') == prefix.count('}'), (
+        'onFocusConsumed() is called inside a branch of the focus effect, so some '
+        'outcome leaves the focus set. Call it once, after the branches.'
+    )
+
+    # (g) a TIE is its own outcome. The ambiguity notice is gated on a state
+    #     that only the `candidates.length > 1` branch sets to a value: the
+    #     lookup never elects a row, and nothing else may claim ambiguity.
+    many = re.search(r'candidates\.length\s*>\s*1\s*\)\s*\{', eff)
+    assert many is not None, (
+        'the focus effect has no `candidates.length > 1` branch for a tie.'
+    )
+    many_block = walk_balanced(eff, many.end() - 1)
+    many_span = (many.end() - 1, many.end() - 1 + len(many_block))
+    ambiguous = None
+    for decl in re.finditer(r'const\s*\[\s*(\w+)\s*,\s*(\w+)\s*\]\s*=\s*uS\(', code):
+        gate = re.search(
+            r'\{\s*' + re.escape(decl.group(1)) + r'\s*&&[\s\S]{0,400}?data-testid="esc-focus-ambiguous"',
+            code,
+        )
+        if gate:
+            ambiguous = (decl.group(1), decl.group(2), gate.start())
+            break
+    assert ambiguous is not None, (
+        'no `uS` state gates the `data-testid="esc-focus-ambiguous"` notice.'
+    )
+    _state, amb_setter, gate_at = ambiguous
+    valued = [
+        call for call in re.finditer(re.escape(amb_setter) + r'\(\s*([^)]*?)\s*\)', eff)
+        if call.group(1) != 'null'
+    ]
+    assert valued, f'the focus effect never sets `{amb_setter}` to a value.'
+    for call in valued:
+        assert many_span[0] <= call.start() < many_span[1], (
+            f'`{amb_setter}({call.group(1)})` is reached outside the '
+            '`candidates.length > 1` branch, so the notice could claim a tie '
+            'that the lookup did not report.'
+        )
+    notice = code[gate_at:gate_at + 1200]
+    assert re.search(
+        r'<button[\s\S]{0,300}?' + re.escape(amb_setter) + r'\(\s*null\s*\)', notice
+    ), 'the ambiguity notice must carry a dismiss control that clears it.'
 
 
 def test_payload_arrival_read_from_a_first_success_marker_not_object_identity(
@@ -1223,4 +1205,115 @@ def test_payload_arrival_read_from_a_first_success_marker_not_object_identity(
         f'{seed_capture.group(0)!r}. A first poll that resolves before this '
         'module is evaluated freezes a real payload as the "seed", and paused '
         'polling or endpoint backoff makes that wedge permanent.'
+    )
+
+
+# ---------------------------------------------------------------------------
+# task 5596 (PRD leaf eta): the tab reads the escalation corpus' named views
+#
+# "Pending in the live queue" and "open in history" are two named populations
+# of ONE walk, served as Datums; escalation_views.js is their one client
+# reader and dashboard/tests/js/escalation_views.test.mjs executes it. What is
+# pinned here is only the wiring a .jsx body cannot run under node.
+# ---------------------------------------------------------------------------
+
+_VIEWS_DESTRUCTURE_RE = re.compile(
+    r'const\s*\{([^}]*)\}\s*=\s*window\.DF_ESCALATION_VIEWS\s*;'
+)
+
+
+def test_tab_escalations_reads_escalation_views_at_module_scope(
+    tab_escalations_jsx_code: str,
+) -> None:
+    """DF_ESCALATION_VIEWS is destructured at module scope, with no fallback.
+
+    The CANONICAL note in datum.js's header: a missing or mis-ordered
+    dependency must throw at load, not degrade silently inside a render.
+    """
+    m = _VIEWS_DESTRUCTURE_RE.search(tab_escalations_jsx_code)
+    assert m is not None, (
+        'tab_escalations.jsx does not destructure `window.DF_ESCALATION_VIEWS` at '
+        'module scope (`const { … } = window.DF_ESCALATION_VIEWS;`, no `|| {}`).'
+    )
+    names = {n.split(':')[-1].strip() for n in m.group(1).split(',') if n.strip()}
+    for name in ('queuePending', 'subsectionQueuePending', 'openInHistoryOver',
+                 'corpusAgeCaption', 'windowedClassSplit', 'taskCard'):
+        assert name in names, (
+            f'tab_escalations.jsx does not take `{name}` from DF_ESCALATION_VIEWS.'
+        )
+
+
+def test_tab_escalations_pill_reads_the_queue_pending_view(
+    tab_escalations_jsx_code: str,
+) -> None:
+    """The header pill renders the served queue_pending view, labelled as such.
+
+    It used to print `byStatus.pending || 0` — a root-only count, request-fresh,
+    beside a strip counting the archive too at a 60s TTL. Now both are views of
+    one walk and each says which population it is.
+    """
+    tab_fn = extract_function_body(tab_escalations_jsx_code, 'EscalationsTab')
+    m = re.search(r'<DatumReading\s+datum=\{([^}]+)\}\s*/>\s*queue pending', tab_fn)
+    assert m is not None, (
+        'EscalationsTab renders no `<DatumReading datum={…} /> queue pending` pill — '
+        'the header count must be the served queue_pending Datum, labelled with the '
+        'population it counts.'
+    )
+    datum_expr = m.group(1).strip()
+    if datum_expr != 'queuePending(DF)':
+        assert re.search(rf'const\s+{re.escape(datum_expr)}\s*=\s*queuePending\(DF\)', tab_fn), (
+            f'the header pill renders `{datum_expr}`, which is not `queuePending(DF)`.'
+        )
+    assert 'byStatus.pending' not in tab_escalations_jsx_code, (
+        'tab_escalations.jsx still counts `byStatus.pending` itself — the pill reads '
+        'the served view, never a client re-count.'
+    )
+
+
+def test_tab_escalations_subsection_pip_reads_the_queue_pending_view(
+    tab_escalations_jsx_code: str,
+) -> None:
+    """Each subsection's pending pip is that queue's served view."""
+    tab_fn = extract_function_body(tab_escalations_jsx_code, 'EscalationsTab')
+    assert re.search(
+        r'<Pip\s+datum=\{subsectionQueuePending\(sec\b[^}]*\}\s+label="queue pending"', tab_fn,
+    ), (
+        'the per-subsection pip does not render '
+        '`<Pip datum={subsectionQueuePending(sec, …)} label="queue pending" />`.'
+    )
+    assert 'secByStatus.pending' not in tab_fn, (
+        'the subsection pip still reads `secByStatus.pending` — read the served view.'
+    )
+
+
+def test_tab_escalations_strip_renders_open_in_history(tab_escalations_jsx_code: str) -> None:
+    """The strip carries an 'open in history' tile over the project filter.
+
+    lifespan.open_items holds every pending record, root or archive, so the 6h
+    breaches it counts are not "of N pending" in the pill's sense; the hint stops
+    saying 'pending' and the open-in-history tile states that population.
+    """
+    strip_fn = extract_function_body(tab_escalations_jsx_code, 'EscalationStatStrip')
+    tiles = re.split(r'(?=<C\.StatTile\b)', strip_fn)[1:]
+    open_tiles = [t.split('/>')[0] for t in tiles if 'label="open in history"' in t.split('/>')[0]]
+    assert len(open_tiles) == 1, (
+        'EscalationStatStrip renders no `<C.StatTile label="open in history" …/>` tile.'
+    )
+    assert re.search(r'datum=\{openInHistoryOver\(DF,\s*projectFilter\)\}', open_tiles[0]), (
+        'the open-in-history tile does not render `openInHistoryOver(DF, projectFilter)`.'
+    )
+    breach_tiles = [t.split('/>')[0] for t in tiles if 'label="6h breaches"' in t.split('/>')[0]]
+    assert len(breach_tiles) == 1, 'could not locate the "6h breaches" tile'
+    assert 'pending' not in breach_tiles[0], (
+        'the 6h-breaches hint still says "pending" — open_items spans the archive '
+        'too, which is the open-in-history population, not the queue\'s pending one.'
+    )
+
+
+def test_tab_escalations_states_the_corpus_age(tab_escalations_jsx_code: str) -> None:
+    """The tab renders how old the corpus walk it shows is, even when fresh."""
+    tab_fn = extract_function_body(tab_escalations_jsx_code, 'EscalationsTab')
+    assert re.search(r'\{\s*corpusAgeCaption\(', tab_fn), (
+        'EscalationsTab renders no `{corpusAgeCaption(…)}` — a count read from a '
+        'cached walk must say when the walk was.'
     )

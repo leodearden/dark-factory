@@ -788,6 +788,13 @@ class TestTickPhaseOrderLiteral:
         )
         assert order.index('delivered_check_gate') < order.index('build_candidates')
         assert order.index('delivered_check_gate') < order.index('select_pins')
+        # (5) reserve_now installs at ctx.effective_priorities (task 5308),
+        # and override_diff reads the snapshot reserve_now takes.
+        assert (
+            order.index('compute_priorities')
+            < order.index('reserve_now')
+            < order.index('override_diff')
+        )
 
         # Every label genuinely drives dispatch — it maps to a real
         # coroutine method on Scheduler, not just a decorative string.

@@ -38,7 +38,10 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
+import logging
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -62,6 +65,7 @@ from _orch_helpers import pydantic_spec
 # invisible to the workflow's relocated meta_root, so a real run() never
 # reaches DONE (rows 5-6).
 from _workflow_helpers import (
+    PLAN,
     AgentStub,
     FakeBriefing,
     FakeMcp,
@@ -73,9 +77,11 @@ from _workflow_helpers import (
     _init_git_repo,
     _init_repo,
     _make,
+    _make_review,
     _make_warmlane_workflow,
 )
 from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 from shared.task_statuses import TaskStatus
 from shared.task_transitions import ActorClass, is_legal_transition, outcome_allows_status
 
@@ -83,10 +89,12 @@ from orchestrator.agents.invoke import AgentResult
 from orchestrator.agents.roles import _FAMILY_TOOL_PREFIXES, ROLES, AgentRole
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig, OrchestratorConfig
+from orchestrator.event_store import EventType
 from orchestrator.git_ops import GitOps
 from orchestrator.harness import TaskReport
 from orchestrator.landed_outbox import MergeProvenance
-from orchestrator.scheduler import TaskAssignment
+from orchestrator.module_charter import derive_modules
+from orchestrator.scheduler import BlastRadiusResult, TaskAssignment
 from orchestrator.unblock_types import BlockClass
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import FailureCategory
@@ -408,6 +416,163 @@ def task_assignment() -> TaskAssignment:
     )
 
 
+_EXIT_CONTRACT_LOGGER = 'orchestrator.exit_contract'
+
+
+def _exit_contract_records(
+    caplog: pytest.LogCaptureFixture, verdict: str,
+) -> list[logging.LogRecord]:
+    return [
+        r for r in caplog.records
+        if r.name == _EXIT_CONTRACT_LOGGER
+        and getattr(r, 'exit_contract_verdict', None) == verdict
+    ]
+
+
+def _exit_contract_events(event_store: MagicMock) -> list[dict]:
+    return [
+        c.kwargs['data'] for c in event_store.emit.call_args_list
+        if c.args and c.args[0] is EventType.workflow_exit_contract
+    ]
+
+
+def _force_blocked_exit_over_a_done_row(
+    scheduler: FakeScheduler, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Drive run() to a BLOCKED exit (AllAccountsCapped) whose SM-2 read sees
+    'done'.  The pre-empt check at the top of ``_drive()`` also reads
+    ``get_status`` and must see a NON-terminal row, or the task exits
+    CANCELLED before reaching the block path; only later reads see 'done'.
+    """
+    from shared.cli_invoke import AllAccountsCappedException
+
+    calls = {'n': 0}
+
+    async def fake_get_status(task_id):
+        calls['n'] += 1
+        return 'pending' if calls['n'] == 1 else 'done'
+
+    monkeypatch.setattr(scheduler, 'get_status', fake_get_status)
+
+    async def raise_cap_exc(*args, **kwargs):
+        raise AllAccountsCappedException(
+            retries=3, elapsed_secs=120.0, label='Task 42 [architect]',
+        )
+
+    monkeypatch.setattr('orchestrator.workflow.invoke_agent', raise_cap_exc)
+    monkeypatch.setattr(
+        'orchestrator.workflow.run_scoped_verification',
+        AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+    )
+
+
+class _WideningArchitectStub(AgentStub):
+    """Architect whose plan.files reaches a module the task does not lock, so
+    ``_plan`` must ask the scheduler for an additional lock."""
+
+    async def _architect(self, cwd: Path) -> AgentResult:
+        plan = dict(PLAN)
+        plan['files'] = ['lib.py', 'locked_module.py']
+        plan['_schema_version'] = 1
+        task_dir = TaskArtifacts(cwd).root
+        task_dir.mkdir(parents=True, exist_ok=True)
+        (task_dir / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+        return AgentResult(success=True, output='Plan created', cost_usd=0.50)
+
+
+class _WideningReplanStub(AgentStub):
+    """The first comprehensive review blocks, and the architect's replan
+    widens plan.files to a module the task does not lock, so the replan must
+    ask the scheduler for an additional lock."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._blocked = False
+
+    def _reviewer(self, role: str, output_schema: dict | None) -> AgentResult:
+        if self._blocked or role != 'reviewer_comprehensive':
+            review = _make_review(role)
+        else:
+            self._blocked = True
+            review = _make_review(role, 'ISSUES_FOUND', [{
+                'severity': 'blocking',
+                'location': 'lib.py:5',
+                'category': 'missing_edge_case',
+                'description': 'No test for empty name',
+                'suggested_fix': 'Add test_farewell_empty',
+            }])
+        return AgentResult(
+            success=True, output=json.dumps(review),
+            structured_output=review, cost_usd=0.10,
+        )
+
+    async def _architect(self, cwd: Path) -> AgentResult:
+        plan_path = TaskArtifacts(cwd).root / 'plan.json'
+        if plan_path.exists():
+            plan = json.loads(plan_path.read_text())
+            plan['files'] = [*plan['files'], 'locked_module.py']
+            plan['steps'].append({
+                'id': 'step-3', 'type': 'test',
+                'description': 'Add test for empty name',
+                'status': 'pending', 'commit': None,
+            })
+        else:
+            plan = {**PLAN, '_schema_version': 1}
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        plan_path.write_text(json.dumps(plan, indent=2) + '\n')
+        return AgentResult(success=True, output='Plan written', cost_usd=0.50)
+
+
+def _drive_plan_into_lock_conflict(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    task_assignment: TaskAssignment,
+    monkeypatch: pytest.MonkeyPatch,
+    conflict: BlastRadiusResult,
+) -> tuple[TaskWorkflow, FakeScheduler]:
+    """Wire a real run() whose ``_plan`` meets a blast-radius lock conflict
+    the scheduler reports as *conflict* (mirrors
+    test_workflow_e2e.py::TestBlastRadiusExpansion::test_expansion_denied_requeues)."""
+    stub = _WideningArchitectStub()
+    workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+    scheduler.blast_radius_result = conflict
+    monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+    monkeypatch.setattr(
+        'orchestrator.workflow.run_scoped_verification',
+        AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
+    )
+    return workflow, scheduler
+
+
+def _drive_replan_into_lock_conflict(
+    config: OrchestratorConfig,
+    git_ops: GitOps,
+    task_assignment: TaskAssignment,
+    monkeypatch: pytest.MonkeyPatch,
+    conflict: BlastRadiusResult,
+) -> tuple[TaskWorkflow, FakeScheduler]:
+    """Wire a real run() whose post-review replan meets a blast-radius lock
+    conflict the scheduler reports as *conflict*.  The task already locks the
+    first plan's modules, so the only scheduler call is the replan's widen
+    (mirrors test_workflow_e2e.py::TestReviewLoop::test_blocking_review_triggers_replan)."""
+    stub = _WideningReplanStub()
+    planned = replace(
+        task_assignment,
+        modules=derive_modules(PLAN['files'], config.lock_depth),
+    )
+    workflow, scheduler = _build_workflow(config, git_ops, planned, stub)
+    scheduler.blast_radius_result = conflict
+    monkeypatch.setattr('orchestrator.workflow.invoke_agent', stub.invoke_agent)
+    monkeypatch.setattr(
+        'orchestrator.workflow.run_scoped_verification',
+        AsyncMock(return_value=VerifyResult(
+            passed=True, test_output='', lint_output='',
+            type_output='', summary='All checks passed',
+        )),
+    )
+    return workflow, scheduler
+
+
 @pytest.mark.asyncio
 class TestStateMachineLegalityAndConsistency:
     """Boundary rows 5-6 (PRD §9): ``WorkflowStateMachine``/``STATE_TO_STATUS``
@@ -545,48 +710,231 @@ class TestStateMachineLegalityAndConsistency:
         assert report.phase == wf.machine.state
         mark_blocked.assert_not_awaited()
 
-    async def test_row6_outcome_status_divergence_raises_loudly_naming_both(
-        self, config, git_ops, task_assignment, monkeypatch,
+    @pytest.mark.exit_contract_violation_expected
+    async def test_row6_outcome_status_divergence_is_recorded_not_raised(
+        self, config, git_ops, task_assignment, monkeypatch, caplog,
     ):
         """NEGATIVE: DB row says 'done' while the actual exit is BLOCKED.
 
-        The pre-empt check at the top of ``_drive()`` also calls
-        ``scheduler.get_status`` — it must see a NON-terminal status there,
-        or the task exits CANCELLED before ever reaching the AllAccountsCapped
-        block path. Only the SECOND call (SM-2's own read, after ``_drive()``
-        returns) sees the injected 'done', simulating a stale/incorrect DB
-        row at the terminal boundary.
+        run() RETURNS the real BLOCKED report — no synthetic mislabel (spec
+        §8-E11) — and the violation is recorded in log mode, never raised.
         """
-        from shared.cli_invoke import AllAccountsCappedException
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        event_store = MagicMock()
+        workflow.event_store = event_store
+        _force_blocked_exit_over_a_done_row(scheduler, monkeypatch)
+        caplog.set_level(logging.WARNING, logger=_EXIT_CONTRACT_LOGGER)
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert report.reason.lower().startswith('all accounts capped')
+        assert report.detail
+        records = _exit_contract_records(caplog, 'violation')
+        assert len(records) == 1
+        message = records[0].getMessage()
+        assert 'would-violate' in message
+        assert 'blocked' in message
+        assert 'done' in message
+        events = _exit_contract_events(event_store)
+        assert len(events) == 1
+        assert events[0]['verdict'] == 'violation'
+        assert events[0]['mode'] == 'log'
+        assert events[0]['outcome'] == 'blocked'
+        assert events[0]['status'] == 'done'
+        assert all(
+            c.args[0] is not EventType.escalation_created
+            for c in event_store.emit.call_args_list
+        )
+
+    @pytest.mark.exit_contract_violation_expected
+    async def test_row6_enforce_mode_files_one_l1_and_leaves_status_untouched(
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+    ):
+        """Enforce mode: ONE deduped L1, and the check writes no status."""
+        monkeypatch.setattr(config, 'workflow_exit_contract_enforce', True)
+        stub = AgentStub()
+        workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        queue = EscalationQueue(tmp_path / 'esc')
+        workflow.escalation_queue = queue
+        _force_blocked_exit_over_a_done_row(scheduler, monkeypatch)
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert report.reason.lower().startswith('all accounts capped')
+        contract_l1s = [
+            esc for esc in queue.get_by_task(workflow.task_id, status='pending')
+            if esc.category == 'workflow_exit_contract'
+        ]
+        assert len(contract_l1s) == 1
+        assert contract_l1s[0].severity == 'blocking'
+        assert contract_l1s[0].level == 1
+        assert scheduler.statuses[workflow.task_id][-1] == 'blocked'
+
+    @pytest.mark.parametrize('enforce', [False, True])
+    async def test_row6_dead_exit_write_is_store_unavailable_not_a_violation(
+        self, enforce, tmp_path, monkeypatch, caplog,
+    ):
+        """Relaxation 2: a re-pend write that dies reclassifies the REQUEUED
+        exit as crash-shaped — ONE store_unavailable record, never a
+        violation, never an escalation (spec §5)."""
+        from orchestrator.git_ops import WarmLanePoolExhausted
+
+        wf = _make_warmlane_workflow(tmp_path=tmp_path)
+        monkeypatch.setattr(wf.config, 'workflow_exit_contract_enforce', enforce)
+        wf.git_ops.create_worktree = AsyncMock(  # type: ignore[method-assign]
+            side_effect=WarmLanePoolExhausted(
+                "warm-lane pool exhausted for branch '1859'; requeue",
+            ),
+        )
+        queue = EscalationQueue(tmp_path / 'esc')
+        wf.escalation_queue = queue
+        event_store = MagicMock()
+        wf.event_store = event_store
+        written: list[str] = []
+
+        async def _die_on_pending(task_id: str, status: str, **kwargs):
+            if status == 'pending':
+                raise RuntimeError(
+                    f'set_task_status({task_id}, {status}) failed after 4 '
+                    f'transient retries: TimeoutError'
+                )
+            written.append(status)
+
+        async def _last_written(task_id: str) -> str:
+            return written[-1] if written else 'pending'
+
+        monkeypatch.setattr(wf.scheduler, 'set_task_status', _die_on_pending)
+        monkeypatch.setattr(wf.scheduler, 'get_status', _last_written)
+        caplog.set_level(logging.WARNING, logger=_EXIT_CONTRACT_LOGGER)
+
+        report = await wf.run()
+
+        assert report.outcome == WorkflowOutcome.REQUEUED
+        assert written[-1] == 'in-progress'
+        assert len(_exit_contract_records(caplog, 'store_unavailable')) == 1
+        assert _exit_contract_records(caplog, 'violation') == []
+        events = _exit_contract_events(event_store)
+        assert [e['verdict'] for e in events] == ['store_unavailable']
+        assert events[0]['failed_write']['target_status'] == 'pending'
+        assert queue.get_by_task(wf.task_id) == []
+
+    @pytest.mark.parametrize('enforce', [False, True])
+    @pytest.mark.parametrize(('drive', 'detail_prefix'), [
+        (_drive_plan_into_lock_conflict, 'Plan expansion blocked'),
+        (_drive_replan_into_lock_conflict, 'Replan expansion blocked'),
+    ], ids=['plan', 'replan'])
+    async def test_row6_lock_conflict_with_dead_repend_is_store_unavailable(
+        self, drive, detail_prefix, enforce,
+        config, git_ops, task_assignment, monkeypatch, caplog, tmp_path,
+    ):
+        """Relaxation 2 via a blast-radius lock conflict exit: the
+        scheduler's re-pend IS this REQUEUED exit's status write, so when it
+        dies (the row stays where dispatch put it) the exit is crash-shaped —
+        ONE store_unavailable record, never a violation, never an escalation."""
+        monkeypatch.setattr(config, 'workflow_exit_contract_enforce', enforce)
+        dead = RuntimeError(
+            'set_task_status(42, pending) failed after 4 transient retries: '
+            'TimeoutError'
+        )
+        workflow, scheduler = drive(
+            config, git_ops, task_assignment, monkeypatch,
+            BlastRadiusResult(applied=False, repend_error=dead),
+        )
+        event_store = MagicMock()
+        workflow.event_store = event_store
+        queue = EscalationQueue(tmp_path / 'esc')
+        workflow.escalation_queue = queue
+        caplog.set_level(logging.WARNING, logger=_EXIT_CONTRACT_LOGGER)
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.REQUEUED
+        assert report.reason == 'plan_blast_radius_lock_conflict'
+        assert report.detail.startswith(detail_prefix)
+        assert report.phase == workflow.machine.state
+        assert len(scheduler.blast_radius_calls) == 1
+        assert scheduler.statuses[workflow.task_id][-1] == 'in-progress'
+        assert len(_exit_contract_records(caplog, 'store_unavailable')) == 1
+        assert _exit_contract_records(caplog, 'violation') == []
+        events = _exit_contract_events(event_store)
+        assert [e['verdict'] for e in events] == ['store_unavailable']
+        assert events[0]['failed_write']['target_status'] == 'pending'
+        assert 'RuntimeError' in events[0]['failed_write']['error']
+        assert queue.get_by_task(workflow.task_id) == []
+
+    @pytest.mark.parametrize(
+        'drive', [_drive_plan_into_lock_conflict, _drive_replan_into_lock_conflict],
+        ids=['plan', 'replan'],
+    )
+    async def test_row6_lock_conflict_with_healthy_repend_is_consistent(
+        self, drive, config, git_ops, task_assignment, monkeypatch, caplog,
+    ):
+        """Control: a conflict whose re-pend landed is an ordinary consistent
+        REQUEUED exit — nothing is recorded against the exit contract."""
+        workflow, scheduler = drive(
+            config, git_ops, task_assignment, monkeypatch,
+            BlastRadiusResult(applied=False),
+        )
+        event_store = MagicMock()
+        workflow.event_store = event_store
+        caplog.set_level(logging.WARNING, logger=_EXIT_CONTRACT_LOGGER)
+
+        report = await workflow.run()
+
+        assert report.outcome == WorkflowOutcome.REQUEUED
+        assert scheduler.statuses[workflow.task_id][-1] == 'pending'
+        assert _exit_contract_records(caplog, 'store_unavailable') == []
+        assert _exit_contract_records(caplog, 'violation') == []
+        assert _exit_contract_events(event_store) == []
+
+    async def test_row6_failed_bypass_reopen_is_store_unavailable(
+        self, config, git_ops, task_assignment, monkeypatch, caplog, tmp_path,
+    ):
+        """Relaxation 2 via ``_handle_terminal_exit_on_block``: the block write
+        meets a bypass 'done' row, and the reopen write then dies too.  The
+        bypass L1 is still filed — recording the dead write must not cost it."""
+        from orchestrator.scheduler import TerminalExitRejection
 
         stub = AgentStub()
         workflow, scheduler = _build_workflow(config, git_ops, task_assignment, stub)
+        event_store = MagicMock()
+        workflow.event_store = event_store
+        queue = EscalationQueue(tmp_path / 'esc')
+        workflow.escalation_queue = queue
+        _force_blocked_exit_over_a_done_row(scheduler, monkeypatch)
+        record_write = scheduler.set_task_status
 
-        calls = {'n': 0}
-
-        async def fake_get_status(task_id):
-            calls['n'] += 1
-            return 'pending' if calls['n'] == 1 else 'done'
-
-        monkeypatch.setattr(scheduler, 'get_status', fake_get_status)
-
-        async def raise_cap_exc(*args, **kwargs):
-            raise AllAccountsCappedException(
-                retries=3, elapsed_secs=120.0, label='Task 42 [architect]',
+        async def _bypassed_then_dead(task_id: str, status: str, **kwargs):
+            if status != 'blocked':
+                await record_write(task_id, status, **kwargs)
+                return
+            if kwargs.get('reopen_reason') is None:
+                raise TerminalExitRejection(
+                    task_id, old_status='done', target_status='blocked',
+                    raw='terminal-exit gate',
+                )
+            raise RuntimeError(
+                f'set_task_status({task_id}, blocked) failed after 4 '
+                f'transient retries: TimeoutError'
             )
 
-        monkeypatch.setattr('orchestrator.workflow.invoke_agent', raise_cap_exc)
-        monkeypatch.setattr(
-            'orchestrator.workflow.run_scoped_verification',
-            AsyncMock(side_effect=AssertionError('run_scoped_verification must not be called')),
-        )
+        monkeypatch.setattr(scheduler, 'set_task_status', _bypassed_then_dead)
+        caplog.set_level(logging.WARNING, logger=_EXIT_CONTRACT_LOGGER)
 
-        with pytest.raises((AssertionError, ValueError)) as exc_info:
-            await workflow.run()
+        report = await workflow.run()
 
-        message = str(exc_info.value).lower()
-        assert 'blocked' in message
-        assert 'done' in message
+        assert report.outcome == WorkflowOutcome.BLOCKED
+        assert _exit_contract_records(caplog, 'violation') == []
+        assert len(_exit_contract_records(caplog, 'store_unavailable')) == 1
+        events = _exit_contract_events(event_store)
+        assert [e['verdict'] for e in events] == ['store_unavailable']
+        assert events[0]['failed_write']['target_status'] == 'blocked'
+        assert [
+            esc.category for esc in queue.get_by_task(workflow.task_id, status='pending')
+        ] == ['bypass_done']
 
     async def test_row6_none_status_does_not_crash_normal_run(
         self, config, git_ops, task_assignment, monkeypatch,

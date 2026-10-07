@@ -10,11 +10,7 @@ from __future__ import annotations
 import re
 
 import pytest
-
-
-@pytest.fixture(scope='module')
-def tab_overview_jsx_body(_client):
-    return _client.get('/static/redux/tab_overview.jsx').text
+from _dashboard_helpers import extract_function_body, strip_js_comments, walk_balanced
 
 
 class TestOverviewTabCurrentTaskRemoved:
@@ -66,7 +62,7 @@ class TestHostLoadCardStaleness:
 def tab_overview_jsx_code(tab_overview_jsx_body):
     """`tab_overview.jsx` with every comment stripped.
 
-    Copied from `test_tab_memory_evals.py`'s `tab_memory_evals_jsx_code`
+    Same shape as `test_tab_memory_evals.py`'s `tab_memory_evals_jsx_code`
     fixture, for the same reason it was created there: a substring assertion
     over the raw body is satisfied by a MENTION in a comment just as well as by
     a render site.  That false-pass mode is not hypothetical — the memory-evals
@@ -79,18 +75,12 @@ def tab_overview_jsx_code(tab_overview_jsx_body):
     `_phantom_branch` would otherwise anchor on the comment's first mention of
     `is_phantom` rather than on the `if (v?.is_phantom)` render site.
 
-    Safe to strip naively: the source contains no `//` inside a string literal
-    (no URLs) and no regex literals, so no `/`-bearing code is eaten.
-
-    NOTE (task 3287 amendment pass, review suggestion 6): this is the fourth
-    near-identical copy of this comment-stripping fixture in this test package
-    (test_tab_escalations.py:40, test_tab_memory_evals.py:71 and :116).  The
-    right fix is one `strip_js_comments(body)` helper in `conftest.py` /
-    `_dashboard_helpers.py` with the rationale documented once — NOT done here
-    because those files and the other three call sites are outside task 3287's
-    module locks.  Filed as a follow-up.
+    The stripping itself is delegated to `_dashboard_helpers.strip_js_comments`,
+    which is quote-aware (it will not eat a `//` inside a string literal) and
+    whose contract is pinned by `TestStripJsComments` in
+    test_jsx_source_helpers.py.
     """
-    return re.sub(r'/\*[\s\S]*?\*/|//[^\n]*', '', tab_overview_jsx_body)
+    return strip_js_comments(tab_overview_jsx_body)
 
 
 class TestReconciliationHealthRowPhantom:
@@ -173,3 +163,232 @@ class TestReconciliationHealthRowPhantom:
             'the is_phantom branch must not fall back to the ordinary '
             f'`verdict: ${{sev}}` label; got: {branch!r}'
         )
+
+
+@pytest.fixture(scope='module')
+def overview_code(tab_overview_jsx_code):
+    """OverviewTab's body with comments stripped, so prose satisfies no probe."""
+    return extract_function_body(tab_overview_jsx_code, 'OverviewTab')
+
+
+def _const_bound_to(code, expression, what):
+    match = re.search(rf'\bconst\s+(\w+)\s*=\s*{expression}', code)
+    assert match, f'OverviewTab does not bind {what} to a const'
+    return match.group(1)
+
+
+def _fleet_census(code):
+    return _const_bound_to(code, r'censusOver\(\s*D\s*,\s*null\s*\)', 'censusOver(D, null)')
+
+
+def _running_tile_entry(code):
+    return _const_bound_to(
+        code,
+        r"TASK_CENSUS_TILES\.find\(\s*(?P<tile>\w+)\s*=>\s*(?P=tile)\.key\s*===\s*'running'\s*\)",
+        "TASK_CENSUS_TILES.find(t => t.key === 'running')",
+    )
+
+
+def _panel(code, title):
+    """The grid cell whose panel head reads *title*, up to the next grid cell."""
+    start = code.find(f'>{title}<')
+    assert start != -1, f'OverviewTab renders no panel titled {title!r}'
+    end = code.find('className="col-span-', start)
+    return code[start:] if end == -1 else code[start:end]
+
+
+def _the_views_map(panel):
+    """The single ``TASK_CENSUS_VIEWS.map(v => ...)`` in *panel*: (parameter, call text)."""
+    maps = list(re.finditer(r'\bTASK_CENSUS_VIEWS\.map\(\s*(\w+)\s*=>', panel))
+    assert len(maps) == 1, f'expected one TASK_CENSUS_VIEWS.map in the panel, found {len(maps)}'
+    paren = panel.index('(', maps[0].start())
+    return maps[0].group(1), walk_balanced(panel, paren, '(', ')')
+
+
+class TestOverviewReadsTheCensus:
+    """The Overview renders every task count from the served census (leaf γ2, task 5589).
+
+    Before: the "Active tasks" tile, the "Task pipeline" card and the
+    Orchestrators table's "Done" column summed per-orchestrator summaries that
+    /orchestrators stopped measuring (task 5587), so they read zeros or an
+    em-dash with no census behind them. Now one fleet census —
+    ``censusOver(D, null)`` — feeds the running tile and the pipeline, and each
+    orchestrator row reads its own project's census, all through StatTile or the
+    shared DatumReading with a named reading from task_snapshot.js. The readings
+    themselves are executed over the boundary sketches in
+    dashboard/tests/js/task_snapshot.test.mjs; these pins prove the wiring
+    reaches them.
+    """
+
+    @pytest.mark.parametrize(
+        'retired',
+        [
+            'DF_ORCH_SUMMARY',
+            'orchSummary',
+            'hasOrchSummary',
+            'ORCH_SUMMARY_ABSENT_REASON',
+            'tasksTotal',
+            'taskShare',
+            'ORCHESTRATORS.reduce',
+            'Active tasks',
+        ],
+    )
+    def test_the_orchestrator_summary_readers_are_gone(self, tab_overview_jsx_code, retired):
+        assert retired not in tab_overview_jsx_code, (
+            f'tab_overview.jsx still contains `{retired}`. The Overview reads the '
+            'census now; a per-orchestrator summary is a count /orchestrators no '
+            'longer measures.'
+        )
+
+    def test_destructures_the_census_reader_without_fallback(self, tab_overview_jsx_code):
+        destructure = re.search(r'const\s*\{([^}]*)\}\s*=\s*window\.DF_TASK_SNAPSHOT\s*;', tab_overview_jsx_code)
+        assert destructure, 'tab_overview.jsx does not destructure window.DF_TASK_SNAPSHOT at module scope.'
+        assert not re.search(r'window\.DF_TASK_SNAPSHOT\s*(\|\||&&|\?\?)', tab_overview_jsx_code), (
+            'a fallback turns a load-order regression into a silently blank Overview.'
+        )
+        bound = set(re.findall(r'\w+', destructure.group(1)))
+        used = {
+            'projectCensus', 'censusOver', 'censusSegments', 'censusHistory',
+            'censusTotal', 'terminalOfTotal', 'viewShareText', 'TASK_CENSUS_VIEWS', 'TASK_CENSUS_TILES',
+        }
+        assert used <= bound, f'tab_overview.jsx reads {sorted(used - bound)} without binding them'
+
+    def test_datum_reading_comes_from_the_shared_shell(self, tab_overview_jsx_code):
+        assert re.search(r'const\s*\{[^}]*\bDatumReading\b[^}]*\}\s*=\s*window\.DF_SHELL\s*;', tab_overview_jsx_code), (
+            'tab_overview.jsx renders <DatumReading> without binding it from window.DF_SHELL.'
+        )
+
+    def test_binds_one_fleet_census(self, overview_code):
+        calls = re.findall(r'censusOver\(\s*D\s*,\s*null\s*\)', overview_code)
+        assert len(calls) == 1, (
+            f'OverviewTab calls censusOver(D, null) {len(calls)} time(s); the tile and '
+            'the pipeline must read one Datum object.'
+        )
+        _fleet_census(overview_code)
+
+    def test_the_running_tile_reads_the_fleet_census(self, overview_code):
+        fleet = _fleet_census(overview_code)
+        running = _running_tile_entry(overview_code)
+        tiles = [t for t in re.findall(r'<StatTile\b[\s\S]*?/>', overview_code) if f'datum={{{fleet}}}' in t]
+        assert len(tiles) == 1, f'expected one StatTile reading {fleet}, found {len(tiles)}'
+        tile = tiles[0]
+        assert f'label={{{running}.label}}' in tile
+        assert f'format={{{running}.reading}}' in tile
+        assert re.search(rf'history=\{{\s*censusHistory\(\s*D\s*,\s*null\s*,\s*{running}\s*\)\s*\}}', tile), (
+            "the tile's spark is not the burndown series of the member its headline shows."
+        )
+        for prop in ('unit', 'hint'):
+            assert not re.search(rf'\b{prop}=', tile), (
+                f'the running tile carries a `{prop}=`: a number beside the Datum has no '
+                'state, age or reason of its own.'
+            )
+
+    def test_the_pipeline_meta_is_the_census_total(self, overview_code):
+        fleet = _fleet_census(overview_code)
+        panel = _panel(overview_code, 'Task pipeline')
+        assert re.search(rf'<DatumReading\s+datum=\{{{fleet}\}}\s+format=\{{censusTotal\}}', panel)
+
+    def test_the_pipeline_bar_maps_the_census_segments(self, overview_code):
+        fleet = _fleet_census(overview_code)
+        panel = _panel(overview_code, 'Task pipeline')
+        assert re.search(rf'censusSegments\(\s*{fleet}\s*\)\.map\(', panel)
+
+    def test_the_pipeline_rows_are_the_views_read_off_the_census(self, overview_code):
+        fleet = _fleet_census(overview_code)
+        view, call = _the_views_map(_panel(overview_code, 'Task pipeline'))
+        assert f'{{{view}.label}}' in call
+        assert f'P[{view}.tone]' in call
+        assert re.search(rf'<DatumReading\s+datum=\{{{fleet}\}}\s+format=\{{{view}\.count\}}', call)
+        assert re.search(
+            rf'<DatumReading\s+datum=\{{{fleet}\}}\s+format=\{{viewShareText\(\s*{view}\.key\s*\)\}}', call
+        ), "each row's share must be a reading of the census, so a hole renders the placeholder."
+
+    def test_no_hand_division_of_task_counts_remains(self, overview_code):
+        assert not re.search(r'/\s*tasks[A-Z]', overview_code), 'a `/ tasks…` division remains'
+        assert not re.search(r'/\s*(?:\w+\.)*total\b', overview_code), (
+            'a `v / total` division remains; at total 0 it renders "NaN%".'
+        )
+
+    def test_the_orchestrators_table_reads_each_project_census(self, overview_code):
+        panel = _panel(overview_code, 'Orchestrators · current work')
+        assert '>Terminal<' in panel
+        assert '>Done<' not in panel, 'the column is the terminal view, not the done member'
+        assert re.search(
+            r'<DatumReading\s+datum=\{\s*projectCensus\(\s*D\s*,\s*o\.project\s*\)\s*\}\s+format=\{\s*terminalOfTotal\s*\}',
+            panel,
+        )
+
+
+def _health_row(code, label):
+    """The ``{ l: '<label>', ... }`` entry of the System health list, braces included."""
+    match = re.search(r"\{\s*l:\s*'" + re.escape(label) + "'", code)
+    assert match, f'OverviewTab has no System health row labelled {label!r}'
+    row = walk_balanced(code, match.start())
+    assert row, f'the {label!r} health row is never closed'
+    return row
+
+
+def _stat_tile(code, label):
+    match = re.search(r'<StatTile\s+label="' + re.escape(label) + r'"(.*?)/>', code, re.DOTALL)
+    assert match, f'OverviewTab renders no <StatTile label="{label}" ... /> tile'
+    return match.group(0)
+
+
+class TestOverviewReadsTheMemoryReadings:
+    """The Overview reads the write queue and the memory ops through memory_readings.js.
+
+    Before: the System health "Write queue" row read raw queue counts that an
+    offline probe left as confident zeros, and the Activity timeline summed the
+    reads/writes series client-side while the Memory tab's donut reduced a
+    different query. Now both read one served value each through one reader;
+    the readings themselves are executed in
+    dashboard/tests/js/memory_readings.test.mjs.
+    """
+
+    def test_destructures_the_memory_readers_without_fallback(self, tab_overview_jsx_code):
+        destructure = re.search(
+            r'const\s*\{([^}]*)\}\s*=\s*window\.DF_MEMORY_READINGS\s*;', tab_overview_jsx_code,
+        )
+        assert destructure, 'tab_overview.jsx does not destructure window.DF_MEMORY_READINGS at module scope.'
+        assert not re.search(r'window\.DF_MEMORY_READINGS\s*(\|\||&&|\?\?)', tab_overview_jsx_code)
+        bound = set(re.findall(r'\w+', destructure.group(1)))
+        used = {'writeQueue', 'queueCountsText', 'queueHealth', 'newestHourOps', 'opsTotals', 'opsCaption'}
+        assert used <= bound, f'tab_overview.jsx reads {sorted(used - bound)} without binding them'
+
+    @pytest.mark.parametrize('retired', ['queue.counts', 'MEMORY_TIMESERIES'])
+    def test_the_retired_reads_are_gone(self, overview_code, retired):
+        assert retired not in overview_code, (
+            f'OverviewTab still reads `{retired}`, which the server no longer serves.'
+        )
+
+    def test_no_client_queue_arithmetic_remains(self, overview_code):
+        assert not re.search(r'queue\.pending\s*\+\s*queue\.retry', overview_code), (
+            'OverviewTab still sums queue counts by hand.'
+        )
+
+    def test_the_write_queue_row_reads_one_queue_datum(self, overview_code):
+        queue = _const_bound_to(overview_code, r'writeQueue\(\s*D\s*\)', 'writeQueue(D)')
+        row = _health_row(overview_code, 'Write queue')
+        assert re.search(
+            r'sub:\s*<DatumReading\s+datum=\{\s*' + queue + r'\s*\}\s+format=\{\s*queueCountsText\s*\}',
+            row,
+        ), f'the Write queue row does not render queueCountsText over {queue}:\n{row}'
+        assert re.search(r'\.\.\.\s*queueHealth\(\s*' + queue + r'\s*\)', row), (
+            f'the Write queue row does not spread queueHealth({queue}):\n{row}'
+        )
+
+    def test_the_memory_ops_tile_reads_the_newest_served_hour(self, overview_code):
+        tile = _stat_tile(overview_code, 'Memory ops / min')
+        assert re.search(r'datum=\{\s*newestHourOps\(\s*D\s*\)', tile), (
+            f'the Memory ops tile is not handed newestHourOps(D):\n{tile}'
+        )
+        assert re.search(r'history=\{[^}]*MEMORY_OPS\.total\b', tile), (
+            f'the Memory ops spark does not read MEMORY_OPS.total:\n{tile}'
+        )
+
+    def test_the_activity_timeline_meta_states_the_served_totals(self, overview_code):
+        panel = _panel(overview_code, 'Activity timeline')
+        assert re.search(
+            r'<DatumReading\s+datum=\{\s*opsTotals\(\s*D\s*\)\s*\}\s+format=\{\s*opsCaption\s*\}',
+            panel,
+        ), f'the Activity timeline meta does not render opsCaption over opsTotals(D):\n{panel}'

@@ -5,13 +5,10 @@ directories — NEVER the host's real ~/.config/systemd/user/ — mirroring the
 rule tests/scripts/test_check_fused_memory_unit_parity.py states in its own
 docstring.
 
-That rule is load-bearing here for a specific reason, not just portability:
-as measured on 2026-08-01 the installed dark-factory-dashboard-watchdog.service
-is still the pre-incident inline-shell copy, so the checker exits 1 against the
-live host today. That is the CORRECT signal — installing the post-3308 units
-belongs to task 3289 — but a test asserting parity against the live host would
-be red on landing, and one asserting drift would flip red the moment 3289 fixes
-it. Either encodes host state rather than checker behaviour.
+That rule is load-bearing here for a specific reason, not just portability: a
+test asserting parity or drift against the live host encodes that host's state
+rather than the checker's behaviour, so it turns red or green for reasons no
+change to the checker can affect.
 
 The only real-tree reads are REPO-side (the committed dashboard/*.service and
 *.timer files), used by the registry staleness guard.
@@ -21,6 +18,7 @@ loaded via importlib.util.spec_from_file_location, mirroring
 tests/scripts/test_check_fused_memory_unit_parity.py::_load_checker.
 """
 
+import dataclasses
 import importlib.util
 import os
 import pathlib
@@ -1169,9 +1167,8 @@ def test_exec_start_flag_helper_reads_the_parsed_value():
 # ---------------------------------------------------------------------------
 #
 # These read REPO-side files only — never ~/.config/systemd/user/ — so they
-# stay green on a host whose installed units are drifted (which this one is,
-# deliberately, until task 3289 lands) and on CI, which has no installed units
-# at all.
+# stay green on a host whose installed units are drifted and on CI, which has
+# no installed units at all.
 
 _DASHBOARD_SERVICE = "dark-factory-dashboard.service"
 _WATCHDOG_SERVICE = "dark-factory-dashboard-watchdog.service"
@@ -1318,6 +1315,198 @@ def test_committed_environment_declarations_are_all_registered():
             )
 
 
+def _unregistered_directives(spec, parsed) -> list[tuple[str, str]]:
+    """Every ``(section, key)`` in *parsed* that *spec* neither covers nor waives.
+
+    Takes the spec and the parsed unit rather than a unit name so the same
+    code drives both the real registry and the throwaway fixture that proves
+    it fires — the guard and its own proof cannot diverge.
+    """
+    covered = spec.covered_directives()
+    waived = {(section, key) for section, key, _reason in spec.unchecked_directives}
+    return [
+        (section, key)
+        for section, directives in parsed.items()
+        for key in directives
+        if (section, key) not in covered and (section, key) not in waived
+    ]
+
+
+def test_every_committed_directive_is_registered_or_explicitly_unchecked():
+    """COMPLETENESS GUARD: every directive a committed unit declares was considered.
+
+    The staleness guards above all run one way — a registered key must be
+    declared — and test_committed_environment_declarations_are_all_registered
+    inverts that for Environment= alone. This is the same inversion for every
+    directive. Without it a committed unit can gain a directive nobody
+    registered, every registered key still compares equal, and the gate reports
+    parity on a host that never received it. SuccessExitStatus= did exactly
+    that for ~3 weeks.
+
+    Comparison stays BOUNDED — the module docstring's case against an
+    unbounded diff is sound — but bounded must mean every directive was
+    considered, not that someone remembered to.
+    """
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        parsed = mod.parse_unit_directives(
+            (REPO_ROOT / spec.repo_relpath).read_text(encoding="utf-8")
+        )
+        unregistered = _unregistered_directives(spec, parsed)
+        assert unregistered == [], (
+            f"{name}: the committed unit {spec.repo_relpath} declares "
+            + ", ".join(f"[{section}] {key}" for section, key in unregistered)
+            + " but the registry neither compares nor waives it, so drift in it "
+            "would be reported as parity. Either register it on the branch that "
+            "fits (compared / present_only / override_directives / "
+            "environment_section), or add it to unchecked_directives with a "
+            "specific reason — a reasoned waiver is a legitimate answer, not a "
+            "way around this guard."
+        )
+
+
+def test_completeness_guard_fires_on_an_unregistered_directive():
+    """The guard's own proof, in both directions.
+
+    OOMPolicy= is a real systemd directive, absent from all three committed
+    units, and plainly not cosmetic — the shape of directive a future edit
+    could add without anyone registering it.
+    """
+    mod = _load_checker()
+    parsed = mod.parse_unit_directives(
+        "[Unit]\n"
+        "Description=Throwaway fixture\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "ExecStart=/bin/true\n"
+        "OOMPolicy=stop\n"
+    )
+    spec = mod.UnitSpec(
+        name="throwaway.service",
+        repo_relpath="dashboard/throwaway.service",
+        compared=(("Unit", "Description"), ("Service", "Type")),
+        present_only=(("Service", "ExecStart"),),
+    )
+
+    assert _unregistered_directives(spec, parsed) == [("Service", "OOMPolicy")]
+
+    waived = mod.UnitSpec(
+        name="throwaway.service",
+        repo_relpath="dashboard/throwaway.service",
+        compared=(("Unit", "Description"), ("Service", "Type")),
+        present_only=(("Service", "ExecStart"),),
+        unchecked_directives=(("Service", "OOMPolicy", "throwaway fixture directive"),),
+    )
+
+    assert _unregistered_directives(waived, parsed) == []
+
+
+def test_unchecked_directives_all_carry_a_nonempty_reason():
+    """Every waiver states a reason, or it is an invisible hole.
+
+    Same stance as test_divergence_allowlist_names_are_declared_in_a_committed_unit:
+    the gate's deliberate holes stay believable only while each one says why,
+    specifically enough for a reviewer to check.
+    """
+    mod = _load_checker()
+
+    for name, spec in mod.UNITS.items():
+        for section, key, reason in spec.unchecked_directives:
+            assert reason.strip(), (
+                f"{name}: unchecked_directives waives [{section}] {key} with an "
+                "empty reason. State why it is safe not to compare it."
+            )
+
+
+def test_unchecked_directive_that_is_also_covered_is_rejected():
+    """A directive both compared and waived raises at construction.
+
+    Its reason string would tell a reviewer the directive is deliberately not
+    compared while a branch compares it, so the waiver stops meaning what it
+    says. Rejected at import time, on the same terms as an env_matches_directive
+    pair registered with no environment_section.
+    """
+    mod = _load_checker()
+
+    with pytest.raises(ValueError) as excinfo:
+        mod.UnitSpec(
+            name="fixture.service",
+            repo_relpath="dashboard/fixture.service",
+            compared=(("Service", "TimeoutStopSec"),),
+            unchecked_directives=(("Service", "TimeoutStopSec", "contradictory waiver"),),
+        )
+
+    message = str(excinfo.value)
+    assert "fixture.service" in message, message
+    assert "[Service] TimeoutStopSec" in message, message
+    assert "contradictory waiver" in message, message
+
+
+# Every UnitSpec field, sorted by what compare_unit does with it. A field added
+# to UnitSpec fails the cross-check below until it is placed in one of these.
+_PROBE_DIRECTIVE_FIELDS = {
+    "compared": (("Service", "Compared"),),
+    "present_only": (("Service", "PresentOnly"),),
+    "override_directives": (("Service", "Override"),),
+    "environment_section": "Service",
+}
+_CONTENT_FIELDS = {"exec_start_flags", "env_matches_directive"}
+_NON_COMPARISON_FIELDS = {"name", "repo_relpath", "unchecked_directives"}
+
+
+def test_covered_directives_is_exactly_what_compare_unit_checks():
+    """covered_directives() and compare_unit's branches cannot drift apart.
+
+    compare_unit reads the spec's fields itself, so covered_directives() is a
+    second enumeration of its directive-level branches. Were the two to
+    disagree, the completeness guard would accept a directive nothing compares,
+    or demand a waiver for one that is compared.
+
+    A probe spec registers one directive on every directive-level field. Each
+    directive is then declared in one copy only, in both directions. It must
+    drift exactly when covered_directives() names it, and an unregistered
+    control directive must never drift. The content fields reach tokens inside
+    a directive, or relate two, so they cover no directive of their own.
+    """
+    mod = _load_checker()
+    assert {field.name for field in dataclasses.fields(mod.UnitSpec)} == (
+        set(_PROBE_DIRECTIVE_FIELDS) | _CONTENT_FIELDS | _NON_COMPARISON_FIELDS
+    ), (
+        "UnitSpec gained or lost a field: give it a probe value in "
+        "_PROBE_DIRECTIVE_FIELDS if compare_unit compares it as a whole "
+        "directive, otherwise classify it in _CONTENT_FIELDS or "
+        "_NON_COMPARISON_FIELDS"
+    )
+    spec = mod.UnitSpec(
+        name="probe.service", repo_relpath="dashboard/probe.service", **_PROBE_DIRECTIVE_FIELDS
+    )
+    covered = spec.covered_directives()
+
+    def drifts_from_either_side(section: str, key: str) -> bool:
+        declared = f"[{section}]\n{key}=PROBE=1\n"
+        bare = f"[{section}]\n"
+        return bool(mod.compare_unit(spec, declared, bare)) and bool(
+            mod.compare_unit(spec, bare, declared)
+        )
+
+    # Listed outright rather than read back from covered, so a branch that
+    # covered_directives() forgets still gets probed.
+    candidates = covered | {
+        ("Service", "Compared"),
+        ("Service", "PresentOnly"),
+        ("Service", "Override"),
+        ("Service", "Environment"),
+        ("Service", "Unregistered"),
+    }
+    drifting = {directive for directive in candidates if drifts_from_either_side(*directive)}
+
+    assert drifting == covered, (
+        f"compare_unit drifts on {sorted(drifting)} but covered_directives() "
+        f"names {sorted(covered)}"
+    )
+
+
 def test_registry_env_matches_directive_entries_are_declared_in_the_committed_units():
     """STALENESS GUARD, intra-copy-relation edition.
 
@@ -1410,6 +1599,54 @@ def test_dashboard_service_spec_pins_the_tasks_minimum_coverage():
             "RestartSteps=, so an installed unit whose cap systemd is silently "
             f"ignoring would be reported as parity. compared: {compared_keys}"
         )
+
+
+def test_dashboard_service_spec_compares_the_success_exit_status():
+    """SuccessExitStatus= is value-compared on the dashboard service.
+
+    It is load-bearing: ``uv run`` propagates its child's SIGTERM death as
+    128+15, so without the directive systemd records every graceful stop as
+    "Failed with result exit-code" (status=143) and a real crash reads exactly
+    like a deploy.
+
+    The measured history is why this needs its own pin. The directive was
+    absent from the installed unit for ~3 weeks after commit d50235fa66 added
+    it to the committed one, and this gate reported parity throughout —
+    BECAUSE THIS KEY WAS NOT IN THE REGISTRY. That is the silent-green failure
+    the staleness guards above exist to prevent, arriving from the one
+    direction they do not cover: they prove every registered key is declared,
+    never that every declared key is registered.
+    """
+    mod = _load_checker()
+    spec = mod.UNITS[_DASHBOARD_SERVICE]
+
+    assert ("Service", "SuccessExitStatus") in spec.compared, (
+        "the dashboard spec does not value-compare SuccessExitStatus=, so an "
+        "installed unit that lost it reports parity while systemd records "
+        f"every graceful stop as a failure. compared: {spec.compared}"
+    )
+
+
+def test_installed_copy_missing_success_exit_status_is_drift():
+    """The registry entry has teeth: dropping the line from the installed copy is drift.
+
+    Membership in ``compared`` proves only that a string is in a tuple. This
+    drives the real registered spec through compare_unit with an installed
+    copy that is the repo copy minus that one line — the exact shape measured
+    on this host before task 3289 — and requires exactly one drift naming it.
+    """
+    mod = _load_checker()
+    spec = mod.UNITS[_DASHBOARD_SERVICE]
+    repo_text = "[Service]\nType=simple\nSuccessExitStatus=143\nTimeoutStopSec=15\n"
+    installed_text = "[Service]\nType=simple\nTimeoutStopSec=15\n"
+
+    drifts = mod.compare_unit(spec, repo_text, installed_text)
+
+    assert len(drifts) == 1, drifts
+    (drift,) = drifts
+    assert drift.key == "SuccessExitStatus"
+    assert drift.repo_value == "143"
+    assert "absent from the installed copy" in drift.reason, drift.reason
 
 
 def test_dashboard_service_spec_pins_the_project_root_env_contract():
@@ -1983,7 +2220,7 @@ def test_main_reports_the_watchdog_pre_incident_drift(tmp_path: pathlib.Path, ca
     """The real measured host drift: the pre-incident inline-shell watchdog.
 
     Reproduced as a FIXTURE rather than read from ~/.config/systemd/user/, so
-    the assertion survives task 3289 installing the post-3308 units.
+    the assertion pins checker behaviour whatever that host has installed since.
     """
     mod = _load_checker()
     repo = _fake_repo(tmp_path, mod)
@@ -2414,9 +2651,9 @@ def _gate_repo(
     #   ordering them first makes it structural that a stub checker body can
     #   never shadow the renderer's dependencies.
     #
-    # This is also why render_dashboard_unit.py must not import the checker: see
+    # This is also why render_systemd_unit.py must not import the checker: see
     # its module docstring, which names this harness as the concrete obstacle.
-    for _name in ("render_dashboard_unit.py", "systemd_unit_parity.py"):
+    for _name in ("render_systemd_unit.py", "systemd_unit_parity.py"):
         (repo / "scripts" / _name).write_text(
             (REPO_ROOT / "scripts" / _name).read_text(encoding="utf-8"),
             encoding="utf-8",
@@ -2872,7 +3109,7 @@ def test_section_8_render_failure_leaves_the_installed_unit_intact(
     """
     mod = _load_checker()
     repo = _gate_repo(tmp_path, mod)
-    (repo / "scripts" / "render_dashboard_unit.py").write_text(
+    (repo / "scripts" / "render_systemd_unit.py").write_text(
         _FAILING_RENDERER, encoding="utf-8"
     )
     unit_dir = _seeded_with_nine_roots(tmp_path, mod, repo)
@@ -2896,7 +3133,7 @@ def test_section_8_missing_renderer_does_not_clobber_host_local_values(
     """
     mod = _load_checker()
     repo = _gate_repo(tmp_path, mod)
-    (repo / "scripts" / "render_dashboard_unit.py").unlink()
+    (repo / "scripts" / "render_systemd_unit.py").unlink()
     unit_dir = _seeded_with_nine_roots(tmp_path, mod, repo)
     before = (unit_dir / _DASHBOARD_SERVICE).read_bytes()
 
@@ -2926,7 +3163,7 @@ def test_section_8_bare_host_with_a_failed_render_still_installs_the_watchdog(
     """
     mod = _load_checker()
     repo = _gate_repo(tmp_path, mod)
-    (repo / "scripts" / "render_dashboard_unit.py").write_text(
+    (repo / "scripts" / "render_systemd_unit.py").write_text(
         _FAILING_RENDERER, encoding="utf-8"
     )
     unit_dir = tmp_path / "bare-unit-dir"
@@ -3576,3 +3813,26 @@ def test_no_parity_call_site_branches_on_a_bare_exit_status(
         "the status anywhere but inside `_parity_verdict` re-creates the "
         f"defect the helper centralises.\n{block}"
     )
+def test_dashboard_reuses_the_shared_drift_and_absent():
+    """``Drift`` and ``_ABSENT`` are the SHARED objects, not local look-alikes.
+
+    IDENTITY, not equality, and the distinction is the whole point: a pasted
+    copy of a six-field frozen dataclass compares equal field-for-field with
+    the original while being a DISTINCT TYPE, so an ``==`` check on the class
+    — or on instances of it — would pass over exactly the fork this guard
+    exists to forbid. ``_ABSENT`` is worse still: two ``"<absent>"`` literals
+    may or may not be interned, so equality says nothing at all about whether
+    there is one definition or three.
+
+    The same pin the three earlier lifts carry (see
+    tests/scripts/test_check_orchestrator_unit_parity.py, which asserts this
+    shape for the parser and for ``find_dropins``). Duplicating a record inside
+    the tooling built to report silent duplication is the failure this family
+    exists to catch, one level up.
+    """
+    import systemd_unit_parity
+
+    mod = _load_checker()
+
+    assert mod.Drift is systemd_unit_parity.Drift
+    assert mod._ABSENT is systemd_unit_parity._ABSENT

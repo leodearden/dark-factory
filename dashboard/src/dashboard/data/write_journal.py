@@ -17,7 +17,11 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections import Counter
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Any
 
 import aiosqlite
 
@@ -32,144 +36,186 @@ logger = logging.getLogger(__name__)
 # line number — a numbered citation across these two packages has gone stale
 # before). `INDEXED BY` makes the index a hard constraint: SQLite raises
 # `no such index: idx_wo_created` rather than silently falling back to a scan
-# if it is ever absent. `get_operations_breakdown`'s `_query` catches exactly
-# that error and retries against `OPS_BREAKDOWN_SQL_UNHINTED`, so the actual
-# observable of a missing index is a correct-but-slow chart plus an ERROR log
-# naming `idx_wo_created` (pinned by
-# TestOperationsBreakdownMissingIndexFallback) — never a 500, and no longer a
-# silently empty chart either (amended, task 3519 review pass; the original
-# version of this comment described the pre-amendment silent-empty behaviour).
-# The index cannot go missing in normal operation: fused-memory's
-# initialize() re-runs the `IF NOT EXISTS` DDL on every start, and
+# if it is ever absent. `get_memory_ops` catches exactly that error and
+# retries against `MEMORY_OPS_SQL_UNHINTED`, so the observable of a missing
+# index is a correct-but-slow chart plus an ERROR log naming
+# `idx_wo_created` (pinned by TestMemoryOpsMissingIndexFallback) — never a
+# 500 and never a silently empty chart. The index cannot go missing in normal
+# operation: fused-memory's initialize() re-runs the `IF NOT EXISTS` DDL on
+# every start, and
 # fused-memory/tests/test_write_journal.py::test_schema_creates_idx_wo_created
 # already fails CI on a rename or a drop there. The residual risk this
 # fallback guards against is narrower than "nothing else catches it": a
 # schema edit that lands without that suite running, or a journal DB produced
 # by an older fused-memory build.
-OPS_BREAKDOWN_SQL = (
-    'SELECT operation, COUNT(*) AS cnt FROM write_ops INDEXED BY idx_wo_created'
-    ' WHERE created_at >= ? GROUP BY operation ORDER BY cnt DESC'
+MEMORY_OPS_SQL = (
+    "SELECT strftime('%Y-%m-%dT%H:00', created_at) AS hour, kind, operation, COUNT(*)"
+    ' FROM write_ops INDEXED BY idx_wo_created'
+    ' WHERE created_at >= ? AND created_at < ?'
+    ' GROUP BY hour, kind, operation'
 )
 
-# Fallback used by `get_operations_breakdown` when idx_wo_created is
-# unexpectedly absent (see the coupling comment above). Derived from
-# OPS_BREAKDOWN_SQL by construction, rather than retyped, so the two strings
-# cannot silently diverge.
-OPS_BREAKDOWN_SQL_UNHINTED = OPS_BREAKDOWN_SQL.replace(' INDEXED BY idx_wo_created', '')
+# Fallback used by `get_memory_ops` when idx_wo_created is unexpectedly
+# absent (see the coupling comment above). Derived from MEMORY_OPS_SQL by
+# construction, rather than retyped, so the two strings cannot diverge.
+MEMORY_OPS_SQL_UNHINTED = MEMORY_OPS_SQL.replace(' INDEXED BY idx_wo_created', '')
+
+_HOUR_KEY_FORMAT = '%Y-%m-%dT%H:00'
 
 
-async def get_memory_timeseries(
-    db: aiosqlite.Connection | None, *, hours: int = 24, now: datetime | None = None,
-) -> dict:
-    """Hourly read/write counts for the last *hours* hours.
+@dataclass(frozen=True, slots=True)
+class MemoryOps:
+    """One window's memory operations, counted once and offered two views.
 
-    Returns ``{labels: ["HH:00", ...], reads: [int, ...], writes: [int, ...]}``.
-    Labels cover every hour in the window, with zeros for gaps.
-
-    *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
-    pass an explicit value for deterministic results.
+    ``reads``, ``writes`` and ``other`` (every kind outside read/write) are
+    hourly counts aligned to ``labels`` ('HH:MM', oldest first).
+    ``by_operation`` is ``(operation, count)`` pairs, count descending then
+    operation ascending. Both views come from the same rows, so the series
+    sum to exactly the by_operation total.
     """
-    now = resolve_now(now)
-    since = now - timedelta(hours=hours)
 
-    # Pre-fill all hour buckets
-    buckets: dict[str, dict[str, int]] = {}
-    for i in range(hours):
-        dt = since + timedelta(hours=i + 1)
-        key = dt.strftime('%Y-%m-%dT%H:00')
-        buckets[key] = {'read': 0, 'write': 0}
+    labels: tuple[str, ...]
+    reads: tuple[int, ...]
+    writes: tuple[int, ...]
+    other: tuple[int, ...]
+    by_operation: tuple[tuple[str, int], ...]
 
-    since_iso = since.isoformat()
+    def __post_init__(self) -> None:
+        hours = len(self.labels)
+        if not len(self.reads) == len(self.writes) == len(self.other) == hours:
+            raise ValueError(f'MemoryOps series must each hold {hours} hourly buckets')
+        series_total = sum(self.reads) + sum(self.writes) + sum(self.other)
+        operations_total = sum(count for _, count in self.by_operation)
+        if series_total != operations_total:
+            raise ValueError(
+                f'MemoryOps views disagree: series count {series_total} rows, '
+                f'by_operation counts {operations_total}'
+            )
 
-    async def _query(db: aiosqlite.Connection) -> list:
-        async with db.execute(
-            "SELECT strftime('%Y-%m-%dT%H:00', created_at) AS hour,"
-            ' kind, COUNT(*) AS cnt'
-            ' FROM write_ops WHERE created_at >= ?'
-            ' GROUP BY hour, kind',
-            (since_iso,),
-        ) as cursor:
-            return list(await cursor.fetchall())
 
-    rows = await with_db(db, _query, [])
-    for hour, kind, cnt in rows:
-        if hour in buckets and kind in ('read', 'write'):
-            buckets[hour][kind] = cnt
+def _hour_keys(newest_hour: datetime, hours: int) -> tuple[str, ...]:
+    """The *hours* hour keys ending with *newest_hour*, oldest first."""
+    oldest_hour = newest_hour - timedelta(hours=hours - 1)
+    return tuple(
+        (oldest_hour + timedelta(hours=i)).strftime(_HOUR_KEY_FORMAT) for i in range(hours)
+    )
 
-    sorted_keys = sorted(buckets)
-    return {
-        'labels': [k[11:16] for k in sorted_keys],  # "HH:MM"
-        'reads': [buckets[k]['read'] for k in sorted_keys],
-        'writes': [buckets[k]['write'] for k in sorted_keys],
+
+def _newest_hour(now: datetime | None) -> datetime:
+    return resolve_now(now).replace(minute=0, second=0, microsecond=0)
+
+
+def empty_memory_ops(*, hours: int = 24, now: datetime | None = None) -> MemoryOps:
+    """The window :func:`get_memory_ops` reads, every bucket zero and no operations.
+
+    What :func:`get_memory_ops` returns when the journal cannot be read.
+    """
+    return _reduce_memory_ops(_hour_keys(_newest_hour(now), hours), ())
+
+
+def _reduce_memory_ops(
+    hour_keys: Sequence[str], rows: Iterable[Sequence[Any]],
+) -> MemoryOps:
+    """Fold ``(hour, kind, operation, count)`` rows into both views at once.
+
+    A row whose hour is not one of *hour_keys* is skipped from BOTH views, so
+    they reconcile by construction.
+    """
+    position = {key: i for i, key in enumerate(hour_keys)}
+    series: dict[str, list[int]] = {
+        'read': [0] * len(hour_keys),
+        'write': [0] * len(hour_keys),
+        'other': [0] * len(hour_keys),
     }
+    by_operation: Counter[str] = Counter()
+    for hour, kind, operation, count in rows:
+        bucket = position.get(hour)
+        if bucket is None:
+            continue
+        series[kind if kind in ('read', 'write') else 'other'][bucket] += count
+        by_operation[operation or 'unknown'] += count
+    return MemoryOps(
+        labels=tuple(key[11:16] for key in hour_keys),
+        reads=tuple(series['read']),
+        writes=tuple(series['write']),
+        other=tuple(series['other']),
+        by_operation=tuple(
+            sorted(by_operation.items(), key=lambda item: (-item[1], item[0]))
+        ),
+    )
 
 
-async def get_operations_breakdown(
+async def get_memory_ops(
     db: aiosqlite.Connection | None, *, hours: int = 24, now: datetime | None = None,
-) -> dict:
-    """Operation type distribution for the last *hours* hours.
+) -> MemoryOps:
+    """Memory operations over the *hours* whole hours ending with now's hour.
 
-    Returns ``{labels: [str, ...], values: [int, ...]}``.
+    The window is hour-ALIGNED and bounded on both sides:
+    ``[floor(now) - (hours-1)h, floor(now) + 1h)``, exactly the hour buckets
+    the chart labels, so no row can count in one view and not the other — a
+    row before the oldest bucket or dated in the future is in neither. (The
+    two queries this replaced disagreed: the timeseries dropped the window's
+    partial oldest hour and every kind outside read/write, while the
+    breakdown counted both.) On a missing DB or a query error it returns
+    :func:`empty_memory_ops` for the same window.
 
     *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
     pass an explicit value for deterministic results.
 
-    Performance — unhinted, the planner chooses ``SCAN write_ops USING INDEX
-    idx_wo_operation`` to satisfy ``GROUP BY operation`` in order and avoid a
-    temp B-tree, paying a per-row ``created_at`` test across every row instead
-    of range-seeking the date index. That choice is stable across ``ANALYZE``,
-    row counts, and a covering ``(created_at, operation)`` variant (task
-    3304's finding — still true, unhinted). An explicit ``INDEXED BY`` (see
-    :data:`OPS_BREAKDOWN_SQL`) overrides it: measured 2026-08-02 on the live
-    DB, 22.01 s -> 0.64 s, 34x, both returning the same 19 groups (task 3519).
-    ``api_memory_graphs`` in :mod:`dashboard.app` serves exactly this query
-    plus :func:`get_memory_timeseries`, so this was the endpoint's dominant
-    residual latency.
+    Performance — one ``GROUP BY hour, kind, operation`` over a
+    ``SEARCH ... USING INDEX idx_wo_created`` range seek. Measured 2026-10-03
+    read-only on the live 17 GB journal (935 554 rows in 24h): 3.93 s for 293
+    groups, against 4.11 s + 0.92 s for the two queries it replaced, which
+    aiosqlite serialised on one connection. The ``INDEXED BY`` hint (see
+    :data:`MEMORY_OPS_SQL`) is inherited from the old operations breakdown,
+    whose unhinted form chose ``SCAN write_ops USING INDEX idx_wo_operation``
+    to satisfy ``GROUP BY operation`` in order — stable across ``ANALYZE``
+    and row counts — and paid a per-row ``created_at`` test across every row:
+    22.01 s unhinted vs 0.64 s hinted, measured 2026-08-02 (task 3519).
 
-    Do NOT "fix" this by restructuring into a ``created_at`` subquery instead
-    of the hint: SQLite flattens an un-hinted subquery pre-filter straight
-    back to the same ``SCAN`` (measured 18.12 s) — the hint is load-bearing;
-    a reshape alone does nothing.
+    Do NOT "fix" a slow plan by restructuring into a ``created_at`` subquery
+    instead of the hint: SQLite flattens an un-hinted subquery pre-filter
+    straight back to the same ``SCAN`` (measured 18.12 s) — the hint is
+    load-bearing; a reshape alone does nothing.
 
     The hint is tuned for SHORT windows — it is measured only against the
-    24h default. ``INDEXED BY`` is unconditional, so a caller passing a much
-    wider ``hours`` (e.g. a multi-month report) forces the same range seek
-    over a large fraction of the index and loses the in-order ``GROUP BY``
-    that ``idx_wo_operation`` would otherwise give it for free; unlike the
-    unhinted form, the planner is no longer free to correct that choice. No
-    caller passes a non-default ``hours`` today (task 3519 review pass).
+    24h default. ``INDEXED BY`` is unconditional, so a much wider ``hours``
+    forces the same range seek over a large fraction of the index, and the
+    planner is no longer free to choose otherwise. No caller passes a
+    non-default ``hours`` today.
 
-    Full variant table and measurements are recorded, authoritatively, in the
-    "Follow-on: α's residual is now owned (added 2026-08-02)" section of
+    Full variant table for the 2026-08-02 measurements:
+    the "Follow-on: α's residual is now owned (added 2026-08-02)" section of
     plans/dashboard-availability-prd.md.
     """
-    since = (resolve_now(now) - timedelta(hours=hours)).isoformat()
+    newest_hour = _newest_hour(now)
+    hour_keys = _hour_keys(newest_hour, hours)
+    window = (
+        (newest_hour - timedelta(hours=hours - 1)).isoformat(),
+        (newest_hour + timedelta(hours=1)).isoformat(),
+    )
 
-    async def _query(db: aiosqlite.Connection) -> dict:
+    async def _query(db: aiosqlite.Connection) -> MemoryOps:
         try:
-            async with db.execute(OPS_BREAKDOWN_SQL, (since,)) as cursor:
+            async with db.execute(MEMORY_OPS_SQL, window) as cursor:
                 rows = await cursor.fetchall()
         except sqlite3.OperationalError as exc:
             if 'no such index' not in str(exc):
                 raise
             # idx_wo_created is missing — see the coupling comment at
-            # OPS_BREAKDOWN_SQL. Fall back to the unhinted query so the chart
-            # stays correct (just slow) instead of going silently blank, and
-            # log loudly enough to name the index without needing the
-            # traceback.
+            # MEMORY_OPS_SQL. Fall back to the unhinted query so the chart
+            # stays correct (just slow), and log loudly enough to name the
+            # index without needing the traceback.
             logger.error(
-                'write_ops index idx_wo_created missing — operations breakdown '
+                'write_ops index idx_wo_created missing — memory ops '
                 'falling back to unhinted scan',
                 exc_info=True,
             )
-            async with db.execute(OPS_BREAKDOWN_SQL_UNHINTED, (since,)) as cursor:
+            async with db.execute(MEMORY_OPS_SQL_UNHINTED, window) as cursor:
                 rows = await cursor.fetchall()
-        return {
-            'labels': [r[0] or 'unknown' for r in rows],
-            'values': [r[1] for r in rows],
-        }
+        return _reduce_memory_ops(hour_keys, rows)
 
-    return await with_db(db, _query, {'labels': [], 'values': []})
+    return await with_db(db, _query, _reduce_memory_ops(hour_keys, ()))
 
 
 async def get_agent_breakdown(
@@ -185,9 +231,8 @@ async def get_agent_breakdown(
     Deliberately NOT hinted with ``INDEXED BY idx_wo_created`` (task 3519 —
     decided and recorded, not left to chance): (1) zero production callers
     today — ``api_memory_graphs`` in :mod:`dashboard.app` calls only
-    :func:`get_memory_timeseries` and :func:`get_operations_breakdown` — so
-    the oversubscription argument that justifies the hint on the breakdown
-    query does not apply here; (2) once ``sqlite_stat1`` exists, the planner
+    :func:`get_memory_ops` — so the oversubscription argument that justifies
+    the hint on that query does not apply here; (2) once ``sqlite_stat1`` exists, the planner
     already reaches the same ``created_at`` range seek via a strictly better
     COVERING skip-scan on ``idx_wo_kind_time`` (``SEARCH ... COVERING INDEX
     idx_wo_kind_time (ANY(kind) AND created_at>?)``), which pinning

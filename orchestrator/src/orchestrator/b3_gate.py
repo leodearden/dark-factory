@@ -42,6 +42,25 @@ FRESH = 'fresh'
 DRIFT = 'drift'
 ABORT = 'abort'
 
+# Closed domain for check_proposal's 'age_state' key — WHY a proposal's age is
+# or is not known.  Before task 5361 all four causes collapsed to a bare
+# 'age_seconds': None, indistinguishable to every consumer.
+#
+# THREE non-parsed states cover FOUR causes, not four states: an absent
+# timestamp and an absent clock each get their own, while BOTH awareness
+# mismatches — a naive investigated_at against an aware clock, and an aware
+# investigated_at against a naive operator-supplied --now — land on
+# AGE_UNPARSEABLE alongside a genuinely malformed string.  They are not split
+# because the fault is the PAIR, not one operand; _age_of's warning names both
+# so the shared state cannot misdirect an operator to the wrong one.
+#
+# AGE_NO_CLOCK is unreachable through the `check` CLI — _parse_now always
+# returns a datetime — and exists for in-process callers that pass now=None.
+AGE_PARSED = 'parsed'
+AGE_UNPARSEABLE = 'unparseable'
+AGE_ABSENT = 'absent'
+AGE_NO_CLOCK = 'no_clock'
+
 POST_MERGE_RED_MAIN_REASON_PREFIX = 'Post-merge unscoped type-check failed'
 """Prefix that identifies the post-merge-red-main fix-forward class.
 
@@ -288,6 +307,41 @@ def _run_git(args: list[str], cwd: str) -> tuple[int, str]:
         return 1, str(exc)
 
 
+def _age_of(
+    entry: dict[str, Any] | None, now: datetime | None,
+) -> tuple[float | None, str]:
+    """Return ``(age_seconds, age_state)`` for a proposal entry's investigated_at.
+
+    The state names WHY an age is unavailable, replacing a bare ``None`` that
+    told a consumer nothing.  THREE non-parsed states cover FOUR causes:
+    ``AGE_ABSENT`` (no timestamp), ``AGE_NO_CLOCK`` (no clock), and
+    ``AGE_UNPARSEABLE`` for an unreadable string AND for either direction of an
+    awareness mismatch.  The two mismatch causes share one state because the
+    fault is the PAIR, not one operand — an aware ``investigated_at`` against a
+    naive operator-supplied ``--now`` is the operator's bug, not the producer's.
+
+    Warns rather than swallowing — a pair this gate cannot subtract is a bug
+    worth surfacing, and siting the warning here means no caller can silently
+    drop it.  The message names BOTH operands precisely because the state does
+    not say which one is at fault.
+    """
+    investigated_at = (entry or {}).get('investigated_at')
+    if not investigated_at:
+        return None, AGE_ABSENT
+    if now is None:
+        return None, AGE_NO_CLOCK
+    try:
+        return (now - datetime.fromisoformat(investigated_at)).total_seconds(), AGE_PARSED
+    except Exception as exc:
+        logger.warning(
+            'check_proposal: could not compute proposal age from investigated_at '
+            '%r against now %r — treating age as unknown; either operand may be '
+            'at fault (a naive --now fails against an aware timestamp): %s',
+            investigated_at, now, exc,
+        )
+        return None, AGE_UNPARSEABLE
+
+
 def check_proposal(
     entry: dict[str, Any] | None,
     *,
@@ -340,9 +394,14 @@ def check_proposal(
       5. head_sha or main_sha missing/None -> drift 'no sha anchor'
       6. HEAD != head_sha -> abort (git-anchored; P1)
       7. diff main_sha..main -- files_referenced non-empty -> drift (P2)
+      7b. age_state != AGE_PARSED -> abort.  A gate authorising unattended
+          edits and merges to main must not certify a proposal fresh when it
+          cannot determine the proposal's age at all.  Placed last so every
+          earlier verdict keeps its more specific reason; abort and drift are
+          both already non-launching, so only the FRESH path needs gating.
       8. else fresh
 
-    Keys: verdict, reason, head_sha, main_sha, age_seconds.
+    Keys: verdict, reason, head_sha, main_sha, age_seconds, age_state.
     The 'run_git' parameter defaults to _run_git; tests inject a fake.
     """
     if run_git is None:
@@ -356,26 +415,24 @@ def check_proposal(
             'head_sha': None,
             'main_sha': None,
             'age_seconds': None,
+            'age_state': AGE_ABSENT,
         }
 
     head_sha = entry.get('head_sha')
     main_sha = entry.get('main_sha')
 
+    # Parsed once per call and shared by every return path, so an unparseable
+    # timestamp warns exactly once no matter which verdict the entry lands on.
+    age_seconds, age_state = _age_of(entry, now)
+
     def _result(verdict, reason):
-        age = None
-        try:
-            investigated_at = entry.get('investigated_at')
-            if investigated_at and now is not None:
-                ts = datetime.fromisoformat(investigated_at)
-                age = (now - ts).total_seconds()
-        except Exception:
-            pass
         return {
             'verdict': verdict,
             'reason': reason,
             'head_sha': head_sha,
             'main_sha': main_sha,
-            'age_seconds': age,
+            'age_seconds': age_seconds,
+            'age_state': age_state,
         }
 
     # --- (1b) Post-merge red-main fix-forward class (dual-read) ---
@@ -458,6 +515,17 @@ def check_proposal(
             return _result(DRIFT, f'could not verify footprint drift (git diff rc={rc})')
         if diff_out.strip():
             return _result(DRIFT, 'main moved within proposal footprint (files_referenced)')
+
+    # --- (7b) Fail closed on an undeterminable age ---
+    # Deliberately last: abort and drift are already non-launching for every
+    # consumer, so gating only the FRESH path is sufficient, and every entry
+    # that fails for a more specific reason keeps that reason verbatim.
+    if age_state != AGE_PARSED:
+        return _result(
+            ABORT,
+            f'proposal age is not determinable (age_state={age_state}) — B3 never '
+            f'certifies a proposal fresh without a parsed investigated_at',
+        )
 
     # --- (8) Fresh ---
     return _result(FRESH, 'sha anchors valid and footprint unchanged')

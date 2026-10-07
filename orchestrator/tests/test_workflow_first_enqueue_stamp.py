@@ -11,11 +11,13 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from _merge_lane_fakes import drive_merge
 from _orch_helpers import MOCK_WORKFLOW_PROJECT_ROOT, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
@@ -322,7 +324,6 @@ async def test_persistence_failure_is_non_fatal():
 @pytest.mark.asyncio
 async def test_submit_to_merge_queue_threads_first_enqueued_at_onto_request(
     tmp_path: Path,
-    monkeypatch,
 ):
     """_submit_to_merge_queue passes merge_first_enqueued_at=111.0 to MergeRequest.
 
@@ -339,7 +340,11 @@ async def test_submit_to_merge_queue_threads_first_enqueued_at_onto_request(
     wf = f.wf
     wf.worktree = tmp_path / 'wt'
     wf.worktree.mkdir(parents=True, exist_ok=True)
-    wf.merge_queue = MagicMock()
+    # A REAL queue, so the REAL register_and_enqueue_merge_request runs and
+    # the request this test reads is the one the production path actually
+    # enqueued -- not one handed to a substitute.
+    merge_queue: asyncio.Queue = asyncio.Queue()
+    wf.merge_queue = merge_queue
     wf.merge_inflight_registry = None  # skip attach branch
     wf.plan = {'files': []}
     wf._module_configs = []
@@ -347,26 +352,16 @@ async def test_submit_to_merge_queue_threads_first_enqueued_at_onto_request(
     # (belt-and-braces rebind before enqueue); must be AsyncMock for await.
     wf.git_ops.rebind_branch_to_head = AsyncMock(return_value=True)
 
-    captured: list[MergeRequest] = []
-
-    async def fake_register_and_enqueue(
-        queue, req: MergeRequest, event_store, registry, *, retention=None,
-    ):
-        # Intercept the function actually called on this path so the patch
-        # stays valid even if register_and_enqueue_merge_request is ever
-        # refactored to stop delegating to enqueue_merge_request internally.
-        captured.append(req)
-        req.result.set_result(MergeOutcome('blocked', reason='generic'))
-        return True
-
-    monkeypatch.setattr(
-        'orchestrator.merge_queue.register_and_enqueue_merge_request',
-        fake_register_and_enqueue,
+    # Nothing is draining the queue, so the submit parks on its result until
+    # this test plays the merger: drive_merge takes the enqueued request off
+    # the real queue, resolves it, and lets the submit finish.
+    driven = await drive_merge(
+        wf._submit_to_merge_queue('99', pre_rebased=False),
+        merge_queue,
+        MergeOutcome('blocked', reason='generic'),
     )
 
-    await wf._submit_to_merge_queue('99', pre_rebased=False)
-
-    assert len(captured) == 1
-    assert captured[0].merge_first_enqueued_at == 111.0
+    assert merge_queue.empty(), 'exactly one request must be enqueued'
+    assert driven.request.merge_first_enqueued_at == 111.0
     # Write-once fast-path: no persist call
     f.update_task.assert_not_awaited()

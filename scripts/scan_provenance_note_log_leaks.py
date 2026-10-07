@@ -2,10 +2,10 @@
 """Detect leaked server-log lines in a task's ``metadata.done_provenance.note``.
 
 READ-ONLY / DETECTION-ONLY: this module and its CLI never mutate task data.
-Every database connection it opens is a read-only SQLite URI
-(``sqlite3.connect(f"file:{path}?mode=ro", uri=True)``), so the sweep is
-structurally incapable of the auto-mutation this tool is explicitly forbidden
-from doing. Remediation of any match it finds is a separate, manual,
+Every database connection it opens goes through
+``_task_db_scan.py::connect_ro``, a read-only SQLite URI (``mode=ro``), so the
+sweep is structurally incapable of the auto-mutation this tool is explicitly
+forbidden from doing. Remediation of any match it finds is a separate, manual,
 individually-reviewed follow-up (matching the safe-vs-irreversible handling
 already applied to tasks 2080 and 2865) — never bulk-edited by this script.
 
@@ -59,13 +59,13 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sqlite3
 import sys
 from typing import NamedTuple
 
 from _task_db_scan import (
     SCAN_EXIT_CODE_EPILOG,
     add_db_discovery_args,
+    connect_ro,
     format_json,
     group_matches_by_db,
     run_scan_cli,
@@ -123,11 +123,9 @@ class NoteLeakMatch(NamedTuple):
 def scan_db(db_path: str) -> list[NoteLeakMatch]:
     """Scan *db_path* read-only for leaked log lines in done_provenance notes.
 
-    Opens the database via a read-only SQLite URI (``mode=ro``) so the scan is
-    structurally incapable of mutating live task data — even while the
-    fused-memory server holds the same file open in WAL mode for concurrent
-    writers. This matters concretely here: task 2902's note is a preserved
-    forensic specimen, and this tool must be unable to touch it.
+    Opens through ``_task_db_scan.py::connect_ro`` (read-only; see there for
+    refusals). The read-only open matters concretely here: task 2902's note
+    is a preserved forensic specimen, and this tool must be unable to touch it.
 
     Every row shape is tolerated: metadata that is NULL, undecodable, or a
     JSON scalar/array rather than an object, and a ``done_provenance`` that is
@@ -135,7 +133,7 @@ def scan_db(db_path: str) -> list[NoteLeakMatch]:
     among thousands of rows must never abort a sweep.
     """
     matches: list[NoteLeakMatch] = []
-    conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
+    conn = connect_ro(db_path)
     try:
         for tag, task_id, metadata in conn.execute(
             'SELECT tag, id, metadata FROM tasks'

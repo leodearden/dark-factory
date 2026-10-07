@@ -22,7 +22,6 @@ import asyncio
 import dataclasses
 import errno
 import hashlib
-import importlib.util
 import json
 import os
 import random
@@ -34,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from _fm_helpers import falkor_skipif
+from _fm_helpers import falkor_skipif, load_script_module
 from shared.testing_streams import (
     StdoutWithAFailingFlush,
     StdoutWithAFailingWrite,
@@ -46,30 +45,7 @@ SCRIPT_PATH = (
 )
 
 
-def _load_module() -> types.ModuleType:
-    """Load build_corpus.py from its file path.
-
-    The module is registered in sys.modules under its name BEFORE
-    ``exec_module`` so that ``@dataclass`` and other reflection-based
-    decorators work correctly (they call ``sys.modules.get(cls.__module__)``),
-    and build_corpus.py defines frozen dataclasses. See the note at
-    test_memory_eval_retrieval_probe.py's copy of this helper.
-    """
-    mod_name = 'lme_build_corpus'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='lme_build_corpus')
 
 
 # ===========================================================================
@@ -154,12 +130,102 @@ class TestPayloadKind:
     def test_temporal_context_prefix_is_stripped(self):
         """``graphiti_client`` prepends ``[temporal:<ctx>] `` when set.
 
-        Verified absent from dark_factory today — all rows are bare
-        ``add_memory:*`` — but the parser must not mis-bucket it if it appears.
+        A writer annotation, not part of the category: the parser must not
+        mis-bucket a temporally-tagged write into its own payload stratum.
         """
         assert _mod.payload_kind('[temporal:2026-05-16] add_memory:temporal_facts') == (
             'temporal_facts'
         )
+
+    def test_unverified_claim_annotation_is_stripped(self):
+        """The exact source_description measured on live dark_factory, 2026-10-01.
+
+        ``graphiti_client`` prepends ``[unverified_claim] `` to a write the
+        completion-claim gate flagged (task 3142). It is a write-time
+        annotation, not a caller string, so the write stays in its category.
+        """
+        assert _mod.payload_kind('[unverified_claim] add_memory:decisions_and_rationale') == (
+            'decisions_and_rationale'
+        )
+
+    def test_composed_writer_annotations_are_stripped(self):
+        """``[unverified_claim]`` outermost, then ``[temporal:<ctx>]``.
+
+        The composition order the writer emits, pinned writer-side by
+        fused-memory/tests/test_unverified_claim_tag_propagation.py::TestGraphitiBackendUnverifiedClaimTag::test_tag_composes_with_the_temporal_prefix.
+        """
+        assert _mod.payload_kind(
+            '[unverified_claim] [temporal:planning] add_memory:temporal_facts'
+        ) == 'temporal_facts'
+
+    @pytest.mark.parametrize(
+        'bad',
+        [
+            '[unverified_claim]',
+            '[unverified_claim] ',
+            '[unverified_claim] [temporal:x]',
+            '[temporal:x]',
+        ],
+    )
+    def test_annotation_only_description_raises_naming_the_offender(self, bad):
+        """Annotations alone identify no writer, so there is no defensible bucket."""
+        with pytest.raises(_mod.CorpusBuildError) as exc:
+            _mod.payload_kind(bad)
+        assert 'source_description' in str(exc.value)
+        assert repr(bad) in str(exc.value)
+
+    def test_unrecognised_bracket_tag_stays_a_caller_string(self):
+        """The stripped annotation set is closed: an unknown tag is not guessed away.
+
+        A new writer annotation therefore lands in ``add_episode`` and turns the
+        live smoke's payload-axis equality red, rather than being silently
+        absorbed into a category stratum.
+        """
+        assert _mod.payload_kind('[some_future_tag] add_memory:temporal_facts') == (
+            'add_episode'
+        )
+
+    @pytest.mark.parametrize(
+        ('temporal_context', 'unverified_claim'),
+        [(None, True), ('planning', False), ('planning', True)],
+    )
+    def test_classifies_what_the_episode_writer_persists(
+        self, mock_config, monkeypatch, temporal_context, unverified_claim
+    ):
+        """The reader's annotation set tracks the writer's real output, offline.
+
+        ``GraphitiBackend.add_episode`` spells its annotations inline, so the
+        literal pins here and in test_unverified_claim_tag_propagation.py could
+        both be respelled while still agreeing with themselves. Classifying the
+        description the writer actually hands graphiti_core makes a respelling
+        fail in the change that makes it, not later on the live smoke.
+        """
+        from fused_memory.backends.graphiti_client import GraphitiBackend  # noqa: PLC0415
+
+        class _RecordingClient:
+            def __init__(self):
+                self.source_descriptions: list[str] = []
+
+            async def add_episode(self, **kwargs):
+                self.source_descriptions.append(kwargs['source_description'])
+
+        client = _RecordingClient()
+        backend = GraphitiBackend(mock_config)
+        monkeypatch.setattr(backend, '_client_for', lambda group_id: client)
+
+        asyncio.run(
+            backend.add_episode(
+                name='e',
+                content='c',
+                group_id='g',
+                source_description='add_memory:decisions_and_rationale',
+                temporal_context=temporal_context,
+                unverified_claim=unverified_claim,
+            )
+        )
+
+        [persisted] = client.source_descriptions
+        assert _mod.payload_kind(persisted) == 'decisions_and_rationale', persisted
 
     @pytest.mark.parametrize('bad', ['', None, 17, '   '])
     def test_unusable_value_raises_naming_the_offender(self, bad):
@@ -3514,10 +3580,17 @@ def test_live_dark_factory_population_smoke(monkeypatch):
         f'sample rather than a census'
     )
 
-    kinds = {_mod.payload_kind(r.source_description) for r in population}
+    classified = [
+        (r.source_description, _mod.payload_kind(r.source_description)) for r in population
+    ]
+    kinds = {kind for _, kind in classified}
+    unexpected_descriptions = sorted(
+        {description for description, kind in classified if kind not in LIVE_PAYLOAD_KINDS}
+    )
     assert kinds == LIVE_PAYLOAD_KINDS, (
-        f'the payload axis changed: {kinds ^ LIVE_PAYLOAD_KINDS} — re-measure the '
-        f'census before building the next corpus'
+        f'the payload axis changed: {kinds ^ LIVE_PAYLOAD_KINDS} '
+        f'(source_descriptions outside it: {unexpected_descriptions[:5]}) — '
+        f're-measure the census before building the next corpus'
     )
 
     months = {_mod.month_bucket(r.created_at) for r in population}

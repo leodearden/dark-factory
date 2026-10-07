@@ -9,18 +9,28 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import enum
 import json
 import logging
 from collections import defaultdict
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, TypeVar
 
 import aiosqlite
 from escalation.queue import iter_all_escalation_paths
+from shared.timestamps import parse_timestamp_or_warn
 
+from dashboard.data.datum import Datum, DatumState
 from dashboard.data.db import with_db
 from dashboard.data.stats_utils import percentile
+from dashboard.data.utils import resolve_now, safe_gather_result
 
 logger = logging.getLogger(__name__)
+
+_Tally = TypeVar('_Tally')
 
 
 def _load_escalations(escalations_dir: Path) -> list[dict]:
@@ -46,24 +56,66 @@ def _load_escalations(escalations_dir: Path) -> list[dict]:
 # Time-window helper
 # ---------------------------------------------------------------------------
 
-_WINDOW_SQL = """\
-SELECT project_id,
-       datetime(MAX(completed_at), '-{days} days') AS cutoff
-  FROM task_results
- WHERE completed_at IS NOT NULL AND completed_at != ''
- GROUP BY project_id
-"""
+
+def _cutoff(days: int, *, now: datetime | None = None) -> str:
+    """Return ISO-format cutoff datetime for the given look-back window.
+
+    Local copy of :func:`dashboard.data.costs._cutoff` — kept independent
+    rather than imported so this module has no cross-module dependency on
+    another data module's private helper. The card families and the
+    hour-bucketed sparklines both bind this one cutoff, so a card and its
+    sparkline count the same rows of the same wall-clock window.
+
+    The ISO-with-offset return value is load-bearing, not cosmetic: it is
+    compared against ``task_results.completed_at``, which orchestrator
+    writes via ``datetime.now(UTC).isoformat()`` (``run_store.py::save_run``).
+    A SQLite-side ``datetime('now', ...)`` call renders SPACE-separated with
+    no offset, so a lexical TEXT comparison against it short-circuits at
+    index 10 on ``'T'`` (0x54) vs ``' '`` (0x20) and silently degrades to
+    DATE granularity — over-including up to a full extra day (task 4624).
+    """
+    return (resolve_now(now) - timedelta(days=days)).isoformat()
 
 
-async def _project_cutoffs(
-    db: aiosqlite.Connection,
-    days: int,
-) -> dict[str, str]:
-    """Return {project_id: cutoff_iso} based on most recent completed_at."""
-    # aiosqlite doesn't support f-string in execute safely, use replace
-    sql = _WINDOW_SQL.replace('{days}', str(int(days)))
-    rows = await db.execute_fetchall(sql)
+# A cancel ends an attempt from outside (shutdown drain, operator cancel, takeover); the resumed attempt
+# records its own row, so no reading counts one. Values of orchestrator/src/orchestrator/workflow_types.py::WorkflowOutcome.
+_NOT_A_CANCEL = "outcome NOT IN ('cancelled', 'soft-cancelled')"
+
+
+async def _latest_completions(db: aiosqlite.Connection) -> dict[str, str]:
+    """Return ``{project_id: MAX(completed_at)}`` for every project with a
+    recorded completion, a cancel not counting (see ``_NOT_A_CANCEL``) —
+    the projects a card family tallies by default."""
+    rows = await db.execute_fetchall(
+        'SELECT project_id, MAX(completed_at) '
+        '  FROM task_results '
+        " WHERE completed_at IS NOT NULL AND completed_at != '' "
+        f'   AND {_NOT_A_CANCEL} '
+        ' GROUP BY project_id',
+    )
     return {row[0]: row[1] for row in rows}
+
+
+async def _window_rows_by_project(
+    db: aiosqlite.Connection,
+    sql: str,
+    since: str,
+    projects: Collection[str] | None,
+) -> dict[str, list[tuple]]:
+    """Each listed project's in-window rows of *sql*, without their leading ``project_id``.
+
+    *sql* selects ``project_id`` first and binds two parameters: the listed
+    projects as a JSON array for ``json_each``, then *since*. One query per
+    call, and ``project_id IN (json_each)`` keeps ``idx_task_results_project``
+    usable. Every listed project gets an entry, so a project with nothing in
+    the window reads ``[]`` — its empty tally, never an absence. *projects*
+    defaults to every project with a recorded completion in *db*.
+    """
+    listed = list(projects if projects is not None else await _latest_completions(db))
+    by_project: dict[str, list[tuple]] = {project_id: [] for project_id in listed}
+    for row in await db.execute_fetchall(sql, (json.dumps(listed), since)):
+        by_project[row[0]].append(tuple(row)[1:])
+    return by_project
 
 
 # ---------------------------------------------------------------------------
@@ -76,11 +128,15 @@ async def get_completion_paths(
     escalations_dir: Path,
     *,
     days: int = 7,
+    now: datetime | None = None,
+    projects: Collection[str] | None = None,
 ) -> dict[str, list[dict]]:
     """Per-project completion path breakdown.
 
-    Returns {project_id: [{path: str, count: int, pct: float}, ...]}.
-    Paths: one-pass, multi-pass, via-steward, via-interactive, blocked.
+    Returns {project_id: [{path: str, count: int, pct: float}, ...]} for each
+    of *projects* (default: every project with a recorded completion).
+    Paths: one-pass, multi-pass, via-steward, via-interactive, blocked; a
+    cancel outcome is no path and is not counted (see ``_NOT_A_CANCEL``).
     """
     escalations = _load_escalations(escalations_dir)
 
@@ -90,21 +146,21 @@ async def get_completion_paths(
         if esc.get('level') == 1 and esc.get('status') in ('resolved', 'dismissed'):
             interactive_task_ids.add(str(esc.get('task_id', '')))
 
+    since = _cutoff(days, now=now)
+
     async def _query(db: aiosqlite.Connection) -> dict[str, list[dict]]:
-        cutoffs = await _project_cutoffs(db, days)
-        if not cutoffs:
-            return {}
-
         result: dict[str, list[dict]] = {}
-        for project_id, cutoff in cutoffs.items():
-            rows = await db.execute_fetchall(
-                'SELECT task_id, outcome, review_cycles, '
-                '       steward_invocations '
-                '  FROM task_results '
-                ' WHERE project_id = ? AND completed_at >= ? ',
-                (project_id, cutoff),
-            )
-
+        rows_by_project = await _window_rows_by_project(
+            db,
+            'SELECT project_id, task_id, outcome, review_cycles, '
+            '       steward_invocations '
+            '  FROM task_results '
+            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? '
+            f'  AND {_NOT_A_CANCEL} ',
+            since,
+            projects,
+        )
+        for project_id, rows in rows_by_project.items():
             counts: dict[str, int] = {
                 'one-pass': 0,
                 'multi-pass': 0,
@@ -148,11 +204,47 @@ async def get_completion_paths(
 # ===========================================================================
 
 
+def _per_db_listings(
+    projects_by_db: Sequence[Collection[str]] | None, db_count: int,
+) -> Sequence[Collection[str] | None]:
+    """Each DB's ``projects=`` argument; ``None`` lets a DB tally all it holds."""
+    return projects_by_db if projects_by_db is not None else [None] * db_count
+
+
+def _drop_partial_tallies(
+    results: Sequence[dict[str, _Tally]],
+    projects_by_db: Sequence[Collection[str]] | None,
+) -> list[dict[str, _Tally]]:
+    """The one merge rule for a family's per-DB *results*: drop, from every
+    result, each project some DB was listed for but returned no tally for.
+
+    A healthy per-DB call tallies every project it is listed for (an idle one
+    reads its empty tally), while a call that failed open under ``with_db``
+    returns ``{}``. So after this a merged reading lists a project only when
+    every DB holding it tallied it, and a partial tally is never served as the
+    whole project's. With *projects_by_db* ``None`` the results are unchanged.
+    """
+    if projects_by_db is None:
+        return list(results)
+    partial = {
+        project_id
+        for result, listed in zip(results, projects_by_db, strict=True)
+        for project_id in listed
+        if project_id not in result
+    }
+    return [
+        {project_id: tally for project_id, tally in result.items() if project_id not in partial}
+        for result in results
+    ]
+
+
 async def aggregate_completion_paths(
     dbs: list[aiosqlite.Connection | None],
     escalations_dirs: list[Path],
     *,
     days: int = 7,
+    now: datetime | None = None,
+    projects_by_db: Sequence[Collection[str]] | None = None,
 ) -> dict[str, list[dict]]:
     """Merge :func:`get_completion_paths` results from multiple databases.
 
@@ -160,18 +252,20 @@ async def aggregate_completion_paths(
     zipped with ``strict=True`` so a mismatch raises immediately.  Each
     element of ``escalations_dirs`` must be the escalation directory
     corresponding to the project root whose runs.db is ``dbs[i]``.
+    ``projects_by_db[i]`` lists the projects ``dbs[i]`` tallies (default:
+    every project it has a completion for); see :func:`_drop_partial_tallies`.
 
     Merging rule: for a given project_id the *count* for each completion
     path is summed across DBs; ``pct`` is recomputed from the new totals.
 
     Shape contract: every project_id that appears in any per-DB
-    :func:`get_completion_paths` result is a key in the returned dict.  Its
+    :func:`get_completion_paths` result kept by
+    :func:`_drop_partial_tallies` is a key in the returned dict.  Its
     value list contains only paths whose merged count is > 0 (the
     ``if count > 0`` guard on the list comprehension), so the list may be
-    empty if every per-DB result for that project had an empty list.  In
-    practice this does not occur because :func:`get_completion_paths` only
-    yields a project_id when at least one ``task_results`` row exists for it,
-    which always classifies into at least one non-zero path.
+    empty if every per-DB result for that project had an empty list — the
+    case of an idle project, one with completions ever but none in the
+    window.
 
     Note: :func:`aggregate_escalation_rates` includes projects with
     ``total_tasks == 0`` (returning rates of 0.0).  The difference is
@@ -182,11 +276,16 @@ async def aggregate_completion_paths(
     if not dbs:
         return {}
 
-    results = await asyncio.gather(
-        *(
-            get_completion_paths(db, edir, days=days)
-            for db, edir in zip(dbs, escalations_dirs, strict=True)
-        )
+    now = resolve_now(now)
+    listings = _per_db_listings(projects_by_db, len(dbs))
+    results = _drop_partial_tallies(
+        await asyncio.gather(
+            *(
+                get_completion_paths(db, edir, days=days, now=now, projects=projects)
+                for db, edir, projects in zip(dbs, escalations_dirs, listings, strict=True)
+            )
+        ),
+        projects_by_db,
     )
 
     # Merge: sum counts per project_id per path
@@ -220,10 +319,14 @@ async def aggregate_escalation_rates(
     escalations_dirs: list[Path],
     *,
     days: int = 7,
+    now: datetime | None = None,
+    projects_by_db: Sequence[Collection[str]] | None = None,
 ) -> dict[str, dict]:
     """Merge :func:`get_escalation_rates` results from multiple databases.
 
     ``dbs`` and ``escalations_dirs`` must have the same length.
+    ``projects_by_db[i]`` lists the projects ``dbs[i]`` tallies (default:
+    every project it has a completion for); see :func:`_drop_partial_tallies`.
     For each project_id: total_tasks, steward_count, interactive_count, and
     each human_attention bucket are summed across DBs.  steward_rate and
     interactive_rate are recomputed from the merged totals (not averaged).
@@ -231,11 +334,16 @@ async def aggregate_escalation_rates(
     if not dbs:
         return {}
 
-    results = await asyncio.gather(
-        *(
-            get_escalation_rates(db, edir, days=days)
-            for db, edir in zip(dbs, escalations_dirs, strict=True)
-        )
+    now = resolve_now(now)
+    listings = _per_db_listings(projects_by_db, len(dbs))
+    results = _drop_partial_tallies(
+        await asyncio.gather(
+            *(
+                get_escalation_rates(db, edir, days=days, now=now, projects=projects)
+                for db, edir, projects in zip(dbs, escalations_dirs, listings, strict=True)
+            )
+        ),
+        projects_by_db,
     )
 
     merged: dict[str, dict] = {}
@@ -267,9 +375,13 @@ async def aggregate_loop_histograms(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int = 7,
+    now: datetime | None = None,
+    projects_by_db: Sequence[Collection[str]] | None = None,
 ) -> dict[str, dict]:
     """Merge :func:`get_loop_histograms` results from multiple databases.
 
+    ``projects_by_db[i]`` lists the projects ``dbs[i]`` tallies (default:
+    every project it has a completion for); see :func:`_drop_partial_tallies`.
     For each project_id: merge outer.values and inner.values by label key
     across DBs.  In the canonical case all DBs return the same label lists
     (4 bins for outer, 6 for inner), so the merge is equivalent to the
@@ -284,7 +396,17 @@ async def aggregate_loop_histograms(
     if not dbs:
         return {}
 
-    results = await asyncio.gather(*(get_loop_histograms(db, days=days) for db in dbs))
+    now = resolve_now(now)
+    listings = _per_db_listings(projects_by_db, len(dbs))
+    results = _drop_partial_tallies(
+        await asyncio.gather(
+            *(
+                get_loop_histograms(db, days=days, now=now, projects=projects)
+                for db, projects in zip(dbs, listings, strict=True)
+            ),
+        ),
+        projects_by_db,
+    )
 
     merged: dict[str, dict] = {}
     for result in results:
@@ -325,6 +447,8 @@ async def _durations_by_project(
     db: aiosqlite.Connection | None,
     *,
     days: int = 7,
+    now: datetime | None = None,
+    projects: Collection[str] | None = None,
 ) -> dict[str, list[int]]:
     """Return raw ``duration_ms`` lists per project_id (internal helper).
 
@@ -333,19 +457,20 @@ async def _durations_by_project(
     multiple DBs before computing percentiles on the unified distribution.
     """
 
-    async def _query(db: aiosqlite.Connection) -> dict[str, list[int]]:
-        cutoffs = await _project_cutoffs(db, days)
-        if not cutoffs:
-            return {}
+    since = _cutoff(days, now=now)
 
+    async def _query(db: aiosqlite.Connection) -> dict[str, list[int]]:
         result: dict[str, list[int]] = {}
-        for project_id, cutoff in cutoffs.items():
-            rows = await db.execute_fetchall(
-                'SELECT duration_ms FROM task_results '
-                " WHERE project_id = ? AND completed_at >= ? AND outcome = 'done' "
-                ' ORDER BY duration_ms ',
-                (project_id, cutoff),
-            )
+        rows_by_project = await _window_rows_by_project(
+            db,
+            'SELECT project_id, duration_ms FROM task_results '
+            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? '
+            "   AND outcome = 'done' "
+            ' ORDER BY duration_ms ',
+            since,
+            projects,
+        )
+        for project_id, rows in rows_by_project.items():
             result[project_id] = [row[0] for row in rows if row[0] is not None and row[0] > 0]
 
         return result
@@ -357,6 +482,8 @@ async def aggregate_time_centiles(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int = 7,
+    now: datetime | None = None,
+    projects_by_db: Sequence[Collection[str]] | None = None,
 ) -> dict[str, dict]:
     """Merge time-centile data from multiple databases.
 
@@ -364,12 +491,24 @@ async def aggregate_time_centiles(
     samples, concatenates them per project_id, then computes p50/p75/p90/p95
     from the unified sample distribution so percentiles are exact (not
     averages of per-DB percentiles).  ``count`` is the total number of tasks
-    across all DBs.
+    across all DBs. ``projects_by_db[i]`` lists the projects ``dbs[i]``
+    tallies (default: every project it has a completion for); see
+    :func:`_drop_partial_tallies`.
     """
     if not dbs:
         return {}
 
-    results = await asyncio.gather(*(_durations_by_project(db, days=days) for db in dbs))
+    now = resolve_now(now)
+    listings = _per_db_listings(projects_by_db, len(dbs))
+    results = _drop_partial_tallies(
+        await asyncio.gather(
+            *(
+                _durations_by_project(db, days=days, now=now, projects=projects)
+                for db, projects in zip(dbs, listings, strict=True)
+            ),
+        ),
+        projects_by_db,
+    )
 
     # Merge: concatenate raw duration lists per project_id
     merged: dict[str, list[int]] = {}
@@ -406,12 +545,15 @@ async def get_escalation_rates(
     escalations_dir: Path,
     *,
     days: int = 7,
+    now: datetime | None = None,
+    projects: Collection[str] | None = None,
 ) -> dict[str, dict]:
     """Per-project escalation rates and human attention breakdown.
 
     Returns {project_id: {total_tasks, steward_count, interactive_count,
                           steward_rate, interactive_rate,
-                          human_attention: {zero, minimal, significant}}}.
+                          human_attention: {zero, minimal, significant}}}
+    for each of *projects* (default: every project with a recorded completion).
     """
     escalations = _load_escalations(escalations_dir)
 
@@ -422,22 +564,20 @@ async def get_escalation_rates(
         if tid:
             esc_by_task[tid].append(esc)
 
+    since = _cutoff(days, now=now)
+
     async def _query(db: aiosqlite.Connection) -> dict[str, dict]:
-        cutoffs = await _project_cutoffs(db, days)
-        if not cutoffs:
-            return {}
-
         result: dict[str, dict] = {}
-        for project_id, cutoff in cutoffs.items():
-            rows = list(
-                await db.execute_fetchall(
-                    'SELECT task_id, steward_invocations '
-                    '  FROM task_results '
-                    ' WHERE project_id = ? AND completed_at >= ? ',
-                    (project_id, cutoff),
-                )
-            )
-
+        rows_by_project = await _window_rows_by_project(
+            db,
+            'SELECT project_id, task_id, steward_invocations '
+            '  FROM task_results '
+            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? '
+            f'  AND {_NOT_A_CANCEL} ',
+            since,
+            projects,
+        )
+        for project_id, rows in rows_by_project.items():
             total = len(rows)
             steward_count = 0
             interactive_count = 0
@@ -492,31 +632,33 @@ async def get_loop_histograms(
     db: aiosqlite.Connection | None,
     *,
     days: int = 7,
+    now: datetime | None = None,
+    projects: Collection[str] | None = None,
 ) -> dict[str, dict]:
     """Per-project loop cycle distributions.
 
     Returns {project_id: {
         outer: {labels: [str], values: [int]},
         inner: {labels: [str], values: [int]},
-    }}.
+    }} for each of *projects* (default: every project with a recorded completion).
     Outer = review_cycles (0,1,2,3+). Inner = verify_attempts (0,1,2,3,4,5+).
     Filtered to outcome=done tasks only.
     """
 
+    since = _cutoff(days, now=now)
+
     async def _query(db: aiosqlite.Connection) -> dict[str, dict]:
-        cutoffs = await _project_cutoffs(db, days)
-        if not cutoffs:
-            return {}
-
         result: dict[str, dict] = {}
-        for project_id, cutoff in cutoffs.items():
-            rows = await db.execute_fetchall(
-                'SELECT review_cycles, verify_attempts '
-                '  FROM task_results '
-                " WHERE project_id = ? AND completed_at >= ? AND outcome = 'done' ",
-                (project_id, cutoff),
-            )
-
+        rows_by_project = await _window_rows_by_project(
+            db,
+            'SELECT project_id, review_cycles, verify_attempts '
+            '  FROM task_results '
+            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? '
+            "   AND outcome = 'done' ",
+            since,
+            projects,
+        )
+        for project_id, rows in rows_by_project.items():
             # Outer loop: review cycles (0, 1, 2, 3+)
             outer_bins = [0, 0, 0, 0]  # indices 0-3
             outer_labels = ['0', '1', '2', '3+']
@@ -551,6 +693,7 @@ async def get_time_centiles(
     db: aiosqlite.Connection | None,
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """Per-project time-to-completion percentiles.
 
@@ -561,7 +704,7 @@ async def get_time_centiles(
     the SQL lives in a single place (shared with
     :func:`aggregate_time_centiles`).
     """
-    durations_by_pid = await _durations_by_project(db, days=days)
+    durations_by_pid = await _durations_by_project(db, days=days, now=now)
 
     result: dict[str, dict] = {}
     for project_id, durations in durations_by_pid.items():
@@ -595,7 +738,7 @@ async def get_time_centiles(
 # table.  /api/v2/dashboard/performance is hit every 3s, so the per-DB
 # query is wrapped in a tiny self-invalidating cache keyed by
 # (project_id, days, max(completed_at)) — bucketing only changes when a new
-# task_results row arrives, so the key is deterministic.
+# counted (non-cancel) task_results row arrives, so the key is deterministic.
 
 _HISTORY_CACHE: dict[tuple, dict] = {}
 _HISTORY_CACHE_MAX = 64
@@ -605,9 +748,10 @@ async def _project_max_completed(
     db: aiosqlite.Connection,
     project_id: str,
 ) -> str:
-    """Return the most recent completed_at for *project_id* (empty string if none)."""
+    """Return the most recent completed_at for *project_id* (empty string if none),
+    a cancel not counting (see ``_NOT_A_CANCEL``), as ``_hour_bucketed_history`` counts none."""
     async with db.execute(
-        "SELECT MAX(completed_at) FROM task_results WHERE project_id = ?",
+        f'SELECT MAX(completed_at) FROM task_results WHERE project_id = ? AND {_NOT_A_CANCEL}',
         (project_id,),
     ) as cur:
         row = await cur.fetchone()
@@ -619,6 +763,7 @@ async def _hour_bucketed_history(
     project_id: str,
     *,
     days: int,
+    now: datetime | None = None,
 ) -> dict[str, list]:
     """Return per-hour rows for *project_id* over the trailing *days* window.
 
@@ -626,12 +771,25 @@ async def _hour_bucketed_history(
     count of done tasks, count of one-pass (review_cycles=0 done) tasks,
     count of escalated (steward_invocations>0) tasks, and total tasks.
     Caller derives ratios.
+
+    Args:
+        now: Reference timestamp forwarded to :func:`_cutoff`. None (the
+            default) resolves to the current UTC clock.
     """
-    # Bucketing is fully covered by idx_task_results_project (project_id +
-    # completed_at). The strftime appears only in GROUP BY so it does not
-    # defeat the index — confirmed via EXPLAIN QUERY PLAN.
+    # The cutoff is bound as a TEXT parameter (via _cutoff) rather than
+    # computed SQL-side via datetime('now', ...): SQLite's datetime()
+    # renders SPACE-separated with no UTC offset, which — compared
+    # lexically against the ISO-with-offset `completed_at` column —
+    # short-circuits at index 10 and silently degrades to DATE granularity,
+    # over-including up to a full extra day (task 4624).
+    # Binding the cutoff instead keeps idx_task_results_project (project_id
+    # + completed_at) usable as a covering index for the WHERE clause —
+    # re-confirmed via EXPLAIN QUERY PLAN and pinned by
+    # TestHourBucketedHistoryWindowBoundary::test_binds_cutoff_as_parameter_and_keeps_covering_index.
+    # strftime appears only in the SELECT/ORDER BY, not the WHERE clause, so
+    # it does not defeat the index either.
     rows = await db.execute_fetchall(
-        """
+        f"""
         SELECT strftime('%Y-%m-%dT%H:00', completed_at) AS bucket,
                duration_ms,
                outcome,
@@ -639,12 +797,13 @@ async def _hour_bucketed_history(
                steward_invocations
           FROM task_results
          WHERE project_id = ?
-           AND completed_at >= datetime('now', ? || ' days')
+           AND completed_at >= ?
            AND completed_at IS NOT NULL
            AND completed_at != ''
+           AND {_NOT_A_CANCEL}
          ORDER BY bucket
         """,
-        (project_id, f'-{int(days)}'),
+        (project_id, _cutoff(days, now=now)),
     )
     buckets: dict[str, dict] = {}
     for row in rows:
@@ -698,12 +857,23 @@ async def _per_db_history(
     project_id: str,
     *,
     days: int,
+    now: datetime | None = None,
 ) -> dict[str, list]:
     """Cached wrapper for ``_hour_bucketed_history`` keyed by max(completed_at).
 
-    The bucket layout only changes when a new task_results row arrives, so
+    The bucket layout only changes when a new counted task_results row arrives, so
     the cache is deterministic and self-invalidating. LRU-trim at
     ``_HISTORY_CACHE_MAX`` keeps memory bounded across many projects.
+
+    The cache key deliberately excludes ``now``/the derived cutoff: this
+    endpoint is polled every 3s with ``now=None``, so keying on the cutoff
+    would make every request miss and defeat the cache's purpose. This is
+    not a new staleness risk — the previous SQL-side cutoff
+    (``datetime('now', ...)``) already moved between calls while the key
+    stayed fixed, so omitting ``now`` here preserves that existing
+    behaviour exactly (see design decision, task 4624). Callers that vary
+    ``now`` across calls on the same ``db`` (i.e. tests) must clear
+    ``_HISTORY_CACHE`` explicitly.
     """
     if db is None:
         return {'labels': [], 'p50': [], 'p95': [], 'one_pass': [], 'escalation': []}
@@ -713,7 +883,7 @@ async def _per_db_history(
     if cached is not None:
         return cached
     try:
-        result = await _hour_bucketed_history(db, project_id, days=days)
+        result = await _hour_bucketed_history(db, project_id, days=days, now=now)
     except Exception:
         logger.debug('per-db history failed', exc_info=True)
         return {'labels': [], 'p50': [], 'p95': [], 'one_pass': [], 'escalation': []}
@@ -758,6 +928,7 @@ async def aggregate_performance_history(
     dbs: list[aiosqlite.Connection | None],
     *,
     days: int = 7,
+    now: datetime | None = None,
 ) -> dict[str, dict]:
     """Return per-project bucketed history for ttc, one-pass, escalation.
 
@@ -770,9 +941,20 @@ async def aggregate_performance_history(
             escalation_history:    {labels, values},
           }
         }
+
+    Args:
+        now: Reference timestamp forwarded to :func:`_cutoff`. Resolved
+            ONCE here (via :func:`resolve_now`) and threaded through both
+            the project-discovery query and every :func:`_per_db_history`
+            call, so the two legs share a single cutoff instant instead of
+            each reading the clock independently and risking a straddled
+            boundary. None (the default) resolves to the current UTC
+            clock, matching the existing ``app.py`` call site.
     """
     if not dbs:
         return {}
+    effective_now = resolve_now(now)
+    since = _cutoff(days, now=effective_now)
     # Discover project IDs across all DBs.
     pid_sets: list[set[str]] = []
     for db in dbs:
@@ -781,8 +963,8 @@ async def aggregate_performance_history(
         try:
             rows = await db.execute_fetchall(
                 'SELECT DISTINCT project_id FROM task_results '
-                "WHERE completed_at >= datetime('now', ? || ' days')",
-                (f'-{int(days)}',),
+                f'WHERE completed_at >= ? AND {_NOT_A_CANCEL}',
+                (since,),
             )
             pid_sets.append({r[0] for r in rows if r[0]})
         except Exception:
@@ -796,7 +978,7 @@ async def aggregate_performance_history(
     out: dict[str, dict] = {}
     for pid in pids:
         per_db = [
-            await _per_db_history(db, pid, days=days) for db in dbs
+            await _per_db_history(db, pid, days=days, now=effective_now) for db in dbs
         ]
         merged = _merge_history(per_db)
         out[pid] = {
@@ -815,3 +997,193 @@ async def aggregate_performance_history(
             },
         }
     return out
+
+
+# ---------------------------------------------------------------------------
+# 6. The per-project cards Datum
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class PerformanceCards:
+    """One project's card block: the four card families' tally for one window."""
+
+    paths: list[dict]
+    escalation: dict
+    hist_outer: dict
+    hist_inner: dict
+    ttc: dict
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            'paths': copy.deepcopy(self.paths),
+            'escalation': copy.deepcopy(self.escalation),
+            'hist_outer': copy.deepcopy(self.hist_outer),
+            'hist_inner': copy.deepcopy(self.hist_inner),
+            'ttc': copy.deepcopy(self.ttc),
+        }
+
+
+def _window_bound_seconds(days: int) -> int:
+    """The cards Datum's freshness bound: the served window's own length."""
+    return int(timedelta(days=days).total_seconds())
+
+
+def _cards_provenance(
+    latest: datetime | None, served_at: datetime, days: int,
+) -> tuple[datetime, DatumState, str | None]:
+    """``(as_of, state, reason)`` for a project whose latest completion is *latest*.
+
+    Fresh exactly when the latest completion lies inside ``[served_at - days,
+    served_at]``, i.e. when the window's tally counts at least one completion.
+    Reasons name the window and the instant, never a *served_at*-derived
+    duration, so they do not change from one poll to the next.
+    """
+    if latest is None:
+        return served_at, DatumState.STALE, 'latest completion time of this project could not be read'
+    latest_iso = latest.astimezone(UTC).isoformat()
+    age_seconds = (served_at - latest).total_seconds()
+    if age_seconds < 0:
+        return latest, DatumState.STALE, (
+            f'last completion {latest_iso} is after the serving instant (clock skew)'
+        )
+    if age_seconds > _window_bound_seconds(days):
+        return latest, DatumState.STALE, (
+            f'no completions in the {days}d window; last completion {latest_iso}'
+        )
+    return latest, DatumState.FRESH, None
+
+
+def _latest_instants(per_db: Sequence[Mapping[str, str]]) -> dict[str, datetime | None]:
+    """``{project_id: latest completion across the per-DB discovery maps}``;
+    ``None`` where none parses."""
+    latest: dict[str, datetime | None] = {}
+    for raw_by_project in per_db:
+        for project_id, raw in raw_by_project.items():
+            instant, parsed = parse_timestamp_or_warn(raw, context='performance.latest_completion')
+            known = latest.get(project_id)
+            if parsed and (known is None or instant > known):
+                latest[project_id] = instant
+            else:
+                latest.setdefault(project_id, None)
+    return latest
+
+
+class _CardFamily(enum.Enum):
+    """The four families a project's card block is built from, by display name."""
+
+    PATHS = 'completion paths'
+    ESCALATION = 'escalation rates'
+    HISTOGRAMS = 'loop histograms'
+    TTC = 'time centiles'
+
+
+async def _read_card_families(
+    dbs: list[aiosqlite.Connection | None],
+    escalations_dirs: list[Path],
+    *,
+    days: int,
+    now: datetime,
+    projects_by_db: Sequence[frozenset[str]],
+) -> dict[_CardFamily, Mapping[str, Any]]:
+    """Each card family's ``{project_id: tally}``, each DB tallying the
+    projects *projects_by_db* lists for it.
+
+    Gathered with ``return_exceptions=True``: a family that raises reads as
+    ``{}``, blanking only its own tallies. A listed project a family did not
+    tally is logged here and served UNKNOWN by :func:`_cards_datum`.
+    """
+    reads = {
+        _CardFamily.PATHS: aggregate_completion_paths(
+            dbs, escalations_dirs, days=days, now=now, projects_by_db=projects_by_db,
+        ),
+        _CardFamily.ESCALATION: aggregate_escalation_rates(
+            dbs, escalations_dirs, days=days, now=now, projects_by_db=projects_by_db,
+        ),
+        _CardFamily.HISTOGRAMS: aggregate_loop_histograms(
+            dbs, days=days, now=now, projects_by_db=projects_by_db,
+        ),
+        _CardFamily.TTC: aggregate_time_centiles(
+            dbs, days=days, now=now, projects_by_db=projects_by_db,
+        ),
+    }
+    projects = frozenset[str]().union(*projects_by_db)
+    results = await asyncio.gather(*reads.values(), return_exceptions=True)
+    readings: dict[_CardFamily, Mapping[str, Any]] = {}
+    for family, result in zip(reads, results, strict=True):
+        reading: Mapping[str, Any] = safe_gather_result(result, {}, f'perf/cards/{family.value}')
+        untallied = projects - reading.keys()
+        if untallied:
+            logger.warning('performance cards: no %s tally for %s', family.value, sorted(untallied))
+        readings[family] = reading
+    return readings
+
+
+def _cards_datum(
+    project_id: str,
+    readings: Mapping[_CardFamily, Mapping[str, Any]],
+    latest: datetime | None,
+    served_at: datetime,
+    days: int,
+) -> Datum[PerformanceCards]:
+    """*project_id*'s cards Datum: UNKNOWN, naming the families, when any
+    family has no tally for it; otherwise its window tally, aged by *latest*."""
+    bound = _window_bound_seconds(days)
+    unread = [family.value for family, reading in readings.items() if project_id not in reading]
+    if unread:
+        return Datum(
+            value=None,
+            as_of=None,
+            state=DatumState.UNKNOWN,
+            reason=f'the {" and ".join(unread)} of this project could not be read',
+            freshness_bound_seconds=bound,
+        )
+    histograms = readings[_CardFamily.HISTOGRAMS][project_id]
+    as_of, state, reason = _cards_provenance(latest, served_at, days)
+    return Datum(
+        value=PerformanceCards(
+            paths=readings[_CardFamily.PATHS][project_id],
+            escalation=readings[_CardFamily.ESCALATION][project_id],
+            hist_outer=histograms['outer'],
+            hist_inner=histograms['inner'],
+            ttc=readings[_CardFamily.TTC][project_id],
+        ),
+        as_of=as_of,
+        state=state,
+        reason=reason,
+        freshness_bound_seconds=bound,
+    )
+
+
+async def aggregate_performance_cards(
+    dbs: list[aiosqlite.Connection | None],
+    escalations_dirs: list[Path],
+    *,
+    days: int = 7,
+    now: datetime | None = None,
+) -> dict[str, Datum[PerformanceCards]]:
+    """Each project's card block for the window ``[now - days, now]``, as one Datum.
+
+    The projects are discovered once per DB, and each DB tallies only the
+    projects it holds (a runs.db whose own discovery query fails lists none;
+    ``with_db`` logs the failure). A project is served a value only when
+    every DB holding it tallied every family; otherwise it is UNKNOWN, and
+    the reason names the families. The value is the project's window tally;
+    ``as_of`` is its newest contributing event, its latest completion. So
+    "fresh" means the last completion lies inside the window, and an idle
+    project (completions ever, none in the window) is stale by the
+    envelope's own bound.
+    """
+    served_at = resolve_now(now)
+    per_db = await asyncio.gather(*(with_db(db, _latest_completions, {}) for db in dbs))
+    latest = _latest_instants(per_db)
+    if not latest:
+        return {}
+    readings = await _read_card_families(
+        dbs, escalations_dirs, days=days, now=served_at,
+        projects_by_db=[frozenset(found) for found in per_db],
+    )
+    return {
+        project_id: _cards_datum(project_id, readings, latest[project_id], served_at, days)
+        for project_id in sorted(latest)
+    }

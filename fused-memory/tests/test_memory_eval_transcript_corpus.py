@@ -15,7 +15,6 @@ the script only reads transcripts off disk.
 """
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import sys
@@ -24,28 +23,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'memory_eval_transcript_corpus.py'
 FIXTURE_ARCHIVE = Path(__file__).parent / 'fixtures' / 'transcript_corpus'
 
 
-def _load_module() -> types.ModuleType:
-    """Load memory_eval_transcript_corpus.py from its file path."""
-    mod_name = 'memory_eval_transcript_corpus'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='memory_eval_transcript_corpus')
 
 SEARCH = 'mcp__fused-memory__search'
 
@@ -1735,6 +1719,47 @@ class TestStampIsValidated:
         # happened at all. Folding it into total_failure would assert
         # transcripts were found and none could be read.
         assert _mod.EXIT_BAD_STAMP not in _mod.EXIT_CODES.values()
+
+
+class TestAnUnwritableOutRootIsARunFailure:
+    """An artifact-write failure is a documented code and one attributed line.
+
+    Never a traceback, and never reported as a stdout failure: the process
+    boundary (``shared.cli_boundary.run_cli``) reports any ``OSError`` that
+    escapes ``main()`` as "cannot write to stdout", so this seam has to
+    convert its own. The out-root is a CHILD of a regular file, which makes
+    ``mkdir`` raise ``NotADirectoryError`` deterministically, even as root.
+    """
+
+    def _run(self, tmp_path: Path) -> tuple[int, Path]:
+        blocker = tmp_path / 'not-a-dir'
+        blocker.write_text('x')
+        out_root = blocker / 'out'
+        code = _mod.main([
+            '--archive-root', str(FIXTURE_ARCHIVE),
+            '--out-root', str(out_root), '--stamp', STAMP,
+        ])
+        return code, out_root
+
+    def test_the_code_is_distinct_from_every_status_and_a_bad_stamp(self, tmp_path):
+        code, _ = self._run(tmp_path)
+
+        assert code == _mod.EXIT_RUN_FAILED
+        assert code not in set(_mod.EXIT_CODES.values()) | {_mod.EXIT_BAD_STAMP}
+
+    def test_stderr_is_one_line_naming_the_out_root_not_stdout(self, tmp_path, capsys):
+        _, out_root = self._run(tmp_path)
+
+        lines = [line for line in capsys.readouterr().err.splitlines() if line.strip()]
+        assert len(lines) == 1
+        assert lines[0].startswith('error: ')
+        assert str(out_root) in lines[0]
+        assert 'stdout' not in lines[0]
+
+    def test_no_report_line_names_a_path_that_does_not_exist(self, tmp_path, capsys):
+        self._run(tmp_path)
+
+        assert 'report:' not in capsys.readouterr().out
 
 
 class TestDefaultArchiveRoot:

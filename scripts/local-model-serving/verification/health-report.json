@@ -1,9 +1,9 @@
 {
-  "schema_version": 4,
-  "measured_at": "2026-08-06T15:57:49.363079+00:00",
+  "schema_version": 6,
+  "measured_at": "2026-09-12T12:31:52.426534+00:00",
   "gpu": {
     "name": "NVIDIA GeForce RTX 3090",
-    "driver_version": "580.159.04",
+    "driver_version": "580.178.04",
     "total_mib": 24576
   },
   "arms": [
@@ -16,11 +16,14 @@
       "verdict": "PASS",
       "reason": "ok",
       "detail": "valid ProbeExtraction for qwen3.5-9b, capturing 4/4 known entities (4 as top-level entities)",
-      "latency_ms": 43501.2,
-      "measured_at": "2026-08-06T15:37:55.077793+00:00",
-      "arm_footprint_mib": 14507,
+      "latency_ms": 33794.8,
+      "first_probe_ms": 41594.4,
+      "measured_at": "2026-09-12T12:15:35.270005+00:00",
+      "arm_footprint_mib": 15569,
       "reasoning": "on",
-      "top_level_entities_named": 4
+      "top_level_entities_named": 4,
+      "measured_cached_prompt_tokens": null,
+      "repeat_latencies_ms": null
     },
     {
       "arm_id": "phi-4-14b",
@@ -31,11 +34,14 @@
       "verdict": "PASS",
       "reason": "ok",
       "detail": "valid ProbeExtraction for phi-4-14b, capturing 3/4 known entities (2 as top-level entities)",
-      "latency_ms": 2854.1,
-      "measured_at": "2026-08-06T15:43:50.566325+00:00",
-      "arm_footprint_mib": 15519,
+      "latency_ms": 2263.4,
+      "first_probe_ms": 2224.9,
+      "measured_at": "2026-09-12T12:20:40.923652+00:00",
+      "arm_footprint_mib": 16637,
       "reasoning": "off",
-      "top_level_entities_named": 2
+      "top_level_entities_named": 2,
+      "measured_cached_prompt_tokens": null,
+      "repeat_latencies_ms": null
     },
     {
       "arm_id": "moe-stretch",
@@ -46,11 +52,14 @@
       "verdict": "PASS",
       "reason": "ok",
       "detail": "valid ProbeExtraction for moe-stretch, capturing 4/4 known entities (4 as top-level entities)",
-      "latency_ms": 2464.5,
-      "measured_at": "2026-08-06T15:45:26.591852+00:00",
-      "arm_footprint_mib": 14604,
+      "latency_ms": 2931.7,
+      "first_probe_ms": 3737.5,
+      "measured_at": "2026-09-12T12:22:28.906563+00:00",
+      "arm_footprint_mib": 14611,
       "reasoning": "off",
-      "top_level_entities_named": 4
+      "top_level_entities_named": 4,
+      "measured_cached_prompt_tokens": 26,
+      "repeat_latencies_ms": null
     },
     {
       "arm_id": "qwen3-embedding-0.6b",
@@ -61,11 +70,14 @@
       "verdict": "PASS",
       "reason": "ok",
       "detail": "1024-dim vector, L2 norm 1.0000",
-      "latency_ms": 506.5,
-      "measured_at": "2026-08-06T15:48:40.778551+00:00",
-      "arm_footprint_mib": 3584,
+      "latency_ms": 38.8,
+      "first_probe_ms": 571.3,
+      "measured_at": "2026-09-12T12:25:23.303361+00:00",
+      "arm_footprint_mib": 3581,
       "reasoning": "off",
-      "top_level_entities_named": null
+      "top_level_entities_named": null,
+      "measured_cached_prompt_tokens": null,
+      "repeat_latencies_ms": null
     },
     {
       "arm_id": "granite-embedding-english-r2",
@@ -76,11 +88,14 @@
       "verdict": "PASS",
       "reason": "ok",
       "detail": "768-dim vector, L2 norm 30.3633",
-      "latency_ms": 128.5,
-      "measured_at": "2026-08-06T15:51:18.231954+00:00",
-      "arm_footprint_mib": 789,
+      "latency_ms": 36.2,
+      "first_probe_ms": 53.4,
+      "measured_at": "2026-09-12T12:27:14.742628+00:00",
+      "arm_footprint_mib": 787,
       "reasoning": "off",
-      "top_level_entities_named": null
+      "top_level_entities_named": null,
+      "measured_cached_prompt_tokens": null,
+      "repeat_latencies_ms": null
     },
     {
       "arm_id": "qwen3-embedding-4b",
@@ -91,11 +106,14 @@
       "verdict": "PASS",
       "reason": "ok",
       "detail": "2560-dim vector, L2 norm 1.0000",
-      "latency_ms": 629.5,
-      "measured_at": "2026-08-06T15:54:40.483374+00:00",
-      "arm_footprint_mib": 10114,
+      "latency_ms": 40.8,
+      "first_probe_ms": 616.4,
+      "measured_at": "2026-09-12T12:30:00.800104+00:00",
+      "arm_footprint_mib": 10123,
       "reasoning": "off",
-      "top_level_entities_named": null
+      "top_level_entities_named": null,
+      "measured_cached_prompt_tokens": null,
+      "repeat_latencies_ms": null
     },
     {
       "arm_id": "gte-modernbert-base",
@@ -106,31 +124,57 @@
       "verdict": "PASS",
       "reason": "ok",
       "detail": "768-dim vector, L2 norm 37.0941",
-      "latency_ms": 115.2,
-      "measured_at": "2026-08-06T15:57:49.363079+00:00",
-      "arm_footprint_mib": 788,
+      "latency_ms": 27.5,
+      "first_probe_ms": 37.9,
+      "measured_at": "2026-09-12T12:31:52.426534+00:00",
+      "arm_footprint_mib": 787,
       "reasoning": "off",
-      "top_level_entities_named": null
+      "top_level_entities_named": null,
+      "measured_cached_prompt_tokens": null,
+      "repeat_latencies_ms": null
     }
   ],
   "vram": {
     "total_mib": 24576,
-    "used_mib": 22724,
-    "free_mib": 1398,
-    "baseline_mib": 7205,
-    "budget_mib": 16918,
-    "arm_footprint_mib": 15519,
-    "used_gib": 22.19,
-    "free_gib": 1.37,
-    "baseline_gib": 7.04,
-    "budget_gib": 16.52,
-    "arm_footprint_gib": 15.16,
+    "used_mib": 22710,
+    "free_mib": 1381,
+    "baseline_mib": 6073,
+    "budget_mib": 18019,
+    "arm_footprint_mib": 16637,
+    "used_gib": 22.18,
+    "free_gib": 1.35,
+    "baseline_gib": 5.93,
+    "budget_gib": 17.6,
+    "arm_footprint_gib": 16.25,
     "nominal_ceiling_gib": 19.5,
     "operating_budget_gib": 16.37,
-    "headroom_gib": 1.37,
+    "headroom_gib": 1.35,
     "verdict": "PASS",
-    "reason": "the arm took 15.16 GiB (22724 - 7205 MiB), within the 16.52 GiB budget free before it started"
+    "reason": "the arm took 16.25 GiB (22710 - 6073 MiB), within the 17.60 GiB budget free before it started",
+    "baseline_consumers": [
+      {
+        "pid": 9024,
+        "process_name": "python",
+        "used_mib": 4050
+      }
+    ],
+    "probe_consumers": [
+      {
+        "pid": 9024,
+        "process_name": "python",
+        "used_mib": 4050
+      },
+      {
+        "pid": 3251027,
+        "process_name": "VLLM::EngineCore",
+        "used_mib": 16632
+      }
+    ],
+    "consumer_inventory_note": "INVENTORY, not an accounting: `nvidia-smi --query-compute-apps` lists only CUDA compute applications. It does not list the KDE/X11 graphics contexts (Xorg, plasmashell, kwin_x11, and ~40 small KDE clients) that hold the remaining ~3.3 GiB on this host \u2014 which is exactly why the measured operating budget is ~16.37 GiB rather than 19.5. These entries name who else held the card; they do not sum to memory.used.",
+    "pollution": "CLEAN",
+    "pollution_reason": ""
   },
   "overall": "PASS",
-  "prd_marker": "PRD-MARKER:local-memory-models-eval serving"
+  "prd_marker": "PRD-MARKER:local-memory-models-eval serving",
+  "latency_caveat": "Latency here is a SINGLE-SAMPLE health-probe measurement taken with the engine warm and the prefix cache COLD (one discarded warm-up on a different prompt precedes it). It is NOT the p95-under-load envelope metric (task 3719 zeta; PRD episode-latency-p50/p95 under concurrent load), and it must not be used to rank arms against one another."
 }

@@ -1,10 +1,22 @@
-"""Functions for discovering orchestrator processes and task status.
+"""Discovering orchestrator PROCESSES: which ones run, and against what root.
 
-Scans running processes (via ``ps aux``) and fetches task trees from the
-fused-memory MCP server (which is the source of truth post-2026-05-02
-SQLite cutover). ``discover_orchestrators`` is async because the MCP call
-is async; the process-scanning helper remains sync and runs via
-``asyncio.to_thread`` from the async caller.
+Scans running processes (via ``ps aux``) and resolves each to the project root
+it targets. That is the whole job. ``discover_orchestrators`` is async only
+because the ``ps`` scan runs via ``asyncio.to_thread``; the scanning helper
+itself is sync.
+
+RETIRED, and deliberately: this module used to additionally fetch EVERY
+resolved root's whole task tree from fused-memory — under a two-layer budget,
+a per-root cache and an offline/degraded split of its own — to compute a
+five-key ``summary`` and a ``last_update`` for each entry. Those were the only
+consumers of the fetch, and both are gone from the wire. The task snapshot
+unit behind ``/api/v2/dashboard/tasks``
+(``dashboard/src/dashboard/data/task_snapshot.py``) is the SINGLE place the
+dashboard measures a task population now, so a second implementation here
+would be one more copy to keep in agreement by hand — and the one that fell
+behind, since nothing on this route ever validated its counts. A handler that
+reads no task tree needs no budget for one, which is why the budget constants
+went with it rather than being left inert.
 
 FORMAT COUPLING
 ================
@@ -52,37 +64,9 @@ import re
 import subprocess
 from pathlib import Path
 
-import httpx
-
 from dashboard.config import DashboardConfig
-from dashboard.data.tasks import DEFAULT_WHOLE_OPERATION_BUDGET, fetch_tasks
 
 logger = logging.getLogger(__name__)
-
-# --- Budget constants -------------------------------------------------------
-#
-# ``discover_orchestrators`` walks its project roots SEQUENTIALLY, so it needs
-# the same two-layer bound ``active_tasks.collect_tasks_with_counts`` uses: a
-# per-root budget AND a whole-loop deadline. A per-root bound alone leaves a
-# worst case of ``roots * budget``, which on a machine with several roots
-# overruns the browser's fetch abort and throws away the very degraded payload
-# the bound exists to deliver.
-
-# Whole-operation bound for ONE root's ``fetch_tasks`` call. Bound to the
-# shared default rather than restating the literal, so the arithmetic lives in
-# exactly one place; a site may later TIGHTEN its own constant (the structural
-# test enforces that it can never widen it).
-_ORCHESTRATORS_PER_ROOT_BUDGET = DEFAULT_WHOLE_OPERATION_BUDGET
-
-# Whole-loop deadline for the entire per-root walk.
-#
-# Strictly below ``data.js``'s 30 000 ms fetch abort with 10 s of headroom for
-# HTTP and JSON serialisation, so the PARTIAL payload the deadline produces is
-# actually deliverable to the browser that asked for it. The reasoning is
-# ``active_tasks._TASKS_TOTAL_BUDGET``'s, restated here rather than imported
-# because this bounds a DIFFERENT handler: coupling the two would make a
-# future adjustment to one silently move the other.
-_ORCHESTRATORS_TOTAL_BUDGET = 20.0
 
 
 def _resolve_project_root(prd: str, default_root: Path) -> Path:
@@ -380,66 +364,26 @@ def find_running_orchestrators() -> list[dict]:
     return orchestrators
 
 
-async def discover_orchestrators(
-    client: httpx.AsyncClient,
-    config: DashboardConfig,
-) -> list[dict]:
-    """Discover running orchestrators and enrich with task tree data.
+async def discover_orchestrators(config: DashboardConfig) -> list[dict]:
+    """Every running orchestrator process, grouped by the root it targets.
 
-    For each running orchestrator process, attaches:
-    - tasks: parsed task list fetched from fused-memory MCP
-    - summary: status counts {total, done, in_progress, blocked, pending}
+    Returns one entry per resolved project root — ``pids``, ``prd``, ``label``,
+    ``project_root``, ``running``, ``started`` — or ``[]`` when nothing is
+    running. Multiple PIDs that resolve to the same canonical root are ONE
+    entry with every pid in ``pids``, which is what makes the tab's row count
+    a count of projects rather than of processes.
 
-    Returns [] if no orchestrator processes are running.
-    Per-project task fetches that hit MCP errors degrade to an empty list.
+    NO TASK TREE IS READ, and *config* is the only argument because none is
+    needed for one: the MCP client this used to take is gone with the fetch.
+    Task counts live on ``/api/v2/dashboard/tasks``, inside a
+    ``Datum`` that says when they were measured — see
+    ``dashboard/src/dashboard/data/task_snapshot.py``. Two consequences worth
+    stating, since a reader may look for the old ones:
 
-    **Bounded as a whole, not merely per root.** The per-root walk below is
-    SEQUENTIAL, so without a deadline the worst case is the SUM of every
-    root's worst case — on a machine with several roots that overruns
-    ``data.js``'s 30 000 ms fetch abort and throws away the very degraded
-    payload the bound exists to deliver. Hence both layers, matching
-    ``active_tasks.collect_tasks_with_counts``: a per-root
-    ``_ORCHESTRATORS_PER_ROOT_BUDGET`` and a whole-loop
-    ``_ORCHESTRATORS_TOTAL_BUDGET`` deadline.
-
-    Both degraded outcomes — a root that TIMED OUT and a root that never got
-    its TURN — surface through this module's existing offline marker, because
-    that is the honest fact available here: the entry contract carries one
-    boolean and no separate degraded channel, and ``redux_api.shape_orchestrators``
-    projects only ``offline``/``error``. The cause is therefore carried in
-    ``error`` (two distinct messages, so an operator can tell a
-    proven-unreachable root from a merely-unmeasured one) and in a WARNING,
-    rather than being silently dropped. The alternative — leaving ``offline``
-    False with empty tasks — would render a starved root as a healthy project
-    with zero tasks, which is exactly the invisible-failure class this bound
-    exists to close.
-
-    **This site deliberately DIVERGES from the sibling invariant.**
-    ``active_tasks.collect_tasks_with_counts`` states that "*degraded* and
-    *offline* are DISTINCT FACTS and must never be merged by a consumer:
-    *offline* means the fetch demonstrably failed (the project is proven
-    unreachable), *degraded* means the budget expired first and this project's
-    state is simply UNKNOWN"
-    (``dashboard/src/dashboard/data/active_tasks.py::collect_tasks_with_counts``),
-    and that is right — collapsing them can send an operator to restart a
-    healthy service. Honouring it HERE, though, means adding a third state to
-    this entry contract, to ``redux_api.shape_orchestrators`` and to the React
-    orchestrators tab, which is outside a change whose remit is "wrap each call
-    site in ``asyncio.wait_for``". So the divergence is a scope boundary, not a
-    disagreement, and it is bounded rather than silent: the distinction
-    survives verbatim in ``error`` and in the WARNING, and a follow-up is filed
-    to widen the entry contract with a ``degraded`` key so the two facts can be
-    carried separately on the wire.
-
-    Until that lands, a CONSUMER of this function must not read ``offline``
-    alone as "fused-memory is proven down" — both budget paths set it with an
-    ``error`` that names the budget verbatim, and neither means the fetch was
-    attempted and failed.
-
-    The two-layer bound is complementary, not redundant: ``fetch_tasks``'
-    ``DEFAULT_PER_CALL_TIMEOUT`` is a PER-HTTP-REQUEST budget bounding
-    connect/read/write and pool acquisition, and never bounds the operation as
-    a whole; only this ``wait_for`` does.
+    * there is no budget here to overrun, and no degraded/offline outcome to
+      report — nothing is attempted that could fail. ``ps`` is a local scan;
+    * ``last_update`` is no longer emitted. It was the max ``updated_at``
+      across a root's tasks, and nothing here reads a task any more.
     """
     processes = await asyncio.to_thread(find_running_orchestrators)
     if not processes:
@@ -464,111 +408,18 @@ async def discover_orchestrators(
     # same project are merged into a single entry with a 'pids' list.
     groups: dict[Path, list[dict]] = {}
     for proc in processes:
-        root = _resolve_root(proc)
-        groups.setdefault(root, []).append(proc)
-
-    # Cache per-project data so we don't re-fetch the same task list
-    # when multiple processes share a project root.
-    # Cache tuple: (tasks, offline, error)
-    project_cache: dict[Path, tuple[list[dict], bool, str | None]] = {}
+        groups.setdefault(_resolve_root(proc), []).append(proc)
 
     result: list[dict] = []
-    # Taken BEFORE the loop so every root's cost is inside the budget rather
-    # than being free time the later roots then pay for.
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + _ORCHESTRATORS_TOTAL_BUDGET
     for project_root, group in groups.items():
-        if project_root not in project_cache:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                # Never got its turn. Reported through the offline marker
-                # rather than silently omitted or rendered as zero tasks.
-                message = (
-                    f'skipped — the {_ORCHESTRATORS_TOTAL_BUDGET:.1f}s '
-                    'orchestrators budget was already spent before this root '
-                    'was reached; its task tree is UNKNOWN for this render '
-                    '(not zero)'
-                )
-                logger.warning('project %s: %s', project_root, message)
-                project_cache[project_root] = ([], True, message)
-            else:
-                # The EFFECTIVE share, hoisted so the operator message can
-                # report the bound this root actually got. Late in the walk
-                # the whole-loop deadline, not the per-root constant, is the
-                # binding constraint — reporting the constant there would tell
-                # an operator a root blew a 7.0s share when it was in fact
-                # given 1.2s, which is the same illegibility this change set
-                # exists to close.
-                share = min(remaining, _ORCHESTRATORS_PER_ROOT_BUDGET)
-                try:
-                    fetched = await asyncio.wait_for(
-                        fetch_tasks(client, config, project_root),
-                        timeout=share,
-                    )
-                except TimeoutError:
-                    # On 3.11+ ``asyncio.TimeoutError`` IS the builtin, and so
-                    # is ``socket.timeout``, so a ``TimeoutError`` raised
-                    # INSIDE the fetch is deliberately folded into this same
-                    # budget path rather than propagating. The message is
-                    # therefore authoritative about the OUTCOME — this root's
-                    # task tree is unknown — and not about the cause.
-                    message = (
-                        f'exceeded its {share:.1f}s share of the '
-                        f'{_ORCHESTRATORS_TOTAL_BUDGET:.1f}s orchestrators '
-                        'budget; its task tree is UNKNOWN for this render '
-                        '(not zero)'
-                    )
-                    logger.warning('project %s: %s', project_root, message)
-                    project_cache[project_root] = ([], True, message)
-                else:
-                    if isinstance(fetched, list):
-                        tasks = fetched
-                        offline = False
-                        fetch_error: str | None = None
-                    else:
-                        # Offline marker: {'offline': True, 'error': ...}
-                        tasks = []
-                        offline = bool(fetched.get('offline')) if isinstance(fetched, dict) else False
-                        fetch_error = str(fetched.get('error', '')) if isinstance(fetched, dict) else None
-                    project_cache[project_root] = (tasks, offline, fetch_error)
-
-        tasks, offline, fetch_error = project_cache[project_root]
-        summary = {
-            'total': len(tasks),
-            'done': sum(1 for t in tasks if t.get('status') == 'done'),
-            'in_progress': sum(1 for t in tasks if t.get('status') == 'in-progress'),
-            'blocked': sum(1 for t in tasks if t.get('status') == 'blocked'),
-            'pending': sum(1 for t in tasks if t.get('status') == 'pending'),
-        }
-        # Lexicographic max over ISO-8601 strings is correct here because
-        # tasks.py copies updatedAt verbatim from a single upstream source, so
-        # all values share the same format and UTC offset.  If the source ever
-        # emits mixed offsets, switch to key=datetime.fromisoformat.
-        # Scope: top-level tasks only, matching the summary counts above.
-        # If subtask recency should count, flatten the task tree first.
-        last_update = max(
-            (t['updated_at'] for t in tasks if t.get('updated_at')),
-            default=None,
-        )
-
-        # Display label: prefer PRD path, fall back to project root path
+        # Display label: prefer PRD path, fall back to project root path.
         prd = next((p['prd'] for p in group if p.get('prd')), None)
-        label = prd if prd else str(project_root)
-
-        entry: dict = {
+        result.append({
             'pids': [p['pid'] for p in group],
             'prd': prd,
-            'label': label,
+            'label': prd if prd else str(project_root),
             'project_root': str(project_root),
             'running': any(p['running'] for p in group),
             'started': group[0]['started'],
-            'last_update': last_update,
-            'tasks': tasks,
-            'summary': summary,
-            'offline': offline,
-        }
-        if fetch_error:
-            entry['error'] = fetch_error
-        result.append(entry)
-
+        })
     return result

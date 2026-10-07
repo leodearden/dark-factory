@@ -25,6 +25,7 @@ include = ["src", "tests"]
 extraPaths = ["src", "../shared/src", ".."]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
+reportUnnecessaryTypeIgnoreComment = "error"
 venvPath = ".."
 venv = ".venv"
 
@@ -46,6 +47,24 @@ docstring-code-format = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Default per-test timeout. This entry CLOSES A TOTAL-ABSENCE GAP rather than
+# updating a stale value: until task 5442 this config declared neither key, so
+# this suite ran uncapped even though pytest-timeout was already a dev
+# dependency — the plugin was installed and inert.
+# `signal` — but NOT because this suite is serial, which it is not. It declares
+# no addopts and so no `-n` of its own, and that used to be given as the reason;
+# verify.py::_with_pytest_numprocesses_str falsifies it by appending
+# `-n <verify_admission_pytest_n>` ("8") to every pytest leg at the gated roles.
+# dark-factory-orchestrator.yaml records the MEASURED render of THIS module's
+# command as `cd sampler && uv run pytest ... -n 8 tests/`.
+# The choice is the same one, on the same evidence, as every other config here:
+# signal measured green under xdist (task 5408). The signal-vs-thread trade is
+# not reopened here; it lives once, in
+# tests/scripts/test_timeout_method_policy.py.
+# Value provenance: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+# Rationale for the setting: shared/pyproject.toml. Neither is restated here.
+timeout = 540
+timeout_method = "signal"
 
 [dependency-groups]
 dev = [
@@ -53,5 +72,7 @@ dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-timeout>=2.4.0",
+    # verify's injected -n; see tests/scripts/test_merge_gate_parallelism_config.py::RULED_SERIAL_MEMBERS
+    "pytest-xdist>=3.5.0",
     "ruff>=0.7.1",
 ]

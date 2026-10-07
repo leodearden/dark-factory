@@ -11,17 +11,6 @@ mirroring task α's test_merge_types.py:
    logger name (not ``orchestrator.merge_gates``) so existing ``caplog``
    assertions filtered to the merge_queue logger keep capturing the moved
    gates' fail-open/fail-closed warnings.
-3. Reach-back / string-path monkeypatch routing — the existing test suite
-   monkeypatches merge-gate dependencies by STRING PATH
-   ``orchestrator.merge_queue.<name>``.  A moved function must resolve a
-   monkeypatched-or-staying sibling via a function-local deferred import so
-   those patches stay effective even though the function body now lives in
-   this module.  Each test below patches BOTH namespaces with CONTRASTING
-   return values — the merge_gates-local (naive) patch would steer the
-   outcome one way, the merge_queue (reach-back target) patch the other —
-   so the assertion is unambiguous about which one governed.
-4. Shim re-export identity (added in a later step, once merge_queue.py's
-   shim swap lands).
 """
 
 from __future__ import annotations
@@ -97,107 +86,47 @@ def test_merge_gates_logger_name_is_merge_queue() -> None:
 
 
 @pytest.mark.asyncio
-class TestReachBackRouting:
-    """Reach-back / string-path monkeypatch routing contract.
+class TestFinalizeRecordsQueueVerifiedTip:
+    """Which landings ``_finalize_advanced_merge`` records as queue-verified."""
 
-    Each test patches the SAME logical dependency in both namespaces with
-    CONTRASTING values: the merge_gates-local (naive bare-global) patch
-    steers the outcome one way, the merge_queue (reach-back target) patch
-    the other.  Asserting on the merge_queue-steered outcome proves the
-    call went through the deferred import rather than the co-located
-    merge_gates sibling.
-    """
+    async def test_finalize_advanced_merge_records_queue_verified_tip(self) -> None:
+        """A clean landing records the advanced SHA as a queue-verified main tip.
 
-    async def test_reverify_rebased_tree_reachback_to_rebase_delta_overlap(self) -> None:
-        """(a) _reverify_rebased_tree must resolve _rebase_delta_touched_overlap
-        via orchestrator.merge_queue, not the co-located merge_gates copy."""
-        from orchestrator.merge_gates import _reverify_rebased_tree
-
-        git_ops = MagicMock()
-        req = MagicMock()
-        req.task_id = 'task-rvrt-reachback'
-        req.worktree = MagicMock()
-        merge_wt = MagicMock()
-        sentinel_outcome = MagicMock(name='sentinel-verify-outcome')
-
-        with (
-            # Naive-resolution target: disjoint (empty) → would return None
-            # WITHOUT ever calling _run_post_merge_verify.
-            patch(
-                'orchestrator.merge_gates._rebase_delta_touched_overlap',
-                AsyncMock(return_value=[]),
-            ),
-            # Reach-back target: overlapping → must delegate to
-            # _run_post_merge_verify (itself already reach-back, per step-2).
-            patch(
-                'orchestrator.merge_queue._rebase_delta_touched_overlap',
-                AsyncMock(return_value=['overlap.py']),
-            ),
-            patch(
-                'orchestrator.merge_queue._run_post_merge_verify',
-                AsyncMock(return_value=sentinel_outcome),
-            ),
-        ):
-            result = await _reverify_rebased_tree(
-                git_ops, req, merge_wt,
-                rebased_from='from-sha',
-                rebased_onto='onto-sha',
-                timeouts={},
-                enospc_retries={},
-                max_timeouts=3,
-                max_enospc=1,
-            )
-
-        assert result is sentinel_outcome, (
-            f'expected the orchestrator.merge_queue-patched overlap to govern '
-            f'the re-verify decision and return its sentinel outcome, got {result!r}'
+        This is the PRODUCER for premise P2 of ``_disjoint_skip_blockers``: a
+        later request rebased onto this tip may trust footprint-disjointness
+        precisely because a green gate run was observed on it here.  A tip that
+        never reaches this return — a nightly job's commit, a direct human
+        commit, a push — is never recorded and is therefore never trusted.
+        """
+        from orchestrator.merge_gates import (
+            _finalize_advanced_merge,
+            main_tip_is_queue_verified,
         )
-
-    async def test_finalize_advanced_merge_reachback_to_equivalence_and_pyright(self) -> None:
-        """(b) _finalize_advanced_merge must resolve _check_post_merge_equivalence
-        and _check_post_merge_pyright via orchestrator.merge_queue, not the
-        co-located merge_gates copies."""
-        from orchestrator.merge_gates import _finalize_advanced_merge
 
         git_ops = MagicMock()
         git_ops.push_main = AsyncMock(return_value='pushed')
         git_ops.cleanup_merge_worktree = AsyncMock()
-        # NOTE (task 1997): the post-rebase SHA is threaded via the explicit
-        # advanced_sha= kwarg below, NOT the git_ops._last_advanced_sha side
-        # channel — deliberately left unset here.
         req = MagicMock()
-        req.task_id = 'task-finalize-reachback'
-        req.branch = 'br-finalize-reachback'
+        req.task_id = 'task-finalize-records-tip'
+        req.branch = 'br-finalize-records-tip'
         req.worktree = MagicMock()
         req.config = MagicMock()
         req.module_configs = []
-        cas_retries = {req.task_id: 1}
-        timeouts = {req.task_id: 1}
-        enospc_retries = {req.task_id: 1}
 
-        naive_broken_pyright = MagicMock(broken=True, failing_subprojects=['naive-pkg'], detail='naive-detail')
-        reachback_clean_pyright = MagicMock(broken=False, failing_subprojects=[], detail='')
+        landed = 'deadbeefcafe0001'
+        assert not main_tip_is_queue_verified(landed), (
+            'precondition: the tip must not already be registered'
+        )
 
+        clean_pyright = MagicMock(broken=False, failing_subprojects=[], detail='')
         with (
-            # Naive-resolution targets: equivalence diverged + pyright broken →
-            # would return 'blocked' before ever reaching push_main.
             patch(
-                'orchestrator.merge_gates._check_post_merge_equivalence',
-                AsyncMock(return_value=['naive-diverged.py']),
-            ),
-            patch(
-                'orchestrator.merge_gates._check_post_merge_pyright',
-                AsyncMock(return_value=naive_broken_pyright),
-            ),
-            # Reach-back targets: equivalence clean + pyright clean → must
-            # reach the 'done' path and call push_main.
-            patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
-                AsyncMock(return_value=reachback_clean_pyright),
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
+                AsyncMock(return_value=clean_pyright),
             ),
         ):
             outcome = await _finalize_advanced_merge(
@@ -205,92 +134,71 @@ class TestReachBackRouting:
                 merge_commit_fallback='fallback-sha',
                 base_sha='base-sha',
                 started_monotonic=0.0,
-                cas_retries=cas_retries,
-                timeouts=timeouts,
-                enospc_retries=enospc_retries,
+                cas_retries={},
+                timeouts={},
+                enospc_retries={},
                 merged_branch_tip='trusted-tip',
-                advanced_sha='abc123def',
+                advanced_sha=landed,
             )
 
-        assert outcome.status == 'done', (
-            f'expected the orchestrator.merge_queue-patched equivalence/pyright '
-            f'results to govern the outcome (done), got {outcome.status}: {outcome.reason!r}'
+        assert outcome.status == 'done', f'expected done, got {outcome!r}'
+        assert main_tip_is_queue_verified(landed), (
+            'a clean landing must record its advanced SHA as queue-verified, '
+            'otherwise every subsequent rebase-under-drift re-verifies forever'
         )
-        git_ops.push_main.assert_awaited_once()
 
-    async def test_check_post_merge_pyright_reachback_to_run_unscoped_typechecks(self) -> None:
-        """(c) _check_post_merge_pyright must resolve _run_unscoped_typechecks
-        via orchestrator.merge_queue (it has no merge_gates-local copy at all —
-        this reach-back was added directly in step-2, not deferred)."""
-        from orchestrator.config import ModuleConfig, OrchestratorConfig
-        from orchestrator.merge_gates import PostMergePyrightResult, _check_post_merge_pyright
+    async def test_finalize_advanced_merge_blocked_does_not_record_tip(self) -> None:
+        """A landing BLOCKED by a post-advance gate records nothing.
+
+        Main has already advanced at that point, but the gate chain says the
+        landed content is not what was verified — so the tip carries no green
+        verdict and must not license a later disjointness skip.
+        """
+        from orchestrator.merge_gates import (
+            _finalize_advanced_merge,
+            main_tip_is_queue_verified,
+        )
 
         git_ops = MagicMock()
-        git_ops._create_merge_worktree = AsyncMock(return_value=('fake-merge-wt', None))
+        git_ops.push_main = AsyncMock(return_value='pushed')
         git_ops.cleanup_merge_worktree = AsyncMock()
-        module_configs = [ModuleConfig(prefix='pkg', type_check_command='pyright src/')]
-        patched_result = PostMergePyrightResult(
-            failing_subprojects=['pkg'], detail='patched-detail',
-        )
+        req = MagicMock()
+        req.task_id = 'task-finalize-blocked-tip'
+        req.branch = 'br-finalize-blocked-tip'
+        req.worktree = MagicMock()
+        req.config = MagicMock()
+        req.module_configs = []
 
-        with patch(
-            'orchestrator.merge_queue._run_unscoped_typechecks',
-            AsyncMock(return_value=patched_result),
+        landed = 'deadbeefcafe0002'
+        broken_pyright = MagicMock(
+            broken=True, failing_subprojects=['pkg'], detail='boom',
+        )
+        with (
+            patch(
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
+                AsyncMock(return_value=[]),
+            ),
+            patch(
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
+                AsyncMock(return_value=broken_pyright),
+            ),
         ):
-            result = await _check_post_merge_pyright(
-                'deadbeef', git_ops, OrchestratorConfig(), module_configs,
-                task_id='task-pyright-reachback',
+            outcome = await _finalize_advanced_merge(
+                git_ops, req, None,
+                merge_commit_fallback='fallback-sha',
+                base_sha='base-sha',
+                started_monotonic=0.0,
+                cas_retries={},
+                timeouts={},
+                enospc_retries={},
+                merged_branch_tip='trusted-tip',
+                advanced_sha=landed,
             )
 
-        assert result is patched_result, (
-            f'expected the orchestrator.merge_queue-patched _run_unscoped_typechecks '
-            f'result to be returned unchanged, got {result!r}'
-        )
-        git_ops.cleanup_merge_worktree.assert_awaited_once()
-
-
-def test_merge_queue_reexports_identical_objects() -> None:
-    """merge_queue re-exports the SAME objects from merge_gates (shim identity).
-
-    Covers every one of the 20 moved names.
-
-    RED (pre-shim): merge_queue.py still defines its own independent copies
-    of these names (the duplicate definitions left in place by the EXPAND
-    step), so ``getattr(merge_queue, name) is getattr(merge_gates, name)``
-    fails for every name — two distinct objects that merely share a name.
-    """
-    import orchestrator.merge_gates as merge_gates
-    import orchestrator.merge_queue as merge_queue
-
-    moved_names = [
-        'DROPPED_PLAN_TARGETS_REASON_PREFIX',
-        'PLAN_FILES_NOT_TOUCHED_REASON_PREFIX',
-        'POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX',
-        'POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX',
-        'DropGuardResult',
-        'PlanFilesTouchedResult',
-        'PostMergePyrightResult',
-        '_GenerationChainContext',
-        '_OVERLAP_GIT_ERROR_SENTINEL',
-        '_check_plan_targets_in_tree',
-        '_normalize_plan_path',
-        '_check_plan_files_touched_in_branch',
-        '_check_post_merge_equivalence',
-        '_rebase_delta_touched_overlap',
-        '_reverify_rebased_tree',
-        '_check_post_merge_pyright',
-        '_resolve_second_parent',
-        '_commit_is_linear',
-        '_finalize_advanced_merge',
-        '_map_advance_failure',
-    ]
-
-    for name in moved_names:
-        mq_obj = getattr(merge_queue, name)
-        mg_obj = getattr(merge_gates, name)
-        assert mq_obj is mg_obj, (
-            f'{name}: orchestrator.merge_queue.{name} and '
-            f'orchestrator.merge_gates.{name} must be the identical object'
+        assert outcome.status != 'done', f'expected a blocked outcome, got {outcome!r}'
+        assert not main_tip_is_queue_verified(landed), (
+            'a tip whose post-advance gates failed must NOT be recorded as '
+            'queue-verified'
         )
 
 
@@ -379,10 +287,7 @@ def test_gate_and_context_construct() -> None:
 
 def test_post_advance_gates_registry_shape() -> None:
     """POST_ADVANCE_GATES is [equivalence, pyright], in order; only the
-    equivalence gate carries the γ2 auto-chain on_blocked hook; the shim
-    re-exports the identical list object (not a copy)."""
-    import orchestrator.merge_gates as merge_gates
-    import orchestrator.merge_queue as merge_queue
+    equivalence gate carries the γ2 auto-chain on_blocked hook."""
     from orchestrator.merge_gates import POST_ADVANCE_GATES, Gate
 
     assert isinstance(POST_ADVANCE_GATES, list)
@@ -396,17 +301,10 @@ def test_post_advance_gates_registry_shape() -> None:
     assert callable(equivalence_gate.on_blocked)
     assert pyright_gate.on_blocked is None
 
-    assert merge_queue.POST_ADVANCE_GATES is merge_gates.POST_ADVANCE_GATES
-
 
 @pytest.mark.asyncio
-class TestGateFunctionsReachBack:
-    """_run_equivalence_gate / _run_pyright_gate unit + reach-back contract.
-
-    Mirrors ``TestReachBackRouting`` above: each block-path test patches the
-    SAME dependency in both namespaces with CONTRASTING values so the
-    assertion is unambiguous about which one governed the verdict.
-    """
+class TestGateFunctions:
+    """_run_equivalence_gate / _run_pyright_gate unit contract."""
 
     def _make_ctx(self, **overrides: object):
         from orchestrator.merge_gates import _PostAdvanceContext
@@ -439,31 +337,23 @@ class TestGateFunctionsReachBack:
 
         ctx = self._make_ctx()
         with patch(
-            'orchestrator.merge_queue._check_post_merge_equivalence',
+            'orchestrator.merge_lane.gates._check_post_merge_equivalence',
             AsyncMock(return_value=[]),
         ):
             verdict = await _run_equivalence_gate(ctx)
 
         assert verdict.passed is True
 
-    async def test_run_equivalence_gate_reachback_governs_block(self) -> None:
+    async def test_run_equivalence_gate_blocks_when_diverged(self) -> None:
         from orchestrator.merge_gates import (
             POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
             _run_equivalence_gate,
         )
 
         ctx = self._make_ctx()
-        with (
-            # Naive-resolution target: clean → would pass if this governed.
-            patch(
-                'orchestrator.merge_gates._check_post_merge_equivalence',
-                AsyncMock(return_value=[]),
-            ),
-            # Reach-back target: diverged → must govern the verdict.
-            patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
-                AsyncMock(return_value=['x.py']),
-            ),
+        with patch(
+            'orchestrator.merge_lane.gates._check_post_merge_equivalence',
+            AsyncMock(return_value=['x.py']),
         ):
             verdict = await _run_equivalence_gate(ctx)
 
@@ -473,39 +363,86 @@ class TestGateFunctionsReachBack:
         assert verdict.reason is not None
         assert verdict.reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
 
+    async def test_equivalence_block_reason_invites_the_correct_triage(
+        self,
+    ) -> None:
+        """A confirmed drop must name the triage diff AND its direction.
+
+        The complement of the two gates' rename awareness (task 5342): a
+        block that SURVIVES rename resolution is a genuine candidate
+        drop, and the message is the only thing steering what the reader
+        does next.  In the measured esc-5694-5 incident it steered the
+        RCA to the opposite of the truth — it named no diff direction, so
+        the diff was read backwards, and it never mentioned ``--follow``,
+        without which a relocated path's history looks empty and the file
+        reads as missing.
+
+        Only load-bearing properties are pinned here, not prose:
+        ``startswith`` because ``unblock_types.py`` and ``workflow.py``
+        both dispatch on the prefix; the branch-tip-FIRST argument order
+        because reading it the other way inverts the meaning of every
+        ``+``/``-`` line; and the structured routing fields, so a reword
+        cannot silently change the verdict.
+        """
+        from orchestrator.merge_gates import (
+            POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX,
+            _run_equivalence_gate,
+        )
+        from orchestrator.merge_types import OutcomeKind
+
+        advanced_sha = 'a1b2c3d4e5f60718293a4b5c6d7e8f90'
+        merged_tip = 'f0e1d2c3b4a5968778695a4b3c2d1e0f'
+        ctx = self._make_ctx(
+            advanced_sha=advanced_sha, resolved_merged_tip=merged_tip,
+        )
+        with patch(
+            'orchestrator.merge_lane.gates._check_post_merge_equivalence',
+            AsyncMock(return_value=['pkg/sub/mod.py']),
+        ):
+            verdict = await _run_equivalence_gate(ctx)
+
+        assert verdict.passed is False
+        assert verdict.reason is not None
+        reason = verdict.reason
+
+        assert reason.startswith(POST_MERGE_EQUIVALENCE_FAILED_REASON_PREFIX)
+
+        # Branch tip FIRST, advanced main SECOND.  A correctness property,
+        # not wording: the opposite order inverts the RCA.
+        assert (
+            f'git diff {merged_tip[:12]} {advanced_sha[:12]}'
+        ) in reason, reason
+
+        assert '--follow' in reason, reason
+        assert 'pkg/sub/mod.py' in reason, reason
+
+        assert verdict.emit_subtype == OutcomeKind.post_merge_equivalence_failed
+        assert verdict.merge_sha == advanced_sha
+
     async def test_run_pyright_gate_ok_when_clean(self) -> None:
         from orchestrator.merge_gates import _run_pyright_gate
 
         ctx = self._make_ctx()
         clean = MagicMock(broken=False, failing_subprojects=[], detail='')
         with patch(
-            'orchestrator.merge_queue._check_post_merge_pyright',
+            'orchestrator.merge_lane.gates._check_post_merge_pyright',
             AsyncMock(return_value=clean),
         ):
             verdict = await _run_pyright_gate(ctx)
 
         assert verdict.passed is True
 
-    async def test_run_pyright_gate_reachback_governs_block(self) -> None:
+    async def test_run_pyright_gate_blocks_when_broken(self) -> None:
         from orchestrator.merge_gates import (
             POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX,
             _run_pyright_gate,
         )
 
         ctx = self._make_ctx()
-        naive_clean = MagicMock(broken=False, failing_subprojects=[], detail='')
-        reachback_broken = MagicMock(broken=True, failing_subprojects=['pkg'], detail='boom')
-        with (
-            # Naive-resolution target: clean → would pass if this governed.
-            patch(
-                'orchestrator.merge_gates._check_post_merge_pyright',
-                AsyncMock(return_value=naive_clean),
-            ),
-            # Reach-back target: broken → must govern the verdict.
-            patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
-                AsyncMock(return_value=reachback_broken),
-            ),
+        broken = MagicMock(broken=True, failing_subprojects=['pkg'], detail='boom')
+        with patch(
+            'orchestrator.merge_lane.gates._check_post_merge_pyright',
+            AsyncMock(return_value=broken),
         ):
             verdict = await _run_pyright_gate(ctx)
 
@@ -572,11 +509,11 @@ class TestFinalizeDrivesRegistry:
         args = self._make_finalize_args()
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=clean_pyright),
             ),
         ):
@@ -593,11 +530,11 @@ class TestFinalizeDrivesRegistry:
         args = self._make_finalize_args()
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=clean_pyright),
             ),
             caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
@@ -624,7 +561,7 @@ class TestFinalizeDrivesRegistry:
         args = self._make_finalize_args(chain_ctx=None)
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=['f.py']),
             ),
             caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
@@ -664,11 +601,11 @@ class TestFinalizeDrivesRegistry:
         args = self._make_finalize_args(chain_ctx=None)
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=broken_pyright),
             ),
             caplog.at_level(logging.INFO, logger='orchestrator.merge_queue'),
@@ -694,10 +631,12 @@ class TestFinalizeDrivesRegistry:
         from orchestrator.merge_gates import _finalize_advanced_merge, _GenerationChainContext
         from orchestrator.merge_types import MergeOutcome
 
+        chained_outcome = MergeOutcome('superseded', merge_sha='chained-sha')
+        maybe_chain_mock = AsyncMock(return_value=chained_outcome)
         chain_ctx = _GenerationChainContext(
             queue=MagicMock(), counts={}, max_auto_generations=3,
+            maybe_auto_chain_generation=maybe_chain_mock,
         )
-        chained_outcome = MergeOutcome('superseded', merge_sha='chained-sha')
         event_store = MagicMock()
         args = self._make_finalize_args(
             chain_ctx=chain_ctx, merged_branch_tip='trusted-tip', event_store=event_store,
@@ -705,14 +644,10 @@ class TestFinalizeDrivesRegistry:
 
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=['f.py']),
             ),
-            patch('orchestrator.merge_queue.AUTO_CHAIN_GENERATIONS_ENABLED', True),
-            patch(
-                'orchestrator.merge_queue._maybe_auto_chain_generation',
-                AsyncMock(return_value=chained_outcome),
-            ) as maybe_chain_mock,
+            patch('orchestrator.merge_lane.gates.AUTO_CHAIN_GENERATIONS_ENABLED', True),
         ):
             outcome = await _finalize_advanced_merge(**args)
 
@@ -736,11 +671,11 @@ class TestFinalizeDrivesRegistry:
         args = self._make_finalize_args(advanced_sha=None)
         with (
             patch(
-                'orchestrator.merge_queue._check_post_merge_equivalence',
+                'orchestrator.merge_lane.gates._check_post_merge_equivalence',
                 AsyncMock(return_value=[]),
             ),
             patch(
-                'orchestrator.merge_queue._check_post_merge_pyright',
+                'orchestrator.merge_lane.gates._check_post_merge_pyright',
                 AsyncMock(return_value=clean_pyright),
             ),
         ):

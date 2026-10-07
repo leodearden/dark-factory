@@ -32,8 +32,8 @@ two things, fail-soft and fast:
 
 ## Absolute paths, not `~/.claude/hooks/`
 
-Unlike the pre-existing `~/.claude/hooks/*.sh` scripts (`skim-rewrite.sh`,
-`worktree-hookspath-*.sh`), these hooks live **in this repo**, version
+Unlike the pre-existing `~/.claude/hooks/*.sh` scripts
+(`worktree-hookspath-*.sh`), these hooks live **in this repo**, version
 controlled, and are referenced from `~/.claude/settings.json` by **absolute
 path** into this checkout (e.g. `/home/leo/src/dark-factory/skills/spawn/hooks/session-start.sh`).
 That is a deliberate PRD decision (§4 decision 5): registry/hook logic is
@@ -43,7 +43,7 @@ not an ad-hoc file dropped in `~/.claude/`.
 ## MERGE, never clobber
 
 `~/.claude/settings.json` already carries a populated `hooks` object
-(`PreToolUse`: Bash → skim-rewrite.sh, EnterWorktree → worktree-hookspath-capture.sh;
+(`PreToolUse`: EnterWorktree → worktree-hookspath-capture.sh;
 `PostToolUse`: ExitWorktree → worktree-hookspath-restore.sh) plus other
 top-level keys (`env`, `permissions`, `statusLine`, `enabledPlugins`, …).
 Installing this trio must **add** the three new event keys

@@ -6,64 +6,37 @@ test_purge_knowlive_namespace.py.
 """
 from __future__ import annotations
 
-import importlib.util
 import logging
 import sys
-import types
 from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
 
 from fused_memory.maintenance.cross_graph_move import SubgraphEdgeResult
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'consolidate_namespace_families.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load consolidate_namespace_families.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    mod_name = 'consolidate_namespace_families'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+_mod = load_script_module(SCRIPT_PATH, mod_name='consolidate_namespace_families')
 
 
-_mod = _load_module()
-
-
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
-    enumerates or scrolls (task 4293). That probe touches the real filesystem,
-    so without this fixture every ``--apply`` test would pass or fail according
-    to whether the machine running pytest happens to be able to write mem0's
-    history directory -- and it genuinely cannot inside an agent sandbox, which
-    is the whole reason the guard exists. This suite is deliberately MOCK-unit
-    (MagicMock graphiti + AsyncMock Qdrant, no live backends), so the
-    environment must not be an input to it.
-
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it enumerates or
+    scrolls (task 4293). This suite is deliberately MOCK-unit (MagicMock
+    graphiti + AsyncMock Qdrant, no live backends).
     ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
     to record, or to pass -- so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-
-    Deliberately NOT ``raising=False``: if the guard is ever removed from the
-    script this fixture must break loudly rather than silently no-op.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+    explicitly rather than assumed away.""",
+)
 
 
 # ===========================================================================
@@ -3015,40 +2988,6 @@ class TestRunApplyStoreMutationPreflight:
         memory_service = _make_run_memory_service(graphiti, qdrant_client)
         return memory_service, graphiti, qdrant_client
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
-    def _fail_closed_records(caplog) -> list:
-        """The guard site's OWN diagnosis.
-
-        ``main`` has no handler at all here, so the refusal exits as an
-        uncaught traceback and this ERROR record is the ONLY place the operator
-        is told what was refused and what to do instead. Pinned on the
-        fail-closed marker and the remedy noun ONLY, so every other word of the
-        message stays free to reword.
-
-        Asserting on message CONTENT is deliberate, and is the narrow exception
-        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
-        this test is about is defined BY its content -- mere record-existence
-        would still pass if the whole diagnosis were replaced by "boom",
-        precisely the regression this exists to catch. Verified non-vacuous:
-        mutating the marker in the script turns this assertion red (task 4127
-        amendment).
-        """
-        return [
-            rec for rec in caplog.records
-            if rec.name == 'consolidate_namespace_families'
-            and rec.levelname == 'ERROR'
-            and 'NOT started (fail-closed)' in rec.getMessage()
-            and 'MCP server' in rec.getMessage()
-        ]
-
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, monkeypatch
@@ -3061,12 +3000,12 @@ class TestRunApplyStoreMutationPreflight:
         is the worst outcome available: it strands records in the sibling
         namespace with the canonical copy already written.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         mocks = _patch_merge_primitives(monkeypatch)
         memory_service, graphiti, qdrant_client = self._scenario()
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(_run_args(apply=True), memory_service, limit=1000)
 
@@ -3103,7 +3042,7 @@ class TestRunApplyStoreMutationPreflight:
         (task 525, scripts/check_asyncmock_assertion_style.py). Each half now
         asserts in the one style its mock supports.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _patch_merge_primitives(monkeypatch)
         memory_service, graphiti, _ = self._scenario()
 
@@ -3119,7 +3058,7 @@ class TestRunApplyStoreMutationPreflight:
         """The other half of the same claim: the raw Qdrant transport is never
         even opened, so the collection enumeration behind it is not paid for
         either."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _patch_merge_primitives(monkeypatch)
         memory_service, _, _ = self._scenario()
 
@@ -3133,7 +3072,7 @@ class TestRunApplyStoreMutationPreflight:
         """A PREVIEW mutates nothing, so it must not require the ability to
         mutate -- the consolidation report stays obtainable from anywhere, with
         the deny still installed."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         mocks = _patch_merge_primitives(monkeypatch)
         memory_service, _, qdrant_client = self._scenario()
 
@@ -3190,7 +3129,7 @@ class TestRunApplyStoreMutationPreflight:
         so without this record the operator sees a bare traceback naming an
         exception class and no remedy.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         _patch_merge_primitives(monkeypatch)
         memory_service, _, _ = self._scenario()
 
@@ -3200,7 +3139,7 @@ class TestRunApplyStoreMutationPreflight:
         ):
             await _mod.run(_run_args(apply=True), memory_service, limit=1000)
 
-        assert self._fail_closed_records(caplog), (
+        assert fail_closed_records(caplog, 'consolidate_namespace_families'), (
             'nothing else explains this traceback -- the guard site must log '
             'the fail-closed diagnosis before raising; got: '
             f'{[rec.getMessage() for rec in caplog.records]}'
