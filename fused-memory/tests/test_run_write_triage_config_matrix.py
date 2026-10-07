@@ -341,9 +341,11 @@ def test_winner_is_the_qualifying_arm_with_fewest_contested_decision_errors() ->
     assert rule['fallback_applied'] is False
 
 
-def _ranked(arm: str, errors: int, cost: float | None, met: bool = True) -> dict[str, Any]:
+def _ranked(arm: str, errors: int, cost: float | None, failed: int = 0) -> dict[str, Any]:
+    """A scored row that fails *failed* bounds, shaped as ``_with_bounds`` writes it."""
+    checks = [{'check': f'bound {index}', 'ok': False, 'note': None} for index in range(failed)]
     return {
-        'arm': arm, 'status': 'scored', 'bounds': {'met': met, 'checks': []},
+        'arm': arm, 'status': 'scored', 'bounds': {'met': not failed, 'checks': checks},
         'quality': {'contested_decision_errors': errors},
         'selection': {'cost_per_write_usd': cost},
     }
@@ -366,6 +368,32 @@ def test_no_qualifying_arm_falls_back_to_fewest_errors() -> None:
 
     assert not any(row['bounds']['met'] for row in _scored_rows(matrix))
     assert matrix['winner'] == SOL
+    assert matrix['selection_rule']['fallback_applied'] is True
+
+
+def test_without_a_qualifying_arm_the_winner_fails_fewest_bounds_before_fewest_errors() -> None:
+    select = _mod().select_winner
+
+    assert select([
+        _ranked('fewest-errors', 48, 0.017, failed=2), _ranked('one-miss', 52, 0.002, failed=1),
+    ]) == ('one-miss', True)
+    assert select([
+        _ranked('a', 60, 0.001, failed=1), _ranked('b', 49, 0.001, failed=1),
+    ]) == ('b', True)
+    assert select([
+        _ranked('close', 0, 0.001, failed=1), _ranked('qualified', 206, 0.001),
+    ]) == ('qualified', False)
+
+    matrix = _build(bounds=[
+        _bound('population.n_judge_band', '>=', '5'),
+        _bound('selection.cost_per_write_usd', '<=', CHEAP),
+    ])
+    failed = {
+        row['arm']: sum(not check['ok'] for check in row['bounds']['checks'])
+        for row in _scored_rows(matrix)
+    }
+    assert failed == {REFERENCE: 1, PRE_PSI: 1, SOL: 2}
+    assert matrix['winner'] == PRE_PSI
     assert matrix['selection_rule']['fallback_applied'] is True
 
 
@@ -400,12 +428,17 @@ QUALIFYING_BOUNDS = [
     ('selection.cost_per_write_usd', '<=', CHEAP),
 ]
 UNMET_BOUNDS = [('population.n_judge_band', '>=', '5')]
+UNEVENLY_UNMET_BOUNDS = [*UNMET_BOUNDS, ('selection.cost_per_write_usd', '<=', CHEAP)]
 
 
 @pytest.mark.parametrize(
     ('spec', 'winner', 'gate_exit'),
-    [(QUALIFYING_BOUNDS, PRE_PSI, 0), (UNMET_BOUNDS, SOL, 1)],
-    ids=['winner-qualified', 'fallback'],
+    [
+        (QUALIFYING_BOUNDS, PRE_PSI, 0),
+        (UNMET_BOUNDS, SOL, 1),
+        (UNEVENLY_UNMET_BOUNDS, PRE_PSI, 1),
+    ],
+    ids=['winner-qualified', 'fallback', 'fallback-fewest-failed-bounds'],
 )
 def test_best_config_copies_the_winner_verbatim(
     spec: list[tuple[str, str, str]], winner: str, gate_exit: int, tmp_path: Path,

@@ -1714,10 +1714,10 @@
         "value": "300"
       }
     ],
-    "rule": "meets every bound (scripts/check_write_triage_readiness_gate.py::check_require); fewest quality.contested_decision_errors; ties to lower selection.cost_per_write_usd, then arm name",
+    "rule": "fewest failed bounds (scripts/check_write_triage_readiness_gate.py::check_require), so an arm meeting every bound beats every arm that does not; then fewest quality.contested_decision_errors; then lower selection.cost_per_write_usd; then arm name",
     "fallback_applied": true
   },
-  "winner": "gpt-5.6-terra:none@20",
+  "winner": "gpt-5.6-terra:none@5",
   "inputs": {
     "population_path": "fused-memory/calibration/write_triage_population.json",
     "population_sha256": "0a6e302db94739eae361f6e723790a54eab373a9af394094a4981f547ba1a9c4",

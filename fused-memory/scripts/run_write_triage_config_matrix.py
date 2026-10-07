@@ -283,9 +283,10 @@ SKIPPED_ARMS: tuple[SkippedArm, ...] = (
 """The PRD's arms that are recorded as skipped rather than silently omitted."""
 
 WINNER_RULE = (
-    'meets every bound (scripts/check_write_triage_readiness_gate.py::check_require);'
-    ' fewest quality.contested_decision_errors; ties to lower'
-    ' selection.cost_per_write_usd, then arm name'
+    'fewest failed bounds (scripts/check_write_triage_readiness_gate.py::check_require),'
+    ' so an arm meeting every bound beats every arm that does not; then fewest'
+    ' quality.contested_decision_errors; then lower selection.cost_per_write_usd;'
+    ' then arm name'
 )
 
 
@@ -357,38 +358,42 @@ def best_config(matrix: Mapping[str, Any]) -> dict[str, Any]:
     if len(winners) != 1:
         raise ValueError(f'the matrix winner {matrix["winner"]!r} names no single scored arm')
     [row] = winners
-    checks = row['bounds']['checks']
     return candidate_doc(row, matrix['population']) | {
         'provenance': {
             'arm': row['arm'],
             'reference_arm': matrix['reference_arm'],
             'meets_every_bound': row['bounds']['met'],
-            'failed_bounds': [check['check'] for check in checks if not check['ok']],
+            'failed_bounds': _failed_bounds(row),
         },
     }
 
 
 def select_winner(rows: Sequence[Mapping[str, Any]]) -> tuple[str, bool]:
-    """The winning arm by :data:`WINNER_RULE`, and whether no arm met every bound.
+    """The winning arm by :data:`WINNER_RULE`, and whether it is a fallback.
 
-    When no scored arm meets every bound, the same ranking runs over every
-    scored arm and the fallback flag is True. Skipped rows are never chosen.
+    The fallback flag is True when the winner fails a bound, which the
+    ranking allows only when no scored arm meets every bound. Skipped rows are
+    never chosen.
     """
     scored = [row for row in rows if row['status'] == 'scored']
     if not scored:
         raise ValueError('no scored arm to choose a winner from')
-    qualified = [row for row in scored if row['bounds']['met']]
-    pool = qualified or scored
-    return min(pool, key=_rank)['arm'], not qualified
+    winner = min(scored, key=_rank)
+    return winner['arm'], not winner['bounds']['met']
 
 
-def _rank(row: Mapping[str, Any]) -> tuple[int, float, str]:
+def _rank(row: Mapping[str, Any]) -> tuple[int, int, float, str]:
     cost = row['selection']['cost_per_write_usd']
     return (
+        len(_failed_bounds(row)),
         row['quality']['contested_decision_errors'],
         math.inf if cost is None else cost,
         row['arm'],
     )
+
+
+def _failed_bounds(row: Mapping[str, Any]) -> list[str]:
+    return [check['check'] for check in row['bounds']['checks'] if not check['ok']]
 
 
 def _reference_arm(population: Population, shipped: ArmSettings) -> PiArm:
