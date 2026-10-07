@@ -476,9 +476,10 @@ function WorkflowPanel({ workflow, terminal, win, generatedAt, regimeMarkers }) 
   const churnDates = Object.keys(churnDaily).sort();
 
   const escPerDoneDaily = sliceRowsByWindow(workflow.esc_per_done_daily || [], generatedAt, win, row => row.date);
-  // A null ratio means done == 0 that day: no task completed, so escalations
-  // per done is undefined rather than zero. It is passed straight through as a
-  // hole, and LineChart breaks the line across it (task 3489). These rows used
+  // A null ratio means done == 0 that day (no task completed), or that the
+  // project's runs.db could not be read (workflow.done_counts_read false), so
+  // escalations per done is undefined rather than zero. It is passed straight
+  // through as a hole, and LineChart breaks the line across it (task 3489). These rows used
   // to be FILTERED OUT, which dropped the day from this label row too — that
   // compacted the x-axis and silently redated every surviving sample, the exact
   // hazard spark_path.js's header calls out.

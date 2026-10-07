@@ -149,6 +149,43 @@ function windowedClassSplit(rows) {
   };
 }
 
+// ── The strip's esc/done reading, and the churn tile's filings ──
+// `parts` are one {project, doneCountsRead, rows} per project, `rows` its
+// already-windowed workflow.esc_per_done_daily. The ratio is Σfilings/Σdone
+// over the window, never a mean of daily ratios. A project whose completed-task
+// counts were not read makes the ratio a hole naming it, rows or no rows: the
+// flag, not a row, is the authority, and a missing denominator would otherwise
+// pass for a smaller one. Filings are summed regardless, since churn needs every
+// one of them. A day that completed nothing has no daily ratio.
+function windowedEscPerDone(parts) {
+  const filingsByDate = {};
+  const doneByDate = {};
+  const unread = [];
+  for (const part of parts) {
+    if (part.doneCountsRead !== true) unread.push(part.project);
+    for (const row of part.rows) {
+      filingsByDate[row.date] = (filingsByDate[row.date] || 0) + (row.filings || 0);
+      doneByDate[row.date] = (doneByDate[row.date] || 0) + (row.done || 0);
+    }
+  }
+  const filings = Object.values(filingsByDate).reduce((sum, n) => sum + n, 0);
+  const done = Object.values(doneByDate).reduce((sum, n) => sum + n, 0);
+  const read = unread.length === 0;
+  return {
+    filings,
+    filingsByDate,
+    ratio: read && done > 0 ? filings / done : null,
+    ratioDaily: read
+      ? Object.keys(doneByDate).sort()
+        .filter(date => doneByDate[date] > 0)
+        .map(date => filingsByDate[date] / doneByDate[date])
+      : [],
+    absentReason: read
+      ? 'no tasks completed in this window'
+      : 'completed-task counts could not be read for ' + unread.join(', '),
+  };
+}
+
 // ── A row's task card ──
 // The server's task Datum, stamped with its endpoint's receipt and drawn by
 // datumView, so a hole and its reason come from the one hole decision.
@@ -182,6 +219,7 @@ const ESCALATION_VIEWS_API = {
   windowedClassSplit,
   taskCard,
   levelCount,
+  windowedEscPerDone,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
