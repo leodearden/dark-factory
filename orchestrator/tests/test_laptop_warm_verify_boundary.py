@@ -73,7 +73,7 @@ import threading
 import time
 import uuid
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from collections.abc import Set as AbstractSet
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -475,6 +475,47 @@ def spawn_ssh_heartbeat_dispatcher(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+
+
+def loopback_ssh_run(
+    *, heartbeat_interval: float
+) -> Callable[..., Awaitable[tuple[int, str, str]]]:
+    """A RemoteRunner ``ssh_run`` that runs the remote command locally, as ssh would.
+
+    ssh becomes a transparent pipe: the leader's stdin is the REAL heartbeat
+    pipe of :func:`~orchestrator.verify_runner._default_ssh_heartbeat_run`,
+    and its stderr comes back exactly as ssh relays it.  The env reaches the
+    leader ambiently -- see :func:`apply_dispatcher_env`.
+    """
+
+    async def ssh_run(argv: list[str], *, cwd: str | Path | None = None) -> tuple[int, str, str]:
+        assert argv[0] == 'ssh', f'RemoteRunner no longer dispatches through ssh: {argv!r}'
+        entry_point, *cli_args = shlex.split(argv[-1])
+        assert entry_point == 'orchestrator', (
+            f'RemoteRunner\'s remote command no longer starts with the orchestrator '
+            f'CLI: {argv[-1]!r}'
+        )
+        return await _default_ssh_heartbeat_run(
+            [sys.executable, '-c', STOCK_BOOTSTRAP, *cli_args],
+            cwd=cwd,
+            heartbeat_interval=heartbeat_interval,
+        )
+
+    return ssh_run
+
+
+async def git_push_succeeds(
+    argv: list[str], *, cwd: str | Path | None = None
+) -> tuple[int, str, str]:
+    """A RemoteRunner ``run`` that accepts every ``git push`` and nothing else.
+
+    With no ``main_branch``, the merge-sha push and its ``--delete`` cleanup
+    are the only commands RemoteRunner sends through ``run``.
+    """
+    assert argv[:2] == ['git', 'push'], (
+        f'RemoteRunner sent a non-push command through run: {argv!r}'
+    )
+    return 0, '', ''
 
 
 # ---------------------------------------------------------------------------
