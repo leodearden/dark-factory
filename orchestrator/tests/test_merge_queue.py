@@ -10,7 +10,7 @@ import os
 import re
 import sqlite3
 import time
-from collections.abc import Collection, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -23350,6 +23350,21 @@ def test_verify_and_advance_shim_removed() -> None:
         'drive_verify_and_advance from _merge_queue_harness, so the production '
         'class must no longer carry the test-only shim.'
     )
+
+
+def _effective_timeout_mark_resolver(
+    namespace: Mapping[str, object],
+) -> Callable[[str], object | None]:
+    """Resolve a ``Class::method`` key to whichever of the method or its class
+    carries the timeout mark pytest applies to that test: a method's own mark
+    replaces its class's (pytest takes the closest marker)."""
+    def resolve(qualname: str) -> object | None:
+        class_name, _, method_name = qualname.partition('::')
+        cls = namespace.get(class_name)
+        method = getattr(cls, method_name, None)
+        own = getattr(method, 'pytestmark', ())
+        return method if any(m.name == 'timeout' for m in own) else cls
+    return resolve
 
 
 class TestTimeoutMarkCoverage:
