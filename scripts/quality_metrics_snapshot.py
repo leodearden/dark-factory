@@ -363,7 +363,11 @@ class _FileMeasure:
 def _measure_file(
     root: Path, member: str, domain_file: source_measures.DomainFile, known: frozenset[str]
 ) -> _FileMeasure:
-    """One file's measures, from one read and one parse; *known* is every src module name."""
+    """One file's measures; *known* is every src module name.
+
+    The file is read and ast-parsed once here, and complexipy reads and parses
+    it again from disk for the cognitive measures.
+    """
     path = domain_file.path
     source = source_measures.read_source(root, path)
     tree = source_measures.parse_source(source, path=path)
@@ -437,7 +441,7 @@ def _require_unique_module_names(domain: Sequence[source_measures.DomainMember])
 def measure_domain(
     root: Path, domain: Sequence[source_measures.DomainMember]
 ) -> Measurement:
-    """Measure every file of *domain* under *root*, each read and parsed once.
+    """Measure every file of *domain* under *root*: one read and ast parse, plus complexipy's own.
 
     A file whose read, parse, tokenize or complexipy step fails is named in
     ``unreadable`` (its reason on stderr) and has no record.
