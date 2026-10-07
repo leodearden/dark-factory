@@ -300,7 +300,8 @@ def _origin(url: str) -> str:
 def require_tap_to_arm(path: Path, tap: TapBinding, arm: SlateArm, spec: LlmArmSpec) -> None:
     upstream_port = urlsplit(tap.upstream_url).port
     if upstream_port != arm.port:
-        _refuse(path, f'the tap must forward to arm {arm.arm_id!r}\'s port {arm.port}', upstream_port)
+        invariant = f'the tap must forward to arm {arm.arm_id!r} on port {arm.port}'
+        _refuse(path, invariant, upstream_port)
     spec_origin = _origin(spec.serving.base_url)
     if tap.listen_url != spec_origin:
         _refuse(path, f'the tap must listen where the spec points, {spec_origin}', tap.listen_url)
@@ -364,11 +365,8 @@ def require_screening_shape(run_dir: Path, run: RunManifest, arm_id: str) -> Non
     expected = SCREENING_RUN_SHAPE.model_dump()
     differing = {key: value for key, value in actual.items() if value != expected[key]}
     if differing:
-        _refuse(
-            run_dir,
-            f'arm {arm_id!r} must run the screening shape {SCREENING_RUN_SHAPE.model_dump(mode="json")}',
-            differing,
-        )
+        shape = SCREENING_RUN_SHAPE.model_dump(mode='json')
+        _refuse(run_dir, f'arm {arm_id!r} must run the screening shape {shape}', differing)
 
 
 def _served(commands: ArmCommands, start: CommandRecord) -> bool:

@@ -134,7 +134,9 @@ def _exchange(
             STREAM_REFUSED_STATUS,
             'the usage tap does not proxy streamed requests: their usage is not measurable here',
         )
-    forwarded = {name: value for name, value in headers.items() if name.lower() not in _NOT_FORWARDED}
+    forwarded = {
+        name: value for name, value in headers.items() if name.lower() not in _NOT_FORWARDED
+    }
     forwarded['Host'] = upstream.netloc
     connection = http.client.HTTPConnection(
         upstream.hostname or '', upstream.port, timeout=UPSTREAM_TIMEOUT_S
