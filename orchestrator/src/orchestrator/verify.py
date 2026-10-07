@@ -45,6 +45,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 # surface is what makes that structural rather than a reviewing burden.
 # flake_ledger depends only on shared.sqlite_sync_base, so there is no cycle.
 from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
+from orchestrator.main_tip_sweep_cadence import SweepSeedMode
 from orchestrator.verify_categories import (
     ARCHIVE_DENY_LIST as _ARCHIVE_DENY_LIST,  # noqa: F401 — re-exported for external consumers
 )
@@ -1573,9 +1574,9 @@ async def _on_main_probe_worktree(
 
     warm_seed=True: the probe shares the rolling warm-lane CoW base with the
     ordinary task verifies it adjudicates, so any warm-base artifact bias is
-    common-mode across both sides of the comparison; the COLD ground truth
-    stays with MAIN_SWEEP and the '_mainsweepconfirm-' confirm worktree
-    (operator sign-off 2026-08-12, task-2567 suggestion).
+    common-mode across both sides of the comparison; the COLD ground truth is
+    the main-tip sweep's periodic cold control plus the '_mainsweepconfirm-'
+    confirm worktree (task 5812, superseding the 2026-08-12 ruling).
     """
     from orchestrator.git_ops import EphemeralWorktreeError, WorktreeKind
 
@@ -8906,10 +8907,10 @@ async def verify_failure_is_preexisting_on_main(
         # warm base exists — see ephemeral_worktree's warm_seed docstring.
         # Sharing the warm base with ordinary task verification means any
         # stale-artifact bias is common-mode across the "preexisting on
-        # main?" comparison; the COLD ground truth remains MAIN_SWEEP plus
-        # the '_mainsweepconfirm-' confirm worktree (operator sign-off
-        # 2026-08-12, task-2567 suggestion — cold here would cost 30-45min
-        # per probe on the contagion-guard hot path).
+        # main?" comparison; the COLD ground truth is the main-tip sweep's
+        # periodic cold control plus the cold '_mainsweepconfirm-' confirm
+        # worktree (task 5812, superseding 2026-08-12 — cold here would
+        # cost 30-45min per probe on the contagion-guard hot path).
         async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
             WorktreeKind.MAIN_PROBE, main_sha, warm_seed=True,
         ) as tmp_path:
@@ -9004,6 +9005,7 @@ async def run_main_tip_sweep(
     git_ops: object,
     *,
     main_sha: str | None = None,
+    seed_mode: SweepSeedMode = SweepSeedMode.COLD,
 ) -> 'tuple[str, VerifyResult] | None':
     """Run a full unscoped verification sweep against the current main-tip SHA.
 
@@ -9021,6 +9023,11 @@ async def run_main_tip_sweep(
             subprocess and closing the TOCTOU window between the harness
             SHA-dedup gate and the worktree pin.  Callers that already resolved
             the SHA (e.g. ``_run_main_tip_sweep`` in harness.py) should pass it.
+        seed_mode: Chosen per sweep by the harness's ``MainSweepColdControl``.
+            ``COLD`` (the default) builds from nothing: the ground truth.
+            ``WARM`` CoW-seeds ``target/`` from the warm-lane base as a
+            read-only consumer, failing soft to cold.  The
+            ``_mainsweepconfirm-`` confirm worktree always stays cold.
 
     Returns:
         ``(main_sha, VerifyResult)`` on success (result.passed may be False).
@@ -9119,6 +9126,7 @@ async def run_main_tip_sweep(
         # contract.
         async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
             WorktreeKind.MAIN_SWEEP, main_sha,
+            warm_seed=seed_mode is SweepSeedMode.WARM,
         ) as tmp_path:
             def _enoent_on_self(r: 'VerifyResult') -> bool:
                 """SECONDARY backstop (task 2507): True iff *r* is a

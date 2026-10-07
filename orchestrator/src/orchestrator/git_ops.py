@@ -3254,9 +3254,9 @@ class GitOps:
                 below, so an unsuppressed raise here would leak the
                 registered worktree instead of degrading to cold. A
                 non-resolvable base (ABSENT/INDETERMINATE) skips the seed
-                subprocess entirely. Default ``False`` keeps
-                ``run_main_tip_sweep`` (``MAIN_SWEEP``) byte-identical to
-                before this parameter existed.
+                subprocess entirely. Default ``False`` (cold);
+                ``run_main_tip_sweep`` picks per sweep — warm by default,
+                periodically cold (task 5812).
 
         Yields:
             The minted worktree path, already checked out at *sha*.
@@ -3387,7 +3387,7 @@ class GitOps:
                                 kind.name, seed_rc, tmp_path,
                             )
                     else:
-                        logger.debug(
+                        logger.info(
                             'ephemeral_worktree(%s): warm base not resolvable — '
                             'skipping seed, proceeding COLD for %s',
                             kind.name, tmp_path,
