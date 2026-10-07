@@ -134,6 +134,7 @@ import argparse
 import json
 import logging
 import os
+import statistics
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -359,6 +360,40 @@ def _floor_condition(
     return blocks, line + (" -> BLOCKS all conditions" if blocks else "")
 
 
+def _count_within(first_seens_utc: list[datetime], *, end: datetime, hours: int) -> int:
+    start = end - timedelta(hours=hours)
+    return sum(1 for fs in first_seens_utc if start <= fs <= end)
+
+
+def _novelty_condition(
+    now_utc: datetime, candidate_first_seens: list[datetime], config: CensusConfig
+) -> tuple[bool, str]:
+    seen = [_as_utc(fs) for fs in candidate_first_seens]
+    hours = config.novelty_spike_window_hours
+    baseline_days = config.novelty_spike_baseline_days
+    count = _count_within(seen, end=now_utc, hours=hours)
+    head = f"novelty-spike: {count} within {hours}h"
+
+    history_days = (now_utc - min(seen)).total_seconds() / 86400.0 if seen else 0.0
+    if history_days < baseline_days:
+        return False, (
+            f"{head} (baseline needs {baseline_days}d of candidate history, "
+            f"have {history_days:.1f}d) -> N/A"
+        )
+
+    baseline = (
+        statistics.median(
+            _count_within(seen, end=now_utc - timedelta(days=k), hours=hours)
+            for k in range(1, baseline_days + 1)
+        )
+        if baseline_days
+        else 0.0
+    )
+    spike = count >= config.novelty_spike_count and count >= config.novelty_spike_multiple * baseline
+    line = f"{head} (baseline median {baseline:g}, x{config.novelty_spike_multiple})"
+    return spike, line + (" -> FIRE" if spike else "")
+
+
 def evaluate(
     *,
     now: datetime,
@@ -373,9 +408,11 @@ def evaluate(
     tasks_landed_threshold, (c) novelty_spike, subject to a floor measured
     from `floor_anchor` (plans/census-incremental-prd.md §4.7 Floor): inside
     floor_days of the anchor nothing fires. The floor never fires by itself,
-    and its reason line always names its anchor. No I/O: all inputs are
-    plain values so the full matrix is testable without a filesystem or a
-    live get_statuses call.
+    and its reason line always names its anchor. The novelty condition is
+    relative to the median of the daily window counts over the trailing
+    baseline_days, and N/A until that much candidate history exists (PRD
+    §4.7 (b)). No I/O: all inputs are plain values so the full matrix is
+    testable without a filesystem or a live get_statuses call.
     """
     now_utc = _as_utc(now)
     last_utc = _as_utc(last_census_at)
@@ -414,19 +451,8 @@ def evaluate(
             )
         )
 
-    window_start = now_utc - timedelta(hours=config.novelty_spike_window_hours)
-    in_window = [
-        fs for fs in candidate_first_seens if window_start <= _as_utc(fs) <= now_utc
-    ]
-    cond_c = len(in_window) >= config.novelty_spike_count
-    reasons.append(
-        "novelty-spike: {} candidate(s) within {}h (threshold {}){}".format(
-            len(in_window),
-            config.novelty_spike_window_hours,
-            config.novelty_spike_count,
-            " -> FIRE" if cond_c else "",
-        )
-    )
+    cond_c, novelty_line = _novelty_condition(now_utc, candidate_first_seens, config)
+    reasons.append(novelty_line)
 
     floor_blocks, floor_line = _floor_condition(now_utc, floor_anchor, config)
     reasons.append(floor_line)
