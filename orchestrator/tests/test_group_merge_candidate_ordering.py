@@ -284,77 +284,86 @@ def test_date_skew_makes_the_documented_candidate_query_pick_the_wrong_merge(
     )
 
 
-def test_a_merge_created_from_the_branch_side_puts_the_task_tip_at_caret_1(
-    tmp_path: Path,
-) -> None:
-    """``$c^1`` is main-just-before-the-merge only when the merge was made ON main.
+_PINNED_DATE = '2020-01-01T00:00:00 +0000'
 
-    Build the merge from the TASK side: ``git checkout -b integ task/T``
-    then ``git merge --no-ff main``, and fast-forward main onto it.  The
-    merge lands on main and ``task/T``'s own ref never advances -- exactly
-    the state the rc=0 arm inspects -- but its first parent is the task
-    tip, not main.  The runbook's ``contained-before`` check then exits 0
-    trivially and the arm reads "unrelated later merge, do not stamp",
-    losing a merge sha it was holding.
 
-    ``orchestrator/src/orchestrator/git_ops.py::GitOps.merge_to_main``
-    always merges FROM main, so a dark-factory landing is safe; a target
-    project reached through ``skills/orchestrate/SKILL.md``'s call site
-    merges by its own convention, which is what makes this reachable.
-    """
-    root = tmp_path / 'repo'
+def _build_branch_side_landing(root: Path) -> None:
+    """Land ``task/T`` by a merge made on the branch side, fast-forwarded onto main."""
     _new_repo(root)
-
-    _commit(root, 'base', 'base.txt')
+    _commit(root, 'base', 'base.txt', date=_PINNED_DATE)
     _git(root, 'checkout', '-b', f'task/{TASK_ID}')
-    _commit(root, 'work', 'work.txt')
-    task_tip = _git(root, 'rev-parse', f'task/{TASK_ID}')
-
-    # main advances, so the landing genuinely needs a merge commit.
+    _commit(root, 'work', 'work.txt', date=_PINNED_DATE)
     _git(root, 'checkout', 'main')
-    mainadv = _commit(root, 'mainadv', 'main.txt')
+    _commit(root, 'side', 'side.txt', date=_PINNED_DATE)
 
-    # The merge is created ON THE TASK SIDE, then fast-forwarded onto main.
     _git(root, 'checkout', '-b', 'integ', f'task/{TASK_ID}')
-    _git(root, 'merge', '--no-ff', 'main', '-m', 'Merge main into integ')
-    merge = _git(root, 'rev-parse', 'HEAD')
+    _git(root, 'merge', '--no-ff', 'main', '-m', 'Merge', date=_PINNED_DATE)
     _git(root, 'checkout', 'main')
+    assert _git_rc(root, 'merge-base', '--is-ancestor', f'task/{TASK_ID}', 'main') == 1, (
+        'task/T must not be on main yet, so the branch-side merge is what brings it in'
+    )
     _git(root, 'merge', '--ff-only', 'integ')
 
-    assert _git(root, 'rev-parse', 'main') == merge
-    assert _git(root, 'rev-parse', f'task/{TASK_ID}') == task_tip, (
-        "the task ref must still sit at its pre-merge tip -- that is the state the rc=0 "
-        'arm inspects, and it is what makes the ^1 mix-up reachable'
+
+def _build_fast_forward_then_unrelated_merge(root: Path) -> None:
+    """Land ``task/T`` by fast-forward, then merge an unrelated branch on main."""
+    _new_repo(root)
+    _commit(root, 'base', 'base.txt', date=_PINNED_DATE)
+    _git(root, 'checkout', '-b', f'task/{TASK_ID}')
+    _commit(root, 'work', 'work.txt', date=_PINNED_DATE)
+    _git(root, 'checkout', '-b', 'f1', 'main')
+    _commit(root, 'side', 'side.txt', date=_PINNED_DATE)
+
+    _git(root, 'checkout', 'main')
+    _git(root, 'merge', '--ff-only', f'task/{TASK_ID}')
+    assert _git(root, 'rev-parse', 'main') == _git(root, 'rev-parse', f'task/{TASK_ID}'), (
+        'task/T must land with NO merge commit, so the later merge is unrelated to it'
     )
+    _git(root, 'merge', '--no-ff', 'f1', '-m', 'Merge', date=_PINNED_DATE)
 
-    # (1) The first parent is the TASK side, not main.
-    assert _git(root, 'rev-parse', f'{merge}^1') == task_tip
-    assert _git(root, 'rev-parse', f'{merge}^2') == mainadv
 
-    candidate = _candidate_topo(root, TASK_ID)
-    assert candidate == merge, 'the ladder must select this merge as the candidate'
+def test_a_branch_side_landing_is_the_same_history_as_a_fast_forward_then_an_unrelated_merge(
+    tmp_path: Path,
+) -> None:
+    """Git records no merge direction, so ``contained-before rc=0`` can be undecided.
 
-    # (2) The runbook's check on ^1 gives the FALSE "do not stamp" verdict...
-    assert _contained_before(root, TASK_ID, f'{candidate}^1') == 0, (
-        'with the task tip at ^1 the containment check exits 0 trivially, which the '
-        'rc=0 arm reads as "unrelated later merge, do not stamp" -- a false skip of a '
-        'merge sha the agent was already holding'
+    Story A lands ``task/T`` through a merge built on the branch side: that
+    merge IS the landing.  Story B fast-forwards main onto ``task/T``, then
+    merges an unrelated branch on main: that merge must NOT be stamped.  With
+    one pinned date and identical subjects the two are byte-identical, so no
+    git query can tell them apart.  Where merge direction is unknown, rc=0 is
+    therefore undecided, and the citation gate is the only exit safe for both.
+    """
+    a, b = tmp_path / 'a', tmp_path / 'b'
+    _build_branch_side_landing(a)
+    _build_fast_forward_then_unrelated_merge(b)
+
+    for ref in ('main', f'task/{TASK_ID}'):
+        assert _git(a, 'rev-parse', ref) == _git(b, 'rev-parse', ref), (
+            f'the two stories must be one commit graph, sha for sha, at {ref} -- that is '
+            'why no git query can tell them apart'
+        )
+
+    candidate = _candidate_topo(a, TASK_ID)
+    assert candidate == _git(a, 'rev-parse', 'main')
+    assert _contained_before(a, TASK_ID, f'{candidate}^1') == 0, (
+        'the task tip is ^1, so the arm takes its "do not stamp" exit -- wrong for story '
+        'A, right for story B'
     )
-
-    # (3) ...while the main-side parent gives the correct one.
-    assert _contained_before(root, TASK_ID, f'{candidate}^2') == 1, (
-        'against the MAIN-side parent the branch is correctly not-yet-contained: this '
-        'IS the merge that brought it in'
+    assert _contained_before(a, TASK_ID, f'{candidate}^2') == 1, (
+        'a "^2 instead" remedy would stamp -- right for story A, a fabricated stamp for '
+        'story B'
     )
 
 
 def test_a_merge_created_on_main_puts_main_at_caret_1(tmp_path: Path) -> None:
-    """The control for the pin above: merge direction is what decides ``^1``.
+    """The control for the branch-side identity pin: merged FROM main, ``^1`` is main.
 
-    Same history, merged the dark-factory way (``git merge --no-ff
-    task/T`` from main).  Here ``^1`` IS main-just-before-the-merge and the
-    containment check renders the correct verdict, so the previous test
-    pins a direction-dependent hazard rather than a universal one.
+    Merged the dark-factory way (``git merge --no-ff task/T`` from main),
+    ``^1`` IS main-just-before-the-merge and the containment check renders
+    the correct verdict, so the ambiguity
+    ``test_a_branch_side_landing_is_the_same_history_as_a_fast_forward_then_an_unrelated_merge``
+    pins exists only where merge direction is unknown.
     """
     root = tmp_path / 'repo'
     _new_repo(root)
@@ -378,8 +387,8 @@ def test_a_merge_created_on_main_puts_main_at_caret_1(tmp_path: Path) -> None:
     assert candidate == merge
     assert _contained_before(root, TASK_ID, f'{candidate}^1') == 1, (
         'merged from main, the documented ^1 check renders the correct "this IS the '
-        'merge that brought it in" verdict -- so the hazard above is about merge '
-        'DIRECTION, not about the check itself'
+        'merge that brought it in" verdict -- so the ambiguity above is about unknown '
+        'merge DIRECTION, not about the check itself'
     )
 
 
@@ -388,9 +397,9 @@ def test_an_already_landed_branch_yields_the_arms_legitimate_rc0_verdict(
 ) -> None:
     """The arm's CORRECT rc=0 exit: a real candidate exists, and must NOT be stamped.
 
-    The two pins above are both FALSE rc=0 verdicts (wrong candidate under date
-    order; branch-side ``^1``) and the ones below assert the positive "stamp it"
-    arm, so nothing yet executes the outcome rc=0 actually exists to produce.
+    The pins above are FALSE or undecided rc=0 verdicts (wrong candidate under
+    date order; unknown merge direction) and the ones below assert the positive
+    "stamp it" arm, so nothing yet executes the outcome rc=0 actually exists to produce.
     This is that mirror.
 
     ``task/T`` never advances past its creation point, so it is already
