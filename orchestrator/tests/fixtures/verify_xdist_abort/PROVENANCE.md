@@ -48,9 +48,13 @@ partial progress. So no single piece of evidence covers every shape, which is
 why INFRA_ABORT has an **rc arm** (shell-reported 128+SIGTERM/SIGINT/SIGHUP)
 and a **text arm** (the signature).
 
-Hypothesis (not measured): in production, `uv run` forwards SIGTERM to its
-direct child, the pytest controller, and that produces the controller-only
-shape.
+Measured under verify's real `uv run` wrapper (`shape1_uv_forwarded_sigterm.log`):
+`uv run` forwards a SIGTERM to its direct child, the pytest controller, and
+only to it. The workers outlive the controller and emit the signature. uv then
+exits 143 itself, so the `/bin/bash -c` wrapper prints no `Terminated`, and the
+unterminated last progress line is glued to the first worker warning's path.
+
+Hypothesis: in production, the SIGTERM is delivered to uv.
 
 ## Recipe
 
@@ -59,7 +63,7 @@ CPython 3.13.9 (`/home/leo/src/dark-factory/.venv/bin/python`, written `$PY` bel
 
 - Scratch suite in a fresh `/tmp` dir, never in a worktree. `pytest.ini` is
   exactly `[pytest]\naddopts =\n`.
-  - Shapes 1 (both variants): `test_slow.py` with 400 tests, each `time.sleep(0.5)`.
+  - Shape 1 (every variant): `test_slow.py` with 400 tests, each `time.sleep(0.5)`.
   - Shape 3: `test_many.py` with 10000 tests, each `time.sleep(0.05)`.
 - Launch: `setsid /bin/bash -c "cd <suite> && $PY -m pytest -n 8 -q --tb=short -p no:cacheprovider <file>; exit \$?" > <log> 2>&1 &`, then `B=$!`.
 - Wait until a progress line (`\[ *[0-9]*%\]`) appears. For shape 3, wait for `\[ *0%\]`.
@@ -68,7 +72,8 @@ CPython 3.13.9 (`/home/leo/src/dark-factory/.venv/bin/python`, written `$PY` bel
 
 The `Terminated` text glued to the last progress line in shapes 1 and 3 is the
 `/bin/bash -c` wrapper reporting its child's death. verify's own `_run_cmd`
-interposes the same shell.
+interposes the same shell. Under `uv run`, the glued text is a surviving
+worker's warning path instead.
 
 ## Files
 
@@ -95,6 +100,18 @@ interposes the same shell.
 | **Size** | 4 lines / 130 bytes, no trailing newline |
 | **Content** | `bringing up nodes...` x2, partial progress, **0 signature pairs**, 0 failure lines |
 | **Models** | The shape-1 kill delivered to the group. Only the rc arm can catch it: replayed at rc=1 it must stay `unknown_test_failure` |
+
+### `shape1_uv_forwarded_sigterm.log`
+
+| | |
+|---|---|
+| **Produced** | 2026-10-07, plan-time capture `/tmp/4843-glue/uv_xdist_term.keep.log`, copied with `cp` |
+| **How** | Recipe above, 400-test suite, with three changes: the launch is `setsid /bin/bash -c "cd <suite> && uv run --no-project --python $PY python -m pytest -n 8 -q --tb=short -p no:cacheprovider test_slow.py; exit \$?"`; the kill is `kill -TERM "$(pgrep -P "$B" | head -1)"`, where that pid is **uv**, not pytest; and the wait adds ~0.3s after the first progress line so the partial line is non-empty. uv 0.11.6, bash 5.2.21 |
+| **Measured rc** | 143 |
+| **sha256** | `dc49df7678d19d13bffa2a7ca63b0bea5a3d5abba7840a26bef5d1067a80fec8` |
+| **Size** | 44 lines / 3691 bytes |
+| **Content** | `bringing up nodes...` x2, progress stopped at 18%, the unterminated partial line `........` glued to the first worker warning's path, 8 signature pairs, 0 `FAILED`/`ERROR`/`INTERNALERROR` lines |
+| **Models** | Shape 1 under verify's real `uv run` wrapper: no `Terminated`, because uv itself exits 143 |
 
 ### `shape3_bringup_sigterm.log`
 
@@ -130,3 +147,6 @@ classify_failure(ToolKind.PYTEST, 143, <file>, False) == 'unknown_test_failure'
 classify_failure(ToolKind.PYTEST, 1,   <file>, False) == 'unknown_test_failure'
 verify._is_bare_xdist_worker_crash(<file>)            is False
 ```
+
+`shape1_uv_forwarded_sigterm.log`, added later the same day, was measured the
+same way: `classify_failure(PYTEST, 143|1, <file>, False) == 'unknown_test_failure'`.

@@ -284,6 +284,15 @@ def _with_line(text: str, line: str) -> str:
     return f'{text}{separator}{line}\n'
 
 
+def _rewrite(text: str, old: str, new: str) -> str:
+    assert text.count(old) == 1, f'fixture drift: {old!r} is not unique'
+    return text.replace(old, new)
+
+
+# The group-kill log ends in its unterminated partial progress line.
+_GROUP_KILL_TAIL = ' [ 18%]\n.......'
+
+
 def _xdist_test_leg(rc: int, output: str, *, timed_out: bool = False):
     """(category, failing_leg_categories) for a red test leg, lint/type green."""
     _, category, _, _, failing = _summarize_checks(
@@ -382,6 +391,111 @@ class TestVerdictlessXdistExitIsInfraAbort:
             _xdist_abort_log('shape1_controller_sigterm.log'),
             _KILLED_PROGRESS_WITH_F.replace('F', status_char),
         )
+        category, _ = _xdist_test_leg(143, output)
+        assert category == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    @pytest.mark.parametrize('rc', [143, 1])
+    def test_uv_forwarded_sigterm_is_infra_abort(self, rc):
+        """Production shape: uv forwards the SIGTERM to the controller only,
+        so the partial line is glued to a worker's warning path. The glued
+        '........' carries no F/E, and the 8 'For more information see …'
+        lines are prose that opens with F. Neither may veto."""
+        output = _xdist_abort_log('shape1_uv_forwarded_sigterm.log')
+        assert '\nFor more information see ' in output
+        category, _ = _xdist_test_leg(rc, output)
+        _assert_infra_abort(category)
+
+    @pytest.mark.parametrize('rc', [143, 1])
+    @pytest.mark.parametrize('status_char', ['F', 'E'])
+    def test_failure_char_before_glued_terminated_vetoes_the_abort(
+        self, status_char, rc,
+    ):
+        """Rule: a killed -q session prints no short summary, so an F or E
+        anywhere in its progress, including the unterminated final line, is
+        the only failure evidence and must veto. Here bash's 'Terminated' is
+        glued onto that line; rc=1 shows the veto also beats the text arm."""
+        output = _rewrite(
+            _xdist_abort_log('shape1_controller_sigterm.log'),
+            '\n..Terminated\n', f'\n..{status_char}.Terminated\n',
+        )
+        category, _ = _xdist_test_leg(rc, output)
+        assert category == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    @pytest.mark.parametrize('status_char', ['F', 'E'])
+    def test_failure_char_opening_the_partial_line_vetoes_the_abort(
+        self, status_char,
+    ):
+        """Rule: a killed -q session prints no short summary, so an F or E
+        anywhere in its progress, including the very first char of the
+        unterminated final line, is the only failure evidence and must veto."""
+        output = _rewrite(
+            _xdist_abort_log('shape1_controller_sigterm.log'),
+            '\n..Terminated\n', f'\n{status_char}Terminated\n',
+        )
+        category, _ = _xdist_test_leg(143, output)
+        assert category == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    @pytest.mark.parametrize('rc', [143, 1])
+    @pytest.mark.parametrize('status_char', ['F', 'E'])
+    def test_failure_char_in_bringup_partial_line_vetoes_the_abort(
+        self, status_char, rc,
+    ):
+        """Rule: a killed -q session prints no short summary, so an F or E
+        anywhere in its progress, including the unterminated final line, is
+        the only failure evidence and must veto, on shape 3 as on shape 1."""
+        output = _rewrite(
+            _xdist_abort_log('shape3_bringup_sigterm.log'),
+            '\n....Terminated\n', f'\n..{status_char}..Terminated\n',
+        )
+        category, _ = _xdist_test_leg(rc, output)
+        assert category == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    @pytest.mark.parametrize('rc', [143, 1])
+    @pytest.mark.parametrize('status_char', ['F', 'E'])
+    def test_failure_char_glued_to_worker_warning_path_vetoes_the_abort(
+        self, status_char, rc,
+    ):
+        """Rule: a killed -q session prints no short summary, so an F or E
+        anywhere in its progress, including the unterminated final line, is
+        the only failure evidence and must veto. In the production shape the
+        glued suffix is a worker's warning path, not a bash word, so a
+        closed list of bash job-status words would miss it."""
+        output = _rewrite(
+            _xdist_abort_log('shape1_uv_forwarded_sigterm.log'),
+            '\n......../home/', f'\n...{status_char}..../home/',
+        )
+        category, _ = _xdist_test_leg(rc, output)
+        assert category == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    @pytest.mark.parametrize('status_char', ['F', 'E'])
+    def test_failure_char_glued_to_bash_job_report_vetoes_the_abort(
+        self, status_char,
+    ):
+        """Rule: a killed -q session prints no short summary, so an F or E
+        anywhere in its progress, including the unterminated final line, is
+        the only failure evidence and must veto. Here bash's pretty-print
+        job report for a SIGHUP is glued onto that line (bash 5.2.21)."""
+        text = _xdist_abort_log('shape1_group_sigterm.log')
+        assert text.endswith(_GROUP_KILL_TAIL)
+        output = _rewrite(
+            text, _GROUP_KILL_TAIL,
+            f' [ 18%]\n..{status_char}./bin/bash: line 1: 1854676 Hangup'
+            '                  /x/python -m pytest -n 8 -q\n',
+        )
+        category, _ = _xdist_test_leg(129, output)
+        assert category == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    @pytest.mark.parametrize('status_char', ['F', 'E'])
+    def test_failure_char_in_partial_line_at_eof_vetoes_the_abort(
+        self, status_char,
+    ):
+        """Rule: a killed -q session prints no short summary, so an F or E
+        anywhere in its progress, including the unterminated final line, is
+        the only failure evidence and must veto. Here nothing is glued on:
+        the partial line simply ends at EOF."""
+        text = _xdist_abort_log('shape1_group_sigterm.log')
+        assert text.endswith(_GROUP_KILL_TAIL)
+        output = _rewrite(text, _GROUP_KILL_TAIL, f' [ 18%]\n...{status_char}...')
         category, _ = _xdist_test_leg(143, output)
         assert category == FailureCategory.UNKNOWN_TEST_FAILURE
 
