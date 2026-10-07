@@ -259,9 +259,11 @@ class TestCensus:
 
 class TestFirstPartyIsTheDomain:
     def test_scripts_is_the_import_root_so_legibility_modules_are_dotted(self, scripts):
-        """PRD decision 3 makes scripts/ the import root, so a bare legibility module name is not first-party."""
         assert scripts.distinct_private_targets == frozenset({'legibility.ledger._x', 'tool._y'})
         assert scripts.tests_with_private_patch == 3
+
+    def test_a_bare_legibility_module_name_is_the_disclosed_undercount(self, scripts):
+        assert 'ledger._x' not in scripts.distinct_private_targets
 
     def test_a_member_namespace_package_without_init_is_first_party(self, pkgb):
         assert pkgb.distinct_private_targets == frozenset({'nsb.state._s'})

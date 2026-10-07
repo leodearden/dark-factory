@@ -440,9 +440,14 @@ A test file is a tracked `.py` file under a workspace member's tests root, as
 `source_measures.workspace_domain` classifies it: each member listed in the root
 pyproject.toml's `[tool.uv.workspace].members` (`{_DECLARED_TESTS_ROOT}/`), plus the
 pseudo-members {_PSEUDO_MEMBERS_TEXT}. Its package is its member. First-party
-names are the import names of the domain's source files, so `scripts/` is an
-import root and `scripts/legibility/x.py` is `legibility.x`. Rows are in
-package-name order and are not ranked.
+names are the import names of the domain's source files whose every dotted
+segment is an identifier, so `scripts/` is an import root and
+`scripts/legibility/x.py` is `legibility.x`. A module has no other name here:
+`scripts/tests/conftest.py` also puts `scripts/legibility/` and
+`scripts/local-model-serving/` on `sys.path`, so a test that imports one of
+their modules by its bare name (`import census`) is not seen to import
+first-party code, and its private patches and prose asserts are undercounted.
+Rows are in package-name order and are not ranked.
 
 - **test fns**: module-level `test*` functions and `test*` methods of `Test*`
   classes (nested `Test*` classes included), in `test_*.py` / `*_test.py` files.
