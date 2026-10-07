@@ -773,6 +773,18 @@ def _run_failure_log_fields(run_id: str, record: Mapping[str, object]) -> str:
     )
 
 
+async def _run_failure_bookkeeping(write: Awaitable[object], *, what: str, run_id: str) -> None:
+    """One write of ``run_full_cycle``'s failure handler; an Exception is logged
+    with its classification and never replaces the failure being handled."""
+    try:
+        await write
+    except Exception as err:
+        logger.error(
+            '%s failed after run failure: %r (%s)',
+            what, err, _run_failure_log_fields(run_id, _sqlite_classification(err)),
+        )
+
+
 def _log_dropped_escalation(category: str, run_id: str, summary: str, *, reason: str) -> None:
     logger.warning(
         'reconciliation.escalation_dropped (%s): category=%s run_id=%s summary=%s',
@@ -4051,11 +4063,18 @@ class ReconciliationHarness:
                     )
                     run.status = RunStatus.failed
                     run.stage_reports['_error'] = failure
-                    await self.journal.complete_run(run_id, 'failed')
-                    await self.buffer.restore_drained(project_id)
+                    # Filed first: a failing or cancelled bookkeeping write below must not lose it (esc-5545-1).
                     self._escalate(
                         'recon_failure', run_id,
                         f'Stage {current_stage_name} failed: {e}',
+                    )
+                    await _run_failure_bookkeeping(
+                        self.journal.complete_run(run_id, 'failed'),
+                        what='complete_run(failed)', run_id=run_id,
+                    )
+                    await _run_failure_bookkeeping(
+                        self.buffer.restore_drained(project_id),
+                        what='restore_drained', run_id=run_id,
                     )
                     raise
 
