@@ -14,13 +14,24 @@ import json
 import logging
 import os
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from escalation.queue import EscalationQueue
+from shared.config_dir import TaskConfigDir
 
-from orchestrator.config import GitConfig
+# Reused read-only, as test_task_verify_lease.py::_build_task_workflow does:
+# the factory that builds a TaskWorkflow with every collaborator mocked.
+from test_workflow_verify_retry import _make_workflow
+
+from orchestrator.agents.invoke import AgentResult
+from orchestrator.agents.roles import SIMPLE_TASK
+from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
 from orchestrator.lane_lifecycle import LaneLifecycle, LaneState
+from orchestrator.scheduler import TaskAssignment
+from orchestrator.verify import VerifyResult
+from orchestrator.workflow import TaskWorkflow
 
 LANE_NAME = '_lane-0'
 
@@ -510,3 +521,150 @@ class TestLaneInUseNesting:
         assert reset == [fossil.name]
         assert live_inside == 'in_use'
         assert _lane_state(git_ops, fossil) == 'assigned'
+
+
+# ---------------------------------------------------------------------------
+# The five workflow spawn sites (PRD §11 q2). One spy per structurally
+# distinct site, so unwrapping any single site fails exactly one test.
+# ---------------------------------------------------------------------------
+
+
+async def _workflow_in_lane(tmp_path: Path) -> tuple[TaskWorkflow, GitOps, Path]:
+    """A TaskWorkflow whose worktree IS a warm lane assigned to its task."""
+    git_ops = _git_ops(tmp_path, pool_size=1)
+    config = OrchestratorConfig(project_root=git_ops.project_root, git=git_ops.config)
+    lane = await _assigned_lane(git_ops, '42')
+    assignment = TaskAssignment(
+        task_id='42',
+        task={
+            'id': '42', 'title': 'X', 'description': '',
+            'status': 'pending', 'metadata': {'files': ['lib']},
+            'dependencies': [],
+        },
+        modules=['lib'],
+    )
+    workflow, _artifacts = _make_workflow(config, git_ops, assignment, lane)
+    return workflow, git_ops, lane
+
+
+def _passing_result() -> VerifyResult:
+    return VerifyResult(
+        passed=True, test_output='', lint_output='', type_output='',
+        summary='ok', timed_out=False,
+    )
+
+
+class _StopMergePhase(Exception):
+    """Raised by the merge-phase spy to unwind before the merge-queue submit."""
+
+
+@pytest.mark.asyncio
+class TestWorkflowSpawnSitesHoldTheSpan:
+    async def test_agent_invocation(self, tmp_path: Path, monkeypatch):
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+        workflow, git_ops, lane = await _workflow_in_lane(tmp_path)
+        workflow._config_dir = TaskConfigDir('42', base_dir=lane / '.task')
+        seen: list[str] = []
+
+        def _agent(**_kwargs) -> AgentResult:
+            seen.append(_lane_state(git_ops, lane))
+            return AgentResult(success=True, output='')
+
+        monkeypatch.setattr(
+            'orchestrator.workflow.invoke_with_cap_retry', AsyncMock(side_effect=_agent),
+        )
+        await TaskWorkflow._invoke(workflow, SIMPLE_TASK, 'p', lane)
+
+        assert seen == ['in_use'], 'AGENT site: _invoke must spawn inside lane_in_use'
+        assert _lane_state(git_ops, lane) == 'assigned'
+
+    async def test_implement_phase_verify(self, tmp_path: Path, monkeypatch):
+        workflow, git_ops, lane = await _workflow_in_lane(tmp_path)
+        seen: list[str] = []
+
+        def _verify(*_args, **_kwargs) -> VerifyResult:
+            seen.append(_lane_state(git_ops, lane))
+            return _passing_result()
+
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification', AsyncMock(side_effect=_verify),
+        )
+        await workflow._run_scoped_verification_with_infra_retry(verify_attempt=0)
+
+        assert seen == ['in_use'], (
+            'IMPLEMENT-PHASE VERIFY site: the verify must run inside lane_in_use'
+        )
+        assert _lane_state(git_ops, lane) == 'assigned'
+
+    async def test_merge_phase_reverify(self, tmp_path: Path, monkeypatch):
+        workflow, git_ops, lane = await _workflow_in_lane(tmp_path)
+        workflow._maybe_defer_as_train_member = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        workflow._enter_phase = MagicMock()  # type: ignore[method-assign]
+        workflow._check_scope_invariant = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        workflow._recover_before_merge = AsyncMock(return_value=None)  # type: ignore[method-assign]
+        git_ops.get_main_sha = AsyncMock(return_value='mainsha')  # type: ignore[method-assign]
+        git_ops.rebase_onto_main = AsyncMock(return_value=True)  # type: ignore[method-assign]
+        seen: list[str] = []
+
+        def _reverify_then_bail(*_args, **_kwargs) -> VerifyResult:
+            seen.append(_lane_state(git_ops, lane))
+            raise _StopMergePhase()
+
+        monkeypatch.setattr(
+            'orchestrator.workflow.run_scoped_verification',
+            AsyncMock(side_effect=_reverify_then_bail),
+        )
+        monkeypatch.setattr(
+            'orchestrator.workflow._run', AsyncMock(return_value=(0, 'headsha\n', '')),
+        )
+        with pytest.raises(_StopMergePhase):
+            await workflow._run_merge_phase('task/42')
+
+        assert seen == ['in_use'], (
+            'MERGE-PHASE RE-VERIFY site: the post-rebase re-verify must run '
+            'inside lane_in_use'
+        )
+        assert _lane_state(git_ops, lane) == 'assigned'
+
+    async def test_venv_sync(self, tmp_path: Path, monkeypatch):
+        workflow, git_ops, lane = await _workflow_in_lane(tmp_path)
+        (lane / 'lib').mkdir()
+        (lane / 'lib' / 'pyproject.toml').write_text(
+            '[project]\nname = "lib"\n\n'
+            '[tool.uv.sources]\nshared = { path = "../shared", editable = true }\n'
+        )
+        seen: list[str] = []
+
+        async def _uv_sync(*_args, **_kwargs) -> MagicMock:
+            seen.append(_lane_state(git_ops, lane))
+            proc = MagicMock(returncode=0)
+            proc.communicate = AsyncMock(return_value=(b'', None))
+            return proc
+
+        monkeypatch.setattr(
+            'orchestrator.workflow.asyncio.create_subprocess_exec', _uv_sync,
+        )
+        await workflow._sync_worktree_venvs()
+
+        assert seen == ['in_use'], 'VENV SYNC site: uv sync must run inside lane_in_use'
+        assert _lane_state(git_ops, lane) == 'assigned'
+
+    async def test_dry_run_investigator(self, tmp_path: Path, monkeypatch):
+        workflow, git_ops, lane = await _workflow_in_lane(tmp_path)
+        workflow.config.unblock_auto.enabled = True
+        seen: list[str] = []
+
+        async def _investigate(**_kwargs) -> None:
+            seen.append(_lane_state(git_ops, lane))
+
+        monkeypatch.setattr('orchestrator.workflow.run_dry_run_unblock', _investigate)
+        workflow._spawn_dry_run_unblock('blocked: demo', 'detail')
+        spawned = [t for t in asyncio.all_tasks() if t.get_name() == 'unblock-auto-42']
+        assert len(spawned) == 1
+        await spawned[0]
+
+        assert seen == ['in_use'], (
+            'DRY-RUN INVESTIGATOR site: the background investigation must run '
+            'inside lane_in_use'
+        )
+        assert _lane_state(git_ops, lane) == 'assigned'
