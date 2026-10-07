@@ -6903,7 +6903,13 @@ class MemoryService:
         - only FAILED mem0 backend_op(s) → ``add()`` raised. In the common
           (clean, pre-persist) failure mem0 did not land, so re-issue is safe
           (0 prior writes + 1 = 1): rebuild ``Scope`` + metadata and call
-          ``mem0.add``; ``completed`` on success, ``dead`` on error.
+          ``mem0.add``; ``completed`` on success, ``dead`` on error. The
+          re-issue goes through ``_journaled_backend_call`` under the intent's
+          own ``write_op_id``, so a crash after a successful re-issue leaves a
+          SUCCESS mem0 backend_op and the next startup reconciles the intent
+          ``completed`` instead of re-issuing again; the only remaining window
+          is the instant between ``mem0.add`` returning and its backend_op
+          committing — the same window add_memory's own leg has.
           RESIDUAL DUPLICATE RISK (accepted, documented): a failure raised
           AFTER mem0 committed but at/near the response (e.g. a read-timeout
           on an otherwise-successful add) ALSO records a FAILED backend_op
@@ -6965,10 +6971,16 @@ class MemoryService:
                         session_id=intent.get('session_id'),
                     )
                     metadata = json.loads(intent.get('metadata') or '{}')
-                    await self.mem0.add(
-                        content=intent.get('content') or '',
-                        scope=scope,
-                        metadata=metadata,
+                    content = intent.get('content') or ''
+                    await self._journaled_backend_call(
+                        write_op_id=write_op_id,
+                        causation_id=intent.get('causation_id'),
+                        backend='mem0',
+                        operation='add',
+                        payload={'content': content[:200]},
+                        coro=self.mem0.add(
+                            content=content, scope=scope, metadata=metadata
+                        ),
                     )
                     await self._write_journal.resolve_mem0_intent(
                         intent_id,
