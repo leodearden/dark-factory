@@ -87,6 +87,7 @@ from orchestrator.landing_evidence import (
 )
 from orchestrator.lane_lifecycle import LaneRecord
 from orchestrator.lane_lifecycle import LaneState as DurableLaneState
+from orchestrator.main_tip_sweep_cadence import MainSweepColdControl, SweepSeedMode
 from orchestrator.mcp_lifecycle import McpLifecycle
 from orchestrator.merge_queue import (
     enqueue_merge_request,
@@ -2071,6 +2072,8 @@ class Harness:
         # Last main SHA successfully swept; used to skip the expensive full
         # verify when main has not advanced since the previous pass.
         self._last_swept_main_sha: str | None = None
+        # Bound on the first sweep tick, once run() has opened runs.db (task 5812).
+        self._main_sweep_cold_control: MainSweepColdControl | None = None
 
         # Deterministic-strand reconciliation sweep — task 2074.
         # Periodic recovery sweep for deterministic gate/deploy tasks stranded
@@ -14881,6 +14884,19 @@ class Harness:
 
         return cancelled
 
+    def _main_sweep_cold_control_for_tick(self) -> MainSweepColdControl:
+        """The sweep's cold-control cadence, bound on first use.
+
+        Lazy because run() opens the RunStore after __init__, and the sweep
+        BackgroundService only ticks after that.  With no RunStore the cadence
+        is in-memory only, so a restart runs the next sweep cold.
+        """
+        if self._main_sweep_cold_control is None:
+            self._main_sweep_cold_control = MainSweepColdControl(
+                self._run_store, self.config.fused_memory.project_id,
+            )
+        return self._main_sweep_cold_control
+
     async def _run_main_tip_sweep(self) -> None:
         """Single testable pass of the main-tip integrity sweep.
 
@@ -14907,6 +14923,12 @@ class Harness:
         above cannot.  Confirmed-flake (``False``) suppresses the alarm
         without self-healing; confirmed-real (``True``) files it exactly as
         before.
+
+        Each sweep's seed mode comes from ``MainSweepColdControl`` (task 5812):
+        warm by default, cold at most once per
+        ``main_tip_sweep_cold_interval_secs``, persisted in runs.db.  Only a
+        cold sweep that reached a verdict resets that clock.  SHA dedup still
+        gates every sweep, so a due cold control waits for main to advance.
         """
         from orchestrator import critical_gate  # noqa: PLC0415
         from orchestrator import verify as verify_mod  # noqa: PLC0415
@@ -14920,11 +14942,21 @@ class Harness:
         if main_sha == self._last_swept_main_sha:
             return
 
+        control = self._main_sweep_cold_control_for_tick()
+        seed_mode: SweepSeedMode = control.seed_mode(
+            self.config.main_tip_sweep_cold_interval_secs
+        )
+        logger.info(
+            'Main-tip integrity sweep: verifying %s with a %s build '
+            '(last cold verdict: %s)',
+            main_sha[:12], seed_mode, control.last_cold_verdict_at or 'never',
+        )
+
         # Pass the already-resolved SHA so verify skips a second git rev-parse
         # and both the dedup gate and the worktree pin use the same value
         # (closes the TOCTOU window — suggestion 2 from the code review).
         outcome = await verify_mod.run_main_tip_sweep(
-            self.config, self.git_ops, main_sha=main_sha
+            self.config, self.git_ops, main_sha=main_sha, seed_mode=seed_mode,
         )
         if outcome is None:
             # Infra failure in the sweep itself — retry next tick, don't mark swept.
@@ -14932,6 +14964,12 @@ class Harness:
 
         swept_sha, vr = outcome
         self._last_swept_main_sha = swept_sha
+        control.record_verdict(seed_mode, swept_sha)
+        logger.info(
+            'Main-tip integrity sweep: %s build of %s %s (%s)',
+            seed_mode, swept_sha[:12], 'passed' if vr.passed else 'failed',
+            vr.category,
+        )
 
         if vr.passed:
             await self._close_superseded_main_sweep_escalations(swept_sha)
