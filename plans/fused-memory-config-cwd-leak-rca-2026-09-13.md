@@ -120,7 +120,8 @@ concurrency lock on neither; taking them would widen its footprint into files an
 editing concurrently. By design, the two fixtures are not yet the same fixture: the orchestrator's
 pins a `project_root` at `tmp_path` and reads a prefixed `ORCH_` env surface, while fused-memory's
 scrubs an UNPREFIXED surface derived from `model_fields`, adds three YAML interpolation names, and
-deliberately does not pin a project root. A factory written today would take all of that as
+deliberately did not pin a project root (task 5481 later pinned the path leaves at `tmp_path`; see *Closed by
+task 5481*). A factory written today would take all of that as
 parameters — a design question, not a copy-paste. It is filed as a follow-up so the third
 `BaseSettings` subproject does not need a third copy, and recorded here so a later reader can tell
 "not considered" from "considered and scoped out".
@@ -163,7 +164,8 @@ inherited value won.
 
 ## The residual: resolution is CWD-independent, the leaves are not
 
-The pin fixes which FILE is read, not what that file's values denote. Measured under the pin:
+The pin fixes which FILE is read, not what that file's values denote. Measured under the task-5444
+pin (historical — closed by task 5481, below):
 
 | leaf | value |
 |---|---|
@@ -171,18 +173,24 @@ The pin fixes which FILE is read, not what that file's values denote. Measured u
 | `reconciliation.explore_codebase_root` | `.` |
 | `queue.data_dir` | `./data/queue` |
 | `reconciliation.data_dir` | `./data/reconciliation` |
+| `reconciliation.escalation_queue_dir` | `./data/reconciliation/escalations` |
 
-Two `FusedMemoryConfig()` constructions either side of a `chdir` therefore produce byte-identical
-`model_dump()`s that denote different directories. That is a weaker invariant than "the config does
+The fifth row was missing from this table as first written; it is driven by
+`${RECONCILIATION_DATA_DIR:./data/reconciliation}/escalations`, the same variable as the fourth.
+
+Two `FusedMemoryConfig()` constructions either side of a `chdir` therefore produced byte-identical
+`model_dump()`s that denoted different directories. That is a weaker invariant than "the config does
 not depend on the CWD" sounds, and reading the dump equality as semantic equality would be the same
 false-assurance shape that produced the phantom red in the first place, so
-`test_config_hermeticity.py` states BOTH halves executably: the dump equality, and a companion test
-asserting that the same relative leaf resolves to two different directories.
+`test_config_hermeticity.py` stated BOTH halves executably: the dump equality, and a companion test
+asserting that the same relative leaf resolves to two different directories. Task 5481 inverted
+that companion test.
 
 The orchestrator's fixture closes this half by also pinning `ORCH_PROJECT_ROOT` at `tmp_path` — "the
-other load-bearing part", in its own docstring. The analogue is deliberately not taken here: it
-would change the value ~19.8k currently-green tests read, which is the collateral the design
-decision above rules out. Filed as a follow-up.
+other load-bearing part", in its own docstring. The analogue was deliberately not taken under task
+5444: it would have changed the value ~19.8k currently-green tests read, which was the collateral
+the design decision above ruled out. It was filed as a follow-up and taken by task 5481 — see
+*Closed by task 5481* below.
 
 What **is** closed is the ambient half of it. Measured with `CONFIG_PATH` already pinned at the
 canonical file, `PROJECT_ROOT=/pwned-by-env` resolved *both* `taskmaster.project_root` and
@@ -192,13 +200,53 @@ interpolation is a **third** environment surface: pydantic never sees it, so the
 is a real launch condition rather than a contrived one — this repo's operator scripts export
 `PROJECT_ROOT` (`scripts/memory-metadata-coverage-census.sh` and two siblings), and the census
 timer's installed systemd unit carries it in the same env block as `CONFIG_PATH`
-(`scripts/tests/test_install_memory_metadata_coverage_census_timer.py` pins that trio). So `_isolate_fm_config` now deletes
-the three interpolation variables that redirect a path leaf: `PROJECT_ROOT`, `QUEUE_DATA_DIR`,
-`RECONCILIATION_DATA_DIR`. Deleting is free where pinning is not — all three are unset under both
-registered verify commands, and the two tests that set `PROJECT_ROOT` do so function-scoped and
-still win. They are listed by name rather than derived, because deriving the interpolation surface
-from the file would sweep in `${OPENAI_API_KEY}` and `${FALKORDB_URI:...}`, which the config reads
-from the environment *by design*.
+(`scripts/tests/test_install_memory_metadata_coverage_census_timer.py` pins that trio). So task
+5444 made `_isolate_fm_config` delete the three interpolation variables that redirect a path leaf:
+`PROJECT_ROOT`, `QUEUE_DATA_DIR`, `RECONCILIATION_DATA_DIR`. Deleting was free where pinning was not
+— all three are unset under both registered verify commands, and the two tests that set
+`PROJECT_ROOT` do so function-scoped and still win. They are listed by name rather than derived,
+because deriving the interpolation surface from the file would sweep in `${OPENAI_API_KEY}` and
+`${FALKORDB_URI:...}`, which the config reads from the environment *by design*. Task 5481 replaced
+the deletion with a pin; `setenv` overwrites an inherited value, so the ambient half stays closed.
+
+### Closed by task 5481
+
+**Mechanism.** `fused-memory/tests/conftest.py::_isolate_fm_config` now SETS the three YAML
+interpolation variables, rather than deleting them, to the test's `tmp_path` laid out as the YAML's
+own defaults: `PROJECT_ROOT=<tmp_path>`, `QUEUE_DATA_DIR=<tmp_path>/data/queue`,
+`RECONCILIATION_DATA_DIR=<tmp_path>/data/reconciliation`. The suite therefore reads the canonical
+config as a deployment rooted at the test's own tmp dir, and all five leaves follow, the escalation
+queue dir included, because the YAML stays the one place each leaf is tied to its variable. A
+test-body `setenv` of one of the three still wins.
+`fused-memory/tests/test_config_hermeticity.py::test_the_pin_anchors_every_path_leaf_in_the_tests_tmp_path`
+asserts it for all five leaves, and
+`::test_a_test_local_interpolation_override_still_reaches_the_config` pins the override.
+
+**Measurement**, with the registered module command
+`uv run --directory fused-memory pytest tests/ --tb=short -q --timeout=300`:
+
+- M1, setting the YAML variables (taken by the architect at `ae6cf64b1e` on a loaded host):
+  `1 failed, 26565 passed, 10 skipped, 4 xfailed` in 1172.50s. The one failure was the
+  characterization test, which this task inverts. Zero collateral.
+- M2, setting pydantic's nested names instead (`TASKMASTER__PROJECT_ROOT`, `QUEUE__DATA_DIR`,
+  `RECONCILIATION__DATA_DIR` and the other two leaves): `4 failed`. Two failed because the env layer
+  materialises a `taskmaster` section under `code_default_config`, where no YAML is loaded
+  (`test_config_hermeticity.py::test_code_default_config_yields_pure_code_defaults`,
+  `test_config_reload.py::TestDiffConfigOptionalSubmodels::test_opposite_toggles_bucket_whole_without_crash`).
+  One failed because env outranks the YAML, so the pin beat `test_link_heal_cli.py`'s OWN config
+  file's `reconciliation.data_dir`. M2 was rejected for that structural reason.
+- M1 as committed, inverted test included (`46ac82a768`): `26571 passed, 12 skipped, 4 xfailed`,
+  0 failed, in 576.04s.
+
+**What remains.** Under the opt-in `code_default_config` no YAML is loaded, so the leaves are the
+schema's relative defaults (`.`, `./data/queue`, …). Pinning them would need the env layer, which is
+M2's defect; that fixture's one user reads no path leaf.
+
+**Adjacent leak, out of scope.**
+`fused-memory/src/fused_memory/middleware/task_interceptor.py::_combine_audit_path` writes
+`data/combine_audit.jsonl` relative to the process CWD unless `DARK_FACTORY_DATA_DIR` is set. That
+is a module-level `os.getenv`, not a config leaf. The measurement runs created
+`fused-memory/data/combine_audit.jsonl` in the task worktree. Filed as task 6456.
 
 ## A second hole, confirmed and deliberately not fixed here
 
