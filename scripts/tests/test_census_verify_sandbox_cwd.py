@@ -24,6 +24,7 @@ scripts/tests/conftest.py) — and tests only census's OWN wiring.
 """
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import census as mod
@@ -98,6 +99,19 @@ def _poison(name):
     return _fn
 
 
+def _commit_all(repo):
+    """Make *repo* a git repo with one commit: main() resolves as_of_sha
+    from the censused project's HEAD."""
+    for args in (
+        ("init", "-q", "-b", "main"),
+        ("config", "user.email", "test@example.com"),
+        ("config", "user.name", "Test"),
+        ("add", "-A"),
+        ("commit", "-q", "-m", "fixture"),
+    ):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+
 @pytest.fixture
 def census_main(tmp_path, monkeypatch, fake_claude_cli, pool_roster, sentinel_login):
     """A launcher dir and a DIFFERENT target project root, cwd in the
@@ -109,6 +123,7 @@ def census_main(tmp_path, monkeypatch, fake_claude_cli, pool_roster, sentinel_lo
     launcher.mkdir()
     target.mkdir()
     _write_legibility_yaml(_default_config_path(target), project_root=target)
+    _commit_all(target)
 
     accounts_file, env_file = pool_roster("max-p")
     fake_claude_cli.plan(default={"result": _VERDICT})

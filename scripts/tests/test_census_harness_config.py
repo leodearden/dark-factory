@@ -12,6 +12,8 @@ scripts/tests/conftest.py) — mirroring test_census_verify_sandbox_cwd.py.
 """
 from __future__ import annotations
 
+import subprocess
+
 import census as mod
 import filing_policy
 from legibility import census_trigger, session_runner
@@ -52,6 +54,19 @@ def _make_fake_main_run_census():
     return fake_run_census
 
 
+def _commit_all(repo):
+    """Make *repo* a git repo with one commit: main() resolves as_of_sha
+    from the censused project's HEAD."""
+    for args in (
+        ("init", "-q", "-b", "main"),
+        ("config", "user.email", "test@example.com"),
+        ("config", "user.name", "Test"),
+        ("add", "-A"),
+        ("commit", "-q", "-m", "fixture"),
+    ):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+
 def _poison(name):
     """A seam fake that raises if ever called — proves a path is not taken."""
     def _fn(*args, **kwargs):
@@ -75,13 +90,14 @@ class _InertRunner:
 
 
 def _setup_main(tmp_path, monkeypatch):
-    """A target project with its own legibility.yaml, and every side effect
+    """A target git repo with its own legibility.yaml, and every side effect
     main() would really perform stubbed out. Returns (target, fake_run_census)."""
     target = tmp_path / "target"
     target.mkdir()
     _write_legibility_yaml(
         target / "docs" / "legibility" / "legibility.yaml", project_root=target,
     )
+    _commit_all(target)
     monkeypatch.setattr(
         session_runner, "open_pooled_runner", lambda *_args, **_kwargs: _InertRunner(),
     )

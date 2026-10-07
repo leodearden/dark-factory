@@ -84,10 +84,12 @@ class TrickleCensusCaps(BaseModel):
 
 class Census(BaseModel):
     """``census`` block — census-trigger (ζ), saturation tuning (PRD §5.2
-    points 6-7) and the nightly trickle's census launch caps."""
+    points 6-7), the nightly trickle's census launch caps, and the length of
+    the census mining window (which is also the session ledger's retention)."""
 
     model_config = ConfigDict(extra='allow')
 
+    ledger_retention_days: int = Field(default=30, ge=1, strict=True)
     max_interval_days: int = 10
     tasks_landed_threshold: int = 120
     tasks_landed_min_days: int = 7
@@ -185,7 +187,7 @@ class LegibilityConfig(BaseModel):
     def _project_root_must_be_absolute(cls, value: str) -> str:
         """Reject a relative ``project_root`` at config-load time.
 
-        Every consumer (sampling.py, census.py's ``default_batch_source``,
+        Every consumer (sampling.py, census_window.py's ``WindowBatchSource``,
         digest.py, ...) resolves ``cfg.project_root`` against its OWN
         process cwd. ``scripts/legibility-trickle@.service`` pins
         ``WorkingDirectory=/home/leo/src/dark-factory`` for every ``%i``

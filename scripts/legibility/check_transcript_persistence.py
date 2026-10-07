@@ -188,7 +188,7 @@ def _usable_prompt_prefix(prompt: str | None) -> str | None:
 def _first_user_turn(path: Path) -> dict[str, Any] | None:
     """Return *path*'s first non-sidechain/non-meta user-turn record, or None.
 
-    A LIGHT alternative to ``sampling._score_and_find_first_turn`` for the
+    A LIGHT alternative to ``sampling.scan_transcript`` for the
     STRONG match: that helper must read the WHOLE file to also compute the
     5-class confusion score (tool_error/not_found/self_correct/df_guard/
     interrupt) — all of which the strong match discards. This loop instead
