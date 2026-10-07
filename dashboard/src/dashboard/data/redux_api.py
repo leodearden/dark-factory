@@ -351,30 +351,53 @@ def _shape_wal_status(
 # ---------------------------------------------------------------------------
 
 
-def shape_memory_graphs(ops: MemoryOps) -> dict[str, Any]:
-    """Return ``{MEMORY_OPS}``: one window's operations, both views.
+_MEMORY_OPS_SERIES_KEYS = ('labels', 'reads', 'writes', 'other', 'total', 'by_operation')
 
-    The hourly ``total`` series and the window ``totals`` are derived here
-    and nowhere else, so the client never re-counts: the reads/writes/other
-    caption and the donut's centre read the same served numbers, and
-    ``totals.total`` equals the ``by_operation`` sum by MemoryOps' invariant.
+
+def _memory_ops_series(ops: MemoryOps | None) -> dict[str, list]:
+    """The block's chart series; every one empty for an unmeasured window."""
+    if ops is None:
+        return {key: [] for key in _MEMORY_OPS_SERIES_KEYS}
+    return {
+        'labels': list(ops.labels),
+        'reads': list(ops.reads),
+        'writes': list(ops.writes),
+        'other': list(ops.other),
+        'total': [r + w + o for r, w, o in zip(ops.reads, ops.writes, ops.other, strict=True)],
+        'by_operation': [{'label': label, 'value': count} for label, count in ops.by_operation],
+    }
+
+
+def shape_memory_graphs(ops: Datum[MemoryOps], *, served_at: datetime) -> dict[str, Any]:
+    """Return ``{MEMORY_OPS, served_at}``: one window's operations, both views.
+
+    The hourly ``total`` series and the two readings, the window ``totals``
+    and the ``newest_hour_total``, are derived here and nowhere else, so the
+    client never re-counts: the reads/writes/other caption, the donut's centre
+    and the ops/min tile read the same served numbers, and ``totals.total``
+    equals the ``by_operation`` sum by MemoryOps' invariant. Both readings
+    carry *ops*'s provenance. An unmeasured window serves them ``unknown``
+    with every series empty, so no chart draws a flat zero line over a hole.
     """
-    reads, writes, other = sum(ops.reads), sum(ops.writes), sum(ops.other)
+    series = _memory_ops_series(ops.value)
+    if ops.value is None:
+        totals = newest_hour_total = None
+    else:
+        reads, writes, other = sum(series['reads']), sum(series['writes']), sum(series['other'])
+        totals = {'reads': reads, 'writes': writes, 'other': other, 'total': reads + writes + other}
+        newest_hour_total = series['total'][-1]
+
+    def reading(value: object, field: str) -> dict[str, object]:
+        measured = Datum(value, ops.as_of, ops.state, ops.reason, ops.freshness_bound_seconds)
+        return _wire_served(measured, f'MEMORY_OPS {field}', served_at)
+
     return {
         'MEMORY_OPS': {
-            'labels': list(ops.labels),
-            'reads': list(ops.reads),
-            'writes': list(ops.writes),
-            'other': list(ops.other),
-            'total': [r + w + o for r, w, o in zip(ops.reads, ops.writes, ops.other, strict=True)],
-            'totals': {
-                'reads': reads, 'writes': writes, 'other': other,
-                'total': reads + writes + other,
-            },
-            'by_operation': [
-                {'label': label, 'value': count} for label, count in ops.by_operation
-            ],
+            **series,
+            'totals': reading(totals, 'totals'),
+            'newest_hour_total': reading(newest_hour_total, 'newest_hour_total'),
         },
+        'served_at': served_at.isoformat(),
     }
 
 

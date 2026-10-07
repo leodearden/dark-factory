@@ -174,7 +174,9 @@ async def _ops_value(conn, **kwargs):
     """The MemoryOps a successful get_memory_ops read measured."""
     from dashboard.data.write_journal import get_memory_ops
 
-    return (await get_memory_ops(conn, **kwargs)).value
+    result = await get_memory_ops(conn, **kwargs)
+    assert result.value is not None, f'expected a measured window, got: {result}'
+    return result.value
 
 
 def _empty_ops():
@@ -292,6 +294,7 @@ class TestGetMemoryOps:
             result.freshness_bound_seconds
             == write_journal.MEMORY_OPS_FRESHNESS_BOUND_SECONDS
         )
+        assert result.value is not None
         assert sum(result.value.reads) == 4
         validate_datum(result, served_at=_OPS_NOW)
 
@@ -458,8 +461,6 @@ class TestNowThreading:
         (outside). FIXED_NOW is an arbitrary historical instant unrelated to
         the real current time, so this only passes if `now` is threaded through.
         """
-        from dashboard.data.write_journal import get_memory_ops
-
         db_path = tmp_path / 'memory_ops_fixed_now.db'
         inside = self.FIXED_NOW - timedelta(hours=1)
         outside = self.FIXED_NOW - timedelta(hours=25)
@@ -470,15 +471,13 @@ class TestNowThreading:
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            result = (await get_memory_ops(conn, now=self.FIXED_NOW)).value
+            result = await _ops_value(conn, now=self.FIXED_NOW)
         assert sum(result.reads) == 1
         assert result.by_operation == (('search', 1),)
 
     @pytest.mark.asyncio
     async def test_memory_ops_no_now_resolves_via_clock(self, tmp_path):
         """Without now, get_memory_ops still windows against the live clock."""
-        from dashboard.data.write_journal import get_memory_ops
-
         db_path = tmp_path / 'memory_ops_live_clock.db'
         real_now = datetime.now(UTC)
         inside = real_now - timedelta(hours=1)
@@ -490,7 +489,7 @@ class TestNowThreading:
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            result = (await get_memory_ops(conn)).value
+            result = await _ops_value(conn)
         assert sum(result.reads) == 1
 
     @pytest.mark.asyncio
@@ -608,7 +607,7 @@ async def _memory_ops_with_sql(conn, sql, monkeypatch, **kwargs):
     from dashboard.data import write_journal
 
     monkeypatch.setattr(write_journal, 'MEMORY_OPS_SQL', sql)
-    return (await write_journal.get_memory_ops(conn, **kwargs)).value
+    return await _ops_value(conn, **kwargs)
 
 
 class TestMemoryOpsResultEquivalence:
@@ -686,8 +685,6 @@ class TestMemoryOpsMissingIndexFallback:
     async def test_missing_index_falls_back_to_unhinted_with_error_log(
         self, tmp_path, caplog,
     ):
-        from dashboard.data.write_journal import get_memory_ops
-
         db_path = tmp_path / 'ops_missing_index.db'
         now = datetime(2026, 4, 11, 12, 30, tzinfo=UTC)
         rows = [
@@ -700,7 +697,7 @@ class TestMemoryOpsMissingIndexFallback:
 
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
-            indexed = (await get_memory_ops(conn, now=now)).value
+            indexed = await _ops_value(conn, now=now)
 
         # WRITE_OPS_SCHEMA minus idx_wo_created — the coupling breaks here.
         setup_conn = sqlite3.connect(str(db_path))
@@ -711,7 +708,7 @@ class TestMemoryOpsMissingIndexFallback:
         async with aiosqlite.connect(str(db_path)) as conn:
             conn.row_factory = aiosqlite.Row
             with caplog.at_level(logging.ERROR, logger='dashboard.data.write_journal'):
-                fallback = (await get_memory_ops(conn, now=now)).value
+                fallback = await _ops_value(conn, now=now)
 
         assert fallback == indexed
         assert dict(fallback.by_operation) == {'search': 1, 'add_memory': 1}, (

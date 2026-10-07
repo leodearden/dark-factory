@@ -182,7 +182,7 @@ window.DF_DATA = {
     projects: {},
     wal: { status: 'offline', reason: null, rows: [] },
   },
-  MEMORY_OPS: { labels: [], reads: [], writes: [], other: [], total: [], totals: null, by_operation: [] },
+  MEMORY_OPS: { labels: [], reads: [], writes: [], other: [], total: [], by_operation: [], totals: null, newest_hour_total: null },
   RECON_STATE: {
     buffer: { buffered_count: 0, oldest_event_age_seconds: null },
     burst_state: [],

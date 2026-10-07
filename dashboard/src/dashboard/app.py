@@ -59,6 +59,7 @@ from dashboard.data.costs import (
     aggregate_cost_summary,
     aggregate_cost_trend,
 )
+from dashboard.data.datum import unknown_datum
 from dashboard.data.db import DbPool
 from dashboard.data.escalation_corpus import reconciliation_queue
 from dashboard.data.load import get_load_metrics
@@ -92,8 +93,8 @@ from dashboard.data.reconciliation import (
 )
 from dashboard.data.scheduler import get_scheduler_snapshot
 from dashboard.data.tasks import fetch_tasks
-from dashboard.data.utils import safe_gather_result
-from dashboard.data.write_journal import empty_memory_ops, get_memory_ops
+from dashboard.data.utils import resolve_now, safe_gather_result
+from dashboard.data.write_journal import MEMORY_OPS_FRESHNESS_BOUND_SECONDS, get_memory_ops
 from dashboard.http_pool import reaper_loop
 from dashboard.loops import _burndown_loop, _BurndownStore, _metrics_loop, _MetricsStore
 from dashboard.project_dbs import _cost_dbs, _cost_sources
@@ -926,16 +927,20 @@ async def _performance_resources(
 
 @app.get('/api/v2/dashboard/memory-graphs')
 async def api_memory_graphs(request: Request) -> JSONResponse:
-    """MEMORY_OPS from the write journal."""
+    """MEMORY_OPS from the write journal; a failed read is an unknown reading, never a 500."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     db = await pool.get(config.write_journal_db)
     try:
         ops = await get_memory_ops(db)
-    except Exception:
+    except Exception as exc:
         logger.warning('memory-graphs: memory ops read failed', exc_info=True)
-        ops = empty_memory_ops()
-    return JSONResponse(redux_api.shape_memory_graphs(ops))
+        ops = unknown_datum(
+            f'memory ops read failed: {type(exc).__name__}: {exc}',
+            MEMORY_OPS_FRESHNESS_BOUND_SECONDS,
+        )
+    served_at = resolve_now(None)
+    return JSONResponse(redux_api.shape_memory_graphs(ops, served_at=served_at))
 
 
 @app.get('/api/v2/dashboard/recon')

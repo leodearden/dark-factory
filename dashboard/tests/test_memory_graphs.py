@@ -38,11 +38,12 @@ def _memory_ops() -> MemoryOps:
     )
 
 
+def _measured_at(age_seconds: int) -> datetime:
+    return SERVED_AT - timedelta(seconds=age_seconds)
+
+
 def _fresh(*, age_seconds: int = 2) -> Datum[MemoryOps]:
-    return Datum(
-        _memory_ops(), SERVED_AT - timedelta(seconds=age_seconds),
-        DatumState.FRESH, None, BOUND,
-    )
+    return Datum(_memory_ops(), _measured_at(age_seconds), DatumState.FRESH, None, BOUND)
 
 
 def _shaped(ops: Datum[MemoryOps]) -> dict:
@@ -117,14 +118,13 @@ def test_the_by_operation_view_keeps_memory_ops_order():
 
 
 def test_fresh_totals_are_a_fresh_wire_datum_reconciling_with_by_operation():
-    measured = _fresh()
-    ops = _shaped(measured)['MEMORY_OPS']
+    ops = _shaped(_fresh(age_seconds=2))['MEMORY_OPS']
     totals = ops['totals']
 
     assert set(totals) == WIRE_DATUM_KEYS
     assert totals['state'] == 'fresh'
     assert totals['reason'] is None
-    assert totals['as_of'] == measured.as_of.isoformat()
+    assert totals['as_of'] == _measured_at(2).isoformat()
     assert totals['freshness_bound_seconds'] == BOUND
     assert totals['value'] == {'reads': 10, 'writes': 3, 'other': 2, 'total': 15}
     _assert_reconciles(ops)
@@ -156,7 +156,7 @@ def test_a_reading_measured_past_its_bound_is_served_stale_with_its_series():
     for reading in ('totals', 'newest_hour_total'):
         assert ops[reading]['state'] == 'stale', (reading, ops[reading])
         assert ops[reading]['reason'] == aged_reason, (reading, ops[reading])
-        assert ops[reading]['as_of'] == measured.as_of.isoformat()
+        assert ops[reading]['as_of'] == _measured_at(BOUND + 30).isoformat()
     assert ops['reads'] == [3, 7]
     _assert_reconciles(ops)
 
