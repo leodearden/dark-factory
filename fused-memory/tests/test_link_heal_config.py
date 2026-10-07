@@ -1,7 +1,10 @@
-"""The link-heal executor's config surface (plans/write-triage-link-healing-prd.md H1, task 6181).
+"""The link-heal config surface (plans/write-triage-link-healing-prd.md H1/H2, tasks 6181, 6184).
 
-Three ``link_heal.*`` caps, all green-tier because their only consumer is
-``fused-memory/scripts/link_heal.py``, which loads config at each run start; and
+The ``link_heal.*`` knobs: the executor's caps and storm escapes (H1) and the
+link adjudicator's model, sharding, text cap, share ceilings and failure streak
+(H2). All are green-tier because their only consumers are scripts
+(``scripts/link_heal.py``, ``scripts/eval_link_adjudicator.py``) that load
+config at each run start; and
 the ``link-heal-`` prefix on the metadata arm of ``mem0_update``, which the
 executor's ``update_memory`` writes need and which must not widen the
 content-amend arm.
@@ -39,6 +42,12 @@ class TestLinkHealConfigDefaults:
         assert cfg.max_actions_per_run == 25
         assert cfg.backlog_multiplier == 5
         assert cfg.write_failure_streak == 3
+        assert cfg.adjudicator_model == 'opus'
+        assert cfg.shard_size == 40
+        assert cfg.field_chars == 4000
+        assert cfg.misfile_share_ceiling == 0.25
+        assert cfg.corrects_share_ceiling == 0.60
+        assert cfg.shard_failure_streak == 3
 
     @pytest.mark.parametrize(
         ('field', 'value'),
@@ -46,6 +55,14 @@ class TestLinkHealConfigDefaults:
             ('max_actions_per_run', -1),
             ('backlog_multiplier', 0),
             ('write_failure_streak', 0),
+            ('shard_size', 0),
+            ('field_chars', 0),
+            ('shard_failure_streak', 0),
+            ('misfile_share_ceiling', -0.01),
+            ('misfile_share_ceiling', 1.01),
+            ('corrects_share_ceiling', -0.01),
+            ('corrects_share_ceiling', 1.01),
+            ('adjudicator_model', ''),
         ],
     )
     def test_out_of_range_values_are_rejected(self, field, value):
@@ -71,10 +88,16 @@ class TestLinkHealLeavesAreGreenTier:
         'max_actions_per_run': 7,
         'backlog_multiplier': 2,
         'write_failure_streak': 9,
+        'adjudicator_model': 'sonnet',
+        'shard_size': 20,
+        'field_chars': 2000,
+        'misfile_share_ceiling': 0.5,
+        'corrects_share_ceiling': 0.9,
+        'shard_failure_streak': 5,
     }
 
-    def test_the_schema_declares_three_leaves(self):
-        assert len(LEAVES) == 3, LEAVES
+    def test_the_schema_declares_nine_leaves(self):
+        assert len(LEAVES) == 9, LEAVES
 
     def test_every_leaf_is_allowlisted(self):
         missing = {f'link_heal.{name}' for name in LEAVES} - RELOADABLE_FIELDS
