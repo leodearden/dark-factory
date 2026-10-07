@@ -44,11 +44,10 @@ from __future__ import annotations
 import json
 import logging
 import uuid as uuid_mod
-from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from _fm_helpers import poll_until
+from _fm_helpers import make_retry_budget_queue, poll_until_dead
 
 # The REAL upstream classes — see the module docstring for why this import is
 # correct here and deliberately absent from test_durable_queue.py.
@@ -77,36 +76,6 @@ _IDENTITY_OP = 'create_node'
 _IDENTITY_KEYS = {_IDENTITY_OP: 'uuid'}
 
 
-async def _poll_until_dead(
-    q: DurableWriteQueue,
-    *,
-    group_id: str | None = None,
-    expected_dead: int,
-    timeout: float = 20.0,
-) -> None:
-    """Poll queue stats until at least *expected_dead* items reach status='dead'.
-
-    Mirrors ``test_durable_queue.py:1207-1236``. Fixed sleeps are unsafe here:
-    the suite runs under ``-n auto --dist loadgroup`` with a 60s per-test
-    timeout that kills the whole worker, and the generous 20s budget means a
-    regression fails on the observed COUNT rather than by timing out.
-    """
-    last_counts: dict = {}
-
-    async def _dead_count_reached():
-        stats = await q.get_stats(group_id=group_id)
-        last_counts.update(stats['counts'])
-        return stats['counts'].get('dead', 0) >= expected_dead
-
-    try:
-        await poll_until(_dead_count_reached, timeout=timeout, interval=0.05)
-    except AssertionError as exc:
-        raise AssertionError(
-            f'Timed out waiting for {expected_dead} dead item(s) '
-            f'(group_id={group_id!r}); last counts={last_counts}'
-        ) from exc
-
-
 def _item(
     operation: str,
     payload,
@@ -132,31 +101,12 @@ def _item(
     ))
 
 
-def _queue(tmp_path, execute, **overrides) -> DurableWriteQueue:
-    """The shared config, matching ``test_durable_queue.py:1571-1586`` exactly
-    so attempt counts here are directly comparable to task 3585's: plain budget
-    5, extended transient budget 12, sub-second backoff."""
-    # Annotated: without it pyright joins the heterogeneous literal values into
-    # a single narrow type and rejects the ** unpacking below.
-    kwargs: dict[str, Any] = dict(
-        data_dir=tmp_path / 'queue',
-        execute_write=execute,
-        workers_per_group=1,
-        semaphore_limit=5,
-        max_attempts=5,
-        retry_base_seconds=0.01,
-        retry_max_delay_seconds=0.05,
-        write_timeout_seconds=2.0,
-        transient_max_attempts=12,
-    )
-    kwargs.update(overrides)
-    return DurableWriteQueue(**kwargs)
-
-
 def _identity_queue(tmp_path, execute, **overrides) -> DurableWriteQueue:
-    """``_queue`` with ``_IDENTITY_KEYS`` injected, so the self-identity rule is
-    live for ``_IDENTITY_OP``."""
-    return _queue(tmp_path, execute, identity_payload_keys=_IDENTITY_KEYS, **overrides)
+    """``make_retry_budget_queue`` with ``_IDENTITY_KEYS`` injected, so the
+    self-identity rule is live for ``_IDENTITY_OP``."""
+    return make_retry_budget_queue(
+        tmp_path, execute, identity_payload_keys=_IDENTITY_KEYS, **overrides
+    )
 
 
 class TestUpstreamNotFoundMessageFormat:
@@ -441,7 +391,7 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
                 group_id='proj1', operation=_IDENTITY_OP,
                 payload={'uuid': u, 'name': 'ep', 'content': 'c', 'group_id': 'proj1'},
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
 
             dead = await q.get_dead_items()
             assert len(dead) == 1
@@ -480,7 +430,7 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
                     'name': 'ep', 'content': 'c', 'group_id': 'proj1',
                 },
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
 
             dead = await q.get_dead_items()
             assert dead[0]['attempts'] == 5, (
@@ -504,7 +454,7 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
                 group_id='proj1', operation=_IDENTITY_OP,
                 payload={'uuid': u, 'name': 'ep', 'content': 'c', 'group_id': 'proj1'},
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
 
             dead = await q.get_dead_items()
             assert dead[0]['attempts'] == 5, (
@@ -527,7 +477,7 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
                 group_id='proj1', operation='add_memory_graphiti',
                 payload={'uuid': u, 'content': 'c', 'group_id': 'proj1'},
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
 
             dead = await q.get_dead_items()
             assert dead[0]['attempts'] == 5, (
@@ -544,14 +494,14 @@ class TestSelfReferentialNotFoundDeadLettersImmediately:
         own payload 'uuid', keeps the plain max_attempts budget."""
         u = _uuid()
         execute = AsyncMock(side_effect=NodeNotFoundError(u))
-        q = _queue(tmp_path, execute)
+        q = make_retry_budget_queue(tmp_path, execute)
         await q.initialize()
         try:
             await q.enqueue(
                 group_id='proj1', operation='add_episode',
                 payload={'uuid': u, 'name': 'ep', 'content': 'c', 'group_id': 'proj1'},
             )
-            await _poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
+            await poll_until_dead(q, group_id='proj1', expected_dead=1, timeout=20.0)
 
             dead = await q.get_dead_items()
             assert len(dead) == 1, f'expected one dead item, got {dead!r}'
@@ -583,7 +533,7 @@ class TestDeadLetterLogNamesOperationAndGroup:
         self, tmp_path, caplog
     ):
         execute = AsyncMock(side_effect=RuntimeError('boom'))
-        q = _queue(tmp_path, execute)
+        q = make_retry_budget_queue(tmp_path, execute)
         await q.initialize()
         try:
             with caplog.at_level(
@@ -593,7 +543,7 @@ class TestDeadLetterLogNamesOperationAndGroup:
                     group_id='proj-alpha', operation='add_episode',
                     payload={'content': 'c', 'group_id': 'proj-alpha', 'name': 'ep'},
                 )
-                await _poll_until_dead(
+                await poll_until_dead(
                     q, group_id='proj-alpha', expected_dead=1, timeout=20.0
                 )
 
@@ -635,7 +585,7 @@ class TestDeadLetterLogNamesOperationAndGroup:
                     group_id='proj-alpha', operation=_IDENTITY_OP,
                     payload={'uuid': u, 'content': 'c', 'group_id': 'proj-alpha'},
                 )
-                await _poll_until_dead(
+                await poll_until_dead(
                     q, group_id='proj-alpha', expected_dead=1, timeout=20.0
                 )
 

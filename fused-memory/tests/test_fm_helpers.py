@@ -918,6 +918,53 @@ class TestPollUntil:
 
 
 # ---------------------------------------------------------------------------
+# Tests for the shared poll_until_dead() dead-letter waiter (task 4847)
+# ---------------------------------------------------------------------------
+# One waiter for the three durable-queue suites. A scripted get_stats stands in
+# for the queue, so these pin call counts and the timeout message only.
+
+class _ScriptedStatsQueue:
+    """Answers get_stats with the next scripted counts; the last entry repeats."""
+
+    def __init__(self, counts_script: list[dict]):
+        self._script = counts_script
+        self.group_ids: list[str | None] = []
+
+    async def get_stats(self, group_id=None):
+        index = min(len(self.group_ids), len(self._script) - 1)
+        self.group_ids.append(group_id)
+        return {'counts': self._script[index]}
+
+
+class TestPollUntilDead:
+    """Unit tests for poll_until_dead(q, *, group_id, expected_dead, timeout)."""
+
+    @pytest.mark.asyncio
+    async def test_returns_once_dead_count_reaches_expected(self):
+        from _fm_helpers import poll_until_dead
+
+        q = _ScriptedStatsQueue([{'pending': 2}, {'dead': 1, 'pending': 1}, {'dead': 2}])
+
+        await poll_until_dead(q, group_id='g1', expected_dead=2, timeout=5.0)
+
+        assert q.group_ids == ['g1', 'g1', 'g1']
+
+    @pytest.mark.asyncio
+    async def test_timeout_names_expected_count_group_and_last_counts(self):
+        from _fm_helpers import poll_until_dead
+
+        q = _ScriptedStatsQueue([{'dead': 1, 'retry': 3}])
+
+        with pytest.raises(AssertionError) as exc_info:
+            await poll_until_dead(q, group_id='g1', expected_dead=2, timeout=0.05)
+
+        message = str(exc_info.value)
+        assert 'Timed out waiting for 2 dead item(s)' in message
+        assert "group_id='g1'" in message
+        assert "'retry': 3" in message
+
+
+# ---------------------------------------------------------------------------
 # Tests for the shared poll_until_stable() settle barrier (task 3697)
 # ---------------------------------------------------------------------------
 # poll_until is a LIVENESS barrier: it returns at the FIRST truthy sample. That
