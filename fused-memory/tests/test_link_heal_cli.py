@@ -600,6 +600,19 @@ class TestPlanFromAdjudicator:
         assert workspace.runs() == []
 
     @pytest.mark.asyncio
+    async def test_project_with_a_corpus_is_refused(self, harness, workspace, capsys):
+        corpus = seed_corpus(harness, workspace, 1)
+
+        code = await run_cli(
+            env_for(harness, workspace), workspace,
+            'plan', '--from-corpus', str(corpus), '--project', DF,
+        )
+
+        assert code == 2
+        assert '--project' in capsys.readouterr().err
+        assert workspace.runs() == []
+
+    @pytest.mark.asyncio
     async def test_project_is_repeatable(self, harness, workspace, capsys):
         seed_unrated_sightings(harness, 1, project=DF, first=100)
         seed_unrated_sightings(harness, 1, project=REIFY, first=200)
