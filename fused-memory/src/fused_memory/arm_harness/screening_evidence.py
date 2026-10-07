@@ -1,6 +1,7 @@
 """What one arm's η screening left on disk, typed and validated: layout, command records, α's VRAM reading, the tap's calls and the pinned run."""
 
 import json
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -14,8 +15,10 @@ from shared.safe_io import atomic_write_text
 
 from fused_memory.arm_harness.arm_spec import ArmId, LlmArmSpec, load_arm_spec
 from fused_memory.arm_harness.frozen_model import FrozenModel
+from fused_memory.arm_harness.llm_metrics import graph_sameness_details, nearest_rank
 from fused_memory.arm_harness.metrics_record import (
     IndexConfiguration,
+    LlmMetricId,
     MetricsRecord,
     UtcDatetime,
     load_metrics_records,
@@ -31,6 +34,8 @@ LMS_CTL_EXIT_CARD_HELD = 5
 HEALTH_REPORT_SCHEMA_VERSION = 6
 """Mirrors scripts/local-model-serving/lms_healthcheck.py::REPORT_SCHEMA_VERSION."""
 CLEAN_READING = 'CLEAN'
+LENGTH_FINISH_REASON = 'length'
+_P50, _P95 = 0.50, 0.95
 
 _Loaded = TypeVar('_Loaded')
 
@@ -166,6 +171,16 @@ class ArmEvidence:
     run: RunManifest | None
     records: tuple[MetricsRecord, ...]
     outcomes: tuple[EpisodeOutcome, ...]
+
+    @property
+    def own_model_calls(self) -> tuple[CallRecord, ...]:
+        """The tap's calls for this arm's own served model, not the embedder's or anyone else's."""
+        return tuple(call for call in self.calls if call.request_model == self.spec.model_id)
+
+    def metric_value(self, metric_id: LlmMetricId) -> float | None:
+        return next(
+            (r.metric.value for r in self.records if r.metric.metric_id == metric_id), None
+        )
 
 
 def _refuse(where: object, invariant: str, offending: object) -> NoReturn:
@@ -413,4 +428,81 @@ def load_arm_evidence(paths: ArmEvidencePaths, arm: SlateArm) -> ArmEvidence:
         run=run,
         records=_guarded(run_dir, lambda: load_metrics_records(run_dir)),
         outcomes=_loaded(run_dir / OUTCOMES_FILENAME, load_outcomes),
+    )
+
+
+# --- reported, never gating ---------------------------------------------------------
+
+class ErrorClassCount(FrozenModel):
+    error_class: str
+    count: int = Field(ge=1)
+
+
+class ReportedEvidence(FrozenModel):
+    """Measured beside the gates and never gating: survival reads the four gates only."""
+
+    episode_failure_rate: float | None
+    conformance_rate: float | None
+    latency_p50_ms: float | None
+    tokens_per_episode: float | None
+    error_classes: tuple[ErrorClassCount, ...]
+    incomplete: bool | None
+    abort_item_count: int | None
+    calls_per_ok_episode_p50: int | None
+    calls_per_ok_episode_max: int | None
+    own_model_calls: int
+    call_duration_p50_ms: float | None
+    call_duration_p95_ms: float | None
+    length_truncations: int
+    rejected_calls: int
+    other_model_calls: int
+    health_verdict: str | None
+    top_level_entities_named: int | None
+    graph_sameness_mean_entity_jaccard: float | None
+    graph_sameness_n: int
+
+
+def _mean(values: Sequence[float]) -> float | None:
+    return sum(values) / len(values) if values else None
+
+
+def _ranked(values: Sequence[float], p: float) -> float | None:
+    return nearest_rank(sorted(values), p) if values else None
+
+
+def reported_evidence(
+    evidence: ArmEvidence, reference_outcomes: Sequence[EpisodeOutcome]
+) -> ReportedEvidence:
+    own = evidence.own_model_calls
+    durations = [call.duration_ms for call in own]
+    calls_per_ok = sorted(
+        outcome.tokens.llm_calls
+        for outcome in evidence.outcomes
+        if outcome.ok and outcome.tokens is not None
+    )
+    errors = Counter(o.error_class for o in evidence.outcomes if o.error_class is not None)
+    sameness = graph_sameness_details(evidence.outcomes, reference_outcomes).episodes
+    run, row = evidence.run, evidence.vram.row if evidence.vram else None
+    return ReportedEvidence(
+        episode_failure_rate=evidence.metric_value(LlmMetricId.EPISODE_FAILURE_RATE),
+        conformance_rate=evidence.metric_value(LlmMetricId.CONFORMANCE_RATE),
+        latency_p50_ms=evidence.metric_value(LlmMetricId.EPISODE_LATENCY_P50),
+        tokens_per_episode=evidence.metric_value(LlmMetricId.TOKENS_PER_EPISODE),
+        error_classes=tuple(
+            ErrorClassCount(error_class=name, count=count) for name, count in sorted(errors.items())
+        ),
+        incomplete=run.incomplete if run else None,
+        abort_item_count=len(run.abort.item_ids) if run and run.abort else None,
+        calls_per_ok_episode_p50=nearest_rank(calls_per_ok, _P50) if calls_per_ok else None,
+        calls_per_ok_episode_max=calls_per_ok[-1] if calls_per_ok else None,
+        own_model_calls=len(own),
+        call_duration_p50_ms=_ranked(durations, _P50),
+        call_duration_p95_ms=_ranked(durations, _P95),
+        length_truncations=sum(1 for c in own if c.finish_reason == LENGTH_FINISH_REASON),
+        rejected_calls=sum(1 for call in own if not call.succeeded),
+        other_model_calls=len(evidence.calls) - len(own),
+        health_verdict=row.verdict if row else None,
+        top_level_entities_named=row.top_level_entities_named if row else None,
+        graph_sameness_mean_entity_jaccard=_mean(tuple(e.entity_jaccard for e in sameness)),
+        graph_sameness_n=len(sameness),
     )

@@ -46,6 +46,10 @@ class CallRecord(FrozenModel):
     finish_reason: str | None
     error_excerpt: str | None
 
+    @property
+    def succeeded(self) -> bool:
+        return is_success_status(self.status)
+
 
 def _json_object(body: bytes) -> Mapping[str, Any]:
     try:
@@ -67,7 +71,7 @@ def _str_or_none(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _succeeded(status: int) -> bool:
+def is_success_status(status: int) -> bool:
     return 200 <= status < 300
 
 
@@ -82,7 +86,7 @@ def call_record(
     response_body: bytes,
 ) -> CallRecord:
     request = _json_object(request_body)
-    response = _json_object(response_body) if _succeeded(status) else {}
+    response = _json_object(response_body) if is_success_status(status) else {}
     usage = _mapping(response.get('usage'))
     choices = response.get('choices')
     first_choice = _mapping(choices[0]) if isinstance(choices, list) and choices else {}
@@ -99,7 +103,7 @@ def call_record(
         completion_tokens=_int_or_none(usage.get('completion_tokens')),
         finish_reason=_str_or_none(first_choice.get('finish_reason')),
         error_excerpt=None
-        if _succeeded(status)
+        if is_success_status(status)
         else response_body.decode('utf-8', 'replace')[:ERROR_EXCERPT_CHARS],
     )
 

@@ -3,24 +3,6 @@
 import dataclasses
 
 import pytest
-from fused_memory.arm_harness.screening import (
-    SURVIVOR_CAP,
-    ArmScreening,
-    GateId,
-    GateResult,
-    GateVerdict,
-    ScreeningOutcome,
-    ScreeningVerdict,
-    conformance_gate,
-    context_gate,
-    derive_screening_verdict,
-    load_screening_verdict,
-    reported_evidence,
-    screen_arm,
-    serialize_screening_verdict,
-    throughput_gate,
-    vram_gate,
-)
 from pydantic import ValidationError
 from shared.memory_eval_metrics import Metric
 
@@ -40,7 +22,27 @@ from arm_harness._fakes import (
 from fused_memory.arm_harness.metrics_record import LlmMetricId, record_for
 from fused_memory.arm_harness.preregistration import latency_envelope
 from fused_memory.arm_harness.replay_types import ArmAbort
-from fused_memory.arm_harness.screening_evidence import ScreeningEvidenceError
+from fused_memory.arm_harness.screening import (
+    SURVIVOR_CAP,
+    ArmScreening,
+    GateId,
+    GateResult,
+    GateVerdict,
+    ScreeningOutcome,
+    ScreeningVerdict,
+    conformance_gate,
+    context_gate,
+    derive_screening_verdict,
+    load_screening_verdict,
+    screen_arm,
+    serialize_screening_verdict,
+    throughput_gate,
+    vram_gate,
+)
+from fused_memory.arm_harness.screening_evidence import (
+    ScreeningEvidenceError,
+    reported_evidence,
+)
 
 ENVELOPE = latency_envelope(120.0)
 QWEN = slate_arm()
@@ -265,10 +267,10 @@ def test_an_arm_screening_carries_exactly_the_four_gates_in_order():
 
 def test_a_gate_margin_is_the_bound_minus_the_value():
     with pytest.raises(ValidationError, match='margin'):
-        GateResult(
-            gate=GateId.VRAM_FIT, verdict=GateVerdict.PASS, value=10.0, bound=20.0,
-            margin=5.0, unit='MiB', detail='x',
-        )
+        GateResult.model_validate({
+            'gate': 'vram-fit', 'verdict': 'PASS', 'value': 10.0, 'bound': 20.0,
+            'margin': 5.0, 'unit': 'MiB', 'detail': 'x',
+        })
 
 
 # --- the reported, non-gating block --------------------------------------------------
@@ -439,6 +441,13 @@ def test_refuses_arms_not_at_the_controls_code_sha():
     inputs = preregistration_inputs(code_sha='e' * 40)
 
     with pytest.raises(ScreeningEvidenceError, match=r'(?s)code_sha.*e{40}'):
+        derive_screening_verdict(SLATE, _evidence(), inputs, screening_outcomes())
+
+
+def test_refuses_arms_not_on_the_controls_corpus():
+    inputs = preregistration_inputs(corpus_sha='9' * 64)
+
+    with pytest.raises(ScreeningEvidenceError, match=r'(?s)corpus_sha.*9{64}'):
         derive_screening_verdict(SLATE, _evidence(), inputs, screening_outcomes())
 
 
