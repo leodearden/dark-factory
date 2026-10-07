@@ -15,17 +15,20 @@ from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec, LlmP
 from fused_memory.arm_harness.conformance import ConformanceCounts
 from fused_memory.arm_harness.instrument_checks import PREREGISTRATION_DOC_PATH
 from fused_memory.arm_harness.llm_metrics import llm_axis_records
-from fused_memory.arm_harness.metrics_record import write_metrics_record
-from fused_memory.arm_harness.replay_types import ArmRunResult, EpisodeOutcome
+from fused_memory.arm_harness.metrics_record import MetricsRecord, write_metrics_record
+from fused_memory.arm_harness.preregistration import PreregistrationInputs, latency_envelope
+from fused_memory.arm_harness.replay_types import ArmAbort, ArmRunResult, EpisodeOutcome
 from fused_memory.arm_harness.run import RUN_MANIFEST_FILENAME, write_outcomes
 from fused_memory.arm_harness.run_manifest import RunManifest, serialize_run_manifest
 from fused_memory.arm_harness.screening_evidence import (
     SCREENING_RUN_SHAPE,
     ArmCommands,
+    ArmEvidence,
     ArmEvidencePaths,
     CommandRecord,
     ScreeningStage,
     TapBinding,
+    VramEvidence,
     write_arm_commands,
     write_screening_spec,
 )
@@ -450,29 +453,37 @@ def screening_run_manifest(spec: LlmArmSpec, /, **overrides) -> RunManifest:
     return run_manifest_for(data.pop('spec', spec), **data)
 
 
+def screening_records(
+    spec: LlmArmSpec,
+    outcomes: tuple[EpisodeOutcome, ...],
+    *,
+    abort: ArmAbort | None = None,
+    schema_valid: int = 180,
+) -> tuple[MetricsRecord, ...]:
+    """The records the pinned harness derives from ``outcomes``, through its own metric code."""
+    result = ArmRunResult(arm_id=spec.arm_id, outcomes=outcomes, cancelled_ids=(), abort=abort)
+    counts = ConformanceCounts(
+        schema_valid=schema_valid, transport_errors=0, invalid_by_error_class={}
+    )
+    return llm_axis_records(
+        spec, result, counts, reference=None, retrieval_ranks=None, measured_at=FINISHED_AT
+    )
+
+
 def write_screening_run(
-    run_dir: Path, run: RunManifest, outcomes: tuple[EpisodeOutcome, ...], schema_valid: int = 180
+    run_dir: Path, run: RunManifest, outcomes: tuple[EpisodeOutcome, ...]
 ) -> None:
     """A pinned harness run's artifacts, through the harness's own writers."""
     assert isinstance(run.spec, LlmArmSpec)
     run_dir.mkdir(parents=True, exist_ok=True)
-    result = ArmRunResult(
-        arm_id=run.spec.arm_id, outcomes=outcomes, cancelled_ids=(), abort=run.abort
-    )
-    counts = ConformanceCounts(
-        schema_valid=schema_valid, transport_errors=0, invalid_by_error_class={}
-    )
-    records = llm_axis_records(
-        run.spec, result, counts, reference=None, retrieval_ranks=None, measured_at=FINISHED_AT
-    )
-    for record in records:
+    for record in screening_records(run.spec, outcomes, abort=run.abort):
         write_metrics_record(record, run_dir)
     write_outcomes(run_dir, outcomes)
     (run_dir / RUN_MANIFEST_FILENAME).write_text(serialize_run_manifest(run))
 
 
 def _stage_records(
-    start_exit: int, wait_ready_exit: int, smoke_exit: int, run_exit: int
+    start_exit: int, wait_ready_exit: int, smoke_exit: int, run_exit: int, smoke_tail: str = ''
 ) -> tuple[CommandRecord, ...]:
     if start_exit != 0:
         stages = ((ScreeningStage.START, start_exit),)
@@ -488,9 +499,93 @@ def _stage_records(
         )
     tail = ((ScreeningStage.STOP, 0), (ScreeningStage.TEARDOWN, 0))
     return tuple(
-        command_record(stage, exit_code=code, output_tail=f'{stage.value} said {code}')
+        command_record(
+            stage,
+            exit_code=code,
+            output_tail=smoke_tail
+            if stage is ScreeningStage.SMOKE and smoke_tail
+            else f'{stage.value} said {code}',
+        )
         for stage, code in stages + tail
     )
+
+
+def _tap_for(arm: SlateArm) -> TapBinding:
+    return TapBinding(listen_url=TAP_LISTEN_URL, upstream_url=arm_endpoint(arm))
+
+
+def vram_evidence(report: dict[str, Any]) -> VramEvidence:
+    return VramEvidence.model_validate({'row': report['arms'][0], 'vram': report['vram']})
+
+
+def default_calls(arm: SlateArm) -> tuple[CallRecord, ...]:
+    return tuple(call(model=arm.served_model_name, prompt_tokens=1000 + i) for i in range(5))
+
+
+def arm_evidence(
+    arm: SlateArm | None = None,
+    *,
+    start_exit: int = 0,
+    wait_ready_exit: int = 0,
+    smoke_exit: int = 0,
+    smoke_tail: str = '',
+    spec: LlmArmSpec | None = None,
+    health: dict[str, Any] | None = None,
+    calls: tuple[CallRecord, ...] | None = None,
+    outcomes: tuple[EpisodeOutcome, ...] | None = None,
+    records: tuple[MetricsRecord, ...] | None = None,
+    abort: ArmAbort | None = None,
+) -> ArmEvidence:
+    """One arm's loaded screening evidence, built in memory; any piece can be swapped."""
+    arm = arm or slate_arm()
+    spec = spec or screening_spec(arm)
+    commands = ArmCommands(
+        arm_id=arm.arm_id,
+        tap=_tap_for(arm),
+        records=_stage_records(start_exit, wait_ready_exit, smoke_exit, 0, smoke_tail),
+    )
+    if start_exit != 0 or wait_ready_exit != 0:
+        return ArmEvidence(
+            arm=arm, spec=spec, commands=commands, served=False,
+            vram=None, calls=(), run=None, records=(), outcomes=(),
+        )
+    outcomes = outcomes if outcomes is not None else screening_outcomes()
+    return ArmEvidence(
+        arm=arm,
+        spec=spec,
+        commands=commands,
+        served=True,
+        vram=vram_evidence(health or health_report(arm.arm_id, reasoning=arm.reasoning)),
+        calls=calls if calls is not None else default_calls(arm),
+        run=screening_run_manifest(spec, incomplete=abort is not None, abort=abort),
+        records=records
+        if records is not None
+        else screening_records(spec, outcomes, abort=abort),
+        outcomes=outcomes,
+    )
+
+
+def preregistration_inputs(**overrides) -> PreregistrationInputs:
+    """ζ's committed inputs in shape: the 120 s envelope, the incumbent's p95 inside it."""
+    data = {
+        'schema_version': 1,
+        'control_arm_ids': ('incumbent-generic-a', 'incumbent-generic-b'),
+        'code_sha': CODE_SHA,
+        'corpus_sha': CORPUS_SHA,
+        'margins': (),
+        'envelope': latency_envelope(120.0),
+        'call_profile': {
+            'n_episodes': 400,
+            'calls_p50': 9,
+            'calls_p95': 14,
+            'calls_max': 39,
+            'input_tokens_per_call': 1700.0,
+            'output_tokens_per_call': 200.0,
+        },
+        'incumbent_latency_p95_ms': 42828.0,
+        'incumbent_latency_max_ms': 92826.0,
+    }
+    return PreregistrationInputs.model_validate(data | overrides)
 
 
 def write_arm_evidence(
@@ -519,7 +614,7 @@ def write_arm_evidence(
         paths.commands,
         ArmCommands(
             arm_id=arm.arm_id,
-            tap=tap or TapBinding(listen_url=TAP_LISTEN_URL, upstream_url=arm_endpoint(arm)),
+            tap=tap or _tap_for(arm),
             records=records
             if records is not None
             else _stage_records(start_exit, wait_ready_exit, smoke_exit, run_exit),
@@ -528,12 +623,7 @@ def write_arm_evidence(
     if start_exit != 0 or wait_ready_exit != 0:
         return paths
     write_call_records(paths.smoke_calls, (call(model=arm.served_model_name),))
-    write_call_records(
-        paths.calls,
-        calls if calls is not None else tuple(
-            call(model=arm.served_model_name, prompt_tokens=1000 + i) for i in range(5)
-        ),
-    )
+    write_call_records(paths.calls, calls if calls is not None else default_calls(arm))
     if write_health:
         report = health or health_report(arm.arm_id, reasoning=arm.reasoning)
         paths.health.write_text(json.dumps(report))
