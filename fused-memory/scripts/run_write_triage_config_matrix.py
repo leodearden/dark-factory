@@ -29,12 +29,16 @@ Outputs
 
 Usage
 -----
-Run from ``fused-memory/``::
+Run from ``fused-memory/``, with one ``--require`` per ``--require best …``
+of task 5808's metadata.before_done.args (two are shown)::
 
     uv run python scripts/run_write_triage_config_matrix.py \\
         --data-root /home/leo/src/dark-factory \\
         --require quality.misfile_rate_of_attaches '<=' 0.08 \\
         --require quality.unrated_pairs '<=' 0
+
+An unrated or tied pair, or an arm file that differs from what π published,
+exits 1 with the reason on stderr and writes neither artifact.
 """
 from __future__ import annotations
 

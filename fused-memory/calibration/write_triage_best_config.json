@@ -1,0 +1,55 @@
+{
+  "quality": {
+    "attaches": 593,
+    "unclear_attaches": 0,
+    "misfiles": 170,
+    "misfile_rate_of_attaches": 0.2867,
+    "misfile_rate_wilson95": [
+      0.2517,
+      0.3244
+    ],
+    "duplicates_placed": 423,
+    "contradictions_attached": 58,
+    "contradictions_contested": 37,
+    "contradiction_recall": 0.6379,
+    "agreeing_attaches": 365,
+    "agreeing_contested": 16,
+    "false_contested_rate": 0.0438,
+    "true_links": 466,
+    "true_links_answered_distinct": 1,
+    "true_links_answered_distinct_rate": 0.0021,
+    "contested_decision_errors": 48,
+    "parse_failures": 6,
+    "unrated_pairs": 0,
+    "unrated_pair_ids": []
+  },
+  "selection": {
+    "judge_provider": "openai",
+    "judge_model": "gpt-5.6-terra",
+    "judge_reasoning_effort": "none",
+    "judge_candidate_count": 20,
+    "wording": "shipped",
+    "field_chars": 4000,
+    "p95_judge_seconds": 2.076,
+    "cost_per_write_usd": 0.017156
+  },
+  "population": {
+    "n_writes": 1517,
+    "n_judge_band": 658,
+    "projects": [
+      "dark_factory",
+      "reify"
+    ],
+    "frozen_at": "2026-10-05T10:01:34.841370+00:00",
+    "snapshot_sha256": "55398cd73c9a355d05f9454a2e1cca9e7da760bd89df141b2f6b5b8f28293e38"
+  },
+  "provenance": {
+    "arm": "gpt-5.6-terra:none@20",
+    "reference_arm": "gpt-4o-mini@5",
+    "meets_every_bound": false,
+    "failed_bounds": [
+      "best:quality.misfile_rate_of_attaches <= 0.08",
+      "best:selection.cost_per_write_usd <= 0.01"
+    ]
+  }
+}
