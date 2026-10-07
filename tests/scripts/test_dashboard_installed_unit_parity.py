@@ -115,6 +115,18 @@ analysis also records as out of scope. Fixing those is a different
 invariant with its own review surface — this module pins ONE invariant of
 this unit at two layers, exactly as its siblings do for theirs.
 
+UPDATED 2026-10-05 (task 4883). The paragraph above is kept as the
+2026-08-19 record; it no longer describes the host. Task 3289 (closed
+2026-08-27, done_provenance.kind=operational-verified) hand-merged all three
+into the installed unit while preserving its nine local
+DASHBOARD_KNOWN_PROJECT_ROOTS, and all three were re-measured present on
+2026-10-05: SuccessExitStatus=143, Environment=DASHBOARD_PROJECT_ROOT=, and
+--timeout-keep-alive 6. This module still asserts none of them; its
+one-invariant scope is unchanged. A recurrence is caught instead by
+scripts/check_dashboard_unit_parity.py, which compares all three
+(SuccessExitStatus only since task 4883) and which
+scripts/orchestrator-watchdog.py runs hourly.
+
 PRE-FIX BASELINE, recorded so a future reader knows this module arrived RED
 and was not written to match an already-green host. Measured by the
 implementer 2026-08-19 against systemd 255.4-1ubuntu8.17:
@@ -153,7 +165,8 @@ RestartMaxDelaySec=60), changing nothing else — followed by `systemctl
     pump-web-ui), and the three known out-of-scope staleness deltas
     (missing SuccessExitStatus=143, missing DASHBOARD_PROJECT_ROOT=, and
     --timeout-keep-alive 5 vs the committed 6) were left exactly as they
-    were — not opportunistically fixed; see follow-up task 4445.
+    were — not opportunistically fixed; see follow-up task 4445. (Since
+    reconciled by task 3289 — see the UPDATED 2026-10-05 note above.)
   - `systemctl --user show dark-factory-dashboard.service -p RestartSteps
     -p RestartMaxDelayUSec` now reports RestartSteps=4 and
     RestartMaxDelayUSec=1min (previously RestartSteps=0).

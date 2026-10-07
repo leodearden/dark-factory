@@ -37,11 +37,17 @@ backstop for the event-driven restart coordinator
 read-only doctor mode that prints a per-unit staleness table and performs
 no mutating systemctl calls.
 
+Each tick also runs scripts/check_dashboard_unit_parity.py, read-only and at
+most hourly (unit_parity_pass()), and logs a WARNING when the checker reports
+the installed dashboard units drifted, overridden by a drop-in, or missing a
+committed counterpart.
+
 Invoked by scripts/orchestrator-watchdog.service (launched via
 scripts/orchestrator-watchdog.timer).
 """
 
 import contextlib
+import enum
 import json
 import math
 import os
@@ -468,6 +474,62 @@ FM_LIVENESS_RESTART_CLOCK_PATH = os.environ.get(
         REPO_DIR, "data", "fused-memory", "last_liveness_restart_fused_memory.json"
     ),
 )
+
+
+# --- dashboard unit-parity backstop (task 4883) ---
+# scripts/check_dashboard_unit_parity.py used to run only when an operator ran
+# setup-host.sh, so an installed dashboard unit could drift for weeks with
+# nothing reporting it. unit_parity_pass() runs it read-only on this tick
+# instead: this unit executes the script FROM THE REPO CHECKOUT on an
+# already-armed timer, so the gate is live on merge with no install action.
+DASHBOARD_PARITY_SCRIPT = os.path.join(REPO_DIR, "scripts", "check_dashboard_unit_parity.py")
+# Every line the checker prints carries this tag (its LOG_TAG), so without it the
+# checker did not report, whatever its exit code says — the rule
+# scripts/setup-host.sh::_parity_verdict applies.
+DASHBOARD_PARITY_TAG = "[dashboard_unit_parity]"
+
+# The parity check's OWN clock, independent of every deploy and restart clock
+# above, so a redeploy never resets the parity cadence and a parity check
+# never moves a deploy gate. Not a deploy clock: df_pytest_isolation.py does
+# not protect it. Env-overridable so tests can point it at a tmp file.
+UNIT_PARITY_CLOCK_PATH = os.environ.get(
+    "ORCH_UNIT_PARITY_CLOCK",
+    os.path.join(REPO_DIR, "data", "orchestrator", "last_unit_parity_check.json"),
+)
+
+# Cost is not the constraint (stdlib-only, reads six files); journal legibility
+# is. Ungated, a drifted host would log ~1440 near-identical WARNINGs a day.
+# <=0 disables the throttle. Env-with-fallback: a typo must not crash the oneshot.
+try:
+    UNIT_PARITY_MIN_INTERVAL_SECS = int(os.environ["ORCH_UNIT_PARITY_MIN_INTERVAL_SECS"])
+except (KeyError, ValueError):
+    UNIT_PARITY_MIN_INTERVAL_SECS = 3600
+
+UNIT_PARITY_TIMEOUT_SECS = 30
+
+
+class UnitParityVerdict(enum.StrEnum):
+    """What unit_parity_verdict() concluded; its value is the --report row's word.
+
+    DRIFT is the checker's exit 1, which covers three findings its report tags
+    apart: [drift], [override] (a drop-in) and [vanished] (a committed unit).
+    """
+
+    PARITY = "parity"
+    DRIFT = "drift"
+    ABSENT = "absent"
+    UNKNOWN = "unknown"
+
+
+# The checker's documented exit codes, believed only once DASHBOARD_PARITY_TAG
+# shows it reported: exit 2 is also python3's can't-open-file and argparse's
+# usage-error status, and an uncaught traceback exits 1. Any other code is
+# not a parity claim and reads as UNKNOWN.
+UNIT_PARITY_VERDICTS: dict[int, UnitParityVerdict] = {
+    0: UnitParityVerdict.PARITY,
+    1: UnitParityVerdict.DRIFT,
+    2: UnitParityVerdict.ABSENT,
+}
 
 
 def log(msg: str) -> None:
@@ -1146,7 +1208,7 @@ def _atomic_write_json(path: str, payload: dict) -> bool:
     """Atomically write *payload* as JSON to *path*; return True iff it landed.
 
     The shared write primitive behind every piece of persisted watchdog state
-    (fm deploy clock, fm liveness streak, fm liveness restart clock) — extracted
+    (every clock, and the fm liveness streak) — extracted
     in task 3764 so the mkdir/mktemp/write/rename dance is defined ONCE rather
     than copy-pasted per state file. Python analogue of
     restart-all-orchestrators.sh's stamp_fleet_deploy_clock: mkdir -p, mktemp a
@@ -1234,8 +1296,8 @@ def _read_clock_epoch(path: str, label: str) -> float | None:
 
     The shared CLOCK-layer read primitive, one level above _read_json_state
     (which owns the missing/corrupt/non-object branches) — extracted so the
-    three watchdog clocks cannot drift apart in their fail-open contracts.
-    All three write and read the same ``{ts, iso, source, pytest_session}``
+    watchdog's clocks cannot drift apart in their fail-open contracts.
+    Every one writes and reads the same ``{ts, iso, source, pytest_session}``
     schema that restart-all-orchestrators.sh's ``stamp_fleet_deploy_clock`` and
     ``StaleServiceRestartCoordinator._load_last_fire_wall`` agree on, so a
     single ``float(ts)`` extraction serves every tier. The two provenance keys
@@ -1273,8 +1335,8 @@ def _stamp_clock(path: str) -> bool:
     not have to decode a bare number, plus the two provenance keys below.
 
     SCHEMA {ts, iso, source, pytest_session} (task 4823; ts/iso predate it).
-    The two provenance keys are ADDITIVE and inert to every reader — all three
-    extract `ts` and nothing else — and what they are FOR is stated once, in
+    The two provenance keys are ADDITIVE and inert to every reader — each
+    extracts `ts` and nothing else — and what they are FOR is stated once, in
     df_pytest_isolation.py::deploy_clock_change_report. The one contract this
     writer must hold on its own: `pytest_session` is ALWAYS present, empty
     included, because empty is the positive statement "no pytest session was an
@@ -1296,10 +1358,9 @@ def _stamp_clock(path: str) -> bool:
     merely their convenience) must inspect that value and say so at their own
     call site — see _stamp_fm_liveness_restart_clock.
 
-    All three clocks this serves (fleet-adjacent, fm deploy, fm liveness
-    restart) get the fields uniformly. The liveness clock is not one of the
-    guarded paths, but a schema that diverged between siblings is exactly the
-    drift these mirrors exist to prevent.
+    Every clock this serves gets the fields uniformly, whether or not it is
+    one of the guarded paths: a schema that diverged between siblings is
+    exactly the drift these mirrors exist to prevent.
     """
     now = time.time()
     return _atomic_write_json(
@@ -1316,13 +1377,13 @@ def _stamp_clock(path: str) -> bool:
 def _within_min_interval(secs: int, read_epoch: Callable[[], float | None]) -> bool:
     """Return True iff *read_epoch*'s clock is newer than *secs* seconds ago.
 
-    The shared min-interval GATE, extracted so all three caps share one
-    definition of "too soon" rather than three copies that could drift.
+    The shared min-interval GATE, extracted so every cap shares one
+    definition of "too soon" rather than a copy each that could drift.
 
     Takes the clock READER rather than a path on purpose: each cap's named
-    reader (_read_last_fleet_deploy_epoch, _read_last_fm_deploy_epoch,
-    _read_last_fm_liveness_restart_epoch) stays the single seam the tests
-    substitute at, so a wrapper can never silently bypass its own reader.
+    reader (_read_last_fleet_deploy_epoch and its siblings) stays the single
+    seam the tests substitute at, so a wrapper can never silently bypass its
+    own reader.
 
     Two fail directions, both toward LETTING the caller act:
       - *secs* <= 0 disables the cap outright, and the clock is not even read
@@ -1416,8 +1477,8 @@ def _read_fleet_lease() -> dict | None:
 
     The LEASE-layer read primitive, one level above _read_json_state (which
     owns the missing/corrupt/non-object branches), so the lease inherits one
-    fail-open contract shared with the three clocks rather than introducing a
-    fourth. A MISSING file is the normal "no sweep running" case and is
+    fail-open contract shared with the clocks rather than introducing another.
+    A MISSING file is the normal "no sweep running" case and is
     deliberately SILENT — logging it would spam the journal every 60s tick;
     corrupt/unreadable/non-object IS logged and swallowed.
 
@@ -1882,6 +1943,96 @@ def _record_fm_liveness_failure(
             count = prior_count + 1
     _write_fm_liveness_streak(count, verdict, now)
     return count
+
+
+def _read_last_unit_parity_epoch() -> float | None:
+    """Return the last dashboard unit-parity check epoch, or None.
+
+    Thin named reader over _read_clock_epoch, like its fleet and fm siblings,
+    so this stays the seam tests substitute at. Fail-open: None means the
+    check is due.
+    """
+    return _read_clock_epoch(UNIT_PARITY_CLOCK_PATH, "unit-parity clock")
+
+
+def _within_unit_parity_min_interval() -> bool:
+    """Return True iff the last parity check is newer than UNIT_PARITY_MIN_INTERVAL_SECS."""
+    return _within_min_interval(UNIT_PARITY_MIN_INTERVAL_SECS, _read_last_unit_parity_epoch)
+
+
+def unit_parity_verdict() -> tuple[UnitParityVerdict, str]:
+    """Run the dashboard unit-parity checker; return ``(verdict, report)``.
+
+    *verdict* is PARITY / DRIFT / ABSENT (the checker's own exit codes 0/1/2,
+    see UNIT_PARITY_VERDICTS) or UNKNOWN when the checker could not run, ran
+    but produced no DASHBOARD_PARITY_TAG report of its own, or exited with
+    anything else. The tag is checked FIRST, as
+    scripts/setup-host.sh::_parity_verdict does. *report* is the checker's
+    combined stdout and stderr — how an operator learns WHICH finding it
+    made, or why the checker did not report.
+
+    ``--installed-dir`` is deliberately not passed: the checker's own default
+    is the one setup-host.sh gates against, and re-deriving it here would be a
+    second copy of it.
+
+    Read-only, and never raises — same contract as probe_port and log(): a
+    tooling failure in an observational check must not abort the tick.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, DASHBOARD_PARITY_SCRIPT, "--repo-root", REPO_DIR],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=UNIT_PARITY_TIMEOUT_SECS,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return UnitParityVerdict.UNKNOWN, f"{type(exc).__name__}: {exc}"
+    report = "\n".join(
+        part.strip() for part in (result.stdout, result.stderr) if part and part.strip()
+    )
+    if DASHBOARD_PARITY_TAG not in report:
+        return UnitParityVerdict.UNKNOWN, (
+            f"checker produced no {DASHBOARD_PARITY_TAG} report "
+            f"(exit {result.returncode}): {report or 'no output'}"
+        )
+    verdict = UNIT_PARITY_VERDICTS.get(result.returncode)
+    if verdict is None:
+        return UnitParityVerdict.UNKNOWN, f"checker exited {result.returncode}: {report}"
+    return verdict, report
+
+
+def unit_parity_pass() -> None:
+    """Report dashboard unit drift to the journal, at most once per min-interval.
+
+    Purely observational and read-only: it runs the checker and logs, and
+    never installs, reloads or restarts anything — there is no --fix by
+    design (see the checker's module docstring).
+
+    The clock is stamped on ATTEMPT, before the checker runs, so a
+    persistently broken checker is retried hourly rather than on every tick.
+    Only DRIFT is a WARNING. ABSENT is silent: the dashboard units are not
+    installed on this host, which setup-host.sh already treats as benign. A
+    checker that could not run gets one plain line, so a broken gate stays
+    distinguishable from a green one.
+
+    Never raises: an unexpected failure is logged so it cannot abort the tick.
+    """
+    try:
+        if _within_unit_parity_min_interval():
+            return
+        _stamp_clock(UNIT_PARITY_CLOCK_PATH)
+        verdict, report = unit_parity_verdict()
+        if verdict == UnitParityVerdict.DRIFT:
+            log(
+                "WARNING: dashboard unit parity: directive drift, a drop-in "
+                "override, or a vanished committed unit — the checker's "
+                f"[drift] / [override] / [vanished] report says which:\n{report}"
+            )
+        elif verdict == UnitParityVerdict.UNKNOWN:
+            log(f"dashboard unit parity: checker could not run, parity unknown: {report}")
+    except Exception as exc:  # noqa: BLE001
+        log(f"dashboard unit parity pass error: {exc!r}")
 
 
 def _unit_active_state(unit: str) -> str | None:
@@ -3010,6 +3161,33 @@ def _print_fused_memory_liveness() -> None:
     )
 
 
+def _print_unit_parity() -> None:
+    """Print the dashboard unit-parity row for ``--report``.
+
+    The operator's right-now view of the check unit_parity_pass() runs hourly.
+    NOT clock-gated — an operator asking now wants an answer now — and it
+    writes no clock, so running --report never shifts the timer path's
+    cadence.
+
+    On DRIFT the checker's own tagged report follows the row, naming the
+    finding without a second command; on UNKNOWN the reason the checker could
+    not run follows it instead.
+
+    Informational only, like the fm row: never alters report()'s exit code.
+    An unexpected failure degrades the verdict to a logged UNKNOWN rather
+    than crashing --report after report() has already computed its exit code.
+    """
+    try:
+        verdict, detail = unit_parity_verdict()
+    except Exception as exc:  # noqa: BLE001
+        log(f"watchdog error printing the dashboard unit parity row: {exc}")
+        verdict, detail = UnitParityVerdict.UNKNOWN, ""
+    checker = os.path.relpath(DASHBOARD_PARITY_SCRIPT, REPO_DIR)
+    print(f"dashboard unit parity: {verdict} | CHECKER: {checker}")
+    if verdict in (UnitParityVerdict.DRIFT, UnitParityVerdict.UNKNOWN) and detail:
+        print(detail)
+
+
 def _cli(argv: list[str] | None = None) -> int:
     """Dispatch the CLI: ``--stamp-fm-deploy-clock`` / ``--report`` / timer path.
 
@@ -3021,21 +3199,24 @@ def _cli(argv: list[str] | None = None) -> int:
     restart-fused-memory.sh exit-0 (task 2714).
 
     If ``--report`` is present, runs the read-only report() followed by the
-    read-only _print_fused_memory_liveness() (B4) and returns report()'s OWN
-    exit code (0 = all fresh, 1 = at least one stale unit) — the fm row is
-    informational only and never alters this exit code. main(),
-    fused_memory_liveness_pass(), staleness_pass(), and
-    fused_memory_staleness_pass() are NOT invoked under --report, so this path
-    never mutates systemd state (I7 at the CLI boundary): the fm staleness
-    backstop runs on the timer path only.
+    read-only _print_fused_memory_liveness() (B4) and _print_unit_parity()
+    rows, and returns report()'s OWN exit code (0 = all fresh, 1 = at least
+    one stale unit) — both rows are informational only and never alter this
+    exit code. main(), fused_memory_liveness_pass(), staleness_pass(),
+    fused_memory_staleness_pass() and unit_parity_pass() are NOT invoked under
+    --report, so this path never mutates systemd state or stamps a clock (I7
+    at the CLI boundary): the fm staleness backstop and the hourly parity
+    check run on the timer path only.
 
     Otherwise runs the timer path: the liveness passes first (main() =
     orchestrator liveness, then fused_memory_liveness_pass() = fm liveness),
     then the scheduled clock-gated deploys (staleness_pass() = orchestrator
-    fleet, then fused_memory_staleness_pass() = fm backstop, task 2714), and
+    fleet, then fused_memory_staleness_pass() = fm backstop, task 2714), then
+    unit_parity_pass() (the dashboard unit-parity check, task 4883), and
     returns 0 — grouping immediate brokenness-revives ahead of scheduled
-    deploys (I5). Unknown flags are not treated as an error — they fall through
-    to the timer path.
+    deploys (I5). The parity pass runs LAST on the same argument: it is purely
+    observational and must never delay a revive. Unknown flags are not treated
+    as an error — they fall through to the timer path.
     """
     argv = sys.argv[1:] if argv is None else argv
     if "--stamp-fm-deploy-clock" in argv:
@@ -3048,11 +3229,13 @@ def _cli(argv: list[str] | None = None) -> int:
     if "--report" in argv:
         rc = report()
         _print_fused_memory_liveness()
+        _print_unit_parity()
         return rc
     main()
     fused_memory_liveness_pass()
     staleness_pass()
     fused_memory_staleness_pass()
+    unit_parity_pass()
     return 0
 
 
