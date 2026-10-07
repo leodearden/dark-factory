@@ -33,11 +33,15 @@ from collections.abc import Mapping
 
 import pytest
 from _role_splice_contract import (
+    BASH_CAPABLE_UNPINNED_ROLES,
     MARKDOWN_HEADING,
     SpliceContract,
     assert_brace_free,
     assert_nonempty,
+    bash_capable_unpinned,
+    bash_capable_unpinned_contract,
 )
+from shared.prompt_artifact import PromptSpec
 
 from orchestrator.agents.roles import ROLES, AgentRole
 
@@ -240,6 +244,85 @@ def test_the_capability_predicate_is_genuinely_a_parameter() -> None:
     with pytest.raises(AssertionError) as excinfo:
         only_alpha.assert_role_set_matches_capability(remedy=_REMEDY)
     assert "gained=['beta']" in str(excinfo.value)
+
+
+_SYNTHETIC_PROMPT_SPEC = PromptSpec(prompt_id='p', contract='c', baseline_heuristics='h')
+
+
+@pytest.mark.parametrize(
+    ('role', 'expected'),
+    [
+        (AgentRole(name='alpha', system_prompt=_SPLICE, allowed_tools=['Bash']), True),
+        (AgentRole(name='alpha', system_prompt=_SPLICE, allowed_tools=['Bash(git:*)']), False),
+        (AgentRole(name='alpha', system_prompt=_SPLICE, allowed_tools=[]), False),
+        (
+            AgentRole(
+                name='alpha',
+                system_prompt=_SPLICE,
+                allowed_tools=['Bash'],
+                prompt_spec=_SYNTHETIC_PROMPT_SPEC,
+            ),
+            False,
+        ),
+    ],
+    ids=['literal-bash', 'git-only-bash', 'no-tools', 'prompt-spec-backed'],
+)
+def test_bash_capable_unpinned_predicate(role: AgentRole, expected: bool) -> None:
+    """Literal prompt AND the exact `'Bash'` grant; `'Bash(git:*)'` does not qualify."""
+    assert bash_capable_unpinned(role) is expected
+
+
+def _bash_capable_mapping(**extra: AgentRole) -> dict[str, AgentRole]:
+    """Every shared-set name as a literal Bash role, plus both excluded shapes.
+
+    `judge` (git-only `Bash`) and a PromptSpec-backed `Bash` holder are both
+    present so each exclusion arm of the predicate meets a role to exclude.
+    """
+    mapping = {
+        name: AgentRole(name=name, system_prompt=_SPLICE, allowed_tools=['Bash'])
+        for name in BASH_CAPABLE_UNPINNED_ROLES
+    }
+    mapping['judge'] = AgentRole(
+        name='judge', system_prompt=_SPLICE, allowed_tools=['Bash(git:*)']
+    )
+    mapping['reviewer_synthetic'] = AgentRole(
+        name='reviewer_synthetic',
+        system_prompt=_SPLICE,
+        allowed_tools=['Bash'],
+        prompt_spec=_SYNTHETIC_PROMPT_SPEC,
+    )
+    mapping.update(extra)
+    return mapping
+
+
+def test_bash_capable_unpinned_contract_binds_the_shared_set() -> None:
+    """The factory binds the shared set, the shared predicate and the caller's constant."""
+    contract = bash_capable_unpinned_contract(
+        'SPLICE_UNIT', _SPLICE, all_roles=_bash_capable_mapping()
+    )
+
+    assert contract.roles is BASH_CAPABLE_UNPINNED_ROLES
+    assert contract.constant == _SPLICE
+    assert contract.constant_name == 'SPLICE_UNIT'
+    assert contract.assert_role_set_matches_capability(remedy=_REMEDY) is None
+    # Identity check only, as in `test_all_roles_defaults_to_the_real_roles_mapping`.
+    assert bash_capable_unpinned_contract('SPLICE_UNIT', _SPLICE).all_roles is ROLES
+
+
+def test_bash_capable_unpinned_contract_fires_when_a_role_gains_bash() -> None:
+    """A new literal `Bash` role is reported as gained, naming the shared set."""
+    gamma = AgentRole(name='gamma', system_prompt=_SPLICE, allowed_tools=['Bash'])
+    contract = bash_capable_unpinned_contract(
+        'SPLICE_UNIT', _SPLICE, all_roles=_bash_capable_mapping(gamma=gamma)
+    )
+
+    with pytest.raises(AssertionError) as excinfo:
+        contract.assert_role_set_matches_capability(remedy=_REMEDY)
+
+    message = str(excinfo.value)
+    assert "gained=['gamma']" in message
+    assert 'BASH_CAPABLE_UNPINNED_ROLES' in message
+    assert _REMEDY in message
 
 
 def test_every_role_carries_passes_when_the_whole_set_carries_the_constant() -> None:
