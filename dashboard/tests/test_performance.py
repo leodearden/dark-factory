@@ -2130,10 +2130,12 @@ def _task_row(
     duration_ms: int = 1000,
     verify_attempts: int = 0,
     review_cycles: int = 0,
+    steward_invocations: int = 0,
 ) -> tuple:
     return (
         f'run-{project_id}', task_id, project_id, None, outcome, 0.0, duration_ms,
-        0, 0, verify_attempts, review_cycles, 0.0, 0, completed_at.isoformat(),
+        0, 0, verify_attempts, review_cycles, 0.0, steward_invocations,
+        completed_at.isoformat(),
     )
 
 
@@ -2567,3 +2569,132 @@ class TestCardsAcrossRunsDbs:
             assert ttc['count'] == 1
         for statements in (statements_a, statements_b):
             assert sum('MAX(completed_at)' in sql for sql in statements) == 1
+
+
+# ---------------------------------------------------------------------------
+# Cancel outcomes are attempts stopped from outside, not task outcomes (task 6424)
+# ---------------------------------------------------------------------------
+
+
+def _rows_with_cancels(now: datetime) -> list[tuple]:
+    """'proj' finishes d1 one-pass and blocks b1 among four cancels, the latest
+    of which (c2) is newer than d1. 'redeployed-idle' last completed 20 days
+    ago, then had a slot cancelled at shutdown. 'drained' holds only a cancel."""
+    return [
+        _task_row('d1', 'proj', now - timedelta(hours=1)),
+        _task_row('b1', 'proj', now - timedelta(hours=2), outcome='blocked'),
+        _task_row(
+            'c1', 'proj', now - timedelta(minutes=50), outcome='cancelled', steward_invocations=1,
+        ),
+        _task_row('s1', 'proj', now - timedelta(minutes=45), outcome='soft-cancelled'),
+        _task_row('c2', 'proj', now - timedelta(minutes=30), outcome='cancelled'),
+        _task_row('c3', 'proj', now - timedelta(hours=5), outcome='cancelled'),
+        _task_row('i1', 'redeployed-idle', now - timedelta(days=20)),
+        _task_row('r1', 'redeployed-idle', now - timedelta(minutes=10), outcome='cancelled'),
+        _task_row('x1', 'drained', now - timedelta(minutes=10), outcome='cancelled'),
+    ]
+
+
+@pytest.fixture()
+async def cancels_conn(tmp_path):
+    db_path = _make_runs_db(tmp_path, 'cancels.db', _rows_with_cancels(CARDS_NOW))
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        yield conn
+
+
+class TestCancelOutcomesAreNotCounted:
+    """A cancel ('cancelled' or 'soft-cancelled') ends an attempt from outside:
+    no performance reading counts one, so a redeploy moves no card."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_history_cache(self):
+        _HISTORY_CACHE.clear()
+
+    @pytest.mark.asyncio
+    async def test_completion_paths_count_no_cancel(self, cancels_conn, empty_escalations_dir):
+        result = await get_completion_paths(
+            cancels_conn, empty_escalations_dir, days=CARDS_DAYS, now=CARDS_NOW,
+        )
+        assert result['proj'] == [
+            {'path': 'one-pass', 'count': 1, 'pct': 50.0},
+            {'path': 'blocked', 'count': 1, 'pct': 50.0},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_aggregated_card_paths_count_no_cancel(
+        self, cancels_conn, empty_escalations_dir,
+    ):
+        result = await aggregate_completion_paths(
+            [cancels_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+        assert result['proj'] == [
+            {'path': 'one-pass', 'count': 1, 'pct': 50.0},
+            {'path': 'blocked', 'count': 1, 'pct': 50.0},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_escalation_rates_count_no_cancel(self, cancels_conn, empty_escalations_dir):
+        rates = (await get_escalation_rates(
+            cancels_conn, empty_escalations_dir, days=CARDS_DAYS, now=CARDS_NOW,
+        ))['proj']
+        assert rates['total_tasks'] == 2
+        assert rates['steward_count'] == 0
+        assert rates['steward_rate'] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_history_counts_no_cancel(self, cancels_conn):
+        """The 07:00 hour holds only the cancel c3, so it gets no label; the
+        11:00 cancels neither dilute d1 nor add c1's steward; 'drained' holds
+        only a cancel, so discovery does not find it."""
+        history = await aggregate_performance_history(
+            [cancels_conn], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+        proj = history['proj']
+        assert proj['one_pass_history'] == {
+            'labels': ['2026-09-30T10:00', '2026-09-30T11:00'], 'values': [0.0, 100.0],
+        }
+        assert proj['escalation_history'] == {
+            'labels': ['2026-09-30T10:00', '2026-09-30T11:00'], 'values': [0.0, 0.0],
+        }
+        assert 'drained' not in history
+
+    @pytest.mark.asyncio
+    async def test_a_later_cancel_keeps_the_history_cache(self, cancels_conn):
+        """The history it buckets counts no cancel, so a redeploy's cancel
+        must not invalidate the cached per-project hour buckets."""
+        await aggregate_performance_history([cancels_conn], days=CARDS_DAYS, now=CARDS_NOW)
+        cached_keys = set(_HISTORY_CACHE)
+        assert cached_keys
+
+        await cancels_conn.execute(
+            'INSERT INTO task_results '
+            '(run_id, task_id, project_id, title, outcome, cost_usd, duration_ms, '
+            ' agent_invocations, execute_iterations, verify_attempts, review_cycles, '
+            ' steward_cost_usd, steward_invocations, completed_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            _task_row('c4', 'proj', CARDS_NOW - timedelta(minutes=5), outcome='cancelled'),
+        )
+        await cancels_conn.commit()
+        await aggregate_performance_history([cancels_conn], days=CARDS_DAYS, now=CARDS_NOW)
+
+        assert set(_HISTORY_CACHE) == cached_keys
+
+    @pytest.mark.asyncio
+    async def test_cards_age_and_list_by_completions_not_cancels(
+        self, cancels_conn, empty_escalations_dir,
+    ):
+        """Fresh exactly when the window's tally counts a completion: a
+        redeploy's cancel alone neither lists a project nor freshens one."""
+        cards = await aggregate_performance_cards(
+            [cancels_conn], [empty_escalations_dir], days=CARDS_DAYS, now=CARDS_NOW,
+        )
+        assert set(cards) == {'proj', 'redeployed-idle'}
+        assert cards['proj'].state is DatumState.FRESH
+        assert cards['proj'].as_of == CARDS_NOW - timedelta(hours=1)
+        idle = cards['redeployed-idle']
+        assert idle.state is DatumState.STALE
+        assert idle.as_of == CARDS_NOW - timedelta(days=20)
+        assert idle.value is not None and idle.value.to_wire()['paths'] == []
+        for datum in cards.values():
+            validate_datum(datum, CARDS_NOW)

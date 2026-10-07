@@ -77,13 +77,20 @@ def _cutoff(days: int, *, now: datetime | None = None) -> str:
     return (resolve_now(now) - timedelta(days=days)).isoformat()
 
 
+# A cancel ends an attempt from outside (shutdown drain, operator cancel, takeover); the resumed attempt
+# records its own row, so no reading counts one. Values of orchestrator/src/orchestrator/workflow_types.py::WorkflowOutcome.
+_NOT_A_CANCEL = "outcome NOT IN ('cancelled', 'soft-cancelled')"
+
+
 async def _latest_completions(db: aiosqlite.Connection) -> dict[str, str]:
     """Return ``{project_id: MAX(completed_at)}`` for every project with a
-    recorded completion — the projects a card family tallies by default."""
+    recorded completion, a cancel not counting (see ``_NOT_A_CANCEL``) —
+    the projects a card family tallies by default."""
     rows = await db.execute_fetchall(
         'SELECT project_id, MAX(completed_at) '
         '  FROM task_results '
         " WHERE completed_at IS NOT NULL AND completed_at != '' "
+        f'   AND {_NOT_A_CANCEL} '
         ' GROUP BY project_id',
     )
     return {row[0]: row[1] for row in rows}
@@ -128,7 +135,8 @@ async def get_completion_paths(
 
     Returns {project_id: [{path: str, count: int, pct: float}, ...]} for each
     of *projects* (default: every project with a recorded completion).
-    Paths: one-pass, multi-pass, via-steward, via-interactive, blocked.
+    Paths: one-pass, multi-pass, via-steward, via-interactive, blocked; a
+    cancel outcome is no path and is not counted (see ``_NOT_A_CANCEL``).
     """
     escalations = _load_escalations(escalations_dir)
 
@@ -147,7 +155,8 @@ async def get_completion_paths(
             'SELECT project_id, task_id, outcome, review_cycles, '
             '       steward_invocations '
             '  FROM task_results '
-            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? ',
+            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? '
+            f'  AND {_NOT_A_CANCEL} ',
             since,
             projects,
         )
@@ -563,7 +572,8 @@ async def get_escalation_rates(
             db,
             'SELECT project_id, task_id, steward_invocations '
             '  FROM task_results '
-            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? ',
+            ' WHERE project_id IN (SELECT value FROM json_each(?)) AND completed_at >= ? '
+            f'  AND {_NOT_A_CANCEL} ',
             since,
             projects,
         )
@@ -728,7 +738,7 @@ async def get_time_centiles(
 # table.  /api/v2/dashboard/performance is hit every 3s, so the per-DB
 # query is wrapped in a tiny self-invalidating cache keyed by
 # (project_id, days, max(completed_at)) — bucketing only changes when a new
-# task_results row arrives, so the key is deterministic.
+# counted (non-cancel) task_results row arrives, so the key is deterministic.
 
 _HISTORY_CACHE: dict[tuple, dict] = {}
 _HISTORY_CACHE_MAX = 64
@@ -738,9 +748,10 @@ async def _project_max_completed(
     db: aiosqlite.Connection,
     project_id: str,
 ) -> str:
-    """Return the most recent completed_at for *project_id* (empty string if none)."""
+    """Return the most recent completed_at for *project_id* (empty string if none),
+    a cancel not counting (see ``_NOT_A_CANCEL``), as ``_hour_bucketed_history`` counts none."""
     async with db.execute(
-        "SELECT MAX(completed_at) FROM task_results WHERE project_id = ?",
+        f'SELECT MAX(completed_at) FROM task_results WHERE project_id = ? AND {_NOT_A_CANCEL}',
         (project_id,),
     ) as cur:
         row = await cur.fetchone()
@@ -778,7 +789,7 @@ async def _hour_bucketed_history(
     # strftime appears only in the SELECT/ORDER BY, not the WHERE clause, so
     # it does not defeat the index either.
     rows = await db.execute_fetchall(
-        """
+        f"""
         SELECT strftime('%Y-%m-%dT%H:00', completed_at) AS bucket,
                duration_ms,
                outcome,
@@ -789,6 +800,7 @@ async def _hour_bucketed_history(
            AND completed_at >= ?
            AND completed_at IS NOT NULL
            AND completed_at != ''
+           AND {_NOT_A_CANCEL}
          ORDER BY bucket
         """,
         (project_id, _cutoff(days, now=now)),
@@ -849,7 +861,7 @@ async def _per_db_history(
 ) -> dict[str, list]:
     """Cached wrapper for ``_hour_bucketed_history`` keyed by max(completed_at).
 
-    The bucket layout only changes when a new task_results row arrives, so
+    The bucket layout only changes when a new counted task_results row arrives, so
     the cache is deterministic and self-invalidating. LRU-trim at
     ``_HISTORY_CACHE_MAX`` keeps memory bounded across many projects.
 
@@ -951,7 +963,7 @@ async def aggregate_performance_history(
         try:
             rows = await db.execute_fetchall(
                 'SELECT DISTINCT project_id FROM task_results '
-                'WHERE completed_at >= ?',
+                f'WHERE completed_at >= ? AND {_NOT_A_CANCEL}',
                 (since,),
             )
             pid_sets.append({r[0] for r in rows if r[0]})
