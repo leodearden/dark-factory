@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 import httpx
 import pytest
@@ -23,6 +24,10 @@ class _PerPortHandler:
     ``TaskRuntimeSnapshot(...).model_dump(mode='json')``) to return on
     tools/call. ``fail_ports`` raise httpx.ConnectError. ``slow_ports``
     sleep before responding (to drive the timeout path).
+    ``stall_ports`` BLOCK the loop thread (``time.sleep``) before handling —
+    a starved xdist worker: host wall clock moves while the loop cannot run.
+    Unlike ``slow_ports`` (an in-loop await), a stall cannot move a
+    shared/src/shared/testing_virtual_clock.py::virtual_clock_test loop clock.
     ``error_status_ports`` maps port -> HTTP status returned on the
     tools/call leg, which ``mcp_tool_call``'s ``raise_for_status()`` turns
     into an ``httpx.HTTPStatusError`` (the "orchestrator answered, but
@@ -38,18 +43,22 @@ class _PerPortHandler:
         *,
         fail_ports: set[int] | None = None,
         slow_ports: dict[int, float] | None = None,
+        stall_ports: dict[int, float] | None = None,
         error_status_ports: dict[int, int] | None = None,
         raise_ports: dict[int, BaseException] | None = None,
     ):
         self.responses = responses or {}
         self.fail_ports = fail_ports or set()
         self.slow_ports = slow_ports or {}
+        self.stall_ports = stall_ports or {}
         self.error_status_ports = error_status_ports or {}
         self.raise_ports = raise_ports or {}
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         port = request.url.port
         assert port is not None
+        if port in self.stall_ports:
+            time.sleep(self.stall_ports[port])
         if port in self.raise_ports:
             raise self.raise_ports[port]
         if port in self.fail_ports:
@@ -95,6 +104,10 @@ def _clean_probe_log_state():
     reset_probe_log_state()
     yield
     reset_probe_log_state()
+
+
+_PROBE_DEADLINE_SECONDS = 0.05
+_HOST_STALL_SECONDS = 2 * _PROBE_DEADLINE_SECONDS
 
 
 def _urls(*ports: int) -> dict[str, str]:
@@ -178,11 +191,12 @@ class TestFetchTaskRuntime:
         handler = _PerPortHandler(
             {8100: TaskRuntimeSnapshot().model_dump(mode='json')},
             slow_ports={8105: 0.5},
+            stall_ports={8100: _HOST_STALL_SECONDS},
         )
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as client:
             result = await fetch_task_runtime(
-                client, _urls(8100, 8105), per_call_timeout=0.05,
+                client, _urls(8100, 8105), per_call_timeout=_PROBE_DEADLINE_SECONDS,
             )
 
         assert result['proj8100'].offline is False
