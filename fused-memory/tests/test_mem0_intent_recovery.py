@@ -13,6 +13,8 @@ real WriteJournal via set_write_journal.
 
 from __future__ import annotations
 
+import datetime
+import logging
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
@@ -134,6 +136,66 @@ class TestAddMemoryIntentBracketing:
         failed = await journal.get_mem0_intents(status='failed')
         assert len(failed) == 1
         assert 'mem0 down' in (failed[0]['reason'] or '')
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'meta',
+        [
+            pytest.param({'x_tags': {'a', 'b'}}, id='set-value'),
+            pytest.param({'x_when': datetime.datetime(2026, 1, 1)}, id='datetime-value'),
+            pytest.param({'x_nested': {1: 'a', 'b': 'c'}}, id='nested-mixed-keys'),
+        ],
+    )
+    async def test_unjournalable_metadata_fails_open_past_the_digest(
+        self, recovery_service, recovery_journal, caplog, meta
+    ):
+        """A digest that cannot serialize the metadata never strands the Graphiti twin."""
+        svc = recovery_service
+
+        with caplog.at_level(logging.ERROR, logger='fused_memory.services.memory_service'):
+            result = await svc.add_memory(
+                content='always pin dependencies exactly',
+                category='preferences_and_norms',
+                project_id='proj-x',
+                metadata=dict(meta),
+                dual_write=True,
+                causation_id='cause-digest',
+            )
+
+        assert svc.mem0.add.await_count == 1
+        assert SourceStore.graphiti in result.stores_written
+        assert SourceStore.mem0 in result.stores_written
+        mem0_beops = [
+            op
+            for op in await recovery_journal.get_ops_by_causation('cause-digest')
+            if op['layer'] == 'backend_op' and op['backend'] == 'mem0'
+        ]
+        assert [op['success'] for op in mem0_beops] == [1]
+        assert any(
+            r.levelno == logging.ERROR
+            and r.name == 'fused_memory.services.memory_service'
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_digest_failure_still_journals_intent_without_digest(
+        self, recovery_service, recovery_journal
+    ):
+        """Losing the digest costs only the fingerprint, never the write-ahead intent."""
+        svc = recovery_service
+        content = 'always pin dependencies exactly'
+
+        await svc.add_memory(
+            content=content,
+            category='preferences_and_norms',
+            project_id='proj-x',
+            metadata={'x_nested': {1: 'a', 'b': 'c'}},
+        )
+
+        completed = await recovery_journal.get_mem0_intents(status='completed')
+        assert len(completed) == 1
+        assert completed[0]['payload_digest'] is None
+        assert completed[0]['content'] == content
 
 
 # ---------------------------------------------------------------------------
