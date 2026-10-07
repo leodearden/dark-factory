@@ -26,14 +26,14 @@ FIGURES = (
 )
 
 
-def _item(key: str, truth, *, kind: str | None = None, verdict: Verdict | None = None):
+def _item(key: str, truth, *, kind: str | None = None, majority: Verdict | None = None):
     return ev.ScoredItem(
         key=key,
         child_text=f'child {key}',
         parent_text=f'parent {key}',
         truth=truth,
         kind_at_rating=kind,
-        verdict=verdict,
+        majority=majority,
     )
 
 
@@ -126,12 +126,12 @@ class TestWilson95:
 class TestKindAgreement:
     def test_an_arm_agrees_when_it_heals_the_kind_the_majority_heals(self):
         items = [
-            _item('s1', T.AGREEING, kind='sighting', verdict=Verdict.EXTENDS),
-            _item('s2', T.AGREEING, kind='sighting', verdict=Verdict.SAME),
-            _item('h1', T.MISFILE, kind=None, verdict=Verdict.RELATED),
-            _item('h2', T.AGREEING, kind='correction', verdict=Verdict.EXTENDS),
-            _item('am', T.AGREEING, kind='amendment', verdict=Verdict.EXTENDS),
-            _item('pe', T.AGREEING, kind='peer', verdict=Verdict.SAME),
+            _item('s1', T.AGREEING, kind='sighting', majority=Verdict.EXTENDS),
+            _item('s2', T.AGREEING, kind='sighting', majority=Verdict.SAME),
+            _item('h1', T.MISFILE, kind=None, majority=Verdict.RELATED),
+            _item('h2', T.AGREEING, kind='correction', majority=Verdict.EXTENDS),
+            _item('am', T.AGREEING, kind='amendment', majority=Verdict.EXTENDS),
+            _item('pe', T.AGREEING, kind='peer', majority=Verdict.SAME),
         ]
         verdicts = [
             _said('s1', Verdict.EXTENDS),
