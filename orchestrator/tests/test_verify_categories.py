@@ -1206,3 +1206,118 @@ class TestIndeterminateExclusionsAreAdjudicated:
         )
         assert INDETERMINATE_VERDICT_CATEGORIES < INFRA_TRANSIENT_CATEGORIES
         assert len(INDETERMINATE_VERDICT_CATEGORIES) == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 4843: LINT_ERROR / TYPE_ERROR name the red gate a lint or type leg
+# reached, and INFRA_ABORT names a pytest-xdist leg torn down from outside the
+# tests before it reached a verdict. All rank-related work for the three lives
+# here, once.
+# ---------------------------------------------------------------------------
+
+
+class TestLintTypeAndInfraAbortCategories:
+    """The three members, their adjudicated policy rows, and the deliberate
+    severity order. The order rule: a leg's branch verdict is never masked by
+    ANOTHER leg's infra-transient category (task #4103)."""
+
+    _NEVER_MASKED = (
+        "a leg's branch verdict is never masked by ANOTHER leg's "
+        'infra-transient category'
+    )
+
+    def test_member_values(self):
+        from orchestrator.verify_categories import FailureCategory
+        assert FailureCategory.LINT_ERROR == 'lint_error'
+        assert FailureCategory.TYPE_ERROR == 'type_error'
+        assert FailureCategory.INFRA_ABORT == 'infra_abort'
+
+    @pytest.mark.parametrize('name', ['LINT_ERROR', 'TYPE_ERROR'])
+    def test_lint_and_type_rows_mirror_unknown_test_failure(self, name):
+        """Only the name changes for a lint/type red: every derived registry
+        keeps UNKNOWN_TEST_FAILURE's membership, asserted side by side."""
+        from orchestrator.verify_categories import (
+            ARCHIVE_DENY_LIST,
+            CATEGORY_POLICY,
+            INDETERMINATE_VERDICT_CATEGORIES,
+            INFRA_TRANSIENT_CATEGORIES,
+            PREEXISTING_BREAK_SKIP_CATEGORIES,
+            FailureCategory,
+            RetryKind,
+            should_archive,
+        )
+        member = FailureCategory[name]
+        mirror = FailureCategory.UNKNOWN_TEST_FAILURE
+        row = CATEGORY_POLICY[member]
+        assert row.archive is True
+        assert row.preexisting_probe is True
+        assert row.is_infra_transient is False
+        assert row.verdict_indeterminate is False
+        assert row.retry_kind == RetryKind.NONE
+        registries = (
+            INFRA_TRANSIENT_CATEGORIES,
+            INDETERMINATE_VERDICT_CATEGORIES,
+            ARCHIVE_DENY_LIST,
+            PREEXISTING_BREAK_SKIP_CATEGORIES,
+        )
+        for registry in registries:
+            assert member not in registry
+            assert (member in registry) == (mirror in registry)
+        assert should_archive(member.value) is True
+        assert should_archive(member.value) == should_archive(mirror.value)
+
+    def test_infra_abort_row(self):
+        from orchestrator.verify_categories import (
+            CATEGORY_POLICY,
+            INDETERMINATE_VERDICT_CATEGORIES,
+            INFRA_TRANSIENT_CATEGORIES,
+            PREEXISTING_BREAK_SKIP_CATEGORIES,
+            FailureCategory,
+            RetryKind,
+        )
+        row = CATEGORY_POLICY[FailureCategory.INFRA_ABORT]
+        assert row.archive is True
+        assert row.preexisting_probe is False
+        assert row.is_infra_transient is True
+        assert row.verdict_indeterminate is False
+        assert row.retry_kind == RetryKind.NONE
+        assert 'infra_abort' in INFRA_TRANSIENT_CATEGORIES
+        assert 'infra_abort' in PREEXISTING_BREAK_SKIP_CATEGORIES
+        assert 'infra_abort' not in INDETERMINATE_VERDICT_CATEGORIES
+        assert set(INDETERMINATE_VERDICT_CATEGORIES) == {'infra_kill'}
+
+    @pytest.mark.parametrize(
+        ('stronger', 'weaker'),
+        [
+            ('pytest_internalerror', 'test_failure'),
+            ('test_failure', 'type_error'),
+            ('type_error', 'lint_error'),
+            ('lint_error', 'unknown_test_failure'),
+            ('unknown_test_failure', 'infra_abort'),
+            ('infra_abort', 'env_transient'),
+            ('env_transient', 'passed'),
+        ],
+    )
+    def test_severity_order(self, stronger, weaker):
+        from orchestrator.verify_categories import CATEGORY_PRIORITY
+        assert CATEGORY_PRIORITY.index(stronger) < CATEGORY_PRIORITY.index(weaker), (
+            f'{stronger} must outrank {weaker}: {self._NEVER_MASKED}'
+        )
+
+    @pytest.mark.parametrize(
+        ('legs', 'expected'),
+        [
+            (['test_failure', 'env_transient'], 'test_failure'),
+            (['unknown_test_failure', 'env_transient'], 'unknown_test_failure'),
+            (['lint_error', 'infra_abort'], 'lint_error'),
+            (['type_error', 'lint_error'], 'type_error'),
+            (['test_failure', 'lint_error'], 'test_failure'),
+            (['env_transient'], 'env_transient'),
+            (['infra_kill', 'test_failure'], 'infra_kill'),
+        ],
+    )
+    def test_worst_category_across_legs(self, legs, expected):
+        from orchestrator.verify import _worst_category
+        assert _worst_category(legs) == expected, (
+            f'{legs} -> {expected}: {self._NEVER_MASKED}'
+        )
