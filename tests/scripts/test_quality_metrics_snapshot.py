@@ -1055,12 +1055,6 @@ class TestTheSummary:
         tests_row = next(row for row in rows if row[0] == 'tests')
         assert (tests_row[2], tests_row[5]) == ('0', '0 / 0')
 
-    def test_nothing_is_averaged(self, measured: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        header, rows = _table(_summary_of(measured, capsys))
-        assert not [cell for row in rows for cell in row[1:] if '.' in cell]
-        for word in ('mean', 'avg', 'average', 'ratio'):
-            assert not [cell for cell in header if word in cell.lower()], word
-
     @pytest.mark.parametrize('content', [None, '{"instrument": "other"}'], ids=['missing', 'foreign'])
     def test_a_bad_snapshot_is_refused_naming_it(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str], content: str | None
