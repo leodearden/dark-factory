@@ -73,6 +73,7 @@ from shared.testing_timeout_markers import (
     DELIBERATE_TIGHT_BOUND_CEILING,
     SiteKind,
     TimeoutSite,
+    inversion_failure_message,
     inverts,
     scan_python_tree,
     timeout_marker_sites,
@@ -2083,37 +2084,14 @@ def test_no_timeout_marker_sits_in_the_inversion_band() -> None:
     )
 
     offenders = _in_band_sites()
-    if offenders:
-        offender_list = '\n  '.join(
-            f'{module}::{site.qualname} ({site.kind}, line {site.lineno}) pins '
-            f'{site.seconds:g}s'
-            for module, site in sorted(offenders, key=lambda pair: (pair[0], pair[1].qualname))
-        )
-        raise AssertionError(
-            f'{len(offenders)} timeout marker(s) in the inversion band '
-            f'({DELIBERATE_TIGHT_BOUND_CEILING} < N < {VERIFY_CLI_PER_TEST_TIMEOUT}).\n\n'
-            'A marker there is a TWO-WAY override, not a floor: it REPLACES '
-            'the ambient budget in both directions, so a number big enough to '
-            'give a slow test room, yet below the '
-            f'--timeout={VERIFY_CLI_PER_TEST_TIMEOUT} verify passes, silently '
-            'tightens the run that actually gates your merge. Exceeding it '
-            "does NOT fail the test: pytest-timeout's thread method os._exit()s "
-            'the xdist worker, --max-worker-restart=0 declines to replace it, '
-            'and the truncated session blames an innocent test that merely '
-            'shared it.\n\n'
-            'Write one of:\n\n'
-            '    from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT\n'
-            '    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)   # slow test\n\n'
-            f'    @pytest.mark.timeout(N)  # N <= {DELIBERATE_TIGHT_BOUND_CEILING}, a '
-            'DELIBERATE tight bound\n\n'
-            'The second is for a test that asserts something happens FAST (see '
-            "test_verify_clock_stop.py's 15s watchdog marks); it is small "
-            'enough to read as that deliberate bound, which is why it is '
-            'allowed. Anything in between '
-            'inverts. Full rationale: the VERIFY_CLI_PER_TEST_TIMEOUT comment '
-            'block in _orch_helpers.py.'
-            f'\n\nOffending sites:\n  {offender_list}'
-        )
+    assert not offenders, inversion_failure_message(
+        offenders,
+        verify_cli_budget=VERIFY_CLI_PER_TEST_TIMEOUT,
+        slow_test_marker=(
+            'from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT\n'
+            '@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)   # slow test'
+        ),
+    )
 
 
 def test_the_marker_census_is_not_vacuous() -> None:

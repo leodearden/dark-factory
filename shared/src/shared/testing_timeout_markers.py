@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import re
+import textwrap
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -18,11 +19,15 @@ from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_va
 
 __all__ = [
     'DELIBERATE_TIGHT_BOUND_CEILING',
+    'GrandfatherRatchet',
     'SiteKind',
     'TimeoutSite',
     'TreeScan',
+    'grandfather_ratchet',
+    'inversion_failure_message',
     'inverts',
     'scan_python_tree',
+    'stale_grandfather_message',
     'timeout_marker_sites',
     'verify_cli_timeout',
 ]
@@ -258,3 +263,90 @@ def scan_python_tree(
             continue
         items.extend(extract(module, tree))
     return TreeScan(tuple(items), examined, tuple(unreadable))
+
+
+def inversion_failure_message(
+    offenders: Iterable[tuple[str, TimeoutSite]],
+    *,
+    verify_cli_budget: int,
+    slow_test_marker: str,
+) -> str:
+    """The failure text every package's guard prints for its in-band *offenders*.
+
+    *slow_test_marker* is the package's own spelling of "this test is slow",
+    offered first among the two remedies.
+    """
+    ordered = sorted(offenders, key=lambda pair: (pair[0], pair[1].qualname))
+    sites = '\n  '.join(
+        f'{module}::{site.qualname} ({site.kind}, line {site.lineno}) pins {site.seconds:g}s'
+        for module, site in ordered
+    )
+    return (
+        f'{len(ordered)} timeout marker(s) in the inversion band '
+        f'({DELIBERATE_TIGHT_BOUND_CEILING} < N < {verify_cli_budget}).\n\n'
+        'A marker there is a TWO-WAY override, not a floor: it REPLACES the '
+        'ambient budget in both directions, so a number big enough to give a '
+        'slow test room, yet below the '
+        f'--timeout={verify_cli_budget} verify passes, silently clamps the run '
+        'that actually gates your merge to N. Under timeout_method="thread" a '
+        'breach does not even fail that one test: it kills the whole xdist '
+        'worker. Which suites run thread, and why: '
+        'tests/scripts/test_timeout_method_policy.py.\n\n'
+        'Write one of:\n\n'
+        f'{textwrap.indent(slow_test_marker, "    ")}\n\n'
+        f'    @pytest.mark.timeout(N)  # N <= {DELIBERATE_TIGHT_BOUND_CEILING}, a '
+        'DELIBERATE tight bound\n\n'
+        'The second is for a test that asserts something happens FAST; it is '
+        'small enough to read as that deliberate bound, which is why it is '
+        'allowed. Anything in between inverts. Full rationale: '
+        'shared/src/shared/testing_timeout_markers.py.'
+        f'\n\nOffending sites:\n  {sites}'
+    )
+
+
+@dataclass(frozen=True)
+class GrandfatherRatchet:
+    """In-band sites checked against a per-site allowlist that may only shrink.
+
+    ``new_offenders`` are the in-band sites the allowlist does not name.
+    ``stale`` are the allowlist's ``(module, qualname)`` keys, sorted, that name
+    no live in-band site -- a raised or deleted marker, or a renamed test --
+    and so must be removed before they admit a newcomer reusing the name.
+    """
+
+    new_offenders: tuple[tuple[str, TimeoutSite], ...]
+    stale: tuple[tuple[str, str], ...]
+
+
+def grandfather_ratchet(
+    in_band: Iterable[tuple[str, TimeoutSite]],
+    grandfathered: frozenset[tuple[str, str]],
+) -> GrandfatherRatchet:
+    """Split *in_band* against *grandfathered*, keyed per SITE as ``(module, qualname)``.
+
+    Per site and never a per-module count, because a count nets to zero when
+    one marker is added and another removed in the same module.
+    """
+    in_band = tuple(in_band)
+    live = {(module, site.qualname) for module, site in in_band}
+    return GrandfatherRatchet(
+        new_offenders=tuple(
+            (module, site)
+            for module, site in in_band
+            if (module, site.qualname) not in grandfathered
+        ),
+        stale=tuple(sorted(grandfathered - live)),
+    )
+
+
+def stale_grandfather_message(stale: Iterable[tuple[str, str]]) -> str:
+    """The failure text for allowlist entries :func:`grandfather_ratchet` found stale."""
+    entries = tuple(stale)
+    listing = '\n  '.join(f'{module}::{qualname}' for module, qualname in entries)
+    return (
+        f'{len(entries)} grandfathered timeout marker site(s) no longer sit in '
+        'the inversion band: the marker was raised or removed, or the test was '
+        'renamed. Delete the entries from the allowlist, which may only ever '
+        'shrink; a stale entry would silently admit a new in-band marker that '
+        f'reuses its name.\n  {listing}'
+    )
