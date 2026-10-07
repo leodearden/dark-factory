@@ -932,6 +932,7 @@ class _MergeFinalizedKey(Enum):
     request_id = "json_extract(data, '$.request_id') = ?"
     branch = "json_extract(data, '$.branch') = ?"
     task_id = 'task_id = ?'
+    superseded_by = "json_extract(data, '$.superseded_by') = ?"
 
 
 class EventStore:
@@ -1059,6 +1060,25 @@ class EventStore:
             'latest_merge_finalized', key, value, cross_run=cross_run, latest_only=True,
         )
         return rows[0] if rows else None
+
+    def merge_finalized_superseded_by(
+        self, superseded_by: str, *, cross_run: bool = False,
+    ) -> list[dict]:
+        """Return the member rows a coalesce-* train id or a gen-(n+1) request id superseded.
+
+        Oldest first, in latest_merge_finalized's projection and run scope
+        (plans/merge-status-durable-non-landed-prd.md D7).  Fire-safe: errors
+        are logged and return [].
+        """
+        if not superseded_by:
+            return []
+        return self._select_merge_finalized(
+            'merge_finalized_superseded_by',
+            _MergeFinalizedKey.superseded_by,
+            superseded_by,
+            cross_run=cross_run,
+            latest_only=False,
+        )
 
     def _select_merge_finalized(
         self,
