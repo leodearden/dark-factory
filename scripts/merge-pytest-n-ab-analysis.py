@@ -75,15 +75,7 @@ def arm_at(arms: list[tuple[datetime, str]], ts: datetime) -> str:
     return cur
 
 
-# DIVERGED TWIN: scripts/load-threshold-calibration.py::pct began as a verbatim
-# copy of this function and now deliberately differs. The twin picks its index
-# with math.floor(p * (len(ys) - 1) + 0.5) so the exact-.5 tie-break does not
-# alternate with the parity of n; this copy keeps int(round(...)) (banker's
-# rounding). The divergence is intended to persist: this consumer only reads
-# p90 of merge durations, where the tie-break is immaterial. They stay separate
-# copies because both scripts must run under the system python3 with stdlib
-# only and scripts/ is not a package. Do not "sync" either copy without
-# reading the other.
+# Twin of scripts/load-threshold-calibration.py::pct (rationale there); this copy keeps banker's rounding.
 def pct(xs: list[float], p: float) -> float:
     if not xs:
         return float('nan')
