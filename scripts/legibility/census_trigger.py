@@ -86,7 +86,7 @@ block directly with a light pyyaml read, falling back to defaults on a
 missing/malformed file. Those defaults ARE sourced from β's
 `legibility.config.Census` pydantic model (scripts/legibility/config.py),
 though -- now that β has landed, it is the single source of truth for the
-eight census threshold values, so `CensusConfig`'s fields read their defaults
+census threshold values, so `CensusConfig`'s fields read their defaults
 from it rather than re-hardcoding them (see the `CensusConfig` docstring).
 
 The get_statuses done-count fetch is injected (`status_fetcher`), not a
@@ -179,7 +179,7 @@ def _as_utc(value: datetime | None) -> datetime | None:
 # CensusConfig — §7.4 census: block, with hardcoded defaults
 # ---------------------------------------------------------------------------
 
-# Single source of truth for the eight census threshold *values*: task β's
+# Single source of truth for the census threshold *values*: task β's
 # `Census` pydantic model (scripts/legibility/config.py), instantiated once
 # at import time. `CensusConfig` below stays its own flat dataclass (not
 # `Census` itself) because its nested `novelty_spike` block's shape doesn't
@@ -192,7 +192,7 @@ _CENSUS_DEFAULTS = _LegibilityCensus()
 
 @dataclass(frozen=True)
 class CensusConfig:
-    """The eight census-trigger thresholds. Field defaults are sourced
+    """The census-trigger thresholds. Field defaults are sourced
     from `legibility.config.Census` (see `_CENSUS_DEFAULTS` above), not
     re-hardcoded here. `from_mapping` merges a partial override mapping
     (e.g. the `census:` sub-dict of a project's legibility.yaml) over these
@@ -228,7 +228,7 @@ class CensusConfig:
         whole batch is reported in exactly one WARNING. This method NEVER
         raises.
 
-        Per-field fallback, not a whole-block reject, because the eight
+        Per-field fallback, not a whole-block reject, because the
         thresholds are independent: one typo'd `novelty_spike.count` must not
         also disarm the (a) max-interval backstop.
 
@@ -603,7 +603,7 @@ def load_census_config(project_root: str | Path) -> CensusConfig:
     A file that parses but holds an unusable threshold VALUE (a quoted
     `'10'`, a float, a JSON `true`, a negative) is handled one level down by
     `CensusConfig.from_mapping`, which rejects that field alone -- default
-    plus one WARNING for the batch -- so the other seven thresholds stay live.
+    plus one WARNING for the batch -- so the other thresholds stay live.
     Between the two, this function returns a fully-typed `CensusConfig` for
     any input whatsoever, which is what makes its never-raises contract, and
     `decide_for_project`'s, actually hold.
