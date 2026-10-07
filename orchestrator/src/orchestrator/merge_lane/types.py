@@ -136,6 +136,21 @@ class _InFlightEntry:
     primary_future: asyncio.Future | None = field(default=None, repr=False)
     """The dispatcher's future (waiter #1).  Resolved by the worker;
     its done-callbacks fan the terminal outcome out to all attached waiters."""
+    coalesced_request_ids: list[str] = field(default_factory=list)
+    """request_ids coalesced onto this entry at the merge_request door.  They
+    are not waiters: no future mirror, no detach."""
+
+    def absorbed_request_ids(self) -> tuple[str, ...]:
+        """Every other request whose outcome is this entry's primary's outcome.
+
+        The current waiters (so a detached one has already dropped out) then
+        the door-coalesced ids, de-duplicated in order, without the entry's own
+        request_id.
+        """
+        candidates = [w.request_id for w in self.waiters] + self.coalesced_request_ids
+        return tuple(
+            rid for rid in dict.fromkeys(candidates) if rid and rid != self.request_id
+        )
 
 
 _INFLIGHT_MERGE_ETA_ESTIMATE_SECS: int = 600
@@ -414,6 +429,28 @@ class InFlightMergeRegistry:
     def entry(self, branch: str) -> _InFlightEntry | None:
         """Return the in-flight entry for *branch*, or None if free."""
         return self._slots.get(branch)
+
+    def primary_entry(self, branch: str, future: asyncio.Future) -> _InFlightEntry | None:
+        """The live entry for *branch* only while *future* is its primary.
+
+        The same object-identity discipline as :meth:`_release_if_current`: a
+        request that enqueued without owning the slot gets None.
+        """
+        entry = self._slots.get(branch)
+        if entry is None or entry.primary_future is not future:
+            return None
+        return entry
+
+    def record_coalesced(self, branch: str, request_id: str) -> bool:
+        """Note *request_id* as coalesced onto the live entry for *branch*.
+
+        Returns False, and records nothing, when *branch* is free.
+        """
+        entry = self._slots.get(branch)
+        if entry is None:
+            return False
+        entry.coalesced_request_ids.append(request_id)
+        return True
 
     def eta_seconds(self, branch: str) -> int | None:
         """Best-effort ETA (seconds) for the in-flight merge of *branch*.
