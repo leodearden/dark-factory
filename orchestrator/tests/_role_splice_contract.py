@@ -70,6 +70,25 @@ from orchestrator.agents.roles import ROLES, AgentRole
 # no-opped when the heading was not found.
 MARKDOWN_HEADING = '\n## '
 
+#: The carrier set of roles.py::_BASH_CAPABLE_ROLE_PREAMBLE. Outside it: judge
+#: (`Bash(git:*)` only) and reviewer_comprehensive (PromptSpec-backed, also
+#: `Bash(git:*)`). A block whose carriers differ declares its own set rather
+#: than editing this one.
+BASH_CAPABLE_UNPINNED_ROLES = frozenset({
+    'architect',
+    'debugger',
+    'deep_reviewer',
+    'implementer',
+    'merger',
+    'simple_task',
+    'steward',
+})
+
+
+def bash_capable_unpinned(role: AgentRole) -> bool:
+    """The capability BASH_CAPABLE_UNPINNED_ROLES derives from; `Bash(git:*)` does not qualify."""
+    return role.prompt_spec is None and 'Bash' in role.allowed_tools
+
 
 def assert_nonempty(name: str, value: str, *, remedy: str) -> None:
     """Assert ``value`` has non-whitespace content.
@@ -430,3 +449,21 @@ class SpliceContract:
             "earliest_allowed); an `offset` or `follows_offset` of 'ABSENT' means "
             f'that block is missing from the role entirely. {remedy}'
         )
+
+
+def bash_capable_unpinned_contract(
+    constant_name: str,
+    constant: str,
+    *,
+    all_roles: Mapping[str, AgentRole] = ROLES,
+) -> SpliceContract:
+    """A SpliceContract over BASH_CAPABLE_UNPINNED_ROLES and its shared predicate."""
+    return SpliceContract(
+        constant_name=constant_name,
+        constant=constant,
+        roles=BASH_CAPABLE_UNPINNED_ROLES,
+        role_set_name='BASH_CAPABLE_UNPINNED_ROLES (in _role_splice_contract.py)',
+        capability=bash_capable_unpinned,
+        capability_description='a literal system_prompt and unqualified `Bash`',
+        all_roles=all_roles,
+    )
