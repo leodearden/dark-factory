@@ -345,22 +345,24 @@ class TestAsyncSqliteBaseClose:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
 class TestAsyncSqliteBaseContextManager:
     """Tests for AsyncSqliteBase.__aenter__ and __aexit__."""
 
+    @pytest.mark.asyncio
     async def test_aenter_opens_connection(self, tmp_path: Path) -> None:
         """__aenter__ opens the connection (_conn is not None inside the block)."""
         store = _SimpleStore(tmp_path / 'store.db')
         async with store:
             assert store._conn is not None
 
+    @pytest.mark.asyncio
     async def test_aenter_returns_self(self, tmp_path: Path) -> None:
         """__aenter__ returns self."""
         store = _SimpleStore(tmp_path / 'store.db')
         async with store as ctx:
             assert ctx is store
 
+    @pytest.mark.asyncio
     async def test_aexit_closes_connection_on_normal_exit(self, tmp_path: Path) -> None:
         """__aexit__ closes the connection after the block exits normally."""
         store = _SimpleStore(tmp_path / 'store.db')
@@ -368,6 +370,7 @@ class TestAsyncSqliteBaseContextManager:
             pass
         assert store._conn is None
 
+    @pytest.mark.asyncio
     async def test_aexit_closes_connection_on_exception(self, tmp_path: Path) -> None:
         """__aexit__ closes the connection even when the body raises."""
         store = _SimpleStore(tmp_path / 'store.db')
