@@ -58,10 +58,10 @@ try:
     _ORCHESTRATOR_AVAILABLE = True
 except ImportError:
     _ORCHESTRATOR_AVAILABLE = False
-    # Satisfy pyright's definite-assignment check.  The TestMergeStatus class
-    # is guarded by @pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE) so these
-    # stubs are never exercised at runtime.  Annotating as Any lets pyright
-    # treat every subsequent use (calls, attribute access) as valid.
+    # Satisfy pyright's definite-assignment check.  Every merge-tool test
+    # class is guarded by @pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE) so
+    # these stubs are never exercised at runtime.  Annotating as Any lets
+    # pyright treat every subsequent use (calls, attribute access) as valid.
     OrchestratorConfig: Any = None
     EventStore: Any = None
     EventType: Any = None
@@ -3749,6 +3749,7 @@ class TestPromoteToL2SentinelIdentity:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestMergeRequestDedup:
     """Server-level de-dup tests for merge_request.
 
@@ -4328,6 +4329,7 @@ class TestMergeRequestDedup:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestMergeRequestWorkflowVerifyEmission:
     """merge_request(verified_green=True) emits a workflow_verify row."""
 
@@ -4767,6 +4769,7 @@ async def _call_get_merge_queue(server) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(not _ORCHESTRATOR_AVAILABLE, reason='orchestrator package not installed')
 class TestGetMergeQueue:
     """Tests for the get_merge_queue escalation MCP tool."""
 
