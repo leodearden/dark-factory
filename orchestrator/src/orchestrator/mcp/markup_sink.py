@@ -35,6 +35,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from shared.eval_lane import is_eval_worktree_path
+
 logger = logging.getLogger(__name__)
 
 #: Where the queue lives under project_root — the same relative path
@@ -432,7 +434,20 @@ def file_residue(
     Filed under the residue ANCHOR, never under the leaking task's own id: at
     the ``level=2`` the middleware declares, a pending record carrying a live
     task id halts that task. See :attr:`MarkupSinkSpec.residue_anchor_task_id`.
+
+    A residue from an eval worktree is not filed at all (task 6479): plan-tools
+    is injected into every eval cell, and this direct ``queue.submit`` bypasses
+    the eval-lane gate in
+    ``escalation/src/escalation/server.py::_chokepoint_or_submit``. The
+    ``None`` returned tells the middleware nothing was preserved, which is true.
     """
+    if is_eval_worktree_path(worktree):
+        logger.info(
+            'markup guard: not filing the residue of %s.%s from eval worktree %s '
+            '(subject %r): an eval-lane artifact is not a production signal',
+            record.get('tool'), record.get('field'), worktree, subject_task_id,
+        )
+        return None
     esc = escalation_cls(
         id=queue.make_id(spec.residue_anchor_task_id),
         task_id=spec.residue_anchor_task_id,
@@ -659,7 +674,8 @@ def make_escalation_sink(
 
     Returns the id of the queued record, which the middleware folds into the
     caller-facing refusal so the payload can be looked up — or ``None`` when
-    the queue could not take it.
+    nothing was filed (the queue could not take it, or the residue came from an
+    eval worktree — see :func:`file_residue`).
 
     THE FLOOR IS THE QUEUE OR NOTHING, for every boundary on this sink. A
     record the queue cannot take is logged once at ERROR and answered with
