@@ -278,6 +278,39 @@ def stderr_tail(raw: bytes, *, limit: int = 2000) -> str:
     return raw.decode(errors='replace')[-limit:]
 
 
+#: How long :func:`drain_exited_stderr` keeps reading before it gives up on EOF.
+STDERR_DRAIN_CEILING_SECS: float = 2.0
+
+
+def drain_exited_stderr(
+    proc: subprocess.Popen, *, ceiling_secs: float = STDERR_DRAIN_CEILING_SECS
+) -> bytes:
+    """Return the raw bytes still unread on an EXITED *proc*'s stderr pipe.
+
+    Reads until EOF or *ceiling_secs*, whichever comes first.  A buffered
+    ``.read()`` is wrong here because it blocks until EOF: ``poll()`` reports
+    only *proc*'s own exit, and a helper it spawned with inherited fds can
+    still hold the pipe's write end open.  A live *proc* is refused, because
+    any snapshot of a still-running writer is racy.
+    """
+    if proc.poll() is None:
+        raise AssertionError(f'pid {proc.pid} has not exited; its stderr is still being written')
+    if proc.stderr is None:
+        raise AssertionError(f'pid {proc.pid} was not spawned with stderr=PIPE')
+    chunks = []
+    read_deadline = time.monotonic() + ceiling_secs
+    fd = proc.stderr.fileno()
+    while True:
+        remaining = read_deadline - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            break
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b''.join(chunks)
+
+
 def apply_dispatcher_env(monkeypatch) -> None:
     """Patch THIS process's os.environ for a direct (in-process) real-dispatcher call.
 
@@ -507,30 +540,17 @@ def describe_proc_exit(proc: subprocess.Popen, label: str) -> str:
     causes that were otherwise indistinguishable in every log this timeout
     has ever produced; a non-leader *proc* follows its own exit-code
     conventions, not this taxonomy.  ``stderr`` is read ONLY when
-    ``proc.poll()`` is not None, and even then via a ``select()``-bounded raw
-    read (2s ceiling) rather than a buffered ``.read()`` (which blocks to
-    EOF): ``poll()`` only reports *proc*'s own exit, and a short-lived helper
-    it spawned with inherited fds could still be holding the pipe's write end
-    open, which would hang this helper (and the rest of the suite) rather
-    than raise.  The tail (not head) is kept -- see :func:`stderr_tail` --
-    since the actionable line is at the END.
+    ``proc.poll()`` is not None, and even then through
+    :func:`drain_exited_stderr`'s bounded read, so a helper still holding the
+    write end cannot hang this helper (and the rest of the suite).  The tail
+    (not head) is kept -- see :func:`stderr_tail` -- since the actionable line
+    is at the END.
     """
     rc = proc.poll()
     description = f'{label} rc={rc}'
     if rc is not None and proc.stderr is not None:
         try:
-            chunks = []
-            read_deadline = time.monotonic() + 2.0
-            fd = proc.stderr.fileno()
-            while True:
-                remaining = read_deadline - time.monotonic()
-                if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
-                    break
-                chunk = os.read(fd, 65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            tail = stderr_tail(b''.join(chunks))
+            tail = stderr_tail(drain_exited_stderr(proc))
         except Exception as e:  # noqa: BLE001
             tail = f'<unreadable: {e!r}>'
         description += f'; stderr tail:\n{tail}'
