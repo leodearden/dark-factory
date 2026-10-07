@@ -1,7 +1,6 @@
 """Tests for reconciliation stage configuration (CLI-native MCP execution)."""
 
 import contextlib
-import itertools
 import json
 import logging
 import subprocess
@@ -19,6 +18,7 @@ from _fm_helpers import (
     complete_paged_read,
     make_8df8_scenario,
 )
+from _tool_surface_classification import assert_tool_surface_classified
 from shared.cli_invoke import AgentResult, AllAccountsCappedException
 
 import fused_memory.reconciliation.stages.base as base_module
@@ -454,40 +454,24 @@ class TestDisallowedToolLists:
             for tool in asyncio.run(server.list_tools())
         }
 
-        unclassified = (
-            registered
-            - set(DISALLOW_ESCALATION_READS)
-            - set(DISALLOW_ESCALATION_WRITES)
-            - _REVIEWED_STAGE_SAFE
+        assert_tool_surface_classified(
+            registered,
+            {
+                'DISALLOW_ESCALATION_READS': DISALLOW_ESCALATION_READS,
+                'DISALLOW_ESCALATION_WRITES': DISALLOW_ESCALATION_WRITES,
+                '_REVIEWED_STAGE_SAFE': _REVIEWED_STAGE_SAFE,
+            },
+            remedy=(
+                'Add each escalation-server tool to DISALLOW_ESCALATION_READS '
+                '(cli_stage_runner.py) if a stage must not call it — the default for '
+                'anything that READS per-task escalation state, since a stage is wired '
+                'to the reconciliation queue and would read a categorical [] as proof '
+                'of absence — or to DISALLOW_ESCALATION_WRITES if it FILES an '
+                'escalation (denied in Stage 1/3, kept by Stage 2 for FIX D), or to '
+                '_REVIEWED_STAGE_SAFE here once you have confirmed it is harmless '
+                'against that store.'
+            ),
         )
-        assert not unclassified, (
-            'These escalation-server tools are reachable from every recon stage '
-            f'and have not been classified: {sorted(unclassified)}. Either add each '
-            'to DISALLOW_ESCALATION_READS (cli_stage_runner.py) if a stage must not '
-            'call it — the default for anything that READS per-task escalation state, '
-            'since a stage is wired to the reconciliation queue and would read a '
-            'categorical [] as proof of absence — or to DISALLOW_ESCALATION_WRITES if '
-            'it FILES an escalation (denied in Stage 1/3, kept by Stage 2 for FIX D), '
-            'or add it to _REVIEWED_STAGE_SAFE here once you have confirmed it is '
-            'harmless against that store.'
-        )
-
-        # The denial must name tools that actually exist, or it is decoration.
-        stale = set(DISALLOW_ESCALATION_READS + DISALLOW_ESCALATION_WRITES) - registered
-        assert not stale, (
-            'DISALLOW_ESCALATION_READS / DISALLOW_ESCALATION_WRITES name tools the '
-            f'server no longer registers: {sorted(stale)}. Remove them, or fix the rename.'
-        )
-
-        # Each tool is classified exactly once: a name in two buckets is two
-        # contradictory decisions, and whichever reads first wins silently.
-        buckets = {
-            'DISALLOW_ESCALATION_READS': set(DISALLOW_ESCALATION_READS),
-            'DISALLOW_ESCALATION_WRITES': set(DISALLOW_ESCALATION_WRITES),
-            '_REVIEWED_STAGE_SAFE': _REVIEWED_STAGE_SAFE,
-        }
-        for (name_a, a), (name_b, b) in itertools.combinations(buckets.items(), 2):
-            assert not a & b, f'{name_a} and {name_b} both classify {sorted(a & b)}'
 
     def test_escalation_reads_denied_in_all_three_stages(self):
         """Every stage must deny the escalation read tools (task 3163).
@@ -544,24 +528,7 @@ class TestDisallowedToolLists:
             )
 
     def test_escalate_blocker_stays_allowed_in_stage2_only(self):
-        """The escalation WRITE path survives exactly where it is sanctioned.
-
-        ``escalate_blocker`` is the sole sanctioned recon escalation use — the
-        Stale Flag Escalation (FIX D) path in Stage 2 (prompts/stage2.py,
-        driven from stages/task_knowledge_sync.py::TaskKnowledgeSync).
-        Over-denying it there breaks FIX D outright, so this remains the
-        anti-over-denial guard; ``escalate_info`` keeps the prompt's either/or.
-
-        RETIRED ASSERTION: this test used to be
-        ``test_escalate_blocker_stays_allowed_in_every_stage`` and asserted the
-        tool was in NO stage list.  Since task 3163 the prompt layer has told
-        Stage 1 and Stage 3 "No escalation action is sanctioned in this stage"
-        (prompts/__init__.py::_ESCALATION_BOUNDARY_NO_ACTION), yet the deny
-        lists still let them call it — the prompt and the mechanism disagreed.
-        Task 3250 makes the mechanism match the prompt, so the guard is
-        narrowed to the one stage that holds the path, and the denial in the
-        other two is asserted positively.
-        """
+        """Stage 2 keeps both filing tools for FIX D; Stages 1 and 3 deny escalate_blocker."""
         for tool in ('mcp__escalation__escalate_blocker', 'mcp__escalation__escalate_info'):
             assert tool not in STAGE2_DISALLOWED, (
                 f'STAGE2_DISALLOWED must keep the sanctioned escalation write path {tool}'

@@ -18,8 +18,13 @@ test pins what the list says, not what the server exposes.
 """
 
 import asyncio
-import itertools
+import functools
 from unittest.mock import AsyncMock
+
+from _tool_surface_classification import (
+    assert_pairwise_disjoint,
+    assert_tool_surface_classified,
+)
 
 from fused_memory.reconciliation.cli_stage_runner import (
     DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES,
@@ -105,11 +110,16 @@ _STAGE_LISTS = {
 }
 
 
-def _registered_tool_names() -> set[str]:
+@functools.cache
+def _registered_tool_names() -> frozenset[str]:
     svc = AsyncMock()
     svc.durable_queue = None
     server = create_mcp_server(svc)
-    return {f'{_PREFIX}{tool.name}' for tool in asyncio.run(server.list_tools())}
+    return frozenset(f'{_PREFIX}{tool.name}' for tool in asyncio.run(server.list_tools()))
+
+
+def _fused_memory_names(tools) -> frozenset[str]:
+    return frozenset(name for name in tools if name.startswith(_PREFIX))
 
 
 def test_every_fused_memory_server_tool_is_classified():
@@ -121,28 +131,31 @@ def test_every_fused_memory_server_tool_is_classified():
     classification check and a direct enforcement of Stage 3's contract. It
     also stays right when a future bucket is added.
     """
-    unclassified = (
-        _registered_tool_names() - set(STAGE3_DISALLOWED) - _REVIEWED_FUSED_MEMORY_STAGE_SAFE
-    )
-    assert not unclassified, (
-        f'These fused-memory tools are reachable from every recon stage, the '
-        f'read-only Stage 3 included, and have not been classified: '
-        f'{sorted(unclassified)}. Stage gating is deny-list only, so an unlisted '
-        f'mutator is silently callable — the update_memory incident. Put each '
-        f'mutating tool in exactly one bucket in cli_stage_runner.py: '
-        f'DISALLOW_MEMORY_WRITES (denied in Stage 3 only), DISALLOW_TASK_WRITES '
-        f'(denied in Stage 1 and Stage 3; Stage 2 files tasks), or '
-        f'DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES (denied in every stage). A '
-        f'tool that only reads goes in _REVIEWED_FUSED_MEMORY_STAGE_SAFE here — '
-        f'a decision that it mutates nothing, not a formality.'
+    assert_tool_surface_classified(
+        _registered_tool_names(),
+        {
+            'STAGE3_DISALLOWED': _fused_memory_names(STAGE3_DISALLOWED),
+            '_REVIEWED_FUSED_MEMORY_STAGE_SAFE': _REVIEWED_FUSED_MEMORY_STAGE_SAFE,
+        },
+        remedy=(
+            'The read-only Stage 3 is among them, so an unlisted mutator is the '
+            'update_memory incident. Put each mutating fused-memory tool in exactly '
+            'one bucket in cli_stage_runner.py: DISALLOW_MEMORY_WRITES (denied in '
+            'Stage 3 only), DISALLOW_TASK_WRITES (denied in Stage 1 and Stage 3; '
+            'Stage 2 files tasks), or DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES '
+            '(denied in every stage). A tool that only reads goes in '
+            '_REVIEWED_FUSED_MEMORY_STAGE_SAFE here — a decision that it mutates '
+            'nothing, not a formality.'
+        ),
     )
 
 
 def test_no_reviewed_safe_tool_is_named_for_a_mutation():
-    """The reviewed-safe set must not become the path of least resistance.
+    """A cheap name-prefix backstop against parking a mutator in the reviewed-safe set.
 
-    A name that leads with a mutating verb is almost certainly a mutator, and
-    parking it here to silence the guard above would re-open the hole.
+    It catches only mutators named for their verb; one with a neutral name
+    passes. Read-only-ness rests on the human review that
+    ``_REVIEWED_FUSED_MEMORY_STAGE_SAFE`` records, not on this test.
     """
     suspicious = sorted(
         name
@@ -157,12 +170,9 @@ def test_no_reviewed_safe_tool_is_named_for_a_mutation():
 
 def test_every_denied_fused_memory_tool_is_registered():
     """A denial naming a tool the server does not register is decoration."""
-    denied = {
-        name
-        for stage_list in _STAGE_LISTS.values()
-        for name in stage_list
-        if name.startswith(_PREFIX)
-    }
+    denied = _fused_memory_names(
+        name for stage_list in _STAGE_LISTS.values() for name in stage_list
+    )
     stale = denied - _registered_tool_names()
     assert not stale, (
         f'The stage disallow lists name fused-memory tools the server no longer '
@@ -170,30 +180,9 @@ def test_every_denied_fused_memory_tool_is_registered():
     )
 
 
-def test_every_reviewed_safe_tool_is_registered():
-    """A stale reviewed-safe entry would hide a rename behind a passing guard."""
-    stale = _REVIEWED_FUSED_MEMORY_STAGE_SAFE - _registered_tool_names()
-    assert not stale, (
-        f'_REVIEWED_FUSED_MEMORY_STAGE_SAFE names tools the server no longer '
-        f'registers: {sorted(stale)}. Remove them, or fix the rename.'
-    )
-
-
-def test_reviewed_safe_tools_are_not_denied_to_stage3():
-    """A tool cannot be safe for the read-only stage and denied to it."""
-    contradictory = _REVIEWED_FUSED_MEMORY_STAGE_SAFE & set(STAGE3_DISALLOWED)
-    assert not contradictory, (
-        f'Both reviewed-safe and denied to Stage 3: {sorted(contradictory)}'
-    )
-
-
 def test_fused_memory_deny_buckets_are_pairwise_disjoint():
     """Each tool sits in exactly one bucket; two would be contradictory decisions."""
-    for (name_a, a), (name_b, b) in itertools.combinations(
-        _FUSED_MEMORY_DENY_BUCKETS.items(), 2
-    ):
-        shared = set(a) & set(b)
-        assert not shared, f'{name_a} and {name_b} both classify {sorted(shared)}'
+    assert_pairwise_disjoint(_FUSED_MEMORY_DENY_BUCKETS)
 
 
 def test_stage_machinery_mutators_are_denied_in_every_stage():
