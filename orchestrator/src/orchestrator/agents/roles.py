@@ -14,6 +14,7 @@ from orchestrator.agents.grep_pattern_guidance import GREP_PATTERN_ESCAPING_GUID
 from orchestrator.agents.partial_failure_guidance import MULTI_PATH_PARTIAL_FAILURE_GUIDANCE
 from orchestrator.agents.path_not_found_guidance import PATH_NOT_FOUND_GUIDANCE
 from orchestrator.agents.pkill_guidance import PKILL_SELF_MATCH_GUIDANCE
+from orchestrator.agents.premise_refutation_guidance import PREMISE_REFUTATION_GUIDANCE
 from orchestrator.agents.python_literal_guidance import PASTED_TEXT_PYTHON_LITERAL_GUIDANCE
 from orchestrator.agents.sigpipe_guidance import SIGPIPE_UNDER_PIPEFAIL_GUIDANCE
 
@@ -1287,6 +1288,7 @@ _BASH_CAPABLE_ROLE_PREAMBLE = (
     + BASH_CWD_ANCHOR_GUIDANCE
     + FILE_LOOKUP_GUIDANCE
     + SIGPIPE_UNDER_PIPEFAIL_GUIDANCE
+    + PREMISE_REFUTATION_GUIDANCE
 )
 
 
