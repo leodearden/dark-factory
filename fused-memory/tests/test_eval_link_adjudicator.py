@@ -264,13 +264,19 @@ class TestTriageItems:
             ev.Exclusion.UNRATED: 1,
         }
 
-    @pytest.mark.parametrize('missing', ['entry_text', 'target_text'])
-    def test_a_pairs_row_without_a_text_key_is_refused(self, missing):
+    @pytest.mark.parametrize('missing', ['entry_id', 'target_id', 'entry_text', 'target_text'])
+    def test_a_pairs_row_without_a_key_is_refused(self, missing):
         row = _pair('e1', 't1')
         del row[missing]
 
         with pytest.raises(ValueError, match=missing):
             ev.triage_items([_vote('e1', 't1', 'SAME')], [row])
+
+    def test_a_pair_listed_twice_is_refused(self):
+        pairs = [_pair('e1', 't1', 'child one'), _pair('e1', 't1', 'child again')]
+
+        with pytest.raises(ValueError, match='twice'):
+            ev.triage_items([_vote('e1', 't1', 'SAME')], pairs)
 
 
 class TestBuildReport:
@@ -415,6 +421,70 @@ class TestHandLinkMode:
 
         assert code == 2
         assert 'line 1' in capsys.readouterr().err
+        assert not out.exists()
+
+
+def _jsonl_text(*rows: object) -> str:
+    return ''.join(json.dumps(row) + '\n' for row in rows)
+
+
+class TestTriageModeRefusesMalformedInput:
+    @pytest.mark.parametrize(
+        ('verdicts', 'pairs', 'named'),
+        [
+            pytest.param(
+                _jsonl_text(_vote('e1', 't1', 'SAME')),
+                _jsonl_text({'entry_text': 'c', 'target_id': 't1', 'target_text': 'p'}),
+                'entry_id',
+                id='pairs-row-without-entry-id',
+            ),
+            pytest.param(
+                _jsonl_text(_vote('e1', 't1', 'SAME')),
+                _jsonl_text(['e1', 't1']),
+                'line 1: not a JSON object',
+                id='pairs-line-a-list',
+            ),
+            pytest.param(
+                _jsonl_text(_vote('e1', 't1', 'SAME')),
+                _jsonl_text(_pair('e1', 't1'), 'e1'),
+                'line 2: not a JSON object',
+                id='pairs-line-a-string',
+            ),
+            pytest.param(
+                _jsonl_text(_vote('e1', 't1', 'SAME'), 7),
+                _jsonl_text(_pair('e1', 't1')),
+                'line 2: not a JSON object',
+                id='verdicts-line-a-number',
+            ),
+            pytest.param(
+                _jsonl_text(_vote('e1', 't1', 'SAME')),
+                _jsonl_text(_pair('e1', 't1'), _pair('e1', 't1')),
+                'twice',
+                id='pair-listed-twice',
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_it_exits_2_naming_the_fault(
+        self, verdicts, pairs, named, monkeypatch, tmp_path, capsys,
+    ):
+        monkeypatch.setenv('CONFIG_PATH', str(tmp_path / 'missing.yaml'))
+        verdicts_path = tmp_path / 'verdicts.jsonl'
+        verdicts_path.write_text(verdicts)
+        pairs_path = tmp_path / 'pairs.jsonl'
+        pairs_path.write_text(pairs)
+        out = tmp_path / 'report.json'
+
+        code = await ev.run(
+            [
+                '--corpus', str(verdicts_path), '--pairs', str(pairs_path),
+                '--arms', 'fake', '--out', str(out),
+            ],
+            ev.EvalEnv(config_loader=lambda _path: FusedMemoryConfig()),
+        )
+
+        assert code == 2
+        assert named in capsys.readouterr().err
         assert not out.exists()
 
 

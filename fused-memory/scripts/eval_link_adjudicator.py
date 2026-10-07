@@ -27,7 +27,7 @@ Two populations:
   by majority, with texts from a pairs file keyed ``entry_text`` and
   ``target_text``, the keys of task 6151's committed
   ``calibration/write_triage_pairs_to_rate.jsonl``. A pairs row lacking either
-  key is refused.
+  id or either text key, and a pair listed twice, are refused.
 
 Arm ``fake`` is a deterministic stand-in, pure in the texts, that runs the real
 sharding and parsing path with no CLI call. A real arm names a Claude CLI model
@@ -320,23 +320,25 @@ def select_arm(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
 
 TRIAGE_CHILD_TEXT_KEY = 'entry_text'
 TRIAGE_PARENT_TEXT_KEY = 'target_text'
-_TRIAGE_TEXT_KEYS = (TRIAGE_CHILD_TEXT_KEY, TRIAGE_PARENT_TEXT_KEY)
+_TRIAGE_PAIR_KEYS = ('entry_id', 'target_id', TRIAGE_CHILD_TEXT_KEY, TRIAGE_PARENT_TEXT_KEY)
 
 Pair = tuple[str, str]
 
 
 def _pair_texts(pair_rows: Iterable[Mapping[str, Any]]) -> dict[Pair, tuple[Any, Any]]:
+    """Each pair's (child, parent) texts; a row lacking a key, or a pair listed twice, is refused."""
     texts: dict[Pair, tuple[Any, Any]] = {}
     for index, row in enumerate(pair_rows):
-        missing = [key for key in _TRIAGE_TEXT_KEYS if key not in row]
+        missing = [key for key in _TRIAGE_PAIR_KEYS if key not in row]
         if missing:
             raise ValueError(
                 f'pairs row {index} ({row.get("entry_id")}, {row.get("target_id")}) '
                 f'lacks {", ".join(missing)}',
             )
-        texts[(row['entry_id'], row['target_id'])] = (
-            row[TRIAGE_CHILD_TEXT_KEY], row[TRIAGE_PARENT_TEXT_KEY],
-        )
+        pair = (row['entry_id'], row['target_id'])
+        if pair in texts:
+            raise ValueError(f'pairs row {index}: pair {pair} is listed twice')
+        texts[pair] = (row[TRIAGE_CHILD_TEXT_KEY], row[TRIAGE_PARENT_TEXT_KEY])
     return texts
 
 
@@ -555,9 +557,12 @@ def _jsonl(path: Path) -> list[dict[str, Any]]:
         if not line.strip():
             continue
         try:
-            rows.append(json.loads(line))
+            row = json.loads(line)
         except json.JSONDecodeError as exc:
             raise EvalRefused(f'{path} line {line_no}: not JSON ({exc})') from exc
+        if not isinstance(row, dict):
+            raise EvalRefused(f'{path} line {line_no}: not a JSON object')
+        rows.append(row)
     return rows
 
 
