@@ -52,6 +52,12 @@ pytestmark = [falkor_skipif(), pytest.mark.integration, pytest.mark.timeout(300)
 JOURNAL_DIRNAME = 'journal'
 CONCURRENT_TEST_GRAPH_PREFIXES = ('_test_', '_probe', 'evalmem_test_')
 """Throwaway graphs other test runs create and delete on a shared FalkorDB host."""
+INDEX_DEFINITION_QUERY = (
+    'CALL db.indexes() YIELD label, properties, types, options, language, stopwords, entitytype '
+    'RETURN label, properties, types, options, language, stopwords, entitytype '
+    'ORDER BY entitytype, label'
+)
+"""Names the definition columns; omits the ``info`` statistics and ``status`` build state, which move with any write on a live graph."""
 
 
 # --- the mock endpoint's answers ------------------------------------------------------
@@ -190,11 +196,13 @@ def _telemetry_rows(run_dir: Path) -> list[sqlite3.Row]:
 
 
 async def _index_definitions(graph: AsyncGraph) -> list[Any]:
-    return (await graph.ro_query('CALL db.indexes()')).result_set
+    return (await graph.ro_query(INDEX_DEFINITION_QUERY)).result_set
 
 
-async def _protected_indexes(client: FalkorDB, graphs: set[str]) -> dict[str, list[Any]]:
-    """``CALL db.indexes()`` over GRAPH.RO_QUERY on every protected graph present on the host."""
+async def _protected_index_definitions(
+    client: FalkorDB, graphs: set[str]
+) -> dict[str, list[Any]]:
+    """The index DEFINITIONS, over GRAPH.RO_QUERY, of every protected graph present on the host."""
     present = sorted(graphs & set(PROTECTED_GRAPHS))
     return {name: await _index_definitions(client.select_graph(name)) for name in present}
 
@@ -233,7 +241,7 @@ async def test_live_replay_lands_only_on_scratch_graphs(mock_config, tmp_path):
     with_indices, embedding_only = _scratch_name(), _scratch_name()
     scratch = {with_indices, embedding_only}
     graphs_before = set(await client.list_graphs())
-    indexes_before = await _protected_indexes(client, graphs_before)
+    definitions_before = await _protected_index_definitions(client, graphs_before)
     repo = make_prereg_repo(tmp_path / 'repo')
     try:
         with mock_openai_server() as server:
@@ -290,7 +298,7 @@ async def test_live_replay_lands_only_on_scratch_graphs(mock_config, tmp_path):
             with contextlib.suppress(Exception):
                 await client.select_graph(name).delete()
         graphs_after = set(await client.list_graphs())
-        indexes_after = await _protected_indexes(client, graphs_after)
+        definitions_after = await _protected_index_definitions(client, graphs_after)
         await client.aclose()
 
     # (6) hazard: only scratch graphs came and went; no protected graph's indices moved
@@ -298,6 +306,6 @@ async def test_live_replay_lands_only_on_scratch_graphs(mock_config, tmp_path):
     assert not changed & set(PROTECTED_GRAPHS)
     assert not scratch & graphs_after
     assert {name for name in changed if not name.startswith(CONCURRENT_TEST_GRAPH_PREFIXES)} == set()
-    if not indexes_before:
+    if not definitions_before:
         pytest.skip('no protected graph exists on this FalkorDB host to compare indices on')
-    assert indexes_after == indexes_before
+    assert definitions_after == definitions_before
