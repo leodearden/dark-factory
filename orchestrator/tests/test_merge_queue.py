@@ -37,6 +37,7 @@ from _merge_queue_harness import drive_verify_and_advance
 from _orch_helpers import (
     MERGE_GATE_BARRIER_TIMEOUT,
     MERGE_RESULT_TIMEOUT,
+    RESPONSIVE_WAIT_WALL_CAP,
     VERIFY_CLI_PER_TEST_TIMEOUT,
     make_placeholder_future,
     pydantic_spec,
@@ -44,6 +45,7 @@ from _orch_helpers import (
 )
 from _resolution_merges import resolution_merge
 from test_merge_queue_concurrent_verify import (
+    HEAVY_BARRIER_TEST_TIMEOUT,
     _fake_verify_result,
     _iter_test_methods,
     _method_wait_budget,
@@ -100,6 +102,10 @@ from orchestrator.merge_types import QueuedBranch
 from orchestrator.suffix_graph import EMPTY_SUFFIX_CONFLICT_GRAPH
 from orchestrator.verify import VerifyResult
 from orchestrator.verify_categories import INFRA_TRANSIENT_CATEGORIES
+
+# Per-test ceiling for classes whose stacked wait_responsive merge waits outgrow
+# HEAVY_BARRIER_TEST_TIMEOUT; TestTimeoutMarkCoverage recomputes every bill it must clear.
+STACKED_MERGE_WAIT_TEST_TIMEOUT = 2 * HEAVY_BARRIER_TEST_TIMEOUT  # 600s
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1858,6 +1864,7 @@ def _cap_is_full(cap: asyncio.Semaphore, bound: int = 1) -> bool:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(STACKED_MERGE_WAIT_TEST_TIMEOUT)
 class TestSpeculativeMergeWorker:
     async def test_speculative_basic_throughput(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -1885,8 +1892,12 @@ class TestSpeculativeMergeWorker:
         await queue.put(req_n)
         await queue.put(req_n1)
 
-        outcome_n = await asyncio.wait_for(req_n.result, timeout=60)
-        outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=60)
+        outcome_n = await wait_responsive(
+            req_n.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='spec-n: MergeOutcome',
+        )
+        outcome_n1 = await wait_responsive(
+            req_n1.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='spec-n1: MergeOutcome',
+        )
 
         assert outcome_n.status == 'done', f'N failed: {outcome_n}'
         assert outcome_n1.status == 'done', f'N+1 failed: {outcome_n1}'
@@ -1947,8 +1958,12 @@ class TestSpeculativeMergeWorker:
             await queue.put(req_n)
             await queue.put(req_n1)
 
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=60)
-            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=60)
+            outcome_n = await wait_responsive(
+                req_n.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='disc-n: MergeOutcome',
+            )
+            outcome_n1 = await wait_responsive(
+                req_n1.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='disc-n1: MergeOutcome',
+            )
 
         assert outcome_n.status == 'blocked', f'N should be blocked: {outcome_n}'
         assert not main_health_probe_spawned(outcome_n), outcome_n.reason
@@ -2024,9 +2039,15 @@ class TestSpeculativeMergeWorker:
             await queue.put(req_n1)
             await queue.put(req_n2)
 
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=60)
-            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=60)
-            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=60)
+            outcome_n = await wait_responsive(
+                req_n.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='cap-n: MergeOutcome',
+            )
+            outcome_n1 = await wait_responsive(
+                req_n1.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='cap-n1: MergeOutcome',
+            )
+            outcome_n2 = await wait_responsive(
+                req_n2.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='cap-n2: MergeOutcome',
+            )
 
         assert outcome_n.status == 'done', f'N: {outcome_n}'
         assert outcome_n1.status == 'done', f'N+1: {outcome_n1}'
@@ -2067,7 +2088,7 @@ class TestSpeculativeMergeWorker:
 
         req = _make_request('single', 'single', wt, config)
         await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=30)
+        outcome = await wait_responsive(req.result, label='single: MergeOutcome')
 
         assert outcome.status == 'done'
         _, out, _ = await _run(['git', 'show', 'main:single.py'], cwd=git_ops.project_root)
@@ -2107,7 +2128,7 @@ class TestSpeculativeMergeWorker:
         ):
             req = _make_request('retry0', 'retry0', wt, config)
             await queue.put(req)
-            await asyncio.wait_for(req.result, timeout=30)
+            await wait_responsive(req.result, label='retry0: MergeOutcome')
 
         await worker.stop()
         await worker_task
@@ -2147,7 +2168,7 @@ class TestSpeculativeMergeWorker:
         ):
             req = _make_request('rolem', 'rolem', wt, config)
             await queue.put(req)
-            await asyncio.wait_for(req.result, timeout=30)
+            await wait_responsive(req.result, label='rolem: MergeOutcome')
 
         await worker.stop()
         await worker_task
@@ -2217,8 +2238,12 @@ class TestSpeculativeMergeWorker:
         await queue.put(req_n)
         await queue.put(req_n1)
 
-        outcome_n = await asyncio.wait_for(req_n.result, timeout=60)
-        outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=60)
+        outcome_n = await wait_responsive(
+            req_n.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='cfl-n: MergeOutcome',
+        )
+        outcome_n1 = await wait_responsive(
+            req_n1.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='cfl-n1: MergeOutcome',
+        )
 
         assert outcome_n.status == 'done', f'N: {outcome_n}'
         # task-1892: conflict surfaces as a 'blocked' rebase-conflict escalation.
@@ -2281,8 +2306,12 @@ class TestSpeculativeMergeWorker:
             req_n1 = _make_request('ev-n1', 'ev-n1', wt_n1, config)
             await queue.put(req_n)
             await queue.put(req_n1)
-            await asyncio.wait_for(req_n.result, timeout=60)
-            await asyncio.wait_for(req_n1.result, timeout=60)
+            await wait_responsive(
+                req_n.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='ev-n: MergeOutcome',
+            )
+            await wait_responsive(
+                req_n1.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='ev-n1: MergeOutcome',
+            )
 
         conn = sqlite3.connect(str(db_path))
         rows = conn.execute(
@@ -2326,8 +2355,12 @@ class TestSpeculativeMergeWorker:
         await queue.put(req_n)
         await queue.put(req_n1)
 
-        outcome_n = await asyncio.wait_for(req_n.result, timeout=60)
-        outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=60)
+        outcome_n = await wait_responsive(
+            req_n.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='am-n: MergeOutcome',
+        )
+        outcome_n1 = await wait_responsive(
+            req_n1.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='am-n1: MergeOutcome',
+        )
 
         assert outcome_n.status == 'done', f'N: {outcome_n}'
         assert outcome_n1.status == 'already_merged', f'N+1: {outcome_n1}'
@@ -2353,7 +2386,7 @@ class TestSpeculativeMergeWorker:
             'ghost-4011', 'ghost-4011', tmp_path / 'no-such-wt', config,
         )
         await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=30)
+        outcome = await wait_responsive(req.result, label='ghost-4011: MergeOutcome')
 
         assert outcome.status == 'unknown_branch', f'got {outcome}'
 
@@ -2424,7 +2457,7 @@ class TestSpeculativeMergeWorker:
         await queue.put(req_n1)
 
         # N must resolve as 'blocked' with 'Verifier error' (not hang forever)
-        outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+        outcome_n = await wait_responsive(req_n.result, label='vex-n: MergeOutcome')
         assert outcome_n.status == 'blocked', f'N: {outcome_n}'
         assert 'Verifier error' in outcome_n.reason, (
             f'Expected Verifier error in reason, got: {outcome_n.reason}'
@@ -2432,7 +2465,7 @@ class TestSpeculativeMergeWorker:
         assert 'Unexpected verifier error' in outcome_n.reason
 
         # N+1 must also complete (not hang forever due to deadlock)
-        outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+        outcome_n1 = await wait_responsive(req_n1.result, label='vex-n1: MergeOutcome')
         assert outcome_n1.status in ('done', 'blocked'), f'N+1: {outcome_n1}'
 
         # No-deadlock proof (task 1862): after a verifier exception the merger
@@ -2449,7 +2482,7 @@ class TestSpeculativeMergeWorker:
         )
         req_fresh = _make_request('vex-fresh', 'vex-fresh', wt_fresh, config)
         await queue.put(req_fresh)
-        outcome_fresh = await asyncio.wait_for(req_fresh.result, timeout=30)
+        outcome_fresh = await wait_responsive(req_fresh.result, label='vex-fresh: MergeOutcome')
         assert outcome_fresh.status in ('done', 'blocked'), (
             f'merger wedged after verifier exception — a fresh request did not '
             f'resolve (deadlock); got: {outcome_fresh}'
@@ -2498,11 +2531,11 @@ class TestSpeculativeMergeWorker:
             await queue.put(req_n1)
 
             # N fails verification → blocked
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            outcome_n = await wait_responsive(req_n.result, label='vre-n: MergeOutcome')
             assert outcome_n.status == 'blocked', f'N: {outcome_n}'
 
             # N+1: _remerge raised → 'blocked' with Verifier error (not hang)
-            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+            outcome_n1 = await wait_responsive(req_n1.result, label='vre-n1: MergeOutcome')
             assert outcome_n1.status == 'blocked', f'N+1: {outcome_n1}'
             assert 'Verifier error' in outcome_n1.reason, (
                 f'Expected Verifier error in N+1 reason, got: {outcome_n1.reason}'
@@ -2524,7 +2557,7 @@ class TestSpeculativeMergeWorker:
             )
             req_fresh = _make_request('vre-fresh', 'vre-fresh', wt_fresh, config)
             await queue.put(req_fresh)
-            outcome_fresh = await asyncio.wait_for(req_fresh.result, timeout=30)
+            outcome_fresh = await wait_responsive(req_fresh.result, label='vre-fresh: MergeOutcome')
             assert outcome_fresh.status in ('done', 'blocked'), (
                 f'merger wedged after _remerge exception — a fresh request did not '
                 f'resolve (deadlock); got: {outcome_fresh}'
@@ -2702,14 +2735,14 @@ class TestSpeculativeMergeWorker:
             await queue.put(req_ok)
 
             # rp-n must resolve as blocked with rev-parse reason
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            outcome_n = await wait_responsive(req_n.result, label='rp-n: MergeOutcome')
             assert outcome_n.status == 'blocked', f'rp-n: {outcome_n}'
             assert 'rev-parse' in outcome_n.reason.lower(), (
                 f'Expected rev-parse in reason: {outcome_n.reason}'
             )
 
             # rp-ok must still succeed (merger loop continues after the error)
-            outcome_ok = await asyncio.wait_for(req_ok.result, timeout=30)
+            outcome_ok = await wait_responsive(req_ok.result, label='rp-ok: MergeOutcome')
             assert outcome_ok.status == 'done', f'rp-ok: {outcome_ok}'
 
         await worker.stop()
@@ -2785,14 +2818,14 @@ class TestSpeculativeMergeWorker:
 
             # mef-n must resolve as 'blocked' with reason mentioning the error
             # (not hang forever — that's the regression without the fix)
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            outcome_n = await wait_responsive(req_n.result, label='mef-n: MergeOutcome')
             assert outcome_n.status == 'blocked', f'mef-n: {outcome_n}'
             assert 'Simulated get_main_sha failure' in outcome_n.reason, (
                 f'Expected error message in reason, got: {outcome_n.reason}'
             )
 
             # mef-ok must succeed — merger loop continues after the per-request error
-            outcome_ok = await asyncio.wait_for(req_ok.result, timeout=30)
+            outcome_ok = await wait_responsive(req_ok.result, label='mef-ok: MergeOutcome')
             assert outcome_ok.status == 'done', f'mef-ok: {outcome_ok}'
 
         await worker.stop()
@@ -2903,7 +2936,9 @@ class TestSpeculativeMergeWorker:
         with patch.object(git_ops, 'merge_to_main', new=blocking_merge):
             await queue.put(req)
             # Wait until the merger is definitely blocked inside merge_to_main.
-            await asyncio.wait_for(merge_started.wait(), timeout=10)
+            await wait_responsive(
+                merge_started.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label='merge_started',
+            )
 
             # stop() will time out (asyncio.wait) since merger is blocked.
             # Without fix: req.result is NOT done after stop() returns.
@@ -2921,8 +2956,6 @@ class TestSpeculativeMergeWorker:
         with contextlib.suppress(Exception):
             await asyncio.wait_for(worker_task, timeout=15)
 
-    # Slow: real git merge worktrees.
-    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
     async def test_speculative_chain_invalidation_propagates(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
@@ -2983,9 +3016,15 @@ class TestSpeculativeMergeWorker:
             side_effect=_verify_chain,
         ):
             worker_task = asyncio.create_task(worker.run())
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=60)
-            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=60)
-            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=60)
+            outcome_n = await wait_responsive(
+                req_n.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='chain-n: MergeOutcome',
+            )
+            outcome_n1 = await wait_responsive(
+                req_n1.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='chain-n1: MergeOutcome',
+            )
+            outcome_n2 = await wait_responsive(
+                req_n2.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='chain-n2: MergeOutcome',
+            )
 
         assert outcome_n.status == 'blocked', (
             f'N: expected blocked, got {outcome_n}'
@@ -3046,7 +3085,7 @@ class TestSpeculativeMergeWorker:
         with patch.object(git_ops, 'advance_main', side_effect=_fail_twice_then_succeed):
             req = _make_request('scas-ok', 'scas-ok', wt, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='scas-ok: MergeOutcome')
 
         assert outcome.status == 'done', f'Expected done, got {outcome}'
         assert call_count == 3, f'Expected 3 advance_main calls (2 CAS fail + 1 success), got {call_count}'
@@ -3086,7 +3125,7 @@ class TestSpeculativeMergeWorker:
         with patch.object(git_ops, 'advance_main', side_effect=_always_cas_fail):
             req = _make_request('scas-lim', 'scas-lim', wt, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='scas-lim: MergeOutcome')
 
         assert outcome.status == 'blocked', f'Expected blocked, got {outcome}'
         assert 'cas retry limit' in outcome.reason.lower(), (
@@ -3136,7 +3175,7 @@ class TestSpeculativeMergeWorker:
         ):
             req = _make_request(branch_name, branch_name, wt, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='sperm: MergeOutcome')
 
         assert outcome.status == 'blocked', f'Expected blocked for {failure_code}, got {outcome}'
         assert failure_code in outcome.reason, (
@@ -3184,7 +3223,7 @@ class TestSpeculativeMergeWorker:
         with patch.object(git_ops, 'advance_main', side_effect=_stash_failed):
             req = _make_request('stashf-sw-1', 'stashf-sw-1', wt, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='stashf-sw-1: MergeOutcome')
 
         assert outcome.status == 'stash_failed'
         assert worker.is_wip_halted
@@ -3273,8 +3312,8 @@ class TestSpeculativeMergeWorker:
         ):
             req = _make_request('stashf-ab-1', 'stashf-ab-1', wt, config)
             await queue.put(req)
-            await asyncio.wait_for(advance_event.wait(), timeout=30)
-            await asyncio.wait_for(release_after_advance.wait(), timeout=30)
+            await wait_responsive(advance_event.wait(), label='advance_event')
+            await wait_responsive(release_after_advance.wait(), label='release_after_advance')
             # Let a regression's generic-path halt fire before we assert it did not.
             for _ in range(30):
                 await asyncio.sleep(0)
@@ -3345,7 +3384,7 @@ class TestSpeculativeMergeWorker:
         ):
             req_a = _make_request('pme-a', 'pme-a', wt_a, config)
             await queue.put(req_a)
-            outcome_a = await asyncio.wait_for(req_a.result, timeout=30)
+            outcome_a = await wait_responsive(req_a.result, label='pme-a: MergeOutcome')
 
         assert outcome_a.status == 'blocked', f'Scenario A: expected blocked, got {outcome_a}'
         assert 'Merger error' in outcome_a.reason, (
@@ -3381,7 +3420,7 @@ class TestSpeculativeMergeWorker:
         ):
             req_b = _make_request('pme-b', 'pme-b', wt_b, config)
             await queue.put(req_b)
-            outcome_b = await asyncio.wait_for(req_b.result, timeout=30)
+            outcome_b = await wait_responsive(req_b.result, label='pme-b: MergeOutcome')
 
         assert outcome_b.status == 'blocked', f'Scenario B: expected blocked, got {outcome_b}'
         assert 'Merger error' in outcome_b.reason, (
@@ -3395,7 +3434,7 @@ class TestSpeculativeMergeWorker:
         # ── Merger loop continues after both exceptions ──────────────────────
         req_ok = _make_request('pme-ok', 'pme-ok', wt_ok, config)
         await queue.put(req_ok)
-        outcome_ok = await asyncio.wait_for(req_ok.result, timeout=30)
+        outcome_ok = await wait_responsive(req_ok.result, label='pme-ok: MergeOutcome')
 
         assert outcome_ok.status == 'done', (
             f'Merger loop should continue after exceptions, got {outcome_ok}'
@@ -3425,7 +3464,7 @@ class TestSpeculativeMergeWorker:
 
         req = _make_request('sdur-done', 'sdur-done', wt, config)
         await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=30)
+        outcome = await wait_responsive(req.result, label='sdur-done: MergeOutcome')
 
         assert outcome.status == 'done', f'Expected done, got: {outcome}'
 
@@ -3445,8 +3484,6 @@ class TestSpeculativeMergeWorker:
         await worker.stop()
         await worker_task
 
-    # Slow: real git merge worktrees.
-    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
     async def test_speculative_merger_phase_emits_duration_ms(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ):
@@ -3490,8 +3527,8 @@ class TestSpeculativeMergeWorker:
             req_n1 = _make_request('sphase-n1', 'sphase-n1', wt_n1, config)
             await q_a.put(req_n)
             await q_a.put(req_n1)
-            out_n = await asyncio.wait_for(req_n.result, timeout=30)
-            out_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+            out_n = await wait_responsive(req_n.result, label='sphase-n: MergeOutcome')
+            out_n1 = await wait_responsive(req_n1.result, label='sphase-n1: MergeOutcome')
 
         assert out_n.status == 'done', f'N: {out_n}'
         assert out_n1.status == 'already_merged', f'N+1: {out_n1}'
@@ -3530,8 +3567,8 @@ class TestSpeculativeMergeWorker:
             req_cfl = _make_request('sphase-cfl', 'sphase-cfl', wt_cfl, config)
             await q_b.put(req_n2)
             await q_b.put(req_cfl)
-            out_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
-            out_cfl = await asyncio.wait_for(req_cfl.result, timeout=30)
+            out_n2 = await wait_responsive(req_n2.result, label='sphase-n2: MergeOutcome')
+            out_cfl = await wait_responsive(req_cfl.result, label='sphase-cfl: MergeOutcome')
 
         assert out_n2.status == 'done', f'N2: {out_n2}'
         # task-1892: the conflicting request is diverted to 'blocked'.
@@ -3621,8 +3658,8 @@ class TestSpeculativeMergeWorker:
             req_n1 = _make_request('rmp-n1', 'rmp-n1', wt_n1, config)
             await queue.put(req_n)
             await queue.put(req_n1)
-            out_n = await asyncio.wait_for(req_n.result, timeout=30)
-            out_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+            out_n = await wait_responsive(req_n.result, label='rmp-n: MergeOutcome')
+            out_n1 = await wait_responsive(req_n1.result, label='rmp-n1: MergeOutcome')
 
         # N should be blocked (verify failed); N+1 should be conflict (from _remerge)
         assert out_n.status == 'blocked', f'N: {out_n}'
@@ -3672,7 +3709,9 @@ class TestSpeculativeMergeWorker:
 
         req_n = _make_request('sspec-task', 'sspec-n', wt_n, config)
         await queue.put(req_n)
-        outcome_n = await asyncio.wait_for(req_n.result, timeout=60)
+        outcome_n = await wait_responsive(
+            req_n.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='sspec-task: MergeOutcome',
+        )
 
         await worker.stop()
         await worker_task
@@ -3879,13 +3918,13 @@ class TestSpeculativeMergeWorker:
             side_effect=blocking_verify,
         ):
             await queue.put(req_n)
-            await asyncio.wait_for(verify_started.wait(), timeout=30)
+            await wait_responsive(verify_started.wait(), label='verify_started')
 
             # Verifier is now blocked on N. Enqueue M — merger detects conflict OOB.
             await queue.put(req_m)
 
             # M must resolve before N's verify finishes
-            outcome_m = await asyncio.wait_for(req_m.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome_m = await wait_responsive(req_m.result, label='oob-e2e-m: MergeOutcome')
             # task-1892: conflict surfaces as a 'blocked' rebase-conflict escalation.
             assert outcome_m.status == 'blocked', (
                 f'M must resolve to blocked while N verify is blocked; '
@@ -3902,7 +3941,7 @@ class TestSpeculativeMergeWorker:
 
             # Unblock N; it completes as done
             release.set()
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            outcome_n = await wait_responsive(req_n.result, label='oob-e2e-n: MergeOutcome')
             assert outcome_n.status == 'done', f'N should complete as done: {outcome_n}'
 
         await worker.stop()
@@ -4144,7 +4183,7 @@ class TestSpeculativeMergeWorker:
 
         req = _make_request('oob-evt-cfl', 'oob-evt-cfl', wt, config)
         await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=30)
+        outcome = await wait_responsive(req.result, label='oob-evt-cfl: MergeOutcome')
         assert outcome.status == 'blocked'
         assert NEEDS_REBASE_REASON_PREFIX in outcome.reason, (
             f'Expected rebase-conflict escalation reason, got: {outcome.reason!r}'
@@ -4270,7 +4309,7 @@ class TestSpeculativeMergeWorker:
             queue, req, event_store, None, retention=retention,
         )
 
-        outcome = await asyncio.wait_for(req.result, timeout=30)
+        outcome = await wait_responsive(req.result, label='ret-oob-cfl: MergeOutcome')
         assert outcome.status == 'blocked'
         assert NEEDS_REBASE_REASON_PREFIX in outcome.reason, (
             f'Expected rebase-conflict escalation reason, got: {outcome.reason!r}'
@@ -4401,7 +4440,7 @@ class TestSpeculativeMergeWorker:
             # yet submitted), and blocked at queue.get() — so N+1 will take the
             # non-speculative blocking-get path.
             await queue.put(req_n)
-            await asyncio.wait_for(n_verify_entered.wait(), timeout=30)
+            await wait_responsive(n_verify_entered.wait(), label='n_verify_entered')
 
             # Phase 2: submit N+1 on the non-speculative path.
             await queue.put(req_n1)
@@ -4444,9 +4483,9 @@ class TestSpeculativeMergeWorker:
 
             # Phase 4: release gate — N, N+1, N+2 all complete as 'done'
             gate_open.set()
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
-            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
-            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
+            outcome_n = await wait_responsive(req_n.result, label='cap-n: MergeOutcome')
+            outcome_n1 = await wait_responsive(req_n1.result, label='cap-n1: MergeOutcome')
+            outcome_n2 = await wait_responsive(req_n2.result, label='cap-n2: MergeOutcome')
 
         assert outcome_n.status == 'done', f'N: {outcome_n}'
         assert outcome_n1.status == 'done', f'N+1: {outcome_n1}'
@@ -4521,7 +4560,7 @@ class TestSpeculativeMergeWorker:
             # Single non-speculative request: merger builds it against M0, hands it
             # to the verifier; the dispatch interposition advances main to M1 first.
             await queue.put(req_n1)
-            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+            outcome_n1 = await wait_responsive(req_n1.result, label='rb-n1: MergeOutcome')
 
         assert outcome_n1.status == 'done', f'N+1: {outcome_n1}'
 
@@ -4710,7 +4749,7 @@ class TestSpeculativeMergeWorker:
         with patch('orchestrator.merge_queue.run_scoped_verification', side_effect=red_verify):
             req = _make_request('mg-spec', 'mg-spec', wt, config, pre_rebased=True)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='mg-spec: MergeOutcome')
 
         # (a) Merge-gate verify must have been called >= 1 time.
         assert verify_call_count >= 1, (
@@ -4740,8 +4779,6 @@ class TestSpeculativeMergeWorker:
 
     # ── Mechanism 2 × chain-invalidation: speculative follower (task 1646 amend) ─
 
-    # Slow: real git merge worktrees.
-    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
     async def test_speculative_follower_chain_invalidated_after_pickup_rebase(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
@@ -4808,7 +4845,7 @@ class TestSpeculativeMergeWorker:
 
             # Submit N and wait for it to be mid-verify.
             await queue.put(req_n)
-            await asyncio.wait_for(n_verify_entered.wait(), timeout=30)
+            await wait_responsive(n_verify_entered.wait(), label='n_verify_entered')
 
             # Put N+1 and N+2 into the queue atomically so the merger attaches
             # N+1 to N's commit and N+2 to N+1's commit (two-deep prefetch, K=2).
@@ -4836,9 +4873,9 @@ class TestSpeculativeMergeWorker:
             # Release gate → N passes verify → main advances; N+1 and N+2 land in
             # order on the advanced tree.
             gate_open.set()
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
-            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
-            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
+            outcome_n = await wait_responsive(req_n.result, label='sf-n: MergeOutcome')
+            outcome_n1 = await wait_responsive(req_n1.result, label='sf-n1: MergeOutcome')
+            outcome_n2 = await wait_responsive(req_n2.result, label='sf-n2: MergeOutcome')
 
         # (1) All three land done
         assert outcome_n.status == 'done', f'N: {outcome_n}'
@@ -4874,8 +4911,6 @@ class TestSpeculativeMergeWorker:
 
     # ── BUG #1687: pre_rebased N+2 + chain_invalidated must verify on tree change ─
 
-    # Slow: real git merge worktrees.
-    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
     async def test_chain_invalidated_pre_rebased_n2_verify_runs(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
@@ -4930,7 +4965,7 @@ class TestSpeculativeMergeWorker:
             req_n2 = _make_request('pr-n2', 'pr-n2', wt_n2, config, pre_rebased=True)
 
             await queue.put(req_n)
-            await asyncio.wait_for(n_verify_entered.wait(), timeout=30)
+            await wait_responsive(n_verify_entered.wait(), label='n_verify_entered')
 
             queue.put_nowait(req_n1)
             queue.put_nowait(req_n2)
@@ -4955,9 +4990,9 @@ class TestSpeculativeMergeWorker:
                 )
 
             gate_open.set()
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
-            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
-            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
+            outcome_n = await wait_responsive(req_n.result, label='pr-n: MergeOutcome')
+            outcome_n1 = await wait_responsive(req_n1.result, label='pr-n1: MergeOutcome')
+            outcome_n2 = await wait_responsive(req_n2.result, label='pr-n2: MergeOutcome')
 
         assert outcome_n.status == 'done', f'N: {outcome_n}'
         assert outcome_n1.status == 'done', f'N+1: {outcome_n1}'
@@ -4991,8 +5026,6 @@ class TestSpeculativeMergeWorker:
         await worker.stop()
         await worker_task
 
-    # Slow: real git merge worktrees.
-    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
     async def test_chain_invalidated_pre_rebased_n2_red_tree_blocked(
         self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
     ) -> None:
@@ -5045,7 +5078,7 @@ class TestSpeculativeMergeWorker:
             req_n2 = _make_request('prb-n2', 'prb-n2', wt_n2, config, pre_rebased=True)
 
             await queue.put(req_n)
-            await asyncio.wait_for(n_verify_entered.wait(), timeout=30)
+            await wait_responsive(n_verify_entered.wait(), label='n_verify_entered')
 
             queue.put_nowait(req_n1)
             queue.put_nowait(req_n2)
@@ -5067,9 +5100,9 @@ class TestSpeculativeMergeWorker:
                 )
 
             gate_open.set()
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
-            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
-            outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
+            outcome_n = await wait_responsive(req_n.result, label='prb-n: MergeOutcome')
+            outcome_n1 = await wait_responsive(req_n1.result, label='prb-n1: MergeOutcome')
+            outcome_n2 = await wait_responsive(req_n2.result, label='prb-n2: MergeOutcome')
 
         assert outcome_n.status == 'done', f'N: {outcome_n}'
         assert outcome_n1.status == 'done', f'N+1: {outcome_n1}'
@@ -5263,7 +5296,7 @@ class TestSpeculativeMergeWorker:
 
             # Submit N and wait for it to be mid-verify
             await queue.put(req_n)
-            await asyncio.wait_for(n_verify_entered.wait(), timeout=30)
+            await wait_responsive(n_verify_entered.wait(), label='n_verify_entered')
 
             # Submit N+1 on the non-speculative blocking-get path (spec window closed)
             await queue.put(req_n1)
@@ -5279,8 +5312,8 @@ class TestSpeculativeMergeWorker:
 
             # Release N's gate — N fails verify → n_failed=True → N+1 is chain-invalidated
             gate_open.set()
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
-            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+            outcome_n = await wait_responsive(req_n.result, label='ci-n: MergeOutcome')
+            outcome_n1 = await wait_responsive(req_n1.result, label='ci-n1: MergeOutcome')
 
         assert outcome_n.status == 'blocked', f'N must be blocked (verify fail): {outcome_n}'
         assert outcome_n1.status == 'done', (
@@ -5297,7 +5330,7 @@ class TestSpeculativeMergeWorker:
         # (2) Submit M — primary proof: cap balanced (merger can acquire again)
         with patch('orchestrator.merge_queue.run_scoped_verification', _mock_verify_pass()):
             await queue.put(req_m)
-            outcome_m = await asyncio.wait_for(req_m.result, timeout=30)
+            outcome_m = await wait_responsive(req_m.result, label='ci-m: MergeOutcome')
 
         assert outcome_m.status == 'done', f'M: {outcome_m}'
 
@@ -5344,14 +5377,14 @@ class TestSpeculativeMergeWorker:
             await queue.put(req_n)
             # Wait for N's merger-phase merge to complete, so N is in the verifier
             # queue with a cap_permit acquired but not yet drained
-            await asyncio.wait_for(n_merge_done.wait(), timeout=30)
+            await wait_responsive(n_merge_done.wait(), label='n_merge_done')
 
             # Cancel N's future before the verifier drains it → abandonment path
             req_n.result.cancel()
 
             # Submit N+1 and wait for it to complete
             await queue.put(req_n1)
-            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+            outcome_n1 = await wait_responsive(req_n1.result, label='ab-n1: MergeOutcome')
 
         assert outcome_n1.status == 'done', (
             f'N+1 must complete after N abandoned; got: {outcome_n1}. '
@@ -5763,7 +5796,7 @@ class TestSpeculativeBackwardCompat:
 
         req = _make_request('compat-1', 'compat-basic', worktree, config)
         await queue.put(req)
-        result = await asyncio.wait_for(req.result, timeout=30)
+        result = await wait_responsive(req.result, label='compat-1: MergeOutcome')
 
         assert result.status == 'done'
         _, content, _ = await _run(
@@ -5792,7 +5825,7 @@ class TestSpeculativeBackwardCompat:
 
         req = _make_request('compat-am', 'compat-am', worktree, config)
         await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
+        outcome = await wait_responsive(req.result, label='compat-am: MergeOutcome')
         assert outcome.status == 'already_merged'
 
         await worker.stop()
@@ -5812,7 +5845,7 @@ class TestSpeculativeBackwardCompat:
         with patch('orchestrator.merge_queue.run_scoped_verification', mock_verify):
             req = _make_request('compat-vf', 'compat-vf', worktree, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='compat-vf: MergeOutcome')
 
         assert outcome.status == 'blocked'
         assert 'verification failed' in outcome.reason.lower()
@@ -5864,7 +5897,7 @@ class TestMergeVerifyColdTimeout:
         ):
             req = _make_request('cold-spec', 'merge-cold-spec', wt, config)
             await queue.put(req)
-            await asyncio.wait_for(req.result, timeout=30)
+            await wait_responsive(req.result, label='cold-spec: MergeOutcome')
 
         await worker.stop()
         await worker_task
@@ -5944,6 +5977,7 @@ class TestLaneSceneVerifyIsNotCalledDead:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(STACKED_MERGE_WAIT_TEST_TIMEOUT)  # a deliberate over-mark -- test_success_resets_counter's nested submit() runs 4 waits, which _method_wait_budget bills once
 class TestMergeVerifyTimeoutLoopBreaker:
     async def test_speculative_worker_abandons_after_threshold(
         self, git_ops: GitOps, config: OrchestratorConfig,
@@ -5979,7 +6013,7 @@ class TestMergeVerifyTimeoutLoopBreaker:
                 for _ in range(worker.MAX_POST_MERGE_VERIFY_TIMEOUTS):
                     req = _make_request('lbs-task', 'loop-break-spec', wt, config)
                     await queue.put(req)
-                    outcome = await asyncio.wait_for(req.result, timeout=30)
+                    outcome = await wait_responsive(req.result, label='lbs-task: MergeOutcome')
                     assert outcome.status == 'blocked'
 
                 verify_calls_before_loopbreak = verify_call_count
@@ -5989,7 +6023,9 @@ class TestMergeVerifyTimeoutLoopBreaker:
                     'lbs-task', 'loop-break-spec', wt, config,
                 )
                 await queue.put(req_final)
-                final = await asyncio.wait_for(req_final.result, timeout=MERGE_RESULT_TIMEOUT)
+                final = await wait_responsive(
+                    req_final.result, label='lbs-task (final): MergeOutcome',
+                )
 
             assert final.status == 'blocked'
             assert final.reason.startswith(ABANDONED_REASON_PREFIX)
@@ -6022,7 +6058,7 @@ class TestMergeVerifyTimeoutLoopBreaker:
                 entries_before = verifier.entered_count
                 req = _make_request('rf-task', 'loop-real-fail', wt, config)
                 await queue.put(req)
-                outcome = await run.outcome(req, timeout=30)
+                outcome = await wait_responsive(run.outcome(req), label='rf-task: MergeOutcome')
                 assert outcome.status == 'blocked'
                 assert 'verification failed' in outcome.reason.lower()
                 assert not outcome.reason.startswith(ABANDONED_REASON_PREFIX), (
@@ -6059,7 +6095,7 @@ class TestMergeVerifyTimeoutLoopBreaker:
             async def submit(branch: str, wt: Path) -> MergeOutcome:
                 req = _make_request('reset-task', branch, wt, config)
                 await queue.put(req)
-                return await run.outcome(req, timeout=30)
+                return await wait_responsive(run.outcome(req), label='reset-task: MergeOutcome')
 
             verifier.default = times_out()
             r1 = await submit('reset-fail', wt_fail)
@@ -6123,7 +6159,7 @@ class TestWipHaltSpeculativeMergeWorker:
             # Submit req1 alone — no req2 in queue, so no speculative look-ahead
             req1 = _make_request('shalt-1', 'shalt-1', wt1, config)
             await queue.put(req1)
-            outcome1 = await asyncio.wait_for(req1.result, timeout=30)
+            outcome1 = await wait_responsive(req1.result, label='shalt-1: MergeOutcome')
 
             assert outcome1.status == 'wip_halted'
             assert outcome1.overlap_files == ['file_shalt_1.py']
@@ -6137,7 +6173,7 @@ class TestWipHaltSpeculativeMergeWorker:
 
             # Un-halt and wait for req2
             worker.unhalt_wip()
-            outcome2 = await asyncio.wait_for(req2.result, timeout=30)
+            outcome2 = await wait_responsive(req2.result, label='shalt-2: MergeOutcome')
 
         assert outcome2.status == 'done'
 
@@ -6163,7 +6199,7 @@ class TestWipHaltSpeculativeMergeWorker:
         with patch.object(git_ops, 'advance_main', side_effect=_pop_conflict):
             req = _make_request('srecov-1', 'srecov-1', wt, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='srecov-1: MergeOutcome')
 
         assert outcome.status == 'done_wip_recovery'
         assert outcome.recovery_branch == 'wip/recovery-srecov-1-20260407T120000'
@@ -6199,7 +6235,7 @@ class TestWipHaltSpeculativeMergeWorker:
         with patch.object(git_ops, 'advance_main', side_effect=_pop_conflict):
             req = _make_request('srecov-sha', 'srecov-sha', wt, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='srecov-sha: MergeOutcome')
 
         assert outcome.status == 'done_wip_recovery'
         assert outcome.merge_sha == 'cafebabe' * 5
@@ -6225,7 +6261,7 @@ class TestWipHaltSpeculativeMergeWorker:
         with patch.object(git_ops, 'advance_main', side_effect=_unmerged_state):
             req = _make_request('uu-sw-1', 'uu-sw-1', wt, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='uu-sw-1: MergeOutcome')
 
         assert outcome.status == 'unmerged_state'
         assert 'unmerged' in outcome.reason.lower()
@@ -6253,7 +6289,7 @@ class TestWipHaltSpeculativeMergeWorker:
         with patch.object(git_ops, 'advance_main', side_effect=_pop_conflict_no_advance):
             req = _make_request('pcna-sw-1', 'pcna-sw-1', wt, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='pcna-sw-1: MergeOutcome')
 
         assert outcome.status == 'wip_recovery_no_advance'
         assert outcome.recovery_branch == 'wip/recovery-x-y'
@@ -6389,7 +6425,7 @@ class TestSpeculativeGateReverifyConsumesAdvanceOutcome:
         ):
             req = _make_request('gate-reverify-sha', 'gate-reverify-sha', wt, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='gate-reverify-sha: MergeOutcome')
 
         assert outcome.status == 'blocked', f'expected blocked; got {outcome!r}'
         # Discriminate the intended second-call 'not_descendant' failure from
@@ -7476,7 +7512,7 @@ class TestSpeculativeMergeWorkerDequeueEvent:
         with patch.object(git_ops, 'merge_to_main', return_value=conflict_result):
             req = _make_request('spec-deq', 'spec-deq', wt, config)
             await enqueue_merge_request(queue, req, event_store)
-            outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome = await wait_responsive(req.result, label='spec-deq: MergeOutcome')
 
         assert outcome.status == 'conflict'
 
@@ -7554,7 +7590,7 @@ class TestCasRetryStaysInLane:
             with patch.object(git_ops, 'advance_main', side_effect=_fail_once):
                 req = _make_request('cas-evt', 'cas-evt', wt, config)
                 await enqueue_merge_request(queue, req, event_store)
-                outcome = await run.outcome(req, timeout=30)
+                outcome = await wait_responsive(run.outcome(req), label='cas-evt: MergeOutcome')
 
         assert outcome.status == 'done'
         assert call_count == 2
@@ -7874,7 +7910,7 @@ class TestPushHook:
         with patch.object(git_ops, 'push_main', push_mock):
             req = _make_request('spec-push', 'spec-push', worktree, config)
             await queue.put(req)
-            result = await asyncio.wait_for(req.result, timeout=30)
+            result = await wait_responsive(req.result, label='spec-push: MergeOutcome')
 
         await worker.stop()
         worker_task.cancel()
@@ -8534,7 +8570,7 @@ async def test_speculative_merger_surfaces_worktree_missing_after_plan_touched_c
             'spec-worktree-missing', 'spec-worktree-missing', worktree, config,
         )
         await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
+        outcome = await wait_responsive(req.result, label='spec-worktree-missing: MergeOutcome')
     finally:
         await worker.stop()
         worker_task.cancel()
@@ -8681,7 +8717,7 @@ class TestEnospcTransientInfraRetry:
         ):
             req = _make_request('enospc-task', 'enospc-task', wt, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='enospc-task: MergeOutcome')
 
         assert outcome.status == 'blocked'
         assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
@@ -8724,7 +8760,7 @@ class TestEnospcTransientInfraRetry:
         ):
             req = _make_request('enospc-heals', 'enospc-heals', wt, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='enospc-heals: MergeOutcome')
 
         assert outcome.status == 'done', f'unexpected: {outcome}'
         assert mock_verify.call_count == 2
@@ -8771,7 +8807,7 @@ class TestSpeculativeMergeWorkerLedgerAwarePrune:
         with patch('orchestrator.merge_queue._run_post_merge_verify', _recording_verify):
             req = _make_request('ledger-snap', 'ledger-snap', wt, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='ledger-snap: MergeOutcome')
 
         assert outcome.status == 'done', f'unexpected: {outcome}'
         # The worker must have forwarded keep_worktrees.
@@ -8828,7 +8864,7 @@ class TestSpeculativeMergeWorkerLedgerAwarePrune:
         ):
             req = _make_request('e2e-prune', 'e2e-prune', wt, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='e2e-prune: MergeOutcome')
 
         assert outcome.status == 'done', f'unexpected: {outcome}'
         # Only the orphan should be gone; both ledger worktrees survive.
@@ -9675,7 +9711,7 @@ class TestPreVerifyDiskGuardWiring:
         ):
             req = _make_request('spec-disk-low', 'spec-disk-low', wt, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='spec-disk-low: MergeOutcome')
 
         assert outcome.status == 'blocked'
         assert outcome.reason.startswith(TRANSIENT_INFRA_REASON_PREFIX), (
@@ -10192,7 +10228,9 @@ class TestGroupMergeRequestSpeculativeWorker:
         worker_task = asyncio.create_task(worker.run())
 
         await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=60)
+        outcome = await wait_responsive(
+            req.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='stacked-train: MergeOutcome',
+        )
 
         assert outcome.status == 'done', f'expected done, got: {outcome!r}'
         assert outcome.merge_sha is not None
@@ -10294,10 +10332,14 @@ class TestGroupMergeRequestSpeculativeWorker:
         worker_task = asyncio.create_task(worker.run())
 
         await queue.put(reg_req)
-        reg_outcome = await asyncio.wait_for(reg_req.result, timeout=60)
+        reg_outcome = await wait_responsive(
+            reg_req.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='reg-task: MergeOutcome',
+        )
         # Now enqueue the train (after regular has resolved, pipeline is idle)
         await queue.put(train_req)
-        train_outcome = await asyncio.wait_for(train_req.result, timeout=60)
+        train_outcome = await wait_responsive(
+            train_req.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='stacked-train: MergeOutcome',
+        )
 
         assert reg_outcome.status == 'done', f'regular request failed: {reg_outcome!r}'
         assert train_outcome.status == 'done', f'train request failed: {train_outcome!r}'
@@ -10339,7 +10381,9 @@ class TestGroupMergeRequestSpeculativeWorker:
             AsyncMock(return_value='pushed'),
         ):
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=60)
+            outcome = await wait_responsive(
+                req.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='stacked-train: MergeOutcome',
+            )
 
         # (1) Outcome is done with push_status propagated from _finalize_advanced_merge.
         assert outcome.status == 'done', f'expected done, got: {outcome!r}'
@@ -10568,7 +10612,7 @@ class TestMergeFailureDiagnostic:
 
         req = _make_request('ghost-m', 'ghost-m', wt, config)
         await queue.put(req)
-        outcome = await asyncio.wait_for(req.result, timeout=30)
+        outcome = await wait_responsive(req.result, label='ghost-m: MergeOutcome')
 
         assert outcome.status == 'unknown_branch', f'got {outcome}'
         assert 'task/ghost-m' in outcome.reason
@@ -10604,8 +10648,8 @@ class TestMergeFailureDiagnostic:
         await queue.put(req_n)
         await queue.put(req_n1)
 
-        outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
-        outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+        outcome_n = await wait_responsive(req_n.result, label='spec-diag-n: MergeOutcome')
+        outcome_n1 = await wait_responsive(req_n1.result, label='ghost-spec: MergeOutcome')
 
         assert outcome_n.status == 'done', f'N should succeed: {outcome_n}'
         assert outcome_n1.status == 'unknown_branch', (
@@ -19194,7 +19238,7 @@ class TestSpeculativeWorkerDequeueDepth:
         with patch.object(git_ops, 'merge_to_main', return_value=conflict_result):
             req = _make_request('spec-depth', 'spec-depth', wt, config)
             await enqueue_merge_request(queue, req, event_store)
-            outcome = await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
+            outcome = await wait_responsive(req.result, label='spec-depth: MergeOutcome')
 
         assert outcome.status == 'conflict'
 
@@ -19447,7 +19491,7 @@ class TestHeartbeatTaskLifecycle:
         with patch.object(git_ops, 'merge_to_main', return_value=conflict_result):
             req = _make_request('hb-lc', 'hb-lc', wt, config)
             await enqueue_merge_request(queue, req, None)
-            await asyncio.wait_for(req.result, timeout=MERGE_RESULT_TIMEOUT)
+            await wait_responsive(req.result, label='hb-lc: MergeOutcome')
 
         await worker.stop()
         with contextlib.suppress(asyncio.CancelledError):
@@ -19639,7 +19683,9 @@ class TestSoftCancelMidVerify:
         ):
             task = asyncio.create_task(drive_verify_and_advance(worker, item))
             # Wait until the blocking verify has started.
-            await asyncio.wait_for(verify_started.wait(), timeout=5)
+            await wait_responsive(
+                verify_started.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label='verify_started',
+            )
 
             # Simulate sole-waiter detach: cancels req.result.
             registry.detach(req.branch.bare_id, req.request_id)
@@ -19713,7 +19759,9 @@ class TestSoftCancelMidVerify:
             await register_and_enqueue_merge_request(
                 queue, req, None, registry, retention=retention,
             )
-            outcome = await asyncio.wait_for(req.result, timeout=60)
+            outcome = await wait_responsive(
+                req.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='sc-c: MergeOutcome',
+            )
 
         # (a) outcome is 'done'
         assert outcome.status == 'done', (
@@ -20287,7 +20335,7 @@ class TestLanePickIntegration:
             await queue.put(req_gate)
 
             # Wait until the gate task's verify has started
-            await asyncio.wait_for(gate_entered.wait(), timeout=30)
+            await wait_responsive(gate_entered.wait(), label='gate_entered')
 
             # Now enqueue the normal backlog + one high task
             await queue.put(req_n1)
@@ -20301,7 +20349,7 @@ class TestLanePickIntegration:
             gate_release.set()
 
             # Wait for high task to complete
-            outcome_high = await asyncio.wait_for(req_high.result, timeout=30)
+            outcome_high = await wait_responsive(req_high.result, label='ln-high: MergeOutcome')
 
         assert outcome_high.status == 'done', f'high task failed: {outcome_high}'
 
@@ -20345,7 +20393,7 @@ class TestLanePickIntegration:
             await queue.put(req_gate)
 
             # Wait until gate task is in verify
-            await asyncio.wait_for(gate_entered.wait(), timeout=30)
+            await wait_responsive(gate_entered.wait(), label='gate_entered')
 
             # Halt normal lane, enqueue normal task (must stay pending) and high task
             worker.halt_lane('normal', 'red main')
@@ -20357,7 +20405,7 @@ class TestLanePickIntegration:
             gate_release.set()
 
             # HIGH task must complete even while normal lane is halted
-            outcome_high = await asyncio.wait_for(req_high.result, timeout=30)
+            outcome_high = await wait_responsive(req_high.result, label='lh-high: MergeOutcome')
             assert outcome_high.status == 'done', f'high task failed: {outcome_high}'
 
             # Normal task must still be pending (normal lane halted)
@@ -20367,7 +20415,9 @@ class TestLanePickIntegration:
 
             # Un-halt normal lane — normal task should now complete
             worker.unhalt_lane('normal', 'red main resolved')
-            outcome_normal = await asyncio.wait_for(req_normal.result, timeout=30)
+            outcome_normal = await wait_responsive(
+                req_normal.result, label='lh-normal: MergeOutcome',
+            )
             assert outcome_normal.status == 'done', f'normal task failed: {outcome_normal}'
 
         await worker.stop()
@@ -20632,7 +20682,9 @@ class TestOperatorHalt:
             caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'),
         ):
             task = asyncio.create_task(drive_verify_and_advance(worker, item))
-            await asyncio.wait_for(verify_started.wait(), timeout=5)
+            await wait_responsive(
+                verify_started.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label='verify_started',
+            )
 
             # Operator halt while the verify is in flight.
             worker.operator_halt('operator halt test')
@@ -20721,7 +20773,9 @@ class TestOperatorHalt:
             side_effect=_blocking_verify,
         ):
             task = asyncio.create_task(drive_verify_and_advance(worker, item))
-            await asyncio.wait_for(verify_started.wait(), timeout=5)
+            await wait_responsive(
+                verify_started.wait(), timeout=MERGE_GATE_BARRIER_TIMEOUT, label='verify_started',
+            )
 
             # Automatic WIP halt while the verify is in flight.
             worker.halt_for_wip('wip halt regression')
@@ -21347,6 +21401,7 @@ class TestSpeculationDepthParameter:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(STACKED_MERGE_WAIT_TEST_TIMEOUT)
 class TestSpeculationSlotSemaphoreDepth:
     """Generalized _speculation_slot (Event→Semaphore) depth and release tests (task-1698 step-5).
 
@@ -21354,10 +21409,8 @@ class TestSpeculationSlotSemaphoreDepth:
     part (b) is the K=1 regression guard that already passes.
     """
 
-    # Slow: gates N's verify for up to 30s waiting for K=2 concurrency and
-    # builds 3 real git merge worktrees.  Budget rationale:
-    # _orch_helpers.py::VERIFY_CLI_PER_TEST_TIMEOUT.
-    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
+    # Slow: holds N's verify until K=2 concurrency is seen (or the gate gives
+    # up), builds 3 real git merge worktrees, then waits on four results.
     async def test_k2_builds_two_speculative_ahead(
         self,
         git_ops: GitOps,
@@ -21408,7 +21461,8 @@ class TestSpeculationSlotSemaphoreDepth:
                 # If K=2 is not yet implemented, this times out (test will
                 # fail on the max_concurrent >= 3 assertion below).
                 with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(k2_reached.wait(), timeout=30)
+                    # noqa: wall-clock-deadline — best-effort gate inside the fake verify; its timeout is swallowed by design, and wait_responsive's pytest.fail would raise inside the lane
+                    await asyncio.wait_for(k2_reached.wait(), timeout=MERGE_RESULT_TIMEOUT)
             return _fake_verify_result(passed=True, summary='')
 
         queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
@@ -21433,11 +21487,20 @@ class TestSpeculationSlotSemaphoreDepth:
             await queue.put(req_n3)
 
             # The gate holds N's verify until 3 concurrent worktrees are seen
-            # OR 30s timeout.  After gate releases, wait for all to complete.
-            await asyncio.wait_for(req_n.result, timeout=60)
-            await asyncio.wait_for(req_n1.result, timeout=60)
-            await asyncio.wait_for(req_n2.result, timeout=60)
-            await asyncio.wait_for(req_n3.result, timeout=60)
+            # OR its MERGE_RESULT_TIMEOUT give-up, which lands before these
+            # RESPONSIVE_WAIT_WALL_CAP waits could.  Then wait for all four.
+            await wait_responsive(
+                req_n.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='k2d-n: MergeOutcome',
+            )
+            await wait_responsive(
+                req_n1.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='k2d-n1: MergeOutcome',
+            )
+            await wait_responsive(
+                req_n2.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='k2d-n2: MergeOutcome',
+            )
+            await wait_responsive(
+                req_n3.result, timeout=RESPONSIVE_WAIT_WALL_CAP, label='k2d-n3: MergeOutcome',
+            )
 
         # Peak must reach 3 (N verifying + N+1 + N+2 speculative).
         # If _speculation_slot is still an Event (depth-1), peak stays ≤ 2.
@@ -21461,6 +21524,7 @@ class TestSpeculationSlotSemaphoreDepth:
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(STACKED_MERGE_WAIT_TEST_TIMEOUT)
 class TestSpeculationPermitLeakOnMergerError:
     """Speculation-permit leak when a PREFETCHED (speculative) item fails inside
     the merger before being put on _verifier_queue (task-1698 step-9 RED).
@@ -21480,9 +21544,6 @@ class TestSpeculationPermitLeakOnMergerError:
        verifier queue, so N+3 hangs.
     """
 
-    # Slow: builds 4 real git merge worktrees and drives a full
-    # SpeculativeMergeWorker through two merge phases.
-    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
     async def test_worktree_missing_releases_speculation_permit(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
@@ -21512,9 +21573,9 @@ class TestSpeculationPermitLeakOnMergerError:
             await queue.put(req_n1)
 
             # N resolves as 'done'; N+1 resolves as 'blocked' with WorktreeMissing reason.
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            outcome_n = await wait_responsive(req_n.result, label='leak-wm-n: MergeOutcome')
             assert outcome_n.status == 'done', f'N expected done, got {outcome_n}'
-            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+            outcome_n1 = await wait_responsive(req_n1.result, label='leak-wm-n1: MergeOutcome')
             assert outcome_n1.status == 'blocked', f'N+1 expected blocked, got {outcome_n1}'
             assert outcome_n1.reason.startswith(WORKTREE_MISSING_REASON_PREFIX), (
                 f'Expected reason starting with {WORKTREE_MISSING_REASON_PREFIX!r}, '
@@ -21538,8 +21599,8 @@ class TestSpeculationPermitLeakOnMergerError:
         req_n3 = _make_request('leak-wm-n3', 'leak-wm-n3', wt_n3, config)
         await queue.put(req_n2)
         await queue.put(req_n3)
-        outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
-        outcome_n3 = await asyncio.wait_for(req_n3.result, timeout=30)
+        outcome_n2 = await wait_responsive(req_n2.result, label='leak-wm-n2: MergeOutcome')
+        outcome_n3 = await wait_responsive(req_n3.result, label='leak-wm-n3: MergeOutcome')
         assert outcome_n2.status in ('done', 'blocked'), f'N+2: {outcome_n2}'
         assert outcome_n3.status in ('done', 'blocked'), f'N+3: {outcome_n3}'
 
@@ -21547,9 +21608,6 @@ class TestSpeculationPermitLeakOnMergerError:
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
 
-    # Slow: builds 4 real git merge worktrees and drives a full
-    # SpeculativeMergeWorker through two merge phases.
-    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
     async def test_merger_exception_releases_speculation_permit(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
@@ -21578,9 +21636,9 @@ class TestSpeculationPermitLeakOnMergerError:
             await queue.put(req_n)
             await queue.put(req_n1)
 
-            outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+            outcome_n = await wait_responsive(req_n.result, label='leak-ex-n: MergeOutcome')
             assert outcome_n.status == 'done', f'N expected done, got {outcome_n}'
-            outcome_n1 = await asyncio.wait_for(req_n1.result, timeout=30)
+            outcome_n1 = await wait_responsive(req_n1.result, label='leak-ex-n1: MergeOutcome')
             assert outcome_n1.status == 'blocked', f'N+1 expected blocked, got {outcome_n1}'
             assert 'Merger error' in outcome_n1.reason, (
                 f'Expected "Merger error" in reason, got: {outcome_n1.reason!r}'
@@ -21597,8 +21655,8 @@ class TestSpeculationPermitLeakOnMergerError:
         req_n3 = _make_request('leak-ex-n3', 'leak-ex-n3', wt_n3, config)
         await queue.put(req_n2)
         await queue.put(req_n3)
-        outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
-        outcome_n3 = await asyncio.wait_for(req_n3.result, timeout=30)
+        outcome_n2 = await wait_responsive(req_n2.result, label='leak-ex-n2: MergeOutcome')
+        outcome_n3 = await wait_responsive(req_n3.result, label='leak-ex-n3: MergeOutcome')
         assert outcome_n2.status in ('done', 'blocked'), f'N+2: {outcome_n2}'
         assert outcome_n3.status in ('done', 'blocked'), f'N+3: {outcome_n3}'
 
@@ -21606,9 +21664,6 @@ class TestSpeculationPermitLeakOnMergerError:
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
 
-    # Slow: builds 4 real git merge worktrees and drives a full
-    # SpeculativeMergeWorker.
-    @pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)
     async def test_abandoned_speculative_releases_speculation_permit(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ):
@@ -21646,7 +21701,7 @@ class TestSpeculationPermitLeakOnMergerError:
         await queue.put(req_n1)
 
         # N completes normally; N+1 is abandoned (future never resolved — don't await).
-        outcome_n = await asyncio.wait_for(req_n.result, timeout=30)
+        outcome_n = await wait_responsive(req_n.result, label='leak-ab-n: MergeOutcome')
         assert outcome_n.status == 'done', f'N expected done, got {outcome_n}'
 
         # Yield several event-loop ticks so the merger processes N+1's abandonment.
@@ -21667,8 +21722,8 @@ class TestSpeculationPermitLeakOnMergerError:
         req_n3 = _make_request('leak-ab-n3', 'leak-ab-n3', wt_n3, config)
         await queue.put(req_n2)
         await queue.put(req_n3)
-        outcome_n2 = await asyncio.wait_for(req_n2.result, timeout=30)
-        outcome_n3 = await asyncio.wait_for(req_n3.result, timeout=30)
+        outcome_n2 = await wait_responsive(req_n2.result, label='leak-ab-n2: MergeOutcome')
+        outcome_n3 = await wait_responsive(req_n3.result, label='leak-ab-n3: MergeOutcome')
         assert outcome_n2.status in ('done', 'blocked'), f'N+2: {outcome_n2}'
         assert outcome_n3.status in ('done', 'blocked'), f'N+3: {outcome_n3}'
 
@@ -22052,7 +22107,7 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
 
             # Unblock verify
             verify_gate.set()
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='reg-test: MergeOutcome')
             assert outcome.status == 'done', f'Expected done; got {outcome}'
 
         finally:
@@ -22157,7 +22212,7 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
         try:
             req = _make_request('done-clear', 'done-clear', wt, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='done-clear: MergeOutcome')
             assert outcome.status == 'done', (
                 f'Expected done landing; got {outcome}'
             )
@@ -22253,7 +22308,7 @@ class TestOwnedMergeWorktreeLivenessHeartbeat:
             )
 
             verify_gate.set()
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='warm-swap: MergeOutcome')
             assert outcome.status == 'done', f'Expected done; got {outcome}'
         finally:
             await worker.stop()
@@ -22928,7 +22983,7 @@ class TestRefreshWarmBaseWiring:
         try:
             req = _make_request('rwb-warm', 'rwb-warm', wt, warm_config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='rwb-warm: MergeOutcome')
         finally:
             await worker.stop()
             with contextlib.suppress(asyncio.CancelledError):
@@ -22965,7 +23020,7 @@ class TestRefreshWarmBaseWiring:
         try:
             req = _make_request('rwb-cold', 'rwb-cold', wt, config)
             await queue.put(req)
-            outcome = await asyncio.wait_for(req.result, timeout=30)
+            outcome = await wait_responsive(req.result, label='rwb-cold: MergeOutcome')
         finally:
             await worker.stop()
             with contextlib.suppress(asyncio.CancelledError):
