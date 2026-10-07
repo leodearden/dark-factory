@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from shared.eval_lane import is_eval_worktree_path
+from shared.eval_lane import eval_lane_provenance
 
 logger = logging.getLogger(__name__)
 
@@ -434,20 +434,7 @@ def file_residue(
     Filed under the residue ANCHOR, never under the leaking task's own id: at
     the ``level=2`` the middleware declares, a pending record carrying a live
     task id halts that task. See :attr:`MarkupSinkSpec.residue_anchor_task_id`.
-
-    A residue from an eval worktree is not filed at all (task 6479): plan-tools
-    is injected into every eval cell, and this direct ``queue.submit`` bypasses
-    the eval-lane gate in
-    ``escalation/src/escalation/server.py::_chokepoint_or_submit``. The
-    ``None`` returned tells the middleware nothing was preserved, which is true.
     """
-    if is_eval_worktree_path(worktree):
-        logger.info(
-            'markup guard: not filing the residue of %s.%s from eval worktree %s '
-            '(subject %r): an eval-lane artifact is not a production signal',
-            record.get('tool'), record.get('field'), worktree, subject_task_id,
-        )
-        return None
     esc = escalation_cls(
         id=queue.make_id(spec.residue_anchor_task_id),
         task_id=spec.residue_anchor_task_id,
@@ -674,8 +661,18 @@ def make_escalation_sink(
 
     Returns the id of the queued record, which the middleware folds into the
     caller-facing refusal so the payload can be looked up — or ``None`` when
-    nothing was filed (the queue could not take it, or the residue came from an
-    eval worktree — see :func:`file_residue`).
+    nothing was filed (the queue could not take it, or the record came from the
+    eval lane — see below).
+
+    AN EVAL-LANE RECORD IS NOT FILED AT ALL, of either kind (task 6479).
+    plan-tools is injected into every eval cell, an eval worktree is a linked
+    worktree of the main checkout, and both filers reach the queue through a
+    direct ``submit`` that bypasses the eval-lane gate in
+    ``escalation/src/escalation/server.py::_chokepoint_or_submit``. So the
+    record is checked here, by that gate's own rule
+    (``shared.eval_lane.eval_lane_provenance`` on the subject and the
+    worktree), before any root is resolved or queue opened, and answered with
+    an INFO line and ``None`` — "nothing was preserved", which is true.
 
     THE FLOOR IS THE QUEUE OR NOTHING, for every boundary on this sink. A
     record the queue cannot take is logged once at ERROR and answered with
@@ -725,6 +722,15 @@ def make_escalation_sink(
     def file_record(record: dict[str, Any]) -> str | None:
         """The blocking body, run on a worker thread."""
         nonlocal project_root, channel
+        subject = _subject()
+        eval_lane_reason = eval_lane_provenance(subject, worktree)
+        if eval_lane_reason is not None:
+            logger.info(
+                'markup guard: not filing the %r record from %s (subject %r): '
+                'eval-lane artifact (%s), not a production signal',
+                record.get('error_type'), worktree, subject, eval_lane_reason,
+            )
+            return None
         if project_root is None:
             project_root = resolve_root(worktree)
             if project_root is None:
@@ -743,7 +749,7 @@ def make_escalation_sink(
         try:
             if error_type == MARKUP_STORM_ERROR_TYPE:
                 return file_storm(
-                    escalation_cls, queue, worktree, _subject(), record, spec,
+                    escalation_cls, queue, worktree, subject, record, spec,
                 )
             if error_type != MARKUP_RESIDUE_ERROR_TYPE:
                 # A kind the middleware grew later. FILE IT rather than
@@ -756,12 +762,12 @@ def make_escalation_sink(
                     'not know about', error_type,
                 )
             return file_residue(
-                escalation_cls, queue, worktree, _subject(), record, spec,
+                escalation_cls, queue, worktree, subject, record, spec,
             )
         except Exception:
             logger.error(
                 _LOSS_LOG_FORMAT, 'the escalation could not be submitted',
-                _loss_account(record), _subject(), exc_info=True,
+                _loss_account(record), subject, exc_info=True,
             )
             return None
 

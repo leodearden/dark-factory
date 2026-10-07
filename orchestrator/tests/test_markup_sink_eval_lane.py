@@ -1,14 +1,14 @@
-"""An eval cell's markup residue never reaches the production escalation queue (task 6479).
+"""An eval cell's markup records never reach the production escalation queue (task 6479).
 
 plan-tools is injected into every eval cell, and an eval worktree is a LINKED
-worktree of the main checkout, so ``markup_sink.file_residue`` would otherwise
-file a pending level-2 record into production ``data/escalations``. These tests
-drive the public sink against a real ``EscalationQueue`` under ``tmp_path``.
+worktree of the main checkout, so the markup sink would otherwise file pending
+records into production ``data/escalations``. These tests drive the public
+sink against a real ``EscalationQueue`` under ``tmp_path``.
 """
 
 from __future__ import annotations
 
-import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +18,8 @@ from escalation.queue import EscalationQueue
 
 from orchestrator.mcp import markup_sink
 
-SUBJECT = 'df_task_2430_adv_plan'
+FIXTURE_SUBJECT = 'df_task_2430_adv_plan'
+PRODUCTION_SUBJECT = '6479'
 
 SPEC = markup_sink.MarkupSinkSpec(
     server_label='plan-tools',
@@ -48,6 +49,23 @@ def _residue_record() -> dict[str, Any]:
     }
 
 
+def _storm_record() -> dict[str, Any]:
+    return {
+        'error_type': markup_sink.MARKUP_STORM_ERROR_TYPE,
+        'count': 7,
+        'threshold': 5,
+        'window_seconds': 3600,
+        'outcome': 'repaired',
+        'project': None,
+        'callers': [],
+    }
+
+
+RECORD_KINDS = pytest.mark.parametrize(
+    'record', [_residue_record, _storm_record], ids=['residue', 'storm'],
+)
+
+
 def _sibling_eval_worktree(tmp_path: Path) -> Path:
     return tmp_path / 'proj-eval-worktrees' / 'df_task_2430_adv_plan' / 'run-c2fbbe84'
 
@@ -60,64 +78,62 @@ def _task_worktree(tmp_path: Path) -> Path:
     return tmp_path / 'proj' / '.worktrees' / '6479'
 
 
-EVAL_LAYOUTS = pytest.mark.parametrize(
-    'eval_worktree', [_sibling_eval_worktree, _legacy_eval_worktree], ids=['sibling', 'legacy'],
+#: Each eval-lane signal the escalation server's own gate recognises
+#: (``shared.eval_lane.eval_lane_provenance``): an eval worktree in either
+#: layout, or an eval fixture subject in an ordinary-looking worktree.
+EVAL_LANE_PROVENANCE = pytest.mark.parametrize(
+    ('worktree', 'subject'),
+    [
+        (_sibling_eval_worktree, PRODUCTION_SUBJECT),
+        (_legacy_eval_worktree, PRODUCTION_SUBJECT),
+        (_task_worktree, FIXTURE_SUBJECT),
+    ],
+    ids=['sibling-eval-worktree', 'legacy-eval-worktree', 'fixture-subject'],
 )
 
 
+def _queue_dir(root: Path) -> Path:
+    return root / markup_sink.MARKUP_QUEUE_DIRNAME
+
+
 def _pending(root: Path) -> list[Escalation]:
-    return EscalationQueue(root / markup_sink.MARKUP_QUEUE_DIRNAME).get_pending()
+    return EscalationQueue(_queue_dir(root)).get_pending()
 
 
-def _sink(tmp_path: Path, worktree: Path):
+def _sink(tmp_path: Path, worktree: Path, subject: str):
     return markup_sink.make_escalation_sink(
         worktree=worktree,
         spec=SPEC,
-        subject_task_id=lambda: SUBJECT,
+        subject_task_id=lambda: subject,
         resolve_root=lambda _wt: tmp_path,
     )
 
 
-def _file_residue_directly(tmp_path: Path, worktree: Path) -> str | None:
-    queue = EscalationQueue(tmp_path / markup_sink.MARKUP_QUEUE_DIRNAME)
-    return markup_sink.file_residue(
-        Escalation, queue, worktree, SUBJECT, _residue_record(), SPEC,
-    )
-
-
-class TestAnEvalCellResidueFilesNoEscalation:
-    @EVAL_LAYOUTS
+class TestAnEvalLaneRecordFilesNothing:
+    @EVAL_LANE_PROVENANCE
+    @RECORD_KINDS
     @pytest.mark.asyncio
-    async def test_the_sink_files_nothing_and_answers_none(self, tmp_path, eval_worktree):
-        filed = await _sink(tmp_path, eval_worktree(tmp_path))(_residue_record())
+    async def test_the_sink_answers_none_and_opens_no_queue(
+        self,
+        tmp_path: Path,
+        worktree: Callable[[Path], Path],
+        subject: str,
+        record: Callable[[], dict[str, Any]],
+    ):
+        filed = await _sink(tmp_path, worktree(tmp_path), subject)(record())
 
         assert filed is None
-        assert _pending(tmp_path) == []
-
-    @EVAL_LAYOUTS
-    def test_file_residue_itself_files_nothing(self, tmp_path, eval_worktree):
-        assert _file_residue_directly(tmp_path, eval_worktree(tmp_path)) is None
-        assert _pending(tmp_path) == []
-
-    @EVAL_LAYOUTS
-    def test_the_drop_is_logged_naming_the_worktree(self, tmp_path, eval_worktree, caplog):
-        worktree = eval_worktree(tmp_path)
-        with caplog.at_level(logging.INFO, logger='orchestrator.mcp.markup_sink'):
-            _file_residue_directly(tmp_path, worktree)
-
-        assert any(
-            record.name == 'orchestrator.mcp.markup_sink'
-            and str(worktree) in record.getMessage()
-            for record in caplog.records
-        )
+        assert not _queue_dir(tmp_path).exists()
 
 
-class TestARealTaskWorktreeResidueStillFiles:
+class TestAProductionRecordStillFiles:
     @pytest.mark.asyncio
-    async def test_one_pending_level_2_record_under_the_residue_anchor(self, tmp_path):
+    async def test_a_residue_files_one_pending_level_2_record_under_its_anchor(
+        self, tmp_path: Path,
+    ):
         worktree = _task_worktree(tmp_path)
 
-        filed = await _sink(tmp_path, worktree)(_residue_record())
+        filed = await _sink(tmp_path, worktree, PRODUCTION_SUBJECT)(_residue_record())
 
         assert isinstance(filed, str)
         [escalation] = _pending(tmp_path)
@@ -125,3 +141,17 @@ class TestARealTaskWorktreeResidueStillFiles:
         assert escalation.level == 2
         assert escalation.task_id == SPEC.residue_anchor_task_id
         assert escalation.worktree == str(worktree)
+
+    @pytest.mark.asyncio
+    async def test_a_burst_alarm_files_one_pending_record_under_its_anchor(
+        self, tmp_path: Path,
+    ):
+        worktree = _task_worktree(tmp_path)
+
+        filed = await _sink(tmp_path, worktree, PRODUCTION_SUBJECT)(_storm_record())
+
+        assert isinstance(filed, str)
+        [escalation] = _pending(tmp_path)
+        assert escalation.id == filed
+        assert escalation.level == markup_sink.MARKUP_STORM_LEVEL
+        assert escalation.task_id == SPEC.storm_anchor_task_id
