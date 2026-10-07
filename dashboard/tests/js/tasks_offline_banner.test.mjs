@@ -347,3 +347,27 @@ test('tasksBannerNoticesFor is tasksBannerNotices over the same keys', () => {
     }),
   );
 });
+
+test('tasksBannerNoticesFor reads exactly the five /tasks keys, so no runtime-probe fact can enter the pipeline', () => {
+  // tab_tasks.jsx hands DF_DATA over whole, so this is the one place the
+  // input set is decided. A probe fact folded in here would be suppressed by
+  // the offline short-circuit (test_tab_tasks_runtime.py::
+  // test_probe_banner_is_not_a_tasksbannernotices_kind).
+  const read = new Set();
+  const data = new Proxy({ TASKS_PROJECT_COUNT: 3, RUNTIME_PROBE: { status: 'timeout' } }, {
+    get(target, key) {
+      if (typeof key === 'string') read.add(key);
+      return target[key];
+    },
+  });
+
+  tasksBannerNoticesFor(data);
+
+  assert.deepEqual([...read].sort(), [
+    'TASKS_COUNT_UNKNOWN_PROJECTS',
+    'TASKS_DEGRADED_PROJECTS',
+    'TASKS_OFFLINE',
+    'TASKS_OFFLINE_PROJECTS',
+    'TASKS_PROJECT_COUNT',
+  ]);
+});
