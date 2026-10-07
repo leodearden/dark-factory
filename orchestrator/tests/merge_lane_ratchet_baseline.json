@@ -976,6 +976,7 @@
     "orchestrator/tests/_merge_queue_doubles.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/_merge_queue_harness.py": {"patch_targets": [], "private_reads": 4},
     "orchestrator/tests/_resolution_merges.py": {"patch_targets": [], "private_reads": 0},
+    "orchestrator/tests/_seed_script_stubs.py": {"patch_targets": [], "private_reads": 0},
     "orchestrator/tests/_workflow_helpers.py": {"patch_targets": [], "private_reads": 1},
     "orchestrator/tests/conftest.py": {"patch_targets": ["run_scoped_verification"], "private_reads": 5},
     "orchestrator/tests/test_agent_capability_wiring.py": {"patch_targets": [], "private_reads": 1},
