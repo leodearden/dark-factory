@@ -14,12 +14,35 @@ This module pins both, through the public predicate and the leg classifier.
 
 from __future__ import annotations
 
-import pytest
+import json
 
+import pytest
+from _verify_config_corpus import ROOT_LINT_COMMAND, ROOT_TYPE_CHECK_COMMAND
+
+from orchestrator.verify import _summarize_checks
+from orchestrator.verify_categories import FailureCategory
 from orchestrator.verify_classify import (
     is_external_kill_rc,
     is_shell_reported_external_kill,
 )
+
+
+def _lint_leg_category(lint_out: str, lint_cmd: str) -> str:
+    _, category, _, _, _ = _summarize_checks(
+        0, '', False, None,
+        1, lint_out, False, lint_cmd,
+        0, '', False, None,
+    )
+    return category
+
+
+def _type_leg_category(type_out: str, type_cmd: str) -> str:
+    _, category, _, _, _ = _summarize_checks(
+        0, '', False, None,
+        0, '', False, None,
+        1, type_out, False, type_cmd,
+    )
+    return category
 
 
 class TestShellReportedExternalKill:
@@ -59,3 +82,46 @@ class TestShellReportedExternalKill:
         """Task #5132: the bare predicate keeps refusing shell conventions;
         only the caller that interposed the shell may read them."""
         assert is_external_kill_rc(143) is False
+
+
+class TestChainedLintTypeArmsAreReached:
+    """``classify_failure`` RECEIVES the tool recovered from the live chained
+    lint/type commands, proven through ``_summarize_checks`` with nothing
+    patched.
+
+    Before task 4843 both commands parsed OPAQUE, and the OPAQUE ladder's
+    rustc-code regex swallowed any output quoting ``error[E0308]:``. That is
+    the C1 token-swallowing the per-tool dispatch exists to prevent: a ruff
+    or pyright JSON message quoting the token classified COMPILE_ERROR. Only
+    the RUFF/PYRIGHT JSON arms can turn that payload into LINT_ERROR or
+    TYPE_ERROR, so this category delta shows the arm is engaged, not merely
+    named.
+    """
+
+    def test_ruff_json_through_the_live_lint_chain_is_lint_error(self):
+        output = json.dumps([{
+            'code': 'F821',
+            'filename': 'a.py',
+            'severity': 'error',
+            'message': 'Undefined name `error[E0308]:`',
+        }])
+        category = _lint_leg_category(output, ROOT_LINT_COMMAND)
+        assert category != FailureCategory.COMPILE_ERROR, (
+            'the OPAQUE ladder swallowed the quoted rustc token'
+        )
+        assert category == FailureCategory.LINT_ERROR
+
+    def test_pyright_json_through_the_live_type_chain_is_type_error(self):
+        output = json.dumps({
+            'version': '1.1.408',
+            'generalDiagnostics': [{
+                'file': 'a.py',
+                'severity': 'error',
+                'message': 'Argument mismatch quoting error[E0308]: mismatched types',
+            }],
+        })
+        category = _type_leg_category(output, ROOT_TYPE_CHECK_COMMAND)
+        assert category != FailureCategory.COMPILE_ERROR, (
+            'the OPAQUE ladder swallowed the quoted rustc token'
+        )
+        assert category == FailureCategory.TYPE_ERROR

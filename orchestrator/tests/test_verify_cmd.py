@@ -27,8 +27,10 @@ from _serial_recovery_helpers import (
     xdist_option_surface,
 )
 from _verify_config_corpus import (
+    DASHBOARD_LINT_COMMAND,
     DF_CONFIG_PATH,
     FM_LINT_COMMAND,
+    MODULE_LINT_COMMANDS,
     REPO_ROOT,
     ROOT_LINT_COMMAND,
     ROOT_TEST_COMMAND,
@@ -325,6 +327,88 @@ class TestParseConfigCommandOpaque:
         assert cmd.base_flags == ()
         assert cmd.targets == ()
         assert cmd.wrappers == ()
+
+
+_LIVE_CHAINED_LINT_COMMANDS = [
+    ('root', ROOT_LINT_COMMAND),
+    ('fused-memory', FM_LINT_COMMAND),
+    ('dashboard', DASHBOARD_LINT_COMMAND),
+    *sorted(MODULE_LINT_COMMANDS.items()),
+]
+
+
+class TestParseChainRecoversLintTypeIdentity:
+    """A chain with exactly one argv-head ruff-check or pyright invocation
+    resolves to that tool, for IDENTITY only (task 4843, #4462): raw is
+    retained, so render is unchanged and no mutator applies. Zero or several
+    recognised tools stay OPAQUE, and the pytest/cargo arms keep precedence.
+    """
+
+    def test_live_module_lint_commands_are_present(self):
+        assert MODULE_LINT_COMMANDS, 'the parametrisation below must not be vacuous'
+
+    @pytest.mark.parametrize(('origin', 'raw'), _LIVE_CHAINED_LINT_COMMANDS)
+    def test_live_chained_lint_command_is_ruff(self, origin, raw):
+        cmd = parse_config_command(raw)
+        assert cmd.tool is ToolKind.RUFF, (
+            f'{origin} lint chain has exactly one argv-head `ruff check`, '
+            'so it must resolve RUFF'
+        )
+        assert cmd.raw == raw, 'identity recovery must retain raw'
+        assert render(cmd) == raw, 'identity recovery must not change rendering'
+
+    def test_live_chained_type_check_command_is_pyright(self):
+        cmd = parse_config_command(ROOT_TYPE_CHECK_COMMAND)
+        assert cmd.tool is ToolKind.PYRIGHT, (
+            'every argv-head tool in the root type-check chain is pyright, '
+            'so it must resolve PYRIGHT'
+        )
+        assert cmd.raw == ROOT_TYPE_CHECK_COMMAND, 'identity recovery must retain raw'
+        assert render(cmd) == ROOT_TYPE_CHECK_COMMAND, (
+            'identity recovery must not change rendering'
+        )
+
+    def test_chainless_scripts_lint_command_stays_structured(self):
+        cmd = parse_config_command(SCRIPTS_LINT_COMMAND)
+        assert cmd.tool is ToolKind.RUFF
+        assert cmd.raw is None, 'a single-segment command keeps its structured parse'
+
+    def test_live_test_command_stays_pytest(self):
+        assert parse_config_command(ROOT_TEST_COMMAND).tool is ToolKind.PYTEST
+
+    @pytest.mark.parametrize(
+        'raw',
+        ['ruff check src/ && pyright src/', 'pyright src/ && ruff check src/'],
+    )
+    def test_two_recognised_tools_stay_opaque(self, raw):
+        assert parse_config_command(raw).tool is ToolKind.OPAQUE, (
+            'a chain running two recognised tools has no dominant tool, and '
+            'the answer must not depend on table order'
+        )
+
+    def test_tool_named_only_in_a_script_path_stays_opaque(self):
+        raw = 'python3 scripts/check_pyright_config.py src/ && mypy src/'
+        assert parse_config_command(raw).tool is ToolKind.OPAQUE, (
+            "a tool name inside a sibling checker's path is not an invocation"
+        )
+
+    @pytest.mark.parametrize(
+        ('raw', 'expected'),
+        [
+            ('uv run ruff check src/ && uv run pytest tests/', ToolKind.PYTEST),
+            ('cargo test --workspace && ruff check src/', ToolKind.CARGO_TEST),
+        ],
+    )
+    def test_pytest_and_cargo_arms_keep_precedence(self, raw, expected):
+        assert parse_config_command(raw).tool is expected, (
+            'pytest/cargo own the chain-aware mutators, so their arms must '
+            'win over identity recovery'
+        )
+
+    def test_chain_with_no_recognised_tool_stays_opaque(self):
+        assert parse_config_command('make lint && make type').tool is ToolKind.OPAQUE, (
+            'a chain invoking no recognised tool has no identity to recover'
+        )
 
 
 class TestRenderRoundTrip:
