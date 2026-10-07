@@ -2,11 +2,11 @@
 
 import json
 import logging
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from shared.cli_invoke import AgentResult, AllAccountsCappedException
+from shared.cli_invoke import AgentResult
 from shared.testing import make_gate_mock
 
 from fused_memory.config.schema import ReconciliationConfig
@@ -15,7 +15,6 @@ from fused_memory.reconciliation.agent_loop import (
     AgentLoop,
     CircuitBreakerError,
     ToolDefinition,
-    _CLIResponseAdapter,
     _OpenAIResponseAdapter,
     _TextBlock,
     _ToolUseBlock,
@@ -433,149 +432,6 @@ async def test_no_tool_calls_ends_loop():
     result, entries = await agent.run('test')
     assert result.get('warning') == 'no_tool_calls'
     assert 'I am done thinking.' in result.get('text', '')
-
-
-def _no_tool_call_agent() -> AgentLoop:
-    """AgentLoop wired with one terminal tool, for no-tool-call exit tests."""
-    return AgentLoop(
-        config=_make_config(),
-        system_prompt='Test',
-        tools={
-            'stage_complete': ToolDefinition(
-                name='stage_complete',
-                description='Complete',
-                parameters={'type': 'object', 'properties': {}},
-                function=lambda **kw: kw,
-            ),
-        },
-        terminal_tool='stage_complete',
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    'origin_token',
-    ['cli_output_empty', 'cli_output_unparseable'],
-)
-async def test_no_tool_calls_propagates_cli_warning_origin(origin_token):
-    """Task 4343: run() must surface the SPECIFIC CLI-failure origin.
-
-    _CLIResponseAdapter computes 'cli_output_empty' (the CLI returned nothing)
-    vs 'cli_output_unparseable' (the CLI returned junk) — different operator
-    responses — and today run() throws the distinction away, collapsing both
-    into the generic 'no_tool_calls'.
-
-    The generic token must stay UNCHANGED: extract_agent_verdict derives its
-    'agent-failed:<token>' sentinel from result['warning'], and
-    test_no_tool_calls_ends_loop pins it.  The origin travels in a separate,
-    additive key.
-    """
-    agent = _no_tool_call_agent()
-
-    async def mock_llm(messages, tool_schemas):
-        return _CLIResponseAdapter(
-            {'tool_calls': [], 'warning': origin_token},
-            session_id='sess-1',
-        )
-
-    agent._call_llm = mock_llm
-
-    result, _entries = await agent.run('test')
-
-    assert result.get('warning') == 'no_tool_calls', (
-        f"Expected the generic token to stay 'no_tool_calls' but got "
-        f'{result.get("warning")!r}'
-    )
-    assert result.get('warning_origin') == origin_token, (
-        f'Expected warning_origin={origin_token!r} but got '
-        f'{result.get("warning_origin")!r}'
-    )
-
-
-@pytest.mark.asyncio
-async def test_no_tool_calls_without_origin_omits_warning_origin():
-    """Task 4343: the new key is strictly ADDITIVE and absent when unknown.
-
-    The anthropic and OpenAI adapters have no `.warning` attribute at all —
-    only _CLIResponseAdapter does.  run() must therefore read it defensively
-    and omit the key entirely rather than emitting an empty string that would
-    read like a measured value.  This is the backward-compatibility guard the
-    _CLIResponseAdapter docstring worried about.
-    """
-    agent = _no_tool_call_agent()
-
-    async def mock_llm(messages, tool_schemas):
-        return FakeResponse(content=[FakeText(text='I am done thinking.')])
-
-    agent._call_llm = mock_llm
-
-    result, _entries = await agent.run('test')
-
-    assert result.get('warning') == 'no_tool_calls'
-    assert 'warning_origin' not in result, (
-        f'Expected no warning_origin key when the response carries no origin, '
-        f'got {result.get("warning_origin")!r}'
-    )
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    'agent_warning',
-    [
-        'i was unable to finish',   # agent-authored prose
-        'CLI_OUTPUT_EMPTY',         # near-miss on a real token
-        {'nested': 'dict'},         # non-str: would raise ValidationError downstream
-        17,
-    ],
-    ids=['prose', 'case_mismatch', 'dict', 'int'],
-)
-async def test_no_tool_calls_drops_unknown_warning_origin(agent_warning):
-    """Task 4343: warning_origin is a CLOSED vocabulary, not a passthrough.
-
-    _CLIResponseAdapter.warning is just structured_output['warning'], so on a
-    real turn it holds whatever the agent's own JSON put there — only
-    _call_claude_cli's synthesised dicts carry our tokens.  The value flows to
-    VerificationResult.failure_token and into the reconciliation.db audit row
-    operators GROUP BY, so an arbitrary string would pollute that census and a
-    non-str would raise ValidationError inside CodebaseVerifier.verify —
-    collapsing the diagnosis into a generic error row, the exact outcome this
-    task removes.  Unknown values are dropped; the generic 'no_tool_calls'
-    still travels in `warning`, so nothing is silently lost.
-    """
-    agent = _no_tool_call_agent()
-
-    async def mock_llm(messages, tool_schemas):
-        return _CLIResponseAdapter(
-            {'tool_calls': [], 'warning': agent_warning},
-            session_id='sess-1',
-        )
-
-    agent._call_llm = mock_llm
-
-    result, _entries = await agent.run('test')
-
-    assert result.get('warning') == 'no_tool_calls'
-    assert 'warning_origin' not in result, (
-        f'Expected an unrecognised warning {agent_warning!r} to be dropped, but '
-        f'warning_origin={result.get("warning_origin")!r} was propagated'
-    )
-
-
-def test_cli_warning_origins_matches_the_tokens_call_claude_cli_synthesises():
-    """The closed vocabulary must not drift from its only producer.
-
-    _call_claude_cli builds {'warning': 'cli_output_unparseable'},
-    {'warning': 'cli_output_empty'} and (task 6022) {'warning': 'api_refusal'}
-    as literals; if any is renamed without updating CLI_WARNING_ORIGINS, run()
-    would silently start dropping a real diagnosis.  Pin the set.
-    """
-    assert set(CLI_WARNING_ORIGINS) == {
-        'cli_output_unparseable',
-        'cli_output_empty',
-        'api_refusal',
-    }, (
-        f'CLI_WARNING_ORIGINS drifted from _call_claude_cli: {CLI_WARNING_ORIGINS!r}'
-    )
 
 
 # --- _OpenAIResponseAdapter tests ---
@@ -1099,6 +955,30 @@ async def test_openai_round_trip_two_turns():
 
 
 # --- Claude CLI provider tests ---
+#
+# On claude_cli the whole investigation is ONE CLI invocation (task 4344): the
+# CLI runs its own built-in ``cli_tools`` and delivers the terminal tool's
+# payload through ``--json-schema``.  Every test below drives the public
+# ``run()`` and patches only the ``invoke_with_cap_retry`` seam (or, for the
+# forwarding test, ``invoke_claude_agent`` one level lower).
+
+_P = {
+    'type': 'object',
+    'properties': {
+        'verdict': {'type': 'string', 'enum': ['confirmed', 'contradicted']},
+        'summary': {'type': 'string'},
+    },
+    'required': ['verdict', 'summary'],
+}
+
+_CLI_TOOLS = ('Read', 'Grep', 'Glob')
+
+_MEASURED_REFUSAL_OUTPUT = (
+    "API Error: Sonnet 5.5's safeguards flagged this message "
+    '(https://www.anthropic.com/legal/aup). This sometimes happens with safe, '
+    "normal conversations. Claude Code can't respond to this message with "
+    'Sonnet 5.5.\n\nRequest ID: req_x'
+)
 
 
 def _make_cli_config(**overrides) -> ReconciliationConfig:
@@ -1113,1287 +993,335 @@ def _make_cli_config(**overrides) -> ReconciliationConfig:
     return ReconciliationConfig(**defaults)
 
 
-def _cli_result_json(structured_output: dict, session_id: str = 'sess-1') -> bytes:
-    """Build a fake CLI JSON response."""
-    return json.dumps({
-        'result': '',
-        'session_id': session_id,
-        'num_input_tokens': 1000,
-        'num_output_tokens': 200,
-        'structured_output': structured_output,
-    }).encode()
-
-
-@pytest.mark.asyncio
-async def test_claude_cli_response_adapter():
-    """_CLIResponseAdapter produces correct _TextBlock/_ToolUseBlock."""
-    structured = {
-        'text': 'I should consolidate memories.',
-        'tool_calls': [
-            {'id': 'tc1', 'name': 'search_memory', 'input': {'query': 'test'}},
-            {'id': 'tc2', 'name': 'delete_memory', 'input': {'id': 'mem-1'}},
-        ],
+def _cli_tool_defs() -> dict[str, ToolDefinition]:
+    return {
+        'read_file': ToolDefinition(
+            name='read_file',
+            description='Read file contents from the codebase.',
+            parameters={'type': 'object', 'properties': {'path': {'type': 'string'}}},
+            function=lambda **kw: kw,
+        ),
+        'verification_complete': ToolDefinition(
+            name='verification_complete',
+            description='Deliver your findings.',
+            parameters=_P,
+            function=lambda **kw: kw,
+        ),
     }
 
-    adapter = _CLIResponseAdapter(structured)
 
-    text_blocks = [b for b in adapter.content if b.type == 'text']
-    tool_blocks = [b for b in adapter.content if b.type == 'tool_use']
-
-    assert len(text_blocks) == 1
-    assert text_blocks[0].text == 'I should consolidate memories.'
-    assert len(tool_blocks) == 2
-    assert tool_blocks[0].name == 'search_memory'
-    assert tool_blocks[0].input == {'query': 'test'}
-    assert tool_blocks[1].name == 'delete_memory'
-    assert tool_blocks[1].id == 'tc2'
-
-
-@pytest.mark.asyncio
-async def test_claude_cli_response_adapter_no_text():
-    """_CLIResponseAdapter handles empty text."""
-    structured = {
-        'text': '',
-        'tool_calls': [{'id': 'tc1', 'name': 'stage_complete', 'input': {}}],
-    }
-    adapter = _CLIResponseAdapter(structured)
-    text_blocks = [b for b in adapter.content if b.type == 'text']
-    tool_blocks = [b for b in adapter.content if b.type == 'tool_use']
-    assert len(text_blocks) == 0
-    assert len(tool_blocks) == 1
-
-
-@pytest.mark.asyncio
-async def test_claude_cli_tool_results_serialization():
-    """_serialize_tool_results formats tool results as text."""
-    tool_results = [
-        {
-            'type': 'tool_result',
-            'tool_use_id': 'tc1',
-            'content': '{"id": "mem-1"}',
-        },
-        {
-            'type': 'tool_result',
-            'tool_use_id': 'tc2',
-            'content': '{"error": "not found"}',
-            'is_error': True,
-        },
-    ]
-
-    text = AgentLoop._serialize_tool_results(tool_results)
-
-    assert '[Tool Result: tc1] (OK)' in text
-    assert '{"id": "mem-1"}' in text
-    assert '[Tool Result: tc2] (ERROR)' in text
-    assert '{"error": "not found"}' in text
-
-
-
-# ---------------------------------------------------------------------------
-# Delegation to invoke_with_cap_retry
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_call_claude_cli_delegates_to_invoke_with_cap_retry():
-    """_call_claude_cli delegates to invoke_with_cap_retry instead of managing subprocess.
-
-    Confirms that the new interface passes `prompt` and `tools` kwargs and that
-    the returned adapter exposes `.text`, `.tool_calls`, and `.session_id`.
-    The dead `response` field has been dropped from both the schema and the
-    adapter (Task 899 step-1/step-2).
-    """
-    from shared.cli_invoke import AgentResult
-
-    from fused_memory.reconciliation.agent_loop import CLAUDE_CLI_RESPONSE_SCHEMA
-
-    fake_gate = make_gate_mock()
-    config = _make_cli_config()
-    tools = [{'name': 'read_file', 'description': 'read', 'input_schema': {}}]
-
-    fake_result = AgentResult(
-        success=True,
-        output='',
-        session_id='sess-1',
-        structured_output={
-            'text': 'reasoning',
-            'tool_calls': [],
-        },
+def _cli_agent(cli_tools=_CLI_TOOLS, **kw) -> AgentLoop:
+    kw.setdefault('config', _make_cli_config())
+    kw.setdefault('usage_gate', make_gate_mock())
+    return AgentLoop(
+        system_prompt='Caller system prompt.',
+        tools=_cli_tool_defs(),
+        terminal_tool='verification_complete',
+        cli_tools=cli_tools,
+        **kw,
     )
 
+
+def _verdict_result(**overrides) -> AgentResult:
+    fields = {
+        'success': True,
+        'output': '',
+        'session_id': 'sess-ok',
+        'structured_output': {'verdict': 'confirmed', 'summary': 's'},
+    }
+    fields.update(overrides)
+    return AgentResult(**fields)
+
+
+async def _run_cli(agent: AgentLoop, result: AgentResult, payload: str = 'payload'):
+    """Run *agent* against one mocked CLI result; return (run output, mock)."""
     with patch(
         'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
         new_callable=AsyncMock,
     ) as mock_invoke:
-        mock_invoke.return_value = fake_result
-
-        agent = AgentLoop(
-            config=config,
-            system_prompt='Test system prompt',
-            tools={},
-            usage_gate=fake_gate,
-        )
-
-        result = await agent._call_claude_cli(prompt='hi', tools=tools)  # type: ignore[arg-type]
-
-    mock_invoke.assert_called_once()
-    call_kwargs = mock_invoke.call_args.kwargs
-    call_positional = mock_invoke.call_args.args
-
-    # Essential delegation contract: prompt, system prompt, schema, model,
-    # timeout, and session-threading are wired through correctly.
-    # Fine-grained knobs (permission_mode, disallowed_tools) are
-    # implementation details covered by shared/tests/test_cli_invoke.py.
-    # max_turns is not: only this caller chooses it, so it is pinned by
-    # test_call_claude_cli_passes_a_workable_max_turns below.
-    from pathlib import Path
-
-    assert call_kwargs['prompt'] == 'hi'
-    assert 'read_file' in call_kwargs['system_prompt']
-    assert call_kwargs['output_schema'] == CLAUDE_CLI_RESPONSE_SCHEMA
-    assert call_kwargs['model'] == config.agent_llm_model
-    assert call_kwargs['timeout_seconds'] == float(config.agent_cli_timeout_seconds)
-    assert call_kwargs['resume_session_id'] is None  # first turn: no prior session
-    assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
-    # Passed unconditionally (including on this, the first turn) — cli_invoke
-    # only reads it inside `if invoke_kwargs.get('resume_session_id'):`, so it
-    # is already inert here; asserting it holds regardless keeps the two
-    # kwargs from silently becoming coupled at the call site.
-    assert call_kwargs['resume_delivers_prompt'] is True
-
-    # usage_gate may be positional or keyword — accept either
-    if 'usage_gate' in call_kwargs:
-        assert call_kwargs['usage_gate'] is fake_gate
-    else:
-        assert call_positional[0] is fake_gate
-
-    # Adapter must expose direct attribute access for text/tool_calls/session_id.
-    assert result.text == 'reasoning'
-    assert result.tool_calls == []
-    assert result.session_id == 'sess-1'
-
-    # `response` must be absent from the schema — it was a dead field never read
-    # by run() or any caller.  Pinning absence here prevents re-introduction.
-    assert 'response' not in CLAUDE_CLI_RESPONSE_SCHEMA['properties']
+        mock_invoke.return_value = result
+        out = await agent.run(payload)
+    return out, mock_invoke
 
 
 @pytest.mark.asyncio
-async def test_call_claude_cli_passes_a_workable_max_turns():
-    """The per-invocation turn cap must leave room for the model's prose turn.
+async def test_cli_run_is_one_invocation_returning_the_terminal_payload():
+    from pathlib import Path
 
-    AgentLoop.run() drives multi-turn EXTERNALLY — one _call_claude_cli per
-    outer step, threaded by resume_session_id — so this cap bounds a SINGLE
-    assistant round-trip, not the conversation.  It still cannot be 1: the
-    model emits a prose turn before it calls StructuredOutput, and a cap of 1
-    leaves no room for it.
+    from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+
+    config = _make_cli_config()
+    agent = _cli_agent(config=config)
+    (payload, journal), mock_invoke = await _run_cli(
+        agent, _verdict_result(input_tokens=30, output_tokens=12),
+    )
+
+    assert payload == {'verdict': 'confirmed', 'summary': 's'}
+    assert journal == []
+    mock_invoke.assert_called_once()
+    kwargs = mock_invoke.call_args.kwargs
+    assert kwargs['prompt'] == 'payload'
+    assert kwargs['output_schema'] == _P
+    assert kwargs['available_tools'] == ['Read', 'Grep', 'Glob']
+    assert kwargs['permission_mode'] == 'dontAsk'
+    assert kwargs.get('disallowed_tools') is None
+    assert kwargs['mcp_config'] == {'mcpServers': {}}
+    assert kwargs['strict_mcp_config'] is True
+    assert kwargs['model'] == config.agent_llm_model
+    assert kwargs['timeout_seconds'] == float(config.agent_cli_timeout_seconds)
+    assert kwargs['cap_wait_sanity_secs'] == _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
+    assert kwargs['cwd'] == Path(config.explore_codebase_root)
+    assert not kwargs.get('resume_session_id')
+    assert not kwargs.get('resume_delivers_prompt')
+    assert agent.llm_call_count == 1
+    assert agent.token_count == 42
+
+
+@pytest.mark.asyncio
+async def test_cli_run_passes_a_workable_max_turns():
+    """The cap bounds the WHOLE investigation, and it can never be 1: the model
+    emits a prose turn before it calls StructuredOutput, and a cap of 1 leaves
+    no room for it.
 
     Pinned as the INVARIANT (>= 3, the floor both migrated siblings use — see
     test_judge.py's and test_task_curator.py's identical pins) rather than the
     tuned constant, so retuning _AGENT_CLI_MAX_TURNS does not churn this test.
     """
-    from shared.cli_invoke import AgentResult
-
-    fake_gate = make_gate_mock()
-    config = _make_cli_config()
-    tools = [{'name': 'read_file', 'description': 'read', 'input_schema': {}}]
-
-    fake_result = AgentResult(
-        success=True,
-        output='',
-        session_id='sess-1',
-        structured_output={'tool_calls': []},
-    )
-
-    with patch(
-        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
-        new_callable=AsyncMock,
-    ) as mock_invoke:
-        mock_invoke.return_value = fake_result
-
-        agent = AgentLoop(
-            config=config,
-            system_prompt='Test system prompt',
-            tools={},
-            usage_gate=fake_gate,
-        )
-
-        await agent._call_claude_cli(prompt='hi', tools=tools)  # type: ignore[arg-type]
-
-    call_kwargs = mock_invoke.call_args.kwargs
-    assert call_kwargs['max_turns'] >= 3, (
+    _out, mock_invoke = await _run_cli(_cli_agent(), _verdict_result())
+    assert mock_invoke.call_args.kwargs['max_turns'] >= 3, (
         'max_turns=1 leaves no room for the prose turn the model emits before '
-        'calling StructuredOutput, so the CLI returns error_max_turns and '
-        '_call_claude_cli raises; see _AGENT_CLI_MAX_TURNS.'
+        'calling StructuredOutput; see _AGENT_CLI_MAX_TURNS.'
     )
 
 
 @pytest.mark.asyncio
-async def test_call_claude_cli_threads_session_id_across_turns():
-    """Session ID is stored after the first call and passed as resume_session_id on subsequent calls.
+async def test_cli_system_prompt_cannot_read_as_a_pseudo_tool_registry():
+    """No in-process tool name, heading or parameter schema reaches the CLI.
 
-    Red test (step-3): verifies the session-threading contract without end-to-end
-    integration. First call must use resume_session_id=None; second call must use
-    resume_session_id='sess-A' (the session_id returned by the first call).
+    The model calls whatever the prompt presents as a tool NATIVELY, and the
+    CLI rejects each such call: the measured attractor that the JSON
+    pseudo-tool protocol produced is recorded in
+    fused-memory/scripts/probe_schema_max_turns.py's docstring.
     """
-    from shared.cli_invoke import AgentResult
+    _out, mock_invoke = await _run_cli(_cli_agent(), _verdict_result())
+    system_prompt = mock_invoke.call_args.kwargs['system_prompt']
 
-    fake_gate = make_gate_mock()
-    config = _make_cli_config()
-    tools: list = []
-    structured = {'tool_calls': []}
+    assert system_prompt.startswith('Caller system prompt.')
+    for name in (*_CLI_TOOLS, 'StructuredOutput'):
+        assert name in system_prompt, f'{name!r} missing from: {system_prompt!r}'
+    assert 'read_file' not in system_prompt
+    assert 'verification_complete' not in system_prompt
+    assert not any(line.startswith('### ') for line in system_prompt.splitlines())
+    assert 'Available Tools' not in system_prompt
+    assert '"properties"' not in system_prompt
+    assert 'tool_calls' not in system_prompt
 
-    first_result = AgentResult(
-        success=True, output='', session_id='sess-A', structured_output=structured
+
+@pytest.mark.asyncio
+async def test_cli_run_without_cli_tools_offers_an_empty_registry():
+    """An AgentLoop that names no CLI tools gets ``--tools ''``, never the CLI's
+    default registry.
+    """
+    agent = AgentLoop(
+        config=_make_cli_config(),
+        system_prompt='Caller system prompt.',
+        tools=_cli_tool_defs(),
+        terminal_tool='verification_complete',
+        usage_gate=make_gate_mock(),
     )
-    second_result = AgentResult(
-        success=True, output='', session_id='sess-A', structured_output=structured
-    )
+    _out, mock_invoke = await _run_cli(agent, _verdict_result())
+    assert mock_invoke.call_args.kwargs['available_tools'] == []
 
+
+@pytest.mark.asyncio
+async def test_cli_run_requires_the_terminal_tool():
+    """The terminal tool's parameters ARE the CLI output schema, so a run
+    without one cannot be started.
+    """
+    tools = _cli_tool_defs()
+    del tools['verification_complete']
+    agent = AgentLoop(
+        config=_make_cli_config(),
+        system_prompt='Caller system prompt.',
+        tools=tools,
+        terminal_tool='verification_complete',
+        cli_tools=_CLI_TOOLS,
+        usage_gate=make_gate_mock(),
+    )
     with patch(
         'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
         new_callable=AsyncMock,
-    ) as mock_invoke:
-        mock_invoke.side_effect = [first_result, second_result]
+    ) as mock_invoke, pytest.raises(ValueError, match='verification_complete'):
+        await agent.run('payload')
+    mock_invoke.assert_not_called()
 
-        agent = AgentLoop(
-            config=config,
-            system_prompt='Test',
-            tools={},
-            usage_gate=fake_gate,
-        )
 
-        await agent._call_claude_cli(prompt='turn-1', tools=tools)
-        await agent._call_claude_cli(prompt='turn-2', tools=tools)
-
-    assert mock_invoke.call_count == 2
-    first_kwargs = mock_invoke.call_args_list[0].kwargs
-    second_kwargs = mock_invoke.call_args_list[1].kwargs
-    assert first_kwargs['resume_session_id'] is None
-    assert second_kwargs['resume_session_id'] == 'sess-A'
+_CLI_FAILURE_CASES = [
+    pytest.param(
+        AgentResult(
+            success=False,
+            output=_MEASURED_REFUSAL_OUTPUT,
+            subtype='success',
+            stop_reason='refusal',
+            session_id='sess-r',
+        ),
+        'api_refusal',
+        id='refusal',
+    ),
+    pytest.param(
+        AgentResult(success=False, output='', subtype='error_max_turns'),
+        'cli_max_turns',
+        id='max_turns',
+    ),
+    pytest.param(
+        _verdict_result(structured_output='not valid json {'),
+        'cli_output_unparseable',
+        id='unparseable',
+    ),
+    pytest.param(_verdict_result(structured_output=None), 'cli_output_empty', id='none'),
+    pytest.param(_verdict_result(structured_output={}), 'cli_output_empty', id='empty_dict'),
+    pytest.param(_verdict_result(structured_output='null'), 'cli_output_empty', id='json_null'),
+]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    'raised_exc',
-    [
-        AllAccountsCappedException(retries=5, elapsed_secs=100.0, label='test'),
-        RuntimeError('boom'),
-        TimeoutError(),
-    ],
-    ids=['AllAccountsCappedException', 'RuntimeError', 'TimeoutError'],
-)
-async def test_call_claude_cli_clears_session_id_on_exception(raised_exc):
-    """_call_claude_cli clears _cli_session_id when invoke_with_cap_retry raises.
-
-    Parametrized over AllAccountsCappedException (the primary cap-retry failure),
-    a generic RuntimeError, and asyncio.TimeoutError — locking in the 'any exception
-    clears the session id' contract described in the method docstring.
-
-    After a successful first call establishes session 'sess-A', a second call that
-    raises must leave agent._cli_session_id as None — not the stale 'sess-A' — so
-    that a retry attempt doesn't --resume an abandoned session.
+@pytest.mark.parametrize(('result', 'origin'), _CLI_FAILURE_CASES)
+async def test_cli_failures_end_the_run_with_a_closed_origin(result, origin, caplog):
+    """Each recognised CLI failure ends the run as an audited no-tool-call exit
+    whose ``warning_origin`` is a closed-vocabulary census token, so verify()
+    writes an agent_failed row rather than a prose-only error row.
     """
-    fake_gate = make_gate_mock()
-    config = _make_cli_config()
-    tools: list = []
-    structured = {'tool_calls': []}
+    with caplog.at_level(logging.WARNING):
+        (payload, journal), _mock = await _run_cli(_cli_agent(), result)
 
-    first_result = AgentResult(
-        success=True, output='', session_id='sess-A', structured_output=structured
+    assert payload['warning'] == 'no_tool_calls'
+    assert payload['warning_origin'] == origin
+    assert journal == []
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(origin in m for m in warnings), f'no WARNING naming {origin}: {warnings}'
+    if origin == 'api_refusal':
+        assert any('req_x' in m for m in warnings), f'request id not logged: {warnings}'
+
+
+@pytest.mark.asyncio
+async def test_cli_warning_origins_is_exactly_what_the_cli_path_emits():
+    """The closed vocabulary must not drift from its only producer, in either
+    direction: every token the CLI path emits is a member, and every member is
+    emitted by some failure.
+    """
+    emitted = set()
+    for case in _CLI_FAILURE_CASES:
+        result, _origin = case.values
+        (payload, _journal), _mock = await _run_cli(_cli_agent(), result)
+        emitted.add(payload['warning_origin'])
+    assert emitted == set(CLI_WARNING_ORIGINS)
+
+
+@pytest.mark.asyncio
+async def test_cli_max_turns_is_distinct_from_refusal_and_crash():
+    """error_max_turns is its own audited token, never the refusal token, and
+    never a raise; any other CLI failure still raises with its diagnostics.
+    Both calls reached the model, so both are counted.
+    """
+    agent = _cli_agent()
+    (payload, _journal), _mock = await _run_cli(
+        agent, AgentResult(success=False, output='', subtype='error_max_turns'),
     )
+    assert payload['warning_origin'] == 'cli_max_turns'
 
-    with patch(
-        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
-        new_callable=AsyncMock,
-    ) as mock_invoke:
-        mock_invoke.side_effect = [first_result, raised_exc]
-
-        agent = AgentLoop(
-            config=config,
-            system_prompt='Test',
-            tools={},
-            usage_gate=fake_gate,
-        )
-
-        # First call succeeds and establishes the session id.
-        await agent._call_claude_cli(prompt='turn-1', tools=tools)
-        assert agent._cli_session_id == 'sess-A'
-
-        # Second call raises — the stale session id must be cleared.
-        with pytest.raises(type(raised_exc)):
-            await agent._call_claude_cli(prompt='turn-2', tools=tools)
-
-    assert agent._cli_session_id is None
-
-
-@pytest.mark.asyncio
-async def test_call_claude_cli_forwards_cwd_to_invoke_claude_agent(tmp_path):
-    """_call_claude_cli passes cwd all the way through to invoke_claude_agent.
-
-    Step-7 (b): patches invoke_claude_agent (one level below invoke_with_cap_retry)
-    so that the kwargs-forwarding layer is exercised.  Omitting cwd from the
-    invoke_with_cap_retry call would raise TypeError at runtime; this test
-    catches that regression without requiring a live Claude CLI.
-
-    Uses ``autospec=True`` (not a bare ``AsyncMock``) so a misspelled or
-    unsupported kwarg at the call site raises TypeError here instead of
-    being forwarded and asserted-on silently — see the fuller rationale on
-    test_call_claude_cli_forwards_mcp_scoping_to_invoke_claude_agent below.
-    """
-    from pathlib import Path
-
-    from shared.cli_invoke import AgentResult
-
-    # Use tmp_path so the cwd Path actually exists on disk.
-    explore_root = str(tmp_path)
-    config = _make_cli_config(explore_codebase_root=explore_root)
-
-    fake_result = AgentResult(
-        success=True,
+    crashed = AgentResult(
+        success=False,
         output='',
-        session_id='sess-cwd',
-        structured_output={'tool_calls': []},
+        stderr='ENOENT: claude CLI binary not found',
+        subtype='error_unexpected',
     )
+    with pytest.raises(RuntimeError) as excinfo:
+        await _run_cli(agent, crashed)
+    msg = str(excinfo.value)
+    assert msg.startswith('Claude CLI agent failed:'), f'unexpected prefix: {msg!r}'
+    assert 'ENOENT: claude CLI binary not found' in msg, f'stderr missing from: {msg!r}'
+    assert "subtype='error_unexpected'" in msg, f'subtype missing from: {msg!r}'
+    assert agent.llm_call_count == 2
 
-    # Patch at the level below invoke_with_cap_retry — this exercises the
-    # kwargs-forwarding path that the higher-level mock skips.
-    # usage_gate=None takes the fast path in invoke_with_cap_retry
-    # (single invocation, no cap retry), so the real forwarding code runs.
-    # autospec (not a bare AsyncMock): validates every kwarg against the
-    # real invoke_claude_agent signature instead of swallowing it silently.
-    with patch(
-        'shared.cli_invoke.invoke_claude_agent',
-        autospec=True,
-    ) as mock_agent:
-        mock_agent.return_value = fake_result
 
-        agent = AgentLoop(
-            config=config,
-            system_prompt='Test',
-            tools={},
-            usage_gate=None,  # fast path: real invoke_with_cap_retry, real forwarding
-        )
-
-        await agent._call_claude_cli(prompt='hello', tools=[])
-
-    mock_agent.assert_called_once()
-    call_kwargs = mock_agent.call_args.kwargs
-    assert call_kwargs['cwd'] == Path(explore_root)
+@pytest.mark.asyncio
+async def test_cli_structured_output_json_string_is_parsed():
+    (payload, _journal), _mock = await _run_cli(
+        _cli_agent(),
+        _verdict_result(structured_output='{"verdict": "confirmed", "summary": "s"}'),
+    )
+    assert payload == {'verdict': 'confirmed', 'summary': 's'}
 
 
 @pytest.mark.asyncio
 async def test_agent_loop_explicit_cwd_overrides_config_explore_root(tmp_path):
     """An explicit `cwd=` wins over config.explore_codebase_root (task 4722, PRD D5).
 
-    The verifier now runs against the TASK's own project root, not the
-    process-global explore root, so AgentLoop must accept a per-instance cwd
-    and hand exactly that to invoke_with_cap_retry.
-
-    The `!=` assertion is not redundant: a regression that silently ignores the
-    parameter and keeps using the global root would still produce a Path, and
-    on an accidental path equality the positive assertion alone could pass.
-    Pinning the inequality against a deliberately DISTINCT global root makes
-    that failure mode loud.
+    The verifier runs against the TASK's own project root, not the
+    process-global explore root.  The `!=` assertion is not redundant: a
+    regression that silently ignores the parameter would still produce a Path,
+    and pinning the inequality against a deliberately DISTINCT global root
+    makes that failure mode loud.
     """
     from pathlib import Path
-
-    from shared.cli_invoke import AgentResult
 
     global_root = tmp_path / 'global'
     global_root.mkdir()
     target = tmp_path / 'target'
     target.mkdir()
-
     config = _make_cli_config(explore_codebase_root=str(global_root))
 
-    fake_result = AgentResult(
-        success=True,
-        output='',
-        session_id='sess-cwd-explicit',
-        structured_output={'tool_calls': []},
-    )
+    _out, mock_invoke = await _run_cli(_cli_agent(config=config, cwd=target), _verdict_result())
 
-    with patch(
-        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
-        new_callable=AsyncMock,
-    ) as mock_invoke:
-        mock_invoke.return_value = fake_result
-
-        agent = AgentLoop(
-            config=config,
-            system_prompt='Test',
-            tools={},
-            usage_gate=make_gate_mock(),
-            cwd=target,
-        )
-
-        await agent._call_claude_cli(prompt='hi', tools=[])
-
-    mock_invoke.assert_called_once()
-    call_kwargs = mock_invoke.call_args.kwargs
-    assert call_kwargs['cwd'] == target
-    assert call_kwargs['cwd'] != Path(config.explore_codebase_root)
+    assert mock_invoke.call_args.kwargs['cwd'] == target
+    assert mock_invoke.call_args.kwargs['cwd'] != Path(config.explore_codebase_root)
 
 
 @pytest.mark.asyncio
 async def test_agent_loop_cwd_defaults_to_config_explore_root(tmp_path):
     """Without an explicit cwd, AgentLoop falls back to config.explore_codebase_root.
 
-    PRD D5's "test compat" clause: `cwd` is optional precisely so this file's
-    ~28 existing construction sites keep working unchanged.  That is the
-    WHOLE blast radius — `AgentLoop(` has exactly ONE call site outside
-    tests, verify.py, and it always passes `cwd`.  The recon stages, the
-    judge harness and cli_stage_runner call `invoke_with_cap_retry` directly
-    and never construct an AgentLoop at all, so nothing in production depends
-    on this fallback and the default is in fact unreachable there.
-
-    This pins the fallback while those test sites still rely on it; a later
-    task can make `cwd` required outright once they pass it explicitly.
+    `AgentLoop(` has exactly ONE call site outside tests, verify.py, and it
+    always passes `cwd`, so nothing in production depends on this fallback.
+    This pins it while this file's construction sites still rely on it.
     """
     from pathlib import Path
-
-    from shared.cli_invoke import AgentResult
 
     global_root = tmp_path / 'global'
     global_root.mkdir()
     config = _make_cli_config(explore_codebase_root=str(global_root))
 
-    fake_result = AgentResult(
-        success=True,
-        output='',
-        session_id='sess-cwd-default',
-        structured_output={'tool_calls': []},
-    )
+    _out, mock_invoke = await _run_cli(_cli_agent(config=config), _verdict_result())
 
-    with patch(
-        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
-        new_callable=AsyncMock,
-    ) as mock_invoke:
-        mock_invoke.return_value = fake_result
-
-        agent = AgentLoop(
-            config=config,
-            system_prompt='Test',
-            tools={},
-            usage_gate=make_gate_mock(),
-        )
-
-        await agent._call_claude_cli(prompt='hi', tools=[])
-
-    mock_invoke.assert_called_once()
-    call_kwargs = mock_invoke.call_args.kwargs
-    assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
+    assert mock_invoke.call_args.kwargs['cwd'] == Path(config.explore_codebase_root)
 
 
 @pytest.mark.asyncio
-async def test_explicit_cwd_survives_forwarding_to_invoke_claude_agent(tmp_path):
-    """The explicit cwd survives the kwargs-forwarding layer down to the CLI call.
+async def test_cli_scoping_survives_forwarding_to_invoke_claude_agent(tmp_path):
+    """Every scoping kwarg survives invoke_with_cap_retry's forwarding layer.
 
-    Sibling of test_call_claude_cli_forwards_cwd_to_invoke_claude_agent, but
-    for the per-instance root: `usage_gate=None` takes invoke_with_cap_retry's
-    fast path so the REAL forwarding code runs, and ``autospec=True`` validates
-    every kwarg against the real invoke_claude_agent signature — a dropped or
-    misspelled kwarg raises TypeError here rather than in production.
+    ``invoke_with_cap_retry`` takes ``**invoke_kwargs`` and forwards them blind.
+    ``usage_gate=None`` takes its single-invocation fast path, so the REAL
+    forwarding code runs, and ``autospec=True`` is load-bearing: a bare
+    ``AsyncMock`` swallows any keyword, while the autospec'd mock raises
+    TypeError on one the real ``invoke_claude_agent`` does not accept.
+
+    Deliberately NOT asserted: that the CLI honours the flags.  That is the
+    external CLI's contract; fused-memory/scripts/probe_schema_max_turns.py
+    measures it live.
     """
-    from pathlib import Path
-
-    from shared.cli_invoke import AgentResult
-
-    global_root = tmp_path / 'global'
-    global_root.mkdir()
     target = tmp_path / 'target'
     target.mkdir()
 
-    config = _make_cli_config(explore_codebase_root=str(global_root))
-
-    fake_result = AgentResult(
-        success=True,
-        output='',
-        session_id='sess-cwd-fwd',
-        structured_output={'tool_calls': []},
-    )
-
-    with patch(
-        'shared.cli_invoke.invoke_claude_agent',
-        autospec=True,
-    ) as mock_agent:
-        mock_agent.return_value = fake_result
-
-        agent = AgentLoop(
-            config=config,
-            system_prompt='Test',
-            tools={},
-            usage_gate=None,  # fast path: real invoke_with_cap_retry, real forwarding
-            cwd=target,
-        )
-
-        await agent._call_claude_cli(prompt='hi', tools=[])
+    with patch('shared.cli_invoke.invoke_claude_agent', autospec=True) as mock_agent:
+        mock_agent.return_value = _verdict_result()
+        await _cli_agent(usage_gate=None, cwd=target).run('payload')
 
     mock_agent.assert_called_once()
-    call_kwargs = mock_agent.call_args.kwargs
-    assert call_kwargs['cwd'] == target
-    assert call_kwargs['cwd'] != Path(config.explore_codebase_root)
-
-
-@pytest.mark.asyncio
-async def test_call_claude_cli_scopes_mcp_to_no_servers():
-    """_call_claude_cli strict-scopes its run to ZERO MCP servers.
-
-    ``disallowed_tools=['*']`` alone does NOT keep MCP tools unreachable here:
-    under an ``output_schema`` cli_invoke turns the wildcard into
-    ``--tools ''``, a registry filter that does not cover MCP tools, and ``cwd`` is
-    ``explore_codebase_root`` (the project root, task 1989), which holds a live
-    ``.mcp.json`` the CLI would ambient-merge — under ``bypassPermissions``,
-    that is unreviewed access to tools like ``halt_scheduler`` /
-    ``delete_memory``.  Closing it takes a truthy scoping ``mcp_config`` plus
-    ``strict_mcp_config=True``; the four pre-existing guarantees are asserted
-    alongside so this fix cannot be traded against them.
-    """
-    from pathlib import Path
-
-    from fused_memory.reconciliation.agent_loop import CLAUDE_CLI_RESPONSE_SCHEMA
-
-    config = _make_cli_config()
-
-    fake_result = AgentResult(
-        success=True,
-        output='',
-        session_id='sess-mcp',
-        structured_output={'tool_calls': []},
-    )
-
-    with patch(
-        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
-        new_callable=AsyncMock,
-    ) as mock_invoke:
-        mock_invoke.return_value = fake_result
-
-        agent = AgentLoop(
-            config=config,
-            system_prompt='Test',
-            tools={},
-            usage_gate=make_gate_mock(),
-        )
-
-        await agent._call_claude_cli(prompt='hi', tools=[])
-
-    mock_invoke.assert_called_once()
-    call_kwargs = mock_invoke.call_args.kwargs
-
-    assert call_kwargs['strict_mcp_config'] is True
-    # A zero-server config, but a TRUTHY one — the --strict-mcp-config emit is
-    # gated on `if mcp_config:`, so an inline `{}` regression fails here.
-    assert call_kwargs['mcp_config'] == {'mcpServers': {}}
-
-    # Unregressed pre-existing guarantees.
-    assert call_kwargs['disallowed_tools'] == ['*']
-    assert call_kwargs['output_schema'] is CLAUDE_CLI_RESPONSE_SCHEMA
-    assert call_kwargs['permission_mode'] == 'bypassPermissions'
-    assert call_kwargs['cwd'] == Path(config.explore_codebase_root)
-
-
-@pytest.mark.asyncio
-async def test_call_claude_cli_forwards_mcp_scoping_to_invoke_claude_agent(tmp_path):
-    """Both MCP-scoping kwargs survive invoke_with_cap_retry's forwarding layer.
-
-    ``invoke_with_cap_retry`` takes ``**invoke_kwargs`` and forwards them blind,
-    so the kwargs-level test above proves only that AgentLoop NAMES these
-    kwargs.  Patching one level lower with ``usage_gate=None`` (the
-    single-invocation fast path) runs the real forwarding code, proving the
-    keys are not dropped en route — same rationale as
-    test_call_claude_cli_forwards_cwd_to_invoke_claude_agent above.
-
-    ``autospec=True`` is load-bearing, not incidental: a bare ``AsyncMock`` is
-    signature-less and swallows arbitrary keywords, so a misspelled
-    ``strict_mcp_configs=True`` would be forwarded and asserted-on happily here
-    and surface as a TypeError only in production.  The autospec'd mock is
-    built from the real ``invoke_claude_agent`` signature and raises TypeError
-    on a kwarg it does not accept, so this test also pins that both names are
-    genuinely supported parameters.
-
-    Deliberately NOT asserted: that the ambient .mcp.json is actually
-    suppressed.  That is the external CLI's own documented
-    ``--strict-mcp-config`` contract, not hermetically testable here.
-    """
-    # Use tmp_path so the cwd Path actually exists on disk.
-    config = _make_cli_config(explore_codebase_root=str(tmp_path))
-
-    fake_result = AgentResult(
-        success=True,
-        output='',
-        session_id='sess-mcp-deep',
-        structured_output={'tool_calls': []},
-    )
-
-    # autospec (not a bare AsyncMock): validates every kwarg against the real
-    # invoke_claude_agent signature, so an unsupported/misspelled one raises
-    # TypeError here instead of only in production. See the docstring.
-    with patch(
-        'shared.cli_invoke.invoke_claude_agent',
-        autospec=True,
-    ) as mock_agent:
-        mock_agent.return_value = fake_result
-
-        agent = AgentLoop(
-            config=config,
-            system_prompt='Test',
-            tools={},
-            usage_gate=None,  # fast path: real invoke_with_cap_retry, real forwarding
-        )
-
-        await agent._call_claude_cli(prompt='hi', tools=[])
-
-    mock_agent.assert_called_once()
-    call_kwargs = mock_agent.call_args.kwargs
-    assert call_kwargs['strict_mcp_config'] is True
-    assert call_kwargs['mcp_config'] == {'mcpServers': {}}
-
-
-# Shared by the two resume-prompt tests below: turn 1 calls `my_tool(x=7)`,
-# turn 2 (after that result is serialized into the resume prompt) calls
-# `stage_complete`. Kept in one place so the pinned serialization contract
-# doesn't live twice: once in the high-seam test below (mocks
-# `invoke_with_cap_retry` out entirely) and once in the low-seam test after
-# it (mocks only `invoke_claude_agent`, so the real `invoke_with_cap_retry`
-# body — including the resume_delivers_prompt swap — actually runs).
-_RESUME_TURN_EXPECTED_PROMPT = '[Tool Result: tc1] (OK)\n{"doubled": 14}'
-
-
-def _two_turn_my_tool_fixture():
-    """Build (tools, first_result, second_result) for the my_tool -> stage_complete flow.
-
-    Turn 1: the agent calls `my_tool(x=7)`. Turn 2: after that result is
-    serialized into the prompt, the agent calls `stage_complete`. The
-    serialized turn-2 prompt this produces is `_RESUME_TURN_EXPECTED_PROMPT`.
-    """
-
-    async def my_tool_fn(x: int = 0):
-        return {'doubled': x * 2}
-
-    tools = {
-        'my_tool': ToolDefinition(
-            name='my_tool',
-            description='Doubles the input',
-            parameters={'type': 'object', 'properties': {'x': {'type': 'integer'}}},
-            function=my_tool_fn,
-        ),
-        'stage_complete': ToolDefinition(
-            name='stage_complete',
-            description='Signals completion',
-            parameters={'type': 'object', 'properties': {'report': {'type': 'object'}}},
-            function=lambda **kw: kw,
-        ),
-    }
-
-    # Turn 1: agent calls my_tool with x=7
-    first_result = AgentResult(
-        success=True,
-        output='',
-        session_id='sess-1',
-        structured_output={
-            'tool_calls': [{'id': 'tc1', 'name': 'my_tool', 'input': {'x': 7}}],
-        },
-    )
-    # Turn 2: agent calls stage_complete with the (serialized) tool result
-    second_result = AgentResult(
-        success=True,
-        output='',
-        session_id='sess-1',
-        structured_output={
-            'tool_calls': [
-                {'id': 'tc2', 'name': 'stage_complete', 'input': {'report': {'result': 14}}}
-            ],
-        },
-    )
-    return tools, first_result, second_result
-
-
-@pytest.mark.asyncio
-async def test_run_threads_serialized_tool_results_into_claude_cli_prompt():
-    """Guards that run() routes tool_results through _serialize_tool_results on follow-up turns.
-
-    Closes the coverage gap left by task 881 (deleted test_claude_cli_provider_first_call and
-    test_claude_cli_provider_resume) for the _call_llm claude_cli branch.
-    """
-    fake_gate = make_gate_mock()
-    config = _make_cli_config()
-    tools, first_result, second_result = _two_turn_my_tool_fixture()
-
-    with patch(
-        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
-        new_callable=AsyncMock,
-    ) as mock_invoke:
-        mock_invoke.side_effect = [first_result, second_result]
-
-        agent = AgentLoop(
-            config=config,
-            system_prompt='You are a test agent.',
-            tools=tools,
-            terminal_tool='stage_complete',
-            usage_gate=fake_gate,
-        )
-
-        result, _journal = await agent.run('initial payload')
-
-    # Terminal tool input round-trips through run()
-    assert result == {'report': {'result': 14}}
-
-    # Both LLM turns must have fired
-    assert mock_invoke.call_count == 2
-
-    # Turn 1: initial string payload is passed straight through (_call_llm string branch)
-    first_prompt = mock_invoke.call_args_list[0].kwargs['prompt']
-    assert first_prompt == 'initial payload'
-
-    # Turn 2: tool_results list is serialized via _serialize_tool_results
-    # before being passed as prompt — the core contract this test guards.
-    # Exact equality catches regressions that swap the \n separator, drop the
-    # [Tool Result: ...] prefix, or subtly reorder fields.
-    second_prompt = mock_invoke.call_args_list[1].kwargs['prompt']
-    assert second_prompt == _RESUME_TURN_EXPECTED_PROMPT
-
-
-@pytest.mark.asyncio
-async def test_run_delivers_serialized_tool_results_on_resume_turn():
-    """Guards that the turn>=2 prompt reaches the CLI intact, not swapped for
-    CRASH_RECOVERY_RESUME_PROMPT.
-
-    This patches `shared.cli_invoke.invoke_claude_agent` — one level BELOW
-    `invoke_with_cap_retry` — instead of the file's usual
-    `patch('fused_memory.reconciliation.agent_loop.invoke_with_cap_retry')`
-    seam used by the sibling test above. That matters: the destruction this
-    test guards against (`cli_invoke.py:1369-1371` — ``if not
-    resume_delivers_prompt: invoke_kwargs['prompt'] =
-    CRASH_RECOVERY_RESUME_PROMPT``) lives INSIDE `invoke_with_cap_retry`'s
-    own body. Mocking that function out — as every existing turn>=2 test in
-    this file does — replaces the very code under test, so it cannot observe
-    the swap by construction; it passes whether or not `agent_loop.py`
-    passes `resume_delivers_prompt=True`. `usage_gate=None` selects the
-    gate-less fast path in `invoke_with_cap_retry` (cli_invoke.py:1507),
-    which still executes the prompt-swap guard above it (:1350-1371) — so
-    the behaviour under test is bit-identical to the gated path — while
-    guaranteeing exactly one `invoke_claude_agent` call per turn.
-    """
-    config = _make_cli_config()
-    tools, first_result, second_result = _two_turn_my_tool_fixture()
-
-    with patch(
-        'shared.cli_invoke.invoke_claude_agent',
-        new_callable=AsyncMock,
-    ) as mock_agent:
-        mock_agent.side_effect = [first_result, second_result]
-
-        agent = AgentLoop(
-            config=config,
-            system_prompt='You are a test agent.',
-            tools=tools,
-            terminal_tool='stage_complete',
-            usage_gate=None,  # fast path: real invoke_with_cap_retry, real forwarding
-        )
-
-        result, _journal = await agent.run('initial payload')
-
-    # Terminal tool input round-trips through run()
-    assert result == {'report': {'result': 14}}
-
-    # Both LLM turns must have fired against the real subprocess-invocation seam.
-    assert mock_agent.call_count == 2
-
-    first_kwargs = mock_agent.call_args_list[0].kwargs
-    second_kwargs = mock_agent.call_args_list[1].kwargs
-
-    # Turn 1 sanity: no prior session, initial payload passed straight through.
-    assert first_kwargs['prompt'] == 'initial payload'
-    assert first_kwargs['resume_session_id'] is None
-
-    # Non-vacuity guard, asserted FIRST: turn 2 really took the resume branch
-    # that performs the swap, so a future refactor that stops resuming fails
-    # loudly here instead of making the prompt assertion below pass trivially.
-    assert second_kwargs['resume_session_id'] == 'sess-1'
-
-    # Core contract: the serialized tool-result prompt reaches the CLI on the
-    # resume turn, byte for byte — the same _RESUME_TURN_EXPECTED_PROMPT
-    # constant the sibling test above asserts against, so both tests agree on
-    # the serialization contract. This equality already rules out the prompt
-    # having been swapped for CRASH_RECOVERY_RESUME_PROMPT, a different,
-    # fixed string.
-    assert second_kwargs['prompt'] == _RESUME_TURN_EXPECTED_PROMPT
-
-
-@pytest.mark.asyncio
-async def test_run_threads_parallel_tool_results_with_double_newline_joiner():
-    """Pins the '\\n\\n' join separator in _serialize_tool_results at integration scope.
-
-    Companion to test_run_threads_serialized_tool_results_into_claude_cli_prompt
-    (the single-result sibling added by Task 897).  That test exercises the
-    per-result format `[Tool Result: <id>] (<status>)\\n<content>` but uses a
-    single tool_use block in turn 1, making the '\\n\\n'.join(parts) call a
-    no-op (len(parts)==1).  This test closes the coverage gap identified by
-    Task 899: two parallel tool_use blocks in turn 1 → two tool_result entries
-    in turn 2's content → _serialize_tool_results joins them with '\\n\\n' →
-    exact-equality assertion on the resulting prompt pins the separator.
-
-    References _serialize_tool_results in agent_loop.py — '\\n\\n'.join(parts).
-    Any change to the separator (e.g. '\\n' or ', ') will fail this test.
-    """
-    from shared.cli_invoke import AgentResult
-
-    fake_gate = make_gate_mock()
-    config = _make_cli_config()
-
-    async def my_tool_fn(x: int = 0):
-        return {'doubled': x * 2}
-
-    async def other_tool_fn(x: int = 0):
-        return {'tripled': x * 3}
-
-    tools = {
-        'my_tool': ToolDefinition(
-            name='my_tool',
-            description='Doubles the input',
-            parameters={'type': 'object', 'properties': {'x': {'type': 'integer'}}},
-            function=my_tool_fn,
-        ),
-        'other_tool': ToolDefinition(
-            name='other_tool',
-            description='Triples the input',
-            parameters={'type': 'object', 'properties': {'x': {'type': 'integer'}}},
-            function=other_tool_fn,
-        ),
-        'stage_complete': ToolDefinition(
-            name='stage_complete',
-            description='Signals completion',
-            parameters={'type': 'object', 'properties': {'report': {'type': 'object'}}},
-            function=lambda **kw: kw,
-        ),
-    }
-
-    # Turn 1: agent calls both my_tool and other_tool in the same response
-    first_result = AgentResult(
-        success=True,
-        output='',
-        session_id='sess-1',
-        structured_output={
-            'tool_calls': [
-                {'id': 'tc1', 'name': 'my_tool', 'input': {'x': 7}},
-                {'id': 'tc2', 'name': 'other_tool', 'input': {'x': 5}},
-            ],
-        },
-    )
-    # Turn 2: agent calls stage_complete to terminate
-    second_result = AgentResult(
-        success=True,
-        output='',
-        session_id='sess-1',
-        structured_output={
-            'tool_calls': [
-                {'id': 'tc3', 'name': 'stage_complete', 'input': {'report': {'ok': True}}}
-            ],
-        },
-    )
-
-    with patch(
-        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
-        new_callable=AsyncMock,
-    ) as mock_invoke:
-        mock_invoke.side_effect = [first_result, second_result]
-
-        agent = AgentLoop(
-            config=config,
-            system_prompt='You are a test agent.',
-            tools=tools,
-            terminal_tool='stage_complete',
-            usage_gate=fake_gate,
-        )
-
-        result, _journal = await agent.run('initial payload')
-
-    # Terminal tool input round-trips through run()
-    assert result == {'report': {'ok': True}}
-
-    # Both LLM turns must have fired
-    assert mock_invoke.call_count == 2
-
-    # Turn 1: initial string payload is passed straight through
-    first_prompt = mock_invoke.call_args_list[0].kwargs['prompt']
-    assert first_prompt == 'initial payload'
-
-    # Turn 2: two tool_results are serialized and joined by '\n\n'.
-    # Exact equality pins the separator — any change (e.g. '\n' or ', ') fails here.
-    second_prompt = mock_invoke.call_args_list[1].kwargs['prompt']
-    expected = (
-        '[Tool Result: tc1] (OK)\n{"doubled": 14}'
-        '\n\n'
-        '[Tool Result: tc2] (OK)\n{"tripled": 15}'
-    )
-    assert second_prompt == expected
-
-
-# ---------------------------------------------------------------------------
-# CLI failure path surfaces stderr + summary in RuntimeError
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_call_claude_cli_failure_surfaces_stderr_and_summary_in_runtime_error():
-    """_call_claude_cli embeds stderr and classify_agent_failure summary in the RuntimeError.
-
-    Red test (step-1): the current code raises RuntimeError(f'Claude CLI agent
-    failed: {result.output[:500]}').  When result.output is '' (typical for a CLI
-    crash), that message is empty and the diagnostic signal lives in result.stderr.
-    This test asserts that after the fix the RuntimeError message:
-      - starts with 'Claude CLI agent failed:'
-      - contains the stderr content ('ENOENT: claude CLI binary not found')
-      - contains 'error_unexpected' (the subtype, present in diagnostic_detail)
-    """
-    from shared.cli_invoke import AgentResult
-
-    fake_gate = make_gate_mock()
-    config = _make_cli_config()
-
-    failing_result = AgentResult(
-        success=False,
-        output='',
-        stderr='ENOENT: claude CLI binary not found at /usr/local/bin/claude',
-        subtype='error_unexpected',
-    )
-
-    with patch(
-        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
-        new_callable=AsyncMock,
-    ) as mock_invoke:
-        mock_invoke.return_value = failing_result
-
-        agent = AgentLoop(
-            config=config,
-            system_prompt='Test system prompt',
-            tools={},
-            usage_gate=fake_gate,
-        )
-
-        with pytest.raises(RuntimeError) as excinfo:
-            await agent._call_claude_cli(prompt='hi', tools=[])
-
-    msg = str(excinfo.value)
-    assert msg.startswith('Claude CLI agent failed:'), f'unexpected prefix: {msg!r}'
-    assert 'ENOENT: claude CLI binary not found' in msg, f'stderr missing from: {msg!r}'
-    assert "subtype='error_unexpected'" in msg, f'subtype missing from: {msg!r}'
-
-
-# ─────────────────────────────────────────────────────────────────────
-# _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS forwarded by agent_loop to
-# invoke_with_cap_retry (task 1401, post-1365 audit)
-# ─────────────────────────────────────────────────────────────────────
-
-
-class TestAgentLoopCapWaitSanityBound:
-    """_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS is forwarded to
-    invoke_with_cap_retry by agent_loop; prevents stalling the reconciliation
-    queue under cap."""
-
-    @pytest.mark.asyncio
-    async def test_call_claude_cli_forwards_cap_wait_sanity_secs(self):
-        """(b) _call_claude_cli forwards cap_wait_sanity_secs=_RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS."""
-        from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
-
-        config = _make_cli_config()
-        agent = AgentLoop(
-            config=config,
-            system_prompt='Test system prompt',
-            tools={},
-            usage_gate=make_gate_mock(),
-        )
-        empty_result = AgentResult(
-            success=True,
-            output='',
-            structured_output={'tool_calls': []},
-        )
-        mock = AsyncMock(return_value=empty_result)
-        with patch(
-            'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
-            new=mock,
-        ):
-            await agent._call_claude_cli(prompt='p', tools=[])
-        assert mock.call_args.kwargs['cap_wait_sanity_secs'] == _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
-
-
-# ---------------------------------------------------------------------------
-# Site-18 loud-sentinel tests (step-3 RED: unparseable; step-5 RED: empty)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_call_claude_cli_unparseable_structured_output_emits_warning(caplog):
-    """When structured_output is a non-JSON string, _call_claude_cli must:
-
-    - emit a WARNING record whose message contains 'cli_output_unparseable'
-    - return an adapter with .warning == 'cli_output_unparseable'
-    - return an adapter with .tool_calls == []
-
-    RED in step-3: JSONDecodeError branch currently swallows the error silently
-    and _CLIResponseAdapter has no .warning attribute.
-    """
-    config = _make_cli_config()
-    agent = AgentLoop(
-        config=config,
-        system_prompt='Test system prompt',
-        tools={},
-        usage_gate=make_gate_mock(),
-    )
-    fake_result = AgentResult(
-        success=True,
-        output='',
-        session_id='s',
-        structured_output='not valid json {',
-    )
-
-    with patch(
-        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
-        new_callable=AsyncMock,
-    ) as mock_invoke:
-        mock_invoke.return_value = fake_result
-
-        with caplog.at_level(logging.WARNING):
-            adapter = await agent._call_claude_cli(prompt='p', tools=[])
-
-    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert warning_records, 'Expected at least one WARNING record, got none'
-    assert any('cli_output_unparseable' in r.message for r in warning_records), (
-        f'Expected a WARNING containing cli_output_unparseable, '
-        f'got: {[r.message for r in warning_records]}'
-    )
-    assert adapter.warning == 'cli_output_unparseable', (
-        f'Expected adapter.warning == "cli_output_unparseable", got {adapter.warning!r}'
-    )
-    assert adapter.tool_calls == []
-
-
-@pytest.mark.asyncio
-async def test_call_claude_cli_legitimate_empty_calls_no_warning(caplog):
-    """A valid non-empty dict with tool_calls=[] (a legitimate no-calls turn) must
-    NOT fire any warning and adapter.warning must be ''.
-
-    This is the guard test written in step-3 (must stay green in step-4 and beyond).
-    """
-    config = _make_cli_config()
-    agent = AgentLoop(
-        config=config,
-        system_prompt='Test system prompt',
-        tools={},
-        usage_gate=make_gate_mock(),
-    )
-    fake_result = AgentResult(
-        success=True,
-        output='',
-        session_id='s',
-        structured_output={'tool_calls': []},
-    )
-
-    with patch(
-        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
-        new_callable=AsyncMock,
-    ) as mock_invoke:
-        mock_invoke.return_value = fake_result
-
-        with caplog.at_level(logging.WARNING):
-            adapter = await agent._call_claude_cli(prompt='p', tools=[])
-
-    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert not warning_records, (
-        f'Expected no WARNING on a valid empty-calls turn, got: {[r.message for r in warning_records]}'
-    )
-    assert adapter.warning == '', (
-        f'Expected adapter.warning == "", got {adapter.warning!r}'
-    )
-    assert adapter.tool_calls == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    'structured_output',
-    [None, {}, 'null'],
-    ids=['none', 'empty_dict', 'json_null'],
-)
-async def test_call_claude_cli_empty_structured_output_emits_warning(
-    structured_output, caplog
-):
-    """When structured_output is None, {}, or JSON 'null', _call_claude_cli must:
-
-    - emit a WARNING record whose message contains 'cli_output_empty'
-    - return an adapter with .warning == 'cli_output_empty'
-    - return an adapter with .tool_calls == []
-
-    RED in step-5: the `if not structured:` branch currently swallows silently.
-    'null' parses to Python None via json.loads, then hits `if not structured`.
-    """
-    config = _make_cli_config()
-    agent = AgentLoop(
-        config=config,
-        system_prompt='Test system prompt',
-        tools={},
-        usage_gate=make_gate_mock(),
-    )
-    fake_result = AgentResult(
-        success=True,
-        output='',
-        session_id='s',
-        structured_output=structured_output,
-    )
-
-    with patch(
-        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
-        new_callable=AsyncMock,
-    ) as mock_invoke:
-        mock_invoke.return_value = fake_result
-
-        with caplog.at_level(logging.WARNING):
-            adapter = await agent._call_claude_cli(prompt='p', tools=[])
-
-    warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert warning_records, 'Expected at least one WARNING record, got none'
-    assert any('cli_output_empty' in r.message for r in warning_records), (
-        f'Expected a WARNING containing cli_output_empty, '
-        f'got: {[r.message for r in warning_records]}'
-    )
-    assert adapter.warning == 'cli_output_empty', (
-        f'Expected adapter.warning == "cli_output_empty", got {adapter.warning!r}'
-    )
-    assert adapter.tool_calls == []
-
-
-# ---------------------------------------------------------------------------
-# Task 6022: API usage-policy refusals (reasoning_extraction)
-# ---------------------------------------------------------------------------
-
-_MEASURED_REFUSAL_OUTPUT = (
-    "API Error: Sonnet 5.5's safeguards flagged this message "
-    '(https://www.anthropic.com/legal/aup). This sometimes happens with safe, '
-    "normal conversations. Claude Code can't respond to this message with "
-    'Sonnet 5.5.\n\nRequest ID: req_x'
-)
-
-
-def _refused_cli_result() -> AgentResult:
-    return AgentResult(
-        success=False,
-        output=_MEASURED_REFUSAL_OUTPUT,
-        subtype='success',
-        stop_reason='refusal',
-        session_id='sess-r',
-    )
-
-
-def _terminal_cli_result() -> AgentResult:
-    return AgentResult(
-        success=True,
-        output='',
-        session_id='sess-ok',
-        structured_output={
-            'tool_calls': [{'id': 'tc1', 'name': 'stage_complete', 'input': {}}],
-        },
-    )
-
-
-def _cli_agent_with_terminal_tool() -> AgentLoop:
-    return AgentLoop(
-        config=_make_cli_config(),
-        system_prompt='Test system prompt',
-        tools={
-            'stage_complete': ToolDefinition(
-                name='stage_complete',
-                description='Complete',
-                parameters={'type': 'object', 'properties': {}},
-                function=lambda **kw: kw,
-            ),
-        },
-        terminal_tool='stage_complete',
-    )
-
-
-@pytest.mark.asyncio
-async def test_cli_invocation_requests_no_reasoning_emission():
-    """Task 6022 measured that a required reasoning field (a "thinking" field
-    plus an instruction to "explain your reasoning" in it) gets verify refused by the
-    API's reasoning_extraction classifier.  Any new schema property must be
-    re-probed with fused-memory/scripts/probe_schema_max_turns.py first.
-
-    The schema's property set is the pin.  The two system-prompt substring
-    checks catch only a revert of the exact removed instruction; a reworded
-    request for the model's reasoning would pass them.
-    """
-    with patch(
-        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
-        new_callable=AsyncMock,
-    ) as mock_invoke:
-        mock_invoke.return_value = _terminal_cli_result()
-        await _cli_agent_with_terminal_tool().run('p')
-
-    call_kwargs = mock_invoke.call_args.kwargs
-    output_schema = call_kwargs['output_schema']
-    assert set(output_schema['properties']) == {'tool_calls'}
-    assert output_schema['required'] == ['tool_calls']
-    assert '"thinking"' not in call_kwargs['system_prompt']
-    assert 'explain your reasoning' not in call_kwargs['system_prompt']
-
-
-@pytest.mark.asyncio
-async def test_api_refusal_ends_run_with_structured_origin(caplog):
-    """A refused call ends the run as a no-tool-call exit whose origin is the
-    closed-vocabulary token 'api_refusal', instead of raising — so verify()
-    writes an audited agent_failed row rather than a prose-only error row.
-    The refused session is never resumed: the CLI says it cannot continue.
-    """
-    agent = _cli_agent_with_terminal_tool()
-
-    with patch(
-        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
-        new_callable=AsyncMock,
-    ) as mock_invoke:
-        mock_invoke.side_effect = [_refused_cli_result(), _terminal_cli_result()]
-
-        with caplog.at_level(logging.WARNING):
-            payload, _entries = await agent.run('p')
-        await agent.run('p2')
-
-    assert payload.get('warning') == 'no_tool_calls'
-    assert payload.get('warning_origin') == 'api_refusal'
-
-    warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert any('api_refusal' in m and 'req_x' in m for m in warning_messages), (
-        f'Expected a WARNING naming api_refusal and the request id, got: {warning_messages}'
-    )
-
-    assert mock_invoke.call_args_list[1].kwargs['resume_session_id'] is None
-
-
-@pytest.mark.asyncio
-async def test_api_refusal_is_counted_like_any_returned_call():
-    """A refused call reached the model and was billed, so it counts toward
-    llm_call_count and token_count exactly as a successful call does.
-    """
-    refused = replace(_refused_cli_result(), input_tokens=30, output_tokens=12)
-    agent = _cli_agent_with_terminal_tool()
-
-    with patch(
-        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
-        new_callable=AsyncMock,
-    ) as mock_invoke:
-        mock_invoke.return_value = refused
-        await agent.run('p')
-
-    assert agent.llm_call_count == 1
-    assert agent.token_count == 30 + 12
-
-
-@pytest.mark.asyncio
-async def test_non_refusal_cli_failure_still_raises():
-    """Only a refusal is converted; every other CLI failure still raises."""
-    with patch(
-        'fused_memory.reconciliation.agent_loop.invoke_with_cap_retry',
-        new_callable=AsyncMock,
-    ) as mock_invoke:
-        mock_invoke.return_value = AgentResult(
-            success=False, output='', subtype='error_max_turns', stop_reason=None
-        )
-        with pytest.raises(RuntimeError):
-            await _cli_agent_with_terminal_tool().run('p')
+    kwargs = mock_agent.call_args.kwargs
+    assert kwargs['available_tools'] == ['Read', 'Grep', 'Glob']
+    assert kwargs['permission_mode'] == 'dontAsk'
+    assert kwargs['mcp_config'] == {'mcpServers': {}}
+    assert kwargs['strict_mcp_config'] is True
+    assert kwargs['output_schema'] == _P
+    assert kwargs['cwd'] == target
