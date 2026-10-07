@@ -134,6 +134,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
+from shared.delivered_check_scope import (
+    GIT_PROBE_FAILURES,
+    GIT_TIMEOUT_SECS,
+    resolve_commit,
+)
+
 __all__ = [
     'GATE_REF',
     'CheckFinding',
@@ -151,27 +157,12 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-#: Wall-clock ceiling for ONE authoring-time git probe (``grep``,
-#: ``ls-tree``, ``ls-files``). Generous relative to a real probe
-#: (milliseconds on this repo) because exceeding it is not a verdict — it
-#: degrades to ``ERRORED``, which is REPORTED rather than blocking, so a
-#: slow disk delays a commit_planning call instead of rejecting a healthy
-#: batch.
-GIT_TIMEOUT_SECS: float = 30.0
-
 #: The ref every delivered_check is judged against: the runtime gate's
 #: (``orchestrator/src/orchestrator/scheduler.py::Scheduler._resolve_main_sha``
 #: rev-parses it, and ``orchestrator.delivered_checks.run_delivered_check``
 #: defaults to it). The authoring-time wire points evaluate against the same
 #: name so the two gates judge one tree.
 GATE_REF: str = 'main'
-
-#: Everything ``subprocess.run`` can raise for one git probe, all of which mean
-#: "unevaluable", never a verdict: ``OSError`` (no ``git``, exec failure),
-#: ``SubprocessError`` (chiefly a timeout) and ``ValueError`` — an argv
-#: element carrying a NUL byte, or a lone surrogate that cannot be encoded
-#: (``UnicodeEncodeError`` is a ``ValueError``), both refused before git runs.
-_GIT_PROBE_FAILURES = (OSError, subprocess.SubprocessError, ValueError)
 
 
 class CheckOutcome(Enum):
@@ -371,7 +362,7 @@ def evaluate_grep_at_tree(
         completed = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout_secs
         )
-    except _GIT_PROBE_FAILURES:
+    except GIT_PROBE_FAILURES:
         return CheckOutcome.ERRORED
     return interpret_grep_rc(completed.returncode, expect)
 
@@ -399,7 +390,7 @@ def evaluate_path_at_tree(
             completed = subprocess.run(
                 argv, capture_output=True, text=True, timeout=timeout_secs
             )
-        except _GIT_PROBE_FAILURES:
+        except GIT_PROBE_FAILURES:
             return CheckOutcome.ERRORED
         outcome = interpret_path_listing(completed.returncode, completed.stdout, expect)
         if outcome is not CheckOutcome.PASS:
@@ -484,7 +475,7 @@ def lint_delivered_checks(
     unresolved, a name like ``main`` with no such branch would be read as a
     PATHSPEC and answered from the working tree.
     """
-    tree = functools.cache(lambda: _resolve_commit(repo_root, ref))
+    tree = functools.cache(lambda: resolve_commit(repo_root, ref))
     findings: list[CheckFinding] = []
     for check in checks:
         finding = _lint_one_check(
@@ -493,21 +484,6 @@ def lint_delivered_checks(
         if finding is not None:
             findings.append(finding)
     return findings
-
-
-def _resolve_commit(
-    repo_root: str | Path, ref: str, timeout_secs: float = GIT_TIMEOUT_SECS
-) -> str | None:
-    """The commit *ref* names in *repo_root*, or ``None`` if it names none."""
-    argv = ['git', '-C', str(repo_root), 'rev-parse', '--verify', '--quiet', f'{ref}^{{commit}}']
-    try:
-        completed = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout_secs
-        )
-    except _GIT_PROBE_FAILURES:
-        return None
-    sha = completed.stdout.strip()
-    return sha if completed.returncode == 0 and sha else None
 
 
 def _unevaluable_finding(name: str, ref: str, repo_root: str | Path) -> CheckFinding:
@@ -780,7 +756,7 @@ def _grep_matches(
         completed = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout_secs
         )
-    except _GIT_PROBE_FAILURES:
+    except GIT_PROBE_FAILURES:
         return None
     if completed.returncode >= 2:
         return None
@@ -818,7 +794,7 @@ def _tracked_paths(
         completed = subprocess.run(
             argv, capture_output=True, text=True, timeout=timeout_secs
         )
-    except _GIT_PROBE_FAILURES:
+    except GIT_PROBE_FAILURES:
         return None
     if completed.returncode != 0:
         return None
