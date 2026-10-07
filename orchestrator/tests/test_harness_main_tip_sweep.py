@@ -23,6 +23,7 @@ This file covers:
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -30,6 +31,8 @@ from _orch_helpers import _init_harness_state_for_test
 
 from orchestrator.config import OrchestratorConfig
 from orchestrator.harness import Harness
+from orchestrator.main_tip_sweep_cadence import SweepSeedMode
+from orchestrator.run_store import RunStore
 from orchestrator.verify import VerifyResult
 
 # ---------------------------------------------------------------------------
@@ -70,7 +73,9 @@ PASSING_RESULT = VerifyResult(
 )
 
 
-def _make_sweep_harness(*, main_sha: str = MAIN_SHA) -> Harness:
+def _make_sweep_harness(
+    *, main_sha: str = MAIN_SHA, run_store: RunStore | None = None,
+) -> Harness:
     """Build a minimal bare Harness for single-pass sweep tests."""
     h = Harness.__new__(Harness)
     _init_harness_state_for_test(h)
@@ -81,7 +86,110 @@ def _make_sweep_harness(*, main_sha: str = MAIN_SHA) -> Harness:
     h._escalation_queue.make_id = MagicMock(return_value='esc-sweep-1')
     h._escalation_queue.has_open_l1 = MagicMock(return_value=False)
     h._last_swept_main_sha = None
+    h._run_store = run_store
+    h._main_sweep_cold_control = None
     return h
+
+
+# ---------------------------------------------------------------------------
+# task 5812: warm-by-default sweep with a periodic COLD control
+# ---------------------------------------------------------------------------
+
+SHA_A = 'a' * 40
+SHA_B = 'c' * 40
+
+
+async def _passing_sweep(config, git_ops, *, main_sha, **kwargs):
+    return (main_sha, PASSING_RESULT)
+
+
+async def _tick_seed_modes(h: Harness, shas: list[str], sweep: AsyncMock) -> list:
+    """Tick the sweep once per sha; return each run_main_tip_sweep call's seed_mode."""
+    from orchestrator import verify as verify_module
+
+    h.git_ops.get_main_sha = AsyncMock(side_effect=shas)
+    h._close_superseded_main_sweep_escalations = AsyncMock()  # type: ignore[method-assign]
+    with patch.object(verify_module, 'run_main_tip_sweep', new=sweep):
+        for _ in shas:
+            await h._run_main_tip_sweep()
+    return [c.kwargs['seed_mode'] for c in sweep.call_args_list]
+
+
+class TestMainTipSweepColdControl:
+    """The harness picks each sweep's seed mode through MainSweepColdControl."""
+
+    @pytest.mark.asyncio
+    async def test_first_sweep_is_cold_and_the_next_sha_is_warm(self) -> None:
+        modes = await _tick_seed_modes(
+            _make_sweep_harness(), [SHA_A, SHA_B], AsyncMock(side_effect=_passing_sweep),
+        )
+
+        assert modes == [SweepSeedMode.COLD, SweepSeedMode.WARM]
+
+    @pytest.mark.asyncio
+    async def test_zero_cold_interval_sweeps_every_sha_cold(self) -> None:
+        h = _make_sweep_harness()
+        h.config = OrchestratorConfig(main_tip_sweep_cold_interval_secs=0)
+
+        modes = await _tick_seed_modes(
+            h, [SHA_A, SHA_B], AsyncMock(side_effect=_passing_sweep),
+        )
+
+        assert modes == [SweepSeedMode.COLD, SweepSeedMode.COLD]
+
+    @pytest.mark.asyncio
+    async def test_cold_sweep_without_a_verdict_keeps_the_next_sweep_cold(self) -> None:
+        """An infra-aborted (None) cold sweep is not ground-truth evidence."""
+        sweep = AsyncMock(side_effect=[None, (SHA_A, PASSING_RESULT)])
+
+        modes = await _tick_seed_modes(_make_sweep_harness(), [SHA_A, SHA_A], sweep)
+
+        assert modes == [SweepSeedMode.COLD, SweepSeedMode.COLD]
+
+    @pytest.mark.asyncio
+    async def test_cold_cadence_survives_a_restart(self, tmp_path) -> None:
+        """Across a restart: harness #2 shares only runs.db with harness #1, and
+        still sweeps warm because #1's cold verdict was persisted there."""
+        store = RunStore(tmp_path / 'runs.db')
+
+        first = await _tick_seed_modes(
+            _make_sweep_harness(run_store=store), [SHA_A],
+            AsyncMock(side_effect=_passing_sweep),
+        )
+        after_restart = await _tick_seed_modes(
+            _make_sweep_harness(run_store=store), [SHA_B],
+            AsyncMock(side_effect=_passing_sweep),
+        )
+
+        assert first == [SweepSeedMode.COLD]
+        assert after_restart == [SweepSeedMode.WARM]
+
+    @pytest.mark.asyncio
+    async def test_sweep_logs_its_mode_before_and_with_its_verdict(self, caplog) -> None:
+        from orchestrator import verify as verify_module
+
+        h = _make_sweep_harness()
+        messages_at_verify: list[str] = []
+
+        async def _sweep(config, git_ops, *, main_sha, **kwargs):
+            messages_at_verify.extend(r.getMessage() for r in caplog.records)
+            return (main_sha, PASSING_RESULT)
+
+        h.git_ops.get_main_sha = AsyncMock(return_value=SHA_A)
+        h._close_superseded_main_sweep_escalations = AsyncMock()  # type: ignore[method-assign]
+        with (
+            caplog.at_level(logging.INFO, logger='orchestrator.harness'),
+            patch.object(verify_module, 'run_main_tip_sweep', new=AsyncMock(side_effect=_sweep)),
+        ):
+            await h._run_main_tip_sweep()
+
+        assert any(SHA_A[:12] in m and 'cold' in m for m in messages_at_verify), (
+            f'no start line naming the sha and mode before verification: {messages_at_verify}'
+        )
+        after = [r.getMessage() for r in caplog.records][len(messages_at_verify):]
+        assert any(
+            'cold' in m and SHA_A[:12] in m and 'passed' in m for m in after
+        ), f'no verdict line naming mode, sha and outcome: {after}'
 
 
 # ---------------------------------------------------------------------------
