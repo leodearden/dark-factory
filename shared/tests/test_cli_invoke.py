@@ -3314,6 +3314,17 @@ class TestSchemaToolNotDisallowed:
         assert 'StructuredOutput' not in captured_cmd
         assert '--json-schema' in captured_cmd
 
+    async def test_available_tools_is_forwarded_as_the_registry_filter(self, tmp_path):
+        captured_cmd = []
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec',
+                   side_effect=_capture_cmd_exec(captured_cmd)):
+            await invoke_claude_agent(
+                prompt='hi', system_prompt='sys', cwd=tmp_path,
+                available_tools=['Read', 'Grep', 'Glob'], output_schema=self._SCHEMA,
+            )
+        assert captured_cmd[captured_cmd.index('--tools') + 1] == 'Read,Grep,Glob'
+        assert '--json-schema' in captured_cmd
+
     async def test_wildcard_without_schema_is_preserved(self, tmp_path):
         """judge.py case: ['*'] with no output_schema must keep blocking all tools."""
         captured_cmd = []
