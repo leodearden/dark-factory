@@ -41,6 +41,7 @@ __all__ = [
     'SubmodelCardinality',
     'TaskMetadata',
     'apply_migrations',
+    'is_known_metadata_key',
     'parse_metadata',
     'register_metadata_submodel',
     'validate_model_overrides',
@@ -1315,8 +1316,17 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # stays countable instead of invisible.
         'pending_since',
         'pending_since_backfilled',
+        # The harness's audit-trail rotation rollup (task 5771, docs/task-authoring.md
+        # §10): written and read back only by
+        # `fused-memory/src/fused_memory/reconciliation/audit_trail_rotation.py`.
+        'audit_trail_rotation',
     }
 )
+
+
+def is_known_metadata_key(key: str) -> bool:
+    """A typed field, a registered submodel slice or a Tier-A blessed key; never ``x_``."""
+    return key in TaskMetadata.model_fields or key in _SUBMODEL_REGISTRY or key in _BLESSED_METADATA_KEYS
 
 
 def _cardinality_mismatch_message(
@@ -1530,9 +1540,8 @@ def parse_metadata(
                 )
             )
 
-    known_fields = set(TaskMetadata.model_fields) | set(_SUBMODEL_REGISTRY)
     for key in parsed:
-        if key in known_fields or key.startswith('x_') or key in _BLESSED_METADATA_KEYS:
+        if is_known_metadata_key(key) or key.startswith('x_'):
             continue
         warnings.append(
             SchemaWarning(
