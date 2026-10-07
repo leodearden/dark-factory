@@ -718,12 +718,12 @@ class TestEscalationBoundaryNote:
 
         The durable end-state assertion: it pins the property at the CONSUMER,
         independent of how the note is assembled.  Stage 3 declares "You do NOT
-        have write or mutation tools" (prompts/stage3.py) — and because
-        ``escalate_blocker`` is deliberately absent from every disallow list
-        (see TestDisallowedToolLists above), the tool really is callable, so a
-        licensing sentence there points at a real durable write to the
-        reconciliation escalation queue.  Stage 1 has no FIX D mechanism either
-        (FIX D lives in TaskKnowledgeSync, not IntegrityCheck).
+        have write or mutation tools" (prompts/stage3.py), and Stage 1 has no
+        FIX D mechanism either (FIX D lives in TaskKnowledgeSync, not
+        IntegrityCheck).  Since task 3250 both stages also deny the tool
+        (``DISALLOW_ESCALATION_WRITES``, see TestDisallowedToolLists above);
+        this is the prompt-side half of that contract — those stages are never
+        told about a tool they cannot hold.
         """
         for prompt, name in (
             (STAGE1_SYSTEM_PROMPT, 'STAGE1_SYSTEM_PROMPT'),
