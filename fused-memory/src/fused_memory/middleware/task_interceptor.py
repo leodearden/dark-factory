@@ -111,6 +111,12 @@ from fused_memory.models.reconciliation import (
     ReconciliationEvent,
 )
 from fused_memory.models.scope import resolve_project_id
+from fused_memory.reconciliation.audit_trail_rotation import (
+    AuditTrailArchive,
+    RotationOutcome,
+    bound_audit_trail,
+    task_fingerprint,
+)
 from fused_memory.reconciliation.consolidation_gate import (
     GATE_METADATA_KEY,
     declared_gate_topic,
@@ -577,6 +583,9 @@ class TaskInterceptor:
         # unexpected status/claimant_run_id divergence. None (default) ->
         # exact current behavior (the pre-existing inline write).
         self._lifecycle_reset_filer: FileFindingFn | None = None
+        # Task 5771: where recon-stage writes archive rotated-out audit trail.
+        # None (default) -> no rotation; see set_audit_trail_archive.
+        self._audit_trail_archive: AuditTrailArchive | None = None
         # Task 3112: the consolidation-gate closure scroll. Optional and
         # DORMANT when unwired — the interceptor holds no MemoryService, and
         # self.reconciler is None at server/main.py's reconciliation-disabled
@@ -653,6 +662,13 @@ class TaskInterceptor:
         behavior change.
         """
         self._lifecycle_reset_filer = filer
+
+    def set_audit_trail_archive(self, archive: AuditTrailArchive) -> None:
+        """Wire the audit-trail rotation archive (task 5771).
+
+        Until called, recon-stage ``update_task`` writes are never rotated.
+        """
+        self._audit_trail_archive = archive
 
     def set_consolidation_scroll(
         self, scroll: Any, count: Any = None, exists: Any = None
@@ -5581,6 +5597,11 @@ class TaskInterceptor:
                 # raise — holds for both tools.py (which delegates here) and
                 # direct interceptor callers (task C2).
                 return e.to_error_dict()
+        rotation: RotationOutcome | None = None
+        if is_recon_stage_write and interceptor_write_succeeded(result):
+            result, rotation = await self._with_bounded_audit_trail(
+                result, task_id, project_root, project_id,
+            )
         event = self._make_event(
             EventType.task_modified,
             project_root,
@@ -5593,6 +5614,7 @@ class TaskInterceptor:
         # exactly what changed without re-fetching. Re-embed unconditionally when
         # the caller passed any of these hints.
         should_reembed = any(k in kwargs for k in ('prompt', 'title', 'description', 'details'))
+        should_reembed = should_reembed or (rotation is not None and rotation.description_rewritten)
         if should_reembed:
             curator = await self._get_curator()
             if curator is not None:
@@ -5627,6 +5649,66 @@ class TaskInterceptor:
                     )
         await self._idempotency_record(client_op_id, 'update_task', result)
         return result
+
+    async def _with_bounded_audit_trail(
+        self, result: dict[str, Any], task_id: str, project_root: str, project_id: str,
+    ) -> tuple[dict[str, Any], RotationOutcome | None]:
+        """The landed recon write's response, plus its audit-trail rotation outcome (task 5771).
+
+        The recon write has already committed, so a rotation failure is
+        reported in the response and logged, never turned into an error reply.
+        """
+        if self._audit_trail_archive is None:
+            return result, None
+        try:
+            outcome = await self._bound_audit_trail(
+                self._audit_trail_archive, task_id, project_root, project_id,
+            )
+        except Exception as e:
+            logger.warning(
+                'audit_trail_rotation: rotating task %s failed after the recon write landed',
+                task_id, exc_info=True,
+            )
+            outcome = RotationOutcome.failed(task_id, e)
+        if outcome is None:
+            return result, None
+        bounded = {**result, 'audit_trail_rotation': outcome.as_dict()}
+        if outcome.committed_task is not None:
+            bounded['updated_task'] = dict(outcome.committed_task)
+        return bounded, outcome
+
+    async def _bound_audit_trail(
+        self, archive: AuditTrailArchive, task_id: str, project_root: str, project_id: str,
+    ) -> RotationOutcome | None:
+        tm = await self._ensure_taskmaster()
+
+        async def commit(
+            *, expected_fingerprint: str, description: str | None, metadata: dict[str, Any],
+        ) -> dict[str, Any] | None:
+            async with self._write_lock(project_id):
+                if task_fingerprint(await tm.get_task(task_id, project_root)) != expected_fingerprint:
+                    return None
+                written = await self._journal_around(
+                    'rewrite_audit_trail',
+                    project_root,
+                    {
+                        'task_id': task_id,
+                        'description': _journal_param_clip(description),
+                        'metadata': _journal_param_clip(json.dumps(metadata)),
+                    },
+                    tm.rewrite_audit_trail(  # type: ignore[attr-defined]
+                        task_id, project_root, description=description, metadata=metadata,
+                    ),
+                )
+                return written['updated_task']
+
+        return await bound_audit_trail(
+            await tm.get_task(task_id, project_root),
+            project_id=project_id,
+            now=datetime.now(UTC),
+            archive=archive,
+            commit=commit,
+        )
 
     async def remove_tasks(self, ids: list[str], project_root: str, tag: str | None = None) -> dict:
         if err := await self._backlog_gate(project_root):

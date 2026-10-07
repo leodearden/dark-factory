@@ -25,6 +25,9 @@ from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
 from shared.systemd_listeners import take_systemd_listeners  # noqa: E402
 
 from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
+from fused_memory.reconciliation.audit_trail_rotation import (  # noqa: E402
+    memory_service_archive,
+)
 from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
     closure_exists_probe,
 )
@@ -926,6 +929,7 @@ async def run_server():
         # Wire the write journal so task writes leave durable audit rows.
         task_interceptor.set_write_journal(write_journal)
         _wire_closure_collaborators(task_interceptor, memory_service)
+        _wire_audit_trail_archive(task_interceptor, memory_service)
 
         # PRD γ (task 1546): Pre-build recon_report components here — before
         # ReconciliationHarness is constructed — so the SAME ReconReportState
@@ -1007,6 +1011,7 @@ async def run_server():
         await task_interceptor.start()
         task_interceptor.set_write_journal(write_journal)
         _wire_closure_collaborators(task_interceptor, memory_service)
+        _wire_audit_trail_archive(task_interceptor, memory_service)
 
     # Machine-derived topic clusters (task 3135). Built in both branches above
     # and never gated on reconciliation.enabled or the autoseed leaf: both of
@@ -2434,6 +2439,16 @@ def _wire_closure_collaborators(task_interceptor: Any, memory_service: Any) -> N
         count=_closure_count,
         exists=closure_exists_probe(memory_service),
     )
+
+
+def _wire_audit_trail_archive(task_interceptor: Any, memory_service: Any) -> None:
+    """Arm the audit-trail rotation (task 5771); it is dormant until this runs.
+
+    Called from both ``TaskInterceptor`` construction arms, beside
+    ``_wire_closure_collaborators``. The rule lives in
+    ``reconciliation/audit_trail_rotation.py``.
+    """
+    task_interceptor.set_audit_trail_archive(memory_service_archive(memory_service))
 
 
 def main():
