@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from _fm_helpers import MERGE_BASE_NEGATIVE_CONTROL_NOTE, STRADDLING_WRITE_FIXTURE
 from pydantic import ValidationError
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings
@@ -2491,28 +2492,6 @@ def _seeded_cluster(topic_id: str) -> ProceduralTopicCluster:
     """
     clusters = ReconciliationConfig().procedural_knowledge_topic_guard_clusters
     return next(c for c in clusters if c.topic_id == topic_id)
-
-
-# --- Topic-guard note fixtures shared with tests/server/test_add_memory_near_duplicate_gate.py
-#
-# These are module-level (not class attributes) because the end-to-end gate
-# suite imports them: the same note must drive both the pure-matcher assertions
-# here and the whole-tool assertions there, or an edit to one copy would leave
-# the other silently exercising a different scenario (task 3054, reviewer:
-# duplication).
-
-STRADDLING_WRITE_FIXTURE = (
-    'Warm-lane reseed gotcha: when a task is dispatched into a recycled warm '
-    'lane, the in-worktree .task/plan.json can be a DANGLING absolute symlink '
-    'whose target worktrees/.task-meta/<lane>/plan.json was never written or '
-    'was scrubbed. The architect then sees no plan and may wrongly call '
-    'report_task_already_done instead of replanning.'
-)
-
-MERGE_BASE_NEGATIVE_CONTROL_NOTE = (
-    'Use git merge-base --is-ancestor <sha> <branch> to test whether a '
-    'commit is an ancestor of a branch tip before cherry-picking.'
-)
 
 
 class TestProceduralTopicGuardClustersDefault:
