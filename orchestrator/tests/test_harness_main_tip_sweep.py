@@ -72,6 +72,17 @@ PASSING_RESULT = VerifyResult(
     summary='all checks passed',
 )
 
+TIMEOUT_RESULT = VerifyResult(
+    passed=False,
+    test_output='',
+    lint_output='',
+    type_output='',
+    summary='Verification timed out',
+    timed_out=True,
+    category='infra_timeout',
+    cause_hint='Command timed out',
+)
+
 
 def _make_sweep_harness(
     *, main_sha: str = MAIN_SHA, run_store: RunStore | None = None,
@@ -104,13 +115,14 @@ async def _passing_sweep(config, git_ops, *, main_sha, **kwargs):
 
 
 async def _tick_seed_modes(h: Harness, shas: list[str], sweep: AsyncMock) -> list:
-    """Tick the sweep once per sha; return each run_main_tip_sweep call's seed_mode."""
+    """Tick the sweep once per sha, main reading that sha for the whole tick;
+    return each run_main_tip_sweep call's seed_mode."""
     from orchestrator import verify as verify_module
 
-    h.git_ops.get_main_sha = AsyncMock(side_effect=shas)
     h._close_superseded_main_sweep_escalations = AsyncMock()  # type: ignore[method-assign]
     with patch.object(verify_module, 'run_main_tip_sweep', new=sweep):
-        for _ in shas:
+        for sha in shas:
+            h.git_ops.get_main_sha = AsyncMock(return_value=sha)
             await h._run_main_tip_sweep()
     return [c.kwargs['seed_mode'] for c in sweep.call_args_list]
 
@@ -143,6 +155,15 @@ class TestMainTipSweepColdControl:
         sweep = AsyncMock(side_effect=[None, (SHA_A, PASSING_RESULT)])
 
         modes = await _tick_seed_modes(_make_sweep_harness(), [SHA_A, SHA_A], sweep)
+
+        assert modes == [SweepSeedMode.COLD, SweepSeedMode.COLD]
+
+    @pytest.mark.asyncio
+    async def test_cold_sweep_that_timed_out_keeps_the_next_sweep_cold(self) -> None:
+        """A timeout is no verdict on the tree, so it cannot stand in for the cold control."""
+        sweep = AsyncMock(side_effect=[(SHA_A, TIMEOUT_RESULT), (SHA_B, PASSING_RESULT)])
+
+        modes = await _tick_seed_modes(_make_sweep_harness(), [SHA_A, SHA_B], sweep)
 
         assert modes == [SweepSeedMode.COLD, SweepSeedMode.COLD]
 
@@ -500,4 +521,46 @@ class TestRunMainTipSweepHarness:
             f'{h.git_ops.get_main_sha.call_count} times'  # type: ignore[union-attr]
         )
         h._escalation_queue.submit.assert_called_once()  # type: ignore[union-attr, attr-defined]
+
+
+class TestMainTipSweepTimedOut:
+    """task 5812: a sweep pass runs once, with no timeout-retries, so a timeout
+    reaches the harness after a single attempt.  It names no failing test, so
+    the REAL confirm gate (deliberately not patched here) has nothing to re-run
+    and confirms it.  The harness files it, failing closed as CATEGORY_POLICY
+    does for a timeout: a hang is a non-completion the tree itself can cause.
+    Only the tip-advanced arm suppresses it."""
+
+    @pytest.mark.asyncio
+    async def test_timed_out_sweep_on_an_unchanged_tip_files_an_l1(self) -> None:
+        from orchestrator import verify as verify_module
+
+        h = _make_sweep_harness()
+
+        with patch.object(
+            verify_module, 'run_main_tip_sweep',
+            new=AsyncMock(return_value=(MAIN_SHA, TIMEOUT_RESULT)),
+        ):
+            await h._run_main_tip_sweep()
+
+        h._escalation_queue.submit.assert_called_once()  # type: ignore[union-attr, attr-defined]
+        esc = h._escalation_queue.submit.call_args[0][0]  # type: ignore[union-attr, attr-defined]
+        assert (esc.level, esc.severity, esc.category) == (1, 'blocking', 'infra_issue')
+        assert 'infra_timeout' in esc.summary
+        assert h._last_swept_main_sha == MAIN_SHA, 'the same tip must not be re-swept'
+
+    @pytest.mark.asyncio
+    async def test_timed_out_sweep_whose_tip_moved_files_nothing(self) -> None:
+        from orchestrator import verify as verify_module
+
+        h = _make_sweep_harness()
+        h.git_ops.get_main_sha = AsyncMock(side_effect=[MAIN_SHA, SHA_B])  # type: ignore[union-attr]
+
+        with patch.object(
+            verify_module, 'run_main_tip_sweep',
+            new=AsyncMock(return_value=(MAIN_SHA, TIMEOUT_RESULT)),
+        ):
+            await h._run_main_tip_sweep()
+
+        h._escalation_queue.submit.assert_not_called()  # type: ignore[union-attr, attr-defined]
 

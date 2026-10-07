@@ -180,6 +180,7 @@ from orchestrator.task_status import (
     is_infra_held,
 )
 from orchestrator.usage_gate import UsageGate
+from orchestrator.verify_categories import FailureCategory
 from orchestrator.workflow import (
     ResumeFailure,
     TerminalReport,
@@ -14927,8 +14928,13 @@ class Harness:
         Each sweep's seed mode comes from ``MainSweepColdControl`` (task 5812):
         warm by default, cold at most once per
         ``main_tip_sweep_cold_interval_secs``, persisted in runs.db.  Only a
-        cold sweep that reached a verdict resets that clock.  SHA dedup still
-        gates every sweep, so a due cold control waits for main to advance.
+        cold sweep that reached a verdict resets that clock; a timed-out sweep
+        reached none.  SHA dedup still gates every sweep, so a due cold control
+        waits for main to advance.
+
+        A timed-out sweep names no failing test, so the confirm gate has nothing
+        to re-run and the harness files it, failing closed as CATEGORY_POLICY
+        does for a timeout; only the tip-advanced arm suppresses it.
         """
         from orchestrator import critical_gate  # noqa: PLC0415
         from orchestrator import verify as verify_mod  # noqa: PLC0415
@@ -14964,7 +14970,9 @@ class Harness:
 
         swept_sha, vr = outcome
         self._last_swept_main_sha = swept_sha
-        control.record_verdict(seed_mode, swept_sha)
+        if vr.category != FailureCategory.INFRA_TIMEOUT:
+            # A timeout is no verdict on the tree, so it cannot be the cold control.
+            control.record_verdict(seed_mode, swept_sha)
         logger.info(
             'Main-tip integrity sweep: %s build of %s %s (%s)',
             seed_mode, swept_sha[:12], 'passed' if vr.passed else 'failed',

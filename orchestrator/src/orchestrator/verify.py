@@ -9078,7 +9078,9 @@ async def run_main_tip_sweep(
     two-failure-escalates rule limit the blast radius.  Host CPU is the
     throughput bottleneck (task 5812), so both passes run with
     ``max_retries=0`` and an ``INFRA_TIMEOUT`` first pass is returned as-is,
-    never retried in full: the harness adjudicates it like any failing sweep.
+    never retried in full.  It names no failing test, so the harness's confirm
+    gate cannot check it: the harness files it unless main has moved on, and
+    does not count it as a cold verdict.
 
     - Retry PASSES → emit a WARNING, append a record to
       ``verify._suppressed_flake_records`` (durable in-process audit trail), and
