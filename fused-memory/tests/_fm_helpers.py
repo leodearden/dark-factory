@@ -30,7 +30,7 @@ import weakref
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, TypedDict
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -1664,14 +1664,7 @@ async def collection_vector_size(
 
 
 # ---------------------------------------------------------------------------
-# Shared quota/rate-limit error builder (task 2448)
-# ---------------------------------------------------------------------------
-#
-# De-duplicates the openai.RateLimitError builder that was previously
-# copy-pasted verbatim in test_memory_service.py and
-# tests/server/test_get_entity_tool.py (flagged by reviewer_comprehensive
-# amendment pass on task 2448) — a single copy avoids the two drifting apart
-# if the openai RateLimitError constructor signature ever changes.
+# Real-git repo builders
 # ---------------------------------------------------------------------------
 
 
@@ -1706,6 +1699,120 @@ def _init_git_repo(path) -> str:
         capture_output=True,
         text=True,
     ).stdout.strip()
+
+
+def _run_git(path, *args) -> str:
+    return subprocess.run(
+        ['git', '-C', str(path), *args], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def init_ab_commit_repo(path) -> str:
+    """Create a repo at *path* whose ``main`` holds one commit adding a.txt and
+    b.txt; return that commit's full SHA.
+
+    The single-parent prefix of :func:`init_merge_history_repo`. Signing is
+    off and every commit skips hooks, so a developer's global gpgsign setting
+    or a stray hook cannot hang or fail this throwaway repo.
+    """
+    subprocess.run(['git', 'init', '-q', '-b', 'main', str(path)], check=True)
+    _run_git(path, 'config', 'user.email', 't@e.example')
+    _run_git(path, 'config', 'user.name', 'T')
+    _run_git(path, 'config', 'commit.gpgsign', 'false')
+    (path / 'a.txt').write_text('a\n')
+    (path / 'b.txt').write_text('b\n')
+    _run_git(path, 'add', '-A')
+    _run_git(path, 'commit', '-q', '--no-verify', '-m', 'feat: ship a + b')
+    return _run_git(path, 'rev-parse', 'HEAD')
+
+
+class MergeHistoryShas(TypedDict):
+    single: str
+    merge: str
+    conflict_merge: str
+
+
+def init_merge_history_repo(path) -> MergeHistoryShas:
+    """Build a repo with a single-parent commit, a clean --no-ff merge, and a
+    --no-ff merge that resolves a real conflict; return their full SHAs.
+
+    Commit graph on ``main``:
+
+      1. ``single`` — :func:`init_ab_commit_repo`'s commit adding a.txt +
+         b.txt (a genuine single-parent commit, used to pin
+         ``--first-parent -m`` as a no-op on non-merge commits).
+      2. a ``feature`` branch off commit 1 adds feature.py plus
+         extra_1.py..extra_4.py (five files total, so max_files truncation is
+         reachable for merge provenance — see
+         tests/test_stages.py::TestDoneProvenanceSection::test_merge_commit_file_list_respects_max_files_truncation);
+         main then merges it via ``git merge --no-ff`` — recorded as
+         ``merge``. Plain ``git show --name-only`` reports NOTHING for this
+         commit (git's combined diff is empty for a clean merge); this is the
+         fixture that reproduces the Stage-2 provenance bug.
+      3. a ``conflict`` branch off commit 1 edits a.txt and adds
+         conflict_only.py; main separately edits a.txt after ``merge``.
+         Merging ``conflict`` into main therefore CONFLICTS on a.txt —
+         resolved by hand and committed, recorded as ``conflict_merge``. This
+         pins the OTHER, worse symptom: plain ``git show --name-only`` on a
+         merge that resolved a conflict reports ONLY the conflict-resolution
+         file(s), silently omitting every non-conflicting file the branch
+         also brought in (measured on this repo's own history: commit
+         a75568bd11 showed 1 file under the bare invocation vs. 6 real
+         first-parent files, none of which was that 1 file — see
+         tests/test_stages.py::TestDoneProvenanceSection::test_merge_commit_with_resolved_conflict_reports_full_first_parent_file_list).
+         ``conflict_only.py`` deliberately does NOT reuse the feature/extra_*
+         names from scenario 2: this branch forks off ``single`` (before the
+         feature merge), so those names are free to reuse on disk, but doing
+         so would make feature.py conflict too (both sides would have
+         independently "added" it), muddying the one conflict this scenario
+         needs.
+
+    The branch/merge sequence follows
+    tests/test_audit_found_on_main_provenance.py::_build_test_repo.
+    """
+    single = init_ab_commit_repo(path)
+
+    _run_git(path, 'checkout', '-q', '-b', 'feature')
+    (path / 'feature.py').write_text('feature = 1\n')
+    for i in range(1, 5):
+        (path / f'extra_{i}.py').write_text(f'extra_{i} = 1\n')
+    _run_git(path, 'add', '-A')
+    _run_git(path, 'commit', '-q', '--no-verify', '-m', 'feat: add feature')
+    _run_git(path, 'checkout', '-q', 'main')
+    _run_git(path, 'merge', '--no-ff', '--no-verify', '-q', '-m', 'Merge feature into main', 'feature')
+    merge = _run_git(path, 'rev-parse', 'HEAD')
+
+    # A second branch that edits a.txt independently of main's own later
+    # edit of the same file — merging it conflicts, exercising the
+    # (worse) symptom where a bare `git show` on a resolved-conflict
+    # merge reports only the conflicted path and hides everything else.
+    _run_git(path, 'checkout', '-q', '-b', 'conflict', single)
+    (path / 'a.txt').write_text('a-conflict-branch\n')
+    (path / 'conflict_only.py').write_text('conflict_only = 1\n')
+    _run_git(path, 'add', '-A')
+    _run_git(path, 'commit', '-q', '--no-verify', '-m', 'feat: edit a.txt on conflict branch')
+    _run_git(path, 'checkout', '-q', 'main')
+    (path / 'a.txt').write_text('a-main-edit\n')
+    _run_git(path, 'add', '-A')
+    _run_git(path, 'commit', '-q', '--no-verify', '-m', 'chore: edit a.txt on main after feature merge')
+
+    # Deliberately not using `_run_git` (check=True): a real conflict makes
+    # `git merge` exit 1 and leave conflict markers instead of a commit.
+    conflict_result = subprocess.run(
+        ['git', '-C', str(path), 'merge', '--no-ff', '--no-verify', '-q',
+         '-m', 'Merge conflict into main', 'conflict'],
+        capture_output=True, text=True,
+    )
+    assert conflict_result.returncode != 0, (
+        'expected a.txt to conflict (both branches edited it since the '
+        'common ancestor); merge unexpectedly succeeded cleanly'
+    )
+    (path / 'a.txt').write_text('a-resolved\n')
+    _run_git(path, 'add', 'a.txt')
+    _run_git(path, 'commit', '-q', '--no-verify', '-m', 'Merge conflict into main (resolved)')
+    conflict_merge = _run_git(path, 'rev-parse', 'HEAD')
+
+    return {'single': single, 'merge': merge, 'conflict_merge': conflict_merge}
 
 
 def make_db_without_claimant_columns(db_path: pathlib.Path, *, status: str = 'pending') -> None:
@@ -1760,6 +1867,18 @@ def make_db_without_claimant_columns(db_path: pathlib.Path, *, status: str = 'pe
     conn.execute("PRAGMA user_version = 2")
     conn.commit()
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Shared quota/rate-limit error builder (task 2448)
+# ---------------------------------------------------------------------------
+#
+# De-duplicates the openai.RateLimitError builder that was previously
+# copy-pasted verbatim in test_memory_service.py and
+# tests/server/test_get_entity_tool.py (flagged by reviewer_comprehensive
+# amendment pass on task 2448) — a single copy avoids the two drifting apart
+# if the openai RateLimitError constructor signature ever changes.
+# ---------------------------------------------------------------------------
 
 
 def _make_rate_limit_error(
