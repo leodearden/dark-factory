@@ -162,10 +162,8 @@ DISALLOW_RECON_REPORT_JOURNAL_WRITES = [
 # the source; the boundary paragraph in the stage prompts
 # (prompts/__init__.py ESCALATION_BOUNDARY_NOTE) explains the absence.
 #
-# The escalation WRITE tool (escalate_blocker) is deliberately NOT denied: it is
-# the sole sanctioned recon escalation use — Stage 2's Stale Flag Escalation
-# (FIX D) — and it writes to the reconciliation store, which is the correct
-# destination for it. Over-denying here breaks FIX D.
+# The escalation WRITE tools are NOT in this list; they have their own
+# per-stage list, DISALLOW_ESCALATION_WRITES, below.
 #
 # PRD open question 4 (reject-vs-omit) resolved during α: `--disallowed-tools`
 # OMITS a denied MCP tool from the agent's tool listing rather than surfacing it
@@ -209,11 +207,31 @@ DISALLOW_ESCALATION_READS = [
     'mcp__escalation__get_task_escalation_history',
 ]
 
+# Escalation FILING tools (disallowed in Stage 1 and Stage 3 — task 3250).
+#
+# The write path is sanctioned in Stage 2 only: the FIX D Stale Flag Escalation
+# in prompts/stage2.py, driven from stages/task_knowledge_sync.py::TaskKnowledgeSync.
+# Denying escalate_blocker in Stage 2 would break FIX D, so this list must never
+# be folded into STAGE2_DISALLOWED.
+#
+# Stage 1 (MemoryConsolidator) and Stage 3 (IntegrityCheck) have no sanctioned
+# escalation write. Their prompts have said so since task 3163 via
+# prompts/__init__.py::render_escalation_boundary_note(can_escalate=False); this
+# list is the mechanical half of that clause. escalate_info rides along because
+# no recon prompt or stage references it. `--disallowed-tools` omits rather than
+# rejects (see above), and _ESCALATION_BOUNDARY_NO_ACTION already explains the
+# absence to a Stage 1/3 agent.
+DISALLOW_ESCALATION_WRITES = [
+    'mcp__escalation__escalate_blocker',
+    'mcp__escalation__escalate_info',
+]
+
 # Per-stage disallowed lists
 STAGE1_DISALLOWED = (
     DISALLOW_TASK_WRITES
     + DISALLOW_RECON_REPORT_LEDGER_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_WRITES
     + DISALLOW_BUILTIN
 )
 # Stage 2 keeps full memory + task write access; only built-ins and the
@@ -225,6 +243,7 @@ STAGE3_DISALLOWED = (
     + DISALLOW_RECON_REPORT_LEDGER_WRITES
     + DISALLOW_RECON_REPORT_JOURNAL_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_WRITES
     + DISALLOW_BUILTIN
 )
 # NOTE: the IN-PROCESS-STATE `mcp__recon-report__*` tools (start_report, add_finding,
