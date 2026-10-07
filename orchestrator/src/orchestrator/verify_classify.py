@@ -73,7 +73,7 @@ def is_shell_reported_external_kill(rc: int) -> bool:
 
     PRECONDITION: *rc* is the exit status of a POSIX shell the CALLER
     interposed, so ``128 + N`` means that shell's child died of signal N.
-    ``verify._classify_leg`` is the caller: every leg runs under
+    ``verify.classify_leg`` is the caller: every leg runs under
     ``_run_cmd``'s ``/bin/bash`` wrapper. Calling this on any other rc is the
     shell-convention guessing ``is_external_kill_rc`` refuses.
 

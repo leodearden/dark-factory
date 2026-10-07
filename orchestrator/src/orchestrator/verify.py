@@ -24,7 +24,7 @@ from dataclasses import dataclass, field, is_dataclass, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, TypeVar
+from typing import TYPE_CHECKING, Literal, NamedTuple, TypedDict, TypeVar, assert_never
 
 if TYPE_CHECKING:
     from shared.psi import PsiSample
@@ -2359,15 +2359,28 @@ def _worker_death_leg_note(label: str) -> str:
     )
 
 
-_LEG_FALLBACK_CATEGORY: dict[str, FailureCategory] = {
-    'test': FailureCategory.UNKNOWN_TEST_FAILURE,
-    'lint': FailureCategory.LINT_ERROR,
-    'type': FailureCategory.TYPE_ERROR,
-}
+class LegSlot(StrEnum):
+    """Which of a module's three verify commands a leg ran."""
+
+    TEST = 'test'
+    LINT = 'lint'
+    TYPE = 'type'
 
 
-def _classify_leg(
-    label: str, rc: int, output: str, timed_out: bool, cmd: str | None,
+def _red_gate_category(slot: LegSlot) -> FailureCategory:
+    match slot:
+        case LegSlot.TEST:
+            return FailureCategory.UNKNOWN_TEST_FAILURE
+        case LegSlot.LINT:
+            return FailureCategory.LINT_ERROR
+        case LegSlot.TYPE:
+            return FailureCategory.TYPE_ERROR
+        case _:
+            assert_never(slot)
+
+
+def classify_leg(
+    slot: LegSlot, rc: int, output: str, timed_out: bool, cmd: str | None,
 ) -> FailureCategory:
     """The ONE per-leg classifier. ``classify_failure`` answers what the tool's
     OUTPUT says; this adds what only verify knows: the leg's slot, and that
@@ -2380,7 +2393,18 @@ def _classify_leg(
         return category
     if tool is ToolKind.PYTEST and _pytest_session_aborted_without_verdict(rc, output):
         return FailureCategory.INFRA_ABORT
-    return _LEG_FALLBACK_CATEGORY[label]
+    return _red_gate_category(slot)
+
+
+def _classify_failing_legs(
+    legs: Iterable[tuple[LegSlot, int, str, bool, str | None]],
+) -> dict[LegSlot, FailureCategory]:
+    """Each failing leg's own category, keyed by slot, in *legs* order."""
+    return {
+        slot: classify_leg(slot, rc, output, timed_out, cmd)
+        for slot, rc, output, timed_out, cmd in legs
+        if rc != 0
+    }
 
 
 def _summarize_checks(
@@ -2391,6 +2415,7 @@ def _summarize_checks(
     test_duration: float | None = None,
     lint_duration: float | None = None,
     type_duration: float | None = None,
+    leg_categories: Mapping[LegSlot, FailureCategory] | None = None,
 ) -> tuple[bool, str, str, str, list[str]]:
     """Classify the three checks into (passed, category, cause_hint, summary,
     failing_leg_categories).
@@ -2462,31 +2487,33 @@ def _summarize_checks(
     every pre-existing caller is byte-identical (see the design decision on
     not refactoring to take ``CheckRun`` objects).  Both production call sites
     pass ``attempt.<leg>.duration_secs``, which they already hold.
+
+    ``leg_categories`` is ``VerifyAttempt.classify_failing_legs()`` over these
+    same legs, for a caller that also reads one leg's category: classifying
+    scans the leg's whole output, so ``run_verification`` classifies once and
+    its env-recovery gate reads the test slot. Omitted, it is computed here.
     """
     passed = test_rc == 0 and lint_rc == 0 and type_rc == 0
     if passed:
         return True, 'passed', '', 'All checks passed', []
 
-    hint_parts = []
-    per_check_categories: list[str] = []
-    for label, rc, out, to, cmd in (
-        ('test', test_rc, test_out, test_timed_out, test_cmd),
-        ('lint', lint_rc, lint_out, lint_timed_out, lint_cmd),
-        ('type', type_rc, type_out, type_timed_out, type_cmd),
-    ):
-        if rc != 0:
-            h = _extract_cause_hint(out)
-            if h:
-                hint_parts.append(h)
-            per_check_categories.append(_classify_leg(label, rc, out, to, cmd))
-    cause_hint = ' | '.join(hint_parts)
+    legs = (
+        (LegSlot.TEST, test_rc, test_out, test_timed_out, test_cmd),
+        (LegSlot.LINT, lint_rc, lint_out, lint_timed_out, lint_cmd),
+        (LegSlot.TYPE, type_rc, type_out, type_timed_out, type_cmd),
+    )
+    if leg_categories is None:
+        leg_categories = _classify_failing_legs(legs)
+    hints = (_extract_cause_hint(out) for _, rc, out, _, _ in legs if rc != 0)
+    cause_hint = ' | '.join(hint for hint in hints if hint)
+    per_check_categories: list[str] = [*leg_categories.values()]
     category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
 
     parts = []
     for rc, out, label, tool_verdict, duration in (
-        (test_rc, test_out, 'test', 'tests failed', test_duration),
-        (lint_rc, lint_out, 'lint', 'lint issues', lint_duration),
-        (type_rc, type_out, 'type', 'type errors', type_duration),
+        (test_rc, test_out, LegSlot.TEST, 'tests failed', test_duration),
+        (lint_rc, lint_out, LegSlot.LINT, 'lint issues', lint_duration),
+        (type_rc, type_out, LegSlot.TYPE, 'type errors', type_duration),
     ):
         if rc == 0:
             continue
@@ -2502,7 +2529,7 @@ def _summarize_checks(
         # task 3173's wording for that case must not regress.
         if is_external_kill_rc(rc):
             parts.append(_killed_leg_note(label, rc, duration))
-        elif label == 'test' and _is_worker_death_truncated_session(out):
+        elif label is LegSlot.TEST and _is_worker_death_truncated_session(out):
             if _first_surviving_failure_line(out) is not None:
                 parts.append(tool_verdict)
             parts.append(_worker_death_leg_note(label))
@@ -4301,19 +4328,27 @@ class VerifyAttempt:
 
     @property
     def test(self) -> CheckRun:
-        return self._by_label('test')
+        return self._by_label(LegSlot.TEST)
 
     @property
     def lint(self) -> CheckRun:
-        return self._by_label('lint')
+        return self._by_label(LegSlot.LINT)
 
     @property
     def type(self) -> CheckRun:
         # Shadows the `type` builtin, but this project's ruff config selects
         # ["E", "F", "UP", "B", "SIM", "I"] — flake8-builtins ("A") is not
         # enabled — so this is lint-safe; matches the CheckRun.label vocabulary
-        # ('test'/'lint'/'type') used throughout verify.py.
-        return self._by_label('type')
+        # (LegSlot) used throughout verify.py.
+        return self._by_label(LegSlot.TYPE)
+
+    def classify_failing_legs(self) -> dict[LegSlot, FailureCategory]:
+        """Each failing check's own category (``classify_leg``), keyed by slot."""
+        checks = ((slot, self._by_label(slot)) for slot in LegSlot)
+        return _classify_failing_legs(
+            (slot, check.rc, check.output, check.timed_out, check.cmd)
+            for slot, check in checks
+        )
 
 
 def _module_attribution_mismatch(
@@ -6931,7 +6966,7 @@ async def run_verification(
     async def _run_or_skip_timed(
         cmd: str | None,
         *,
-        label: str,
+        label: LegSlot,
         current_attempt: int,
     ) -> CheckRun:
         """Like _run_cmd but returns a CheckRun capturing (rc, output, timed_out,
@@ -6955,7 +6990,7 @@ async def run_verification(
         # collected" (task 5671).
         chain_segments = (
             split_and_chain_segments(config_cmd)
-            if segment_chained_test and label == 'test'
+            if segment_chained_test and label is LegSlot.TEST
             else None
         )
         # junitxml injection (task μ, verify-scope-inversion-prd.md): only
@@ -6970,7 +7005,7 @@ async def run_verification(
         # before the cpu-governance wrap immediately below: once governed,
         # cmd is an opaque outer `<exec> -- /bin/bash -c '...'` string that
         # parse_config_command can no longer see as pytest.
-        if junit.leg_path is not None and label == 'test' and chain_segments is None:
+        if junit.leg_path is not None and label is LegSlot.TEST and chain_segments is None:
             # THE chokepoint: every test-leg invocation in this call reaches
             # here — all three branches of the retry loop and the env-recovery
             # re-run — so clearing here is once per pytest run, which is the
@@ -6984,7 +7019,7 @@ async def run_verification(
         # Resolved here rather than after the governance wrap below because
         # the `-n` gate reads it and must itself precede that wrap; it
         # depends on nothing but config/label, so the move is inert.
-        admission = _verify_admission_active(config) and label == 'test'
+        admission = _verify_admission_active(config) and label is LegSlot.TEST
         # -n cap (task 2394 T6): capping is a property of the SAME role set
         # the slot semaphore gates, so it asks T1's is_gated_role rather than
         # re-deriving that set (task 5424) — 'merge' bypasses slot-counting
@@ -7272,7 +7307,7 @@ async def run_verification(
         # test_verify_ruff_config_boundary.py::TestEscapeProbeIsGated). Fires
         # on green legs too: the escape is about which RULE SET ran, which is
         # exactly the question a green result cannot answer for itself.
-        if label == 'lint' and _command_invokes_ruff(config_cmd):
+        if label is LegSlot.LINT and _command_invokes_ruff(config_cmd):
             await _report_ruff_config_escape(worktree)
         if rc != 0 and is_interpreter_missing_workspace_packages(out):
             logger.error(
@@ -7285,7 +7320,7 @@ async def run_verification(
                 'instead of this worktree\'s own .venv. Fix surface: pin '
                 '[tool.pyright] venvPath/venv in the checked subproject\'s '
                 'pyproject.toml. See task 3367 / esc-3359-1.',
-                label,
+                label.value,
                 len(unresolved_top_level_modules(out)),
             )
         return CheckRun(
@@ -7372,33 +7407,33 @@ async def run_verification(
         # pre-loop sentinel scaffolding needed.
         if concurrent:
             attempt = VerifyAttempt(list(await asyncio.gather(
-                _run_or_skip_timed(test_cmd, label='test', current_attempt=current_attempt_id),
-                _run_or_skip_timed(lint_cmd, label='lint', current_attempt=current_attempt_id),
-                _run_or_skip_timed(type_cmd, label='type', current_attempt=current_attempt_id),
+                _run_or_skip_timed(test_cmd, label=LegSlot.TEST, current_attempt=current_attempt_id),
+                _run_or_skip_timed(lint_cmd, label=LegSlot.LINT, current_attempt=current_attempt_id),
+                _run_or_skip_timed(type_cmd, label=LegSlot.TYPE, current_attempt=current_attempt_id),
             )))
         elif lint_first:
             # Merge-role fail-fast: run lint first; on a lint failure, short-
             # circuit — record test+type as skipped (vacuous rc=0 passes) and
             # let the attempt fail on the lint leg, so a lint-only-red merge
             # skips the long test phase entirely.
-            lint_run = await _run_or_skip_timed(lint_cmd, label='lint', current_attempt=current_attempt_id)
+            lint_run = await _run_or_skip_timed(lint_cmd, label=LegSlot.LINT, current_attempt=current_attempt_id)
             if lint_run.rc != 0:
                 attempt = VerifyAttempt([
-                    CheckRun.skipped('test'), lint_run, CheckRun.skipped('type'),
+                    CheckRun.skipped(LegSlot.TEST), lint_run, CheckRun.skipped(LegSlot.TYPE),
                 ])
             else:
                 # Lint green: run test+type, then assemble in canonical
                 # [test, lint, type] order (not execution order) so the green-
                 # path VerifyResult and persisted artifacts stay byte-identical
                 # to the plain-sequential branch below.
-                test_run = await _run_or_skip_timed(test_cmd, label='test', current_attempt=current_attempt_id)
-                type_run = await _run_or_skip_timed(type_cmd, label='type', current_attempt=current_attempt_id)
+                test_run = await _run_or_skip_timed(test_cmd, label=LegSlot.TEST, current_attempt=current_attempt_id)
+                type_run = await _run_or_skip_timed(type_cmd, label=LegSlot.TYPE, current_attempt=current_attempt_id)
                 attempt = VerifyAttempt([test_run, lint_run, type_run])
         else:
             attempt = VerifyAttempt([
-                await _run_or_skip_timed(test_cmd, label='test', current_attempt=current_attempt_id),
-                await _run_or_skip_timed(lint_cmd, label='lint', current_attempt=current_attempt_id),
-                await _run_or_skip_timed(type_cmd, label='type', current_attempt=current_attempt_id),
+                await _run_or_skip_timed(test_cmd, label=LegSlot.TEST, current_attempt=current_attempt_id),
+                await _run_or_skip_timed(lint_cmd, label=LegSlot.LINT, current_attempt=current_attempt_id),
+                await _run_or_skip_timed(type_cmd, label=LegSlot.TYPE, current_attempt=current_attempt_id),
             ])
 
         test_runs.append(attempt.test)
@@ -7418,6 +7453,7 @@ async def run_verification(
 
     # Build summary/category/cause_hint (shared with the env-recovery retry
     # below via _summarize_checks — see task 2048 code_duplication fix).
+    leg_categories = attempt.classify_failing_legs()
     passed, category, cause_hint, summary, failing_leg_categories = _summarize_checks(
         attempt.test.rc, attempt.test.output, attempt.test.timed_out, attempt.test.cmd,
         attempt.lint.rc, attempt.lint.output, attempt.lint.timed_out, attempt.lint.cmd,
@@ -7425,6 +7461,7 @@ async def run_verification(
         test_duration=attempt.test.duration_secs,
         lint_duration=attempt.lint.duration_secs,
         type_duration=attempt.type.duration_secs,
+        leg_categories=leg_categories,
     )
     if timed_out:
         summary = f'Verification timed out after {max_retries} retries' if max_retries > 0 else 'Verification timed out'
@@ -7443,10 +7480,7 @@ async def run_verification(
     # The vanished-xdist/pip signatures and the serial rewrite apply only to
     # a test command resolving to ToolKind.PYTEST; any other test command
     # classified ENV_TRANSIENT is re-run unchanged (_serial_pytest_str).
-    if _classify_leg(
-        'test', attempt.test.rc, attempt.test.output, attempt.test.timed_out,
-        attempt.test.cmd,
-    ) == FailureCategory.ENV_TRANSIENT:
+    if leg_categories.get(LegSlot.TEST) == FailureCategory.ENV_TRANSIENT:
         recovered_test_cmd = _serial_pytest_str(attempt.test.cmd, invocation_dir=worktree)
         logger.warning(
             'Verification hit an environmental shared-venv transient '
@@ -7455,7 +7489,7 @@ async def run_verification(
             recovered_test_cmd,
         )
         new_test = await _run_or_skip_timed(
-            recovered_test_cmd, label='test', current_attempt=current_attempt_id,
+            recovered_test_cmd, label=LegSlot.TEST, current_attempt=current_attempt_id,
         )
         test_runs.append(new_test)
 

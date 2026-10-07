@@ -1330,21 +1330,3 @@ class TestLintTypeAndInfraAbortCategories:
         assert CATEGORY_PRIORITY.index(stronger) < CATEGORY_PRIORITY.index(weaker), (
             f'{stronger} must outrank {weaker}: {self._NEVER_MASKED}'
         )
-
-    @pytest.mark.parametrize(
-        ('legs', 'expected'),
-        [
-            (['test_failure', 'env_transient'], 'test_failure'),
-            (['unknown_test_failure', 'env_transient'], 'unknown_test_failure'),
-            (['lint_error', 'infra_abort'], 'lint_error'),
-            (['type_error', 'lint_error'], 'type_error'),
-            (['test_failure', 'lint_error'], 'test_failure'),
-            (['env_transient'], 'env_transient'),
-            (['infra_kill', 'test_failure'], 'infra_kill'),
-        ],
-    )
-    def test_worst_category_across_legs(self, legs, expected):
-        from orchestrator.verify import _worst_category
-        assert _worst_category(legs) == expected, (
-            f'{legs} -> {expected}: {self._NEVER_MASKED}'
-        )

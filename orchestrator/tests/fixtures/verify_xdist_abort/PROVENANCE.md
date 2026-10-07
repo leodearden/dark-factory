@@ -8,7 +8,7 @@ down from outside the tests**, so that it never reached a verdict about the bran
 ## The rule
 
 > **If a test that reads these bytes fails, the INFRA_ABORT classification has
-> drifted.** Fix the **consumer** (`orchestrator/src/orchestrator/verify.py::_classify_leg`
+> drifted.** Fix the **consumer** (`orchestrator/src/orchestrator/verify.py::classify_leg`
 > and its evidence helpers). Do **NOT** edit these logs, and do not hand-write a
 > substitute. Their value is that real pytest/xdist/pluggy code produced every
 > byte, so the classifier is not tested against our own guess at the format.

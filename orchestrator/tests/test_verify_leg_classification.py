@@ -23,36 +23,49 @@ from _verify_config_corpus import ROOT_LINT_COMMAND, ROOT_TYPE_CHECK_COMMAND
 
 from orchestrator import verify
 from orchestrator.config import OrchestratorConfig
-from orchestrator.verify import _summarize_checks
+from orchestrator.verify import LegSlot, classify_leg
 from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
 from orchestrator.verify_classify import (
     is_external_kill_rc,
     is_shell_reported_external_kill,
 )
 
-_GREEN_LEG = (0, '', None)
+_GREEN_LEG = (0, '')
 
 _TEST_CMD = 'uv run pytest tests/'
 
 
-def _summarize(*, test=_GREEN_LEG, lint=_GREEN_LEG, type_=_GREEN_LEG):
-    """``_summarize_checks`` over (rc, output, cmd) legs, none timed out."""
-    (test_rc, test_out, test_cmd) = test
-    (lint_rc, lint_out, lint_cmd) = lint
-    (type_rc, type_out, type_cmd) = type_
-    return _summarize_checks(
-        test_rc, test_out, False, test_cmd,
-        lint_rc, lint_out, False, lint_cmd,
-        type_rc, type_out, False, type_cmd,
+def _lint_leg_category(lint_out: str, lint_cmd: str) -> FailureCategory:
+    return classify_leg(LegSlot.LINT, 1, lint_out, False, lint_cmd)
+
+
+def _type_leg_category(type_out: str, type_cmd: str) -> FailureCategory:
+    return classify_leg(LegSlot.TYPE, 1, type_out, False, type_cmd)
+
+
+async def _verify_legs(
+    project_root: Path, *, test=_GREEN_LEG, lint=_GREEN_LEG, type_=_GREEN_LEG,
+) -> verify.VerifyResult:
+    """``run_verification`` over the live lint/type chains, each leg scripted
+    as (rc, output) at the ``_run_cmd`` seam, none timed out."""
+    config = OrchestratorConfig(
+        project_root=project_root,
+        test_command=_TEST_CMD,
+        lint_command=ROOT_LINT_COMMAND,
+        type_check_command=ROOT_TYPE_CHECK_COMMAND,
     )
 
+    async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+        # 'ruff check' first: the lint chain names df_pytest_isolation.py.
+        for marker, (rc, output) in (
+            ('ruff check', lint), ('pyright', type_), ('pytest', test),
+        ):
+            if marker in cmd:
+                return rc, output, False
+        return 0, '', False
 
-def _lint_leg_category(lint_out: str, lint_cmd: str) -> str:
-    return _summarize(lint=(1, lint_out, lint_cmd))[1]
-
-
-def _type_leg_category(type_out: str, type_cmd: str) -> str:
-    return _summarize(type_=(1, type_out, type_cmd))[1]
+    with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+        return await verify.run_verification(project_root, config)
 
 
 # Verbatim task-3121 ruff output: the human text a real lint red prints.
@@ -122,7 +135,7 @@ class TestShellReportedExternalKill:
 
 class TestChainedLintTypeArmsAreReached:
     """``classify_failure`` RECEIVES the tool recovered from the live chained
-    lint/type commands, proven through ``_summarize_checks`` with nothing
+    lint/type commands, proven through ``classify_leg`` with nothing
     patched.
 
     Before task 4843 both commands parsed OPAQUE, and the OPAQUE ladder's
@@ -169,22 +182,20 @@ class TestLegSlotNamesTheRedGate:
     unknown_test_failure (task 4843, #3975). Only that fall-through is
     relabelled; the test slot never is."""
 
-    def test_human_text_lint_red_is_lint_error(self):
-        _, category, _, summary, failing = _summarize(
-            lint=(1, _RUFF_I001_OUTPUT, ROOT_LINT_COMMAND),
-        )
-        assert category != FailureCategory.UNKNOWN_TEST_FAILURE
-        assert category == FailureCategory.LINT_ERROR
-        assert summary == 'Failures: lint issues'
-        assert failing == ['lint_error']
+    @pytest.mark.asyncio
+    async def test_human_text_lint_red_is_lint_error(self, tmp_path: Path):
+        result = await _verify_legs(tmp_path, lint=(1, _RUFF_I001_OUTPUT))
+        assert result.category != FailureCategory.UNKNOWN_TEST_FAILURE
+        assert result.category == FailureCategory.LINT_ERROR
+        assert result.summary == 'Failures: lint issues'
+        assert result.failing_leg_categories == ['lint_error']
 
-    def test_human_text_type_red_is_type_error(self):
-        _, category, _, summary, failing = _summarize(
-            type_=(1, _PYRIGHT_TEXT_OUTPUT, ROOT_TYPE_CHECK_COMMAND),
-        )
-        assert category == FailureCategory.TYPE_ERROR
-        assert summary == 'Failures: type errors'
-        assert failing == ['type_error']
+    @pytest.mark.asyncio
+    async def test_human_text_type_red_is_type_error(self, tmp_path: Path):
+        result = await _verify_legs(tmp_path, type_=(1, _PYRIGHT_TEXT_OUTPUT))
+        assert result.category == FailureCategory.TYPE_ERROR
+        assert result.summary == 'Failures: type errors'
+        assert result.failing_leg_categories == ['type_error']
 
     def test_specific_lint_diagnosis_survives(self):
         category = _lint_leg_category(
@@ -203,29 +214,16 @@ class TestLegSlotNamesTheRedGate:
         )
 
     def test_externally_killed_lint_leg_stays_infra_kill(self):
-        _, category, _, _, _ = _summarize(lint=(-9, '', ROOT_LINT_COMMAND))
+        category = classify_leg(LegSlot.LINT, -9, '', False, ROOT_LINT_COMMAND)
         assert category == FailureCategory.INFRA_KILL, (
             'only the unknown fall-through is relabelled'
         )
 
     def test_test_slot_is_never_relabelled(self):
-        _, category, _, _, _ = _summarize(test=(5, 'no tests ran in 0.01s\n', _TEST_CMD))
+        category = classify_leg(
+            LegSlot.TEST, 5, 'no tests ran in 0.01s\n', False, _TEST_CMD,
+        )
         assert category == FailureCategory.UNKNOWN_TEST_FAILURE
-
-    def test_test_failure_outranks_lint_error(self):
-        _, category, _, _, failing = _summarize(
-            test=(1, 'FAILED tests/test_x.py::test_y - assert 1 == 2\n', _TEST_CMD),
-            lint=(1, _RUFF_I001_OUTPUT, ROOT_LINT_COMMAND),
-        )
-        assert category == FailureCategory.TEST_FAILURE
-        assert failing == ['test_failure', 'lint_error']
-
-    def test_type_error_outranks_lint_error(self):
-        _, category, _, _, _ = _summarize(
-            lint=(1, _RUFF_I001_OUTPUT, ROOT_LINT_COMMAND),
-            type_=(1, _PYRIGHT_TEXT_OUTPUT, ROOT_TYPE_CHECK_COMMAND),
-        )
-        assert category == FailureCategory.TYPE_ERROR
 
     @pytest.mark.asyncio
     async def test_briefing_names_the_lint_gate(self, tmp_path: Path):
@@ -305,14 +303,8 @@ _VERBOSE_XDIST_PARAM_FAILED = '[gw1] [ 60%] FAILED tests/test_a.py::test_param[a
 _VERBOSE_XDIST_PASSED = '[gw0] [ 20%] PASSED tests/test_a.py::test_ok '
 
 
-def _xdist_test_leg(rc: int, output: str, *, timed_out: bool = False):
-    """(category, failing_leg_categories) for a red test leg, lint/type green."""
-    _, category, _, _, failing = _summarize_checks(
-        rc, output, timed_out, _FUSED_MEMORY_TEST_CMD,
-        0, '', False, None,
-        0, '', False, None,
-    )
-    return category, failing
+def _xdist_test_leg(rc: int, output: str, *, timed_out: bool = False) -> FailureCategory:
+    return classify_leg(LegSlot.TEST, rc, output, timed_out, _FUSED_MEMORY_TEST_CMD)
 
 
 def _assert_infra_abort(category: str) -> None:
@@ -340,15 +332,14 @@ class TestVerdictlessXdistExitIsInfraAbort:
 
     def test_controller_sigterm_with_kill_rc_is_infra_abort(self):
         """esc-4808-1, esc-3824-1/-2: rc=143 and the signature, both arms."""
-        category, failing = _xdist_test_leg(
+        category = _xdist_test_leg(
             143, _xdist_abort_log('shape1_controller_sigterm.log'),
         )
         _assert_infra_abort(category)
-        assert failing == ['infra_abort']
 
     def test_channel_collapse_signature_alone_is_infra_abort(self):
         """esc-4808-1's text with no kill rc: the text arm alone fires."""
-        category, _ = _xdist_test_leg(
+        category = _xdist_test_leg(
             1, _xdist_abort_log('shape1_controller_sigterm.log'),
         )
         _assert_infra_abort(category)
@@ -356,7 +347,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
     def test_group_sigterm_is_caught_by_the_kill_rc_alone(self):
         """esc-4808-1's kill delivered to the whole group leaves no
         signature, so only the rc arm can catch it."""
-        category, _ = _xdist_test_leg(
+        category = _xdist_test_leg(
             143, _xdist_abort_log('shape1_group_sigterm.log'),
         )
         _assert_infra_abort(category)
@@ -364,7 +355,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
     def test_group_sigterm_without_kill_rc_stays_unknown(self):
         """The discriminating twin of the case above: the same text with no
         kill rc carries neither arm's evidence."""
-        category, _ = _xdist_test_leg(
+        category = _xdist_test_leg(
             1, _xdist_abort_log('shape1_group_sigterm.log'),
         )
         assert category == FailureCategory.UNKNOWN_TEST_FAILURE
@@ -372,7 +363,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
     def test_green_tally_then_sigterm_is_infra_abort(self):
         """esc-4246-4: the session finished green, then the shell reported a
         SIGTERM. The log carries no signature; the kill rc decides."""
-        category, _ = _xdist_test_leg(
+        category = _xdist_test_leg(
             143, _xdist_abort_log('shape2_green_tally.log'),
         )
         _assert_infra_abort(category)
@@ -381,7 +372,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
     def test_bringup_sigterm_is_infra_abort_on_the_signature(self, rc):
         """esc-4071-1: its rc was never recorded, so the text signature
         alone must decide."""
-        category, _ = _xdist_test_leg(
+        category = _xdist_test_leg(
             rc, _xdist_abort_log('shape3_bringup_sigterm.log'),
         )
         _assert_infra_abort(category)
@@ -392,7 +383,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
             _xdist_abort_log('shape1_controller_sigterm.log'),
             'FAILED tests/test_x.py::test_y - AssertionError',
         )
-        category, _ = _xdist_test_leg(143, output)
+        category = _xdist_test_leg(143, output)
         assert category == FailureCategory.TEST_FAILURE
 
     @pytest.mark.parametrize('status_char', ['F', 'E'])
@@ -403,7 +394,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
             _xdist_abort_log('shape1_controller_sigterm.log'),
             _KILLED_PROGRESS_WITH_F.replace('F', status_char),
         )
-        category, _ = _xdist_test_leg(143, output)
+        category = _xdist_test_leg(143, output)
         assert category == FailureCategory.UNKNOWN_TEST_FAILURE
 
     @pytest.mark.parametrize('rc', [143, 1])
@@ -414,7 +405,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
         lines are prose that opens with F. Neither may veto."""
         output = _xdist_abort_log('shape1_uv_forwarded_sigterm.log')
         assert '\nFor more information see ' in output
-        category, _ = _xdist_test_leg(rc, output)
+        category = _xdist_test_leg(rc, output)
         _assert_infra_abort(category)
 
     @pytest.mark.parametrize('rc', [143, 1])
@@ -430,7 +421,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
             _xdist_abort_log('shape1_controller_sigterm.log'),
             '\n..Terminated\n', f'\n..{status_char}.Terminated\n',
         )
-        category, _ = _xdist_test_leg(rc, output)
+        category = _xdist_test_leg(rc, output)
         assert category == FailureCategory.UNKNOWN_TEST_FAILURE
 
     @pytest.mark.parametrize('status_char', ['F', 'E'])
@@ -444,7 +435,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
             _xdist_abort_log('shape1_controller_sigterm.log'),
             '\n..Terminated\n', f'\n{status_char}Terminated\n',
         )
-        category, _ = _xdist_test_leg(143, output)
+        category = _xdist_test_leg(143, output)
         assert category == FailureCategory.UNKNOWN_TEST_FAILURE
 
     @pytest.mark.parametrize('rc', [143, 1])
@@ -459,7 +450,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
             _xdist_abort_log('shape3_bringup_sigterm.log'),
             '\n....Terminated\n', f'\n..{status_char}..Terminated\n',
         )
-        category, _ = _xdist_test_leg(rc, output)
+        category = _xdist_test_leg(rc, output)
         assert category == FailureCategory.UNKNOWN_TEST_FAILURE
 
     @pytest.mark.parametrize('rc', [143, 1])
@@ -476,7 +467,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
             _xdist_abort_log('shape1_uv_forwarded_sigterm.log'),
             '\n......../home/', f'\n...{status_char}..../home/',
         )
-        category, _ = _xdist_test_leg(rc, output)
+        category = _xdist_test_leg(rc, output)
         assert category == FailureCategory.UNKNOWN_TEST_FAILURE
 
     @pytest.mark.parametrize('status_char', ['F', 'E'])
@@ -494,7 +485,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
             f' [ 18%]\n..{status_char}./bin/bash: line 1: 1854676 Hangup'
             '                  /x/python -m pytest -n 8 -q\n',
         )
-        category, _ = _xdist_test_leg(129, output)
+        category = _xdist_test_leg(129, output)
         assert category == FailureCategory.UNKNOWN_TEST_FAILURE
 
     @pytest.mark.parametrize('status_char', ['F', 'E'])
@@ -508,7 +499,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
         text = _xdist_abort_log('shape1_group_sigterm.log')
         assert text.endswith(_GROUP_KILL_TAIL)
         output = _rewrite(text, _GROUP_KILL_TAIL, f' [ 18%]\n...{status_char}...')
-        category, _ = _xdist_test_leg(143, output)
+        category = _xdist_test_leg(143, output)
         assert category == FailureCategory.UNKNOWN_TEST_FAILURE
 
     @pytest.mark.parametrize('rc', [143, 1])
@@ -530,7 +521,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
         output = _with_line(
             _xdist_abort_log('shape1_controller_sigterm.log'), verbose_line,
         )
-        category, _ = _xdist_test_leg(rc, output)
+        category = _xdist_test_leg(rc, output)
         assert category == FailureCategory.UNKNOWN_TEST_FAILURE
 
     @pytest.mark.parametrize(
@@ -545,7 +536,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
         output = _with_line(
             _xdist_abort_log('shape1_controller_sigterm.log'), verbose_line,
         )
-        category, _ = _xdist_test_leg(143, output)
+        category = _xdist_test_leg(143, output)
         _assert_infra_abort(category)
 
     @pytest.mark.parametrize(
@@ -558,7 +549,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
         output = _with_line(
             _xdist_abort_log('shape1_controller_sigterm.log'), evidence,
         )
-        category, _ = _xdist_test_leg(143, output)
+        category = _xdist_test_leg(143, output)
         assert category == FailureCategory.UNKNOWN_TEST_FAILURE
 
     def test_failing_tally_vetoes_the_abort(self):
@@ -570,7 +561,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
             _SHAPE2_TALLY,
             '1 failed, 18884 passed, 1 skipped, 249 warnings in 225.85s (0:03:45)',
         )
-        category, _ = _xdist_test_leg(143, output)
+        category = _xdist_test_leg(143, output)
         assert category == FailureCategory.UNKNOWN_TEST_FAILURE
 
     def test_internalerror_is_decided_by_the_classifier_first(self):
@@ -580,7 +571,7 @@ class TestVerdictlessXdistExitIsInfraAbort:
             _xdist_abort_log('shape3_bringup_sigterm.log'),
             'INTERNALERROR> Traceback (most recent call last):',
         )
-        category, _ = _xdist_test_leg(143, output)
+        category = _xdist_test_leg(143, output)
         assert category == FailureCategory.PYTEST_INTERNALERROR
 
     @pytest.mark.parametrize(
@@ -593,28 +584,76 @@ class TestVerdictlessXdistExitIsInfraAbort:
     )
     def test_non_abort_exit_status_stays_unknown(self, rc, why):
         """Rule: only a shell-reported SIGTERM/SIGINT/SIGHUP is the rc arm."""
-        category, _ = _xdist_test_leg(rc, _xdist_abort_log('shape2_green_tally.log'))
+        category = _xdist_test_leg(rc, _xdist_abort_log('shape2_green_tally.log'))
         assert category == FailureCategory.UNKNOWN_TEST_FAILURE, why
 
     def test_raw_negative_returncode_stays_infra_kill(self):
         """Rule: the structural external-kill arm is unchanged and still
         dominates."""
-        category, _ = _xdist_test_leg(-15, _xdist_abort_log('shape2_green_tally.log'))
+        category = _xdist_test_leg(-15, _xdist_abort_log('shape2_green_tally.log'))
         assert category == FailureCategory.INFRA_KILL
 
     def test_lint_leg_is_out_of_the_abort_scope(self):
         """Rule: the abort arms are PYTEST-scoped, because their veto set is
         a pytest-output veto set. A killed lint leg reports its gate; this
         pins the documented residual."""
-        _, category, _, _, _ = _summarize(
-            lint=(143, _xdist_abort_log('shape1_controller_sigterm.log'), ROOT_LINT_COMMAND),
+        category = classify_leg(
+            LegSlot.LINT, 143, _xdist_abort_log('shape1_controller_sigterm.log'),
+            False, ROOT_LINT_COMMAND,
         )
         assert category == FailureCategory.LINT_ERROR
 
     def test_timed_out_leg_stays_infra_timeout(self):
         """Rule: the classifier's timeout guard is unchanged and decides
         first."""
-        category, _ = _xdist_test_leg(
+        category = _xdist_test_leg(
             143, _xdist_abort_log('shape1_controller_sigterm.log'), timed_out=True,
         )
         assert category == FailureCategory.INFRA_TIMEOUT
+
+
+_TEST_FAILURE_OUTPUT = 'FAILED tests/test_x.py::test_y - assert 1 == 2\n'
+
+
+class TestTheWorstLegDecidesTheRun:
+    """The run-wide category is the most severe failing leg's, and a leg's
+    branch verdict is never masked by ANOTHER leg's infra-transient category
+    (task #4103). ``failing_leg_categories`` keeps every failing leg's own
+    category, in test/lint/type order."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('legs', 'expected', 'failing'),
+        [
+            pytest.param(
+                {'test': (1, _TEST_FAILURE_OUTPUT), 'lint': (1, _RUFF_I001_OUTPUT)},
+                'test_failure', ['test_failure', 'lint_error'],
+                id='test_failure_outranks_lint_error',
+            ),
+            pytest.param(
+                {'lint': (1, _RUFF_I001_OUTPUT), 'type_': (1, _PYRIGHT_TEXT_OUTPUT)},
+                'type_error', ['lint_error', 'type_error'],
+                id='type_error_outranks_lint_error',
+            ),
+            pytest.param(
+                {
+                    'test': (143, _xdist_abort_log('shape1_controller_sigterm.log')),
+                    'lint': (1, _RUFF_I001_OUTPUT),
+                },
+                'lint_error', ['infra_abort', 'lint_error'],
+                id='lint_error_outranks_infra_abort',
+            ),
+            pytest.param(
+                {
+                    'test': (5, 'no tests ran in 0.01s\n'),
+                    'type_': (1, _PYRIGHT_INTERPRETER_MISRESOLVED_OUTPUT),
+                },
+                'unknown_test_failure', ['unknown_test_failure', 'env_transient'],
+                id='unknown_test_failure_outranks_env_transient',
+            ),
+        ],
+    )
+    async def test_worst_leg_decides(self, tmp_path: Path, legs, expected, failing):
+        result = await _verify_legs(tmp_path, **legs)
+        assert result.category == expected
+        assert result.failing_leg_categories == failing

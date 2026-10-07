@@ -368,7 +368,7 @@ CATEGORY_POLICY: dict[FailureCategory, CategoryPolicy] = {
         is_infra_transient=False, verdict_indeterminate=False,
         retry_kind=RetryKind.NONE,
     ),
-    # Produced ONLY by ``verify._classify_leg``, never by ``classify_failure``:
+    # Produced ONLY by ``verify.classify_leg``, never by ``classify_failure``:
     # a PYTEST leg with no failure evidence whose session was torn down from
     # outside the tests (a shell-reported SIGTERM/SIGINT/SIGHUP, or xdist's
     # controller-only teardown signature).
