@@ -24,7 +24,7 @@ from _verify_config_corpus import ROOT_LINT_COMMAND, ROOT_TYPE_CHECK_COMMAND
 from orchestrator import verify
 from orchestrator.config import OrchestratorConfig
 from orchestrator.verify import _summarize_checks
-from orchestrator.verify_categories import FailureCategory
+from orchestrator.verify_categories import CATEGORY_POLICY, FailureCategory
 from orchestrator.verify_classify import (
     is_external_kill_rc,
     is_shell_reported_external_kill,
@@ -259,3 +259,199 @@ class TestLegSlotNamesTheRedGate:
         report = result.failure_report()
         assert 'Category: lint_error' in report
         assert 'unknown_test_failure' not in report
+
+
+_XDIST_ABORT_FIXTURES = Path(__file__).parent / 'fixtures' / 'verify_xdist_abort'
+
+# The esc-4246-4 sighting's own command; it resolves PYTEST.
+_FUSED_MEMORY_TEST_CMD = (
+    'uv run --directory fused-memory pytest tests/ --tb=short -q --timeout=300'
+)
+
+_SHAPE2_TALLY = '18885 passed, 1 skipped, 249 warnings in 225.85s (0:03:45)'
+
+# A killed -q session's last progress line: it never prints a short summary,
+# so its F or E is the only failure evidence left.
+_KILLED_PROGRESS_WITH_F = '....F...' + '.' * 64 + ' [ 40%]'
+
+
+def _xdist_abort_log(name: str) -> str:
+    return (_XDIST_ABORT_FIXTURES / name).read_text()
+
+
+def _with_line(text: str, line: str) -> str:
+    separator = '' if text.endswith('\n') else '\n'
+    return f'{text}{separator}{line}\n'
+
+
+def _xdist_test_leg(rc: int, output: str, *, timed_out: bool = False):
+    """(category, failing_leg_categories) for a red test leg, lint/type green."""
+    _, category, _, _, failing = _summarize_checks(
+        rc, output, timed_out, _FUSED_MEMORY_TEST_CMD,
+        0, '', False, None,
+        0, '', False, None,
+    )
+    return category, failing
+
+
+def _assert_infra_abort(category: str) -> None:
+    assert category == FailureCategory.INFRA_ABORT
+    policy = CATEGORY_POLICY[FailureCategory(category)]
+    assert policy.is_infra_transient is True, (
+        'a verdictless abort earns the bounded retry, not a debugger dispatch'
+    )
+    assert policy.verdict_indeterminate is False, (
+        'the leg keeps its veto at the per-land cross-check'
+    )
+
+
+class TestVerdictlessXdistExitIsInfraAbort:
+    """A pytest-xdist test leg torn down from outside the tests reached no
+    verdict about the branch, so it is INFRA_ABORT (task 4843, #5132).
+
+    Two arms, because no single piece of evidence covers every shape: the
+    shell-reported SIGTERM/SIGINT/SIGHUP exit status, and the channel-collapse
+    signature xdist workers print when they outlive their controller. Every
+    log is a real capture (``fixtures/verify_xdist_abort/PROVENANCE.md``).
+    Any failure evidence vetoes both arms, and the classifier's own answer
+    passes through.
+    """
+
+    def test_controller_sigterm_with_kill_rc_is_infra_abort(self):
+        """esc-4808-1, esc-3824-1/-2: rc=143 and the signature, both arms."""
+        category, failing = _xdist_test_leg(
+            143, _xdist_abort_log('shape1_controller_sigterm.log'),
+        )
+        _assert_infra_abort(category)
+        assert failing == ['infra_abort']
+
+    def test_channel_collapse_signature_alone_is_infra_abort(self):
+        """esc-4808-1's text with no kill rc: the text arm alone fires."""
+        category, _ = _xdist_test_leg(
+            1, _xdist_abort_log('shape1_controller_sigterm.log'),
+        )
+        _assert_infra_abort(category)
+
+    def test_group_sigterm_is_caught_by_the_kill_rc_alone(self):
+        """esc-4808-1's kill delivered to the whole group leaves no
+        signature, so only the rc arm can catch it."""
+        category, _ = _xdist_test_leg(
+            143, _xdist_abort_log('shape1_group_sigterm.log'),
+        )
+        _assert_infra_abort(category)
+
+    def test_group_sigterm_without_kill_rc_stays_unknown(self):
+        """The discriminating twin of the case above: the same text with no
+        kill rc carries neither arm's evidence."""
+        category, _ = _xdist_test_leg(
+            1, _xdist_abort_log('shape1_group_sigterm.log'),
+        )
+        assert category == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    def test_green_tally_then_sigterm_is_infra_abort(self):
+        """esc-4246-4: the session finished green, then the shell reported a
+        SIGTERM. The log carries no signature; the kill rc decides."""
+        category, _ = _xdist_test_leg(
+            143, _xdist_abort_log('shape2_green_tally.log'),
+        )
+        _assert_infra_abort(category)
+
+    @pytest.mark.parametrize('rc', [143, 1])
+    def test_bringup_sigterm_is_infra_abort_on_the_signature(self, rc):
+        """esc-4071-1: its rc was never recorded, so the text signature
+        alone must decide."""
+        category, _ = _xdist_test_leg(
+            rc, _xdist_abort_log('shape3_bringup_sigterm.log'),
+        )
+        _assert_infra_abort(category)
+
+    def test_failed_line_vetoes_the_abort(self):
+        """Rule: a FAILED line is a verdict, so TEST_FAILURE survives."""
+        output = _with_line(
+            _xdist_abort_log('shape1_controller_sigterm.log'),
+            'FAILED tests/test_x.py::test_y - AssertionError',
+        )
+        category, _ = _xdist_test_leg(143, output)
+        assert category == FailureCategory.TEST_FAILURE
+
+    @pytest.mark.parametrize('status_char', ['F', 'E'])
+    def test_killed_progress_failure_char_vetoes_the_abort(self, status_char):
+        """Rule: a killed -q session prints no short summary, so an F or E
+        in its progress line is the only failure evidence and must veto."""
+        output = _with_line(
+            _xdist_abort_log('shape1_controller_sigterm.log'),
+            _KILLED_PROGRESS_WITH_F.replace('F', status_char),
+        )
+        category, _ = _xdist_test_leg(143, output)
+        assert category == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    @pytest.mark.parametrize(
+        'evidence',
+        ['ERROR tests/test_x.py::test_y - fixture', 'E   assert 1 == 2'],
+    )
+    def test_error_line_vetoes_the_abort(self, evidence):
+        """Rule: an ERROR summary line or an assertion E-line is failure
+        evidence, so the classifier's own answer passes through."""
+        output = _with_line(
+            _xdist_abort_log('shape1_controller_sigterm.log'), evidence,
+        )
+        category, _ = _xdist_test_leg(143, output)
+        assert category == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    def test_failing_tally_vetoes_the_abort(self):
+        """Rule: a tally that counts a failure is a verdict, even when the
+        shell then reports a SIGTERM."""
+        green = _xdist_abort_log('shape2_green_tally.log')
+        assert _SHAPE2_TALLY in green
+        output = green.replace(
+            _SHAPE2_TALLY,
+            '1 failed, 18884 passed, 1 skipped, 249 warnings in 225.85s (0:03:45)',
+        )
+        category, _ = _xdist_test_leg(143, output)
+        assert category == FailureCategory.UNKNOWN_TEST_FAILURE
+
+    def test_internalerror_is_decided_by_the_classifier_first(self):
+        """Rule: only the unknown fall-through is rewritten, so the
+        classifier's PYTEST_INTERNALERROR wins over both arms."""
+        output = _with_line(
+            _xdist_abort_log('shape3_bringup_sigterm.log'),
+            'INTERNALERROR> Traceback (most recent call last):',
+        )
+        category, _ = _xdist_test_leg(143, output)
+        assert category == FailureCategory.PYTEST_INTERNALERROR
+
+    @pytest.mark.parametrize(
+        ('rc', 'why'),
+        [
+            (137, 'SIGKILL is excluded: the branch-OOM residual'),
+            (139, 'a crash signal is a fault of the code under test'),
+            (1, 'no kill rc and no signature'),
+        ],
+    )
+    def test_non_abort_exit_status_stays_unknown(self, rc, why):
+        """Rule: only a shell-reported SIGTERM/SIGINT/SIGHUP is the rc arm."""
+        category, _ = _xdist_test_leg(rc, _xdist_abort_log('shape2_green_tally.log'))
+        assert category == FailureCategory.UNKNOWN_TEST_FAILURE, why
+
+    def test_raw_negative_returncode_stays_infra_kill(self):
+        """Rule: the structural external-kill arm is unchanged and still
+        dominates."""
+        category, _ = _xdist_test_leg(-15, _xdist_abort_log('shape2_green_tally.log'))
+        assert category == FailureCategory.INFRA_KILL
+
+    def test_lint_leg_is_out_of_the_abort_scope(self):
+        """Rule: the abort arms are PYTEST-scoped, because their veto set is
+        a pytest-output veto set. A killed lint leg reports its gate; this
+        pins the documented residual."""
+        _, category, _, _, _ = _summarize(
+            lint=(143, _xdist_abort_log('shape1_controller_sigterm.log'), ROOT_LINT_COMMAND),
+        )
+        assert category == FailureCategory.LINT_ERROR
+
+    def test_timed_out_leg_stays_infra_timeout(self):
+        """Rule: the classifier's timeout guard is unchanged and decides
+        first."""
+        category, _ = _xdist_test_leg(
+            143, _xdist_abort_log('shape1_controller_sigterm.log'), timed_out=True,
+        )
+        assert category == FailureCategory.INFRA_TIMEOUT
