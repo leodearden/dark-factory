@@ -324,35 +324,6 @@ WHOLE_TREE_SCAN_TEST_TIMEOUT = 540
 VERIFY_CLI_PER_TEST_TIMEOUT = 300
 
 
-# task 5147: the band's LOWER edge -- the largest N that still reads as a
-# DELIBERATE tight bound rather than a slow test's opt-out.
-#
-# A LITERAL, and deliberately NOT `PYPROJECT_DEFAULT_TIMEOUT`, which it merely
-# EQUALLED until 2026-09-12.  It was first written as that mirror, while the
-# ini default was 60 and a marker above it read to its author as a loosening.
-# Commit 64e24b547f then raised the ini default 60 -> 300 in every package, and
-# a mirror would have followed it: (300, 300) is EMPTY, so every sweep built on
-# this band would pass VACUOUSLY -- green because nothing can offend -- while
-# the 61 in-band markers it was built to ratchet stayed untouched in the tree.
-# Task 5442 then moved the ini default again, to 540, which is a second reason
-# the same mirror would have been wrong: it would now put the lower edge ABOVE
-# the upper one and make the band not merely empty but inverted.
-#
-# The raise did not remove the hazard, only one framing of it.  A marker at 120
-# still REPLACES verify's 300, still `os._exit()`s the xdist worker when a
-# loaded host starves it, and is still what blamed tasks 4176, 4384 and 4405.
-# What the raise removed is the SIGN-FLIP: an author reading `timeout = 300`
-# who writes 120 is now knowingly tightening rather than reaching for what
-# looks like a loosening. The edge therefore stays at the value the design
-# always used -- pinned by test_timeout_marker_inversion_guard.py::
-# test_the_band_edges_are_exactly_where_the_design_puts_them -- and stops
-# borrowing a number that can move underneath it. The ini default DID move
-# again -- 300 -> 540 on 2026-09-17, task 5442, which is the measured value the
-# follow-up this comment anticipated was owed -- and this edge did not move
-# with it, which is the whole point of it having stopped being a mirror.
-DELIBERATE_TIGHT_BOUND_CEILING = 60
-
-
 # task 3451's measured worst-case happy-path subprocess spawn latency (n=3:
 # 2.13/3.10/4.71, load-per-core 6.6) -- the per-spawn price
 # `required_timeout_secs` below charges.

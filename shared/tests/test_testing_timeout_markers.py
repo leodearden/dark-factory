@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from types import MappingProxyType
 
 import pytest
+
 from shared.testing_timeout_markers import (
     DELIBERATE_TIGHT_BOUND_CEILING,
     SiteKind,
