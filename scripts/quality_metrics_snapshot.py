@@ -123,6 +123,22 @@ def _empty_import_graph() -> dict[str, list[Any]]:
     return {key: [] for key in _IMPORT_GRAPH_KEYS}
 
 
+def _require_unique_module_names(domain: Sequence[source_measures.DomainMember]) -> None:
+    """The import graph is keyed by module name, so one name must mean one file."""
+    paths_by_name: dict[str, list[str]] = {}
+    for member in domain:
+        for domain_file in member.files:
+            if domain_file.import_name is not None:
+                paths_by_name.setdefault(domain_file.import_name, []).append(domain_file.path)
+    collisions = {name: sorted(paths) for name, paths in paths_by_name.items() if len(paths) > 1}
+    if collisions:
+        raise source_measures.MetricsError(
+            'src files that import as one module name would make the import graph '
+            'ambiguous: '
+            + '; '.join(f'{name!r}: {", ".join(paths)}' for name, paths in sorted(collisions.items()))
+        )
+
+
 def measure_domain(
     root: Path, domain: Sequence[source_measures.DomainMember]
 ) -> Measurement:
@@ -131,6 +147,7 @@ def measure_domain(
     A file whose read, parse, tokenize or complexipy step fails is named in
     ``unreadable`` (its reason on stderr) and has no record.
     """
+    _require_unique_module_names(domain)
     files: dict[str, Mapping[str, Any]] = {}
     functions: dict[str, int] = {}
     unreadable: list[str] = []
@@ -170,13 +187,34 @@ def _evidence(
     }
 
 
+def _require_clean_domain(root: Path, as_of: str) -> None:
+    dirty = source_measures.uncommitted_domain_paths(root)
+    if dirty:
+        raise source_measures.MetricsError(
+            f'the domain has uncommitted changes, so HEAD ({as_of}) is not what the '
+            f'work tree holds: {", ".join(dirty)}; commit, or measure a clean checkout'
+        )
+
+
+def _require_unmoved_head(root: Path, as_of: str) -> None:
+    now = source_measures.head_commit(root)
+    if now != as_of:
+        raise source_measures.MetricsError(
+            f'HEAD moved from {as_of} to {now} during the measurement (a merge '
+            'landed?); re-run, or measure a pinned worktree'
+        )
+
+
 def take_snapshot(root: Path, *, run_id: str, since: str) -> dict[str, Any]:
-    """Measure *root*'s HEAD as a schema-1 snapshot."""
+    """Measure *root*'s HEAD as a schema-1 snapshot; refuse a dirty domain or a moved HEAD."""
     started = time.monotonic()
     version = source_measures.require_complexipy()
     as_of = source_measures.head_commit(root)
     domain = source_measures.workspace_domain(root)
+    _require_clean_domain(root, as_of)
     measured = measure_domain(root, domain)
+    _require_unmoved_head(root, as_of)
+    _require_clean_domain(root, as_of)
     snapshot = {
         'schema_version': SCHEMA_VERSION,
         'instrument': INSTRUMENT,
@@ -362,7 +400,9 @@ def _write(out: Path, text: str) -> None:
 
 def _measure(args: argparse.Namespace) -> int:
     root = Path(args.root) if args.root is not None else _DEFAULT_ROOT
-    snapshot = take_snapshot(root, run_id=args.run_id, since='none')
+    previous = load_snapshot(Path(args.diff)) if args.diff is not None else None
+    since = previous['as_of_sha'] if previous is not None else 'none'
+    snapshot = take_snapshot(root, run_id=args.run_id, since=since)
     out = Path(args.out)
     _write(out, render_snapshot(snapshot))
     evidence = snapshot['evidence']
@@ -370,7 +410,8 @@ def _measure(args: argparse.Namespace) -> int:
         f'wrote {out}: {evidence["measured_files"]}/{evidence["domain_files"]} domain '
         f'files measured, complete={json.dumps(evidence["complete"])}'
     )
-    print(NO_PREVIOUS_LINE)
+    if previous is None:
+        print(NO_PREVIOUS_LINE)
     return 0
 
 
