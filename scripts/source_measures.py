@@ -923,6 +923,14 @@ def _require_declared_members_populated(domain: tuple[DomainMember, ...]) -> Non
         )
 
 
+def _workspace_members(root: Path) -> tuple[MemberRoots, ...]:
+    """The declared members of *root*'s pyproject.toml, then ``PSEUDO_MEMBERS``."""
+    return (
+        *(MemberRoots.declared(name) for name in _declared_members(root)),
+        *PSEUDO_MEMBERS,
+    )
+
+
 def workspace_domain(root: Path) -> tuple[DomainMember, ...]:
     """Every workspace member's tracked ``.py`` files, classified src or tests.
 
@@ -932,11 +940,36 @@ def workspace_domain(root: Path) -> tuple[DomainMember, ...]:
     is every file under no member's src or tests root (``hooks/`` included).
     """
     _require_work_tree_top(root)
-    members = (
-        *(MemberRoots.declared(name) for name in _declared_members(root)),
-        *PSEUDO_MEMBERS,
-    )
+    members = _workspace_members(root)
     entries = _tracked_blobs(root, '*.py')
     domain = tuple(_domain_member(member, entries) for member in members)
     _require_declared_members_populated(domain)
     return domain
+
+
+def head_commit(root: Path) -> str:
+    """The full sha of *root*'s HEAD commit."""
+    _require_work_tree_top(root)
+    try:
+        return _git_output(root, 'rev-parse', '--verify', 'HEAD').strip()
+    except MetricsError as exc:
+        raise MetricsError(
+            f'{root}: the work tree has no HEAD commit to measure -- {exc}'
+        ) from exc
+
+
+def uncommitted_domain_paths(root: Path) -> tuple[str, ...]:
+    """Domain ``.py`` paths whose index or work-tree copy differs from HEAD, sorted.
+
+    Untracked files are not listed: they are outside the domain.
+    """
+    _require_work_tree_top(root)
+    members = _workspace_members(root)
+    listing = _git_output(
+        root, 'status', '--porcelain=v1', '-z', '--untracked-files=no', '--no-renames',
+        '--', '*.py',
+    )
+    paths = {record[3:] for record in listing.split('\0') if record}
+    return tuple(
+        sorted(path for path in paths if any(m.kind_of(path) is not None for m in members))
+    )
