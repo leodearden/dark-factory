@@ -3,7 +3,8 @@
 ``plans/local-memory-models-eval-controls/`` holds the four live incumbent control runs
 the pre-registration is derived from, and ``preregistration-inputs.json``, the committed
 formula's output over runs A and B. These tests re-derive that output from the committed
-runs, so the numbers the preregistration doc quotes cannot drift from the formula.
+runs, so the committed ``preregistration-inputs.json`` cannot drift from the formula. The
+preregistration doc names that file as the authoritative copy of its numbers.
 
 Lane discipline: file reads plus ``git`` subprocesses only, and NO ``integration``
 marker, so the merge lane's default selection runs them.
@@ -23,6 +24,7 @@ from fused_memory.arm_harness.corpus import corpus_sha
 from fused_memory.arm_harness.llm_metrics import (
     GRAPH_SAMENESS_DETAILS_FILENAME,
     GraphSamenessDetails,
+    graph_sameness_details,
 )
 from fused_memory.arm_harness.margins import GATED_METRICS
 from fused_memory.arm_harness.metrics_record import (
@@ -158,19 +160,27 @@ def test_the_screening_runs_cover_the_first_twenty_manifest_episodes(arm_id):
 # --- the pre-registration inputs ------------------------------------------------------
 
 
+def _outcomes(arm_id: str):
+    return load_outcomes(_run_dir(arm_id) / OUTCOMES_FILENAME)
+
+
 def _derived_inputs():
-    run_a, run_b = _run_dir(ARM_A), _run_dir(ARM_B)
     return derive_preregistration_inputs(
         _run(ARM_A),
         _records(ARM_A),
-        load_outcomes(run_a / OUTCOMES_FILENAME),
+        _outcomes(ARM_A),
         _run(ARM_B),
         _records(ARM_B),
-        load_outcomes(run_b / OUTCOMES_FILENAME),
-        GraphSamenessDetails.model_validate_json(
-            (run_b / GRAPH_SAMENESS_DETAILS_FILENAME).read_text()
-        ),
+        _outcomes(ARM_B),
     )
+
+
+def test_run_b_was_measured_against_run_a():
+    committed = GraphSamenessDetails.model_validate_json(
+        (_run_dir(ARM_B) / GRAPH_SAMENESS_DETAILS_FILENAME).read_text()
+    )
+
+    assert committed == graph_sameness_details(_outcomes(ARM_B), _outcomes(ARM_A))
 
 
 def test_the_committed_inputs_are_the_formula_over_the_committed_runs():

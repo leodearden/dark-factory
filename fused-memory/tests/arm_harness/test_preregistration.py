@@ -1,5 +1,6 @@
 """The LLM axis's pre-registered decision quantities (arm_harness/preregistration.py)."""
 
+import json
 import math
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -11,12 +12,8 @@ from shared.memory_eval_metrics import Metric
 from arm_harness._fakes import incumbent_control_spec, run_manifest_for
 from fused_memory.arm_harness.arm_spec import LlmArmSpec
 from fused_memory.arm_harness.comparison import RunComparabilityError
-from fused_memory.arm_harness.llm_metrics import (
-    EpisodeSameness,
-    GraphSamenessDetails,
-    TokenAccountingError,
-)
-from fused_memory.arm_harness.margins import derive_margins
+from fused_memory.arm_harness.llm_metrics import TokenAccountingError
+from fused_memory.arm_harness.margins import MarginDerivationError, derive_margins
 from fused_memory.arm_harness.metrics_record import LlmMetricId, MetricsRecord, record_for
 from fused_memory.arm_harness.preregistration import (
     LATENCY_HEADROOM,
@@ -39,7 +36,10 @@ MEASURED_AT = datetime(2026, 10, 6, 12, 0, tzinfo=UTC)
 SPEC_A = incumbent_control_spec(arm_id='incumbent-ctrl-a', scratch_group_id='evalmem_ctrl_a')
 SPEC_B = incumbent_control_spec(arm_id='incumbent-ctrl-b', scratch_group_id='evalmem_ctrl_b')
 EPISODES = ('e1', 'e2', 'e3', 'e4')
-JACCARDS = (0.6, 0.8, 1.0, 0.8)
+ENTITIES_A = (('a', 'b', 'c', 'd'), ('a', 'b', 'c', 'd', 'e'), ('a',), ('a', 'b', 'c', 'd', 'e'))
+ENTITIES_B = (('a', 'b', 'c', 'x'), ('a', 'b', 'c', 'd'), ('a',), ('a', 'b', 'c', 'd'))
+JACCARDS = (3 / 5, 4 / 5, 1.0, 4 / 5)
+"""B's per-episode entity Jaccard against A, by construction of the two entity tables."""
 
 
 def _outcome(
@@ -47,8 +47,9 @@ def _outcome(
     calls: int,
     *,
     ok: bool = True,
-    duration_ms: float = 3000.0,
+    duration_ms: float = 5000.0,
     tokens: LlmTokenUsage | None | str = 'derived',
+    entities: tuple[str, ...] = ('alice',),
 ) -> EpisodeOutcome:
     usage = (
         LlmTokenUsage(input_tokens=1000 * calls + 7, output_tokens=100 * calls, llm_calls=calls)
@@ -62,17 +63,22 @@ def _outcome(
         duration_ms=duration_ms,
         tokens=usage if not isinstance(usage, str) else None,
         replay_episode_uuid=f'replay-{episode_id}' if ok else None,
-        entity_names=('alice',) if ok else (),
+        entity_names=entities if ok else (),
         edge_triples=(),
     )
 
 
-def _outcomes(calls: Sequence[int]) -> tuple[EpisodeOutcome, ...]:
-    return tuple(_outcome(episode_id, n) for episode_id, n in zip(EPISODES, calls, strict=True))
+def _outcomes(
+    calls: Sequence[int], entities: Sequence[tuple[str, ...]] = ENTITIES_A, *, ok: bool = True
+) -> tuple[EpisodeOutcome, ...]:
+    return tuple(
+        _outcome(episode_id, n, entities=names, ok=ok)
+        for episode_id, n, names in zip(EPISODES, calls, entities, strict=True)
+    )
 
 
-OUTCOMES_A = _outcomes((3, 5, 8, 10))
-OUTCOMES_B = _outcomes((4, 4, 6, 6))
+OUTCOMES_A = _outcomes((3, 5, 8, 10), ENTITIES_A)
+OUTCOMES_B = _outcomes((4, 4, 6, 6), ENTITIES_B)
 
 
 def _proportion(metric_id: str, hits: int, total: int, direction) -> Metric:
@@ -109,25 +115,6 @@ def _records(
     )
 
 
-def _sameness_details(jaccards: Sequence[float] = JACCARDS) -> GraphSamenessDetails:
-    return GraphSamenessDetails(
-        episodes=tuple(
-            EpisodeSameness(
-                episode_id=episode_id,
-                arm_entity_count=1,
-                ref_entity_count=1,
-                arm_edge_count=0,
-                ref_edge_count=0,
-                entity_jaccard=jaccard,
-                edge_triple_jaccard=1.0,
-            )
-            for episode_id, jaccard in zip(EPISODES, jaccards, strict=False)
-        ),
-        excluded_arm_ids=(),
-        excluded_reference_ids=(),
-    )
-
-
 def _run(spec: LlmArmSpec, **overrides) -> RunManifest:
     return run_manifest_for(spec, **({'episode_ids': EPISODES} | overrides))
 
@@ -140,7 +127,6 @@ def _derive(**overrides) -> PreregistrationInputs:
         'run_b': _run(SPEC_B),
         'records_b': _records(SPEC_B, sameness=True),
         'outcomes_b': OUTCOMES_B,
-        'sameness_b': _sameness_details(),
     } | overrides
     return derive_preregistration_inputs(**args)
 
@@ -232,7 +218,7 @@ def test_the_inputs_compose_margins_envelope_and_call_profile_from_the_control_p
     assert inputs.envelope == latency_envelope(episode_timeout_s=120.0)
     assert inputs.call_profile == call_profile(OUTCOMES_A, OUTCOMES_B)
     assert inputs.incumbent_latency_p95_ms == 4000.0
-    assert inputs.incumbent_latency_max_ms == 3000.0
+    assert inputs.incumbent_latency_max_ms == 5000.0
 
 
 def test_the_incumbent_p95_is_the_worse_of_the_two_runs():
@@ -242,7 +228,7 @@ def test_the_incumbent_p95_is_the_worse_of_the_two_runs():
 
 
 def test_the_incumbent_max_is_the_slowest_ok_episode_of_either_run():
-    slow = (*OUTCOMES_B[:3], _outcome('e4', 6, duration_ms=9000.0))
+    slow = (*OUTCOMES_B[:3], _outcome('e4', 6, duration_ms=9000.0, entities=ENTITIES_B[3]))
 
     assert _derive(outcomes_b=slow).incumbent_latency_max_ms == 9000.0
 
@@ -303,13 +289,60 @@ def test_outcomes_that_are_not_the_runs_episodes_are_refused():
 
 
 def test_an_empty_graph_sameness_comparison_is_refused():
-    message = _refused(sameness_b=_sameness_details(()))
+    message = _refused(outcomes_b=_outcomes((4, 4, 6, 6), ENTITIES_B, ok=False))
 
     assert 'graph-sameness' in message
     assert 'incumbent-ctrl-b' in message
 
 
+def test_a_run_b_without_a_graph_sameness_record_is_refused():
+    message = _refused(records_b=_records(SPEC_B))
+
+    assert 'graph-sameness' in message
+    assert '--reference-outcomes' in message
+
+
+def test_a_sameness_record_not_measured_against_run_a_is_refused():
+    other_reference = _outcomes((3, 5, 8, 10), ENTITIES_B)
+
+    with pytest.raises(MarginDerivationError) as raised:
+        _derive(outcomes_a=other_reference)
+
+    assert 'graph-sameness' in str(raised.value)
+    assert 'incumbent-ctrl-b' in str(raised.value)
+
+
+def test_a_p95_above_the_slowest_ok_episode_is_refused():
+    message = _refused(records_b=_records(SPEC_B, p95_ms=5500.0, sameness=True))
+
+    assert '5500.0' in message
+    assert '5000.0' in message
+
+
 # --- serialization --------------------------------------------------------------------
+
+
+def _tampered(**fields) -> dict:
+    return _derive().model_dump(mode='json') | fields
+
+
+@pytest.mark.parametrize(
+    'fields',
+    [
+        {'incumbent_latency_p95_ms': 60000.0, 'incumbent_latency_max_ms': 90000.0},
+        {'incumbent_latency_p95_ms': 6000.0},
+        {'control_arm_ids': ['incumbent-ctrl-a', 'incumbent-ctrl-a']},
+    ],
+    ids=['p95-outside-envelope', 'p95-above-max', 'one-arm-twice'],
+)
+def test_inputs_that_break_a_preregistration_invariant_never_validate(fields, tmp_path):
+    path = tmp_path / PREREGISTRATION_INPUTS_FILENAME
+    path.write_text(json.dumps(_tampered(**fields)))
+
+    with pytest.raises(ValidationError):
+        PreregistrationInputs.model_validate(_tampered(**fields))
+    with pytest.raises(ValidationError):
+        load_preregistration_inputs(path)
 
 
 def test_the_inputs_round_trip_canonically(tmp_path):

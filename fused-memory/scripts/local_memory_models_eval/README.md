@@ -240,7 +240,7 @@ Live endpoints come from `FusedMemoryConfig()` (honours `CONFIG_PATH`).
 | `integrity --reference G --candidate G` | ι | Re-embed integrity verdict over two scratch topologies (`topology.py`) |
 | `parity-check --run-a A --run-b B` | ζ | Client-class parity deltas (a − b) into `A/parity/<arm b>/metrics/` (`comparison.py`) |
 | `control-check --run A --run B [--run …] [--reference-outcomes F]` | ζ | Symmetry, one code sha, token/cost and reference checks (`checks.py`) |
-| `preregister --run-a A --run-b B --out F` | ζ | The incumbent control pair's margins, latency envelope and calls-per-episode profile, written to `F`; B must have run with `--reference-outcomes` A (`preregistration.py`, `margins.py`) |
+| `preregister --run-a A --run-b B --out F` | ζ | The incumbent control pair's margins, latency envelope and calls-per-episode profile, written to a fresh `F` (an existing `F` is refused, never overwritten); B must have run with `--reference-outcomes` A, and its graph-sameness is recomputed from both runs' outcomes (`preregistration.py`, `margins.py`) |
 | `topology --graph G` | ζ, ι | A scratch graph's node and edge counts and topology hash: ζ freezes the reference graph, ι re-runs it to verify the graph is unchanged (`topology.py`) |
 | `teardown --arm-spec S [--collection]` | ι | Deletes the arm's scratch graph and, with `--collection`, its Qdrant replica (`teardown.py`) |
 

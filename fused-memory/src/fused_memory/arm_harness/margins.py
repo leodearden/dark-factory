@@ -265,10 +265,16 @@ def _floor(records: Sequence[MetricsRecord]) -> float | None:
     if len(kinds) != 1:
         metric_id = records[0].metric.metric_id
         raise MarginDerivationError(f'{metric_id!r} is reported as different kinds {kinds}')
-    denominators = [r.metric.denominator for r in records if r.metric.denominator is not None]
     if kinds[0] != 'proportion':
         return None
-    return 1 / min(denominators)
+    return 1 / min(_denominator(record) for record in records)
+
+
+def _denominator(record: MetricsRecord) -> int:
+    """A proportion's trial count; ``Metric`` guarantees one, positive, for every proportion."""
+    denominator = record.metric.denominator
+    assert denominator is not None, record.metric
+    return denominator
 
 
 def _run_pair_entry(

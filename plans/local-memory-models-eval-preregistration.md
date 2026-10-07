@@ -65,8 +65,10 @@ pass direction. `MarginEntry.admits` applies the direction.
   run pair's sample standard deviation, |a − b| / √2. Graph-sameness is pairwise by
   nature: B measured against A yields exactly one incumbent self-agreement value, and
   Jaccard is symmetric, so A against B adds nothing. For it, σ is that one observation's
-  per-episode standard error, stdev(entity Jaccards) / √n, read from B's
-  `graph_sameness_details.json`.
+  per-episode standard error, stdev(entity Jaccards) / √n. `preregister` recomputes those
+  Jaccards from A's and B's `outcomes.jsonl` rather than trusting a file, and refuses
+  unless their mean and count match B's recorded graph-sameness. That is what shows B was
+  measured against A.
 - **floor.** For a proportion, the floor is 1 / min(denominator), the smallest step the
   metric can express. A margin below one item's step would let a single item decide the
   verdict, which is noise rather than measurement. Floors are absent for scalars

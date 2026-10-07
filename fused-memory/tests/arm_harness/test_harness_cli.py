@@ -15,7 +15,7 @@ import pytest
 from _fm_helpers import load_script_module
 from _mock_openai_server import mock_openai_server
 from shared.cli_boundary import EXIT_STDOUT_FAILED
-from shared.memory_eval_metrics import Metric, canonical_json_text
+from shared.memory_eval_metrics import Metric
 from shared.safe_io import atomic_write_text
 
 from arm_harness._fakes import (
@@ -35,11 +35,6 @@ from fused_memory.arm_harness.checks import CLEANUP_CYPHER, PROBE_CYPHER
 from fused_memory.arm_harness.conformance import ConformanceLedger
 from fused_memory.arm_harness.corpus import corpus_sha
 from fused_memory.arm_harness.instrument_checks import InstrumentCheckId
-from fused_memory.arm_harness.llm_metrics import (
-    GRAPH_SAMENESS_DETAILS_FILENAME,
-    EpisodeSameness,
-    GraphSamenessDetails,
-)
 from fused_memory.arm_harness.metrics_record import (
     IndexConfiguration,
     LlmMetricId,
@@ -1000,7 +995,6 @@ def test_teardown_collection_also_deletes_the_same_named_replica(harness, live, 
 # --- preregister ----------------------------------------------------------------------
 
 PREREG_EPISODES = ('e1', 'e2', 'e3', 'e4')
-PREREG_JACCARDS = (0.6, 0.8, 1.0, 0.8)
 
 
 def _prereg_outcomes(calls: tuple[int, ...]) -> list[EpisodeOutcome]:
@@ -1009,7 +1003,7 @@ def _prereg_outcomes(calls: tuple[int, ...]) -> list[EpisodeOutcome]:
             episode_id=episode_id,
             ok=True,
             error_class=None,
-            duration_ms=3000.0,
+            duration_ms=5000.0,
             tokens=LlmTokenUsage(input_tokens=1000 * n, output_tokens=100 * n, llm_calls=n),
             replay_episode_uuid=f'replay-{episode_id}',
             entity_names=('alice',),
@@ -1035,26 +1029,9 @@ def _prereg_records(
         Metric(metric_id=LlmMetricId.EPISODE_LATENCY_P95, kind='scalar', value=p95_ms, n=4),
     ]
     if sameness:
-        mean = sum(PREREG_JACCARDS) / len(PREREG_JACCARDS)
-        metrics.append(Metric(metric_id=LlmMetricId.GRAPH_SAMENESS, kind='scalar', value=mean, n=4))
+        metrics.append(Metric(metric_id=LlmMetricId.GRAPH_SAMENESS, kind='scalar', value=1.0, n=4))
     measured = [record_for(spec, m, measured_at=MEASURED_AT, incomplete=False) for m in metrics]
     return measured + _accounted(spec)
-
-
-def _sameness_details_json() -> str:
-    details = GraphSamenessDetails(
-        episodes=tuple(
-            EpisodeSameness(
-                episode_id=episode_id, arm_entity_count=1, ref_entity_count=1,
-                arm_edge_count=0, ref_edge_count=0, entity_jaccard=jaccard,
-                edge_triple_jaccard=1.0,
-            )
-            for episode_id, jaccard in zip(PREREG_EPISODES, PREREG_JACCARDS, strict=True)
-        ),
-        excluded_arm_ids=(),
-        excluded_reference_ids=(),
-    )
-    return canonical_json_text(details.model_dump(mode='json'))
 
 
 def _control_run_dir(
@@ -1066,8 +1043,6 @@ def _control_run_dir(
         spec, p95_ms=p95_ms, sameness=sameness
     ))
     write_outcomes(run_dir, _prereg_outcomes(calls))
-    if sameness:
-        atomic_write_text(run_dir / GRAPH_SAMENESS_DETAILS_FILENAME, _sameness_details_json())
     return run_dir
 
 
@@ -1098,9 +1073,6 @@ def test_preregister_writes_the_inputs_derived_from_the_control_pair(
         load_run_manifest(run_b / RUN_MANIFEST_FILENAME),
         load_metrics_records(run_b),
         load_outcomes(run_b / OUTCOMES_FILENAME),
-        GraphSamenessDetails.model_validate_json(
-            (run_b / GRAPH_SAMENESS_DETAILS_FILENAME).read_text()
-        ),
     )
     assert load_preregistration_inputs(out) == expected
     assert out.read_text() == serialize_preregistration_inputs(expected)
@@ -1126,16 +1098,27 @@ def _refused_preregister(
     return err
 
 
-def test_preregister_refuses_a_run_b_without_graph_sameness_details(
-    harness, live, tmp_path, capsys
-):
-    run_a, run_b = _control_pair(tmp_path)
-    (run_b / GRAPH_SAMENESS_DETAILS_FILENAME).unlink()
+def test_preregister_refuses_a_run_b_without_graph_sameness(harness, live, tmp_path, capsys):
+    run_a, run_b = _control_pair(tmp_path, sameness=False)
 
     err = _refused_preregister(harness, live, run_a, run_b, tmp_path / 'f.json', capsys)
 
-    assert GRAPH_SAMENESS_DETAILS_FILENAME in err
+    assert 'graph-sameness' in err
     assert '--reference-outcomes' in err
+
+
+def test_preregister_never_overwrites_existing_inputs(harness, live, tmp_path, capsys):
+    run_a, run_b = _control_pair(tmp_path)
+    out = tmp_path / PREREGISTRATION_INPUTS_FILENAME
+    out.write_text('pre-registered\n')
+
+    code = harness.main(_preregister_argv(run_a, run_b, out), deps=live.factory(harness))
+
+    assert code == harness.EXIT_REFUSED
+    assert out.read_text() == 'pre-registered\n'
+    err = capsys.readouterr().err
+    assert err.startswith('error: ')
+    assert str(out) in err
 
 
 def test_preregister_refuses_an_incumbent_outside_the_envelope(harness, live, tmp_path, capsys):

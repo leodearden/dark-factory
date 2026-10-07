@@ -19,6 +19,7 @@ from fused_memory.arm_harness.checks import control_variance_check
 from fused_memory.arm_harness.frozen_model import FrozenModel
 from fused_memory.arm_harness.llm_metrics import (
     GraphSamenessDetails,
+    graph_sameness_details,
     nearest_rank,
     ok_token_usages,
 )
@@ -108,6 +109,33 @@ class PreregistrationInputs(FrozenModel):
     incumbent_latency_p95_ms: float
     incumbent_latency_max_ms: float
 
+    @model_validator(mode='after')
+    def _is_a_valid_preregistration(self) -> Self:
+        arm_a, arm_b = self.control_arm_ids
+        if arm_a == arm_b:
+            raise ValueError(f'control_arm_ids name arm {arm_a!r} twice; a control pair is two')
+        require_incumbent_latency_valid(
+            self.envelope, self.incumbent_latency_p95_ms, self.incumbent_latency_max_ms
+        )
+        return self
+
+
+def require_incumbent_latency_valid(
+    envelope: LatencyEnvelope, p95_ms: float, max_ms: float
+) -> None:
+    """The incumbent's p95 lies inside its own envelope and at or below its slowest episode."""
+    if not envelope.admits(p95_ms):
+        raise PreregistrationError(
+            f'the incumbent latency p95 {p95_ms} ms is not inside the envelope bound '
+            f'{envelope.p95_bound_ms} ms: an envelope the incumbent fails is not a valid '
+            'pre-registration'
+        )
+    if p95_ms > max_ms:
+        raise PreregistrationError(
+            f'the incumbent latency p95 {p95_ms} ms exceeds its slowest ok episode {max_ms} ms, '
+            'so the p95 records and the outcomes are not one measurement'
+        )
+
 
 def derive_preregistration_inputs(
     run_a: RunManifest,
@@ -116,25 +144,23 @@ def derive_preregistration_inputs(
     run_b: RunManifest,
     records_b: Sequence[MetricsRecord],
     outcomes_b: Sequence[EpisodeOutcome],
-    sameness_b: GraphSamenessDetails,
 ) -> PreregistrationInputs:
-    """Refuses unless the pair passes control-check and the incumbent sits inside its envelope."""
+    """Refuses unless the pair passes control-check, B's graph-sameness was measured against
+    A's outcomes, and the incumbent sits inside its envelope."""
     _require_control_checks_pass(run_a, records_a, run_b, records_b)
     for run, outcomes in ((run_a, outcomes_a), (run_b, outcomes_b)):
         _require_outcomes_of(run, outcomes)
+    _require_sameness_recorded(run_b, records_b)
     envelope = latency_envelope(_shared_episode_timeout(run_a, run_b))
+    sameness = graph_sameness_details(outcomes_b, outcomes_a)
     margins = derive_margins(
         records_a,
         records_b,
-        episode_values={LlmMetricId.GRAPH_SAMENESS: _sameness_values(run_b, sameness_b)},
+        episode_values={LlmMetricId.GRAPH_SAMENESS: _sameness_values(run_b, sameness)},
     )
     p95_ms = max(_latency_p95_ms(records_a), _latency_p95_ms(records_b))
-    if not envelope.admits(p95_ms):
-        raise PreregistrationError(
-            f'the incumbent latency p95 {p95_ms} ms is not inside the envelope bound '
-            f'{envelope.p95_bound_ms} ms: an envelope the incumbent fails is not a valid '
-            'pre-registration'
-        )
+    max_ms = max(o.duration_ms for o in (*outcomes_a, *outcomes_b) if o.ok)
+    require_incumbent_latency_valid(envelope, p95_ms, max_ms)
     return PreregistrationInputs(
         schema_version=1,
         control_arm_ids=(run_a.spec.arm_id, run_b.spec.arm_id),
@@ -144,7 +170,7 @@ def derive_preregistration_inputs(
         envelope=envelope,
         call_profile=call_profile(outcomes_a, outcomes_b),
         incumbent_latency_p95_ms=p95_ms,
-        incumbent_latency_max_ms=max(o.duration_ms for o in (*outcomes_a, *outcomes_b) if o.ok),
+        incumbent_latency_max_ms=max_ms,
     )
 
 
@@ -185,13 +211,21 @@ def _shared_episode_timeout(run_a: RunManifest, run_b: RunManifest) -> float:
     return timeout_a
 
 
-def _sameness_values(run_b: RunManifest, sameness_b: GraphSamenessDetails) -> tuple[float, ...]:
-    if not sameness_b.episodes:
+def _require_sameness_recorded(run_b: RunManifest, records_b: Sequence[MetricsRecord]) -> None:
+    if not any(r.metric.metric_id == LlmMetricId.GRAPH_SAMENESS for r in records_b):
         raise PreregistrationError(
-            f'the graph-sameness comparison of {run_b.spec.arm_id!r} against its reference '
-            'holds no episode'
+            f'control run {run_b.spec.arm_id!r} reports no graph-sameness: run B with '
+            "--reference-outcomes <A's outcomes.jsonl> so its self-agreement is measured"
         )
-    return tuple(episode.entity_jaccard for episode in sameness_b.episodes)
+
+
+def _sameness_values(run_b: RunManifest, sameness: GraphSamenessDetails) -> tuple[float, ...]:
+    if not sameness.episodes:
+        raise PreregistrationError(
+            f'the graph-sameness comparison of {run_b.spec.arm_id!r} against run A '
+            'holds no episode ok in both'
+        )
+    return tuple(episode.entity_jaccard for episode in sameness.episodes)
 
 
 def _latency_p95_ms(records: Sequence[MetricsRecord]) -> float:

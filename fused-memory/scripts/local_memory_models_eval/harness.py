@@ -55,11 +55,7 @@ from fused_memory.arm_harness.corpus import (
     select_replay_items,
 )
 from fused_memory.arm_harness.instrument_checks import CheckResult
-from fused_memory.arm_harness.llm_metrics import (
-    GRAPH_SAMENESS_DETAILS_FILENAME,
-    GraphSamenessDetails,
-    TokenAccountingError,
-)
+from fused_memory.arm_harness.llm_metrics import TokenAccountingError
 from fused_memory.arm_harness.margins import MarginDerivationError
 from fused_memory.arm_harness.metrics_record import (
     IndexConfiguration,
@@ -309,18 +305,14 @@ def _read_outcomes(path: Path) -> tuple[EpisodeOutcome, ...]:
         raise _Refusal(EXIT_REFUSED, f'{path} is not a readable outcomes file: {error}') from error
 
 
-def _load_sameness(run_dir: Path) -> GraphSamenessDetails:
-    path = run_dir / GRAPH_SAMENESS_DETAILS_FILENAME
-    if not path.is_file():
+def _fresh_output(path: Path) -> Path:
+    if path.exists():
         raise _Refusal(
             EXIT_REFUSED,
-            f'{run_dir} has no {GRAPH_SAMENESS_DETAILS_FILENAME}: run B with '
-            "--reference-outcomes <A's outcomes.jsonl> so its graph-sameness is measured",
+            f'{path} already exists; pre-registered inputs are never overwritten, so write '
+            'to a new path',
         )
-    try:
-        return GraphSamenessDetails.model_validate_json(path.read_text())
-    except (OSError, ValueError) as error:
-        raise _Refusal(EXIT_REFUSED, f'{path} is not readable sameness details: {error}') from error
+    return path
 
 
 def _scratch_graph(
@@ -461,6 +453,7 @@ def _cmd_control_check(args: argparse.Namespace, deps: DepsFactory) -> int:
 
 
 def _cmd_preregister(args: argparse.Namespace, deps: DepsFactory) -> int:
+    out = _fresh_output(args.out)
     run_a, records_a = _load_control_run(args.run_a)
     run_b, records_b = _load_control_run(args.run_b)
     inputs = derive_preregistration_inputs(
@@ -470,11 +463,10 @@ def _cmd_preregister(args: argparse.Namespace, deps: DepsFactory) -> int:
         run_b,
         records_b,
         _read_outcomes(args.run_b / OUTCOMES_FILENAME),
-        _load_sameness(args.run_b),
     )
-    atomic_write_text(args.out, serialize_preregistration_inputs(inputs), mkdir=True)
+    atomic_write_text(out, serialize_preregistration_inputs(inputs), mkdir=True)
     _print_preregistration(inputs)
-    print(f'wrote: {args.out}')
+    print(f'wrote: {out}')
     return EXIT_OK
 
 
@@ -606,7 +598,9 @@ def _build_parser() -> argparse.ArgumentParser:
     preregister.add_argument(
         '--run-b', type=Path, required=True, help="the control run with A's reference outcomes"
     )
-    preregister.add_argument('--out', type=Path, required=True, help='the inputs JSON to write')
+    preregister.add_argument(
+        '--out', type=Path, required=True, help='the inputs JSON to write; never overwritten'
+    )
     preregister.set_defaults(handler=_cmd_preregister)
 
     topology = commands.add_parser('topology', help="a scratch graph's topology hash")
