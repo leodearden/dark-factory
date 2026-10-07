@@ -14,6 +14,7 @@ against the gate's own ``check_require``. All three scripts are loaded by path
 from __future__ import annotations
 
 import functools
+import json
 import types
 from itertools import chain
 from pathlib import Path
@@ -378,3 +379,53 @@ def test_skipped_arms_are_recorded_with_reasons() -> None:
     cases[taken] = [dict(row, arm=taken) for row in cases.pop(SOL)]
     with pytest.raises(ValueError, match='skipped'):
         _build(arms=arms, cases_by_arm=cases)
+
+
+# --- step 5: best_config is the winner's candidate doc ------------------------------
+
+QUALIFYING_BOUNDS = [
+    ('quality.misfile_rate_of_attaches', '<=', '0.3'),
+    ('selection.cost_per_write_usd', '<=', CHEAP),
+]
+UNMET_BOUNDS = [('population.n_judge_band', '>=', '5')]
+
+
+@pytest.mark.parametrize(
+    ('spec', 'winner', 'gate_exit'),
+    [(QUALIFYING_BOUNDS, PRE_PSI, 0), (UNMET_BOUNDS, SOL, 1)],
+    ids=['winner-qualified', 'fallback'],
+)
+def test_best_config_copies_the_winner_verbatim(
+    spec: list[tuple[str, str, str]], winner: str, gate_exit: int, tmp_path: Path,
+) -> None:
+    cases = _three_arm_cases()
+    matrix = _build(cases_by_arm=cases, bounds=[_bound(*bound) for bound in spec])
+    assert matrix['winner'] == winner
+    [row] = [row for row in _scored_rows(matrix) if row['arm'] == winner]
+    oracle = _mod_iota().score_pairs(chain(*cases.values()), VERDICTS, reference_arm=REFERENCE)
+
+    best = _mod().best_config(matrix)
+
+    assert set(best) == {'quality', 'selection', 'population', 'provenance'}
+    assert best['quality'] == row['quality'] == oracle['arms'][winner]['quality']
+    assert best['selection'] == row['selection']
+    assert set(best['selection']) == {
+        'judge_provider', 'judge_model', 'judge_reasoning_effort', 'judge_candidate_count',
+        'wording', 'field_chars', 'p95_judge_seconds', 'cost_per_write_usd',
+    }
+    assert best['population'] == matrix['population']
+    assert set(best['population']) == {
+        'n_writes', 'n_judge_band', 'projects', 'frozen_at', 'snapshot_sha256',
+    }
+    assert best['provenance'] == {
+        'arm': winner,
+        'reference_arm': matrix['reference_arm'],
+        'meets_every_bound': row['bounds']['met'],
+        'failed_bounds': [c['check'] for c in row['bounds']['checks'] if not c['ok']],
+    }
+    assert '"false_contested_rate":' in json.dumps(best, indent=2)
+
+    path = tmp_path / 'best_config.json'
+    path.write_text(json.dumps(best, indent=2))
+    requires = [arg for bound in spec for arg in ('--require', 'best', *bound)]
+    assert _mod_gate().main(['--gate', 'G', '--report', 'best', str(path), *requires]) == gate_exit
