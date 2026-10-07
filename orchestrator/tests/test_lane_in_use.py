@@ -9,6 +9,7 @@ dark-factory's own spawn points rather than a /proc scan, is decided in
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -17,6 +18,8 @@ from pathlib import Path
 import pytest
 from escalation.queue import EscalationQueue
 
+from orchestrator.config import GitConfig
+from orchestrator.git_ops import GitOps
 from orchestrator.lane_lifecycle import LaneLifecycle, LaneState
 
 LANE_NAME = '_lane-0'
@@ -260,3 +263,144 @@ class TestResetStaleInUse:
         assert swept.reset_stale_in_use() == []
 
         assert self._snapshot(tmp_path, [*self.STALE, *self.UNTOUCHED]) == settled
+
+
+def _git_ops(tmp_path: Path, pool_size: int = 0) -> GitOps:
+    """A pure-FS GitOps (these tests never shell out to git), pooled when
+    *pool_size* > 0. Mirrors test_task_verify_lease.py::_git_ops."""
+    project_root = tmp_path / 'project'
+    project_root.mkdir(exist_ok=True)
+    config = GitConfig(
+        main_branch='main',
+        branch_prefix='task/',
+        remote='origin',
+        worktree_dir='.worktrees',
+        push_after_advance=False,
+        warm_lane_pool=pool_size > 0,
+    )
+    return GitOps(config, project_root, warm_lane_pool_size=pool_size)
+
+
+async def _assigned_lane(git_ops: GitOps, task_id: str = '42') -> Path:
+    """Assign the first free pool lane to *task_id* through the pool, the sole
+    ASSIGNED writer, which mirrors it onto the durable record."""
+    pool = git_ops.warm_lane_pool
+    assert pool is not None
+    acquired = await pool.acquire_for(
+        task_id, title=f'demo-{task_id}', branch=f'task/{task_id}',
+    )
+    assert acquired is not None
+    lane, _reused = acquired
+    lane.mkdir(parents=True, exist_ok=True)
+    return lane
+
+
+def _lane_state(git_ops: GitOps, lane: Path) -> str:
+    return _on_disk(git_ops.worktree_base, lane.name)['state']
+
+
+def _assignment(git_ops: GitOps, lane: Path) -> tuple[str, str, str]:
+    record = _on_disk(git_ops.worktree_base, lane.name)
+    return record['task_id'], record['title'], record['branch']
+
+
+@pytest.mark.asyncio
+class TestLaneInUseSpan:
+    async def test_lane_reads_in_use_inside_the_span_and_assigned_after(
+        self, tmp_path: Path,
+    ):
+        git_ops = _git_ops(tmp_path, pool_size=1)
+        lane = await _assigned_lane(git_ops)
+        assert _lane_state(git_ops, lane) == 'assigned'
+
+        async with git_ops.lane_in_use(lane):
+            inside = _lane_state(git_ops, lane)
+            assignment_inside = _assignment(git_ops, lane)
+
+        assert inside == 'in_use'
+        assert _lane_state(git_ops, lane) == 'assigned'
+        assert assignment_inside == _assignment(git_ops, lane) == (
+            '42', 'demo-42', 'task/42',
+        )
+
+    async def test_a_cold_worktree_is_not_tracked(self, tmp_path: Path):
+        git_ops = _git_ops(tmp_path, pool_size=1)
+        cold = git_ops.worktree_base / '3076'
+        cold.mkdir(parents=True)
+        ran = False
+
+        async with git_ops.lane_in_use(cold):
+            ran = True
+
+        assert ran
+        assert not (git_ops.worktree_base / '.lane-state').exists()
+
+    async def test_a_gitops_without_a_pool_tracks_nothing(self, tmp_path: Path):
+        git_ops = _git_ops(tmp_path)
+        assert git_ops.warm_lane_pool is None
+        lane = git_ops.worktree_base / LANE_NAME
+        lane.mkdir(parents=True)
+        ran = False
+
+        async with git_ops.lane_in_use(lane):
+            ran = True
+
+        assert ran
+        assert not (git_ops.worktree_base / '.lane-state').exists()
+
+    async def test_no_lane_tracks_nothing(self, tmp_path: Path):
+        git_ops = _git_ops(tmp_path, pool_size=1)
+        ran = False
+
+        async with git_ops.lane_in_use(None):
+            ran = True
+
+        assert ran
+        assert not (git_ops.worktree_base / '.lane-state').exists()
+
+    async def test_a_raising_body_propagates_and_the_lane_returns_to_assigned(
+        self, tmp_path: Path,
+    ):
+        git_ops = _git_ops(tmp_path, pool_size=1)
+        lane = await _assigned_lane(git_ops)
+
+        with pytest.raises(RuntimeError, match='child failed'):
+            async with git_ops.lane_in_use(lane):
+                raise RuntimeError('child failed')
+
+        assert _lane_state(git_ops, lane) == 'assigned'
+
+    async def test_a_cancelled_body_returns_the_lane_to_assigned(self, tmp_path: Path):
+        git_ops = _git_ops(tmp_path, pool_size=1)
+        lane = await _assigned_lane(git_ops)
+        entered = asyncio.Event()
+
+        async def _hold_forever() -> None:
+            async with git_ops.lane_in_use(lane):
+                entered.set()
+                await asyncio.Event().wait()
+
+        holder = asyncio.create_task(_hold_forever())
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        assert _lane_state(git_ops, lane) == 'in_use'
+        holder.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await holder
+
+        assert _lane_state(git_ops, lane) == 'assigned'
+
+    async def test_a_released_lane_is_never_written(self, tmp_path: Path):
+        git_ops = _git_ops(tmp_path, pool_size=1)
+        lane = await _assigned_lane(git_ops)
+        pool = git_ops.warm_lane_pool
+        assert pool is not None
+        await pool.release(lane)
+        record_path = _record_path(git_ops.worktree_base, lane.name)
+        released = record_path.read_bytes()
+        assert json.loads(released)['state'] == 'released'
+
+        async with git_ops.lane_in_use(lane):
+            inside = record_path.read_bytes()
+
+        assert inside == released
+        assert record_path.read_bytes() == released
