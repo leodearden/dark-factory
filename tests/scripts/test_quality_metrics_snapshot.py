@@ -436,6 +436,80 @@ class TestTheImportGraph:
 
 
 # ---------------------------------------------------------------------------
+# The tests-kind measures: what a test reaches inside first-party modules.
+
+_TEST_MOD = (
+    'from unittest.mock import patch\n'
+    'from pkg import mod\n'
+    '\n'
+    'def test_it(monkeypatch):\n'
+    "    with patch('pkg.mod._x'), patch('pkg.mod.public'), patch.object(mod, '_y'), "
+    "patch('os._exit'):\n"
+    '        assert mod._x is not None\n'
+    '        assert mod.public\n'
+)
+
+_PATCHING: dict[str, str] = {
+    'alpha/src/pkg/__init__.py': '',
+    'alpha/src/pkg/mod.py': '_x = 1\n_y = 2\npublic = 3\n',
+    'alpha/src/pkg/_impl.py': 'thing = 1\n',
+    'alpha/tests/test_mod.py': _TEST_MOD,
+    'alpha/tests/test_impl.py': (
+        "from unittest.mock import patch\n\ndef test_impl():\n"
+        "    with patch('pkg._impl.thing'):\n        pass\n"
+    ),
+    'alpha/tests/test_twice.py': (
+        'from unittest.mock import patch\n\n'
+        "def test_a():\n    with patch('pkg.mod._y'), patch('pkg.mod._x'):\n        pass\n\n"
+        "def test_b():\n    with patch('pkg.mod._x'):\n        pass\n"
+    ),
+    'beta/src/beta/b.py': 'B = 1\n',
+}
+
+_SRC_ONLY_FIELDS = frozenset({
+    'module', 'package_init', 'function_local_imports', 'reexport_names',
+    'reach_back_imports', 'fan_out', 'fan_in_src', 'fan_in_tests',
+})
+
+
+class TestTheTestsKindMeasures:
+    @pytest.fixture
+    def files(self, tmp_path: Path) -> dict[str, Any]:
+        return _measured(tmp_path, _PATCHING)['files']
+
+    def test_private_names_patched_by_string_or_object_path(self, files: dict[str, Any]) -> None:
+        # Row 10: the public leaf and the third-party os._exit do not count, and
+        # patch.object(mod, '_y') resolves through `from pkg import mod`.
+        assert files['alpha/tests/test_mod.py']['private_patch_targets'] == [
+            'pkg.mod._x',
+            'pkg.mod._y',
+        ]
+
+    def test_a_private_module_segment_counts(self, files: dict[str, Any]) -> None:
+        assert files['alpha/tests/test_impl.py']['private_patch_targets'] == ['pkg._impl.thing']
+
+    def test_private_reads_are_the_shared_measure(self, files: dict[str, Any]) -> None:
+        reads = files['alpha/tests/test_mod.py']['private_reads']
+        assert reads == source_measures.private_reads(_TEST_MOD, path='test_mod.py')
+        assert reads >= 1
+
+    def test_a_tests_record_has_exactly_the_contract_fields(self, files: dict[str, Any]) -> None:
+        record = files['alpha/tests/test_mod.py']
+        assert set(record) == {
+            'member', 'kind', 'blob', 'lines', 'prose_lines', 'prose_ratio',
+            'cognitive_total', 'cognitive_max', 'cognitive_max_function', 'functions',
+            'private_patch_targets', 'private_reads',
+        }
+        assert not _SRC_ONLY_FIELDS & set(record)
+
+    def test_targets_are_distinct_and_sorted(self, files: dict[str, Any]) -> None:
+        assert files['alpha/tests/test_twice.py']['private_patch_targets'] == [
+            'pkg.mod._x',
+            'pkg.mod._y',
+        ]
+
+
+# ---------------------------------------------------------------------------
 # Refusals: exit 2, the cause named on stderr, nothing written.
 
 
