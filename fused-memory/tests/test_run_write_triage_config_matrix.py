@@ -14,6 +14,7 @@ against the gate's own ``check_require``. All three scripts are loaded by path
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import types
 from itertools import chain
@@ -429,3 +430,92 @@ def test_best_config_copies_the_winner_verbatim(
     path.write_text(json.dumps(best, indent=2))
     requires = [arg for bound in spec for arg in ('--require', 'best', *bound)]
     assert _mod_gate().main(['--gate', 'G', '--report', 'best', str(path), *requires]) == gate_exit
+
+
+# --- step 7: μ refuses inputs that drifted from what π published ----------------------
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+
+
+def _publish(root: Path, cases_by_arm: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    """Write each arm's rows under *root* and return a population doc that pins their digests."""
+    arms = []
+    for provenance in THREE_ARMS:
+        path = root / provenance['cases_path']
+        _write_rows(path, cases_by_arm[provenance['arm']])
+        arms.append(dict(provenance, cases_sha256=_sha256(path)))
+    return _population(arms, 4)
+
+
+def _read(doc: dict[str, Any], root: Path) -> dict[str, list[dict[str, Any]]]:
+    return _mod().read_arm_cases(_mod().Population.from_artifact(doc), root)
+
+
+def test_read_arm_cases_returns_rows_keyed_by_arm(tmp_path: Path) -> None:
+    cases = _three_arm_cases()
+    doc = _publish(tmp_path, cases)
+
+    assert _read(doc, tmp_path) == cases
+
+
+def test_read_arm_cases_refuses_a_digest_mismatch(tmp_path: Path) -> None:
+    doc = _publish(tmp_path, _three_arm_cases())
+    path = tmp_path / THREE_ARMS[1]['cases_path']
+    expected = _sha256(path)
+    with path.open('a') as handle:
+        handle.write('\n')
+
+    with pytest.raises(_mod().MatrixInputError) as refusal:
+        _read(doc, tmp_path)
+    assert issubclass(_mod().MatrixInputError, ValueError)
+    message = str(refusal.value)
+    assert all(part in message for part in (PRE_PSI, str(path), expected, _sha256(path)))
+
+
+def test_read_arm_cases_refuses_a_missing_file(tmp_path: Path) -> None:
+    doc = _publish(tmp_path, _three_arm_cases())
+    path = tmp_path / THREE_ARMS[2]['cases_path']
+    path.unlink()
+
+    with pytest.raises(_mod().MatrixInputError) as refusal:
+        _read(doc, tmp_path)
+    message = str(refusal.value)
+    assert all(part in message for part in (SOL, str(path), '--data-root'))
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'), [('arm', 'other'), ('snapshot_sha256', 'another-snapshot')],
+)
+def test_read_arm_cases_refuses_rows_of_another_arm_or_snapshot(
+    field: str, value: str, tmp_path: Path,
+) -> None:
+    cases = _three_arm_cases()
+    cases[REFERENCE][2] = dict(cases[REFERENCE][2], **{field: value})
+    doc = _publish(tmp_path, cases)
+
+    with pytest.raises(_mod().MatrixInputError) as refusal:
+        _read(doc, tmp_path)
+    message = str(refusal.value)
+    assert REFERENCE in message
+    assert value in message
+
+
+def test_build_matrix_refuses_an_arm_whose_judge_band_disagrees_with_the_population() -> None:
+    with pytest.raises(_mod().MatrixInputError) as refusal:
+        _build(n_judge_band=5)
+    message = str(refusal.value)
+    assert REFERENCE in message
+    assert '4' in message and '5' in message
+
+
+def test_build_matrix_propagates_iota_refusal() -> None:
+    verdicts = [v for v in VERDICTS if (v['entry_id'], v['target_id']) != ('w3', 't3')]
+
+    with pytest.raises(_mod_iota().IncompleteCorpusError, match='w3 t3'):
+        _build(verdicts=verdicts)
