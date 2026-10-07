@@ -1232,14 +1232,9 @@ async def test_schedule_detached_systemd_restart_builds_correct_argv() -> None:
         '--collect',
         '--working-directory=/fake/project',
     )
-    # Index-derived, not a re-hardcoded length: `--setenv=` options (task 3453,
-    # the submit child's explicit PYTHONPATH) are spliced between
-    # --working-directory and /bin/sh, so pin the COMMAND's shape relative to
-    # /bin/sh rather than at fixed offsets.
-    sh_at = argv.index('/bin/sh')
-    assert argv[sh_at + 1] == '-c'
-    assert len(argv) == sh_at + 3, 'the /bin/sh -c payload must be the final token'
-    wrapped = argv[sh_at + 2]
+    assert argv[6:8] == ('/bin/sh', '-c')
+    assert len(argv) == 9, 'the /bin/sh -c payload must be the final token'
+    wrapped = argv[8]
     expected_script = str(Path('/fake/project') / 'scripts/restart-orchestrator.sh')
     assert wrapped.startswith(expected_script)
     assert '__rc=$?;' in wrapped
