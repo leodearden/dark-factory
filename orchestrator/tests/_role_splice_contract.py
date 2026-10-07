@@ -59,8 +59,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import ClassVar
 
-from orchestrator.agents.roles import ROLES, AgentRole
+from orchestrator.agents.roles import GREP_LOOKAROUND_GUIDANCE, ROLES, AgentRole
 
 # A splice unit opens with its own ``\n## `` heading, so "spliced between the
 # identity paragraph and the role's first real section" is exactly "its heading
@@ -467,3 +468,123 @@ def bash_capable_unpinned_contract(
         capability_description='a literal system_prompt and unqualified `Bash`',
         all_roles=all_roles,
     )
+
+
+def _joined(*parts: str) -> str:
+    """Join the non-empty remedy parts, so an omitted note leaves no stray space."""
+    return ' '.join(part for part in parts if part)
+
+
+@dataclass(frozen=True)
+class PreambleTailBlock:
+    """A census block appended at the tail of roles.py::_BASH_CAPABLE_ROLE_PREAMBLE.
+
+    It carries the remedy prose only that block can state.
+    """
+
+    constant_name: str
+    constant: str
+    restore_remedy: str
+    brace_remedy: str
+    excluded_roles_remedy: str
+    carrier_note: str = ''
+    order_note: str = ''
+    all_roles: Mapping[str, AgentRole] = field(default_factory=lambda: ROLES)
+
+    @property
+    def contract(self) -> SpliceContract:
+        return bash_capable_unpinned_contract(
+            self.constant_name, self.constant, all_roles=self.all_roles
+        )
+
+
+class PreambleTailContractTests:
+    """The eight invariants every preamble-tail block holds.
+
+    Subclass it as ``Test<Block>Splice`` in the block's own module and set
+    ``block``. The base has no ``Test`` prefix, so pytest never collects it bare.
+    """
+
+    block: ClassVar[PreambleTailBlock]
+
+    def test_guidance_is_nonempty(self) -> None:
+        """The sole guard against every containment test passing on an emptied constant."""
+        assert_nonempty(
+            self.block.constant_name, self.block.constant, remedy=self.block.restore_remedy
+        )
+
+    def test_guidance_is_brace_free(self) -> None:
+        """Held brace-free so it stays safe at any future interpolating splice site."""
+        assert_brace_free(
+            self.block.constant_name, self.block.constant, remedy=self.block.brace_remedy
+        )
+
+    def test_guidance_opens_its_own_section(self) -> None:
+        """The block opens with its own ``\\n## `` heading."""
+        assert self.block.constant.startswith(MARKDOWN_HEADING), (
+            f'{self.block.constant_name} does not start with MARKDOWN_HEADING, so '
+            'at the tail of _BASH_CAPABLE_ROLE_PREAMBLE it would read as an unheaded '
+            'continuation of whichever block precedes it. Give it a leading blank '
+            'line and a `## ` heading.'
+        )
+
+    def test_role_set_matches_bash_capability(self) -> None:
+        """Premise tripwire: the hand-maintained set equals the derived one."""
+        self.block.contract.assert_role_set_matches_capability(
+            remedy=_joined(
+                "A role's `Bash` grant changed, or a role was added. Update "
+                f'BASH_CAPABLE_UNPINNED_ROLES to match; if {self.block.constant_name}\'s '
+                'carriers should now differ from that shared set, give it its own '
+                'SpliceContract with an explicit set instead.',
+                self.block.carrier_note,
+            ),
+        )
+
+    def test_every_bash_capable_role_carries_guidance(self) -> None:
+        """Every Bash-capable role with a literal prompt carries the block."""
+        self.block.contract.assert_every_role_carries(
+            remedy=(
+                f'Append {self.block.constant_name} to the tail of '
+                'roles.py::_BASH_CAPABLE_ROLE_PREAMBLE; that one composite reaches '
+                'every Bash-capable role.'
+            ),
+        )
+
+    def test_no_other_role_carries_guidance(self) -> None:
+        """The negative half: no role outside the set carries the block."""
+        self.block.contract.assert_no_other_role_carries(
+            remedy=self.block.excluded_roles_remedy
+        )
+
+    def test_guidance_appears_exactly_once_per_role(self) -> None:
+        """No stale duplicate splice survives beside a new one.
+
+        ``absent_ok=True`` leaves a missing splice to fail only
+        `test_every_bash_capable_role_carries_guidance`: one root cause, one
+        failing test.
+        """
+        self.block.contract.assert_spliced_exactly_once(
+            absent_ok=True,
+            remedy=f'Keep exactly one {self.block.constant_name} term in the preamble.',
+        )
+
+    def test_guidance_lands_after_the_grep_block(self) -> None:
+        """The block lands anywhere after `GREP_LOOKAROUND_GUIDANCE` ends.
+
+        (a) Landing there keeps every earlier placement pin intact: the wait
+        block stays the first `##` heading, and the tool-call-rejection,
+        error-remedy and grep blocks each still abut their predecessor.
+
+        (b) Adjacency is deliberately NOT pinned (esc-5966-3): sibling census
+        blocks append to the same tail of `_BASH_CAPABLE_ROLE_PREAMBLE` in any
+        merge order.
+        """
+        self.block.contract.assert_lands_after(
+            follows=GREP_LOOKAROUND_GUIDANCE,
+            follows_name='GREP_LOOKAROUND_GUIDANCE',
+            remedy=_joined(
+                'Re-append it at the END of roles.py::_BASH_CAPABLE_ROLE_PREAMBLE; '
+                'moving it earlier breaks the adjacency pins of the blocks ahead of it.',
+                self.block.order_note,
+            ),
+        )
