@@ -8630,6 +8630,37 @@ class MemoryService:
             'tombstone_expires_at': record.expires_at,
         }
 
+    async def find_mem0_deletion_tombstones(self, project_id: str, prefix: str) -> list[dict]:
+        """Every readable tombstone whose memory id starts with *prefix*.
+
+        Feeds the uuid-prefix miss report (PRD C4, task 5323): the tombstone
+        store is keyed by the full id, so a prefix needs a listing. Each id is
+        decoded by :meth:`get_mem0_deletion_tombstone` and tagged with its
+        ``memory_id``. Shares that method's fail-safe posture: no ledger, or a
+        raising listing (one WARNING), yields ``[]``.
+        """
+        ledger = getattr(self, 'recon_ledger', None)
+        if ledger is None:
+            return []
+        try:
+            memory_ids = await ledger.mem0_tombstone_ids_with_prefix(project_id, prefix)
+        except Exception:
+            logger.warning(
+                'find_mem0_deletion_tombstones: tombstone store listing FAILED for '
+                'prefix=%s in project=%s; reporting no tombstones',
+                prefix,
+                project_id,
+                exc_info=True,
+                extra={'project_id': project_id, 'prefix': prefix},
+            )
+            return []
+        found: list[dict] = []
+        for memory_id in memory_ids:
+            decoded = await self.get_mem0_deletion_tombstone(project_id, memory_id)
+            if decoded is not None:
+                found.append({'memory_id': memory_id, **decoded})
+        return found
+
     # ------------------------------------------------------------------
     # Read: cycle_summary ledger presence (task 2436, τ1)
     # ------------------------------------------------------------------
