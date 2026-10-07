@@ -6,8 +6,9 @@ task and the clock) and executes the plan over two injected ports: an archive
 that must read back byte-identical before anything leaves the task, and a
 compare-and-swap commit.
 
-Import-light by design (stdlib + ``shared``), like ``consolidation_gate.py``:
-the interceptor imports this module, and the memory service is duck-typed.
+Import-light by design, like ``consolidation_gate.py``: stdlib, ``shared`` and
+the one ``context_assembler`` constant whose prefix it must never shed.  The
+interceptor imports this module, and the memory service is duck-typed.
 """
 
 from __future__ import annotations
@@ -23,6 +24,8 @@ from typing import Any
 
 from shared.task_statuses import TERMINAL
 
+from fused_memory.reconciliation.context_assembler import HINT_QUERIES_EXECUTED
+
 __all__ = [
     'ROTATE_THRESHOLD_BYTES',
     'ROTATE_TARGET_BYTES',
@@ -32,6 +35,7 @@ __all__ = [
     'ROLLUP_KEY',
     'RotationPlan',
     'TaskRewrite',
+    'near_duplicate_key',
     'plan_rotation',
     'task_fingerprint',
     'task_payload_bytes',
@@ -76,6 +80,29 @@ _DATED_KEY_RE = re.compile(
 )
 _HISTORY_SUFFIX = '_history'
 _METADATA_SECTION = '=== METADATA ENTRIES ROTATED OUT (verbatim JSON) ==='
+_QUERY_SECTION = '=== MEMORY HINT QUERIES ROTATED OUT ==='
+
+# Volatile tokens that make two otherwise-identical hint queries look different,
+# in the order they are replaced (a UUID holds hex runs, a date holds digit runs).
+_VOLATILE_TOKENS = (
+    (re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'), 'uuid'),
+    (re.compile(r'\d{4}[-_/]\d{2}[-_/]\d{2}'), 'date'),
+    (re.compile(r'(?<![0-9a-z])(?=[0-9a-f]*\d)[0-9a-f]{7,}(?![0-9a-z])'), 'hex'),
+    (re.compile(r'\d+'), 'n'),
+)
+_SEPARATORS_RE = re.compile(r'[\W_]+')
+
+
+def near_duplicate_key(query: str) -> str:
+    """Equal for hint queries differing only in case, spacing, punctuation, dates, ids, numbers."""
+    key = query.casefold()
+    for pattern, placeholder in _VOLATILE_TOKENS:
+        key = pattern.sub(f' {placeholder} ', key)
+    return _SEPARATORS_RE.sub(' ', key).strip()
+
+
+def archive_link_query(archive_memory_id: str, task_id: str) -> str:
+    return f'audit-trail rotation archive memory {archive_memory_id} (task {task_id})'
 
 
 @dataclass(frozen=True)
@@ -187,6 +214,7 @@ class RotationPlan:
     folded_keys: tuple[str, ...]
     prior_rotations: tuple[Any, ...]
     shed_history: Mapping[str, tuple[Any, ...]] = dataclasses.field(default_factory=dict)
+    shed_queries: tuple[str, ...] = ()
 
     @property
     def archive_text(self) -> str | None:
@@ -195,6 +223,8 @@ class RotationPlan:
         if self.shed_history:
             shed = {key: list(entries) for key, entries in self.shed_history.items()}
             sections.append(f'{_METADATA_SECTION}\n{_verbatim_json(shed)}')
+        if self.shed_queries:
+            sections.append('\n'.join([_QUERY_SECTION, *self.shed_queries]))
         if not sections:
             return None
         header = (
@@ -205,6 +235,8 @@ class RotationPlan:
 
     def render(self, archive_memory_id: str | None) -> TaskRewrite:
         metadata = dict(self.metadata)
+        if archive_memory_id is not None:
+            metadata = _with_archive_link(metadata, archive_link_query(archive_memory_id, self.task_id))
         metadata[ROLLUP_KEY] = {
             'history_keys': list(self.history_keys),
             'rotations': list(self.prior_rotations),
@@ -214,6 +246,55 @@ class RotationPlan:
 
 def _verbatim_json(value: Any) -> str:
     return json.dumps(value, indent=2, ensure_ascii=False)
+
+
+def _with_archive_link(metadata: dict[str, Any], link: str) -> dict[str, Any]:
+    hints = metadata.get('memory_hints', {'entities': [], 'queries': []})
+    if not isinstance(hints, dict) or not isinstance(hints.get('queries', []), list):
+        return metadata
+    return {**metadata, 'memory_hints': {**hints, 'queries': [*hints.get('queries', []), link]}}
+
+
+def _hint_queries(metadata: Mapping[str, Any]) -> list[str] | None:
+    """The dict-shaped ``memory_hints.queries``; None for any shape the bound leaves alone."""
+    hints = metadata.get('memory_hints')
+    queries = hints.get('queries') if isinstance(hints, dict) else None
+    if not isinstance(queries, list) or not all(isinstance(query, str) for query in queries):
+        return None
+    return queries
+
+
+def _bounded_query_indexes(queries: list[str]) -> set[int]:
+    """First occurrences only; the executed prefix plus the newest, up to HISTORY_KEEP."""
+    seen: set[str] = set()
+    unique: list[int] = []
+    for index, query in enumerate(queries):
+        key = near_duplicate_key(query)
+        if key not in seen:
+            seen.add(key)
+            unique.append(index)
+    executed, rest = unique[:HINT_QUERIES_EXECUTED], unique[HINT_QUERIES_EXECUTED:]
+    room = max(HISTORY_KEEP - len(executed), 0)
+    return {*executed, *rest[max(len(rest) - room, 0):]}
+
+
+def _bound_hint_queries(plan: RotationPlan) -> RotationPlan:
+    queries = _hint_queries(plan.metadata)
+    if queries is None:
+        return plan
+    kept = _bounded_query_indexes(queries)
+    if len(kept) == len(queries):
+        return plan
+    hints = {
+        **plan.metadata['memory_hints'],
+        'queries': [query for index, query in enumerate(queries) if index in kept],
+    }
+    shed = tuple(query for index, query in enumerate(queries) if index not in kept)
+    return dataclasses.replace(
+        plan,
+        metadata={**plan.metadata, 'memory_hints': hints},
+        shed_queries=(*plan.shed_queries, *shed),
+    )
 
 
 def _shed_history_entry(plan: RotationPlan, history_key: str) -> RotationPlan:
@@ -265,6 +346,8 @@ def plan_rotation(task: Mapping[str, Any], *, now: datetime) -> RotationPlan | N
         prior_rotations=prior.rotations,
     )
     plan = _trim_owned_arrays(plan, over=HISTORY_MAX, keep=HISTORY_KEEP)
-    if not plan.folded_keys and not plan.shed_history:
+    if len(_hint_queries(plan.metadata) or ()) > HISTORY_MAX:
+        plan = _bound_hint_queries(plan)
+    if not plan.folded_keys and not plan.shed_history and not plan.shed_queries:
         return None
     return plan
