@@ -2302,6 +2302,27 @@ def _worker_death_leg_note(label: str) -> str:
     )
 
 
+_LEG_FALLBACK_CATEGORY: dict[str, FailureCategory] = {
+    'test': FailureCategory.UNKNOWN_TEST_FAILURE,
+    'lint': FailureCategory.LINT_ERROR,
+    'type': FailureCategory.TYPE_ERROR,
+}
+
+
+def _classify_leg(
+    label: str, rc: int, output: str, timed_out: bool, cmd: str | None,
+) -> FailureCategory:
+    """The ONE per-leg classifier. ``classify_failure`` answers what the tool's
+    OUTPUT says; this adds what only verify knows, the leg's slot. It rewrites
+    only the UNKNOWN_TEST_FAILURE fall-through, so every more specific
+    diagnosis survives.
+    """
+    category = classify_failure(_tool_for_cmd(cmd), rc, output, timed_out)
+    if category != FailureCategory.UNKNOWN_TEST_FAILURE:
+        return category
+    return _LEG_FALLBACK_CATEGORY[label]
+
+
 def _summarize_checks(
     test_rc: int, test_out: str, test_timed_out: bool, test_cmd: str | None,
     lint_rc: int, lint_out: str, lint_timed_out: bool, lint_cmd: str | None,
@@ -2388,16 +2409,16 @@ def _summarize_checks(
 
     hint_parts = []
     per_check_categories: list[str] = []
-    for rc, out, to, cmd in (
-        (test_rc, test_out, test_timed_out, test_cmd),
-        (lint_rc, lint_out, lint_timed_out, lint_cmd),
-        (type_rc, type_out, type_timed_out, type_cmd),
+    for label, rc, out, to, cmd in (
+        ('test', test_rc, test_out, test_timed_out, test_cmd),
+        ('lint', lint_rc, lint_out, lint_timed_out, lint_cmd),
+        ('type', type_rc, type_out, type_timed_out, type_cmd),
     ):
         if rc != 0:
             h = _extract_cause_hint(out)
             if h:
                 hint_parts.append(h)
-            per_check_categories.append(classify_failure(_tool_for_cmd(cmd), rc, out, to))
+            per_check_categories.append(_classify_leg(label, rc, out, to, cmd))
     cause_hint = ' | '.join(hint_parts)
     category = _worst_category(per_check_categories) if per_check_categories else 'unknown_test_failure'
 

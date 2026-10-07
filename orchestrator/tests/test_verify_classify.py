@@ -3420,7 +3420,8 @@ class TestSummarizeChecksReportsEveryFailingLegCategory:
         """CONTROL: SIGSEGV is a genuine fault OF THE CODE UNDER TEST, not an
         external kill — it must stay RED and must never reach the per-leg list
         as 'infra_kill', or the veto gate would wave a segfaulting branch
-        through."""
+        through. Since task 4843 the red lint leg reports its gate,
+        lint_error, rather than unknown_test_failure."""
         from orchestrator.verify import _summarize_checks
 
         _, _, _, _, failing_leg_categories = _summarize_checks(
@@ -3429,7 +3430,7 @@ class TestSummarizeChecksReportsEveryFailingLegCategory:
             0, '', False, None,
             lint_duration=_MEASURED_LINT_DURATION,
         )
-        assert failing_leg_categories == ['unknown_test_failure']
+        assert failing_leg_categories == ['lint_error']
         assert 'infra_kill' not in failing_leg_categories
 
     def test_every_failing_leg_appears_in_test_lint_type_order(self):

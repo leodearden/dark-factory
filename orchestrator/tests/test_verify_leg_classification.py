@@ -230,7 +230,13 @@ class TestLegSlotNamesTheRedGate:
     @pytest.mark.asyncio
     async def test_briefing_names_the_lint_gate(self, tmp_path: Path):
         """The literal user-observable signal: the debugger's briefing says
-        lint_error, not unknown_test_failure."""
+        lint_error, not unknown_test_failure.
+
+        A task worktree always carries ``.task/``, and the briefing's
+        Category line renders only beside the attempt logs that
+        ``_persist_attempt_logs`` writes there.
+        """
+        (tmp_path / '.task').mkdir()
         config = OrchestratorConfig(
             project_root=tmp_path,
             test_command=_TEST_CMD,
