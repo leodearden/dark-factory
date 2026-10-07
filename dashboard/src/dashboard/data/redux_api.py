@@ -184,6 +184,9 @@ def shape_memory(
     series; ``delta_24h`` carries per-project ``{graphiti_nodes,
     mem0_memories}`` snapshots from ~24h ago for delta rendering.  All three
     are populated from metrics.db; absent / empty when history is sparse.
+
+    graphiti/mem0 ``connected`` is served as ``get_status`` measured it, and
+    null when unmeasured: an absent flag, or fused-memory itself unreachable.
     """
     spark_g = (sparks or {}).get('graphiti_nodes') or _EMPTY_SERIES
     spark_m = (sparks or {}).get('mem0_memories') or _EMPTY_SERIES
@@ -200,10 +203,9 @@ def shape_memory(
 
     if status.get('offline'):
         return {'MEMORY_STATUS': {
-            'graphiti': {'connected': False, 'node_count': 0, 'edge_count': 0, 'episode_count': 0,
+            'graphiti': {'connected': None, 'node_count': 0, 'edge_count': 0, 'episode_count': 0,
                          'spark': _empty_series_dict()},
-            'mem0': {'connected': False, 'memory_count': 0, 'spark': _empty_series_dict()},
-            'taskmaster': {'connected': False},
+            'mem0': {'connected': None, 'memory_count': 0, 'spark': _empty_series_dict()},
             'queue': queue_block,
             'projects': {},
             'wal': _shape_wal_status(wal),
@@ -214,7 +216,7 @@ def shape_memory(
         }, 'served_at': served_at.isoformat()}
 
     graphiti = dict(status.get('graphiti') or {})
-    graphiti.setdefault('connected', True)
+    graphiti['connected'] = graphiti.get('connected')
     for _key in ('node_count', 'edge_count', 'episode_count'):
         graphiti.setdefault(_key, 0)
     graphiti['spark'] = {
@@ -222,15 +224,12 @@ def shape_memory(
         'values': list(spark_g.get('values') or []),
     }
     mem0 = dict(status.get('mem0') or {})
-    mem0.setdefault('connected', True)
+    mem0['connected'] = mem0.get('connected')
     mem0.setdefault('memory_count', 0)
     mem0['spark'] = {
         'labels': list(spark_m.get('labels') or []),
         'values': list(spark_m.get('values') or []),
     }
-    taskmaster = dict(status.get('taskmaster') or {})
-    taskmaster.setdefault('connected', True)
-
     raw_projects = dict(status.get('projects') or {})
     enriched_projects = {pid: _project_block(pid, payload) for pid, payload in raw_projects.items()}
 
@@ -239,7 +238,6 @@ def shape_memory(
     return {'MEMORY_STATUS': {
         'graphiti': graphiti,
         'mem0': mem0,
-        'taskmaster': taskmaster,
         'queue': queue_block,
         'projects': enriched_projects,
         'wal': wal_block,
