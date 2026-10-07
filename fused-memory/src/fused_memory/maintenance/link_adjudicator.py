@@ -22,6 +22,7 @@ schema-bound output, every tool denied, no MCP servers, a neutral cwd.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections import Counter
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -376,11 +377,12 @@ class ClaudeShardAsker:
 
     async def __call__(self, shard: Shard) -> ShardReply:
         try:
+            brief = await asyncio.to_thread(self._brief_path.read_text, encoding='utf-8')
             result = await self._invoke(
                 usage_gate=None,
                 label=f'link-adjudicator[{shard.model}]',
                 prompt=render_user_prompt(shard),
-                system_prompt=render_system_prompt(self._brief_path.read_text(encoding='utf-8')),
+                system_prompt=render_system_prompt(brief),
                 cwd=neutral_cli_cwd(),
                 model=shard.model,
                 max_turns=self._max_turns,
