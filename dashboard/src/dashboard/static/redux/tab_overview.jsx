@@ -10,6 +10,7 @@ const {
 } = window.DF_TASK_SNAPSHOT;
 const { plainDatum } = window.DF_DATUM;
 const { writeQueue, queueCountsText, queueHealth, newestHourOps, opsTotals, opsCaption } = window.DF_MEMORY_READINGS;
+const { todaySpend, spendText } = window.DF_SPEND_READINGS;
 // The System health decisions (system_health.js); same CANONICAL note.
 const {
   graphitiHealth, mem0Health, taskStoreHealth, fusedMemoryHealth, reconHealth, walHealth, healthTone, healthSummary,
@@ -22,7 +23,6 @@ const { useState, useEffect } = React;
 // per polled endpoint by its URL with the query stripped).
 const EP_OVERVIEW = Object.freeze({
   orchestrators: '/api/v2/dashboard/orchestrators',
-  costs:         '/api/v2/dashboard/costs',
 });
 
 function StatusDot({ kind }) { return <span className={`status-dot ${kind}`}></span>; }
@@ -237,7 +237,7 @@ function OverviewTab({ paused }) {
           history={censusHistory(D, null, runningTile)} sparkColor={P[runningTile.tone]} />
         <StatTile label="Memory ops / min" datum={newestHourOps(D)} format={ops => (ops / 60).toFixed(1)} unit="ops"
           history={D.MEMORY_OPS.total} sparkColor={P.ok} hint="last 24h hourly" />
-        <StatTile label="Spend (today)" datum={plainDatum(D.COSTS.summary?.today, EP_OVERVIEW.costs)} format={spend => `$${spend.toFixed(2)}`}
+        <StatTile label="Spend (today)" datum={todaySpend(D)} format={spendText}
           delta={deltaPct != null ? `${deltaPct}%` : null}
           deltaDir={deltaPct != null ? (deltaPct < 0 ? 'down' : 'up') : null}
           history={costSpark} sparkColor={P.warn}

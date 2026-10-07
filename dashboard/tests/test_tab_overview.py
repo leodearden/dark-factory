@@ -306,6 +306,29 @@ class TestOverviewReadsTheMemoryReadings:
         ), f'the Activity timeline meta does not render opsCaption over opsTotals(D):\n{panel}'
 
 
+
+class TestOverviewReadsTheSpendReading:
+    """The Spend (today) tile reads today's spend through spend_readings.js, as the topbar does.
+
+    One reader for both surfaces, so they cannot disagree; the hole before
+    /costs delivers is executed in dashboard/tests/js/spend_readings.test.mjs.
+    """
+
+    def test_destructures_the_spend_reader_without_fallback(self, tab_overview_jsx_code):
+        destructure = re.search(
+            r'const\s*\{([^}]*)\}\s*=\s*window\.DF_SPEND_READINGS\s*;', tab_overview_jsx_code,
+        )
+        assert destructure, 'tab_overview.jsx does not destructure window.DF_SPEND_READINGS at module scope.'
+        assert not re.search(r'window\.DF_SPEND_READINGS\s*(\|\||&&|\?\?)', tab_overview_jsx_code)
+        bound = set(re.findall(r'\w+', destructure.group(1)))
+        assert {'todaySpend', 'spendText'} <= bound
+
+    def test_the_spend_tile_reads_todays_spend(self, overview_code):
+        tile = _stat_tile(overview_code, 'Spend (today)')
+        assert re.search(r'datum=\{\s*todaySpend\(\s*D\s*\)\s*\}\s+format=\{\s*spendText\s*\}', tile), (
+            f'the Spend (today) tile is not todaySpend(D) formatted by spendText:\n{tile}'
+        )
+
 def _health_rows_const(code):
     """The one const array holding the System health rows: (name, array text)."""
     bound = []
