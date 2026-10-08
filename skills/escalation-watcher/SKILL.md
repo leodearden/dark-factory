@@ -1407,10 +1407,10 @@ esc-id-citing correction block in the cluster's task descriptions, or the subjec
 advancing while the task is blocked/parked (tip-advance on an `in-progress` subject is ordinary
 work, not a signal).
 
-`triaged_by` is server-attributed from the stamping connection's `X-Escalation-Identity` header and
-cannot be spoofed by the caller — the identical non-spoofable attribution contract this skill
-already documents for `resolved_by` (see "Recognizing the supervised auto-watcher's resolutions"
-below).
+`triaged_by` is server-enforced when the stamping connection sends `X-Escalation-Identity` (the
+auto-watcher does), the same attribution contract this skill documents for `resolved_by` (see
+"Recognizing the supervised auto-watcher's resolutions" below); for a header-less interactive session
+it is a convention, not a guarantee — see "Shadow-mode standing-policy rulings (measurement only)".
 
 ### Refuting a premise: the claim's execution context, or it is not a refutation
 
