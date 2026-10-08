@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
+from shared.async_sqlite_base import CheckpointResult
 from test_daemon_connect_consolidation import assert_connection_thread_is_daemon
 
 from fused_memory.middleware.ticket_store import TicketStore, _new_ticket_id
@@ -657,3 +658,57 @@ async def test_mark_pending_failed_for_project_returns_reaped_ids(store):
     # Project B ticket stays pending.
     row_b = await store.get(b1)
     assert row_b['status'] == 'pending', f'B ticket was unexpectedly reaped: {row_b}'
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_write_does_not_discard_a_concurrent_submit(tmp_path):
+    """Cancelling one unit must not roll back another coroutine's in-flight submit.
+
+    Rollback is a property of the CONNECTION, and every coroutine shares the
+    store's one connection, so a cancelled unit that rolls back takes any other
+    coroutine's uncommitted INSERT with it — whose own commit then succeeds.
+    Measured before ``AtomicConnection``: the survivor ticket was LOST 3/3.
+    Same shape as
+    ``tests/test_recon_db_atomicity.py::test_a_cancelled_write_does_not_discard_a_concurrent_one``.
+    """
+    store = TicketStore(tmp_path / 'tickets.db')
+    await store.initialize()
+    try:
+        seed = await store.submit('p', '{}')
+        victim = asyncio.create_task(store.mark_pending_failed_for_project('p', reason='x'))
+        survivor = asyncio.create_task(store.submit('q', '{}'))
+        await asyncio.sleep(0)
+        victim.cancel()
+
+        _, tid = await asyncio.wait_for(
+            asyncio.gather(victim, survivor, return_exceptions=True), 10
+        )
+
+        assert isinstance(tid, str), tid
+        assert await store.get(tid) is not None, (
+            "the surviving submit is gone: the cancelled unit's connection-wide "
+            'rollback discarded it, and its own commit reported success'
+        )
+        seed_row = await store.get(seed)
+        assert seed_row is not None
+        assert seed_row['status'] == 'pending', (
+            'the cancelled reap left a partial write behind'
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_after_close_answers_unavailable(tmp_path):
+    """A checkpoint tick landing after ``close()`` answers the sentinel, never a raise.
+
+    ``server/main.py::_run_checkpoint_cycle`` runs on a timer against stores
+    whose shutdown it does not own, so this is an expected race.
+    """
+    store = TicketStore(tmp_path / 'tickets.db')
+    await store.initialize()
+    try:
+        await store.close()
+        assert await store.checkpoint() == CheckpointResult.unavailable()
+    finally:
+        await store.close()
