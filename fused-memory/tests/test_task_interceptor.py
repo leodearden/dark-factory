@@ -14,6 +14,7 @@ import pytest
 import pytest_asyncio
 from _fm_helpers import _init_git_repo, make_8df8_scenario
 from _fm_helpers import submit_and_resolve as _submit_and_resolve
+from shared.async_sqlite_base import CheckpointResult
 from shared.cli_invoke import AgentResult
 from shared.task_metadata_wire import coerce_task_metadata
 from shared.task_statuses import TaskStatus
@@ -7390,7 +7391,7 @@ async def test_main_wires_ticket_store_into_interceptor(
     assert store._db_path == tmp_path / 'tickets.db', (
         f'Expected db path {tmp_path / "tickets.db"}, got {store._db_path}'
     )
-    assert store._access is not None, 'TicketStore should be open after _build_ticket_store'
+    assert await store.checkpoint() != CheckpointResult.unavailable(), 'TicketStore should be open after _build_ticket_store'
 
     # Verify TaskInterceptor accepts and stores the ticket_store kwarg correctly.
     ti = TaskInterceptor(taskmaster, reconciler, event_buffer, ticket_store=store)

@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import aiosqlite
 import pytest
 import pytest_asyncio
 from _fm_helpers import poll_until
+from shared.async_sqlite_base import CheckpointResult
 
 import fused_memory.services.durable_queue as dq_module
 from fused_memory.services.durable_queue import DurableWriteQueue
@@ -670,41 +672,55 @@ class TestShutdown:
 
         # Workers should be cleaned up
         assert len(q._worker_tasks) == 0
-        assert q._access is None
+        assert await q.checkpoint() == CheckpointResult.unavailable()
 
 
 class TestDeleteDead:
-    """Tests for DurableWriteQueue.delete_dead(group_id, ids)."""
+    """Tests for DurableWriteQueue.delete_dead(group_id, ids).
 
-    async def _insert_dead_row(self, q, group_id: str = 'proj1') -> int:
-        """Insert a dead row directly via SQL and return its id."""
-        cursor = await q._require_access().connection.execute(
-            'INSERT INTO write_queue '
-            '(group_id, operation, payload, status, attempts, max_attempts, '
-            ' next_retry_at, created_at) '
-            "VALUES (?, 'add_episode', '{\"content\":\"dead\"}', 'dead', 3, 3, 0, ?)",
-            (group_id, time.time()),
-        )
-        await q._require_access().connection.commit()
-        return cursor.lastrowid  # type: ignore[return-value]
+    Rows are seeded and re-read through an independent connection to the
+    queue's database file, never through the queue's own connection.
+    """
 
-    async def _insert_pending_row(self, q, group_id: str = 'proj1') -> int:
-        """Insert a pending row directly via SQL and return its id."""
-        cursor = await q._require_access().connection.execute(
-            'INSERT INTO write_queue '
-            '(group_id, operation, payload, status, attempts, max_attempts, '
-            ' next_retry_at, created_at) '
-            "VALUES (?, 'add_episode', '{\"content\":\"pending\"}', 'pending', 0, 3, 0, ?)",
-            (group_id, time.time()),
-        )
-        await q._require_access().connection.commit()
-        return cursor.lastrowid  # type: ignore[return-value]
+    @pytest.fixture
+    def queue_file(self, tmp_path) -> Path:
+        """The database file of a queue whose ``data_dir`` is ``tmp_path / 'queue'``."""
+        return tmp_path / 'queue' / 'write_queue.db'
+
+    @staticmethod
+    async def _insert_row(queue_file: Path, group_id: str, status: str, attempts: int) -> int:
+        async with aiosqlite.connect(str(queue_file)) as db:
+            cursor = await db.execute(
+                'INSERT INTO write_queue '
+                '(group_id, operation, payload, status, attempts, max_attempts, '
+                ' next_retry_at, created_at) '
+                "VALUES (?, 'add_episode', ?, ?, ?, 3, 0, ?)",
+                (group_id, f'{{"content":"{status}"}}', status, attempts, time.time()),
+            )
+            await db.commit()
+        assert cursor.lastrowid is not None
+        return cursor.lastrowid
+
+    async def _insert_dead_row(self, queue_file: Path, group_id: str = 'proj1') -> int:
+        return await self._insert_row(queue_file, group_id, 'dead', 3)
+
+    async def _insert_pending_row(self, queue_file: Path, group_id: str = 'proj1') -> int:
+        return await self._insert_row(queue_file, group_id, 'pending', 0)
+
+    @staticmethod
+    async def _present_ids(queue_file: Path, ids: list[int]) -> set[int]:
+        async with aiosqlite.connect(str(queue_file)) as db:
+            rows = await db.execute_fetchall(
+                f"SELECT id FROM write_queue WHERE id IN ({','.join('?' * len(ids))})",
+                tuple(ids),
+            )
+        return {row[0] for row in rows}
 
     @pytest.mark.asyncio
-    async def test_bulk_delete_dead_rows(self, queue):
+    async def test_bulk_delete_dead_rows(self, queue, queue_file):
         """Bulk-deleting dead rows returns them in 'deleted' and removes them."""
-        id1 = await self._insert_dead_row(queue, 'proj1')
-        id2 = await self._insert_dead_row(queue, 'proj1')
+        id1 = await self._insert_dead_row(queue_file, 'proj1')
+        id2 = await self._insert_dead_row(queue_file, 'proj1')
 
         result = await queue.delete_dead(group_id='proj1', ids=[id1, id2])
 
@@ -726,9 +742,9 @@ class TestDeleteDead:
         assert sorted(result['not_found']) == [88888, 99999]
 
     @pytest.mark.asyncio
-    async def test_cross_project_ids_not_deleted(self, queue):
+    async def test_cross_project_ids_not_deleted(self, queue, queue_file):
         """Dead rows from proj-b are not deleted when calling with proj-a."""
-        id_b = await self._insert_dead_row(queue, 'proj-b')
+        id_b = await self._insert_dead_row(queue_file, 'proj-b')
 
         result = await queue.delete_dead(group_id='proj-a', ids=[id_b])
 
@@ -740,21 +756,18 @@ class TestDeleteDead:
         assert any(item['id'] == id_b for item in dead_b)
 
     @pytest.mark.asyncio
-    async def test_non_dead_status_ids_not_deleted(self, queue):
+    async def test_non_dead_status_ids_not_deleted(self, queue, queue_file):
         """Pending rows are silently skipped (land in 'not_found') and stay in table."""
-        id_pending = await self._insert_pending_row(queue, 'proj1')
+        id_pending = await self._insert_pending_row(queue_file, 'proj1')
 
         result = await queue.delete_dead(group_id='proj1', ids=[id_pending])
 
         assert result['deleted'] == []
         assert result['not_found'] == [id_pending]
 
-        # Row must still be present
-        cursor = await queue._require_access().connection.execute(
-            'SELECT id FROM write_queue WHERE id = ?', (id_pending,)
+        assert await self._present_ids(queue_file, [id_pending]) == {id_pending}, (
+            'Pending row must not be deleted'
         )
-        row = await cursor.fetchone()
-        assert row is not None, 'Pending row must not be deleted'
 
     @pytest.mark.asyncio
     async def test_empty_ids_no_op(self, queue):
@@ -764,11 +777,11 @@ class TestDeleteDead:
         assert result == {'deleted': [], 'not_found': []}
 
     @pytest.mark.asyncio
-    async def test_mixed_call_partitions_correctly(self, queue):
+    async def test_mixed_call_partitions_correctly(self, queue, queue_file):
         """Mixed input: valid dead, cross-project dead, non-existent, non-dead partitions."""
-        id_dead_proj1 = await self._insert_dead_row(queue, 'proj1')
-        id_dead_proj2 = await self._insert_dead_row(queue, 'proj2')
-        id_pending = await self._insert_pending_row(queue, 'proj1')
+        id_dead_proj1 = await self._insert_dead_row(queue_file, 'proj1')
+        id_dead_proj2 = await self._insert_dead_row(queue_file, 'proj2')
+        id_pending = await self._insert_pending_row(queue_file, 'proj1')
         id_nonexistent = 999999
 
         result = await queue.delete_dead(
@@ -781,7 +794,7 @@ class TestDeleteDead:
 
     @pytest.mark.asyncio
     async def test_chunks_large_id_lists_without_param_limit_error(
-        self, queue, monkeypatch
+        self, queue, queue_file, monkeypatch
     ):
         """Large id lists are processed in chunks without hitting SQLite variable limits.
 
@@ -792,11 +805,11 @@ class TestDeleteDead:
         monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
 
         # Insert 7 dead rows for proj1.
-        dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(7)]
+        dead_ids = [await self._insert_dead_row(queue_file, 'proj1') for _ in range(7)]
 
         # Insert 1 pending row for proj1 and 1 dead row for proj2 (both ineligible).
-        pending_id = await self._insert_pending_row(queue, 'proj1')
-        cross_id = await self._insert_dead_row(queue, 'proj2')
+        pending_id = await self._insert_pending_row(queue_file, 'proj1')
+        cross_id = await self._insert_dead_row(queue_file, 'proj2')
         nonexistent_id = 999999
 
         all_input_ids = dead_ids + [pending_id, cross_id, nonexistent_id]
@@ -817,7 +830,7 @@ class TestDeleteDead:
         assert any(item['id'] == cross_id for item in proj2_items)
 
     @pytest.mark.asyncio
-    async def test_exact_batch_size_boundary(self, queue, monkeypatch):
+    async def test_exact_batch_size_boundary(self, queue, queue_file, monkeypatch):
         """ids count == batch_size exercises the loop with zero remainder.
 
         An off-by-one in ``range(0, len(ids), step)`` would silently drop the
@@ -828,7 +841,7 @@ class TestDeleteDead:
 
         # Boundary cases: batch_size-1, batch_size, batch_size+1, 2*batch_size.
         for count in (2, 3, 4, 6):
-            dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(count)]
+            dead_ids = [await self._insert_dead_row(queue_file, 'proj1') for _ in range(count)]
             result = await queue.delete_dead(group_id='proj1', ids=dead_ids)
             assert sorted(result['deleted']) == sorted(dead_ids), (
                 f'All {count} dead rows must be deleted (batch_size boundary)'
@@ -836,7 +849,7 @@ class TestDeleteDead:
             assert result['not_found'] == []
 
     @pytest.mark.asyncio
-    async def test_all_ineligible_chunk_followed_by_eligible_chunk(self, queue, monkeypatch):
+    async def test_all_ineligible_chunk_followed_by_eligible_chunk(self, queue, queue_file, monkeypatch):
         """An all-ineligible first chunk does not clobber the deleted accumulator.
 
         If ``deleted`` were ever overwritten instead of unioned, the second
@@ -845,8 +858,8 @@ class TestDeleteDead:
         """
         monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
 
-        pending_ids = [await self._insert_pending_row(queue, 'proj1') for _ in range(3)]
-        dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(3)]
+        pending_ids = [await self._insert_pending_row(queue_file, 'proj1') for _ in range(3)]
+        dead_ids = [await self._insert_dead_row(queue_file, 'proj1') for _ in range(3)]
 
         # Interleave so the first chunk is all-ineligible.
         all_ids = pending_ids + dead_ids
@@ -855,23 +868,18 @@ class TestDeleteDead:
         assert sorted(result['deleted']) == sorted(dead_ids)
         assert sorted(result['not_found']) == sorted(pending_ids)
 
-        # Pending rows must still be present.
-        cursor = await queue._require_access().connection.execute(
-            f"SELECT id FROM write_queue WHERE id IN ({','.join('?' * len(pending_ids))})",
-            tuple(pending_ids),
+        assert await self._present_ids(queue_file, pending_ids) == set(pending_ids), (
+            'Pending rows must not be deleted'
         )
-        rows = await cursor.fetchall()
-        found = {(row[0] if isinstance(row, tuple) else row['id']) for row in rows}
-        assert found == set(pending_ids), 'Pending rows must not be deleted'
 
     @pytest.mark.asyncio
-    async def test_operational_error_returns_typed_envelope(self, queue, monkeypatch):
+    async def test_operational_error_returns_typed_envelope(self, queue, queue_file, monkeypatch):
         """An aiosqlite.OperationalError during DELETE returns a typed retriable envelope.
 
         The function must NOT raise; instead it returns a dict with
         error_type='TransientSqliteError' and retriable=True.
         """
-        id1 = await self._insert_dead_row(queue, 'proj1')
+        id1 = await self._insert_dead_row(queue_file, 'proj1')
 
         # Replace db.execute with one that raises OperationalError on any DELETE call.
         original_execute = queue._require_access().connection.execute
@@ -898,7 +906,7 @@ class TestDeleteDead:
 
     @pytest.mark.asyncio
     async def test_operational_error_mid_batch_preserves_deleted_progress(
-        self, queue, monkeypatch
+        self, queue, queue_file, monkeypatch
     ):
         """Mid-batch OperationalError: prior-chunk deletions are committed and reported.
 
@@ -912,7 +920,7 @@ class TestDeleteDead:
         """
         monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
 
-        dead_ids = [await self._insert_dead_row(queue, 'proj1') for _ in range(7)]
+        dead_ids = [await self._insert_dead_row(queue_file, 'proj1') for _ in range(7)]
 
         # Track which DELETE invocation we're on.
         delete_call_count = 0
@@ -946,7 +954,7 @@ class TestDeleteDead:
         # confirm the commit landed.  We avoid re-instantiating DurableWriteQueue
         # with hard-coded constructor args (which could silently diverge from the
         # fixture) — raw aiosqlite is sufficient for a table-contents check.
-        db_path = queue._data_dir / 'write_queue.db'
+        db_path = queue_file
         await queue.close()
 
         async with aiosqlite.connect(str(db_path)) as raw_db:
@@ -973,7 +981,7 @@ class TestDeleteDead:
         assert envelope_deleted | envelope_remaining == set(dead_ids)
 
     @pytest.mark.asyncio
-    async def test_duplicate_input_ids_never_overlap_buckets(self, queue, monkeypatch):
+    async def test_duplicate_input_ids_never_overlap_buckets(self, queue, queue_file, monkeypatch):
         """Duplicate ids in the input must never appear in both deleted and not_found.
 
         When batch_size=1 a list like [id1, id1] forces two separate chunks.
@@ -986,7 +994,7 @@ class TestDeleteDead:
         """
         monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 1)
 
-        id1 = await self._insert_dead_row(queue, 'proj1')
+        id1 = await self._insert_dead_row(queue_file, 'proj1')
 
         result = await queue.delete_dead(group_id='proj1', ids=[id1, id1])
 
@@ -1000,7 +1008,7 @@ class TestDeleteDead:
 
     @pytest.mark.asyncio
     async def test_recovery_commit_failure_logs_at_error_level_with_traceback(
-        self, queue, monkeypatch, caplog
+        self, queue, queue_file, monkeypatch, caplog
     ):
         """Recovery-commit failure must be logged at ERROR level with a traceback.
 
@@ -1010,7 +1018,7 @@ class TestDeleteDead:
         operators see the traceback — distinguishing logger.exception() from
         logger.error() or logger.warning().
         """
-        id1 = await self._insert_dead_row(queue, 'proj1')
+        id1 = await self._insert_dead_row(queue_file, 'proj1')
 
         # Raise OperationalError on any DELETE to trigger the error path.
         original_execute = queue._require_access().connection.execute
@@ -1055,7 +1063,7 @@ class TestDeleteDead:
     @pytest.mark.parametrize('journal_mode', ['WAL', 'DELETE'])
     @pytest.mark.asyncio
     async def test_real_sqlite_busy_mid_batch_durable_recovery(
-        self, tmp_path, monkeypatch, journal_mode
+        self, tmp_path, monkeypatch, journal_mode, queue_file
     ):
         """Real SQLITE_BUSY on chunk 2: prior-chunk deletes are durable (both journal modes).
 
@@ -1086,7 +1094,7 @@ class TestDeleteDead:
         try:
             # (2) Patch batch size to 3 so 7 rows => chunks [0:3], [3:6], [6:7].
             monkeypatch.setattr(dq_module, '_DELETE_DEAD_BATCH_SIZE', 3)
-            dead_ids = [await self._insert_dead_row(q, 'proj1') for _ in range(7)]
+            dead_ids = [await self._insert_dead_row(queue_file, 'proj1') for _ in range(7)]
 
             # (3) Switch the queue connection to the parametrized journal mode.
             #     Fetch the PRAGMA result to confirm the switch actually happened —
@@ -1101,7 +1109,7 @@ class TestDeleteDead:
             )
             await q._require_access().connection.commit()
 
-            db_path = q._data_dir / 'write_queue.db'
+            db_path = queue_file
 
             # (4) Open conn2 to the same file; confirm the matching journal mode.
             async with aiosqlite.connect(str(db_path)) as conn2:

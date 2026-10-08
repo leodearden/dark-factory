@@ -85,7 +85,7 @@ async def test_initialize_creates_schema_and_reinit_after_close_is_safe(tmp_path
     # task 1560: every connection this test opened must now be closed.
     assert first_db is not None, 'first_db should have been set after initialize()'
     _assert_connection_closed(first_db)
-    assert store._access is None, 'store._access must be None after close() (task 1560)'
+    assert await store.checkpoint() == CheckpointResult.unavailable(), 'the store must be closed after close() (task 1560)'
 
 
 @pytest.mark.asyncio
@@ -139,7 +139,7 @@ async def test_double_initialize_without_close_is_idempotent_and_no_leak(tmp_pat
 
     finally:
         await store.close()
-        assert store._access is None, 'store._access must be None after close()'
+        assert await store.checkpoint() == CheckpointResult.unavailable(), 'the store must be closed after close()'
         if store_second_db is not None:
             _assert_connection_closed(store_second_db)
 
@@ -162,7 +162,7 @@ async def test_reconnect_close_then_initialize_preserves_data_and_no_leak(tmp_pa
 
     # Explicit close — the canonical safe teardown path.
     await store.close()
-    assert store._access is None
+    assert await store.checkpoint() == CheckpointResult.unavailable()
 
     # Reconnect via initialize().
     try:
@@ -180,7 +180,7 @@ async def test_reconnect_close_then_initialize_preserves_data_and_no_leak(tmp_pa
 
     finally:
         await store.close()
-        assert store._access is None
+        assert await store.checkpoint() == CheckpointResult.unavailable()
 
 
 @pytest.mark.asyncio
@@ -523,7 +523,7 @@ async def test_migration_adds_escalated_at_to_legacy_db(tmp_path):
     # task 1560: every connection this test opened must now be closed.
     assert first_db is not None, 'first_db should have been set after initialize()'
     _assert_connection_closed(first_db)
-    assert store._access is None, 'store._access must be None after close() (task 1560)'
+    assert await store.checkpoint() == CheckpointResult.unavailable(), 'the store must be closed after close() (task 1560)'
 
 
 # ---------------------------------------------------------------------------
