@@ -85,7 +85,7 @@ def _candidate_blob(
 
 
 async def _force_failed(store: TicketStore, ticket_id: str, *, reason: str) -> None:
-    db = store._require_db()
+    db = store._require_access().connection
     await db.execute(
         "UPDATE tickets SET status='failed', reason=?, resolved_at=datetime('now') "
         "WHERE ticket_id=?",

@@ -7,7 +7,6 @@ On startup, any tickets left in 'pending' state from a prior run are marked as
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import secrets
 import time
@@ -15,7 +14,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
-from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
+from shared.async_sqlite_base import (
+    AtomicConnection,
+    CheckpointResult,
+    apply_full_durability_pragmas,
+    connect_daemon,
+)
 
 # Crockford Base32 alphabet — omits I, L, O, U to reduce transcription errors.
 _CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
@@ -85,17 +89,17 @@ class TicketStore:
 
     def __init__(self, db_path: Path | str) -> None:
         self._db_path = Path(db_path)
-        self._db: aiosqlite.Connection | None = None
+        self._access: AtomicConnection | None = None
 
     async def initialize(self) -> None:
         """Open the SQLite connection and create the schema.
 
         Idempotent at both the connection level and the schema level:
 
-        * **Connection-level** — if ``self._db`` is already set (e.g. from a
+        * **Connection-level** — if the store is already open (e.g. from a
           prior ``initialize()`` or a reconnect-via-reinit pattern), the
           existing connection is closed first via :meth:`close` (which also
-          checkpoints the WAL and nulls ``self._db``) before a fresh one is
+          checkpoints the WAL and nulls ``self._access``) before a fresh one is
           opened.  This prevents orphaning the aiosqlite worker thread, which
           would otherwise raise ``"Event loop is closed"`` on GC (tasks 1560,
           1562).
@@ -104,22 +108,24 @@ class TicketStore:
           ``CREATE INDEX IF NOT EXISTS`` make repeated calls safe on an
           already-initialised database.
         """
-        if self._db is not None:
+        if self._access is not None:
             # Idempotent / reconnect-safe: close (checkpoint WAL + close +
             # null out) any prior connection before reassigning.  Orphaning it
             # leaks the aiosqlite worker thread and raises "Event loop is
             # closed" on GC (tasks 1560, 1562).
             await self.close()
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = await connect_daemon(str(self._db_path))
-        self._db.row_factory = aiosqlite.Row
-        await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
+        conn = await connect_daemon(str(self._db_path))
+        conn.row_factory = aiosqlite.Row
+        await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
+        self._access = AtomicConnection(conn)
         # Tables first, then in-place migrate, then indexes — the
         # escalated_at index references the column added by the migration.
-        await self._db.executescript(TABLE_SQL)
+        async with self._access.write() as db:
+            await db.executescript(TABLE_SQL)
         await self._migrate_add_escalated_at()
-        await self._db.executescript(INDEX_SQL)
-        await self._db.commit()
+        async with self._access.write() as db:
+            await db.executescript(INDEX_SQL)
         logger.info('TicketStore initialized at %s', self._db_path)
 
     async def _migrate_add_escalated_at(self) -> None:
@@ -129,30 +135,17 @@ class TicketStore:
         column needs an explicit ALTER for legacy DBs. Idempotent: probes
         ``PRAGMA table_info`` first.
         """
-        db = self._require_db()
-        cursor = await db.execute('PRAGMA table_info(tickets)')
-        rows = await cursor.fetchall()
-        cols = {row[1] for row in rows}
+        access = self._require_access()
+        cols = {row[1] for row in await access.read_all('PRAGMA table_info(tickets)')}
         if 'escalated_at' not in cols:
-            await db.execute('ALTER TABLE tickets ADD COLUMN escalated_at TEXT')
+            async with access.write() as db:
+                await db.execute('ALTER TABLE tickets ADD COLUMN escalated_at TEXT')
             logger.info('TicketStore: migrated tickets table — added escalated_at column')
 
-    def _require_db(self) -> aiosqlite.Connection:
-        if self._db is None:
+    def _require_access(self) -> AtomicConnection:
+        if self._access is None:
             raise RuntimeError('TicketStore not initialized — call initialize() first')
-        return self._db
-
-    @contextlib.asynccontextmanager
-    async def _txn(self):
-        """Explicit transaction: commit on success, rollback on any exception."""
-        db = self._require_db()
-        try:
-            yield db
-            await db.commit()
-        except BaseException:
-            with contextlib.suppress(Exception):
-                await db.rollback()
-            raise
+        return self._access
 
     async def submit(
         self,
@@ -170,7 +163,7 @@ class TicketStore:
         now = datetime.now(UTC)
         # Advisory placeholder; reaper is worker-liveness based, not TTL.
         expires_at = now + timedelta(days=365)
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(
                 """
                 INSERT INTO tickets
@@ -196,7 +189,7 @@ class TicketStore:
         returns ``False`` without clobbering the existing terminal data.
         """
         now = datetime.now(UTC).isoformat()
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             cursor = await db.execute(
                 """
                 UPDATE tickets
@@ -220,7 +213,7 @@ class TicketStore:
         server run.  Returns the number of rows updated.
         """
         now = datetime.now(UTC).isoformat()
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             cursor = await db.execute(
                 """
                 UPDATE tickets
@@ -235,11 +228,9 @@ class TicketStore:
 
     async def get(self, ticket_id: str) -> dict | None:
         """Return the ticket row as a plain dict, or None if not found."""
-        db = self._require_db()
-        cursor = await db.execute(
+        row = await self._require_access().read_one(
             'SELECT * FROM tickets WHERE ticket_id = ?', (ticket_id,)
         )
-        row = await cursor.fetchone()
         if row is None:
             return None
         return dict(row)
@@ -252,11 +243,9 @@ class TicketStore:
         liveness probe whether the per-project worker is still alive; dead
         workers' rows get terminalised as ``failed/worker_dead``.
         """
-        db = self._require_db()
-        cursor = await db.execute(
+        rows = await self._require_access().read_all(
             "SELECT DISTINCT project_id FROM tickets WHERE status = 'pending'",
         )
-        rows = await cursor.fetchall()
         return [row['project_id'] for row in rows]
 
     async def mark_pending_failed_for_project(
@@ -269,25 +258,18 @@ class TicketStore:
         attribute failure timing.
 
         Returns the list of ``ticket_id`` values that were pending (and are
-        now terminalised as ``failed``).  Both the SELECT and the UPDATE run
-        inside the same ``_txn()``.  On the store's single shared aiosqlite
-        connection the ids will exactly match the rows changed absent concurrent
-        writers; if another coroutine (e.g. a worker calling ``mark_resolved``)
-        races between the SELECT and the UPDATE, the UPDATE's ``WHERE
-        status='pending'`` guard silently skips that ticket, so ``reaped_ids``
-        may contain an id whose terminal status is not ``worker_dead``.  The
-        practical impact is benign: any woken ``resolve_ticket`` caller
-        re-reads the persisted terminal row (whatever it is), so correctness is
-        preserved — only the log count is off by the number of raced tickets.
+        now terminalised as ``failed``).  The SELECT and the UPDATE run in
+        ONE write unit, which holds the store's per-connection lock, so no
+        other in-process writer can land between them: ``reaped_ids`` exactly
+        matches the rows this call changed.
         """
         now = datetime.now(UTC).isoformat()
-        async with self._txn() as db:
-            cursor = await db.execute(
+        async with self._require_access().write() as db:
+            rows = await db.execute_fetchall(
                 "SELECT ticket_id FROM tickets "
                 "WHERE project_id = ? AND status = 'pending'",
                 (project_id,),
             )
-            rows = await cursor.fetchall()
             reaped_ids = [row['ticket_id'] for row in rows]
             await db.execute(
                 """
@@ -316,7 +298,6 @@ class TicketStore:
         ``created_at``.
         Default window when ``since`` is None: last 7 days.
         """
-        db = self._require_db()
         if since is None:
             since = datetime.now(UTC) - timedelta(days=7)
         sql_parts = [
@@ -329,8 +310,7 @@ class TicketStore:
             params.append(status)
         sql_parts.append('ORDER BY created_at DESC LIMIT ?')
         params.append(limit)
-        cursor = await db.execute(' '.join(sql_parts), tuple(params))
-        rows = await cursor.fetchall()
+        rows = await self._require_access().read_all(' '.join(sql_parts), tuple(params))
         return [dict(r) for r in rows]
 
     async def fetch_unescalated_failures(
@@ -363,7 +343,6 @@ class TicketStore:
             limit: Maximum rows per call (default 100). Aligns with
                 ``curator.janitor.batch_limit``.
         """
-        db = self._require_db()
         sql = (
             "SELECT * FROM tickets "
             "WHERE status = 'failed' "
@@ -376,8 +355,7 @@ class TicketStore:
             params = (project_id,)
         sql += " ORDER BY resolved_at LIMIT ?"
         params = (*params, limit)
-        cursor = await db.execute(sql, params)
-        rows = await cursor.fetchall()
+        rows = await self._require_access().read_all(sql, params)
         return [dict(r) for r in rows]
 
     async def mark_escalated(self, ticket_ids: list[str] | tuple[str, ...]) -> int:
@@ -391,7 +369,7 @@ class TicketStore:
             return 0
         now = datetime.now(UTC).isoformat()
         placeholders = ','.join('?' * len(ticket_ids))
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             cursor = await db.execute(
                 f"UPDATE tickets SET escalated_at = ? "
                 f"WHERE ticket_id IN ({placeholders})",
@@ -406,19 +384,17 @@ class TicketStore:
         empty WAL and the main DB is fully up to date. Best-effort —
         failures don't block the close.
         """
-        if self._db is not None:
-            with contextlib.suppress(Exception):
-                await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            await self._db.close()
-            self._db = None
+        if self._access is not None:
+            await self._access.close()
+            self._access = None
 
-    async def checkpoint(self) -> tuple[int, int, int]:
-        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` and return ``(busy, log,
-        checkpointed)``. Called by the periodic checkpoint loop in
-        ``server/main.py``."""
-        db = self._require_db()
-        cursor = await db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-        row = await cursor.fetchone()
-        if row is None:
-            return (-1, -1, -1)
-        return int(row[0]), int(row[1]), int(row[2])
+    async def checkpoint(self) -> CheckpointResult:
+        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``.
+
+        Called by ``server/main.py::_run_checkpoint_cycle``, which does not own
+        this store's shutdown, so a closed store answers
+        :meth:`CheckpointResult.unavailable` rather than raising.
+        """
+        if self._access is None:
+            return CheckpointResult.unavailable()
+        return await self._access.checkpoint()

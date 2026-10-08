@@ -7377,7 +7377,7 @@ async def test_main_wires_ticket_store_into_interceptor(
 
     Asserts:
     1. _build_ticket_store returns a TicketStore backed by data_dir/tickets.db.
-    2. The returned store's _db is connected (not None) — initialize() was called.
+    2. The returned store is open — initialize() was called.
     3. A TaskInterceptor built with ticket_store=store exposes it as _ticket_store.
     """
     from fused_memory.server.main import _build_ticket_store  # noqa: PLC0415
@@ -7390,7 +7390,7 @@ async def test_main_wires_ticket_store_into_interceptor(
     assert store._db_path == tmp_path / 'tickets.db', (
         f'Expected db path {tmp_path / "tickets.db"}, got {store._db_path}'
     )
-    assert store._db is not None, 'TicketStore._db should be connected after _build_ticket_store'
+    assert store._access is not None, 'TicketStore should be open after _build_ticket_store'
 
     # Verify TaskInterceptor accepts and stores the ticket_store kwarg correctly.
     ti = TaskInterceptor(taskmaster, reconciler, event_buffer, ticket_store=store)
@@ -8035,8 +8035,7 @@ class TestSubmitTaskGuardrail:
         ticket_id = result.get('ticket', '')
         assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket, got: {result}'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -8156,12 +8155,11 @@ class TestSubmitTaskGuardrail:
             f'Expected tkt_-prefixed ticket, got: {result}'
         )
 
-        # Direct _db access is intentional: we're pinning the storage-layer
+        # Direct connection access is intentional: we're pinning the storage-layer
         # serialisation contract, which has no public query path.  This mirrors
         # the pattern used by sibling tests in this class (e.g.
         # test_submit_task_advises_dark_factory_paths_in_wrong_project).
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT project_id, candidate_json FROM tickets WHERE ticket_id = ?',
             (result['ticket'],),
@@ -8242,8 +8240,7 @@ class TestSubmitTaskGuardrail:
         )
         assert result.get('suggested_project') == 'dark_factory'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute('SELECT COUNT(*) FROM tickets')
         row = await cursor.fetchone()
         assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
@@ -8278,8 +8275,7 @@ class TestSubmitTaskGuardrail:
         ticket_id = result.get('ticket', '')
         assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket, got: {result}'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -8386,8 +8382,7 @@ class TestSubmitTaskGuardrail:
             f'Field {field!r}: expected tkt_-prefixed ticket, got: {result}'
         )
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -8440,8 +8435,7 @@ class TestSubmitTaskGuardrail:
         )
 
         # Verify the row was persisted for the submitting project
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT project_id, candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -8497,8 +8491,7 @@ class TestSubmitTaskGuardrail:
         ticket_id = result.get('ticket', '')
         assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket, got: {result}'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -8698,8 +8691,7 @@ async def _persisted_candidate_metadata(ticket_store, result):
     ticket_id = result.get('ticket', '')
     assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket: {result}'
 
-    db = ticket_store._db
-    assert db is not None
+    db = ticket_store._require_access().connection
     cursor = await db.execute(
         'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
         (ticket_id,),
@@ -8798,8 +8790,7 @@ class TestSubmitTaskGuardrailMultiProject:
         )
         assert result.get('suggested_project') == 'dark_factory'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute('SELECT COUNT(*) FROM tickets')
         row = await cursor.fetchone()
         assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
@@ -8853,8 +8844,7 @@ class TestSubmitTaskGuardrailMultiProject:
         )
         assert result.get('suggested_project') == 'dark_factory'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute('SELECT COUNT(*) FROM tickets')
         row = await cursor.fetchone()
         assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
@@ -8923,8 +8913,7 @@ class TestSubmitTaskCrossRepoDeliverable:
         ticket_id = result.get('ticket', '')
         assert ticket_id.startswith('tkt_'), f'Expected tkt_ ticket, got: {result}'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -8986,8 +8975,7 @@ class TestSubmitTaskCrossRepoDeliverable:
         ticket_id = result.get('ticket', '')
         assert ticket_id.startswith('tkt_'), f'Expected tkt_ ticket, got: {result}'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -9029,8 +9017,7 @@ class TestSubmitTaskCrossRepoDeliverable:
         assert result.get('error_type') == 'DarkFactoryPathScopeViolation', (
             f'Expected DarkFactoryPathScopeViolation, got: {result}'
         )
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute('SELECT COUNT(*) FROM tickets')
         row = await cursor.fetchone()
         assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
@@ -9074,8 +9061,7 @@ class TestSubmitTaskCrossRepoDeliverable:
             f'Expected DarkFactoryPathScopeViolation for unregistered filer, '
             f'got: {result}'
         )
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute('SELECT COUNT(*) FROM tickets')
         row = await cursor.fetchone()
         assert row[0] == 0, f'Expected 0 tickets (rejected), found {row[0]}'
@@ -9186,8 +9172,7 @@ class TestProseRightBoundarySignal:
             f'Expected the ticket to still be created, got: {result}'
         )
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -9244,8 +9229,7 @@ class TestProseRightBoundarySignal:
         ticket_id = result.get('ticket', '')
         assert ticket_id.startswith('tkt_'), f'Expected tkt_-prefixed ticket, got: {result}'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?',
             (ticket_id,),
@@ -10158,8 +10142,7 @@ class TestPathGuardFallbackMetadataFiles:
         assert result.get('suggested_project') == 'dark_factory'
 
         # Ticket store must have zero rows (guard fires before persist)
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute('SELECT COUNT(*) FROM tickets')
         row = await cursor.fetchone()
         assert row[0] == 0, f'meta_key={meta_key!r}: expected 0 tickets in store, found {row[0]}'
@@ -11833,8 +11816,7 @@ class TestRoutingOverrideEndToEndAudit:
         ticket_id = result.get('ticket', '')
         assert ticket_id.startswith('tkt_'), f'expected a ticket, got: {result}'
 
-        db = ticket_store._db
-        assert db is not None
+        db = ticket_store._require_access().connection
         cursor = await db.execute(
             'SELECT candidate_json FROM tickets WHERE ticket_id = ?', (ticket_id,),
         )

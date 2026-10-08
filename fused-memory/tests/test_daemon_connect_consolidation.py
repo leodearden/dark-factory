@@ -74,7 +74,7 @@ _DAEMON_CASES = [
     pytest.param(
         lambda tmp: TicketStore(tmp / 'tickets.db'),
         _std_lifecycle,
-        lambda store, _root: store._db,
+        lambda store, _root: store._require_access().connection,
         id='TicketStore',
     ),
     pytest.param(

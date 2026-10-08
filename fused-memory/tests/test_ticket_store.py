@@ -49,7 +49,7 @@ async def test_initialize_creates_schema_and_reinit_after_close_is_safe(tmp_path
     # initialize() unconditionally opens a new aiosqlite connection, orphaning
     # the previous one if not explicitly closed first.  The orphaned non-daemon
     # worker thread raises "Event loop is closed" on GC.
-    first_db = store._db
+    first_db = store._require_access().connection
     # Close the first connection before the idempotent re-init so it is not
     # orphaned (task 1560: its non-daemon worker would otherwise leak).
     await store.close()
@@ -57,7 +57,7 @@ async def test_initialize_creates_schema_and_reinit_after_close_is_safe(tmp_path
     await store.initialize()
     try:
         # Verify the table exists with the expected columns
-        db = store._db
+        db = store._require_access().connection
         assert db is not None
         cursor = await db.execute("PRAGMA table_info(tickets)")
         rows = await cursor.fetchall()
@@ -85,7 +85,7 @@ async def test_initialize_creates_schema_and_reinit_after_close_is_safe(tmp_path
     # task 1560: every connection this test opened must now be closed.
     assert first_db is not None, 'first_db should have been set after initialize()'
     _assert_connection_closed(first_db)
-    assert store._db is None, 'store._db must be None after close() (task 1560)'
+    assert store._access is None, 'store._access must be None after close() (task 1560)'
 
 
 @pytest.mark.asyncio
@@ -103,18 +103,18 @@ async def test_double_initialize_without_close_is_idempotent_and_no_leak(tmp_pat
     """
     store = TicketStore(tmp_path / 'tickets.db')
     await store.initialize()
-    first_db = store._db
+    first_db = store._require_access().connection
     assert first_db is not None
 
     # Second initialize() WITHOUT an intervening close() — the idempotency path.
     store_second_db = None
     try:
         await store.initialize()
-        store_second_db = store._db
+        store_second_db = store._require_access().connection
 
         # (a) A fresh connection was opened.
-        assert store._db is not None and store._db is not first_db, (
-            'store._db should be a new connection after the second initialize()'
+        assert store._require_access().connection is not first_db, (
+            'the second initialize() should open a new connection'
         )
 
         # (b) RED ASSERTION: the prior connection must be closed, not orphaned.
@@ -130,7 +130,7 @@ async def test_double_initialize_without_close_is_idempotent_and_no_leak(tmp_pat
         _assert_connection_closed(first_db)
 
         # (c) The NEW connection is a live daemon-backed worker.
-        assert_connection_thread_is_daemon(store._db, 'TicketStore re-init')
+        assert_connection_thread_is_daemon(store._require_access().connection, 'TicketStore re-init')
 
         # (d) Usability: submit + get through the new connection.
         tid = await store.submit(project_id='p', candidate_json='{}')
@@ -139,7 +139,7 @@ async def test_double_initialize_without_close_is_idempotent_and_no_leak(tmp_pat
 
     finally:
         await store.close()
-        assert store._db is None, 'store._db must be None after close()'
+        assert store._access is None, 'store._access must be None after close()'
         if store_second_db is not None:
             _assert_connection_closed(store_second_db)
 
@@ -157,20 +157,20 @@ async def test_reconnect_close_then_initialize_preserves_data_and_no_leak(tmp_pa
     store = TicketStore(tmp_path / 'tickets.db')
     await store.initialize()
     tid = await store.submit(project_id='p', candidate_json='{}')
-    first_db = store._db
+    first_db = store._require_access().connection
     assert first_db is not None
 
     # Explicit close — the canonical safe teardown path.
     await store.close()
-    assert store._db is None
+    assert store._access is None
 
     # Reconnect via initialize().
     try:
         await store.initialize()
 
         # New connection is a fresh daemon-backed worker, distinct from the prior one.
-        assert store._db is not None and store._db is not first_db
-        assert_connection_thread_is_daemon(store._db, 'TicketStore reconnect')
+        assert store._require_access().connection is not first_db
+        assert_connection_thread_is_daemon(store._require_access().connection, 'TicketStore reconnect')
 
         # Data survived the reconnect — net-new assertion over the schema-only test.
         row = await store.get(tid)
@@ -180,7 +180,7 @@ async def test_reconnect_close_then_initialize_preserves_data_and_no_leak(tmp_pa
 
     finally:
         await store.close()
-        assert store._db is None
+        assert store._access is None
 
 
 @pytest.mark.asyncio
@@ -338,7 +338,7 @@ async def test_flush_pending_on_startup_marks_all_pending_failed(store):
 
 async def _force_failed(store: TicketStore, ticket_id: str, *, reason: str) -> None:
     """Test helper: terminalise a ticket as failed with the given reason."""
-    db = store._db
+    db = store._require_access().connection
     assert db is not None
     now = datetime.now(UTC).isoformat()
     await db.execute(
@@ -434,7 +434,7 @@ async def test_fetch_unescalated_failures_orders_by_resolved_at(store):
     older = await store.submit(project_id='p', candidate_json='{}')
     newer = await store.submit(project_id='p', candidate_json='{}')
     # Force resolved_at directly so ordering is deterministic in CI.
-    db = store._db
+    db = store._require_access().connection
     await db.execute(
         "UPDATE tickets SET status='failed', reason='r', resolved_at=? WHERE ticket_id=?",
         ('2026-01-01T00:00:00+00:00', older),
@@ -508,10 +508,9 @@ async def test_migration_adds_escalated_at_to_legacy_db(tmp_path):
     # initialize() unconditionally opens a new aiosqlite connection, orphaning
     # the previous one if not explicitly closed first.  The orphaned non-daemon
     # worker thread raises "Event loop is closed" on GC.
-    first_db = store._db
+    first_db = store._require_access().connection
     try:
-        assert store._db is not None
-        cursor = await store._db.execute('PRAGMA table_info(tickets)')
+        cursor = await store._require_access().connection.execute('PRAGMA table_info(tickets)')
         cols = {r[1] for r in await cursor.fetchall()}
         assert 'escalated_at' in cols
         # Close the first connection before the idempotent re-init so it is not
@@ -524,7 +523,7 @@ async def test_migration_adds_escalated_at_to_legacy_db(tmp_path):
     # task 1560: every connection this test opened must now be closed.
     assert first_db is not None, 'first_db should have been set after initialize()'
     _assert_connection_closed(first_db)
-    assert store._db is None, 'store._db must be None after close() (task 1560)'
+    assert store._access is None, 'store._access must be None after close() (task 1560)'
 
 
 # ---------------------------------------------------------------------------
@@ -534,7 +533,7 @@ async def test_migration_adds_escalated_at_to_legacy_db(tmp_path):
 
 async def _force_created_at(store: TicketStore, ticket_id: str, when: datetime) -> None:
     """Test helper: rewrite a ticket's created_at so window filters can be exercised."""
-    db = store._db
+    db = store._require_access().connection
     assert db is not None
     await db.execute(
         'UPDATE tickets SET created_at = ? WHERE ticket_id = ?',
@@ -565,7 +564,7 @@ async def test_list_tickets_status_filter_excludes_other_states(store):
     failed = await store.submit(project_id='p', candidate_json='{}')
     combined = await store.submit(project_id='p', candidate_json='{}')
     await _force_failed(store, failed, reason='curator_failed')
-    db = store._db
+    db = store._require_access().connection
     await db.execute(
         "UPDATE tickets SET status='combined', resolved_at=? WHERE ticket_id=?",
         (datetime.now(UTC).isoformat(), combined),
