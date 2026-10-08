@@ -5,7 +5,6 @@ Provides:
 - apply_full_durability_pragmas(conn, busy_timeout_ms): WAL + busy_timeout + Phase 3 triad
 - connect_daemon(database, **kwargs): open a connection with worker thread marked daemon
 - AtomicConnection: per-connection lock making every access an atomic unit
-- checkpoint_or_unavailable(access): the not-open checkpoint contract of AtomicConnection stores
 - AsyncSqliteBase: ABC with lifecycle management (open/close/context-manager/guard)
 """
 
@@ -26,7 +25,6 @@ __all__ = [
     'connect_daemon',
     'CheckpointResult',
     'AtomicConnection',
-    'checkpoint_or_unavailable',
     'AsyncSqliteBase',
 ]
 
@@ -310,19 +308,19 @@ class AtomicConnection:
                 await self._connection.execute_fetchall('PRAGMA wal_checkpoint(TRUNCATE)')
             await self._connection.close()
 
+    @staticmethod
+    async def checkpoint_or_unavailable(access: AtomicConnection | None) -> CheckpointResult:
+        """Checkpoint a store's access, or answer :meth:`CheckpointResult.unavailable` when it is not open.
 
-async def checkpoint_or_unavailable(access: AtomicConnection | None) -> CheckpointResult:
-    """Checkpoint a store's access, or answer :meth:`CheckpointResult.unavailable` when it is not open.
-
-    The one not-open contract of every AtomicConnection store.  Their
-    ``checkpoint()`` is driven by
-    ``fused-memory/src/fused_memory/server/main.py::_run_checkpoint_cycle``,
-    which does not own any store's lifecycle, so a store that is not yet open
-    or already closed answers the sentinel rather than raising.
-    """
-    if access is None:
-        return CheckpointResult.unavailable()
-    return await access.checkpoint()
+        The one not-open contract of every AtomicConnection store.  Their
+        ``checkpoint()`` is driven by
+        ``fused-memory/src/fused_memory/server/main.py::_run_checkpoint_cycle``,
+        which does not own any store's lifecycle, so a store that is not yet
+        open or already closed answers the sentinel rather than raising.
+        """
+        if access is None:
+            return CheckpointResult.unavailable()
+        return await access.checkpoint()
 
 
 class AsyncSqliteBase(abc.ABC):

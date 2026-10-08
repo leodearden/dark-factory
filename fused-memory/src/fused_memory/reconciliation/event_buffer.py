@@ -13,7 +13,6 @@ from shared.async_sqlite_base import (
     AtomicConnection,
     CheckpointResult,
     apply_full_durability_pragmas,
-    checkpoint_or_unavailable,
     connect_daemon,
 )
 
@@ -1266,4 +1265,4 @@ class EventBuffer:
             self._access = None
 
     async def checkpoint(self) -> CheckpointResult:
-        return await checkpoint_or_unavailable(self._access)
+        return await AtomicConnection.checkpoint_or_unavailable(self._access)

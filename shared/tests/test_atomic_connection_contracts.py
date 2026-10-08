@@ -2,7 +2,7 @@
 
 * A write unit's rollback never displaces the exception that ended the unit,
   even when a second cancellation lands while the rollback is awaited.
-* ``checkpoint_or_unavailable`` is the one place a store that is not open
+* ``AtomicConnection.checkpoint_or_unavailable`` is the one place a store that is not open
   answers :meth:`CheckpointResult.unavailable` instead of raising.
 """
 
@@ -18,7 +18,6 @@ from shared.async_sqlite_base import (
     AtomicConnection,
     CheckpointResult,
     apply_wal_pragmas,
-    checkpoint_or_unavailable,
     connect_daemon,
 )
 
@@ -74,14 +73,14 @@ async def test_a_cancel_during_the_rollback_does_not_displace_the_units_error(on
 
 @pytest.mark.asyncio
 async def test_a_store_that_is_not_open_answers_unavailable():
-    assert await checkpoint_or_unavailable(None) == CheckpointResult.unavailable()
+    assert await AtomicConnection.checkpoint_or_unavailable(None) == CheckpointResult.unavailable()
 
 
 @pytest.mark.asyncio
 async def test_an_open_access_runs_the_checkpoint(one_row_access):
     _, access = one_row_access
 
-    result = await checkpoint_or_unavailable(access)
+    result = await AtomicConnection.checkpoint_or_unavailable(access)
 
     assert result != CheckpointResult.unavailable()
     assert result.busy == 0
