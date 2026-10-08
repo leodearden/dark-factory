@@ -172,14 +172,17 @@ Fidelity notes (all load-bearing — a naive probe gets a wrong answer)
   production's ``invoke_with_cap_retry`` makes.  argv, env handling, the
   default ``max_budget_usd`` and the ``AgentResult`` verdict (``success``,
   ``schema_salvaged``, ``schema_tool_denied``) are production's own.
-* The recon-verify invocation is CAPTURED, not re-assembled: the real
-  ``CodebaseVerifier.verify()`` runs on the claude_cli provider until AgentLoop
-  calls ``invoke_with_cap_retry``, and that call's kwargs are replayed — system
-  prompt, user prompt, schema, ``available_tools``, permission mode and MCP
-  closure alike.  Only ``max_turns``, ``timeout_seconds``, ``model`` and
-  ``cwd`` are the probe's own.  A toy system prompt SUCCEEDS at
-  ``max_turns=1`` and manufactures the opposite verdict — this is the single
-  biggest way to get this measurement wrong.
+* Both invocations are CAPTURED, not re-assembled: the real
+  ``CodebaseVerifier.verify()`` (recon-verify) or ``Judge.review_run()`` over
+  one synthetic run (judge) runs on the claude_cli provider until it calls
+  ``invoke_with_cap_retry``, and that call's kwargs are replayed — system
+  prompt, user prompt, schema, tool registry, permission mode, setting sources
+  and MCP closure alike.  Only ``max_turns``, ``timeout_seconds``, ``model``,
+  ``cwd``, ``oauth_token`` and ``config_dir`` are the probe's own; a captured
+  kwarg neither ``invoke_claude_agent`` nor ``invoke_with_cap_retry`` declares
+  stops the run.  A toy system prompt SUCCEEDS at ``max_turns=1`` and
+  manufactures the opposite verdict — this is the single biggest way to get
+  this measurement wrong.
 * Model and per-run timeout come from ``ReconciliationConfig``
   (``agent_cli_timeout_seconds`` / ``judge_cli_timeout_seconds``), so a run
   production would kill is counted as ``timed_out`` here, not as a success.
@@ -202,17 +205,20 @@ from __future__ import annotations
 import argparse
 import asyncio
 import inspect
+import logging
 import os
 import subprocess
 import sys
 import tempfile
 import time
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from types import ModuleType
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -227,12 +233,23 @@ from shared.cli_invoke import (  # noqa: E402
     AgentResult,
     classify_agent_failure,
     invoke_claude_agent,
-    no_mcp_servers_config,
+    invoke_with_cap_retry,
     transcript_evidence_for_session,
     transcript_model_id_for_session,
 )
 
 from fused_memory.config.schema import ReconciliationConfig  # noqa: E402
+from fused_memory.models.reconciliation import (  # noqa: E402
+    JournalEntry,
+    ReconciliationRun,
+    RunStatus,
+    RunType,
+    StageId,
+    StageReport,
+)
+
+if TYPE_CHECKING:
+    from fused_memory.reconciliation.journal import ReconciliationJournal
 
 _DEFAULT_ACCOUNTS_FILE = _REPO_ROOT / 'config' / 'usage-accounts.yaml'
 _PRECHECK_TIMEOUT_SECS = 120.0
@@ -271,9 +288,12 @@ _OUTCOME_OTHER = 'other_failure'
 _OUTCOME_API_REFUSAL = 'api_refusal'
 
 # invoke_claude_agent kwargs the probe sets itself, per run: the matrix sets
-# max_turns, --model and --timeout override model and timeout_seconds, and cwd
-# is --codebase-root.  Everything else is production's own captured value.
-_PROBE_CONTROLLED_KWARGS = frozenset({'max_turns', 'timeout_seconds', 'model', 'cwd'})
+# max_turns, --model and --timeout override model and timeout_seconds, cwd is
+# --codebase-root, and each run gets its own pool token and throwaway config
+# dir.  Everything else is production's own captured value.
+_PROBE_CONTROLLED_KWARGS = frozenset({
+    'max_turns', 'timeout_seconds', 'model', 'cwd', 'oauth_token', 'config_dir',
+})
 
 
 @dataclass(frozen=True)
@@ -346,25 +366,74 @@ class Shape:
 
 
 class _ShapeCaptured(Exception):
-    """Sentinel raised to stop ``verify()`` at its CLI invocation."""
+    """Sentinel raised to stop production code at its CLI invocation."""
+
+
+def _capture_invocation(
+    module: ModuleType, drive: Callable[[], Coroutine[Any, Any, Any]],
+) -> tuple[dict[str, Any], Any]:
+    """Run *drive* with *module*'s ``invoke_with_cap_retry`` replaced by a recorder.
+
+    Returns the recorded kwargs, empty when the call was never reached, and
+    whatever *drive* returned.  The recorder aborts the call before any CLI
+    runs, and logging is silenced meanwhile: a caller that catches the abort
+    would otherwise log it as a real failure.
+    """
+    captured: dict[str, Any] = {}
+
+    async def _capture(*_args: Any, **kwargs: Any) -> AgentResult:
+        captured.update(kwargs)
+        raise _ShapeCaptured
+
+    returned = None
+    logging.disable(logging.CRITICAL)
+    try:
+        with patch.object(module, 'invoke_with_cap_retry', _capture), suppress(_ShapeCaptured):
+            returned = asyncio.run(drive())
+    finally:
+        logging.disable(logging.NOTSET)
+    return captured, returned
+
+
+def _shape_from_capture(name: str, captured: Mapping[str, Any]) -> Shape:
+    """Split a captured ``invoke_with_cap_retry`` call into a replayable Shape.
+
+    Raises on a kwarg that neither ``invoke_claude_agent`` nor
+    ``invoke_with_cap_retry`` declares: replaying without it would measure a
+    different call than production makes, silently.
+    """
+    cli_params = set(inspect.signature(invoke_claude_agent).parameters)
+    retry_params = {
+        param.name
+        for param in inspect.signature(invoke_with_cap_retry).parameters.values()
+        if param.kind is not inspect.Parameter.VAR_KEYWORD
+    }
+    unknown = sorted(set(captured) - cli_params - retry_params)
+    if unknown:
+        raise RuntimeError(
+            f'The {name} invocation passes {unknown}, which neither invoke_claude_agent '
+            'nor invoke_with_cap_retry declares; update this script before measuring.'
+        )
+    replayed = cli_params - _PROBE_CONTROLLED_KWARGS
+    return Shape(
+        name=name,
+        cli_kwargs={k: v for k, v in captured.items() if k in replayed},
+        model=str(captured['model']),
+        timeout_seconds=float(captured['timeout_seconds']),
+        max_turns=int(captured['max_turns']),
+    )
 
 
 def _capture_agent_shape(config: ReconciliationConfig, codebase_root: Path) -> Shape:
     """Capture the recon-verify CLI invocation exactly as production makes it.
 
     Drives the real ``CodebaseVerifier.verify()`` on the claude_cli provider up
-    to the moment AgentLoop calls ``invoke_with_cap_retry``, records that
-    call's kwargs, and aborts before any CLI call.  The probe therefore follows
-    any change to verify.py or agent_loop.py's invocation automatically.
+    to the moment AgentLoop calls ``invoke_with_cap_retry``.  The probe
+    therefore follows any change to verify.py or agent_loop.py's invocation
+    automatically.
     """
     from fused_memory.reconciliation import agent_loop
     from fused_memory.reconciliation.verify import CodebaseVerifier
-
-    captured: dict[str, Any] = {}
-
-    async def _capture(*_args: Any, **kwargs: Any) -> AgentResult:
-        captured.update(kwargs)
-        raise _ShapeCaptured
 
     # verify() takes ``codebase_root`` per call and does not read
     # ``config.explore_codebase_root`` (verify.py::CodebaseVerifier __init__,
@@ -372,27 +441,18 @@ def _capture_agent_shape(config: ReconciliationConfig, codebase_root: Path) -> S
     verifier = CodebaseVerifier(
         config.model_copy(update={'agent_llm_provider': 'claude_cli'}),
     )
-    returned = None
-    with patch.object(agent_loop, 'invoke_with_cap_retry', _capture), suppress(_ShapeCaptured):
-        returned = asyncio.run(
-            verifier.verify(
-                claim='The claude_cli AgentLoop runs a verification as one CLI invocation.',
-                context='Probe run; the verdict is irrelevant, only the invocation shape matters.',
-                scope_hints=['fused-memory/src/fused_memory/reconciliation/agent_loop.py'],
-                codebase_root=codebase_root,
-            )
-        )
-
+    captured, returned = _capture_invocation(
+        agent_loop,
+        lambda: verifier.verify(
+            claim='The claude_cli AgentLoop runs a verification as one CLI invocation.',
+            context='Probe run; the verdict is irrelevant, only the invocation shape matters.',
+            scope_hints=['fused-memory/src/fused_memory/reconciliation/agent_loop.py'],
+            codebase_root=codebase_root,
+        ),
+    )
     if not captured:
         raise RuntimeError(_capture_failure_message(returned, codebase_root))
-    accepted = set(inspect.signature(invoke_claude_agent).parameters) - _PROBE_CONTROLLED_KWARGS
-    return Shape(
-        name='recon-verify',
-        cli_kwargs={k: v for k, v in captured.items() if k in accepted},
-        model=str(captured['model']),
-        timeout_seconds=float(captured['timeout_seconds']),
-        max_turns=int(captured['max_turns']),
-    )
+    return _shape_from_capture('recon-verify', captured)
 
 
 def _capture_failure_message(returned: Any, codebase_root: Path) -> str:
@@ -417,27 +477,76 @@ def _capture_failure_message(returned: Any, codebase_root: Path) -> str:
     )
 
 
-def _capture_judge_shape(config: ReconciliationConfig) -> Shape:
-    from fused_memory.reconciliation.judge import _JUDGE_CLI_MAX_TURNS, JUDGE_VERDICT_SCHEMA
-    from fused_memory.reconciliation.prompts.judge import JUDGE_SYSTEM_PROMPT
+class _OneRunJournal:
+    """The reads ``Judge.review_run`` makes, answered from one synthetic run."""
 
-    return Shape(
-        name='judge',
-        cli_kwargs={
-            'system_prompt': JUDGE_SYSTEM_PROMPT,
-            'prompt': (
-                'Evaluate this reconciliation run: 3 memories were written, 1 task was '
-                'closed, and every claim cited a file path. Produce your verdict.'
-            ),
-            'output_schema': JUDGE_VERDICT_SCHEMA,
-            'disallowed_tools': ['*'],
-            'mcp_config': no_mcp_servers_config(),
-            'strict_mcp_config': True,
+    def __init__(self, run: ReconciliationRun, entries: list[JournalEntry]):
+        self._run = run
+        self._entries = entries
+
+    async def get_run(self, run_id: str) -> ReconciliationRun | None:
+        return self._run if run_id == self._run.id else None
+
+    async def get_entries(self, run_id: str) -> list[JournalEntry]:
+        return self._entries
+
+    async def get_run_actions_combined(self, run_id: str) -> list[dict]:
+        return []
+
+    async def get_recent_verdicts(self, project_id: str, limit: int = 10, since: Any = None) -> list:
+        return []
+
+
+def _synthetic_judge_run() -> tuple[ReconciliationRun, list[JournalEntry]]:
+    """A small completed targeted run: three memory writes and one task closed."""
+    now = datetime.now(UTC)
+    run = ReconciliationRun(
+        id='probe-run', project_id='dark_factory', run_type=RunType.targeted,
+        trigger_reason='task 4344 marked done', started_at=now, completed_at=now,
+        events_processed=4, status=RunStatus.completed,
+        stage_reports={
+            stage.value: StageReport(
+                stage=stage, started_at=now, completed_at=now, llm_calls=1, tokens_used=9000,
+            )
+            for stage in StageId
         },
-        model=config.judge_llm_model,
-        timeout_seconds=float(config.judge_cli_timeout_seconds),
-        max_turns=_JUDGE_CLI_MAX_TURNS,
     )
+    writes = [
+        ('add_memory', 'mem0', 'agent_loop.py passes setting_sources=[] (agent_loop.py).'),
+        ('add_memory', 'mem0', 'verify.py hands Read/Grep/Glob to the CLI (verify.py).'),
+        ('add_memory', 'graphiti', 'cli_invoke.py emits --setting-sources (cli_invoke.py).'),
+        ('set_task_status', 'taskmaster', 'Task 4344 merged; its commits touch agent_loop.py.'),
+    ]
+    entries = [
+        JournalEntry(
+            id=f'probe-entry-{i}', run_id=run.id, timestamp=now, operation=operation,
+            target_system=target, after_state={'ok': True}, reasoning=reasoning,
+        )
+        for i, (operation, target, reasoning) in enumerate(writes)
+    ]
+    return run, entries
+
+
+def _capture_judge_shape(config: ReconciliationConfig) -> Shape:
+    """Capture the judge's CLI invocation exactly as production makes it.
+
+    Drives the real ``Judge.review_run()`` on the claude_cli provider over one
+    synthetic run, so the review prompt is production's own rendering too.
+    """
+    from fused_memory.reconciliation import judge
+
+    run, entries = _synthetic_judge_run()
+    reviewer = judge.Judge(
+        config.model_copy(update={'judge_llm_provider': 'claude_cli'}),
+        cast('ReconciliationJournal', _OneRunJournal(run, entries)),
+    )
+    captured, _returned = _capture_invocation(judge, lambda: reviewer.review_run(run.id))
+    if not captured:
+        raise RuntimeError(
+            'Failed to capture the judge shape: Judge.review_run() returned without '
+            'invoking the CLI. judge.py has changed shape; update _capture_judge_shape.'
+        )
+    return _shape_from_capture('judge', captured)
 
 
 # ---------------------------------------------------------------------------
