@@ -1276,6 +1276,30 @@ def test_uvicorn_flag_lookup_is_scoped_to_exec_start(tmp_path: pathlib.Path) -> 
     assert _uvicorn_int_flag(commented, "timeout-graceful-shutdown") == 8
 
 
+def test_uvicorn_flag_lookup_reads_the_effective_exec_start(tmp_path: pathlib.Path) -> None:
+    """_uvicorn_int_flag must read the LAST ExecStart=, the one systemd runs.
+
+    A drop-in under <unit>.d/ merges by appending an empty reset and then the
+    real command, so a first-match read reports a value systemd discards (the
+    reasoning lives on systemd_unit_invariants.logical_exec_start).  This pins
+    the deliberate first-to-last change in this suite's ExecStart= lookup.
+    """
+    overridden = _write_synthetic_unit(
+        tmp_path / "overridden.service",
+        "ExecStart=/usr/bin/uv run python -m uvicorn app:app --timeout-graceful-shutdown 20\n"
+        "ExecStart=\n"
+        "ExecStart=/usr/bin/uv run python -m uvicorn app:app \\\n"
+        "  --timeout-graceful-shutdown 8",
+    )
+    graceful = _uvicorn_int_flag(overridden, "timeout-graceful-shutdown")
+    assert graceful == 8, (
+        f"_uvicorn_int_flag read --timeout-graceful-shutdown {graceful} from an "
+        "overridden ExecStart= rather than the command systemd runs (8): the "
+        "lookup must take the LAST ExecStart= assignment, joined across "
+        "continuations."
+    )
+
+
 def test_timeout_stop_sec_parses_systemd_time_specs(tmp_path: pathlib.Path) -> None:
     """_timeout_stop_sec must distinguish absent / infinity / unparseable / valid.
 
