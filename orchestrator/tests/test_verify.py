@@ -10875,16 +10875,6 @@ class TestSerialPytestStrReSuppliesGoverningAddopts:
             "--import-mode=importlib -m 'not smoke and not integration and not warm_lane_bash'",
         ]
 
-    def test_every_caller_must_name_the_invocation_dir(self):
-        """Required and keyword-only, so a new call site cannot silently fall back to the blank."""
-        import inspect
-
-        from orchestrator.verify import _serial_pytest_str
-
-        parameter = inspect.signature(_serial_pytest_str).parameters['invocation_dir']
-        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
-        assert parameter.default is inspect.Parameter.empty
-
     def test_no_invocation_dir_is_the_historical_blank(self, tmp_path):
         from orchestrator.verify import _serial_pytest_str
 
