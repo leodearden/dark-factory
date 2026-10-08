@@ -133,6 +133,14 @@ function ActivePinsStrip({ pinQueue, rows, onReorder, onUnpin }) {
   );
 }
 
+// The priority a park-stack entry was installed at, as the orchestrator names
+// it. An orchestrator still running pre-6144 code names nothing, so its raw
+// rank is shown instead of an empty label.
+function parkEntryLabel(entry) {
+  if (entry.source === 'pin') return `pin #${entry.pin_order}`;
+  return entry.tier ?? `rank ${entry.rank}`;
+}
+
 // ── Park Stacks section ──
 // Rendered in the Modules sub-tab below ModulesView.
 // For each module with a non-empty park_stack, shows the full LIFO stack
@@ -195,7 +203,7 @@ function ParkStacksSection({ modules, rows, onEvict }) {
                       T-{entry.owner}
                     </span>
                     <span style={{ color: 'var(--fg-3)', fontSize: 10 }}>
-                      {entry.source === 'pin' ? `pin #${entry.pin_order}` : entry.tier}
+                      {parkEntryLabel(entry)}
                     </span>
                     {ageStr && (
                       <span style={{ color: 'var(--fg-3)', fontSize: 10 }}>{ageStr}</span>
