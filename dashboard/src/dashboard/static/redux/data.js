@@ -67,7 +67,7 @@ function endpointsFor(win) {
     '/api/v2/dashboard/recon':                        { 'RECON_STATE': PLAIN, 'AGENTS': PLAIN },
     [`/api/v2/dashboard/merge-queue?window=${w}`]:    { 'MERGE_QUEUE': PLAIN },
     [`/api/v2/dashboard/costs?window=${w}`]:          { 'COSTS': PLAIN },
-    [`/api/v2/dashboard/performance?window=${w}`]:    { 'PERFORMANCE': PLAIN },
+    [`/api/v2/dashboard/performance?window=${w}`]:    { 'PERFORMANCE': PLAIN, 'PERFORMANCE_LISTING': PLAIN },
     [`/api/v2/dashboard/burndown?window=${w}`]:       { 'BURNDOWN': PLAIN, 'BURNDOWN_BY_PROJECT': PLAIN },
     '/api/v2/dashboard/curator':                      { 'CURATOR_STATE': PLAIN },
     '/api/v2/dashboard/scheduler':                    { 'SCHEDULER': PLAIN },
@@ -172,6 +172,8 @@ window.DF_DATA = {
   //   for the selected task only, via ON_DEMAND_KEYS.taskProse.
   TASKS_SNAPSHOT: {},
   PERFORMANCE: {},
+  // performance_cards.js::cardsListing answers a missing Datum, so no zero is seeded.
+  PERFORMANCE_LISTING: null,
   MEMORY_STATUS: {
     graphiti: { connected: false, node_count: 0, edge_count: 0, episode_count: 0 },
     mem0: { connected: false, memory_count: 0 },

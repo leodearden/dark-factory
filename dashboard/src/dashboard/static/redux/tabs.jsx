@@ -36,6 +36,8 @@ const {
   queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
 } = window.DF_MERGE_QUEUE;
 const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalText } = window.DF_MEMORY_READINGS;
+// PerfTab reads the served cards, and why a tile over them is empty — performance_cards.js.
+const { projectCards, cardsAbsentReason } = window.DF_PERFORMANCE_CARDS;
 const { useState: uS } = React;
 // The persisted UI-preference hooks — persisted_state.js.
 const { createPersistedHooks } = window.DF_PERSISTED_STATE;
@@ -412,6 +414,8 @@ function PerfTab({ projectFilter }) {
           const onePass = aggOnePassPct(subset);
           const escalation = aggEscalationRate(subset, 'interactive_rate');
           const totalTasks = cardBlocks(subset).reduce((s, c) => s + (c.ttc?.count || 0), 0);
+          const absentReason = cardsAbsentReason(DF);
+          const countHint = value => (value == null ? null : `${totalTasks} tasks (window)`);
           const fmtPct = v => `${v.toFixed(1)}`;
           // Aggregate historical sparks across the in-scope projects.
           // Per-project hour buckets must be aligned by label before summing.
@@ -475,14 +479,14 @@ function PerfTab({ projectFilter }) {
           return (
             <>
               <ST label="p50 time-to-completion"
-                datum={derivedDatum(p50, EP.performance, 'no tasks in this window')} format={fmtMs}
-                hint={`${totalTasks} tasks (window)`} history={p50Spark} sparkColor={CP.accent} />
+                datum={derivedDatum(p50, EP.performance, absentReason)} format={fmtMs}
+                hint={countHint(p50)} history={p50Spark} sparkColor={CP.accent} />
               <ST label="p95 time-to-completion"
-                datum={derivedDatum(p95, EP.performance, 'no tasks in this window')} format={fmtMs}
-                hint={`${totalTasks} tasks (window)`} history={p95Spark} sparkColor={CP.warn} />
-              <ST label="One-pass success" datum={derivedDatum(onePass, EP.performance, 'no tasks in this window')} format={fmtPct} unit={onePass == null ? '' : '%'}
-                hint={onePass == null ? 'no tasks' : 'across all paths'} history={onePassSpark} sparkColor={CP.ok} />
-              <ST label="Human escalation rate" datum={derivedDatum(escalation, EP.performance, 'no tasks in this window')} format={fmtPct} unit={escalation == null ? '' : '%'}
+                datum={derivedDatum(p95, EP.performance, absentReason)} format={fmtMs}
+                hint={countHint(p95)} history={p95Spark} sparkColor={CP.warn} />
+              <ST label="One-pass success" datum={derivedDatum(onePass, EP.performance, absentReason)} format={fmtPct} unit={onePass == null ? '' : '%'}
+                hint={onePass == null ? null : 'across all paths'} history={onePassSpark} sparkColor={CP.ok} />
+              <ST label="Human escalation rate" datum={derivedDatum(escalation, EP.performance, absentReason)} format={fmtPct} unit={escalation == null ? '' : '%'}
                 hint="interactive" history={escalationSpark} sparkColor={CP.warn} />
             </>
           );
@@ -493,7 +497,7 @@ function PerfTab({ projectFilter }) {
 
       {projects.map(pid => {
         const p = DF.PERFORMANCE[pid];
-        const cards = servedDatum(p.cards, EP.performance, `the performance payload has no cards Datum for ${pid}`);
+        const cards = projectCards(DF, pid);
         const block = cards.value;
         const summary = (
           <>
