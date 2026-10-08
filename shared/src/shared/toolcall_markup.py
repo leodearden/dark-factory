@@ -438,9 +438,9 @@ _ANY_OPENER_RE = re.compile(
 #
 # A BOUNDED STEP COUNT IS ONLY A BOUND ON COST WHILE EACH STEP STAYS CHEAP, and
 # these ceilings MULTIPLY: candidates x tail items x inner closers. Task 4502's
-# ambiguity probe briefly made the innermost step O(len(body)) by slicing, which
-# these ceilings do not contain — see :func:`_parse_body`'s *start* parameter.
-# Anything added inside these loops must be O(1) in the input length.
+# alternative-boundary check briefly made the innermost step O(len(body)) by
+# slicing, which these ceilings do not contain — see :func:`_at_item_boundary`'s
+# *pos*. Anything added inside these loops must be O(1) in the input length.
 _MAX_CANDIDATES = 64
 _MAX_TAIL_ITEMS = 64
 
@@ -511,6 +511,61 @@ def _as_name_set(names: object) -> frozenset[str]:
     return frozenset(name for name in names if isinstance(name, str))
 
 
+def _skip_blank(body: str, pos: int) -> int:
+    """The first position at or after *pos* that is not whitespace."""
+    while pos < len(body) and body[pos].isspace():
+        pos += 1
+    return pos
+
+
+class _ItemOpener(NamedTuple):
+    """An item opener matched in a body, and the closer name that ends its item."""
+
+    name: str
+    closer_name: str
+    end: int
+
+
+def _item_opener_at(body: str, pos: int) -> _ItemOpener | None:
+    """The item opener at *pos* in *body*, in the parser's order, else ``None``.
+
+    The ONE definition of "an item opens here", shared by :func:`_parse_body`
+    and condition (ii) of :func:`_inner_markup_blocks`, so the boundary rule
+    cannot drift from the parser it reasons about. Canonical first, because
+    its closer is ``parameter`` while a name-echoing opener closes on its own
+    name.
+    """
+    match = _CANONICAL_OPENER_RE.match(body, pos)
+    if match is not None:
+        return _ItemOpener(match.group(1), _NAME_PARAMETER, match.end())
+    match = _ECHO_OPENER_RE.match(body, pos)
+    if match is not None:
+        return _ItemOpener(match.group(1), match.group(1), match.end())
+    return None
+
+
+def _at_item_boundary(body: str, pos: int) -> bool:
+    """Would :func:`_parse_body`, standing at *pos*, be at an ITEM BOUNDARY?
+
+    True when only whitespace remains, or an item opener follows it.
+
+    *pos* is a position into the shared *body*, NOT a slice of the remainder,
+    and that is a performance contract. This runs once per inner closer per
+    tail item per candidate, and almost always answers in O(1): the remainder
+    starts mid-prose and neither opener matches. The obvious slice is
+    O(len(body)) instead. Measured on the sliced version at a CONSTANT 1024
+    calls, growing only the body: 216 KB -> 0.0042 s, 3.2 MB -> 0.0496 s,
+    i.e. linear in a length the decision does not depend on, and
+    :func:`repair` pays that up to :data:`_MAX_CANDIDATES` times over on the
+    middleware's synchronous request path. DO NOT turn *pos* into a slice,
+    such as a ``strip()`` of the remainder: no regex here is anchored (see
+    :data:`_CANONICAL_OPENER_RE`, :data:`_ECHO_OPENER_RE` — neither uses ``^``
+    or a lookbehind), so a position is exactly equivalent and merely free.
+    """
+    pos = _skip_blank(body, pos)
+    return pos >= len(body) or _item_opener_at(body, pos) is not None
+
+
 def _inner_markup_blocks(
     body: str,
     value_start: int,
@@ -557,12 +612,12 @@ def _inner_markup_blocks(
         next-tool-call paragraph, reported as ``outcome=repaired`` and, under
         FORWARD_REPAIR, written straight into the tool's arguments — the exact
         swallow-the-next-call failure this condition exists to prevent, reached
-        through the mirror image of negative control (a). The ambiguity probe
-        (ii) does not catch it, because that trailing prose does not itself
-        parse as pseudo-parameters; or
-    (ii) reading that closer as this item's terminator ALSO yields a valid
-        parse of the remainder — the genuine AMBIGUITY B5's own wording
-        describes, where the item's boundary really is a guess.
+        through the mirror image of negative control (a). (ii) does not catch
+        it: that trailing prose is not an item boundary; or
+    (ii) reading that closer as this item's terminator leaves the parser at an
+        ITEM BOUNDARY: nothing but whitespace follows, or an opener does — the
+        genuine AMBIGUITY B5's own wording describes, where the item's boundary
+        really is a guess.
 
     Otherwise the occurrence is QUOTED PROSE and recovery proceeds.
 
@@ -582,11 +637,8 @@ def _inner_markup_blocks(
       opened a SIBLING ITEM on, so reading it as prose is a guess about where
       this item ends — precisely what B5 refuses — and guessing wrong writes
       one argument's text into another and reports it ``repaired``.
-    * Probe (ii) cannot decide it from EITHER position: run from an inner
-      CLOSER, as it is, the remainder ahead of such an opener begins mid-prose;
-      run from an inner OPENER — the alternative weighed for 5620 — it stays
-      silent whenever the sibling's own text carries a closing tag, which the
-      depth-1 bound reads as "does not parse".
+    * Condition (ii) cannot decide it: it reads only the position after an
+      inner CLOSER, and the remainder ahead of such an opener begins mid-prose.
     * BOTH DIALECTS, via :data:`_ANY_OPENER_RE`, because :func:`_parse_body`
       tries the canonical opener first and falls back to the name-echoing one:
       both are shapes it would have opened on — a property of the PARSER, not
@@ -611,27 +663,26 @@ def _inner_markup_blocks(
     swallowed; that shape predates 4502 and is owned by task **5639**.
 
     CONDITION (i) IS NOT REDUNDANT, and dropping it is the single most likely
-    way a reimplementation goes wrong. The ambiguity probe alone — or
-    qualifying inner closers only on schema membership — also accepts
+    way a reimplementation goes wrong. Condition (ii) alone — or qualifying
+    inner closers only on schema membership — accepts a mis-close of this item
+    followed by trailing text that is not an item boundary, silently
+    swallowing that text into the recovered value: a no-silent-partial-repair
+    failure, strictly worse than ``None``. The original witness is
     committed-corpus record 25 (``mcp__plan-tools__add_design_decision`` /
-    ``decision``), whose value opens canonically for ``rationale``, closes with
-    the name-echoing ``rationale`` closer, and is followed by an invoke closer
-    plus the head of a whole NEXT invoke block. The probe does not catch it
-    because that residue does not itself parse as pseudo-parameters, so the
-    naive rule would silently swallow the next tool call's fragment into the
-    recovered ``rationale`` — a no-silent-partial-repair failure, and strictly
-    worse than the ``None`` returned today.
+    ``decision``), a canonical ``rationale`` closed by the name-echoing
+    ``rationale`` closer and followed by the head of a whole NEXT invoke
+    block. Since 5620 the opener mirror refuses that record first, so the
+    live witnesses are negative controls (b) and (d).
 
-    *value_start* is *item_value*'s offset within *body*, so the probe can read
-    the remainder from the shared string rather than copying it: it is passed
-    as :func:`_parse_body`'s *start*, NOT used to slice. That is a performance
-    contract, not a stylistic one — see *start*'s own docstring for the
-    measurement and for why slicing here is super-linear on the request path.
+    *value_start* is *item_value*'s offset within *body*, so (ii) reads the
+    position after an inner closer from the shared string rather than copying
+    the remainder: it is passed to :func:`_at_item_boundary` as *pos*, NOT used
+    to slice. That is a performance contract — see *pos* there.
 
     Bounded like everything else here: at most :data:`_MAX_CANDIDATES` inner
-    closers are considered, and the probe runs at depth 1 with the blanket
-    substring behaviour restored, so it cannot recurse. Beyond the budget the
-    answer is BLOCK, the conservative direction.
+    closers are considered, and (ii) is local — a whitespace skip and two
+    anchored matches — so it never recurses. Beyond the budget the answer is
+    BLOCK, the conservative direction.
     """
     if _ANY_OPENER_RE.search(item_value) is not None:
         return True  # (i)'s OPENER MIRROR: a sibling this parser would have opened
@@ -647,105 +698,52 @@ def _inner_markup_blocks(
             or closer_for(inner_name) == INVOKE_CLOSER
         ):
             return True  # (i) a mis-close of THIS item, or a call boundary
-        if _parse_body(body, probe=True, start=value_start + inner.end()) is not None:
-            return True  # (ii) the alternative boundary parses too — a guess
+        if _at_item_boundary(body, value_start + inner.end()):
+            return True  # (ii) the alternative boundary is an item boundary — a guess
     # The prefilter fired but no WELL-FORMED closer is present, so there is
     # nothing to reason about: keep B5's original answer rather than widening
     # the carve-out onto a shape this rule was never measured against.
     return considered == 0
 
 
-def _parse_body(body: str, *, probe: bool, start: int = 0) -> dict[str, str] | None:
+def _parse_body(body: str) -> dict[str, str] | None:
     """The item loop of :func:`_parse_tail`, after the invoke closer is stripped.
 
-    Factored out (task **4502**) so :func:`_inner_markup_blocks` can ask whether
-    a remainder ALSO parses without standing up a second parser that could
-    drift from this one. *probe* is that reentrant call: it restores the blanket
-    bare-substring refusal, which bounds the recursion at depth 1 by
-    construction — deliberately a flag rather than a depth counter, because
-    there is exactly one legal depth and a counter would invite a second.
-
-    THAT DEPTH-1 REFUSAL NO LONGER FIRES (task **5620**), and is kept anyway.
-    :func:`_inner_markup_blocks` now blocks any value carrying a well-formed
-    parameter opener, and an opener at the remainder's start position is the
-    only thing the probe could have parsed an item from — so the branch is
-    unreachable BY CONSTRUCTION rather than merely untested, and condition (ii)
-    decides only whether the remainder is blank. Instrumented across the five
-    markup suites: 1 execution at ``1b9fedeb97``, 0 at ``715bf54b9d``. Stated
-    here as the measurement it is, with the collapse owned by ticket
-    task **5640**, so a reader meets a known dead branch
-    rather than an oversight. Note what the collapse may NOT take with it:
-    *start* below carries its own separately-measured performance contract and
-    has nothing to do with this rule.
-
-    *start* is where in *body* to begin, and is what keeps the probe CHEAP. It
-    exists instead of the obvious ``_parse_body(body[offset:], ...)`` because
-    that slice is O(len(body)) and runs once per inner closer per tail item per
-    candidate, while the probe itself almost always answers in O(1) — the
-    remainder starts mid-prose, neither opener matches at *pos*, and it returns
-    immediately. Measured on the sliced version at a CONSTANT 1024 probes,
-    growing only the body: 216 KB -> 0.0042 s, 3.2 MB -> 0.0496 s, i.e. linear
-    in a length the parse work does not depend on, and :func:`repair` pays that
-    up to :data:`_MAX_CANDIDATES` times over. Since :func:`repair` runs
-    synchronously on the middleware's request path, a large leaked argument
-    stalled the server for the duration. DO NOT "simplify" *start* back into a
-    slice: no regex here is anchored (see :data:`_CANONICAL_OPENER_RE`,
-    :data:`_ECHO_OPENER_RE`, :func:`_closer_re` — none uses ``^`` or a
-    lookbehind), so passing a position is exactly equivalent and merely free.
+    Each item opens through :func:`_skip_blank` and :func:`_item_opener_at`,
+    the same opening step condition (ii) of :func:`_inner_markup_blocks` takes
+    through :func:`_at_item_boundary`, so B5's boundary test and this parser
+    share one definition of where an item may open.
 
     ``None`` means the body did not parse with ZERO leftover.
     """
     recovered: dict[str, str] = {}
-    pos = start
+    pos = 0
     for _ in range(_MAX_TAIL_ITEMS):
-        while pos < len(body) and body[pos].isspace():
-            pos += 1
+        pos = _skip_blank(body, pos)
         if pos >= len(body):
             return recovered
 
-        match = _CANONICAL_OPENER_RE.match(body, pos)
-        if match is not None:
-            name = match.group(1)
-            closer_name = _NAME_PARAMETER
-        else:
-            match = _ECHO_OPENER_RE.match(body, pos)
-            if match is None:
-                return None  # leftover text — not a parse, so not a repair
-            name = match.group(1)
-            closer_name = name
+        opener = _item_opener_at(body, pos)
+        if opener is None:
+            return None  # leftover text — not a parse, so not a repair
 
-        closer = _closer_re(closer_name).search(body, match.end())
+        closer = _closer_re(opener.closer_name).search(body, opener.end)
         if closer is None:
-            item_value = body[match.end():]  # final UNTERMINATED opener
+            item_value = body[opener.end:]  # final UNTERMINATED opener
             pos = len(body)
         else:
-            item_value = body[match.end(): closer.start()]
+            item_value = body[opener.end: closer.start()]
             pos = closer.end()
 
         # THE CHEAP PREFILTER, retained verbatim so the clean path pays exactly
         # what it paid before: one substring scan, and nothing else.
-        if '\x3c/' in item_value:
-            if probe:
-                # Depth 1. The probe only has to answer "does this remainder
-                # parse at all"; re-entering the narrowing here would recurse.
-                #
-                # MEASURED UNREACHABLE as of task 5620, and deliberately kept.
-                # Instrumented across the five markup suites: 1 execution at
-                # 1b9fedeb97, 0 at 715bf54b9d. The probe can only parse an item
-                # when an opener sits at its start position, and that value is
-                # now blocked by the opener mirror before condition (ii) is
-                # consulted, so (ii) decides only whether the remainder is
-                # blank. Collapsing the apparatus belongs to task 5640,
-                # not here: it means deleting a
-                # recursion bound task 4502 landed with an explicit
-                # flag-not-counter argument. *start* must survive that collapse
-                # regardless — its contract is independent of this rule.
-                return None
-            if _inner_markup_blocks(body, match.end(), item_value, name, closer_name):
-                return None  # a SECOND mis-close: the boundary is a guess (B5)
-        if name in recovered:
+        if '\x3c/' in item_value and _inner_markup_blocks(
+            body, opener.end, item_value, opener.name, opener.closer_name
+        ):
+            return None  # a SECOND mis-close: the boundary is a guess (B5)
+        if opener.name in recovered:
             return None  # the same parameter twice is not a well-formed tail
-        recovered[name] = item_value
+        recovered[opener.name] = item_value
 
     return None  # more items than any real call has — refuse rather than guess
 
@@ -771,8 +769,9 @@ def _parse_tail(tail: str) -> dict[str, str] | None:
     ALTERNATIVE-BOUNDARY test rather than a bare substring refusal: markup
     inside a recovered item's value blocks recovery when a closing tag
     mis-closes THAT item or spans a tool-call boundary, when reading it as the
-    terminator also parses, or when the value carries a well-formed parameter
-    OPENER in either dialect — but NOT when a closer is merely quoted prose. A recovered value is verbatim caller
+    terminator leaves the parser at an item boundary, or when the value carries
+    a well-formed parameter OPENER in either dialect — but NOT when a closer is
+    merely quoted prose. A recovered value is verbatim caller
     text under invariant D5, and a faithful report of a markup leak necessarily
     quotes the leak; ``clean_value``'s envelope-free post-condition is
     untouched, because that is the value the repairer REWROTE.
@@ -783,7 +782,7 @@ def _parse_tail(tail: str) -> dict[str, str] | None:
     if body.endswith(INVOKE_CLOSER):
         body = body[: -len(INVOKE_CLOSER)].rstrip()
 
-    return _parse_body(body, probe=False)
+    return _parse_body(body)
 
 
 def repair(

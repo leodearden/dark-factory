@@ -1066,8 +1066,8 @@ class TestQuotedReportIsRepairable:
 
         The trailing ``xyz`` closer and the prose after it are LOAD-BEARING and
         must not be tidied away: without them the sibling's text ends the body,
-        the remainder after that closer is empty, an empty remainder parses as
-        an empty recovery, and condition (ii) refuses the whole specimen. Each
+        the remainder after that closer is empty, a blank remainder is an item
+        boundary, so condition (ii) refuses the whole specimen. Each
         of these would then pass for a reason that has nothing to do with the
         opener rule it exists to pin.
         """
@@ -1159,8 +1159,8 @@ class TestQuotedReportIsRepairable:
         ``rationale`` opens in the CANONICAL dialect but closes with the
         name-echoing ``rationale`` closer, and is followed by an invoke closer
         and then the head of a whole NEXT invoke block ending in an
-        unterminated opener. An ambiguity probe alone does not catch this (the
-        residue does not itself parse as pseudo-parameters), so a narrowing
+        unterminated opener. Condition (ii) alone does not catch this (the
+        residue is not an item boundary), so a narrowing
         that qualified inner closers only on ambiguity — or only on schema
         membership — would ACCEPT it and silently swallow the next tool call's
         fragment into the recovered ``rationale``. That is the
@@ -1169,7 +1169,8 @@ class TestQuotedReportIsRepairable:
 
         An item's OWN closing tag appearing inside its value is a cross-dialect
         mis-close by definition, never prose about itself — which is why the
-        rule may state that condition categorically.
+        rule may state that condition categorically. Since task 5620 the
+        opener mirror refuses this specimen before condition (i) is consulted.
         """
         clean = 'Recording the rationale for the routing change.'
         value = (
@@ -1221,8 +1222,8 @@ class TestQuotedReportIsRepairable:
         Referenced by SHAPE rather than duplicated: this is exactly
         ``TestRepairRefuses::test_doubly_corrupted_tail_is_refused`` — a
         name-echoing ``agent_id`` item closed by the ``details`` closer, where
-        reading that closer as the terminator ALSO yields a valid parse of the
-        remainder. That is the genuine ambiguity B5 was written for ("its
+        nothing follows that closer, so reading it as the terminator is
+        equally valid. That is the genuine ambiguity B5 was written for ("its
         boundary is a guess"), it is NOT quoted prose, and it stays refused.
         Asserted here too so the two halves of the narrowed rule — own-name and
         alternative-boundary — are both pinned inside this class.
@@ -1257,9 +1258,9 @@ class TestQuotedReportIsRepairable:
         ``agent_id`` as ``'claude-interactive'`` + the canonical closer + the
         whole trailing paragraph, reported as ``outcome=repaired`` — so under
         FORWARD_REPAIR a corrupt ``agent_id`` carrying the head of the NEXT
-        tool call went straight into the tool's arguments. Probe (ii) cannot
-        save this: the trailing prose does not itself parse as pseudo-
-        parameters, which is the same argument control (a) makes.
+        tool call went straight into the tool's arguments. (ii) cannot save
+        this: the trailing prose is not an item boundary, which is the same
+        argument control (a) makes.
 
         The fix lists ``parameter`` categorically, independent of the item's
         opener dialect, because ``_parse_body`` treats the canonical closer as
@@ -1302,14 +1303,9 @@ class TestQuotedReportIsRepairable:
         through an OPENER instead of a closer, which is why the opener half is
         stated as categorically as condition (i) states the closer half.
 
-        THE AMBIGUITY PROBE CANNOT REACH THIS, as it stands OR moved. As it
-        stands, (ii) runs from each inner CLOSER, and both remainders here
-        begin mid-prose, so neither parses. Moved to run from each inner OPENER
-        — the other remedy weighed for this task — it still answers "does not
-        parse", because the sibling's own text carries the trailing ``xyz``
-        closer and the probe's depth-1 bound restores the blanket substring
-        refusal for exactly that. Only a rule stated on the opener refuses this
-        shape.
+        CONDITION (ii) CANNOT REACH THIS: it reads only the position after
+        each inner closer, and both remainders here begin mid-prose. Only a
+        rule stated on the opener refuses this shape.
         """
         value = (
             self._CLEAN
@@ -1343,8 +1339,8 @@ class TestQuotedReportIsRepairable:
         (a)/(d) on the closer side, (g)/(h) on the opener side.
 
         The trailing ``xyz`` closer inside the sibling's text is kept for (g)'s
-        reason — so that ONLY the opener rule can refuse this, and the
-        ambiguity probe demonstrably cannot, from either position.
+        reason — so that ONLY the opener rule can refuse this, and condition
+        (ii) cannot.
         """
         value = (
             self._CLEAN
@@ -1357,13 +1353,15 @@ class TestQuotedReportIsRepairable:
 
     # -- the narrowed rule's own BOUNDS -------------------------------------
     #
-    # Three branches decide how far the narrowing does NOT reach: the
-    # malformed-closer fallback, the inner-closer budget, and the probe's depth
-    # bound. Measured with ``pytest --cov=shared.toolcall_markup`` before these
-    # pins existed, all three were UNEXECUTED by the entire suite — so for a
-    # change whose whole subject is loosening a safety guard, the parts that
-    # bound the loosening carried no regression pin at all. Each specimen below
-    # is mutation-verified: deleting the branch it names flips that specimen and
+    # These decide how far the narrowing does NOT reach: the malformed-closer
+    # fallback, the inner-closer budget, and the alternative-boundary controls
+    # (task 5638) for an opener standing just after an inner closer. When task
+    # 4502 measured with ``pytest --cov=shared.toolcall_markup``, the three
+    # branches then bounding it — the first two and a since-removed probe depth
+    # bound — were all UNEXECUTED by the entire suite, so for a change whose
+    # whole subject is loosening a safety guard, the parts that bound the
+    # loosening carried no regression pin at all. Controls (e) and (f) are
+    # mutation-verified: deleting the branch each names flips that specimen and
     # leaves every other test in this file green.
 
     def test_a_malformed_closing_sequence_alone_is_still_refused(self):
@@ -1440,9 +1438,9 @@ class TestQuotedReportIsRepairable:
     ):
         """The both-ways control for the test above: the spanned parse completes.
 
-        It fails under the tempting collapse of condition (ii) to "only a blank
-        remainder is a boundary", which recovers this specimen while every
-        other markup test stays green.
+        Refused before task 5638 as well, so it pins that the collapse of
+        condition (ii) lost nothing: the tempting "only a blank remainder is a
+        boundary" variant would newly recover this specimen.
         """
         value = self._spanning_opener_value(opener, own_closer, '')
 
@@ -1458,8 +1456,7 @@ class TestQuotedReportIsRepairable:
         parse?", at depth 1 it restores the blanket substring refusal, so a
         remainder that WOULD parse into an item whose own value quotes markup
         reads as "does not parse", condition (ii) stays silent, and the tail is
-        recovered whole. The mutation it cited was real, and the bound it
-        describes still exists.
+        recovered whole. The mutation it cited was real.
 
         IT WAS ALSO A PIN ON THE DEFECT TASK 5620 REMOVES. This specimen
         differs from negative control (g) in ONE cell — a single space where
@@ -1479,8 +1476,7 @@ class TestQuotedReportIsRepairable:
         refuses the value before condition (ii) is consulted, so the old
         MUTATION-VERIFIED claim — that deleting the ``probe`` short-circuit
         flips this answer — no longer holds and is deliberately not restated.
-        :func:`shared.toolcall_markup._parse_body` carries the measured
-        consequence for that branch.
+        Task 5638 then removed that bound altogether.
         """
         value = (
             self._CLEAN
