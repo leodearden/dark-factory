@@ -2305,6 +2305,108 @@
           "current": 31946
         }
       ]
+    },
+    {
+      "task_id": "4830",
+      "reason": "Net-additive feature (PRD plans/merge-status-durable-non-landed-prd.md task gamma): merge_finalized gains absorbed_request_ids derived from the in-flight entry; registry gains record_coalesced/primary_entry; recovery threads the registry into enqueue. Not a failed refactor.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 66,
+          "current": 72
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 2192,
+          "current": 2193
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py::enqueue_merge_request",
+          "baseline": 17,
+          "current": 18
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/queue_store.py",
+          "baseline": 885,
+          "current": 886
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 1827,
+          "current": 1864
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22057,
+          "current": 22081
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 962,
+          "current": 977
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12514,
+          "current": 12519
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4827,
+          "current": 4834
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57336,
+          "current": 57398
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31946,
+          "current": 31966
+        }
+      ]
+    },
+    {
+      "task_id": "4830",
+      "reason": "Amendment (review suggestion 1, PRD plans/merge-status-durable-non-landed-prd.md task gamma): a detaching release now keeps the ids of the waiters it cancels (_InFlightEntry.release_waiters / released_waiter_ids), so a C3 REPLACE, stale-reap or merge_cancel row still lists them in absorbed_request_ids. Net-additive bug fix; release()'s cognitive falls 10 -> 3 by moving the waiter teardown onto the entry.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 1864,
+          "current": 1875
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/types.py",
+          "baseline": 977,
+          "current": 978
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57398,
+          "current": 57409
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31966,
+          "current": 31967
+        }
+      ]
     }
   ]
 }

@@ -252,7 +252,9 @@ def test_sketch_9_a_window_counts_its_own_merges_and_each_attempt_once(served_bo
     in_window = [attempt for attempt in MERGE_ATTEMPTS if attempt.age <= span]
 
     assert body['WINDOW']['served'] == window
-    assert block['recent_total'] == len(block['recent']) == len(in_window)
+    assert block['recent_total']['state'] == 'fresh', 'a readable runs.db window total is measured'
+    assert block['speculative']['state'] == 'fresh', 'a readable runs.db speculative count is measured'
+    assert block['recent_total']['value'] == len(block['recent']) == len(in_window)
     latency = block['latency']
     assert sum(block['outcomes']['values']) == latency['with_duration'] + latency['without_duration']
     assert latency['with_duration'] == sum(1 for attempt in in_window if attempt.duration_ms)
@@ -262,7 +264,7 @@ def test_sketch_9_a_window_counts_its_own_merges_and_each_attempt_once(served_bo
 def test_sketch_9_the_two_windows_hold_different_merges(served_bodies):
     week, day = (served_bodies[f'merge_{window}']['MERGE_QUEUE']['dark-factory'] for window in ('7d', '24h'))
 
-    assert week['recent_total'] != day['recent_total']
+    assert week['recent_total']['value'] != day['recent_total']['value']
     assert len(week['recent']) != len(day['recent'])
 
 

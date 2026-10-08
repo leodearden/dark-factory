@@ -1890,7 +1890,6 @@ class TestExemptionSeparatorVariants:
 # can produce two.  test_merge_speculation.py measures ZERO (task 3980 migrated it)
 # and is deliberately ABSENT.
 _EXPECTED_WALL_CLOCK_DEBT_PATHS = frozenset({
-    'orchestrator/tests/test_merge_queue.py',
     'orchestrator/tests/test_merge_queue_concurrent_verify.py',
     'orchestrator/tests/test_concurrent_verify_boundary.py',
     'orchestrator/tests/test_merge_queue_lifecycle_registry.py',
@@ -2118,8 +2117,8 @@ class TestWallClockDeadlineDebtBaseline:
         """The budget is what makes 'shrink-only' checked rather than merely commented.
 
         Without it a debt entry grandfathers its file WHOLESALE, so a brand-new
-        wall-clock wait added to test_merge_queue.py (the largest debt file, an
-        actively-developed hub) would be invisible to the gate forever.
+        wall-clock wait added to an actively-developed debt file would be
+        invisible to the gate forever.
         """
         at_budget = _against_a_budget_of_1(1)
         assert at_budget == [], (

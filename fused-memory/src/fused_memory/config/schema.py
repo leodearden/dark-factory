@@ -2359,6 +2359,13 @@ class CuratorConfig(BaseModel):
     zot_duplicate_score_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
     zot_duplicate_search_limit: int = Field(default=5, ge=1)
 
+    # Degraded-streak alarm (task 4448): escalate once when one project's run
+    # of CONSECUTIVE degraded curations, of any cause, reaches this length.
+    # Counted per project_id, so another project's healthy curations neither
+    # reset nor mask it. Distinct from zero_output_breaker_threshold above,
+    # which counts only hung calls and short-circuits them; this only reports.
+    degraded_streak_threshold: int = Field(default=5, ge=1)
+
     # Cancelled-premise blocklist: path (absolute, or relative to server cwd)
     # of a YAML file listing premises proven wrong by revert. Matching
     # candidates are dropped before any LLM call. None disables the guard.

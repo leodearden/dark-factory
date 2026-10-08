@@ -50,9 +50,11 @@ from shared.cli_invoke import (
     AgentResult,
     AllAccountsCappedException,
     TranscriptEvidence,
+    claude_binary_spec,
     invoke_with_cap_retry,
     is_zero_output_timeout,
     no_mcp_servers_config,
+    resolve_claude_binary,
     transcript_evidence_for_session,
 )
 from shared.config_dir import (
@@ -421,6 +423,12 @@ class CuratorDecision:
     # candidate in the same batch (neither yet materialised as a task).
     # The worker substitutes the sibling's resulting task_id at dispatch time.
     batch_target_index: int | None = None
+    # True for a fail-open create that no dedupe judgement stands behind: the
+    # response itself was unusable, or the curator never got one. False for a
+    # usable decision that POOL STATE vetoed. Every fail-open create states it
+    # explicitly, as enforced (with the classification rule spelled out) by
+    # fused-memory/tests/test_curator_arm_instrumentation_guard.py.
+    degraded: bool = False
     # Structured signal that dedupe was silently skipped for this create by a
     # zero-output hang; never derived from ``justification``, which is shared.
     degraded_by_zot: bool = False
@@ -758,6 +766,19 @@ def _scale_budget(base: float, per_entry: float, size: int, cap: float) -> float
     return min(base + per_entry * size, cap)
 
 
+@dataclass
+class _DegradedStreak:
+    """One project's run of consecutive degraded curations.
+
+    ``alarm_fired`` latches so a streak escalates once, not once per curation
+    past the threshold; the whole record is discarded on that project's next
+    usable decision.
+    """
+
+    count: int = 0
+    alarm_fired: bool = False
+
+
 class _LazyRegistry:
     """One-shot, off-loop lazy load of a YAML registry file.
 
@@ -927,6 +948,13 @@ class TaskCurator:
         self._consecutive_zero_output_timeouts: int = 0
         # monotonic() time until which the breaker is open (None = closed).
         self._zero_output_breaker_open_until: float | None = None
+        # Degraded-curation streaks by project_id (task 4448). Distinct from
+        # the ZOT counter above: that one counts hung calls in order to stop
+        # paying for them; these count degraded decisions of every cause, in
+        # order to make a sustained outage visible. Keyed by project because
+        # one curator serves every project, so a shared count would let one
+        # project's healthy curations mask another's outage.
+        self._degraded_streaks: dict[str, _DegradedStreak] = {}
 
     # ------------------------------------------------------------------
     # Zero-output-timeout circuit breaker (task 1743)
@@ -1606,6 +1634,128 @@ class TaskCurator:
         )
         return decision
 
+    # ------------------------------------------------------------------
+    # Backend-binary startup self-check (task 4448)
+    # ------------------------------------------------------------------
+
+    async def startup_self_check(self, project_id: str, project_root: str) -> bool:
+        """Report whether the curator's backend CLI binary resolves. Never raises.
+
+        An unresolvable binary degrades every curation; asking once at wiring
+        time escalates it before the first candidate is filed. A verdict, not
+        a precondition: a curator without its binary still fails open to
+        ``action='create'``, whereas raising would reach the interceptor's
+        ``except Exception -> return None`` and disable dedupe outright.
+        """
+        spec = claude_binary_spec()
+        resolved = resolve_claude_binary()
+        if resolved is not None:
+            logger.info(
+                'task_curator: backend binary %r resolves to %s', spec, resolved,
+            )
+            return True
+
+        search_path = os.environ.get('PATH', '')
+        logger.error(
+            'task_curator: backend binary %r does not resolve (PATH=%s) — every '
+            'curation for project %s will degrade to action=create WITHOUT '
+            'dedupe until this is fixed. Set CLAUDE_BINARY to an absolute path, '
+            'or pin Environment=PATH= in the fused-memory systemd unit.',
+            spec, search_path, project_id,
+        )
+        if self._escalator is not None:
+            await self._escalator.report_backend_binary_unresolvable(
+                project_root=project_root,
+                project_id=project_id,
+                binary_spec=spec,
+                search_path=search_path,
+            )
+        return False
+
+    # ------------------------------------------------------------------
+    # Class-agnostic degraded-streak alarm (task 4448)
+    # ------------------------------------------------------------------
+
+    def _reset_degraded_streak(self, project_id: str) -> None:
+        """Clear *project_id*'s streak and re-arm its alarm, on a usable decision."""
+        self._degraded_streaks.pop(project_id, None)
+
+    async def _degraded_create(
+        self,
+        *,
+        justification: str,
+        pool_sizes: dict[str, int],
+        start: float,
+        candidate: CandidateTask,
+        project_id: str,
+        project_root: str,
+        degraded_by_zot: bool = False,
+        zot_escalation_id: str | None = None,
+    ) -> CuratorDecision:
+        """Build a degraded ``action='create'`` decision and count it.
+
+        The only ``TaskCurator`` method that builds a create of its own, which
+        is what lets the streak be counted without enumerating why a curation
+        can degrade; fused-memory/tests/test_curator_arm_instrumentation_guard.py
+        enforces that. Degrading is the designed fail-open, so this neither
+        raises nor alters the decision; it only notices when degrading has
+        stopped being occasional.
+        """
+        decision = CuratorDecision(
+            action='create',
+            justification=justification,
+            pool_sizes=pool_sizes,
+            latency_ms=int((time.monotonic() - start) * 1000),
+            degraded=True,
+            degraded_by_zot=degraded_by_zot,
+            zot_escalation_id=zot_escalation_id,
+        )
+        await self._count_degraded(
+            justification=justification,
+            project_id=project_id,
+            project_root=project_root,
+            candidate_title=candidate.title,
+        )
+        return decision
+
+    async def _count_degraded(
+        self,
+        *,
+        justification: str,
+        project_id: str,
+        project_root: str,
+        candidate_title: str,
+    ) -> None:
+        """Advance *project_id*'s streak by one degraded curation, alarming once.
+
+        Shared by :meth:`_degraded_create` (single-candidate paths) and by
+        :meth:`_call_llm_batch` (items a successful round-trip nonetheless
+        failed to decide).  The alarm is class-agnostic by construction: it
+        takes only the fact that a curation degraded, never the reason.
+        """
+        streak = self._degraded_streaks.setdefault(project_id, _DegradedStreak())
+        streak.count += 1
+        threshold = self._config.curator.degraded_streak_threshold
+        if streak.count < threshold or streak.alarm_fired:
+            return
+
+        streak.alarm_fired = True
+        logger.error(
+            'task_curator: %d consecutive degraded curations for project %s '
+            '(threshold %d) — every candidate in that run was filed without '
+            'dedupe. Last: %s',
+            streak.count, project_id, threshold, justification,
+        )
+        if self._escalator is not None:
+            await self._escalator.report_consecutive_degraded(
+                project_root=project_root,
+                project_id=project_id,
+                streak=streak.count,
+                threshold=threshold,
+                last_justification=justification,
+                candidate_title=candidate_title,
+            )
+
     async def curate(
         self,
         candidate: CandidateTask,
@@ -1696,11 +1846,13 @@ class TaskCurator:
                 candidate.title,
                 self._consecutive_zero_output_timeouts,
             )
-            return CuratorDecision(
-                action='create',
+            return await self._degraded_create(
                 justification='zero-output-breaker-open',
                 pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
-                latency_ms=int((time.monotonic() - start) * 1000),
+                start=start,
+                candidate=candidate,
+                project_id=project_id,
+                project_root=project_root,
                 degraded_by_zot=True,
             )
 
@@ -1719,13 +1871,15 @@ class TaskCurator:
                     exc,
                     exc_info=True,
                 )
-                decision = CuratorDecision(
-                    action='create',
+                decision = await self._degraded_create(
                     justification=f'corpus-failed: {exc}',
                     pool_sizes={
                         'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0,
                     },
-                    latency_ms=int((time.monotonic() - start) * 1000),
+                    start=start,
+                    candidate=candidate,
+                    project_id=project_id,
+                    project_root=project_root,
                 )
                 self._store_cache(payload_hash, decision)
                 return decision
@@ -1743,6 +1897,17 @@ class TaskCurator:
             # Success: reset the consecutive-ZOT counter so a single hung call
             # that was followed by a healthy one doesn't accumulate toward open.
             self._reset_zero_output_breaker()
+            # A completed call can still carry no usable decision (the parser
+            # fails open without raising), so the streak keys on the decision.
+            if decision.degraded:
+                await self._count_degraded(
+                    justification=decision.justification,
+                    project_id=project_id,
+                    project_root=project_root,
+                    candidate_title=candidate.title,
+                )
+            else:
+                self._reset_degraded_streak(project_id)
         except AllAccountsCappedException as exc:
             logger.warning(
                 'task_curator: all accounts capped (%d retries in %.1fs) — deferring to create',
@@ -1757,11 +1922,13 @@ class TaskCurator:
                     timed_out=False,
                     duration_ms=int(exc.elapsed_secs * 1000),
                 )
-            decision = CuratorDecision(
-                action='create',
+            decision = await self._degraded_create(
                 justification='all-accounts-capped',
                 pool_sizes=pool_sizes,
-                latency_ms=int((time.monotonic() - start) * 1000),
+                start=start,
+                candidate=candidate,
+                project_id=project_id,
+                project_root=project_root,
             )
         except CuratorFailureError as exc:
             zot_escalation_id: str | None = None
@@ -1795,23 +1962,46 @@ class TaskCurator:
                 # from when the failure was observed, not from before the
                 # (potentially 180s) hung LLM call started.
                 self._record_zero_output_timeout(time.monotonic())
-            decision = CuratorDecision(
-                action='create',
+            decision = await self._degraded_create(
                 justification='llm-error-escalated',
                 pool_sizes=pool_sizes,
-                latency_ms=int((time.monotonic() - start) * 1000),
+                start=start,
+                candidate=candidate,
+                project_id=project_id,
+                project_root=project_root,
                 degraded_by_zot=exc.zero_output_timeout,
                 zot_escalation_id=zot_escalation_id if exc.zero_output_timeout else None,
             )
         except Exception as exc:
+            # An exception class nobody anticipated: degrade AND report, like
+            # the named arms. A silent create here is indistinguishable
+            # downstream from a healthy one.
             logger.warning(
-                'task_curator: LLM call failed, falling through to create: %s', exc,
+                'task_curator: LLM call failed with unexpected %s, '
+                'falling through to create: %s',
+                type(exc).__name__,
+                exc,
+                exc_info=True,
             )
-            decision = CuratorDecision(
-                action='create',
-                justification=f'llm-failed: {exc}',
+            if self._escalator is not None:
+                # Unguarded on purpose, as in the CuratorFailureError arm: with
+                # no orchestrator to escalate to, report_failure raises
+                # CuratorFailureError and the caller sees a loud failure.
+                await self._escalator.report_failure(
+                    project_root=project_root,
+                    project_id=project_id,
+                    justification=f'unexpected-exception: {type(exc).__name__}: {exc}',
+                    candidate_title=candidate.title,
+                    subtype=f'unexpected-exception:{type(exc).__name__}',
+                    pool_sizes=pool_sizes,
+                )
+            decision = await self._degraded_create(
+                justification=f'llm-failed: {type(exc).__name__}: {exc}',
                 pool_sizes=pool_sizes,
-                latency_ms=int((time.monotonic() - start) * 1000),
+                start=start,
+                candidate=candidate,
+                project_id=project_id,
+                project_root=project_root,
             )
 
         self._store_cache(payload_hash, decision)
@@ -2130,20 +2320,20 @@ class TaskCurator:
         # and size-1 alike — not just the size-1 successes handled by
         # curate().
         if llm_k_list and self._zero_output_breaker_open(time.monotonic()):
-            batch_breaker_now = time.monotonic()
             logger.warning(
                 'curate_batch: zero-output-breaker open — short-circuiting %d '
                 'LLM-bound candidate(s) to create (consecutive ZOTs=%d)',
                 len(llm_k_list),
                 self._consecutive_zero_output_timeouts,
             )
-            _empty_pool_sizes = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
             for _k in llm_k_list:
-                cache_hit_map[_k] = CuratorDecision(
-                    action='create',
+                cache_hit_map[_k] = await self._degraded_create(
                     justification='zero-output-breaker-open',
-                    pool_sizes=_empty_pool_sizes,
-                    latency_ms=int((batch_breaker_now - start) * 1000),
+                    pool_sizes={'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0},
+                    start=start,
+                    candidate=candidates[unique_indices[_k]],
+                    project_id=project_id,
+                    project_root=project_root,
                     degraded_by_zot=True,
                 )
             llm_k_list = []
@@ -3205,10 +3395,9 @@ class TaskCurator:
         # many healthy BATCH calls in a batch-dominant deployment until
         # threshold (default 2) trips the breaker and disables dedupe for
         # the cooldown (default 600s) on a healthy service (task 4143).
-        # Keyed on agent_result.success, not on decision quality:
-        # _parse_batch_decisions degrades unparseable items to
-        # action='create' without raising, and a degraded decision is
-        # still evidence the CLI round-trip completed.
+        # Keyed on agent_result.success, not on decision quality: what this
+        # breaker asserts is a wedged BACKEND, and a completed round-trip
+        # disproves that however unusable its payload turns out to be.
         #
         # This also closes an ALREADY-OPEN breaker/cooldown, not just the
         # counter: _call_llm_batch_with_fallback's two bisect halves run
@@ -3221,12 +3410,29 @@ class TaskCurator:
         # TestZeroOutputBreakerBatchReset.test_successful_batch_closes_already_open_breaker).
         self._reset_zero_output_breaker()
 
-        return _parse_batch_decisions(
+        decisions = _parse_batch_decisions(
             agent_result,
             pools=pools,
             pool_sizes_list=pool_sizes_list,
             latency_ms=latency_ms,
         )
+
+        # The streak, unlike the breaker, needs a usable DECISION rather than a
+        # completed round-trip: _parse_batch_decisions fails items open to
+        # action='create' without raising. One usable decision suffices — the
+        # other items' degradation is then the designed per-item fail-open.
+        if any(not d.degraded for d in decisions):
+            self._reset_degraded_streak(project_id)
+        else:
+            for candidate, decision in zip(candidates, decisions, strict=True):
+                await self._count_degraded(
+                    justification=decision.justification,
+                    project_id=project_id,
+                    project_root=project_root,
+                    candidate_title=candidate.title,
+                )
+
+        return decisions
 
     async def _call_llm_batch_with_fallback(
         self,
@@ -3638,7 +3844,7 @@ def _parse_decision_dict(
 
     Called by both :func:`_parse_decision` (single-item) and
     :func:`_parse_batch_decisions` (per-item inside a batch).  The function
-    **never raises**: every malformed-input path returns a degraded
+    **never raises**: every malformed-input path fails open to
     ``CuratorDecision(action='create', ...)`` instead of propagating an
     exception.  Per-item isolation in the batch path is provided by the
     ``try/except`` wrapper in :func:`_parse_batch_decisions`, not by
@@ -3652,6 +3858,7 @@ def _parse_decision_dict(
             pool_sizes=pool_sizes,
             latency_ms=latency_ms,
             cost_usd=cost_usd,
+            degraded=True,
         )
 
     justification = str(raw.get('justification', ''))
@@ -3695,23 +3902,39 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=True,
             )
         is_within_batch_drop = (
             action == 'drop'
             and batch_target_index is not None
             and target_id is None
         )
-        if not is_within_batch_drop and (not target_id or target_id not in valid_ids):
-            return CuratorDecision(
-                action='create',
-                justification=(
-                    f'invalid-target: action={action} target_id={target_id!r}; '
-                    f'not in pool'
-                ),
-                pool_sizes=pool_sizes,
-                latency_ms=latency_ms,
-                cost_usd=cost_usd,
-            )
+        if not is_within_batch_drop:
+            # Two causes, two branches: they fall on opposite sides of the
+            # degraded line (see CuratorDecision.degraded).
+            if not target_id:
+                return CuratorDecision(
+                    action='create',
+                    justification=(
+                        f'missing-target: action={action} has no target_id'
+                    ),
+                    pool_sizes=pool_sizes,
+                    latency_ms=latency_ms,
+                    cost_usd=cost_usd,
+                    degraded=True,
+                )
+            if target_id not in valid_ids:
+                return CuratorDecision(
+                    action='create',
+                    justification=(
+                        f'invalid-target: action={action} target_id={target_id!r}; '
+                        f'not in pool'
+                    ),
+                    pool_sizes=pool_sizes,
+                    latency_ms=latency_ms,
+                    cost_usd=cost_usd,
+                    degraded=False,
+                )
         # RC3 create-safe guard: never drop/combine against a pool entry whose
         # status is unconfirmable ('unknown' — e.g. a thin fallback entry built
         # after a TRANSIENT get_task failure, see _fetch_entry_for_neighbor).
@@ -3730,6 +3953,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=False,
             )
         # combine-only tasks must also be combine_eligible (pending status).
         if action == 'combine' and target_entry is not None and not target_entry.combine_eligible:
@@ -3742,6 +3966,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=False,
             )
 
     rewritten: RewrittenTask | None = None
@@ -3754,6 +3979,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=True,
             )
         try:
             rewritten = RewrittenTask(
@@ -3770,6 +3996,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=True,
             )
         if not rewritten.title or not rewritten.details:
             return CuratorDecision(
@@ -3778,6 +4005,7 @@ def _parse_decision_dict(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
+                degraded=True,
             )
 
     return CuratorDecision(
@@ -3818,6 +4046,7 @@ def _parse_decision(
                 pool_sizes=pool_sizes,
                 latency_ms=latency_ms,
                 cost_usd=agent_result.cost_usd,
+                degraded=True,
             )
 
     if not isinstance(raw, dict):
@@ -3827,6 +4056,7 @@ def _parse_decision(
             pool_sizes=pool_sizes,
             latency_ms=latency_ms,
             cost_usd=agent_result.cost_usd,
+            degraded=True,
         )
 
     return _parse_decision_dict(
@@ -3904,6 +4134,7 @@ def _parse_batch_decisions(
                 pool_sizes=pool_sizes_list[i] if i < len(pool_sizes_list) else {},
                 latency_ms=latency_ms,
                 cost_usd=cost_per_item,
+                degraded=True,
             ))
             continue
         try:
@@ -3921,6 +4152,7 @@ def _parse_batch_decisions(
                 pool_sizes=pool_sizes_list[i] if i < len(pool_sizes_list) else {},
                 latency_ms=latency_ms,
                 cost_usd=cost_per_item,
+                degraded=True,
             )
         results.append(decision)
 
@@ -3941,6 +4173,7 @@ def _parse_batch_decisions(
                     pool_sizes=d.pool_sizes,
                     latency_ms=d.latency_ms,
                     cost_usd=d.cost_usd,
+                    degraded=True,
                 )
 
     # Build the directed graph for cycle detection (only batch-drop edges).
@@ -3989,6 +4222,7 @@ def _parse_batch_decisions(
             pool_sizes=d.pool_sizes,
             latency_ms=d.latency_ms,
             cost_usd=d.cost_usd,
+            degraded=True,
         )
 
     return results

@@ -483,8 +483,8 @@ def _apply_debt_budget(
     - Not a debt file (*budget* is None) → every violation is reported unchanged.
     - At or under budget → silence: this is the grandfathering the baseline exists for.
     - Over budget → report exactly ``found - budget`` violations, so the noise is
-      proportional to the overrun rather than dumping all 317 Rule C violations of
-      test_merge_queue.py on someone who added one.
+      proportional to the overrun rather than dumping every Rule C violation of a
+      large debt file on someone who added one.
 
     The reported sites are the last in source order.  That choice is deterministic
     rather than diagnostic — the checker cannot know which site is new — and the
@@ -611,9 +611,9 @@ def _dataclass_double_violation(
 # The count is a BUDGET, not a comment.  A debt file is silent while it carries at
 # most its recorded number and reports the overrun the moment it carries more, so
 # "shrink-only" is enforced on the same hot path the rule itself runs on rather than
-# trusted.  This matters most for orchestrator/tests/test_merge_queue.py, an
-# actively-developed hub, where a wholesale grandfather would have made a brand-new
-# wall-clock wait added tomorrow invisible to the gate.
+# trusted.  This matters most for an actively-developed debt file, where a
+# wholesale grandfather would have made a brand-new wall-clock wait added tomorrow
+# invisible to the gate.
 #
 # DO NOT ADD ENTRIES, AND DO NOT RAISE A NUMBER.  Both may only shrink, as files are
 # migrated onto wait_responsive(...) with bounds derived from MERGE_RESULT_TIMEOUT.
@@ -633,7 +633,6 @@ def _dataclass_double_violation(
 # on trailing path COMPONENTS, so the package directory keeps them distinct.
 _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
     # orchestrator/tests
-    'orchestrator/tests/test_merge_queue.py': 267,
     'orchestrator/tests/test_merge_queue_concurrent_verify.py': 85,
     'orchestrator/tests/test_concurrent_verify_boundary.py': 44,
     'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 30,

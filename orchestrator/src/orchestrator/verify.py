@@ -1771,20 +1771,19 @@ def _should_archive_category(category: str) -> bool:
     return should_archive(category)
 
 
-def _serial_pytest_str(cmd: str | None) -> str | None:
+def _serial_pytest_str(cmd: str | None, *, invocation_dir: Path | None) -> str | None:
     """Rewrite every ``pytest`` invocation in *cmd* to run serially, via VerifyCmd.
 
     Thin string-level wrapper around ``parse_config_command`` ->
-    ``serial_pytest`` -> ``render`` (replaces ``_force_serial_pytest``):
-    appends `` -p no:xdist -o addopts=`` to a structured PYTEST command's
-    flags, or — for a raw-retained ``&&``-chain — to every ``pytest``
-    invocation's arguments via ``serial_pytest``'s localised regex rewrite.
-    ``-o addopts=`` clears any pyproject-level ``addopts`` (e.g. ``-n auto``)
-    — this is the exact ``-o addopts=""`` workaround that task 2045 proved
-    recovers a shared-venv-mutation transient, applied structurally rather
-    than by gambling on the concurrent ``uv sync`` window having closed.
-    ``-p no:xdist`` is belt-and-suspenders: it disables the xdist plugin
-    outright and is safe even when xdist is already absent from the venv.
+    ``serial_pytest`` -> ``render`` (replaces ``_force_serial_pytest``): the
+    recovery task 2045 proved for a shared-venv-mutation transient, applied
+    structurally rather than by gambling on the concurrent ``uv sync`` window
+    having closed. What the rewrite appends, and which addopts it keeps, is
+    ``verify_cmd.py::serial_pytest``'s contract. This wrapper supplies its
+    *ini_addopts*: those of the config pytest reads for *cmd* run from
+    *invocation_dir* (``verify_plan.py::governing_addopts``). Every caller
+    must name that directory; ``None`` resolves no config, so addopts are
+    blanked.
 
     Returns *cmd* unchanged when it is ``None`` or does not parse/chain into
     a PYTEST ToolKind (e.g. a ``cargo test --workspace`` command — covers
@@ -1817,18 +1816,12 @@ def _serial_pytest_str(cmd: str | None) -> str | None:
     command is an expected, benign no-op. That leaves exactly one thing a
     raw-retained PYTEST chain returning unchanged can be: the appender's
     refusal.
-
-    Tradeoff: clearing ``addopts`` also drops any per-subproject marker
-    filters baked into pyproject (e.g. ``-m 'not integration'``).  Accepted
-    for a single bounded recovery run whose only purpose is a
-    non-misattributed pass/fail signal — see run_verification's env-recovery
-    retry — and unavoidable at the CLI layer since the subproject's addopts
-    contents aren't visible to this string rewrite.
     """
     if cmd is None:
         return None
     parsed = parse_config_command(cmd)
-    rewritten = serial_pytest(parsed)
+    ini_addopts = verify_plan.governing_addopts(parsed, _worktree_reader(invocation_dir))
+    rewritten = serial_pytest(parsed, ini_addopts)
     if rewritten is parsed:
         if parsed.tool is ToolKind.PYTEST and parsed.raw is not None:
             refused = _unspliceable_pytest_spans(parsed.raw)
@@ -1866,9 +1859,10 @@ def _with_pytest_timeout_str(cmd: str | None, secs: int) -> str | None:
 
     The α confirm gate composes this OUTSIDE ``_serial_pytest_str`` — the
     generous explicit ``--timeout`` is required because the serial recovery's
-    ``-o addopts=`` clears pyproject ``addopts`` but NOT the
-    ``[tool.pytest.ini_options] timeout=60`` default, which would otherwise
-    starve the isolated confirm run into a false non-suppression.
+    ``-o addopts=<value>`` overrides only pyproject ``addopts`` — the
+    ``[tool.pytest.ini_options] timeout`` default is a separate ini key, so it
+    is neither cleared nor carried and would otherwise starve the isolated
+    confirm run into a false non-suppression.
     """
     if cmd is None:
         return None
@@ -7104,13 +7098,13 @@ async def run_verification(
         and attempt.test.cmd is not None
         and attempt.test.rc != 0
     ):
+        recovered_test_cmd = _serial_pytest_str(attempt.test.cmd, invocation_dir=worktree)
         logger.warning(
             'Verification hit an environmental shared-venv transient '
-            '(vanished xdist/pip); retrying test command once, forced serial '
-            '(this clears all pyproject addopts, including any marker '
-            'filters, for the recovery run — see serial_pytest)'
+            '(vanished xdist/pip); retrying test command once, forced serial, '
+            'with the addopts verify_cmd.py::serial_pytest keeps: %s',
+            recovered_test_cmd,
         )
-        recovered_test_cmd = _serial_pytest_str(attempt.test.cmd)
         new_test = await _run_or_skip_timed(
             recovered_test_cmd, label='test', current_attempt=current_attempt_id,
         )
@@ -9357,8 +9351,8 @@ async def run_main_tip_sweep(
 # 2370). A PASS on ANY attempt within this bound is treated as a confirmed
 # flake for that group — mirrors run_main_tip_sweep's single-retry heuristic,
 # widened slightly since this re-run is already scoped to just the named
-# tests (cheap) and serial/addopts-cleared (task 2045's proven xdist-
-# contention recovery). No config flag: the gate is a strict fail-safe
+# tests (cheap) and serial with xdist stripped from addopts (task 2045's
+# proven xdist-contention recovery). No config flag: the gate is a strict fail-safe
 # improvement over the status quo (a bare, unconfirmed alarm), so it is
 # always-on.
 _SWEEP_CONFIRM_MAX_ATTEMPTS = 2
@@ -9367,8 +9361,8 @@ _SWEEP_CONFIRM_MAX_ATTEMPTS = 2
 #: CONFIRM gate's isolated re-run command via ``_with_pytest_timeout_str``.
 #: Same rationale as ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS`` /
 #: ``_SWEEP_PREFILTER_TIMEOUT_SECS``: the serial recovery's ``-o addopts=``
-#: clears pyproject ``addopts`` but NOT the
-#: ``[tool.pytest.ini_options] timeout=60`` default, so without this
+#: overrides only pyproject ``addopts``, NOT the
+#: ``[tool.pytest.ini_options] timeout`` default, so without this
 #: explicit override a still-loaded host can starve the isolated confirm
 #: run into a false "still fails" verdict — and unlike the merge gate
 #: (which only holds a merge), a false verdict HERE files a red-main L1.
@@ -9651,8 +9645,8 @@ def _group_node_ids_by_subproject(
 #: Generous per-test timeout (seconds) injected into the main-tip-sweep
 #: isolated PRE-FILTER's re-run command via ``_with_pytest_timeout_str``.
 #: Same rationale as ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS``: the serial
-#: recovery's ``-o addopts=`` clears pyproject ``addopts`` but NOT the
-#: ``[tool.pytest.ini_options] timeout=60`` default, so without this explicit
+#: recovery's ``-o addopts=`` overrides only pyproject ``addopts``, NOT the
+#: ``[tool.pytest.ini_options] timeout`` default, so without this explicit
 #: override a still-loaded host could starve the isolated run into a false
 #: "reproduces" verdict. Kept as a SEPARATE constant from the merge gate's so
 #: sweep tuning is not coupled to merge-gate tuning (they are retuned on
@@ -9734,6 +9728,7 @@ async def _sweep_failure_reproduces_in_isolation(
             scoped_cmd = _with_pytest_timeout_str(
                 _serial_pytest_str(
                     _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+                    invocation_dir=worktree,
                 ),
                 _SWEEP_PREFILTER_TIMEOUT_SECS,
             )
@@ -9788,14 +9783,14 @@ async def confirm_main_tip_failure_is_real(
     esc-main-sweep-ea2bd3c95e33-2 and the 2026-07-09 park_stop/symlink-loop
     incidents. This function is the harness's confirm-before-alarm gate: it
     extracts the named failing pytest node-ids from *failing_result*, and
-    re-runs JUST those tests, in ISOLATION (scoped + forced-serial + addopts
-    cleared — the exact task-2045 recovery — plus an explicit generous
+    re-runs JUST those tests, in ISOLATION (scoped + forced-serial with xdist
+    stripped from addopts — the task-2045 recovery — plus an explicit generous
     ``--timeout``), in a FRESH probe worktree pinned at *main_sha* — never
     the sweep's own contended worktree.
 
     The ``--timeout`` (``_SWEEP_CONFIRM_TIMEOUT_SECS``, task 3290) is not
-    cosmetic: ``-o addopts=`` clears pyproject's ``addopts`` but NOT its
-    ``[tool.pytest.ini_options] timeout=60`` default, so without the
+    cosmetic: ``-o addopts=`` overrides only pyproject's ``addopts``, NOT its
+    ``[tool.pytest.ini_options] timeout`` default, so without the
     override a still-loaded host could starve this confirmation into a
     false "still fails" verdict — which here means filing a red-main L1
     escalation for a flake, the exact false positive this gate exists to
@@ -9922,6 +9917,7 @@ async def confirm_main_tip_failure_is_real(
             scoped_cmd = _with_pytest_timeout_str(
                 _serial_pytest_str(
                     _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+                    invocation_dir=tmp_path,
                 ),
                 _SWEEP_CONFIRM_TIMEOUT_SECS,
             )
@@ -9974,8 +9970,8 @@ async def confirm_main_tip_failure_is_real(
 #: Generous per-test timeout (seconds) injected into the α confirm gate's
 #: isolated re-run command via ``_with_pytest_timeout_str``. Must comfortably
 #: exceed any legitimate single-test wall time: the serial recovery's
-#: ``-o addopts=`` clears pyproject ``addopts`` but NOT the
-#: ``[tool.pytest.ini_options] timeout=60`` default, so without this explicit
+#: ``-o addopts=`` overrides only pyproject ``addopts``, NOT the
+#: ``[tool.pytest.ini_options] timeout`` default, so without this explicit
 #: override the isolated confirm re-run could itself starve under residual load
 #: into a false non-suppression. A tunable (PRD §9).
 _MERGE_FLAKE_CONFIRM_TIMEOUT_SECS = 300
@@ -9984,8 +9980,8 @@ _MERGE_FLAKE_CONFIRM_TIMEOUT_SECS = 300
 #: gate's isolated re-run command via ``_with_pytest_timeout_str``. A
 #: SEPARATE constant from ``_SWEEP_CONFIRM_TIMEOUT_SECS`` /
 #: ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS`` so the three are retuned on their own
-#: signals. Same rationale as both: ``-o addopts=`` clears pyproject
-#: ``addopts`` but NOT the ``[tool.pytest.ini_options] timeout=60`` default,
+#: signals. Same rationale as both: ``-o addopts=`` overrides only pyproject
+#: ``addopts``, NOT the ``[tool.pytest.ini_options] timeout`` default,
 #: so without this explicit override a still-loaded host can starve the
 #: isolated confirm run into a false "still fails" verdict — and here that
 #: false verdict would mean a false red-main verdict (BLOCKED awaiting a
@@ -10174,12 +10170,12 @@ def _loadavg1_or_none(loadavg: Callable[[], tuple[float, float, float]]) -> 'flo
 
 # The spellings of the xdist WORKER-COUNT flag this stamp must recognise.
 #
-# DELIBERATELY NARROWER than ``verify_cmd._XDIST_WORKER_FLAGS``, and not a
-# drifting copy of it: that set is the family a serial recovery must SHED, so it
-# also carries ``--dist`` (a distribution MODE) and ``--maxprocesses`` (a CAP).
-# Neither is a worker count, and reporting either one's value as ``n_flag``
-# would put a fabricated count in the corpus this stamp exists to make
-# trustworthy. Both members here are also ``_PYTEST_VALUE_FLAGS`` members, so
+# DELIBERATELY NARROWER than ``verify_cmd._XDIST_OPTIONS``, and not a
+# drifting copy of it: that set is xdist's whole option surface, which a serial
+# recovery must SHED, so it also carries ``--dist`` (a distribution MODE),
+# ``--maxprocesses`` (a CAP) and more. None of those is a worker count, and
+# reporting any one's value as ``n_flag`` would put a fabricated count in the
+# corpus this stamp exists to make trustworthy. Both members here are also ``_PYTEST_VALUE_FLAGS`` members, so
 # the pair-binding walk below needs no special case for them;
 # test_verify_load_stamp.py asserts BOTH containments, so the narrowing stays a
 # stated choice rather than becoming drift the day either set moves.
@@ -10218,12 +10214,10 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
       in the corpus this deliverable exists to make trustworthy. No live config
       uses the long spelling today, so that was latent rather than active.
 
-      The CONCATENATED short form (``-n8``) is deliberately reported as absent.
-      That is the grammar boundary ``verify_cmd._is_xdist_worker_flag`` — the
-      one home for "is this token a worker flag" — already draws for the serial
-      recovery's strip and refusal screen, and matching it keeps ONE answer in
-      the module: widening only the telemetry would leave the stamp claiming a
-      flag the strip would not shed.
+      The CONCATENATED short form (``-n8``) is reported as absent. The serial
+      recovery's strip (``verify_cmd._is_xdist_option``) does shed it, because
+      there a surviving xdist token is a hard usage error; here the miss only
+      under-reports, and no live config uses that spelling.
     - ``auto_num_workers`` — ``PYTEST_XDIST_AUTO_NUM_WORKERS`` as this command's
       own subprocess will see it, or ``None`` when nothing sets it. Resolved by
       asking ``_target_subprocess_env`` — the SAME builder ``_run_cmd`` spawns
@@ -10462,9 +10456,10 @@ async def confirm_isolated_rerun_verdict(
 
     SERIAL + ISOLATED + GENEROUS TIMEOUT (INV-4): each subproject group is
     re-run through ``_with_pytest_timeout_str(_serial_pytest_str(
-    _scope_to_keyword(...)), policy.timeout_secs)`` with ``lint_command`` and
-    ``type_check_command`` nulled, so only the named tests run, serially,
-    without pyproject ``addopts`` or its 60s per-test default.
+    _scope_to_keyword(...), invocation_dir=worktree), policy.timeout_secs)``
+    with ``lint_command`` and ``type_check_command`` nulled, so only the named
+    tests run, serially, under the governing pyproject ``addopts`` minus xdist
+    and an explicit ``--timeout`` in place of its ini per-test default.
 
     At the merge gate (``policy.refuses_partially_measured_sessions``) no
     re-run is attempted when the failing session left tests unmeasured: a
@@ -10683,6 +10678,7 @@ async def confirm_isolated_rerun_verdict(
             scoped_cmd = _with_pytest_timeout_str(
                 _serial_pytest_str(
                     _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+                    invocation_dir=worktree,
                 ),
                 policy.timeout_secs,
             )

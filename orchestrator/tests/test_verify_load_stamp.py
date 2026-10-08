@@ -361,9 +361,9 @@ class TestXdistWorkers:
     def test_a_mode_or_a_cap_is_not_a_worker_count(self, cmd):
         """The narrowing that makes ``_XDIST_N_FLAGS`` its own set, behaviourally.
 
-        ``verify_cmd._XDIST_WORKER_FLAGS`` is the family a serial recovery must
-        SHED, so it also carries ``--dist`` (a distribution MODE) and
-        ``--maxprocesses`` (a CAP). Reusing it here would report ``'loadgroup'``
+        ``verify_cmd._XDIST_OPTIONS`` is xdist's whole option surface, the
+        family a serial recovery must SHED, so it also carries ``--dist`` (a
+        distribution MODE) and ``--maxprocesses`` (a CAP). Reusing it here would report ``'loadgroup'``
         as a worker count — the fabricated datum this stamp exists to remove.
         """
         from orchestrator.verify import _xdist_workers  # noqa: PLC0415
@@ -397,10 +397,10 @@ class TestXdistWorkers:
         from orchestrator.verify import _XDIST_N_FLAGS  # noqa: PLC0415
         from orchestrator.verify_cmd import (  # noqa: PLC0415
             _PYTEST_VALUE_FLAGS,
-            _XDIST_WORKER_FLAGS,
+            _XDIST_OPTIONS,
         )
 
-        assert _XDIST_N_FLAGS <= _XDIST_WORKER_FLAGS
+        assert _XDIST_N_FLAGS <= _XDIST_OPTIONS
         assert _XDIST_N_FLAGS <= _PYTEST_VALUE_FLAGS
 
     def test_the_live_command_carries_no_flag_and_says_so(self):

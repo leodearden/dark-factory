@@ -1,4 +1,10 @@
-"""Static detection of "every file-scoped pytest target is marker-deselected" (task 3494).
+"""The pure reader of pytest CONFIGURATION and marker facts from file content.
+
+Shared by two consumers: the marker-deselection probe — static detection of
+"every file-scoped pytest target is marker-deselected" (task 3494) — and the
+serial-recovery addopts derivation (``verify_plan.py::governing_addopts``,
+task 5079), which both need "which config does pytest read, and what are its
+addopts" answered one way.
 
 WHY STATIC, not a ``--collect-only`` probe.  This module's sole consumer is
 ``verify_plan._derive_module_runs``, and ``derive_verify_plan``'s docstring makes
@@ -31,6 +37,8 @@ destroy the ENTIRE plan record.
 from __future__ import annotations
 
 import ast
+import posixpath
+import re
 import shlex
 import tomllib
 from collections.abc import Callable, Iterator, Sequence
@@ -55,26 +63,31 @@ def _marker_expr_from_tokens(tokens: Sequence[str]) -> str | None:
     return found
 
 
-def _addopts_tokens(pyproject_text: str | None) -> list[str] | None:
-    """``[tool.pytest.ini_options].addopts`` from *pyproject_text*, as a token list.
-
-    A ``str`` addopts is split with ``shlex``; a list keeps only its ``str``
-    elements.  Any other type, any malformed TOML, and any missing/non-dict
-    intermediate table yields None.
-    """
-    if not pyproject_text:
-        return None
+def _pyproject_pytest_table(pyproject_text: str) -> dict | None:
+    """The ``[tool.pytest]`` table of *pyproject_text*; ``{}`` when absent, None when malformed."""
     try:
         data = tomllib.loads(pyproject_text)
     except (tomllib.TOMLDecodeError, ValueError, TypeError):
         return None
-    node: object = data
-    for key in ('tool', 'pytest', 'ini_options', 'addopts'):
-        if not isinstance(node, dict):
-            return None
-        if key not in node:
-            return None
-        node = node[key]
+    tool = data.get('tool')
+    table = tool.get('pytest') if isinstance(tool, dict) else None
+    return table if isinstance(table, dict) else {}
+
+
+def addopts_tokens(pyproject_text: str | None) -> list[str] | None:
+    """``[tool.pytest.ini_options].addopts`` from *pyproject_text*, as a token list.
+
+    A ``str`` addopts is split with ``shlex``; a list keeps only its ``str``
+    elements.  Any other type, any malformed TOML, and any missing/non-dict
+    intermediate table yields None — including a native ``[tool.pytest]``
+    (toml mode) table, which has no ``ini_options``.
+    """
+    if not pyproject_text:
+        return None
+    ini_options = (_pyproject_pytest_table(pyproject_text) or {}).get('ini_options')
+    if not isinstance(ini_options, dict) or 'addopts' not in ini_options:
+        return None
+    node = ini_options['addopts']
     if isinstance(node, str):
         try:
             return shlex.split(node)
@@ -83,6 +96,65 @@ def _addopts_tokens(pyproject_text: str | None) -> list[str] | None:
     if isinstance(node, list):
         return [element for element in node if isinstance(element, str)]
     return None
+
+
+#: pytest's config file names, in its lookup order within one directory
+#: (``_pytest/config/findpaths.py::locate_config``, pytest 9.0.3).
+_PYTEST_CONFIG_NAMES = (
+    'pytest.toml', '.pytest.toml', 'pytest.ini', '.pytest.ini',
+    'pyproject.toml', 'tox.ini', 'setup.cfg',
+)
+_ALWAYS_DECLARING_NAMES = frozenset({'pytest.toml', '.pytest.toml', 'pytest.ini', '.pytest.ini'})
+_TOX_PYTEST_SECTION = re.compile(r'^\[pytest\][ \t]*$', re.MULTILINE)
+_SETUP_CFG_PYTEST_SECTION = re.compile(r'^\[tool:pytest\][ \t]*$', re.MULTILINE)
+
+
+def _declares_pytest_config(name: str, text: str) -> bool | None:
+    """Whether config file *name* with content *text* is one pytest would read.
+
+    ``_pytest/config/findpaths.py::load_config_dict_from_file``'s matching
+    rule. None for a malformed ``pyproject.toml``, where pytest raises a
+    UsageError rather than reading any config at all.
+    """
+    if name in _ALWAYS_DECLARING_NAMES:
+        return True
+    if name == 'pyproject.toml':
+        table = _pyproject_pytest_table(text)
+        return None if table is None else bool(table)
+    if name == 'tox.ini':
+        return _TOX_PYTEST_SECTION.search(text) is not None
+    return _SETUP_CFG_PYTEST_SECTION.search(text) is not None
+
+
+def locate_pytest_config(start_dir: str, read: Callable[[str], str | None]) -> str | None:
+    """The config file pytest reads for a run rooted at *start_dir*, else None.
+
+    pytest's own walk (``_pytest/config/findpaths.py::locate_config``):
+    *start_dir*, then each ancestor, checking ``_PYTEST_CONFIG_NAMES`` in
+    order; the first file that declares pytest config wins. *start_dir* and
+    the result are relative to *read*'s root ('' or '.' is the root itself),
+    and the walk never looks above that root, so the answer is the config
+    pytest finds first or None. A malformed ``pyproject.toml`` on the way
+    also yields None. A *start_dir* that is absolute or escapes the root is
+    refused rather than walked.
+    """
+    directory = posixpath.normpath(start_dir or '.')
+    if posixpath.isabs(directory) or directory == '..' or directory.startswith('../'):
+        return None
+    while True:
+        for name in _PYTEST_CONFIG_NAMES:
+            path = name if directory == '.' else posixpath.join(directory, name)
+            text = read(path)
+            if text is None:
+                continue
+            declares = _declares_pytest_config(name, text)
+            if declares is None:
+                return None
+            if declares:
+                return path
+        if directory == '.':
+            return None
+        directory = posixpath.dirname(directory) or '.'
 
 
 #: Shell chain operators that terminate one clause of a chained command.
@@ -150,22 +222,22 @@ def resolve_marker_expression(
     inside *test_command*'s FIRST ``pytest`` clause replaces it (see
     :func:`_cli_marker_expr` for why that clause, and only that clause).
 
-    *pyproject_text* is the content of the ini file at pytest's ROOTDIR, which
-    the caller locates from the command's effective cwd — see
+    *pyproject_text* is the content of the config file pytest reads for the
+    command, which the caller locates with pytest's own walk
+    (:func:`locate_pytest_config`) — see
     ``verify_plan.deselecting_expression_for_command``.  This function does not
     and cannot check that the two describe the same invocation.
 
     Never raises — every failure path returns None.
 
-    Caveat, recorded for the reader rather than handled here: ``verify_cmd``'s
-    serial-retry recovery appends ``-o addopts=`` at EXECUTION time, which clears
-    the addopts ``-m`` after planning.  A retry can therefore select MORE than
-    the plan assumed, which is the safe direction (extra coverage, never less).
+    A serial-retry recovery that cannot resolve the governing addopts blanks
+    them (``verify_cmd.py::serial_pytest``), so it can select MORE than the
+    plan assumed — the safe direction.
     """
     cli_expr = _cli_marker_expr(test_command)
     if cli_expr is not None:
         return cli_expr
-    tokens = _addopts_tokens(pyproject_text)
+    tokens = addopts_tokens(pyproject_text)
     if tokens is None:
         return None
     return _marker_expr_from_tokens(tokens)

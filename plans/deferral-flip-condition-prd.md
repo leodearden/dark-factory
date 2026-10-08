@@ -12,6 +12,10 @@ enforced deterministically (perhaps the MCP); optionally a deferral can be of li
 duration so that when it expires the task goes back to pending; the use case is a deferral
 while an agent session works on a task, which is meant to be temporary but can end up
 forever if the session dies." The brief's recommendations 1–4 were accepted ("LGTM").
+**Amended 2026-10-08 (Leo, ruling on D-e):** "no notice so long as the session is live" —
+sessions can legitimately sit for days while a complex question waits its turn. The 24 h
+idle-holder notice is gone; a live holder is never notified, flipped or counted as needing
+a human. Only holder death files a notice and, after the grace window, flips the task.
 §3 records where this PRD departs from their wording and why.
 
 ## 1. Goal
@@ -20,7 +24,7 @@ Every task in `deferred` carries exactly one structured record, `metadata.deferr
 names what ends the hold, who ends it, and, optionally, when it lapses. The server refuses a
 write into `deferred` that has no valid record. A hold whose owner can die (an interactive
 session), or that was given a lapse time, returns to `pending` without anyone acting, and a
-human is told when a holder dies. Observable when it lands:
+human is told when a holder dies — never while it lives. Observable when it lands:
 
 - `set_task_status(id=…, status="deferred")` with no `deferral` returns
   `{'success': False, 'error': 'deferral_required', …}`, and `get_task` shows the row's status
@@ -110,7 +114,7 @@ These rulings are executed as given:
 
 The departures below are the lead's call, under "pause only at a gate the brief cannot
 resolve". An adversarial critic seat (opus) judged D-a, D-b, D-c, D-d and D-f justified.
-D-e is the one that needs Leo's explicit confirmation at decompose.
+Leo confirmed D-e on 2026-10-08 with one change: no notice of any kind while the holder lives.
 
 | # | Brief | This PRD | Why |
 |---|---|---|---|
@@ -118,7 +122,7 @@ D-e is the one that needs Leo's explicit confirmation at decompose.
 | D-b | kind `until_time` (reuse milestone + sweep) | no `until_time` kind; optional `expires_at` on `until_condition` | Heuristic 3: *what ends a hold* and *whether it lapses* are independent axes. Leo's words ("optionally a deferral can be of limited duration") describe a bound on a human-owned hold, not a kind. A gate that is *only* time belongs on a `pending` task with `metadata.milestone {mode: 'dated'}`, which is landed and restart-safe and needs no status flip (heuristic 11: one "not before T" mechanism). The milestone gate could not be reused for a `deferred` row anyway, because `Scheduler._milestone_time_gated` withholds `pending` tasks and never writes a status. |
 | D-c | four kinds | adds `planning`, which the server stamps on every `planning_mode` birth | Four birth paths write `deferred`, and no caller on them can supply a reason. Births must not be refused, and an abandoned batch must be visible rather than silent. `commit_planning` may release only this kind (decision 3). |
 | D-d | field `flip` | field `deferral` | The record carries the reason and the owner as well as the flip. `flip` also collides with the write-triage "flip" vocabulary already in the corpus. |
-| D-e | "TTL renewed by heartbeat; on expiry flip + escalate"; lease mirrors the claimant predicates | **the lease is the holder process's life.** A live holder never lapses. Death starts a grace window (`grace_secs`, default 2 h). Only death plus grace flips the task, and the notice is filed at death. A live holder silent for 24 h gets one INFO notice and no flip. Claimant columns are untouched. | The brief itself names the hazard a fixed TTL creates: "if the session is alive but slow, a flip to pending lets the scheduler dispatch an agent onto the same files". The available heartbeat is turn-granular: a session working through one long turn sends none (measured, §7). So any timeout on a *live* holder would release work that is still being written. The claimant PRD's D2/B2 forbid overloading `claimant_run_id`. **Needs Leo:** confirm that a live but abandoned session gets a notice, never a flip. |
+| D-e | "TTL renewed by heartbeat; on expiry flip + escalate"; lease mirrors the claimant predicates | **the lease is the holder process's life.** A live holder never lapses. Death starts a grace window (`grace_secs`, default 2 h). Only death plus grace flips the task, and the notice is filed at death. A live holder is never notified, however long it holds (Leo, 2026-10-08). Claimant columns are untouched. | The brief itself names the hazard a fixed TTL creates: "if the session is alive but slow, a flip to pending lets the scheduler dispatch an agent onto the same files". The available heartbeat is turn-granular: a session working through one long turn sends none (measured, §7). So any timeout on a *live* holder would release work that is still being written. The claimant PRD's D2/B2 forbid overloading `claimant_run_id`. **Ruled (Leo, 2026-10-08):** confirmed, without the idle notice — "sometimes complex questions get pushed to the back of the queue and take days to get answered. This is fine." |
 | D-f | "rejected with a typed `SetTaskStatusRejected` subclass" | the server returns error dicts with stable codes; the orchestrator client maps them to a new `DeferralRejection` subclass | `SetTaskStatusRejected` is a client-side class in `orchestrator/src/orchestrator/scheduler.py`. Every server gate returns `{'success': False, 'error': <code>, …, 'hint'}`. |
 
 ## 4. Resolved design decisions
@@ -149,7 +153,7 @@ violation either way (decision 10).
 |---|---|---|---|---|
 | `carried_by` | `carrier_task_id` | a human: once the carrier is terminal, they close the row (`done` with `found_on_main`, or `cancelled`) or re-pend it | carrier `done` ⇒ **closable**; carrier `cancelled` ⇒ **orphaned** (the absorbed work never landed: re-pend or re-carry). While the carrier is live, the scheduler owns the carrier and so bounds the hold; a deferred carrier has its own record. | any caller |
 | `until_condition` | `condition` (text, ≤ 500 chars); optional `expires_at` | a human who judges the condition | `expires_at` ⇒ the sweep flips to `pending`. Without it, the hold is **stale** after 30 days and is listed for review. | any caller |
-| `held_by_session` | `holder_pid` (the caller's `$CLAUDE_PID`); optional `grace_secs` | the holding session, which lands or releases it | holder death + `grace_secs` ⇒ notice, then flip to `pending` (decision 6) | any caller whose pid is a live `claude` process on the fused-memory host |
+| `held_by_session` | `holder_pid` (the caller's `$CLAUDE_PID`); optional `grace_secs` | the holding session, which lands or releases it | holder death ⇒ one INFO notice; death observed for `grace_secs` ⇒ flip to `pending`; while the holder lives, nothing (decision 6) | any caller whose pid is a live `claude` process on the fused-memory host |
 | `planning` | none | the planner, via `commit_planning` | **stale batch** after 24 h; never lapses, because an unwired batch must not auto-release | the server only, at `planning_mode` birth |
 | `legacy_unknown` | none | the migration triage gate (ζ) | listed with a count until triaged | the migration only (decision 9) |
 
@@ -252,12 +256,13 @@ process. The session uuid is not a key, because `/clear` and compaction re-mint 
 subagents and in-process forks see the parent's `$CLAUDE_PID`. The hold then belongs to the
 parent session, which is the process whose death matters.
 
-**Liveness** comes from the shared `process_identity.is_alive(identity)`:
-- **True** means the same host, the same boot, and a process with that pid and start ticks
+**Liveness** comes from the shared `process_identity.liveness(identity)`, the one liveness
+test everywhere:
+- **`ALIVE`** means the same host, the same boot, and a process with that pid and start ticks
   exists.
-- **False** means the same host and the identity no longer exists: the pid is gone, its start
+- **`DEAD`** means the same host and the identity no longer exists: the pid is gone, its start
   ticks differ, or the boot id differs. A **reboot is death**.
-- **None** means another host. Liveness is unknown, so the sweep holds the row and surfaces
+- **`OTHER_HOST`** means another host. Liveness is unknown, so the sweep holds the row and surfaces
   it, and never flips it.
 
 **Lapse.** `lapse_cause(record, now, dead_since)` returns `holder_lost` when the sweep has
@@ -275,13 +280,13 @@ death would leave no grace at all.
 blocked for three hours in one build sends no heartbeat (the hooks fire per turn end), and
 flipping its hold would let the scheduler dispatch a second writer onto the same files.
 
-**Live but silent.** The session hooks
-(`skills/spawn/hooks/{session-start,notification,stop}.sh` →
-`orchestrator/src/orchestrator/session_hooks.py`) bump `record.json` at every turn end, for
-every session, hand-launched ones included. If a live holder's record, resolved through
-`session_registry.resolve_session_slug_for_pid`, is older than 24 h, the sweep files one INFO
-notice (decision 7). It does not flip. Only the orchestrator sweep reads this heartbeat;
-readers in other packages see liveness through `process_identity` alone.
+**Live means silent (Leo, 2026-10-08).** While the holder lives, nothing is filed, nothing is
+flipped, and the hold is not in `needs_human`, however long it lasts: a session may wait days
+for its human. The dashboard still draws the row "held by session <pid> (live)" with its age
+— a display, not a notice. So no part of the design reads a session heartbeat: liveness is
+`process_identity` alone, everywhere. The sweep's only use of the session registry is a
+best-effort `session_registry.resolve_session_slug_for_pid` to name a dead holder in its
+notice.
 
 **A merge in flight.** Before a `holder_lost` flip, the sweep checks its own harness's merge
 queue. If an entry names the task, it holds and surfaces `merge_in_flight`. When a hand-carry
@@ -309,7 +314,6 @@ moves the merge to a separate carrier task, the hand-carry guidance re-stamps th
   |---|---|
   | `until_condition` with `expires_at ≤ now` | `Flip('expired')` |
   | `held_by_session`, holder dead, no merge in flight | `Notify` at first sight of death, then `Flip('holder_lost')` when `lapse_cause` fires |
-  | live holder silent > 24 h | `Notify('idle_hold')` |
   | anything else | `Hold` |
   | missing or unparseable record | `Hold`, surfaced as `invalid_record`; never a flip |
 
@@ -319,9 +323,9 @@ moves the merge to a separate carrier task, the hand-carry guidance re-stamps th
   (`deferral-holder:<host>:<boot_id8>:<pid>:<start_ticks>`), following the
   `_DIRTY_TREE_ESCALATION_SENTINEL` precedent, with `agent_role='orchestrator-deferral-sweep'`
   (a harness sentinel role).
-  - It names the holder (pid, slug, last heartbeat), every task it holds, and what will happen
-    ("released to `pending` at <t>" / "released" / "idle, not released").
-  - Dedup is by sentinel id in any status, so one holder is reported once per cause, across
+  - It names the holder (pid, best-effort slug), every task it holds, and what will happen
+    ("released to `pending` at <t>" / "released").
+  - Dedup is by sentinel id in any status, so one dead holder is reported once, across
     restarts.
   - Filing it against a sentinel rather than the re-pended task leaves that task's dispatch and
     pins untouched.
@@ -361,8 +365,7 @@ moves the merge to a separate carrier task, the hand-carry guidance re-stamps th
   escalation for that task and stops retrying it until its record changes. A pass event
   `deferral_sweep_pass {evaluated, flipped, would_flip, notified, surfaced, failed}` is emitted
   only when some count is non-zero.
-- **Per-pass cost (INV-8).** Each pass makes one `get_tasks` call, two small `/proc` reads and
-  one `stat` per held row, one merge-queue lookup per lapsing row, and awaited MCP writes. That
+- **Per-pass cost (INV-8).** Each pass makes one `get_tasks` call, two small `/proc` reads per held row, one merge-queue lookup per lapsing row, and awaited MCP writes. That
   was 335 rows at authoring.
 
 ### 8. Why `carried_by` is not a dependency edge
@@ -411,7 +414,7 @@ must act on:
 - `held_by_session` whose holder is dead (release pending), or on another host;
 - any missing or invalid record.
 
-The 24 h idle notice for a live holder is the sweep's alone (decision 6).
+A `held_by_session` row with a live holder is never in `needs_human` (decision 6).
 
 - **Dashboard.** `dashboard/src/dashboard/data/active_tasks.py::_build_task_row` and the tasks
   tab (`dashboard/src/dashboard/static/redux/tab_tasks.jsx`) show a deferred row as one of:
@@ -513,7 +516,6 @@ Deferral = <the request's kind fields, with holder_pid replaced by
 
 DEFAULT_GRACE_SECS = 7200; GRACE_BOUNDS = (600, 86400)
 STALE_PLANNING_AFTER_SECS = 86400; STALE_CONDITION_AFTER_SECS = 30 * 86400
-IDLE_HOLDER_NOTICE_AFTER_SECS = 86400
 
 class Liveness(StrEnum): ALIVE, DEAD, OTHER_HOST
 def lapse_cause(record, now, dead_since: datetime | None) -> LapseCause | None
@@ -597,7 +599,7 @@ stance, `docs/code-quality.md`). The owning leaf is in brackets.
 | 11 | Raw-SQL exit [β] | deferred row hit by the candidate-key self-heal | cancelled, no `metadata.deferral` |
 | 12 | Liveness [α] | a spawned process; its identity with a forged old `boot_id`; with another `host` | `ALIVE`; `DEAD` (reboot is death); `OTHER_HOST` |
 | 13 | Holder lost [γ] | `claude`-named helper process holds a row (`grace_secs=600`), then is killed; fake clock | first pass after death → one sentinel INFO notice, row still `deferred`; pass 601 s after first-seen-dead → row `pending`, `deferral_expired{cause:'holder_lost'}`; no second notice |
-| 14 | Live holder never lapses [γ] | live holder, record heartbeat 3 h old | `Hold`; at 24 h one `idle_hold` notice; never flipped |
+| 14 | Live holder is silent [γ] | live holder; fake clock advanced 7 days | `Hold` on every pass; no escalation filed; not in `needs_human`; never flipped |
 | 15 | `expires_at` lapses [γ] | `until_condition`, `expires_at` in the past | one pass → `pending`; no escalation; `deferral_expired{cause:'expired'}` |
 | 16 | Paused [γ] | row as in 13, scheduler paused | notice filed ("released on resume"); no flip; `would_flip=1`; first unpaused pass flips |
 | 17 | Race [γ] | row as in 15; re-stamp between the sweep's read and its write | `deferral_changed`; row keeps the new record; counted as a benign skip, not a failure |
@@ -624,7 +626,7 @@ stance, `docs/code-quality.md`). The owning leaf is in brackets.
 | Pause predicate | `orchestrator/src/orchestrator/scheduler.py::Scheduler.is_paused` |
 | Live-claimant predicate | `shared/src/shared/task_claimant.py::has_live_claimant(task, now, ttl)`, as used by the dispatch gate |
 | Sentinel born-at-L2 escalation precedent | `harness.py::_DIRTY_TREE_ESCALATION_SENTINEL`; harness sentinel role prefix `orchestrator-` (`escalation/src/escalation/server.py::_HARNESS_SENTINEL_ROLE_PREFIXES`) |
-| Session heartbeat on every session | `session_hooks.py` via `skills/spawn/hooks/*.sh`, wired in `~/.claude/settings.json` (SessionStart/Stop/Notification); `session_registry.py::resolve_session_slug_for_pid`, `record_path_for_slug`, `LEASE_HEARTBEAT_TTL` |
+| Naming a dead holder (best-effort) | `session_registry.py::resolve_session_slug_for_pid` (pid → slug via `~/.claude/fleet/sessions-by-pid`); `LEASE_HEARTBEAT_TTL` is the precedent the default `grace_secs` matches (not imported) |
 | `$CLAUDE_PID` names the Claude CLI | measured 2026-10-07 in the authoring session: `/proc/$CLAUDE_PID/comm` = `claude`; `/proc/$CLAUDE_PID/stat` field 22 and `/proc/sys/kernel/random/boot_id` readable; `~/.claude/fleet/sessions-by-pid/$CLAUDE_PID` resolves to the session's slug; a `/team` subagent sees the same pid |
 | The server and the sweep can read other processes' `/proc` | `systemctl --user show` on `fused-memory.service` and `orchestrator-dark-factory.service`: `ProtectProc=default`, `ProcSubset=all`; the fused-memory transport is local (`127.0.0.1:8002`) |
 | The heartbeat is per turn, not continuous | the authoring session's `record.json` mtime was 21 min old mid-turn while it worked continuously, which is why a live holder must never lapse (decision 6) |
@@ -645,8 +647,8 @@ There is no external prerequisite.
 | Other PRD / surface | Direction | Seam mechanism | Owner | Status |
 |---|---|---|---|---|
 | `plans/task-status-authority-prd.md` (Table A, C1/D1/D5) | consumes | the choke point `_apply_status_transition`. Table A edges are unchanged. The deferral rule is a payload rule layered beside legality, not a new table, and it keys on data shape, not actor (D5) | **this PRD** | that PRD landed; enforce-mode live |
-| `docs/prds/claimant-invariant-enforcement.md` (4618, carrier 4866, pending) | consumes read-only | `shared.task_claimant.has_live_claimant` is the sweep's guard. Entering `deferred` leaves claimant columns untouched (its B2), and the lease never writes them | **this PRD** owns the guard call; that PRD owns claimant semantics | 4866 also edits `_apply_status_transition`. This PRD's wiring there is one `plan()` call, serialized by the file-lock layer, with no dependency edge |
-| `orchestrator/src/orchestrator/session_registry.py` (Attention Rail, task 4193) | consumes read-only | pid → slug resolution and the record mtime, for the idle notice only | **this PRD** (reader); that module is not edited | landed |
+| `docs/prds/claimant-invariant-enforcement.md` (4618 pending; carrier 4866 landed `bfc61f6624` 2026-10-07) | consumes read-only | `shared.task_claimant.has_live_claimant` is the sweep's guard. Entering `deferred` leaves claimant columns untouched (its B2), and the lease never writes them | **this PRD** owns the guard call; that PRD owns claimant semantics | 4866 landed terminal-claimant clearing and the post-lock recurrence mint in `_apply_status_transition`; neither changes a premise here (`has_live_claimant` unchanged; `plan()` files no task under the lock). This PRD's wiring there is one `plan()` call, with no dependency edge |
+| `orchestrator/src/orchestrator/session_registry.py` (Attention Rail, task 4193) | consumes read-only | best-effort pid → slug resolution, to name a dead holder in its notice; no heartbeat is read | **this PRD** (reader); that module is not edited | landed |
 | `plans/scheduler-pause-halt-retirement-prd.md` (4686–4694, 5313, pending) | consumes | `Scheduler.is_paused` as "is dispatch halted"; the shape precedent for owner + expiry per hold class. Intentional divergence: an expired operator halt escalates and never resumes, while an expired session hold releases, because its owner is dead and leaving the work parked is the failure being fixed | that PRD owns the pause predicate. If it makes pauses class-scoped, `deferral_sweep` keeps asking the single question "is dispatch halted?" | pending |
 | `plans/stranding-remediation-scheduler-ergonomics-prd.md` β (5311, pending) | none | the sweep never re-pends into a paused scheduler, so it emits no `repend_while_paused` and depends on nothing there | 5311 | pending |
 | `docs/prds/milestone-tasks.md` | consumes convention | ISO-UTC wall-clock parsing for `expires_at`. Pure-time gates are steered to `pending` + `metadata.milestone {mode:'dated'}`. `_milestone_time_gated` is not touched | **this PRD** | landed |
@@ -718,7 +720,7 @@ same file.
 - **γ — Expiry sweep, client mapping, de-flake scope (orchestrator).** [high; normal;
   ~1,000–1,300 LOC; 11 files] depends on α and β.
   - Files:
-    - `orchestrator/src/orchestrator/deferral_sweep.py` (new: liveness read, idle heartbeat,
+    - `orchestrator/src/orchestrator/deferral_sweep.py` (new: liveness read,
       `decide`, pass, sentinel notices, merge-queue check, streak);
     - `harness.py` (service registration and the notice filer);
     - `config.py` + `defaults.yaml` (three keys);
@@ -809,7 +811,7 @@ once β lands, and δ follows ε.
 | β | births stamped | `_submit_task_planning_mode` is the only `deferred` birth path (critic grep 2026-10-07) |
 | β | holder corroboration | `/proc/<pid>/comm`, `/proc/<pid>/stat` and `boot_id` readable by the fused-memory unit (§7) |
 | γ | the sweep runs while halted | `BackgroundService` registration in `harness.py` |
-| γ | heartbeat for the idle notice | session hooks wired in `~/.claude/settings.json`; `resolve_session_slug_for_pid` |
+| γ | dead holder named in its notice | `resolve_session_slug_for_pid` (best-effort; pid is always present) |
 | γ | a notice reaches the human queue without pinning the task | the sentinel born-at-L2 precedent (`_DIRTY_TREE_ESCALATION_SENTINEL`) |
 | γ | the rejection reaches the client typed | `Scheduler.set_task_status` `error_code` branches |
 | δ | real records to draw (INV-13) | β's producer is live, and the signal requires one record per caller kind written through the MCP |
@@ -825,7 +827,8 @@ G7 walk (advisory at author time, against `docs/legibility/design-invariants.md`
 - INV-5: one kind vocabulary and one `needs_human`, both in `task_deferral.py`.
 - INV-6: `held_by_session` implies a live owner, the sweep is its reconciler, and the
   dashboard shows liveness.
-- INV-7: decision 2's owner/bound table.
+- INV-7: decision 2's owner/bound table. A live `held_by_session` hold is bounded by its owner's
+  life and drawn on the dashboard with its age; Leo ruled (2026-10-08) that it raises no notice.
 - INV-8: bounded per-pass work in a background service.
 - INV-9: `metadata.deferral` is the only home, `x_coalesced_into` becomes history, and the
   briefing points to the mechanism rather than restating it.
@@ -851,6 +854,8 @@ No waiver.
 - Holds whose holder is on another host. These are surfaced, never flipped.
 - Re-validating the population against Table A or dependency shape in `--check`. The census
   reads records; the briefing's "dependency-shaped gate" judgment stays a reviewer's.
+- Any notice, flip or `needs_human` entry for a live holder, however long it holds (Leo,
+  2026-10-08).
 - Persisting `dead_since` across orchestrator restarts. A restart only lengthens grace
   (decision 6).
 

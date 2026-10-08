@@ -3,12 +3,14 @@
 import asyncio
 import contextlib
 import logging
+import shlex
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from _serial_recovery_helpers import ORCH_SHAPED_PYPROJECT, ROOT_SHAPED_PYPROJECT, addopts_values
 from _xdist_crash_fixtures import (
     XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT,
     XDIST_CRASH_ATTRIBUTED_FAILED_LINE,
@@ -10697,7 +10699,7 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
         from orchestrator.verify import _serial_pytest_str
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            result = _serial_pytest_str(self._REFUSED)
+            result = _serial_pytest_str(self._REFUSED, invocation_dir=None)
 
         assert result is self._REFUSED, "the no-op must return the caller's own string"
         records = [r for r in caplog.records if r.name == 'orchestrator.verify']
@@ -10731,7 +10733,7 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
 
         cmd = 'echo "pytest" && true'
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            assert _serial_pytest_str(cmd) is cmd
+            assert _serial_pytest_str(cmd, invocation_dir=None) is cmd
 
         records = [r for r in caplog.records if r.name == 'orchestrator.verify']
         assert len(records) == 1
@@ -10803,7 +10805,7 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
         from orchestrator.verify import _serial_pytest_str
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            _serial_pytest_str(cmd)
+            _serial_pytest_str(cmd, invocation_dir=None)
 
         assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
 
@@ -10819,10 +10821,88 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
 
         from orchestrator.verify import _serial_pytest_str
 
-        result = _serial_pytest_str(ROOT_TEST_COMMAND)
+        result = _serial_pytest_str(ROOT_TEST_COMMAND, invocation_dir=None)
         assert result is not None
         assert result is not ROOT_TEST_COMMAND
         assert 'no:xdist' in result
+
+
+def _write_serial_recovery_tree(root: Path) -> Path:
+    """A real tree: a root-shaped root config and an orchestrator-shaped ``sub``."""
+    (root / 'pyproject.toml').write_text(ROOT_SHAPED_PYPROJECT, encoding='utf-8')
+    (root / 'sub' / 'tests').mkdir(parents=True)
+    (root / 'sub' / 'pyproject.toml').write_text(ORCH_SHAPED_PYPROJECT, encoding='utf-8')
+    (root / 'sub' / 'tests' / 'test_x.py').write_text('def test_t():\n    pass\n', encoding='utf-8')
+    return root
+
+
+class TestSerialPytestStrReSuppliesGoverningAddopts:
+    """``_serial_pytest_str(cmd, invocation_dir)`` re-supplies the governing addopts.
+
+    The config is resolved by pytest's own walk from the directory the command
+    runs in, so scoped and unscoped shapes of one module agree; every xdist
+    option is removed. ``invocation_dir=None`` is the historical blank.
+    """
+
+    def test_a_module_directory_command_carries_its_own_config(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        rendered = _serial_pytest_str('uv run --directory sub pytest tests/', invocation_dir=tree)
+        assert rendered is not None
+        assert addopts_values(shlex.split(rendered)) == ["-m 'not warm_lane_bash'"]
+        assert not any(
+            token in rendered for token in ('-n auto', '--dist', '--max-worker-restart')
+        ), rendered
+
+    def test_the_scoped_cwd_stripped_shape_carries_the_same_config(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        rendered = _serial_pytest_str(
+            'uv run --project sub pytest sub/tests/test_x.py::T::t', invocation_dir=tree,
+        )
+        assert rendered is not None
+        assert addopts_values(shlex.split(rendered)) == ["-m 'not warm_lane_bash'"]
+
+    def test_a_root_targeted_command_carries_the_root_config(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        rendered = _serial_pytest_str('uv run pytest tests/', invocation_dir=tree)
+        assert rendered is not None
+        assert addopts_values(shlex.split(rendered)) == [
+            "--import-mode=importlib -m 'not smoke and not integration and not warm_lane_bash'",
+        ]
+
+    def test_no_invocation_dir_is_the_historical_blank(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        assert _serial_pytest_str('uv run --directory sub pytest tests/', invocation_dir=None) == (
+            'cd sub && uv run pytest -p no:xdist -o addopts= tests/'
+        )
+
+    def test_none_and_non_pytest_commands_pass_through(self, tmp_path):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        assert _serial_pytest_str(None, invocation_dir=tree) is None
+        cmd = 'cargo test --workspace'
+        assert _serial_pytest_str(cmd, invocation_dir=tree) is cmd
+
+    def test_a_refused_rewrite_still_logs_once_with_an_invocation_dir(
+        self, tmp_path, caplog: pytest.LogCaptureFixture,
+    ):
+        from orchestrator.verify import _serial_pytest_str
+
+        tree = _write_serial_recovery_tree(tmp_path)
+        refused = "pytest -k 'a && b' tests/ && true"
+        with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
+            assert _serial_pytest_str(refused, invocation_dir=tree) is refused
+        records = [r for r in caplog.records if r.name == 'orchestrator.verify']
+        assert len(records) == 1
+        assert refused in records[0].getMessage()
+        assert "pytest -k 'a " in records[0].getMessage()
 
 
 # ---------------------------------------------------------------------------
