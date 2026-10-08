@@ -17,11 +17,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import shlex
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
+from _serial_recovery_helpers import ORCH_SHAPED_PYPROJECT
 from pydantic import ValidationError
 from shared.testing_virtual_clock import virtual_clock_test
 
@@ -1476,7 +1478,7 @@ async def test_default_confirm_command_serializes_and_extracts_node_ids(tmp_path
     extracts still-failing pytest node-ids from FULL stdout.
 
     Reuses the reify-side confirm primitives (PRD sec 5): _serial_pytest_str
-    rewrites the command serial (-p no:xdist -o addopts=), and
+    rewrites the command serial (-p no:xdist -o addopts=<value>), and
     _extract_failing_test_ids pulls the FAILED/ERROR node-ids. cwd/env mirror
     _default_run_command (idle nice/ionice, DF_VERIFY_ROLE=offline).
 
@@ -1506,7 +1508,9 @@ async def test_default_confirm_command_serializes_and_extracts_node_ids(tmp_path
 
     argv = list(mock_exec.call_args.args)
     kwargs = mock_exec.call_args.kwargs
-    expected_serial = _serial_pytest_str('pytest -m integration')
+    expected_serial = _serial_pytest_str(
+        'pytest -m integration', invocation_dir=wt_path / 'fused-memory',
+    )
     assert argv[:5] == ['nice', '-n', '19', 'ionice', '-c3'], (
         'confirm re-run must also run at idle nice/ionice'
     )
@@ -1518,6 +1522,37 @@ async def test_default_confirm_command_serializes_and_extracts_node_ids(tmp_path
     assert kwargs['env']['DF_VERIFY_ROLE'] == 'offline'
     assert kwargs['stdout'] == asyncio.subprocess.PIPE
     assert kwargs['stderr'] == asyncio.subprocess.STDOUT
+
+
+@pytest.mark.asyncio
+async def test_default_confirm_command_re_supplies_the_lane_cwds_addopts(tmp_path: Path):
+    """The serial confirm keeps the governing config's addopts minus xdist (task 5079).
+
+    The walk is bounded at the lane's run cwd, so ``sub``'s own config is the
+    one read. The CLI ``-m warm_lane_bash`` still wins over the re-supplied
+    ``-m 'not warm_lane_bash'``: pytest prepends addopts to argv.
+    """
+    from orchestrator.config import LaneCommand
+
+    worker = _make_worker(tmp_path)
+    wt_path = tmp_path / '_offline-deep'
+    (wt_path / 'sub').mkdir(parents=True)
+    (wt_path / 'sub' / 'pyproject.toml').write_text(ORCH_SHAPED_PYPROJECT, encoding='utf-8')
+    cmd = LaneCommand(name='w', command='pytest -m warm_lane_bash', cwd='sub')
+
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(b'all tests passed\n', None))
+    mock_proc.returncode = 0
+
+    with patch(
+        'orchestrator.offline_lane.asyncio.create_subprocess_exec',
+        return_value=mock_proc,
+    ) as mock_exec:
+        await worker.command_confirmation_runner(cmd, wt_path, 'HEAD1')
+
+    tokens = shlex.split(mock_exec.call_args.args[-1])
+    assert tokens[:3] == ['pytest', '-m', 'warm_lane_bash'], tokens
+    assert tokens[3:] == ['-p', 'no:xdist', '-o', "addopts=-m 'not warm_lane_bash'"], tokens
 
 
 @pytest.mark.asyncio

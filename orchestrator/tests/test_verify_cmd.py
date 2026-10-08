@@ -19,6 +19,13 @@ import subprocess
 
 import pytest
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
+from _serial_recovery_helpers import (
+    ORCH_SHAPED_ADDOPTS,
+    ROOT_SHAPED_ADDOPTS,
+    addopts_values,
+    xdist_offenders,
+    xdist_option_surface,
+)
 from _verify_config_corpus import (
     DF_CONFIG_PATH,
     FM_LINT_COMMAND,
@@ -943,6 +950,207 @@ class TestSerialPytest:
             f'stdout: {result.stdout}\n'
             f'stderr: {result.stderr}'
         )
+
+
+_XDIST_SAMPLE_VALUES = {
+    '-n': '4', '--numprocesses': '4', '--maxprocesses': '2',
+    '--max-worker-restart': '3', '--dist': 'loadgroup', '--tx': 'popen',
+    '--px': 'x', '--rsyncdir': 'd', '--rsyncignore': 'g',
+    '--testrunuid': 'u', '--maxschedchunk': '2',
+}
+
+
+def _xdist_value_option_params():
+    return [
+        pytest.param(name, _XDIST_SAMPLE_VALUES.get(name, 'v'), id=name)
+        for name, takes_value in sorted(xdist_option_surface().items())
+        if takes_value
+    ]
+
+
+def _xdist_boolean_option_params():
+    return [
+        pytest.param(name, id=name)
+        for name, takes_value in sorted(xdist_option_surface().items())
+        if not takes_value
+    ]
+
+
+def _xdist_argv_spelling_params():
+    """Every argv spelling of every xdist option: separate, attached, boolean."""
+    params = []
+    for name, takes_value in sorted(xdist_option_surface().items()):
+        if not takes_value:
+            params.append(pytest.param(name, id=name))
+            continue
+        value = _XDIST_SAMPLE_VALUES.get(name, 'v')
+        params.append(pytest.param(f'{name} {value}', id=f'{name}-separate'))
+        attached = f'{name}={value}' if name.startswith('--') else f'{name}{value}'
+        params.append(pytest.param(attached, id=f'{name}-attached'))
+    return params
+
+
+class TestSerialPytestShedsEveryXdistOption:
+    """``serial_pytest`` sheds xdist's WHOLE option surface from argv.
+
+    ``-p no:xdist`` unregisters every option xdist adds, not just the worker
+    count, so any xdist option surviving on argv is a hard
+    ``unrecognized arguments`` (rc=4) on the recovery run. The option set is
+    derived from xdist itself (``xdist_option_surface``), never restated.
+    """
+
+    @staticmethod
+    def _recover(command: str) -> str:
+        return render(serial_pytest(parse_config_command(command)))
+
+    def _assert_shed(self, rendered: str, *, what: str) -> None:
+        offenders = xdist_offenders(shlex.split(rendered))
+        assert not offenders, (
+            f'{what}: serial recovery left xdist option(s) {offenders} on argv; '
+            f'with `-p no:xdist` appended pytest exits rc=4 with '
+            f'`unrecognized arguments`.\nrendered: {rendered!r}'
+        )
+        assert '-p no:xdist' in rendered, rendered
+        assert parse_config_command(rendered).targets == ('tests/',), (
+            f'{what}: `tests/` must stay the ONLY positional target — a value '
+            f'stranded by a half-shed flag runs as a phantom target.\n'
+            f'rendered: {rendered!r}'
+        )
+
+    def test_the_oracle_sees_xdist_s_known_options(self):
+        """Non-vacuity: the stub really read xdist's registrations."""
+        surface = xdist_option_surface()
+        assert surface['-n'] is True
+        assert surface['--max-worker-restart'] is True
+        assert surface['-d'] is False
+        assert surface['--no-loadscope-reorder'] is False
+
+    @pytest.mark.parametrize(('option', 'value'), _xdist_value_option_params())
+    def test_separate_token_value_form_is_shed_with_its_value(self, option, value):
+        self._assert_shed(
+            self._recover(f'uv run pytest {option} {value} tests/'),
+            what=f'{option} {value}',
+        )
+
+    @pytest.mark.parametrize(('option', 'value'), _xdist_value_option_params())
+    def test_attached_form_is_shed_as_one_token(self, option, value):
+        attached = f'{option}={value}' if option.startswith('--') else f'{option}{value}'
+        self._assert_shed(
+            self._recover(f'uv run pytest {attached} tests/'), what=attached,
+        )
+
+    @pytest.mark.parametrize('attached', ['-nauto', '-n4'])
+    def test_attached_short_worker_count_is_shed(self, attached):
+        self._assert_shed(
+            self._recover(f'uv run pytest {attached} tests/'), what=attached,
+        )
+
+    @pytest.mark.parametrize('option', _xdist_boolean_option_params())
+    def test_boolean_form_is_shed_without_eating_the_next_token(self, option):
+        rendered = self._recover(f'uv run pytest {option} -q tests/')
+        self._assert_shed(rendered, what=option)
+        assert '-q' in shlex.split(rendered), (
+            f'{option} is boolean, so shedding it must not swallow the '
+            f'following `-q`: {rendered!r}'
+        )
+
+    @pytest.mark.parametrize('spelling', _xdist_argv_spelling_params())
+    def test_a_raw_chain_carrying_any_xdist_option_is_refused_by_identity(self, spelling):
+        """No sound raw surgery exists, so the chain is handed back untouched."""
+        cmd = parse_config_command(f'pytest {spelling} tests/ && true')
+        assert cmd.raw is not None
+        assert serial_pytest(cmd) is cmd
+
+
+_ALL_XDIST_ADDOPTS = ('-n', 'auto', '--dist', 'loadgroup')
+
+
+class TestSerialPytestReSuppliesGoverningAddopts:
+    """``serial_pytest(cmd, ini_addopts)`` re-supplies the governing addopts minus xdist.
+
+    A bare ``-o addopts=`` drops the import mode and marker filter along with
+    ``-n auto``, so the recovery run collects and selects a DIFFERENT test set
+    from the run it recovers. The caller hands in the governing config's RAW
+    addopts tokens; the xdist strip is ``serial_pytest``'s, beside the
+    ``-p no:xdist`` that requires it.
+    """
+
+    _STRUCTURED = 'uv run --directory orchestrator pytest tests/ --tb=short -q'
+
+    def _recover(self, command: str, ini_addopts=()) -> str:
+        return render(serial_pytest(parse_config_command(command), ini_addopts))
+
+    def test_xdist_is_stripped_and_the_rest_is_carried_as_one_token(self):
+        tokens = shlex.split(self._recover(self._STRUCTURED, ORCH_SHAPED_ADDOPTS))
+        assert tokens[-5:] == ['-p', 'no:xdist', '-o', "addopts=-m 'not warm_lane_bash'", 'tests/']
+        assert not xdist_offenders(tokens)
+
+    def test_root_shaped_addopts_are_carried_intact(self):
+        tokens = shlex.split(self._recover(self._STRUCTURED, ROOT_SHAPED_ADDOPTS))
+        assert addopts_values(tokens) == [shlex.join(ROOT_SHAPED_ADDOPTS)]
+
+    def test_all_xdist_addopts_render_the_historical_blank(self):
+        assert self._recover(self._STRUCTURED, _ALL_XDIST_ADDOPTS) == self._recover(self._STRUCTURED)
+        assert self._recover('pytest tests/x.py', _ALL_XDIST_ADDOPTS) == (
+            'pytest -p no:xdist -o addopts= tests/x.py'
+        )
+
+    def test_the_default_is_byte_identical_to_the_historical_recovery(self):
+        assert self._recover('pytest tests/x.py') == 'pytest -p no:xdist -o addopts= tests/x.py'
+        assert self._recover('cd a && pytest t1 && cd ../b && pytest t2') == (
+            "cd a && pytest t1 -p no:xdist -o addopts='' && "
+            "cd ../b && pytest t2 -p no:xdist -o addopts=''"
+        )
+
+    def test_a_raw_chain_carries_the_value_on_every_invocation(self):
+        rendered = self._recover('cd a && pytest t1 && cd ../b && pytest t2', ORCH_SHAPED_ADDOPTS)
+        suffix = f' -p no:xdist -o {shlex.quote("addopts=-m " + shlex.quote("not warm_lane_bash"))}'
+        assert rendered == f'cd a && pytest t1{suffix} && cd ../b && pytest t2{suffix}'
+        tokens = shlex.split(rendered)
+        assert addopts_values(tokens) == ["-m 'not warm_lane_bash'"] * 2
+        assert not xdist_offenders(tokens)
+
+    @pytest.mark.parametrize(
+        'command',
+        [
+            pytest.param("pytest -k 'a && b' tests/ && true", id='unspliceable-chain'),
+            pytest.param('pytest -n 4 tests/ && true', id='raw-chain-with-argv-worker-flag'),
+            pytest.param('cargo test --workspace', id='non-pytest'),
+            pytest.param('mypy src/', id='opaque'),
+        ],
+    )
+    def test_refusals_still_return_the_callers_own_command(self, command):
+        cmd = parse_config_command(command)
+        assert serial_pytest(cmd, ROOT_SHAPED_ADDOPTS) is cmd
+
+    def test_the_rendered_value_survives_a_render_parse_render_round_trip(self):
+        """``-o`` is bound at parse time, so later string rewrites compose on top."""
+        rendered = self._recover(self._STRUCTURED, ROOT_SHAPED_ADDOPTS)
+        assert render(parse_config_command(rendered)) == rendered
+
+        timed = shlex.split(render(with_pytest_timeout(parse_config_command(rendered), 300)))
+        assert addopts_values(timed) == [shlex.join(ROOT_SHAPED_ADDOPTS)]
+        addopts_at = next(i for i, tok in enumerate(timed) if tok.startswith('addopts='))
+        assert timed[addopts_at + 1 : addopts_at + 3] == ['--timeout', '300']
+
+    @pytest.mark.parametrize(
+        'command',
+        [
+            pytest.param('uv run --directory orchestrator pytest tests/', id='structured'),
+            pytest.param('cd a && pytest t1 && cd ../b && pytest t2', id='raw-chain'),
+        ],
+    )
+    def test_the_recovered_command_is_serial_forced(self, command):
+        recovered = serial_pytest(parse_config_command(command), ORCH_SHAPED_ADDOPTS)
+        assert _is_serial_forced(recovered)
+        assert apply_pytest_numprocesses(recovered, '8') is recovered
+
+    def test_a_cli_marker_filter_still_follows_the_re_supplied_one(self):
+        """pytest prepends addopts to argv and ``-m`` is last-wins, so the CLI ``-m`` wins."""
+        tokens = shlex.split(self._recover('uv run pytest -m warm_lane_bash', ORCH_SHAPED_ADDOPTS))
+        cli_marker_at = tokens.index('-m')
+        assert tokens[cli_marker_at : cli_marker_at + 2] == ['-m', 'warm_lane_bash']
+        assert addopts_values(tokens) == ["-m 'not warm_lane_bash'"]
 
 
 class TestRawRewriteDoesNotSwallowSubshellTerminator:
