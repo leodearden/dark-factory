@@ -1039,10 +1039,8 @@ class EventStore:
         considered, because branches and task_ids are reused across runs and a
         prior run's terminal state must never read as this run's outcome.
         ``cross_run=True`` is the explicit opt-in for history.  Every row
-        carries ``run_id`` and ``is_current_run`` so a caller cannot mistake
-        history for present truth; a prior-run row may only populate a
-        labelled ``last_outcome`` (plans/merge-status-durable-non-landed-prd.md
-        D2).
+        carries ``run_id`` and ``is_current_run``, so history is always
+        labelled as such (plans/merge-status-durable-non-landed-prd.md D2).
 
         The returned dict has keys request_id, task_id, branch, state,
         snapshot_tip, merge_sha, superseded_by, reason, finished_at (the
