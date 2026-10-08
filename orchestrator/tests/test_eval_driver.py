@@ -1456,7 +1456,7 @@ class TestBuildEvalOrchConfigAutoSeedsProxiedPrices:
 
         base = _base_config(tmp_path)
         proxied = EvalConfig(
-            'minimax-m2.5-endpoint', 'claude', MINIMAX_MODEL, 'high',
+            'minimax-m3-endpoint', 'claude', MINIMAX_MODEL, 'high',
             env_overrides={
                 'ANTHROPIC_BASE_URL': MINIMAX_BASE_URL,
                 'ANTHROPIC_AUTH_TOKEN': 'dummy',
@@ -1487,7 +1487,7 @@ class TestBuildEvalOrchConfigAutoSeedsProxiedPrices:
             update={'prices': {MINIMAX_MODEL: manual_rate}},
         )
         proxied = EvalConfig(
-            'minimax-m2.5-endpoint', 'claude', MINIMAX_MODEL, 'high',
+            'minimax-m3-endpoint', 'claude', MINIMAX_MODEL, 'high',
             env_overrides={
                 'ANTHROPIC_BASE_URL': MINIMAX_BASE_URL,
                 'ANTHROPIC_AUTH_TOKEN': 'dummy',
