@@ -140,3 +140,28 @@ def test_a_doc_with_no_headings_has_no_slugs_and_warns_once(tmp_path, caplog):
     warnings = _warnings(caplog)
     assert len(warnings) == 1
     assert str(root / invariants.DOC_RELPATH) in warnings[0].getMessage()
+
+
+def test_an_undecodable_doc_has_no_slugs_and_warns_naming_it(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
+    doc = tmp_path / invariants.DOC_RELPATH
+    doc.parent.mkdir(parents=True)
+    doc.write_bytes(b'## INV-1 `a-slug`\n\xff\xfe\n')
+
+    assert invariants.read_slugs(tmp_path) == ()
+
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1
+    assert str(doc) in warnings[0].getMessage()
+
+
+def test_an_unreadable_doc_has_no_slugs_and_warns_naming_it(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
+    doc = tmp_path / invariants.DOC_RELPATH
+    doc.mkdir(parents=True)
+
+    assert invariants.read_slugs(tmp_path) == ()
+
+    warnings = _warnings(caplog)
+    assert len(warnings) == 1
+    assert str(doc) in warnings[0].getMessage()

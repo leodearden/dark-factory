@@ -51,13 +51,21 @@ def parse_headings(md_text: str) -> tuple[Invariant, ...]:
 def read_slugs(project_root: str | os.PathLike[str]) -> tuple[str, ...]:
     """The distinct slugs *project_root*'s doc declares, first occurrence first.
 
-    A project without the doc declares none. A doc that exists but yields no
-    heading is a parse drift, not an empty family, so it is logged.
+    A project without the doc declares none. A doc that cannot be read or
+    decoded, or that yields no heading, declares none too, and is logged: the
+    slugs are guidance, so a broken doc must not stop the run that reads it.
     """
     path = Path(project_root) / DOC_RELPATH
     try:
         text = path.read_text(encoding='utf-8')
     except FileNotFoundError:
+        return ()
+    except (OSError, UnicodeDecodeError) as exc:
+        logger.warning(
+            '%s could not be read (%s: %s); the coder will be told this '
+            'project declares no invariant slugs',
+            path, type(exc).__name__, exc,
+        )
         return ()
     headings = parse_headings(text)
     if not headings:
