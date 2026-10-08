@@ -59,6 +59,7 @@ from fused_memory.reconciliation.policies import is_snapshot_write_blocked
 from fused_memory.reconciliation.prompts import (
     _STAGE2_PROJECT_ID_GUIDELINE,
     _STAGE3_PROJECT_ID_GUIDELINE,
+    FLAG_FOR_STAGE2_MARKER_KIND,
 )
 from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 from fused_memory.reconciliation.recon_pool_map import (
@@ -1450,13 +1451,22 @@ class _TasklessRetirement(NamedTuple):
     """When a pool member citing no task may pass the terminal-closure gate (task 4995)."""
 
     max_age_days: int
+    marker_kind: str
 
-    def permits(self, created_at: datetime, now: datetime) -> bool:
+    def permits(self, metadata, created_at: datetime, now: datetime) -> bool:
+        # The kind arm mirrors scripts/sweep_orphan_flag_markers.py::protection_reason
+        # (task 5286); == rather than set membership, so an unhashable kind cannot raise.
+        if not isinstance(metadata, dict):
+            return False
+        kind = metadata.get('kind')
+        if kind is not None and kind != self.marker_kind:
+            return False
         return created_at < now - timedelta(days=self.max_age_days)
 
 
 _FLAG_FOR_STAGE2_TASKLESS_RETIREMENT = _TasklessRetirement(
     max_age_days=_FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS,
+    marker_kind=FLAG_FOR_STAGE2_MARKER_KIND,
 )
 
 
@@ -1483,7 +1493,9 @@ def _closure_permits_retirement(
     key = _cited_task_key(metadata)
     if key:
         return key in terminal_ids
-    return taskless_retirement is not None and taskless_retirement.permits(created_at, now)
+    return taskless_retirement is not None and taskless_retirement.permits(
+        metadata, created_at, now,
+    )
 
 
 async def _sweep_stale_mem0_pool(

@@ -63,6 +63,7 @@ from fused_memory.reconciliation.stages.memory_consolidator import MemoryConsoli
 from fused_memory.reconciliation.stages.task_knowledge_sync import (
     _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE,
     _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS,
+    _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS,
     _FLAGGED_ITEMS_CHAR_BUDGET,
     IntegrityCheck,
     TaskKnowledgeSync,
@@ -9416,6 +9417,7 @@ class TestSweepStaleMem0FlagForStage2Markers:
 
 _RETIRE_NOW = datetime(2026, 9, 28, 12, 0, 0, tzinfo=UTC)
 _STALE_DAYS = _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS + 6
+_TASKLESS_CEILING_DAYS = _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS
 
 
 def _relay_marker(mid: str, age_days: int, **metadata) -> dict:
@@ -9543,10 +9545,7 @@ class TestFlagForStage2TasklessRetirement:
         ids=['absent', 'none', 'empty', 'whitespace'],
     )
     async def test_taskless_marker_past_the_ceiling_is_retired(self, cited_task):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
-        )
-        pool = LiveFlagPool([_relay_marker('taskless', ceiling + 1, **cited_task)])
+        pool = LiveFlagPool([_relay_marker('taskless', _TASKLESS_CEILING_DAYS + 1, **cited_task)])
 
         result = await _sweep_stale_mem0_flag_for_stage2_markers(
             pool, 'dark_factory', 'cycle-run', terminal_task_ids={'T'}, now=_RETIRE_NOW,
@@ -9559,10 +9558,6 @@ class TestFlagForStage2TasklessRetirement:
 
     @pytest.mark.asyncio
     async def test_the_taskless_ceiling_not_the_ttl_governs(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
-        )
-
         def taskless(mid: str, age: timedelta) -> dict:
             return {
                 'id': mid,
@@ -9571,8 +9566,8 @@ class TestFlagForStage2TasklessRetirement:
             }
 
         pool = LiveFlagPool([
-            taskless('past-ceiling', timedelta(days=ceiling, hours=1)),
-            taskless('short-of-ceiling', timedelta(days=ceiling, hours=-1)),
+            taskless('past-ceiling', timedelta(days=_TASKLESS_CEILING_DAYS, hours=1)),
+            taskless('short-of-ceiling', timedelta(days=_TASKLESS_CEILING_DAYS, hours=-1)),
             taskless('past-ttl-only', timedelta(days=_FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS + 1)),
         ])
 
@@ -9585,12 +9580,9 @@ class TestFlagForStage2TasklessRetirement:
 
     @pytest.mark.asyncio
     async def test_taskless_retirement_does_not_wait_on_taskmaster(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
-        )
         pool = LiveFlagPool([
-            _relay_marker('taskless', ceiling + 1),
-            _relay_marker('cites-task', ceiling + 1, task_id='T'),
+            _relay_marker('taskless', _TASKLESS_CEILING_DAYS + 1),
+            _relay_marker('cites-task', _TASKLESS_CEILING_DAYS + 1, task_id='T'),
         ])
 
         await _sweep_stale_mem0_flag_for_stage2_markers(
@@ -9601,10 +9593,7 @@ class TestFlagForStage2TasklessRetirement:
 
     @pytest.mark.asyncio
     async def test_task_citing_markers_never_reach_the_ceiling(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
-        )
-        ancient = 10 * ceiling
+        ancient = 10 * _TASKLESS_CEILING_DAYS
         pool = LiveFlagPool([
             _relay_marker('open-task', ancient, task_id='OPEN'),
             _relay_marker('comma-joined', ancient, task_id='T,U'),
@@ -9620,10 +9609,7 @@ class TestFlagForStage2TasklessRetirement:
 
     @pytest.mark.asyncio
     async def test_protected_records_stay_protected_without_a_task(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
-        )
-        ancient = 10 * ceiling
+        ancient = 10 * _TASKLESS_CEILING_DAYS
         pool = LiveFlagPool([
             _relay_marker('mirror', ancient, kind='cycle_summary'),
             _relay_marker('audit', ancient, kind='cadence_check'),
@@ -9638,13 +9624,10 @@ class TestFlagForStage2TasklessRetirement:
 
     @pytest.mark.asyncio
     async def test_retained_warning_counts_only_what_is_still_withheld(self, caplog):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
-        )
         pool = LiveFlagPool([
-            _relay_marker('taskless-past-ceiling', ceiling + 1),
+            _relay_marker('taskless-past-ceiling', _TASKLESS_CEILING_DAYS + 1),
             _relay_marker('taskless-past-ttl', _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS + 1),
-            _relay_marker('open-task', ceiling + 1, task_id='OPEN'),
+            _relay_marker('open-task', _TASKLESS_CEILING_DAYS + 1, task_id='OPEN'),
         ])
 
         with caplog.at_level(logging.WARNING):
@@ -9657,14 +9640,10 @@ class TestFlagForStage2TasklessRetirement:
 
     @pytest.mark.asyncio
     async def test_done_hook_leaves_taskless_markers_to_the_sweep(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
-        )
-
         def pool() -> LiveFlagPool:
             return LiveFlagPool([
-                _relay_marker('taskless', ceiling + 1),
-                _relay_marker('cites-T', ceiling + 1, task_id='T'),
+                _relay_marker('taskless', _TASKLESS_CEILING_DAYS + 1),
+                _relay_marker('cites-T', _TASKLESS_CEILING_DAYS + 1, task_id='T'),
             ])
 
         hook_pool, sweep_pool = pool(), pool()
@@ -9684,11 +9663,8 @@ class TestFlagForStage2TasklessRetirement:
 
     @pytest.mark.asyncio
     async def test_taskless_marker_declaring_the_marker_kind_is_retired(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
-        )
         pool = LiveFlagPool([
-            _relay_marker('marker-kind', ceiling + 1, kind=FLAG_FOR_STAGE2_MARKER_KIND),
+            _relay_marker('marker-kind', _TASKLESS_CEILING_DAYS + 1, kind=FLAG_FOR_STAGE2_MARKER_KIND),
         ])
 
         await _sweep_stale_mem0_flag_for_stage2_markers(
@@ -9708,10 +9684,7 @@ class TestFlagForStage2TasklessRetirement:
         ],
     )
     async def test_taskless_marker_declaring_a_foreign_kind_is_kept_at_any_age(self, kind):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
-        )
-        pool = LiveFlagPool([_relay_marker('foreign-kind', 10 * ceiling, kind=kind)])
+        pool = LiveFlagPool([_relay_marker('foreign-kind', 10 * _TASKLESS_CEILING_DAYS, kind=kind)])
 
         result = await _sweep_stale_mem0_flag_for_stage2_markers(
             pool, 'dark_factory', 'cycle-run', terminal_task_ids={'T'}, now=_RETIRE_NOW,
@@ -9722,14 +9695,11 @@ class TestFlagForStage2TasklessRetirement:
 
     @pytest.mark.asyncio
     async def test_taskless_member_with_non_dict_metadata_is_kept(self):
-        from fused_memory.reconciliation.stages.task_knowledge_sync import (
-            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
-        )
         memory_service = AsyncMock()
         memory_service.count_memories_by_metadata = AsyncMock(return_value=1)
         memory_service.get_memories_by_metadata = AsyncMock(return_value=[{
             'id': 'odd',
-            'created_at': (_RETIRE_NOW - timedelta(days=10 * ceiling)).isoformat(),
+            'created_at': (_RETIRE_NOW - timedelta(days=10 * _TASKLESS_CEILING_DAYS)).isoformat(),
             'metadata': None,
         }])
         memory_service.delete_memory = AsyncMock(return_value=None)
