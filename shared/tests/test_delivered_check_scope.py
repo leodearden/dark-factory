@@ -96,11 +96,20 @@ class TestClassifyScopePaths:
                     'import sys\n\ndef swap(x):\n    sys.modules[__name__] = x\n'
                 ),
                 'docs/x.md': 'sys.modules[__name__] = y\n',
+                'src/spaced.py': 'import sys\n\nsys.modules[__name__]  =  object()\n',
+                'src/tabbed.py': 'import sys\n\nsys.modules[__name__]\t= object()\n',
             },
         )
 
         result = classify_scope_paths(
-            ['src/old_mod.py', 'src/indented.py', 'docs/x.md', 'src/new_mod.py'],
+            [
+                'src/old_mod.py',
+                'src/indented.py',
+                'docs/x.md',
+                'src/new_mod.py',
+                'src/spaced.py',
+                'src/tabbed.py',
+            ],
             repo_root=repo,
             ref='main',
         )
@@ -110,11 +119,9 @@ class TestClassifyScopePaths:
             'src/indented.py': PathState.LIVE,
             'docs/x.md': PathState.LIVE,
             'src/new_mod.py': PathState.LIVE,
+            'src/spaced.py': PathState.SYS_MODULES_SHIM,
+            'src/tabbed.py': PathState.SYS_MODULES_SHIM,
         }
-
-    def test_shim_pattern_is_a_line_anchored_posix_ere(self):
-        assert SYS_MODULES_SHIM_PATTERN.startswith('^sys')
-        assert '[[:space:]]' in SYS_MODULES_SHIM_PATTERN
 
     def test_file_deleted_on_main_is_removed_naming_the_commit(self, tmp_path):
         repo = _init_git_repo(tmp_path / 'repo', {'src/gone.py': 'x = 1\n', 'src/keep.py': ''})
