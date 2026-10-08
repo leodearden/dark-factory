@@ -453,8 +453,8 @@ Investigate this claim against the codebase and report your findings.
             tools=tools,
             terminal_tool='verification_complete',
             cli_tools=_EXPLORE_CLI_TOOLS,
-            # The agent explores the TARGET project (task 4722): its cwd, and
-            # so the CLAUDE.md the CLI auto-loads, must be that project's.
+            # The agent explores the TARGET project (task 4722): its cwd, the
+            # root the CLI confines its read tools to, must be that project's.
             cwd=codebase_root,
         )
 

@@ -380,9 +380,14 @@ class AgentLoop:
             system_prompt=self._cli_system_prompt(),
             output_schema=terminal.parameters,
             available_tools=list(self.cli_tools),
-            # No allow rules: under dontAsk the CLI's built-in read tools stay
-            # confined to cwd (measured; see the probe script's docstring).
+            # Read-only and confined to cwd: dontAsk denies whatever would need
+            # a permission prompt, which keeps the read tools inside cwd unless
+            # an allow rule widens them.  This call passes none and reads no
+            # settings file, so no user or project allow rule applies either;
+            # one would (measured), and so would managed policy settings.  No
+            # settings file also means the CLI auto-loads no CLAUDE.md.
             permission_mode='dontAsk',
+            setting_sources=[],
             # --tools does not filter MCP, so MCP is closed by the strict empty
             # config.  cwd is the codebase root (tasks 1989/4722), which may
             # hold a live .mcp.json.

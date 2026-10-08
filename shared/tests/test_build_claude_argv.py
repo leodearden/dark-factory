@@ -361,6 +361,66 @@ def test_build_claude_argv_refuses_a_non_bare_registry_entry(entry: str) -> None
     mkstemp.assert_not_called()
 
 
+def _sources_argv(setting_sources: list[str] | None) -> tuple[list[str], list[str]]:
+    return build_claude_argv(
+        model='opus',
+        max_budget_usd=5.0,
+        system_prompt='sys',
+        max_turns=20,
+        permission_mode='dontAsk',
+        allowed_tools=None,
+        disallowed_tools=None,
+        mcp_config=None,
+        output_schema=None,
+        effort=None,
+        resume_session_id=None,
+        session_id=None,
+        setting_sources=setting_sources,
+    )
+
+
+def test_build_claude_argv_empty_setting_sources_reads_no_settings_file() -> None:
+    """``[]`` is ``--setting-sources ''``: no user, project or local settings
+    file is read, so none of their permission allow rules reach the call.
+    """
+    cmd, temp_files = _sources_argv([])
+    try:
+        assert cmd.count('--setting-sources') == 1, f'got {cmd!r}'
+        assert cmd[cmd.index('--setting-sources') + 1] == '', f'got {cmd!r}'
+    finally:
+        _cleanup(temp_files)
+
+
+def test_build_claude_argv_setting_sources_are_comma_joined() -> None:
+    cmd, temp_files = _sources_argv(['project', 'local'])
+    try:
+        assert cmd[cmd.index('--setting-sources') + 1] == 'project,local', f'got {cmd!r}'
+    finally:
+        _cleanup(temp_files)
+
+
+def test_build_claude_argv_default_emits_no_setting_sources() -> None:
+    cmd, temp_files = _sources_argv(None)
+    try:
+        assert '--setting-sources' not in cmd, f'got {cmd!r}'
+    finally:
+        _cleanup(temp_files)
+
+
+@pytest.mark.parametrize('entry', ['policy', 'User', 'user,project', ''])
+def test_build_claude_argv_refuses_an_unknown_setting_source(entry: str) -> None:
+    """Only the CLI's three file sources are accepted; the refusal names the
+    entry and comes before any temp file exists.
+    """
+    with (
+        patch('shared.cli_invoke.tempfile.mkstemp') as mkstemp,
+        pytest.raises(ValueError) as excinfo,
+    ):
+        _sources_argv(['user', entry])
+    assert repr(entry) in str(excinfo.value), str(excinfo.value)
+    mkstemp.assert_not_called()
+
+
 def test_build_claude_argv_resume_keeps_system_prompt_schema_and_tool_filter() -> None:
     """RESUME + output_schema: BOTH the system prompt and the schema survive.
 

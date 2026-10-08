@@ -113,3 +113,16 @@ async def test_the_cli_gets_read_grep_glob_and_the_verdict_schema(git_root):
     assert 'explain your reasoning' not in kwargs['system_prompt']
     assert '"thinking"' not in kwargs['system_prompt']
     assert kwargs['cwd'] == git_root.resolve()
+
+
+@pytest.mark.asyncio
+async def test_no_ambient_settings_file_can_widen_the_read_confinement(git_root):
+    """dontAsk confines Read/Grep/Glob to cwd only while NO allow rule applies,
+    and the CLI otherwise merges allow rules from the user's settings and from
+    the target project's own .claude/settings*.json.  The call therefore reads
+    no settings file at all.  The measured widening is recorded in
+    fused-memory/scripts/probe_schema_max_turns.py's docstring.
+    """
+    kwargs = await _verify_cli_kwargs(git_root)
+    assert kwargs['setting_sources'] == []
+    assert not kwargs.get('allowed_tools')

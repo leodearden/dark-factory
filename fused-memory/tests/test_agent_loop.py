@@ -1064,6 +1064,7 @@ async def test_cli_run_is_one_invocation_returning_the_terminal_payload():
     assert kwargs['output_schema'] == _P
     assert kwargs['available_tools'] == ['Read', 'Grep', 'Glob']
     assert kwargs['permission_mode'] == 'dontAsk'
+    assert kwargs['setting_sources'] == []
     assert kwargs.get('disallowed_tools') is None
     assert kwargs['mcp_config'] == {'mcpServers': {}}
     assert kwargs['strict_mcp_config'] is True
@@ -1324,6 +1325,7 @@ async def test_cli_scoping_survives_forwarding_to_invoke_claude_agent(tmp_path):
     kwargs = mock_agent.call_args.kwargs
     assert kwargs['available_tools'] == ['Read', 'Grep', 'Glob']
     assert kwargs['permission_mode'] == 'dontAsk'
+    assert kwargs['setting_sources'] == []
     assert kwargs['mcp_config'] == {'mcpServers': {}}
     assert kwargs['strict_mcp_config'] is True
     assert kwargs['output_schema'] == _P

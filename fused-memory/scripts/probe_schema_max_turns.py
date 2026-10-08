@@ -18,13 +18,14 @@ credentials and spends real tokens; the suite stays hermetic and offline.
 Current shape (task 4344)
 -------------------------
 Recon-verify is ONE CLI invocation: ``--tools Read,Grep,Glob``,
-``--permission-mode dontAsk`` with no allow rules, the strict empty MCP config,
-``--json-schema`` = the ``verification_complete`` parameters, and
-``max_turns=_AGENT_CLI_MAX_TURNS`` (20).
+``--permission-mode dontAsk`` with no allow rules, ``--setting-sources ''``,
+the strict empty MCP config, ``--json-schema`` = the ``verification_complete``
+parameters, and ``max_turns=_AGENT_CLI_MAX_TURNS`` (20).
 
 Measured on Claude CLI 2.1.293, alias ``sonnet`` served as
 ``claude-sonnet-5-5``, 2026-10-07, ``--repeat 12`` at the production cap, one
-pool account (max-c; four were usage-capped and two failed auth that day):
+pool account (max-c; four were usage-capped and two failed auth that day),
+BEFORE ``--setting-sources ''``, so with the root's CLAUDE.md loaded:
 
     recon-verify  max_turns=20 -> 12/12 ok   num_turns 5 on every run
                   slowest 41s of the 180s timeout (others 12-22s)
@@ -50,6 +51,19 @@ on every CLI upgrade.
   running in don't ask mode"; (iii) ``StructuredOutput`` delivered the schema
   payload (accepted in the transcript); (iv) the transcript's tool uses were
   Read, Read, Grep, StructuredOutput — nothing outside the registry.
+* CLI 2.1.293 (task 4344 amendment, 2026-10-08, sonnet, ad-hoc
+  ``invoke_claude_agent`` calls with the production kwargs, a throwaway cwd
+  holding a CLAUDE.md, and a throwaway ``CLAUDE_CONFIG_DIR``): the facts above
+  hold only while no settings FILE carries an allow rule.  A
+  ``Read(//etc/**)`` allow rule in EITHER the cwd's
+  ``.claude/settings.local.json`` OR the config dir's ``settings.json`` let a
+  Read of ``/etc/hostname`` through under ``dontAsk``.  With
+  ``setting_sources=[]`` (``--setting-sources ''``) and both rules present the
+  same Read was DENIED, while in-cwd Read and ``StructuredOutput`` still
+  worked; so the verifier passes it.  The flag also stops the CLI loading the
+  cwd's CLAUDE.md: a fact stated only there was reported without the flag and
+  not with it.  Managed policy settings are not a setting source and would
+  still apply.
 
 RETIRED pseudo-tool shape (pre-4344) history
 --------------------------------------------

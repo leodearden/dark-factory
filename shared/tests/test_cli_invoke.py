@@ -3325,6 +3325,16 @@ class TestSchemaToolNotDisallowed:
         assert captured_cmd[captured_cmd.index('--tools') + 1] == 'Read,Grep,Glob'
         assert '--json-schema' in captured_cmd
 
+    async def test_setting_sources_is_forwarded(self, tmp_path):
+        captured_cmd = []
+        with patch('shared.cli_invoke.asyncio.create_subprocess_exec',
+                   side_effect=_capture_cmd_exec(captured_cmd)):
+            await invoke_claude_agent(
+                prompt='hi', system_prompt='sys', cwd=tmp_path,
+                available_tools=['Read'], output_schema=self._SCHEMA, setting_sources=[],
+            )
+        assert captured_cmd[captured_cmd.index('--setting-sources') + 1] == ''
+
     async def test_wildcard_without_schema_is_preserved(self, tmp_path):
         """judge.py case: ['*'] with no output_schema must keep blocking all tools."""
         captured_cmd = []

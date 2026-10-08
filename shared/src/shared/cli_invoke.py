@@ -2083,6 +2083,7 @@ async def invoke_claude_agent(
     absolute_cap_secs: float | None = None,
     strict_mcp_config: bool = False,
     available_tools: list[str] | None = None,
+    setting_sources: list[str] | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
 
@@ -2099,6 +2100,11 @@ async def invoke_claude_agent(
     MCP, so a caller must also pass ``mcp_config=no_mcp_servers_config()``
     with ``strict_mcp_config=True``.  Forwarded verbatim to
     ``build_claude_argv``, which validates it.
+
+    *setting_sources*, when not None, names the settings files the CLI reads
+    (``--setting-sources``); ``[]`` reads none, so no ambient permission allow
+    rule reaches the call.  Forwarded verbatim to ``build_claude_argv``, which
+    validates it.
 
     *oauth_token*, when set, overrides the Claude CLI's default credentials
     via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
@@ -2173,6 +2179,7 @@ async def invoke_claude_agent(
         absolute_cap_secs=absolute_cap_secs,
         strict_mcp_config=strict_mcp_config,
         available_tools=available_tools,
+        setting_sources=setting_sources,
     )
 
 
@@ -3210,6 +3217,7 @@ def build_claude_argv(
     session_id: str | None,
     strict_mcp_config: bool = False,
     available_tools: list[str] | None = None,
+    setting_sources: list[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Assemble the Claude CLI argv — the single source of truth shared by the
     non-sandbox (``_invoke_claude``) and sandbox (``_invoke_claude_with_sandbox``)
@@ -3243,6 +3251,14 @@ def build_claude_argv(
     ``mcp_config=no_mcp_servers_config()`` with ``strict_mcp_config=True``.
     Both refusals raise ``ValueError`` before any temp file exists.
 
+    ``setting_sources`` (default ``None``, which emits nothing and leaves the
+    CLI reading every settings file): the settings files the CLI reads, emitted
+    as ``--setting-sources <a,b>`` from ``'user'``, ``'project'`` and
+    ``'local'``.  ``[]`` gives ``--setting-sources ''``, which reads none of
+    them, so no ambient permission allow rule reaches the call.  Managed
+    (policy) settings are not a source and still apply.  An unknown entry
+    raises ``ValueError`` before any temp file exists.
+
     Returns ``(cmd, temp_files)``: ``cmd`` is the assembled argv list;
     ``temp_files`` lists the temp file paths created.  It is never empty — the
     sysprompt path is always present, on the resume path too (task 3983) —
@@ -3255,6 +3271,7 @@ def build_claude_argv(
     propagates — callers never need to clean up after a raised call.
     """
     _check_available_tools(available_tools, disallowed_tools)
+    _check_setting_sources(setting_sources)
     cmd = ['claude', '--print', '--output-format', 'json']
 
     cmd.extend(['--model', model])
@@ -3316,6 +3333,8 @@ def build_claude_argv(
 
         cmd.extend(['--permission-mode', permission_mode])
         cmd.extend(['--max-turns', str(max_turns)])
+        if setting_sources is not None:
+            cmd.extend(['--setting-sources', ','.join(setting_sources)])
 
         if effort:
             cmd.extend(['--effort', effort])
@@ -3371,6 +3390,18 @@ def _check_available_tools(
             raise ValueError(
                 f'available_tools entry {entry!r} is not a bare tool name; '
                 "permission-rule specs such as 'Bash(git log:*)' go in allowed_tools"
+            )
+
+
+_SETTING_SOURCES = frozenset({'user', 'project', 'local'})
+
+
+def _check_setting_sources(setting_sources: list[str] | None) -> None:
+    """Refuse a ``setting_sources`` entry that is not one of the CLI's file sources."""
+    for entry in setting_sources or ():
+        if entry not in _SETTING_SOURCES:
+            raise ValueError(
+                f'setting_sources entry {entry!r} is not one of {sorted(_SETTING_SOURCES)}'
             )
 
 
@@ -3431,6 +3462,7 @@ async def _invoke_claude(
     absolute_cap_secs: float | None = None,
     strict_mcp_config: bool = False,
     available_tools: list[str] | None = None,
+    setting_sources: list[str] | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     # BEFORE build_claude_argv, which writes system-prompt / mcp-config temp
@@ -3452,6 +3484,7 @@ async def _invoke_claude(
         session_id=session_id,
         strict_mcp_config=strict_mcp_config,
         available_tools=available_tools,
+        setting_sources=setting_sources,
     )
 
     # User prompt goes over stdin, never argv, to avoid ARG_MAX on large
