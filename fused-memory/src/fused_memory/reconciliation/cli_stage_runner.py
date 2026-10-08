@@ -33,11 +33,14 @@ logger = logging.getLogger(__name__)
 # Non-MCP built-in tools that stages should never use
 DISALLOW_BUILTIN = ['Bash', 'Edit', 'Write', 'NotebookEdit']
 
-# Task write tools (disallowed in Stage 1 — memory consolidation only)
+# Task write tools (disallowed in Stage 1 and Stage 3; Stage 2 files tasks).
 DISALLOW_TASK_WRITES = [
     'mcp__fused-memory__set_task_status',
     'mcp__fused-memory__submit_task',
     'mcp__fused-memory__resolve_ticket',
+    'mcp__fused-memory__cancel_ticket',
+    'mcp__fused-memory__commit_planning',
+    'mcp__fused-memory__set_task_claimant',
     'mcp__fused-memory__update_task',
     'mcp__fused-memory__remove_task',
     'mcp__fused-memory__add_dependency',
@@ -62,6 +65,7 @@ DISALLOW_TASK_WRITES = [
 DISALLOW_MEMORY_WRITES = [
     'mcp__fused-memory__add_episode',
     'mcp__fused-memory__add_memory',
+    'mcp__fused-memory__add_system_record',
     'mcp__fused-memory__delete_memory',
     'mcp__fused-memory__update_memory',
     # consolidate_memories (task 3133) is classified in the SAME change that
@@ -148,6 +152,26 @@ DISALLOW_RECON_REPORT_JOURNAL_WRITES = [
     'mcp__recon-report__repair_memory_citation',
 ]
 
+# fused-memory CONTROL-PLANE mutators (disallowed in every stage — task 3250):
+# tools that mutate the machinery running a stage — reconciliation, config, the
+# scheduler, dead-letter queues and indexes — rather than the data it curates.
+#
+# Every registered fused-memory tool must be in a deny bucket or reviewed as
+# read-only — see
+# tests/test_recon_stage_fused_memory_tool_classification.py::test_every_fused_memory_server_tool_is_classified.
+DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES = [
+    'mcp__fused-memory__trigger_reconciliation',
+    'mcp__fused-memory__unhalt_reconciliation',
+    'mcp__fused-memory__reload_config',
+    'mcp__fused-memory__rebuild_candidate_key_index',
+    'mcp__fused-memory__replay_event_dead_letters',
+    'mcp__fused-memory__delete_dead_letters',
+    'mcp__fused-memory__set_task_priority_override',
+    'mcp__fused-memory__clear_task_priority_override',
+    'mcp__fused-memory__reorder_pin_queue',
+    'mcp__fused-memory__request_park_eviction',
+]
+
 # Escalation READ tools (disallowed in every stage — task 3163,
 # plans/escalation-store-ambiguity-prd.md task α).
 #
@@ -162,10 +186,8 @@ DISALLOW_RECON_REPORT_JOURNAL_WRITES = [
 # the source; the boundary paragraph in the stage prompts
 # (prompts/__init__.py ESCALATION_BOUNDARY_NOTE) explains the absence.
 #
-# The escalation WRITE tool (escalate_blocker) is deliberately NOT denied: it is
-# the sole sanctioned recon escalation use — Stage 2's Stale Flag Escalation
-# (FIX D) — and it writes to the reconciliation store, which is the correct
-# destination for it. Over-denying here breaks FIX D.
+# The escalation WRITE tools are NOT in this list; they have their own
+# per-stage list, DISALLOW_ESCALATION_WRITES, below.
 #
 # PRD open question 4 (reject-vs-omit) resolved during α: `--disallowed-tools`
 # OMITS a denied MCP tool from the agent's tool listing rather than surfacing it
@@ -209,22 +231,47 @@ DISALLOW_ESCALATION_READS = [
     'mcp__escalation__get_task_escalation_history',
 ]
 
+# Escalation FILING tools (disallowed in Stage 1 and Stage 3 — task 3250).
+#
+# The write path is sanctioned in Stage 2 only: the FIX D Stale Flag Escalation
+# in prompts/stage2.py, driven from stages/task_knowledge_sync.py::TaskKnowledgeSync.
+# Denying escalate_blocker in Stage 2 would break FIX D, so this list must never
+# be folded into STAGE2_DISALLOWED.
+#
+# Stage 1 (MemoryConsolidator) and Stage 3 (IntegrityCheck) have no sanctioned
+# escalation write. Their prompts have said so since task 3163 via
+# prompts/__init__.py::render_escalation_boundary_note(can_escalate=False); this
+# list is the mechanical half of that clause. escalate_info rides along because
+# no recon prompt or stage references it. `--disallowed-tools` omits rather than
+# rejects (see above), and _ESCALATION_BOUNDARY_NO_ACTION already explains the
+# absence to a Stage 1/3 agent.
+DISALLOW_ESCALATION_WRITES = [
+    'mcp__escalation__escalate_blocker',
+    'mcp__escalation__escalate_info',
+]
+
 # Per-stage disallowed lists
 STAGE1_DISALLOWED = (
     DISALLOW_TASK_WRITES
     + DISALLOW_RECON_REPORT_LEDGER_WRITES
+    + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_WRITES
     + DISALLOW_BUILTIN
 )
-# Stage 2 keeps full memory + task write access; only built-ins and the
-# escalation reads are blocked.
-STAGE2_DISALLOWED = DISALLOW_ESCALATION_READS + DISALLOW_BUILTIN
+# Stage 2 keeps full memory + task write access; only built-ins, the escalation
+# reads and the fused-memory control-plane mutators are blocked.
+STAGE2_DISALLOWED = (
+    DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES + DISALLOW_ESCALATION_READS + DISALLOW_BUILTIN
+)
 STAGE3_DISALLOWED = (
     DISALLOW_TASK_WRITES
     + DISALLOW_MEMORY_WRITES
     + DISALLOW_RECON_REPORT_LEDGER_WRITES
     + DISALLOW_RECON_REPORT_JOURNAL_WRITES
+    + DISALLOW_FUSED_MEMORY_CONTROL_PLANE_WRITES
     + DISALLOW_ESCALATION_READS
+    + DISALLOW_ESCALATION_WRITES
     + DISALLOW_BUILTIN
 )
 # NOTE: the IN-PROCESS-STATE `mcp__recon-report__*` tools (start_report, add_finding,
