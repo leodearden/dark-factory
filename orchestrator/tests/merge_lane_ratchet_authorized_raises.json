@@ -2461,6 +2461,42 @@
           "current": 31994
         }
       ]
+    },
+    {
+      "task_id": "4580",
+      "reason": "Task 4580 review amendment: the dispatch_seen_in_flight semantics move out of event_store.py (outside the cluster) into no_progress_abort.py's module docstring, so the payload has one documented home; the None-on-local-lease conditional moves from the removed dispatch_returned property into event_data (module cognitive unchanged). Records the landed cluster totals.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/no_progress_abort.py::NoProgressAbort::event_data",
+          "baseline": 1,
+          "current": 2
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/no_progress_abort.py",
+          "baseline": 98,
+          "current": 99
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/no_progress_abort.py",
+          "baseline": 25,
+          "current": 30
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57517,
+          "current": 57518
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31994,
+          "current": 31999
+        }
+      ]
     }
   ]
 }

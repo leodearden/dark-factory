@@ -13,8 +13,13 @@ lease whose dispatch had already returned. Since task 4579 such an abort means
 the post-dispatch LOCAL work wrote nothing under the merge worktree for a whole
 budget, which is the stalled-local-work class the cap bounds; the remote leg's
 health says nothing about it, and not counting would turn a stalled cross-check
-into an unbounded requeue loop holding the verifier host. ``dispatch_returned``
-makes that population measurable before any separate cap is designed.
+into an unbounded requeue loop holding the verifier host. The event's
+``dispatch_seen_in_flight`` key makes that population measurable before any
+separate cap is designed. It is None on a local lease, which has no dispatch.
+On a remote lease True means some poll of this verify saw the ssh dispatch in
+flight, so the no-progress clock started after it returned; False means no poll
+ever saw it in flight -- a pre-dispatch coast, or a dispatch shorter than one
+poll tick.
 """
 
 from __future__ import annotations
@@ -34,7 +39,7 @@ class NoProgressAbort:
     budget_secs: float
     strike: int
     max_strikes: int
-    dispatch_seen_live: bool
+    dispatch_seen_in_flight: bool
 
     def __post_init__(self) -> None:
         if self.strike < 1 or self.no_progress_secs < self.budget_secs:
@@ -49,10 +54,6 @@ class NoProgressAbort:
     def capped(self) -> bool:
         return self.strike >= self.max_strikes
 
-    @property
-    def dispatch_returned(self) -> bool | None:
-        return None if self.is_local else self.dispatch_seen_live
-
     def event_data(self) -> dict:
         return {
             'request_id': self.request_id,
@@ -63,7 +64,7 @@ class NoProgressAbort:
             'strike': self.strike,
             'max_strikes': self.max_strikes,
             'capped': self.capped,
-            'dispatch_returned': self.dispatch_returned,
+            'dispatch_seen_in_flight': None if self.is_local else self.dispatch_seen_in_flight,
         }
 
     def terminal_reason(self) -> str:
@@ -82,7 +83,7 @@ class NoProgressAbort:
     def _lease_clause(self) -> str:
         if self.is_local:
             return 'local lease'
-        if self.dispatch_seen_live:
+        if self.dispatch_seen_in_flight:
             return 'remote lease, dispatch had returned'
         return 'remote lease, no dispatch seen in flight'
 

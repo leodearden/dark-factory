@@ -189,20 +189,10 @@ class EventType(StrEnum):
     merge_flake_suppressed = 'merge_flake_suppressed'
     # One firing of Abort trigger 3 (no in-flight verify progress for a full
     # budget) in orchestrator/src/orchestrator/merge_lane/worker.py::
-    # SpeculativeMergeWorker._run_inflight_verify, emitted on EVERY firing,
-    # requeue and cap-out alike; before task 4580 a strike below the cap left
-    # no durable trace.  task_id is the column, phase='merge'.  data always
-    # carries {request_id, lease_kind, runner, no_progress_secs, budget_secs,
-    # strike, max_strikes, capped, dispatch_returned}; normative definition:
+    # SpeculativeMergeWorker._run_inflight_verify, requeue and cap-out alike.
+    # task_id-keyed, phase='merge'; data is defined by
     # orchestrator/src/orchestrator/merge_lane/no_progress_abort.py::
-    # NoProgressAbort.event_data.  dispatch_returned is None on a local lease.
-    # On a remote lease True means some poll of this verify saw the ssh
-    # dispatch in flight, so the no-progress clock started after it returned;
-    # False means no poll ever saw it in flight -- a pre-dispatch coast, or a
-    # dispatch shorter than one VERIFY_ABANDON_POLL_SECS tick.  E.g.
-    #   GROUP BY json_extract(data,'$.lease_kind'),
-    #            json_extract(data,'$.dispatch_returned'),
-    #            json_extract(data,'$.capped')
+    # NoProgressAbort.event_data.
     merge_verify_progress_abort = 'merge_verify_progress_abort'
     # The branch's OWN pre-merge verify verdict, recorded by the orchestrator
     # workflow VERIFY phase (branch-vs-its-merge-base) — distinct from

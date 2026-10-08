@@ -933,7 +933,7 @@ class TestDeadInflightVerifyAborts:
             'strike': 1,
             'max_strikes': worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS,
             'capped': False,
-            'dispatch_returned': None,
+            'dispatch_seen_in_flight': None,
         }
 
     async def test_healthy_writing_local_verify_is_not_aborted(
@@ -1067,7 +1067,7 @@ class TestDeadInflightVerifyAborts:
         assert abort['task_id'] == req.task_id
         assert abort['lease_kind'] == 'remote'
         assert abort['runner'] == 'remote-host'
-        assert abort['dispatch_returned'] is False
+        assert abort['dispatch_seen_in_flight'] is False
         assert abort['strike'] == 1
         assert abort['capped'] is False
 
@@ -1380,7 +1380,7 @@ class TestDeadInflightVerifyAborts:
         must NOT rescue it. If a future change makes this test abort late or not at all, trigger 3
         has been silently disabled for remote leases.
 
-        The abort's event reports dispatch_returned=True, the field that makes the mr-945466ca
+        The abort's event reports dispatch_seen_in_flight=True, the field that makes the mr-945466ca
         shape self-diagnosing, and strike 1: a dispatch-returned abort still counts towards the cap
         (orchestrator/src/orchestrator/merge_lane/no_progress_abort.py's module docstring says why).
 
@@ -1434,7 +1434,7 @@ class TestDeadInflightVerifyAborts:
         [abort] = _progress_aborts(store)
         assert abort['task_id'] == req.task_id
         assert abort['lease_kind'] == 'remote'
-        assert abort['dispatch_returned'] is True
+        assert abort['dispatch_seen_in_flight'] is True
         assert abort['strike'] == 1
 
     async def test_remote_lease_content_mtime_seed_is_unconditional_before_first_dispatch_turn(
@@ -1863,7 +1863,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
 
         def _strikes() -> list[tuple[str, int, bool, str, bool | None]]:
             return [
-                (a['task_id'], a['strike'], a['capped'], a['lease_kind'], a['dispatch_returned'])
+                (a['task_id'], a['strike'], a['capped'], a['lease_kind'], a['dispatch_seen_in_flight'])
                 for a in _progress_aborts(store)
             ]
 

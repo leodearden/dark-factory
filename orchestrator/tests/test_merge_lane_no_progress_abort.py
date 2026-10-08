@@ -12,7 +12,6 @@ import json
 import pytest
 from _recording_event_store import _RecordingEventStore
 
-from orchestrator.event_store import EventType
 from orchestrator.merge_lane.no_progress_abort import (
     NoProgressAbort,
     emit_no_progress_abort,
@@ -27,7 +26,7 @@ _EVENT_KEYS = {
     'strike',
     'max_strikes',
     'capped',
-    'dispatch_returned',
+    'dispatch_seen_in_flight',
 }
 
 
@@ -41,7 +40,7 @@ def _abort(**overrides) -> NoProgressAbort:
         'budget_secs': 5400.0,
         'strike': 1,
         'max_strikes': 3,
-        'dispatch_seen_live': False,
+        'dispatch_seen_in_flight': False,
     }
     fields.update(overrides)
     return NoProgressAbort(**fields)
@@ -54,8 +53,8 @@ def _remote(**overrides) -> NoProgressAbort:
 def _every_lease_variant(**overrides) -> list[NoProgressAbort]:
     return [
         _abort(**overrides),
-        _remote(dispatch_seen_live=True, **overrides),
-        _remote(dispatch_seen_live=False, **overrides),
+        _remote(dispatch_seen_in_flight=True, **overrides),
+        _remote(dispatch_seen_in_flight=False, **overrides),
     ]
 
 
@@ -72,24 +71,23 @@ class TestEventData:
         assert data['strike'] == 1
         assert data['max_strikes'] == 3
         assert data['capped'] is False
-        assert data['dispatch_returned'] is None
+        assert data['dispatch_seen_in_flight'] is None
         assert json.loads(json.dumps(data)) == data
 
     def test_remote_abort_reports_whether_a_dispatch_was_seen_in_flight(self):
-        returned = _remote(dispatch_seen_live=True).event_data()
-        never_seen = _remote(dispatch_seen_live=False).event_data()
+        seen = _remote(dispatch_seen_in_flight=True).event_data()
+        never_seen = _remote(dispatch_seen_in_flight=False).event_data()
 
-        assert returned['lease_kind'] == 'remote'
-        assert returned['runner'] == 'laptop'
-        assert returned['dispatch_returned'] is True
+        assert seen['lease_kind'] == 'remote'
+        assert seen['runner'] == 'laptop'
+        assert seen['dispatch_seen_in_flight'] is True
         assert never_seen['lease_kind'] == 'remote'
-        assert never_seen['dispatch_returned'] is False
+        assert never_seen['dispatch_seen_in_flight'] is False
 
     def test_local_abort_has_no_dispatch_to_report(self):
-        abort = _abort(dispatch_seen_live=True)
+        data = _abort(dispatch_seen_in_flight=True).event_data()
 
-        assert abort.dispatch_returned is None
-        assert abort.event_data()['dispatch_returned'] is None
+        assert data['dispatch_seen_in_flight'] is None
 
 
 class TestCapped:
@@ -190,6 +188,3 @@ class TestEmit:
         assert store.events == [
             ('merge_verify_progress_abort', {'task_id': 't1', 'data': abort.event_data()}),
         ]
-
-    def test_event_type_value_is_its_name(self):
-        assert str(EventType.merge_verify_progress_abort) == 'merge_verify_progress_abort'

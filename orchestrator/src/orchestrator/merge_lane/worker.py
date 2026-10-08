@@ -18656,7 +18656,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # per-attempt t0 at the top of the dequeue loop).
             _last_progress_at = self._clock.monotonic()
             _last_probe_at = _last_progress_at
-            _dispatch_seen_live = False
+            _dispatch_seen_in_flight = False
             # task 2420 amend (reviewer finding, correctness); revised by task
             # 4579: guard against INFLIGHT_VERIFY_PROGRESS_PROBE_SECS not
             # being comfortably smaller than INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS.
@@ -18841,7 +18841,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
                 if _dispatch_live:
                     _last_progress_at = _now
-                    _dispatch_seen_live = True
+                    _dispatch_seen_in_flight = True
                 # Evidence A — content progress under merge_wt (BOTH lease kinds), probed only when
                 # evidence B is not already live.
                 elif _now - _last_probe_at >= _progress_probe_secs:
@@ -18875,18 +18875,18 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         budget_secs=self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS,
                         strike=_dead_abort_n,
                         max_strikes=self.MAX_INFLIGHT_DEAD_VERIFY_ABORTS,
-                        dispatch_seen_live=_dispatch_seen_live,
+                        dispatch_seen_in_flight=_dispatch_seen_in_flight,
                     )
                     logger.warning(
                         'Task %s: no in-flight verify progress for %.0fs '
                         '(budget=%.0fs) — %s (%d/%d consecutive dead aborts)',
-                        req.task_id,
-                        _no_progress_secs,
-                        self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS,
+                        _abort.task_id,
+                        _abort.no_progress_secs,
+                        _abort.budget_secs,
                         'abandoning without re-queue' if _abort.capped
                         else 'aborting and re-queuing merge for re-verify',
-                        _dead_abort_n,
-                        self.MAX_INFLIGHT_DEAD_VERIFY_ABORTS,
+                        _abort.strike,
+                        _abort.max_strikes,
                     )
                     emit_no_progress_abort(self._event_store, _abort)
                     await self._teardown_verify_task(lease, verify_task, req.task_id)
