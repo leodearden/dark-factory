@@ -1771,20 +1771,33 @@ def _should_archive_category(category: str) -> bool:
     return should_archive(category)
 
 
-def _serial_pytest_str(cmd: str | None) -> str | None:
+def _serial_pytest_str(cmd: str | None, invocation_dir: Path | None = None) -> str | None:
     """Rewrite every ``pytest`` invocation in *cmd* to run serially, via VerifyCmd.
 
     Thin string-level wrapper around ``parse_config_command`` ->
     ``serial_pytest`` -> ``render`` (replaces ``_force_serial_pytest``):
-    appends `` -p no:xdist -o addopts=`` to a structured PYTEST command's
-    flags, or — for a raw-retained ``&&``-chain — to every ``pytest``
-    invocation's arguments via ``serial_pytest``'s localised regex rewrite.
-    ``-o addopts=`` clears any pyproject-level ``addopts`` (e.g. ``-n auto``)
-    — this is the exact ``-o addopts=""`` workaround that task 2045 proved
-    recovers a shared-venv-mutation transient, applied structurally rather
-    than by gambling on the concurrent ``uv sync`` window having closed.
-    ``-p no:xdist`` is belt-and-suspenders: it disables the xdist plugin
-    outright and is safe even when xdist is already absent from the venv.
+    appends `` -p no:xdist -o addopts=<value>`` to a structured PYTEST
+    command's flags, or — for a raw-retained ``&&``-chain — to every
+    ``pytest`` invocation's arguments via ``serial_pytest``'s localised regex
+    rewrite. This is the recovery task 2045 proved for a shared-venv-mutation
+    transient, applied structurally rather than by gambling on the concurrent
+    ``uv sync`` window having closed. ``-p no:xdist`` disables the xdist
+    plugin outright and is safe even when xdist is already absent from the
+    venv.
+
+    ``-o addopts=<value>`` RE-SUPPLIES the addopts of the config pytest will
+    read for THIS command — resolved by pytest's own walk from
+    *invocation_dir*, the directory the command runs in
+    (``verify_plan.py::governing_addopts``) — with every xdist option removed,
+    so task 2045's ``-n auto`` removal still holds while the import mode and
+    marker filter survive. Blanking them instead was measured to change what
+    the recovery runs: on the ``scripts`` leg the blank collected with two
+    import-file-mismatch errors (esc-4377-3), and on ``shared`` (2026-10-08) it
+    collected 6939 items against the primary run's 6928/6939 (11 integration
+    tests deselected) — the 646s-vs-197-296s recovery the operator fold-in
+    recorded. ``invocation_dir=None`` is the historical blank
+    ``-o addopts=``. A raw ``&&`` chain also gets the blank, since one suffix
+    serves clauses that each read their own config — a documented under-fire.
 
     Returns *cmd* unchanged when it is ``None`` or does not parse/chain into
     a PYTEST ToolKind (e.g. a ``cargo test --workspace`` command — covers
@@ -1817,18 +1830,12 @@ def _serial_pytest_str(cmd: str | None) -> str | None:
     command is an expected, benign no-op. That leaves exactly one thing a
     raw-retained PYTEST chain returning unchanged can be: the appender's
     refusal.
-
-    Tradeoff: clearing ``addopts`` also drops any per-subproject marker
-    filters baked into pyproject (e.g. ``-m 'not integration'``).  Accepted
-    for a single bounded recovery run whose only purpose is a
-    non-misattributed pass/fail signal — see run_verification's env-recovery
-    retry — and unavoidable at the CLI layer since the subproject's addopts
-    contents aren't visible to this string rewrite.
     """
     if cmd is None:
         return None
     parsed = parse_config_command(cmd)
-    rewritten = serial_pytest(parsed)
+    ini_addopts = verify_plan.governing_addopts(cmd, _worktree_reader(invocation_dir))
+    rewritten = serial_pytest(parsed, ini_addopts)
     if rewritten is parsed:
         if parsed.tool is ToolKind.PYTEST and parsed.raw is not None:
             refused = _unspliceable_pytest_spans(parsed.raw)
@@ -1866,9 +1873,10 @@ def _with_pytest_timeout_str(cmd: str | None, secs: int) -> str | None:
 
     The α confirm gate composes this OUTSIDE ``_serial_pytest_str`` — the
     generous explicit ``--timeout`` is required because the serial recovery's
-    ``-o addopts=`` clears pyproject ``addopts`` but NOT the
-    ``[tool.pytest.ini_options] timeout=60`` default, which would otherwise
-    starve the isolated confirm run into a false non-suppression.
+    ``-o addopts=<value>`` overrides only pyproject ``addopts`` — the
+    ``[tool.pytest.ini_options] timeout`` default is a separate ini key, so it
+    is neither cleared nor carried and would otherwise starve the isolated
+    confirm run into a false non-suppression.
     """
     if cmd is None:
         return None
