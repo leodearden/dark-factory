@@ -5,6 +5,7 @@ Provides:
 - apply_full_durability_pragmas(conn, busy_timeout_ms): WAL + busy_timeout + Phase 3 triad
 - connect_daemon(database, **kwargs): open a connection with worker thread marked daemon
 - AtomicConnection: per-connection lock making every access an atomic unit
+- checkpoint_or_unavailable(access): the not-open checkpoint contract of AtomicConnection stores
 - AsyncSqliteBase: ABC with lifecycle management (open/close/context-manager/guard)
 """
 
@@ -25,6 +26,7 @@ __all__ = [
     'connect_daemon',
     'CheckpointResult',
     'AtomicConnection',
+    'checkpoint_or_unavailable',
     'AsyncSqliteBase',
 ]
 
@@ -241,35 +243,34 @@ class AtomicConnection:
 
         ``BaseException`` is caught deliberately: cancellation must roll back
         too, or aiosqlite's implicit transaction stays open holding the writer
-        lock against every other coroutine on the connection.
+        lock against every other coroutine on the connection.  The rollback's
+        own failure is suppressed as ``BaseException`` for the same reason, so
+        a second cancellation landing while it is awaited never displaces the
+        error that ended the unit.  The rollback still runs: aiosqlite queues it
+        before the first suspension, ahead of any later unit's statement.
 
         Residual, and stated as a known BOUND rather than left to look like an
         oversight: a unit that SELECTs before it writes opens a read snapshot
         ahead of its first write, so a commit from a DIFFERENT connection to the
         same file landing between the two statements can still raise
-        ``SQLITE_BUSY_SNAPSHOT``.  Three units have that shape today —
-        ``EventBuffer.claim_deferred_writes``, ``EventBuffer.release_stale_claims``
-        and ``ReconLedgerStore.mark_addressed`` — verified by reading the FIRST
-        statement of every write unit in the three stores.  A unit that batches a
-        read AFTER its first write does not have it: ``ReconLedgerStore.gc`` opens
-        with its ``DELETE`` and only then SELECTs the rows to TTL-flip, by which
-        point the transaction has already been promoted to a write transaction and
-        no other connection can commit into the gap.
+        ``SQLITE_BUSY_SNAPSHOT``.  A unit whose first statement writes does not
+        have it: by the time it reads, the transaction is already a write
+        transaction and no other connection can commit into the gap.
 
         The lock removes the in-process, cross-COROUTINE collision, which is the
         failure this primitive owns and the one the incidents were.  Closing the
         remaining cross-CONNECTION window would need ``BEGIN IMMEDIATE`` — which
         the RCA measured still raising, and excludes by name — or a bounded
-        retry, which is separate work.  Do not read the three units above as
-        sites awaiting conversion: batching their read inside the unit is
-        deliberate, because each must see its own uncommitted write.
+        retry, which is separate work.  A unit that reads first is not a site
+        awaiting conversion: batching the read inside the unit is right whenever
+        the unit must see its own uncommitted write.
         """
         async with self._held('write()'):
             try:
                 yield self._connection
                 await self._connection.commit()
             except BaseException:
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(BaseException):
                     await self._connection.rollback()
                 raise
 
@@ -308,6 +309,20 @@ class AtomicConnection:
             with contextlib.suppress(Exception):
                 await self._connection.execute_fetchall('PRAGMA wal_checkpoint(TRUNCATE)')
             await self._connection.close()
+
+
+async def checkpoint_or_unavailable(access: AtomicConnection | None) -> CheckpointResult:
+    """Checkpoint a store's access, or answer :meth:`CheckpointResult.unavailable` when it is not open.
+
+    The one not-open contract of every AtomicConnection store.  Their
+    ``checkpoint()`` is driven by
+    ``fused-memory/src/fused_memory/server/main.py::_run_checkpoint_cycle``,
+    which does not own any store's lifecycle, so a store that is not yet open
+    or already closed answers the sentinel rather than raising.
+    """
+    if access is None:
+        return CheckpointResult.unavailable()
+    return await access.checkpoint()
 
 
 class AsyncSqliteBase(abc.ABC):

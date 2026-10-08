@@ -18,6 +18,7 @@ from shared.async_sqlite_base import (
     AtomicConnection,
     CheckpointResult,
     apply_full_durability_pragmas,
+    checkpoint_or_unavailable,
     connect_daemon,
 )
 
@@ -389,12 +390,4 @@ class TicketStore:
             self._access = None
 
     async def checkpoint(self) -> CheckpointResult:
-        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``.
-
-        Called by ``server/main.py::_run_checkpoint_cycle``, which does not own
-        this store's shutdown, so a closed store answers
-        :meth:`CheckpointResult.unavailable` rather than raising.
-        """
-        if self._access is None:
-            return CheckpointResult.unavailable()
-        return await self._access.checkpoint()
+        return await checkpoint_or_unavailable(self._access)

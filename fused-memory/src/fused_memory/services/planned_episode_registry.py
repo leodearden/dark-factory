@@ -19,6 +19,7 @@ from shared.async_sqlite_base import (
     AtomicConnection,
     CheckpointResult,
     apply_full_durability_pragmas,
+    checkpoint_or_unavailable,
     connect_daemon,
 )
 
@@ -88,10 +89,7 @@ class PlannedEpisodeRegistry:
         logger.info('PlannedEpisodeRegistry closed')
 
     async def checkpoint(self) -> CheckpointResult:
-        """``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``."""
-        if self._access is None:
-            return CheckpointResult.unavailable()
-        return await self._access.checkpoint()
+        return await checkpoint_or_unavailable(self._access)
 
     # ------------------------------------------------------------------
     # Core operations

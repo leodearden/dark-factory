@@ -26,6 +26,7 @@ from shared.async_sqlite_base import (
     AtomicConnection,
     CheckpointResult,
     apply_full_durability_pragmas,
+    checkpoint_or_unavailable,
     connect_daemon,
 )
 
@@ -353,15 +354,7 @@ class WriteJournal:
             self._access = None
 
     async def checkpoint(self) -> CheckpointResult:
-        """``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``.
-
-        A journal that is not open answers :meth:`CheckpointResult.unavailable`,
-        never a raise: ``server/main.py::_run_checkpoint_cycle`` does not own
-        this store's shutdown.
-        """
-        if self._access is None:
-            return CheckpointResult.unavailable()
-        return await self._access.checkpoint()
+        return await checkpoint_or_unavailable(self._access)
 
     def _require_access(self) -> AtomicConnection:
         if self._access is None:

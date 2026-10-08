@@ -24,6 +24,7 @@ from shared.async_sqlite_base import (
     AtomicConnection,
     CheckpointResult,
     apply_full_durability_pragmas,
+    checkpoint_or_unavailable,
     connect_daemon,
 )
 
@@ -434,15 +435,7 @@ class DurableWriteQueue:
         return self._access
 
     async def checkpoint(self) -> CheckpointResult:
-        """``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``.
-
-        Called by ``server/main.py::_run_checkpoint_cycle``, which does not own
-        this queue's shutdown, so a queue that is not open answers
-        :meth:`CheckpointResult.unavailable` rather than raising.
-        """
-        if self._access is None:
-            return CheckpointResult.unavailable()
-        return await self._access.checkpoint()
+        return await checkpoint_or_unavailable(self._access)
 
     # -- callbacks ------------------------------------------------------------
 
