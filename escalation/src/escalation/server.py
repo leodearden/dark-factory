@@ -69,6 +69,7 @@ from escalation.queue import AmendmentOutcome, EscalationQueue, ResolveOutcome
 from escalation.queue import observed_submit_response as _observed_submit_response
 from escalation.related_pending import related_pending
 from escalation.server_instructions import ESCALATION_SERVER_INSTRUCTIONS
+from escalation.store_identity import StoreIdentity
 
 logger = logging.getLogger(__name__)
 
@@ -921,6 +922,7 @@ def create_server(
     merge_inflight_registry: Any = None,
     startup_sweep: bool = True,
     startup_sweep_now: datetime | None = None,
+    store_identity: StoreIdentity | None = None,
 ) -> FastMCP:
     """Create the escalation MCP server with all tools registered.
 
@@ -975,6 +977,14 @@ def create_server(
     ``archive.prune_archive(now=...)``.  When None, live UTC is used (production
     default).  Pass a fixed datetime in tests to make the prune cutoff
     deterministic and wall-clock-independent.
+
+    *store_identity* (default None) — which store this server serves
+    (``escalation.store_identity::StoreIdentity``), passed by both production
+    call sites.  Its consumers are the ``project_root`` assertion guard (γ2)
+    and the store line rendered into tool descriptions (γ3) of
+    ``plans/escalation-store-ambiguity-prd.md``.  None (tests, standalone)
+    degrades to the identity-less behaviour exactly: no assertion accepted,
+    no identity line rendered, and it never raises.
     """
     mcp = FastMCP('escalation', instructions=ESCALATION_SERVER_INSTRUCTIONS)
 
