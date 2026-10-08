@@ -16,7 +16,6 @@ import contextlib
 import json
 import logging
 import os
-import re
 import shutil
 import sqlite3
 import subprocess
@@ -43,10 +42,7 @@ from legibility import (
     config as config_mod,
 )
 from legibility.config import TrickleCensusCaps, load_config
-
-# Resolved through coder.py's own orchestrator/src bootstrap, which the
-# `nightly` import above has already run.
-from orchestrator.agents import code_quality
+from quality_doc_texts import definition_body, heuristic_headlines
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 
 # ---------------------------------------------------------------------------
@@ -5215,20 +5211,6 @@ def _messages(caplog, level):
     return [r.getMessage() for r in caplog.records if r.levelno == level]
 
 
-def _quality_doc_text() -> str:
-    return code_quality.NORMATIVE_DOC.read_text(encoding='utf-8')
-
-
-def _heuristic_headlines() -> list[str]:
-    headlines = re.findall(
-        r'^\d+\. \*\*(.+?)\*\*',
-        code_quality.section(_quality_doc_text(), '## The fourteen heuristics'),
-        re.MULTILINE,
-    )
-    assert headlines, 'no numbered bold heuristic headline parsed from the normative doc'
-    return headlines
-
-
 class TestRunNightlyInvariantSlugs:
 
     def test_every_merging_night_journals_its_slug_tally(self, tmp_path, caplog):
@@ -5282,7 +5264,6 @@ class TestRunNightlyInvariantSlugs:
         assert _committed_codebook(repo)['candidates'] == []
         assert [row[4] for row in _ledger_rows()] == [session_ledger.Outcome.EMPTY.value]
         [prompt] = prompts
-        definition = code_quality.section(_quality_doc_text(), '## Definition').strip()
-        assert definition in prompt
-        for headline in _heuristic_headlines():
+        assert definition_body() in prompt
+        for headline in heuristic_headlines():
             assert headline not in prompt

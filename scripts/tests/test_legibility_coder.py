@@ -20,7 +20,6 @@ import functools
 import inspect
 import json
 import logging
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -31,10 +30,7 @@ import digest as digest_mod
 import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
 from legibility import invariants, session_runner
-
-# Imported AFTER `coder`, deliberately: coder.py's own module-level sys.path
-# bootstrap is what puts this checkout's orchestrator/src on the path.
-from orchestrator.agents import code_quality
+from quality_doc_texts import definition_body, heuristic_headlines
 
 # Imported AFTER `coder`, deliberately: it is coder.py's own module-level
 # sys.path bootstrap that puts this checkout's shared/src on the path, so this
@@ -1345,26 +1341,8 @@ def test_main_digests_dir_skips_subdirectories(tmp_path, pooled_main, capsys):
 # task 6400: the quality Definition is the minting test, and the coder is told
 # the observed project's invariant slugs (plans/census-incremental-prd.md R9,
 # §4.8 rows 15 and 17). Expected texts are computed from the normative doc at
-# test time, never restated.
+# test time (quality_doc_texts), never restated.
 # ---------------------------------------------------------------------------
-
-_HEURISTIC_HEADLINE_RE = re.compile(r"^\d+\. \*\*(.+?)\*\*", re.MULTILINE)
-
-
-def _quality_doc_text():
-    return code_quality.NORMATIVE_DOC.read_text(encoding="utf-8")
-
-
-def _definition_body():
-    return code_quality.section(_quality_doc_text(), "## Definition").strip()
-
-
-def _heuristic_headlines():
-    headlines = _HEURISTIC_HEADLINE_RE.findall(
-        code_quality.section(_quality_doc_text(), "## The fourteen heuristics")
-    )
-    assert headlines, "no numbered bold heuristic headline parsed from the normative doc"
-    return headlines
 
 
 def _block(prompt, name):
@@ -1408,8 +1386,8 @@ def test_the_invariant_slugs_are_required_never_defaulted(call):
 def test_the_prompt_carries_the_quality_definition_and_no_heuristic():
     prompt = _slugged_prompt(("a-slug", "b-slug"))
 
-    assert _definition_body() in prompt
-    for headline in _heuristic_headlines():
+    assert definition_body() in prompt
+    for headline in heuristic_headlines():
         assert headline not in prompt
 
 
