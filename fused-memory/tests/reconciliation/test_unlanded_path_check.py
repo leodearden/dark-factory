@@ -8,11 +8,15 @@ Stage-1 flag per task for Stage 2 to act on.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from datetime import UTC, datetime
 from itertools import count
+from pathlib import Path
 
 import pytest
+from _fm_helpers import _init_git_repo
+from _merged_branch_repo import commit_file, delete_file, git, merge_no_ff
 
 from fused_memory.models.reconciliation import EventSource, EventType, ReconciliationEvent
 from fused_memory.reconciliation.cli_stage_runner import FINDING_ITEM_SCHEMA
@@ -27,6 +31,7 @@ from fused_memory.reconciliation.unlanded_path_check import (
     DoneTransition,
     UnlandedPathCheckResult,
     build_unlanded_path_flag,
+    check_unlanded_path_claims,
     mentions_path,
     select_done_transitions,
 )
@@ -37,6 +42,7 @@ from fused_memory.services.unlanded_branch_paths import (
 )
 
 GUARD = 'tests/unit/guard.py'
+BRIEFING = 'review/briefing.yaml'
 OTHER = 'src/pkg/helper.py'
 MERGE_SHA = 'abcdef0123' + '4' * 30
 ADD_SHA = '1111111111' + 'a' * 30
@@ -222,3 +228,207 @@ class TestUnlandedPathCheckResult:
     def test_is_frozen(self):
         with pytest.raises(dataclasses.FrozenInstanceError):
             UnlandedPathCheckResult.empty().checked = 1  # type: ignore[misc]
+
+
+# ── check_unlanded_path_claims against a real merged repo ───────────────────
+
+PROJECT = 'test_project'
+
+
+class FakeMemoryService:
+    """Duck-typed stand-in for the two public MemoryService readers, with their keyword signatures.
+
+    *memories_by_task* maps a task id to ``{memory_id: content}``; a ``None``
+    content makes ``get_memory_by_id`` answer not-found for that id.
+    """
+
+    def __init__(
+        self,
+        memories_by_task: dict[str, dict[str, str | None]] | None = None,
+        *,
+        list_error: BaseException | None = None,
+        read_errors: dict[str, BaseException] | None = None,
+    ) -> None:
+        self.memories_by_task = memories_by_task or {}
+        self.list_error = list_error
+        self.read_errors = read_errors or {}
+        self.list_calls: list[dict] = []
+        self.read_calls: list[dict] = []
+
+    async def get_memories_by_metadata(self, *, project_id: str, filters: dict, limit: int = 1000) -> list[dict]:
+        self.list_calls.append({'project_id': project_id, 'filters': filters, 'limit': limit})
+        if self.list_error is not None:
+            raise self.list_error
+        task_id = filters['task_id']
+        return [
+            {'id': memory_id, 'created_at': '2026-09-18T13:08:50+00:00', 'metadata': {'task_id': task_id}}
+            for memory_id in self.memories_by_task.get(task_id, {})
+        ]
+
+    async def get_memory_by_id(self, *, project_id: str, memory_id: str) -> dict | None:
+        self.read_calls.append({'project_id': project_id, 'memory_id': memory_id})
+        if memory_id in self.read_errors:
+            raise self.read_errors[memory_id]
+        for memories in self.memories_by_task.values():
+            content = memories.get(memory_id)
+            if content is not None:
+                return {'id': memory_id, 'content': content, 'metadata': {}}
+        return None
+
+
+INCIDENT_MEMORIES: dict[str, str | None] = {
+    'm1': f'Task 107 delivered {GUARD} and a briefing edit.',
+    'm2': f'Task 107 edited {BRIEFING}.',
+    'm3': None,
+}
+
+
+@pytest.fixture
+def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(tmp_path))
+    root = tmp_path / 'repo'
+    root.mkdir()
+    _init_git_repo(root)
+    commit_file(root, BRIEFING, 'v1\n', 'seed briefing')
+    return root
+
+
+def _incident_merge(repo: Path, task_id: str) -> str:
+    """The solar_challenge 107 shape: the branch adds, edits and deletes GUARD, and edits BRIEFING."""
+    branch = f'task/{task_id}'
+    git(repo, 'checkout', '-q', '-b', branch, 'main')
+    commit_file(repo, GUARD, 'one\n', 'add guard')
+    commit_file(repo, BRIEFING, f'{task_id}\n', 'edit briefing')
+    commit_file(repo, GUARD, 'two\n', 'edit guard')
+    delete_file(repo, GUARD, 'drop guard')
+    return merge_no_ff(repo, branch)
+
+
+def _clean_merge(repo: Path, task_id: str) -> str:
+    branch = f'task/{task_id}'
+    git(repo, 'checkout', '-q', '-b', branch, 'main')
+    commit_file(repo, f'src/feature_{task_id}.py', 'x\n', 'add feature')
+    return merge_no_ff(repo, branch)
+
+
+async def _check(memory: FakeMemoryService, root: Path, events: list[ReconciliationEvent]) -> UnlandedPathCheckResult:
+    return await check_unlanded_path_claims(memory, PROJECT, str(root), events)
+
+
+@pytest.mark.asyncio
+async def test_incident_flags_only_the_memory_naming_the_unlanded_path(repo: Path) -> None:
+    merge = _incident_merge(repo, '107')
+    memory = FakeMemoryService({'107': INCIDENT_MEMORIES})
+
+    result = await _check(memory, repo, [_status('107', 'done', _merged(merge))])
+
+    (flag,) = result.flags
+    assert flag['task_id'] == '107'
+    assert flag['cited_memories'] == [{'memory_id': 'm1', 'store': 'mem0'}]
+    assert GUARD in flag['description']
+    assert result.checked == 1
+    assert result.errors == 0
+    assert result.stats()['unlanded_path_check_flags_emitted'] == 1
+    assert [(c['project_id'], c['filters']) for c in memory.list_calls] == [(PROJECT, {'task_id': '107'})]
+    assert {c['project_id'] for c in memory.read_calls} == {PROJECT}
+
+
+@pytest.mark.asyncio
+async def test_clean_merge_costs_no_memory_reads(repo: Path) -> None:
+    merge = _clean_merge(repo, '108')
+    memory = FakeMemoryService({'108': {'m1': f'Mentions {GUARD} anyway.'}})
+
+    result = await _check(memory, repo, [_status('108', 'done', _merged(merge))])
+
+    assert result.checked == 1
+    assert result.flags == ()
+    assert memory.list_calls == []
+    assert memory.read_calls == []
+
+
+@pytest.mark.asyncio
+async def test_commitless_and_non_merge_transitions_are_skipped(repo: Path) -> None:
+    seed = git(repo, 'rev-list', '--max-parents=0', 'HEAD')
+    memory = FakeMemoryService({'201': {'m1': GUARD}, '202': {'m2': GUARD}})
+    events = [
+        _status('201', 'done', {'kind': 'operational-verified', 'evidence': 'ran it'}),
+        _status('202', 'done', _merged(seed)),
+    ]
+
+    result = await _check(memory, repo, events)
+
+    assert result.skipped == 2
+    assert result.checked == 0
+    assert result.flags == ()
+    assert memory.list_calls == []
+    assert memory.read_calls == []
+
+
+@pytest.mark.asyncio
+async def test_non_git_project_root_is_an_error_not_a_raise(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv('GIT_CEILING_DIRECTORIES', str(tmp_path))
+    plain = tmp_path / 'plain'
+    plain.mkdir()
+    memory = FakeMemoryService({'107': INCIDENT_MEMORIES})
+
+    result = await _check(memory, plain, [_status('107', 'done', _merged(MERGE_SHA))])
+
+    assert result.errors == 1
+    assert result.flags == ()
+    assert memory.list_calls == []
+
+
+@pytest.mark.asyncio
+async def test_memory_listing_failure_is_an_error_not_a_raise(repo: Path) -> None:
+    merge = _incident_merge(repo, '107')
+    memory = FakeMemoryService({'107': INCIDENT_MEMORIES}, list_error=TimeoutError('qdrant read timed out'))
+
+    result = await _check(memory, repo, [_status('107', 'done', _merged(merge))])
+
+    assert result.errors == 1
+    assert result.flags == ()
+
+
+@pytest.mark.asyncio
+async def test_one_unreadable_memory_does_not_cost_the_flag(repo: Path) -> None:
+    merge = _incident_merge(repo, '107')
+    memory = FakeMemoryService(
+        {'107': {'m-bad': f'also names {GUARD}', 'm1': f'delivered {GUARD}'}},
+        read_errors={'m-bad': TimeoutError('qdrant read timed out')},
+    )
+
+    result = await _check(memory, repo, [_status('107', 'done', _merged(merge))])
+
+    assert result.errors == 1
+    (flag,) = result.flags
+    assert flag['cited_memories'] == [{'memory_id': 'm1', 'store': 'mem0'}]
+
+
+@pytest.mark.asyncio
+async def test_two_done_tasks_one_unlanded(repo: Path) -> None:
+    incident = _incident_merge(repo, '107')
+    clean = _clean_merge(repo, '108')
+    memory = FakeMemoryService({'107': INCIDENT_MEMORIES, '108': {'m9': 'clean work'}})
+    events = [_status('107', 'done', _merged(incident)), _status('108', 'done', _merged(clean))]
+
+    result = await _check(memory, repo, events)
+
+    assert result.checked == 2
+    assert [flag['task_id'] for flag in result.flags] == ['107']
+
+
+@pytest.mark.asyncio
+async def test_cancellation_propagates(repo: Path) -> None:
+    merge = _incident_merge(repo, '107')
+    memory = FakeMemoryService({'107': INCIDENT_MEMORIES}, list_error=asyncio.CancelledError())
+
+    with pytest.raises(asyncio.CancelledError):
+        await _check(memory, repo, [_status('107', 'done', _merged(merge))])
+
+
+@pytest.mark.asyncio
+async def test_no_done_transitions_is_empty(repo: Path) -> None:
+    memory = FakeMemoryService({'107': INCIDENT_MEMORIES})
+    events = [_status('107', 'blocked'), _event(EventType.memory_added, {'task_id': '107'})]
+
+    assert await _check(memory, repo, events) == UnlandedPathCheckResult.empty()
