@@ -14,6 +14,7 @@ from fused_memory.arm_harness.frozen_model import FrozenModel
 from fused_memory.arm_harness.metrics_record import LlmMetricId
 from fused_memory.arm_harness.preregistration import LatencyEnvelope, PreregistrationInputs
 from fused_memory.arm_harness.replay_types import EpisodeOutcome
+from fused_memory.arm_harness.run_manifest import RunManifest
 from fused_memory.arm_harness.screening_evidence import (
     ArmEvidence,
     ReportedEvidence,
@@ -194,6 +195,22 @@ def context_gate(evidence: ArmEvidence) -> GateResult:
     )
 
 
+def _incomplete_run_detail(
+    run: RunManifest, outcomes: Sequence[EpisodeOutcome], partial_p95: float
+) -> str:
+    if run.abort is None:
+        stopped = 'it is marked incomplete'
+    else:
+        classes = ', '.join(sorted(set(run.abort.error_classes)))
+        stopped = f'INV-4 aborted it on {len(run.abort.item_ids)} items ({classes})'
+    ok = sum(1 for outcome in outcomes if outcome.ok)
+    return (
+        f'the screening run did not complete: {stopped}. Its p95 of {partial_p95:.0f} ms over '
+        f'{ok}/{len(outcomes)} ok attempted episodes is not the screening run\'s warm p95 '
+        'under load'
+    )
+
+
 def throughput_gate(evidence: ArmEvidence, envelope: LatencyEnvelope) -> GateResult:
     gate = GateId.THROUGHPUT_FLOOR
     if not evidence.served:
@@ -208,6 +225,10 @@ def throughput_gate(evidence: ArmEvidence, envelope: LatencyEnvelope) -> GateRes
             f'no ok episode, so no warm p95 under load: {ok}/{len(evidence.outcomes)} '
             f'episodes ok; fastest attempted {fastest_text}'
         )
+        return _gate(gate, GateVerdict.FAIL, detail, bound=bound, unit=GateUnit.MS)
+    run = evidence.run
+    if run is not None and run.incomplete:
+        detail = _incomplete_run_detail(run, evidence.outcomes, p95)
         return _gate(gate, GateVerdict.FAIL, detail, bound=bound, unit=GateUnit.MS)
     return _measured(
         gate,

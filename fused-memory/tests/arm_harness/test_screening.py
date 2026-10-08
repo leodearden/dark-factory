@@ -250,6 +250,46 @@ def test_no_ok_episode_fails_with_no_p95_and_names_what_was_attempted():
     assert '120000' in result.detail
 
 
+def _aborted_with_three_fast_ok_episodes():
+    timed_out = tuple(
+        episode_outcome(episode_id, ok=False, duration_ms=120000.0)
+        for episode_id in SCREENING_EPISODE_IDS[3:8]
+    )
+    abort = ArmAbort(
+        arm_id='qwen3.5-9b', item_ids=SCREENING_EPISODE_IDS[3:8],
+        error_classes=('TimeoutError',) * 5,
+    )
+    outcomes = (*_durations(5000.0, 6000.0, 7000.0), *timed_out)
+    return arm_evidence(outcomes=outcomes, abort=abort)
+
+
+def test_an_aborted_run_fails_even_when_its_few_ok_episodes_were_fast():
+    evidence = _aborted_with_three_fast_ok_episodes()
+    assert evidence.metric_value(LlmMetricId.EPISODE_LATENCY_P95) == 7000.0
+
+    result = throughput_gate(evidence, ENVELOPE)
+
+    assert result.verdict is GateVerdict.FAIL
+    assert (result.value, result.bound, result.margin) == (None, 60000.0, None)
+    assert 'did not complete' in result.detail
+    assert 'INV-4 aborted it on 5 items (TimeoutError)' in result.detail
+    assert '7000 ms over 3/8' in result.detail
+    assert screen_arm(evidence, ENVELOPE, screening_outcomes()).survives is False
+
+
+def test_a_run_marked_incomplete_without_an_abort_cannot_pass_either():
+    evidence = arm_evidence(outcomes=_uniform(5000.0))
+    assert evidence.run is not None
+    incomplete = dataclasses.replace(
+        evidence, run=evidence.run.model_copy(update={'incomplete': True})
+    )
+
+    result = throughput_gate(incomplete, ENVELOPE)
+
+    assert result.verdict is GateVerdict.FAIL
+    assert 'it is marked incomplete' in result.detail
+
+
 # --- unserved arms and the arm-level verdict -------------------------------------------
 
 

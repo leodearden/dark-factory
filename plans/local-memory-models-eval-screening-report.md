@@ -116,7 +116,10 @@ strict (`LatencyEnvelope.admits`).
 
 qwen3.5-9b and moe-stretch were stopped by INV-4 after 5 consecutive `TimeoutError`
 episodes at the 120 s budget. Each run left a complete `run.json` and `abort.json`, so
-these are results, not invalid runs. α's single-sample cold health-probe latency was not
+these are results, not invalid runs. An incomplete run can never pass this gate. Had an
+aborted run's few ok episodes been fast, their p95 would still be a partial run's, not
+the screening run's, and the gate fails it. Neither aborted run here had an ok episode,
+so that rule decided nothing. α's single-sample cold health-probe latency was not
 used as throughput evidence anywhere. This gate reads only the screening run's own
 records.
 
