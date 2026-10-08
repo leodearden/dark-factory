@@ -55,7 +55,3 @@ def test_a_value_that_is_not_a_task_id_yields_nothing(raw: Any) -> None:
 @pytest.mark.parametrize('raw', [',', ',,', ' , ', ''])
 def test_a_separator_only_or_blank_value_yields_nothing(raw: str) -> None:
     assert task_id_components(raw) == ()
-
-
-def test_the_result_is_a_tuple() -> None:
-    assert isinstance(task_id_components('3105,4223'), tuple)

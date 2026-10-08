@@ -14,6 +14,8 @@ pin WIRING, never prose.
 
 from __future__ import annotations
 
+import json
+
 from _recon_prompt_write_scope import tool_listing
 
 from fused_memory.reconciliation.cli_stage_runner import STAGE1_DISALLOWED
@@ -57,4 +59,4 @@ def test_section_names_the_reader() -> None:
 
 
 def test_section_renders_the_guards_filter() -> None:
-    assert repr(preservation_mem0_filters('<id>')) in _section()
+    assert json.dumps(preservation_mem0_filters('<id>')) in _section()

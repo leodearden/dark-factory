@@ -1,5 +1,7 @@
 """System prompt for Stage 1: Memory Consolidator."""
 
+import json
+
 from fused_memory.memory_metadata import render_metadata_vocabulary_guidance
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
@@ -70,8 +72,6 @@ LIVE_STATE_FRESHNESS_HEADING = f'## {LIVE_STATE_FRESHNESS_TITLE}'
 #: reason, for ``tests/reconciliation/test_stage1_preservation_specimen_prompt.py``.
 PRESERVED_SPECIMEN_CORROBORATION_TITLE = 'Preserved-Specimen Corroboration'
 PRESERVED_SPECIMEN_CORROBORATION_HEADING = f'## {PRESERVED_SPECIMEN_CORROBORATION_TITLE}'
-
-_PRESERVATION_MEM0_FILTERS = preservation_mem0_filters('<id>')
 
 _CHILD_KIND_NAMES = ' or '.join(f'`{kind}`' for kind in sorted(CHILD_KINDS))
 
@@ -1041,7 +1041,7 @@ signals alone, and a reset would destroy the very thing it is being kept for.
 corroborate that its state is unintentional.** Two places already hold the answer:
 1. `get_entity('Task <id>')` — a preserved specimen usually has an edge saying so.
 2. `mcp__fused-memory__get_memories_by_metadata(project_id=..., \
-filters={_PRESERVATION_MEM0_FILTERS!r})` — the prior cycles' recorded not-actionable \
+filters={json.dumps(preservation_mem0_filters('<id>'))})` — the prior cycles' recorded not-actionable \
 verdicts on this exact question; read each row's prose. Use this scroll rather than \
 `search`, whose top-N cutoff can drop the one row that matters.
 
