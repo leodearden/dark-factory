@@ -261,6 +261,20 @@ def test_noqa_codes_are_extracted_with_or_without_a_space_after_the_colon():
     assert tight.codes == ('E402',)
 
 
+def test_noqa_is_read_case_insensitively_as_ruff_reads_it():
+    """Ruff suppresses on ``# NOQA: F401``, so a site the scan missed would be invisible to the gate."""
+    (upper,) = _sites('import os  # NOQA: F401')
+    (mixed,) = _sites('import os  # NoQa')
+
+    assert (upper.kind, upper.codes) == (inline_suppressions.Kind.NOQA, ('F401',))
+    assert (mixed.kind, mixed.codes) == (inline_suppressions.Kind.NOQA, ())
+
+
+def test_type_and_pyright_ignores_stay_case_sensitive_as_their_tools_are():
+    assert _sites('a = 1  # TYPE: IGNORE') == []
+    assert _sites('a = 1  # PYRIGHT: IGNORE') == []
+
+
 def test_noqa_code_extraction_stops_at_the_first_token_that_is_not_a_code():
     """The live tree's dominant shape: a code, then a dash, then prose.
 
@@ -426,6 +440,17 @@ def test_scan_counts_the_files_it_enumerated_and_the_files_it_tokenized(tmp_path
 
     assert scan.files_enumerated == 3
     assert scan.files_tokenized == 1
+
+
+def test_the_prefilter_admits_a_file_whose_only_marker_is_an_upper_case_noqa(tmp_path: Path):
+    _write_fixture_tree(tmp_path, {'shouty.py': 'import os  # NOQA: F401\n'})
+
+    scan = inline_suppressions.scan_tree(tmp_path)
+
+    assert scan.files_tokenized == 1
+    assert [(site.kind, site.codes) for site in scan.sites] == [
+        (inline_suppressions.Kind.NOQA, ('F401',))
+    ]
 
 
 def test_a_tracked_file_that_cannot_be_tokenized_is_an_instrument_failure(tmp_path: Path):
@@ -2252,7 +2277,7 @@ def test_the_live_scan_tokenizes_exactly_the_marker_bearing_files(capsys):
     A tracked path whose worktree file is gone is passed over here for the same
     reason the scanner passes over it: ``git ls-files`` reads the index.
     """
-    markers = tuple(spec.marker.encode('utf-8') for spec in inline_suppressions.KIND_SPECS.values())
+    specs = tuple(inline_suppressions.KIND_SPECS.values())
     listed = _run_git(['ls-files', '-z', '--', '*.py'], cwd=REPO_ROOT).stdout
     tracked = {path for path in listed.split('\0') if path}
     carrying = 0
@@ -2261,7 +2286,10 @@ def test_the_live_scan_tokenizes_exactly_the_marker_bearing_files(capsys):
             raw = (REPO_ROOT / relative).read_bytes()
         except FileNotFoundError:
             continue
-        carrying += any(marker in raw for marker in markers)
+        carrying += any(
+            spec.marker.encode('utf-8') in (raw.lower() if spec.folds_case else raw)
+            for spec in specs
+        )
 
     report = _live_report(capsys)
 

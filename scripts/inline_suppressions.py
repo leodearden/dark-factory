@@ -89,6 +89,7 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
+from functools import cached_property
 from io import StringIO
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType, ModuleType
@@ -262,13 +263,32 @@ class KindSpec:
         pattern: Searched against a whole COMMENT token.  Anchoring each form
             to its own ``#`` is what stops ``# see the noqa convention`` from
             registering, and matches how ruff and mypy read their own
-            directives.
+            directives.  Compiled with ``re.IGNORECASE`` exactly when the
+            consuming tool reads the directive case-insensitively; that flag is
+            the one statement of the kind's case rule, and both marker tests
+            follow it through :attr:`folds_case`.
         codes: Reads the rule codes out of that match.
     """
 
     marker: str
     pattern: re.Pattern[str]
     codes: Callable[[re.Match[str]], tuple[str, ...]]
+
+    def __post_init__(self) -> None:
+        if self.folds_case and self.marker != self.marker.lower():
+            raise ValueError(
+                f'case-folding kind marker {self.marker!r} must be lower-case, '
+                'because it is tested against lower-cased text'
+            )
+
+    @cached_property
+    def folds_case(self) -> bool:
+        """Whether the directive is read case-insensitively, from the pattern's flags."""
+        return bool(self.pattern.flags & re.IGNORECASE)
+
+    def may_match(self, text: str) -> bool:
+        """The cheap substring test that stands in front of :attr:`pattern`."""
+        return self.marker in (text.lower() if self.folds_case else text)
 
 
 def _no_codes(match: re.Match[str]) -> tuple[str, ...]:
@@ -345,7 +365,8 @@ KIND_SPECS: MappingProxyType[Kind, KindSpec] = MappingProxyType(
             marker='noqa',
             # The tail stops at the next `#`, so a disposition riding in the
             # same comment can never be read as a rule code.
-            pattern=re.compile(r'#\s*noqa(?::\s*([^#]*))?'),
+            # Case-insensitive because ruff reads the directive in any case.
+            pattern=re.compile(r'#\s*noqa(?::\s*([^#]*))?', re.IGNORECASE),
             codes=_noqa_codes,
         ),
         Kind.PYRIGHT_IGNORE: KindSpec(
@@ -435,7 +456,7 @@ def _comment_at(token: tokenize.TokenInfo, *, path: str) -> Comment:
     matched = [
         (kind, spec.codes(match))
         for kind, spec in KIND_SPECS.items()
-        if spec.marker in text and (match := spec.pattern.search(text)) is not None
+        if spec.may_match(text) and (match := spec.pattern.search(text)) is not None
     ]
     stripped = token.line.strip() if matched else ''
     sites = tuple(
@@ -483,12 +504,25 @@ class Scan:
         return tuple(site for comment in self.comments for site in comment.sites)
 
 
-#: Every kind's prefilter substring as raw bytes, for the pre-decode pass.
-#: Derived from the one table rather than written twice; the markers are ASCII,
-#: so the encoding is exact.
-_MARKER_BYTES: tuple[bytes, ...] = tuple(
-    spec.marker.encode('utf-8') for spec in KIND_SPECS.values()
+#: The case-sensitive kinds' prefilter substrings as raw bytes, for the
+#: pre-decode pass.  Derived from the one table rather than written twice; the
+#: markers are ASCII, so the encoding is exact.
+_EXACT_MARKER_BYTES: tuple[bytes, ...] = tuple(
+    spec.marker.encode('utf-8') for spec in KIND_SPECS.values() if not spec.folds_case
 )
+
+#: The case-folding kinds' substrings, tested against the lower-cased bytes.
+_FOLDED_MARKER_BYTES: tuple[bytes, ...] = tuple(
+    spec.marker.encode('utf-8') for spec in KIND_SPECS.values() if spec.folds_case
+)
+
+
+def _may_hold_marker(raw: bytes) -> bool:
+    """The byte prefilter: could any kind's pattern match somewhere in *raw*?"""
+    if any(marker in raw for marker in _EXACT_MARKER_BYTES):
+        return True
+    folded = raw.lower()
+    return any(marker in folded for marker in _FOLDED_MARKER_BYTES)
 
 
 def _tracked_python_files(root: Path) -> tuple[str, ...]:
@@ -556,7 +590,7 @@ def _source_of(root: Path, relative: str) -> str | None:
             f'{relative}: could not be read -- {type(exc).__name__}: {exc}'
         ) from exc
 
-    if not any(marker in raw for marker in _MARKER_BYTES):
+    if not _may_hold_marker(raw):
         return None
 
     try:
