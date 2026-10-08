@@ -28,6 +28,10 @@ isolation.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import sqlite3
+from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -36,6 +40,8 @@ from fused_memory.backends.sqlite_task_backend import SqliteTaskBackend
 
 CHECKPOINT_ITERATIONS = 20
 TIMEOUT_SECONDS = 10
+PROBE_SECONDS = 0.25
+PROBE_ATTEMPTS = 8
 
 
 @pytest_asyncio.fixture
@@ -81,6 +87,37 @@ async def test_checkpoint_all_and_writes_do_not_lock_each_other_out(backend, pro
         )
 
 
+@contextlib.contextmanager
+def _foreign_writer_holding_the_file(project_root: str) -> Iterator[None]:
+    """An independent connection holds the tasks.db write lock until the block exits.
+
+    A backend write unit that reaches its first write parks there, inside the
+    unit, until the lock is released.
+    """
+    foreign = sqlite3.connect(
+        Path(project_root) / '.taskmaster' / 'tasks' / 'tasks.db', isolation_level=None
+    )
+    try:
+        foreign.execute('BEGIN IMMEDIATE')
+        yield
+        foreign.execute('ROLLBACK')
+    finally:
+        foreign.close()
+
+
+async def _until_a_write_unit_holds_the_connection(backend, project_root: str) -> None:
+    """Return once a read through the write connection's lock stalls behind a unit."""
+    for _ in range(PROBE_ATTEMPTS):
+        try:
+            await asyncio.wait_for(backend.validate_dependencies(project_root), PROBE_SECONDS)
+        except TimeoutError:
+            return
+    pytest.fail(
+        'validate_dependencies never stalled: either the victim never entered its write '
+        'unit, or validate_dependencies no longer reads through the write connection'
+    )
+
+
 @pytest.mark.asyncio
 async def test_a_cancelled_write_unit_does_not_discard_a_concurrent_add_task(
     backend, project_root
@@ -90,21 +127,30 @@ async def test_a_cancelled_write_unit_does_not_discard_a_concurrent_add_task(
     GREEN before the fix: the per-project write lock already serialised write
     units.  Kept as the guard that ``AtomicConnection.write()`` keeps the same
     rollback isolation once it replaces that lock.
+
+    The cancel must land INSIDE the victim's unit, or this arm passes without
+    exercising a rollback at all.  A foreign writer parks the victim on its
+    first write, and the cancel waits until the victim holds the connection.
     """
     for i in range(1, 4):
         await backend.add_task(project_root, title=f'seed {i}', description='d')
 
-    victim = asyncio.create_task(backend.remove_tasks(['1'], project_root))
-    survivor = asyncio.create_task(
-        backend.add_task(project_root, title='survivor', description='d')
-    )
-    await asyncio.sleep(0)
-    victim.cancel()
+    with _foreign_writer_holding_the_file(project_root):
+        victim = asyncio.create_task(backend.remove_tasks(['1'], project_root))
+        await _until_a_write_unit_holds_the_connection(backend, project_root)
+        survivor = asyncio.create_task(
+            backend.add_task(project_root, title='survivor', description='d')
+        )
+        await asyncio.sleep(0)
+        victim.cancel()
 
-    _, added = await asyncio.wait_for(
+    cancelled, added = await asyncio.wait_for(
         asyncio.gather(victim, survivor, return_exceptions=True), TIMEOUT_SECONDS
     )
 
+    assert isinstance(cancelled, asyncio.CancelledError), (
+        f'the victim finished instead of being cancelled inside its unit: {cancelled!r}'
+    )
     assert isinstance(added, dict), added
     survivor_row = await backend.get_task(added['id'], project_root)
     assert survivor_row['title'] == 'survivor', (
