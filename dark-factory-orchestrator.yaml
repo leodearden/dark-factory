@@ -890,8 +890,20 @@ verify_admission_pytest_n: "8"
 # timeouts/day went 2,1,3,7,13,9,7 (08-28..09-07). Dose-response against the
 # number of OTHER concurrent orchestrator-suite fan-outs: 0-0.5 others -> 1978s
 # median, 0/12 timeouts; >=0.5 others -> 3600s censored, 29/52 timeouts. So 2
-# slots is not a middle ground either. Slot time is not the constraint: the whole
-# task-lane leg volume (~240 legs/14d) sums to ~5.5h/day, i.e. ~23% of ONE slot.
+# slots is not a middle ground either.
+# CORRECTED 2026-09-18: an earlier version of this block said slot time was not
+# the constraint ("~240 legs/14d, ~5.5h/day, ~23% of ONE slot"). That counted one
+# module's legs only (the basis lines above are orchestrator-module only, and
+# orchestrator is 34% of gated arrivals), so it undercounted slot-gated task
+# legs by 6.3x: measured arrivals are 107.5 legs/day (n=578 over 5.38d), not
+# ~17.1/day. Priced at service times from the same period, offered work is
+# 23.9 h/day, so the ONE slot is ~99% utilised, not ~23%. The orchestrator
+# full-suite task leg alone is 22% of arrivals and 86% of slot work, and its
+# mean service time rose from 644s (July) to 3,066s (from 2026-09-12).
+# Sources, in plans/verify-merge-queue-policy-study-2026-09-18/:
+# measure-sem.md, and critic.md finding 1 (summary: SYNTHESIS.md §1).
+# With the slot saturated and in-flight tasks pinned at max_concurrent_tasks,
+# mean task duration is set by WIP and leg service time, not by slot ordering.
 # The host is: 32 threads, 99% busy, runqueue p50 136 / p90 380 (PSI cpu-some
 # 49-72 and non-discriminating at this load, per task 3590).
 # The main-tip sweep (background role) shares this slot and was already live in
@@ -910,13 +922,13 @@ verify_admission_pytest_n: "8"
 # to 1. That is the same reversibility clause the 09-03 raise carried, which did
 # fire and was honoured.
 # MEASUREMENT GAP, stated rather than papered over: the "~23% of ONE slot"
-# figure above could NOT be re-verified on 2026-09-23 — `workflow_verify` events
-# carry only {base_sha, branch, passed, tip_sha} and NO duration, so task-lane
-# slot-hours are not derivable from the event store at all. Only the leg COUNT
-# is: 572 workflow_verify events in 14.4d versus the ~240/14d that figure was
-# computed from. Task 5798 closes that gap. Until it lands, this knob is being
-# tuned on merge-lane duration plus queue-depth observation, not on task-lane
-# slot utilisation.
+# figure (corrected above) could NOT be re-verified on 2026-09-23 —
+# `workflow_verify` events carry only {base_sha, branch, passed, tip_sha} and NO
+# duration, so task-lane slot-hours are not derivable from the event store at
+# all. Only the leg COUNT is: 572 workflow_verify events in 14.4d versus the
+# ~240/14d that figure was computed from. Task 5798 closes that gap. Until it
+# lands, this knob is being tuned on merge-lane duration plus queue-depth
+# observation, not on task-lane slot utilisation.
 # PUT BACK TO 1 (task 5797 gate, 2026-09-27). The dated-revert clause above
 # fired. Equal 4.3d arms on either side of the 09-23 reload:
 #   orchestrator-suite task-leg verify (verify-summary census):
