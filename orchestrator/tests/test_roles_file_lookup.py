@@ -19,6 +19,7 @@ from _role_splice_contract import (
     SpliceContract,
     assert_brace_free,
     assert_nonempty,
+    bash_capable_unpinned,
 )
 
 from orchestrator.agents.file_lookup_guidance import FILE_LOOKUP_GUIDANCE
@@ -29,13 +30,13 @@ from orchestrator.agents.roles import (
     AgentRole,
 )
 
-#: Every role with a literal system_prompt. DERIVED rather than
-#: hand-maintained, as in the sibling census-block modules.
+#: Every role with a literal system_prompt, derived from ROLES.
 _UNPINNED_ROLES = frozenset(name for name, role in ROLES.items() if role.prompt_spec is None)
 
-#: The carriers of `_BASH_CAPABLE_ROLE_PREAMBLE`, whose tail this block joins.
+#: The carriers of `_BASH_CAPABLE_ROLE_PREAMBLE`, whose tail this block joins,
+#: derived through the shared bash_capable_unpinned predicate.
 _BASH_PREAMBLE_ROLES = frozenset(
-    name for name in _UNPINNED_ROLES if 'Bash' in ROLES[name].allowed_tools
+    name for name, role in ROLES.items() if bash_capable_unpinned(role)
 )
 
 #: Roles building their own chain around the read-only Grep variant (`judge`).
@@ -109,7 +110,7 @@ def test_derived_role_sets_are_nonempty():
     )
     assert _BASH_PREAMBLE_ROLES, (
         'No literal-prompt role holds unqualified `Bash`, so the preamble-order '
-        "test passes over an empty set. Check the `'Bash' in allowed_tools` "
+        'test passes over an empty set. Check the bash_capable_unpinned '
         'derivation.'
     )
 
