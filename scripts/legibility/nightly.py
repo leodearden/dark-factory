@@ -47,6 +47,7 @@ from legibility import (  # noqa: E402
     codebook,
     coder,
     digest,
+    invariants,
     inventory,
     sampling,
     session_ledger,
@@ -907,6 +908,10 @@ def _ledger_fault(
     return outcome
 
 
+def _trickle_run_ref(cfg: LegibilityConfig, target_date: date) -> str:
+    return f'trickle-{cfg.project_id}-{target_date:%Y%m%d}'
+
+
 def _ledger_coded_sessions(
     cfg: LegibilityConfig, records, target_date: date, now: datetime | None,
 ) -> _LedgerWrite:
@@ -918,7 +923,7 @@ def _ledger_coded_sessions(
         rows = session_ledger.rows_for(
             records,
             coded_by=session_ledger.CodedBy.TRICKLE,
-            run_ref=f'trickle-{cfg.project_id}-{target_date:%Y%m%d}',
+            run_ref=_trickle_run_ref(cfg, target_date),
             instrument_version=digest.DIGEST_INSTRUMENT_VERSION,
             coded_at=now if now is not None else datetime.now(UTC),
         )
@@ -935,6 +940,23 @@ def _ledger_coded_sessions(
         cfg.project_id, target_date.isoformat(), written, 0,
     )
     return _LedgerWrite(written=written, failed=0, error=None)
+
+
+def _report_invariant_slugs(
+    cfg: LegibilityConfig,
+    target_date: date,
+    tally: codebook.SlugTally,
+    invariant_slugs: Sequence[str],
+) -> None:
+    """Journal what the merger kept and dropped of the night's
+    ``invariant_violated`` values, and warn once naming the dropped ones."""
+    logger.info(
+        'legibility trickle: project=%s date=%s invariant slugs: %d valid, %d rejected',
+        cfg.project_id, target_date.isoformat(), tally.valid, len(tally.rejected),
+    )
+    codebook.warn_unknown_invariant_slugs(
+        tally, invariant_slugs, run=_trickle_run_ref(cfg, target_date),
+    )
 
 
 def _report_sample_outcome(
@@ -1460,9 +1482,11 @@ def run_nightly(
                 codebook_path,
             )
             cb = {'version': 2, 'entries': [], 'candidates': []}
+        invariant_slugs = invariants.read_slugs(cfg.project_root)
 
         run = coder.code_digests(
-            digests, cb, project=cfg.project_id, model=cfg.models.trickle, invoke=invoke,
+            digests, cb, project=cfg.project_id, model=cfg.models.trickle,
+            invariant_slugs=invariant_slugs, invoke=invoke,
         )
 
         if coder.is_cap_deferral(run):
@@ -1518,11 +1542,14 @@ def run_nightly(
 
         applied = 0
         conflicts = 0
+        slug_tally = codebook.SlugTally()
         deletion_skipped: list[str] = []
         merged_records = []
         for record in run.records:
             try:
-                cb, stats = codebook.apply_coding_record(cb, record)
+                cb, stats = codebook.apply_coding_record(
+                    cb, record, invariant_slugs=invariant_slugs,
+                )
             except codebook.NeverDeleteError as exc:
                 # One deletion-shaped coder record must not cost the whole
                 # night's merge: apply_coding_record raises before it deep-
@@ -1544,6 +1571,7 @@ def run_nightly(
                 continue
             merged_records.append(record)
             conflicts += stats['candidate_disposition_conflicts']
+            slug_tally = slug_tally.plus(stats['invariant_slugs'])
             # A conflict-appended sighting IS a codebook mutation (a
             # recurrence appended to an already-adjudicated candidate), so it
             # must count toward the dump/commit gate below -- otherwise a
@@ -1561,6 +1589,7 @@ def run_nightly(
                 + stats['corrections_applied']
             )
 
+        _report_invariant_slugs(cfg, target_date, slug_tally, invariant_slugs)
         if conflicts:
             logger.info(
                 'legibility trickle: %d candidate sighting(s) appended to an '

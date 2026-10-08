@@ -67,7 +67,7 @@ import sys
 import tempfile
 import time
 import traceback
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -107,6 +107,7 @@ from legibility import (  # noqa: E402
     census_trigger,
     census_window,
     digest,
+    invariants,
     session_ledger,
     session_runner,
     unlanded,
@@ -262,8 +263,8 @@ class MiningResult:
 
 
 def mine_to_saturation(
-    batch_source, codebook_dict: dict, *, project: str, model: str, config, invoke,
-    max_batches: int | None = None,
+    batch_source, codebook_dict: dict, *, project: str, model: str, config,
+    invariant_slugs: Sequence[str], invoke, max_batches: int | None = None,
 ) -> MiningResult:
     """Code batches from *batch_source* against *codebook_dict* via
     ``coder.code_digests`` until novelty saturates.
@@ -272,8 +273,9 @@ def mine_to_saturation(
     is ready to code it, so a source that stops yielding once mining
     saturates never has its later batches materialized. Per batch: code
     via ``coder.code_digests(batch, codebook_dict, project=project,
-    model=model, invoke=invoke)``, compute this batch's ``dup_rate`` over
-    its own successful records (``batch_dup_rate`` -- failed codings are
+    model=model, invariant_slugs=invariant_slugs, invoke=invoke)``,
+    compute this batch's ``dup_rate`` over its own successful records
+    (``batch_dup_rate`` -- failed codings are
     excluded from the denominator per that function's own contract), and
     track a consecutive-saturated-batch counter: incremented when
     ``dup_rate >= config.dup_rate`` AND the batch is not a storm, reset to
@@ -367,7 +369,8 @@ def mine_to_saturation(
             _MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH
         ) as bounded:
             run_result = coder.code_digests(
-                list(batch), codebook_dict, project=project, model=model, invoke=invoke,
+                list(batch), codebook_dict, project=project, model=model,
+                invariant_slugs=invariant_slugs, invoke=invoke,
             )
         result.records.extend(run_result.records)
 
@@ -2603,12 +2606,14 @@ def run_census(
         report_path, codebook_path, census_state_path, dry_run_payloads_path,
     )
 
+    invariant_slugs = invariants.read_slugs(project_root)
     mining_result = mine_to_saturation(
         batch_source,
         codebook_dict,
         project=project_id,
         model=config.models.census_miner,
         config=config.census.saturation,
+        invariant_slugs=invariant_slugs,
         invoke=invoke,
         max_batches=max_batches,
     )
@@ -2754,9 +2759,14 @@ def run_census(
     # `_stats`, which made a conflict the adjudication loops never reached
     # invisible everywhere.
     disposition_conflicts = 0
+    slug_tally = codebook.SlugTally()
     for record in mining_result.records:
-        updated_codebook, _stats = codebook.apply_coding_record(updated_codebook, record)
+        updated_codebook, _stats = codebook.apply_coding_record(
+            updated_codebook, record, invariant_slugs=invariant_slugs,
+        )
         disposition_conflicts += _stats.get("candidate_disposition_conflicts", 0)
+        slug_tally = slug_tally.plus(_stats["invariant_slugs"])
+    codebook.warn_unknown_invariant_slugs(slug_tally, invariant_slugs, run=run_id)
 
     # ONE list for every verdict this run paid for and dropped, shared by both
     # adjudication loops below -- a per-loop name would fork the tally

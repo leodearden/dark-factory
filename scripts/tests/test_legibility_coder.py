@@ -20,13 +20,17 @@ import functools
 import inspect
 import json
 import logging
+import subprocess
+import sys
 from pathlib import Path
 
 import codebook as codebook_mod
 import coder as mod
 import digest as digest_mod
 import pytest
-from legibility import session_runner
+from cli_subprocess_timeout import cli_timeout_from_env
+from legibility import invariants, session_runner
+from quality_doc_texts import code_quality, definition_body, heuristic_headlines
 
 # Imported AFTER `coder`, deliberately: it is coder.py's own module-level
 # sys.path bootstrap that puts this checkout's shared/src on the path, so this
@@ -39,6 +43,10 @@ from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, REAL_CLI_CAP_MESSAGES
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LIVE_CODEBOOK_PATH = _REPO_ROOT / "docs" / "legibility" / "confusion-codebook.yaml"
+
+# The vocabulary of a project declaring no invariant slugs, for every test
+# that is not about the slug list.
+_NO_SLUGS: tuple[str, ...] = ()
 
 # ---------------------------------------------------------------------------
 # Shared fixture helpers — synthetic transcript -> real digest text, mirrors
@@ -245,14 +253,14 @@ def test_build_prompt_embeds_digest_and_index_verbatim():
     digest_text = '---\nsession: "s1"\n---\n\n## User Corrections\n- unique marker UC123'
     index = "- entry-a: Title A — cause a\n- entry-b: Title B — cause b"
 
-    prompt = mod.build_prompt(digest_text, index)
+    prompt = mod.build_prompt(digest_text, index, invariant_slugs=_NO_SLUGS)
 
     assert digest_text in prompt
     assert index in prompt
 
 
 def test_build_prompt_embeds_phase_enum_including_unknown():
-    prompt = mod.build_prompt("digest text", "codebook index")
+    prompt = mod.build_prompt("digest text", "codebook index", invariant_slugs=_NO_SLUGS)
 
     for phase in codebook_mod.PHASES:
         assert phase in prompt
@@ -336,7 +344,7 @@ def test_code_digest_happy_path_success(tmp_path):
 
     result = mod.code_digest(
         digest_text, live_codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is True
@@ -371,7 +379,7 @@ def test_code_digest_unparseable_output_is_failure_not_fabricated():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is False
@@ -404,7 +412,7 @@ def test_code_digest_schema_invalid_record_is_failure_not_fabricated():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is False
@@ -426,7 +434,7 @@ def test_code_digest_invocation_error_is_failure_not_fabricated():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is False
@@ -448,7 +456,7 @@ def test_code_digest_malformed_frontmatter_is_failure_not_raised():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is False
@@ -466,7 +474,7 @@ def test_code_digest_empty_judgment_is_success_not_failure():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is True
@@ -518,7 +526,7 @@ def test_code_digest_cap_exhausted_is_a_labelled_failure_not_fabricated():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.capped is True, (
@@ -545,7 +553,7 @@ def _capped_flag_for(invoke):
     digest_text = _hand_digest(_SESSION_ID, "a confusing correction happened here")
     return mod.code_digest(
         digest_text, _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=invoke,
+        invoke=invoke, invariant_slugs=_NO_SLUGS,
     )
 
 
@@ -604,7 +612,7 @@ def test_code_digest_malformed_frontmatter_is_never_labelled_capped():
 
     result = mod.code_digest(
         "no frontmatter here, just prose", _tiny_codebook(),
-        project="dark_factory", model="haiku", invoke=fake_invoke,
+        project="dark_factory", model="haiku", invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
     assert result.ok is False
     assert result.capped is False
@@ -636,7 +644,7 @@ def test_code_digest_exit_zero_cap_banner_is_labelled_capped(message):
     result = mod.code_digest(
         _hand_digest(_SESSION_ID, "a confusing correction happened here"),
         _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.capped is True, (
@@ -655,7 +663,7 @@ def test_code_digest_exit_zero_cap_reason_names_the_marker():
     result = mod.code_digest(
         _hand_digest(_SESSION_ID, "a confusing correction happened here"),
         _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
     assert result.capped is True
     assert result.reason is not None, "a capped digest must still record WHY"
@@ -701,7 +709,7 @@ def test_code_digest_a_verdict_QUOTING_cap_text_is_never_read_as_a_banner():
     result = mod.code_digest(
         _hand_digest(_SESSION_ID, "a confusing correction happened here"),
         _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.capped is False, (
@@ -750,7 +758,7 @@ def test_code_digest_ordinary_garbage_stays_an_unlabelled_parse_failure():
     result = mod.code_digest(
         _hand_digest(_SESSION_ID, "a confusing correction happened here"),
         _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
     assert result.ok is False
     assert result.capped is False
@@ -800,7 +808,7 @@ def _run_mixed(*, capped, failed, ok):
     digests = _batch_digests(capped + failed + ok)
     return mod.code_digests(
         digests, _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=_mixed_batch_invoke(capped=capped, failed=failed),
+        invoke=_mixed_batch_invoke(capped=capped, failed=failed), invariant_slugs=_NO_SLUGS,
     )
 
 
@@ -920,7 +928,7 @@ def test_code_digests_all_succeed_batch_status_ok():
 
     result = mod.code_digests(
         digests, codebook, project="dark_factory", model="haiku",
-        invoke=_make_batch_invoke(fail_sessions=set()),
+        invoke=_make_batch_invoke(fail_sessions=set()), invariant_slugs=_NO_SLUGS,
     )
 
     assert result.status == "ok"
@@ -940,7 +948,7 @@ def test_code_digests_majority_failure_batch_status_failure():
 
     result = mod.code_digests(
         digests, codebook, project="dark_factory", model="haiku",
-        invoke=_make_batch_invoke(fail_sessions),
+        invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
     )
 
     assert result.status == "failure"
@@ -962,7 +970,7 @@ def test_code_digests_exactly_half_failure_is_not_a_storm():
 
     result = mod.code_digests(
         digests, codebook, project="dark_factory", model="haiku",
-        invoke=_make_batch_invoke(fail_sessions),
+        invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
     )
 
     assert result.status == "ok"
@@ -1019,7 +1027,7 @@ def test_code_digests_logs_every_failure_in_a_sub_storm_batch(caplog):
     with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
         result = mod.code_digests(
             digests, _tiny_codebook(), project="dark_factory", model="haiku",
-            invoke=_make_batch_invoke(fail_sessions),
+            invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
         )
 
     assert result.status == "ok", (
@@ -1059,7 +1067,7 @@ def test_code_digests_logs_one_record_per_failure_in_a_storm(caplog):
     with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
         result = mod.code_digests(
             digests, _tiny_codebook(), project="dark_factory", model="haiku",
-            invoke=_make_batch_invoke(fail_sessions),
+            invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
         )
 
     assert result.status == "failure"
@@ -1086,7 +1094,7 @@ def test_code_digests_logs_the_isolated_crash_path_too(caplog):
     with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
         result = mod.code_digests(
             digests, _tiny_codebook(), project="dark_factory", model="haiku",
-            invoke=_make_crashing_invoke({"batch-sess-1"}),
+            invoke=_make_crashing_invoke({"batch-sess-1"}), invariant_slugs=_NO_SLUGS,
         )
 
     # The batch kept going: the other two digests still coded.
@@ -1191,9 +1199,13 @@ def _main_digests(tmp_path, prefix, count):
 
 
 def _run_main(tmp_path, *args):
+    """Run main() with *tmp_path* as the observed project's root."""
     codebook_path = tmp_path / "codebook.yaml"
     codebook_mod.dump(_tiny_codebook(), codebook_path)
-    return mod.main([*map(str, args), "--codebook", str(codebook_path), "--project", "dark_factory"])
+    return mod.main([
+        *map(str, args), "--codebook", str(codebook_path), "--project", "dark_factory",
+        "--project-root", str(tmp_path),
+    ])
 
 
 def test_main_happy_path_writes_valid_jsonl_and_returns_0(
@@ -1323,3 +1335,166 @@ def test_main_digests_dir_skips_subdirectories(tmp_path, pooled_main, capsys):
     lines = [line for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(lines) == 1
     assert json.loads(lines[0])["session"] == "dir-sess-1"
+
+
+# ---------------------------------------------------------------------------
+# task 6400: the quality Definition is the minting test, and the coder is told
+# the observed project's invariant slugs (plans/census-incremental-prd.md R9,
+# §4.8 rows 15 and 17). Expected texts are computed from the normative doc at
+# test time (quality_doc_texts), never restated.
+# ---------------------------------------------------------------------------
+
+
+def _block(prompt, name):
+    lines = prompt.splitlines()
+    start = lines.index(f"=== {name} ===")
+    body = []
+    for line in lines[start + 1:]:
+        if line.startswith("=== "):
+            break
+        body.append(line)
+    return body
+
+
+def _bullets(block):
+    return [line for line in block if line.startswith("- ")]
+
+
+def _slugged_prompt(invariant_slugs):
+    return mod.build_prompt("digest text", "codebook index", invariant_slugs=invariant_slugs)
+
+
+def _never_invoked(*args, **kwargs):
+    pytest.fail("invoke reached: invariant_slugs acquired a default")
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: mod.build_prompt("digest text", "codebook index"),  # pyright: ignore[reportCallIssue]
+        lambda: mod.code_digest("digest text", {}, project="p", invoke=_never_invoked),  # pyright: ignore[reportCallIssue]
+        lambda: mod.code_digests([], {}, project="p", invoke=_never_invoked),  # pyright: ignore[reportCallIssue]
+    ],
+    ids=["build_prompt", "code_digest", "code_digests"],
+)
+def test_the_invariant_slugs_are_required_never_defaulted(call):
+    """A default would tell the miner a project declares no slugs, silently."""
+    with pytest.raises(TypeError):
+        call()
+
+
+def test_the_prompt_carries_the_quality_definition_and_no_heuristic():
+    prompt = _slugged_prompt(("a-slug", "b-slug"))
+
+    assert definition_body() in prompt
+    for headline in heuristic_headlines():
+        assert headline not in prompt
+
+
+def test_the_prompt_lists_the_invariant_slugs_in_order():
+    block = _block(_slugged_prompt(("a-slug", "b-slug")), "INVARIANT SLUGS")
+
+    assert _bullets(block) == ["- a-slug", "- b-slug"]
+
+
+def test_a_project_without_slugs_is_stated_not_omitted():
+    block = _block(_slugged_prompt(()), "INVARIANT SLUGS")
+
+    assert _bullets(block) == []
+    assert any(str(invariants.DOC_RELPATH) in line for line in block)
+
+
+@pytest.mark.parametrize("invariant_slugs", [("a-slug",), ()])
+def test_the_prompt_prescribes_exactly_one_json_reply_line(invariant_slugs):
+    lines = _slugged_prompt(invariant_slugs).splitlines()
+
+    assert len([line for line in lines if line.startswith("{")]) == 1
+
+
+def _recording_invoke(prompts):
+    def fake_invoke(prompt, model):
+        prompts.append(prompt)
+        return json.dumps({"matches": [], "candidates": []})
+
+    return fake_invoke
+
+
+def test_code_digest_passes_the_slugs_to_the_prompt():
+    prompts = []
+
+    result = mod.code_digest(
+        _hand_digest("slug-sess", "marker"), _tiny_codebook(), project="dark_factory",
+        invariant_slugs=("a-slug",), invoke=_recording_invoke(prompts),
+    )
+
+    assert result.ok
+    assert _bullets(_block(prompts[0], "INVARIANT SLUGS")) == ["- a-slug"]
+
+
+def test_code_digests_passes_the_slugs_to_every_prompt():
+    prompts = []
+
+    mod.code_digests(
+        [_hand_digest("slug-a", "one"), _hand_digest("slug-b", "two")], _tiny_codebook(),
+        project="dark_factory", invariant_slugs=("a-slug",), invoke=_recording_invoke(prompts),
+    )
+
+    assert len(prompts) == 2
+    assert all(_bullets(_block(p, "INVARIANT SLUGS")) == ["- a-slug"] for p in prompts)
+
+
+@pytest.mark.parametrize(
+    "definition_section",
+    ["## Definition\n\n", "## Renamed definition\n\nSome text.\n\n"],
+    ids=["emptied", "renamed"],
+)
+def test_a_broken_quality_definition_fails_every_digest(
+    tmp_path, monkeypatch, definition_section
+):
+    """Minting against no Definition would be silent; a failed batch is not."""
+    doc = tmp_path / "code_quality.md"
+    doc.write_text(
+        "# Code quality\n\n" + definition_section + "## The fourteen heuristics\n\n1. **One**\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(code_quality, "NORMATIVE_DOC", doc)
+    prompts = []
+
+    run = mod.code_digests(
+        _batch_digests(2), _tiny_codebook(), project="dark_factory",
+        invariant_slugs=("a-slug",), invoke=_recording_invoke(prompts),
+    )
+
+    assert prompts == []
+    assert run.records == []
+    assert run.status == "failure"
+    assert len(run.failures) == 2
+    assert all("## Definition" in reason for _session, reason in run.failures)
+
+
+def test_main_reads_the_slugs_from_the_project_root(tmp_path, pooled_main):
+    pooled_main.plan(default={"result": _EMPTY_VERDICT})
+    doc = tmp_path / invariants.DOC_RELPATH
+    doc.parent.mkdir(parents=True)
+    doc.write_text("## INV-1 `cli-visible-slug`\n", encoding="utf-8")
+
+    rc = _run_main(tmp_path, *_main_digests(tmp_path, "main-slug", 1))
+
+    assert rc == 0
+    assert any(
+        "cli-visible-slug" in call["stdin"] or "cli-visible-slug" in " ".join(call["argv"])
+        for call in pooled_main.calls()
+    )
+
+
+def test_coder_runs_standalone_and_takes_a_project_root():
+    """Outside pytest nothing else puts orchestrator/src on sys.path, so this
+    proves coder.py's own bootstrap resolves the code-quality slicer."""
+    completed = subprocess.run(
+        [sys.executable, str(_REPO_ROOT / "scripts" / "legibility" / "coder.py"), "--help"],
+        cwd=_REPO_ROOT, capture_output=True, text=True,
+        timeout=cli_timeout_from_env("LEGIBILITY_CODER_CLI_TEST_TIMEOUT"),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--project-root" in completed.stdout

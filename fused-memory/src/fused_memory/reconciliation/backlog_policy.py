@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
+from urllib.parse import quote
 
 from shared.safe_io import atomic_write_text
 
@@ -139,6 +140,13 @@ def _policy_keys(error_type: str, backlog: int, threshold: int) -> dict[str, Any
         (error_type, backlog, threshold),
         strict=True,
     ))
+
+
+def _escalation_id(kind: str, project_id: str, timestamp: str) -> str:
+    """``<kind-prefix><percent-encoded project>-<sanitised timestamp>``."""
+    prefix = _ESC_ID_PREFIXES.get(kind, _ESC_ID_PREFIXES['backlog'])
+    safe_ts = timestamp.replace(':', '').replace('+', '').replace('.', '_')
+    return f'{prefix}{quote(project_id, safe="")}-{safe_ts}'
 
 
 class _MergeOutcome(NamedTuple):
@@ -854,9 +862,7 @@ class BacklogPolicy:
 
         esc_dir = Path(project_root) / 'data' / 'escalations'
         ts = datetime.fromtimestamp(self._now(), tz=UTC).isoformat()
-        safe_ts = ts.replace(':', '').replace('+', '').replace('.', '_')
-        prefix = _ESC_ID_PREFIXES.get(kind, _ESC_ID_PREFIXES['backlog'])
-        esc_id = f'{prefix}{safe_ts}'
+        esc_id = _escalation_id(kind, project_id, ts)
 
         # Fold key = (category, kind, project_id) and NOTHING else. ``kind``
         # occupies the finding_category slot so a judge halt can never fold into
