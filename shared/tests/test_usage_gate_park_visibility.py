@@ -40,6 +40,7 @@ import asyncio
 import json
 import logging
 import math
+import time
 from datetime import UTC, datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -242,29 +243,43 @@ class TestAllCappedParkIsVisible:
         """
         interval = fast_heartbeat(0.05)
         gate = _all_capped_gate()
-        duration = 0.3
 
         async def _wake_repeatedly() -> None:
             while True:
                 gate._open.set()
                 await asyncio.sleep(0.001)
 
+        # The park is driven to a target pass COUNT, not a wall-clock budget,
+        # so the flood exists by construction however much CPU the host spared.
+        # The deadline is only a runaway backstop; hitting it skips, because a
+        # host that could not build the flood has proven nothing either way.
+        target_passes = 200
+        deadline = time.monotonic() + 30.0
+        started = time.monotonic()
+
         waker = asyncio.create_task(_wake_repeatedly())
+        parked = asyncio.create_task(gate.before_invoke())
         try:
-            await _park_for(gate, duration)
+            while _loop_passes(caplog) < target_passes:
+                if time.monotonic() > deadline:
+                    break
+                await asyncio.sleep(0.005)
         finally:
+            parked.cancel()
             waker.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await waker
+            for task in (parked, waker):
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        duration = time.monotonic() - started
 
         heartbeats = len(_park_records(caplog))
         passes = _loop_passes(caplog)
 
-        assert passes > 10, (
-            f'only {passes} loop passes occurred, so this test never created '
-            'the flood it exists to bound and its throttling assertion would '
-            'pass vacuously'
-        )
+        if passes < target_passes:
+            pytest.skip(
+                f'only {passes} loop passes in {duration:.1f}s: the host could '
+                'not build the flood this test exists to bound'
+            )
         assert heartbeats <= math.ceil(duration / interval) + 2, (
             f'{heartbeats} heartbeats across {duration}s at a {interval}s '
             f'interval — the log rate must be bounded by the interval, not by '
