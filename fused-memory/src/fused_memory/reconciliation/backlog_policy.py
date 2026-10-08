@@ -143,14 +143,7 @@ def _policy_keys(error_type: str, backlog: int, threshold: int) -> dict[str, Any
 
 
 def _escalation_id(kind: str, project_id: str, timestamp: str) -> str:
-    """The record id: fault kind, then project, then filing time.
-
-    The project is percent-encoded, not slugified, because the encoding is
-    injective: distinct projects never share an id on one tick. It also emits
-    no ``/`` or glob metacharacter, so the id stays one literal filename in
-    the escalation dir, which ``_locate_persisted``'s archive glob relies on.
-    Real project ids pass through unchanged.
-    """
+    """``<kind-prefix><percent-encoded project>-<sanitised timestamp>``."""
     prefix = _ESC_ID_PREFIXES.get(kind, _ESC_ID_PREFIXES['backlog'])
     safe_ts = timestamp.replace(':', '').replace('+', '').replace('.', '_')
     return f'{prefix}{quote(project_id, safe="")}-{safe_ts}'

@@ -84,6 +84,16 @@ async def _seed_buffered(event_buffer: EventBuffer, project_id: str, n: int) -> 
         await event_buffer.push(event)
 
 
+def _pending_records(esc_dir: Path) -> dict[str, dict]:
+    """Every pending record in ``esc_dir``, keyed by id."""
+    out = {}
+    for path in sorted(esc_dir.glob('esc-*.json')):
+        body = json.loads(path.read_text(encoding='utf-8'))
+        if body.get('status') == 'pending':
+            out[body['id']] = body
+    return out
+
+
 # ── BacklogPolicy.check ───────────────────────────────────────────────────
 
 
@@ -1300,16 +1310,6 @@ class TestFoldIsolation:
     ``_maybe_write_escalation``.
     """
 
-    @staticmethod
-    def _pending(esc_dir: Path) -> dict[str, dict]:
-        """Every pending record in ``esc_dir``, keyed by id."""
-        out = {}
-        for path in sorted(esc_dir.glob('esc-*.json')):
-            body = json.loads(path.read_text(encoding='utf-8'))
-            if body.get('status') == 'pending':
-                out[body['id']] = body
-        return out
-
     @pytest.mark.asyncio
     async def test_judge_halt_does_not_fold_into_a_pending_backlog_parent(
         self, event_buffer, tmp_path,
@@ -1343,7 +1343,7 @@ class TestFoldIsolation:
         assert halt_verdict.escalation_path != backlog_verdict.escalation_path
 
         esc_dir = project_root / 'data' / 'escalations'
-        pending = self._pending(esc_dir)
+        pending = _pending_records(esc_dir)
         assert len(pending) == 2, sorted(pending)
 
         backlog_ids = [i for i in pending if i.startswith('esc-reconciliation-backlog-')]
@@ -1399,7 +1399,7 @@ class TestFoldIsolation:
         assert v_a.escalation_path != v_b.escalation_path
 
         esc_dir = shared_root / 'data' / 'escalations'
-        pending = self._pending(esc_dir)
+        pending = _pending_records(esc_dir)
         assert len(pending) == 2, sorted(pending)
         by_project = {body['project_id']: body for body in pending.values()}
         assert set(by_project) == {'proj_a', 'proj_b'}
@@ -1461,7 +1461,7 @@ class TestFoldIsolation:
         assert verdict.escalation_path is not None
         assert Path(verdict.escalation_path).name != foreign_path.name
 
-        pending = self._pending(esc_dir)
+        pending = _pending_records(esc_dir)
         assert len(pending) == 2, sorted(pending)
         own = [i for i in pending if i.startswith('esc-reconciliation-backlog-')]
         assert len(own) == 1, sorted(pending)
@@ -1505,7 +1505,7 @@ class TestEscalationIdScoping:
         assert first_a.escalation_path != first_b.escalation_path
 
         esc_dir = shared_root / 'data' / 'escalations'
-        pending = TestFoldIsolation._pending(esc_dir)
+        pending = _pending_records(esc_dir)
         assert len(pending) == 2, sorted(pending)
         by_project = {body['project_id']: body for body in pending.values()}
         assert set(by_project) == {'proj_a', 'proj_b'}
@@ -1524,7 +1524,7 @@ class TestEscalationIdScoping:
         second_a = await policy.check('proj_a', project_root=str(shared_root))
         second_b = await policy.check('proj_b', project_root=str(shared_root))
 
-        pending = TestFoldIsolation._pending(esc_dir)
+        pending = _pending_records(esc_dir)
         assert len(pending) == 2, sorted(pending)
         by_project = {body['project_id']: body for body in pending.values()}
         assert by_project['proj_a']['dedupe_count'] == 1
@@ -1553,7 +1553,7 @@ class TestEscalationIdScoping:
         assert Path(slashed.escalation_path).parent == esc_dir
         assert Path(underscored.escalation_path).parent == esc_dir
 
-        pending = TestFoldIsolation._pending(esc_dir)
+        pending = _pending_records(esc_dir)
         assert len(pending) == 2, sorted(pending)
         assert {body['project_id'] for body in pending.values()} == {
             'team/a', 'team_a',
@@ -1751,7 +1751,7 @@ class TestDegradedFilingPaths:
         assert second_id != first_id
 
         esc_dir = project_root / 'data' / 'escalations'
-        pending = TestFoldIsolation._pending(esc_dir)
+        pending = _pending_records(esc_dir)
         assert list(pending) == [second_id], sorted(pending)
         # A NEW incident, counted from zero — not a child of the closed one.
         assert pending[second_id]['dedupe_count'] == 0
