@@ -144,3 +144,34 @@ class TestStoreIdentityNormalizesPaths:
         )
 
         assert si.queue_dir == queue.queue_dir.resolve()
+
+
+class TestStoreIdentityValidatesKindCoherence:
+    @pytest.mark.parametrize(
+        ('kind', 'project_id', 'project_root', 'offending_field'),
+        [
+            ('project', None, Path('/repo'), 'project_id'),
+            ('project', 'test-project', None, 'project_root'),
+            ('reconciliation', 'test-project', None, 'project_id'),
+            ('reconciliation', None, Path('/repo'), 'project_root'),
+        ],
+    )
+    def test_incoherent_combination_raises_naming_kind_and_field(
+        self,
+        tmp_path: Path,
+        kind: str,
+        project_id: str | None,
+        project_root: Path | None,
+        offending_field: str,
+    ) -> None:
+        with pytest.raises(ValueError, match=rf"kind='{kind}'.*\b{offending_field}\b"):
+            StoreIdentity(
+                kind=kind,  # type: ignore[arg-type]
+                queue_dir=tmp_path / 'esc',
+                project_id=project_id,
+                project_root=project_root,
+            )
+
+    def test_coherent_combinations_construct(self, tmp_path: Path) -> None:
+        _project_identity(tmp_path)
+        _reconciliation_identity(tmp_path)
