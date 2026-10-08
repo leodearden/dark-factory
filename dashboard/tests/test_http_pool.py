@@ -32,7 +32,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import re
 from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -109,8 +108,8 @@ class FakeStream(httpcore.AsyncNetworkStream):
 
     ``close_error`` and ``close_gate`` are the same two controls over the CLOSE
     side, set on an individual stream after a test has minted its orphan. They
-    exist because ``reap_orphaned_connections``'s two suppressed-failure paths
-    are otherwise unreachable: a close that raises is what separates its
+    exist because ``OrphanReaper.sweep``'s two suppressed-failure paths are
+    otherwise unreachable: a close that raises is what separates its
     "closed" count from the set it unpools, and a close that suspends is the
     only window in which a concurrent request can unpool a connection the sweep
     is midway through closing.
@@ -347,7 +346,7 @@ class TestReapingReclaimsTheOrphan:
                 'the orphan holds no open stream, so this test would assert nothing'
             )
 
-            reaped = await http_pool.reap_orphaned_connections(minted.client)
+            reaped = await http_pool.OrphanReaper(minted.client).sweep()
 
             assert reaped == 1
             after = http_pool.census(minted.client)
@@ -368,10 +367,11 @@ class TestReapingReclaimsTheOrphan:
         """IDEMPOTENCE — the reaper runs on a 60s loop, so most sweeps find nothing."""
         async with _orphan_sweep() as minted:
             assert minted is not None, _NO_ORPHAN_MINTED
-            assert await http_pool.reap_orphaned_connections(minted.client) == 1
+            reaper = http_pool.OrphanReaper(minted.client)
+            assert await reaper.sweep() == 1
             settled = http_pool.census(minted.client)
 
-            assert await http_pool.reap_orphaned_connections(minted.client) == 0
+            assert await reaper.sweep() == 0
 
             assert http_pool.census(minted.client) == settled
 
@@ -393,7 +393,7 @@ class TestReapingReclaimsTheOrphan:
             [stream] = [s for s in minted.backend.streams if not s.closed]
             stream.close_error = OSError('close(2) failed on the underlying socket')
 
-            reaped = await http_pool.reap_orphaned_connections(minted.client)
+            reaped = await http_pool.OrphanReaper(minted.client).sweep()
 
             assert reaped == 0, 'a close that raised is not a clean close and must not count'
             after = http_pool.census(minted.client)
@@ -419,7 +419,7 @@ class TestReapingReclaimsTheOrphan:
             gate = asyncio.Event()
             stream.close_gate = gate
 
-            sweep = asyncio.create_task(http_pool.reap_orphaned_connections(minted.client))
+            sweep = asyncio.create_task(http_pool.OrphanReaper(minted.client).sweep())
             try:
                 await _step_until(
                     lambda: stream.reached_close,
@@ -474,7 +474,7 @@ class TestReapingReclaimsTheOrphan:
                     what='the second request queueing for the slot the orphan holds',
                 )
 
-                assert await http_pool.reap_orphaned_connections(minted.client) == 1
+                assert await http_pool.OrphanReaper(minted.client).sweep() == 1
 
                 # CLOCK-FREE, deliberately: a sweep that merely unpooled would
                 # exhaust these steps and fail here naming what it was waiting
@@ -518,7 +518,7 @@ class TestReapingSparesLiveTraffic:
             assert census is not None
             assert census.orphaned == 0
 
-            assert await http_pool.reap_orphaned_connections(harness.client) == 0
+            assert await http_pool.OrphanReaper(harness.client).sweep() == 0
             assert not any(s.closed for s in harness.backend.streams), (
                 'the reaper closed a socket a live request was still using'
             )
@@ -607,7 +607,7 @@ class TestShapeGuardDegradesLoudly:
     """
 
     @pytest.mark.parametrize('build_client', _UNRESOLVABLE_CLIENTS)
-    async def test_the_free_functions_return_sentinels_and_say_nothing(
+    async def test_census_returns_none_and_says_nothing(
         self,
         build_client: Callable[[], httpx.AsyncClient],
         caplog: pytest.LogCaptureFixture,
@@ -617,12 +617,11 @@ class TestShapeGuardDegradesLoudly:
         try:
             with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
                 assert http_pool.census(client) is None
-                assert await http_pool.reap_orphaned_connections(client) == 0
 
             said = [r.getMessage() for r in caplog.records if r.name == _LOGGER_NAME]
             assert said == [], (
-                'census and reap_orphaned_connections must stay silent; the None/0 '
-                f'sentinel already tells their caller the pool was unreadable. Got {said}'
+                'census must stay silent; the None sentinel already tells its caller '
+                f'the pool was unreadable. Got {said}'
             )
         finally:
             with contextlib.suppress(Exception):
@@ -638,7 +637,7 @@ class TestShapeGuardDegradesLoudly:
         client = build_client()
         try:
             with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
-                await http_pool.OrphanReaper(client).sweep()
+                assert await http_pool.OrphanReaper(client).sweep() == 0
 
             warnings = _messages(caplog, logging.WARNING)
             assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings}'
@@ -723,10 +722,8 @@ class TestASweepReports:
 
             warnings = _messages(caplog, logging.WARNING)
             assert len(warnings) == 1, f'expected exactly one WARNING, got {warnings}'
-            # A WHOLE token: after the reap every census field reads 0 except
-            # max_connections=100, so a bare '1' could only match the count.
-            assert re.search(r'\b1\b', warnings[0]), (
-                f'the WARNING must name the count, got {warnings[0]}'
+            assert warnings[0].startswith('Reaped 1 orphaned'), (
+                f'the WARNING must lead with the count, got {warnings[0]}'
             )
             assert all(
                 field in warnings[0] for field in ('total=', 'orphaned=', 'max_connections=')
@@ -818,20 +815,19 @@ class TestReaperLoop:
         sweeps: list[http_pool.OrphanReaper] = []
 
         class _FailsFirstSweep(http_pool.OrphanReaper):
-            async def sweep(self) -> None:
+            async def sweep(self) -> int:
                 sweeps.append(self)
                 if len(sweeps) == 1:
                     raise RuntimeError('pool went sideways')
-                await super().sweep()
+                return await super().sweep()
 
-        monkeypatch.setattr(http_pool, 'OrphanReaper', _FailsFirstSweep)
         harness = _build_harness()
 
         with (
             caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME),
             pytest.raises(asyncio.CancelledError),
         ):
-            await http_pool.reaper_loop(harness.client)
+            await http_pool.reaper_loop(harness.client, reaper_factory=_FailsFirstSweep)
 
         assert len(sweeps) == 3, 'a failed sweep must not stop the ticks after it'
         failures = _records(caplog, logging.WARNING)
@@ -1001,6 +997,41 @@ class TestPoolSaturationAlarm:
         ), (
             'the WARNING must carry the whole census: "4 of 5" alone does not say '
             f'whether the pool is busy or wedged; got {warnings[0]}'
+        )
+
+    async def test_a_reap_that_leaves_the_pool_saturated_reports_both_from_one_reading(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """One sweep, one post-reap reading, two reports, reap first.
+
+        The orphan and the idle connections fill the pool; reaping the orphan
+        leaves it exactly at the mark. Both lines must quote the POST-reap
+        census: a saturation reading taken before the reap would still count
+        the orphan this sweep had just closed.
+        """
+        async with _orphan_sweep(max_connections=_SMALL_MAX_CONNECTIONS) as minted:
+            assert minted is not None, _NO_ORPHAN_MINTED
+            await _fill_pool(minted.client, _AT_HIGH_WATER)
+            before = http_pool.census(minted.client)
+            assert before is not None
+            assert (before.total, before.orphaned) == (_SMALL_MAX_CONNECTIONS, 1), before
+
+            with caplog.at_level(logging.DEBUG, logger=_LOGGER_NAME):
+                assert await http_pool.OrphanReaper(minted.client).sweep() == 1
+
+            after = http_pool.census(minted.client)
+            assert after is not None
+            assert (after.total, after.orphaned) == (_AT_HIGH_WATER, 0), after
+
+        warnings = _messages(caplog, logging.WARNING)
+        assert len(warnings) == 2, (
+            f'expected a reap WARNING then a saturation WARNING, got {warnings}'
+        )
+        reap_line, saturation_line = warnings
+        assert reap_line.startswith('Reaped 1 orphaned'), reap_line
+        assert 'high-water mark' in saturation_line, saturation_line
+        assert all(str(after) in line for line in warnings), (
+            f'both reports must quote the one post-reap census {after}; got {warnings}'
         )
 
     async def test_a_sweep_below_the_high_water_mark_says_nothing(

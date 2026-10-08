@@ -64,6 +64,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import cast
 
@@ -243,18 +244,6 @@ def census(client: httpx.AsyncClient) -> PoolCensus | None:
     return None if isinstance(pool, _UnresolvedPool) else _read(pool)
 
 
-async def reap_orphaned_connections(client: httpx.AsyncClient) -> int:
-    """Close and unpool *client*'s orphaned connections. Returns how many closed.
-
-    ``0`` on an unrecognised pool, silently, for the reason :func:`census`
-    gives. :func:`_reap` states how the reclaim works.
-    """
-    pool = _resolve_pool(client)
-    if isinstance(pool, _UnresolvedPool):
-        return 0
-    return await _reap(pool)
-
-
 async def _reap(pool: httpcore.AsyncConnectionPool) -> int:
     """Close and unpool *pool*'s orphaned connections. Returns how many closed.
 
@@ -352,12 +341,16 @@ class OrphanReaper:
         self._shape_guard = _LatchedWarning()
         self._saturation_alarm = _LatchedWarning()
 
-    async def sweep(self) -> None:
-        """Reap the pool once, then report on what the reap left."""
+    async def sweep(self) -> int:
+        """Reap the pool once, then report on what the reap left.
+
+        Returns how many orphans closed cleanly, which :func:`_reap` defines;
+        ``0`` on an unrecognised pool, after announcing it.
+        """
         pool = _resolve_pool(self._client)
         if isinstance(pool, _UnresolvedPool):
             self._shape_guard.fire(_UNRESOLVED_POOL_WARNING, pool.path)
-            return
+            return 0
         reaped = await _reap(pool)
         # One reading, taken AFTER the reap and shared by both reports below:
         # post-reap occupancy is the number that actually predicts a wedge, and
@@ -371,6 +364,7 @@ class OrphanReaper:
                 'Reaped %d orphaned pool connection(s); pool now %s', reaped, reading
             )
         self._report_occupancy(reading)
+        return reaped
 
     def _report_occupancy(self, reading: PoolCensus) -> None:
         """Report pool occupancy at or above :data:`POOL_HIGH_WATER_FRACTION`.
@@ -421,7 +415,10 @@ REAP_INTERVAL_SECONDS = 60.0
 
 
 async def reaper_loop(
-    client: httpx.AsyncClient, interval: float = REAP_INTERVAL_SECONDS
+    client: httpx.AsyncClient,
+    interval: float = REAP_INTERVAL_SECONDS,
+    *,
+    reaper_factory: Callable[[httpx.AsyncClient], OrphanReaper] = OrphanReaper,
 ) -> None:
     """Sweep *client*'s pool for orphans forever, at *interval*.
 
@@ -438,11 +435,11 @@ async def reaper_loop(
     Sleeps BEFORE its first sweep: a pool that has served no requests yet can
     hold no orphans, so a sweep at startup could only ever find nothing.
 
-    ONE :class:`OrphanReaper` for the loop's whole life, so its warn-once
-    latches last exactly as long as the loop: a fresh reaper per tick would
-    re-announce a broken pool every *interval*.
+    ONE reaper for the loop's whole life, built by *reaper_factory* from
+    *client*, so its warn-once latches last exactly as long as the loop: a
+    fresh reaper per tick would re-announce a broken pool every *interval*.
     """
-    reaper = OrphanReaper(client)
+    reaper = reaper_factory(client)
     while True:
         await asyncio.sleep(interval)
         try:
