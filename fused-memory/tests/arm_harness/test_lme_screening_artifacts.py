@@ -3,9 +3,13 @@
 ``plans/local-memory-models-eval-screening/`` holds one sweep's evidence: per-arm specs,
 command records, α's VRAM readings, the usage tap's calls and the pinned runs. It also
 holds ``screening-verdict.json``, the pre-registered survivor rule's output over that
-evidence. These tests re-derive the verdict from the committed evidence, so the
-committed verdict cannot drift from the rule or the evidence. They also couple the
-evidence to the committed arms.yaml slate: a slate change invalidates η's verdict.
+evidence. These tests re-derive the verdict from the committed evidence and compare
+what the rule decided: the pins, the envelope, the cap, the survivors, the outcome, and
+each arm's gates by verdict, value, bound, margin and unit. So the committed decision
+cannot drift from the rule or the evidence. Gate detail prose and the non-gating
+reported block are deliberately left out of the comparison: rewording them does not
+mean rewriting this dated artifact. The tests also couple the evidence to the
+committed arms.yaml slate: a slate change invalidates η's verdict.
 
 Lane discipline: file reads plus ``git`` subprocesses only, and NO ``integration``
 marker, so the merge lane's default selection runs them.
@@ -35,7 +39,6 @@ from fused_memory.arm_harness.screening import (
     ScreeningVerdict,
     derive_screening_verdict,
     load_screening_verdict,
-    serialize_screening_verdict,
 )
 from fused_memory.arm_harness.screening_evidence import (
     SCREENING_RUN_SHAPE,
@@ -180,6 +183,26 @@ def test_each_served_run_is_a_pinned_screening_run_of_the_committed_spec(arm_id)
 # --- the verdict ----------------------------------------------------------------------
 
 
+def _decision(verdict: ScreeningVerdict) -> dict[str, object]:
+    return {
+        'pins': (verdict.preregistration_sha, verdict.code_sha, verdict.corpus_sha),
+        'envelope': verdict.envelope,
+        'cap': verdict.cap,
+        'survivors': verdict.survivors,
+        'outcome': verdict.outcome,
+        'arms': [
+            (
+                arm.arm_id, arm.stack, arm.reasoning, arm.served, arm.survives,
+                [
+                    (gate.gate, gate.verdict, gate.value, gate.bound, gate.margin, gate.unit)
+                    for gate in arm.gates
+                ],
+            )
+            for arm in verdict.arms
+        ],
+    }
+
+
 def test_the_committed_verdict_is_the_rule_over_the_committed_evidence():
     verdict = derive_screening_verdict(
         SLATE,
@@ -188,9 +211,7 @@ def test_the_committed_verdict_is_the_rule_over_the_committed_evidence():
         load_outcomes(_control_a_outcomes_path()),
     )
 
-    assert (SCREENING / SCREENING_VERDICT_FILENAME).read_text() == serialize_screening_verdict(
-        verdict
-    )
+    assert _decision(_committed_verdict()) == _decision(verdict)
 
 
 def test_each_arm_was_screened_in_its_manifest_reasoning_mode():
