@@ -1118,6 +1118,114 @@ class TestSerialPytestShedsEveryXdistOption:
         assert serial_pytest(cmd) is cmd
 
 
+#: The governing addopts shapes, as raw tokens (xdist included) — the input
+#: ``serial_pytest`` receives from ``verify_plan.governing_addopts``.
+_ORCH_SHAPED_ADDOPTS = (
+    '-n', 'auto', '--dist', 'loadgroup', '--max-worker-restart=0', '-m', 'not warm_lane_bash',
+)
+_ROOT_SHAPED_ADDOPTS = (
+    '--import-mode=importlib', '-m', 'not smoke and not integration and not warm_lane_bash',
+)
+_ALL_XDIST_ADDOPTS = ('-n', 'auto', '--dist', 'loadgroup')
+
+
+def _addopts_values(tokens: list[str]) -> list[str]:
+    """Every ``-o addopts=<value>`` value in *tokens*, in argv order."""
+    return [
+        value.removeprefix('addopts=')
+        for flag, value in zip(tokens, tokens[1:], strict=False)
+        if flag == '-o' and value.startswith('addopts=')
+    ]
+
+
+class TestSerialPytestReSuppliesGoverningAddopts:
+    """``serial_pytest(cmd, ini_addopts)`` re-supplies the governing addopts minus xdist.
+
+    A bare ``-o addopts=`` drops the import mode and marker filter along with
+    ``-n auto``, so the recovery run collects and selects a DIFFERENT test set
+    from the run it recovers. The caller hands in the governing config's RAW
+    addopts tokens; the xdist strip is ``serial_pytest``'s, beside the
+    ``-p no:xdist`` that requires it.
+    """
+
+    _STRUCTURED = 'uv run --directory orchestrator pytest tests/ --tb=short -q'
+
+    def _recover(self, command: str, ini_addopts=()) -> str:
+        return render(serial_pytest(parse_config_command(command), ini_addopts))
+
+    def test_xdist_is_stripped_and_the_rest_is_carried_as_one_token(self):
+        tokens = shlex.split(self._recover(self._STRUCTURED, _ORCH_SHAPED_ADDOPTS))
+        assert tokens[-5:] == ['-p', 'no:xdist', '-o', "addopts=-m 'not warm_lane_bash'", 'tests/']
+        assert not xdist_offenders(tokens)
+
+    def test_root_shaped_addopts_are_carried_intact(self):
+        tokens = shlex.split(self._recover(self._STRUCTURED, _ROOT_SHAPED_ADDOPTS))
+        assert _addopts_values(tokens) == [shlex.join(_ROOT_SHAPED_ADDOPTS)]
+
+    def test_all_xdist_addopts_render_the_historical_blank(self):
+        assert self._recover(self._STRUCTURED, _ALL_XDIST_ADDOPTS) == self._recover(self._STRUCTURED)
+        assert self._recover('pytest tests/x.py', _ALL_XDIST_ADDOPTS) == (
+            'pytest -p no:xdist -o addopts= tests/x.py'
+        )
+
+    def test_the_default_is_byte_identical_to_the_historical_recovery(self):
+        assert self._recover('pytest tests/x.py') == 'pytest -p no:xdist -o addopts= tests/x.py'
+        assert self._recover('cd a && pytest t1 && cd ../b && pytest t2') == (
+            "cd a && pytest t1 -p no:xdist -o addopts='' && "
+            "cd ../b && pytest t2 -p no:xdist -o addopts=''"
+        )
+
+    def test_a_raw_chain_carries_the_value_on_every_invocation(self):
+        rendered = self._recover('cd a && pytest t1 && cd ../b && pytest t2', _ORCH_SHAPED_ADDOPTS)
+        suffix = f' -p no:xdist -o {shlex.quote("addopts=-m " + shlex.quote("not warm_lane_bash"))}'
+        assert rendered == f'cd a && pytest t1{suffix} && cd ../b && pytest t2{suffix}'
+        tokens = shlex.split(rendered)
+        assert _addopts_values(tokens) == ["-m 'not warm_lane_bash'"] * 2
+        assert not xdist_offenders(tokens)
+
+    @pytest.mark.parametrize(
+        'command',
+        [
+            pytest.param("pytest -k 'a && b' tests/ && true", id='unspliceable-chain'),
+            pytest.param('pytest -n 4 tests/ && true', id='raw-chain-with-argv-worker-flag'),
+            pytest.param('cargo test --workspace', id='non-pytest'),
+            pytest.param('mypy src/', id='opaque'),
+        ],
+    )
+    def test_refusals_still_return_the_callers_own_command(self, command):
+        cmd = parse_config_command(command)
+        assert serial_pytest(cmd, _ROOT_SHAPED_ADDOPTS) is cmd
+
+    def test_the_rendered_value_survives_a_render_parse_render_round_trip(self):
+        """``-o`` is bound at parse time, so later string rewrites compose on top."""
+        rendered = self._recover(self._STRUCTURED, _ROOT_SHAPED_ADDOPTS)
+        assert render(parse_config_command(rendered)) == rendered
+
+        timed = shlex.split(render(with_pytest_timeout(parse_config_command(rendered), 300)))
+        assert _addopts_values(timed) == [shlex.join(_ROOT_SHAPED_ADDOPTS)]
+        addopts_at = next(i for i, tok in enumerate(timed) if tok.startswith('addopts='))
+        assert timed[addopts_at + 1 : addopts_at + 3] == ['--timeout', '300']
+
+    @pytest.mark.parametrize(
+        'command',
+        [
+            pytest.param('uv run --directory orchestrator pytest tests/', id='structured'),
+            pytest.param('cd a && pytest t1 && cd ../b && pytest t2', id='raw-chain'),
+        ],
+    )
+    def test_the_recovered_command_is_serial_forced(self, command):
+        recovered = serial_pytest(parse_config_command(command), _ORCH_SHAPED_ADDOPTS)
+        assert _is_serial_forced(recovered)
+        assert apply_pytest_numprocesses(recovered, '8') is recovered
+
+    def test_a_cli_marker_filter_still_follows_the_re_supplied_one(self):
+        """pytest prepends addopts to argv and ``-m`` is last-wins, so the CLI ``-m`` wins."""
+        tokens = shlex.split(self._recover('uv run pytest -m warm_lane_bash', _ORCH_SHAPED_ADDOPTS))
+        cli_marker_at = tokens.index('-m')
+        assert tokens[cli_marker_at : cli_marker_at + 2] == ['-m', 'warm_lane_bash']
+        assert _addopts_values(tokens) == ["-m 'not warm_lane_bash'"]
+
+
 class TestRawRewriteDoesNotSwallowSubshellTerminator:
     """The raw-retained rewrite must append INSIDE a subshell, not after its `)`.
 
