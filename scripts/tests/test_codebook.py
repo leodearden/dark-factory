@@ -1366,14 +1366,38 @@ def test_unknown_slugs_are_warned_once_per_run(caplog):
     caplog.set_level(logging.DEBUG, logger="legibility.codebook")
 
     mod.warn_unknown_invariant_slugs(
-        mod.SlugTally(valid=2, rejected=("x", "y", "x")), ("a",), run="r1"
+        mod.SlugTally(valid=2, rejected=("unknown-x", "unknown-y", "unknown-x")),
+        ("a",),
+        run="run-1",
     )
 
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
     assert warnings[0].name == "legibility.codebook"
     message = warnings[0].getMessage()
-    assert "x" in message and "y" in message and "r1" in message
+    assert "run-1" in message
+    assert "stored 3 " in message
+    assert "['unknown-x', 'unknown-y']" in message
+    assert message.count("unknown-x") == 1
+
+
+def test_the_unknown_slug_warning_stays_one_bounded_line(caplog):
+    """The values are LLM free text: a large run must not grow the line without
+    bound, while the count stays exact."""
+    caplog.set_level(logging.DEBUG, logger="legibility.codebook")
+    rejected = tuple(f"free-text-{n:03d}-" + "z" * 1000 for n in range(50))
+
+    mod.warn_unknown_invariant_slugs(
+        mod.SlugTally(rejected=rejected), ("a",), run="run-1"
+    )
+
+    [warning] = [r for r in caplog.records if r.levelno == logging.WARNING]
+    message = warning.getMessage()
+    assert "stored 50 " in message
+    assert "free-text-000-" in message
+    assert "free-text-049-" not in message
+    assert "more" in message
+    assert len(message) < 2000
 
 
 def test_no_unknown_slugs_means_no_warning(caplog):

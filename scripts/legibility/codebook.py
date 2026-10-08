@@ -506,11 +506,28 @@ def screen_invariant_slugs(
     return screened, SlugTally(valid=valid, rejected=tuple(rejected))
 
 
+_MAX_REPORTED_REJECTED_SLUGS = 10
+_MAX_REPORTED_SLUG_CHARS = 80
+
+
+def _bounded_rejected_slugs(rejected: Collection[str]) -> str:
+    """The distinct *rejected* values, sorted, as one bounded rendering: they
+    are LLM free text, so both their number and their length are capped."""
+    distinct = sorted(set(rejected))
+    shown = [
+        value if len(value) <= _MAX_REPORTED_SLUG_CHARS
+        else value[:_MAX_REPORTED_SLUG_CHARS] + "..."
+        for value in distinct[:_MAX_REPORTED_REJECTED_SLUGS]
+    ]
+    hidden = len(distinct) - len(shown)
+    return f"{shown} +{hidden} more" if hidden else f"{shown}"
+
+
 def warn_unknown_invariant_slugs(
     tally: SlugTally, invariant_slugs: Collection[str], *, run: str
 ) -> None:
     """The one WARNING a run emits for its rejected ``invariant_violated``
-    values, if it rejected any."""
+    values, if it rejected any. The count is exact; the values are bounded."""
     if not tally.rejected:
         return
     declared = (
@@ -521,7 +538,7 @@ def warn_unknown_invariant_slugs(
     logger.warning(
         "codebook: run %s stored %d invariant_violated value(s) as absent "
         "because they name no declared invariant slug: %s; declared slugs: %s",
-        run, len(tally.rejected), sorted(set(tally.rejected)), declared,
+        run, len(tally.rejected), _bounded_rejected_slugs(tally.rejected), declared,
     )
 
 
