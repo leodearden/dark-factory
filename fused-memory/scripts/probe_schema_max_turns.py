@@ -23,13 +23,36 @@ the strict empty MCP config, ``--json-schema`` = the ``verification_complete``
 parameters, and ``max_turns=_AGENT_CLI_MAX_TURNS`` (20).
 
 Measured on Claude CLI 2.1.293, alias ``sonnet`` served as
-``claude-sonnet-5-5``, 2026-10-07, ``--repeat 12`` at the production cap, one
-pool account (max-c; four were usage-capped and two failed auth that day),
-BEFORE ``--setting-sources ''``, so with the root's CLAUDE.md loaded:
+``claude-sonnet-5-5``, ``--repeat 12`` at the production cap:
 
+    2026-10-08, the shape above, two pool accounts (max-f, max-c; three were
+    usage-capped and two failed auth that day):
+    recon-verify  max_turns=20 -> 12/12 ok   num_turns 4-6
+                  slowest 21s of the 180s timeout (others 12-18s)
+                  unregistered_tool_calls 0   api_refusal 0   error_max_turns 0
+
+    2026-10-07, BEFORE ``--setting-sources ''`` (so with the root's CLAUDE.md
+    loaded), one pool account (max-c; four were usage-capped and two failed
+    auth that day):
     recon-verify  max_turns=20 -> 12/12 ok   num_turns 5 on every run
                   slowest 41s of the 180s timeout (others 12-22s)
                   unregistered_tool_calls 0   api_refusal 0   error_max_turns 0
+
+Judge shape, first baseline (``--shape judge``, captured from
+``Judge.review_run()`` over the synthetic run in ``_synthetic_judge_run``):
+2026-10-08, same CLI, model and accounts as above, ``--repeat 12``:
+
+    judge         max_turns=3  -> 12/12 ok   num_turns 2-4
+                  slowest 76s of the 600s timeout (others 10-16s)
+                  unregistered_tool_calls 9, spread over 8 of the 12 runs
+                  api_refusal 0   error_max_turns 0
+
+The judge's registry is empty (``--tools ''``), so every unregistered call
+is one the CLI rejected.  Four ad-hoc re-runs of the same captured shape
+named them: native ``Grep`` calls ("No such tool available: Grep") in 2 of
+the 4, searching for names the synthetic run's journal reasoning cites.
+Each run still delivered its verdict.  The synthetic reasoning cites file
+names, so it may invite more such calls than production runs do.
 
 Permission facts
 ----------------
@@ -113,8 +136,6 @@ Task 4344 architect STEP 0, CLI 2.1.287, sonnet (2026-10-02):
   pseudo-tool calls, so the attractor survived the cap raise.
 * the planned native shape at mt=20: 3/3 runs that reached the model, 4-8
   turns, 5-16s, zero rejected calls, zero denials.
-
-The judge's shape (``--shape judge``) has no recorded baseline yet.
 
 Task 6022: reasoning_extraction refusals
 ----------------------------------------
