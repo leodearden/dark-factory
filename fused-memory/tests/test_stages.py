@@ -52,6 +52,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
 from fused_memory.reconciliation.live_workflow_section import NO_PER_TASK_SIGNAL_TOKEN
 from fused_memory.reconciliation.prompts import (
     ESCALATION_BOUNDARY_NOTE,
+    FLAG_FOR_STAGE2_MARKER_KIND,
     render_escalation_boundary_note,
 )
 from fused_memory.reconciliation.prompts.stage1 import STAGE1_SYSTEM_PROMPT
@@ -9680,6 +9681,66 @@ class TestFlagForStage2TasklessRetirement:
         assert hook_deleted == {'cites-T'}
         assert sweep_deleted == {'taskless', 'cites-T'}
         assert hook_deleted <= sweep_deleted
+
+    @pytest.mark.asyncio
+    async def test_taskless_marker_declaring_the_marker_kind_is_retired(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
+        )
+        pool = LiveFlagPool([
+            _relay_marker('marker-kind', ceiling + 1, kind=FLAG_FOR_STAGE2_MARKER_KIND),
+        ])
+
+        await _sweep_stale_mem0_flag_for_stage2_markers(
+            pool, 'dark_factory', 'cycle-run', terminal_task_ids={'T'}, now=_RETIRE_NOW,
+        )
+
+        assert pool.deleted_ids() == ['marker-kind']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'kind',
+        [
+            'stage1_flag',
+            'stage1_flag_suppression_exempt_finding',
+            'consolidation_gate_request',
+            pytest.param([FLAG_FOR_STAGE2_MARKER_KIND], id='list-valued-marker-kind'),
+        ],
+    )
+    async def test_taskless_marker_declaring_a_foreign_kind_is_kept_at_any_age(self, kind):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
+        )
+        pool = LiveFlagPool([_relay_marker('foreign-kind', 10 * ceiling, kind=kind)])
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            pool, 'dark_factory', 'cycle-run', terminal_task_ids={'T'}, now=_RETIRE_NOW,
+        )
+
+        assert result == 0
+        assert pool.deleted_ids() == []
+
+    @pytest.mark.asyncio
+    async def test_taskless_member_with_non_dict_metadata_is_kept(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
+        )
+        memory_service = AsyncMock()
+        memory_service.count_memories_by_metadata = AsyncMock(return_value=1)
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=[{
+            'id': 'odd',
+            'created_at': (_RETIRE_NOW - timedelta(days=10 * ceiling)).isoformat(),
+            'metadata': None,
+        }])
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            memory_service, 'dark_factory', 'cycle-run',
+            terminal_task_ids={'T'}, now=_RETIRE_NOW,
+        )
+
+        assert result == 0
+        memory_service.delete_memory.assert_not_awaited()
 
 
 class TestWarnOnFlagForStage2TypeDrift:
