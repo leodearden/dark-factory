@@ -7115,10 +7115,11 @@ async def run_verification(
         logger.warning(
             'Verification hit an environmental shared-venv transient '
             '(vanished xdist/pip); retrying test command once, forced serial '
-            '(this clears all pyproject addopts, including any marker '
-            'filters, for the recovery run — see serial_pytest)'
+            '(xdist options removed; the governing pyproject\'s other addopts '
+            '— import mode, marker filters — are re-supplied, or addopts is '
+            'blanked when none can be resolved — see serial_pytest)'
         )
-        recovered_test_cmd = _serial_pytest_str(attempt.test.cmd)
+        recovered_test_cmd = _serial_pytest_str(attempt.test.cmd, invocation_dir=worktree)
         new_test = await _run_or_skip_timed(
             recovered_test_cmd, label='test', current_attempt=current_attempt_id,
         )
@@ -9365,8 +9366,8 @@ async def run_main_tip_sweep(
 # 2370). A PASS on ANY attempt within this bound is treated as a confirmed
 # flake for that group — mirrors run_main_tip_sweep's single-retry heuristic,
 # widened slightly since this re-run is already scoped to just the named
-# tests (cheap) and serial/addopts-cleared (task 2045's proven xdist-
-# contention recovery). No config flag: the gate is a strict fail-safe
+# tests (cheap) and serial with xdist stripped from addopts (task 2045's
+# proven xdist-contention recovery). No config flag: the gate is a strict fail-safe
 # improvement over the status quo (a bare, unconfirmed alarm), so it is
 # always-on.
 _SWEEP_CONFIRM_MAX_ATTEMPTS = 2
@@ -9375,8 +9376,8 @@ _SWEEP_CONFIRM_MAX_ATTEMPTS = 2
 #: CONFIRM gate's isolated re-run command via ``_with_pytest_timeout_str``.
 #: Same rationale as ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS`` /
 #: ``_SWEEP_PREFILTER_TIMEOUT_SECS``: the serial recovery's ``-o addopts=``
-#: clears pyproject ``addopts`` but NOT the
-#: ``[tool.pytest.ini_options] timeout=60`` default, so without this
+#: overrides only pyproject ``addopts``, NOT the
+#: ``[tool.pytest.ini_options] timeout`` default, so without this
 #: explicit override a still-loaded host can starve the isolated confirm
 #: run into a false "still fails" verdict — and unlike the merge gate
 #: (which only holds a merge), a false verdict HERE files a red-main L1.
@@ -9659,8 +9660,8 @@ def _group_node_ids_by_subproject(
 #: Generous per-test timeout (seconds) injected into the main-tip-sweep
 #: isolated PRE-FILTER's re-run command via ``_with_pytest_timeout_str``.
 #: Same rationale as ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS``: the serial
-#: recovery's ``-o addopts=`` clears pyproject ``addopts`` but NOT the
-#: ``[tool.pytest.ini_options] timeout=60`` default, so without this explicit
+#: recovery's ``-o addopts=`` overrides only pyproject ``addopts``, NOT the
+#: ``[tool.pytest.ini_options] timeout`` default, so without this explicit
 #: override a still-loaded host could starve the isolated run into a false
 #: "reproduces" verdict. Kept as a SEPARATE constant from the merge gate's so
 #: sweep tuning is not coupled to merge-gate tuning (they are retuned on
@@ -9742,6 +9743,7 @@ async def _sweep_failure_reproduces_in_isolation(
             scoped_cmd = _with_pytest_timeout_str(
                 _serial_pytest_str(
                     _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+                    invocation_dir=worktree,
                 ),
                 _SWEEP_PREFILTER_TIMEOUT_SECS,
             )
@@ -9802,8 +9804,8 @@ async def confirm_main_tip_failure_is_real(
     the sweep's own contended worktree.
 
     The ``--timeout`` (``_SWEEP_CONFIRM_TIMEOUT_SECS``, task 3290) is not
-    cosmetic: ``-o addopts=`` clears pyproject's ``addopts`` but NOT its
-    ``[tool.pytest.ini_options] timeout=60`` default, so without the
+    cosmetic: ``-o addopts=`` overrides only pyproject's ``addopts``, NOT its
+    ``[tool.pytest.ini_options] timeout`` default, so without the
     override a still-loaded host could starve this confirmation into a
     false "still fails" verdict — which here means filing a red-main L1
     escalation for a flake, the exact false positive this gate exists to
@@ -9930,6 +9932,7 @@ async def confirm_main_tip_failure_is_real(
             scoped_cmd = _with_pytest_timeout_str(
                 _serial_pytest_str(
                     _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+                    invocation_dir=tmp_path,
                 ),
                 _SWEEP_CONFIRM_TIMEOUT_SECS,
             )
@@ -9982,8 +9985,8 @@ async def confirm_main_tip_failure_is_real(
 #: Generous per-test timeout (seconds) injected into the α confirm gate's
 #: isolated re-run command via ``_with_pytest_timeout_str``. Must comfortably
 #: exceed any legitimate single-test wall time: the serial recovery's
-#: ``-o addopts=`` clears pyproject ``addopts`` but NOT the
-#: ``[tool.pytest.ini_options] timeout=60`` default, so without this explicit
+#: ``-o addopts=`` overrides only pyproject ``addopts``, NOT the
+#: ``[tool.pytest.ini_options] timeout`` default, so without this explicit
 #: override the isolated confirm re-run could itself starve under residual load
 #: into a false non-suppression. A tunable (PRD §9).
 _MERGE_FLAKE_CONFIRM_TIMEOUT_SECS = 300
@@ -9992,8 +9995,8 @@ _MERGE_FLAKE_CONFIRM_TIMEOUT_SECS = 300
 #: gate's isolated re-run command via ``_with_pytest_timeout_str``. A
 #: SEPARATE constant from ``_SWEEP_CONFIRM_TIMEOUT_SECS`` /
 #: ``_MERGE_FLAKE_CONFIRM_TIMEOUT_SECS`` so the three are retuned on their own
-#: signals. Same rationale as both: ``-o addopts=`` clears pyproject
-#: ``addopts`` but NOT the ``[tool.pytest.ini_options] timeout=60`` default,
+#: signals. Same rationale as both: ``-o addopts=`` overrides only pyproject
+#: ``addopts``, NOT the ``[tool.pytest.ini_options] timeout`` default,
 #: so without this explicit override a still-loaded host can starve the
 #: isolated confirm run into a false "still fails" verdict — and here that
 #: false verdict would mean a false red-main verdict (BLOCKED awaiting a
@@ -10468,9 +10471,10 @@ async def confirm_isolated_rerun_verdict(
 
     SERIAL + ISOLATED + GENEROUS TIMEOUT (INV-4): each subproject group is
     re-run through ``_with_pytest_timeout_str(_serial_pytest_str(
-    _scope_to_keyword(...)), policy.timeout_secs)`` with ``lint_command`` and
-    ``type_check_command`` nulled, so only the named tests run, serially,
-    without pyproject ``addopts`` or its 60s per-test default.
+    _scope_to_keyword(...), invocation_dir=worktree), policy.timeout_secs)``
+    with ``lint_command`` and ``type_check_command`` nulled, so only the named
+    tests run, serially, under the governing pyproject ``addopts`` minus xdist
+    and an explicit ``--timeout`` in place of its ini per-test default.
 
     At the merge gate (``policy.refuses_partially_measured_sessions``) no
     re-run is attempted when the failing session left tests unmeasured: a
@@ -10689,6 +10693,7 @@ async def confirm_isolated_rerun_verdict(
             scoped_cmd = _with_pytest_timeout_str(
                 _serial_pytest_str(
                     _scope_to_keyword(mc.test_command, 'pytest', group_node_ids),
+                    invocation_dir=worktree,
                 ),
                 policy.timeout_secs,
             )
