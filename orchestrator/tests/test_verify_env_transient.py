@@ -291,14 +291,15 @@ class TestRunVerificationEnvRecovery:
     async def test_env_transient_recovery_logs_addopts_clearing_note(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
-        """Amendment regression (reviewer_comprehensive robustness_false_signal,
-        verify.py:637): serial_pytest's `-o addopts=` clears ALL
-        pyproject addopts, not just `-n auto` — including any marker filters
-        (e.g. `-m 'not integration'`) — so the single recovery run can
-        exercise a materially different test selection than the original.
-        At minimum this must be observable in the log so an operator
-        investigating a recovery-path result knows a broader test selection
-        may have run.
+        """The recovery WARNING says what happens to the pyproject addopts.
+
+        serial_pytest's `-o addopts=<value>` replaces the ini addopts: it
+        re-supplies the governing config's import mode and marker filters
+        minus xdist, or blanks addopts when none can be resolved — in which
+        case the single recovery run can exercise a broader test selection
+        than the original. An operator investigating a recovery-path result
+        must be able to read which from the log (task 5079; originally
+        reviewer_comprehensive robustness_false_signal).
         """
         import logging
 

@@ -10,24 +10,38 @@ side, and its derive-don't-restate rule governs this module too: every
 expected token is read from the real ``pyproject.toml`` files and every
 command from the real module configs, never restated.
 
-This module is the DRIFT GUARD against the real repo — the resolver agrees
+Two halves. The DRIFT GUARD runs against the real repo: the resolver agrees
 with pytest's own config discovery for every module command, scoped and
-unscoped, and the rewrite drops nothing but xdist.
+unscoped, and the rewrite drops nothing but xdist. The WIRING tests drive
+each serial-recovery call site against a real tmp tree and check it passes
+the directory its command runs in, so none is left on the blanking default.
 """
 
 from __future__ import annotations
 
+import asyncio
 import shlex
 import tomllib
 from functools import cache
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
+import pytest
 from _pytest.config.findpaths import determine_setup
 from _verify_config_corpus import DF_CONFIG_PATH, REPO_ROOT, load_config_scalar
 from test_verify_cmd import xdist_offenders
+from test_verify_env_transient import _XDIST_VANISHED_OUTPUT
+from test_verify_main_tip_sweep import MAIN_SHA, _make_confirm_fake_run, _make_git_ops
+from test_verify_merge_flake_suppression import _failing, _make_config, _result
 
-from orchestrator import verify_plan
-from orchestrator.config import _discover_module_configs
-from orchestrator.verify import _scope_to_keyword, _serial_pytest_str, _worktree_reader
+from orchestrator import verify, verify_plan
+from orchestrator.config import ModuleConfig, OrchestratorConfig, _discover_module_configs
+from orchestrator.verify import (
+    VerifyResult,
+    _scope_to_keyword,
+    _serial_pytest_str,
+    _worktree_reader,
+)
 from orchestrator.verify_cmd import parse_config_command
 
 #: Modules whose governing config carries a marker filter or an import mode,
@@ -185,3 +199,140 @@ class TestSerialRecoveryPreservesTheGoverningAddopts:
         assert {
             value for flag, value in zip(tokens, tokens[1:], strict=False) if flag == '-o'
         } == {'addopts='}
+
+
+# ---------------------------------------------------------------------------
+# WIRING: each serial-recovery call site passes the directory its command runs in.
+# ---------------------------------------------------------------------------
+
+_ROOT_SHAPED_PYPROJECT = (
+    '[tool.pytest.ini_options]\n'
+    'addopts = "--import-mode=importlib -m \'not smoke and not integration and not warm_lane_bash\'"\n'
+)
+_SUB_SHAPED_PYPROJECT = (
+    '[tool.pytest.ini_options]\n'
+    'addopts = "-n auto --dist loadgroup --max-worker-restart=0 -m \'not warm_lane_bash\'"\n'
+)
+_SUB_ADDOPTS = "-m 'not warm_lane_bash'"
+_ROOT_ADDOPTS = "--import-mode=importlib -m 'not smoke and not integration and not warm_lane_bash'"
+_SUB_NODE_ID = 'sub/tests/test_x.py::test_t'
+
+#: A worktree with a root-shaped root config and an orchestrator-shaped ``sub``
+#: module (discoverable through its own ``orchestrator.yaml``).
+_TREE_LAYOUT = {
+    'pyproject.toml': _ROOT_SHAPED_PYPROJECT,
+    'sub/pyproject.toml': _SUB_SHAPED_PYPROJECT,
+    'sub/orchestrator.yaml': 'test_command: "uv run --directory sub pytest tests/ --tb=short -q"\n',
+    'sub/tests/test_x.py': 'def test_t():\n    pass\n',
+}
+
+
+def _write_tree(root: Path) -> Path:
+    for relpath, content in _TREE_LAYOUT.items():
+        path = root / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding='utf-8')
+    return root
+
+
+def _sub_module_config(test_command: str = 'uv run --directory sub pytest tests/ --tb=short -q'):
+    return ModuleConfig(prefix='sub', test_command=test_command)
+
+
+def _assert_carries_sub_config(command: str) -> None:
+    assert _rendered_addopts_value(command) == _SUB_ADDOPTS, command
+    tokens = shlex.split(command)
+    assert not xdist_offenders(tokens), command
+    assert sum(token.startswith('addopts=') for token in tokens) == 1, command
+
+
+def _failing_on_the_sub_node() -> VerifyResult:
+    return _failing(f'FAILED {_SUB_NODE_ID}\n1 failed, 10 passed in 1.00s\n')
+
+
+@pytest.mark.asyncio
+class TestEnvTransientRecoveryWiring:
+    """``run_verification``'s ENV_TRANSIENT retry resolves the config of the command it re-runs."""
+
+    @staticmethod
+    async def _recovery_command(worktree: Path, config: OrchestratorConfig, module_config) -> str:
+        invoked: list[str] = []
+
+        async def fake_cmd(cmd, cwd, timeout, env=None, log_path=None, **kwargs):
+            invoked.append(cmd)
+            if 'pytest' in cmd and 'no:xdist' not in cmd:
+                return 4, _XDIST_VANISHED_OUTPUT, False
+            return 0, '', False
+
+        with patch('orchestrator.verify._run_cmd', side_effect=fake_cmd):
+            result = await verify.run_verification(worktree, config, module_config)
+
+        assert result.passed is True, result
+        recoveries = [c for c in invoked if 'pytest' in c and 'no:xdist' in c]
+        assert len(recoveries) == 1, invoked
+        return recoveries[0]
+
+    @staticmethod
+    def _config(worktree: Path) -> OrchestratorConfig:
+        return OrchestratorConfig(
+            project_root=worktree,
+            test_command='uv run pytest tests/',
+            lint_command='echo lint',
+            type_check_command='echo type',
+        )
+
+    async def test_a_scoped_cwd_stripped_module_run_recovers_with_its_own_config(self, tmp_path):
+        """The FILE_SCOPED shape; the root's three-clause ``-m`` would be strictly worse than blank."""
+        worktree = _write_tree(tmp_path)
+        recovery = await self._recovery_command(
+            worktree, self._config(worktree),
+            _sub_module_config('uv run --project sub pytest sub/tests/test_x.py --tb=short -q'),
+        )
+        _assert_carries_sub_config(recovery)
+
+    async def test_a_run_without_a_module_config_recovers_with_the_root_config(self, tmp_path):
+        worktree = _write_tree(tmp_path)
+        recovery = await self._recovery_command(worktree, self._config(worktree), None)
+        assert _rendered_addopts_value(recovery) == _ROOT_ADDOPTS
+
+
+class TestScopedConfirmSitesWiring:
+    """The sweep prefilter, main-tip confirm and flake engine each resolve the scoped command's config."""
+
+    def test_the_sweep_prefilter(self, tmp_path):
+        worktree = _write_tree(tmp_path)
+        rv = AsyncMock(return_value=_result(True))
+        with patch.object(verify, 'run_verification', rv):
+            asyncio.run(verify._sweep_failure_reproduces_in_isolation(
+                worktree, _make_config(worktree), _failing_on_the_sub_node(),
+            ))
+        rv.assert_awaited_once()
+        _assert_carries_sub_config(rv.call_args.args[2].test_command)
+
+    def test_the_main_tip_confirm(self, tmp_path):
+        config = _make_config(tmp_path)
+        rv = AsyncMock(return_value=_result(True))
+        with (
+            patch('orchestrator.git_ops._run', side_effect=_make_confirm_fake_run([], _TREE_LAYOUT)),
+            patch.object(verify, 'run_verification', rv),
+        ):
+            asyncio.run(verify.confirm_main_tip_failure_is_real(
+                config, _make_git_ops(tmp_path), _failing_on_the_sub_node(), main_sha=MAIN_SHA,
+            ))
+        rv.assert_awaited_once()
+        _assert_carries_sub_config(rv.call_args.args[2].test_command)
+
+    def test_the_merge_flake_engine(self, tmp_path):
+        worktree = _write_tree(tmp_path)
+        rv = AsyncMock(return_value=_result(True))
+        with patch.object(verify, 'run_verification', rv):
+            asyncio.run(verify.confirm_merge_verify_flake_suppressible(
+                _make_config(worktree), _failing_on_the_sub_node(),
+                worktree=worktree, module_configs=[_sub_module_config()],
+            ))
+        rv.assert_awaited_once()
+        command = rv.call_args.args[2].test_command
+        _assert_carries_sub_config(command)
+        tokens = shlex.split(command)
+        addopts_at = next(i for i, token in enumerate(tokens) if token.startswith('addopts='))
+        assert tokens[addopts_at + 1] == '--timeout', command
