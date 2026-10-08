@@ -241,7 +241,7 @@ class TestAllCappedParkIsVisible:
         so the bound cannot be satisfied merely by the wait period being long:
         the loop demonstrably ran many more times than the heartbeat fired.
         """
-        interval = fast_heartbeat(0.05)
+        interval = fast_heartbeat(0.5)
         gate = _all_capped_gate()
 
         async def _wake_repeatedly() -> None:
@@ -249,13 +249,13 @@ class TestAllCappedParkIsVisible:
                 gate._open.set()
                 await asyncio.sleep(0.001)
 
-        # The park is driven to a target pass COUNT, not a wall-clock budget,
-        # so the flood exists by construction however much CPU the host spared.
-        # The deadline is only a runaway backstop; hitting it skips, because a
-        # host that could not build the flood has proven nothing either way.
+        # A correct throttle emits at most duration/interval + 1 heartbeats
+        # however slow the host, so a run is evidence only when passes exceed
+        # that budget; the pass target and a 0.5s interval make that the
+        # normal case, and a host too slow to clear it skips.
         target_passes = 200
-        deadline = time.monotonic() + 30.0
         started = time.monotonic()
+        deadline = started + 30.0
 
         waker = asyncio.create_task(_wake_repeatedly())
         parked = asyncio.create_task(gate.before_invoke())
@@ -274,13 +274,16 @@ class TestAllCappedParkIsVisible:
 
         heartbeats = len(_park_records(caplog))
         passes = _loop_passes(caplog)
+        heartbeat_budget = math.ceil(duration / interval) + 2
 
-        if passes < target_passes:
+        if passes <= heartbeat_budget:
             pytest.skip(
-                f'only {passes} loop passes in {duration:.1f}s: the host could '
-                'not build the flood this test exists to bound'
+                f'only {passes} loop passes in {duration:.1f}s, no more than the '
+                f'{heartbeat_budget} heartbeats a {interval}s throttle may emit in '
+                'that time: the host never woke the loop faster than the '
+                'throttle, so there was no flood to bound'
             )
-        assert heartbeats <= math.ceil(duration / interval) + 2, (
+        assert heartbeats <= heartbeat_budget, (
             f'{heartbeats} heartbeats across {duration}s at a {interval}s '
             f'interval — the log rate must be bounded by the interval, not by '
             f'how often the loop happens to wake ({passes} passes)'
