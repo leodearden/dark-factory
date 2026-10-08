@@ -207,6 +207,7 @@ if TYPE_CHECKING:
 try:
     from escalation.queue import EscalationQueue
     from escalation.server import create_server
+    from escalation.store_identity import StoreIdentity
     HAS_ESCALATION = True
 except ImportError:
     HAS_ESCALATION = False
@@ -12854,6 +12855,12 @@ class Harness:
             task_status_lookup=self._build_task_status_lookup(),
             task_claimant_lookup=self._build_task_claimant_lookup(),
             merge_inflight_registry=self._merge_inflight_registry,
+            store_identity=StoreIdentity(  # type: ignore[possibly-unbound]
+                kind='project',
+                queue_dir=self._escalation_queue.queue_dir,
+                project_id=self.config.fused_memory.project_id,
+                project_root=self.config.project_root,
+            ),
         )
         host = self.config.escalation.host
         port = self.config.escalation.port
