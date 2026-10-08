@@ -10,6 +10,7 @@ from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from _serial_recovery_helpers import ORCH_SHAPED_PYPROJECT, ROOT_SHAPED_PYPROJECT, addopts_values
 from _xdist_crash_fixtures import (
     XDIST_BAILOUT_WITH_STOPPED_PROGRESS_OUTPUT,
     XDIST_CRASH_ATTRIBUTED_FAILED_LINE,
@@ -10698,7 +10699,7 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
         from orchestrator.verify import _serial_pytest_str
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            result = _serial_pytest_str(self._REFUSED)
+            result = _serial_pytest_str(self._REFUSED, invocation_dir=None)
 
         assert result is self._REFUSED, "the no-op must return the caller's own string"
         records = [r for r in caplog.records if r.name == 'orchestrator.verify']
@@ -10732,7 +10733,7 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
 
         cmd = 'echo "pytest" && true'
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            assert _serial_pytest_str(cmd) is cmd
+            assert _serial_pytest_str(cmd, invocation_dir=None) is cmd
 
         records = [r for r in caplog.records if r.name == 'orchestrator.verify']
         assert len(records) == 1
@@ -10804,7 +10805,7 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
         from orchestrator.verify import _serial_pytest_str
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.verify'):
-            _serial_pytest_str(cmd)
+            _serial_pytest_str(cmd, invocation_dir=None)
 
         assert [r.message for r in caplog.records if r.name == 'orchestrator.verify'] == []
 
@@ -10820,39 +10821,19 @@ class TestSerialPytestStrRefusedRewriteIsLogged:
 
         from orchestrator.verify import _serial_pytest_str
 
-        result = _serial_pytest_str(ROOT_TEST_COMMAND)
+        result = _serial_pytest_str(ROOT_TEST_COMMAND, invocation_dir=None)
         assert result is not None
         assert result is not ROOT_TEST_COMMAND
         assert 'no:xdist' in result
 
 
-_ROOT_SHAPED_PYPROJECT = (
-    '[tool.pytest.ini_options]\n'
-    'addopts = "--import-mode=importlib -m \'not smoke and not integration and not warm_lane_bash\'"\n'
-)
-_SUB_SHAPED_PYPROJECT = (
-    '[tool.pytest.ini_options]\n'
-    'addopts = "-n auto --dist loadgroup --max-worker-restart=0 -m \'not warm_lane_bash\'"\n'
-)
-
-
 def _write_serial_recovery_tree(root: Path) -> Path:
     """A real tree: a root-shaped root config and an orchestrator-shaped ``sub``."""
-    (root / 'pyproject.toml').write_text(_ROOT_SHAPED_PYPROJECT, encoding='utf-8')
+    (root / 'pyproject.toml').write_text(ROOT_SHAPED_PYPROJECT, encoding='utf-8')
     (root / 'sub' / 'tests').mkdir(parents=True)
-    (root / 'sub' / 'pyproject.toml').write_text(_SUB_SHAPED_PYPROJECT, encoding='utf-8')
+    (root / 'sub' / 'pyproject.toml').write_text(ORCH_SHAPED_PYPROJECT, encoding='utf-8')
     (root / 'sub' / 'tests' / 'test_x.py').write_text('def test_t():\n    pass\n', encoding='utf-8')
     return root
-
-
-def _serial_addopts_values(rendered: str) -> list[str]:
-    """Every ``-o addopts=<value>`` value of *rendered*, in argv order."""
-    tokens = shlex.split(rendered)
-    return [
-        value.removeprefix('addopts=')
-        for flag, value in zip(tokens, tokens[1:], strict=False)
-        if flag == '-o' and value.startswith('addopts=')
-    ]
 
 
 class TestSerialPytestStrReSuppliesGoverningAddopts:
@@ -10869,7 +10850,7 @@ class TestSerialPytestStrReSuppliesGoverningAddopts:
         tree = _write_serial_recovery_tree(tmp_path)
         rendered = _serial_pytest_str('uv run --directory sub pytest tests/', invocation_dir=tree)
         assert rendered is not None
-        assert _serial_addopts_values(rendered) == ["-m 'not warm_lane_bash'"]
+        assert addopts_values(shlex.split(rendered)) == ["-m 'not warm_lane_bash'"]
         assert not any(
             token in rendered for token in ('-n auto', '--dist', '--max-worker-restart')
         ), rendered
@@ -10882,7 +10863,7 @@ class TestSerialPytestStrReSuppliesGoverningAddopts:
             'uv run --project sub pytest sub/tests/test_x.py::T::t', invocation_dir=tree,
         )
         assert rendered is not None
-        assert _serial_addopts_values(rendered) == ["-m 'not warm_lane_bash'"]
+        assert addopts_values(shlex.split(rendered)) == ["-m 'not warm_lane_bash'"]
 
     def test_a_root_targeted_command_carries_the_root_config(self, tmp_path):
         from orchestrator.verify import _serial_pytest_str
@@ -10890,14 +10871,24 @@ class TestSerialPytestStrReSuppliesGoverningAddopts:
         tree = _write_serial_recovery_tree(tmp_path)
         rendered = _serial_pytest_str('uv run pytest tests/', invocation_dir=tree)
         assert rendered is not None
-        assert _serial_addopts_values(rendered) == [
+        assert addopts_values(shlex.split(rendered)) == [
             "--import-mode=importlib -m 'not smoke and not integration and not warm_lane_bash'",
         ]
+
+    def test_every_caller_must_name_the_invocation_dir(self):
+        """Required and keyword-only, so a new call site cannot silently fall back to the blank."""
+        import inspect
+
+        from orchestrator.verify import _serial_pytest_str
+
+        parameter = inspect.signature(_serial_pytest_str).parameters['invocation_dir']
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is inspect.Parameter.empty
 
     def test_no_invocation_dir_is_the_historical_blank(self, tmp_path):
         from orchestrator.verify import _serial_pytest_str
 
-        assert _serial_pytest_str('uv run --directory sub pytest tests/') == (
+        assert _serial_pytest_str('uv run --directory sub pytest tests/', invocation_dir=None) == (
             'cd sub && uv run pytest -p no:xdist -o addopts= tests/'
         )
 

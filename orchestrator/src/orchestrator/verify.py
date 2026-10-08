@@ -1771,33 +1771,19 @@ def _should_archive_category(category: str) -> bool:
     return should_archive(category)
 
 
-def _serial_pytest_str(cmd: str | None, invocation_dir: Path | None = None) -> str | None:
+def _serial_pytest_str(cmd: str | None, *, invocation_dir: Path | None) -> str | None:
     """Rewrite every ``pytest`` invocation in *cmd* to run serially, via VerifyCmd.
 
     Thin string-level wrapper around ``parse_config_command`` ->
-    ``serial_pytest`` -> ``render`` (replaces ``_force_serial_pytest``):
-    appends `` -p no:xdist -o addopts=<value>`` to a structured PYTEST
-    command's flags, or — for a raw-retained ``&&``-chain — to every
-    ``pytest`` invocation's arguments via ``serial_pytest``'s localised regex
-    rewrite. This is the recovery task 2045 proved for a shared-venv-mutation
-    transient, applied structurally rather than by gambling on the concurrent
-    ``uv sync`` window having closed. ``-p no:xdist`` disables the xdist
-    plugin outright and is safe even when xdist is already absent from the
-    venv.
-
-    ``-o addopts=<value>`` RE-SUPPLIES the addopts of the config pytest will
-    read for THIS command — resolved by pytest's own walk from
-    *invocation_dir*, the directory the command runs in
-    (``verify_plan.py::governing_addopts``) — with every xdist option removed,
-    so task 2045's ``-n auto`` removal still holds while the import mode and
-    marker filter survive. Blanking them instead was measured to change what
-    the recovery runs: on the ``scripts`` leg the blank collected with two
-    import-file-mismatch errors (esc-4377-3), and on ``shared`` (2026-10-08) it
-    collected 6939 items against the primary run's 6928/6939 (11 integration
-    tests deselected) — the 646s-vs-197-296s recovery the operator fold-in
-    recorded. ``invocation_dir=None`` is the historical blank
-    ``-o addopts=``. A raw ``&&`` chain also gets the blank, since one suffix
-    serves clauses that each read their own config — a documented under-fire.
+    ``serial_pytest`` -> ``render`` (replaces ``_force_serial_pytest``): the
+    recovery task 2045 proved for a shared-venv-mutation transient, applied
+    structurally rather than by gambling on the concurrent ``uv sync`` window
+    having closed. What the rewrite appends, and which addopts it keeps, is
+    ``verify_cmd.py::serial_pytest``'s contract. This wrapper supplies its
+    *ini_addopts*: those of the config pytest reads for *cmd* run from
+    *invocation_dir* (``verify_plan.py::governing_addopts``). Every caller
+    must name that directory; ``None`` resolves no config, so addopts are
+    blanked.
 
     Returns *cmd* unchanged when it is ``None`` or does not parse/chain into
     a PYTEST ToolKind (e.g. a ``cargo test --workspace`` command — covers
@@ -1834,7 +1820,7 @@ def _serial_pytest_str(cmd: str | None, invocation_dir: Path | None = None) -> s
     if cmd is None:
         return None
     parsed = parse_config_command(cmd)
-    ini_addopts = verify_plan.governing_addopts(cmd, _worktree_reader(invocation_dir))
+    ini_addopts = verify_plan.governing_addopts(parsed, _worktree_reader(invocation_dir))
     rewritten = serial_pytest(parsed, ini_addopts)
     if rewritten is parsed:
         if parsed.tool is ToolKind.PYTEST and parsed.raw is not None:
@@ -7112,14 +7098,13 @@ async def run_verification(
         and attempt.test.cmd is not None
         and attempt.test.rc != 0
     ):
+        recovered_test_cmd = _serial_pytest_str(attempt.test.cmd, invocation_dir=worktree)
         logger.warning(
             'Verification hit an environmental shared-venv transient '
-            '(vanished xdist/pip); retrying test command once, forced serial '
-            '(xdist options removed; the governing pyproject\'s other addopts '
-            '— import mode, marker filters — are re-supplied, or addopts is '
-            'blanked when none can be resolved — see serial_pytest)'
+            '(vanished xdist/pip); retrying test command once, forced serial, '
+            'with the addopts verify_cmd.py::serial_pytest keeps: %s',
+            recovered_test_cmd,
         )
-        recovered_test_cmd = _serial_pytest_str(attempt.test.cmd, invocation_dir=worktree)
         new_test = await _run_or_skip_timed(
             recovered_test_cmd, label='test', current_attempt=current_attempt_id,
         )
@@ -10188,9 +10173,9 @@ def _loadavg1_or_none(loadavg: Callable[[], tuple[float, float, float]]) -> 'flo
 # DELIBERATELY NARROWER than ``verify_cmd._XDIST_OPTIONS``, and not a
 # drifting copy of it: that set is xdist's whole option surface, which a serial
 # recovery must SHED, so it also carries ``--dist`` (a distribution MODE),
-# ``--maxprocesses`` (a CAP) and more. None of those is a worker count, and reporting either one's value as ``n_flag``
-# would put a fabricated count in the corpus this stamp exists to make
-# trustworthy. Both members here are also ``_PYTEST_VALUE_FLAGS`` members, so
+# ``--maxprocesses`` (a CAP) and more. None of those is a worker count, and
+# reporting any one's value as ``n_flag`` would put a fabricated count in the
+# corpus this stamp exists to make trustworthy. Both members here are also ``_PYTEST_VALUE_FLAGS`` members, so
 # the pair-binding walk below needs no special case for them;
 # test_verify_load_stamp.py asserts BOTH containments, so the narrowing stays a
 # stated choice rather than becoming drift the day either set moves.

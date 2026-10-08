@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _orch_helpers import pydantic_spec
+from _serial_recovery_helpers import ORCH_SHAPED_PYPROJECT
 from pydantic import ValidationError
 from shared.testing_virtual_clock import virtual_clock_test
 
@@ -1477,7 +1478,7 @@ async def test_default_confirm_command_serializes_and_extracts_node_ids(tmp_path
     extracts still-failing pytest node-ids from FULL stdout.
 
     Reuses the reify-side confirm primitives (PRD sec 5): _serial_pytest_str
-    rewrites the command serial (-p no:xdist -o addopts=), and
+    rewrites the command serial (-p no:xdist -o addopts=<value>), and
     _extract_failing_test_ids pulls the FAILED/ERROR node-ids. cwd/env mirror
     _default_run_command (idle nice/ionice, DF_VERIFY_ROLE=offline).
 
@@ -1507,7 +1508,9 @@ async def test_default_confirm_command_serializes_and_extracts_node_ids(tmp_path
 
     argv = list(mock_exec.call_args.args)
     kwargs = mock_exec.call_args.kwargs
-    expected_serial = _serial_pytest_str('pytest -m integration')
+    expected_serial = _serial_pytest_str(
+        'pytest -m integration', invocation_dir=wt_path / 'fused-memory',
+    )
     assert argv[:5] == ['nice', '-n', '19', 'ionice', '-c3'], (
         'confirm re-run must also run at idle nice/ionice'
     )
@@ -1534,11 +1537,7 @@ async def test_default_confirm_command_re_supplies_the_lane_cwds_addopts(tmp_pat
     worker = _make_worker(tmp_path)
     wt_path = tmp_path / '_offline-deep'
     (wt_path / 'sub').mkdir(parents=True)
-    (wt_path / 'sub' / 'pyproject.toml').write_text(
-        '[tool.pytest.ini_options]\n'
-        'addopts = "-n auto --dist loadgroup --max-worker-restart=0 -m \'not warm_lane_bash\'"\n',
-        encoding='utf-8',
-    )
+    (wt_path / 'sub' / 'pyproject.toml').write_text(ORCH_SHAPED_PYPROJECT, encoding='utf-8')
     cmd = LaneCommand(name='w', command='pytest -m warm_lane_bash', cwd='sub')
 
     mock_proc = AsyncMock()

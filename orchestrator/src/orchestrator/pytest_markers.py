@@ -230,11 +230,9 @@ def resolve_marker_expression(
 
     Never raises — every failure path returns None.
 
-    The serial-retry recovery (``verify_cmd.py::serial_pytest``) re-supplies
-    the governing addopts minus xdist, so a retry keeps this ``-m``. Where it
-    cannot resolve them it still blanks addopts, and that retry can select
-    MORE than the plan assumed — the safe direction (extra coverage, never
-    less).
+    A serial-retry recovery that cannot resolve the governing addopts blanks
+    them (``verify_cmd.py::serial_pytest``), so it can select MORE than the
+    plan assumed — the safe direction.
     """
     cli_expr = _cli_marker_expr(test_command)
     if cli_expr is not None:

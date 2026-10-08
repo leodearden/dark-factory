@@ -22,6 +22,12 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
+from _serial_recovery_helpers import (
+    ORCH_SHAPED_ADDOPTS,
+    ORCH_SHAPED_PYPROJECT,
+    ROOT_SHAPED_PYPROJECT,
+    pyproject_with_addopts,
+)
 from _verify_config_corpus import (
     DASHBOARD_LINT_COMMAND,
     FM_LINT_COMMAND,
@@ -2826,23 +2832,11 @@ class TestVersionPinSurvivesPrefixScoping:
         assert render(cmd) == f'npx pyright {_ESC_3805_FILE}'
 
 
-_ROOT_PYTEST_PYPROJECT = (
-    '[tool.pytest.ini_options]\n'
-    'addopts = "--import-mode=importlib -m \'not smoke and not integration and not warm_lane_bash\'"\n'
-)
-_ORCH_PYTEST_PYPROJECT = (
-    '[tool.pytest.ini_options]\n'
-    'addopts = "-n auto --dist loadgroup --max-worker-restart=0 -m \'not warm_lane_bash\'"\n'
-)
-_COCKPIT_PYTEST_PYPROJECT = (
-    '[tool.pytest.ini_options]\naddopts = "-n auto --dist loadgroup -m \'not smoke\'"\n'
-)
-
 #: A repo-shaped tree: the root and two subprojects each carry pytest config.
 _CONFIG_TREE = {
-    'pyproject.toml': _ROOT_PYTEST_PYPROJECT,
-    'orchestrator/pyproject.toml': _ORCH_PYTEST_PYPROJECT,
-    'cockpit/pyproject.toml': _COCKPIT_PYTEST_PYPROJECT,
+    'pyproject.toml': ROOT_SHAPED_PYPROJECT,
+    'orchestrator/pyproject.toml': ORCH_SHAPED_PYPROJECT,
+    'cockpit/pyproject.toml': pyproject_with_addopts(('-n', 'auto', '--dist', 'loadgroup', '-m', 'not smoke')),
 }
 
 
@@ -2859,7 +2853,7 @@ class _RecordingTreeReader:
 
 
 class TestPytestConfigPathForCommand:
-    """``pytest_config_path_for_command(test_command, worktree_reader)``.
+    """``pytest_config_path_for_command(cmd, worktree_reader)``.
 
     Maps the command ACTUALLY being run to the config pytest reads for it:
     pytest's own walk from the common ancestor of its positional targets (or
@@ -2868,9 +2862,9 @@ class TestPytestConfigPathForCommand:
     """
 
     @staticmethod
-    def _resolve(command: str | None, contents: dict[str, str] = _CONFIG_TREE):
+    def _resolve(command: str, contents: dict[str, str] = _CONFIG_TREE):
         reader = _RecordingTreeReader(contents)
-        return verify_plan_module.pytest_config_path_for_command(command, reader), reader
+        return verify_plan_module.pytest_config_path_for_command(parse_config_command(command), reader), reader
 
     @pytest.mark.parametrize(
         ('command', 'expected'),
@@ -2909,15 +2903,33 @@ class TestPytestConfigPathForCommand:
     def test_real_command_shapes_resolve_to_the_config_pytest_reads(self, command, expected):
         assert self._resolve(command)[0] == expected
 
-    def test_a_file_target_starts_the_walk_at_its_parent(self):
-        path, reader = self._resolve('pytest orchestrator/tests/test_x.py')
+    def test_a_readable_file_target_starts_the_walk_at_its_parent(self):
+        path, reader = self._resolve(
+            'pytest orchestrator/tests/test_x.py',
+            {**_CONFIG_TREE, 'orchestrator/tests/test_x.py': 'def test_x():\n    pass\n'},
+        )
         assert path == 'orchestrator/pyproject.toml'
         assert not any(p.startswith('orchestrator/tests/test_x.py/') for p in reader.paths)
 
     @pytest.mark.parametrize(
+        'target',
+        [
+            pytest.param('pkg/tests/v1.2/', id='dotted-directory'),
+            pytest.param('pkg/tests/v1.2/test_a.py::test_t', id='node-id-inside-a-dotted-directory'),
+        ],
+    )
+    def test_a_dotted_directory_is_walked_as_a_directory(self, target):
+        """A dot in a directory name does not make it a file: pytest asks the filesystem."""
+        contents = {
+            'pkg/pyproject.toml': ROOT_SHAPED_PYPROJECT,
+            'pkg/tests/v1.2/pyproject.toml': ORCH_SHAPED_PYPROJECT,
+            'pkg/tests/v1.2/test_a.py': 'def test_t():\n    pass\n',
+        }
+        assert self._resolve(f'pytest {target}', contents)[0] == 'pkg/tests/v1.2/pyproject.toml'
+
+    @pytest.mark.parametrize(
         'command',
         [
-            pytest.param(None, id='none'),
             pytest.param('', id='empty'),
             pytest.param('cargo test --workspace', id='cargo'),
             pytest.param('npm test', id='npm'),
@@ -2937,18 +2949,23 @@ class TestPytestConfigPathForCommand:
 
 
 class TestGoverningAddopts:
-    """``governing_addopts(test_command, worktree_reader)``: the RAW addopts pytest will apply.
+    """``governing_addopts(cmd, worktree_reader)``: the RAW addopts pytest will apply.
 
     xdist tokens included — stripping them is ``verify_cmd.serial_pytest``'s
     job, beside the ``-p no:xdist`` that requires it. Every refusal is ``()``,
     which renders the historical blank ``-o addopts=``.
     """
 
+    @staticmethod
+    def _addopts(command: str, contents: dict[str, str]) -> tuple[str, ...]:
+        return verify_plan_module.governing_addopts(
+            parse_config_command(command), _RecordingTreeReader(contents),
+        )
+
     def test_the_resolved_pyprojects_raw_addopts_are_returned(self):
-        assert verify_plan_module.governing_addopts(
-            'uv run --project orchestrator pytest orchestrator/tests/test_x.py',
-            _RecordingTreeReader(_CONFIG_TREE),
-        ) == ('-n', 'auto', '--dist', 'loadgroup', '--max-worker-restart=0', '-m', 'not warm_lane_bash')
+        assert self._addopts(
+            'uv run --project orchestrator pytest orchestrator/tests/test_x.py', _CONFIG_TREE,
+        ) == ORCH_SHAPED_ADDOPTS
 
     @pytest.mark.parametrize(
         ('command', 'contents'),
@@ -2956,7 +2973,7 @@ class TestGoverningAddopts:
             pytest.param('pytest tests/', {}, id='nothing-resolves'),
             pytest.param(
                 'cd sub && pytest tests/',
-                {'sub/pytest.ini': '[pytest]\naddopts = -q\n', 'pyproject.toml': _ROOT_PYTEST_PYPROJECT},
+                {'sub/pytest.ini': '[pytest]\naddopts = -q\n', 'pyproject.toml': ROOT_SHAPED_PYPROJECT},
                 id='non-pyproject-config',
             ),
             pytest.param(
@@ -2973,4 +2990,4 @@ class TestGoverningAddopts:
         ],
     )
     def test_every_refusal_is_the_empty_tuple(self, command, contents):
-        assert verify_plan_module.governing_addopts(command, _RecordingTreeReader(contents)) == ()
+        assert self._addopts(command, contents) == ()

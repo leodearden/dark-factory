@@ -291,15 +291,14 @@ class TestRunVerificationEnvRecovery:
     async def test_env_transient_recovery_logs_addopts_clearing_note(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
     ):
-        """The recovery WARNING says what happens to the pyproject addopts.
+        """The recovery WARNING shows the addopts the recovery run applies.
 
-        serial_pytest's `-o addopts=<value>` replaces the ini addopts: it
-        re-supplies the governing config's import mode and marker filters
-        minus xdist, or blanks addopts when none can be resolved — in which
-        case the single recovery run can exercise a broader test selection
-        than the original. An operator investigating a recovery-path result
-        must be able to read which from the log (task 5079; originally
-        reviewer_comprehensive robustness_false_signal).
+        serial_pytest's `-o addopts=<value>` replaces the ini addopts, and a
+        blank one lets the recovery run exercise a broader test selection than
+        the original. The WARNING carries the recovered command itself, so an
+        operator investigating a recovery-path result reads which addopts it
+        ran under (task 5079; originally reviewer_comprehensive
+        robustness_false_signal).
         """
         import logging
 
@@ -319,11 +318,11 @@ class TestRunVerificationEnvRecovery:
         assert result.passed is True
         addopts_warnings = [
             r for r in caplog.records
-            if 'shared-venv transient' in r.getMessage() and 'addopts' in r.getMessage()
+            if 'shared-venv transient' in r.getMessage() and '-o addopts=' in r.getMessage()
         ]
         assert addopts_warnings, (
-            f'Expected the recovery WARNING to mention addopts/marker-filter '
-            f'clearing; got: {[r.getMessage() for r in caplog.records]}'
+            f'Expected the recovery WARNING to carry the recovered command and '
+            f'its -o addopts= value; got: {[r.getMessage() for r in caplog.records]}'
         )
 
     @pytest.mark.asyncio

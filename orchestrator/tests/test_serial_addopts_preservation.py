@@ -28,8 +28,14 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from _pytest.config.findpaths import determine_setup
+from _serial_recovery_helpers import (
+    ORCH_SHAPED_PYPROJECT,
+    ROOT_SHAPED_ADDOPTS,
+    ROOT_SHAPED_PYPROJECT,
+    addopts_values,
+    xdist_offenders,
+)
 from _verify_config_corpus import DF_CONFIG_PATH, REPO_ROOT, load_config_scalar
-from test_verify_cmd import xdist_offenders
 from test_verify_env_transient import _XDIST_VANISHED_OUTPUT
 from test_verify_main_tip_sweep import MAIN_SHA, _make_confirm_fake_run, _make_git_ops
 from test_verify_merge_flake_suppression import _failing, _make_config, _result
@@ -81,10 +87,10 @@ def _command_shapes() -> list[tuple[str, str]]:
     return shapes
 
 
-def _pytest_own_inipath(command: str) -> str | None:
-    """The config pytest ITSELF picks for *command*, worktree-root-relative — the oracle."""
+def _pytest_own_inipath(command: str, root: Path = REPO_ROOT) -> str | None:
+    """The config pytest ITSELF picks for *command* run in *root*, root-relative — the oracle."""
     parsed = parse_config_command(command)
-    invocation_dir = REPO_ROOT / (parsed.cwd_rel or '')
+    invocation_dir = root / (parsed.cwd_rel or '')
     _, inipath, _, _ = determine_setup(
         inifile=None,
         override_ini=None,
@@ -92,7 +98,13 @@ def _pytest_own_inipath(command: str) -> str | None:
         rootdir_cmd_arg=None,
         invocation_dir=invocation_dir,
     )
-    return None if inipath is None else inipath.relative_to(REPO_ROOT).as_posix()
+    return None if inipath is None else inipath.relative_to(root).as_posix()
+
+
+def _our_inipath(command: str, root: Path = REPO_ROOT) -> str | None:
+    return verify_plan.pytest_config_path_for_command(
+        parse_config_command(command), _worktree_reader(root),
+    )
 
 
 def _real_addopts(pyproject: str) -> list[str]:
@@ -114,13 +126,8 @@ def _non_xdist_requirements(addopts: list[str]) -> list[tuple[str, ...]]:
 
 
 def _rendered_addopts_value(rendered: str) -> str:
-    """The LAST ``-o addopts=<value>`` value in *rendered* — the one pytest applies."""
-    tokens = shlex.split(rendered)
-    values = [
-        value.removeprefix('addopts=')
-        for flag, value in zip(tokens, tokens[1:], strict=False)
-        if flag == '-o' and value.startswith('addopts=')
-    ]
+    """The ``-o addopts=<value>`` value pytest applies for *rendered*: the last one."""
+    values = addopts_values(shlex.split(rendered))
     assert values, f'no -o addopts= pair in {rendered!r}'
     return values[-1]
 
@@ -137,12 +144,10 @@ def _recover(command: str) -> str:
 
 class TestSerialRecoveryPreservesTheGoverningAddopts:
     def test_the_resolver_picks_the_config_pytest_itself_picks(self):
-        reader = _worktree_reader(REPO_ROOT)
         mismatches = {
-            label: (verify_plan.pytest_config_path_for_command(command, reader), oracle)
+            label: (ours, oracle)
             for label, command in _command_shapes()
-            if verify_plan.pytest_config_path_for_command(command, reader)
-            != (oracle := _pytest_own_inipath(command))
+            if (ours := _our_inipath(command)) != (oracle := _pytest_own_inipath(command))
         }
         assert not mismatches, f'(ours, pytest determine_setup) disagree: {mismatches}'
 
@@ -197,45 +202,70 @@ class TestSerialRecoveryPreservesTheGoverningAddopts:
         """Each ``cd X &&`` clause reads its own config, but one suffix serves them all."""
         fleet = load_config_scalar(DF_CONFIG_PATH, 'test_command')
         assert parse_config_command(fleet).raw is not None
-        assert verify_plan.governing_addopts(fleet, _worktree_reader(REPO_ROOT)) == ()
+        assert verify_plan.governing_addopts(
+            parse_config_command(fleet), _worktree_reader(REPO_ROOT),
+        ) == ()
         tokens = shlex.split(_recover(fleet))
         assert {
             value for flag, value in zip(tokens, tokens[1:], strict=False) if flag == '-o'
         } == {'addopts='}
 
 
+def _write_tree(root: Path, layout: dict[str, str]) -> Path:
+    for relpath, content in layout.items():
+        path = root / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding='utf-8')
+    return root
+
+
+class TestTheResolverMatchesPytestOnTargetShapesNoModuleUsesYet:
+    """Target shapes the real module commands do not exercise, against pytest's own discovery.
+
+    pytest tells a file target from a directory by asking the filesystem, so a
+    dotted directory must not be mistaken for a file and an extensionless file
+    must not be mistaken for a directory.
+    """
+
+    _LAYOUT = {
+        'pyproject.toml': ROOT_SHAPED_PYPROJECT,
+        'pkg/pyproject.toml': ROOT_SHAPED_PYPROJECT,
+        'pkg/tests/v1.2/pyproject.toml': ORCH_SHAPED_PYPROJECT,
+        'pkg/tests/v1.2/test_a.py': 'def test_t():\n    pass\n',
+        'pkg/tests/runme': 'def test_t():\n    pass\n',
+    }
+
+    @pytest.mark.parametrize(
+        'command',
+        [
+            pytest.param('pytest pkg/tests/v1.2/', id='dotted-directory'),
+            pytest.param('pytest pkg/tests/v1.2', id='dotted-directory-no-slash'),
+            pytest.param('pytest pkg/tests/v1.2/test_a.py::test_t', id='node-id-in-dotted-directory'),
+            pytest.param('cd pkg && pytest tests/v1.2/', id='dotted-directory-under-cd'),
+            pytest.param('pytest pkg/tests/runme', id='extensionless-file'),
+            pytest.param('pytest pkg/tests/v1.2/ pkg/tests/runme', id='dotted-directory-and-file'),
+        ],
+    )
+    def test_ours_agrees_with_pytest_determine_setup(self, tmp_path, command):
+        root = _write_tree(tmp_path, self._LAYOUT)
+        assert _our_inipath(command, root) == _pytest_own_inipath(command, root)
+
+
 # ---------------------------------------------------------------------------
 # WIRING: each serial-recovery call site passes the directory its command runs in.
 # ---------------------------------------------------------------------------
 
-_ROOT_SHAPED_PYPROJECT = (
-    '[tool.pytest.ini_options]\n'
-    'addopts = "--import-mode=importlib -m \'not smoke and not integration and not warm_lane_bash\'"\n'
-)
-_SUB_SHAPED_PYPROJECT = (
-    '[tool.pytest.ini_options]\n'
-    'addopts = "-n auto --dist loadgroup --max-worker-restart=0 -m \'not warm_lane_bash\'"\n'
-)
 _SUB_ADDOPTS = "-m 'not warm_lane_bash'"
-_ROOT_ADDOPTS = "--import-mode=importlib -m 'not smoke and not integration and not warm_lane_bash'"
 _SUB_NODE_ID = 'sub/tests/test_x.py::test_t'
 
 #: A worktree with a root-shaped root config and an orchestrator-shaped ``sub``
 #: module (discoverable through its own ``orchestrator.yaml``).
 _TREE_LAYOUT = {
-    'pyproject.toml': _ROOT_SHAPED_PYPROJECT,
-    'sub/pyproject.toml': _SUB_SHAPED_PYPROJECT,
+    'pyproject.toml': ROOT_SHAPED_PYPROJECT,
+    'sub/pyproject.toml': ORCH_SHAPED_PYPROJECT,
     'sub/orchestrator.yaml': 'test_command: "uv run --directory sub pytest tests/ --tb=short -q"\n',
     'sub/tests/test_x.py': 'def test_t():\n    pass\n',
 }
-
-
-def _write_tree(root: Path) -> Path:
-    for relpath, content in _TREE_LAYOUT.items():
-        path = root / relpath
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding='utf-8')
-    return root
 
 
 def _sub_module_config(test_command: str = 'uv run --directory sub pytest tests/ --tb=short -q'):
@@ -286,7 +316,7 @@ class TestEnvTransientRecoveryWiring:
 
     async def test_a_scoped_cwd_stripped_module_run_recovers_with_its_own_config(self, tmp_path):
         """The FILE_SCOPED shape; the root's three-clause ``-m`` would be strictly worse than blank."""
-        worktree = _write_tree(tmp_path)
+        worktree = _write_tree(tmp_path, _TREE_LAYOUT)
         recovery = await self._recovery_command(
             worktree, self._config(worktree),
             _sub_module_config('uv run --project sub pytest sub/tests/test_x.py --tb=short -q'),
@@ -294,16 +324,16 @@ class TestEnvTransientRecoveryWiring:
         _assert_carries_sub_config(recovery)
 
     async def test_a_run_without_a_module_config_recovers_with_the_root_config(self, tmp_path):
-        worktree = _write_tree(tmp_path)
+        worktree = _write_tree(tmp_path, _TREE_LAYOUT)
         recovery = await self._recovery_command(worktree, self._config(worktree), None)
-        assert _rendered_addopts_value(recovery) == _ROOT_ADDOPTS
+        assert _rendered_addopts_value(recovery) == shlex.join(ROOT_SHAPED_ADDOPTS)
 
 
 class TestScopedConfirmSitesWiring:
     """The sweep prefilter, main-tip confirm and flake engine each resolve the scoped command's config."""
 
     def test_the_sweep_prefilter(self, tmp_path):
-        worktree = _write_tree(tmp_path)
+        worktree = _write_tree(tmp_path, _TREE_LAYOUT)
         rv = AsyncMock(return_value=_result(True))
         with patch.object(verify, 'run_verification', rv):
             asyncio.run(verify._sweep_failure_reproduces_in_isolation(
@@ -326,7 +356,7 @@ class TestScopedConfirmSitesWiring:
         _assert_carries_sub_config(rv.call_args.args[2].test_command)
 
     def test_the_merge_flake_engine(self, tmp_path):
-        worktree = _write_tree(tmp_path)
+        worktree = _write_tree(tmp_path, _TREE_LAYOUT)
         rv = AsyncMock(return_value=_result(True))
         with patch.object(verify, 'run_verification', rv):
             asyncio.run(verify.confirm_merge_verify_flake_suppressible(

@@ -110,6 +110,27 @@ class VerifyCmd:
 # RECOGNISED-BUT-UNSTRUCTURABLE discussion).
 _CHAIN_OPERATOR_TOKENS = frozenset({'&&', '||', ';', '|'})
 
+# pytest-xdist's FULL option surface, copied from
+# `xdist/plugin.py::pytest_addoption` (pytest-xdist 3.8.0). `serial_pytest`
+# sheds every one of these from BOTH argv and the governing addopts it
+# re-supplies: `-p no:xdist` unregisters them all, so any survivor is a hard
+# `unrecognized arguments` failure (rc=4) on the recovery run rather than a
+# degraded one. test_verify_cmd.py::TestSerialPytestShedsEveryXdistOption reads
+# the option list from xdist itself, so an xdist upgrade that adds one turns
+# that test red instead of a verify leg.
+#
+# The value-taking members join _PYTEST_VALUE_FLAGS by construction, so the
+# parse has already bound each to its value as an adjacent pair and the strip
+# can drop the pair by position rather than re-deriving the grammar. The
+# booleans (-d, --loadscope-reorder, --no-loadscope-reorder) are kept out of
+# it: binding one would make the strip swallow the following token.
+_XDIST_VALUE_OPTIONS = frozenset({
+    '-n', '--numprocesses', '--maxprocesses', '--max-worker-restart', '--dist',
+    '--tx', '--px', '--rsyncdir', '--rsyncignore', '--testrunuid',
+    '--maxschedchunk',
+})
+_XDIST_OPTIONS = _XDIST_VALUE_OPTIONS | {'-d', '--loadscope-reorder', '--no-loadscope-reorder'}
+
 # Genuinely value-taking pytest flags that consume a SEPARATE following
 # token (as opposed to a boolean flag, or a `--flag=value` single token).
 # THE COMPLETE parse-side declaration: _split_pytest_args binds each of these
@@ -131,27 +152,23 @@ _CHAIN_OPERATOR_TOKENS = frozenset({'&&', '||', ';', '|'})
 # `... -n auto --dist --junitxml /tmp/j.xml ... loadgroup`, which exits rc=4
 # with `argument --dist: expected one argument` — on the merge gate's own
 # path, since verify.py injects --junitxml for role=='merge' with
-# merge_verify_breadth=='full'. So every value-taking xdist option is listed
-# here (`_XDIST_VALUE_OPTIONS`, asserted to be a subset at import):
-# `--numprocesses`/`--maxprocesses` are xdist's long spellings for the worker
-# count and its cap, and a set that binds `-n` but not `-n`'s own long
-# spelling is the same latent defect one config rename away. The rest
-# (`--max-worker-restart` and friends) are bound because serial_pytest sheds
-# them too, and a shed flag whose value is not bound leaves that value
-# behind as a phantom test target.
+# merge_verify_breadth=='full'. So every value-taking xdist option is bound
+# here, by joining `_XDIST_VALUE_OPTIONS`: `--numprocesses`/`--maxprocesses`
+# are xdist's long spellings for the worker count and its cap, and a set that
+# binds `-n` but not `-n`'s own long spelling is the same latent defect one
+# config rename away. The rest (`--max-worker-restart` and friends) are bound
+# because serial_pytest sheds them too, and a shed flag whose value is not
+# bound leaves that value behind as a phantom test target.
 #
 # `--timeout`/`--junitxml` were the last two omissions (task 5580, measured
 # below): value-taking flags no config had to contain, because this module
 # emits them itself.
 _PYTEST_VALUE_FLAGS = frozenset({
-    '-k', '-m', '-c', '-W', '-p', '-o', '-n',
+    '-k', '-m', '-c', '-W', '-p', '-o',
     '--maxfail', '--tb', '--rootdir', '--override-ini',
     '--deselect', '--ignore', '--ignore-glob',
-    '--dist', '--numprocesses', '--maxprocesses',
-    '--max-worker-restart', '--tx', '--px', '--rsyncdir', '--rsyncignore',
-    '--testrunuid', '--maxschedchunk',
     '--timeout', '--junitxml',
-})
+}) | _XDIST_VALUE_OPTIONS
 
 # The SUBSET of the above that THIS MODULE's own mutators emit —
 # `-p no:xdist -o addopts=` (serial_pytest), `-n <count>`
@@ -1815,34 +1832,6 @@ def _append_to_raw_pytest_invocations(raw: str, suffix: str) -> str:
         cursor = match.end()
     out.append(raw[cursor:])
     return ''.join(out)
-
-
-# pytest-xdist's FULL option surface, copied from
-# `xdist/plugin.py::pytest_addoption` (pytest-xdist 3.8.0). `serial_pytest`
-# sheds every one of these from BOTH argv and the governing addopts it
-# re-supplies: `-p no:xdist` unregisters them all, so any survivor is a hard
-# `unrecognized arguments` failure (rc=4) on the recovery run rather than a
-# degraded one. test_verify_cmd.py::TestSerialPytestShedsEveryXdistOption reads
-# the option list from xdist itself, so an xdist upgrade that adds one turns
-# that test red instead of a verify leg.
-#
-# Every value-taking member is also in _PYTEST_VALUE_FLAGS, so the parse has
-# already bound each to its value as an adjacent pair and the strip below can
-# drop the pair by position rather than re-deriving the grammar. The booleans
-# (-d, --loadscope-reorder, --no-loadscope-reorder) are deliberately NOT there:
-# binding one would make the strip swallow the following token.
-_XDIST_VALUE_OPTIONS = frozenset({
-    '-n', '--numprocesses', '--maxprocesses', '--max-worker-restart', '--dist',
-    '--tx', '--px', '--rsyncdir', '--rsyncignore', '--testrunuid',
-    '--maxschedchunk',
-})
-_XDIST_OPTIONS = _XDIST_VALUE_OPTIONS | {'-d', '--loadscope-reorder', '--no-loadscope-reorder'}
-
-assert _XDIST_VALUE_OPTIONS <= _PYTEST_VALUE_FLAGS, (
-    f'{sorted(_XDIST_VALUE_OPTIONS - _PYTEST_VALUE_FLAGS)} take a separate '
-    f'value token but are not bound at parse time, so stripping the flag would '
-    f'leave its value behind as a phantom test target'
-)
 
 
 def _is_xdist_option(token: str) -> bool:
