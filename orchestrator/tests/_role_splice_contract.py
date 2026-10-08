@@ -13,7 +13,7 @@ It also holds the shared Bash-capable carrier set and predicate
 (``BASH_CAPABLE_UNPINNED_ROLES``, ``bash_capable_unpinned``) that every block
 spliced through roles.py::_BASH_CAPABLE_ROLE_PREAMBLE derives from, and the
 preamble-tail contract (``PreambleTailBlock`` + ``PreambleTailContractTests``),
-which a new tail block adopts with one subclass instead of eight test clones.
+which a new tail block adopts with one subclass instead of cloning its tests.
 
 What the extraction bought, stated honestly, because the framing here previously
 overstated it (task 4405 review): NOT a smaller tree today. The helper plus its
@@ -500,7 +500,7 @@ class PreambleTailBlock:
 
 
 class PreambleTailContractTests:
-    """The eight invariants every preamble-tail block holds.
+    """The invariants every preamble-tail block holds.
 
     Subclass it as ``Test<Block>Splice`` in the block's own module and set
     ``block``. The base has no ``Test`` prefix, so pytest never collects it bare.

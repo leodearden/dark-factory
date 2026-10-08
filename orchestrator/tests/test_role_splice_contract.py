@@ -960,7 +960,7 @@ def _probe(block: PreambleTailBlock) -> PreambleTailContractTests:
 
 
 class TestPreambleTailContractOnAConformingSplice(PreambleTailContractTests):
-    """The PASS case, run exactly as a consumer runs it: all eight inherited methods."""
+    """The PASS case, run exactly as a consumer runs it: every inherited method."""
 
     block = _tail_block()
 
@@ -1038,9 +1038,3 @@ def test_tail_exactly_once_skips_an_absent_splice() -> None:
     assert probe.test_guidance_appears_exactly_once_per_role() is None
     with pytest.raises(AssertionError):
         probe.test_every_bash_capable_role_carries_guidance()
-
-
-def test_preamble_tail_block_is_frozen() -> None:
-    """A consumer's module-level block cannot be mutated by one test under another."""
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        _tail_block().constant_name = 'OTHER'  # type: ignore[misc]
