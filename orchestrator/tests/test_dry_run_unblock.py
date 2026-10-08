@@ -27,6 +27,7 @@ from shared.cli_invoke import AllAccountsCappedException
 from shared.config_dir import TaskConfigDir
 
 from orchestrator.config import OrchestratorConfig, TranscriptArchiveConfig
+from orchestrator.dry_run_unblock import _TASK_EMPTY_STATE, _TASK_UNAVAILABLE_STATE
 from orchestrator.scheduler import Scheduler
 
 # ---------------------------------------------------------------------------
@@ -2947,50 +2948,39 @@ class TestSkillPromptExplainsEveryTaskBlockState:
     """The investigator reads ``skills/unblock-auto/SKILL.md`` — its system
     prompt — to interpret the task block ``dry_run_unblock.py::_task_context``
     renders into its user prompt, so the two must stay aligned.  This guard is
-    that alignment mechanism.  ``agents/briefing.py::_format_task``'s
-    similar-looking labels have no such reader and are deliberately NOT
-    coupled to these (task 5538).
+    that alignment mechanism.
     """
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(('state', 'make_scheduler', 'state_phrase'), [
+    @pytest.mark.parametrize(('make_scheduler', 'state_phrases'), [
         pytest.param(
-            'healthy', lambda: _TaskDocScheduler(), None,
+            _TaskDocScheduler,
+            {'**Title:**', '**Description:**', '**Details:**', '**Declared files:**'},
             id='healthy',
         ),
         pytest.param(
-            'fetch_failed', lambda: _TaskDocScheduler(returns_none=True),
-            '**Task record:** unavailable',
+            lambda: _TaskDocScheduler(returns_none=True),
+            {_TASK_UNAVAILABLE_STATE},
             id='fetch_failed',
         ),
         pytest.param(
-            'record_empty',
-            lambda: _TaskDocScheduler(
-                task_doc=_CONTENTLESS_TASK_DOC,
-            ),
-            '**Task record:** fetched but empty',
+            lambda: _TaskDocScheduler(task_doc=_CONTENTLESS_TASK_DOC),
+            {_TASK_EMPTY_STATE},
             id='record_empty',
         ),
     ])
     async def test_system_prompt_explains_the_task_block(
-        self, tmp_path, state, make_scheduler, state_phrase,
+        self, tmp_path, make_scheduler, state_phrases,
     ):
         kwargs = await _capture_investigation_call(tmp_path, make_scheduler())
         user, system = kwargs['prompt'], kwargs['system_prompt']
 
-        labels = set(re.findall(r'\*\*[^*\n]+?:\*\*', user))
-        assert labels, f'{state}: no bold label in the user prompt\n{user}'
-        for label in sorted(labels):
-            assert label in system, (
-                f'{state}: the user prompt carries {label!r} but the '
-                f'unblock-auto system prompt never explains it'
-            )
+        unrendered = sorted(p for p in state_phrases if p not in user)
+        assert not unrendered, f'the renderer no longer emits {unrendered}\n{user}'
 
-        if state_phrase is not None:
-            assert state_phrase in user, (
-                f'{state}: the renderer no longer emits {state_phrase!r}\n{user}'
-            )
-            assert state_phrase in system, (
-                f'{state}: the user prompt carries {state_phrase!r} but the '
-                f'unblock-auto system prompt never explains it'
-            )
+        labels = set(re.findall(r'\*\*[^*\n]+?:\*\*', user))
+        unexplained = sorted(p for p in labels | state_phrases if p not in system)
+        assert not unexplained, (
+            f'the user prompt carries {unexplained} but the unblock-auto '
+            f'system prompt never explains them'
+        )

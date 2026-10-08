@@ -1426,10 +1426,6 @@ A prior block-time investigation concluded the following; verify against the cur
     def _format_task(self, task: dict, *, include_files: bool = True) -> str:
         """Format a task dict as readable text.
 
-        The label vocabulary is deliberately independent of
-        ``orchestrator/src/orchestrator/dry_run_unblock.py::_task_context``
-        (task 5538; the rationale is in that docstring).
-
         Args:
             task: Task dict with id, title, description, metadata, etc.
             include_files: When False, the ``metadata.files`` line is omitted
