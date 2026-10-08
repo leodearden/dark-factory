@@ -5,15 +5,15 @@ constant is spliced into a machine-derived set of role prompts: the constant is
 non-empty, it reaches every role in the set, it reaches no role outside it, it
 appears exactly once per role, it lands in a structurally defined spot, and the
 hand-maintained role set still equals the set derived from the capability that
-justifies the splice. Two anchor-test modules assert that family today:
+justifies the splice. This module holds that shape once, and is the
+AUTHORITATIVE home for the rationale behind it — the consumers point here rather
+than restating it, so there is one place to correct.
 
-- ``test_roles_wait_pattern.py`` — task 3607, ``BACKGROUND_WAIT_GUIDANCE``.
-- ``test_roles_tool_call_rejection.py`` — tasks 4273/4578,
-  ``TOOL_CALL_REJECTION_GUIDANCE``.
-
-Both grew the same assertion shape independently. This module holds it once, and
-is the AUTHORITATIVE home for the rationale behind that shape — the consumers
-point here rather than restating it, so there is one place to correct.
+It also holds the shared Bash-capable carrier set and predicate
+(``BASH_CAPABLE_UNPINNED_ROLES``, ``bash_capable_unpinned``) that every block
+spliced through roles.py::_BASH_CAPABLE_ROLE_PREAMBLE derives from, and the
+preamble-tail contract (``PreambleTailBlock`` + ``PreambleTailContractTests``),
+which a new tail block adopts with one subclass instead of eight test clones.
 
 What the extraction bought, stated honestly, because the framing here previously
 overstated it (task 4405 review): NOT a smaller tree today. The helper plus its
@@ -21,10 +21,11 @@ contract test cost considerably more lines than the consumers shed, and both
 consumers are in fact marginally LONGER than before, their assertion bodies
 having become call-site ``remedy`` prose. The win is structural and
 forward-looking: the shape is defined and independently tested in ONE place, so
-a THIRD prompt constant costs ~10 lines of contract construction plus one-line
-test bodies rather than a third clone — and a defect in the shape is fixed once
-instead of found twice or missed once. ``assert_placement``'s char-budget arm
-was exactly that: one latent bug, one fix, both consumers covered.
+a new preamble-tail block costs one ``PreambleTailBlock`` declaration, and any
+other new prompt constant a contract construction plus one-line test bodies,
+rather than another clone — and a defect in the shape is fixed once instead of
+found twice or missed once. ``assert_placement``'s char-budget arm was exactly
+that: one latent bug, one fix, both consumers covered.
 
 THE STANDING RULE THIS MODULE MUST NOT WEAKEN, carried over from both consumers:
 every assertion here is an existence / containment / count / index check against
@@ -37,8 +38,8 @@ review). Do not add a prose-pinning assertion to this module, and do not
 "strengthen" any index check into a regex.
 
 THE ``capability`` PREDICATE IS DELIBERATELY A PARAMETER, not a unified rule.
-The two consumers ask genuinely different questions and both are correct for
-their constant — see ``SpliceContract``'s class docstring.
+Consumers ask genuinely different questions, each correct for its own constant
+— see ``SpliceContract``'s class docstring.
 
 EVERY ASSERTION TAKES A CALLER-SUPPLIED ``remedy``. This module formats only the
 mechanical half of a failure message (the offender list or mapping, the

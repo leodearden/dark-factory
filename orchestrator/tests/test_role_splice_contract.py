@@ -2,30 +2,28 @@
 
 Follows ``test_conftest_helpers.py``'s precedent of contract-testing test
 infrastructure. ``_role_splice_contract.py`` is not production code; it is the
-deduplicated body behind the per-role splice assertions in
-``test_roles_wait_pattern.py`` (task 3607, ``BACKGROUND_WAIT_GUIDANCE``) and
-``test_roles_tool_call_rejection.py`` (tasks 4273/4578,
-``TOOL_CALL_REJECTION_GUIDANCE``).
+deduplicated body behind the per-role splice assertions in the ``test_roles_*``
+anchor modules.
 
-WHY THE FIRING CASES MATTER, and why this file exists at all. Both consumer
-modules name the same motivating risk in their docstrings: a prompt refactor
-silently drops a mandated block and CI stays green. Once both files delegate
-their assertions to one helper, that hazard concentrates. An assertion helper
-that degrades into a no-op — an ``assert`` accidentally softened to a truthy
-expression, an offender loop that never appends, a message that swallows the
-call site's remedy — would leave all 24 consumer tests green while asserting
-nothing at all. So every assertion here is pinned TWICE: once that it PASSES
-on a conforming input, and once that it FIRES (raises ``AssertionError``, with
-the offenders named) on a violating one. A helper that only ever passes is
-indistinguishable from a helper that does nothing.
+WHY THE FIRING CASES MATTER, and why this file exists at all. The consumer
+modules name the same motivating risk: a prompt refactor silently drops a
+mandated block and CI stays green. Once they all delegate their assertions to
+one helper, that hazard concentrates. An assertion helper that degrades into a
+no-op — an ``assert`` accidentally softened to a truthy expression, an offender
+loop that never appends, a message that swallows the call site's remedy — would
+leave every consumer test green while asserting nothing at all. So every
+assertion here is pinned TWICE: once that it PASSES on a conforming input, and
+once that it FIRES (raises ``AssertionError``, with the offenders named) on a
+violating one. A helper that only ever passes is indistinguishable from a
+helper that does nothing.
 
 Everything under test here is driven by SYNTHETIC fixtures — string literals
 and synthetic ``AgentRole`` mappings — never by a real prompt constant from
 ``roles.py``, except ``GREP_LOOKAROUND_GUIDANCE``, imported only as the opaque
 landmark the preamble-tail order check anchors on and never asserted on. This
-file tests the HELPER; whether the real prompts satisfy the
-contract is the two consumer files' job, and duplicating that here would
-recreate the very clone this task is closing.
+file tests the HELPER; whether the real prompts satisfy the contract is the
+consumer modules' job, and duplicating that here would recreate the very clone
+this task is closing.
 """
 
 from __future__ import annotations
@@ -162,7 +160,7 @@ def test_all_roles_defaults_to_the_real_roles_mapping() -> None:
     """Omitting `all_roles` binds the real `ROLES`, so consumers stay one-liners.
 
     Identity check ONLY. Nothing about the real roles' prompt CONTENTS is
-    asserted here — that is the two consumer files' job, and duplicating it here
+    asserted here — that is the consumer modules' job, and duplicating it here
     would recreate the clone this task closes.
     """
     contract = SpliceContract(
