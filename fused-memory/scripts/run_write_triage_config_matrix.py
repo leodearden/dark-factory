@@ -48,7 +48,6 @@ import hashlib
 import importlib.util
 import json
 import math
-import os
 import sys
 import types
 from collections.abc import Iterable, Mapping, Sequence
@@ -59,6 +58,7 @@ from types import MappingProxyType
 from typing import Any
 
 from shared.cli_boundary import LoudArgumentParser, run_cli
+from shared.safe_io import atomic_write_text
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.server.write_triage_judge import (
@@ -584,23 +584,15 @@ def _json_body(doc: Mapping[str, Any]) -> str:
     return json.dumps(doc, indent=2, ensure_ascii=False) + '\n'
 
 
-def _write_staged(bodies: Mapping[Path, str]) -> None:
-    """Write every body beside its path before moving any into place.
+def _write_artifacts(bodies: Mapping[Path, str]) -> None:
+    """Write each body atomically, one file after another.
 
-    A body that cannot be written therefore replaces none of the files. The
-    moves run one after another, so a move that fails after the first leaves
-    the earlier files replaced and the later ones not: the artifacts then
-    disagree until the next successful run.
+    Each file is either wholly replaced or left as it was. A write that fails
+    after the first leaves the earlier files replaced and the later ones not:
+    the artifacts then disagree until the next successful run.
     """
-    staged = {path: path.with_name(f'{path.name}.tmp') for path in bodies}
-    try:
-        for path, body in bodies.items():
-            staged[path].write_text(body, encoding='utf-8')
-        for path, temporary in staged.items():
-            os.replace(temporary, path)
-    finally:
-        for temporary in staged.values():
-            temporary.unlink(missing_ok=True)
+    for path, body in bodies.items():
+        atomic_write_text(path, body)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -614,7 +606,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     best_out = args.out_dir / BEST_CONFIG_NAME
     try:
         args.out_dir.mkdir(parents=True, exist_ok=True)
-        _write_staged({matrix_out: _json_body(matrix), best_out: _json_body(best)})
+        _write_artifacts({matrix_out: _json_body(matrix), best_out: _json_body(best)})
     except OSError as failure:
         print(f'cannot write the artifacts under {args.out_dir}: {failure}', file=sys.stderr)
         return 1
