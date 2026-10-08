@@ -57,6 +57,7 @@ class PinOrder:
     pin_order clamps to 0, and pin orders at or past ``_PIN_RANK_SPAN - 1``
     all tie at rank -1 — a tie only matters if two such pins reserve one key
     at once, where the earlier install then blocks the later one (INV-3).
+    ``from_rank`` is the inverse: it answers the in-band pin order of a rank.
     """
 
     value: int
@@ -64,6 +65,14 @@ class PinOrder:
     @property
     def rank(self) -> int:
         return -_PIN_RANK_SPAN + min(max(self.value, 0), _PIN_RANK_SPAN - 1)
+
+    @classmethod
+    def from_rank(cls, rank: int) -> PinOrder:
+        if rank < -_PIN_RANK_SPAN or not is_pin_rank(rank):
+            raise ValueError(
+                f'rank {rank} lies outside the pin band [{-_PIN_RANK_SPAN}, -1]'
+            )
+        return cls(rank + _PIN_RANK_SPAN)
 
 
 #: What a park is installed AT: a priority tier name, or a pin's order.
@@ -120,15 +129,19 @@ class ReservationSource(StrEnum):
 def rank_payload(rank: int) -> dict[str, str | int]:
     """How a park-stack entry names the priority behind its *rank*.
 
-    The inverse of :func:`priority_payload` for a stored rank: always a
-    ``source``, plus ``pin_order`` for a pin rank or ``tier`` for a tier rank.
-    A rank past the last tier clamps to the last tier.
+    The inverse of :func:`park_rank`: always a ``source``, plus ``pin_order``
+    for a pin rank or ``tier`` for a tier rank.  A rank :func:`park_rank`
+    cannot produce raises ``ValueError`` rather than being renamed.
     """
     source = ReservationSource.source_of_rank(rank)
     if source is ReservationSource.PIN:
-        return {'source': source.value, 'pin_order': rank + _PIN_RANK_SPAN}
-    tier = PRIORITY_TIERS[min(rank, len(PRIORITY_TIERS) - 1)]
-    return {'source': source.value, 'tier': tier}
+        return {'source': source.value, 'pin_order': PinOrder.from_rank(rank).value}
+    if rank >= len(PRIORITY_TIERS):
+        raise ValueError(
+            f'rank {rank} names no priority tier: tier ranks are '
+            f'{_BEST_TIER_RANK}..{len(PRIORITY_TIERS) - 1}'
+        )
+    return {'source': source.value, 'tier': PRIORITY_TIERS[rank]}
 
 
 class BlockerKind(StrEnum):

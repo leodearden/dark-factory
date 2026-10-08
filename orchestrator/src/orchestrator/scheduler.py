@@ -8175,9 +8175,10 @@ class Scheduler:
         - skip_counts: {task_id: int}
         - parks: {task_id: {modules: [...], installed_at: str}} — every active
           top, pin reservations included
-        - park_stacks: {module: [{owner, rank, shadowed, installed_at}, ...]} —
-          full LIFO stack bottom→top per module (active top + shadowed owners);
-          additive sibling to the INV-7 top-only ``parks`` key
+        - park_stacks: {module: [entry, ...]} — full LIFO stack bottom→top
+          per module (active top + shadowed owners); additive sibling to the
+          INV-7 top-only ``parks`` key.  Entry fields:
+          :meth:`ModuleLockTable.snapshot_park_stacks`
         - pin_reservations: {task_id: {modules: [...], installed_at: str}} —
           the park entries held at a pin rank (task 6040), top or buried,
           shown apart from fairness parks
