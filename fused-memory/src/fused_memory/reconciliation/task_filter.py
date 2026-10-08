@@ -317,19 +317,8 @@ NON_TERMINAL_STATUS_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-# OUT-OF-MODULE IMPORTERS (the census this module keeps for its shared
-# regexes, as it does for TASK_REF_RE and STRICT_CLAUSE_BOUNDARY_RE above):
-#   - reconciliation/stale_gate_citation_guard.py — scans the ~40 chars
-#     trailing a captured gate-citation id list, so a RETROSPECTIVE relay
-#     ("external deps 3658/3659 have landed") is not read as an assertion that
-#     those gates are still pending. Same fail-open direction as the detectors
-#     below: a missed cue merely means a rephrase-and-retry for the author, and
-#     the word list's deliberate recall gaps ('landing' is not 'landed') cost
-#     that guard nothing.
-# That guard deliberately does NOT import STRICT_CLAUSE_BOUNDARY_RE — it is
-# marker-anchored rather than clause-scoped — so that constant's documented
-# "a THIRD importer must first show the same fail-safe direction" bar is
-# untouched.
+# Out-of-module importer: reconciliation/stale_gate_citation_guard.py
+# (retrospective cue after a gate-citation id list).
 TERMINAL_OUTCOME_RE: re.Pattern[str] = re.compile(
     r'\b(?:merged|landed|merge\s+commit|done|cancell?ed|completed|shipped)\b',
     re.IGNORECASE,
