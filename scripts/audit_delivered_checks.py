@@ -122,8 +122,10 @@ from shared.delivered_check_polarity import (  # noqa: E402
 )
 from shared.delivered_check_scope import (  # noqa: E402
     STALE_PATH_CODES,
+    STALE_PATH_REASONS,
     ScopePath,
     classify_scope_paths,
+    is_literal_scope_path,
     stale_scope_paths,
 )
 
@@ -250,18 +252,20 @@ class StructuralFinding(NamedTuple):
 class StalePathFinding(NamedTuple):
     """One descriptor ``paths`` entry that leaves its check unable to go green.
 
-    ``actionable`` follows who is actually held (:func:`stale_path_is_actionable`);
     ``open_dependents`` is always carried, since "nobody" is itself an answer.
     """
 
     row: DescriptorRow
     scope: ScopePath
-    open_dependents: tuple[int, ...] = ()
-    actionable: bool = False
+    open_dependents: tuple[int, ...]
 
     @property
     def code(self) -> str:
         return STALE_PATH_CODES[self.scope.state]
+
+    @property
+    def actionable(self) -> bool:
+        return stale_path_is_actionable(self.row.status, self.open_dependents)
 
 
 class StalePathSweep(NamedTuple):
@@ -316,32 +320,32 @@ def stale_path_findings(
     open_dependents: Mapping[int, tuple[int, ...]] = MappingProxyType({}),
 ) -> StalePathSweep:
     """Every stale ``paths`` entry across *rows*, from ONE classification of
-    their distinct paths at *ref*; the policy is the authoring lint's own.
+    their distinct literal paths at *ref*; the policy is the authoring lint's
+    own. A row's findings keep its ``paths`` order.
 
-    A path the classifier could not answer for is counted in
+    A literal path the classifier could not answer for is counted in
     ``paths_unclassified`` (all of them when git could not answer at all), so
-    a git failure never reads as "nothing stale".
+    a git failure never reads as "nothing stale". A glob or pathspec-magic
+    entry names no single path, so it is neither classified nor counted.
     """
     swept = list(rows)
-    distinct = sorted({path for row in swept for path in row.paths})
-    census = classify_scope_paths(distinct, repo_root=repo_root, ref=ref) or {}
+    literals = sorted(
+        {path for row in swept for path in row.paths if is_literal_scope_path(path)}
+    )
+    census = classify_scope_paths(literals, repo_root=repo_root, ref=ref) or {}
     findings = []
     for row in swept:
         scope = [census[path] for path in dict.fromkeys(row.paths) if path in census]
-        dependents = open_dependents.get(row.task_id, ())
         findings.extend(
             StalePathFinding(
-                row=row,
-                scope=entry,
-                open_dependents=dependents,
-                actionable=stale_path_is_actionable(row.status, dependents),
+                row=row, scope=entry, open_dependents=open_dependents.get(row.task_id, ())
             )
             for entry in stale_scope_paths(row.kind, row.expect, scope)
         )
-    findings.sort(key=lambda f: (not f.actionable, f.row.task_id, f.row.name, f.scope.path))
+    findings.sort(key=lambda f: (not f.actionable, f.row.task_id, f.row.name))
     return StalePathSweep(
         findings=tuple(findings),
-        paths_unclassified=sum(1 for path in distinct if path not in census),
+        paths_unclassified=sum(1 for path in literals if path not in census),
     )
 
 
@@ -891,23 +895,6 @@ _STRUCTURAL_LABEL = "STRUCTURAL, report-only"
 _STALE_LABEL = "STALE PATHS"
 _STALE_REPORT_ONLY_LABEL = "STALE PATHS, report-only"
 
-_STALE_REASONS = {
-    "shim_path": (
-        "the check's paths name a sys.modules alias shim — the file only "
-        "rebinds sys.modules[__name__] to the module it aliases, so this "
-        "expect=present check can never go green and its dependents wedge "
-        "behind what reads as an undelivered capability; repath this source's "
-        "paths to the aliased module, or drop the descriptor"
-    ),
-    "removed_path": (
-        "the check's paths name a path the mainline deleted or moved away "
-        "(removed_in names the commit), so this expect=present check can never "
-        "go green and its dependents wedge behind what reads as an undelivered "
-        "capability; repath this source's paths to where the code lives now, "
-        "or drop the descriptor"
-    ),
-}
-
 #: One line per disposition saying WHY, in the reader's terms. A disposition
 #: name alone is a verdict without an argument: it tells an operator what the
 #: classifier concluded but not whether to act, which forces them back into
@@ -1019,7 +1006,7 @@ def _format_stale(finding: StalePathFinding) -> list[str]:
     pairs.append(
         ("open_dependents", ",".join(str(d) for d in finding.open_dependents) or "none")
     )
-    return [format_kv_line(pairs), f"      reason: {_STALE_REASONS[finding.code]}"]
+    return [format_kv_line(pairs), f"      reason: {STALE_PATH_REASONS[finding.code]}"]
 
 
 def _disposition_section(audit: ProjectAudit, label: str, disposition: str) -> list[str]:
@@ -1142,7 +1129,7 @@ def format_json(audits: list[ProjectAudit]) -> str:
                             "removed_in": item.scope.removed_in,
                             "actionable": item.actionable,
                             "open_dependents": list(item.open_dependents),
-                            "reason": _STALE_REASONS[item.code],
+                            "reason": STALE_PATH_REASONS[item.code],
                         }
                         for item in audit.stale_paths
                     ],

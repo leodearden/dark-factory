@@ -992,8 +992,11 @@ _STALE_TREE = {
 
 
 def _delete(root, message, rel):
-    """Commit the deletion of *rel* alone; the untracked tasks.db stays out."""
-    subprocess.run(['git', '-C', str(root), 'rm', '-q', rel], check=True, capture_output=True)
+    """Commit the deletion of *rel* (a file or a directory) alone; the
+    untracked tasks.db stays out."""
+    subprocess.run(
+        ['git', '-C', str(root), 'rm', '-q', '-r', rel], check=True, capture_output=True
+    )
     subprocess.run(
         ['git', '-C', str(root), '-c', 'user.email=t@e', '-c', 'user.name=t',
          'commit', '-q', '-m', message],
@@ -1023,17 +1026,23 @@ class TestStalePaths:
     """The STALE PATHS sweep: an expect=present check whose `paths` name a
     sys.modules shim or a mainline-removed path can never go green."""
 
-    def test_sweep_flags_shim_and_removed_paths_only(self, tmp_path):
-        root = _init_repo(tmp_path / 'repo', _STALE_TREE)
-        _delete(root, 'retire the gone module', 'src/gone.py')
+    @pytest.mark.parametrize(
+        ('removed', 'gone'),
+        [('src/gone.py', 'src/gone.py'), ('src/olddir', 'src/olddir/')],
+        ids=['file', 'directory-with-trailing-slash'],
+    )
+    def test_sweep_flags_shim_and_removed_paths_only(self, tmp_path, removed, gone):
+        root = _init_repo(
+            tmp_path / 'repo', {**_STALE_TREE, 'src/olddir/legacy.py': 'pass\n'}
+        )
+        _delete(root, 'retire the gone module', removed)
         rows = [
             _row(task_id=1, name='grep-shim', paths=('src/old_mod.py',)),
-            _row(task_id=2, name='grep-gone', paths=('src/gone.py',)),
-            _row(task_id=3, name='path-gone', kind='path', pattern=None,
-                 paths=('src/gone.py',)),
+            _row(task_id=2, name='grep-gone', paths=(gone,)),
+            _row(task_id=3, name='path-gone', kind='path', pattern=None, paths=(gone,)),
             _row(task_id=4, name='grep-new', paths=('src/never_created.py',)),
             _row(task_id=5, name='absent-shim', expect='absent', paths=('src/old_mod.py',)),
-            _row(task_id=6, name='absent-gone', expect='absent', paths=('src/gone.py',)),
+            _row(task_id=6, name='absent-gone', expect='absent', paths=(gone,)),
             _row(task_id=7, name='path-shim', kind='path', pattern=None,
                  paths=('src/old_mod.py',)),
             _row(task_id=8, name='grep-live', paths=('src/new_mod.py',)),
@@ -1043,14 +1052,37 @@ class TestStalePaths:
 
         assert {(f.row.task_id, f.row.name, f.scope.path, f.code) for f in sweep.findings} == {
             (1, 'grep-shim', 'src/old_mod.py', 'shim_path'),
-            (2, 'grep-gone', 'src/gone.py', 'removed_path'),
-            (3, 'path-gone', 'src/gone.py', 'removed_path'),
+            (2, 'grep-gone', gone, 'removed_path'),
+            (3, 'path-gone', gone, 'removed_path'),
         }
         removed = [f for f in sweep.findings if f.code == 'removed_path']
         assert all(
             f.scope.removed_in and 'retire the gone module' in f.scope.removed_in
             for f in removed
         )
+        assert sweep.paths_unclassified == 0
+
+    def test_a_row_yields_one_finding_per_stale_path_in_its_paths_order(self, tmp_path):
+        root = _init_repo(tmp_path / 'repo', _STALE_TREE)
+        _delete(root, 'retire the gone module', 'src/gone.py')
+        row = _row(paths=('src/old_mod.py', 'src/new_mod.py', 'src/gone.py'))
+
+        sweep = stale_path_findings([row], repo_root=str(root), ref='main')
+
+        assert [(f.scope.path, f.code) for f in sweep.findings] == [
+            ('src/old_mod.py', 'shim_path'),
+            ('src/gone.py', 'removed_path'),
+        ]
+
+    def test_glob_entries_are_neither_classified_nor_counted_unclassified(self, tmp_path):
+        root = _init_repo(tmp_path / 'repo', _STALE_TREE)
+        row = _row(paths=('src/*.py', ':(glob)src/**', 'src/old_mod.py'))
+
+        sweep = stale_path_findings([row], repo_root=str(root), ref='main')
+
+        assert [(f.scope.path, f.code) for f in sweep.findings] == [
+            ('src/old_mod.py', 'shim_path'),
+        ]
         assert sweep.paths_unclassified == 0
 
     @pytest.mark.parametrize(
@@ -1108,6 +1140,26 @@ class TestStalePaths:
         report_only = result.stdout.split('STALE PATHS, report-only (1)', 1)[1]
         assert 'task_id=51' in report_only
 
+    def test_cancelled_producer_is_report_only_even_with_an_open_dependent(
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+    ):
+        root = _stale_project(
+            tmp_path, make_tasks_db, project_root_with_tasks_db,
+            tasks=[
+                {'id': 56, 'status': 'cancelled', 'metadata': _checks(_shim_grep('cap'))},
+                {'id': 79, 'status': 'blocked'},
+            ],
+        )
+        _seed_dependencies(root, [(79, 56)])
+
+        result = _run_cli('--project-root', str(root))
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert 'STALE PATHS (0)' in result.stdout
+        report_only = result.stdout.split('STALE PATHS, report-only (1)', 1)[1]
+        assert 'task_id=56' in report_only
+        assert 'status=cancelled' in report_only
+
     def test_done_producer_with_an_open_dependent_exits_1(
         self, tmp_path, make_tasks_db, project_root_with_tasks_db
     ):
@@ -1161,17 +1213,25 @@ class TestStalePaths:
             ('metadata', 'cap', 'shim_path'),
         ]
 
+    @pytest.mark.parametrize(
+        ('gone', 'removed_by'),
+        [('src/gone.py', 'retire the gone module'),
+         ('src/olddir/', 'retire the old package')],
+        ids=['file', 'directory-with-trailing-slash'],
+    )
     def test_json_carries_stale_paths_and_their_coverage(
-        self, tmp_path, make_tasks_db, project_root_with_tasks_db
+        self, tmp_path, make_tasks_db, project_root_with_tasks_db, gone, removed_by
     ):
         root = _stale_project(
             tmp_path, make_tasks_db, project_root_with_tasks_db,
+            files={'src/olddir/legacy.py': 'pass\n'},
             tasks=[
                 {'id': 53, 'status': 'pending', 'metadata': _checks(
-                    _grep('gone', 'BrandNewSymbol', paths=('src/gone.py',)))},
+                    _grep('gone', 'BrandNewSymbol', paths=(gone,)))},
                 {'id': 78, 'status': 'pending'},
             ],
         )
+        _delete(root, 'retire the old package', 'src/olddir')
         _seed_dependencies(root, [(78, 53)])
 
         result = _run_cli('--project-root', str(root), '--json')
@@ -1179,9 +1239,9 @@ class TestStalePaths:
 
         [entry] = project['stale_paths']
         assert entry['task_id'] == 53
-        assert entry['path'] == 'src/gone.py'
+        assert entry['path'] == gone
         assert entry['code'] == 'removed_path'
-        assert 'retire the gone module' in entry['removed_in']
+        assert removed_by in entry['removed_in']
         assert entry['actionable'] is True
         assert entry['open_dependents'] == [78]
         assert project['coverage']['scope_paths_unclassified'] == 0
