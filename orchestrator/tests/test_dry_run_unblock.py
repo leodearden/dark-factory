@@ -2551,6 +2551,8 @@ _TASK_DOC = {
     },
 }
 
+_CONTENTLESS_TASK_DOC = {'id': '42', 'status': 'blocked'}
+
 
 class _TaskDocScheduler:
     """Scheduler fake whose ``get_task`` returns a FULL task document.
@@ -2600,7 +2602,7 @@ async def _capture_investigation_call(tmp_path, scheduler) -> dict:
             mcp=MagicMock(),
             config=_make_config(),
         )
-    return mock_invoke.call_args.kwargs
+    return dict(mock_invoke.call_args.kwargs)
 
 
 async def _capture_investigation_prompt(tmp_path, scheduler) -> str:
@@ -2891,8 +2893,6 @@ class TestContentlessTaskRecordIsAlsoDegraded:
     `TestFalsyFetchIsAlsoLoud` exists to eliminate, one level in.
     """
 
-    _CONTENTLESS = {'id': '42', 'status': 'blocked'}
-
     @pytest.mark.asyncio
     async def test_prompt_and_entry_agree_when_the_record_is_empty(self, tmp_path):
         """The coherence invariant, extended to the third state."""
@@ -2901,7 +2901,7 @@ class TestContentlessTaskRecordIsAlsoDegraded:
             _TASK_UNAVAILABLE_MARKER,
         )
 
-        scheduler = _TaskDocScheduler(task_doc=self._CONTENTLESS)
+        scheduler = _TaskDocScheduler(task_doc=_CONTENTLESS_TASK_DOC)
         prompt = await _capture_investigation_prompt(tmp_path, scheduler)
         entry = _persisted_entry(scheduler)
 
@@ -2915,7 +2915,7 @@ class TestContentlessTaskRecordIsAlsoDegraded:
     async def test_empty_record_warns_once_without_claiming_a_failed_fetch(
         self, tmp_path, caplog,
     ):
-        scheduler = _TaskDocScheduler(task_doc=self._CONTENTLESS)
+        scheduler = _TaskDocScheduler(task_doc=_CONTENTLESS_TASK_DOC)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.dry_run_unblock'):
             await _run_with_scheduler(tmp_path, scheduler)
@@ -2966,7 +2966,7 @@ class TestSkillPromptExplainsEveryTaskBlockState:
         pytest.param(
             'record_empty',
             lambda: _TaskDocScheduler(
-                task_doc=TestContentlessTaskRecordIsAlsoDegraded._CONTENTLESS,
+                task_doc=_CONTENTLESS_TASK_DOC,
             ),
             '**Task record:** fetched but empty',
             id='record_empty',
