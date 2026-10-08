@@ -990,8 +990,9 @@ Because no call can block >100 s, top-level submission is safe BY PROTOCOL.
         Mirrors shared/src/shared/merge_state.py::SUBMIT_NON_TERMINAL. Pinned by
         scripts/tests/test_merge_state_vocabulary_consistency.py — extend the enum
         and this list goes red until it matches. -->
-   A timeout yields a non-terminal queued shape: `{status: 'queued'|'attached', request_id,
-   snapshot_tip, generation, position, queue_depth, eta_seconds}`.
+   A timeout yields a non-terminal shape with `status: 'queued'|'attached'` and a
+   `request_id` to poll; its full key set is stated in `merge_request`'s own docstring
+   (`escalation/src/escalation/server.py::merge_request`), not restated here.
    <!-- merge-state-vocab:end -->
    Both are a **successful, durable submission** — the entry survives disconnect (PRD D2);
    intent persists even if the MCP session drops mid-bounded-wait.
@@ -1406,10 +1407,23 @@ esc-id-citing correction block in the cluster's task descriptions, or the subjec
 advancing while the task is blocked/parked (tip-advance on an `in-progress` subject is ordinary
 work, not a signal).
 
-`triaged_by` is server-attributed from the stamping connection's `X-Escalation-Identity` header and
-cannot be spoofed by the caller — the identical non-spoofable attribution contract this skill
-already documents for `resolved_by` (see "Recognizing the supervised auto-watcher's resolutions"
-below).
+`triaged_by` is server-enforced (`escalation/src/escalation/server.py::stamp_triage`) when the
+stamping connection sends `X-Escalation-Identity` (the auto-watcher does), the same attribution
+contract this skill documents for `resolved_by` (see "Recognizing the supervised auto-watcher's
+resolutions" below); for a header-less interactive session it is a convention, not a guarantee —
+see "Shadow-mode standing-policy rulings (measurement only)".
+
+### Refuting a premise: the claim's execution context, or it is not a refutation
+
+A check that does not reproduce an escalation's premise refutes it only if it ran in the premise's
+execution context; anywhere else it is a non-reproduction. The rule covers the probes you re-run and
+the resolution text you write. It also covers spawn briefs: never hand a spawned session a premise
+marked disproved, or marked "do not re-derive", unless the refuting check ran in that context, and
+state the context each cited check ran in. Specimen: on esc-legibility-trickle-reify-3 a brief
+refuted a boot-time timer's PATH premise from a post-login interactive shell. The premise was right,
+and the auto-watcher's triage note had said its probe did not verify the job's own PATH. Single
+normative statement of the rule:
+`orchestrator/src/orchestrator/agents/premise_refutation_guidance.py::PREMISE_REFUTATION_GUIDANCE`.
 
 ### Reading preserved framing (`amendments`)
 
@@ -2086,13 +2100,10 @@ them is reported as `gated_stamps` and excluded from every rate.
 
 ### Two facts about attribution and timing
 
-**Attribution here is a convention, not a guarantee.**
-`escalation/src/escalation/server.py::stamp_triage` overrides `triaged_by` from the
-`X-Escalation-Identity` header **only when that header is present**. The auto-watcher sends one, so
-for it the attribution is server-enforced; this session does not, so `triaged_by` is whatever you
-pass. This NARROWS the general statement in "Reading a triage-ack annotation" above for your own
-stamps. Therefore: **pass the same identity string you resolve with**, or `triaged_by` and
-`resolved_by` never compare and the `self_resolved` check silently never fires.
+**Attribution here is a convention, not a guarantee** (see "Reading a triage-ack annotation"
+above): this session sends no identity header, so `triaged_by` is whatever you pass. **Pass the
+same identity string you resolve with**, or `triaged_by` and `resolved_by` never compare and the
+`self_resolved` check silently never fires.
 
 **Stamp before the record is resolved.** `stamp_triage` refuses anything that is not `pending`, so a
 stamp written after the close is simply not written.

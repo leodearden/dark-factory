@@ -708,6 +708,8 @@ def _make_main_tip_harness(*, main_sha: str) -> Harness:
     # Distinct from main_sha so the SHA-dedup gate does not short-circuit
     # before verify.run_main_tip_sweep is even called.
     h._last_swept_main_sha = 'stale-' + main_sha[:6]
+    h._run_store = None
+    h._main_sweep_cold_control = None
     return h
 
 

@@ -19,7 +19,7 @@ import enum
 import subprocess
 import tokenize
 import tomllib
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from io import StringIO
 from pathlib import Path
 from typing import NamedTuple
@@ -184,7 +184,57 @@ def file_size_measures_in_tree(
 # ---------------------------------------------------------------------------
 # Structural import measures.
 
-_FUNCTION_NODES: tuple[type[ast.AST], ...] = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+@dataclasses.dataclass(frozen=True)
+class ImportStatement:
+    """One import statement, and where it sits."""
+
+    node: ast.Import | ast.ImportFrom
+    runtime: bool  # False inside an ``if TYPE_CHECKING:`` body
+    deferred: bool  # inside a function body, however deeply nested: a function-local import
+
+    @property
+    def line(self) -> int:
+        return self.node.lineno
+
+
+def _is_type_checking(test: ast.expr) -> bool:
+    return (isinstance(test, ast.Name) and test.id == 'TYPE_CHECKING') or (
+        isinstance(test, ast.Attribute) and test.attr == 'TYPE_CHECKING'
+    )
+
+
+def _nested_bodies(node: ast.stmt) -> Iterator[list[ast.stmt]]:
+    """The statement lists directly inside *node*, in source order."""
+    for _field, value in ast.iter_fields(node):
+        if not isinstance(value, list) or not value:
+            continue
+        if isinstance(value[0], ast.stmt):
+            yield value
+        elif isinstance(value[0], ast.ExceptHandler | ast.match_case):
+            for clause in value:
+                yield clause.body
+
+
+def _statements_in(
+    body: Sequence[ast.stmt], *, runtime: bool, deferred: bool
+) -> Iterator[ImportStatement]:
+    for node in body:
+        if isinstance(node, ast.Import | ast.ImportFrom):
+            yield ImportStatement(node, runtime=runtime, deferred=deferred)
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            yield from _statements_in(node.body, runtime=runtime, deferred=True)
+        elif isinstance(node, ast.If) and _is_type_checking(node.test):
+            yield from _statements_in(node.body, runtime=False, deferred=deferred)
+            yield from _statements_in(node.orelse, runtime=runtime, deferred=deferred)
+        else:
+            for nested in _nested_bodies(node):
+                yield from _statements_in(nested, runtime=runtime, deferred=deferred)
+
+
+def import_statements_in_tree(tree: ast.Module) -> tuple[ImportStatement, ...]:
+    """Every import statement in *tree*, in source order, each visited once."""
+    return tuple(_statements_in(tree.body, runtime=True, deferred=False))
 
 
 def function_local_imports(source: str, *, path: str) -> int:
@@ -193,24 +243,16 @@ def function_local_imports(source: str, *, path: str) -> int:
     These are reach-back imports -- function-local imports that exist to break
     import cycles, plus every other deferred import in the same shape.
 
-    Counted per STATEMENT, not per bound name, and deduped by node identity so a
-    nested function's import is counted once rather than once per enclosing
-    function. AST-based, so a docstring quoting an import statement -- which
-    reach-back notes often do verbatim -- is never counted.
+    Counted per STATEMENT, not per bound name, and once however deeply its
+    function nests. AST-based, so a docstring quoting an import statement --
+    which reach-back notes often do verbatim -- is never counted.
     """
     return function_local_imports_in_tree(parse_source(source, path=path))
 
 
 def function_local_imports_in_tree(tree: ast.Module) -> int:
-    """``function_local_imports`` over an already-parsed tree."""
-    seen: set[int] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, _FUNCTION_NODES):
-            continue
-        for inner in ast.walk(node):
-            if isinstance(inner, ast.Import | ast.ImportFrom):
-                seen.add(id(inner))
-    return len(seen)
+    """``function_local_imports`` over an already-parsed tree: its deferred import statements."""
+    return sum(statement.deferred for statement in import_statements_in_tree(tree))
 
 
 def reexport_names(source: str, *, path: str) -> list[str]:
@@ -923,6 +965,14 @@ def _require_declared_members_populated(domain: tuple[DomainMember, ...]) -> Non
         )
 
 
+def _workspace_members(root: Path) -> tuple[MemberRoots, ...]:
+    """The declared members of *root*'s pyproject.toml, then ``PSEUDO_MEMBERS``."""
+    return (
+        *(MemberRoots.declared(name) for name in _declared_members(root)),
+        *PSEUDO_MEMBERS,
+    )
+
+
 def workspace_domain(root: Path) -> tuple[DomainMember, ...]:
     """Every workspace member's tracked ``.py`` files, classified src or tests.
 
@@ -932,11 +982,36 @@ def workspace_domain(root: Path) -> tuple[DomainMember, ...]:
     is every file under no member's src or tests root (``hooks/`` included).
     """
     _require_work_tree_top(root)
-    members = (
-        *(MemberRoots.declared(name) for name in _declared_members(root)),
-        *PSEUDO_MEMBERS,
-    )
+    members = _workspace_members(root)
     entries = _tracked_blobs(root, '*.py')
     domain = tuple(_domain_member(member, entries) for member in members)
     _require_declared_members_populated(domain)
     return domain
+
+
+def head_commit(root: Path) -> str:
+    """The full sha of *root*'s HEAD commit."""
+    _require_work_tree_top(root)
+    try:
+        return _git_output(root, 'rev-parse', '--verify', 'HEAD').strip()
+    except MetricsError as exc:
+        raise MetricsError(
+            f'{root}: the work tree has no HEAD commit to measure -- {exc}'
+        ) from exc
+
+
+def uncommitted_domain_paths(root: Path) -> tuple[str, ...]:
+    """Domain ``.py`` paths whose index or work-tree copy differs from HEAD, sorted.
+
+    Untracked files are not listed: they are outside the domain.
+    """
+    _require_work_tree_top(root)
+    members = _workspace_members(root)
+    listing = _git_output(
+        root, 'status', '--porcelain=v1', '-z', '--untracked-files=no', '--no-renames',
+        '--', '*.py',
+    )
+    paths = {record[3:] for record in listing.split('\0') if record}
+    return tuple(
+        sorted(path for path in paths if any(m.kind_of(path) is not None for m in members))
+    )

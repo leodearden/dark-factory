@@ -1,0 +1,146 @@
+{
+  "arm_id": "phi-4-14b",
+  "records": [
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "--project",
+        "/home/leo/src/dark-factory/shared",
+        "python",
+        "/home/leo/src/dark-factory/scripts/local-model-serving/lms_ctl.py",
+        "start",
+        "phi-4-14b"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:14:51.267161Z",
+      "output_tail": "started lms-arm@phi-4-14b.service\n",
+      "stage": "start",
+      "started_at": "2026-10-07T20:14:50.750643Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "--project",
+        "/home/leo/src/dark-factory/shared",
+        "python",
+        "/home/leo/src/dark-factory/scripts/local-model-serving/lms_ctl.py",
+        "wait-ready",
+        "phi-4-14b"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:19:44.878943Z",
+      "output_tail": "phi-4-14b: ready\n",
+      "stage": "wait-ready",
+      "started_at": "2026-10-07T20:14:51.267443Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "python",
+        "scripts/local_memory_models_eval/harness.py",
+        "smoke",
+        "--arm-spec",
+        "/tmp/lme-eta-3720/evidence/specs/phi-4-14b.json"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:19:51.206408Z",
+      "output_tail": "PASS endpoint-conformance: arm 'phi-4-14b' at http://127.0.0.1:8418/v1 (json_schema) returned a schema-valid SmokeEntities\nPASS validator-negative-control: the validator rejected a deliberately off-schema payload\n",
+      "stage": "smoke",
+      "started_at": "2026-10-07T20:19:44.907581Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "python",
+        "scripts/local_memory_models_eval/harness.py",
+        "run",
+        "--arm-spec",
+        "/tmp/lme-eta-3720/evidence/specs/phi-4-14b.json",
+        "--manifest",
+        "/tmp/lme-eta-3720/code/fused-memory/scripts/local_memory_models_eval/corpus_manifest.json",
+        "--out-root",
+        "/tmp/lme-eta-3720/evidence/runs",
+        "--repo-root",
+        "/tmp/lme-eta-3720/code",
+        "--limit",
+        "20",
+        "--concurrency",
+        "3",
+        "--index-configuration",
+        "with-indices"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:24:14.797003Z",
+      "output_tail": "ure_timeout_failure'\nInvalid duplicate_name for extracted node a88402d1-3c14-4879-a7b5-b3c6849aff50; treating as no duplicate. duplicate_name was: 'pure_timeout_failure'\nInvalid duplicate_name for extracted node c4ef84e8-b5eb-46a0-a271-c83650c7d278; treating as no duplicate. duplicate_name was: 'pure_timeout_failure'\nInvalid duplicate_name for extracted node 39c2f627-252b-4480-87c0-9fd707f72be3; treating as no duplicate. duplicate_name was: 'pure_timeout_failure'\nInvalid duplicate_name for extracted node edafb62b-b725-4f92-bf76-b7eab735669c; treating as no duplicate. duplicate_name was: 'pure_timeout_failure'\nInvalid duplicate_name for extracted node 0a764751-e0dd-4f14-8e0d-b6b64a40cb4e; treating as no duplicate. duplicate_name was: 'pure_timeout_failure'\nInvalid duplicate_name for extracted node 538a3fbc-6d1f-4632-be0d-31fa845a7692; treating as no duplicate. duplicate_name was: 'pure_timeout_failure'\nInvalid duplicate_name for extracted node aa85b100-cfa7-420a-b1ea-587d049b3b4b; treating as no duplicate. duplicate_name was: 'pure_timeout_failure'\nInvalid duplicate_name for extracted node aadb7085-09ac-44a7-ac83-cf30b1e64a9c; treating as no duplicate. duplicate_name was: 'pure_timeout_failure'\nInvalid duplicate_name for extracted node 481bc908-a754-4b1d-9b24-49d9f129e893; treating as no duplicate. duplicate_name was: 'pure_timeout_failure'\nInvalid duplicate_name for extracted node fc086235-491c-4b0b-a18d-c2b6b40dc864; treating as no duplicate. duplicate_name was: 'pure_timeout_failure'\nInvalid duplicate_name for extracted node d14cf74a-98a1-4d41-b94b-7aedfa22c5d3; treating as no duplicate. duplicate_name was: 'pure_timeout_failure'\nInvalid duplicate_name for extracted node 5bc739fb-a2b9-4f9f-adb1-2d8413fdbe08; treating as no duplicate. duplicate_name was: 'pure_timeout_failure'\nInvalid duplicate_name for extracted node fef4c09e-7b13-4504-884f-24c3cc66911e; treating as no duplicate. duplicate_name was: 'pure_timeout_failure'\nInvalid duplicate_name for extracted node 20fba5d0-3cce-4bc3-a174-ff99cf4a1d8d; treating as no duplicate. duplicate_name was: 'pure_timeout_failure'\nLLM returned invalid duplicate_facts idx values [4] (valid range: 0--1 for EXISTING FACTS)\nLLM returned invalid duplicate_facts idx values [2] (valid range: 0--1 for EXISTING FACTS)\nError in generating LLM response: Expecting ',' delimiter: line 7715 column 1 (char 12734)\nRetrying after application error (attempt 1/2): Expecting ',' delimiter: line 7715 column 1 (char 12734)\nLLM returned invalid IDs outside valid range 0-16: [17] (all returned IDs: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17])\nSkipping invalid LLM dedupe id 17 (valid range: 0-16, received 18 resolutions)\nTarget entity not found in nodes for edge relation: PREVENTS\nTarget entity not found in nodes for edge relation: ACTIVATED_BY\nTarget entity not found in nodes for edge relation: INVOLVES\nInvalid duplicate_name for extracted node def5db5e-face-41b6-9ce8-fe9fee10f616; treating as no duplicate. duplicate_name was: 'mistral_common'\nInvalid duplicate_name for extracted node a69a1a13-b6c3-4db1-8ba3-be949c6e463c; treating as no duplicate. duplicate_name was: 'mistral_common'\nInvalid duplicate_name for extracted node d087c031-f4da-4546-a996-583159c4706a; treating as no duplicate. duplicate_name was: 'mistral_common'\nError in generating LLM response: Unterminated string starting at: line 363 column 22 (char 15896)\nRetrying after application error (attempt 1/2): Unterminated string starting at: line 363 column 22 (char 15896)\nLLM returned invalid duplicate_facts idx values [2, 3, 5] (valid range: 0--1 for EXISTING FACTS)\nrun: /tmp/lme-eta-3720/evidence/runs/phi-4-14b/20261007T201954Z\nPASS code-sha-matches-checkout: HEAD 055e9c15a0d756704017b0d77ffbe4185155402f is clean and matches the spec\nPASS preregistration-sha: 865a017d79c6a210da157474e639fd15fe51f9e0 carries plans/local-memory-models-eval-preregistration.md\nPASS token-cost-accounting: arm 'phi-4-14b': tokens and cost are accounted\n",
+      "stage": "run",
+      "started_at": "2026-10-07T20:19:51.558099Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "--project",
+        "/home/leo/src/dark-factory/shared",
+        "python",
+        "/home/leo/src/dark-factory/scripts/local-model-serving/lms_healthcheck.py",
+        "--arm",
+        "phi-4-14b",
+        "--output",
+        "/tmp/lme-eta-3720/evidence/arms/phi-4-14b/health.json"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:24:20.254824Z",
+      "output_tail": "local model serving health — 2026-10-07T20:24:15.399357+00:00\nGPU: NVIDIA GeForce RTX 3090 (driver 580.178.04, 24576 MiB)\n\nARM        AXIS  STACK  ENDPOINT               VERDICT  REASON  COLD-MS  MS\n---------  ----  -----  ---------------------  -------  ------  -------  ----\nphi-4-14b  llm   vllm   http://127.0.0.1:8412  PASS     ok      1823     2595\n\nVRAM PASS: the arm took 16301 MiB (23372 used - 7071 baseline) of the 17021 MiB free before it started\n  headroom 0.7 GiB; card total 24576 MiB, now 719 MiB free\n  reported, NOT gating — PRD D10 nominal ceiling 19.5 GiB, measured operating budget on this host 16.37 GiB\n  the arm took 15.92 GiB (23372 - 7071 MiB), within the 16.62 GiB budget free before it started\n\nnon-arm GPU consumers\n  at baseline, before the arm started:\n    pid 9024 python — 4050 MiB (3.96 GiB)\n  at the probe reading (the arm included):\n    pid 9024 python — 4050 MiB (3.96 GiB)\n    pid 3089166 VLLM::EngineCore — 16302 MiB (15.92 GiB)\n  INVENTORY, not an accounting: `nvidia-smi --query-compute-apps` lists only CUDA\n  compute applications. It does not list the KDE/X11 graphics contexts (Xorg,\n  plasmashell, kwin_x11, and ~40 small KDE clients) that hold the remaining ~3.3 GiB on\n  this host — which is exactly why the measured operating budget is ~16.37 GiB rather\n  than 19.5. These entries name who else held the card; they do not sum to memory.used.\n\nCOLD-MS is the DISCARDED warm-up, MS the measured run. Latency here is a SINGLE-SAMPLE health-probe measurement taken with the engine warm and the prefix cache COLD (one discarded warm-up on a different prompt precedes it). It is NOT the p95-under-load envelope metric (task 3719 zeta; PRD episode-latency-p50/p95 under concurrent load), and it must not be used to rank arms against one another.\n\nOVERALL: PASS\n\nwrote /tmp/lme-eta-3720/evidence/arms/phi-4-14b/health.json\n",
+      "stage": "healthcheck",
+      "started_at": "2026-10-07T20:24:14.962691Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "--project",
+        "/home/leo/src/dark-factory/shared",
+        "python",
+        "/home/leo/src/dark-factory/scripts/local-model-serving/lms_ctl.py",
+        "stop",
+        "phi-4-14b"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:24:33.427968Z",
+      "output_tail": "stopped lms-arm@phi-4-14b.service\n",
+      "stage": "stop",
+      "started_at": "2026-10-07T20:24:20.258139Z"
+    },
+    {
+      "argv": [
+        "/home/leo/.local/bin/uv",
+        "run",
+        "--no-sync",
+        "python",
+        "scripts/local_memory_models_eval/harness.py",
+        "teardown",
+        "--arm-spec",
+        "/tmp/lme-eta-3720/evidence/specs/phi-4-14b.json"
+      ],
+      "exit_code": 0,
+      "finished_at": "2026-10-07T20:24:37.948328Z",
+      "output_tail": "deleted 'evalmem_lme_eta_phi_4_14b'\n",
+      "stage": "teardown",
+      "started_at": "2026-10-07T20:24:33.428195Z"
+    }
+  ],
+  "tap": {
+    "listen_url": "http://127.0.0.1:8418",
+    "upstream_url": "http://127.0.0.1:8412"
+  }
+}

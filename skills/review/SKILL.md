@@ -114,7 +114,7 @@ Is the codebase internally consistent, complete, and cheap to change? Detail: `r
 
 0. Compute the changed scope (incremental) and re-verify the carry set (both modes).
 1. Project `/audit`, when the project ships one.
-1.5. Read the inputs: latest hotspot and `/review-all` reports, and the confusion codebook (§9).
+1.5. Read the inputs: latest hotspot and `/review-all` reports, the confusion codebook (§9), and the latest committed metrics snapshot — the newest `plans/quality-metrics/*.json` by commit (`git log -1 --diff-filter=A --name-only --format= -- plans/quality-metrics/`), rendered with `scripts/quality_metrics_snapshot.py --summary`. The snapshot is context for choosing Step 4's modules, never a ranking (contract §10).
 2. Stub and placeholder audit.
 3. Critical-path tracing (requires briefing).
 4. Deep read of high-risk modules, including the heuristic look-fors.

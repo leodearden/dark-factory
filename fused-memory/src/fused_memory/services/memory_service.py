@@ -2823,26 +2823,38 @@ class MemoryService:
         session_id: str | None,
         category: str | None,
         metadata: dict | None,
-    ) -> str:
+    ) -> str | None:
         """sha256 over the canonical mem0 write payload — audit/idempotency key.
 
         Used to stamp the write-ahead ``mem0_intent`` (task 2710) so a
         dead-lettered intent carries a stable fingerprint of exactly what
         would have been written, for audit and manual replay.
+
+        Never raises, like ``WriteJournal.log_mem0_intent``: on failure it logs
+        at ERROR and returns None.
         """
-        canonical = json.dumps(
-            {
-                'content': content,
-                'project_id': project_id,
-                'agent_id': agent_id,
-                'session_id': session_id,
-                'category': category,
-                'metadata': metadata or {},
-            },
-            sort_keys=True,
-            ensure_ascii=False,
-        )
-        return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+        try:
+            canonical = json.dumps(
+                {
+                    'content': content,
+                    'project_id': project_id,
+                    'agent_id': agent_id,
+                    'session_id': session_id,
+                    'category': category,
+                    'metadata': metadata or {},
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+        except Exception as e:
+            logger.error(
+                'mem0 payload digest could not be computed (%s: %s); the '
+                'mem0_intent is journaled without a digest',
+                type(e).__name__,
+                e,
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Durable queue: execute write dispatcher
@@ -6903,7 +6915,8 @@ class MemoryService:
         - only FAILED mem0 backend_op(s) → ``add()`` raised. In the common
           (clean, pre-persist) failure mem0 did not land, so re-issue is safe
           (0 prior writes + 1 = 1): rebuild ``Scope`` + metadata and call
-          ``mem0.add``; ``completed`` on success, ``dead`` on error.
+          ``mem0.add``; ``completed`` on success, ``dead`` on error. Crash
+          after re-issue: ``fused-memory/tests/test_mem0_intent_recovery.py::TestRecoverMem0Intents::test_crash_after_successful_reissue_is_reconciled_not_reissued_again``.
           RESIDUAL DUPLICATE RISK (accepted, documented): a failure raised
           AFTER mem0 committed but at/near the response (e.g. a read-timeout
           on an otherwise-successful add) ALSO records a FAILED backend_op
@@ -6965,10 +6978,16 @@ class MemoryService:
                         session_id=intent.get('session_id'),
                     )
                     metadata = json.loads(intent.get('metadata') or '{}')
-                    await self.mem0.add(
-                        content=intent.get('content') or '',
-                        scope=scope,
-                        metadata=metadata,
+                    content = intent.get('content') or ''
+                    await self._journaled_backend_call(
+                        write_op_id=write_op_id,
+                        causation_id=intent.get('causation_id'),
+                        backend='mem0',
+                        operation='add',
+                        payload={'content': content[:200]},
+                        coro=self.mem0.add(
+                            content=content, scope=scope, metadata=metadata
+                        ),
                     )
                     await self._write_journal.resolve_mem0_intent(
                         intent_id,

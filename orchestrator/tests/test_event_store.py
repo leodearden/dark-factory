@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from typing import TypedDict
+
+import pytest
 
 from orchestrator.event_store import EventStore, EventType
 
@@ -637,31 +640,44 @@ class TestTrainEventTypes:
         assert 'verify' in derailed_data['derail_reason']
 
 
+_ABSENT: object = object()
+
+
+class _LookupKey(TypedDict, total=False):
+    request_id: str
+    branch: str
+    task_id: str
+
+
+def _emit_finalized(
+    store: EventStore,
+    *,
+    request_id: str,
+    task_id: str,
+    branch: str,
+    state: str,
+    snapshot_tip: str | None = None,
+    merge_sha: str | None = None,
+    superseded_by: object = _ABSENT,
+    absorbed_request_ids: object = _ABSENT,
+) -> None:
+    """Emit one merge_finalized row; optional keys enter the payload only when passed."""
+    data: dict[str, object] = {
+        'request_id': request_id,
+        'branch': branch,
+        'state': state,
+        'snapshot_tip': snapshot_tip,
+        'merge_sha': merge_sha,
+    }
+    if superseded_by is not _ABSENT:
+        data['superseded_by'] = superseded_by
+    if absorbed_request_ids is not _ABSENT:
+        data['absorbed_request_ids'] = absorbed_request_ids
+    store.emit(EventType.merge_finalized, task_id=task_id, data=data)
+
+
 class TestLatestMergeFinalized:
     """EventStore.latest_merge_finalized — query helper for the merge_status tool."""
-
-    def _emit_finalized(
-        self,
-        store: EventStore,
-        *,
-        request_id: str,
-        task_id: str,
-        branch: str,
-        state: str,
-        snapshot_tip: str | None = None,
-        merge_sha: str | None = None,
-    ) -> None:
-        store.emit(
-            EventType.merge_finalized,
-            task_id=task_id,
-            data={
-                'request_id': request_id,
-                'branch': branch,
-                'state': state,
-                'snapshot_tip': snapshot_tip,
-                'merge_sha': merge_sha,
-            },
-        )
 
     def test_returns_none_on_empty_store(self, tmp_path: Path) -> None:
         """Returns None when no merge_finalized rows exist."""
@@ -671,7 +687,7 @@ class TestLatestMergeFinalized:
     def test_lookup_by_request_id(self, tmp_path: Path) -> None:
         """Returns the matching row when looked up by request_id."""
         store = EventStore(tmp_path / 'ev.db', 'run-lmf')
-        self._emit_finalized(
+        _emit_finalized(
             store,
             request_id='mr-aa001',
             task_id='T1',
@@ -694,16 +710,16 @@ class TestLatestMergeFinalized:
     def test_lookup_by_request_id_returns_none_for_unknown(self, tmp_path: Path) -> None:
         """Returns None for a request_id that was never recorded."""
         store = EventStore(tmp_path / 'ev.db', 'run-lmf')
-        self._emit_finalized(store, request_id='mr-exists', task_id='T', branch='b', state='done')
+        _emit_finalized(store, request_id='mr-exists', task_id='T', branch='b', state='done')
         assert store.latest_merge_finalized(request_id='mr-does-not-exist') is None
 
     def test_lookup_by_branch_returns_most_recent(self, tmp_path: Path) -> None:
         """branch= lookup returns the most-recent (highest id) matching row."""
         store = EventStore(tmp_path / 'ev.db', 'run-lmf')
-        self._emit_finalized(
+        _emit_finalized(
             store, request_id='mr-old', task_id='T1', branch='feature-x', state='conflict'
         )
-        self._emit_finalized(
+        _emit_finalized(
             store, request_id='mr-new', task_id='T1', branch='feature-x', state='done'
         )
 
@@ -717,10 +733,10 @@ class TestLatestMergeFinalized:
     def test_lookup_by_task_id_returns_most_recent(self, tmp_path: Path) -> None:
         """task_id= lookup returns the most-recent matching row."""
         store = EventStore(tmp_path / 'ev.db', 'run-lmf')
-        self._emit_finalized(
+        _emit_finalized(
             store, request_id='mr-first', task_id='T42', branch='b1', state='blocked'
         )
-        self._emit_finalized(
+        _emit_finalized(
             store, request_id='mr-second', task_id='T42', branch='b2', state='done'
         )
 
@@ -734,22 +750,22 @@ class TestLatestMergeFinalized:
     def test_no_lookup_key_returns_none(self, tmp_path: Path) -> None:
         """Calling with no key (all None) returns None immediately."""
         store = EventStore(tmp_path / 'ev.db', 'run-lmf')
-        self._emit_finalized(store, request_id='mr-x', task_id='T', branch='b', state='done')
+        _emit_finalized(store, request_id='mr-x', task_id='T', branch='b', state='done')
         assert store.latest_merge_finalized() is None
 
     def test_unknown_branch_returns_none(self, tmp_path: Path) -> None:
         """Returns None when branch doesn't match any row."""
         store = EventStore(tmp_path / 'ev.db', 'run-lmf')
-        self._emit_finalized(store, request_id='mr-y', task_id='T', branch='branch-a', state='done')
+        _emit_finalized(store, request_id='mr-y', task_id='T', branch='branch-a', state='done')
         assert store.latest_merge_finalized(branch='branch-z') is None
 
     def test_request_id_takes_precedence_over_branch(self, tmp_path: Path) -> None:
         """When both request_id and branch are passed, request_id wins."""
         store = EventStore(tmp_path / 'ev.db', 'run-lmf')
-        self._emit_finalized(
+        _emit_finalized(
             store, request_id='mr-req', task_id='T1', branch='branch-req', state='done'
         )
-        self._emit_finalized(
+        _emit_finalized(
             store, request_id='mr-branch', task_id='T2', branch='branch-other', state='conflict'
         )
 
@@ -758,6 +774,277 @@ class TestLatestMergeFinalized:
         assert row['request_id'] == 'mr-req', (
             f'Expected request_id-matched row, got {row["request_id"]!r}'
         )
+
+    _KEY_KINDS = pytest.mark.parametrize(
+        'key',
+        [{'request_id': 'mr-a1'}, {'branch': 'feature-a'}, {'task_id': 'T-A'}],
+        ids=['request_id', 'branch', 'task_id'],
+    )
+
+    @staticmethod
+    def _restarted_stores(tmp_path: Path) -> tuple[EventStore, EventStore]:
+        """A prior run (run-A) holding one finalized row, and the run after it (run-B)."""
+        db_path = tmp_path / 'runs.db'
+        store_a = EventStore(db_path, 'run-A')
+        _emit_finalized(
+            store_a,
+            request_id='mr-a1',
+            task_id='T-A',
+            branch='feature-a',
+            state='blocked',
+            snapshot_tip='tip-a',
+            merge_sha=None,
+            superseded_by='coalesce-a',
+        )
+        return store_a, EventStore(db_path, 'run-B')
+
+    @_KEY_KINDS
+    def test_default_is_run_scoped_so_a_prior_run_row_is_not_returned(
+        self, tmp_path: Path, key: _LookupKey
+    ) -> None:
+        """The anti-staleness default: a restarted run never reads a prior run's outcome."""
+        _, store_b = self._restarted_stores(tmp_path)
+        assert store_b.latest_merge_finalized(**key) is None
+
+    @_KEY_KINDS
+    def test_cross_run_returns_the_prior_run_row_labelled_as_history(
+        self, tmp_path: Path, key: _LookupKey
+    ) -> None:
+        _, store_b = self._restarted_stores(tmp_path)
+
+        row = store_b.latest_merge_finalized(**key, cross_run=True)
+
+        assert row is not None
+        assert row['run_id'] == 'run-A'
+        assert row['is_current_run'] is False
+        assert row['request_id'] == 'mr-a1'
+        assert row['task_id'] == 'T-A'
+        assert row['branch'] == 'feature-a'
+        assert row['state'] == 'blocked'
+        assert row['snapshot_tip'] == 'tip-a'
+        assert row['merge_sha'] is None
+        assert row['superseded_by'] == 'coalesce-a'
+        assert row['reason'] is None
+        assert row['finished_at'] is not None
+
+    def test_cross_run_picks_the_newest_row_across_runs(self, tmp_path: Path) -> None:
+        db_path = tmp_path / 'runs.db'
+        store_a = EventStore(db_path, 'run-A')
+        store_b = EventStore(db_path, 'run-B')
+        _emit_finalized(store_a, request_id='mr-1', task_id='T', branch='feat', state='conflict')
+        _emit_finalized(store_b, request_id='mr-2', task_id='T', branch='feat', state='done')
+
+        row = store_b.latest_merge_finalized(branch='feat', cross_run=True)
+
+        assert row is not None
+        assert (row['state'], row['run_id'], row['is_current_run']) == ('done', 'run-B', True)
+
+    def test_cross_run_orders_by_insertion_not_by_current_run(self, tmp_path: Path) -> None:
+        db_path = tmp_path / 'runs.db'
+        store_a = EventStore(db_path, 'run-A')
+        store_b = EventStore(db_path, 'run-B')
+        _emit_finalized(store_b, request_id='mr-1', task_id='T', branch='feat', state='conflict')
+        _emit_finalized(store_a, request_id='mr-2', task_id='T', branch='feat', state='done')
+
+        row = store_b.latest_merge_finalized(branch='feat', cross_run=True)
+
+        assert row is not None
+        assert (row['request_id'], row['run_id'], row['is_current_run']) == (
+            'mr-2', 'run-A', False,
+        )
+
+    def test_default_mode_row_is_labelled_current_run(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'ev.db', 'run-lmf')
+        _emit_finalized(store, request_id='mr-c', task_id='T', branch='b', state='done')
+
+        row = store.latest_merge_finalized(request_id='mr-c')
+
+        assert row is not None
+        assert row['run_id'] == 'run-lmf'
+        assert row['is_current_run'] is True
+
+    def test_absorbed_request_ids_is_none_on_rows_written_without_the_key(
+        self, tmp_path: Path
+    ) -> None:
+        """Pre-task rows never recorded who they absorbed: unknown, not empty."""
+        store = EventStore(tmp_path / 'ev.db', 'run-lmf')
+        _emit_finalized(store, request_id='mr-legacy', task_id='T', branch='b', state='done')
+
+        row = store.latest_merge_finalized(request_id='mr-legacy')
+
+        assert row is not None
+        assert row['absorbed_request_ids'] is None
+
+    def test_absorbed_request_ids_round_trips_when_written(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'ev.db', 'run-lmf')
+        _emit_finalized(
+            store,
+            request_id='mr-p',
+            task_id='T',
+            branch='b',
+            state='done',
+            absorbed_request_ids=['mr-l1'],
+        )
+
+        row = store.latest_merge_finalized(request_id='mr-p')
+
+        assert row is not None
+        assert row['absorbed_request_ids'] == ['mr-l1']
+
+
+class TestMergeFinalizedSupersededBy:
+    """EventStore.merge_finalized_superseded_by — the member rows a train or generation superseded."""
+
+    @staticmethod
+    def _stores_with_members(tmp_path: Path) -> EventStore:
+        db_path = tmp_path / 'runs.db'
+        store_a = EventStore(db_path, 'run-A')
+        store_b = EventStore(db_path, 'run-B')
+        _emit_finalized(
+            store_a, request_id='mr-m1', task_id='T1', branch='b1', state='superseded',
+            superseded_by='coalesce-abc123',
+        )
+        _emit_finalized(
+            store_b, request_id='mr-m2', task_id='T2', branch='b2', state='superseded',
+            superseded_by='coalesce-abc123',
+        )
+        _emit_finalized(
+            store_b, request_id='mr-x', task_id='T9', branch='b9', state='superseded',
+            superseded_by='coalesce-other',
+        )
+        _emit_finalized(
+            store_b, request_id='mr-m3', task_id='T3', branch='b3', state='superseded',
+            superseded_by='coalesce-abc123',
+        )
+        _emit_finalized(
+            store_b, request_id='mr-plain', task_id='T4', branch='b4', state='done',
+            superseded_by=None,
+        )
+        return store_b
+
+    def test_cross_run_returns_every_member_in_emission_order(self, tmp_path: Path) -> None:
+        store_b = self._stores_with_members(tmp_path)
+
+        rows = store_b.merge_finalized_superseded_by('coalesce-abc123', cross_run=True)
+
+        assert [
+            (r['request_id'], r['run_id'], r['is_current_run']) for r in rows
+        ] == [
+            ('mr-m1', 'run-A', False),
+            ('mr-m2', 'run-B', True),
+            ('mr-m3', 'run-B', True),
+        ]
+        assert rows[1] == store_b.latest_merge_finalized(request_id='mr-m2')
+
+    def test_default_is_run_scoped(self, tmp_path: Path) -> None:
+        store_b = self._stores_with_members(tmp_path)
+
+        rows = store_b.merge_finalized_superseded_by('coalesce-abc123')
+
+        assert [r['request_id'] for r in rows] == ['mr-m2', 'mr-m3']
+
+    def test_unknown_and_empty_ids_return_empty_list(self, tmp_path: Path) -> None:
+        store_b = self._stores_with_members(tmp_path)
+
+        assert store_b.merge_finalized_superseded_by('coalesce-nope', cross_run=True) == []
+        assert store_b.merge_finalized_superseded_by('', cross_run=True) == []
+
+    def test_resolves_a_generation_successor_request_id(self, tmp_path: Path) -> None:
+        """Auto-chain supersession uses the same key: gen-(n+1)'s request id."""
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+        _emit_finalized(
+            store, request_id='mr-gen1', task_id='T', branch='b', state='superseded',
+            superseded_by='mr-gen2',
+        )
+
+        rows = store.merge_finalized_superseded_by('mr-gen2', cross_run=True)
+
+        assert [r['request_id'] for r in rows] == ['mr-gen1']
+
+
+class TestMergeFinalizedAbsorbing:
+    """EventStore.merge_finalized_absorbing — a loser's request_id resolves to its primary's row."""
+
+    def test_cross_run_resolves_a_loser_to_the_primary_row(self, tmp_path: Path) -> None:
+        db_path = tmp_path / 'runs.db'
+        store_a = EventStore(db_path, 'run-A')
+        _emit_finalized(
+            store_a, request_id='mr-p1', task_id='T', branch='b', state='blocked',
+            absorbed_request_ids=['mr-l1', 'mr-l2'],
+        )
+        store_b = EventStore(db_path, 'run-B')
+
+        row = store_b.merge_finalized_absorbing('mr-l2', cross_run=True)
+
+        assert row is not None
+        assert row['request_id'] == 'mr-p1'
+        assert row['state'] == 'blocked'
+        assert row['run_id'] == 'run-A'
+        assert row['is_current_run'] is False
+        assert row['absorbed_request_ids'] == ['mr-l1', 'mr-l2']
+
+    def test_default_is_run_scoped(self, tmp_path: Path) -> None:
+        db_path = tmp_path / 'runs.db'
+        store_a = EventStore(db_path, 'run-A')
+        _emit_finalized(
+            store_a, request_id='mr-p1', task_id='T', branch='b', state='blocked',
+            absorbed_request_ids=['mr-l1'],
+        )
+        store_b = EventStore(db_path, 'run-B')
+
+        assert store_b.merge_finalized_absorbing('mr-l1') is None
+        own_run = store_a.merge_finalized_absorbing('mr-l1')
+        assert own_run is not None
+        assert own_run['request_id'] == 'mr-p1'
+
+    def test_most_recent_absorbing_row_wins(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+        _emit_finalized(
+            store, request_id='mr-p-old', task_id='T', branch='b', state='conflict',
+            absorbed_request_ids=['mr-l1'],
+        )
+        _emit_finalized(
+            store, request_id='mr-p-new', task_id='T', branch='b', state='done',
+            absorbed_request_ids=['mr-l1'],
+        )
+
+        row = store.merge_finalized_absorbing('mr-l1', cross_run=True)
+
+        assert row is not None
+        assert row['request_id'] == 'mr-p-new'
+
+    def test_matches_whole_ids_only_never_a_prefix(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+        _emit_finalized(
+            store, request_id='mr-p1', task_id='T', branch='b', state='done',
+            absorbed_request_ids=['mr-l1'],
+        )
+
+        assert store.merge_finalized_absorbing('mr-l', cross_run=True) is None
+
+    def test_rows_with_no_absorbed_ids_never_match(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+        _emit_finalized(store, request_id='mr-legacy', task_id='T', branch='b', state='done')
+        _emit_finalized(
+            store, request_id='mr-empty', task_id='T', branch='b', state='done',
+            absorbed_request_ids=[],
+        )
+        _emit_finalized(
+            store, request_id='mr-null', task_id='T', branch='b', state='done',
+            absorbed_request_ids=None,
+        )
+
+        assert store.merge_finalized_absorbing('mr-legacy', cross_run=True) is None
+        assert store.merge_finalized_absorbing('mr-l1', cross_run=True) is None
+
+    def test_empty_id_returns_none(self, tmp_path: Path) -> None:
+        store = EventStore(tmp_path / 'runs.db', 'run-A')
+        _emit_finalized(
+            store, request_id='mr-p1', task_id='T', branch='b', state='done',
+            absorbed_request_ids=[''],
+        )
+
+        assert store.merge_finalized_absorbing('', cross_run=True) is None
 
 
 class TestFetchEventsByTypeAllRuns:

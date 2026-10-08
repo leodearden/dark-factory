@@ -577,6 +577,13 @@ JSON with `description`/`affected_ids`/`actionable`), and `dedupe_count`.
 action). `action='close_only'` → status `dismissed` (accepted-as-known, no action).
 Both archive the record. Be specific in the note — it is the only audit trail.
 
+**Runtime-behaviour findings:** a verify-fixed or accept-as-known close on a
+finding about runtime behaviour needs its check run in that runtime's execution
+context; a check from your own session that fails to reproduce it is a
+non-reproduction, not a refutation. The resolution note names the context the
+check ran in. Single normative statement of the rule:
+`orchestrator/src/orchestrator/agents/premise_refutation_guidance.py::PREMISE_REFUTATION_GUIDANCE`.
+
 ## Per-Category Playbook
 
 - **`recon_integrity_issue`** (info) — memory/task consistency findings. Run the

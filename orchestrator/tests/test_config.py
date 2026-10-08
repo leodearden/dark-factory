@@ -3714,6 +3714,28 @@ class TestMainTipSweepIsolatedPrefilterEnabled:
         )
 
 
+class TestMainTipSweepColdIntervalSecs:
+    """task 5812: the main-tip sweep builds warm by default, and at most once
+    per this many seconds runs a COLD control sweep as ground truth."""
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_defaults_to_one_day(self):
+        assert OrchestratorConfig().main_tip_sweep_cold_interval_secs == 86400.0
+
+    def test_zero_round_trips(self):
+        """Zero means every sweep cold — the pre-5812 behaviour."""
+        config = OrchestratorConfig(main_tip_sweep_cold_interval_secs=0)
+        assert config.main_tip_sweep_cold_interval_secs == 0
+
+    def test_negative_rejected(self):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(main_tip_sweep_cold_interval_secs=-1)
+
+    def test_not_in_reloadable_fields(self):
+        """Restart-only, the same tier as the rest of the main_tip_sweep family."""
+        assert 'main_tip_sweep_cold_interval_secs' not in RELOADABLE_FIELDS
+
+
 # ---------------------------------------------------------------------------
 # task 3227: coerce_tier() observability — warn on real anomalies only
 # ---------------------------------------------------------------------------

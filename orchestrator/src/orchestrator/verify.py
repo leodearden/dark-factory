@@ -45,6 +45,7 @@ from orchestrator.config import ModuleConfig, OrchestratorConfig
 # surface is what makes that structural rather than a reviewing burden.
 # flake_ledger depends only on shared.sqlite_sync_base, so there is no cycle.
 from orchestrator.flake_ledger import FlakeCallSite, FlakeSuppression, FlakeVerdict
+from orchestrator.main_tip_sweep_cadence import SweepSeedMode
 from orchestrator.verify_categories import (
     ARCHIVE_DENY_LIST as _ARCHIVE_DENY_LIST,  # noqa: F401 — re-exported for external consumers
 )
@@ -1573,9 +1574,9 @@ async def _on_main_probe_worktree(
 
     warm_seed=True: the probe shares the rolling warm-lane CoW base with the
     ordinary task verifies it adjudicates, so any warm-base artifact bias is
-    common-mode across both sides of the comparison; the COLD ground truth
-    stays with MAIN_SWEEP and the '_mainsweepconfirm-' confirm worktree
-    (operator sign-off 2026-08-12, task-2567 suggestion).
+    common-mode across both sides of the comparison; the COLD ground truth is
+    the main-tip sweep's periodic cold control plus the '_mainsweepconfirm-'
+    confirm worktree (task 5812, superseding the 2026-08-12 ruling).
     """
     from orchestrator.git_ops import EphemeralWorktreeError, WorktreeKind
 
@@ -7501,6 +7502,7 @@ async def run_full_verification(
     *,
     force_rediscover: bool = False,
     role: Literal['merge', 'task', 'background'] = 'task',
+    max_retries: int | None = None,
 ) -> VerifyResult:
     """Run verification for ALL subprojects against the project root.
 
@@ -7520,6 +7522,10 @@ async def run_full_verification(
     Accepted trade-off (operator ruling 2026-08-12, task-2391 suggestion):
     one pool is the admission gate's entire point — a single bound on total
     concurrent pytest — and the inversion is per-leg-bounded and latency-only.
+
+    *max_retries* overrides ``config.verify_timeout_retries`` for every
+    internal :func:`run_verification`; ``None`` keeps the config default, and
+    ``run_main_tip_sweep`` passes ``0`` (task 5812).
 
     Discovery reuse: ``config._module_configs`` uses a sentinel of ``None`` to
     mean "discovery never ran".  When it holds any dict (including ``{}``,
@@ -7554,14 +7560,19 @@ async def run_full_verification(
         module_configs = _discover_module_configs(project_root)
     if not module_configs:
         logger.info('Full verification: no subproject configs — using global')
-        return await run_verification(project_root, config, role=role)
+        return await run_verification(
+            project_root, config, role=role, max_retries=max_retries,
+        )
 
     logger.info(
         'Full verification: running %d subprojects in parallel',
         len(module_configs),
     )
     results = await asyncio.gather(
-        *(run_verification(project_root, config, mc, role=role) for mc in module_configs.values())
+        *(
+            run_verification(project_root, config, mc, role=role, max_retries=max_retries)
+            for mc in module_configs.values()
+        )
     )
     return _aggregate_results(list(results))
 
@@ -8896,10 +8907,10 @@ async def verify_failure_is_preexisting_on_main(
         # warm base exists — see ephemeral_worktree's warm_seed docstring.
         # Sharing the warm base with ordinary task verification means any
         # stale-artifact bias is common-mode across the "preexisting on
-        # main?" comparison; the COLD ground truth remains MAIN_SWEEP plus
-        # the '_mainsweepconfirm-' confirm worktree (operator sign-off
-        # 2026-08-12, task-2567 suggestion — cold here would cost 30-45min
-        # per probe on the contagion-guard hot path).
+        # main?" comparison; the COLD ground truth is the main-tip sweep's
+        # periodic cold control plus the cold '_mainsweepconfirm-' confirm
+        # worktree (task 5812, superseding 2026-08-12 — cold here would
+        # cost 30-45min per probe on the contagion-guard hot path).
         async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
             WorktreeKind.MAIN_PROBE, main_sha, warm_seed=True,
         ) as tmp_path:
@@ -8994,6 +9005,7 @@ async def run_main_tip_sweep(
     git_ops: object,
     *,
     main_sha: str | None = None,
+    seed_mode: SweepSeedMode = SweepSeedMode.COLD,
 ) -> 'tuple[str, VerifyResult] | None':
     """Run a full unscoped verification sweep against the current main-tip SHA.
 
@@ -9011,6 +9023,11 @@ async def run_main_tip_sweep(
             subprocess and closing the TOCTOU window between the harness
             SHA-dedup gate and the worktree pin.  Callers that already resolved
             the SHA (e.g. ``_run_main_tip_sweep`` in harness.py) should pass it.
+        seed_mode: Chosen per sweep by the harness's ``MainSweepColdControl``.
+            ``COLD`` (the default) builds from nothing: the ground truth.
+            ``WARM`` CoW-seeds ``target/`` from the warm-lane base as a
+            read-only consumer, failing soft to cold.  The
+            ``_mainsweepconfirm-`` confirm worktree always stays cold.
 
     Returns:
         ``(main_sha, VerifyResult)`` on success (result.passed may be False).
@@ -9050,15 +9067,20 @@ async def run_main_tip_sweep(
     before.
 
     Retry-on-flake: when the first ``run_full_verification`` call fails (and its
-    category is NOT one of the infra sentinels above, and the pre-filter did not
-    short-circuit), the function re-runs it ONCE in the same pinned worktree
-    (idempotent; no second ``git worktree add``).  **The retry reuses first-pass
-    worktree state by design** — no cleanup of temp files, partially-written
-    DBs, or caches is performed before the re-run.  This is intentional: the
+    category is NOT one of the infra sentinels above, NOT ``INFRA_TIMEOUT``, and
+    the pre-filter did not short-circuit), the function re-runs it ONCE in the
+    same pinned worktree (idempotent; no second ``git worktree add``).  **The
+    retry reuses first-pass worktree state by design** — no cleanup of temp
+    files, partially-written DBs, or caches is performed before the re-run.  This is intentional: the
     purpose is a fast flake-vs-drift heuristic, not a hermetic isolation
     guarantee.  A first run that fails partway may leave residue that makes the
     retry non-representative in either direction; the single-retry bound and the
-    two-failure-escalates rule limit the blast radius.
+    two-failure-escalates rule limit the blast radius.  Host CPU is the
+    throughput bottleneck (task 5812), so both passes run with
+    ``max_retries=0`` and an ``INFRA_TIMEOUT`` first pass is returned as-is,
+    never retried in full.  It names no failing test, so the harness's confirm
+    gate cannot check it: the harness files it unless main has moved on, and
+    does not count it as a cold verdict.
 
     - Retry PASSES → emit a WARNING, append a record to
       ``verify._suppressed_flake_records`` (durable in-process audit trail), and
@@ -9106,6 +9128,7 @@ async def run_main_tip_sweep(
         # contract.
         async with git_ops.ephemeral_worktree(  # type: ignore[union-attr]
             WorktreeKind.MAIN_SWEEP, main_sha,
+            warm_seed=seed_mode is SweepSeedMode.WARM,
         ) as tmp_path:
             def _enoent_on_self(r: 'VerifyResult') -> bool:
                 """SECONDARY backstop (task 2507): True iff *r* is a
@@ -9136,7 +9159,10 @@ async def run_main_tip_sweep(
             # role='background' (lowest nice tier — task 2391/PRD T3): the sweep is a
             # background asyncio.Task with no dispatch/merge/deploy path awaiting it, so
             # its fan-out should never contend with real task/merge lane verifies.
-            result = await run_full_verification(tmp_path, config, role='background')  # type: ignore[arg-type]
+            # max_retries=0 (task 5812): no pure-timeout re-runs on either pass.
+            result = await run_full_verification(  # type: ignore[arg-type]
+                tmp_path, config, role='background', max_retries=0,
+            )
 
             # pytest INTERNALERROR means the test infrastructure itself crashed (e.g. an
             # xdist worker was killed by os._exit).  env_transient means a concurrent
@@ -9165,6 +9191,15 @@ async def run_main_tip_sweep(
                 return None
 
             if not result.passed:
+                _sha_prefix = main_sha[:12] if main_sha else '?'
+                if result.category == FailureCategory.INFRA_TIMEOUT:
+                    logger.warning(
+                        'run_main_tip_sweep: first-pass sweep timed out at %s '
+                        '(cause_hint=%r) — returning the timeout verdict '
+                        'without a full-suite retry (task 5812)',
+                        _sha_prefix, result.cause_hint,
+                    )
+                    return (main_sha, result)
                 # First pass failed (not an INTERNALERROR).  Re-run once in the same
                 # pinned worktree to distinguish a transient load-sensitive flake from
                 # deterministic drift.  A second worktree add is NOT needed — the
@@ -9172,7 +9207,6 @@ async def run_main_tip_sweep(
                 # NOTE: worktree state (temp files, partially-written DBs, caches) from
                 # the first run is NOT reset before the retry — this is intentional (fast
                 # heuristic, not hermetic isolation; see docstring for tradeoff discussion).
-                _sha_prefix = main_sha[:12] if main_sha else '?'
                 logger.warning(
                     'run_main_tip_sweep: first-pass verification failed at %s '
                     '(category=%r, cause_hint=%r) — retrying once in the same '
@@ -9221,7 +9255,9 @@ async def run_main_tip_sweep(
                     )
                     return (main_sha, result)
 
-                retry = await run_full_verification(tmp_path, config, role='background')  # type: ignore[arg-type]
+                retry = await run_full_verification(  # type: ignore[arg-type]
+                    tmp_path, config, role='background', max_retries=0,
+                )
 
                 if retry.category in INFRA_TRANSIENT_CATEGORIES:
                     logger.warning(

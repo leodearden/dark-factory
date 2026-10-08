@@ -4421,6 +4421,7 @@ async def enqueue_merge_request(
     *,
     retention: TerminalOutcomeRetention | None = None,
     source: str | None = None,
+    registry: InFlightMergeRegistry | None = None,
 ) -> None:
     """Enqueue a MergeRequest and emit a merge_queued event.
 
@@ -4443,7 +4444,18 @@ async def enqueue_merge_request(
     ``merge_finalized`` event and records the outcome into *retention* (when
     provided).  The callback is fire-and-forget: any exception is logged as a
     warning and never propagates.
+
+    That row's ``absorbed_request_ids`` lists the requests that resolve to this
+    one's outcome without a row of their own: the waiters and door-coalesced
+    ids of the *registry* slot *req* owns at enqueue time, else ``[]``
+    (PRD plans/merge-status-durable-non-landed-prd.md D7).
     """
+    absorbing = (
+        registry.primary_entry(req.branch.bare_id, req.result)
+        if registry is not None
+        else None
+    )
+
     def _on_finalized(fut: asyncio.Future) -> None:  # noqa: ANN001
         # --- derive terminal state -------------------------------------------
         superseded_by: str | None = None
@@ -4509,6 +4521,11 @@ async def enqueue_merge_request(
                         'generation': req.generation,
                         'reason': reason,
                         'landed_via_chain': landed_via_chain,
+                        'absorbed_request_ids': (
+                            list(absorbing.absorbed_request_ids())
+                            if absorbing is not None
+                            else []
+                        ),
                     },
                 )
             except Exception:  # noqa: BLE001
@@ -4716,7 +4733,9 @@ async def register_and_enqueue_merge_request(
         else False
     )
     try:
-        await enqueue_merge_request(queue, req, event_store, retention=retention)
+        await enqueue_merge_request(
+            queue, req, event_store, retention=retention, registry=registry,
+        )
     except BaseException:
         # Slot-leak guard: if the enqueue raises before the worker can ever
         # resolve req.result, the done_callback will never fire.  Release the
@@ -5269,6 +5288,7 @@ async def coalesce_or_enqueue_merge_request(
                         try:
                             await enqueue_merge_request(
                                 queue, req, event_store, retention=retention,
+                                registry=registry,
                             )
                         except BaseException:
                             # Slot-leak guard (mirrors the acquire-and-enqueue tail):
@@ -5295,6 +5315,7 @@ async def coalesce_or_enqueue_merge_request(
                 # a fresh request that gets its own terminal record.
                 if retention is not None and entry.request_id is not None:
                     retention.record_alias(req.request_id, entry.request_id)
+                registry.record_coalesced(branch, req.request_id)
                 _emit_merge_coalesced(event_store, req, source='registry', eta=eta)
                 return MergeDispatchResult(
                     dispatched=False,
@@ -5416,7 +5437,9 @@ async def coalesce_or_enqueue_merge_request(
     # ── 3. Atomic acquire-and-enqueue ─────────────────────────────────
     if registry.acquire(branch, req.task_id, req.result, request_id=req.request_id):
         try:
-            await enqueue_merge_request(queue, req, event_store, retention=retention)
+            await enqueue_merge_request(
+                queue, req, event_store, retention=retention, registry=registry,
+            )
         except BaseException:
             # Slot leak guard: if the enqueue raises (e.g. queue closed,
             # cancellation) before the worker can ever resolve req.result,
@@ -5435,6 +5458,7 @@ async def coalesce_or_enqueue_merge_request(
     entry = registry.entry(branch)
     if retention is not None and entry is not None and entry.request_id is not None:
         retention.record_alias(req.request_id, entry.request_id)
+    registry.record_coalesced(branch, req.request_id)
     _emit_merge_coalesced(event_store, req, source='registry', eta=eta)
     return MergeDispatchResult(
         dispatched=False,

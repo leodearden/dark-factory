@@ -1223,7 +1223,10 @@ def test_null_done_count_baseline_makes_condition_b_fail_safe(tmp_path, caplog):
     decision = census_trigger.evaluate(
         now=now,
         last_census_at=now - timedelta(days=config.tasks_landed_min_days + 1),
-        never_censused=False,
+        floor_anchor=census_trigger.FloorAnchor(
+            census_trigger.FloorAnchorKind.SESSION_WATERMARK,
+            now - timedelta(days=config.tasks_landed_min_days + 1),
+        ),
         tasks_landed=None,
         candidate_first_seens=[],
         config=config,

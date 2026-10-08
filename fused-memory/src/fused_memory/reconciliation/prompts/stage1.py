@@ -1,5 +1,7 @@
 """System prompt for Stage 1: Memory Consolidator."""
 
+import json
+
 from fused_memory.memory_metadata import render_metadata_vocabulary_guidance
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
@@ -13,6 +15,9 @@ from fused_memory.reconciliation.internal_writers import (
 from fused_memory.reconciliation.live_workflow_section import (
     NOT_LIVE_TOKEN,
     render_live_workflow_authority_rules,
+)
+from fused_memory.reconciliation.preservation_specimen_guard import (
+    preservation_mem0_filters,
 )
 from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
@@ -63,6 +68,11 @@ EXECUTING_A_CLUSTER_FOLD_HEADING = f'## {EXECUTING_A_CLUSTER_FOLD_TITLE}'
 LIVE_STATE_FRESHNESS_TITLE = 'Live-State Freshness Before Re-Flagging'
 LIVE_STATE_FRESHNESS_HEADING = f'## {LIVE_STATE_FRESHNESS_TITLE}'
 
+#: The preserved-specimen section's heading (task 5465), exported for the same
+#: reason, for ``tests/reconciliation/test_stage1_preservation_specimen_prompt.py``.
+PRESERVED_SPECIMEN_CORROBORATION_TITLE = 'Preserved-Specimen Corroboration'
+PRESERVED_SPECIMEN_CORROBORATION_HEADING = f'## {PRESERVED_SPECIMEN_CORROBORATION_TITLE}'
+
 _CHILD_KIND_NAMES = ' or '.join(f'`{kind}`' for kind in sorted(CHILD_KINDS))
 
 #: The Authority-Model carve-out for child memories (task 6193), exported so
@@ -110,6 +120,11 @@ duplicate Mem0 cluster into one canonical entry, in place of a hand-rolled \
 - `mcp__fused-memory__get_memory_by_id` — read one Mem0 entry by id, returning its \
 RAW stored payload under `metadata` (including the `agent_id` that wrote it, which \
 search results do NOT carry)
+- `mcp__fused-memory__get_memories_by_metadata` — enumerate the Mem0 entries whose \
+metadata EQUALS every key in `filters`. A deterministic payload scroll, not a ranked \
+`search`, so a low-similarity match is never cut off; each row's `metadata` is the raw \
+stored payload, prose included. See the **{PRESERVED_SPECIMEN_CORROBORATION_TITLE}** \
+section below.
 - `mcp__fused-memory__update_edge` — update an existing edge's fact text directly (no LLM pipeline)
 {AMEND_AND_EPISODE_TOOLS_BLOCK}
 - `mcp__fused-memory__refresh_entity_summary` — regenerate an entity node's summary \
@@ -1015,7 +1030,7 @@ neither through a per-task signal nor through the project-wide lock — and none
 landing evidence; no live-workflow suppression applies, and stranded/blocked-escalation \
 flags may be emitted normally.
 
-## Preserved-Specimen Corroboration
+{PRESERVED_SPECIMEN_CORROBORATION_HEADING}
 Absence of a live-workflow signal is necessary for the stranded claim but it is NOT \
 sufficient. Some tasks are left `in-progress` with a null claimant and a null heartbeat \
 DELIBERATELY, because that state is itself the evidence something else is waiting on — \
@@ -1025,8 +1040,10 @@ signals alone, and a reset would destroy the very thing it is being kept for.
 **Before asserting that a no-claimant / dead-heartbeat `in-progress` task is stranded, \
 corroborate that its state is unintentional.** Two places already hold the answer:
 1. `get_entity('Task <id>')` — a preserved specimen usually has an edge saying so.
-2. the task's `investigation_outcome` memories — a prior cycle that adjudicated this \
-   exact question records its verdict there.
+2. `mcp__fused-memory__get_memories_by_metadata(project_id=..., \
+filters={json.dumps(preservation_mem0_filters('<id>'))})` — the prior cycles' recorded not-actionable \
+verdicts on this exact question; read each row's prose. Use this scroll rather than \
+`search`, whose top-N cutoff can drop the one row that matters.
 
 If either names the task as a preserved / validation specimen, do NOT recommend a status \
 reset, a redispatch, or an operator gate task. Emit the finding at `severity='info'` with \

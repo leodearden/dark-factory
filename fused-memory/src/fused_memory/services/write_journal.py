@@ -880,7 +880,7 @@ class WriteJournal:
         category: str | None = None,
         content: str,
         metadata: dict | None = None,
-        payload_digest: str,
+        payload_digest: str | None,
     ) -> None:
         """Write-ahead a Mem0 write intent.
 

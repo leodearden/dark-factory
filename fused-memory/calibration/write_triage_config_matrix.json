@@ -1,0 +1,1727 @@
+{
+  "reference_arm": "gpt-4o-mini@5",
+  "reference_settings": {
+    "judge_provider": "openai",
+    "judge_model": "gpt-4o-mini",
+    "judge_reasoning_effort": null,
+    "judge_candidate_count": 5,
+    "wording": "shipped",
+    "field_chars": 4000
+  },
+  "population": {
+    "n_writes": 1517,
+    "n_judge_band": 658,
+    "projects": [
+      "dark_factory",
+      "reify"
+    ],
+    "frozen_at": "2026-10-05T10:01:34.841370+00:00",
+    "snapshot_sha256": "55398cd73c9a355d05f9454a2e1cca9e7da760bd89df141b2f6b5b8f28293e38"
+  },
+  "verdict_corpus": {
+    "pairs": 1216,
+    "ratings": 1216,
+    "raters": [
+      "majority"
+    ],
+    "resolutions": {
+      "agreeing": 555,
+      "corrects": 129,
+      "misfile": 532,
+      "unclear": 0,
+      "tied": 0
+    }
+  },
+  "list_prices": {
+    "as_of": "2026-09-30",
+    "source": "https://developers.openai.com/api/docs/pricing",
+    "usd_per_million_tokens": {
+      "gpt-4o-mini": {
+        "input": 0.15,
+        "output": 0.6
+      },
+      "gpt-6-luna": {
+        "input": 0.1,
+        "output": 0.5
+      },
+      "gpt-5.6-luna": {
+        "input": 0.2,
+        "output": 1.2
+      },
+      "gpt-5.6-terra": {
+        "input": 2.0,
+        "output": 12.0
+      },
+      "gpt-6.1-sol": {
+        "input": 2.0,
+        "output": 10.0
+      },
+      "gpt-5.6-sol": {
+        "input": 4.0,
+        "output": 20.0
+      },
+      "gpt-6-astra": {
+        "input": 10.0,
+        "output": 50.0
+      }
+    }
+  },
+  "arms": [
+    {
+      "arm": "gpt-4o-mini@5",
+      "status": "scored",
+      "selection": {
+        "judge_provider": "openai",
+        "judge_model": "gpt-4o-mini",
+        "judge_reasoning_effort": null,
+        "judge_candidate_count": 5,
+        "wording": "shipped",
+        "field_chars": 4000,
+        "p95_judge_seconds": 2.051,
+        "cost_per_write_usd": 0.000439
+      },
+      "quality": {
+        "attaches": 433,
+        "unclear_attaches": 0,
+        "misfiles": 113,
+        "misfile_rate_of_attaches": 0.261,
+        "misfile_rate_wilson95": [
+          0.2218,
+          0.3043
+        ],
+        "duplicates_placed": 320,
+        "contradictions_attached": 48,
+        "contradictions_contested": 34,
+        "contradiction_recall": 0.7083,
+        "agreeing_attaches": 272,
+        "agreeing_contested": 104,
+        "false_contested_rate": 0.3824,
+        "true_links": 466,
+        "true_links_answered_distinct": 94,
+        "true_links_answered_distinct_rate": 0.2017,
+        "contested_decision_errors": 206,
+        "parse_failures": 0,
+        "unrated_pairs": 0,
+        "unrated_pair_ids": []
+      },
+      "runtime": {
+        "judge_calls": 658,
+        "untimed_calls": 0,
+        "p50_judge_seconds": 1.226,
+        "p95_judge_seconds": 2.051,
+        "judge_models": [
+          "gpt-4o-mini"
+        ],
+        "unpriced_calls": 0,
+        "cost_per_write_usd": 0.000439
+      },
+      "paired_vs_reference": null,
+      "bounds": {
+        "met": false,
+        "checks": [
+          {
+            "check": "best:quality.misfile_rate_of_attaches <= 0.08",
+            "actual": 0.261,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:quality.contradiction_recall >= 0.60",
+            "actual": 0.7083,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:quality.false_contested_rate <= 0.10",
+            "actual": 0.3824,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:selection.p95_judge_seconds <= 8.0",
+            "actual": 2.051,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:selection.cost_per_write_usd <= 0.01",
+            "actual": 0.000439,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:quality.unrated_pairs <= 0",
+            "actual": 0,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:population.n_judge_band >= 300",
+            "actual": 658,
+            "ok": true,
+            "note": null
+          }
+        ]
+      }
+    },
+    {
+      "arm": "gpt-4o-mini@5+pre-psi",
+      "status": "scored",
+      "selection": {
+        "judge_provider": "openai",
+        "judge_model": "gpt-4o-mini",
+        "judge_reasoning_effort": null,
+        "judge_candidate_count": 5,
+        "wording": "pre-psi",
+        "field_chars": 4000,
+        "p95_judge_seconds": 1.973,
+        "cost_per_write_usd": 0.000445
+      },
+      "quality": {
+        "attaches": 423,
+        "unclear_attaches": 0,
+        "misfiles": 105,
+        "misfile_rate_of_attaches": 0.2482,
+        "misfile_rate_wilson95": [
+          0.2094,
+          0.2915
+        ],
+        "duplicates_placed": 318,
+        "contradictions_attached": 42,
+        "contradictions_contested": 5,
+        "contradiction_recall": 0.119,
+        "agreeing_attaches": 276,
+        "agreeing_contested": 4,
+        "false_contested_rate": 0.0145,
+        "true_links": 466,
+        "true_links_answered_distinct": 96,
+        "true_links_answered_distinct_rate": 0.206,
+        "contested_decision_errors": 49,
+        "parse_failures": 0,
+        "unrated_pairs": 0,
+        "unrated_pair_ids": []
+      },
+      "runtime": {
+        "judge_calls": 658,
+        "untimed_calls": 0,
+        "p50_judge_seconds": 1.21,
+        "p95_judge_seconds": 1.973,
+        "judge_models": [
+          "gpt-4o-mini"
+        ],
+        "unpriced_calls": 0,
+        "cost_per_write_usd": 0.000445
+      },
+      "paired_vs_reference": {
+        "misfile": {
+          "n_common": 658,
+          "only_arm": 23,
+          "only_reference": 31,
+          "mcnemar_p": 0.3409,
+          "parent_sign_test": {
+            "groups_favouring_arm": 31,
+            "groups_favouring_reference": 23,
+            "p": 0.3409
+          }
+        },
+        "contested_decision_error": {
+          "n_common": 658,
+          "only_arm": 22,
+          "only_reference": 179,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 171,
+            "groups_favouring_reference": 20,
+            "p": 0.0
+          }
+        },
+        "missed_contradiction": {
+          "n_common": 658,
+          "only_arm": 23,
+          "only_reference": 0,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 0,
+            "groups_favouring_reference": 23,
+            "p": 0.0
+          }
+        },
+        "false_contested": {
+          "n_common": 658,
+          "only_arm": 0,
+          "only_reference": 100,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 97,
+            "groups_favouring_reference": 0,
+            "p": 0.0
+          }
+        },
+        "true_link_answered_distinct": {
+          "n_common": 658,
+          "only_arm": 18,
+          "only_reference": 16,
+          "mcnemar_p": 0.8642,
+          "parent_sign_test": {
+            "groups_favouring_arm": 16,
+            "groups_favouring_reference": 17,
+            "p": 1.0
+          }
+        }
+      },
+      "bounds": {
+        "met": false,
+        "checks": [
+          {
+            "check": "best:quality.misfile_rate_of_attaches <= 0.08",
+            "actual": 0.2482,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:quality.contradiction_recall >= 0.60",
+            "actual": 0.119,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:quality.false_contested_rate <= 0.10",
+            "actual": 0.0145,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:selection.p95_judge_seconds <= 8.0",
+            "actual": 1.973,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:selection.cost_per_write_usd <= 0.01",
+            "actual": 0.000445,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:quality.unrated_pairs <= 0",
+            "actual": 0,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:population.n_judge_band >= 300",
+            "actual": 658,
+            "ok": true,
+            "note": null
+          }
+        ]
+      }
+    },
+    {
+      "arm": "gpt-4o-mini@20",
+      "status": "scored",
+      "selection": {
+        "judge_provider": "openai",
+        "judge_model": "gpt-4o-mini",
+        "judge_reasoning_effort": null,
+        "judge_candidate_count": 20,
+        "wording": "shipped",
+        "field_chars": 4000,
+        "p95_judge_seconds": 2.998,
+        "cost_per_write_usd": 0.001271
+      },
+      "quality": {
+        "attaches": 486,
+        "unclear_attaches": 0,
+        "misfiles": 148,
+        "misfile_rate_of_attaches": 0.3045,
+        "misfile_rate_wilson95": [
+          0.2653,
+          0.3468
+        ],
+        "duplicates_placed": 338,
+        "contradictions_attached": 45,
+        "contradictions_contested": 35,
+        "contradiction_recall": 0.7778,
+        "agreeing_attaches": 293,
+        "agreeing_contested": 120,
+        "false_contested_rate": 0.4096,
+        "true_links": 466,
+        "true_links_answered_distinct": 55,
+        "true_links_answered_distinct_rate": 0.118,
+        "contested_decision_errors": 246,
+        "parse_failures": 6,
+        "unrated_pairs": 0,
+        "unrated_pair_ids": []
+      },
+      "runtime": {
+        "judge_calls": 658,
+        "untimed_calls": 0,
+        "p50_judge_seconds": 1.422,
+        "p95_judge_seconds": 2.998,
+        "judge_models": [
+          "gpt-4o-mini"
+        ],
+        "unpriced_calls": 0,
+        "cost_per_write_usd": 0.001271
+      },
+      "paired_vs_reference": {
+        "misfile": {
+          "n_common": 658,
+          "only_arm": 57,
+          "only_reference": 22,
+          "mcnemar_p": 0.0001,
+          "parent_sign_test": {
+            "groups_favouring_arm": 21,
+            "groups_favouring_reference": 56,
+            "p": 0.0001
+          }
+        },
+        "contested_decision_error": {
+          "n_common": 658,
+          "only_arm": 75,
+          "only_reference": 35,
+          "mcnemar_p": 0.0002,
+          "parent_sign_test": {
+            "groups_favouring_arm": 35,
+            "groups_favouring_reference": 75,
+            "p": 0.0002
+          }
+        },
+        "missed_contradiction": {
+          "n_common": 658,
+          "only_arm": 2,
+          "only_reference": 6,
+          "mcnemar_p": 0.2891,
+          "parent_sign_test": {
+            "groups_favouring_arm": 6,
+            "groups_favouring_reference": 2,
+            "p": 0.2891
+          }
+        },
+        "false_contested": {
+          "n_common": 658,
+          "only_arm": 41,
+          "only_reference": 25,
+          "mcnemar_p": 0.064,
+          "parent_sign_test": {
+            "groups_favouring_arm": 24,
+            "groups_favouring_reference": 40,
+            "p": 0.0599
+          }
+        },
+        "true_link_answered_distinct": {
+          "n_common": 658,
+          "only_arm": 12,
+          "only_reference": 51,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 51,
+            "groups_favouring_reference": 12,
+            "p": 0.0
+          }
+        }
+      },
+      "bounds": {
+        "met": false,
+        "checks": [
+          {
+            "check": "best:quality.misfile_rate_of_attaches <= 0.08",
+            "actual": 0.3045,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:quality.contradiction_recall >= 0.60",
+            "actual": 0.7778,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:quality.false_contested_rate <= 0.10",
+            "actual": 0.4096,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:selection.p95_judge_seconds <= 8.0",
+            "actual": 2.998,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:selection.cost_per_write_usd <= 0.01",
+            "actual": 0.001271,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:quality.unrated_pairs <= 0",
+            "actual": 0,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:population.n_judge_band >= 300",
+            "actual": 658,
+            "ok": true,
+            "note": null
+          }
+        ]
+      }
+    },
+    {
+      "arm": "gpt-4o-mini@20+pre-psi",
+      "status": "scored",
+      "selection": {
+        "judge_provider": "openai",
+        "judge_model": "gpt-4o-mini",
+        "judge_reasoning_effort": null,
+        "judge_candidate_count": 20,
+        "wording": "pre-psi",
+        "field_chars": 4000,
+        "p95_judge_seconds": 2.601,
+        "cost_per_write_usd": 0.001278
+      },
+      "quality": {
+        "attaches": 500,
+        "unclear_attaches": 0,
+        "misfiles": 149,
+        "misfile_rate_of_attaches": 0.298,
+        "misfile_rate_wilson95": [
+          0.2596,
+          0.3395
+        ],
+        "duplicates_placed": 351,
+        "contradictions_attached": 46,
+        "contradictions_contested": 5,
+        "contradiction_recall": 0.1087,
+        "agreeing_attaches": 305,
+        "agreeing_contested": 10,
+        "false_contested_rate": 0.0328,
+        "true_links": 466,
+        "true_links_answered_distinct": 44,
+        "true_links_answered_distinct_rate": 0.0944,
+        "contested_decision_errors": 60,
+        "parse_failures": 3,
+        "unrated_pairs": 0,
+        "unrated_pair_ids": []
+      },
+      "runtime": {
+        "judge_calls": 658,
+        "untimed_calls": 0,
+        "p50_judge_seconds": 1.426,
+        "p95_judge_seconds": 2.601,
+        "judge_models": [
+          "gpt-4o-mini"
+        ],
+        "unpriced_calls": 0,
+        "cost_per_write_usd": 0.001278
+      },
+      "paired_vs_reference": {
+        "misfile": {
+          "n_common": 658,
+          "only_arm": 66,
+          "only_reference": 30,
+          "mcnemar_p": 0.0003,
+          "parent_sign_test": {
+            "groups_favouring_arm": 29,
+            "groups_favouring_reference": 65,
+            "p": 0.0003
+          }
+        },
+        "contested_decision_error": {
+          "n_common": 658,
+          "only_arm": 32,
+          "only_reference": 178,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 170,
+            "groups_favouring_reference": 29,
+            "p": 0.0
+          }
+        },
+        "missed_contradiction": {
+          "n_common": 658,
+          "only_arm": 30,
+          "only_reference": 3,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 3,
+            "groups_favouring_reference": 30,
+            "p": 0.0
+          }
+        },
+        "false_contested": {
+          "n_common": 658,
+          "only_arm": 5,
+          "only_reference": 99,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 95,
+            "groups_favouring_reference": 4,
+            "p": 0.0
+          }
+        },
+        "true_link_answered_distinct": {
+          "n_common": 658,
+          "only_arm": 9,
+          "only_reference": 59,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 59,
+            "groups_favouring_reference": 9,
+            "p": 0.0
+          }
+        }
+      },
+      "bounds": {
+        "met": false,
+        "checks": [
+          {
+            "check": "best:quality.misfile_rate_of_attaches <= 0.08",
+            "actual": 0.298,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:quality.contradiction_recall >= 0.60",
+            "actual": 0.1087,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:quality.false_contested_rate <= 0.10",
+            "actual": 0.0328,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:selection.p95_judge_seconds <= 8.0",
+            "actual": 2.601,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:selection.cost_per_write_usd <= 0.01",
+            "actual": 0.001278,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:quality.unrated_pairs <= 0",
+            "actual": 0,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:population.n_judge_band >= 300",
+            "actual": 658,
+            "ok": true,
+            "note": null
+          }
+        ]
+      }
+    },
+    {
+      "arm": "gpt-6-luna:low@5",
+      "status": "scored",
+      "selection": {
+        "judge_provider": "openai",
+        "judge_model": "gpt-6-luna",
+        "judge_reasoning_effort": "low",
+        "judge_candidate_count": 5,
+        "wording": "shipped",
+        "field_chars": 4000,
+        "p95_judge_seconds": 5.364,
+        "cost_per_write_usd": 0.000384
+      },
+      "quality": {
+        "attaches": 521,
+        "unclear_attaches": 0,
+        "misfiles": 132,
+        "misfile_rate_of_attaches": 0.2534,
+        "misfile_rate_wilson95": [
+          0.2179,
+          0.2924
+        ],
+        "duplicates_placed": 389,
+        "contradictions_attached": 60,
+        "contradictions_contested": 46,
+        "contradiction_recall": 0.7667,
+        "agreeing_attaches": 329,
+        "agreeing_contested": 36,
+        "false_contested_rate": 0.1094,
+        "true_links": 466,
+        "true_links_answered_distinct": 30,
+        "true_links_answered_distinct_rate": 0.0644,
+        "contested_decision_errors": 72,
+        "parse_failures": 3,
+        "unrated_pairs": 0,
+        "unrated_pair_ids": []
+      },
+      "runtime": {
+        "judge_calls": 658,
+        "untimed_calls": 0,
+        "p50_judge_seconds": 3.081,
+        "p95_judge_seconds": 5.364,
+        "judge_models": [
+          "gpt-6-luna"
+        ],
+        "unpriced_calls": 0,
+        "cost_per_write_usd": 0.000384
+      },
+      "paired_vs_reference": {
+        "misfile": {
+          "n_common": 658,
+          "only_arm": 74,
+          "only_reference": 55,
+          "mcnemar_p": 0.1127,
+          "parent_sign_test": {
+            "groups_favouring_arm": 55,
+            "groups_favouring_reference": 73,
+            "p": 0.1326
+          }
+        },
+        "contested_decision_error": {
+          "n_common": 658,
+          "only_arm": 33,
+          "only_reference": 167,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 160,
+            "groups_favouring_reference": 32,
+            "p": 0.0
+          }
+        },
+        "missed_contradiction": {
+          "n_common": 658,
+          "only_arm": 12,
+          "only_reference": 12,
+          "mcnemar_p": 1.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 12,
+            "groups_favouring_reference": 12,
+            "p": 1.0
+          }
+        },
+        "false_contested": {
+          "n_common": 658,
+          "only_arm": 18,
+          "only_reference": 86,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 82,
+            "groups_favouring_reference": 17,
+            "p": 0.0
+          }
+        },
+        "true_link_answered_distinct": {
+          "n_common": 658,
+          "only_arm": 5,
+          "only_reference": 69,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 67,
+            "groups_favouring_reference": 5,
+            "p": 0.0
+          }
+        }
+      },
+      "bounds": {
+        "met": false,
+        "checks": [
+          {
+            "check": "best:quality.misfile_rate_of_attaches <= 0.08",
+            "actual": 0.2534,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:quality.contradiction_recall >= 0.60",
+            "actual": 0.7667,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:quality.false_contested_rate <= 0.10",
+            "actual": 0.1094,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:selection.p95_judge_seconds <= 8.0",
+            "actual": 5.364,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:selection.cost_per_write_usd <= 0.01",
+            "actual": 0.000384,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:quality.unrated_pairs <= 0",
+            "actual": 0,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:population.n_judge_band >= 300",
+            "actual": 658,
+            "ok": true,
+            "note": null
+          }
+        ]
+      }
+    },
+    {
+      "arm": "gpt-6-luna:low@20",
+      "status": "scored",
+      "selection": {
+        "judge_provider": "openai",
+        "judge_model": "gpt-6-luna",
+        "judge_reasoning_effort": "low",
+        "judge_candidate_count": 20,
+        "wording": "shipped",
+        "field_chars": 4000,
+        "p95_judge_seconds": 6.202,
+        "cost_per_write_usd": 0.000946
+      },
+      "quality": {
+        "attaches": 571,
+        "unclear_attaches": 0,
+        "misfiles": 140,
+        "misfile_rate_of_attaches": 0.2452,
+        "misfile_rate_wilson95": [
+          0.2117,
+          0.2821
+        ],
+        "duplicates_placed": 431,
+        "contradictions_attached": 65,
+        "contradictions_contested": 52,
+        "contradiction_recall": 0.8,
+        "agreeing_attaches": 366,
+        "agreeing_contested": 23,
+        "false_contested_rate": 0.0628,
+        "true_links": 466,
+        "true_links_answered_distinct": 2,
+        "true_links_answered_distinct_rate": 0.0043,
+        "contested_decision_errors": 52,
+        "parse_failures": 3,
+        "unrated_pairs": 0,
+        "unrated_pair_ids": []
+      },
+      "runtime": {
+        "judge_calls": 658,
+        "untimed_calls": 0,
+        "p50_judge_seconds": 3.289,
+        "p95_judge_seconds": 6.202,
+        "judge_models": [
+          "gpt-6-luna"
+        ],
+        "unpriced_calls": 0,
+        "cost_per_write_usd": 0.000946
+      },
+      "paired_vs_reference": {
+        "misfile": {
+          "n_common": 658,
+          "only_arm": 87,
+          "only_reference": 60,
+          "mcnemar_p": 0.0316,
+          "parent_sign_test": {
+            "groups_favouring_arm": 58,
+            "groups_favouring_reference": 83,
+            "p": 0.0429
+          }
+        },
+        "contested_decision_error": {
+          "n_common": 658,
+          "only_arm": 28,
+          "only_reference": 182,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 173,
+            "groups_favouring_reference": 26,
+            "p": 0.0
+          }
+        },
+        "missed_contradiction": {
+          "n_common": 658,
+          "only_arm": 11,
+          "only_reference": 12,
+          "mcnemar_p": 1.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 12,
+            "groups_favouring_reference": 11,
+            "p": 1.0
+          }
+        },
+        "false_contested": {
+          "n_common": 658,
+          "only_arm": 13,
+          "only_reference": 94,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 89,
+            "groups_favouring_reference": 12,
+            "p": 0.0
+          }
+        },
+        "true_link_answered_distinct": {
+          "n_common": 658,
+          "only_arm": 1,
+          "only_reference": 93,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 91,
+            "groups_favouring_reference": 1,
+            "p": 0.0
+          }
+        }
+      },
+      "bounds": {
+        "met": false,
+        "checks": [
+          {
+            "check": "best:quality.misfile_rate_of_attaches <= 0.08",
+            "actual": 0.2452,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:quality.contradiction_recall >= 0.60",
+            "actual": 0.8,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:quality.false_contested_rate <= 0.10",
+            "actual": 0.0628,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:selection.p95_judge_seconds <= 8.0",
+            "actual": 6.202,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:selection.cost_per_write_usd <= 0.01",
+            "actual": 0.000946,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:quality.unrated_pairs <= 0",
+            "actual": 0,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:population.n_judge_band >= 300",
+            "actual": 658,
+            "ok": true,
+            "note": null
+          }
+        ]
+      }
+    },
+    {
+      "arm": "gpt-5.6-terra:none@5",
+      "status": "scored",
+      "selection": {
+        "judge_provider": "openai",
+        "judge_model": "gpt-5.6-terra",
+        "judge_reasoning_effort": "none",
+        "judge_candidate_count": 5,
+        "wording": "shipped",
+        "field_chars": 4000,
+        "p95_judge_seconds": 2.052,
+        "cost_per_write_usd": 0.006056
+      },
+      "quality": {
+        "attaches": 553,
+        "unclear_attaches": 0,
+        "misfiles": 168,
+        "misfile_rate_of_attaches": 0.3038,
+        "misfile_rate_wilson95": [
+          0.2669,
+          0.3434
+        ],
+        "duplicates_placed": 385,
+        "contradictions_attached": 63,
+        "contradictions_contested": 43,
+        "contradiction_recall": 0.6825,
+        "agreeing_attaches": 322,
+        "agreeing_contested": 19,
+        "false_contested_rate": 0.059,
+        "true_links": 466,
+        "true_links_answered_distinct": 21,
+        "true_links_answered_distinct_rate": 0.0451,
+        "contested_decision_errors": 51,
+        "parse_failures": 3,
+        "unrated_pairs": 0,
+        "unrated_pair_ids": []
+      },
+      "runtime": {
+        "judge_calls": 658,
+        "untimed_calls": 0,
+        "p50_judge_seconds": 1.557,
+        "p95_judge_seconds": 2.052,
+        "judge_models": [
+          "gpt-5.6-terra"
+        ],
+        "unpriced_calls": 0,
+        "cost_per_write_usd": 0.006056
+      },
+      "paired_vs_reference": {
+        "misfile": {
+          "n_common": 658,
+          "only_arm": 88,
+          "only_reference": 33,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 33,
+            "groups_favouring_reference": 86,
+            "p": 0.0
+          }
+        },
+        "contested_decision_error": {
+          "n_common": 658,
+          "only_arm": 29,
+          "only_reference": 184,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 176,
+            "groups_favouring_reference": 28,
+            "p": 0.0
+          }
+        },
+        "missed_contradiction": {
+          "n_common": 658,
+          "only_arm": 16,
+          "only_reference": 10,
+          "mcnemar_p": 0.3269,
+          "parent_sign_test": {
+            "groups_favouring_arm": 10,
+            "groups_favouring_reference": 16,
+            "p": 0.3269
+          }
+        },
+        "false_contested": {
+          "n_common": 658,
+          "only_arm": 12,
+          "only_reference": 97,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 92,
+            "groups_favouring_reference": 12,
+            "p": 0.0
+          }
+        },
+        "true_link_answered_distinct": {
+          "n_common": 658,
+          "only_arm": 1,
+          "only_reference": 74,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 73,
+            "groups_favouring_reference": 1,
+            "p": 0.0
+          }
+        }
+      },
+      "bounds": {
+        "met": false,
+        "checks": [
+          {
+            "check": "best:quality.misfile_rate_of_attaches <= 0.08",
+            "actual": 0.3038,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:quality.contradiction_recall >= 0.60",
+            "actual": 0.6825,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:quality.false_contested_rate <= 0.10",
+            "actual": 0.059,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:selection.p95_judge_seconds <= 8.0",
+            "actual": 2.052,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:selection.cost_per_write_usd <= 0.01",
+            "actual": 0.006056,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:quality.unrated_pairs <= 0",
+            "actual": 0,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:population.n_judge_band >= 300",
+            "actual": 658,
+            "ok": true,
+            "note": null
+          }
+        ]
+      }
+    },
+    {
+      "arm": "gpt-5.6-terra:none@20",
+      "status": "scored",
+      "selection": {
+        "judge_provider": "openai",
+        "judge_model": "gpt-5.6-terra",
+        "judge_reasoning_effort": "none",
+        "judge_candidate_count": 20,
+        "wording": "shipped",
+        "field_chars": 4000,
+        "p95_judge_seconds": 2.076,
+        "cost_per_write_usd": 0.017156
+      },
+      "quality": {
+        "attaches": 593,
+        "unclear_attaches": 0,
+        "misfiles": 170,
+        "misfile_rate_of_attaches": 0.2867,
+        "misfile_rate_wilson95": [
+          0.2517,
+          0.3244
+        ],
+        "duplicates_placed": 423,
+        "contradictions_attached": 58,
+        "contradictions_contested": 37,
+        "contradiction_recall": 0.6379,
+        "agreeing_attaches": 365,
+        "agreeing_contested": 16,
+        "false_contested_rate": 0.0438,
+        "true_links": 466,
+        "true_links_answered_distinct": 1,
+        "true_links_answered_distinct_rate": 0.0021,
+        "contested_decision_errors": 48,
+        "parse_failures": 6,
+        "unrated_pairs": 0,
+        "unrated_pair_ids": []
+      },
+      "runtime": {
+        "judge_calls": 658,
+        "untimed_calls": 0,
+        "p50_judge_seconds": 1.569,
+        "p95_judge_seconds": 2.076,
+        "judge_models": [
+          "gpt-5.6-terra"
+        ],
+        "unpriced_calls": 0,
+        "cost_per_write_usd": 0.017156
+      },
+      "paired_vs_reference": {
+        "misfile": {
+          "n_common": 658,
+          "only_arm": 97,
+          "only_reference": 40,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 40,
+            "groups_favouring_reference": 96,
+            "p": 0.0
+          }
+        },
+        "contested_decision_error": {
+          "n_common": 658,
+          "only_arm": 26,
+          "only_reference": 184,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 175,
+            "groups_favouring_reference": 24,
+            "p": 0.0
+          }
+        },
+        "missed_contradiction": {
+          "n_common": 658,
+          "only_arm": 16,
+          "only_reference": 9,
+          "mcnemar_p": 0.2295,
+          "parent_sign_test": {
+            "groups_favouring_arm": 9,
+            "groups_favouring_reference": 16,
+            "p": 0.2295
+          }
+        },
+        "false_contested": {
+          "n_common": 658,
+          "only_arm": 10,
+          "only_reference": 98,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 92,
+            "groups_favouring_reference": 9,
+            "p": 0.0
+          }
+        },
+        "true_link_answered_distinct": {
+          "n_common": 658,
+          "only_arm": 0,
+          "only_reference": 93,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 91,
+            "groups_favouring_reference": 0,
+            "p": 0.0
+          }
+        }
+      },
+      "bounds": {
+        "met": false,
+        "checks": [
+          {
+            "check": "best:quality.misfile_rate_of_attaches <= 0.08",
+            "actual": 0.2867,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:quality.contradiction_recall >= 0.60",
+            "actual": 0.6379,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:quality.false_contested_rate <= 0.10",
+            "actual": 0.0438,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:selection.p95_judge_seconds <= 8.0",
+            "actual": 2.076,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:selection.cost_per_write_usd <= 0.01",
+            "actual": 0.017156,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:quality.unrated_pairs <= 0",
+            "actual": 0,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:population.n_judge_band >= 300",
+            "actual": 658,
+            "ok": true,
+            "note": null
+          }
+        ]
+      }
+    },
+    {
+      "arm": "gpt-6.1-sol:low@5",
+      "status": "scored",
+      "selection": {
+        "judge_provider": "openai",
+        "judge_model": "gpt-6.1-sol",
+        "judge_reasoning_effort": "low",
+        "judge_candidate_count": 5,
+        "wording": "shipped",
+        "field_chars": 4000,
+        "p95_judge_seconds": 8.562,
+        "cost_per_write_usd": 0.006211
+      },
+      "quality": {
+        "attaches": 471,
+        "unclear_attaches": 0,
+        "misfiles": 83,
+        "misfile_rate_of_attaches": 0.1762,
+        "misfile_rate_wilson95": [
+          0.1445,
+          0.2132
+        ],
+        "duplicates_placed": 388,
+        "contradictions_attached": 77,
+        "contradictions_contested": 75,
+        "contradiction_recall": 0.974,
+        "agreeing_attaches": 311,
+        "agreeing_contested": 36,
+        "false_contested_rate": 0.1158,
+        "true_links": 466,
+        "true_links_answered_distinct": 44,
+        "true_links_answered_distinct_rate": 0.0944,
+        "contested_decision_errors": 70,
+        "parse_failures": 0,
+        "unrated_pairs": 0,
+        "unrated_pair_ids": []
+      },
+      "runtime": {
+        "judge_calls": 658,
+        "untimed_calls": 0,
+        "p50_judge_seconds": 3.873,
+        "p95_judge_seconds": 8.562,
+        "judge_models": [
+          "gpt-6.1-sol"
+        ],
+        "unpriced_calls": 0,
+        "cost_per_write_usd": 0.006211
+      },
+      "paired_vs_reference": {
+        "misfile": {
+          "n_common": 658,
+          "only_arm": 41,
+          "only_reference": 71,
+          "mcnemar_p": 0.0059,
+          "parent_sign_test": {
+            "groups_favouring_arm": 70,
+            "groups_favouring_reference": 40,
+            "p": 0.0054
+          }
+        },
+        "contested_decision_error": {
+          "n_common": 658,
+          "only_arm": 36,
+          "only_reference": 172,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 166,
+            "groups_favouring_reference": 34,
+            "p": 0.0
+          }
+        },
+        "missed_contradiction": {
+          "n_common": 658,
+          "only_arm": 2,
+          "only_reference": 14,
+          "mcnemar_p": 0.0042,
+          "parent_sign_test": {
+            "groups_favouring_arm": 14,
+            "groups_favouring_reference": 2,
+            "p": 0.0042
+          }
+        },
+        "false_contested": {
+          "n_common": 658,
+          "only_arm": 20,
+          "only_reference": 88,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 84,
+            "groups_favouring_reference": 19,
+            "p": 0.0
+          }
+        },
+        "true_link_answered_distinct": {
+          "n_common": 658,
+          "only_arm": 10,
+          "only_reference": 60,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 58,
+            "groups_favouring_reference": 10,
+            "p": 0.0
+          }
+        }
+      },
+      "bounds": {
+        "met": false,
+        "checks": [
+          {
+            "check": "best:quality.misfile_rate_of_attaches <= 0.08",
+            "actual": 0.1762,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:quality.contradiction_recall >= 0.60",
+            "actual": 0.974,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:quality.false_contested_rate <= 0.10",
+            "actual": 0.1158,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:selection.p95_judge_seconds <= 8.0",
+            "actual": 8.562,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:selection.cost_per_write_usd <= 0.01",
+            "actual": 0.006211,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:quality.unrated_pairs <= 0",
+            "actual": 0,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:population.n_judge_band >= 300",
+            "actual": 658,
+            "ok": true,
+            "note": null
+          }
+        ]
+      }
+    },
+    {
+      "arm": "gpt-6.1-sol:low@20",
+      "status": "scored",
+      "selection": {
+        "judge_provider": "openai",
+        "judge_model": "gpt-6.1-sol",
+        "judge_reasoning_effort": "low",
+        "judge_candidate_count": 20,
+        "wording": "shipped",
+        "field_chars": 4000,
+        "p95_judge_seconds": 6.914,
+        "cost_per_write_usd": 0.01734
+      },
+      "quality": {
+        "attaches": 522,
+        "unclear_attaches": 0,
+        "misfiles": 95,
+        "misfile_rate_of_attaches": 0.182,
+        "misfile_rate_wilson95": [
+          0.1513,
+          0.2174
+        ],
+        "duplicates_placed": 427,
+        "contradictions_attached": 82,
+        "contradictions_contested": 80,
+        "contradiction_recall": 0.9756,
+        "agreeing_attaches": 345,
+        "agreeing_contested": 38,
+        "false_contested_rate": 0.1101,
+        "true_links": 466,
+        "true_links_answered_distinct": 12,
+        "true_links_answered_distinct_rate": 0.0258,
+        "contested_decision_errors": 65,
+        "parse_failures": 0,
+        "unrated_pairs": 0,
+        "unrated_pair_ids": []
+      },
+      "runtime": {
+        "judge_calls": 658,
+        "untimed_calls": 0,
+        "p50_judge_seconds": 3.849,
+        "p95_judge_seconds": 6.914,
+        "judge_models": [
+          "gpt-6.1-sol"
+        ],
+        "unpriced_calls": 0,
+        "cost_per_write_usd": 0.01734
+      },
+      "paired_vs_reference": {
+        "misfile": {
+          "n_common": 658,
+          "only_arm": 52,
+          "only_reference": 70,
+          "mcnemar_p": 0.1234,
+          "parent_sign_test": {
+            "groups_favouring_arm": 69,
+            "groups_favouring_reference": 51,
+            "p": 0.1203
+          }
+        },
+        "contested_decision_error": {
+          "n_common": 658,
+          "only_arm": 35,
+          "only_reference": 176,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 170,
+            "groups_favouring_reference": 33,
+            "p": 0.0
+          }
+        },
+        "missed_contradiction": {
+          "n_common": 658,
+          "only_arm": 2,
+          "only_reference": 14,
+          "mcnemar_p": 0.0042,
+          "parent_sign_test": {
+            "groups_favouring_arm": 14,
+            "groups_favouring_reference": 2,
+            "p": 0.0042
+          }
+        },
+        "false_contested": {
+          "n_common": 658,
+          "only_arm": 19,
+          "only_reference": 85,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 82,
+            "groups_favouring_reference": 17,
+            "p": 0.0
+          }
+        },
+        "true_link_answered_distinct": {
+          "n_common": 658,
+          "only_arm": 7,
+          "only_reference": 89,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 87,
+            "groups_favouring_reference": 7,
+            "p": 0.0
+          }
+        }
+      },
+      "bounds": {
+        "met": false,
+        "checks": [
+          {
+            "check": "best:quality.misfile_rate_of_attaches <= 0.08",
+            "actual": 0.182,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:quality.contradiction_recall >= 0.60",
+            "actual": 0.9756,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:quality.false_contested_rate <= 0.10",
+            "actual": 0.1101,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:selection.p95_judge_seconds <= 8.0",
+            "actual": 6.914,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:selection.cost_per_write_usd <= 0.01",
+            "actual": 0.01734,
+            "ok": false,
+            "note": null
+          },
+          {
+            "check": "best:quality.unrated_pairs <= 0",
+            "actual": 0,
+            "ok": true,
+            "note": null
+          },
+          {
+            "check": "best:population.n_judge_band >= 300",
+            "actual": 658,
+            "ok": true,
+            "note": null
+          }
+        ]
+      }
+    },
+    {
+      "arm": "claude-haiku",
+      "status": "skipped",
+      "provider": "anthropic",
+      "reason": "no route today: the deployment's ANTHROPIC_API_KEY is rejected (401), PRD §11.1; dropped from μ by §11.6"
+    },
+    {
+      "arm": "local-model",
+      "status": "skipped",
+      "provider": "local",
+      "reason": "no route today: σ dropped from μ's deps by PRD §11.6; π ran no local endpoint"
+    }
+  ],
+  "wording_attribution": {
+    "gpt-4o-mini@5+pre-psi": {
+      "shipped_twin": "gpt-4o-mini@5",
+      "paired": {
+        "misfile": {
+          "n_common": 658,
+          "only_arm": 23,
+          "only_reference": 31,
+          "mcnemar_p": 0.3409,
+          "parent_sign_test": {
+            "groups_favouring_arm": 31,
+            "groups_favouring_reference": 23,
+            "p": 0.3409
+          }
+        },
+        "contested_decision_error": {
+          "n_common": 658,
+          "only_arm": 22,
+          "only_reference": 179,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 171,
+            "groups_favouring_reference": 20,
+            "p": 0.0
+          }
+        },
+        "missed_contradiction": {
+          "n_common": 658,
+          "only_arm": 23,
+          "only_reference": 0,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 0,
+            "groups_favouring_reference": 23,
+            "p": 0.0
+          }
+        },
+        "false_contested": {
+          "n_common": 658,
+          "only_arm": 0,
+          "only_reference": 100,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 97,
+            "groups_favouring_reference": 0,
+            "p": 0.0
+          }
+        },
+        "true_link_answered_distinct": {
+          "n_common": 658,
+          "only_arm": 18,
+          "only_reference": 16,
+          "mcnemar_p": 0.8642,
+          "parent_sign_test": {
+            "groups_favouring_arm": 16,
+            "groups_favouring_reference": 17,
+            "p": 1.0
+          }
+        }
+      }
+    },
+    "gpt-4o-mini@20+pre-psi": {
+      "shipped_twin": "gpt-4o-mini@20",
+      "paired": {
+        "misfile": {
+          "n_common": 658,
+          "only_arm": 39,
+          "only_reference": 38,
+          "mcnemar_p": 1.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 38,
+            "groups_favouring_reference": 39,
+            "p": 1.0
+          }
+        },
+        "contested_decision_error": {
+          "n_common": 658,
+          "only_arm": 31,
+          "only_reference": 217,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 208,
+            "groups_favouring_reference": 28,
+            "p": 0.0
+          }
+        },
+        "missed_contradiction": {
+          "n_common": 658,
+          "only_arm": 31,
+          "only_reference": 0,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 0,
+            "groups_favouring_reference": 31,
+            "p": 0.0
+          }
+        },
+        "false_contested": {
+          "n_common": 658,
+          "only_arm": 1,
+          "only_reference": 111,
+          "mcnemar_p": 0.0,
+          "parent_sign_test": {
+            "groups_favouring_arm": 108,
+            "groups_favouring_reference": 0,
+            "p": 0.0
+          }
+        },
+        "true_link_answered_distinct": {
+          "n_common": 658,
+          "only_arm": 10,
+          "only_reference": 21,
+          "mcnemar_p": 0.0708,
+          "parent_sign_test": {
+            "groups_favouring_arm": 21,
+            "groups_favouring_reference": 10,
+            "p": 0.0708
+          }
+        }
+      }
+    }
+  },
+  "selection_rule": {
+    "bounds": [
+      {
+        "path": "quality.misfile_rate_of_attaches",
+        "op": "<=",
+        "value": "0.08"
+      },
+      {
+        "path": "quality.contradiction_recall",
+        "op": ">=",
+        "value": "0.60"
+      },
+      {
+        "path": "quality.false_contested_rate",
+        "op": "<=",
+        "value": "0.10"
+      },
+      {
+        "path": "selection.p95_judge_seconds",
+        "op": "<=",
+        "value": "8.0"
+      },
+      {
+        "path": "selection.cost_per_write_usd",
+        "op": "<=",
+        "value": "0.01"
+      },
+      {
+        "path": "quality.unrated_pairs",
+        "op": "<=",
+        "value": "0"
+      },
+      {
+        "path": "population.n_judge_band",
+        "op": ">=",
+        "value": "300"
+      }
+    ],
+    "rule": "fewest failed bounds (scripts/check_write_triage_readiness_gate.py::check_require), so an arm meeting every bound beats every arm that does not; then fewest quality.contested_decision_errors; then lower selection.cost_per_write_usd; then arm name",
+    "fallback_applied": true
+  },
+  "winner": "gpt-5.6-terra:none@5",
+  "inputs": {
+    "population_path": "fused-memory/calibration/write_triage_population.json",
+    "population_sha256": "0a6e302db94739eae361f6e723790a54eab373a9af394094a4981f547ba1a9c4",
+    "verdicts_path": "fused-memory/calibration/write_triage_pair_verdicts.jsonl",
+    "verdicts_sha256": "ecd95fc0b97bee838118dca5458d8cb3a2e3291ddd06e6211d3ef408bbb37ee9"
+  }
+}

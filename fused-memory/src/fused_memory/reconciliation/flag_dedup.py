@@ -361,6 +361,7 @@ from fused_memory.reconciliation.flag_record_contract import (
     canonical_flag_types,
     normalize_flag_record_metadata,
 )
+from fused_memory.reconciliation.flag_task_ids import task_id_components
 from fused_memory.reconciliation.internal_writers import is_internal_writer
 from fused_memory.reconciliation.recon_ledger import (
     ReconLedgerRecord,
@@ -5700,47 +5701,30 @@ def _accounting_unconfirmable_reason(
 def _flag_candidate_task_ids(flag: dict[str, Any]) -> list[str]:
     """Return every task id *flag* points at, in resolution order (task 3476).
 
-    Two channels, top-level first:
+    Two channels, top-level first, each value decomposed by
+    :func:`~fused_memory.reconciliation.flag_task_ids.task_id_components`:
 
-    1. ``flag['task_id']`` -- coerced to ``str`` (an int ``3417`` yields
-       ``'3417'``) and split on ``','`` to handle the composite shape
-       (``'3417,3468'``), each component stripped.
-    2. ``flag['cited_tasks'][].task_id`` -- coerced to ``str``, blanks and
-       non-dict entries skipped.  ``project_id`` is deliberately NOT filtered
-       on; see :func:`filter_accounted_cluster_growth_flags`' docstring.
+    1. ``flag['task_id']``.
+    2. ``flag['cited_tasks'][].task_id``, non-dict entries skipped.
+       ``project_id`` is deliberately NOT filtered on; see
+       :func:`filter_accounted_cluster_growth_flags`' docstring.
 
     NOT :func:`_decompose_suppression_task_id`: that helper's contract reserves
     comma-decomposition for suppression LEDGER rows and states that a flag's
-    own task_id is never split by it.  This is the separate, task-3476-owned
+    own task_id is never split by it.  ``task_id_components`` is the separate
     splitter for a flag's own task_id.
 
-    Total over malformed LLM-authored input.  Results are deduped, keeping
-    first position; returns ``[]`` when nothing resolvable is present.
+    Total over malformed LLM-authored input.  Results are deduped ACROSS both
+    channels, keeping first position; returns ``[]`` when nothing resolvable
+    is present.
 
     Pure, sync, no I/O.
     """
-    seen: set[str] = set()
-    ids: list[str] = []
-
-    def _add(raw: Any) -> None:
-        if raw is None or isinstance(raw, bool):
-            return
-        if not isinstance(raw, (str, int)):
-            return
-        for part in str(raw).split(','):
-            part = part.strip()
-            if not part or part in seen:
-                continue
-            seen.add(part)
-            ids.append(part)
-
-    _add(flag.get('task_id'))
+    raws = [flag.get('task_id')]
     cited_tasks = flag.get('cited_tasks')
     if isinstance(cited_tasks, list):
-        for entry in cited_tasks:
-            if isinstance(entry, dict):
-                _add(entry.get('task_id'))
-    return ids
+        raws.extend(entry.get('task_id') for entry in cited_tasks if isinstance(entry, dict))
+    return list(dict.fromkeys(tid for raw in raws for tid in task_id_components(raw)))
 
 
 @dataclass(frozen=True)

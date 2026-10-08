@@ -141,6 +141,11 @@ class TestDisallowListForAmendAndEpisodeTools:
     `config/config.yaml` leaves that list commented out (only the metadata-patch
     list is active there), so that default applies — Stage 3 both passed the
     authz gate and held the tool.
+
+    This class is a PER-TOOL contract for these three advertised tools. The
+    COMPLETENESS contract — no fused-memory tool registers without a stage
+    classification — is
+    tests/test_recon_stage_fused_memory_tool_classification.py::test_every_fused_memory_server_tool_is_classified.
     """
 
     # -- PART A: set membership (cheap structural guard) --------------------

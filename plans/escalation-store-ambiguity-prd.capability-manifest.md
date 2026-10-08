@@ -46,6 +46,15 @@ without first observing a live stage spawn.
 | `stage-prompt-declares-the-boundary` | capability→producer — α adds the boundary paragraph rendered from **one** `ESCALATION_BOUNDARY*` module constant (INV-5), extending the scope wording already at `prompts/stage2.py:647-648` | PASS |
 | `mcp-tool-names-honored-in-disallow-lists` | substrate CONFIRMED — `mcp__fused-memory__*` names already in `DISALLOW_*` and production-proven | PASS |
 
+> **Amendment (2026-10-07, task 3250).** `escalation-write-stays-sanctioned` is
+> narrowed to **Stage 2 only**. Stage 1 and Stage 3 now deny `escalate_blocker`
+> and `escalate_info` via `cli_stage_runner.py::DISALLOW_ESCALATION_WRITES`,
+> matching the no-action clause their prompts have carried since α. The
+> sidecar's `expect: absent` grep was falsified by that deny and is now a
+> `manual` check pointing at
+> `fused-memory/tests/test_stages.py::TestDisallowedToolLists::test_escalate_blocker_stays_allowed_in_stage2_only`.
+> The row above is the decompose-time record and is left as written.
+
 ### β — `get_task_escalation_history`
 
 | Capability | Binding | Verdict |
