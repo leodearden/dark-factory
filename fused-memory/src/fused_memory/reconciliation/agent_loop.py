@@ -70,8 +70,15 @@ _AGENT_CLI_MAX_TURNS = 20
 
 
 def _cli_failure_payload(origin: str, text: str) -> dict:
-    """The single constructor of a CLI no-tool-call exit carrying *origin*."""
-    assert origin in CLI_WARNING_ORIGINS, origin
+    """The single constructor of a CLI no-tool-call exit carrying *origin*.
+
+    The one gate on the CLOSED ``CLI_WARNING_ORIGINS`` vocabulary.
+    """
+    if origin not in CLI_WARNING_ORIGINS:
+        raise ValueError(
+            f'CLI warning_origin {origin!r} is not in the closed vocabulary '
+            f'CLI_WARNING_ORIGINS={sorted(CLI_WARNING_ORIGINS)}'
+        )
     return {'warning': 'no_tool_calls', 'text': text, 'warning_origin': origin}
 
 

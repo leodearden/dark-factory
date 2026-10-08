@@ -487,10 +487,10 @@ Investigate this claim against the codebase and report your findings.
         # construction boundary, and a non-str under either key would raise
         # ValidationError below — surfacing as a generic 'error' audit row,
         # i.e. losing exactly the diagnosis this code exists to preserve.
-        # AgentLoop.run() already gates `warning_origin` on its closed
-        # CLI_WARNING_ORIGINS vocabulary; this is the independent guard at the
-        # consuming end, so a future producer cannot widen the column by
-        # accident.
+        # agent_loop.py::_cli_failure_payload already gates `warning_origin` on
+        # the closed CLI_WARNING_ORIGINS vocabulary; this is the independent
+        # guard at the consuming end, so a future producer cannot widen the
+        # column by accident.
         token = ''
         if verdict.failed:
             token = (
