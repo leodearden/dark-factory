@@ -1265,16 +1265,12 @@ class EventBuffer:
             self._access = None
 
     async def checkpoint(self) -> CheckpointResult:
-        """``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``.
+        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``.
 
-        Still ``(-1, -1, -1)`` — never a raise — for a buffer that was never
-        initialized OR one already closed: server/main.py's checkpoint cycle
-        unpacks the result and logs exceptions separately.
-
-        This is the contract THIS store's callers already had; the journal and
-        ReconLedgerStore raise 'not initialized' in both those cases instead.
-        See ``ReconciliationJournal.checkpoint`` for why the split is deliberate.
+        Called by ``server/main.py::_run_checkpoint_cycle``, which does not own
+        this store's shutdown, so a never-initialized or closed buffer answers
+        :meth:`CheckpointResult.unavailable` rather than raising.
         """
         if self._access is None:
-            return CheckpointResult(-1, -1, -1)
+            return CheckpointResult.unavailable()
         return await self._access.checkpoint()

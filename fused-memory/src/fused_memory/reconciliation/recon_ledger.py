@@ -1004,12 +1004,12 @@ class ReconLedgerStore:
             self._access = None
 
     async def checkpoint(self) -> CheckpointResult:
-        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` and return ``(busy, log,
-        checkpointed)``. Called by the periodic checkpoint loop in
-        ``server/main.py``.
+        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``.
 
-        Post-close this RAISES 'not initialized', as ReconciliationJournal does;
-        EventBuffer alone answers ``(-1, -1, -1)``.  See
-        ``ReconciliationJournal.checkpoint`` for why the split is deliberate.
+        Called by ``server/main.py::_run_checkpoint_cycle``, which does not own
+        this store's shutdown, so a closed store answers
+        :meth:`CheckpointResult.unavailable` rather than raising.
         """
-        return await self._require_access().checkpoint()
+        if self._access is None:
+            return CheckpointResult.unavailable()
+        return await self._access.checkpoint()

@@ -334,27 +334,21 @@ class ReconciliationJournal:
             # the next open starts with an empty one.  Nulling _access matches
             # EventBuffer and ReconLedgerStore: all three then raise the same
             # 'not initialized' from _require_access() after close, instead of
-            # this store alone surfacing aiosqlite's 'Connection closed'.  That
-            # uniformity is the _require_access() guard ONLY — checkpoint() does
-            # not go through it and does not follow it; see checkpoint() below.
+            # this store alone surfacing aiosqlite's 'Connection closed'.
+            # checkpoint() is the one exception: it answers the sentinel.
             await self._access.close()
             self._access = None
 
     async def checkpoint(self) -> CheckpointResult:
-        """``PRAGMA wal_checkpoint(TRUNCATE)``. Returns ``(busy, log,
-        checkpointed)``. Called by the periodic loop in ``server/main.py``.
+        """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``.
 
-        Post-close this RAISES 'not initialized', as ReconLedgerStore does;
-        EventBuffer alone answers ``(-1, -1, -1)``.  So a checkpoint tick that
-        races shutdown — a real path, since that loop runs on a timer against
-        stores it does not own the shutdown of — is logged for two of the three
-        stores and silent for the third.  The split is deliberate: each store
-        keeps the contract its callers already had, which is what let this
-        migration leave ``server/main.py`` edit-free.  Pinned by
-        ``test_recon_db_atomicity.py::test_the_post_close_checkpoint_contract_of_each_store``
-        so it cannot drift further, and unified by task 5562's adoption.
+        Called by ``server/main.py::_run_checkpoint_cycle``, which does not own
+        this store's shutdown, so a closed store answers
+        :meth:`CheckpointResult.unavailable` rather than raising.
         """
-        return await self._require_access().checkpoint()
+        if self._access is None:
+            return CheckpointResult.unavailable()
+        return await self._access.checkpoint()
 
     def _require_access(self) -> AtomicConnection:
         if self._access is None:
