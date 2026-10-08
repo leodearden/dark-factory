@@ -135,14 +135,13 @@ def require_installed_unit(basename: str) -> pathlib.Path:
 # at that docstring rather than restating it, because prose copies drift the
 # same way code copies do and nothing keeps them in step.
 #
-# WHAT DID NOT MOVE, and why: `_exec_start_line` (file content -> the
-# ExecStart= line) stayed in test_orchestrator_service_files.py and
-# `_argv_from_exec_start_show` (systemctl struct -> argv) stayed in
-# test_know_live_installed_unit_parity.py.  Each still has exactly ONE
-# consumer, and this module's lift trigger is a second consumer, not proximity
-# or tidiness: lifting a single-consumer helper buys no de-duplication while
-# widening this module's surface.  Their negative-case guards stay with them,
-# per the same convention that kept systemctl_user_show's where it was written.
+# WHAT DID NOT MOVE, and why: `_argv_from_exec_start_show` (systemctl struct
+# -> argv) stayed in test_know_live_installed_unit_parity.py.  It still has
+# exactly ONE consumer, and this module's lift trigger is a second consumer,
+# not proximity or tidiness: lifting a single-consumer helper buys no
+# de-duplication while widening this module's surface.  Its negative-case
+# guard stays with it, per the same convention that kept systemctl_user_show's
+# where it was written.
 # ---------------------------------------------------------------------------
 
 # CLAUDE.md makes `<project_root>/dark-factory-orchestrator.yaml` the
@@ -163,10 +162,9 @@ class MalformedExecStart(ValueError):
     and must FAIL.  Which inputs land where is the contract on
     config_arg_from_exec_start below, stated there once.
 
-    Also raised by callers that own the OTHER half of a parse — locating the
-    ExecStart= text before the scan sees it (cf. test_orchestrator_service_
-    files._exec_start_line) — so a broken unit surfaces as one class whichever
-    layer notices it first.
+    Also raised by the OTHER half of a parse — locating the ExecStart= text
+    before the scan sees it (logical_exec_start below) — so a broken unit
+    surfaces as one class whichever layer notices it first.
     """
 
 
@@ -188,20 +186,20 @@ def config_arg_from_exec_start(
     how a guard waves through the drift it exists to catch.  Verified before
     the two copies were reconciled onto this contract: every committed unit
     uses the space-separated form with a real path, so tightening moved no live
-    verdict — only the failure text.  (A caller that has to LOCATE the
-    ExecStart= text first owns the third no-value case, a unit with no usable
-    ExecStart= line, and raises the same class for the same reason.)
+    verdict — only the failure text.  (logical_exec_start below, which LOCATES
+    the ExecStart= text first, owns the third no-value case, a unit with no
+    usable ExecStart= line, and raises the same class for the same reason.)
 
     *exec_start_value* may be a whole ``ExecStart=`` line, just its value, or
     the ``argv[]=`` segment of a ``systemctl show`` struct: the scan looks only
     for ``--config`` tokens and is prefix-agnostic.  That looseness is not
-    laxity — the three call sites genuinely hold those three shapes, and
-    normalising at the boundary would have meant three wrappers or three
-    copies.  *unit_name* is pure diagnostics, interpolated into both raises so
-    the caller's context (a unit path, or a ``systemctl --user show ...``
-    provenance string) survives into the failure; the messages say "command
-    line" rather than "ExecStart= line" precisely because two of those three
-    accepted shapes are not one.
+    laxity — the call sites genuinely hold different shapes (a command value,
+    a ``systemctl show`` ``argv[]=`` segment), and normalising at the boundary
+    would have meant a wrapper or a copy per shape.  *unit_name* is pure
+    diagnostics, interpolated into both raises so the caller's context (a
+    unit path, or a ``systemctl --user show ...`` provenance string) survives
+    into the failure; the messages say "command line" rather than "ExecStart=
+    line" precisely because two of those three accepted shapes are not one.
     """
     tokens = exec_start_value.split()
     for i, token in enumerate(tokens):
@@ -225,6 +223,79 @@ def config_arg_from_exec_start(
                 )
             return value
     return None
+
+
+# ---------------------------------------------------------------------------
+# The effective ExecStart= command
+#
+# Read by tests/scripts/test_orchestrator_service_files.py::
+# _exec_start_config_arg and tests/scripts/test_uv_run_venv_isolation.py::
+# discover_uv_run_units.  Its home is here because the consumers carried three
+# disagreeing copies.  Its negative-case guard lives in
+# test_orchestrator_service_files.py's fixture-string section.
+# ---------------------------------------------------------------------------
+
+# The trailing `=` keeps ExecStartPre= out; whitespace around the `=` is legal
+# systemd.syntax.  A discovery grep must use this SAME anchor as the parser
+# (tests/scripts/test_uv_run_venv_isolation.py::discover_exec_start_files), or
+# a unit it discovers is then reported as declaring no ExecStart= at all.
+EXEC_START_PREFIX = r"ExecStart[ \t]*="
+_EXEC_START_RE = re.compile(rf"^{EXEC_START_PREFIX}")
+
+
+def logical_exec_start(text: str, unit_name: str = "<unit>") -> str:
+    """Return the effective ExecStart= COMMAND in unit *text* as one logical line.
+
+    LAST OCCURRENCE WINS, as in systemd and restart_directive below: a drop-in
+    under <unit>.d/ merges by appending, so an override lands as an empty
+    ``ExecStart=`` list RESET followed by the real command.  A first-match read
+    answers about the reset, or about the overridden command — either way a
+    command systemd never runs.
+
+    CONTINUATIONS ARE JOINED: the ExecStart= of scripts/dashboard.service.
+    template and scripts/fused-memory.service.template spans several physical
+    lines, and an unjoined read sees one fragment — passing a flag check
+    vacuously until the day that flag moves to a continuation line.
+
+    Returns the command WITHOUT the directive prefix.  Raises MalformedExecStart
+    when *text* has no ExecStart= at all, or when the effective one carries no
+    command: neither is a legitimate "this command lacks X" answer, the
+    None-vs-raise split config_arg_from_exec_start's contract states.
+    *unit_name* is diagnostics only, named in both raises.
+    """
+    lines = text.splitlines()
+    start_indices = [
+        i for i, ln in enumerate(lines) if _EXEC_START_RE.match(ln.strip())
+    ]
+    if not start_indices:
+        raise MalformedExecStart(
+            f"{unit_name} declares no ExecStart= line, so there is no command "
+            "to inspect. Treating this as an answer would silently drop the "
+            "unit out of whichever guard asked."
+        )
+
+    parts: list[str] = []
+    idx = start_indices[-1]
+    while True:
+        line = lines[idx].strip()
+        continued = line.endswith("\\")
+        if continued:
+            line = line[:-1]
+        parts.append(line.strip())
+        if not continued or idx + 1 >= len(lines):
+            break
+        idx += 1
+
+    command = _EXEC_START_RE.sub("", " ".join(p for p in parts if p), count=1).strip()
+    if not command:
+        raise MalformedExecStart(
+            f"{unit_name}'s effective ExecStart= carries no command: the last "
+            "assignment is a list RESET with nothing appended after it, so "
+            "systemd has no command to run at all. Treating this as an answer "
+            "would silently drop a unit that cannot start out of whichever "
+            "guard asked."
+        )
+    return command
 
 
 # ---------------------------------------------------------------------------

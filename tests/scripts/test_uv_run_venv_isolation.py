@@ -31,22 +31,16 @@ unit added next month is covered the day it lands.  Structurally modelled on
 tests/scripts/test_systemd_restart_backoff.py.
 """
 import pathlib
-import re
 import subprocess
 
 import pytest
-from systemd_unit_invariants import MalformedExecStart
+from systemd_unit_invariants import (
+    EXEC_START_PREFIX,
+    MalformedExecStart,
+    logical_exec_start,
+)
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
-
-# The ExecStart= anchor, shared by the grep and by logical_exec_start so the
-# discoverer and the parser answer the SAME question.  They did not at first:
-# the grep tolerated systemd's legal `  ExecStart = /usr/bin/uv` while the
-# parser matched a bare `ExecStart=` prefix, so such a unit was discovered and
-# then reported as declaring no ExecStart at all.  The trailing `=` is what
-# excludes `ExecStartPre=`, which offers `P` where the pattern needs `=`.
-_EXEC_START_PREFIX = r"ExecStart[ \t]*="
-_EXEC_START_RE = re.compile(rf"^{_EXEC_START_PREFIX}")
 
 # Copied from tests/scripts/test_systemd_restart_backoff.py::
 # _NON_UNIT_PATHSPECS, which holds the reasoning and the measurements: test
@@ -163,7 +157,8 @@ def discover_exec_start_files() -> list[str]:
             "git",
             "grep",
             "-lE",
-            rf"^[ \t]*{_EXEC_START_PREFIX}",
+            # The parser's own anchor, so discovery and parsing cannot disagree.
+            rf"^[ \t]*{EXEC_START_PREFIX}",
             "--",
             ".",
             *_NON_UNIT_PATHSPECS,
@@ -181,67 +176,6 @@ def discover_exec_start_files() -> list[str]:
         f"sweep green while checking nothing. stderr: {proc.stderr.strip()!r}"
     )
     return sorted(line.strip() for line in proc.stdout.splitlines() if line.strip())
-
-
-def logical_exec_start(text: str, unit_name: str = "<unit>") -> str:
-    """Return the effective ExecStart COMMAND in *text* as one logical line.
-
-    Two normalisations, each of which a naive read gets wrong on a file
-    committed in this repo today.
-
-    LAST OCCURRENCE WINS, mirroring systemd and
-    test_orchestrator_service_files.py::_exec_start_line, whose docstring holds
-    the reasoning: a drop-in override lands as an empty ``ExecStart=`` RESET
-    followed by the real command, so a first-match read finds the reset, sees no
-    flags, and passes a unit whose real command may well be wrong.
-
-    CONTINUATIONS ARE JOINED, following
-    test_dashboard_service_template.py::_logical_exec_start.  The ExecStart= of
-    scripts/dashboard.service.template and scripts/fused-memory.service.template
-    (with its committed mirror) spans several physical lines.  For those three
-    the first fragment happens to hold the run-level flags today, which is worse
-    than useless: an unjoined read would pass them VACUOUSLY and stop noticing
-    the day a flag moved to a continuation line.
-
-    Returns the command only, with the directive prefix removed.  Raises
-    MalformedExecStart — the shared class, so a broken unit surfaces as ONE
-    class whichever layer notices it first — when there is no ExecStart= at all,
-    or when the effective one carries no command.  Neither is a legitimate "this
-    unit has no uv flags" answer; that is the None return below.
-    """
-    lines = text.splitlines()
-    start_indices = [
-        i for i, ln in enumerate(lines) if _EXEC_START_RE.match(ln.strip())
-    ]
-    if not start_indices:
-        raise MalformedExecStart(
-            f"{unit_name} declares no ExecStart= line, so there is no command "
-            "to check for run-level uv flags. Treating this as 'not a uv run "
-            "command' would silently drop the unit out of the sweep — the exact "
-            "direction a guard against a silently-mutated venv must refuse."
-        )
-
-    parts: list[str] = []
-    idx = start_indices[-1]
-    while True:
-        line = lines[idx].strip()
-        continued = line.endswith("\\")
-        if continued:
-            line = line[:-1]
-        parts.append(line.strip())
-        if not continued or idx + 1 >= len(lines):
-            break
-        idx += 1
-
-    command = _EXEC_START_RE.sub("", " ".join(p for p in parts if p), count=1).strip()
-    if not command:
-        raise MalformedExecStart(
-            f"{unit_name}'s effective ExecStart= carries no command: the last "
-            "assignment is a list RESET with nothing appended after it, so "
-            "systemd has no command to run at all. Treating this as 'not a uv "
-            "run command' would silently drop a unit that cannot start."
-        )
-    return command
 
 
 def uv_run_level_flags(exec_start: str) -> list[str] | None:
