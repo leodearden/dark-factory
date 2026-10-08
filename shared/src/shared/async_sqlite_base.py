@@ -43,6 +43,11 @@ class CheckpointResult(NamedTuple):
     log: int
     checkpointed: int
 
+    @classmethod
+    def unavailable(cls) -> CheckpointResult:
+        """No checkpoint ran: the store has no open connection, or the pragma returned no row."""
+        return cls(-1, -1, -1)
+
 
 async def apply_wal_pragmas(conn: aiosqlite.Connection, *, busy_timeout_ms: int) -> None:
     """Configure WAL journal mode and optional busy_timeout on an open aiosqlite connection.
@@ -271,25 +276,25 @@ class AtomicConnection:
     async def checkpoint(self) -> CheckpointResult:
         """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` as one atomic access.
 
-        Returns ``CheckpointResult(-1, -1, -1)`` when the pragma yields no row,
-        preserving the contract the reconciliation stores' callers already
-        depend on: the checkpoint cycle unpacks the tuple and logs raises
-        separately, so turning a benign empty result into an exception would
-        report a checkpoint failure on every affected tick.
+        Returns :meth:`CheckpointResult.unavailable` when the pragma yields no
+        row.  This family — the fused-memory stores driven by
+        ``fused-memory/src/fused_memory/server/main.py::_run_checkpoint_cycle`` —
+        answers "no checkpoint ran" with that sentinel, never a raise: the cycle
+        unpacks the tuple and logs raises separately, so a benign empty result
+        must not read as a checkpoint failure on every affected tick.
 
-        That is the OPPOSITE of :meth:`AsyncSqliteBase.checkpoint`, which raises
-        ``RuntimeError`` on the identical condition — and both live in this one
-        module.  Read both before moving a store from one to the other: the swap
-        turns "raises on an impossible pragma result" into "returns a sentinel
-        that unpacks as three ints" with no type or test signal.  The divergence
-        is deliberate and temporary; task 5562's adoption unifies it.
+        :meth:`AsyncSqliteBase.checkpoint` (dashboard, ``cost_store``) raises
+        ``RuntimeError`` on the identical condition instead, and both live in
+        this one module.  Read both before moving a store from one to the other:
+        the swap turns "raises on an impossible pragma result" into "returns a
+        sentinel that unpacks as three ints" with no type or test signal.
         """
         async with self._held('checkpoint()'):
             rows = list(
                 await self._connection.execute_fetchall('PRAGMA wal_checkpoint(TRUNCATE)')
             )
         if not rows:
-            return CheckpointResult(-1, -1, -1)
+            return CheckpointResult.unavailable()
         row = rows[0]
         return CheckpointResult(int(row[0]), int(row[1]), int(row[2]))
 
@@ -405,12 +410,11 @@ class AsyncSqliteBase(abc.ABC):
                 (unexpected; SQLite always returns a row for this pragma).
 
         Note:
-            :meth:`AtomicConnection.checkpoint` answers that same no-rows case
-            with ``CheckpointResult(-1, -1, -1)`` instead, preserving the
-            contract the reconciliation stores' callers already had.  Two
-            opposite contracts under one name in one module: a store migrating
-            between them changes behaviour silently, so see both.  Deliberate
-            and temporary; task 5562's adoption unifies it.
+            :meth:`AtomicConnection.checkpoint` — the fused-memory store family
+            — answers that same no-rows case with
+            :meth:`CheckpointResult.unavailable` instead.  Two opposite
+            contracts under one name in one module: a store moving between
+            them changes behaviour silently, so read both first.
         """
         conn = self._require_conn()
         async with conn.execute('PRAGMA wal_checkpoint(TRUNCATE)') as cursor:
