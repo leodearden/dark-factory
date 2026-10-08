@@ -107,6 +107,7 @@ from legibility import (  # noqa: E402
     census_trigger,
     census_window,
     digest,
+    invariants,
     session_ledger,
     session_runner,
     unlanded,
@@ -2603,6 +2604,7 @@ def run_census(
         report_path, codebook_path, census_state_path, dry_run_payloads_path,
     )
 
+    invariant_slugs = invariants.read_slugs(project_root)
     mining_result = mine_to_saturation(
         batch_source,
         codebook_dict,
@@ -2755,7 +2757,9 @@ def run_census(
     # invisible everywhere.
     disposition_conflicts = 0
     for record in mining_result.records:
-        updated_codebook, _stats = codebook.apply_coding_record(updated_codebook, record)
+        updated_codebook, _stats = codebook.apply_coding_record(
+            updated_codebook, record, invariant_slugs=invariant_slugs,
+        )
         disposition_conflicts += _stats.get("candidate_disposition_conflicts", 0)
 
     # ONE list for every verdict this run paid for and dropped, shared by both

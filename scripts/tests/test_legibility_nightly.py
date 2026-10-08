@@ -3296,7 +3296,7 @@ def test_run_nightly_persists_a_corrections_only_night(tmp_path, monkeypatch):
 
     real_apply = codebook.apply_coding_record
 
-    def apply_with_correction(cb, record):
+    def apply_with_correction(cb, record, **kwargs):
         return real_apply(cb, {
             **record,
             'corrections': [{
@@ -3304,7 +3304,7 @@ def test_run_nightly_persists_a_corrections_only_night(tmp_path, monkeypatch):
                 'note': 'framing refuted',
                 'title': 'Corrected Cause',
             }],
-        })
+        }, **kwargs)
 
     monkeypatch.setattr(nightly.codebook, 'apply_coding_record', apply_with_correction)
 

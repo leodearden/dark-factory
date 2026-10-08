@@ -19,8 +19,19 @@ import os
 import re
 import sys
 import tempfile
+from collections.abc import Collection
+from dataclasses import dataclass
+from pathlib import Path
 
 import yaml
+
+# Self-bootstrap for a standalone `python scripts/legibility/codebook.py` run,
+# which puts only scripts/legibility/ (not scripts/) on sys.path. Mirrors
+# coder.py's identical guard.
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from legibility import invariants  # noqa: E402
 
 logger = logging.getLogger("legibility.codebook")
 
@@ -86,8 +97,9 @@ _SIGHTING_SCHEMA = {
         "session": {"type": "string"},
         "origin_phase": {"enum": PHASES},
         "manifested_phase": {"enum": PHASES},
-        # Free string, NOT slug-checked against design-invariants.md's INV
-        # vocabulary — this PRD ships the field, the sibling PRD owns the gate.
+        # A free string here, so validate() keeps the legacy free-text values
+        # valid. New writes are screened against the project's invariant
+        # slugs by screen_invariant_slugs inside apply_coding_record.
         "invariant_violated": {"type": ["string", "null"]},
         "note": {"type": "string"},
         "evidence_quote": {"type": "string"},
@@ -449,7 +461,73 @@ def assert_no_deletion(before: dict, after: dict) -> None:
             )
 
 
-def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
+_SIGHTING_OPS = ("matches", "candidates", "corrections")
+
+
+@dataclass(frozen=True)
+class SlugTally:
+    """``invariant_violated`` values screened on write: how many named a
+    declared slug, and the values that did not (stored as absent)."""
+
+    valid: int = 0
+    rejected: tuple[str, ...] = ()
+
+    def plus(self, other: SlugTally) -> SlugTally:
+        return SlugTally(
+            valid=self.valid + other.valid,
+            rejected=self.rejected + other.rejected,
+        )
+
+
+def screen_invariant_slugs(
+    record: dict, invariant_slugs: Collection[str]
+) -> tuple[dict, SlugTally]:
+    """A copy of *record* keeping only ``invariant_violated`` values that are
+    one of *invariant_slugs*, and the tally of what was kept and dropped.
+
+    Covers every op a sighting is built from. An empty value is neither
+    valid nor rejected: it is already absent.
+    """
+    screened = copy.deepcopy(record)
+    valid = 0
+    rejected: list[str] = []
+    for key in _SIGHTING_OPS:
+        for op in screened.get(key) or []:
+            if not isinstance(op, dict):
+                continue
+            value = op.get("invariant_violated")
+            if not value:
+                continue
+            if isinstance(value, str) and value in invariant_slugs:
+                valid += 1
+                continue
+            del op["invariant_violated"]
+            rejected.append(value if isinstance(value, str) else repr(value))
+    return screened, SlugTally(valid=valid, rejected=tuple(rejected))
+
+
+def warn_unknown_invariant_slugs(
+    tally: SlugTally, invariant_slugs: Collection[str], *, run: str
+) -> None:
+    """The one WARNING a run emits for its rejected ``invariant_violated``
+    values, if it rejected any."""
+    if not tally.rejected:
+        return
+    declared = (
+        ", ".join(invariant_slugs)
+        if invariant_slugs
+        else f"none (the project declares no slug in {invariants.DOC_RELPATH})"
+    )
+    logger.warning(
+        "codebook: run %s stored %d invariant_violated value(s) as absent "
+        "because they name no declared invariant slug: %s; declared slugs: %s",
+        run, len(tally.rejected), sorted(set(tally.rejected)), declared,
+    )
+
+
+def apply_coding_record(
+    codebook: dict, record: dict, *, invariant_slugs: Collection[str]
+) -> tuple[dict, dict]:
     """Apply one §7.3 coding record to a v2 codebook. Sole-writer merge.
 
     Three ops: `matches` (append a sighting to an existing entry),
@@ -462,11 +540,18 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
     `(new_codebook, stats)` where stats has keys `matched`,
     `skipped_unknown_entry`, `candidates_applied`,
     `candidate_disposition_conflicts`, `corrections_applied`,
-    `correction_skipped`, `record_invalid`.
+    `correction_skipped`, `record_invalid`, `invariant_slugs`.
 
     A record that fails `validate_coding_record()` is skipped WHOLE (never
     partially applied): the input codebook comes back unchanged (deep
     copy) and `stats['record_invalid']` is True.
+
+    A valid record is then screened by `screen_invariant_slugs()` against
+    *invariant_slugs*, the observed project's declared vocabulary: an
+    `invariant_violated` value that is not one of them is stored as absent
+    rather than failing the record, and `stats['invariant_slugs']` is the
+    record's `SlugTally`. Emitting the run's one WARNING is the caller's job
+    (`warn_unknown_invariant_slugs()`).
 
     Match handling: an entry_id that doesn't resolve to an existing entry
     is counted as skipped and never fabricated into a new entry — only the
@@ -565,6 +650,7 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
         "corrections_applied": 0,
         "correction_skipped": 0,
         "record_invalid": False,
+        "invariant_slugs": SlugTally(),
     }
 
     result = copy.deepcopy(codebook)
@@ -574,6 +660,7 @@ def apply_coding_record(codebook: dict, record: dict) -> tuple[dict, dict]:
         stats["record_invalid"] = True
         assert_no_deletion(codebook, result)
         return result, stats
+    record, stats["invariant_slugs"] = screen_invariant_slugs(record, invariant_slugs)
 
     session = record["session"]
     date = record["date"]
@@ -730,7 +817,8 @@ def validate_coding_record(record: dict) -> list[str]:
     Returns a list of human-readable error strings; an empty list means the
     record is valid. Required: session/date/project/agent_class (strings).
     matches/candidates are optional lists; invariant_violated accepts null
-    or any string (not slug-checked — see PHASES/HEADER module docstring).
+    or any string here. An unknown slug is not an error: apply_coding_record
+    stores it as absent through screen_invariant_slugs.
     """
     return _schema_errors(record, CODING_RECORD_SCHEMA)
 
@@ -901,7 +989,13 @@ def _cmd_apply(args: argparse.Namespace) -> int:
     session. It is reported here and as a WARNING (never silently dropped),
     but the batch keeps going and the return value stays 0 — the record is
     valid, it just says the same thing twice.
+
+    `invariant_slugs_valid`/`invariant_slugs_rejected` count the
+    `invariant_violated` values screened against the slugs declared under
+    `--project-root`; a rejected value is stored as absent and the batch
+    logs one WARNING naming them.
     """
+    invariant_slugs = invariants.read_slugs(args.project_root)
     codebook = load(args.codebook)
     if not isinstance(codebook, dict):
         print(
@@ -921,6 +1015,7 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         "malformed_json": 0,
         "deletion_directive": 0,
     }
+    slug_tally = SlugTally()
 
     with open(args.records, encoding="utf-8") as f:
         for lineno, raw_line in enumerate(f, start=1):
@@ -942,7 +1037,9 @@ def _cmd_apply(args: argparse.Namespace) -> int:
                 totals["malformed_json"] += 1
                 continue
             try:
-                codebook, stats = apply_coding_record(codebook, record)
+                codebook, stats = apply_coding_record(
+                    codebook, record, invariant_slugs=invariant_slugs
+                )
             except NeverDeleteError as exc:
                 # Mirror the malformed-JSON sibling above: one deletion-shaped
                 # record is dropped and counted, never aborts the rest of the
@@ -966,6 +1063,11 @@ def _cmd_apply(args: argparse.Namespace) -> int:
             totals["corrections_applied"] += stats["corrections_applied"]
             totals["correction_skipped"] += stats["correction_skipped"]
             totals["record_invalid"] += int(stats["record_invalid"])
+            slug_tally = slug_tally.plus(stats["invariant_slugs"])
+
+    warn_unknown_invariant_slugs(slug_tally, invariant_slugs, run=f"apply {args.records}")
+    totals["invariant_slugs_valid"] = slug_tally.valid
+    totals["invariant_slugs_rejected"] = len(slug_tally.rejected)
 
     errors = validate(codebook)
     if errors:
@@ -981,7 +1083,9 @@ def _cmd_apply(args: argparse.Namespace) -> int:
         "correction_skipped={correction_skipped} "
         "skipped_unknown_entry={skipped_unknown_entry} "
         "record_invalid={record_invalid} malformed_json={malformed_json} "
-        "deletion_directive={deletion_directive}".format(**totals)
+        "deletion_directive={deletion_directive} "
+        "invariant_slugs_valid={invariant_slugs_valid} "
+        "invariant_slugs_rejected={invariant_slugs_rejected}".format(**totals)
     )
     return 0
 
@@ -1006,6 +1110,12 @@ def main(argv: list[str] | None = None) -> int:
 
     apply_parser = subparsers.add_parser(
         "apply", help="apply a JSONL file of §7.3 coding records to a codebook file"
+    )
+    apply_parser.add_argument(
+        "--project-root",
+        required=True,
+        help="the observed project, whose design-invariants doc declares the "
+        "invariant slugs a sighting may name",
     )
     apply_parser.add_argument("codebook")
     apply_parser.add_argument("records")

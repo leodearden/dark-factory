@@ -47,6 +47,7 @@ from legibility import (  # noqa: E402
     codebook,
     coder,
     digest,
+    invariants,
     inventory,
     sampling,
     session_ledger,
@@ -1460,6 +1461,7 @@ def run_nightly(
                 codebook_path,
             )
             cb = {'version': 2, 'entries': [], 'candidates': []}
+        invariant_slugs = invariants.read_slugs(cfg.project_root)
 
         run = coder.code_digests(
             digests, cb, project=cfg.project_id, model=cfg.models.trickle, invoke=invoke,
@@ -1522,7 +1524,9 @@ def run_nightly(
         merged_records = []
         for record in run.records:
             try:
-                cb, stats = codebook.apply_coding_record(cb, record)
+                cb, stats = codebook.apply_coding_record(
+                    cb, record, invariant_slugs=invariant_slugs,
+                )
             except codebook.NeverDeleteError as exc:
                 # One deletion-shaped coder record must not cost the whole
                 # night's merge: apply_coding_record raises before it deep-
