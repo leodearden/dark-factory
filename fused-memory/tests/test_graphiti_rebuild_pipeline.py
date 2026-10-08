@@ -1,7 +1,7 @@
 """Tests for code-quality improvements to graphiti_client.py rebuild/refresh pipeline.
 
 Task 433: 8 code-quality improvements deferred from task-419 review.
-- StaleSummaryResult NamedTuple (steps 1-2)
+- StaleSummaryResult named result type (steps 1-2; keyword-only since task 4914)
 - _canonical_facts() @staticmethod (steps 3-4)
 - refresh_entity_summary optional name/old_summary params (steps 5-6)
 - rebuild_entity_summaries force+dry_run edge-fetch skip (steps 7-8)
@@ -13,11 +13,13 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _fm_helpers import complete_paged_read, make_rebuild_detail
+from _fm_helpers import COMPLETE_READ, complete_paged_read, make_rebuild_detail
 
 from fused_memory.backends.graphiti_client import (
+    INCOMPLETE_SHORT_READ,
     EdgeDict,
     GraphitiBackend,
+    ReadCompleteness,
     StaleSummaryResult,
 )
 
@@ -66,50 +68,52 @@ def make_stale_list():
 
 
 # ---------------------------------------------------------------------------
-# step-1: StaleSummaryResult named tuple with backward-compat tuple unpacking
+# step-1: StaleSummaryResult named result type
 # ---------------------------------------------------------------------------
 
 
 class TestStaleSummaryResult:
-    """StaleSummaryResult has named attrs and supports 3-tuple unpacking."""
+    """StaleSummaryResult has named attrs and is constructed by keyword only."""
 
     def test_named_attribute_stale(self):
         """StaleSummaryResult.stale holds the stale list."""
         stale_list = [{'uuid': 'u1', 'name': 'Alice'}]
         edges: dict[str, list[EdgeDict]] = {'u1': [{'uuid': 'e-1', 'fact': 'fact1', 'name': 'knows'}]}
-        result = StaleSummaryResult(stale=stale_list, all_edges=edges, total_count=5)
+        result = StaleSummaryResult(
+            stale=stale_list, all_edges=edges, total_count=5,
+            entities_completeness=COMPLETE_READ, edges_completeness=COMPLETE_READ,
+        )
         assert result.stale is stale_list
 
     def test_named_attribute_all_edges(self):
         """StaleSummaryResult.all_edges holds the edges dict."""
         stale_list: list[dict] = []
         edges: dict[str, list[EdgeDict]] = {'u1': [{'uuid': 'e-1', 'fact': 'fact1', 'name': 'knows'}]}
-        result = StaleSummaryResult(stale=stale_list, all_edges=edges, total_count=3)
+        result = StaleSummaryResult(
+            stale=stale_list, all_edges=edges, total_count=3,
+            entities_completeness=COMPLETE_READ, edges_completeness=COMPLETE_READ,
+        )
         assert result.all_edges is edges
 
     def test_named_attribute_total_count(self):
         """StaleSummaryResult.total_count holds the total entity count."""
-        result = StaleSummaryResult(stale=[], all_edges={}, total_count=42)
+        result = StaleSummaryResult(
+            stale=[], all_edges={}, total_count=42,
+            entities_completeness=COMPLETE_READ, edges_completeness=COMPLETE_READ,
+        )
         assert result.total_count == 42
 
-    def test_tuple_unpacking_backward_compat(self):
-        """StaleSummaryResult supports 3-tuple unpacking (backward compat)."""
-        stale_list = [{'uuid': 'u1'}]
-        edges = {'u1': []}
-        result = StaleSummaryResult(stale=stale_list, all_edges=edges, total_count=7)
-        a, b, c = result
-        assert a is stale_list
-        assert b is edges
-        assert c == 7
-
-    def test_is_tuple_subclass(self):
-        """StaleSummaryResult compares value-equal to a plain 3-tuple (backward-compat promise)."""
-        stale_list = [{'uuid': 'u1'}]
-        edges: dict = {}
-        result = StaleSummaryResult(stale=stale_list, all_edges=edges, total_count=1)
-        # Value-equality with a plain tuple proves the NamedTuple backward-compat promise:
-        # only actual tuple subclasses compare equal to plain tuples this way.
-        assert result == (stale_list, edges, 1)
+    def test_positional_construction_is_refused(self):
+        """Keyword-only: the two same-typed completeness fields cannot be swapped silently."""
+        with pytest.raises(TypeError):
+            StaleSummaryResult([], {}, 0, COMPLETE_READ, COMPLETE_READ)  # type: ignore[misc]
+        short_edges = ReadCompleteness(complete=False, incomplete_kind=INCOMPLETE_SHORT_READ)
+        result = StaleSummaryResult(
+            stale=[], all_edges={}, total_count=0,
+            entities_completeness=COMPLETE_READ, edges_completeness=short_edges,
+        )
+        assert result.entities_completeness is COMPLETE_READ
+        assert result.edges_completeness is short_edges
 
     def test_no_legacy_edges_attribute(self):
         """StaleSummaryResult must NOT expose the old 'edges' field name.
@@ -117,7 +121,10 @@ class TestStaleSummaryResult:
         StaleSummaryResult uses all_edges (not edges) as the field name; this test
         prevents silent re-aliasing.
         """
-        result = StaleSummaryResult(stale=[], all_edges={}, total_count=0)
+        result = StaleSummaryResult(
+            stale=[], all_edges={}, total_count=0,
+            entities_completeness=COMPLETE_READ, edges_completeness=COMPLETE_READ,
+        )
         assert not hasattr(result, 'edges')
 
     @pytest.mark.asyncio
@@ -138,17 +145,10 @@ class TestStaleSummaryResult:
         )
         result = await backend.detect_stale_with_edges(group_id='test')
 
-        # Named access
         assert isinstance(result, StaleSummaryResult)
         assert result.total_count == 1
         assert isinstance(result.stale, list)
         assert isinstance(result.all_edges, dict)
-
-        # Positional (backward compat)
-        stale, edges, total = result
-        assert total == 1
-        assert isinstance(stale, list)
-        assert isinstance(edges, dict)
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +497,10 @@ class TestRebuildEntitySummariesDataFlow:
             'u1': [{'uuid': 'e-1', 'fact': 'Alice knows Bob', 'name': 'knows'}]
         }
         # total_count=10 means 10 entities exist but only 1 is stale
-        detect_result = StaleSummaryResult(stale=stale_list, all_edges=all_edges, total_count=10)
+        detect_result = StaleSummaryResult(
+            stale=stale_list, all_edges=all_edges, total_count=10,
+            entities_completeness=COMPLETE_READ, edges_completeness=COMPLETE_READ,
+        )
         svc.graphiti.detect_stale_with_edges = AsyncMock(return_value=detect_result)
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(
             return_value=make_rebuild_detail(
@@ -567,6 +570,8 @@ class TestRebuildEntitySummariesDataFlow:
                 stale=[{'uuid': 'u1', 'name': 'Alice', 'summary': 'some summary'}],
                 all_edges={'u1': []},
                 total_count=1,
+                entities_completeness=COMPLETE_READ,
+                edges_completeness=COMPLETE_READ,
             )
         )
         svc.graphiti.detect_stale_dry_run = AsyncMock()
@@ -734,6 +739,8 @@ class TestRebuildEntitySummariesErrorHandling:
             stale=stale_list,
             all_edges={'u1': [], 'u2': []},
             total_count=5,
+            entities_completeness=COMPLETE_READ,
+            edges_completeness=COMPLETE_READ,
         )
         svc.graphiti.detect_stale_with_edges = AsyncMock(return_value=detect_result)
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(

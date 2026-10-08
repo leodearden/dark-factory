@@ -20,7 +20,7 @@ from collections.abc import Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from _fm_helpers import make_rebuild_detail, pydantic_spec
+from _fm_helpers import COMPLETE_READ, make_rebuild_detail, pydantic_spec
 
 from fused_memory.backends.graphiti_client import EdgeDict, GraphitiBackend, StaleSummaryResult
 from fused_memory.config.schema import FusedMemoryConfig
@@ -970,6 +970,8 @@ class TestRebuildEntitySummaries:
                 stale=[{'uuid': 'uuid-1', 'name': 'Alice', 'summary': 'stale fact'}],
                 all_edges={'uuid-1': [{'uuid': 'e1', 'fact': 'current fact', 'name': 'edge1'}]},
                 total_count=2,
+                entities_completeness=COMPLETE_READ,
+                edges_completeness=COMPLETE_READ,
             )
         )
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(return_value={
@@ -1012,7 +1014,10 @@ class TestRebuildEntitySummaries:
         """Returns dict with total_entities, stale_entities, rebuilt, skipped, errors, details."""
         svc = _make_svc(mock_config)
         svc.graphiti.detect_stale_with_edges = AsyncMock(
-            return_value=StaleSummaryResult(stale=[], all_edges={}, total_count=0)
+            return_value=StaleSummaryResult(
+                stale=[], all_edges={}, total_count=0,
+                entities_completeness=COMPLETE_READ, edges_completeness=COMPLETE_READ,
+            )
         )
         result = await svc.rebuild_entity_summaries(project_id='test')
         assert set(result.keys()) == {'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors', 'details'}
@@ -1032,6 +1037,8 @@ class TestRebuildEntitySummaries:
                     'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
                 },
                 total_count=2,
+                entities_completeness=COMPLETE_READ,
+                edges_completeness=COMPLETE_READ,
             )
         )
 
@@ -1055,7 +1062,10 @@ class TestRebuildEntitySummaries:
         """No entities means all counts are 0."""
         svc = _make_svc(mock_config)
         svc.graphiti.detect_stale_with_edges = AsyncMock(
-            return_value=StaleSummaryResult(stale=[], all_edges={}, total_count=0)
+            return_value=StaleSummaryResult(
+                stale=[], all_edges={}, total_count=0,
+                entities_completeness=COMPLETE_READ, edges_completeness=COMPLETE_READ,
+            )
         )
         result = await svc.rebuild_entity_summaries(project_id='test')
         assert result['total_entities'] == 0
@@ -1114,6 +1124,8 @@ class TestMemoryServiceRebuildEntitySummaries:
                     'u2': [{'uuid': 'e2', 'fact': 'new B', 'name': 'rel2'}],
                 },
                 total_count=5,
+                entities_completeness=COMPLETE_READ,
+                edges_completeness=COMPLETE_READ,
             )
         )
         dispatch = _uuid_dispatch({
@@ -1206,6 +1218,8 @@ class TestMemoryServiceRebuildEntitySummaries:
                     'u4': [{'uuid': 'e4', 'fact': 'new D', 'name': 'r4'}],
                 },
                 total_count=10,
+                entities_completeness=COMPLETE_READ,
+                edges_completeness=COMPLETE_READ,
             )
         )
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
@@ -1772,6 +1786,8 @@ class TestRebuildEntitySummariesParallel:
                 'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
             },
             total_count=2,
+            entities_completeness=COMPLETE_READ,
+            edges_completeness=COMPLETE_READ,
         ))
         svc.graphiti.get_valid_edges_for_node = AsyncMock()
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
@@ -1969,6 +1985,8 @@ class TestRebuildEntitySummariesParallel:
                 'uuid-2': [{'uuid': 'e2', 'fact': 'bob current', 'name': 'edge2'}],
             },
             total_count=2,
+            entities_completeness=COMPLETE_READ,
+            edges_completeness=COMPLETE_READ,
         ))
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
             {'uuid': 'uuid-1', 'name': 'Alice', 'old_summary': 'alice stale', 'new_summary': 'alice current', 'edge_count': 1},
@@ -2289,6 +2307,8 @@ class TestRebuildEntitySummariesCancellation:
                     'uuid-2': [{'uuid': 'e2', 'fact': 'current2', 'name': 'edge2'}],
                 },
                 total_count=2,
+                entities_completeness=COMPLETE_READ,
+                edges_completeness=COMPLETE_READ,
             )
         )
         # First entity's rebuild raises CancelledError; second would succeed
@@ -2491,6 +2511,8 @@ class TestServiceRebuildOrchestration:
                 stale=stale_entities,
                 all_edges=all_edges,
                 total_count=3,
+                entities_completeness=COMPLETE_READ,
+                edges_completeness=COMPLETE_READ,
             )
         )
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=[
@@ -2720,6 +2742,8 @@ class TestServiceRebuildOrchestrationErrors:
                 stale=stale_entities,
                 all_edges={},
                 total_count=2,
+                entities_completeness=COMPLETE_READ,
+                edges_completeness=COMPLETE_READ,
             )
         )
         return svc

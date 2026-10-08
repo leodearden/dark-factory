@@ -42,6 +42,7 @@ from fused_memory.backends.graphiti_client import (
     INCOMPLETE_SHORT_READ,
     INCOMPLETE_STRUCTURAL_KINDS,
     PagedRead,
+    ReadCompleteness,
 )
 from fused_memory.utils.target_store_preflight import task_store_path
 
@@ -385,6 +386,11 @@ def incomplete_paged_read(
         reason=reason,
         incomplete_kind=kind,
     )
+
+
+#: The verdict for a proven-complete read, for the StaleSummaryResult fields a
+#: test does not care about (task 4914).
+COMPLETE_READ = ReadCompleteness(complete=True, incomplete_kind=None)
 
 
 # ---------------------------------------------------------------------------
