@@ -1,4 +1,4 @@
-"""The incumbent's measured LLM spend: production per-write telemetry and the controls' replay unit cost.
+"""The incumbent's measured LLM spend: production per-attempt telemetry and the controls' replay unit cost.
 
 Provenance of the committed figures: plans/local-memory-models-eval-llm/README.md.
 """
@@ -12,7 +12,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Literal, Self, TypeVar
 
-from pydantic import AwareDatetime, Field, TypeAdapter, model_validator
+from pydantic import AwareDatetime, Field, TypeAdapter, ValidationError, model_validator
 from shared.memory_eval_metrics import canonical_json_text
 
 from fused_memory.arm_harness.arm_spec import ArmId, LlmArmSpec, TokenPricing
@@ -40,19 +40,25 @@ class LlmWriteOperation(StrEnum):
 _LLM_WRITE_OPERATIONS = frozenset(operation.value for operation in LlmWriteOperation)
 
 
+class TelemetryRowError(ValueError):
+    """A telemetry row cannot be parsed: the dump is malformed."""
+
+
 class TelemetryWindowError(ValueError):
     """The telemetry cannot bound a measurement window, so nothing is costed."""
 
 
 class TelemetryAccountingError(ValueError):
-    """An LLM-bearing write inside the window has no token record: its cost is unknown, not zero."""
+    """An LLM attempt inside the window has no token record: its cost is unknown, not zero."""
 
 
 class IncumbentCostError(ValueError):
     """The inputs cannot yield a measured incumbent cost, so none is written."""
 
 
-class LlmWriteTelemetry(FrozenModel):
+class LlmAttemptTelemetry(FrozenModel):
+    """One graphiti attempt at an LLM-bearing write; a retried write yields one per attempt."""
+
     created_at: AwareDatetime
     operation: LlmWriteOperation
     project_id: str = Field(min_length=1)
@@ -64,104 +70,134 @@ class LlmWriteTelemetry(FrozenModel):
     @classmethod
     def from_telemetry_row(cls, row: Mapping[str, object]) -> Self:
         """Parse one ``telemetry_query.py`` row, refusing a total that is not input + output."""
-        write = cls.model_validate({field: row.get(field) for field in cls.model_fields})
+        where = f'telemetry row at {row.get("created_at")}'
+        try:
+            attempt = cls.model_validate({field: row.get(field) for field in cls.model_fields})
+        except ValidationError as error:
+            raise TelemetryRowError(f'{where}: {error}') from error
         total = row.get('total_tokens')
-        if total != write.input_tokens + write.output_tokens:
-            raise ValueError(
-                f'telemetry row at {row.get("created_at")}: total_tokens {total} != '
-                f'input_tokens {write.input_tokens} + output_tokens {write.output_tokens}'
+        if total != attempt.input_tokens + attempt.output_tokens:
+            raise TelemetryRowError(
+                f'{where}: total_tokens {total} != input_tokens {attempt.input_tokens} + '
+                f'output_tokens {attempt.output_tokens}'
             )
-        return write
+        return attempt
 
 
 class TelemetryWindow(FrozenModel):
-    """The LLM writes from the first token-bearing one up to, not including, ``end``."""
+    """The LLM attempts from the first token-bearing one up to, not including, ``end``."""
 
     start: AwareDatetime
     end: AwareDatetime
-    writes: tuple[LlmWriteTelemetry, ...]
+    attempts: tuple[LlmAttemptTelemetry, ...]
 
     @model_validator(mode='after')
-    def _bounds_its_writes(self) -> Self:
+    def _bounds_its_attempts(self) -> Self:
         if self.end <= self.start:
             raise ValueError(
                 f'window end {self.end.isoformat()} is not after its start {self.start.isoformat()}'
             )
-        if not self.writes:
+        if not self.attempts:
             raise ValueError(f'window [{self.start.isoformat()}, {self.end.isoformat()}) is empty')
         self._require_sorted()
-        self._require_start_is_first_write()
-        self._require_writes_before_end()
+        self._require_start_is_first_attempt()
+        self._require_attempts_before_end()
         return self
 
     def _require_sorted(self) -> None:
-        for earlier, later in pairwise(self.writes):
+        for earlier, later in pairwise(self.attempts):
             if later.created_at < earlier.created_at:
                 raise ValueError(
-                    f'window writes are not sorted by created_at: {later.created_at.isoformat()} '
-                    f'follows {earlier.created_at.isoformat()}'
+                    f'window attempts are not sorted by created_at: '
+                    f'{later.created_at.isoformat()} follows {earlier.created_at.isoformat()}'
                 )
 
-    def _require_start_is_first_write(self) -> None:
-        first = self.writes[0].created_at
+    def _require_start_is_first_attempt(self) -> None:
+        first = self.attempts[0].created_at
         if self.start != first:
             raise ValueError(
-                f"window start {self.start.isoformat()} is not its first write's created_at "
+                f"window start {self.start.isoformat()} is not its first attempt's created_at "
                 f'{first.isoformat()}'
             )
 
-    def _require_writes_before_end(self) -> None:
-        late = [write.created_at for write in self.writes if write.created_at >= self.end]
+    def _require_attempts_before_end(self) -> None:
+        late = [attempt.created_at for attempt in self.attempts if attempt.created_at >= self.end]
         if late:
             raise ValueError(
-                f'{len(late)} write(s) at or after the window end {self.end.isoformat()}, '
+                f'{len(late)} attempt(s) at or after the window end {self.end.isoformat()}, '
                 f'the first at {late[0].isoformat()}'
             )
 
 
-def select_llm_writes(rows: Iterable[Mapping[str, object]], *, until: datetime) -> TelemetryWindow:
-    """The window of graphiti LLM writes from where token telemetry began up to ``until``."""
+def select_llm_attempts(
+    rows: Iterable[Mapping[str, object]], *, until: datetime
+) -> TelemetryWindow:
+    """The window of graphiti LLM attempts from where token telemetry began up to ``until``."""
     if until.tzinfo is None:
         raise TelemetryWindowError(f'until {until.isoformat()} is naive; the journal stamps UTC')
-    stamped = _llm_writes_by_time(rows)
-    start = _first_tokened_at(stamped, until)
-    _require_coverage(stamped, start)
-    in_window = [(moment, row) for moment, row in stamped if start <= moment < until]
+    stamped = _by_time(rows)
+    _require_coverage_to(stamped, until)
+    llm_attempts = [(moment, row) for moment, row in stamped if _is_llm_attempt(row)]
+    start = _first_tokened_at(llm_attempts, until)
+    _require_coverage_from(llm_attempts, start)
+    in_window = [(moment, row) for moment, row in llm_attempts if start <= moment < until]
     _require_accounted(in_window)
     return TelemetryWindow(
         start=start,
         end=until,
-        writes=tuple(LlmWriteTelemetry.from_telemetry_row(row) for _, row in in_window),
+        attempts=tuple(LlmAttemptTelemetry.from_telemetry_row(row) for _, row in in_window),
     )
 
 
-def _llm_writes_by_time(rows: Iterable[Mapping[str, object]]) -> list[_StampedRow]:
-    stamped = [
-        (_AWARE_DATETIME.validate_python(row.get('created_at')), row)
-        for row in rows
-        if row.get('backend') == GRAPHITI_BACKEND and row.get('operation') in _LLM_WRITE_OPERATIONS
-    ]
-    return sorted(stamped, key=lambda pair: pair[0])
+def _by_time(rows: Iterable[Mapping[str, object]]) -> list[_StampedRow]:
+    return sorted(((_created_at(row), row) for row in rows), key=lambda pair: pair[0])
+
+
+def _created_at(row: Mapping[str, object]) -> datetime:
+    try:
+        return _AWARE_DATETIME.validate_python(row.get('created_at'))
+    except ValidationError as error:
+        raise TelemetryRowError(
+            f'telemetry row created_at {row.get("created_at")!r}: {error}'
+        ) from error
+
+
+def _is_llm_attempt(row: Mapping[str, object]) -> bool:
+    return row.get('backend') == GRAPHITI_BACKEND and row.get('operation') in _LLM_WRITE_OPERATIONS
 
 
 def _has_any_tokens(row: Mapping[str, object]) -> bool:
     return any(row.get(column) is not None for column in _TOKEN_COLUMNS)
 
 
-def _first_tokened_at(stamped: Sequence[_StampedRow], until: datetime) -> datetime:
-    for moment, row in stamped:
+def _require_coverage_to(stamped: Sequence[_StampedRow], until: datetime) -> None:
+    if not stamped:
+        raise TelemetryWindowError(
+            f'the telemetry holds no row, so it cannot reach until {until.isoformat()}'
+        )
+    latest = stamped[-1][0]
+    if latest < until:
+        raise TelemetryWindowError(
+            f'the telemetry ends at {latest.isoformat()}, before until {until.isoformat()}: '
+            'the window would count days the dump never saw'
+        )
+
+
+def _first_tokened_at(llm_attempts: Sequence[_StampedRow], until: datetime) -> datetime:
+    for moment, row in llm_attempts:
         if moment < until and _has_any_tokens(row):
             return moment
     raise TelemetryWindowError(
-        f'no token-bearing LLM write lies before until {until.isoformat()}: there is no window'
+        f'no token-bearing LLM attempt lies before until {until.isoformat()}: there is no window'
     )
 
 
-def _require_coverage(stamped: Sequence[_StampedRow], start: datetime) -> None:
-    if not any(moment < start for moment, _ in stamped):
+def _require_coverage_from(llm_attempts: Sequence[_StampedRow], start: datetime) -> None:
+    if not any(moment < start for moment, _ in llm_attempts):
         raise TelemetryWindowError(
-            f'no untokened LLM write precedes the first token-bearing one at {start.isoformat()}: '
-            'the telemetry does not reach back past where token recording began'
+            f'no untokened LLM attempt precedes the first token-bearing one at '
+            f'{start.isoformat()}: the telemetry does not reach back past where token '
+            'recording began'
         )
 
 
@@ -173,37 +209,37 @@ def _require_accounted(in_window: Sequence[_StampedRow]) -> None:
     ]
     if unaccounted:
         raise TelemetryAccountingError(
-            f'{len(unaccounted)} LLM write(s) in the window lack a complete token record, the '
+            f'{len(unaccounted)} LLM attempt(s) in the window lack a complete token record, the '
             f'first at {unaccounted[0].isoformat()}; their tokens are unknown, not zero'
         )
 
 
 class DailySpend(FrozenModel):
     day: date
-    writes: int = Field(gt=0)
+    attempts: int = Field(gt=0)
     usd: float = Field(ge=0)
 
 
 class ProjectSpend(FrozenModel):
     project_id: str = Field(min_length=1)
-    writes: int = Field(gt=0)
+    attempts: int = Field(gt=0)
     usd: float = Field(ge=0)
 
 
 class ProductionCost(FrozenModel):
-    """The window's LLM spend; failed writes count, because their tokens were spent."""
+    """The window's LLM spend; failed attempts count, because their tokens were spent."""
 
     window_start: AwareDatetime
     window_end: AwareDatetime
     days: float = Field(gt=0)
-    writes: int = Field(gt=0)
-    failed_writes: int = Field(ge=0)
+    attempts: int = Field(gt=0)
+    failed_attempts: int = Field(ge=0)
     llm_calls: int = Field(ge=0)
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
     usd: float = Field(ge=0)
-    usd_per_ok_write: float
-    tokens_per_write: float
+    usd_per_ok_attempt: float
+    tokens_per_attempt: float
     usd_per_day: float
     projected_usd_per_30_days: float
     by_day: tuple[DailySpend, ...]
@@ -211,14 +247,31 @@ class ProductionCost(FrozenModel):
 
     @model_validator(mode='after')
     def _carries_its_derivation(self) -> Self:
+        if self.failed_attempts >= self.attempts:
+            raise ValueError(
+                f'failed_attempts {self.failed_attempts} leaves no ok attempt among attempts '
+                f'{self.attempts}'
+            )
         _require_derived(
             'days', self.days, 'window length', _days_between(self.window_start, self.window_end)
         )
         _require_derived(
-            'by_day writes', sum(d.writes for d in self.by_day), 'writes', self.writes
+            'by_day attempts', sum(d.attempts for d in self.by_day), 'attempts', self.attempts
         )
         _require_derived(
-            'by_project writes', sum(p.writes for p in self.by_project), 'writes', self.writes
+            'by_project attempts', sum(p.attempts for p in self.by_project), 'attempts', self.attempts
+        )
+        _require_derived(
+            'usd_per_ok_attempt',
+            self.usd_per_ok_attempt,
+            'usd / (attempts - failed_attempts)',
+            self.usd / (self.attempts - self.failed_attempts),
+        )
+        _require_derived(
+            'tokens_per_attempt',
+            self.tokens_per_attempt,
+            '(input_tokens + output_tokens) / attempts',
+            (self.input_tokens + self.output_tokens) / self.attempts,
         )
         _require_derived('usd_per_day', self.usd_per_day, 'usd / days', self.usd / self.days)
         _require_derived(
@@ -239,64 +292,64 @@ def _days_between(start: datetime, end: datetime) -> float:
     return (end - start).total_seconds() / _SECONDS_PER_DAY
 
 
-def _usd(write: LlmWriteTelemetry, pricing: TokenPricing) -> float:
-    return pricing.usd_for(write.input_tokens, write.output_tokens)
+def _usd(attempt: LlmAttemptTelemetry, pricing: TokenPricing) -> float:
+    return pricing.usd_for(attempt.input_tokens, attempt.output_tokens)
 
 
 def production_cost(window: TelemetryWindow, pricing: TokenPricing) -> ProductionCost:
-    writes = window.writes
-    ok_writes = sum(1 for write in writes if write.success)
-    if ok_writes == 0:
+    attempts = window.attempts
+    ok_attempts = sum(1 for attempt in attempts if attempt.success)
+    if ok_attempts == 0:
         raise IncumbentCostError(
-            f'the window from {window.start.isoformat()} holds {len(writes)} write(s) and no '
-            'ok write to cost'
+            f'the window from {window.start.isoformat()} holds {len(attempts)} attempt(s) and '
+            'no ok attempt to cost'
         )
-    usd = sum(_usd(write, pricing) for write in writes)
+    usd = sum(_usd(attempt, pricing) for attempt in attempts)
     days = _days_between(window.start, window.end)
     usd_per_day = usd / days
-    input_tokens = sum(write.input_tokens for write in writes)
-    output_tokens = sum(write.output_tokens for write in writes)
+    input_tokens = sum(attempt.input_tokens for attempt in attempts)
+    output_tokens = sum(attempt.output_tokens for attempt in attempts)
     return ProductionCost(
         window_start=window.start,
         window_end=window.end,
         days=days,
-        writes=len(writes),
-        failed_writes=len(writes) - ok_writes,
-        llm_calls=sum(write.llm_calls for write in writes),
+        attempts=len(attempts),
+        failed_attempts=len(attempts) - ok_attempts,
+        llm_calls=sum(attempt.llm_calls for attempt in attempts),
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         usd=usd,
-        usd_per_ok_write=usd / ok_writes,
-        tokens_per_write=(input_tokens + output_tokens) / len(writes),
+        usd_per_ok_attempt=usd / ok_attempts,
+        tokens_per_attempt=(input_tokens + output_tokens) / len(attempts),
         usd_per_day=usd_per_day,
         projected_usd_per_30_days=usd_per_day * PROJECTION_DAYS,
         by_day=tuple(
-            DailySpend(day=day, writes=len(usds), usd=sum(usds))
-            for day, usds in _usd_by(writes, pricing, _utc_day)
+            DailySpend(day=day, attempts=len(usds), usd=sum(usds))
+            for day, usds in _usd_by(attempts, pricing, _utc_day)
         ),
         by_project=tuple(
-            ProjectSpend(project_id=project_id, writes=len(usds), usd=sum(usds))
-            for project_id, usds in _usd_by(writes, pricing, _project_id)
+            ProjectSpend(project_id=project_id, attempts=len(usds), usd=sum(usds))
+            for project_id, usds in _usd_by(attempts, pricing, _project_id)
         ),
     )
 
 
-def _utc_day(write: LlmWriteTelemetry) -> date:
-    return write.created_at.astimezone(UTC).date()
+def _utc_day(attempt: LlmAttemptTelemetry) -> date:
+    return attempt.created_at.astimezone(UTC).date()
 
 
-def _project_id(write: LlmWriteTelemetry) -> str:
-    return write.project_id
+def _project_id(attempt: LlmAttemptTelemetry) -> str:
+    return attempt.project_id
 
 
 def _usd_by(
-    writes: Sequence[LlmWriteTelemetry],
+    attempts: Sequence[LlmAttemptTelemetry],
     pricing: TokenPricing,
-    key: Callable[[LlmWriteTelemetry], _GroupKey],
+    key: Callable[[LlmAttemptTelemetry], _GroupKey],
 ) -> list[tuple[_GroupKey, list[float]]]:
     groups: defaultdict[_GroupKey, list[float]] = defaultdict(list)
-    for write in writes:
-        groups[key(write)].append(_usd(write, pricing))
+    for attempt in attempts:
+        groups[key(attempt)].append(_usd(attempt, pricing))
     return sorted(groups.items(), key=lambda group: group[0])
 
 
@@ -395,14 +448,16 @@ def load_incumbent_cost(path: Path | str) -> IncumbentCost:
     return IncumbentCost.model_validate_json(Path(path).read_text())
 
 
-def serialize_llm_writes(writes: Sequence[LlmWriteTelemetry]) -> str:
-    """One canonical (sorted-key) JSON line per write."""
+def serialize_llm_attempts(attempts: Sequence[LlmAttemptTelemetry]) -> str:
+    """One canonical (sorted-key) JSON line per attempt."""
     return ''.join(
-        json.dumps(write.model_dump(mode='json'), sort_keys=True, ensure_ascii=False) + '\n'
-        for write in writes
+        json.dumps(attempt.model_dump(mode='json'), sort_keys=True, ensure_ascii=False) + '\n'
+        for attempt in attempts
     )
 
 
-def load_llm_writes(path: Path | str) -> tuple[LlmWriteTelemetry, ...]:
+def load_llm_attempts(path: Path | str) -> tuple[LlmAttemptTelemetry, ...]:
     lines = Path(path).read_text(encoding='utf-8').splitlines()
-    return tuple(LlmWriteTelemetry.model_validate_json(line) for line in lines if line.strip())
+    return tuple(
+        LlmAttemptTelemetry.model_validate_json(line) for line in lines if line.strip()
+    )

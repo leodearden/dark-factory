@@ -19,7 +19,7 @@ It carries no integration marker, so the merge lane runs it.
 
 | Path | What it is |
 |---|---|
-| `production-telemetry.jsonl` | The selected measurement window: one `LlmWriteTelemetry` per line, in `created_at` order (`incumbent_cost.serialize_llm_writes`) |
+| `production-telemetry.jsonl` | The selected measurement window: one `LlmAttemptTelemetry` per line, in `created_at` order (`incumbent_cost.serialize_llm_attempts`) |
 | `incumbent-cost.json` | `harness.py incumbent-cost` over the dump: the production cost of that window, priced at control A's rates, plus each control run's replay unit cost (`incumbent_cost.IncumbentCost`) |
 | `graphiti-write-history.jsonl` | Query 2 below: graphiti `add_memory`/`add_episode` attempts per day, operation, success and error class, 2026-09-01 up to the cutoff |
 
@@ -62,28 +62,36 @@ uv run --frozen --project fused-memory python fused-memory/scripts/local_memory_
   --out-dir plans/local-memory-models-eval-llm
 ```
 
-Exit 0. Its stdout, verbatim:
+Exit 0. It wrote both committed files.
+
+A review amendment later renamed the artifact's counted fields from `writes` to
+`attempts` and added the window-end coverage check. On 2026-10-08 the same command ran
+again over the same dump, with only `--out-dir /tmp/lme-theta-3721/amend-out` changed.
+Exit 0. Its `production-telemetry.jsonl` is byte-identical to the committed one. Its
+`incumbent-cost.json` is the committed one: every value matches the first run's, and
+only the four renamed keys differ. Its stdout, verbatim:
 
 ```text
 window: 2026-10-05T11:23:27.597318+00:00 to 2026-10-08T11:00:00+00:00 (2.983708364375 days)
-writes 1850 (53 failed), llm_calls 18104, tokens/write 19636.374054054053
+attempts 1850 (53 failed), llm_calls 18104, tokens/attempt 19636.374054054053
 usd 6.20433015 at incumbent-generic-a pricing: usd/day 2.0794023384050226, projected usd/30 days 62.38207015215068
 replay incumbent-generic-a: usd/episode 0.0027364319999999996 tokens/episode 15688.47 (n 200)
 replay incumbent-generic-b: usd/episode 0.002764701 tokens/episode 15836.355 (n 200)
-wrote: plans/local-memory-models-eval-llm/production-telemetry.jsonl
-wrote: plans/local-memory-models-eval-llm/incumbent-cost.json
+wrote: /tmp/lme-theta-3721/amend-out/production-telemetry.jsonl
+wrote: /tmp/lme-theta-3721/amend-out/incumbent-cost.json
 ```
 
-- **Selection rule.** A row is an LLM write when its backend is `graphiti` and its
-  operation is `add_memory` or `add_episode` (`incumbent_cost.select_llm_writes`). In a
+- **Selection rule.** A row is an LLM attempt when its backend is `graphiti` and its
+  operation is `add_memory` or `add_episode` (`incumbent_cost.select_llm_attempts`). In a
   census of the raw dump, all 1850 token-bearing rows are graphiti `add_memory` rows. No
   `add_episode` row carries tokens, and no other operation does either. Each selected
   row is one `backend_ops` row, which is one graphiti attempt. A retried write
-  contributes one row per attempt, so `writes` in `incumbent-cost.json` counts attempts.
+  contributes one row per attempt, so `incumbent-cost.json` counts attempts, not writes.
 - **Window rule.** The window starts at the `created_at` of the first token-bearing LLM
-  write and ends at the cutoff, end excluded. Code applies this rule; it is not a choice
-  made per run. The dump reaches back to 2026-09-01, past that start, so the coverage
-  check passed. Every LLM write in the window carried all four token columns, so the
+  attempt and ends at the cutoff, end excluded. Code applies this rule; it is not a
+  choice made per run. The dump reaches back to 2026-09-01, past that start. Its latest
+  row is at `2026-10-08T11:02:49.957469+00:00`, past the cutoff. So both coverage checks
+  passed. Every LLM attempt in the window carried all four token columns, so the
   accounting check passed.
 - **Under-count.** OPERATIONS.md §"Per-write telemetry (duration + tokens)": on the
   OpenAI-shaped clients a call records only its successful attempt. A re-prompted

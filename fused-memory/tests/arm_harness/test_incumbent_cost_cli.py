@@ -28,8 +28,8 @@ from fused_memory.arm_harness.incumbent_cost import (
     IncumbentCost,
     TelemetryWindow,
     derive_incumbent_cost,
-    load_llm_writes,
-    select_llm_writes,
+    load_llm_attempts,
+    select_llm_attempts,
     serialize_incumbent_cost,
 )
 from fused_memory.arm_harness.metrics_record import (
@@ -58,6 +58,7 @@ NOISE_ROWS = (
         operation='update_task',
         project_id='solar_challenge',
     ),
+    untokened_telemetry_row('2026-10-08T00:30:00+00:00', backend='mem0'),
 )
 
 
@@ -146,7 +147,7 @@ def _cost_inputs(
 
 def _expected(inputs: CostInputs) -> tuple[TelemetryWindow, IncumbentCost]:
     rows = [json.loads(line) for line in inputs.telemetry.read_text().splitlines()]
-    window = select_llm_writes(rows, until=datetime.fromisoformat(UNTIL))
+    window = select_llm_attempts(rows, until=datetime.fromisoformat(UNTIL))
     cost = derive_incumbent_cost(
         window,
         pricing_spec=inputs.pricing_spec,
@@ -164,19 +165,39 @@ def test_incumbent_cost_writes_the_window_and_the_cost_derived_from_its_inputs(
 
     assert code == harness.EXIT_OK
     window, cost = _expected(inputs)
-    assert load_llm_writes(inputs.telemetry_out) == window.writes
-    assert len(window.writes) == len(TOKENED_ROWS)
+    assert load_llm_attempts(inputs.telemetry_out) == window.attempts
+    assert len(window.attempts) == len(TOKENED_ROWS)
     assert inputs.cost_out.read_text() == serialize_incumbent_cost(cost)
     out = capsys.readouterr().out
     lines = out.splitlines()
     assert window.start.isoformat() in out
     assert UNTIL in out
-    assert f'writes {cost.production.writes}' in out
+    assert f'attempts {cost.production.attempts}' in out
     assert str(cost.production.usd_per_day) in out
     assert str(cost.production.projected_usd_per_30_days) in out
     for unit in cost.replay:
         assert any(unit.arm_id in line and str(unit.usd_per_episode) in line for line in lines)
     assert lines[-2:] == [f'wrote: {inputs.telemetry_out}', f'wrote: {inputs.cost_out}']
+
+
+def test_a_failed_cost_write_leaves_no_output_so_a_re_run_is_not_refused(
+    harness, tmp_path, monkeypatch
+):
+    inputs = _cost_inputs(tmp_path)
+    real_write = harness.atomic_write_text
+
+    def disk_full_on_the_cost(path: Path, text: str, **kwargs: Any) -> None:
+        if Path(path) == inputs.cost_out:
+            raise OSError(f'disk full writing {path}')
+        real_write(path, text, **kwargs)
+
+    monkeypatch.setattr(harness, 'atomic_write_text', disk_full_on_the_cost)
+    with pytest.raises(OSError, match='disk full'):
+        harness.main(inputs.argv(), deps=_offline)
+
+    assert list(inputs.out_dir.iterdir()) == []
+    monkeypatch.setattr(harness, 'atomic_write_text', real_write)
+    assert harness.main(inputs.argv(), deps=_offline) == harness.EXIT_OK
 
 
 def _refused(harness: ModuleType, argv: list[str], capsys: Any) -> str:
@@ -250,10 +271,16 @@ def test_incumbent_cost_refuses_an_unpriced_pricing_spec(harness, tmp_path, caps
     ('rows', 'error_type'),
     [
         (
-            (*TOKENED_ROWS, untokened_telemetry_row('2026-10-06T09:00:00+00:00'), PRE_START_ROW),
+            (
+                *TOKENED_ROWS,
+                *NOISE_ROWS,
+                untokened_telemetry_row('2026-10-06T09:00:00+00:00'),
+                PRE_START_ROW,
+            ),
             'TelemetryAccountingError',
         ),
-        (TOKENED_ROWS, 'TelemetryWindowError'),
+        ((*TOKENED_ROWS, *NOISE_ROWS), 'TelemetryWindowError'),
+        ((*TOKENED_ROWS, PRE_START_ROW), 'TelemetryWindowError'),
     ],
 )
 def test_incumbent_cost_refuses_telemetry_it_cannot_window_or_account(

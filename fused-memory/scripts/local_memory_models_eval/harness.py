@@ -64,12 +64,13 @@ from fused_memory.arm_harness.incumbent_cost import (
     IncumbentCost,
     IncumbentCostError,
     TelemetryAccountingError,
+    TelemetryRowError,
     TelemetryWindow,
     TelemetryWindowError,
     derive_incumbent_cost,
-    select_llm_writes,
+    select_llm_attempts,
     serialize_incumbent_cost,
-    serialize_llm_writes,
+    serialize_llm_attempts,
 )
 from fused_memory.arm_harness.instrument_checks import CheckResult
 from fused_memory.arm_harness.llm_metrics import TokenAccountingError
@@ -344,6 +345,19 @@ def _fresh_output(path: Path) -> Path:
     return path
 
 
+def _write_all_or_none(*outputs: tuple[Path, str]) -> None:
+    """Write each output in turn; if one fails, remove those already written."""
+    written: list[Path] = []
+    try:
+        for path, text in outputs:
+            atomic_write_text(path, text, mkdir=True)
+            written.append(path)
+    except BaseException:
+        for path in written:
+            path.unlink(missing_ok=True)
+        raise
+
+
 def _scratch_graph(
     client: ScratchGraphClient, name: str, checkpoint: GuardCheckpoint
 ) -> ScratchGraph:
@@ -576,8 +590,10 @@ def _cmd_incumbent_cost(args: argparse.Namespace, deps: DepsFactory) -> int:
     cost = derive_incumbent_cost(
         window, pricing_spec=pricing_spec, control_records=control_records
     )
-    atomic_write_text(telemetry_out, serialize_llm_writes(window.writes), mkdir=True)
-    atomic_write_text(cost_out, serialize_incumbent_cost(cost), mkdir=True)
+    _write_all_or_none(
+        (telemetry_out, serialize_llm_attempts(window.attempts)),
+        (cost_out, serialize_incumbent_cost(cost)),
+    )
     _print_incumbent_cost(cost)
     print(f'wrote: {telemetry_out}')
     print(f'wrote: {cost_out}')
@@ -587,10 +603,8 @@ def _cmd_incumbent_cost(args: argparse.Namespace, deps: DepsFactory) -> int:
 def _select_window(path: Path, until: datetime) -> TelemetryWindow:
     rows = _read_telemetry_rows(path)
     try:
-        return select_llm_writes(rows, until=until)
-    except (TelemetryWindowError, TelemetryAccountingError):
-        raise
-    except ValueError as error:
+        return select_llm_attempts(rows, until=until)
+    except TelemetryRowError as error:
         raise _Refusal(EXIT_REFUSED, f'{path} holds a malformed telemetry row: {error}') from error
 
 
@@ -620,8 +634,8 @@ def _print_incumbent_cost(cost: IncumbentCost) -> None:
         f'({production.days} days)'
     )
     print(
-        f'writes {production.writes} ({production.failed_writes} failed), '
-        f'llm_calls {production.llm_calls}, tokens/write {production.tokens_per_write}'
+        f'attempts {production.attempts} ({production.failed_attempts} failed), '
+        f'llm_calls {production.llm_calls}, tokens/attempt {production.tokens_per_attempt}'
     )
     print(
         f'usd {production.usd} at {cost.pricing_arm_id} pricing: usd/day {production.usd_per_day}, '

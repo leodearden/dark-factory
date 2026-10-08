@@ -24,7 +24,7 @@ from fused_memory.arm_harness.incumbent_cost import (
     TelemetryWindow,
     derive_incumbent_cost,
     load_incumbent_cost,
-    load_llm_writes,
+    load_llm_attempts,
     serialize_incumbent_cost,
 )
 from fused_memory.arm_harness.metrics_record import load_metrics_records
@@ -87,7 +87,7 @@ def test_the_committed_cost_re_derives_byte_for_byte_from_the_committed_window()
     window = TelemetryWindow(
         start=committed.production.window_start,
         end=committed.production.window_end,
-        writes=load_llm_writes(LLM_AXIS / PRODUCTION_TELEMETRY_FILENAME),
+        attempts=load_llm_attempts(LLM_AXIS / PRODUCTION_TELEMETRY_FILENAME),
     )
 
     derived = derive_incumbent_cost(

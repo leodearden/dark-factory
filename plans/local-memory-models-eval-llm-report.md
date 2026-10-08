@@ -97,7 +97,7 @@ control A's gpt-4o-mini rates, $0.15 / $0.60 per 1M input / output tokens. Produ
 runs the same model.
 
 **Production, measured.** The window runs from 2026-10-05T11:23:27.597318Z, the first
-token-bearing graphiti write, to 2026-10-08T11:00:00Z: 2.98 days.
+token-bearing graphiti attempt, to 2026-10-08T11:00:00Z: 2.98 days.
 
 | Quantity | Value |
 |---|---|
@@ -209,7 +209,7 @@ graph agreement is unmeasured.
 - **The negative verdict.** No local LLM arm is non-inferior, because no arm survived
   screening (§1).
 - **The incumbent's measured cost.** At least $2.08/day and $62.38 per 30 days over
-  2026-10-05 to 10-08, at $0.00345 per ok write. This replaces the PRD's estimate of
+  2026-10-05 to 10-08, at $0.00345 per ok attempt. This replaces the PRD's estimate of
   $15–25/month (§4).
 - **The availability record.** About 2.2k rate-limited attempts and 17
   credit-exhausted ones on 2026-10-03/04, with no write lost (§5).

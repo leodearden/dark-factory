@@ -5,68 +5,68 @@
   },
   "pricing_arm_id": "incumbent-generic-a",
   "production": {
+    "attempts": 1850,
     "by_day": [
       {
+        "attempts": 412,
         "day": "2026-10-05",
-        "usd": 1.4151847499999999,
-        "writes": 412
+        "usd": 1.4151847499999999
       },
       {
+        "attempts": 402,
         "day": "2026-10-06",
-        "usd": 1.34953755,
-        "writes": 402
+        "usd": 1.34953755
       },
       {
+        "attempts": 842,
         "day": "2026-10-07",
-        "usd": 2.8178997,
-        "writes": 842
+        "usd": 2.8178997
       },
       {
+        "attempts": 194,
         "day": "2026-10-08",
-        "usd": 0.62170815,
-        "writes": 194
+        "usd": 0.62170815
       }
     ],
     "by_project": [
       {
+        "attempts": 551,
         "project_id": "dark_factory",
-        "usd": 1.8035748,
-        "writes": 551
+        "usd": 1.8035748
       },
       {
+        "attempts": 361,
         "project_id": "reify",
-        "usd": 1.1552109,
-        "writes": 361
+        "usd": 1.1552109
       },
       {
+        "attempts": 6,
         "project_id": "scoping_intake",
-        "usd": 0.01104645,
-        "writes": 6
+        "usd": 0.01104645
       },
       {
+        "attempts": 499,
         "project_id": "solar_challenge",
-        "usd": 1.82172585,
-        "writes": 499
+        "usd": 1.82172585
       },
       {
+        "attempts": 433,
         "project_id": "solar_challenge_platform",
-        "usd": 1.41277215,
-        "writes": 433
+        "usd": 1.41277215
       }
     ],
     "days": 2.983708364375,
-    "failed_writes": 53,
+    "failed_attempts": 53,
     "input_tokens": 34648989,
     "llm_calls": 18104,
     "output_tokens": 1678303,
     "projected_usd_per_30_days": 62.38207015215068,
-    "tokens_per_write": 19636.374054054053,
+    "tokens_per_attempt": 19636.374054054053,
     "usd": 6.20433015,
     "usd_per_day": 2.0794023384050226,
-    "usd_per_ok_write": 0.0034526044240400667,
+    "usd_per_ok_attempt": 0.0034526044240400667,
     "window_end": "2026-10-08T11:00:00Z",
-    "window_start": "2026-10-05T11:23:27.597318Z",
-    "writes": 1850
+    "window_start": "2026-10-05T11:23:27.597318Z"
   },
   "replay": [
     {
