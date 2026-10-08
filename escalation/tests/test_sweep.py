@@ -17,6 +17,7 @@ from _scan_race_helpers import (
 
 from escalation import sweep
 from escalation.models import Escalation
+from escalation.queue import EscalationQueue
 
 
 def _write_root_esc(
@@ -1066,8 +1067,6 @@ class TestReapOrphanLocksSeqSafety:
         so a future rename of the suffix fails HERE, loudly, instead of silently
         disarming the guard.
         """
-        from escalation.queue import EscalationQueue
-
         q = EscalationQueue(tmp_path)
         esc_id = q.make_id('4566')
         assert esc_id == 'esc-4566-1'
@@ -1216,8 +1215,6 @@ class TestStartupSweepOrphanLockPass:
         survivors.  The counter is MINTED through the real ``make_id`` so the
         never-reap rule is exercised end to end, not against a hand-written name.
         """
-        from escalation.queue import EscalationQueue
-
         dated = ('2026-05-20T10:00:00+00:00', '2026-05-25T10:00:00+00:00')
         archived_records = []
         for n in range(40):
@@ -1439,8 +1436,6 @@ class TestArchivedRecordStaysWritableAfterItsLockIsReaped:
     def test_patch_after_reap_updates_the_archived_record_and_recreates_the_sidecar(
         self, tmp_path: Path
     ):
-        from escalation.queue import EscalationQueue
-
         esc_id = 'esc-1-1'
         lock_path = tmp_path / f'{esc_id}.json.lock'
         q = EscalationQueue(tmp_path)
