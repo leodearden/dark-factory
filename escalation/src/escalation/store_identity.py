@@ -19,6 +19,12 @@ class StoreIdentity:
     ``queue_dir`` compares directly against any other resolved path —
     ``escalation.queue::EscalationQueue.__init__`` keeps its ``queue_dir``
     as given.
+
+    A ``'project'`` identity must carry both ``project_id`` and
+    ``project_root``; a ``'reconciliation'`` identity must carry neither.
+    Constructing an incoherent identity raises ``ValueError``: it is a wiring
+    bug. That raise is separate from ``create_server(store_identity=None)``,
+    which degrades to identity-less behaviour and never raises.
     """
 
     kind: Literal['project', 'reconciliation']
@@ -27,6 +33,18 @@ class StoreIdentity:
     project_root: Path | None
 
     def __post_init__(self) -> None:
+        self._require_project_fields_match_kind()
         object.__setattr__(self, 'queue_dir', Path(self.queue_dir).resolve())
         if self.project_root is not None:
             object.__setattr__(self, 'project_root', Path(self.project_root).resolve())
+
+    def _require_project_fields_match_kind(self) -> None:
+        serves_a_project = self.kind == 'project'
+        for field_name in ('project_id', 'project_root'):
+            value = getattr(self, field_name)
+            if serves_a_project and value is None:
+                raise ValueError(f"StoreIdentity kind='project' requires {field_name}; got None")
+            if not serves_a_project and value is not None:
+                raise ValueError(
+                    f'StoreIdentity kind={self.kind!r} must not carry {field_name}; got {value!r}'
+                )
