@@ -10174,10 +10174,10 @@ def _loadavg1_or_none(loadavg: Callable[[], tuple[float, float, float]]) -> 'flo
 
 # The spellings of the xdist WORKER-COUNT flag this stamp must recognise.
 #
-# DELIBERATELY NARROWER than ``verify_cmd._XDIST_WORKER_FLAGS``, and not a
-# drifting copy of it: that set is the family a serial recovery must SHED, so it
-# also carries ``--dist`` (a distribution MODE) and ``--maxprocesses`` (a CAP).
-# Neither is a worker count, and reporting either one's value as ``n_flag``
+# DELIBERATELY NARROWER than ``verify_cmd._XDIST_OPTIONS``, and not a
+# drifting copy of it: that set is xdist's whole option surface, which a serial
+# recovery must SHED, so it also carries ``--dist`` (a distribution MODE),
+# ``--maxprocesses`` (a CAP) and more. None of those is a worker count, and reporting either one's value as ``n_flag``
 # would put a fabricated count in the corpus this stamp exists to make
 # trustworthy. Both members here are also ``_PYTEST_VALUE_FLAGS`` members, so
 # the pair-binding walk below needs no special case for them;
@@ -10218,12 +10218,10 @@ def _xdist_workers(cmd: str, verify_env: 'Mapping[str, str] | None') -> dict:
       in the corpus this deliverable exists to make trustworthy. No live config
       uses the long spelling today, so that was latent rather than active.
 
-      The CONCATENATED short form (``-n8``) is deliberately reported as absent.
-      That is the grammar boundary ``verify_cmd._is_xdist_worker_flag`` — the
-      one home for "is this token a worker flag" — already draws for the serial
-      recovery's strip and refusal screen, and matching it keeps ONE answer in
-      the module: widening only the telemetry would leave the stamp claiming a
-      flag the strip would not shed.
+      The CONCATENATED short form (``-n8``) is reported as absent. The serial
+      recovery's strip (``verify_cmd._is_xdist_option``) does shed it, because
+      there a surviving xdist token is a hard usage error; here the miss only
+      under-reports, and no live config uses that spelling.
     - ``auto_num_workers`` — ``PYTEST_XDIST_AUTO_NUM_WORKERS`` as this command's
       own subprocess will see it, or ``None`` when nothing sets it. Resolved by
       asking ``_target_subprocess_env`` — the SAME builder ``_run_cmd`` spawns
