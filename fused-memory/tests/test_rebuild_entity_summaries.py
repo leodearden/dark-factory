@@ -3163,18 +3163,21 @@ class TestRebuildReportsReadCompleteness:
     _EDGES = {'u1': [{'uuid': 'e1', 'fact': 'a real summary', 'name': 'knows'}]}
 
     def _svc(self, mock_config, *, nodes_read, edges_read):
+        """The service, and the MagicMock backend it reads through."""
         svc = _make_svc(mock_config)
-        svc.graphiti.enumerate_entity_nodes = AsyncMock(return_value=(self._NODES, nodes_read))
-        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=(self._EDGES, edges_read))
-        svc.graphiti.rebuild_entity_from_edges = AsyncMock(
+        graphiti = MagicMock()
+        graphiti.enumerate_entity_nodes = AsyncMock(return_value=(self._NODES, nodes_read))
+        graphiti.enumerate_all_valid_edges = AsyncMock(return_value=(self._EDGES, edges_read))
+        graphiti.rebuild_entity_from_edges = AsyncMock(
             return_value=make_rebuild_detail('u1', 'Alice')
         )
-        return svc
+        svc.graphiti = graphiti
+        return svc, graphiti
 
     @pytest.mark.asyncio
     async def test_force_write_reports_a_short_node_read_and_still_rebuilds(self, mock_config):
         """Empirical incompleteness is reported, never escalated into a refusal."""
-        svc = self._svc(
+        svc, graphiti = self._svc(
             mock_config,
             nodes_read=incomplete_paged_read(INCOMPLETE_SHORT_READ),
             edges_read=complete_paged_read(),
@@ -3186,11 +3189,11 @@ class TestRebuildReportsReadCompleteness:
         assert result['edges_complete'] is True
         assert result['edges_incomplete_kind'] is None
         assert result['rebuilt'] == len(self._NODES)
-        svc.graphiti.rebuild_entity_from_edges.assert_awaited_once()
+        graphiti.rebuild_entity_from_edges.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_force_dry_run_has_no_edge_verdict(self, mock_config):
-        svc = self._svc(
+        svc, graphiti = self._svc(
             mock_config,
             nodes_read=incomplete_paged_read(INCOMPLETE_CENSUS_UNAVAILABLE),
             edges_read=complete_paged_read(),
@@ -3201,11 +3204,11 @@ class TestRebuildReportsReadCompleteness:
         assert result['entities_incomplete_kind'] == INCOMPLETE_CENSUS_UNAVAILABLE
         assert result['edges_complete'] is None
         assert result['edges_incomplete_kind'] is None
-        svc.graphiti.enumerate_all_valid_edges.assert_not_awaited()
+        graphiti.enumerate_all_valid_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_targeted_write_reports_an_unproven_edge_read(self, mock_config):
-        svc = self._svc(
+        svc, _ = self._svc(
             mock_config,
             nodes_read=complete_paged_read(),
             edges_read=incomplete_paged_read(INCOMPLETE_CENSUS_UNAVAILABLE),
@@ -3219,7 +3222,7 @@ class TestRebuildReportsReadCompleteness:
 
     @pytest.mark.asyncio
     async def test_targeted_dry_run_has_no_edge_verdict(self, mock_config):
-        svc = self._svc(
+        svc, _ = self._svc(
             mock_config, nodes_read=complete_paged_read(), edges_read=complete_paged_read(),
         )
         result = await svc.rebuild_entity_summaries(
@@ -3268,7 +3271,7 @@ class TestRebuildReportsReadCompleteness:
     @pytest.mark.asyncio
     async def test_empirical_warning_is_logged_under_the_service(self, mock_config, caplog):
         """The policy warning surfaces beside the rebuild's own lines, not the backend's."""
-        svc = self._svc(
+        svc, _ = self._svc(
             mock_config,
             nodes_read=incomplete_paged_read(INCOMPLETE_SHORT_READ),
             edges_read=complete_paged_read(),

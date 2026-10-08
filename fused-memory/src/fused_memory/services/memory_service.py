@@ -2296,6 +2296,26 @@ async def _enumerate_rebuild_edges(
     return edges, ReadCompleteness.of(paged)
 
 
+def _completeness_keys(
+    entities_completeness: ReadCompleteness | None,
+    edges_completeness: ReadCompleteness | None,
+) -> dict[str, bool | str | None]:
+    """The four tri-state result keys for a rebuild's two reads; None is no verdict."""
+    def pair(verdict: ReadCompleteness | None) -> tuple[bool | None, str | None]:
+        if verdict is None:
+            return None, None
+        return verdict.complete, verdict.incomplete_kind
+
+    entities_complete, entities_incomplete_kind = pair(entities_completeness)
+    edges_complete, edges_incomplete_kind = pair(edges_completeness)
+    return {
+        'entities_complete': entities_complete,
+        'entities_incomplete_kind': entities_incomplete_kind,
+        'edges_complete': edges_complete,
+        'edges_incomplete_kind': edges_incomplete_kind,
+    }
+
+
 class MemoryService:
     """Central orchestration — fused read/write across Graphiti + Mem0."""
 
@@ -10886,7 +10906,15 @@ class MemoryService:
 
         Returns:
             Dict with keys: total_entities, stale_entities, rebuilt, skipped,
-            errors, details.
+            errors, details, and the tri-state read completeness
+            entities_complete / entities_incomplete_kind / edges_complete /
+            edges_incomplete_kind.  True: the read was proven complete.
+            False: it was observed incomplete; the rebuild proceeded on what
+            was fetched and the policy warned.  None: no verdict for that
+            read on this path, because the read was not issued or this is the
+            force=False dry_run probe (tkt_0RVHH0D37FVAWSMT1NVGSHDSZM).
+            Gate on ``is True``.  The raise/warn split is
+            fused-memory/src/fused_memory/backends/graphiti_client.py::apply_incompleteness_policy.
         """
         write_op_id = str(uuid_mod.uuid4())
         success = True
@@ -10898,10 +10926,14 @@ class MemoryService:
             all_edges: dict[str, list] = {}
             total_entities: int = 0
             not_found_details: list[dict] = []
+            entities_completeness: ReadCompleteness | None = None
+            edges_completeness: ReadCompleteness | None = None
 
             if entity_uuids is not None and len(entity_uuids) > 0:
                 requested = list(dict.fromkeys(entity_uuids))  # dedupe, preserve order
-                all_entities, _ = await _enumerate_rebuild_nodes(self.graphiti, project_id)
+                all_entities, entities_completeness = await _enumerate_rebuild_nodes(
+                    self.graphiti, project_id
+                )
                 by_uuid = {e['uuid']: e for e in all_entities}
                 targets = [
                     {'uuid': u, 'name': by_uuid[u]['name'], 'old_summary': by_uuid[u]['summary']}
@@ -10915,19 +10947,25 @@ class MemoryService:
                 ]
                 total_entities = len(targets)
                 if not dry_run:
-                    all_edges, _ = await _enumerate_rebuild_edges(self.graphiti, project_id)
+                    all_edges, edges_completeness = await _enumerate_rebuild_edges(
+                        self.graphiti, project_id
+                    )
             elif entity_uuids is not None:
                 # entity_uuids == [] — explicit zero-count no-op, no backend calls.
                 pass
             elif force:
-                all_entities, _ = await _enumerate_rebuild_nodes(self.graphiti, project_id)
+                all_entities, entities_completeness = await _enumerate_rebuild_nodes(
+                    self.graphiti, project_id
+                )
                 targets = [
                     {'uuid': e['uuid'], 'name': e['name'], 'old_summary': e['summary']}
                     for e in all_entities
                 ]
                 total_entities = len(all_entities)
                 if not dry_run:
-                    all_edges, _ = await _enumerate_rebuild_edges(self.graphiti, project_id)
+                    all_edges, edges_completeness = await _enumerate_rebuild_edges(
+                        self.graphiti, project_id
+                    )
             else:
                 if dry_run:
                     stale, total_entities = await self.graphiti.detect_stale_dry_run(
@@ -10940,6 +10978,8 @@ class MemoryService:
                     stale = detect_result.stale
                     all_edges = detect_result.all_edges
                     total_entities = detect_result.total_count
+                    entities_completeness = detect_result.entities_completeness
+                    edges_completeness = detect_result.edges_completeness
                 targets = [
                     {'uuid': s['uuid'], 'name': s['name'], 'old_summary': s['summary']}
                     for s in stale
@@ -11019,11 +11059,14 @@ class MemoryService:
             # without affecting rebuilt/skipped/errors counts.
             details.extend(not_found_details)
 
+            completeness = _completeness_keys(entities_completeness, edges_completeness)
             logger.info(
                 'rebuild_entity_summaries: group=%s total=%d stale=%d rebuilt=%d '
-                'skipped=%d errors=%d dry_run=%s force=%s',
+                'skipped=%d errors=%d dry_run=%s force=%s entities_complete=%s '
+                'edges_complete=%s',
                 project_id, total_entities, stale_entities, rebuilt, skipped, errors,
-                dry_run, force,
+                dry_run, force, completeness['entities_complete'],
+                completeness['edges_complete'],
             )
             result = {
                 'total_entities': total_entities,
@@ -11032,6 +11075,7 @@ class MemoryService:
                 'skipped': skipped,
                 'errors': errors,
                 'details': details,
+                **completeness,
             }
         except Exception as e:
             success = False
