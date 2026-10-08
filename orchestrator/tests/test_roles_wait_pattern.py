@@ -63,11 +63,11 @@ vs-hardcoded role-set comparison, the count and index bookkeeping — lives in
 per invariant, each delegating its body to that helper while keeping its own
 docstring and its own remediation prose. That module's docstring is the
 authoritative account of what the shared shape does and does not absorb — most
-of it is NOT restated here. This file's own ``capability`` predicate is
-``'Bash' in role.allowed_tools`` (see the comment on
-``_BACKGROUND_CAPABLE_ROLES`` below); it deliberately differs from the
-sibling's, and ``SpliceContract``'s class docstring explains why both are
-correct for their own constant.
+of it is NOT restated here. This file's carrier set is the shared
+``BASH_CAPABLE_UNPINNED_ROLES``, but its own ``capability`` predicate is
+``'Bash' in role.allowed_tools`` (see the comment above ``_CONTRACT`` below); it
+deliberately differs from the sibling's, and ``SpliceContract``'s class
+docstring explains why both are correct for their own constant.
 """
 
 from __future__ import annotations
@@ -77,7 +77,12 @@ from unittest.mock import patch
 
 import pytest
 import yaml
-from _role_splice_contract import SpliceContract, assert_brace_free, assert_nonempty
+from _role_splice_contract import (
+    BASH_CAPABLE_UNPINNED_ROLES,
+    SpliceContract,
+    assert_brace_free,
+    assert_nonempty,
+)
 
 from orchestrator.agents.briefing import BriefingAssembler
 from orchestrator.agents.roles import (
@@ -90,22 +95,6 @@ from orchestrator.agents.roles import (
 )
 from orchestrator.config import OrchestratorConfig
 
-# A role can encounter background work iff it holds the UNQUALIFIED ``'Bash'``
-# tool — i.e. it can launch a build, a full test suite, or a long verification
-# run. ``reviewer_comprehensive`` and ``judge`` hold only ``'Bash(git:*)'``
-# (read-only git, no long-running command is reachable) and are deliberately
-# excluded: the whole block would be dead weight in every one of their
-# sessions.
-_BACKGROUND_CAPABLE_ROLES = frozenset({
-    'architect',
-    'implementer',
-    'debugger',
-    'merger',
-    'steward',
-    'deep_reviewer',
-    'simple_task',
-})
-
 # Secondary, deliberately LOOSE bound on how much identity paragraph may
 # precede the block. The real invariant is the structural one below (the
 # guidance's own heading must be the prompt's FIRST ``##`` heading); this only
@@ -114,6 +103,16 @@ _BACKGROUND_CAPABLE_ROLES = frozenset({
 # headroom and will not fire merely because someone added a sentence.
 _UP_FRONT_CHAR_BUDGET = 1500
 
+# A role can encounter background work iff it holds the UNQUALIFIED ``'Bash'``
+# tool — i.e. it can launch a build, a full test suite, or a long verification
+# run. ``reviewer_comprehensive`` and ``judge`` hold only ``'Bash(git:*)'``
+# (read-only git, no long-running command is reachable) and are deliberately
+# excluded: the whole block would be dead weight in every one of their
+# sessions. The contract checks the shared set against this file's own
+# ``'Bash' in role.allowed_tools`` predicate, so a PromptSpec-backed role gaining
+# ``Bash`` fires this tripwire, a wait-specific signal the shared predicate
+# would hide.
+#
 # The splice contract for this constant: what is spliced, into which roles, and
 # the capability that justifies it. ``all_roles`` is omitted, so it binds the
 # real ``ROLES``. The structural ``\n## `` landmark the placement check compares
@@ -122,8 +121,8 @@ _UP_FRONT_CHAR_BUDGET = 1500
 _CONTRACT = SpliceContract(
     constant_name='BACKGROUND_WAIT_GUIDANCE',
     constant=BACKGROUND_WAIT_GUIDANCE,
-    roles=_BACKGROUND_CAPABLE_ROLES,
-    role_set_name='_BACKGROUND_CAPABLE_ROLES',
+    roles=BASH_CAPABLE_UNPINNED_ROLES,
+    role_set_name='BASH_CAPABLE_UNPINNED_ROLES (in _role_splice_contract.py)',
     capability=lambda role: 'Bash' in role.allowed_tools,
     capability_description='the unqualified `Bash` tool',
 )
@@ -318,10 +317,11 @@ def test_background_capable_role_set_matches_bash_capability() -> None:
     """
     _CONTRACT.assert_role_set_matches_capability(
         remedy=(
-            'A newly Bash-capable role must be added to _BACKGROUND_CAPABLE_ROLES '
-            'AND given BACKGROUND_WAIT_GUIDANCE up front in its system_prompt; if '
-            'it is genuinely exempt, justify the exclusion in the comment above '
-            'the set.'
+            'A newly Bash-capable role needs BACKGROUND_WAIT_GUIDANCE up front. If '
+            'its system_prompt is literal, add it to BASH_CAPABLE_UNPINNED_ROLES '
+            'and the preamble carries the block. If it is PromptSpec-backed, the '
+            "shared set no longer describes this block's carriers: declare a "
+            'wait-specific set here, and justify any exclusion in its comment.'
         ),
     )
 
@@ -351,7 +351,7 @@ def test_excluded_roles_do_not_carry_combined_guidance() -> None:
             'These roles cannot launch a long-running command, so the block is '
             'dead weight in every one of their sessions. Either remove the splice, '
             'or — if the role genuinely gained the capability — grant it `Bash` and '
-            'add it to _BACKGROUND_CAPABLE_ROLES.'
+            'add it to BASH_CAPABLE_UNPINNED_ROLES.'
         ),
     )
 

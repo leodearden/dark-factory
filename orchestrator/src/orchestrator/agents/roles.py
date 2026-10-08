@@ -835,8 +835,9 @@ this session is one-shot, and abandoned work is recorded as a successful run."""
 # Task 3607 excluded judge (and reviewer_comprehensive) from
 # BACKGROUND_WAIT_GUIDANCE partly on a cost framing -- neither holds
 # unqualified `Bash`, so "the whole block would be dead weight in every one
-# of their sessions" (test_roles_wait_pattern.py's `_BACKGROUND_CAPABLE_ROLES`
-# comment).  JUDGE runs after EVERY implementer iteration, making it the
+# of their sessions" (the comment above
+# orchestrator/tests/test_roles_wait_pattern.py::_CONTRACT).  JUDGE runs after
+# EVERY implementer iteration, making it the
 # highest per-invocation multiplier of the eight roles this constant is
 # spliced into, and unlike the wait block, JUDGE genuinely can hit this
 # rejection: it holds `Read` and runs on a tight 30-turn budget, so a
@@ -1267,10 +1268,10 @@ GREP_LOOKAROUND_GUIDANCE_READ_ONLY = _GREP_ENGINE_LIMITS + _GREP_PCRE_READ_ONLY_
 # APPEND-ONLY AT THE TAIL. Each block through GREP_LOOKAROUND_GUIDANCE has its
 # own test module pin it to start exactly where its predecessor ends; blocks
 # appended after it pin only ORDER (after GREP_LOOKAROUND_GUIDANCE), so
-# concurrent appends do not break each other. That order pin is the one shared
-# orchestrator/tests/_role_splice_contract.py::SpliceContract.assert_lands_after;
-# do not add a local copy. BACKGROUND_WAIT_GUIDANCE's heading must stay the
-# prompt's first `##`.
+# concurrent appends do not break each other. A tail block's anchor test
+# subclasses orchestrator/tests/_role_splice_contract.py::PreambleTailContractTests,
+# which applies that order pin; do not clone its tests. BACKGROUND_WAIT_GUIDANCE's
+# heading must stay the prompt's first `##`.
 # _GREP_ENGINE_LIMITS's prose also points at ERROR_REMEDY_HINT_GUIDANCE as "the
 # section just above". Inserting anywhere but the end breaks a pin, or
 # silently redirects that pointer.
