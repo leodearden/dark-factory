@@ -20,13 +20,21 @@ import functools
 import inspect
 import json
 import logging
+import re
+import subprocess
+import sys
 from pathlib import Path
 
 import codebook as codebook_mod
 import coder as mod
 import digest as digest_mod
 import pytest
-from legibility import session_runner
+from cli_subprocess_timeout import cli_timeout_from_env
+from legibility import invariants, session_runner
+
+# Imported AFTER `coder`, deliberately: coder.py's own module-level sys.path
+# bootstrap is what puts this checkout's orchestrator/src on the path.
+from orchestrator.agents import code_quality
 
 # Imported AFTER `coder`, deliberately: it is coder.py's own module-level
 # sys.path bootstrap that puts this checkout's shared/src on the path, so this
@@ -1323,3 +1331,145 @@ def test_main_digests_dir_skips_subdirectories(tmp_path, pooled_main, capsys):
     lines = [line for line in out_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     assert len(lines) == 1
     assert json.loads(lines[0])["session"] == "dir-sess-1"
+
+
+# ---------------------------------------------------------------------------
+# task 6400: the quality Definition is the minting test, and the coder is told
+# the observed project's invariant slugs (plans/census-incremental-prd.md R9,
+# §4.8 rows 15 and 17). Expected texts are computed from the normative doc at
+# test time, never restated.
+# ---------------------------------------------------------------------------
+
+_HEURISTIC_HEADLINE_RE = re.compile(r"^\d+\. \*\*(.+?)\*\*", re.MULTILINE)
+
+
+def _quality_doc_text():
+    return code_quality.NORMATIVE_DOC.read_text(encoding="utf-8")
+
+
+def _definition_body():
+    return code_quality.section(_quality_doc_text(), "## Definition").strip()
+
+
+def _heuristic_headlines():
+    headlines = _HEURISTIC_HEADLINE_RE.findall(
+        code_quality.section(_quality_doc_text(), "## The fourteen heuristics")
+    )
+    assert headlines, "no numbered bold heuristic headline parsed from the normative doc"
+    return headlines
+
+
+def _block(prompt, name):
+    lines = prompt.splitlines()
+    start = lines.index(f"=== {name} ===")
+    body = []
+    for line in lines[start + 1:]:
+        if line.startswith("=== "):
+            break
+        body.append(line)
+    return body
+
+
+def _bullets(block):
+    return [line for line in block if line.startswith("- ")]
+
+
+def _slugged_prompt(invariant_slugs):
+    return mod.build_prompt("digest text", "codebook index", invariant_slugs=invariant_slugs)
+
+
+@pytest.mark.parametrize("entry", [mod.build_prompt, mod.code_digest, mod.code_digests])
+def test_the_invariant_slugs_are_required_never_defaulted(entry):
+    """A default would tell the miner a project declares no slugs, silently."""
+    slugs = inspect.signature(entry).parameters["invariant_slugs"]
+
+    assert slugs.kind is inspect.Parameter.KEYWORD_ONLY
+    assert slugs.default is inspect.Parameter.empty
+
+
+def test_the_prompt_carries_the_quality_definition_and_no_heuristic():
+    prompt = _slugged_prompt(("a-slug", "b-slug"))
+
+    assert _definition_body() in prompt
+    for headline in _heuristic_headlines():
+        assert headline not in prompt
+
+
+def test_the_prompt_lists_the_invariant_slugs_in_order():
+    block = _block(_slugged_prompt(("a-slug", "b-slug")), "INVARIANT SLUGS")
+
+    assert _bullets(block) == ["- a-slug", "- b-slug"]
+
+
+def test_a_project_without_slugs_is_stated_not_omitted():
+    block = _block(_slugged_prompt(()), "INVARIANT SLUGS")
+
+    assert _bullets(block) == []
+    assert any(str(invariants.DOC_RELPATH) in line for line in block)
+
+
+@pytest.mark.parametrize("invariant_slugs", [("a-slug",), ()])
+def test_the_prompt_prescribes_exactly_one_json_reply_line(invariant_slugs):
+    lines = _slugged_prompt(invariant_slugs).splitlines()
+
+    assert len([line for line in lines if line.startswith("{")]) == 1
+
+
+def _recording_invoke(prompts):
+    def fake_invoke(prompt, model):
+        prompts.append(prompt)
+        return json.dumps({"matches": [], "candidates": []})
+
+    return fake_invoke
+
+
+def test_code_digest_passes_the_slugs_to_the_prompt():
+    prompts = []
+
+    result = mod.code_digest(
+        _hand_digest("slug-sess", "marker"), _tiny_codebook(), project="dark_factory",
+        invariant_slugs=("a-slug",), invoke=_recording_invoke(prompts),
+    )
+
+    assert result.ok
+    assert _bullets(_block(prompts[0], "INVARIANT SLUGS")) == ["- a-slug"]
+
+
+def test_code_digests_passes_the_slugs_to_every_prompt():
+    prompts = []
+
+    mod.code_digests(
+        [_hand_digest("slug-a", "one"), _hand_digest("slug-b", "two")], _tiny_codebook(),
+        project="dark_factory", invariant_slugs=("a-slug",), invoke=_recording_invoke(prompts),
+    )
+
+    assert len(prompts) == 2
+    assert all(_bullets(_block(p, "INVARIANT SLUGS")) == ["- a-slug"] for p in prompts)
+
+
+def test_main_reads_the_slugs_from_the_project_root(tmp_path, pooled_main):
+    pooled_main.plan(default={"result": _EMPTY_VERDICT})
+    doc = tmp_path / invariants.DOC_RELPATH
+    doc.parent.mkdir(parents=True)
+    doc.write_text("## INV-1 `cli-visible-slug`\n", encoding="utf-8")
+
+    rc = _run_main(tmp_path, *_main_digests(tmp_path, "main-slug", 1))
+
+    assert rc == 0
+    assert any(
+        "cli-visible-slug" in call["stdin"] or "cli-visible-slug" in " ".join(call["argv"])
+        for call in pooled_main.calls()
+    )
+
+
+def test_coder_runs_standalone_and_takes_a_project_root():
+    """Outside pytest nothing else puts orchestrator/src on sys.path, so this
+    proves coder.py's own bootstrap resolves the code-quality slicer."""
+    completed = subprocess.run(
+        [sys.executable, str(_REPO_ROOT / "scripts" / "legibility" / "coder.py"), "--help"],
+        cwd=_REPO_ROOT, capture_output=True, text=True,
+        timeout=cli_timeout_from_env("LEGIBILITY_CODER_CLI_TEST_TIMEOUT"),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--project-root" in completed.stdout
