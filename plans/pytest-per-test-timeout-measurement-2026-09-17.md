@@ -25,7 +25,7 @@ measurement. Three configs — the repo root, `cockpit` and `sampler` — carrie
 Adopted wholesale from what this repo already justifies, rather than invented:
 
 - The **8x headroom factor** is
-  `orchestrator/tests/test_whole_tree_scan_timeout_guard.py::_REQUIRED_HEADROOM_FACTOR`.
+  `orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR`.
   8x rather than 2x because the xdist worker deaths the cap exists to avoid were
   observed at loadavg 250-423 — one inflation step PAST the load at which
   measurements can be taken — so the value has to clear a figure nobody has
@@ -236,7 +236,7 @@ this repo's existing convention for exactly this reason.
 ## The arithmetic
 
     worst unmarked wall clock, any suite, any phase, any mode  =  61.52s
-    x _REQUIRED_HEADROOM_FACTOR (8)                            = 492.16s
+    x UNDER_LOAD_HEADROOM_FACTOR (8)                           = 492.16s
     round up to a multiple of 60                               = 540s
     max(300, 540)                                              = 540s
 

@@ -260,6 +260,13 @@ PYPROJECT_DEFAULT_TIMEOUT = 540
 # PYPROJECT_DEFAULT_TIMEOUT)`.  Filed as follow-up.
 WHOLE_TREE_SCAN_TEST_TIMEOUT = 540
 
+# Headroom a per-test ceiling must keep over its family's measured-under-load
+# worst case.  8x rather than 2x: the xdist worker deaths these ceilings exist
+# to prevent were observed at loadavg 250-423, one inflation step past the load
+# at which any measurement has been taken.  Rationale and corpus:
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+UNDER_LOAD_HEADROOM_FACTOR = 8
+
 # task 5147: the per-test budget VERIFY actually passes -- the `--timeout=300`
 # token in `orchestrator/orchestrator.yaml`'s `test_command`, mirrored by every
 # pytest segment of the fleet chain in dark-factory-orchestrator.yaml.  This

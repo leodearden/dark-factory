@@ -67,6 +67,7 @@ import pytest
 from _orch_helpers import (
     ORCH_PYPROJECT,
     PYPROJECT_DEFAULT_TIMEOUT,
+    UNDER_LOAD_HEADROOM_FACTOR,
     VERIFY_CLI_PER_TEST_TIMEOUT,
     WHOLE_TREE_SCAN_TEST_TIMEOUT,
 )
@@ -108,12 +109,6 @@ _MIN_EXPECTED_SCANNERS = 10
 # left in prose so the floor below is anchored to a measurement instead of only
 # to a ratio against a setting that can itself move.
 _MEASURED_UNDER_LOAD_WORST_CASE = 30.75
-
-# Headroom demanded over that measurement.  8x rather than 2x because the
-# xdist worker deaths this guard exists to prevent were observed at loadavg
-# 250-423 -- one further inflation step PAST the load at which the 30.75s was
-# taken -- so the ceiling has to clear a figure nobody has managed to measure.
-_REQUIRED_HEADROOM_FACTOR = 8
 
 # ABSOLUTE floor in seconds, deliberately independent of
 # PYPROJECT_DEFAULT_TIMEOUT -- and, since 2026-09-12, the PRIMARY anchor for
@@ -256,12 +251,12 @@ class TestTimeoutConstants:
         """
         assert (
             _ABSOLUTE_FLOOR_SECONDS
-            >= _MEASURED_UNDER_LOAD_WORST_CASE * _REQUIRED_HEADROOM_FACTOR
+            >= _MEASURED_UNDER_LOAD_WORST_CASE * UNDER_LOAD_HEADROOM_FACTOR
         ), (
             f'the absolute floor ({_ABSOLUTE_FLOOR_SECONDS}s) no longer clears '
-            f'{_REQUIRED_HEADROOM_FACTOR}x the measured-under-load worst case '
+            f'{UNDER_LOAD_HEADROOM_FACTOR}x the measured-under-load worst case '
             f'({_MEASURED_UNDER_LOAD_WORST_CASE}s = '
-            f'{_MEASURED_UNDER_LOAD_WORST_CASE * _REQUIRED_HEADROOM_FACTOR}s). '
+            f'{_MEASURED_UNDER_LOAD_WORST_CASE * UNDER_LOAD_HEADROOM_FACTOR}s). '
             'Either a slower measurement has landed or the floor was lowered; '
             'raise the floor rather than relaxing this arithmetic.'
         )
