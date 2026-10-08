@@ -17,7 +17,12 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from _scan_race_helpers import relocating_read_text, unreadable_read_text
+from _scan_race_helpers import (
+    deleting_read_text,
+    pruning_read_text,
+    relocating_read_text,
+    unreadable_read_text,
+)
 
 from escalation.classify import effective_benign
 from escalation.models import Escalation
@@ -2048,14 +2053,8 @@ class TestGetRetriesRelocationBetweenLocateAndRead:
         queue.submit(_make_escalation('esc-1-1', task_id='1'))
 
         doomed = queue.queue_dir / 'esc-1-1.json'
-        original_read_text = Path.read_text
 
-        def deleting_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
-            if self == doomed and doomed.exists():
-                doomed.unlink()
-            return original_read_text(self, *args, **kwargs)
-
-        with patch.object(Path, 'read_text', deleting_read_text):
+        with patch.object(Path, 'read_text', deleting_read_text(doomed)):
             result = queue.get('esc-1-1')
 
         assert result is None
@@ -2194,14 +2193,8 @@ class TestGetByTaskRecoversRecordRelocatedMidScan:
         queue.submit(_make_escalation('esc-4176-2', task_id='4176', status='resolved'))
 
         doomed = queue.queue_dir / 'esc-4176-2.json'
-        original_read_text = Path.read_text
 
-        def deleting_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
-            if self == doomed and doomed.exists():
-                doomed.unlink()
-            return original_read_text(self, *args, **kwargs)
-
-        with patch.object(Path, 'read_text', deleting_read_text):
+        with patch.object(Path, 'read_text', deleting_read_text(doomed)):
             results = queue.get_by_task('4176', status=None)
 
         assert [e.id for e in results] == ['esc-4176-1'], (
@@ -2255,6 +2248,51 @@ class TestGetByTaskRecoversRecordRelocatedMidScan:
         assert any('re-glob after vanish' in r.getMessage() for r in warnings), (
             f'Expected a WARNING naming the re-glob-after-vanish context; got: '
             f'{[r.getMessage() for r in warnings]}'
+        )
+
+
+class TestGetByTaskLeavesAnArchiveTierVanishUnrecovered:
+    """The other side of the mid-scan recovery gate in
+    ``queue.py::EscalationQueue.get_by_task``: only a ROOT-tier vanish is
+    re-located.
+    """
+
+    def test_an_archive_copy_pruned_mid_scan_costs_no_extra_archive_walk(
+        self, tmp_path: Path,
+    ):
+        """An archive copy rmtree'd mid-scan, as ``archive.prune_archive``
+        does, is dropped without raising, and the scan walks the archive no
+        more often than the same scan run undisturbed.
+        """
+        queue = EscalationQueue(tmp_path / 'queue')
+        queue.submit(_make_escalation('esc-4176-1', task_id='4176'))
+        queue.submit(_make_escalation('esc-4176-2', task_id='4176'))
+        queue.resolve('esc-4176-2', 'resolved before the scan')
+        (archive_copy,) = (queue.queue_dir / 'archive').rglob('esc-4176-2.json')
+
+        with patch.object(Path, 'rglob', autospec=True, side_effect=Path.rglob) as undisturbed:
+            queue.get_by_task('4176', status=None)
+        with (
+            patch.object(Path, 'read_text', pruning_read_text(archive_copy)),
+            patch.object(Path, 'rglob', autospec=True, side_effect=Path.rglob) as disturbed,
+        ):
+            results = queue.get_by_task('4176', status=None)
+
+        assert [e.id for e in results] == ['esc-4176-1'], (
+            f'Expected only the surviving record after the archive copy was '
+            f'pruned mid-scan (no raise), got {[e.id for e in results]}'
+        )
+        assert not archive_copy.parent.exists(), (
+            f'Expected the interposition to have pruned {archive_copy.parent}; '
+            f'without that the walk count below is vacuous'
+        )
+        assert undisturbed.call_count > 0, (
+            'Expected the spy to observe the undisturbed scan walking the archive; '
+            'without that the walk count below is vacuous'
+        )
+        assert disturbed.call_count == undisturbed.call_count, (
+            f'Expected no extra archive walk for an archive-tier vanish; undisturbed '
+            f'walks {undisturbed.call_args_list}, disturbed walks {disturbed.call_args_list}'
         )
 
 
