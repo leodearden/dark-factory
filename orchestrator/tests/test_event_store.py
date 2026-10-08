@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from pathlib import Path
+from typing import TypedDict
 
 import pytest
 
@@ -642,6 +643,12 @@ class TestTrainEventTypes:
 _ABSENT: object = object()
 
 
+class _LookupKey(TypedDict, total=False):
+    request_id: str
+    branch: str
+    task_id: str
+
+
 def _emit_finalized(
     store: EventStore,
     *,
@@ -793,7 +800,7 @@ class TestLatestMergeFinalized:
 
     @_KEY_KINDS
     def test_default_is_run_scoped_so_a_prior_run_row_is_not_returned(
-        self, tmp_path: Path, key: dict[str, str]
+        self, tmp_path: Path, key: _LookupKey
     ) -> None:
         """The anti-staleness default: a restarted run never reads a prior run's outcome."""
         _, store_b = self._restarted_stores(tmp_path)
@@ -801,7 +808,7 @@ class TestLatestMergeFinalized:
 
     @_KEY_KINDS
     def test_cross_run_returns_the_prior_run_row_labelled_as_history(
-        self, tmp_path: Path, key: dict[str, str]
+        self, tmp_path: Path, key: _LookupKey
     ) -> None:
         _, store_b = self._restarted_stores(tmp_path)
 
