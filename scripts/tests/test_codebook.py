@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 from legibility import codebook as mod
-from legibility import coder
+from legibility import coder, invariants
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1247,6 +1247,139 @@ def test_assert_no_deletion_allows_candidate_promotion_via_disposition_change():
 
 
 # ---------------------------------------------------------------------------
+# task 6400: invariant_violated is screened against the project's slugs on
+# write (plans/census-incremental-prd.md §4.8 row 15)
+# ---------------------------------------------------------------------------
+
+_KNOWN_SLUGS = ("known-slug", "other-slug")
+
+
+def _slugged_record() -> dict:
+    record = _match_record()
+    record["matches"][0]["invariant_violated"] = "known-slug"
+    record["candidates"] = [
+        {"title": "novel shape", "invariant_violated": "free text not a slug"}
+    ]
+    return record
+
+
+def _sighting_on(holder: dict, session: str) -> dict:
+    return next(s for s in holder["sightings"] if s["session"] == session)
+
+
+def test_a_known_slug_persists_and_an_unknown_one_is_stored_as_absent():
+    result, stats = mod.apply_coding_record(
+        _codebook_with_entry_a(), _slugged_record(), invariant_slugs=_KNOWN_SLUGS
+    )
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert _sighting_on(entry, "sess-1")["invariant_violated"] == "known-slug"
+    candidate = next(c for c in result["candidates"] if c["title"] == "novel shape")
+    assert "invariant_violated" not in _sighting_on(candidate, "sess-1")
+    assert stats["invariant_slugs"] == mod.SlugTally(
+        valid=1, rejected=("free text not a slug",)
+    )
+    assert mod.validate(result) == []
+
+
+def test_a_correction_with_an_unknown_slug_lands_without_it():
+    record = _correction_record()
+    record["corrections"][0]["invariant_violated"] = "not-a-declared-slug"
+
+    result, stats = mod.apply_coding_record(
+        _codebook_with_entry_a(), record, invariant_slugs=_KNOWN_SLUGS
+    )
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert entry["title"] == record["corrections"][0]["title"]
+    assert "invariant_violated" not in _sighting_on(entry, "sess-correction")
+    assert stats["corrections_applied"] == 1
+    assert stats["invariant_slugs"].rejected == ("not-a-declared-slug",)
+
+
+@pytest.mark.parametrize("value", [None, "", "<absent>"])
+def test_an_empty_slug_is_neither_valid_nor_rejected(value):
+    record = _match_record()
+    if value == "<absent>":
+        del record["matches"][0]["invariant_violated"]
+    else:
+        record["matches"][0]["invariant_violated"] = value
+
+    _, stats = mod.apply_coding_record(
+        _codebook_with_entry_a(), record, invariant_slugs=_KNOWN_SLUGS
+    )
+
+    assert stats["invariant_slugs"] == mod.SlugTally()
+
+
+def test_a_project_without_slugs_rejects_every_value():
+    result, stats = mod.apply_coding_record(
+        _codebook_with_entry_a(), _slugged_record(), invariant_slugs=()
+    )
+
+    entry = next(e for e in result["entries"] if e["id"] == "entry-a")
+    assert "invariant_violated" not in _sighting_on(entry, "sess-1")
+    assert stats["invariant_slugs"] == mod.SlugTally(
+        valid=0, rejected=("known-slug", "free text not a slug")
+    )
+
+
+def test_the_slug_screen_does_not_mutate_the_record():
+    record = _slugged_record()
+    original = copy.deepcopy(record)
+
+    mod.apply_coding_record(_codebook_with_entry_a(), record, invariant_slugs=())
+
+    assert record == original
+
+
+def test_validate_still_accepts_a_legacy_free_text_slug():
+    codebook = _codebook_with_entry_a()
+    codebook["entries"][0]["sightings"] = [
+        {
+            "date": "2026-07-01",
+            "project": "dark_factory",
+            "session": "legacy",
+            "origin_phase": "unknown",
+            "manifested_phase": "unknown",
+            "invariant_violated": "some legacy free text",
+        }
+    ]
+
+    assert mod.validate(codebook) == []
+
+
+def test_slug_tallies_add_up():
+    total = mod.SlugTally(valid=1, rejected=("a",)).plus(
+        mod.SlugTally(valid=2, rejected=("b", "a"))
+    )
+
+    assert total == mod.SlugTally(valid=3, rejected=("a", "b", "a"))
+
+
+def test_unknown_slugs_are_warned_once_per_run(caplog):
+    caplog.set_level(logging.DEBUG, logger="legibility.codebook")
+
+    mod.warn_unknown_invariant_slugs(
+        mod.SlugTally(valid=2, rejected=("x", "y", "x")), ("a",), run="r1"
+    )
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert warnings[0].name == "legibility.codebook"
+    message = warnings[0].getMessage()
+    assert "x" in message and "y" in message and "r1" in message
+
+
+def test_no_unknown_slugs_means_no_warning(caplog):
+    caplog.set_level(logging.DEBUG, logger="legibility.codebook")
+
+    mod.warn_unknown_invariant_slugs(mod.SlugTally(valid=2), ("a",), run="r1")
+
+    assert [r for r in caplog.records if r.levelno == logging.WARNING] == []
+
+
+# ---------------------------------------------------------------------------
 # amendment: migrate_v1_to_v2()/apply_coding_record() fail loudly with a
 # clear ValueError on a non-dict codebook (e.g. an empty or malformed YAML
 # file loads via yaml.safe_load as None), instead of an AttributeError deep
@@ -1555,6 +1688,32 @@ class TestMainCLI:
         assert ret == 1
         assert captured.err.strip() != ""
         assert path.read_bytes() == before
+
+    def test_apply_screens_slugs_against_the_project_doc(self, tmp_path, capsys, caplog):
+        caplog.set_level(logging.DEBUG)
+        root = tmp_path / "project"
+        doc = root / invariants.DOC_RELPATH
+        doc.parent.mkdir(parents=True)
+        doc.write_text("## INV-1 `known-slug`\n", encoding="utf-8")
+        codebook_path = tmp_path / "codebook.yaml"
+        mod.dump(_codebook_with_entry_a(), codebook_path)
+        records_path = tmp_path / "records.jsonl"
+        records_path.write_text(json.dumps(_slugged_record()) + "\n", encoding="utf-8")
+
+        ret = mod.main(
+            ["apply", "--project-root", str(root), str(codebook_path), str(records_path)]
+        )
+
+        assert ret == 0
+        reloaded = mod.load(codebook_path)
+        entry = next(e for e in reloaded["entries"] if e["id"] == "entry-a")
+        assert _sighting_on(entry, "sess-1")["invariant_violated"] == "known-slug"
+        candidate = next(c for c in reloaded["candidates"] if c["title"] == "novel shape")
+        assert "invariant_violated" not in _sighting_on(candidate, "sess-1")
+        out = capsys.readouterr().out
+        assert "invariant_slugs_valid=1" in out
+        assert "invariant_slugs_rejected=1" in out
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
 
 
 # ---------------------------------------------------------------------------
