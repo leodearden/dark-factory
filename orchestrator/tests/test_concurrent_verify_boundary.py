@@ -748,7 +748,7 @@ class TestB4CancelBehavior:
 # + 2 `wait_responsive` result waits billed at their hard wall cap
 # `min(RESPONSIVE_WAIT_STRETCH * 30, RESPONSIVE_WAIT_WALL_CAP)` = 60s each
 # + the 5s worker_task teardown = 155s worst case.  HEAVY_BARRIER_TEST_TIMEOUT
-# (300s) clears it.  Note this class was ALREADY under-marked before the
+# clears it.  Note this class was ALREADY under-marked before the
 # migration — 15+15+30+30+5 = 95s against the bare 60s default — so the mark
 # also closes a pre-existing worker-death hazard.
 @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)

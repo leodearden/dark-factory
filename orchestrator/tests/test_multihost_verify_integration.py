@@ -70,9 +70,8 @@ from _merge_lane_fakes import (
     main_health_probe_spawned,
     passes,
 )
-from _orch_helpers import wait_responsive
+from _orch_helpers import PYPROJECT_DEFAULT_TIMEOUT, wait_responsive
 from test_merge_queue_concurrent_verify import (
-    HEAVY_BARRIER_TEST_TIMEOUT,
     _inject_two_host_allocator,
     _make_branch_with_file,
     _timeout_mark_offenders,
@@ -1178,13 +1177,13 @@ _LANE_STOP_TIMEOUT = 30.0
 #: Per-test ceiling for the host capstone, whose methods settle a real-git lane
 #: through several ``wait_responsive`` waits and a reprobe sweep.  Sized above
 #: the budget ``TestTimeoutMarkCoverage`` recomputes from this module's own
-#: source rather than from any figure written here; ``HEAVY_BARRIER_TEST_TIMEOUT``
-#: (300s) is NOT enough for it.  Why a mark at all: pytest-timeout's thread
+#: source rather than from any figure written here, and never below
+#: ``PYPROJECT_DEFAULT_TIMEOUT``.  Why a mark at all: pytest-timeout's thread
 #: method ``os._exit()``s the xdist worker on expiry, and ``--max-worker-restart=0``
 #: then truncates the whole session against an innocent test -- so a
 #: slow-but-correct run under a too-tight default is strictly worse than the
 #: tail it would otherwise have reported (esc-3980-1, task 3492).
-HOST_CAPSTONE_TEST_TIMEOUT = 2 * HEAVY_BARRIER_TEST_TIMEOUT
+HOST_CAPSTONE_TEST_TIMEOUT = 600
 
 
 async def _setup_repo(repo: Path) -> None:
@@ -2957,4 +2956,22 @@ class TestTimeoutMarkCoverage:
             'clean per-test failure -- strictly worse than the flake being '
             'fixed. Add @pytest.mark.timeout(HOST_CAPSTONE_TEST_TIMEOUT) '
             'directly above each offending class.'
+        )
+
+
+class TestHostCapstoneTimeoutConstant:
+    """HOST_CAPSTONE_TEST_TIMEOUT is a literal held up by the never-narrow floor.
+
+    The per-class WAIT floor is TestTimeoutMarkCoverage's job, not this one's.
+    """
+
+    def test_never_narrows_the_ini_default(self) -> None:
+        """The constant never falls below PYPROJECT_DEFAULT_TIMEOUT."""
+        assert HOST_CAPSTONE_TEST_TIMEOUT >= PYPROJECT_DEFAULT_TIMEOUT, (
+            f'HOST_CAPSTONE_TEST_TIMEOUT ({HOST_CAPSTONE_TEST_TIMEOUT}s) is below '
+            f'the pyproject default ({PYPROJECT_DEFAULT_TIMEOUT}s). A timeout mark '
+            'REPLACES the ambient budget rather than flooring it (see '
+            '_orch_helpers.VERIFY_CLI_PER_TEST_TIMEOUT), so below the ini default '
+            'the capstone runs TIGHTER than every unmarked test on a bare local '
+            'or agent run. Raise the constant.'
         )
