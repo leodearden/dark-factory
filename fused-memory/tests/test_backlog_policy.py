@@ -1387,16 +1387,8 @@ class TestFoldIsolation:
             rate_limit_seconds=900.0,
             time_provider=now,
         )
-        # The 1s offsets are LOAD-BEARING, not cosmetic. The escalation id is
-        # derived from ``kind`` and the clock alone (``_ESC_ID_PREFIXES`` +
-        # isoformat), with nothing project-scoped in it, so two projects
-        # escalating at the SAME clock reading mint the same id and the second
-        # submit overwrites the first at the same path. That id collision
-        # predates this fold mechanism (it is byte-identical at base
-        # 63a2984c65) and is unreachable in production, where ``time.time()``
-        # resolves to microseconds; a frozen test clock is what makes it
-        # certain. Offsetting keeps this test measuring FOLD isolation instead
-        # of that collision — see the follow-up filed for the id scheme.
+        # The 1s offsets keep this test measuring fold isolation alone; same-tick
+        # id scoping is pinned separately by ``TestEscalationIdScoping``.
         await policy.check('proj_a', project_root=str(shared_root))
         clock['now'] += 1.0
         await policy.check('proj_b', project_root=str(shared_root))
