@@ -13,6 +13,8 @@ Argument wiring and live dependencies only; every behaviour lives in
   control-check  symmetry, code sha, token/cost and reference checks over control runs
   preregister    the pre-registration inputs (margins, envelope, call profile) of a control pair
   screen         η's screening verdict over one sweep's evidence root (offline post-processing)
+  incumbent-cost the incumbent's measured LLM spend from production telemetry and the
+                 controls (offline)
   topology       a scratch graph's node/edge counts and topology hash
   teardown       delete the arm's scratch graph and, with --collection, its replica
 
@@ -28,6 +30,7 @@ import json
 import sys
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlparse
@@ -54,6 +57,19 @@ from fused_memory.arm_harness.corpus import (
     CorpusIntegrityError,
     corpus_sha,
     select_replay_items,
+)
+from fused_memory.arm_harness.incumbent_cost import (
+    INCUMBENT_COST_FILENAME,
+    PRODUCTION_TELEMETRY_FILENAME,
+    IncumbentCost,
+    IncumbentCostError,
+    TelemetryAccountingError,
+    TelemetryWindow,
+    TelemetryWindowError,
+    derive_incumbent_cost,
+    select_llm_writes,
+    serialize_incumbent_cost,
+    serialize_llm_writes,
 )
 from fused_memory.arm_harness.instrument_checks import CheckResult
 from fused_memory.arm_harness.llm_metrics import TokenAccountingError
@@ -551,6 +567,73 @@ def _print_screening(verdict: ScreeningVerdict) -> None:
     print(f'outcome: {verdict.outcome.value}')
 
 
+def _cmd_incumbent_cost(args: argparse.Namespace, deps: DepsFactory) -> int:
+    telemetry_out = _fresh_output(args.out_dir / PRODUCTION_TELEMETRY_FILENAME)
+    cost_out = _fresh_output(args.out_dir / INCUMBENT_COST_FILENAME)
+    window = _select_window(args.telemetry, args.until)
+    pricing_spec = _load_llm_spec(args.pricing_spec, 'incumbent-cost')
+    control_records = [_load_control_run(run_dir)[1] for run_dir in args.control_run]
+    cost = derive_incumbent_cost(
+        window, pricing_spec=pricing_spec, control_records=control_records
+    )
+    atomic_write_text(telemetry_out, serialize_llm_writes(window.writes), mkdir=True)
+    atomic_write_text(cost_out, serialize_incumbent_cost(cost), mkdir=True)
+    _print_incumbent_cost(cost)
+    print(f'wrote: {telemetry_out}')
+    print(f'wrote: {cost_out}')
+    return EXIT_OK
+
+
+def _select_window(path: Path, until: datetime) -> TelemetryWindow:
+    rows = _read_telemetry_rows(path)
+    try:
+        return select_llm_writes(rows, until=until)
+    except (TelemetryWindowError, TelemetryAccountingError):
+        raise
+    except ValueError as error:
+        raise _Refusal(EXIT_REFUSED, f'{path} holds a malformed telemetry row: {error}') from error
+
+
+def _read_telemetry_rows(path: Path) -> list[dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding='utf-8').splitlines()
+    except OSError as error:
+        raise _Refusal(EXIT_REFUSED, f'cannot read telemetry {path}: {error}') from error
+    rows = []
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise _Refusal(EXIT_REFUSED, f'{path} line {number} is not JSON: {error}') from error
+        if not isinstance(row, dict):
+            raise _Refusal(EXIT_REFUSED, f'{path} line {number} is not a JSON object')
+        rows.append(row)
+    return rows
+
+
+def _print_incumbent_cost(cost: IncumbentCost) -> None:
+    production = cost.production
+    print(
+        f'window: {production.window_start.isoformat()} to {production.window_end.isoformat()} '
+        f'({production.days} days)'
+    )
+    print(
+        f'writes {production.writes} ({production.failed_writes} failed), '
+        f'llm_calls {production.llm_calls}, tokens/write {production.tokens_per_write}'
+    )
+    print(
+        f'usd {production.usd} at {cost.pricing_arm_id} pricing: usd/day {production.usd_per_day}, '
+        f'projected usd/30 days {production.projected_usd_per_30_days}'
+    )
+    for unit in cost.replay:
+        print(
+            f'replay {unit.arm_id}: usd/episode {unit.usd_per_episode} '
+            f'tokens/episode {unit.tokens_per_episode} (n {unit.n})'
+        )
+
+
 def _cmd_topology(args: argparse.Namespace, deps: DepsFactory) -> int:
     require_scratch_name(args.graph, checkpoint=GuardCheckpoint.TOPOLOGY_READ)
     topology = asyncio.run(_topology(deps(), args.graph))
@@ -596,6 +679,16 @@ def _positive_int(text: str) -> int:
     if value < 1:
         raise argparse.ArgumentTypeError(f'must be >= 1, got {value}')
     return value
+
+
+def _aware_timestamp(text: str) -> datetime:
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f'not an ISO-8601 timestamp: {text!r}') from error
+    if moment.tzinfo is None:
+        raise argparse.ArgumentTypeError(f'{text!r} has no UTC offset; write it with +00:00')
+    return moment
 
 
 def _add_arm_spec(parser: argparse.ArgumentParser) -> None:
@@ -681,6 +774,27 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     screen.set_defaults(handler=_cmd_screen)
 
+    incumbent = commands.add_parser(
+        'incumbent-cost',
+        help="the incumbent's measured LLM spend from production telemetry (offline)",
+    )
+    incumbent.add_argument(
+        '--telemetry', type=Path, required=True, help="telemetry_query.py's JSONL dump"
+    )
+    incumbent.add_argument(
+        '--until', type=_aware_timestamp, required=True, help='window end, ISO-8601 with offset'
+    )
+    incumbent.add_argument(
+        '--pricing-spec', type=Path, required=True, help='the metered control spec to price by'
+    )
+    incumbent.add_argument(
+        '--control-run', type=Path, action='append', required=True, help='a control run dir'
+    )
+    incumbent.add_argument(
+        '--out-dir', type=Path, required=True, help='where both outputs go; never overwritten'
+    )
+    incumbent.set_defaults(handler=_cmd_incumbent_cost)
+
     topology = commands.add_parser('topology', help="a scratch graph's topology hash")
     topology.add_argument('--graph', required=True, help='scratch graph name')
     topology.set_defaults(handler=_cmd_topology)
@@ -720,6 +834,9 @@ def main(argv: list[str] | None = None, *, deps: DepsFactory = build_live_deps) 
         MarginDerivationError,
         TokenAccountingError,
         ScreeningEvidenceError,
+        TelemetryWindowError,
+        TelemetryAccountingError,
+        IncumbentCostError,
     ) as error:
         return _report(EXIT_REFUSED, _named(error))
     except (CorpusIntegrityError, build_corpus.CorpusBuildError) as error:
