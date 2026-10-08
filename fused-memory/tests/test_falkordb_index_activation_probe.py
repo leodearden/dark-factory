@@ -12,7 +12,12 @@ import types
 from pathlib import Path
 
 import pytest
+from _falkor_index_doubles import rows_for
 from _fm_helpers import load_script_module
+from test_falkor_indices import LIVE_HEADER
+
+from fused_memory.backends import falkor_indices
+from fused_memory.backends.falkor_indices import IndexHeaderShapeError, expected_index_set
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'falkordb_index_activation_probe.py'
 
@@ -223,3 +228,120 @@ class TestBriefingVerdict:
         assert verdict.hits == hit_count
         assert verdict.total == 5
         assert verdict.floor == 4
+
+
+def _records(specs, *, header=LIVE_HEADER):
+    return _mod().index_records(header, rows_for(specs))
+
+
+class TestIndexRecords:
+    def test_maps_a_live_header_result_by_name(self):
+        expected = expected_index_set()
+
+        records = _records(expected)
+
+        assert records
+        for record in records:
+            assert set(record) == {'label', 'field', 'type', 'entity_type', 'status'}
+            assert record['entity_type'] in {'NODE', 'RELATIONSHIP'}
+            assert record['status'] == 'OPERATIONAL'
+        assert falkor_indices.normalize_index_records(records) == expected
+
+    def test_a_reordered_header_yields_the_same_records(self):
+        rows = rows_for(expected_index_set())
+        order = list(reversed(range(len(LIVE_HEADER))))
+        header = [LIVE_HEADER[i] for i in order]
+        reordered_rows = [[row[i] for i in order] for row in rows]
+
+        assert _mod().index_records(header, reordered_rows) == _mod().index_records(LIVE_HEADER, rows)
+
+    def test_a_header_without_status_raises(self):
+        header = [column for column in LIVE_HEADER if column[1] != 'status']
+
+        with pytest.raises(IndexHeaderShapeError):
+            _mod().index_records(header, [])
+
+
+class TestGraphIndexStatus:
+    def test_an_absent_graph_is_not_present_and_not_counted_incomplete(self):
+        status = _mod().graph_index_status('autotrade', None, expected_index_set())
+
+        assert status.group_id == 'autotrade'
+        assert status.present is False
+        assert _mod().incomplete_graph_ids([status]) == []
+
+    def test_every_expected_spec_operational_is_complete(self):
+        expected = expected_index_set()
+
+        status = _mod().graph_index_status('dark_factory', _records(expected), expected)
+
+        assert status.present is True
+        assert status.complete is True
+        assert list(status.missing) == []
+        assert list(status.unsettled) == []
+        assert _mod().incomplete_graph_ids([status]) == []
+
+    def test_a_missing_spec_is_incomplete_and_named(self):
+        expected = expected_index_set()
+        dropped = sorted(expected)[0]
+
+        status = _mod().graph_index_status('reify', _records(expected - {dropped}), expected)
+
+        assert status.complete is False
+        assert dropped in status.missing
+        assert _mod().incomplete_graph_ids([status]) == ['reify']
+
+    def test_an_index_under_construction_is_incomplete_and_named(self):
+        expected = expected_index_set()
+        records = _records(expected)
+        building = '[Indexing] 3/9: UNDER CONSTRUCTION'
+        records[0] = {**records[0], 'status': building}
+
+        status = _mod().graph_index_status('reify', records, expected)
+
+        assert status.complete is False
+        assert (records[0]['label'], building) in status.unsettled
+
+    def test_an_operator_added_index_is_unexpected_but_still_complete(self):
+        expected = expected_index_set()
+        extra = ('Entity', 'NODE', 'operator_added_field', 'RANGE')
+        assert extra not in expected
+
+        status = _mod().graph_index_status('reify', _records(expected | {extra}), expected)
+
+        assert extra in status.unexpected
+        assert status.complete is True
+
+    def test_specs_are_recorded_sorted(self):
+        expected = expected_index_set()
+
+        status = _mod().graph_index_status('dark_factory', _records(expected), expected)
+
+        assert list(status.actual) == sorted(expected)
+
+
+class TestTheExpectedSetIsAlphas:
+    def test_the_module_uses_alphas_expected_set_not_a_copy(self):
+        assert _mod().expected_index_set is falkor_indices.expected_index_set
+
+    def test_a_complete_status_reports_the_full_expected_total(self):
+        expected = expected_index_set()
+
+        status = _mod().graph_index_status('dark_factory', _records(expected), expected)
+
+        assert status.expected_total == len(expected_index_set())
+
+
+class TestRequireKnownProjectRoots:
+    def test_an_empty_registry_input_raises_naming_the_variable_and_its_source(self):
+        with pytest.raises(_mod().RegistryUnavailableError) as excinfo:
+            _mod().require_known_project_roots([])
+
+        message = str(excinfo.value)
+        assert 'DASHBOARD_KNOWN_PROJECT_ROOTS' in message
+        assert 'systemctl --user show fused-memory.service -p Environment' in message
+
+    def test_a_non_empty_list_passes_through(self):
+        roots = ['/home/leo/src/dark-factory', '/home/leo/src/reify']
+
+        assert _mod().require_known_project_roots(roots) == roots
