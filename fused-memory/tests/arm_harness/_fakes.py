@@ -388,6 +388,7 @@ def call(
     finish_reason: str | None = 'stop',
     duration_ms: float = 2000.0,
     error_excerpt: str | None = None,
+    outlived_session: bool = False,
 ) -> CallRecord:
     succeeded = 200 <= status < 300
     return CallRecord(
@@ -403,6 +404,7 @@ def call(
         completion_tokens=completion_tokens if succeeded else None,
         finish_reason=finish_reason if succeeded else None,
         error_excerpt=None if succeeded else (error_excerpt or f'error {status}'),
+        outlived_session=outlived_session,
     )
 
 

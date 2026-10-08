@@ -5,7 +5,11 @@ import json
 import socket
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 from urllib.parse import urlsplit
 
 from _mock_openai_server import chat_completion_body, mock_openai_server
@@ -96,6 +100,7 @@ def test_forwards_a_chat_completion_unchanged_and_records_the_server_usage(tmp_p
     assert record.completion_tokens == 56
     assert record.finish_reason == 'length'
     assert record.error_excerpt is None
+    assert record.outlived_session is False
 
 
 def test_a_rejected_call_passes_through_and_records_an_excerpt_without_usage(tmp_path):
@@ -250,3 +255,81 @@ def test_a_session_with_no_calls_still_leaves_its_empty_log(tmp_path):
 
     assert log.read_text() == ''
     assert load_call_records(log) == ()
+
+
+@contextmanager
+def _held_upstream(received: threading.Event, release: threading.Event) -> Iterator[str]:
+    """An upstream that answers each call only once ``release`` is set."""
+    body = json.dumps(_usage_body(321, 5, 'stop')).encode()
+
+    class HeldHandler(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
+        def log_message(self, *args: Any) -> None:  # noqa: A002 - stdlib signature
+            """Silent."""
+
+        def do_POST(self) -> None:  # noqa: N802 - stdlib naming
+            self.rfile.read(int(self.headers.get('Content-Length') or 0))
+            received.set()
+            release.wait(timeout=30)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), HeldHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f'http://127.0.0.1:{server.server_address[1]}'
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_a_call_still_in_flight_when_the_session_closes_is_marked_as_outliving_it(tmp_path):
+    log = tmp_path / 'calls.jsonl'
+    received, release = threading.Event(), threading.Event()
+    statuses: list[int] = []
+    with _held_upstream(received, release) as upstream:
+        with usage_tap(upstream, log_path=log) as tap_url:
+            client = threading.Thread(
+                target=lambda: statuses.append(
+                    _post(tap_url, CHAT_PATH, json.dumps(REQUEST).encode())[0]
+                ),
+                daemon=True,
+            )
+            client.start()
+            assert received.wait(timeout=10)
+        recorded_at_session_exit = log.read_text()
+        release.set()
+        client.join(timeout=10)
+
+    assert recorded_at_session_exit == ''
+    assert statuses == [200]
+    (record,) = load_call_records(log)
+    assert record.outlived_session is True
+    assert record.status == 200
+    assert record.prompt_tokens == 321
+
+
+def test_a_record_written_without_the_session_marker_loads_as_inside_its_session(tmp_path):
+    log = tmp_path / 'calls.jsonl'
+    record = call_record(
+        started_at=datetime(2026, 10, 7, tzinfo=UTC),
+        duration_ms=1.0,
+        method='POST',
+        path=CHAT_PATH,
+        request_body=json.dumps(REQUEST).encode(),
+        status=200,
+        response_body=json.dumps(_usage_body(10, 1, 'stop')).encode(),
+    )
+    payload = record.model_dump(mode='json')
+    del payload['outlived_session']
+    log.write_text(json.dumps(payload) + '\n')
+
+    assert load_call_records(log) == (record,)
+    assert record.outlived_session is False

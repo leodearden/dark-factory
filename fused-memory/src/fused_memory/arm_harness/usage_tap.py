@@ -45,6 +45,7 @@ class CallRecord(FrozenModel):
     completion_tokens: int | None
     finish_reason: str | None
     error_excerpt: str | None
+    outlived_session: bool = False
 
     @property
     def succeeded(self) -> bool:
@@ -113,15 +114,21 @@ def load_call_records(path: Path | str) -> tuple[CallRecord, ...]:
     return tuple(CallRecord.model_validate_json(line) for line in lines if line.strip())
 
 
-class _CallLog:
+class _SessionCallLog:
     def __init__(self, path: Path) -> None:
         self._path = path
         self._lock = threading.Lock()
+        self._closed = False
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
 
     def append(self, record: CallRecord) -> None:
-        line = record.model_dump_json() + '\n'
         with self._lock, self._path.open('a') as stream:
-            stream.write(line)
+            if self._closed:
+                record = record.model_copy(update={'outlived_session': True})
+            stream.write(record.model_dump_json() + '\n')
             stream.flush()
 
 
@@ -158,7 +165,9 @@ def _exchange(
         connection.close()
 
 
-def _handler_class(upstream: SplitResult, call_log: _CallLog) -> type[BaseHTTPRequestHandler]:
+def _handler_class(
+    upstream: SplitResult, call_log: _SessionCallLog
+) -> type[BaseHTTPRequestHandler]:
     class TapHandler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
 
@@ -214,7 +223,8 @@ def usage_tap(
 ) -> Iterator[str]:
     call_log_path = Path(log_path)
     call_log_path.touch()
-    handler = _handler_class(_upstream_origin(upstream_url), _CallLog(call_log_path))
+    call_log = _SessionCallLog(call_log_path)
+    handler = _handler_class(_upstream_origin(upstream_url), call_log)
     server = ThreadingHTTPServer((host, port), handler)
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True, name='usage-tap')
@@ -222,6 +232,7 @@ def usage_tap(
     try:
         yield f'http://{host}:{server.server_address[1]}'
     finally:
+        call_log.close()
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)

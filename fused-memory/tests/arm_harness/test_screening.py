@@ -187,6 +187,32 @@ def test_a_served_own_model_call_without_usage_leaves_the_longest_prompt_unknown
     assert context_gate(arm_evidence(QWEN, calls=calls)).verdict is GateVerdict.UNMEASURED
 
 
+def test_an_unreported_call_that_outlived_its_tap_session_does_not_count():
+    stopped = call(status=502, error_excerpt='upstream failed', outlived_session=True)
+    calls = (call(prompt_tokens=500), stopped)
+
+    result = context_gate(arm_evidence(QWEN, calls=calls))
+
+    assert result.verdict is GateVerdict.PASS
+    assert result.value == 500
+    assert '1 call(s) that outlived the tap session' in result.detail
+
+
+def test_a_prompt_reported_after_the_session_closed_still_counts():
+    calls = (call(prompt_tokens=500), call(prompt_tokens=7000, outlived_session=True))
+
+    assert context_gate(arm_evidence(QWEN, calls=calls)).value == 7000
+
+
+def test_only_outlived_unreported_calls_leave_the_gate_unmeasured():
+    calls = (call(status=502, outlived_session=True),)
+
+    result = context_gate(arm_evidence(QWEN, calls=calls))
+
+    assert result.verdict is GateVerdict.UNMEASURED
+    assert 'outlived the tap session' in result.detail
+
+
 # --- gate 4: throughput floor ---------------------------------------------------------
 
 

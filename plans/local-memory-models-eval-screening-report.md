@@ -86,10 +86,11 @@ phi-4-14b is UNMEASURED, not PASS. One of its 156 calls has no reported prompt l
 That call is a 502 the tap synthesized: "upstream 127.0.0.1:8412 failed:
 RemoteDisconnected". It was still being served for an episode the harness had already
 abandoned when the sweep's own `lms_ctl stop` stopped the server, 57.4 s after it
-started. The README gives the timeline. The rule treats any own-model call without a
-reported prompt as making the longest prompt unknown, and that rule is applied here as
-written. The artifact does not change phi-4-14b's survival, because gate 4 fails on its
-own.
+started. The README gives the timeline. The rule treats any in-session own-model call
+without a reported prompt as making the longest prompt unknown. This record predates the
+tap's session marker (end of §7), so it reads as in-session, and the rule is applied
+here as written. The artifact does not change phi-4-14b's survival, because gate 4 fails
+on its own.
 
 **Answer to PRD Open Q2 (Phi-4 16K context), on this subset:** the longest prompt
 phi-4's server reported was 4065 tokens. That is 8223 tokens inside the 12288 tokens
@@ -194,9 +195,16 @@ Failure modes, in short:
    failure common to all three arms is the "specific, stronger justification" rulings 1,
    3 and 4 contemplate is Leo's judgement. η makes no claim either way.
 
-The phi-4-14b 502 is an instrument defect, not a finding about the arm. The driver
-stopped an arm while a call was still in flight. It is filed as follow-up work on the
-sweep driver.
+The phi-4-14b 502 is an instrument defect, not a finding about the arm. The call
+started at 20:23:34Z and the run stage ended at 20:24:14Z. The tap's record landed
+57.4 s after the call started, at about 20:24:31Z, inside the stop stage (20:24:20Z to
+20:24:33Z). So the call outlived its tap session: the tap's handler threads are
+daemons, and closing a session did not wait for them. The tap now marks a record that
+lands after its session closed as `outlived_session`. The context gate does not count
+such a call when it reports no prompt, but it still counts any prompt length one
+reports. The committed record predates that marker and loads as an in-session call, so
+the committed verdict applies the rule as written and phi-4-14b's gate 3 stays
+UNMEASURED.
 
 ## 8. Consumer note
 

@@ -133,6 +133,14 @@ def vram_gate(evidence: ArmEvidence) -> GateResult:
     )
 
 
+def _reported_prompt_tokens(call: CallRecord) -> int | None:
+    return call.prompt_tokens if call.succeeded else None
+
+
+def _reported_prompts(calls: Sequence[CallRecord]) -> list[int]:
+    return [tokens for tokens in map(_reported_prompt_tokens, calls) if tokens is not None]
+
+
 def _unreported_detail(
     model_id: str, unreported: Sequence[CallRecord], own: Sequence[CallRecord]
 ) -> str:
@@ -141,13 +149,20 @@ def _unreported_detail(
         f'{count}x status {status}: {excerpt}'
         for (status, excerpt), count in kinds[:_LISTED_REJECTIONS]
     )
-    reported = [call.prompt_tokens for call in own if call.prompt_tokens is not None]
+    reported = _reported_prompts(own)
     longest = f'{max(reported)} tokens' if reported else 'none'
     return (
         f'{len(unreported)} of {len(own)} {model_id!r} calls report no prompt length, so the '
         f'longest prompt is unknown (longest of the {len(reported)} reported: {longest}): '
         f'{listed}'
     )
+
+
+def _outlived_note(unreported: Sequence[CallRecord]) -> str:
+    outlived = sum(1 for call in unreported if call.outlived_session)
+    if not outlived:
+        return ''
+    return f'; {outlived} call(s) that outlived the tap session reported no prompt and do not count'
 
 
 def context_gate(evidence: ArmEvidence) -> GateResult:
@@ -157,22 +172,25 @@ def context_gate(evidence: ArmEvidence) -> GateResult:
     model_id = evidence.spec.model_id
     bound = evidence.arm.max_model_len - evidence.spec.params.max_tokens
     own = evidence.own_model_calls
-    unreported = [call for call in own if not call.succeeded or call.prompt_tokens is None]
-    if unreported:
-        detail = _unreported_detail(model_id, unreported, own)
+    unreported = [call for call in own if _reported_prompt_tokens(call) is None]
+    in_session_unreported = [call for call in unreported if not call.outlived_session]
+    if in_session_unreported:
+        detail = _unreported_detail(model_id, in_session_unreported, own)
         return _gate(gate, GateVerdict.UNMEASURED, detail, bound=bound, unit=GateUnit.TOKENS)
-    if not own:
-        detail = f'no {model_id!r} call reported a prompt length'
+    reported = _reported_prompts(own)
+    outlived = _outlived_note(unreported)
+    if not reported:
+        detail = f'no {model_id!r} call reported a prompt length{outlived}'
         return _gate(gate, GateVerdict.UNMEASURED, detail, bound=bound, unit=GateUnit.TOKENS)
-    longest = max(call.prompt_tokens or 0 for call in own)
+    longest = max(reported)
     return _measured(
         gate,
         longest <= bound,
         longest,
         bound,
         GateUnit.TOKENS,
-        f'longest of {len(own)} server-reported prompts against max_model_len '
-        f'{evidence.arm.max_model_len} - max_tokens {evidence.spec.params.max_tokens}',
+        f'longest of {len(reported)} server-reported prompts against max_model_len '
+        f'{evidence.arm.max_model_len} - max_tokens {evidence.spec.params.max_tokens}{outlived}',
     )
 
 
