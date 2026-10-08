@@ -1188,14 +1188,10 @@ _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS: tuple[dict, ...] = (
 # deliberately sequenced AFTER task 4375 (dependency 4374 -> 4375, ratified
 # 2026-08-25): landing it first would have roughly DOUBLED the rate of the
 # measured, irreversible audit-record loss (288 records destroyed, 40 of them
-# kind='cadence_check'). With 4375 on main the age cutoff is only gate 1 of
-# the four-part composite eligibility rule in _sweep_stale_mem0_pool — the
-# task-3041 protected-mirror invariant (gate 2), PROTECTED_AUDIT_KINDS
-# (gate 3) and the terminal-task closure gate (gate 4, the primary defence)
-# all still apply unchanged at 7 days, so a record this TTL newly exposes is
-# reaped only if it is ALSO unprotected and cites a task confirmed terminal;
-# one citing no task is instead bounded by _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS
-# plus the marker-kind guard (task 4995).
+# kind='cadence_check'). With 4375 on main the age cutoff is only the first
+# gate of a composite eligibility rule, so a record this TTL newly exposes is
+# reaped only if it ALSO clears the remaining gates, the terminal-task closure
+# gate being the primary defence.
 # See _sweep_stale_mem0_flag_for_stage2_markers' docstring for the full rule.
 _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS: int = 7
 # A flag_for_stage2 marker citing no task may be retired once older than this.
@@ -1456,8 +1452,9 @@ class _TasklessRetirement(NamedTuple):
     marker_kind: str
 
     def permits(self, metadata, created_at: datetime, now: datetime) -> bool:
-        # The kind arm mirrors scripts/sweep_orphan_flag_markers.py::protection_reason
-        # (task 5286); == rather than set membership, so an unhashable kind cannot raise.
+        # The kind arm mirrors
+        # fused-memory/scripts/sweep_orphan_flag_markers.py::protection_reason (task 5286);
+        # == rather than set membership, so an unhashable kind cannot raise.
         if not isinstance(metadata, dict):
             return False
         kind = metadata.get('kind')
@@ -4011,18 +4008,9 @@ class TaskKnowledgeSync(BaseStage):
         # cycle, per-project, alongside the three sibling GC passes; explicit
         # value so downstream consumers never need a .get(..., 0) fallback.
         #
-        # Retirement here is COMPOSITE, not age-only (task 4375): a marker is
-        # deleted only when it is past the _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS
-        # cutoff (7 days since task 4374, interim mitigation per esc-3796-1;
-        # was 14) AND is not a protected cycle_summary mirror AND its kind is
-        # not in PROTECTED_AUDIT_KINDS AND either its task_id is confirmed
-        # terminal in the list hoisted above or, citing NO task, it is older
-        # than _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS and declares no kind or
-        # FLAG_FOR_STAGE2_MARKER_KIND (task 4995). The terminal gate is the
-        # primary arm — it was added because 40 kind='cadence_check' audit
-        # records in autopilot_video were destroyed by the age-only sweep, all
-        # citing a task that is merely 'deferred'. The two sibling Mem0 sweeps
-        # above are deliberately age-only and are NOT gated.
+        # Unlike the two age-only sibling sweeps above, retirement here is
+        # composite and gated on the terminal ids hoisted above (tasks 4375,
+        # 4995); _sweep_stale_mem0_flag_for_stage2_markers' docstring owns the rule.
         report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] = (
             await _sweep_stale_mem0_flag_for_stage2_markers(
                 self.memory, self.project_id, run_id,
