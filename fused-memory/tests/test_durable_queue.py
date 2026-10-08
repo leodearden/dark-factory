@@ -398,8 +398,7 @@ class TestRecovery:
         await q.initialize()
 
         # Manually insert an in_flight item (simulating crash)
-        assert q._db is not None
-        await q._db.execute(
+        await q._require_access().connection.execute(
             'INSERT INTO write_queue '
             '(group_id, operation, payload, status, attempts, max_attempts, '
             ' next_retry_at, created_at) '
@@ -407,7 +406,7 @@ class TestRecovery:
             ('proj1', 'add_episode', '{"content":"crashed","group_id":"proj1","name":"ep"}',
              time.time()),
         )
-        await q._db.commit()
+        await q._require_access().connection.commit()
         await q.close()
 
         # Re-open — should recover
@@ -527,7 +526,8 @@ class TestEnqueueBatchRollback:
         (so ``pytest.raises(KeyError)`` fails too).  This final shape, which
         also puts ``_handle_failure``'s commit in the window, re-measured over
         5 runs: failed 5/5 — 126, 138, 140 and 153 'batch' rows survived as
-        pending in four, and the fifth raised the same ``BEGIN`` error.
+        pending in four, and the fifth raised the same ``BEGIN`` error.  After
+        the fix: passed 5/5, no batch row left.
 
         A CANCELLED batch is deliberately absent: it measured clean before the
         fix (it cancels at its ``BEGIN`` and leaves nothing), and an arm that
@@ -670,7 +670,7 @@ class TestShutdown:
 
         # Workers should be cleaned up
         assert len(q._worker_tasks) == 0
-        assert q._db is None
+        assert q._access is None
 
 
 class TestDeleteDead:
@@ -678,28 +678,26 @@ class TestDeleteDead:
 
     async def _insert_dead_row(self, q, group_id: str = 'proj1') -> int:
         """Insert a dead row directly via SQL and return its id."""
-        assert q._db is not None
-        cursor = await q._db.execute(
+        cursor = await q._require_access().connection.execute(
             'INSERT INTO write_queue '
             '(group_id, operation, payload, status, attempts, max_attempts, '
             ' next_retry_at, created_at) '
             "VALUES (?, 'add_episode', '{\"content\":\"dead\"}', 'dead', 3, 3, 0, ?)",
             (group_id, time.time()),
         )
-        await q._db.commit()
+        await q._require_access().connection.commit()
         return cursor.lastrowid  # type: ignore[return-value]
 
     async def _insert_pending_row(self, q, group_id: str = 'proj1') -> int:
         """Insert a pending row directly via SQL and return its id."""
-        assert q._db is not None
-        cursor = await q._db.execute(
+        cursor = await q._require_access().connection.execute(
             'INSERT INTO write_queue '
             '(group_id, operation, payload, status, attempts, max_attempts, '
             ' next_retry_at, created_at) '
             "VALUES (?, 'add_episode', '{\"content\":\"pending\"}', 'pending', 0, 3, 0, ?)",
             (group_id, time.time()),
         )
-        await q._db.commit()
+        await q._require_access().connection.commit()
         return cursor.lastrowid  # type: ignore[return-value]
 
     @pytest.mark.asyncio
@@ -752,8 +750,7 @@ class TestDeleteDead:
         assert result['not_found'] == [id_pending]
 
         # Row must still be present
-        assert queue._db is not None
-        cursor = await queue._db.execute(
+        cursor = await queue._require_access().connection.execute(
             'SELECT id FROM write_queue WHERE id = ?', (id_pending,)
         )
         row = await cursor.fetchone()
@@ -859,8 +856,7 @@ class TestDeleteDead:
         assert sorted(result['not_found']) == sorted(pending_ids)
 
         # Pending rows must still be present.
-        assert queue._db is not None
-        cursor = await queue._db.execute(
+        cursor = await queue._require_access().connection.execute(
             f"SELECT id FROM write_queue WHERE id IN ({','.join('?' * len(pending_ids))})",
             tuple(pending_ids),
         )
@@ -878,14 +874,14 @@ class TestDeleteDead:
         id1 = await self._insert_dead_row(queue, 'proj1')
 
         # Replace db.execute with one that raises OperationalError on any DELETE call.
-        original_execute = queue._db.execute
+        original_execute = queue._require_access().connection.execute
 
         async def mock_execute(sql, *args, **kwargs):
             if 'DELETE' in sql.upper():
                 raise aiosqlite.OperationalError('database is locked')
             return await original_execute(sql, *args, **kwargs)
 
-        monkeypatch.setattr(queue._db, 'execute', mock_execute)
+        monkeypatch.setattr(queue._require_access().connection, 'execute', mock_execute)
 
         result = await queue.delete_dead(group_id='proj1', ids=[id1])
 
@@ -920,7 +916,7 @@ class TestDeleteDead:
 
         # Track which DELETE invocation we're on.
         delete_call_count = 0
-        original_execute = queue._db.execute
+        original_execute = queue._require_access().connection.execute
 
         async def mock_execute(sql, *args, **kwargs):
             nonlocal delete_call_count
@@ -930,7 +926,7 @@ class TestDeleteDead:
                     raise aiosqlite.OperationalError('database is locked')
             return await original_execute(sql, *args, **kwargs)
 
-        monkeypatch.setattr(queue._db, 'execute', mock_execute)
+        monkeypatch.setattr(queue._require_access().connection, 'execute', mock_execute)
 
         result = await queue.delete_dead(group_id='proj1', ids=dead_ids)
 
@@ -1017,20 +1013,20 @@ class TestDeleteDead:
         id1 = await self._insert_dead_row(queue, 'proj1')
 
         # Raise OperationalError on any DELETE to trigger the error path.
-        original_execute = queue._db.execute
+        original_execute = queue._require_access().connection.execute
 
         async def mock_execute(sql, *args, **kwargs):
             if 'DELETE' in sql.upper():
                 raise aiosqlite.OperationalError('database is locked')
             return await original_execute(sql, *args, **kwargs)
 
-        monkeypatch.setattr(queue._db, 'execute', mock_execute)
+        monkeypatch.setattr(queue._require_access().connection, 'execute', mock_execute)
 
         # Also fail the recovery commit so we enter the double-failure branch.
         async def mock_commit():
             raise aiosqlite.OperationalError('disk I/O error')
 
-        monkeypatch.setattr(queue._db, 'commit', mock_commit)
+        monkeypatch.setattr(queue._require_access().connection, 'commit', mock_commit)
 
         with caplog.at_level(logging.ERROR, logger='fused_memory.services.durable_queue'):
             result = await queue.delete_dead(group_id='proj1', ids=[id1])
@@ -1086,7 +1082,6 @@ class TestDeleteDead:
             write_timeout_seconds=2.0,
         )
         await q.initialize()
-        assert q._db is not None  # narrowed from Optional after initialize()
 
         try:
             # (2) Patch batch size to 3 so 7 rows => chunks [0:3], [3:6], [6:7].
@@ -1098,13 +1093,13 @@ class TestDeleteDead:
             #     PRAGMA journal_mode silently returns the *current* mode rather
             #     than raising on failure, so discarding the cursor can mask a
             #     no-op switch (e.g. WAL→DELETE while another connection holds WAL).
-            cur = await q._db.execute(f'PRAGMA journal_mode={journal_mode}')
+            cur = await q._require_access().connection.execute(f'PRAGMA journal_mode={journal_mode}')
             row = await cur.fetchone()
             assert row is not None and row[0].lower() == journal_mode.lower(), (
                 f'journal_mode switch failed: expected {journal_mode!r}, '
                 f'got {(row[0] if row else None)!r}'
             )
-            await q._db.commit()
+            await q._require_access().connection.commit()
 
             db_path = q._data_dir / 'write_queue.db'
 
@@ -1118,7 +1113,7 @@ class TestDeleteDead:
                 )
                 await conn2.commit()
 
-                # (5) Install the coordinator wrapper around q._db.execute.
+                # (5) Install the coordinator wrapper around the queue connection's execute.
                 #
                 # Chunk-1 path (delete_call_count == 1):
                 #   a. Execute chunk-1 DELETE and pre-fetch RETURNING rows before
@@ -1129,14 +1124,13 @@ class TestDeleteDead:
                 #   e. Return a proxy cursor with the pre-buffered RETURNING rows.
                 # All other calls (including chunk-2 DELETE) forward to the real execute.
                 #
-                # Recovery-commit safety note: delete_dead's except-OperationalError
-                # handler calls ``await self._db.commit()`` as a recovery attempt after
-                # chunk-2 fails.  That commit is a no-op because the coordinator already
+                # Recovery-commit safety note: delete_dead's write unit commits on
+                # its clean exit after chunk-2 fails.  That commit is a no-op because the coordinator already
                 # committed chunk-1 above, leaving *no pending transaction* on the queue
                 # connection.  A no-op commit never needs the write lock, so there is no
                 # race risk from busy_timeout still being 50 ms at that point.
                 delete_call_count = 0
-                q_db = q._db
+                q_db = q._require_access().connection
                 original_execute = q_db.execute
 
                 async def coordinator(sql, *args, **kwargs):
@@ -1217,7 +1211,7 @@ class TestDeleteDead:
             )
 
         finally:
-            # close() guards against _db being None, so a double-call is a no-op.
+            # close() guards against _access being None, so a double-call is a no-op.
             await q.close()
 
 
@@ -1429,9 +1423,8 @@ class TestGetStatsScopedByGroup:
             old_ts = now - 100.0  # proj_a item created 100 seconds ago
             recent_ts = now - 10.0  # proj_b item created 10 seconds ago
 
-            assert q._db is not None
             # Insert directly so workers aren't triggered (they'd change status)
-            await q._db.execute(
+            await q._require_access().connection.execute(
                 'INSERT INTO write_queue '
                 '(group_id, operation, payload, status, attempts, max_attempts, '
                 ' next_retry_at, created_at) '
@@ -1440,7 +1433,7 @@ class TestGetStatsScopedByGroup:
                  '{"content":"old","group_id":"proj_a","name":"old"}',
                  old_ts),
             )
-            await q._db.execute(
+            await q._require_access().connection.execute(
                 'INSERT INTO write_queue '
                 '(group_id, operation, payload, status, attempts, max_attempts, '
                 ' next_retry_at, created_at) '
@@ -1449,7 +1442,7 @@ class TestGetStatsScopedByGroup:
                  '{"content":"recent","group_id":"proj_b","name":"recent"}',
                  recent_ts),
             )
-            await q._db.commit()
+            await q._require_access().connection.commit()
 
             stats_b = await q.get_stats(group_id='proj_b')
             age_b = stats_b['oldest_pending_age_seconds']

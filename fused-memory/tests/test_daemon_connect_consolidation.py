@@ -80,7 +80,7 @@ _DAEMON_CASES = [
     pytest.param(
         lambda tmp: DurableWriteQueue(data_dir=tmp / 'queue', execute_write=AsyncMock()),
         _std_lifecycle,
-        lambda store, _root: store._db,
+        lambda store, _root: store._require_access().connection,
         id='DurableWriteQueue',
     ),
     pytest.param(
