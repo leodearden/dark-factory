@@ -249,10 +249,10 @@ class TestAllCappedParkIsVisible:
                 gate._open.set()
                 await asyncio.sleep(0.001)
 
-        # A correct throttle emits at most duration/interval + 1 heartbeats
-        # however slow the host, so a run is evidence only when passes exceed
-        # that budget; the pass target and a 0.5s interval make that the
-        # normal case, and a host too slow to clear it skips.
+        # A correct throttle's heartbeat count is bounded by elapsed time, so a
+        # run is evidence only when passes exceed `heartbeat_budget` below. The
+        # pass target and the long interval make that the normal case; a host
+        # too slow to clear it skips.
         target_passes = 200
         started = time.monotonic()
         deadline = started + 30.0
@@ -264,12 +264,14 @@ class TestAllCappedParkIsVisible:
                 if time.monotonic() > deadline:
                     break
                 await asyncio.sleep(0.005)
+            assert not parked.done(), (
+                f'before_invoke ended while every account was capped ({parked!r}): '
+                'the park must block until an account reopens'
+            )
         finally:
-            parked.cancel()
             waker.cancel()
-            for task in (parked, waker):
-                with pytest.raises(asyncio.CancelledError):
-                    await task
+            parked.cancel()
+            await asyncio.gather(waker, parked, return_exceptions=True)
         duration = time.monotonic() - started
 
         heartbeats = len(_park_records(caplog))
