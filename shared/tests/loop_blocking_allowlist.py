@@ -294,7 +294,7 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
     # ---- backends/sqlite_task_backend.py ----
     (
         'fused-memory/src/fused_memory/backends/sqlite_task_backend.py',
-        'SqliteTaskBackend._get_connection',
+        'SqliteTaskBackend._get_write_access',
         '14c6bfa75f63',
         'accepted',
         _MKDIR_ON_STORE_OPEN_WHY,
