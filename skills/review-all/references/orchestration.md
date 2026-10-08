@@ -37,7 +37,7 @@ const ARGS_SCHEMA = {
       properties: {
         seat: { type: 'string', description: '<area>/<slice-slug>, or <area> when the area is one slice' },
         area: { type: 'string' },
-        read_fully: { type: 'array', items: { type: 'object', required: ['path', 'lines', 'prose_share', 'cognitive_max', 'cognitive_total', 'fan_in', 'fan_out', 'reach_back_imports', 'reexports', 'patch_targets'],
+        read_fully: { type: 'array', description: "each entry's numbers come from the snapshot's file record for its path: prose_share = prose_ratio (0 where that is null, a 0-line file); fan_in = fan_in_src; reexports = len(reexport_names); patch_targets = the count of distinct private_patch_targets, across tests records, that continue this record's module; the rest are the record's own fields", items: { type: 'object', required: ['path', 'lines', 'prose_share', 'cognitive_max', 'cognitive_total', 'fan_in', 'fan_out', 'reach_back_imports', 'reexports', 'patch_targets'],
           properties: { path: { type: 'string' }, lines: { type: 'integer' }, prose_share: { type: 'number' }, cognitive_max: { type: 'integer' }, cognitive_total: { type: 'integer' }, fan_in: { type: 'integer' }, fan_out: { type: 'integer' }, reach_back_imports: { type: 'integer' }, reexports: { type: 'integer' }, patch_targets: { type: 'integer' } } } },
         index_only: { type: 'array', items: { type: 'string' } },
         tests_reaching_internals: { type: 'array', items: { type: 'object', required: ['test_path', 'targets'], properties: { test_path: { type: 'string' }, targets: { type: 'array', items: { type: 'string' } } } } },
@@ -50,15 +50,15 @@ const ARGS_SCHEMA = {
       } } },
     cross: { type: 'array', items: { type: 'object', required: ['lens', 'tag', 'title', 'question'],
       properties: { lens: { type: 'string' }, tag: { type: 'string' }, title: { type: 'string' }, question: { type: 'string' } } } },
-    metrics_summary: { type: 'string', description: 'whole-repo Phase 1 snapshot rendered as ≤4k chars of tables' },
+    metrics_summary: { type: 'string', description: '`scripts/quality_metrics_snapshot.py --summary` plus its `--diff` sections, ≤4k chars' },
     quality_guidance: { type: ['string', 'null'], description: "null when <root>/docs/code-quality.md exists (prompts say Read it); otherwise the render of orchestrator/src/orchestrator/agents/code_quality.py::guidance, embedded verbatim (contract §10)" },
-    import_graph_path: { type: 'string', description: 'JSON file under scratch: {edges:[[from,to]], reach_back:[...], deferred:[...], cycles:[[...]]}' },
+    import_graph_path: { type: 'string', description: "JSON file under scratch: the snapshot's import_graph section unchanged — {edges:[[from,to]], reach_back:[{from,to,names,line}], deferred:[{from,line,imports}], cycles:[[module,...]]}, nodes are module import names (a file record's `module`)" },
     prior: { type: 'object', required: ['open', 'standing'], properties: {
       open: { type: 'array', items: { type: 'object', required: ['canonical', 'key', 'area', 'statement', 'severity', 'source_run', 'disposition'] } },
       standing: { type: 'array', items: { type: 'object', required: ['canonical', 'key', 'area', 'statement', 'disposition'] } } } },
     routing: { type: 'object', required: ['area', 'skeptic', 'cross', 'synthesis', 'critic'],
       additionalProperties: { type: 'object', required: ['model', 'effort'], properties: { model: { type: 'string' }, effort: { type: 'string' } } } },
-    ceilings: { type: 'object', required: ['soft_lines', 'alarm_lines', 'max_findings_per_seat'],
+    ceilings: { type: 'object', required: ['soft_lines', 'alarm_lines', 'max_findings_per_seat'], description: "soft_lines and alarm_lines come from the snapshot's params (h14_soft_ceiling_lines, h14_alarm_lines)",
       properties: { soft_lines: { type: 'integer' }, alarm_lines: { type: 'integer' }, max_findings_per_seat: { type: 'integer' } } },
   },
 }

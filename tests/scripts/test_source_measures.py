@@ -184,6 +184,44 @@ class TestFunctionLocalImports:
         assert 'broken.py' in str(excinfo.value)
 
 
+class TestImportStatements:
+    def test_each_statement_carries_whether_it_runs_and_whether_it_is_deferred(self) -> None:
+        source = (
+            'import a\n'
+            'from typing import TYPE_CHECKING\n'
+            'if TYPE_CHECKING:\n'
+            '    import b\n'
+            'else:\n'
+            '    import c\n'
+            'class C:\n'
+            '    import d\n'
+            'def f():\n'
+            '    import e\n'
+            '    if typing.TYPE_CHECKING:\n'
+            '        import g\n'
+            '    class Local:\n'
+            '        import h\n'
+        )
+        statements = source_measures.import_statements_in_tree(ast.parse(source))
+        assert [(s.line, s.runtime, s.deferred) for s in statements] == [
+            (1, True, False),
+            (2, True, False),
+            (4, False, False),
+            (6, True, False),
+            (8, True, False),
+            (10, True, True),
+            (12, False, True),
+            (14, True, True),
+        ]
+
+    def test_the_function_local_count_is_the_deferred_statements(self) -> None:
+        source = 'import a\n\ndef f():\n    import b\n    def g():\n        from c import d\n'
+        tree = ast.parse(source)
+        deferred = [s for s in source_measures.import_statements_in_tree(tree) if s.deferred]
+        assert [s.line for s in deferred] == [4, 6]
+        assert source_measures.function_local_imports_in_tree(tree) == len(deferred)
+
+
 class TestReexportNames:
     def test_unreferenced_module_level_import_from_names_are_reexports(self) -> None:
         source = 'from a import (B, C)\n'
@@ -1110,6 +1148,91 @@ class TestWorkspaceDomainFailsHard:
             source_measures.MetricsError, match='not the top of a git work tree'
         ):
             source_measures.workspace_domain(root / 'alpha')
+
+
+def _commit(root: Path, message: str) -> None:
+    """Commit the index with a fixture identity: the suite guarantees none."""
+    git(
+        root,
+        '-c', 'user.name=fixture',
+        '-c', 'user.email=fixture@example.invalid',
+        'commit', '--no-verify', '-q', '-m', message,
+    )
+
+
+class TestHeadCommit:
+    def test_it_is_the_sha_head_names(self, tmp_path: Path) -> None:
+        root = _domain_repo(tmp_path / 'repo')
+        _commit(root, 'base')
+        assert source_measures.head_commit(root) == git(root, 'rev-parse', 'HEAD').strip()
+
+    def test_a_repo_with_no_commit_is_refused_naming_head(self, tmp_path: Path) -> None:
+        root = _domain_repo(tmp_path / 'repo')
+        with pytest.raises(source_measures.MetricsError, match='HEAD'):
+            source_measures.head_commit(root)
+
+    def test_a_subdirectory_of_the_work_tree_is_refused(self, tmp_path: Path) -> None:
+        root = _domain_repo(tmp_path / 'repo')
+        _commit(root, 'base')
+        with pytest.raises(
+            source_measures.MetricsError, match='not the top of a git work tree'
+        ):
+            source_measures.head_commit(root / 'alpha')
+
+
+class TestUncommittedDomainPaths:
+    @pytest.fixture
+    def root(self, tmp_path: Path) -> Path:
+        root = _domain_repo(
+            tmp_path / 'repo', tracked=(*_DOMAIN_TRACKED, 'alpha/src/alpha/data.txt')
+        )
+        _commit(root, 'base')
+        return root
+
+    def test_a_clean_tree_has_none(self, root: Path) -> None:
+        assert source_measures.uncommitted_domain_paths(root) == ()
+
+    def test_every_uncommitted_domain_python_path_is_listed_and_nothing_else(
+        self, root: Path
+    ) -> None:
+        (root / 'alpha/src/alpha/mod.py').write_text('# changed, unstaged\n', encoding='utf-8')
+        # A staged deletion is gone from the index, so the domain's own file set
+        # would never see it.
+        git(root, 'rm', '-q', 'beta/src/beta/b.py')
+        (root / 'scripts/x.py').write_text('# changed, staged\n', encoding='utf-8')
+        git(root, 'add', 'scripts/x.py')
+        (root / 'hooks/h.py').write_text('# outside every member root\n', encoding='utf-8')
+        (root / 'alpha/src/alpha/new.py').write_text('# untracked\n', encoding='utf-8')
+        (root / 'alpha/src/alpha/data.txt').write_text('not python\n', encoding='utf-8')
+        assert source_measures.uncommitted_domain_paths(root) == (
+            'alpha/src/alpha/mod.py',
+            'beta/src/beta/b.py',
+            'scripts/x.py',
+        )
+
+    def test_a_staged_change_whose_work_tree_copy_was_reverted_is_listed(
+        self, root: Path
+    ) -> None:
+        target = root / 'alpha/tests/test_a.py'
+        committed = target.read_text(encoding='utf-8')
+        target.write_text('# staged\n', encoding='utf-8')
+        git(root, 'add', 'alpha/tests/test_a.py')
+        target.write_text(committed, encoding='utf-8')
+        assert source_measures.uncommitted_domain_paths(root) == ('alpha/tests/test_a.py',)
+
+    def test_a_subdirectory_of_the_work_tree_is_refused(self, root: Path) -> None:
+        with pytest.raises(
+            source_measures.MetricsError, match='not the top of a git work tree'
+        ):
+            source_measures.uncommitted_domain_paths(root / 'alpha')
+
+    @pytest.mark.parametrize('pyproject', [pytest.param(_workspace(), id='no-members')])
+    def test_a_member_list_that_cannot_be_read_is_refused(
+        self, tmp_path: Path, pyproject: str
+    ) -> None:
+        root = _domain_repo(tmp_path / 'repo', pyproject=pyproject)
+        with pytest.raises(source_measures.MetricsError, match=r'tool\.uv\.workspace'):
+            source_measures.uncommitted_domain_paths(root)
 
 
 # ---------------------------------------------------------------------------
