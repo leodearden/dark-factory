@@ -767,6 +767,15 @@ def _progress_aborts(store: _RecordingEventStore) -> list[dict]:
     ]
 
 
+def _assert_reason_restates(reason: str, capped_abort: dict, *fragments: str) -> None:
+    """A cap-out reason restates its capped event's budget and strike, plus *fragments*, and diagnoses nothing."""
+    lowered = reason.lower()
+    assert 'dead' not in lowered and 'hung' not in lowered, reason
+    expected = (f"{capped_abort['budget_secs']:g}s", f"{capped_abort['strike']} consecutive", *fragments)
+    missing = [fragment for fragment in expected if fragment not in reason]
+    assert not missing, f'{reason!r} lacks {missing!r}'
+
+
 class _DispatchReturnsMidVerifyRemote:
     """Stub RemoteRunner whose `dispatch_in_flight` is a real `@property`
     over a mutable flag — not a MagicMock snapshot — so it can genuinely
@@ -1590,16 +1599,19 @@ class TestRepeatedDeadVerifyBusyLoopCap:
             f'again — got status={result2.status!r}'
         )
         assert result2.outcome is not None and result2.outcome.status == 'blocked'
-        reason = result2.outcome.reason.lower()
-        assert 'dead' in reason and 'hung' in reason, (
-            f"expected the blocked reason to mention 'dead'/'hung' verify, got: "
-            f'{result2.outcome.reason!r}'
+        _assert_reason_restates(
+            result2.outcome.reason,
+            _progress_aborts(store)[-1],
+            f'{worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS:g}s',
+            f'{worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS} consecutive',
+            'local',
         )
         assert result2.merge_wt is None
 
         assert req2.result.done(), 'the MAX-th abort must resolve req2.result directly'
         outcome2 = req2.result.result()
         assert outcome2.status == 'blocked'
+        assert outcome2.reason == result2.outcome.reason
 
         assert q.empty(), 'the MAX-th dead abort must NOT be re-queued (busy-loop guard)'
         assert _strikes() == [first, capped]
@@ -1892,16 +1904,20 @@ class TestRepeatedDeadVerifyBusyLoopCap:
             f'not REQUEUED again — got status={result2.status!r}'
         )
         assert result2.outcome is not None and result2.outcome.status == 'blocked'
-        reason = result2.outcome.reason.lower()
-        assert 'dead' in reason and 'hung' in reason, (
-            f"expected the blocked reason to mention 'dead'/'hung' verify, got: "
-            f'{result2.outcome.reason!r}'
+        _assert_reason_restates(
+            result2.outcome.reason,
+            _progress_aborts(store)[-1],
+            f'{worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS:g}s',
+            f'{worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS} consecutive',
+            'remote',
+            'no dispatch seen in flight',
         )
         assert result2.merge_wt is None
 
         assert req2.result.done(), 'the MAX-th abort must resolve req2.result directly'
         outcome2 = req2.result.result()
         assert outcome2.status == 'blocked'
+        assert outcome2.reason == result2.outcome.reason
 
         assert q.empty(), 'the MAX-th remote coast must NOT be re-queued (busy-loop guard)'
         assert _strikes() == [first, capped]
