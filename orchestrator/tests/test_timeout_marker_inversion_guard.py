@@ -170,7 +170,7 @@ _TIMEOUT_FLAG_RE = re.compile(r'--timeout[=\s](\d+)')
 #: cache of those definitions, never a claim about them.
 _SANCTIONED_TIMEOUT_NAMES: dict[str, float] = {
     'WHOLE_TREE_SCAN_TEST_TIMEOUT': 540.0,
-    'HEAVY_BARRIER_TEST_TIMEOUT': 300.0,
+    'HEAVY_BARRIER_TEST_TIMEOUT': 540.0,
     'PYTEST_TIMEOUT': 960.0,
     'VERIFY_CLI_PER_TEST_TIMEOUT': float(VERIFY_CLI_PER_TEST_TIMEOUT),
     'DEEP_GATE_SCENE_TEST_TIMEOUT': float(DEEP_GATE_SCENE_TEST_TIMEOUT),
