@@ -1584,7 +1584,7 @@ def require_non_blank_prompt(
     CLI" failure impossible to cause from OUR side.
 
     The claude backend is 100% stdin-dependent.  ``build_claude_argv`` emits
-    ``cmd = ['claude', '--print', '--output-format', 'json']`` and NEVER
+    ``cmd = [<resolved claude binary>, '--print', '--output-format', 'json']`` and NEVER
     appends a positional prompt or a ``-`` stdin marker (unlike the codex
     backend in ``orchestrator/agents/invoke.py``, which passes its own input
     argument).  The prompt is delivered solely on stdin — ``stdin_data =
@@ -3290,7 +3290,7 @@ def build_claude_argv(
     # against whatever PATH the spawning process inherited. This one site
     # covers BOTH spawn paths — the sandbox and non-sandbox invocations here,
     # and the orchestrator's, which reaches this same helper via
-    # orchestrator/src/orchestrator/agents/invoke.py::_invoke_claude_cli.
+    # orchestrator/src/orchestrator/agents/invoke.py::_invoke_claude_with_sandbox.
     #
     # Fail-open: an unresolvable spec falls back to itself, so a caller that
     # only assembles an argv (several test suites, the startup probe) keeps
