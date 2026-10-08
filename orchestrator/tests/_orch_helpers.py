@@ -225,29 +225,13 @@ PYPROJECT_DEFAULT_TIMEOUT = 540
 # 300 -> 540 on 2026-09-17 (task 5442): the never-narrow rule below forces it,
 # since the ini default moved to 540, and 540 also clears the family's own 420.
 #
-# Deliberately NOT taken from HEAVY_BARRIER_TEST_TIMEOUT, which happens to
-# equal 300 but is merge-wait arithmetic (`5 * MERGE_RESULT_TIMEOUT + 75`); an
-# AST sweep performs zero merge waits, so borrowing it would let a future
-# merge-timing retune silently move this ceiling.  Never-narrow: it must also
+# Deliberately NOT taken from HEAVY_BARRIER_TEST_TIMEOUT: that one bounds a
+# different hazard, sized by merge-barrier waits, and an AST sweep performs
+# zero merge waits, so borrowing it would let a future merge-timing retune
+# silently move this ceiling.  Never-narrow: it must also
 # never fall below PYPROJECT_DEFAULT_TIMEOUT, or a module-level mark meant as
 # a FLOOR would start narrowing its module below the global default (pinned by
 # test_whole_tree_scan_timeout_guard.py).
-#
-# THAT NEVER-NARROW RULE WAS APPLIED HERE AND NOT TO ITS NEIGHBOUR, which is
-# recorded rather than left to be noticed later.  HEAVY_BARRIER_TEST_TIMEOUT
-# (test_merge_queue_concurrent_verify.py) stayed at 300 while this moved to 540,
-# so it now sits BELOW the ini default it used to equal: under a bare
-# local/agent run the heaviest merge-barrier classes become the one heavy family
-# whose module marks TIGHTEN below the ambient budget -- exactly the inversion
-# the rule above exists to prevent, on the tests most exposed to the CPU
-# starvation the 540 raise answers.  A LATENT GAP, not a regression: verify
-# passes `--timeout=300` on its CLI either way (see VERIFY_CLI_PER_TEST_TIMEOUT
-# below), so on the merge gate those tests see 300 whatever this file says.
-# Unfixed here because that constant lives outside the file scope of the task
-# that moved this one, and because the fix is a genuine choice rather than a
-# mechanical one -- either exempt a DERIVED merge-wait bound from the rule
-# explicitly, or raise it to `max(5 * MERGE_RESULT_TIMEOUT + 75,
-# PYPROJECT_DEFAULT_TIMEOUT)`.  Filed as follow-up.
 WHOLE_TREE_SCAN_TEST_TIMEOUT = 540
 
 # Headroom a per-test ceiling must keep over its family's measured-under-load
@@ -314,7 +298,7 @@ UNDER_LOAD_HEADROOM_FACTOR = 8
 # to 100 while a ratio assertion stayed green as an identity -- collapsing the
 # band toward nothing without a single test going red.  Same hazard, and same
 # resolution, as WHOLE_TREE_SCAN_TEST_TIMEOUT deliberately not borrowing
-# HEAVY_BARRIER_TEST_TIMEOUT's 300.  The literal is instead kept honest by an
+# HEAVY_BARRIER_TEST_TIMEOUT.  The literal is instead kept honest by an
 # EXECUTABLE link: test_timeout_marker_inversion_guard.py::
 # TestVerifyCliBudgetConstant re-reads orchestrator/orchestrator.yaml at
 # runtime and fails if the two disagree.  Never-narrow.
@@ -657,7 +641,7 @@ DEEP_GATE_SCENE_BUDGET = SpawnBudget(
 # claim about what this class costs", so borrowing it would let a Row 7
 # re-measurement silently move this module's ceiling -- the identical hazard
 # WHOLE_TREE_SCAN_TEST_TIMEOUT cites when it declines to borrow
-# HEAVY_BARRIER_TEST_TIMEOUT's 300 despite the numbers matching.  The two
+# HEAVY_BARRIER_TEST_TIMEOUT.  The two
 # scenes are sized by different arithmetic anyway: Row 7 is 234 spawns with
 # zero bounded waits, this is 169 spawns plus a 180s bounded-wait path.
 #
@@ -673,8 +657,9 @@ DEEP_GATE_SCENE_BUDGET = SpawnBudget(
 #     default 300 -> 540 on measurement and deliberately left verify's CLI at
 #     300, so a value can now clear the verify edge while narrowing the
 #     ambient one.  That is not hypothetical -- the same commit recorded its
-#     own casualty, HEAVY_BARRIER_TEST_TIMEOUT, left at 300 and now below the
-#     default it used to equal.  1080 clears 540 today, so this pin changes
+#     own casualty, HEAVY_BARRIER_TEST_TIMEOUT, left at 300 below the default
+#     it used to equal until task 5572 re-derived it to 540.  1080 clears 540
+#     today, so this pin changes
 #     nothing now; it exists so a future re-derivation landing somewhere like
 #     360 cannot satisfy the verify edge and reproduce that gap in silence;
 #   * `<= verify_command_timeout_secs` (7200, orchestrator/orchestrator.yaml)
@@ -908,21 +893,12 @@ RESPONSIVE_WAIT_WALL_CAP = int(RESPONSIVE_WAIT_STRETCH * MERGE_RESULT_TIMEOUT)  
 # because the amendment pass asked the question directly: in the regime where
 # THIS process is scheduled normally but its child `git`/verify subprocesses
 # are starved, the stretch buys a gate barrier nothing at all (see the helper's
-# "Limitation" section), so is 15 still right?  Yes, on three grounds:
+# "Limitation" section), so is 15 still right?  Yes, on two grounds:
 #   1. No gate-barrier failure has ever been MEASURED.  All three archived
 #      failures were result-future waits (45s, 45s, 25s).  Raising a nominal
 #      that has not been observed to fail is a plain widening, which this repo
 #      forbids as a flake fix (plans/flake-ledger-prd.md:216-223).
-#   2. It would be actively harmful.  Gates at a 45s nominal are billed 90s
-#      each, raising a late-arrival method's bill by 120s (two gate
-#      barriers, 60s more each) -- more than the heaviest of them has left
-#      under its paired
-#      @pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT), as
-#      test_merge_speculation.py::TestTimeoutMarkCoverage would report.
-#      Under `timeout_method = "thread"` plus `--max-worker-restart=0`, a
-#      blown mark is an os._exit() of the xdist worker, i.e. a worker death
-#      instead of a clean failure.
-#   3. It is not tight.  Every barrier in the LateArrival suite resolves inside
+#   2. It is not tight.  Every barrier in the LateArrival suite resolves inside
 #      a test that completes in ~5s end to end, against a 15s nominal and a 30s
 #      ceiling.
 # If a gate-barrier flake is ever measured, the fix is to make child-process

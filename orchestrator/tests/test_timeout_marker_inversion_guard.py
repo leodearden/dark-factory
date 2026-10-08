@@ -145,7 +145,7 @@ _TIMEOUT_FLAG_RE = re.compile(r'--timeout[=\s](\d+)')
 #: seconds each one carries.  A literal MAP rather than an import, because none
 #: of the three is importable from ``_orch_helpers``: two are defined
 #: FILE-LOCALLY in the modules that use them --
-#: ``HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s``
+#: ``HEAVY_BARRIER_TEST_TIMEOUT = 540``
 #: (test_merge_queue_concurrent_verify.py) and ``PYTEST_TIMEOUT = 960``
 #: (test_warm_lane_bash_suite.py -- test_pytest_marker_deselection.py's
 #: identical line is inside a string FIXTURE, so it is not a binding, which
@@ -158,9 +158,9 @@ _TIMEOUT_FLAG_RE = re.compile(r'--timeout[=\s](\d+)')
 #:
 #: These are cross-module MIRRORS, and a stale one is NOT self-announcing.  A
 #: mirror that reads too HIGH fails SILENTLY, which is the dangerous
-#: direction: retune ``MERGE_RESULT_TIMEOUT`` to 30 and every
+#: direction: lower ``HEAVY_BARRIER_TEST_TIMEOUT`` by hand to 225 and every
 #: ``timeout(HEAVY_BARRIER_TEST_TIMEOUT)`` site really pins 225s -- squarely
-#: inside the band -- while this map still answers 300 and the sweep stays
+#: inside the band -- while this map still answers 540 and the sweep stays
 #: green.  Matching on the TRAILING name only widens that hole: a new
 #: file-local ``PYTEST_TIMEOUT = 120`` would be waved through at 960.
 #:
@@ -627,10 +627,9 @@ def _assert_enforced_call_names(
 # ---------------------------------------------------------------------------
 
 #: Numbers a sanctioned constant's definition may be written in terms of.  All
-#: four real definitions are literal arithmetic over _orch_helpers' own numeric
-#: globals -- ``5 * PYPROJECT_DEFAULT_TIMEOUT`` and ``5 * MERGE_RESULT_TIMEOUT
-#: + 75``, the latter defined in a test module that imports that name from
-#: there -- so ONE namespace resolves every case with no test module imported.
+#: four real definitions are literals or literal arithmetic over _orch_helpers'
+#: own numeric globals, so ONE namespace resolves every case with no test module
+#: imported.
 #: Importing one for a constant would be a bad trade: test modules run code at
 #: import, and test_warm_lane_bash_suite.py asserts at module scope right below
 #: the PYTEST_TIMEOUT this map mirrors.
@@ -818,11 +817,11 @@ class TestSanctionedNameMirrors:
     marker to a safe number while the real constant sits inside the band, so
     the sweep stays green over a live inversion.
 
-    THE MEASURED CASE this closes:
-    ``HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75``
-    (test_merge_queue_concurrent_verify.py) is not a literal -- retune
-    ``MERGE_RESULT_TIMEOUT`` from 45 to 30 and every site marked with it really
-    pins 225s.  And because :func:`_resolve_seconds` matches on the TRAILING
+    THE CASE this closes:
+    ``HEAVY_BARRIER_TEST_TIMEOUT`` (test_merge_queue_concurrent_verify.py) is
+    defined file-locally -- lower it by hand from 540 to 225 and every site
+    marked with it really pins 225s while this map still answers 540.  And
+    because :func:`_resolve_seconds` matches on the TRAILING
     name only, a NEW file-local ``PYTEST_TIMEOUT = 120`` anywhere under this
     directory would resolve at 960.  Both are caught here, at their source.
     """
@@ -1377,8 +1376,9 @@ class TestDeepLandingSceneBudget:
 
         That same commit made the never-narrow rule explicit in _orch_helpers.py
         and, in the same breath, recorded a LATENT GAP where it had not been
-        applied -- ``HEAVY_BARRIER_TEST_TIMEOUT`` stayed at 300 and now sits
-        below the default it used to equal.  1080 clears 540 today, so this pin
+        applied -- ``HEAVY_BARRIER_TEST_TIMEOUT`` stayed at 300, below the
+        default it used to equal, until task 5572 closed it by re-deriving the
+        constant to 540.  1080 clears 540 today, so this pin
         changes no number; it exists so a future re-derivation cannot land
         somewhere like 360 that satisfies the verify edge while silently
         reproducing that gap.
@@ -1399,7 +1399,8 @@ class TestDeepLandingSceneBudget:
             'the two stopped coinciding when task 5442 raised the ini default '
             'to 540 on 2026-09-17, and clearing only the lower of them '
             'reproduces the HEAVY_BARRIER_TEST_TIMEOUT gap that commit '
-            'recorded. Re-derive upward rather than clamping.'
+            'recorded (closed by task 5572). Re-derive upward rather than '
+            'clamping.'
         )
 
     def test_the_timeout_fits_inside_the_whole_verify_run_budget(self) -> None:
@@ -2453,7 +2454,7 @@ def test_the_band_edges_are_exactly_where_the_design_puts_them() -> None:
         True,  # 150         -- measured, test_offline_lane_integration.py
         True,  # 180         -- measured, the most common in-band value (34 sites)
         True,  # 299         -- last inverting value
-        False,  # 300        -- WHOLE_TREE_SCAN / HEAVY_BARRIER / the CLI budget
+        False,  # 300        -- WHOLE_TREE_SCAN / the CLI budget
         False,  # 360        -- loosens under both
         False,  # 960        -- PYTEST_TIMEOUT (warm-lane bash bucket)
     ]

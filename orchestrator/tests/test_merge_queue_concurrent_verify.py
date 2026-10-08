@@ -267,17 +267,19 @@ async def _stop_worker(
 
 
 # The shared per-test ceiling for every class whose waits outgrow the ambient
-# budget. Derived, not literal, so the marks that share it cannot drift apart:
-# task 3477 found two that had, one so tight it would itself os._exit() the
-# xdist worker (timeout_method = "thread", --max-worker-restart=0) before the
-# loud _await_outcome failure could report. Generalized from
-# CASCADE_TEST_TIMEOUT by task 3492.
+# budget. SHARED, not per-class, so the marks cannot drift apart (task 3477
+# found two that had; task 3492 generalized CASCADE_TEST_TIMEOUT into this).
 #
 # No class's budget is written here or beside its mark: TestTimeoutMarkCoverage
 # recomputes each one from source on every run (_worst_per_method_wait_budget)
 # and checks it against the class's mark, or against the ambient budget for an
 # unmarked class -- so leaving a class unmarked is a checked decision too.
-HEAVY_BARRIER_TEST_TIMEOUT = 5 * MERGE_RESULT_TIMEOUT + 75  # 300s
+#
+# A literal, pinned by TestHeavyBarrierTimeoutConstant against the measured
+# worst case below x UNDER_LOAD_HEADROOM_FACTOR and against
+# PYPROJECT_DEFAULT_TIMEOUT (never-narrow).  Derivation:
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+HEAVY_BARRIER_TEST_TIMEOUT = 540
 
 # Worst per-test wall clock -- setup+call+teardown, what a pytest-timeout mark
 # bounds -- of any HEAVY_BARRIER- or capstone-marked test: task 5572, 2026-10-08,
