@@ -1264,7 +1264,7 @@ async def _build_task_status_probe(
 
     The read runs over :func:`_read_task_statuses_readonly` rather than
     ``SqliteTaskBackend.get_statuses``. The backend's read path opens a
-    READ/WRITE connection first (``_get_connection``: WAL pragmas + schema
+    READ/WRITE connection first (``_get_write_access``: WAL pragmas + schema
     migration) and is never closed, leaking its aiosqlite worker threads — and
     a sweep answering cross-project claims points it at OTHER projects' live
     databases while their orchestrators are running. ``mode=ro`` makes the

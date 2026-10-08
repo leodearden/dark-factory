@@ -13,7 +13,6 @@ included.
 from __future__ import annotations
 
 import collections
-import contextlib
 import json
 import logging
 import time
@@ -23,7 +22,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
-from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
+from shared.async_sqlite_base import (
+    AtomicConnection,
+    CheckpointResult,
+    apply_full_durability_pragmas,
+    connect_daemon,
+)
 
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
 
@@ -328,68 +332,43 @@ class WriteJournal:
 
     def __init__(self, data_dir: Path | str):
         self.data_dir = Path(data_dir)
-        self._db: aiosqlite.Connection | None = None
+        self._access: AtomicConnection | None = None
         self._dropped: collections.Counter[str] = collections.Counter()
 
     async def initialize(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         db_path = self.data_dir / 'write_journal.db'
-        self._db = await connect_daemon(str(db_path))
-        self._db.row_factory = aiosqlite.Row
-        await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
-        await self._db.executescript(SCHEMA_SQL)
-        await self._db.commit()
+        conn = await connect_daemon(str(db_path))
+        conn.row_factory = aiosqlite.Row
+        await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
+        self._access = AtomicConnection(conn)
+        async with self._access.write() as db:
+            await db.executescript(SCHEMA_SQL)
         await self._migrate()
         logger.info(f'Write journal initialized at {db_path}')
 
     async def close(self) -> None:
-        if self._db:
-            with contextlib.suppress(Exception):
-                await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            await self._db.close()
+        if self._access is not None:
+            await self._access.close()
+            self._access = None
 
-    async def checkpoint(self) -> tuple[int, int, int]:
-        """``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``."""
-        if self._db is None:
-            return (-1, -1, -1)
-        cursor = await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-        row = await cursor.fetchone()
-        if row is None:
-            return (-1, -1, -1)
-        return int(row[0]), int(row[1]), int(row[2])
+    async def checkpoint(self) -> CheckpointResult:
+        return await AtomicConnection.checkpoint_or_unavailable(self._access)
 
-    def _require_db(self) -> aiosqlite.Connection:
-        if self._db is None:
+    def _require_access(self) -> AtomicConnection:
+        if self._access is None:
             raise RuntimeError('WriteJournal not initialized — call initialize() first')
-        return self._db
-
-    async def _safe_rollback(self) -> None:
-        """Best-effort rollback — never raises."""
-        if self._db is None:
-            return
-        with contextlib.suppress(Exception):
-            await self._db.rollback()
-
-    @contextlib.asynccontextmanager
-    async def _txn(self):
-        """Explicit transaction wrapper — commit on success, rollback on any exception."""
-        db = self._require_db()
-        try:
-            yield db
-            await db.commit()
-        except BaseException:
-            await self._safe_rollback()
-            raise
+        return self._access
 
     async def _migrate(self) -> None:
         """Add columns introduced after initial schema (idempotent)."""
-        db = self._require_db()
-        async with db.execute('PRAGMA table_info(write_ops)') as cursor:
-            existing = {row[1] for row in await cursor.fetchall()}
-        async with db.execute('PRAGMA table_info(backend_ops)') as cursor:
-            existing_backend_ops = {row[1] for row in await cursor.fetchall()}
+        access = self._require_access()
+        existing = {row[1] for row in await access.read_all('PRAGMA table_info(write_ops)')}
+        existing_backend_ops = {
+            row[1] for row in await access.read_all('PRAGMA table_info(backend_ops)')
+        }
 
-        async with self._txn() as db:
+        async with access.write() as db:
             if 'session_id' not in existing:
                 await db.execute('ALTER TABLE write_ops ADD COLUMN session_id TEXT')
                 logger.info('Migration: added session_id column to write_ops')
@@ -478,7 +457,7 @@ class WriteJournal:
         with ``success=0`` and the refusal in ``error``.
         """
         try:
-            async with self._txn() as db:
+            async with self._require_access().write() as db:
                 await db.execute(
                     """INSERT INTO write_ops
                        (id, causation_id, source, provenance, operation,
@@ -537,7 +516,7 @@ class WriteJournal:
         """Log a Layer 2 backend dispatch. Fire-and-forget — never raises."""
         try:
             summary = _backend_result_summary(result_summary, llm_tokens)
-            async with self._txn() as db:
+            async with self._require_access().write() as db:
                 await db.execute(
                     """INSERT INTO backend_ops
                        (id, write_op_id, causation_id, backend, operation,
@@ -609,7 +588,7 @@ class WriteJournal:
             # not have. `get_referent_findings` orders on the rowid precisely
             # so a shared `created_at` cannot scramble their order.
             created_at = datetime.now(UTC).isoformat()
-            async with self._txn() as db:
+            async with self._require_access().write() as db:
                 await db.executemany(
                     """INSERT INTO referent_findings
                        (id, group_id, episode_uuid, payload, created_at)
@@ -658,7 +637,6 @@ class WriteJournal:
         operator/replay read, not a hot write path, and an unreadable journal is
         an answer the caller has to see rather than an empty list to act on.
         """
-        db = self._require_db()
         clauses: list[str] = []
         params: list = []
         if group_id is not None:
@@ -669,15 +647,12 @@ class WriteJournal:
             params.append(after_seq)
         where = f'WHERE {" AND ".join(clauses)} ' if clauses else ''
         params.append(limit)
-        async with db.execute(
+        rows = await self._require_access().read_all(
             f'SELECT rowid AS seq, * FROM referent_findings {where}'
             'ORDER BY rowid LIMIT ?',
             params,
-        ) as cursor:
-            return [
-                {**dict(row), 'payload': json.loads(row['payload'])}
-                for row in await cursor.fetchall()
-            ]
+        )
+        return [{**dict(row), 'payload': json.loads(row['payload'])} for row in rows]
 
     def journal_drop_stats(self) -> dict:
         """Return ``{'dropped_total': int, 'by_operation': dict}`` — rows LOST.
@@ -711,22 +686,17 @@ class WriteJournal:
 
     async def get_ops_by_causation(self, causation_id: str) -> list[dict]:
         """Return all write_ops and backend_ops for a causation_id."""
-        db = self._require_db()
-        results: list[dict] = []
-
-        async with db.execute(
+        access = self._require_access()
+        write_ops = await access.read_all(
             'SELECT * FROM write_ops WHERE causation_id = ? ORDER BY created_at',
             (causation_id,),
-        ) as cursor:
-            for row in await cursor.fetchall():
-                results.append({'layer': 'write_op', **dict(row)})
-
-        async with db.execute(
+        )
+        backend_ops = await access.read_all(
             'SELECT * FROM backend_ops WHERE causation_id = ? ORDER BY created_at',
             (causation_id,),
-        ) as cursor:
-            for row in await cursor.fetchall():
-                results.append({'layer': 'backend_op', **dict(row)})
+        )
+        results = [{'layer': 'write_op', **dict(row)} for row in write_ops]
+        results += [{'layer': 'backend_op', **dict(row)} for row in backend_ops]
 
         results.sort(key=lambda r: r.get('created_at', ''))
         return results
@@ -735,15 +705,13 @@ class WriteJournal:
         self, since: str, limit: int = 100, kind: str | None = None
     ) -> list[dict]:
         """Return write_ops since a timestamp, optionally filtered by kind."""
-        db = self._require_db()
         if kind:
             sql = 'SELECT * FROM write_ops WHERE created_at >= ? AND kind = ? ORDER BY created_at LIMIT ?'
             params = (since, kind, limit)
         else:
             sql = 'SELECT * FROM write_ops WHERE created_at >= ? ORDER BY created_at LIMIT ?'
             params = (since, limit)
-        async with db.execute(sql, params) as cursor:
-            return [dict(row) for row in await cursor.fetchall()]
+        return [dict(row) for row in await self._require_access().read_all(sql, params)]
 
     async def get_write_op(self, write_op_id: str) -> dict | None:
         """Return a single ``write_ops`` row by id, or ``None`` on a miss.
@@ -756,22 +724,19 @@ class WriteJournal:
         ``backend_ops.operation`` is the literal ``'add_episode'`` for BOTH
         the ``add_episode`` and ``add_memory_graphiti`` paths.
         """
-        db = self._require_db()
-        async with db.execute(
+        row = await self._require_access().read_one(
             'SELECT * FROM write_ops WHERE id = ?',
             (write_op_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
+        )
         return dict(row) if row is not None else None
 
     async def get_backend_ops_for_write_op(self, write_op_id: str) -> list[dict]:
         """Return all backend_ops linked to a write_op."""
-        db = self._require_db()
-        async with db.execute(
+        rows = await self._require_access().read_all(
             'SELECT * FROM backend_ops WHERE write_op_id = ? ORDER BY created_at',
             (write_op_id,),
-        ) as cursor:
-            return [dict(row) for row in await cursor.fetchall()]
+        )
+        return [dict(row) for row in rows]
 
     # ------------------------------------------------------------------
     # idempotent_ops: client-supplied idempotency keys for mutating task
@@ -787,12 +752,10 @@ class WriteJournal:
         journal's never-block discipline.
         """
         try:
-            db = self._require_db()
-            async with db.execute(
+            row = await self._require_access().read_one(
                 'SELECT result FROM idempotent_ops WHERE client_op_id = ?',
                 (client_op_id,),
-            ) as cursor:
-                row = await cursor.fetchone()
+            )
             if row is None:
                 return None
             return json.loads(row[0])
@@ -811,7 +774,7 @@ class WriteJournal:
         but never raises (mirrors ``log_write_op``).
         """
         try:
-            async with self._txn() as db:
+            async with self._require_access().write() as db:
                 await db.execute(
                     """INSERT OR IGNORE INTO idempotent_ops
                        (client_op_id, operation, result, created_at)
@@ -846,7 +809,7 @@ class WriteJournal:
         try:
             cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
             deleted = 0
-            async with self._txn() as db:
+            async with self._require_access().write() as db:
                 cursor = await db.execute(
                     'DELETE FROM idempotent_ops WHERE created_at < ?',
                     (cutoff,),
@@ -895,7 +858,7 @@ class WriteJournal:
         journaling hiccup must not fail an otherwise-good write.
         """
         try:
-            async with self._txn() as db:
+            async with self._require_access().write() as db:
                 await db.execute(
                     """INSERT INTO mem0_intents
                        (id, write_op_id, causation_id, project_id, agent_id,
@@ -927,7 +890,7 @@ class WriteJournal:
         Fire-and-forget — logs loudly on failure but never raises.
         """
         try:
-            async with self._txn() as db:
+            async with self._require_access().write() as db:
                 await db.execute(
                     'UPDATE mem0_intents SET status = ?, reason = ?, resolved_at = ? '
                     'WHERE id = ?',
@@ -988,7 +951,7 @@ class WriteJournal:
         """
         try:
             now = datetime.now(UTC).isoformat()
-            async with self._txn() as db:
+            async with self._require_access().write() as db:
                 await db.execute(
                     """INSERT INTO write_ops
                        (id, source, kind, created_at,
@@ -1020,25 +983,22 @@ class WriteJournal:
         A ``pending`` row is one whose process died between the intent write
         and its terminal stamp — the set the startup reconciler resolves.
         """
-        db = self._require_db()
-        async with db.execute(
+        rows = await self._require_access().read_all(
             "SELECT * FROM mem0_intents WHERE status = 'pending' ORDER BY created_at"
-        ) as cursor:
-            return [dict(row) for row in await cursor.fetchall()]
+        )
+        return [dict(row) for row in rows]
 
     async def get_mem0_intents(self, status: str | None = None) -> list[dict]:
         """Return mem0_intents, optionally filtered by status."""
-        db = self._require_db()
+        access = self._require_access()
         if status is not None:
-            async with db.execute(
+            rows = await access.read_all(
                 'SELECT * FROM mem0_intents WHERE status = ? ORDER BY created_at',
                 (status,),
-            ) as cursor:
-                return [dict(row) for row in await cursor.fetchall()]
-        async with db.execute(
-            'SELECT * FROM mem0_intents ORDER BY created_at'
-        ) as cursor:
-            return [dict(row) for row in await cursor.fetchall()]
+            )
+        else:
+            rows = await access.read_all('SELECT * FROM mem0_intents ORDER BY created_at')
+        return [dict(row) for row in rows]
 
     async def prune_mem0_intents(
         self,
@@ -1071,7 +1031,7 @@ class WriteJournal:
             cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
             placeholders = ','.join('?' for _ in statuses)
             deleted = 0
-            async with self._txn() as db:
+            async with self._require_access().write() as db:
                 cursor = await db.execute(
                     f'DELETE FROM mem0_intents '
                     f'WHERE status IN ({placeholders}) '
@@ -1138,9 +1098,9 @@ class WriteJournal:
         mode: a long write-lock on a serving instance SILENTLY DROPS journal rows,
         because ``busy_timeout`` is 5000 ms and ``log_write_op`` swallows its own
         errors. A multi-minute startup DELETE would therefore corrupt the very
-        telemetry it is pruning. Each batch commits in its own transaction so the
-        lock is released between batches (chunked-delete precedent:
-        ``services/durable_queue.py::delete_dead``), and the sweep stops on
+        telemetry it is pruning. Each batch is its own ``write()`` unit, so both
+        the per-connection lock and SQLite's write lock are released between
+        batches and serving writes interleave, and the sweep stops on
         whichever bound comes first. ``max_rows`` is only a PROXY for the risk;
         ``max_seconds`` bounds it directly, because rows-per-second is not
         knowable in advance — it depends on page-cache warmth and on six index
@@ -1222,7 +1182,7 @@ class WriteJournal:
                         halted = 'row budget'
                         backlog.append(label)
                         break
-                    async with self._txn() as db:
+                    async with self._require_access().write() as db:
                         cursor = await db.execute(
                             f'DELETE FROM write_ops WHERE id IN '
                             f'(SELECT id FROM write_ops WHERE {predicate} LIMIT ?)',
@@ -1278,37 +1238,35 @@ class WriteJournal:
 
         Returns {reads, writes, by_operation, by_agent}.
         """
-        db = self._require_db()
+        access = self._require_access()
         where = 'WHERE created_at >= ?'
         params: list = [since]
         if project_id:
             where += ' AND project_id = ?'
             params.append(project_id)
 
-        # Totals by kind
-        async with db.execute(
-            f'SELECT kind, COUNT(*) FROM write_ops {where} GROUP BY kind', params
-        ) as cursor:
-            kind_counts = {row[0]: row[1] for row in await cursor.fetchall()}
-
-        # By operation
-        async with db.execute(
-            f'SELECT operation, COUNT(*) FROM write_ops {where} GROUP BY operation',
-            params,
-        ) as cursor:
-            by_operation = {row[0]: row[1] for row in await cursor.fetchall()}
-
-        # By agent (read/write breakdown)
-        async with db.execute(
+        kind_counts = {
+            row[0]: row[1]
+            for row in await access.read_all(
+                f'SELECT kind, COUNT(*) FROM write_ops {where} GROUP BY kind', params
+            )
+        }
+        by_operation = {
+            row[0]: row[1]
+            for row in await access.read_all(
+                f'SELECT operation, COUNT(*) FROM write_ops {where} GROUP BY operation',
+                params,
+            )
+        }
+        by_agent: dict[str, dict[str, int]] = {}
+        for row in await access.read_all(
             f'SELECT agent_id, kind, COUNT(*) FROM write_ops {where} GROUP BY agent_id, kind',
             params,
-        ) as cursor:
-            by_agent: dict[str, dict[str, int]] = {}
-            for row in await cursor.fetchall():
-                aid = row[0] or '_unknown'
-                if aid not in by_agent:
-                    by_agent[aid] = {'read': 0, 'write': 0}
-                by_agent[aid][row[1]] = row[2]
+        ):
+            aid = row[0] or '_unknown'
+            if aid not in by_agent:
+                by_agent[aid] = {'read': 0, 'write': 0}
+            by_agent[aid][row[1]] = row[2]
 
         return {
             'reads': kind_counts.get('read', 0),
@@ -1321,7 +1279,6 @@ class WriteJournal:
         self, agent_id: str, since: str | None = None, limit: int = 100
     ) -> list[dict]:
         """Return ops for a specific agent, most recent first."""
-        db = self._require_db()
         if since:
             sql = (
                 'SELECT * FROM write_ops WHERE agent_id = ? AND created_at >= ? '
@@ -1334,5 +1291,4 @@ class WriteJournal:
                 'ORDER BY created_at DESC LIMIT ?'
             )
             params = (agent_id, limit)
-        async with db.execute(sql, params) as cursor:
-            return [dict(row) for row in await cursor.fetchall()]
+        return [dict(row) for row in await self._require_access().read_all(sql, params)]

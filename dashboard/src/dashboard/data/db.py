@@ -117,7 +117,8 @@ class DbPool:
         self._closing: dict[aiosqlite.Connection, asyncio.Future[None]] = {}
         # Per-path open locks — prevents duplicate opens for the same path while
         # allowing disjoint paths to open concurrently (no serialisation between
-        # unrelated paths).  Mirrors SqliteTaskBackend._get_connection convention.
+        # unrelated paths).  Mirrors the per-project connect-lock convention of
+        # fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend._get_write_access.
         # Growth is bounded; see class docstring for the structural argument.
         self._open_locks: dict[Path, asyncio.Lock] = {}
         self._open_locks_lock: asyncio.Lock = asyncio.Lock()
@@ -157,7 +158,7 @@ class DbPool:
             #     resumed get() would install a fresh connection into an already-
             #     drained pool, leaking the aiosqlite worker thread indefinitely.
             #     DbPool closes that window here; note the mirrored
-            #     SqliteTaskBackend._get_connection convention has the same window
+            #     SqliteTaskBackend._get_write_access convention has the same window
             #     (not closed there — callers must not race close and get).
             if self._closed:
                 return None

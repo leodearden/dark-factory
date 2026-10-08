@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 from _fm_helpers import poll_until, poll_until_stable, pydantic_spec
+from shared.async_sqlite_base import CheckpointResult
 from test_ticket_janitor import _make_orchestrator_layout, _project_id_for
 
 from fused_memory.config.schema import FusedMemoryConfig
@@ -1032,7 +1033,7 @@ async def test_close_drains_worker_and_closes_store(
 
     After close():
     - The worker task is done (cancelled or finished).
-    - ticket_store._db is None (closed).
+    - The ticket store is closed: its checkpoint answers the not-open sentinel.
     - A subsequent submit_task raises RuntimeError (interceptor is closed).
     """
     from fused_memory.middleware.ticket_store import TicketStore
@@ -1074,7 +1075,7 @@ async def test_close_drains_worker_and_closes_store(
         'All worker tasks should be done after close()'
     )
     # Ticket store should be closed.
-    assert store._db is None, 'TicketStore._db should be None after close()'
+    assert await store.checkpoint() == CheckpointResult.unavailable(), 'TicketStore should be closed after close()'
 
     # Subsequent submit_task should raise or return an error (closed guard).
     result = await ti.submit_task('/project', title='AfterClose')
@@ -1388,7 +1389,7 @@ async def test_resolve_ticket_returns_server_closed_when_store_closes_post_wake(
     2. Monkeypatch ``ticket_store.get`` with a ``racing_get`` that:
        - Call 1: returns the real pending row.
        - Call 2 (post-wake re-read): raises RuntimeError, as would happen if
-         ``TicketStore.close()`` set ``_db = None`` between the signal and the
+         ``TicketStore.close()`` set ``_access = None`` between the signal and the
          re-read.
     3. Schedule ``interceptor._signal_ticket_event(ticket_id)`` to fire after a
        short delay so the resolve_ticket waiter wakes and enters the re-read
@@ -1450,7 +1451,7 @@ async def test_resolve_ticket_returns_server_closed_when_store_closed_before_ini
 ):
     """Regression: if TicketStore.close() has already run when resolve_ticket
     makes its initial ``ticket_store.get()`` call, the RuntimeError from
-    ``_require_db()`` must be caught and the server_closed sentinel returned —
+    ``_require_access()`` must be caught and the server_closed sentinel returned —
     not a bare RuntimeError escaping the coroutine.
 
     Complements ``test_resolve_ticket_returns_server_closed_when_store_closes_post_wake``

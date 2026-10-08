@@ -1851,8 +1851,7 @@ async def _setup_curator_usage_gate(
 
     **Cancellation hardening:** each cleanup await is wrapped in
     ``asyncio.shield(...)`` and guarded by ``except BaseException:`` +
-    log-and-swallow.  This mirrors the pattern at
-    ``SqliteTaskBackend._txn`` (``sqlite_task_backend.py:414-417``):
+    log-and-swallow:
     shielding prevents an external cancel from tearing the close mid-flush;
     catching ``BaseException`` ensures a synchronous ``CancelledError``
     originating inside the awaited coroutine cannot mask the original
