@@ -700,7 +700,9 @@ async def test_escalation_server_receives_a_reconciliation_store_identity(
     assert identity.kind == 'reconciliation'
     assert identity.project_id is None
     assert identity.project_root is None
-    assert identity.queue_dir == harness._escalation_queue.queue_dir.resolve()
+    queue = harness._escalation_queue
+    assert queue is not None
+    assert identity.queue_dir == queue.queue_dir.resolve()
 
 
 def _mock_stage_run(stage, items_flagged=None, before_return=None, capture_call_args=None):
