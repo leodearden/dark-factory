@@ -303,12 +303,32 @@ class TestStaleGateCitationError:
         assert err is not None
         assert '3660' in err['error']
 
-    def test_cross_project_dependency_spelling_is_skipped_not_raised(self):
-        # 'reify:6508' is the cross-project external-dep spelling; the numeric
-        # entries alongside it must still be honoured.
+    def test_cross_project_gate_in_external_deps_is_live(self):
+        # Cross-project gates live in metadata.external_deps, not dependencies.
         assert stale_gate_citation_guard.stale_gate_citation_error(
-            TRANSITIVE, AGENT_ID, live_dependencies=[3659, 'reify:6508', 4856],
+            'pending external gates: 6508 (reify) landing',
+            AGENT_ID,
+            live_dependencies=[],
+            metadata_payloads=({'external_deps': ['reify:6508']},),
         ) is None
+
+    def test_external_deps_in_a_json_metadata_payload_are_read(self):
+        assert stale_gate_citation_guard.stale_gate_citation_error(
+            'external deps 6508 landing',
+            AGENT_ID,
+            live_dependencies=[],
+            metadata_payloads=(None, '{"external_deps": ["reify:6508"]}'),
+        ) is None
+
+    def test_external_deps_do_not_excuse_an_unrelated_stale_id(self):
+        err = stale_gate_citation_guard.stale_gate_citation_error(
+            'external deps 6508/3660 landing',
+            AGENT_ID,
+            live_dependencies=[],
+            metadata_payloads=({'external_deps': ['reify:6508', 'garbage']},),
+        )
+        assert err is not None
+        assert '3660' in err['error']
 
     def test_empty_dependencies_still_enforces(self):
         # An empty array is interpretable, not missing: citing pending gates
@@ -469,6 +489,26 @@ class TestUpdateTaskBoundary:
 
         assert result.get('error_type') == 'ReconStaleGateCitationRejected'
         taskmaster.update_task.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cross_project_gate_on_the_live_row_is_written(
+        self, interceptor, taskmaster,
+    ):
+        taskmaster.get_task = AsyncMock(
+            return_value={
+                'id': '3708', 'status': 'pending', 'title': 'γ',
+                'dependencies': [],
+                'metadata': {'external_deps': ['reify:6508']},
+            },
+        )
+
+        result = await interceptor.update_task(
+            '3708', '/project', details='pending external gates: 6508 (reify) landing',
+            append=True, agent_id=AGENT_ID,
+        )
+
+        assert result.get('error_type') is None
+        taskmaster.update_task.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_row_without_dependencies_fails_open(self, interceptor, taskmaster):

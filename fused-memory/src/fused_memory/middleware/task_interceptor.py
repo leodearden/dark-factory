@@ -5595,6 +5595,9 @@ class TaskInterceptor:
                         incoming_dependencies if incoming_dependencies is not None
                         else (before or {}).get('dependencies')
                     ),
+                    metadata_payloads=(
+                        (before or {}).get('metadata'), kwargs.get('metadata'),
+                    ),
                 ):
                     return err
 

@@ -97,8 +97,12 @@ citations, because the corpus spells them as BARE id lists
 
 from __future__ import annotations
 
+import json
 import re
+from collections.abc import Iterable
 from typing import Any
+
+from shared.task_metadata import ExternalDep
 
 from fused_memory.reconciliation.task_filter import TERMINAL_OUTCOME_RE
 
@@ -232,8 +236,8 @@ def _normalise_dependency_ids(value: Any) -> set[int] | None:
     ``TaskBackend.update_task(..., dependencies: list[str] | None)`` takes
     ``list[str]`` on WRITE, and the interceptor prefers the write kwarg when the
     same call rewrites the array. Non-coercible entries are skipped rather than
-    raising, which is what admits the cross-project ``'reify:6508'`` spelling
-    alongside ordinary ids.
+    raising. Cross-project gates never appear here: they live in
+    ``metadata.external_deps`` and are read by ``_external_dep_task_ids``.
     """
     if not isinstance(value, (list, tuple)):
         return None
@@ -248,11 +252,43 @@ def _normalise_dependency_ids(value: Any) -> set[int] | None:
     return ids
 
 
+def _external_dep_task_ids(metadata_payloads: Iterable[Any]) -> set[int]:
+    """Task-id halves of every ``metadata.external_deps`` entry in the payloads.
+
+    Cross-project gates (``"project_id:task_id"``, docs/task-authoring.md §3.2)
+    are stored in ``metadata.external_deps``, not in ``dependencies``, yet are
+    just as live. Payloads may be a dict or a JSON string; anything unreadable
+    contributes nothing. Ids are unioned across payloads, so a collision with a
+    local id only widens the live set — the fail-open direction.
+    """
+    ids: set[int] = set()
+    for payload in metadata_payloads:
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError:
+                continue
+        if not isinstance(payload, dict):
+            continue
+        entries = payload.get('external_deps')
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, str):
+                continue
+            try:
+                ids.add(int(ExternalDep.parse(entry).task_id))
+            except ValueError:
+                continue
+    return ids
+
+
 def stale_gate_citation_error(
     details: Any,
     agent_id: str | None,
     *,
     live_dependencies: Any,
+    metadata_payloads: Iterable[Any] = (),
 ) -> dict[str, Any] | None:
     """Reject a recon-stage ``details`` write that cites a pending external gate
     absent from the task's live ``dependencies`` array.
@@ -271,6 +307,9 @@ def stale_gate_citation_error(
             safe to unit-test and safe to call from any boundary.
         live_dependencies: The dependency array the write LEAVES BEHIND — the
             incoming kwarg when the same call rewrites it, else the live row's.
+        metadata_payloads: The live row's ``metadata`` and any incoming
+            ``metadata`` write. Their ``external_deps`` task ids count as live
+            gates alongside ``live_dependencies``.
     """
     if not (isinstance(agent_id, str) and agent_id.startswith('recon-stage-')):
         return None
@@ -279,6 +318,7 @@ def stale_gate_citation_error(
     live = _normalise_dependency_ids(live_dependencies)
     if live is None:
         return None
+    live |= _external_dep_task_ids(metadata_payloads)
 
     stale = sorted(find_gate_citation_ids(details) - live)
     if not stale:
