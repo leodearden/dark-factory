@@ -4004,14 +4004,17 @@ class TaskKnowledgeSync(BaseStage):
         # value so downstream consumers never need a .get(..., 0) fallback.
         #
         # Retirement here is COMPOSITE, not age-only (task 4375): a marker is
-        # deleted only when it is past the 14-day cutoff AND is not a
-        # protected cycle_summary mirror AND its kind is not in
-        # PROTECTED_AUDIT_KINDS AND its task_id is confirmed terminal in the
-        # list hoisted above. The terminal gate is the primary arm — it was
-        # added because 40 kind='cadence_check' audit records in
-        # autopilot_video were destroyed by the age-only sweep, all citing a
-        # task that is merely 'deferred'. The two sibling Mem0 sweeps above
-        # are deliberately age-only and are NOT gated.
+        # deleted only when it is past the _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS
+        # cutoff (7 days since task 4374, interim mitigation per esc-3796-1;
+        # was 14) AND is not a protected cycle_summary mirror AND its kind is
+        # not in PROTECTED_AUDIT_KINDS AND either its task_id is confirmed
+        # terminal in the list hoisted above or, citing NO task, it is older
+        # than _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS and declares no kind or
+        # FLAG_FOR_STAGE2_MARKER_KIND (task 4995). The terminal gate is the
+        # primary arm — it was added because 40 kind='cadence_check' audit
+        # records in autopilot_video were destroyed by the age-only sweep, all
+        # citing a task that is merely 'deferred'. The two sibling Mem0 sweeps
+        # above are deliberately age-only and are NOT gated.
         report.stats['stale_mem0_flag_for_stage2_markers_gc_swept'] = (
             await _sweep_stale_mem0_flag_for_stage2_markers(
                 self.memory, self.project_id, run_id,
