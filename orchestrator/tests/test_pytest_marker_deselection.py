@@ -2069,25 +2069,29 @@ class TestDeriveModuleRunsWidensOnFullDeselection:
 class TestProbeConsultsTheCommandsEffectiveRootdir:
     """WHERE the probe looks for ``addopts``, and which commands it refuses outright.
 
-    pytest reads ``addopts`` from its ROOTDIR, which follows the command's
-    effective cwd — NOT from ``mc.prefix``.  The two come apart in this repo:
-    ``scripts`` and ``tests/scripts`` both run ``uv run --project shared pytest
-    tests/scripts/ ...`` from the REPO ROOT, so ``<prefix>/pyproject.toml``
-    would be a config pytest never applies.
+    pytest reads ``addopts`` from the config its own walk finds first, starting
+    at the command's targets (or its effective cwd) — NOT from ``mc.prefix``.
+    The two come apart in this repo: ``scripts`` and ``tests/scripts`` both run
+    ``uv run --project shared pytest tests/scripts/ ...`` from the REPO ROOT, so
+    ``<prefix>/pyproject.toml`` would be a config pytest never applies.
 
-    Every reader below serves a DESELECTING pyproject at EVERY ``*pyproject.toml``
-    path it is asked for, so a refusal test can never pass vacuously through a
-    missing file: if the guard under test stopped firing, the widening would.
+    The refusal tests' reader serves a DESELECTING pyproject at EVERY
+    ``*pyproject.toml`` path it is asked for, so a refusal can never pass
+    vacuously through a missing file: if the guard under test stopped firing,
+    the widening would. The WHERE tests serve configs only where their scenario
+    places them, since no real tree has one in every directory.
     """
 
     #: A marked target under every prefix these tests use.
     _MARKED = 'import pytest\npytestmark = pytest.mark.slow\n'
 
     @classmethod
-    def _reader_serving_every_pyproject(cls, reads: list[str]):
-        """A recording reader for which EVERY pyproject path deselects ``slow``."""
+    def _reader_serving_every_pyproject(cls, reads: list[str], absent: frozenset[str] = frozenset()):
+        """A recording reader for which every pyproject path but *absent* deselects ``slow``."""
         def read(path: str) -> str | None:
             reads.append(path)
+            if path in absent:
+                return None
             if path.endswith('pyproject.toml'):
                 return _DESELECTING_PYPROJECT
             return cls._MARKED if path.endswith('.py') else None
@@ -2120,7 +2124,9 @@ class TestProbeConsultsTheCommandsEffectiveRootdir:
     def test_directory_flag_selects_that_directorys_config(self):
         """``uv run --directory X pytest`` roots at X — the orchestrator/shared shape."""
         reads: list[str] = []
-        read = self._reader_serving_every_pyproject(reads)
+        read = self._reader_serving_every_pyproject(
+            reads, absent=frozenset({'mod/tests/pyproject.toml'}),
+        )
         plan = derive_verify_plan(
             ['mod/tests/test_a.py'], [_mc('mod')], None, read, role='task',
         )
@@ -2288,6 +2294,17 @@ _CLASS_MARKED_OVERRIDES: dict[str, str | None] = dict.fromkeys(
 )
 
 
+#: ``_permissive_reader`` overrides that leave a scenario's intermediate
+#: directories config-free, as a real tree's are: pytest's walk would otherwise
+#: stop at the first ``*/pyproject.toml`` the reader invents.
+_NO_CONFIG_UNDER_MOD: dict[str, str | None] = {
+    'mod/tests/pyproject.toml': None,
+    'mod/pyproject.toml': None,
+}
+_NO_CONFIG_UNDER_SUB_TESTS: dict[str, str | None] = {'sub/tests/pyproject.toml': None}
+_NO_CONFIG_UNDER_TESTS: dict[str, str | None] = {'tests/pyproject.toml': None}
+
+
 def _permissive_reader(
     reads: list[str],
     overrides: dict[str, str | None] | None = None,
@@ -2333,8 +2350,8 @@ class TestDeselectingExpressionForCommand:
     behaviour" — in every other case.
 
     *targets* are worktree-ROOT-relative (the reader's frame), while the
-    command's own targets may be cwd-relative; only the CONFIG path follows the
-    command's ``cwd_rel``.
+    command's own targets may be cwd-relative; the CONFIG is found by pytest's
+    own walk from the command's targets (``verify_plan.pytest_config_path_for_command``).
     """
 
     def test_marked_target_under_a_deselecting_root_returns_the_expression(self):
@@ -2343,31 +2360,44 @@ class TestDeselectingExpressionForCommand:
         assert deselecting_expression_for_command(
             'pytest mod/tests/test_a.py',
             ['mod/tests/test_a.py'],
-            _permissive_reader(reads),
+            _permissive_reader(reads, _NO_CONFIG_UNDER_MOD),
         ) == 'not slow'
 
-    def test_a_command_without_a_cwd_reads_the_repo_root_config(self):
-        """WHERE: no ``cd``/``--directory`` means pytest's rootdir IS the repo root."""
+    def test_a_command_without_a_cwd_reads_the_root_config_when_none_is_nearer(self):
+        """WHERE: no ``cd``/``--directory`` and no nearer config, so pytest reads the root's."""
         reads: list[str] = []
         deselecting_expression_for_command(
-            'pytest mod/tests/test_a.py', ['mod/tests/test_a.py'], _permissive_reader(reads),
+            'pytest mod/tests/test_a.py', ['mod/tests/test_a.py'],
+            _permissive_reader(reads, _NO_CONFIG_UNDER_MOD),
         )
         assert 'pyproject.toml' in reads
-        assert 'mod/pyproject.toml' not in reads
 
     def test_a_cd_command_reads_that_subprojects_config_not_the_root(self):
-        """The anti-over-fire pin: the probe follows the command's effective rootdir.
+        """The anti-over-fire pin: the probe follows the config pytest finds first.
 
-        ``cd sub && uv run pytest ...`` roots at ``sub``, so a root-only
-        ``addopts`` must never be what proves the deselection.
+        ``cd sub && uv run pytest ...`` roots at ``sub``'s config, so a
+        root-only ``addopts`` must never be what proves the deselection.
         """
         reads: list[str] = []
-        read = _permissive_reader(reads)
+        read = _permissive_reader(reads, _NO_CONFIG_UNDER_SUB_TESTS)
         assert deselecting_expression_for_command(
             'cd sub && uv run pytest tests/test_a.py', ['sub/tests/test_a.py'], read,
         ) == 'not slow'
         assert 'sub/pyproject.toml' in reads
         assert 'pyproject.toml' not in reads, 'root config is not this command\'s rootdir'
+
+    def test_a_pytest_ini_in_the_cwd_refuses_rather_than_reading_a_pyproject(self):
+        """pytest reads ``pytest.ini`` there, whose addopts this probe cannot read.
+
+        The old cwd rule read ``sub/pyproject.toml`` — a file pytest ignores
+        beside a ``pytest.ini`` — and could widen on it: an over-fire.
+        """
+        reads: list[str] = []
+        read = _permissive_reader(reads, {**_NO_CONFIG_UNDER_SUB_TESTS, 'sub/pytest.ini': '[pytest]\n'})
+        assert deselecting_expression_for_command(
+            'cd sub && uv run pytest tests/test_a.py', ['sub/tests/test_a.py'], read,
+        ) is None
+        assert 'sub/pyproject.toml' not in reads
 
     #: ``npm test`` and ``./scripts/test.sh`` both parse OPAQUE; a pyproject's
     #: addopts describe a suite neither command ever invokes, so consulting them
@@ -2453,7 +2483,7 @@ class TestDeselectingExpressionForCommand:
     def test_a_cd_command_with_a_class_marked_target_still_reads_its_own_rootdir(self):
         """WHERE is decided before WHETHER: the new tier does not move the ini lookup."""
         reads: list[str] = []
-        read = _permissive_reader(reads, _CLASS_MARKED_OVERRIDES)
+        read = _permissive_reader(reads, {**_CLASS_MARKED_OVERRIDES, **_NO_CONFIG_UNDER_SUB_TESTS})
         assert deselecting_expression_for_command(
             'cd sub && uv run pytest tests/test_a.py', ['sub/tests/test_a.py'], read,
         ) == 'not slow'
@@ -2565,7 +2595,8 @@ class TestWidenFallbackRefuses:
     def test_a_rootdir_declaring_no_marker_expression_is_refused(self):
         """No ``-m`` anywhere means nothing was deselected — today's FILE_SCOPED run stands."""
         self._refuses(
-            'pytest mod/tests/test_a.py', {'pyproject.toml': _PLAIN_PYPROJECT},
+            'pytest mod/tests/test_a.py',
+            {**_NO_CONFIG_UNDER_MOD, 'pyproject.toml': _PLAIN_PYPROJECT},
         )
 
     # -- ARM 2's guards are unmoved by the class-level tier --------------------
@@ -2611,6 +2642,7 @@ class TestWidenFallbackWidensOnFullDeselection:
         reads: list[str] = []
         fallback = _fallback_mc('pytest tests/test_smoke.py')
         read = _permissive_reader(reads, {
+            **_NO_CONFIG_UNDER_TESTS,
             'pyproject.toml': _pyproject('"-m \'not smoke\'"'),
             'tests/test_smoke.py': 'import pytest\npytestmark = pytest.mark.smoke\n',
         })
@@ -2627,6 +2659,7 @@ class TestWidenFallbackWidensOnFullDeselection:
         """Mirrors arm 4a's wording, so ONE operator-facing phrase covers the class."""
         reads: list[str] = []
         read = _permissive_reader(reads, {
+            **_NO_CONFIG_UNDER_TESTS,
             'pyproject.toml': _pyproject('"-m \'not smoke\'"'),
             'tests/test_smoke.py': 'import pytest\npytestmark = pytest.mark.smoke\n',
         })
@@ -2683,6 +2716,7 @@ class TestWidenFallbackWidensOnFullDeselection:
         """
         reads: list[str] = []
         read = _permissive_reader(reads, {
+            **_NO_CONFIG_UNDER_SUB_TESTS,
             # ONLY the subproject deselects; the root declares no -m at all.
             'pyproject.toml': _PLAIN_PYPROJECT,
             'sub/tests/test_smoke.py': 'import pytest\npytestmark = pytest.mark.slow\n',
@@ -2699,12 +2733,13 @@ class TestWidenFallbackWidensOnFullDeselection:
     def test_a_root_only_addopts_never_widens_a_subproject_command(self):
         """THE anti-over-fire pin: the config a ``cd sub`` command's rootdir may not see.
 
-        pytest would walk UP to the repo root when ``sub/pyproject.toml``
-        declares no ini_options — a walk this probe deliberately does not model.
-        Refusing is an UNDER-fire, the one direction task 3494 permits.
+        ``sub/pyproject.toml`` declares pytest config (with no ``-m``), so
+        pytest's walk stops there and never reaches the root's deselecting
+        addopts; the probe follows the same walk and refuses.
         """
         reads: list[str] = []
         read = _permissive_reader(reads, {
+            **_NO_CONFIG_UNDER_SUB_TESTS,
             'sub/pyproject.toml': _PLAIN_PYPROJECT,
             'sub/tests/test_smoke.py': 'import pytest\npytestmark = pytest.mark.slow\n',
         })

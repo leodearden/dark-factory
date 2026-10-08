@@ -2824,3 +2824,153 @@ class TestVersionPinSurvivesPrefixScoping:
         """
         cmd = _scope_prefix_to_keyword('npx pyright-foo', 'pyright', [_ESC_3805_FILE])
         assert render(cmd) == f'npx pyright {_ESC_3805_FILE}'
+
+
+_ROOT_PYTEST_PYPROJECT = (
+    '[tool.pytest.ini_options]\n'
+    'addopts = "--import-mode=importlib -m \'not smoke and not integration and not warm_lane_bash\'"\n'
+)
+_ORCH_PYTEST_PYPROJECT = (
+    '[tool.pytest.ini_options]\n'
+    'addopts = "-n auto --dist loadgroup --max-worker-restart=0 -m \'not warm_lane_bash\'"\n'
+)
+_COCKPIT_PYTEST_PYPROJECT = (
+    '[tool.pytest.ini_options]\naddopts = "-n auto --dist loadgroup -m \'not smoke\'"\n'
+)
+
+#: A repo-shaped tree: the root and two subprojects each carry pytest config.
+_CONFIG_TREE = {
+    'pyproject.toml': _ROOT_PYTEST_PYPROJECT,
+    'orchestrator/pyproject.toml': _ORCH_PYTEST_PYPROJECT,
+    'cockpit/pyproject.toml': _COCKPIT_PYTEST_PYPROJECT,
+}
+
+
+class _RecordingTreeReader:
+    """A dict-backed ``worktree_reader`` that records every path it is asked for."""
+
+    def __init__(self, contents: dict[str, str]) -> None:
+        self.contents = contents
+        self.paths: list[str] = []
+
+    def __call__(self, path: str) -> str | None:
+        self.paths.append(path)
+        return self.contents.get(path)
+
+
+class TestPytestConfigPathForCommand:
+    """``pytest_config_path_for_command(test_command, worktree_reader)``.
+
+    Maps the command ACTUALLY being run to the config pytest reads for it:
+    pytest's own walk from the common ancestor of its positional targets (or
+    its cwd when it names none), bounded at the reader's root. Correct for
+    scoped, cwd-stripped commands as well as the module's unscoped one.
+    """
+
+    @staticmethod
+    def _resolve(command: str | None, contents: dict[str, str] = _CONFIG_TREE):
+        reader = _RecordingTreeReader(contents)
+        return verify_plan_module.pytest_config_path_for_command(command, reader), reader
+
+    @pytest.mark.parametrize(
+        ('command', 'expected'),
+        [
+            pytest.param(
+                'uv run --directory orchestrator pytest tests/ --tb=short -q --timeout=300',
+                'orchestrator/pyproject.toml',
+                id='module-directory',
+            ),
+            pytest.param(
+                'uv run --project shared pytest tests/scripts/ scripts/tests/ --tb=short -q '
+                '--import-mode=importlib -n auto --dist loadgroup',
+                'pyproject.toml',
+                id='scripts-from-root',
+            ),
+            pytest.param(
+                'uv run --project orchestrator pytest '
+                'orchestrator/tests/test_x.py::TestA::test_b --tb=short -q',
+                'orchestrator/pyproject.toml',
+                id='scoped-cwd-stripped',
+            ),
+            pytest.param('cd cockpit && uv run pytest tests/', 'cockpit/pyproject.toml', id='cd'),
+            pytest.param('pytest -m warm_lane_bash', 'pyproject.toml', id='no-targets'),
+            pytest.param(
+                'cd orchestrator && pytest -m warm_lane_bash',
+                'orchestrator/pyproject.toml',
+                id='no-targets-under-cd',
+            ),
+            pytest.param(
+                'pytest orchestrator/tests/test_a.py cockpit/tests/test_b.py',
+                'pyproject.toml',
+                id='two-subtrees',
+            ),
+        ],
+    )
+    def test_real_command_shapes_resolve_to_the_config_pytest_reads(self, command, expected):
+        assert self._resolve(command)[0] == expected
+
+    def test_a_file_target_starts_the_walk_at_its_parent(self):
+        path, reader = self._resolve('pytest orchestrator/tests/test_x.py')
+        assert path == 'orchestrator/pyproject.toml'
+        assert not any(p.startswith('orchestrator/tests/test_x.py/') for p in reader.paths)
+
+    @pytest.mark.parametrize(
+        'command',
+        [
+            pytest.param(None, id='none'),
+            pytest.param('', id='empty'),
+            pytest.param('cargo test --workspace', id='cargo'),
+            pytest.param('npm test', id='npm'),
+            pytest.param('cd orchestrator && pytest tests/ && cd ../cockpit && pytest tests/', id='raw-chain'),
+            pytest.param('pytest -c x.ini tests/', id='dash-c'),
+            pytest.param('pytest --config-file x.ini tests/', id='config-file'),
+            pytest.param('pytest --config-file=x.ini tests/', id='config-file-attached'),
+            pytest.param('pytest /abs/tests/', id='absolute-target'),
+            pytest.param('pytest ../x/tests/', id='escaping-target'),
+            pytest.param('cd orchestrator && pytest ../../x/', id='escaping-under-cd'),
+        ],
+    )
+    def test_refused_commands_resolve_to_none_without_a_read(self, command):
+        path, reader = self._resolve(command)
+        assert path is None
+        assert reader.paths == []
+
+
+class TestGoverningAddopts:
+    """``governing_addopts(test_command, worktree_reader)``: the RAW addopts pytest will apply.
+
+    xdist tokens included — stripping them is ``verify_cmd.serial_pytest``'s
+    job, beside the ``-p no:xdist`` that requires it. Every refusal is ``()``,
+    which renders the historical blank ``-o addopts=``.
+    """
+
+    def test_the_resolved_pyprojects_raw_addopts_are_returned(self):
+        assert verify_plan_module.governing_addopts(
+            'uv run --project orchestrator pytest orchestrator/tests/test_x.py',
+            _RecordingTreeReader(_CONFIG_TREE),
+        ) == ('-n', 'auto', '--dist', 'loadgroup', '--max-worker-restart=0', '-m', 'not warm_lane_bash')
+
+    @pytest.mark.parametrize(
+        ('command', 'contents'),
+        [
+            pytest.param('pytest tests/', {}, id='nothing-resolves'),
+            pytest.param(
+                'cd sub && pytest tests/',
+                {'sub/pytest.ini': '[pytest]\naddopts = -q\n', 'pyproject.toml': _ROOT_PYTEST_PYPROJECT},
+                id='non-pyproject-config',
+            ),
+            pytest.param(
+                'cd sub && pytest tests/',
+                {'sub/pyproject.toml': '[tool.pytest.ini_options]\ntimeout = 300\n'},
+                id='no-addopts-key',
+            ),
+            pytest.param(
+                'cd sub && pytest tests/',
+                {'sub/pyproject.toml': '[tool.pytest]\naddopts = ["-q"]\n'},
+                id='toml-mode',
+            ),
+            pytest.param('cargo test --workspace', _CONFIG_TREE, id='refused-command'),
+        ],
+    )
+    def test_every_refusal_is_the_empty_tuple(self, command, contents):
+        assert verify_plan_module.governing_addopts(command, _RecordingTreeReader(contents)) == ()
