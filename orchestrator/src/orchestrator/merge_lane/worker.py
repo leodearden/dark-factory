@@ -18914,13 +18914,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # argument -- the dead-verify busy-loop cap-out is a
                         # terminal 'blocked' for this task_id.
                         self._chain_error_suppressed.discard(req.task_id)
-                        err_outcome = MergeOutcome(
-                            'blocked',
-                            reason=(
-                                'repeated dead/hung in-flight verify (no '
-                                f'progress for budget) x{_dead_abort_n}'
-                            ),
-                        )
+                        err_outcome = MergeOutcome('blocked', reason=_abort.terminal_reason())
                         if not req.result.done():
                             req.result.set_result(err_outcome)
                         return InflightVerifyResult(outcome=err_outcome, merge_wt=None)

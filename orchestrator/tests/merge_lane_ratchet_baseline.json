@@ -123,7 +123,7 @@
     "orchestrator/src/orchestrator/merge_lane/skew_tripwire.py": {"cognitive": 31, "function_local_imports": 1, "lines": 422, "prose_lines": 197, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/speculation_controller.py": {"cognitive": 21, "function_local_imports": 0, "lines": 580, "prose_lines": 400, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_lane/types.py": {"cognitive": 69, "function_local_imports": 0, "lines": 1875, "prose_lines": 978, "reexport_names": 0},
-    "orchestrator/src/orchestrator/merge_lane/worker.py": {"cognitive": 2193, "function_local_imports": 2, "lines": 22097, "prose_lines": 12521, "reexport_names": 0},
+    "orchestrator/src/orchestrator/merge_lane/worker.py": {"cognitive": 2193, "function_local_imports": 2, "lines": 22091, "prose_lines": 12521, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_liveness.py": {"cognitive": 0, "external_importers": 4, "function_local_imports": 0, "lines": 12, "prose_lines": 2, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_queue.py": {"cognitive": 0, "external_importers": 129, "function_local_imports": 0, "lines": 12, "prose_lines": 2, "reexport_names": 0},
     "orchestrator/src/orchestrator/merge_queue_store.py": {"cognitive": 0, "external_importers": 7, "function_local_imports": 0, "lines": 7, "prose_lines": 2, "reexport_names": 0},
