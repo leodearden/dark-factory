@@ -4,12 +4,14 @@ import asyncio
 import dataclasses
 import json
 import subprocess
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+
+from shared.safe_io import atomic_write_text
 
 from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec, LlmParams
 from fused_memory.arm_harness.conformance import ConformanceCounts
@@ -470,6 +472,49 @@ def screening_records(
     return llm_axis_records(
         spec, result, counts, reference=None, retrieval_ranks=None, measured_at=FINISHED_AT
     )
+
+
+def telemetry_row(
+    created_at: str,
+    *,
+    backend: str = 'graphiti',
+    operation: str | None = 'add_memory',
+    project_id: str | None = 'dark_factory',
+    success: int = 1,
+    tokens: tuple[int | None, int | None, int | None] = (1000, 100, 9),
+) -> dict[str, object]:
+    """One object shaped exactly like a ``telemetry_query.py`` output line."""
+    input_tokens, output_tokens, llm_calls = tokens
+    total_tokens = (
+        None if input_tokens is None or output_tokens is None else input_tokens + output_tokens
+    )
+    return {
+        'created_at': created_at,
+        'operation': operation,
+        'project_id': project_id,
+        'backend': backend,
+        'success': success,
+        'duration_ms': 1234.5,
+        'input_tokens': input_tokens,
+        'output_tokens': output_tokens,
+        'total_tokens': total_tokens,
+        'llm_calls': llm_calls,
+    }
+
+
+def untokened_telemetry_row(created_at: str, **overrides) -> dict[str, object]:
+    """A telemetry row whose four token columns are null, as before token recording began."""
+    return telemetry_row(created_at, tokens=(None, None, None), **overrides)
+
+
+def write_run(run_dir: Path, manifest: RunManifest, records: Sequence[MetricsRecord]) -> Path:
+    """A finished run directory: its manifest and metrics records, through the harness writers."""
+    atomic_write_text(
+        run_dir / RUN_MANIFEST_FILENAME, serialize_run_manifest(manifest), mkdir=True
+    )
+    for record in records:
+        write_metrics_record(record, run_dir)
+    return run_dir
 
 
 def write_screening_run(

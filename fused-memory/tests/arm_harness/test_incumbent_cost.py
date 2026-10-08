@@ -7,7 +7,12 @@ from datetime import UTC, date, datetime
 import pytest
 from shared.memory_eval_metrics import Metric, canonical_json_text
 
-from arm_harness._fakes import incumbent_control_spec, llm_spec
+from arm_harness._fakes import (
+    incumbent_control_spec,
+    llm_spec,
+    telemetry_row,
+    untokened_telemetry_row,
+)
 from fused_memory.arm_harness.arm_spec import LlmArmSpec, TokenPricing
 from fused_memory.arm_harness.incumbent_cost import (
     PROJECTION_DAYS,
@@ -42,40 +47,6 @@ FIRST_TOKENED = '2026-10-05T11:23:27.123456+00:00'
 LATER = '2026-10-06T08:00:00+00:00'
 UNTIL_TEXT = '2026-10-08T00:00:00+00:00'
 UNTIL = datetime.fromisoformat(UNTIL_TEXT)
-_UNTOKENED = (None, None, None)
-
-
-def telemetry_row(
-    created_at: str,
-    *,
-    backend: str = 'graphiti',
-    operation: str | None = 'add_memory',
-    project_id: str | None = 'dark_factory',
-    success: int = 1,
-    tokens: tuple[int | None, int | None, int | None] = (1000, 100, 9),
-) -> dict[str, object]:
-    """One object shaped exactly like a ``telemetry_query.py`` output line."""
-    input_tokens, output_tokens, llm_calls = tokens
-    total_tokens = (
-        None if input_tokens is None or output_tokens is None else input_tokens + output_tokens
-    )
-    return {
-        'created_at': created_at,
-        'operation': operation,
-        'project_id': project_id,
-        'backend': backend,
-        'success': success,
-        'duration_ms': 1234.5,
-        'input_tokens': input_tokens,
-        'output_tokens': output_tokens,
-        'total_tokens': total_tokens,
-        'llm_calls': llm_calls,
-    }
-
-
-def untokened_row(created_at: str, **overrides) -> dict[str, object]:
-    return telemetry_row(created_at, tokens=_UNTOKENED, **overrides)
-
 
 def at(text: str) -> datetime:
     return datetime.fromisoformat(text)
@@ -87,18 +58,18 @@ def write_at(text: str, **overrides) -> LlmWriteTelemetry:
 
 def test_only_graphiti_add_memory_and_add_episode_rows_are_llm_writes():
     rows = [
-        untokened_row(PRE_START),
+        untokened_telemetry_row(PRE_START),
         telemetry_row(FIRST_TOKENED),
         telemetry_row(LATER, operation='add_episode'),
-        untokened_row('2026-10-06T09:00:00+00:00', backend='mem0'),
-        untokened_row('2026-10-06T10:00:00+00:00', operation='update_edge'),
-        untokened_row(
+        untokened_telemetry_row('2026-10-06T09:00:00+00:00', backend='mem0'),
+        untokened_telemetry_row('2026-10-06T10:00:00+00:00', operation='update_edge'),
+        untokened_telemetry_row(
             '2026-10-06T11:00:00+00:00',
             backend='sqlite_task_backend',
             operation='update_task',
             project_id='solar_challenge',
         ),
-        untokened_row('2026-10-06T12:00:00+00:00', backend='graphiti', operation=None),
+        untokened_telemetry_row('2026-10-06T12:00:00+00:00', backend='graphiti', operation=None),
     ]
 
     window = select_llm_writes(rows, until=UNTIL)
@@ -111,12 +82,12 @@ def test_only_graphiti_add_memory_and_add_episode_rows_are_llm_writes():
 
 def test_window_runs_from_the_first_token_bearing_write_up_to_but_excluding_until():
     rows = [
-        untokened_row('2026-10-08T00:00:01+00:00'),
+        untokened_telemetry_row('2026-10-08T00:00:01+00:00'),
         telemetry_row(UNTIL_TEXT),
         telemetry_row(LATER, project_id='reify'),
         telemetry_row(FIRST_TOKENED),
-        untokened_row(PRE_START),
-        untokened_row('2026-10-01T00:00:00+00:00'),
+        untokened_telemetry_row(PRE_START),
+        untokened_telemetry_row('2026-10-01T00:00:00+00:00'),
     ]
 
     window = select_llm_writes(rows, until=UNTIL)
@@ -131,8 +102,8 @@ def test_window_runs_from_the_first_token_bearing_write_up_to_but_excluding_unti
     'pre_start_rows',
     [
         [],
-        [untokened_row(PRE_START, backend='mem0')],
-        [untokened_row(PRE_START, operation='update_edge')],
+        [untokened_telemetry_row(PRE_START, backend='mem0')],
+        [untokened_telemetry_row(PRE_START, operation='update_edge')],
     ],
 )
 def test_a_dump_that_does_not_reach_back_past_the_telemetry_start_is_refused(pre_start_rows):
@@ -144,11 +115,11 @@ def test_a_dump_that_does_not_reach_back_past_the_telemetry_start_is_refused(pre
 
 def test_an_untokened_llm_write_inside_the_window_is_unknown_not_zero():
     rows = [
-        untokened_row(PRE_START),
+        untokened_telemetry_row(PRE_START),
         telemetry_row(FIRST_TOKENED),
-        untokened_row('2026-10-06T01:00:00+00:00'),
+        untokened_telemetry_row('2026-10-06T01:00:00+00:00'),
         telemetry_row(LATER),
-        untokened_row('2026-10-07T01:00:00+00:00', operation='add_episode'),
+        untokened_telemetry_row('2026-10-07T01:00:00+00:00', operation='add_episode'),
     ]
 
     with pytest.raises(TelemetryAccountingError) as caught:
@@ -162,7 +133,7 @@ def test_an_untokened_llm_write_inside_the_window_is_unknown_not_zero():
 
 def test_a_partially_tokened_llm_write_inside_the_window_is_refused():
     rows = [
-        untokened_row(PRE_START),
+        untokened_telemetry_row(PRE_START),
         telemetry_row(FIRST_TOKENED),
         telemetry_row(LATER, tokens=(1000, 100, None)),
     ]
@@ -173,9 +144,9 @@ def test_a_partially_tokened_llm_write_inside_the_window_is_refused():
 
 def test_untokened_writes_after_until_are_outside_the_accounting():
     rows = [
-        untokened_row(PRE_START),
+        untokened_telemetry_row(PRE_START),
         telemetry_row(FIRST_TOKENED),
-        untokened_row('2026-10-08T03:00:00+00:00'),
+        untokened_telemetry_row('2026-10-08T03:00:00+00:00'),
     ]
 
     assert len(select_llm_writes(rows, until=UNTIL).writes) == 1
@@ -184,8 +155,8 @@ def test_untokened_writes_after_until_are_outside_the_accounting():
 @pytest.mark.parametrize(
     'rows',
     [
-        [untokened_row(PRE_START), untokened_row(LATER)],
-        [untokened_row(PRE_START), telemetry_row(UNTIL_TEXT)],
+        [untokened_telemetry_row(PRE_START), untokened_telemetry_row(LATER)],
+        [untokened_telemetry_row(PRE_START), telemetry_row(UNTIL_TEXT)],
         [],
     ],
 )
@@ -195,7 +166,7 @@ def test_no_token_bearing_llm_write_before_until_is_refused(rows):
 
 
 def test_a_naive_until_is_refused():
-    rows = [untokened_row(PRE_START), telemetry_row(FIRST_TOKENED)]
+    rows = [untokened_telemetry_row(PRE_START), telemetry_row(FIRST_TOKENED)]
 
     with pytest.raises(TelemetryWindowError, match='until'):
         select_llm_writes(rows, until=datetime(2026, 10, 8))
@@ -207,7 +178,7 @@ def test_a_naive_created_at_is_refused_at_the_boundary():
 
 
 def test_a_naive_created_at_is_refused_by_selection():
-    rows = [untokened_row('2026-10-05T10:00:00'), telemetry_row(FIRST_TOKENED)]
+    rows = [untokened_telemetry_row('2026-10-05T10:00:00'), telemetry_row(FIRST_TOKENED)]
 
     with pytest.raises(ValueError, match=re.escape('2026-10-05T10:00:00')):
         select_llm_writes(rows, until=UNTIL)
