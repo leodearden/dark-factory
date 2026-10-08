@@ -111,23 +111,21 @@ _MIN_EXPECTED_SCANNERS = 10
 # never the freshest.  Corpus: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 _MEASURED_UNDER_LOAD_WORST_CASE = 51.87
 
-# ABSOLUTE floor in seconds, deliberately independent of
-# PYPROJECT_DEFAULT_TIMEOUT -- and, since 2026-09-12, the PRIMARY anchor for
-# the family ceiling rather than a backstop under a derivation.
+# ABSOLUTE floor in seconds: the measured worst case above times
+# UNDER_LOAD_HEADROOM_FACTOR, rounded up to a whole minute.  Deliberately
+# independent of PYPROJECT_DEFAULT_TIMEOUT, and never-narrow.
 #
 # WHOLE_TREE_SCAN_TEST_TIMEOUT used to be DERIVED (`5 *
 # PYPROJECT_DEFAULT_TIMEOUT`), which tracked the hazard UPWARD but also tracked
 # the ini default DOWNWARD in silence: tightening
 # `[tool.pytest.ini_options].timeout` to 20s would shrink the family ceiling to
-# 100s -- inside ~3x of the measured-under-load worst case, and well inside the
-# further inflation seen at loadavg 250-423 -- while a ratio-only assertion
-# (`>= 5 * PYPROJECT_DEFAULT_TIMEOUT`) stayed green because it was an identity.
-# This floor was written to make that scenario fail loudly, and it is what the
-# constant is now pinned AT: the derivation was dropped when the ini default
-# was raised 60 -> 300 (for host-contention reasons of its own), because
-# carrying the multiple forward would have set the family ceiling to 1500s on
-# no measurement at all.  Never-narrow.
-_ABSOLUTE_FLOOR_SECONDS = 300
+# 100s -- well inside the measured-under-load worst case -- while a ratio-only
+# assertion (`>= 5 * PYPROJECT_DEFAULT_TIMEOUT`) stayed green because it was an
+# identity.  This floor was written to make that scenario fail loudly.  The
+# derivation was dropped when the ini default was raised 60 -> 300 (for
+# host-contention reasons of its own), because carrying the multiple forward
+# would have set the family ceiling to 1500s on no measurement at all.
+_ABSOLUTE_FLOOR_SECONDS = 420
 
 # Resolved from _orch_helpers' shared anchor, which is itself resolved from
 # THAT file and never from the process CWD: merge-verify runs pytest from the
@@ -220,23 +218,20 @@ class TestTimeoutConstants:
         * 17.85 / 21.32 / 30.75s per call for that serial-worker guard
           at loadavg 120-176 (task 4215's record) -- ~4.8x its unloaded figure;
         * xdist worker deaths observed at loadavg 250-423 (esc-3980-1,
-          esc-3787-1), i.e. past the 60s default then in force.
+          esc-3787-1), i.e. past the 60s default then in force;
+        * 51.87s setup for test_merge_lane_ratchet.py under task 5442's full
+          suite -- the current anchor, ``_MEASURED_UNDER_LOAD_WORST_CASE``.
 
-        The 300s floor leaves ~36x headroom over the unloaded worst case and
-        ~10x over the measured-under-load worst case above; the constant itself
-        now sits at 540, dragged up by the never-narrow rule when task 5442
-        raised the ini default there.  That task also re-measured this family
-        under load and found a marked member at 51.87s -- 1.7x the 30.75s the
-        floor is anchored to -- so 540 clears the family's own current
-        requirement (51.87 x 8 = 414.96) while the FLOOR's arithmetic below
-        still rests on the older figure.  Asserted as ``>=`` rather than ``==`` so
-        raising the constant later is never blocked by this test -- the
-        never-narrow polarity the neighbouring shared timeouts use.
+        The 420s floor clears 8 x 51.87.  WHOLE_TREE_SCAN_TEST_TIMEOUT (540)
+        clears both the floor and the ini default, and the ini default is the
+        binding one.  Asserted as ``>=`` rather than ``==`` so raising the
+        constant later is never blocked by this test -- the never-narrow
+        polarity the neighbouring shared timeouts use.
 
         THREE ASSERTIONS, each pinning something the others do not:
 
         1. the ABSOLUTE floor still clears the MEASUREMENT with the demanded
-           headroom -- the arithmetic that justifies the literal 300 rather
+           headroom -- the arithmetic that justifies the literal floor rather
            than leaving it a bare number;
         2. the constant clears that floor -- the substantive check;
         3. the constant has not fallen below the ini default, which would turn

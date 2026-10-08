@@ -186,7 +186,7 @@ PYPROJECT_DEFAULT_TIMEOUT = 540
 #     guard that merely shared the dead worker.
 #   So one slow tree-scan costs a whole verify run AND misattributes the blame.
 #
-# MEASURED basis for 300 rather than a tuned literal:
+# MEASURED history of the family:
 #   * unloaded and serial (`-n0`) on a 32-core box: 8.25s/call
 #     (test_merge_queue_reachback_patch_guard), 6.70s
 #     (test_event_loop_antipattern_guard), 6.46s
@@ -202,8 +202,9 @@ PYPROJECT_DEFAULT_TIMEOUT = 540
 #   FAMILY defect rather than three accidents, and why the rest are marked
 #   preemptively: a marked-but-fast test costs nothing, while an
 #   unmarked-and-slow one costs a whole session.
-# 300s is ~36x the unloaded worst case and ~10x the measured-under-load worst
-# case, and that MEASUREMENT is what the value is anchored to.
+# The current anchor is 51.87s under load (task 5442), which floors the family
+# at 420s: test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS.
+# Derivation: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 #
 # WAS `5 * PYPROJECT_DEFAULT_TIMEOUT` until 2026-09-12, when that ini default
 # was raised 60 -> 300 to stop CPU starvation on a loaded host false-redding a
@@ -216,24 +217,13 @@ PYPROJECT_DEFAULT_TIMEOUT = 540
 # measurement asks for, and one that would silently let a genuinely hung tree
 # scan burn 25 minutes.  So the two knobs are now what they always were
 # SEMANTICALLY -- orthogonal, one sized by host contention and one by the cost
-# of an AST sweep -- and this one is pinned at the figure its own measurements
+# of an AST sweep -- and this one is floored at the figure its own measurements
 # justify.  test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS
-# already encoded exactly that independence and is unchanged.
+# encodes that independence; it has since been re-anchored, but its role is
+# unchanged.
 #
-# 300 -> 540 on 2026-09-17 (task 5442), and NOT because this family was
-# re-measured: the never-narrow rule below forces it, since the ini default it
-# must not fall below moved to 540.  Two things follow and are recorded rather
-# than left to be rediscovered.  (a) The raise incidentally CLEARS this
-# family's own freshly measured requirement -- that task measured a marked
-# member of it (test_merge_lane_ratchet.py) at 51.87s setup under load,
-# 51.87 x 8 = 414.96, which 540 covers and the former 300 did not.  (b) The
-# ANCHOR is nonetheless stale: `_MEASURED_UNDER_LOAD_WORST_CASE = 30.75` dates
-# from task 4215 and this family has since been measured at 1.7x that, so the
-# arithmetic that justifies _ABSOLUTE_FLOOR_SECONDS now rests on an
-# out-of-date figure even though its conclusion is no longer binding.
-# Re-anchoring it is deliberately NOT done here -- it would change a constant
-# whose whole point is independence from the ini default, on a task that
-# measured the ini default -- and is filed as follow-up.
+# 300 -> 540 on 2026-09-17 (task 5442): the never-narrow rule below forces it,
+# since the ini default moved to 540, and 540 also clears the family's own 420.
 #
 # Deliberately NOT taken from HEAVY_BARRIER_TEST_TIMEOUT, which happens to
 # equal 300 but is merge-wait arithmetic (`5 * MERGE_RESULT_TIMEOUT + 75`); an
