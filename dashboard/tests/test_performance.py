@@ -6,7 +6,7 @@ import contextlib
 import json
 import logging
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -2477,7 +2477,7 @@ class TestPerformanceCardsDatum:
 # ---------------------------------------------------------------------------
 
 
-async def _listing_across(db_paths: list[Path | None], escalations_dir: Path) -> PerformanceListing:
+async def _listing_across(db_paths: Sequence[Path | None], escalations_dir: Path) -> PerformanceListing:
     async with contextlib.AsyncExitStack() as stack:
         conns: list[aiosqlite.Connection | None] = [
             None if db_path is None

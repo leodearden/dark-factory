@@ -1049,6 +1049,7 @@ class TestSpeculativeStats:
             merge_events_db, _speculative_events('speculative_merge', 3, now=now), now=now,
         )
 
+        assert datum.value is not None
         assert datum.value['hit_rate'] == pytest.approx(1.0)
         assert datum.value['discard_count'] == 0
 
@@ -1059,6 +1060,7 @@ class TestSpeculativeStats:
             merge_events_db, _speculative_events('speculative_discard', 3, now=now), now=now,
         )
 
+        assert datum.value is not None
         assert datum.value['hit_rate'] == pytest.approx(0.0)
         assert datum.value['hit_count'] == 0
 
