@@ -317,7 +317,10 @@ def test_background_capable_role_set_matches_bash_capability() -> None:
     """
     _CONTRACT.assert_role_set_matches_capability(
         remedy=(
-            'A newly Bash-capable role needs BACKGROUND_WAIT_GUIDANCE up front. If '
+            'This tripwire deliberately compares the shared set against unqualified '
+            '`Bash` ALONE, whether or not a role is PromptSpec-backed, so it is wider '
+            'than the predicate the set is named for. A newly Bash-capable role '
+            'needs BACKGROUND_WAIT_GUIDANCE up front. If '
             'its system_prompt is literal, add it to BASH_CAPABLE_UNPINNED_ROLES '
             'and the preamble carries the block. If it is PromptSpec-backed, the '
             "shared set no longer describes this block's carriers: declare a "
