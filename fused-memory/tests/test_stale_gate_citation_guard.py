@@ -2,14 +2,11 @@
 
 Closes the incident where task 3708's evidence-relay prose kept citing
 ``3660`` as a pending external gate for three relay cycles after 3660 was
-coalesced into 4856 — see
-``fused_memory.reconciliation.stale_gate_citation_guard``'s module docstring
-for the full incident record and the corpus measurement.
+coalesced into 4856; the incident and the corpus measurement are in the task
+4919 record.
 
-Every fixture constant below is a VERBATIM excerpt from task 3708's live
-``details`` field, re-confirmed present in ``.taskmaster/tasks/tasks.db``
-(tag=master) on 2026-09-11. The expected value for each is the scanner output
-observed in that run, not a guess.
+The relay fixture constants below are VERBATIM excerpts from task 3708's live
+``details`` field (tag=master).
 """
 
 from __future__ import annotations
@@ -50,9 +47,8 @@ CORRECTION = (
     'longer exists as a separate gate'
 )
 
-# Correct relays that a CLAUSE-SCOPED rule would wrongly block: the ids after
-# the capture are TRANSITIVE gates (gates of this task's gates), legitimately
-# absent from this task's own `dependencies`.
+# Correct relays naming TRANSITIVE gates (gates of this task's gates),
+# legitimately absent from this task's own `dependencies`.
 TRANSITIVE = (
     'The only real remediation lever remains external deps 3659 and 4856 '
     'landing (via their own upstream gates 3212 and 4006 respectively)'
@@ -62,20 +58,18 @@ PARENTHETICAL = (
     '4856 (blocked on 3659+4006), and now also 4987 (blocked on 4932+4986) '
     'landing'
 )
-
-# OUT-OF-SAMPLE. Both of these are relay prose written AFTER this algorithm was
-# designed — they appear in the 2026-09-11 corpus scan but not the 2026-09-08
-# one — and both must PASS. They are the evidence that the marker vocabulary
-# generalises rather than being fitted to the incident. CAPS_GATING also
-# exercises the ALL-CAPS spelling (hence re.IGNORECASE) and ARROW_LEVERS the
-# colon-less connector.
-CAPS_GATING = (
-    'GATING DEPENDENCY 4987 OBSERVED (append-only; not evidence of a status '
-    'change)'
-)
 ARROW_LEVERS = (
     'The only real remediation levers remain 3659 (→3212), 4856 (→3659+4006), '
     'and 4987 (→4932+4986)'
+)
+LEVER_CHAIN = (
+    'The only real remediation levers remain 3212 (in-progress) -> 3659, and '
+    '4985 -> 4986 -> 4987, landing so this task (γ) can be dispatched.'
+)
+
+CAPS_GATING = (
+    'GATING DEPENDENCY 4987 OBSERVED (append-only; not evidence of a status '
+    'change)'
 )
 
 
@@ -100,17 +94,33 @@ class TestFindGateCitationIds:
 
     def test_capture_stops_at_a_parenthetical(self):
         # Deliberate under-fire: only the first id of the list is captured.
-        # Fail-open beats false-positive.
-        assert find_gate_citation_ids(PARENTHETICAL) == {3659}
+        assert find_gate_citation_ids(
+            'external deps 3659 (blocked on 3212→3207), 4856'
+        ) == {3659}
+
+    def test_marker_with_a_colon_connector_anchors(self):
+        assert find_gate_citation_ids('external gates: 3659/4856 landing') == {
+            3659, 4856,
+        }
 
     def test_all_caps_marker_matches_case_insensitively(self):
-        # Out-of-sample; stops at ' OBSERVED'.
         assert find_gate_citation_ids(CAPS_GATING) == {4987}
 
-    def test_marker_without_a_connector_still_anchors(self):
-        # Out-of-sample; no colon after the marker, stops at the arrow
-        # parenthetical.
-        assert find_gate_citation_ids(ARROW_LEVERS) == {3659}
+    def test_remediation_levers_is_not_a_marker(self):
+        # A remediation lever may be a transitive gate: LEVER_CHAIN leads with
+        # 3212, which gates 3659, not this task.
+        for text in (PARENTHETICAL, ARROW_LEVERS, LEVER_CHAIN):
+            assert find_gate_citation_ids(text) == set()
+
+    def test_a_date_after_the_marker_is_not_a_task_id(self):
+        assert find_gate_citation_ids(
+            'pending external gates: 2026-09-11 check found none open'
+        ) == set()
+
+    def test_a_date_after_the_id_list_does_not_extend_it(self):
+        assert find_gate_citation_ids(
+            'external deps 3658/3659, 2026-09-11 check'
+        ) == {3658, 3659}
 
     def test_marker_with_no_adjacent_id_list_is_a_no_op(self):
         assert find_gate_citation_ids(
@@ -141,16 +151,12 @@ class TestFindGateCitationIds:
             'the only real remediation lever remains external deps landing'
         ) == set()
 
-    def test_marker_alternation_is_module_level(self):
-        # The regex is frozen at import time, not rebuilt per call.
-        assert stale_gate_citation_guard.GATE_CITATION_RE.groups == 1
-
 
 class TestTerminalOutcomeEscape:
     """A RETROSPECTIVE statement about gates that already landed is a
     legitimate relay, even when written against an already-emptied
-    `dependencies` array. Suppressing those is the false-positive class the
-    trailing-tail escape exists to remove."""
+    `dependencies` array. Only an outcome reported directly of the id list
+    makes it one."""
 
     def test_have_landed_is_not_a_pending_gate_assertion(self):
         assert find_gate_citation_ids(
@@ -167,29 +173,36 @@ class TestTerminalOutcomeEscape:
             'pending external gates 3658/3659 were merged last week'
         ) == set()
 
+    def test_have_all_been_merged_is_not_a_pending_gate_assertion(self):
+        assert find_gate_citation_ids(
+            'external deps 3658/3659 have all been merged'
+        ) == set()
+
     def test_escape_does_not_suppress_the_live_stale_spelling(self):
-        # THE LOAD-BEARING ASSERTION. The corpus spells the defect
-        # '… 3658/3659/3660 landing so this task (γ) can be dispatched', and
-        # TERMINAL_OUTCOME_RE's `\blanded\b` does not match 'landing'. Measured:
-        # with the escape applied, the would-fire count over task 3708's 9
-        # matches stays exactly 3.
+        # 'landing' is not a terminal outcome.
         assert find_gate_citation_ids(STALE_A) == {3658, 3659, 3660}
 
     def test_escape_does_not_suppress_the_transitive_relay(self):
-        # Tail is ' landing (via their own upstream gates …' — no terminal cue.
         assert find_gate_citation_ids(TRANSITIVE) == {3659, 4856}
 
-    def test_escape_does_not_suppress_the_out_of_sample_caps_relay(self):
-        # Tail is ' OBSERVED (append-only; not evidence of …' — no terminal cue.
+    def test_escape_does_not_suppress_the_caps_relay(self):
         assert find_gate_citation_ids(CAPS_GATING) == {4987}
 
-    def test_terminal_cue_beyond_the_tail_window_does_not_suppress(self):
-        # 'done' here is far past the end of the citation, describing something
-        # else entirely; only a cue in the immediate tail is a retrospective.
+    def test_terminal_cue_about_this_task_does_not_suppress(self):
+        # 'done' describes this task, not the gates.
         assert find_gate_citation_ids(
-            'external deps 3658/3659 landing so this task can finally be '
-            'dispatched once everything is done'
-        ) == {3658, 3659}
+            'external deps 3658/3659/3660 landing so this task can be done'
+        ) == {3658, 3659, 3660}
+
+    def test_terminal_cue_about_one_listed_id_does_not_suppress_the_list(self):
+        assert find_gate_citation_ids(
+            'external deps 3658/3659/3660 (3658 landed)'
+        ) == {3658, 3659, 3660}
+
+    def test_negated_terminal_cue_does_not_suppress(self):
+        assert find_gate_citation_ids(
+            'external deps 3658/3659/3660 are not done'
+        ) == {3658, 3659, 3660}
 
 
 # Recon-stage agent_id — the only caller class this guard polices. Matches
@@ -244,10 +257,20 @@ class TestStaleGateCitationError:
     # --- fail-open: no violation ------------------------------------------- #
 
     def test_correct_relays_are_not_rejected(self):
-        for text in (CORRECTION, TRANSITIVE, PARENTHETICAL, CAPS_GATING, ARROW_LEVERS):
+        for text in (
+            CORRECTION, TRANSITIVE, PARENTHETICAL, CAPS_GATING, ARROW_LEVERS,
+            LEVER_CHAIN,
+        ):
             assert stale_gate_citation_guard.stale_gate_citation_error(
                 text, AGENT_ID, live_dependencies=LIVE_DEPS,
             ) is None
+
+    def test_a_dated_relay_is_not_rejected(self):
+        assert stale_gate_citation_guard.stale_gate_citation_error(
+            'pending external gates: 2026-09-11 check found none open',
+            AGENT_ID,
+            live_dependencies=[],
+        ) is None
 
     def test_non_recon_callers_are_not_policed(self):
         for agent_id in ('claude-task-4919-implementer', None, ''):
