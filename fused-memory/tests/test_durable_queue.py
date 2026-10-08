@@ -505,15 +505,97 @@ class TestEnqueueBatchRollback:
         with pytest.raises(KeyError):
             await queue.enqueue_batch(items)
 
-        # Verify rollback: no items should have been persisted
-        assert queue._db is not None
-        cursor = await queue._db.execute(
-            "SELECT COUNT(*) FROM write_queue WHERE status='pending'"
+        counts = (await queue.get_stats(group_id='proj1'))['counts']
+        assert counts == {}, f'Expected no rows after rollback, got {counts}'
+
+    @pytest.mark.asyncio
+    async def test_a_failed_batch_is_atomic_while_workers_commit(self, tmp_path):
+        """A failing batch leaves nothing, and no worker's commit is discarded.
+
+        The queue shares ONE aiosqlite connection between ``enqueue_batch`` and
+        every worker, so the batch's statements and the workers' claim /
+        executed / completed / failure commits interleave on it.  A worker's
+        commit then commits whatever half of the batch was already inserted,
+        and the batch's rollback discards whatever a worker had not committed
+        yet — the connection-wide rollback of
+        ``plans/recon-sqlite-database-locked-rca-2026-09-16.md`` RC9.
+
+        Measured before ``AtomicConnection`` with a probe of this shape minus
+        the transient failures, 3 runs: 85 and 88 'batch' rows survived as
+        pending, and in the third run the batch's explicit ``BEGIN`` raised
+        ``OperationalError: cannot start a transaction within a transaction``
+        (so ``pytest.raises(KeyError)`` fails too).  This final shape, which
+        also puts ``_handle_failure``'s commit in the window, re-measured over
+        5 runs: failed 5/5 — 126, 138, 140 and 153 'batch' rows survived as
+        pending in four, and the fifth raised the same ``BEGIN`` error.
+
+        A CANCELLED batch is deliberately absent: it measured clean before the
+        fix (it cancels at its ``BEGIN`` and leaves nothing), and an arm that
+        passes on unfixed code asserts nothing.
+        """
+        executed: list[str] = []
+        attempts: dict[str, int] = {}
+
+        async def execute_write(_operation, payload):
+            name = payload['name']
+            attempts[name] = attempts.get(name, 0) + 1
+            if int(name.removeprefix('w')) % 2 == 1 and attempts[name] == 1:
+                raise ConnectionError(f'first attempt of {name} fails transiently')
+            executed.append(name)
+            return {'ok': True}
+
+        q = DurableWriteQueue(
+            data_dir=tmp_path / 'queue',
+            execute_write=execute_write,
+            workers_per_group=3,
+            semaphore_limit=5,
+            max_attempts=3,
+            retry_base_seconds=0.05,
+            write_timeout_seconds=2.0,
         )
-        row = await cursor.fetchone()
-        assert row[0] == 0, (
-            f'Expected 0 pending items after rollback, got {row[0]}'
-        )
+        await q.initialize()
+        try:
+            for i in range(30):
+                await q.enqueue(
+                    group_id='workers', operation='add_episode',
+                    payload={'content': f'item {i}', 'group_id': 'workers', 'name': f'w{i}'},
+                )
+            batch = [
+                {'group_id': 'batch', 'operation': 'add_episode',
+                 'payload': {'content': f'batch {i}', 'group_id': 'batch', 'name': f'b{i}'}}
+                for i in range(200)
+            ]
+            # Missing 'operation' — a KeyError after 200 INSERTs.
+            batch.append(
+                {'group_id': 'batch',
+                 'payload': {'content': 'bad', 'group_id': 'batch', 'name': 'bad'}}
+            )
+
+            with pytest.raises(KeyError):
+                await asyncio.wait_for(q.enqueue_batch(batch), 10)
+
+            async def _workers_drained():
+                stats = await q.get_stats(group_id='workers')
+                return stats if stats['counts'].get('completed', 0) == 30 else None
+
+            await poll_until(
+                _workers_drained,
+                timeout=20.0,
+                message='timed out waiting for the 30 worker items to complete',
+            )
+
+            batch_counts = (await q.get_stats(group_id='batch'))['counts']
+            assert batch_counts == {}, (
+                f'the failed batch left rows behind: {batch_counts} — a worker commit '
+                'swept up its half-inserted statements'
+            )
+            assert len(executed) == 30 and len(set(executed)) == 30, (
+                f'{len(executed)} executions of {len(set(executed))} items: a foreign '
+                'rollback discarded a claim or completion and the item re-executed'
+            )
+            assert await q.get_dead_items() == []
+        finally:
+            await q.close()
 
 
 class TestCallbackFailure:
