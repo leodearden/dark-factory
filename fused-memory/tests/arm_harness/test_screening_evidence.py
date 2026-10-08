@@ -30,6 +30,7 @@ from fused_memory.arm_harness.screening_evidence import (
     load_arm_commands,
     load_arm_evidence,
     load_vram_evidence,
+    own_model_calls,
     write_arm_commands,
     write_screening_spec,
 )
@@ -277,6 +278,13 @@ def test_refuses_a_served_arm_without_its_call_log(tmp_path):
     _refused(paths, str(paths.calls))
 
 
+def test_refuses_a_served_arm_without_its_smoke_call_log(tmp_path):
+    paths = write_arm_evidence(tmp_path, QWEN)
+    paths.smoke_calls.unlink()
+
+    _refused(paths, str(paths.smoke_calls))
+
+
 @pytest.mark.parametrize('stamps', [(), ('20261007T120000Z', '20261007T130000Z')])
 def test_refuses_a_served_arm_without_exactly_one_run(tmp_path, stamps):
     paths = write_arm_evidence(tmp_path, QWEN, stamps=stamps)
@@ -338,8 +346,20 @@ def test_refuses_an_own_model_call_whose_max_tokens_is_not_the_specs(tmp_path):
     _refused(paths, 'max_tokens', '2048', '4096')
 
 
+def test_refuses_a_smoke_call_whose_max_tokens_is_not_the_specs(tmp_path):
+    paths = write_arm_evidence(tmp_path, QWEN, smoke_calls=(call(max_tokens=1024),))
+
+    _refused(paths, str(paths.smoke_calls), 'max_tokens', '1024', '4096')
+
+
 def test_other_models_calls_do_not_carry_the_max_tokens_premise(tmp_path):
     calls = (call(), call(model='text-embedding-3-small', max_tokens=None))
-    paths = write_arm_evidence(tmp_path, QWEN, calls=calls)
+    paths = write_arm_evidence(tmp_path, QWEN, calls=calls, smoke_calls=calls)
 
     assert len(load_arm_evidence(paths, QWEN).calls) == 2
+
+
+def test_own_model_calls_are_the_specs_served_model_only():
+    own, embedder = call(), call(model='text-embedding-3-small')
+
+    assert own_model_calls((own, embedder, own), screening_spec(QWEN)) == (own, own)

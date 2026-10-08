@@ -160,6 +160,11 @@ class VramEvidence(FrozenModel):
     vram: VramReading
 
 
+def own_model_calls(calls: Sequence[CallRecord], spec: LlmArmSpec) -> tuple[CallRecord, ...]:
+    """The tap's calls for the arm's own served model, not the embedder's or anyone else's."""
+    return tuple(call for call in calls if call.request_model == spec.model_id)
+
+
 @dataclass(frozen=True)
 class ArmEvidence:
     arm: SlateArm
@@ -174,8 +179,7 @@ class ArmEvidence:
 
     @property
     def own_model_calls(self) -> tuple[CallRecord, ...]:
-        """The tap's calls for this arm's own served model, not the embedder's or anyone else's."""
-        return tuple(call for call in self.calls if call.request_model == self.spec.model_id)
+        return own_model_calls(self.calls, self.spec)
 
     def metric_value(self, metric_id: LlmMetricId) -> float | None:
         return next(
@@ -346,9 +350,8 @@ def require_max_tokens_premise(
     offending = sorted(
         {
             str(call.request_max_tokens)
-            for call in calls
-            if call.request_model == spec.model_id
-            and call.request_max_tokens != spec.params.max_tokens
+            for call in own_model_calls(calls, spec)
+            if call.request_max_tokens != spec.params.max_tokens
         }
     )
     if offending:
@@ -419,6 +422,8 @@ def load_arm_evidence(paths: ArmEvidencePaths, arm: SlateArm) -> ArmEvidence:
             vram=None, calls=(), run=None, records=(), outcomes=(),
         )
     require_recorded(paths.commands, commands, ScreeningStage.SMOKE)
+    smoke_calls = _loaded(paths.smoke_calls, load_call_records)
+    require_max_tokens_premise(paths.smoke_calls, smoke_calls, spec)
     vram = load_vram_evidence(paths.health, arm.arm_id)
     require_screened_reasoning(paths.health, vram.row, arm)
     calls = _loaded(paths.calls, load_call_records)

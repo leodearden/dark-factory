@@ -601,6 +601,7 @@ def write_arm_evidence(
     spec: LlmArmSpec | None = None,
     health: dict[str, Any] | None = None,
     write_health: bool = True,
+    smoke_calls: tuple[CallRecord, ...] | None = None,
     calls: tuple[CallRecord, ...] | None = None,
     outcomes: tuple[EpisodeOutcome, ...] | None = None,
     run_overrides: Mapping[str, Any] | None = None,
@@ -622,7 +623,10 @@ def write_arm_evidence(
     )
     if start_exit != 0 or wait_ready_exit != 0:
         return paths
-    write_call_records(paths.smoke_calls, (call(model=arm.served_model_name),))
+    write_call_records(
+        paths.smoke_calls,
+        smoke_calls if smoke_calls is not None else (call(model=arm.served_model_name),),
+    )
     write_call_records(paths.calls, calls if calls is not None else default_calls(arm))
     if write_health:
         report = health or health_report(arm.arm_id, reasoning=arm.reasoning)
