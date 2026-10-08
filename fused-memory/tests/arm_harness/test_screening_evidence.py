@@ -1,5 +1,6 @@
 """One arm's η screening evidence on disk, typed and validated (arm_harness/screening_evidence.py)."""
 
+import ast
 import json
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from arm_harness._fakes import (
 from fused_memory.arm_harness.arm_spec import load_arm_spec
 from fused_memory.arm_harness.metrics_record import IndexConfiguration, LlmMetricId
 from fused_memory.arm_harness.screening_evidence import (
+    HEALTH_REPORT_SCHEMA_VERSION,
     LMS_CTL_EXIT_CARD_HELD,
     SCREENING_RUN_SHAPE,
     ArmCommands,
@@ -37,6 +39,7 @@ from fused_memory.arm_harness.screening_evidence import (
 from fused_memory.arm_harness.slate import arm_endpoint
 
 QWEN = slate_arm()
+SERVING_ROOT = Path(__file__).parents[3] / 'scripts' / 'local-model-serving'
 
 
 def _commands() -> ArmCommands:
@@ -157,6 +160,28 @@ def test_a_failed_vram_verdict_is_a_reading_not_a_refusal(tmp_path):
 
 def test_screening_evidence_errors_are_value_errors():
     assert issubclass(ScreeningEvidenceError, ValueError)
+
+
+def _module_level_constant(path: Path, name: str) -> object:
+    values = [
+        ast.literal_eval(node.value)
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
+    ]
+    assert len(values) == 1, f'{path} must assign {name} exactly once at module level'
+    return values[0]
+
+
+@pytest.mark.parametrize(
+    ('mirror', 'source', 'name'),
+    [
+        (LMS_CTL_EXIT_CARD_HELD, 'lms_ctl.py', 'EXIT_CARD_HELD'),
+        (HEALTH_REPORT_SCHEMA_VERSION, 'lms_healthcheck.py', 'REPORT_SCHEMA_VERSION'),
+    ],
+)
+def test_each_mirrored_serving_constant_equals_its_source(mirror, source, name):
+    assert _module_level_constant(SERVING_ROOT / source, name) == mirror
 
 
 # --- one arm's evidence --------------------------------------------------------------
