@@ -1,0 +1,709 @@
+prd: plans/deferral-flip-condition-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 6524
+  title: Deferral record and process identity (shared)
+  note: 'The manifest seat found needs-human-expiry-overrun-threshold FAIL (producer-downstream):
+    the sweep interval had no owner upstream of α. Resolved at decompose (PRD §12
+    item 3): α owns DEFAULT_SWEEP_INTERVAL_SECS and LAPSE_OVERDUE_AFTER_SECS, and
+    γ''s config default reads the former.'
+  capabilities:
+  - name: deferral-kind-vocabulary
+    binding: capability→producer — α introduces `DeferralKind` (StrEnum, five members)
+      in shared/src/shared/task_deferral.py. Class name and module path are fixed
+      by PRD §5.1; no task_deferral module exists on main. Every consumer (gate, sweep,
+      dashboard, census) imports it and none restates a kind list.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class[[:space:]]+DeferralKind[[:space:]]*[(:]
+      paths:
+      - shared/src/shared/task_deferral.py
+      expect: present
+  - name: caller-kinds-subset
+    binding: capability→producer — α introduces `CALLER_KINDS`, the frozenset of kinds
+      a caller may write (carried_by, until_condition, held_by_session). The gate's
+      `server_only_kind` refusal and the migration's `legacy_unknown` exception both
+      read it. Name fixed by PRD §5.1.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^CALLER_KINDS[[:space:]]*[:=]
+      paths:
+      - shared/src/shared/task_deferral.py
+      expect: present
+  - name: deferral-submodel-registered
+    binding: capability→producer — α registers the stored record under metadata key
+      `deferral` with register_metadata_submodel(…, cardinality='dict'), following
+      shared/src/shared/deploy_state.py and shared/src/shared/capability_manifest.py.
+      The registry API is shared/src/shared/task_metadata.py::register_metadata_submodel.
+      The pattern accepts both the one-line call and the wrapped call whose key sits
+      on the next line.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: register_metadata_submodel\([[:space:]]*(['"]deferral['"]|$)
+      paths:
+      - shared/src/shared/task_deferral.py
+      expect: present
+  - name: process-identity-type
+    binding: capability→producer — α introduces the frozen `ProcessIdentity` (pid,
+      start_ticks, boot_id, host) in shared/src/shared/process_identity.py; β stores
+      it as `holder` and γ/δ read liveness from it. Module path and class name are
+      fixed by PRD §5.2.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class[[:space:]]+ProcessIdentity[[:space:]]*[(:]
+      paths:
+      - shared/src/shared/process_identity.py
+      expect: present
+  - name: liveness-predicate
+    binding: capability→producer — α introduces `liveness(identity)` in shared/src/shared/process_identity.py,
+      the one liveness test everywhere (ALIVE / DEAD / OTHER_HOST). γ's sweep and
+      δ's dashboard both call it. Signature fixed by PRD §5.2.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def[[:space:]]+liveness[[:space:]]*\(
+      paths:
+      - shared/src/shared/process_identity.py
+      expect: present
+  - name: lapse-cause-predicate
+    binding: capability→producer — α introduces the pure `lapse_cause(record, now,
+      dead_since)` in shared/src/shared/task_deferral.py; γ's `decide` is its only
+      production caller. Signature fixed by PRD §5.1 and decision 6.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def[[:space:]]+lapse_cause[[:space:]]*\(
+      paths:
+      - shared/src/shared/task_deferral.py
+      expect: present
+  - name: needs-human-predicate
+    binding: capability→producer — α introduces the pure `needs_human(record, now,
+      carrier_status, liveness)` in shared/src/shared/task_deferral.py, the single
+      definition (INV-5) of what a human must act on. δ's header count and ε's census
+      both call it. Signature fixed by PRD §5.1 and decision 10.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def[[:space:]]+needs_human[[:space:]]*\(
+      paths:
+      - shared/src/shared/task_deferral.py
+      expect: present
+  - name: process-identity-capture-and-command-name
+    binding: capability→producer — α introduces `capture(pid)` and `command_name(pid)`
+      in shared/src/shared/process_identity.py (PRD §5.2). β's `holder_not_live` and
+      `holder_not_session` refusals consume them. Covered by boundary row 12 with
+      real spawned processes.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: two names that must both exist cannot be ANDed in one grep (alternation
+        is OR); the sibling process-identity-type and liveness-predicate checks prove
+        the module landed, and shared/tests/test_process_identity.py drives both functions
+        against real processes
+  - name: registration-load-path
+    binding: capability→producer — registration is a side effect of importing the
+      registering module (shared/src/shared/deploy_state.py precedent), and shared/src/shared/task_metadata.py::parse_metadata
+      reports unknown_key for a key not registered in the calling process. So α makes
+      shared/src/shared/task_metadata.py load the deferral registration, as milestone
+      and recurrence register inside it (PRD §5.1, amended at decompose), and tests
+      is_known_metadata_key('deferral') after importing only shared.task_metadata.
+      parse_metadata splats a registered slice into the model, and a pydantic RootModel
+      accepts that (verified on pydantic 2.12.5 at decompose).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the load mechanism is the implementer's choice inside task_metadata.py;
+        α's own test proves it
+  - name: process-identity-unreadable-is-not-dead
+    binding: 'capability→producer — α delivers ProcessIdentityUnreadable (PRD §5.2,
+      decision 6): DEAD needs ENOENT plus a positive self-check, and any other /proc
+      read failure raises. β maps it to holder_unverifiable, γ to Hold surfaced liveness_unknown.
+      Boundary row 26.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a behavioural property proved by α's row-26 test, not a symbol a dependent
+        greps for
+  - name: needs-human-expiry-overrun-threshold
+    binding: capability→producer — resolved at decompose (PRD §12 item 3). α owns
+      DEFAULT_SWEEP_INTERVAL_SECS = 60 and LAPSE_OVERDUE_AFTER_SECS = 2 * DEFAULT_SWEEP_INTERVAL_SECS
+      in shared/src/shared/task_deferral.py (PRD §5.1, amended). needs_human and ε's
+      census both read the latter, and γ's deferral_sweep_interval_secs default reads
+      the former. The constant's name is fixed by the amended §5.1. Formerly FAIL
+      (producer-downstream).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^LAPSE_OVERDUE_AFTER_SECS[[:space:]]*[:=]
+      paths:
+      - shared/src/shared/task_deferral.py
+      expect: present
+- label: β
+  task_id: 6525
+  title: 'Server enforcement: gate, arguments, re-stamp, commit scope, clear-on-exit,
+    floor, writers'
+  capabilities:
+  - name: deferral-gate-plan-entrypoint
+    binding: capability→producer, α upstream (wired edge) — β introduces the pure
+      `plan()` decision function in fused-memory/src/fused_memory/middleware/deferral_gate.py.
+      Module path and function name are fixed by PRD decision 3 and §13.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^[[:space:]]*(async[[:space:]]+)?def[[:space:]]+plan[[:space:]]*\(
+      paths:
+      - fused-memory/src/fused_memory/middleware/deferral_gate.py
+      expect: present
+  - name: deferral-gate-wired-into-choke-point
+    binding: capability→producer (wired, not merely declared) — fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._apply_status_transition
+      is the one status choke point (every writer, including recon's orphan sweeps,
+      goes through it). β adds one call into the gate module there. No reference to
+      deferral_gate exists in task_interceptor.py on main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: deferral_gate
+      paths:
+      - fused-memory/src/fused_memory/middleware/task_interceptor.py
+      expect: present
+  - name: deferral-required-refusal-code
+    binding: capability→producer — β emits the `deferral_required` error code (PRD
+      §5.3 table) when a write enters deferred without a record. γ's DeferralRejection
+      maps it and ε's migration relies on its absence for stamped rows. Scoped to
+      production code in fused-memory and shared (the orchestrator client cannot import
+      fused_memory, so a shared home for the code strings is legitimate).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[''"]deferral_required[''"]'
+      paths:
+      - fused-memory/src/fused_memory/
+      - shared/src/shared/
+      expect: present
+  - name: deferral-invalid-refusal-code
+    binding: capability→producer — β emits `deferral_invalid` with reason_code, field
+      and value (PRD §5.3 table). ε's migration surfaces it as a per-row failure.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[''"]deferral_invalid[''"]'
+      paths:
+      - fused-memory/src/fused_memory/
+      - shared/src/shared/
+      expect: present
+  - name: deferral-changed-refusal-code
+    binding: capability→producer — β emits `deferral_changed` when `expected_stamped_at`
+      no longer matches the stored record (PRD §5.3 table). γ's sweep relies on it
+      as the INV-3 compare-and-set and counts it as a benign skip.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[''"]deferral_changed[''"]'
+      paths:
+      - fused-memory/src/fused_memory/
+      - shared/src/shared/
+      expect: present
+  - name: deferral-write-authority-refusal-code
+    binding: capability→producer — β emits `deferral_write_authority` when update_task
+      or submit_task metadata adds, alters or removes `deferral` (PRD §5.3 table).
+      It is the fourth code γ's DeferralRejection maps.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[''"]deferral_write_authority[''"]'
+      paths:
+      - fused-memory/src/fused_memory/
+      - shared/src/shared/
+      expect: present
+  - name: set-task-status-takes-expected-stamped-at
+    binding: capability→producer — β adds the `expected_stamped_at` argument to the
+      `set_task_status` MCP tool (PRD §5.3 signature). γ's guarded flip passes it.
+      fused-memory/src/fused_memory/server/tools.py::set_task_status has no such parameter
+      on main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'expected_stamped_at[[:space:]]*:'
+      paths:
+      - fused-memory/src/fused_memory/server/tools.py
+      expect: present
+  - name: set-task-status-takes-restamp-only
+    binding: 'capability→producer — β adds the `restamp_only` argument to the `set_task_status`
+      MCP tool (PRD decision 3 and §5.3, amended at decompose: a guarded re-stamp
+      refused with deferral_changed unless the row is still deferred with the expected
+      record). ε''s migration makes every write with it. fused-memory/src/fused_memory/server/tools.py
+      has no such parameter on main; the name is fixed by the amended §5.3.'
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: 'restamp_only[[:space:]]*:'
+      paths:
+      - fused-memory/src/fused_memory/server/tools.py
+      expect: present
+  - name: response-echo-and-restamp-early-return
+    binding: capability→producer — β's successful writes echo the stored record (`deferral`
+      / `deferral_cleared`, boundary row 27), and a re-stamp returns before the interceptor's
+      targeted-reconciliation step (TaskInterceptor.STATUS_TRIGGERS includes `deferred`;
+      boundary row 6). Both were added at decompose (PRD decision 3).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: response shape and control flow judged by rows 6 and 27
+  - name: rewrite-audit-trail-carries-deferral
+    binding: capability→producer — SqliteTaskBackend.rewrite_audit_trail (task 5771,
+      landed after authoring) is a second whole-blob metadata writer, reached from
+      TaskInterceptor._bound_audit_trail. β makes it carry `deferral` through unchanged,
+      as it already does `done_provenance` via _assert_done_provenance_passthrough
+      (PRD decision 3, amended at decompose).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: passthrough property judged by β's floor tests
+  - name: refusal-before-mutation-at-choke-point
+    binding: substrate CONFIRMED — `_apply_status_transition` runs its validators
+      under the project write lock before any state changes, with the `_validate_done_provenance`
+      step as the precedent for a payload rule layered beside Table A (shared/src/shared/task_transitions.py::_UNION).
+      β slots the gate call into that order.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing gate ordering β extends; boundary row 1 asserts the unchanged
+        row and the success=False journal entry
+  - name: atomic-record-and-status-write
+    binding: substrate CONFIRMED — fused-memory/src/fused_memory/backends/sqlite_task_backend.py::SqliteTaskBackend.set_status_and_stamp_audit
+      commits status and `audit_fields` in one transaction, so the record rides with
+      the status. It has no key-deletion semantics; β adds the narrow removal (PRD
+      open question 1), covered by the clear-on-exit-removes-record row.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing atomic write β extends; the removal extension is judged
+        by boundary row 5
+  - name: clear-on-exit-removes-record
+    binding: capability→producer — β clears `deferral` on every edge out of deferred
+      at the choke point (→ pending, done, blocked, cancelled) and in the candidate-key
+      self-heal's raw-SQL cancel in sqlite_task_backend.py (the `auto_cancelled_by_self_heal`
+      path). Extent covers both the choke-point exits and the one raw-SQL exit, per
+      PRD decision 4.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behavioural invariant (a record iff status is deferred) across several
+        write paths, judged by boundary rows 5 and 11, not expressible as a static
+        pattern
+  - name: update-task-cannot-bypass-the-floor
+    binding: substrate CONFIRMED (to follow, not clone) — the done_provenance write
+      floor in SqliteTaskBackend.update_task, its sqlite_task_backend.py::_assert_done_provenance_passthrough
+      helper and task_backend_errors.py::DoneProvenanceWriteAuthorityError. That floor
+      refuses the key outright in merge/additive and passes an echo only in replace;
+      β's deferral floor compares against the stored row in all three modes, inside
+      the transaction (PRD decision 3, amended at decompose).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: clone of an existing floor, judged by boundary row 8; the error code
+        the dependents consume is bound mechanically in deferral-write-authority-refusal-code
+  - name: planning-births-stamped
+    binding: 'substrate CONFIRMED — fused-memory/src/fused_memory/middleware/task_interceptor.py::TaskInterceptor._submit_task_planning_mode
+      is the only tm.add_task(status=''deferred'') call (re-greped 2026-10-08 at main
+      fc55c9c7c8: two docstring mentions and one call, all in that method). β stamps
+      `{kind: ''planning''}` there and refuses a caller-supplied deferral in TaskInterceptor.submit_task.'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing single birth path; stamping judged by boundary row 7
+  - name: commit-planning-scope-and-agent-id
+    binding: capability→producer — fused-memory/src/fused_memory/server/tools.py::commit_planning
+      has no agent_id and no deferral argument on main; β adds both and scopes release
+      to planning-kind or unrecorded rows (`not_planning_hold`). It routes through
+      TaskInterceptor.set_task_status (CSV), the existing choke point.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: scope rule is behavioural (refuse any non-planning kind), judged by
+        boundary row 7
+  - name: holder-corroboration-proc-reads
+    binding: producer:task-α upstream (capture and command_name) plus substrate CONFIRMED
+      — fused-memory.service shows ProtectProc=default and ProcSubset=all (re-measured
+      2026-10-08), the transport is local (127.0.0.1:8002), and PRD §7 measured /proc/$CLAUDE_PID/comm
+      = claude and that start_ticks and boot_id are readable.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: host-process permission measured with systemctl --user show, not a repository
+        pattern; judged by boundary row 4 against a live helper process
+  - name: repo-tracked-writers-instructed
+    binding: capability→producer — β edits docs/task-authoring.md, skills/unblock/SKILL.md,
+      skills/do/SKILL.md, skills/prd/references/decompose-mode.md, skills/_shared/filing-the-trigger-chain.md
+      and the steward prompt in orchestrator/src/orchestrator/agents/roles.py, then
+      re-greps skills/ and docs/ for any other instruction that sets deferred (cap
+      15 files, rest filed as a follow-up).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: prose edits across several files; no stable code pattern, judged by
+        review of the commit's file list
+- label: γ
+  task_id: 6526
+  title: Expiry sweep, client mapping, de-flake scope (orchestrator)
+  capabilities:
+  - name: sweep-pass-function
+    binding: capability→producer, α and β upstream — γ introduces `run_deferral_sweep_pass`
+      in orchestrator/src/orchestrator/deferral_sweep.py, the BackgroundService pass
+      function. Module path and function name are fixed by PRD §5.4.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^(async[[:space:]]+)?def[[:space:]]+run_deferral_sweep_pass[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/deferral_sweep.py
+      expect: present
+  - name: sweep-decide-function
+    binding: capability→producer — γ introduces the pure `decide(...)` returning Hold,
+      Notify or Flip in orchestrator/src/orchestrator/deferral_sweep.py (PRD §5.4
+      and decision 7). Scoped to the new module, where the name is not generic.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def[[:space:]]+decide[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/deferral_sweep.py
+      expect: present
+  - name: sweep-service-registered
+    binding: capability→producer (wired) — γ registers a BackgroundService named `deferral-sweep`,
+      as harness.py does for `stranded-reconcile` in the same registration block.
+      orchestrator/src/orchestrator/background_service.py::BackgroundService keeps
+      running while the scheduler is halted. The pattern requires the quoted service
+      name, so the `orchestrator-deferral-sweep` agent id cannot satisfy it.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[''"]deferral-sweep[''"]'
+      paths:
+      - orchestrator/src/orchestrator/
+      expect: present
+  - name: deferral-rejection-client-error
+    binding: capability→producer — γ adds `DeferralRejection(SetTaskStatusRejected)`
+      to orchestrator/src/orchestrator/scheduler.py and raises it for the four `deferral_*`
+      codes, which β emits (β upstream). Base class scheduler.py::SetTaskStatusRejected
+      and the error_code branches in Scheduler.set_task_status exist on main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^class[[:space:]]+DeferralRejection[[:space:]]*\(
+      paths:
+      - orchestrator/src/orchestrator/scheduler.py
+      expect: present
+  - name: scheduler-forwards-expected-stamped-at
+    binding: capability→producer, β upstream — Scheduler.set_task_status forwards
+      the `expected_stamped_at` argument that β adds server-side, together with optional
+      agent_id and client_op_id (PRD §5.4, amended at decompose). No reference exists
+      in scheduler.py on main.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: expected_stamped_at
+      paths:
+      - orchestrator/src/orchestrator/scheduler.py
+      expect: present
+  - name: sweep-config-keys
+    binding: capability→producer — γ adds `deferral_sweep_enabled`, `deferral_sweep_interval_secs`
+      and `deferral_flip_failure_streak` to orchestrator/src/orchestrator/config.py
+      as restart-only keys, like stranded_reconcile_* (none is in config.py::RELOADABLE_FIELDS,
+      and the service reads its interval once at registration; PRD decision 7, corrected
+      at decompose). The interval's default reads α's task_deferral.DEFAULT_SWEEP_INTERVAL_SECS.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: leaf deliverable with no dependents; three keys judged by the config
+        tests and rows 13 to 21
+  - name: dead-holder-named-in-notice
+    binding: substrate CONFIRMED — orchestrator/src/orchestrator/session_registry.py::resolve_session_slug_for_pid
+      returns a slug or None, so the notice names the pid always and the slug when
+      known. session_registry.py is read, not edited.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing best-effort resolver γ consumes
+  - name: notice-reaches-human-queue-without-pinning
+    binding: substrate CONFIRMED — the born-at-L2 sentinel precedent is orchestrator/src/orchestrator/harness.py::_DIRTY_TREE_ESCALATION_SENTINEL
+      (a stable synthetic task id, severity critical, level=2). Born at L2 means a
+      severity in escalation/src/escalation/models.py::BORN_AT_L2_SEVERITIES, so the
+      notice is severity urgent with category deferral_holder_lost (PRD decision 7,
+      amended at decompose; §12 item 2 records Leo's option of info). The harness
+      sentinel role prefix `orchestrator-` is in escalation/src/escalation/server.py::_HARNESS_SENTINEL_ROLE_PREFIXES,
+      so `orchestrator-deferral-sweep` is admitted. Dedup in any status reads the
+      whole archive (EscalationQueue.get_by_task(status=None), ~1.2 s), so γ seeds
+      it once, off the loop, at service start.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing filing pattern γ follows; one-notice-per-holder judged
+        by rows 13 and 20
+  - name: live-claimant-guard
+    binding: substrate CONFIRMED — shared/src/shared/task_claimant.py::has_live_claimant(task,
+      now, ttl) exists; the ttl is orchestrator config `claimant_liveness_ttl_secs`
+      (300 s). The same-named fused-memory/src/fused_memory/middleware/live_task_write_guard.py
+      function is a different, in-progress-only predicate and must not be used.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing predicate γ consumes; guard judged by row 18
+  - name: merge-in-flight-lookup
+    binding: substrate CONFIRMED — orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker.snapshot
+      returns an `entries` list whose dicts carry `task_id`, including queued and
+      verifying states, so a task-id lookup composes from it without new substrate.
+      PRD open question 5 leaves the exact read to γ.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing read γ composes; exact accessor is a tactical choice left
+        to γ, so no name is pinned
+  - name: pause-predicate
+    binding: substrate CONFIRMED — orchestrator/src/orchestrator/scheduler.py::Scheduler.is_paused
+      exists as the single "is dispatch halted" question the sweep asks.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing predicate γ consumes; behaviour judged by row 16
+  - name: deferred-rows-readable-by-status
+    binding: substrate CONFIRMED — fused-memory/src/fused_memory/server/tools.py::get_tasks
+      takes an opt-in `statuses` list (SQL status IN), the sweep's one read per pass.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing filter γ consumes
+  - name: de-flake-owner-completed-only-when-planning
+    binding: capability→producer, β upstream — γ changes orchestrator/src/orchestrator/flake_ledger.py
+      so the de-flake owner is completed only when its record is `planning` or absent
+      (the same scope as β's commit_planning, PRD decision 3 amended at decompose).
+      β's birth stamp makes the record readable. Today `_owner_liveness` treats any
+      deferred owner as a half-filed birth from a status-only read.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: behavioural scope rule, judged by the flake-ledger test and row 21
+- label: δ
+  task_id: 6527
+  title: 'Dashboard: draw the hold'
+  capabilities:
+  - name: dashboard-reads-shared-deferral-model
+    binding: capability→producer, α upstream — δ makes the dashboard parse records
+      and call needs_human through `shared.task_deferral` (dashboard depends on `dark-factory-shared`,
+      not on orchestrator, per dashboard/pyproject.toml). Scoped to the dashboard
+      package so a restated kind list elsewhere cannot satisfy it.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: task_deferral
+      paths:
+      - dashboard/src/dashboard/
+      expect: present
+  - name: no-deferral-recorded-state
+    binding: capability→producer — δ draws a deferred row with no record as the distinct
+      state "no deferral recorded" (INV-13), not as any kind. The wording is fixed
+      by PRD decision 10 and the δ signal. Scoped to the dashboard package, which
+      holds either the server-composed text or the JSX.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[Nn]o deferral recorded'
+      paths:
+      - dashboard/src/dashboard/
+      expect: present
+  - name: real-records-to-draw
+    binding: producer:task-β upstream (INV-13) — δ's in-task signal is boundary row
+      24 over the row-22 fixture; the live drawing of one record per caller kind moved
+      to ζ step 5 at decompose (PRD §12 item 1), after the fused-memory and dashboard
+      restarts that no code task delivers.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: depends on a fused-memory restart, an operational state the repository
+        cannot show
+  - name: row-shaping-site
+    binding: substrate CONFIRMED — dashboard/src/dashboard/data/active_tasks.py::_build_task_row
+      is the row shaper δ extends; the tasks tab is dashboard/src/dashboard/static/redux/tab_tasks.jsx.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing site δ edits
+  - name: dashboard-can-read-holder-liveness
+    binding: substrate CONFIRMED — dark-factory-dashboard.service shows ProtectProc=default
+      and ProcSubset=all (measured 2026-10-08), so the dashboard process can read
+      /proc on the same host. PRD §7 measured only the fused-memory and orchestrator
+      units; the dashboard unit is an addition recorded here.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: host-process permission measured with systemctl --user show, not a repository
+        pattern
+  - name: needs-human-count-matches-census
+    binding: producer:task-ε upstream, α upstream — the header count and the census
+      both call the single `needs_human` from α, so equality holds by construction
+      once ε's scripts/deferral_census.py exists. δ depends on ε in the PRD DAG.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: equality of two live counts at one moment is an operational comparison;
+        ε's mechanical checks already gate δ on the census existing
+- label: ε
+  task_id: 6528
+  title: Census, migration script, check 6
+  capabilities:
+  - name: census-script-check-flag
+    binding: capability→producer, α and β upstream — ε introduces scripts/deferral_census.py
+      with a `--check` mode that exits non-zero on any missing or invalid record,
+      stray record or unflipped lapse (PRD decision 10). Script path and the `--check`
+      flag are fixed by the PRD goal text. δ's signal and ζ's gate both compare against
+      it.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[''"]--check[''"]'
+      paths:
+      - scripts/deferral_census.py
+      expect: present
+  - name: migration-script-apply-flag
+    binding: capability→producer, α and β upstream — ε introduces scripts/migrate_deferrals.py,
+      dry-run by default, writing only with `--apply` (PRD decision 9). Script path
+      and flag are fixed by the PRD. ζ's operator step runs it.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '[''"]--apply[''"]'
+      paths:
+      - scripts/migrate_deferrals.py
+      expect: present
+  - name: census-expiry-lapse-threshold
+    binding: producer:task-α upstream — the census `--check` fails on an `expires_at`
+      lapse left unflipped for more than task_deferral.LAPSE_OVERDUE_AFTER_SECS, which
+      α owns (PRD §5.1 and §12 item 3, amended at decompose). α is a direct dependency
+      of ε, and α's grep check on the constant gates ε. Formerly FAIL (producer-downstream).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: gated by α's needs-human-expiry-overrun-threshold check; the census
+        edit itself is judged by rows 22-23
+  - name: migration-writes-are-guarded-restamps
+    binding: producer:task-β upstream — every migration write is set_task_status(status='deferred',
+      deferral=…, restamp_only=True), refused with deferral_changed unless the row
+      is still deferred with the expected record (PRD decision 3, §5.3, amended at
+      decompose; boundary row 25). β is a direct dependency of ε, and β's restamp-only
+      check gates ε.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: gated by β's set-task-status-takes-restamp-only check
+  - name: migration-mapping-substrate
+    binding: substrate CONFIRMED — the three source shapes are read from task metadata
+      (`x_coalesced_into`, `deferred_watch` with `trigger`, `x_armed_by`) and re-stamped
+      through the MCP, which β's gate accepts (carried_by, until_condition, and the
+      unrecorded-row legacy_unknown re-stamp). Counts are cross-checked read-only
+      per CLAUDE.md "Forensic reads of tasks.db" using scripts/tasks_db_schema.py.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the live check compares the dry-run table to an independent forensic
+        count at one moment; not a repository pattern
+  - name: deferred-read-transport
+    binding: substrate CONFIRMED — fused-memory/src/fused_memory/server/tools.py::get_tasks
+      with `statuses`, reached from scripts through scripts/legibility/census_trigger.py::post_mcp_tool_call
+      (shared/src/shared/mcp_post.py holds an async twin). PRD open question 2 lets
+      ε page it if too heavy.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: pre-existing read path and transport ε consumes
+  - name: ownership-reads-carrier-field
+    binding: capability→producer — scripts/sitting/ownership.py::COALESCE_KEY is `x_coalesced_into`
+      today; ε makes it read `deferral.carrier_task_id` for deferred rows, the live
+      claim (the old key stays as history).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: no dependent consumes it and the new field name is the PRD's, covered
+        by the ownership test
+  - name: review-briefing-check-6-runs-census
+    binding: capability→producer — skills/review-briefing/SKILL.md check 6 (today
+      a prose "Deferred-task invariant" read via forensic query) runs the census instead,
+      and review/briefing.yaml points at the mechanism.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: prose edit to a skill and a briefing, judged by review
+- label: ζ
+  task_id: 6529
+  title: 'Human gate: restarts, live checks, migration, triage'
+  note: 'Pure human gate (execution_class operational) with no dependents, so every
+    capability is manual. At decompose it also became the integration gate: the post-restart
+    live checks of β, γ and δ moved here (PRD §12 item 1), because no task in the
+    batch delivers a service restart. Its signal''s producers are upstream: ε (census
+    and migration scripts), δ (needs-human header count), γ (the sweep), and α and
+    β in their closure.'
+  capabilities:
+  - name: post-restart-live-checks
+    binding: producer:task-β, task-γ, task-δ upstream — ζ steps 1, 4 and 5 exercise
+      the deferral_required refusal and record round-trip (β), the holder-death notice
+      and release within grace plus three intervals and the expires_at lapse (γ),
+      and the tasks-tab rendering and needs-human count (δ), each after the operator's
+      restart of the relevant service. All three producers are in ζ's dependency closure.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: operator actions against live services after restarts
+  - name: successor-owner-for-remaining-holds
+    binding: 'ζ step 7 (INV-7, added at decompose): any project with needs-human rows
+      left gets a successor pure gate with a 30-day delayed milestone before ζ closes.
+      Substrate CONFIRMED: metadata.milestone {mode: ''delayed''} on a deterministic
+      gate (docs/task-authoring.md §6; task 6409 is a live example).'
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an operator filing, not a repository pattern
+  - name: census-check-exit-code-oracle
+    binding: producer:task-ε upstream — scripts/deferral_census.py `--check` is the
+      signal's exit-0 oracle and reports the per-project legacy_unknown count. ε is
+      in ζ's dependency closure.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: ζ is a pure human gate with no dependents; ε's census checks gate ε's
+        own dependents
+  - name: migration-apply-available
+    binding: producer:task-ε upstream, producer:task-β upstream — scripts/migrate_deferrals.py
+      `--apply` re-stamps through the MCP gate β enforces, including the unrecorded-row
+      legacy_unknown shape. Both are in ζ's dependency closure.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: operator action against live stores; not a repository pattern
+  - name: dashboard-needs-human-count-to-compare
+    binding: producer:task-δ upstream — the tasks-tab header count the signal compares
+      with the census. δ is a direct dependency of ζ.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: live comparison of two counts at one moment
+  - name: sweep-running-for-lapse-arm
+    binding: producer:task-γ upstream — the census flags an unflipped expiry lapse
+      only meaningfully when the sweep is running, so the exit-0 signal presumes γ's
+      service is live (ζ step 3 restarts the fleet). γ is a direct dependency of ζ.
+      The threshold is α's LAPSE_OVERDUE_AFTER_SECS.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: depends on an orchestrator restart onto γ, an operational state
+  - name: file-memories-to-update-exist
+    binding: substrate CONFIRMED — procedural_defer_a_pinned_task_to_guard_a_hand_carry.md
+      and feedback_hand_carry_procedure.md both exist in /home/leo/.claude/projects/-home-leo-src-dark-factory/memory/
+      (outside the repository, so no pattern can check them).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: files live outside the repository tree

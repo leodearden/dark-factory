@@ -1,6 +1,8 @@
 # Deferral records: every `deferred` task says how it ends
 
-**Status:** authored 2026-10-07 (`/team` + `/prd` author mode), not yet decomposed.
+**Status:** authored 2026-10-07 (`/team` + `/prd` author mode); decomposed 2026-10-08 into
+tasks 6524 (α), 6525 (β), 6526 (γ), 6527 (δ), 6528 (ε) and 6529 (ζ), plus reify 8368. The decompose re-walk corrected premises that had drifted or were false
+on main `fc55c9c7c8`. The corrections are made in place, and §12 records each one and why.
 **Type:** new contract at the task-status write choke point, one new orchestrator sweep,
 two readers, one migration. No new store and no schema migration: the record is task metadata.
 **Approach:** B+H. G5 applies on several counts: five packages, the persistence choke point,
@@ -30,11 +32,12 @@ human is told when a holder dies — never while it lives. Observable when it la
   `{'success': False, 'error': 'deferral_required', …}`, and `get_task` shows the row's status
   unchanged. A malformed record returns `error: 'deferral_invalid'`, naming `reason_code`,
   `field` and the offending `value`.
-- When a `held_by_session` holder process exits, a human-queue INFO notice names the dead
-  session and every task it held. Each task returns to `pending` once the sweep has seen the
-  holder dead for `grace_secs` (default 7,200 s; at most one 60 s pass later).
-- An `until_condition` deferral with `expires_at` returns to `pending` within one sweep pass
-  after `expires_at`.
+- When a `held_by_session` holder process exits, a human-queue notice names the dead session
+  and every task it held. The notice is informational: nothing waits on it. Each task returns to
+  `pending` once the sweep has seen the holder dead for `grace_secs` (default 7,200 s), at most
+  `grace_secs` plus three sweep intervals after the exit.
+- An `until_condition` deferral with `expires_at` returns to `pending` within two sweep
+  intervals after `expires_at`.
 - The dashboard tasks tab shows each deferred row as "parked: <what ends it>" with its age.
   The tab also counts the deferrals that need a human.
 - `scripts/deferral_census.py --check` exits 0 for each migrated project. It is run by
@@ -153,7 +156,7 @@ violation either way (decision 10).
 |---|---|---|---|---|
 | `carried_by` | `carrier_task_id` | a human: once the carrier is terminal, they close the row (`done` with `found_on_main`, or `cancelled`) or re-pend it | carrier `done` ⇒ **closable**; carrier `cancelled` ⇒ **orphaned** (the absorbed work never landed: re-pend or re-carry). While the carrier is live, the scheduler owns the carrier and so bounds the hold; a deferred carrier has its own record. | any caller |
 | `until_condition` | `condition` (text, ≤ 500 chars); optional `expires_at` | a human who judges the condition | `expires_at` ⇒ the sweep flips to `pending`. Without it, the hold is **stale** after 30 days and is listed for review. | any caller |
-| `held_by_session` | `holder_pid` (the caller's `$CLAUDE_PID`); optional `grace_secs` | the holding session, which lands or releases it | holder death ⇒ one INFO notice; death observed for `grace_secs` ⇒ flip to `pending`; while the holder lives, nothing (decision 6) | any caller whose pid is a live `claude` process on the fused-memory host |
+| `held_by_session` | `holder_pid` (the caller's `$CLAUDE_PID`); optional `grace_secs` | the holding session, which lands or releases it | holder death ⇒ one informational notice (decision 7); death observed for `grace_secs` ⇒ flip to `pending`; while the holder lives, nothing (decision 6) | any caller whose pid is a live `claude` process on the fused-memory host |
 | `planning` | none | the planner, via `commit_planning` | **stale batch** after 24 h; never lapses, because an unwired batch must not auto-release | the server only, at `planning_mode` birth |
 | `legacy_unknown` | none | the migration triage gate (ζ) | listed with a count until triaged | the migration only (decision 9) |
 
@@ -190,25 +193,50 @@ The interceptor applies `DeferralWrite`; it does not interpret deferrals (heuris
   - give a planning-born task a real reason.
 
   `deferred_at` (first entry) is preserved; `stamped_at` and `stamped_by` are new. A
-  `deferred` write without a `deferral` on a `deferred` row stays today's no-op.
+  `deferred` write without a `deferral` on a `deferred` row stays today's no-op. A re-stamp
+  is not a status change. It emits only `deferral_restamped` and returns before the
+  interceptor's targeted-reconciliation step (`TaskInterceptor.STATUS_TRIGGERS` includes
+  `deferred`). Without that, the migration's ~575 re-stamps would launch ~575 reconciliations.
+- **Guarded re-stamp** (`restamp_only=True`, single id). The write is refused with
+  `deferral_changed` unless the row is in `deferred` now and its record's `stamped_at` equals
+  `expected_stamped_at`. An omitted `expected_stamped_at` means "expects no record". The
+  migration uses it for every write. Without it, a human could re-pend a row between the
+  migration's read and its write, and the write would be a fresh entry that silently re-parks
+  released work (INV-3). With a status other than `deferred` it is refused
+  `field_not_allowed`, with CSV ids `cas_needs_single_id`, and without `deferral`
+  `deferral_required`.
+- **Every successful write echoes the stored record** (`deferral` in the response). Skill text
+  goes live when β merges, and the server only after its restart. An old server silently drops
+  an unknown argument (FastMCP's argument model ignores extras). So every instruction β edits
+  tells the caller to confirm the echo. If the echo is absent, the server predates β: the
+  caller treats the hold as unrecorded and re-stamps it once the server restarts.
 - **`commit_planning`** gains `agent_id`.
   - `commit_planning(target_status='pending'|'cancelled')` flips only rows whose record is
     `planning`, or absent (the pre-migration window). Any other kind is refused
     (`reason_code='not_planning_hold'`), so a human hold or a live hand-carry can never be
-    released by a batch commit.
+    released by a batch commit. `commit_planning` reaches the choke point through the CSV
+    `TaskInterceptor.set_task_status`, so it passes `plan()` an internal commit-scope marker.
+    The marker is not a parameter of the MCP `set_task_status`. A plain
+    `set_task_status(status='pending')` out of `deferred` stays legal for every kind.
   - `commit_planning(target_status='deferred')` requires `deferral` (a caller kind) and
     forwards it as a re-stamp.
   - `orchestrator/src/orchestrator/flake_ledger.py` completes its owner only when the owner's
-    record is `planning`; otherwise it treats the owner as held.
+    record is `planning` or absent, the same scope as `commit_planning`. Otherwise it treats
+    the owner as held.
 - **`submit_task(planning_mode=True)`** stamps `{kind: 'planning'}` itself, attributed to the
   submitting `agent_id`. Any `submit_task` carrying a caller-supplied `metadata.deferral` is
   refused in `TaskInterceptor.submit_task` before the ticket/planning split. The backend's
   `add_task` stays neutral, because it cannot tell the interceptor from a caller.
 - **`update_task(metadata=…)`** may not add, alter or remove `deferral`, in any metadata
   mode. A byte-equal echo of the stored record passes, so read-modify-write writers that
-  return the blob unchanged keep working. This clones the `done_provenance` write floor in
-  `SqliteTaskBackend.update_task`, with a new `DeferralWriteAuthorityError` in
-  `fused-memory/src/fused_memory/backends/task_backend_errors.py`.
+  return the blob unchanged keep working. The floor follows the `done_provenance` write floor
+  in `SqliteTaskBackend.update_task`, with a new `DeferralWriteAuthorityError` in
+  `fused-memory/src/fused_memory/backends/task_backend_errors.py`. It is not a clone: the
+  `done_provenance` floor refuses the key outright in `merge` and `additive` modes and lets an
+  echo through only in `replace`. The echo rule here compares against the stored row in all
+  three modes, so it runs inside the transaction. The same rule binds
+  `SqliteTaskBackend.rewrite_audit_trail` (task 5771), the privileged whole-blob writer behind
+  the recon-stage audit-trail rotation: it carries `deferral` through unchanged.
 - **A `deferral` with any status other than `deferred`** is refused (`status_not_deferred`).
 
 ### 4. Leaving `deferred` clears the record, and says what it cleared
@@ -238,7 +266,10 @@ old and new records.
   - The server reads `/proc/<holder_pid>` on its own host. The process must be the Claude CLI
     (`/proc/<pid>/comm` is `claude`). A missing process is refused with `holder_not_live`. A
     different process is refused with `holder_not_session`: a shell or session leader can
-    outlive a crashed `claude`, and would otherwise pin the hold forever.
+    outlive a crashed `claude`, and would otherwise pin the hold forever. A `/proc` that cannot
+    be read for any other reason is refused with `holder_unverifiable`, never read as "not
+    live". The reads run off the event loop (`asyncio.to_thread`) before the write lock is
+    taken (INV-8).
   - The server stores a pid-reuse- and reboot-safe identity `{pid, start_ticks, boot_id, host}`
     (new `shared/src/shared/process_identity.py`). This corroborates the claim at write time
     (INV-3).
@@ -261,7 +292,12 @@ test everywhere:
 - **`ALIVE`** means the same host, the same boot, and a process with that pid and start ticks
   exists.
 - **`DEAD`** means the same host and the identity no longer exists: the pid is gone, its start
-  ticks differ, or the boot id differs. A **reboot is death**.
+  ticks differ, or the boot id differs. A **reboot is death**. "Gone" requires positive
+  evidence: `ENOENT` on `/proc/<pid>` together with a self-check that this process can see
+  other processes' `/proc` entries. Any other read failure (`EACCES`, a `hidepid` or
+  `ProtectProc=invisible` mount) raises `ProcessIdentityUnreadable`. Callers map that to
+  "hold and surface", never to `DEAD`. Otherwise a hardened unit would read every live holder
+  as dead, and the sweep would release them all after grace.
 - **`OTHER_HOST`** means another host. Liveness is unknown, so the sweep holds the row and surfaces
   it, and never flips it.
 
@@ -299,9 +335,14 @@ moves the merge to a separate carrier task, the hand-carry guidance re-stamps th
   `orchestrator/src/orchestrator/harness.py`, like `stranded-reconcile`. Its logic lives in a
   new module, `orchestrator/src/orchestrator/deferral_sweep.py`. Background services keep
   running while the scheduler is halted; phases hosted in `Scheduler.acquire_next` do not.
-  Config keys (green-tier, like the other sweep intervals):
+  Config keys, restart-only like the other sweep intervals (`stranded_reconcile_*` and
+  `main_tip_sweep_*` are not in `config.py::RELOADABLE_FIELDS`, and
+  `Harness._build_lifecycle_registry` reads the enabled flag and the interval once, at
+  registration):
   - `deferral_sweep_enabled` (default true);
-  - `deferral_sweep_interval_secs` (default 60);
+  - `deferral_sweep_interval_secs` (default `task_deferral.DEFAULT_SWEEP_INTERVAL_SECS`, 60;
+    bounded `0 < interval ≤ LAPSE_OVERDUE_AFTER_SECS / 2`, so a configured interval can never
+    outrun the census's overdue threshold);
   - `deferral_flip_failure_streak` (default 5).
 
   Every project's orchestrator runs it for its own project. A project with no running
@@ -316,20 +357,36 @@ moves the merge to a separate carrier task, the hand-carry guidance re-stamps th
   | `held_by_session`, holder dead, no merge in flight | `Notify` at first sight of death, then `Flip('holder_lost')` when `lapse_cause` fires |
   | anything else | `Hold` |
   | missing or unparseable record | `Hold`, surfaced as `invalid_record`; never a flip |
+  | holder liveness unreadable (`ProcessIdentityUnreadable`) | `Hold`, surfaced as `liveness_unknown`; never a flip |
 
   The last row fails safe toward holding, as the milestone gate fails toward withholding.
-- **Notices.** A notice is one born-at-L2 INFO escalation per holder. It is filed against a
+- **Notices.** A notice is one born-at-L2 escalation per holder. It is filed against a
   stable sentinel task id derived from the holder identity
   (`deferral-holder:<host>:<boot_id8>:<pid>:<start_ticks>`), following the
   `_DIRTY_TREE_ESCALATION_SENTINEL` precedent, with `agent_role='orchestrator-deferral-sweep'`
-  (a harness sentinel role).
-  - It names the holder (pid, best-effort slug), every task it holds, and what will happen
-    ("released to `pending` at <t>" / "released").
+  (a harness sentinel role). The escalation id comes from `make_id` over one fixed key,
+  `deferral-holder`, so no per-holder sequence files accumulate.
+  - **Shape.** Born at L2 means a severity in `escalation/src/escalation/models.py::BORN_AT_L2_SEVERITIES`
+    (`critical`, `urgent`); a level-2 `info` record is incoherent to the readers of that
+    contract. The notice uses `severity='urgent'` (the lower of the two) and
+    `category='deferral_holder_lost'`. Its summary says it is informational: nothing waits on
+    it, and the release happens without anyone acting. Leo's word "INFO" (2026-10-08) is
+    carried by that content and by the watcher's `close_only` handling, not by the severity
+    field. Consequence: the escalation watcher pushes every born-at-L2 record to the phone at
+    urgent priority (`escalation/src/escalation/watcher.py::_send_ntfy`). §12 records this as
+    the one choice Leo may want to revisit.
+  - It names the holder (pid, best-effort slug), every task it holds with its worktree path and
+    branch where one exists (so a human can `/resume` or salvage within grace), and what will
+    happen ("released to `pending` at <t>" / "released").
   - Dedup is by sentinel id in any status, so one dead holder is reported once, across
-    restarts.
+    restarts. That read (`EscalationQueue.get_by_task(status=None)`) parses the whole archive,
+    about 1.2 s at 3,495 records (measured 2026-10-08). So the sweep runs it off the event
+    loop, once, when the service starts, to seed an in-memory set of notified holders. After
+    that it reads only pending records.
   - Filing it against a sentinel rather than the re-pended task leaves that task's dispatch and
     pins untouched.
   - The L2 watcher closes it as it does other sentinel notices (`close_only`).
+    `skills/escalation-watcher/SKILL.md` gains the row for `deferral_holder_lost`.
   - The notice is filed **before** the flip, so a crash between the two cannot lose it; the
     next pass finds the escalation and completes the flip.
   - `expires_at` lapses file nothing, because the human asked for that outcome. They emit only
@@ -337,8 +394,14 @@ moves the merge to a separate carrier task, the hand-carry guidance re-stamps th
 - **Guarded write.** A flip calls `set_task_status(status='pending',
   expected_stamped_at=<record.stamped_at>)` with:
   - `agent_id='orchestrator-deferral-sweep'`;
-  - `client_op_id=f'deferral-flip:{task_id}:{stamped_at}'`, so a transient-retry replays the
-    recorded outcome instead of reading its own success as a conflict.
+  - `client_op_id=f'deferral-flip:{project_id}:{task_id}:{stamped_at}'`, so a transient retry
+    replays the recorded outcome instead of reading its own success as a conflict.
+
+  The sweep goes through `Scheduler.set_task_status`, which today fixes
+  `agent_id=ORCHESTRATOR_MCP_IDENTITY` and has no `client_op_id`. So γ widens it with
+  optional `agent_id`, `client_op_id` and `expected_stamped_at`, fixed before the retry loop
+  so every retry resends the same key. If a flip's response lacks β's `deferral_cleared`
+  field, the server predates β: the sweep stops flipping for that pass and surfaces it.
 
   Inside the write lock, the server compares `expected_stamped_at` with the current record. It
   refuses with `deferral_changed` if someone re-stamped in the meantime. This is INV-3: the
@@ -361,12 +424,23 @@ moves the merge to a separate carrier task, the hand-carry guidance re-stamps th
   - Other pauses, such as the usage cap, gate capacity rather than intent, and the sweep
     ignores them. A task flipped during a usage-cap pause waits like any `pending` task.
 - **Storm escape (INV-4).** A failed flip is retried on the next pass and counted per task.
-  After `deferral_flip_failure_streak` consecutive failures, the sweep files one blocking
-  escalation for that task and stops retrying it until its record changes. A pass event
+  After `deferral_flip_failure_streak` consecutive failures, the sweep files one born-at-L2
+  escalation (`urgent`, the sweep's sentinel role) for that task and stops retrying it until
+  its record changes. A pass event
   `deferral_sweep_pass {evaluated, flipped, would_flip, notified, surfaced, failed}` is emitted
-  only when some count is non-zero.
-- **Per-pass cost (INV-8).** Each pass makes one `get_tasks` call, two small `/proc` reads per held row, one merge-queue lookup per lapsing row, and awaited MCP writes. That
-  was 335 rows at authoring.
+  only when `flipped`, `would_flip`, `notified` or `failed` is non-zero, or when the set of
+  surfaced task ids changed since the last pass. Without that edge trigger, every pass between
+  γ going live and the migration (~575 unrecorded rows across five projects) would emit an
+  event.
+- **Per-pass cost (INV-8).** Each pass makes one `get_tasks` call, two small `/proc` reads per
+  held row (off the event loop), one merge-queue lookup per lapsing row, at most one
+  pending-only escalation read per dead holder, and awaited MCP writes. That was 335 rows at
+  authoring.
+- **Merge in flight** includes a coalesce train's members, read from the harness's in-process
+  train state through one read-only accessor (γ exposes it if none exists; CLAUDE.md:
+  `get_merge_queue` does not show a train's verify, task 5245). If that read raises or times
+  out in a pass, the row is held for that pass. "Cannot be read" never means "no accessor
+  exists"; that would hold every lapse forever.
 
 ### 8. Why `carried_by` is not a dependency edge
 
@@ -396,6 +470,15 @@ already have a valid record are skipped. Its mapping:
   uncommitted planning birth" where that flag is set, because `pending_since` cannot tell the
   two apart (§2).
 
+Every `--apply` write is a `restamp_only` guarded re-stamp (decision 3) and must see the
+record echoed. A response without the echo means the server predates the gate: the run
+aborts with exit 2 before its next write, never printing a "stamped" table it did not write.
+If β refuses a mapped `carried_by` or `until_condition` record (`deferral_invalid`, e.g.
+`carrier_not_found`), the row falls back to a `legacy_unknown` re-stamp. Its `reason` carries
+the source key, the refused value (truncated) and the `reason_code`, and the report lists
+every fallback. A `deferral_changed` refusal is reported as "moved since read", not as a
+failure.
+
 Its report lists the closable and orphaned `carried_by` rows (45 closable in dark_factory at
 authoring). Applying the migration and triaging what it leaves is a human gate (ζ).
 `x_coalesced_into` stays on the rows as the 2026-09-09 sweep's historical stamp; the live
@@ -409,9 +492,10 @@ must act on:
 - `carried_by` whose carrier is `done` (closable) or `cancelled` (orphaned);
 - `planning` older than 24 h (a stale batch; an unknown age counts as stale);
 - `until_condition` without `expires_at` older than 30 days (stale);
-- `until_condition` past `expires_at` by more than two sweep intervals (the sweep is not
-  running);
-- `held_by_session` whose holder is dead (release pending), or on another host;
+- `until_condition` past `expires_at` by more than `LAPSE_OVERDUE_AFTER_SECS` (two default
+  sweep intervals: the sweep is not running);
+- `held_by_session` whose holder is dead (release pending), on another host, or whose
+  liveness could not be read (`liveness_unknown`);
 - any missing or invalid record.
 
 A `held_by_session` row with a live holder is never in `needs_human` (decision 6).
@@ -432,7 +516,7 @@ A `held_by_session` row with a live holder is never in `needs_human` (decision 6
   the shared model over the MCP read path (`get_tasks(statuses=['deferred'])`). It also checks
   non-deferred rows for a stray `deferral`.
   - `--check` exits non-zero on any missing or invalid record, any stray record, or any
-    `expires_at` lapse left unflipped for more than two sweep intervals.
+    `expires_at` lapse left unflipped for more than `LAPSE_OVERDUE_AFTER_SECS`.
   - It lists `legacy_unknown`, closable, orphaned, stale and lost-holder rows without failing.
   - If a project has deferred rows but no record anywhere, it says "no deferral producer has
     written" rather than "all clean".
@@ -462,12 +546,19 @@ to correct its own call (the INV-1 house pattern). β lands the enforcement toge
 every repo-tracked writer's instructions.
 
 The gate is server-wide, so it binds reify, know_live and every other project at once. The
-`/unblock`, `/do` and `/prd` skill files live in this repo, and `~/.claude/skills` links to
-them, so β's edits reach every project. Any project-local prose elsewhere is corrected by the
-hint.
+skill files β edits live in this repo and reach every project: `~/.claude/skills/prd` is a
+symlink into it, and `/unblock`, `/do` and `/review-briefing` reach sessions through
+`~/.claude/commands/*.md` symlinks into the main checkout. The hint corrects any other
+project-local prose that *transitions* a task into `deferred`. It cannot correct prose that
+leaves a planning *birth* deferred, because births are never refused. That prose gets a
+follow-up in its own repo: reify's `.claude/skills/audit` leaves Medium findings deferred as
+triage proposals, so they would render as stale `planning` batches after 24 h (§12).
 
 The live effect needs a fused-memory restart onto β's code. The orchestrator side (γ) needs
-an orchestrator restart.
+an orchestrator restart, and the dashboard (δ) a dashboard restart. No task in the batch
+delivers a restart. fused-memory redeploys on its own staleness clock (8 h), while orchestrator
+fleet deploys are paused (task 5020) and the dashboard has no staleness redeploy. So the
+post-restart live checks belong to the human gate ζ, which orders the restarts (§9).
 
 ### 13. Placement (heuristics 9, 13, 14)
 
@@ -516,24 +607,41 @@ Deferral = <the request's kind fields, with holder_pid replaced by
 
 DEFAULT_GRACE_SECS = 7200; GRACE_BOUNDS = (600, 86400)
 STALE_PLANNING_AFTER_SECS = 86400; STALE_CONDITION_AFTER_SECS = 30 * 86400
+DEFAULT_SWEEP_INTERVAL_SECS = 60           # γ's config default reads it
+LAPSE_OVERDUE_AFTER_SECS = 2 * DEFAULT_SWEEP_INTERVAL_SECS
 
-class Liveness(StrEnum): ALIVE, DEAD, OTHER_HOST
-def lapse_cause(record, now, dead_since: datetime | None) -> LapseCause | None
-def needs_human(record, now, carrier_status, liveness) -> NeedsHumanReason | None
+# Liveness is defined in process_identity.py (§5.2) and imported here: task_deferral's
+# stored model already imports ProcessIdentity, so defining it here would make the two
+# modules import each other.
+def lapse_cause(record, now, dead_since: datetime | None) -> LapseCause | None  # expired | holder_lost
+def needs_human(record, now, carrier_status, liveness: Liveness | None) -> NeedsHumanReason | None
+    # liveness None = not read or unreadable: held_by_session → liveness_unknown; other kinds ignore it
 ```
 
-The predicates take liveness and times as arguments and do no I/O (heuristic 7).
+The predicates take liveness and times as arguments and do no I/O (heuristic 7). The
+registry entry is the **stored** `Deferral` shape (wrapped in a `RootModel`), not the request.
+`deferral` must be a known key in every process that parses metadata, not only in the four
+consumers that import `task_deferral`. Otherwise `parse_metadata` reports `unknown_key` on
+every deferred row in any other process. So `task_deferral.py` calls
+`register_metadata_submodel('deferral', …)` at module level, and
+`shared/src/shared/task_metadata.py` loads it with one bare side-effect import
+(`import shared.task_deferral`) as its last statement, after the registry is defined. Never a
+`from … import`: that would fail on a partially initialised module.
 
 ### 5.2 `shared/src/shared/process_identity.py`
 
 ```
+class Liveness(StrEnum): ALIVE, DEAD, OTHER_HOST
+class ProcessIdentityUnreadable(Exception)        # /proc could not be read; never "dead"
 @dataclass(frozen=True)
 class ProcessIdentity: pid: int; start_ticks: int; boot_id: str; host: str
-def capture(pid: int) -> ProcessIdentity | None   # None: no such process
+# each function below takes keyword proc_root: Path = Path('/proc'), the seam rows 12 and 26 test through
+def capture(pid: int) -> ProcessIdentity | None   # None: no such process (ENOENT); raises on unreadable
 def command_name(pid: int) -> str | None          # /proc/<pid>/comm
 def liveness(identity: ProcessIdentity) -> Liveness
-    # OTHER_HOST iff host differs; DEAD iff same host and (boot_id differs, pid absent,
-    # or start_ticks differ); else ALIVE
+    # OTHER_HOST iff host differs; DEAD iff same host and (boot_id differs, pid absent
+    # with positive evidence, or start_ticks differ); else ALIVE; raises
+    # ProcessIdentityUnreadable when /proc cannot be read (decision 6)
 ```
 
 ### 5.3 MCP surface (fused-memory)
@@ -543,23 +651,27 @@ set_task_status(id, status, project_root, tag=None, done_provenance=None,
                 reopen_reason=None, claimant_run_id=…, heartbeat_at=…,
                 agent_id=None, client_op_id=None,
                 deferral: dict | None = None,              # NEW
-                expected_stamped_at: str | None = None)    # NEW, single id only
+                expected_stamped_at: str | None = None,    # NEW, single id only
+                restamp_only: bool = False)                # NEW, single id only (decision 3)
 commit_planning(project_root, task_ids, target_status='pending',
                 deferral: dict | None = None,              # NEW, required iff target_status='deferred'
                 agent_id: str | None = None)               # NEW
 ```
 
 Refusals are dicts: nothing is persisted, and each is journalled with `success=False`.
+A successful write that stores or clears a record echoes it in the response (`deferral` or
+`deferral_cleared`).
 
 | `error` | When | Typed fields |
 |---|---|---|
 | `deferral_required` | entering `deferred`, or `commit_planning` to `deferred`, without `deferral` | `task_id`, `from_status`, `accepted_kinds`, `alternatives`, `hint` |
 | `deferral_invalid` | any validation failure | `task_id`, `reason_code`, `field`, `value`, `hint` (`reason_code` values below the table) |
-| `deferral_changed` | `expected_stamped_at` does not match the current record's `stamped_at`, or the row has left `deferred` | `task_id`, `expected_stamped_at`, `current_stamped_at`, `current_status` |
+| `deferral_changed` | `expected_stamped_at` does not match the current record's `stamped_at`, or the row has left `deferred`; with `restamp_only`, the row is not `deferred` or its record is not the expected one (none, when `expected_stamped_at` is omitted) | `task_id`, `expected_stamped_at`, `current_stamped_at`, `current_status` |
 | `deferral_write_authority` | `update_task` or `submit_task` metadata adds, alters or removes `deferral` | `task_id` (if any), `path`, `hint` |
 
 `reason_code` for `deferral_invalid` is one of: `unknown_kind`, `missing_field`,
 `field_not_allowed`, `server_only_kind`, `holder_not_live`, `holder_not_session`,
+`holder_unverifiable`,
 `carrier_not_found`, `carrier_is_self`, `expires_at_not_future`, `grace_out_of_range`,
 `text_too_long`, `status_not_deferred`, `not_planning_hold`, `cas_needs_single_id`.
 
@@ -571,18 +683,26 @@ and a new event `deferral_restamped {task_id, old, new}` covers re-stamps.
 - **`orchestrator/src/orchestrator/scheduler.py`.**
   - `DeferralRejection(SetTaskStatusRejected)` carries `reason_code`, and
     `Scheduler.set_task_status` raises it for the four `deferral_*` codes.
-  - `Scheduler.set_task_status` forwards `expected_stamped_at`.
+  - `Scheduler.set_task_status` gains optional `agent_id`, `client_op_id` and
+    `expected_stamped_at` (today it fixes `agent_id=ORCHESTRATOR_MCP_IDENTITY` and has no
+    `client_op_id`), set once before its transient-retry loop. It returns the successful
+    response instead of `None` (its Protocol stub changes with it), so the sweep can read the
+    `deferral_cleared` echo.
 - **`deferral_sweep.py`.** It contains `decide(...)` (pure) and `run_deferral_sweep_pass(...)`
   (the `BackgroundService` pass function). Events: `deferral_sweep_pass`, and
   `deferral_expired {task_id, kind, cause, record}`.
 - **`flake_ledger.py`.** The de-flake owner is completed only when its record is `planning`
-  (decision 3).
+  or absent (decision 3). The ledger's liveness read today is status-only, and its
+  `get_statuses` fallback cannot see a record, so the owner is treated as held when its
+  record cannot be read.
 
 ## 6. Boundary-test sketch
 
-All rows run against a real SQLite task store in a temp `project_root`. They drive the public
-tool and interceptor functions with real processes and never patch private names (Tests
-stance, `docs/code-quality.md`). The owning leaf is in brackets.
+Rows 1–21 and 25–28 run against a real SQLite task store in a temp `project_root`. They
+drive the public tool and interceptor functions with real processes. Rows 22–24 run over
+fixture rows: the scripts read only over MCP, through the `scripts/tests` fake-transport seam,
+and the dashboard over its own fixture dicts. No row patches private names (Tests stance,
+`docs/code-quality.md`). The owning task is in brackets.
 
 | # | Scenario | Preconditions | Postconditions |
 |---|---|---|---|
@@ -591,46 +711,53 @@ stance, `docs/code-quality.md`). The owning leaf is in brackets.
 | 3 | Malformed record [β] | `until_condition` with `condition: "  "` | `deferral_invalid`, `reason_code='missing_field'`, `field='condition'` |
 | 4 | Holder corroboration [β] | a live `sleep` (comm ≠ `claude`); an unused pid | `holder_not_session`; `holder_not_live` |
 | 5 | Exit clears [β] | a deferred row | `→ pending`, `→ done (found_on_main)`, `→ cancelled` and `→ blocked` each leave no `metadata.deferral`; the event carries `deferral_cleared` |
-| 6 | Re-stamp [β] | `planning`-born row | `set_task_status(deferred, deferral=until_condition)` replaces the record; `deferred_at` kept; `deferral_restamped` emitted; a `deferred` write without `deferral` is still a no-op |
+| 6 | Re-stamp [β] | `planning`-born row | `set_task_status(deferred, deferral=until_condition)` replaces the record; `deferred_at` kept; `deferral_restamped` emitted, and no `task_status_changed` and no targeted reconciliation; a `deferred` write without `deferral` is still a no-op |
 | 7 | Planning birth and commit scope [β] | `submit_task(planning_mode=True)`; a second task deferred `until_condition` | birth row has `kind='planning'`; `commit_planning(pending)` clears it; `commit_planning(pending)` on the second → `not_planning_hold`, row unchanged; `commit_planning(deferred)` without `deferral` → `deferral_required` |
 | 8 | Floor [β] | deferred row | `update_task(metadata={'deferral': <altered>})` in merge, additive and replace modes → `deferral_write_authority`; replace without the key → refused; an echo of the stored record → accepted, record unchanged; `submit_task(metadata={'deferral': …})` → refused |
 | 9 | CAS and replay [β] | deferred row re-stamped after a read | `set_task_status(pending, expected_stamped_at=<old>)` → `deferral_changed`; with the current value → `pending`; the same call replayed with its `client_op_id` returns the recorded success |
 | 10 | Legacy shape [β] | a row inserted `deferred` with no record | `legacy_unknown` re-stamp accepted with `deferred_at=null`; the same kind on a recorded row → `server_only_kind` |
 | 11 | Raw-SQL exit [β] | deferred row hit by the candidate-key self-heal | cancelled, no `metadata.deferral` |
 | 12 | Liveness [α] | a spawned process; its identity with a forged old `boot_id`; with another `host` | `ALIVE`; `DEAD` (reboot is death); `OTHER_HOST` |
-| 13 | Holder lost [γ] | `claude`-named helper process holds a row (`grace_secs=600`), then is killed; fake clock | first pass after death → one sentinel INFO notice, row still `deferred`; pass 601 s after first-seen-dead → row `pending`, `deferral_expired{cause:'holder_lost'}`; no second notice |
+| 13 | Holder lost [γ] | `claude`-named helper process holds a row (`grace_secs=600`), then is killed; fake clock | first pass after death → one `deferral_holder_lost` notice (born at L2, severity `urgent`), row still `deferred`; pass 601 s after first-seen-dead → row `pending`, `deferral_expired{cause:'holder_lost'}`; no second notice |
 | 14 | Live holder is silent [γ] | live holder; fake clock advanced 7 days | `Hold` on every pass; no escalation filed; not in `needs_human`; never flipped |
 | 15 | `expires_at` lapses [γ] | `until_condition`, `expires_at` in the past | one pass → `pending`; no escalation; `deferral_expired{cause:'expired'}` |
 | 16 | Paused [γ] | row as in 13, scheduler paused | notice filed ("released on resume"); no flip; `would_flip=1`; first unpaused pass flips |
 | 17 | Race [γ] | row as in 15; re-stamp between the sweep's read and its write | `deferral_changed`; row keeps the new record; counted as a benign skip, not a failure |
-| 18 | Guards [γ] | row as in 15 with a fresh claimant; a held row whose task id is in the merge queue | both held; the second surfaced `merge_in_flight` |
-| 19 | Failure streak [γ] | server refusing writes for the row | after 5 passes, one blocking escalation; no retries until the record changes |
+| 18 | Guards [γ] | row as in 15 with a fresh claimant; a lapsing `held_by_session` row whose task id is in the merge queue, one in a coalesce train, and one in neither | the first three held, the merge ones surfaced `merge_in_flight`; the one in neither IS flipped |
+| 19 | Failure streak [γ] | server refusing writes for the row | after 5 passes, one born-at-L2 escalation (severity `urgent`, agent_role `orchestrator-deferral-sweep`); no retries until the record changes |
 | 20 | Restart [γ] | holder dead, notice filed, sweep restarted | no duplicate notice (sentinel dedup); grace restarts from the new first-seen-dead |
 | 21 | Client mapping and de-flake [γ] | stub server returning each `deferral_*` code; a de-flake owner deferred `until_condition` | `DeferralRejection` with the right `reason_code`; the ledger leaves the owner alone |
 | 22 | Census [ε] | fixture: each kind, one unrecorded deferred row, one stray record on a `pending` row | `--check` exits non-zero naming both; after the fixes it exits 0 and lists `legacy_unknown`, closable and orphaned rows |
 | 23 | Migration [ε] | fixture with `x_coalesced_into`, `x_armed_by`, `deferred_watch` and bare rows across two project roots | dry-run prints the mapping per project; `--apply` stamps it; a second `--apply` writes nothing |
-| 24 | Dashboard [δ] | the row-22 fixture | each row renders its "parked: …" text and age; the unrecorded row reads "no deferral recorded"; the header count equals `deferral_census.py`'s needs-human count over the same store |
+| 24 | Dashboard [δ] | a fixture of row dicts like row 22's (each kind, one unrecorded, one stray) | each row renders its "parked: …" text and age; the unrecorded row reads "no deferral recorded"; a row without the field renders as today; the header count equals the number of rows for which `task_deferral.needs_human` is not `None` over the same dicts (the live census comparison is ζ step 5) |
+| 25 | Guarded re-stamp [β] | an unrecorded deferred row; the same row re-pended between a read and a write | `restamp_only` write on the unrecorded row → accepted; on the re-pended row → `deferral_changed`, row stays `pending` |
+| 26 | Unreadable `/proc` [α, β] | a process-identity read pointed at an unreadable proc root | `liveness` and `capture` raise `ProcessIdentityUnreadable`, never `DEAD`/`None`; a `held_by_session` entry is refused `holder_unverifiable` |
+| 27 | Echo [β] | any successful entry, re-stamp and exit | the response carries `deferral` (entry, re-stamp) or `deferral_cleared` (exit) |
+| 28 | Quiet passes [γ] | five unrecorded deferred rows, three passes, nothing changing | one `deferral_sweep_pass` event, not three; a sixth unrecorded row → one more |
 
-## 7. Pre-conditions (G3): substrate verified on `5b645d822a`
+## 7. Pre-conditions (G3): substrate verified on `5b645d822a`, re-verified on `fc55c9c7c8` (decompose, 2026-10-08)
 
 | Capability | Evidence |
 |---|---|
 | Single status choke point; validators run before mutation | `task_interceptor.py::TaskInterceptor._apply_status_transition` (gate chain under `_write_lock`; `_validate_done_provenance` at step 2b; same-status guard with the `done → done` repair seam `_repair_done_provenance_same_status`) |
 | Atomic status + metadata write | `sqlite_task_backend.py::SqliteTaskBackend.set_status_and_stamp_audit` (one `_txn`, shallow merge, `_write_status_and_verify`). There are no key-deletion semantics yet, so β adds the narrow removal |
-| Write-authority floor to clone | `SqliteTaskBackend.update_task` `done_provenance` floor, `_assert_done_provenance_passthrough`, `task_backend_errors.py::DoneProvenanceWriteAuthorityError` |
+| Write-authority floor to follow | `SqliteTaskBackend.update_task` `done_provenance` floor, `_assert_done_provenance_passthrough`, `task_backend_errors.py::DoneProvenanceWriteAuthorityError`. That floor refuses the key outright in `merge`/`additive` and passes an echo only in `replace`; the all-modes echo rule is new (decision 3) |
+| A second whole-blob metadata writer | `SqliteTaskBackend.rewrite_audit_trail` (task 5771, landed after authoring), reached from `TaskInterceptor._bound_audit_trail`; it passes `done_provenance` through and must pass `deferral` through too |
 | Only one birth path | `TaskInterceptor._submit_task_planning_mode` is the only `tm.add_task(status='deferred')` call; the curator and `task_knowledge_sync` births default to `pending` |
 | `commit_planning` goes through the choke point | `tools.py::commit_planning` → `TaskInterceptor.set_task_status` (CSV); it has no `agent_id` today |
 | Recon exits go through the choke point | `targeted.py::_sweep_cancel_orphan` and `_sweep_block_orphan` call `task_interceptor.set_task_status` |
 | Typed sub-model registry | `shared/src/shared/task_metadata.py::register_metadata_submodel`; self-registering `deploy_state.py`, `capability_manifest.py` |
-| A sweep host that survives a halt | `orchestrator/src/orchestrator/background_service.py::BackgroundService`; `harness.py` registers `stranded-reconcile` and others; the paused branch says background services keep running |
+| A sweep host that survives a halt | `orchestrator/src/orchestrator/background_service.py::BackgroundService` (sleep-first loop: period = interval + pass time); `Harness._build_lifecycle_registry` registers `stranded-reconcile` and others; the paused branch says background services keep running |
+| Sweep config tier | `orchestrator/src/orchestrator/config.py::RELOADABLE_FIELDS` holds no sweep interval; the service reads its interval once at registration. The new keys are restart-only |
+| Born-at-L2 shape | `escalation/src/escalation/models.py::BORN_AT_L2_SEVERITIES` = {`critical`, `urgent`}; the in-process `EscalationQueue.submit` writes what it is given; `escalation/src/escalation/watcher.py::_send_ntfy` pushes `critical`/`urgent`/`blocking` at urgent priority |
 | Pause predicate | `orchestrator/src/orchestrator/scheduler.py::Scheduler.is_paused` |
 | Live-claimant predicate | `shared/src/shared/task_claimant.py::has_live_claimant(task, now, ttl)`, as used by the dispatch gate |
 | Sentinel born-at-L2 escalation precedent | `harness.py::_DIRTY_TREE_ESCALATION_SENTINEL`; harness sentinel role prefix `orchestrator-` (`escalation/src/escalation/server.py::_HARNESS_SENTINEL_ROLE_PREFIXES`) |
 | Naming a dead holder (best-effort) | `session_registry.py::resolve_session_slug_for_pid` (pid → slug via `~/.claude/fleet/sessions-by-pid`); `LEASE_HEARTBEAT_TTL` is the precedent the default `grace_secs` matches (not imported) |
 | `$CLAUDE_PID` names the Claude CLI | measured 2026-10-07 in the authoring session: `/proc/$CLAUDE_PID/comm` = `claude`; `/proc/$CLAUDE_PID/stat` field 22 and `/proc/sys/kernel/random/boot_id` readable; `~/.claude/fleet/sessions-by-pid/$CLAUDE_PID` resolves to the session's slug; a `/team` subagent sees the same pid |
-| The server and the sweep can read other processes' `/proc` | `systemctl --user show` on `fused-memory.service` and `orchestrator-dark-factory.service`: `ProtectProc=default`, `ProcSubset=all`; the fused-memory transport is local (`127.0.0.1:8002`) |
+| The server, the sweep and the dashboard can read other processes' `/proc` | `systemctl --user show` on `fused-memory.service`, `orchestrator-dark-factory.service` and `dark-factory-dashboard.service`: `ProtectProc=default`, `ProcSubset=all` (re-measured 2026-10-08); the fused-memory transport is local (`127.0.0.1:8002`). This is configuration, not a guarantee, hence `ProcessIdentityUnreadable` (decision 6) |
 | The heartbeat is per turn, not continuous | the authoring session's `record.json` mtime was 21 min old mid-turn while it worked continuously, which is why a live holder must never lapse (decision 6) |
-| Client rejection mapping | `scheduler.py::SetTaskStatusRejected` and its subclasses; `Scheduler.set_task_status` `error_code` branches; transient retry |
+| Client rejection mapping | `scheduler.py::SetTaskStatusRejected` and its subclasses; `Scheduler.set_task_status` `error_code` branches; transient retry. Its `agent_id` is fixed and it takes no `client_op_id` today (γ widens it) |
 | Deferred-row read for the sweep and census | `tools.py::get_tasks(statuses=…)` |
 | Script MCP transport | `scripts/legibility/census_trigger.py::post_mcp_tool_call` |
 | Dashboard row shaping; dashboard depends on `shared`, not `orchestrator` | `dashboard/src/dashboard/data/active_tasks.py::_build_task_row`; `dashboard/pyproject.toml` |
@@ -662,168 +789,224 @@ deferral record or the sweep.
 
 ## 9. Decomposition plan
 
-There are six tasks:
-- α, β and ε are intermediates that unblock others.
-- γ and δ are leaves.
-- ζ is the human gate that closes the batch.
+There are six tasks (decomposed 2026-10-08; ids in brackets):
+- α, β, γ, δ and ε are code tasks. Each one's completion signal is its boundary rows, which its
+  own agent can make green in its worktree.
+- ε also carries a live check its own agent can run before β is live (read-only).
+- ζ is the human gate that closes the batch. It is also the integration gate: every live check
+  that needs a service restart onto this batch's code is ζ's, because no task in the batch
+  delivers a restart (decision 12).
 
 Sizes follow the overlay's bands (`.claude/skills/prd/project.md`). No two tasks edit the
-same file.
+same file; the dependency edges serialize any re-grep overlap.
 
-- **α — Deferral record and process identity (shared).** [medium; normal; ~500 LOC; 5 files]
+- **α — Deferral record and process identity (shared).** [6524; high; normal; ~500 LOC; 5 files]
   - Files:
     - `shared/src/shared/task_deferral.py` (new): `DeferralKind`, `CALLER_KINDS`, the request
-      and stored models (RootModel-wrapped union), `Liveness`, `lapse_cause`, `needs_human`,
-      constants, sub-model registration;
-    - `shared/src/shared/process_identity.py` (new);
-    - tests for both (`shared/tests/test_task_deferral.py`, `shared/tests/test_process_identity.py`),
-      using real processes (spawn, capture, kill, re-check), including boundary row 12;
-    - the registration import, wherever the registry needs it loaded.
+      and stored models (the stored shape registered, RootModel-wrapped), `lapse_cause`,
+      `needs_human`, constants including `DEFAULT_SWEEP_INTERVAL_SECS` and
+      `LAPSE_OVERDUE_AFTER_SECS`, sub-model registration;
+    - `shared/src/shared/process_identity.py` (new): `Liveness`, `ProcessIdentity`,
+      `ProcessIdentityUnreadable`, `capture`, `command_name`, `liveness`;
+    - `shared/src/shared/task_metadata.py`: load the `deferral` registration so the key is
+      known in every process that parses metadata (§5.1);
+    - tests for both new modules (`shared/tests/test_task_deferral.py`,
+      `shared/tests/test_process_identity.py`), using real processes (spawn, capture, kill,
+      re-check), including boundary rows 12 and 26 (α half).
   - **Unlocks** β, γ, δ and ε, which import it.
 
 - **β — Server enforcement: gate, arguments, re-stamp, commit scope, clear-on-exit, floor,
-  writers.** [high; normal; ~1,200–1,500 LOC; 13 files] depends on α. Intermediate: it
-  unlocks γ, δ and ε, and its live check proves the producer.
+  writers.** [6525; high; normal; ~1,300–1,600 LOC; 13 files] depends on α. Intermediate: it
+  unlocks γ, δ, ε and ζ.
   - Code:
     - `fused-memory/src/fused_memory/middleware/deferral_gate.py` (new: `plan()`);
-    - `task_interceptor.py` (one `plan()` call and its application, the planning-birth stamp,
-      the `submit_task` refusal, event fields);
-    - `server/tools.py` (`deferral` and `expected_stamped_at` on `set_task_status`;
-      `deferral` and `agent_id` on `commit_planning`; docstrings);
-    - `backends/sqlite_task_backend.py` (the floor with echo passthrough, key removal on exit,
-      the self-heal's drop);
+    - `task_interceptor.py` (one `plan()` call and its application, the internal commit-scope
+      marker, the planning-birth stamp, the `submit_task` refusal, the re-stamp's early return
+      before targeted reconciliation, event fields, the response echo);
+    - `server/tools.py` (`deferral`, `expected_stamped_at` and `restamp_only` on
+      `set_task_status`; `deferral` and `agent_id` on `commit_planning`; docstrings);
+    - `backends/sqlite_task_backend.py` (the floor with echo passthrough in all three modes,
+      `rewrite_audit_trail` passthrough, key removal on exit, the self-heal's drop);
     - `backends/task_backend_errors.py`;
-    - `fused-memory/tests/test_deferral_gate.py` (boundary rows 1–11).
+    - `fused-memory/tests/test_deferral_gate.py` (boundary rows 1–11, 25, 26 (β half), 27).
   - Every repo-tracked writer:
-    - `docs/task-authoring.md`: the §2 table, the §8 key, and a §9 "Deferring a task" recipe
-      with the three not-a-deferral shapes;
+    - `docs/task-authoring.md`: the §2 table, the §8 key, and a "Deferring a task" recipe inside
+      the existing §9 "Practical recipes" (no renumbering).
+      The recipe is the prose home of the hold vocabulary. It covers the three
+      not-a-deferral shapes and the hand-carry hold: `held_by_session` while a session
+      carries the work, re-stamped `carried_by(<carrier>)` when the merge moves to a carrier
+      task. It also covers confirming the response echo.
     - `skills/unblock/SKILL.md`: the hand hold becomes `held_by_session`, and "no sweep moves
       it back" is replaced by the lease rule;
-    - `skills/do/SKILL.md`: the hand-carry guard, including the re-stamp to
-      `carried_by(<carrier>)` when the merge moves to a carrier;
     - `skills/prd/references/decompose-mode.md`: births are stamped; a task held out of the
       commit gets a real record;
-    - `skills/_shared/filing-the-trigger-chain.md`: gates left deferred are re-stamped
-      `until_condition`;
-    - the steward prompt in `orchestrator/src/orchestrator/agents/roles.py`: one sentence
-      saying a steward deferral needs `until_condition`.
+    - `skills/_shared/filing-the-trigger-chain.md`, `docs/quality-findings-contract.md` and
+      `skills/hotspot-survey/SKILL.md`: a chain left deferred past its filing session is
+      re-stamped `until_condition`. Its later release becomes `set_task_status(status='pending')`,
+      because `commit_planning` releases only `planning` holds;
+    - the steward prompt in `orchestrator/src/orchestrator/agents/roles.py`: one new sentence
+      saying a steward deferral needs `until_condition`. It goes live only on an orchestrator
+      restart, so the `deferral_required` hint carries a worked call and stands alone.
   - β re-greps `skills/` and `docs/` for any other instruction that sets `deferred` and lists
     them in its commit. If that would cross 15 files, it files the rest as a follow-up rather
-    than widening.
-  - **Live check:** fused-memory restarts onto β. Then an MCP `set_task_status` to `deferred`
-    on a scratch task without `deferral` returns `deferral_required`, and `get_task` shows the
-    task unchanged. The same call with `deferral={"kind":"until_condition","condition":"…"}`
-    stores the record. A flip to `pending` removes it. The scratch task carries
-    `metadata.milestone {mode:'dated', at:'2099-01-01T00:00:00Z'}` while pending, so the
-    scheduler cannot dispatch it, and it is cancelled at the end. Boundary rows 1–11 are green.
+    than widening. `skills/do/SKILL.md` holds no hold text (its 52 lines never mention
+    `deferred`), so it is not edited.
+  - **Signal:** boundary rows 1–11 and 25–27 are green in the fused-memory suite. The live
+    check after fused-memory restarts onto β is ζ's step 1.
 
-- **γ — Expiry sweep, client mapping, de-flake scope (orchestrator).** [high; normal;
-  ~1,000–1,300 LOC; 11 files] depends on α and β.
+- **γ — Expiry sweep, client mapping, de-flake scope (orchestrator).** [6526; medium; normal;
+  ~1,100–1,400 LOC; 12 files] depends on α and β. Intermediate: it unlocks ζ.
   - Files:
-    - `orchestrator/src/orchestrator/deferral_sweep.py` (new: liveness read,
-      `decide`, pass, sentinel notices, merge-queue check, streak);
+    - `orchestrator/src/orchestrator/deferral_sweep.py` (new: liveness read, `decide`, pass,
+      sentinel notices, merge-queue and train check, streak, edge-triggered pass event);
     - `harness.py` (service registration and the notice filer);
-    - `config.py` + `defaults.yaml` (three keys);
-    - `scheduler.py` (`DeferralRejection`, `expected_stamped_at` forwarding);
-    - `flake_ledger.py` (complete only `planning` owners);
-    - `orchestrator/tests/test_deferral_sweep.py` (rows 13–21), and a flake-ledger test;
-    - `docs/task-escalation-state-spec.md` (the `deferred` row: owner per kind, with the sweep
-      as the only automatic exit);
+    - `config.py` (three restart-only keys);
+    - `scheduler.py` (`DeferralRejection`; optional `agent_id`, `client_op_id` and
+      `expected_stamped_at` on `Scheduler.set_task_status`, which returns the successful
+      response);
+    - `shared/src/shared/task_transitions.py` (the sweep joins the `(DEFERRED, PENDING)`
+      pair's call-site anchor comment);
+    - `flake_ledger.py` (complete only `planning` or unrecorded owners);
+    - `orchestrator/tests/test_deferral_sweep.py` (rows 13–21, 28) and
+      `orchestrator/tests/test_flake_ledger.py`;
+    - `skills/escalation-watcher/SKILL.md` (the `close_only` row for `deferral_holder_lost`);
+    - `docs/task-escalation-state-spec.md` (the `deferred` row: owner per kind, the sweep as the
+      only automatic exit; a pointer to the `docs/task-authoring.md` recipe, not a copy);
     - `ARCHITECTURE.md` (state diagram and planning-mode prose);
-    - `OPERATIONS.md` (the sweep, its config, its events, how the L2 watcher closes a holder
+    - `OPERATIONS.md` (the sweep, its config and events, how the L2 watcher closes a holder
       notice).
-  - **Signal (leaf):** on the live dark_factory orchestrator after restart:
-    - A throwaway interactive session defers a scratch task `held_by_session` with
-      `grace_secs=600`, then exits.
-    - Within one pass, the L2 queue holds one INFO notice on a `deferral-holder:…` sentinel
-      that names its pid and the task.
-    - At most 12 minutes after exit, `get_task` shows the task `pending`, and the run's events
-      hold `deferral_expired{cause:'holder_lost'}`.
-    - A second scratch task, deferred `until_condition` with `expires_at` two minutes ahead, is
-      `pending` within one pass of that time.
-    - Both scratch tasks carry the 2099 dated milestone so they are not dispatched, and both
-      are cancelled at the end.
-    - Rows 13–21 are green.
+  - **Signal:** rows 13–21 and 28 are green in the orchestrator suite. The live check after the
+    orchestrator restarts onto γ is ζ's step 4.
 
-- **ε — Census, migration script, check 6.** [medium; normal; ~700–1,000 LOC; 7 files] depends
-  on α and β.
+- **ε — Census, migration script, check 6.** [6528; medium; normal; ~700–1,000 LOC; 8 files]
+  depends on α and β.
   - Files:
     - `scripts/deferral_census.py` (new);
-    - `scripts/migrate_deferrals.py` (new; dry-run by default; repeatable `--project-root`);
-    - `tests/scripts/test_deferral_census.py` and `tests/scripts/test_migrate_deferrals.py`
-      (rows 22–23);
+    - `scripts/migrate_deferrals.py` (new; dry-run by default; repeatable `--project-root`;
+      every write is a `restamp_only` guarded re-stamp);
+    - `scripts/tests/test_deferral_census.py` and `scripts/tests/test_migrate_deferrals.py`
+      (rows 22–23; `scripts/tests/` is where tests of `scripts/*.py` live);
     - `skills/review-briefing/SKILL.md` (check 6 runs the census);
     - `review/briefing.yaml` (the invariant points at the mechanism instead of restating it,
       and the stale "1147/1853" sentence goes);
-    - `scripts/sitting/ownership.py`: it reads `x_coalesced_into` as a live claim, so it reads
-      `deferral.carrier_task_id` for deferred rows.
-  - **Unlocks** δ (whose signal compares against the census) and ζ.
-  - **Live check:** a dry-run of `scripts/migrate_deferrals.py` against every project with
-    deferred rows prints a per-project class table. For each project, its `carried_by` and
-    `until_condition` counts equal an independent read-only forensic count taken at the same
-    moment: of `x_coalesced_into`, and of `x_armed_by`/`deferred_watch`, among deferred rows.
-    `legacy_unknown` is the remainder. `deferral_census.py --check` exits non-zero and lists
-    the unrecorded rows (pre-migration).
+    - `scripts/sitting/ownership.py` and `scripts/tests/test_sitting_ownership.py`: it reads
+      `x_coalesced_into` as a live claim, so it reads `deferral.carrier_task_id` for deferred
+      rows.
+  - Both scripts enumerate projects from the `orchestrator-*.service` unit files under
+    `~/.config/systemd/user` whose `ExecStart` carries `--config` (no D-Bus needed), rather
+    than a fixed list; repeatable `--project-root` adds or overrides. solar-challenge had 2
+    deferred rows on 2026-10-08 and is not among the four §2 names. A root given by hand with
+    no unit is reported "no sweep: surfaced only". A project whose read fails makes the run
+    exit non-zero and names it.
+  - **Unlocks** δ (whose header count uses the same `needs_human`) and ζ.
+  - **Signal (live, read-only, before β is live):** a dry-run of `scripts/migrate_deferrals.py`
+    against every enumerated project prints a per-project class table. For each project, its
+    `carried_by` and `until_condition` task-id **sets** equal those of an independent
+    read-only forensic read taken at the same moment:
+    - `carried_by`: deferred rows whose `x_coalesced_into` is non-null;
+    - `until_condition`: deferred rows with a non-null `x_armed_by`, or a non-null
+      `deferred_watch` with a `trigger`. Key presence is not enough: 2217 carries
+      `x_armed_by: null`.
 
-- **δ — Dashboard: draw the hold.** [medium; normal; ~400–700 LOC; ~6 files] depends on α, β
-  and ε.
+    Both sides exclude deferred rows that already carry `deferral`, so the check holds whether
+    or not β is live yet. A mismatch counts only if it survives one re-run within a minute
+    (the store moves).
+    `deferral_census.py --check` exits non-zero and lists the unrecorded rows (pre-migration).
+    Rows 22–23 are green.
+
+- **δ — Dashboard: draw the hold.** [6527; medium; normal; ~400–700 LOC; ~7 files] depends on
+  α, β and ε. Intermediate: it unlocks ζ.
   - Files:
-    - `dashboard/src/dashboard/data/active_tasks.py` (`_build_task_row` adds a `deferral`
-      summary and the `needs_human` reason, with liveness from `process_identity`);
-    - `dashboard/src/dashboard/static/redux/tab_tasks.jsx` (rendering and the header count);
-    - `data.js` (row-shape comment);
-    - `styles.css`;
-    - dashboard tests (row 24).
-  - **Signal (leaf):** on the live dashboard, after β is live, with one scratch record of each
-    caller kind written through the MCP (dispatch-proofed as in β):
-    - the tasks tab shows each row's "parked: …" text and age;
-    - an unmigrated legacy row reads "no deferral recorded";
-    - the header's needs-human count equals the count `deferral_census.py` reports for the same
-      project at the same moment.
+    - `dashboard/src/dashboard/data/active_tasks.py`: `_build_task_row` emits a ready-to-render
+      deferral summary (label text, state, age, `needs_human` reason) computed with
+      `task_deferral` and `process_identity`. Carrier status comes from the snapshot's
+      `status_map`, never a per-row `get_task`;
+    - `dashboard/src/dashboard/static/redux/tab_tasks.jsx`: renders those fields with no kind
+      switch (INV-5); a missing field (old backend) renders nothing new, and a `null` summary
+      renders "no deferral recorded"; header count per project;
+    - `data.js` (row-shape comment), `styles.css`, `index.html` (the `?v=` cache-buster bump
+      the freshness guard requires);
+    - dashboard tests (row 24): `dashboard/tests/test_active_tasks.py` and
+      `dashboard/tests/test_tab_tasks_deferral.py`, over δ's own fixture dicts.
+  - Liveness reads for `held_by_session` rows run once per snapshot, off the event loop.
+  - **Signal:** row 24 is green. The live check after β is live and the dashboard restarts is
+    ζ's step 5.
 
-- **ζ — Human gate: apply the migration and triage.** [medium; `execution_class='operational'`
-  pure gate] depends on γ, δ and ε.
-  - The operator runs `scripts/migrate_deferrals.py --apply` for each project with deferred
-    rows (dark_factory, reify, know_live and autopilot_video at authoring), then
-    `scripts/deferral_census.py --check`.
-  - They then:
-    - close or re-pend the closable `carried_by` rows (45 in dark_factory at authoring);
-    - re-pend or re-carry the orphaned ones;
-    - triage `legacy_unknown` rows into a real kind, `pending` or `cancelled` as time allows
-      (the census keeps listing the rest);
-    - update the two file memories that teach the old hold,
-      `procedural_defer_a_pinned_task_to_guard_a_hand_carry.md` and
-      `feedback_hand_carry_procedure.md`, which no dispatched agent can reach.
-  - **Signal (leaf):** `deferral_census.py --check` exits 0 for every migrated project, its
-    `legacy_unknown` count per project is reported, and the dashboard's needs-human count
-    matches the census.
+- **ζ — Human gate: restarts, live checks, migration, triage.** [6529; medium;
+  `execution_class='operational'` pure gate] depends on γ, δ and ε (β and α transitively).
+  The operator works this checklist in order:
+  0. Confirm fused-memory restarted after β's merge (`systemctl --user show fused-memory.service
+     -p ActiveEnterTimestamp`). It normally redeploys within 8 h; otherwise restart it per
+     `OPERATIONS.md`.
+  1. **β live check.** On a scratch task (recipe below): `set_task_status(status="deferred")`
+     without `deferral` returns `deferral_required` and `get_task` shows it unchanged; with
+     `deferral={"kind":"until_condition","condition":"β live check"}` the response echoes the
+     record and `get_task` shows `metadata.deferral`; a flip to `pending` removes it.
+  2. Re-run ε's dry-run, then `scripts/migrate_deferrals.py --apply` for every enumerated
+     project, then `scripts/deferral_census.py --check`. Doing the migration before the
+     orchestrator restart is preferred, not load-bearing: a sweep that meets unrecorded rows
+     holds them. Run it when no planning batch is mid-decompose. A pre-β uncommitted birth is
+     stamped `legacy_unknown`, and its later `commit_planning(pending)` fails
+     `not_planning_hold`; release it with `set_task_status(status='pending')`.
+  3. A drained fleet restart (`OPERATIONS.md` §"Fleet redeploy & watchdog", after the
+     merge-queue check in `CLAUDE.md`), so γ is live on every project's orchestrator.
+  4. **γ live check.** A throwaway session (`/spawn`) defers a scratch task `held_by_session`
+     with its own `$CLAUDE_PID` and `grace_secs=600`, then exits. Within one pass, the L2 queue
+     holds one `deferral_holder_lost` notice on a `deferral-holder:…` sentinel naming its pid
+     and the task. At most `grace_secs` plus three sweep intervals (13 min) after the exit,
+     `get_task` shows the task `pending`, and the run's events hold
+     `deferral_expired{cause:'holder_lost'}`. A second scratch task deferred `until_condition`
+     with `expires_at` two minutes ahead is `pending` within two sweep intervals of that time.
+  5. Restart the dashboard (`scripts/restart-dashboard.sh`). **δ live check:** with one
+     scratch record of each caller kind, the tasks tab shows each row's "parked: …" text and
+     age, an unmigrated row, if any is left, reads "no deferral recorded", and the header's
+     needs-human count for dark_factory equals `deferral_census.py`'s for the same project,
+     both read on this host within the same minute. A mismatch counts only if a re-read
+     repeats it.
+  6. Close or re-pend the closable `carried_by` rows (45 in dark_factory at authoring), and
+     re-pend or re-carry the orphaned ones. Triage `legacy_unknown` rows, de-flake owners
+     first, into a real kind, `pending` or `cancelled`, as time allows.
+  7. **Successor owner (INV-7).** For each project where `legacy_unknown` or other needs-human
+     rows remain, file one successor pure gate before closing ζ. It names
+     `/home/leo/src/dark-factory/scripts/deferral_census.py --project-root <root>` as its check
+     and carries a `metadata.milestone {mode:'delayed', after_secs: 2592000}`, so the remainder
+     keeps an owner and a 30-day bound.
+  8. Update the two file memories that teach the old hold,
+     `procedural_defer_a_pinned_task_to_guard_a_hand_carry.md` and
+     `feedback_hand_carry_procedure.md`, and their two `MEMORY.md` index lines, to point at the
+     `docs/task-authoring.md` recipe.
+  9. Confirm the holder-notice severity Leo ruled (§12 item 2) matches what γ shipped.
+  10. Cancel every scratch task.
+
+  **Scratch-task recipe.** `submit_task(planning_mode=True, task_kind='normal', priority='low',
+  title='SCRATCH deferral live check <step> <date>', metadata={'milestone': {'mode':'dated',
+  'at':'2099-01-01T00:00:00Z'}, 'x_scratch_for':'deferral-flip-condition-prd'})`, then
+  `commit_planning` to `pending`. The dated milestone withholds it from dispatch
+  (`Scheduler._milestone_time_gated`). Never pin it, give each a distinct title, and cancel it
+  at the end.
+
+  **Signal (leaf):** `deferral_census.py --check` exits 0 for every migrated project, each
+  project's `legacy_unknown` count is reported, the step 1, 4 and 5 live checks passed, and
+  every project with needs-human rows left has a successor gate.
 
 Dependencies: α → β; α, β → γ; α, β → ε; α, β, ε → δ; γ, δ, ε → ζ. γ and ε run in parallel
-once β lands, and δ follows ε.
+once β lands, and δ follows ε. One out-of-batch follow-up: reify's audit-skill re-stamp
+(reify 8368), which depends on β through `metadata.external_deps`.
 
-### Capability bindings (draft for the decompose manifest)
+### Capability bindings
 
-| Task | Capability | Evidence |
-|---|---|---|
-| β | refusal before mutation at the choke point | `_apply_status_transition` gate order (the step-2b precedent) |
-| β | atomic record + status | `set_status_and_stamp_audit` via `audit_fields` |
-| β | `update_task` cannot bypass | the `done_provenance` floor in `SqliteTaskBackend.update_task`, to clone |
-| β | births stamped | `_submit_task_planning_mode` is the only `deferred` birth path (critic grep 2026-10-07) |
-| β | holder corroboration | `/proc/<pid>/comm`, `/proc/<pid>/stat` and `boot_id` readable by the fused-memory unit (§7) |
-| γ | the sweep runs while halted | `BackgroundService` registration in `harness.py` |
-| γ | dead holder named in its notice | `resolve_session_slug_for_pid` (best-effort; pid is always present) |
-| γ | a notice reaches the human queue without pinning the task | the sentinel born-at-L2 precedent (`_DIRTY_TREE_ESCALATION_SENTINEL`) |
-| γ | the rejection reaches the client typed | `Scheduler.set_task_status` `error_code` branches |
-| δ | real records to draw (INV-13) | β's producer is live, and the signal requires one record per caller kind written through the MCP |
-| ε | counts checkable | read-only forensic query per `CLAUDE.md` §"Forensic reads of tasks.db" |
+The committed manifest is `plans/deferral-flip-condition-prd.capability-manifest.md`, with
+its machine-readable twin `plans/deferral-flip-condition-prd.capability-manifest.yaml`. It
+binds every task's capabilities to evidence on `fc55c9c7c8`. Its mechanical delivered checks
+gate each producer's dependents.
 
 G7 walk (advisory at author time, against `docs/legibility/design-invariants.md`):
 - INV-1: the contract is a schema plus a server guard, with its envelope in the tool docstring.
 - INV-2: refusals and events carry `reason_code`, `field`, `value` and the cleared record.
 - INV-3: the sweep's write is a compare-and-set at the choke point, plus the claimant and
   merge-in-flight guards, and the holder is corroborated at write time.
-- INV-4: a failure-streak cap, one notice per holder by sentinel, and pass events only when
-  non-zero.
+- INV-4: a failure-streak cap, one notice per holder by sentinel, and edge-triggered pass
+  events.
 - INV-5: one kind vocabulary and one `needs_human`, both in `task_deferral.py`.
 - INV-6: `held_by_session` implies a live owner, the sweep is its reconciler, and the
   dashboard shows liveness.
@@ -837,6 +1020,29 @@ G7 walk (advisory at author time, against `docs/legibility/design-invariants.md`
   "no hold".
 - INV-12: `planning` is owned by `commit_planning`, and `legacy_unknown` by gate ζ.
 - INV-13: "no deferral recorded" and "no producer has written" are distinct states.
+
+G7 re-walk at decompose (2026-10-08). An adversarial seat walked every task against every
+invariant and found ten hits. Each is resolved in the task text and the decisions above;
+none is waived:
+- α, `no-silent-fail-soft`: an unreadable `/proc` raises `ProcessIdentityUnreadable`, never
+  reads as `DEAD` (decision 6).
+- β, `loop-thread-occupancy-bounded`: the `/proc` reads run off the event loop, before the
+  write lock (decision 5).
+- β, `no-silent-fail-soft`: the response echo, plus instructions that verify it, because an
+  old server silently drops the unknown argument (decision 3).
+- β, `one-fact-one-home`: `docs/task-authoring.md` §9 is the prose home of the hold
+  vocabulary; other docs point at it.
+- γ, `storm-escape-required`: edge-triggered pass events (decision 7).
+- γ, `loop-thread-occupancy-bounded`: the archive-wide dedup scan runs once, off the loop, at
+  service start (decision 7).
+- γ, `contracts-machine-checked`: the watcher's `close_only` row for the new category, and a
+  fixed `make_id` key.
+- δ, `no-lockstep-duplication`: the backend emits a ready-to-render summary; the JSX has no kind
+  switch.
+- ε, `corroborate-before-acting`: every migration write is a `restamp_only` guarded re-stamp
+  (decision 3).
+- ζ, `holds-owned-and-bounded`: remaining needs-human rows get a successor gate with a 30-day
+  bound (§9 ζ step 7).
 
 No waiver.
 
@@ -869,8 +1075,64 @@ No waiver.
 3. **Registration loading.** Self-registering modules must be imported before
    `parse_metadata` runs. α follows whatever mechanism loads `deploy_state.py` and
    `capability_manifest.py` today.
-4. **Default priority.** β is suggested high, because it closes the stranding source; the
-   others medium. Decide at decompose.
+4. **Default priority.** Decided at decompose: α and β high (α is β's only prerequisite, so
+   a medium α would invert the critical path), γ, δ, ε and ζ medium.
 5. **Merge-queue lookup.** γ uses whichever read of its own harness's merge queue names
    queued and verifying entries by task id. It considers the task's own id only; the carrier
    case is covered by the re-stamp to `carried_by`.
+
+## 12. Decompose record (2026-10-08)
+
+The decompose ran as a `/team`: an anchor re-walk (sonnet), an adversarial G6/G7 seat (opus),
+a manifest seat (sonnet) and a fresh critic (opus). Main had moved from `5b645d822a` to
+`fc55c9c7c8`. What changed in this document, and why:
+
+1. **Live checks moved to ζ.** No task in the batch restarts a service. fused-memory redeploys
+   on its own 8 h staleness clock, orchestrator fleet deploys are paused (task 5020), and the
+   dashboard has no staleness redeploy. So a post-merge, post-restart check cannot be run by
+   the agent that owns the task. β, γ and δ complete on their boundary rows, γ and δ became
+   intermediates, and ζ became the integration gate that orders the restarts (decision 12,
+   §9). ε's live check stays in ε, because it reads only and needs no restart.
+2. **Notice severity.** "Born-at-L2 INFO" is incoherent to the escalation package: born at L2
+   means `critical` or `urgent`. The notice is `urgent` with the informational category
+   `deferral_holder_lost` (decision 7). **Leo may prefer** a default-priority phone push, which
+   needs `severity='info'` at level 2 and an explicit exception to the models' contract. That
+   change belongs in γ's text, before γ dispatches.
+3. **Sweep interval ownership.** "Two sweep intervals" had no owner upstream of α and ε (the
+   manifest's two `producer-downstream` FAILs). α now owns `DEFAULT_SWEEP_INTERVAL_SECS` and
+   `LAPSE_OVERDUE_AFTER_SECS`, and γ's config default reads the former (§5.1).
+4. **Config tier.** The sweep keys are restart-only like their siblings. "Green-tier" was
+   false (decision 7).
+5. **Contract additions:** `restamp_only` and the response echo (decision 3, §5.3);
+   `holder_unverifiable` and `ProcessIdentityUnreadable` (decisions 5 and 6); the internal
+   commit-scope marker; the re-stamp's early return before targeted reconciliation; and
+   `Scheduler.set_task_status`'s optional `agent_id`, `client_op_id` and `expected_stamped_at`
+   (§5.4).
+6. **Writers.** `rewrite_audit_trail` (task 5771) is a second whole-blob writer, so the floor
+   binds it. The `update_task` echo rule is new behaviour in `merge`/`additive`, not a clone.
+   `skills/do/SKILL.md` holds no hold text; the hand-carry recipe is new content in
+   `docs/task-authoring.md` §9. Trigger-chain prose in three files leaves chains deferred
+   across sessions; it re-stamps them and releases them with `set_task_status`.
+7. **Placement.** `Liveness` lives in `process_identity.py` (an import cycle otherwise), and
+   `task_metadata.py` loads the `deferral` registration so every process knows the key (§5.1).
+8. **Paths and projects.** Script tests live in `scripts/tests/`. Scripts enumerate projects
+   from the running orchestrator units: solar-challenge had 2 deferred rows. ε's live check
+   compares id sets and counts values, not keys.
+9. **Other repos.** reify's audit skill leaves planning births deferred as triage proposals.
+   Births are never refused, so the hint cannot correct it; a reify follow-up re-stamps them
+   (reify 8368, external dependency on β).
+10. **Critic pass.** A fresh critic seat's findings were folded in. They covered:
+    - the registration's import shape (§5.1);
+    - `needs_human` taking `Liveness | None` → `liveness_unknown`;
+    - the `proc_root` test seam;
+    - `restamp_only`'s edge refusals;
+    - the migration's echo abort and `legacy_unknown` fallback (decision 9);
+    - `Scheduler.set_task_status` returning the response;
+    - an explicit train-membership read, with row 18's flip case;
+    - rows 22–24 over fixtures;
+    - rows 13 and 19 and decision 2 aligned to the notice shape;
+    - the sweep interval bounded by the overdue threshold;
+    - project enumeration from unit files.
+11. **Population** at decompose (read-only, 2026-10-08): dark_factory 334 deferred, 158 with
+    `x_coalesced_into` (carriers: 113 `pending`, 45 `done`); reify 227; know_live 10;
+    autopilot_video 1; solar-challenge 2.
