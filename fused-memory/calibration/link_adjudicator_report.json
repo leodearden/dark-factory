@@ -1,0 +1,185 @@
+{
+  "arms": [
+    {
+      "arm": "opus",
+      "corrects_recall": 0.8828828828828829,
+      "corrects_recall_ci95": [
+        0.8098841750443868,
+        0.930265735789318
+      ],
+      "corrects_recall_den": 111,
+      "corrects_recall_num": 98,
+      "cost_usd": 7.3129536,
+      "failure_storm": null,
+      "false_corrects_rate": 0.004291845493562232,
+      "false_corrects_rate_ci95": [
+        0.0007579987871743476,
+        0.023906587163942346
+      ],
+      "false_corrects_rate_den": 233,
+      "false_corrects_rate_num": 1,
+      "false_detach_rate": 0.0029069767441860465,
+      "false_detach_rate_ci95": [
+        0.0005133240107990933,
+        0.016280526983446564
+      ],
+      "false_detach_rate_den": 344,
+      "false_detach_rate_num": 1,
+      "kind_agreement": 0.9254658385093167,
+      "kind_agreement_always_amendment_baseline": 0.8881987577639752,
+      "kind_agreement_always_amendment_baseline_ci95": [
+        0.8302023723261438,
+        0.9281013568296033
+      ],
+      "kind_agreement_always_amendment_baseline_den": 161,
+      "kind_agreement_always_amendment_baseline_num": 143,
+      "kind_agreement_ci95": [
+        0.8742484769216827,
+        0.956852410233016
+      ],
+      "kind_agreement_den": 161,
+      "kind_agreement_num": 149,
+      "misfile_recall": 0.8666666666666667,
+      "misfile_recall_ci95": [
+        0.6211750079348376,
+        0.9626395301086407
+      ],
+      "misfile_recall_den": 15,
+      "misfile_recall_num": 13,
+      "parse_failure_rate": 0.0,
+      "parse_failure_rate_ci95": [
+        0.0,
+        0.010587540127703108
+      ],
+      "parse_failure_rate_den": 359,
+      "parse_failure_rate_num": 0
+    },
+    {
+      "arm": "sonnet",
+      "corrects_recall": 0.6666666666666666,
+      "corrects_recall_ci95": [
+        0.5746929345584374,
+        0.7474899678044694
+      ],
+      "corrects_recall_den": 111,
+      "corrects_recall_num": 74,
+      "cost_usd": 2.7138478000000004,
+      "failure_storm": null,
+      "false_corrects_rate": 0.02575107296137339,
+      "false_corrects_rate_ci95": [
+        0.011854044718643295,
+        0.05503285352896187
+      ],
+      "false_corrects_rate_den": 233,
+      "false_corrects_rate_num": 6,
+      "false_detach_rate": 0.04941860465116279,
+      "false_detach_rate_ci95": [
+        0.0310801633316574,
+        0.07770958464558282
+      ],
+      "false_detach_rate_den": 344,
+      "false_detach_rate_num": 17,
+      "kind_agreement": 0.8695652173913043,
+      "kind_agreement_always_amendment_baseline": 0.8881987577639752,
+      "kind_agreement_always_amendment_baseline_ci95": [
+        0.8302023723261438,
+        0.9281013568296033
+      ],
+      "kind_agreement_always_amendment_baseline_den": 161,
+      "kind_agreement_always_amendment_baseline_num": 143,
+      "kind_agreement_ci95": [
+        0.8088234681350441,
+        0.9130816820212271
+      ],
+      "kind_agreement_den": 161,
+      "kind_agreement_num": 140,
+      "misfile_recall": 0.6666666666666666,
+      "misfile_recall_ci95": [
+        0.41713125151212976,
+        0.8482389930530876
+      ],
+      "misfile_recall_den": 15,
+      "misfile_recall_num": 10,
+      "parse_failure_rate": 0.0,
+      "parse_failure_rate_ci95": [
+        0.0,
+        0.010587540127703108
+      ],
+      "parse_failure_rate_den": 359,
+      "parse_failure_rate_num": 0
+    }
+  ],
+  "population": {
+    "excluded": 0,
+    "excluded_by_reason": {},
+    "n_belongs": 344,
+    "n_corrects": 111,
+    "n_misfile": 15,
+    "n_pairs": 359,
+    "n_unclear": 0
+  },
+  "provenance": {
+    "brief_sha256": "7f161b0ed8b8cd5d24592a926068c00d075efdc2106375d65cfe1879bbebed11",
+    "corpus_sha256": "e8a2574c8cc4e8c1835189902e763c07e4987da1e66aae8edd020e80c9854b75",
+    "field_chars": 4000,
+    "mode": "hand_link",
+    "pairs_sha256": null,
+    "shard_size": 40,
+    "text_key_basis": "texts read live by id through get_memory_by_id, kept only while they hash to the corpus row",
+    "text_keys": null
+  },
+  "selection": {
+    "arm": "opus",
+    "corrects_recall": 0.8828828828828829,
+    "corrects_recall_ci95": [
+      0.8098841750443868,
+      0.930265735789318
+    ],
+    "corrects_recall_den": 111,
+    "corrects_recall_num": 98,
+    "cost_usd": 7.3129536,
+    "failure_storm": null,
+    "false_corrects_rate": 0.004291845493562232,
+    "false_corrects_rate_ci95": [
+      0.0007579987871743476,
+      0.023906587163942346
+    ],
+    "false_corrects_rate_den": 233,
+    "false_corrects_rate_num": 1,
+    "false_detach_rate": 0.0029069767441860465,
+    "false_detach_rate_ci95": [
+      0.0005133240107990933,
+      0.016280526983446564
+    ],
+    "false_detach_rate_den": 344,
+    "false_detach_rate_num": 1,
+    "kind_agreement": 0.9254658385093167,
+    "kind_agreement_always_amendment_baseline": 0.8881987577639752,
+    "kind_agreement_always_amendment_baseline_ci95": [
+      0.8302023723261438,
+      0.9281013568296033
+    ],
+    "kind_agreement_always_amendment_baseline_den": 161,
+    "kind_agreement_always_amendment_baseline_num": 143,
+    "kind_agreement_ci95": [
+      0.8742484769216827,
+      0.956852410233016
+    ],
+    "kind_agreement_den": 161,
+    "kind_agreement_num": 149,
+    "misfile_recall": 0.8666666666666667,
+    "misfile_recall_ci95": [
+      0.6211750079348376,
+      0.9626395301086407
+    ],
+    "misfile_recall_den": 15,
+    "misfile_recall_num": 13,
+    "parse_failure_rate": 0.0,
+    "parse_failure_rate_ci95": [
+      0.0,
+      0.010587540127703108
+    ],
+    "parse_failure_rate_den": 359,
+    "parse_failure_rate_num": 0
+  }
+}
