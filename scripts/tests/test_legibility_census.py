@@ -35,6 +35,7 @@ from legibility import (
     census_trigger,
     census_window,
     check_census_report,
+    invariants,
     session_ledger,
     session_runner,
     trickle_state,
@@ -2599,6 +2600,62 @@ def test_run_census_persists_run_identity_and_repo_relative_report(tmp_path):
         "session_watermark": None,
         "last_census_done_count": 5,
     }
+
+
+def _declared_and_free_text_slug_response(prompt, model):
+    """A mining reply matching entry-a: the `digest-alpha` session names the
+    declared slug, every other session a free-text value."""
+    if prompt == mod._HEADROOM_PROBE_PROMPT:
+        return "pong"
+    slug = "known-slug" if "digest-alpha" in prompt else "free-text-one"
+    return json.dumps(
+        {"matches": [{"entry_id": "entry-a", "invariant_violated": slug}], "candidates": []}
+    )
+
+
+def _invariant_slugs_block(prompt):
+    return prompt.split("=== INVARIANT SLUGS ===\n", 1)[1].split("\n=== ", 1)[0]
+
+
+def test_run_census_screens_mined_slugs_and_warns_once(tmp_path, caplog):
+    """plans/census-incremental-prd.md §4.8 row 15 on the census path."""
+    doc = tmp_path / invariants.DOC_RELPATH
+    doc.parent.mkdir(parents=True)
+    doc.write_text("## INV-1 `known-slug`\n", encoding="utf-8")
+    fake_invoke = _make_fake_invoke(_declared_and_free_text_slug_response)
+    kwargs = _run_census_kwargs(
+        tmp_path,
+        invoke=fake_invoke,
+        batch_source=[[
+            _hand_digest("digest-alpha", "one confusion"),
+            _hand_digest("digest-beta", "another confusion"),
+        ]],
+        verify_fn=_make_fake_verify_fn(),
+        synthesize_fn=_make_fake_synthesize_fn(),
+        status_fetcher=_make_fake_status_fetcher(5),
+        commit=_make_fake_commit(),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    mining_prompts = [
+        c["prompt"] for c in fake_invoke.calls if c["prompt"] != mod._HEADROOM_PROBE_PROMPT
+    ]
+    assert len(mining_prompts) == 2
+    for prompt in mining_prompts:
+        assert "- known-slug" in _invariant_slugs_block(prompt).splitlines()
+    persisted = codebook.load(kwargs["codebook_path"])
+    [entry] = [e for e in persisted["entries"] if e["id"] == "entry-a"]
+    by_session = {s["session"]: s for s in entry["sightings"]}
+    assert by_session["digest-alpha"]["invariant_violated"] == "known-slug"
+    assert "invariant_violated" not in by_session["digest-beta"]
+    naming_it = [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and "free-text-one" in r.getMessage()
+    ]
+    assert len(naming_it) == 1, naming_it
 
 
 def test_run_census_rejects_a_report_path_outside_project_root_before_any_spend(tmp_path):
