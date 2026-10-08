@@ -103,12 +103,13 @@ _TESTS_DIR = Path(__file__).resolve().parent
 _MIN_EXPECTED_TEST_FILES = 400
 _MIN_EXPECTED_SCANNERS = 10
 
-# Worst per-call wall clock MEASURED for a member of this family under REAL
-# load: 30.75s for the serial-worker import guard (deleted by task 5034) at
-# loadavg 120-176 (task 4215's record; ~4.8x its 6.46s unloaded figure).  Named rather than
-# left in prose so the floor below is anchored to a measurement instead of only
-# to a ratio against a setting that can itself move.
-_MEASURED_UNDER_LOAD_WORST_CASE = 30.75
+# Worst wall clock MEASURED for a member of this family under REAL load: task
+# 5442's full orchestrator suite under `-n auto` (32 workers), loadavg 89.5 ->
+# 67.7 with a mid-run peak of 365, put test_merge_lane_ratchet.py's
+# module-scoped fixture setup at 51.87s.  Task 5572's targeted re-measurement
+# (2026-10-08, worst 37.61s) did not exceed it, and the worst run is kept,
+# never the freshest.  Corpus: plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+_MEASURED_UNDER_LOAD_WORST_CASE = 51.87
 
 # ABSOLUTE floor in seconds, deliberately independent of
 # PYPROJECT_DEFAULT_TIMEOUT -- and, since 2026-09-12, the PRIMARY anchor for
@@ -271,8 +272,8 @@ class TestTimeoutConstants:
             f'({PYPROJECT_DEFAULT_TIMEOUT}s, asserted separately below) -- so '
             'the likeliest cause of this failure is the constant being lowered '
             'by hand. The family ceiling must stay anchored to the measured '
-            f'cost ({_MEASURED_UNDER_LOAD_WORST_CASE}s per call at loadavg '
-            '120-176, with worker deaths at loadavg 250-423), not to whichever '
+            f'cost ({_MEASURED_UNDER_LOAD_WORST_CASE}s under load, with worker '
+            'deaths at loadavg 250-423), not to whichever '
             'setting it happens to clear -- pin it explicitly rather than '
             'lowering this floor.'
         )
@@ -890,7 +891,8 @@ def test_whole_tree_scanners_carry_module_level_timeout_mark() -> None:
             '    pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)\n\n'
             'at module level in each. These modules rglob() every *.py in the '
             'repo and ast.parse() each one; under `-n auto` that has been '
-            'MEASURED at 30.75s per call at loadavg 120-176, against the '
+            f'MEASURED at up to {_MEASURED_UNDER_LOAD_WORST_CASE}s under load, '
+            'against the '
             f'per-test default in {ORCH_PYPROJECT.name}. Exceeding it does NOT fail '
             'the '
             "test: pytest-timeout's thread method os._exit()s the whole xdist "
