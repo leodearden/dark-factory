@@ -945,6 +945,179 @@ class TestSerialPytest:
         )
 
 
+class _RecordingOptionGroup:
+    def __init__(self) -> None:
+        self.options: list[tuple[tuple[str, ...], dict]] = []
+
+    def addoption(self, *names: str, **attrs) -> None:
+        self.options.append((names, attrs))
+
+    _addoption = addoption
+
+
+class _RecordingParser:
+    def __init__(self) -> None:
+        self.group = _RecordingOptionGroup()
+
+    def getgroup(self, *_args, **_kwargs) -> _RecordingOptionGroup:
+        return self.group
+
+    def addini(self, *_args, **_kwargs) -> None:
+        pass
+
+
+#: argparse actions that consume no value token.
+_ZERO_ARG_ACTIONS = frozenset({'store_true', 'store_false', 'store_const', 'append_const', 'count'})
+
+
+def xdist_option_surface() -> dict[str, bool]:
+    """Every option name pytest-xdist registers, mapped to "takes a value token".
+
+    Read from ``xdist.plugin.pytest_addoption`` itself through a recording
+    parser stub rather than restated, so an xdist upgrade that adds an option
+    turns the shed tests red here instead of surfacing as an ``unrecognized
+    arguments`` failure on a serial-recovery verify leg.
+    """
+    from xdist.plugin import pytest_addoption
+
+    parser = _RecordingParser()
+    pytest_addoption(parser)
+    return {
+        name: attrs.get('action', 'store') not in _ZERO_ARG_ACTIONS
+        for names, attrs in parser.group.options
+        for name in names
+    }
+
+
+def xdist_offenders(tokens: list[str]) -> list[str]:
+    """The tokens of *tokens* that pytest would read as an xdist option."""
+    surface = xdist_option_surface()
+
+    def is_xdist(token: str) -> bool:
+        if token in surface:
+            return True
+        for name, takes_value in surface.items():
+            if not takes_value:
+                continue
+            if name.startswith('--') and token.startswith(f'{name}='):
+                return True
+            if not name.startswith('--') and token.startswith(name) and len(token) > len(name):
+                return True
+        return False
+
+    return [token for token in tokens if is_xdist(token)]
+
+
+_XDIST_SAMPLE_VALUES = {
+    '-n': '4', '--numprocesses': '4', '--maxprocesses': '2',
+    '--max-worker-restart': '3', '--dist': 'loadgroup', '--tx': 'popen',
+    '--px': 'x', '--rsyncdir': 'd', '--rsyncignore': 'g',
+    '--testrunuid': 'u', '--maxschedchunk': '2',
+}
+
+
+def _xdist_value_option_params():
+    return [
+        pytest.param(name, _XDIST_SAMPLE_VALUES.get(name, 'v'), id=name)
+        for name, takes_value in sorted(xdist_option_surface().items())
+        if takes_value
+    ]
+
+
+def _xdist_boolean_option_params():
+    return [
+        pytest.param(name, id=name)
+        for name, takes_value in sorted(xdist_option_surface().items())
+        if not takes_value
+    ]
+
+
+def _xdist_argv_spelling_params():
+    """Every argv spelling of every xdist option: separate, attached, boolean."""
+    params = []
+    for name, takes_value in sorted(xdist_option_surface().items()):
+        if not takes_value:
+            params.append(pytest.param(name, id=name))
+            continue
+        value = _XDIST_SAMPLE_VALUES.get(name, 'v')
+        params.append(pytest.param(f'{name} {value}', id=f'{name}-separate'))
+        attached = f'{name}={value}' if name.startswith('--') else f'{name}{value}'
+        params.append(pytest.param(attached, id=f'{name}-attached'))
+    return params
+
+
+class TestSerialPytestShedsEveryXdistOption:
+    """``serial_pytest`` sheds xdist's WHOLE option surface from argv.
+
+    ``-p no:xdist`` unregisters every option xdist adds, not just the worker
+    count, so any xdist option surviving on argv is a hard
+    ``unrecognized arguments`` (rc=4) on the recovery run. The option set is
+    derived from xdist itself (``xdist_option_surface``), never restated.
+    """
+
+    @staticmethod
+    def _recover(command: str) -> str:
+        return render(serial_pytest(parse_config_command(command)))
+
+    def _assert_shed(self, rendered: str, *, what: str) -> None:
+        offenders = xdist_offenders(shlex.split(rendered))
+        assert not offenders, (
+            f'{what}: serial recovery left xdist option(s) {offenders} on argv; '
+            f'with `-p no:xdist` appended pytest exits rc=4 with '
+            f'`unrecognized arguments`.\nrendered: {rendered!r}'
+        )
+        assert '-p no:xdist' in rendered, rendered
+        assert parse_config_command(rendered).targets == ('tests/',), (
+            f'{what}: `tests/` must stay the ONLY positional target — a value '
+            f'stranded by a half-shed flag runs as a phantom target.\n'
+            f'rendered: {rendered!r}'
+        )
+
+    def test_the_oracle_sees_xdist_s_known_options(self):
+        """Non-vacuity: the stub really read xdist's registrations."""
+        surface = xdist_option_surface()
+        assert surface['-n'] is True
+        assert surface['--max-worker-restart'] is True
+        assert surface['-d'] is False
+        assert surface['--no-loadscope-reorder'] is False
+
+    @pytest.mark.parametrize(('option', 'value'), _xdist_value_option_params())
+    def test_separate_token_value_form_is_shed_with_its_value(self, option, value):
+        self._assert_shed(
+            self._recover(f'uv run pytest {option} {value} tests/'),
+            what=f'{option} {value}',
+        )
+
+    @pytest.mark.parametrize(('option', 'value'), _xdist_value_option_params())
+    def test_attached_form_is_shed_as_one_token(self, option, value):
+        attached = f'{option}={value}' if option.startswith('--') else f'{option}{value}'
+        self._assert_shed(
+            self._recover(f'uv run pytest {attached} tests/'), what=attached,
+        )
+
+    @pytest.mark.parametrize('attached', ['-nauto', '-n4'])
+    def test_attached_short_worker_count_is_shed(self, attached):
+        self._assert_shed(
+            self._recover(f'uv run pytest {attached} tests/'), what=attached,
+        )
+
+    @pytest.mark.parametrize('option', _xdist_boolean_option_params())
+    def test_boolean_form_is_shed_without_eating_the_next_token(self, option):
+        rendered = self._recover(f'uv run pytest {option} -q tests/')
+        self._assert_shed(rendered, what=option)
+        assert '-q' in shlex.split(rendered), (
+            f'{option} is boolean, so shedding it must not swallow the '
+            f'following `-q`: {rendered!r}'
+        )
+
+    @pytest.mark.parametrize('spelling', _xdist_argv_spelling_params())
+    def test_a_raw_chain_carrying_any_xdist_option_is_refused_by_identity(self, spelling):
+        """No sound raw surgery exists, so the chain is handed back untouched."""
+        cmd = parse_config_command(f'pytest {spelling} tests/ && true')
+        assert cmd.raw is not None
+        assert serial_pytest(cmd) is cmd
+
+
 class TestRawRewriteDoesNotSwallowSubshellTerminator:
     """The raw-retained rewrite must append INSIDE a subshell, not after its `)`.
 
