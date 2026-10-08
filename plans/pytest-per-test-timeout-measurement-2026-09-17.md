@@ -20,7 +20,7 @@ measurement. Three configs — the repo root, `cockpit` and `sampler` — carrie
 
 ## The derivation rule
 
-    derived = max(300, round_up_to_multiple_of_60(worst_unmarked_wall_clock * 8))
+    derived = max(_ABSOLUTE_FLOOR_SECONDS, round_up_to_multiple_of_60(worst_unmarked_wall_clock * 8))
 
 Adopted wholesale from what this repo already justifies, rather than invented:
 
@@ -30,12 +30,17 @@ Adopted wholesale from what this repo already justifies, rather than invented:
   observed at loadavg 250-423 — one inflation step PAST the load at which
   measurements can be taken — so the value has to clear a figure nobody has
   managed to measure directly.
-- The **300 floor** is that same file's `_ABSOLUTE_FLOOR_SECONDS`, which is
-  itself anchored to an independent measurement
-  (`_MEASURED_UNDER_LOAD_WORST_CASE = 30.75` at loadavg 120-176, x8 = 246,
-  rounded up). It is a never-narrow term: taking the max of two measured anchors
-  can only validate or raise the number, never discard the older evidence and
-  re-open the CPU-starvation false-red that the 60 -> 300 raise closed.
+- The **floor** is
+  `orchestrator/tests/test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS`,
+  which is itself anchored to an independent measurement of the whole-tree-scan
+  family. It was 300 when this sweep ran (`_MEASURED_UNDER_LOAD_WORST_CASE =
+  30.75` at loadavg 120-176, x8 = 246, rounded up); task 5572 re-anchored it to
+  **420** (51.87 x 8 = 414.96, rounded up — see the addendum at the end).
+  Re-evaluating the rule with the 420 floor leaves the ini value at 540:
+  max(420, 540) = 540. It is a never-narrow term: taking the max of two measured
+  anchors can only validate or raise the number, never discard the older
+  evidence and re-open the CPU-starvation false-red that the 60 -> 300 raise
+  closed.
 - **Rounding to a multiple of 60** keeps the value readable as whole minutes,
   matching how the existing 60 and 300 read.
 
@@ -239,6 +244,7 @@ this repo's existing convention for exactly this reason.
     x UNDER_LOAD_HEADROOM_FACTOR (8)                           = 492.16s
     round up to a multiple of 60                               = 540s
     max(300, 540)                                              = 540s
+      (300 was the floor on 2026-09-17; with task 5572's 420, max(420, 540) = 540s)
 
 ## THE RESULT: 540 seconds. The measurement RAISES the value; it does not validate it.
 
@@ -258,7 +264,10 @@ to surface faster.
 
 ## Residue, recorded rather than left silent
 
-1. **The whole-tree-scan family's measurement anchor is stale, though its value
+1. **RESOLVED by task 5572** — the anchor is now 51.87s and the floor 420; see
+   "Re-anchoring addendum (task 5572, 2026-10-08)" below. The original record
+   follows.
+   **The whole-tree-scan family's measurement anchor is stale, though its value
    is no longer binding.** `_ABSOLUTE_FLOOR_SECONDS = 300` is justified by
    `_MEASURED_UNDER_LOAD_WORST_CASE = 30.75` (task 4215, loadavg 120-176) times
    the same 8x factor. This sweep measured a MARKED member of that family at
@@ -302,3 +311,98 @@ to surface faster.
    1.3-1.7x, so applying the largest of it to the next-worst unmarked figure in
    the corpus (25.27s) yields ~43s, still comfortably below the 61.52s the value
    is derived from.
+
+## Re-anchoring addendum (task 5572, 2026-10-08)
+
+Task 5572 re-derived two marked-test ceilings in `orchestrator/tests/` by the
+rule above: the whole-tree-scan family's floor
+(`test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS`) and
+`test_merge_queue_concurrent_verify.py::HEAVY_BARRIER_TEST_TIMEOUT`.
+
+### Method
+
+Base `057aeed7d0`, cwd `orchestrator/`, `-n auto` = 32 workers, started
+2026-10-08T04:03:50Z and finished 04:06:04Z:
+
+```
+env -u VIRTUAL_ENV uv run --project . pytest \
+  tests/test_archive_sole_locator_gate.py tests/test_cited_test_class_drift.py \
+  tests/test_eval_boundary_suite.py tests/test_event_loop_antipattern_guard.py \
+  tests/test_info_l0_mechanical_roles.py tests/test_killpg_frozen_pgid_guard.py \
+  tests/test_lane_lifecycle_gitops.py tests/test_local_repo_seeder_guard.py \
+  tests/test_lock_release_single_writer_guard.py tests/test_marker_registration_drift.py \
+  tests/test_mcp_post_transport.py tests/test_merge_lane_alias_names.py \
+  tests/test_merge_lane_ratchet.py tests/test_merge_worker_retired.py \
+  tests/test_prune_chokepoint_guard.py tests/test_raw_semaphore_access_guard.py \
+  tests/test_scheduler_hold_history.py tests/test_steward_scaffolding_guards.py \
+  tests/test_timeout_marker_inversion_guard.py tests/test_whole_tree_scan_timeout_guard.py \
+  tests/test_workflow_factory.py \
+  tests/test_merge_queue_concurrent_verify.py tests/test_merge_speculation.py \
+  tests/test_concurrent_verify_boundary.py tests/test_multihost_verify_integration.py \
+  -q --durations=0 --timeout=0 -p no:cacheprovider
+```
+
+The first 21 modules are the whole-tree-scan family; the last four carry the
+`HEAVY_BARRIER_TEST_TIMEOUT` and capstone marks.
+
+Result: **980 passed in 127.82s**.
+
+Load, 1-minute: 455.06 a few minutes before launch, 152.34 at start, 101.37 at
+end. 5-minute: 277.59 at start, 214.06 at end. This was a TARGETED run of two
+families, not the full suite, so its contention is lower than task 5442's
+full-suite run above.
+
+### Per-family worst
+
+| Family | Test | Phase / per-test total |
+|---|---|---|
+| whole-tree scan | `test_merge_lane_ratchet.py::TestLanePatchTargets::test_real_tree_union_anchor` | 37.61 setup |
+| whole-tree scan | `test_merge_lane_alias_names.py::test_no_tracked_file_reaches_a_missing_name_through_an_alias` | 34.62 call |
+| whole-tree scan | `test_steward_scaffolding_guards.py::TestAbsoluteTmpProjectRootLiteralsAreCensused::test_every_absolute_tmp_project_root_literal_is_adjudicated` | 34.07 call |
+| heavy barrier | `test_merge_speculation.py::TestSpecLaneAbortReleasesLane::test_operator_halt_releases_spec_lane` | 14.59 total / 14.15 call |
+| heavy barrier | `test_merge_speculation.py::TestSpecLaneAbortReleasesLane::test_waiter_walking_away_releases_spec_lane` | 13.05 total |
+| heavy barrier (capstone) | `test_multihost_verify_integration.py::TestUnreachableHostCapstone::test_a_cancel_against_a_down_host_parks_the_slot_and_reprobe_unparks_it` | 12.28 total |
+| heavy barrier | `test_merge_queue_concurrent_verify.py::TestRunnerUnavailableHeadCascade::test_ru_head_cascade_reruns_speculative_downstream` | 5.45 total |
+
+The heavy-barrier anchor is a per-test TOTAL (setup + call + teardown), because
+that is what a pytest-timeout mark bounds. The whole-tree anchor stays a phase
+figure, because a phase is all task 5442 recorded; it is a lower bound on that
+test's total.
+
+### Whole-tree-scan floor
+
+    anchor = max(51.87 from task 5442's full suite, 37.61 today) = 51.87s
+             (the worst run, never the freshest)
+    x UNDER_LOAD_HEADROOM_FACTOR (8)                          = 414.96s
+    round up to a multiple of 60                              = 420s  -> _ABSOLUTE_FLOOR_SECONDS
+
+`WHOLE_TREE_SCAN_TEST_TIMEOUT` stays **540**: it clears the 420 floor, and the
+540 ini default binds through the never-narrow rule.
+
+### HEAVY_BARRIER_TEST_TIMEOUT
+
+    measured worst, per-test total                      = 14.59s
+    x UNDER_LOAD_HEADROOM_FACTOR (8)                    = 116.72s -> rounds up to 120s
+    computed wait budget, heaviest marked class         = 255s (TestCascadeErrorContainment)
+    computed wait budget, late-arrival classes          = 245s
+    never-narrow ini default                            = 540s
+    result                                              = 540s
+
+The ini default is the binding term. The wait budgets are those
+`TestTimeoutMarkCoverage` recomputes from source, and that guard still checks
+every class against the mark. The constant was `5 * MERGE_RESULT_TIMEOUT + 75`
+(300) and is now a literal pinned by
+`test_merge_queue_concurrent_verify.py::TestHeavyBarrierTimeoutConstant`.
+
+The conclusion does not depend on today's lighter load. Task 5442's full suite
+put every MARKED orchestrator test at or below 51.87s on 2026-09-17. Used as
+the anchor, that looser bound derives only 420, still below 540.
+
+`HOST_CAPSTONE_TEST_TIMEOUT` (`test_multihost_verify_integration.py`) has a
+computed budget of 360s. It stays at **600** as a literal, rather than
+following its old `2 x HEAVY_BARRIER_TEST_TIMEOUT` to 1080.
+
+Task 5570 may raise verify's CLI `--timeout` from 300 to 540. Either way, 540
+is outside the inversion band
+`DELIBERATE_TIGHT_BOUND_CEILING < N < VERIFY_CLI_PER_TEST_TIMEOUT`: it is above
+300 today, and at 540 it would sit on the band's open upper edge.
