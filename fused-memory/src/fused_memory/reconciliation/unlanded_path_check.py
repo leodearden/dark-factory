@@ -9,12 +9,20 @@ before the merge.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
 from fused_memory.models.reconciliation import EventType, ReconciliationEvent
-from fused_memory.services.unlanded_branch_paths import UnlandedPath, UnlandedPathsProbe
+from fused_memory.services.unlanded_branch_paths import (
+    ProbeOutcome,
+    UnlandedPath,
+    UnlandedPathsProbe,
+    probe_unlanded_paths,
+)
+
+logger = logging.getLogger(__name__)
 
 UNLANDED_PATH_FLAG_TYPE = 'memory_cites_unlanded_path'
 UNLANDED_PATH_FLAG_CATEGORY = 'memory_stale'
@@ -120,3 +128,96 @@ class UnlandedPathCheckResult:
             'unlanded_path_check_errors': self.errors,
             'unlanded_path_check_flags_emitted': len(self.flags),
         }
+
+    def __add__(self, other: UnlandedPathCheckResult) -> UnlandedPathCheckResult:
+        return UnlandedPathCheckResult(
+            flags=self.flags + other.flags,
+            checked=self.checked + other.checked,
+            skipped=self.skipped + other.skipped,
+            errors=self.errors + other.errors,
+        )
+
+
+_SKIPPED = UnlandedPathCheckResult(flags=(), checked=0, skipped=1, errors=0)
+_ERRORED = UnlandedPathCheckResult(flags=(), checked=0, skipped=0, errors=1)
+
+
+def _memory_ids(rows: object) -> tuple[str, ...]:
+    if not isinstance(rows, list):
+        return ()
+    return tuple(str(row['id']) for row in rows if isinstance(row, dict) and row.get('id') is not None)
+
+
+async def _memory_content(memory_service, project_id: str, memory_id: str) -> str | None:
+    memory = await memory_service.get_memory_by_id(project_id=project_id, memory_id=memory_id)
+    content = memory.get('content') if isinstance(memory, dict) else None
+    return content if isinstance(content, str) else None
+
+
+async def _offending_memories(
+    memory_service, project_id: str, task_id: str, probe: UnlandedPathsProbe, log: logging.Logger,
+) -> tuple[tuple[Offender, ...], int]:
+    """The task's memories that name an unlanded path, and how many reads failed."""
+    try:
+        rows = await memory_service.get_memories_by_metadata(project_id=project_id, filters={'task_id': task_id})
+    except Exception:
+        log.exception('unlanded_path_check: listing memories of task %s (merge %s) failed', task_id, probe.merge_commit)
+        return (), 1
+    offenders: list[Offender] = []
+    errors = 0
+    for memory_id in _memory_ids(rows):
+        try:
+            content = await _memory_content(memory_service, project_id, memory_id)
+        except Exception:
+            log.exception('unlanded_path_check: reading memory %s of task %s failed', memory_id, task_id)
+            errors += 1
+            continue
+        if content is None:
+            continue
+        named = tuple(p for p in probe.unlanded if mentions_path(content, p.path))
+        if named:
+            offenders.append((memory_id, named))
+    return tuple(offenders), errors
+
+
+async def _check_transition(
+    memory_service, project_id: str, project_root: str, transition: DoneTransition, log: logging.Logger,
+) -> UnlandedPathCheckResult:
+    if transition.commit is None:
+        return _SKIPPED
+    probe = await probe_unlanded_paths(project_root, transition.commit)
+    if probe.outcome is ProbeOutcome.UNKNOWN:
+        log.warning('unlanded_path_check: git could not analyze task %s merge %s', transition.task_id, transition.commit)
+        return _ERRORED
+    if probe.outcome is ProbeOutcome.NOT_A_MERGE:
+        return _SKIPPED
+    if not probe.unlanded:
+        return UnlandedPathCheckResult(flags=(), checked=1, skipped=0, errors=0)
+    offenders, errors = await _offending_memories(memory_service, project_id, transition.task_id, probe, log)
+    flags = (build_unlanded_path_flag(transition.task_id, probe, offenders),) if offenders else ()
+    return UnlandedPathCheckResult(flags=flags, checked=1, skipped=0, errors=errors)
+
+
+async def check_unlanded_path_claims(
+    memory_service,
+    project_id: str,
+    project_root: str,
+    events: Sequence[ReconciliationEvent],
+    *,
+    log: logging.Logger = logger,
+) -> UnlandedPathCheckResult:
+    """Flag each task that went done in *events* whose Mem0 memories name a path its branch never landed.
+
+    Total: a per-transition failure is logged and tallied into ``errors``, and
+    only cancellation-class exceptions propagate, so callers need no guard.
+    """
+    result = UnlandedPathCheckResult.empty()
+    for transition in select_done_transitions(events):
+        try:
+            result += await _check_transition(memory_service, project_id, project_root, transition, log)
+        except Exception:
+            log.exception(
+                'unlanded_path_check: task %s (commit %s) failed', transition.task_id, transition.commit,
+            )
+            result += _ERRORED
+    return result
