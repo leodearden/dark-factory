@@ -15,7 +15,18 @@ from typing import Literal
 
 @dataclass(frozen=True)
 class StoreIdentity:
+    """Both path fields are made absolute and resolved at construction, so
+    ``queue_dir`` compares directly against any other resolved path —
+    ``escalation.queue::EscalationQueue.__init__`` keeps its ``queue_dir``
+    as given.
+    """
+
     kind: Literal['project', 'reconciliation']
     queue_dir: Path
     project_id: str | None
     project_root: Path | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, 'queue_dir', Path(self.queue_dir).resolve())
+        if self.project_root is not None:
+            object.__setattr__(self, 'project_root', Path(self.project_root).resolve())
