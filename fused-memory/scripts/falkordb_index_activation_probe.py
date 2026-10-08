@@ -13,6 +13,16 @@ import re
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 
+from fused_memory.backends.falkor_indices import (
+    IndexSpec,
+    expected_index_set,
+    normalize_index_records,
+    resolve_header_positions,
+    unsettled_index_statuses,
+)
+from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV
+from fused_memory.reconciliation.index_health import summarize_index_health
+
 ORIGINAL_PROBE_IDS = ('877', '2286', '3127', '3600', '1157')
 DRIFTED_IDS = ('877', '3600')
 RETIRED_TASK_TEMPLATE = 'task {task_id} context and related decisions'
@@ -22,6 +32,14 @@ REPLACEMENT_FLOOR = 2
 REPLACEMENT_MAX_DISTANCE = 50
 
 GRAPHITI_STORE = 'graphiti'
+
+INDEX_COLUMNS = {
+    'label': 'label',
+    'field': 'properties',
+    'type': 'types',
+    'entity_type': 'entitytype',
+    'status': 'status',
+}
 
 _JOINER = r'(?:\s*(?:,|&|/|\band\b|\bor\b))+\s*'
 _TASK_REFERENCE_RE = re.compile(
@@ -69,8 +87,24 @@ class BriefingVerdict:
     missed: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class GraphIndexStatus:
+    group_id: str
+    present: bool
+    expected_total: int
+    actual: tuple[IndexSpec, ...]
+    missing: tuple[IndexSpec, ...]
+    unexpected: tuple[IndexSpec, ...]
+    unsettled: tuple[tuple[object, object], ...]
+    complete: bool
+
+
 class NoReplacementError(LookupError):
     """No candidate id within the walk qualified as a replacement."""
+
+
+class RegistryUnavailableError(RuntimeError):
+    """The project registry input is unset, so the sweep would silently narrow."""
 
 
 def mentions_task(text: str | None, task_id: str) -> bool:
@@ -141,3 +175,56 @@ def briefing_verdict(hits_by_id: Mapping[str, bool], floor: int = PROBE_FLOOR) -
         passed=hits >= floor,
         missed=tuple(task_id for task_id, hit in hits_by_id.items() if not hit),
     )
+
+
+def index_records(header, rows) -> list[dict]:
+    """``CALL db.indexes()`` rows as the records ``GraphitiBackend.list_indices`` returns."""
+    positions = resolve_header_positions(header, INDEX_COLUMNS)
+    return [{key: row[position] for key, position in positions.items()} for row in rows]
+
+
+def graph_index_status(
+    group_id: str,
+    records: Sequence[Mapping] | None,
+    expected: Collection[IndexSpec],
+) -> GraphIndexStatus:
+    """One graph's catalog against *expected*; ``records`` is None when the graph key is absent."""
+    if records is None:
+        return GraphIndexStatus(
+            group_id=group_id, present=False, expected_total=len(expected),
+            actual=(), missing=(), unexpected=(), unsettled=(), complete=False,
+        )
+    actual = normalize_index_records(records)
+    health = summarize_index_health(actual, set(expected))
+    unsettled = tuple(unsettled_index_statuses(records))
+    return GraphIndexStatus(
+        group_id=group_id,
+        present=True,
+        expected_total=health['expected_total'],
+        actual=tuple(sorted(actual)),
+        missing=tuple(health['missing']),
+        unexpected=tuple(health['unexpected']),
+        unsettled=unsettled,
+        complete=health['healthy'] and not unsettled,
+    )
+
+
+def sorted_expected_specs() -> tuple[IndexSpec, ...]:
+    return tuple(sorted(expected_index_set()))
+
+
+def incomplete_graph_ids(statuses: Sequence[GraphIndexStatus]) -> list[str]:
+    """Present graphs whose catalog is not complete; an absent graph is not incomplete."""
+    return [status.group_id for status in statuses if status.present and not status.complete]
+
+
+def require_known_project_roots(roots: list[str]) -> list[str]:
+    if not roots:
+        raise RegistryUnavailableError(
+            f'{KNOWN_PROJECT_ROOTS_ENV} is unset or empty, so the registry would '
+            'narrow to the primary project alone and the sweep would certify one '
+            'graph as "every registered graph". It lives in the fused-memory unit, '
+            'not in .env; read it with '
+            '`systemctl --user show fused-memory.service -p Environment` and export it.'
+        )
+    return roots
