@@ -29,10 +29,13 @@ from _fm_helpers import (
 )
 
 from fused_memory.backends.graphiti_client import (
+    INCOMPLETE_CENSUS_UNAVAILABLE,
+    INCOMPLETE_SHORT_READ,
     INCOMPLETE_STRUCTURAL_KINDS,
     EdgeDict,
     GraphitiBackend,
     IncompleteEnumerationError,
+    ReadCompleteness,
     StaleSummaryResult,
 )
 from fused_memory.config.schema import FusedMemoryConfig
@@ -1023,7 +1026,7 @@ class TestRebuildEntitySummaries:
 
     @pytest.mark.asyncio
     async def test_returns_aggregate_result(self, mock_config):
-        """Returns dict with total_entities, stale_entities, rebuilt, skipped, errors, details."""
+        """Returns the six count/detail keys plus the four read-completeness keys."""
         svc = _make_svc(mock_config)
         svc.graphiti.detect_stale_with_edges = AsyncMock(
             return_value=StaleSummaryResult(
@@ -1032,7 +1035,11 @@ class TestRebuildEntitySummaries:
             )
         )
         result = await svc.rebuild_entity_summaries(project_id='test')
-        assert set(result.keys()) == {'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors', 'details'}
+        assert set(result.keys()) == {
+            'total_entities', 'stale_entities', 'rebuilt', 'skipped', 'errors', 'details',
+            'entities_complete', 'entities_incomplete_kind',
+            'edges_complete', 'edges_incomplete_kind',
+        }
 
     @pytest.mark.asyncio
     async def test_partial_failure_continues(self, mock_config):
@@ -1381,6 +1388,10 @@ class TestRebuildEntitySummariesEntityUuids:
             'skipped': 0,
             'errors': 0,
             'details': [],
+            'entities_complete': None,
+            'entities_incomplete_kind': None,
+            'edges_complete': None,
+            'edges_incomplete_kind': None,
         }
         svc.graphiti.enumerate_entity_nodes.assert_not_awaited()
         svc.graphiti.rebuild_entity_from_edges.assert_not_awaited()
@@ -3138,3 +3149,139 @@ class TestRebuildReadsApplyThePolicy:
             )
 
         svc.graphiti.rebuild_entity_from_edges.assert_not_awaited()
+
+
+class TestRebuildReportsReadCompleteness:
+    """The result carries the tri-state completeness of each read on every path.
+
+    True is proven complete, False is observed incomplete, and None is no
+    verdict for that read on this path.  Every assertion is an explicit
+    ``is``, never truthiness, because only ``is True`` is a safe gate.
+    """
+
+    _NODES = [{'uuid': 'u1', 'name': 'Alice', 'summary': 'a real summary'}]
+    _EDGES = {'u1': [{'uuid': 'e1', 'fact': 'a real summary', 'name': 'knows'}]}
+
+    def _svc(self, mock_config, *, nodes_read, edges_read):
+        svc = _make_svc(mock_config)
+        svc.graphiti.enumerate_entity_nodes = AsyncMock(return_value=(self._NODES, nodes_read))
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=(self._EDGES, edges_read))
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(
+            return_value=make_rebuild_detail('u1', 'Alice')
+        )
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_force_write_reports_a_short_node_read_and_still_rebuilds(self, mock_config):
+        """Empirical incompleteness is reported, never escalated into a refusal."""
+        svc = self._svc(
+            mock_config,
+            nodes_read=incomplete_paged_read(INCOMPLETE_SHORT_READ),
+            edges_read=complete_paged_read(),
+        )
+        result = await svc.rebuild_entity_summaries(project_id='test', force=True)
+
+        assert result['entities_complete'] is False
+        assert result['entities_incomplete_kind'] == INCOMPLETE_SHORT_READ
+        assert result['edges_complete'] is True
+        assert result['edges_incomplete_kind'] is None
+        assert result['rebuilt'] == len(self._NODES)
+        svc.graphiti.rebuild_entity_from_edges.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_force_dry_run_has_no_edge_verdict(self, mock_config):
+        svc = self._svc(
+            mock_config,
+            nodes_read=incomplete_paged_read(INCOMPLETE_CENSUS_UNAVAILABLE),
+            edges_read=complete_paged_read(),
+        )
+        result = await svc.rebuild_entity_summaries(project_id='test', force=True, dry_run=True)
+
+        assert result['entities_complete'] is False
+        assert result['entities_incomplete_kind'] == INCOMPLETE_CENSUS_UNAVAILABLE
+        assert result['edges_complete'] is None
+        assert result['edges_incomplete_kind'] is None
+        svc.graphiti.enumerate_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_targeted_write_reports_an_unproven_edge_read(self, mock_config):
+        svc = self._svc(
+            mock_config,
+            nodes_read=complete_paged_read(),
+            edges_read=incomplete_paged_read(INCOMPLETE_CENSUS_UNAVAILABLE),
+        )
+        result = await svc.rebuild_entity_summaries(project_id='test', entity_uuids=['u1'])
+
+        assert result['entities_complete'] is True
+        assert result['entities_incomplete_kind'] is None
+        assert result['edges_complete'] is False
+        assert result['edges_incomplete_kind'] == INCOMPLETE_CENSUS_UNAVAILABLE
+
+    @pytest.mark.asyncio
+    async def test_targeted_dry_run_has_no_edge_verdict(self, mock_config):
+        svc = self._svc(
+            mock_config, nodes_read=complete_paged_read(), edges_read=complete_paged_read(),
+        )
+        result = await svc.rebuild_entity_summaries(
+            project_id='test', entity_uuids=['u1'], dry_run=True
+        )
+
+        assert result['entities_complete'] is True
+        assert result['entities_incomplete_kind'] is None
+        assert result['edges_complete'] is None
+        assert result['edges_incomplete_kind'] is None
+
+    @pytest.mark.asyncio
+    async def test_stale_write_mirrors_both_detection_verdicts(self, mock_config):
+        svc = _make_svc(mock_config)
+        svc.graphiti.detect_stale_with_edges = AsyncMock(return_value=StaleSummaryResult(
+            stale=[], all_edges={}, total_count=0,
+            entities_completeness=COMPLETE_READ,
+            edges_completeness=ReadCompleteness(
+                complete=False, incomplete_kind=INCOMPLETE_SHORT_READ
+            ),
+        ))
+        result = await svc.rebuild_entity_summaries(project_id='test')
+
+        assert result['entities_complete'] is True
+        assert result['entities_incomplete_kind'] is None
+        assert result['edges_complete'] is False
+        assert result['edges_incomplete_kind'] == INCOMPLETE_SHORT_READ
+
+    @pytest.mark.asyncio
+    async def test_stale_dry_run_has_no_verdict(self, mock_config):
+        """Documented residual tkt_0RVHH0D37FVAWSMT1NVGSHDSZM.
+
+        The force=False dry_run probe, detect_stale_dry_run, still reads through
+        the list_entity_nodes shim and surfaces no verdict.  Expected to flip
+        when that ticket lands.
+        """
+        svc = _make_svc(mock_config)
+        svc.graphiti.detect_stale_dry_run = AsyncMock(return_value=([], 0))
+        result = await svc.rebuild_entity_summaries(project_id='test', dry_run=True)
+
+        assert result['entities_complete'] is None
+        assert result['entities_incomplete_kind'] is None
+        assert result['edges_complete'] is None
+        assert result['edges_incomplete_kind'] is None
+
+    @pytest.mark.asyncio
+    async def test_empirical_warning_is_logged_under_the_service(self, mock_config, caplog):
+        """The policy warning surfaces beside the rebuild's own lines, not the backend's."""
+        svc = self._svc(
+            mock_config,
+            nodes_read=incomplete_paged_read(INCOMPLETE_SHORT_READ),
+            edges_read=complete_paged_read(),
+        )
+        with caplog.at_level(logging.WARNING):
+            await svc.rebuild_entity_summaries(project_id='test', force=True)
+
+        def warned_under(logger_name):
+            return [
+                r for r in caplog.records
+                if r.name == logger_name and r.levelno == logging.WARNING
+                and 'enumerate_entity_nodes' in r.getMessage()
+            ]
+
+        assert warned_under('fused_memory.services.memory_service')
+        assert not warned_under('fused_memory.backends.graphiti_client')
