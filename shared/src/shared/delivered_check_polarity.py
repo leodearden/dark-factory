@@ -145,6 +145,7 @@ from shared.delivered_check_scope import (
     GIT_PROBE_FAILURES,
     GIT_TIMEOUT_SECS,
     STALE_PATH_CODES,
+    STALE_PATH_REASONS,
     PathState,
     ScopePath,
     classify_scope_paths,
@@ -728,20 +729,11 @@ _POLARITY_LINTERS: dict[str, Callable[..., CheckFinding | None]] = {
 # The scope axis
 # ---------------------------------------------------------------------------
 
-_NEVER_GREEN = (
-    'so the check can never go green, and its dependents wedge behind what '
-    'reads as an undelivered capability.'
-)
-
-
 def _shim_path_message(name: str, entries: Sequence[ScopePath], ref: str) -> str:
     paths = [entry.path for entry in entries]
     return (
-        f'delivered_check {name!r} (expect=present) is scoped to {paths!r}, which at '
-        f'{ref} is a sys.modules alias shim: the file only rebinds '
-        f'sys.modules[__name__] to the module it aliases, so the code the check '
-        f'asserts lives elsewhere, {_NEVER_GREEN} Repath `paths` to the module the '
-        f'shim aliases, where the code lives now.'
+        f'delivered_check {name!r} (expect=present) is scoped to {paths!r} at '
+        f'{ref}: {STALE_PATH_REASONS["shim_path"]}'
     )
 
 
@@ -751,10 +743,9 @@ def _removed_path_message(name: str, entries: Sequence[ScopePath], ref: str) -> 
         for entry in entries
     )
     return (
-        f'delivered_check {name!r} (expect=present) names {sites}: deleted or moved '
-        f'away on the mainline and absent at {ref}, {_NEVER_GREEN} Repath `paths` to '
-        f'where the code lives now. If this task genuinely re-creates the file, scope '
-        f'a grep check to its parent directory instead.'
+        f'delivered_check {name!r} (expect=present) names {sites}, absent at '
+        f'{ref}: {STALE_PATH_REASONS["removed_path"]} If this task genuinely '
+        f're-creates the file, scope a grep check to its parent directory instead.'
     )
 
 

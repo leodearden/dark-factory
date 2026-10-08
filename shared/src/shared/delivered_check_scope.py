@@ -27,10 +27,12 @@ __all__ = [
     'GIT_PROBE_FAILURES',
     'GIT_TIMEOUT_SECS',
     'STALE_PATH_CODES',
+    'STALE_PATH_REASONS',
     'SYS_MODULES_SHIM_PATTERN',
     'PathState',
     'ScopePath',
     'classify_scope_paths',
+    'is_literal_scope_path',
     'resolve_commit',
     'stale_scope_paths',
 ]
@@ -79,6 +81,26 @@ class ScopePath:
 STALE_PATH_CODES = MappingProxyType({
     PathState.SYS_MODULES_SHIM: 'shim_path',
     PathState.REMOVED: 'removed_path',
+})
+
+_NEVER_GREEN = (
+    'so the expect=present check can never go green, and its dependents wedge '
+    'behind what reads as an undelivered capability.'
+)
+
+#: Why each stale code blocks, and its repair: the one explanation the lint's
+#: messages and the audit's ``reason`` both carry.
+STALE_PATH_REASONS = MappingProxyType({
+    'shim_path': (
+        'the path is a sys.modules alias shim: the file only rebinds '
+        'sys.modules[__name__] to the module it aliases, so the code the check '
+        f'asserts lives elsewhere, {_NEVER_GREEN} Repath `paths` to the module '
+        'the shim aliases.'
+    ),
+    'removed_path': (
+        'the path was deleted or moved away on the mainline, '
+        f'{_NEVER_GREEN} Repath `paths` to where the code lives now.'
+    ),
 })
 
 _STALE_STATES_BY_KIND: dict[str, frozenset[PathState]] = {
@@ -130,8 +152,9 @@ def resolve_commit(
     return completed.stdout.strip() or None
 
 
-def _is_literal(path: object) -> bool:
-    """A plain repo path: not a glob, not pathspec magic, not empty."""
+def is_literal_scope_path(path: object) -> bool:
+    """A plain repo path: not a glob, not pathspec magic, not empty. Only
+    these are classified; the rest name no single path."""
     return (
         isinstance(path, str)
         and bool(path.strip('/'))
@@ -234,15 +257,15 @@ def classify_scope_paths(
 ) -> dict[str, ScopePath] | None:
     """Classify each LITERAL entry of *paths* at the commit *ref* resolves to.
 
-    Keyed by the exact input string; glob and pathspec-magic entries are left
-    out, since they name no single path. ``None`` means git could not answer
+    Keyed by the exact input string; entries failing
+    :func:`is_literal_scope_path` are left out. ``None`` means git could not answer
     (non-repo root, unresolvable *ref*, a value no argv can carry, a timeout),
     never "nothing is stale". A missing entry is REMOVED only when a
     first-parent commit deleted it or everything under it; otherwise it is
     the forward-looking NEVER_EXISTED. Costs a constant number of git calls,
     plus one per REMOVED entry to name the commit.
     """
-    literals = list(dict.fromkeys(p for p in paths if _is_literal(p)))
+    literals = list(dict.fromkeys(p for p in paths if is_literal_scope_path(p)))
     if not literals:
         return {}
     sha = resolve_commit(repo_root, ref, timeout_secs)

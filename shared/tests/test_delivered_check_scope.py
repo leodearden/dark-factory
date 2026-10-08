@@ -17,10 +17,12 @@ import pytest
 from shared.delivered_check_polarity import lint_delivered_checks, polarity_error
 from shared.delivered_check_scope import (
     STALE_PATH_CODES,
+    STALE_PATH_REASONS,
     SYS_MODULES_SHIM_PATTERN,
     PathState,
     ScopePath,
     classify_scope_paths,
+    is_literal_scope_path,
     resolve_commit,
     stale_scope_paths,
 )
@@ -222,6 +224,16 @@ class TestClassifyScopePaths:
 
         assert _states(result) == {'src/a.py': PathState.LIVE}
 
+    def test_the_classified_keys_are_exactly_the_literal_entries(self, tmp_path):
+        repo = _init_git_repo(tmp_path / 'repo', {'src/a.py': ''})
+        entries = ['src/*.py', ':(glob)src/**', 'src/[ab].py', '/', '', 'src/a.py', 'src/']
+
+        result = classify_scope_paths(entries, repo_root=repo, ref='main')
+
+        assert result is not None
+        assert set(result) == {p for p in entries if is_literal_scope_path(p)}
+        assert set(result) == {'src/a.py', 'src/'}
+
     def test_non_repo_root_returns_none(self, tmp_path):
         not_a_repo = tmp_path / 'plain'
         not_a_repo.mkdir()
@@ -315,6 +327,9 @@ class TestStaleScopePolicy:
             PathState.SYS_MODULES_SHIM: 'shim_path',
             PathState.REMOVED: 'removed_path',
         }
+
+    def test_every_stale_code_carries_one_reason(self):
+        assert set(STALE_PATH_REASONS) == set(STALE_PATH_CODES.values())
 
 
 @pytest.fixture
