@@ -1030,13 +1030,19 @@ async def api_performance(request: Request) -> JSONResponse:
         aggregate_performance_history(dbs, days=window.days, now=now),
         return_exceptions=True,
     )
-    failure = cards_r if isinstance(cards_r, Exception) else None
-    shaped = redux_api.shape_performance(
-        listing=safe_gather_result(
+    if isinstance(cards_r, BaseException):
+        listing = safe_gather_result(
             cards_r,
-            unread_listing(f'the performance cards could not be read: {failure}', days=window.days),
+            unread_listing(
+                f'the performance cards could not be read: {describe_exc(cards_r)}',
+                days=window.days,
+            ),
             'perf/cards',
-        ),
+        )
+    else:
+        listing = cards_r
+    shaped = redux_api.shape_performance(
+        listing=listing,
         history=safe_gather_result(history_r, {}, 'perf/history'),
         served_at=now,
     )

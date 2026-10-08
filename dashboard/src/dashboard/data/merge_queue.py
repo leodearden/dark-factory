@@ -19,10 +19,10 @@ import json
 import logging
 import math
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, TypedDict
+from typing import Any, TypedDict, TypeVar
 
 import aiosqlite
 import httpx
@@ -30,6 +30,7 @@ import httpx
 from dashboard.data.chart_utils import ChartData
 from dashboard.data.datum import Datum, DatumState, unknown_datum
 from dashboard.data.db import with_db
+from dashboard.data.mcp_fanout import describe_exc
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.stats_utils import percentile
 from dashboard.data.task_lookup import FETCHED_ROW_FRESHNESS_BOUND_SECONDS, TaskRef
@@ -739,6 +740,21 @@ def _unknown_title(reason: str) -> Datum[str]:
     return unknown_datum(reason, FETCHED_ROW_FRESHNESS_BOUND_SECONDS)
 
 
+_Leg = TypeVar('_Leg')
+
+
+def _leg_or_unread(result: _Leg | BaseException, unread: Callable[[str], _Leg], label: str) -> _Leg:
+    """*result*, or — when its leg raised — ``unread(cause)``, the leg's unread reading.
+
+    The fallback is built only for a failed leg, from the cause as
+    :func:`describe_exc` renders it. :func:`safe_gather_result` still logs the
+    failure and re-raises a cancellation.
+    """
+    if isinstance(result, BaseException):
+        return safe_gather_result(result, unread(describe_exc(result)), label)
+    return result
+
+
 async def build_per_project_merge_queue(
     project_dbs: Sequence[tuple[str, aiosqlite.Connection | None]],
     *,
@@ -787,14 +803,19 @@ async def build_per_project_merge_queue(
             )
             depth = safe_gather_result(depth_r, _DEFAULT_DEPTH, f'{pid}/depth')
             attempts = safe_gather_result(attempts_r, MergeAttempts(), f'{pid}/attempts')
-            unread_recent: RecentMerges = {
-                'rows': [],
-                'total': unknown_datum(f'{pid} recent merges could not be read', bound),
-            }
-            recent = safe_gather_result(recent_r, unread_recent, f'{pid}/recent')
-            spec = safe_gather_result(
+            recent = _leg_or_unread(
+                recent_r,
+                lambda cause: {
+                    'rows': [],
+                    'total': unknown_datum(f'{pid} recent merges could not be read: {cause}', bound),
+                },
+                f'{pid}/recent',
+            )
+            spec = _leg_or_unread(
                 spec_r,
-                unknown_datum(f'{pid} speculative-merge stats could not be read', bound),
+                lambda cause: unknown_datum(
+                    f'{pid} speculative-merge stats could not be read: {cause}', bound,
+                ),
                 f'{pid}/speculative',
             )
             train_events_list = safe_gather_result(train_r, [], f'{pid}/train_events')
@@ -815,7 +836,9 @@ async def build_per_project_merge_queue(
                 pid,
                 exc,
             )
-            unread = unknown_datum(f'the merge history of {pid} could not be read: {exc}', bound)
+            unread = unknown_datum(
+                f'the merge history of {pid} could not be read: {describe_exc(exc)}', bound,
+            )
             return pid, {
                 'depth_timeseries': _DEFAULT_DEPTH,
                 'outcomes': MergeAttempts().outcome_chart(),

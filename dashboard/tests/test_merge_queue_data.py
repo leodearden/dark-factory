@@ -1659,6 +1659,7 @@ class TestBuildPerProjectMergeQueue:
         project = result['/tmp/P']
         assert project[field].state is DatumState.UNKNOWN
         assert '/tmp/P' in (project[field].reason or '')
+        assert 'RuntimeError: boom' in (project[field].reason or '')
         assert project[sibling].state is DatumState.FRESH
         for served in (field, sibling):
             validate_datum(project[served], now)
@@ -1683,7 +1684,7 @@ class TestBuildPerProjectMergeQueue:
         assert project['recent'] == []
         for field in ('speculative', 'recent_total'):
             assert project[field].state is DatumState.UNKNOWN, field
-            assert 'boom' in (project[field].reason or ''), field
+            assert 'RuntimeError: boom' in (project[field].reason or ''), field
             validate_datum(project[field], now)
 
     @pytest.mark.asyncio

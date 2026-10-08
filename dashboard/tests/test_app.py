@@ -1690,7 +1690,7 @@ def test_performance_route_serves_an_unknown_listing_when_cards_raise(client):
     body = resp.json()
     assert body['PERFORMANCE'] == {}
     assert body['PERFORMANCE_LISTING']['state'] == 'unknown'
-    assert 'boom' in body['PERFORMANCE_LISTING']['reason']
+    assert 'RuntimeError: boom' in body['PERFORMANCE_LISTING']['reason']
 
 
 def test_burndown_returns_aggregate_and_per_project(client):
