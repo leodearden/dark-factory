@@ -37,7 +37,7 @@ const {
 } = window.DF_MERGE_QUEUE;
 const { writeQueue, queueHint, newestHourOps, opsTotals, opsCaption, opsTotalText } = window.DF_MEMORY_READINGS;
 // PerfTab reads the served cards, and why a tile over them is empty — performance_cards.js.
-const { projectCards, cardsAbsentReason } = window.DF_PERFORMANCE_CARDS;
+const { projectCards, cardsAbsentReason, cardsShortfall } = window.DF_PERFORMANCE_CARDS;
 const { useState: uS } = React;
 // The persisted UI-preference hooks — persisted_state.js.
 const { createPersistedHooks } = window.DF_PERSISTED_STATE;
@@ -414,7 +414,11 @@ function PerfTab({ projectFilter }) {
           const onePass = aggOnePassPct(subset);
           const escalation = aggEscalationRate(subset, 'interactive_rate');
           const totalTasks = cardBlocks(subset).reduce((s, c) => s + (c.ttc?.count || 0), 0);
-          const absentReason = cardsAbsentReason(DF);
+          const absentReason = cardsAbsentReason(DF, projectFilter);
+          const shortfall = cardsShortfall(DF, projectFilter);
+          const caveated = (value, hint) => (value == null || !shortfall
+            ? hint
+            : <span title={shortfall}>{hint} · partial fleet</span>);
           const countHint = value => (value == null ? null : `${totalTasks} tasks (window)`);
           const fmtPct = v => `${v.toFixed(1)}`;
           // Aggregate historical sparks across the in-scope projects.
@@ -480,14 +484,14 @@ function PerfTab({ projectFilter }) {
             <>
               <ST label="p50 time-to-completion"
                 datum={derivedDatum(p50, EP.performance, absentReason)} format={fmtMs}
-                hint={countHint(p50)} history={p50Spark} sparkColor={CP.accent} />
+                hint={caveated(p50, countHint(p50))} history={p50Spark} sparkColor={CP.accent} />
               <ST label="p95 time-to-completion"
                 datum={derivedDatum(p95, EP.performance, absentReason)} format={fmtMs}
-                hint={countHint(p95)} history={p95Spark} sparkColor={CP.warn} />
+                hint={caveated(p95, countHint(p95))} history={p95Spark} sparkColor={CP.warn} />
               <ST label="One-pass success" datum={derivedDatum(onePass, EP.performance, absentReason)} format={fmtPct} unit={onePass == null ? '' : '%'}
-                hint={onePass == null ? null : 'across all paths'} history={onePassSpark} sparkColor={CP.ok} />
+                hint={caveated(onePass, onePass == null ? null : 'across all paths')} history={onePassSpark} sparkColor={CP.ok} />
               <ST label="Human escalation rate" datum={derivedDatum(escalation, EP.performance, absentReason)} format={fmtPct} unit={escalation == null ? '' : '%'}
-                hint="interactive" history={escalationSpark} sparkColor={CP.warn} />
+                hint={caveated(escalation, 'interactive')} history={escalationSpark} sparkColor={CP.warn} />
             </>
           );
         })()}

@@ -32,7 +32,7 @@ function loadPerformanceCards() {
 }
 
 const { api: performanceCards, window: loadedWindow } = loadPerformanceCards();
-const { projectCards, cardsListing, cardsAbsentReason } = performanceCards;
+const { projectCards, cardsListing, cardsAbsentReason, cardsShortfall } = performanceCards;
 const { isDatum } = loadedWindow.DF_DATUM;
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
@@ -87,7 +87,7 @@ const ONE_PROJECT = () => perfData({ hive: entryWith(cardsFor()) }, served('fres
 test('the module exposes its readers and assigns window.DF_PERFORMANCE_CARDS', () => {
   assert.deepEqual(
     Object.keys(performanceCards).sort(),
-    ['cardsAbsentReason', 'cardsListing', 'projectCards'],
+    ['cardsAbsentReason', 'cardsListing', 'cardsShortfall', 'projectCards'],
   );
   for (const name of Object.keys(performanceCards)) {
     assert.equal(typeof performanceCards[name], 'function', `${name} should be a function`);
@@ -175,35 +175,79 @@ test('cardsListing: a payload without the listing Datum is a reasoned hole', () 
 });
 
 // ── cardsAbsentReason: why a header tile derived over the cards has no value ─
+// The second argument is PerfTab's projectFilter: empty is the whole fleet.
+
+const WHOLE_FLEET = [];
+const SHORT_REASON = '1 of 3 runs.db could not be read; their projects are not listed';
 
 test('cardsAbsentReason: before the first /performance payload, it is not yet fetched', () => {
-  assert.equal(cardsAbsentReason(perfData({}, undefined, null)), 'not yet fetched');
+  assert.equal(cardsAbsentReason(perfData({}, undefined, null), WHOLE_FLEET), 'not yet fetched');
 });
 
 test('cardsAbsentReason: a fully read listing means the window holds no tasks', () => {
-  assert.equal(cardsAbsentReason(perfData({}, served('fresh', 0))), 'no tasks in this window');
+  assert.equal(cardsAbsentReason(perfData({}, served('fresh', 0)), WHOLE_FLEET), 'no tasks in this window');
 });
 
 test('cardsAbsentReason: an unread listing says why, never "no tasks"', () => {
   // THE SIGNAL. An unreadable fleet of runs.db files serves no cards at all;
   // the header tiles must say the reads failed rather than that nothing ran.
   const reason = 'none of the 3 runs.db files could be read';
-  assert.equal(cardsAbsentReason(perfData({}, served('unknown', null, reason))), reason);
+  assert.equal(cardsAbsentReason(perfData({}, served('unknown', null, reason)), WHOLE_FLEET), reason);
 });
 
 test('cardsAbsentReason: a short listing says which reads are missing', () => {
-  const reason = '1 of 3 runs.db could not be read; their projects are not listed';
-  assert.equal(cardsAbsentReason(perfData({}, served('lower_bound', 0, reason))), reason);
+  assert.equal(cardsAbsentReason(perfData({}, served('lower_bound', 0, SHORT_REASON)), WHOLE_FLEET), SHORT_REASON);
 });
 
 test('cardsAbsentReason: a stale listing gives its reason', () => {
   const reason = 'listed 2h before it was served';
-  assert.equal(cardsAbsentReason(perfData({}, served('stale', 0, reason))), reason);
+  assert.equal(cardsAbsentReason(perfData({}, served('stale', 0, reason)), WHOLE_FLEET), reason);
 });
 
 test('cardsAbsentReason: a payload missing its listing says so', () => {
   assert.equal(
-    cardsAbsentReason(perfData({}, undefined)),
+    cardsAbsentReason(perfData({}, undefined), WHOLE_FLEET),
     'the /performance payload has no PERFORMANCE_LISTING Datum',
   );
+});
+
+test('cardsAbsentReason: a filter naming only listed projects was read — its empty window holds no tasks', () => {
+  // An unread runs.db lists nothing, so the fleet's shortfall is not these
+  // projects': blaming it would name the wrong cause.
+  const data = perfData({ hive: entryWith(cardsFor()) }, served('lower_bound', 1, SHORT_REASON));
+  assert.equal(cardsAbsentReason(data, ['hive']), 'no tasks in this window');
+});
+
+test('cardsAbsentReason: a filter naming an unlisted project may be the shortfall — it gives the listing\'s reason', () => {
+  const data = perfData({ hive: entryWith(cardsFor()) }, served('lower_bound', 1, SHORT_REASON));
+  assert.equal(cardsAbsentReason(data, ['hive', 'comb']), SHORT_REASON);
+});
+
+// ── cardsShortfall: the caveat a header tile WITH a value carries ───────────
+
+test('cardsShortfall: a short listing caveats the whole fleet\'s tiles', () => {
+  const data = perfData({ hive: entryWith(cardsFor()) }, served('lower_bound', 1, SHORT_REASON));
+  assert.equal(cardsShortfall(data, WHOLE_FLEET), SHORT_REASON);
+});
+
+test('cardsShortfall: a filter naming an unlisted project is caveated', () => {
+  const data = perfData({ hive: entryWith(cardsFor()) }, served('lower_bound', 1, SHORT_REASON));
+  assert.equal(cardsShortfall(data, ['hive', 'comb']), SHORT_REASON);
+});
+
+test('cardsShortfall: a filter naming only listed projects is not caveated', () => {
+  const data = perfData({ hive: entryWith(cardsFor()) }, served('lower_bound', 1, SHORT_REASON));
+  assert.equal(cardsShortfall(data, ['hive']), null);
+});
+
+test('cardsShortfall: a listing that is not short leaves the tiles uncaveated', () => {
+  const cases = [
+    ['a fresh listing', perfData({ hive: entryWith(cardsFor()) }, served('fresh', 1))],
+    ['an unread listing', perfData({}, served('unknown', null, 'none of the 3 runs.db files could be read'))],
+    ['no payload yet', perfData({}, undefined, null)],
+    ['no listing Datum', perfData({}, undefined)],
+  ];
+  for (const [label, data] of cases) {
+    assert.equal(cardsShortfall(data, WHOLE_FLEET), null, label);
+  }
 });

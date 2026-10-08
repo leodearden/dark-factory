@@ -19,7 +19,14 @@
 // AN EMPTY PERFORMANCE IS NOT "NO TASKS" BY ITSELF. Projects are discovered
 // from each runs.db, so a runs.db that could not be read lists nothing; only
 // the listing knows whether every one was read. A header tile derived over the
-// cards with no value therefore asks the listing why.
+// cards with no value therefore asks the listing why, and a tile with a value
+// asks whether it covers only part of its scope.
+//
+// THE LISTING IS FLEET-WIDE; PerfTab's tiles are scoped by its projectFilter
+// (empty is the whole fleet). The projects an unread runs.db would have listed
+// are exactly the ones missing from PERFORMANCE, so a filter naming only listed
+// projects lost none of them to the shortfall, and the listing's reason is not
+// its cause.
 
 // Module scope, no fallback, RENAMED — see the CANONICAL note in datum.js's
 // header.
@@ -54,11 +61,28 @@ function cardsListing(data) {
   );
 }
 
-// Why a value derived over the cards is absent: the listing's own reason when
-// it is anything but fresh — its title is null exactly then — else the window
-// genuinely holds no tasks.
-function cardsAbsentReason(data) {
-  return viewCardsDatum(cardsListing(data)).title || 'no tasks in this window';
+function scopeListedInFull(data, projectFilter) {
+  const listed = data.PERFORMANCE || {};
+  return projectFilter.length > 0 && projectFilter.every(project => Object.hasOwn(listed, project));
+}
+
+// Why a value derived over *projectFilter*'s cards is absent: the listing's own
+// reason when it is anything but fresh — its title is null exactly then — and
+// the scope may hold a project it could not list; else the window genuinely
+// holds no tasks.
+function cardsAbsentReason(data, projectFilter) {
+  const why = viewCardsDatum(cardsListing(data)).title;
+  return why && !scopeListedInFull(data, projectFilter) ? why : 'no tasks in this window';
+}
+
+// Why the values derived over *projectFilter*'s cards may cover only part of
+// it: a short listing's reason when the scope may hold a project it could not
+// list, else null. A tile with a value has no hole to carry the reason, so it
+// rides as the tile's caveat.
+function cardsShortfall(data, projectFilter) {
+  const listing = cardsListing(data);
+  const short = listing.state === 'lower_bound' && !scopeListedInFull(data, projectFilter);
+  return short ? listing.reason : null;
 }
 
 // Module-unique export const, never a bare `API` — the CANONICAL note in
@@ -67,6 +91,7 @@ const PERFORMANCE_CARDS_API = {
   projectCards,
   cardsListing,
   cardsAbsentReason,
+  cardsShortfall,
 };
 
 if (typeof module !== 'undefined' && module.exports) {
