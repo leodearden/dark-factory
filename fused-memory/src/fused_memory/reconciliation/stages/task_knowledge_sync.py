@@ -1195,6 +1195,10 @@ _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS: tuple[dict, ...] = (
 # reaped only if it is ALSO unprotected and cites a task confirmed terminal.
 # See _sweep_stale_mem0_flag_for_stage2_markers' docstring for the full rule.
 _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS: int = 7
+# A flag_for_stage2 marker citing no task may be retired once older than this.
+# It sits well past the TTL above because no task closure can vouch that such
+# a member is a relay marker (task 4995).
+_FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS: int = 30
 _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE = 'flag_for_stage2_gc_sweep'
 _FLAG_FOR_STAGE2_ENUM_FILTERS: dict = {'flag_for_stage2': True}
 
@@ -1442,6 +1446,46 @@ async def _gc_recon_markers(
         return 0
 
 
+class _TasklessRetirement(NamedTuple):
+    """When a pool member citing no task may pass the terminal-closure gate (task 4995)."""
+
+    max_age_days: int
+
+    def permits(self, created_at: datetime, now: datetime) -> bool:
+        return created_at < now - timedelta(days=self.max_age_days)
+
+
+_FLAG_FOR_STAGE2_TASKLESS_RETIREMENT = _TasklessRetirement(
+    max_age_days=_FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS,
+)
+
+
+def _cited_task_key(metadata) -> str:
+    """The stripped ``metadata['task_id']``, or ``''`` when the member cites no task."""
+    task_id = metadata.get('task_id') if isinstance(metadata, dict) else None
+    return '' if task_id is None else str(task_id).strip()
+
+
+def _closure_permits_retirement(
+    metadata,
+    created_at: datetime,
+    *,
+    terminal_ids: frozenset[str],
+    taskless_retirement: _TasklessRetirement | None,
+    now: datetime,
+) -> bool:
+    """The terminal-closure gate's verdict on one age-stale member (tasks 4375, 4995).
+
+    A member citing a task passes only on an exact-string match against
+    *terminal_ids*, so a comma-joined or non-Taskmaster id never does. A
+    member citing no task passes only under *taskless_retirement*.
+    """
+    key = _cited_task_key(metadata)
+    if key:
+        return key in terminal_ids
+    return taskless_retirement is not None and taskless_retirement.permits(created_at, now)
+
+
 async def _sweep_stale_mem0_pool(
     memory_service,
     project_id: str,
@@ -1456,6 +1500,7 @@ async def _sweep_stale_mem0_pool(
     count_short_circuit: bool = False,
     enum_filters: dict | Sequence[dict] | None = None,
     terminal_task_ids: Collection[str] | None = None,
+    taskless_retirement: _TasklessRetirement | None = None,
 ) -> int:
     """Shared age-GC skeleton for a single-source Mem0 marker pool.
 
@@ -1832,7 +1877,8 @@ async def _sweep_stale_mem0_pool(
                 extra={'project_id': project_id, 'run_id': run_id},
             )
 
-    cutoff = _assume_utc(now or datetime.now(UTC)) - timedelta(days=max_age_days)
+    reference_now = _assume_utc(now or datetime.now(UTC))
+    cutoff = reference_now - timedelta(days=max_age_days)
 
     # Full member dicts, not bare ids: the tombstone write below needs the
     # victim's metadata/created_at at classification time (task 3041). Kept
@@ -1940,22 +1986,15 @@ async def _sweep_stale_mem0_pool(
             #   The gate is a `continue` either way, so the SET OF DELETED
             #   RECORDS is identical under either ordering — only the
             #   diagnostic's meaning changes.
-            #
-            # Exact-string match on the stripped task_id, reusing
-            # _gc_recon_markers' precedent verbatim — so a comma-joined
-            # multi-task task_id, a non-Taskmaster pseudo-id, an empty string
-            # and a missing key all fail the test and are KEPT. Never raises
-            # on a weird payload.
-            if terminal_ids is not None:
-                raw_task_id = (
-                    member_metadata.get('task_id')
-                    if isinstance(member_metadata, dict)
-                    else None
-                )
-                key = str(raw_task_id).strip() if raw_task_id is not None else ''
-                if not key or key not in terminal_ids:
-                    retained_unclosed += 1
-                    continue
+            if terminal_ids is not None and not _closure_permits_retirement(
+                member_metadata,
+                created_at,
+                terminal_ids=terminal_ids,
+                taskless_retirement=taskless_retirement,
+                now=reference_now,
+            ):
+                retained_unclosed += 1
+                continue
 
             stale_members.append(member)
 
@@ -2482,6 +2521,7 @@ async def _retire_flag_for_stage2_members(
         count_short_circuit=True,
         enum_filters=enum_filters,
         terminal_task_ids=terminal_task_ids,
+        taskless_retirement=_FLAG_FOR_STAGE2_TASKLESS_RETIREMENT,
     )
 
 
