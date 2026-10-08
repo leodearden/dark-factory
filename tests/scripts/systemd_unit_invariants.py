@@ -6,7 +6,9 @@ unit/template suite (tests/scripts/test_dashboard_service_template.py, which
 also owns the helper's negative-case guard) and the fleet-wide sweep
 (tests/scripts/test_systemd_restart_backoff.py) — and duplicating it into
 both is how the two copies drift until one silently stops catching the
-defect.  Written for task 3333, lifted here by task 3408.
+defect.  Written for task 3333, lifted here by task 3408.  The same
+reasoning brings the effective ExecStart= command parse here, together with
+the discovery scope the content-discovered sweeps share.
 
 Almost every line of the docstrings below is measured systemd 255.4
 behaviour, not restatement of the code.  Preserve it: it is the reason the
@@ -401,6 +403,60 @@ def assert_restart_backoff_effective(path: pathlib.Path) -> None:
         "starts from systemd's 100ms default and the backoff that runs is not "
         "the one the file describes."
     )
+
+
+# ---------------------------------------------------------------------------
+# Unit discovery scope
+#
+# Shared by the two content-discovered sweeps:
+# tests/scripts/test_systemd_restart_backoff.py::
+# discover_units_declaring_a_restart_cap and
+# tests/scripts/test_uv_run_venv_isolation.py::discover_exec_start_files.
+# ---------------------------------------------------------------------------
+
+# What discovery refuses to treat as a unit, excluded by CATEGORY rather than
+# by naming individual paths.  Both categories are files that CONTAIN a unit as
+# quoted text rather than files systemd can load, and both break the sweeps
+# the same way: restart_directive and logical_exec_start above are
+# last-occurrence-wins FILE-WIDE, so on a file holding more than one embedded
+# unit they splice a directive out of one and a directive out of another and
+# report a verdict about neither.
+#
+#   **/tests/**  — parity suites embed whole units as column-0 triple-quoted
+#     fixtures.  Measured: tests/scripts/test_check_fused_memory_unit_parity.py
+#     was swept as a 13th "unit" and PASSED by accident, splicing a cap out of
+#     the NEGATIVE fixture (which deliberately models the defect) together with
+#     RestartSteps= out of an unrelated POSITIVE one.  The glob form is
+#     load-bearing: a plain `:!tests/` excludes only the top-level directory and
+#     leaves fused-memory/tests/, orchestrator/tests/, scripts/tests/ and
+#     dashboard/tests/ swept — and fused-memory/tests/test_systemd_unit_config.py
+#     already parses systemd units, so one fixture there gaining a column-0 cap
+#     would drag a .py file back in.
+#
+#   **/*.md — prose.  A doc may legitimately show the DEFECT: a PRD or
+#     postmortem for this very task would carry a "before" fence (cap, no steps)
+#     next to an "after" fence, and no mechanical rule distinguishes a
+#     cautionary example from a prescription.  plans/afk-C1-systemd.md is the
+#     live instance — an as-built record of what was deployed, already diverged
+#     from the fleet in three visible ways (`Requires=fused-memory.service`,
+#     which the real units reject and test_orchestrator_service_files.py asserts
+#     is ABSENT; an obsolete `--config orchestrator/config.yaml`; no `--frozen`).
+#     Editing a directive inside it would falsify the record without making any
+#     unit correct.  Excluding the category rather than the path means the next
+#     doc quoting a unit does not turn CI red and does not have to be
+#     hand-added to a constant in a test file.
+#
+# The cost is that a doc which IS a copy-source for real units must opt back in
+# explicitly: FACTORY_INIT_REFERENCE below.
+NON_UNIT_PATHSPECS = (
+    ":(exclude,glob)**/tests/**",
+    ":(exclude,glob)**/*.md",
+)
+
+# The copy-source new projects' supervised units are minted from, and the only
+# markdown file each sweep opts back in.  Each consumer guards it
+# UNCONDITIONALLY, i.e. strictly more strongly than its sweep would.
+FACTORY_INIT_REFERENCE = "skills/factory-init/references/supervised-unit.md"
 
 
 # ---------------------------------------------------------------------------

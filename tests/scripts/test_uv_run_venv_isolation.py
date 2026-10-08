@@ -36,21 +36,13 @@ import subprocess
 import pytest
 from systemd_unit_invariants import (
     EXEC_START_PREFIX,
+    FACTORY_INIT_REFERENCE,
+    NON_UNIT_PATHSPECS,
     MalformedExecStart,
     logical_exec_start,
 )
 
 REPO_ROOT = pathlib.Path(__file__).parents[2]
-
-# Copied from tests/scripts/test_systemd_restart_backoff.py::
-# _NON_UNIT_PATHSPECS, which holds the reasoning and the measurements: test
-# files embed whole units as fixtures, and docs may legitimately quote the
-# DEFECT.  The glob forms are load-bearing — a plain `:!tests/` excludes only
-# the top-level directory.
-_NON_UNIT_PATHSPECS = (
-    ":(exclude,glob)**/tests/**",
-    ":(exclude,glob)**/*.md",
-)
 
 # Every committed unit or template whose ExecStart is a `uv run` against a
 # workspace member.  Asserted by EQUALITY below, unlike the one-sided coverage
@@ -81,14 +73,6 @@ _EXPECTED_UV_RUN_UNITS = frozenset(
 # absolute uv path by scripts/setup-host.sh.  Recognised so a template is swept
 # in its COMMITTED form rather than only after rendering.
 _UV_PATH_SENTINEL = "__UV_PATH__"
-
-# The one markdown file opted back in, mirroring
-# tests/scripts/test_systemd_restart_backoff.py::_FACTORY_INIT_REFERENCE.  It is
-# not prose ABOUT a unit but the unit new projects are minted from, declaring in
-# its Layer 1 section that the scripts/orchestrator-*.service files are "cp'd
-# verbatim by setup-host.sh".  A copy-source still showing the old flags mints
-# this defect into every new project, with nothing in the sweep able to see it.
-_FACTORY_INIT_REFERENCE = "skills/factory-init/references/supervised-unit.md"
 
 # How the flag walk classifies each run-level token.  PARTIAL BY DESIGN and
 # backed by a raise, not by a guess: `uv run --help` lists ~80 options, and
@@ -161,7 +145,7 @@ def discover_exec_start_files() -> list[str]:
             rf"^[ \t]*{EXEC_START_PREFIX}",
             "--",
             ".",
-            *_NON_UNIT_PATHSPECS,
+            *NON_UNIT_PATHSPECS,
         ],
         cwd=REPO_ROOT,
         capture_output=True,
@@ -277,7 +261,7 @@ def discover_uv_run_units() -> list[str]:
 
 def swept_paths() -> list[str]:
     """The discovered units plus the markdown opt-in, which is never a skip."""
-    return sorted([*discover_uv_run_units(), _FACTORY_INIT_REFERENCE])
+    return sorted([*discover_uv_run_units(), FACTORY_INIT_REFERENCE])
 
 
 def _run_level_flags_of(rel_path: str) -> list[str]:
@@ -304,17 +288,17 @@ def test_factory_init_reference_is_swept() -> None:
     copy-source out of both arms silently, turning sixteen cases into fifteen
     with nothing red.
     """
-    path = REPO_ROOT / _FACTORY_INIT_REFERENCE
+    path = REPO_ROOT / FACTORY_INIT_REFERENCE
     assert path.exists(), (
-        f"{_FACTORY_INIT_REFERENCE} does not exist. New projects' supervised "
+        f"{FACTORY_INIT_REFERENCE} does not exist. New projects' supervised "
         "units are copied from it, so if it moved this guard must follow it "
         "rather than silently stop checking anything."
     )
     flags = uv_run_level_flags(
-        logical_exec_start(path.read_text(encoding="utf-8"), _FACTORY_INIT_REFERENCE)
+        logical_exec_start(path.read_text(encoding="utf-8"), FACTORY_INIT_REFERENCE)
     )
     assert flags is not None, (
-        f"{_FACTORY_INIT_REFERENCE}'s ExecStart no longer parses as a `uv run` "
+        f"{FACTORY_INIT_REFERENCE}'s ExecStart no longer parses as a `uv run` "
         "command, so both arms below would pass it vacuously. Either the fenced "
         "ini block was reformatted past logical_exec_start, or the command "
         "changed shape — check it deliberately rather than letting the repo's "
@@ -366,7 +350,7 @@ def test_discovery_covers_every_known_uv_run_unit() -> None:
         "so carry the same obligation. A file whose ExecStart= is MALFORMED also "
         "lands here, deliberately (see discover_uv_run_units); its own case "
         "below will name the defect. If they are not units at all, exclude them "
-        "via _NON_UNIT_PATHSPECS rather than checking them."
+        "via NON_UNIT_PATHSPECS rather than checking them."
     )
 
 
