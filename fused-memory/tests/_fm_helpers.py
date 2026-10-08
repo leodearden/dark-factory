@@ -38,10 +38,9 @@ from openai import RateLimitError
 from pydantic import BaseModel
 
 from fused_memory.backends.graphiti_client import (
-    INCOMPLETE_CENSUS_UNAVAILABLE,
-    INCOMPLETE_SHORT_READ,
-    INCOMPLETE_STRUCTURAL_KINDS,
+    INCOMPLETE_KINDS,
     PagedRead,
+    ReadCompleteness,
 )
 from fused_memory.utils.target_store_preflight import task_store_path
 
@@ -324,11 +323,6 @@ def extract_params(call_args: Any) -> dict:
 # projects into stats — so the two must be settable independently.
 # ---------------------------------------------------------------------------
 
-_KNOWN_INCOMPLETE_KINDS: frozenset[str] = INCOMPLETE_STRUCTURAL_KINDS | {
-    INCOMPLETE_CENSUS_UNAVAILABLE,
-    INCOMPLETE_SHORT_READ,
-}
-
 
 def complete_paged_read(
     *, rows_seen: int = 0, expected_rows: int | None = None
@@ -358,7 +352,7 @@ def incomplete_paged_read(
 ) -> PagedRead:
     """A PagedRead reporting an INCOMPLETE enumeration of the given kind.
 
-    `kind` is validated against the four `INCOMPLETE_*` constants rather than
+    `kind` is validated against `INCOMPLETE_KINDS` rather than
     taken on trust: a typo'd kind string matches no policy branch, so it would
     quietly behave like a complete read and the test would pass for the wrong
     reason.
@@ -367,9 +361,9 @@ def incomplete_paged_read(
     mirroring the real backend's shape closely enough that an assertion on the
     reason reaching an operator-facing message is meaningful.
     """
-    assert kind in _KNOWN_INCOMPLETE_KINDS, (
+    assert kind in INCOMPLETE_KINDS, (
         f'unknown incomplete_kind {kind!r}; expected one of '
-        f'{sorted(_KNOWN_INCOMPLETE_KINDS)}'
+        f'{sorted(INCOMPLETE_KINDS)}'
     )
     if reason is None:
         reason = (
@@ -385,6 +379,11 @@ def incomplete_paged_read(
         reason=reason,
         incomplete_kind=kind,
     )
+
+
+#: The verdict for a proven-complete read, for the StaleSummaryResult fields a
+#: test does not care about (task 4914).
+COMPLETE_READ = ReadCompleteness(complete=True, incomplete_kind=None)
 
 
 # ---------------------------------------------------------------------------
