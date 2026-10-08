@@ -69,9 +69,11 @@ from test_verify_scope_kappa import _executed_module_configs, _run_verification_
 from orchestrator import verify, verify_plan
 from orchestrator.config import ModuleConfig, OrchestratorConfig
 from orchestrator.pytest_markers import (
+    addopts_tokens,
     deselecting_expression_for_targets,
     expression_definitely_deselects,
     guaranteed_marker_names,
+    locate_pytest_config,
     module_level_marker_names,
     per_item_marker_names,
     resolve_marker_expression,
@@ -228,6 +230,128 @@ class TestResolveMarkerExpression:
             _pyproject(f'"{_REAL_ADDOPTS}"'), "uv run pytest tests/ -m 'unbalanced",
         )
         assert resolved == 'not warm_lane_bash'
+
+
+class TestAddoptsTokens:
+    """``addopts_tokens(pyproject_text)``: the one ``[tool.pytest.ini_options].addopts`` reader."""
+
+    def test_a_string_addopts_is_shlex_split(self):
+        assert addopts_tokens(_pyproject(f'"{_REAL_ADDOPTS}"')) == [
+            '-n', 'auto', '--dist', 'loadgroup', '--max-worker-restart=0', '-m', 'not warm_lane_bash',
+        ]
+
+    def test_a_list_addopts_is_kept(self):
+        assert addopts_tokens(_pyproject('["-m", "not integration"]')) == ['-m', 'not integration']
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param(None, id='absent'),
+            pytest.param('[tool.pytest.ini_options\naddopts = ', id='malformed'),
+            pytest.param('[tool.ruff]\nline-length = 100\n', id='no-ini-options'),
+            pytest.param(_pyproject('42'), id='wrong-type'),
+        ],
+    )
+    def test_anything_unreadable_is_none(self, text):
+        assert addopts_tokens(text) is None
+
+
+_INI_OPTIONS = '[tool.pytest.ini_options]\naddopts = "-q"\n'
+_ROOT_INI_OPTIONS = '[tool.pytest.ini_options]\naddopts = "--import-mode=importlib"\n'
+
+
+class TestLocatePytestConfig:
+    """``locate_pytest_config(start_dir, read)``: pytest's own config walk, bounded at the reader root.
+
+    Mirrors ``_pytest/config/findpaths.py::locate_config``: in each directory
+    from *start_dir* upward, the first of pytest's config names that declares
+    pytest configuration wins. Returns the worktree-relative path, or None
+    when nothing inside the reader root does (or a pyproject is malformed).
+    """
+
+    def test_the_nearest_module_config_wins_over_the_root(self):
+        read = _RecordingReader({
+            'orchestrator/pyproject.toml': _INI_OPTIONS,
+            'pyproject.toml': _ROOT_INI_OPTIONS,
+        })
+        assert locate_pytest_config('orchestrator/tests', read) == 'orchestrator/pyproject.toml'
+
+    def test_a_pyproject_without_a_tool_pytest_table_is_skipped(self):
+        read = _RecordingReader({
+            'sub/pyproject.toml': '[tool.ruff]\nline-length = 100\n',
+            'pyproject.toml': _ROOT_INI_OPTIONS,
+        })
+        assert locate_pytest_config('sub', read) == 'pyproject.toml'
+
+    def test_an_empty_ini_options_table_still_declares_config(self):
+        read = _RecordingReader({
+            'sub/pyproject.toml': '[tool.pytest.ini_options]\n',
+            'pyproject.toml': _ROOT_INI_OPTIONS,
+        })
+        assert locate_pytest_config('sub', read) == 'sub/pyproject.toml'
+
+    def test_a_native_tool_pytest_table_declares_config(self):
+        read = _RecordingReader({
+            'sub/pyproject.toml': '[tool.pytest]\naddopts = ["-q"]\n',
+            'pyproject.toml': _ROOT_INI_OPTIONS,
+        })
+        assert locate_pytest_config('sub', read) == 'sub/pyproject.toml'
+
+    @pytest.mark.parametrize('name', ['pytest.ini', '.pytest.ini', 'pytest.toml', '.pytest.toml'])
+    def test_a_dedicated_config_file_declares_config_even_when_empty(self, name):
+        read = _RecordingReader({f'sub/{name}': '', 'pyproject.toml': _ROOT_INI_OPTIONS})
+        assert locate_pytest_config('sub', read) == f'sub/{name}'
+
+    def test_pytest_ini_beats_pyproject_in_the_same_directory(self):
+        read = _RecordingReader({'sub/pytest.ini': '[pytest]\n', 'sub/pyproject.toml': _INI_OPTIONS})
+        assert locate_pytest_config('sub', read) == 'sub/pytest.ini'
+
+    @pytest.mark.parametrize(
+        ('name', 'declaring', 'non_declaring'),
+        [
+            pytest.param('tox.ini', '[tox]\nenvlist = py\n\n[pytest]\naddopts = -q\n', '[tox]\nenvlist = py\n', id='tox'),
+            pytest.param('setup.cfg', '[metadata]\nname = x\n[tool:pytest]\naddopts = -q\n', '[metadata]\nname = x\n', id='setup-cfg'),
+        ],
+    )
+    def test_shared_config_files_declare_only_with_their_pytest_section(
+        self, name, declaring, non_declaring,
+    ):
+        assert locate_pytest_config('sub', _RecordingReader({
+            f'sub/{name}': declaring, 'pyproject.toml': _ROOT_INI_OPTIONS,
+        })) == f'sub/{name}'
+        assert locate_pytest_config('sub', _RecordingReader({
+            f'sub/{name}': non_declaring, 'pyproject.toml': _ROOT_INI_OPTIONS,
+        })) == 'pyproject.toml'
+
+    def test_a_deeper_match_wins_over_a_shallower_one(self):
+        read = _RecordingReader({
+            'a/b/pytest.ini': '',
+            'a/pyproject.toml': _INI_OPTIONS,
+            'pyproject.toml': _ROOT_INI_OPTIONS,
+        })
+        assert locate_pytest_config('a/b/c', read) == 'a/b/pytest.ini'
+
+    def test_nothing_inside_the_reader_root_is_none(self):
+        read = _RecordingReader({'pyproject.toml': '[tool.ruff]\n'})
+        assert locate_pytest_config('a/b', read) is None
+
+    def test_a_malformed_pyproject_refuses(self):
+        """pytest itself raises a UsageError there, so there is no config to name."""
+        read = _RecordingReader({
+            'sub/pyproject.toml': '[tool.pytest.ini_options\naddopts = ',
+            'pyproject.toml': _ROOT_INI_OPTIONS,
+        })
+        assert locate_pytest_config('sub', read) is None
+
+    @pytest.mark.parametrize('start_dir', ['', '.'])
+    def test_the_reader_root_is_named_unprefixed(self, start_dir):
+        read = _RecordingReader({'pyproject.toml': _ROOT_INI_OPTIONS})
+        assert locate_pytest_config(start_dir, read) == 'pyproject.toml'
+
+    def test_only_the_start_dirs_ancestor_chain_is_read(self):
+        read = _RecordingReader({'pyproject.toml': _ROOT_INI_OPTIONS})
+        locate_pytest_config('a/b', read)
+        assert {path.rpartition('/')[0] for path in read.paths} == {'a/b', 'a', ''}
 
 
 # ---------------------------------------------------------------------------
