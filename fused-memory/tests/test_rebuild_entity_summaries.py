@@ -3103,7 +3103,7 @@ class TestStructuralRefusalNeverBlanksSummaries:
 
 
 # ---------------------------------------------------------------------------
-# task 4914: the shared policy is re-applied at the service's own call site
+# task 4914: the service reads through the checked reads, so the policy holds
 # ---------------------------------------------------------------------------
 
 
@@ -3116,9 +3116,10 @@ _REBUILD_READ_PATHS = [
 class TestRebuildReadsApplyThePolicy:
     """A structural read verdict raises at the service and nothing is written.
 
-    ``enumerate_*`` never raises, so a service that switched to it without
-    re-applying ``apply_incompleteness_policy`` would hand a fabricated corpus
-    to the write path.  The collections here are NON-EMPTY so the write path
+    ``enumerate_*`` never raises, so a service that read through it directly
+    instead of through ``read_entity_nodes_checked`` /
+    ``read_all_valid_edges_checked`` would hand a fabricated corpus to the
+    write path.  The collections here are NON-EMPTY so the write path
     WOULD be reached without the policy, and the absence of the write is
     pinned, not just the exception.
     """

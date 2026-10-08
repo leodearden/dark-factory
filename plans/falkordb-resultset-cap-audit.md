@@ -159,7 +159,7 @@ Moved from the task-4340 comment block:
 
 ### Consumers now act on it (tasks 4386, 4914)
 
-Task 4386 discharged `tkt_0RSJP8CH1M9GAAJTABV8FZB4AH` for three whole-graph consumers, and task 4914 extended it to the summary write-back path. Every consumer below calls the `enumerate_*` methods directly and applies `apply_incompleteness_policy` at its OWN call site — the policy was SHARED, not migrated, so the raise/warn split stays one implementation (see that function's docstring for why). Each then reports what it read:
+Task 4386 discharged `tkt_0RSJP8CH1M9GAAJTABV8FZB4AH` for three whole-graph consumers, and task 4914 extended it to the summary write-back path. The policy was SHARED, not migrated, so the raise/warn split stays one implementation (see `apply_incompleteness_policy`'s docstring for why). The task-4386 consumers call the `enumerate_*` methods directly and apply it at their OWN call sites. The task-4914 consumers read through `read_entity_nodes_checked` / `read_all_valid_edges_checked` in `graphiti_client.py`, which wire each enumeration to the policy once and return its `ReadCompleteness`; the `list_entity_nodes` / `get_all_valid_edges` shims are those checked reads with the verdict dropped. Each consumer then reports what it read:
 
 - `stale_status_snapshot_edge_sweep` and `stale_priority_override_edge_sweep` project it into TRI-STATE per-cycle stats `enumeration_complete` / `enumeration_incomplete_kind`, which `MemoryConsolidator` surfaces on `report.stats` under the `stale_status_snapshot_edges_` and `stale_priority_override_edges_` prefixes. The two key sets are INDEPENDENT: a truncated corpus for one sweep never marks the other.
 - `scripts/cleanup_count_snapshots.py` reports it per project (four keys on each `report['projects'][pid]`) plus a `totals['incomplete_enumerations']` roll-up counting PROJECTS, and renders it as a Corpus column with a warning line on the operator-facing summary table.
@@ -180,7 +180,7 @@ STILL UNWIRED on the summary write-back path, both deliberately left out of task
 
 A materially-short `INCOMPLETE_SHORT_READ` still returns a partial collection. The `force=True` path of `fused-memory/src/fused_memory/services/memory_service.py::MemoryService.rebuild_entity_summaries` will write it back, blanking the summary of any entity whose edges fell in the missing remainder. That path never consults staleness, so it writes to every entity the node read returned.
 
-Do NOT close it by tightening the shims. Guard 4 fires on any shortfall at all, including a single concurrently-invalidated edge, so raising there would take down the live rebuild for exactly the transient that the warn-not-raise decision rejected. The fix belongs at the consumer: a policy on how short is too short, applied where the destructive write is decided. The signal such a policy would key off now reaches `rebuild_entity_summaries` (task 4914): it is the `ReadCompleteness` its read helpers return at the read site.
+Do NOT close it by tightening the shims. Guard 4 fires on any shortfall at all, including a single concurrently-invalidated edge, so raising there would take down the live rebuild for exactly the transient that the warn-not-raise decision rejected. The fix belongs at the consumer: a policy on how short is too short, applied where the destructive write is decided. The signal such a policy would key off now reaches `rebuild_entity_summaries` (task 4914): it is the `ReadCompleteness` the checked reads return at the read site.
 
 ## TICKETS
 

@@ -809,6 +809,30 @@ class TestReadCompleteness:
         with pytest.raises(ValueError, match='shortread'):
             ReadCompleteness(complete=False, incomplete_kind='shortread')
 
+    @pytest.mark.parametrize(
+        'complete, kind',
+        [
+            pytest.param(True, None, id='complete'),
+            pytest.param(False, INCOMPLETE_SHORT_READ, id='incomplete'),
+        ],
+    )
+    def test_result_keys_flatten_a_verdict_under_its_prefix(self, complete, kind):
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        verdict = ReadCompleteness(complete=complete, incomplete_kind=kind)
+        assert ReadCompleteness.result_keys('edges', verdict) == {
+            'edges_complete': complete,
+            'edges_incomplete_kind': kind,
+        }
+
+    def test_result_keys_of_no_verdict_are_both_none(self):
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        assert ReadCompleteness.result_keys('entities', None) == {
+            'entities_complete': None,
+            'entities_incomplete_kind': None,
+        }
+
     def test_is_frozen(self):
         import dataclasses
 
@@ -909,7 +933,7 @@ class TestGetAllValidEdgesPagination:
         assert grouped
         messages = _warnings(caplog)
         assert messages
-        assert any('get_all_valid_edges' in m for m in messages)
+        assert any('enumerate_all_valid_edges' in m for m in messages)
         assert any(str(_LIVE_EDGE_ROWS) in m for m in messages)
 
     @pytest.mark.asyncio
@@ -1153,7 +1177,7 @@ class TestListEntityNodesPagination:
             nodes = await backend.list_entity_nodes(group_id='test')
         assert len(nodes) == _LIVE_ENTITY_NODES
         messages = _warnings(caplog)
-        assert any('list_entity_nodes' in m for m in messages)
+        assert any('enumerate_entity_nodes' in m for m in messages)
         assert any(str(_LIVE_ENTITY_NODES) in m for m in messages)
 
     @pytest.mark.asyncio
@@ -1496,7 +1520,7 @@ class TestShimsStillWarnOnEmpiricalIncompleteness:
         assert grouped
         assert len(distinct_edge_uuids(grouped)) == _LIVE_DISTINCT_EDGES
         messages = _warnings(caplog)
-        assert any('get_all_valid_edges' in m for m in messages)
+        assert any('enumerate_all_valid_edges' in m for m in messages)
 
         _, paged = await backend.enumerate_all_valid_edges(group_id='test')
         assert paged.incomplete_kind == getattr(graphiti_client, kind_name)
@@ -1530,7 +1554,7 @@ class TestShimsStillWarnOnEmpiricalIncompleteness:
 
         assert len(nodes) == _LIVE_ENTITY_NODES
         messages = _warnings(caplog)
-        assert any('list_entity_nodes' in m for m in messages)
+        assert any('enumerate_entity_nodes' in m for m in messages)
 
         _, paged = await backend.enumerate_entity_nodes(group_id='test')
         assert paged.incomplete_kind == getattr(graphiti_client, kind_name)
@@ -1773,13 +1797,14 @@ class TestApplyIncompletenessPolicy:
 
 
 class TestShimPolicyIsUnchangedByThePromotion:
-    """REGRESSION: promoting the helper changed nothing a shim caller sees.
+    """REGRESSION: promoting the helper kept the shims' raise/warn split.
 
-    The shims are the pre-4386 consumer contract and stay in place (the
-    rebuild write-path still depends on their fail-closed raise), so the
+    The shims are the pre-4386 consumer contract and stay in place, so the
     promotion has to be provably behaviour-preserving for them. Driven
     through the REAL backend against `FakeCappedGraph` rather than against a
-    stubbed policy, so it exercises the actual wiring.
+    stubbed policy, so it exercises the actual wiring.  Their warning names
+    the enumeration they read through, the same name every other consumer of
+    that read logs (task 4914).
     """
 
     @pytest.mark.asyncio
@@ -1817,7 +1842,7 @@ class TestShimPolicyIsUnchangedByThePromotion:
         with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
             grouped = await backend.get_all_valid_edges(group_id='test')
         assert len(distinct_edge_uuids(grouped)) == _LIVE_DISTINCT_EDGES
-        assert any('get_all_valid_edges' in m for m in _warnings(caplog))
+        assert any('enumerate_all_valid_edges' in m for m in _warnings(caplog))
 
         caplog.clear()
         _wire(
@@ -1829,7 +1854,7 @@ class TestShimPolicyIsUnchangedByThePromotion:
         with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
             nodes = await backend.list_entity_nodes(group_id='test')
         assert len(nodes) == _LIVE_ENTITY_NODES
-        assert any('list_entity_nodes' in m for m in _warnings(caplog))
+        assert any('enumerate_entity_nodes' in m for m in _warnings(caplog))
 
 
 # ---------------------------------------------------------------------------
@@ -2248,6 +2273,82 @@ class TestDetectStaleWithEdgesReportsBothReads:
 
         with pytest.raises(graphiti_client.IncompleteEnumerationError):
             await backend.detect_stale_with_edges(group_id='test')
+
+
+# ---------------------------------------------------------------------------
+# task 4914: the checked reads — each enumeration wired to the policy once
+# ---------------------------------------------------------------------------
+
+_CHECKED_NODES = [{'uuid': 'u1', 'name': 'Alice', 'summary': 'a real summary'}]
+_CHECKED_EDGES = {'u1': [{'uuid': 'e1', 'fact': 'a real summary', 'name': 'knows'}]}
+_CHECKED_READS = [
+    pytest.param('read_entity_nodes_checked', 'nodes_read', _CHECKED_NODES, id='nodes'),
+    pytest.param('read_all_valid_edges_checked', 'edges_read', _CHECKED_EDGES, id='edges'),
+]
+
+
+class TestCheckedReads:
+    """A checked read is its ``enumerate_*`` call plus the shared policy, returning the verdict.
+
+    Driven through a real backend whose ``enumerate_*`` seam is stubbed.
+    """
+
+    @pytest.fixture
+    def checked_read(self, mock_config, make_backend, make_edge_backend):
+        """callable(reader_name, read_kwarg, paged) -> awaitable of the checked read."""
+        from fused_memory.backends import graphiti_client
+
+        def _call(reader_name, read_kwarg, paged, **kwargs):
+            backend = make_edge_backend(
+                make_backend(mock_config),
+                nodes=_CHECKED_NODES, edges=_CHECKED_EDGES, **{read_kwarg: paged},
+            )
+            reader = getattr(graphiti_client, reader_name)
+            return reader(backend, group_id='test', **kwargs)
+
+        return _call
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('reader_name, read_kwarg, collection', _CHECKED_READS)
+    async def test_a_complete_read_returns_its_collection_and_a_complete_verdict(
+        self, reader_name, read_kwarg, collection, checked_read
+    ):
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        got, verdict = await checked_read(reader_name, read_kwarg, complete_paged_read())
+        assert got == collection
+        assert verdict == ReadCompleteness(complete=True, incomplete_kind=None)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('reader_name, read_kwarg, collection', _CHECKED_READS)
+    async def test_an_empirical_read_warns_on_the_given_log_and_returns_its_verdict(
+        self, reader_name, read_kwarg, collection, checked_read, caplog
+    ):
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        caller_log = logging.getLogger('test.checked_read.caller')
+        with caplog.at_level(logging.WARNING):
+            got, verdict = await checked_read(
+                reader_name, read_kwarg, incomplete_paged_read(INCOMPLETE_SHORT_READ),
+                log=caller_log,
+            )
+        assert got == collection
+        assert verdict == ReadCompleteness(
+            complete=False, incomplete_kind=INCOMPLETE_SHORT_READ
+        )
+        warned_under = {r.name for r in caplog.records if r.levelno == logging.WARNING}
+        assert warned_under == {caller_log.name}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('reader_name, read_kwarg, collection', _CHECKED_READS)
+    @pytest.mark.parametrize('kind', sorted(INCOMPLETE_STRUCTURAL_KINDS))
+    async def test_a_structural_read_raises(
+        self, reader_name, read_kwarg, collection, kind, checked_read
+    ):
+        from fused_memory.backends.graphiti_client import IncompleteEnumerationError
+
+        with pytest.raises(IncompleteEnumerationError):
+            await checked_read(reader_name, read_kwarg, incomplete_paged_read(kind))
 
 
 # ---------------------------------------------------------------------------

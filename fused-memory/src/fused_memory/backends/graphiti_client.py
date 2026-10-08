@@ -740,6 +740,21 @@ class ReadCompleteness:
     def of(cls, paged: PagedRead) -> 'ReadCompleteness':
         return cls(complete=paged.complete, incomplete_kind=paged.incomplete_kind)
 
+    @staticmethod
+    def result_keys(
+        prefix: str, verdict: 'ReadCompleteness | None'
+    ) -> dict[str, bool | str | None]:
+        """``<prefix>_complete`` and ``<prefix>_incomplete_kind`` for a result dict.
+
+        A None verdict means the read was not issued, and maps both keys to None.
+        """
+        if verdict is None:
+            return {f'{prefix}_complete': None, f'{prefix}_incomplete_kind': None}
+        return {
+            f'{prefix}_complete': verdict.complete,
+            f'{prefix}_incomplete_kind': verdict.incomplete_kind,
+        }
+
 
 async def _census_count(graph, cypher: str, params: dict | None = None) -> int | None:
     """Return the single integer a ``count(...)`` probe reports, or None.
@@ -1069,9 +1084,11 @@ def apply_incompleteness_policy(
     (wire the completeness signal through to consumers) would have to move
     when the policy migrated to the consumer.  Task 4386 discharged that
     ticket, and the policy was SHARED rather than migrated: it was promoted
-    to public and is applied UNCHANGED at each whole-graph consumer's own
-    call site.  The consumers are listed in one place, the "Consumers now act
-    on it" section of plans/falkordb-resultset-cap-audit.md.  Migrating would
+    to public and is applied UNCHANGED by each whole-graph consumer, at its
+    own call site or through a checked read (``read_entity_nodes_checked``,
+    ``read_all_valid_edges_checked``).  The consumers are listed in one place,
+    the "Consumers now act on it" section of
+    plans/falkordb-resultset-cap-audit.md.  Migrating would
     have meant one hand-written copy of the raise/warn decision per consumer
     — exactly the drift the paragraph above names, at consumer scale, and
     silent in the corrupting direction.  What moved to the consumers is the
@@ -1129,6 +1146,56 @@ def apply_incompleteness_policy(
             method, group_id, paged.rows_seen, returned_count, noun,
             paged.reason, paged.rows_seen, paged.expected_rows,
         )
+
+
+async def read_entity_nodes_checked(
+    backend: 'GraphitiBackend', *, group_id: str, log: logging.Logger = logger
+) -> tuple[list[dict], ReadCompleteness]:
+    """Every entity node, with the policy applied and the read's verdict returned.
+
+    The one place ``enumerate_entity_nodes`` is wired to
+    ``apply_incompleteness_policy``; ``list_entity_nodes`` is this without the
+    verdict.  ``log`` receives the EMPIRICAL warning.
+
+    Raises:
+        IncompleteEnumerationError: The read was structurally incomplete.
+    """
+    nodes, paged = await backend.enumerate_entity_nodes(group_id=group_id)
+    apply_incompleteness_policy(
+        paged,
+        method='enumerate_entity_nodes',
+        group_id=group_id,
+        returned_count=len(nodes),
+        noun='nodes',
+        consequence='must not drive a staleness verdict or a summary rewrite',
+        log=log,
+    )
+    return nodes, ReadCompleteness.of(paged)
+
+
+async def read_all_valid_edges_checked(
+    backend: 'GraphitiBackend', *, group_id: str, log: logging.Logger = logger
+) -> tuple[dict[str, list[EdgeDict]], ReadCompleteness]:
+    """Every valid edge by entity uuid, with the policy applied and the read's verdict returned.
+
+    The one place ``enumerate_all_valid_edges`` is wired to
+    ``apply_incompleteness_policy``; ``get_all_valid_edges`` is this without
+    the verdict.  ``log`` receives the EMPIRICAL warning.
+
+    Raises:
+        IncompleteEnumerationError: The read was structurally incomplete.
+    """
+    grouped, paged = await backend.enumerate_all_valid_edges(group_id=group_id)
+    apply_incompleteness_policy(
+        paged,
+        method='enumerate_all_valid_edges',
+        group_id=group_id,
+        returned_count=len(grouped),
+        noun='entities',
+        consequence='must not be written back',
+        log=log,
+    )
+    return grouped, ReadCompleteness.of(paged)
 
 
 def _first_row_per_uuid(rows: list[list], *, reader: str) -> list[list]:
@@ -2778,6 +2845,7 @@ class GraphitiBackend:
         ORDER BY and completeness rules that make paging safe are in
         _paged_ro_query.
 
+        This is read_all_valid_edges_checked without the verdict.
         Incompleteness is handled by the shared apply_incompleteness_policy:
         STRUCTURAL kinds raise IncompleteEnumerationError, EMPIRICAL ones warn
         and return what was fetched.  See that helper for the policy and
@@ -2805,15 +2873,7 @@ class GraphitiBackend:
             required, because 12506 distinct edges exceeds the cap on its own.
             Halving buys margin, not correctness.
         """
-        grouped, paged = await self.enumerate_all_valid_edges(group_id=group_id)
-        apply_incompleteness_policy(
-            paged,
-            method='get_all_valid_edges',
-            group_id=group_id,
-            returned_count=len(grouped),
-            noun='entities',
-            consequence='must not be written back',
-        )
+        grouped, _ = await read_all_valid_edges_checked(self, group_id=group_id)
         return grouped
 
     @_canonicalize_group_args
@@ -4571,9 +4631,10 @@ class GraphitiBackend:
         Why a node read was in scope for an edge-cap task: see §History in
         plans/falkordb-resultset-cap-audit.md.
 
-        Incompleteness is handled by the same shared
-        apply_incompleteness_policy get_all_valid_edges uses; see that helper.
-        enumerate_entity_nodes returns the signal as a value and never raises.
+        This is read_entity_nodes_checked without the verdict, so
+        incompleteness is handled by the shared apply_incompleteness_policy;
+        see that helper.  enumerate_entity_nodes returns the signal as a value
+        and never raises.
 
         Args:
             group_id: Project graph to query.
@@ -4586,15 +4647,7 @@ class GraphitiBackend:
             IncompleteEnumerationError: The underlying enumeration was
                 structurally incomplete.
         """
-        nodes, paged = await self.enumerate_entity_nodes(group_id=group_id)
-        apply_incompleteness_policy(
-            paged,
-            method='list_entity_nodes',
-            group_id=group_id,
-            returned_count=len(nodes),
-            noun='nodes',
-            consequence='must not drive a staleness verdict or a summary rewrite',
-        )
+        nodes, _ = await read_entity_nodes_checked(self, group_id=group_id)
         return nodes
 
     @_canonicalize_group_args
@@ -4618,13 +4671,14 @@ class GraphitiBackend:
         any graph above the cap) that made every rate computed against it
         wrong.  With pagination it is the true node count.
 
-        Each read goes through ``apply_incompleteness_policy``, so a
-        STRUCTURALLY incomplete read raises ``IncompleteEnumerationError``
-        before a single verdict is formed.  A fabricated ``{}`` edge corpus
-        would otherwise make every non-empty summary look stale, and
-        ``rebuild_entity_from_edges`` would write ``''`` back over it.  The
-        node read is checked before the edge read is issued.  An EMPIRICALLY
-        incomplete read warns and proceeds, and its verdict is returned.
+        Each read is a checked read (``read_entity_nodes_checked``,
+        ``read_all_valid_edges_checked``), so a STRUCTURALLY incomplete read
+        raises ``IncompleteEnumerationError`` before a single verdict is
+        formed.  A fabricated ``{}`` edge corpus would otherwise make every
+        non-empty summary look stale, and ``rebuild_entity_from_edges`` would
+        write ``''`` back over it.  The node read is checked before the edge
+        read is issued.  An EMPIRICALLY incomplete read warns and proceeds,
+        and its verdict is returned.
 
         Args:
             group_id: Project graph to query.
@@ -4633,23 +4687,11 @@ class GraphitiBackend:
             StaleSummaryResult, carrying the node read's and the edge read's
             ReadCompleteness alongside the verdicts.
         """
-        entities, entities_read = await self.enumerate_entity_nodes(group_id=group_id)
-        apply_incompleteness_policy(
-            entities_read,
-            method='enumerate_entity_nodes',
-            group_id=group_id,
-            returned_count=len(entities),
-            noun='nodes',
-            consequence='must not drive a staleness verdict or a summary rewrite',
+        entities, entities_completeness = await read_entity_nodes_checked(
+            self, group_id=group_id
         )
-        all_edges, edges_read = await self.enumerate_all_valid_edges(group_id=group_id)
-        apply_incompleteness_policy(
-            edges_read,
-            method='enumerate_all_valid_edges',
-            group_id=group_id,
-            returned_count=len(all_edges),
-            noun='entities',
-            consequence='must not be written back',
+        all_edges, edges_completeness = await read_all_valid_edges_checked(
+            self, group_id=group_id
         )
         stale: list[dict] = []
         for entity in entities:
@@ -4661,8 +4703,8 @@ class GraphitiBackend:
             stale=stale,
             all_edges=all_edges,
             total_count=len(entities),
-            entities_completeness=ReadCompleteness.of(entities_read),
-            edges_completeness=ReadCompleteness.of(edges_read),
+            entities_completeness=entities_completeness,
+            edges_completeness=edges_completeness,
         )
 
     @_canonicalize_group_args
