@@ -194,8 +194,11 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
         # _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS age cutoff AND is not a protected
         # cycle_summary mirror AND its kind is not in
         # mem0_tombstone.PROTECTED_AUDIT_KINDS AND its task_id is confirmed
-        # terminal. The age-only rule destroyed 40 kind='cadence_check' audit
-        # records in autopilot_video, all citing a merely-'deferred' task.
+        # terminal. A marker citing no task is instead deleted once past
+        # _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS if it declares no kind or
+        # FLAG_FOR_STAGE2_MARKER_KIND (task 4995). The age-only rule destroyed
+        # 40 kind='cadence_check' audit records in autopilot_video, all citing
+        # a merely-'deferred' task.
         #
         # Second firing site (task 4376), a latency layer applying the same
         # rule to the one task that just closed:

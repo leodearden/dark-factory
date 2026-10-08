@@ -1193,7 +1193,9 @@ _STAGE1_FLAG_MARKER_MEM0_ENUM_FILTER_VARIANTS: tuple[dict, ...] = (
 # task-3041 protected-mirror invariant (gate 2), PROTECTED_AUDIT_KINDS
 # (gate 3) and the terminal-task closure gate (gate 4, the primary defence)
 # all still apply unchanged at 7 days, so a record this TTL newly exposes is
-# reaped only if it is ALSO unprotected and cites a task confirmed terminal.
+# reaped only if it is ALSO unprotected and cites a task confirmed terminal;
+# one citing no task is instead bounded by _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS
+# plus the marker-kind guard (task 4995).
 # See _sweep_stale_mem0_flag_for_stage2_markers' docstring for the full rule.
 _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS: int = 7
 # A flag_for_stage2 marker citing no task may be retired once older than this.
@@ -1594,34 +1596,32 @@ async def _sweep_stale_mem0_pool(
       (:func:`_sweep_stale_persistence_markers`,
       :func:`_sweep_stale_mem0_flag_markers`), which are age-only by design.
     - An EMPTY collection means "gate active, nothing is terminal" and
-      therefore retires nothing this cycle. :func:`_resolve_terminal_task_ids`
-      is explicitly fail-safe to ``[]`` on a falsy taskmaster, a raising
-      ``get_statuses``, or an unexpected result shape — so a Taskmaster outage
-      degrades to a FULL KEEP, not to unconditional age-deletion during
-      exactly the window in which nothing can be verified. Collapsing the two
-      sentinels would invert that.
+      therefore retires no task-citing member this cycle.
+      :func:`_resolve_terminal_task_ids` is explicitly fail-safe to ``[]`` on
+      a falsy taskmaster, a raising ``get_statuses``, or an unexpected result
+      shape — so a Taskmaster outage degrades to a FULL KEEP of task-citing
+      members, not to unconditional age-deletion during exactly the window in
+      which nothing can be verified. Collapsing the two sentinels would invert
+      that.
 
     Matching is exact-string against ``str(task_id).strip()``, deliberately
     reusing ``_gc_recon_markers``' documented precedent and its consequence: a
     marker whose stored ``task_id`` is a comma-joined multi-task list never
     matches even when every cited task is terminal, and is KEPT. So is a
-    marker with no ``task_id`` at all, an empty one, or a non-Taskmaster
-    pseudo-id. That is a KEEP-direction leak and it is deliberate — this
-    module's documented posture is "uncertain => keep, never delete on
-    partial/failed information", and bounded recoverable growth outranks
-    permanent loss.
+    non-Taskmaster pseudo-id. That is a KEEP-direction leak and it is
+    deliberate — this module's documented posture is "uncertain => keep, never
+    delete on partial/failed information", and bounded recoverable growth
+    outranks permanent loss.
 
-    **The leak is SIZED, not merely asserted bounded** (amendment pass;
-    reviewer finding robustness/unbounded-growth, which correctly noted the
-    original census measured ``kind`` and ``source`` coverage but never
-    ``task_id``). Direct Qdrant scroll of every live ``flag_for_stage2`` pool,
-    2026-09-02: **56 live records across 5 projects, 41 (73%) carry a
-    non-empty ``task_id`` and 15 (27%) do not** — dark_factory 3/11, reify
-    12/24, autopilot_video 0/12, know_live 0/9, solar_challenge_platform 0
-    (pool empty). So the permanently-un-retireable cohort is a minority of the
-    pool, and the sweep still retires the ~73% majority once their cited task
-    closes; it does not degrade to retiring nothing. The 27% is real growth
-    and is why the aggregate WARNING below exists.
+    A member citing NO task (a missing, ``None`` or empty ``task_id``) has no
+    closure to wait for. It is KEPT unless the caller passes
+    *taskless_retirement*, under which it is retired once past that policy's
+    age ceiling, provided it declares no ``kind`` or the policy's
+    ``marker_kind``. Comma-joined, pseudo-id and open-task citations are still
+    KEPT at any age.
+
+    The task-less cohort, 15 of 56 live ``flag_for_stage2`` records in the
+    2026-09-02 census, now has that bounded path (task 4995).
 
     The matching HISTORICAL census — ``task_id`` coverage on the 289 records
     this sweep already destroyed — is **unmeasurable, permanently**:
@@ -1635,10 +1635,9 @@ async def _sweep_stale_mem0_pool(
 
     The leak is surfaced, not hidden: when the gate withholds at
     least one AGE-STALE member, ONE aggregate WARNING per sweep names the
-    retained count, so a persistently growing number becomes visible as the
-    signal that this pool needs a real closure path for task_id-less markers.
+    retained count, so a persistently growing number becomes visible.
     The gate is evaluated only for members that already cleared the age
-    cutoff, so that count means "old enough to retire but cannot be" and never
+    cutoff, so that count means "old enough to retire but withheld" and never
     "not yet old enough" — a still-young marker citing an open task is the
     healthy steady state of a live pool and must not inflate the signal.
 
@@ -1725,6 +1724,11 @@ async def _sweep_stale_mem0_pool(
             See the "Terminal-task-closure gate" note above for the
             ``None``-vs-``[]`` distinction and the deliberate KEEP-direction
             consequences.
+        taskless_retirement: Opt-in policy under which an age-stale member
+            citing no task may pass the closure gate (task 4995). ``None``
+            (default) keeps every such member. Has no effect when
+            *terminal_task_ids* is ``None``, because then every age-stale
+            member is already eligible.
 
     Returns:
         Number of memories successfully deleted (0 if nothing is stale, on
@@ -2046,9 +2050,10 @@ async def _sweep_stale_mem0_pool(
     if retained_unclosed > 0:
         # Retained-unclosed diagnostic (task 4375). The gate's KEEP direction
         # is deliberate and correct — permanent loss outranks bounded,
-        # recoverable growth — but a marker with no task_id, a pseudo-id, or a
-        # comma-joined task_id can now NEVER be retired, so the cohort only
-        # grows. Surfaced rather than hidden, per the project's
+        # recoverable growth — but a marker citing a pseudo-id or a
+        # comma-joined task_id can NEVER be retired, and one citing no task
+        # waits out a longer ceiling or, declaring a foreign kind, is kept
+        # forever (task 4995). Surfaced rather than hidden, per the project's
         # loud-over-silent-degradation invariant.
         #
         # Modelled on the task-3915 under-tagged-drift block above: purely
@@ -2059,11 +2064,11 @@ async def _sweep_stale_mem0_pool(
         try:
             logger.warning(
                 'reconciliation.%s: RETAINED %d age-stale %s record(s) — their '
-                'referencing task is not terminal, or they cite no resolvable '
-                'task id (missing/empty/comma-joined/non-Taskmaster). This is '
-                'the deliberate fail-safe KEEP direction, not a failure; a '
-                'persistently growing count means this pool needs a closure '
-                'path for task_id-less markers (task 4375).',
+                'cited task is not terminal, their task id is unresolvable '
+                '(comma-joined/non-Taskmaster), or they cite no task and are '
+                'younger than the task-less ceiling or declare a foreign kind. '
+                'This is the deliberate fail-safe KEEP direction, not a '
+                'failure (tasks 4375, 4995).',
                 log_name, retained_unclosed, source,
                 extra={
                     'project_id': project_id,
@@ -2425,7 +2430,9 @@ async def _sweep_stale_mem0_flag_for_stage2_markers(
     3. Its ``kind`` is not in ``mem0_tombstone.PROTECTED_AUDIT_KINDS`` (task
        4375, Part B).
     4. Its ``task_id`` is confirmed TERMINAL via *terminal_task_ids* (task
-       4375, Part A).
+       4375, Part A) or, when it cites NO task, it is older than
+       ``_FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS`` and declares no ``kind`` or
+       ``FLAG_FOR_STAGE2_MARKER_KIND`` (task 4995).
 
     Gate 4 is the PRIMARY defence and gate 3 is defence in depth for the
     residual intersection, not the other way round: every one of the 40
@@ -2516,9 +2523,10 @@ async def _retire_flag_for_stage2_members(
     """The ``flag_for_stage2`` retirement core shared by the per-cycle sweep and the done hook.
 
     Fixes what makes a delete a ``flag_for_stage2`` retirement — the pool label,
-    the deleter tag, the count short-circuit — and leaves eligibility entirely
-    to :func:`_sweep_stale_mem0_pool`'s composite rule. Callers choose only
-    which members to enumerate and which tasks count as terminal.
+    the deleter tag, the count short-circuit, the task-less retirement policy —
+    and leaves eligibility entirely to :func:`_sweep_stale_mem0_pool`'s
+    composite rule. Callers choose only which members to enumerate and which
+    tasks count as terminal.
     """
     return await _sweep_stale_mem0_pool(
         memory_service,
