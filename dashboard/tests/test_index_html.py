@@ -1531,13 +1531,17 @@ _MERGE_QUEUE_ORDER_CASES = [
     (_DATUM_PREFIX, 'datum.js', _MERGE_QUEUE_PREFIX, 'merge_queue.js'),
     (_MERGE_QUEUE_PREFIX, 'merge_queue.js', _TABS_PREFIX, 'tabs.jsx'),
     (_MERGE_QUEUE_PREFIX, 'merge_queue.js', _APP_JSX_PREFIX, 'app.jsx'),
+    (_MERGE_QUEUE_PREFIX, 'merge_queue.js', _SHELL_PREFIX, 'shell.jsx'),
 ]
 
 
 @pytest.mark.parametrize(
     'before_prefix, before_label, after_prefix, after_label',
     _MERGE_QUEUE_ORDER_CASES,
-    ids=['datum-before-merge-queue', 'merge-queue-before-tabs', 'merge-queue-before-app'],
+    ids=[
+        'datum-before-merge-queue', 'merge-queue-before-tabs', 'merge-queue-before-app',
+        'merge-queue-before-shell',
+    ],
 )
 def test_merge_queue_js_load_order(
     index_html_body: str,
@@ -1547,6 +1551,67 @@ def test_merge_queue_js_load_order(
     after_label: str,
 ) -> None:
     """The merge-queue reader loads after what it reads and before what reads it."""
+    assert_script_loads_before(
+        index_html_body,
+        before_prefix,
+        after_prefix,
+        before_label=before_label,
+        after_label=after_label,
+        consumer_note=f'{after_label} ' + _READS_AT_MODULE_SCOPE.format(before=before_label),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression guard: performance_cards.js is served, versioned, and sits between
+# the module it reads and the tab that reads it (task 6245)
+#
+# performance_cards.js destructures window.DF_DATUM at module scope, and
+# tabs.jsx destructures window.DF_PERFORMANCE_CARDS at module scope — neither
+# with a fallback. Each edge is its own case because each blanks PerfTab.
+# ---------------------------------------------------------------------------
+
+_PERFORMANCE_CARDS_PREFIX = '/static/redux/performance_cards.js'
+
+
+def test_performance_cards_js_is_served(client) -> None:
+    """GET /static/redux/performance_cards.js returns 200.
+
+    The load-order guards below only read tag positions, which a file present
+    in git but not served would still pass — while tabs.jsx throws on its
+    top-level destructure.
+    """
+    resp = client.get(_PERFORMANCE_CARDS_PREFIX)
+    assert resp.status_code == 200, (
+        f'expected 200 for {_PERFORMANCE_CARDS_PREFIX}, got {resp.status_code} — '
+        'the module is registered in index.html but not reachable at runtime.'
+    )
+
+
+def test_performance_cards_js_has_cache_buster(index_html_body: str) -> None:
+    """performance_cards.js is present among the VERSIONED redux assets."""
+    assert re.search(r'/static/redux/performance_cards\.js\?v=\d+', index_html_body), (
+        'performance_cards.js is not present among the versioned /static/redux/* '
+        'assets in index.html — tabs.jsx destructures window.DF_PERFORMANCE_CARDS '
+        'at top level with no fallback. Bump all /static/redux/* ?v= uniformly.'
+    )
+
+
+@pytest.mark.parametrize(
+    'before_prefix, before_label, after_prefix, after_label',
+    [
+        (_DATUM_PREFIX, 'datum.js', _PERFORMANCE_CARDS_PREFIX, 'performance_cards.js'),
+        (_PERFORMANCE_CARDS_PREFIX, 'performance_cards.js', _TABS_PREFIX, 'tabs.jsx'),
+    ],
+    ids=['datum-before-performance-cards', 'performance-cards-before-tabs'],
+)
+def test_performance_cards_js_load_order(
+    index_html_body: str,
+    before_prefix: str,
+    before_label: str,
+    after_prefix: str,
+    after_label: str,
+) -> None:
+    """The performance-cards reader loads after what it reads and before what reads it."""
     assert_script_loads_before(
         index_html_body,
         before_prefix,

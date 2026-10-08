@@ -6,7 +6,7 @@ import asyncio
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 import httpx
@@ -113,10 +113,21 @@ async def empty_merge_events_conn(empty_merge_events_db):
         yield conn
 
 
+@pytest.fixture()
+async def tableless_runs_conn(tmp_path):
+    """A readable runs.db with NO ``events`` table: every query raises OperationalError."""
+    db_path = tmp_path / 'tableless_runs.db'
+    sqlite3.connect(str(db_path)).close()
+    async with aiosqlite.connect(str(db_path)) as conn:
+        conn.row_factory = aiosqlite.Row
+        yield conn
+
+
 # ---------------------------------------------------------------------------
 # Imports under test (deferred so the test file fails gracefully before impl)
 # ---------------------------------------------------------------------------
 
+from dashboard.data import merge_queue  # noqa: E402
 from dashboard.data.datum import Datum, DatumState, validate_datum  # noqa: E402
 from dashboard.data.merge_queue import (  # noqa: E402
     RECENT_MERGES_CAP,
@@ -798,17 +809,41 @@ class TestRecentMerges:
         assert {'task_id', 'outcome', 'duration_ms', 'timestamp', 'run_id'} <= set(
             result['rows'][0].keys()
         )
-        assert result['total'] == 25
+        total = result['total']
+        assert total.state is DatumState.FRESH
+        assert total.value == 25
+        assert total.as_of == now
+        assert total.freshness_bound_seconds == merge_queue.RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
+        validate_datum(total, now)
 
     @pytest.mark.asyncio
     async def test_none_db(self):
-        result = await recent_merges(None, limit=20, hours=24)
-        assert result == {'rows': [], 'total': 0}
+        """No runs.db open: no rows, and a window total nobody measured."""
+        now = datetime.now(UTC)
+        result = await recent_merges(None, limit=20, hours=24, now=now)
+        assert result['rows'] == []
+        assert result['total'].state is DatumState.UNKNOWN
+        assert 'no runs.db is open' in (result['total'].reason or '')
+        validate_datum(result['total'], now)
 
     @pytest.mark.asyncio
     async def test_empty_db(self, empty_merge_events_conn):
-        result = await recent_merges(empty_merge_events_conn, limit=20, hours=24)
-        assert result == {'rows': [], 'total': 0}
+        """A readable empty window is a measured zero."""
+        now = datetime.now(UTC)
+        result = await recent_merges(empty_merge_events_conn, limit=20, hours=24, now=now)
+        assert result['rows'] == []
+        assert result['total'].state is DatumState.FRESH
+        assert result['total'].value == 0
+        validate_datum(result['total'], now)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_read_has_an_unknown_total(self, tableless_runs_conn):
+        now = datetime.now(UTC)
+        result = await recent_merges(tableless_runs_conn, limit=20, hours=24, now=now)
+        assert result['rows'] == []
+        assert result['total'].state is DatumState.UNKNOWN
+        assert (result['total'].reason or '').strip()
+        validate_datum(result['total'], now)
 
     @pytest.mark.asyncio
     async def test_custom_limit(self, merge_events_db):
@@ -827,7 +862,7 @@ class TestRecentMerges:
             result = await recent_merges(db, limit=5, hours=24, now=now)
 
         assert len(result['rows']) == 5
-        assert result['total'] == 10
+        assert result['total'].value == 10
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize('limit', [0, -1])
@@ -923,7 +958,7 @@ class TestRecentMerges:
         assert len(result['rows']) == 3
         task_ids = [r['task_id'] for r in result['rows']]
         assert all(tid.startswith('recent-') for tid in task_ids)
-        assert result['total'] == 3
+        assert result['total'].value == 3
 
 
 def test_recent_merges_cap_is_two_hundred():
@@ -935,79 +970,99 @@ def test_recent_merges_cap_is_two_hundred():
 # TestSpeculativeStats
 # ---------------------------------------------------------------------------
 
+async def _speculative_over(db_path, events, *, now):
+    conn_sync = sqlite3.connect(str(db_path))
+    for evt in events:
+        _insert_event(conn_sync, **evt)
+    conn_sync.commit()
+    conn_sync.close()
+    async with aiosqlite.connect(str(db_path)) as db:
+        db.row_factory = aiosqlite.Row
+        return await speculative_stats(db, hours=24, now=now)
+
+
+def _speculative_events(event_type, count, *, now, first_minutes_ago=1):
+    return [
+        {'event_type': event_type, 'timestamp': now - timedelta(minutes=i + first_minutes_ago)}
+        for i in range(count)
+    ]
+
+
 class TestSpeculativeStats:
     @pytest.mark.asyncio
     async def test_populated(self, merge_events_db):
-        """hit_count, discard_count, total, hit_rate computed correctly."""
+        """A readable window is one FRESH Datum carrying the counts and their rate."""
         now = datetime.now(UTC)
-        conn_sync = sqlite3.connect(str(merge_events_db))
-        for i in range(5):
-            _insert_event(conn_sync, event_type='speculative_merge',
-                          timestamp=now - timedelta(minutes=i + 1),
-                          data={'base_sha': f'abc{i}'})
-        for i in range(2):
-            _insert_event(conn_sync, event_type='speculative_discard',
-                          timestamp=now - timedelta(minutes=i + 10),
-                          data={'reason': 'previous_failed'})
-        conn_sync.commit()
-        conn_sync.close()
+        datum = await _speculative_over(
+            merge_events_db,
+            _speculative_events('speculative_merge', 5, now=now)
+            + _speculative_events('speculative_discard', 3, now=now, first_minutes_ago=10),
+            now=now,
+        )
 
-        async with aiosqlite.connect(str(merge_events_db)) as db:
-            db.row_factory = aiosqlite.Row
-            result = await speculative_stats(db, hours=24)
-
-        assert result['hit_count'] == 5
-        assert result['discard_count'] == 2
-        assert result['total'] == 7
-        assert result['hit_rate'] == pytest.approx(5 / 7, abs=1e-6)
-
-    @pytest.mark.asyncio
-    async def test_none_db(self):
-        result = await speculative_stats(None, hours=24)
-        assert result == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
+        assert isinstance(datum, Datum)
+        assert datum.state is DatumState.FRESH
+        assert datum.reason is None
+        assert datum.as_of == now
+        assert datum.freshness_bound_seconds == merge_queue.RUNS_DB_READ_FRESHNESS_BOUND_SECONDS
+        assert datum.value == {'hit_count': 5, 'discard_count': 3, 'total': 8, 'hit_rate': 5 / 8}
+        validate_datum(datum, now)
 
     @pytest.mark.asyncio
     async def test_empty_db(self, empty_merge_events_conn):
-        result = await speculative_stats(empty_merge_events_conn, hours=24)
-        assert result == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
+        """A readable empty window is measured zeros, and a zero-attempt window has no rate."""
+        now = datetime.now(UTC)
+        datum = await speculative_stats(empty_merge_events_conn, hours=24, now=now)
+
+        assert datum.state is DatumState.FRESH
+        assert datum.as_of == now
+        assert datum.value == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': None}
+        validate_datum(datum, now)
+
+    @pytest.mark.asyncio
+    async def test_none_db(self):
+        """A project with no runs.db open has no counts, not zero counts."""
+        now = datetime.now(UTC)
+        datum = await speculative_stats(None, hours=24, now=now)
+
+        assert datum.state is DatumState.UNKNOWN
+        assert datum.value is None
+        assert datum.as_of is None
+        assert 'no runs.db is open' in (datum.reason or '')
+        validate_datum(datum, now)
+
+    @pytest.mark.asyncio
+    async def test_a_failed_read_is_unknown_not_zeros(self, tableless_runs_conn):
+        """with_db swallows the OperationalError; its default must still say the read failed."""
+        now = datetime.now(UTC)
+        datum = await speculative_stats(tableless_runs_conn, hours=24, now=now)
+
+        assert datum.state is DatumState.UNKNOWN
+        assert datum.value is None
+        assert 'speculative-merge events could not be read' in (datum.reason or '')
+        validate_datum(datum, now)
 
     @pytest.mark.asyncio
     async def test_all_hits(self, merge_events_db):
-        """All speculative_merge → hit_rate=1.0."""
         now = datetime.now(UTC)
-        conn_sync = sqlite3.connect(str(merge_events_db))
-        for i in range(3):
-            _insert_event(conn_sync, event_type='speculative_merge',
-                          timestamp=now - timedelta(minutes=i + 1),
-                          data={'base_sha': f'sha{i}'})
-        conn_sync.commit()
-        conn_sync.close()
+        datum = await _speculative_over(
+            merge_events_db, _speculative_events('speculative_merge', 3, now=now), now=now,
+        )
 
-        async with aiosqlite.connect(str(merge_events_db)) as db:
-            db.row_factory = aiosqlite.Row
-            result = await speculative_stats(db, hours=24)
-
-        assert result['hit_rate'] == pytest.approx(1.0)
-        assert result['discard_count'] == 0
+        assert datum.value is not None
+        assert datum.value['hit_rate'] == pytest.approx(1.0)
+        assert datum.value['discard_count'] == 0
 
     @pytest.mark.asyncio
     async def test_all_discards(self, merge_events_db):
-        """All speculative_discard → hit_rate=0.0."""
         now = datetime.now(UTC)
-        conn_sync = sqlite3.connect(str(merge_events_db))
-        for i in range(3):
-            _insert_event(conn_sync, event_type='speculative_discard',
-                          timestamp=now - timedelta(minutes=i + 1),
-                          data={'reason': 'chain_invalidated'})
-        conn_sync.commit()
-        conn_sync.close()
+        datum = await _speculative_over(
+            merge_events_db, _speculative_events('speculative_discard', 3, now=now), now=now,
+        )
 
-        async with aiosqlite.connect(str(merge_events_db)) as db:
-            db.row_factory = aiosqlite.Row
-            result = await speculative_stats(db, hours=24)
-
-        assert result['hit_rate'] == pytest.approx(0.0)
-        assert result['hit_count'] == 0
+        assert datum.value is not None
+        assert datum.value['hit_rate'] == pytest.approx(0.0)
+        assert datum.value['hit_count'] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1354,7 +1409,7 @@ class TestBuildPerProjectMergeQueue:
         task_ids = {r['task_id'] for r in recent}
         assert 'in-window' in task_ids
         assert 'out-window' not in task_ids
-        assert result['/tmp/A']['recent_total'] == 1
+        assert result['/tmp/A']['recent_total'].value == 1
 
     async def test_none_db_entry_skipped(self, tmp_path):
         """A (pid, None) pair yields the declared full-default shape (all 5 keys,
@@ -1374,8 +1429,9 @@ class TestBuildPerProjectMergeQueue:
         assert data['outcomes'] == {'labels': [], 'values': []}
         assert data['latency'] == ZERO_LATENCY
         assert data['recent'] == []
-        assert data['recent_total'] == 0
-        assert data['speculative'] == {'hit_count': 0, 'discard_count': 0, 'total': 0, 'hit_rate': 0.0}
+        for field in ('speculative', 'recent_total'):
+            assert data[field].state is DatumState.UNKNOWN, field
+            validate_datum(data[field], now)
         assert 'active' not in data, (
             'the live probe is the one source of the queue; the route reads it'
         )
@@ -1408,11 +1464,19 @@ class TestBuildPerProjectMergeQueue:
         none_data = result['/tmp/none']
         assert none_data['latency']['with_duration'] == 0
         assert none_data['recent'] == []
-        assert none_data['recent_total'] == 0
+        for field in ('speculative', 'recent_total'):
+            assert none_data[field].state is DatumState.UNKNOWN, field
 
-        # Real-db entry has the expected top-level keys
+        # Real-but-empty entry: its zeros were measured
         real_data = result['/tmp/real']
         assert set(real_data.keys()) >= {'depth_timeseries', 'outcomes', 'latency', 'recent', 'speculative'}
+        assert real_data['speculative'].state is DatumState.FRESH
+        assert real_data['speculative'].value['total'] == 0
+        assert real_data['recent_total'].state is DatumState.FRESH
+        assert real_data['recent_total'].value == 0
+        for data in result.values():
+            for field in ('speculative', 'recent_total'):
+                validate_datum(data[field], now)
 
     async def test_the_outcome_total_is_the_latency_attempt_total(self, tmp_path):
         """Sketch #9, second half: one row set behind the donut and the latency."""
@@ -1540,7 +1604,7 @@ class TestBuildPerProjectMergeQueue:
 
         project = result['/tmp/P']
         assert [r['task_id'] for r in project['recent']] == expected_ids
-        assert project['recent_total'] == expected_total
+        assert project['recent_total'].value == expected_total
 
     @pytest.mark.asyncio
     async def test_burst_beyond_the_cap_keeps_the_newest_and_counts_them_all(self, tmp_path):
@@ -1570,7 +1634,58 @@ class TestBuildPerProjectMergeQueue:
         assert [r['task_id'] for r in project['recent']] == [
             f'burst-task-{i:03d}' for i in range(RECENT_MERGES_CAP)
         ]
-        assert project['recent_total'] == burst
+        assert project['recent_total'].value == burst
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('leg, field, sibling', [
+        ('speculative_stats', 'speculative', 'recent_total'),
+        ('recent_merges', 'recent_total', 'speculative'),
+    ])
+    async def test_a_raising_leg_serves_unknown_not_zeros(self, tmp_path, leg, field, sibling):
+        """A leg that raises is a hole in its own field; its siblings stay measured."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        db_path = _make_db(tmp_path, 'raising.db', [])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with patch(
+                f'dashboard.data.merge_queue.{leg}',
+                new=AsyncMock(side_effect=RuntimeError('boom')),
+            ):
+                result = await build_per_project_merge_queue([('/tmp/P', conn)], hours=24, now=now)
+
+        project = result['/tmp/P']
+        assert project[field].state is DatumState.UNKNOWN
+        assert '/tmp/P' in (project[field].reason or '')
+        assert 'RuntimeError: boom' in (project[field].reason or '')
+        assert project[sibling].state is DatumState.FRESH
+        for served in (field, sibling):
+            validate_datum(project[served], now)
+
+    @pytest.mark.asyncio
+    async def test_the_whole_project_fallback_serves_unknown(self, tmp_path):
+        """The outer ``except Exception`` arm serves holes naming the error, not zeros."""
+        from dashboard.data.merge_queue import build_per_project_merge_queue
+
+        now = datetime(2026, 4, 23, 12, 0, 0, tzinfo=UTC)
+        db_path = _make_db(tmp_path, 'fallback.db', [])
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            conn.row_factory = aiosqlite.Row
+            with patch(
+                'dashboard.data.merge_queue.safe_gather_result',
+                side_effect=RuntimeError('boom'),
+            ):
+                result = await build_per_project_merge_queue([('/tmp/P', conn)], hours=24, now=now)
+
+        project = result['/tmp/P']
+        assert project['recent'] == []
+        for field in ('speculative', 'recent_total'):
+            assert project[field].state is DatumState.UNKNOWN, field
+            assert 'RuntimeError: boom' in (project[field].reason or ''), field
+            validate_datum(project[field], now)
 
     @pytest.mark.asyncio
     async def test_cancelled_error_from_sub_query_propagates(self, tmp_path):
@@ -1854,13 +1969,20 @@ class TestNormalizeLiveEntry:
         result = _normalize_entry(raw)
         assert set(result.keys()) == {'task_id', 'branch', 'state', 'age_secs', 'position', 'waiter_alive'}
 
-    def test_missing_age_secs_defaults_zero(self):
-        """Missing age_secs defaults to 0.0 (defensive)."""
+    def test_missing_age_is_none_not_zero(self):
+        """An entry that omits its age has no age; 0.0 would read as 'queued just now'."""
         from dashboard.data.merge_queue import _normalize_entry
 
         raw = {'task_id': '5', 'branch': 'b', 'state': 'queued'}
         result = _normalize_entry(raw)
-        assert result['age_secs'] == 0.0
+        assert result['age_secs'] is None
+
+    def test_none_age_is_none(self):
+        from dashboard.data.merge_queue import _normalize_entry
+
+        raw = {'task_id': '5', 'branch': 'b', 'state': 'queued', 'age_secs': None}
+        result = _normalize_entry(raw)
+        assert result['age_secs'] is None
 
 
 # ---------------------------------------------------------------------------

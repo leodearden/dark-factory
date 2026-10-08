@@ -80,6 +80,7 @@ from dashboard.data.model_role import aggregate_model_role_rollup
 from dashboard.data.performance import (
     aggregate_performance_cards,
     aggregate_performance_history,
+    unread_listing,
 )
 from dashboard.data.reconciliation import (
     get_buffer_stats,
@@ -1018,7 +1019,7 @@ async def api_costs(request: Request) -> JSONResponse:
 
 @app.get('/api/v2/dashboard/performance')
 async def api_performance(request: Request) -> JSONResponse:
-    """PERFORMANCE + served_at — per-project cards Datum and sparkline histories."""
+    """PERFORMANCE + PERFORMANCE_LISTING + served_at — per-project cards Datum, sparkline histories, and the listing's provenance."""
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     dbs, esc_dirs = await _performance_resources(config, pool)
@@ -1029,8 +1030,19 @@ async def api_performance(request: Request) -> JSONResponse:
         aggregate_performance_history(dbs, days=window.days, now=now),
         return_exceptions=True,
     )
+    if isinstance(cards_r, BaseException):
+        listing = safe_gather_result(
+            cards_r,
+            unread_listing(
+                f'the performance cards could not be read: {describe_exc(cards_r)}',
+                days=window.days,
+            ),
+            'perf/cards',
+        )
+    else:
+        listing = cards_r
     shaped = redux_api.shape_performance(
-        cards=safe_gather_result(cards_r, {}, 'perf/cards'),
+        listing=listing,
         history=safe_gather_result(history_r, {}, 'perf/history'),
         served_at=now,
     )

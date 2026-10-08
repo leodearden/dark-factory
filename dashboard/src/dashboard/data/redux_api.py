@@ -38,7 +38,7 @@ from dashboard.data.datum import (
 from dashboard.data.escalation_corpus import EscalationView
 from dashboard.data.mcp_fanout import project_label
 from dashboard.data.outcome_colors import assign_outcome_colors
-from dashboard.data.performance import PerformanceCards
+from dashboard.data.performance import PerformanceListing
 from dashboard.data.reconciliation import AgentActivity
 from dashboard.data.stats_utils import percentile
 from dashboard.data.utils import resolve_now
@@ -506,13 +506,15 @@ def shape_merge_queue(
     ``speculative``, ``active`` (the live probe's entries), ``in_queue``,
     ``live_probe_configured`` (false keeps the project out of the client's
     multi-project in-queue totals), ``active_spark``, ``halt``,
-    ``train_events``. ``in_queue`` and ``live_probe_configured`` are required:
-    the route resolves both for every project.
+    ``train_events``. ``in_queue``, ``speculative``, ``recent_total`` and
+    ``live_probe_configured`` are required: the route resolves them for every
+    project.
 
-    ``in_queue`` and every ``recent``/``active`` row's ``title`` are Datums the
-    route resolved, each aged to *served_at*, validated against it and
-    rendered to the wire. A field that is not a Datum, or a Datum that breaks
-    its contract there, is a wiring or shaper bug, and the
+    ``in_queue``, ``speculative``, ``recent_total`` and every
+    ``recent``/``active`` row's ``title`` are Datums the route resolved, each
+    aged to *served_at*, validated against it and rendered to the wire. A
+    field that is not a Datum, or a Datum that breaks its contract there, is
+    a wiring or shaper bug, and the
     :class:`~dashboard.data.datum.DatumContractError` propagates.
 
     ``active_sparks`` (optional) is ``in_queue``'s sampled history, keyed by
@@ -543,8 +545,8 @@ def shape_merge_queue(
             'outcomes': _shape_outcomes(data.get('outcomes')),
             'latency': dict(data.get('latency') or {}),
             'recent': _titled(data.get('recent'), f'{label}.recent'),
-            'recent_total': int(data.get('recent_total') or 0),
-            'speculative': dict(data.get('speculative') or {}),
+            'recent_total': _served(data.get('recent_total'), f'{label}.recent_total'),
+            'speculative': _served(data.get('speculative'), f'{label}.speculative'),
             'active': _titled(data.get('active'), f'{label}.active'),
             'in_queue': _served(data.get('in_queue'), f'{label}.in_queue'),
             'live_probe_configured': bool(data['live_probe_configured']),
@@ -860,21 +862,24 @@ def shape_escalation_analytics(
 
 def shape_performance(
     *,
-    cards: Mapping[str, Datum[PerformanceCards]],
+    listing: PerformanceListing,
     history: Mapping[str, Mapping[str, Any]] | None = None,
     served_at: datetime,
 ) -> dict[str, Any]:
     """Each project's cards Datum beside its hour-bucketed histories, as served at *served_at*.
 
     Output: ``{PERFORMANCE: {project_label: {cards, time_centiles_history,
-    one_pass_history, escalation_history}}, served_at}``, where ``cards`` is
-    the project's wire Datum from
+    one_pass_history, escalation_history}}, PERFORMANCE_LISTING, served_at}``,
+    where ``cards`` is the project's wire Datum from
     :func:`dashboard.data.performance.aggregate_performance_cards` and
     ``served_at`` is the instant every Datum was validated against — the one
     the client ages each ``as_of`` from.
 
-    ``cards`` is the listing authority: a project appears exactly when it has
-    a cards Datum, measured or UNKNOWN. ``history`` (optional) is
+    ``listing.cards`` decides which projects appear: exactly those with a
+    cards Datum, measured or UNKNOWN. ``PERFORMANCE_LISTING`` is
+    ``listing.listed``, aged, validated and wired: the authority on whether an
+    empty ``PERFORMANCE`` means no project completed anything or no runs.db
+    could be read. ``history`` (optional) is
     :func:`dashboard.data.performance.aggregate_performance_history`'s
     output; a project absent from it gets empty history blocks. A Datum that
     breaks its contract at *served_at* is a shaper bug, and the
@@ -884,7 +889,7 @@ def shape_performance(
     empty_pair = {'labels': [], 'values': []}
     empty_centiles = {'labels': [], 'p50': [], 'p95': []}
     out: dict[str, dict] = {}
-    for pid, datum in cards.items():
+    for pid, datum in listing.cards.items():
         validate_datum(datum, served_at)
         h = history.get(pid) or {}
         out[project_label(pid)] = {
@@ -893,7 +898,11 @@ def shape_performance(
             'one_pass_history': dict(h.get('one_pass_history') or empty_pair),
             'escalation_history': dict(h.get('escalation_history') or empty_pair),
         }
-    return {'PERFORMANCE': out, 'served_at': served_at.isoformat()}
+    return {
+        'PERFORMANCE': out,
+        'PERFORMANCE_LISTING': _wire_served(listing.listed, 'PERFORMANCE_LISTING', served_at),
+        'served_at': served_at.isoformat(),
+    }
 
 
 # ---------------------------------------------------------------------------
