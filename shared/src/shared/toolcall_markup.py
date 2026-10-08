@@ -440,7 +440,10 @@ _ANY_OPENER_RE = re.compile(
 # these ceilings MULTIPLY: candidates x tail items x inner closers. Task 4502's
 # alternative-boundary check briefly made the innermost step O(len(body)) by
 # slicing, which these ceilings do not contain — see :func:`_at_item_boundary`'s
-# *pos*. Anything added inside these loops must be O(1) in the input length.
+# *pos*. Anything added inside these loops must be O(1) amortised, never copying
+# or re-scanning the body: :func:`_skip_blank` walks forward but stops at or
+# before the next tag, so the skips after successive inner closers cover
+# disjoint spans of one item's value.
 _MAX_CANDIDATES = 64
 _MAX_TAIL_ITEMS = 64
 

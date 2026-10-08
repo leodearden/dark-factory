@@ -23,6 +23,7 @@ appears verbatim in the file text. Leave it escaped.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 
 import pytest
 
@@ -1054,7 +1055,9 @@ class TestQuotedReportIsRepairable:
         )
 
     @staticmethod
-    def _sibling_opener_tail(opener, separator: str = _SIBLING_PROSE) -> str:
+    def _sibling_opener_tail(
+        opener: Callable[[str], str], separator: str = _SIBLING_PROSE
+    ) -> str:
         """An ``evidence`` value that QUOTES a whole record, opener included.
 
         The three specimens that turn on a sibling opener differ in exactly two
@@ -1078,7 +1081,9 @@ class TestQuotedReportIsRepairable:
         )
 
     @classmethod
-    def _spanning_opener_value(cls, opener, own_closer: str, sibling_closer: str) -> str:
+    def _spanning_opener_value(
+        cls, opener: Callable[[str], str], own_closer: str, sibling_closer: str
+    ) -> str:
         """An ``evidence`` item hiding an opener that SPANS its own closer.
 
         The quoted name after ``abc`` never closes inside the value, so the
@@ -1086,7 +1091,9 @@ class TestQuotedReportIsRepairable:
         closed by the BLEND sibling opener's stray quote. An item therefore
         opens right after the quoted ``foo`` closer although no complete opener
         lies inside the value, which the opener mirror cannot see. That stray
-        quote is load-bearing; *sibling_closer* is the one varying cell.
+        quote is load-bearing. *sibling_closer* is the cell the two
+        alternative_boundary tests vary; *opener* and *own_closer* carry the
+        enclosing dialect, varied separately by ``_ENCLOSING_DIALECTS``.
         """
         return (
             cls._CLEAN
@@ -1447,36 +1454,14 @@ class TestQuotedReportIsRepairable:
         assert self._repair(value) is None
 
     def test_a_sibling_opener_abutting_a_quoted_closer_is_refused_TOO(self):
-        """The narrowing's REACH, re-pinned INVERTED by task **5620**.
+        """The narrowing's REACH: one cell away from control (g), refused like it.
 
-        WAS ``test_the_ambiguity_probe_does_not_recurse_and_that_is_VISIBLE``,
-        and it asserted a RECOVERY of this exact specimen, which is unchanged
-        below. THE OLD READING, correct about the machinery when 4502 wrote it:
-        the probe asks "does the remainder after this inner closer ALSO
-        parse?", at depth 1 it restores the blanket substring refusal, so a
-        remainder that WOULD parse into an item whose own value quotes markup
-        reads as "does not parse", condition (ii) stays silent, and the tail is
-        recovered whole. The mutation it cited was real.
-
-        IT WAS ALSO A PIN ON THE DEFECT TASK 5620 REMOVES. This specimen
-        differs from negative control (g) in ONE cell — a single space where
-        that one has a sentence of prose, which is why both are built by
-        ``_sibling_opener_tail`` rather than spelled out. Both regressed
-        identically at 4502 (measured: it refused both before, recovered both
-        after), so no rule can block one and spare the other. What the recovery
-        asserted here actually WAS: ``suggested_action``, a real parameter of
-        this tool, silently not recovered, its text written into ``evidence``
-        instead — the same swallowed-sibling partial repair control (g) refuses.
-
-        SO THE PIN IS INVERTED RATHER THAN DELETED. Its subject — how far the
-        narrowing reaches — is still the thing under test, and this is the
-        decision its own closing sentence demanded: "moving it must be a
-        decision rather than a tidy-up." What changed is only WHICH rule
-        decides the specimen. The depth-1 bound no longer does; the opener rule
-        refuses the value before condition (ii) is consulted, so the old
-        MUTATION-VERIFIED claim — that deleting the ``probe`` short-circuit
-        flips this answer — no longer holds and is deliberately not restated.
-        Task 5638 then removed that bound altogether.
+        This specimen differs from negative control (g) in ONE cell — a single
+        space where that one has a sentence of prose, which is why both are
+        built by ``_sibling_opener_tail``. The opener mirror refuses it before
+        condition (ii) is consulted. A recovery would be the swallowed-sibling
+        partial repair (g) refuses: ``suggested_action``, a real parameter of
+        this tool, not recovered, its text written into ``evidence`` instead.
         """
         value = (
             self._CLEAN
