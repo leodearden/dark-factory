@@ -2407,6 +2407,30 @@
           "current": 31967
         }
       ]
+    },
+    {
+      "task_id": "4580",
+      "reason": "Task 4580: new merge_lane/no_progress_abort.py, the durable record for Abort trigger 3 (event payload and observation-language blocked reason). Net-additive observability, kept out of worker.py.",
+      "measures": [
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4831,
+          "current": 4838
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57409,
+          "current": 57507
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31967,
+          "current": 31992
+        }
+      ]
     }
   ]
 }
