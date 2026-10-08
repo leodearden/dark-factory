@@ -1,8 +1,10 @@
 """The incumbent's measured LLM spend: production write telemetry and the controls' unit cost."""
 
+import re
 from datetime import datetime
 
 import pytest
+
 from fused_memory.arm_harness.incumbent_cost import (
     LlmWriteOperation,
     LlmWriteTelemetry,
@@ -31,7 +33,9 @@ def telemetry_row(
 ) -> dict[str, object]:
     """One object shaped exactly like a ``telemetry_query.py`` output line."""
     input_tokens, output_tokens, llm_calls = tokens
-    accounted = input_tokens is not None and output_tokens is not None
+    total_tokens = (
+        None if input_tokens is None or output_tokens is None else input_tokens + output_tokens
+    )
     return {
         'created_at': created_at,
         'operation': operation,
@@ -41,7 +45,7 @@ def telemetry_row(
         'duration_ms': 1234.5,
         'input_tokens': input_tokens,
         'output_tokens': output_tokens,
-        'total_tokens': input_tokens + output_tokens if accounted else None,
+        'total_tokens': total_tokens,
         'llm_calls': llm_calls,
     }
 
@@ -111,7 +115,7 @@ def test_window_runs_from_the_first_token_bearing_write_up_to_but_excluding_unti
 def test_a_dump_that_does_not_reach_back_past_the_telemetry_start_is_refused(pre_start_rows):
     rows = [*pre_start_rows, telemetry_row(FIRST_TOKENED), telemetry_row(LATER)]
 
-    with pytest.raises(TelemetryWindowError, match=FIRST_TOKENED):
+    with pytest.raises(TelemetryWindowError, match=re.escape(FIRST_TOKENED)):
         select_llm_writes(rows, until=UNTIL)
 
 
@@ -140,7 +144,7 @@ def test_a_partially_tokened_llm_write_inside_the_window_is_refused():
         telemetry_row(LATER, tokens=(1000, 100, None)),
     ]
 
-    with pytest.raises(TelemetryAccountingError, match=LATER):
+    with pytest.raises(TelemetryAccountingError, match=re.escape(LATER)):
         select_llm_writes(rows, until=UNTIL)
 
 
@@ -163,7 +167,7 @@ def test_untokened_writes_after_until_are_outside_the_accounting():
     ],
 )
 def test_no_token_bearing_llm_write_before_until_is_refused(rows):
-    with pytest.raises(TelemetryWindowError, match=UNTIL_TEXT):
+    with pytest.raises(TelemetryWindowError, match=re.escape(UNTIL_TEXT)):
         select_llm_writes(rows, until=UNTIL)
 
 
@@ -175,21 +179,21 @@ def test_a_naive_until_is_refused():
 
 
 def test_a_naive_created_at_is_refused_at_the_boundary():
-    with pytest.raises(ValueError, match='2026-10-05T12:00:00'):
+    with pytest.raises(ValueError, match=re.escape('2026-10-05T12:00:00')):
         LlmWriteTelemetry.from_telemetry_row(telemetry_row('2026-10-05T12:00:00'))
 
 
 def test_a_naive_created_at_is_refused_by_selection():
     rows = [untokened_row('2026-10-05T10:00:00'), telemetry_row(FIRST_TOKENED)]
 
-    with pytest.raises(ValueError, match='2026-10-05T10:00:00'):
+    with pytest.raises(ValueError, match=re.escape('2026-10-05T10:00:00')):
         select_llm_writes(rows, until=UNTIL)
 
 
 def test_a_total_that_is_not_input_plus_output_is_refused_naming_the_row():
     row = telemetry_row(LATER) | {'total_tokens': 1}
 
-    with pytest.raises(ValueError, match=LATER) as caught:
+    with pytest.raises(ValueError, match=re.escape(LATER)) as caught:
         LlmWriteTelemetry.from_telemetry_row(row)
 
     assert 'total_tokens' in str(caught.value)
