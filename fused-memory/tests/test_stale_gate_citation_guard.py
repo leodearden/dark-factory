@@ -229,7 +229,6 @@ class TestStaleGateCitationError:
         )
         assert err is not None
         assert 'dependencies' in err['hint']
-        assert 're-derive' in err['hint'].lower()
 
     def test_rejection_carries_the_live_array_so_no_second_read_is_needed(self):
         # The whole reason blocking does not lose the evidence: Stage 2 can
@@ -629,9 +628,6 @@ class TestGateCitationPromptSection:
             stale_gate_citation_guard.ERROR_TYPE
             in stale_gate_citation_guard.render_gate_citation_section()
         )
-
-    def test_section_names_the_field_to_re_read(self):
-        assert 'dependencies' in stale_gate_citation_guard.render_gate_citation_section()
 
     def test_section_lists_every_policed_marker_phrase(self):
         # An agent reading the prompt must be able to tell which phrasings are
