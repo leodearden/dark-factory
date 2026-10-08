@@ -13,7 +13,8 @@
 // LOADED THROUGH A WINDOW SHIM, in index.html's order: merge_queue.js
 // destructures window.DF_DATUM at module scope with no fallback, and datum.js
 // in turn destructures window.DF_ENDPOINT_STALENESS — task_snapshot.test.mjs
-// has the same shape.
+// has the same shape. window_chip.js rides along because MergeTab hands
+// recentTotal's value to its recentMergesCaption.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -21,14 +22,14 @@ import { createRequire } from 'node:module';
 import staleness from '../../src/dashboard/static/redux/endpoint_staleness.js';
 
 const REDUX = '../../src/dashboard/static/redux/';
-const LOAD_CHAIN = ['datum.js', 'merge_queue.js'].map(name => REDUX + name);
+const LOAD_CHAIN = ['datum.js', 'window_chip.js', 'merge_queue.js'].map(name => REDUX + name);
 
 function loadMergeQueue() {
   const win = { DF_ENDPOINT_STALENESS: staleness };
   globalThis.window = win;
   const require = createRequire(import.meta.url);
   for (const specifier of LOAD_CHAIN) delete require.cache[require.resolve(specifier)];
-  const [, mergeQueueApi] = LOAD_CHAIN.map(specifier => require(specifier));
+  const [, , mergeQueueApi] = LOAD_CHAIN.map(specifier => require(specifier));
   return { api: mergeQueueApi, window: win };
 }
 
@@ -38,6 +39,7 @@ const {
   queuedSince, projectSpeculative, speculativeOver, hitRateText, recentTotal,
 } = mergeQueue;
 const { isDatum, datumView, EM_DASH } = loadedWindow.DF_DATUM;
+const { recentMergesCaption } = loadedWindow.DF_WINDOW_CHIP;
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -368,6 +370,12 @@ for (const [field, reader, value] of [
     }
   });
 
+  test(`${field}: an entry without the Datum names both the project and the field`, () => {
+    const served = reader(mqData({ hive: entryWith(inQueue('fresh', 0)) }), 'hive');
+    assert.equal(served.state, 'unknown');
+    assert.equal(served.reason, `the /merge-queue entry for hive has no ${field} Datum`);
+  });
+
   test(`${field}: an unread runs.db keeps the server's reason`, () => {
     const unread = runsDbRead('unknown');
     const served = reader(mqData({ a: entryReading(unread, unread) }), 'a');
@@ -375,6 +383,27 @@ for (const [field, reader, value] of [
     assert.equal(served.reason, unread.reason);
   });
 }
+
+// ── recentTotal into the Recent-merges caption, as MergeTab wires it ────────
+
+test('recentTotal: a window total that is a hole captions as unknown, never "of 0"', () => {
+  const echo = Object.freeze({ requested: '24h', served: '24h', days: 1 });
+  const holes = [
+    ['an unread runs.db', { a: entryReading(runsDbRead('fresh', counts(0, 0)), runsDbRead('unknown')) }],
+    ['an entry with no recent_total', { a: entryWith(inQueue('fresh', 0)) }],
+  ];
+  for (const [label, entries] of holes) {
+    const total = recentTotal(mqData(entries), 'a');
+    assert.equal(total.state, 'unknown', label);
+    assert.equal(recentMergesCaption(0, total.value, echo), `showing 0 of ${EM_DASH} in 24h`, label);
+  }
+});
+
+test('recentTotal: a measured window total captions as its count', () => {
+  const echo = Object.freeze({ requested: '24h', served: '24h', days: 1 });
+  const total = recentTotal(mqData({ a: entryReading(runsDbRead('fresh', counts(0, 0)), runsDbRead('fresh', 0)) }), 'a');
+  assert.equal(recentMergesCaption(0, total.value, echo), 'showing 0 of 0 in 24h');
+});
 
 // ── speculativeOver: the cross-project speculative tile ────────────────────
 
