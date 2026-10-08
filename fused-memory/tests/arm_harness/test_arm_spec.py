@@ -228,6 +228,28 @@ def test_specs_are_frozen():
         spec.model_id = 'other'  # type: ignore[misc]
 
 
+GPT_4O_MINI_PRICING = TokenPricing(usd_per_mtok_input=0.15, usd_per_mtok_output=0.60)
+
+
+def test_usd_for_one_million_tokens_each_way_is_the_sum_of_the_two_rates():
+    assert GPT_4O_MINI_PRICING.usd_for(1_000_000, 1_000_000) == 0.75
+
+
+def test_usd_for_prices_input_and_output_at_their_per_million_rates():
+    assert GPT_4O_MINI_PRICING.usd_for(1650, 95) == (1650 * 0.15 + 95 * 0.60) / 1_000_000
+
+
+@pytest.mark.parametrize(
+    ('input_tokens', 'output_tokens', 'offending'),
+    [(-1, 10, 'input_tokens'), (10, -7, 'output_tokens')],
+)
+def test_usd_for_refuses_a_negative_token_count(input_tokens, output_tokens, offending):
+    with pytest.raises(ValueError, match=offending) as caught:
+        GPT_4O_MINI_PRICING.usd_for(input_tokens, output_tokens)
+
+    assert str(min(input_tokens, output_tokens)) in str(caught.value)
+
+
 @pytest.mark.parametrize('factory', [control_llm_data, moe_candidate_data, embedding_data])
 def test_load_arm_spec_round_trips_a_dumped_spec(tmp_path, factory):
     spec = parse_arm_spec(factory())
