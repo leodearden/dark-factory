@@ -502,7 +502,7 @@ class TestPendingSinceThroughStatusWriters:
         """
         project_root = str(tmp_path)
         dto = await backend.add_task(project_root=project_root, title='corrupt')
-        conn = await backend._get_connection(project_root)
+        conn = (await backend._get_write_access(project_root)).connection
         await conn.execute(
             "UPDATE tasks SET metadata = 'NOT_JSON_ANCHOR' WHERE id = ?",
             (int(dto['id']),),

@@ -61,7 +61,7 @@ async def _std_lifecycle(store, tmp_path: Path) -> None:  # noqa: ARG001
 
 
 async def _backend_lifecycle(store: SqliteTaskBackend, tmp_path: Path) -> None:
-    """SqliteTaskBackend lifecycle: start() then trigger _get_connection via get_tasks()."""
+    """SqliteTaskBackend lifecycle: start() then trigger _get_write_access via get_tasks()."""
     await store.start()
     await store.get_tasks(project_root=str(tmp_path))
 
@@ -110,7 +110,7 @@ _DAEMON_CASES = [
     pytest.param(
         lambda tmp: SqliteTaskBackend(),  # noqa: ARG005
         _backend_lifecycle,
-        lambda store, root: store._connections[root],
+        lambda store, root: store._write_accesses[root].connection,
         id='SqliteTaskBackend',
     ),
 ]
