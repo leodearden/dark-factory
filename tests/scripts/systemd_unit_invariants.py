@@ -229,8 +229,9 @@ def config_arg_from_exec_start(
 # The effective ExecStart= command
 #
 # Read by tests/scripts/test_orchestrator_service_files.py::
-# _exec_start_config_arg and tests/scripts/test_uv_run_venv_isolation.py::
-# discover_uv_run_units.  Its home is here because the consumers carried three
+# _exec_start_config_arg, tests/scripts/test_dashboard_service_template.py::
+# _uvicorn_int_flag and tests/scripts/test_uv_run_venv_isolation.py::
+# discover_uv_run_units.  Its home is here because those three carried three
 # disagreeing copies.  Its negative-case guard lives in
 # test_orchestrator_service_files.py's fixture-string section.
 # ---------------------------------------------------------------------------
