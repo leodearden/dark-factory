@@ -321,11 +321,13 @@ class TestMakeEdgeBackend:
         with pytest.raises(TypeError):
             make_edge_backend(backend, [], {})  # type: ignore[call-arg]
 
-    @pytest.mark.parametrize('name', ['nodes', 'edges', 'nodes_read', 'edges_read'])
-    def test_parameter_is_keyword_only(self, make_edge_backend, name):
-        """Every parameter after the backend has kind KEYWORD_ONLY."""
-        sig = inspect.signature(make_edge_backend)
-        assert sig.parameters[name].kind == inspect.Parameter.KEYWORD_ONLY
+    def test_a_read_cannot_be_passed_positionally(self, make_edge_backend):
+        """With nodes and edges by keyword, a second positional would bind to a read if one accepted it."""
+        backend = MagicMock()
+        with pytest.raises(TypeError, match='positional'):
+            make_edge_backend(  # type: ignore[misc]
+                backend, incomplete_paged_read(INCOMPLETE_SHORT_READ), nodes=[], edges={}
+            )
 
 
 # ---------------------------------------------------------------------------
