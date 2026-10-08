@@ -1156,10 +1156,8 @@ class OfflineLaneWorker:
 
         Reuses the reify-side confirm primitives named by the PRD (sec 5):
         :func:`~orchestrator.verify._serial_pytest_str` rewrites ``cmd.command``
-        to run serial (appends ``-p no:xdist -o addopts=<value>``, re-supplying
-        the addopts of the config pytest reads from the run cwd minus xdist,
-        or blanking them when none resolves inside it), falling back to the
-        raw command when it is not a pytest invocation; the command is
+        to run serial (``-p no:xdist``; the run cwd's governing addopts kept minus xdist), falling
+        back to the raw command when it is not a pytest invocation; the command is
         launched exactly like :meth:`_default_run_command` (idle nice/ionice
         ``sh -c`` in ``<wt_path>/<cmd.cwd>``, ``DF_VERIFY_ROLE=offline``); and
         :func:`~orchestrator.verify._extract_failing_test_ids` extracts the

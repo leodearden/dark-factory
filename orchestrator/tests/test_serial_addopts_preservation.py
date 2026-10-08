@@ -60,10 +60,13 @@ def _module_test_commands() -> dict[str, str]:
 
 
 def _one_real_test_file(command: str) -> str:
-    """A tracked test file under *command*'s first target, worktree-root-relative."""
+    """A test file directly inside *command*'s first target, worktree-root-relative."""
     parsed = parse_config_command(command)
     target_dir = REPO_ROOT / (parsed.cwd_rel or '') / parsed.targets[0]
-    first = sorted(target_dir.rglob('test_*.py'))[0]
+    first = min(
+        path for path in target_dir.iterdir()
+        if path.name.startswith('test_') and path.suffix == '.py'
+    )
     return first.relative_to(REPO_ROOT).as_posix()
 
 

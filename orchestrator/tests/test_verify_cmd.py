@@ -16,6 +16,7 @@ import re
 import shlex
 import shutil
 import subprocess
+from typing import cast
 
 import pytest
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT
@@ -981,7 +982,7 @@ def xdist_option_surface() -> dict[str, bool]:
     from xdist.plugin import pytest_addoption
 
     parser = _RecordingParser()
-    pytest_addoption(parser)
+    pytest_addoption(cast(pytest.Parser, parser))
     return {
         name: attrs.get('action', 'store') not in _ZERO_ARG_ACTIONS
         for names, attrs in parser.group.options

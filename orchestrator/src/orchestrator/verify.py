@@ -9798,8 +9798,8 @@ async def confirm_main_tip_failure_is_real(
     esc-main-sweep-ea2bd3c95e33-2 and the 2026-07-09 park_stop/symlink-loop
     incidents. This function is the harness's confirm-before-alarm gate: it
     extracts the named failing pytest node-ids from *failing_result*, and
-    re-runs JUST those tests, in ISOLATION (scoped + forced-serial + addopts
-    cleared — the exact task-2045 recovery — plus an explicit generous
+    re-runs JUST those tests, in ISOLATION (scoped + forced-serial with xdist
+    stripped from addopts — the task-2045 recovery — plus an explicit generous
     ``--timeout``), in a FRESH probe worktree pinned at *main_sha* — never
     the sweep's own contended worktree.
 
