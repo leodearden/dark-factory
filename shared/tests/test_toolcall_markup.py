@@ -1077,6 +1077,36 @@ class TestQuotedReportIsRepairable:
             + 'refile once the guard is narrowed ' + _closer('xyz') + ' done'
         )
 
+    @classmethod
+    def _spanning_opener_value(cls, opener, own_closer: str, sibling_closer: str) -> str:
+        """An ``evidence`` item hiding an opener that SPANS its own closer.
+
+        The quoted name after ``abc`` never closes inside the value, so the
+        canonical opener pattern's name group runs across *own_closer* and is
+        closed by the BLEND sibling opener's stray quote. An item therefore
+        opens right after the quoted ``foo`` closer although no complete opener
+        lies inside the value, which the opener mirror cannot see. That stray
+        quote is load-bearing; *sibling_closer* is the one varying cell.
+        """
+        return (
+            cls._CLEAN
+            + _CANONICAL_CLOSER + '\n'
+            + opener('evidence')
+            + 'the report quotes ' + _closer('foo') + ' '
+            + CANONICAL_OPENER_PREFIX + '"abc'
+            + own_closer
+            + _blend_opener('suggested_action')
+            + 'refile once the guard is narrowed'
+            + sibling_closer
+            + '\n' + INVOKE_CLOSER
+        )
+
+    _ENCLOSING_DIALECTS = pytest.mark.parametrize(
+        ('opener', 'own_closer'),
+        [(_canonical_opener, _CANONICAL_CLOSER), (_opener, _closer('evidence'))],
+        ids=['canonical', 'echo'],
+    )
+
     def test_the_quoted_report_recovers_both_dropped_siblings(self):
         """THE RED ASSERTION. Returns None today; must return a Repair.
 
@@ -1387,6 +1417,34 @@ class TestQuotedReportIsRepairable:
             + 'the sweep quoted ' + quoted + ' and then prose that does not parse.'
             + '\n' + INVOKE_CLOSER
         )
+
+        assert self._repair(value) is None
+
+    @_ENCLOSING_DIALECTS
+    def test_an_opener_at_the_alternative_boundary_is_refused_when_the_remainder_would_not_parse(
+        self, opener, own_closer
+    ):
+        """An item opening just after an inner closer makes that closer a guess.
+
+        Whether the rest of the remainder would parse does not change that, so
+        B5 refuses either way. Here the spanned sibling's value carries its own
+        closer: the shape a depth-limited re-parse read as "does not parse".
+        """
+        value = self._spanning_opener_value(opener, own_closer, _closer('suggested_action'))
+
+        assert self._repair(value) is None
+
+    @_ENCLOSING_DIALECTS
+    def test_an_opener_at_the_alternative_boundary_is_refused_when_the_remainder_parses(
+        self, opener, own_closer
+    ):
+        """The both-ways control for the test above: the spanned parse completes.
+
+        It fails under the tempting collapse of condition (ii) to "only a blank
+        remainder is a boundary", which recovers this specimen while every
+        other markup test stays green.
+        """
+        value = self._spanning_opener_value(opener, own_closer, '')
 
         assert self._repair(value) is None
 
