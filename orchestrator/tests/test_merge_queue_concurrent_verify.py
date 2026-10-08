@@ -6757,6 +6757,10 @@ class TestHeavyBarrierTimeoutName:
 '''
         budgets = _worst_per_method_wait_budget(source)
 
+        assert math.isfinite(budgets['TestHeavyBarrierTimeoutName']), (
+            f'Expected timeout=HEAVY_BARRIER_TEST_TIMEOUT to resolve to a '
+            f'finite budget, got {budgets!r}: the name was billed as unbounded.'
+        )
         expected = float(HEAVY_BARRIER_TEST_TIMEOUT)
         assert budgets == {'TestHeavyBarrierTimeoutName': expected}, (
             f'Expected timeout=HEAVY_BARRIER_TEST_TIMEOUT to resolve to '
