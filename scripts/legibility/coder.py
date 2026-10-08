@@ -221,10 +221,17 @@ _DEFINITION_HEADING = "## Definition"
 
 
 def _quality_definition() -> str:
-    """The normative code-quality doc's ``## Definition`` body, read per call
-    so a renamed heading fails one digest rather than the import."""
+    """The normative code-quality doc's ``## Definition`` body, read on every
+    call. A renamed, removed or emptied section raises ValueError, so it fails
+    every digest in the batch (a coder storm) instead of the import."""
     doc_text = code_quality.NORMATIVE_DOC.read_text(encoding="utf-8")
-    return code_quality.section(doc_text, _DEFINITION_HEADING).strip()
+    definition = code_quality.section(doc_text, _DEFINITION_HEADING).strip()
+    if not definition:
+        raise ValueError(
+            f"section {_DEFINITION_HEADING!r} of {code_quality.NORMATIVE_DOC} is "
+            "empty, so the coder has no minting test"
+        )
+    return definition
 
 
 def _invariant_slugs_block(invariant_slugs: Sequence[str]) -> str:

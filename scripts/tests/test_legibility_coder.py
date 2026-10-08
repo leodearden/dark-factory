@@ -30,7 +30,7 @@ import digest as digest_mod
 import pytest
 from cli_subprocess_timeout import cli_timeout_from_env
 from legibility import invariants, session_runner
-from quality_doc_texts import definition_body, heuristic_headlines
+from quality_doc_texts import code_quality, definition_body, heuristic_headlines
 
 # Imported AFTER `coder`, deliberately: it is coder.py's own module-level
 # sys.path bootstrap that puts this checkout's shared/src on the path, so this
@@ -1441,6 +1441,35 @@ def test_code_digests_passes_the_slugs_to_every_prompt():
 
     assert len(prompts) == 2
     assert all(_bullets(_block(p, "INVARIANT SLUGS")) == ["- a-slug"] for p in prompts)
+
+
+@pytest.mark.parametrize(
+    "definition_section",
+    ["## Definition\n\n", "## Renamed definition\n\nSome text.\n\n"],
+    ids=["emptied", "renamed"],
+)
+def test_a_broken_quality_definition_fails_every_digest(
+    tmp_path, monkeypatch, definition_section
+):
+    """Minting against no Definition would be silent; a failed batch is not."""
+    doc = tmp_path / "code_quality.md"
+    doc.write_text(
+        "# Code quality\n\n" + definition_section + "## The fourteen heuristics\n\n1. **One**\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(code_quality, "NORMATIVE_DOC", doc)
+    prompts = []
+
+    run = mod.code_digests(
+        _batch_digests(2), _tiny_codebook(), project="dark_factory",
+        invariant_slugs=("a-slug",), invoke=_recording_invoke(prompts),
+    )
+
+    assert prompts == []
+    assert run.records == []
+    assert run.status == "failure"
+    assert len(run.failures) == 2
+    assert all("## Definition" in reason for _session, reason in run.failures)
 
 
 def test_main_reads_the_slugs_from_the_project_root(tmp_path, pooled_main):
