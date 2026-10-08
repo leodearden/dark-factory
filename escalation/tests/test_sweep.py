@@ -17,7 +17,6 @@ from _scan_race_helpers import (
 
 from escalation import sweep
 from escalation.models import Escalation
-from escalation.queue import SEQ_COUNTER_SUFFIX
 
 
 def _write_root_esc(
@@ -1001,7 +1000,7 @@ def _write_lock(queue_dir: Path, escalation_id: str) -> Path:
 
 
 class TestReapOrphanLocks:
-    """sweep.reap_orphan_locks unlinks sidecars whose record is in neither tier."""
+    """sweep.reap_orphan_locks unlinks sidecars whose record is not in the queue root."""
 
     def test_orphan_lock_deleted_on_apply(self, tmp_path: Path):
         """A sidecar with no record in root and no archive at all is reaped."""
@@ -1026,22 +1025,24 @@ class TestReapOrphanLocks:
             'dry-run changed disk state — apply=False must be a pure count'
         )
 
-    def test_lock_for_archived_record_is_kept(self, tmp_path: Path):
-        """An archived record's sidecar is NOT an orphan.
+    def test_lock_for_archived_record_is_reaped(self, tmp_path: Path):
+        """An archived record's sidecar IS an orphan; the record itself is untouched.
 
-        An archived record is still readable via ``get()``/``get_by_task`` and
-        its resolve/dismiss paths still take the sidecar lock, so a lock counts
-        as orphaned only when the record is absent from BOTH tiers.
+        A later writer to the archived record simply re-creates the sidecar —
+        ``escalation_id_lock`` re-validates its inode after acquiring, so the
+        unlink cannot split exclusion.
         """
-        _write_archive_esc(
+        record_path = _write_archive_esc(
             tmp_path, 'esc-1-1', '2026-05-20T10:00:00+00:00', 'resolved'
         )
+        record_bytes = record_path.read_bytes()
         lock_path = _write_lock(tmp_path, 'esc-1-1')
 
         count = sweep.reap_orphan_locks(tmp_path, apply=True)
 
-        assert count == 0, 'a record in the archive tier still owns its lock'
-        assert lock_path.exists(), 'sidecar of an archived record was reaped'
+        assert count == 1, 'a record outside the queue root no longer owns a root sidecar'
+        assert not lock_path.exists(), 'sidecar of an archived record survived the reap'
+        assert record_path.read_bytes() == record_bytes, 'the archived record changed'
 
     def test_lock_for_root_record_is_kept(self, tmp_path: Path):
         """A pending root record's sidecar is NOT an orphan."""
@@ -1100,17 +1101,14 @@ class TestStartupSweepOrphanLockPass:
     _STALE_AT = '2026-01-01T00:00:00+00:00'
     _RECENT_AT = '2026-05-20T10:00:00+00:00'
 
-    def test_lock_of_record_archived_by_this_run_is_kept(self, tmp_path: Path):
-        """ORDERING: the reap runs AFTER sweep(), so a just-relocated record keeps its lock.
+    def test_lock_of_record_archived_by_this_run_is_reaped_in_the_same_run(
+        self, tmp_path: Path
+    ):
+        """ORDERING: pass 4 runs AFTER sweep(), so this run's relocations are collected now.
 
-        The companion to the prune-ordering case below, and the more dangerous
-        direction of the two.  Pass 1 moves esc-7-1 out of the root into
-        ``archive/<date>/``; pass 4 is safe only because it builds its archive
-        view AFTER that move.  Hoisting the index build — or the whole reap —
-        above ``sweep()`` would unlink the sidecar of a perfectly LIVE record,
-        data-affecting harm, where a bad prune-vs-reap order merely defers
-        cleanup by one restart.  Nothing else in the suite fails under that
-        reordering.
+        Pass 1 moves esc-7-1 out of the root into ``archive/<date>/``.  Were the
+        reap hoisted above ``sweep()``, it would still see the record in the
+        root and keep its sidecar until the NEXT restart.
         """
         _write_root_esc(tmp_path, 'esc-7-1', 'resolved', resolved_at=self._RECENT_AT)
         lock_path = _write_lock(tmp_path, 'esc-7-1')
@@ -1119,37 +1117,29 @@ class TestStartupSweepOrphanLockPass:
 
         assert report.sweep.archived == 1, 'precondition: pass 1 relocated the record'
         assert (tmp_path / 'archive' / '2026-05-20' / 'esc-7-1.json').exists()
-        assert report.orphan_locks_reaped == 0, (
-            'the reap ran before (or independently of) the root->archive '
-            'relocation and judged a live record dead'
+        assert report.orphan_locks_reaped == 1, (
+            'the sidecar of a record this run archived was not collected in the '
+            'same run — the reap must run after sweep()'
         )
-        assert lock_path.exists(), (
-            'sidecar of a record archived by this very run was unlinked — the '
-            'reap must take its archive snapshot after sweep()'
-        )
+        assert not lock_path.exists()
 
-    def test_lock_of_same_run_pruned_record_is_reaped(self, tmp_path: Path):
-        """ORDERING: the reap runs AFTER prune, so this run's evictions are cleaned up.
-
-        Reversing the two passes would leave the pruned record's sidecar behind
-        for a whole restart cycle — the exact accumulation this task removes.
-        """
+    def test_locks_of_pruned_and_still_archived_records_are_both_reaped(
+        self, tmp_path: Path
+    ):
+        """Archive membership no longer matters: pruned or retained, the root sidecar goes."""
         # Stale: prune_archive drops archive/2026-01-01 during THIS run.
         _write_archive_esc(tmp_path, 'esc-9-1', self._STALE_AT, 'resolved')
         stale_lock = _write_lock(tmp_path, 'esc-9-1')
-        # Recent: inside retention, so record and sidecar both stay.
+        # Recent: inside retention, so the record stays archived.
         _write_archive_esc(tmp_path, 'esc-8-1', self._RECENT_AT, 'resolved')
         recent_lock = _write_lock(tmp_path, 'esc-8-1')
 
         report = sweep.run_startup_sweep(tmp_path, now=self._NOW)
 
         assert report.pruned_dirs == 1, 'the stale dated dir should have been pruned'
-        assert report.orphan_locks_reaped == 1
-        assert not stale_lock.exists(), (
-            'sidecar of a record pruned in this same run survived — the reap pass '
-            'must run after prune_archive'
-        )
-        assert recent_lock.exists(), 'sidecar of a still-archived record was reaped'
+        assert report.orphan_locks_reaped == 2
+        assert not stale_lock.exists(), 'sidecar of a record pruned in this run survived'
+        assert not recent_lock.exists(), 'sidecar of a still-archived record survived'
 
     def test_startup_summary_line_reports_orphan_lock_count(self, tmp_path: Path, caplog):
         """The one INFO summary line carries orphan_locks= beside the other counts."""
@@ -1188,36 +1178,69 @@ class TestStartupSweepOrphanLockPass:
     def test_dry_run_orphan_count_is_a_lower_bound_not_a_projection(self, tmp_path: Path):
         """DRY-RUN SEMANTICS: a sidecar an applying run WOULD reap is counted as a keep.
 
-        ``archive.prune_archive`` has no dry-run mode for run_startup_sweep to
-        forward ``apply`` to, so pass 3 is skipped outright and the stale record
-        is still in the archive when pass 4 takes its snapshot — its sidecar
-        looks live.  The applying run therefore reaps MORE than the dry-run
-        promised.  That asymmetry is the contract documented on
-        run_startup_sweep's ``apply`` arg: never an over-estimate, so an operator
-        reading a dry-run is never surprised by fewer reaps than advertised.
+        A dry-run pass 1 leaves the terminal record esc-7-1 in the queue root,
+        so when pass 4 looks its sidecar still has a record beside it and
+        counts as live.  The applying run relocates it first and therefore
+        reaps MORE than the dry-run promised.  That asymmetry is the contract
+        documented on run_startup_sweep's ``apply`` arg: never an
+        over-estimate, so an operator reading a dry-run is never surprised by
+        fewer reaps than advertised.
         """
-        _write_archive_esc(tmp_path, 'esc-9-1', self._STALE_AT, 'resolved')
-        stale_lock = _write_lock(tmp_path, 'esc-9-1')
+        _write_root_esc(tmp_path, 'esc-7-1', 'resolved', resolved_at=self._RECENT_AT)
+        terminal_lock = _write_lock(tmp_path, 'esc-7-1')
         plain_orphan = _write_lock(tmp_path, 'esc-1-1')
         before = _disk_snapshot(tmp_path)
 
         dry = sweep.run_startup_sweep(tmp_path, apply=False, now=self._NOW)
 
-        assert dry.pruned_dirs == 0, 'prune_archive is skipped entirely in dry-run'
         assert dry.orphan_locks_reaped == 1, (
-            "dry-run still sees the stale record archived, so only the plain "
-            "orphan counts"
+            'dry-run leaves the terminal record in the root, so only the plain '
+            'orphan counts'
         )
         assert _disk_snapshot(tmp_path) == before, 'dry-run changed disk state'
 
         applied = sweep.run_startup_sweep(tmp_path, apply=True, now=self._NOW)
 
-        assert applied.pruned_dirs == 1
         assert applied.orphan_locks_reaped == 2, (
-            "applying reaps the pruned record's sidecar too — the dry-run count "
-            "is a LOWER BOUND, never an over-estimate"
+            "applying reaps the just-archived record's sidecar too — the dry-run "
+            "count is a LOWER BOUND, never an over-estimate"
         )
-        assert not stale_lock.exists() and not plain_orphan.exists()
+        assert not terminal_lock.exists() and not plain_orphan.exists()
+
+    def test_backlog_of_archived_record_locks_drains_in_one_startup_sweep(
+        self, tmp_path: Path
+    ):
+        """The one-time backlog: every archived record's sidecar goes in a single run.
+
+        Root-record sidecars and the ``make_id`` counter sidecar are the only
+        survivors.  The counter is MINTED through the real ``make_id`` so the
+        never-reap rule is exercised end to end, not against a hand-written name.
+        """
+        from escalation.queue import EscalationQueue
+
+        dated = ('2026-05-20T10:00:00+00:00', '2026-05-25T10:00:00+00:00')
+        archived_records = []
+        for n in range(40):
+            esc_id = f'esc-{100 + n}-1'
+            archived_records.append(
+                _write_archive_esc(tmp_path, esc_id, dated[n % 2], 'resolved')
+            )
+            _write_lock(tmp_path, esc_id)
+        root_ids = ('esc-1-1', 'esc-2-1', 'esc-3-1')
+        for esc_id in root_ids:
+            _write_root_esc(tmp_path, esc_id, 'pending')
+            _write_lock(tmp_path, esc_id)
+        EscalationQueue(tmp_path).make_id('5649')
+
+        report = sweep.run_startup_sweep(tmp_path, now=self._NOW)
+
+        assert report.orphan_locks_reaped == 40
+        assert {p.name for p in tmp_path.glob('*.json.lock')} == {
+            *(f'{esc_id}.json.lock' for esc_id in root_ids),
+            'esc-5649.seq.json.lock',
+        }
+        missing = [p.name for p in archived_records if not p.exists()]
+        assert missing == [], f'archived records lost by the reap: {missing}'
 
     def test_second_startup_sweep_is_a_byte_stable_noop(self, tmp_path: Path):
         """After an applying run the pass neither re-reaps nor resurrects a sidecar."""
@@ -1407,85 +1430,42 @@ class TestReapOrphanLocksResilience:
         assert 'archived=1' in infos[0] and 'orphan_locks=1' in infos[0], infos[0]
 
 
-class TestReapOrphanLocksEarlyExit:
-    """With nothing to judge, the pass must not walk the archive tree at all."""
+class TestArchivedRecordStaysWritableAfterItsLockIsReaped:
+    """Reaping an archived record's sidecar costs a later writer one O_CREAT, nothing more."""
 
-    def test_no_candidates_skips_the_archive_walk(self, tmp_path: Path, monkeypatch):
-        """The steady state — a root of .seq sidecars and foreign files — costs no rglob.
-
-        ``run_startup_sweep`` already pays one full archive rglob in ``sweep()``;
-        a second one on every restart, for a root with zero reapable candidates,
-        is pure waste on the largest tree in the queue dir.
-        """
-        _seed_non_esc_residents(tmp_path)
-        _write_lock(tmp_path, f'esc-4566{SEQ_COUNTER_SUFFIX}')
-        _write_archive_esc(tmp_path, 'esc-1-1', '2026-05-20T10:00:00+00:00', 'resolved')
-
-        calls: list[Path] = []
-        real_stems = sweep._archive_stems
-
-        def _counting(archive_root: Path) -> set[str]:
-            calls.append(archive_root)
-            return real_stems(archive_root)
-
-        monkeypatch.setattr(sweep, '_archive_stems', _counting)
-
-        assert sweep.reap_orphan_locks(tmp_path, apply=True) == 0
-        assert calls == [], (
-            'reap_orphan_locks walked the archive tree with zero candidates — '
-            'the early return ahead of the index build was removed'
-        )
-
-    def test_archive_walk_still_happens_when_a_candidate_exists(
-        self, tmp_path: Path, monkeypatch
+    def test_patch_after_reap_updates_the_archived_record_and_recreates_the_sidecar(
+        self, tmp_path: Path
     ):
-        """Positive control: the early return must not swallow a real candidate."""
-        _seed_non_esc_residents(tmp_path)
-        _write_lock(tmp_path, f'esc-4566{SEQ_COUNTER_SUFFIX}')
-        orphan = _write_lock(tmp_path, 'esc-1-1')
+        from escalation.queue import EscalationQueue
 
-        calls: list[Path] = []
-        real_stems = sweep._archive_stems
-
-        def _counting(archive_root: Path) -> set[str]:
-            calls.append(archive_root)
-            return real_stems(archive_root)
-
-        monkeypatch.setattr(sweep, '_archive_stems', _counting)
+        esc_id = 'esc-1-1'
+        lock_path = tmp_path / f'{esc_id}.json.lock'
+        q = EscalationQueue(tmp_path)
+        q.submit(
+            Escalation(
+                id=esc_id,
+                task_id='1',
+                agent_role='test',
+                severity='info',
+                category='cleanup_needed',
+                summary='test escalation',
+            )
+        )
+        assert q.resolve(esc_id, 'done', resolved_by='human') is not None
+        assert not (tmp_path / f'{esc_id}.json').exists(), 'precondition: resolve archived it'
 
         assert sweep.reap_orphan_locks(tmp_path, apply=True) == 1
-        assert not orphan.exists()
-        assert len(calls) == 1, 'the archive tier is consulted exactly once per pass'
+        assert not lock_path.exists()
 
+        assert q.patch_resolution_metadata(esc_id, resolution_turns=3) is not None
 
-class TestArchiveStemsHelper:
-    """_archive_stems: presence-only, and quiet about duplicates _build_archive_index warns on."""
-
-    def test_returns_stems_from_every_dated_subdir(self, tmp_path: Path):
-        _write_archive_esc(tmp_path, 'esc-1-1', '2026-05-20T10:00:00+00:00', 'resolved')
-        _write_archive_esc(tmp_path, 'esc-2-1', '2026-01-01T00:00:00+00:00', 'dismissed')
-
-        stems = sweep._archive_stems(tmp_path / 'archive')
-
-        assert stems == {'esc-1-1', 'esc-2-1'}
-
-    def test_missing_archive_root_is_an_empty_set(self, tmp_path: Path):
-        assert sweep._archive_stems(tmp_path / 'archive') == set()
-
-    def test_duplicate_id_across_dated_dirs_logs_nothing(self, tmp_path: Path, caplog):
-        """The duplicate WARNING belongs to the path-picking indexer, not to presence.
-
-        sweep() has already emitted it once this startup; a second copy per
-        multi-dated duplicate is noise for a caller that never looks at paths.
-        """
-        _write_archive_esc(tmp_path, 'esc-1-1', '2026-05-20T10:00:00+00:00', 'resolved')
-        _write_archive_esc(tmp_path, 'esc-1-1', '2026-01-01T00:00:00+00:00', 'resolved')
-
-        with caplog.at_level(logging.WARNING, logger='escalation.sweep'):
-            stems = sweep._archive_stems(tmp_path / 'archive')
-
-        assert stems == {'esc-1-1'}
-        assert [r.getMessage() for r in caplog.records] == []
+        reread = EscalationQueue(tmp_path).get(esc_id)
+        assert reread is not None and reread.resolution_turns == 3
+        assert not (tmp_path / f'{esc_id}.json').exists(), (
+            'the patch resurrected the archived record into the queue root'
+        )
+        assert len(list((tmp_path / 'archive').rglob(f'{esc_id}.json'))) == 1
+        assert lock_path.exists(), 'the write did not re-create the reaped sidecar'
 
 
 def _relocating_lock(doomed: Path, dest_dir: Path):
