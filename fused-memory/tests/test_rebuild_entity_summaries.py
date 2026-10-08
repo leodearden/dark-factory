@@ -40,6 +40,9 @@ from fused_memory.backends.graphiti_client import (
 )
 from fused_memory.config.schema import FusedMemoryConfig
 
+#: The logger the service hands detect_stale_with_edges for the policy warning.
+_SERVICE_LOG = logging.getLogger('fused_memory.services.memory_service')
+
 
 def _make_svc(mock_config):
     """Service with mocked graphiti backend — shared by service-level migration tests."""
@@ -997,7 +1000,9 @@ class TestRebuildEntitySummaries:
         assert result['total_entities'] == 2
         assert result['stale_entities'] == 1
         assert result['rebuilt'] == 1
-        svc.graphiti.detect_stale_with_edges.assert_awaited_once_with(group_id='test')
+        svc.graphiti.detect_stale_with_edges.assert_awaited_once_with(
+            group_id='test', log=_SERVICE_LOG
+        )
         assert result['details'][0]['old_summary'] == 'stale fact'
 
     @pytest.mark.asyncio
@@ -1073,7 +1078,9 @@ class TestRebuildEntitySummaries:
         error_detail = next(d for d in result['details'] if d['status'] == 'error')
         assert 'FalkorDB timeout' in error_detail['error']
         assert error_detail['uuid'] == 'uuid-1'
-        svc.graphiti.detect_stale_with_edges.assert_awaited_once_with(group_id='test')
+        svc.graphiti.detect_stale_with_edges.assert_awaited_once_with(
+            group_id='test', log=_SERVICE_LOG
+        )
         dispatch.assert_all_dispatched()
 
     @pytest.mark.asyncio
@@ -1166,7 +1173,7 @@ class TestMemoryServiceRebuildEntitySummaries:
             dry_run=False,
         )
         service.graphiti.detect_stale_with_edges.assert_awaited_once_with(
-            group_id='dark_factory'
+            group_id='dark_factory', log=_SERVICE_LOG
         )
         assert result['total_entities'] == 5
         service.graphiti.rebuild_entity_from_edges.side_effect.assert_all_dispatched()
@@ -2551,7 +2558,7 @@ class TestServiceRebuildOrchestration:
         """Service calls graphiti.detect_stale_with_edges with the correct group_id."""
         await service.rebuild_entity_summaries(project_id='myproject')
         service.graphiti.detect_stale_with_edges.assert_awaited_once_with(
-            group_id='myproject'
+            group_id='myproject', log=_SERVICE_LOG
         )
 
     @pytest.mark.asyncio
@@ -3270,15 +3277,33 @@ class TestRebuildReportsReadCompleteness:
         assert result['edges_incomplete_kind'] is None
 
     @pytest.mark.asyncio
-    async def test_empirical_warning_is_logged_under_the_service(self, mock_config, caplog):
-        """The policy warning surfaces beside the rebuild's own lines, not the backend's."""
-        svc, _ = self._svc(
-            mock_config,
+    @pytest.mark.parametrize(
+        'path_kwargs',
+        [
+            pytest.param({'force': True}, id='force'),
+            pytest.param({'entity_uuids': ['u1']}, id='targeted'),
+            pytest.param({}, id='stale'),
+        ],
+    )
+    async def test_empirical_warning_is_logged_under_the_service(
+        self, path_kwargs, mock_config, make_backend, make_edge_backend, caplog
+    ):
+        """On every write path the policy warning surfaces beside the rebuild's own lines.
+
+        A real backend, so the stale path runs the real detect_stale_with_edges.
+        """
+        svc = _make_svc(mock_config)
+        svc.graphiti = make_edge_backend(
+            make_backend(mock_config),
+            nodes=self._NODES,
+            edges=self._EDGES,
             nodes_read=incomplete_paged_read(INCOMPLETE_SHORT_READ),
-            edges_read=complete_paged_read(),
+        )
+        svc.graphiti.rebuild_entity_from_edges = AsyncMock(
+            return_value=make_rebuild_detail('u1', 'Alice')
         )
         with caplog.at_level(logging.WARNING):
-            await svc.rebuild_entity_summaries(project_id='test', force=True)
+            await svc.rebuild_entity_summaries(project_id='test', **path_kwargs)
 
         def warned_under(logger_name):
             return [

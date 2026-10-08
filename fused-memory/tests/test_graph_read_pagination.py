@@ -2257,6 +2257,28 @@ class TestDetectStaleWithEdgesReportsBothReads:
         )
 
     @pytest.mark.asyncio
+    async def test_empirical_warnings_go_to_the_given_log(
+        self, mock_config, make_backend, caplog
+    ):
+        """Both reads' policy warnings; ``_paged_ro_query``'s own diagnostics stay on the backend's."""
+        edges = _healthy_edges()
+        backend = make_backend(mock_config)
+        _wire(backend, DualCorpusGraph(
+            _healthy_entities(), edges,
+            node_graph_kwargs={'census_result_set': [], 'census_result_set_set': True},
+            edge_graph_kwargs={'census_override': len(edges) + 3},
+        ))
+        caller_log = logging.getLogger('test.detect_stale.caller')
+        with caplog.at_level(logging.WARNING):
+            await backend.detect_stale_with_edges(group_id='test', log=caller_log)
+
+        policy_warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING and 'enumeration INCOMPLETE' in r.getMessage()
+        ]
+        assert [r.name for r in policy_warnings] == [caller_log.name, caller_log.name]
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize('forced', _STRUCTURAL_FORCINGS)
     async def test_structural_node_read_raises(
         self, forced, mock_config, make_backend, monkeypatch

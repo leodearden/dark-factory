@@ -10,6 +10,7 @@ Task 433: 8 code-quality improvements deferred from task-419 review.
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -22,6 +23,9 @@ from fused_memory.backends.graphiti_client import (
     ReadCompleteness,
     StaleSummaryResult,
 )
+
+#: The logger the service hands detect_stale_with_edges for the policy warning.
+_SERVICE_LOG = logging.getLogger('fused_memory.services.memory_service')
 
 
 def _make_svc(mock_config):
@@ -581,7 +585,9 @@ class TestRebuildEntitySummariesDataFlow:
 
         await svc.rebuild_entity_summaries(project_id='test', force=False, dry_run=False)
 
-        svc.graphiti.detect_stale_with_edges.assert_awaited_once_with(group_id='test')
+        svc.graphiti.detect_stale_with_edges.assert_awaited_once_with(
+            group_id='test', log=_SERVICE_LOG
+        )
         svc.graphiti.detect_stale_dry_run.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -776,7 +782,9 @@ class TestRebuildEntitySummariesErrorHandling:
         assert ok_detail['old_summary'] == 'old B'
         assert ok_detail['edge_count'] == 0
 
-        svc.graphiti.detect_stale_with_edges.assert_awaited_once_with(group_id='test')
+        svc.graphiti.detect_stale_with_edges.assert_awaited_once_with(
+            group_id='test', log=_SERVICE_LOG
+        )
         assert svc.graphiti.rebuild_entity_from_edges.await_count == 2
 
         # Symmetrical to the force=True test: pin the force=False forwarding path

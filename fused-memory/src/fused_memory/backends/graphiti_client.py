@@ -4652,7 +4652,7 @@ class GraphitiBackend:
 
     @_canonicalize_group_args
     async def detect_stale_with_edges(
-        self, *, group_id: str
+        self, *, group_id: str, log: logging.Logger = logger
     ) -> StaleSummaryResult:
         """Detect stale summaries and return a StaleSummaryResult.
 
@@ -4682,16 +4682,18 @@ class GraphitiBackend:
 
         Args:
             group_id: Project graph to query.
+            log: Logger for either read's EMPIRICAL warning, so a caller's
+                rebuild reports its short read beside its own log lines.
 
         Returns:
             StaleSummaryResult, carrying the node read's and the edge read's
             ReadCompleteness alongside the verdicts.
         """
         entities, entities_completeness = await read_entity_nodes_checked(
-            self, group_id=group_id
+            self, group_id=group_id, log=log
         )
         all_edges, edges_completeness = await read_all_valid_edges_checked(
-            self, group_id=group_id
+            self, group_id=group_id, log=log
         )
         stale: list[dict] = []
         for entity in entities:

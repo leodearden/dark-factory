@@ -10911,7 +10911,7 @@ class MemoryService:
                     )
                 else:
                     detect_result = await self.graphiti.detect_stale_with_edges(
-                        group_id=project_id
+                        group_id=project_id, log=logger
                     )
                     stale = detect_result.stale
                     all_edges = detect_result.all_edges
