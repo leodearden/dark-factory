@@ -9529,6 +9529,159 @@ class TestRetireFlagMarkersForTerminalTask:
         assert any("stored as the string 'true'" in m for m in sweep_warnings), sweep_warnings
 
 
+class TestFlagForStage2TasklessRetirement:
+    """A flag_for_stage2 marker citing no task has no closure to wait for, so
+    the sweep retires it past a longer age ceiling instead, while every
+    task-citing marker keeps the terminal-closure rule (task 4995).
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'cited_task',
+        [{}, {'task_id': None}, {'task_id': ''}, {'task_id': '   '}],
+        ids=['absent', 'none', 'empty', 'whitespace'],
+    )
+    async def test_taskless_marker_past_the_ceiling_is_retired(self, cited_task):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
+        )
+        pool = LiveFlagPool([_relay_marker('taskless', ceiling + 1, **cited_task)])
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            pool, 'dark_factory', 'cycle-run', terminal_task_ids={'T'}, now=_RETIRE_NOW,
+        )
+
+        assert result == 1
+        assert pool.deleted_ids() == ['taskless']
+        assert pool.delete_memory.await_args is not None
+        assert pool.delete_memory.await_args.kwargs['_source'] == _FLAG_FOR_STAGE2_GC_SWEEP_SOURCE
+
+    @pytest.mark.asyncio
+    async def test_the_taskless_ceiling_not_the_ttl_governs(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
+        )
+
+        def taskless(mid: str, age: timedelta) -> dict:
+            return {
+                'id': mid,
+                'created_at': (_RETIRE_NOW - age).isoformat(),
+                'metadata': {'flag_for_stage2': True},
+            }
+
+        pool = LiveFlagPool([
+            taskless('past-ceiling', timedelta(days=ceiling, hours=1)),
+            taskless('short-of-ceiling', timedelta(days=ceiling, hours=-1)),
+            taskless('past-ttl-only', timedelta(days=_FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS + 1)),
+        ])
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            pool, 'dark_factory', 'cycle-run', terminal_task_ids={'T'}, now=_RETIRE_NOW,
+        )
+
+        assert result == 1
+        assert pool.deleted_ids() == ['past-ceiling']
+
+    @pytest.mark.asyncio
+    async def test_taskless_retirement_does_not_wait_on_taskmaster(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
+        )
+        pool = LiveFlagPool([
+            _relay_marker('taskless', ceiling + 1),
+            _relay_marker('cites-task', ceiling + 1, task_id='T'),
+        ])
+
+        await _sweep_stale_mem0_flag_for_stage2_markers(
+            pool, 'dark_factory', 'cycle-run', terminal_task_ids=[], now=_RETIRE_NOW,
+        )
+
+        assert pool.deleted_ids() == ['taskless']
+
+    @pytest.mark.asyncio
+    async def test_task_citing_markers_never_reach_the_ceiling(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
+        )
+        ancient = 10 * ceiling
+        pool = LiveFlagPool([
+            _relay_marker('open-task', ancient, task_id='OPEN'),
+            _relay_marker('comma-joined', ancient, task_id='T,U'),
+            _relay_marker('pseudo-id', ancient, task_id='graphiti_index_health_falkordb'),
+            _relay_marker('terminal-task', ancient, task_id='T'),
+        ])
+
+        await _sweep_stale_mem0_flag_for_stage2_markers(
+            pool, 'dark_factory', 'cycle-run', terminal_task_ids={'T', 'U'}, now=_RETIRE_NOW,
+        )
+
+        assert set(pool.deleted_ids()) == {'terminal-task'}
+
+    @pytest.mark.asyncio
+    async def test_protected_records_stay_protected_without_a_task(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
+        )
+        ancient = 10 * ceiling
+        pool = LiveFlagPool([
+            _relay_marker('mirror', ancient, kind='cycle_summary'),
+            _relay_marker('audit', ancient, kind='cadence_check'),
+        ])
+
+        result = await _sweep_stale_mem0_flag_for_stage2_markers(
+            pool, 'dark_factory', 'cycle-run', terminal_task_ids={'T'}, now=_RETIRE_NOW,
+        )
+
+        assert result == 0
+        assert pool.deleted_ids() == []
+
+    @pytest.mark.asyncio
+    async def test_retained_warning_counts_only_what_is_still_withheld(self, caplog):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
+        )
+        pool = LiveFlagPool([
+            _relay_marker('taskless-past-ceiling', ceiling + 1),
+            _relay_marker('taskless-past-ttl', _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS + 1),
+            _relay_marker('open-task', ceiling + 1, task_id='OPEN'),
+        ])
+
+        with caplog.at_level(logging.WARNING):
+            await _sweep_stale_mem0_flag_for_stage2_markers(
+                pool, 'dark_factory', 'cycle-run', terminal_task_ids={'T'}, now=_RETIRE_NOW,
+            )
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+        assert len([m for m in warnings if 'RETAINED 2 age-stale' in m]) == 1, warnings
+
+    @pytest.mark.asyncio
+    async def test_done_hook_leaves_taskless_markers_to_the_sweep(self):
+        from fused_memory.reconciliation.stages.task_knowledge_sync import (
+            _FLAG_FOR_STAGE2_TASKLESS_MAX_AGE_DAYS as ceiling,
+        )
+
+        def pool() -> LiveFlagPool:
+            return LiveFlagPool([
+                _relay_marker('taskless', ceiling + 1),
+                _relay_marker('cites-T', ceiling + 1, task_id='T'),
+            ])
+
+        hook_pool, sweep_pool = pool(), pool()
+
+        await retire_flag_markers_for_terminal_task(
+            hook_pool, 'dark_factory', 'done-run', task_id='T', now=_RETIRE_NOW,
+        )
+        await _sweep_stale_mem0_flag_for_stage2_markers(
+            sweep_pool, 'dark_factory', 'cycle-run', terminal_task_ids={'T'}, now=_RETIRE_NOW,
+        )
+
+        hook_deleted = set(hook_pool.deleted_ids())
+        sweep_deleted = set(sweep_pool.deleted_ids())
+        assert hook_deleted == {'cites-T'}
+        assert sweep_deleted == {'taskless', 'cites-T'}
+        assert hook_deleted <= sweep_deleted
+
+
 class TestWarnOnFlagForStage2TypeDrift:
     """_warn_on_flag_for_stage2_type_drift: best-effort boolean/string
     type-drift diagnostic for the flag_for_stage2 GC sweep (task 2966
