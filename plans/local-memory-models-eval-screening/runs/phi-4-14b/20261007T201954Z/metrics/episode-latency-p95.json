@@ -1,0 +1,17 @@
+{
+  "arm_id": "phi-4-14b",
+  "arm_role": "candidate",
+  "axis": "llm",
+  "code_sha": "055e9c15a0d756704017b0d77ffbe4185155402f",
+  "corpus_sha": "850cf7c937c745b0d224a0ba975efc1c69080ad61d84c5369d06287cdd16f2e8",
+  "incomplete": false,
+  "measured_at": "2026-10-07T20:24:13.559996Z",
+  "metric": {
+    "kind": "scalar",
+    "metric_id": "episode-latency-p95",
+    "n": 19,
+    "value": 101879.16103005409
+  },
+  "preregistration_sha": "865a017d79c6a210da157474e639fd15fe51f9e0",
+  "schema_version": 1
+}

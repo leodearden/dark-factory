@@ -241,8 +241,16 @@ Live endpoints come from `FusedMemoryConfig()` (honours `CONFIG_PATH`).
 | `parity-check --run-a A --run-b B` | ζ | Client-class parity deltas (a − b) into `A/parity/<arm b>/metrics/` (`comparison.py`) |
 | `control-check --run A --run B [--run …] [--reference-outcomes F]` | ζ | Symmetry, one code sha, token/cost and reference checks (`checks.py`) |
 | `preregister --run-a A --run-b B --out F` | ζ | The incumbent control pair's margins, latency envelope and calls-per-episode profile, written to a fresh `F` (an existing `F` is refused, never overwritten); B must have run with `--reference-outcomes` A, and its graph-sameness is recomputed from both runs' outcomes (`preregistration.py`, `margins.py`) |
+| `screen --evidence-root R --arms-manifest Y --preregistration-inputs P --reference-outcomes O --out F` | η | Offline: loads each `arms.yaml` LLM arm's screening evidence under `R` and writes the survivor verdict to a fresh `F`. A zero-survivor verdict exits 0, and invalid evidence exits 2 (`screening.py`, `screening_evidence.py`) |
 | `topology --graph G` | ζ, ι | A scratch graph's node and edge counts and topology hash: ζ freezes the reference graph, ι re-runs it to verify the graph is unchanged (`topology.py`) |
 | `teardown --arm-spec S [--collection]` | ι | Deletes the arm's scratch graph and, with `--collection`, its Qdrant replica (`teardown.py`) |
+
+`screen_slate.py`, beside `harness.py`, is η's sweep driver. It runs every LLM
+arm in turn: start, smoke, run, α's healthcheck, stop and teardown, all through
+the pinned harness. Each arm's traffic passes through the in-process usage tap
+(`usage_tap.py`), which records the server's own per-call `usage`. Its
+provenance and run record:
+`plans/local-memory-models-eval-screening/README.md`.
 
 `run` refuses before touching any store unless the spec's `code_sha` is the
 clean HEAD of `--repo-root`, a candidate's `preregistration_sha` carries the
