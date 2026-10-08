@@ -41,7 +41,7 @@ from __future__ import annotations
 import posixpath
 import re
 import shlex
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
@@ -1921,32 +1921,44 @@ def _raw_pytest_carries_xdist_option(raw: str) -> bool:
     return False
 
 
-def serial_pytest(cmd: VerifyCmd) -> VerifyCmd:
+def serial_pytest(cmd: VerifyCmd, ini_addopts: Sequence[str] = ()) -> VerifyCmd:
     """Return *cmd* with the serial-recovery flags applied to every pytest invocation.
 
-    Appends ``-p no:xdist -o addopts=`` (the ``-o addopts=""`` workaround
-    task 2045 proved recovers a shared-venv-mutation transient; ``-p
-    no:xdist`` is belt-and-suspenders) to a structured command's
+    Appends ``-p no:xdist -o addopts=<value>`` to a structured command's
     ``base_flags``, or — for a raw-retained pytest chain — to every
     ``pytest`` invocation's arguments in ``raw`` via a localised regex
     rewrite (moved from ``_force_serial_pytest``), so each chained
     invocation recovers independently. No-ops unless ``cmd.tool is
-    ToolKind.PYTEST`` (covers OPAQUE and every other tool — P1).
+    ToolKind.PYTEST`` (covers OPAQUE and every other tool — P1). This is the
+    recovery task 2045 proved for a shared-venv-mutation transient, where
+    xdist has vanished from the venv.
 
-    ``-o addopts=`` reaches only a PYPROJECT-level ``-n auto``, and that
-    limit is load-bearing rather than incidental: a worker flag already on
-    ARGV survives it, and ``-p no:xdist`` then UNREGISTERS the option that
-    flag names. Measured on the live ``scripts`` leg (task 5408)::
+    *ini_addopts* is the RAW ``addopts`` of the config pytest will read for
+    this command, supplied by the caller
+    (``verify_plan.py::governing_addopts`` produces it,
+    ``verify.py::_serial_pytest_str`` wires it). ``-o addopts=<value>``
+    REPLACES the ini addopts wholesale, so ``<value>`` re-supplies them with
+    every xdist option removed (``_strip_xdist_options``, the same walk that
+    sheds argv): ``-p no:xdist`` unregisters those options, and any survivor
+    is a hard ``unrecognized arguments``. Keeping the import mode and the
+    marker filter is what makes the recovery run collect and select the same
+    test set as the run it recovers; a CLI ``-m`` still wins over the
+    re-supplied one, because pytest prepends addopts to argv. The default
+    ``()`` is the historical blank ``-o addopts=``, exactly right for a
+    config with no addopts and the fail-safe for one that cannot be resolved.
+
+    The re-supplied addopts never reach a worker flag already on ARGV, and
+    ``-p no:xdist`` then UNREGISTERS the option that flag names. Measured on
+    the live ``scripts`` leg (task 5408)::
 
         pytest ... -n auto --dist loadgroup -p no:xdist -o addopts= <target>
         pytest: error: unrecognized arguments: -n --dist          (rc=4)
 
-    So the structured path SHEDS every xdist option via
-    ``_strip_xdist_options`` before appending the recovery pair. This is
-    the mirror of ``_is_serial_forced``, which stops a later
-    ``apply_pytest_numprocesses`` ADDING ``-n`` after the fact; read the two
-    together — they close the same plugin/option interaction from opposite
-    directions, and neither alone is sufficient.
+    So the structured path SHEDS every xdist option from argv too, before
+    appending the recovery pair. This is the mirror of ``_is_serial_forced``,
+    which stops a later ``apply_pytest_numprocesses`` ADDING ``-n`` after the
+    fact; read the two together — they close the same plugin/option
+    interaction from opposite directions, and neither alone is sufficient.
 
     Two no-ops on the raw path, both returning *cmd* ITSELF rather than an
     equal ``replace`` copy: the caller's ``is`` identity guard
@@ -1966,17 +1978,17 @@ def serial_pytest(cmd: VerifyCmd) -> VerifyCmd:
     """
     if cmd.tool is not ToolKind.PYTEST:
         return cmd
+    addopts = f'addopts={shlex.join(_strip_xdist_options(tuple(ini_addopts)))}'
     if cmd.raw is not None:
         if _raw_pytest_carries_xdist_option(cmd.raw):
             return cmd
-        rewritten = _append_to_raw_pytest_invocations(cmd.raw, " -p no:xdist -o addopts=''")
+        quoted = "addopts=''" if addopts == 'addopts=' else shlex.quote(addopts)
+        rewritten = _append_to_raw_pytest_invocations(cmd.raw, f' -p no:xdist -o {quoted}')
         if rewritten == cmd.raw:
             return cmd
         return replace(cmd, raw=rewritten)
     shed = replace(cmd, base_flags=_strip_xdist_options(cmd.base_flags))
-    return _append_value_flag(
-        _append_value_flag(shed, '-p', 'no:xdist'), '-o', 'addopts=',
-    )
+    return _append_value_flag(_append_value_flag(shed, '-p', 'no:xdist'), '-o', addopts)
 
 
 def _is_serial_forced(cmd: VerifyCmd) -> bool:
@@ -1991,10 +2003,11 @@ def _is_serial_forced(cmd: VerifyCmd) -> bool:
     already-serial command (the env-transient and flaky-scoped recovery
     re-runs both pass such commands back through the injection site).
 
-    That is one direction of the interaction. The other — a worker flag
+    That is one direction of the interaction. The other — an xdist option
     already on argv when the command is forced serial — is closed in
-    ``serial_pytest``, which strips it there rather than relying on ``-o
-    addopts=`` (which cannot reach argv). The two docstrings are one account.
+    ``serial_pytest``, which strips it there (the ``-o addopts=`` override
+    replaces only the ini addopts, never argv). The two docstrings are one
+    account.
 
     ``no:xdist`` is checked across both ``base_flags`` and ``targets``: a
     freshly ``serial_pytest``-ed structured command carries the ``-p
