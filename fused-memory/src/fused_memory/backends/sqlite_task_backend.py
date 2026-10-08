@@ -1425,19 +1425,19 @@ def _row_to_task(row: aiosqlite.Row, dependencies: list[int], *, project_root: s
 
 def _updated_task_response(
     refreshed: aiosqlite.Row | None,
-    deps: dict[int, list[int]],
+    dependencies: list[int],
     *,
     task_id: str,
     project_root: str,
     message: str,
 ) -> UpdateTaskResult:
-    """The reply of a writer that re-read its row and the dependencies inside its own unit."""
+    """The reply of a writer that re-read its row and its dependencies inside its own unit."""
     return {
         'id': task_id,
         'message': message,
         'updated': True,
         'updated_task': (
-            _row_to_task(refreshed, deps.get(refreshed['id'], []), project_root=project_root)
+            _row_to_task(refreshed, dependencies, project_root=project_root)
             if refreshed is not None else None
         ),
     }
@@ -1926,6 +1926,22 @@ class SqliteTaskBackend:
         for deps in out.values():
             deps.sort()
         return out
+
+    async def _fetch_task_dependencies(
+        self, conn: aiosqlite.Connection, tag: str, tid: int,
+    ) -> list[int]:
+        """Return task *tid*'s ``depends_on`` ids, ascending, in one queued hop.
+
+        The single-task counterpart of :meth:`_fetch_dependencies`, for a
+        writer re-reading its own row inside its write unit: scanning the whole
+        tag there would hold the project's write path for every task's deps.
+        """
+        rows = await conn.execute_fetchall(
+            'SELECT depends_on FROM dependencies WHERE tag = ? AND task_id = ? '
+            'ORDER BY depends_on',
+            (tag, tid),
+        )
+        return [row['depends_on'] for row in rows]
 
     async def _get_tasks_internal(
         self, project_root: str, tag: str,
@@ -3547,7 +3563,7 @@ class SqliteTaskBackend:
                 (tag, tid),
             )
             refreshed = await refreshed_cursor.fetchone()
-            deps = await self._fetch_dependencies(conn, tag)
+            deps = await self._fetch_task_dependencies(conn, tag, tid)
         return _updated_task_response(
             refreshed, deps, task_id=task_id, project_root=project_root,
             message=f'Task {task_id} updated',
@@ -3711,7 +3727,7 @@ class SqliteTaskBackend:
                 (tag, tid),
             )
             refreshed = await refreshed_cursor.fetchone()
-            deps = await self._fetch_dependencies(conn, tag)
+            deps = await self._fetch_task_dependencies(conn, tag, tid)
         return _updated_task_response(
             refreshed, deps, task_id=task_id, project_root=project_root,
             message=f'Rotated audit trail of task {task_id}',
