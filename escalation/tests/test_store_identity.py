@@ -10,8 +10,10 @@ import dataclasses
 from pathlib import Path
 
 import pytest
+from fastmcp import Client, FastMCP
 
 from escalation.queue import EscalationQueue
+from escalation.server import create_server
 from escalation.store_identity import StoreIdentity
 
 
@@ -175,3 +177,41 @@ class TestStoreIdentityValidatesKindCoherence:
     def test_coherent_combinations_construct(self, tmp_path: Path) -> None:
         _project_identity(tmp_path)
         _reconciliation_identity(tmp_path)
+
+
+async def _registered_tool_names(server: FastMCP) -> set[str]:
+    async with Client(server) as client:
+        return {tool.name for tool in await client.list_tools()}
+
+
+class TestCreateServerAcceptsStoreIdentity:
+    @pytest.mark.parametrize('make_identity', [_project_identity, _reconciliation_identity])
+    def test_accepts_an_identity_of_either_kind(self, tmp_path: Path, make_identity) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        server = create_server(queue, startup_sweep=False, store_identity=make_identity(tmp_path))
+
+        assert isinstance(server, FastMCP)
+
+    def test_accepts_none(self, tmp_path: Path) -> None:
+        queue = EscalationQueue(tmp_path / 'esc')
+
+        assert isinstance(create_server(queue, startup_sweep=False, store_identity=None), FastMCP)
+
+    @pytest.mark.asyncio
+    async def test_registered_tool_names_do_not_depend_on_identity(self, tmp_path: Path) -> None:
+        def fresh_queue(name: str) -> EscalationQueue:
+            return EscalationQueue(tmp_path / name)
+
+        omitted = create_server(fresh_queue('omitted'), startup_sweep=False)
+        explicit_none = create_server(
+            fresh_queue('none'), startup_sweep=False, store_identity=None
+        )
+        with_identity = create_server(
+            fresh_queue('esc'), startup_sweep=False, store_identity=_project_identity(tmp_path)
+        )
+
+        omitted_names = await _registered_tool_names(omitted)
+        assert omitted_names
+        assert await _registered_tool_names(explicit_none) == omitted_names
+        assert await _registered_tool_names(with_identity) == omitted_names
