@@ -11,16 +11,16 @@ visible in normal searches.  This happens when a task is marked done.
 
 from __future__ import annotations
 
-import contextlib
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-import aiosqlite
-from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
-
-if TYPE_CHECKING:
-    pass
+from shared.async_sqlite_base import (
+    AtomicConnection,
+    CheckpointResult,
+    apply_full_durability_pragmas,
+    connect_daemon,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ class PlannedEpisodeRegistry:
 
     def __init__(self, data_dir: str | Path) -> None:
         self._data_dir = Path(data_dir)
-        self._db: aiosqlite.Connection | None = None
+        self._access: AtomicConnection | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -63,35 +63,35 @@ class PlannedEpisodeRegistry:
 
         Idempotent — safe to call multiple times; subsequent calls are no-ops.
         """
-        if self._db is not None:
+        if self._access is not None:
             return
         self._data_dir.mkdir(parents=True, exist_ok=True)
         db_path = self._data_dir / 'planned_episodes.db'
-        self._db = await connect_daemon(str(db_path))
-        await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
-        await self._db.execute(_CREATE_TABLE)
-        await self._db.execute(_CREATE_INDEX)
-        await self._db.commit()
+        conn = await connect_daemon(str(db_path))
+        await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
+        self._access = AtomicConnection(conn)
+        async with self._access.write() as db:
+            await db.execute(_CREATE_TABLE)
+            await db.execute(_CREATE_INDEX)
         logger.info('PlannedEpisodeRegistry initialized at %s', db_path)
+
+    def _require_access(self) -> AtomicConnection:
+        if self._access is None:
+            raise RuntimeError('PlannedEpisodeRegistry not initialized — call initialize() first')
+        return self._access
 
     async def close(self) -> None:
         """Close the database connection."""
-        if self._db:
-            with contextlib.suppress(Exception):
-                await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            await self._db.close()
-            self._db = None
+        if self._access is not None:
+            await self._access.close()
+            self._access = None
         logger.info('PlannedEpisodeRegistry closed')
 
-    async def checkpoint(self) -> tuple[int, int, int]:
+    async def checkpoint(self) -> CheckpointResult:
         """``PRAGMA wal_checkpoint(TRUNCATE)`` → ``(busy, log, checkpointed)``."""
-        if self._db is None:
-            return (-1, -1, -1)
-        cursor = await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-        row = await cursor.fetchone()
-        if row is None:
-            return (-1, -1, -1)
-        return int(row[0]), int(row[1]), int(row[2])
+        if self._access is None:
+            return CheckpointResult.unavailable()
+        return await self._access.checkpoint()
 
     # ------------------------------------------------------------------
     # Core operations
@@ -102,45 +102,38 @@ class PlannedEpisodeRegistry:
 
         Uses INSERT OR IGNORE to handle duplicate calls without raising.
         """
-        assert self._db is not None
-        from datetime import UTC, datetime
         created_at = datetime.now(UTC).isoformat()
-        await self._db.execute(
-            'INSERT OR IGNORE INTO planned_episodes (episode_uuid, project_id, created_at) '
-            'VALUES (?, ?, ?)',
-            (episode_uuid, project_id, created_at),
-        )
-        await self._db.commit()
+        async with self._require_access().write() as db:
+            await db.execute(
+                'INSERT OR IGNORE INTO planned_episodes (episode_uuid, project_id, created_at) '
+                'VALUES (?, ?, ?)',
+                (episode_uuid, project_id, created_at),
+            )
         logger.debug('Registered planned episode %s for project %s', episode_uuid, project_id)
 
     async def is_planned(self, episode_uuid: str) -> bool:
         """Return True if the episode is registered as planned."""
-        assert self._db is not None
-        async with self._db.execute(
+        row = await self._require_access().read_one(
             'SELECT 1 FROM planned_episodes WHERE episode_uuid = ? LIMIT 1',
             (episode_uuid,),
-        ) as cursor:
-            row = await cursor.fetchone()
+        )
         return row is not None
 
     async def get_planned_uuids(self, project_id: str) -> set[str]:
         """Return the set of planned episode UUIDs for a project."""
-        assert self._db is not None
-        async with self._db.execute(
+        rows = await self._require_access().read_all(
             'SELECT episode_uuid FROM planned_episodes WHERE project_id = ?',
             (project_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
+        )
         return {row[0] for row in rows}
 
     async def promote(self, episode_uuid: str) -> None:
         """Remove an episode from the planned registry (promote to real)."""
-        assert self._db is not None
-        await self._db.execute(
-            'DELETE FROM planned_episodes WHERE episode_uuid = ?',
-            (episode_uuid,),
-        )
-        await self._db.commit()
+        async with self._require_access().write() as db:
+            await db.execute(
+                'DELETE FROM planned_episodes WHERE episode_uuid = ?',
+                (episode_uuid,),
+            )
         logger.debug('Promoted episode %s (removed from planned registry)', episode_uuid)
 
     async def are_all_planned(self, episode_uuids: list[str]) -> bool:
@@ -151,13 +144,10 @@ class PlannedEpisodeRegistry:
         """
         if not episode_uuids:
             return False
-        assert self._db is not None
-        # Query for how many of the given UUIDs exist in the registry
         placeholders = ','.join('?' * len(episode_uuids))
-        async with self._db.execute(
+        row = await self._require_access().read_one(
             f'SELECT COUNT(*) FROM planned_episodes WHERE episode_uuid IN ({placeholders})',
             episode_uuids,
-        ) as cursor:
-            row = await cursor.fetchone()
+        )
         count = row[0] if row else 0
         return count == len(episode_uuids)

@@ -106,24 +106,21 @@ class TestIdempotentInitialize:
 
     @pytest.mark.asyncio
     async def test_double_initialize_preserves_connection_identity(self, tmp_path):
-        """Second call to initialize() must return early, keeping original connection.
-
-        Currently FAILS because initialize() unconditionally overwrites self._db.
-        """
+        """Second call to initialize() must return early, keeping original connection."""
         reg = PlannedEpisodeRegistry(data_dir=tmp_path / 'registry')
         await reg.initialize()
 
         # Register data so we can verify it's still accessible afterwards
         await reg.register('uuid-before', 'proj-1')
 
-        # Capture the original connection object
-        original_db = reg._db
+        # Capture the original access object
+        original_access = reg._access
 
         # Second call — must be a no-op (early return)
         await reg.initialize()
 
         # Connection identity must be preserved (no new connection opened)
-        assert reg._db is original_db, (
+        assert reg._access is original_access, (
             'Second initialize() must not open a new connection (would leak the old one)'
         )
 

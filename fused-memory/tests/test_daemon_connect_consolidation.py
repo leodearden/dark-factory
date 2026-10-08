@@ -86,7 +86,7 @@ _DAEMON_CASES = [
     pytest.param(
         lambda tmp: PlannedEpisodeRegistry(data_dir=tmp / 'registry'),
         _std_lifecycle,
-        lambda store, _root: store._db,
+        lambda store, _root: store._require_access().connection,
         id='PlannedEpisodeRegistry',
     ),
     pytest.param(
