@@ -1039,7 +1039,9 @@ def _uvicorn_int_flag(path: pathlib.Path, flag: str) -> int | None:
     The lookup is deliberately scoped to the logical ExecStart line rather than
     the whole file: both unit files discuss these same flags in the explanatory
     comment block above ExecStart, so a whole-file regex would keep reporting a
-    value after the flag had actually been deleted from the command.
+    value after the flag had actually been deleted from the command.  None
+    means the command lacks the flag, never that there is no command: a unit
+    with no effective ExecStart= raises MalformedExecStart instead.
     """
     command = logical_exec_start(path.read_text(encoding="utf-8"), str(path))
     match = re.search(rf"--{re.escape(flag)}[=\s]+(\d+)", command)

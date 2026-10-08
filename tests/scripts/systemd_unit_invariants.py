@@ -423,24 +423,28 @@ def assert_restart_backoff_effective(path: pathlib.Path) -> None:
 # report a verdict about neither.
 #
 #   **/tests/**  — parity suites embed whole units as column-0 triple-quoted
-#     fixtures.  Measured: tests/scripts/test_check_fused_memory_unit_parity.py
-#     was swept as a 13th "unit" and PASSED by accident, splicing a cap out of
+#     fixtures.  Measured in test_systemd_restart_backoff.py's sweep:
+#     tests/scripts/test_check_fused_memory_unit_parity.py was swept as a 13th
+#     "unit" and PASSED by accident, splicing a RestartMaxDelaySec= cap out of
 #     the NEGATIVE fixture (which deliberately models the defect) together with
 #     RestartSteps= out of an unrelated POSITIVE one.  The glob form is
 #     load-bearing: a plain `:!tests/` excludes only the top-level directory and
 #     leaves fused-memory/tests/, orchestrator/tests/, scripts/tests/ and
 #     dashboard/tests/ swept — and fused-memory/tests/test_systemd_unit_config.py
-#     already parses systemd units, so one fixture there gaining a column-0 cap
-#     would drag a .py file back in.
+#     already parses systemd units, so one fixture there gaining a column-0
+#     directive either sweep anchors on would drag a .py file back in.
 #
-#   **/*.md — prose.  A doc may legitimately show the DEFECT: a PRD or
-#     postmortem for this very task would carry a "before" fence (cap, no steps)
-#     next to an "after" fence, and no mechanical rule distinguishes a
-#     cautionary example from a prescription.  plans/afk-C1-systemd.md is the
-#     live instance — an as-built record of what was deployed, already diverged
-#     from the fleet in three visible ways (`Requires=fused-memory.service`,
-#     which the real units reject and test_orchestrator_service_files.py asserts
-#     is ABSENT; an obsolete `--config orchestrator/config.yaml`; no `--frozen`).
+#   **/*.md — prose.  A doc may legitimately show the DEFECT a sweep guards
+#     against: a PRD or postmortem quoting the defective unit next to the fixed
+#     one, and no mechanical rule distinguishes a cautionary example from a
+#     prescription.  For test_systemd_restart_backoff.py that "before" fence is
+#     a cap with no RestartSteps=; for test_uv_run_venv_isolation.py it is a
+#     `uv run` missing run-level `--no-sync`, or carrying a stale `--frozen`
+#     beside it.  plans/afk-C1-systemd.md is the live instance — an as-built
+#     record of what was deployed, already diverged from the fleet in three
+#     visible ways (`Requires=fused-memory.service`, which the real units reject
+#     and test_orchestrator_service_files.py asserts is ABSENT; an obsolete
+#     `--config orchestrator/config.yaml`; no `--no-sync`).
 #     Editing a directive inside it would falsify the record without making any
 #     unit correct.  Excluding the category rather than the path means the next
 #     doc quoting a unit does not turn CI red and does not have to be
