@@ -760,6 +760,13 @@ _EVERY_INCOMPLETE_KIND = sorted(
 )
 
 
+def test_incomplete_kinds_is_the_whole_vocabulary():
+    """The structural kinds plus the two empirical ones, and nothing else."""
+    from fused_memory.backends.graphiti_client import INCOMPLETE_KINDS
+
+    assert sorted(INCOMPLETE_KINDS) == _EVERY_INCOMPLETE_KIND
+
+
 class TestReadCompleteness:
     """``ReadCompleteness.of`` is the one PagedRead -> (complete, kind) projection."""
 
@@ -794,6 +801,13 @@ class TestReadCompleteness:
         message = str(excinfo.value)
         assert f'complete={complete!r}' in message
         assert f'incomplete_kind={kind!r}' in message
+
+    def test_an_unknown_kind_is_refused(self):
+        """A misspelt kind would fall out of every ``in INCOMPLETE_STRUCTURAL_KINDS`` gate."""
+        from fused_memory.backends.graphiti_client import ReadCompleteness
+
+        with pytest.raises(ValueError, match='shortread'):
+            ReadCompleteness(complete=False, incomplete_kind='shortread')
 
     def test_is_frozen(self):
         import dataclasses

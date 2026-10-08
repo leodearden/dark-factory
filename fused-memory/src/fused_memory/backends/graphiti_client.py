@@ -600,6 +600,12 @@ Callers should branch on membership in this set rather than on a specific
 kind, so a future fifth structural path is covered by construction.
 """
 
+INCOMPLETE_KINDS = INCOMPLETE_STRUCTURAL_KINDS | {
+    INCOMPLETE_CENSUS_UNAVAILABLE,
+    INCOMPLETE_SHORT_READ,
+}
+"""Every incompleteness kind: the vocabulary ``incomplete_kind`` is drawn from."""
+
 
 # Page/census pairs for the paginated whole-graph reads. Each pair shares an
 # IDENTICAL MATCH/WHERE so the two numbers describe the same population and
@@ -723,6 +729,11 @@ class ReadCompleteness:
                 'ReadCompleteness: incomplete_kind must be None exactly when '
                 f'complete is True, got complete={self.complete!r} '
                 f'incomplete_kind={self.incomplete_kind!r}'
+            )
+        if self.incomplete_kind is not None and self.incomplete_kind not in INCOMPLETE_KINDS:
+            raise ValueError(
+                f'ReadCompleteness: unknown incomplete_kind={self.incomplete_kind!r}; '
+                f'expected one of {sorted(INCOMPLETE_KINDS)}'
             )
 
     @classmethod
