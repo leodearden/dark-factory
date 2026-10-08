@@ -832,6 +832,41 @@ def test_exec_start_config_arg_ignores_exec_start_pre() -> None:
     )
 
 
+_CONTINUED_ORCHESTRATOR_RUN = (
+    "ExecStart=/usr/bin/uv run --no-sync --project orchestrator \\",
+    "  orchestrator run \\",
+    "  --config /home/leo/src/x/dark-factory-orchestrator.yaml",
+)
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        pytest.param(_CONTINUED_ORCHESTRATOR_RUN, id="config-on-a-continuation-line"),
+        pytest.param(
+            (
+                "ExecStart = /usr/bin/uv run orchestrator run "
+                "--config /home/leo/src/x/dark-factory-orchestrator.yaml",
+            ),
+            id="whitespace-around-separator",
+        ),
+        pytest.param(
+            ("ExecStart=", *_CONTINUED_ORCHESTRATOR_RUN),
+            id="reset-then-continued-command",
+        ),
+    ],
+)
+def test_exec_start_config_arg_reads_the_logical_command(lines: tuple[str, ...]) -> None:
+    """The --config parse reads the whole LOGICAL command systemd runs.
+
+    These are the continuation-line variants the coverage guard below names,
+    plus the whitespace around ``=`` that systemd.syntax accepts.
+    """
+    assert _exec_start_config_arg(_unit_fixture(*lines), "fixture.service") == (
+        "/home/leo/src/x/dark-factory-orchestrator.yaml"
+    )
+
+
 # Marker identifying a unit that launches the orchestrator CLI proper (as
 # opposed to orchestrator-watchdog.service, which runs a bare probe script).
 # `orchestrator run` REQUIRES a --config, so this is the mechanical predicate
