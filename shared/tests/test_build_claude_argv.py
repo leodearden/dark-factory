@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -36,6 +37,23 @@ _CLI_2_1_283_INIT_INVENTORY = frozenset({
 })
 
 
+@pytest.fixture
+def pinned_claude(monkeypatch, tmp_path: Path) -> str:
+    """Pin CLAUDE_BINARY at a real executable and yield its absolute path.
+
+    argv[0] is now a RESOLVED path rather than the bare name 'claude' (task
+    4448), so every golden-argv expectation needs a deterministic value for it.
+    Pinning the env var is what makes these tests independent of whether
+    `claude` happens to be installed on the CI PATH — the very ambient
+    dependency that took the curator down for 80+ hours on 2026-08-13→08-18.
+    """
+    exec_file = tmp_path / 'claude'
+    exec_file.write_text('#!/bin/sh\nexit 0\n')
+    exec_file.chmod(0o755)
+    monkeypatch.setenv('CLAUDE_BINARY', str(exec_file))
+    return str(exec_file)
+
+
 def _normalize(cmd: list[str], temp_files: list[str]) -> list[str]:
     """Replace any temp-file-valued token in *cmd* with a fixed placeholder.
 
@@ -51,7 +69,7 @@ def _cleanup(temp_files: list[str]) -> None:
         Path(path).unlink(missing_ok=True)
 
 
-def test_build_claude_argv_fresh_full_options() -> None:
+def test_build_claude_argv_fresh_full_options(pinned_claude: str) -> None:
     """FRESH (non-resume) case: full flag set in the documented order.
 
     Also confirms the sysprompt/mcp-config temp files are actually created
@@ -79,7 +97,7 @@ def test_build_claude_argv_fresh_full_options() -> None:
         assert json.loads(Path(mcp_path).read_text()) == {'mcpServers': {'foo': {'command': 'bar'}}}
 
         expected = _normalize([
-            'claude', '--print', '--output-format', 'json',
+            pinned_claude, '--print', '--output-format', 'json',
             '--model', 'opus',
             '--max-budget-usd', '5.0',
             '--system-prompt-file', sysprompt_path,
@@ -256,7 +274,7 @@ def test_build_claude_argv_schema_wildcard_keeps_explicit_extra_denies() -> None
         _cleanup(temp_files)
 
 
-def test_build_claude_argv_wildcard_without_schema_is_unchanged() -> None:
+def test_build_claude_argv_wildcard_without_schema_is_unchanged(pinned_claude: str) -> None:
     """With no output_schema a bare ``'*'`` deny is already an empty registry
     (measured on CLI 2.1.283), so that branch is not the leak and its argv stays
     byte-identical: ``--disallowed-tools *`` and no ``--tools``.
@@ -264,7 +282,7 @@ def test_build_claude_argv_wildcard_without_schema_is_unchanged() -> None:
     cmd, temp_files = _wildcard_argv(['*'])
     try:
         assert _normalize(cmd, temp_files) == [
-            'claude', '--print', '--output-format', 'json',
+            pinned_claude, '--print', '--output-format', 'json',
             '--model', 'opus',
             '--max-budget-usd', '5.0',
             '--system-prompt-file', _TMP_PLACEHOLDER,
@@ -336,7 +354,9 @@ def test_build_claude_argv_resume_keeps_system_prompt_schema_and_tool_filter() -
         _cleanup(temp_files)
 
 
-def test_build_claude_argv_strict_mcp_config_emits_flag_after_mcp_config() -> None:
+def test_build_claude_argv_strict_mcp_config_emits_flag_after_mcp_config(
+    pinned_claude: str,
+) -> None:
     """strict_mcp_config=True (with an mcp_config) appends --strict-mcp-config
     immediately after the --mcp-config <path> pair — the recon-watch isolation
     pattern that scopes the invocation to ONLY the --mcp-config servers,
@@ -361,7 +381,7 @@ def test_build_claude_argv_strict_mcp_config_emits_flag_after_mcp_config() -> No
         assert '--strict-mcp-config' in cmd
         sysprompt_path, mcp_path = temp_files
         expected = _normalize([
-            'claude', '--print', '--output-format', 'json',
+            pinned_claude, '--print', '--output-format', 'json',
             '--model', 'opus',
             '--max-budget-usd', '5.0',
             '--system-prompt-file', sysprompt_path,
@@ -537,6 +557,63 @@ def test_build_claude_argv_resume_keeps_mcp_config_and_strict_flag() -> None:
         _cleanup(temp_files)
 
 
+# ── argv[0] binary resolution (task 4448) ─────────────────────────────────────
+# argv[0] is resolved by the builder, not left to whatever PATH the spawning
+# process inherits: the absolute path when the spec resolves, otherwise the
+# bare spec plus a WARNING naming it — never an exception.
+
+
+def _minimal_argv(**overrides):
+    """build_claude_argv with the smallest viable kwargs, for argv[0] assertions."""
+    kwargs: dict[str, Any] = dict(
+        model='opus',
+        max_budget_usd=5.0,
+        system_prompt='sys',
+        max_turns=50,
+        permission_mode='bypassPermissions',
+        allowed_tools=None,
+        disallowed_tools=None,
+        mcp_config=None,
+        output_schema=None,
+        effort=None,
+        resume_session_id=None,
+        session_id=None,
+    )
+    kwargs.update(overrides)
+    return build_claude_argv(**kwargs)
+
+
+def test_build_claude_argv_emits_resolved_absolute_path(pinned_claude: str) -> None:
+    """argv[0] is the RESOLVED absolute path, not a bare PATH name."""
+    cmd, temp_files = _minimal_argv()
+    try:
+        assert cmd[0] == pinned_claude, f'argv[0] was not resolved: {cmd[:2]!r}'
+        assert Path(cmd[0]).is_absolute(), f'argv[0] is not absolute: {cmd[0]!r}'
+    finally:
+        _cleanup(temp_files)
+
+
+def test_build_claude_argv_falls_back_to_spec_and_warns_when_unresolvable(
+    monkeypatch, tmp_path: Path, caplog,
+) -> None:
+    """An unresolvable spec: argv still builds (fail-open) and a WARNING names it.
+
+    Raising here would break every caller that only assembles an argv without
+    spawning. The warning is the diagnostic that was missing for 80+ hours.
+    """
+    missing = str(tmp_path / 'no-such-claude')
+    monkeypatch.setenv('CLAUDE_BINARY', missing)
+    with caplog.at_level('WARNING', logger='shared.cli_invoke'):
+        cmd, temp_files = _minimal_argv()
+    try:
+        assert cmd[0] == missing, f'expected fail-open fallback to the spec; got {cmd[:2]!r}'
+        assert any(missing in rec.getMessage() for rec in caplog.records), (
+            f'no WARNING named the unresolvable spec; got {[r.getMessage() for r in caplog.records]}'
+        )
+    finally:
+        _cleanup(temp_files)
+
+
 # ── ARG_MAX / no-positional-prompt guard (task 3147) ─────────────────────────
 
 # Flags this builder emits with NO value of their own.  The walk below needs
@@ -548,7 +625,7 @@ _BOOLEAN_FLAGS = {'--print', '--strict-mcp-config'}
 MAX_ARG_STRLEN = 131072  # Linux per-argument limit (128 KiB)
 
 
-def test_argv_never_carries_the_user_prompt() -> None:
+def test_argv_never_carries_the_user_prompt(pinned_claude: str) -> None:
     """The user prompt can never reach argv — the single most tempting wrong fix.
 
     `claude --help` on v2.1.226 documents `claude [options] [command] [prompt]`,
@@ -607,7 +684,7 @@ def test_argv_never_carries_the_user_prompt() -> None:
         # flag (verified by mutation — appending a positional after
         # `--json-schema <schema>` slips past the walk but fails here).
         supplied = {
-            'claude', 'json',              # base argv constants
+            pinned_claude, 'json',         # base argv constants (argv[0] is resolved)
             _TMP_PLACEHOLDER,              # --system-prompt-file / --mcp-config
             'opus', '5.0', '50', 'bypassPermissions', 'high', 'sess-123',
             'Read', 'Grep', 'Bash',
@@ -625,7 +702,7 @@ def test_argv_never_carries_the_user_prompt() -> None:
 
         # Structural walk: argv[0] is the program; everything after it is a
         # flag or a flag's value.  There is no bare positional.
-        assert cmd[0] == 'claude'
+        assert cmd[0] == pinned_claude
         tokens = normalized[1:]
         assert tokens and tokens[0].startswith('--'), (
             f'argv does not begin with a flag after the program name: {tokens[:3]}'
