@@ -2171,6 +2171,12 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # human-gate-owned, so the deterministic gate-owned
             # suggested_action normalizer rewrites nothing.
             'gate_owned_suggested_actions_normalized': 0,
+            # Always present (task 5626), pre-initialised before the
+            # remediation early-return; 0 here because no task completed.
+            'unlanded_path_check_checked': 0,
+            'unlanded_path_check_skipped': 0,
+            'unlanded_path_check_errors': 0,
+            'unlanded_path_check_flags_emitted': 0,
             # ELEVEN keys from the two stale-edge sweeps, not the four this
             # task added (task 4386).  The count is what needs explaining: the
             # consolidator's per-sweep `else:` branch copies out the WHOLE key
@@ -2378,6 +2384,12 @@ class TestProjectIdValidation(BaseStageValidationTest):
             # human-gate-owned, so the deterministic gate-owned
             # suggested_action normalizer rewrites nothing.
             'gate_owned_suggested_actions_normalized': 0,
+            # Always present (task 5626), pre-initialised before the
+            # remediation early-return; 0 here because no task completed.
+            'unlanded_path_check_checked': 0,
+            'unlanded_path_check_skipped': 0,
+            'unlanded_path_check_errors': 0,
+            'unlanded_path_check_flags_emitted': 0,
             # ELEVEN keys from the two stale-edge sweeps, not the four this
             # task added (task 4386).  The count is what needs explaining: the
             # consolidator's per-sweep `else:` branch copies out the WHOLE key
