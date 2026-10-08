@@ -195,7 +195,7 @@ function ParkStacksSection({ modules, rows, onEvict }) {
                       T-{entry.owner}
                     </span>
                     <span style={{ color: 'var(--fg-3)', fontSize: 10 }}>
-                      tier {entry.rank}
+                      {entry.source === 'pin' ? `pin #${entry.pin_order}` : entry.tier}
                     </span>
                     {ageStr && (
                       <span style={{ color: 'var(--fg-3)', fontSize: 10 }}>{ageStr}</span>

@@ -62,6 +62,7 @@ from orchestrator.pin_reservation import (
     park_rank,
     pin_release_reason,
     priority_payload,
+    rank_payload,
 )
 from orchestrator.recovery_emission import (
     LeaveReason,
@@ -1812,6 +1813,10 @@ class ModuleLockTable:
         - ``shadowed``: bool — True for every entry except the active top
         - ``installed_at``: str — ISO8601 timestamp from ``_park_install_at``,
           or ``''`` if the owner has no recorded install timestamp
+        - ``source``: ``'pin'`` | ``'fairness'`` — derived from ``rank`` by
+          :func:`~orchestrator.pin_reservation.rank_payload`
+        - ``pin_order``: int (pin entries only) / ``tier``: str (fairness
+          entries only) — the priority behind ``rank``
 
         INV-3: ranks are strictly decreasing top-ward (``entry[i].rank > entry[i+1].rank``).
 
@@ -1830,6 +1835,7 @@ class ModuleLockTable:
                     'rank': rank,
                     'shadowed': idx != last_index,
                     'installed_at': self._park_install_at.get(owner, ''),
+                    **rank_payload(rank),
                 })
             result[module] = entries
         return result

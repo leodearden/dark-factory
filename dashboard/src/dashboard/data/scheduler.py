@@ -416,7 +416,7 @@ def _stranded_park_rows(
           park_state={'modules': sorted(mods), 'installed_at': str},
           lock_set=sorted(mods), age_seconds=int.
     """
-    # Build {owner: {'mods': [module, ...], 'installed_at': str}} across all stacks.
+    # Build {owner: {'mods': {module, ...}, 'installed_at': str}} across all stacks.
     owner_data: dict[str, dict] = {}
     for mod, stack in (park_stacks or {}).items():
         for entry in stack:
@@ -424,8 +424,8 @@ def _stranded_park_rows(
             if not owner:
                 continue
             if owner not in owner_data:
-                owner_data[owner] = {'mods': [], 'installed_at': ''}
-            owner_data[owner]['mods'].append(mod)
+                owner_data[owner] = {'mods': set(), 'installed_at': ''}
+            owner_data[owner]['mods'].add(mod)
             # Keep first non-empty installed_at encountered across all modules.
             if not owner_data[owner]['installed_at']:
                 ia = entry.get('installed_at') or ''

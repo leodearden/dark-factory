@@ -117,6 +117,20 @@ class ReservationSource(StrEnum):
         return cls.PIN if is_pin_rank(rank) else cls.FAIRNESS
 
 
+def rank_payload(rank: int) -> dict[str, str | int]:
+    """How a park-stack entry names the priority behind its *rank*.
+
+    The inverse of :func:`priority_payload` for a stored rank: always a
+    ``source``, plus ``pin_order`` for a pin rank or ``tier`` for a tier rank.
+    A rank past the last tier clamps to the last tier.
+    """
+    source = ReservationSource.source_of_rank(rank)
+    if source is ReservationSource.PIN:
+        return {'source': source.value, 'pin_order': rank + _PIN_RANK_SPAN}
+    tier = PRIORITY_TIERS[min(rank, len(PRIORITY_TIERS) - 1)]
+    return {'source': source.value, 'tier': tier}
+
+
 class BlockerKind(StrEnum):
     """How a module refuses a requester: a live holder, or an active park."""
 
