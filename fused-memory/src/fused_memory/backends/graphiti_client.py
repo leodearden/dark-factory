@@ -15,7 +15,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, NamedTuple, TypedDict, cast
+from typing import Any, TypedDict, cast
 from urllib.parse import urlparse
 
 from graphiti_core import Graphiti
@@ -402,23 +402,26 @@ class EdgeDict(TypedDict):
     name: str
 
 
-class StaleSummaryResult(NamedTuple):
+@dataclass(frozen=True, kw_only=True)
+class StaleSummaryResult:
     """Structured return type for detect_stale_with_edges.
 
-    Use named attribute access — the canonical idiom after Task 438/465:
+    - ``stale`` — list of stale entity dicts (each has uuid, name, summary, etc.)
+    - ``all_edges`` — dict[uuid, list[EdgeDict]] of valid edges for every scanned entity
+    - ``total_count`` — total number of entity nodes scanned
+    - ``entities_completeness`` / ``edges_completeness`` — the verdict of the
+      node read and of the edge read.  The two reads are independent, so a
+      partial edge corpus says nothing about the node corpus, and vice versa.
 
-    - ``result.stale`` — list of stale entity dicts (each has uuid, name, summary, etc.)
-    - ``result.all_edges`` — dict[uuid, list[EdgeDict]] of valid edges for every scanned entity
-    - ``result.total_count`` — total number of entity nodes scanned
-
-    Because StaleSummaryResult is a NamedTuple (a tuple subclass), positional
-    unpacking still works at runtime, but named access is the preferred idiom
-    across the codebase.
+    Keyword-only because the two verdicts share a type, so a positional
+    swap would be silent.
     """
 
     stale: list[dict]
     all_edges: dict[str, list[EdgeDict]]
     total_count: int
+    entities_completeness: 'ReadCompleteness'
+    edges_completeness: 'ReadCompleteness'
 
 
 class NodeNotFoundError(Exception):
@@ -700,6 +703,31 @@ class PagedRead:
     expected_rows: int | None
     reason: str | None
     incomplete_kind: str | None = None
+
+
+@dataclass(frozen=True)
+class ReadCompleteness:
+    """The completeness pair a consumer reports for one whole-graph read.
+
+    A PagedRead without ``rows``, which would hold the corpus a second time,
+    and without ``reason``, which is an unstable diagnostic.  Gate on
+    ``.complete is True``.
+    """
+
+    complete: bool
+    incomplete_kind: str | None
+
+    def __post_init__(self) -> None:
+        if (self.incomplete_kind is None) != self.complete:
+            raise ValueError(
+                'ReadCompleteness: incomplete_kind must be None exactly when '
+                f'complete is True, got complete={self.complete!r} '
+                f'incomplete_kind={self.incomplete_kind!r}'
+            )
+
+    @classmethod
+    def of(cls, paged: PagedRead) -> 'ReadCompleteness':
+        return cls(complete=paged.complete, incomplete_kind=paged.incomplete_kind)
 
 
 async def _census_count(graph, cypher: str, params: dict | None = None) -> int | None:
@@ -1030,12 +1058,14 @@ def apply_incompleteness_policy(
     (wire the completeness signal through to consumers) would have to move
     when the policy migrated to the consumer.  Task 4386 discharged that
     ticket, and the policy was SHARED rather than migrated: it was promoted
-    to public and is applied UNCHANGED at each of the three whole-graph
-    consumers' own call sites.  Migrating would have meant three hand-written
-    copies of the raise/warn decision — exactly the drift the paragraph above
-    names, at consumer scale, and silent in the corrupting direction.  What
-    moved to the consumers is the REPORTING of the signal, not the DECISION
-    about it; the ``log`` parameter below exists for the same reason, so a
+    to public and is applied UNCHANGED at each whole-graph consumer's own
+    call site.  The consumers are listed in one place, the "Consumers now act
+    on it" section of plans/falkordb-resultset-cap-audit.md.  Migrating would
+    have meant one hand-written copy of the raise/warn decision per consumer
+    — exactly the drift the paragraph above names, at consumer scale, and
+    silent in the corrupting direction.  What moved to the consumers is the
+    REPORTING of the signal, not the DECISION about it; the ``log``
+    parameter below exists for the same reason, so a
     sweep's warning surfaces with the rest of its cycle's diagnostics without
     the policy itself being duplicated.
 
@@ -4527,15 +4557,8 @@ class GraphitiBackend:
         RESULTSET_SIZE ceiling as get_all_valid_edges — measured counts in
         plans/falkordb-resultset-cap-audit.md.
 
-        THE COMPOUNDING HAZARD, and the reason this method is in scope for a
-        task nominally about edges: ``detect_stale_with_edges`` calls this
-        method and ``get_all_valid_edges`` on consecutive lines, and the two
-        truncations were INDEPENDENT.  An entity that survived the node cut
-        could still lose every one of its edges to the edge cut, yielding a
-        bogus "stale, zero valid facts" verdict that ``rebuild_entity_from_edges``
-        then WROTE BACK into ``n.summary``.  That makes the defect corrupting
-        rather than merely under-reporting, which is why it was fixed rather
-        than deferred.
+        Why a node read was in scope for an edge-cap task: see §History in
+        plans/falkordb-resultset-cap-audit.md.
 
         Incompleteness is handled by the same shared
         apply_incompleteness_policy get_all_valid_edges uses; see that helper.
@@ -4584,36 +4607,52 @@ class GraphitiBackend:
         any graph above the cap) that made every rate computed against it
         wrong.  With pagination it is the true node count.
 
-        PROTECTED AT THE SOURCE.  Both calls below are the back-compat shims,
-        which RAISE ``IncompleteEnumerationError`` on a structurally
-        incomplete read.  So this method can no longer manufacture a stale
-        verdict from a non-enumeration: were the edge read to return a
-        fabricated ``{}`` (or a uuid-ordered PREFIX), ``_build_stale_entry``
-        would compute ``canonical = '\\n'.join([]) == ''`` for every affected
-        entity, find ``summary != canonical`` for every non-empty summary, and
-        report the whole graph stale — which ``rebuild_entity_from_edges``
-        would then write back as ``''``.  The raise stops that before a single
-        verdict is formed.  An empirically short read still reaches here and
-        is only WARNed about; see the residual noted in the module audit.
+        Each read goes through ``apply_incompleteness_policy``, so a
+        STRUCTURALLY incomplete read raises ``IncompleteEnumerationError``
+        before a single verdict is formed.  A fabricated ``{}`` edge corpus
+        would otherwise make every non-empty summary look stale, and
+        ``rebuild_entity_from_edges`` would write ``''`` back over it.  The
+        node read is checked before the edge read is issued.  An EMPIRICALLY
+        incomplete read warns and proceeds, and its verdict is returned.
 
         Args:
             group_id: Project graph to query.
 
         Returns:
-            StaleSummaryResult with fields:
-              .stale       - list of stale entity dicts
-              .all_edges   - dict[uuid, list[EdgeDict]] of valid edges for all entities
-              .total_count - total number of entity nodes scanned
+            StaleSummaryResult, carrying the node read's and the edge read's
+            ReadCompleteness alongside the verdicts.
         """
-        entities = await self.list_entity_nodes(group_id=group_id)
-        all_edges = await self.get_all_valid_edges(group_id=group_id)
+        entities, entities_read = await self.enumerate_entity_nodes(group_id=group_id)
+        apply_incompleteness_policy(
+            entities_read,
+            method='enumerate_entity_nodes',
+            group_id=group_id,
+            returned_count=len(entities),
+            noun='nodes',
+            consequence='must not drive a staleness verdict or a summary rewrite',
+        )
+        all_edges, edges_read = await self.enumerate_all_valid_edges(group_id=group_id)
+        apply_incompleteness_policy(
+            edges_read,
+            method='enumerate_all_valid_edges',
+            group_id=group_id,
+            returned_count=len(all_edges),
+            noun='entities',
+            consequence='must not be written back',
+        )
         stale: list[dict] = []
         for entity in entities:
             edges = all_edges.get(entity['uuid'], [])
             entry = self._build_stale_entry(entity, edges)
             if entry is not None:
                 stale.append(entry)
-        return StaleSummaryResult(stale=stale, all_edges=all_edges, total_count=len(entities))
+        return StaleSummaryResult(
+            stale=stale,
+            all_edges=all_edges,
+            total_count=len(entities),
+            entities_completeness=ReadCompleteness.of(entities_read),
+            edges_completeness=ReadCompleteness.of(edges_read),
+        )
 
     @_canonicalize_group_args
     async def detect_stale_dry_run(
