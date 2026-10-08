@@ -1,0 +1,86 @@
+{
+  "pricing": {
+    "usd_per_mtok_input": 0.15,
+    "usd_per_mtok_output": 0.6
+  },
+  "pricing_arm_id": "incumbent-generic-a",
+  "production": {
+    "by_day": [
+      {
+        "day": "2026-10-05",
+        "usd": 1.4151847499999999,
+        "writes": 412
+      },
+      {
+        "day": "2026-10-06",
+        "usd": 1.34953755,
+        "writes": 402
+      },
+      {
+        "day": "2026-10-07",
+        "usd": 2.8178997,
+        "writes": 842
+      },
+      {
+        "day": "2026-10-08",
+        "usd": 0.62170815,
+        "writes": 194
+      }
+    ],
+    "by_project": [
+      {
+        "project_id": "dark_factory",
+        "usd": 1.8035748,
+        "writes": 551
+      },
+      {
+        "project_id": "reify",
+        "usd": 1.1552109,
+        "writes": 361
+      },
+      {
+        "project_id": "scoping_intake",
+        "usd": 0.01104645,
+        "writes": 6
+      },
+      {
+        "project_id": "solar_challenge",
+        "usd": 1.82172585,
+        "writes": 499
+      },
+      {
+        "project_id": "solar_challenge_platform",
+        "usd": 1.41277215,
+        "writes": 433
+      }
+    ],
+    "days": 2.983708364375,
+    "failed_writes": 53,
+    "input_tokens": 34648989,
+    "llm_calls": 18104,
+    "output_tokens": 1678303,
+    "projected_usd_per_30_days": 62.38207015215068,
+    "tokens_per_write": 19636.374054054053,
+    "usd": 6.20433015,
+    "usd_per_day": 2.0794023384050226,
+    "usd_per_ok_write": 0.0034526044240400667,
+    "window_end": "2026-10-08T11:00:00Z",
+    "window_start": "2026-10-05T11:23:27.597318Z",
+    "writes": 1850
+  },
+  "replay": [
+    {
+      "arm_id": "incumbent-generic-a",
+      "n": 200,
+      "tokens_per_episode": 15688.47,
+      "usd_per_episode": 0.0027364319999999996
+    },
+    {
+      "arm_id": "incumbent-generic-b",
+      "n": 200,
+      "tokens_per_episode": 15836.355,
+      "usd_per_episode": 0.002764701
+    }
+  ],
+  "schema_version": 1
+}
