@@ -908,6 +908,10 @@ def _ledger_fault(
     return outcome
 
 
+def _trickle_run_ref(cfg: LegibilityConfig, target_date: date) -> str:
+    return f'trickle-{cfg.project_id}-{target_date:%Y%m%d}'
+
+
 def _ledger_coded_sessions(
     cfg: LegibilityConfig, records, target_date: date, now: datetime | None,
 ) -> _LedgerWrite:
@@ -919,7 +923,7 @@ def _ledger_coded_sessions(
         rows = session_ledger.rows_for(
             records,
             coded_by=session_ledger.CodedBy.TRICKLE,
-            run_ref=f'trickle-{cfg.project_id}-{target_date:%Y%m%d}',
+            run_ref=_trickle_run_ref(cfg, target_date),
             instrument_version=digest.DIGEST_INSTRUMENT_VERSION,
             coded_at=now if now is not None else datetime.now(UTC),
         )
@@ -936,6 +940,23 @@ def _ledger_coded_sessions(
         cfg.project_id, target_date.isoformat(), written, 0,
     )
     return _LedgerWrite(written=written, failed=0, error=None)
+
+
+def _report_invariant_slugs(
+    cfg: LegibilityConfig,
+    target_date: date,
+    tally: codebook.SlugTally,
+    invariant_slugs: Sequence[str],
+) -> None:
+    """Journal what the merger kept and dropped of the night's
+    ``invariant_violated`` values, and warn once naming the dropped ones."""
+    logger.info(
+        'legibility trickle: project=%s date=%s invariant slugs: %d valid, %d rejected',
+        cfg.project_id, target_date.isoformat(), tally.valid, len(tally.rejected),
+    )
+    codebook.warn_unknown_invariant_slugs(
+        tally, invariant_slugs, run=_trickle_run_ref(cfg, target_date),
+    )
 
 
 def _report_sample_outcome(
@@ -1521,6 +1542,7 @@ def run_nightly(
 
         applied = 0
         conflicts = 0
+        slug_tally = codebook.SlugTally()
         deletion_skipped: list[str] = []
         merged_records = []
         for record in run.records:
@@ -1549,6 +1571,7 @@ def run_nightly(
                 continue
             merged_records.append(record)
             conflicts += stats['candidate_disposition_conflicts']
+            slug_tally = slug_tally.plus(stats['invariant_slugs'])
             # A conflict-appended sighting IS a codebook mutation (a
             # recurrence appended to an already-adjudicated candidate), so it
             # must count toward the dump/commit gate below -- otherwise a
@@ -1566,6 +1589,7 @@ def run_nightly(
                 + stats['corrections_applied']
             )
 
+        _report_invariant_slugs(cfg, target_date, slug_tally, invariant_slugs)
         if conflicts:
             logger.info(
                 'legibility trickle: %d candidate sighting(s) appended to an '
