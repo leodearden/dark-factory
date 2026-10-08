@@ -1311,6 +1311,20 @@ def test_screen_never_overwrites_an_existing_verdict(harness, tmp_path, capsys):
     assert str(inputs.out) in err
 
 
+def test_screen_refuses_a_misshapen_arms_manifest_naming_it(harness, tmp_path, capsys):
+    inputs = _screen_inputs(tmp_path)
+    inputs.arms_manifest.write_text('arms:\n  - not-a-mapping\n')
+
+    code = harness.main(inputs.argv(), deps=_offline)
+
+    assert code == harness.EXIT_REFUSED
+    assert not inputs.out.exists()
+    err = capsys.readouterr().err
+    assert err.startswith('error: ')
+    assert str(inputs.arms_manifest) in err
+    assert 'not mappings' in err
+
+
 def test_screen_refuses_invalid_evidence_naming_the_error(harness, tmp_path, capsys):
     missing_moe = {k: v for k, v in SURVIVOR_FAIL_UNSERVED.items() if k != 'moe-stretch'}
     inputs = _screen_inputs(tmp_path, missing_moe)

@@ -150,6 +150,27 @@ def test_refuses_an_unquoted_yaml_reasoning_on_rather_than_coercing_the_bool(tmp
         load_llm_slate(path)
 
 
+@pytest.mark.parametrize(
+    ('text', 'fragment'),
+    [
+        ('arms: [\n', 'not parseable YAML'),
+        ('- arm_id: qwen3.5-9b\n', 'is a mapping'),
+        ('port_block: [8410, 8417]\n', 'is a list'),
+        ('arms:\n  arm_id: qwen3.5-9b\n', 'is a list'),
+        ('arms:\n  - axis: embedding\n  - just-a-string\n', 'entries [1] are not mappings'),
+    ],
+    ids=['malformed-yaml', 'top-level-list', 'no-arms', 'arms-not-a-list', 'non-mapping-entry'],
+)
+def test_refuses_a_manifest_of_the_wrong_shape_naming_it(tmp_path, text, fragment):
+    path = _write(tmp_path, text)
+
+    with pytest.raises(ValueError) as raised:
+        load_llm_slate(path)
+
+    assert str(path) in str(raised.value)
+    assert fragment in str(raised.value)
+
+
 def test_refuses_duplicate_arm_ids(tmp_path):
     path = _write(tmp_path, FIXTURE.replace('arm_id: moe-stretch', 'arm_id: qwen3.5-9b'))
 

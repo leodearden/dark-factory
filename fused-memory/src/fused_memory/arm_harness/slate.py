@@ -45,12 +45,26 @@ class SlateArm(BaseModel):
 
 def load_llm_slate(path: Path | str) -> tuple[SlateArm, ...]:
     manifest_path = Path(path)
-    entries = yaml.safe_load(manifest_path.read_text())['arms']
+    entries = _arm_entries(manifest_path)
     slate = tuple(
         _slate_arm(manifest_path, entry) for entry in entries if entry.get('axis') == LLM_AXIS
     )
     _require_unique_arm_ids(manifest_path, slate)
     return slate
+
+
+def _arm_entries(manifest_path: Path) -> list[dict[str, object]]:
+    try:
+        document = yaml.safe_load(manifest_path.read_text())
+    except yaml.YAMLError as error:
+        raise ValueError(f'{manifest_path}: not parseable YAML: {error}') from error
+    entries = document.get('arms') if isinstance(document, dict) else None
+    if not isinstance(entries, list):
+        raise ValueError(f'{manifest_path}: an arms manifest is a mapping whose `arms` is a list')
+    misshapen = [index for index, entry in enumerate(entries) if not isinstance(entry, dict)]
+    if misshapen:
+        raise ValueError(f'{manifest_path}: `arms` entries {misshapen} are not mappings')
+    return entries
 
 
 def _slate_arm(manifest_path: Path, entry: Mapping[str, object]) -> SlateArm:

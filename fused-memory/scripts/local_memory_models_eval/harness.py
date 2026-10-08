@@ -526,7 +526,7 @@ def _cmd_screen(args: argparse.Namespace, deps: DepsFactory) -> int:
 def _read_slate(path: Path) -> tuple[SlateArm, ...]:
     try:
         return load_llm_slate(path)
-    except (OSError, ValueError, LookupError, TypeError) as error:
+    except (OSError, ValueError) as error:
         raise _Refusal(EXIT_REFUSED, f'{path} is not a readable arms manifest: {error}') from error
 
 
