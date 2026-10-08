@@ -386,7 +386,7 @@ def _return_label_exprs(badge_body: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-# The seven top-level keys of ``redux_api.shape_memory_evals``'s return body.
+# The eight top-level keys of ``redux_api.shape_memory_evals``'s return body.
 # This list IS the payload contract (that fn's own docstring says so, per PRD
 # open question 4); the React section consumes exactly these spellings.
 _MEMORY_EVALS_CONTRACT_KEYS = (
@@ -397,11 +397,12 @@ _MEMORY_EVALS_CONTRACT_KEYS = (
     'issues',
     'issue_count',
     'unmatched_escalations',
+    'escalation_queue',
 )
 
 
 def test_data_js_registers_memory_evals_endpoint(data_js_body: str) -> None:
-    """data.js must register /api/v2/dashboard/memory-evals -> ['MEMORY_EVALS']
+    """data.js must register /api/v2/dashboard/memory-evals -> {'MEMORY_EVALS': SPEC}
     and seed DF_DATA.MEMORY_EVALS with the server's own default body.
 
     The seed is asserted key-by-key against the ``shape_memory_evals`` contract
@@ -415,17 +416,22 @@ def test_data_js_registers_memory_evals_endpoint(data_js_body: str) -> None:
     assert '/api/v2/dashboard/memory-evals' in data_js_body, (
         "data.js does not register '/api/v2/dashboard/memory-evals'. Add a "
         'static (non-windowed) row to endpointsFor() mapping it to '
-        "['MEMORY_EVALS']."
+        "{'MEMORY_EVALS': <spec>}."
     )
 
     # (b) key and value must be checked as a PAIR — two independent substring
     # hits would pass even if the endpoint mapped to some other DF_DATA key.
+    # The mapped value is a key->spec OBJECT, and the spec is matched as a bare
+    # identifier (`PLAIN`/`DATUM`) rather than pinned to one of them: which spec
+    # a row carries is data.js's to flip, and this test is about WHICH KEY the
+    # endpoint feeds.  The closing brace has to follow immediately, so
+    # 'MEMORY_EVALS' must be the row's only entry.
     assert re.search(
-        r"""['"]/api/v2/dashboard/memory-evals['"]\s*:\s*\[\s*['"]MEMORY_EVALS['"]\s*,?\s*\]""",
+        r"""['"]/api/v2/dashboard/memory-evals['"]\s*:\s*\{\s*['"]MEMORY_EVALS['"]\s*:\s*\w+\s*,?\s*\}""",
         data_js_body,
     ), (
         "data.js's endpointsFor() must map '/api/v2/dashboard/memory-evals' to "
-        "exactly ['MEMORY_EVALS']."
+        "exactly one key spec, {'MEMORY_EVALS': <spec>}."
     )
 
     # (c) the DF_DATA seed block exists
@@ -436,7 +442,7 @@ def test_data_js_registers_memory_evals_endpoint(data_js_body: str) -> None:
         'reads undefined and crashes the Memory tab.'
     )
 
-    # (d) exactly the seven contract keys — no more, no fewer
+    # (d) exactly the eight contract keys — no more, no fewer
     for key in _MEMORY_EVALS_CONTRACT_KEYS:
         assert re.search(rf'\b{key}\s*:', seed_block), (
             f"data.js MEMORY_EVALS seed is missing the '{key}' key required by "
@@ -457,6 +463,10 @@ def test_data_js_registers_memory_evals_endpoint(data_js_body: str) -> None:
     )
     assert re.search(r'\bgenerated_at\s*:\s*null\b', seed_block), (
         'data.js MEMORY_EVALS seed must default generated_at to `null`.'
+    )
+    assert re.search(r'\bescalation_queue\s*:\s*null\b', seed_block), (
+        'data.js MEMORY_EVALS seed must default escalation_queue to `null` — the '
+        "server's default body names no queue, so a pre-fetch link renders disabled."
     )
     assert re.search(r'\bstorm_escape\s*:\s*null\b', seed_block), (
         'data.js MEMORY_EVALS seed must default storm_escape to `null` — a '
@@ -568,13 +578,9 @@ def test_index_html_registers_tab_memory_evals_load_order(
     # (b2) memory_evals_fmt.js specifically must be a CLASSIC script — no type
     #      at all, not even text/babel. assert_script_loads_before already
     #      rejects defer/async/type=module; what this adds is the failure MODE a
-    #      `type="text/babel"` .js has, which is silence: Babel-standalone would
-    #      transform it out of the classic-script shared global scope, and
-    #      classic_script_scope.test.mjs's CLASSIC_SCRIPT_RE (which matches only
-    #      `<script src="/static/redux/NAME.js?v=NN"></script>`) would stop
-    #      seeing the file at all. That suite does catch it — its registry entry
-    #      would go unmatched — but it reports a missing script, not a wrong
-    #      tag shape, so this names the actual cause.
+    #      `type="text/babel"` .js has: classic_script_scope.test.mjs catches it
+    #      too, but reports an unmatched script, not a wrong tag shape, so this
+    #      names the actual cause.
     fmt_found = find_script_position(index_html_body, '/static/redux/memory_evals_fmt.js')
     assert fmt_found is not None, (
         'No <script src="/static/redux/memory_evals_fmt.js..."> tag in '
@@ -585,9 +591,8 @@ def test_index_html_registers_tab_memory_evals_load_order(
     assert fmt_attrs.get('type') is None, (
         'memory_evals_fmt.js is plain JS, so its <script> tag must carry NO type '
         f'attribute; got type={fmt_attrs.get("type")!r}. A text/babel .js would be '
-        'handed to Babel-standalone and would not join the shared classic-script '
-        'global scope, and classic_script_scope.test.mjs would stop matching the '
-        'tag entirely.'
+        'handed to Babel-standalone instead of loading as the classic script '
+        'classic_script_scope.test.mjs expects.'
     )
 
     # (c) THE load-bearing assertion — before tabs.jsx.
@@ -778,7 +783,7 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
         (r'\{\s*ev\.truncated\s*&&\s*\(',),
     ),
     (
-        # `localStorage` is real code in this file (the persisted open-state
+        # `localStorage` was real code in this file (the persisted open-state
         # helpers), so the old alternation stayed green with `<details` deleted
         # — it was answered by a different feature entirely. `\s` spans the
         # newline before `open={provOpen}`.
@@ -862,14 +867,20 @@ _PRESENCE_CONTRACTS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ),
     (
         # The producer end of the escalation-link contract, and the exact site
-        # `test_memory_evals_escalation_id_contract.py` is built around: the id
-        # handed to `onNavigate` is what `tab_escalations.jsx` resolves with
-        # `row.id === id`.  Not comment-answered today, but the .jsx prose does
-        # discuss the navigation handoff, so one sentence naming the call is all
-        # it would take — which is the latent false pass this entry closes.
-        'escalation link navigates by id',
-        r"onNavigate\(\s*'esc'\s*,\s*escalation\.id\s*\)",
-        (r"onNavigate\(\s*'esc'\s*,\s*escalation\.id\s*\)",),
+        # `test_memory_evals_escalation_id_contract.py` is built around: the
+        # `(queue, id)` descriptor handed to `onNavigate` is what
+        # `escalation_focus.js::findEscalationRow` resolves.  A bare
+        # `escalation.id` second argument does not satisfy it.  The .jsx prose
+        # discusses the navigation handoff, so one sentence naming the call is
+        # all it would take to answer a raw-body grep.
+        'escalation link navigates by queue and id',
+        r"onNavigate\(\s*'esc'\s*,\s*\{\s*queue\s*:\s*payload\.escalation_queue\s*,\s*id\s*:\s*escalation\.id\s*,?\s*\}\s*\)",
+        (r"onNavigate\(\s*'esc'\s*,\s*\{\s*queue\s*:\s*payload\.escalation_queue\s*,\s*id\s*:\s*escalation\.id\s*,?\s*\}\s*\)",),
+    ),
+    (
+        'escalation link opens through its callback',
+        r'onOpenEscalation\(\s*escalation\s*\)',
+        (r'onOpenEscalation\(\s*escalation\s*\)',),
     ),
     (
         # The `MEDF\.` disjunct is a spelling pin that nothing matches today
@@ -1880,11 +1891,9 @@ def test_pure_helpers_are_consumed_from_the_fmt_module(
     Task 3481 moved them into a plain-JS classic script so `node --test` can
     execute their branching (dashboard/tests/js/memory_evals_fmt.test.mjs)
     instead of this file grepping their source text.  Two copies would drift
-    silently: Babel-standalone downlevels .jsx top-level bindings out of the
-    classic-script shared global scope, so the "Identifier X has already been
-    declared" failure that protects the .js modules from each other
-    (dashboard/tests/js/classic_script_scope.test.mjs) would NOT fire here.
-    This test is the substitute for that protection.
+    silently: a .jsx redefinition of a classic `function` loads without error
+    (the SCOPE note in dashboard/tests/js/classic_script_scope.test.mjs), so
+    this test is the substitute for a load-time guard.
     """
     code = tab_memory_evals_jsx_code
 
@@ -2241,9 +2250,9 @@ def test_a_holed_trend_is_drawn_and_its_missing_samples_disclosed(
     assert not re.search(r'\bfunction\s+trendGaps\s*\(', code), (
         'tab_memory_evals.jsx must NOT define `trendGaps` — it moved to '
         'memory_evals_fmt.js (task 3481) so node can execute it. Two '
-        'definitions would drift, and the classic-script shared global scope '
-        'would not even catch it, since Babel downlevels .jsx top-level '
-        'bindings out of that scope.'
+        'definitions would drift, and no load error would catch it: a .jsx '
+        'redefinition of a classic `function` is legal (the SCOPE note in '
+        'dashboard/tests/js/classic_script_scope.test.mjs).'
     )
     assert 'window.DF_MEMORY_EVALS_FMT' in code, (
         'tab_memory_evals.jsx must obtain `trendGaps` from '
@@ -2738,7 +2747,7 @@ def test_limits_provenance_rendered(
     # Compact / expandable so provenance does not dominate the card.
     #
     # Narrowed to the <details> element carrying an `open=` attribute. The old
-    # alternation also accepted `localStorage`, which is real code in this file
+    # alternation also accepted `localStorage`, which was real code in this file
     # for the persisted open-state helpers — so it stayed green with `<details`
     # deleted, answered by a different feature entirely.
     #
@@ -2843,18 +2852,14 @@ def test_limits_provenance_open_state_is_per_eval(
         'rather than per-section.'
     )
     initializer = state_decl.group(3)
-    read_helpers = sorted({
-        fn[0]
-        for m in re.finditer(r'localStorage\.getItem\(', code)
-        if (fn := _enclosing_function(code, m.start())) is not None
-    })
+    read_helpers = _policy_helpers(code, 'readPersisted')
     assert read_helpers, (
-        'no function in tab_memory_evals.jsx reads localStorage — the '
+        'no function in tab_memory_evals.jsx reads through readPersisted — the '
         'provenance open state must still be PERSISTED across reloads.'
     )
     assert any(re.search(r'\b' + re.escape(h) + r'\s*\(', initializer) for h in read_helpers), (
         f'the state initializer {initializer.strip()!r} does not call the '
-        f'localStorage read helper (one of {read_helpers}). The stored open '
+        f'persisted read helper (one of {read_helpers}). The stored open '
         'state must seed the component exactly once at mount.'
     )
 
@@ -2881,7 +2886,7 @@ def test_limits_provenance_open_state_is_per_eval(
     )
 
     # (d) the persisted key is derived from the EVAL IDENTITY, so the key
-    #     expression reaching localStorage varies per card.
+    #     expression reaching storage varies per card.
     assert re.search(r'\bev\.eval_id\b', prov_body), (
         'LimitsProvenance never reads `ev.eval_id`, so its persisted open-state '
         'key cannot vary per eval — one card\'s toggle would expand every other '
@@ -2891,24 +2896,54 @@ def test_limits_provenance_open_state_is_per_eval(
     # (e) the read and write helpers take the key as a PARAMETER rather than
     #     closing over one module constant. This is what makes a single global
     #     key structurally unrepresentable, not merely absent today.
-    for call in ('getItem', 'setItem'):
-        sites = list(re.finditer(
-            r'localStorage\.' + call + r'\(\s*([\w.]+)', code
-        ))
-        assert sites, f'no `localStorage.{call}(` call site found in tab_memory_evals.jsx.'
+    for call in ('readPersisted', 'writePersisted'):
+        sites = list(re.finditer(r'\b' + call + r'\(\s*([\w.]+)', code))
+        assert sites, f'no `{call}(` call site found in tab_memory_evals.jsx.'
         for site in sites:
             first_arg = site.group(1)
             enclosing = _enclosing_function(code, site.start())
             assert enclosing is not None, (
-                f'a `localStorage.{call}(` call sits at module scope — the '
+                f'a `{call}(` call sits at module scope — the '
                 'storage key must be a parameter of an enclosing helper.'
             )
             fn_name, param_names = enclosing
             assert first_arg in param_names, (
-                f'`{fn_name}` passes {first_arg!r} to localStorage.{call}() but '
+                f'`{fn_name}` passes {first_arg!r} to {call}() but '
                 f'its parameters are {param_names}. The storage key must be a '
                 'PARAMETER, so a single module-global key shared by every eval '
                 'card is unrepresentable rather than merely not-currently-written.'
+            )
+
+
+def _policy_helpers(code: str, call: str) -> list[str]:
+    """Names of the functions in *code* that call persisted_state.js's *call*."""
+    return sorted({
+        fn[0]
+        for m in re.finditer(r'\b' + call + r'\s*\(', code)
+        if (fn := _enclosing_function(code, m.start())) is not None
+    })
+
+
+def test_provenance_open_state_persists_through_the_policy_module(
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """The provenance open state is stored through persisted_state.js, as a boolean.
+
+    The helpers wrote '1'/'0' straight to localStorage inside a catch that
+    swallowed a failure.  The policy module stores a JSON boolean, drops the key
+    while the state is the default (collapsed), and warns on a failed write.
+    A legacy '1' still reads truthy; a legacy '0' reads falsy and is swept.
+    What every consumer of the module shares — binding, no direct localStorage,
+    no empty catch — is checked once, in test_persisted_state_consumers.py.
+    """
+    code = tab_memory_evals_jsx_code
+    for call in ('readPersisted', 'writePersisted'):
+        helpers = _policy_helpers(code, call)
+        assert helpers, f'no provenance helper in tab_memory_evals.jsx calls `{call}(`.'
+        for helper in helpers:
+            assert not re.search(r"""['"][01]['"]""", extract_function_body(code, helper)), (
+                f"`{helper}` still encodes the open state as '1'/'0'; pass the boolean "
+                'to the policy module, which stores it as JSON.'
             )
 
 
@@ -3119,7 +3154,7 @@ def test_escalation_link_navigation_is_wired(
     and threads a handler down.
     """
     # (a) the handler wired to <MemoryTab onNavigate={...}> must switch the tab
-    #     AND record the focus id into the SAME state <EscalationsTab focusId=
+    #     AND record the focus into the SAME state <EscalationsTab focus=
     #     {...}> reads.
     #
     #     Every identifier below is DERIVED from the cross-file prop contract,
@@ -3134,16 +3169,16 @@ def test_escalation_link_navigation_is_wired(
     assert handler is not None, (
         'app.jsx must pass a named handler to <MemoryTab onNavigate={...}>.'
     )
-    focus_state = re.search(r'<EscalationsTab[^>]*focusId=\{(\w+)\}', app_jsx_body)
+    focus_state = re.search(r'<EscalationsTab[^>]*\bfocus=\{(\w+)\}', app_jsx_body)
     assert focus_state is not None, (
-        'app.jsx must pass a state variable to <EscalationsTab focusId={...}>.'
+        'app.jsx must pass a state variable to <EscalationsTab focus={...}>.'
     )
     setter = re.search(
         r'const\s*\[\s*' + re.escape(focus_state.group(1)) + r'\s*,\s*(\w+)\s*\]\s*=\s*uS\(',
         app_jsx_body,
     )
     assert setter is not None, (
-        f'the id passed to <EscalationsTab focusId must be React state, but no '
+        f'the focus passed to <EscalationsTab focus must be React state, but no '
         f'`const [{focus_state.group(1)}, set...] = uS(` declaration exists.'
     )
     nav = re.search(
@@ -3157,23 +3192,23 @@ def test_escalation_link_navigation_is_wired(
     )
     nav_body = nav.group(1)
     assert setter.group(1) + '(' in nav_body, (
-        f'`{handler.group(1)}` must record the focus id via `{setter.group(1)}(`, '
+        f'`{handler.group(1)}` must record the focus via `{setter.group(1)}(`, '
         'the same state <EscalationsTab reads. Writing it anywhere else means '
         f'the link switches tab and lands on an unfocused list. Body: {nav_body!r}'
     )
     assert set(re.findall(r'\b(set\w+)\s*\(', nav_body)) - {setter.group(1)}, (
-        f'`{handler.group(1)}` records the focus id but never switches the tab, '
+        f'`{handler.group(1)}` records the focus but never switches the tab, '
         f'so the link highlights an escalation the operator cannot see. '
         f'Body: {nav_body!r}'
     )
 
-    # (b)/(c) the handler reaches MemoryTab and the focus id reaches EscalationsTab.
+    # (b)/(c) the handler reaches MemoryTab and the focus reaches EscalationsTab.
     assert re.search(r'<MemoryTab[^>]*onNavigate=\{', app_jsx_body), (
         'app.jsx must pass onNavigate to <MemoryTab at the `case \'memory\':` '
         'branch — otherwise the section renders its link disabled.'
     )
-    assert re.search(r'<EscalationsTab[^>]*focusId=\{', app_jsx_body), (
-        'app.jsx must pass the focus id into <EscalationsTab.'
+    assert re.search(r'<EscalationsTab[^>]*\bfocus=\{', app_jsx_body), (
+        'app.jsx must pass the focus into <EscalationsTab.'
     )
     assert re.search(r'<EscalationsTab[^>]*onFocusConsumed=\{', app_jsx_body), (
         'app.jsx must pass onFocusConsumed into <EscalationsTab so the focus '
@@ -3190,18 +3225,18 @@ def test_escalation_link_navigation_is_wired(
 
     # (e) tab_escalations.jsx consumes the focus and clears it.
     assert re.search(
-        r'function\s+EscalationsTab\s*\(\s*\{[^}]*\bfocusId\b', tab_escalations_jsx_body
-    ), 'EscalationsTab must accept a `focusId` prop.'
+        r'function\s+EscalationsTab\s*\(\s*\{[^}]*\bfocus\b', tab_escalations_jsx_body
+    ), 'EscalationsTab must accept a `focus` prop.'
     assert re.search(
         r'function\s+EscalationsTab\s*\(\s*\{[^}]*\bonFocusConsumed\b',
         tab_escalations_jsx_body,
     ), 'EscalationsTab must accept an `onFocusConsumed` prop.'
     effect = re.search(
-        r'uE\(\(\)\s*=>\s*\{([\s\S]{0,900}?)\n\s*\},\s*\[[^\]]*focusId[^\]]*\]\)',
+        r'uE\(\(\)\s*=>\s*\{([\s\S]{0,900}?)\n\s*\},\s*\[[^\]]*\bfocus\b[^\]]*\]\)',
         tab_escalations_jsx_body,
     )
     assert effect is not None, (
-        'EscalationsTab must run a `uE` effect keyed on `focusId`.'
+        'EscalationsTab must run a `uE` effect keyed on `focus`.'
     )
     eff = effect.group(1)
     assert 'setSelected(' in eff, (
@@ -3218,14 +3253,76 @@ def test_escalation_link_navigation_is_wired(
 
     # (f) the producer end of the contract, re-asserted here — over
     #     COMMENT-STRIPPED source, and through `_PRESENCE_CONTRACTS` so the
-    #     mutation guard covers it.  The id this call passes is what
-    #     tab_escalations.jsx resolves with `row.id === id`, which is the
-    #     contract `test_memory_evals_escalation_id_contract.py` checks on the
-    #     payload side; a sentence in the .jsx prose naming the call must not be
-    #     able to stand in for the call.
+    #     mutation guard covers it.  The descriptor this call passes is what
+    #     escalation_focus.js::findEscalationRow resolves by `(queue, id)`, which
+    #     is the contract `test_memory_evals_escalation_id_contract.py` checks on
+    #     the payload side; a sentence in the .jsx prose naming the call must not
+    #     be able to stand in for the call.
     code = tab_memory_evals_jsx_code
     assert re.search(
-        _presence_pattern('escalation link navigates by id', code), code, re.MULTILINE
+        _presence_pattern('escalation link navigates by queue and id', code), code, re.MULTILINE
     ), (
-        "tab_memory_evals.jsx's link must call onNavigate('esc', escalation.id)."
+        "tab_memory_evals.jsx's link must call "
+        "onNavigate('esc', { queue: payload.escalation_queue, id: escalation.id })."
     )
+
+
+def test_memory_eval_links_open_through_one_queue_bound_callback(
+    tab_memory_evals_jsx_code: str,
+) -> None:
+    """The section binds the payload's queue once; every link opens through it.
+
+    The queue is a payload-level fact (`MEMORY_EVALS.escalation_queue`), so
+    `MemoryEvalsSection` reads it where it reads the payload and hands the inner
+    components one `onOpenEscalation(escalation)` callback.  The leaf never
+    learns the `'esc'` tab id or the descriptor's shape.  With no queue named
+    there is no callback, so the link renders disabled rather than matching
+    across queues.
+    """
+    code = tab_memory_evals_jsx_code
+    section = extract_function_body(code, 'MemoryEvalsSection')
+
+    # (a) the descriptor is built in the section, from the payload's queue.
+    assert re.search(
+        _presence_pattern('escalation link navigates by queue and id', code), section
+    ), 'MemoryEvalsSection must build the (queue, id) descriptor it hands onNavigate.'
+
+    # (b) no queue, no callback: the descriptor is gated on the queue.
+    assert re.search(r'&&\s*payload\.escalation_queue\b|payload\.escalation_queue\s*\?', section), (
+        'the bound callback must exist only when the payload names its queue; '
+        'without one the link has nothing to scope its lookup by.'
+    )
+
+    # (c) onNavigate never leaves the section, so no leaf knows the tab id.
+    signature = re.compile(r'function\s+MemoryEvalsSection\s*\(\s*\{[^}]*\}\s*\)')
+    outside = signature.sub('', code.replace(section, ''))
+    assert 'onNavigate' not in outside, (
+        'onNavigate is referenced outside MemoryEvalsSection. The inner components '
+        'take the queue-bound onOpenEscalation callback instead.'
+    )
+
+    # (d) every inner component that renders a link receives the bound callback.
+    for component in ('StormBanner', 'MemoryEvalCard', 'UnmatchedEscalations'):
+        assert re.search(rf'<{component}\b[^>]*\bonOpenEscalation=\{{', section), (
+            f'MemoryEvalsSection must pass onOpenEscalation to <{component}>.'
+        )
+    card = extract_function_body(code, 'MemoryEvalCard')
+    assert re.search(r'<MemoryEvalMetricRow\b[^>]*\bonOpenEscalation=\{', card), (
+        'MemoryEvalCard must pass onOpenEscalation on to <MemoryEvalMetricRow>.'
+    )
+
+    # (e) the link opens through the callback, and is disabled without it.
+    signature_props = re.search(r'function\s+EscalationLink\s*\(\s*\{([^}]*)\}', code)
+    assert signature_props is not None and re.search(
+        r'\bonOpenEscalation\b', signature_props.group(1)
+    ), 'EscalationLink must take an `onOpenEscalation` prop.'
+    link = extract_function_body(code, 'EscalationLink')
+    assert re.search(
+        _presence_pattern('escalation link opens through its callback', code), link
+    ), 'EscalationLink must call onOpenEscalation(escalation).'
+    disabled = re.search(r'disabled=\{\s*!\s*(\w+)\s*\}', link)
+    assert disabled is not None, 'EscalationLink must render `disabled={!...}`.'
+    gate = disabled.group(1)
+    assert gate == 'onOpenEscalation' or re.search(
+        rf'const\s+{re.escape(gate)}\s*=\s*!!\s*onOpenEscalation\b', link
+    ), f'EscalationLink is disabled on `{gate}`, which is not derived from onOpenEscalation.'

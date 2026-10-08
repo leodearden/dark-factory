@@ -1,27 +1,54 @@
 """System prompt for Stage 1: Memory Consolidator."""
 
+from fused_memory.memory_metadata import render_metadata_vocabulary_guidance
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
 )
+from fused_memory.reconciliation.gate_owned_finding_phrasing import (
+    render_gate_owned_action_norm,
+)
 from fused_memory.reconciliation.internal_writers import (
     INTERNAL_WRITER_POPULATION_NOTE,
+)
+from fused_memory.reconciliation.live_workflow_section import (
+    NOT_LIVE_TOKEN,
+    render_live_workflow_authority_rules,
 )
 from fused_memory.reconciliation.prompts import (
     _STAGE1_GRAPHITI_QUEUED_GUIDANCE,
     _STAGE1_PROJECT_ID_GUIDELINE,
     AMEND_AND_EPISODE_TOOLS_BLOCK,
+    CITATION_REPAIR_TOOL_BLOCK,
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
+    FLAG_FOR_STAGE2_MARKER_KIND,
+    REFERENT_DECLARATION_GUIDANCE,
     STALE_KNOWLEDGE_ANNOTATION_NORM,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
     render_finding_provenance_section,
 )
 from fused_memory.reconciliation.recon_self_model import (
+    MEM0_TOMBSTONE_DELETERS,
     render_entity_standing_decision_schema_section,
     render_marker_lifecycle_section,
     render_source_completion_section,
     render_suppression_schema_section,
 )
+from fused_memory.reconciliation.stage1_stall_detector import (
+    STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS,
+)
+from fused_memory.server.grouped_read import CHILD_KINDS, PARENT_ID_KEY
+
+_STAGE1_GATE_STALL_THRESHOLD_HOURS = int(
+    STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS // 3600
+)
+"""Stall threshold in whole hours, for the Escalation-Probe Precondition below.
+
+Derived from ``stage1_stall_detector.py::STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS``
+rather than restated, so the detector stays the single owner of the number and a
+future change to it cannot leave stale prompt text behind.  Pinned by
+``tests/test_recon_escalation_probe_precondition.py``.
+"""
 
 #: The cluster-fold execution section's title and heading (task 3134), exported
 #: so a rename moves the prompt and the wiring pins in
@@ -30,6 +57,28 @@ from fused_memory.reconciliation.recon_self_model import (
 #: byte-identical body turns them red for no behavioural reason.
 EXECUTING_A_CLUSTER_FOLD_TITLE = 'Executing a Cluster Fold'
 EXECUTING_A_CLUSTER_FOLD_HEADING = f'## {EXECUTING_A_CLUSTER_FOLD_TITLE}'
+
+#: The live-state freshness section's heading (task 5271), exported for the
+#: same reason, for ``tests/reconciliation/test_stage1.py``.
+LIVE_STATE_FRESHNESS_TITLE = 'Live-State Freshness Before Re-Flagging'
+LIVE_STATE_FRESHNESS_HEADING = f'## {LIVE_STATE_FRESHNESS_TITLE}'
+
+_CHILD_KIND_NAMES = ' or '.join(f'`{kind}`' for kind in sorted(CHILD_KINDS))
+
+#: The Authority-Model carve-out for child memories (task 6193), exported so
+#: tests mirror ``server/grouped_read.py::CHILD_KINDS`` against it.
+CHILD_MEMORY_AUTHORITY_RULE = (
+    f'- A Mem0 memory whose metadata carries `{PARENT_ID_KEY}` with a `kind` of '
+    f'{_CHILD_KIND_NAMES} is a CHILD of the memory that `{PARENT_ID_KEY}` names, not a '
+    f"duplicate of it; the payload shows that link beside the memory's id. Never delete a "
+    f'child to dedupe it against its parent or a sibling child — neither via '
+    f"`delete_memory` nor by listing it in `consolidate_memories`' `supersedes`. This "
+    f'overrides the duplicate rule above: a sighting restates its parent by design and is '
+    f"what the parent's sighting count counts, and an amendment holds the only copy of its "
+    f'newer text.'
+)
+
+_DOCUMENTED_SWEEP_DELETERS = ', '.join(f'`{d}`' for d in MEM0_TOMBSTONE_DELETERS)
 
 STAGE1_SYSTEM_PROMPT = f"""\
 You are a Memory Consolidator agent operating in sleep mode. Your role is to review and \
@@ -70,8 +119,17 @@ against the ReconLedgerStore `cycle_summary` row (the source of truth written by
 `write_cycle_summary` / `write_stage1_cycle_summary`), as opposed to \
 `count_memories_by_metadata`'s best-effort Mem0 mirror query. Returns \
 `{{'present': bool, 'ledger_available': bool, 'project_id': ..., 'run_id': ..., \
-'stage': ...}}`. `ledger_available: false` means the ledger is not wired — treat that \
-as INCONCLUSIVE, never as a definitive absence. Use this as the PRIMARY cycle-summary \
+'stage': ..., 'remediation': bool|null, 'reason': str, 'expected': bool|null, \
+'run_lookup_available': bool, 'run_status': str|null}}`. \
+`present: false` ALONE IS NOT EVIDENCE OF LOSS — `reason` says why the row is absent and \
+`expected` is the gate: treat a genuine gap as established ONLY when `present: false` \
+AND `expected: true` (`reason: 'missing'`). `expected: false` (`reason: \
+'stage_not_run'`) means the run never reached that stage, so no summary was ever owed. \
+`expected: null` (`reason: 'expired'`, `'run_unknown'` or `'ledger_unavailable'`) is \
+INCONCLUSIVE, never a definitive absence — `expired` means the run is past the ledger's \
+retention window, so the row would have been reaped whether or not it was ever written. \
+`run_status` is DIAGNOSTIC context for a finding's evidence line and must NEVER itself \
+decide whether to flag. Use this as the PRIMARY cycle-summary \
 presence check (see ## Pre-Check: Already-Reconstructed Stage 2 Summaries below).
 
 You do not have access to task *write* tools — task reconciliation is Stage 2's job. \
@@ -167,6 +225,7 @@ any other caller's, coming back with `routed` set to `stored`, `restated`, `amen
 ## Authority Model
 - Knowledge contradicts task assumptions → Knowledge wins (more recent). Flag for Stage 2.
 - Duplicate knowledge across stores → Keep most recent / highest confidence. Delete duplicate.
+{CHILD_MEMORY_AUTHORITY_RULE}
 
 ## Guidelines
 - Be surgical: only modify what needs changing. Don't rewrite memories that are fine.
@@ -195,6 +254,8 @@ weaken the guidance above — still prefer `update_edge`/`refresh_entity_summary
 - **Report channel — recon_report MCP tools (PRD γ §9)**: For each inconsistency or finding \
 (including cross-project scope mismatches flagged to Stage 2): \
 {get_recon_report_tool_guidance()}
+
+{CITATION_REPAIR_TOOL_BLOCK}
 
 {STALE_KNOWLEDGE_ANNOTATION_NORM}
 
@@ -285,6 +346,47 @@ and does not violate the Stage 1 / Stage 2 separation.**
 
 Skipping this check risks persisting temporal facts that contradict Taskmaster's live \
 state, which misleads Stage 2 task reconciliation.
+
+## Escalation-Probe Precondition (task 3052)
+A STANDING PRECONDITION on a whole class of finding, in the same shape as the \
+Terminal-State Pre-Check above: it names the check you must pass before you are \
+entitled to write the claim at all.
+
+**PROHIBITION — never file an escalation-missing finding.** Do not write a memory, a \
+finding, or a flagged item asserting that no escalation was filed for some task, that \
+the escalation channel is dead, that a filing path yields zero records, or any \
+equivalent "the record does not exist" claim. The reason — stated as a reason, not as \
+an invitation to go looking — is that all four escalation READ tools \
+(`get_pending_escalations`, `get_escalation`, `get_task_escalations`, \
+`get_task_escalation_history`) are DENIED to you here, via \
+`cli_stage_runner.py::STAGE1_DISALLOWED` -> `DISALLOW_ESCALATION_READS`. You are \
+structurally blind to the escalation queue and can never hold evidence for such a \
+claim; an absence you cannot observe is not an absence you may report. If the \
+condition nevertheless looks real, emit an ORDINARY flag for Stage 2 describing only \
+what you did observe, rather than asserting the channel is dead.
+
+Two facts recorded here for a downstream reader who DOES hold the tools, so the \
+historical findings are not re-derived by someone able to run the probe:
+
+1. Reconciliation-filed gate escalations are born at **level 1**. A probe filtered to \
+   `level=2` structurally cannot see them, and returns an empty result for reasons \
+   that have nothing to do with whether the record exists. (Verified live 2026-09-02: \
+   124 of 124 pending `reconciliation_stale_gate_backlog` records were `level=1`.)
+2. An existence check must be ARCHIVE-AWARE. Resolving a record moves it out of the \
+   queue root, and `queue.py::EscalationQueue.get_pending` globs the root only — so a \
+   record that was written and then closed reads as "never filed" to a root-only \
+   lookup.
+
+**The one clause you CAN execute.** Before describing a human-decision gate as \
+"stalled", read the task record and confirm that `metadata.gate_escalated_at` is \
+genuinely older than the {_STAGE1_GATE_STALL_THRESHOLD_HOURS}h stall threshold \
+(`stage1_stall_detector.py::STAGE1_GATE_BACKLOG_STALL_THRESHOLD_SECS`). A gate stamped \
+more recently than that is NOT stalled and must not be reported as such. This check \
+needs no escalation read at all: the stamp lives on the task record, which you do hold.
+
+{REFERENT_DECLARATION_GUIDANCE}
+
+{render_metadata_vocabulary_guidance()}
 
 ## Verifying Writes
 After calling `mcp__fused-memory__add_memory`, inspect the `memory_ids` field in the \
@@ -410,6 +512,26 @@ not guess from line counts.
 key actions taken") are NOT volatile counts and may still be written as \
 `temporal_facts` edges when they capture non-recoverable per-cycle decisions or \
 observations. Keep run summaries concise and deduplicated across cycles.
+
+### Pin-order and priority-override state — DO NOT persist as durable edges
+Pin order, pinned status, boost tier, `reserve_now` and TTL are LIVE-QUERIED state. \
+The authoritative source is `scheduler_overrides.db`, read via the `get_pin_queue` \
+MCP tool — that live read is the single source of truth for the current cycle. \
+Structural per-change history already exists in `data/orchestrator/runs.db` \
+(`priority_override_set`, `priority_override_cleared`, `task_pinned`, `task_unpinned`, \
+`pin_queue_reordered`) and is surfaced by the `get_scheduler_events` MCP tool.
+
+**MUST NOT**: write pin-order or priority-override state as durable Graphiti edges \
+— not via `add_memory` under any GRAPHITI_PRIMARY category \
+(`entities_and_relations`, `temporal_facts`, `decisions_and_rationale`), and not via \
+`add_episode`. This state churns and is routinely CLEARED with no corresponding \
+write, so a persisted edge goes stale within the hour while still reading as current. \
+Extraction also produces facts that name no task at all (e.g. "Pin order is set to \
+10."), which no sweep can attribute to a task or drain.
+
+**Do not be the writer**: since task 3853 (the esc-3834-1 ruling) this edge class no \
+longer originates from the MCP override tools, which emit no memory write at all. Do \
+not re-mint it from a pin-queue observation.
 
 ### Stale task-count snapshot edges — do NOT emit correction findings
 
@@ -612,10 +734,18 @@ finding): \
 stage='task_knowledge_sync')`
 - `ledger_available: true` and `present: true` → the Stage 2 summary is present. Do NOT \
 emit the missing-summary finding.
-- `ledger_available: true` and `present: false` → the authoritative row is GENUINELY \
-ABSENT. Emit the missing-summary finding for this run.
-- `ledger_available: false`, or the tool returns an error → INCONCLUSIVE. Fall through \
+- `present: false` and `expected: true` (`reason: 'missing'`) → the run DID reach Stage \
+2 and is within the ledger's retention window, so the row is genuinely lost. Emit the \
+missing-summary finding for this run.
+- `present: false` and `expected: false` (`reason: 'stage_not_run'`) → the run never \
+reached Stage 2, so no summary was ever owed. Do NOT emit the finding and do NOT frame \
+it as a defect — this is ordinary, and it is what MOST absences turn out to be.
+- `present: false` and `expected: null` (`reason: 'expired'`, `'run_unknown'` or \
+`'ledger_unavailable'`), or the tool returns an error → INCONCLUSIVE. Fall through \
 to the FALLBACK below, using Path 1 + Path 2 keyed `stage='task_knowledge_sync'`.
+- `run_status` is DIAGNOSTIC ONLY — cite it as evidence in a finding you have already \
+decided to emit, never as a condition for deciding. A `failed` or `interrupted` run may \
+well have run the stage and lost only the ledger write.
 
 **B. Stage 1's own prior-run summary** (presence audit only — the Stage 1 summary is \
 written deterministically by Python (`write_stage1_cycle_summary`) and is never \
@@ -625,11 +755,14 @@ informs your cycle report): \
 stage='memory_consolidator')`
 - `ledger_available: true` and `present: true` → your own prior-run summary is present. \
 No action needed.
-- `ledger_available: true` and `present: false` → your own prior-run summary is \
-genuinely absent. Note this in your cycle report — do NOT attempt to reconstruct it \
-yourself and do NOT emit a missing-summary finding for it; only the Stage-2 case (A) \
-above is actionable.
-- `ledger_available: false`, or the tool returns an error → INCONCLUSIVE. Fall through \
+- `present: false` and `expected: true` (`reason: 'missing'`) → your own prior-run \
+summary is genuinely absent. Note this in your cycle report — do NOT attempt to \
+reconstruct it yourself and do NOT emit a missing-summary finding for it; only the \
+Stage-2 case (A) above is actionable.
+- `present: false` and `expected: false` (`reason: 'stage_not_run'`) → that run never \
+reached Stage 1, so no summary was owed. Nothing to note.
+- `present: false` and `expected: null` (`reason: 'expired'`, `'run_unknown'` or \
+`'ledger_unavailable'`), or the tool returns an error → INCONCLUSIVE. Fall through \
 to the FALLBACK below, using Path 1 + Path 2 keyed `stage='memory_consolidator'`.
 
 ### FALLBACK (used ONLY when the corresponding ledger check above is inconclusive)
@@ -671,8 +804,7 @@ only ever as a report-only note per the audit rule above — never as a finding.
 **Tool error handling**: if `count_memories_by_metadata` returns an error (e.g. backend \
 unavailable), treat as inconclusive and do NOT reconstruct — the documented harm is \
 false-positive reconstruction (wasteful duplicate summaries), so bias toward skipping \
-reconstruction on uncertainty. Note the tool error in your cycle report instead. \
-This mirrors the Flag Suppression Check's conservative handling of search failures.
+reconstruction on uncertainty. Note the tool error in your cycle report instead.
 
 Rationale: back-to-back remediation passes otherwise trigger double-reconstruction of \
 the same Stage 2 summary, producing duplicate per-cycle entries a later cycle must clean \
@@ -691,14 +823,13 @@ search Mem0 for a completion summary written by TaskInterceptor / TargetedReconc
   project_id=..., categories=['observations_and_summaries'], stores=['mem0'], limit=20)
 
 Including `task_id=<task_id>` in the query biases the vector ranking toward the specific \
-task's entry (mirroring the Flag Suppression Check which uses \
-`query="stage1_flag_suppression task_id=<N>"`); without it a generic query risks ranking \
+task's entry; without it a generic query risks ranking \
 the relevant entry out of the top-20 when many tasks have completion summaries.
 
 Inspect each result: if any result satisfies BOTH of the following, do NOT emit the \
 missing-completion-summary finding for that task:
   1. `str(result.metadata.get('task_id')) == str(task_id)` (both sides coerced to str \
-to handle legacy int vs str task_id — consistent with the Flag Suppression Check)
+to handle legacy int vs str task_id)
   2. `result.metadata.get('source') == 'targeted_reconciliation'` \
 OR the result content contains "completed"
 
@@ -720,62 +851,19 @@ through can be cleaned up in a later consolidation cycle.
 ## Flag Suppression Check
 **The deterministic suppression gate is enforced in code** by \
 `flag_dedup.filter_suppressed`, which runs as the first step of the post-processor \
-before any flag reaches the signature-dedup loop.  You do not need to perform this \
-check yourself — suppressed flags are dropped automatically.
+before any flag reaches the signature-dedup loop and reads ONLY `recon_ledger` rows.  \
+You do not need to perform this check yourself — suppressed flags are dropped automatically.
 
-As an optimisation you *may* skip emitting a flag for a task that you know is \
-suppressed, but the code gate is the authoritative enforcement point; any flag you \
-emit for a suppressed task_id (and, for a scoped record, matching flag_type — see \
-below) will be dropped by the post-processor regardless.
+Do NOT withhold a flag because you believe it is suppressed: emit it. The code gate \
+is the only authority on what is suppressed, and it drops every flag matched by an \
+active suppression row (for a scoped row, only a matching flag_type — see below).
 
 {render_suppression_schema_section()}
-
-Producing a suppression record: operators and remediation hooks should call \
-`fused_memory.reconciliation.flag_dedup.write_suppression_record(memory_service, \
-project_id=..., task_id=N, flag_types=[...])` rather than constructing the \
-canonical schema by hand. The helper coerces `task_id` to a string (accepting a \
-single numeric id or a comma-joined composite signature), sorts/dedupes \
-`flag_types`, and pins the metadata.kind/content shape so future schema changes \
-touch one location. **Prefer a scoped record** (explicit `flag_types`) over the \
-legacy blanket form: scoping to the specific flag_type(s) you intend to suppress \
-means a newly-relevant flag_type for the same task is NOT silently blanket-blocked. \
-This is not hypothetical — an unscoped record once let an unrelated flag_type's \
-blanket suppression hide a genuinely recurring \
-`live_workflow_recurrence_counter_needed` flag for 6+ cycles with no tracking task. \
-Omit `flag_types` only when you deliberately want to silence every flag_type for \
-that task.
-
-If you do choose to check: call \
-`search(query="stage1_flag_suppression task_id=<N>", project_id=..., \
-categories=['observations_and_summaries'], stores=['mem0'], limit=50)`. \
-`task_id=<N>` in the query biases vector ranking; `limit=50` overrides the \
-default `limit=10` so a busy project doesn't drop the record; `limit=50` is \
-intentionally smaller than `filter_suppressed`'s bulk-sweep `limit=501` because \
-the `task_id=<N>` bias makes 50 sufficient for a single-task lookup. \
-Historical/legacy suppression records were written with `task_id` as either \
-`int` or `str`; new records are pinned to `int` by `build_suppression_payload`, \
-but readers MUST coerce both sides via `str(...)` to remain compatible with \
-legacy data: a result is a valid suppression record ONLY when BOTH \
-`metadata.kind == "stage1_flag_suppression"` AND \
-`str(result.metadata.get('task_id')) == str(target_task_id)`. When the matched \
-record also carries a non-empty `metadata.flag_types`, it is in effect for your \
-candidate flag ONLY if `str(candidate_flag_type)` also appears in that list \
-(str-coerced, same convention as task_id); an empty/absent `flag_types` means the \
-record is blanket and applies regardless of flag_type. Do NOT rely on \
-semantic/vector proximity alone — a result that fails either metadata field, or \
-an empty result set, means "no suppression in effect"; proceed normally.
-
-If the suppression search returns an error or times out, treat suppression as \
-not-in-effect and proceed with normal flag emission; record the search failure \
-in your cycle summary so operators can re-check. This mirrors the conservative \
-pass-through that the post-processor's `filter_suppressed` already performs in \
-code, keeping prompt-driven and code-driven outcomes aligned.
 
 Suppression is distinct from the post-processor dedup described in the next section. \
 Dedup collapses repeated emissions of the same (task_id, flag_type) pair across runs; \
 suppression authoritatively forbids flag emission for a task_id — either for every \
-flag_type (legacy blanket record) or for a scoped subset of flag_types (a record \
-carrying a non-empty `flag_types`). \
+flag_type (blanket rows) or for a scoped subset of flag_types (scoped rows). \
 The contamination cycle motivating this gate: Stage 1 writes a violating flag → Stage 3 \
 detects it → remediation deletes it → next cycle Stage 1 writes it again. \
 `flag_dedup.filter_suppressed` breaks this cycle deterministically in code.
@@ -827,6 +915,8 @@ This directive mirrors the code-side enforcement: see the completion-marker \
 same-cycle self-delete branch in `flag_dedup.dedup_flags` (task 2312), gated on \
 the same present-and-false `flag_for_stage2` signal.
 
+{render_gate_owned_action_norm()}
+
 ## Stage 2 Flag Relay (FIX B)
 When you write a flag to Mem0 with `metadata.flag_for_stage2=true`, you MUST ALSO include \
 the same flag content in the `flagged_items` field of your structured-output report — the \
@@ -836,7 +926,9 @@ both; the `flagged_items` entry should carry the same `task_id`, `flag_type`, an
 `description` as the Mem0 memory.
 
 Every `flag_for_stage2=true` Mem0 write MUST also include `metadata.run_id=<current_run_id>` \
-(use the `run_id` value from the `## Reconciliation Context` section appended to this prompt).
+(use the `run_id` value from the `## Reconciliation Context` section appended to this prompt) \
+and `metadata.kind='{FLAG_FOR_STAGE2_MARKER_KIND}'`, which keeps the marker a standalone \
+record rather than one filed under a memory it resembles.
 
 Post-write confirmation (LLM-side variant of the findability discipline enforced in code by flag_dedup.confirm_marker_persisted — task-1400, post-task-1413): \
 `add_memory` returns a `memory_ids` list, but Mem0 may store the content under a DIFFERENT \
@@ -888,20 +980,23 @@ injected/fabricated" purely because the imperative writing style looked foreign 
 
 ## Live-Workflow Authority
 The payload may include a `### Live-Workflow Signals` section. When present, it lists \
-tasks whose branch `task/<id>` has at least one live-workflow signal: a registered \
-git worktree, a recent branch commit (within the last 6 hours), or an active \
-orchestrator process holding the project lock. These signals indicate that a live \
+tasks whose branch `task/<id>` has a per-task live-workflow signal (a registered git \
+worktree, or a recent branch commit within the last 6 hours), tasks that are live only \
+through the project-wide orchestrator lock (stated once, on the section's own project \
+line), and tasks whose work has already landed on main. A live listing suggests that a \
 pipeline — typically the reify-build orchestrator — is actively driving that task's \
-lifecycle.
+lifecycle; the rules below say how to confirm it.
 
-**For any task listed in `### Live-Workflow Signals`, do NOT emit a stranded-work or \
-blocked-escalation flag** (e.g. `flag_type='task_blocked_stale_escalations'`) **at \
+{render_live_workflow_authority_rules()}
+
+**For any task with a LIVE row in `### Live-Workflow Signals` (any row not reading \
+`{NOT_LIVE_TOKEN}`), do NOT emit a stranded-work or blocked-escalation flag** (e.g. `flag_type='task_blocked_stale_escalations'`) **at \
 `severity='moderate'` with `actionable=true`.** A task under an active live pipeline is \
 mid-flight, not stranded — asserting a moderate/actionable disposition for it contradicts \
 Stage 2's own Live-Workflow Authority policy (task 1655) and produces two contradictory \
 disposition markers for the same `task_id`+`flag_type` in a single reconciliation cycle.
 
-Instead, for a task listed under `### Live-Workflow Signals`, do one of:
+Instead, for a task with a live row, do one of:
 1. **Downgrade** the flag to `severity='info'` and `actionable=false`, or
 2. **Annotate** the flag's description with "pending Stage 2 live-workflow confirmation" \
    and leave the final disposition to Stage 2, which has direct access to live scheduler \
@@ -911,12 +1006,13 @@ Either remediation is acceptable; what is NOT acceptable is emitting the flag at
 `severity='moderate'` with `actionable=true` as though the task were genuinely stranded.
 
 **Only treat a stranded / blocked-escalation flag as fully actionable when NO live signal \
-is present** — i.e., the task is absent from `### Live-Workflow Signals` (all three \
-signals are False: no worktree, no recent commits, no active orchestrator). That is the \
-genuinely stranded case that legitimately needs operator attention.
+is present** — i.e., the task has no live row in `### Live-Workflow Signals`, or \
+`get_task` shows no live claimant for it (the tie-breaker above), and its work has not \
+landed. That is the genuinely stranded case that legitimately needs operator attention.
 
-If `### Live-Workflow Signals` is absent from the payload, all three signals are False \
-for every task; no live-workflow suppression applies, and stranded/blocked-escalation \
+If `### Live-Workflow Signals` is absent from the payload, no task is live this cycle — \
+neither through a per-task signal nor through the project-wide lock — and none has \
+landing evidence; no live-workflow suppression applies, and stranded/blocked-escalation \
 flags may be emitted normally.
 
 ## Preserved-Specimen Corroboration
@@ -947,4 +1043,28 @@ live validation specimen for gate task 3546, and this re-flag twice became an op
 gate task asking for it to be reset — tasks 5080 and 5104, the second born-at-L2 critical. \
 Both were declined by hand. The same false positive has already appeared under three \
 different `flag_type` namings, so renaming it does not make it a new finding.
+
+{LIVE_STATE_FRESHNESS_HEADING}
+A Mem0 memory's "still needs appending" / "caveat still missing" clause records what was \
+true WHEN IT WAS WRITTEN. Before emitting a `premature_widening_evidence_caveat` finding, \
+or any "task N's metadata still lacks X" finding, call `get_task` for that task and read \
+its CURRENT `metadata`. Do not emit it when the caveat, or the source memory id it cites, \
+is already there. When you do emit it, `cite_memory` the caveat-source memory: the code \
+gate `flag_dedup.filter_already_recorded_caveat_flags` drops the flag once the task's live \
+metadata records every cited memory id, and keeps it whenever the lookup is inconclusive.
+
+The buffered-event deletion log shows THAT a Mem0 record was deleted, never WHY. Before \
+counting a swept id as a `mem0_evidentiary_anchor_deletion_pattern` occurrence, call \
+`get_memory_by_id` on it. A miss carrying a `tombstone` whose `deleter` is one of \
+{_DOCUMENTED_SWEEP_DELETERS} is a designed recon sweep — expected, not an anomaly — and \
+must not be flagged. Only an id with no tombstone, or with an undocumented deleter, \
+supports the flag. Name every swept id's full UUID in the description, and do not bundle \
+unrelated deletions into this flag type. The code gate \
+`sweep_deletion_guard.filter_benign_sweep_deletion_flags` drops a flag when every swept id \
+it can see is benign-tombstoned. It sees an id only if the id carries a tombstone or was \
+deleted in this cycle's event buffer, so an untombstoned deletion from an EARLIER cycle is \
+invisible to it: report such an id in a flag of its own, never alongside benign-tombstoned \
+ids. This rule exists because solar_challenge_platform run 09f2829f \
+(finding c4639ec8) reported three "new occurrences" that all carried \
+`stage1_cycle_summary_trim` / `stage2_cycle_summary_trim` tombstones from the same run.
 """

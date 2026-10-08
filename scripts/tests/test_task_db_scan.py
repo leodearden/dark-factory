@@ -2,11 +2,13 @@
 the four READ-ONLY tasks.db sweep scripts (tasks 3336 and 3616, following task
 3286's "~134 identical lines" finding).
 
-Tier 1 (discovery: _DEFAULT_PROJECT_ROOTS / tasks_db_path /
+Tier 1 (discovery: _DEFAULT_PROJECT_ROOTS / tasks_db_path / decode_metadata /
 resolve_project_roots / discover_project_roots / discover_db_paths) is adopted
-by ALL FOUR sweep scripts. Tier 2 (leak-scanner CLI plumbing) is adopted by the
-two LEAK SCANNERS only; Tier 3 (audit-script CLI plumbing: run_audit_cli /
-sweep_project_roots / the AUDIT_EXIT_* codes / format_kv_line /
+by ALL FOUR sweep scripts — except decode_metadata, which is Tier 1 by SHAPE
+(pure, no per-script semantics) rather than by adoption count, and is used only
+by the two AUDIT scripts (task 4782). Tier 2 (leak-scanner CLI plumbing) is
+adopted by the two LEAK SCANNERS only; Tier 3 (audit-script CLI plumbing:
+run_audit_cli / sweep_project_roots / the AUDIT_EXIT_* codes / format_kv_line /
 format_coverage_block) by the two AUDIT scripts only. The split is
 load-bearing rather than cosmetic: Tier 2 sweeps db PATHS and accumulates
 MATCHES, Tier 3 sweeps project ROOTS and collects exactly one audit per root,
@@ -74,6 +76,7 @@ from _task_db_scan import (
     TaskDbUnreadable,
     add_db_discovery_args,
     connect_ro,
+    decode_metadata,
     discover_db_paths,
     discover_project_roots,
     format_coverage_block,
@@ -613,6 +616,55 @@ def test_discover_db_paths_skips_project_root_without_tasks_db(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# decode_metadata(raw) -> dict
+#
+# Promoted from a copy verbatim-duplicated across
+# audit_combine_gate_marker_loss.py and audit_manifest_descriptor_drift.py
+# (task 4782). Used only by the two AUDIT scripts, not by the leak scanners —
+# it is Tier 1 by shape (pure, no per-script semantics), not by adoption
+# count. These cases were previously asserted indirectly, through
+# load_combine_targets, in test_audit_combine_gate_marker_loss.py; asserted
+# here directly against the raw value, with no sqlite roundtrip needed.
+# ---------------------------------------------------------------------------
+
+def test_decode_metadata_null_degrades_to_empty_dict():
+    assert decode_metadata(None) == {}
+
+
+def test_decode_metadata_empty_string_degrades_to_empty_dict():
+    assert decode_metadata("") == {}
+
+
+def test_decode_metadata_malformed_json_degrades_to_empty_dict():
+    assert decode_metadata("{not json at all") == {}
+
+
+def test_decode_metadata_json_list_degrades_to_empty_dict():
+    """Valid JSON that decodes to a list, not a dict, is still degraded."""
+    assert decode_metadata('["curator_action"]') == {}
+
+
+def test_decode_metadata_json_scalar_degrades_to_empty_dict():
+    """A bare JSON scalar decodes fine but is not a dict — skipped, not raised."""
+    assert decode_metadata('"combine"') == {}
+    assert decode_metadata("17") == {}
+    assert decode_metadata("null") == {}
+
+
+def test_decode_metadata_non_str_non_bytes_degrades_to_empty_dict():
+    """A wrong-typed column value (e.g. an int) is corrupt data, not raised."""
+    assert decode_metadata(17) == {}
+
+
+def test_decode_metadata_valid_json_dict_round_trips():
+    assert decode_metadata('{"curator_action": "combine"}') == {"curator_action": "combine"}
+
+
+def test_decode_metadata_accepts_bytes():
+    assert decode_metadata(b'{"curator_action": "combine"}') == {"curator_action": "combine"}
+
+
+# ---------------------------------------------------------------------------
 # Tier 2 — leak-scanner CLI plumbing (the two leak scanners only).
 #
 # audit_wiped_metadata_files.py deliberately does NOT adopt this tier; see the
@@ -756,6 +808,24 @@ def test_sweep_databases_skips_unreadable_db_and_warns_on_stderr(capsys):
     assert "results below are incomplete" in err
 
 
+def test_sweep_databases_skips_a_store_connect_ro_refused_and_warns_on_stderr(capsys):
+    refusal = TaskDbUnreadable(Path("/db/stub.db"), TaskDbProblem.EMPTY_STUB)
+
+    def scan(db_path):
+        if db_path == "/db/stub.db":
+            raise refusal
+        return [_match(db_path=db_path)]
+
+    matches, unreadable = sweep_databases(["/db/stub.db", "/db/good.db"], scan)
+
+    assert [m.db_path for m in matches] == ["/db/good.db"]
+    assert unreadable == ["/db/stub.db"]
+
+    err = capsys.readouterr().err
+    assert f"warning: skipping unreadable database /db/stub.db: {refusal}" in err
+    assert "results below are incomplete" in err
+
+
 def test_sweep_databases_omits_the_aggregate_warning_when_all_readable(capsys):
     matches, unreadable = sweep_databases(["/db/a.db"], lambda db_path: [])
 
@@ -831,6 +901,25 @@ def test_run_scan_cli_exits_3_when_every_db_is_unreadable(tmp_path, capsys):
     assert captured.out.strip() == "rendered:0"
     assert "results below are incomplete" in captured.err
     assert "NOTHING was scanned" in captured.err
+
+
+def _scan_through_connect_ro(db_path):
+    connect_ro(db_path).close()
+    return []
+
+
+def test_run_scan_cli_exits_3_when_connect_ro_refuses_every_real_stub(tmp_path, capsys):
+    stub_a = tmp_path / "a.db"
+    stub_b = tmp_path / "b.db"
+    stub_a.write_bytes(b"")
+    stub_b.write_bytes(b"")
+
+    exit_code = _cli(["--db", str(stub_a), "--db", str(stub_b)], _scan_through_connect_ro)
+
+    assert exit_code == 3
+    err = capsys.readouterr().err
+    assert str(TaskDbUnreadable(stub_a.resolve(), TaskDbProblem.EMPTY_STUB)) in err
+    assert "NOTHING was scanned" in err
 
 
 def test_run_scan_cli_exits_0_when_some_dbs_unreadable_and_rest_clean(tmp_path, capsys):
@@ -955,6 +1044,24 @@ def test_sweep_project_roots_skips_unreadable_root_and_warns_on_stderr(capsys):
     assert (
         "warning: skipping unreadable project /proj/bad: file is not a database" in err
     )
+
+
+def test_sweep_project_roots_skips_a_store_connect_ro_refused_and_warns_on_stderr(capsys):
+    refusal = TaskDbUnreadable(Path("/proj/stub"), TaskDbProblem.EMPTY_STUB)
+
+    def audit(root):
+        if root == "/proj/stub":
+            raise refusal
+        return f"audit:{root}"
+
+    audits, unreadable = sweep_project_roots(["/proj/stub", "/proj/good"], audit)
+
+    assert audits == ["audit:/proj/good"]
+    assert unreadable == ["/proj/stub"]
+
+    err = capsys.readouterr().err
+    assert f"warning: skipping unreadable project /proj/stub: {refusal}" in err
+    assert "results below are incomplete" in err
 
 
 def test_sweep_project_roots_warns_once_in_aggregate_that_results_are_incomplete(capsys):
@@ -1090,6 +1197,27 @@ def test_run_audit_cli_exits_3_when_every_root_is_unreadable(
     assert captured.out.strip() == "rendered:0"
     assert "results below are incomplete" in captured.err
     assert "NOTHING was audited (this is not a clean result)" in captured.err
+
+
+def test_run_audit_cli_exits_3_when_connect_ro_refuses_every_real_stub(
+    project_root_with_tasks_db, tmp_path, capsys
+):
+    root_a = tmp_path / "proj_a"
+    root_b = tmp_path / "proj_b"
+    stub_a = project_root_with_tasks_db(root_a)
+    project_root_with_tasks_db(root_b)
+
+    def audit(root, args):
+        connect_ro(tasks_db_path(root)).close()
+        return "audit"
+
+    exit_code = _audit_cli(
+        ["--project-root", str(root_a), "--project-root", str(root_b)], audit
+    )
+
+    assert exit_code == AUDIT_EXIT_NOTHING_AUDITED
+    err = capsys.readouterr().err
+    assert str(TaskDbUnreadable(stub_a.resolve(), TaskDbProblem.EMPTY_STUB)) in err
 
 
 def test_run_audit_cli_exits_0_when_some_roots_unreadable_and_rest_clean(

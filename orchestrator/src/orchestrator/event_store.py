@@ -81,6 +81,16 @@ class EventType(StrEnum):
     # restart noise.  `WHERE event_type = 'stale_l0_strand_dismissed'` answers
     # it directly; a json_extract discriminator over every resolution would not.
     stale_l0_strand_dismissed = 'stale_l0_strand_dismissed'
+    # One info-severity L0 was dispositioned by the router or the reviewer leg
+    # (plans/info-l0-disposition-router-prd.md D11).  The escalation record is
+    # the fact's home; this row is telemetry naming it, keyed on the subject's
+    # REAL task_id.
+    # data: {escalation_id, class, by, exit_kind, ticket, task_id, decided_at}
+    #   class: the escalation.disposition class written (a RESOLUTION_CLASSES
+    #   member when the record closed); by: the dispositioning actor;
+    #   exit_kind: an escalation.disposition.ExitKind value; ticket: the
+    #   curator ticket id, or null; decided_at: ISO-8601 UTC.
+    info_l0_dispositioned = 'info_l0_dispositioned'
 
     # Waste detection
     waste_detected = 'waste_detected'
@@ -395,12 +405,100 @@ class EventType(StrEnum):
     session_resume_fallback = 'session_resume_fallback'
     session_resume_capped = 'session_resume_capped'
 
-    # session_resume_failed (task 3578) — a resume that was ADOPTED by the
-    # _run_slot guard above and then still failed to happen. It closes the
-    # population that was previously journal-only and runs.db-INVISIBLE: an
-    # armed --resume whose transcript the CLI could not resolve exits before it
-    # ever contacts the API, so none of the three events above, and no cost or
-    # cap row, ever recorded that the session was lost.
+    # session_config_dir_ambiguous (task 3620) — the surviving worktree holds
+    # config-dir candidates but NOT the one this session's transcript would be
+    # in, so the recovered session cannot be corroborated at all.
+    #
+    # Emitted by orchestrator/src/orchestrator/harness.py::Harness._adopt_recovered_session,
+    # at BOOT during crash recovery — NOT by the _run_slot dispatch guard that
+    # emits the three events above. The config dir is DERIVED from the adopted
+    # task id (the sole creator, shared/src/shared/config_dir.py::TaskConfigDir,
+    # names it `claude-config-<task_id>`); when that derived dir is absent but
+    # other `claude-config-*` dirs are present, the worktree belongs to some
+    # other owner — e.g. the `claude-config-<task_id>-unblock` dir created by
+    # orchestrator/src/orchestrator/dry_run_unblock.py::dry_run_unblock. Nothing
+    # is stashed, so the ensuing dispatch is a GUARANTEED 'no_transcript'
+    # fallback. Before this event that outcome was silent: the resolver stashed
+    # a lexically-first candidate, the dispatch-time re-glob found no transcript
+    # there, and the session degraded with zero operator signal.
+    #
+    # NOT part of the ratio recipe's denominator above, and this is the one
+    # thing to get right when querying it — the same trap
+    # session_resume_failed's own comment warns about, restated because this
+    # member sits inside the family block. The three outcome events are one per
+    # DISPATCH that carried a recovered session; this one is one per ADOPTION
+    # that could not resolve. Adding it to that sum would mix populations
+    # counted on different units and inflate the attempt count.
+    #
+    # Emitted IF AND ONLY IF candidates exist and the derived dir is absent. An
+    # empty `.task/` — no `claude-config-*` at all — stays SILENT: that is
+    # ABSENCE, not ambiguity, and it is the dominant recovered-session
+    # population (warm-lane acquire always re-seeds a lane from base, wiping the
+    # transcript store, which is why `reseeded` is a by-design fallback reason
+    # above). Emitting there would fire on nearly every recovered lane and put
+    # the most-expected outcome in the same bucket as a genuine defect. That
+    # population is already instrumented at dispatch by
+    # session_resume_fallback's '$.archive_available'.
+    #
+    # data: {expected, found, session_id, task_id} — `expected` the derived
+    # path, `found` a SORTED list of every candidate path as a string so
+    # json_extract(data, '$.found') is a stable group key (same discipline as
+    # '$.reasons'), `session_id` the sidecar's session, `task_id` the adopted
+    # key (also passed as the row's task_id, so it stays joinable).
+    #
+    # SQL: which derived path was missing, and what was there instead —
+    #   SELECT json_extract(data, '$.expected'), json_extract(data, '$.found'),
+    #          COUNT(*)
+    #     FROM events WHERE event_type = 'session_config_dir_ambiguous'
+    #    GROUP BY 1, 2;
+    # A nonzero count is a definite lost resume with a definite cause, unlike a
+    # fallback census — which is why it also files a deduped L1 (one open at a
+    # time, under harness.py::Harness._CONFIG_DIR_AMBIGUOUS_SENTINEL) rather
+    # than being counted against a storm threshold.
+    #
+    # It consequently does NOT feed the session-resume fallback-storm streak,
+    # and that exclusion is STRUCTURAL rather than a carve-out: this is
+    # detected at BOOT during adoption, while the streak is only ever touched
+    # in the _run_slot DISPATCH guard — unlike the by-design `capped` case,
+    # which sits inside that same guard block and therefore does need an
+    # explicit branch. So config.fallback_storm_threshold has no effect here
+    # and an ambiguity L1 appearing alone is not evidence of a resume storm.
+    session_config_dir_ambiguous = 'session_config_dir_ambiguous'
+
+    # session_resume_failed (task 3578) — an ARMED resume that then failed to
+    # happen. It closes the population that was previously journal-only and
+    # runs.db-INVISIBLE: an armed --resume whose transcript the CLI could not
+    # resolve exits before it ever contacts the API, so none of the three
+    # events above, and no cost or cap row, ever recorded that the session was
+    # lost.
+    #
+    # WHICH PRODUCER ARMED IT is not what this used to say. The original text
+    # read "a resume that was ADOPTED by the _run_slot guard above", and the
+    # data says otherwise: measured 2026-09-16 against runs.db, all 10 rows are
+    # stage='cli', spanning 2026-08-24..2026-09-15, and NOT ONE of their
+    # session ids (or task ids) appears among the 8 session_resume rows the
+    # guard has ever emitted — whose nearest neighbours in time, 2026-08-20 and
+    # 2026-09-16, fall outside the failure span entirely. The only other writer
+    # of TaskWorkflow._pending_resume_session_id is the IN-WORKFLOW
+    # progress-timeout re-arm (workflow.py::TaskWorkflow, the re-arm beside the
+    # progress-timeout handler), so that is what armed all ten.
+    #
+    # That is also why this population, and not the guard's, is dense enough to
+    # carry an alarm — see the streak note below.
+    #
+    # THE INV-4 STORM STREAK'S SOLE GENUINE FEEDER since task ε/3733. Every row
+    # here is also reported to Harness.note_resume_failed, which subtracts the
+    # by-design carve-out and counts what is left as a chained run. FEEDS the
+    # streak: stage='cli' always (the restore ran a phase earlier and is not
+    # what failed), and stage='pre_flight' with restore 'fault' or 'published'.
+    # Does NOT feed it: restore 'disabled' (the kill switch) and 'miss' (the
+    # archive-COVERAGE signal, which belongs on a RATE watch rather than a
+    # consecutive-run detector) — harness.py::_BY_DESIGN_RESTORE_OUTCOMES. A
+    # restore outcome added later is GENUINE by default and must be added to
+    # that constant to be exempted. No new EventType was introduced for the
+    # feeder and no fourth term was added to the ratio denominator below: these
+    # rows already ARE the population, and a second event would be a second
+    # source of truth for one fact.
     #
     # NOT part of the ratio recipe's denominator above, and this is the one
     # thing to get right when querying it. The three events above are emitted by
@@ -453,7 +551,14 @@ class EventType(StrEnum):
 
     # Scheduler fairness
     task_skipped = 'task_skipped'
+    # Producer of both: scheduler.py::Scheduler._complete_parks (semantics there).
+    # Every emitted reservation_* event carries data.source in {pin, fairness}
+    # (task 6040): an operator pin's reservation, or the automatic machinery's.
+    # Pin-sourced installed / shadowed / install_blocked carry pin_order in
+    # place of the tier fields (priority, preempted_by_priority): a pin rank
+    # lies above every tier, so no tier describes it.
     reservation_installed = 'reservation_installed'
+    reservation_install_blocked = 'reservation_install_blocked'
     reservation_expired = 'reservation_expired'
     reservation_evicted = 'reservation_evicted'
     reservation_shadowed = 'reservation_shadowed'
@@ -461,6 +566,13 @@ class EventType(StrEnum):
     reservation_used = 'reservation_used'
     reservation_force_evicted = 'reservation_force_evicted'
     reservation_force_evict_refused = 'reservation_force_evict_refused'
+    # A pinned task failed to take its module locks (task 6040).  Producer:
+    # scheduler.py::Scheduler._phase_select_pins.  Payload: {task_id,
+    # pin_order, head, blockers: [{module, owner, kind: held|parked}]}, with
+    # the blockers named BEFORE the head's own reservation installs.  Emitted
+    # when the pin becomes blocked, then at most once per
+    # pin_blocked_emit_interval_secs while it stays blocked.
+    pin_blocked = 'pin_blocked'
     # Emitted once per acquire_next tick when the fused-memory task read
     # FAILED (distinct from a genuinely empty project) and the park-eviction
     # drain was therefore SKIPPED (fail-safe, survey finding C3).
@@ -616,6 +728,14 @@ class EventType(StrEnum):
     # a restart of a backing service (e.g. fused-memory.service after a merge
     # whose landed diff touched fused-memory/src/).
     service_restart = 'service_restart'
+
+    # Restart drain (task 5371) — one per honoured drain request, emitted by
+    # orchestrator/src/orchestrator/fleet_drain.py::DrainEventTracker via the
+    # harness. data keys: unit, requested_ts, sweep_pid, waited_secs, outcome
+    # ('drained' | 'verifies_killed' | 'abandoned'), refused (the refusal that
+    # abandoned it, else null), merge_verifies_awaited, merge_verifies_killed
+    # (each a list of {task_id, host, kind, started_ts, deadline_ts}).
+    fleet_drain = 'fleet_drain'
 
     # Cross-project external-dep gate held — emitted when a pending task's
     # external deps have been holding dispatch for ``threshold`` consecutive
@@ -787,6 +907,23 @@ class EventType(StrEnum):
     # these rows for a stranded task is therefore meaningful: nothing held it.
     recovery_vetoed = 'recovery_vetoed'
     recovery_left = 'recovery_left'
+
+    # workflow_exit_contract — one row per run() exit whose contract verdict is
+    # a violation or store-unavailable (spec docs/task-escalation-state-spec.md
+    # §5/E11; task theta 3542).  The canonical WHY lives in
+    # orchestrator/src/orchestrator/exit_contract.py (module docstring).
+    # Payload vocabulary:
+    #   {verdict, mode, check, outcome, status, report_phase, machine_state,
+    #    failed_write, escalation_id}
+    #   verdict       — 'violation' | 'store_unavailable'.
+    #   mode          — 'log' | 'enforce' (workflow_exit_contract_enforce).
+    #   check         — 'phase' | 'outcome_status' for a violation, else null.
+    #   failed_write  — {target_status, error} for store_unavailable, else null.
+    #   escalation_id — the L1 an enforce-mode violation filed; null when
+    #                   deduped against an open one, or in log mode.
+    # task_id is ALSO a first-class column.  Task mu's soak counts
+    # verdict='violation' rows with mode='log' before flipping enforce on.
+    workflow_exit_contract = 'workflow_exit_contract'
 
 
 class EventStore:

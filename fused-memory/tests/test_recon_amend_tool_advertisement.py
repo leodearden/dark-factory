@@ -138,8 +138,9 @@ class TestDisallowListForAmendAndEpisodeTools:
     integrity check) held a live Mem0 silent-rewrite primitive. Its agent_id
     `recon-stage-integrity_check` matches `Mem0UpdateConfig`'s default
     `content_amend_allowed_agent_prefixes` via its `recon-stage-` entry, and
-    the `mem0_update` block in `config/config.yaml` is fully commented out, so
-    that default applies — Stage 3 both passed the authz gate and held the tool.
+    `config/config.yaml` leaves that list commented out (only the metadata-patch
+    list is active there), so that default applies — Stage 3 both passed the
+    authz gate and held the tool.
     """
 
     # -- PART A: set membership (cheap structural guard) --------------------
@@ -188,9 +189,9 @@ class TestDisallowListForAmendAndEpisodeTools:
 
         output_schema={'type': 'object'} is passed to match the realistic
         recon call site and exercise (not dodge) `build_claude_argv`'s
-        wildcard-expansion branch (the `_REAL_BUILTIN_TOOLS_DENYLIST`
-        substitution). That branch only rewrites disallowed_tools
-        when '*' is present; DISALLOW_BUILTIN (['Bash', 'Edit', 'Write',
+        schema-wildcard branch (the `'*'` -> `--tools ''` substitution, which
+        removes built-in and deferred tools but not MCP). That branch only
+        rewrites disallowed_tools when '*' is present; DISALLOW_BUILTIN (['Bash', 'Edit', 'Write',
         'NotebookEdit']) carries no '*', so STAGE3_DISALLOWED renders as a
         straight passthrough here — confirmed against today's code.
         """
@@ -297,10 +298,11 @@ class TestMem0UpdateConfigDefaultAdmitsEveryReconStage:
 
     If either half of this premise silently changes — the schema default stops
     admitting recon-stage agent_ids, or config/config.yaml grows an active
-    `mem0_update:` override (ANY override, wider or narrower: production
-    authority silently moving from schema to YAML is itself the event a human
-    should look at) — the cli_stage_runner.py comment's reasoning needs to be
-    re-examined; that is exactly what these three tests exist to catch.
+    `mem0_update.content_amend_allowed_agent_prefixes` override (ANY override,
+    wider or narrower: production content-amend authority silently moving from
+    schema to YAML is itself the event a human should look at) — the
+    cli_stage_runner.py comment's reasoning needs to be re-examined; that is
+    exactly what these three tests exist to catch.
 
     They fired once, as designed: commit 65b011ed8c (2026-08-11) uncommented
     the YAML block to grant curator- both arms per esc-3524-1 ruling (b). The
@@ -308,6 +310,11 @@ class TestMem0UpdateConfigDefaultAdmitsEveryReconStage:
     no recon agent_id), and the ruling of 2026-08-12 promoted the grant into
     the schema default and re-commented the YAML block — which is why the
     default now carries two entries.
+
+    Since task 6181 the YAML `mem0_update:` block is active again, but for the
+    metadata-patch list only (adding `link-heal-`, per
+    plans/write-triage-link-healing-prd.md H1). The content-amend list these
+    tests guard is still the schema default.
     """
 
     def test_schema_default_content_amend_prefixes_are_recon_stage_and_curator(
@@ -321,10 +328,10 @@ class TestMem0UpdateConfigDefaultAdmitsEveryReconStage:
     def test_shipped_config_yaml_leaves_mem0_update_at_the_schema_default(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """config/config.yaml ships its `mem0_update:` block fully commented out
-        (verified: every line under it is a `#` comment), so the schema default
-        pinned above — not an operator override this test cannot see — is what
-        actually governs production. Loads the REAL on-disk config the same way
+        """config/config.yaml leaves `mem0_update.content_amend_allowed_agent_prefixes`
+        commented out (only the metadata-patch list is active there), so the
+        schema default pinned above — not an operator override this test cannot
+        see — is what actually governs production. Loads the REAL on-disk config the same way
         test_config_schema.py's TestConfigYamlEnablesRequireDoneProvenance does,
         rather than trusting a text scan of the comment."""
         from fused_memory.config.schema import FusedMemoryConfig, Mem0UpdateConfig

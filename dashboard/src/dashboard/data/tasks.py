@@ -10,32 +10,28 @@ do not need to be re-keyed.
 Network errors are caught and surfaced as ``{'offline': True, 'error': ...}``;
 the caller turns that into a per-project skip plus a Tasks-tab banner.
 
-Note: the three failover loops below raise ``ValueError`` from within their
+Note: the four failover loops below raise ``ValueError`` from within their
 ``_call`` closures on a "soft failure" (malformed/errored MCP result), which
 ``mcp_fanout.first_success`` treats the same as a transport error — including
 invalidating that URL's cached session. Previously a soft failure here fell
 through with a bare ``continue`` and no session teardown; see
 ``mcp_fanout``'s module docstring for why this normalization is intentional.
+``fetch_task_prose`` RETURNS one structured error instead of raising it: a
+missing task is a definitive answer, not a soft failure.
 
-Two of those three loops (``fetch_tasks``, ``fetch_statuses``) are
-parameterized by ``project_root``, so they compose their ``log_label``
-through ``mcp_fanout.fanout_label`` to keep each root's failure streak on its
-own throttle key — one fused-memory URL serves every root, so a fixed literal
-label would let a healthy root's success clear a broken root's streak and
-re-arm its opening WARNING every poll cycle. ``fetch_external_statuses`` is
-parameterized by a ``deps`` list rather than a root, so its fixed label is
-already a correct single key.
+Three of those four loops (``fetch_tasks``, ``fetch_statuses``,
+``fetch_task_prose``) are parameterized by ``project_root``, so they compose
+their ``log_label`` through ``mcp_fanout.fanout_label`` to keep each root's
+failure streak on its own throttle key — one fused-memory URL serves every
+root, so a fixed literal label would let a healthy root's success clear a
+broken root's streak and re-arm its opening WARNING every poll cycle.
+``fetch_external_statuses`` is parameterized by a ``deps`` list rather than a
+root, so its fixed label is already a correct single key.
 
-Caching: ``fetch_tasks`` and ``fetch_statuses`` are both cached, at
-deliberately different TTLs (20 s and 5 s). ``fetch_tasks``'s key is a
-:class:`_TasksRead` RECORD — (project_root, statuses, mode) — rather than the
-root alone. Four of its five callers need the whole tree while ``active_tasks``
-narrows, so a root-only key would let one caller's status-filtered result be
-served to the others for up to the TTL window. The record is also the single
-source of the WIRE arguments (:meth:`_TasksRead.wire_arguments`), so the key
-and the request it stands for cannot drift apart.
-``fetch_statuses`` takes no narrowing arguments, so the root alone IS its
-whole key. ``fetch_external_statuses`` is uncached and returns live data.
+Caching: none. Every read here is live; staleness is owned by
+``task_snapshot``'s unit TTL, the one cache a task datum has
+(one-datum-one-path PRD decision 20). ``fetch_task``'s caller owns its cache
+(``task_lookup``), because only the caller knows which answers may be held.
 """
 
 from __future__ import annotations
@@ -46,45 +42,16 @@ import os
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, TypeVar
 
 import httpx
 from shared.task_claimant import is_stranded
 
 from dashboard.config import DashboardConfig
-from dashboard.data.mcp_fanout import TTLCache, fanout_label, first_success
+from dashboard.data.mcp_fanout import fanout_label, first_success
 from dashboard.data.memory import mcp_tool_call
 from dashboard.data.utils import resolve_now
 
-# ---------------------------------------------------------------------------
-# Per-project_root TTL cache for fetch_tasks
-# (mirrors app._load_task_cards / merge_queue.load_task_titles pattern)
-#
-# Code-duplication note: fetch_tasks's own copy of the {TTL constant, store,
-# _clear() hook, store-only-on-success, list()-copy} pattern is now extracted
-# into dashboard.data.mcp_fanout.TTLCache (this task).  app._task_cards_cache
-# and merge_queue._task_titles_cache still implement the pattern inline —
-# extracting a shared helper there would require changes to those modules,
-# which fall outside this task's module lock.  Both caller caches are now
-# primarily redundant for MCP de-duplication (the 20 s inner TTL handles it);
-# they remain for legacy shaping-cost avoidance and are outside this task's
-# scope to remove.
-#
-# Keyed by project_root_str — a small, bounded set in practice — which
-# satisfies TTLCache's documented "bounded key space" assumption (it never
-# evicts individual store/lock entries short of a blanket .clear()).
-# ---------------------------------------------------------------------------
-
-# Within the PRD's recommended 15-30 s staleness window.  Slightly longer than
-# the 10 s caller caches (_TASK_CARDS_TTL_SECONDS / _TASK_TITLES_TTL_SECONDS)
-# because fetch_tasks is the dominant full-tree seam — a monitoring view
-# tolerates brief staleness; the inner TTL dominates net MCP cadence.
-#
-# Caller-cache stacking: app._load_task_cards (10 s) and
-# merge_queue.load_task_titles (10 s) both cache fetch_tasks output on top of
-# this inner cache.  Worst-case combined staleness ≈ caller TTL + inner TTL
-# ≈ 10 s + 20 s = 30 s — at the PRD's upper bound; intentional for a
-# monitoring view where brief staleness is preferable to MCP hammering.
 DEFAULT_PER_CALL_TIMEOUT = 2.0
 """Per-HTTP-request budget for every ``fetch_tasks`` MCP call.
 
@@ -110,7 +77,7 @@ states that a cold session performs these three posts, which is why its
 *timeout* bounds each request and not the operation.
 
 A named tuple rather than a literal ``3``, for the same reason
-``active_tasks._PER_PROJECT_MCP_CALLS`` is one: if the session handshake ever
+``task_snapshot.PER_PROJECT_MCP_CALLS`` is one: if the session handshake ever
 gains a fourth post, the structural invariant in
 ``tests/test_fetch_tasks_whole_operation_budget.py`` fails a test instead of
 silently overrunning in production.
@@ -133,7 +100,7 @@ arithmetic — the two are not coupled in code, so either may be tightened
 independently.
 
 **What that sum does and does NOT claim.** The 6.0 figure is PER URL.
-``fetch_tasks``' ``_refresh`` delegates to
+``fetch_tasks`` delegates (through ``_fanout_read``) to
 ``first_success(config.fused_memory_urls, ...)``, and
 ``mcp_fanout.first_success`` walks its URLs strictly IN ORDER, falling
 through to the next only after the current one fails — so an N-URL
@@ -149,30 +116,21 @@ budget. Without this note, ``6.0 <= 7.0`` reads as a total-worst-case
 guarantee it is not.
 """
 
+
+
 # ---------------------------------------------------------------------------
-# The fetch_tasks cache key: a structured record, not an encoded string
+# The task read record: structured, not an encoded string
 # ---------------------------------------------------------------------------
-# These replace the hand-rolled ``_fetch_tasks_cache_key`` encoder (a ``*``
-# sentinel for None, ``|`` field separators and a ``\x1f`` unit separator).
-# That encoding produced two measured defects, and the shape below makes both
-# UNREPRESENTABLE rather than merely fixed:
-#
-#   OFFSET DRIFT.  The encoder rendered ``|o={offset}`` unconditionally while
-#   ``offset`` only reached the wire alongside ``page_size``, so two reads with
-#   a byte-identical wire request minted two entries.  Here the only read that
-#   HAS an offset is :class:`_OnePage`, and ``wire_arguments`` sends THAT
-#   field rather than a window handed to it, so the bytes on the wire are the
-#   bytes in the key by construction.
-#
-#   STATUSES ORDER.  ``['a','b']`` and ``['b','a']`` encoded differently while
-#   naming one order-insensitive SQL ``IN`` list.  ``frozenset`` collapses them.
+# A read's MCP wire arguments are derived from one record, so no second copy
+# of a window can disagree with the read it stands for.  The only read that
+# HAS an offset is :class:`_OnePage`, and ``wire_arguments`` sends THAT field
+# rather than a window handed to it.
 #
 # The mode is a UNION rather than three flat fields because flat fields would
 # permit `page_size` set with `offset` unset, and a read that is somehow both a
 # page and a walk — invalid states that would then need runtime validation.
 # No field carries a DEFAULT, so a future read mode that forgets to enter one
-# is a pyright construction error AND a runtime TypeError, rather than a
-# valid-but-wrong key that collides silently.
+# is a pyright construction error AND a runtime TypeError.
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,18 +147,6 @@ class _CompleteRead:
 
     ``None`` means one unpaginated request; an int means walk the tree that
     many rows at a time.  Both yield the same set.
-
-    *chunk_size* is nevertheless part of the cache key, and removing it is a
-    SILENT PRODUCTION REGRESSION rather than a simplification.  The positive
-    cache is chunk-INsensitive (both transports agree), but the NEGATIVE cache
-    is chunk-SENSITIVE: ``burndown._fetch_snapshot_tasks`` probes UNPAGINATED
-    and falls back to the chunked walk only when the probe returns the offline
-    marker — which is exactly what an oversize tree produces.  Both caches
-    share this one key (keying them separately is how they drift apart), so a
-    chunk-insensitive key would make probe and fallback ONE key: the fallback
-    would be suppressed by the probe's own failure and never reach the server,
-    and precisely the large projects pagination exists to serve would write no
-    snapshot row — a permanent hole in an append-only table with no backfill.
     """
 
     chunk_size: int | None
@@ -208,15 +154,14 @@ class _CompleteRead:
 
 @dataclass(frozen=True, slots=True)
 class _TasksRead:
-    """One ``fetch_tasks`` read: simultaneously the cache key AND the wire args.
+    """One task read: the record its MCP wire arguments are derived from.
 
-    Being both is the point.  The key and the request dict used to be built by
-    two separate encoders that already disagreed about ``offset``; deriving
-    both from this one record means they cannot disagree again.  For a PAGE
-    read that is enforced rather than merely intended: :meth:`wire_arguments`
-    reads the window off :attr:`mode` — the very field the key hashes — and
-    REFUSES a second one, so no call site can hand the wire a window the key
-    does not carry.
+    The request dict is derived from this record, never assembled beside it,
+    so a read and the request it sends cannot disagree about ``offset``.
+    For a PAGE read that is enforced
+    rather than merely intended: :meth:`wire_arguments` reads the window off
+    :attr:`mode` and REFUSES a second one, so no call site can hand the wire a
+    window the read does not name.
 
     The RETURN CONTRACT is the *mode*'s TYPE — ``type(read.mode)`` answers
     "one page or the whole set?" without parsing anything out of a string.
@@ -234,7 +179,7 @@ class _TasksRead:
         parameter at all.  A :class:`_OnePage` read has no such freedom: its
         window IS :attr:`mode`, so it is read from there and a caller-supplied
         one is a ``TypeError`` rather than a silent override.  Both halves
-        matter.  Deriving it is what makes key/wire OFFSET DRIFT structurally
+        matter.  Deriving it is what makes read/wire OFFSET DRIFT structurally
         impossible instead of a discipline the one page call site happens to
         keep; refusing the redundant argument is what stops a future edit
         (clamping an offset, retrying a short page) from reintroducing the
@@ -249,7 +194,7 @@ class _TasksRead:
         if isinstance(self.mode, _OnePage) and window is not None:
             raise TypeError(
                 f'{self.mode!r} already fixes this read\'s window; passing '
-                f'{window!r} as well is the key/wire disagreement this record '
+                f'{window!r} as well is the read/wire disagreement this record '
                 f'exists to make unrepresentable'
             )
         page = self.mode if isinstance(self.mode, _OnePage) else window
@@ -262,100 +207,30 @@ class _TasksRead:
         return arguments
 
 
-_FETCH_TASKS_TTL_SECONDS = 20.0
-_fetch_tasks_cache: TTLCache[list[dict] | dict, _TasksRead] = TTLCache(
-    ttl_seconds=lambda: _FETCH_TASKS_TTL_SECONDS
-)
-
-# Negative (offline-marker) cache.  ``cache_ok`` on the positive cache stores
-# successes ONLY, which made failure the expensive path: a healthy root rides
-# the 20 s TTL while a broken one re-walks its whole tree on every UI poll.
-#
-# 5.0 s is picked against the two real clocks either side of it:
-#   * SHORTER than _FETCH_TASKS_TTL_SECONDS (20 s), so an outage is re-probed
-#     several times per positive-cache window and recovery is noticed quickly;
-#   * LONGER than data.js's POLL_INTERVAL_MS (3 s), so a broken root costs at
-#     most one tree-walk attempt per two polls instead of one per poll.
-#
-# A SECOND TTLCache instance rather than a change to TTLCache itself: the
-# class carries exactly one TTL per instance and sits on eight other call
-# sites, so parameterising it would be the larger and less obviously correct
-# change.  No mcp_fanout change is required.
-#
-# The two caches CAN both hold a fresh entry for one key, so the read order
-# between them is load-bearing.  The negative lookup sits outside the positive
-# cache's per-key lock, and ``TTLCache`` documents that a ``cache_ok``-rejected
-# value stores nothing and lets "the next lock-queued waiter run its own
-# refresh in turn" — so with two concurrent callers for the same key (the
-# routine case: app._load_task_cards, data.orchestrator, data.merge_queue and
-# data.burndown all fetch the same unnarrowed key on the same poll) waiter A's
-# failure can write a 5 s marker while waiter B's success writes a 20 s
-# positive entry.  ``fetch_tasks`` therefore prefers a fresh POSITIVE entry
-# over a fresh marker: a demonstrated success outranks a retry-suppression
-# hint, and serving the marker there would put a false offline banner over
-# rows that had already loaded.  Both caches are keyed by the IDENTICAL
-# :class:`_TasksRead` record, so a recovered root also repopulates the positive
-# cache on its next attempt.  Keying them differently is exactly how the two
-# drift apart, which is why the record is built once per read and shared.
-_FETCH_TASKS_NEGATIVE_TTL_SECONDS = 5.0
-_fetch_tasks_negative_cache: TTLCache[dict, _TasksRead] = TTLCache(
-    ttl_seconds=lambda: _FETCH_TASKS_NEGATIVE_TTL_SECONDS
-)
-
-
 # ---------------------------------------------------------------------------
-# Per-project_root TTL cache for fetch_statuses
+# Safe page size for the fetch_statuses walk
 # ---------------------------------------------------------------------------
 #
-# WHY THIS EXISTS.  ``fetch_statuses`` was the one per-project MCP call in the
-# post-narrowing design with no cache, and ``active_tasks._shape_one_project``
-# issues it UNCONDITIONALLY (it is ``_resolve_deps``' only bounded fallback,
-# not merely done_count's source).  Because BOTH ``/api/v2/dashboard/tasks``
-# and ``/api/v2/dashboard/scheduler`` route through
-# ``collect_tasks_with_counts``, and ``data.js`` polls both every 3 s, that
-# meant two full-population ``get_statuses`` reads per root per poll — on a
-# nine-root config ~360 uncached status reads a minute.  The narrowing cut
-# wire BYTES dramatically and would have raised backend QUERY count, which
-# cuts against this change's own goal of bounding dashboard->MCP cost.
-#
-# 5.0 s is picked against the same two clocks as the negative cache above:
-#   * STRICTLY SHORTER than _FETCH_TASKS_TTL_SECONDS (20 s), so the status map
-#     is always the fresher half of any row+map pair (done_count can be newer
-#     than the rows, never staler) — see fetch_tasks' "Data consistency" note;
-#   * LONGER than data.js's POLL_INTERVAL_MS (3 s), so the two endpoints'
-#     duplicate read within one poll collapses to one call, and consecutive
-#     polls of one endpoint collapse too.
-#
-# NO negative cache, deliberately, unlike fetch_tasks: a failed get_statuses
-# costs one bounded DEFAULT_PER_CALL_TIMEOUT per URL rather than a full
-# tree-walk, so failure is not the expensive path here; and its offline marker
-# is what puts a root in TASKS_COUNT_UNKNOWN_PROJECTS, a user-visible
-# degradation that should clear on the first poll after recovery rather than
-# up to 5 s later.
-_FETCH_STATUSES_TTL_SECONDS = 5.0
-# NOTE the key type is left DEFAULTED (``str``): fetch_statuses takes no
-# narrowing arguments, so the root alone IS its whole key. Since task 5018
-# that asymmetry against the two _TasksRead-keyed caches above is CHECKED by
-# pyright rather than merely conventional.
-_fetch_statuses_cache: TTLCache[dict] = TTLCache(
-    ttl_seconds=lambda: _FETCH_STATUSES_TTL_SECONDS
-)
+# NO CACHE sits here, deliberately.  The only consumer,
+# ``task_snapshot.acquire_snapshot``, owns a 15 s TTL over the whole snapshot
+# unit — a second, shorter TTL layered under that one is the duplicated
+# staleness the one-datum-one-path PRD removes, and it would let the unit
+# stamp an ``as_of`` newer than the map it is stamping.  The row reads are
+# uncached for the same reason.
 
+STATUSES_SAFE_PAGE_SIZE = 2000
+"""How many statuses one ``get_statuses`` page may carry.
 
-def _fetch_tasks_cache_clear() -> None:
-    """Clear BOTH fetch_tasks TTL caches, positive and negative (test/admin hook)."""
-    _fetch_tasks_cache.clear()
-    _fetch_tasks_negative_cache.clear()
+The server's own documented bound (``_STATUSES_AUTO_PAGE_LIMIT``), and a
+measured one rather than a round number: 2 000 entries is ~46 KB against the
+~62 KB documented-safe MCP tool-response envelope, while 3 000 is ~69 KB —
+past the wall.  An oversized page is NOT clamped server-side; it is rejected
+WHOLESALE, which is the incident paging exists to close.
 
-
-def _fetch_statuses_cache_clear() -> None:
-    """Clear the fetch_statuses TTL cache (test/admin hook).
-
-    Deliberately NOT folded into :func:`_fetch_tasks_cache_clear`: that hook's
-    contract ("both fetch_tasks caches") is asserted by name in the suite, and
-    a caller clearing one seam should not silently reach into the other.
-    """
-    _fetch_statuses_cache.clear()
+Restated here rather than imported because the dashboard does not depend on
+the fused-memory package — this is the wire contract's value, held at the
+seam that speaks it.
+"""
 
 
 def _shape_task(task: dict) -> dict | None:
@@ -366,6 +241,11 @@ def _shape_task(task: dict) -> dict | None:
     ``updatedAt`` is preserved as ``updated_at`` — it is the recency key for
     ordering done tasks and the ``completed`` display timestamp.
 
+    ``description`` stays because ``redux_api.shape_escalations`` embeds this
+    whole dict as each escalation row's ``task`` and the Escalations drawer
+    renders it; ``details`` is dropped because only the Task Detail pane
+    renders it, and that pane reads it through :func:`fetch_task_prose`.
+
     ``claimant_run_id`` and ``heartbeat_at`` are carried through for the
     STRANDED projection (task 3543 / PRD ι): they are the two columns
     :func:`task_is_stranded` reads, and dropping them here is what previously
@@ -374,10 +254,10 @@ def _shape_task(task: dict) -> dict | None:
     emit them) surfaces ``None`` rather than raising — the shaped dict always
     carries the keys, so consumers never have to guard for their absence.
 
-    Mutation warning: :func:`fetch_tasks` caches these dicts by reference and
-    hands the same objects to every caller within the TTL window, so callers
-    must NOT mutate ``claimant_run_id``/``heartbeat_at`` (or any other field)
-    in place — build a fresh row instead.
+    Mutation warning: ``task_snapshot``'s unit cache holds these dicts by
+    reference and hands the same objects to every reader within its TTL, so
+    callers must NOT mutate ``claimant_run_id``/``heartbeat_at`` (or any other
+    field) in place — build a fresh row instead.
     """
     raw_id = task.get('id')
     if raw_id is None:
@@ -403,7 +283,6 @@ def _shape_task(task: dict) -> dict | None:
         'id': tid,
         'title': task.get('title') or '',
         'description': task.get('description') or '',
-        'details': task.get('details') or '',
         'status': task.get('status'),
         'priority': task.get('priority'),
         'dependencies': deps,
@@ -490,8 +369,8 @@ async def _walk_pages(
     self-consistent. Hence no url/config parameter here.
 
     The walk starts at offset 0. A complete read starting mid-tree is not
-    complete, and after task 5018 the cache key for a complete read carries no
-    offset, so honouring one would put two different answers under one key.
+    complete, which is why a :class:`_CompleteRead` carries no offset to
+    honour.
 
     TRUNCATION IS LOUD. Every failure below raises ``ValueError`` and DISCARDS
     whatever rows were accumulated. ``fetch_tasks``' contract distinguishes only
@@ -620,25 +499,159 @@ async def _walk_pages(
     return shaped
 
 
-async def _cached_fanout(
+@dataclass(frozen=True, slots=True)
+class _StatusPage:
+    """One ``get_statuses`` response: the slice it carried, and its envelope.
+
+    ``pagination`` is None when the response carried no envelope, which the
+    tool's contract defines as a COMPLETE answer rather than a missing field.
+
+    *statuses* may be SHORTER than *delivered*: an entry whose id is not an
+    integer is dropped. The walk's ``returned`` cross-check must count
+    *delivered*, what the server actually sent, for the reason
+    :class:`_Page` gives: counting the parsed entries would turn one
+    unparseable id into an offline marker for the whole project.
+    """
+
+    statuses: dict[int, str]
+    delivered: int
+    pagination: dict | None
+
+
+async def _walk_statuses(
+    page_fn: Callable[[int], Awaitable[_StatusPage]],
+    project_root: str,
+) -> dict[int, str]:
+    """Assemble the COMPLETE status map from repeated *page_fn* calls.
+
+    *page_fn* is injected and already bound to ONE url, for the same reason
+    :func:`_walk_pages` binds its own: ``first_success`` tries urls in order,
+    and a walk free to fan out mid-walk would tile pages from two different
+    states of the world.
+
+    ADVANCE BY ``returned``, THE COUNT SERVED.  The envelope comes from
+    ``fused_memory/server/tools.py::_pagination_meta``.  It passes the
+    caller's REQUESTED ``page_size`` through verbatim, sets ``returned`` to
+    the number of entries it actually sliced, and derives
+    ``has_more = offset + returned < total``.  That identity is why
+    ``offset + returned`` is the only advance that tiles the population
+    without gaps: a walk that stops on the server's ``has_more`` has to step
+    exactly as the server counted.  Advancing by the requested size would skip
+    the difference whenever a server serves fewer entries than asked, which
+    produces a silently incomplete census.
+
+    ``get_statuses``' own docstring says the opposite: "Advance by
+    ``pagination['page_size']`` (what was actually served)".  Its
+    implementation does not do that.  Do not switch this walk back to
+    ``page_size`` because of that docstring.  :func:`_walk_pages` reads
+    ``returned`` off the same envelope, so both walkers key on one field.
+
+    ``returned`` is cross-checked against the entries the page actually
+    delivered, because it is the counter the walk advances on.  A page
+    clipped in flight that still claims its full count would skip the clipped
+    entries and terminate normally.  A page that under-reports would re-read
+    entries already held.  Neither is detectable afterwards, so the read is
+    refused.
+
+    TRUNCATION IS LOUD, as in :func:`_walk_pages`: every failure below raises
+    ``ValueError`` and discards the pages in hand.  ``fetch_statuses``'
+    contract distinguishes only a map (complete) from the offline marker, so a
+    short map is indistinguishable from a full one at the call site, and
+    ``census.build_census`` would tally it into a confident under-report of
+    ``total`` — the uniform lie that module exists to refuse.  ``ValueError``
+    is ``first_success``'s soft-failure signal, so the fan-out tries the next
+    url and, on exhaustion, yields the marker.
+
+    Unlike ``_walk_pages`` there is no changed-``total`` coherence check,
+    because the terminator is different: this walk stops on the SERVER's
+    ``has_more``, computed against the population at the instant of each page,
+    where ``_walk_pages`` stops on a client-side ``offset >= total`` comparison
+    that a shrinking total silently satisfies early.
+    """
+    merged: dict[int, str] = {}
+    offset = 0
+    pages = 0
+    page_budget: int | None = None
+    while True:
+        page = await page_fn(offset)
+        merged.update(page.statuses)
+        pages += 1
+
+        meta = page.pagination
+        if meta is None:
+            # No envelope: the response IS the whole map.  Looping blind here
+            # would re-request the same entries forever.
+            break
+
+        has_more = meta.get('has_more')
+        returned = meta.get('returned')
+        total = meta.get('total')
+        if not isinstance(has_more, bool) or not isinstance(returned, int):
+            # Without these two, completeness is UNVERIFIABLE — and an
+            # unverifiable read must not be reported as a complete one.
+            raise ValueError(
+                f'get_statuses pagination for {project_root} is unverifiable at '
+                f'offset {offset}: has_more={has_more!r}, returned={returned!r}'
+            )
+        if returned != page.delivered:
+            raise ValueError(
+                f'get_statuses pagination for {project_root} inconsistent at '
+                f'offset {offset}: server claims returned={returned} but sent '
+                f'{page.delivered} status(es)'
+            )
+        if not has_more:
+            break
+        if returned <= 0:
+            # More entries are owed, but the page that would carry them cannot
+            # advance the offset, so this server cannot be paged past.
+            raise ValueError(
+                f'get_statuses pagination for {project_root} cannot advance at '
+                f'offset {offset}: more entries remain but returned={returned}'
+            )
+
+        if page_budget is None:
+            # BOUND THE WALK.  ``has_more`` is the loop's only terminator and
+            # it is server-reported, so a server that never lowers it would
+            # spin here on the same httpx client the render polls share.
+            # Derived from the FIRST page's ``returned`` because that is the
+            # rate the walk actually advances at; the +2 covers the final
+            # partial page plus one page of slack.
+            if not isinstance(total, int):
+                raise ValueError(
+                    f'get_statuses pagination for {project_root} reports no usable '
+                    f'total at offset {offset}: total={total!r}'
+                )
+            page_budget = math.ceil(total / returned) + 2
+        if pages >= page_budget:
+            raise ValueError(
+                f'get_statuses pagination for {project_root} exceeded its '
+                f'{page_budget}-page budget at offset {offset} '
+                f'(total={total}); refusing to keep walking'
+            )
+        offset += returned
+    return merged
+
+
+
+
+async def _fanout_read(
     config: DashboardConfig,
     read: _TasksRead,
     strategy: Callable[[str], Awaitable[list[dict]]],
     label: str,
 ) -> list[dict] | dict:
-    """Fan out *strategy* across the configured urls, through BOTH task caches.
+    """Fan *strategy* out across the configured urls: rows, or the offline marker.
 
-    THE one place the fan-out / positive cache / negative cache / marker
-    policy lives.  Every public read routes through it and they differ only in
-    the *read* record they build and the *strategy* they bind — so there is no
-    second copy of any of this to drift out of step (INV-5).
+    THE one place the fan-out and offline-marker policy of the two row reads
+    lives.  Both public reads route through it and differ only in the *read*
+    record they build and the *strategy* they bind, so there is no second copy
+    of this to drift out of step (INV-5).  Nothing is stored: every call
+    reaches the substrate, and a failure is returned to the caller that met it
+    and remembered nowhere, so the very next call retries.
 
     *strategy* is invoked with ONE url at a time and is already bound to it, so
-    whatever it does (a single page, or a whole pinned-url walk) stays below
-    the cache: a per-page public call would mint one entry and one lock per
-    page, and let a failed page write a 5 s marker served mid-walk.
-
-    The bound *strategy* carries the HTTP client and the per-request timeout
+    whatever it does (a single page, or a whole pinned-url walk) is one attempt
+    against one server.  It carries the HTTP client and the per-request timeout
     budget a read actually costs; this layer neither needs nor receives them.
 
     *label* NAMES THE CALLING READ, and is a parameter rather than a literal
@@ -647,50 +660,12 @@ async def _cached_fanout(
     one stream and log either failure under the other's name — the operator
     debugging a page read would be told ``fetch_tasks`` had failed.
     """
-    async def _refresh() -> list[dict] | dict:
-        return await first_success(
-            config.fused_memory_urls,
-            strategy,
-            log_label=fanout_label(label, read.project_root),
-            offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
-        )
-
-    # A fresh negative entry short-circuits the attempt.  The marker is still
-    # RETURNED, so degradation stays exactly as visible to the caller as it was
-    # before — only the retry is suppressed.
-    #
-    # UNLESS a fresh positive entry also exists (see the negative-cache note
-    # above: a concurrent failure+success pair leaves both fresh).  Then fall
-    # through and serve the data: the marker exists to suppress a RETRY, not to
-    # withhold a result already in hand, and reporting a root offline while
-    # holding fresh rows for it is the false-banner failure this whole seam is
-    # meant to avoid.  Falling through costs no MCP call — ``get_or_refresh``
-    # returns the same fresh entry this check just saw.  If it expires in the
-    # gap the worst case is one extra attempt, which is strictly better than a
-    # wrong answer.
-    suppressed = _fetch_tasks_negative_cache.get_fresh(read)
-    if suppressed is not None and _fetch_tasks_cache.get_fresh(read) is None:
-        return suppressed
-
-    result = await _fetch_tasks_cache.get_or_refresh(
-        read, _refresh, cache_ok=lambda v: isinstance(v, list),
+    return await first_success(
+        config.fused_memory_urls,
+        strategy,
+        log_label=fanout_label(label, read.project_root),
+        offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
     )
-    if not isinstance(result, list):
-        # Record the offline marker, under the SAME record the positive cache
-        # is keyed by — keying the two differently is exactly how they drift.
-        # ``get_or_refresh`` is the store path because ``TTLCache`` exposes no
-        # bare setter and this needs no ``mcp_fanout`` change; the default
-        # always-true ``cache_ok`` keeps it, and its per-key lock makes a
-        # concurrent second failure reuse the first marker rather than race it.
-        async def _mark() -> dict:
-            return result
-
-        await _fetch_tasks_negative_cache.get_or_refresh(read, _mark)
-        return result
-    # Shallow copy: list-level mutation by a caller is isolated from the cached
-    # entry, the inner dicts are shared.  Both halves are documented on the
-    # public reads.
-    return list(result)
 
 
 def task_is_stranded(task: Mapping[str, Any], now: datetime | None = None) -> bool:
@@ -747,8 +722,8 @@ async def fetch_task_page(
     let a caller ask for "a page" without saying WHICH page and silently get
     the first, which is how a page and a whole tree came to look alike
     (esc-4360-7).  For the complete set call :func:`fetch_tasks` — a different
-    function because it is a different contract, and the two can no longer
-    compute the same cache key.
+    function because it is a different contract, carried by a different read
+    mode.
 
     **Ascending id is the only ordering key.**  *page_size*/*offset* are a
     POST-FETCH in-memory slice in ``server/tools.py::get_tasks``, over a list
@@ -762,25 +737,11 @@ async def fetch_task_page(
     is not expressible server-side).  That second gap is why reaching the
     high-id end takes a COMPUTED *offset* rather than a ``LIMIT``.
 
-    **The key space is NOT a small fixed set.**  ``active_tasks``' terminal
-    window passes ``offset=max(0, n_terminal - window)``, computed from a live
-    task count that grows every time a task completes, so a fresh key is
-    minted on every completion.  Each retired key held a 400-row list — rows
-    carrying description/details/metadata — plus an ``asyncio.Lock``, forever
-    (task 3857 review).  Quantizing the offset does NOT fix this and was
-    rejected: ``n_terminal`` grows monotonically, so quantized offsets do too
-    — that slows the leak by the quantum, it does not bound it.
-    :meth:`TTLCache._evict_expired` evicts entries past a multiple of the TTL,
-    which bounds the resident set to "keys requested within the eviction
-    horizon" no matter how many distinct keys are ever used.  That is the real
-    invariant, it lives where the store lives, and it holds for every
-    ``TTLCache`` caller.
-
-    Caching, *statuses* narrowing, copy isolation, graceful degradation,
-    negative caching and the per-request *timeout* budget behave IDENTICALLY
-    here and are documented once on :func:`fetch_tasks`.  Both reads go
-    through the single :func:`_cached_fanout` core, so there is deliberately
-    no second copy of that policy — or of its description — to drift.
+    *statuses* narrowing, the offline marker, the absence of any cache and the
+    per-request *timeout* budget behave IDENTICALLY here and are documented
+    once on :func:`fetch_tasks`.  Both reads go through the single
+    :func:`_fanout_read` core, so there is deliberately no second copy of that
+    policy — or of its description — to drift.
     """
     read = _TasksRead(
         str(project_root),
@@ -791,15 +752,15 @@ async def fetch_task_page(
     async def _call(url: str) -> list[dict]:
         """Read the whole answer from ONE url: for a page read, that is a page."""
         # No window is passed: `read.mode` IS this read's window, so the wire
-        # request is derived from the cache key rather than from a second copy
-        # of *page_size*/*offset* that could drift from it.
+        # request is derived from the read record rather than from a second
+        # copy of *page_size*/*offset* that could drift from it.
         #
         # The pagination envelope is deliberately DISCARDED. It bounds a WALK;
         # here the requested window IS the contract, and a short final page is
         # a correct answer rather than a truncation to detect.
         return (await _fetch_page(client, url, read, None, timeout)).rows
 
-    return await _cached_fanout(config, read, _call, 'fetch_task_page')
+    return await _fanout_read(config, read, _call, 'fetch_task_page')
 
 
 async def fetch_tasks(
@@ -821,11 +782,11 @@ async def fetch_tasks(
     **Chunking (``chunk_size``) selects TRANSPORT, never the contract.**
     ``None`` issues one unpaginated request; an int WALKS the tree that many
     rows at a time and returns the assembled complete set.  Both yield the
-    same rows.  It exists for the burndown collector, whose whole-tree read on
-    a large project can exceed the MCP transport's response limit; that
-    response is rejected wholesale, so the collector's cycle writes no row at
-    all into an append-only history table — a permanent hole no later cycle
-    backfills (the hole is logged; no backfill exists).
+    same rows.  It was built for the burndown collector, whose whole-tree read
+    on a large project can exceed the MCP transport's response limit (that
+    response is rejected wholesale).  The collector now reads through
+    ``task_snapshot.acquire_snapshot`` instead, and no production caller passes
+    *chunk_size* today.
 
     It is spelled ``chunk_size`` and not ``page_size`` on purpose.  Since the
     public split this module holds BOTH meanings side by side — the slice
@@ -834,18 +795,11 @@ async def fetch_tasks(
     you are inside, is precisely the ambiguity that produced esc-4360-7.  The
     MCP WIRE argument is still ``page_size``; only the Python parameter differs.
 
-    **``chunk_size`` is nevertheless PART OF THE CACHE KEY, and removing it is
-    a silent production regression rather than a simplification.**  Why, in
-    full, is stated once on :class:`_CompleteRead`, which carries the field —
-    read it before "tidying" a transport detail out of a key.
-
     The RETURN CONTRACT is what discriminates this read from a page read, and
-    it does so structurally: the cache key's ``mode`` is a
-    :class:`_CompleteRead` rather than an :class:`_OnePage`, so a walk at
-    ``chunk_size=10`` and a genuine first-page-of-10 cannot compute one key and
-    be served to each other — a complete tree handed to a caller that asked for
-    one page, or a 10-row page handed to the burndown collector as the whole
-    tree.
+    it does so structurally: this read's record carries a
+    :class:`_CompleteRead` mode, never an :class:`_OnePage`, so a walk at
+    ``chunk_size=10`` and a genuine first-page-of-10 are different reads with
+    different answers rather than one read with two meanings.
 
     *statuses* and *timeout* are threaded into EVERY page request of a walk.
     For *statuses* that is required for coherence: ``server/tools.py::get_tasks``
@@ -865,9 +819,7 @@ async def fetch_tasks(
     transport envelope on its own.  Nor is it free — the server materialises
     the whole list and slices in memory per request, so a chunk size of P on an
     N-task project costs ``ceil(N/P)`` SEQUENTIAL round trips and O(N**2/P)
-    server-side row builds.  The row-density measurement and the derivation of
-    the only chunk size in the tree today live in one place:
-    ``burndown._SNAPSHOT_PAGE_SIZE``.
+    server-side row builds.
 
     **A chunked read is all-or-nothing.**  If a page cannot be verified as
     complete, the partial rows are DISCARDED and the offline marker is returned
@@ -881,67 +833,29 @@ async def fetch_tasks(
     prefix looking complete); and a walk exceeding the page budget derived from
     the first response's ``total``.  A
     truncated ``list`` would be indistinguishable from a complete one at every
-    call site, and ``collect_snapshot`` would write that undercount into an
-    append-only history table as fact.  An empty page with no rows still owed
+    call site, and a caller writing history would record that undercount as
+    fact.  An empty page with no rows still owed
     (``total <= 0``, or ``offset >= total``) is a complete read of an empty or
     exhausted tree and still returns ``[]`` — a true zero, not a truncation.
 
-    **Caching.**  Results are cached under a :class:`_TasksRead` record —
-    (project_root, statuses, mode) — for ``_FETCH_TASKS_TTL_SECONDS`` (~20 s)
-    to avoid hammering the MCP server on every render.  Whatever a given
-    narrowing returns is cached unchanged, and an unnarrowed entry and a
-    narrowed entry for the same root are INDEPENDENT — which is what keeps a
-    narrowed read from serving a status-filtered subset to the full-tree
-    callers.  Offline/error markers never enter the POSITIVE cache, so a
-    transient failure does not pin empty results for the TTL window.  The
-    policy itself lives once, in :func:`_cached_fanout`; this section and
-    the three below describe it for BOTH public reads.
-
-    **Copy isolation (list-level only):** returns a shallow ``list()`` copy on
-    every call, so list-level mutations (``result.clear()``, ``result.append()``)
-    do not affect the cached entry.  Inner task dicts are shared references —
-    mutating a field in place (e.g. ``result[0]['status'] = 'x'``) WILL corrupt
-    the cached entry and other callers' views within the TTL window.  Current
-    callers (active_tasks, shape_escalations) build fresh rows and do not mutate
-    source dicts.  Switch to ``copy.deepcopy(cached[1])`` if element-level
-    isolation becomes necessary.
-
-    **Graceful degradation:** during an MCP outage that begins while a valid
-    cache entry exists, callers receive the stale cached list (not the offline
-    marker) for up to ``_FETCH_TASKS_TTL_SECONDS`` before the entry expires and
-    a fresh attempt is made.  This delays outage detection by up to ~20 s —
-    intentional for a monitoring view (stale data preferable to a blank tab).
-
-    **Negative caching:** once that entry does expire and the attempt fails,
-    the resulting offline marker is held for
-    ``_FETCH_TASKS_NEGATIVE_TTL_SECONDS`` (~5 s) under the SAME key, so a
-    broken root stops being the expensive path.  The marker is still returned
-    to every caller in the window — the retry is suppressed, the degradation
-    signal is not — and the negative entry is per (project_root, narrowing,
-    mode), so one failing read never blinds a healthy sibling root or a
-    differently narrowed read of the same root.  A fresh POSITIVE entry
-    outranks the marker, so a success that raced a failure is served rather
-    than shadowed; the marker still suppresses the retry either way.
-
-    **Data consistency:** ``fetch_statuses`` is cached too, but at a much
-    shorter TTL (``_FETCH_STATUSES_TTL_SECONDS``, ~5 s), so callers that
-    combine a cached task tree (this function) with a status map in the same
-    render may observe transiently inconsistent rows for up to ~20 s (e.g. a
-    task listed as in-progress in the tree but already done per the status
-    map).  The status map is the FRESHER of the two by construction — its TTL
-    is strictly shorter — so the skew never runs the other way.  The
-    pre-existing 10 s caller caches had this property at a narrower window;
-    the 20 s inner cache widens it uniformly across all callers.
+    **No cache.**  Every call reaches the substrate; staleness is owned by
+    ``task_snapshot``'s unit TTL, the one cache a task datum has (PRD decision
+    20).  An offline marker is returned to the caller that met the failure and
+    stored nowhere, so the very next call retries.  Every call shapes its rows
+    afresh, so no caller shares a list with another through this read.  A
+    caller pairing this read with :func:`fetch_statuses` measures both halves
+    live, and ``task_snapshot``'s ``skew_seconds`` reports the gap between
+    them.
 
     **Server-side narrowing.**  *statuses* is forwarded to the ``get_tasks``
     MCP tool and is added to the arguments dict only when actually requested,
     so a caller that narrows nothing sends a dict byte-identical to the
-    pre-narrowing shape — the four full-tree callers
-    (``app._load_task_cards``, ``data.orchestrator``, ``data.merge_queue``,
-    ``data.burndown``) are unaffected.  It is a REAL server-side row filter —
-    it becomes ``WHERE tag = ? AND status IN (...)`` in SQL, so narrowing with
-    it cuts backend work, not just wire bytes.  ``None`` (the default) means
-    "no filter"; an EMPTY LIST is a valid, distinct "return nothing" request
+    pre-narrowing shape — the one full-tree caller,
+    ``app._fanout_probe_completion``, is unaffected.  It is a REAL server-side
+    row filter — it becomes ``WHERE tag = ? AND status IN (...)`` in SQL, so
+    narrowing with it cuts backend work, not just wire bytes.  ``None`` (the
+    default) means "no filter"; an EMPTY LIST is a valid, distinct "return
+    nothing" request
     and is therefore SENT rather than dropped — which is why every guard on
     this path tests ``is not None`` and never truthiness, ``frozenset()``
     being falsy.  A bare string is rejected server-side with a
@@ -958,26 +872,12 @@ async def fetch_tasks(
     ``tools/call``), so the worst case here is roughly ``3 * timeout`` plus
     the server's think time — and that is before the fan-out tries a second
     URL. A caller needing a hard bound must still wrap this in
-    ``asyncio.wait_for``; every route caller now does, and the two layers are
-    complementary rather than redundant.
-    ``active_tasks.collect_tasks_with_counts`` was first, with its own
-    per-project budget; ``orchestrator.discover_orchestrators``,
-    ``merge_queue.load_task_titles`` and ``app._load_task_cards`` follow it,
-    each binding a named module constant to
-    :data:`DEFAULT_WHOLE_OPERATION_BUDGET`.
-
-    EVERY caller is now whole-operation bounded, including the background
-    ones (task 4884 / #4424 closed the last gap). ``burndown.collect_snapshot``
-    binds ``burndown._SNAPSHOT_PER_ROOT_BUDGET`` around each root's read rather
-    than :data:`DEFAULT_WHOLE_OPERATION_BUDGET`, and that discrepancy is
-    DELIBERATE — do not "fix" it. Its read can fall back to
-    ``paginate=True``, ONE call that internally walks ``ceil(N/page_size)``
-    SEQUENTIAL round trips (measured ~209 s for one root of this repo's size),
-    so a 7.0 s bound would time out every big root on every cycle and hole an
-    APPEND-ONLY chart that no later cycle backfills. It shares this
-    convention's SHAPE — a named module constant, ``asyncio.wait_for``, expiry
-    surfacing as a handled per-root exception — and differs only in its value;
-    the derivation is on that constant.
+    ``asyncio.wait_for``, and the two layers are complementary rather than
+    redundant. ``task_snapshot._bounded`` does so around each of the snapshot
+    unit's reads. The one caller deliberately left unbounded is
+    ``app._fanout_probe_completion``: the /healthz probe keeps its read
+    outstanding so a wedge stays observable, and
+    ``app._MCP_PROBE_OUTSTANDING_LIMIT`` turns that read's age into a verdict.
     """
     read = _TasksRead(
         str(project_root),
@@ -991,17 +891,16 @@ async def fetch_tasks(
 
         if chunk_size is not None:
             # The walk binds a SINGLE url per first_success attempt — the
-            # coherence checks assume one server — and sits BELOW the cache, so
-            # a failed page cannot mint a per-page marker served mid-walk.
-            # Both constraints now hold BY CONSTRUCTION: `_walk_pages` takes no
-            # url/config and is reachable only from inside a bound strategy.
+            # coherence checks assume one server.  That holds BY CONSTRUCTION:
+            # `_walk_pages` takes no url/config and is reachable only from
+            # inside a bound strategy.
             return await _walk_pages(page_fn, read.project_root, chunk_size)
 
         # One unpaginated request: no chunk to walk, and the whole tree is the
         # answer.  The envelope, if any, is irrelevant — nothing is being paged.
         return (await page_fn(None)).rows
 
-    return await _cached_fanout(config, read, _call, 'fetch_tasks')
+    return await _fanout_read(config, read, _call, 'fetch_tasks')
 
 
 async def fetch_external_statuses(
@@ -1050,58 +949,52 @@ async def fetch_statuses(
     """Fetch a compact ``{int(id): status}`` map for *project_root* via MCP.
 
     ~95% smaller than ``fetch_tasks``, so it is the right seam for a
-    status-only caller.  The sole consumer today is
-    ``active_tasks.collect_done_counts``, which needs nothing but a per-status
-    count.
+    status-only caller.  The sole consumer is
+    ``task_snapshot.acquire_snapshot``, which tallies the map into a
+    ``TaskCensus`` and hands ``active_tasks`` the raw map as ``_resolve_deps``'
+    bounded fallback for a dependency outside the fetched rows.
 
     NOTE: the burndown collector used to be the headline consumer and is NOT
     one any more — ``burndown.collect_snapshot`` moved to ``fetch_tasks`` in
     task 3543 because this compact map carries no claimant columns, so the
-    live/stranded split is physically underivable from it.  (The mirror of
-    this note lives on ``collect_done_counts``; keep the two in step.)
+    live/stranded split is physically underivable from it.
 
-    Returns ``{'offline': True, 'error': str}`` if every server fails.
+    Returns ``{'offline': True, 'error': str}`` if every server fails, or if
+    any page of the walk does — a partial map is never served as a complete
+    one (see :func:`_walk_statuses`).
 
-    **Caching.** Successful reads are held for
-    ``_FETCH_STATUSES_TTL_SECONDS`` (~5 s) in a per-``project_root`` TTL cache
-    — see that constant for why this call, of all of them, needs one and why
-    5 s is the number.  The key is the root ALONE: unlike ``fetch_tasks`` this
-    function takes no narrowing arguments, so there is no second dimension to
-    collapse.  *timeout* is deliberately NOT part of the key — it is a
-    per-request budget, not a narrowing argument, so two callers passing
-    different budgets are asking for the identical map and either may serve
-    the other.  Offline markers are NOT cached (``cache_ok``), so a broken
-    root is re-probed on every poll and recovery is noticed immediately.  The
-    returned mapping is a shallow COPY, so a caller mutating it cannot poison
-    the entry for the next one.
+    **Paging.** The map is assembled by walking
+    :data:`STATUSES_SAFE_PAGE_SIZE`-sized pages, because an unpaginated read
+    of a large population is rejected wholesale by the MCP transport.  Each
+    page is one HTTP request; the WALK is one operation, and the caller bounds
+    it as one — see ``task_snapshot.PER_PROJECT_MCP_CALLS``.
 
-    **Per-request budget.** *timeout* is threaded into
-    :func:`dashboard.data.memory.mcp_tool_call` exactly as ``fetch_tasks``
-    threads its own, and DEFAULTS to the same shared
-    ``DEFAULT_PER_CALL_TIMEOUT``.  This is not decoration: ``get_statuses`` is
-    one of the three calls enumerated in
-    ``active_tasks._PER_PROJECT_MCP_CALLS``, whose budget invariant is only a
-    true statement about the shipped system if every enumerated call actually
-    carries the term.  Left on ``mcp_tool_call``'s 10 s default, this one call
-    could alone exceed the per-project budget the arithmetic claims to bound.
+    **No cache.** Reads are live.  The consumer above owns a 15 s TTL over the
+    whole snapshot unit, and a second TTL under it would let that unit serve a
+    map older than the ``as_of`` it stamps.  The returned mapping is freshly
+    built by the walk, so a caller may mutate it freely.
 
-    The DEFAULT is not the term that invariant uses, though — do not compute
-    the Tasks-tab arithmetic from it.  ``active_tasks._shape_one_project``
-    passes ``active_tasks._TASKS_PER_CALL_TIMEOUT`` (measured, and wider than
-    the shared default) into all three of its calls, so the shipped invariant
-    is ``_TASKS_PER_CALL_TIMEOUT * 3 <= _TASKS_PER_PROJECT_BUDGET`` — which is
-    what ``test_tasks_budget.py`` assertion (a) checks.  Reading the shared
-    default into that sum instead reports slack that does not exist.  The
-    shared default stays where it is deliberately: it is bound into three
-    unrelated route budgets via ``DEFAULT_WHOLE_OPERATION_BUDGET``, none of
-    which fetches a 5 000-task tree, so the Tasks tab widens its own constant
-    rather than theirs — see ``_TASKS_PER_CALL_TIMEOUT`` for that rationale.
+    **Per-request budget.** *timeout* bounds ONE page request and is threaded
+    into :func:`dashboard.data.memory.mcp_tool_call` exactly as ``fetch_tasks``
+    threads its own, defaulting to the same shared
+    ``DEFAULT_PER_CALL_TIMEOUT``.  Left on ``mcp_tool_call``'s 10 s default a
+    single page could alone exceed the per-project budget its caller's
+    arithmetic claims to bound.  It is deliberately NOT a whole-walk bound:
+    that belongs to the caller, which wraps the walk in one
+    ``asyncio.wait_for`` (``task_snapshot``, design decision 2), and the two
+    layers are complementary rather than redundant.
     """
     project_root_str = str(project_root)
 
-    async def _call(url: str) -> dict[int, str]:
+    async def _page(url: str, offset: int) -> _StatusPage:
+        """Read ONE page from *url*, shaped and with its envelope kept."""
         result = await mcp_tool_call(
-            client, url, 'get_statuses', {'project_root': project_root_str},
+            client, url, 'get_statuses',
+            {
+                'project_root': project_root_str,
+                'page_size': STATUSES_SAFE_PAGE_SIZE,
+                'offset': offset,
+            },
             timeout=timeout,
         )
         if 'error' in result and 'statuses' not in result:
@@ -1114,19 +1007,154 @@ async def fetch_statuses(
                 out[int(raw_id)] = status
             except (TypeError, ValueError):
                 continue
-        return out
+        meta = result.get('pagination')
+        return _StatusPage(out, len(raw), meta if isinstance(meta, dict) else None)
 
-    async def _refresh() -> dict:
-        return await first_success(
-            config.fused_memory_urls,
-            _call,
-            log_label=fanout_label('fetch_statuses', project_root_str),
-            offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
+    async def _call(url: str) -> dict[int, str]:
+        """Read the whole map from ONE url, pinned for the duration of the walk."""
+        return await _walk_statuses(
+            functools.partial(_page, url), project_root_str,
         )
 
-    result = await _fetch_statuses_cache.get_or_refresh(
-        project_root_str,
-        _refresh,
-        cache_ok=lambda v: isinstance(v, dict) and not v.get('offline'),
+    return await first_success(
+        config.fused_memory_urls,
+        _call,
+        log_label=fanout_label('fetch_statuses', project_root_str),
+        offline_result=lambda errs: {'offline': True, 'error': '; '.join(errs)},
     )
-    return dict(result) if isinstance(result, dict) else result
+
+
+@dataclass(frozen=True, slots=True)
+class TaskProse:
+    """One task's description and details, as the Task Detail pane renders them."""
+
+    description: str
+    details: str
+
+    def to_wire(self) -> dict[str, str]:
+        """The pair's JSON spelling; the one place it is written down."""
+        return {'description': self.description, 'details': self.details}
+
+
+@dataclass(frozen=True, slots=True)
+class TaskNotFound:
+    """fused-memory answered definitively: the root holds no task with that id."""
+
+    detail: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskReadOffline:
+    """No fused-memory URL answered; *detail* names each URL's failure."""
+
+    detail: str
+
+
+TaskProseRead = TaskProse | TaskNotFound | TaskReadOffline
+TaskRowRead = dict | TaskNotFound | TaskReadOffline
+
+_Projected = TypeVar('_Projected')
+
+
+async def _read_task(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    project_root: str | os.PathLike[str],
+    task_id: int,
+    *,
+    timeout: float,
+    log_name: str,
+    project: Callable[[dict], _Projected],
+) -> _Projected | TaskNotFound | TaskReadOffline:
+    """Read ONE task through fused-memory's ``get_task``, projected by *project*.
+
+    The single place the ``get_task`` wire answer is classified:
+
+    - fused-memory's ``TaskNotFoundError``, matched on its structured
+      ``error_type``, is RETURNED as :class:`TaskNotFound` from the per-URL
+      call, not raised: ``first_success`` would treat a raised ``ValueError``
+      as a soft failure and ask the next URL, reporting an absent task as an
+      outage;
+    - any other tool error, or an empty result, raises ``ValueError`` — a soft
+      failure, so the next URL is asked; *project* may raise it too;
+    - every URL failing is :class:`TaskReadOffline` naming each failure.
+
+    *timeout* is per HTTP request; the caller bounds the whole read.
+    """
+    root = str(project_root)
+
+    async def _call(url: str) -> _Projected | TaskNotFound:
+        result = await mcp_tool_call(
+            client, url, 'get_task', {'id': str(task_id), 'project_root': root},
+            timeout=timeout,
+        )
+        if result.get('error_type') == 'TaskNotFoundError':
+            return TaskNotFound(str(result['error']))
+        if 'error' in result or not result:
+            raise ValueError(str(result.get('error', 'empty result')))
+        return project(result)
+
+    return await first_success(
+        config.fused_memory_urls,
+        _call,
+        log_label=fanout_label(log_name, root),
+        offline_result=lambda errs: TaskReadOffline('; '.join(errs)),
+    )
+
+
+def _prose_of(result: dict) -> TaskProse:
+    """Missing prose normalises to ``''``, as :func:`_shape_task` does for ``description``."""
+    return TaskProse(result.get('description') or '', result.get('details') or '')
+
+
+def _row_of(result: dict) -> dict:
+    """The :func:`_shape_task` row; an id it cannot parse is a soft failure."""
+    row = _shape_task(result)
+    if row is None:
+        raise ValueError(f'get_task answered with an unparseable id {result.get("id")!r}')
+    return row
+
+
+async def fetch_task_prose(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    project_root: str | os.PathLike[str],
+    task_id: int,
+    *,
+    timeout: float = DEFAULT_PER_CALL_TIMEOUT,
+) -> TaskProseRead:
+    """Read ONE task's description/details for the Tasks tab's Task Detail pane.
+
+    The ACTIVE_TASKS rows omit both fields; the pane fetches them here for the
+    selected task only. Each outcome is its own type because the route answers
+    each with a different status: :class:`TaskProse`, :class:`TaskNotFound`
+    or :class:`TaskReadOffline`, classified by :func:`_read_task`.
+
+    *timeout* is per HTTP request; the caller bounds the whole read.
+    Uncached, deliberately: a primary-key lookup fetched only on selection.
+    """
+    return await _read_task(
+        client, config, project_root, task_id,
+        timeout=timeout, log_name='fetch_task_prose', project=_prose_of,
+    )
+
+
+async def fetch_task(
+    client: httpx.AsyncClient,
+    config: DashboardConfig,
+    project_root: str | os.PathLike[str],
+    task_id: int,
+    *,
+    timeout: float = DEFAULT_PER_CALL_TIMEOUT,
+) -> TaskRowRead:
+    """Read ONE task's dashboard row — the :func:`_shape_task` row ``fetch_tasks`` serves.
+
+    The per-id read for a caller that needs a few tasks, not the tree:
+    :class:`TaskNotFound` and :class:`TaskReadOffline` are classified by
+    :func:`_read_task`. *timeout* is per HTTP request; the caller bounds the
+    whole read. Uncached here; its caller owns the cache.
+    """
+    return await _read_task(
+        client, config, project_root, task_id,
+        timeout=timeout, log_name='fetch_task', project=_row_of,
+    )

@@ -42,6 +42,10 @@ logger = logging.getLogger(__name__)
 #: returned (SPOT).
 _HINT_SEARCH_LIMIT = 3
 
+#: How many leading memory_hints queries a reconciliation run executes.
+#: audit_trail_rotation.py never sheds this prefix.
+HINT_QUERIES_EXECUTED = 3
+
 #: `write_ops.source` for a memory_hints execution. A distinct value from the
 #: MCP boundary's 'mcp_tool' so a consumer can tell a reconciliation-originated
 #: read from an agent-originated one without re-deriving it from `operation`.
@@ -314,7 +318,7 @@ class ContextAssembler:
         journal = getattr(self.memory, 'write_journal', None)
         _hint_exc_logged = False
         _hint_journal_exc_logged = False
-        for query in queries[:3]:  # cap hint queries
+        for query in queries[:HINT_QUERIES_EXECUTED]:
             try:
                 results = await self.memory.search(
                     query=query,

@@ -38,6 +38,7 @@ shape (`test_capability_guard_http.py`).
 from __future__ import annotations
 
 import logging
+import subprocess
 import sys
 from pathlib import Path
 
@@ -112,6 +113,19 @@ def _write_legibility_yaml(project_root, *, escalation_port):
     return config_path
 
 
+def _commit_all(repo):
+    """Make *repo* a git repo with one commit: census.main resolves as_of_sha
+    from the censused project's HEAD and exits 1 before run_census otherwise."""
+    for args in (
+        ('init', '-q', '-b', 'main'),
+        ('config', 'user.email', 'test@example.com'),
+        ('config', 'user.name', 'Test'),
+        ('add', '-A'),
+        ('commit', '-q', '-m', 'fixture'),
+    ):
+        subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True)
+
+
 # WHY THE `with census.own_endpoint():` BLOCKS BELOW (task 5279 W1).
 #
 # census refuses every real MCP POST made from inside a pytest process,
@@ -146,6 +160,7 @@ def live_census_project(tmp_path, serve_escalation_mcp, monkeypatch):
     project_root = tmp_path / 'project'
     project_root.mkdir()
     _write_legibility_yaml(project_root, escalation_port=port)
+    _commit_all(project_root)
 
     def _raising_run_census(**kwargs):
         raise RuntimeError(_RAISED_MESSAGE)

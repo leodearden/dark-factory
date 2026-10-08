@@ -61,6 +61,12 @@ max_concurrent_tasks: 24
 #
 # RED TIER: lock_depth is not in RELOADABLE_FIELDS. This takes effect at the next
 # orchestrator restart, not on reload_config.
+#
+# Retuning a knob here can turn red any test that pins a value derived from it
+# (094d634465 did, at this knob). Fix such a test to read the value live; never
+# pin the new value. Decision: docs/config-retune-gate.md (task 3886); guards:
+# tests/scripts/test_config_retune_gate_decision.py and
+# orchestrator/tests/test_operational_config_binding.py.
 lock_depth: 12
 
 # Verification commands (dark-factory multi-subproject layout)
@@ -75,13 +81,31 @@ lock_depth: 12
 # --timeout=300 (a CLI --timeout overrides each subproject's pyproject.toml
 # `[tool.pytest.ini_options].timeout`, which was 60 when this was written and
 # is now itself 300 — see shared/pyproject.toml, 2026-09-12):
-# orchestrator/fused-memory run pytest-xdist, and
+# some segments run pytest-xdist, and
 # under host CPU oversubscription a starved xdist worker crosses that ceiling,
 # gets os._exit()'d by pytest-timeout's thread method, and
 # --max-worker-restart=0 turns that into a false-failing per-test "node down"
-# on whatever test happens to be running. A uniform ``-n`` cap was rejected:
-# shared/escalation/dashboard declare no pytest-xdist, so ``-n`` would error
-# with "unrecognized arguments" on those segments. A 6th segment now also runs
+# on whatever test happens to be running. A uniform ``-n`` cap on THIS chain was
+# rejected while some member did not declare pytest-xdist: ``-n`` errors with
+# "unrecognized arguments" on any segment whose member lacks the plugin. Tasks
+# 5408 and 5486 emptied that set, so that reason no longer holds; whether to cap
+# this chain is a separate decision, not taken here. WHICH members declare it is
+# deliberately not restated here, because a list like that drifts silently. What
+# is gated instead, at its full width: every pytest leg that will RUN ``-n`` must
+# select a member that declares the plugin, whether ``-n`` comes from the module
+# config's own argv, from the addopts of the member its uv selector names, or
+# from the ``-n <verify_admission_pytest_n>`` verify appends at the gated roles
+# whenever orchestrator/src/orchestrator/verify_cmd.py::apply_pytest_numprocesses
+# would. That is derived structurally from the module-config walk by
+# tests/scripts/test_merge_gate_parallelism_config.py::
+# test_every_pytest_leg_running_workers_declares_the_plugin.
+#
+# Because the injected ``-n`` is now counted (task 5486), a future module config
+# whose member lacks the declaration reds on the day it lands. The worker count
+# belongs in each member's own addopts regardless: there it travels with that
+# member's own timeout/dist settings and also governs a bare
+# ``cd <member> && uv run pytest tests/``, which a flag added here would not.
+# A 6th segment now also runs
 # the repo-root tests/scripts/ suite (not a workspace member, so never covered
 # by the 5 subprojects' own tests/ dirs) via ``--project shared``, mirroring
 # scripts/orchestrator.yaml, so a task scoped only to tests/scripts/ is no
@@ -133,10 +157,16 @@ lock_depth: 12
 # ``pytest tests/scripts/ scripts/tests/`` — the same two-directory form,
 # in the same order, as this segment — so a scripts/** diff is gated on
 # BOTH directories by its owning module config, under FULL_SUITE and under
-# merge-role merge_verify_breadth="full" alike. The two are kept spelled
-# identically deliberately, so this path and that one cannot drift into
+# merge-role merge_verify_breadth="full" alike. The two TARGET LISTS are kept
+# spelled identically deliberately, so this path and that one cannot drift into
 # different notions of "the scripts suites"; if you widen one, widen the
-# other. That coupling is GATED, not merely asserted here —
+# other. Their FLAGS are not coupled and never were — that module config carries
+# --tb=short/-q/--import-mode=importlib this segment does not, and task 5408
+# added `-n auto --dist loadgroup` there without parallelising this fallback
+# chain (at the time that would have needed every member in it to declare
+# pytest-xdist, the same reason the uniform `-n` cap above was rejected).
+# The TARGET-LIST coupling — and only that one; the flags above are explicitly
+# NOT coupled — is GATED, not merely asserted here:
 # tests/scripts/test_scripts_module_config.py::
 # test_root_fleet_chain_and_scripts_module_agree_on_the_scripts_suites reads
 # this segment through the production config loader and fails if either side
@@ -356,7 +386,8 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 # 'skills/**/test_*.py' 'skills/**/*_test.py'` is empty), but the inference
 # drawn from it is FALSE. An honest test_command is not a tests/scripts/
 # pointer: the tests that actually READ or EXECUTE real paths under skills/ at
-# runtime span THREE uv projects. Enumerated first-hand, not copied forward:
+# runtime span the orchestrator, shared and fused-memory uv projects.
+# Enumerated first-hand, not copied forward:
 #   orchestrator/tests/test_skill_prompt.py       — exercises
 #       orchestrator.agents.skill_prompt.load_skill_system_prompt, which walks
 #       up from its own __file__ to the IN-REPO skills/<name>/SKILL.md (not
@@ -379,6 +410,12 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 #   tests/scripts/test_unblock_skill_done_provenance_templates.py — reads
 #       skills/unblock/SKILL.md to validate its done_provenance payload
 #       literals against the live DoneProvenance model (task 4095).
+#   tests/scripts/test_shadow_ruling_doc_contract.py — reads
+#       skills/escalation-watcher/SKILL.md to validate its x_shadow_ruling
+#       payload literals against the live parser (task 5374).
+#   fused-memory/tests/test_referent_declaration_examples.py — reads
+#       skills/reflect/SKILL.md to execute its `entities=` examples against
+#       the live entities_gate (task 3675).
 # So the union includes orchestrator/tests/ — the fleet's largest suite —
 # duplicated on every review checkpoint, main-tip sweep and merge full-verify.
 # That is far worse than the single-suite duplication 3485 assumed, and it
@@ -591,259 +628,89 @@ lint_command: "uv run ruff check shared escalation fused-memory orchestrator das
 # tests/scripts/test_pyright_version_pin.py holds to one version.
 type_check_command: "cd fused-memory && npx pyright && cd ../orchestrator && npx pyright && cd ../dashboard && npx pyright && cd ../shared && npx pyright && cd ../escalation && npx pyright && cd ../sampler && npx pyright && cd ../cockpit && npx pyright"
 
-# Verification timeouts. verify_command_timeout_secs is a PER-COMMAND budget
-# (skills/orchestrate/references/project-setup.md:150) and the fallback fleet
-# chain above is ONE shell command, so this single ceiling bounds all eight
-# suites together.
+# Verification timeouts: the budget of the FALLBACK fleet chain above.
 #
-# The "full warm verify here is ~2 min" premise these were originally sized
-# against is STALE by an order of magnitude — it predates the monorepo growing
-# to 9 chained suites. It is deleted rather than softened, because a stale
-# justification is worse than none.
-#
-# MEASURED per-segment durations. These span TWO measurement epochs, separated
-# by a regime change — do not read the table as one run:
-#
-#   shared / escalation / fused-memory / tests/scripts — task 3062 attempt-2,
-#     .task/verify/attempt-2.__fallback__.{summary.json,test.log}, run started
-#     2026-07-31T02:00:48Z under `nice -n 15 ionice -c2 -n7`, surfaced as
-#     escalation esc-3062-3. One logged run each (tests/scripts: lowest of four).
-#   orchestrator — RE-MEASURED 2026-08-28 by task 4902 from the per-module
-#     verify corpus (`.worktrees/*/.task/verify/*.orchestrator.summary.json`),
-#     FULL-SUITE GREEN runs only, n=28.
-#
-# THE REGIME CHANGE between them: commit 685f558728 (2026-08-20) set
-# `verify_admission_pytest_n: "8"`, capping orchestrator's xdist fanout. Its
-# median green full-suite cost stepped from 691.40s to 1765.95s — ~2.6x. The
-# four 2026-07-31 figures were NOT re-measured and are 28 days older.
-#
-# NO PER-SEGMENT FIGURE IS RESTATED HERE, deliberately (task 4902). Each
-# segment's value, its measurement date, its sample size and — for
-# orchestrator — its percentile spread live ONCE, in
-# MEASURED_FLEET_SEGMENT_SECS, MEASURED_FLEET_SEGMENT_PROVENANCE and
-# POST_CAP_ORCHESTRATOR_GREEN_SECS in tests/scripts/
-# test_fallback_verify_config.py. Read them there: a number copied into this
-# comment would be one more copy to raise in lockstep — the same reason the
-# per-module budgets below are not copied here either.
-#
-# dashboard, sampler and cockpit are absent because the run timed out at
-# 1800.66s before dashboard even started, so 2238.32 is a measured LOWER BOUND
-# on the MEDIAN green chain — five of eight segments, each a representative
-# green run — not an estimate, and not a bound on an individual run (see the
-# measured spread below). The old 1800s ceiling was provably below it: a healthy
-# run could not clear it, so it surfaced no hangs — it manufactured infra_timeout
-# on the honest green path, after already passing 25,536 tests with zero
-# failures. A structural overrun, not a hang.
-#
-# Raised to 3600s warm / 5400s cold. All eight segments accounted for — the six
-# measured plus the three unmeasured ones estimated rather than silently costed
-# at zero:
-#
-#     measured floor (five segments, summed from
-#                   MEASURED_FLEET_SEGMENT_SECS)  2238.32
-#     + scripts/tests (task 3384, lowest of local
-#                   runs, 1184 passed)                ~113
-#     + dashboard  1393 collected @ ~0.137 s/test  ~190
-#     + sampler                                     ~60
-#     + cockpit     321 collected @ ~0.137 s/test   ~44   (conditional: the
-#                   segment is wrapped in `[ -d cockpit ] || exit 0`, so it
-#                   costs 0 on a checkout where cockpit is absent — but it IS
-#                   present here, so budget for it)
-#                                                 -------
-#     honest green path (at orchestrator p50)      ~2645
-#
-# The ~0.137 s/test rate is escalation's 898 serial tests in 123.29s; dashboard
-# and cockpit both run serial (no pytest-xdist, per this file's own fanout
-# comment). 3600s leaves ~1.36x headroom over that path — it was ~1.6x before
-# the 4902 re-measurement, and the margin has since collapsed.
-#
-# THE LOAD VARIANCE THAT HEADROOM HAS TO COVER is far wider than this comment
-# used to claim. It cited the two same-day 2026-07-31 orchestrator measurements
-# (1157.62s vs 1366.23s, ~18% apart) as the spread to budget for. The 4902
-# corpus of 28 green full-suite runs shows 864.83s to 3310.50s — a 3.8x spread,
-# with 14 of the 28 above 1800s. The ~18% figure is not a soft under-estimate to
-# be padded; it is no longer true, and is replaced rather than softened. Add to
-# it scripts/tests' own load sensitivity (task 3384 measured
-# it between ~113s idle and, combined with tests/scripts/, up to ~505s wall
-# under contention — see the task-3384 comment above and project memory for
-# the combined-directories figures). Cold gets 5400s because it additionally
-# pays the ~180s `uv sync --all-packages` preprovision plus uv sync across 6
-# subprojects.
-#
-# THE FINDING OF THE 4902 RE-MEASUREMENT, stated plainly because the numbers
-# above no longer speak for themselves. The path is green at the MEDIAN and
-# tight or over everywhere above it:
-#
-#     at orchestrator p50 1765.95  ->  honest green path ~2645   1.36x under 3600
-#     at orchestrator p90 2552.09  ->  honest green path ~3431   1.05x under 3600
-#     at observed max     3310.50  ->  honest green path ~4190   OVER 3600
-#
-# That last row is not hypothetical. At the time of the 4902 mine one run had
-# already consumed the full 3600s ceiling and been recorded as a false
-# infra_timeout: timed_out true, rc 1, duration 3600.649s, started
-# 2026-08-28T17:25:05Z, observed at
-# .worktrees/4023/.task/verify/attempt-1.orchestrator.summary.json.
-#
-# THE INLINED FIGURES ARE THE EVIDENCE; THE PATH IS NOT. A
-# `.task/verify/*.summary.json` is a TRANSIENT, per-attempt artifact — it is
-# OVERWRITTEN by the next attempt in the same worktree and PRUNED with the
-# worktree itself. The numbers are copied here precisely because that is the
-# only durable form this observation has: the path records where it was read,
-# not where it can be re-read. Re-checked 2026-08-30, two days later: that
-# exact path had already been rewritten by a later, unrelated attempt (rc 1,
-# timed_out FALSE, 2884.15s, started 2026-08-30T08:49:51Z) and no longer holds
-# the record above, while a different worktree's attempt showed the same
-# ceiling hit (timed_out true, 3605.06s) that same day. So do NOT re-point
-# these numbers at whatever that path currently contains, and do NOT read a
-# non-matching path as the claim having been false. To re-establish the
-# phenomenon, re-mine the corpus glob
-# (`.worktrees/*/.task/verify/*.orchestrator.summary.json`) — never one path.
-#
-# That is the same failure MODE the 1800s ceiling produced and this raise was
-# meant to end; the -n 8 cap moved the suite back up into it.
-#
-# The remedies — exempting the `orchestrator` prefix from the -n cap, giving
-# orchestrator/orchestrator.yaml its own budget above 3600, or task 3589's
-# controlled fixed-CPUQuota A/B — are the PINNED OPERATOR DECISION on task
-# 3353's L1. Task 4902 deliberately took none of them: it re-measured and
-# recorded, and changed no budget, no -n cap and no per-module yaml. The
-# evidence the decision needs is written down; only the action is deferred.
-#
-# It also un-starves the `orchestrator` module's OWN verify. At the 2026-07-31
-# figure of 1366.23s that segment was consuming 76% of the old 1800s ceiling;
-# re-measured at 1765.95s it is 49% of this 3600s one — but at its observed
-# green maximum of 3310.50s it is 92%, which is the row above restated.
-#
-# WHERE "tight timeouts surface hangs" LIVES NOW: on the PER-MODULE budgets —
-# each subproject's own orchestrator.yaml — not on starving the whole-fleet
-# fallback chain. The tight-timeout rationale still holds and is unchanged in
-# KIND: a genuine hang should still surface on the first verify that touches the
-# module, not 8 days later at a post-completion full review. But that property
-# cannot hold at the FLEET level, because a ceiling a green run cannot clear
-# surfaces nothing but false infra_timeouts. It holds per-module, where each
-# suite's real cost is known.
-#
-# THE ACTUAL DISPOSITION, because the sentence above used to overclaim it and
-# that is exactly how the gap went unnoticed (task 3473). When 3473 was filed
-# this claim was true for ONE discovered module config; when it was planned,
-# three. It is now true of EVERY discovered module config EXCEPT `orchestrator`.
-# Each declared budget is sized from that module's own measured worst run at
-# ~2.6x, floored at 600s, and they range from 600s to 2400s — the per-module
-# yamls carry the figures and the derivation, and are the single place those
-# numbers live. They are deliberately NOT copied here: a second copy of a
-# measurement is a second thing to raise in lockstep, which is the drift the
-# RAISE-TOGETHER rule in each provenance block exists to prevent.
-#
-# `orchestrator` is the one exception, and it is a REPORTED gap rather than a
-# hidden one: it declares no budget and so still falls through to the 3600 below
-# (verify._resolve_verify_timeout does not "inherit-ish" — an unset module knob
-# is a HARD fall-through to this value). Closing it is task 3353's scope, not
-# 3473's. That is not mere deference: 3353 has since been rewritten to split or
-# shard the orchestrator suite, so a budget sized now against the unsharded
-# figure would be invalidated by 3353's own change rather than refined by it.
-# The 4902 re-measurement makes that deferral MORE justified, not less — the
-# unsharded figure is a moving target, having gone 1366.23s (2026-07-31, n=1)
-# -> 1765.95s median with a 864.83..3310.50s spread (2026-08-28, n=28). It is carried as the single documented entry in MODULE_BUDGET_EXCLUSIONS
-# with a stated deletion condition — once orchestrator/orchestrator.yaml declares
-# its own verify_command_timeout_secs, delete that entry and the coverage guard
-# picks it up with no further edit.
-#
-# WHAT KEEPS THAT PARAGRAPH TRUE rather than merely asserted:
+# WHAT THEY BOUND. verify_command_timeout_secs is a PER-COMMAND budget
+# (skills/orchestrate/references/project-setup.md §"Per-subproject module
+# overrides"), and the fleet chain is ONE shell command, so this ceiling bounds
+# all nine suites together — eight `&&` segments, since tests/scripts/ and
+# scripts/tests/ share the last. It bounds nothing else: every discovered module
+# config declares its own budget (MODULE_BUDGET_EXCLUSIONS is empty, and
 # tests/scripts/test_module_verify_budgets.py::
-# test_every_discovered_module_config_declares_its_own_verify_budget. It walks
-# what config._discover_module_configs actually REGISTERS rather than a frozen
-# list, so a newly-registered module config landing with no budget fails it with
-# no edit to the guard.
+# test_every_discovered_module_config_declares_its_own_verify_budget keeps it so).
 #
-# The two values below are UNCHANGED by task 3473 and must stay that way. They
-# bound the whole-fleet fallback chain, and every per-module budget asserts
-# strictly-below against 3600 — lowering it would break those assertions across
-# the board as well as the floor guard named next.
-# Guarded by tests/scripts/test_fallback_verify_config.py::
-# test_fallback_verify_budget_clears_the_measured_fleet_chain_floor.
+# WHERE "tight timeouts surface hangs" LIVES: on those per-module budgets, each
+# sized from its module's own measured worst run (600-2400s). The figures and
+# derivations live in each module's orchestrator.yaml and are not copied here: a
+# second copy of a measurement is a second thing to raise in lockstep.
+# orchestrator's own 7200 warm / 10800 cold is a RULED exception, held at or
+# above a census-derived floor (test_module_verify_budgets.py::
+# RULED_INTERIM_BUDGET_EXCEPTIONS and ::RULED_COLD_BUDGET_DECLARATIONS). The
+# property cannot hold at the fleet level: a ceiling a green run cannot clear
+# surfaces no hangs, only false infra_timeouts.
 #
-# BE PRECISE ABOUT WHAT THAT FLEET-CHAIN-FLOOR GUARD DOES, because overclaiming
-# it would repeat this comment's own original sin. It asserts the measured floor
-# rather than pinning a value, so it catches anyone LOWERING this budget below
-# 2238.32s. It does NOT detect suite growth: MEASURED_FLEET_SEGMENT_SECS is a
-# frozen literal table.
+# WHY 7200 (Leo, 2026-09-12). The measured floor is
+# sum(MEASURED_FLEET_SEGMENT_SECS) in tests/scripts/test_fallback_verify_config.py:
+# six of the nine suites, each a representative green run, so a lower bound on
+# the MEDIAN green chain and not a bound on any one run. Its orchestrator row is
+# derived from task 3353's census (test_module_verify_budgets.py::
+# ORCHESTRATOR_BUDGET_CENSUS); every other row carries dated provenance beside
+# the table. The three unmeasured suites are costed by estimate, not at zero.
+# As of the 2026-09-14 census:
 #
-# THAT PREDICTION CAME TRUE VERBATIM, so record it rather than re-issue it. This
-# paragraph used to read "if the orchestrator segment doubles tomorrow the table
-# still reads 1366.23, the floor still reads 1838.60, and the guard stays green
-# while the budget is once again provably below the honest green path." The
-# segment roughly doubled (commit 685f558728, 2026-08-20), the table did stay at
-# 1366.23, and the guard did stay green — for eight days, until task 4902
-# re-measured the segment BY HAND on 2026-08-28.
+#     measured floor (six suites)                   3860.29
+#     + dashboard  1393 collected @ ~0.137 s/test   ~190
+#     + sampler                                      ~60
+#     + cockpit     321 collected @ ~0.137 s/test    ~44  (0 where cockpit is
+#                   absent: the segment is wrapped in `[ -d cockpit ] || exit 0`)
+#                                                  -------
+#     honest green path                             ~4154
 #
-# So the table still cannot measure itself, and 4902 built no detector that
-# would let it. What changed is only this: nothing performs the re-measurement
-# AUTOMATICALLY, task 4902 performed it once by hand, and the two copies of the
-# table can no longer drift apart because there is no longer a second copy —
-# 4902 first tried to POLICE the duplicate with a guard that parsed this
-# comment block, then deleted the duplicate instead, which is the remedy the
-# per-module budgets above already use. Each entry's age and sample now live in
-# MEASURED_FLEET_SEGMENT_PROVENANCE beside the table, so which epoch a figure
-# came from is readable without archaeology.
+#     orchestrator at census p50 -> ~4154   1.73x under 7200
+#     orchestrator at census p90 -> ~4564   1.58x under 7200
+#     orchestrator at census max -> ~5506   1.31x under 7200
 #
-# TO REPEAT THE MEASUREMENT rather than re-derive it: mine
-# `.worktrees/*/.task/verify/*.orchestrator.summary.json` for `test`-label
-# commands, keep only FULL-SUITE runs (the positional pytest target is bare
-# `tests/` — file-scoped rescopes measure a diff's blast radius, not a segment)
-# and only GREEN ones (rc 0 and not timed_out), then split on the regime change.
-# The full rules, both arms and the percentile conventions are recorded at
-# POST_CAP_ORCHESTRATOR_GREEN_SECS in that same test file. Note the corpus is
-# PRUNED with its worktrees, so it shrinks over time and no test may read it.
-# (A durations-based growth check would need to read a recent run's recorded
-# per-segment times rather than a literal; that is deliberately not built here —
-# the point is that nothing currently performs it, so a human must.)
+# The ~0.137 s/test rate is escalation's 898 serial tests in 123.29s, so these
+# estimates are deliberately the LARGER figures: task 5408 has since moved
+# dashboard and cockpit to xdist and measured them at 95.07s and 16.78s. Sizing
+# a ceiling takes the larger figure; the test file's lower-bound argument takes
+# 5408's smaller ones. Each is conservative in its own direction.
 #
-# NOTE: this buys headroom, it does not fix the trend — and the trend has since
-# been observed continuing. orchestrator's suite alone went from 1366s
-# (2026-07-31) to a 1765.95s median with runs to 3310.50s (2026-08-28, task
-# 4902), consuming most of the headroom this raise bought. If it keeps growing,
-# the answer is scoping verify to the task's declared modules — which is what
-# tests/scripts/orchestrator.yaml now does for this very fallback path (task
-# 3350) — or sharding the suite (task 3353), not raising this number again.
-# RAISED 3600 -> 7200 warm / 5400 -> 10800 cold (Leo, 2026-09-12), OVERRIDING the
-# paragraph immediately above, which says "not raising this number again". Recorded
-# as an override rather than by quietly deleting that sentence, because its
-# reasoning is still correct and is the thing that should eventually retire this
-# raise.
+# WHY NOT BACK TO 3600. The 2026-09-12 raise was to be reverted to 3600/5400
+# once task 3353 landed or the orchestrator module declared its own budget. Both
+# have happened, but 3600 is below the measured floor (~0.87x the honest green
+# path at p50), so test_fallback_verify_config.py::
+# test_fallback_verify_budget_clears_the_measured_fleet_chain_floor refuses it.
+# Lowering this needs an operator decision about the fallback chain itself.
+# Raising it again is not the answer either: if the chain outgrows 7200, scope
+# verify to the task's declared modules (tests/scripts/orchestrator.yaml does
+# this for this very fallback path, task 3350) or shard the suite.
 #
-# WHY OVERRIDE IT NOW. That paragraph names the right answers — scope verify to the
-# task's declared modules, or shard the suite (task 3353) — but neither is
-# implemented, and the cost of waiting is being paid daily in FALSE reds, not in
-# slow runs: 5 worktrees lost to false verify timeouts in 6 days (esc-4211-6), each
-# burning ~1h of 8 workers on a task that was fully green, plus task 3202, which is
-# complete and review-clean and cannot pass verify at any priority. A ceiling a
-# green run cannot clear surfaces nothing but false infra_timeouts — this file
-# already says so, twelve lines up, about the 1800s era.
+# COLD. 10800 = 1.5x warm, the ruled cold/warm ratio, kept when both doubled on
+# 2026-09-12. A cold run does strictly more work — the same chain plus
+# verify_cold_preprovision_command (`uv sync --all-packages && npm ci …`) — so
+# warm <= cold is asserted (tasks 3350 and 3397, test_fallback_verify_config.py).
 #
-# WHAT THIS ACTUALLY LOOSENS: only the `orchestrator` module. Every other
-# discovered module config declares its own budget (600-2400s) and is unaffected;
-# `orchestrator` is the single documented exception that hard-falls-through to this
-# value (see MODULE_BUDGET_EXCLUSIONS). Its measured cost is 1765.95s median with an
-# 864.83..3310.50s spread (n=28, task 4902) — at that observed max the honest green
-# path is ~4190s, i.e. OVER the old ceiling, which is the defect in one line.
-# 7200 is the figure already ruled as task 3353 scope B.
+# THE COST. A genuinely WEDGED run holds a verify slot for 2h warm / 3h cold,
+# and verify_admission_task_slots is 1, so that is the whole task-verify lane.
+# Accepted against the false-red rate the raise ended (esc-4211-6).
 #
-# THE COLD VALUE MOVED BECAUSE IT HAD TO, not from measurement: warm <= cold is
-# asserted twice (test_fallback_verify_config.py, tasks 3350 and 3397) on the
-# ground that a cold run does strictly more work. Both values are scaled x2 so the
-# previously-ruled 1.5x cold/warm relationship is preserved exactly rather than
-# silently re-derived on the way past.
+# WHAT THE GUARDS DO NOT DO. The floor guard fails if this warm value drops below
+# the measured floor or rises above the cold one;
+# test_measured_fleet_table_partitions_the_chain_it_measures fails if
+# test_command gains or loses a suite with no entry in MEASURED_FLEET_SEGMENT_SECS
+# or UNMEASURED_FLEET_SEGMENTS. Neither detects DURATION growth: nothing
+# re-measures automatically, and the verify-summary corpus is pruned with its
+# worktrees, so no test may read it — in 2026-08 the floor guard stayed green for
+# eight days while this budget sat provably below the honest green path.
+# Re-measuring is a human act: run ORCHESTRATOR_BUDGET_CENSUS.census_command
+# (scripts/verify_budget_census.py) and replace that record; the fleet table's
+# orchestrator row follows it.
 #
-# THE COST, stated because it is real: a genuinely WEDGED run now holds a verify
-# slot for 2h warm / 3h cold instead of 1h / 1.5h, and verify_admission_task_slots
-# is 1, so that is the whole task-verify lane. Accepted against a false-red rate of
-# ~1 stranded green worktree per day.
-#
-# REVERT CONDITION, and it is the one the paragraph above already wrote: when task
-# 3353 lands (split or shard the orchestrator suite) or the module declares its own
-# budget, put these back to 3600/5400. This raise buys time for that work; it is not
-# a replacement for it. Do NOT read it as licence to raise again — the next raise
-# should be refused and 3353 done instead.
+# HISTORY — the 1800s "~2 min" era and task 3062's 1800.66s overrun, task 3350's
+# 3600/5400, task 4902's re-measurement and the false infra_timeout it recorded,
+# the 2026-09-12 raise and its revert condition, and task 3496's finding — is in
+# plans/fleet-verify-budget-history.md.
 verify_command_timeout_secs: 7200
 verify_cold_command_timeout_secs: 10800
 
@@ -985,7 +852,8 @@ verify_admission_slots_dir: "/tmp/df-verify-slots-1000-dark_factory"
 # move in the SAME COMMIT as any change to the value below.
 verify_admission_pytest_n: "8"
 
-# TASK-ROLE VERIFY ADMISSION WIDTH (raised 1 -> 3, 2026-09-03).
+# TASK-ROLE VERIFY ADMISSION WIDTH (1 -> 3 on 09-03, -> 1 on 09-08, -> 2 on
+# 09-23, -> 1 on 09-27; 2026).
 #
 # The code default is 1 (config.py::OrchestratorConfig.verify_admission_task_slots)
 # and it had never been set in either yaml, so ONE task-role pytest ran at a
@@ -1028,6 +896,37 @@ verify_admission_pytest_n: "8"
 # 49-72 and non-discriminating at this load, per task 3590).
 # The main-tip sweep (background role) shares this slot and was already live in
 # the 1-slot regime the 2300s figure comes from.
+# RAISED 1 -> 2 (operator decision, Leo 2026-09-23). Deliberately overrides the
+# "So 2 slots is not a middle ground either" line above, which was written from
+# the 09-03 3-slot episode and never tested 2 directly. What changed since:
+#   - merge rate  9.71 -> 16.29 /day (first vs second 7d of 09-09..09-22)
+#   - merge verify duration 64.3 -> 55.2 min mean over the same split (~49 today)
+#   - 24/24 concurrency slots occupied while only 4 tasks execute; 20 park at
+#     `phase_enter verify` behind this one flock
+#   - backlog +16.6 pending/day (burndown.db 992 -> 1080 over 5.3d), median
+#     pending age 14.2d, 225 high-priority waiting
+# UNDER OBSERVATION, WITH A DATED REVERT: task 5797 fires 48h after this lands
+# and re-measures; if median task duration or timeouts/day worsen, put this back
+# to 1. That is the same reversibility clause the 09-03 raise carried, which did
+# fire and was honoured.
+# MEASUREMENT GAP, stated rather than papered over: the "~23% of ONE slot"
+# figure above could NOT be re-verified on 2026-09-23 — `workflow_verify` events
+# carry only {base_sha, branch, passed, tip_sha} and NO duration, so task-lane
+# slot-hours are not derivable from the event store at all. Only the leg COUNT
+# is: 572 workflow_verify events in 14.4d versus the ~240/14d that figure was
+# computed from. Task 5798 closes that gap. Until it lands, this knob is being
+# tuned on merge-lane duration plus queue-depth observation, not on task-lane
+# slot utilisation.
+# PUT BACK TO 1 (task 5797 gate, 2026-09-27). The dated-revert clause above
+# fired. Equal 4.3d arms on either side of the 09-23 reload:
+#   orchestrator-suite task-leg verify (verify-summary census):
+#     median 3233s -> 4995s, >=3600s share 27.3% -> 63.3%
+#   task-lane verify after a rebase, all modules (runs.db rebase_verify_cost):
+#     median  222s ->  633s, >=3600s share 11.0% -> 28.1%
+# Journal timeouts 0 -> 2 (fused-memory, 09-24). Merge verify was flat (p50
+# 51.5 -> 54.7 min), and landings/day fell 17.1 -> 14.1. Full before/after on
+# all five measures, with sources and caveats:
+# plans/verify-admission-task-slots-gate.md.
 verify_admission_task_slots: 1
 
 # Pin `-n auto` for every verify subprocess (task 3589's residual, operator
@@ -1044,8 +943,8 @@ verify_admission_task_slots: 1
 # PYTEST_XDIST_AUTO_NUM_WORKERS=8 that caps the offline lane and agent shells.
 # Green-tier (verify_env is in RELOADABLE_FIELDS).
 verify_env:
-  # A/B arm: PYTEST_XDIST_AUTO_NUM_WORKERS set to "8" at 2026-09-10T12:42:14Z by scripts/merge-pytest-n-ab-switch.sh
-  PYTEST_XDIST_AUTO_NUM_WORKERS: "8"
+  # A/B arm: PYTEST_XDIST_AUTO_NUM_WORKERS set to "16" at 2026-09-17T11:39:20Z by scripts/merge-pytest-n-ab-switch.sh
+  PYTEST_XDIST_AUTO_NUM_WORKERS: "16"
 
   # ARM THE REAL-KERNEL SANDBOX ENFORCEMENT SURFACE (task 4635, esc-4559-9).
   #
@@ -1206,6 +1105,30 @@ budgets:
   implementer: 20.0
   merger: 8.0
 
+# Steward LIFETIME budget (flat, per-task: one steward instance handles one
+# task's escalations and accumulates across its own invocations).  RAISED
+# 12.0 -> 20.0 on 2026-09-21 by Leo's ruling (option A of cockpit decision
+# steward-lifetime-budget-cap-2026-09-19), after SIX tasks exhausted the $12
+# cap: 3353 ($12.02), 3592 ($12.02), 5488 ($12.49), 5557 ($14.82), 5588
+# ($16.12) and 4797 ($13.29).  All six were tasks whose work was finished or
+# genuinely in progress -- the recurring shape is a steward stopping ONE call
+# short of closing out.  Three of the six overran by only 0.2-4%.  Cost of the
+# old value: three spawned /unblock sessions, two tasks left blocked (5588 at
+# HIGH with a complete green plan; 4797 mid-rebase), and -- suspected, not yet
+# measured -- stewards ceasing to drain L0s, which is one candidate cause of
+# the 27h L0 strand that esc-__stale_l0_strand_sweep__-14 reported.
+#
+# 20.0 clears the largest observed total ($16.12) with ~24% headroom while
+# keeping a real guard.  NOTE the guard is checked BEFORE an invocation and the
+# last call may overshoot (per_invocation = min(budgets.steward, remaining)),
+# so an observed total can exceed the cap; budget the ceiling accordingly.
+#
+# Green-tier hot-reloadable (config.py "Steward grace" group), so this is a
+# reload not a restart, and reverting is equally cheap.  Leo is still weighing
+# option C (a PER-TASK cap rather than this flat one); if C lands, this flat
+# value becomes the fallback for tasks carrying no explicit override.
+steward_lifetime_budget: 20.0
+
 # Per-role model overrides (project-level; defaults.yaml is the fleet default).
 # implementer/debugger sonnet -> opus on dark-factory ONLY, for a two-week
 # canary from 2026-09-10 (Leo ruling D4). Basis: on the same task population
@@ -1230,6 +1153,20 @@ models:
   # drop-guard violation and +23% per run ($1.64 vs $1.33 median) on ~18-79 runs/month.
   # Cache read is $0.25/Mtok (measured), so the swap premium is output + cache-create only.
   merger: claude-fable-5-1
+
+# Every role that runs Opus here drops effort max -> xhigh (Leo, 2026-09-24): early
+# reports on the newly released Opus show max burning many times the reasoning tokens
+# of xhigh for minimal improvement in results. This supersedes defaults.yaml's
+# eval-held architect max (task 2848). reviewer and steward already run Opus at high.
+# The Fable merger drops max -> high, the effort the D5 merger replay actually
+# validated it at (plans/fable-evidence-package-2026-09-10/merger_replay.py); max on
+# Fable was never evaluated. Hot-reloadable (green tier).
+effort:
+  architect: xhigh
+  implementer: xhigh
+  debugger: xhigh
+  merger: high
+  deep_reviewer: xhigh
 
 # Model routing (Leo ruling D6, 2026-09-10; applied 2026-09-12). Admits claude-fable-5-1
 # for exactly two roles: the merger (via models.merger above) and the steward on its
@@ -1280,12 +1217,6 @@ routing:
         min_routing_tier: 1
       set:
         model: "+1"
-    - id: steward-retry-fable
-      match:
-        role: [steward]
-        min_routing_tier: 1
-      set:
-        model: claude-fable-5-1
 
 # Trailing-24h spend ceiling. Default $200 was a backstop from before the
 # multi-account failover landed — with Anthropic's per-account caps as the
@@ -1483,6 +1414,46 @@ merge_train_max_members: 3
 # serialized), accepted against the oversubscription-flake churn it removes.
 merge_verify_max_concurrent_modules: 1
 
+# ── Lever C (multi-host post-merge verify): laptop runner, prefer_remote ──────
+# ENABLED 2026-09-30 (task 5053 = D1; plans/merge-lane-throughput-prd.md). leo-laptop
+# joins this project's merge-verify pool. It takes effect at the next orchestrator
+# restart of ANY kind (coordinator, staleness backstop, liveness revive); task 5054
+# (D2) is the deliberate one. Measured 2026-09-03 on reify's workload: the laptop
+# verifies ~2.5x faster than this workstation (p50 17.4 vs 43.4 min) and sits
+# 78-88% idle while this host's CPU is the lane bottleneck. DF's own measurement,
+# 2026-09-30: the laptop ran DF's full 9-module gate in ~12.7 min against 57-75 min
+# locally. Fail-safe: an unreachable laptop falls back to local, never stalls.
+# df_checkout_path turns on the INV-2 auto-sync of the laptop's DF checkout (stale
+# tree = stale verify-merge, #5120).
+# Laptop-side knobs live on leo-laptop, not here: its dark-factory-laptop.yaml sets
+# merge_verify_max_concurrent_modules: 1 and verify_use_cgroup_scope: true, and a systemd
+# drop-in caps each verify scope at MemoryMax=24G (a memory kill reports RED, not a
+# local fallback, until task 6106).
+# TRUST-ANCHOR TRADE-OFF, EYES OPEN: prefer-local existed because local is the trust
+# anchor (a laptop false green landed a red commit, #5120). Under prefer_remote nearly
+# every verdict is a REMOTE verdict, so verify_drift_check_every_n_lands is the
+# standing fidelity guard: 10 here, not the 20 of the PRD's first draft. A drift check
+# leases BOTH hosts and runs both legs, so 1-in-10 gives back a little local CPU.
+# verify_cross_check_remote_green: false (2026-10-02, task 5416 OFF step). Leo ruled on
+# esc-5416-2 to shorten the parity window to one day and pre-approved the OFF step. The
+# window ran 2026-10-01T05:01Z to 2026-10-02T05:01Z on the code default TRUE (a blocking
+# local re-verify of every non-trivial remote green): dark_factory verdict_parity_ok x13,
+# zero mismatch or inconclusive. reload_config re-reads this file and takes no arguments,
+# so OFF needs this key; deleting it restores TRUE on the next reload.
+# ROLLBACK: verify_host_policy: prefer_local (green tier, mcp__escalation__reload_config);
+# enabled: false, or dropping this block, needs a restart (verify_runners and
+# verify_drift_check_every_n_lands are restart-only).
+verify_runners:
+  - name: laptop
+    ssh_host: leo-laptop
+    git_remote: leo-laptop
+    config_path: /home/leo/.config/orchestrator/dark-factory-laptop.yaml
+    df_checkout_path: /home/leo/src/dark-factory
+    enabled: true
+verify_host_policy: prefer_remote
+verify_drift_check_every_n_lands: 10
+verify_cross_check_remote_green: false
+
 # Pre-merge rebase-and-reverify: run it ONCE and never repeat it (Leo, 2026-09-06).
 # workflow.py's merge phase rebases the task branch onto main and runs a full
 # task-role scoped verify (admission-gated, 3 slots on this box) BEFORE submitting
@@ -1521,6 +1492,13 @@ git:
   offline_lane_enabled: true
   persistent_offline_deep_worktree: true
   offline_lane_legacy_numeric_enabled: false
+
+  # A config-only merge diff touching this file runs the full gate
+  # (docs/config-retune-gate.md, task 3886). RED TIER: not in
+  # RELOADABLE_FIELDS, so it takes effect at the next orchestrator restart.
+  merge_config_only_full_gate_globs:
+    - "dark-factory-orchestrator.yaml"
+
   offline_lane_commands:
     - name: qdrant-integration
       command: "pytest -m integration"
@@ -1594,3 +1572,10 @@ git:
 speculation_probe:
   probe_fraction: 0.0
   suppress_flake_rate: 0.40
+
+# Attended-mode B3 (low-risk auto-unblock) ON — Leo, 2026-09-25, after the gate check in
+# plans/escalation-watcher-prompting-study-2026-09-23.md. SKILL-FACING: read by the
+# interactive L2 watcher session (skills/escalation-watcher/SKILL.md "Applicability"),
+# never by an orchestrator process — no restart, no reload_config.
+unblock_auto:
+ attended_b3_enabled: true

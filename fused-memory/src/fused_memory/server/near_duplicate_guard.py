@@ -13,10 +13,15 @@ is found (see ``server/tools.py``).
 This module intentionally does no I/O — the caller is responsible for
 fetching candidate ``MemoryResult`` objects (typically via
 ``MemoryService.search``) and for fail-open behaviour on search errors.
+
+The topic-cluster list is the config seeds plus the writing project's
+machine-derived rows from ``server/topic_cluster_store.py``, merged by
+:func:`resolve_topic_guard_clusters`.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 from fused_memory.models.enums import MemoryCategory, SourceStore
@@ -25,12 +30,18 @@ if TYPE_CHECKING:
     from fused_memory.config.schema import ProceduralTopicCluster
     from fused_memory.models.memory import MemoryResult
 
+logger = logging.getLogger(__name__)
+
 # Default similarity threshold when config is absent/partial/non-numeric.
 # Mirrors Mem0's own cited ~0.92 cosine dedup threshold.
 _DEFAULT_NEAR_DUP_THRESHOLD = 0.92
 
 # Default enable flag when config is absent/partial/non-numeric.
 _DEFAULT_NEAR_DUP_GUARD_ENABLED = True
+
+# Default for the machine-derived topic-cluster switch when config is
+# absent/partial/non-bool; mirrors the schema default.
+_DEFAULT_TOPIC_CLUSTER_AUTOSEED_ENABLED = True
 
 # Surfaced in the soft-block dict, the add_memory tool docstring, and
 # FUSED_MEMORY_INSTRUCTIONS so the override is discoverable at the point of
@@ -68,7 +79,7 @@ _TOPIC_CLUSTER_DEFAULT_HINT = (
 )
 
 
-def _cosine_of(r: MemoryResult) -> float | None:
+def cosine_of(r: MemoryResult) -> float | None:
     """Read the per-store cosine a search result carries, or ``None``.
 
     Since task 3658 ``MemoryService.search`` puts the honest per-store
@@ -77,6 +88,12 @@ def _cosine_of(r: MemoryResult) -> float | None:
     :func:`resolve_near_dup_threshold` — ``bool`` is excluded despite being an
     ``int`` subclass, as is any attribute an unspecced test double might
     auto-generate — so a non-measurement can never be read as a similarity.
+
+    Public (task 4734): this selector is imported across module boundaries
+    (``write_triage.py``, ``write_triage_judge.py``) as the one home for the
+    POST-RRF cosine extraction (INV-5), so it carries a public name rather
+    than an underscore-prefixed one a cross-module import would have to
+    reach past.
     """
     value = (r.metadata or {}).get('store_score')
     if isinstance(value, int | float) and not isinstance(value, bool):
@@ -99,7 +116,7 @@ def find_near_duplicate_memory(
     mismatched category or source_store even when their score is high —
     callers may pass unfiltered/mixed search results.
 
-    The cosine is read from ``metadata['store_score']`` (see :func:`_cosine_of`),
+    The cosine is read from ``metadata['store_score']`` (see :func:`cosine_of`),
     **not** from ``relevance_score`` — which since task 3658 is an ordinal RRF
     fusion value (single-store rank-1 ~ 0.0164) and would never clear a 0.92
     cosine threshold, silently disabling this guard for every input.
@@ -116,13 +133,13 @@ def find_near_duplicate_memory(
         for r in results
         if r.category == category
         and r.source_store == source_store
-        and (cosine := _cosine_of(r)) is not None
+        and (cosine := cosine_of(r)) is not None
         and cosine >= threshold
     ]
     if not qualifying:
         return None
     # Every qualifying result has a non-None cosine by construction above.
-    return max(qualifying, key=lambda r: _cosine_of(r) or 0.0)
+    return max(qualifying, key=lambda r: cosine_of(r) or 0.0)
 
 
 def find_matching_topic_cluster(
@@ -212,21 +229,135 @@ def resolve_near_dup_guard_enabled(memory_service: Any) -> bool:
     return _DEFAULT_NEAR_DUP_GUARD_ENABLED
 
 
-def resolve_topic_guard_clusters(memory_service: Any) -> list:
-    """Read the configured topic-guard clusters from *memory_service*'s config.
+def resolve_topic_cluster_autoseed_enabled(memory_service: Any) -> bool:
+    """Read the machine-derived topic-cluster switch from *memory_service*'s config.
 
-    Same defensive ``getattr`` navigation as :func:`resolve_near_dup_threshold`
-    (via :func:`_reconciliation_attr`), returning the configured
-    ``procedural_knowledge_topic_guard_clusters`` list iff the leaf is a real
+    The ONE reader of ``procedural_knowledge_topic_cluster_autoseed_enabled``,
+    shared by the ``consolidate_memories`` seed and the guard merge in
+    :func:`resolve_topic_guard_clusters`, so the two can never disagree about
+    whether the feature is on. Same defensive navigation as
+    :func:`resolve_near_dup_guard_enabled`: anything but a real ``bool`` falls
+    back to :data:`_DEFAULT_TOPIC_CLUSTER_AUTOSEED_ENABLED`.
+    """
+    value = _reconciliation_attr(
+        memory_service, 'procedural_knowledge_topic_cluster_autoseed_enabled'
+    )
+    if isinstance(value, bool):
+        return value
+    return _DEFAULT_TOPIC_CLUSTER_AUTOSEED_ENABLED
+
+
+def resolve_retired_derived_topic_ids(memory_service: Any, project_id: str) -> frozenset[str]:
+    """Read *project_id*'s retired derived ``topic_id``s from *memory_service*'s config.
+
+    The ONE reader of ``procedural_knowledge_topic_cluster_autoseed_retired``,
+    shared by the ``consolidate_memories`` seed and
+    :func:`resolve_topic_guard_clusters`, like
+    :func:`resolve_topic_cluster_autoseed_enabled`. Anything but a real
+    ``dict`` whose value for *project_id* is a ``list`` retires nothing, and
+    non-string entries are ignored.
+    """
+    value = _reconciliation_attr(
+        memory_service, 'procedural_knowledge_topic_cluster_autoseed_retired'
+    )
+    topic_ids = value.get(project_id) if isinstance(value, dict) else None
+    if not isinstance(topic_ids, list):
+        return frozenset()
+    return frozenset(topic_id for topic_id in topic_ids if isinstance(topic_id, str))
+
+
+def merge_topic_clusters(
+    config_clusters: list,
+    runtime_clusters: list,
+    *,
+    retired: frozenset[str] = frozenset(),
+) -> list:
+    """Return config seeds in order, then runtime clusters whose ``topic_id`` is new and not *retired*.
+
+    Order is load-bearing: :func:`find_matching_topic_cluster` returns the
+    FIRST qualifying cluster, so an operator's curated cluster produces the
+    diagnostic whenever both would match. On a ``topic_id`` collision the
+    config seed wins and the runtime cluster is dropped, because curated
+    ``sufficient_phrases`` and gate-task hints are what a derived cluster
+    cannot reproduce. A repeated runtime ``topic_id`` keeps its first entry.
+    *retired* drops runtime clusters only; a config seed is retired by
+    removing it from the config list.
+
+    Duck-typed on ``.topic_id`` so this module keeps importing
+    ``config.schema`` for type checking only. Returns a new list and mutates
+    neither input.
+    """
+    merged = list(config_clusters)
+    emitted = {cluster.topic_id for cluster in merged}
+    for cluster in runtime_clusters:
+        if cluster.topic_id in emitted or cluster.topic_id in retired:
+            logger.debug(
+                'topic-cluster merge: dropped runtime cluster %r (already emitted or retired)',
+                cluster.topic_id,
+            )
+            continue
+        emitted.add(cluster.topic_id)
+        merged.append(cluster)
+    return merged
+
+
+def resolve_topic_guard_clusters(
+    memory_service: Any,
+    *,
+    runtime_store: Any = None,
+    project_id: str | None = None,
+) -> list:
+    """Return the live topic-guard clusters: config seeds, then *project_id*'s derived ones.
+
+    THE merge chokepoint for topic clusters (the PRD's "guard/triage read"):
+    a future write-triage topic arm inherits the merge by calling this rather
+    than re-reading config.
+
+    The config half uses the same defensive ``getattr`` navigation as
+    :func:`resolve_near_dup_threshold` (via :func:`_reconciliation_attr`),
+    taking ``procedural_knowledge_topic_guard_clusters`` iff the leaf is a real
     ``list`` — otherwise an empty list. The ``isinstance(value, list)`` guard
     excludes a missing/``None`` config hop and any Mock attribute an unspecced
-    test double might auto-generate, so an empty return reliably means "topic
-    guard inert" (task 2845).
+    test double might auto-generate (task 2845).
+
+    The runtime half (task 3135) is merged by :func:`merge_topic_clusters` only
+    when both *runtime_store* and *project_id* are given and
+    :func:`resolve_topic_cluster_autoseed_enabled` is on, less the topics
+    :func:`resolve_retired_derived_topic_ids` names, both read live per call.
+    Derived rows are project-scoped because their hint names one project's
+    canonical. A store that raises or returns a non-list degrades to the
+    config half with a WARNING: this runs inside ``add_memory``, where an
+    exception would turn a memory write into a tool error.
     """
     value = _reconciliation_attr(memory_service, 'procedural_knowledge_topic_guard_clusters')
-    if isinstance(value, list):
-        return value
-    return []
+    config_clusters = value if isinstance(value, list) else []
+    if (
+        runtime_store is None
+        or project_id is None
+        or not resolve_topic_cluster_autoseed_enabled(memory_service)
+    ):
+        return config_clusters
+    try:
+        runtime = runtime_store.list_clusters(project_id)
+    except Exception:
+        logger.warning(
+            'topic-cluster store read failed for project %r; using config seeds only',
+            project_id,
+            exc_info=True,
+        )
+        return config_clusters
+    if not isinstance(runtime, list):
+        logger.warning(
+            'topic-cluster store returned %s for project %r, not a list; using config seeds only',
+            type(runtime).__name__,
+            project_id,
+        )
+        return config_clusters
+    return merge_topic_clusters(
+        config_clusters,
+        runtime,
+        retired=resolve_retired_derived_topic_ids(memory_service, project_id),
+    )
 
 
 def _reconciliation_attr(memory_service: Any, attr: str) -> Any:
@@ -262,7 +393,7 @@ def build_near_duplicate_block(
         'agent_id': agent_id,
         'content_excerpt': content[:200],
         'matched_memory_id': match.id,
-        'similarity': _cosine_of(match),
+        'similarity': cosine_of(match),
         'threshold': threshold,
         'matched_excerpt': match.content[:200],
         'hint': _NEAR_DUPLICATE_HINT,

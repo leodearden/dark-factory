@@ -350,13 +350,30 @@ class TestDefaults:
             'orchestrator_restart_min_interval_secs) and must NOT be in '
             'RELOADABLE_FIELDS'
         )
+        # task 4755: how old the in-flight fleet-redeploy lease may get before
+        # its readers stop believing it. DERIVED from the --drain verify-wait cap
+        # (worst legitimate sweep ~13,300s), not picked, and deliberately far
+        # below the 8h min-interval so a lease leaked by a SIGKILLed sweep
+        # delays at most one window. Red-tier / restart-only like its
+        # siblings — captured at coordinator construction.
+        assert config.orchestrator_restart_lease_max_age_secs == 14400.0
+        assert (
+            'orchestrator_restart_lease_max_age_secs' not in RELOADABLE_FIELDS
+        ), (
+            'orchestrator_restart_lease_max_age_secs requires a process '
+            'restart to take effect (matches its siblings '
+            'orchestrator_restart_merge_phase_grace_secs / '
+            'orchestrator_restart_force_fire_after_secs / '
+            'orchestrator_restart_min_interval_secs) and must NOT be in '
+            'RELOADABLE_FIELDS'
+        )
 
     def test_fused_memory_restart_force_fire_default(self, monkeypatch, tmp_path):
         """Bare OrchestratorConfig() exposes the fused-memory force-fire default.
 
         The force-fire escape lets a pending fused-memory restart still fire
-        under chronic fleet saturation (when the run-loop idle branch is
-        starved) after a bounded owed-age window — mirroring the orchestrator
+        under chronic fleet saturation (when agents are never idle) after a
+        bounded owed-age window — mirroring the orchestrator
         coordinator's own force_fire_after_secs (task 2817). Like its
         orchestrator_restart_* siblings it is captured once at coordinator
         construction (_build_service_restart_coordinator), so it is
@@ -1387,19 +1404,27 @@ class TestSccacheConfig:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("code_default_config")
 class TestOrchestratorConfigSccache:
-    """OrchestratorConfig.sccache field and effective_verify_env property."""
+    """OrchestratorConfig.sccache field and effective_verify_env property.
 
-    def test_sccache_defaults_to_disabled(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+    All four tests construct a bare/kwargs-only ``OrchestratorConfig()`` and
+    assert on the CODE defaults, so all four need the same isolation from the
+    ambient operational yaml — hence one class-level fixture rather than a
+    per-test mix. Two of them used to hand-roll it as ``monkeypatch.chdir`` +
+    ``delenv('ORCH_CONFIG_PATH')``, which is the weaker form: it leans on the
+    cwd-relative fallback in ``settings_customise_sources`` instead of
+    pointing ``ORCH_CONFIG_PATH`` at a guaranteed-absent file, and two
+    mechanisms for one job in one class invite the next editor to copy the
+    wrong one.
+    """
+
+    def test_sccache_defaults_to_disabled(self):
         config = OrchestratorConfig()
         assert isinstance(config.sccache, SccacheConfig)
         assert config.sccache.enabled is False
 
-    def test_effective_verify_env_equals_verify_env_when_disabled(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv('ORCH_CONFIG_PATH', raising=False)
+    def test_effective_verify_env_equals_verify_env_when_disabled(self):
         config = OrchestratorConfig(verify_env={'RUSTC_WRAPPER': 'sccache'})
         assert config.effective_verify_env == config.verify_env
 
@@ -1553,6 +1578,7 @@ class TestVerifyRunnerConfig:
         ])
         assert config.verify_runners[0].df_checkout_path is None
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_orchestrator_config_verify_runners_defaults_empty(self):
         """OrchestratorConfig.verify_runners defaults to [] not None."""
         config = OrchestratorConfig()
@@ -1569,6 +1595,7 @@ class TestVerifyRunnerConfig:
         assert isinstance(config.verify_runners[0], VerifyRunnerConfig)
         assert config.verify_runners[0].name == 'laptop'
 
+    @pytest.mark.usefixtures("code_default_config")
     def test_orchestrator_config_verify_drift_check_every_n_lands_default(self):
         """verify_drift_check_every_n_lands defaults to 20."""
         config = OrchestratorConfig()
@@ -2169,6 +2196,50 @@ class TestParkBackfillConfig:
             f"'{leaf}' must be in RELOADABLE_FIELDS (green-tier hot-reloadable, "
             'alongside fairness.skip_threshold in the scheduler-tuning slice)'
         )
+
+
+class TestPinReservationConfig:
+    """The three pin reservation knobs (task 6040).
+
+    Flat ``OrchestratorConfig`` leaves beside the ``backfill_*`` block, read
+    from ``self.config`` at tick time, so green-tier membership alone makes
+    them hot-reloadable.
+    """
+
+    @pytest.mark.usefixtures('code_default_config')
+    def test_defaults(self):
+        cfg = OrchestratorConfig()
+        assert cfg.pin_reservations_enabled is True
+        assert cfg.pin_reservation_max_active == 1
+        assert cfg.pin_blocked_emit_interval_secs == 3600.0
+
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_max_active_rejects_below_one(self, bad):
+        """ge=1: the kill switch is the single "off" lever, not max_active=0."""
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(pin_reservation_max_active=bad)
+
+    @pytest.mark.parametrize('bad', [0, -1])
+    def test_emit_interval_rejects_non_positive(self, bad):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(pin_blocked_emit_interval_secs=bad)
+
+    @pytest.mark.parametrize('leaf', [
+        'pin_reservations_enabled',
+        'pin_reservation_max_active',
+        'pin_blocked_emit_interval_secs',
+    ])
+    def test_pin_reservation_leaves_are_green_tier_reloadable(self, leaf):
+        assert leaf in RELOADABLE_FIELDS
+
+    def test_reloading_the_kill_switch_flips_the_live_config(self):
+        live = OrchestratorConfig()
+        assert live.pin_reservations_enabled is True, 'premise: enabled before the reload'
+
+        report = apply_reload(live, OrchestratorConfig(pin_reservations_enabled=False))
+
+        assert 'pin_reservations_enabled' in report['applied']
+        assert live.pin_reservations_enabled is False
 
 
 class TestTransientRequeueBackoffConfig:
@@ -3362,19 +3433,32 @@ class TestSessionResumeConfig:
     no count: it reads as a checked claim.
     """
 
-    def test_defaults(self):
-        """SessionResumeConfig() carries the γ default knobs."""
+    def test_defaults(self, code_default_config):
+        """SessionResumeConfig() carries the γ default knobs.
+
+        Takes ``code_default_config`` so these assert the SHIPPED CODE
+        defaults: `session_resume` is absent from
+        dark-factory-orchestrator.yaml today, but an operator adding it must
+        not silently turn this row green against a tuned value (the convention
+        e9d1055ed8 established after two suites went red pinning live yaml).
+        """
         from orchestrator.config import SessionResumeConfig
 
         cfg = SessionResumeConfig()
         assert cfg.enabled is True
         assert cfg.freshness_window_secs == 86400
         assert cfg.max_resumes_per_task == 3
+        # task ε/3733: the window, NOT the threshold, was the binding
+        # constraint — at the old 3600s nothing chained at any threshold. 5
+        # stays, two above the measured null's longest run of 3 inside 24h.
         assert cfg.fallback_storm_threshold == 5
-        # task 3256: the storm streak is a rolling window, not a cumulative
-        # per-boot counter. 3600s is read off the measured signature — bursts
-        # are ~17 fallbacks inside one hour, quiet gaps are ~7h and ~39h.
-        assert cfg.storm_window_secs == 3600
+        # task ε/3733: a DERIVED bound, re-derived from the population that
+        # actually feeds the streak after 3728 carved out the
+        # session_resume_fallback bursts the old 3600s was read off. 86400s
+        # sits inside the measured admissible interval [5.82h, 53.00h); the
+        # derivation, its provenance and its live re-derivation guard are in
+        # orchestrator/storm_window_bound.py and test_storm_window_bound.py.
+        assert cfg.storm_window_secs == 86400
         # task 3730 (PRD leaf δ / D3): a DERIVED bound, not a chosen number.
         # 432000s = 5 days is the 2026-09-07 requirement (355,803s = 4.12d)
         # rounded up to the next whole day; the derivation and its provenance
@@ -3952,6 +4036,9 @@ class TestRecoveryEmissionConfig:
         # The narrower kill switch for the only part that WRITES to the
         # escalation queue — separate from `enabled` on purpose.
         assert cfg.recovery_emission.streak_escalation_enabled is True
+        # Task 4541: ships ON — a hold whose every pin is already an L2 in
+        # front of a human files no alarm.
+        assert cfg.recovery_emission.streak_escalation_suppress_human_parked is True
         # Task 4647: the landing-detector git_error storm escape hatch shares
         # this section because it is the same KIND of knob — a recovery-site
         # detector whose alarm an operator must be able to retune or silence
@@ -3993,6 +4080,15 @@ class TestRecoveryEmissionConfig:
         with pytest.raises(ValidationError):
             RecoveryEmissionConfig(landing_git_error_rate_per_hour=-1)
 
+    def test_suppress_human_parked_is_not_a_second_kill_switch(self):
+        """Turning it off restores pre-4541 filing; it never silences the alarm."""
+        from orchestrator.config import RecoveryEmissionConfig
+
+        cfg = RecoveryEmissionConfig(streak_escalation_suppress_human_parked=False)
+
+        assert cfg.streak_escalation_suppress_human_parked is False
+        assert cfg.streak_escalation_enabled is True
+
     def test_defaults_yaml_block_matches_the_field_defaults(self):
         """The shipped stanza must not drift from the pydantic defaults.
 
@@ -4010,6 +4106,7 @@ class TestRecoveryEmissionConfig:
         assert block['veto_streak_threshold'] == 3
         assert block['veto_streak_min_span_secs'] == 1500.0
         assert block['streak_escalation_enabled'] is True
+        assert block['streak_escalation_suppress_human_parked'] is True
         # Task 4647 — a Field(default=...) with no stanza key is exactly the
         # silent drift this test exists to catch, so the new leaves are pinned
         # here alongside the sibling four rather than trusted to pydantic.
@@ -4094,3 +4191,68 @@ class TestMergeParkLockGraceSeconds:
             'RELOADABLE_FIELDS (green-tier hot-reloadable, explicitly '
             'registered beside the git.offline_lane_* leaves)'
         )
+
+
+class TestInfoL0RouterConfig:
+    """The four info-L0 disposition router knobs
+    (plans/info-l0-disposition-router-prd.md D5/D9/D12, §Contract)."""
+
+    _LEAVES = (
+        'info_l0_router_enabled',
+        'info_l0_router_ticket_timeout_secs',
+        'info_l0_router_max_conversions_per_sweep',
+        'info_l0_note_detail_chars',
+    )
+
+    @pytest.fixture(autouse=True)
+    def _isolated(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv('ORCH_CONFIG_PATH', '')
+
+    def test_defaults(self):
+        config = OrchestratorConfig()
+        assert config.info_l0_router_enabled is True
+        assert config.info_l0_router_ticket_timeout_secs == 900.0
+        assert config.info_l0_router_max_conversions_per_sweep == 20
+        assert config.info_l0_note_detail_chars == 1200
+
+    @pytest.mark.parametrize(
+        ('field', 'bad'),
+        [
+            # gt=0: a zero timeout would fail every D9 hold on its first tick.
+            ('info_l0_router_ticket_timeout_secs', 0),
+            ('info_l0_router_ticket_timeout_secs', -1),
+            ('info_l0_router_max_conversions_per_sweep', -1),
+            ('info_l0_note_detail_chars', -1),
+        ],
+    )
+    def test_out_of_bounds_values_rejected(self, field, bad):
+        with pytest.raises(ValidationError):
+            OrchestratorConfig(**{field: bad})
+
+    @pytest.mark.parametrize('leaf', _LEAVES)
+    def test_leaves_are_green_tier_reloadable(self, leaf):
+        assert leaf in RELOADABLE_FIELDS
+
+    def test_apply_reload_retunes_the_live_config(self):
+        live = OrchestratorConfig()
+        fresh = OrchestratorConfig(
+            info_l0_router_enabled=False,
+            info_l0_router_ticket_timeout_secs=60.0,
+            info_l0_router_max_conversions_per_sweep=5,
+            info_l0_note_detail_chars=400,
+        )
+        report = apply_reload(live, fresh)
+        assert report['reloaded'] is True
+        assert report['error'] is None
+        assert report['restart_required'] == {}
+        assert report['applied'] == {
+            'info_l0_router_enabled': {'old': True, 'new': False},
+            'info_l0_router_ticket_timeout_secs': {'old': 900.0, 'new': 60.0},
+            'info_l0_router_max_conversions_per_sweep': {'old': 20, 'new': 5},
+            'info_l0_note_detail_chars': {'old': 1200, 'new': 400},
+        }
+        assert live.info_l0_router_enabled is False
+        assert live.info_l0_router_ticket_timeout_secs == 60.0
+        assert live.info_l0_router_max_conversions_per_sweep == 5
+        assert live.info_l0_note_detail_chars == 400

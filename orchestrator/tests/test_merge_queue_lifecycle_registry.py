@@ -30,12 +30,14 @@ import dataclasses
 import inspect
 import logging
 import textwrap
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _merge_lane_fakes import (
+    FakeClock,
     FakeVerifier,
     RecordingEscalations,
     hangs_until,
@@ -750,7 +752,6 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
         """
         from orchestrator.git_ops import MergeVerifyLeaseContended
         from orchestrator.merge_queue import (
-            PRODUCTION_CLOCK,
             InflightStatus,
             ItemLifecycleState,
             RealMergeItem,
@@ -768,12 +769,10 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
             ),
             'df3082-pair-deadverify': hangs_until(asyncio.Event()),
         })
-        # The real clock, deliberately: the no-progress budget below is read
-        # off the clock port while the abandon poll's cadence is real asyncio
-        # time, so a hand-advanced clock would never reach the budget.
+        clock = FakeClock()
         worker = make_lane(
-            git_ops, queue, verifier=verifier, clock=PRODUCTION_CLOCK,
-            escalation_queue=fake_eq,
+            git_ops, queue, verifier=verifier, escalation_queue=fake_eq,
+            clock=clock,
         )
         worker.VERIFY_ABANDON_POLL_SECS = 0.02
         worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
@@ -810,6 +809,24 @@ class TestOnRequeuedIsAlwaysPairedWithNoteRequeue:
             worker._run_inflight_verify(item_cl, lease), timeout=15.0,
         )
         assert vr_cl.status == InflightStatus.REQUEUED, f'{vr_cl!r}'
+
+        # The dead-verify drive below only TERMINATES because the abandon poll
+        # takes its cadence from the injected clock (task 5485): the fake
+        # charges `mono` the full poll interval per wait, so the no-progress
+        # budget elapses in ten polls costing no real time. Pinned here, off
+        # the cheap control drive above, so reverting that poll to a bare
+        # `asyncio.wait` fails with THIS message rather than as an opaque 15 s
+        # TimeoutError below.
+        assert clock.waits, (
+            'the abandon poll recorded no ClockPort.wait_for_any call — the lane '
+            'is waiting on something other than the clock it measures its '
+            'no-progress budget against'
+        )
+        assert set(clock.waits) == {worker.VERIFY_ABANDON_POLL_SECS}, (
+            f'every ClockPort.wait_for_any must wait exactly '
+            f'VERIFY_ABANDON_POLL_SECS ({worker.VERIFY_ABANDON_POLL_SECS}s): '
+            f'{clock.waits!r}'
+        )
 
         # ── THE DEFECT: dead-verify no-progress abort (:13775/:13776) ────────
         req_dv, item_dv = await _make_merged_item(
@@ -2526,7 +2543,7 @@ def _stub_train_callback_factory(train_id: str):  # noqa: ARG001
     """Minimal TrainCallbacks stub (duplicated from
     test_merge_queue_coalesce.py's _stub_factory — per-file duplication
     convention, see this file's module docstring)."""
-    from orchestrator.merge_queue import TrainCallbacks
+    from orchestrator.merge_lane.types import TrainCallbacks
 
     return TrainCallbacks(
         status_check=AsyncMock(return_value={}),
@@ -2865,3 +2882,591 @@ class TestMultiItemPipelineToQuiescenceNoLeaks:
 
         await worker.stop()
         await worker_task
+
+
+# ---------------------------------------------------------------------------
+# task 4582: a verify that gives its request back (REQUEUED) or drops it
+# (DROPPED) from inside `_run_inflight_verify` must VACATE its InflightEntry —
+# hand the host lease back at once and mark the entry — rather than leave a
+# corpse holding the lease until its head-of-line finalize.
+#
+# The scene is the production dispatch shape: a HEAD entry H whose verify never
+# ends sits at index 0, so the entry R under test is at index >= 1 and cannot
+# reach head-of-line while H verifies. R's verify task is created BEFORE its
+# entry and is handed an InflightEntrySlot that the entry fills, as
+# `_dispatch_item` does.
+# ---------------------------------------------------------------------------
+
+_VACATE_TRIGGERS = ('operator_halt', 'no_progress', 'lane_contended', 'abandon')
+_REQUEUE_TRIGGERS = ('operator_halt', 'no_progress', 'lane_contended')
+
+
+@dataclasses.dataclass
+class _VerifyExitScene:
+    """A worker after R's verify exited through *trigger* (task 4582)."""
+
+    worker: Any
+    queue: asyncio.Queue
+    fake_eq: RecordingEscalations
+    allocator: MagicMock
+    head_req: MergeRequest
+    head_item: Any
+    head_entry: Any
+    req: MergeRequest
+    item: Any
+    lease: Any
+    entry: Any
+    vr: Any
+
+
+@contextlib.asynccontextmanager
+async def _verify_exit_scene(
+    git_ops: GitOps, config: OrchestratorConfig, trigger: str,
+    *, cancel_and_release: AsyncMock | None = None,
+) -> AsyncIterator[_VerifyExitScene]:
+    """Drive R's verify out through *trigger* and yield the scene; on exit,
+    cancel H's never-ending verify.
+
+    *trigger* is one of :data:`_VACATE_TRIGGERS`. The poll settings follow
+    ``TestOnRequeuedIsAlwaysPairedWithNoteRequeue``; the 0.2s no-progress
+    budget applies to 'no_progress' alone, so the other triggers cannot race
+    into a dead-verify abort. *cancel_and_release* replaces the allocator's
+    always-succeeding release.
+    """
+    from orchestrator.git_ops import MergeVerifyLeaseContended
+    from orchestrator.merge_lane.types import InflightEntrySlot
+    from orchestrator.merge_queue import InflightEntry, ItemLifecycleState
+    from orchestrator.verify_runner import HostLease
+
+    branch = f"df4582-{trigger.replace('_', '-')}"
+    head_req, head_item = await _make_merged_item(
+        git_ops, config, f'{branch}-head', 'df4582_h.py', 'h = 1\n',
+    )
+    req, item = await _make_merged_item(git_ops, config, branch, 'df4582_r.py', 'r = 1\n')
+
+    script = (
+        raises(MergeVerifyLeaseContended(Path('/x/_merge-verify.lock'), 300.0))
+        if trigger == 'lane_contended'
+        else hangs_until(asyncio.Event())
+    )
+    verifier = FakeVerifier(scripts={req.task_id: script})
+    fake_eq = RecordingEscalations()
+    queue: asyncio.Queue = asyncio.Queue()
+    worker = make_lane(
+        git_ops, queue, verifier=verifier, escalation_queue=fake_eq, clock=FakeClock(),
+    )
+    worker.VERIFY_ABANDON_POLL_SECS = 0.02
+    worker.INFLIGHT_VERIFY_PROGRESS_PROBE_SECS = 0.02
+    if trigger == 'no_progress':
+        worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS = 0.2
+    allocator = MagicMock()
+    allocator.cancel_and_release = (
+        AsyncMock(return_value=True) if cancel_and_release is None else cancel_and_release
+    )
+    allocator.release = AsyncMock()
+    worker._host_allocator = allocator
+
+    worker._register_item(head_item, initial=ItemLifecycleState.DISPATCHING)
+    head_verify = asyncio.ensure_future(asyncio.Event().wait())
+    head_entry = InflightEntry(
+        item=head_item,
+        lease=HostLease(name='head-host', runner=MagicMock(), is_local=False),
+        verify_task=cast(Any, head_verify),
+        merge_wt=head_item.merge_wt,
+        was_speculative=False,
+    )
+    worker._inflight_append(head_entry)
+
+    worker._register_owned_merge_worktree(item.merge_wt)
+    worker._register_item(item, initial=ItemLifecycleState.DISPATCHING)
+    local_runner = MagicMock()
+    local_runner.name = 'local'
+    local_runner.is_local = True
+    lease = HostLease(name='local', runner=local_runner, is_local=True)
+    slot = InflightEntrySlot()
+    verify_task = asyncio.ensure_future(
+        worker._run_inflight_verify(item, lease, entry_slot=slot),
+    )
+    entry = InflightEntry(
+        item=item,
+        lease=lease,
+        verify_task=cast(Any, verify_task),
+        merge_wt=item.merge_wt,
+        was_speculative=False,
+    )
+    slot.entry = entry
+    worker._inflight_append(entry)
+
+    try:
+        if trigger in ('operator_halt', 'abandon'):
+            await asyncio.wait_for(verifier.await_entry(1), timeout=15.0)
+            if trigger == 'operator_halt':
+                worker.operator_halt('test: mid-verify halt')
+            else:
+                req.result.cancel()
+        vr = await asyncio.wait_for(verify_task, timeout=15.0)
+        yield _VerifyExitScene(
+            worker=worker, queue=queue, fake_eq=fake_eq, allocator=allocator,
+            head_req=head_req, head_item=head_item, head_entry=head_entry,
+            req=req, item=item, lease=lease, entry=entry, vr=vr,
+        )
+    finally:
+        for task in (head_verify, verify_task):
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.asyncio
+class TestVerifyExitVacatesItsInflightEntry:
+    """A verify that requeues or drops its request releases the host lease
+    BEFORE it returns, and stamps the sentinel on its own entry; the entry's
+    eventual head-of-line finalize releases nothing more (task 4582 step-1 RED
+    / step-2 GREEN).
+    """
+
+    @pytest.mark.parametrize('trigger', _VACATE_TRIGGERS)
+    async def test_verify_exit_releases_the_lease_once_and_marks_the_entry(
+        self, git_ops: GitOps, config: OrchestratorConfig, trigger: str,
+    ) -> None:
+        from orchestrator.merge_queue import InflightStatus
+
+        sentinel = (
+            InflightStatus.DROPPED if trigger == 'abandon' else InflightStatus.REQUEUED
+        )
+        async with _verify_exit_scene(git_ops, config, trigger) as scene:
+            cancel_and_release = scene.allocator.cancel_and_release
+            assert scene.vr.status == sentinel, f'{scene.vr!r}'
+            assert cancel_and_release.await_count == 1, (
+                f'the verify must hand its host lease back at the {sentinel} '
+                f'itself, not leave it held until head-of-line finalize: '
+                f'{cancel_and_release.await_args_list!r}'
+            )
+            cancel_and_release.assert_awaited_once_with(scene.lease)
+            assert scene.entry.lease is None, (
+                'a released lease must be nulled on the entry, or a later '
+                'cascade/stop()/finalize would act on a slot already re-leased'
+            )
+            assert scene.entry.status == sentinel, (
+                f'the entry must carry the {sentinel} stamp: {scene.entry.status!r}'
+            )
+
+            await scene.worker._finalize_inflight(scene.entry)
+
+            assert cancel_and_release.await_count == 1, (
+                f'exactly one release per lease — the head-of-line finalize must '
+                f'not release it again: {cancel_and_release.await_args_list!r}'
+            )
+            if sentinel == InflightStatus.REQUEUED:
+                assert not scene.req.result.done(), (
+                    'a requeued request must be left PENDING for its re-dispatch'
+                )
+            assert _rejected_transition_escalations(scene.fake_eq) == [], (
+                f'vacating must not escalate: {scene.fake_eq.filed!r}'
+            )
+
+    async def test_a_failed_release_still_requeues_and_leaves_the_lease_to_finalize(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        from orchestrator.merge_queue import InflightStatus
+
+        cancel_and_release = AsyncMock(side_effect=[RuntimeError('allocator down'), True])
+        async with _verify_exit_scene(
+            git_ops, config, 'lane_contended', cancel_and_release=cancel_and_release,
+        ) as scene:
+            assert scene.vr.status == InflightStatus.REQUEUED, f'{scene.vr!r}'
+            assert scene.queue.qsize() == 1, (
+                'a failed lease release must not stop the requeue'
+            )
+            assert scene.queue.get_nowait() is scene.req
+            assert scene.entry.lease is scene.lease, (
+                'a lease whose release failed stays on the entry for finalize'
+            )
+            assert not scene.entry.vacated, (
+                f'an entry still holding its lease is not vacated: {scene.entry.status!r}'
+            )
+
+            await scene.worker._finalize_inflight(scene.entry)
+
+            assert cancel_and_release.await_count == 2, (
+                f'finalize must retry the failed release: '
+                f'{cancel_and_release.await_args_list!r}'
+            )
+            cancel_and_release.assert_awaited_with(scene.lease)
+            assert _rejected_transition_escalations(scene.fake_eq) == [], (
+                f'{scene.fake_eq.filed!r}'
+            )
+
+
+_MQ_VERIFY_EXIT_METHOD = '_run_inflight_verify'
+_VERIFY_EXIT_BYPASSES = ('_requeue_request', '_retire_item')
+
+
+def _calls_inside_run_inflight_verify(source: str, attr: str) -> list[str]:
+    """Every ``<x>.attr(...)`` call inside
+    ``SpeculativeMergeWorker._run_inflight_verify`` in *source*, rendered as
+    ``'<lineno> <call>'`` in source order; ``[]`` on unparseable source.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    ranges = _chokepoint_ranges(tree, _MQ_CHOKEPOINT_CLASS, _MQ_VERIFY_EXIT_METHOD)
+    calls = sorted(
+        (
+            call for call in _attr_calls(tree, attr)
+            if any(start <= call.lineno <= end for start, end in ranges)
+        ),
+        key=lambda call: call.lineno,
+    )
+    return [f'{call.lineno} {ast.unparse(call)}' for call in calls]
+
+
+def _verify_exit_vacate_bypasses(source: str) -> list[str]:
+    """Bare ``_requeue_request``/``_retire_item`` calls inside
+    ``_run_inflight_verify`` — each one gives a request back or drops it
+    without vacating its InflightEntry first.
+    """
+    hits = [
+        hit for attr in _VERIFY_EXIT_BYPASSES
+        for hit in _calls_inside_run_inflight_verify(source, attr)
+    ]
+    return sorted(hits, key=lambda hit: int(hit.split(' ', 1)[0]))
+
+
+class TestRunInflightVerifyRequeuesOnlyThroughVacate:
+    """Every requeue or drop inside ``_run_inflight_verify`` goes through
+    ``_requeue_from_verify`` / ``_drop_from_verify``, which vacate the entry
+    before the request leaves (task 4582 step-1 RED / step-2 GREEN).
+    """
+
+    def test_scanner_accepts_calls_routed_through_the_vacate_wrappers(self) -> None:
+        """POSITIVE control."""
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def _run_inflight_verify(self, item, lease):\n'
+            '        await self._requeue_from_verify(item)\n'
+            '        await self._drop_from_verify(item)\n'
+            '\n'
+            '    async def _requeue_from_verify(self, item):\n'
+            '        self._requeue_request(item.request)\n'
+        )
+        assert _verify_exit_vacate_bypasses(src) == []
+        assert len(_calls_inside_run_inflight_verify(src, '_requeue_from_verify')) == 1
+
+    def test_scanner_flags_a_bare_requeue_and_a_bare_retire(self) -> None:
+        """SYNTHETIC BYPASS, including one inside a nested closure."""
+        src = (
+            'class SpeculativeMergeWorker:\n'
+            '    async def _run_inflight_verify(self, item, lease):\n'
+            '        req = item.request\n'
+            '        self._requeue_request(req)\n'
+            '        def _drop():\n'
+            '            self._retire_item(req.request_id)\n'
+            '        _drop()\n'
+        )
+        offenders = _verify_exit_vacate_bypasses(src)
+        assert offenders == [
+            '4 self._requeue_request(req)',
+            '6 self._retire_item(req.request_id)',
+        ], offenders
+
+    def test_scanner_scans_only_the_worker_method(self) -> None:
+        """CLASS-QUALIFICATION: a same-named method on another class, and a
+        bare call in a different worker method, are out of scope.
+        """
+        src = (
+            'class SomethingElse:\n'
+            '    async def _run_inflight_verify(self, item, lease):\n'
+            '        self._requeue_request(item.request)\n'
+            '\n'
+            'class SpeculativeMergeWorker:\n'
+            '    async def _dispatch_item(self, item):\n'
+            '        self._requeue_request(item.request)\n'
+        )
+        assert _verify_exit_vacate_bypasses(src) == []
+
+    def test_scanner_returns_empty_on_unparseable_source(self) -> None:
+        assert _verify_exit_vacate_bypasses('def broken(:\n') == []
+
+    def test_run_inflight_verify_requeues_and_drops_only_through_vacate(self) -> None:
+        import orchestrator.merge_queue as _mq  # module-local import convention
+
+        source = Path(inspect.getfile(_mq)).read_text()
+        offenders = _verify_exit_vacate_bypasses(source)
+        assert offenders == [], (
+            '_run_inflight_verify must give a request back through '
+            '`await self._requeue_from_verify(item)` and drop it through '
+            '`await self._drop_from_verify(item)`, which hand the host lease back '
+            'and mark the InflightEntry first. Bare calls: '
+            f'{offenders!r}'
+        )
+        routed = _calls_inside_run_inflight_verify(source, '_requeue_from_verify')
+        assert routed, (
+            'no _requeue_from_verify call found inside _run_inflight_verify — '
+            'the scan is mis-wired or the method moved'
+        )
+
+
+def _rendered_ids(snap: dict) -> list[str]:
+    """The request_ids of *snap*'s entries, in emission order."""
+    return [e['request_id'] for e in snap['entries']]
+
+
+@pytest.mark.asyncio
+class TestVacatedInflightEntryRendersAtMostOnce:
+    """A vacated entry is invisible to every in-flight reader: the requeued
+    request renders exactly once, as queued, and never sits in the frozen
+    prefix and the unfrozen suffix at once (task 4582 step-3 RED / step-4
+    GREEN). Read through the public seams only: ``snapshot()``,
+    ``frozen_prefix()``, ``unfrozen_suffix()``, ``check_frozen_prefix_invariant()``.
+    """
+
+    @pytest.mark.parametrize('trigger', _REQUEUE_TRIGGERS)
+    async def test_requeued_request_renders_once_before_and_after_the_drain(
+        self, git_ops: GitOps, config: OrchestratorConfig, trigger: str,
+    ) -> None:
+        async with _verify_exit_scene(git_ops, config, trigger) as scene:
+            worker = scene.worker
+            rid = scene.req.request_id
+            head_rid = scene.head_req.request_id
+            head_tid = scene.head_req.task_id
+
+            for where in ('on the input queue', 'in a lane buffer'):
+                if where == 'in a lane buffer':
+                    worker._drain_queue_into_lanes()
+                    assert rid in worker.unfrozen_suffix(), (
+                        f'the drain must have buffered the requeued request: '
+                        f'{worker.unfrozen_suffix()!r}'
+                    )
+                snap = worker.snapshot()
+                rendered = _rendered_ids(snap)
+                assert rendered.count(rid) == 1, (
+                    f'{where}: the requeued request must render exactly once, '
+                    f'not also as its vacated InflightEntry: {snap["entries"]!r}'
+                )
+                assert next(
+                    e['state'] for e in snap['entries'] if e['request_id'] == rid
+                ) == 'queued', f'{where}: {snap["entries"]!r}'
+                assert rid not in worker.frozen_prefix(), (
+                    f'{where}: a vacated entry is not frozen: {worker.frozen_prefix()!r}'
+                )
+                assert worker.check_frozen_prefix_invariant(scene.head_item.base_sha) == [], (
+                    f'{where}: {worker.check_frozen_prefix_invariant(scene.head_item.base_sha)!r}'
+                )
+                assert snap['depth'] == 2 == len(set(rendered)), (
+                    f'{where}: depth must count the two live requests: '
+                    f'depth={snap["depth"]} entries={snap["entries"]!r}'
+                )
+                assert snap['occupancy']['inflight_by_host'] == {'head-host': [head_tid]}, (
+                    f'{where}: {snap["occupancy"]!r}'
+                )
+                assert snap['occupancy']['inflight_total'] == 1, f'{where}: {snap["occupancy"]!r}'
+                assert snap['verify_in_progress'] is not None
+                assert snap['verify_in_progress']['task_id'] == head_tid, (
+                    f'{where}: {snap["verify_in_progress"]!r}'
+                )
+                assert snap['frozen_prefix']['request_ids'] == [head_rid], (
+                    f'{where}: {snap["frozen_prefix"]!r}'
+                )
+
+    async def test_dropped_request_does_not_render(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        async with _verify_exit_scene(git_ops, config, 'abandon') as scene:
+            worker = scene.worker
+            rid = scene.req.request_id
+
+            snap = worker.snapshot()
+
+            assert _rendered_ids(snap).count(rid) == 0, (
+                f'a dropped request must not render as its vacated entry: '
+                f'{snap["entries"]!r}'
+            )
+            assert rid not in worker.frozen_prefix(), f'{worker.frozen_prefix()!r}'
+            assert snap['depth'] == 1, f'{snap["entries"]!r}'
+            assert worker.check_frozen_prefix_invariant(scene.head_item.base_sha) == [], (
+                f'{worker.check_frozen_prefix_invariant(scene.head_item.base_sha)!r}'
+            )
+
+
+@pytest.mark.asyncio
+class TestVacatedCorpseFinalizeLeavesReincarnationAlone:
+    """A vacated corpse's late head-of-line finalize must not touch the
+    request_id once it has been re-dispatched: the registry's VERIFYING then
+    belongs to the new incarnation (task 4582 step-5 RED / step-6 GREEN).
+
+    This is the reify mr-945466ca shape — a corpse still in ``_inflight`` while
+    the same request_id verifies again behind it.
+    """
+
+    async def test_corpse_finalize_leaves_the_redispatched_verify_verifying(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        from orchestrator.merge_queue import InflightEntry, ItemLifecycleState
+        from orchestrator.verify_runner import HostLease
+
+        async with _verify_exit_scene(git_ops, config, 'operator_halt') as scene:
+            worker = scene.worker
+            rid = scene.req.request_id
+            worker.unhalt_all_lanes('test: the halt is not needed past the vacate')
+
+            # Walk the request back to VERIFYING through the production
+            # chokepoints and legal edges, as a fresh incarnation N.
+            worker._drain_queue_into_lanes()
+            assert worker._pop_next_pickable() is scene.req
+            n_item = dataclasses.replace(scene.item)
+            worker._note_transition(
+                rid, ItemLifecycleState.MERGING, ItemLifecycleState.AWAITING_VERIFY,
+                live_obj=n_item,
+            )
+            worker._note_transition(
+                rid, ItemLifecycleState.AWAITING_VERIFY, ItemLifecycleState.DISPATCHING,
+                live_obj=n_item,
+            )
+            n_verify = asyncio.ensure_future(asyncio.Event().wait())
+            n_entry = InflightEntry(
+                item=n_item,
+                lease=HostLease(name='n-host', runner=MagicMock(), is_local=False),
+                verify_task=cast(Any, n_verify),
+                merge_wt=n_item.merge_wt,
+                was_speculative=False,
+            )
+            worker._inflight_append(n_entry)
+            assert worker._lifecycle.current(rid) == ItemLifecycleState.VERIFYING
+            try:
+                await worker._finalize_inflight(scene.entry)
+
+                current = worker._lifecycle.current(rid)
+                assert current == ItemLifecycleState.VERIFYING, (
+                    f'the corpse finalize bounced the re-dispatched verify: '
+                    f'registry reads {current!r}'
+                )
+                assert worker._live_items[rid] is n_entry, (
+                    f'_live_items must still hold the new incarnation: '
+                    f'{worker._live_items.get(rid)!r}'
+                )
+                assert _rejected_transition_escalations(scene.fake_eq) == [], (
+                    f'{scene.fake_eq.filed!r}'
+                )
+                snap = worker.snapshot()
+                mine = [e for e in snap['entries'] if e['request_id'] == rid]
+                assert len(mine) == 1, f'{snap["entries"]!r}'
+                assert mine[0]['state'] == 'verifying', f'{mine[0]!r}'
+                assert mine[0]['host'] == 'n-host', f'{mine[0]!r}'
+                assert worker.frozen_prefix().count(rid) == 1, f'{worker.frozen_prefix()!r}'
+            finally:
+                n_verify.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await n_verify
+
+
+@dataclasses.dataclass
+class _DuplicateScene:
+    """A worker verifying A while a stale reference to A sits on its input
+    queue ahead of B (task 4582)."""
+
+    worker: Any
+    queue: asyncio.Queue
+    a_req: MergeRequest
+    b_req: MergeRequest
+
+
+@contextlib.asynccontextmanager
+async def _duplicate_scene(
+    git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+) -> AsyncIterator[_DuplicateScene]:
+    """Yield a :class:`_DuplicateScene`; on exit, cancel A's never-ending verify."""
+    from orchestrator.merge_queue import InflightEntry, ItemLifecycleState
+    from orchestrator.verify_runner import HostLease
+
+    queue: asyncio.Queue = asyncio.Queue()
+    worker = make_lane(git_ops, queue)
+    a_req, a_item = await _make_merged_item(
+        git_ops, config, 'df4582-dedup-a', 'df4582_a.py', 'a = 1\n',
+    )
+    b_req = _make_request('df4582-dedup-b', 'df4582-dedup-b', tmp_path, config)
+    worker._register_item(a_item, initial=ItemLifecycleState.DISPATCHING)
+    a_verify = asyncio.ensure_future(asyncio.Event().wait())
+    worker._inflight_append(InflightEntry(
+        item=a_item,
+        lease=HostLease(name='a-host', runner=MagicMock(), is_local=False),
+        verify_task=cast(Any, a_verify),
+        merge_wt=a_item.merge_wt,
+        was_speculative=False,
+    ))
+    # The stale reference sits ahead of B, so the dropped duplicate is mid-list.
+    queue.put_nowait(a_req)
+    queue.put_nowait(b_req)
+    try:
+        yield _DuplicateScene(worker=worker, queue=queue, a_req=a_req, b_req=b_req)
+    finally:
+        a_verify.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await a_verify
+
+
+def _warnings_naming(caplog: pytest.LogCaptureFixture, request_id: str) -> list[str]:
+    """Every captured WARNING message that names *request_id*."""
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno == logging.WARNING and request_id in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+class TestSnapshotRendersEachRequestIdOnce:
+    """Belt and braces: whatever container holds a stale reference to a
+    request already rendered at a deeper pipeline stage, ``snapshot()`` keeps
+    only the first, head-of-line copy, renumbers positions, counts distinct
+    requests in ``depth`` and logs a WARNING naming the dropped request_id
+    once per episode (task 4582 step-7 RED / step-8 GREEN).
+    """
+
+    async def test_duplicate_request_id_keeps_the_head_of_line_copy(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        async with _duplicate_scene(git_ops, config, tmp_path) as scene:
+            a_req, b_req = scene.a_req, scene.b_req
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+                snap = scene.worker.snapshot()
+
+            assert _rendered_ids(snap) == [a_req.request_id, b_req.request_id], (
+                f'the head-of-line copy of A must be kept and its queued '
+                f'duplicate dropped: {snap["entries"]!r}'
+            )
+            assert snap['entries'][0]['state'] == 'verifying', f'{snap["entries"][0]!r}'
+            assert snap['depth'] == 2, f'depth must count distinct requests: {snap["depth"]}'
+            assert [e['position'] for e in snap['entries']] == [0, 1], (
+                f'positions must be renumbered contiguously: {snap["entries"]!r}'
+            )
+            assert snap['head_of_line'] == a_req.task_id, f'{snap["head_of_line"]!r}'
+            assert len(_warnings_naming(caplog, a_req.request_id)) == 1, (
+                f'exactly one WARNING must name the dropped duplicate: '
+                f'{[r.getMessage() for r in caplog.records]!r}'
+            )
+
+    async def test_a_persisting_duplicate_is_named_once_per_episode(
+        self, git_ops: GitOps, config: OrchestratorConfig, tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        async with _duplicate_scene(git_ops, config, tmp_path) as scene:
+            rid = scene.a_req.request_id
+            with caplog.at_level(logging.WARNING, logger='orchestrator.merge_queue'):
+                for _ in range(3):
+                    scene.worker.snapshot()
+                assert len(_warnings_naming(caplog, rid)) == 1, (
+                    f'a duplicate that persists across snapshots must be named '
+                    f'once, not on every heartbeat: {caplog.messages!r}'
+                )
+
+                assert scene.queue.get_nowait() is scene.a_req
+                scene.worker.snapshot()
+                scene.queue.put_nowait(scene.a_req)
+                scene.worker.snapshot()
+
+                assert len(_warnings_naming(caplog, rid)) == 2, (
+                    f'a duplicate that clears and recurs is a new episode and '
+                    f'must be named again: {caplog.messages!r}'
+                )

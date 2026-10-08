@@ -21,7 +21,6 @@ from __future__ import annotations
 import contextlib
 import errno
 import functools
-import importlib.util
 import json
 import os
 import signal
@@ -32,6 +31,7 @@ import types
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 SCRIPTS_DIR = Path(__file__).parent.parent / 'scripts'
 SCRIPT_PATH = SCRIPTS_DIR / 'cleanup_test_collections.py'
@@ -45,17 +45,7 @@ def _load(path: Path, name: str) -> types.ModuleType:
     reflection-based decorators look their defining module up in
     ``sys.modules`` on the way in.
     """
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(name, None)
-        raise
-    return module
+    return load_script_module(path, mod_name=name)
 
 
 @functools.cache
@@ -68,12 +58,9 @@ def _bake_off() -> types.ModuleType:
     return _load(BAKE_OFF_PATH, 'bake_off_storage_shape')
 
 
-# --- lease-dir isolation (task 4775, prerequisite pre-1) -------------------
-#
-# Defined once in the sibling module so five importers cannot drift apart;
-# its docstring says why redirecting the directory is a hard boundary rather
-# than a convenience.  Autouse applies to every test in THIS module.
-from _fm_lease_dir_fixture import lease_dir_fixture  # noqa: E402,F401
+# Lease-dir isolation (task 4775), autouse for every test in this module:
+# see _fm_helpers.py::lease_dir_fixture.
+from _fm_helpers import lease_dir_fixture  # noqa: E402,F401
 
 # --- the fake Qdrant -------------------------------------------------------
 

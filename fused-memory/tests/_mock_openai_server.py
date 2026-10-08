@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -35,7 +35,7 @@ from typing import Any
 DEFAULT_EMBEDDING_LEN = 1536
 
 
-def _chat_completion_body(content: str) -> dict[str, Any]:
+def chat_completion_body(content: str) -> dict[str, Any]:
     """A minimal valid chat.completions payload.
 
     ``content`` is a JSON *string*: OpenAIGenericClient._generate_response does
@@ -54,6 +54,40 @@ def _chat_completion_body(content: str) -> dict[str, Any]:
             },
         ],
         'usage': {'prompt_tokens': 1, 'completion_tokens': 1, 'total_tokens': 2},
+    }
+
+
+def responses_body(text: str, *, input_tokens: int = 3, output_tokens: int = 4) -> dict[str, Any]:
+    """A minimal valid Responses-API payload, as ``responses.parse`` reads it.
+
+    ``text`` is the JSON *string* the SDK validates against ``text_format``;
+    graphiti's BaseOpenAIClient reads it back as ``response.output_text``.
+    """
+    return {
+        'id': 'resp-mock',
+        'object': 'response',
+        'created_at': 0,
+        'model': 'mock-model',
+        'status': 'completed',
+        'parallel_tool_calls': True,
+        'tool_choice': 'auto',
+        'tools': [],
+        'output': [
+            {
+                'type': 'message',
+                'id': 'msg_1',
+                'role': 'assistant',
+                'status': 'completed',
+                'content': [{'type': 'output_text', 'text': text, 'annotations': []}],
+            },
+        ],
+        'usage': {
+            'input_tokens': input_tokens,
+            'output_tokens': output_tokens,
+            'total_tokens': input_tokens + output_tokens,
+            'input_tokens_details': {'cached_tokens': 0},
+            'output_tokens_details': {'reasoning_tokens': 0},
+        },
     }
 
 
@@ -82,8 +116,10 @@ class MockOpenAIServer:
         # ThreadingHTTPServer serves concurrently — guard the record list.
         self._lock = threading.Lock()
         self._requests: list[dict[str, Any]] = []
-        self._responses: dict[str, dict[str, Any]] = {}
+        self._responses: dict[str, list[tuple[int, dict[str, Any]]]] = {}
         self.chat_content = '{"ok": true}'
+        self.chat_responder: Callable[[Any], str] | None = None
+        """When set, each chat reply's content is computed from that request's JSON body."""
         self.embedding_len = DEFAULT_EMBEDDING_LEN
 
     @property
@@ -104,8 +140,16 @@ class MockOpenAIServer:
 
     def set_response(self, path_suffix: str, body: dict[str, Any]) -> None:
         """Override the canned response for paths ending in ``path_suffix``."""
+        self.set_response_sequence(path_suffix, [(200, body)])
+
+    def set_response_sequence(
+        self, path_suffix: str, bodies: Sequence[tuple[int, dict[str, Any]]]
+    ) -> None:
+        """Serve ``(status, body)`` pairs in order for ``path_suffix``; the last one repeats."""
+        if not bodies:
+            raise ValueError('a response sequence needs at least one (status, body) pair')
         with self._lock:
-            self._responses[path_suffix] = body
+            self._responses[path_suffix] = list(bodies)
 
     # -- internals used by the handler --
 
@@ -113,11 +157,11 @@ class MockOpenAIServer:
         with self._lock:
             self._requests.append(entry)
 
-    def _canned(self, path: str) -> dict[str, Any] | None:
+    def _canned(self, path: str) -> tuple[int, dict[str, Any]] | None:
         with self._lock:
-            for suffix, body in self._responses.items():
+            for suffix, sequence in self._responses.items():
                 if path.endswith(suffix):
-                    return body
+                    return sequence.pop(0) if len(sequence) > 1 else sequence[0]
         return None
 
 
@@ -153,11 +197,13 @@ def _make_handler(state: MockOpenAIServer) -> type[BaseHTTPRequestHandler]:
 
             canned = state._canned(self.path)
             if canned is not None:
-                self._send_json(200, canned)
+                self._send_json(*canned)
                 return
 
             if self.path.endswith('/chat/completions'):
-                self._send_json(200, _chat_completion_body(state.chat_content))
+                responder = state.chat_responder
+                content = responder(json_body) if responder else state.chat_content
+                self._send_json(200, chat_completion_body(content))
                 return
 
             if self.path.endswith('/embeddings'):

@@ -13,13 +13,12 @@ reporting a zero.
 from __future__ import annotations
 
 import dataclasses
-import importlib.util
 import json
-import sys
 import types
 from pathlib import Path
 
 import pytest
+from _fm_helpers import load_script_module
 
 # Shared with tests/reconciliation/test_stale_status_snapshot_edge_sweep.py,
 # which parametrizes its guard tests off these same lists. ``tests/`` carries
@@ -62,17 +61,7 @@ def _load_module(mod_name: str, path: Path) -> types.ModuleType:
     not on PYTHONPATH. The pinned shape corpora are an ordinary package
     import (see below) and need no such machinery.
     """
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {path}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+    return load_script_module(path, mod_name=mod_name)
 
 
 _mod = _load_module('measure_plural_enum_guard_recall', SCRIPT_PATH)

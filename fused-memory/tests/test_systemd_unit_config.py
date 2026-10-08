@@ -206,3 +206,48 @@ class TestServicePathPinned:
             "and byte-identical to the rendered unit.\n"
             f"Found: {path_lines}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Socket activation — the port survives service restarts
+# ---------------------------------------------------------------------------
+
+_FM_DIR = Path(__file__).resolve().parent.parent
+_SOCKET_UNIT = _FM_DIR.parent / "scripts" / "fused-memory.socket.template"
+_SERVICE_UNITS = [
+    _FM_DIR / "fused-memory.service.example-systemd-config",
+    _FM_DIR.parent / "scripts" / "fused-memory.service.template",
+]
+
+
+class TestSocketActivation:
+    """fused-memory.socket must hold exactly the port the server is configured for,
+    and every committed service unit must depend on it."""
+
+    def test_socket_listens_on_the_configured_endpoints(self, monkeypatch) -> None:
+        from fused_memory.config.schema import FusedMemoryConfig
+
+        monkeypatch.setenv("CONFIG_PATH", str(_FM_DIR / "config" / "config.yaml"))
+        monkeypatch.delenv("RECON_ESCALATION_PORT", raising=False)
+        config = FusedMemoryConfig()
+        recon = config.reconciliation
+        assert _parse_systemd_unit(_SOCKET_UNIT)["Socket"] == [
+            f"ListenStream={config.server.host}:{config.server.port}",
+            f"ListenStream={recon.escalation_host}:{recon.escalation_port}",
+        ]
+
+    @pytest.mark.parametrize("unit_path", _SERVICE_UNITS, ids=lambda p: p.name)
+    def test_service_wants_and_orders_after_the_socket(self, unit_path: Path) -> None:
+        sections = _parse_systemd_unit(unit_path)
+        unit = sections["Unit"]
+        assert "Wants=fused-memory.socket" in unit
+        after = [d for d in unit if d.startswith("After=")]
+        assert any("fused-memory.socket" in d.split("=", 1)[1].split() for d in after)
+        assert "Also=fused-memory.socket" in sections["Install"]
+
+    @pytest.mark.parametrize("unit_path", _SERVICE_UNITS, ids=lambda p: p.name)
+    def test_a_deliberate_stop_also_stops_the_socket(self, unit_path: Path) -> None:
+        service = _parse_systemd_unit(unit_path)["Service"]
+        hooks = [d for d in service if d.startswith("ExecStopPost=")]
+        assert len(hooks) == 1
+        assert hooks[0].endswith("/scripts/stop-socket-unless-restarting.sh %n")

@@ -26,7 +26,8 @@ from _orch_helpers import pydantic_spec
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
-from orchestrator.merge_queue import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+from orchestrator.merge_lane import POST_MERGE_PYRIGHT_BROKEN_REASON_PREFIX
+from orchestrator.scheduler import BlastRadiusResult
 from orchestrator.workflow import TaskWorkflow
 
 
@@ -60,7 +61,7 @@ class _Scheduler:
     async def handle_blast_radius_expansion(
         self, task_id, current, needed, /, *, persist_files=None
     ):
-        return False
+        return BlastRadiusResult(applied=False)
 
     async def dispatch_tool(self, name, arguments, *, timeout=30.0):
         return {}
@@ -125,11 +126,30 @@ def _make_workflow(*, tmp_path: Path, task_id: str = '42',
     wf.artifacts = TaskArtifacts(worktree)
     wf.worktree = worktree
     wf.plan = {'files': []}
-    wf._module_configs = []
     # No escalation queue so _mark_blocked doesn't try to submit escalations
     wf.escalation_queue = None
     wf.event_store = None
     return wf, scheduler
+
+
+async def _drain_unblock_tasks(wf: TaskWorkflow) -> None:
+    """Await the dry-run investigation task(s) this workflow spawned.
+
+    The hook names its background task ``unblock-auto-<task_id>``, and
+    production's own duplicate-spawn guard keys on exactly that name
+    (``orchestrator/workflow.py::TaskWorkflow._spawn_dry_run_unblock``), so the
+    name is a load-bearing public identity rather than an incidental label.
+    Reading the spawn back off ``asyncio.all_tasks()`` is therefore an honest
+    public observation of it, and it is what keeps pytest-asyncio from warning
+    "Task destroyed but it is pending".
+    """
+    me = asyncio.current_task()
+    spawned = [
+        t for t in asyncio.all_tasks()
+        if t is not me and t.get_name() == f'unblock-auto-{wf.task_id}'
+    ]
+    if spawned:
+        await asyncio.gather(*spawned, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -162,12 +182,10 @@ class TestMarkBlockedSpawnsFireAndForget:
         # Give the background task a tick to register its call
         await asyncio.sleep(0)
 
-        # Capture any still-pending background tasks before releasing hang,
-        # then await them so pytest-asyncio doesn't warn "Task destroyed while pending".
-        pending = list(wf._background_tasks)
+        # Release the hanging investigation, then drain it so pytest-asyncio
+        # doesn't warn "Task destroyed but it is pending".
         hang_event.set()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         # run_dry_run_unblock was called with the right kwargs
         assert len(calls) == 1
@@ -306,11 +324,10 @@ class TestMarkBlockedDeduplicatesDryRun:
             f'Expected 1 dry-run invocation, got {len(calls)}'
         )
 
-        # Clean up: release the hanging task
-        pending = list(wf._background_tasks)
+        # Release the hanging investigation, then drain it so pytest-asyncio
+        # doesn't warn "Task destroyed but it is pending".
         hang_event.set()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
 
 # ---------------------------------------------------------------------------
@@ -360,11 +377,10 @@ class TestMarkBlockedSpawnsDryRunWhenMergePhaseAndOptIn:
         # Give the background task a tick to register its call
         await asyncio.sleep(0)
 
-        # Capture pending tasks and drain them cleanly
-        pending = list(wf._background_tasks)
+        # Release the hanging investigation, then drain it so pytest-asyncio
+        # doesn't warn "Task destroyed but it is pending".
         hang_event.set()
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         # run_dry_run_unblock was called once with the correct task worktree
         assert len(calls) == 1, f'Expected 1 dry-run invocation, got {len(calls)}'
@@ -446,9 +462,7 @@ class TestMarkBlockedSpawnDryRunOrderingInvariant:
             await wf._mark_blocked(_reason, merge_phase=True, spawn_dry_run=True)
 
         await asyncio.sleep(0)
-        pending = list(wf._background_tasks)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         assert len(dry_run_calls) == 1, (
             f'Correct prefix should spawn once, got {len(dry_run_calls)}'
@@ -484,9 +498,7 @@ class TestMarkBlockedForwardsResilienceContext:
             await wf._mark_blocked('verify exhausted')
 
         await asyncio.sleep(0)  # let the background task register its call
-        pending = list(wf._background_tasks)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         assert len(calls) == 1, f'Expected 1 dry-run invocation, got {len(calls)}'
         kwargs = calls[0]
@@ -520,9 +532,7 @@ class TestMarkBlockedStampsLastBlockedAt:
             await wf._mark_blocked('verify exhausted', detail='All attempts failed')
 
         await asyncio.sleep(0)  # let any background tasks register
-        pending = list(wf._background_tasks)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         # Confirmed block transition: the status write succeeded first.
         assert 'blocked' in scheduler.statuses.get('46', [])
@@ -595,9 +605,7 @@ class TestMarkBlockedStampPrecedesDryRunSpawn:
             await wf._mark_blocked('verify exhausted', detail='All attempts failed')
 
         await asyncio.sleep(0)  # let any background tasks register/finish
-        pending = list(wf._background_tasks)
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
+        await _drain_unblock_tasks(wf)
 
         assert call_order == ['stamp', 'spawn'], (
             'Expected the last_blocked_at stamp to be awaited BEFORE '

@@ -285,7 +285,7 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: resolver
+      pattern: resolver=
       paths:
       - fused-memory/src/fused_memory/reconciliation/harness.py
       expect: present

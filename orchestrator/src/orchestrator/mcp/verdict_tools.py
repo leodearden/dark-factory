@@ -34,6 +34,7 @@ from fastmcp import FastMCP
 from shared.mcp_markup_middleware import (
     MarkupGuardMiddleware,
     RepairPolicy,
+    accepts_markup_override,
 )
 
 from orchestrator.artifacts import TaskArtifacts, _validate_verdict_role
@@ -327,9 +328,9 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
     # INV-5 failure this PRD exists to rule against, and it very nearly shipped
     # here: the first cut of this leaf wrote residue to a worktree-local
     # `.task/markup_residue-<n>.json`, which dies with the lane at
-    # `git worktree remove --force` and which nothing ever reads. That file is
-    # now only the LAST RESORT, taken when the queue cannot be opened at all,
-    # and the sink says so in the log line it writes.
+    # `git worktree remove --force` and which nothing ever reads. The floor is
+    # the queue or nothing, the same floor plan-tools declares, decided once
+    # in markup_sink.
     #
     # Filing works from this process even though it is a standalone stdio
     # subprocess with no in-process queue: markup_sink resolves project_root
@@ -400,12 +401,12 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
             spec=_MARKUP_SINK_SPEC,
             subject_task_id=lambda: _markup_subject_task_id(artifacts),
             resolve_root=lambda worktree: _markup_project_root(worktree),
-            last_resort=artifacts.write_markup_residue,
         ),
     ))
 
     if role == 'judge':
         @mcp.tool()
+        @accepts_markup_override
         def submit_completion_verdict(
             complete: bool,
             reasoning: str,
@@ -426,6 +427,7 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
             )
     elif role == 'triage':
         @mcp.tool()
+        @accepts_markup_override
         def submit_triage(
             accepted: list[dict],
             skipped: list[dict],
@@ -444,6 +446,7 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
             )
     elif role == 'merger':
         @mcp.tool()
+        @accepts_markup_override
         def submit_merge_disposition(
             blocked: bool,
             reason: str,
@@ -463,6 +466,7 @@ def create_server(artifacts: TaskArtifacts, role: str, session_id: str = '') -> 
         assert role not in _SINGLETON_ROLE_TOOLS
 
         @mcp.tool()
+        @accepts_markup_override
         def submit_review_verdict(
             reviewer: str,
             verdict: str,

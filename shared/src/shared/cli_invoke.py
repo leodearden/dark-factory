@@ -17,13 +17,14 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Any, TypeGuard
+from typing import IO, TYPE_CHECKING, Any, TypeGuard, TypeVar
+
+from shared.cost_store import CapReason
+from shared.proc_group import snapshot_process_group, terminate_process_group
 
 # VllmBridge depends on aiohttp, which is not installed in every consumer
 # environment (e.g. dashboard's venv).  Tolerate ImportError so that callers
 # that never set ANTHROPIC_BASE_URL can still import shared.cli_invoke.
-from shared.proc_group import snapshot_process_group, terminate_process_group
-
 try:
     from shared.vllm_bridge import VllmBridge as _VllmBridgeRuntime
 except ImportError:  # pragma: no cover - exercised only when aiohttp absent
@@ -181,6 +182,32 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 #                                         give a BIGGER account pool LESS
 #                                         wall-clock patience.
 #
+# scripts/legibility/session_runner.py    NO patience at all: park_on_frozen_
+#   (nightly legibility trickle + census, pool=False + max_cap_retries=
+#    every LLM call they make)            gate.account_count.  The contract is
+#                                         IMMEDIATE defer/taint (task 4736):
+#                                         a nightly oneshot must not block on
+#                                         a cap wait across the NEXT night's
+#                                         timer, and its digests are
+#                                         re-derivable, so patience buys
+#                                         nothing and costs a missed run.  One
+#                                         pass over the pool, then
+#                                         AllAccountsCappedException or
+#                                         PoolFrozen, which the runner types
+#                                         per task 5947 (all-capped defers at
+#                                         exit 0; all-auth-failed fails loud).
+#                                         is_usable_reply per stage: its
+#                                         codebook is dominated by usage-limit
+#                                         clusters, so a verdict QUOTING a
+#                                         banner must not cap a healthy
+#                                         account, while an unparseable exit-0
+#                                         banner still rotates.
+#                                         cap_wait_sanity_secs left at the
+#                                         default: the two bounds above always
+#                                         fire first.  Was an audited
+#                                         NON-caller (own text-mode spawn, no
+#                                         account pool) until task 6042.
+#
 # SCOPE OF EVERY BOUND IN THIS TABLE (task 3630 amendment, reviewer:
 # robustness).  cap_wait_sanity_secs is consulted at exactly one place —
 # _check_cap_wait — which runs in the cap-hit branch AFTER an invocation
@@ -190,82 +217,15 @@ _WATCHDOG_SLOW_READ_WARN_SECS = 1.0
 # ends in an unbounded `await self._open.wait()` (usage_gate.py) released only
 # by a real cap reset or a successful resume probe.  So a caller whose pool is
 # ALREADY frozen when it starts can still block for hours despite a 120 s or
-# 1800 s policy here.  Every caller in this table inherits that gap; none of
-# them currently compensates for it.  Closing it belongs HERE, inside the
-# wrapper, where a wait in before_invoke is definitionally a cap wait and can
-# be attributed correctly — a caller-side asyncio.wait_for cannot tell a frozen
+# 1800 s policy here.  Every caller in this table inherits that gap by
+# default.  It is now closable PER CALLER, inside the wrapper as it had to be
+# (task 6042): park_on_frozen_pool=False makes before_invoke raise
+# usage_gate.PoolFrozen where it would have parked, so a caller that must
+# defer rather than wait never blocks on a frozen pool.  The default stays
+# True, so every caller above still parks.  The fix belongs in the wrapper
+# because a wait in before_invoke is definitionally a cap wait and can be
+# attributed correctly — a caller-side asyncio.wait_for cannot tell a frozen
 # pool from a slow agent and would misattribute the latter.
-#
-# AUDITED NON-CALLERS (task 4736).  A caller that deliberately does NOT route
-# through invoke_with_cap_retry still gets a row, so the next investigator
-# finds an audit ANSWER here rather than an absence and re-derives nothing.
-#
-# Caller                                  Policy / WHY
-# ───────────────────────────────────────────────────────────────────────────
-# scripts/legibility/coder.py             DELIBERATE NON-CALLER — no
-#   (nightly legibility trickle, spawned  cap_wait_sanity_secs, because there
-#    via scripts/legibility/nightly.py)   is no cap WAIT to bound.  Its
-#                                         contract is IMMEDIATE defer/taint,
-#                                         in the shape of evals/runner.py's
-#                                         `cap_exhausted:` marker above: a
-#                                         capped digest is EXCLUDED (labelled
-#                                         CoderCapExhausted, tallied into
-#                                         RunResult.capped, no record
-#                                         fabricated), and a majority-capped
-#                                         storm defers the whole night at
-#                                         exit 0 (coder.is_cap_deferral).
-#                                         Three measured reasons, not an
-#                                         omission:
-#                                         (1) the systemd unit runs `uv run
-#                                             --frozen --project shared python
-#                                             scripts/legibility/nightly.py`;
-#                                             under that interpreter `import
-#                                             orchestrator` resolves to a
-#                                             NAMESPACE package with
-#                                             __file__ is None, so
-#                                             OrchestratorConfig is
-#                                             unreachable — and the unit
-#                                             exports none of the
-#                                             `oauth_token_env` vars named in
-#                                             config/usage-accounts.yaml, so a
-#                                             UsageGate built here would
-#                                             resolve only the single default
-#                                             ~/.claude/.credentials.json
-#                                             credential.  One account: no
-#                                             failover target to wait FOR.
-#                                         (2) with usage_gate=None this
-#                                             function performs NO cap
-#                                             classification at all
-#                                             (classify_invocation runs only
-#                                             in the gated `else` branch), so
-#                                             any cap_wait_sanity_secs
-#                                             documented for it would be
-#                                             inert, and the caller would
-#                                             still have to detect the cap
-#                                             itself.
-#                                         (3) a nightly systemd oneshot must
-#                                             not block on a cap wait across
-#                                             the NEXT night's timer, and its
-#                                             digests are re-derivable — a
-#                                             deferred night simply re-mines
-#                                             tomorrow, so patience buys
-#                                             nothing and costs a missed run.
-#                                         So the trickle detects the cap with
-#                                         the LOOSE defer-gate matcher
-#                                         shared.cap_markers::
-#                                         looks_like_blocking_banner — exactly
-#                                         as its sibling
-#                                         census.py::preflight_headroom does,
-#                                         and per that module's own docstring
-#                                         on skip-guard vs production-detector
-#                                         contracts — and defers.
-#                                         TO CHANGE THIS: making the trickle a
-#                                         real caller requires first giving it
-#                                         an ACCOUNT POOL (a reachable
-#                                         OrchestratorConfig + the
-#                                         oauth_token_env vars in the unit).
-#                                         Until then a row in the bound table
-#                                         above would be decoration.
 # ─────────────────────────────────────────────────────────────────────────────
 _DEFAULT_CAP_WAIT_SANITY_SECS = 14 * 86400  # 14 days: outer sanity bound for patient cap waits
 _CAP_WAIT_LOG_INTERVAL_SECS = 600.0  # emit at most one cap_wait log per ~10 min
@@ -318,12 +278,15 @@ __all__ = [
     'AgentFailureKind',
     'AgentResult',
     'AllAccountsCappedException',
+    'TranscriptEvidence',
     'build_failure_message',
     'classify_agent_failure',
+    'classify_cap_kill',
     'claude_binary_spec',
     'count_transcript_turns',
     'detect_ended_awaiting_background',
     'detect_resumable_progress',
+    'detect_transcript_model_id',
     'ended_awaiting_background_for_session',
     'invoke_claude_agent',
     'invoke_with_cap_retry',
@@ -336,7 +299,10 @@ __all__ = [
     'require_non_blank_prompt',
     'resolve_claude_binary',
     'resumable_progress_for_session',
+    'transcript_evidence',
+    'transcript_evidence_for_session',
     'transcript_exists',
+    'transcript_model_id_for_session',
 ]
 
 
@@ -400,65 +366,40 @@ class AllAccountsCappedException(Exception):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# StructuredOutput schema-tool deny-list (CLI 2.1.168 regression guard)
+# Pure-classifier tool scoping: ``'*'`` + ``--json-schema`` → ``--tools ''``
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI 2.1.168 delivers ``--json-schema`` structured output through a *synthetic
-# tool* named ``StructuredOutput``.  A ``disallowed_tools=['*']`` wildcard — used
-# by pure-classifier callers (curator single/batch, recon agent_loop) that want
-# no real tool access — now ALSO matches and denies that schema tool, so every
-# structured answer is permission-denied → ``error_max_structured_output_retries``
-# (or ``error_max_budget_usd``) with no salvageable payload.
+# ``--json-schema`` output rides on a synthetic ``StructuredOutput`` tool, which
+# a ``'*'`` deny would also block (CLI 2.1.168).  So when a caller passes
+# ``disallowed_tools=['*']`` WITH an ``output_schema``, ``build_claude_argv``
+# drops the ``'*'`` and emits ``--tools ''`` instead.  That is the CLI's
+# registry filter: it leaves only ``StructuredOutput`` in the registry
+# (measured on CLI 2.1.283 from the ``system/init`` inventory).  Without a
+# schema, the bare ``'*'`` deny already empties the registry and is kept as-is.
 #
-# Fix (central, in ``_invoke_claude``): when an ``output_schema`` is requested AND
-# ``'*'`` is in ``disallowed_tools``, expand the ``'*'`` into this explicit
-# deny-list of real built-in tools — which deliberately OMITS ``StructuredOutput``
-# — preserving the "no real (file/bash/web/MCP) tool access" guarantee while
-# letting the schema tool through.  Whitelisting ``StructuredOutput`` while keeping
-# ``'*'`` does NOT work: deny precedence beats allow, so the wildcard must be
-# removed entirely (confirmed against live CLI 2.1.168).
+# Do not replace this with an enumerated deny list.  The live registry is
+# account-dependent and churns, so a list cannot be complete, and ToolSearch
+# will load and run any deferred tool the list misses (it ran CronList under
+# the old one).
 #
-# KEEP IN SYNC with the CLI's built-in tool names: a *future new* built-in tool
-# would not be auto-denied by this list.  Accepted because (a) these prompts forbid
-# tool use, and (b) a future change to the CLI's tool-exclusion semantics is caught
-# loudly by the ``schema_tool_denied`` detection below rather than degrading silently.
+# SCOPE: ``--tools`` does NOT filter MCP tools.  An account-scoped claude.ai
+# connector stayed reachable even at an empty neutral cwd.  A wildcard-deny
+# caller must ALSO pass ``mcp_config=no_mcp_servers_config()`` with
+# ``strict_mcp_config=True``.
 #
-# SCOPE — BUILT-INS ONLY: this list contains no MCP tool pattern, so expanding the
-# ``'*'`` narrows the deny to built-ins and leaves every MCP tool REACHABLE.  That
-# is invisible only while no MCP server is in play; the CLI ambient-merges the
-# project-scoped ``.mcp.json`` found at ``cwd``, so a wildcard-deny caller running
-# at a cwd that carries one (e.g. the project root) silently regains MCP tools —
-# under ``bypassPermissions``, that is unreviewed write access.  Such a caller MUST
-# ALSO pass ``mcp_config=no_mcp_servers_config()`` with ``strict_mcp_config=True``
-# to keep MCP tools out of reach; denying built-ins alone does not do it.
+# Two checks guard this.  The live inventory test is
+# shared/tests/test_wildcard_deny_live_inventory.py (``-m integration``).  If a
+# CLI change ever denies the schema tool itself, ``_parse_claude_output``
+# reports ``schema_tool_denied``.
 _SCHEMA_OUTPUT_TOOL = 'StructuredOutput'
-_REAL_BUILTIN_TOOLS_DENYLIST = [
-    'Bash',
-    'BashOutput',
-    'KillShell',
-    'KillBash',
-    'Read',
-    'Edit',
-    'Write',
-    'MultiEdit',
-    'NotebookEdit',
-    'Glob',
-    'Grep',
-    'Task',
-    'Agent',
-    'WebFetch',
-    'WebSearch',
-    'TodoWrite',
-    'ExitPlanMode',
-    'SlashCommand',
-]
+_SCHEMA_OUTPUT_ATTACHMENT = 'structured_output'
 
 
 def no_mcp_servers_config() -> dict[str, Any]:
     """Build a FRESH scoping ``mcp_config`` carrying ZERO MCP servers.
 
     For callers that pass ``disallowed_tools=['*']`` and must keep MCP tools
-    unreachable even when an ``output_schema`` forces the wildcard expansion
-    above (which denies built-ins ONLY).  Paired with
+    unreachable even when an ``output_schema`` turns the wildcard into
+    ``--tools ''`` (which does not filter MCP; see above).  Paired with
     ``strict_mcp_config=True`` this emits ``--mcp-config <file>
     --strict-mcp-config``, scoping the invocation to the file's server set —
     i.e. nothing — instead of ambient-merging the ``.mcp.json`` at the
@@ -515,9 +456,9 @@ class AgentResult:
     - ``schema_tool_denied``: True when the CLI reported is_error=True with NO
       structured payload AND a ``StructuredOutput`` permission denial — i.e. the
       schema tool itself was blocked.  This is a systemic config break (the
-      cli_invoke deny-list no longer permits the schema tool), NOT a flaky
-      candidate.  ``success`` stays False (NOT salvaged); callers should raise a
-      loud, un-suppressed escalation so the deny-list gets fixed.
+      ``--tools ''`` substitution no longer permits the schema tool), NOT a
+      flaky candidate.  ``success`` stays False (NOT salvaged); callers should
+      raise a loud, un-suppressed escalation so the substitution gets fixed.
     - ``ended_awaiting_background``: True when the run ended its turn while a
       backgrounded Bash command was still pending — launched via
       ``run_in_background`` and never subsequently REAPED, where a reap is a
@@ -567,6 +508,8 @@ class AgentResult:
       ``result.session_id``, so neither the caller's id nor the final
       ``result.session_id`` is reliably the session that was lost.  A tuple
       (not a list) so the default is a safe immutable dataclass default.
+    - ``stop_reason``: the CLI result JSON's ``stop_reason`` (None when absent
+      or not a string); ``'refusal'`` marks an API-side usage-policy refusal.
     """
 
     success: bool
@@ -591,12 +534,19 @@ class AgentResult:
     proc_tree: str = ''
     resume_fallbacks: int = 0
     resume_fallback_session_ids: tuple[str, ...] = ()
+    stop_reason: str | None = None
     transcript_turns: int | None = None
     """Number of assistant turns found in the on-disk JSONL transcript, or None
-    when the transcript could not be read or located.  Stamped on the
-    SIGTERM/SIGKILL timeout path (via count_transcript_turns) AND on the
-    normal-exit path (task 2761 — derived from the same records read for the
-    ended_awaiting_background check, at no extra I/O)."""
+    when the transcript could not be read or located.  Stamped on both the
+    SIGTERM/SIGKILL timeout path and the normal-exit path, each time derived
+    from that path's single transcript read alongside its other signals."""
+    model_id: str | None = None
+    """The exact model id the CLI actually served (e.g. ``claude-opus-5``),
+    read from the on-disk transcript via ``detect_transcript_model_id``; None
+    when the transcript could not be read or carries no real id.  Deliberately
+    distinct from the caller-supplied lineage alias (``opus``/``sonnet``) that
+    callers record as ``model`` — that alias names the routing choice, this
+    names the version that answered."""
 
 
 def _resolve_transcript_path(config_dir: Path, session_id: str) -> Path | None:
@@ -668,6 +618,11 @@ def read_transcript_records(
         return None
 
 
+def _is_assistant_turn(record: object) -> bool:
+    """True iff *record* is one assistant turn; every transcript turn count uses this."""
+    return isinstance(record, dict) and record.get('type') == 'assistant'
+
+
 def count_transcript_turns(
     config_dir: Path,
     session_id: str,
@@ -686,7 +641,12 @@ def count_transcript_turns(
     records = read_transcript_records(config_dir, session_id)
     if records is None:
         return None
-    return sum(1 for r in records if r.get('type') == 'assistant')
+    return _assistant_turn_count(records)
+
+
+def _assistant_turn_count(records: list[dict]) -> int:
+    """The number of assistant turns in parsed *records*."""
+    return sum(1 for r in records if _is_assistant_turn(r))
 
 
 def note_unreadable_transcript(
@@ -784,13 +744,40 @@ def note_unreadable_transcript(
     return True
 
 
-# Background-management tool names that "reap" a launched background task — a
-# poll (``BashOutput``) or a kill (``KillShell`` / ``KillBash``, the latter an
-# older CLI spelling), plus their Task-tool analogues: ``TaskOutput`` collects a
-# backgrounded Task/subagent's result and ``TaskStop`` terminates it (task
-# 3639).  All five are equally conclusive evidence that the session engaged with
-# its pending work rather than abandoning it, so any of them AFTER the last
-# background launch clears the abandonment verdict.
+# Background-management tool names that "reap" a launched background task.  Any
+# of them AFTER the last background launch is conclusive evidence the session
+# engaged with its pending work rather than abandoning it, so it clears the
+# abandonment verdict.
+#
+# WHICH OF THESE ARE REAL: only ``TaskStop`` (task 5332).  ``BashOutput`` and
+# ``KillShell`` were never observed in this fleet at all, ``KillBash`` is an
+# older CLI spelling, and ``TaskOutput`` was live until the registry dropped it.
+# The query behind those claims, its dates and the fleet census live at exactly
+# one site -- orchestrator/tests/test_roles_harness_tool_inventory.py::
+# MEASURED_ABSENT_TOOLS -- and are deliberately not restated here, because six
+# hand-copies of them had already drifted apart in shape.
+#
+# KEEP EVERY MEMBER ANYWAY.  This is an ACCEPT set, so the two directions of
+# error are not symmetric: a never-observed name costs nothing, while dropping
+# one silently regresses detection if a CLI build ever ships it again — and the
+# registry demonstrably churns in BOTH directions, so "absent today" is not
+# "gone forever".
+#
+# AND THE SET DOES NOT HAVE TO BE CURRENT, which is the part a future reader
+# tempted to "resync" it needs first.  ``detect_ended_awaiting_background`` reaps
+# on EITHER this set OR its second clause (task 3639): a tool_use of ANY kind
+# whose input references the background task's id or output-file path.  That
+# clause is tool-agnostic, so it catches the ``Read``-the-output-file shape the
+# role wait-guidance now prescribes (roles.py WAIT_PATTERN_GUIDANCE) — which is
+# why correcting those prompts needed no change to this detector.  If the first
+# clause were the whole mechanism, only ``TaskStop`` would still fire it.
+#
+# That is an executable claim, not a comment's promise: the exact prescribed
+# shape — a ``Read`` tool_use whose ``file_path`` is the launch's output file —
+# is pinned by tests/test_cli_invoke_background.py::TestForegroundBgLogReadIsAReap::
+# test_read_tool_of_bg_log_is_false.  Narrowing ``_iter_input_strings`` (say, to
+# a ``command`` key) fails there rather than silently downgrading every
+# correctly-behaved session to failure.
 _BACKGROUND_REAP_TOOLS = frozenset(
     {'BashOutput', 'KillShell', 'KillBash', 'TaskOutput', 'TaskStop'}
 )
@@ -848,30 +835,48 @@ _BG_LOG_PATH_RE = re.compile(r'Output is being written to:\s*(\S+?)\.?(?=\s|$)')
 _MIN_BG_TOKEN_LEN = 6
 
 
-def _content_blocks(record: object) -> list:
-    """Return *record*'s content blocks, tolerating both transcript nestings.
+_FieldT = TypeVar('_FieldT')
 
-    The real CLI shape nests blocks under ``record['message']['content']``;
-    a flat ``record['content']`` is also accepted (older records and the
-    ``nested=False`` half of the detector's parametrized fixtures).  Anything
-    else — a non-dict record, a missing key, a non-list content — yields an
-    empty list rather than raising.
 
-    SOLE expression of that tolerance rule: both ``_iter_result_texts`` and
-    ``detect_ended_awaiting_background`` route through here, so a future CLI
-    nesting change is a one-line fix in one place rather than two copies that
-    can drift (reviewer_comprehensive amendment, task 3639 — previously the
-    same cascade was inlined in each).
+def _record_field(
+    record: object,
+    key: str,
+    accepts: Callable[[object], TypeGuard[_FieldT]],
+) -> _FieldT | None:
+    """Return *record*'s *key* field, tolerating both transcript nestings.
+
+    The real CLI shape nests fields under ``record['message'][key]``; a flat
+    ``record[key]`` is also accepted (older records and the ``nested=False``
+    half of the detectors' parametrized fixtures).  The nested value wins when
+    *accepts* it, else the flat one; anything else — a non-dict record, a
+    missing key, a value *accepts* rejects — yields None rather than raising.
+
+    SOLE expression of that tolerance rule (task 3639): ``_content_blocks`` and
+    ``detect_transcript_model_id`` both route through here, so a future CLI
+    nesting change is a one-line fix in one place.
     """
     if not isinstance(record, dict):
-        return []
+        return None
     message = record.get('message')
-    if isinstance(message, dict) and isinstance(message.get('content'), list):
-        return message['content']
-    content = record.get('content')
-    if isinstance(content, list):
-        return content
-    return []
+    if isinstance(message, dict) and accepts(nested := message.get(key)):
+        return nested
+    flat = record.get(key)
+    return flat if accepts(flat) else None
+
+
+def _is_list(value: object) -> TypeGuard[list]:
+    return isinstance(value, list)
+
+
+def _is_non_empty_str(value: object) -> TypeGuard[str]:
+    return isinstance(value, str) and bool(value)
+
+
+def _content_blocks(record: object) -> list:
+    """Return *record*'s content blocks (via ``_record_field``), or an empty
+    list when it carries none.  Shared by ``_iter_result_texts`` and
+    ``detect_ended_awaiting_background``."""
+    return _record_field(record, 'content', _is_list) or []
 
 
 def _iter_result_texts(record: dict):
@@ -1084,6 +1089,35 @@ def detect_ended_awaiting_background(records: list[dict]) -> bool:
     return last_launch_idx != -1 and last_launch_idx > last_reap_idx
 
 
+# The CLI writes this in place of a model name on records it synthesised
+# itself rather than received from a model.
+_SYNTHETIC_MODEL_SENTINEL = '<synthetic>'
+
+
+def detect_transcript_model_id(records: list[dict]) -> str | None:
+    """Return the exact model id the CLI actually served, from *records*.
+
+    Reads the non-empty string ``model`` field (via ``_record_field``) of each
+    ``type == 'assistant'`` record, skipping malformed records rather than
+    raising, and discards :data:`_SYNTHETIC_MODEL_SENTINEL` as absent.
+
+    Returns the LAST surviving id, or None when no record carries one.  Last
+    over first because a run that fails over or is downgraded mid-flight ends
+    on the model that actually produced its final output.
+
+    Pure and total — operates on already-parsed records, so it costs no I/O at
+    a seam that has already read them.
+    """
+    found: str | None = None
+    for record in records:
+        if not isinstance(record, dict) or record.get('type') != 'assistant':
+            continue
+        model = _record_field(record, 'model', _is_non_empty_str)
+        if model is not None and model != _SYNTHETIC_MODEL_SENTINEL:
+            found = model
+    return found
+
+
 def detect_resumable_progress(records: list[dict] | None) -> bool:
     """Return True when the transcript *records* hold work worth CONTINUING.
 
@@ -1243,6 +1277,112 @@ def ended_awaiting_background_for_session(
     if records is None:
         return False
     return detect_ended_awaiting_background(records)
+
+
+def transcript_model_id_for_session(
+    config_dir: Path,
+    session_id: str,
+) -> str | None:
+    """Return the exact model id served for *session_id*, read from its transcript.
+
+    Mirrors ``ended_awaiting_background_for_session``' shape: delegate to
+    ``read_transcript_records``; if it returns None (transcript not located or
+    a catastrophic read error) return None; otherwise apply the pure
+    :func:`detect_transcript_model_id` detector.  Never raises — an
+    unattributable run records NULL, which reads correctly as "not recorded",
+    rather than failing the invocation over telemetry.
+
+    ``_run_subprocess`` does not call this: it already holds the parsed
+    records and applies the pure detector to them directly.
+    """
+    records = read_transcript_records(config_dir, session_id)
+    if records is None:
+        return None
+    return detect_transcript_model_id(records)
+
+
+@dataclass(frozen=True)
+class TranscriptEvidence:
+    """What a run did, as recorded in its transcript.
+
+    - ``assistant_turns``: the turn count ``count_transcript_turns`` reports.
+    - ``accepted_schema_payload``: the ``data`` of the last ``structured_output``
+      attachment, i.e. the CLI's record that it accepted a ``StructuredOutput``
+      call against the schema, else None. A rejected or merely attempted call
+      (schema mismatch, unparseable input, permission denial, or killed before
+      validation) has none.
+    - ``other_tool_uses``: every tool_use name other than ``StructuredOutput``,
+      in transcript order, duplicates kept.
+    """
+
+    assistant_turns: int
+    accepted_schema_payload: dict | None
+    other_tool_uses: tuple[str, ...]
+
+
+def _accepted_schema_output(record: object) -> dict | None:
+    """Return the verdict *record* shows the CLI accepted, else None. Never raises."""
+    if not isinstance(record, dict) or record.get('type') != 'attachment':
+        return None
+    attachment = record.get('attachment')
+    if not isinstance(attachment, dict) or attachment.get('type') != _SCHEMA_OUTPUT_ATTACHMENT:
+        return None
+    data = attachment.get('data')
+    return data if isinstance(data, dict) else None
+
+
+def _tool_use_names(record: dict) -> list[str]:
+    """Return the name of every well-formed tool_use block in *record*."""
+    return [
+        block['name'] for block in _content_blocks(record)
+        if isinstance(block, dict)
+        and block.get('type') == 'tool_use'
+        and isinstance(block.get('name'), str)
+    ]
+
+
+def transcript_evidence(records: list[dict]) -> TranscriptEvidence:
+    """Summarise transcript *records* as :class:`TranscriptEvidence`.
+
+    Recovers evidence from a run whose stdout never arrived (a killed
+    process), so it complements ``_parse_claude_output``'s stdout-based
+    ``schema_salvaged`` path rather than duplicating it. The payload is taken
+    from the CLI's acceptance record, never from the model's tool_use input.
+    Pure: whether to trust a recovered payload is the caller's decision. Only
+    assistant records count as turns, and malformed records and blocks are
+    skipped without raising.
+    """
+    assistant_turns = 0
+    accepted_schema_payload: dict | None = None
+    other_tool_uses: list[str] = []
+    for record in records:
+        accepted = _accepted_schema_output(record)
+        if accepted is not None:
+            accepted_schema_payload = accepted
+            continue
+        if not _is_assistant_turn(record):
+            continue
+        assistant_turns += 1
+        other_tool_uses += [
+            name for name in _tool_use_names(record) if name != _SCHEMA_OUTPUT_TOOL
+        ]
+    return TranscriptEvidence(assistant_turns, accepted_schema_payload, tuple(other_tool_uses))
+
+
+def transcript_evidence_for_session(
+    config_dir: Path,
+    session_id: str,
+) -> TranscriptEvidence | None:
+    """Return :func:`transcript_evidence` for *session_id*'s on-disk transcript.
+
+    Delegates all I/O to ``read_transcript_records``. Returns None when no
+    transcript can be read, so a missing transcript is never reported as
+    empty evidence. Never raises.
+    """
+    records = read_transcript_records(config_dir, session_id)
+    if records is None:
+        return None
+    return transcript_evidence(records)
 
 
 def is_zero_output_timeout(result: AgentResult) -> bool:
@@ -1549,7 +1689,11 @@ class AgentFailureKind(enum.StrEnum):
     MODEL_NOT_FOUND = 'model_not_found'
     TIMED_OUT = 'timed_out'
     STRUCTURAL = 'structural'
+    API_REFUSAL = 'api_refusal'
     UNKNOWN = 'unknown'
+
+
+_REFUSAL_STOP_REASON = 'refusal'
 
 
 @dataclass
@@ -1655,7 +1799,12 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
     10. ``result.schema_salvaged`` → ``STRUCTURAL`` (schema-salvage: the
        subtype looked like an error but a valid structured output was
        recovered; callers usually treat as success).
-    11. otherwise → ``UNKNOWN``.
+    11. ``result.stop_reason == 'refusal'`` → ``API_REFUSAL`` (task 6022): the
+       API's usage-policy safeguards refused the call, and the refused session
+       cannot be continued.  It sits last so that it only reclassifies results
+       that were ``UNKNOWN``, which means no existing kind, and no
+       orchestrator routing keyed on one, moves.
+    12. otherwise → ``UNKNOWN``.
 
     ``diagnostic_detail`` always includes: subtype, turns, cost_usd,
     duration_ms, timed_out, transcript_turns, api_error_status, output
@@ -1836,11 +1985,63 @@ def classify_agent_failure(result: AgentResult) -> AgentFailureClass:
             summary='agent succeeded via schema salvage',
             diagnostic_detail=diagnostic_detail,
         )
+    if result.stop_reason == _REFUSAL_STOP_REASON:
+        return AgentFailureClass(
+            kind=AgentFailureKind.API_REFUSAL,
+            summary=(
+                "agent refused by the API's usage-policy safeguards "
+                "(stop_reason='refusal'); the refused session cannot be continued"
+            ),
+            diagnostic_detail=diagnostic_detail,
+        )
     return AgentFailureClass(
         kind=AgentFailureKind.UNKNOWN,
         summary=(f'agent failed: subtype={result.subtype!r} (no specific failure signal)'),
         diagnostic_detail=diagnostic_detail,
     )
+
+
+def classify_cap_kill(
+    result: AgentResult,
+    *,
+    budget_usd: float | None,
+    max_turns: int | None,
+    backend: str = 'claude',
+) -> CapReason | None:
+    """Return which configured ceiling ended *result* — ``CapReason.BUDGET``
+    or ``CapReason.TURNS`` — or None when no ceiling did.
+
+    Deliberately narrower than :func:`classify_agent_failure`'s "why did this
+    fail?" ladder, which has no budget kind at all.  ``CapReason.ACCOUNT`` is
+    not this function's business: an account usage cap is not a configured
+    ceiling.
+
+    The CLI subtype is authoritative and is checked first, ungated on
+    ``success`` (a schema-salvaged run is reported successful yet was still
+    ended at the turn ceiling).  The numeric comparison against *budget_usd* /
+    *max_turns* is only a fallback for a FAILED run whose subtype is
+    inconclusive: a healthy run that spends its whole budget or uses its last
+    turn finished on its own terms.  When both fallbacks fire, budget is
+    reported.  A None ceiling disables its fallback, and so does any
+    *backend* other than ``'claude'``: the others enforce neither ceiling
+    natively (see ``orchestrator/src/orchestrator/agents/invoke.py``), so no
+    ceiling can have ended their runs.  Total — never raises.
+
+    The subtype literals match ``shared/src/shared/usage_gate.py`` and
+    :func:`classify_agent_failure`; a third spelling of the budget one lives
+    at ``orchestrator/src/orchestrator/dry_run_unblock.py::_BUDGET_SUBTYPES``.
+    """
+    if result.subtype == 'error_max_budget_usd':
+        return CapReason.BUDGET
+    if result.subtype == 'error_max_turns':
+        return CapReason.TURNS
+    if result.success or backend != 'claude':
+        return None
+    if budget_usd is not None and result.cost_usd >= budget_usd:
+        return CapReason.BUDGET
+    if max_turns is not None and result.turns >= max_turns:
+        return CapReason.TURNS
+    return None
 
 
 def build_failure_message(label: str, result: AgentResult) -> str:
@@ -1903,6 +2104,11 @@ class _SubprocessResult:
     backgrounded Bash command; carried into AgentResult and used by
     _parse_claude_output to downgrade success→failure.  Never set on the
     timeout path (a timed-out run is already non-success)."""
+    model_id: str | None = None
+    """The exact CLI-served model id read from the transcript on BOTH the
+    normal-exit and timeout paths, or None when unavailable; carried verbatim
+    into ``AgentResult.model_id``.  Distinct from the caller's lineage alias
+    passed in as ``_run_subprocess``'s ``model``."""
 
 
 async def invoke_claude_agent(
@@ -2030,6 +2236,8 @@ async def invoke_with_cap_retry(
     resume_delivers_prompt: bool = False,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
+    park_on_frozen_pool: bool = True,
+    is_usable_reply: Callable[[str], bool] | None = None,
     **invoke_kwargs,
 ) -> AgentResult:
     """Invoke an agent, retrying on usage-cap hits with account failover.
@@ -2075,6 +2283,30 @@ async def invoke_with_cap_retry(
     the time-based bound) before the next cooldown sleep.  Defaults to
     ``None``, which preserves the existing patient, count-unbounded wait —
     only *cap_wait_sanity_secs* bounds the retry loop.
+
+    *park_on_frozen_pool* bounds the wait neither of the two above can see:
+    the gate's own park when NO account is admissible (every one capped or
+    AUTH_FAILED, or a scoped model exhausted everywhere).  ``True`` (the
+    default) parks until an account reopens, unchanged.  ``False`` lets
+    ``usage_gate.PoolFrozen`` propagate unconverted, for a caller that must
+    defer rather than wait (task 6042).  It is not converted to
+    ``AllAccountsCappedException`` because a pool frozen on rejected
+    credentials is not a cap and will not clear at a reset.
+
+    *is_usable_reply* decides which SUCCESSFUL results are offered to the cap
+    detector.  ``UsageGate.detect_cap_hit`` builds a synthetic
+    ``success=False`` result before classifying, so a successful reply that
+    merely QUOTES a banner reads as a cap: measured 2026-10-02, a verdict
+    whose evidence quotes ``REAL_CLI_CAP_HIT_MESSAGES[0]`` classifies ``OK()``
+    as it is and ``CapHit`` once forced to fail.  ``None`` (the default)
+    offers every result, unchanged for the fleet.  A predicate offers a
+    successful result only when it REJECTS the output — a reply the caller
+    could not use at all, which is where a banner delivered at exit 0 lands —
+    so a usable reply quoting cap text never costs an account, while an exit-0
+    banner still rotates it (task 5637's route).  The predicate decides only
+    whether to ASK; the gate's strict detector still decides whether it is a
+    cap.  Failed results are always offered.  Consumer: the legibility runner,
+    whose replies routinely quote cap text (task 6042).
 
     *rebuild_prompt*, when provided, is awaited as ``rebuild_prompt(True)``
     on a cap retry whose session cannot be resumed (no ``session_id`` on the
@@ -2348,7 +2580,7 @@ async def invoke_with_cap_retry(
         _cfg = getattr(usage_gate, '_config', None)
         scope = scope_for(model, _cfg) if (backend == 'claude' and _cfg is not None) else None
         while True:
-            async with usage_gate.invoke_slot(scope=scope) as slot:
+            async with usage_gate.invoke_slot(scope=scope, park=park_on_frozen_pool) as slot:
                 # slot.account_name is derived from slot.lease — the SAME
                 # account slot.token came from (task W4-δ, PRD §7.4). This
                 # is what makes the attribution below (and the save_invocation
@@ -2527,7 +2759,14 @@ async def invoke_with_cap_retry(
                     await _rebuild_fresh_prompt()
                     continue  # __aexit__ releases probe slot
 
-                if slot.detect_cap_hit(result.stderr, result.output, backend=backend):
+                offered_to_cap_detector = (
+                    not result.success
+                    or is_usable_reply is None
+                    or not is_usable_reply(result.output)
+                )
+                if offered_to_cap_detector and slot.detect_cap_hit(
+                    result.stderr, result.output, backend=backend,
+                ):
                     consecutive_cap_hits += 1
                     full_cycles = (consecutive_cap_hits - 1) // num_accounts
                     cooldown = min(
@@ -2961,6 +3200,18 @@ async def invoke_with_cap_retry(
     result.account_name = account_name
     result.resume_fallbacks = resume_fallbacks
     result.resume_fallback_session_ids = tuple(resume_fallback_session_ids)
+    # 'account' outranks a ceiling reason: an unattributed usage cap ends the
+    # run before any configured ceiling could have been reached.  `model` stays
+    # the caller's lineage alias so existing GROUP BY model consumers
+    # (dashboard/src/dashboard/data/model_role.py, orchestrator digest) are
+    # unaffected; the exact served version goes in `model_id` beside it.
+    ceiling_reason = classify_cap_kill(
+        result,
+        budget_usd=invoke_kwargs.get('max_budget_usd'),
+        max_turns=invoke_kwargs.get('max_turns'),
+        backend=backend,
+    )
+    capped_reason = CapReason.ACCOUNT if unattributed_cap else ceiling_reason
     if cost_store:
         try:
             await cost_store.save_invocation(
@@ -2976,7 +3227,9 @@ async def invoke_with_cap_retry(
                 cache_read_tokens=result.cache_read_tokens,
                 cache_create_tokens=result.cache_create_tokens,
                 duration_ms=result.duration_ms,
-                capped=unattributed_cap,
+                capped=capped_reason is not None,
+                capped_reason=capped_reason,
+                model_id=result.model_id,
                 started_at=started_at,
                 completed_at=completed_at,
             )
@@ -3121,19 +3374,12 @@ def build_claude_argv(
 
         if allowed_tools:
             cmd.extend(['--allowed-tools', *allowed_tools])
+        if output_schema and disallowed_tools and '*' in disallowed_tools:
+            # The '*' would also deny the schema's StructuredOutput tool; the
+            # registry filter keeps only that tool.  See _SCHEMA_OUTPUT_TOOL.
+            cmd.extend(['--tools', ''])
+            disallowed_tools = [t for t in disallowed_tools if t != '*']
         if disallowed_tools:
-            # CLI 2.1.168: ``--json-schema`` is delivered via a synthetic
-            # ``StructuredOutput`` tool that a ``'*'`` deny wildcard would block,
-            # failing every structured-output call.  When a schema IS requested,
-            # expand the wildcard into an explicit real-builtins deny-list that omits
-            # ``StructuredOutput`` — keeping "no real tool access" while letting the
-            # schema tool through.  A caller that passes no output_schema keeps
-            # ``'*'`` verbatim, so all tools stay blocked.  See the deny-list
-            # constant above for the keep-in-sync caveat.
-            if output_schema and '*' in disallowed_tools:
-                disallowed_tools = [
-                    t for t in disallowed_tools if t != '*'
-                ] + _REAL_BUILTIN_TOOLS_DENYLIST
             cmd.extend(['--disallowed-tools', *disallowed_tools])
 
         if mcp_config:
@@ -3317,8 +3563,8 @@ async def _invoke_claude(
 def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     """Parse Claude Code JSON output into AgentResult.
 
-    timed_out and transcript_turns are propagated directly from result on every
-    return path.
+    timed_out, transcript_turns and model_id are propagated directly from
+    result on every return path.
     """
     if not result.stdout.strip():
         # Distinct subtype (task 2360 fix #3): a wall-clock timeout that DID
@@ -3354,6 +3600,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             proc_tree=result.proc_tree,
             transcript_turns=result.transcript_turns,
             ended_awaiting_background=result.ended_awaiting_background,
+            model_id=result.model_id,
         )
 
     try:
@@ -3368,6 +3615,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
             proc_tree=result.proc_tree,
             transcript_turns=result.transcript_turns,
             ended_awaiting_background=result.ended_awaiting_background,
+            model_id=result.model_id,
         )
 
     cost = data.get('cost_usd', data.get('total_cost_usd', 0.0))
@@ -3377,6 +3625,8 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     subtype = data.get('subtype', '')
     structured = data.get('structured_output')
     api_error_status = data.get('api_error_status')
+    raw_stop_reason = data.get('stop_reason')
+    stop_reason = raw_stop_reason if isinstance(raw_stop_reason, str) else None
 
     usage = data.get('usage') or {}
     input_tokens = _to_token_count(usage.get('input_tokens'))
@@ -3426,7 +3676,7 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
     # synthetic schema tool itself was blocked — a systemic config break, not a
     # flaky candidate.  We deliberately do NOT salvage to success: ``success``
     # stays False and ``schema_tool_denied`` is flagged so callers raise a loud,
-    # un-suppressed escalation to get the cli_invoke deny-list fixed.  Priority is
+    # un-suppressed escalation to get build_claude_argv's tool scoping fixed.  Priority is
     # "get it fixed"; silent recovery is exactly the trap that hid the outage.
     schema_tool_denied = False
     if not is_success and not isinstance(structured, dict):
@@ -3455,8 +3705,10 @@ def _parse_claude_output(result: _SubprocessResult) -> AgentResult:
         schema_tool_denied=schema_tool_denied,
         ended_awaiting_background=result.ended_awaiting_background,
         api_error_status=api_error_status,
+        stop_reason=stop_reason,
         proc_tree=result.proc_tree,
         transcript_turns=result.transcript_turns,
+        model_id=result.model_id,
     )
 
 
@@ -4100,8 +4352,9 @@ async def _run_subprocess(
             # `except asyncio.CancelledError:` below, which cancels comm_task and
             # reaps the process group — the same treatment a cancel landing
             # anywhere else in the outer try receives.  No new leak path.
-            tt = (
-                await asyncio.to_thread(count_transcript_turns, config_dir, session_id)
+            # ONE read feeds both stamped signals, as on the normal-exit path.
+            killed_records = (
+                await asyncio.to_thread(read_transcript_records, config_dir, session_id)
                 if (config_dir and session_id)
                 else None
             )
@@ -4112,7 +4365,12 @@ async def _run_subprocess(
                 duration_ms=duration_ms,
                 timed_out=True,
                 proc_tree=proc_tree,
-                transcript_turns=tt,
+                transcript_turns=(
+                    None if killed_records is None else _assistant_turn_count(killed_records)
+                ),
+                model_id=(
+                    None if killed_records is None else detect_transcript_model_id(killed_records)
+                ),
             )
     except asyncio.CancelledError:
         # Orchestrator shutdown path: the awaiting task was cancelled. Kill the
@@ -4149,8 +4407,8 @@ async def _run_subprocess(
         )
 
     # Re-read the on-disk transcript ONCE on the normal-exit path and derive
-    # BOTH signals from the same parsed records — no double file I/O (task 2761
-    # amendment):
+    # ALL THREE signals from the same parsed records — no double file I/O (task
+    # 2761 amendment):
     #   • transcript_turns — the assistant-turn count surfaced in
     #     classify_agent_failure's diagnostic_detail.  Previously stamped only on
     #     the timeout path, so a normal-exit ENDED_AWAITING_BACKGROUND
@@ -4161,8 +4419,10 @@ async def _run_subprocess(
     #     silently abandoned the work.  Symmetric to the timeout path's
     #     transcript re-read above; _parse_claude_output owns the actual
     #     success→failure downgrade.
-    # Both fail safe when the transcript can't be located (records None →
-    # transcript_turns None, ended_awaiting_background False).
+    #   • model_id — the exact CLI-served model id, which the caller's alias
+    #     cannot tell apart across versions.
+    # All fail safe when the transcript can't be located (records None →
+    # transcript_turns None, ended_awaiting_background False, model_id None).
     # OFF-LOOP — see the task-3925 INVARIANT block above the poll loop.  This is
     # the largest of the four reads: it parses the FULL record list, and every
     # successful run pays it.
@@ -4172,8 +4432,8 @@ async def _run_subprocess(
     # That is safe and needs no asyncio.shield: comm_task has already completed
     # (proc.communicate() returned), so the child has exited and been reaped —
     # there is no process group left to orphan.  The only loss is the
-    # transcript_turns / ended_awaiting_background enrichment on a run that is
-    # being torn down anyway.
+    # transcript_turns / ended_awaiting_background / model_id enrichment on a
+    # run that is being torn down anyway.
     transcript_records = (
         await asyncio.to_thread(read_transcript_records, config_dir, session_id)
         if (config_dir and session_id)
@@ -4182,9 +4442,11 @@ async def _run_subprocess(
     if transcript_records is None:
         transcript_turns = None
         ended_awaiting_background = False
+        model_id = None
     else:
-        transcript_turns = sum(1 for r in transcript_records if r.get('type') == 'assistant')
+        transcript_turns = _assistant_turn_count(transcript_records)
         ended_awaiting_background = detect_ended_awaiting_background(transcript_records)
+        model_id = detect_transcript_model_id(transcript_records)
 
     return _SubprocessResult(
         stdout=stdout.decode(),
@@ -4193,4 +4455,5 @@ async def _run_subprocess(
         duration_ms=duration_ms,
         transcript_turns=transcript_turns,
         ended_awaiting_background=ended_awaiting_background,
+        model_id=model_id,
     )

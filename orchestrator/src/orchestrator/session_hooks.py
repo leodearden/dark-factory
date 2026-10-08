@@ -112,14 +112,56 @@ def resolve_hook_identity(
 
     Delegates to ``session_registry.parse_spawn_identity``: ``CLAUDE_SPAWN_*``
     env wins when present; otherwise falls back to its documented defaults
-    (``role='session'``, ``project=basename(cwd)``) since hook stdin carries
-    no title to parse. *cwd* comes from the hook's stdin JSON, falling back
+    (``role='session'``, ``project`` derived from the enclosing checkout of
+    *cwd* -- see ``session_registry.py::parse_spawn_identity``) since hook
+    stdin carries no title to parse. *cwd* comes from the hook's stdin JSON, falling back
     to ``os.getcwd()`` when absent.
+
+    SCOPE of the fork-path strip, stated once (tasks 4663, 5421): the strip
+    covers every caller that DESCRIBES the event's own session. Those are
+    ``run_session_start`` (the persisted record body) and
+    ``_run_status_refresh_and_retitle`` (the OSC retitle, which goes to the
+    hook process's own controlling terminal and so describes the session
+    whose hook fired). Both obtain their *env* from ``_own_identity_env``,
+    which strips the SPAWNER-describing identity keys whenever the inherited
+    env slug was rejected (see ``_HookSlugResolution.rejected_env_slug``),
+    so a forked session describes itself rather than its spawner.
+
+    The ONE raw-env caller is the slug derivation in ``_resolve_hook_slug``:
+    an opaque key whose spawner-derived segments nothing parses back, and
+    which must be identical across all three hook events.
     """
     cwd = str(hook_input.get('cwd') or os.getcwd())
     title = env.get('CLAUDE_SPAWN_TITLE', '') or ''
     prompt = env.get('CLAUDE_SPAWN_PROMPT', '') or ''
     return session_registry.parse_spawn_identity(env, title, prompt, cwd)
+
+
+_SPAWNER_IDENTITY_ENV_KEYS = frozenset({
+    'CLAUDE_SPAWN_ROLE',
+    'CLAUDE_SPAWN_PROJECT',
+    'CLAUDE_SPAWN_TASK_ID',
+    'CLAUDE_SPAWN_ESCALATION_ID',
+    'CLAUDE_SPAWN_TITLE',
+    'CLAUDE_SPAWN_PROMPT',
+})
+"""``CLAUDE_SPAWN_*`` keys that ``parse_spawn_identity``/``hook_display_title``
+read to build role/project/task_id/escalation_id/title.
+
+Named separately from the handful of ``CLAUDE_SPAWN_*`` keys
+``run_session_start`` already knows describe the SPAWNER on the fork path
+(``CLAUDE_SPAWN_PARENT_ID``, ``CLAUDE_SPAWN_LAUNCHER_PID``,
+``CLAUDE_SPAWN_WM_TITLE``) because those are consulted directly by name at
+their own call sites, not funneled through identity resolution -- this set
+exists purely to drive ``_own_identity_env``.
+
+``CLAUDE_SPAWN_PROMPT`` is the one member no assertion can pin: it is
+forwarded to ``parse_spawn_identity`` but documented there as taking no part
+in the resolution, so stripping it is inert today and listed only so the
+funnel stays complete if that ever changes. Every OTHER member is
+load-bearing and mutation-detectable -- see
+``test_forked_inheritor_does_not_inherit_the_spawners_role_task_or_title``.
+"""
 
 
 def _hook_session_id(hook_input: Mapping[str, Any]) -> str:
@@ -523,6 +565,25 @@ def _resolve_hook_slug(
             return _HookSlugResolution(candidate, None, may_bind, snapshot)
         rejected = candidate
 
+    # RAW env, deliberately, on the fork branch too (task 4663): the
+    # role/project/task segments below stay SPAWNER-derived even though the
+    # record BODY `run_session_start` writes at this slug does not, so on
+    # that one path slug and body legitimately disagree. Two reasons to
+    # leave it. First, the slug is an opaque KEY, not a description: every
+    # consumer either keys on it or prints it verbatim (measured over
+    # cockpit's registry_reader/session_table/spawn_tree, workflow.py,
+    # scripts/legibility, spawn-claude.sh -- none splits a slug back into an
+    # identity), so a spawner-flavoured segment misleads nothing but a human
+    # reading the sessions dir, whose authoritative answer is the body.
+    # Second, this exact shape is a landed task-4193 contract, pinned by
+    # test_hook_session_slug_forks_when_binding_mismatches -- re-deriving it
+    # is a deliberate contract change, not a consistency tidy-up.
+    # CONSTRAINT on any such change: SessionStart, Notification and Stop each
+    # re-derive this slug independently, so whatever identity it is built
+    # from must be identical across all three or one forked session splits
+    # across two records. The forked session's OWN identity is carried by its
+    # record body AND its retitle instead -- see `resolve_hook_identity` for
+    # that strip's scope.
     identity = resolve_hook_identity(hook_input, env)
     session_id = _hook_session_id(hook_input) or 'unknown'
     # session_id (str) deliberately fills the launcher_pid slot as the
@@ -597,6 +658,32 @@ def hook_session_slug(
     return _resolve_hook_slug(hook_input, env, root, allow_remint=allow_remint).slug
 
 
+def _own_identity_env(
+    env: Mapping[str, str],
+    resolution: _HookSlugResolution,
+) -> Mapping[str, str]:
+    """The env this event's OWN session identity (record body, OSC retitle) resolves from.
+
+    The raw hook env, unless ``_resolve_hook_slug`` REJECTED an inherited
+    ``CLAUDE_SPAWN_SESSION_ID`` (tasks 4663, 4193 review): this event then
+    belongs to a nested ``claude`` that merely inherited the variable, so
+    every remaining ``CLAUDE_SPAWN_*`` identity value in scope describes the
+    SPAWNER -- the same principle ``run_session_start`` already applies to
+    ``parent_session_id``/display/``launcher_pid``. Those
+    ``_SPAWNER_IDENTITY_ENV_KEYS`` are stripped, so ``resolve_hook_identity``
+    and ``hook_display_title`` fall through to their own non-spawn defaults
+    (``role='session'``, ``project`` from the enclosing checkout -- see
+    ``session_registry.py::parse_spawn_identity`` -- ``task_id=None``,
+    ``escalation_id=None``) instead of parroting the spawner's identity.
+
+    The slug itself is deliberately NOT derived from this (see
+    ``_resolve_hook_slug``).
+    """
+    if resolution.rejected_env_slug is None:
+        return env
+    return {k: v for k, v in env.items() if k not in _SPAWNER_IDENTITY_ENV_KEYS}
+
+
 def _bind_claude_session_id(
     record: session_registry.SessionRecord,
     hook_input: Mapping[str, Any],
@@ -641,6 +728,26 @@ def _bind_claude_session_id(
     # read back as "cannot prove ownership".
     record.claude_owner_pid = (probes or _EventProbes({})).owning_claude_pid()
     return True
+
+
+def _stamp_session_pointer(
+    record: session_registry.SessionRecord,
+    probes: _EventProbes,
+    root: Path | str | None,
+) -> None:
+    """Point this event's claude pid at *record*, iff the record names it as owner.
+
+    The pointer asserts exactly what the written record already proves --
+    ``claude_owner_pid`` is this event's owning claude pid -- so one rule
+    covers every lane (adopt, fork, a withheld launch window, an unproven
+    adopt, a blank session_id) without branching on them. The pid comes from
+    the event's probe memo, the same observation the binding was made from.
+    Fail-soft: ``write_session_pointer`` never raises.
+    """
+    pid = probes.owning_claude_pid()
+    if pid is None or record.claude_owner_pid != pid:
+        return
+    session_registry.write_session_pointer(pid, record.session_slug, root=root)
 
 
 # ---------------------------------------------------------------------------
@@ -1241,9 +1348,17 @@ def run_session_start(
     ``CLAUDE_SPAWN_WM_TITLE`` display resolution is skipped (see
     ``_resolve_display``) and ``launcher_pid`` comes from
     ``_nested_claude_liveness_pid`` so the forked record stays reapable.
+
+    RESIDUAL sibling fixed (task 4663): the three overrides above left
+    ``resolve_hook_identity``/``hook_display_title`` still reading
+    role/task_id/escalation_id/title straight out of the inherited env, so a
+    forked record got the SPAWNER's role, task_id, escalation_id and display
+    title -- two cockpit rows identical except for slug. ``identity_env``
+    comes from ``_own_identity_env`` (stripped on the fork path, raw on
+    every other), so identity resolution falls through to this session's own
+    defaults instead of the spawner's.
     """
     probes = _EventProbes(env)
-    identity = resolve_hook_identity(hook_input, env)
     resolution = _resolve_hook_slug(
         hook_input, env, root, allow_remint=True, probes=probes
     )
@@ -1252,6 +1367,8 @@ def run_session_start(
         resolution.rejected_env_slug,
         resolution.may_bind,
     )
+    identity_env = _own_identity_env(env, resolution)
+    identity = resolve_hook_identity(hook_input, identity_env)
     # THE event's only read of the slug it writes: on the adopt path the
     # ownership probe already read this very record, so its snapshot is
     # handed forward rather than re-read (task 4662).
@@ -1282,7 +1399,7 @@ def run_session_start(
         record = session_registry.SessionRecord(
             session_slug=slug,
             status=session_registry.Status.RUNNING,
-            title=hook_display_title(identity, env, record=None),
+            title=hook_display_title(identity, identity_env, record=None),
             role=identity.role,
             project=identity.project,
             task_id=identity.task_id,
@@ -1301,7 +1418,7 @@ def run_session_start(
         parent_session_id = _resolve_parent_session_id(env)
         if parent_session_id is not None:
             record.parent_session_id = parent_session_id
-    title = record.title or hook_display_title(identity, env, record)
+    title = record.title or hook_display_title(identity, identity_env, record)
     display = _resolve_display(env, title, allow_spawn_marker=forked_from is None)
     if display is not None:
         record.display = display
@@ -1320,6 +1437,7 @@ def run_session_start(
             probes=probes,
         )
     session_registry.write_record(record, root=root)
+    _stamp_session_pointer(record, probes, root)
     return record
 
 
@@ -1525,9 +1643,12 @@ def _run_status_refresh_and_retitle(
     alternative of forking every pre-SessionStart event onto a new slug,
     which would misroute the OWNER's session whenever its SessionStart is
     merely slow -- trading a rare stale status for a routine wrong one.
+
+    The refresh path stamps the pid pointer too (``_stamp_session_pointer``),
+    so a session already running when the pointer shipped -- a long-lived
+    watcher -- is linked by its next Notification/Stop, not its next restart.
     """
     probes = _EventProbes(env)
-    identity = resolve_hook_identity(hook_input, env)
     resolution = _resolve_hook_slug(hook_input, env, root, probes=probes)
     slug, may_bind = resolution.slug, resolution.may_bind
     # THE event's only read of the slug it writes: the ownership probe
@@ -1579,7 +1700,10 @@ def _run_status_refresh_and_retitle(
     # itself, and that bump is owed on EVERY event, a withheld one included
     # -- it is the whole point of withholding rather than skipping.
     session_registry.write_record(record, root=root)
-    title = hook_display_title(identity, env, record)
+    _stamp_session_pointer(record, probes, root)
+    identity_env = _own_identity_env(env, resolution)
+    identity = resolve_hook_identity(hook_input, identity_env)
+    title = hook_display_title(identity, identity_env, record)
     return osc_retitle_sequence(status, title)
 
 

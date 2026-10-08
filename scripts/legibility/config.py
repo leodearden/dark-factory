@@ -63,17 +63,40 @@ class Saturation(BaseModel):
     consecutive_batches: int = 2
 
 
+class TrickleCensusCaps(BaseModel):
+    """``census.trickle_caps`` — the cost caps the NIGHTLY TRICKLE forwards to
+    the census it launches, as census.py's existing ``--max-batches`` /
+    ``--max-verify-clusters`` flags.
+
+    ``null`` omits that flag (uncapped — an explicit per-project opt-out).
+    A manual census.py run never reads this block; its caps are the flags the
+    operator types. The 50/150 defaults are the bound ratified for reify's
+    attended first census (skills/census/SKILL.md), so an unattended census
+    is bounded unless a project says otherwise. Frozen, so one instance can be
+    shared as a default without any holder being able to uncap it.
+    """
+
+    model_config = ConfigDict(extra='allow', frozen=True)
+
+    max_batches: int | None = Field(default=50, ge=1, strict=True)
+    max_verify_clusters: int | None = Field(default=150, ge=1, strict=True)
+
+
 class Census(BaseModel):
-    """``census`` block — census-trigger (ζ) and saturation tuning (PRD §5.2 points 6-7)."""
+    """``census`` block — census-trigger (ζ), saturation tuning (PRD §5.2
+    points 6-7), the nightly trickle's census launch caps, and the length of
+    the census mining window (which is also the session ledger's retention)."""
 
     model_config = ConfigDict(extra='allow')
 
+    ledger_retention_days: int = Field(default=30, ge=1, strict=True)
     max_interval_days: int = 10
     tasks_landed_threshold: int = 120
     tasks_landed_min_days: int = 7
     novelty_spike: NoveltySpike = Field(default_factory=NoveltySpike)
     floor_days: int = 5
     saturation: Saturation = Field(default_factory=Saturation)
+    trickle_caps: TrickleCensusCaps = Field(default_factory=TrickleCensusCaps)
 
 
 class Models(BaseModel):
@@ -92,8 +115,8 @@ class Timeouts(BaseModel):
     budgets (seconds).
 
     The census runs three claude-CLI-backed stages with very different
-    shapes, but originally handed every stage ``coder._invoke_cli``'s single
-    module default of 120s (sized for one Haiku trickle-coding call). That
+    shapes, but originally handed every stage the trickle coder's single
+    default of 120s (sized for one Haiku trickle-coding call). That
     default demonstrably killed the first dark_factory census: every Sonnet
     verify-vs-``main`` call (one per novel cluster, exploring current
     ``main`` via targeted reads) and the final large Fable synthesis call
@@ -105,6 +128,7 @@ class Timeouts(BaseModel):
     cluster exploring current ``main``), ``census_synthesis_secs`` (1800 —
     one large Fable call over all verified clusters). An omitted block loads
     with all three defaults, so a pre-existing legibility.yaml keeps working.
+    ``census.census_stage_specs`` binds each to its stage.
     """
 
     model_config = ConfigDict(extra='allow')
@@ -163,7 +187,7 @@ class LegibilityConfig(BaseModel):
     def _project_root_must_be_absolute(cls, value: str) -> str:
         """Reject a relative ``project_root`` at config-load time.
 
-        Every consumer (sampling.py, census.py's ``default_batch_source``,
+        Every consumer (sampling.py, census_window.py's ``WindowBatchSource``,
         digest.py, ...) resolves ``cfg.project_root`` against its OWN
         process cwd. ``scripts/legibility-trickle@.service`` pins
         ``WorkingDirectory=/home/leo/src/dark-factory`` for every ``%i``
@@ -271,8 +295,8 @@ def configure_logging(default_level: str = 'INFO') -> None:
     tinguishable from genuine no-change nights.
 
     ``LEGIBILITY_LOG_LEVEL`` overrides *default_level* (matching the
-    ``LEGIBILITY_SEARCH_ROOTS`` / ``LEGIBILITY_CLAUDE_BIN`` env convention
-    already used across these modules). Either spelling operators reach for
+    ``LEGIBILITY_SEARCH_ROOTS`` env convention already used across these
+    modules). Either spelling operators reach for
     is accepted — a level NAME (``DEBUG``, case-insensitive) or a numeric
     level (``10``, which is what ``logging``'s own API takes). An
     unparseable value degrades to *default_level* and logs one warning — it

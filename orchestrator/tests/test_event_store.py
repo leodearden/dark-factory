@@ -267,6 +267,78 @@ class TestStaleL0StrandDismissedEventType:
         assert extracted[0][4] == 'stale-strand'
 
 
+class TestInfoL0DispositionedEventType:
+    """EventType.info_l0_dispositioned must exist and round-trip
+    (plans/info-l0-disposition-router-prd.md D11).
+
+    One row per info-severity L0 the router or the reviewer leg dispositioned,
+    keyed on the subject's real task_id.
+    """
+
+    _KEYS = ('escalation_id', 'class', 'by', 'exit_kind', 'ticket', 'task_id', 'decided_at')
+
+    def test_info_l0_dispositioned_member_exists_and_name_equals_value(self) -> None:
+        assert EventType.info_l0_dispositioned == 'info_l0_dispositioned'
+        assert EventType.info_l0_dispositioned.value == EventType.info_l0_dispositioned.name
+
+    def test_info_l0_dispositioned_round_trip(self, tmp_path: Path) -> None:
+        db_path = tmp_path / 'events.db'
+        payload = {
+            'escalation_id': 'esc-5050-4',
+            'class': 'converted',
+            'by': 'info-l0-router',
+            'exit_kind': 'merge_deferred',
+            'ticket': 'tkt_abc',
+            'task_id': '5050',
+            'decided_at': '2026-09-08T12:00:00+00:00',
+        }
+        EventStore(db_path, 'run-router').emit(
+            EventType.info_l0_dispositioned, task_id='5050', data=payload,
+        )
+
+        rows = [
+            row for row in _query_all(db_path)
+            if row['event_type'] == 'info_l0_dispositioned' and row['task_id'] == '5050'
+        ]
+        assert len(rows) == 1
+
+        conn = sqlite3.connect(str(db_path))
+        extracted = conn.execute(
+            'SELECT ' + ', '.join(f"json_extract(data, '$.{key}')" for key in self._KEYS)
+            + " FROM events WHERE event_type = 'info_l0_dispositioned'"
+        ).fetchone()
+        conn.close()
+
+        assert dict(zip(self._KEYS, extracted, strict=True)) == payload
+
+    def test_null_ticket_is_stored_as_json_null(self, tmp_path: Path) -> None:
+        """A status-info close has no ticket; the key must survive as JSON null."""
+        db_path = tmp_path / 'events.db'
+        EventStore(db_path, 'run-router').emit(
+            EventType.info_l0_dispositioned,
+            task_id='5050',
+            data={
+                'escalation_id': 'esc-5050-5',
+                'class': 'status-info',
+                'by': 'info-l0-router',
+                'exit_kind': 'orphan',
+                'ticket': None,
+                'task_id': '5050',
+                'decided_at': '2026-09-08T12:00:00+00:00',
+            },
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        ticket, ticket_type = conn.execute(
+            "SELECT json_extract(data, '$.ticket'), json_type(data, '$.ticket') "
+            "FROM events WHERE event_type = 'info_l0_dispositioned'"
+        ).fetchone()
+        conn.close()
+
+        assert ticket is None
+        assert ticket_type == 'null'
+
+
 class TestMergeBlockedEventType:
     """EventType.merge_blocked must exist and round-trip through the event store.
 
@@ -838,3 +910,32 @@ class TestMergeSerialLaneBreachedEventType:
         assert rows[0][7] == 'task/5326'
         assert rows[0][8] == 'mr-29dfdbc2'
         assert rows[0][9] == 'local'
+
+
+class TestPinBlockedEventType:
+    """``pin_blocked`` names why a pinned task cannot dispatch (task 6040)."""
+
+    def test_pin_blocked_round_trips(self, tmp_path: Path) -> None:
+        assert EventType.pin_blocked.value == EventType.pin_blocked.name == 'pin_blocked'
+
+        db_path = tmp_path / 'e.db'
+        store = EventStore(db_path, 'run-1')
+        store.emit(
+            EventType.pin_blocked,
+            task_id='P',
+            data={
+                'task_id': 'P',
+                'pin_order': 1,
+                'head': True,
+                'blockers': [{'module': 'w.py', 'owner': 'H', 'kind': 'held'}],
+            },
+        )
+
+        conn = sqlite3.connect(str(db_path))
+        rows = conn.execute(
+            "SELECT task_id, json_extract(data, '$.blockers[0].owner') "
+            "FROM events WHERE event_type = 'pin_blocked'"
+        ).fetchall()
+        conn.close()
+
+        assert rows == [('P', 'H')]

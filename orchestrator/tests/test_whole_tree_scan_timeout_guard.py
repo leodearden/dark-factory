@@ -12,9 +12,11 @@ deaths were then observed at loadavg 250-423, one further inflation step past
 the 60s ``[tool.pytest.ini_options].timeout`` default THEN IN FORCE (that
 default was raised to 300 on 2026-09-12 for an unrelated reason -- CPU
 starvation on a loaded host false-redding a shifting victim; see
-shared/pyproject.toml.  The family ceiling stayed at its own
-measurement-anchored 300s rather than following, so the marks this module
-demands are now equal to, not above, the global default: they still guarantee
+shared/pyproject.toml.  That default has since moved again, to a
+MEASURED 540 (2026-09-17, task 5442), and the family ceiling followed it up --
+not because this family was re-measured, but because the never-narrow rule
+forbids the ceiling sitting below the global default.  The marks this module
+demands are therefore equal to, not above, that default: they still guarantee
 the family never drops BELOW it, which is what a floor is for).
 
 What makes the breach so expensive is the two settings around it:
@@ -42,9 +44,10 @@ truncated verify.
 NOT widening the global ``timeout`` *as the remedy for THIS hazard*: doing it
 for that reason would blunt the hang-catching ceiling for the other ~16000
 tests to buy headroom only ~13 modules need.  (The global default did later
-move 60 -> 300, but for a different hazard -- wall-clock CPU starvation
-false-redding a shifting victim -- and the per-module marks stayed, because a
-sweep's cost and a host's contention are separate things to size against.)
+move 60 -> 300 and then 300 -> 540, but for a different hazard -- wall-clock
+CPU starvation false-redding a shifting victim -- and the per-module marks
+stayed, because a sweep's cost and a host's contention are separate things to
+size against.)
 
 WHERE THE RATIONALE LIVES.  The mechanism is restated here because this is the
 module a failing run points at, but the CANONICAL home -- the derivation of the
@@ -64,6 +67,7 @@ import pytest
 from _orch_helpers import (
     ORCH_PYPROJECT,
     PYPROJECT_DEFAULT_TIMEOUT,
+    VERIFY_CLI_PER_TEST_TIMEOUT,
     WHOLE_TREE_SCAN_TEST_TIMEOUT,
 )
 
@@ -93,15 +97,14 @@ _TESTS_DIR = Path(__file__).resolve().parent
 # loudly if the sweep itself ever breaks (a wrong _TESTS_DIR, a read that
 # silently yields nothing, a detector rotted to always-False).  The house
 # pattern for exactly this risk:
-# test_marker_registration_drift.py::_MIN_EXPECTED_TEST_FILES,
-# test_killpg_frozen_pgid_guard.py's measured file
-# floor, test_serial_merge_worker_import_guard.py::test_allowlist_has_no_stale_entries.
+# test_marker_registration_drift.py::_MIN_EXPECTED_TEST_FILES and
+# test_killpg_frozen_pgid_guard.py's measured file floor.
 _MIN_EXPECTED_TEST_FILES = 400
 _MIN_EXPECTED_SCANNERS = 10
 
 # Worst per-call wall clock MEASURED for a member of this family under REAL
-# load: 30.75s for test_serial_merge_worker_import_guard at loadavg 120-176
-# (task 4215's record; ~4.8x its 6.46s unloaded figure).  Named rather than
+# load: 30.75s for the serial-worker import guard (deleted by task 5034) at
+# loadavg 120-176 (task 4215's record; ~4.8x its 6.46s unloaded figure).  Named rather than
 # left in prose so the floor below is anchored to a measurement instead of only
 # to a ratio against a setting that can itself move.
 _MEASURED_UNDER_LOAD_WORST_CASE = 30.75
@@ -147,6 +150,31 @@ def _pytest_ini_options() -> dict[str, object]:
 class TestTimeoutConstants:
     """The two constants this guard's remediation advice depends on."""
 
+    def test_a_hung_test_dumps_its_stacks_before_any_kill_can_reach_it(self) -> None:
+        """``faulthandler_timeout`` must fire below the tightest kill a test meets.
+
+        Under ``timeout_method = "thread"`` the kill is an ``os._exit()`` that
+        leaves no traceback.  pytest-timeout's own banner goes through the
+        terminal writer to the worker's STDOUT, which execnet's
+        ``init_popen_io`` dup2s to /dev/null, so under xdist it never reaches
+        the controller; the faulthandler dump goes to STDERR, which the worker
+        inherits from the controller, and verify merges stderr into its log.
+        The dump is evidence only if it lands first, and the tightest kill an
+        UNMARKED test can meet is verify's CLI ``--timeout=300``, not this
+        file's ini default.  Marked tests below this value still die silently.
+        """
+        ini_options = _pytest_ini_options()
+
+        dump_after = ini_options['faulthandler_timeout']
+        assert isinstance(dump_after, int | float), (
+            f'faulthandler_timeout must be a TOML number, got {dump_after!r}'
+        )
+        assert 0 < dump_after < VERIFY_CLI_PER_TEST_TIMEOUT, (
+            f'faulthandler_timeout ({dump_after}) must be positive and below '
+            f'VERIFY_CLI_PER_TEST_TIMEOUT ({VERIFY_CLI_PER_TEST_TIMEOUT}), or a '
+            'hung test is killed before its stacks reach the verify log'
+        )
+
     def test_pyproject_default_timeout_mirrors_pyproject(self) -> None:
         """``PYPROJECT_DEFAULT_TIMEOUT`` must equal the REAL configured default.
 
@@ -191,15 +219,21 @@ class TestTimeoutConstants:
 
         * 8.25s / 6.70s / 6.46s per call unloaded and serial (``-n0``) on a
           32-core box for test_merge_queue_reachback_patch_guard,
-          test_event_loop_antipattern_guard and
-          test_serial_merge_worker_import_guard respectively;
-        * 17.85 / 21.32 / 30.75s per call for test_serial_merge_worker_import_guard
+          test_event_loop_antipattern_guard and the serial-worker import
+          guard (deleted by task 5034) respectively;
+        * 17.85 / 21.32 / 30.75s per call for that serial-worker guard
           at loadavg 120-176 (task 4215's record) -- ~4.8x its unloaded figure;
         * xdist worker deaths observed at loadavg 250-423 (esc-3980-1,
           esc-3787-1), i.e. past the 60s default then in force.
 
-        300s leaves ~36x headroom over the unloaded worst case and ~10x over the
-        measured-under-load worst case.  Asserted as ``>=`` rather than ``==`` so
+        The 300s floor leaves ~36x headroom over the unloaded worst case and
+        ~10x over the measured-under-load worst case above; the constant itself
+        now sits at 540, dragged up by the never-narrow rule when task 5442
+        raised the ini default there.  That task also re-measured this family
+        under load and found a marked member at 51.87s -- 1.7x the 30.75s the
+        floor is anchored to -- so 540 clears the family's own current
+        requirement (51.87 x 8 = 414.96) while the FLOOR's arithmetic below
+        still rests on the older figure.  Asserted as ``>=`` rather than ``==`` so
         raising the constant later is never blocked by this test -- the
         never-narrow polarity the neighbouring shared timeouts use.
 
@@ -234,13 +268,17 @@ class TestTimeoutConstants:
         assert WHOLE_TREE_SCAN_TEST_TIMEOUT >= _ABSOLUTE_FLOOR_SECONDS, (
             f'WHOLE_TREE_SCAN_TEST_TIMEOUT ({WHOLE_TREE_SCAN_TEST_TIMEOUT}) has '
             f'fallen below the absolute floor ({_ABSOLUTE_FLOOR_SECONDS}s). It '
-            f'is derived as 5 * PYPROJECT_DEFAULT_TIMEOUT '
-            f'({PYPROJECT_DEFAULT_TIMEOUT}), so the likeliest cause is that the '
-            "pyproject's per-test default was TIGHTENED and dragged this "
-            'ceiling down with it. The family ceiling must stay anchored to the '
-            f'measured cost ({_MEASURED_UNDER_LOAD_WORST_CASE}s per call at '
-            'loadavg 120-176, with worker deaths at loadavg 250-423), not to '
-            'the setting it exists to clear -- pin it explicitly rather than '
+            'is a LITERAL, derived from nothing: the `5 * '
+            'PYPROJECT_DEFAULT_TIMEOUT` derivation was DROPPED on 2026-09-12 '
+            "(this test's docstring says why), so do not read the two as "
+            'tracking each other. What binds the constant is never-narrow '
+            'against TWO independent bounds -- this floor, and the ini default '
+            f'({PYPROJECT_DEFAULT_TIMEOUT}s, asserted separately below) -- so '
+            'the likeliest cause of this failure is the constant being lowered '
+            'by hand. The family ceiling must stay anchored to the measured '
+            f'cost ({_MEASURED_UNDER_LOAD_WORST_CASE}s per call at loadavg '
+            '120-176, with worker deaths at loadavg 250-423), not to whichever '
+            'setting it happens to clear -- pin it explicitly rather than '
             'lowering this floor.'
         )
         assert WHOLE_TREE_SCAN_TEST_TIMEOUT >= PYPROJECT_DEFAULT_TIMEOUT, (

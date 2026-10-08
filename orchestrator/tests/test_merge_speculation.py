@@ -42,7 +42,6 @@ _patch_cold_shadow_verify(monkeypatch, return_value) (helper)
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import stat
 from collections.abc import Awaitable, Callable
@@ -51,7 +50,14 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from _merge_lane_fakes import FakeVerifier, VerifyScript, hangs_until, passes
+from _merge_lane_fakes import (
+    FakeVerifier,
+    VerifyScript,
+    hangs_until,
+    lane_scene_config,
+    main_health_probe_spawned,
+    passes,
+)
 from _orch_helpers import (  # noqa: F401
     MERGE_GATE_BARRIER_TIMEOUT,
     MERGE_RESULT_TIMEOUT,
@@ -62,7 +68,6 @@ from _orch_helpers import (  # noqa: F401
 from test_merge_queue_concurrent_verify import (  # noqa: F401
     _FAIL_OPEN_LOGGERS,
     HEAVY_BARRIER_TEST_TIMEOUT,
-    PYPROJECT_DEFAULT_TIMEOUT,
     _fail_open_records,
     _fake_verify_result,
     _format_fail_open_records,
@@ -71,6 +76,7 @@ from test_merge_queue_concurrent_verify import (  # noqa: F401
     _inject_two_host_allocator,
     _make_branch_with_file,
     _make_request,
+    _stop_worker,
     _timeout_mark_offenders,
     _worst_per_method_wait_budget,
 )
@@ -90,18 +96,10 @@ from orchestrator.merge_disposition import (  # noqa: F401
     classify_merge_failure_disposition,
 )
 from orchestrator.merge_lane import MergeLane
-from orchestrator.merge_queue import (  # noqa: F401
-    InflightEntry,
-    InflightVerifyResult,
-    MergeOutcome,
+from orchestrator.merge_lane.shadow import _submit_shadow_divergence_escalation  # noqa: F401
+from orchestrator.merge_queue import (
     MergeRequest,
-    RealMergeItem,
-    SpeculativeMergeWorker,
     _acquire_warm_verify_worktree,
-    _maybe_run_drift_check,
-    _maybe_schedule_shadow_compare,
-    _run_cold_shadow_verify,
-    _submit_shadow_divergence_escalation,
 )
 from orchestrator.verify import VerifyResult  # noqa: F401
 from orchestrator.warm_lane_pool import LaneState, WarmLanePool  # noqa: F401
@@ -773,7 +771,7 @@ async def _spec_lane_git_ops(
     # see the storage is really there (git_ops.py::GitOps.acquire_spec_lane).
     git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
     git_ops.mark_pool_storage_present()
-    return git_ops, OrchestratorConfig(project_root=repo, git=git_config)
+    return git_ops, lane_scene_config(repo, git_config)
 
 
 class _AdvanceFailingGitOps(GitOps):
@@ -1402,50 +1400,13 @@ def _make_late_arrival_lane(
     return lane, q
 
 
-async def _stop_worker(
-    worker: MergeLane,
-    worker_task: asyncio.Task[None],
-    *,
-    join_timeout: float = 5.0,
-) -> None:
-    """Shut *worker* down and join its run task — the ONE teardown shape every
-    late-arrival test uses, so no site can drift or be forgotten.
-
-    ALWAYS call this from a ``finally:`` covering the body of the
-    ``with patch(...)`` block (task 3980 amendment, esc-3980-4). ``wait_responsive``
-    gives up by raising ``_pytest.outcomes.Failed``, and an assertion mid-body
-    raises too; on the old straight-line shape either one skipped ``stop()``
-    entirely and leaked a live merge worker plus its run task into
-    pytest-asyncio teardown. That leak is why one red test used to cascade into
-    unrelated failures elsewhere in the session.
-
-    Safe on the give-up path even when a gate was never released: ``stop()``
-    cancels every in-flight verify task rather than awaiting it
-    (merge_queue.py:12730+), so it cannot itself block on an unreleased
-    ``asyncio.Event``.  Whatever the lane still has to unwind on the way out
-    keeps seeing the injected verifier, which is the lane's own collaborator
-    for its whole lifetime rather than a binding swapped in for a block.
-
-    The join stays best-effort (``suppress(Exception)``): it asserts nothing,
-    and a slow join must not convert a real failure above into a confusing
-    second one. It is also why this wait is exempt from the shared
-    ``wall-clock-deadline`` rule
-    (fused-memory/scripts/check_bare_magicmock_config.py): its target is a bare
-    Name, not a ``.result`` future or a ``gate*.wait()`` barrier, so the
-    exemption is structural rather than a listed name.
-    """
-    await worker.stop()
-    with contextlib.suppress(Exception):
-        await asyncio.wait_for(worker_task, timeout=join_timeout)
-
-
 # ===========================================================================
 # Step-1 RED: late arrival attaches to in-flight predecessor's merge commit
 # ===========================================================================
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 210s here
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
 class TestLateArrivalAttaches:
     """Step-1 RED — late arrival B attaches to in-flight predecessor A's merge commit.
 
@@ -1520,7 +1481,7 @@ class TestLateArrivalAttaches:
         )
 
         # ── Build branches ─────────────────────────────────────────────────────
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/late1-a', 'late1_a.py', 'a = 1\n',
         )
@@ -1660,7 +1621,7 @@ class TestLateArrivalAttaches:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 240s here
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
 class TestLateArrivalCleanCAS:
     """Step-3 RED→GREEN — after A lands, B advances via clean CAS (DONE-WHEN 3).
 
@@ -1725,7 +1686,7 @@ class TestLateArrivalCleanCAS:
         )
 
         # ── Build branches (disjoint files) ──────────────────────────────────
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/late3-a', 'late3_a.py', 'a = 1\n',
         )
@@ -1839,7 +1800,7 @@ class TestLateArrivalCleanCAS:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 240s here
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
 class TestLateArrivalFailCascade:
     """Step-5 RED→GREEN — predecessor failing invalidates the late arrival (DONE-WHEN 4).
 
@@ -1925,7 +1886,7 @@ class TestLateArrivalFailCascade:
         )
 
         # ── Build disjoint branches ───────────────────────────────────────────
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/late5-a', 'late5_a.py', 'a = 1\n',
         )
@@ -2006,6 +1967,7 @@ class TestLateArrivalFailCascade:
         assert outcome_a.status != 'done', (
             f'A must NOT land (verify failed); got outcome_a={outcome_a!r}'
         )
+        assert not main_health_probe_spawned(outcome_a), outcome_a.reason
 
         # ── DONE-WHEN 4(a): speculative_merge event for B (B was dispatched
         #    speculatively against A's commit — only present after step-2).
@@ -2076,7 +2038,7 @@ class TestLateArrivalFailCascade:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 210s here
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
 class TestLateArrivalGuards:
     """Step-7 guards — fallback + permit accounting + depth-K + skip_verify + K=1 sanity.
 
@@ -2129,7 +2091,7 @@ class TestLateArrivalGuards:
         fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='fallback7-laptop')
 
         # ── Build branches ────────────────────────────────────────────────────
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/guard7-a', 'guard7_a.py', 'a = 1\n',
         )
@@ -2218,7 +2180,7 @@ class TestLateArrivalGuards:
         gate_b_prerelease.set()
         fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='depth7-laptop')
 
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/dk7-a', 'dk7_a.py', 'a = 1\n',
         )
@@ -2310,7 +2272,7 @@ class TestLateArrivalGuards:
         gate_b_prerelease.set()
         fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='sv7-laptop')
 
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/sv7-a', 'sv7_a.py', 'a = 1\n',
         )
@@ -2399,7 +2361,7 @@ class TestLateArrivalGuards:
         gate_b_prerelease.set()
         fake_remote = _gated_runner(gate_b_prerelease, passed=True, name='k1-7-laptop')
 
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/k1-7-a', 'k1_7_a.py', 'a = 1\n',
         )
@@ -2526,7 +2488,7 @@ class TestLateArrivalGuards:
             gate_b_prerelease, passed=True, name='shutdown-guard-laptop',
         )
 
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/shutdown-guard-a', 'shutdown_guard_a.py', 'a = 1\n',
         )
@@ -2600,7 +2562,7 @@ class TestLateArrivalGuards:
 
 
 @pytest.mark.asyncio
-@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: _worst_per_method_wait_budget computes 240s here
+@pytest.mark.timeout(HEAVY_BARRIER_TEST_TIMEOUT)  # task 3980: TestTimeoutMarkCoverage checks it against _worst_per_method_wait_budget
 class TestLateArrivalSubmissionOrderCAS:
     """Step-8 guard — main advances in strict submission order on the late-arrival path.
 
@@ -2697,7 +2659,7 @@ class TestLateArrivalSubmissionOrderCAS:
         )
 
         # ── Build disjoint branches ───────────────────────────────────────────
-        config = OrchestratorConfig(project_root=spec_git_repo, git=git_config)
+        config = lane_scene_config(spec_git_repo, git_config)
         wt_a = await _make_branch_with_file(
             git_ops, 'task/cas8-a', 'cas8_a.py', 'a = 1\n',
         )
@@ -2937,9 +2899,10 @@ class TestJournalLandedThenAdvanceHelper:
 
 
 class TestTimeoutMarkCoverage:
-    """Enforced invariant: every class in THIS module whose computed
-    worst-per-method wait budget clears the pyproject default timeout must
-    carry a ``@pytest.mark.timeout`` mark whose value clears that budget.
+    """Enforced invariant: every class in THIS module must have its computed
+    worst-case per-method wait budget cleared by the timeout it actually
+    runs under -- its own ``@pytest.mark.timeout`` mark if it has one, else
+    the ambient budget (see ``_timeout_mark_offenders``).
 
     Task 3492 built this guard and applied it to
     test_merge_queue_concurrent_verify.py, but hard-scoped it to that file's
@@ -2957,35 +2920,29 @@ class TestTimeoutMarkCoverage:
     worst case, ``min(RESPONSIVE_WAIT_STRETCH * timeout,
     RESPONSIVE_WAIT_WALL_CAP)``.  The helper computes its own default cap from
     that SAME formula, which is what makes the bill an EXACT upper bound on
-    real wall clock rather than an under-count -- for any site leaving
-    ``max_wall_s`` at its default, which is every scanned site here.  That
+    real wall clock rather than an under-count.  That
     stretch is why this guard must exist BEFORE any wait in this file is
     migrated: a stretched wait under an inadequate mark is strictly worse than
     the flake it fixes.
     """
 
     def test_heavy_wait_classes_carry_adequate_timeout_mark(self) -> None:
-        """Every Test* class computing >= PYPROJECT_DEFAULT_TIMEOUT must
-        carry a ``timeout`` mark whose value clears its own computed budget.
+        """Every Test* class's computed worst-case per-method wait budget
+        must be cleared by the timeout it actually runs under (its own mark
+        if it has one, else the ambient budget).
 
-        Recomputes from source; no figure written anywhere in this file is
-        load-bearing for the assertion.  (For orientation only, current at the
-        time of writing: 210/240/240/210/240 for the five late-arrival classes
-        against their 300s marks.  The per-class ``@pytest.mark.timeout``
-        comments carry the same numbers -- if they disagree with this guard,
-        the guard is right.)
+        Recomputes every class's budget from source on each run -- the
+        single source of those figures, so none is restated beside a mark.
         """
         source = Path(__file__).read_text()
         budgets = _worst_per_method_wait_budget(source)
         offenders = _timeout_mark_offenders(budgets, globals().get)
 
         assert not offenders, (
-            'The following classes have a worst-case per-method wait '
-            f'budget at or above the pyproject default timeout '
-            f'({PYPROJECT_DEFAULT_TIMEOUT}s, see the '
-            f'[tool.pytest.ini_options].timeout setting in '
-            f'orchestrator/pyproject.toml) but lack an adequate '
-            f'@pytest.mark.timeout mark:\n'
+            'The following classes have a computed worst-case per-method '
+            'wait budget that the timeout they actually run under (their '
+            'own mark if they have one, else the ambient budget) does not '
+            'clear:\n'
             + '\n'.join(f'  - {offender}' for offender in offenders)
             + '\n\nConsequence: pytest-timeout\'s thread method os._exit()s '
             'the xdist worker under --max-worker-restart=0, so a '
@@ -3009,8 +2966,8 @@ class TestTimeoutMarkCoverage:
 # this module's own test run.
 #
 # WHAT THE RULE STILL KEYS ON, and why it must stay that way: the call SHAPE.
-# A load-bearing target is `X.result` (a MergeRequest.result future) or
-# `gate*.wait()` (an asyncio.Event barrier); the `_stop_worker` teardown join
+# A load-bearing target is `X.result` (a MergeRequest.result future) or a
+# zero-argument `.wait()` barrier on any receiver; the `_stop_worker` teardown join
 # below is exempt because its target is a bare Name, not because anything lists
 # it. No class list and no budget threshold decides which sites are scanned —
 # task 2376's sweep expressed its policy as "literals up to 15" and the lone
@@ -3019,13 +2976,10 @@ class TestTimeoutMarkCoverage:
 # five-class frozenset for the same reason. A list cannot catch what is outside
 # it, and a threshold is just another list.
 #
-# One honest asymmetry, recorded by task 4246's amendment pass rather than
-# glossed: the `.result` leg is pure shape, but the barrier leg also requires a
-# receiver Name starting with `gate` — a naming convention (universal in THIS
-# module, which is why the guard could carry it while it lived here) standing in
-# for "this is an asyncio.Event". Repo-wide it has a measured false-negative
-# surface of 102 `asyncio.wait_for(<expr>.wait(), ...)` sites. The checker's
-# Rule C docstring carries the census and why dropping the prefix was declined.
+# Both legs are pure shape: task 5269 dropped the `gate` receiver-name prefix the
+# barrier leg once required, so no name is consulted. The checker's Rule C
+# docstring records the zero-argument discriminator and the accepted
+# false-positive surface.
 #
 # Deleting the local copy was gated on a two-sided proof, not on this module
 # merely passing: fused-memory/tests/test_check_bare_magicmock_config.py::
@@ -3052,8 +3006,8 @@ class TestTimeoutMarkCoverage:
 # lone `MagicMock(passed=True)` — recorded and pinned in
 # fused-memory/tests/test_check_bare_magicmock_config.py::
 # TestRuleBCoversMergeSpeculation, which also holds the two-sided proof that the
-# rule reaches this module. This module is deliberately absent from the rule's
-# _DATACLASS_DOUBLE_DEBT baseline, so a regression here fails the gate.
+# rule reaches this module. Rule B has no debt baseline at all (task 4354), so a
+# regression here fails the gate.
 #
 # The single deliberate bare double below keeps a per-site
 # `bare-dataclass-double` noqa pragma, which is now its SOLE suppression.
@@ -3153,15 +3107,15 @@ class TestDispositionDoubleFidelity:
         (fused-memory/scripts/check_bare_magicmock_config.py, task 4016).  The
         file-local scope exemption that used to pair with it was deleted in task
         4246 along with the duplicate guard it belonged to.  That single pragma
-        is not a licence to add another bare double here: every other one in this
-        module is still covered, because the module is deliberately OFF the
-        rule's _DATACLASS_DOUBLE_DEBT baseline.
+        is not a licence to add another bare double here: a pragma suppresses the
+        one site it sits above, and Rule B has no per-file baseline that could
+        cover the rest (task 4354).
         """
         for logger_name in _FAIL_OPEN_LOGGERS:
             caplog.set_level(logging.WARNING, logger=logger_name)
 
-        # This module is deliberately OFF _DATACLASS_DOUBLE_DEBT, so the pragma
-        # below is a per-SITE suppression and every other double here stays covered.
+        # The pragma below is a per-SITE suppression — Rule B has no per-file
+        # baseline — so every other double in this module stays covered.
         # noqa: bare-dataclass-double — permanent mutation leg: this bare double IS the test subject, proving the positive leg can actually fail
         bare = MagicMock(
             passed=False, summary='tests failed', test_output='FAIL',

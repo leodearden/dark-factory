@@ -270,13 +270,28 @@ def known_project_roots_from_env(
 
     Returns ``[]`` when the env var is unset or empty.  Whitespace around
     each entry is stripped; empty entries (e.g. trailing comma) are
-    skipped.  Does *not* resolve symlinks or check existence — call sites
-    decide whether stat-ing each root is appropriate.
+    skipped.  Does *not* resolve symlinks or check existence:
+    :func:`build_known_projects_map` admits a root that is not a directory
+    with a WARNING, and :func:`is_phantom_project_root` is the detector.
     """
     raw = os.environ.get(env_var, '')
     if not raw:
         return []
     return [p.strip() for p in raw.split(',') if p.strip()]
+
+
+def is_phantom_project_root(root: str | os.PathLike[str]) -> bool:
+    """True when *root* is not a directory on this host — a typo'd, moved or
+    unmounted checkout, or a file.
+
+    This is the ONE definition of a phantom project root, shared by
+    :func:`build_known_projects_map`,
+    :class:`~fused_memory.middleware.project_prefix_registry.ProjectPrefixRegistry`
+    and ``fused-memory/scripts/sweep_orphan_flag_markers.py``.  It uses
+    :func:`os.path.isdir`, which answers False rather than raising on an
+    unreadable or malformed path, so it is safe during process startup.
+    """
+    return not os.path.isdir(root)
 
 
 def build_known_projects_map(
@@ -290,9 +305,21 @@ def build_known_projects_map(
     :func:`known_project_roots_from_env` output so callers can rely on the
     env var by default but override in tests.
 
-    Empty/missing primary roots are silently skipped.  Roots that can't be
-    resolved (file not found, permission denied) are logged and skipped —
+    An empty primary root is silently skipped.  A root whose ``resolve()``
+    raises ``OSError`` is logged and skipped; that is the ONLY skip, because
     this helper must not raise during process startup.
+
+    A root that resolves but is NOT A DIRECTORY (per
+    :func:`is_phantom_project_root`) is ADMITTED deliberately, with one
+    WARNING per admitted phantom root per call (task 5286, arm (b)).
+    Skipping it would leave its project_id unregistered, and
+    ``reconciliation/harness.py::ReconciliationHarness._project_loop`` answers
+    an unregistered id by dead-lettering every buffered event for it through
+    ``reconciliation/event_buffer.py::EventBuffer.mark_project_dead_letter``,
+    which is terminal with no replay path.  Every consumer also snapshots
+    this map once at process start, so a checkout that is briefly absent at
+    startup would lose its events and stay de-registered until restart.
+    Admitting costs only an inert id, and the WARNING makes it loud.
     """
     if extra_roots is None:
         extra_roots = known_project_roots_from_env()
@@ -323,6 +350,14 @@ def build_known_projects_map(
                 pid, resolved, out[pid],
             )
             continue
+        if is_phantom_project_root(resolved):
+            logger.warning(
+                'build_known_projects_map: admitting project root %r '
+                '(resolved %s) as project_id %r, but it is not a directory on '
+                'this host; check %s or taskmaster.project_root for a typo or '
+                'a moved/unmounted checkout',
+                raw, resolved, pid, KNOWN_PROJECT_ROOTS_ENV,
+            )
         out[pid] = resolved
     return out
 

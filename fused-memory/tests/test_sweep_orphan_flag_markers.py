@@ -6,7 +6,6 @@ without sys.path pollution — mirrors the pattern in test_cleanup_count_snapsho
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
 import logging
 import sys
@@ -17,54 +16,30 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from _fm_helpers import load_script_module
+from _store_mutation_preflight_contract import (
+    SENTINEL,
+    deny,
+    fail_closed_records,
+    neutralise_fixture,
+)
+
+from fused_memory.reconciliation.mem0_tombstone import PROTECTED_AUDIT_KINDS
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'sweep_orphan_flag_markers.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load sweep_orphan_flag_markers.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    reflection-based decorators work correctly.
-    """
-    mod_name = 'sweep_orphan_flag_markers'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
+_mod = load_script_module(SCRIPT_PATH, mod_name='sweep_orphan_flag_markers')
 
 
-_mod = _load_module()
-
-
-@pytest.fixture(autouse=True)
-def _neutralise_store_mutation_preflight(monkeypatch):
-    """Keep this MOCK-unit suite independent of the REAL ``~/.mem0``.
-
-    ``run(..., apply=True)`` runs a fail-closed capability preflight before it
-    counts or scrolls (task 4127). That probe touches the real filesystem, so
-    without this fixture every ``--apply`` test would pass or fail according to
-    whether the machine running pytest happens to be able to write mem0's
-    history directory -- and it genuinely cannot inside an agent sandbox, which
-    is the whole reason the guard exists. This suite is deliberately MOCK-unit
-    (an AsyncMock service, no live Qdrant), so the environment must not be an
-    input to it.
-
-    ``TestRunApplyStoreMutationPreflight`` re-rigs this per test -- to refuse,
-    to record, or to pass -- so the guard's own behaviour is still pinned
-    explicitly rather than assumed away.
-
-    Deliberately NOT ``raising=False``: if the guard is ever removed from the
-    script this fixture must break loudly rather than silently no-op.
-    """
-    monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', lambda **_kw: None)
+_neutralise = neutralise_fixture(
+    _mod,
+    note="""``run(..., apply=True)`` runs the preflight before it counts or
+    scrolls (task 4127). This suite is deliberately MOCK-unit (an AsyncMock
+    service, no live Qdrant). ``TestRunApplyStoreMutationPreflight`` re-rigs
+    this per test -- to refuse, to record, or to pass -- so the guard's own
+    behaviour is still pinned explicitly rather than assumed away.""",
+)
 
 
 # ===========================================================================
@@ -156,6 +131,23 @@ def _ledger_stamp(id: str) -> dict:
     member = _member(id, kind='stage1_flag_marker')
     member['metadata']['record_type'] = 'ledger_stamp'
     return member
+
+
+def _audit(id: str, task_id: str = '452') -> dict:
+    """Member that is a deliberately-permanent AUDIT record (task 4375).
+
+    The motivating shape: 40 ``kind='cadence_check'`` records, every one
+    citing deferred task 452, were destroyed by a pure age-GC. Its kind comes
+    from ``PROTECTED_AUDIT_KINDS`` itself, so this fixture tracks the single
+    source of truth rather than a hand-typed copy of it.
+    """
+    return _member(id, kind=sorted(PROTECTED_AUDIT_KINDS)[0], task_id=task_id)
+
+
+def _foreign(id: str) -> dict:
+    """Member declaring a kind from some OTHER pool that nobody registered —
+    an audit kind its author never added to ``PROTECTED_AUDIT_KINDS``."""
+    return _member(id, kind='quarterly_audit_log')
 
 
 def _svc_with_ledger() -> tuple[AsyncMock, AsyncMock]:
@@ -756,6 +748,228 @@ class TestFindProtectedMarkers:
         """A member with no 'metadata' key at all is handled, not raised on."""
         member = {'id': 'nometa', 'created_at': None}
         assert _mod.find_protected_markers([member]) == []
+
+    def test_audit_and_foreign_kind_records_are_returned(self):
+        """The audit and foreign-kind arms join the protected set (task 5286),
+        in input order and by object identity, beside the legacy shapes the
+        sweep still owns."""
+        audit = _audit('a1')
+        foreign = _foreign('f1')
+        assert audit['metadata']['kind'] in PROTECTED_AUDIT_KINDS
+        members = [_orphan('o1'), audit, _member('keep'), foreign]
+        result = _mod.find_protected_markers(members)
+        assert result == [audit, foreign], f'Expected [a1, f1], got: {result!r}'
+        assert result[0] is members[1], 'Expected same object identity'
+        assert result[1] is members[3], 'Expected same object identity'
+
+    def test_with_reasons_pairs_each_protected_member_with_its_arm(self):
+        """The attribution-preserving form returns the same members, each
+        paired with the arm protection_reason names for it."""
+        members = [_orphan('o1'), _mirror('m1'), _audit('a1'), _foreign('f1')]
+        pairs = _mod.find_protected_markers_with_reasons(members)
+        assert [member for member, _ in pairs] == _mod.find_protected_markers(members)
+        assert all(
+            paired is original for (paired, _), original in zip(pairs, members[1:], strict=True)
+        ), 'Expected same object identity'
+        assert [reason for _, reason in pairs] == [
+            _mod.ProtectionReason.CYCLE_SUMMARY_MIRROR,
+            _mod.ProtectionReason.PROTECTED_AUDIT_KIND,
+            _mod.ProtectionReason.FOREIGN_KIND,
+        ]
+
+
+class TestProtectionReason:
+    """protection_reason(metadata): WHICH guard withholds a record, if any.
+
+    The arms are checked in order mirror -> audit -> foreign-kind, and that
+    order IS the attribution: a record matching an earlier, specific arm is
+    never reported under a later, generic one.
+    """
+
+    @pytest.mark.parametrize('builder', [_mirror, _ledger_stamp])
+    def test_mirror_shapes_are_cycle_summary_mirror(self, builder):
+        member = builder('m1')
+        assert (
+            _mod.protection_reason(member['metadata'])
+            is _mod.ProtectionReason.CYCLE_SUMMARY_MIRROR
+        )
+
+    def test_audit_kind_is_attributed_to_the_audit_arm_not_foreign(self):
+        member = _audit('a1')
+        assert member['metadata']['kind'] in PROTECTED_AUDIT_KINDS
+        reason = _mod.protection_reason(member['metadata'])
+        assert reason is _mod.ProtectionReason.PROTECTED_AUDIT_KIND
+
+    @pytest.mark.parametrize('builder', [_foreign, _wrong_kind])
+    def test_unregistered_kind_is_foreign_kind(self, builder):
+        member = builder('f1')
+        assert (
+            _mod.protection_reason(member['metadata'])
+            is _mod.ProtectionReason.FOREIGN_KIND
+        )
+
+    @staticmethod
+    def _explicit_none_kind(id: str) -> dict:
+        member = _member(id)
+        member['metadata']['kind'] = None
+        return member
+
+    @pytest.mark.parametrize(
+        'builder',
+        [_member, _orphan, _taskless, _explicit_none_kind.__func__],
+        ids=['marker', 'kind_missing', 'taskless', 'kind_none'],
+    )
+    def test_legacy_marker_shapes_are_unprotected(self, builder):
+        """Kind absent or MARKER_KIND is exactly the pool this sweep owns."""
+        member = builder('keep')
+        assert _mod.protection_reason(member['metadata']) is None
+
+    @pytest.mark.parametrize('metadata', [None, ['not', 'a', 'dict'], 'string'])
+    def test_non_dict_metadata_is_unprotected_and_does_not_raise(self, metadata):
+        assert _mod.protection_reason(metadata) is None
+
+    @pytest.mark.parametrize(
+        'kind', [['cadence_check'], {'nested': 'cadence_check'}],
+        ids=['list_kind', 'dict_kind'],
+    )
+    def test_unhashable_kind_is_foreign_and_does_not_raise(self, kind):
+        """The unhashable-kind payload is_protected_audit_record guards
+        against: still withheld, never a TypeError."""
+        metadata = {'source': 'stage1_flag_marker', 'task_id': '1', 'kind': kind}
+        assert (
+            _mod.protection_reason(metadata)
+            is _mod.ProtectionReason.FOREIGN_KIND
+        )
+
+
+# ===========================================================================
+# Tests: find_undrainable_markers (task 4436)
+# ===========================================================================
+
+class TestFindUndrainableMarkers:
+    """Tests for the pure function find_undrainable_markers(members, drained_ids).
+
+    The PERMANENT floor on ``after.total_source``: the enumerated members no
+    invocation of this sweep can ever drain, minus the ones this run's delete
+    set already covers. Two structurally different arms compose it — the
+    UNDATED arm (``find_undated_markers``; invocation-relative, because
+    ``--delete-ids``/``--terminal-drain`` can still reach it) and the
+    PROTECTED arm (``find_protected_markers``; absolute, refused
+    unconditionally at the delete choke point even against ``--delete-ids``).
+    """
+
+    @staticmethod
+    def _undated(id: str, created_at: str | None = None) -> dict:
+        """Build an undated member with a valid kind and non-terminal task_id.
+
+        Mirrors ``TestFindUndatedMarkers._dated``: ``_member``'s hardcoded
+        ``created_at='2026-01-01T00:00:00Z'`` is always dated, so the undated
+        shapes are built by hand. Carries kind+task_id so no OTHER predicate
+        catches it — isolating the undated dimension.
+        """
+        member: dict = {
+            'id': id,
+            'metadata': {
+                'source': 'stage1_flag_marker',
+                'kind': 'stage1_flag_marker',
+                'task_id': '9001',
+            },
+        }
+        if created_at is not None:
+            member['created_at'] = created_at
+        return member
+
+    def test_missing_created_at_and_undrained_is_returned(self):
+        """(a) A member with no created_at key that this run does not delete
+        floors the backlog."""
+        member = self._undated('missing1')
+        result = _mod.find_undrainable_markers([member], set())
+        assert result == [member], f'Expected [missing1], got: {result!r}'
+
+    def test_none_created_at_and_undrained_is_returned(self):
+        """(b) created_at explicitly None is undated, hence floor."""
+        member = self._undated('none1')
+        member['created_at'] = None
+        result = _mod.find_undrainable_markers([member], set())
+        assert result == [member], f'Expected [none1], got: {result!r}'
+
+    def test_unparseable_created_at_and_undrained_is_returned(self):
+        """(c) An unparseable created_at is undated, hence floor."""
+        member = self._undated('bad1', created_at='not-a-date')
+        result = _mod.find_undrainable_markers([member], set())
+        assert result == [member], f'Expected [bad1], got: {result!r}'
+
+    def test_undated_but_drained_is_not_returned(self):
+        """(d) THE UNDATED KEY CASE — a member the delete set already covers
+        sets NO floor, however undated it is.
+
+        This is why ``undated_kept_count`` is the wrong number to key a
+        constraint on: ``find_orphan_markers`` / ``find_taskless_markers`` /
+        ``find_terminal_task_markers`` never consult ``created_at``, so an
+        undated member any of them catches IS drained this run.
+        """
+        member = self._undated('drained1')
+        result = _mod.find_undrainable_markers([member], {'drained1'})
+        assert result == [], f'Expected [] (already drained), got: {result!r}'
+
+    def test_dated_protected_members_are_returned(self):
+        """(e) THE PROTECTED ARM — fully DATED protected records floor the
+        backlog even though ``find_undated_markers`` returns neither.
+
+        The protected-mirror guard refuses them at every age and under every
+        flag, so they are undrainable in a strictly stronger sense than an
+        undated member is.
+        """
+        mirror = _mirror('m1')
+        stamp = _ledger_stamp('l1')
+        assert _mod.find_undated_markers([mirror, stamp]) == [], (
+            'Fixture drift: the protected arm must be exercised by DATED members'
+        )
+        result = _mod.find_undrainable_markers([mirror, stamp], set())
+        assert result == [mirror, stamp], f'Expected [m1, l1], got: {result!r}'
+
+    def test_protected_member_is_returned_even_when_in_drained_ids(self):
+        """(f) The protected arm does not depend on the caller having
+        subtracted protected members from its delete set first.
+
+        ``run()`` does subtract them, so this state is unreachable there —
+        which is exactly why the predicate must not TRUST that it happened.
+        """
+        mirror = _mirror('m1')
+        result = _mod.find_undrainable_markers([mirror], {'m1'})
+        assert result == [mirror], f'Expected [m1], got: {result!r}'
+
+    @pytest.mark.parametrize('drained_ids', [set(), {'keep'}])
+    def test_ordinary_dated_member_is_never_returned(self, drained_ids):
+        """(g) A dated, kinded, task_id-carrying marker floors nothing,
+        in or out of the delete set."""
+        member = _member('keep')
+        result = _mod.find_undrainable_markers([member], drained_ids)
+        assert result == [], f'Expected [], got: {result!r}'
+
+    def test_undated_and_protected_member_appears_exactly_once(self):
+        """(h) The two arms are an id-deduplicated UNION, not a concatenation."""
+        both = _mirror('both1')
+        del both['created_at']
+        assert _mod.find_undated_markers([both]) == [both], 'Fixture drift: not undated'
+        assert _mod.find_protected_markers([both]) == [both], 'Fixture drift: not protected'
+        result = _mod.find_undrainable_markers([both], set())
+        assert result == [both], f'Expected exactly one [both1], got: {result!r}'
+
+    def test_empty_input_returns_empty(self):
+        """(i) Empty input list returns empty list."""
+        assert _mod.find_undrainable_markers([], set()) == []
+
+    def test_preserves_order_and_identity(self):
+        """(j) Returned dicts are the same objects, in scroll order —
+        matching TestFindUndatedMarkers.test_preserves_order_and_identity."""
+        undated = self._undated('u1')
+        stamp = _ledger_stamp('l1')
+        members = [_orphan('o1'), undated, _member('keep'), stamp]
+        result = _mod.find_undrainable_markers(members, set())
+        assert result == [undated, stamp], f'Expected [u1, l1], got: {result!r}'
+        assert result[0] is members[1], 'Expected same object identity'
+        assert result[1] is members[3], 'Expected same object identity'
 
 
 # ===========================================================================
@@ -2154,6 +2368,816 @@ class TestRunExcludesProtectedMirrorsFromTheDeleteSet:
 
         assert report['protected_skipped_count'] == 0
         assert report['protected_skipped_ids'] == []
+        assert report['protected_skipped_reasons'] == {}
+
+
+class TestProtectedAuditAndForeignKindRecordsAreNeverDeleted:
+    """Audit records and foreign-kind records are withheld in EVERY mode
+    (task 5286).
+
+    The motivating loss was an age-only collector taking 40 audit records
+    that all cited deferred task 452. Here every arm that could nominate such
+    a record is switched on at once: the age predicate (``now`` is months
+    past ``created_at``), the kind-orphan predicate (their kind is not
+    MARKER_KIND), and, under --terminal-drain, the terminal predicate (452 is
+    in the terminal set). None of them may get one deleted.
+    """
+
+    _AGED_NOW = datetime(2026, 9, 1, tzinfo=UTC)
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+    _service = staticmethod(TestRunExcludesProtectedMirrorsFromTheDeleteSet._service)
+
+    @staticmethod
+    def _args(apply: bool, delete_ids: list[str] | None = None):
+        return types.SimpleNamespace(
+            apply=apply, project_id='dark_factory', max_age_days=14,
+            delete_ids=delete_ids,
+        )
+
+    @staticmethod
+    def _deleted_ids(memory_service: AsyncMock) -> set[str]:
+        return {
+            c.kwargs['memory_id']
+            for c in memory_service.delete_memory.call_args_list
+        }
+
+    @pytest.mark.asyncio
+    async def test_choke_point_refuses_audit_and_foreign_kind_records(self):
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        audit = _audit('a1')
+        assert audit['metadata']['kind'] in PROTECTED_AUDIT_KINDS
+
+        result = await _mod.delete_orphan_markers(
+            memory_service, 'dark_factory', [_orphan('o1'), audit, _foreign('f1')],
+        )
+
+        assert self._deleted_ids(memory_service) == {'o1'}
+        assert memory_service.delete_memory.await_count == 1
+        assert result['protected_skipped'] == ['a1', 'f1']
+        assert result['deleted'] == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'terminal_task_ids', [None, {'452'}], ids=['ordinary', 'terminal_drain'],
+    )
+    @pytest.mark.parametrize('apply', [False, True], ids=['dry_run', 'apply'])
+    async def test_run_withholds_them_in_every_mode(self, terminal_task_ids, apply):
+        audit = _audit('a1')
+        assert audit['metadata']['kind'] in PROTECTED_AUDIT_KINDS
+        members = [_orphan('o1'), audit, _foreign('f1')]
+        memory_service = self._service(members, apply=apply)
+
+        report = await _mod.run(
+            self._args(apply=apply), memory_service,
+            now=self._AGED_NOW, terminal_task_ids=terminal_task_ids,
+        )
+
+        assert 'a1' not in report['orphan_ids']
+        assert 'f1' not in report['orphan_ids']
+        assert report['protected_skipped_ids'] == ['a1', 'f1']
+        undrainable = report['structural_floor']['undrainable_ids']
+        assert 'a1' in undrainable and 'f1' in undrainable, undrainable
+        if apply:
+            deleted = self._deleted_ids(memory_service)
+            assert 'a1' not in deleted and 'f1' not in deleted, deleted
+            assert report['enforced_protected_skipped'] == []
+
+    @pytest.mark.asyncio
+    async def test_delete_ids_cannot_override_them(self):
+        audit = _audit('a1')
+        assert audit['metadata']['kind'] in PROTECTED_AUDIT_KINDS
+        members = [_orphan('o1'), audit, _foreign('f1')]
+        memory_service = self._service(members, apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True, delete_ids=['a1', 'f1']), memory_service,
+            now=self._NEUTRAL_NOW,
+        )
+
+        deleted = self._deleted_ids(memory_service)
+        assert 'a1' not in deleted and 'f1' not in deleted, deleted
+        assert set(report['targeted_correction_ids']) == {'a1', 'f1'}
+
+
+class TestProtectedSkipsAreAttributedToTheirGuard:
+    """Each withheld record names the guard that withheld it (task 5286).
+
+    Mirrors the in-cycle collector's rule that a mirror skip must not be
+    logged as an audit skip, or vice versa. Asserted on the structured
+    ``ProtectionReason`` values, never on surrounding prose.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+    _service = staticmethod(TestRunExcludesProtectedMirrorsFromTheDeleteSet._service)
+    _EXPECTED = {
+        'mirror-id': _mod.ProtectionReason.CYCLE_SUMMARY_MIRROR.value,
+        'audit-id': _mod.ProtectionReason.PROTECTED_AUDIT_KIND.value,
+        'foreign-id': _mod.ProtectionReason.FOREIGN_KIND.value,
+    }
+
+    @staticmethod
+    def _members() -> list[dict]:
+        return [
+            _mirror('mirror-id'), _audit('audit-id'),
+            _foreign('foreign-id'), _orphan('orphan-id'),
+        ]
+
+    @staticmethod
+    def _warnings(caplog) -> list[str]:
+        return [
+            r.getMessage() for r in caplog.records
+            if r.name == 'sweep_orphan_flag_markers' and r.levelno == logging.WARNING
+        ]
+
+    @pytest.mark.asyncio
+    async def test_choke_point_names_each_records_own_reason(self, caplog):
+        memory_service = AsyncMock()
+        memory_service.delete_memory = AsyncMock(return_value=None)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            await _mod.delete_orphan_markers(
+                memory_service, 'dark_factory', self._members(),
+            )
+
+        warnings = self._warnings(caplog)
+        for memory_id, reason in self._EXPECTED.items():
+            naming = [m for m in warnings if memory_id in m]
+            assert len(naming) == 1, (memory_id, warnings)
+            assert reason in naming[0], (memory_id, naming[0])
+        audit_line = next(m for m in warnings if 'audit-id' in m)
+        assert (
+            _mod.ProtectionReason.CYCLE_SUMMARY_MIRROR.value not in audit_line
+        ), audit_line
+
+    @pytest.mark.asyncio
+    async def test_run_aggregate_names_every_reason(self, caplog):
+        memory_service = self._service(self._members(), apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            await _mod.run(
+                types.SimpleNamespace(
+                    apply=False, project_id='dark_factory', max_age_days=14,
+                    delete_ids=None,
+                ),
+                memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        naming_all = [
+            m for m in self._warnings(caplog)
+            if all(memory_id in m for memory_id in self._EXPECTED)
+        ]
+        assert len(naming_all) == 1, self._warnings(caplog)
+        for reason in self._EXPECTED.values():
+            assert reason in naming_all[0], (reason, naming_all[0])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('apply', [False, True], ids=['dry_run', 'apply'])
+    async def test_report_maps_each_skipped_id_to_its_reason(self, apply):
+        """The attribution reaches the JSON report as structured data, so a
+        consumer never greps the journal to tell the arms apart."""
+        memory_service = self._service(self._members(), apply=apply)
+
+        report = await _mod.run(
+            types.SimpleNamespace(
+                apply=apply, project_id='dark_factory', max_age_days=14,
+                delete_ids=None,
+            ),
+            memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['protected_skipped_reasons'] == self._EXPECTED
+        assert list(report['protected_skipped_reasons']) == report['protected_skipped_ids']
+        assert json.dumps(report)
+
+
+# ===========================================================================
+# Tests: run() emits the structural_floor block (task 4436)
+# ===========================================================================
+
+class TestStructuralFloorReportBlock:
+    """The permanent backlog floor, made machine-readable beside cross_check.
+
+    ``undated_kept_count`` alone is the WRONG number to key a constraint on,
+    and after task 4435 it can be wrong in BOTH directions: an undated
+    kind-orphan is drained and floors nothing, while a fully dated protected
+    mirror floors permanently while contributing ``0`` to the raw count.
+    This block reports the raw count and the true floor side by side.
+
+    Mirrors ``TestRunExcludesProtectedMirrorsFromTheDeleteSet``'s local
+    ``_args``/``_service`` shape and its delete-set boundary assertions
+    rather than reaching into ``TestRun``.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def _args(
+        self,
+        apply: bool = False,
+        project_id: str = 'dark_factory',
+        max_age_days: int = 14,
+        delete_ids: list[str] | None = None,
+    ):
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=apply, project_id=project_id, max_age_days=max_age_days,
+            delete_ids=delete_ids,
+        )
+
+    @staticmethod
+    def _service(members: list[dict], *, apply: bool) -> AsyncMock:
+        memory_service = AsyncMock()
+        counts = (
+            _counts(source=[len(members), 0], kind=[0, 0]) if apply
+            else _counts(source=len(members), kind=0)
+        )
+        memory_service.count_memories_by_metadata = counts
+        memory_service.get_memories_by_metadata = AsyncMock(return_value=members)
+        memory_service.delete_memory = AsyncMock(return_value=None)
+        return memory_service
+
+    @staticmethod
+    def _undated(id: str, *, kind: str | None = 'stage1_flag_marker',
+                 task_id: str | None = '9001') -> dict:
+        """An undated member — no ``created_at`` key at all.
+
+        ``_member``'s hardcoded ``created_at`` is always dated, so undated
+        shapes are built by hand (the shape already used by
+        ``test_undated_members_are_kept_and_reported_with_warning``). The
+        default kind+task_id make it undrainable; pass ``kind=None`` to make
+        it a kind-orphan the delete set covers.
+        """
+        metadata: dict = {'source': 'stage1_flag_marker'}
+        if kind is not None:
+            metadata['kind'] = kind
+        if task_id is not None:
+            metadata['task_id'] = task_id
+        return {'id': id, 'metadata': metadata}
+
+    @pytest.mark.asyncio
+    async def test_block_shape(self):
+        """(a) The report carries a structural_floor dict with the floor keys."""
+        members = [_member('keep')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert isinstance(block, dict), f'Expected a dict, got: {block!r}'
+        assert {'undated_kept_count', 'undrainable_count', 'undrainable_ids'} <= set(block)
+
+    @pytest.mark.asyncio
+    async def test_undated_and_undrained_member_is_the_floor(self):
+        """(b) An undated member no other predicate catches floors the backlog."""
+        members = [_member('keep'), self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['orphan_ids'] == [], (
+            f"Fixture drift: u1 must be undrained, got: {report['orphan_ids']!r}"
+        )
+        block = report['structural_floor']
+        assert block['undrainable_count'] == 1
+        assert block['undrainable_ids'] == ['u1']
+
+    @pytest.mark.asyncio
+    async def test_undated_but_drained_member_floors_nothing(self):
+        """(c) THE FALSE-POSITIVE FIX, end to end.
+
+        An undated member that is ALSO a kind-orphan is in the delete set, so
+        it floors nothing — even though undated_kept_count counts it. Today's
+        WARNING is keyed on that raw count and tells an operator to raise
+        --max-backlog when the true floor is 0.
+        """
+        members = [self._undated('u1', kind=None)]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['orphan_ids'] == ['u1'], (
+            f"Fixture drift: u1 must be drained, got: {report['orphan_ids']!r}"
+        )
+        block = report['structural_floor']
+        assert block['undated_kept_count'] == 1
+        assert block['undrainable_count'] == 0
+        assert block['undrainable_ids'] == []
+
+    @pytest.mark.asyncio
+    async def test_dated_protected_members_are_the_floor(self):
+        """(d) THE PROTECTED ARM, and the proof the block reads the
+        POST-subtraction delete set.
+
+        All three members are dated, so undated_kept_count is 0 — yet the two
+        protected records floor permanently. `m1` is ALSO a kind-orphan, so
+        it is in the union loop's `seen_ids`; computing the floor from that
+        superset would classify it as drained and under-report the floor,
+        which is the false negative this block exists to eliminate.
+        """
+        members = [_orphan('o1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert block['undated_kept_count'] == 0
+        assert block['undrainable_count'] == 2
+        assert block['undrainable_ids'] == ['m1', 'l1']
+
+    @pytest.mark.asyncio
+    async def test_top_level_undated_kept_count_is_unchanged(self):
+        """(e) REGRESSION PIN — the top-level key survives verbatim.
+
+        It is asserted by existing tests AND extracted into
+        done_provenance.note by the orchestrator's before_done path, so
+        relocating it would break a durable provenance record.
+        """
+        members = [self._undated('u1'), self._undated('u2', kind=None)]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['undated_kept_count'] == 2, 'raw undated count, not the floor'
+        assert report['structural_floor']['undrainable_count'] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_floor_never_widens_the_delete_set(self):
+        """(f) BOUNDARY — this block is diagnostic and must never delete.
+
+        Mirrors TestFlagForStage2IsNeverDeleted: no floor id appears in
+        orphan_ids, and under --apply delete_memory is never awaited with
+        one. Without this, a later edit could quietly turn a REPORTING
+        change into a DELETING one — the exact risk the rejected "make
+        find_undated_markers load-bearing in the delete set" option carries.
+        """
+        members = [_orphan('o1'), self._undated('u1'), _mirror('m1'), _ledger_stamp('l1')]
+        memory_service = self._service(members, apply=True)
+
+        report = await _mod.run(
+            self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        floor_ids = set(report['structural_floor']['undrainable_ids'])
+        assert floor_ids == {'u1', 'm1', 'l1'}, f'Unexpected floor: {floor_ids!r}'
+        assert not (floor_ids & set(report['orphan_ids'])), (
+            f"Floor leaked into the delete set: {report['orphan_ids']!r}"
+        )
+        deleted_ids = {
+            call.kwargs['memory_id']
+            for call in memory_service.delete_memory.call_args_list
+        }
+        assert deleted_ids == {'o1'}, f'Expected only o1 deleted, got: {deleted_ids!r}'
+        assert not (deleted_ids & floor_ids)
+
+    @pytest.mark.asyncio
+    async def test_all_dated_unprotected_population_has_no_floor(self):
+        """(g) The healthy steady state reports a zero floor."""
+        members = [_member('keep'), _orphan('o1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert block['undrainable_count'] == 0
+        assert block['undrainable_ids'] == []
+
+
+# ===========================================================================
+# Tests: run()'s undated WARNING is keyed on the UNDRAINED subset (task 4436)
+# ===========================================================================
+
+class TestStructuralFloorWarning:
+    """The false-positive fix: the created_at WARNING speaks for the floor,
+    not for the raw undated count.
+
+    Today the WARNING fires whenever ``undated_kept_count`` is nonzero and
+    tells the operator to raise ``--max-backlog`` — even when every undated
+    member is in this run's delete set and the true floor is 0.
+
+    The two arms of the floor keep SEPARATE log lines on purpose. This one
+    names ``missing/unparseable created_at``, which is simply false for a
+    fully dated protected mirror; the protected arm has its own WARNING
+    (task 4435) that already states its floor correctly.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+    _UNDATED_MARKER = 'missing/unparseable created_at'
+
+    # Borrowed from the sibling class above: same populations, different
+    # question (the JSON block vs. the journal line). Re-wrapped in
+    # staticmethod because attribute access unwraps the descriptor, and a
+    # bare function assigned to a class attribute rebinds as an INSTANCE
+    # method — which would silently pass `self` as `members`.
+    _args = TestStructuralFloorReportBlock._args
+    _service = staticmethod(TestStructuralFloorReportBlock._service)
+    _undated = staticmethod(TestStructuralFloorReportBlock._undated)
+
+    @staticmethod
+    def _undated_warnings(caplog) -> list[str]:
+        return [
+            record.message for record in caplog.records
+            if record.levelno == logging.WARNING
+            and TestStructuralFloorWarning._UNDATED_MARKER in record.message
+        ]
+
+    @pytest.mark.asyncio
+    async def test_drained_undated_member_logs_no_warning(self, caplog):
+        """(a) THE FIX — an undated member the delete set already covers is
+        not a finding, so nothing is logged about it.
+
+        Against current behaviour this FAILS: undated_kept_count is 1, so
+        the WARNING fires and tells an operator to raise --max-backlog when
+        the true floor is 0.
+        """
+        members = [self._undated('u1', kind=None)]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['undated_kept_count'] == 1, 'Fixture drift: u1 must be undated'
+        assert report['orphan_ids'] == ['u1'], 'Fixture drift: u1 must be drained'
+        assert report['structural_floor']['undrainable_count'] == 0
+        assert self._undated_warnings(caplog) == [], (
+            'A member the sweep is about to delete is not a finding: '
+            f'{self._undated_warnings(caplog)!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_undrained_undated_residue_logs_one_warning_with_remedies(self, caplog):
+        """(b) A genuine residue logs exactly one WARNING naming the undrained
+        count, the total enumerated, and every remedy."""
+        members = [_member('keep'), self._undated('u1'), self._undated('u2', kind=None)]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['undated_kept_count'] == 2, 'Fixture drift: two undated members'
+        assert report['structural_floor']['undrainable_count'] == 1
+
+        warnings = self._undated_warnings(caplog)
+        assert len(warnings) == 1, f'Expected exactly one WARNING, got: {warnings!r}'
+        message = warnings[0]
+        # The UNDRAINED count (1), not the raw undated count (2), of 3 enumerated.
+        assert '1 of 3' in message, f'Expected the undrained count, got: {message!r}'
+        for remedy in ('--delete-ids', '--terminal-drain', '--max-backlog'):
+            assert remedy in message, f'Expected {remedy} named as a remedy: {message!r}'
+
+    @pytest.mark.asyncio
+    async def test_all_dated_population_logs_nothing(self, caplog):
+        """(c) An all-dated population is silent, as it is today."""
+        members = [_member('keep'), _orphan('o1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['undated_kept_count'] == 0
+        assert self._undated_warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_protected_arm_keeps_its_own_warning_and_is_not_swallowed(self, caplog):
+        """(d) SCOPE GUARD — the two arms keep separate log lines.
+
+        A dated protected member floors the backlog but has no created_at
+        problem, so the created_at WARNING must NOT speak for it. Its own
+        task-4435 WARNING must still fire: the re-key must not silently
+        swallow the other arm.
+        """
+        members = [_mirror('m1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.WARNING, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(apply=False), memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['structural_floor']['undrainable_count'] == 1, 'm1 floors'
+        assert report['structural_floor']['undated_kept_count'] == 0, 'but is dated'
+        assert self._undated_warnings(caplog) == [], (
+            f'created_at is not this floor\'s cause: {self._undated_warnings(caplog)!r}'
+        )
+        assert any(
+            record.levelno == logging.WARNING and 'protected records' in record.message
+            for record in caplog.records
+        ), f'The protected arm lost its own WARNING: {[r.message for r in caplog.records]!r}'
+
+
+# ===========================================================================
+# Tests: the checked constraint — structural_floor.gate_unsatisfiable (task 4436)
+# ===========================================================================
+
+class TestUnsatisfiableGateIsChecked:
+    """The constraint itself: a --check --max-backlog below the permanent
+    floor is reported as structurally unsatisfiable, and said out loud.
+
+    The exit-code surface is deliberately unchanged (see
+    scripts/fused-memory-flag-marker-check.sh's already-adjudicated ruling
+    that a distinct code buys separability nowhere it is consumed), so the
+    JSON block IS the machine-readable discriminator — exactly as
+    cross_check.blind_spot is for the enumeration blind spot.
+    """
+
+    _NEUTRAL_NOW = datetime(2026, 1, 1, tzinfo=UTC)
+
+    _service = staticmethod(TestStructuralFloorReportBlock._service)
+    _undated = staticmethod(TestStructuralFloorReportBlock._undated)
+
+    def _args(
+        self,
+        apply: bool = False,
+        max_backlog: int = 0,
+        check: bool = False,
+    ):
+        """A namespace carrying the gate config, unlike TestRun's."""
+        import types as _types
+        return _types.SimpleNamespace(
+            apply=apply, project_id='dark_factory', max_age_days=14,
+            delete_ids=None, max_backlog=max_backlog, check=check,
+        )
+
+    @staticmethod
+    def _errors(caplog) -> list[str]:
+        return [r.message for r in caplog.records if r.levelno == logging.ERROR]
+
+    @pytest.mark.asyncio
+    async def test_floor_above_ceiling_is_reported_unsatisfiable(self):
+        """(a) One undrainable member against --max-backlog 0."""
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(max_backlog=0), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert block['undrainable_count'] == 1
+        assert block['max_backlog'] == 0
+        assert block['gate_unsatisfiable'] is True
+
+    @pytest.mark.asyncio
+    async def test_ceiling_that_accommodates_the_floor_is_satisfiable(self):
+        """(b) The same population against --max-backlog 1."""
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(max_backlog=1), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert block['undrainable_count'] == 1
+        assert block['max_backlog'] == 1
+        assert block['gate_unsatisfiable'] is False
+
+    @pytest.mark.asyncio
+    async def test_all_drainable_population_is_satisfiable_at_zero(self):
+        """(c) A population that drains to 0 passes a --max-backlog 0 gate."""
+        members = [_orphan('o1'), self._undated('u2', kind=None)]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(max_backlog=0), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        assert report['structural_floor']['undrainable_count'] == 0
+        assert report['structural_floor']['gate_unsatisfiable'] is False
+
+    @pytest.mark.asyncio
+    async def test_protected_only_population_is_unsatisfiable(self):
+        """(d) PROTECTED-ONLY UNSATISFIABILITY — the case a floor keyed on
+        undated markers alone would have wrongly passed.
+
+        Everything here is dated, so undated_kept_count is 0; the protected
+        mirror nonetheless floors the backlog permanently, and task 4435's
+        own WARNING already asserts in prose that a gate below that floor can
+        never pass.
+        """
+        members = [_orphan('o1'), _mirror('m1')]
+        memory_service = self._service(members, apply=False)
+
+        report = await _mod.run(
+            self._args(max_backlog=0), memory_service, now=self._NEUTRAL_NOW,
+        )
+
+        block = report['structural_floor']
+        assert block['undated_kept_count'] == 0
+        assert block['undrainable_count'] == 1
+        assert block['gate_unsatisfiable'] is True
+
+    @pytest.mark.asyncio
+    async def test_namespace_without_check_or_max_backlog_defaults_safely(self, caplog):
+        """(e) THE ARGS GOTCHA — a namespace carrying NEITHER field.
+
+        Exactly what TestRun._args builds, and what ~40 existing tests pass.
+        A bare args.check / args.max_backlog would AttributeError across all
+        of them, so the getattr defaults are pinned here directly rather than
+        left to be discovered as collateral damage.
+        """
+        import types as _types
+        bare = _types.SimpleNamespace(
+            apply=False, project_id='dark_factory', max_age_days=14,
+        )
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.ERROR, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(bare, memory_service, now=self._NEUTRAL_NOW)
+
+        block = report['structural_floor']
+        assert block['max_backlog'] == 0, 'default ceiling'
+        assert block['gate_unsatisfiable'] is True, 'floor 1 > default ceiling 0'
+        assert self._errors(caplog) == [], 'no --check is being evaluated'
+
+    @pytest.mark.asyncio
+    async def test_check_with_unsatisfiable_gate_logs_one_error(self, caplog):
+        """(f) DIAGNOSIS — an operator evaluating the gate is told, loudly,
+        that re-running can never clear it."""
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.ERROR, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(max_backlog=0, check=True),
+                memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['structural_floor']['gate_unsatisfiable'] is True
+        errors = self._errors(caplog)
+        assert len(errors) == 1, f'Expected exactly one ERROR, got: {errors!r}'
+        message = errors[0]
+        assert 'u1' in message, f'Expected the floor member named: {message!r}'
+        # The floor and the ceiling are asserted IN CONTEXT. A bare
+        # `'1' in message and '0' in message` passed incidentally — the '1'
+        # from the fixture id 'u1' (already asserted above) and the '0' from
+        # the ceiling, which is formatted in regardless of the computed
+        # floor, so a floor that regressed to 0 still passed. Prose is not
+        # pinned: rewording the futility clause must not break a green test.
+        assert '--max-backlog 0 is' in message, (
+            f'Expected the evaluated ceiling named: {message!r}'
+        )
+        assert 'at least 1' in message, (
+            f'Expected the computed floor named: {message!r}'
+        )
+        for remedy in ('--delete-ids', '--terminal-drain', 'delete_memory'):
+            assert remedy in message, f'Expected {remedy} named: {message!r}'
+
+    @pytest.mark.asyncio
+    async def test_no_check_logs_no_error_but_still_reports_the_fact(self, caplog):
+        """(g) The nightly --apply --terminal-drain service passes no --check,
+        so it must not gain a spurious ERROR for a gate it never evaluates —
+        while still recording the satisfiability fact in its journal JSON."""
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.ERROR, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(max_backlog=0, check=False),
+                memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['structural_floor']['gate_unsatisfiable'] is True
+        assert self._errors(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_check_with_satisfiable_gate_logs_no_error(self, caplog):
+        """(h) A gate that CAN pass is silent, even under --check."""
+        members = [self._undated('u1')]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.ERROR, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(max_backlog=1, check=True),
+                memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        assert report['structural_floor']['gate_unsatisfiable'] is False
+        assert self._errors(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_gate_evaluated_separates_a_real_verdict_from_a_hypothetical(self):
+        """gate_unsatisfiable is computed unconditionally, so on its own it
+        cannot be read: the nightly --apply --terminal-drain service
+        publishes `true` for a gate it never runs. gate_evaluated is the
+        discriminator, as cross_check.probe_failed is for blind_spot."""
+        members = [self._undated('u1')]
+
+        evaluated = await _mod.run(
+            self._args(max_backlog=0, check=True),
+            self._service(members, apply=False), now=self._NEUTRAL_NOW,
+        )
+        hypothetical = await _mod.run(
+            self._args(max_backlog=0, check=False),
+            self._service(members, apply=False), now=self._NEUTRAL_NOW,
+        )
+
+        assert evaluated['structural_floor']['gate_unsatisfiable'] is True
+        assert hypothetical['structural_floor']['gate_unsatisfiable'] is True, (
+            'The field itself does not discriminate — that is the point'
+        )
+        assert evaluated['structural_floor']['gate_evaluated'] is True
+        assert hypothetical['structural_floor']['gate_evaluated'] is False, (
+            'A gate that never ran must not read as an evaluated verdict'
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_error_does_not_present_the_floor_as_a_sufficient_ceiling(
+        self, caplog,
+    ):
+        """Raising --max-backlog to the floor is NECESSARY, not sufficient.
+
+        _resolve_check_exit_code falls back to before.total_source whenever
+        no 'after' key is present — every dry-run --check, which is exactly
+        the shape scripts/fused-memory-flag-marker-check.sh hardcodes. So a
+        10-member population with a floor of 1 STILL exits 1 at
+        --max-backlog 1, and the one message whose purpose is to stop
+        operators mis-tuning that ceiling must not imply otherwise.
+        """
+        members = [self._undated('u1')] + [_member(f'live{i}') for i in range(9)]
+        memory_service = self._service(members, apply=False)
+
+        with caplog.at_level(logging.ERROR, logger='sweep_orphan_flag_markers'):
+            report = await _mod.run(
+                self._args(max_backlog=0, check=True),
+                memory_service, now=self._NEUTRAL_NOW,
+            )
+
+        floor = report['structural_floor']['undrainable_count']
+        residual = report['before']['total_source']
+        assert (floor, residual) == (1, 10), 'Fixture drift'
+        # The trap, reproduced: the gate is unsatisfiable, but clearing the
+        # floor does not make this dry run pass.
+        assert _mod._resolve_check_exit_code(report, max_backlog=floor) == 1
+        assert _mod._resolve_check_exit_code(report, max_backlog=residual) == 0
+
+        message = self._errors(caplog)[0]
+        assert 'NECESSARY but NOT sufficient' in message, (
+            f'The floor must not read as a sufficient ceiling: {message!r}'
+        )
+        assert 'before.total_source (10)' in message, (
+            f"The verdict's actual comparand must be named: {message!r}"
+        )
+
+    def test_the_exit_code_ignores_the_structural_floor(self):
+        """The design's central safety claim, pinned as a regression rather
+        than only asserted in prose: the constraint refines the REASON, never
+        the code.
+
+        The obvious follow-up — "make the constraint ENFORCED" by wiring the
+        floor into _resolve_check_exit_code — would otherwise land green.
+        This builds a report by hand precisely because the combination is
+        unreachable from run() (the residual is always >= the floor), which
+        is what makes it a clean probe of what the resolver READS.
+        """
+        report = {
+            'before': {'total_source': 3, 'total_with_kind': 3},
+            'after': {'total_source': 3, 'total_with_kind': 3},
+            'structural_floor': {
+                'undated_kept_count': 0,
+                'undrainable_count': 2,
+                'undrainable_ids': ['m1', 'l1'],
+                'max_backlog': 0,
+                'gate_unsatisfiable': True,
+                'gate_evaluated': True,
+            },
+        }
+        assert _mod.unsatisfiable_backlog_gate(2, 0) is True, 'Fixture drift'
+
+        assert _mod._resolve_check_exit_code(report, max_backlog=3) == 0, (
+            'A satisfiable backlog must still resolve to 0 with an '
+            'unsatisfiable floor in the report'
+        )
+        # Indifferent to the FLOOR specifically, not indifferent in general:
+        # both inputs the resolver does read still move the code.
+        assert _mod._resolve_check_exit_code(report, max_backlog=2) == 1, (
+            'the backlog verdict still decides'
+        )
+        report['cross_check'] = {
+            'source_total': 3, 'flag_for_stage2_total': 61,
+            'blind_spot': True, 'probe_failed': False,
+        }
+        assert _mod._resolve_check_exit_code(report, max_backlog=3) == 1, (
+            'the blind-spot veto still decides'
+        )
 
 
 # ===========================================================================
@@ -2459,6 +3483,61 @@ class TestBacklogVerdict:
     def test_over_max_backlog_returns_1(self, after_total_source, max_backlog):
         """Residual backlog above the ceiling is violated → 1."""
         assert _mod.backlog_verdict(after_total_source, max_backlog) == 1
+
+
+# ===========================================================================
+# Tests: unsatisfiable_backlog_gate (task 4436)
+# ===========================================================================
+
+class TestUnsatisfiableBacklogGate:
+    """Tests for the pure function unsatisfiable_backlog_gate(structural_floor,
+    max_backlog) (task 4436): is this gate configuration structurally
+    incapable of EVER passing?
+
+    The structural sibling of enumeration_blind_spot — it answers one
+    diagnostic question about the GATE rather than about the population, and
+    it distinguishes a TRANSIENT backlog violation, which a later drain
+    clears, from a PERMANENT one, which no re-run can.
+    """
+
+    @pytest.mark.parametrize('structural_floor,max_backlog', [
+        (1, 0),
+        (4, 3),
+    ])
+    def test_floor_above_ceiling_is_unsatisfiable(self, structural_floor, max_backlog):
+        """(a)/(d) A floor above the ceiling can never pass — the exact
+        `--check --max-backlog 0` footgun this task exists to make legible."""
+        assert _mod.unsatisfiable_backlog_gate(structural_floor, max_backlog) is True
+
+    @pytest.mark.parametrize('structural_floor,max_backlog', [
+        (0, 0),
+        (3, 3),
+        (0, 5),
+    ])
+    def test_floor_at_or_under_ceiling_is_satisfiable(self, structural_floor, max_backlog):
+        """(b)/(c)/(e) A floor the ceiling accommodates is satisfiable.
+
+        (0, 0) is the measured-today population: the check must NOT fire on a
+        clean pool. (3, 3) is the BOUNDARY — the ceiling is inclusive, exactly
+        as backlog_verdict's is.
+        """
+        assert _mod.unsatisfiable_backlog_gate(structural_floor, max_backlog) is False
+
+    @pytest.mark.parametrize('structural_floor', range(5))
+    @pytest.mark.parametrize('max_backlog', range(5))
+    def test_is_the_strict_complement_of_backlog_verdict(self, structural_floor, max_backlog):
+        """The two predicates can never disagree at the boundary.
+
+        Pins this constraint to the same inclusive `<=` semantics as the
+        verdict it describes. Without it, a later edit could drift the two
+        apart and make the structural_floor block claim "unsatisfiable" about
+        a gate that in fact passes — a checked constraint that lies, which is
+        worse than the prose caveat it replaces.
+        """
+        assert (
+            _mod.unsatisfiable_backlog_gate(structural_floor, max_backlog)
+            is (_mod.backlog_verdict(structural_floor, max_backlog) == 1)
+        )
 
 
 # ===========================================================================
@@ -3167,55 +4246,16 @@ class TestRunApplyStoreMutationPreflight:
         memory_service.delete_memory = AsyncMock(return_value=None)
         return memory_service
 
-    @staticmethod
-    def _deny(monkeypatch):
-        """Rig the preflight to refuse, as it would inside an agent sandbox."""
-        def _raise(*_args, **_kwargs):
-            raise _mod.StoreMutationUnavailable('SENTINEL-store-unwritable')
-
-        monkeypatch.setattr(_mod, 'assert_store_mutation_allowed', _raise)
-
-    @staticmethod
-    def _fail_closed_records(caplog) -> list:
-        """The guard site's OWN diagnosis, isolated from ``main``'s generic
-        handler.
-
-        Both emit ERROR from this script's logger, so neither the level nor the
-        logger name can tell them apart -- only the fail-closed marker and the
-        remedy can, and carrying those is the entire reason the site-specific
-        message exists. ``main`` logs "fatal error during sweep", which tells
-        an operator reading the journal nothing about what was refused or what
-        to do instead.
-
-        Pinned on those two clauses ONLY -- the marker and the remedy noun --
-        so every other word of the message stays free to reword.
-
-        Asserting on message CONTENT is deliberate, and is the narrow exception
-        to the repo's don't-pin-guard-message-prose norm (task 3799): the record
-        this test is about is defined BY its content. Level and logger name are
-        shared with ``main``'s own ERROR record, and mere record-existence would
-        still pass if the whole diagnosis were replaced by "boom" -- precisely
-        the regression this exists to catch. Verified non-vacuous: mutating the
-        marker in the script turns this assertion red (task 4127 amendment).
-        """
-        return [
-            r for r in caplog.records
-            if r.name == 'sweep_orphan_flag_markers'
-            and r.levelno >= logging.ERROR
-            and 'NOT started (fail-closed)' in r.getMessage()
-            and 'MCP server' in r.getMessage()
-        ]
-
     @pytest.mark.asyncio
     async def test_apply_performs_zero_mutations_when_the_store_is_unwritable(
         self, monkeypatch
     ):
         """The whole point: refuse to start rather than half-complete."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service = self._service()
 
         with pytest.raises(
-            _mod.StoreMutationUnavailable, match='SENTINEL-store-unwritable'
+            _mod.StoreMutationUnavailable, match=SENTINEL
         ):
             await _mod.run(
                 self._args(apply=True), memory_service, now=self._NEUTRAL_NOW,
@@ -3230,7 +4270,7 @@ class TestRunApplyStoreMutationPreflight:
         counts plus the flag_for_stage2 census) and the scroll enumeration are
         all skipped in an environment that was never going to be allowed to
         delete."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service = self._service()
 
         with pytest.raises(_mod.StoreMutationUnavailable):
@@ -3246,7 +4286,7 @@ class TestRunApplyStoreMutationPreflight:
     async def test_a_dry_run_is_never_gated_on_write_capability(self, monkeypatch):
         """A read-only run mutates nothing, so it must not require the ability
         to mutate -- the sweep report stays obtainable from anywhere."""
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service = self._service()
 
         report = await _mod.run(
@@ -3309,7 +4349,7 @@ class TestRunApplyStoreMutationPreflight:
         exit code is non-zero, never 0, AND the journal an operator reads
         carries the diagnosis rather than only "fatal error during sweep".
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service = self._service()
         monkeypatch.setattr(
             sys, 'argv', ['sweep_orphan_flag_markers.py', '--apply'],
@@ -3331,7 +4371,9 @@ class TestRunApplyStoreMutationPreflight:
             exit_code = _mod.main()
 
         assert exit_code == 2
-        assert self._fail_closed_records(caplog), (
+        # ``main``'s own generic "fatal error during sweep" ERROR shares this
+        # logger AND this level, so only the markers can tell the two apart.
+        assert fail_closed_records(caplog, 'sweep_orphan_flag_markers'), (
             "main's blanket handler only says 'fatal error during sweep', so "
             'the guard site must log the fail-closed diagnosis itself; got: '
             f'{[r.getMessage() for r in caplog.records]}'
@@ -3349,7 +4391,7 @@ class TestRunApplyStoreMutationPreflight:
         the store" into "the backlog is within budget". Pin that the refusal
         wins: exit 2, never the predicate's 0.
         """
-        self._deny(monkeypatch)
+        deny(_mod, monkeypatch)
         memory_service = self._service()
         monkeypatch.setattr(
             sys, 'argv',
@@ -3372,7 +4414,9 @@ class TestRunApplyStoreMutationPreflight:
             exit_code = _mod.main()
 
         assert exit_code == 2, 'a refused --apply must never satisfy the --check gate'
-        assert self._fail_closed_records(caplog), (
+        # ``main``'s own generic "fatal error during sweep" ERROR shares this
+        # logger AND this level, so only the markers can tell the two apart.
+        assert fail_closed_records(caplog, 'sweep_orphan_flag_markers'), (
             'a gate that fails must say WHY it failed -- an exit 2 with no '
             'fail-closed diagnosis is indistinguishable from a crashed sweep; '
             f'got: {[r.getMessage() for r in caplog.records]}'
@@ -3402,9 +4446,9 @@ class TestKnownProjectsCoverageIssue:
 
     Three cases must be told apart:
       (i)   a named root that IS NOT A DIRECTORY (typo, moved/unmounted
-            checkout). ``Path.resolve()`` is non-strict, so the builder
-            ADMITS it under a basename-derived id — the sweep runs a phantom
-            project that enumerates 0, deletes 0 and exits 0;
+            checkout). The builder ADMITS it deliberately, with a WARNING
+            (task 5286, arm (b)), so the sweep runs a phantom project that
+            enumerates 0, deletes 0 and exits 0;
       (ii)  a named root whose resolved path is ABSENT from the map, i.e. its
             project_id was claimed first by another root (first-wins). That
             checkout is never swept;
@@ -3462,9 +4506,9 @@ class TestKnownProjectsCoverageIssue:
     ):
         """Case (i), and the reason id-membership was the wrong test.
 
-        A nonexistent root is NOT skipped by build_known_projects_map --
-        ``Path(raw).resolve()`` is non-strict, so the root is admitted under a
-        basename-derived project_id. Its id IS therefore in the map, an
+        A nonexistent root is NOT skipped by build_known_projects_map -- the
+        builder admits it deliberately, with a WARNING (task 5286, arm (b)),
+        under a basename-derived project_id. Its id IS therefore in the map, an
         id-membership predicate reports clean, and the wrapper goes on to
         sweep a phantom project that counts 0 and exits 0. Asserted here on
         the REAL map so the dead branch cannot come back.
@@ -3477,7 +4521,7 @@ class TestKnownProjectsCoverageIssue:
 
         assert 'gone_project' in known, (
             f'Premise of this test: the builder ADMITS a nonexistent root '
-            f'(resolve() is non-strict), which is why membership-by-id cannot '
+            f'(task 5286, arm (b)), which is why membership-by-id cannot '
             f'detect it; got {known!r}'
         )
         assert issue is not None, (

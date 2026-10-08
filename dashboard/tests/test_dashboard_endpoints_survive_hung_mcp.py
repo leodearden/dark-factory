@@ -7,6 +7,11 @@ fused-memory seam, and ``/tasks`` — which reaches the SAME ``fetch_tasks``
 through ``collect_tasks_with_counts`` — survived, because it alone wrapped
 the call in ``asyncio.wait_for``. That asymmetry is what this file pins.
 
+``/orchestrators`` has since been taken out of the population altogether
+(task 5587): it reads no task tree, so it has no seam to hang behind. It is
+still swept for a 200 — the route list is derived and nothing can opt out of
+it — but it is no longer one of the modules the hang must be reached in.
+
 Why the per-request timeout was never enough: ``fetch_tasks``' *timeout* is
 threaded into ``mcp_tool_call`` and thence ``client.post``, so it bounds
 connect/read/write and pool acquisition ONLY. The incident's hang was inside
@@ -21,31 +26,53 @@ Three properties keep this probe from quietly stopping checking:
 * the hang stub is ``await asyncio.Event().wait()`` on an event nothing ever
   sets — it has no duration at all, so no budget value can make pre-fix code
   pass, unlike a slow-sleep stub;
-* a NON-VACUITY assertion requires that all three formerly-wedging modules
-  actually reached the hang, so the sweep cannot pass by never exercising one.
+* a NON-VACUITY assertion requires that the hang was actually reached for
+  each formerly-wedging endpoint that still reads tasks, so the sweep cannot
+  pass by never exercising one.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import sqlite3
+from contextlib import closing
+from datetime import UTC, datetime, timedelta
 
 import pytest
+from escalation.models import Escalation
 
 # Budgets are shrunk to this so the whole sweep is fast. The stub never
 # returns, so every bounded call site pays exactly this and then degrades.
 _TINY_BUDGET = 0.05
 
 _TARGET_MODULES = {
-    'dashboard.app',
-    'dashboard.data.orchestrator',
-    'dashboard.data.merge_queue',
+    'dashboard.data.task_lookup',
 }
+"""The modules whose hang this probe must actually REACH, or it proves nothing.
+
+``dashboard.data.task_lookup`` stands in for both ``dashboard.data.merge_queue``
+(task 5595) and ``dashboard.api.escalations`` (task 5596). Neither endpoint
+fetches a task tree any more: each asks ``task_lookup.lookup_tasks`` for the
+few ids its rows name, and that module's ``fetch_task`` binding is the seam
+both now wait on. The hang must be reached THERE, for EACH endpoint's root —
+the sweep test checks the escalation probe's root separately — or that
+endpoint's bound is unexercised.
+
+``dashboard.data.orchestrator`` was the third, and is deliberately no longer
+here: task 5587 removed ``discover_orchestrators``' task fetch outright, so it
+holds no ``fetch_tasks`` binding to hang. That is the strongest available
+resolution of its share of the 19.8 h incident — a call that does not exist
+cannot wedge — and not a shrinking of the sweep. ``/api/v2/dashboard/orchestrators``
+is still requested below, because the route list is derived from ``app.routes``
+and cannot be opted out of; it must still answer 200 while the seam hangs.
+"""
 
 
 def _dashboard_get_paths() -> list[str]:
     """Every LITERAL GET route under /api/v2/dashboard/, read off the live app.
 
-    Templated routes (``/api/v2/dashboard/task/{task_id}``) are excluded: this
+    Templated routes (``/api/v2/dashboard/task/{project}/T-{task_id}``) are excluded: this
     sweep requests each path verbatim, so a templated one would be fetched as
     the literal string ``.../{task_id}`` and answer 404/422 — a false failure
     about path construction, reported under a message about hung dependencies,
@@ -73,64 +100,87 @@ def _all_dashboard_get_paths() -> list[str]:
 
 
 @pytest.fixture()
-def hung_mcp(monkeypatch, tmp_path):
-    """Hang every fetch_tasks binding; shrink every budget; clear every cache.
+def hung_mcp(monkeypatch, tmp_path, client):
+    """Hang every task-read binding; shrink every budget; clear every cache.
 
     Returns the ``reached`` list of ``(module_name, project_root)`` pairs the
     stub recorded, so a caller can assert the hang was genuinely exercised.
+    Requests ``client`` so the configured root it seeds is the one the running
+    app reads.
     """
-    from dashboard.app import _analytics_cache_clear, _task_cards_cache_clear
-    from dashboard.data import active_tasks, merge_queue, orchestrator, tasks
+    import dashboard.api.escalations as _esc
+    from dashboard.data import (
+        active_tasks,
+        escalation_corpus,
+        orchestrator,
+        task_lookup,
+        task_snapshot,
+    )
+    from dashboard.data.escalation_corpus import QueueKind, QueueRef
 
     reached: list[tuple[str, str]] = []
 
     def _make_stub(module_name: str):
-        async def _hang(client, config, project_root):
+        # **kwargs absorbs each binding's own narrowing arguments — the
+        # snapshot unit threads statuses/timeout/cached, the others do not —
+        # so one stub can stand in for every call shape without being laxer
+        # about the thing under test, which is that the call HANGS.
+        async def _hang(client, config, project_root, *_args, **_kwargs):
             reached.append((module_name, str(project_root)))
             await asyncio.Event().wait()  # nothing ever sets it
 
         return _hang
 
     # Patch the binding in EVERY module that imported the name by value —
-    # patching dashboard.data.tasks.fetch_tasks alone would miss all four.
+    # patching dashboard.data.tasks.fetch_tasks alone would miss all of them.
+    # ``dashboard.app`` still binds it for the /healthz probe, which this
+    # sweep does not reach. ``dashboard.api.escalations`` binds no task read
+    # at all (task 5596): its owner probe reads the snapshot unit's active
+    # rows and its cards go through task_lookup. ``dashboard.data.orchestrator``
+    # is absent because it binds the name no longer — see _TARGET_MODULES.
     for module_name in (
         'dashboard.app',
-        'dashboard.data.orchestrator',
-        'dashboard.data.merge_queue',
-        'dashboard.data.active_tasks',
+        # The Tasks tab's binding travelled to the snapshot unit with the read
+        # itself (task 5587); active_tasks holds no fetch name at all now.
+        'dashboard.data.task_snapshot',
     ):
         monkeypatch.setattr(
             f'{module_name}.fetch_tasks', _make_stub(module_name),
         )
-
-    import dashboard.app as _app
-
-    monkeypatch.setattr(_app, '_TASK_CARDS_BUDGET', _TINY_BUDGET)
-    monkeypatch.setattr(merge_queue, '_TASK_TITLES_BUDGET', _TINY_BUDGET)
+    # /merge-queue and /escalations read their rows' tasks one id at a time
+    # (tasks 5595, 5596).
     monkeypatch.setattr(
-        orchestrator, '_ORCHESTRATORS_PER_ROOT_BUDGET', _TINY_BUDGET,
+        'dashboard.data.task_lookup.fetch_task',
+        _make_stub('dashboard.data.task_lookup'),
     )
-    monkeypatch.setattr(
-        orchestrator, '_ORCHESTRATORS_TOTAL_BUDGET', _TINY_BUDGET,
-    )
+
+    # The lookup's ONE deadline encloses its snapshot read before any
+    # fetch_task miss, and that read pays the shrunk PER_CALL_TIMEOUT below
+    # against the same hang. At _TINY_BUDGET the deadline would expire inside
+    # the snapshot read and the fetch_task seam would never be reached.
+    monkeypatch.setattr(task_lookup, 'LOOKUP_BUDGET_SECONDS', 4 * _TINY_BUDGET)
     # The Tasks tab is already compliant; shrink it too so it does not
-    # dominate the sweep's wall time. _TASKS_PER_CALL_TIMEOUT is shrunk for
+    # dominate the sweep's wall time. PER_CALL_TIMEOUT is shrunk for
     # the same reason and is NOT optional: it was widened to 4.4 s for real
     # 5 000-task trees (task 4884), and against a stub that never returns the
     # sweep would otherwise pay it per call per root.
-    monkeypatch.setattr(active_tasks, '_TASKS_PER_CALL_TIMEOUT', _TINY_BUDGET)
+    monkeypatch.setattr(task_snapshot, 'PER_CALL_TIMEOUT', _TINY_BUDGET)
     monkeypatch.setattr(active_tasks, '_TASKS_PER_PROJECT_BUDGET', _TINY_BUDGET)
     monkeypatch.setattr(active_tasks, '_TASKS_TOTAL_BUDGET', _TINY_BUDGET)
 
-    # A warm entry would be served without ever reaching the hang.
-    tasks._fetch_tasks_cache_clear()
-    tasks._fetch_statuses_cache_clear()
-    merge_queue._task_titles_cache_clear()
-    _task_cards_cache_clear()
-    _analytics_cache_clear()
+    def _clear_caches() -> None:
+        task_snapshot._snapshot_cache_clear()
+        task_lookup._lookup_cache_clear()
+        escalation_corpus._corpus_cache_clear()
+        _esc._analytics_memo_clear()
 
-    # Force the preconditions so the three target endpoints actually REACH
-    # their call site — otherwise the probe would pass vacuously.
+    # A warm entry would be served without ever reaching the hang.
+    _clear_caches()
+
+    # Force the preconditions so the target endpoints actually REACH their
+    # call site — otherwise the probe would pass vacuously. The orchestrator
+    # stub stays even though that endpoint no longer fetches: it is what makes
+    # the sweep exercise discovery's grouping path rather than its empty one.
     proj = tmp_path / 'probe_root'
     (proj / '.taskmaster').mkdir(parents=True)
     monkeypatch.setattr(
@@ -141,28 +191,72 @@ def hung_mcp(monkeypatch, tmp_path):
             'running': True, 'started': 'Aug27',
         }],
     )
+    # /escalations looks up only the task ids its rows name, so its one queue
+    # holds a real record naming one.
+    escalation_dir = proj / 'data' / 'escalations'
+    escalation_dir.mkdir(parents=True)
+    (escalation_dir / 'esc-4788-1.json').write_text(json.dumps(Escalation(
+        id='esc-4788-1', task_id='4788', agent_role='implementer',
+        severity='blocking', category='infra_issue', summary='hung seam probe',
+    ).to_dict()))
     monkeypatch.setattr(
-        _app,
-        'build_escalation_queues',
-        lambda config: {
-            'subsections': [
-                {'id': str(proj), 'kind': 'orchestrator', 'label': 'probe',
-                 'items': []},
-            ],
-        },
+        _esc,
+        'corpus_queues',
+        lambda config: (QueueRef(
+            id=str(proj), label='probe', kind=QueueKind.ORCHESTRATOR,
+            directory=escalation_dir, runs_db=proj / 'data' / 'orchestrator' / 'runs.db',
+        ),),
     )
+    # /merge-queue looks up only the ids its rows name, so it needs a row.
+    seeded = _seed_merge_attempt(client.app.state.config.project_root)
 
     yield reached
 
+    seeded()
+
     # Leave no hang-stubbed entry behind for the next test in the session.
-    tasks._fetch_tasks_cache_clear()
-    tasks._fetch_statuses_cache_clear()
-    merge_queue._task_titles_cache_clear()
-    _task_cards_cache_clear()
-    _analytics_cache_clear()
+    _clear_caches()
 
 
-def test_every_dashboard_endpoint_survives_a_hung_fetch_tasks(client, hung_mcp):
+def _seed_merge_attempt(project_root):
+    """Put one titled-by-lookup merge_attempt in *project_root*'s runs.db.
+
+    The root is the session-scoped one every ``client`` shares, so the return
+    value undoes exactly what this wrote: the file if it created it, else the
+    one row.
+    """
+    runs_db = project_root / 'data' / 'orchestrator' / 'runs.db'
+    created = not runs_db.exists()
+    runs_db.parent.mkdir(parents=True, exist_ok=True)
+    attempted_at = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    with closing(sqlite3.connect(runs_db)) as conn:
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS events ('
+            ' id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL,'
+            ' run_id TEXT NOT NULL, task_id TEXT, event_type TEXT NOT NULL,'
+            " phase TEXT, role TEXT, data TEXT DEFAULT '{}', cost_usd REAL,"
+            ' duration_ms INTEGER)'
+        )
+        row_id = conn.execute(
+            'INSERT INTO events (timestamp, run_id, task_id, event_type, phase,'
+            ' data, duration_ms) VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (attempted_at, 'run-4788', '4788', 'merge_attempt', 'merge',
+             json.dumps({'outcome': 'done', 'branch': 'task/4788'}), 1200),
+        ).lastrowid
+        conn.commit()
+
+    def _undo() -> None:
+        if created:
+            runs_db.unlink(missing_ok=True)
+            return
+        with closing(sqlite3.connect(runs_db)) as conn:
+            conn.execute('DELETE FROM events WHERE id = ?', (row_id,))
+            conn.commit()
+
+    return _undo
+
+
+def test_every_dashboard_endpoint_survives_a_hung_fetch_tasks(client, hung_mcp, tmp_path):
     """Every GET endpoint answers 200 while the fetch_tasks seam hangs."""
     paths = _dashboard_get_paths()
 
@@ -187,14 +281,53 @@ def test_every_dashboard_endpoint_survives_a_hung_fetch_tasks(client, hung_mcp):
             'never wedge or 500 it'
         )
 
-    # NON-VACUITY: the probe must actually have exercised a hang in each of
-    # the three modules that wedged, or it proves nothing at all.
+    # NON-VACUITY: the probe must actually have exercised the hang for each
+    # endpoint that still reads tasks, or it proves nothing at all.
     modules_reached = {module for module, _ in hung_mcp}
     assert modules_reached >= _TARGET_MODULES, (
         f'the hang was never reached in {sorted(_TARGET_MODULES - modules_reached)} '
         f'(reached: {sorted(modules_reached)}) — the sweep passed without '
         'exercising the defect, so it proves nothing. Check the endpoint '
         'preconditions in the hung_mcp fixture.'
+    )
+    escalation_probe = ('dashboard.data.task_lookup', str(tmp_path / 'probe_root'))
+    assert escalation_probe in hung_mcp, (
+        f'/escalations never reached the task_lookup hang for its probe root '
+        f'(reached: {sorted(set(hung_mcp))}) — its card lookup went unexercised'
+    )
+
+
+def test_task_prose_route_survives_a_hung_fetch_task_prose(client, monkeypatch):
+    """The templated prose route, probed with REAL parameter values.
+
+    The sweep above cannot request ``/task/{project}/T-{task_id}`` verbatim, so
+    this binds the configured root's own label and a real id, hangs the route
+    module's ``fetch_task_prose`` binding, and requires a bounded answer.
+    """
+    import dashboard.api.task_prose as task_prose
+
+    reached: list[tuple[str, int]] = []
+
+    async def _hang(http_client, config, project_root, task_id):
+        reached.append((str(project_root), task_id))
+        await asyncio.Event().wait()  # nothing ever sets it
+
+    monkeypatch.setattr(task_prose, 'fetch_task_prose', _hang)
+    monkeypatch.setattr(task_prose, '_TASK_PROSE_BUDGET', _TINY_BUDGET)
+    root = client.app.state.config.project_root
+
+    resp = client.get(f'/api/v2/dashboard/task/{root.name}/T-1')
+
+    assert resp.status_code == 504, (
+        f'the prose route returned {resp.status_code} while fetch_task_prose '
+        'was hung — a hung dependency must degrade this endpoint, never wedge '
+        'or 500 it'
+    )
+    # NON-VACUITY: a 504 that never reached the seam proves nothing.
+    assert reached == [(str(root), 1)], (
+        f'the hang was reached as {reached}, not exactly once with the '
+        f'configured root {root} and task id 1 — the probe passed without '
+        'exercising the seam'
     )
 
 
@@ -205,15 +338,17 @@ def test_templated_dashboard_routes_are_not_silently_unswept():
     cannot request them verbatim. That filter is the right call — but a silent
     filter is how coverage rots, so this test fails the moment one appears and
     says what to do about it. Extend the expected set below ONLY together with
-    a probe that exercises the new route with real parameter values under the
-    same ``hung_mcp`` fixture.
+    a dedicated probe that exercises the new route with real parameter values
+    against a hung dependency, as
+    :func:`test_task_prose_route_survives_a_hung_fetch_task_prose` does.
     """
     templated = sorted(p for p in _all_dashboard_get_paths() if '{' in p)
 
-    assert templated == [], (
-        f'templated GET route(s) {templated} exist under /api/v2/dashboard/ '
-        'and are NOT covered by the hung-MCP sweep, which requests every path '
-        'verbatim and would fetch the literal brace string. Add a dedicated '
-        'probe that binds real parameter values (reusing the hung_mcp '
-        'fixture), then list the route here.'
+    assert templated == ['/api/v2/dashboard/task/{project}/T-{task_id}'], (
+        f'templated GET route(s) {templated} exist under /api/v2/dashboard/; '
+        'the only one with a dedicated hung-dependency probe is the task-prose '
+        'route (test_task_prose_route_survives_a_hung_fetch_task_prose). The '
+        'sweep requests every path verbatim and would fetch the literal brace '
+        'string, so a new templated route needs its own probe that binds real '
+        'parameter values, listed here together with it.'
     )

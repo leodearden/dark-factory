@@ -99,7 +99,10 @@ signal is `e.source_description`, which the writers shape as
 `add_memory:<category>` (and `replay_from_mem0:<category>` on the Mem0 replay
 path). A caller-supplied `add_episode` description buckets under a single
 explicit `add_episode` kind rather than fanning the axis into one stratum per
-caller string.
+caller string. The annotations `GraphitiBackend.add_episode` prepends,
+`[unverified_claim] ` and `[temporal:<ctx>] `, are stripped before
+classification, so a tagged write stays in its category's stratum; any other
+leading text is a caller string and buckets as `add_episode`.
 
 Allocation is **min-1 floor + largest-remainder proportional, capped at cell
 size**. The floor is load-bearing, not tidiness: the
@@ -115,25 +118,26 @@ canonically by uuid (so the result does not depend on the order FalkorDB
 happens to return rows in, which is not guaranteed stable), permute under
 `Random(f'{seed}:{month}:{kind}')`, take the first `allocate()[cell]`.
 
-## N = 200 is provisional
+## N = 200 is final (ruled by ζ)
 
-200 is δ's choice: the midpoint of the PRD's 150–300 band, checked against the
-measured census so that all 16 non-empty cells receive at least one seat.
-**PRD Open Q4 defers the final corpus size to ζ**, to be settled from measured
-control variance and wall-clock.
+200 was δ's choice: the midpoint of the PRD's 150–300 band, checked against the
+measured census so that all 16 non-empty cells receive at least one seat. PRD
+Open Q4 deferred the final corpus size to ζ, and **ζ kept N = 200** after
+measuring control variance and wall-clock on this exact manifest. Every LLM
+gated margin derived from the two incumbent control replays is far inside the
+0.10 adequacy bound, and wall-clock does not constrain N. The ruling and its
+measured basis are in `plans/local-memory-models-eval-preregistration.md`
+§"Corpus N".
 
-Re-tuning is cheap by construction. Because each cell's take is a *prefix* of
-that cell's permutation, growing N only ever **appends** to a cell — so ζ can
-re-run the builder at a different N without invalidating replays ε has already
-completed at the smaller one. Note this is a **per-cell** guarantee, not a
-global one: largest-remainder allocation can move a single seat between cells
-as N changes, so a cell whose allocation *shrank* is the one case where an
-earlier pick is dropped.
+The controls, and every margin pre-registered from them, are bound to this
+manifest's `corpus_sha`. Re-running the builder at a different `--n` writes a
+different manifest with a different `corpus_sha`, which invalidates the
+controls. That would be a new pre-registration, not a re-tune.
 
-```bash
-# what ζ runs to re-tune
-uv run python fused-memory/scripts/local_memory_models_eval/build_corpus.py --n 300
-```
+The builder's prefix property still holds. Each cell's take is a prefix of that
+cell's seeded permutation, so growing N only ever **appends** to a cell. This
+is a **per-cell** guarantee, not a global one: largest-remainder allocation can
+move a single seat between cells as N changes.
 
 ## The binding hazard: no conditioning on the incumbent's outcome
 
@@ -220,3 +224,81 @@ regex form, never literally, so it does not satisfy the check it documents —
 the same trick the capability-manifest pair uses on itself. If you add a file
 here that carries the literal, update the expected count above in the same
 commit, or this self-check quietly stops meaning anything.
+
+# Arm-runner harness (task ε)
+
+`harness.py` is thin CLI wiring over `fused_memory.arm_harness`; read the
+module named in each row for behaviour. Run it from `fused-memory/` with
+`uv run python scripts/local_memory_models_eval/harness.py <subcommand> …`.
+Live endpoints come from `FusedMemoryConfig()` (honours `CONFIG_PATH`).
+
+| Subcommand | Invoked by | What it does |
+|---|---|---|
+| `run --arm-spec S --manifest M --out-root D --concurrency N --index-configuration {with-indices,embedding-only} [--reference-outcomes F] [--repo-root R] [--limit N]` | ζ, θ | Replays this corpus through one LLM arm (`run.py`) |
+| `smoke --arm-spec S` | η | One schema-constrained request plus the validator's negative control (`checks.py`) |
+| `index-check --arm-spec S --expect {with-indices,embedding-only}` | ι | Whether the scratch graph answers fulltext as claimed (`checks.py`) |
+| `integrity --reference G --candidate G` | ι | Re-embed integrity verdict over two scratch topologies (`topology.py`) |
+| `parity-check --run-a A --run-b B` | ζ | Client-class parity deltas (a − b) into `A/parity/<arm b>/metrics/` (`comparison.py`) |
+| `control-check --run A --run B [--run …] [--reference-outcomes F]` | ζ | Symmetry, one code sha, token/cost and reference checks (`checks.py`) |
+| `preregister --run-a A --run-b B --out F` | ζ | The incumbent control pair's margins, latency envelope and calls-per-episode profile, written to a fresh `F` (an existing `F` is refused, never overwritten); B must have run with `--reference-outcomes` A, and its graph-sameness is recomputed from both runs' outcomes (`preregistration.py`, `margins.py`) |
+| `topology --graph G` | ζ, ι | A scratch graph's node and edge counts and topology hash: ζ freezes the reference graph, ι re-runs it to verify the graph is unchanged (`topology.py`) |
+| `teardown --arm-spec S [--collection]` | ι | Deletes the arm's scratch graph and, with `--collection`, its Qdrant replica (`teardown.py`) |
+
+`run` refuses before touching any store unless the spec's `code_sha` is the
+clean HEAD of `--repo-root`, a candidate's `preregistration_sha` carries the
+preregistration doc, and the manifest's bytes hash to the spec's `corpus_sha`.
+It then requires `build_corpus.verify_manifest` to report `ok` on the fetched
+population.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | ok |
+| 1 | the run could not complete (store unreachable, index build failed, the index probe could not remove its seeded node — the error names it — or a traceback) |
+| 2 | refused: invalid spec or input, a pre-run instrument check failed, a run dir is not fresh or not complete, a control pair yields no valid pre-registration |
+| 3 | an instrument check failed (post-run, smoke, index-check, integrity, control-check) |
+| 4 | INV-4 abort: consecutive episode failures stopped the run |
+| 5 | scratch guard: a non-`evalmem_` name reached a guarded checkpoint |
+| 6 | corpus integrity: `corpus_sha` mismatch, or δ's verdict is not ok |
+
+argparse usage errors also exit 2.
+
+## Run directory
+
+`<out-root>/<arm_id>/<STAMP>/`, where `STAMP` is `$MEMORY_EVAL_RUN_STAMP` or
+the current UTC time. A run refuses a stamp directory that already holds
+artifacts.
+
+| Path | Content |
+|---|---|
+| `run.json` | The `RunManifest`, written last: its absence marks an interrupted run |
+| `outcomes.jsonl` | One `EpisodeOutcome` per attempted episode |
+| `metrics/` | One `MetricsRecord` per metric |
+| `abort.json` | Present only after an INV-4 abort |
+| `graph_sameness_details.json` | Present only with `--reference-outcomes` |
+| `journal/` | The run-local write journal; read it with `OPERATOR_TELEMETRY_QUERY` |
+
+## Scratch names
+
+Every graph or collection the harness writes, indexes, reads for topology or
+deletes must pass `fused_memory/arm_harness/scratch_guard.py`; that module is
+the rule's one home. Protected graphs are unreachable by construction.
+
+## Live check
+
+```bash
+uv run pytest -m integration tests/arm_harness
+```
+
+It replays two episodes onto `evalmem_test_` graphs on the FalkorDB at
+`FALKOR_HOST`/`FALKOR_PORT` against a local mock endpoint, and asserts that no
+protected graph or index changed.
+
+## Known limitations
+
+- `GraphitiBackend.search` returns `[]` on timeout, so a timed-out retrieval
+  probe reads as a miss. That is the production behaviour being measured.
+- The harness never sets graphiti's `SEMAPHORE_LIMIT`, whose env name collides
+  with the queue knob. `run.json` records the effective value, and the
+  symmetry check requires it to be equal across arms.

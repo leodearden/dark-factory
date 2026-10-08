@@ -1,498 +1,99 @@
-"""Tests for project-scoping the dispatched-agent briefing ``# Context`` block.
+"""End-to-end tests for the dispatched-agent briefing ``# Context`` block.
 
-Task 3609 (census R5): a hardcoded ``search(project_id=self.project_id)`` call
-in ``BriefingAssembler._get_memory_context`` still surfaces cross-project
-memory facts (metadata carries no project tag on the dominant, Graphiti-backed
-leak channel) into a dispatched agent's prompt. This file covers the pure
-``filter_foreign_project_results`` helper — the metadata-tag filter half of
-the fix — plus (once added) the assembly-level end-to-end behaviour and the
+Task 3609 (census R5): memory recalled for a dispatch can carry facts from
+another project. This file covers the assembled block: cross-project
+filtering, the query table, rendering, degradation, the outage streak and the
 standing provenance caveat that covers the untagged leak channel the filter
-cannot reach on its own.
+cannot reach on its own. The pure parse, filter, render and compose functions
+are tested directly in ``test_memory_recall.py``.
 
-See ``orchestrator/src/orchestrator/agents/briefing.py``:
-``filter_foreign_project_results`` / ``_canonical_project`` /
-``_scoped_search`` / ``_get_memory_context``.
+Every test drives a public prompt builder and answers the memory service at
+its one transport seam, :func:`_briefing_helpers.memory_transport`, so the
+real recall pipeline runs.
 """
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import logging
-from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
+import httpx
 import pytest
-
-from orchestrator.agents.briefing import (
-    FOREIGN_PROJECT_TAG_KEYS,
-    MEMORY_CONTEXT_CAVEAT,
-    BriefingAssembler,
-    filter_foreign_project_results,
+from _briefing_helpers import (
+    _edge,
+    _entity_envelope,
+    _grouped_parent,
+    _mcp_search_envelope,
+    _node,
+    _result,
+    _search_arguments,
+    briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
+    memory_transport,
+    recorded_search_envelope,
+    recorded_search_text,
 )
-from orchestrator.config import GitConfig, OrchestratorConfig
+from shared.briefing_queries import TASK_SEMANTIC, BriefingScope, queries_for
 
+from orchestrator.agents.briefing import BriefingAssembler
+from orchestrator.agents.memory_recall import (
+    ENTITY_CHANNEL_SUFFIX,
+    MEMORY_CONTEXT_CAVEAT,
+    MEMORY_DEGRADED_STORES_NOTICE,
+    MEMORY_EMPTY_NOTICE,
+    MEMORY_OUTAGE_NOTICE,
+    MEMORY_OUTAGE_STREAK_THRESHOLD,
+    MEMORY_SECTION_FAILURE_NOTICE,
+    MemoryFailure,
+)
 
-@pytest.fixture
-def briefing(tmp_path: Path) -> BriefingAssembler:
-    config = OrchestratorConfig(
-        project_root=tmp_path,
-        git=GitConfig(
-            main_branch='main',
-            branch_prefix='task/',
-            remote='origin',
-            worktree_dir='.worktrees',
-        ),
-    )
-    return BriefingAssembler(config)
+_PLAN = {
+    'task_id': '3609',
+    'title': 'Project-scope the dispatched-agent briefing context block',
+    'files': ['orchestrator/src/orchestrator/agents/briefing.py'],
+    'steps': [],
+}
+"""A plan standing in for a real dispatch: an id, a title and declared files.
 
+The query table asks what a dispatch is ABOUT, so a scope carrying only an id
+would fire the single generic conventions query instead of the two-query
+task-scoped set.
+"""
 
-def _result(id_: str, content: str, metadata: dict | None = None, source_store: str = 'graphiti') -> dict:
-    """Build a dict matching the wire shape of ``fused_memory.models.memory.MemoryResult``.
+_SCOPE = BriefingScope.from_plan(_PLAN)
 
-    Mirrors the real result schema (id/content/category/source_store/
-    relevance_score/provenance/temporal/entities/metadata/created_at) so the
-    filter is exercised against the actual payload shape, not an invented one.
-    """
-    return {
-        'id': id_,
-        'content': content,
-        'category': None,
-        'source_store': source_store,
-        'relevance_score': 0.9,
-        'provenance': [],
-        'temporal': None,
-        'entities': [],
-        'metadata': {} if metadata is None else metadata,
-        'created_at': None,
-    }
 
+async def _prompt(briefing: BriefingAssembler) -> str:
+    return await briefing.build_implementer_prompt(_PLAN)
 
-class TestFilterForeignProjectResults:
-    """Unit coverage for the pure metadata-tag filter."""
 
-    def test_foreign_tagged_result_is_dropped(self):
-        payload = json.dumps({
-            'results': [_result('1', 'Foreign fact about reify.', metadata={'project_id': 'reify'})],
-        })
+def _context_block(prompt: str) -> str:
+    """The ``# Context`` block, which the implementer prompt puts ahead of its identity."""
+    return prompt.split('\n\n## Agent Identity', 1)[0]
 
-        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
 
-        assert 'Foreign fact about reify.' not in text
-        assert dropped == 1
+async def _recall(briefing: BriefingAssembler, transport: AsyncMock) -> str:
+    """The ``# Context`` block of one implementer dispatch answered by *transport*."""
+    with memory_transport(transport):
+        return _context_block(await _prompt(briefing))
 
-    def test_own_project_tagged_result_is_kept(self):
-        payload = json.dumps({
-            'results': [_result('1', 'Own project fact.', metadata={'project_id': 'dark_factory'})],
-        })
 
-        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
+def _answering(reply: dict) -> AsyncMock:
+    return AsyncMock(return_value=reply)
 
-        assert 'Own project fact.' in text
-        assert dropped == 0
 
-    def test_untagged_result_is_kept_and_not_counted(self):
-        payload = json.dumps({
-            'results': [_result('1', 'Untagged fact.', metadata={})],
-        })
-
-        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert 'Untagged fact.' in text
-        assert dropped == 0
-
-    def test_all_foreign_returns_empty_text_and_full_drop_count(self):
-        payload = json.dumps({
-            'results': [
-                _result('1', 'Foreign one.', metadata={'project_id': 'reify'}),
-                _result('2', 'Foreign two.', metadata={'project_id': 'other_proj'}),
-            ],
-        })
-
-        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert text == ''
-        assert dropped == 2
-
-    def test_sibling_top_level_keys_survive(self):
-        payload = json.dumps({
-            'results': [_result('1', 'Own fact.', metadata={'project_id': 'dark_factory'})],
-            'degraded': True,
-            'failed_stores': ['mem0'],
-        })
-
-        text, _dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-        parsed = json.loads(text)
-
-        assert parsed['degraded'] is True
-        assert parsed['failed_stores'] == ['mem0']
-
-    def test_kept_results_round_trip_in_original_order(self):
-        payload = json.dumps({
-            'results': [
-                _result('1', 'First own fact.', metadata={'project_id': 'dark_factory'}),
-                _result('2', 'Foreign fact.', metadata={'project_id': 'reify'}),
-                _result('3', 'Second own fact.', metadata={}),
-            ],
-        })
-
-        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-        parsed = json.loads(text)
-
-        assert [r['id'] for r in parsed['results']] == ['1', '3']
-        assert dropped == 1
-
-    def test_no_op_when_nothing_dropped_returns_original_text_unchanged(self):
-        """The common case (nothing filtered) must not pay for a re-serialise.
-
-        Asserted via identity (``is``), not just equality: a rewrite that
-        stopped short-circuiting but still round-tripped equal-looking JSON
-        would not be caught by an equality check alone.
-        """
-        payload = json.dumps({
-            'results': [_result('1', 'Own — café fact.', metadata={'project_id': 'dark_factory'})],
-        })
-
-        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert dropped == 0
-        assert text is payload
-
-    def test_non_ascii_content_survives_round_trip_without_escaping(self):
-        """When something IS dropped, the re-serialise must not mangle unicode.
-
-        ``json.dumps`` defaults to ``ensure_ascii=True``, which would turn a
-        literal em dash / accented character into a ``\\uXXXX`` escape —
-        dark-factory memory content is dense with both.
-        """
-        payload = json.dumps({
-            'results': [
-                _result('1', 'Own — café fact.', metadata={'project_id': 'dark_factory'}),
-                _result('2', 'Foreign fact.', metadata={'project_id': 'reify'}),
-            ],
-        })
-
-        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert dropped == 1
-        assert 'Own — café fact.' in text
-        assert '\\u2014' not in text
-        assert '\\u00e9' not in text
-
-    def test_dropped_entry_is_logged_at_debug_with_id_key_and_value(self, caplog):
-        """A false-positive drop must be diagnosable from an existing run's logs."""
-        payload = json.dumps({
-            'results': [_result('42', 'Foreign fact.', metadata={'project_id': 'reify'})],
-        })
-
-        with caplog.at_level(logging.DEBUG):
-            filter_foreign_project_results(payload, 'dark_factory')
-
-        debug_records = [r for r in caplog.records if r.levelno == logging.DEBUG]
-        assert any(
-            '42' in r.getMessage() and 'project_id' in r.getMessage() and 'reify' in r.getMessage()
-            for r in debug_records
-        )
-
-
-class TestFilterFailsOpen:
-    """The filter must never destroy context on a malformed payload.
-
-    It fails OPEN — returns the original text unchanged and drops nothing —
-    and logs loudly (WARNING) rather than silently blanking the # Context
-    block on a serialisation surprise.
-    """
-
-    def test_non_json_text_fails_open(self, caplog):
-        text_in = 'not json at all'
-
-        with caplog.at_level(logging.WARNING):
-            text, dropped, _nested = filter_foreign_project_results(text_in, 'dark_factory')
-
-        assert (text, dropped) == (text_in, 0)
-        assert any(r.levelno == logging.WARNING for r in caplog.records)
-
-    def test_json_array_not_object_fails_open(self, caplog):
-        text_in = '[1, 2, 3]'
-
-        with caplog.at_level(logging.WARNING):
-            text, dropped, _nested = filter_foreign_project_results(text_in, 'dark_factory')
-
-        assert (text, dropped) == (text_in, 0)
-        assert any(r.levelno == logging.WARNING for r in caplog.records)
-
-    def test_missing_results_key_fails_open(self, caplog):
-        text_in = json.dumps({'degraded': True})
-
-        with caplog.at_level(logging.WARNING):
-            text, dropped, _nested = filter_foreign_project_results(text_in, 'dark_factory')
-
-        assert (text, dropped) == (text_in, 0)
-        assert any(r.levelno == logging.WARNING for r in caplog.records)
-
-    def test_non_list_results_fails_open(self, caplog):
-        text_in = json.dumps({'results': 'oops'})
-
-        with caplog.at_level(logging.WARNING):
-            text, dropped, _nested = filter_foreign_project_results(text_in, 'dark_factory')
-
-        assert (text, dropped) == (text_in, 0)
-        assert any(r.levelno == logging.WARNING for r in caplog.records)
-
-    def test_non_dict_entry_is_kept_without_raising(self):
-        payload = json.dumps({
-            'results': ['stray', _result('1', 'Own fact.', metadata={'project_id': 'dark_factory'})],
-        })
-
-        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-        parsed = json.loads(text)
-
-        assert 'stray' in parsed['results']
-        assert dropped == 0
-
-    def test_non_dict_metadata_is_kept_without_raising(self):
-        entry_none_meta = _result('1', 'Fact with null metadata.')
-        entry_none_meta['metadata'] = None
-        entry_list_meta = _result('2', 'Fact with list metadata.')
-        entry_list_meta['metadata'] = ['oops']
-        payload = json.dumps({'results': [entry_none_meta, entry_list_meta]})
-
-        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert 'Fact with null metadata.' in text
-        assert 'Fact with list metadata.' in text
-        assert dropped == 0
-
-
-class TestForeignTagKeysAndSpelling:
-    """Tag extraction must recognise more than the bare ``project_id`` key,
-    prefer ``src_project`` for CGL-eta rehomed entries, and canonicalise
-    divergent spellings so ``dark-factory`` isn't mistaken for a foreign
-    project.
-    """
-
-    def test_group_id_tag_is_dropped(self):
-        payload = json.dumps({'results': [_result('1', 'Fact.', metadata={'group_id': 'reify'})]})
-
-        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert 'Fact.' not in text
-        assert dropped == 1
-
-    def test_project_tag_is_dropped(self):
-        payload = json.dumps({'results': [_result('1', 'Fact.', metadata={'project': 'reify'})]})
-
-        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert 'Fact.' not in text
-        assert dropped == 1
-
-    def test_cgl_eta_rehome_production_case_is_dropped(self):
-        """The one foreign-tag channel demonstrably present in production data.
-
-        Task-2273 CGL-eta rehomed entries physically live in dst_project's
-        Mem0 collection but reference src_project's task numbers — src_project
-        is the authoritative origin.
-        """
-        payload = json.dumps({'results': [_result(
-            '1',
-            "A park on 'crates/reify-compiler/src' blocks acquire of 'crates/reify-compiler'.",
-            metadata={
-                'kind': 'cgl_eta_cross_target_rehome',
-                'src_project': 'reify',
-                'dst_project': 'dark_factory',
-                'src_entity': 'Task 2310',
-            },
-        )]})
-
-        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert 'crates/reify-compiler' not in text
-        assert dropped == 1
-
-    def test_src_project_wins_over_same_entry_project_id(self):
-        payload = json.dumps({'results': [_result(
-            '1', 'Fact.', metadata={'src_project': 'reify', 'project_id': 'dark_factory'},
-        )]})
-
-        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert 'Fact.' not in text
-        assert dropped == 1
-
-    def test_dst_project_alone_is_never_consulted_and_is_kept(self):
-        payload = json.dumps({'results': [_result(
-            '1', 'Fact.', metadata={'dst_project': 'dark_factory'},
-        )]})
-
-        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert 'Fact.' in text
-        assert dropped == 0
-
-    def test_first_present_key_precedence(self):
-        payload = json.dumps({'results': [_result(
-            '1', 'Fact.', metadata={'project_id': 'dark_factory', 'group_id': 'reify'},
-        )]})
-
-        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert 'Fact.' in text
-        assert dropped == 0
-
-    def test_canonicalisation_of_divergent_spellings(self):
-        for spelling in ('dark-factory', 'Dark_Factory', '  dark_factory  '):
-            payload = json.dumps({'results': [_result('1', 'Fact.', metadata={'project_id': spelling})]})
-
-            text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-
-            assert 'Fact.' in text, f'spelling {spelling!r} should be treated as own-project'
-            assert dropped == 0
-
-        payload = json.dumps({'results': [_result('1', 'Fact.', metadata={'project_id': 'reify'})]})
-        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-        assert 'Fact.' not in text
-        assert dropped == 1
-
-    def test_non_string_tag_is_treated_as_untagged(self):
-        payload = json.dumps({'results': [_result('1', 'Fact.', metadata={'project_id': 123})]})
-
-        text, dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert 'Fact.' in text
-        assert dropped == 0
-
-
-class TestOriginTagKeyDriftGuard:
-    """The two hand-copied tag tuples must stay identical, key for key.
-
-    ``fused_memory.server.grouped_read.ORIGIN_PROJECT_TAG_KEYS`` is what
-    STAMPS an origin tag onto a nested child; :data:`FOREIGN_PROJECT_TAG_KEYS`
-    is what READS it back here. Neither side can import the other — the
-    orchestrator declares no runtime dependency on fused-memory (it appears
-    only in ``orchestrator/pyproject.toml``'s ``[tool.pyright] extraPaths``, a
-    type-checking-only reference) — so the coupling is by COPY, and until this
-    test existed it rested entirely on two prose comments.
-
-    Drift is SILENT and one-directional: a key added to the reader alone is
-    harmless, but a key added to the reader that grouped_read never stamps (or
-    a key dropped from the stamper) makes the nested safeguard stop firing on
-    it, and a safeguard that never fires returns ``nested_dropped == 0`` —
-    indistinguishable from "nothing foreign was found". That is exactly the
-    failure this file otherwise cannot detect.
-
-    The stamper is loaded BY PATH from this worktree, not through the normal
-    import machinery, so the assertion compares THIS branch's stamper against
-    THIS branch's reader. Resolving ``fused_memory`` by import name instead
-    picks up whichever editable install the active virtualenv points at — on
-    a task worktree that is the MAIN checkout, whose ``grouped_read`` predates
-    this branch and carries no ``ORIGIN_PROJECT_TAG_KEYS`` at all. Measured:
-    under ``/home/leo/src/dark-factory/.venv`` the import resolved to
-    ``<main checkout>/fused-memory/.../grouped_read.py`` and this test raised
-    ``AttributeError``, while under the worktree's own ``.venv`` it resolved
-    in-tree and passed — i.e. by-name resolution made the guard's verdict a
-    property of the ENVIRONMENT rather than of the two constants, and would
-    equally report a spurious GREEN once this work lands on main.
-    """
-
-    def test_grouped_read_mirrors_the_briefing_tag_keys(self):
-        # Load the IN-TREE stamper by file location. parents[2] of
-        # ``orchestrator/tests/<this file>`` is the worktree root, mirroring
-        # ``tests/conftest.py``'s documented "local src takes precedence"
-        # intent, which front-loads orchestrator/shared/escalation src but
-        # deliberately not fused-memory/src. Kept inside the test body rather
-        # than at module scope: grouped_read's absolute ``fused_memory.*``
-        # imports drag in graphiti_core, and every xdist worker would pay that
-        # cost merely to COLLECT the other tests in this file.
-        fm_grouped_read = (
-            Path(__file__).resolve().parents[2]
-            / 'fused-memory'
-            / 'src'
-            / 'fused_memory'
-            / 'server'
-            / 'grouped_read.py'
-        )
-        if not fm_grouped_read.exists():
-            pytest.skip(f'fused-memory sibling package not present at {fm_grouped_read}')
-
-        spec = importlib.util.spec_from_file_location('_fm_grouped_read', fm_grouped_read)
-        assert spec is not None and spec.loader is not None
-        grouped_read = importlib.util.module_from_spec(spec)
-        try:
-            # ImportError ONLY. That covers the legitimate gap this guard is
-            # allowed to skip on — fused-memory's own dependencies absent in an
-            # orchestrator-only environment. It must NOT cover AttributeError
-            # on the constant itself: a missing stamper key IS the drift this
-            # test exists to catch, and skipping on it would rebuild the
-            # original defect in a quieter form. The module is never inserted
-            # into ``sys.modules``, so the rest of the session is unaffected.
-            spec.loader.exec_module(grouped_read)
-        except ImportError as exc:
-            pytest.skip(f'fused-memory not importable in this environment: {exc}')
-
-        # Provenance: pins that the tuple just read really is this worktree's.
-        # Without it, an editable install rooted at the MAIN checkout silently
-        # shadows the branch's source — the exact way this test first went red.
-        # Bound to a local first: ``ModuleType.__file__`` is typed
-        # ``str | None`` (a namespace/builtin module has none), so feeding it
-        # straight to ``Path()`` is a type error even though
-        # ``spec_from_file_location`` always populates it. Asserting rather
-        # than defaulting keeps an unpopulated ``__file__`` a FAILURE of the
-        # provenance check, never a silent pass.
-        loaded_file = grouped_read.__file__
-        assert loaded_file is not None, (
-            'the loaded module has no __file__, so its provenance cannot be '
-            'established and the branch-against-branch comparison below would '
-            'be unverifiable.'
-        )
-        assert Path(loaded_file).resolve() == fm_grouped_read.resolve(), (
-            'the stamper was loaded from outside this worktree, so the '
-            'comparison below would not be branch-against-branch. '
-            f'loaded={loaded_file!r} expected={str(fm_grouped_read)!r}'
-        )
-
-        assert grouped_read.ORIGIN_PROJECT_TAG_KEYS == FOREIGN_PROJECT_TAG_KEYS, (
-            'grouped_read.ORIGIN_PROJECT_TAG_KEYS (the STAMPER) and '
-            'briefing.FOREIGN_PROJECT_TAG_KEYS (the READER) are hand-copies of '
-            'one another and have drifted. Tuple equality is asserted, not set '
-            'equality, so PRECEDENCE order is pinned too: src_project must stay '
-            'first, or a CGL-eta rehomed record whose co-present project_id '
-            'names the local project would be certified as native. Add the new '
-            f'key to BOTH sides. stamper={grouped_read.ORIGIN_PROJECT_TAG_KEYS!r} '
-            f'reader={FOREIGN_PROJECT_TAG_KEYS!r}'
-        )
-
-
-def _mcp_search_envelope(results: list[dict]) -> dict:
-    """Build the real ``tools/call`` response envelope ``_mcp_search`` reads.
-
-    Mirrors ``BriefingAssembler._mcp_search`` (briefing.py:1250-1275): FastMCP
-    returns ``{'result': {'content': [{'type': 'text', 'text': ...}]}}`` where
-    ``text`` is the JSON-serialised ``search`` tool payload. Used to patch
-    ``orchestrator.agents.briefing.mcp_call`` directly (unlike every other
-    briefing test, which patches ``_get_memory_context`` itself away to a
-    stub) so the real ``_get_memory_context`` / ``_scoped_search`` /
-    ``filter_foreign_project_results`` pipeline actually runs end-to-end.
-    """
-    return {
-        'result': {
-            'content': [
-                {'type': 'text', 'text': json.dumps({'results': results})},
-            ],
-        },
-    }
+def _raising(exc: BaseException) -> AsyncMock:
+    return AsyncMock(side_effect=exc)
 
 
 @pytest.mark.asyncio
-class TestGetMemoryContextFiltersForeignFacts:
-    """``_get_memory_context`` drops foreign-tagged results end-to-end.
+class TestRecallFiltersForeignFacts:
+    """Foreign-tagged results are dropped end-to-end.
 
-    ``_mcp_search`` is called once per hardcoded query (project overview,
-    conventions, decisions, and — since a ``task_id`` is passed — task
-    context: four calls). The stub answers every call identically, so a
-    single foreign result per query yields a filtered count of 4 in the
-    assembled block, not 1 — the count must reflect all four queries, not
-    just one.
+    One search is fired per spec the query table selects for the scope — for
+    a task-scoped dispatch, the area-conventions and task-semantic pair. The
+    stub answers every call identically, so a single foreign result per query
+    yields a filtered count of 2 in the assembled block, not 1.
     """
 
     async def test_filters_foreign_facts_and_announces_the_drop(
@@ -512,22 +113,17 @@ class TestGetMemoryContextFiltersForeignFacts:
             ),
         ])
         foreign_per_query = 1
-        queries_fired = 4  # overview, conventions, decisions, task-context (task_id given below)
+        queries_fired = 2  # area conventions + task-semantic (the scope declares files)
         expected_dropped = foreign_per_query * queries_fired
 
-        with caplog.at_level(logging.INFO), patch(
-            'orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope),
-        ):
-            context = await briefing._get_memory_context('3609')
+        with caplog.at_level(logging.INFO):
+            context = await _recall(briefing, _answering(envelope))
 
         assert context.splitlines()[0] == '# Context'
         assert 'Own project fact about dark_factory.' in context
         assert 'crates/reify-compiler' not in context
-        assert "A park on 'crates/reify-compiler/src'" not in context
-        # The message names BOTH numbers (slots and queries) rather than
-        # just `expected_dropped` — one distinct foreign fact matching all
-        # four queries must not read as "4 memory results", which would
-        # overstate the leak volume by 4x (task 3609 amendment).
+        # The note names BOTH numbers (slots and queries): one foreign fact
+        # matching every query must not read as N distinct leaked results.
         assert (
             f'{expected_dropped} memory result slot(s) across {queries_fired} queries were '
             'tagged to another project and filtered out'
@@ -539,86 +135,832 @@ class TestGetMemoryContextFiltersForeignFacts:
     async def test_all_foreign_results_surface_drop_count_in_empty_context(
         self, briefing: BriefingAssembler, caplog,
     ):
-        """The most consequential outcome — every recalled result is
-        foreign — must not degrade silently: the drop count is visible in
-        both the rendered message and the INFO log, not just discarded
-        along with the (empty) recalled sections.
-        """
+        """Every recalled result foreign must not degrade silently: the drop
+        count is visible in both the rendered message and the INFO log."""
         envelope = _mcp_search_envelope([
             _result('1', 'Foreign fact.', metadata={'project_id': 'reify'}),
         ])
 
-        with caplog.at_level(logging.INFO), patch(
-            'orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope),
-        ):
-            context = await briefing._get_memory_context('3609')
+        with caplog.at_level(logging.INFO):
+            context = await _recall(briefing, _answering(envelope))
 
         assert context.splitlines()[0] == '# Context'
         assert 'Foreign fact.' not in context
         assert '_No memory context available' in context
-        assert '4 memory result slot(s) across 4 queries' in context
+        assert '2 memory result slot(s) across 2 queries' in context
         assert any(r.levelno == logging.INFO for r in caplog.records)
         assert 'filtered' in caplog.text.lower()
 
     async def test_a_nested_only_drop_is_reported_as_nested_records(
         self, briefing: BriefingAssembler, caplog,
     ):
-        """The rendered note must not call a dropped CHILD a dropped result slot.
+        """A dropped CHILD is not a dropped result slot (task 4008 amendment).
 
-        Task 4008 amendment. Here every top-level result survives and only
-        children inside them are removed, so a note reading "N memory result
-        slot(s) ... filtered out" would tell an operator that N recalled facts
-        vanished when in fact none did. The note is the ONLY signal a human
-        gets that a leak was blocked, so it names the two quantities apart.
+        Every top-level result survives and only children inside them are
+        removed, so the note must not tell an operator that recalled facts
+        vanished.
         """
         envelope = _mcp_search_envelope([_grouped_parent()])
         # One foreign amendment + one foreign pinned body per query, and the
-        # stub answers all four queries identically.
-        expected_nested = 2 * 4
+        # stub answers both queries identically.
+        expected_nested = 2 * 2
 
-        with caplog.at_level(logging.INFO), patch(
-            'orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope),
-        ):
-            context = await briefing._get_memory_context('3609')
+        with caplog.at_level(logging.INFO):
+            context = await _recall(briefing, _answering(envelope))
 
         assert 'FOREIGN AMENDMENT BODY' not in context
         assert 'FOREIGN SIGHTING BODY' not in context
-        assert 'Native canonical.' in context, (
-            'The parent itself was never foreign and must still be recalled'
-        )
+        assert 'Native canonical.' in context
         assert (
-            f'{expected_nested} nested memory record(s) across 4 queries were '
+            f'{expected_nested} nested memory record(s) across 2 queries were '
             'tagged to another project and filtered out'
-        ) in context, (
-            f'a nested-only drop must be reported as nested records, got {context!r}'
-        )
-        assert 'memory result slot(s)' not in context, (
-            'No top-level result was dropped, so the note must not claim a '
-            f'result slot was vacated, got {context!r}'
-        )
+        ) in context
+        assert 'memory result slot(s)' not in context
         assert any(r.levelno == logging.INFO for r in caplog.records)
 
     async def test_mixed_drops_name_both_quantities_separately(
-        self, briefing: BriefingAssembler, caplog,
+        self, briefing: BriefingAssembler,
     ):
-        """A foreign result AND a foreign child are reported as distinct counts."""
         envelope = _mcp_search_envelope([
             _result('f1', 'Foreign fact.', metadata={'project_id': 'reify'}),
             _grouped_parent(),
         ])
 
-        with caplog.at_level(logging.INFO), patch(
-            'orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope),
-        ):
-            context = await briefing._get_memory_context('3609')
+        context = await _recall(briefing, _answering(envelope))
 
         assert 'Foreign fact.' not in context
         assert 'FOREIGN AMENDMENT BODY' not in context
         assert (
-            '4 memory result slot(s) and 8 nested memory record(s) across 4 '
+            '2 memory result slot(s) and 4 nested memory record(s) across 2 '
             'queries were tagged to another project and filtered out'
-        ) in context, (
-            f'both quantities must be named, and named apart, got {context!r}'
+        ) in context
+
+
+@pytest.mark.asyncio
+class TestQueryTableComesFromTheSharedSpecs:
+    """The queries fired are the ones ``shared.briefing_queries`` declares.
+
+    Every assertion reads the expected values back OUT of the shared specs
+    rather than re-spelling them, so a template reworded in ``shared`` cannot
+    leave this file passing against a stale copy.
+    """
+
+    async def test_a_task_scoped_dispatch_fires_exactly_two_searches(
+        self, briefing: BriefingAssembler,
+    ):
+        mcp = _answering(_mcp_search_envelope([_result('1', 'A fact.')]))
+
+        await _recall(briefing, mcp)
+
+        fired = [args['query'] for args in _search_arguments(mcp)]
+        assert fired == [text for _spec, text in queries_for(_SCOPE)]
+
+    async def test_every_search_carries_its_spec_s_scoping(
+        self, briefing: BriefingAssembler,
+    ):
+        mcp = _answering(_mcp_search_envelope([_result('1', 'A fact.')]))
+
+        await _recall(briefing, mcp)
+
+        by_query = {args['query']: args for args in _search_arguments(mcp)}
+        for spec, text in queries_for(_SCOPE):
+            args = by_query[text]
+            assert args['limit'] == spec.limit
+            assert tuple(args.get('stores', ())) == spec.stores
+            assert tuple(args.get('categories', ())) == spec.categories
+            assert args['project_id'] == briefing.project_id
+
+    async def test_the_retired_queries_are_asked_by_nobody(
+        self, briefing: BriefingAssembler,
+    ):
+        """D1 retires these two rather than rewording them, so neither may
+        survive as a query OR as a rendered section heading."""
+        mcp = _answering(_mcp_search_envelope([_result('1', 'A fact.')]))
+
+        context = await _recall(briefing, mcp)
+
+        asked = ' '.join(args['query'] for args in _search_arguments(mcp)).lower()
+        for retired in ('project overview architecture goals', 'recent decisions and rationale'):
+            assert retired not in asked
+        assert '## Project Context' not in context
+        assert '## Recent Decisions' not in context
+
+    async def test_every_search_declares_who_is_asking(
+        self, briefing: BriefingAssembler,
+    ):
+        """D8: the journal records the caller, and the string it records is
+        the same one the prompt's own ``## Agent Identity`` block declares."""
+        mcp = _answering(_mcp_search_envelope([_result('1', 'A fact.')]))
+
+        with memory_transport(mcp):
+            prompt = await _prompt(briefing)
+
+        arguments = _search_arguments(mcp)
+        assert arguments
+        for args in arguments:
+            assert args['caller_agent_id'] == 'claude-task-3609-implementer'
+            assert args['caller_task_id'] == '3609'
+        assert 'claude-task-3609-implementer' in prompt.split('## Agent Identity', 1)[1]
+
+    # A task-less dispatch's query table, caller identity and absent
+    # caller_task_id are pinned by
+    # test_briefing.py::TestPerRoleMemoryTable::
+    # test_the_reviewer_still_builds_without_a_task.
+
+
+@pytest.mark.asyncio
+class TestDistilledRendering:
+    """Recalled memory renders as markdown bullets, never as raw JSON (D5).
+
+    Each surviving result renders as one ``- [category · date · store]
+    content`` bullet, with the content WHOLE.
+    """
+
+    async def _render(self, briefing: BriefingAssembler, results: list[dict]) -> str:
+        return await _recall(briefing, _answering(_mcp_search_envelope(results)))
+
+    async def test_a_mem0_result_renders_as_a_tagged_bullet(
+        self, briefing: BriefingAssembler,
+    ):
+        entry = _result('1', 'Never run git stash in any dark-factory checkout.', source_store='mem0')
+        entry['category'] = 'preferences_and_norms'
+        entry['created_at'] = '2026-08-15T22:22:49+00:00'
+
+        context = await self._render(briefing, [entry])
+
+        assert (
+            '- [preferences_and_norms · 2026-08-15 · mem0] '
+            'Never run git stash in any dark-factory checkout.'
+        ) in context
+
+    async def test_no_raw_json_survives_anywhere_in_the_block(
+        self, briefing: BriefingAssembler,
+    ):
+        entry = _result('1', 'A recalled fact.', source_store='mem0')
+        entry['category'] = 'observations_and_summaries'
+        entry['created_at'] = '2026-08-15T22:22:49+00:00'
+
+        context = await self._render(briefing, [entry])
+
+        assert '{' not in context and '}' not in context
+        assert 'relevance_score' not in context
+        assert 'provenance' not in context
+
+    async def test_a_long_entry_renders_whole(self, briefing: BriefingAssembler):
+        """D5: entries are not capped, because a canonical memory record is
+        long precisely because its reasoning is the payload."""
+        long_content = 'The measured rationale. ' * 200
+        entry = _result('1', long_content.strip(), source_store='mem0')
+
+        context = await self._render(briefing, [entry])
+
+        assert long_content.strip() in context
+        assert '...' not in context
+        assert 'truncated' not in context
+
+    async def test_a_graphiti_result_falls_back_to_its_valid_at_date(
+        self, briefing: BriefingAssembler,
+    ):
+        entry = _result('1', 'An edge fact about task 3659.', source_store='graphiti')
+        entry['temporal'] = {'valid_at': '2026-09-14T07:58:01.179808+00:00', 'invalid_at': None}
+
+        context = await self._render(briefing, [entry])
+
+        assert (
+            '- [uncategorized · 2026-09-14 · graphiti] An edge fact about task 3659.'
+        ) in context
+
+    async def test_the_category_falls_back_to_the_metadata_copy(
+        self, briefing: BriefingAssembler,
+    ):
+        entry = _result('1', 'A convention.', metadata={'category': 'procedural_knowledge'},
+                        source_store='mem0')
+        entry['created_at'] = '2026-08-15T22:22:49+00:00'
+
+        context = await self._render(briefing, [entry])
+
+        assert '- [procedural_knowledge · 2026-08-15 · mem0] A convention.' in context
+
+    async def test_an_untagged_undated_result_still_renders_its_content(
+        self, briefing: BriefingAssembler,
+    ):
+        """The tag is best-effort; the content is not."""
+        context = await self._render(
+            briefing, [_result('1', 'A fact with no tags at all.', source_store='mem0')],
+        )
+
+        assert '- [uncategorized · undated · mem0] A fact with no tags at all.' in context
+        assert 'None' not in context
+
+    async def test_grouped_children_render_as_nested_bullets(
+        self, briefing: BriefingAssembler,
+    ):
+        """A filtered amendment digest still renders, as a nested bullet, or
+        the nested-drop note would announce blocking a leak nobody renders."""
+        context = await self._render(briefing, [_grouped_parent()])
+
+        assert '- [uncategorized · undated · mem0] Native canonical.' in context
+        assert '  - [amendment · undated · mem0] NATIVE AMENDMENT BODY' in context
+        assert 'FOREIGN AMENDMENT BODY' not in context
+
+    async def test_a_native_matched_child_renders_as_a_nested_bullet(
+        self, briefing: BriefingAssembler,
+    ):
+        """The other half of ``GROUPED_CHILD_KEYS``: ``matched_children``
+        carries ``content`` where an amendment digest carries ``digest``."""
+        parent = _grouped_parent(grouped={
+            'matched_children': [
+                {'id': 's1', 'content': 'NATIVE SIGHTING BODY', 'created_at': None,
+                 'kind': 'sighting', 'matched': True,
+                 'metadata': {'project_id': 'dark_factory'}},
+            ],
+            'sighting_count': 1,
+        })
+
+        context = await self._render(briefing, [parent])
+
+        assert '- [uncategorized · undated · mem0] Native canonical.' in context
+        assert '  - [sighting · undated · mem0] NATIVE SIGHTING BODY' in context
+
+    async def test_the_briefing_shows_the_contesting_child_in_full(
+        self, briefing: BriefingAssembler,
+    ):
+        """A correction recalled with the claim it contests reaches the agent
+        whole and marked as contesting it, not as a cut digest under it."""
+        results = json.loads(recorded_search_text('child-also-matched'))['results']
+        parent = next(entry for entry in results if 'grouped' in entry)
+        contesting_id = next(
+            child['id'] for child in parent['grouped']['amendments'] if child.get('contested')
+        )
+        full_body = next(entry['content'] for entry in results if entry['id'] == contesting_id)
+
+        context = await _recall(
+            briefing, _answering(recorded_search_envelope('child-also-matched')),
+        )
+
+        assert any(
+            line.startswith('  - [contests its parent · ') and line.endswith(f'] {full_body}')
+            for line in context.splitlines()
+        ), context
+
+    async def test_the_section_headings_come_from_the_specs(
+        self, briefing: BriefingAssembler,
+    ):
+        context = await self._render(briefing, [_result('1', 'A fact.', source_store='mem0')])
+
+        assert '## Conventions & Gotchas' in context
+        assert '## Task Context' in context
+        for spec, _text in queries_for(_SCOPE):
+            assert f'## {spec.section_title}' in context
+
+
+@pytest.mark.asyncio
+class TestTaskEntityChannel:
+    """The second half of D3's dual-channel task context.
+
+    ``get_entity`` is asked for ``Task <id>`` alongside the semantic search.
+    Its fuzzy fallback answers a miss with a DIFFERENT entity, so the reply
+    is admitted only on exact name equality, client-side.
+    """
+
+    async def _render(
+        self, briefing: BriefingAssembler, entity_reply: dict,
+    ) -> str:
+        """Answer the searches with one fact and the entity call with *entity_reply*."""
+        search_reply = _mcp_search_envelope([_result('1', 'A recalled fact.', source_store='mem0')])
+
+        async def dispatch(_url, _method, params, **_kwargs):
+            return entity_reply if params['name'] == 'get_entity' else search_reply
+
+        return await _recall(briefing, AsyncMock(side_effect=dispatch))
+
+    async def test_an_exactly_named_node_renders_its_summary_and_edges(
+        self, briefing: BriefingAssembler,
+    ):
+        context = await self._render(briefing, _entity_envelope(
+            nodes=[_node('Task 3609', 'Project-scopes the briefing context block.')],
+            edges=[_edge('Task 3609 is related to task 3212.')],
+        ))
+
+        task_section = context.split('## Task Context')[1]
+        assert 'Project-scopes the briefing context block.' in task_section
+        assert 'Task 3609 is related to task 3212.' in task_section
+
+    async def test_the_entity_is_asked_for_by_exact_task_name(
+        self, briefing: BriefingAssembler,
+    ):
+        mcp = _answering(_mcp_search_envelope([_result('1', 'A fact.')]))
+
+        await _recall(briefing, mcp)
+
+        entity_calls = [
+            call.args[2]['arguments']
+            for call in mcp.await_args_list
+            if call.args[2].get('name') == 'get_entity'
+        ]
+        assert len(entity_calls) == 1
+        assert entity_calls[0]['name'] == 'Task 3609'
+        assert entity_calls[0]['project_id'] == briefing.project_id
+
+    async def test_a_fuzzy_neighbour_is_rendered_by_nothing(
+        self, briefing: BriefingAssembler,
+    ):
+        context = await self._render(briefing, _entity_envelope(
+            nodes=[_node('Task 3212', 'A DIFFERENT TASK ENTIRELY.')],
+            edges=[_edge('Task 3212 threads caller identity through search.')],
+        ))
+
+        assert 'A DIFFERENT TASK ENTIRELY.' not in context
+        assert 'Task 3212 threads caller identity' not in context
+        assert 'A recalled fact.' in context, 'the semantic channel is unaffected'
+
+    async def test_an_empty_node_list_renders_nothing_and_does_not_raise(
+        self, briefing: BriefingAssembler,
+    ):
+        context = await self._render(briefing, _entity_envelope(nodes=[], edges=[]))
+
+        assert '## Task Context' in context
+        assert 'A recalled fact.' in context
+
+    async def test_a_dateless_edge_renders_its_fact_alone(
+        self, briefing: BriefingAssembler,
+    ):
+        context = await self._render(briefing, _entity_envelope(
+            nodes=[_node('Task 3609')],
+            edges=[_edge('Task 3609 is related to task 3212.')],
+        ))
+
+        assert 'Task 3609 is related to task 3212.' in context
+        assert 'None' not in context
+
+    async def test_a_dated_edge_renders_its_date_alongside_the_fact(
+        self, briefing: BriefingAssembler,
+    ):
+        context = await self._render(briefing, _entity_envelope(
+            nodes=[_node('Task 3609')],
+            edges=[
+                _edge('Task 3609 landed as commit abc123.', valid_at='2026-09-14T07:58:01.179808+00:00'),
+                _edge('Task 3609 is related to task 3212.'),
+            ],
+        ))
+
+        task_section = context.split('## Task Context')[1]
+        assert '- Task 3609 landed as commit abc123. (2026-09-14)' in task_section
+        assert 'Task 3609 is related to task 3212.' in task_section
+
+    async def test_a_graph_outage_is_named_not_rendered_as_an_empty_graph(
+        self, briefing: BriefingAssembler,
+    ):
+        """``get_entity`` answers a Graphiti fault with the same fault-only
+        ``degraded``/``failed_stores`` keys the search channel uses; without
+        reading them a failed graph renders exactly like an empty one."""
+        degraded = _entity_envelope(nodes=[], edges=[])
+        payload = json.loads(degraded['result']['content'][0]['text'])
+        payload.update({'degraded': True, 'failed_stores': ['graphiti']})
+        degraded['result']['content'][0]['text'] = json.dumps(payload)
+
+        context = await self._render(briefing, degraded)
+        healthy = await self._render(briefing, _entity_envelope(nodes=[], edges=[]))
+
+        assert MEMORY_DEGRADED_STORES_NOTICE.format(
+            section='Task Context' + ENTITY_CHANNEL_SUFFIX, stores='graphiti',
+        ) in context
+        assert context != healthy
+
+    async def test_an_unreachable_graph_names_its_channel_and_reason(
+        self, briefing: BriefingAssembler,
+    ):
+        search_reply = _mcp_search_envelope([_result('1', 'A recalled fact.', source_store='mem0')])
+
+        async def dispatch(_url, _method, params, **_kwargs):
+            if params['name'] == 'get_entity':
+                raise ConnectionError('graph unreachable')
+            return search_reply
+
+        context = await _recall(briefing, AsyncMock(side_effect=dispatch))
+
+        assert MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Task Context' + ENTITY_CHANNEL_SUFFIX,
+            reason=MemoryFailure.TRANSPORT.value,
+        ) in context
+        assert 'A recalled fact.' in context, 'the semantic channel still renders'
+
+    async def test_a_graph_tool_error_is_named_and_never_rendered(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """The shared ``isError`` blind spot, on the channel that also has it."""
+        with caplog.at_level(logging.DEBUG):
+            context = await self._render(briefing, {'result': {
+                'isError': True,
+                'content': [{'type': 'text', 'text': 'Error: graph unavailable'}],
+            }})
+
+        assert 'graph unavailable' not in context
+        assert MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Task Context' + ENTITY_CHANNEL_SUFFIX,
+            reason=MemoryFailure.MALFORMED.value,
+        ) in context
+        assert any(
+            'graph unavailable' in r.getMessage() and r.levelno >= logging.WARNING
+            for r in caplog.records
+        )
+
+    @pytest.mark.parametrize(
+        'text',
+        ['not json', '["a", "list"]', '"a bare string"', 'null'],
+        ids=['not-json', 'json-list', 'json-string', 'json-null'],
+    )
+    async def test_a_graph_reply_that_is_not_a_json_object_is_named_malformed(
+        self, briefing: BriefingAssembler, caplog, text,
+    ):
+        """Unlike a search reply, a garbled graph reply cannot fail open: the
+        exact-name admission needs the parsed node, so it is a failure, never
+        an empty graph and never rendered."""
+        with caplog.at_level(logging.WARNING):
+            context = await self._render(briefing, {'result': {
+                'content': [{'type': 'text', 'text': text}],
+            }})
+
+        assert MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Task Context' + ENTITY_CHANNEL_SUFFIX,
+            reason=MemoryFailure.MALFORMED.value,
+        ) in context
+        assert text not in context.split('## Task Context')[1]
+        assert 'A recalled fact.' in context, 'the semantic channel still renders'
+        assert any('Task 3609' in r.getMessage() for r in caplog.records)
+
+    async def test_the_two_channels_of_one_section_name_themselves_apart(
+        self, briefing: BriefingAssembler,
+    ):
+        """Both answer ``## Task Context``, so an unqualified notice would
+        print the same sentence twice and name neither corpus."""
+        context = await _recall(briefing, _raising(ConnectionError('everything is down')))
+
+        semantic = MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Task Context', reason='transport',
+        )
+        graph = MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Task Context' + ENTITY_CHANNEL_SUFFIX, reason='transport',
+        )
+        assert semantic in context and graph in context
+        assert context.count(semantic) == 1, 'no duplicated, unattributable line'
+
+    async def test_the_graph_channel_is_gated_on_the_spec_field(
+        self, briefing: BriefingAssembler,
+    ):
+        """The loop asks ``wants_entity_block``, not "is this spec TASK_SEMANTIC"."""
+        assert TASK_SEMANTIC.wants_entity_block
+        fired = [spec.wants_entity_block for spec, _text in queries_for(_SCOPE)]
+        assert fired.count(True) == 1
+
+        mcp = _answering(_mcp_search_envelope([_result('1', 'A fact.')]))
+        await _recall(briefing, mcp)
+
+        assert len([
+            call for call in mcp.await_args_list
+            if call.args[2].get('name') == 'get_entity'
+        ]) == 1
+
+    async def test_a_task_less_dispatch_asks_for_no_entity(
+        self, briefing: BriefingAssembler,
+    ):
+        mcp = _answering(_mcp_search_envelope([_result('1', 'A fact.')]))
+
+        with memory_transport(mcp):
+            await briefing.build_reviewer_prompt('reviewer_comprehensive', 'DIFF')
+
+        assert not [
+            call for call in mcp.await_args_list
+            if call.args[2].get('name') == 'get_entity'
+        ]
+
+
+@pytest.mark.asyncio
+class TestDegradationIsLoud:
+    """A memory outage is reported, not silently rendered as "nothing known" (D6/INV-2)."""
+
+    def _dispatch(self, *, failing_slug: str | None = None, payload: dict | None = None):
+        """Answer every call with *payload*, except the query for *failing_slug*."""
+        payload = payload if payload is not None else {
+            'results': [_result('1', 'A recalled fact.', source_store='mem0')],
+        }
+        reply = {'result': {'content': [{'type': 'text', 'text': json.dumps(payload)}]}}
+        failing = {
+            text for spec, text in queries_for(_SCOPE) if spec.slug == failing_slug
+        }
+
+        async def dispatch(_url, _method, params, **_kwargs):
+            if params['arguments'].get('query') in failing:
+                raise ConnectionError('memory service unreachable')
+            return reply
+
+        return AsyncMock(side_effect=dispatch)
+
+    async def test_a_failed_query_names_its_missing_section_and_warns(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        with caplog.at_level(logging.DEBUG):
+            context = await _recall(
+                briefing, self._dispatch(failing_slug='briefing-task-semantic'),
+            )
+
+        assert MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Task Context', reason='transport',
+        ) in context
+        assert '## Conventions & Gotchas' in context, 'the healthy query still renders'
+        assert 'A recalled fact.' in context
+
+        failure_logs = [r for r in caplog.records if 'memory service unreachable' in r.getMessage()]
+        assert failure_logs, 'the transport failure must reach the log'
+        assert all(r.levelno >= logging.WARNING for r in failure_logs)
+
+    async def test_a_degraded_reply_names_the_stores_that_failed(
+        self, briefing: BriefingAssembler,
+    ):
+        """The signal was already on the wire; it must be read and rendered."""
+        context = await _recall(briefing, self._dispatch(payload={
+            'results': [_result('1', 'A recalled fact.', source_store='mem0')],
+            'degraded': True,
+            'failed_stores': ['graphiti'],
+        }))
+
+        assert MEMORY_DEGRADED_STORES_NOTICE.format(
+            section='Conventions & Gotchas', stores='graphiti',
+        ) in context
+        assert 'A recalled fact.' in context
+        assert '{' not in context and '}' not in context
+
+    async def test_a_total_outage_reads_differently_from_an_empty_corpus(
+        self, briefing: BriefingAssembler,
+    ):
+        assert MEMORY_EMPTY_NOTICE != MEMORY_OUTAGE_NOTICE
+
+        outage = await _recall(briefing, _raising(ConnectionError('memory service unreachable')))
+        empty = await _recall(briefing, _answering({'result': {'content': []}}))
+
+        assert MEMORY_EMPTY_NOTICE in empty
+        assert MEMORY_EMPTY_NOTICE not in outage
+        assert MEMORY_OUTAGE_NOTICE.format(reasons='transport') in outage
+        assert outage != empty
+
+    async def test_a_drop_note_and_a_failure_notice_both_render(
+        self, briefing: BriefingAssembler,
+    ):
+        """A blocked cross-project leak and a broken query are separate
+        facts; neither may displace the other."""
+        context = await _recall(briefing, self._dispatch(
+            failing_slug='briefing-task-semantic',
+            payload={'results': [
+                _result('1', 'Own fact.', metadata={'project_id': 'dark_factory'}),
+                _result('2', 'Foreign fact.', metadata={'project_id': 'reify'}),
+            ]},
+        ))
+
+        assert 'tagged to another project and filtered out' in context
+        assert '**Task Context**' in context
+        assert 'Own fact.' in context
+        assert 'Foreign fact.' not in context
+
+    async def test_a_partial_failure_survives_having_nothing_left_to_render(
+        self, briefing: BriefingAssembler,
+    ):
+        """One query fails AND the other recalls nothing: the notices must
+        survive the no-sections branch rather than read as a healthy empty corpus."""
+        context = await _recall(briefing, self._dispatch(
+            failing_slug='briefing-task-semantic',
+            payload={'results': [], 'degraded': True, 'failed_stores': ['graphiti']},
+        ))
+
+        assert MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Task Context', reason='transport',
+        ) in context
+        assert MEMORY_DEGRADED_STORES_NOTICE.format(
+            section='Conventions & Gotchas', stores='graphiti',
+        ) in context
+        assert context != f'# Context\n\n{MEMORY_EMPTY_NOTICE}'
+
+    async def test_a_total_outage_keeps_its_per_section_notices(
+        self, briefing: BriefingAssembler,
+    ):
+        """The family line says "memory is unavailable", the notices say
+        WHICH questions went unanswered; the family line leads."""
+        context = await _recall(briefing, _raising(ConnectionError('memory service unreachable')))
+
+        assert context.index(MEMORY_OUTAGE_NOTICE.split('{')[0]) < context.index(
+            MEMORY_SECTION_FAILURE_NOTICE.split('{')[0]
+        ), 'the family line leads the block, so the digest markers still match'
+        for section in ('Conventions & Gotchas', 'Task Context'):
+            assert MEMORY_SECTION_FAILURE_NOTICE.format(
+                section=section, reason='transport',
+            ) in context, f'{section} went unanswered and must say so'
+        assert MEMORY_DEGRADED_STORES_NOTICE.split('{')[0] not in context
+
+    async def test_a_reply_with_no_tool_result_is_named_malformed(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """The JSON-RPC error envelope: no ``result`` key at all."""
+        with caplog.at_level(logging.DEBUG):
+            context = await _recall(
+                briefing, _answering({'error': {'code': -32603, 'message': 'boom'}}),
+            )
+
+        for section in ('Conventions & Gotchas', 'Task Context'):
+            assert MEMORY_SECTION_FAILURE_NOTICE.format(
+                section=section, reason=MemoryFailure.MALFORMED.value,
+            ) in context
+        no_result_logs = [r for r in caplog.records if 'no tool result' in r.getMessage()]
+        assert no_result_logs
+        assert all(r.levelno >= logging.WARNING for r in no_result_logs)
+
+    async def test_a_reply_with_null_content_is_an_honest_empty_answer(
+        self, briefing: BriefingAssembler,
+    ):
+        """The service answered, oddly but without ``isError``: that is no
+        text, read the same way the shared envelope reader reads it, never a
+        broken recall loop that blames the transport."""
+        context = await _recall(briefing, _answering({'result': {'content': None}}))
+
+        assert context == f'# Context\n\n{MEMORY_EMPTY_NOTICE}'
+
+    async def test_a_non_dict_tool_result_is_named_malformed(
+        self, briefing: BriefingAssembler,
+    ):
+        context = await _recall(briefing, _answering({'result': ['not', 'a', 'dict']}))
+
+        assert MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Conventions & Gotchas', reason=MemoryFailure.MALFORMED.value,
+        ) in context
+
+    async def test_a_malformed_dispatch_counts_toward_the_outage_streak(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """All three failure classes are outages; only the reason differs."""
+        with caplog.at_level(logging.ERROR):
+            for _ in range(MEMORY_OUTAGE_STREAK_THRESHOLD):
+                await _recall(
+                    briefing, _answering({'error': {'code': -32603, 'message': 'boom'}}),
+                )
+
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1, errors
+
+    async def test_a_tool_error_is_a_failure_not_a_recalled_fact(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """FastMCP reports a tool-level failure IN the body, not by raising.
+
+        Its text block reads exactly like a result, so a shape-only reader
+        would render ``Error: ...`` as remembered fact and count it as a
+        recall that resets the outage streak.
+        """
+        tool_error = _answering({'result': {
+            'isError': True,
+            'content': [{'type': 'text', 'text': 'Error: embeddings backend refused'}],
+        }})
+
+        with caplog.at_level(logging.DEBUG):
+            contexts = [
+                await _recall(briefing, tool_error)
+                for _ in range(MEMORY_OUTAGE_STREAK_THRESHOLD)
+            ]
+
+        assert 'embeddings backend refused' not in contexts[0]
+        assert MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Conventions & Gotchas', reason=MemoryFailure.MALFORMED.value,
+        ) in contexts[0]
+        streak_errors = [
+            r for r in caplog.records
+            if r.levelno == logging.ERROR
+            and f' {MEMORY_OUTAGE_STREAK_THRESHOLD} consecutive ' in r.getMessage()
+        ]
+        assert len(streak_errors) == 1, 'a tool error recalled nothing, so it must not reset the streak'
+        assert any(
+            'embeddings backend refused' in r.getMessage() and r.levelno == logging.WARNING
+            for r in caplog.records
+        ), 'the error text is owed to the log even though it is kept out of the prompt'
+
+    async def test_a_search_reply_without_a_results_list_is_malformed_not_a_recall(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """The server answers a rejected search with a NORMAL, non-isError JSON dict.
+
+        ``{"error": ..., "error_type": ...}`` parses cleanly but carries no
+        ``results`` list, so it recalled nothing; rendered as text it would put
+        raw JSON in the prompt and reset the outage streak.
+        """
+        rejection = json.dumps({
+            'error': "Invalid project_id 'foo-bar'", 'error_type': 'ValidationError',
+        })
+        rejecting = _answering({'result': {'content': [{'type': 'text', 'text': rejection}]}})
+
+        with caplog.at_level(logging.DEBUG), memory_transport(rejecting):
+            prompts = [
+                await briefing.build_implementer_prompt({'steps': []}, task_id='3609')
+                for _ in range(MEMORY_OUTAGE_STREAK_THRESHOLD)
+            ]
+
+        assert MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Conventions & Gotchas', reason=MemoryFailure.MALFORMED.value,
+        ) in prompts[0]
+        assert 'error_type' not in prompts[0]
+        assert '{' not in prompts[0]
+        streak_errors = [
+            r for r in caplog.records
+            if r.levelno == logging.ERROR
+            and f' {MEMORY_OUTAGE_STREAK_THRESHOLD} consecutive ' in r.getMessage()
+        ]
+        assert len(streak_errors) == 1
+        assert any(
+            r.levelno >= logging.WARNING and 'results' in r.getMessage()
+            for r in caplog.records
+        )
+
+
+@pytest.mark.asyncio
+class TestOutageStreakEscape:
+    """A sustained memory outage escalates above the per-dispatch noise (INV-4).
+
+    A consecutive STREAK, not a time window: it resets on any dispatch that
+    recalled something and re-alarms at every multiple of the threshold.
+    """
+
+    async def _failing_dispatch(self, briefing: BriefingAssembler) -> str:
+        return await _recall(briefing, _raising(ConnectionError('memory service unreachable')))
+
+    async def _healthy_dispatch(self, briefing: BriefingAssembler) -> str:
+        return await _recall(briefing, _answering(_mcp_search_envelope([
+            _result('1', 'A recalled fact.', source_store='mem0'),
+        ])))
+
+    @staticmethod
+    def _errors(caplog) -> list[str]:
+        return [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+
+    async def test_a_short_run_of_outages_does_not_escalate(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        with caplog.at_level(logging.ERROR):
+            for _ in range(MEMORY_OUTAGE_STREAK_THRESHOLD - 1):
+                await self._failing_dispatch(briefing)
+
+        assert self._errors(caplog) == []
+
+    async def test_crossing_the_threshold_escalates_exactly_once(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        with caplog.at_level(logging.ERROR):
+            for _ in range(MEMORY_OUTAGE_STREAK_THRESHOLD):
+                await self._failing_dispatch(briefing)
+
+        errors = self._errors(caplog)
+        assert len(errors) == 1, errors
+        assert f' {MEMORY_OUTAGE_STREAK_THRESHOLD} consecutive ' in errors[0]
+
+    async def test_a_permanent_outage_re_alarms_on_each_further_crossing(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """Twice the threshold separates ``% THRESHOLD`` from ``== THRESHOLD``
+        (silent after the first crossing) and ``>= THRESHOLD`` (one line per
+        dispatch forever)."""
+        with caplog.at_level(logging.ERROR):
+            for _ in range(2 * MEMORY_OUTAGE_STREAK_THRESHOLD):
+                await self._failing_dispatch(briefing)
+
+        errors = self._errors(caplog)
+        assert len(errors) == 2, (
+            f'one line per crossing — not one per dispatch, and not one ever: {errors}'
+        )
+        assert f' {MEMORY_OUTAGE_STREAK_THRESHOLD} consecutive ' in errors[0]
+        assert f' {2 * MEMORY_OUTAGE_STREAK_THRESHOLD} consecutive ' in errors[1]
+
+    async def test_a_single_success_resets_the_streak(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        for _ in range(MEMORY_OUTAGE_STREAK_THRESHOLD - 1):
+            await self._failing_dispatch(briefing)
+        await self._healthy_dispatch(briefing)
+
+        with caplog.at_level(logging.ERROR):
+            for _ in range(MEMORY_OUTAGE_STREAK_THRESHOLD - 1):
+                await self._failing_dispatch(briefing)
+
+        assert self._errors(caplog) == []
+
+    async def test_the_per_dispatch_layer_still_reports_every_failure(
+        self, briefing: BriefingAssembler, caplog,
+    ):
+        """The escalation is an added layer, not a replacement: every failing
+        dispatch still warns and still says so in its own prompt."""
+        with caplog.at_level(logging.WARNING):
+            blocks = [
+                await self._failing_dispatch(briefing)
+                for _ in range(MEMORY_OUTAGE_STREAK_THRESHOLD)
+            ]
+
+        assert all(MEMORY_OUTAGE_NOTICE.split('{')[0] in block for block in blocks)
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) >= 2 * MEMORY_OUTAGE_STREAK_THRESHOLD, (
+            'each dispatch fires two queries and each failure warns'
         )
 
 
@@ -626,12 +968,8 @@ class TestGetMemoryContextFiltersForeignFacts:
 class TestMemoryContextProvenanceCaveat:
     """A standing caveat covers the leak channel the tag filter cannot reach.
 
-    ``filter_foreign_project_results`` only ever fires on Mem0-sourced
-    results that carry a project tag. Every Graphiti-sourced result is
-    untagged today (metadata == {}), so it survives the filter unclassified
-    — the caveat is what converts "agent cd's/reads into a recalled
-    'crates/reify-compiler' path" into "agent verifies the path first" for
-    that untagged channel.
+    Every Graphiti-sourced result is untagged, so it survives the filter
+    unclassified; the caveat is what makes the agent verify a recalled path.
     """
 
     async def test_caveat_present_and_precedes_first_section(
@@ -641,45 +979,23 @@ class TestMemoryContextProvenanceCaveat:
             _result('1', 'Own project fact.', metadata={'project_id': 'dark_factory'}),
         ])
 
-        with patch('orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope)):
-            context = await briefing._get_memory_context('3609')
+        context = await _recall(briefing, _answering(envelope))
 
         assert context.splitlines()[0] == '# Context'
-        assert briefing.project_id in context
-
-        # Identity check against the actual constant, rather than pinning a
-        # handful of substrings from its prose: any rewording that keeps the
-        # constant's own text intact still passes, and any drift in what's
-        # actually rendered is caught exactly (task 3609 amendment).
-        assert MEMORY_CONTEXT_CAVEAT.format(project_id=briefing.project_id) in context
-
-        # The caveat must precede the first '## ' section heading. Locate the
-        # project_id mention that establishes the caveat is present (the
-        # earliest one after the heading) and confirm it comes before that
-        # heading — the JSON section body below also names the project, but
-        # only as a later occurrence.
-        caveat_mention = context.index(briefing.project_id, len('# Context'))
-        first_section = context.index('\n## ')
-        assert caveat_mention < first_section
+        caveat = MEMORY_CONTEXT_CAVEAT.format(project_id=briefing.project_id)
+        assert caveat in context
+        assert context.index(caveat) < context.index('\n## ')
 
     async def test_caveat_absent_when_no_sections_survive(self, briefing: BriefingAssembler):
-        envelope = {'result': {'content': []}}
+        context = await _recall(briefing, _answering({'result': {'content': []}}))
 
-        with patch('orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope)):
-            context = await briefing._get_memory_context('3609')
-
-        assert context == '# Context\n\n_No memory context available._'
+        assert context == f'# Context\n\n{MEMORY_EMPTY_NOTICE}'
 
     async def test_caveat_present_alongside_untagged_foreign_path_content(
         self, briefing: BriefingAssembler,
     ):
-        """The census failure mode: untagged content naming a foreign path.
-
-        The result carries no project tag at all (metadata == {}), so the
-        filter cannot classify — let alone drop — it; it renders verbatim.
-        The caveat must still be present so the agent is warned to verify
-        the path before treating it as real.
-        """
+        """The census failure mode: untagged content naming a foreign path
+        renders verbatim, so the caveat must be there to warn about it."""
         envelope = _mcp_search_envelope([
             _result(
                 '1',
@@ -689,75 +1005,102 @@ class TestMemoryContextProvenanceCaveat:
             ),
         ])
 
-        with patch('orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope)):
-            context = await briefing._get_memory_context('3609')
+        context = await _recall(briefing, _answering(envelope))
 
         assert 'crates/reify-compiler' in context
-        assert briefing.project_id in context
-        assert 'verify' in context.lower()
+        assert MEMORY_CONTEXT_CAVEAT.format(project_id=briefing.project_id) in context
 
     async def test_caveat_covers_recalled_sections_after_partial_failure(
         self, briefing: BriefingAssembler,
     ):
-        """A later query raising must not blank the caveat for sections that
-        were already successfully recalled.
+        """A query failing must not blank the caveat for sections that were
+        already genuinely recalled."""
+        failing = {text for spec, text in queries_for(_SCOPE) if spec.slug == TASK_SEMANTIC.slug}
+        search_reply = _mcp_search_envelope([
+            _result('1', 'A recalled convention.', source_store='mem0'),
+        ])
 
-        The caveat used to be gated on `memory_unavailable`, which — because
-        it is set by a `try`/`except` wrapping all four searches — suppressed
-        the caveat for the WHOLE block even when earlier queries had already
-        returned real facts. This patches `_scoped_search` directly (rather
-        than `mcp_call`, as the other tests in this module do) because
-        `_mcp_search` itself catches every exception internally and returns
-        `None` — a `mcp_call` failure can never reach `_get_memory_context`
-        as a raised exception, only as an empty result. `_scoped_search` is
-        the seam where `_get_memory_context`'s own `try`/`except` can
-        actually observe a failure.
-        """
-        async def scoped_search_side_effect(query):
-            if 'decisions' in query:
+        async def dispatch(_url, _method, params, **_kwargs):
+            if params['name'] == 'get_entity':
+                return _entity_envelope(nodes=[], edges=[])
+            if params['arguments']['query'] in failing:
                 raise TimeoutError('memory service unreachable')
-            return f'## recalled for: {query}', 0, 0
+            return search_reply
 
-        with patch.object(
-            briefing, '_scoped_search', new=AsyncMock(side_effect=scoped_search_side_effect),
-        ):
-            context = await briefing._get_memory_context('3609')
+        context = await _recall(briefing, AsyncMock(side_effect=dispatch))
 
         assert context.splitlines()[0] == '# Context'
-        assert '## Project Context' in context
-        assert '## Conventions' in context
-        assert '## Recent Decisions' not in context
+        assert '## Conventions & Gotchas' in context
+        assert '## Task Context' not in context
         assert MEMORY_CONTEXT_CAVEAT.format(project_id=briefing.project_id) in context
 
 
 @pytest.mark.asyncio
-class TestScopedSearch:
-    """Direct coverage of ``_scoped_search``, the seam between
-    ``_mcp_search`` and ``_get_memory_context``.
+class TestFailureClassification:
+    """A slow memory service reads differently from an unreachable one.
+
+    ``mcp_call`` re-raises a plain ``RuntimeError`` once its retries exhaust,
+    keeping the cause only as ``__cause__``; these tests raise exactly that.
     """
 
-    async def test_returns_none_with_no_drop_when_underlying_search_is_empty(
+    @staticmethod
+    def _exhausted(cause: Exception) -> RuntimeError:
+        """The wrap ``McpSession._raw_call`` raises on retry exhaustion.
+
+        The shape itself is pinned against the real retry loop in
+        ``test_mcp_retry.py::TestTimeoutCausePredicate``.
+        """
+        err = RuntimeError(
+            f'MCP tools/call failed after 3 attempts: {type(cause).__name__}: {cause}'
+        )
+        err.__cause__ = cause
+        return err
+
+    async def test_an_exhausted_timeout_reaches_the_reader_as_a_timeout(
         self, briefing: BriefingAssembler,
     ):
-        with patch.object(briefing, '_mcp_search', new=AsyncMock(return_value=None)):
-            result = await briefing._scoped_search('anything')
+        context = await _recall(briefing, _raising(self._exhausted(httpx.ReadTimeout(''))))
 
-        assert result == (None, 0, 0)
+        assert MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Conventions & Gotchas', reason=MemoryFailure.TIMEOUT.value,
+        ) in context
+        assert MemoryFailure.TRANSPORT.value not in context, (
+            'an alive-but-slow service must not be reported as unreachable'
+        )
+
+    async def test_an_exhausted_connect_error_reaches_the_reader_as_transport(
+        self, briefing: BriefingAssembler,
+    ):
+        context = await _recall(
+            briefing, _raising(self._exhausted(httpx.ConnectError('refused'))),
+        )
+
+        assert MEMORY_SECTION_FAILURE_NOTICE.format(
+            section='Conventions & Gotchas', reason=MemoryFailure.TRANSPORT.value,
+        ) in context
+        assert MemoryFailure.TIMEOUT.value not in context
+
+
+@pytest.mark.asyncio
+class TestSearchReplyShapes:
+    """How the shape of a well-delivered search reply reaches the block."""
+
+    async def test_a_reply_with_no_text_blocks_is_an_honest_empty_corpus(
+        self, briefing: BriefingAssembler,
+    ):
+        """Nothing came back and nothing broke, which is what distinguishes
+        this from an outage."""
+        context = await _recall(briefing, _answering({'result': {'content': []}}))
+
+        assert context == f'# Context\n\n{MEMORY_EMPTY_NOTICE}'
 
     async def test_multi_text_block_response_fails_open_known_limitation(
         self, briefing: BriefingAssembler, caplog,
     ):
-        """``_mcp_search`` joins every MCP text block with ``'\\n'`` before
-        returning (unchanged by this task — see its allowlist entry in
-        ``shared/tests/silent_fallthrough_allowlist.py``). If the search
-        tool ever answers with more than one text block, the joined text is
-        not a single valid JSON document, so the filter fails open — the
-        cross-project filter silently stops working for that query, though
-        the block still renders (nothing is lost from the prompt, just the
-        filtering). This test PINS that known limitation so a change to the
-        response shape — or a future per-block fix — is caught rather than
-        drifting unnoticed.
-        """
+        """A reply split across text blocks joins into invalid JSON, so the
+        filter cannot run on it: it renders verbatim and unfiltered, with a
+        WARNING. Pinned so a change to the response shape, or a per-block
+        fix, is caught rather than drifting unnoticed."""
         envelope = {
             'result': {
                 'content': [
@@ -771,398 +1114,11 @@ class TestScopedSearch:
             },
         }
 
-        with caplog.at_level(logging.WARNING), patch(
-            'orchestrator.agents.briefing.mcp_call', new=AsyncMock(return_value=envelope),
-        ):
-            text, dropped, _nested = await briefing._scoped_search('anything')
+        with caplog.at_level(logging.WARNING):
+            context = await _recall(briefing, _answering(envelope))
 
-        # Known limitation: the joined multi-block text isn't valid JSON, so
-        # the filter fails open rather than filtering each block — the
-        # foreign fact is NOT removed.
-        assert dropped == 0
-        assert text is not None
-        assert 'Foreign fact.' in text
-        assert 'Own fact.' in text
+        conventions = context.split('## Conventions & Gotchas', 1)[1].split('\n\n---\n\n', 1)[0]
+        assert 'Foreign fact.' in conventions
+        assert 'Own fact.' in conventions
+        assert 'filtered out' not in context
         assert any(r.levelno == logging.WARNING for r in caplog.records)
-
-
-def _grouped_parent(id_: str = 'p1', *, grouped: dict | None = None) -> dict:
-    """A NATIVE canonical hit carrying a ``grouped`` block, as the server nests it.
-
-    Mirrors what ``fused_memory.server.grouped_read.group_search_results``
-    emits: the block is hung on a KEPT parent entry at ``entry['grouped']``
-    (grouped_read.py:716-718), with bounded amendment digests under
-    ``amendments`` and full swallowed bodies under ``matched_children``.
-    """
-    entry = _result('x', 'placeholder', metadata=None, source_store='mem0')
-    entry['id'] = id_
-    entry['content'] = 'Native canonical.'
-    entry['metadata'] = {'project_id': 'dark_factory'}
-    entry['grouped'] = _grouped_block() if grouped is None else grouped
-    return entry
-
-
-def _grouped_block() -> dict:
-    return {
-        'amendments': [
-            {'id': 'a1', 'digest': 'FOREIGN AMENDMENT BODY', 'created_at': None,
-             'kind': 'amendment', 'metadata': {'src_project': 'reify'}},
-            {'id': 'a2', 'digest': 'NATIVE AMENDMENT BODY', 'created_at': None,
-             'kind': 'amendment', 'metadata': {'project_id': 'dark_factory'}},
-            {'id': 'a3', 'digest': 'UNTAGGED AMENDMENT BODY', 'created_at': None,
-             'kind': 'amendment'},
-        ],
-        'matched_children': [
-            {'id': 's1', 'content': 'FOREIGN SIGHTING BODY', 'created_at': None,
-             'kind': 'sighting', 'matched': True, 'metadata': {'src_project': 'reify'}},
-        ],
-        'amendment_count': 3,
-        'sighting_count': 1,
-    }
-
-
-class TestGroupedChildrenAreFiltered:
-    """task 4008: a foreign child nested under a NATIVE canonical must not survive.
-
-    ``group_search_results`` nests child data inside a KEPT parent entry, and
-    ``_get_memory_context`` appends the filtered JSON verbatim into the
-    ``# Context`` block — so a ``grouped`` sub-object renders as raw JSON in a
-    dispatched agent's prompt, foreign digest text and foreign pinned bodies
-    included.  Reading only the TOP-LEVEL tag lets every one of them through.
-
-    SCOPE: ``src_project`` is the task-2273 CGL-eta rehome shape (see
-    :data:`FOREIGN_PROJECT_TAG_KEYS`) — a record physically in dark_factory's
-    collection naming a different ORIGIN project.  That is the ONLY reachable
-    leak shape here, because ``_read_grouped_document``
-    (``fused_memory/server/grouped_read.py``:275-305) already scopes every
-    child read by ``project_id``, so a child from a foreign COLLECTION cannot
-    appear in a block at all.
-    """
-
-    def test_foreign_nested_children_are_dropped_from_a_kept_parent(self):
-        payload = json.dumps({'results': [_grouped_parent()]})
-
-        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        # (a) THE SUBSTANTIVE PIN: neither foreign body reaches the prompt.
-        assert 'FOREIGN AMENDMENT BODY' not in text, (
-            'A foreign-tagged amendment digest nested under a native canonical '
-            f'must not survive into the # Context block, got {text!r}'
-        )
-        assert 'FOREIGN SIGHTING BODY' not in text, (
-            'A foreign-tagged pinned body — the FULL text, not a digest — must '
-            f'not survive into the # Context block, got {text!r}'
-        )
-        # (b) The correctly-tagged parent is NOT collateral damage.
-        assert [r['id'] for r in json.loads(text)['results']] == ['p1']
-        # (c) A native child survives.
-        assert 'NATIVE AMENDMENT BODY' in text
-        # (d) Nested entries inherit the top-level KEEP-UNTAGGED policy.
-        assert 'UNTAGGED AMENDMENT BODY' in text, (
-            'An untagged nested child must be KEPT, exactly as an untagged '
-            f'top-level result is — not held to a stricter policy, got {text!r}'
-        )
-        # (e) Exactly the foreign children are gone.
-        grouped = json.loads(text)['results'][0]['grouped']
-        assert [c['id'] for c in grouped['amendments']] == ['a2', 'a3']
-        assert grouped['matched_children'] == []
-        # (f) Nested drops are COUNTED — in their own counter, so they reach
-        # the drop note as nested records rather than as vacated result slots.
-        assert nested == 2, (
-            'Nested drops must be counted and returned, so a blocked leak is '
-            f'reported rather than silently swallowed, got {nested}'
-        )
-        assert dropped == 0, (
-            'No TOP-LEVEL result was foreign here — the parent survived — so '
-            f'the result-slot counter must stay at 0, got {dropped}'
-        )
-
-    def test_a_nested_only_drop_defeats_the_no_op_fast_path(self):
-        """Every top-level entry is native or untagged; only a CHILD is foreign.
-
-        Pins that the ``dropped == 0`` fast path (which returns ``payload_text``
-        byte-for-byte unchanged) cannot swallow a nested-only drop.
-        """
-        payload = json.dumps({
-            'results': [
-                _result('u1', 'Untagged graphiti fact.'),
-                _grouped_parent(),
-            ],
-        })
-
-        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert (dropped, nested) == (0, 2)
-        assert 'FOREIGN AMENDMENT BODY' not in text
-        assert 'FOREIGN SIGHTING BODY' not in text
-        assert text != payload, (
-            'The payload must be genuinely re-serialised when only a nested '
-            'entry was dropped — returning the unfiltered text would discard '
-            'the drop entirely'
-        )
-        assert [r['id'] for r in json.loads(text)['results']] == ['u1', 'p1']
-
-    def test_a_single_nested_drop_is_reported_and_re_serialised(self):
-        """The minimal nested-only case: exactly ONE foreign child, nothing else."""
-        payload = json.dumps({
-            'results': [_grouped_parent(grouped={
-                'amendments': [
-                    {'id': 'a1', 'digest': 'FOREIGN AMENDMENT BODY', 'created_at': None,
-                     'kind': 'amendment', 'metadata': {'src_project': 'reify'}},
-                ],
-                'amendment_count': 1,
-                'sighting_count': 0,
-            })],
-        })
-
-        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert (dropped, nested) == (0, 1)
-        assert 'FOREIGN AMENDMENT BODY' not in text
-        assert json.loads(text)['results'][0]['grouped']['amendments'] == []
-
-
-    def test_nested_children_canonicalise_divergent_spellings(self):
-        """The descent must use ``_canonical_project``, not a raw string compare.
-
-        fused-memory explicitly PERMITS divergent project-id spellings (see
-        ``plans/cross-graph-entity-leak-prd.md`` decision 1 / S1), and the
-        top-level loop already canonicalises before comparing
-        (``TestForeignTagKeysAndSpelling``). If the nested loop compared raw
-        tags instead, a native child tagged ``dark-factory`` would be
-        FALSE-POSITIVE DROPPED — silent context loss on real corpus data,
-        which is strictly worse than the leak this task set out to close, and
-        every other test in this file would still pass.
-        """
-        for spelling in ('dark-factory', 'Dark_Factory', '  dark_factory  '):
-            payload = json.dumps({'results': [_grouped_parent(grouped={
-                'amendments': [
-                    {'id': 'a1', 'digest': 'NATIVE AMENDMENT BODY', 'created_at': None,
-                     'kind': 'amendment', 'metadata': {'project_id': spelling}},
-                ],
-                'amendment_count': 1,
-                'sighting_count': 0,
-            })]})
-
-            text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
-
-            assert (dropped, nested) == (0, 0), (
-                f'nested spelling {spelling!r} must be treated as own-project, '
-                f'got dropped={dropped} nested={nested}'
-            )
-            assert 'NATIVE AMENDMENT BODY' in text, (
-                f'A native child spelled {spelling!r} must survive, got {text!r}'
-            )
-
-    def test_a_foreign_nested_child_is_dropped_whatever_its_casing(self):
-        """The same canonicalisation must not let a FOREIGN child through either."""
-        payload = json.dumps({'results': [_grouped_parent(grouped={
-            'amendments': [
-                {'id': 'a1', 'digest': 'FOREIGN AMENDMENT BODY', 'created_at': None,
-                 'kind': 'amendment', 'metadata': {'src_project': '  REIFY  '}},
-            ],
-            'amendment_count': 1,
-            'sighting_count': 0,
-        })]})
-
-        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert (dropped, nested) == (0, 1)
-        assert 'FOREIGN AMENDMENT BODY' not in text, (
-            'Canonicalisation must normalise the FOREIGN side too — a tag of '
-            f"'  REIFY  ' still names another project, got {text!r}"
-        )
-
-    def test_a_dropped_parent_is_counted_once_not_once_per_child(self):
-        """A foreign parent takes its whole subtree with it — for exactly 1 drop.
-
-        The descent runs only for a KEPT entry. If the
-        ``_filter_grouped_children`` call were ever moved above the
-        ``continue`` that drops a foreign parent, this parent would score
-        1 + 3 = 4 instead of 1 — and ``dropped`` is not internal bookkeeping,
-        it renders into the operator-visible drop note, so an over-count is a
-        wrong number shown to a human.
-        """
-        entry = _result('f1', 'FOREIGN CANONICAL.', metadata={'src_project': 'reify'},
-                        source_store='mem0')
-        entry['grouped'] = {
-            'amendments': [
-                {'id': 'a1', 'digest': 'FOREIGN CHILD ONE', 'kind': 'amendment',
-                 'metadata': {'src_project': 'reify'}},
-                {'id': 'a2', 'digest': 'FOREIGN CHILD TWO', 'kind': 'amendment',
-                 'metadata': {'src_project': 'reify'}},
-            ],
-            'matched_children': [
-                {'id': 's1', 'content': 'FOREIGN CHILD THREE', 'kind': 'sighting',
-                 'matched': True, 'metadata': {'src_project': 'reify'}},
-            ],
-            'amendment_count': 2,
-            'sighting_count': 1,
-        }
-        payload = json.dumps({'results': [entry, _result('n1', 'Native fact.')]})
-
-        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert dropped == 1, (
-            'A dropped parent is ONE drop however many children hung off it, '
-            f'got {dropped}'
-        )
-        assert nested == 0, (
-            'A dropped parent must not be descended into: its children are '
-            f'already gone, so counting them would double-count, got {nested}'
-        )
-        assert [r['id'] for r in json.loads(text)['results']] == ['n1']
-        for body in ('FOREIGN CANONICAL.', 'FOREIGN CHILD ONE',
-                     'FOREIGN CHILD TWO', 'FOREIGN CHILD THREE'):
-            assert body not in text, f'{body!r} must go with its parent'
-
-
-class TestGroupedDescentIsSurgicalAndFailsOpen:
-    """The descent rewrites the child LISTS and nothing else, and never raises.
-
-    Surgical: the server's ``grouped`` block carries EXACT counts from
-    ``count_memories_by_metadata``; a briefing that recomputed them after a
-    drop would be fabricating a number the store never returned, which is a
-    worse lie than a visibly-short list.
-
-    Fails open: mirroring the malformed-payload arms of
-    ``filter_foreign_project_results``, a shape surprise must never blank the
-    ``# Context`` block — a silent capability loss across every prompt builder
-    is the worse failure direction than one unfiltered entry.
-    """
-
-    def test_the_server_counts_are_never_rewritten(self):
-        """(a) A shortened list keeps the count API's EXACT value."""
-        payload = json.dumps({'results': [_grouped_parent()]})
-
-        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        grouped = json.loads(text)['results'][0]['grouped']
-        assert nested == 2
-        assert len(grouped['amendments']) == 2, 'PRECONDITION: the list really did shrink'
-        assert grouped['amendment_count'] == 3, (
-            'amendment_count is the count API\'s exact value; recomputing it here '
-            f'would fabricate a number the store never returned, got {grouped!r}'
-        )
-        assert grouped['sighting_count'] == 1, (
-            f'sighting_count must survive a matched_children drop verbatim, got {grouped!r}'
-        )
-
-    def test_sibling_grouped_keys_survive_verbatim(self):
-        """(b) Only the child lists are touched."""
-        block = _grouped_block()
-        block['truncated'] = True
-        block['children_unavailable'] = True
-        block['error_type'] = 'TimeoutError'
-        payload = json.dumps({'results': [_grouped_parent(grouped=block)]})
-
-        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        grouped = json.loads(text)['results'][0]['grouped']
-        assert nested == 2
-        assert grouped['truncated'] is True
-        assert grouped['children_unavailable'] is True
-        assert grouped['error_type'] == 'TimeoutError'
-
-    def test_the_parents_own_fields_are_untouched(self):
-        """(c) The descent edits the subtree, never the entry that carries it."""
-        payload = json.dumps({'results': [_grouped_parent()]})
-
-        text, _dropped, _nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        parent = json.loads(text)['results'][0]
-        assert parent['id'] == 'p1'
-        assert parent['content'] == 'Native canonical.'
-        assert parent['metadata'] == {'project_id': 'dark_factory'}
-        assert parent['relevance_score'] == 0.9
-
-    def test_an_entry_with_no_grouped_key_is_a_no_op(self):
-        """(d) Today's overwhelmingly common shape: zero child records in the corpus.
-
-        ``build_grouped_document`` returns None on a zero-child canonical, so
-        ``group_search_results`` sets no ``grouped`` key at all.
-        """
-        payload = json.dumps({
-            'results': [_result('n1', 'Native fact.', metadata={'project_id': 'dark_factory'})],
-        })
-
-        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert (dropped, nested) == (0, 0)
-        assert 'Native fact.' in text
-
-    def test_a_non_dict_grouped_value_fails_open(self):
-        """(e)"""
-        entry = _result('p1', 'Native canonical.', metadata={'project_id': 'dark_factory'})
-        entry['grouped'] = 'not a dict at all'
-        payload = json.dumps({'results': [entry]})
-
-        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert (dropped, nested) == (0, 0), (
-            f'A shape surprise must not be counted as a drop, got {dropped}/{nested}'
-        )
-        assert [r['id'] for r in json.loads(text)['results']] == ['p1'], (
-            f'The entry must SURVIVE a malformed grouped block, got {text!r}'
-        )
-
-    def test_a_non_list_child_collection_fails_open(self):
-        """(f)"""
-        entry = _result('p1', 'Native canonical.', metadata={'project_id': 'dark_factory'})
-        entry['grouped'] = {'amendments': 'not a list', 'amendment_count': 1}
-        payload = json.dumps({'results': [entry]})
-
-        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert (dropped, nested) == (0, 0)
-        assert json.loads(text)['results'][0]['grouped']['amendments'] == 'not a list', (
-            'A child collection of the wrong type is left EXACTLY as received — '
-            'never coerced, never emptied'
-        )
-
-    def test_a_non_dict_nested_entry_is_kept_not_dropped(self):
-        """(g) Same treatment the top-level loop gives a stray non-dict entry."""
-        entry = _result('p1', 'Native canonical.', metadata={'project_id': 'dark_factory'})
-        entry['grouped'] = {
-            'amendments': [
-                None,
-                'a bare string',
-                {'id': 'a1', 'digest': 'FOREIGN AMENDMENT BODY', 'kind': 'amendment',
-                 'metadata': {'src_project': 'reify'}},
-                {'id': 'a2', 'digest': 'NATIVE AMENDMENT BODY', 'kind': 'amendment'},
-            ],
-            'amendment_count': 4,
-        }
-        payload = json.dumps({'results': [entry]})
-
-        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert (dropped, nested) == (0, 1), (
-            f'Only the classifiably-foreign child may be dropped, got {dropped}/{nested}'
-        )
-        amendments = json.loads(text)['results'][0]['grouped']['amendments']
-        assert amendments[:2] == [None, 'a bare string'], (
-            f'An unclassifiable nested entry is KEPT, not dropped, got {amendments!r}'
-        )
-        assert 'FOREIGN AMENDMENT BODY' not in text
-        assert 'NATIVE AMENDMENT BODY' in text
-
-    def test_a_non_dict_nested_metadata_is_kept(self):
-        """(h) ``_result_project`` already returns None for that — pinned end to end."""
-        entry = _result('p1', 'Native canonical.', metadata={'project_id': 'dark_factory'})
-        entry['grouped'] = {
-            'amendments': [
-                {'id': 'a1', 'digest': 'ODDLY SHAPED BODY', 'kind': 'amendment',
-                 'metadata': 'not a dict'},
-            ],
-            'amendment_count': 1,
-        }
-        payload = json.dumps({'results': [entry]})
-
-        text, dropped, nested = filter_foreign_project_results(payload, 'dark_factory')
-
-        assert (dropped, nested) == (0, 0)
-        assert 'ODDLY SHAPED BODY' in text, (
-            'A nested entry whose metadata is unreadable is untagged, and '
-            f'untagged means KEPT, got {text!r}'
-        )

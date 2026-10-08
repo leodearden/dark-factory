@@ -7,43 +7,24 @@ test_audit_duplicate_memories.py.
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import json
 import subprocess
 import types
 from pathlib import Path
 
 import pytest
+from _fm_helpers import (
+    load_script_module,
+    make_populated_task_store,
+    make_zero_byte_task_store,
+)
 
 from fused_memory.utils.target_store_preflight import TargetStoreMissing
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_found_on_main_provenance.py'
 
 
-def _load_module() -> types.ModuleType:
-    """Load audit_found_on_main_provenance.py from its file path.
-
-    The module is registered in sys.modules under its name so that
-    @dataclass and other reflection-based decorators work correctly
-    (they call sys.modules.get(cls.__module__)).
-    """
-    import sys  # noqa: PLC0415
-
-    mod_name = 'audit_found_on_main_provenance'
-    spec = importlib.util.spec_from_file_location(mod_name, SCRIPT_PATH)
-    if spec is None or spec.loader is None:
-        raise ImportError(f'Cannot load {SCRIPT_PATH}')
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = module  # required for @dataclass __module__ lookup
-    try:
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    return module
-
-
-_mod = _load_module()
+_mod = load_script_module(SCRIPT_PATH, mod_name='audit_found_on_main_provenance')
 TaskProvenanceAudit = _mod.TaskProvenanceAudit
 CITATION_PATTERN = _mod.CITATION_PATTERN
 select_found_on_main_tasks = _mod.select_found_on_main_tasks
@@ -264,6 +245,19 @@ class TestExtractCitedTaskIdsConventions:
     def test_task_branch_mention_convention(self):
         """A bare `task/{id}` mention anywhere in the message cites the id."""
         assert extract_cited_task_ids('fix: touch task/50 handler') == {'50'}
+
+    @pytest.mark.parametrize('commit_type', ['config', 'perf', 'revert', 'pre', 'prereq'])
+    def test_less_common_conventional_types_cite_the_task_id(self, commit_type):
+        """Each of these types heads real `type(N):` self-citations on main; task
+        4517's `config(4456): ...` lost its only citation once the bare-paren
+        alternative was retired (task 4705)."""
+        subject = f'{commit_type}(4456): set verify_admission_pytest_n: "8" (interim)'
+        assert extract_cited_task_ids(subject) == {'4456'}
+
+    def test_unlisted_type_word_does_not_cite(self):
+        """The type vocabulary is a closed list: a word outside it does not cite,
+        even in `type(N):` shape."""
+        assert extract_cited_task_ids('misc(4456): stray subject') == set()
 
     def test_no_citation_returns_empty_set(self):
         """A message with no citation of any kind yields an empty set."""
@@ -935,6 +929,30 @@ class TestClassifyOk:
         verdict, reasons = classify(audit)
         assert verdict == 'ok'
         assert reasons == []
+
+    def test_revert_subject_attributes_the_commit_to_its_task(self):
+        """A `revert(N):` commit is task N's own in-branch step, so it self-cites
+        and outranks a foreign citation in the body."""
+        audit = _audit(
+            task_id='50', is_ancestor=True,
+            commit_message='revert(50): roll back the step-3 filter\n\nSupersedes (task 77).',
+            declared_files=[],
+        )
+        verdict, reasons = classify(audit)
+        assert verdict == 'ok'
+        assert reasons == []
+
+    def test_revert_subject_does_not_vouch_for_the_deliverable(self):
+        """Self-citation is attribution only: a `revert(N):` commit whose diff
+        misses every declared file still reads deliverable_absent."""
+        audit = _audit(
+            task_id='50', is_ancestor=True,
+            commit_message='revert(50): roll back the step-3 filter',
+            declared_files=['src/thing.py'],
+            commit_files=['src/other.py'],
+        )
+        verdict, _ = classify(audit)
+        assert verdict == 'deliverable_absent'
 
     def test_declared_files_present_in_commit_is_ok(self):
         """Declared files present in the commit diff are sufficient, even with no citation."""
@@ -2102,6 +2120,19 @@ class TestRunTargetStorePreflight:
 
         assert not (tmp_path / '.taskmaster').exists()
 
+    async def test_refuses_a_zero_byte_task_store(self, tmp_path, monkeypatch):
+        """A zero-byte tasks.db is refused before any backend is built (task 5468).
+
+        The predicate is pinned in test_target_store_preflight.py::TestTaskStoreArm.
+        """
+        make_zero_byte_task_store(tmp_path)
+        factory = self._patch(monkeypatch)
+
+        with pytest.raises(TargetStoreMissing):
+            await _mod._run(_run_args(tmp_path))
+
+        assert factory.constructions == []
+
     @pytest.mark.parametrize('fail_on_findings', [False, True])
     async def test_refusal_is_not_one_of_the_fail_on_findings_exit_codes(
         self, tmp_path, monkeypatch, fail_on_findings,
@@ -2109,9 +2140,11 @@ class TestRunTargetStorePreflight:
         """A refusal is an exception, never 0 / 1 / 2.
 
         ``--fail-on-findings`` exists so a clean exit only ever means "nothing
-        flagged", and ``scripts/check_found_on_main_spurious_rate.py`` wraps
-        this script as a CI predicate reading that ladder. The guard must not
-        be confusable with "clean report" (0) or "findings present" (2).
+        flagged". ``scripts/check_found_on_main_spurious_rate.py`` reuses this
+        module's ``build_audit_report`` but not its exit-code ladder, and maps
+        its own store refusal onto a reserved exit 3. The guard must not be
+        confusable with "clean report" (0) or "findings present" (2) on THIS
+        script's ladder.
         """
         self._patch(monkeypatch)
 
@@ -2120,10 +2153,8 @@ class TestRunTargetStorePreflight:
                 _run_args(tmp_path, fail_on_findings=fail_on_findings),
             )
 
-    async def test_proceeds_when_the_db_exists(self, tmp_path, monkeypatch):
-        db = tmp_path / '.taskmaster' / 'tasks' / 'tasks.db'
-        db.parent.mkdir(parents=True)
-        db.touch()
+    async def test_proceeds_when_the_db_holds_tasks(self, tmp_path, monkeypatch):
+        make_populated_task_store(tmp_path)
         factory = self._patch(monkeypatch)
 
         exit_code = await _mod._run(_run_args(tmp_path))

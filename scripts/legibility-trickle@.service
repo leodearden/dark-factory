@@ -12,20 +12,25 @@ WorkingDirectory=/home/leo/src/dark-factory
 # "__main__"` guard), but PYTHONPATH is set explicitly too so `from legibility
 # import ...` resolves even if that self-bootstrap ever changes.
 Environment=PYTHONPATH=/home/leo/src/dark-factory/scripts
-# coder.py's _invoke_cli resolves the CLI as `claude_bin or
-# os.environ.get('LEGIBILITY_CLAUDE_BIN') or 'claude'`, so without this pin the
-# bare name is execvp-resolved against whatever PATH the `systemd --user`
-# manager happens to hold. On 2026-08-18 that manager started at boot
-# (08:58:30, linger) with NO ~/.local/bin on PATH -- the graphical login that
-# imports ~/.profile came 84 minutes later -- and the timer's Persistent=true
-# catch-up run fired into exactly that window, ENOENT'ing 6/6 selected digests
-# on reify and 38/38 on dark_factory in about one second. Mirrors this unit's
-# existing choice of an absolute /home/leo/.local/bin/uv in ExecStart. This
-# ALSO covers the census grandchild: nightly.py launches census.py via
-# `subprocess.run([...], check=False)` with no `env=` kwarg, so the child
-# inherits this Environment.
-Environment=LEGIBILITY_CLAUDE_BIN=/home/leo/.local/bin/claude
-ExecStart=/home/leo/.local/bin/uv run --frozen --project shared python scripts/legibility/nightly.py run --project-id %i
+# Every legibility call spawns the BARE name `claude` through the shared
+# runner (shared.cli_invoke, task 6042), resolved against this PATH, which the
+# census grandchild inherits too. Pinned absolutely, in the orchestrator
+# units' form, because the `systemd --user` manager's own PATH can lack
+# ~/.local/bin: on 2026-08-18 it started at boot (linger) 84 minutes before
+# the login that imports ~/.profile, and the Persistent=true catch-up run
+# ENOENT'd 6/6 digests on reify and 38/38 on dark_factory in about a second.
+Environment=PATH=/home/leo/.local/bin:/home/leo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# The multi-account pool (task 5488): the CLAUDE_OAUTH_TOKEN_* vars that
+# config/usage-accounts.yaml names. A token source, never a token pin -- the
+# gate picks the account per invocation. Policy for this directive and the
+# next: OPERATIONS.md §"Legibility trickle accounts (03:00)". Optional ("-"):
+# a missing .env must not stop the unit starting -- build_pool loads it itself
+# and turns an empty pool into a recorded deferral (task 5635).
+EnvironmentFile=-/home/leo/src/dark-factory/.env
+# Load-bearing: the CLI prefers an API key over the OAuth token, and the .env
+# above defines one.
+UnsetEnvironment=ANTHROPIC_API_KEY
+ExecStart=/home/leo/.local/bin/uv run --no-sync --project shared python scripts/legibility/nightly.py run --project-id %i
 StandardOutput=journal
 StandardError=journal
 

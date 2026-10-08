@@ -13,7 +13,7 @@ import tempfile
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 from shared.timestamps import parse_timestamp_or_warn
 
@@ -23,7 +23,7 @@ from escalation import archive
 # makes this import legal at all: dedupe.py imports THIS module at module level,
 # so queue.py can never import dedupe.py, where the transform used to live.
 from escalation.canonical import canonical_root_cause
-from escalation.classify import default_resolution_class_for_resolver
+from escalation.classify import classify_resolver_tier, default_resolution_class_for_resolver
 
 # The declared-pin field's normalisation (strip / drop blanks / order-preserving
 # de-dup) is ONE contract with two sides — this writer and the read-side
@@ -38,7 +38,16 @@ from escalation.declared_pins import normalise_declarers
 # module-private symbol.  Imported under its real, public name: it is a shared
 # cross-module helper, and spelling it `_max_severity` here would signal the
 # opposite at every use site.
-from escalation.models import RESOLUTION_CLASSES, Amendment, Escalation, max_severity
+from escalation.models import (
+    PERSIST_CHECK_ABSENT,
+    PERSIST_CHECK_UNREADABLE,
+    RESOLUTION_CLASSES,
+    STATUS_ACCEPTED_UNPERSISTED,
+    Amendment,
+    Escalation,
+    LateResolution,
+    max_severity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,8 +119,9 @@ _ARCHIVE_NEGATIVE_CACHE_MAX_SIZE = 10_000
 # ``.json`` record, so it would otherwise look permanently orphaned).
 SEQ_COUNTER_SUFFIX = '.seq'
 
-# Hard cap on the NUMBER of Escalation.amendments entries (see add_members_to_l2,
-# the SOLE writer and sole trimmer).  Worst case is repeated folds of one cluster
+# Hard cap on the NUMBER of Escalation.amendments entries (see
+# _append_amendment_capped, the single home of the append-and-trim policy for
+# every writer of that list).  Worst case is repeated folds of one cluster
 # inside a single AFK window, and amendments are deliberately NOT in the server's
 # compact projection, so they never inflate a watcher's drain no matter how deep
 # the list gets.  Past the cap the OLDEST are shed — the ORIGINAL framing is never
@@ -147,6 +157,39 @@ _MAX_AMENDMENTS = 20
 _MAX_AMENDMENT_LINE_CHARS = 300
 _MAX_AMENDMENT_DETAIL_CHARS = 1200
 _MAX_AMENDMENT_OPTIONS = 6
+
+# Hard cap on the NUMBER of Escalation.late_resolutions entries — the
+# substantive resolutions that arrived after an automated sweep had already
+# closed the record (task 4495; see `_is_late_resolution_worth_capturing` for
+# why that is rare).  Same sole-writer/sole-trimmer, oldest-shed,
+# count-every-drop policy as `_MAX_AMENDMENTS` above: `resolve()`'s
+# already-terminal branch owns both, and each shed entry increments the
+# record's `late_resolutions_truncated` so the TRUE total
+# (`len(list) + truncated`) never plateaus.
+#
+# OLDEST-shed is right here for the same reason it is right for `amendments`:
+# these entries are strictly ADDITIONAL to the record's own immutable
+# status/resolution/resolved_by, so nothing anchoring is stored only in this
+# list, and a reader triaging NOW wants the most recent finding.
+#
+# SIZED SMALLER THAN `_MAX_AMENDMENTS` (20) on purpose: an L2 folds repeatedly
+# by design, but a SECOND late resolution on one already-swept record means the
+# race recurred on the same escalation — a shape that should be exceptional, so
+# a low cap costs nothing real and keeps the envelope tight.
+#   whole list <= 8 * (1200 kept + ~70 marker + ~180 timestamp/keys) ~= 11 KB
+# — the same order as `root_cause_variants` (~7 KB), far under `amendments`.
+_MAX_LATE_RESOLUTIONS = 8
+
+# Per-ENTRY character cap on a captured `resolution`.  An entry count alone is
+# NOT a size bound: `resolution` is unbounded caller free text (an agent's full
+# finding), so 8 uncapped entries could add hundreds of KB to a record every
+# reader of a full record then parses.  Shares `_MAX_AMENDMENT_DETAIL_CHARS`'s
+# sizing — both are the "prose" field of their entry — and the same in-band
+# marked elision, with the dropped characters counted on the record in
+# `late_resolutions_chars_elided` exactly as shed ENTRIES are counted in
+# `late_resolutions_truncated`.  The loss is a durable structured fact either
+# way, never log-only (INV-8).
+_MAX_LATE_RESOLUTION_CHARS = _MAX_AMENDMENT_DETAIL_CHARS
 
 # Hard cap on the NUMBER of Escalation.root_cause_variants entries — the DISTINCT
 # pre-canonical root_cause spellings one L2 has been addressed by (task 3998).
@@ -235,21 +278,180 @@ class AmendmentOutcome(TypedDict):
     variants: int
 
 
-def _elide(text: str, limit: int) -> tuple[str, int]:
+class AmendWithRecord(TypedDict):
+    """An :meth:`EscalationQueue.amend` call that read the record it names."""
+
+    status: Literal['amended', 'repeat_framing', 'not_pending']
+    escalation: Escalation  # as amended, or as found when nothing was recorded
+    recorded: bool          # THIS call appended an amendment
+    dropped: int            # entries THIS call shed at the _MAX_AMENDMENTS cap
+
+
+class AmendWithoutRecord(TypedDict):
+    """An :meth:`EscalationQueue.amend` call that read no record."""
+
+    status: Literal['no_framing', 'not_found']
+    escalation: None
+    recorded: bool
+    dropped: int
+
+
+# What ONE `amend` call did.  A RETURN value rather than an out-param, unlike
+# `AmendmentOutcome`: `amend` has no pre-existing call sites to keep reading a
+# bare `Escalation`.  Computed inside `escalation_id_lock` for the TOCTOU reason
+# `AmendmentOutcome` states.  Discriminated on `status`, so a caller matching on
+# it gets `escalation` typed exactly for that status and a type checker flags
+# any status the caller leaves unhandled.
+AmendResult = AmendWithRecord | AmendWithoutRecord
+
+
+class ResolveOutcome(TypedDict):
+    """What ONE :meth:`EscalationQueue.resolve` call actually DID (task 4495).
+
+    An OUT-PARAM for exactly the reasons ``AmendmentOutcome`` above is one: the
+    ``Escalation`` is ``resolve()``'s primary return value and every existing
+    call site reads it directly, so widening the return into a tuple would churn
+    all of them — the member cascade, ``dismiss_all_pending``, the steward, the
+    five workflow auto-dismiss backstops — for a fact only ``server.resolve_issue``
+    wants.
+
+    WHY IT EXISTS: ``resolve()``'s already-terminal branch is a no-op, so a caller
+    whose text did NOT apply gets back a perfectly healthy-looking ``Escalation``
+    and is told nothing.  That is the esc-3902-1 harm: an agent's substantive
+    resolution lands microseconds after an automated sweep dismissed the record,
+    and the agent is told "success".
+
+    Re-deriving these facts in the server from a pre-call ``queue.get`` would cost
+    a second full read+parse on every resolve AND be a real TOCTOU: this queue is
+    explicitly built for cross-process mutators (the sidecar flocks), so an
+    auto-dismiss landing between the pre-read and the call makes the reported flag
+    wrong in either direction — reading "pending, so my text will apply" for a
+    call that is about to no-op.  Computed INSIDE ``escalation_id_lock``, where
+    the check-and-set itself happens, these are exact.
+
+    Every key is populated on EVERY return path — including the not-found early
+    return — so a caller never reads a stale or missing key.
+    """
+
+    applied: bool                          # THIS call wrote the incoming resolution
+    prior_status: str | None               # the record's status BEFORE this call; None if absent
+    prior_resolved_by: str | None          # who had already closed it, when applied is False
+    late_resolution_captured: bool         # the text was preserved in `late_resolutions` instead
+    resolution_class_corrected: str | None  # the stamp this call re-derived, or None
+
+
+def _elide(text: str, limit: int, what: str = 'amendment field') -> tuple[str, int]:
     """Return (*text* capped at *limit*, characters dropped).
 
     The elision is MARKED IN-BAND and names both the count and the cap, so a
     human reading a preserved framing can tell "this is all of it" from "this
     is the head of it" without cross-referencing anything.  Silent truncation
     of decision context would be the loud-over-silent norm inverted.
+
+    *what* names WHICH cap did the eliding, so a reader of a marker on a
+    late-resolution entry is not told it hit an "amendment field cap" it has
+    nothing to do with.  It defaults to the amendment wording, keeping every
+    pre-existing caller's output byte-identical.
     """
     if len(text) <= limit:
         return text, 0
     dropped = len(text) - limit
     return (
         f'{text[:limit]}\n[... {dropped} char(s) elided at the '
-        f'{limit}-char amendment field cap ...]'
+        f'{limit}-char {what} cap ...]'
     ), dropped
+
+
+def _is_late_resolution_worth_capturing(
+    esc: Escalation, resolution: str, resolved_by: str | None,
+) -> bool:
+    """Should this already-terminal ``resolve()`` PRESERVE its incoming text?
+
+    The capture exists for one shape — the W9-δ auto-dismiss race (task 4495,
+    esc-3902-1) — and is deliberately narrow, because a forensic field is only
+    high-signal while it stays rare.  Every conjunct below suppresses a shape
+    that already happens routinely in this system:
+
+    - ``esc.status == 'dismissed'`` — a stored *resolve* already carries a
+      substantive finding of its own, so a second one displaces nothing.  Only a
+      DISMISSAL closed the record without one.
+
+    - stored tier is ``'reaper-sweep'`` — the close was AUTOMATED (a sweep that
+      never read the record), so the incoming text is strictly more informative
+      than what it lost the race to.  Without this, every ordinary idempotent
+      double-resolve of a human- or steward-closed record would append an entry.
+
+    - incoming tier is NOT ``'reaper-sweep'`` — an auto-dismisser re-closing an
+      already-auto-dismissed record is routine bookkeeping, not a lost finding.
+      This is what keeps ``orchestrator.workflow``'s idempotent auto-dismiss
+      backstops (five call sites) and ``test_workflow_escalated_steward_stall``'s
+      deliberate re-dismissals silent.
+
+    - the incoming ``resolution`` is non-empty and DIFFERENT from the stored one
+      — an empty or byte-identical retry preserves nothing the record lacks.
+
+    The ``'cascade'`` tier is deliberately NOT excluded on the incoming side
+    alongside ``'reaper-sweep'``, even though it is equally automated.  ``resolve()``'s L2 member cascade forwards
+    the L2's OWN resolution text to every member, so what reaches an
+    already-swept member can be a human's substantive finding about the whole
+    cluster — exactly the loss this capture exists to prevent, arriving through
+    a different door.  A cascade is not a RACE, though, so
+    ``_capture_late_resolution`` logs it at INFO as a cascade forward rather
+    than at WARNING as a late arrival: the rarity the field's signal depends on
+    is defended in the LOG, where the noise would otherwise be, not by dropping
+    a finding on the floor.
+
+    BOTH resolver-tier tests go through ``escalation.classify.classify_resolver_tier``
+    rather than re-deriving an ``'auto-dismissed'`` literal here, so the
+    reaper-sweep membership stays single-sited in classify.py (INV-5) and a
+    future member added to ``_REAPER_SWEEP_RESOLVERS`` is covered by construction
+    rather than silently starting to generate noise.
+
+    Pure — no I/O, no mutation.  The caller holds ``escalation_id_lock``, so
+    *esc* is the record as it is inside the critical section.
+    """
+    if esc.status != 'dismissed':
+        return False
+    if classify_resolver_tier(esc.resolved_by) != 'reaper-sweep':
+        return False
+    if classify_resolver_tier(resolved_by) == 'reaper-sweep':
+        return False
+    return bool(resolution) and resolution != esc.resolution
+
+
+def _build_late_resolution(
+    *, resolution: str, resolved_by: str | None, dismiss: bool,
+    prior_resolution_class: str | None, timestamp: str,
+) -> tuple[LateResolution, int]:
+    """Build one :class:`~escalation.models.LateResolution`, size-bounded.
+
+    Modelled on :func:`_build_amendment`: the single site that maps a
+    ``resolve()`` argument set onto the entry's key names, and the single site
+    that applies the per-entry character cap (``_MAX_LATE_RESOLUTION_CHARS``)
+    that turns ``_MAX_LATE_RESOLUTIONS`` from an entry count into an actual size
+    bound.  Elision is marked in-band and the dropped total is returned so the
+    caller can make it durable on the record rather than log-only.
+
+    *timestamp* is passed in rather than read here so the queue's write
+    chokepoint owns the clock — a caller can never backdate a capture.
+
+    The arguments are exactly the facts ``resolve()`` receives.  The finer C1
+    action is NOT among them and the entry carries no key for it: the action is
+    stamped onto the record by ``server.resolve_issue`` before the call, on a
+    path an already-terminal record never takes (see the ``LateResolution``
+    docstring).
+
+    Returns ``(entry, chars_elided)``.
+    """
+    kept, lost = _elide(resolution, _MAX_LATE_RESOLUTION_CHARS, 'late-resolution')
+    entry: LateResolution = {
+        'timestamp': timestamp,
+        'resolution': kept,
+        'resolved_by': resolved_by,
+        'dismiss': dismiss,
+        'prior_resolution_class': prior_resolution_class,
+    }
+    return entry, lost
 
 
 def _build_amendment(
@@ -378,6 +580,81 @@ def _is_repeat_framing(esc: Escalation, candidate: Amendment) -> bool:
     return _framing_view(baseline) == _framing_view(candidate)
 
 
+def _has_framing(
+    *, root_cause: str, summary: str, evidence: str, options: list[str] | None,
+) -> bool:
+    """True when incoming framing carries anything an amendment could record.
+
+    THE one definition of "empty framing", read by every writer that must tell
+    a no-op apart from a write before it decides what to do: an empty amendment
+    carries no information and would still burn a ``_MAX_AMENDMENTS`` slot.
+    """
+    return bool(root_cause or summary or evidence or options)
+
+
+def _append_amendment_capped(
+    esc: Escalation, *, root_cause: str, summary: str, evidence: str,
+    options: list[str] | None, agent_role: str, caller: str,
+) -> tuple[bool, int]:
+    """Append one framing :class:`~escalation.models.Amendment` to *esc*, capped.
+
+    THE single home of the ``amendments`` append-and-trim policy, whichever
+    queue method carries the framing in: build the entry through
+    :func:`_build_amendment` (per-field elision), suppress it when
+    :func:`_is_repeat_framing`, count elided characters in
+    ``amendments_chars_elided``, and shed the OLDEST entries past
+    ``_MAX_AMENDMENTS`` into ``amendments_truncated``.  Every loss is a durable
+    structured fact on the record and a WARNING, never log-only.
+
+    Framing that fails :func:`_has_framing` records nothing.
+
+    Mutates *esc* in memory only.  The caller holds ``escalation_id_lock``, owns
+    the single ``_rewrite``, and decides whether to bump ``updated_at``, so the
+    append stays atomic with whatever else that caller writes.  The timestamp is
+    stamped HERE, so the write chokepoint owns the clock and no caller can
+    backdate an entry.  *caller* only prefixes the WARNING lines.
+
+    Returns ``(recorded, dropped)``: whether an entry was appended, and how many
+    oldest entries the cap shed.
+    """
+    if not _has_framing(
+        root_cause=root_cause, summary=summary, evidence=evidence, options=options,
+    ):
+        return False, 0
+    candidate, chars_elided = _build_amendment(
+        root_cause=root_cause, summary=summary, evidence=evidence,
+        options=options, agent_role=agent_role,
+        timestamp=datetime.now(UTC).isoformat(),
+    )
+    # Built BEFORE the repeat check, and the check reads the built entry: the
+    # stored form is what a later amendment will be compared against, so
+    # comparing anything else would let two entries the record cannot tell
+    # apart both be recorded.
+    if _is_repeat_framing(esc, candidate):
+        return False, 0
+    esc.amendments.append(candidate)
+    if chars_elided:
+        esc.amendments_chars_elided += chars_elided
+        logger.warning(
+            '%s: %s elided %d char(s) of incoming framing at the per-field '
+            "amendment caps (running total elided=%d); the record's own "
+            'framing is unaffected',
+            caller, esc.id, chars_elided, esc.amendments_chars_elided,
+        )
+    dropped = 0
+    if len(esc.amendments) > _MAX_AMENDMENTS:
+        dropped = len(esc.amendments) - _MAX_AMENDMENTS
+        del esc.amendments[:dropped]
+        esc.amendments_truncated += dropped
+        logger.warning(
+            '%s: %s shed %d oldest amendment(s) at the _MAX_AMENDMENTS=%d cap '
+            "(running total truncated=%d); the record's own original framing "
+            'is unaffected',
+            caller, esc.id, dropped, _MAX_AMENDMENTS, esc.amendments_truncated,
+        )
+    return True, dropped
+
+
 def iter_all_escalation_paths(escalations_dir: Path) -> Iterator[Path]:
     """Yield all ``esc-*.json`` paths from *escalations_dir* and its archive subtree.
 
@@ -499,7 +776,12 @@ def read_escalation_for_scan(
     file in this package was audited when this helper was introduced; the
     asymmetry below is deliberate, not an oversight.
 
-    FIXED -- the unlocked scans, all six reads routed through this helper:
+    FIXED -- the unlocked scans, all seven reads routed through this helper:
+    ``shadow_ruling.py::agreement_report`` (task 5374; the weekly shadow-ruling
+    count, which the watcher skill points at the LIVE ``data/escalations``
+    tree and which passes a WIDER ``parse_errors`` tuple than the default --
+    it adds ``ValueError`` so a truncated file's ``UnicodeDecodeError`` costs
+    one record rather than the whole measurement),
     ``queue.py::EscalationQueue.get_by_task``,
     ``queue.py::EscalationQueue.get_pending`` (which also backs
     ``dismiss_all_pending``, so the startup L0 sweep inherits the fix),
@@ -1187,6 +1469,7 @@ class EscalationQueue:
         *, resolved_by: str | None = None, resolution_turns: int | None = None,
         resolution_class: str | None = None,
         granted_files: list[str] | None = None,
+        outcome: ResolveOutcome | None = None,
     ) -> Escalation | None:
         """Update an escalation's status to resolved or dismissed.
 
@@ -1205,11 +1488,28 @@ class EscalationQueue:
         the caller's ``resolved_by`` (see ``escalation.classify.
         default_resolution_class_for_resolver``).
 
+        ``outcome`` (task 4495): an optional :class:`ResolveOutcome` dict filled
+        in place with what this call DID — whether the resolution was actually
+        applied, and the prior status/resolver when it was not.  Every key is
+        written on every return path.  Read it rather than assuming a non-None
+        return means the text took effect: the already-terminal branch below
+        returns the STORED record unchanged.
+
         Concurrency: the get → status-check → mutate → _atomic_write →
         _archive_resolved critical section is serialized under
         ``escalation_id_lock``.  Moving the idempotency status-check INSIDE
         the lock ensures that two concurrent resolves for the same id
         serialize and produce exactly one archive copy.
+
+        Already-terminal calls are a NON-LOSSY no-op (task 4495).  The record's
+        ``status`` / ``resolution`` / ``resolved_at`` / ``resolved_by`` are never
+        moved — downstream waiters have already consumed that terminal state —
+        but when the stored close was an AUTOMATED sweep and the incoming call
+        is a substantive human/agent resolution, the incoming text is appended to
+        ``late_resolutions`` and persisted IN PLACE at ``_locate_path``, inside
+        this same critical section so the capture is atomic with the
+        check-and-set it follows.  ``_is_late_resolution_worth_capturing`` is the
+        predicate, ``_capture_late_resolution`` the capture itself.
 
         Callbacks and cascade run AFTER releasing the lock:
         - ``_resolve_callback`` fires after the lock is released, preventing
@@ -1267,16 +1567,51 @@ class EscalationQueue:
                 f'expected one of {sorted(RESOLUTION_CLASSES)} or None'
             )
 
+        # Seed BEFORE the lock so the early returns below leave a complete dict
+        # rather than a stale caller-supplied one (the add_members_to_l2
+        # convention).  Note this runs AFTER the resolution_class validation
+        # above, so an INV-1 rejection leaves the caller's dict untouched —
+        # nothing is persisted and nothing is reported.
+        if outcome is not None:
+            outcome['applied'] = False
+            outcome['prior_status'] = None
+            outcome['prior_resolved_by'] = None
+            outcome['late_resolution_captured'] = False
+            outcome['resolution_class_corrected'] = None
+
         with escalation_id_lock(self.queue_dir, escalation_id):
             esc = self.get(escalation_id)
             if esc is None:
                 return None
 
             if esc.status != 'pending':
+                if outcome is not None:
+                    outcome['prior_status'] = esc.status
+                    outcome['prior_resolved_by'] = esc.resolved_by
                 logger.info(
                     f'Escalation {escalation_id} already {esc.status}; resolve() is a no-op'
                 )
+                # NON-LOSSY no-op (task 4495): the incoming text is refused, not
+                # DISCARDED.  See _is_late_resolution_worth_capturing for why the
+                # predicate is narrow, and _capture_late_resolution for what the
+                # capture does.  Both run inside escalation_id_lock, so the
+                # capture is atomic with the check-and-set it follows.
+                if _is_late_resolution_worth_capturing(esc, resolution, resolved_by):
+                    captured, corrected = self._capture_late_resolution(
+                        escalation_id, esc,
+                        resolution=resolution,
+                        resolved_by=resolved_by,
+                        dismiss=dismiss,
+                        resolution_class=resolution_class,
+                    )
+                    if captured and outcome is not None:
+                        outcome['late_resolution_captured'] = True
+                        outcome['resolution_class_corrected'] = corrected
                 return esc
+
+            if outcome is not None:
+                outcome['applied'] = True
+                outcome['prior_status'] = esc.status
 
             esc.status = 'dismissed' if dismiss else 'resolved'
             esc.resolution = resolution
@@ -1335,6 +1670,146 @@ class EscalationQueue:
                     )
 
         return esc
+
+    def _capture_late_resolution(
+        self, escalation_id: str, esc: Escalation, *,
+        resolution: str, resolved_by: str | None, dismiss: bool,
+        resolution_class: str | None,
+    ) -> tuple[bool, str | None]:
+        """Preserve one late resolution on an already-terminal *esc*.
+
+        THE one caller is :meth:`resolve`'s already-terminal branch, which has
+        already applied :func:`_is_late_resolution_worth_capturing` and holds
+        ``escalation_id_lock`` — so *esc* is the record as it is inside that
+        critical section and the capture is atomic with the check-and-set that
+        refused the incoming text.
+
+        Extracted so ``resolve()`` reads as its own primary job (check-and-set,
+        then apply) rather than burying it between two halves of this
+        bookkeeping: the stamp-correction derivation, the entry build, the
+        append, the cap trim, the loud-loss WARNINGs, and the rollback.
+
+        Returns ``(captured, corrected)`` — whether the entry reached DISK, and
+        the ``resolution_class`` this call re-derived (None when it re-derived
+        nothing).  ``corrected`` is meaningful only when *captured*: a write
+        that did not land is rolled back in full, stamp included, so there is no
+        correction left to report.
+
+        Mutates *esc* in place on the success path; the caller returns that same
+        object, so what it hands back matches what is on disk either way.
+        """
+        prior_class = esc.resolution_class
+        # Correct the stamp ONLY when it is the one the automated
+        # dismissal DERIVED.  `default_resolution_class_for_resolver`
+        # maps the reaper-sweep tier to 'benign' — i.e. the sweep
+        # asserted "nothing actionable here" about a record whose
+        # real resolution is the text we are capturing, which is the
+        # esc-3902-1 harm.  An 'actionable' stamp is already the
+        # truth this aims at, and 'moot-terminal-subject' (task 2724)
+        # says something specific about WHY the record was closed
+        # that flattening would destroy — neither is touched.
+        #
+        # A candidate EQUAL to the stored stamp is not a correction
+        # either, so it is reported as none: `corrected` means "the
+        # stamp this call re-derived", and re-deriving the value
+        # already there re-derived nothing.  Two live routes reach
+        # that: an explicit `resolution_class='benign'` argument,
+        # and the L2 member cascade (see `resolve`) forwarding a
+        # reaper-sweep L2's own 'benign' stamp onto a member that
+        # was itself already auto-dismissed 'benign'.
+        corrected: str | None = None
+        if esc.resolution_class == 'benign':
+            # `resolution_class` was validated against RESOLUTION_CLASSES at
+            # the top of `resolve`, so the incoming value is known-legal here.
+            candidate = resolution_class or 'actionable'
+            corrected = candidate if candidate != esc.resolution_class else None
+
+        entry, chars_elided = _build_late_resolution(
+            resolution=resolution,
+            resolved_by=resolved_by,
+            dismiss=dismiss,
+            # Preserved so the correction destroys nothing and the
+            # original derivation stays auditable.
+            prior_resolution_class=prior_class if corrected else None,
+            timestamp=datetime.now(UTC).isoformat(),
+        )
+        prior_list = list(esc.late_resolutions)
+        prior_truncated = esc.late_resolutions_truncated
+        prior_elided = esc.late_resolutions_chars_elided
+
+        esc.late_resolutions.append(entry)
+        esc.late_resolutions_chars_elided += chars_elided
+        # Trim in the SAME critical section and the SAME single
+        # write as the append, so no over-cap list is ever durable.
+        # OLDEST-shed: these entries are strictly additional to the
+        # record's own immutable terminal state, and a reader
+        # triaging NOW wants the most recent finding.
+        dropped_entries = 0
+        if len(esc.late_resolutions) > _MAX_LATE_RESOLUTIONS:
+            dropped_entries = len(esc.late_resolutions) - _MAX_LATE_RESOLUTIONS
+            esc.late_resolutions = esc.late_resolutions[dropped_entries:]
+            esc.late_resolutions_truncated += dropped_entries
+        if corrected is not None:
+            esc.resolution_class = corrected
+
+        if not self._write_late_resolution(escalation_id, esc):
+            # The write did not land, so nothing may be reported as
+            # captured — roll the in-memory record back to what is
+            # actually on disk, bookkeeping counters included.
+            esc.late_resolutions = prior_list
+            esc.late_resolutions_truncated = prior_truncated
+            esc.late_resolutions_chars_elided = prior_elided
+            esc.resolution_class = prior_class
+            return False, None
+
+        # An L2 member cascade is an ORDINARY close path, not a race: resolving
+        # an L2 re-resolves every member under `l2-cascade:<id>`, and a member a
+        # sweep had already auto-dismissed captures that forwarded text.  The
+        # capture itself is still wanted (the L2's resolution can be a human's
+        # substantive finding — see _is_late_resolution_worth_capturing), but
+        # calling it a late arrival "after that automated dismissal" would
+        # describe a race that did not happen, and at WARNING it would dilute
+        # the signal the real thing is supposed to carry.  Same facts, honest
+        # framing, routine level.
+        via_cascade = classify_resolver_tier(resolved_by) == 'cascade'
+        logger.log(
+            logging.INFO if via_cascade else logging.WARNING,
+            'Escalation %s was already dismissed by %r; %s from %r has been '
+            'CAPTURED in late_resolutions '
+            "(the record's terminal state is unchanged"
+            '%s): %s',
+            escalation_id, esc.resolved_by,
+            (
+                'an L2 CASCADE forward'
+                if via_cascade else
+                'a LATE resolution arriving after that automated dismissal'
+            ),
+            resolved_by,
+            (
+                f'; resolution_class corrected {prior_class!r} -> '
+                f'{corrected!r}'
+            ) if corrected is not None else '',
+            resolution[:200],
+        )
+        if dropped_entries:
+            logger.warning(
+                'resolve: %s shed %d oldest late resolution(s) at '
+                'the _MAX_LATE_RESOLUTIONS=%d cap (running total '
+                "truncated=%d); the record's own terminal state is "
+                'unaffected',
+                escalation_id, dropped_entries, _MAX_LATE_RESOLUTIONS,
+                esc.late_resolutions_truncated,
+            )
+        if chars_elided:
+            logger.warning(
+                'resolve: %s elided %d char(s) from a captured late '
+                'resolution at the _MAX_LATE_RESOLUTION_CHARS=%d cap '
+                '(running total elided=%d); the kept text is the HEAD '
+                'of what was submitted and says so in-band',
+                escalation_id, chars_elided, _MAX_LATE_RESOLUTION_CHARS,
+                esc.late_resolutions_chars_elided,
+            )
+        return True, corrected
 
     def park(
         self,
@@ -1671,10 +2146,11 @@ class EscalationQueue:
         text.  Characters dropped are added to ``amendments_chars_elided``,
         the byte-side counterpart of ``amendments_truncated``.
 
-        **The list is capped at** :data:`_MAX_AMENDMENTS`.  THIS METHOD is the
-        trimmer, at write time, in the same critical section and the same single
-        ``_rewrite`` as the append — so cap enforcement is atomic with it and no
-        over-cap list is ever durable.  It sheds the OLDEST entries, which is
+        **The list is capped at** :data:`_MAX_AMENDMENTS`.  The trim happens at
+        write time (:func:`_append_amendment_capped`), in the same critical
+        section and the same single ``_rewrite`` as the append — so cap
+        enforcement is atomic with it and no over-cap list is ever durable.  It
+        sheds the OLDEST entries, which is
         safe because the ORIGINAL framing is never in this list at all: it lives
         permanently in the record's own immutable ``root_cause``/``detail``/
         ``options``/``summary``.  The oldest amendment is therefore the
@@ -1741,7 +2217,10 @@ class EscalationQueue:
                 logger.warning(f'Failed to parse L2 escalation {escalation_id}: {e}')
                 return None
 
-            incoming_framing = bool(root_cause or evidence or options or summary)
+            incoming_framing = _has_framing(
+                root_cause=root_cause, summary=summary, evidence=evidence,
+                options=options,
+            )
             if not new_member_ids and severity_floor is None and not incoming_framing:
                 return esc  # no-op
 
@@ -1758,13 +2237,6 @@ class EscalationQueue:
                 else esc.severity
             )
             severity_changed = new_severity != esc.severity
-
-            # Preserve the incoming framing rather than discarding it.  Built
-            # inside the SAME escalation_id_lock critical section as the member
-            # append, so it lands in the same single _rewrite below — no second
-            # write path, no new durability story.
-            amendment_recorded = False
-            dropped_entries = 0
 
             # Track the DISTINCT pre-canonical root_cause spellings this cluster
             # has been addressed by (task 3998).  Canonicalising the match makes
@@ -1815,48 +2287,14 @@ class EscalationQueue:
                             + esc.root_cause_variants_truncated,
                         )
 
-            if incoming_framing:
-                candidate, chars_elided = _build_amendment(
-                    root_cause=root_cause, summary=summary, evidence=evidence,
-                    options=options, agent_role=agent_role,
-                    timestamp=datetime.now(UTC).isoformat(),
-                )
-                # Built BEFORE the repeat check, and the check reads the built
-                # entry: the stored form is what a later fold will be compared
-                # against, so comparing anything else would let two entries the
-                # record cannot tell apart both be recorded.
-                if not _is_repeat_framing(esc, candidate):
-                    esc.amendments.append(candidate)
-                    amendment_recorded = True
-                    # Count what the per-field caps dropped on the record, for
-                    # the same reason shed ENTRIES are counted below: a reader
-                    # must be able to tell a whole framing from the head of one
-                    # without scraping logs (INV-8).
-                    if chars_elided:
-                        esc.amendments_chars_elided += chars_elided
-                        logger.warning(
-                            'add_members_to_l2: %s elided %d char(s) of incoming '
-                            'framing at the per-field amendment caps (running '
-                            "total elided=%d); the record's own framing is "
-                            'unaffected',
-                            escalation_id, chars_elided,
-                            esc.amendments_chars_elided,
-                        )
-                    # Enforce the cap in the SAME critical section, so the trim
-                    # lands in the same single _rewrite as the append and there
-                    # is no durable window in which an over-cap list exists.
-                    if len(esc.amendments) > _MAX_AMENDMENTS:
-                        dropped_entries = len(esc.amendments) - _MAX_AMENDMENTS
-                        del esc.amendments[:dropped_entries]
-                        esc.amendments_truncated += dropped_entries
-                        logger.warning(
-                            'add_members_to_l2: %s shed %d oldest amendment(s) at '
-                            'the _MAX_AMENDMENTS=%d cap (running total '
-                            "truncated=%d); the record's own original framing is "
-                            'unaffected',
-                            escalation_id, dropped_entries, _MAX_AMENDMENTS,
-                            esc.amendments_truncated,
-                        )
+            # Preserve the incoming framing rather than discarding it, inside
+            # the SAME critical section as the member append, so it lands in
+            # the same single _rewrite below.
+            amendment_recorded, dropped_entries = _append_amendment_capped(
+                esc, root_cause=root_cause, summary=summary, evidence=evidence,
+                options=options, agent_role=agent_role,
+                caller='add_members_to_l2',
+            )
 
             # A new variant is a real content change, so it joins the existing
             # write condition rather than getting a write of its own — a fold
@@ -1922,9 +2360,10 @@ class EscalationQueue:
         previously-recorded predicate/probe. Does NOT touch ``updated_at``:
         an annotation must not masquerade as a content change.  The mutations
         that DO bump ``updated_at`` — and therefore DO re-trigger the watcher's
-        "changed since I triaged it" re-assess rule — are
+        "changed since I triaged it" re-assess rule — are, exhaustively:
         ``add_members_to_l2`` (a real member append, severity promotion or
-        recorded amendment; guarded, since a true no-op must not bump) and
+        recorded amendment; guarded, since a true no-op must not bump),
+        ``amend`` (a recorded explicit amendment; guarded the same way) and
         ``attach_dedupe_child`` (a dedupe fold; unconditional, since every
         successful call appends a child and increments ``dedupe_count``).
 
@@ -1953,6 +2392,74 @@ class EscalationQueue:
             self._rewrite(escalation_id, esc)
             logger.info('stamp_triage: stamped triage ack on %s', escalation_id)
             return esc
+
+    def amend(
+        self, escalation_id: str, *, root_cause: str = '', summary: str = '',
+        detail: str = '', options: list[str] | None = None, agent_role: str = '',
+    ) -> AmendResult:
+        """Append one framing :class:`~escalation.models.Amendment` to a pending record.
+
+        The explicit counterpart of the framing a ``promote_to_l2`` fold carries
+        in: a ruling made elsewhere can be written onto the record it rules on
+        WITHOUT a fold's side effects.  APPEND-ONLY through
+        :func:`_append_amendment_capped`, so the per-field elision, repeat
+        suppression and ``_MAX_AMENDMENTS`` oldest-shed policy are exactly the
+        fold's.  *detail* lands under the amendment's ``detail`` key.
+
+        It NEVER writes ``status``, ``severity``, ``level``, ``members``,
+        ``resolution`` / ``resolved_at`` / ``resolved_by`` /
+        ``resolution_action``, the triage quad, the record's own framing, or
+        ``root_cause_variants`` (an explicit amend is not a fold, so it must
+        not feed the over-fold signal).  There is NO severity floor, and it is
+        category-agnostic.
+
+        PENDING-ONLY, parked records included.  Loads from the queue root ONLY
+        (never ``self.get()``), so an archived record is ``not_found`` and is
+        never resurrected — the ``stamp_triage`` guard.
+
+        An ``updated_at`` writer (see ``stamp_triage``'s enumeration), guarded:
+        only a RECORDED amendment bumps it and rewrites the file.  A repeat of
+        what the record already says and an all-empty framing write nothing.
+
+        Serialized per-id by ``escalation_id_lock``; the result is computed
+        inside it.  See :class:`AmendResult`.
+        """
+        if not _has_framing(
+            root_cause=root_cause, summary=summary, evidence=detail, options=options,
+        ):
+            return {'status': 'no_framing', 'escalation': None, 'recorded': False, 'dropped': 0}
+        with escalation_id_lock(self.queue_dir, escalation_id):
+            path = self.queue_dir / f'{escalation_id}.json'
+            if not path.exists():
+                return {'status': 'not_found', 'escalation': None, 'recorded': False, 'dropped': 0}
+            try:
+                esc = Escalation.from_json(path.read_text())
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning(f'Failed to parse escalation {escalation_id}: {e}')
+                return {'status': 'not_found', 'escalation': None, 'recorded': False, 'dropped': 0}
+
+            if esc.status != 'pending':
+                return {'status': 'not_pending', 'escalation': esc, 'recorded': False, 'dropped': 0}
+
+            recorded, dropped = _append_amendment_capped(
+                esc, root_cause=root_cause, summary=summary, evidence=detail,
+                options=options, agent_role=agent_role, caller='amend',
+            )
+            # Framing already passed _has_framing above, so nothing recorded
+            # can only mean the record already says it.
+            if not recorded:
+                return {
+                    'status': 'repeat_framing', 'escalation': esc, 'recorded': False,
+                    'dropped': 0,
+                }
+
+            esc.updated_at = datetime.now(UTC).isoformat()
+            self._rewrite(escalation_id, esc)
+            logger.info(
+                'amend: %s recorded an amendment by %r (amendments=%d, shed=%d)',
+                escalation_id, agent_role, len(esc.amendments), dropped,
+            )
+            return {'status': 'amended', 'escalation': esc, 'recorded': True, 'dropped': dropped}
 
     def declare_pin(
         self, escalation_id: str, *, declared_by: list[str], reason: str = '',
@@ -1999,11 +2506,11 @@ class EscalationQueue:
         archived record into the pending pile — the Defect-2 class of bug that
         motivated task 1498's ``add_members_to_l2`` guard.
 
-        Does NOT touch ``status``, ``level``, ``triaged_at`` or ``updated_at``.
-        ``add_members_to_l2`` remains the SOLE ``updated_at`` writer, so that
-        signal keeps meaning exactly one thing ("real member append"); the
-        protection here is the loud refusal at resolve time, not a freshness
-        bump (see the task's design decision).
+        Does NOT touch ``status``, ``level``, ``triaged_at`` or ``updated_at``
+        — it is not among the ``updated_at`` writers ``stamp_triage``'s
+        docstring enumerates, so that signal keeps meaning "the record's
+        content changed"; the protection here is the loud refusal at resolve
+        time, not a freshness bump (see the task's design decision).
 
         Returns the updated ``Escalation``, or ``None`` when *escalation_id* is
         not found in the queue root, fails to parse, is not pending, or when
@@ -2375,6 +2882,50 @@ class EscalationQueue:
             finally:
                 os.close(dir_fd)
 
+    def _write_late_resolution(self, escalation_id: str, esc: Escalation) -> bool:
+        """Persist a late-resolution capture IN PLACE.  Returns True if it landed.
+
+        Writes to ``_locate_path(escalation_id)`` — wherever the record actually
+        lives — via ``_atomic_write_path``.  Deliberately NOT ``_atomic_write``,
+        which is hard-wired to ``queue_dir/{id}.json``: by the time a late
+        resolution arrives the record has been moved into the dated archive by
+        ``_archive_resolved``, so a root-targeted write would leave a SECOND copy
+        beside the archived one — resurrecting a closed record onto the
+        pending-scan surface and creating exactly the orphan state
+        ``TestResolveIdempotent`` exists to prevent.  Also NOT
+        ``_archive_resolved``, which would try to move an already-archived file.
+        ``patch_resolution_metadata`` is the established precedent for patching
+        an already-archived record in place.
+
+        FAIL-CLOSED and LOUD: a missing path or a failed write returns False
+        (the caller then drops the in-memory entry rather than reporting a
+        capture that is not on disk) and logs a WARNING carrying the text that
+        could not be persisted, so the resolution is at worst degraded to
+        log-only — never silently lost, and never reported as captured when it
+        was not.  A capture failure must not crash the resolve() it rode in on:
+        the caller's real business (reporting the record's terminal state) is
+        already done.
+        """
+        path = self._locate_path(escalation_id)
+        if path is None:
+            logger.warning(
+                'Could not locate on-disk record for %s; late resolution NOT '
+                'persisted and survives only in this log line: %s',
+                escalation_id, esc.late_resolutions[-1] if esc.late_resolutions else None,
+            )
+            return False
+        try:
+            self._atomic_write_path(path, esc.to_json())
+        except Exception as exc:
+            logger.warning(
+                'Failed to persist late resolution for %s to %s: %s; it survives '
+                'only in this log line: %s',
+                escalation_id, path, exc,
+                esc.late_resolutions[-1] if esc.late_resolutions else None,
+            )
+            return False
+        return True
+
     def _archive_resolved(self, escalation_id: str, resolved_at: str) -> None:
         """Best-effort move ``queue_dir/{escalation_id}.json`` into the dated archive subdir.
 
@@ -2734,26 +3285,48 @@ def observed_submit_response(
     still reported to its filer as 'queued'.  The filer then had no way to
     learn its escalation had been swallowed.
 
+    Task 5368 AMENDS that fix.  3236 left the two degraded branches — a re-read
+    that returns ``None``, and one that raises — returning the historical
+    ``'queued'`` shape, byte-identical to the branch that had actually
+    confirmed the record on disk.  That reintroduced 3236's own failure one
+    case over: a filer whose write never landed was told it had.  This function
+    now NEVER reports write intent as observed state on any branch.
+
     Re-reads the persisted record and returns:
     - still pending → ``{'id', 'status': 'queued', 'level'}`` (as before, plus
       the persisted level so a caller that asked for ``level=1`` can confirm
-      it landed);
+      it landed).  ``'queued'`` means, and only means, that the re-read found
+      the record pending on disk;
+    - re-read unavailable → ``{'id', 'status': 'accepted_unpersisted',
+      'persist_check', 'level'}``.  The write was accepted but its durability
+      is UNCONFIRMED, so nothing is guaranteed for L1 or L2 to drain and the
+      caller must keep driving the blocked task rather than standing down;
     - anything else → the auto-resolved shape ``escalate_blocker``'s docstring
       already promises, ``{'id', 'status', 'resolution', 'resolved_by',
-      'level'}``, carrying the record's REAL values.  No new status vocabulary
-      is invented, so no consumer needs updating.
+      'level'}``, carrying the record's REAL values.
 
-    FAIL-OPEN by construction: a re-read that returns ``None`` or raises falls
-    back to the historical ``'queued'`` response and logs a WARNING rather than
-    raising.  A filing must never be lost to a bookkeeping read — that is the
-    very failure mode being fixed here.
+    ``persist_check`` discriminates the two causes, which are materially
+    different for an operator debugging the outage: ``'absent'`` means nothing
+    for that id is on disk — ``queue.get`` exhausted the queue root, the
+    archive, a targeted archive re-probe AND the TOCTOU re-locate retry, and a
+    path re-probe agrees; ``'unreadable'`` means a read was attempted and
+    yielded no record, so the record's state is unknown rather than known to be
+    missing.  ``get`` answers ``None`` for BOTH — a file it cannot parse is a
+    ``None`` too — which is why the ``None`` branch re-probes instead of
+    assuming absence (``_classify_failed_reread``).  It is a structured field
+    rather than two statuses because the distinction does not change what the
+    caller should do.
+
+    STILL FAIL-OPEN, in the sense that matters: a bookkeeping read never raises
+    at the ladder's front door and never costs the caller its escalation id.
+    What it no longer does is launder an unconfirmed write into a confirmation.
 
     ``fallback_level`` is the level the CALLER wrote (i.e. ``esc.level``).  It
-    is echoed on the two fail-open branches so ``level`` is present on EVERY
+    is echoed on the two unpersisted branches so ``level`` is present on EVERY
     response this function can return: the ``level`` echo is documented as the
     way a caller confirms its requested level landed, and a caller written to
-    that contract must not hit a ``KeyError`` in exactly the degraded case the
-    fail-open exists to survive.  It is a fallback, never an override — when
+    that contract must not hit a ``KeyError`` in exactly the degraded case
+    these branches exist to survive.  It is a fallback, never an override — when
     the re-read succeeds, the PERSISTED level is reported even if it differs
     from what the caller asked for (born-at-L2 severity legitimately overrides
     a requested level=1).
@@ -2769,25 +3342,37 @@ def observed_submit_response(
     from the root — i.e. an O(archive) scan is possible on the submit path in
     exactly the resolve+archive race this targets.  Acceptable at current
     volumes; if it ever shows up in a storm profile (e.g. a 30-task infra
-    fan-out), read ``queue_dir/{id}.json`` directly and treat an absent record
-    as the fail-open 'queued' case — that is already this function's documented
-    behaviour for an unreadable record, though it would forfeit the honest
-    observed-state report for a record archived between submit and re-read.
+    fan-out), read ``queue_dir/{id}.json`` directly — but note that a bare
+    root read cannot tell an archived record from an absent one, so it would
+    report ``'accepted_unpersisted'`` for a record that legitimately landed and
+    was archived between submit and re-read.
     """
     try:
         persisted = queue.get(esc_id)
     except Exception as exc:
-        logger.warning(
-            'Post-submit re-read of %s failed (%s); reporting queued (fail-open)',
+        logger.error(
+            'Post-submit re-read of %s failed (%s); its persistence is '
+            'UNCONFIRMED and it may never reach L1 or L2',
             esc_id, exc,
         )
-        return _fail_open_queued(esc_id, fallback_level)
+        return _unpersisted_response(esc_id, fallback_level, PERSIST_CHECK_UNREADABLE)
     if persisted is None:
-        logger.warning(
-            'Post-submit re-read of %s returned nothing; reporting queued (fail-open)',
-            esc_id,
-        )
-        return _fail_open_queued(esc_id, fallback_level)
+        persist_check = _classify_failed_reread(queue, esc_id)
+        if persist_check == PERSIST_CHECK_ABSENT:
+            logger.error(
+                'Post-submit re-read of %s found no record in the queue root or '
+                'the archive; the filing did not persist and will never reach '
+                'L1 or L2',
+                esc_id,
+            )
+        else:
+            logger.error(
+                'Post-submit re-read of %s found a file on disk that yielded no '
+                'record (a torn or corrupt write is the likely cause); its '
+                'persistence is UNCONFIRMED and it may never reach L1 or L2',
+                esc_id,
+            )
+        return _unpersisted_response(esc_id, fallback_level, persist_check)
     if persisted.status == 'pending':
         return {'id': esc_id, 'status': 'queued', 'level': persisted.level}
     logger.warning(
@@ -2804,12 +3389,59 @@ def observed_submit_response(
     }
 
 
-def _fail_open_queued(esc_id: str, fallback_level: int | None) -> dict[str, Any]:
-    """The fail-open 'queued' response, carrying *fallback_level* when known.
+def _classify_failed_reread(queue: EscalationQueue, esc_id: str) -> str:
+    """Why a ``None`` re-read yielded nothing: absent, or present-but-unreadable.
+
+    ``EscalationQueue.get`` answers ``None`` for two materially different
+    reasons.  The record may be nowhere — queue root, archive, the targeted
+    archive re-probe and the TOCTOU re-locate retry all missed.  Or a file for
+    that id IS on disk and yields no record: ``get`` warns and returns ``None``
+    when the JSON will not parse into an ``Escalation``, which is the torn or
+    corrupt write — precisely the "accepted but not durable" failure this
+    response exists to name.  Calling that ``'absent'`` would send an operator
+    hunting for a file that is sitting right there, so the path is re-probed to
+    tell the two apart.
+
+    Cheap by construction: the ``_locate_path`` call ``get`` just made
+    negative-caches a genuinely absent id, so this re-probe is a set hit rather
+    than a second archive scan.
+
+    Uses ``queue._locate_path`` because it is the one thing that answers "is
+    anything on disk for this id" without re-reading the record.  That is an
+    intra-module use of the class this module defines, not a reach into another
+    module's internals.
+    """
+    try:
+        located = queue._locate_path(esc_id)
+    except Exception as exc:
+        logger.warning(
+            'Post-submit path re-probe of %s failed (%s); reporting its persist '
+            'state as unknown rather than as a confirmed absence',
+            esc_id, exc,
+        )
+        return PERSIST_CHECK_UNREADABLE
+    return PERSIST_CHECK_ABSENT if located is None else PERSIST_CHECK_UNREADABLE
+
+
+def _unpersisted_response(
+    esc_id: str,
+    fallback_level: int | None,
+    persist_check: str,
+) -> dict[str, Any]:
+    """The unconfirmed-persist response, carrying *fallback_level* when known.
+
+    *persist_check* is one of ``models.PERSIST_CHECKS`` — see the
+    ``persist_check`` paragraph in ``observed_submit_response``'s docstring for
+    what each verdict claims.
 
     ``level`` is omitted only when the caller supplied no fallback — legacy
     callers that predate the echo contract — so the key is never fabricated.
     """
+    response = {
+        'id': esc_id,
+        'status': STATUS_ACCEPTED_UNPERSISTED,
+        'persist_check': persist_check,
+    }
     if fallback_level is None:
-        return {'id': esc_id, 'status': 'queued'}
-    return {'id': esc_id, 'status': 'queued', 'level': fallback_level}
+        return response
+    return {**response, 'level': fallback_level}

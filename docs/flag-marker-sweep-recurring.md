@@ -66,8 +66,8 @@ enumerates it, never runs a predicate over it, and never adds it to the
 delete set — a boundary enforced by `TestFlagForStage2IsNeverDeleted` in
 `fused-memory/tests/test_sweep_orphan_flag_markers.py`. Three reasons were
 originally given, two of them measured on 2026-08-09. Item 2 has since been
-closed by task 4435 (on the two gaps it named — see the divergence note under
-it) and no longer carries any weight; the ruling stands on items 1 and 3, each
+closed by task 4435 (on the two gaps it named — see the note under it) and no
+longer carries any weight; the ruling stands on items 1 and 3, each
 independently sufficient:
 
 1. **23 of the 61 live records carry no usable `task_id`**, so the script's
@@ -96,28 +96,15 @@ independently sufficient:
    so a reader can see the gap existed and was closed rather than wondering
    whether it was ever considered.
 
-   **Do not read this as full parity with the in-cycle collector.**
-   `_sweep_stale_mem0_pool` applies a THIRD protected-record predicate the
-   script still lacks: `is_protected_audit_record` /
-   `PROTECTED_AUDIT_KINDS` (task 4375), which withholds
-   deliberately-permanent audit records such as `kind='cadence_check'` —
-   the guard added after an age-only rule destroyed 40 of them in
-   `autopilot_video`. The script's own `find_stale_markers` /
-   `find_terminal_task_markers` can still reach such a record if it carries
-   `source='stage1_flag_marker'`. That divergence is deliberate (task
-   4435's scope was the two counts above, and the audit arm does not port
-   mechanically — in the in-cycle collector it sits BEHIND a primary
-   terminal-task-closure gate, whereas this script's `--terminal-drain`
-   deliberately deletes markers *because* their task went terminal) and is
-   tracked as **task 5129**. It does not reopen this item, whose subject was
-   the mirror guard and the tombstone write — both closed. If anything it
-   argues the other way: the 40 destroyed `cadence_check` records were in
-   *this* `flag_for_stage2` pool, so a script that deleted from it while
-   still missing the audit guard would repeat exactly that loss. Within the
-   script's own `source` enumeration the gap is live but latent for the same
-   structural reason item 2 was before it was closed: that filter is
-   documented above as matching zero records in every project probed, so it
-   reaches no `cadence_check` record either — today.
+   `_sweep_stale_mem0_pool` applies a THIRD protected-record predicate,
+   `is_protected_audit_record` / `PROTECTED_AUDIT_KINDS` (task 4375), which
+   withholds deliberately-permanent audit records such as
+   `kind='cadence_check'` — the guard added after an age-only rule destroyed
+   40 of them in `autopilot_video`. Task 5286 ported it to the script,
+   together with a primary arm of the script's own; the decision is recorded
+   in [Protected-record guards](#protected-record-guards-denylist-plus-a-primary-arm-task-5286).
+   That does not reopen this item, whose subject was the mirror guard and the
+   tombstone write.
 3. **The pool is already drained correctly** by task 2966's in-cycle
    collector, on a rolling 14-day window. A second collector here would race
    a correct one, producing duplicate deletes and duplicate tombstones for
@@ -126,6 +113,60 @@ independently sufficient:
 Whether those records should *ultimately* be deleted is a separate question,
 now adjudicable because the sweep can finally see them. Making them visible
 is this script's job; deleting them is not.
+
+### Protected-record guards: denylist plus a primary arm (task 5286)
+
+Every record the sweep withholds is classified by
+`fused-memory/scripts/sweep_orphan_flag_markers.py::protection_reason`, in
+this order. Each skip's WARNING names its reason, and the JSON report's
+`protected_skipped_reasons` maps each skipped id to it:
+
+1. `cycle_summary_mirror` — `mem0_tombstone.is_protected_mirror_record`
+   (tasks 3041/4435).
+2. `protected_audit_kind` — `mem0_tombstone.is_protected_audit_record`, the
+   `PROTECTED_AUDIT_KINDS` denylist (task 4375).
+3. `foreign_kind` — the script's PRIMARY arm: a `kind` that is present and
+   is not `stage1_flag_marker`.
+
+**Decision:** the denylist PLUS a named primary arm, the foreign-kind arm.
+
+**Why a primary arm is needed.** The denylist protects only the kinds
+someone registered, and in this script that is not enough:
+
+- `find_orphan_markers` (`kind != MARKER_KIND`) nominates any foreign-kind
+  record IMMEDIATELY, at any age and in every mode, so an unregistered audit
+  kind would be reached on the first run.
+- `--terminal-drain` walks into the denylist's residual intersection by
+  design: it deletes markers *because* their task went terminal.
+
+**Why not the terminal-closure gate.** `mem0_tombstone` names the
+terminal-task-closure gate as the primary defence, but `--terminal-drain` is
+its inverse. That gate also guards only the `flag_for_stage2` collector; this
+pool's in-cycle collector, `_sweep_stale_mem0_flag_markers`, is age-only plus
+the two denylist guards.
+
+**Why the foreign-kind arm.** The legacy pool's shape is exactly "kind absent
+or `stage1_flag_marker`", so a declared different kind is positive evidence
+that the record belongs to another pool, and an unregistered audit kind is
+protected without anyone editing a list. The arm ignores task status, so it
+behaves identically with and without `--terminal-drain`. Withholding costs
+nothing: the in-cycle collector still age-GCs genuine foreign-kind dead
+weight in this pool, subject to its own guards.
+
+**Why the denylist is kept.** Correct attribution — an audit record is
+reported as `protected_audit_kind`, never as merely `foreign_kind` — and
+parity with the in-cycle collector, so a future narrowing of the primary arm
+cannot silently drop audit protection.
+
+**The accepted residual.** An audit record that carries NO `kind` is
+protected by neither arm, the same as in-cycle.
+
+**The arm is absolute.** Like the mirror guard, it is enforced at the delete
+choke point and overrides `--delete-ids` (`targeted_correction_ids` still
+shows the refused request). The remedy for a record that genuinely must go is
+the individually authorised fused-memory MCP `delete_memory` tool. Every
+protected record also floors the residual backlog; see
+[`structural_floor`](#structural_floor-which-part-of-the-backlog-can-never-be-drained).
 
 ## Reading the output: `0 swept` is not automatically a clean bill
 
@@ -157,6 +198,93 @@ its JSON report:
   unobserved population is never reported as an observed blind spot. The
   sweep is unaffected: the probe is count-only and can never alter the
   delete set or abort a run.
+
+### `structural_floor`: which part of the backlog can never be drained
+
+A `--check --max-backlog N` violation renders as a plain `rc=1` whether it is
+transient (a drain clears it) or permanent (nothing ever will). Task 4436
+makes that distinction machine-readable. Every run emits:
+
+```json
+"structural_floor": {
+  "undated_kept_count": 1,
+  "undrainable_count": 2,
+  "undrainable_ids": ["u1", "m1"],
+  "max_backlog": 0,
+  "gate_unsatisfiable": true,
+  "gate_evaluated": true
+}
+```
+
+The floor is **the undated-and-undrained members UNION the protected ones** —
+NOT the raw `undated_kept_count`. The two arms differ in kind, and so do
+their remedies:
+
+- **Undated and undrained.** `find_stale_markers` fail-safe keeps a
+  missing/unparseable `created_at` at every `--max-age-days` including `0`,
+  so no age cutoff reaches these — but `--delete-ids` and `--terminal-drain`
+  still can. This arm is therefore **relative to the invocation**: a
+  `--check` without `--terminal-drain` counts terminal-referenced undated
+  markers as floor, which is the honest answer to "can THIS command's gate
+  ever pass". The logged remedy names the missing flag.
+- **Protected.** `cycle_summary` mirrors and `ledger_stamp` records (tasks
+  3041/4435), `PROTECTED_AUDIT_KINDS` audit records (task 4375) and
+  foreign-kind records (task 5286) are refused unconditionally at the delete
+  choke point, overriding even `--delete-ids`. This arm is **absolute**: no flag of this
+  script drains it, so the remedy is the fused-memory MCP `delete_memory`
+  tool or a corrected `source` enumeration.
+
+`undated_kept_count` is repeated inside the block so the raw count and the
+true floor read side by side, because the two can differ in **both**
+directions:
+
+- an undated marker that is also a kind-orphan is deleted this run, so it
+  counts toward `undated_kept_count` and floors **nothing**;
+- a fully dated protected mirror contributes `0` to `undated_kept_count` and
+  floors the backlog **permanently**.
+
+Before task 4436 the WARNING was keyed on the raw count, so the first case
+told operators to raise `--max-backlog` when the true floor was 0.
+
+- **`gate_unsatisfiable: true`** — `undrainable_count > max_backlog`: no
+  re-run of this sweep can ever clear this gate. Computed on every run
+  against the effective `--max-backlog` (default `0`), so a nightly
+  `--apply --terminal-drain` records the fact in its journal JSON too.
+- **`gate_evaluated`** — mirrors `--check`, and is the discriminator between
+  the two things `gate_unsatisfiable` can mean. `true`: a gate really ran
+  and can never pass. `false`: no gate was configured, and this is what the
+  *default* ceiling would have done — the nightly service's shape, which is
+  why `gate_unsatisfiable: true` there is not a failing check. Without this
+  field the block would mix an evaluated verdict with a hypothetical one and
+  give a consumer no way to tell them apart. The matching ERROR is logged
+  only when `gate_evaluated` is `true`, so the nightly service gains no
+  spurious ERROR line for a gate it never runs.
+
+**Clearing the floor is NECESSARY, not sufficient.** `--check` resolves its
+verdict through `_resolve_check_exit_code`, which compares
+`after.total_source` on an `--apply` run and falls back to
+`before.total_source` otherwise — and
+`scripts/fused-memory-flag-marker-check.sh` hardcodes `--check` with no
+`--apply`, so **its** verdict compares the whole enumerated residual rather
+than the floor. Concretely: 10 enumerated members with a floor of 1 under
+`--check --max-backlog 0` reports `gate_unsatisfiable: true`, but raising
+the ceiling to 1 still exits 1, because the comparand is 10. Raise the
+ceiling to at least `undrainable_count` to make the gate *satisfiable at
+all*; raise it to the resolved residual to make *this* run pass. Both
+figures are in the emitted JSON (`structural_floor.undrainable_count` and
+`before.total_source` / `after.total_source`), and the ERROR names them.
+- **The exit code is unchanged by design.** `rc` is the sweep's own, and the
+  orchestrator's `before_done` path renders any `rc != 0` identically as a
+  predicate violation, so a distinct code would buy separability nowhere it
+  is consumed (the same ruling already adjudicated for the blind spot, in
+  `scripts/fused-memory-flag-marker-check.sh`'s header). A consumer that
+  needs to tell a permanent floor from a transient backlog reads
+  `structural_floor.gate_unsatisfiable`, exactly as it reads
+  `cross_check.blind_spot`.
+
+The floor is defined over the sweep's KEEP-sets rather than over an
+enumerated list of sources, so when task 5286 added the audit and
+foreign-kind arms to the protected set, this floor widened automatically.
 
 **An observed blind spot fails `--check` BY DEFAULT (task 3923).** A verdict
 rendered from an enumeration that matched nothing must not read as a pass,
@@ -373,10 +501,12 @@ an `if not known_projects` check is unreachable in exactly the degradation it
 looks like it guards. Three cases are distinguished:
 
 - **a named root that is not a directory on this host** — a typo, or a
-  moved/unmounted checkout. `Path.resolve()` is non-strict, so the builder
-  *admits* such a root under a basename-derived project_id rather than
-  skipping it: the nightly then sweeps a phantom project that enumerates 0,
-  deletes 0 and exits 0 — a silent green. Named individually.
+  moved/unmounted checkout. The builder *admits* such a root under a
+  basename-derived project_id deliberately, and WARNs at build time (task
+  5286; `fused-memory/src/fused_memory/models/scope.py::build_known_projects_map`'s
+  docstring records why). The nightly still sweeps that phantom project,
+  which enumerates 0, deletes 0 and exits 0 — a silent green — so the report
+  names it individually.
 - **a named root whose resolved path is absent from the map** — its
   project_id was claimed first by a root listed earlier (`first-wins`, with
   the primary root seeded first), so that checkout is never swept. Named
@@ -401,19 +531,32 @@ derivation, read by both consumers (`--list-known-projects` prints
 
 ## Why no `--check` in the recurring service
 
-The sweep's own docstring/WARNING (see `run()`'s `undated_kept_count`) notes
-that markers with a missing or unparseable `created_at` can never be
-drained by `find_stale_markers`, at any age cutoff — this sets a residual
-floor on the backlog. A recurring `--check --max-backlog 0` service would
-therefore enter systemd `failed` state on every run, forever, whenever any
-undated marker exists — a self-inflicted perpetual-failure footgun. Dropping
-`--check` from the recurring service lets each nightly drain exit 0 on a
-normal run.
+Part of the enumerated population can never be drained by any invocation of
+this sweep — see [`structural_floor`](#structural_floor-which-part-of-the-backlog-can-never-be-drained)
+above. A recurring `--check --max-backlog 0` service would therefore enter
+systemd `failed` state on every run, forever, whenever that floor is nonzero
+— a self-inflicted perpetual-failure footgun. Dropping `--check` from the
+recurring service lets each nightly drain exit 0 on a normal run.
+
+Since task 4436 this is a **checked constraint rather than an unenforced
+caveat**: the nightly run still computes and reports the floor and what a
+hypothetical default-ceiling gate would have done (marked
+`gate_evaluated: false`, so it is never mistaken for a failing check), and an
+invocation that *does* pass `--check` with a ceiling below the floor is told
+so with an ERROR naming the floor, the ceiling and the per-arm remedy,
+instead of failing indistinguishably from a transient over-backlog. Note the
+floor is not equal to `undated_kept_count`, which is why keying a gate on
+that count was itself a footgun — and that clearing the floor is necessary
+but not sufficient for a gate to pass, which is why the ERROR names the
+resolved residual as well.
 
 ## Backstop for residual backlog
 
-Persistent or undrainable residual (chiefly the undated-marker floor above)
-is already surfaced by the existing reconciliation Stage-1/2 re-flag net —
+"Undrainable residual" means precisely `structural_floor.undrainable_count`
+above — the undated-and-undrained members plus the protected ones — not the
+raw `undated_kept_count`, and not a backlog that is merely large. Persistent
+or undrainable residual is already surfaced by the existing reconciliation
+Stage-1/2 re-flag net —
 the very mechanism that filed tasks 2596 and 2693. No new escalation glue
 was added for this. A future enhancement could add a 2663-2666-style
 delayed-predicate born-at-L2 tripwire (e.g. "N days after this task lands,
@@ -446,8 +589,8 @@ mcp__fused-memory__count_memories_by_metadata(
 )
 ```
 
-A residual count near the undated-marker floor (see above) is expected and
-healthy; a count that isn't shrinking at all across multiple nightly runs
+A residual count near `structural_floor.undrainable_count` (see above) is
+expected and healthy — that is the floor no invocation can reach below; a count that isn't shrinking at all across multiple nightly runs
 means the timer isn't actually firing — check `systemctl --user
 list-timers` and `journalctl --user -u fused-memory-flag-marker-sweep.service`
 on the host.

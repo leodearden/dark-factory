@@ -15,6 +15,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _git_fixtures import seed_repo
 
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import GitConfig
@@ -490,20 +491,9 @@ class TestWarmLanePoolCensusClassification:
 # ===========================================================================
 
 
-async def _init_repo(repo: Path) -> None:
-    await _run(['git', 'init', '-b', 'main'], cwd=repo)
-    await _run(['git', 'config', 'user.email', 'test@test.com'], cwd=repo)
-    await _run(['git', 'config', 'user.name', 'Test'], cwd=repo)
-    (repo / 'README.md').write_text('# Test\n')
-    await _run(['git', 'add', '-A'], cwd=repo)
-    await _run(['git', 'commit', '-m', 'Initial commit'], cwd=repo)
-
-
 @pytest.fixture
 def wl_git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / 'repo'
-    repo.mkdir()
-    asyncio.run(_init_repo(repo))
+    repo = seed_repo(tmp_path / 'repo')
     # Task 2061: pre-create the DEFAULT derived warm-lane base
     # (<repo>/.worktrees/_merge-verify/target, non-empty) so the
     # acquire_warm_lane pre-acquire base-health gate sees WarmBaseHealth.OK
@@ -793,6 +783,46 @@ class TestSeedRcToUnavailable:
         from orchestrator.git_ops import _seed_rc_to_unavailable
         assert _seed_rc_to_unavailable(127) is WarmLaneUnavailable.FAULT
 
+    def test_124_is_lane_lock_timeout(self):
+        """Task 4930: rc=124 is flock's --conflict-exit-code for the bounded
+        ``<lane_dir>.lock`` wait — a TRANSIENT contention signal (a concurrent
+        GC reseed / thin / another seed still holds the lock), not a per-task
+        fault.  Before 4930 it fell through to FAULT, which is the one
+        warm-lane discriminant that is not a WarmLaneRequeue, so a lost lock
+        race hard-BLOCKed the task with agent_invocations=0.
+
+        Pinned via the module constant, not a bare 124 literal, so a retune of
+        the sentinel moves the test with it.
+        """
+        from orchestrator.git_ops import (
+            _SEED_WARM_LANE_LOCK_TIMEOUT_RC,
+            _seed_rc_to_unavailable,
+        )
+        assert _SEED_WARM_LANE_LOCK_TIMEOUT_RC == 124, (
+            'the flock --conflict-exit-code sentinel is expected to stay at '
+            "timeout(1)'s well-known 124 convention"
+        )
+        assert (
+            _seed_rc_to_unavailable(_SEED_WARM_LANE_LOCK_TIMEOUT_RC)
+            is WarmLaneUnavailable.LANE_LOCK_TIMEOUT
+        )
+
+    def test_existing_rc_mappings_unchanged(self):
+        """The new 124 branch must not swallow a neighbouring rc.
+
+        Re-asserts every other documented row in one place so a future edit to
+        the discriminant cannot quietly widen the lock-timeout branch (e.g. a
+        ``rc >= 124`` comparison) past its single cell.
+        """
+        from orchestrator.git_ops import _seed_rc_to_unavailable
+        assert _seed_rc_to_unavailable(75) is WarmLaneUnavailable.DISK_PRESSURE
+        assert _seed_rc_to_unavailable(76) is WarmLaneUnavailable.BASE_ABSENT
+        assert (
+            _seed_rc_to_unavailable(77)
+            is WarmLaneUnavailable.LANE_LOCK_CONTENDED
+        )
+        assert _seed_rc_to_unavailable(1) is WarmLaneUnavailable.FAULT
+        assert _seed_rc_to_unavailable(127) is WarmLaneUnavailable.FAULT
     # ── task 4211: rc 77 → LANE_LOCK_CONTENDED ────────────────────────────
     #
     # reify's seed-warm-lane.sh emits 75 at exactly two sites, BOTH lane-lock

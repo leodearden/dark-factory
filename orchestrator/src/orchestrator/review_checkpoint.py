@@ -9,7 +9,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from shared.cli_invoke import AllAccountsCappedException, invoke_with_cap_retry
+from shared.cli_invoke import (
+    AllAccountsCappedException,
+    classify_cap_kill,
+    invoke_with_cap_retry,
+)
 
 from orchestrator.agents.invoke import invoke_agent
 from orchestrator.agents.roles import DEEP_REVIEWER, submit_only_instructions
@@ -28,6 +32,30 @@ if TYPE_CHECKING:
     from orchestrator.usage_gate import UsageGate
 
 logger = logging.getLogger(__name__)
+
+
+def render_reflection_instructions(*, project_id: str, review_id: str) -> str:
+    """Step 4 of the deep-review prompt: preserve the review's insights as memories.
+
+    Public because ``fused-memory/tests/test_referent_declaration_examples.py``
+    runs its ``add_memory`` example through the live entities_gate.
+    """
+    return f"""\
+4. **Reflect on your findings** — write separate memories for each insight worth preserving:
+   - **Patterns and surprises** — recurring issues, unexpected gaps, systemic weaknesses
+     (`category="observations_and_summaries"`)
+   - **Discovered conventions** — implicit rules you noticed in the code that aren't documented
+     (`category="preferences_and_norms"`)
+   - **Architectural insights** — structural observations about how modules interact, where
+     coupling is tight or loose, where the design is fragile
+     (`category="decisions_and_rationale"`)
+   - Use `add_memory(content=..., category=..., project_id="{project_id}", agent_id="claude-review-{review_id}")`,
+     adding `entities` to declare the task(s) the insight is about, for example:
+     `add_memory(content="Task 3127's retry loop swallows the timeout error", category="observations_and_summaries", project_id="{project_id}", agent_id="claude-review-{review_id}", entities=[{{'kind': 'task', 'id': 3127}}])`
+   - Declare only the referents the insight is about, and pass `[]` when none apply. Omitting
+     `entities` always succeeds; a declaration that your own content contradicts is rejected
+   - Write each insight as its own memory — don't batch into one blob
+   - Skip anything obvious from the code itself; focus on what a future agent couldn't easily rediscover"""
 
 
 @dataclass
@@ -206,6 +234,7 @@ class ReviewCheckpoint:
             event_store=self.event_store,
             cost_store=self.cost_store,
         )
+        backend = getattr(self.config.backends, 'deep_reviewer', 'claude')
         try:
             result = await invoke_with_cap_retry(
                 usage_gate=self.usage_gate,
@@ -221,7 +250,7 @@ class ReviewCheckpoint:
                 disallowed_tools=DEEP_REVIEWER.disallowed_tools or None,
                 mcp_config=mcp_config,
                 effort=decision.effort,
-                backend=getattr(self.config.backends, 'deep_reviewer', 'claude'),
+                backend=backend,
             )
         except AllAccountsCappedException as e:
             # BD-1: the reason text is single-sourced from the SAME
@@ -256,7 +285,13 @@ class ReviewCheckpoint:
             try:
                 # Report the RESOLVED model (task η) — diverges from raw
                 # config.models.deep_reviewer under a policy rule / override.
+                # `model` is that routing-resolved lineage alias; `model_id` is
+                # the exact version the CLI actually served (task 4826).
                 model_name = decision.model
+                capped_reason = classify_cap_kill(
+                    result, budget_usd=decision.budget_usd, max_turns=decision.max_turns,
+                    backend=backend,
+                )
                 await self.cost_store.save_invocation(
                     run_id=self.run_id,
                     task_id=None,
@@ -270,7 +305,9 @@ class ReviewCheckpoint:
                     cache_read_tokens=result.cache_read_tokens,
                     cache_create_tokens=result.cache_create_tokens,
                     duration_ms=elapsed_ms,
-                    capped=False,
+                    capped=capped_reason is not None,
+                    capped_reason=capped_reason,
+                    model_id=result.model_id,
                     started_at=started_at,
                     completed_at=completed_at,
                 )
@@ -413,6 +450,9 @@ class ReviewCheckpoint:
         project_root = str(self.config.project_root)
         project_id = self.config.fused_memory.project_id
 
+        reflection_block = render_reflection_instructions(
+            project_id=project_id, review_id=review_id
+        )
         submit_resolve_block = submit_only_instructions(
             f'{{"source": "review-cycle", "review_id": "{review_id}", '
             f'"files": ["path/to/file-or-directory", ...], '
@@ -510,17 +550,7 @@ violations are always bugs. Pay special attention to `stability_concerns`.
    - Ambiguous/architectural → `escalate_info(category=..., summary=...)`
    - Known/accepted → dismiss (don't report)
 
-4. **Reflect on your findings** — write separate memories for each insight worth preserving:
-   - **Patterns and surprises** — recurring issues, unexpected gaps, systemic weaknesses
-     (`category="observations_and_summaries"`)
-   - **Discovered conventions** — implicit rules you noticed in the code that aren't documented
-     (`category="preferences_and_norms"`)
-   - **Architectural insights** — structural observations about how modules interact, where
-     coupling is tight or loose, where the design is fragile
-     (`category="decisions_and_rationale"`)
-   - Use `add_memory(content=..., category=..., project_id="{project_id}", agent_id="claude-review-{review_id}")`
-   - Write each insight as its own memory — don't batch into one blob
-   - Skip anything obvious from the code itself; focus on what a future agent couldn't easily rediscover
+{reflection_block}
 
 5. **Output** structured JSON at the end of your response:
 

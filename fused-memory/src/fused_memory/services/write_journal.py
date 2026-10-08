@@ -1,4 +1,14 @@
-"""SQLite-backed write journal for durable auditing of all memory writes."""
+"""SQLite-backed write journal for durable auditing of all memory writes.
+
+``OPERATOR_TELEMETRY_QUERY`` is the read-only per-write telemetry query, which
+operators run through ``fused-memory/scripts/telemetry_query.py`` (OPERATIONS.md
+§11). In it, a NULL ``backend_ops.duration_ms`` means the row predates the
+column; a value is the measured backend-call time, excluding identity-lock and
+queue wait. Its token columns are populated only on graphiti LLM-bearing
+writes. They are attributed to their write exactly, but they count what the
+upstream LLM client records, so tokens from failed or retried attempts are not
+included.
+"""
 
 from __future__ import annotations
 
@@ -8,11 +18,14 @@ import json
 import logging
 import time
 import uuid as uuid_mod
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
 from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
+
+from fused_memory.backends.llm_token_usage import LlmTokenUsage
 
 logger = logging.getLogger(__name__)
 
@@ -80,11 +93,11 @@ CREATE TABLE IF NOT EXISTS write_ops (
     --               the write. That case is separable: the queue prefixes
     --               terminal_error with POST_EXECUTE_DEAD_PREFIX
     --               ('post-execute failure (the backend write LANDED; ...)')
-    --               when the failure happened after the backend call
-    --               succeeded. Absent that prefix, terminal_error is the
-    --               queue's own f'{type(exc).__name__}: {exc}' from a failed
-    --               execute. When in doubt, check backend_ops (joined on
-    --               write_op_id) before replaying.
+    --               when a backend write for the item had landed. Before
+    --               replaying, read the queue row's structured `executed`
+    --               rather than matching that prefix; its domain and the
+    --               replay rule are in
+    --               services/durable_queue.py::DurableWriteQueue.get_dead_items.
     --
     -- LAST-WRITE-WINS: replay_dead resets a dead item to pending, so a
     -- dead-letter that is later replayed and lands correctly re-stamps
@@ -188,7 +201,8 @@ CREATE TABLE IF NOT EXISTS backend_ops (
     result_summary TEXT,
     success INTEGER DEFAULT 1,
     error TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    duration_ms REAL  -- backend-call milliseconds; NULL = not measured / predates the column
 );
 CREATE INDEX IF NOT EXISTS idx_bo_write_op ON backend_ops(write_op_id);
 CREATE INDEX IF NOT EXISTS idx_bo_causation ON backend_ops(causation_id);
@@ -228,7 +242,85 @@ CREATE TABLE IF NOT EXISTS idempotent_ops (
     result TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- referent_findings: the durable half of leaf zeta's diagnosis (task 4984).
+-- `_verify_episode_referents` returns its findings in-process and they are then
+-- gone, so an episode whose edges were fully diagnosed with no path to repair
+-- left nothing a later pass could act on.
+--
+-- A DIAGNOSIS LOG, NOT A WORK QUEUE. There is deliberately no status/claimed
+-- column: a row records what was TRUE of the graph at one moment, not an
+-- instruction, so the phase-5 replay pass must re-verify a row against the live
+-- graph before acting on it. That is the fail-closed direction, and the same one
+-- `ReferentFinding.resolvable` takes by defaulting to False. A status column now
+-- would pre-empt phase 5's own read-path choice with speculative generality.
+--
+-- HOW A READER DRAINS IT, given no status column: WriteJournal.get_referent_findings
+-- returns the OLDEST page and takes an `after_seq` cursor over the sqlite rowid,
+-- which is the only total insertion order here — one episode's findings are
+-- written in ONE batched commit and deliberately share a single `created_at`.
+-- RETENTION is NOT yet wired: the startup sweep that runs prune_mem0_intents /
+-- prune_idempotent_ops / prune_write_ops lives in server/main.py, outside task
+-- 4984's locks, so growth is watched rather than bounded for now (the write path
+-- is the ~0.2%-of-edges finding path, so the rate is low, not zero).
+--
+-- No ALTER migration: initialize() runs executescript(SCHEMA_SQL) unconditionally
+-- and this DDL is IF NOT EXISTS, so a fresh AND an existing database both pick
+-- the table up on the next start (same reasoning as the idx_wo_created block
+-- above). _migrate() is for ALTER TABLE column additions.
+CREATE TABLE IF NOT EXISTS referent_findings (
+    id TEXT PRIMARY KEY,
+    group_id TEXT,
+    episode_uuid TEXT,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+-- ONE index, serving the ONLY planned read's filter (`WHERE group_id = ?`); the
+-- rowid ordering that read applies on top of it is free, since an index entry
+-- already carries the rowid. The idx_wo_created note above measures what a new
+-- index costs on a populated table — 47 s of startup DDL against a ~120 s
+-- watchdog grace; this table starts EMPTY so that build is free today, and must
+-- not be multiplied later without taking that measurement again.
+CREATE INDEX IF NOT EXISTS idx_rf_group_time ON referent_findings(group_id, created_at);
 """
+
+#: Parameters: ``(since_iso_timestamp, limit)``.
+OPERATOR_TELEMETRY_QUERY = """
+SELECT
+    bo.created_at AS created_at,
+    wo.operation AS operation,
+    wo.project_id AS project_id,
+    bo.backend AS backend,
+    bo.success AS success,
+    bo.duration_ms AS duration_ms,
+    CASE WHEN json_valid(bo.result_summary)
+        THEN json_extract(bo.result_summary, '$.tokens.input_tokens') END AS input_tokens,
+    CASE WHEN json_valid(bo.result_summary)
+        THEN json_extract(bo.result_summary, '$.tokens.output_tokens') END AS output_tokens,
+    CASE WHEN json_valid(bo.result_summary)
+        THEN json_extract(bo.result_summary, '$.tokens.total_tokens') END AS total_tokens,
+    CASE WHEN json_valid(bo.result_summary)
+        THEN json_extract(bo.result_summary, '$.tokens.llm_calls') END AS llm_calls
+FROM backend_ops AS bo
+LEFT JOIN write_ops AS wo ON wo.id = bo.write_op_id
+WHERE bo.created_at >= ?
+ORDER BY bo.created_at DESC
+LIMIT ?
+"""
+
+
+def _backend_result_summary(
+    result_summary: dict | str | None, llm_tokens: LlmTokenUsage | None
+) -> dict | str | None:
+    """The persisted ``result_summary``: nested under ``result`` beside the
+    ``tokens`` block ``OPERATOR_TELEMETRY_QUERY`` reads, when tokens were measured."""
+    if llm_tokens is None:
+        return result_summary
+    if not isinstance(llm_tokens, LlmTokenUsage):
+        raise TypeError(
+            f'llm_tokens must be an LlmTokenUsage or None, got {type(llm_tokens).__name__}'
+        )
+    return {'result': result_summary, 'tokens': llm_tokens.as_journal_dict()}
 
 
 class WriteJournal:
@@ -294,6 +386,8 @@ class WriteJournal:
         db = self._require_db()
         async with db.execute('PRAGMA table_info(write_ops)') as cursor:
             existing = {row[1] for row in await cursor.fetchall()}
+        async with db.execute('PRAGMA table_info(backend_ops)') as cursor:
+            existing_backend_ops = {row[1] for row in await cursor.fetchall()}
 
         async with self._txn() as db:
             if 'session_id' not in existing:
@@ -328,6 +422,12 @@ class WriteJournal:
             if 'terminal_error' not in existing:
                 await db.execute('ALTER TABLE write_ops ADD COLUMN terminal_error TEXT')
                 logger.info('Migration: added terminal_error column to write_ops')
+
+            # Same O(1), no-backfill stance as terminal_* above: a historical
+            # row's duration is unknown, so it stays NULL.
+            if 'duration_ms' not in existing_backend_ops:
+                await db.execute('ALTER TABLE backend_ops ADD COLUMN duration_ms REAL')
+                logger.info('Migration: added duration_ms column to backend_ops')
 
             # Indexes on new columns (safe after migration ensures columns exist)
             await db.execute(
@@ -366,6 +466,16 @@ class WriteJournal:
         OMITS ``terminal_status`` / ``terminal_at`` / ``terminal_error``, so the
         late producer completes that row instead of clobbering the outcome it
         was racing.
+
+        ``agent_id`` READS DIFFERENTLY ON ONE ROW KIND. Interceptor rows
+        normally carry the literal ``'task-interceptor'`` — the component that
+        wrote the row. On a ``set_task_status`` DONE row it is instead the
+        RESOLVED CALLER, and ``NULL`` when the caller supplied no identity
+        (task 5241, PRD C5): that row is the audit surface for who recorded a
+        task's completion, so naming the component there would assert a caller
+        that is really just the writer. Such a row also carries
+        ``params['done_provenance_kind']`` and lands for a REFUSED write too,
+        with ``success=0`` and the refusal in ``error``.
         """
         try:
             async with self._txn() as db:
@@ -421,15 +531,19 @@ class WriteJournal:
         result_summary: dict | str | None = None,
         success: bool = True,
         error: str | None = None,
+        duration_ms: float | None = None,
+        llm_tokens: LlmTokenUsage | None = None,
     ) -> None:
         """Log a Layer 2 backend dispatch. Fire-and-forget — never raises."""
         try:
+            summary = _backend_result_summary(result_summary, llm_tokens)
             async with self._txn() as db:
                 await db.execute(
                     """INSERT INTO backend_ops
                        (id, write_op_id, causation_id, backend, operation,
-                        payload, result_summary, success, error, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        payload, result_summary, success, error, created_at,
+                        duration_ms)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         str(uuid_mod.uuid4()),
                         write_op_id,
@@ -437,15 +551,133 @@ class WriteJournal:
                         backend,
                         operation,
                         json.dumps(payload) if payload else '{}',
-                        json.dumps(result_summary) if isinstance(result_summary, dict) else result_summary,
+                        json.dumps(summary) if isinstance(summary, dict) else summary,
                         1 if success else 0,
                         error,
                         datetime.now(UTC).isoformat(),
+                        duration_ms,
                     ),
                 )
         except Exception as e:
             self._dropped[operation] += 1
             logger.warning(f'Failed to log backend_op: {e}')
+
+    async def log_referent_finding(
+        self, *, payload: dict, group_id: str, episode_uuid: str
+    ) -> None:
+        """Persist ONE referent finding. Fire-and-forget — never raises.
+
+        The singular convenience over :meth:`log_referent_findings`, which owns
+        the only INSERT. One commit either way, so a caller already holding an
+        episode's findings should hand them over together rather than call this
+        in a loop — see that method's BATCHED note for what the loop costs.
+        """
+        await self.log_referent_findings(
+            [payload], group_id=group_id, episode_uuid=episode_uuid,
+        )
+
+    async def log_referent_findings(
+        self, payloads: Sequence[dict], *, group_id: str, episode_uuid: str
+    ) -> None:
+        """Persist ONE EPISODE's referent findings, in ONE commit. Never raises.
+
+        Modelled on :meth:`log_backend_op` and counting its losses on the SAME
+        ``_dropped`` counter (INV-5) rather than growing a second, divergent
+        one. The contract matters to the caller: it runs inside the per-group
+        identity lock AFTER the episode write has already committed, so a
+        journal fault must cost a diagnosis and never the write — and because
+        the guard is here, no call site needs a try/except of its own.
+
+        BATCHED, not per finding, because every commit here is a
+        ``synchronous=FULL`` fsync (~1-5 ms, and up to the 5000 ms
+        ``busy_timeout`` under contention) taken while that identity lock
+        serializes same-group writes. An episode's finding count has NO
+        ceiling — the verify pass's warn cap is documented as capping the log
+        and nothing else — so a storm episode of 50-100 misattached ends would
+        hold the lock for 50-500 ms of fsyncs one row at a time. One
+        transaction makes that cost per EPISODE instead of per finding.
+
+        A dropped batch counts EVERY row it lost, because
+        :meth:`journal_drop_stats` reports rows LOST rather than calls failed.
+        """
+        if not payloads:
+            return
+        try:
+            # ONE timestamp for the batch: these rows are one episode's
+            # diagnosis, taken under one lock at one moment, and stamping them
+            # microseconds apart would invent a precision the observation does
+            # not have. `get_referent_findings` orders on the rowid precisely
+            # so a shared `created_at` cannot scramble their order.
+            created_at = datetime.now(UTC).isoformat()
+            async with self._txn() as db:
+                await db.executemany(
+                    """INSERT INTO referent_findings
+                       (id, group_id, episode_uuid, payload, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    [
+                        (
+                            str(uuid_mod.uuid4()),
+                            group_id,
+                            episode_uuid,
+                            json.dumps(payload),
+                            created_at,
+                        )
+                        for payload in payloads
+                    ],
+                )
+        except Exception as e:
+            self._dropped['referent_finding'] += len(payloads)
+            logger.warning(
+                f'Failed to log {len(payloads)} referent_finding row(s): {e}'
+            )
+
+    async def get_referent_findings(
+        self,
+        *,
+        group_id: str | None = None,
+        after_seq: int | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """The OLDEST *limit* findings, in insertion order, ``payload`` decoded.
+
+        OLDEST-FIRST AND TRUNCATED AT *limit* — say it plainly, because the
+        table has no prune path and no status column to mark a row handled (it
+        is a diagnosis log, not a work queue). A consumer of a table longer
+        than one page that does not carry *after_seq* forward therefore re-reads
+        the same oldest page forever and never reaches a newer diagnosis. Pass
+        the ``seq`` of the last row handled to get the next page.
+
+        ``seq`` is the row's sqlite ``rowid``: assigned at INSERT, so it is the
+        ONE key that totally orders these rows the way they were written —
+        including inside a batched commit, where every row deliberately shares
+        one ``created_at``. It is also gap-tolerant as a cursor: a future
+        retention sweep deleting the oldest rows cannot renumber the newer ones
+        under a reader mid-page.
+
+        Unlike :meth:`log_referent_findings` this one MAY raise: it is an
+        operator/replay read, not a hot write path, and an unreadable journal is
+        an answer the caller has to see rather than an empty list to act on.
+        """
+        db = self._require_db()
+        clauses: list[str] = []
+        params: list = []
+        if group_id is not None:
+            clauses.append('group_id = ?')
+            params.append(group_id)
+        if after_seq is not None:
+            clauses.append('rowid > ?')
+            params.append(after_seq)
+        where = f'WHERE {" AND ".join(clauses)} ' if clauses else ''
+        params.append(limit)
+        async with db.execute(
+            f'SELECT rowid AS seq, * FROM referent_findings {where}'
+            'ORDER BY rowid LIMIT ?',
+            params,
+        ) as cursor:
+            return [
+                {**dict(row), 'payload': json.loads(row['payload'])}
+                for row in await cursor.fetchall()
+            ]
 
     def journal_drop_stats(self) -> dict:
         """Return ``{'dropped_total': int, 'by_operation': dict}`` — rows LOST.

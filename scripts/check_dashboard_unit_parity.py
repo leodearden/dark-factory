@@ -116,7 +116,7 @@ are split by CLASS, because one rule cannot fit all of them:
 One unit has THREE sites, not two: ``setup-host.sh`` installs
 ``dark-factory-dashboard.service`` by RENDERING
 ``scripts/dashboard.service.template`` (``__REPO_ROOT__`` / ``__UV_PATH__``
-substitution, performed by ``scripts/render_dashboard_unit.py`` since task
+substitution, performed by ``scripts/render_systemd_unit.py`` since task
 4793 — no longer an inline ``sed``), and only ``cp``s the two watchdog units
 verbatim — so the committed ``dashboard/dark-factory-dashboard.service`` this
 checker treats as truth is not the source of the copy it compares against.
@@ -142,24 +142,20 @@ Design notes
 - No ``--fix``, unlike that precedent.  Propagating repo units into
   ``~/.config/systemd/user/`` and daemon-reloading is already what
   ``scripts/setup-host.sh`` does; duplicating it here would be a fourth copy of
-  the install logic.  It would also be actively unsafe today: the repo
-  watchdog timer's own comment records that RE-ARMING the installed timer is
-  task 3289's job, so a ``--fix`` that installed and reloaded it would
-  silently re-arm a watchdog someone deliberately left disarmed — a
-  supervision change disguised as a parity fix.  Drift is reported with a
-  remediation pointer instead.
+  the install logic.  Drift is reported with a remediation pointer instead.
+- Two consumers branch on the 0/1/2 exit codes: ``setup-host.sh``, and
+  ``scripts/orchestrator-watchdog.py::unit_parity_pass``, which runs this
+  checker read-only, at most hourly, on the watchdog's timer tick.  Changing
+  the codes changes both.
 
 Testing note
 ------------
 All drift-logic tests run against ``tmp_path`` fixtures — never the host's
 real ``~/.config/systemd/user/`` — mirroring the rule the fused-memory test
-module states in its own docstring.  This is not merely for portability: as
-measured on 2026-08-01 the installed watchdog service is still the
-pre-incident inline-shell copy, so this checker exits 1 against the live host
-today.  That is the CORRECT signal (installing the post-3308 units belongs to
-task 3289), but a test asserting parity against the live host would be red on
-landing, and one asserting drift would flip red the moment 3289 fixes it.
-Either encodes host state rather than checker behaviour.
+module states in its own docstring.  This is not merely for portability: a
+test asserting parity or drift against the live host encodes that host's
+state rather than this checker's behaviour, so it is red or green for reasons
+no change to this file can affect.
 """
 
 import argparse
@@ -197,13 +193,13 @@ DIVERGENCE_ALLOWLIST: dict[str, str] = {
         "therefore report drift on every run of a correctly-configured host, "
         "and a gate that is always red gets switched off — taking the "
         "accidental drift it exists to catch with it. "
-        "SECOND CONSUMER (task 4793): scripts/render_dashboard_unit.py now "
+        "SECOND CONSUMER (task 4793): scripts/render_systemd_unit.py now "
         "PRESERVES this variable's installed value when setup-host.sh "
         "re-renders the unit. Its HOST_LOCAL_ENVIRONMENT is the host-local "
         "SUBSET of this allowlist, not the allowlist itself — the two entries "
         "here are on it for opposite reasons, and preserving the other one "
         "would pin the data root at the previous checkout. Held by "
-        "tests/scripts/test_render_dashboard_unit.py::"
+        "tests/scripts/test_render_systemd_unit.py::"
         "test_host_local_environment_is_a_subset_of_the_divergence_allowlist "
         "and ::test_host_local_environment_excludes_project_root. So editing "
         "THIS dict has a second blast radius: adding a name here does not make "
@@ -369,17 +365,55 @@ class UnitSpec:
     # test_registry_env_matches_directive_entries_are_declared_in_the_committed_units
     # rejects a variable or directive name that section does not declare.
     env_matches_directive: tuple[tuple[str, str], ...] = ()
+    # (section, key, reason) triples for directives the committed unit declares
+    # that are DELIBERATELY not compared. The reasoned counterpart to
+    # DIVERGENCE_ALLOWLIST, and held to its preamble's rule: keep it small, and
+    # keep every reason specific enough that a reviewer can check it.
+    #
+    # Bounded comparison is right (see the module docstring's case against an
+    # unbounded diff), but "bounded" has to mean every directive was
+    # CONSIDERED, not that someone remembered to register it. The completeness
+    # guard in tests/scripts/test_check_dashboard_unit_parity.py therefore
+    # requires every directive in the committed unit to be either in
+    # covered_directives() or named here.
+    #
+    # That guard is DIRECTIVE-granular. Tokens inside ExecStart are reached
+    # only through exec_start_flags, and nothing enforces that list's
+    # completeness.
+    unchecked_directives: tuple[tuple[str, str, str], ...] = ()
+
+    def covered_directives(self) -> frozenset[tuple[str, str]]:
+        """Every ``(section, key)`` a compare_unit branch checks as a whole directive.
+
+        compare_unit reads the spec's fields itself, so this is a second
+        enumeration of its directive-level branches, held in step with them by
+        tests/scripts/test_check_dashboard_unit_parity.py::test_covered_directives_is_exactly_what_compare_unit_checks.
+        The completeness guard and ``__post_init__`` both read it rather than
+        re-deriving the list. exec_start_flags and env_matches_directive cover
+        no directive of their own: they reach tokens inside one, or relate two.
+        """
+        covered = {*self.compared, *self.present_only, *self.override_directives}
+        if self.environment_section is not None:
+            covered.add((self.environment_section, "Environment"))
+        return frozenset(covered)
 
     def __post_init__(self) -> None:
-        """Reject a registry entry whose relation branch could never run.
+        """Reject a registry entry that contradicts itself or could never run.
 
         ``env_matches_directive`` reads both halves out of
         ``environment_section``, so registering a pair without setting that
         field makes the branch a silent no-op: the spec reads as though the
         value were checked while nothing is compared at all — the one failure
         mode a gate must not have, and the one its own report cannot reveal.
-        Raising here turns it into an import-time error on the registry, where
-        it is unmissable, instead of a green run that checked less than it says.
+
+        A directive both covered by a branch and listed in
+        ``unchecked_directives`` is the same defect from the other side: its
+        reason string tells a reviewer the directive is deliberately not
+        compared while a branch compares it, so the waiver can no longer be
+        trusted to mean what it says.
+
+        Raising turns either into an import-time error on the registry, where
+        it is unmissable, instead of a green run that checked other than it says.
         """
         if self.env_matches_directive and self.environment_section is None:
             raise ValueError(
@@ -388,6 +422,15 @@ class UnitSpec:
                 "be set — both the variable and the directive are read from that "
                 "section, so the comparison would silently check nothing"
             )
+        covered = self.covered_directives()
+        for section, key, reason in self.unchecked_directives:
+            if (section, key) in covered:
+                raise ValueError(
+                    f"{self.name}: [{section}] {key} is listed in "
+                    f"unchecked_directives (reason: {reason!r}) but is also "
+                    "covered by a comparison branch — remove one of the two so "
+                    "the registry says what it actually checks"
+                )
 
 
 def _render(values: list[str] | None) -> str:
@@ -470,7 +513,7 @@ def _compare_exec_start_flags(
 # _environment_map lives in scripts/systemd_unit_parity.py and is RE-EXPORTED
 # here under its existing PRIVATE name, on the same terms as the parser and
 # find_dropins above.  The THIRD lift, and the first whose second consumer is
-# not another checker: scripts/render_dashboard_unit.py must read the INSTALLED
+# not another checker: scripts/render_systemd_unit.py must read the INSTALLED
 # unit's Environment= map to preserve this host's host-local
 # DASHBOARD_KNOWN_PROJECT_ROOTS when setup-host.sh re-renders that unit, and a
 # value this checker can SEE has to be exactly a value the installer can
@@ -750,18 +793,24 @@ def compare_unit(
 # The unit registry
 # ---------------------------------------------------------------------------
 
-# Every entry names WHY a key is on its list. Description= and After= are
-# deliberately absent from all three: they are cosmetic, they legitimately
-# differ (the installed timer's Description predates the incident rewrite),
-# and comparing them would spend the gate's credibility on nothing.
+# Every entry names WHY a key is on its list. Directives deliberately left
+# uncompared live in each spec's unchecked_directives, each with its reason.
 #
 # Registry KEYS are curated; expected VALUES are not — they are read from the
 # committed unit at run time. See UnitSpec's docstring for why. The keys are
-# guarded against rot by the staleness tests in
-# tests/scripts/test_check_dashboard_unit_parity.py, which assert every key
-# listed here is genuinely declared in the committed unit; a key that is not
-# would compare absent-to-absent and check nothing, forever, while still
-# reporting green.
+# guarded against rot in BOTH directions by
+# tests/scripts/test_check_dashboard_unit_parity.py: the staleness tests assert
+# every key listed here is genuinely declared in the committed unit (a key that
+# is not would compare absent-to-absent and check nothing, forever, while still
+# reporting green), and the completeness guard asserts every directive the
+# committed unit declares is listed here or in unchecked_directives (one that is
+# neither would drift unreported, forever, while still reporting green).
+_DESCRIPTION_IS_COSMETIC = (
+    "Cosmetic label, read only by `systemctl status` and journal output. "
+    "Comparing it would turn a wording reflow into reported supervision drift "
+    "— the unbounded-diff noise the module docstring rejects."
+)
+
 UNITS: dict[str, UnitSpec] = {
     "dark-factory-dashboard.service": UnitSpec(
         name="dark-factory-dashboard.service",
@@ -807,6 +856,21 @@ UNITS: dict[str, UnitSpec] = {
             # makes the cap effective reports parity on exactly that host.
             ("Service", "RestartSteps"),
             ("Service", "RestartMaxDelaySec"),
+            # A clean SIGTERM stop exits 143, because `uv run` translates its
+            # child's signal death into 128+15. Without this line systemd's
+            # default classification records every routine restart as a
+            # failure, until "failed" means nothing and a real crash reads
+            # exactly like a deploy.  Value-compared, not presence-only: 143
+            # is a host-invariant literal, and an installed copy that kept the
+            # directive but changed the code would restore the false-failure
+            # accounting while presence still matched.
+            #
+            # This key's ABSENCE FROM THE REGISTRY — not from the unit — is why
+            # the drift measured 2026-08-19 went unreported for ~3 weeks while
+            # this gate reported parity. It is the worked example
+            # UnitSpec.unchecked_directives and its completeness guard exist
+            # to stop recurring.
+            ("Service", "SuccessExitStatus"),
             # 15 is sized against uvicorn's own 8s drain bound (see the unit's
             # comment); a drifted value silently re-opens the SIGKILL window
             # that produced the ~16s dead restarts.
@@ -818,10 +882,24 @@ UNITS: dict[str, UnitSpec] = {
             ("Install", "WantedBy"),
         ),
         present_only=(
-            # Both carry absolute host paths (/home/leo/.local/bin/uv, the
-            # repo root). Presence only; content reached via exec_start_flags.
+            # All three carry absolute host paths (/home/leo/.local/bin/uv,
+            # the repo root). Presence only; ExecStart's content is reached
+            # via exec_start_flags.
+            ("Unit", "Documentation"),
             ("Service", "ExecStart"),
             ("Service", "WorkingDirectory"),
+        ),
+        unchecked_directives=(
+            ("Unit", "Description", _DESCRIPTION_IS_COSMETIC),
+            (
+                "Unit",
+                "After",
+                "Ordering-only dependency on units this checker does not own "
+                "(network.target, fused-memory.service). A host running "
+                "fused-memory under another unit name would report permanent "
+                "drift, and a start-ordering failure surfaces as availability, "
+                "which the dashboard watchdog owns.",
+            ),
         ),
         # Neither copy declares one today. Registered so that a locally added
         # EnvironmentFile= is VISIBLE: it could override any Environment= the
@@ -860,8 +938,7 @@ UNITS: dict[str, UnitSpec] = {
             # for Type=oneshot by default, and the timer's OnUnitActiveSec
             # measures from this unit's last activation — so a tick that never
             # returns is not a slow tick, it is the END of supervision, with
-            # nothing saying so. Its absence from the installed copy is
-            # precisely the drift measured on this host.
+            # nothing saying so.
             ("Service", "TimeoutStartSec"),
             ("Service", "StandardOutput"),
             ("Service", "StandardError"),
@@ -884,6 +961,7 @@ UNITS: dict[str, UnitSpec] = {
         # EnvironmentFile= was registered to close — on the same unit, left
         # open until now.
         environment_section="Service",
+        unchecked_directives=(("Unit", "Description", _DESCRIPTION_IS_COSMETIC),),
     ),
     "dark-factory-dashboard-watchdog.timer": UnitSpec(
         name="dark-factory-dashboard-watchdog.timer",
@@ -900,6 +978,7 @@ UNITS: dict[str, UnitSpec] = {
             # about.
             ("Install", "WantedBy"),
         ),
+        unchecked_directives=(("Unit", "Description", _DESCRIPTION_IS_COSMETIC),),
     ),
 }
 

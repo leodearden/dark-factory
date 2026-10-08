@@ -143,6 +143,19 @@ assert "A7: non-integer --min-free-gib writes error to stderr" \
 REIFY_WARM_LANE_DISK_GUARD_MIN_FREE_GIB=50G run_helper check --mount /tmp --min-free-inodes 100000
 assert "A8: non-integer env MIN_FREE_GIB exits 2" test "$RC" -eq 2
 
+# A9: leading-zero (octal-misread) and overflowing --min-free-gib values exit 2.
+# 08 would error out of $(( )) leaving the variable unset, 010 would silently
+# mean 8, and 9223372036854775807 would wrap negative on the 1024^3 multiply.
+for A9_BAD in 08 010 9223372036854775807; do
+    run_helper check --mount /tmp --min-free-gib "$A9_BAD" --min-free-inodes 100000
+    assert "A9: --min-free-gib $A9_BAD exits 2" test "$RC" -eq 2
+    assert "A9: --min-free-gib $A9_BAD writes error to stderr" \
+        bash -c 'printf "%s\n" "$1" | grep -qi "integer"' _ "$ERR_OUT"
+done
+
+REIFY_WARM_LANE_DISK_GUARD_MIN_FREE_GIB=010 run_helper check --mount /tmp --min-free-inodes 100000
+assert "A9: env MIN_FREE_GIB=010 exits 2" test "$RC" -eq 2
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Block B — happy path: ample bytes AND inodes → exits 0
 # ──────────────────────────────────────────────────────────────────────────────
@@ -381,6 +394,27 @@ run_helper check --mount "$D_TMP" --soft --min-free-gib 10 --soft-free-gib abc
 assert "D5b: non-integer --soft-free-gib exits 2" test "$RC" -eq 2
 assert "D5b: stderr names integer/soft-free-gib misconfiguration" \
     bash -c 'printf "%s\n" "$1" | grep -qi "integer\|invalid\|soft.free.gib"' _ "$ERR_OUT"
+
+# D5c (soft-floor GiB canonical-decimal validation, A9 under --soft): each value
+# clears the soft>hard relation check against a 5 GiB hard floor, yet the soft
+# gate would enforce a different floor — 0600 as octal 384 GiB, 010 as 8 GiB,
+# and 9223372036854775807 wraps negative on the 1024^3 multiply, disabling the
+# throttle. Ample avail, so only the validator can produce exit 2.
+for D5C_BAD in 0600 010 9223372036854775807; do
+    run_helper check --mount "$D_TMP" --soft \
+        --min-free-gib 5 --soft-free-gib "$D5C_BAD" \
+        --min-free-inodes 100000 --soft-free-inodes 200000
+    assert "D5c: --soft-free-gib $D5C_BAD exits 2" test "$RC" -eq 2
+    assert "D5c: --soft-free-gib $D5C_BAD stderr names an invalid integer" \
+        bash -c 'printf "%s\n" "$1" | grep -qi "valid integer"' _ "$ERR_OUT"
+    assert "D5c: --soft-free-gib $D5C_BAD stdout empty (no sentinel)" \
+        bash -c '[ -z "$1" ]' _ "$OUT"
+done
+
+REIFY_WARM_LANE_DISK_GUARD_SOFT_FREE_GIB=0600 \
+    run_helper check --mount "$D_TMP" --soft \
+    --min-free-gib 5 --min-free-inodes 100000 --soft-free-inodes 200000
+assert "D5c: env SOFT_FREE_GIB=0600 exits 2" test "$RC" -eq 2
 
 # D6 (E1, inodes axis config error): soft_free_inodes <= min_free_inodes, with
 # a VALID soft-free-gib supplied so only the inodes axis is misconfigured.

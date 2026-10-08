@@ -56,9 +56,10 @@ def derive_actor_class(agent_id: str | None) -> ActorClass:
     Ordering is CRITICAL — later rules would otherwise be shadowed by an
     earlier, broader prefix:
 
-    1. ``None`` (header-less write; orchestrator pipeline/scheduler/harness
-       callbacks/deterministic_runner/crash-recovery all write without a
-       per-write ``agent_id`` today) -> HUMAN, the safe-open default (D5).
+    1. ``None`` (header-less write) -> HUMAN, the safe-open default (D5).
+       Writes through ``Scheduler.set_task_status`` now carry
+       ``'orchestrator'`` (rule 4); header-less writes that remain, such as
+       direct ``dispatch_tool`` status writes, still land here.
     2. ``recon-stage-*`` (live prefix, verified at
        fused-memory/reconciliation/stages/task_knowledge_sync.py:2787) or the
        defensive doc-convention variant ``reconciliation-stage*`` ->
@@ -87,10 +88,13 @@ def derive_actor_class(agent_id: str | None) -> ActorClass:
 
 # ---------------------------------------------------------------------------
 # TRANSITIONS — the enumerated (from, to) legality union, derived by
-# enumerating every live status-write call site (grep across orchestrator/ +
-# fused-memory/ on 2026-07-06; see the task-2168 plan analysis for the full
-# derivation). Each pair carries its call-site anchor as an inline comment,
-# grouped by kind. This is the LOAD-BEARING artifact — is_legal_transition
+# enumerating every live status-write call site across orchestrator/ and
+# fused-memory/ (first derived 2026-07-06 for task 2168; every anchor below
+# re-verified against the tree and re-cited as path::symbol by task 3542).
+# Each pair carries its call-site anchors as an inline comment, grouped by
+# kind. A bare file name is under orchestrator/src/orchestrator/; recon's
+# targeted.py is fused-memory/src/fused_memory/reconciliation/targeted.py.
+# This is the LOAD-BEARING artifact — is_legal_transition
 # and every downstream consumer (rho1b's interceptor enforcement, W9's
 # WorkflowStateMachine) trust this set completely, so it is derived, not
 # guessed.
@@ -105,14 +109,17 @@ def derive_actor_class(agent_id: str | None) -> ActorClass:
 _UNION: frozenset[tuple[TaskStatus, TaskStatus]] = frozenset(
     {
         # dispatch
-        (TaskStatus.PENDING, TaskStatus.IN_PROGRESS),  # workflow.py:1510
+        (TaskStatus.PENDING, TaskStatus.IN_PROGRESS),  # workflow.py::TaskWorkflow._setup_worktree_and_artifacts
         # completion
         (
             TaskStatus.IN_PROGRESS,
             TaskStatus.DONE,
-        ),  # merged workflow.py:1380; found_on_main workflow.py:3809/7396/harness.py:3623
-        (TaskStatus.MERGE_DEFERRED, TaskStatus.DONE),  # workflow.py:1015/6424, harness.py:619/646
-        (TaskStatus.BLOCKED, TaskStatus.DONE),  # train attribution workflow.py:6424
+        ),  # merged workflow.py::TaskWorkflow._finalise_merged_done; already-merged recovery workflow.py::TaskWorkflow._finalise_recovery_done; found_on_main workflow.py::TaskWorkflow._handle_already_done_report / _on_architect_merge_done, harness.py::Harness._mark_in_progress_done
+        (
+            TaskStatus.MERGE_DEFERRED,
+            TaskStatus.DONE,
+        ),  # train workflow.py::TaskWorkflow._maybe_enqueue_group_merge (its _mark_member_done closure) / _attribute_train_failure, harness.py::build_train_callback_factory (mark_member_done / redrive_member)
+        (TaskStatus.BLOCKED, TaskStatus.DONE),  # train attribution workflow.py::TaskWorkflow._attribute_train_failure
         (
             TaskStatus.PENDING,
             TaskStatus.DONE,
@@ -122,56 +129,79 @@ _UNION: frozenset[tuple[TaskStatus, TaskStatus]] = frozenset(
             TaskStatus.DONE,
         ),  # operator/vehicle direct-complete of a deferred task whose deliverable landed out-of-band (planning-mode/merge-vehicle task landed via merge queue); manual set_task_status write, no enumerated orchestrator call site — mirrors the (PENDING, DONE) found-on-main rationale above
         # park
-        (TaskStatus.IN_PROGRESS, TaskStatus.MERGE_DEFERRED),  # workflow.py:867/896
+        (
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.MERGE_DEFERRED,
+        ),  # workflow.py::TaskWorkflow._enter_merge_deferred / _handle_superseded
         # requeue
         (
             TaskStatus.IN_PROGRESS,
             TaskStatus.PENDING,
-        ),  # workflow.py:2464/3755, blast-radius scheduler.py:4484, stranded-revert harness.py:3487/3567
+        ),  # workflow.py::TaskWorkflow._repend_for_requeue (callers include _requeue_on_server_error, task 3316) / _plan / _handle_blocking_dep_report; blast-radius scheduler.py::Scheduler.handle_blast_radius_expansion; stranded-revert harness.py::Harness._revert_in_progress_if_no_live_claimant; Table B restart harness.py::Harness._action_teardown_and_set_status
         (
             TaskStatus.BLOCKED,
             TaskStatus.PENDING,
-        ),  # steward re-pend workflow.py:8007, escalation resume harness.py:8739
-        (TaskStatus.MERGE_DEFERRED, TaskStatus.PENDING),  # re-drive harness.py:682
-        (TaskStatus.DEFERRED, TaskStatus.PENDING),  # stage2 commit_planning
+        ),  # steward re-pend workflow.py::TaskWorkflow._mark_blocked (its _requeue closure); escalation resume harness.py::Harness._cascade_unblock_member; stranded-blocked redispatch scheduler.py::Scheduler._phase_redispatch_stranded_blocked; recon dependency unblock targeted.py::TargetedReconciler._unblock_dependent
+        (
+            TaskStatus.MERGE_DEFERRED,
+            TaskStatus.PENDING,
+        ),  # train re-drive harness.py::build_train_callback_factory (redrive_member / _revert_withheld_member), workflow.py::TaskWorkflow._revert_withheld_member
+        (
+            TaskStatus.DEFERRED,
+            TaskStatus.PENDING,
+        ),  # planning-mode commit fused-memory/src/fused_memory/server/tools.py::create_mcp_server.commit_planning
         # block
         (
             TaskStatus.IN_PROGRESS,
             TaskStatus.BLOCKED,
-        ),  # _mark_blocked workflow.py:7758, retry-cap scheduler.py:4659, substrate harness.py:4687, dep harness.py:3905
-        (TaskStatus.MERGE_DEFERRED, TaskStatus.BLOCKED),  # train failer workflow.py:6464
-        (TaskStatus.DEFERRED, TaskStatus.BLOCKED),  # recon targeted.py:1041
+        ),  # workflow.py::TaskWorkflow._mark_blocked via _persist_blocked_row; CONVERT_TO_BLOCKED harness.py::Harness._reconcile_one_stranded; Table B park harness.py::Harness._action_teardown_and_set_status and escalation/src/escalation/server.py::release_workflow
+        (TaskStatus.MERGE_DEFERRED, TaskStatus.BLOCKED),  # train failer workflow.py::TaskWorkflow._attribute_train_failure
+        (TaskStatus.DEFERRED, TaskStatus.BLOCKED),  # recon targeted.py::TargetedReconciler._sweep_block_orphan
         (
             TaskStatus.PENDING,
             TaskStatus.BLOCKED,
-        ),  # deterministic pure-gate born-at-L2 deterministic_runner.py:755/853; human block of a pending task is an out-of-band manual write with no enumerated call site (unlike the anchored half of this pair)
-        # cancel — recon's any-non-terminal->cancelled (targeted.py:1001)
-        # covers pending/blocked/deferred/merge-deferred; harness.py:8417
-        # covers the orchestrator abandon path from in-progress/blocked.
-        (TaskStatus.IN_PROGRESS, TaskStatus.CANCELLED),  # abandon harness.py:8417
-        (TaskStatus.PENDING, TaskStatus.CANCELLED),  # recon targeted.py:1001
-        (TaskStatus.BLOCKED, TaskStatus.CANCELLED),  # harness.py:8417, recon targeted.py:1001
-        (TaskStatus.DEFERRED, TaskStatus.CANCELLED),  # recon targeted.py:1001
+        ),  # born-at-L2 deterministic_runner.py::DeterministicRunner's *_and_block helpers (the pure gate's _file_milestone_gate_and_block among them); dispatch gates harness.py::Harness._block_and_escalate_external_dep / _delivered_check / _cross_repo / _substrate_flip (all before TaskWorkflow's in-progress claim); retry-cap scheduler.py::Scheduler.trigger_retry_cap_exhausted (after a REQUEUED exit re-pended the row); human block of a pending task is an out-of-band manual write with no enumerated call site
+        # cancel — recon's any-non-terminal->cancelled
+        # (targeted.py::TargetedReconciler._sweep_cancel_orphan) covers
+        # pending/blocked/deferred/merge-deferred; Table B abandon
+        # (harness.py::Harness._action_teardown_and_set_status) covers the
+        # orchestrator path from in-progress/blocked.
+        (TaskStatus.IN_PROGRESS, TaskStatus.CANCELLED),  # abandon harness.py::Harness._action_teardown_and_set_status
+        (TaskStatus.PENDING, TaskStatus.CANCELLED),  # recon targeted.py::TargetedReconciler._sweep_cancel_orphan
+        (
+            TaskStatus.BLOCKED,
+            TaskStatus.CANCELLED,
+        ),  # abandon harness.py::Harness._action_teardown_and_set_status; recon targeted.py::TargetedReconciler._sweep_cancel_orphan
+        (TaskStatus.DEFERRED, TaskStatus.CANCELLED),  # recon targeted.py::TargetedReconciler._sweep_cancel_orphan
         # W9-θ: a cancel (hard task.cancel() or soft _cancel_event) can land
         # on a train member parked in merge-deferred — it awaits
-        # _await_cancellable(future) inside _maybe_enqueue_group_merge
-        # (workflow.py:1320) and set_task_status('merge-deferred') at :1113,
-        # both after the merge-deferred row is persisted. _finalise_cancellation
+        # _await_cancellable(future) inside
+        # workflow.py::TaskWorkflow._maybe_enqueue_group_merge, after
+        # workflow.py::TaskWorkflow._enter_merge_deferred has persisted the
+        # merge-deferred row. workflow.py::TaskWorkflow._finalise_cancellation
         # then drives the machine to CANCELLED (WorkflowStateMachine.transition
         # consults this table), so the merge-deferred origin needs its own
         # cancel edge — completing the "any-non-terminal->cancelled" family the
         # comment above describes. Also the persisted-write sibling of recon's
-        # any-non-terminal->cancelled (targeted.py:1001), which already sweeps
+        # any-non-terminal->cancelled sweep, which already covers
         # merge-deferred rows.
         (
             TaskStatus.MERGE_DEFERRED,
             TaskStatus.CANCELLED,
-        ),  # W9-θ cancel workflow.py:2639; recon targeted.py:1001
-        # infra resume-at-verify (D3 migrates this to blocked->infra-hold)
-        (TaskStatus.BLOCKED, TaskStatus.IN_PROGRESS),  # harness.py:8713
-        # forward-compat D3 infra-hold edges (C7/workflow.py:4842) — live
-        # write sites still use in-progress + metadata.infra_hold today;
-        # omega4 migrates them before the Gamma enforcement gate flips.
+        ),  # W9-θ cancel workflow.py::TaskWorkflow._finalise_cancellation; recon targeted.py::TargetedReconciler._sweep_cancel_orphan
+        # (blocked, in-progress) has NO orchestrator status writer since task
+        # 3538 (γ3): the infra resume re-pends instead
+        # (harness.py::Harness._cascade_unblock_member). The pair stays because
+        # WorkflowStateMachine's BLOCKED/ESCALATED -> working-phase moves
+        # project onto it through
+        # orchestrator/src/orchestrator/workflow_types.py::STATE_TO_STATUS.
+        (TaskStatus.BLOCKED, TaskStatus.IN_PROGRESS),
+        # infra-hold (D3). in-progress -> infra-hold is
+        # workflow.py::TaskWorkflow._mark_blocked(block_status='infra-hold'),
+        # from _execute_verify_review_loop's verify-infra stamp; infra-hold ->
+        # pending is the infra resume in
+        # harness.py::Harness._cascade_unblock_member. The other infra-hold
+        # edges are forward-compat, with no enumerated writer.
         (TaskStatus.IN_PROGRESS, TaskStatus.INFRA_HOLD),
         (TaskStatus.BLOCKED, TaskStatus.INFRA_HOLD),
         (TaskStatus.INFRA_HOLD, TaskStatus.IN_PROGRESS),
@@ -256,92 +286,69 @@ def is_legal_transition(
 
 # ---------------------------------------------------------------------------
 # outcome_allows_status — the WorkflowOutcome -> TaskStatus consistency map.
-# Keys MIRROR the 8 WorkflowOutcome string values (orchestrator/workflow.py:
-# 337-345) as inline literals, since shared/ must NOT import orchestrator
-# (layering).
+# Keys MIRROR the 8 WorkflowOutcome string values
+# (orchestrator/src/orchestrator/workflow_types.py::WorkflowOutcome) as inline
+# literals, since shared/ must NOT import orchestrator (layering).
 #
 # test-outcome's test_recognized_outcome_keys_match_mirrored_workflow_outcomes
 # only pins these _OUTCOME_ALLOWED keys against that test's own
 # _WORKFLOW_OUTCOME_VALUES copy — both are hand-maintained mirrors of the real
-# orchestrator.workflow.WorkflowOutcome enum, so that assertion catches
+# orchestrator.workflow_types.WorkflowOutcome enum, so that assertion catches
 # module-vs-test drift between the two copies, NOT drift from the actual
 # source of truth (shared/ cannot import orchestrator to check that
-# directly). A genuine cross-layer guard would need to live in
-# orchestrator/tests, asserting against the real WorkflowOutcome enum.
+# directly). The genuine cross-layer guard lives in orchestrator/tests:
+# orchestrator/tests/test_workflow_state_machine.py::TestExitContractCoversEveryOutcome.
 #
-# Several rows are intentionally loose sets rather than a single dominant
-# status: W9's SM-2 invariant checks outcome_allows_status(report.outcome,
-# last_status_row) holds at EVERY run() exit, and the traced code shows each
-# of these outcomes can legitimately coexist with more than one status row
-# at exit.
+# Each row is exactly the spec §5 exit contract
+# (docs/task-escalation-state-spec.md): the status rows the outcome's proven
+# producers leave at a run() exit (task 3542, divergence E10). Producers named
+# bare below are methods of
+# orchestrator/src/orchestrator/workflow.py::TaskWorkflow. Relaxation 1 (a
+# row already terminal is reported AS that terminal) is producer-side, in
+# TaskWorkflow._observed_terminal_outcome. Relaxation 2 (the exit's own status
+# write failed) is applied by the consumer,
+# orchestrator/src/orchestrator/exit_contract.py::judge_exit, not by this
+# pure table.
 # ---------------------------------------------------------------------------
 
 _OUTCOME_ALLOWED: dict[str, frozenset[TaskStatus]] = {
     'done': frozenset({TaskStatus.DONE}),
-    # Internal-only sub-phase — the task stays claimed (in-progress).
-    'planned': frozenset({TaskStatus.IN_PROGRESS}),
-    # BLOCKED is TaskWorkflow's own dominant exit for _mark_blocked, but the
-    # post-escalation resume guard ("Fix 1", orchestrator/workflow.py ~2057)
-    # also returns BLOCKED when a steward resolves an L0 by setting the task
-    # to another WORKFLOW_PRESERVE_STATUSES member (cancelled / deferred /
-    # merge-deferred) — an intentional steward terminal decision the
-    # orchestrator must not overwrite. 'done' is excluded: that status is
-    # handled by a dedicated branch that returns WorkflowOutcome.DONE, never
-    # BLOCKED. IN_PROGRESS is also included, for the BLOCKED paths that
-    # deliberately PRESERVE the mid-flight row rather than parking it:
-    #   - spec §5's steward terminal-decision preserve carve-out — the steward
-    #     already adjudicated the row (e.g. 'deferred'), and _mark_blocked
-    #     returns BLOCKED without rewriting it;
-    #   - the merge-gating bail's documented in-progress-preserving shape (the
-    #     same shape already noted below for 'escalated').
-    # NOT the merge-halt trio: as of task 3537 _handle_stash_failed /
-    # _handle_unmerged_state / _handle_wip_recovery_no_advance all route their
-    # BLOCKED exit through _mark_blocked and DO write the row (spec §7.9 /
-    # §8-E3, INV-6) — that justification is retired, not the member.
-    # The frozenset is deliberately NOT narrowed here: removing IN_PROGRESS is
-    # divergence E10's scope, and doing it in isolation would turn every
-    # still-legitimate preserve path above into a hard AssertionError from
-    # run()'s SM-2 check.
-    # INFRA_HOLD is the infra-hold PARK ROW: _mark_blocked(block_status=
-    # 'infra-hold') writes the first-class infra-hold status (PRD C7/D3) and
-    # then returns BLOCKED, so 'infra-hold' is a legitimate BLOCKED exit row —
-    # exactly like BLOCKED, just on the status the harness HOLD guard and
-    # RESUME cascade key on (is_infra_held).  Omitting it made SM-2 raise
-    # AssertionError out of run() on a row the writer had deliberately parked;
-    # task 3537 added the same block_status pass-through to the merge-phase
-    # park write, which would have widened that trap to a second path.
+    # An internal sub-phase outcome consumed inside _drive, never a run()
+    # exit. The key stays so a PLANNED exit is a named violation rather than
+    # an unknown outcome.
+    'planned': frozenset(),
+    # _mark_blocked writes 'blocked' / 'infra-hold', or a steward terminal
+    # decision (WORKFLOW_PRESERVE minus done) is preserved through
+    # _honour_steward_terminal_decision and _mark_blocked's
+    # StewardTerminalDecision branch.
     'blocked': frozenset(
         {
             TaskStatus.BLOCKED,
+            TaskStatus.INFRA_HOLD,
             TaskStatus.CANCELLED,
             TaskStatus.DEFERRED,
             TaskStatus.MERGE_DEFERRED,
-            TaskStatus.IN_PROGRESS,
-            TaskStatus.INFRA_HOLD,
         }
     ),
-    # Self-repend / deferred-to-stranded-sweep window / requeue-cap
-    # exhausted -> blocked.
-    'requeued': frozenset({TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.BLOCKED}),
-    # Dominant _mark_blocked + open L1 / merge-gating bail preserves
-    # in-progress.  INFRA_HOLD for the same reason as in 'blocked' above: the
-    # infra-hold park row is written by _mark_blocked's ENTRY gate, BEFORE the
-    # branch that picks BLOCKED vs ESCALATED, so the same row can reach either
-    # exit and the two keys must agree about it.
-    'escalated': frozenset(
-        {TaskStatus.BLOCKED, TaskStatus.IN_PROGRESS, TaskStatus.INFRA_HOLD}
-    ),
+    # _mark_blocked writes the row (its entry gate, or _park_merge_phase_row)
+    # before its StewardReescalatedL1 exit. The sole block_status='infra-hold'
+    # caller passes escalate_to_human=True, so it always exits BLOCKED.
+    'escalated': frozenset({TaskStatus.BLOCKED}),
+    # Every slot-exiting writer re-pends first: _repend_for_requeue (for the
+    # WarmLaneRequeue clause, _handle_soft_cancel's fallback and
+    # _requeue_on_server_error), _mark_blocked's _requeue, _plan,
+    # _handle_blocking_dep_report, and
+    # orchestrator/src/orchestrator/scheduler.py::Scheduler.handle_blast_radius_expansion.
+    'requeued': frozenset({TaskStatus.PENDING}),
     'cancelled': frozenset({TaskStatus.CANCELLED}),
     'merge-deferred': frozenset({TaskStatus.MERGE_DEFERRED}),
-    # preserved / release_workflow park->blocked / stranded-sweep->pending.
-    # MERGE_DEFERRED is included for the W9-θ soft-cancel-of-a-parked-train-
-    # member path: _await_cancellable(future) inside _maybe_enqueue_group_merge
-    # (workflow.py:1320) is reached AFTER set_task_status('merge-deferred') has
-    # persisted the merge-deferred row, so a soft _cancel_event there makes
-    # _handle_soft_cancel return SOFT_CANCELLED while the last-persisted status
-    # is still 'merge-deferred' (release_workflow parks it to blocked only
-    # after run() returns). This is the same "preserved — row left wherever it
-    # was" case as the IN_PROGRESS entry, not a new terminal write.
+    # escalation/src/escalation/server.py::release_workflow parks
+    # 'in-progress' -> 'blocked' only after the slot clears;
+    # orchestrator/src/orchestrator/harness.py::Harness._action_teardown_and_set_status
+    # writes the park / restart row before the kill; a parked train member
+    # stays 'merge-deferred'. Keeping IN_PROGRESS / MERGE_DEFERRED is a
+    # reviewed divergence from spec §5's "never wherever it was": the park is
+    # written after the exit, not before it (still open in the spec's §8-E10).
     'soft-cancelled': frozenset(
         {
             TaskStatus.IN_PROGRESS,

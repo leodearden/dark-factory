@@ -14,14 +14,22 @@ keeps every store operation deterministic and mock-free to test.
 
 The ``recon_ledger`` table lives inside the existing ``reconciliation.db``
 file (shared with :class:`~fused_memory.reconciliation.journal.ReconciliationJournal`),
-opened via a second ``aiosqlite`` connection — WAL mode + a busy timeout make
-this safe, and ``CREATE TABLE IF NOT EXISTS`` only ever touches this store's
-own table.
+opened via a second ``aiosqlite`` connection, and ``CREATE TABLE IF NOT EXISTS``
+only ever touches this store's own table.
+
+That second connection to the same file is not incidental — it is the co-factor
+the ``SQLITE_BUSY_SNAPSHOT`` collision needs, because a commit from ANOTHER
+connection is what makes a pinned read snapshot fatal.  This docstring used to
+say WAL mode plus a busy timeout made the arrangement safe; the busy-timeout
+half is refuted (``plans/recon-sqlite-database-locked-rca-2026-09-16.md``, RC3):
+SQLite never invokes the busy handler for a connection that already holds an
+open transaction, so the write fails immediately no matter how long the timeout
+is.  What makes it safe is that every access on this connection is an atomic
+unit — see :class:`shared.async_sqlite_base.AtomicConnection`.
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 from collections.abc import Sequence
@@ -29,14 +37,22 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import aiosqlite
-from shared.async_sqlite_base import apply_full_durability_pragmas, connect_daemon
+from shared.async_sqlite_base import (
+    AtomicConnection,
+    CheckpointResult,
+    apply_full_durability_pragmas,
+    connect_daemon,
+)
 
 from fused_memory.reconciliation.standing_decision_constants import (
     EXPIRY_REASON_TTL,
     GROUNDS_ENUM,
     RECORD_KIND_ENTITY_STANDING_DECISION,
+    RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
     STATE_ACTIVE,
     STATE_EXPIRED,
+    STREAK_PAYLOAD_KEY,
+    STREAK_WINDOW_PAYLOAD_KEY,
 )
 
 logger = logging.getLogger(__name__)
@@ -179,21 +195,109 @@ def _record_from_row(row: aiosqlite.Row) -> ReconLedgerRecord:
     )
 
 
+def nonnegative_int_from_payload(payload: object, key: str) -> int:
+    """Read the non-negative ``int`` counter stored under *key* in a ledger payload.
+
+    Returns 0 for anything else — a payload that is not a dict, an absent key,
+    ``None``, a bool (``True`` is an ``int`` in Python and must not be read as
+    the count 1), a string, or a negative value.  Free-form JSON off a ledger
+    row is never trusted for shape.
+
+    Pure, sync, no I/O — never raises.
+    """
+    if not isinstance(payload, dict):
+        return 0
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return 0
+    return value
+
+
+def _positive_int_tuple_from_payload(payload: object, key: str) -> tuple[int, ...]:
+    """Read the list of positive ``int`` counts stored under *key* in a ledger payload.
+
+    Returns ``()`` for anything but a list whose every entry is an ``int`` >= 1
+    and not a bool; one malformed entry discards the whole list.
+
+    Pure, sync, no I/O — never raises.
+    """
+    if not isinstance(payload, dict):
+        return ()
+    value = payload.get(key)
+    if not isinstance(value, list) or any(
+        isinstance(entry, bool) or not isinstance(entry, int) or entry < 1 for entry in value
+    ):
+        return ()
+    return tuple(value)
+
+
+#: The streak row's payload key for the run that last wrote it.  Private
+#: because only this module writes and reads it: consumers get it as
+#: :attr:`SuppressionStreakRow.last_run_id`.
+_STREAK_LAST_RUN_ID_KEY = 'last_run_id'
+
+
+@dataclass(frozen=True)
+class SuppressionStreakRow:
+    """One decoded suppression-streak row (task 2943), as
+    :meth:`ReconLedgerStore.list_suppression_streaks` returns it.
+
+    ``streak`` is the number of consecutive full cycles in which the standing
+    decision on ``(entity_uuid, grounds)`` suppressed a flag.
+    ``recent_counts`` holds the suppression counts of the streak's most recent
+    cycles, oldest first, never more entries than ``streak``.
+    ``last_run_id`` is the run that last wrote the row.
+    """
+
+    entity_uuid: str
+    grounds: str
+    streak: int
+    recent_counts: tuple[int, ...]
+    last_run_id: str
+
+
+def _streak_row_from_record(record: ReconLedgerRecord) -> SuppressionStreakRow:
+    """Decode a suppression-streak record without trusting its payload's shape.
+
+    Anything :meth:`ReconLedgerStore.upsert_suppression_streak` would have
+    rejected reads as the smaller value: a payload that is not a JSON object
+    reads as empty, a malformed streak as 0, a malformed window as ``()``, a
+    window longer than its streak (as one left on a zero streak is) as
+    ``()``, and a non-string run id as ``''``.
+    """
+    try:
+        payload = json.loads(record.payload_json)
+    except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    streak = nonnegative_int_from_payload(payload, STREAK_PAYLOAD_KEY)
+    recent_counts = _positive_int_tuple_from_payload(payload, STREAK_WINDOW_PAYLOAD_KEY)
+    last_run_id = payload.get(_STREAK_LAST_RUN_ID_KEY)
+    return SuppressionStreakRow(
+        entity_uuid=record.entity_uuid or record.run_id,
+        grounds=record.flag_type,
+        streak=streak,
+        recent_counts=recent_counts if len(recent_counts) <= streak else (),
+        last_run_id=last_run_id if isinstance(last_run_id, str) else '',
+    )
+
+
 class ReconLedgerStore:
     """SQLite-backed control-plane ledger for recon markers/suppressions/summaries."""
 
     def __init__(self, db_path: Path | str) -> None:
         self._db_path = Path(db_path)
-        self._db: aiosqlite.Connection | None = None
+        self._access: AtomicConnection | None = None
 
     async def initialize(self) -> None:
         """Open the SQLite connection and create the schema.
 
         Idempotent at both the connection level and the schema level:
 
-        * **Connection-level** — if ``self._db`` is already set (e.g. from a
+        * **Connection-level** — if ``self._access`` is already set (e.g. from a
           prior ``initialize()``), the existing connection is closed first via
-          :meth:`close` (which also checkpoints the WAL and nulls ``self._db``)
+          :meth:`close` (which also checkpoints the WAL and nulls ``self._access``)
           before a fresh one is opened. This prevents orphaning the aiosqlite
           worker thread, which would otherwise raise "Event loop is closed" on
           GC (ticket_store.py precedent, tasks 1560, 1562).
@@ -211,14 +315,15 @@ class ReconLedgerStore:
         the ALTER adds it, so building the index first would raise. This
         mirrors the TABLE→INDEX split in ``middleware/ticket_store.py``.
         """
-        if self._db is not None:
+        if self._access is not None:
             await self.close()
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = await connect_daemon(str(self._db_path))
-        self._db.row_factory = aiosqlite.Row
-        await apply_full_durability_pragmas(self._db, busy_timeout_ms=5000)
-        await self._db.executescript(TABLE_SQL)
-        await self._db.commit()
+        conn = await connect_daemon(str(self._db_path))
+        conn.row_factory = aiosqlite.Row
+        await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
+        self._access = AtomicConnection(conn)
+        async with self._access.write() as db:
+            await db.executescript(TABLE_SQL)
 
         # Safe migration: add the nullable entity_uuid column to pre-existing
         # recon_ledger tables (task 2894 α, journal.py:214-249 ALTER-TABLE
@@ -233,34 +338,21 @@ class ReconLedgerStore:
         # swallowed and left to re-surface one statement later as a confusing
         # "no such column: entity_uuid" from the INDEX_SQL that references it.
         try:
-            await self._db.execute('ALTER TABLE recon_ledger ADD COLUMN entity_uuid TEXT')
-            await self._db.commit()
+            async with self._access.write() as db:
+                await db.execute('ALTER TABLE recon_ledger ADD COLUMN entity_uuid TEXT')
         except Exception as exc:
-            with contextlib.suppress(Exception):
-                await self._db.rollback()
+            # The write unit has already rolled itself back.
             if 'duplicate column name' not in str(exc).lower():
                 raise  # Not the benign "column already exists" case — surface it.
 
-        await self._db.executescript(INDEX_SQL)
-        await self._db.commit()
+        async with self._access.write() as db:
+            await db.executescript(INDEX_SQL)
         logger.info('ReconLedgerStore initialized at %s', self._db_path)
 
-    def _require_db(self) -> aiosqlite.Connection:
-        if self._db is None:
+    def _require_access(self) -> AtomicConnection:
+        if self._access is None:
             raise RuntimeError('ReconLedgerStore not initialized — call initialize() first')
-        return self._db
-
-    @contextlib.asynccontextmanager
-    async def _txn(self):
-        """Explicit transaction: commit on success, rollback on any exception."""
-        db = self._require_db()
-        try:
-            yield db
-            await db.commit()
-        except BaseException:
-            with contextlib.suppress(Exception):
-                await db.rollback()
-            raise
+        return self._access
 
     @staticmethod
     def _upsert_params(record: ReconLedgerRecord) -> tuple:
@@ -289,7 +381,7 @@ class ReconLedgerStore:
         Use :meth:`upsert_many` when writing a batch: each call here is its own
         transaction, hence its own commit and its own fsync.
         """
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.execute(_UPSERT_SQL, self._upsert_params(record))
 
     async def upsert_many(self, records: Sequence[ReconLedgerRecord]) -> int:
@@ -320,7 +412,7 @@ class ReconLedgerStore:
         params = [self._upsert_params(record) for record in records]
         if not params:
             return 0
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             await db.executemany(_UPSERT_SQL, params)
         return len(params)
 
@@ -333,8 +425,7 @@ class ReconLedgerStore:
         run_id: str = '',
     ) -> ReconLedgerRecord | None:
         """Return the record matching the five-part identity, or None."""
-        db = self._require_db()
-        cursor = await db.execute(
+        row = await self._require_access().read_one(
             """
             SELECT * FROM recon_ledger
             WHERE project_id = ? AND record_kind = ? AND task_id = ?
@@ -342,7 +433,6 @@ class ReconLedgerStore:
             """,
             (project_id, record_kind, task_id, flag_type, run_id),
         )
-        row = await cursor.fetchone()
         if row is None:
             return None
         return _record_from_row(row)
@@ -380,15 +470,13 @@ class ReconLedgerStore:
 
         Satisfied by the ``(project_id, record_kind, state)`` index.
         """
-        db = self._require_db()
-        cursor = await db.execute(
+        rows = await self._require_access().read_all(
             """
             SELECT * FROM recon_ledger
             WHERE project_id = ? AND record_kind = 'stage1_flag_suppression' AND state = 'active'
             """,
             (project_id,),
         )
-        rows = await cursor.fetchall()
         return [_record_from_row(row) for row in rows]
 
     async def is_suppressed(self, project_id: str, task_id: str, flag_type: str) -> bool:
@@ -398,8 +486,7 @@ class ReconLedgerStore:
         covering every flag_type for that task — matched here via
         ``flag_type IN (?, '')``.
         """
-        db = self._require_db()
-        cursor = await db.execute(
+        row = await self._require_access().read_one(
             """
             SELECT 1 FROM recon_ledger
             WHERE project_id = ? AND record_kind = 'stage1_flag_suppression' AND state = 'active'
@@ -408,7 +495,6 @@ class ReconLedgerStore:
             """,
             (project_id, task_id, flag_type),
         )
-        row = await cursor.fetchone()
         return row is not None
 
     async def marker_task_ids(self, project_id: str) -> set[str]:
@@ -432,16 +518,14 @@ class ReconLedgerStore:
         project-scoped ``cycle_summary`` records, which are not per-task
         markers) are excluded.
         """
-        db = self._require_db()
         marker_placeholders = ','.join('?' * len(MARKER_KINDS))
-        cursor = await db.execute(
+        rows = await self._require_access().read_all(
             f"""
             SELECT DISTINCT task_id FROM recon_ledger
             WHERE project_id = ? AND record_kind IN ({marker_placeholders}) AND task_id != ''
             """,
             (project_id, *MARKER_KINDS),
         )
-        rows = await cursor.fetchall()
         return {row['task_id'] for row in rows}
 
     async def gc(
@@ -513,7 +597,7 @@ class ReconLedgerStore:
         corrupt this comparison; callers are responsible for passing
         normalized timestamps.
         """
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             if terminal_task_ids:
                 marker_placeholders = ','.join('?' * len(MARKER_KINDS))
                 terminal_placeholders = ','.join('?' * len(terminal_task_ids))
@@ -603,7 +687,7 @@ class ReconLedgerStore:
         acknowledgement keys are stamped in, so this never raises — and never
         rolls back the transaction — on an unexpected payload shape.
         """
-        async with self._txn() as db:
+        async with self._require_access().write() as db:
             cursor = await db.execute(
                 """
                 SELECT payload_json FROM recon_ledger
@@ -724,9 +808,9 @@ class ReconLedgerStore:
         optionally further filtered to a single ``state``. This is the ζ
         growth/merge sweep source and the round-trip read for α's own tests.
         """
-        db = self._require_db()
+        access = self._require_access()
         if state is None:
-            cursor = await db.execute(
+            rows = await access.read_all(
                 """
                 SELECT * FROM recon_ledger
                 WHERE project_id = ? AND record_kind = ?
@@ -734,14 +818,13 @@ class ReconLedgerStore:
                 (project_id, RECORD_KIND_ENTITY_STANDING_DECISION),
             )
         else:
-            cursor = await db.execute(
+            rows = await access.read_all(
                 """
                 SELECT * FROM recon_ledger
                 WHERE project_id = ? AND record_kind = ? AND state = ?
                 """,
                 (project_id, RECORD_KIND_ENTITY_STANDING_DECISION, state),
             )
-        rows = await cursor.fetchall()
         return [_record_from_row(row) for row in rows]
 
     async def get_active_entity_standing_decision(
@@ -771,8 +854,7 @@ class ReconLedgerStore:
         explicit ``grounds`` argument) MUST be resolved before a second grounds
         value is admitted to ``GROUNDS_ENUM``.
         """
-        db = self._require_db()
-        cursor = await db.execute(
+        rows = await self._require_access().read_all(
             """
             SELECT * FROM recon_ledger
             WHERE project_id = ? AND record_kind = ? AND entity_uuid = ? AND state = ?
@@ -781,10 +863,6 @@ class ReconLedgerStore:
             """,
             (project_id, RECORD_KIND_ENTITY_STANDING_DECISION, entity_uuid, STATE_ACTIVE),
         )
-        # aiosqlite types fetchall() as Iterable[Row] (not Sized); materialize
-        # to a list so len()/indexing below type-check (it's already a list at
-        # runtime).
-        rows = list(await cursor.fetchall())
         if not rows:
             return None
         if len(rows) > 1:
@@ -797,6 +875,123 @@ class ReconLedgerStore:
             )
         return _record_from_row(rows[0])
 
+    async def upsert_suppression_streak(
+        self,
+        *,
+        project_id: str,
+        entity_uuid: str,
+        grounds: str,
+        streak: int,
+        recent_counts: Sequence[int],
+        last_run_id: str,
+        updated_at: str,
+        expires_at: str,
+    ) -> None:
+        """Write (last-write-wins) one suppression-streak row: the streak count
+        of the standing decision on ``(entity_uuid, grounds)`` plus its recent
+        per-cycle window (task 2943).  The streak counts the consecutive full
+        cycles in which the decision suppressed a flag; ``recent_counts`` holds
+        the suppression counts of the streak's most recent cycles, oldest first.
+        Capping that window at K is the caller's job, so the ledger stays
+        threshold-agnostic.
+
+        The PK slots deliberately mirror
+        :meth:`upsert_entity_standing_decision` — ``task_id=''``,
+        ``flag_type=grounds``, ``run_id=entity_uuid``, plus the indexed
+        ``entity_uuid`` column — so a streak row and its decision row share an
+        identity a reader can join on, while the distinct record kind
+        (:data:`~fused_memory.reconciliation.standing_decision_constants.RECORD_KIND_ENTITY_SUPPRESSION_STREAK`)
+        keeps this write from touching the decision row's payload.
+
+        Unlike the decision row, a streak row is HARD-DELETED by :meth:`gc` once
+        ``expires_at`` passes rather than TTL-flipped: recurrence history for a
+        derived counter is not worth preserving, and the delete is what bounds
+        row growth.
+
+        Validation is loud (INV-1), as in :meth:`upsert_entity_standing_decision`:
+        an empty ``entity_uuid``, a ``streak`` that is not a non-negative int, a
+        ``recent_counts`` that is not a list or tuple of non-bool ints >= 1 no
+        longer than ``streak``, a ``grounds`` outside ``GROUNDS_ENUM``, or a
+        ``None`` ``expires_at`` raises ``ValueError`` naming the field, and
+        nothing is written.
+        """
+        if not entity_uuid:
+            raise ValueError(
+                'upsert_suppression_streak: entity_uuid must be a non-empty '
+                f'string (got {entity_uuid!r})'
+            )
+        if isinstance(streak, bool) or not isinstance(streak, int) or streak < 0:
+            raise ValueError(
+                'upsert_suppression_streak: streak must be a non-negative int '
+                f'(got {streak!r})'
+            )
+        if not isinstance(recent_counts, (list, tuple)):
+            raise ValueError(
+                'upsert_suppression_streak: recent_counts must be a list or tuple '
+                f'of per-cycle counts (got {recent_counts!r})'
+            )
+        if any(
+            isinstance(count, bool) or not isinstance(count, int) or count < 1
+            for count in recent_counts
+        ):
+            raise ValueError(
+                'upsert_suppression_streak: every recent_counts entry must be an '
+                f'int >= 1, one suppressing cycle\'s count (got {recent_counts!r})'
+            )
+        if len(recent_counts) > streak:
+            raise ValueError(
+                'upsert_suppression_streak: recent_counts may hold at most one '
+                f'entry per cycle of the streak (got {len(recent_counts)} entries '
+                f'for streak={streak})'
+            )
+        if grounds not in GROUNDS_ENUM:
+            raise ValueError(
+                'upsert_suppression_streak: grounds must be a member of '
+                f'GROUNDS_ENUM {sorted(GROUNDS_ENUM)} (got {grounds!r})'
+            )
+        if expires_at is None:
+            raise ValueError(
+                'upsert_suppression_streak: expires_at must not be None '
+                '(an unexpiring streak row would never be reaped by gc())'
+            )
+        payload = {
+            STREAK_PAYLOAD_KEY: streak,
+            STREAK_WINDOW_PAYLOAD_KEY: list(recent_counts),
+            _STREAK_LAST_RUN_ID_KEY: last_run_id,
+            'grounds': grounds,
+            'updated_at': updated_at,
+        }
+        await self.upsert(
+            ReconLedgerRecord(
+                project_id=project_id,
+                record_kind=RECORD_KIND_ENTITY_SUPPRESSION_STREAK,
+                task_id='',
+                flag_type=grounds,
+                run_id=entity_uuid,
+                entity_uuid=entity_uuid,
+                payload_json=json.dumps(payload),
+                state=STATE_ACTIVE,
+                created_at=updated_at,
+                expires_at=expires_at,
+            )
+        )
+
+    async def list_suppression_streaks(self, project_id: str) -> list[SuppressionStreakRow]:
+        """Return every suppression-streak row for a project, decoded.
+
+        Stored payloads are never trusted for shape (see
+        :func:`_streak_row_from_record`), so a hand-edited or older-shaped row
+        can lose its streak or window but can never read as a larger one.
+        """
+        rows = await self._require_access().read_all(
+            """
+            SELECT * FROM recon_ledger
+            WHERE project_id = ? AND record_kind = ?
+            """,
+            (project_id, RECORD_KIND_ENTITY_SUPPRESSION_STREAK),
+        )
+        return [_streak_row_from_record(_record_from_row(row)) for row in rows]
+
     async def close(self) -> None:
         """Close the underlying aiosqlite connection.
 
@@ -804,19 +999,17 @@ class ReconLedgerStore:
         empty WAL and the main DB is fully up to date. Best-effort —
         failures don't block the close.
         """
-        if self._db is not None:
-            with contextlib.suppress(Exception):
-                await self._db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-            await self._db.close()
-            self._db = None
+        if self._access is not None:
+            await self._access.close()
+            self._access = None
 
-    async def checkpoint(self) -> tuple[int, int, int]:
+    async def checkpoint(self) -> CheckpointResult:
         """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` and return ``(busy, log,
         checkpointed)``. Called by the periodic checkpoint loop in
-        ``server/main.py``."""
-        db = self._require_db()
-        cursor = await db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-        row = await cursor.fetchone()
-        if row is None:
-            return (-1, -1, -1)
-        return int(row[0]), int(row[1]), int(row[2])
+        ``server/main.py``.
+
+        Post-close this RAISES 'not initialized', as ReconciliationJournal does;
+        EventBuffer alone answers ``(-1, -1, -1)``.  See
+        ``ReconciliationJournal.checkpoint`` for why the split is deliberate.
+        """
+        return await self._require_access().checkpoint()

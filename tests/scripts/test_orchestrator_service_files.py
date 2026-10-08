@@ -125,15 +125,18 @@ def test_dark_factory_orchestrator_service_structure() -> None:
         in content
     ), "Missing ExecStartPre wait-for-port gate on fused-memory's port"
     assert (
-        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/dark-factory/dark-factory-orchestrator.yaml"
+        "uv run --no-sync --project orchestrator orchestrator run --config /home/leo/src/dark-factory/dark-factory-orchestrator.yaml"
         in content
-    ), "ExecStart must invoke the orchestrator with the df config, frozen"
-    # --frozen: process start must NEVER implicitly re-sync the shared
-    # dark-factory/.venv (the 2026-05-29 ghost-venv fix — a frozen start fails
-    # fast instead of bootstrapping/mutating the runtime interpreter).
-    assert "uv run --frozen" in content, (
-        "ExecStart must pass --frozen so unit start never re-syncs the shared venv"
-    )
+    ), "ExecStart must invoke the orchestrator with the df config, no-sync"
+    # --no-sync, and its position before the command token, are pinned by the
+    # contiguous substring above. CORRECTION (task 5553): this pinned --frozen
+    # from the 2026-05-29 ghost-venv fix until then, believing a frozen start
+    # could not bootstrap the runtime interpreter — measured false; --frozen is
+    # a lockfile option (scripts/orchestrator-autopilot-video.service holds the
+    # measurement). The INVARIANT now lives fleet-wide in
+    # tests/scripts/test_uv_run_venv_isolation.py, which checks both arms
+    # (--no-sync present, no lockfile flag) against every committed unit; what
+    # stays here is this unit's config path, which no sweep can know.
     assert "Restart=on-failure" in content
     assert "RestartSec=10" in content
     assert "RestartMaxDelaySec=60" in content
@@ -208,14 +211,11 @@ def test_reify_orchestrator_service_structure() -> None:
         in content
     ), "Missing ExecStartPre wait-for-port gate on fused-memory's port"
     assert (
-        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/reify/dark-factory-orchestrator.yaml"
+        "uv run --no-sync --project orchestrator orchestrator run --config /home/leo/src/reify/dark-factory-orchestrator.yaml"
         in content
-    ), "ExecStart must invoke the orchestrator with the reify config, frozen"
-    # --frozen: see the df structure test — unit start must never re-sync the
-    # shared dark-factory/.venv that the reify orchestrator also runs under.
-    assert "uv run --frozen" in content, (
-        "ExecStart must pass --frozen so unit start never re-syncs the shared venv"
-    )
+    ), "ExecStart must invoke the orchestrator with the reify config, no-sync"
+    # --no-sync: see the df structure test above, and
+    # tests/scripts/test_uv_run_venv_isolation.py for the fleet-wide arm.
     assert "Restart=on-failure" in content
     assert "RestartSec=10" in content
     assert "RestartMaxDelaySec=60" in content
@@ -317,12 +317,26 @@ def test_reify_and_df_differ_only_in_config_and_description() -> None:
     expected_df_orch_unit_line = "Environment=ORCH_UNIT=orchestrator-dark-factory.service"
     expected_reify_orch_unit_line = "Environment=ORCH_UNIT=orchestrator-reify.service"
 
+    # Each unit also Wants=/After= and (in [Install]) Also= its OWN
+    # `orchestrator-<project>.socket` (escalation socket activation), so every
+    # line naming that socket differs by project the same way the ORCH_UNIT
+    # line does. Checked by SUBSTITUTION rather than another allowed-fragment
+    # pair: those lines are not fixed strings (After= carries a
+    # space-separated list, the comment above Wants= is prose), so the only
+    # exact claim available is "this line becomes reify's line if you swap in
+    # reify's socket name" — which still fails on any OTHER difference on the
+    # same line.
+    df_socket = "orchestrator-dark-factory.socket"
+    reify_socket = "orchestrator-reify.socket"
+
     unexpected: list[tuple[int, str, str]] = []
     for lineno, dl, rl in diff_lines:
         if (
             dl.strip() == expected_df_orch_unit_line
             and rl.strip() == expected_reify_orch_unit_line
         ):
+            continue
+        if df_socket in dl and dl.replace(df_socket, reify_socket) == rl:
             continue
         df_ok = any(frag in dl for frag in allowed_df_fragments)
         reify_ok = any(frag in rl for frag in allowed_reify_fragments)
@@ -346,8 +360,9 @@ def test_autopilot_video_service_exists_and_structure() -> None:
 
     Until the 2026-05-29 venv-isolation fix this unit was live in
     ~/.config/systemd/user/ but had NO source template in scripts/ — so
-    setup-host.sh would never reinstall it and it could not pick up --frozen.
-    This test guards the now-tracked template going forward.
+    setup-host.sh would never reinstall it and it could not pick up a fleet-wide
+    ExecStart change at all. This test guards the now-tracked template going
+    forward.
     """
     assert AUTOPILOT_SERVICE.exists(), (
         "scripts/orchestrator-autopilot-video.service must exist as a tracked "
@@ -381,10 +396,9 @@ def test_autopilot_video_service_exists_and_structure() -> None:
         in content
     )
     assert (
-        "uv run --frozen --project orchestrator orchestrator run --config /home/leo/src/autopilot-video/dark-factory-orchestrator.yaml"
+        "uv run --no-sync --project orchestrator orchestrator run --config /home/leo/src/autopilot-video/dark-factory-orchestrator.yaml"
         in content
-    ), "ExecStart must invoke the orchestrator with the autopilot-video config, frozen"
-    assert "uv run --frozen" in content
+    ), "ExecStart must invoke the orchestrator with the autopilot-video config, no-sync"
     assert "Restart=on-failure" in content
     assert "StartLimitIntervalSec=600" in content
     assert "StartLimitBurst=10" in content

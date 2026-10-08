@@ -14,10 +14,16 @@
 # maintenance action must run under the SERVICE env, not a bare shell, or
 # the census silently narrows.
 #
-# Runs `--apply --terminal-drain` WITHOUT `--check` on purpose: the sweep's
-# own docstring/WARNING notes undated markers can never be drained by
-# find_stale_markers, so a `--check --max-backlog 0` recurring service would
-# enter systemd `failed` state forever whenever any undated marker exists.
+# Runs `--apply --terminal-drain` WITHOUT `--check` on purpose: part of the
+# enumerated population cannot be drained by ANY invocation of the sweep, so
+# a `--check --max-backlog 0` recurring service would enter systemd `failed`
+# state forever whenever that floor is nonzero. The arms and their remedies
+# are stated once in docs/flag-marker-sweep-recurring.md -- the single copy.
+# Since task 4436 each run still REPORTS the floor here (structural_floor in
+# the JSON below). Read gate_evaluated with it: this service publishes
+# `gate_evaluated: false`, marking gate_unsatisfiable as a verdict on the
+# HYPOTHETICAL default-ceiling gate it never runs -- which is why no ERROR
+# accompanies it, and why a `true` here is not a failing check.
 # Backlog visibility is instead left to the existing reconciliation
 # Stage-1/2 re-flag net (the mechanism that filed this task).
 #
@@ -30,31 +36,22 @@
 # (a no-op source). FLAG_MARKER_SWEEP_PROJECT_IDS (whitespace-separated)
 # overrides the per-project sweep list -- see the loop at the bottom.
 #
-# Task 2917 EDIT 3 -- `uv` is resolved to an ABSOLUTE path below rather than
-# trusted to be on PATH. OBSERVED (journalctl --user -u
-# fused-memory-flag-marker-sweep.service):
-#
-#   Aug 18 09:02:44 ... fused-memory-flag-marker-sweep.sh[65377]:
-#       .../fused-memory-flag-marker-sweep.sh: line 46: exec: uv: not found
-#   Aug 18 09:02:44 ... fused-memory-flag-marker-sweep.service:
-#       Main process exited, code=exited, status=127/n/a
-#
-# That line is immediately preceded by a `-- Boot ... --` marker, and the
-# next normal timer firing (Aug 19 03:34:58) succeeded -- so the failure is
-# specific to the unit's `Persistent=true` BOOT CATCH-UP run, which fires
-# before the login session pushes the user PATH into the systemd user
-# manager. `uv` lives in $HOME/.local/bin, absent from that minimal boot
-# PATH. UV_BIN overrides the resolution outright (the test seam); otherwise
-# `command -v uv` wins, then the measured real location, then
-# /usr/local/bin. An unresolvable `uv` is reported LOUDLY (an ERROR: line
-# naming uv, the PATH searched, and the boot-catch-up cause) rather than
-# left as a bare shell 127 that says nothing about why.
+# `uv` is resolved to an absolute path by
+# scripts/lib/resolve_uv.sh::require_uv_bin rather than trusted to be on PATH
+# (task 2917 EDIT 3; see that lib for the ladder and the boot-catch-up cause,
+# and the .service unit for the observed journal excerpt). The call runs
+# AFTER `source "$REPO/.env"` so a UV_BIN or PATH set in .env is honored.
 #
 # This is belt-and-braces with the `Environment=PATH=` line the .service
 # unit now carries: the unit-level PATH covers everything else the wrapper
 # shells out to, while this wrapper-level resolution survives a STALE
 # installed unit that predates that line.
 set -euo pipefail
+
+case "${BASH_SOURCE[0]}" in */*) _self_dir="${BASH_SOURCE[0]%/*}" ;; *) _self_dir=. ;; esac
+_uv_lib="$_self_dir/lib/resolve_uv.sh"
+# shellcheck source=lib/resolve_uv.sh
+source "$_uv_lib" || { echo "${0##*/}: ERROR: cannot load the shared uv resolver $_uv_lib -- refusing to guess which uv to run." >&2; exit 127; }
 
 REPO="${REPO:-/home/leo/src/dark-factory}"
 FM="$REPO/fused-memory"
@@ -66,37 +63,13 @@ export CONFIG_PATH="${CONFIG_PATH:-$FM/config/config.yaml}"
 export PROJECT_ROOT="${PROJECT_ROOT:-$REPO}"
 export FALKORDB_URI="${FALKORDB_URI:-redis://localhost:6379}"
 
-resolve_uv_bin() {
-  # Order: explicit override, then PATH, then the two known install roots.
-  if [ -n "${UV_BIN:-}" ] && [ -x "${UV_BIN}" ]; then
-    printf '%s' "${UV_BIN}"
-    return 0
-  fi
-  local from_path
-  if from_path="$(command -v uv 2>/dev/null)" && [ -x "$from_path" ]; then
-    printf '%s' "$from_path"
-    return 0
-  fi
-  local candidate
-  for candidate in "$HOME/.local/bin/uv" /usr/local/bin/uv; do
-    if [ -x "$candidate" ]; then
-      printf '%s' "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
-
 if [ -n "${FLAG_MARKER_SWEEP_CMD:-}" ]; then
   # The documented test seam: an unquoted expansion so a multi-word prefix
   # word-splits into the array.
   # shellcheck disable=SC2206
   SWEEP_CMD=(${FLAG_MARKER_SWEEP_CMD})
 else
-  if ! UV_RESOLVED="$(resolve_uv_bin)"; then
-    echo "fused-memory-flag-marker-sweep.sh: ERROR: cannot resolve \`uv\` -- not at \$UV_BIN (${UV_BIN:-unset}), not on PATH (${PATH}), and not at \$HOME/.local/bin/uv or /usr/local/bin/uv. This is the \`exec: uv: not found\` / status=127 boot-catch-up failure OBSERVED 2026-08-18 09:02:44: the unit's Persistent=true catch-up run fires before the login session pushes the user PATH into the systemd user manager. Install uv, or set UV_BIN to its absolute path." >&2
-    exit 127
-  fi
+  UV_RESOLVED="$(require_uv_bin)" || exit $?
   # Built literally (not via a \${X:-...} default inside an unquoted array
   # expansion) so "$FM" survives verbatim even when the repo path contains
   # spaces -- see test_wrapper_default_prefix_invokes_uv_run_frozen_project.

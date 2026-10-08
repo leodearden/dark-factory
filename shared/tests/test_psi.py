@@ -40,19 +40,34 @@ class TestParsePressureFileRehome:
         from shared.psi import parse_pressure_file
 
         result = parse_pressure_file(PSI_CPU_TEXT)
-        assert result == {'some_avg10': 2.50, 'full_avg10': 0.30}
+        assert result == {
+            'some_avg10': 2.50,
+            'some_avg60': 1.80,
+            'full_avg10': 0.30,
+            'full_avg60': 0.20,
+        }
 
     def test_missing_full_defaults_to_zero(self):
         from shared.psi import parse_pressure_file
 
         result = parse_pressure_file(PSI_MEM_TEXT)
-        assert result == {'some_avg10': 1.23, 'full_avg10': 0.0}
+        assert result == {
+            'some_avg10': 1.23,
+            'some_avg60': 0.90,
+            'full_avg10': 0.0,
+            'full_avg60': 0.0,
+        }
 
     def test_io_both_lines(self):
         from shared.psi import parse_pressure_file
 
         result = parse_pressure_file(PSI_IO_TEXT)
-        assert result == {'some_avg10': 0.75, 'full_avg10': 0.45}
+        assert result == {
+            'some_avg10': 0.75,
+            'some_avg60': 0.60,
+            'full_avg10': 0.45,
+            'full_avg60': 0.30,
+        }
 
     def test_float_precision(self):
         from shared.psi import parse_pressure_file
@@ -79,6 +94,74 @@ class TestParsePressureFileRehome:
         assert parse_pressure_file(PSI_MEM_TEXT) is not None
 
 
+class TestParsePressureFileBothWindows:
+    """Both averaging windows come off ONE scan (task 3353, ruling D17).
+
+    D17 wants the verify-summary load stamp to carry cpu ``some avg10`` AND
+    ``avg60`` while forbidding a second PSI reader, so the ONE re-homed reader
+    grows the 60 s window additively rather than a parallel parser appearing in
+    verify.py. The ``found`` sentinel semantics are deliberately UNCHANGED by
+    that growth: only a TOTAL miss returns ``None``, and a line carrying a
+    window this parser knows is a parse even when the other window is absent.
+    """
+
+    def test_a_line_without_avg60_still_parses(self):
+        """avg60-absent is a partial miss (0.0), never the None sentinel."""
+        from shared.psi import parse_pressure_file
+
+        result = parse_pressure_file('some avg10=1.50 total=42\n')
+        assert result == {
+            'some_avg10': 1.50,
+            'some_avg60': 0.0,
+            'full_avg10': 0.0,
+            'full_avg60': 0.0,
+        }
+
+    def test_a_line_without_avg10_still_parses_on_the_60s_window(self):
+        """The generalised scan is window-symmetric: either window is a find."""
+        from shared.psi import parse_pressure_file
+
+        result = parse_pressure_file('some avg60=2.25 total=42\n')
+        assert result == {
+            'some_avg10': 0.0,
+            'some_avg60': 2.25,
+            'full_avg10': 0.0,
+            'full_avg60': 0.0,
+        }
+
+    def test_total_miss_still_returns_the_none_sentinel(self):
+        """A window this parser does not read is still a total miss."""
+        from shared.psi import parse_pressure_file
+
+        assert parse_pressure_file('some avg300=1.20 total=42\n') is None
+        assert parse_pressure_file('garbage line with no avg fields\n') is None
+        assert parse_pressure_file('') is None
+
+    def test_avg300_is_never_mistaken_for_a_known_window(self):
+        """The 300 s window must not bleed into either extracted window."""
+        from shared.psi import parse_pressure_file
+
+        result = parse_pressure_file(PSI_CPU_TEXT)
+        assert result is not None
+        assert 1.20 not in result.values()
+        assert 0.10 not in result.values()
+
+    def test_both_windows_of_both_lines_come_off_one_scan(self):
+        """One line carries two windows, so the scan cannot stop at the first."""
+        from shared.psi import parse_pressure_file
+
+        result = parse_pressure_file(
+            'some avg10=9.00 avg60=8.00 avg300=7.00 total=1\n'
+            'full avg10=6.00 avg60=5.00 avg300=4.00 total=2\n'
+        )
+        assert result == {
+            'some_avg10': 9.00,
+            'some_avg60': 8.00,
+            'full_avg10': 6.00,
+            'full_avg60': 5.00,
+        }
+
+
 class TestPsiSampleV2Fields:
     """PRD `plans/load-throttle-harmonisation-prd.md` §6.1 — the v2 field surface.
 
@@ -97,6 +180,8 @@ class TestPsiSampleV2Fields:
         'own_cpu_some10',
         'own_cgroup',
         'own_read_ok',
+        # Ruling D17 (task 3353) appends the 60 s CPU window by the same rule.
+        'cpu_some60',
     )
 
     def test_v1_construction_still_works_and_v2_fields_default(self):
@@ -114,6 +199,7 @@ class TestPsiSampleV2Fields:
         assert sample.own_cpu_some10 == 0.0
         assert sample.own_cgroup == ''
         assert sample.own_read_ok is False
+        assert sample.cpu_some60 == 0.0
 
     def test_v2_fields_settable_by_keyword(self):
         from shared.psi import PsiSample
@@ -204,6 +290,39 @@ def _healthy_sample(**overrides):
     )
     fields.update(overrides)
     return PsiSample(**fields)
+
+
+class TestPsiSampleCpuSome60:
+    """The 60 s CPU window on the sample (task 3353, ruling D17).
+
+    Appended DEFAULTED, per the rule the class docstring already states: the
+    defaults are the "component absent" reading, so every shipped keyword
+    construction stays valid. It is TELEMETRY, not a gate arm — the D10
+    saturation rank is owned by the load-throttle PRD and tasks 3590/3592, so
+    stamping a verify summary must not move it.
+    """
+
+    def test_the_60s_window_is_telemetry_not_a_gate_arm(self):
+        """A sky-high 60 s window must not saturate, even with a threshold set.
+
+        The cfg carries a ``cpu_some_avg60`` a future arm would read, so this
+        goes red if anyone wires the field into ``_ARMS`` rather than passing
+        silently on ``getattr(cfg, field, None)``.
+        """
+        cfg = _saturation_cfg()
+        cfg.cpu_some_avg60 = 1.0
+        sample = _healthy_sample(cpu_some60=99.0)
+
+        assert sample.saturated(cfg) is False
+        with pytest.raises(ValueError):
+            sample.tripping_metric(cfg)
+
+    def test_the_60s_window_does_not_displace_the_10s_arm(self):
+        """The 10 s arm still trips on its own value, not the 60 s one."""
+        cfg = _configured_cfg(cpu_some_avg10=85.0)
+
+        assert _healthy_sample(cpu_some10=90.0, cpu_some60=0.0).saturated(cfg) is True
+        assert _healthy_sample(cpu_some10=0.0, cpu_some60=90.0).saturated(cfg) is False
 
 
 class TestPsiSampleSaturated:
@@ -983,6 +1102,7 @@ class TestReadPsiSampleHappyPath:
 
         assert sample.read_ok is True
         assert sample.cpu_some10 == pytest.approx(2.50)
+        assert sample.cpu_some60 == pytest.approx(1.80)
         assert sample.mem_some10 == pytest.approx(1.23)
         assert sample.mem_full10 == 0.0
         assert sample.io_some10 == pytest.approx(0.75)
@@ -1022,6 +1142,7 @@ class TestReadPsiSampleFailOpen:
     def _assert_sentinel(self, sample):
         assert sample.read_ok is False
         assert sample.cpu_some10 == 0.0
+        assert sample.cpu_some60 == 0.0
         assert sample.mem_some10 == 0.0
         assert sample.mem_full10 == 0.0
         assert sample.io_some10 == 0.0
@@ -1108,7 +1229,7 @@ class TestReadPsiSampleV2Composition:
 
         return read
 
-    def test_all_ten_fields_populated_when_every_component_succeeds(self, tmp_path):
+    def test_every_field_populated_when_every_component_succeeds(self, tmp_path):
         import os
 
         from shared.psi import read_psi_sample
@@ -1119,6 +1240,7 @@ class TestReadPsiSampleV2Composition:
 
         assert sample.read_ok is True
         assert sample.cpu_some10 == pytest.approx(2.50)
+        assert sample.cpu_some60 == pytest.approx(1.80)
         assert sample.mem_some10 == pytest.approx(1.23)
         assert sample.mem_full10 == 0.0
         assert sample.io_some10 == pytest.approx(0.75)
@@ -1137,6 +1259,7 @@ class TestReadPsiSampleV2Composition:
 
         assert sample.read_ok is False
         assert sample.cpu_some10 == 0.0
+        assert sample.cpu_some60 == 0.0
         assert sample.mem_some10 == 0.0
         assert sample.mem_full10 == 0.0
         assert sample.io_some10 == 0.0

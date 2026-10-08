@@ -17,9 +17,25 @@ from pathlib import Path
 
 import pytest
 import yaml
+from _orch_helpers import DELIBERATE_TIGHT_BOUND_CEILING
 from pydantic import ValidationError
 
 from orchestrator.config import OrchestratorConfig
+
+# Real-subprocess tests run _run_cmd, whose TimeoutError path escalates
+# terminate_process_group(grace_secs=_TERMINATE_GRACE_SECS) as SIGTERM-wait then
+# SIGKILL-wait.  _UNREACHED_RUN_CMD_TIMEOUT_SECS is the largest timeout these
+# tests pass (a wall-clock budget meant NOT to fire before another deadline), so
+# a regressed kill still ends within _WORST_CASE_SECS.  The marker is a
+# deliberate tight bound: it REPLACES verify's --timeout=300 and the ini default
+# rather than raising a floor, so a hung _run_cmd fails here in a minute, and it
+# sits 3x over the worst case so a CPU-starved host does not trip it.
+# timeout_method="thread" makes a breach os._exit() the xdist worker.
+# TestRealSubprocessTimeoutMarker pins the grace copy and the tight-bound band.
+_TERMINATE_GRACE_SECS = 5.0
+_UNREACHED_RUN_CMD_TIMEOUT_SECS = 10.0
+_WORST_CASE_SECS = _UNREACHED_RUN_CMD_TIMEOUT_SECS + 2 * _TERMINATE_GRACE_SECS
+REAL_SUBPROCESS_TEST_TIMEOUT = int(3 * _WORST_CASE_SECS)
 
 
 def _load_package_defaults() -> dict:
@@ -484,6 +500,37 @@ class TestClockStopReason:
         assert _extract_cause_hint(blob) == line
 
 
+class TestRealSubprocessTimeoutMarker:
+    """REAL_SUBPROCESS_TEST_TIMEOUT is derived from a copy of _run_cmd's
+    terminate grace and must stay a deliberate tight bound; the marker
+    inversion guard cannot resolve a derived name, so both facts are pinned
+    here and drift goes red instead of silently invalidating the derivation."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
+    async def test_terminate_grace_matches_run_cmd(self, tmp_path: Path):
+        from unittest.mock import patch
+
+        from orchestrator import verify
+
+        real_terminate = verify.terminate_process_group
+        graces: list[float] = []
+
+        async def recording_terminate(proc, pgid, *, grace_secs):
+            graces.append(grace_secs)
+            await real_terminate(proc, pgid, grace_secs=grace_secs)
+
+        with patch.object(verify, 'terminate_process_group', recording_terminate):
+            _, _, timed_out = await verify._run_cmd(
+                'sleep 5', tmp_path, timeout=0.2, log_path=tmp_path / 'verify.log',
+            )
+        assert timed_out is True, 'stub must hit the TimeoutError kill path'
+        assert graces == [_TERMINATE_GRACE_SECS]
+
+    def test_marker_stays_a_deliberate_tight_bound(self):
+        assert REAL_SUBPROCESS_TEST_TIMEOUT <= DELIBERATE_TIGHT_BOUND_CEILING
+
+
 # ── Step-7 / Step-8: Core _run_cmd clock-stop behavioral tests ────────────────
 
 
@@ -496,7 +543,7 @@ class TestRunCmdClockStop:
     """
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_happy_exclude_span(self, tmp_path: Path):
         """(a) HAPPY/EXCLUDE-SPAN: stopped span is excluded from wall-clock budget.
 
@@ -521,12 +568,13 @@ class TestRunCmdClockStop:
         assert timed_out is False, f'Expected timed_out=False; got timed_out={timed_out}'
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_heartbeat_idle_kill(self, tmp_path: Path):
         """(b) HEARTBEAT-IDLE KILL: silent stop triggers idle backstop.
 
-        timeout=10.0, heartbeat_idle_max=0.5.  Stub emits STOP then sleeps 5s
-        silently.  Expected: timed_out is True, killed well before 5s.
+        timeout=_UNREACHED_RUN_CMD_TIMEOUT_SECS, heartbeat_idle_max=0.5.  Stub
+        emits STOP then sleeps 5s silently.  Expected: timed_out is True, killed
+        well before 5s.
         """
         from orchestrator.verify import _run_cmd
         log_path = tmp_path / 'verify.log'
@@ -536,12 +584,13 @@ class TestRunCmdClockStop:
         )
         cfg = _make_clock_stop_cfg(heartbeat_idle_max=0.5)
         rc, out, timed_out = await _run_cmd(
-            cmd, tmp_path, timeout=10.0, log_path=log_path, clock_stop=cfg,
+            cmd, tmp_path, timeout=_UNREACHED_RUN_CMD_TIMEOUT_SECS, log_path=log_path,
+            clock_stop=cfg,
         )
         assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_resumed_budget_kill(self, tmp_path: Path):
         """(c) RESUMED-BUDGET KILL: post-START wall-clock fires.
 
@@ -566,7 +615,7 @@ class TestRunCmdClockStop:
         assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_enabled_no_markers_normal_hang(self, tmp_path: Path):
         """(d) ENABLED-NO-MARKERS: clock_stop enabled but stub emits no markers.
 
@@ -583,7 +632,7 @@ class TestRunCmdClockStop:
         assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_gate_disabled_markers_ignored(self, tmp_path: Path):
         """(e) GATE/DISABLED: clock_stop=None; markers in output are ignored.
 
@@ -611,13 +660,14 @@ class TestRunCmdMaxTotalSecs:
     """max_total_secs cumulative-stopped-time cap."""
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_max_total_secs_exceeded(self, tmp_path: Path):
         """max_total_secs=0.5; stub HEARTBEATs forever (never STARTs).
 
-        timeout=10.0 (wall-clock won't fire), heartbeat_idle_max=5.0 (idle
-        won't fire).  Stub emits STOP then heartbeats every 0.2s.
-        Expected: timed_out is True, killed at ~0.5s cumulative stopped time.
+        timeout=_UNREACHED_RUN_CMD_TIMEOUT_SECS (wall-clock won't fire),
+        heartbeat_idle_max=5.0 (idle won't fire).  Stub emits STOP then
+        heartbeats every 0.2s.  Expected: timed_out is True, killed at ~0.5s
+        cumulative stopped time.
         """
         from orchestrator.verify import _run_cmd
         log_path = tmp_path / 'verify.log'
@@ -628,12 +678,13 @@ class TestRunCmdMaxTotalSecs:
         )
         cfg = _make_clock_stop_cfg(heartbeat_idle_max=5.0, max_total_secs=0.5)
         rc, out, timed_out = await _run_cmd(
-            cmd, tmp_path, timeout=10.0, log_path=log_path, clock_stop=cfg,
+            cmd, tmp_path, timeout=_UNREACHED_RUN_CMD_TIMEOUT_SECS, log_path=log_path,
+            clock_stop=cfg,
         )
         assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(10)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_max_total_secs_zero_means_unlimited(self, tmp_path: Path):
         """max_total_secs=0 (unlimited); heartbeating stub is NOT killed by total cap.
 
@@ -716,7 +767,7 @@ class TestClockStopMessageAttribution:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_elapsed_is_measured_at_the_stop_not_the_last_read(self, tmp_path: Path):
         """(b) defect 2: the reported elapsed must be measured when the stop
         actually fires, not frozen at when the last output arrived.
@@ -745,7 +796,7 @@ class TestClockStopMessageAttribution:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_legitimate_heartbeat_idle_kill_is_still_named(self, tmp_path: Path):
         """(c) guard against the rewire producing a false 'unattributed':
         a genuine heartbeat-idle backstop kill is still named."""
@@ -757,7 +808,8 @@ class TestClockStopMessageAttribution:
         )
         cfg = _make_clock_stop_cfg(heartbeat_idle_max=0.5)
         rc, out, timed_out = await _run_cmd(
-            cmd, tmp_path, timeout=10.0, log_path=log_path, clock_stop=cfg,
+            cmd, tmp_path, timeout=_UNREACHED_RUN_CMD_TIMEOUT_SECS, log_path=log_path,
+            clock_stop=cfg,
         )
         assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
         assert 'heartbeat-idle backstop (0s)' in out, f'Unexpected message: {out!r}'
@@ -775,7 +827,7 @@ class TestClockStopMessageAttribution:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_legitimate_max_total_secs_kill_is_still_named(self, tmp_path: Path):
         """(d) guard against the rewire producing a false 'unattributed' on
         the max-total-stopped-cap NARROWING path — the path where the armed
@@ -791,7 +843,8 @@ class TestClockStopMessageAttribution:
         )
         cfg = _make_clock_stop_cfg(heartbeat_idle_max=5.0, max_total_secs=0.5)
         rc, out, timed_out = await _run_cmd(
-            cmd, tmp_path, timeout=10.0, log_path=log_path, clock_stop=cfg,
+            cmd, tmp_path, timeout=_UNREACHED_RUN_CMD_TIMEOUT_SECS, log_path=log_path,
+            clock_stop=cfg,
         )
         assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
         assert 'max-total-stopped cap' in out, f'Unexpected message: {out!r}'
@@ -860,7 +913,7 @@ class TestClockStopMessageAttribution:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
     async def test_genuine_expiry_does_not_warn(self, tmp_path: Path, caplog):
         """(b) A genuine wall-clock expiry must stay silent — the guard must
         fire only on the anomaly, or it becomes noise on every ordinary

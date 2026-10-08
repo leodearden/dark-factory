@@ -566,9 +566,9 @@ CAVEATS: tuple[str, ...] = (
     'of all of these: every targeted graph WAS asked and returned nothing.',
     'DETECTION BOUND: claims are detected by the deterministic lexical '
     'vocabulary in fused_memory.services.completion_claim_gate, which requires '
-    'completion PHRASING and a concrete NAMED REF (task id / commit sha / tkt_ '
-    'id) to co-occur in one clause. A fabricated completion phrased without a '
-    'named ref is invisible to this sweep by construction.',
+    'a completion marker bound to its nearest concrete NAMED REF (task id / '
+    'commit sha / tkt_ id) in the same clause. A fabricated completion phrased '
+    'without a named ref is invisible to this sweep by construction.',
 )
 """The report's caveats, as DATA rather than docstring prose.
 
@@ -1102,6 +1102,11 @@ def _readonly_connect(db_path: Path) -> Any:
 
     Raises on a missing/unopenable file; every caller maps that to
     UNVERIFIABLE rather than to an accusation.
+
+    Not ``scripts/_task_db_scan.py::connect_ro``, deliberately:
+    ``fused-memory/scripts`` cannot import that ``scripts/`` sibling, this one
+    opener also serves tickets.db, and every caller degrades a failure to
+    UNVERIFIABLE, so a refusal's remedy would never reach the reader.
     """
     import sqlite3  # noqa: PLC0415
 
@@ -1200,22 +1205,18 @@ async def _build_ticket_probe(
 ) -> Callable[[str], dict[str, Any] | None | Any]:
     """Build the ticket probe, probing store AVAILABILITY exactly once.
 
-    THE DELIBERATE DIVERGENCE from the live write-path gate.
-    ``TaskInterceptor.get_ticket_row`` returns ``None`` BOTH for "no such
-    ticket" and for "no ticket store configured" (task_interceptor.py:
-    3006-3012), and ``completion_claim_gate._verify_ticket`` maps a ``None``
-    row to ``'mismatch'`` (:575). On the write path that conflation is
-    contained upstream by the ``_taskmaster_configured`` guard and costs at
-    most one spurious tag on one episode. In a BATCH sweep the same conflation
-    is a different animal: if tickets.db is merely absent or unopenable, every
-    ticket claim in the entire corpus prints as a fabrication accusation
-    against a named agent.
+    ``completion_claim_gate._verify_ticket`` maps a ``None`` row to
+    ``'mismatch'``, so ``None`` must mean only "no such ticket". The live
+    write path gets that from ``TaskInterceptor.get_ticket_row``, which raises
+    ``TicketStoreNotConfiguredError`` rather than returning ``None`` when no
+    store is configured. This sweep reads tickets.db directly, so it
+    establishes availability itself, to the same effect: if tickets.db is
+    absent or unopenable, every ticket claim in the corpus would otherwise
+    print as a fabrication accusation against a named agent.
 
     So availability is established ONCE, up front, and unavailability yields
-    :data:`UNRESOLVABLE` for every ref — never ``None``. The gate's own module
-    makes this distinction load-bearing at the sentinel level (:123-127,
-    INV-2), so honouring it here follows its stated intent rather than
-    departing from it.
+    :data:`UNRESOLVABLE` for every ref — never ``None``, the distinction the
+    gate's ``UNRESOLVABLE`` sentinel exists to keep (INV-2).
 
     The read runs over :func:`_read_ticket_rows_readonly` rather than
     ``TicketStore``, whose ``initialize()`` mkdirs the parent and applies
@@ -1302,38 +1303,18 @@ async def _build_task_status_probe(
 def _build_commit_probe(
     project_roots: dict[str, str],
 ) -> Callable[[str, str | None], bool | None]:
-    """Build the commit probe over the IMPORTED :func:`make_commit_probe`.
+    """Build the commit probe: the live gate's IMPORTED registry probe.
 
-    Rooted at the CLAIMED project's repository. An unregistered project is
-    unresolvable, never a miss — reporting "no such commit" because the wrong
-    repo was searched would be a false accusation.
+    :func:`make_registry_commit_probe` looks in the claimed project's
+    repository first and then in every other registered one, and reports a
+    miss only when all of them answered. Delegating keeps the sweep and the
+    write path on one definition of "this commit does not exist".
     """
     from fused_memory.services.completion_claim_gate import (  # noqa: PLC0415
-        make_commit_probe,
+        make_registry_commit_probe,
     )
 
-    cache: dict[str, Callable[[str], bool | None]] = {}
-
-    def probe(ref: str, project_id: str | None) -> bool | None:
-        root = project_roots.get(project_id) if project_id else None
-        if not root:
-            return None
-        if project_id not in cache:
-            try:
-                cache[str(project_id)] = make_commit_probe(root)
-            except Exception:
-                logger.warning(
-                    'could not build a commit probe for %r; UNVERIFIABLE',
-                    project_id, exc_info=True,
-                )
-                return None
-        try:
-            return cache[str(project_id)](ref)
-        except Exception:
-            logger.warning('commit probe failed for %r; UNVERIFIABLE', ref)
-            return None
-
-    return probe
+    return make_registry_commit_probe(project_roots)
 
 
 def _default_project_roots() -> dict[str, str]:

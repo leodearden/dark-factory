@@ -10,10 +10,33 @@
  *             created by tabs.jsx; app.jsx destructures it last)
  */
 const { useState: uS, useEffect: uE } = React;
-const { ProjectGroup, taskId } = window.DF_SHELL;
+const { ProjectGroup, Pip, DatumReading, taskId } = window.DF_SHELL;
 const DF = window.DF_DATA;
 const C = window.DF_CHARTS;
 const { pinningSummary } = window.DF_PINS_RECOVERY;
+// The Datum wrappers. Module scope, no fallback — see the CANONICAL note in
+// datum.js's header.
+const { plainDatum, derivedDatum } = window.DF_DATUM;
+// The served views of the escalation corpus, its class split and each row's
+// task card — read only through their one client reader, escalation_views.js.
+const {
+  queuePending,
+  subsectionQueuePending,
+  openInHistoryOver,
+  corpusAgeCaption,
+  windowedClassSplit,
+  taskCard,
+} = window.DF_ESCALATION_VIEWS;
+// The cross-tab focus lookup, keyed on (queue, id) — escalation_focus.js.
+const { findEscalationRow } = window.DF_ESCALATION_FOCUS;
+// The persisted UI-preference hooks — persisted_state.js.
+const { createPersistedHooks } = window.DF_PERSISTED_STATE;
+const { usePersistedState, useOpenSet } = createPersistedHooks(React);
+
+// Every number this tab renders arrives on one endpoint, and the path is the
+// lookup key into DF_DATA.__receipt (data.js keys one receipt per polled
+// endpoint by its URL with the query stripped).
+const EP_ESCALATIONS = '/api/v2/dashboard/escalations';
 
 // ── Cross-tab focus helpers (module scope) ──
 //
@@ -52,59 +75,7 @@ function escalationsLoaded() {
   return !!(DF.__loaded && DF.__loaded.ESCALATIONS);
 }
 
-function findEscalationRow(escalations, id) {
-  for (const sub of (escalations.subsections || [])) {
-    for (const row of (sub.escalations || [])) {
-      if (row.id === id) return row;
-    }
-  }
-  return null;
-}
-
-// ── Local helpers (tabs.jsx-compatible copies; not exported from any namespace) ──
-
-function useOpenSet(ids, defaultOpen = true, storageKey = null) {
-  const [openMap, setOpenMap] = uS(() => {
-    let stored = {};
-    if (storageKey) {
-      try { stored = JSON.parse(localStorage.getItem(storageKey) || '{}') || {}; } catch (e) {}
-    }
-    const init = {};
-    for (const id of ids) init[id] = id in stored ? !!stored[id] : defaultOpen;
-    return init;
-  });
-  // Backfill ids that arrive after mount (ESCALATIONS.subsections starts [] and
-  // is populated by the first poll, so groups would otherwise render collapsed).
-  const idsKey = ids.join('\0');
-  uE(() => {
-    setOpenMap(m => {
-      let patch = null;
-      for (const id of ids) {
-        if (!(id in m)) { if (!patch) patch = {}; patch[id] = defaultOpen; }
-      }
-      return patch ? { ...m, ...patch } : m;
-    });
-  }, [idsKey]); // eslint-disable-line react-hooks/exhaustive-deps
-  uE(() => {
-    if (storageKey) {
-      try { localStorage.setItem(storageKey, JSON.stringify(openMap)); } catch (e) {}
-    }
-  }, [storageKey, openMap]);
-  const toggle = id => setOpenMap(m => ({ ...m, [id]: !m[id] }));
-  const setAll = v => setOpenMap(Object.fromEntries(ids.map(id => [id, v])));
-  return [openMap, toggle, setAll];
-}
-
-function usePersistedState(storageKey, defaultValue) {
-  const [v, setV] = uS(() => {
-    try {
-      const raw = localStorage.getItem(storageKey);
-      return raw === null ? defaultValue : JSON.parse(raw);
-    } catch (e) { return defaultValue; }
-  });
-  uE(() => { try { localStorage.setItem(storageKey, JSON.stringify(v)); } catch (e) {} }, [storageKey, v]);
-  return [v, setV];
-}
+// ── Local helpers (a tabs.jsx-compatible copy; not exported from any namespace) ──
 
 function GroupAllToggle({ allOpen, onSetAll }) {
   return (
@@ -226,8 +197,8 @@ function sliceDailyByWindow(dailyObj, cutoff) {
   return out;
 }
 
-// ── EscalationStatStrip — five-tile summary (benign rate, 6h breaches,
-//    esc/done, churn, pinning), reading the ESCALATION_ANALYTICS payload
+// ── EscalationStatStrip — six-tile summary (benign rate, open in history,
+//    6h breaches, esc/done, churn, pinning), reading the ESCALATION_ANALYTICS payload
 //    already wired into DF_DATA by the analytics tab (no duplicated
 //    computation) ──
 
@@ -243,49 +214,28 @@ function EscalationStatStrip({ analytics, projectFilter }) {
   // falls back to all rows via the slice helpers' pass-through.
   const cutoff = windowCutoffDate(a.generated_at, 7);
 
-  // (a) benign rate — workflow.flow_daily is the only per-day benign/
-  // actionable series in the payload; sum n by class across every filtered
-  // project's WINDOWED rows (cross-project rollup), also building a
-  // per-date map (summed across projects) for the trend sparkline.
-  let benignN = 0, actionableN = 0;
-  const benignByDate = {}; // date -> { benign, actionable }
-  for (const p of projects) {
-    const flowDaily = sliceRowsByWindow((p.workflow || {}).flow_daily || [], cutoff);
-    for (const row of flowDaily) {
-      const bucket = benignByDate[row.date] || (benignByDate[row.date] = { benign: 0, actionable: 0 });
-      if (row.class === 'benign') { benignN += row.n; bucket.benign += row.n; }
-      else if (row.class === 'actionable') { actionableN += row.n; bucket.actionable += row.n; }
-    }
-  }
-  const benignDenom = benignN + actionableN;
-  const benignRate = benignDenom > 0 ? benignN / benignDenom : null;
-  // Per-day benign rate, one point per date that appears in flow_daily (i.e.
-  // had at least one row that day). Windowed dates with NO flow_daily rows
-  // are OMITTED here, not zero-filled, so the sparkline is not fully
-  // window-aligned when flow_daily has gaps — it only covers dates the
-  // payload actually reported.
-  const benignSpark = Object.keys(benignByDate).sort().map(d => {
-    const { benign, actionable } = benignByDate[d];
-    const denom = benign + actionable;
-    return denom > 0 ? benign / denom : 0;
-  });
+  // (a) benign rate — every filtered project's WINDOWED workflow.flow_daily
+  // rows, split by class over ALL of them (escalation_views.js). The daily
+  // series has a point only for dates the payload reported.
+  const classSplit = windowedClassSplit(
+    projects.flatMap(p => sliceRowsByWindow((p.workflow || {}).flow_daily || [], cutoff)),
+  );
 
   // Stamped-share hint — NO per-day provenance series exists in the payload,
   // so this is an ALL-TIME aggregate from origin.sources[], weighted by each
-  // source's classified count (benign + actionable). A coarse adoption
-  // indicator, not a windowed figure.
+  // source's served classified count. A coarse adoption indicator, not a
+  // windowed figure.
   let stampedWeighted = 0, classifiedTotal = 0;
   for (const p of projects) {
     for (const s of (p.origin || {}).sources || []) {
-      const classified = (s.benign || 0) + (s.actionable || 0);
-      stampedWeighted += (s.stamped_share || 0) * classified;
-      classifiedTotal += classified;
+      stampedWeighted += (s.stamped_share || 0) * (s.classified || 0);
+      classifiedTotal += s.classified || 0;
     }
   }
   const stampedPct = classifiedTotal > 0 ? Math.round((stampedWeighted / classifiedTotal) * 100) : null;
 
-  // (b) 6h-breach — live pending queue (lifespan.open_items), NOT windowed;
-  // the payload carries no historical breach series.
+  // (b) 6h-breach — every open record, root or archive (lifespan.open_items),
+  // NOT windowed; the payload carries no historical breach series.
   let openItems = [];
   for (const p of projects) {
     openItems = openItems.concat((p.lifespan || {}).open_items || []);
@@ -356,31 +306,38 @@ function EscalationStatStrip({ analytics, projectFilter }) {
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10, marginBottom: 10 }}>
       <C.StatTile
         label="benign rate"
-        value={benignRate != null ? `${Math.round(benignRate * 100)}%` : '—'}
+        datum={derivedDatum(classSplit.benignShare, EP_ESCALATIONS, 'no classified filings in this window')}
+        format={rate => `${Math.round(rate * 100)}%`}
         hint={stampedPct != null ? `${stampedPct}% stamped` : undefined}
-        spark={benignSpark}
+        history={classSplit.benignShareDaily}
         sparkColor={C.PALETTE.ok}
       />
       <C.StatTile
+        label="open in history"
+        datum={openInHistoryOver(DF, projectFilter)}
+      />
+      <C.StatTile
         label="6h breaches"
-        value={breachCount}
-        hint={`of ${openItems.length} pending`}
+        datum={plainDatum(breachCount, EP_ESCALATIONS)}
+        hint={`of ${openItems.length} open`}
       />
       <C.StatTile
         label="esc / done"
-        value={escPerDone != null ? escPerDone.toFixed(2) : '—'}
-        spark={epdSpark}
+        datum={derivedDatum(escPerDone, EP_ESCALATIONS, 'no tasks completed in this window')}
+        format={ratio => ratio.toFixed(2)}
+        history={epdSpark}
         sparkColor={C.PALETTE.accent}
       />
       <C.StatTile
         label="churn 24h"
-        value={churnRate != null ? `${Math.round(churnRate * 100)}%` : '—'}
-        spark={churnSpark}
+        datum={derivedDatum(churnRate, EP_ESCALATIONS, 'no filings in this window')}
+        format={rate => `${Math.round(rate * 100)}%`}
+        history={churnSpark}
         sparkColor={C.PALETTE.bad}
       />
       <C.StatTile
         label="pinning"
-        value={pinningCount}
+        datum={plainDatum(pinningCount, EP_ESCALATIONS)}
         hint={`blocking ${pinnedTaskCount} task${pinnedTaskCount === 1 ? '' : 's'}`}
       />
     </div>
@@ -389,7 +346,7 @@ function EscalationStatStrip({ analytics, projectFilter }) {
 
 // ── EscalationsTab ──
 
-function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
+function EscalationsTab({ projectFilter, focus, onFocusConsumed }) {
   // ESC_EMPTY is hoisted to module scope; see the note at its declaration.
   // Note it is NOT a "loaded" signal: arrival is read from data.js's
   // first-success marker (escalationsLoaded), so falling back to this
@@ -457,13 +414,16 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
   // A focus id that matched no row. Held rather than dropped: the operator
   // clicked a link and is owed an answer either way.
   const [focusMiss, setFocusMiss] = uS(null);
+  // A focus that matched more than one row of its queue: `{id, count}`. The
+  // lookup never elects one, so this opens nothing and says why.
+  const [focusAmbiguous, setFocusAmbiguous] = uS(null);
 
   // Cross-tab focus handoff (from the memory-eval escalation links in
-  // tab_memory_evals.jsx, lifted through app.jsx). Search every subsection for
-  // the row and open the existing detail sidebar with it.
+  // tab_memory_evals.jsx, lifted through app.jsx). Resolve the `{queue, id}`
+  // focus to a row and open the existing detail sidebar with it.
   //
   // The focus is consumed once a DECISION is REACHABLE, never before. Keyed on
-  // `escalations` as well as `focusId`: while the payload is still the pre-fetch
+  // `escalations` as well as `focus`: while the payload is still the pre-fetch
   // seed the effect declines to decide, and the dep's per-poll identity change
   // (applyKey replaces the reference) is what re-runs it — so a cold load, or an
   // endpoint in backoff, no longer silently eats the focus.
@@ -474,32 +434,35 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
   // reopen a stale drawer on every later visit to this tab — but it is now
   // recorded and rendered rather than dropped in silence.
   uE(() => {
-    if (!focusId) return;
+    if (!focus) return;
     if (!escalationsLoaded()) return;
-    const found = findEscalationRow(escalations, focusId);
-    if (found) { setSelected(found); setFocusMiss(null); }
-    else { setFocusMiss(focusId); }
+    const found = findEscalationRow(escalations, focus);
+    if (found.row) { setSelected(found.row); setFocusMiss(null); setFocusAmbiguous(null); }
+    else if (found.candidates.length > 1) {
+      setFocusAmbiguous({ id: focus.id, count: found.candidates.length });
+      setFocusMiss(null);
+    } else { setFocusMiss(focus.id); setFocusAmbiguous(null); }
     if (onFocusConsumed) onFocusConsumed();
-  }, [focusId, escalations]);
+  }, [focus, escalations]);
 
   // Global summary from top-level data
   const gs = escalations.summary || {};
   const byLevel = gs.by_level || {};
-  const byStatus = gs.by_status || {};
+  const pendingInQueue = queuePending(DF);
 
   return (
     <div style={{ position: 'relative' }}>
       <EscalationStatStrip analytics={DF.ESCALATION_ANALYTICS} projectFilter={projectFilter} />
 
-      {/* Cross-tab focus feedback. Two states, not one: a click that lands
-          before the escalations payload does is WAITING, not a miss, and
-          saying "no longer in the queue" while the endpoint is still in
-          backoff would be a false claim. Both name the id, so the operator
-          can see which link they followed. */}
-      {focusId && !escalationsLoaded() && (
+      {/* Cross-tab focus feedback. A click that lands before the escalations
+          payload does is WAITING, not a miss, and saying "no longer in the
+          queue" while the endpoint is still in backoff would be a false
+          claim. A tie opens nothing rather than guessing. Each notice names
+          the id, so the operator can see which link they followed. */}
+      {focus && !escalationsLoaded() && (
         <div className="badge" data-testid="esc-focus-pending" style={{ marginBottom: 8 }}>
           waiting for the escalation queue to load — will open{' '}
-          <span className="mono">{focusId}</span> when it arrives
+          <span className="mono">{focus.id}</span> when it arrives
         </div>
       )}
       {focusMiss && (
@@ -511,6 +474,20 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
             className="chip"
             style={{ marginLeft: 8 }}
             onClick={() => setFocusMiss(null)}
+          >
+            dismiss
+          </button>
+        </div>
+      )}
+      {focusAmbiguous && (
+        <div className="badge warn" data-testid="esc-focus-ambiguous" style={{ marginBottom: 8 }}>
+          <span className="mono">{focusAmbiguous.id}</span> matches {focusAmbiguous.count} rows
+          in its queue — none was opened
+          <button
+            type="button"
+            className="chip"
+            style={{ marginLeft: 8 }}
+            onClick={() => setFocusAmbiguous(null)}
           >
             dismiss
           </button>
@@ -543,7 +520,7 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
         </button>
         {/* Summary pills */}
         <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--fg-3)' }}>
-          {byStatus.pending || 0} pending · {byLevel[1] || 0} L1 · {byLevel[2] || 0} L2
+          <DatumReading datum={pendingInQueue} /> queue pending · {byLevel[1] || 0} L1 · {byLevel[2] || 0} L2
           {/* Global, like the pips beside it: read from the unfiltered top-level
               summary, so with a project filter active this can count files in
               queues that are not rendered below.  Titled rather than re-derived
@@ -558,6 +535,9 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
             </span>
           )}
         </span>
+        <span style={{ fontSize: 10, color: 'var(--fg-3)' }} title="When the escalation queues were last walked">
+          {corpusAgeCaption(pendingInQueue, Date.now())}
+        </span>
       </div>
 
       {/* Expand / collapse all */}
@@ -567,7 +547,6 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
       {subsections.map(sec => {
         const secSummary = sec.summary || {};
         const secByLevel = secSummary.by_level || {};
-        const secByStatus = secSummary.by_status || {};
         const filteredRows = sortRows((sec.escalations || []).filter(row => {
           if (!matchesFilter(row)) return false;
           // Reconciliation subsections: filter by row.project (not subsection label).
@@ -583,15 +562,15 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
 
         const summary = (
           <>
-            <span className="pip" style={{ fontSize: 10 }}>{secByStatus.pending || 0} pending</span>
+            <Pip datum={subsectionQueuePending(sec, DF.__receipt)} label="queue pending" />
             {(secByLevel[1] || 0) > 0 && (
-              <span className="pip"><span className="badge warn" style={{ fontSize: 9 }}>L1 · {secByLevel[1]}</span></span>
+              <Pip datum={plainDatum(secByLevel[1], EP_ESCALATIONS)} badge="warn" format={n => `L1 · ${n}`} />
             )}
             {(secByLevel[2] || 0) > 0 && (
-              <span className="pip"><span className="badge bad" style={{ fontSize: 9 }}>L2 · {secByLevel[2]}</span></span>
+              <Pip datum={plainDatum(secByLevel[2], EP_ESCALATIONS)} badge="bad" format={n => `L2 · ${n}`} />
             )}
             {skipped.length > 0 && (
-              <span className="pip"><span className="badge bad" style={{ fontSize: 9 }}>{skipped.length} unreadable</span></span>
+              <Pip datum={plainDatum(skipped.length, EP_ESCALATIONS)} badge="bad" label="unreadable" />
             )}
             <span className="mono" style={{ color: 'var(--fg-3)', fontSize: 10 }}>{sec.kind}</span>
           </>
@@ -688,7 +667,8 @@ function EscalationsTab({ projectFilter, focusId, onFocusConsumed }) {
 
 function EscalationSidebar({ row, onClose }) {
   if (!row) return null;
-  const task = row.task || null;
+  const card = taskCard(row, DF.__receipt, Date.now());
+  const task = card.task;
   return (
     <div className="sched-drawer" role="dialog" aria-label={`Escalation detail for ${row.id}`}>
       {/* Header */}
@@ -761,18 +741,17 @@ function EscalationSidebar({ row, onClose }) {
         {/* Linked task */}
         <div className="sched-drawer-section">
           <div style={{ fontSize: 10, color: 'var(--fg-3)', marginBottom: 4 }}>Linked Task</div>
-          {row.task_id && row.task_unresolved ? (
-            // task_id present but could not be resolved — distinct from "no task linked"
+          {card.isHole ? (
             <div style={{ fontSize: 12, color: 'var(--fg-3)' }}>
-              Task ID <span className="mono">{row.task_id}</span> could not be resolved
-              {row.worktree && <span> (worktree: <span className="mono">{row.worktree}</span>)</span>}.
+              {row.task_id && <>Task <span className="mono">{row.task_id}</span>: </>}{card.reason}
             </div>
-          ) : task ? (
-            <div>
+          ) : (
+            <div title={card.reason || undefined}>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 4 }}>
                 <span className="mono" style={{ fontSize: 11, color: 'var(--fg-3)' }}>T-{taskId(String(task.id || ''))}</span>
                 <span className={`badge ${task.status === 'in-progress' ? 'ok' : task.status === 'blocked' ? 'bad' : ''}`}
                   style={{ fontSize: 10 }}>{task.status || '—'}</span>
+                {card.age && <span style={{ fontSize: 10, color: 'var(--fg-3)' }}>{card.age}</span>}
               </div>
               <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--fg-0)', marginBottom: 4 }}>{task.title || '—'}</div>
               {task.description && (
@@ -781,8 +760,6 @@ function EscalationSidebar({ row, onClose }) {
                 </div>
               )}
             </div>
-          ) : (
-            <div style={{ fontSize: 12, color: 'var(--fg-3)' }}>No linked task.</div>
           )}
         </div>
       </div>

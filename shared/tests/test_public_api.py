@@ -99,12 +99,15 @@ class TestModuleLevelAll:
             'AgentFailureKind',
             'AgentResult',
             'AllAccountsCappedException',
+            'TranscriptEvidence',
             'build_failure_message',
             'classify_agent_failure',
+            'classify_cap_kill',
             'claude_binary_spec',
             'count_transcript_turns',
             'detect_ended_awaiting_background',
             'detect_resumable_progress',
+            'detect_transcript_model_id',
             'ended_awaiting_background_for_session',
             'invoke_claude_agent',
             'invoke_with_cap_retry',
@@ -117,7 +120,10 @@ class TestModuleLevelAll:
             'require_non_blank_prompt',
             'resolve_claude_binary',
             'resumable_progress_for_session',
+            'transcript_evidence',
+            'transcript_evidence_for_session',
             'transcript_exists',
+            'transcript_model_id_for_session',
         }
 
     def test_usage_gate_all(self):
@@ -154,7 +160,8 @@ class TestModuleLevelAll:
 
         assert hasattr(async_sqlite_base, '__all__'), 'async_sqlite_base must define __all__'
         assert set(async_sqlite_base.__all__) == {
-            'apply_wal_pragmas', 'apply_full_durability_pragmas', 'connect_daemon', 'CheckpointResult', 'AsyncSqliteBase'
+            'apply_wal_pragmas', 'apply_full_durability_pragmas', 'connect_daemon', 'CheckpointResult',
+            'AtomicConnection', 'AsyncSqliteBase',
         }
 
     def test_locking_all(self):

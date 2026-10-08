@@ -11,8 +11,9 @@ via the standalone `evaluate` CLI subcommand below.
 
 Extended census-state READ contract (for task η, which WRITES/advances
 docs/legibility/census-state.json): in addition to the §7.5 minimal shape
-`{last_census_at, last_census_report}`, this module reads an OPTIONAL
-`last_census_done_count` integer baseline — the fused-memory get_statuses()
+`{last_census_at, last_census_report}` and the optional run identity and
+`session_watermark` of plans/census-incremental-prd.md §4.2, this module
+reads an OPTIONAL `last_census_done_count` integer baseline — the fused-memory get_statuses()
 done-task count as of the last census, used to compute the "tasks landed
 since last census" delta for condition (b). fused-memory's get_statuses
 returns only a `{id: status}` status snapshot with no timestamps, so that
@@ -406,18 +407,37 @@ def evaluate(
 # load_census_state — §7.5 census-state.json reader (three-valued)
 # ---------------------------------------------------------------------------
 
+_STATE_TIMESTAMP_KEYS = ("last_census_at", "session_watermark")
+
+
+def _unparseable_timestamp(value: object) -> Exception | None:
+    """Why *value* is not a usable state timestamp, or None when it is
+    (absent and null are usable: the key is optional)."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return TypeError(f"expected an ISO-8601 string, got {type(value).__name__}")
+    try:
+        datetime.fromisoformat(value)
+    except ValueError as exc:
+        return exc
+    return None
+
+
 def load_census_state(path: str | Path) -> tuple[str, dict | None]:
     """Read `docs/legibility/census-state.json` (§7.5, extended with the
     optional `last_census_done_count` baseline documented in this module's
-    docstring). Three-valued result distinguishing "never censused" from
-    "fail safe":
+    docstring, and with plans/census-incremental-prd.md §4.2's optional
+    `last_census_run_id`, `last_census_as_of_sha` and `session_watermark`).
+    Three-valued result distinguishing "never censused" from "fail safe":
 
     - path does not exist -> `("missing", None)`, no warning logged. A
       project that has never run a census is a normal, expected state, not
       a degradation.
-    - unreadable / invalid JSON / non-dict top level / unparseable
-      `last_census_at` -> `("malformed", None)` + exactly one WARNING.
-      Callers must fail SAFE (never fire) rather than guess a timestamp.
+    - unreadable / invalid JSON / non-dict top level / an unparseable
+      `last_census_at` or `session_watermark` -> `("malformed", None)` +
+      exactly one WARNING. Callers must fail SAFE (never fire) rather than
+      guess a timestamp.
     - otherwise -> `("ok", data)`.
     """
     path = Path(path)
@@ -439,16 +459,15 @@ def load_census_state(path: str | Path) -> tuple[str, dict | None]:
         )
         return "malformed", None
 
-    last_census_at = data.get("last_census_at")
-    if last_census_at is not None:
-        try:
-            datetime.fromisoformat(last_census_at)
-        except (TypeError, ValueError) as exc:
+    for key in _STATE_TIMESTAMP_KEYS:
+        error = _unparseable_timestamp(data.get(key))
+        if error is not None:
             logger.warning(
-                "census state at %s is malformed: unparseable last_census_at %r: %s",
+                "census state at %s is malformed: unparseable %s %r: %s",
                 path,
-                last_census_at,
-                exc,
+                key,
+                data.get(key),
+                error,
             )
             return "malformed", None
 
@@ -1271,9 +1290,8 @@ def default_status_fetcher(project_root: str | Path):
     # an `isError: false` JSON-RPC response, so it used to sail through
     # `_extract_tool_result` and get counted as a done-count of 0.
     #
-    # In production this call ALWAYS carried a relative path: census.py's
-    # CLI defaults --project-root to "." and nightly._default_census_launcher
-    # (nightly.py:521) launches census.py with no arguments at all.
+    # census.py resolves its own, now required, --project-root (task 3269);
+    # the `evaluate` CLI's "." default still depends on this resolve().
     #
     # Resolving HERE, at the wire boundary, rather than at each CLI
     # entrypoint, fixes every consumer at once -- census.py's main(), the

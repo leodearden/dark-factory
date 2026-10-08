@@ -5,8 +5,9 @@ This script carries THREE INDEPENDENT RULES.  Rules A and B are mock-spec
 discipline and share the AST predicates ``_is_magicmock_call`` / ``_is_specced``;
 Rule C is a wait-deadline rule and shares none of them.  What ALL THREE share is
 only the exemption-comment contract (``_EXEMPT_TEMPLATE`` / ``_is_exempted``), the
-per-file debt-budget machinery (``_debt_budget`` / ``_apply_debt_budget``), the
-single ``ast.walk`` and the output format.  They have separate detection pipelines,
+single ``ast.walk`` and the output format.  The per-file debt-budget machinery
+(``_debt_budget`` / ``_apply_debt_budget``) is Rule C's alone: Rules A and B are
+hot for every scanned file.  They have separate detection pipelines,
 separate message vocabularies and separate ``# noqa`` codes.  Every statement in the
 "Rule A" section below is scoped to Rule A and says nothing about Rule B or Rule C.
 
@@ -20,18 +21,18 @@ separate message vocabularies and separate ``# noqa`` codes.  Every statement in
       kwargs match a registered stdlib-dataclass shape (``_DATACLASS_SHAPES``;
       ``VerifyResult`` today).  The binding name is never consulted.  Remedies are
       dataclass-specific (``_fake_verify_result``, ``MagicMock(spec=VerifyResult)``).
-      Carries a shrink-only per-file debt BUDGET (``_DATACLASS_DOUBLE_DEBT``): a
-      grandfathered file is silent while it carries at most its recorded number of
-      sites and reports the overrun as soon as it carries more.
+      Hot for every scanned file: the transitional per-file debt baseline was
+      retired once its 95 grandfathered sites were migrated (task 4354).
 
   Rule C — ``wall-clock-deadline`` (task 4246)
       NOT a mock-spec rule.  Position-blind over any ``ast.Call``: a load-bearing
-      synchronisation point (a ``MergeRequest.result`` future or a ``gate*.wait()``
-      barrier) awaited through a bare ``asyncio.wait_for`` instead of
-      ``wait_responsive``, or carrying a raw numeric ``timeout=`` literal on either
-      call shape.  Remedies are wait-specific (``wait_responsive(...)`` with a
-      ``label=``, bound derived from ``MERGE_RESULT_TIMEOUT``).  Carries its own
-      shrink-only per-file debt BUDGET (``_WALL_CLOCK_DEADLINE_DEBT``).
+      synchronisation point (a ``MergeRequest.result`` future or a zero-argument
+      ``.wait()`` barrier) awaited through a bare ``asyncio.wait_for`` instead of
+      ``wait_responsive``, or carrying a raw numeric literal bound (``timeout=``,
+      ``max_wall_s=`` or wait_for's positional timeout).  Remedies are wait-specific
+      (``wait_responsive(...)`` with a ``label=``, bound derived from
+      ``MERGE_RESULT_TIMEOUT``).  Carries its own shrink-only per-file debt BUDGET
+      (``_WALL_CLOCK_DEADLINE_DEBT``).
 
 WIDEN-NOT-SIBLING RULING (task 4016): Rule B was added here rather than as a sibling
 script.  A sibling would have cost nine wiring edits (seven package ``orchestrator.yaml``
@@ -115,8 +116,9 @@ Rule B — ``bare-dataclass-double``
 Rule: any ``MagicMock(...)`` call, IN ANY POSITION, with no spec/spec_set and no
 positional argument, whose literal keyword names match a shape registered in
 ``_DATACLASS_SHAPES`` — unless the preceding non-blank line carries
-``# noqa: bare-dataclass-double — <reason>``, or the file is on the debt baseline
-and still within its recorded site budget.
+``# noqa: bare-dataclass-double — <reason>``.  That per-site pragma is the ONLY
+suppression: Rule B carries no per-file baseline, so a bare double is never
+grandfathered by the file it lives in.
 
 Matching is ANCHOR + OVERLAP, deliberately NOT "kwargs are a subset of the fields":
 every anchor must be present AND at least ``min_field_matches`` fields must match.
@@ -146,15 +148,17 @@ Rule C — ``wall-clock-deadline``
 ---------------------------------------------------------------------------
 
 Rule: a LOAD-BEARING synchronisation point — a ``MergeRequest.result`` future
-(``req.result``) or an ``asyncio.Event`` gate barrier (``gate*.wait()``) — awaited
-with a wall-clock deadline.  Two independent offence kinds, so ONE call can produce
+(``req.result``) or a zero-argument ``.wait()`` barrier (``done.wait()``,
+``self._entered.wait()``) — awaited with a wall-clock deadline.  Two independent offence kinds, so ONE call can produce
 TWO violations:
 
   1. the target is awaited through a bare ``asyncio.wait_for(...)`` rather than
      ``wait_responsive(...)``, so its deadline is charged in WALL CLOCK; and
-  2. the call carries a RAW numeric ``timeout=`` literal — on EITHER call shape.
-     ``wait_responsive`` takes a ``timeout`` keyword too, so a migrated site can
-     have moved the accounting while keeping a hand-written number.
+  2. the call carries a RAW numeric literal bound — a ``timeout=`` or
+     ``max_wall_s=`` keyword on EITHER call shape, or ``asyncio.wait_for``'s
+     positional timeout.  ``wait_responsive`` takes both keywords too, so a
+     migrated site can have moved the accounting while keeping a hand-written
+     number.  Several literal bounds on one call are still ONE violation.
 
 Suppressed by ``# noqa: wall-clock-deadline — <reason>`` on the preceding non-blank
 line, or by the file's ``_WALL_CLOCK_DEADLINE_DEBT`` budget.
@@ -170,33 +174,25 @@ outside it.  Task 3980's own amendment pass then deleted a hand-maintained five-
 frozenset for the same reason.  So no class list and no budget threshold decides which
 sites are scanned.
 
-The two legs are NOT equally shape-selected, and the difference is a real coverage
-boundary rather than a detail (recorded by task 4246's amendment pass, which found the
-flat claim "selection is by call shape alone" overstated):
+Both legs are pure SHAPE, on any receiver (a Name, an Attribute, a Subscript or a
+Call), in any scope of any file.  No receiver name is consulted:
 
-  * The ``req.result`` leg IS pure shape — ``ast.Attribute`` with ``attr == 'result'``,
-    any receiver, any scope, any file.
-  * The ``gate*.wait()`` leg additionally requires the receiver to be a bare ``Name``
-    whose id starts with ``gate``.  That IS name-based selection.  It stands in for
-    "this is an ``asyncio.Event`` barrier", which the AST cannot distinguish from any
-    other ``.wait()`` (``proc.wait()``, ``threading.Event.wait()``, a ``Condition``);
-    the convention is universal in the module the file-local guard was ported from.
+  * the ``req.result`` leg is an ``ast.Attribute`` with ``attr == 'result'``;
+  * the barrier leg is a ``.wait()`` method call taking NO arguments.  The
+    zero-argument requirement is the structural discriminator: an ``asyncio.Event``
+    ``.wait()`` takes none, while ``asyncio.wait(aws)`` and
+    ``threading.Event.wait(timeout)`` take arguments and so stay out.
 
-MEASURED false-negative surface of that prefix, over the seven scanned tests/ dirs:
-102 ``asyncio.wait_for(<expr>.wait(), ...)`` sites across 36 files whose receiver is
-not a gate-prefixed Name — 60 under orchestrator/tests (``done.wait()``,
-``verify_started.wait()``, ``drive.first_dispatched.wait()``), 24 under
-dashboard/tests, 18 under fused-memory/tests.  Rule C sees none of them.
+The accepted false-positive surface is an asyncio subprocess ``Process.wait()`` and a
+``Condition``/``Barrier`` ``.wait()``.  The latter two are genuine synchronisation
+points, so flagging them is correct; ``# noqa: wall-clock-deadline — <reason>`` is the
+escape for a ``Process.wait()``.
 
-Dropping the prefix was considered and DECLINED on a measurement, not a preference:
-the remedy this rule names — ``wait_responsive`` — is defined in
-``orchestrator/tests/_orch_helpers.py`` and exists nowhere else, so flagging the 42
-dashboard/fused-memory sites would emit a rejection naming a helper those packages
-cannot import, and grandfather them into a shrink-only baseline they have no way to
-shrink.  Scoping the wider leg to orchestrator/tests would reintroduce exactly the
-a-list-decides-coverage failure mode the paragraph above rejects.  So the gap is
-documented here rather than asserted away; closing it needs ``wait_responsive`` (or an
-equivalent) reachable from every scanned package first.
+Remedy reachability: ``wait_responsive`` and ``MERGE_RESULT_TIMEOUT`` are defined in
+``orchestrator/tests/_orch_helpers.py`` and importable only under orchestrator/tests,
+so every Rule C message says that elsewhere the per-site ``# noqa`` is the remedy.
+Scoping the rule to orchestrator/tests instead would reintroduce exactly the
+a-list-decides-coverage failure mode the paragraph above rejects.
 
 What is deliberately NOT load-bearing: a wait on a bare ``ast.Name`` target, i.e. the
 ``asyncio.wait_for(worker_task, ...)`` teardown join in ``_stop_worker``.  It sits
@@ -225,6 +221,8 @@ hooks/project-checks can invoke it via plain python3 without uv env-resolution o
 Adding a third-party dependency here would break that fast path.  This is why
 ``_DATACLASS_SHAPES`` hardcodes field names instead of importing the dataclasses it
 describes: ``import orchestrator.verify`` would need pydantic and break every caller.
+The hardcoded copy's drift guards live in the test, which CAN import it:
+fused-memory/tests/test_check_bare_magicmock_config.py::TestDataclassShapeRegistry.
 """
 
 from __future__ import annotations
@@ -281,12 +279,13 @@ class _DataclassShape(NamedTuple):
 # all seven package lint_commands can run it under bare ``python3`` with no venv
 # resolution.  ``import orchestrator.verify`` would need pydantic and break every caller.
 #
-# VerifyResult's field list mirrors orchestrator/src/orchestrator/verify.py::VerifyResult.
-# Drift is absorbed structurally rather than by keeping this list exhaustive:
-# matching keys on the ``passed`` anchor plus a 2-field overlap floor, so adding,
-# renaming or removing a peripheral field cannot silently disable detection.  Only
-# removing ``passed`` itself could, and that is a VerifyResult refactor that would
-# break the orchestrator far more loudly first.
+# VerifyResult's field list is a stdlib-only copy of
+# orchestrator/src/orchestrator/verify.py::VerifyResult, kept EXHAUSTIVE: a field
+# missing here does not count toward the overlap floor, so a double built from it
+# slips through.  Its drift guards are in
+# fused-memory/tests/test_check_bare_magicmock_config.py::TestDataclassShapeRegistry,
+# which compare this literal against ``dataclasses.fields(VerifyResult)`` at runtime,
+# one test per drift direction.
 _DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
     _DataclassShape(
         name='VerifyResult',
@@ -305,9 +304,11 @@ _DATACLASS_SHAPES: tuple[_DataclassShape, ...] = (
             'contention',
             'plan',
             'failing_test_ids',
+            'failing_test_ids_by_module',
             'failing_leg_categories',
             'trivial',
             'duration_secs',
+            'flake_suppression',
         }),
         anchors=frozenset({'passed'}),
         min_field_matches=2,
@@ -436,55 +437,10 @@ def _dataclass_violation_msg(shape: _DataclassShape, kwargs: set[str]) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Rule B debt baseline — SHRINK-ONLY, and CHECKED.
-#
-# path → the number of pre-existing dataclass-double sites that file carried when
-# Rule B landed (AST census over all seven scanned tests/ directories, task 4016;
-# 95 sites across 11 files).  Shipping the rule hot with no transition would have
-# turned orchestrator/tests' lint_command red on day one and stalled the merge lane
-# repo-wide, so these are grandfathered — Rule B ONLY; Rule A still applies in full
-# to every file here.
-#
-# The count is a BUDGET, not a comment.  A debt file is silent while it carries at
-# most its recorded number of sites and reports the overrun the moment it carries
-# more, so "shrink-only" is enforced on the same hot path the rule itself runs on
-# rather than trusted.  This matters most for
-# orchestrator/tests/test_merge_queue.py: 63 sites in an actively-developed hub,
-# where a wholesale grandfather would have made a brand-new bare double added
-# tomorrow invisible to the gate.
-#
-# DO NOT ADD ENTRIES, AND DO NOT RAISE A NUMBER.  Both may only shrink, as files
-# are migrated onto _fake_verify_result / MagicMock(spec=VerifyResult); that
-# migration is filed as a follow-up task.  A NEW file with a bare dataclass double
-# must fail the gate — that is the entire reason the baseline is opt-OUT rather
-# than opt-in.
-#
-# orchestrator/tests/test_merge_speculation.py is deliberately NOT here: task
-# 3980 just cleaned that module, and even a budgeted entry would let a new double
-# land there silently. Its one deliberate double carries a per-site pragma instead.
-_DATACLASS_DOUBLE_DEBT: dict[str, int] = {
-    'orchestrator/tests/test_merge_queue.py': 63,
-    'orchestrator/tests/test_concurrent_verify_boundary.py': 9,
-    'orchestrator/tests/test_merge_queue_permit_conservation.py': 7,
-    'orchestrator/tests/test_merge_queue_resolve_release.py': 7,
-    'orchestrator/tests/test_merge_queue_request_liveness.py': 3,
-    'orchestrator/tests/test_coalesce_integration_gate.py': 1,
-    'orchestrator/tests/test_merge_item_union.py': 1,
-    'orchestrator/tests/test_merge_queue_equivalence.py': 1,
-    'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 1,
-    'orchestrator/tests/test_merge_queue_metrics.py': 1,
-    'orchestrator/tests/test_merge_queue_single_writer_asserts.py': 1,
-}
-
-
 def _debt_budget(filename: str, debt: dict[str, int]) -> int | None:
     """Return *filename*'s budget in the *debt* mapping, or None if it is not listed.
 
-    Parameterised over the mapping rather than copied per rule (task 4246): the
-    trailing-component matching below is what makes repo-relative CLI paths and
-    absolute pytest paths reach the same verdict, and defining it once is what stops
-    the baselines drifting apart in their matching semantics.
+    Parameterised over *debt* so every baseline matches paths the same way (task 4246).
 
     Compares TRAILING PATH COMPONENTS, not substrings: ``a/b/c.py`` matches an
     entry ``b/c.py`` because its last two components are exactly ``b`` and ``c.py``.
@@ -506,21 +462,6 @@ def _debt_budget(filename: str, debt: dict[str, int]) -> int | None:
     return None
 
 
-def _debt_overrun_msg(budget: int, found: int) -> str:
-    """Build the message for a debt file that has grown past its recorded budget."""
-    return (
-        'this file is on the SHRINK-ONLY bare-dataclass-double debt baseline with a'
-        f' recorded budget of {budget} site(s), but {found} were found —'
-        f' {found - budget} over budget. The baseline may only shrink.'
-        ' The reported sites are simply the LAST in source order: the anchor is'
-        ' positional and is NOT a claim that these exact sites are the new ones.'
-        ' Fix by migrating a site in this file onto _fake_verify_result(...) or'
-        ' MagicMock(spec=VerifyResult) seeded from dataclasses.fields, or by adding'
-        ' # noqa: bare-dataclass-double — <reason> above a deliberate one.'
-        ' Do NOT raise the recorded budget in check_bare_magicmock_config.py.'
-    )
-
-
 def _apply_debt_budget(
     found: list[Violation],
     budget: int | None,
@@ -531,10 +472,10 @@ def _apply_debt_budget(
 
     *build_overrun_msg* is the caller's own ``(budget, found) -> str`` message
     builder, REQUIRED and keyword-only (task 4246 amendment pass).  Each rule's
-    overrun carries its OWN remedy — telling a Rule C overrun to migrate onto
-    ``_fake_verify_result`` would send the reader down a dead end — so there is
-    deliberately no default: a future Rule D that forgets the argument fails at the
-    call, rather than silently inheriting Rule B's remedy with no type error and no
+    overrun carries its OWN remedy — telling a Rule C overrun to migrate a mock
+    double would send the reader down a dead end — so there is deliberately no
+    default: a future Rule D that forgets the argument fails at the call, rather
+    than silently inheriting another rule's remedy with no type error and no
     test failure.  It is passed as a builder rather than a built string so the
     over-budget-only computation stays lazy and no caller has to invent a value for
     the *budget is None* branch, where it is never consulted.
@@ -542,8 +483,8 @@ def _apply_debt_budget(
     - Not a debt file (*budget* is None) → every violation is reported unchanged.
     - At or under budget → silence: this is the grandfathering the baseline exists for.
     - Over budget → report exactly ``found - budget`` violations, so the noise is
-      proportional to the overrun rather than dumping all 63 Rule B sites (or all
-      317 Rule C ones) of test_merge_queue.py on someone who added one.
+      proportional to the overrun rather than dumping all 317 Rule C violations of
+      test_merge_queue.py on someone who added one.
 
     The reported sites are the last in source order.  That choice is deterministic
     rather than diagnostic — the checker cannot know which site is new — and the
@@ -642,25 +583,37 @@ def _dataclass_double_violation(
 # Rule C debt baseline — SHRINK-ONLY, and CHECKED.
 #
 # path → the number of pre-existing wall-clock-deadline VIOLATIONS that file
-# carried when Rule C landed (AST census over all seven scanned tests/ directories,
-# task 4246; 618 violations across 20 files, every one under orchestrator/tests/).
+# carries, measured by AST census over all seven scanned tests/ directories.
 #
-# The number counts VIOLATIONS, not SITES — unlike _DATACLASS_DOUBLE_DEBT above.
+# Provenance.  Task 4246 shipped Rule C with 618 violations across 20 files, every
+# one under orchestrator/tests/ (333 bare-wait_for + 285 raw-literal); migrations
+# had shrunk that to 8 files by task 5269.  Task 5269 then RE-MEASURED the census
+# after WIDENING DETECTION — the barrier leg became a structural zero-argument
+# ``.wait()`` on any receiver, the raw-literal leg learned ``max_wall_s=`` and
+# wait_for's positional timeout, and directory discovery gained ``_*.py`` helper
+# modules — and recorded 650 violations across 47 files in four packages.  That is
+# the one sanctioned rise: every added violation was already in the tree, newly
+# SEEN, not new debt.  The non-orchestrator entries can shrink only by a per-site
+# ``# noqa: wall-clock-deadline`` until follow-up ticket
+# tkt_0RVCE77JGW0CZGWPSFFZ00REB5 makes ``wait_responsive`` importable outside
+# orchestrator/tests.
+#
+# The number counts VIOLATIONS, not SITES.
 # One call can produce two: `asyncio.wait_for(req.result, timeout=25.0)` is
 # simultaneously the wrong routing (bare-wait_for) and a written number
-# (raw-literal).  The day-one split was 333 bare-wait_for + 285 raw-literal.
+# (raw-literal).
 #
-# Shipping the rule hot with no transition would have turned orchestrator/tests'
-# lint_command red on day one and stalled the merge lane repo-wide — the identical
-# situation Rule B faced at 95 sites/11 files, so these are grandfathered.  Rule C
-# ONLY: Rules A and B still apply in full to every file here.
+# Shipping the rule hot with no transition would have turned the lint_command of
+# every package listed here red on day one and stalled the merge lane repo-wide —
+# the identical situation Rule B faced at 95 sites/11 files, so these are
+# grandfathered.  Rule C ONLY: Rules A and B still apply in full to every file here.
 #
 # The count is a BUDGET, not a comment.  A debt file is silent while it carries at
 # most its recorded number and reports the overrun the moment it carries more, so
 # "shrink-only" is enforced on the same hot path the rule itself runs on rather than
-# trusted.  This matters most for orchestrator/tests/test_merge_queue.py: 317
-# violations in an actively-developed hub, where a wholesale grandfather would have
-# made a brand-new wall-clock wait added tomorrow invisible to the gate.
+# trusted.  This matters most for orchestrator/tests/test_merge_queue.py, an
+# actively-developed hub, where a wholesale grandfather would have made a brand-new
+# wall-clock wait added tomorrow invisible to the gate.
 #
 # DO NOT ADD ENTRIES, AND DO NOT RAISE A NUMBER.  Both may only shrink, as files are
 # migrated onto wait_responsive(...) with bounds derived from MERGE_RESULT_TIMEOUT.
@@ -675,26 +628,61 @@ def _dataclass_double_violation(
 # be a blanket suppression letting a regression land there silently — which is what
 # 3980 spent a task removing, and what makes it safe for task 4246 to delete that
 # module's file-local copy of this guard.
+#
+# Two entries share the trailing ``tests/test_harness.py``; ``_debt_budget`` matches
+# on trailing path COMPONENTS, so the package directory keeps them distinct.
 _WALL_CLOCK_DEADLINE_DEBT: dict[str, int] = {
-    'orchestrator/tests/test_merge_queue.py': 309,
-    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 90,
+    # orchestrator/tests
+    'orchestrator/tests/test_merge_queue.py': 267,
+    'orchestrator/tests/test_merge_queue_concurrent_verify.py': 85,
     'orchestrator/tests/test_concurrent_verify_boundary.py': 44,
+    'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 30,
     'orchestrator/tests/test_merge_queue_permit_conservation.py': 27,
-    'orchestrator/tests/test_merge_queue_lifecycle_registry.py': 26,
     'orchestrator/tests/test_merge_queue_resolve_release.py': 25,
-    'orchestrator/tests/test_merge_queue_invariant_integration_gate.py': 8,
-    'orchestrator/tests/test_merge_queue_equivalence.py': 12,
-    'orchestrator/tests/test_merge_queue_restart_hook.py': 12,
-    'orchestrator/tests/test_merge_queue_request_liveness.py': 4,
-    'orchestrator/tests/test_coalesce_integration_gate.py': 4,
-    'orchestrator/tests/test_merge_queue_coalesce.py': 8,
-    'orchestrator/tests/test_merge_queue_persistent_worktree.py': 6,
-    'orchestrator/tests/test_merge_queue_single_writer_asserts.py': 4,
-    'orchestrator/tests/test_merge_guard_pipeline.py': 2,
-    'orchestrator/tests/test_merge_queue_supervisor.py': 2,
-    'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py': 2,
+    'orchestrator/tests/test_coalesce_integration_gate.py': 12,
+    'orchestrator/tests/test_merge_queue_request_liveness.py': 10,
+    'orchestrator/tests/test_offline_lane.py': 10,
+    'orchestrator/tests/test_live_merge_worker.py': 6,
+    'orchestrator/tests/test_background_service.py': 4,
+    'orchestrator/tests/test_merge_queue_deep_dispatch.py': 4,
+    'orchestrator/tests/test_merge_queue_deep_landing.py': 3,
+    'orchestrator/tests/test_merge_queue_verifier_raw_cancel.py': 3,
+    'orchestrator/tests/test_harness.py': 2,
+    'orchestrator/tests/test_invoke.py': 2,
+    'orchestrator/tests/test_merge_queue_coalesce.py': 2,
+    'orchestrator/tests/test_merge_queue_deep_integration_gate.py': 2,
+    'orchestrator/tests/test_merge_queue_invariant_integration_gate.py': 2,
+    'orchestrator/tests/test_merge_skew_tripwire.py': 2,
     'orchestrator/tests/test_merge_worktree_lifecycle_integration_gate.py': 2,
-    'orchestrator/tests/test_merge_queue_dispatch_fill_redispatch.py': 1,
+    'orchestrator/tests/test_offline_lane_infra_integration.py': 2,
+    'orchestrator/tests/test_offline_lane_integration.py': 2,
+    'orchestrator/tests/test_workflow_cancellation.py': 2,
+    'orchestrator/tests/test_verify.py': 1,
+    # dashboard/tests
+    'dashboard/tests/test_db.py': 26,
+    'dashboard/tests/test_mcp_fanout.py': 18,
+    'dashboard/tests/test_durability.py': 4,
+    'dashboard/tests/test_metrics_curator.py': 4,
+    'dashboard/tests/_dashboard_helpers.py': 3,
+    'dashboard/tests/test_api_curator.py': 2,
+    'dashboard/tests/test_merge_queue_data.py': 2,
+    # fused-memory/tests
+    'fused-memory/tests/test_drain_signal_handler.py': 4,
+    'fused-memory/tests/test_harness.py': 4,
+    'fused-memory/tests/test_memory_service.py': 4,
+    'fused-memory/tests/test_operator_signal_handler.py': 4,
+    'fused-memory/tests/test_periodic_rebuild_summaries.py': 4,
+    'fused-memory/tests/test_task_interceptor.py': 4,
+    'fused-memory/tests/server/test_grouped_read.py': 2,
+    'fused-memory/tests/test_dependency_direction_check.py': 2,
+    'fused-memory/tests/test_e2e_durable_queue.py': 2,
+    'fused-memory/tests/test_journaling_integration.py': 2,
+    'fused-memory/tests/test_recon_claim_verification_wiring.py': 2,
+    'fused-memory/tests/test_ticket_worker.py': 2,
+    # shared/tests
+    'shared/tests/test_uuid_prefix_guard.py': 2,
+    'shared/tests/test_async_sqlite_base.py': 1,
+    'shared/tests/test_cli_invoke.py': 1,
 }
 
 
@@ -715,7 +703,8 @@ def _wall_clock_overrun_msg(budget: int, found: int) -> str:
         ' with a descriptive label=, or by deriving its bound from'
         ' MERGE_RESULT_TIMEOUT instead of writing a number, or by adding'
         ' # noqa: wall-clock-deadline — <reason> above a deliberate one.'
-        ' Do NOT raise the recorded budget in check_bare_magicmock_config.py.'
+        + _WALL_CLOCK_REMEDY_REACH
+        + ' Do NOT raise the recorded budget in check_bare_magicmock_config.py.'
     )
 
 # ---------------------------------------------------------------------------
@@ -732,16 +721,12 @@ def _load_bearing_wait_target(node: ast.expr) -> str | None:
       * ``req_a.result`` — a ``MergeRequest.result`` future.  Its resolution IS
         the event the test is waiting for; a deadline here fails a test whose
         merge pipeline completed correctly.
-      * ``gate_a_entered.wait()`` — an ``asyncio.Event`` barrier.  Already
-        event-driven; only its deadline is wall-clock.  NOTE the asymmetry: this
-        leg is NOT pure shape.  The ``gate`` name prefix is a naming convention
-        standing in for "this is an Event", because the AST cannot tell an
-        ``Event.wait()`` from a ``proc.wait()``.  It therefore has a real,
-        measured false-negative surface — 102 ``asyncio.wait_for(<expr>.wait())``
-        sites across 36 files in the scanned dirs are invisible to it.  See the
-        Rule C section of the module docstring for the census and for why
-        dropping the prefix was declined (``wait_responsive``, the remedy this
-        rule names, exists only under orchestrator/tests).
+      * ``done.wait()`` — a zero-argument ``.wait()`` barrier, on ANY receiver
+        (``self._entered.wait()``, ``verifier.entered[0].wait()``).  Already
+        event-driven; only its deadline is wall-clock.  Requiring zero arguments
+        is what excludes ``asyncio.wait(aws)`` and ``threading.Event.wait(timeout)``;
+        see the Rule C section of the module docstring for the accepted
+        false-positive surface.
 
     Deliberately NOT load-bearing, and therefore excluded: the
     ``await asyncio.wait_for(worker_task, timeout=join_timeout)`` join in
@@ -751,11 +736,7 @@ def _load_bearing_wait_target(node: ast.expr) -> str | None:
     stretching it would only slow teardown down.  The Name-vs-Attribute/Call
     distinction is what makes THAT exclusion structural rather than a
     hand-maintained name list, which is what lets this rule scan every scope of
-    every file the nine call sites reach.  (It is an exclusion, not a selector:
-    the only name-based *selection* here is the ``gate`` prefix above.)
-
-    Ported unchanged in behaviour from the file-local guard this rule replaced
-    (task 3980, orchestrator/tests/test_merge_speculation.py).
+    every file the nine call sites reach.  Neither leg selects by name.
     """
     if isinstance(node, ast.Attribute) and node.attr == 'result':
         return f'{ast.unparse(node)} (MergeRequest.result future)'
@@ -763,10 +744,10 @@ def _load_bearing_wait_target(node: ast.expr) -> str | None:
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == 'wait'
-        and isinstance(node.func.value, ast.Name)
-        and node.func.value.id.startswith('gate')
+        and not node.args
+        and not node.keywords
     ):
-        return f'{ast.unparse(node)} (asyncio.Event gate barrier)'
+        return f'{ast.unparse(node)} (.wait() barrier)'
     return None
 
 # Rule C's two offence kinds.  They are INDEPENDENT — one call can trip both
@@ -780,7 +761,15 @@ _WALL_CLOCK_RAW_LITERAL = 'raw-literal'
 # all genuine deadline expiries on tests that had already passed.
 _WALL_CLOCK_CONSEQUENCE = (
     ' A deadline expiry on a load-bearing synchronisation point fails a test whose'
-    ' merge pipeline completed correctly, purely because the worker was descheduled.'
+    ' awaited event did happen, only because the loop was descheduled.'
+)
+
+# Shared by both kinds and the debt overrun: every Rule C remedy names
+# wait_responsive or MERGE_RESULT_TIMEOUT, and both live in
+# orchestrator/tests/_orch_helpers.py while the rule scans every package.
+_WALL_CLOCK_REMEDY_REACH = (
+    ' wait_responsive and MERGE_RESULT_TIMEOUT are importable only under'
+    ' orchestrator/tests, so in another package the # noqa escape is the remedy.'
 )
 
 _WALL_CLOCK_SUPPRESS = (
@@ -789,8 +778,11 @@ _WALL_CLOCK_SUPPRESS = (
 )
 
 
-def _wall_clock_violation_msg(kind: str, target: str) -> str:
+def _wall_clock_violation_msg(kind: str, target: str, *, parameter: str | None = None) -> str:
     """Build Rule C's rejection message for one offence *kind* on *target*.
+
+    *parameter* names the bound that carries the raw literal (``timeout`` or
+    ``max_wall_s``); it is consulted only for the raw-literal kind.
 
     Deliberately shares NO vocabulary with ``_VIOLATION_MSG`` or
     ``_dataclass_violation_msg``: Rule A's remedies read pydantic ``model_fields``
@@ -809,16 +801,54 @@ def _wall_clock_violation_msg(kind: str, target: str) -> str:
             + ' Route it through wait_responsive(...) with a descriptive label='
             ' (orchestrator/tests/_orch_helpers.py::wait_responsive), which charges its'
             ' budget in loop-responsive time and still reports a genuine hang red.'
+            + _WALL_CLOCK_REMEDY_REACH
             + _WALL_CLOCK_SUPPRESS
         )
     return (
-        f'load-bearing wait on {target} carries a RAW wall-clock literal timeout=.'
+        f'load-bearing wait on {target} carries a RAW wall-clock literal as its'
+        f' {parameter} bound.'
         + _WALL_CLOCK_CONSEQUENCE
         + ' Derive the bound from MERGE_RESULT_TIMEOUT instead of writing a number:'
         ' a written literal is a threshold, and task 2376 measured that a policy'
         ' expressed as "literals up to N" cannot catch the one just above N.'
+        + _WALL_CLOCK_REMEDY_REACH
         + _WALL_CLOCK_SUPPRESS
     )
+
+
+# The keywords that carry a wall-clock bound on a wait call: ``timeout`` on both call
+# shapes, and ``max_wall_s``, wait_responsive's wall-clock cap
+# (orchestrator/tests/_orch_helpers.py::wait_responsive).
+_WALL_CLOCK_BOUND_KEYWORDS: tuple[str, ...] = ('timeout', 'max_wall_s')
+
+
+def _is_numeric_literal(node: ast.expr) -> bool:
+    """Return True if *node* is a written int or float.
+
+    ``bool`` is excluded explicitly because it is an int SUBCLASS — without the
+    guard, ``timeout=True`` would be reported as a wall-clock number.
+    """
+    return (
+        isinstance(node, ast.Constant)
+        and isinstance(node.value, (int, float))
+        and not isinstance(node.value, bool)
+    )
+
+
+def _raw_wall_clock_literal(call: ast.Call, *, is_bare_wait_for: bool) -> str | None:
+    """Return the name of the first wall-clock bound on *call* written as a number.
+
+    Checks the ``_WALL_CLOCK_BOUND_KEYWORDS`` keywords on either call shape, and
+    ``asyncio.wait_for``'s positional timeout (``args[1]``) only when
+    *is_bare_wait_for*: wait_responsive's ``timeout`` is keyword-only, so a
+    positional second argument there is a TypeError, not a lintable site.
+    """
+    for kw in call.keywords:
+        if kw.arg in _WALL_CLOCK_BOUND_KEYWORDS and _is_numeric_literal(kw.value):
+            return kw.arg
+    if is_bare_wait_for and len(call.args) >= 2 and _is_numeric_literal(call.args[1]):
+        return 'timeout'
+    return None
 
 
 def _wall_clock_deadline_violations(
@@ -828,7 +858,9 @@ def _wall_clock_deadline_violations(
 
     Returns a LIST, not an Optional, because the two offence kinds are independent
     and a single call can trip both — ``asyncio.wait_for(req.result, timeout=25.0)``
-    is simultaneously the wrong routing and a written number.
+    is simultaneously the wrong routing and a written number.  The written number is
+    a raw numeric literal on ``timeout=`` or ``max_wall_s=``, or wait_for's
+    positional timeout (``_raw_wall_clock_literal``).
 
     Gating order is cheapest-first, and deliberately so:
       1. the call has at least one positional argument (no ``args[0]`` to inspect
@@ -881,33 +913,29 @@ def _wall_clock_deadline_violations(
     if _is_exempted(lines, call.lineno, _RULE_C_CODE):
         return []
 
-    kinds: list[str] = []
+    messages: list[str] = []
     if is_bare_wait_for:
-        kinds.append(_WALL_CLOCK_BARE_WAIT_FOR)
+        messages.append(_wall_clock_violation_msg(_WALL_CLOCK_BARE_WAIT_FOR, target))
 
     # A raw numeric literal is an offence on EITHER call shape: wait_responsive
-    # also takes a ``timeout`` keyword, so a migrated site can have moved the
-    # accounting into loop-responsive time while keeping a hand-written number.
-    #
-    # ``bool`` is excluded explicitly because it is an int SUBCLASS — without the
-    # guard, ``timeout=True`` would be reported as a wall-clock number.
-    timeout_kw = next((kw for kw in call.keywords if kw.arg == 'timeout'), None)
-    if (
-        timeout_kw is not None
-        and isinstance(timeout_kw.value, ast.Constant)
-        and isinstance(timeout_kw.value.value, (int, float))
-        and not isinstance(timeout_kw.value.value, bool)
-    ):
-        kinds.append(_WALL_CLOCK_RAW_LITERAL)
+    # also takes ``timeout`` and ``max_wall_s`` keywords, so a migrated site can
+    # have moved the accounting into loop-responsive time while keeping a
+    # hand-written number.  At most ONE raw-literal violation per call, however
+    # many bounds carry a number: it is one offence with one remedy.
+    parameter = _raw_wall_clock_literal(call, is_bare_wait_for=is_bare_wait_for)
+    if parameter is not None:
+        messages.append(
+            _wall_clock_violation_msg(_WALL_CLOCK_RAW_LITERAL, target, parameter=parameter)
+        )
 
     return [
         Violation(
             filename=filename,
             lineno=call.lineno,
             col_offset=call.col_offset,
-            message=_wall_clock_violation_msg(kind, target),
+            message=message,
         )
-        for kind in kinds
+        for message in messages
     ]
 
 def _is_exempted(lines: list[str], lineno: int, code: str) -> bool:
@@ -955,14 +983,14 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     position whose literal kwargs match a registered ``_DATACLASS_SHAPES`` entry.
 
     Rule C — ``wall-clock-deadline``: each load-bearing wait (a
-    ``MergeRequest.result`` future or a ``gate*.wait()`` barrier) routed through a
-    bare ``asyncio.wait_for``, and/or carrying a raw numeric ``timeout=`` literal.
-    One call can produce TWO violations — the kinds are independent.
+    ``MergeRequest.result`` future or a zero-argument ``.wait()`` barrier) routed through a
+    bare ``asyncio.wait_for``, and/or carrying a raw numeric literal bound
+    (``timeout=``, ``max_wall_s=`` or wait_for's positional timeout).  One call can
+    produce TWO violations — the kinds are independent.
 
-    Rules B and C additionally honour their own SHRINK-ONLY per-file debt budgets
-    (``_DATACLASS_DOUBLE_DEBT`` / ``_WALL_CLOCK_DEADLINE_DEBT``), applied to the
-    collected COUNT after the walk.  Rule A has no baseline and applies in full to
-    every file.
+    Rule C additionally honours its own SHRINK-ONLY per-file debt budget
+    (``_WALL_CLOCK_DEADLINE_DEBT``), applied to the collected COUNT after the walk.
+    Rules A and B have no baseline and apply in full to every file.
 
     SyntaxError in *source* → returns an empty list.
 
@@ -977,14 +1005,8 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     lines = source.splitlines()
     violations: list[Violation] = []
 
-    # Rule B violations are collected separately so a debt file's budget can be
-    # applied to the COUNT after the walk (see _apply_debt_budget).  Looked up once
-    # per file, not per node.
-    dataclass_doubles: list[Violation] = []
-    debt_budget = _debt_budget(filename, _DATACLASS_DOUBLE_DEBT)
-
-    # Rule C violations are collected separately for the same reason, and against
-    # their own independent baseline (task 4246).  Both budgets are looked up ONCE
+    # Rule C violations are collected separately so its debt file's budget can be
+    # applied to the COUNT after the walk (see _apply_debt_budget).  Looked up ONCE
     # per file, not per node.
     wall_clock: list[Violation] = []
     wall_clock_budget = _debt_budget(filename, _WALL_CLOCK_DEADLINE_DEBT)
@@ -1003,7 +1025,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
         if isinstance(node, ast.Call):
             double = _dataclass_double_violation(node, lines, filename)
             if double is not None:
-                dataclass_doubles.append(double)
+                violations.append(double)
             # Rule C shares this branch rather than adding its own `continue`:
             # a second early exit here would shadow Rule B for any node Rule C
             # matched first.  Both run, then the single existing continue fires.
@@ -1063,16 +1085,9 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                 )
             )
 
-    # Each rule's per-file debt budget is applied to its own collected COUNT, not to
+    # Rule C's per-file debt budget is applied to its collected COUNT, not to
     # individual sites: a grandfathered file stays silent while it does not grow, and
-    # reports exactly its overrun once it does.  The overrun MESSAGE is built by the
-    # caller because each rule's remedy differs — Rule B's is _fake_verify_result,
-    # Rule C's is wait_responsive / MERGE_RESULT_TIMEOUT.
-    violations.extend(
-        _apply_debt_budget(
-            dataclass_doubles, debt_budget, build_overrun_msg=_debt_overrun_msg
-        )
-    )
+    # reports exactly its overrun once it does.
     violations.extend(
         _apply_debt_budget(
             wall_clock, wall_clock_budget, build_overrun_msg=_wall_clock_overrun_msg
@@ -1082,13 +1097,34 @@ def find_violations(source: str, filename: str) -> list[Violation]:
     return sorted(violations, key=lambda v: (v.lineno, v.col_offset))
 
 
+# The files a DIRECTORY argument expands to, recursively: test modules, conftest
+# files and ``_*.py`` test-helper modules (task 5269).  Helpers hold mock factories
+# and waits as surely as test modules do.  ``__init__.py`` matches ``_*.py`` and is
+# deliberately included as harmless.  Explicit file arguments bypass this.
+_DISCOVERY_GLOBS: tuple[str, ...] = ('test_*.py', 'conftest.py', '_*.py')
+
+
+def discover_scan_targets(directory: Path) -> list[Path]:
+    """Return every file under *directory* the checker scans, sorted.
+
+    The one home of directory discovery: ``main`` and the baseline-integrity census
+    in fused-memory/tests/test_check_bare_magicmock_config.py both call it, so the
+    gate and its census cannot scan different file sets.
+    """
+    found: set[Path] = set()
+    for pattern in _DISCOVERY_GLOBS:
+        found.update(directory.rglob(pattern))
+    return sorted(found)
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.  Accepts file paths and/or directories.
 
     Runs all three rules — ``bare-magicmock``, ``bare-dataclass-double`` and
     ``wall-clock-deadline`` — in a single AST pass per file.
 
-    For directories, recursively scans for test_*.py and conftest.py files only.
+    For directories, recursively scans test_*.py, conftest.py and _*.py helper
+    modules only (``discover_scan_targets``).
     Prints violations to stdout in 'path:lineno:col: message' format (ruff-style).
 
     Explicit file paths are validated up front; a missing explicit path fails
@@ -1117,7 +1153,7 @@ def main(argv: list[str] | None = None) -> int:
     for path_str in args.paths:
         p = Path(path_str)
         if p.is_dir():
-            files_to_scan.extend(sorted(set(p.rglob('test_*.py')) | set(p.rglob('conftest.py'))))
+            files_to_scan.extend(discover_scan_targets(p))
         else:
             if not p.exists():
                 print(f'error: {p}: No such file or directory', file=sys.stderr)

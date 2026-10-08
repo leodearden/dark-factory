@@ -71,12 +71,14 @@ if str(REPO_ROOT) not in sys.path:
 from _fm_helpers import (  # noqa: E402
     _leaked_async_httpx_clients,
     _warn_if_drain_closed_a_foreign_client,
+    install_identity_mocks,
     pydantic_spec,
     reap_leaked_async_httpx_clients,
     reap_leaked_ticket_workers,
     resolve_xdist_worker_id,
     track_async_httpx_clients,
 )
+from _graphiti_fake import FakeGraphitiClient  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
     _df_deploy_clocks_unwritten,  # noqa: F401  — the binding IS the wiring
     _df_git_ceiling_at_basetemp,  # noqa: F401  — the binding IS the wiring
@@ -95,6 +97,7 @@ from fused_memory.config.schema import (  # noqa: E402
     QueueConfig,
     RoutingConfig,
 )
+from fused_memory.models.scope import KNOWN_PROJECT_ROOTS_ENV  # noqa: E402
 
 
 def pytest_configure(config):
@@ -148,13 +151,16 @@ FM_CONFIG_PATH = Path(_tests_dir).parent / 'config' / 'config.yaml'
 #: survive in one subproject after being fixed in the other.
 _FM_CONFIG_FIELDS = frozenset(FusedMemoryConfig.model_fields)
 
-#: The variables the TRACKED config interpolates into its PATH-VALUED leaves:
-#: ``${PROJECT_ROOT:.}`` (``taskmaster.project_root``,
-#: ``reconciliation.explore_codebase_root``), ``${QUEUE_DATA_DIR:./data/queue}``
-#: and ``${RECONCILIATION_DATA_DIR:./data/reconciliation}``.  A THIRD env
-#: surface, reached through the YAML's own interpolation rather than through
-#: pydantic's env layer, so the derived names above cannot see it: measured
-#: with ``CONFIG_PATH`` already pinned at the canonical file,
+#: The variables the TRACKED config interpolates into its PATH-VALUED leaves,
+#: each mapped to its layout under a test's ``tmp_path``.  The layout's home is
+#: the ``${VAR:default}`` in ``fused-memory/config/config.yaml``; it is mirrored
+#: here so config-driven stores stay out of the tmp root a test uses for its
+#: own files, and
+#: ``test_config_hermeticity.py::test_the_pin_lays_out_tmp_path_as_the_tracked_config_does``
+#: fails if the mirror drifts from that home.  A
+#: THIRD env surface, reached through the YAML's own interpolation rather than
+#: through pydantic's env layer, so the derived names above cannot see it:
+#: measured with ``CONFIG_PATH`` already pinned at the canonical file,
 #: ``PROJECT_ROOT=/pwned-by-env`` still rewrote both of its leaves, and this
 #: repo's operator scripts do export ``PROJECT_ROOT``
 #: (``scripts/memory-metadata-coverage-census.sh`` and two siblings).
@@ -162,7 +168,11 @@ _FM_CONFIG_FIELDS = frozenset(FusedMemoryConfig.model_fields)
 #: interpolation surface from the file would sweep in ``${OPENAI_API_KEY}`` and
 #: ``${FALKORDB_URI:...}``, which the config reads from the environment BY
 #: DESIGN.  Only path-valued names belong here.
-_FM_CONFIG_PATH_INTERPOLATIONS = ('PROJECT_ROOT', 'QUEUE_DATA_DIR', 'RECONCILIATION_DATA_DIR')
+_FM_CONFIG_PATH_INTERPOLATIONS = {
+    'PROJECT_ROOT': Path('.'),
+    'QUEUE_DATA_DIR': Path('data', 'queue'),
+    'RECONCILIATION_DATA_DIR': Path('data', 'reconciliation'),
+}
 
 
 def _reads_as_a_config_override(env_name):
@@ -188,9 +198,10 @@ def _reads_as_a_config_override(env_name):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_fm_config(monkeypatch):
+def _isolate_fm_config(monkeypatch, tmp_path):
     """Pin ``CONFIG_PATH`` at the canonical config so config resolution does
-    not depend on the process CWD (task 5444).
+    not depend on the process CWD (task 5444), and its path leaves at this
+    test's ``tmp_path`` (task 5481).
 
     ``FusedMemoryConfig`` is a pydantic-settings ``BaseSettings``, not a plain
     ``BaseModel``: ``fused_memory.config.schema::FusedMemoryConfig.settings_customise_sources``
@@ -222,22 +233,15 @@ def _isolate_fm_config(monkeypatch):
     ``orchestrator/``").  That hardening was applied subproject-locally and
     never propagated; this is the propagation.
 
-    THE HALF DELIBERATELY NOT PROPAGATED.  ``_isolate_orch_config`` also pins
-    ``ORCH_PROJECT_ROOT`` at ``tmp_path`` — "the other load-bearing part" in
-    its own words — which rewrites the config's path leaves.  The tracked
-    fused-memory config's path leaves are RELATIVE: measured under this pin
-    they are ``taskmaster.project_root='.'``,
-    ``reconciliation.explore_codebase_root='.'``,
-    ``queue.data_dir='./data/queue'`` and
-    ``reconciliation.data_dir='./data/reconciliation'``.  So what this fixture
-    buys is that config RESOLUTION is CWD-independent — same layers, same
-    strings, from any CWD — while those four STRINGS still denote the
-    directory pytest was launched from.  Pointing them at tmp would change the
-    value ~19.8k currently-green tests read, which is the behaviour change this
-    task's zero-collateral design decision rules out; it is recorded in the RCA
-    and filed as a follow-up rather than done here.  What IS closed is the
-    ambient half of it: the variables that redirect those leaves are scrubbed
-    below, so the leaves denote the launching CWD and nothing else.
+    THE PATH-LEAF HALF.  The tracked file's path leaves interpolate the
+    variables in ``_FM_CONFIG_PATH_INTERPOLATIONS``; this fixture points them
+    at this test's ``tmp_path``, so a write through a bare config lands in tmp
+    — the mirror of ``ORCH_PROJECT_ROOT`` in
+    ``orchestrator/tests/conftest.py::_isolate_orch_config``.  It pins the
+    YAML's own variables, not pydantic's nested ``TASKMASTER__PROJECT_ROOT``
+    names: the env layer outranks the YAML, so those would override a test's
+    OWN config file.  A test-body ``setenv`` of one of the three still wins.
+    The measurement is in ``plans/fused-memory-config-cwd-leak-rca-2026-09-13.md``;
     ``test_config_hermeticity.py`` states both halves executably.
 
     ``monkeypatch.setenv`` restores the pre-existing value at teardown, so this
@@ -260,18 +264,36 @@ def _isolate_fm_config(monkeypatch):
     ``orchestrator/src/orchestrator/verify.py``'s reason for scrubbing the
     whole ``ORCH_`` prefix: so a variable added later cannot reintroduce the
     class.  The comprehension snapshots the names before the loop deletes any,
-    since mutating ``os.environ`` while iterating it raises.
-    ``_FM_CONFIG_PATH_INTERPOLATIONS`` is the same treatment for the YAML's own
-    interpolation surface, which pydantic never sees and the derived names
-    therefore miss.
+    since mutating ``os.environ`` while iterating it raises.  The YAML's own
+    interpolation surface, which pydantic never sees, is covered by the
+    path-leaf pin above: ``setenv`` overwrites an inherited value.
     """
     for inherited in [name for name in os.environ if _reads_as_a_config_override(name)]:
         monkeypatch.delenv(inherited, raising=False)
 
-    for interpolated in _FM_CONFIG_PATH_INTERPOLATIONS:
-        monkeypatch.delenv(interpolated, raising=False)
+    for name, layout in _FM_CONFIG_PATH_INTERPOLATIONS.items():
+        monkeypatch.setenv(name, str(tmp_path / layout))
 
     monkeypatch.setenv('CONFIG_PATH', str(FM_CONFIG_PATH))
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_project_registry(monkeypatch):
+    """Drop an INHERITED ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (task 3708).
+
+    A ``GraphitiBackend`` built without ``registered_graph_ids`` (through
+    ``MemoryService`` or a direct construction, rather than ``make_backend``)
+    derives its index-provisioning registry from this variable plus
+    ``taskmaster.project_root``.  The live service exports it, so an operator
+    shell would otherwise register real project ids, and writes to them would
+    attempt provisioning against mock drivers.  A test that sets it itself still
+    wins, because its ``monkeypatch.setenv`` runs after this fixture.
+
+    The project_root half is ``_isolate_fm_config``'s pin, this test's
+    ``tmp_path``, so the derived registry registers that tmp dir's basename,
+    never the launching checkout.
+    """
+    monkeypatch.delenv(KNOWN_PROJECT_ROOTS_ENV, raising=False)
 
 
 @pytest.fixture
@@ -495,11 +517,47 @@ def standard_mock_config() -> MagicMock:
 
 @pytest.fixture
 def make_backend():
-    """Factory fixture: returns a callable(config) -> GraphitiBackend with mock client."""
-    def _factory(config) -> GraphitiBackend:
-        backend = GraphitiBackend(config)
+    """Factory fixture: returns a callable(config) -> GraphitiBackend with mock client.
+
+    ``registered_graph_ids`` defaults to EMPTY, not to the derived registry, so
+    no ambient DASHBOARD_KNOWN_PROJECT_ROOTS or CWD-derived project id can turn
+    on index provisioning against a MagicMock driver (task 3708).
+
+    For a client that enforces graphiti_core's uuid= contract, use
+    make_backend_over_fake_graphiti.
+    """
+    def _factory(config, *, registered_graph_ids=()) -> GraphitiBackend:
+        backend = GraphitiBackend(config, registered_graph_ids=registered_graph_ids)
         backend.client = MagicMock()
         backend._driver = MagicMock()
+        return backend
+
+    return _factory
+
+
+@pytest.fixture
+def make_backend_over_fake_graphiti():
+    """Factory fixture: returns a callable(config, fake, *, registered_graph_ids=()) -> GraphitiBackend over *fake*.
+
+    The contract-faithful sibling of make_backend: use it when a test depends
+    on graphiti_core's argument semantics (FakeGraphitiClient models the
+    ``uuid=`` load-or-raise contract); use make_backend when a permissive
+    MagicMock client suffices.  Same empty registry default as make_backend.
+
+    The real backend stays in the path; only the graphiti_core client is
+    replaced.  ``_driver_for`` returns None because there is no FalkorDB
+    driver and the fake ignores ``client.search(driver=...)``.
+    ``install_identity_mocks`` keeps the post-write reconcile off the
+    nonexistent driver.
+    """
+    def _factory(
+        config, fake: FakeGraphitiClient, *, registered_graph_ids=(),
+    ) -> GraphitiBackend:
+        backend = GraphitiBackend(config, registered_graph_ids=registered_graph_ids)
+        backend.client = fake  # type: ignore[assignment]
+        backend._client_for = MagicMock(return_value=fake)  # type: ignore[method-assign]
+        backend._driver_for = MagicMock(return_value=None)  # type: ignore[method-assign]
+        install_identity_mocks(backend)  # type: ignore[arg-type]
         return backend
 
     return _factory
@@ -545,12 +603,14 @@ def make_graph_mock():
     person to paginate something rediscovers the same trap.
 
     This fixture deliberately does NOT simulate the server's
-    ``RESULTSET_SIZE`` truncation.  ONE double owns that behaviour —
-    ``test_graph_read_pagination.FakeCappedGraph``, which also carries the
-    stateful query log the truncation tests need — because two doubles that
-    both claim to stand in for the same server drift, and the drift shows up
-    as a test that passes against a fake nothing else agrees with.  A test
-    that needs the cap should use that one.
+    ``RESULTSET_SIZE`` truncation.  ONE ro_query-level double owns that
+    behaviour — ``test_graph_read_pagination.FakeCappedGraph``, which also
+    carries the stateful query log the truncation tests need — because two
+    doubles that both claim to stand in for the same server drift, and the
+    drift shows up as a test that passes against a fake nothing else agrees
+    with.  A test that needs the cap should use that one (or, for episode
+    reads through graphiti-core, its API-level counterpart
+    ``FakeCappedEpisodeStore`` in the same module).
     """
     skip_limit_re = re.compile(r'SKIP\s+(\d+)\s+LIMIT\s+(\d+)', re.IGNORECASE)
     # Deliberately NARROW: only a query whose entire projection is a bare row

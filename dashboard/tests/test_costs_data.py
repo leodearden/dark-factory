@@ -785,7 +785,8 @@ class TestCostByAccount:
 
         The dashboard surfaces only what the gate persisted; reason-text
         regex parsing was removed in favour of a single source of truth in
-        ``shared.usage_gate._parse_resets_at`` (called at the write site).
+        ``shared.invocation_outcome._parse_resets_at`` (called at the write
+        site).
         Older rows pre-dating the persistence convention render as a blank
         cell — accepted in exchange for not duplicating parser logic.
         """
@@ -1562,7 +1563,7 @@ class TestSchema:
         )
         sys.path.insert(0, shared_src)
         try:
-            from shared.cost_store import (  # pyright: ignore[reportMissingImports]
+            from shared.cost_store import (
                 _SCHEMA as PROD_SCHEMA,  # noqa: PLC0415
             )
         finally:

@@ -39,9 +39,10 @@ import asyncio
 import logging
 import os
 import time
-from collections.abc import Awaitable, Callable, Sequence
+import weakref
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 import httpx
 
@@ -55,17 +56,11 @@ from typing_extensions import TypeVar as TypeVarD
 logger = logging.getLogger(__name__)
 
 V = TypeVar('V')
-# TTLCache's KEY type. Defaulted to `str` and declared TRAILING so every
-# existing single-argument `TTLCache[V]` keeps checking unedited — a
-# defaulted TypeVar may not precede a non-defaulted one, so V stays first.
-#
-# THE TRADE, since the result reads backwards against every stdlib mapping
-# generic (`TTLCache[dict, _TasksRead]` looks like `Mapping[value, key]`):
-# declaring K FIRST with no default would read conventionally, at the cost of
-# editing all six single-argument `TTLCache[V]` annotations in src plus 32 in
-# test_mcp_fanout.py — churn across five modules, none of which cares what the
-# key type is. The default was chosen instead, and the inversion it forces is
-# deliberate rather than a typo.
+# TTLCache's KEY type. Defaulted to `str` and declared TRAILING so a
+# single-argument `TTLCache[V]` annotation checks without naming a key type —
+# a defaulted TypeVar may not precede a non-defaulted one, so V stays first.
+# The value-first order (`TTLCache[dict, _AnalyticsKey]`) therefore reads
+# backwards against `Mapping[key, value]`, deliberately rather than by typo.
 K = TypeVarD('K', default=str)
 
 
@@ -105,27 +100,26 @@ _failure_streaks: dict[tuple[str, str], int] = {}
 # roughly 3 * DEFAULT_PER_CALL_TIMEOUT (~6s) per URL — while converting an
 # UNBOUNDED wedge (19.8h measured) into a bounded one.
 #
-# This bound is UNREACHABLE from active_tasks.collect_tasks_with_counts's
-# per-project path (the Tasks tab): _shape_one_project — which calls
-# fetch_tasks/fetch_statuses, i.e. THIS bound's own _fetch_tasks_cache /
-# _fetch_statuses_cache — runs under
-# ``asyncio.wait_for(..., timeout=min(remaining, _TASKS_PER_PROJECT_BUDGET))``
-# with active_tasks._TASKS_PER_PROJECT_BUDGET == 7.0, itself inside
-# active_tasks._TASKS_TOTAL_BUDGET == 20.0. A caller on THAT path is
-# cancelled at <= 7s, well before this 15s bound could ever fire, so a wedge
-# there still surfaces exactly as it did before this module's fix: as a
-# per-project "degraded" WARNING (rows/done-count UNKNOWN), never as a
-# bypass. That is acceptable — collect_tasks_with_counts already has its own
-# adequate degradation story for exactly this case, and this fix does not
-# need to duplicate it; the fix is chosen for the callers below instead.
+# The task-snapshot path has exactly ONE per-key lock: the unit's own
+# task_snapshot._snapshot_cache. Nothing beneath the unit has a
+# get_or_refresh at all — tasks.fetch_statuses and tasks.fetch_tasks are live
+# reads — so a wedged read can only ever be parked inside that
+# one refresh.
 #
-# The bound IS reachable from every OTHER live call site, because none of
-# them has an enclosing deadline: app._task_cards_cache (which also reaches
-# _fetch_tasks_cache, but via fetch_tasks called from _load_task_cards — a
-# path with no _TASKS_PER_PROJECT_BUDGET-style wrapper, so the SAME cache
-# can be bound-reachable or not depending on which caller reached it),
-# app._analytics_cache, app._memory_evals_cache, scheduler._scheduler_cache,
-# and merge_queue._task_titles_cache.
+# Whether this bound is reachable on that lock depends on the caller's
+# enclosing deadline. The Tasks tab and the census projection
+# (active_tasks.collect_tasks_with_counts, collect_census_snapshots) admit
+# each root under active_tasks._TASKS_PER_PROJECT_BUDGET (14.0 s), shorter
+# than this bound, so their callers are cancelled before it can fire and a
+# wedge surfaces as the snapshot unit's stale/unknown state — its documented
+# degradation story — never as a bypass. task_lookup._lookup_cache is
+# likewise unreachable, under task_lookup.LOOKUP_BUDGET_SECONDS (7.0 s).
+#
+# The bound IS reachable wherever the enclosing deadline is longer or absent:
+# the burndown loop's acquire_snapshot (under
+# burndown._SNAPSHOT_PER_ROOT_BUDGET, 60.0 s), app._memory_evals_cache,
+# scheduler._scheduler_cache, escalation_corpus._corpus_cache and
+# api.escalations._analytics_memo.
 _LOCK_ACQUIRE_TIMEOUT_SECONDS = 15.0
 
 # A bypass must leave its own journal trace — reusing the SAME
@@ -154,7 +148,7 @@ _LOCK_BYPASS_REWARN_EVERY = 100
 # point UNRELATED endpoint families start raising httpx.PoolTimeout — turning
 # the incident's per-key outage (3 of 14 endpoints dead, the other 11 healthy
 # for the full 19.8h) into a whole-dashboard one. The amplification is worse
-# for the two to_thread-backed caches (app._analytics_cache,
+# for the two to_thread-backed caches (api.escalations._analytics_memo,
 # app._memory_evals_cache): abandoned to_thread work cannot be cancelled at
 # all, so each re-arm permanently consumes a default-executor worker.
 #
@@ -170,6 +164,22 @@ _LOCK_BYPASS_REWARN_EVERY = 100
 # fraction of a 100-connection pool". With ~8 live TTLCache instances the
 # worst case is a low tens of connections even if every key wedged at once.
 _MAX_LIVE_BYPASSES_PER_KEY = 3
+
+# How long the shutdown reap waits for a cancelled bypass to actually unwind.
+#
+# Cancellation is a REQUEST: how long the coroutine takes to honour it is the
+# coroutine's business. A refresh whose cleanup awaits — a `finally` that
+# flushes, a shielded section, an anyio cancel scope exiting in the wrong task
+# — can take arbitrarily long, or never finish at all. Unbounded, that hangs
+# `dashboard.app.lifespan`'s teardown, and a process sitting in shutdown with
+# no diagnostic is strictly worse than what this reap replaced: the old
+# abandon-don't-cancel policy could leak a task but never DELAYED anything.
+#
+# So the wait degrades to the old leak plus a journal line naming the keys.
+# 5s is generous against what the reap actually waits for — a cancelled httpx
+# request unwinds in milliseconds — while staying far below any sensible
+# process-shutdown patience (systemd's stock TimeoutStopSec is 90s).
+_REAP_UNWIND_TIMEOUT_SECONDS = 5.0
 
 # ── the one fan-out failure tuple ───────────────────────────────────
 #
@@ -346,13 +356,13 @@ def project_label(project_root: str | os.PathLike[str]) -> str:
     definition of that rule for the fan-out cluster — :func:`fanout_label`
     composes it rather than re-deriving it.
 
-    ``active_tasks._project_label`` and ``redux_api._project_label`` are
-    independent hand-rolled copies of the same rule. They are not imported here
+    ``redux_api``, ``metrics`` and ``api/merge_queue.py`` call this directly
+    (task 5595). ``active_tasks._project_label`` is still an independent
+    hand-rolled copy of the same rule. It is not imported here
     (``active_tasks`` imports from ``tasks``, which imports this module), which
-    also means the delegation can only run the other way: those two can
-    eventually call *this*, collapsing three copies onto one. That cross-module
-    edit is out of task 4133's module lock and is filed as follow-up work; until
-    it lands, the three definitions must be kept string-identical by hand.
+    also means the delegation can only run the other way: it can eventually
+    call *this*, collapsing the last copy. Until it does, the two definitions
+    must be kept string-identical by hand.
     """
     root_str = str(project_root)
     return Path(root_str).name or root_str
@@ -379,10 +389,10 @@ def fanout_label(base: str, project_root: str | os.PathLike[str]) -> str:
     A collapsed key also erases the diagnosis: the message names only the
     shared URL, so the operator cannot tell *which* project_root is down.
 
-    The discriminator is :func:`project_label` — the basename, deliberately
-    string-identical to ``active_tasks._project_label`` /
-    ``redux_api._project_label`` so operator log labels match the project chips
-    the UI already renders. ``mcp_fanout``, the leaf of this cluster, is the
+    The discriminator is :func:`project_label` — the basename, the same rule
+    ``redux_api`` labels its payloads with and deliberately string-identical
+    to ``active_tasks._project_label``, so operator log labels match the
+    project chips the UI already renders. ``mcp_fanout``, the leaf of this cluster, is the
     helper's home (see :func:`project_label`) and this docstring is the single
     place the convention is written down.
 
@@ -638,6 +648,86 @@ async def first_success(
     return offline_result(errors)
 
 
+async def cancel_and_await(tasks: Mapping[asyncio.Task[Any], str], what: str) -> int:
+    """Cancel *tasks* and wait for them to end, within ``_REAP_UNWIND_TIMEOUT_SECONDS``.
+
+    The shutdown reap's one mechanism, keyed by each task's label for the
+    WARNING. Every outcome is consumed, since nobody awaits a reaped task. A task
+    still unwinding at the bound is abandoned, named in one WARNING, and not
+    counted: returns how many actually ended.
+    """
+    for task in tasks:
+        task.cancel()
+    if not tasks:  # asyncio.wait rejects an empty set
+        return 0
+    ended, abandoned = await asyncio.wait(tasks, timeout=_REAP_UNWIND_TIMEOUT_SECONDS)
+    for task in ended:
+        if not task.cancelled():
+            task.exception()
+    if abandoned:
+        logger.warning(
+            '%d %s did not unwind within %.1fs and are abandoned (%s); '
+            'shutdown continues without them',
+            len(abandoned),
+            what,
+            _REAP_UNWIND_TIMEOUT_SECONDS,
+            ', '.join(sorted({tasks[task] for task in abandoned})),
+        )
+    return len(ended)
+
+
+# Every live TTLCache, enrolled from __init__ so reap_detached_refreshes()
+# below can reach all of them without anyone enumerating the 8 module-level
+# instances spread over 4 modules (app.py, data/tasks.py, data/task_lookup.py,
+# data/scheduler.py). Enrolment is what makes shutdown coverage exhaustive by
+# construction: a ninth cache is reaped with no edit at its call site.
+#
+# WEAK, so the registry cannot become a leak of its own — a cache constructed
+# inside a test drops out when the test does. Module-level for the same reason
+# _failure_streaks above is: the state is genuinely per-process, and the
+# alternative (an explicit list in app.py's lifespan) trades one global for an
+# import edge onto every module that happens to own a cache.
+_live_caches: weakref.WeakSet[TTLCache[Any, Any]] = weakref.WeakSet()
+
+
+async def reap_detached_refreshes() -> int:
+    """Cancel every in-flight bypass refresh across all live caches; return the count.
+
+    The process-shutdown hook for :meth:`TTLCache.cancel_live_bypasses` —
+    called from the dashboard app's ``lifespan`` teardown. See that method
+    for why cancelling is correct here and nowhere else.
+
+    One WARNING when anything was actually reaped: a detached refresh
+    outliving its app lifespan is an anomaly worth a journal line, and at one
+    line per shutdown it needs no streak throttle (contrast
+    :meth:`TTLCache._note_lock_bypass`, which sits on a hot path).
+
+    The registry is snapshotted before the first ``await`` rather than
+    iterated lazily: it is a ``WeakSet``, so a collection during one of those
+    awaits would otherwise mutate the set mid-iteration.
+
+    **Every registered cache gets its chance to be reaped**, whatever any
+    other cache does — the registry admits any ``TTLCache`` subclass, and this
+    runs inside ``dashboard.app.lifespan``'s teardown, where a cache skipped
+    here leaks its tasks into the next app on a loop that will by then be
+    closed (the task-3466 class). ``Exception``, never ``BaseException``: a
+    ``CancelledError`` here is the SHUTDOWN itself being cancelled, and
+    swallowing that would make this unkillable inside a teardown that is
+    already being torn down.
+    """
+    total = 0
+    for cache in list(_live_caches):
+        try:
+            total += await cache.cancel_live_bypasses()
+        except Exception:
+            logger.exception('failed to reap detached refreshes for one cache')
+    if total:
+        logger.warning(
+            'reaped %d detached cache refresh(es) still in flight at shutdown', total
+        )
+    return total
+
+
 class TTLCache(Generic[V, K]):
     """Single-flight, short-TTL cache keyed by an arbitrary HASHABLE.
 
@@ -651,8 +741,9 @@ class TTLCache(Generic[V, K]):
     ``ttl_seconds`` accepts a plain float OR a zero-arg callable, resolved
     at *each* freshness check rather than captured once at construction —
     this is what lets a caller monkeypatch a module-level TTL constant at
-    runtime (as ``test_tasks.py`` does for ``_FETCH_TASKS_TTL_SECONDS``) and
-    have it take effect immediately.
+    runtime (as ``tests/test_task_snapshot.py`` does for
+    ``task_snapshot.SNAPSHOT_TTL_SECONDS``) and have it take effect
+    immediately.
 
     ``cache_ok`` (per-call, default always-true) gates whether a given
     refresh result is stored — e.g. an offline/error marker should not pin
@@ -758,6 +849,20 @@ class TTLCache(Generic[V, K]):
     add eviction from outside (``_store`` is private), so the fix belongs
     here. Steady-state size is now "keys requested within the eviction
     horizon", regardless of how many distinct keys the caller has ever used.
+
+    **Shutdown is the ONE exception to abandon-don't-cancel.** Everywhere else
+    — :meth:`_evict_expired`'s ``dead_bypasses`` sweep, :meth:`clear`,
+    :meth:`_bypass_refresh`'s supersession — an abandoned bypass is
+    deliberately left running: it may still store a late value and heal the
+    key for whoever asks next, which is what lets a wedged key recover on its
+    own. That reasoning holds for exactly as long as a "next caller" can
+    exist. At process shutdown none can, while the task still pins a
+    connection on the shared httpx client — and, since these caches are
+    module-level and event loops are not, it can outlive the loop that
+    started it. :meth:`cancel_live_bypasses` (and its module-level fan-out
+    :func:`reap_detached_refreshes`) is therefore the single place a bypass is
+    ever cancelled, and is called only from the app's ``lifespan`` teardown.
+    Runtime behaviour is untouched.
     """
 
     # Multiple of the TTL after which an untouched entry is evicted. Entries
@@ -772,10 +877,10 @@ class TTLCache(Generic[V, K]):
         self._store: dict[K, tuple[float, V]] = {}
         self._locks: dict[K, asyncio.Lock] = {}
         # Per-INSTANCE (not module-level) consecutive-bypass streaks, keyed
-        # by cache key. Per-instance because the key space is per-cache:
-        # tasks._fetch_tasks_cache and tasks._fetch_tasks_negative_cache
-        # share keys exactly, and three more live instances key on a
-        # bare project_root — a module-level dict would collapse them.
+        # by cache key. Per-instance because a key means something only
+        # inside the cache that minted it: several live instances key on a
+        # bare string, so a module-level dict would let two caches' streaks
+        # collide.
         self._bypass_streaks: dict[K, int] = {}
         # The in-flight bypass task for a key, if any, stamped with the
         # monotonic time it started. Bounds concurrent bypass refreshes to
@@ -801,6 +906,7 @@ class TTLCache(Generic[V, K]):
         # task's own done-callback, and swept defensively by
         # _live_bypasses_for / _evict_expired.
         self._live_bypasses: dict[K, list[asyncio.Task[V]]] = {}
+        _live_caches.add(self)
 
     def get_fresh(self, key: K) -> V | None:
         """Return the cached value for *key* iff still within TTL, else None."""
@@ -1357,6 +1463,103 @@ class TTLCache(Generic[V, K]):
                 return await self._refresh_and_store(key, refresh, cache_ok)
             finally:
                 lock.release()
+
+    async def cancel_live_bypasses(self) -> int:
+        """Cancel and await every bypass refresh still in flight; return the count.
+
+        The shutdown-only exception to abandon-don't-cancel (see the class
+        docstring). Unlike :meth:`clear`, which merely stops TRACKING an
+        in-flight bypass and leaves it running, this ends it: the cancellation
+        is AWAITED, so by the time this returns the task has actually unwound
+        and released its connection rather than merely been asked to.
+
+        AWAITED FOR AT MOST ``_REAP_UNWIND_TIMEOUT_SECONDS``, because how long
+        a coroutine takes to honour a cancellation is the coroutine's business
+        and the thing being reaped is by hypothesis already wedged. A cleanup
+        that never finishes would otherwise hang ``dashboard.app.lifespan``'s
+        teardown outright — worse than the leak this reap exists to fix, since
+        abandon-don't-cancel never DELAYED a shutdown. Past the bound the task
+        is abandoned exactly as that older policy would have abandoned it,
+        with one WARNING naming the keys so the degradation is visible rather
+        than inferred.
+
+        EVERY outcome of that unwind is consumed, not only ``CancelledError``
+        — a refresh can finish by raising on its own account (an anyio/httpx
+        cancel-scope ``RuntimeError``, a ``finally`` that blows up), and a
+        detached bypass by construction has no awaiter such an outcome could
+        mean anything to. :meth:`_start_bypass`'s done-callback already
+        settles that policy for the same tasks while the process runs; this
+        matches it rather than narrowing it to one exception type. Narrowing
+        is not cosmetic here: an escape reaches :func:`reap_detached_refreshes`
+        and then ``dashboard.app.lifespan``, above the closes that follow it.
+
+        Reads the roster through :meth:`_live_bypasses_for` so its sweep
+        applies: a task that finished before its done-callback ran is dropped
+        rather than counted as reaped. Both maps are rebuilt before the first
+        cancellation, so the done-callbacks those cancellations trigger find
+        nothing of theirs to unpick and cannot mutate a roster being iterated.
+
+        **Only tasks on the CALLING loop are touched**, because this cache
+        outlives individual event loops while its tasks do not. The instances
+        are module-level, and the dashboard's own test suite runs a fresh loop
+        per ``TestClient(app)`` in its own thread, so a roster entry left by an
+        earlier loop is a state this method will really meet. Cancelling one
+        cancels its parked future, which schedules that future's callbacks
+        through ``loop.call_soon`` — on a closed loop, ``RuntimeError: Event
+        loop is closed``, the same escape ``dashboard.app.lifespan``'s
+        docstring attributes to task 3466.
+
+        The residual, named honestly: a task on a CLOSED foreign loop is
+        UNREACHABLE, not reaped. Its loop is gone, so nothing this process can
+        do will advance, finish or free it, and it is excluded from the
+        returned count for that reason. Its roster entry is dropped anyway —
+        otherwise a dead loop's residue counts against
+        ``_MAX_LIVE_BYPASSES_PER_KEY`` forever, denying the live loop bypasses
+        it is entitled to.
+
+        A task on a foreign loop that is still OPEN is a different state and
+        keeps BOTH its roster entries. It is someone else's in-flight work,
+        not residue: it still holds a connection, so it must still count
+        against that key's bound, and the loop running it will reach its own
+        shutdown, where this same method has to find it. Un-tracking it here
+        would reset the bound while the task runs on, and then lose the task
+        itself — recreating the very leak this reap exists to close. Only
+        ``is_closed()`` separates the two states; "not my loop" alone does
+        not, and overlapping app lifespans are routine in this project's own
+        test suite.
+
+        Counts tasks that actually ENDED, not keys and not tasks merely asked
+        to end: a key may hold up to ``_MAX_LIVE_BYPASSES_PER_KEY`` tasks, and
+        one still unwinding past the bound is a leak being reported, not work
+        reclaimed. A task that ended by RAISING is counted — it ended, so it
+        released its connection.
+        """
+        loop = asyncio.get_running_loop()
+
+        def _runs_on_another_live_loop(task: asyncio.Task[V]) -> bool:
+            task_loop = task.get_loop()
+            return task_loop is not loop and not task_loop.is_closed()
+
+        reapable = [
+            (key, task)
+            for key in list(self._live_bypasses)
+            for task in self._live_bypasses_for(key)
+            if task.get_loop() is loop
+        ]
+        retained: dict[K, list[asyncio.Task[V]]] = {}
+        for key, tasks in self._live_bypasses.items():
+            elsewhere = [task for task in tasks if _runs_on_another_live_loop(task)]
+            if elsewhere:
+                retained[key] = elsewhere
+        self._live_bypasses = retained
+        self._bypass_tasks = {
+            key: entry
+            for key, entry in self._bypass_tasks.items()
+            if _runs_on_another_live_loop(entry[1])
+        }
+        return await cancel_and_await(
+            {task: repr(key) for key, task in reapable}, 'detached cache refresh(es)',
+        )
 
     def clear(self) -> None:
         """Reset the store, all per-key locks, and open bypass streaks (test/admin hook).

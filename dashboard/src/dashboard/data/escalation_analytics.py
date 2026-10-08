@@ -6,20 +6,16 @@ Backend data layer for plans/escalation-lifecycle-dashboard-prd.md Seam 2
 workflow aggregates over the escalation archive, plus regime markers and a
 ``parse_failures`` count (INV-4 — every skipped record is loud AND counted).
 
-This module is a PURE-SYNC core: :func:`build_escalation_analytics` does a
-per-request archive walk with no ``asyncio``. The route (``dashboard.app``)
-wraps the call in ``asyncio.to_thread`` behind a short TTL cache so a cold
-~10k-record walk never blocks the event loop. Tests exercise this module's
-functions directly.
-
-Clock discipline: the only permitted clock read is via
-:func:`dashboard.data.utils.resolve_now`, threaded through once from
-:func:`build_escalation_analytics` — see ``test_clock_discipline.py``.
+This module is a PURE-SYNC core over the escalation corpus
+(:mod:`dashboard.data.escalation_corpus`): it walks nothing and reads no
+clock. The corpus' own instant is the payload's instant, so every number here
+answers for the same walk the Escalations tab reads. The route
+(``dashboard.api.escalations``) runs it in ``asyncio.to_thread``, once per
+corpus generation.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 from bisect import bisect_left
@@ -29,11 +25,12 @@ from pathlib import Path
 
 import yaml
 from escalation.classify import classify_resolver_tier, effective_benign
-from escalation.models import Escalation
-from escalation.queue import iter_all_escalation_paths
+from escalation.models import RESOLUTION_CLASSES, Escalation
 
+from dashboard.data.datum import Datum
+from dashboard.data.escalation_corpus import EscalationCorpus, views_over
 from dashboard.data.stats_utils import percentile
-from dashboard.data.utils import parse_utc, resolve_now
+from dashboard.data.utils import parse_utc
 
 logger = logging.getLogger(__name__)
 
@@ -137,39 +134,6 @@ def _done_by_day(runs_db: Path) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------
-# Archive walk (record loading)
-# ---------------------------------------------------------------------------
-
-
-def _load_escalation_records(escalations_dir: Path) -> tuple[list[Escalation], int]:
-    """Walk *escalations_dir* (queue root + archive) parsing every escalation file.
-
-    Returns ``(records, parse_failures)``. ``triaged_at``/``triaged_by`` (2555)
-    are first-class ``Escalation`` dataclass fields (``escalation.models``), so
-    ``Escalation.from_dict``'s ``__dataclass_fields__`` filter already
-    preserves them on the parsed record — no raw dict needs to be carried
-    alongside it for later blocks (``triage_segments``) to read.
-
-    A file that is not valid JSON, or whose parsed JSON cannot construct an
-    ``Escalation`` (missing required field, non-dict top level, etc.), is
-    counted in ``parse_failures`` and skipped — never raises. INV-4: the
-    dashboard is the loud surface for a corrupt archive file (skipped AND
-    counted), not a silent drop or a 500.
-    """
-    records: list[Escalation] = []
-    parse_failures = 0
-    for path in iter_all_escalation_paths(Path(escalations_dir)):
-        try:
-            esc = Escalation.from_dict(json.loads(path.read_text()))
-        except Exception as exc:
-            logger.warning('_load_escalation_records: failed to parse %s: %s', path, exc)
-            parse_failures += 1
-            continue
-        records.append(esc)
-    return records, parse_failures
-
-
-# ---------------------------------------------------------------------------
 # Origin block
 # ---------------------------------------------------------------------------
 
@@ -185,10 +149,13 @@ def _origin_block(records: list[Escalation], *, now: datetime) -> dict:
     """Per-source (``agent_role``) origin aggregates over *records*.
 
     ``sources[].filings`` counts every record for that source, regardless of
-    status. ``benign``/``actionable``/``stamped_share``/``benign_rate`` are
+    status. ``classes``/``classified``/``stamped_share``/``benign_rate`` are
     computed over ALL-TIME terminal (``resolved``/``dismissed``) records only
     (pending records are excluded — nothing to classify yet), via
-    :func:`escalation.classify.effective_benign`.
+    :func:`escalation.classify.effective_benign`. ``classes`` is keyed by
+    every :data:`escalation.models.RESOLUTION_CLASSES` member, zero-filled,
+    plus any stamp outside that vocabulary under its own key, so the parts
+    always sum to ``classified``.
 
     ``predictably_benign`` is a separate, windowed computation — trailing
     ``_PREDICTABLY_BENIGN_WINDOW_DAYS`` days keyed by ``resolved_at`` — True
@@ -206,9 +173,7 @@ def _origin_block(records: list[Escalation], *, now: datetime) -> dict:
     window_cutoff = now - timedelta(days=_PREDICTABLY_BENIGN_WINDOW_DAYS)
 
     filings: dict[str, int] = {}
-    classified: dict[str, int] = {}
-    benign: dict[str, int] = {}
-    actionable: dict[str, int] = {}
+    classes: dict[str, dict[str, int]] = {}
     stamped: dict[str, int] = {}
     window_n: dict[str, int] = {}
     window_benign: dict[str, int] = {}
@@ -234,13 +199,10 @@ def _origin_block(records: list[Escalation], *, now: datetime) -> dict:
         cls, provenance = effective_benign(esc)
         if cls is None:
             continue
-        classified[source] = classified.get(source, 0) + 1
+        source_classes = classes.setdefault(source, dict.fromkeys(sorted(RESOLUTION_CLASSES), 0))
+        source_classes[cls] = source_classes.get(cls, 0) + 1
         if provenance == 'stamped':
             stamped[source] = stamped.get(source, 0) + 1
-        if cls == 'benign':
-            benign[source] = benign.get(source, 0) + 1
-        elif cls == 'actionable':
-            actionable[source] = actionable.get(source, 0) + 1
 
         try:
             resolved_dt = parse_utc(esc.resolved_at)
@@ -257,8 +219,9 @@ def _origin_block(records: list[Escalation], *, now: datetime) -> dict:
 
     sources = []
     for source, n_filings in sorted(filings.items()):
-        n_classified = classified.get(source, 0)
-        n_benign = benign.get(source, 0)
+        source_classes = classes.get(source, dict.fromkeys(sorted(RESOLUTION_CLASSES), 0))
+        n_classified = sum(source_classes.values())
+        n_benign = source_classes['benign']
         n_window = window_n.get(source, 0)
         n_window_benign = window_benign.get(source, 0)
         window_rate = n_window_benign / n_window if n_window else 0.0
@@ -267,8 +230,8 @@ def _origin_block(records: list[Escalation], *, now: datetime) -> dict:
         sources.append({
             'source': source,
             'filings': n_filings,
-            'benign': n_benign,
-            'actionable': actionable.get(source, 0),
+            'classes': source_classes,
+            'classified': n_classified,
             'stamped_share': stamped.get(source, 0) / n_classified if n_classified else 0.0,
             'benign_rate': n_benign / n_classified if n_classified else 0.0,
             'predictably_benign': (
@@ -579,8 +542,9 @@ def _workflow_block(records: list[Escalation], runs_db: Path) -> dict:
     - ``tier_weekly``: ISO-week (``YYYY-Www``) -> ``{tier: count}``, over
       terminal records with a parseable ``resolved_at``
       (:func:`~escalation.classify.classify_resolver_tier` of ``resolved_by``).
-    - ``action_mix``: terminal ``resolution_action`` counts, ``None`` ->
-      ``'unspecified'`` (visible adoption gap — INV-4).
+    - ``action_mix``: ``resolution_action`` counts over EVERY terminal record
+      — the population ``origin`` classifies — ``None`` -> ``'unspecified'``
+      (visible adoption gap — INV-4).
     - ``churn_daily``: ``date(timestamp) -> count`` of filings whose
       ``task_id`` had ANY other escalation resolved/dismissed within the
       24h before this filing's own ``timestamp``.
@@ -604,6 +568,9 @@ def _workflow_block(records: list[Escalation], runs_db: Path) -> dict:
         if esc.status not in ('resolved', 'dismissed'):
             continue
 
+        action_key = esc.resolution_action or 'unspecified'
+        action_mix[action_key] = action_mix.get(action_key, 0) + 1
+
         try:
             resolved_at = parse_utc(esc.resolved_at)
         except (TypeError, ValueError):
@@ -618,9 +585,6 @@ def _workflow_block(records: list[Escalation], runs_db: Path) -> dict:
         week_key = f'{iso.year}-W{iso.week:02d}'
         week_bucket = tier_weekly.setdefault(week_key, {})
         week_bucket[tier] = week_bucket.get(tier, 0) + 1
-
-        action_key = esc.resolution_action or 'unspecified'
-        action_mix[action_key] = action_mix.get(action_key, 0) + 1
 
         cls, _provenance = effective_benign(esc)
         if cls is None:
@@ -713,24 +677,26 @@ def _workflow_block(records: list[Escalation], runs_db: Path) -> dict:
 
 def _aggregate_project(
     project: str,
-    escalations_dir: Path,
+    records: list[Escalation],
     runs_db: Path,
     *,
     now: datetime,
     downsample_threshold: int = 10_000,
     pins_by_id: Mapping[str, list[str]] | None = None,
-) -> tuple[dict, int]:
-    """Aggregate one project's escalation archive into a Seam-2 payload entry.
+) -> dict:
+    """Aggregate one project's escalations into a Seam-2 payload entry.
+
+    ``terminal`` is the one terminal-record population that ``origin``'s
+    ``classes`` and ``workflow.action_mix`` both count, stated once so a
+    consumer can check the parts against the whole.
 
     *pins_by_id* is THIS project's pins_recovery annotation (``None`` when its
     escalation MCP could not be read); it is only consumed by
     :func:`_lifespan_block`'s ``open_items``.
-
-    Returns ``(entry, parse_failures)``.
     """
-    records, parse_failures = _load_escalation_records(Path(escalations_dir))
-    entry = {
+    return {
         'project': project,
+        'terminal': sum(esc.status in ('resolved', 'dismissed') for esc in records),
         'origin': _origin_block(records, now=now),
         'lifespan': _lifespan_block(
             records, now=now, downsample_threshold=downsample_threshold,
@@ -738,7 +704,6 @@ def _aggregate_project(
         ),
         'workflow': _workflow_block(records, Path(runs_db)),
     }
-    return entry, parse_failures
 
 
 # ---------------------------------------------------------------------------
@@ -747,139 +712,78 @@ def _aggregate_project(
 
 
 def build_escalation_analytics(
-    project_dirs: list[tuple[str, Path, Path]],
+    corpus_datum: Datum[EscalationCorpus],
     *,
-    now: datetime | None = None,
     regime_markers_path: Path | None = None,
     downsample_threshold: int = 10_000,
     pins_by_project: Mapping[str, Mapping[str, list[str]] | None] | None = None,
 ) -> dict:
-    """Build the full Seam-2 escalation-analytics payload across *project_dirs*.
+    """Build the full Seam-2 escalation-analytics payload over the corpus' orchestrator queues.
 
-    *project_dirs* is ``[(label, escalations_dir, runs_db), ...]``, primary
-    project first. This is the PURE-SYNC core — the only permitted clock
-    read in this module: ``now`` is resolved once via :func:`resolve_now`
-    and threaded through every per-project aggregation, so no per-project
-    call reads the live clock independently.
+    *corpus_datum* must be a measured walk; an unknown one raises
+    ``ValueError``. Each orchestrator queue is one project, read against its
+    queue's ``runs_db``. The reconciliation queue is not a project and is not
+    aggregated here.
 
-    ``parse_failures`` combines archive-record parse failures (summed
-    across all project dirs) AND the regime-markers load's
-    ``parse_failures_delta`` into a single loud count (INV-4) — there is
-    only one ``parse_failures`` field in the payload.
+    ``generated_at`` is the corpus' ``as_of``: the payload answers for the
+    walk it was derived from, and every age in it is measured against that
+    one instant.
+
+    ``parse_failures`` combines the orchestrator queues' unreadable files
+    AND the regime-markers load's ``parse_failures_delta`` into a single loud
+    count (INV-4) — there is only one ``parse_failures`` field in the payload.
 
     ``downsample_threshold`` bounds each project's ``lifespan.samples`` —
     see :func:`_lifespan_block` and :func:`_downsample_stratified`.
 
     ``pins_by_project`` is :func:`dashboard.data.escalations.fetch_pins_recovery`'s
     return value passed through verbatim: ``{label: {escalation_id: [task_ids]}
-    | None}``.  Both maps are keyed by project BASENAME, which is why no
-    translation is needed here — ``_analytics_project_dirs`` labels and
-    ``config.escalation_urls`` keys are the same ``root.name``.  A project
-    absent from the mapping (no escalation URL was ever discovered for that
-    root) and a project mapped to ``None`` (its escalation MCP could not be
-    read) are treated identically: UNKNOWN, so nothing is stamped.  This
-    function stays pure — the fetch happens in the route, outside the
-    ``asyncio.to_thread`` boundary.
+    | None}``, keyed by project label (``root.name``), as are the queue labels.
+    A project absent from the mapping and a project mapped to ``None`` are
+    treated identically: UNKNOWN, so nothing is stamped.
 
-    Two archive-reach signals, both computed from ONE ``is_dir`` stat per
-    project.  They exist because nothing else in the payload can answer either
-    question — :func:`iter_all_escalation_paths` returns silently on a missing
-    dir and :meth:`Path.glob` swallows ``PermissionError``, so an absent
-    archive, an unreadable one and a genuinely empty one otherwise produce
-    byte-identical entries.
+    Two queue-reach signals, read from the corpus scans:
 
-    * ``archives_present`` (``all``) — the completeness DIAGNOSTIC: did this
-      scan reach EVERY configured archive?  An operator reads it to find a
+    * ``archives_present`` (``all``) — the completeness DIAGNOSTIC: did the
+      walk reach EVERY orchestrator queue?  An operator reads it to find a
       root that is unmounted or misconfigured.
-    * ``archives_reached`` (``any``) — the CACHE predicate (see
-      :func:`archive_scan_succeeded`): did this scan reach ANY archive at all?
-      A build that walked nothing is free to re-derive and must not pin an
-      empty view for a TTL window past the moment the volume mounts; a build
-      that walked something paid for that walk, and the cache is what stops it
-      being paid again on the next poll.
+    * ``archives_reached`` (``any``) — did it reach any at all?  The corpus
+      cache keys its cacheability on the same fact
+      (:attr:`~dashboard.data.escalation_corpus.EscalationCorpus.reached_any`).
 
-    They are separate fields because ``all`` is UNSOUND as a cache predicate,
-    which is not hypothetical: measured 2026-08-01 against the installed
-    unit's own ``DASHBOARD_KNOWN_PROJECT_ROOTS`` (9 roots), 2 roots have no
-    ``data/escalations`` dir at all while the other 7 hold ~9.1k records
-    between them.  Keying on ``all`` there means the TTL never stores
-    anything and every 3s poll re-runs the whole multi-second walk — ``all``
-    reports "this scan was free to redo" at precisely the moment it was most
-    expensive.  A root that has simply never escalated must not delete the
-    cache in front of the other seven.
-
-    Their shared LIMIT, stated because a signal is only useful if its blind
-    spot is known: one ``is_dir`` stat distinguishes the ABSENT/unmounted
-    case, not every permission flap — a directory that exists but whose own
-    mode is stripped still passes ``is_dir`` and then globs empty.  Both are
-    deliberately not ``parse_failures``, which counts unparseable RECORDS:
-    that count is a permanent property of a corrupt file, so a cache keyed on
-    it would be defeated forever in front of the ~10k-record walk the cache
-    exists to prevent.  All three fields answer different questions and none
-    is derived from another.
+    ``views`` (per project, and across every orchestrator queue at the top
+    level) are the corpus' named views, as Datums stamped with its instant.
     """
-    resolved_now = resolve_now(now)
+    corpus, as_of = corpus_datum.value, corpus_datum.as_of
+    if corpus is None or as_of is None:
+        raise ValueError(f'the escalation corpus was not measured: {corpus_datum.reason}')
+    projects = [
+        (scan, runs_db) for scan in corpus.scans if (runs_db := scan.queue.runs_db) is not None
+    ]
+    scans = [scan for scan, _runs_db in projects]
 
     parse_failures = 0
     per_project = []
-    for project, escalations_dir, runs_db in project_dirs:
-        entry, project_parse_failures = _aggregate_project(
-            project, escalations_dir, runs_db, now=resolved_now,
+    for scan, runs_db in projects:
+        entry = _aggregate_project(
+            scan.queue.label, [record.escalation for record in scan.records],
+            runs_db, now=as_of,
             downsample_threshold=downsample_threshold,
-            pins_by_id=(pins_by_project or {}).get(project),
+            pins_by_id=(pins_by_project or {}).get(scan.queue.label),
         )
-        parse_failures += project_parse_failures
+        entry['views'] = views_over(corpus_datum, [scan.queue.id])
+        parse_failures += len(scan.unreadable)
         per_project.append(entry)
 
     markers, markers_parse_failures = load_regime_markers(regime_markers_path)
     parse_failures += markers_parse_failures
 
-    # ONE pass, one stat per project, feeding both signals — so the two can
-    # never drift apart by disagreeing about what was on disk when.
-    reached = [
-        Path(escalations_dir).is_dir() for _label, escalations_dir, _runs_db in project_dirs
-    ]
-
     return {
-        'generated_at': resolved_now.isoformat(),
+        'generated_at': as_of.isoformat(),
         'parse_failures': parse_failures,
         'regime_markers': markers,
         'per_project': per_project,
-        # ``all`` — the completeness diagnostic an operator reads.
-        'archives_present': all(reached),
-        # ``any`` — the cache predicate; see archive_scan_succeeded.
-        'archives_reached': any(reached),
+        'archives_present': all(scan.reached for scan in scans),
+        'archives_reached': any(scan.reached for scan in scans),
+        'views': views_over(corpus_datum, [scan.queue.id for scan in scans]),
     }
-
-
-def archive_scan_succeeded(payload: dict) -> bool:
-    """Did this scan reach any escalation archive at all?
-
-    The cacheability predicate for the analytics route's TTL cache
-    (``cache_ok=archive_scan_succeeded``).  False for exactly one payload: the
-    one built without reaching a single archive, where every configured
-    ``escalations_dir`` failed its :meth:`Path.is_dir` check and nothing was
-    walked.  That is O(1) to recompute — one negative stat per project — so
-    re-deriving it on every poll costs nothing, while caching it keeps the tab
-    reporting an empty archive for a full TTL window after the volume mounts.
-
-    A PARTIAL scan is cacheable, and that is the whole point of keying on
-    ``archives_reached`` (``any``) rather than ``archives_present`` (``all``):
-    the ordinary multi-project config has roots that have simply never
-    escalated, and one of those must not delete the cache sitting in front of
-    every other root's ~10k-record walk.  ``archives_present: False`` rides
-    along in the payload as the diagnostic and has no say here.  The accepted
-    trade-off is the narrow one: an archive that disappears mid-life leaves
-    that project's panel up to one TTL window stale.
-
-    Deliberately not keyed on ``parse_failures`` — that counts unparseable
-    RECORDS and is permanent for a corrupt file, so gating on it would defeat
-    the cache forever in front of the very walk it protects.
-
-    Reads through ``.get`` for the same reason
-    :func:`dashboard.data.memory_evals.root_scan_succeeded` does: it runs
-    inside the cache write path, where a partially-built or older-shaped
-    payload must degrade to "don't cache" rather than raise where a raise
-    would surface as a 500 on a 3s dashboard poll.
-    """
-    return bool(payload.get('archives_reached'))

@@ -408,6 +408,66 @@ def test_load_census_state_valid_file_is_ok_with_no_warning(tmp_path, caplog):
 
 
 # ---------------------------------------------------------------------------
+# task 6397: the six-key census state, and the legacy shapes it replaces
+# ---------------------------------------------------------------------------
+
+_LEGACY_STATE = {
+    "last_census_at": "2026-10-03",
+    "last_census_report": "/home/leo/src/dark-factory/plans/confusion-census-2026-10-03.md",
+    "last_census_done_count": 2872,
+}
+
+_SIX_KEY_STATE = {
+    "last_census_at": "2026-10-06",
+    "last_census_run_id": "census-dark_factory-20261006",
+    "last_census_report": "plans/confusion-census-2026-10-06.md",
+    "last_census_as_of_sha": "a" * 40,
+    "session_watermark": "2026-10-06T00:00:00+00:00",
+    "last_census_done_count": 2900,
+}
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        _LEGACY_STATE,
+        _SIX_KEY_STATE,
+        {"last_census_at": "2026-10-01T09:30:00+00:00", "last_census_report": "x.md"},
+        {**_SIX_KEY_STATE, "session_watermark": None},
+    ],
+    ids=["legacy", "six-key", "hand-seeded-datetime", "null-watermark"],
+)
+def test_load_census_state_accepts_every_supported_shape(tmp_path, caplog, state):
+    path = tmp_path / "census-state.json"
+    path.write_text(json.dumps(state), encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING):
+        status, data = ct.load_census_state(path)
+
+    assert (status, data) == ("ok", state)
+    assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+@pytest.mark.parametrize("watermark", ["yesterday", 5])
+def test_load_census_state_unparseable_watermark_is_malformed_with_one_warning(
+    tmp_path, caplog, watermark,
+):
+    path = tmp_path / "census-state.json"
+    path.write_text(
+        json.dumps({**_SIX_KEY_STATE, "session_watermark": watermark}), encoding="utf-8",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        status, data = ct.load_census_state(path)
+
+    assert (status, data) == ("malformed", None)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "session_watermark" in warnings[0].getMessage()
+    assert repr(watermark) in warnings[0].getMessage()
+
+
+# ---------------------------------------------------------------------------
 # step-13: RED — codebook_signal() + load_census_config()
 # ---------------------------------------------------------------------------
 
@@ -1040,9 +1100,8 @@ def test_default_status_fetcher_sends_absolute_project_root_for_dot(
     `{"error": "project_root must be a non-empty absolute path, got: '.'",
       "error_type": "ValidationError"}`.
 
-    In production that call ALWAYS carried a relative path: census.py's CLI
-    defaults `--project-root` to `"."`, and `nightly._default_census_launcher`
-    (nightly.py:521) launches census.py with no arguments at all. The MCP
+    census.py resolves its own, now required, `--project-root` (task 3269);
+    the `evaluate` CLI's `"."` default still reaches this resolve. The MCP
     argument is resolved by the SERVER's cwd, not the client's, so a relative
     path is meaningless over the wire."""
     monkeypatch.chdir(tmp_path)

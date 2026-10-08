@@ -4,7 +4,7 @@ PRD eval-framework-revival §ε, Contract C1.mem, Boundary test B5.
 
 In eval mode every orchestrator-side memory write
 (``TaskWorkflow._write_completion_to_memory`` / ``_write_decisions_to_memory``
-/ ``_write_suggestions_to_memory``) POSTs raw httpx to ``{self.mcp.url}/mcp/``,
+/ ``_write_suggestions_to_memory``) POSTs raw httpx to ``{self.mcp.url}/mcp``,
 where ``self.mcp = _EvalMcpStub(orch_config.fused_memory.url)``. Because
 ``fused_memory.url`` defaults to the real production endpoint
 (``http://localhost:8002``), an un-isolated green eval run would write into
@@ -271,7 +271,7 @@ async def test_all_memory_write_paths_route_through_mcp_url_to_sink(
     """ALL THREE orchestrator-side memory writes funnel through ``self.mcp.url`` to the sink.
 
     The isolation guarantee rests on every ``_write_*_to_memory`` method POSTing to
-    ``f'{self.mcp.url}/mcp/'`` — the single leaf the ``memory_endpoint`` override lands
+    ``mcp_endpoint_url(self.mcp.url)`` — the single leaf the ``memory_endpoint`` override lands
     on. ``test_memory_endpoint_override_routes_real_workflow_write_to_sink`` proves this
     for the completion path only; here each real write path
     (``_write_completion_to_memory`` / ``_write_decisions_to_memory`` /

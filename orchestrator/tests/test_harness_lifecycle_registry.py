@@ -32,7 +32,8 @@ from orchestrator.harness import Harness
 # Canonical start-order registration list — task 2241 plan.json "HARNESS
 # MIGRATION": escalation-server and merge-worker first (the recovery block
 # depends on both being live); the remaining bespoke adapter (offline-lane)
-# and the seven BackgroundService sweeps follow.
+# and the seven BackgroundService sweeps follow, then the two always-on
+# services that keep their cadence whatever the dispatch loop does (task 5344).
 _CANONICAL_ORDER = [
     'escalation-server',
     'merge-worker',
@@ -45,6 +46,8 @@ _CANONICAL_ORDER = [
     'no-landings-breaker',
     'deterministic-recon-sweep',
     'warm-lane-gc',
+    'stale-service-restart',
+    'merge-heartbeat',
 ]
 
 
@@ -54,12 +57,12 @@ _CANONICAL_ORDER = [
 
 
 class TestLifecycleRegistrationOrder:
-    """harness._build_lifecycle_registry() wires the canonical eleven-name order."""
+    """harness._build_lifecycle_registry() wires the canonical name order."""
 
-    def test_all_eleven_enabled_matches_canonical_order(self, tmp_path: Path) -> None:
-        """A real OrchestratorConfig defaults every one of the eleven
-        enable-gates to True, so the freshly built registry's services are
-        exactly the canonical START order (LR-3)."""
+    def test_all_enabled_matches_canonical_order(self, tmp_path: Path) -> None:
+        """A real OrchestratorConfig defaults every enable-gate to True, so
+        the freshly built registry's services are exactly the canonical START
+        order (LR-3)."""
         config = OrchestratorConfig(project_root=tmp_path)
         harness = Harness(config)
 

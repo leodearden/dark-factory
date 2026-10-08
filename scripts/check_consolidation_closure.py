@@ -68,9 +68,9 @@ READ-ONLY. Every database handle this script opens is a read-only SQLite
 URI, and the only store calls are a metadata scroll plus (task 4808) one
 raw point read per unstamped CANDIDATE — ``get_memory_by_id``, a
 non-semantic Qdrant point read. It never writes a task, a memory or a
-status. The candidate list is EMPTY for every well-formed gate (an
-observed member already stamped into the topic is subtracted before any
-read), so the common path costs exactly what it did before.
+status. A retain-arm gate whose observed members are all stamped into the
+topic probes nothing; a delete-arm gate costs one point read per id its
+canonical claims in ``supersedes`` that is absent from the scroll.
 """
 
 from __future__ import annotations
@@ -99,8 +99,9 @@ if str(_SHARED_SRC) not in sys.path:
 
 # `_task_db_scan` is a flat sibling in scripts/ and resolves solely because a
 # DIRECTLY-EXECUTED script puts its own directory at sys.path[0] — so never
-# invoke this via `python -m`. It is the single home for the tasks.db path.
-from _task_db_scan import tasks_db_path  # noqa: E402
+# invoke this via `python -m`. It is the single home for the tasks.db path and
+# its read-only open.
+from _task_db_scan import TaskDbUnreadable, connect_ro, tasks_db_path  # noqa: E402
 from fused_memory.middleware.task_interceptor import TaskInterceptor  # noqa: E402
 from fused_memory.reconciliation.consolidation_gate import (  # noqa: E402
     EXIT_CLOSED,
@@ -203,12 +204,17 @@ def render_human(verdict: Any, *, scroll: dict) -> str:
 
 
 def load_task_metadata(project_root: str, task_id: str, tag: str) -> Any:
-    """Read one task's raw metadata column from tasks.db, READ-ONLY."""
+    """Read one task's raw metadata column from tasks.db, READ-ONLY.
+
+    Opens through ``_task_db_scan.py::connect_ro``, whose refusal of a wrong
+    file already names the path and the remedy, so it becomes the UsageError
+    verbatim.
+    """
     db_path = tasks_db_path(project_root)
-    if not db_path.exists():
-        raise UsageError(f"no tasks.db at {db_path}")
     try:
-        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        con = connect_ro(db_path)
+    except TaskDbUnreadable as refusal:
+        raise UsageError(str(refusal)) from refusal
     except sqlite3.Error as exc:
         raise UsageError(f"could not open {db_path} read-only: {exc}") from exc
     try:
@@ -234,11 +240,13 @@ async def scroll_cluster(
     count, and DISCLOSE truncation — so the common path is cheap and a
     capped scroll never reads as complete.
 
-    Also derives ``unstamped`` (task 4808) from *block*'s inert provenance,
-    through the SHARED ``consolidation_gate.py::resolve_unstamped_live_ids``
-    (over the SHARED ``consolidation_gate.py::closure_exists_probe``) — never
-    a second copy of that subtraction nor of that argument adaptation, so the
-    CLI and the seam cannot disagree about which observed members are strays.
+    Also derives ``unstamped`` (task 4808) from *block*'s inert provenance
+    and the canonical's ``supersedes`` claim, through the SHARED
+    ``consolidation_gate.py::resolve_unstamped_live_ids`` (over the SHARED
+    ``consolidation_gate.py::closure_exists_probe``) — never a second copy of
+    that candidate derivation nor of that argument adaptation, so the CLI and
+    the seam cannot disagree about which off-scroll ids (observed members or
+    claimed-absorbed ids) are live.
     It stays INSIDE this function on purpose: ``run()``'s existing
     ``except Exception -> available: False -> EXIT_USAGE`` wrapper then
     covers a probe failure with no new branch, matching the store-outage
@@ -248,7 +256,7 @@ async def scroll_cluster(
     ``consolidation_gate.py::evaluate_closure`` sets for its own
     completeness arguments. A defaulted *block* would let a caller silently
     fall back to pre-4808 behaviour — ``resolve_unstamped_live_ids`` treats a
-    non-Mapping gate block as "no candidates" by design — and reintroduce
+    non-Mapping gate block as "no observed members" by design — and reintroduce
     exactly the SILENT DORMANCY this task exists to remove, with no error and
     no log line to notice it by.
     """

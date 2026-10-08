@@ -308,6 +308,114 @@ class TestRawCallRetry:
         assert isinstance(excinfo.value.__cause__, httpx.ReadTimeout)
 
 
+class TestTimeoutCausePredicate:
+    """``is_timeout_failure`` recovers the timeout fact ``_raw_call`` erases.
+
+    Task 3659 (review fix 3). ``_raw_call`` retries ``httpx.TimeoutException``
+    and, on exhaustion, re-raises a ``RuntimeError`` — so every caller sees
+    the same type whether the service was slow or unreachable, and a
+    ``except TimeoutError`` branch above it can never fire. The predicate
+    inverts that wrap by walking ``__cause__``, which is where the original
+    type survives.
+    """
+
+    async def _drive(self, cause: Exception) -> RuntimeError:
+        """The RuntimeError ``_raw_call`` really raises for *cause*.
+
+        Built by driving the retry loop to exhaustion rather than by
+        hand-writing the wrap, so the predicate is tested against the
+        production exception shape and not an imitation of it.
+        """
+        session = McpSession('http://localhost:8002')
+        mock_client = AsyncMock()
+        mock_client.post.side_effect = cause
+
+        with (
+            patch('orchestrator.mcp_lifecycle.httpx.AsyncClient') as mock_cls,
+            patch('orchestrator.mcp_lifecycle.fm_retry_backoffs', return_value=[0.01, 0.01]),
+            patch('asyncio.sleep', new_callable=AsyncMock),
+        ):
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            with pytest.raises(RuntimeError) as excinfo:
+                await session._raw_call('tools/call', {'name': 't', 'arguments': {}})
+        return excinfo.value
+
+    @pytest.mark.asyncio
+    async def test_a_real_exhausted_read_timeout_is_a_timeout(self):
+        """The case the unreachable ``except TimeoutError`` branch meant to catch."""
+        from orchestrator.mcp_lifecycle import is_timeout_failure
+
+        err = await self._drive(httpx.ReadTimeout(''))
+
+        assert not isinstance(err, TimeoutError), (
+            'the wrap is why a type check cannot answer this question'
+        )
+        assert is_timeout_failure(err)
+
+    @pytest.mark.asyncio
+    async def test_a_real_exhausted_connect_error_is_not_a_timeout(self):
+        """Same wrapper type, opposite answer: unreachable, not slow."""
+        from orchestrator.mcp_lifecycle import is_timeout_failure
+
+        err = await self._drive(httpx.ConnectError('refused'))
+
+        assert not is_timeout_failure(err)
+
+    def test_bare_timeout_exceptions_are_timeouts(self):
+        from orchestrator.mcp_lifecycle import is_timeout_failure
+
+        assert is_timeout_failure(httpx.TimeoutException('slow'))
+        assert is_timeout_failure(httpx.ReadTimeout(''))
+        # `asyncio.TimeoutError` is an alias of the builtin since 3.11, so
+        # one assertion covers both spellings the predicate documents.
+        assert is_timeout_failure(TimeoutError())
+
+    def test_non_timeouts_are_not_timeouts(self):
+        from orchestrator.mcp_lifecycle import is_timeout_failure
+
+        assert not is_timeout_failure(httpx.ConnectError('refused'))
+        assert not is_timeout_failure(RuntimeError('no cause at all'))
+        assert not is_timeout_failure(ValueError('unrelated'))
+
+    def test_a_timeout_deep_in_a_none_terminated_chain_is_found(self):
+        """The wrap can nest: the walk follows the chain to its end.
+
+        The chain built below terminates rather than cycling — a freshly
+        constructed ``ReadTimeout`` has no ``__cause__`` — which is what
+        separates this case from the two cyclic ones after it.
+        """
+        from orchestrator.mcp_lifecycle import is_timeout_failure
+
+        inner = RuntimeError('MCP tools/call failed after 3 attempts: ReadTimeout: ')
+        inner.__cause__ = httpx.ReadTimeout('')
+        outer = RuntimeError('search failed')
+        outer.__cause__ = inner
+
+        assert is_timeout_failure(outer)
+
+    def test_a_cyclic_cause_chain_terminates(self):
+        """A cycle must return an answer, not hang the briefing assembler."""
+        from orchestrator.mcp_lifecycle import is_timeout_failure
+
+        first = RuntimeError('first')
+        second = RuntimeError('second')
+        first.__cause__ = second
+        second.__cause__ = first
+
+        assert not is_timeout_failure(first)
+
+    def test_a_cycle_containing_a_timeout_still_reports_it(self):
+        from orchestrator.mcp_lifecycle import is_timeout_failure
+
+        slow = httpx.ReadTimeout('')
+        wrapper = RuntimeError('wrapper')
+        wrapper.__cause__ = slow
+        slow.__cause__ = wrapper
+
+        assert is_timeout_failure(wrapper)
+
+
 class TestClientOpIdInjection:
     """_raw_call injects a per-logical-call client_op_id for mutating task
     tools so the transport-level retry loop is safe (task 2712).

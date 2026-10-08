@@ -41,6 +41,7 @@ __all__ = [
     'SubmodelCardinality',
     'TaskMetadata',
     'apply_migrations',
+    'is_known_metadata_key',
     'parse_metadata',
     'register_metadata_submodel',
     'validate_model_overrides',
@@ -1003,6 +1004,7 @@ _WHOLE_METADATA_FIELD = '<metadata>'
 _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
     {
         'source',
+        # retired 2026-08; stays blessed for historical carriers (docs/task-authoring.md §8).
         'modules',
         'spawn_context',
         'complexity',
@@ -1247,8 +1249,92 @@ _BLESSED_METADATA_KEYS: frozenset[str] = frozenset(
         # unrepairable until task 3777 lifts the presence-only write-authority
         # floor.
         'execution_class',
+        # Merge-queue priority-lane selector (task 4888). The sole input to
+        # lane selection anywhere in the system, and the only way a task can
+        # ask to be merged ahead of the normal queue. Writers and reader are
+        # named because that is what a future reader greps when deciding
+        # whether the key is still load-bearing (all re-verified 2026-09-17):
+        # writers `orchestrator/src/orchestrator/merge_queue.py::
+        # SpeculativeMergeWorker::_spawn_main_health_fix_task` (auto-heal
+        # main-health fix task, 'high'), `orchestrator/src/orchestrator/
+        # workflow.py::build_offline_lane_fix_task_arguments` (offline-lane fix
+        # task, 'normal') and `orchestrator/src/orchestrator/workflow.py::
+        # TaskWorkflow::_spawn_main_health_fix_task` (fix-main brief, 'high');
+        # reader `orchestrator/src/orchestrator/merge_queue.py::
+        # lane_for_task_metadata` -> `_normalize_lane`, consumed at
+        # `orchestrator/src/orchestrator/workflow.py::TaskWorkflow::
+        # _submit_to_merge_queue` to set `MergeRequest.lane` and -- as of this
+        # task -- by `escalation/src/escalation/merge_lane_resolution.py::
+        # resolve_merge_lane` on the MCP submit path.
+        #
+        # THE BLESSING GROUND IS NOT CORPUS VOLUME, unlike the
+        # finding-provenance and `related_tasks` entries above. Census
+        # (2026-08-20): FOUR carriers -- tasks 3875, 4221, 4289, 4471, values
+        # {normal: 3, high: 1} -- which on volume alone would decide nothing.
+        # It rests on the other two criteria in docs/task-authoring.md
+        # "Promoting a convention": LOAD-BEARING (above) and STABLE (a closed
+        # two-value vocabulary, `MERGE_LANES = ('high', 'normal')`). As with
+        # the entries above, this comment is deliberately the SINGLE in-repo
+        # copy of those figures -- the doc cites this entry rather than
+        # restating them, so a re-census updates one place.
+        #
+        # BLESSED RATHER THAN PROMOTED TO A TYPED `Literal['normal', 'high']`,
+        # which is tempting here precisely because the vocabulary IS closed.
+        # Declined on the `execution_class` precedent below: a Literal raises
+        # on every metadata write to an out-of-vocabulary carrier under
+        # direction='write', enforce=True, permanently, because terminal tasks
+        # are unrepairable under the `done_provenance` write-authority floor --
+        # and task 4888 deliberately GROWS this population via the new
+        # `merge_request(lane=...)` parameter. The typo the stronger form would
+        # catch is caller intent, and that path is now guarded where it
+        # actually lives: `merge_request` rejects an unknown CALLER-supplied
+        # lane loudly with `code='invalid_lane'`, while an inherited metadata
+        # value still normalises silently.  Why those two differ is stated
+        # once, in `escalation/src/escalation/merge_lane_resolution.py`, on
+        # the same one-place rule as the census figures above.
+        'merge_lane',
+        # The scheduler's durable pending-wait anchor (task 3816, PRD
+        # plans/scheduler-dispatch-scoring-and-lock-layer-prd.md §C1).
+        #
+        # `pending_since` is an ISO-8601 UTC wall-clock stamp in the same
+        # format `updated_at` uses, written by the fused-memory status
+        # chokepoint on every `* -> pending` landing -- writer
+        # `fused-memory/src/fused_memory/backends/sqlite_task_backend.py::
+        # stamp_pending_since`, the one shared implementation called from
+        # `add_task`, `set_task_status` and `set_status_and_stamp_audit`. It
+        # is READ back by the orchestrator scheduler's age term (task beta)
+        # and the watchdog idle clock (task delta), so it is load-bearing on
+        # both sides -- the same machine-written-stamp profile as
+        # `last_blocked_at` and `files_tagged_at` above, and blessed on the
+        # same "Promoting a convention" grounds.
+        #
+        # `pending_since_backfilled` is the marker written ONLY by the
+        # one-shot v4 -> v5 migration, which anchors the legacy pending
+        # population from `updated_at`. That deliberately UNDER-ages those
+        # rows (PRD design decision 4: never over-ages, so it cannot
+        # manufacture a queue jump); the marker exists so the distortion
+        # stays countable instead of invisible.
+        'pending_since',
+        'pending_since_backfilled',
+        # Ledger entry for a terminal write that honoured an explicit
+        # claimant (task 4866). Writer `fused-memory/src/fused_memory/
+        # middleware/task_interceptor.py::_claimant_exception_entry` via
+        # `_apply_status_transition`; consumer the detection gauge's ledger
+        # classification (docs/prds/claimant-invariant-detection.md D-5, E-2).
+        # A permanent machine stamp: unblessed, every carrier would emit
+        # unknown_key census noise.
+        'claimant_exception',
+        # The harness's audit-trail rotation rollup (task 5771, docs/task-authoring.md
+        # §10): written and read back only by
+        # `fused-memory/src/fused_memory/reconciliation/audit_trail_rotation.py`.
+        'audit_trail_rotation',
     }
 )
+
+
+def is_known_metadata_key(key: str) -> bool:
+    """A typed field, a registered submodel slice or a Tier-A blessed key; never ``x_``."""
+    return key in TaskMetadata.model_fields or key in _SUBMODEL_REGISTRY or key in _BLESSED_METADATA_KEYS
 
 
 def _cardinality_mismatch_message(
@@ -1462,9 +1548,8 @@ def parse_metadata(
                 )
             )
 
-    known_fields = set(TaskMetadata.model_fields) | set(_SUBMODEL_REGISTRY)
     for key in parsed:
-        if key in known_fields or key.startswith('x_') or key in _BLESSED_METADATA_KEYS:
+        if is_known_metadata_key(key) or key.startswith('x_'):
             continue
         warnings.append(
             SchemaWarning(

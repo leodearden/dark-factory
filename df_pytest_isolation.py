@@ -34,7 +34,8 @@ strictly tighter than this one (``cwd.parent`` rather than the basetemp):
 * ``_orch_helpers.git_env_with_ceiling`` — the same ceiling mechanism applied
   per call, on a private env copy.
 
-SECOND DEFENCE — a test run can never falsify a REAL deploy clock.
+SECOND DEFENCE — a test run can never falsify REAL fleet-redeploy coordination
+state: either deploy clock, or task 4755's in-flight lease.
 
 Task 3797.  ``scripts/restart-all-orchestrators.sh`` resolves its ``CLOCK_FILE``
 from ``$ORCH_FLEET_DEPLOY_CLOCK``, defaulting to
@@ -53,6 +54,26 @@ session-scoped autouse fixture wiring them — and the same reason for living
 here: the defence must be suite-wide and impossible to opt out of, because the
 defect class is "a spawner that forgets the env var" and the next one has not
 been written yet.
+
+Task 4755 widened the defence from clocks to fleet-redeploy coordination state
+generally, by registering its IN-FLIGHT LEASE
+(``data/orchestrator/fleet_redeploy_lease.json``, env ``ORCH_FLEET_LEASE``) in
+the same table.  It gets the REDIRECT half of this defence and deliberately not
+the change-detection half — ``REDIRECT_ONLY_RELPATHS`` implements that split and
+the comment at ``FLEET_LEASE_RELPATH`` states why, once.  Do not restate it
+here.
+
+Task 5299 closed an asymmetry the guard's own message used to invite: the
+GUARD above is autoused into all nine conftests that import this module, but
+until this task the MITIGATION — redirecting ``ORCH_FLEET_DEPLOY_CLOCK`` and
+``FM_DEPLOY_CLOCK`` at a tmp file — existed only in
+``scripts/tests/conftest.py``.  Any other suite (``shared/tests``,
+``escalation/tests``, ...) that happened to be running when a REAL fleet
+redeploy fired watched the live path with nothing pointing it away, and failed
+for a cause entirely outside that task's control (incident esc-4892-7).  The
+redirect now lives inside ``_df_deploy_clocks_unwritten`` itself, below, rather
+than in a second fixture every conftest would need to import on top of the
+first — the shape that produced the gap in the first place.
 
 Unlike the ceiling, this one guards TWO roots when it runs inside a task
 worktree: that worktree AND the main checkout enclosing it.  The bash script
@@ -266,6 +287,7 @@ together by
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import enum
 import json
 import math
@@ -275,9 +297,9 @@ import subprocess
 import time
 import uuid
 import warnings
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, assert_never
 
 import pytest
 
@@ -457,12 +479,13 @@ def _df_git_ceiling_at_basetemp(tmp_path_factory: pytest.TempPathFactory):
 # Deploy-clock isolation (task 3797)
 # ---------------------------------------------------------------------------
 
-# Both entries are MIN-INTERVAL deploy clocks: scripts/orchestrator-watchdog.py
-# reads each as "this component was redeployed at <ts>" and SKIPS its staleness
-# pass while the corresponding min-interval window is open (8h by default —
-# ORCH_RESTART_MIN_INTERVAL_SECS / FM_RESTART_MIN_INTERVAL_SECS). Falsifying
-# either one therefore SUPPRESSES a staleness backstop for the rest of the day,
-# invisibly and with every test still green.
+# The first two entries are MIN-INTERVAL deploy clocks:
+# scripts/orchestrator-watchdog.py reads each as "this component was redeployed
+# at <ts>" and SKIPS its staleness pass while the corresponding min-interval
+# window is open (8h by default — ORCH_RESTART_MIN_INTERVAL_SECS /
+# FM_RESTART_MIN_INTERVAL_SECS). Falsifying either one therefore SUPPRESSES a
+# staleness backstop for the rest of the day, invisibly and with every test
+# still green.
 #
 # The fused-memory clock is included even though only the fleet clock has
 # actually been falsified so far, because it is the identical defect class, not
@@ -474,9 +497,85 @@ def _df_git_ceiling_at_basetemp(tmp_path_factory: pytest.TempPathFactory):
 # LITERALS, not imports: see the module docstring's import constraint. All four
 # mirrors of these paths are pinned together by
 # tests/scripts/test_orchestrator_watchdog.py::test_fleet_deploy_clock_path_matches_across_tiers.
-PROTECTED_DEPLOY_CLOCK_RELPATHS: tuple[str, ...] = (
-    'data/orchestrator/last_redeploy_orchestrator.json',
-    'data/fused-memory/last_redeploy_fused_memory.json',
+#
+# Each clock is NAMED as well as tabulated, so a reader — and the fleet-clock
+# fixture at the bottom of this section — can identify one by MEANING rather
+# than by its position in the table. Position carries no identity here: the
+# ordering below is the order deploy_clock_violation_reason reports offenders
+# in, and a future reorder for message-reading reasons must not silently
+# repoint anything that meant "the fleet clock, not the fused-memory one".
+FLEET_DEPLOY_CLOCK_RELPATH = 'data/orchestrator/last_redeploy_orchestrator.json'
+FM_DEPLOY_CLOCK_RELPATH = 'data/fused-memory/last_redeploy_fused_memory.json'
+
+# NOT a clock — task 4755's IN-FLIGHT LEASE, written by
+# scripts/restart-all-orchestrators.sh while a fleet sweep is running and
+# removed on every catchable exit path. It gets the REDIRECT half of this
+# section's defence and deliberately NOT the change-detection half; the split
+# is stated here once, and REDIRECT_ONLY_RELPATHS below is what implements it.
+#
+# REDIRECT: yes, and it is what a lease actually needs. Its exposure is a TEST
+# spawning the producer without $ORCH_FLEET_LEASE set, and a lease is exposed
+# in BOTH directions where a clock is exposed in one — one left behind
+# SUPPRESSES real redeploys until the max-age bound expires, and a
+# lease_release run against the live path DELETES a genuine in-flight sweep's
+# lease. Pointing the var at a tmp file removes that at the source. Registered
+# in the table below rather than given a parallel fixture precisely because
+# that table exists to make two structures naming different files (or
+# different vars) for the same thing unrepresentable (heuristic 11, SPOT).
+#
+# CHANGE DETECTION: no, and it CANNOT work for a lease, for two independent
+# reasons. (i) deploy_clock_guard_roots deliberately watches the MAIN checkout
+# as well as this one, and a real sweep creates, per-unit rewrites and removes
+# the live lease there for its whole duration — so a real sweep IS a benign
+# external write, which is the only reason that root is watched at all, and a
+# verify run straddling either end of one would fail an innocent branch
+# (REWRITTEN / DELETED / CREATED). That is the false-positive class task 4823
+# closed, with a far wider window than a clock, which moves once and
+# instantaneously. (ii) Unlike a clock, no provenance in the body could rescue
+# it: the DELETED case has after=None and leaves nothing to attribute.
+#
+# ACCEPTED RESIDUAL, named rather than left to be discovered: a spawner that
+# HARDCODES the lease path instead of reading $ORCH_FLEET_LEASE is no longer
+# detected. Nothing in the repo does that, and what keeps it true is the
+# four-way drift pin plus the per-test monkeypatch.setenv('ORCH_FLEET_LEASE',
+# ...) discipline the existing lease tests follow.
+#
+# Its four mirrors are pinned by
+# tests/scripts/test_orchestrator_watchdog.py::test_fleet_lease_path_matches_across_tiers,
+# and the behaviour above by
+# tests/scripts/test_deploy_clock_isolation.py::TestALeaseOnlyChangeIsNeverReported.
+FLEET_LEASE_RELPATH = 'data/orchestrator/fleet_redeploy_lease.json'
+
+# The env var a forgetful spawner needed to set to avoid stamping each protected
+# relpath — and, since task 5299, the SINGLE table everything else in this
+# section derives from: the watched-relpath tuple below, the failure message
+# (which names the fix) and the suite-wide redirect fixture all read it, so no
+# two of them can name a different var — or a different SET of files — for the
+# same clock. Task 5299 folded a second table doing this by hand with an
+# `if 'fused-memory' in relpath` check into this one.
+PROTECTED_DEPLOY_CLOCK_ENV_VARS: dict[str, str] = {
+    FLEET_DEPLOY_CLOCK_RELPATH: 'ORCH_FLEET_DEPLOY_CLOCK',
+    FM_DEPLOY_CLOCK_RELPATH: 'FM_DEPLOY_CLOCK',
+    FLEET_LEASE_RELPATH: 'ORCH_FLEET_LEASE',
+}
+
+# Which entries of the table above get the REDIRECT half of the defence only,
+# and not change detection. A NAMED, structured statement of that split rather
+# than an `if 'lease' in relpath` string test (heuristic 12) and rather than a
+# second literal list of files (which is exactly what task 5299 folded away).
+# The reasoning for the one member is at FLEET_LEASE_RELPATH above.
+REDIRECT_ONLY_RELPATHS: frozenset[str] = frozenset({FLEET_LEASE_RELPATH})
+
+# DERIVED, not a second literal list (heuristic 11, SPOT): a protected clock the
+# guard watches but the table above omits would have made the message path raise
+# KeyError from the session-teardown `finally` below — replacing the actionable
+# 3am message with a traceback at exactly the moment a REAL clock was falsified.
+# Deriving makes that state unrepresentable. Dicts preserve insertion order, so
+# the reporting order documented above is retained.
+PROTECTED_DEPLOY_CLOCK_RELPATHS: tuple[str, ...] = tuple(
+    relpath
+    for relpath in PROTECTED_DEPLOY_CLOCK_ENV_VARS
+    if relpath not in REDIRECT_ONLY_RELPATHS
 )
 
 # A real clock body is ~70 bytes (`{"ts": <int>, "iso": "<timestamp>"}`), so this
@@ -510,11 +609,11 @@ def deploy_clock_guard_roots(
     main-checkout one — was accepted deliberately, and
     :func:`deploy_clock_change_report` has since removed most of it by
     attributing such a stamp rather than failing on it.  What remains is the
-    fail-closed default for a stamp bearing NO provenance, so widening the
-    guarded roots is still a decision about how loudly to fail on an
-    unattributable change — and it is why the message prints the absolute path
-    plus both observed bodies, so "real redeploy" stays one glance away from
-    "test bug" for exactly that residue.
+    fail-closed default for a stamp bearing NO provenance or another run's
+    token, so widening the guarded roots is still a decision about how loudly
+    to fail on a change this run cannot clear — and it is why the message
+    prints the absolute path plus both observed bodies, so "real redeploy"
+    stays one glance away from "test bug" for exactly that residue.
 
     Own checkout FIRST and deduped, so the message names the run's own checkout
     when both were touched, and so a suite running in the main checkout (where
@@ -572,6 +671,23 @@ def deploy_clock_snapshot(
 PYTEST_SESSION_TOKEN_ENV = 'DF_PYTEST_SESSION_TOKEN'
 CLOCK_PROVENANCE_SOURCE_KEY = 'source'
 CLOCK_PROVENANCE_SESSION_KEY = 'pytest_session'
+
+
+def run_session_token(workerinput: Mapping[str, object] | None) -> str:
+    """The deploy-clock token for this pytest RUN; never falsy.
+
+    xdist hands every worker of one run the same ``workerinput['testrunuid']``
+    (pytest-xdist ``workermanage``/``remote``), so the workers adopt it: with
+    per-worker tokens a sibling worker's stamp read as another session's (task
+    5282).  A plain or nested session has no *workerinput* and mints its own
+    ``uuid4().hex``, as does a worker whose uid is empty or not a ``str`` — an
+    empty token would make every test-spawned writer stamp ``''`` and read as a
+    real redeploy.
+    """
+    testrunuid = (workerinput or {}).get('testrunuid')
+    if isinstance(testrunuid, str) and testrunuid:
+        return testrunuid
+    return uuid.uuid4().hex
 
 
 class DeployClockRedeployWarning(UserWarning):
@@ -706,6 +822,48 @@ class ClockVerdict(enum.Enum):
     EXTERNAL_REDEPLOY = 'external_redeploy'
 
 
+class _StampAttribution(enum.Enum):
+    """Who a provenance-bearing stamp says wrote it, relative to this run."""
+
+    NO_RUN_TOKEN = 'no_run_token'
+    THIS_RUN = 'this_run'
+    OTHER_RUN = 'other_run'
+    NO_PYTEST_ANCESTOR = 'no_pytest_ancestor'
+
+
+@dataclasses.dataclass(frozen=True)
+class _AttributedStamp:
+    """A stamp's self-declared writer and its attribution against this run."""
+
+    source: str
+    attribution: _StampAttribution
+
+
+def _attribute_stamp(
+    entry: tuple[bytes, int] | None, session_token: str | None,
+) -> _AttributedStamp | None:
+    """Classify one snapshot entry against this run's *session_token*.
+
+    ``None`` when the stamp carries no usable provenance — the fail-closed
+    value, as in :func:`clock_stamp_provenance`.  The falsy-token check
+    precedes the empty-stamp one: an unstamped run must fail closed, never read
+    an empty stamp token as "no pytest ancestor".
+    """
+    provenance = clock_stamp_provenance(entry)
+    if provenance is None:
+        return None
+    stamp_token = provenance[CLOCK_PROVENANCE_SESSION_KEY]
+    if not session_token:
+        attribution = _StampAttribution.NO_RUN_TOKEN
+    elif not stamp_token:
+        attribution = _StampAttribution.NO_PYTEST_ANCESTOR
+    elif stamp_token == session_token:
+        attribution = _StampAttribution.THIS_RUN
+    else:
+        attribution = _StampAttribution.OTHER_RUN
+    return _AttributedStamp(provenance[CLOCK_PROVENANCE_SOURCE_KEY], attribution)
+
+
 def deploy_clock_change_report(
     before: dict[str, tuple[bytes, int] | None],
     after: dict[str, tuple[bytes, int] | None],
@@ -721,8 +879,8 @@ def deploy_clock_change_report(
         The change cannot be attributed to anything but this run, or cannot be
         attributed at all.  This is the DEFAULT — today's behaviour, unchanged —
         and it covers a provenance-free (pre-4823) body, an unparseable one, a
-        DELETED file, a missing *session_token*, a stamp carrying THIS session's
-        token, and a stamp carrying some other pytest session's token.
+        DELETED file, a missing *session_token*, a stamp carrying THIS run's
+        token, and a stamp carrying another pytest RUN's token.
     :attr:`ClockVerdict.EXTERNAL_REDEPLOY`
         A provenance-aware writer stamped the clock with an EMPTY session token,
         i.e. no pytest session was an ancestor of the write.  A REAL fleet or
@@ -749,13 +907,14 @@ def deploy_clock_change_report(
     would silently forgive every write the first time the fixture failed to
     stamp one.
 
-    A FOREIGN token is deliberately left failing rather than downgraded to
-    "somebody else's problem".  Under ``merge_verify_breadth: "full"`` many
-    worktrees run this suite against the same main checkout, so a foreign token
-    means another session falsified a shared clock — but that session's OWN
-    guard sees its own token and fails, so the signal is never lost, and this
-    run must not become the arbiter of another run's bug on the strength of a
-    token it cannot verify.
+    A FOREIGN token (neither empty nor this run's) stays
+    :attr:`~ClockVerdict.FALSIFIED`, under its own CONCURRENT-session headline
+    and remedy (task 5282).  It is not a warning because the writing run may be
+    killed before its own teardown reports anything, and because a nested
+    session or a test that sets ``$DF_PYTEST_SESSION_TOKEN`` itself stamps a
+    foreign token from inside this run.  Every xdist worker of one run shares
+    one token (:func:`run_session_token`), so "foreign" means a writer outside
+    this pytest invocation.
 
     PRECEDENCE: :attr:`~ClockVerdict.FALSIFIED` anywhere outranks
     :attr:`~ClockVerdict.EXTERNAL_REDEPLOY` anywhere, so EVERY protected relpath
@@ -804,10 +963,11 @@ def deploy_clock_change_report(
             f'observed before: {_describe_clock_entry(before_entry)}\n'
             f'observed after:  {_describe_clock_entry(after_entry)}\n'
         )
-        provenance = clock_stamp_provenance(after_entry)
-        if provenance is not None and session_token and not provenance[
-            CLOCK_PROVENANCE_SESSION_KEY
-        ]:
+        stamp = _attribute_stamp(after_entry, session_token)
+        if (
+            stamp is not None
+            and stamp.attribution is _StampAttribution.NO_PYTEST_ANCESTOR
+        ):
             # Hold it, keep scanning: a later clock may still be falsified, and
             # that outranks this.  Only the FIRST benign change is kept, so the
             # reported one stays first in protected order.
@@ -815,23 +975,18 @@ def deploy_clock_change_report(
                 benign = (
                     ClockVerdict.EXTERNAL_REDEPLOY,
                     _external_redeploy_message(
-                        where, kind, observed,
-                        provenance[CLOCK_PROVENANCE_SOURCE_KEY],
+                        where, kind, observed, stamp.source,
                     ),
                 )
             continue
         return (
             ClockVerdict.FALSIFIED,
-            _falsified_message(
-                relpath, where, kind, observed, provenance, session_token,
-            ),
+            _falsified_message(relpath, where, kind, observed, stamp),
         )
     return benign
 
 
-def _clock_attribution_line(
-    provenance: dict[str, str] | None, session_token: str | None,
-) -> str:
+def _clock_attribution_line(stamp: _AttributedStamp | None) -> str:
     """One line saying what provenance the stamp carried and why it did not clear.
 
     Appended to the falsified message so a reader is never left guessing whether
@@ -839,7 +994,7 @@ def _clock_attribution_line(
     yours" and "nothing in this file says who wrote it" is the whole reason the
     two readings below can be told apart at all.
     """
-    if provenance is None:
+    if stamp is None:
         return (
             'Attribution: the stamp carries no usable provenance (no '
             f'{CLOCK_PROVENANCE_SOURCE_KEY!r}/{CLOCK_PROVENANCE_SESSION_KEY!r} '
@@ -847,27 +1002,37 @@ def _clock_attribution_line(
             'is treated as one. A provenance-bearing stamp written outside a '
             'pytest session would have been reported as a benign redeploy.'
         )
-    source = provenance[CLOCK_PROVENANCE_SOURCE_KEY]
-    token = provenance[CLOCK_PROVENANCE_SESSION_KEY]
-    if not session_token:
-        return (
-            f'Attribution: the stamp names {source!r} as its writer, but this '
-            f'run has no ${PYTEST_SESSION_TOKEN_ENV} of its own to compare it '
-            'against, so nothing here can be cleared. Fail-closed by design — '
-            'an unstamped token must never read as "every write is external".'
-        )
-    if token == session_token:
-        return (
-            f'Attribution: {source!r} wrote this stamp FROM INSIDE this run — it '
-            f'carries this run\'s own ${PYTEST_SESSION_TOKEN_ENV}, so a real '
-            'redeploy is ruled out and a test spawned the writer.'
-        )
-    return (
-        f'Attribution: {source!r} wrote this stamp from inside another pytest '
-        f'session (its ${PYTEST_SESSION_TOKEN_ENV} is not this run\'s). That '
-        'session\'s own guard fails on it too, so the signal is not lost here; '
-        'this run reports it rather than absolving a token it cannot verify.'
-    )
+    source = stamp.source
+    match stamp.attribution:
+        case _StampAttribution.NO_RUN_TOKEN:
+            return (
+                f'Attribution: the stamp names {source!r} as its writer, but '
+                f'this run has no ${PYTEST_SESSION_TOKEN_ENV} of its own to '
+                'compare it against, so nothing here can be cleared. '
+                'Fail-closed by design — an unstamped token must never read as '
+                '"every write is external".'
+            )
+        case _StampAttribution.THIS_RUN:
+            return (
+                f'Attribution: {source!r} wrote this stamp FROM INSIDE this run '
+                f'— it carries this run\'s own ${PYTEST_SESSION_TOKEN_ENV}, so '
+                'a real redeploy is ruled out and a test spawned the writer.'
+            )
+        case _StampAttribution.OTHER_RUN:
+            return (
+                f'Attribution: {source!r} wrote this stamp under a '
+                f'${PYTEST_SESSION_TOKEN_ENV} that is neither this run\'s nor '
+                'empty, so a real redeploy is ruled out and some other pytest '
+                'session ran the writer. This run reports it rather than '
+                'absolving a token it cannot verify.'
+            )
+        case _StampAttribution.NO_PYTEST_ANCESTOR:
+            raise ValueError(
+                'a stamp with no pytest ancestor is the benign verdict and has '
+                'no falsification attribution line'
+            )
+        case _:
+            assert_never(stamp.attribution)
 
 
 def _falsified_message(
@@ -875,40 +1040,80 @@ def _falsified_message(
     where: str,
     kind: str,
     observed: str,
-    provenance: dict[str, str] | None,
-    session_token: str | None,
+    stamp: _AttributedStamp | None,
 ) -> str:
-    """The accusing message — VERBATIM as before task 4823, plus one attribution line.
+    """The accusing message: one of two headlines sharing one signature string.
 
-    Kept byte-for-byte because it is the message four years of triage notes,
-    ``OPERATIONS.md`` and two end-to-end tests key on: the literal
-    ``'falsified a REAL deploy clock'`` is what
-    ``TestTheGuardFailsTheRunEndToEnd`` asserts on, in both directions.
+    The literal ``'falsified a REAL deploy clock'`` is in BOTH headlines because
+    triage notes, ``OPERATIONS.md`` and the end-to-end tests key on it, and
+    ``_external_redeploy_message`` must never contain it.  A stamp carrying
+    another run's token (task 5282) gets the CONCURRENT-session headline and
+    remedy; every other reading keeps this run's headline and remedy
+    byte-for-byte.  Both end with the attribution line.
     """
-    env_var = (
-        'FM_DEPLOY_CLOCK' if 'fused-memory' in relpath else 'ORCH_FLEET_DEPLOY_CLOCK'
-    )
+    if stamp is not None and stamp.attribution is _StampAttribution.OTHER_RUN:
+        headline = (
+            'a CONCURRENT pytest session, not this run, falsified a REAL '
+            'deploy clock'
+        )
+        remedy = _concurrent_session_remedy()
+    else:
+        headline = 'this test run falsified a REAL deploy clock'
+        remedy = _own_run_remedy(PROTECTED_DEPLOY_CLOCK_ENV_VARS[relpath])
     return (
-        f'this test run falsified a REAL deploy clock: {where} was {kind}.\n'
+        f'{headline}: {where} was {kind}.\n'
         + observed
         + 'scripts/orchestrator-watchdog.py reads that file as "this component '
         'was redeployed at <ts>" and SKIPS its staleness pass while the '
         'min-interval window is open (8h by default), so the stamp silently '
         'disarms staleness recovery for the rest of the day.\n'
+        + remedy
+        + _clock_attribution_line(stamp)
+    )
+
+
+def _own_run_remedy(env_var: str) -> str:
+    """The Fix and Benign-alternative paragraphs for a stamp this run may own.
+
+    The Fix names the suite-wide redirect in :func:`_df_deploy_clocks_unwritten`
+    (task 5299), not the ``scripts/tests`` conftest fixture that used to own it.
+    """
+    return (
         f'Fix (the usual cause): a test spawned a process that resolved its '
-        f'clock path from the environment and defaulted to the live checkout. '
-        f'Point {env_var} at a tmp file for the whole suite, as '
-        'scripts/tests/conftest.py::_df_fleet_deploy_clock_redirect does, or '
-        'per call, as tests/scripts/test_orchestrator_watchdog.py::'
-        '_boundary_run_drain_script does with its REQUIRED clock_file '
-        'parameter.\n'
+        f'clock path from the environment and reached the live checkout '
+        f'anyway. Since task 5299 the suite-wide redirect in '
+        f'df_pytest_isolation.py::_df_deploy_clocks_unwritten already points '
+        f'{env_var} at a tmp file for EVERY rootdir, so nobody "forgot to '
+        'set it" — the spawner either built its subprocess env without '
+        'copying os.environ, or hardcoded the path. Copy os.environ (as '
+        'scripts/tests/test_restart_all_orchestrators.py::_run_script does), '
+        'or pass the clock path explicitly per call (as tests/scripts/'
+        'test_orchestrator_watchdog.py::_boundary_run_drain_script does with '
+        'its REQUIRED clock_file parameter).\n'
         'Benign alternative, worth ruling out first in a machine-operated '
         'checkout: a REAL fleet redeploy (the deployed watchdog, or an '
         'operator running restart-all-orchestrators.sh --drain) fired while '
         'this suite was running. That is a genuine stamp and not a test bug — '
         'the two bodies printed above ARE that comparison: check the {ts, iso} '
         'against the deploy you expect.\n'
-        + _clock_attribution_line(provenance, session_token)
+    )
+
+
+def _concurrent_session_remedy() -> str:
+    """The remedy for a stamp carrying another run's token.
+
+    No real-redeploy alternative: a non-empty token already rules one out.
+    """
+    return (
+        'This run is most likely NOT the writer: re-run it. The writer is the '
+        f'pytest run whose token is the {CLOCK_PROVENANCE_SESSION_KEY!r} value '
+        'in the "observed after" body above, and that run\'s own guard prints '
+        'the same body — search the concurrent verify logs for that token and '
+        'fix that branch\'s spawner. If no log carries it, that run was killed '
+        'before its teardown and this report is the only record.\n'
+        'Rule out first: a nested pytest session spawned by this run (it mints '
+        f'its own token), or a test here that sets ${PYTEST_SESSION_TOKEN_ENV} '
+        'itself before running a real writer.\n'
     )
 
 
@@ -955,10 +1160,10 @@ def deploy_clock_violation_reason(
 
     Reports the FIRST offending relpath in :data:`PROTECTED_DEPLOY_CLOCK_RELPATHS`
     order, what happened to it, the before/after readings actually observed, and
-    both readings of that observation — a test that forgot to redirect its clock
-    (the common case, with the concrete remedy) and a genuine concurrent redeploy
-    in a machine-operated checkout (not a bug at all).  Naming only the first
-    would invite the reader to assume whichever one they thought of first.
+    both readings of that observation — a spawner that escaped the suite-wide
+    redirect (the common case, with the concrete remedy) and a genuine concurrent
+    redeploy in a machine-operated checkout (not a bug at all).  Naming only the
+    first would invite the reader to assume whichever one they thought of first.
 
     *root* is optional and cosmetic-but-load-bearing: pass the checkout the
     snapshots were taken against and the message names the ABSOLUTE file.  A run
@@ -976,7 +1181,9 @@ def deploy_clock_violation_reason(
 
 
 @pytest.fixture(scope='session', autouse=True)
-def _df_deploy_clocks_unwritten():
+def _df_deploy_clocks_unwritten(
+    tmp_path_factory: pytest.TempPathFactory, pytestconfig: pytest.Config,
+):
     """Fail the run if it falsified a REAL deploy clock in any guarded checkout.
 
     The roots come from :func:`deploy_clock_guard_roots`, seeded with
@@ -989,11 +1196,13 @@ def _df_deploy_clocks_unwritten():
     spawned it.  So the guard watches exactly the files a forgetful spawner would
     hit, in every checkout it could hit them in.
 
-    ATTRIBUTES rather than accuses: it stamps a fresh per-session token into
+    ATTRIBUTES rather than accuses: it stamps one token per pytest run, shared
+    by its xdist workers (:func:`run_session_token`), into
     :data:`PYTEST_SESSION_TOKEN_ENV` and hands it to
     :func:`deploy_clock_change_report` at teardown, which decides what a moved
     clock means — fail, or warn with :class:`DeployClockRedeployWarning` and
-    leave the run green — and states why.
+    leave the run green — and states why, including why another run's token
+    still fails.
 
     The token lives in the ENVIRONMENT for the same reason
     :data:`LEAK_TOKEN_ENV` does, and that fixture established the mechanism:
@@ -1022,12 +1231,56 @@ def _df_deploy_clocks_unwritten():
     A failure raised in teardown surfaces as a run-level ERROR with a non-zero
     exit code even when every test passed.  That is the intended loudness: the
     damage is to production state, not to any one test's result.
+
+    THE MITIGATION LIVES HERE TOO, as of task 5299.  Before task 3797's guard
+    above ever fires, EVERY entry of :data:`PROTECTED_DEPLOY_CLOCK_ENV_VARS`
+    is pointed at a tmp file for the WHOLE session — the same redirect
+    ``scripts/tests/conftest.py::_df_fleet_deploy_clock_redirect`` used to apply
+    for that one rootdir only.  The guard above is wired into all NINE
+    conftests that import this module (root plus the eight subproject
+    rootdirs), so a test that spawns ``restart-all-orchestrators.sh`` or
+    ``scripts/orchestrator-watchdog.py`` from ANY of them — not just
+    ``scripts/tests`` — now inherits a redirected env var instead of falling
+    through to the live checkout default. Folding the redirect into this
+    already-universally-wired fixture, rather than adding a second fixture that
+    every conftest would need to import separately, is what keeps mitigation
+    and guard from drifting apart again (heuristic 11, SPOT) — a second,
+    independently-wired mitigation fixture is exactly the shape that produced
+    the scripts-tests-only gap this task closes.
+
+    Deliberately does NOT close the gap for a GENUINE external redeploy: a real
+    ``restart-all-orchestrators.sh --drain`` (the deployed watchdog, or an
+    operator) runs as its own process with its own environment and writes the
+    literal default path directly, regardless of what this session's
+    ``os.environ`` says. This redirect only reaches processes THIS session
+    spawns. The guard's roots therefore still watch the literal live paths, and
+    a concurrent genuine redeploy still moves one of them mid-run — that case
+    is what the ATTRIBUTION above (task 4823) is for: a provenance-bearing
+    stamp with no pytest ancestor is downgraded to a warning rather than
+    failing the run. The two defences are complementary, not redundant: the
+    redirect keeps this session's own spawners off the live clocks, and
+    attribution tells the guard that whatever still moved them was not us.
+
+    Restored EXACTLY on teardown — popping each key when it was absent rather
+    than setting an empty string, for the same reason
+    ``_df_git_ceiling_at_basetemp`` restores absence by deletion: an empty
+    value is not "unset" to the shell scripts' ``${VAR:-…}`` defaults.
     """
-    token = uuid.uuid4().hex
+    token = run_session_token(getattr(pytestconfig, 'workerinput', None))
     prior = os.environ.get(PYTEST_SESSION_TOKEN_ENV)
     os.environ[PYTEST_SESSION_TOKEN_ENV] = token
     roots = deploy_clock_guard_roots(Path(__file__).resolve().parent)
     before = [(root, deploy_clock_snapshot(root)) for root in roots]
+    saved_env = {
+        env_var: os.environ.get(env_var)
+        for env_var in PROTECTED_DEPLOY_CLOCK_ENV_VARS.values()
+    }
+    redirect_dir = tmp_path_factory.mktemp('deploy-clock-redirect')
+    # THE SUITE-WIDE REDIRECT (task 5299) — the answer to "who sets
+    # ORCH_FLEET_DEPLOY_CLOCK / FM_DEPLOY_CLOCK for this suite?", which this
+    # fixture's name (about DETECTION) does not advertise. Grep lands here.
+    for relpath, env_var in PROTECTED_DEPLOY_CLOCK_ENV_VARS.items():
+        os.environ[env_var] = str(redirect_dir / Path(relpath).name)
     try:
         yield
     finally:
@@ -1038,6 +1291,11 @@ def _df_deploy_clocks_unwritten():
             os.environ.pop(PYTEST_SESSION_TOKEN_ENV, None)
         else:
             os.environ[PYTEST_SESSION_TOKEN_ENV] = prior
+        for env_var, saved in saved_env.items():
+            if saved is None:
+                os.environ.pop(env_var, None)
+            else:
+                os.environ[env_var] = saved
         for root, snapshot in before:
             report = deploy_clock_change_report(
                 snapshot, deploy_clock_snapshot(root),
@@ -1050,6 +1308,36 @@ def _df_deploy_clocks_unwritten():
                 warnings.warn(message, DeployClockRedeployWarning, stacklevel=1)
                 continue
             pytest.fail(message, pytrace=False)
+
+
+@pytest.fixture(scope='session')
+def _df_fleet_deploy_clock_redirect(_df_deploy_clocks_unwritten) -> Path:
+    """The ``ORCH_FLEET_DEPLOY_CLOCK`` path this session's redirect resolved to.
+
+    NOT autouse: the redirect itself is applied unconditionally by
+    :func:`_df_deploy_clocks_unwritten`, which every conftest that imports this
+    module already binds.  This fixture exists only so a test that wants to
+    assert ON the redirected path (rather than merely benefit from it) can take
+    it BY NAME instead of reading ``os.environ`` bare — deleting the fixture
+    then fails collection with a message naming it, instead of quietly passing
+    off a leftover env var, mirroring ``_df_fleet_dir_redirect``'s convention.
+
+    Requesting ``_df_deploy_clocks_unwritten`` as a parameter (rather than
+    relying on its autouse ordering) makes the dependency explicit: pytest
+    resolves it before this fixture's body runs, so the env var this reads is
+    guaranteed already redirected.
+
+    Formerly ``scripts/tests/conftest.py``'s own fixture (task 3797); promoted
+    here and generalized to the whole-session redirect (task 5299) so
+    ``scripts/tests`` is no longer the only rootdir that mitigates what the
+    guard above catches everywhere.
+
+    Identifies its clock by :data:`FLEET_DEPLOY_CLOCK_RELPATH`, never by
+    position in :data:`PROTECTED_DEPLOY_CLOCK_RELPATHS`: that tuple's order is
+    the guard message's reporting order, so a reorder made for readability
+    must not silently repoint this fixture at the fused-memory clock.
+    """
+    return Path(os.environ[PROTECTED_DEPLOY_CLOCK_ENV_VARS[FLEET_DEPLOY_CLOCK_RELPATH]])
 
 
 # ---------------------------------------------------------------------------
@@ -1195,10 +1483,22 @@ def load_scaled_grace(base_secs: int, *, cap_secs: int = 30) -> int:
     failing the caller outright would trade an inert budget for a red suite.
 
     LOAD-PER-CORE, not worker count, is the right signal for the two test
-    roots that use this: they run SERIALLY (no xdist, no random ordering), so
-    the contention that stretches their subprocess spawns is EXTERNAL -- other
-    suites' workers on the same 32-core host. A worker-count heuristic would
-    see nothing and scale by 1.
+    roots that use this and for ``orchestrator/tests``' row discovery ceiling,
+    which delegates here, and it STAYS right now that they run under xdist.
+    Task 5408 put ``-n auto --dist loadgroup`` on the ``scripts`` module's
+    test_command, which is the command that runs both ``tests/scripts/`` and
+    ``scripts/tests/``, so the clause this paragraph used to carry -- "they run
+    SERIALLY (no xdist, no random ordering)" -- is false and is corrected rather
+    than softened.
+    Nothing about the function changes, for two independent reasons. Loadavg is
+    a WHOLE-HOST signal, so it already counts this suite's own workers
+    alongside every other suite's -- the contention is no longer purely
+    EXTERNAL, but it is still fully visible, which is all this reads it for.
+    And the result is a FLOOR: at ``factor == 1.0`` it returns ``base_secs``
+    exactly, so every call site can only be LENGTHENED under contention, never
+    shortened. A worker-count heuristic would still be the wrong signal: it
+    would see this root's own 8 workers and nothing of the other suites sharing
+    the 32-core host.
 
     Returns an ``int``: callers stringify these budgets into env vars that
     bash's integer operators compare, and those reject ``30.0`` -- the same
@@ -1232,7 +1532,7 @@ def _unsafe_pgid_reason(pgid: int) -> str | None:
     """Return why *pgid* is unsafe to ``killpg``, or ``None`` if it is fine.
 
     Ported (not imported — see the module docstring's stdlib-only constraint)
-    from ``shared.proc_group._unsafe_pgid_reason``, which is the canonical
+    from ``shared.proc_group.unsafe_pgid_reason``, which is the canonical
     async sibling of this function and the place to look for the full history.
 
     This is not belt-and-braces. That module's docstring records task 845: a
@@ -1243,9 +1543,9 @@ def _unsafe_pgid_reason(pgid: int) -> str | None:
     exists to reap are themselves reparented to ``systemd --user``.
 
     Takes no ``proc_pid`` companion argument, unlike the ``shared`` version:
-    the single caller captures ``pgid = p.pid`` at the instant of spawn and
-    passes that same value here, so a ``pgid != proc.pid`` check would compare
-    a variable against itself.
+    every pgid reaching here is the ``p.pid`` that :func:`_spawn_in_new_session`
+    captured at the instant of spawn, so a ``pgid != proc.pid`` check would
+    compare a variable against itself.
     """
     if pgid <= 1:
         return f'pgid <= 1 ({pgid!r})'
@@ -1324,34 +1624,11 @@ def run_in_new_session(
     their ``_decode`` / ``_boundary_decode`` helpers, which normalise both
     ``bytes`` and ``str`` and so keep working unchanged).
     """
-    p = subprocess.Popen(
-        cmd,
-        env=env,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=text,
-        start_new_session=True,
-    )
-    # IMMEDIATELY, and never re-derived: this is the whole task-845 defence.
-    pgid = p.pid
+    p, pgid = _spawn_in_new_session(cmd, env=env, cwd=cwd, text=text)
     try:
         out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as expired:
-        _kill_process_group(p, pgid)
-        try:
-            out, err = p.communicate(timeout=_POST_KILL_DRAIN_SECS)
-        except subprocess.TimeoutExpired:
-            # Something still holds the pipe open despite the group kill.
-            # Give up on the output rather than on the timeout: the caller
-            # asked for a bound and gets one.
-            #
-            # Deliberately NOT bound with `as`: Python unbinds an `as` name at
-            # the end of its except block, so reusing the name here would clear
-            # the binding the re-raise below depends on.
-            p.kill()
-            _release_abandoned_child(p)
-            out, err = ('', '') if text else (b'', b'')
+        out, err = _stop_group_and_drain(p, pgid, text=text)
         # `expired.timeout`, not the `timeout` parameter, and not by accident.
         # The parameter is `float | None`, but typeshed pins both
         # `TimeoutExpired.__init__(cmd, timeout: float, ...)` and the attribute
@@ -1365,11 +1642,126 @@ def run_in_new_session(
     return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 
+# How often run_in_new_session_until re-reads its condition while the child
+# runs. A retried `communicate()` loses no output, so this only sets latency.
+_CONDITION_POLL_SLICE_SECS = 0.05
+
+
+@dataclasses.dataclass(frozen=True)
+class RunUntilOutcome:
+    """How a :func:`run_in_new_session_until` run ended, short of its deadline.
+
+    ``stopped_on_condition`` is False when the child exited on its own first,
+    in which case ``completed`` is exactly what ``run_in_new_session`` would
+    have returned. When True, the group was stopped mid-run and ``completed``
+    carries the output printed up to the stop.
+    """
+
+    completed: subprocess.CompletedProcess
+    stopped_on_condition: bool
+
+
+def run_in_new_session_until(
+    cmd: list[str],
+    *,
+    condition: Callable[[], bool],
+    timeout: float,
+    env: dict[str, str] | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    text: bool = True,
+) -> RunUntilOutcome:
+    """:func:`run_in_new_session`, stopping the whole group once *condition* holds.
+
+    For a proof that must observe the child MID-RUN: "the script is still
+    waiting" is established by stopping it on an observable readiness
+    condition (a ledger the script writes, a file it creates) instead of by a
+    wall-clock kill, so how fast the host happens to be cannot decide the
+    verdict. *timeout* is a must-not-hang deadline, paid only when the
+    condition never holds; it raises ``TimeoutExpired`` with the partial
+    output, exactly as ``run_in_new_session`` does.
+
+    Spawned and contained exactly as ``run_in_new_session`` is, through the
+    same stop, and every exit path stops the group -- including an exception
+    raised by *condition* itself, which then propagates.
+    """
+    p, pgid = _spawn_in_new_session(cmd, env=env, cwd=cwd, text=text)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                out, err = p.communicate(timeout=_CONDITION_POLL_SLICE_SECS)
+            except subprocess.TimeoutExpired:
+                pass
+            else:
+                completed = subprocess.CompletedProcess(cmd, p.returncode, out, err)
+                return RunUntilOutcome(completed, stopped_on_condition=False)
+            stopped_on_condition = condition()
+            if stopped_on_condition or time.monotonic() >= deadline:
+                break
+    except BaseException:
+        with contextlib.suppress(Exception):
+            _stop_group_and_drain(p, pgid, text=text)
+        raise
+    out, err = _stop_group_and_drain(p, pgid, text=text)
+    if not stopped_on_condition:
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+    completed = subprocess.CompletedProcess(cmd, p.returncode, out, err)
+    return RunUntilOutcome(completed, stopped_on_condition=True)
+
+
+def _spawn_in_new_session(
+    cmd: list[str],
+    *,
+    env: dict[str, str] | None,
+    cwd: str | os.PathLike[str] | None,
+    text: bool,
+) -> tuple[subprocess.Popen, int]:
+    """Spawn *cmd* as its own session leader; return it with its FROZEN pgid.
+
+    The spawn half of the containment both spawners share, paired with
+    :func:`_stop_group_and_drain` as the stop half. The reasoning for the
+    frozen pgid is :func:`run_in_new_session`'s docstring.
+    """
+    p = subprocess.Popen(
+        cmd,
+        env=env,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=text,
+        start_new_session=True,
+    )
+    # IMMEDIATELY, and never re-derived: this is the whole task-845 defence.
+    return p, p.pid
+
+
+def _stop_group_and_drain(
+    p: subprocess.Popen, pgid: int, *, text: bool,
+) -> tuple[Any, Any]:
+    """SIGKILL the captured *pgid*, then collect what the child printed, BOUNDED.
+
+    The stop half of the containment both spawners share, paired with
+    :func:`_spawn_in_new_session` as the spawn half; the reasoning for each
+    half of the stop (the frozen pgid, the bounded drain) is
+    :func:`run_in_new_session`'s docstring.
+    """
+    _kill_process_group(p, pgid)
+    try:
+        return p.communicate(timeout=_POST_KILL_DRAIN_SECS)
+    except subprocess.TimeoutExpired:
+        # Something still holds the pipe open despite the group kill. Give up
+        # on the output rather than on the bound: the caller asked for one and
+        # gets it.
+        p.kill()
+        _release_abandoned_child(p)
+        return ('', '') if text else (b'', b'')
+
+
 def _release_abandoned_child(p: subprocess.Popen) -> None:
     """Reap *p* and close its pipes after a drain we gave up on.
 
-    Reachable only from :func:`run_in_new_session`'s last-resort branch, where
-    the bounded second ``communicate()`` itself timed out. Nothing has waited on
+    Reachable only from :func:`_stop_group_and_drain`'s last-resort branch,
+    where the bounded second ``communicate()`` itself timed out. Nothing has waited on
     the child there and nothing has closed the two pipe fds ``Popen`` opened for
     it, so without this they survive until ``Popen.__del__`` runs — a
     ``ResourceWarning`` plus two leaked descriptors PER OCCURRENCE, inside the
@@ -1377,9 +1769,9 @@ def _release_abandoned_child(p: subprocess.Popen) -> None:
     branch taken when something is STILL holding those pipes, i.e. the one most
     likely to repeat within a single run.
 
-    Every step is best-effort and swallowed: the caller is already on its way to
-    raising ``TimeoutExpired``, and replacing a legible timeout with a cleanup
-    error would hide the thing the caller actually needs to see.
+    Every step is best-effort and swallowed: the caller is already on its way
+    out of the spawn, usually raising ``TimeoutExpired``, and replacing a legible
+    timeout with a cleanup error would hide the thing the caller needs to see.
     """
     with contextlib.suppress(Exception):
         p.wait(timeout=_ABANDONED_CHILD_REAP_SECS)
@@ -1393,10 +1785,10 @@ def _kill_process_group(p: subprocess.Popen, pgid: int) -> None:
     """SIGKILL the captured *pgid*, degrading to the direct child if unsure.
 
     Every failure mode degrades to ``p.kill()`` rather than propagating: the
-    caller is already on its way to raising ``TimeoutExpired``, and masking
-    that with a signalling error would replace a legible timeout with a
-    confusing one. ``ProcessLookupError`` is the ordinary case of a child that
-    exited between the timeout and the signal.
+    caller is already on its way out of the spawn, usually raising
+    ``TimeoutExpired``, and masking that with a signalling error would replace
+    a legible timeout with a confusing one. ``ProcessLookupError`` is the
+    ordinary case of a child that exited between the timeout and the signal.
     """
     reason = _unsafe_pgid_reason(pgid)
     if reason is not None:
@@ -1502,6 +1894,48 @@ LEAK_TOKEN_ENV = 'DF_PYTEST_LEAK_TOKEN'
 
 # The one script whose survivors are worth failing a run over.
 DRAIN_SCRIPT_CMDLINE_MARKER = 'restart-all-orchestrators.sh'
+
+
+def read_drain_poll_trace(
+    path: str | os.PathLike[str], *, complete_only: bool = False,
+) -> list[tuple[str, str]]:
+    """Read the drain gate's poll ledger as one ``(verdict, unit)`` pair per poll.
+
+    ``scripts/restart-all-orchestrators.sh::drain_check_verdict`` appends one
+    ``<verdict>\\t<unit>`` record per drain poll when
+    ``ORCH_DRAIN_POLL_TRACE_FILE`` is set, AFTER python3 has read the
+    heartbeat. So the ledger's LENGTH is a load-independent count of what the
+    gate actually did, which is what lets a test assert on the script's
+    progress instead of on how long its own clock ran (task 4486). It lives
+    here because both test roots read it and cannot import each other's test
+    modules.
+
+    An absent ledger reads as ``[]``, so a caller whose ledger never appeared
+    fails on its own diagnostic rather than on a bare ``FileNotFoundError``.
+
+    ``complete_only`` is for a reader racing the script: it drops the text
+    after the last newline, a record still being appended, which must never
+    count. A finished ledger is read whole, so a torn final record fails the
+    field check instead of vanishing. The failure is a ``ValueError``, not
+    ``pytest.fail``: a watcher thread collecting ``Exception`` must see it,
+    and ``Failed`` is a ``BaseException``.
+    """
+    try:
+        text = Path(path).read_text()
+    except FileNotFoundError:
+        return []
+    if complete_only:
+        text = text[: text.rfind('\n') + 1]
+    records = []
+    for raw_line in text.splitlines():
+        fields = raw_line.split('\t')
+        if len(fields) != 2:
+            raise ValueError(
+                f'poll-trace records are <verdict>\\t<unit>, exactly two fields; '
+                f'got {raw_line!r} in {path}'
+            )
+        records.append((fields[0], fields[1]))
+    return records
 
 
 def leaked_drain_processes(
@@ -2191,9 +2625,10 @@ def _df_no_synthetic_heartbeats_in_live_fleet():
 
 # The vars that retarget git WITHOUT walking anywhere. Deliberately NARROW:
 # only names that change WHICH repository (or which config) a command acts on.
-# Identity vars (GIT_AUTHOR_*, GIT_COMMITTER_*) are left alone -- they change
-# what a commit says, never where it lands, and tests legitimately set them for
-# determinism.
+# GIT_CONFIG_PARAMETERS is git's own `-c` propagation channel, read at
+# command-line precedence (it can inject a core.hooksPath). Identity vars
+# (GIT_AUTHOR_*, GIT_COMMITTER_*) are left alone -- they change what a commit
+# says, never where it lands, and tests legitimately set them for determinism.
 #
 # GIT_CEILING_DIRECTORIES is NOT here and must never be: it is the first
 # defence's own mechanism (:func:`_df_git_ceiling_at_basetemp`), so scrubbing it
@@ -2209,10 +2644,12 @@ _GIT_REDIRECT_ENV = (
     'GIT_CONFIG_GLOBAL',
     'GIT_CONFIG_SYSTEM',
     'GIT_CONFIG_COUNT',
+    'GIT_CONFIG_PARAMETERS',
 )
 
-# `git -c` pairs are passed as an INDEXED family (GIT_CONFIG_KEY_0/VALUE_0, ...),
-# so they cannot be enumerated by name.
+# GIT_CONFIG_COUNT's pairs are an INDEXED family (GIT_CONFIG_KEY_0/VALUE_0, ...),
+# so they cannot be enumerated by name. (`git -c` itself propagates through
+# GIT_CONFIG_PARAMETERS above, not through this family.)
 _GIT_REDIRECT_ENV_PREFIXES = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
 
 

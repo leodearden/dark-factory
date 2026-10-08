@@ -4,6 +4,7 @@ Tests cover compute_flag_signature, dedup_flags, and error-handling behavior.
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import uuid as _uuid_mod
@@ -19,10 +20,8 @@ from fused_memory.reconciliation import flag_dedup
 from fused_memory.reconciliation.flag_dedup import build_suppression_payload
 from fused_memory.reconciliation.recon_ledger import ReconLedgerRecord, ReconLedgerStore
 from fused_memory.reconciliation.standing_decision_constants import (
-    CATEGORY_STANDING_DECISION_STORM,
     GROUNDS_STRUCTURAL_SIZE_CONFLATION,
     RECORD_KIND_ENTITY_STANDING_DECISION,
-    SUPPRESSION_STORM_THRESHOLD_PER_CYCLE,
 )
 
 
@@ -2400,11 +2399,11 @@ class TestWriteSuppressionRecordPreWriteCheck:
 
 
 def test_write_suppression_record_importable_from_canonical_path():
-    """Smoke test: write_suppression_record is importable from the path stage1.py advertises.
+    """Smoke test: write_suppression_record, the operator entry point for
+    stage1_flag_suppression rows, stays importable from its canonical path.
 
-    If the helper is ever moved or renamed, this test fails CI rather than
-    silently drifting the prompt's operator instructions
-    (see STAGE1_SYSTEM_PROMPT ## Flag Suppression Check section).
+    Operators script against this path (recon_self_model.MARKER_LIFECYCLE
+    names it as the kind's only writer), so a move or rename must fail CI.
     """
     from fused_memory.reconciliation.flag_dedup import write_suppression_record  # noqa: F401
 
@@ -2726,6 +2725,106 @@ class TestConfirmTaskPresent:
             assert confirm_task_present(bad) is False, (
                 f'confirm_task_present must return False for non-dict {bad!r} (fail-safe)'
             )
+
+
+# ---------------------------------------------------------------------------
+# task-3051 step-1: safe_get_task (RED tests)
+# ---------------------------------------------------------------------------
+
+
+class TestSafeGetTask:
+    """RED tests for the module-level ``safe_get_task`` (task 3051 step-1).
+
+    ``safe_get_task(taskmaster, task_id, project_root)`` is the single shared
+    one-task fetch every cross-project corroboration path routes through: it
+    returns the raw ``taskmaster.get_task`` result untouched on success and
+    normalises ANY exception to ``{'error': str(exc), 'error_type':
+    type(exc).__name__}``, so ``confirm_task_present`` / ``confirm_task_absent``
+    classify the raised-exception path exactly as they classify the MCP
+    wrapper's own error-dict path. That normalisation is also what lets every
+    caller keep using a PLAIN ``asyncio.gather``.
+
+    It is PUBLIC (no leading underscore) because task 3051 adds a call site
+    outside this module — ``task_knowledge_sync._corroborate_record_keys`` —
+    and one more private copy is exactly what this helper exists to prevent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_task_record_unchanged(self):
+        """A successful task-record result passes through byte-identical."""
+        from fused_memory.reconciliation.flag_dedup import safe_get_task
+
+        record = {'id': '3045', 'title': 'A real task', 'status': 'pending'}
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=record)
+
+        result = await safe_get_task(taskmaster, '3045', '/repo/df')
+
+        assert result is record
+        assert flag_dedup.confirm_task_present(result) is True
+
+    @pytest.mark.asyncio
+    async def test_returns_error_dict_unchanged(self):
+        """A RETURNED error dict is passed through untouched, not re-wrapped."""
+        from fused_memory.reconciliation.flag_dedup import safe_get_task
+
+        error_dict = {
+            'error': 'TASKMASTER_TOOL_ERROR: No tasks found for ID(s): 9999',
+            'error_type': 'TaskmasterError',
+        }
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value=error_dict)
+
+        result = await safe_get_task(taskmaster, '9999', '/repo/df')
+
+        assert result is error_dict
+        assert flag_dedup.confirm_task_absent(result) is True
+
+    @pytest.mark.asyncio
+    async def test_forwards_task_id_and_project_root_positionally(self):
+        """task_id and project_root are forwarded POSITIONALLY, in that order."""
+        from fused_memory.reconciliation.flag_dedup import safe_get_task
+
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(return_value={'id': '7'})
+
+        await safe_get_task(taskmaster, 7, '/repo/other')
+
+        taskmaster.get_task.assert_awaited_once_with(7, '/repo/other')
+
+    @pytest.mark.asyncio
+    async def test_normalises_not_found_exception_to_absent_error_dict(self):
+        """A RAISED TaskmasterError carrying the canonical not-found phrase
+        normalises to a dict that ``confirm_task_absent`` classifies exactly as
+        it classifies the returned error-dict path."""
+        from fused_memory.reconciliation.flag_dedup import safe_get_task
+
+        exc = TaskmasterError('TASKMASTER_TOOL_ERROR', 'No tasks found for ID(s): 9999')
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=exc)
+
+        result = await safe_get_task(taskmaster, '9999', '/repo/df')
+
+        assert result == {'error': str(exc), 'error_type': 'TaskmasterError'}
+        assert flag_dedup.confirm_task_absent(result) is True
+        assert flag_dedup.confirm_task_present(result) is False
+
+    @pytest.mark.asyncio
+    async def test_normalises_generic_exception_to_inconclusive_error_dict(self):
+        """A generic exception normalises to the same shape and is INCONCLUSIVE:
+        neither classifier fires, so it can neither corroborate presence nor
+        confirm absence."""
+        from fused_memory.reconciliation.flag_dedup import safe_get_task
+
+        exc = RuntimeError('backend down')
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(side_effect=exc)
+
+        result = await safe_get_task(taskmaster, '3045', '/repo/df')
+
+        assert result == {'error': 'backend down', 'error_type': 'RuntimeError'}
+        assert flag_dedup.confirm_task_present(result) is False
+        assert flag_dedup.confirm_task_absent(result) is False
 
 
 # ---------------------------------------------------------------------------
@@ -10268,7 +10367,7 @@ class TestDiscoverForeignFixTaskCitations:
         'The Stage 2 remediation payload omits live workflow signals; '
         'no fix task has been filed.'
     )
-    #: What ``_safe_get_task`` reports for the matched task.  Deliberately
+    #: What ``safe_get_task`` reports for the matched task.  Deliberately
     #: DIFFERENT from the ``get_tasks`` title below so a test can prove the
     #: citation's title is read from the LIVE record rather than from the
     #: bulk listing the match was computed against.
@@ -10364,7 +10463,7 @@ class TestDiscoverForeignFixTaskCitations:
             'a carried-forward complaint already covered by a filed foreign '
             f'task must yield a citation naming it; got {result!r}'
         )
-        # The title comes from the LIVE record (_safe_get_task), not from the
+        # The title comes from the LIVE record (safe_get_task), not from the
         # bulk listing the coverage match was computed against — so a
         # discovered citation corroborates by construction.
         taskmaster.get_task.assert_awaited_once_with('3839', '/df')
@@ -12049,7 +12148,7 @@ class TestFilterStyleOnlyAuthorshipFlags:
 
 
 class TestIsClusterGrowthFlagType:
-    """`_is_cluster_growth_flag_type` recognises the duplicate-cluster-growth
+    """`CLUSTER_GROWTH_FAMILY.matches` recognises the duplicate-cluster-growth
     family across LLM spelling drift (task 3476).
 
     Stage 1 emits these findings with an LLM-authored, un-enumerated
@@ -12069,11 +12168,10 @@ class TestIsClusterGrowthFlagType:
     ])
     def test_known_canonical_spellings_match(self, flag_type):
         """Both spellings named in the incident are recognised."""
-        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+        from fused_memory.reconciliation.flag_dedup import CLUSTER_GROWTH_FAMILY
 
-        assert _is_cluster_growth_flag_type(flag_type) is True, (
-            f'{flag_type!r} is a canonical incident spelling and must match. '
-            'RED: _is_cluster_growth_flag_type does not exist yet.'
+        assert CLUSTER_GROWTH_FAMILY.matches(flag_type) is True, (
+            f'{flag_type!r} is a canonical incident spelling and must match.'
         )
 
     @pytest.mark.parametrize('flag_type', [
@@ -12085,9 +12183,9 @@ class TestIsClusterGrowthFlagType:
     ])
     def test_case_separator_and_word_order_variants_match(self, flag_type):
         """canonical_flag_type_family normalization collapses these onto a known family."""
-        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+        from fused_memory.reconciliation.flag_dedup import CLUSTER_GROWTH_FAMILY
 
-        assert _is_cluster_growth_flag_type(flag_type) is True, (
+        assert CLUSTER_GROWTH_FAMILY.matches(flag_type) is True, (
             f'{flag_type!r} is a case/separator/word-order variant of a known '
             'spelling and must match via canonical_flag_type_family'
         )
@@ -12104,9 +12202,9 @@ class TestIsClusterGrowthFlagType:
         this filter only ever DROPS on positively-confirmed UUID presence, so
         over-matching can only reclassify an already-accounted-for finding.
         """
-        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+        from fused_memory.reconciliation.flag_dedup import CLUSTER_GROWTH_FAMILY
 
-        assert _is_cluster_growth_flag_type(flag_type) is True, (
+        assert CLUSTER_GROWTH_FAMILY.matches(flag_type) is True, (
             f'{flag_type!r} carries both the cluster and growth tokens and must '
             'match via the token-pair arm'
         )
@@ -12119,9 +12217,9 @@ class TestIsClusterGrowthFlagType:
     ])
     def test_single_token_flag_types_do_not_match(self, flag_type):
         """Only ONE of the two tokens is not enough — the pair is required."""
-        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+        from fused_memory.reconciliation.flag_dedup import CLUSTER_GROWTH_FAMILY
 
-        assert _is_cluster_growth_flag_type(flag_type) is False, (
+        assert CLUSTER_GROWTH_FAMILY.matches(flag_type) is False, (
             f'{flag_type!r} carries only one of the cluster/growth tokens and '
             'must NOT match'
         )
@@ -12135,21 +12233,63 @@ class TestIsClusterGrowthFlagType:
     ])
     def test_unrelated_flag_types_do_not_match(self, flag_type):
         """Unrelated / empty flag types never match."""
-        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+        from fused_memory.reconciliation.flag_dedup import CLUSTER_GROWTH_FAMILY
 
-        assert _is_cluster_growth_flag_type(flag_type) is False, (
+        assert CLUSTER_GROWTH_FAMILY.matches(flag_type) is False, (
             f'{flag_type!r} is unrelated to cluster growth and must NOT match'
         )
 
     @pytest.mark.parametrize('flag_type', [None, 123, 4.2, [], {}, object()])
     def test_non_string_input_is_false_not_raising(self, flag_type):
         """The predicate must be TOTAL over malformed LLM-authored input."""
-        from fused_memory.reconciliation.flag_dedup import _is_cluster_growth_flag_type
+        from fused_memory.reconciliation.flag_dedup import CLUSTER_GROWTH_FAMILY
 
-        assert _is_cluster_growth_flag_type(flag_type) is False, (
+        assert CLUSTER_GROWTH_FAMILY.matches(flag_type) is False, (
             f'{flag_type!r} is not a str; the predicate must return False rather '
             'than raise (flag dicts are LLM-authored and unvalidated)'
         )
+
+
+class TestFlagTypeFamily:
+    """`FlagTypeFamily` (task 5271 amendment): one value per Stage-1 finding's
+    spellings, shared by the accounting gates and sweep_deletion_guard."""
+
+    _FAMILY = flag_dedup.FlagTypeFamily(
+        name='widget_anomaly',
+        spellings=frozenset({'widget_anomaly_detected'}),
+        drift_token='widget',
+    )
+
+    def test_without_unseen_tokens_only_canonical_variants_match(self):
+        assert self._FAMILY.matches('Detected-Widget Anomaly') is True
+        assert self._FAMILY.matches('widget_anomaly_detected_again') is False, (
+            'a family with no unseen_spelling_tokens must not admit an added word'
+        )
+
+    def test_log_drift_names_the_event_the_family_and_only_unmatched_types(self, caplog):
+        flags = [
+            {'flag_type': 'widget_anomaly_detected'},
+            {'flag_type': 'widget_drift_suspected'},
+            {'flag_type': 'stale_metadata'},
+            {'flag_type': None},
+        ]
+
+        with caplog.at_level(logging.INFO):
+            self._FAMILY.log_drift(flags, log_event='reconciliation.widget_filter_possible_drift')
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert len(messages) == 1, messages
+        assert messages[0].startswith('reconciliation.widget_filter_possible_drift ')
+        assert 'family=widget_anomaly' in messages[0]
+        assert "unmatched_flag_types=['widget_drift_suspected']" in messages[0]
+
+    def test_log_drift_is_silent_when_every_token_bearer_matches(self, caplog):
+        with caplog.at_level(logging.INFO):
+            self._FAMILY.log_drift(
+                [{'flag_type': 'Widget-Anomaly Detected'}], log_event='reconciliation.x',
+            )
+
+        assert caplog.records == []
 
 
 # ---------------------------------------------------------------------------
@@ -12159,7 +12299,7 @@ class TestIsClusterGrowthFlagType:
 
 
 class TestClusterGrowthExtractionHelpers:
-    """`_cluster_growth_cited_memory_ids` / `_cluster_growth_candidate_task_ids`
+    """`_flag_cited_memory_ids` / `_flag_candidate_task_ids`
     read the flag's STRUCTURED citation channels only (task 3476).
 
     Both are pure/sync/no-I/O and must be TOTAL over malformed LLM-authored
@@ -12173,27 +12313,27 @@ class TestClusterGrowthExtractionHelpers:
     _UUID_B = '01499374-8029-4c01-baa0-b7851d2376cb'
     _UUID_C = '4a4daa2d-1111-4c01-baa0-b7851d2376cb'
 
-    # -- (a) _cluster_growth_cited_memory_ids ------------------------------
+    # -- (a) _flag_cited_memory_ids ------------------------------
 
     def test_cited_memory_ids_returns_ids_in_order(self):
         """Every cited memory_id, in citation order."""
         from fused_memory.reconciliation.flag_dedup import (
-            _cluster_growth_cited_memory_ids,
+            _flag_cited_memory_ids,
         )
 
         flag = {'cited_memories': [
             {'memory_id': self._UUID_A, 'store': 'mem0'},
             {'memory_id': self._UUID_B, 'store': 'mem0'},
         ]}
-        assert _cluster_growth_cited_memory_ids(flag) == [self._UUID_A, self._UUID_B], (
+        assert _flag_cited_memory_ids(flag) == [self._UUID_A, self._UUID_B], (
             'cited memory ids must be returned in citation order. '
-            'RED: _cluster_growth_cited_memory_ids does not exist yet.'
+            'RED: _flag_cited_memory_ids does not exist yet.'
         )
 
     def test_cited_memory_ids_are_deduped_preserving_first_position(self):
         """A repeated citation contributes one id, at its first position."""
         from fused_memory.reconciliation.flag_dedup import (
-            _cluster_growth_cited_memory_ids,
+            _flag_cited_memory_ids,
         )
 
         flag = {'cited_memories': [
@@ -12201,7 +12341,7 @@ class TestClusterGrowthExtractionHelpers:
             {'memory_id': self._UUID_B, 'store': 'mem0'},
             {'memory_id': self._UUID_A, 'store': 'mem0'},
         ]}
-        assert _cluster_growth_cited_memory_ids(flag) == [self._UUID_A, self._UUID_B]
+        assert _flag_cited_memory_ids(flag) == [self._UUID_A, self._UUID_B]
 
     def test_cited_memory_ids_includes_graphiti_store_entries(self):
         """A non-mem0 citation is INCLUDED -- conservative by design.
@@ -12211,14 +12351,14 @@ class TestClusterGrowthExtractionHelpers:
         could let a partially-accounted finding be dropped.
         """
         from fused_memory.reconciliation.flag_dedup import (
-            _cluster_growth_cited_memory_ids,
+            _flag_cited_memory_ids,
         )
 
         flag = {'cited_memories': [
             {'memory_id': self._UUID_A, 'store': 'mem0'},
             {'memory_id': self._UUID_B, 'store': 'graphiti'},
         ]}
-        assert _cluster_growth_cited_memory_ids(flag) == [self._UUID_A, self._UUID_B], (
+        assert _flag_cited_memory_ids(flag) == [self._UUID_A, self._UUID_B], (
             'a graphiti citation must be INCLUDED: an unmatched id can only force '
             'a KEEP, which is the fail-safe direction'
         )
@@ -12235,10 +12375,10 @@ class TestClusterGrowthExtractionHelpers:
     def test_cited_memory_ids_skips_malformed_entries(self, entries):
         """Malformed citation entries are skipped, never raised on."""
         from fused_memory.reconciliation.flag_dedup import (
-            _cluster_growth_cited_memory_ids,
+            _flag_cited_memory_ids,
         )
 
-        assert _cluster_growth_cited_memory_ids({'cited_memories': entries}) == [], (
+        assert _flag_cited_memory_ids({'cited_memories': entries}) == [], (
             f'malformed cited_memories entry {entries!r} must be skipped'
         )
 
@@ -12246,47 +12386,47 @@ class TestClusterGrowthExtractionHelpers:
     def test_cited_memory_ids_returns_empty_for_missing_or_non_list(self, cited):
         """A missing / None / non-list cited_memories yields []."""
         from fused_memory.reconciliation.flag_dedup import (
-            _cluster_growth_cited_memory_ids,
+            _flag_cited_memory_ids,
         )
 
-        assert _cluster_growth_cited_memory_ids({'cited_memories': cited}) == []
-        assert _cluster_growth_cited_memory_ids({}) == []
+        assert _flag_cited_memory_ids({'cited_memories': cited}) == []
+        assert _flag_cited_memory_ids({}) == []
 
-    # -- (b) _cluster_growth_candidate_task_ids ----------------------------
+    # -- (b) _flag_candidate_task_ids ----------------------------
 
     def test_candidate_task_ids_yields_top_level_task_id(self):
         """The flag's own task_id is a candidate."""
         from fused_memory.reconciliation.flag_dedup import (
-            _cluster_growth_candidate_task_ids,
+            _flag_candidate_task_ids,
         )
 
-        assert _cluster_growth_candidate_task_ids({'task_id': '3417'}) == ['3417'], (
+        assert _flag_candidate_task_ids({'task_id': '3417'}) == ['3417'], (
             'the flag\'s own task_id must be a candidate. '
-            'RED: _cluster_growth_candidate_task_ids does not exist yet.'
+            'RED: _flag_candidate_task_ids does not exist yet.'
         )
 
     def test_candidate_task_ids_splits_the_comma_joined_shape(self):
         """A comma-joined task_id decomposes, each component stripped."""
         from fused_memory.reconciliation.flag_dedup import (
-            _cluster_growth_candidate_task_ids,
+            _flag_candidate_task_ids,
         )
 
-        assert _cluster_growth_candidate_task_ids(
+        assert _flag_candidate_task_ids(
             {'task_id': '3417, 3468 ,3500'},
         ) == ['3417', '3468', '3500']
 
     def test_candidate_task_ids_tolerates_an_int_task_id(self):
         """An int task_id is coerced to str."""
         from fused_memory.reconciliation.flag_dedup import (
-            _cluster_growth_candidate_task_ids,
+            _flag_candidate_task_ids,
         )
 
-        assert _cluster_growth_candidate_task_ids({'task_id': 3417}) == ['3417']
+        assert _flag_candidate_task_ids({'task_id': 3417}) == ['3417']
 
     def test_candidate_task_ids_includes_cited_task_ids(self):
         """Every cited_tasks[].task_id is also a candidate."""
         from fused_memory.reconciliation.flag_dedup import (
-            _cluster_growth_candidate_task_ids,
+            _flag_candidate_task_ids,
         )
 
         flag = {
@@ -12296,12 +12436,12 @@ class TestClusterGrowthExtractionHelpers:
                 {'project_id': 'reify', 'task_id': 42, 'title': 'Other'},
             ],
         }
-        assert _cluster_growth_candidate_task_ids(flag) == ['3468', '42']
+        assert _flag_candidate_task_ids(flag) == ['3468', '42']
 
     def test_candidate_task_ids_dedupes_across_both_channels_preserving_order(self):
         """Top-level ids come first; a repeat from cited_tasks is deduped."""
         from fused_memory.reconciliation.flag_dedup import (
-            _cluster_growth_candidate_task_ids,
+            _flag_candidate_task_ids,
         )
 
         flag = {
@@ -12311,7 +12451,7 @@ class TestClusterGrowthExtractionHelpers:
                 {'task_id': '3500'},
             ],
         }
-        assert _cluster_growth_candidate_task_ids(flag) == ['3417', '3468', '3500']
+        assert _flag_candidate_task_ids(flag) == ['3417', '3468', '3500']
 
     @pytest.mark.parametrize('entries', [
         [{'project_id': 'dark_factory'}],       # missing task_id
@@ -12324,10 +12464,10 @@ class TestClusterGrowthExtractionHelpers:
     def test_candidate_task_ids_skips_malformed_cited_task_entries(self, entries):
         """Malformed cited_tasks entries are skipped, never raised on."""
         from fused_memory.reconciliation.flag_dedup import (
-            _cluster_growth_candidate_task_ids,
+            _flag_candidate_task_ids,
         )
 
-        assert _cluster_growth_candidate_task_ids(
+        assert _flag_candidate_task_ids(
             {'task_id': None, 'cited_tasks': entries},
         ) == [], f'malformed cited_tasks entry {entries!r} must be skipped'
 
@@ -12344,10 +12484,10 @@ class TestClusterGrowthExtractionHelpers:
     def test_candidate_task_ids_returns_empty_when_nothing_resolvable(self, flag):
         """No resolvable task id yields [] -- the caller then KEEPs the flag."""
         from fused_memory.reconciliation.flag_dedup import (
-            _cluster_growth_candidate_task_ids,
+            _flag_candidate_task_ids,
         )
 
-        assert _cluster_growth_candidate_task_ids(flag) == []
+        assert _flag_candidate_task_ids(flag) == []
 
 
 # ---------------------------------------------------------------------------
@@ -12854,7 +12994,7 @@ class TestFilterAccountedClusterGrowthFlags:
             f'the drift log must name the unmatched flag_type; got {drift[0]!r}'
         )
         assert 'procedural_knowledge_cluster_growth' in drift[0], (
-            'the drift log must name CLUSTER_GROWTH_FLAG_TYPES as its reference '
+            'the drift log must name the CLUSTER_GROWTH_FAMILY spellings as its reference '
             f'point; got {drift[0]!r}'
         )
 
@@ -13181,6 +13321,316 @@ class TestFilterAccountedClusterGrowthFlags:
             f'no candidate was skipped, so nothing may be logged; got {noise!r}'
         )
 
+
+class TestFilterAlreadyRecordedCaveatFlags:
+    """`filter_already_recorded_caveat_flags` drops a premature-widening-caveat
+    finding once the cited task's LIVE metadata already records every cited
+    caveat-source memory id (task 5271).
+
+    Closes the pump_web_ui run-e8913eb1 / finding-3b15dd73 recurrence: Stage 1
+    re-flagged task 18 for a caveat whose ``metadata.memory_hints`` entry was
+    already there, paraphrased rather than copied, and ending "Full rationale:
+    Mem0 memory 6597957b-...".  The memory UUID is the one token the flag and
+    the live metadata share.
+    """
+
+    _CAVEAT_MEMORY_ID = '6597957b-2269-4913-b4a3-8c5bff0df51d'
+    _OTHER_MEMORY_ID = '0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d'
+
+    def _make_caveat_flag(
+        self,
+        *,
+        flag_type: str = 'premature_widening_evidence_caveat',
+        memory_ids: list[str] | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """The Stage-1 finding 3b15dd73, incident-shaped."""
+        ids = [self._CAVEAT_MEMORY_ID] if memory_ids is None else memory_ids
+        flag: dict[str, Any] = {
+            'task_id': '18',
+            'flag_type': flag_type,
+            'category': 'task_metadata_gap',
+            'description': (
+                "Task 18's metadata.memory_hints still lacks the premature-"
+                'widening evidence caveat recorded in Mem0; append it before the '
+                'widening decision is re-read.'
+            ),
+            'cited_tasks': [{
+                'project_id': 'pump_web_ui',
+                'task_id': '18',
+                'title': 'Widen the pump-curve evidence window',
+            }],
+            'cited_memories': [{'memory_id': m, 'store': 'mem0'} for m in ids],
+        }
+        flag.update(extra)
+        return flag
+
+    def _make_task_record(
+        self,
+        *,
+        hint_queries: list[str] | None = None,
+        description: str = '',
+        details: str = '',
+    ) -> dict[str, Any]:
+        """Task 18 as live get_task returns it: the caveat is paraphrased."""
+        queries = (
+            [
+                'pump curve evidence window widening decision',
+                'task 18 temporal caveat recorded 2026-07-30c: the widening '
+                'rests on one week of readings and must be re-checked. '
+                f'Full rationale: Mem0 memory {self._CAVEAT_MEMORY_ID}.',
+            ]
+            if hint_queries is None
+            else hint_queries
+        )
+        return {
+            'id': 18,
+            'title': 'Widen the pump-curve evidence window',
+            'description': description,
+            'details': details,
+            'metadata': {'memory_hints': {'queries': queries}},
+        }
+
+    def _taskmaster(self, **get_task_kwargs: Any) -> AsyncMock:
+        taskmaster = AsyncMock()
+        taskmaster.get_task = AsyncMock(**get_task_kwargs)
+        return taskmaster
+
+    @pytest.mark.asyncio
+    async def test_incident_caveat_already_in_live_metadata_is_dropped(self):
+        """(1) The live metadata names the caveat's source memory -> DROP."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flag = self._make_caveat_flag()
+        taskmaster = self._taskmaster(return_value=self._make_task_record())
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', [flag])
+
+        assert result == [], (
+            "task 18's live metadata.memory_hints already cites the caveat-source "
+            f'memory, so the flag must be DROPPED; got {result!r}'
+        )
+        taskmaster.get_task.assert_awaited_once_with('18', '/root')
+
+    @pytest.mark.asyncio
+    async def test_metadata_lacking_the_id_keeps_the_flag_unchanged(self):
+        """(2) The caveat is genuinely missing -> KEEP, byte-identical."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flag = self._make_caveat_flag()
+        snapshot = copy.deepcopy(flag)
+        taskmaster = self._taskmaster(return_value=self._make_task_record(
+            hint_queries=['pump curve evidence window widening decision'],
+        ))
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', [flag])
+
+        assert result == [flag], (
+            f'the caveat is not in the live metadata, so KEEP; got {result!r}'
+        )
+        assert flag == snapshot, 'a kept flag must not be modified'
+
+    @pytest.mark.asyncio
+    async def test_get_task_raising_keeps_the_flag(self):
+        """(3) A lookup error KEEPS the flag -- the pinned fail direction."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flag = self._make_caveat_flag()
+        taskmaster = self._taskmaster(side_effect=Exception('boom'))
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', [flag])
+
+        assert result == [flag], (
+            'a raised get_task must fail toward KEEP. This is deliberately the '
+            'OPPOSITE of filter_false_absence_flags, which fails closed because '
+            'it guards an irreversible delete_memory; here a wrong DROP would '
+            f'silence a genuinely missing caveat every cycle. Got {result!r}'
+        )
+
+    @pytest.mark.parametrize('bad_result', [
+        None,
+        'oops',
+        123,
+        [],
+        {'error': 'Task 18 not found', 'error_type': 'TaskNotFoundError'},
+        {'id': 18, 'title': 't', 'description': '', 'details': ''},
+        {'id': 18, 'title': 't', 'metadata': None},
+    ])
+    @pytest.mark.asyncio
+    async def test_inconclusive_result_keeps_the_flag(self, bad_result):
+        """(4) Non-dict, error-dict or metadata-less results can never confirm."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flag = self._make_caveat_flag()
+        taskmaster = self._taskmaster(return_value=bad_result)
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', [flag])
+
+        assert result == [flag], (
+            f'get_task returning {bad_result!r} carries no metadata to confirm '
+            f'against, so the flag must be KEPT; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_id_only_in_description_or_details_keeps_the_flag(self):
+        """(5) The claim is about metadata, so only metadata can refute it."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flag = self._make_caveat_flag()
+        taskmaster = self._taskmaster(return_value=self._make_task_record(
+            hint_queries=['pump curve evidence window widening decision'],
+            description=f'See Mem0 memory {self._CAVEAT_MEMORY_ID}.',
+            details=f'Caveat source: {self._CAVEAT_MEMORY_ID}',
+        ))
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', [flag])
+
+        assert result == [flag], (
+            'the id is in description/details but NOT in metadata; the finding '
+            f'claims metadata lacks the caveat, so KEEP; got {result!r}'
+        )
+
+    @pytest.mark.parametrize('flag_type', [
+        'Evidence-Caveat_premature widening',
+        'caveat_evidence_premature_widening',
+    ])
+    @pytest.mark.asyncio
+    async def test_paraphrased_flag_type_spellings_are_candidates(self, flag_type):
+        """(6) canonical_flag_type_family collapses reworded spellings."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flag = self._make_caveat_flag(flag_type=flag_type)
+        taskmaster = self._taskmaster(return_value=self._make_task_record())
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', [flag])
+
+        assert result == [], (
+            f'{flag_type!r} is the same family as premature_widening_evidence_'
+            f'caveat and its caveat is recorded, so DROP; got {result!r}'
+        )
+
+    @pytest.mark.asyncio
+    async def test_partial_presence_keeps_the_flag(self):
+        """(7) Two cited ids, only one recorded -> KEEP."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flag = self._make_caveat_flag(
+            memory_ids=[self._CAVEAT_MEMORY_ID, self._OTHER_MEMORY_ID],
+        )
+        taskmaster = self._taskmaster(return_value=self._make_task_record())
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', [flag])
+
+        assert result == [flag], (
+            'only one of the two cited ids is in the live metadata, so the '
+            f'second caveat may still be missing: KEEP; got {result!r}'
+        )
+
+    @pytest.mark.parametrize('cited', [
+        None,
+        [],
+        [{'memory_id': 'mem0', 'store': 'mem0'}],
+        [{'memory_id': '3', 'store': 'mem0'}],
+    ])
+    @pytest.mark.asyncio
+    async def test_uncitable_candidate_keeps_the_flag_without_io(self, cited):
+        """(8) Nothing discriminating to look for -> KEEP, no lookup."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flag = self._make_caveat_flag()
+        flag['cited_memories'] = cited
+        taskmaster = self._taskmaster(return_value=self._make_task_record())
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', [flag])
+
+        assert result == [flag], (
+            'a candidate citing no discriminating memory id cannot be confirmed '
+            f"(the metadata contains 'Mem0' and digits by chance): KEEP; got {result!r}"
+        )
+        taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_candidates_pass_through_with_zero_io(self):
+        """(9) Other families are out of scope, even when their ids are recorded."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flags = [
+            {'task_id': '1', 'flag_type': 'stale_metadata', 'description': 'a'},
+            {'task_id': '2', 'flag_type': 'missing_deliverable', 'description': 'b'},
+            self._make_caveat_flag(flag_type='procedural_knowledge_cluster_growth'),
+        ]
+        snapshot = copy.deepcopy(flags)
+        taskmaster = self._taskmaster(return_value=self._make_task_record())
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', flags)
+
+        assert result == snapshot, (
+            f'non-caveat flags must pass through byte-identical; got {result!r}'
+        )
+        taskmaster.get_task.assert_not_awaited()
+
+    @pytest.mark.parametrize(('taskmaster', 'project_root'), [
+        (None, '/root'),
+        (AsyncMock(), ''),
+        (None, ''),
+    ])
+    @pytest.mark.asyncio
+    async def test_falsy_dependencies_degrade_to_a_no_op(self, taskmaster, project_root):
+        """(10) Falsy taskmaster / project_root -> unchanged pass-through."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        flags = [self._make_caveat_flag()]
+
+        result = await filter_already_recorded_caveat_flags(
+            taskmaster, project_root, flags,
+        )
+
+        assert result == flags
+        if taskmaster is not None:
+            taskmaster.get_task.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_input_is_not_mutated_and_survivor_order_is_preserved(self):
+        """(11) A new list, survivors in input order, input list untouched."""
+        from fused_memory.reconciliation.flag_dedup import (
+            filter_already_recorded_caveat_flags,
+        )
+
+        first = {'task_id': '1', 'flag_type': 'stale_metadata', 'description': 'a'}
+        recorded = self._make_caveat_flag()
+        middle = {'task_id': '2', 'flag_type': 'missing_deliverable', 'description': 'b'}
+        missing = self._make_caveat_flag(memory_ids=[self._OTHER_MEMORY_ID])
+        flags = [first, recorded, middle, missing]
+        snapshot = copy.deepcopy(flags)
+        taskmaster = self._taskmaster(return_value=self._make_task_record())
+
+        result = await filter_already_recorded_caveat_flags(taskmaster, '/root', flags)
+
+        assert result == [first, middle, missing]
+        assert result is not flags
+        assert flags == snapshot, 'the input list must not be mutated'
+
+
 # Entity-standing-decision (Hook A / γ, task 2896) — pure match helpers
 # ---------------------------------------------------------------------------
 #
@@ -13345,6 +13795,28 @@ class TestEntityStandingMatchHelpers:
         assert flag_dedup._flag_type_in_grounds_family(
             'Oversized_Entity', GROUNDS_STRUCTURAL_SIZE_CONFLATION
         ) is True
+
+
+class TestExtractFlagUuids:
+    """`extract_flag_uuids` is the public seam other modules read a flag's
+    named UUIDs through (task 5271)."""
+
+    def test_collects_lowercased_uuids_from_every_nested_str_value(self):
+        flag = {
+            'description': f'deleted {_ESD_U1_UPPER}',
+            'evidence': [f'see {_ESD_U2}', {'note': f'and {_ESD_U3}'}],
+            'cited_memories': [{'memory_id': _ESD_U1, 'store': 'mem0'}],
+        }
+
+        assert flag_dedup.extract_flag_uuids(flag) == {_ESD_U1, _ESD_U2, _ESD_U3}
+
+    def test_non_str_values_are_ignored(self):
+        flag = {'task_id': 165, 'score': 0.5, 'ok': True, 'none': None, 'd': f'{_ESD_U2}'}
+
+        assert flag_dedup.extract_flag_uuids(flag) == {_ESD_U2}
+
+    def test_empty_flag_yields_empty_set(self):
+        assert flag_dedup.extract_flag_uuids({}) == set()
 
 
 # ---------------------------------------------------------------------------
@@ -13762,171 +14234,88 @@ class TestFilterEntityStandingDecisionsExpiry:
 
 
 # ---------------------------------------------------------------------------
-# maybe_escalate_suppression_storm (Hook A storm escape / γ, task 2896) — step-7
+# EntityStandingSuppressionResult.suppression_evaluated / empty_batch (task 2943)
 # ---------------------------------------------------------------------------
-# (SUPPRESSION_STORM_THRESHOLD_PER_CYCLE imported at module top.)
+# Cross-cycle streak accounting resets a decision's streak on a cycle where it
+# suppressed nothing.  That is only sound when the cycle actually consulted the
+# active-decision index, so the result says whether it did.
 
 
-def _storm_result(
-    *, entity_uuid: str = _ESD_U1, count: int | None = None, extra: dict | None = None
-) -> flag_dedup.EntityStandingSuppressionResult:
-    """An EntityStandingSuppressionResult carrying *count* suppressions for one
-    (or, via *extra*, several) decision(s).  Defaults to one over the threshold."""
-    counts = {entity_uuid: SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 1 if count is None else count}
-    counts.update(extra or {})
-    return flag_dedup.EntityStandingSuppressionResult(
-        kept_flags=[],
-        suppressed_by_decision=counts,
-        grounds_by_decision={u: GROUNDS_STRUCTURAL_SIZE_CONFLATION for u in counts},
-    )
-
-
-class TestMaybeEscalateSuppressionStorm:
-    """Per-cycle, per-decision storm escape escalation (task 2896 step-7).
-
-    Driven against a REAL ``EscalationQueue`` on tmp_path rather than a
-    MagicMock: the filing path folds through ``submit_or_dedupe``, whose whole
-    contract is what the queue does on the SECOND cycle, and a mock that answers
-    every lookup with a mock cannot witness a fold, a dedupe_count, or the
-    agreement between the key written and the key read back.
-    """
+class TestEntityStandingSuppressionEvaluated:
+    """Which Hook A outcomes are genuine observations (task 2943 step-5)."""
 
     _PID = 'p'
-    _RUN = 'run-1'
+    _FLAG = {
+        'entity_uuid': _ESD_U1,
+        'grounds': GROUNDS_STRUCTURAL_SIZE_CONFLATION,
+        'flag_type': 'oversized_entity',
+    }
 
-    @pytest.fixture
-    def queue(self, tmp_path):
-        from escalation.queue import EscalationQueue
-
-        return EscalationQueue(tmp_path / 'escalations')
-
-    @staticmethod
-    def _pending(queue, entity_uuid: str = _ESD_U1) -> list:
-        return queue.get_by_task(entity_uuid, status='pending', level=1)
-
-    @pytest.mark.asyncio
-    async def test_over_threshold_files_one_escalation(self, queue):
-        """(a) count > threshold → exactly one L1 storm escalation for that uuid."""
-        escalated = await flag_dedup.maybe_escalate_suppression_storm(
-            queue, self._PID, self._RUN, _storm_result()
-        )
-        assert escalated == [_ESD_U1]
-
-        pending = self._pending(queue)
-        assert len(pending) == 1
-        esc = pending[0]
-        assert esc.level == 1
-        assert esc.severity == 'blocking'
-        assert esc.category == CATEGORY_STANDING_DECISION_STORM
-        assert esc.agent_role == 'reconciliation-stage1'
-        # The entity is the record's subject: task_id is the key get_by_task /
-        # has_open_l1 read a storm record back by, so a filing that left it ''
-        # would be unfindable per entity.  Pinned explicitly, not merely implied
-        # by the get_by_task lookup above, so the field cannot be repurposed
-        # silently (reviewer finding test-coverage, amendment pass).
-        assert esc.task_id == _ESD_U1
-        blob = f'{esc.summary}\n{esc.detail}'
-        assert _ESD_U1 in blob
-        assert GROUNDS_STRUCTURAL_SIZE_CONFLATION in blob
-        assert str(SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 1) in blob
-
-    @pytest.mark.asyncio
-    async def test_at_threshold_does_not_escalate(self, queue):
-        """(b) count == threshold (strict >) → nothing filed, returns []."""
-        escalated = await flag_dedup.maybe_escalate_suppression_storm(
-            queue, self._PID, self._RUN,
-            _storm_result(count=SUPPRESSION_STORM_THRESHOLD_PER_CYCLE),
-        )
-        assert escalated == []
-        assert self._pending(queue) == []
-
-    @pytest.mark.asyncio
-    async def test_below_threshold_does_not_escalate(self, queue):
-        """(b') count well below threshold → nothing filed, returns []."""
-        escalated = await flag_dedup.maybe_escalate_suppression_storm(
-            queue, self._PID, self._RUN, _storm_result(count=1)
-        )
-        assert escalated == []
-        assert self._pending(queue) == []
-
-    @pytest.mark.asyncio
-    async def test_two_entities_over_threshold_each_file_once(self, queue):
-        """Two decisions storming in ONE cycle each get their own record.
-
-        The fold key is per-entity, so a second storming entity must not be
-        mistaken for a recurrence of the first.
-        """
-        escalated = await flag_dedup.maybe_escalate_suppression_storm(
-            queue, self._PID, self._RUN,
-            _storm_result(extra={_ESD_U2: SUPPRESSION_STORM_THRESHOLD_PER_CYCLE + 3}),
-        )
-        assert sorted(escalated) == sorted([_ESD_U1, _ESD_U2])
-        assert len(self._pending(queue, _ESD_U1)) == 1
-        assert len(self._pending(queue, _ESD_U2)) == 1
-        first, second = self._pending(queue, _ESD_U1)[0], self._pending(queue, _ESD_U2)[0]
-        assert first.dedupe_fingerprint != second.dedupe_fingerprint
-
-    @pytest.mark.asyncio
-    async def test_escalation_unavailable_returns_empty(self, queue, monkeypatch):
-        """(d) Escalation package unavailable (None) → returns [], no raise, nothing filed."""
-        monkeypatch.setattr(flag_dedup, 'Escalation', None, raising=False)
-        escalated = await flag_dedup.maybe_escalate_suppression_storm(
-            queue, self._PID, self._RUN, _storm_result()
-        )
-        assert escalated == []
-        assert self._pending(queue) == []
-
-    @pytest.mark.asyncio
-    async def test_submit_failure_logs_warning_and_excludes_entity(self, tmp_path, caplog):
-        """A queue whose submit raises costs the entity its filing, not the cycle.
-
-        The helper is best-effort by contract: the failure is logged WARNING
-        naming the entity, the entity is absent from the returned list, and the
-        exception never escapes into the Stage-1 run.
-        """
-        from escalation.queue import EscalationQueue
-
-        class _BrokenQueue(EscalationQueue):
-            def submit(self, escalation):
-                raise RuntimeError('boom')
-
-        queue = _BrokenQueue(tmp_path / 'escalations')
-        with caplog.at_level(
-            logging.WARNING, logger='fused_memory.reconciliation.flag_dedup'
-        ):
-            escalated = await flag_dedup.maybe_escalate_suppression_storm(
-                queue, self._PID, self._RUN, _storm_result()
+    def test_every_construction_must_state_whether_it_evaluated(self):
+        """A fail-open return that forgot the field would otherwise read as an
+        evaluated quiet cycle and reset every established streak."""
+        with pytest.raises(TypeError, match='suppression_evaluated'):
+            flag_dedup.EntityStandingSuppressionResult(  # type: ignore[call-arg]
+                kept_flags=[], suppressed_by_decision={}, grounds_by_decision={}
             )
-        assert escalated == []
-        assert any(
-            rec.levelno == logging.WARNING and _ESD_U1 in rec.getMessage()
-            for rec in caplog.records
-        ), 'a WARNING naming the entity must be logged'
 
     @pytest.mark.asyncio
-    async def test_recurring_storm_folds_into_one_parent(self, queue):
-        """REGRESSION: a decision that keeps storming folds, it is not re-filed.
-
-        Two things are pinned here, and only a real queue can pin either.  (1)
-        The record is written under the key the reader queries — an earlier
-        revision wrote ``task_id=''`` while looking up by entity_uuid, which made
-        the guard a permanent no-op.  (2) Recurrence FOLDS rather than being
-        silently skipped (task 3522): the second cycle mints no second record and
-        increments ``dedupe_count`` on the first, which is the steward's
-        triage-order signal.  A ``has_open_l1`` skip would leave that count
-        pinned at 0 forever, making one storm indistinguishable from forty.
-        """
-        result = _storm_result()
-        assert await flag_dedup.maybe_escalate_suppression_storm(
-            queue, self._PID, self._RUN, result
-        ) == [_ESD_U1]
-        assert queue.has_open_l1(_ESD_U1, category=CATEGORY_STANDING_DECISION_STORM)
-
-        second = await flag_dedup.maybe_escalate_suppression_storm(
-            queue, self._PID, 'run-2', result
+    async def test_suppressing_path_is_evaluated(self, ledger_memory_service):
+        await _seed_standing_decision(ledger_memory_service.recon_ledger, self._PID, _ESD_U1)
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [self._FLAG]
         )
-        assert second == [], 'a folded recurrence is not a new filing'
+        assert result.suppressed_by_decision == {_ESD_U1: 1}
+        assert result.suppression_evaluated is True
 
-        pending = self._pending(queue)
-        assert len(pending) == 1, f'expected one storm escalation, got {len(pending)}'
-        assert pending[0].dedupe_count == 1, 'the recurrence must be counted on the parent'
+    @pytest.mark.asyncio
+    async def test_empty_flags_is_evaluated(self, ledger_memory_service):
+        """A cycle with nothing to suppress is one in which no decision drained anything."""
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, []
+        )
+        assert result.suppression_evaluated is True
+
+    @pytest.mark.asyncio
+    async def test_no_active_decisions_is_evaluated(self, ledger_memory_service):
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [self._FLAG]
+        )
+        assert result.kept_flags == [self._FLAG]
+        assert result.suppression_evaluated is True
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_is_not_evaluated(self, ledger_memory_service):
+        ledger_memory_service.recon_ledger = None
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [self._FLAG]
+        )
+        assert result.kept_flags == [self._FLAG]
+        assert result.suppression_evaluated is False
+
+    @pytest.mark.asyncio
+    async def test_ledger_read_failure_is_not_evaluated(self, ledger_memory_service):
+        await _seed_standing_decision(ledger_memory_service.recon_ledger, self._PID, _ESD_U1)
+        ledger_memory_service.recon_ledger.list_entity_standing_decisions = AsyncMock(
+            side_effect=RuntimeError('boom')
+        )
+        result = await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, [self._FLAG]
+        )
+        assert result.kept_flags == [self._FLAG]
+        assert result.suppression_evaluated is False
+
+    @pytest.mark.asyncio
+    async def test_empty_batch_matches_the_filters_empty_flags_result(
+        self, ledger_memory_service
+    ):
+        """The consolidator's zero-flag cycle and the filter's empty-flags
+        return must be the same observation, so they must not drift."""
+        empty = flag_dedup.EntityStandingSuppressionResult.empty_batch()
+        assert empty.kept_flags == []
+        assert empty.suppressed_by_decision == {}
+        assert empty.grounds_by_decision == {}
+        assert empty.suppression_evaluated is True
+        assert empty == await flag_dedup.filter_entity_standing_decisions(
+            ledger_memory_service, self._PID, []
+        )

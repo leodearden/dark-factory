@@ -1,13 +1,1800 @@
-"""Value types that cross the merge lane's ports.
+"""Merge-lane data types and registries (MQ-refactor task α; PRD task ζ1).
 
-PRD ``plans/merge-lane-quality-prd.md`` task ζ1. Each wraps exactly what the
-collaborator behind a port produces or consumes today; nothing here is new
-information. Frozen, so a value handed across a port is never mutated by the
-other side.
+The request / outcome / item / entry dataclasses and the registries that
+own them, plus the value types that cross the lane's ports
+(``DiskGuardOutcome``, ``EscalationRecord``): each of those wraps exactly
+what the collaborator behind a port produces or consumes today, frozen so a
+value handed across a port is never mutated by the other side.
 """
+
 from __future__ import annotations
 
+import asyncio
+import collections
 import dataclasses
+import logging
+import time
+import uuid
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from enum import StrEnum
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
+
+from shared.branch_names import canonical_queued_branch_name
+
+from orchestrator.git_ops import MergeResult
+from orchestrator.merge_lane.disposition import MergeFailureDisposition, SkewEvidence
+from orchestrator.verify import VerifyResult, merge_verify_command_budget_secs
+
+if TYPE_CHECKING:
+    from orchestrator.config import ModuleConfig, OrchestratorConfig
+
+logger = logging.getLogger(__name__)
+
+
+class MainHealthAutoHealRegistry:
+    """Monotonic per-signature attempt counter for main-health auto-heal.
+
+    Keyed by sha-INDEPENDENT failure signatures (workflow._merge_outcome_signature),
+    so a recurrence at a new main SHA (after a fix advanced main) is detected and
+    the attempt cap trips correctly.
+
+    Thread safety: no synchronisation needed — the registry is owned by the merge
+    worker and accessed only from asyncio tasks in the same event loop.
+    """
+
+    def __init__(self) -> None:
+        self._attempts: dict[str, int] = {}
+
+    def attempts(self, sig: str) -> int:
+        """Return the number of auto-heal attempts recorded for *sig* (0 if none)."""
+        return self._attempts.get(sig, 0)
+
+    def record_attempt(self, sig: str) -> int:
+        """Increment the attempt counter for *sig* and return the new count."""
+        count = self._attempts.get(sig, 0) + 1
+        self._attempts[sig] = count
+        return count
+
+
+class MergeBounceRegistry:
+    """Monotonic per-branch bounce counter for the η=1892 needs-rebase bounce cap.
+
+    Keyed by branch NAME (sha-independent), so the counter survives the
+    HEAD-SHA churn of repeated rebases.  This is the same robustness principle
+    as the 1688 thrash signature (which is sha-independent), realized here by
+    mirroring :class:`MainHealthAutoHealRegistry`.
+
+    Thread safety: no synchronisation needed — the registry is owned by the
+    merge worker and accessed only from asyncio tasks in the same event loop.
+    """
+
+    def __init__(self) -> None:
+        self._bounces: dict[str, int] = {}
+
+    def count(self, branch: str) -> int:
+        """Return the number of bounces recorded for *branch* (0 if none)."""
+        return self._bounces.get(branch, 0)
+
+    def record_bounce(self, branch: str) -> int:
+        """Increment the bounce counter for *branch* and return the new count."""
+        n = self._bounces.get(branch, 0) + 1
+        self._bounces[branch] = n
+        return n
+
+    def clear(self, branch: str) -> None:
+        """Remove the bounce counter for *branch*.
+
+        Call when a branch is escalated (removed from the lane buffer) so that
+        a later resubmission of the same branch name starts from zero rather
+        than inheriting the old count.  This prevents a new PR on a recycled
+        branch name from being prematurely cap-escalated.
+
+        For the successful-merge path the counter is also moot once the branch
+        has landed; wiring a clear() there would require hooking into
+        advance_main / verifier completion — deferred as a future improvement.
+        """
+        self._bounces.pop(branch, None)
+
+
+@dataclass
+class _InFlightEntry:
+    """Registry slot for a single in-flight merge branch.
+
+    γ1 extended fields (all have defaults — existing callers unaffected):
+    - ``branch`` / ``snapshot_tip`` / ``generation`` / ``verifying``:
+      substrate for the PRD §7.2 multi-waiter coalescing model.
+    - ``waiters``: ordered list of :class:`WaiterRecord` objects; the
+      dispatcher is seeded as waiter #1 by :meth:`InFlightMergeRegistry.acquire`.
+    - ``primary_future``: the future owned by the dispatcher (waiter #1).
+      Stored so :meth:`~InFlightMergeRegistry.attach` can mirror its
+      terminal outcome onto all later waiters' futures.
+    """
+
+    task_id: str
+    enqueued_monotonic: float  # time.monotonic() at acquire time
+    request_id: str | None = None
+    """Stable identity of the dispatched MergeRequest (e.g. 'mr-a1b2c3d4').
+    Set at acquire time from the MergeRequest.request_id; None for legacy
+    callers that don't pass a request_id (back-compat)."""
+    # ── γ1 multi-waiter substrate ─────────────────────────────────────────
+    branch: str | None = None
+    """Branch name (e.g. '591'), set at acquire time."""
+    snapshot_tip: str | None = None
+    """Git SHA of the branch tip at acquire time (PRD §7.2 snapshot_tip)."""
+    generation: int = 1
+    """Monotonically increasing generation counter; incremented on each
+    re-snapshot that triggers a new merge attempt (γ2)."""
+    verifying: bool = False
+    """True once the merge worker has entered the post-merge verify phase.
+    Used by :func:`decide_attach_action` to choose ATTACH_AND_CHAIN vs
+    RESNAPSHOT for SUPERSET incoming submissions (γ2)."""
+    waiters: list[WaiterRecord] = field(default_factory=list)
+    """Ordered list of waiters; dispatcher is waiter #1 (seeded by
+    :meth:`InFlightMergeRegistry.acquire`).  Empty ⟺ released."""
+    primary_future: asyncio.Future | None = field(default=None, repr=False)
+    """The dispatcher's future (waiter #1).  Resolved by the worker;
+    its done-callbacks fan the terminal outcome out to all attached waiters."""
+
+
+_INFLIGHT_MERGE_ETA_ESTIMATE_SECS: int = 600
+"""Coarse estimate (seconds) for how long a full post-merge verify takes.
+Used ONLY to compute a best-effort ETA for coalesced callers.  NOT a
+guaranteed bound — cold npm+cargo builds vary widely.  Tests must NOT
+assert a specific numeric value for ETA."""
+
+
+@dataclass
+class TerminalOutcomeRecord:
+    """Immutable record of a MergeRequest's terminal outcome.
+
+    Stored in the TerminalOutcomeRetention ring for O(1) hot-path lookups.
+    The event store (merge_finalized rows) is the durable tier, so ring
+    eviction is lossless — evicted ids fall through to event-store queries.
+    """
+
+    request_id: str
+    task_id: str
+    branch: str
+    state: str
+    """Terminal state: MergeOutcome.status value, 'abandoned' (cancelled), or 'error'."""
+    snapshot_tip: str | None = None
+    merge_sha: str | None = None
+    finished_at: float = field(default_factory=time.time, kw_only=True)
+    superseded_by: str | None = field(default=None, kw_only=True)
+    """request_id of the gen-(n+1) request that supersedes this one (α1/γ2 provenance)."""
+    generation: int = field(default=1, kw_only=True)
+    """Generation of the merge request that produced this record (γ2 provenance)."""
+    reason: str | None = field(default=None, kw_only=True)
+    """MergeOutcome.reason for failure outcomes (empty string normalized to None)."""
+    landed_via_chain: int | None = field(default=None, kw_only=True)
+    """Mirrors :attr:`MergeOutcome.landed_via_chain` (task 3186 δ) — ``1`` when
+    a deep merge-ahead chain walk landed this item, else None.
+
+    Carried here because this ring and the ``merge_finalized`` row are two
+    tiers of ONE record: the ring is documented as lossless on eviction
+    precisely because an evicted id falls through to the durable row, so a
+    field on one tier and not the other would break that equivalence."""
+
+
+class TerminalOutcomeRetention:
+    """Bounded in-memory ring of recent terminal merge outcomes.
+
+    Backed by a ``collections.deque(maxlen=maxlen)`` for eviction and three
+    dict indexes for O(1) lookups:
+
+    * ``_index`` — keyed by ``request_id`` (primary).
+    * ``_by_branch`` — keyed by ``branch`` (secondary, newest-wins).
+    * ``_by_task`` — keyed by ``task_id`` (secondary, newest-wins).
+
+    When the ring is full, the oldest entry is evicted from all three indexes
+    atomically using an identity guard — so evicting an old record never drops
+    a secondary-index entry that is now owned by a newer live record (see
+    ``record()`` docstring).
+
+    A fourth ``_aliases`` ordered dict maps coalesced/absorbed request_ids to
+    the primary request_id whose terminal record they should resolve to.
+    Aliases resolve lazily through ``_index``; a dangling alias (primary
+    evicted or not-yet-recorded) returns None — matching the ring's existing
+    lossless eviction contract.  ``_aliases`` is capped at ``maxlen * 4``
+    entries; when the cap is exceeded the oldest alias is dropped first
+    (FIFO), as oldest entries are the most likely to be dangling and the
+    least likely to be polled (see ``record_alias()`` docstring).
+
+    The event store is the durable tier so eviction is lossless — α3's
+    merge_status falls through to event-store queries for evicted ids.
+    """
+
+    def __init__(self, maxlen: int = 200) -> None:
+        self._maxlen = maxlen
+        self._ring: collections.deque[TerminalOutcomeRecord] = collections.deque(maxlen=maxlen)
+        self._index: dict[str, TerminalOutcomeRecord] = {}
+        self._by_branch: dict[str, TerminalOutcomeRecord] = {}
+        self._by_task: dict[str, TerminalOutcomeRecord] = {}
+        # OrderedDict so oldest alias can be FIFO-trimmed when the cap is hit.
+        self._aliases: collections.OrderedDict[str, str] = collections.OrderedDict()
+
+    def record(self, rec: TerminalOutcomeRecord) -> None:
+        """Append *rec* to the ring, evicting the oldest entry from all indexes if full.
+
+        Eviction uses an identity guard on each index: ``if index[key] is evicted``
+        before deleting, so a newer record that already claimed the same
+        branch/task_id key is never accidentally removed (Case B in the
+        eviction-discipline tests).  The secondary-index prune runs BEFORE the
+        new record is indexed, so a new record with the same branch/task_id
+        replaces rather than loses its secondary entry.
+        """
+        if len(self._ring) == self._ring.maxlen:
+            # Capture the about-to-be-evicted entry before appending.
+            evicted = self._ring[0]
+            self._ring.append(rec)
+            # Only remove each index entry if it still points to *evicted* — a
+            # newer record that already claimed the same key must be preserved.
+            if self._index.get(evicted.request_id) is evicted:
+                del self._index[evicted.request_id]
+            if self._by_branch.get(evicted.branch) is evicted:
+                del self._by_branch[evicted.branch]
+            if self._by_task.get(evicted.task_id) is evicted:
+                del self._by_task[evicted.task_id]
+        else:
+            self._ring.append(rec)
+        self._index[rec.request_id] = rec
+        self._by_branch[rec.branch] = rec
+        self._by_task[rec.task_id] = rec
+
+    def get(self, request_id: str) -> TerminalOutcomeRecord | None:
+        """Return the record for *request_id*, or None if evicted / not yet recorded.
+
+        When *request_id* is not in ``_index``, falls back to alias resolution:
+        ``_aliases[request_id]`` → ``_index[primary]``.  A direct ``_index`` hit
+        always takes precedence over an alias for the same id.  A dangling alias
+        (primary evicted or not-yet-recorded) returns None — lossless fall-through.
+        """
+        rec = self._index.get(request_id)
+        if rec is not None:
+            return rec
+        primary = self._aliases.get(request_id)
+        if primary is not None:
+            return self._index.get(primary)
+        return None
+
+    def record_alias(self, alias_id: str, primary_request_id: str) -> None:
+        """Register *alias_id* as an alias for *primary_request_id*.
+
+        Aliases resolve lazily through ``_index`` in ``get()``, so the primary
+        record need not be recorded before the alias is registered — useful when
+        a coalesced request_id is registered at coalesce time before the primary
+        finalises.  Dangling aliases (primary evicted or never recorded) return
+        None, matching the ring's lossless eviction contract.
+
+        ``_aliases`` is capped at ``maxlen * 4`` entries (default 800).  When
+        the cap is exceeded the oldest alias is dropped first (FIFO); oldest
+        aliases are most likely dangling and least likely to be polled.  The
+        cap prevents unbounded growth proportional to total coalesce traffic
+        for long-running orchestrator processes.
+        """
+        self._aliases[alias_id] = primary_request_id
+        _cap = self._maxlen * 4
+        while len(self._aliases) > _cap:
+            self._aliases.popitem(last=False)  # drop oldest alias FIFO
+
+    def get_by_branch(self, branch: str) -> TerminalOutcomeRecord | None:
+        """Return the most-recently recorded record for *branch*, or None if unknown."""
+        return self._by_branch.get(branch)
+
+    def get_by_task(self, task_id: str) -> TerminalOutcomeRecord | None:
+        """Return the most-recently recorded record for *task_id*, or None if unknown."""
+        return self._by_task.get(task_id)
+
+    def forget(self, request_id: str) -> bool:
+        """Remove *request_id* from every lookup; return whether it had a record.
+
+        The "sticky per-task result cleared" retirement primitive (task ε):
+        after a ``merge_cancel`` the retirement path calls this so an immediate
+        resubmit observes a clean ring rather than the cancelled corpse's
+        ``'abandoned'`` record shadowing the branch/task.
+
+        Pops *request_id* from ``_index``; when a record was present, removes
+        it from ``_by_branch`` / ``_by_task`` under the SAME object-identity
+        guard ``record()`` uses for eviction (delete a secondary key only when
+        it still ``is`` that record) so a newer record that already claimed the
+        same branch/task key is never clobbered.  Also drops every alias whose
+        key OR value equals *request_id* (a coalesced id resolving to it, or an
+        alias registered under it).  The deque slot is left untouched — the
+        lossy-eviction contract tolerates a missing ``_index`` entry, so the
+        stale deque record simply becomes unreachable and ages out normally.
+
+        Returns True when a record was removed from ``_index``; False when
+        *request_id* had no direct record (aliases keyed by / pointing at it
+        are dropped regardless of the return value).
+        """
+        rec = self._index.pop(request_id, None)
+        if rec is not None:
+            # Identity-guarded secondary-index removal (mirrors record()'s
+            # eviction guard): only drop the key while it still points to *rec*.
+            if self._by_branch.get(rec.branch) is rec:
+                del self._by_branch[rec.branch]
+            if self._by_task.get(rec.task_id) is rec:
+                del self._by_task[rec.task_id]
+        # Drop aliases where *request_id* is the alias key or its resolution
+        # target — a stale coalesced id must not resolve to a forgotten record.
+        if self._aliases:
+            stale = [
+                k for k, v in self._aliases.items()
+                if k == request_id or v == request_id
+            ]
+            for k in stale:
+                del self._aliases[k]
+        return rec is not None
+
+
+class InFlightMergeRegistry:
+    """Per-branch in-flight de-dup registry for the merge-request chokepoint.
+
+    Tracks at most one in-flight merge request per branch (keyed by the bare
+    branch name, e.g. ``"591"`` not ``"task/591"``).  The slot is acquired at
+    dispatch and auto-released when the request's future resolves — via
+    ``Future.add_done_callback`` — so neither MergeWorker nor
+    SpeculativeMergeWorker needs any change.
+
+    Thread safety: all callers run in the same asyncio event loop; the
+    ``acquire`` check-and-set is synchronous so it is race-free within the
+    loop (no ``await`` between the presence check and the dict write).
+    """
+
+    def __init__(self) -> None:
+        self._slots: dict[str, _InFlightEntry] = {}
+
+    def acquire(
+        self,
+        branch: str,
+        task_id: str,
+        future: asyncio.Future,
+        *,
+        request_id: str | None = None,
+        source: str = 'mcp',
+        submitted_tip: str | None = None,
+        snapshot_tip: str | None = None,
+    ) -> bool:
+        """Atomic check-and-set: claim *branch* for *task_id*.
+
+        Returns True if the slot was free and has been claimed; False if
+        *branch* was already in-flight (caller should coalesce).
+
+        On success, registers a ``done_callback`` on *future* so that
+        ``_release_if_current(branch, entry)`` fires automatically on every
+        terminal path (result set, exception set, or cancellation).  The
+        identity guard ensures that a late callback from a cancelled stale
+        future does NOT clobber a subsequently re-acquired slot for the same
+        branch (see ``_release_if_current`` for details).
+
+        *request_id* is the stable per-instance identity of the dispatched
+        :class:`MergeRequest` (e.g. ``'mr-a1b2c3d4'``).  Stored on the
+        :class:`_InFlightEntry` so β1 can re-source the ``'attached'``
+        response from the existing entry's id rather than the submitting
+        request's id (PRD D8).
+
+        γ1 additions (keyword-only, all defaulted for back-compat):
+        - *source*: origin of the dispatcher (``'mcp'`` or ``'workflow'``).
+        - *submitted_tip*: branch tip SHA at submit time; used for
+          tip-relation classification downstream.
+        - *snapshot_tip*: branch tip SHA snapshotted at dispatch time
+          (often the same as *submitted_tip*); stored on the entry for
+          re-snapshot / gen-2 chaining (γ2).
+
+        The dispatcher is seeded as waiter #1 in ``entry.waiters``; the
+        entry invariant is ``in-flight ⟺ len(waiters) ≥ 1``.
+        """
+        if branch in self._slots:
+            return False
+        entry = _InFlightEntry(
+            task_id=task_id,
+            enqueued_monotonic=time.monotonic(),
+            request_id=request_id,
+            branch=branch,
+            snapshot_tip=snapshot_tip,
+            generation=1,
+            primary_future=future,
+        )
+        entry.waiters = [WaiterRecord(
+            request_id=request_id or '',
+            future=future,
+            source=source,
+            submitted_tip=submitted_tip,
+        )]
+        self._slots[branch] = entry
+        future.add_done_callback(lambda _: self._release_if_current(branch, entry))
+        return True
+
+    def is_inflight(self, branch: str) -> bool:
+        """True when *branch* has an active in-flight slot."""
+        return branch in self._slots
+
+    def entry(self, branch: str) -> _InFlightEntry | None:
+        """Return the in-flight entry for *branch*, or None if free."""
+        return self._slots.get(branch)
+
+    def eta_seconds(self, branch: str) -> int | None:
+        """Best-effort ETA (seconds) for the in-flight merge of *branch*.
+
+        Returns ``max(0, ESTIMATE - elapsed)`` as a coarse hint for pollers.
+        This is NOT a guaranteed bound — cold builds vary widely.  Returns
+        None when *branch* is not in-flight.
+        """
+        e = self._slots.get(branch)
+        if e is None:
+            return None
+        elapsed = time.monotonic() - e.enqueued_monotonic
+        remaining = _INFLIGHT_MERGE_ETA_ESTIMATE_SECS - elapsed
+        if remaining <= 0:
+            # Estimate exceeded — return None so callers fall back to a fixed
+            # backoff rather than busy-polling with a saturated 0 estimate.
+            # (ETA window is 600 s; liveness window is 10800 s — a worktree can
+            # legitimately be in-flight long after the ETA estimate runs out.)
+            return None
+        return int(remaining)
+
+    def attach(self, branch: str, waiter: WaiterRecord) -> bool:
+        """Attach *waiter* as a peer on the in-flight entry for *branch*.
+
+        Returns True if the branch is in-flight and the waiter was appended;
+        False if the branch is free (caller must dispatch independently).
+
+        Fan-out: registers a guarded done-callback on ``entry.primary_future``
+        that mirrors its terminal outcome (result / exception / cancel) onto
+        ``waiter.future``.  The guard skips ``waiter.future`` when it is
+        already done (soft-cancel / detach race), so the callback never raises
+        ``InvalidStateError``.
+
+        Synchronous (no ``await``) — I10 race-freedom guaranteed within a
+        single asyncio event loop tick.
+        """
+        entry = self._slots.get(branch)
+        if entry is None:
+            return False
+        entry.waiters.append(waiter)
+        primary = entry.primary_future
+        if primary is not None and primary is not waiter.future:
+            target = waiter.future
+
+            def _mirror(pf: asyncio.Future) -> None:
+                if target.done():
+                    return  # guard: pre-resolved / detached future — skip
+                if pf.cancelled():
+                    target.cancel()
+                elif (exc := pf.exception()) is not None:
+                    target.set_exception(exc)
+                else:
+                    target.set_result(pf.result())
+
+            primary.add_done_callback(_mirror)
+        return True
+
+    def detach(self, branch: str, request_id: str) -> int:
+        """Remove the waiter identified by *request_id* from *branch*.
+
+        Returns the remaining waiter count (0 when the last waiter detaches).
+
+        When the count reaches zero the entry is considered abandoned:
+        ``primary_future`` is cancelled (if not already done), which fires
+        the existing acquire-time release done-callback (slot freed) and
+        makes the existing ``_request_abandoned`` checkpoint return True at
+        the next worker poll — dropping the queued work with ZERO worker code
+        change.
+
+        While ≥ 1 waiter remains the entry proceeds normally (boundary test
+        10 substrate).
+
+        Returns 0 for a branch not in-flight (no-op, safe to call).
+        Unknown *request_id* is a no-op returning the unchanged count.
+
+        **Resolution race guard (γ2/task 1640 wiring invariant):**
+        ``primary_future`` may be cancelled by ``detach()`` while the worker
+        has already passed an ``_request_abandoned`` checkpoint (returning
+        False) but has not yet called ``req.result.set_result()`` /
+        ``set_exception()``.  Calling either on a cancelled future raises
+        ``InvalidStateError``.
+
+        The established codebase convention — ``if not req.result.done():
+        req.result.set_result(...)`` — is already present at every
+        production resolution site (e.g. lines 3054-3055, 3065-3066,
+        4456-4457) and degrades a detach-cancel race to a safe no-op.
+        **All new worker resolution paths introduced by γ2 (task 1640) MUST
+        use the same guard.**  No ``await`` may appear between an
+        ``_request_abandoned`` checkpoint returning False and the subsequent
+        resolution call.
+        """
+        entry = self._slots.get(branch)
+        if entry is None:
+            return 0
+        entry.waiters = [w for w in entry.waiters if w.request_id != request_id]
+        if not entry.waiters:
+            pf = entry.primary_future
+            if pf is not None and not pf.done():
+                pf.cancel()
+        return len(entry.waiters)
+
+    def re_snapshot(self, branch: str, new_tip: str) -> bool:
+        """Update the snapshot tip for *branch* to *new_tip*.
+
+        Returns True on success; False if *branch* is not in-flight.
+        The generation counter is NOT incremented here — the caller (γ2
+        worker wiring) increments it when triggering a new merge attempt.
+        """
+        entry = self._slots.get(branch)
+        if entry is None:
+            return False
+        entry.snapshot_tip = new_tip
+        return True
+
+    def set_verifying(self, branch: str, verifying: bool = True) -> None:
+        """Set the ``verifying`` flag on the in-flight entry for *branch*.
+
+        No-op when *branch* is not in-flight (safe to call on release race).
+        """
+        entry = self._slots.get(branch)
+        if entry is not None:
+            entry.verifying = verifying
+
+    def release(self, branch: str, *, detach_waiters: bool = False) -> None:
+        """Remove *branch* from the in-flight registry.
+
+        Public surface for callers that need to release a slot on an
+        exceptional path (e.g. enqueue failure before the worker can ever
+        resolve the future).  The ``done_callback`` registered inside
+        :meth:`acquire` is the normal release path; this method is the
+        explicit fallback used by the slot-leak guards in
+        :func:`register_and_enqueue_merge_request` and
+        :func:`coalesce_or_enqueue_merge_request`.
+
+        *detach_waiters* (keyword-only, default False):
+        When True, every still-pending waiter future (including the primary,
+        which is waiter #1) is cancelled atomically before the slot is
+        popped.  Use this on the **abnormal / stale-reap path** where the
+        primary is dead and any attached waiters would otherwise hang
+        forever.
+
+        Keep *detach_waiters=False* (the default) for the **normal
+        terminal resolution path**: the acquire-time done-callback
+        (``_release`` alias) fires BEFORE the attach() ``_mirror``
+        callbacks; cancelling waiters here would make ``_mirror`` see them
+        as already-done and skip delivery — regressing coalesced waiters
+        from receiving the real outcome to being cancelled instead.
+        """
+        if detach_waiters:
+            entry = self._slots.get(branch)
+            if entry is not None:
+                for w in entry.waiters:
+                    if not w.future.done():
+                        w.future.cancel()
+                entry.waiters.clear()
+        self._slots.pop(branch, None)
+
+    def _release_if_current(self, branch: str, entry: _InFlightEntry) -> None:
+        """Identity-aware acquire-time done-callback.
+
+        Pops *branch* from ``_slots`` only when the stored entry is still
+        *entry* (object-identity check via ``is``).
+
+        **Why identity matters.**  ``Future.cancel()`` / ``Future.set_result()``
+        schedule done-callbacks via ``loop.call_soon``, so they run on a LATER
+        event-loop turn — not synchronously.  The stale-reap path in
+        :func:`coalesce_or_enqueue_merge_request` calls
+        ``release(branch, detach_waiters=True)``, which cancels the stale
+        primary future and immediately re-acquires the slot for the same branch
+        with a fresh request.  A branch-keyed ``_release(branch)`` would then
+        pop the FRESH entry on the next loop turn, leaving the branch with no
+        registry slot for the rest of the freshly-dispatched merge — so a
+        concurrent :func:`merge_request` would not coalesce and would
+        double-dispatch, the exact failure the registry exists to prevent.
+
+        The identity guard makes the late callback a no-op once the slot has
+        moved on (``self._slots.get(branch)`` returns the FRESH entry, not
+        *entry*).  On the NORMAL terminal-resolution path the slot still IS the
+        entry, so it pops exactly as before.
+        """
+        if self._slots.get(branch) is entry:
+            self._slots.pop(branch, None)
+
+    # Keep the private alias so callers that hold a reference to ``_release``
+    # continue to work, and for the legacy path.  The acquire-time done-callback
+    # now uses ``_release_if_current(branch, entry)`` instead (identity-aware).
+    _release = release
+
+
+@dataclass
+class MergeDispatchResult:
+    """Structured return value from :func:`coalesce_or_enqueue_merge_request`.
+
+    Attributes:
+        dispatched: True when the request was enqueued (new work item added).
+        in_flight: True when a merge for *branch* was already in-flight and
+            the caller was coalesced rather than enqueued.
+        branch: The bare branch name (e.g. ``"591"``).
+        inflight_task_id: task_id of the existing in-flight merger, or None
+            when dispatched=True.
+        eta_seconds: Best-effort ETA (coarse heuristic, NOT a bound), or None
+            when dispatched=True or eta is unavailable.
+        source: ``'registry'`` (in-memory) or ``'worktree'`` (disk scan),
+            indicating which source detected the in-flight merger.  None when
+            dispatched=True.
+    """
+
+    dispatched: bool
+    in_flight: bool
+    branch: str
+    inflight_task_id: str | None = None
+    eta_seconds: int | None = None
+    source: str | None = None
+    inflight_request_id: str | None = None
+    """request_id of the already-in-flight MergeRequest for *branch* (D8).
+    Set on coalesce from the _InFlightEntry's stored request_id; None when
+    dispatched=True or the entry predates request_id tracking."""
+
+    rejected: bool = False
+    """True when the C3 submit gate REJECTed the request: a NEWER SHA was
+    submitted for *branch* while its EARLIER SHA is already in verify
+    (PRD §5 D3).  The live in-flight entry is left undisturbed.  Mutually
+    exclusive with ``dispatched``/``in_flight`` — a rejected result is neither
+    enqueued nor coalesced."""
+    reject_code: str | None = None
+    """Machine-readable reject code (e.g. ``'duplicate_in_verify'``) when
+    ``rejected=True``; None otherwise.  Surfaced as ``code`` in the
+    escalation ``merge_request`` MCP error envelope."""
+    existing_sha: str | None = None
+    """snapshot_tip of the IN-FLIGHT entry the submission collided with (D8:
+    correlate with the existing entry, not the rejected submission).  Set on a
+    C3 reject; None otherwise."""
+    verify_age_secs: int | None = None
+    """Age in seconds of the in-flight verify at reject time, sourced from the
+    live worker snapshot entry.  Set on a C3 reject; None otherwise."""
+
+
+@dataclass
+class WaiterRecord:
+    """Server-side durable-intent waiter record keyed by request_id.
+
+    Registered in the ``merge_request`` MCP tool's closure dict
+    ``_waiters[request_id]`` at dispatch time, and cleaned up via a
+    ``future.add_done_callback``.  The ``asyncio.shield`` on every awaiting
+    path (β1) ensures that cancelling the tool coroutine (MCP client
+    disconnect) does NOT cancel ``future`` — only an explicit
+    ``merge_cancel`` call (β2) may do so, by looking up this record and
+    cancelling ``future`` directly.
+
+    Lifecycle:
+      - Created in the dispatched-path of ``merge_request``.
+      - Cleaned up automatically when the future resolves/errors/cancels
+        (done_callback removes it from ``_waiters``).
+      - Consumed by β2 (``merge_cancel``) which looks up ``request_id``
+        here to cancel the future explicitly.
+    """
+
+    request_id: str
+    """Stable per-instance identity of the MergeRequest (e.g. 'mr-a1b2c3d4')."""
+    future: asyncio.Future = field(repr=False)
+    """The MergeRequest.result future — the one shielded from MCP disconnect."""
+    source: str = 'mcp'
+    """Origin of the waiter: 'mcp' (via merge_request tool) or 'workflow'."""
+    submitted_tip: str | None = None
+    """Git SHA of the branch tip at submit time (snapshot_tip), or None if unavailable."""
+    branch: str | None = None
+    """Bare branch name (e.g. '591') this waiter's merge targets, populated at
+    dispatch so ``merge_cancel`` can drive per-branch retirement (release the
+    registry slot / find the in-flight worktree) from a request_id alone (task
+    ε).  Back-compat optional (the ``_waiters`` dict is keyed by request_id)."""
+    task_id: str | None = None
+    """Task id of this waiter's merge, the ``_by_task`` retention-index key that
+    retirement clears (task ε).  Back-compat optional."""
+
+
+@dataclass(frozen=True)
+class QueuedBranch:
+    """A merge-queue branch name in both its bare and full-ref shapes.
+
+    ``bare_id`` is the task id alone (e.g. ``'4778'``); ``full_name`` is the
+    branch name with the configured prefix applied (e.g. ``'task/4778'``).
+
+    :meth:`parse` is the ONLY place bare/full pairing logic lives
+    (parse-don't-validate, ``plans/merge-queue-reliability-prd.md`` DD7) —
+    construct instances through it rather than the dataclass constructor
+    directly. It delegates the actual prefix-prepend rule to
+    :func:`shared.branch_names.canonical_queued_branch_name`, the existing
+    single source of truth for that rule, so the two never diverge. Git
+    refs should always be built from ``.full_name``; task/branch
+    bookkeeping keys should use ``.bare_id``.
+
+    Frozen (immutable) so two independently-parsed values compare equal by
+    field value (and hash identically), regardless of which shape the raw
+    input arrived in.
+
+    Consumed in production as of task ν (``plans/merge-queue-reliability-prd.md``
+    scope 5): :attr:`MergeRequest.branch` and :attr:`GroupMergeRequest.tip_branch`
+    are typed ``QueuedBranch``, parsed at every construction boundary; consumers
+    build git refs from ``.full_name`` and bookkeeping keys from ``.bare_id``.
+    ν narrowed the original spec — ``canonical_queued_branch_name`` (this type's
+    delegate) and ``GitOps.resolve_queued_branch_ref``'s try-both are RETAINED
+    (still load-bearing for raw-input and str-branch callers); only the
+    orchestrator-internal journal strip/re-add and re-exports were removed. Do
+    not add further ad hoc prefix-stripping/prepending call sites; route them
+    through :meth:`parse` instead.
+    """
+
+    bare_id: str
+    full_name: str
+
+    def __post_init__(self) -> None:
+        """Reject the grossest incoherent pairs: full_name must end with bare_id.
+
+        :meth:`parse` always produces this shape — ``full_name`` is always
+        ``branch_prefix + bare_id``, so ``full_name.endswith(bare_id)`` holds
+        for every prefix (including the empty-prefix case, where
+        ``full_name == bare_id``). This guard never rejects ``parse()``
+        output built from a non-empty raw id (the only kind any current
+        caller ever passes).
+
+        This is a partial, not complete, realization of "mixed shape
+        unrepresentable" (PRD DD7): ``__post_init__`` has no ``branch_prefix``
+        to check against, so it cannot enforce the stronger invariant
+        ``full_name == branch_prefix + bare_id`` — only the weaker
+        ``endswith`` consequence of it. A pathological hand-built pair can
+        still slip through, e.g. ``QueuedBranch(bare_id='778',
+        full_name='task/4778')`` satisfies ``endswith`` even though
+        ``bare_id`` is a truncation of the real id. ``parse()`` is the sole
+        intended constructor and always satisfies the stronger invariant;
+        this guard exists to catch gross incoherence (e.g. an unrelated or
+        wrongly-prefixed ``full_name``) in pairs built by bypassing it.
+
+        A degenerate empty ``bare_id`` is rejected outright rather than
+        left to the ``endswith`` check above, since every string trivially
+        ends with ``''`` — the ``endswith`` check alone cannot catch it.
+        This is reachable via ``parse('', branch_prefix)`` or
+        ``parse(branch_prefix, branch_prefix)`` (both strip to ``''``); no
+        current caller passes either, but an empty task id is meaningless,
+        so it is refused rather than silently producing a
+        ``QueuedBranch(bare_id='', full_name=branch_prefix)``.
+        """
+        if not self.bare_id:
+            raise ValueError(
+                f'QueuedBranch is incoherent: bare_id is empty '
+                f'(full_name={self.full_name!r})',
+            )
+        if not self.full_name.endswith(self.bare_id):
+            raise ValueError(
+                f'QueuedBranch is incoherent: full_name={self.full_name!r} '
+                f'does not end with bare_id={self.bare_id!r}',
+            )
+
+    @classmethod
+    def parse(cls, raw: str, branch_prefix: str) -> QueuedBranch:
+        """Parse *raw* (bare or already-prefixed) into a canonical QueuedBranch.
+
+        *raw* may arrive bare (``'4778'``) or already prefixed
+        (``'task/4778'``); both parse to the same value. ``full_name`` is
+        computed by delegating to
+        :func:`shared.branch_names.canonical_queued_branch_name` — the
+        existing single source of truth for the prepend-unless-present rule
+        — rather than reimplementing it here; ``bare_id`` is then stripped
+        from it the same way the ``merge_queue_store.py`` journal
+        normalization does. This is the ONLY place branch-prefix *pairing*
+        logic should live — callers should not reimplement prefix
+        stripping/prepending elsewhere.
+        """
+        full_name = canonical_queued_branch_name(raw, branch_prefix)
+        bare_id = full_name.removeprefix(branch_prefix)
+        return cls(bare_id=bare_id, full_name=full_name)
+
+
+@dataclass
+class MergeRequest:
+    """A request to merge a task branch into main."""
+
+    task_id: str
+    branch: QueuedBranch  # typed branch identity (task ν, PRD scope 5); .bare_id == the old bare "591", .full_name == the old f'{prefix}591'
+    worktree: Path
+    pre_rebased: bool
+    task_files: list[str] | None
+    module_configs: list[ModuleConfig]
+    config: OrchestratorConfig
+    result: asyncio.Future[MergeOutcome] = field(repr=False)
+    enqueued_at: float = field(default_factory=time.time, kw_only=True)
+    merge_first_enqueued_at: float | None = field(default=None, kw_only=True)
+    """Wall-clock epoch of the FIRST merge submission of this branch's lineage.
+
+    Sourced from ``metadata.merge_first_enqueued_at`` (persisted, survives
+    restart) and populated by :meth:`TaskWorkflow._stamp_first_merge_enqueue`
+    at the per-task merge-submit chokepoint (workflow.py α-substrate, task 1886).
+
+    Contrast with :attr:`enqueued_at`, which is re-stamped on every resubmission
+    and held in-memory only (lost on restart).  ζ's aging comparator at
+    ``_pop_next_pickable`` reads this field; ``None`` for legacy in-flight requests
+    created before α was deployed (ζ owns the ``enqueued_at`` fallback for those).
+    """
+    request_id: str = field(
+        default_factory=lambda: f'mr-{uuid.uuid4().hex[:8]}',
+        kw_only=True,
+    )
+    """Stable per-instance identity for this merge request (e.g. 'mr-a1b2c3d4')."""
+    snapshot_tip: str | None = field(default=None, kw_only=True)
+    """Optional git ref / SHA of the snapshot tip used by α3 merge-status lookups."""
+    generation: int = field(default=1, kw_only=True)
+    """Generation counter for auto-chained merges (γ2).  Gen-1 is the original;
+    each auto-chain increments by 1.  Bounded by MAX_AUTO_CHAINED_GENERATIONS."""
+    lane: Literal['normal', 'high'] = field(default='normal', kw_only=True)
+    """Priority lane for this request.  'high' requests are picked before all
+    'normal' requests; within a lane FIFO order is preserved."""
+    retry_failed_only: bool = field(default=False, kw_only=True)
+    """Caller-vouched flag routing this request's post-merge verify retries to
+    a failed-tests-only re-run instead of a full re-verify (PRD
+    docs/prds/verify-retry-failed-only.md task D1).
+
+    Threaded from ``merge_request(retry_failed_only=...)`` (escalation server)
+    onto the ``MergeRequest`` the merge worker dequeues, so it is visible on
+    ``req`` inside the worker's post-merge verify retry path
+    (:func:`orchestrator.merge_queue._run_post_merge_verify`).
+
+    When set, DF BUILDS THE SUBSET ITSELF (task 3059): on a classified
+    infra-transient attempt-0 red it derives the {did-not-pass} set from that
+    attempt's own per-test results plus a ``cargo nextest list`` planned probe,
+    corroborates the content-tree OID against reify's
+    ``target/reify-verify-attempt.json`` stamp, and ships the resulting
+    ``REIFY_VERIFY_RETRY_*`` contract in the retry's ``verify_env``.  reify's
+    ``verify.sh`` is the CONSUMER of that contract, not the producer of the
+    subset.  Every fail-safe route (no sidecar, no plan, a rebased tree) falls
+    back to a FULL re-verify.
+
+    Default ``False`` remains a strict no-op: no payload is built, no probe is
+    run, and every retry path behaves byte-identically."""
+
+
+@dataclass(frozen=True)
+class TrainCallbacks:
+    """Scheduler-backed callbacks for a single train, built in the harness.
+
+    Holds async callables captured over a live scheduler + train_id so
+    the merge worker (a pure git engine with no scheduler import) can flip
+    member tasks done after a train advance.  Built by
+    :func:`harness.build_train_callback_factory` and consumed by task γ when
+    it constructs :class:`GroupMergeRequest` inside SpeculativeMergeWorker.
+    """
+
+    status_check: Callable[[list[str]], Awaitable[dict[str, str]]]
+    """Async callback: given member_task_ids, return {task_id: status}."""
+
+    mark_member_done: Callable[[str, str], Awaitable[None]]
+    """Async callback: mark a single member task done with the merge SHA."""
+
+    redrive_member: Callable[[str, bool, str | None], Awaitable[None]] | None = None
+    """Async callback: re-drive an absorbed member that is still merge-deferred
+    after a coalesce-train derail.  Signature: (mid, found_on_main, sha) -> None.
+    found_on_main=True → mark done with found_on_main provenance (double-landing
+    guard); False → flip to pending so the scheduler re-dispatches a solo merge.
+    None when the callback is not available (back-compat with existing callers
+    that build TrainCallbacks with only status_check/mark_member_done)."""
+
+
+# Type alias for the factory that produces per-train callbacks.
+# Called with a train_id str; returns a TrainCallbacks for that train.
+TrainCallbackFactory = Callable[[str], TrainCallbacks]
+
+
+# Type alias for the injectable merge-ready predicate (δ/1720 confidence gate).
+# Called with a MergeRequest; returns an exclusion REASON string (truthy →
+# exclude from train) or None (eligible).  Returning the reason (not a bool)
+# lets the same value flow uniformly into the log line and the event
+# data['exclusions'] entry, for both built-in and injected predicates.
+MergeReadyPredicate = Callable[['MergeRequest'], 'str | None']
+
+
+@dataclass
+class GroupMergeRequest(MergeRequest):
+    """A request to atomically merge a linear-stacked train of task branches.
+
+    Extends :class:`MergeRequest` with train-specific fields and async
+    callbacks.  The base ``task_id`` / ``branch`` / ``worktree`` are set to
+    the TIP task's values so existing logging, event emission, and CAS
+    bookkeeping all behave normally.
+
+    The callbacks are populated by the enqueuer (δ₂) and capture the
+    scheduler + train_id, keeping the merge worker a pure git engine with no
+    direct scheduler dependency.
+    """
+
+    train_id: str
+    """Unique identifier for this train (e.g. the scheduler's train UUID)."""
+
+    member_task_ids: list[str]
+    """Ordered list of task IDs from root to tip (inclusive)."""
+
+    tip_branch: QueuedBranch
+    """Branch name of the tip task (alias of ``branch``)."""
+
+    tip_task_id: str
+    """Task ID of the tip member (alias of ``task_id``)."""
+
+    status_check: Callable[[list[str]], Awaitable[dict[str, str]]]
+    """Async callback: given *member_task_ids*, return ``{task_id: status}``."""
+
+    mark_member_done: Callable[[str, str], Awaitable[None]]
+    """Async callback: mark a single member task done with the merge SHA."""
+
+    redrive_member: Callable[[str, bool, str | None], Awaitable[None]] | None = field(
+        default=None, kw_only=True,
+    )
+    """Optional async callback: re-drive an absorbed member still merge-deferred
+    after a coalesce-train derail.  Signature: (mid, found_on_main, sha) -> None.
+    None when not wired (back-compat with existing test constructions)."""
+
+
+@dataclass
+class MergeOutcome:
+    """Result delivered to the caller via the Future."""
+
+    status: Literal['done', 'conflict', 'blocked', 'already_merged', 'wip_halted', 'done_wip_recovery', 'wip_recovery_no_advance', 'unmerged_state', 'stash_failed', 'unknown_branch', 'superseded', 'error']
+    reason: str = ''
+    conflict_details: str = ''
+    recovery_branch: str | None = None
+    overlap_files: list[str] | None = None
+    dirty_files: list[str] | None = None
+    """Dirty TRACKED files in project_root that ``advance_main`` could not park
+    before advancing — set only on the ``stash_failed`` outcome (task 2758).
+
+    Distinct from :attr:`overlap_files`, which means "uncommitted WIP that
+    overlaps the merge diff" (the ``wip_halted`` case): a stash_failed file
+    need not overlap the merge diff at all — it is a project_root main-checkout
+    hygiene fault (the shared park failed), not a per-merge-diff conflict."""
+    merge_sha: str | None = None
+    push_status: str | None = None
+    failure_diagnostic: dict[str, str] | None = None
+    failure_category: str = ''
+    """Structured post-merge VerifyResult category (e.g. 'gui_tsc') for the
+    workflow merge-thrash signature.  Empty when no VerifyResult was produced."""
+    failure_cause_hint: str = ''
+    """Structured post-merge VerifyResult cause_hint for the workflow
+    merge-thrash signature.  Empty when no VerifyResult was produced."""
+    verify_skipped: bool = False
+    """True when the disk guard fired and ``run_scoped_verification`` was never
+    called.  Lets callers distinguish a disk-guard short-circuit from an actual
+    verification failure in log messages."""
+    superseded_by: str | None = None
+    """request_id of the gen-(n+1) request that supersedes this one (γ2)."""
+    dedupe_fingerprint: str = ''
+    """Carries the preexisting-main-break dedupe fingerprint so the workflow
+    can fold N concurrent failing merges into one parent escalation via
+    ``submit_or_dedupe``.  Empty for all non-main-health outcomes."""
+    disposition: MergeFailureDisposition = MergeFailureDisposition.INDETERMINATE
+    """Merge-skew attribution verdict from ``classify_merge_failure_disposition``
+    (task 2381 α, mechanism M1 of plans/merge-skew-attribution-prd.md).
+    Defaults to INDETERMINATE, preserving today's behaviour for callers that
+    do not yet populate it (β routing/surfacing + γ runs.db event depend on
+    this field, keying off α alone — no dependency inversion)."""
+    skew_evidence: SkewEvidence | None = None
+    """The bundle GATHERED by ``classify_merge_failure_disposition``
+    (``ClassificationResult.observed_evidence``), carried so the step-18
+    ``merge_attempt`` emit can persist bounded evidence into runs.db (task 3178).
+
+    A non-None value is NOT a skew verdict — read ``disposition`` for that; see
+    ``ClassificationResult`` for the full contract. The distinction is
+    load-bearing HERE because it is what the emit guard keys on: an adjudicated
+    INDETERMINATE (evidence exists) emits a row, a skipped or fail-open one
+    (nothing gathered) emits none. ``None`` for callers that do not populate
+    it."""
+    landed_via_chain: int | None = None
+    """``1`` on an item landed by a deep merge-ahead chain walk (task 3186 δ);
+    ``None`` for every ordinary sequential landing — the "iff landed by a chain
+    walk" half of the PRD contract.  Each of the k items a walk lands carries
+    its own ``1``, so a walk contributes exactly k.
+
+    THE UNIT IS PINNED BY A COMMITTED CONSUMER, not by prose.
+    ``scripts/merge-deep-canary-predicate.sh:89-91`` already computes
+    ``items_per = sum(landed_via_chain over all merge_finalized) / n_deep``
+    and calls the result "items landed per deep verify run".  That arithmetic
+    is only correct if the per-walk contributions SUM to the number of items
+    the walk landed — which ``1``-per-landed-item satisfies by construction.
+    Stamping the chain size k on every one of k items would report k²/n_deep
+    instead, and stamping 1-indexed positions would report k(k+1)/2; η1's
+    filter (``isinstance(..., int) and >= 1``) is also why a walk that lands
+    nothing emits no value at all rather than a ``0``.  See
+    test_merge_queue_deep_landing.py, which asserts the encoding through a
+    verbatim transcription of that predicate rather than restating it."""
+
+
+@dataclass
+class SoloVerifyResult:
+    """Result of verifying a single train member's un-stacked delta in isolation.
+
+    Returned by :func:`reverify_member_solo`.  ``passed=True`` means the
+    member's own delta passes the post-merge verify in a fresh solo worktree;
+    ``passed=False`` means it failed (or the solo worktree could not be created
+    / the rebase conflicted — treated as a failer by the attribution logic).
+
+    ``merge_sha`` is the rebased tip SHA of the solo branch (used by
+    ``advance_main`` when the member passes and needs to land); None on failure.
+
+    ``solo_wt`` and ``solo_branch`` carry the isolated worktree path and branch
+    name so ``_attribute_train_failure`` can call ``advance_main`` for passers
+    without re-materialising the worktree (keeps the verify cost at ≤N+1).
+    """
+    member_id: str
+    passed: bool
+    merge_sha: str | None
+    reason: str = ''
+    solo_wt: Path | None = None
+    solo_branch: str | None = None
+
+
+@dataclass(eq=False)
+class SpecPermit:
+    """Opaque speculation-slot permit token (MQ-refactor zeta / task 2159).
+
+    Returned by ``PermitLedger.acquire()`` (see
+    ``merge_speculation_controller.py``) and stored on the pipeline item /
+    in-flight entry that owns it. ``eq=False`` leaves ``__eq__``/``__hash__``
+    at their ``object`` defaults — IDENTITY, not field-value — comparison, so
+    a ``PermitLedger``'s ``live`` set treats every acquired token as a
+    distinct member even though two permits' fields may compare equal.
+
+    ``released`` starts False and is flipped to True exactly once, by
+    ``PermitLedger.release`` — which checks this flag FIRST, so a second
+    release of the same token is a silent no-op rather than an over-release
+    or an assertion failure (kills the known CancelledError-after-put
+    double-release race).
+    """
+
+    released: bool = False
+
+
+@dataclass(eq=False)
+class CapPermit:
+    """Opaque merge-ahead-cap permit token (MQ-refactor theta / task 2161).
+
+    The ``_merge_ahead_cap`` analogue of :class:`SpecPermit`: returned by a
+    :class:`~orchestrator.merge_speculation_controller.PermitLedger`
+    constructed with ``token_factory=CapPermit`` and stored on the
+    :class:`RealMergeItem` that owns it (``.cap_permit``). Byte-for-byte
+    mirror of :class:`SpecPermit` -- same ``eq=False`` IDENTITY (not
+    field-value) comparison so a ledger's ``live`` set treats every acquired
+    token as a distinct member, and the same once-only ``released`` flip
+    that makes a second release of the same token a silent no-op rather than
+    an over-release or an assertion failure.
+    """
+
+    released: bool = False
+
+
+@dataclass
+class RealMergeItem:
+    """Internal message passed from Merger coroutine to Verifier coroutine:
+    a merge actually happened and needs verification + CAS-advance of main.
+
+    The REAL arm of the MQ-refactor ο item union (mirrors ``classify_and_merge``'s
+    :class:`MergedOk`).  Structurally disjoint from :class:`DecidedItem` — this
+    class has no ``immediate_outcome``/``already_delivered``/``failure_diagnostic``
+    fields, so the task-1990 I2 "REAL xor DECIDED" __post_init__ check retires
+    into type structure: the illegal shape can no longer be constructed.
+    """
+
+    request: MergeRequest
+    merge_result: MergeResult          # the successful merge result
+    merge_wt: Path                     # Merge worktree
+    base_sha: str                      # main SHA at merge time (actual or speculative)
+    speculative: bool                  # True → merged against pending N's SHA
+    started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
+    merged_branch_tip: str | None = None  # γ2: branch HEAD rev-parsed by the merger; passed to _finalize_advanced_merge
+    cap_permit: CapPermit | None = None  # θ: merge-ahead-cap token owned by PermitLedger; non-None for non-speculative, non-train successful merges (Mechanism 1)
+    permit: SpecPermit | None = None  # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
+    # task 3206 / PRD §5.3 re-merge carve-out: True → produced by _remerge (a
+    # RECOVERY re-merge onto real main), so the §5.3 verify-base⊄frozen-tip
+    # guard is exempt.  Set ONLY at _remerge's single-exit chokepoint (which
+    # covers all five consumer paths); default False keeps every other
+    # construction site unchanged.
+    #
+    # SCOPED TO THE RECOVERY BASE, NOT THE ITEM'S LIFETIME.  dataclasses.replace
+    # copies the marker like any other field, so a re-anchoring rebuild would
+    # otherwise carry the exemption onto a base the carve-out never justified.
+    # The two finalize-path rebuilds that re-anchor base_sha (gate rebase, CAS
+    # retry) therefore pass remerge_recovery=False explicitly; a future re-anchor
+    # site must do the same or it opens a silent §5.3 false-negative window.
+    remerge_recovery: bool = False
+
+
+@dataclass
+class DecidedItem:
+    """Internal message passed from Merger coroutine to Verifier coroutine:
+    a terminal MergeOutcome was already decided — delivered as a passthrough
+    (no real verify task) in submission order.
+
+    The DECIDED arm of the MQ-refactor ο item union (mirrors
+    ``classify_and_merge``'s :class:`Decided`).  Structurally disjoint from
+    :class:`RealMergeItem` — this class has no
+    ``merge_result``/``merge_wt``/``merged_branch_tip``/``cap_permit``
+    fields, so the task-1990 I2 "REAL xor DECIDED" __post_init__ check retires
+    into type structure: the illegal shape can no longer be constructed.
+    """
+
+    request: MergeRequest
+    immediate_outcome: MergeOutcome    # conflict / already_merged / train-handoff / retry outcome
+    base_sha: str                      # main SHA at merge time (actual or speculative)
+    speculative: bool                  # True → merged against pending N's SHA
+    started_monotonic: float | None = None  # time.monotonic() at entry; None → unset, _elapsed_ms returns None
+    already_delivered: bool = False  # True → merger resolved req.result OOB; verifier skips set_result but still runs n_failed/slot bookkeeping
+    failure_diagnostic: dict[str, str] | None = None  # Populated on non-conflict merge failure
+    permit: SpecPermit | None = None  # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
+    # task 3206 / PRD §5.3: mirrors RealMergeItem so BOTH arms of the union
+    # carry the marker.  Currently UNREAD on this arm — both §5.3 consumers
+    # (_warn_if_verify_base_not_frozen_tip, _frozen_base_chain) type-narrow to
+    # RealMergeItem before reading it, because only a real merge has a verify
+    # base to check.  It is not decorative, though: _remerge's single-exit
+    # chokepoint stamps the marker with dataclasses.replace on whichever
+    # variant its body returned, and replace() raises TypeError for an unknown
+    # field — so dropping this would break every DecidedItem exit of the
+    # recovery path.  See the RealMergeItem field for the lifetime scoping.
+    remerge_recovery: bool = False
+
+
+SpeculativeItem: TypeAlias = RealMergeItem | DecidedItem
+"""Union of the two pipeline-item variants passed from Merger to Verifier
+(task ο / MQ-refactor).  Retained under its original task-1990 name so every
+existing ``item: SpeculativeItem`` annotation and ``isinstance(item,
+SpeculativeItem)`` check keeps working unchanged — only the CONSTRUCTORS
+changed, from the single product dataclass to :class:`RealMergeItem` /
+:class:`DecidedItem`."""
+
+
+def item_merge_wt(item: SpeculativeItem) -> Path | None:
+    """Return the merge worktree owned by *item*, if any.
+
+    Centralizes the "clean up the owned worktree, if this item has one"
+    pattern shared by the various cleanup/drain call sites: a
+    :class:`RealMergeItem` always owns a merge worktree; a
+    :class:`DecidedItem` never does (it short-circuited before any merge
+    worktree existed).  The ``assert_never`` fallthrough makes pyright flag
+    any future third variant that isn't handled here.
+    """
+    match item:
+        case RealMergeItem():
+            return item.merge_wt
+        case DecidedItem():
+            return None
+        case _:
+            assert_never(item)
+
+
+@dataclass
+class MergedOk:
+    """A merge actually happened — returned by ``classify_and_merge`` on success.
+
+    The REAL arm of the classify_and_merge sum type (mirrors SpeculativeItem's
+    REAL-xor-DECIDED shape).  ``branch_tip`` is the rev-parsed HEAD of the
+    source branch captured during the already-merged check, unifying the
+    three separate tip-captures previously duplicated across
+    ``_do_merge``/``_merger_loop``/``_remerge`` into one value that feeds
+    ``merged_branch_tip`` downstream.
+    """
+
+    merge_result: MergeResult
+    merge_wt: Path | None
+    branch_tip: str | None
+
+
+@dataclass
+class Decided:
+    """A terminal MergeOutcome was reached — returned by ``classify_and_merge``
+    on any non-success path (missing branch, already-merged, conflict,
+    non-conflict failure, or drop-guard).
+
+    The DECIDED arm of the classify_and_merge sum type.  ``merge_result`` is
+    populated only for the conflict / non-conflict-failure paths (it carries
+    the failed ``MergeResult`` so ``_remerge``'s speculation-race retry gate
+    can inspect ``.success``/``.conflicts``/``.details``/``.pre_merge_sha``);
+    it is ``None`` for the branch-presence / already-merged / drop-guard
+    paths, which never attempt a merge.
+    """
+
+    outcome: MergeOutcome
+    merge_result: MergeResult | None = None
+
+
+@dataclass
+class ChainResult:
+    """Result of a deep merge-ahead chain build (``plans/deep-merge-ahead-prd.md``
+    §Contract, task β).
+
+    Returned by :func:`orchestrator.merge_queue.build_chain`, which
+    sequentially merges queued items in submission order onto the frozen
+    head's merge commit inside ONE scratch worktree, truncating at the first
+    textual conflict.  Sibling of the ``classify_and_merge`` sum type
+    (:class:`MergedOk` / :class:`Decided`) — same family, one level up: those
+    describe a single item's merge, this describes a whole speculative chain.
+
+    Field semantics:
+
+    * ``links`` — ``(task_id, merge_commit)`` in LAND order.  A contiguous
+      PREFIX of the queue snapshot: never a subset with a hole, because δ
+      lands these in order through the existing CAS advance and a hole would
+      break the in-order / frozen-prefix invariant.
+    * ``tip`` — the SHA the chain ends at.  Equals ``head_merge_commit`` when
+      ``links`` is empty, so a zero-link result still names a verifiable tip.
+    * ``truncated_at`` — ``task_id`` of the first item that did NOT chain, or
+      ``None``.  **A depth stop is NOT a truncation**: when the walk stopped
+      because it reached ``target_depth``/``cap``, or ran the whole snapshot
+      clean, ``truncated_at`` is ``None``.
+    * ``truncated_reason`` — ``'conflict'`` (genuine textual conflict — an
+      expected, benign chain outcome), ``'train_request'`` (a
+      :class:`GroupMergeRequest`, which ``_do_train_merge`` owns),
+      ``'already_merged'`` (the item's work is ALREADY in the base, so
+      ``git merge --no-ff`` was a no-op — benign: it caps the chain but
+      signals no fault, and the item's real verdict is rendered by the
+      sequential path's ``_is_genuinely_merged`` guard), or ``'merge_error'``
+      (a non-conflict merge failure: missing ref, hook rejection).  **Only
+      ``'merge_error'`` denotes a genuine fault** — the other three are
+      expected outcomes and are deliberately NOT collapsed into it, so ε's
+      deep-fail reader is not inflated with non-faults.
+    * ``lane`` / ``lane_warm`` — the ONE scratch worktree holding ``tip``.
+    * ``build_ms`` — wall-clock milliseconds the build cost, stamped by γ's
+      caller (``_deep_chain_placement``) rather than by ``build_chain``
+      itself, so it measures the FULL stall the dispatch loop pays: lane
+      acquisition, the sequential merges, and the ``asyncio.timeout`` wrapper's
+      own overhead.  ``None`` on any result ``build_chain`` returned directly
+      to a caller that did not stamp it.  γ emits it as the ``chain_build_ms``
+      field on the same ``merge_verify`` event that carries ``chain_items``,
+      because the build is awaited INLINE on the dispatch path: for its whole
+      duration ``_verifier_loop`` cannot run FINALIZE-HEAD, and that per-round
+      stall must be attributable to the chain rather than misread as verify
+      time (see the Caller-cost note on ``build_chain``).
+
+    **Decision #4 — the ``truncated_at`` item MUST NOT have any outcome
+    emitted for it.**  A chain conflict at position j may be a conflict with
+    an *unlanded* predecessor, so item j is not genuinely conflicted; it takes
+    its normal sequential path later.  ``build_chain`` therefore never
+    resolves a future, never calls ``_emit_merge_attempt``, and never calls
+    ``_note_conflict_detected`` for any item in the snapshot.
+
+    **Lane ownership.**  A NON-EMPTY result HOLDS ``lane``, and the caller
+    MUST release it via
+    :func:`orchestrator.merge_liveness.release_chain_build_lane` (passing
+    ``warm=lane_warm``) once done with the tip.  An EMPTY result never holds a
+    lane (``lane is None``, ``lane_warm is False``), so a caller that skips
+    the release on the empty path cannot leak one.
+    """
+
+    links: list[tuple[str, str]]
+    tip: str
+    truncated_at: str | None = None
+    truncated_reason: str | None = None
+    lane: Path | None = None
+    lane_warm: bool = False
+    build_ms: int | None = None
+
+    @property
+    def depth(self) -> int:
+        """Number of chained links — items ADDITIONAL to the dispatching one.
+
+        Off by one from the ``chain_items`` telemetry field on purpose: the
+        dispatching item is chain item #1 and is not a link, so γ emits
+        ``1 + depth`` (merge_queue.py, ``_run_inflight_verify``'s chain arm).
+        A 2-link chain is ``depth == 2`` and ``chain_items == 3``.
+        """
+        return len(self.links)
+
+
+class InflightStatus(StrEnum):
+    """Sentinel status values for :class:`InflightEntry` / :class:`InflightVerifyResult`.
+
+    A single str-compatible Enum (task 1990 / MQ-invariants ε) shared by both
+    dataclasses' ``status`` fields — ``InflightEntry.status`` carries the two
+    PREDISPATCH members, or DROPPED / REQUEUED once a verify has vacated the
+    entry (see :attr:`InflightEntry.vacated`); ``InflightVerifyResult.status``
+    carries only the first three (DROPPED / REQUEUED / RUNNER_UNAVAILABLE).
+    Members are ``str`` instances (mirrors ``event_store.EventType`` /
+    ``verify_runner.DriftVerdict``), so every existing ``==`` / ``in``
+    comparison against the raw sentinel strings keeps working unchanged.
+    """
+
+    DROPPED = 'DROPPED'
+    REQUEUED = 'REQUEUED'
+    RUNNER_UNAVAILABLE = 'RUNNER_UNAVAILABLE'
+    ABANDONED_PREDISPATCH = 'ABANDONED_PREDISPATCH'
+    REQUEUED_PREDISPATCH = 'REQUEUED_PREDISPATCH'
+
+
+class OutcomeKind(StrEnum):
+    """The ``_emit_merge_attempt`` outcome vocabulary (task 2165).
+
+    A single str-compatible Enum (mirrors ``InflightStatus`` above /
+    ``event_store.EventType``) enumerating every ``data['outcome']`` value
+    passed to :func:`orchestrator.merge_queue._emit_merge_attempt`. Members
+    are ``str`` instances, so every existing ``==``/``in``/JSON comparison
+    against the raw outcome strings keeps working unchanged, and
+    ``EventStore.emit``'s ``json.dumps`` produces byte-identical payloads to
+    before this enum existed.
+
+    Member names are lowercase and match their values, following
+    ``EventType``'s convention (the event-vocabulary sibling emitted
+    alongside this one in the same ``merge_attempt`` row) rather than
+    ``InflightStatus``'s uppercase sentinels — the wire values here are
+    already lowercase.
+
+    ``'blocked'`` is intentionally NOT a member: bare-infrastructure
+    ``blocked`` outcomes (merge-infra failures unrelated to conflicts,
+    ``advance_main``'s ``not_descendant``/``contaminated``/``stash_failed``
+    codes) are documented as never passed to ``_emit_merge_attempt`` — see
+    its docstring. Only specific diagnostic ``blocked`` outcomes (e.g.
+    ``dropped_plan_targets``, ``cas_exhausted``) are emitted, and those have
+    their own members here.
+    """
+
+    done = 'done'
+    already_merged = 'already_merged'
+    unknown_branch = 'unknown_branch'
+    conflict = 'conflict'
+    merge_failed = 'merge_failed'
+    verify_failed = 'verify_failed'
+    advance_failed = 'advance_failed'
+    dropped_plan_targets = 'dropped_plan_targets'
+    abandoned_verify_timeouts = 'abandoned_verify_timeouts'
+    train_incomplete = 'train_incomplete'
+    train_rebase_conflict = 'train_rebase_conflict'
+    train_partial_flip = 'train_partial_flip'
+    cas_exhausted = 'cas_exhausted'
+    main_health_red = 'main_health_red'
+    post_merge_equivalence_failed = 'post_merge_equivalence_failed'
+    post_merge_pyright_broken = 'post_merge_pyright_broken'
+    plan_files_not_touched = 'plan_files_not_touched'
+    plan_files_narrowed = 'plan_files_narrowed'
+    plan_files_cross_repo = 'plan_files_cross_repo'
+    plan_files_already_landed = 'plan_files_already_landed'
+    cas_retry = 'cas_retry'
+    gate_retry = 'gate_retry'
+    post_merge_generation_chained = 'post_merge_generation_chained'
+
+    @property
+    def is_terminal(self) -> bool:
+        """False for the four outcomes where the attempt/merge is still live.
+
+        See ``_NON_TERMINAL_OUTCOMES`` below (defined after this class;
+        looked up here at call time, once the module has finished loading).
+        """
+        return self not in _NON_TERMINAL_OUTCOMES
+
+
+_NON_TERMINAL_OUTCOMES: frozenset[OutcomeKind] = frozenset({
+    OutcomeKind.cas_retry,
+    OutcomeKind.gate_retry,
+    OutcomeKind.post_merge_generation_chained,
+    OutcomeKind.plan_files_narrowed,
+})
+"""The non-terminal subset of :class:`OutcomeKind` — attempt/merge still live.
+
+``cas_retry``/``gate_retry``: the attempt continues (a retry is queued).
+``post_merge_generation_chained``: the gen-(n+1) request is enqueued by
+``_maybe_auto_chain_generation`` BEFORE this emit, so the merge is still live.
+``plan_files_narrowed``: a mid-submission waypoint — enqueue / ``merge_queued``
+follows in the same flow.
+
+FROZEN CONTRACT: this exact set is mirrored by the dashboard's
+``_ACTIVE_ONLY`` allowlist (``dashboard/src/dashboard/data/merge_queue.py``),
+which has no import on this module. Changing this set REQUIRES updating that
+allowlist in the same change — see the pinning test in
+``tests/test_outcome_kind.py::TestOutcomeKindFrozenContract``.
+"""
+
+
+class ItemLifecycleState(StrEnum):
+    """The single source of an item's merge-queue lifecycle state
+    (merge-queue-reliability PRD scope-4 iota / task 2164, L-1).
+
+    Normalizes today's FOUR redundant state encodings — container
+    membership across the five queues (``_queue``/``_lane_buffers``/
+    ``_verifier_queue``/``_redispatch``/``_dispatch_item``), the free-form
+    ``InflightEntry.phase: str`` field (deleted by task lambda / task 2173 —
+    phase is now derived via ``SpeculativeMergeWorker._entry_phase()``), the
+    :class:`InflightStatus` sentinel enum above, and the four worker transient side-fields
+    (``_inflight_req``/``_remerging_item``/``_finalizing_head``/
+    ``_dispatching_item``) — into ten members tracing the pipeline flow:
+    queued -> (lane_buffered ->) merging -> awaiting_verify ->
+    (redispatch_parked <->) dispatching -> verifying -> gate_reverify ->
+    finalizing -> terminal.
+
+    Members are ``str`` instances (mirrors :class:`InflightStatus` /
+    :class:`OutcomeKind` above). Only THREE members share a wire value with
+    an existing live phase string today — ``VERIFYING`` ('verifying', set in
+    ``_run_inflight_verify``), ``GATE_REVERIFY`` ('gate_reverify'), and
+    ``FINALIZING`` ('finalizing') (the latter two set in
+    ``_finalize_inflight``) — so ``==``/``in`` comparisons against THOSE
+    THREE raw strings keep working unchanged. The other seven members are
+    new vocabulary replacing queue-membership / worker-side-field encodings
+    that never had a phase-string form, so there is no existing raw string
+    for them to stay compatible with.
+
+    The live pipeline (``_dispatch_item``) also sets phase values this enum
+    does NOT model, so task kappa's downstream repoint is a value REMAP for
+    these, not a mechanical rename:
+
+      * ``_verify_phase = 'remerging'`` (cascade-remerge window) is the live
+        string for the conceptual MERGING state used by the cascade-remerge
+        edges in ``_LEGAL_TRANSITIONS`` below — the wire VALUES differ
+        ('remerging' vs 'merging') even though the STATE is the same.
+      * The (deleted) ``entry.phase`` values ``'abandoned'``, ``'halted'``,
+        and ``'passthrough'`` (pre-dispatch abandon / operator-halt /
+        decided-item passthrough branches) never had a member here at all —
+        this substrate intentionally does not model them. Task lambda (task
+        2173) confirmed all three values only ever appeared on entries
+        finalized inline before any reader could observe them, so the
+        omission was never a gap.
+
+    This is ONLY the state vocabulary — see
+    ``orchestrator.merge_queue.ItemLifecycle`` for the request_id-keyed
+    registry, ``orchestrator.merge_queue._LEGAL_TRANSITIONS`` for the
+    legal-edge table, and ``ItemLifecycle.transition()`` for the guarded
+    mutator. Task iota delivers only this substrate; the sibling task kappa
+    wires ``transition()`` at every put/pop call site and repoints
+    ``snapshot()`` / the permit audit / liveness checks onto the registry.
+    """
+
+    QUEUED = 'queued'
+    LANE_BUFFERED = 'lane_buffered'
+    MERGING = 'merging'
+    AWAITING_VERIFY = 'awaiting_verify'
+    REDISPATCH_PARKED = 'redispatch_parked'
+    DISPATCHING = 'dispatching'
+    VERIFYING = 'verifying'
+    GATE_REVERIFY = 'gate_reverify'
+    FINALIZING = 'finalizing'
+    TERMINAL = 'terminal'
+
+
+@dataclass
+class VerifyWorktreeHandle:
+    """The worktree ``_run_inflight_verify`` is ACTUALLY verifying in (task 3186).
+
+    A one-field mutable box, and the shape is forced by construction order:
+    ``_dispatch_item`` creates the verify task BEFORE it builds the
+    :class:`InflightEntry` that wraps it, so the coroutine cannot simply be
+    handed the entry to write back into.  The box is created first, passed to
+    the verify as a keyword-only kwarg, and stored on the entry — so both ends
+    hold the same object and the WRITER (the warm-swap block) publishes to the
+    READER (δ's adoption) without either knowing about the other.
+
+    Named fields rather than a bare list or tuple deliberately: the field names
+    ARE the documentation of what gets published, and a positional container
+    would make the ``spec_warm`` half — which decides whether a pooled lane is
+    RELEASED or ``git worktree remove``d — a silently swappable boolean.
+
+    WHY IT EXISTS.  ``InflightEntry.merge_wt`` is the PRE-verify fact.  On the
+    LOCAL warm path ``_acquire_warm_verify_worktree`` replaces that ephemeral
+    ``_merge-<uuid>`` with the persistent ``_merge-verify`` lane (or a pooled
+    ``_spec-`` lane), deregisters the ephemeral from the liveness ledger and
+    removes it from disk — after which the entry's own field names a path that
+    no longer exists.  For an ORDINARY landing that is harmless, because the
+    PASS arm reads ``vr.merge_wt``; but δ's adopted head has NO ``vr`` (its
+    verify was torn down on the tip's authority), so without this handle the
+    adoption would land from the corpse: ``advance_main``'s retry loop would
+    ``git rebase`` against a missing cwd, the D10 ``refresh_warm_base`` gate
+    (keyed on the lane NAME) would never match, and the live lane would never
+    reach the release path at all.
+
+    Fields
+    ------
+    merge_wt  : the worktree the verify is currently using — seeded with the
+                item's own ephemeral at dispatch, overwritten by the warm swap.
+    spec_warm : ``True`` when *merge_wt* is a warm-seeded lane, i.e. the value
+                ``_release_or_cleanup`` needs to return it to the POOL instead
+                of removing it.
+    """
+
+    merge_wt: Path | None = None
+    spec_warm: bool = False
+
+
+@dataclass(frozen=True)
+class VerifyBaseFacts:
+    """The dispatch-time base facts a verify's merge-skew classifier attributes
+    a failure against (task 2383 β).
+
+    ``main_sha`` is the item's FROZEN merge-time ``base_sha``, never a fresh
+    read of main (task 2357) — or, when a variable-depth probe fires, the
+    deeper cumulative tip it probed (task 2359), a relabel that never touches
+    the item.  ``merge_base_sha`` is ``git merge-base`` of ``main_sha`` and
+    the item's ``merged_branch_tip``; ``None`` (unresolvable) skips
+    classification, degrading to INDETERMINATE (I3, fail-open).
+    """
+
+    main_sha: str
+    merge_base_sha: str | None
+
+
+@dataclass
+class InflightEntry:
+    """An in-flight verify entry held in SpeculativeMergeWorker._inflight deque.
+
+    One entry per item that has been dispatched to a host and has a background
+    asyncio verify task running (or a passthrough/sentinel that needs serial
+    finalization in submission order).
+
+    Ordering invariant
+    ------------------
+    The deque head is always finalized before the next entry is processed.
+    This guarantees that main is advanced in SUBMISSION ORDER regardless of
+    which background verify task finishes first.
+
+    This invariant covers main-advancement ordering; it does NOT guarantee
+    that result-Future delivery is strictly ordered across item types.
+    Passthrough entries (verify_task=None, immediate_outcome set) are finalized
+    INLINE during DISPATCH-FILL — meaning a later passthrough can resolve its
+    Future before an earlier real-verify entry resolves its Future.  Because
+    passthroughs never advance main (they are conflict / already_merged / skip),
+    this does not violate the main-advancement order guarantee.  No known
+    consumer depends on strict cross-item Future-resolution ordering.
+
+    Fields
+    ------
+    item           : the SpeculativeItem being verified
+    lease          : the HostLease held for this verify (None for passthroughs)
+    verify_task    : the asyncio.Task wrapping _run_inflight_verify (None for passthroughs)
+    merge_wt       : the merge worktree path.  The PRE-verify fact UNTIL δ's
+                     adoption publishes the post-verify one onto it (task
+                     3186): ``_run_inflight_verify`` never writes this field,
+                     so for every non-adopted entry it stays the ephemeral
+                     ``_merge-<uuid>`` the item was merged in, and the
+                     post-verify path is ``vr.merge_wt``.
+    verify_wt      : the :class:`VerifyWorktreeHandle` the verify task
+                     publishes its CURRENT worktree into (task 3186).  ``None``
+                     for a passthrough entry and for the hand-built entries in
+                     the test suite; readers must tolerate that.
+    spec_warm      : warmth of ``merge_wt`` once adoption has published it —
+                     the value ``_finalize_inflight`` hands
+                     ``_release_or_cleanup`` when there is no ``vr`` to read it
+                     from.  Meaningless (and never read) unless
+                     ``chain_adopted``.
+    was_speculative: True if item.speculative was True at dispatch time (for slot release)
+    passthrough_outcome: set for immediate-outcome entries (conflict/already_merged/skip_verify)
+                         that are enqueued without a real verify task so finalize can deliver
+                         them in submission order
+    verify_result  : set when the verify has completed (pass=None; fail=VerifyResult)
+    status         : optional sentinel.  ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH are
+                     set by _dispatch_item; DROPPED / REQUEUED by the entry's own verify
+                     when it vacates the entry (see :attr:`vacated`, task 4582).
+    chain          : the :class:`ChainResult` this dispatch's verify was
+                     REDIRECTED onto (task 3185, PRD γ), or ``None`` on the
+                     ordinary adjacent-verify path.  Its READER is
+                     SpeculativeMergeWorker._land_chain_prefix (task 3186, PRD
+                     δ), the in-order CAS walk that lands ``links`` once the
+                     tip has passed; a red or errored tip still adopts nothing
+                     (see _run_inflight_verify's chain arm).  NOTE the lane
+                     referenced here is already RELEASED by the time
+                     _finalize_inflight sees this entry: _run_inflight_verify
+                     returns it to the pool in its own ``finally``, so this
+                     field is never a release handle.
+    chain_adopted  : ``True`` when δ (task 3186) claimed THIS entry for a
+                     green chain tip.  Set only on the HEAD I0 — the
+                     non-speculative trust anchor whose merge commit the
+                     speculative slot-2 item was stacked on, so the tip's
+                     cumulative tree strictly CONTAINS the head's.  PRD
+                     decision #3 makes that tip authoritative for the whole
+                     prefix, which is why the adopting exit cancels the head's
+                     own in-flight verify rather than waiting for a verdict
+                     about a subset it already has better evidence for.
+                     ``_finalize_inflight`` reads it for exactly two things:
+                     to tolerate the ``CancelledError`` that teardown produces
+                     at its ``await entry.verify_task``, and to decline a
+                     verdict that already came back RED (the PRD's
+                     "Head-fail + tip-pass" boundary row).  Never set on a
+                     chain LINK — links are landed by the walk and never had
+                     an ``InflightEntry`` at all.
+    verify_base    : the :class:`VerifyBaseFacts` this entry's verify forwarded
+                     to classification, published by the verify itself
+                     through :class:`InflightEntrySlot` (task 5447).  ``None``
+                     until resolved, and always ``None`` for passthroughs.
+    """
+
+    item: SpeculativeItem
+    lease: Any | None                       # HostLease | None
+    verify_task: asyncio.Task | None        # type: ignore[type-arg]
+    merge_wt: Path | None
+    was_speculative: bool
+    passthrough_outcome: MergeOutcome | None = None
+    verify_result: VerifyResult | None = None  # None = pass; VerifyResult = fail/skip
+    status: InflightStatus | None = None    # sentinel: DROPPED / REQUEUED / RUNNER_UNAVAILABLE / ABANDONED_PREDISPATCH / REQUEUED_PREDISPATCH
+    started_at: float | None = None         # time.time() at dispatch construction (≈ verify start)
+    permit: SpecPermit | None = None        # ζ: speculation-slot token owned by PermitLedger; threaded/released by η
+    chain: ChainResult | None = None        # γ (task 3185): the deep chain this verify was redirected onto
+    chain_adopted: bool = False             # δ (task 3186): this HEAD lands on a green tip's authority
+    verify_wt: VerifyWorktreeHandle | None = None  # δ (task 3186): the verify's POST-swap worktree
+    spec_warm: bool = False                 # δ (task 3186): warmth of an ADOPTED head's published merge_wt
+    verify_base: VerifyBaseFacts | None = None
+
+    @property
+    def vacated(self) -> bool:
+        """True once the verify dropped or requeued this entry's request and
+        released its lease; only the head-of-line finalize remains."""
+        return self.status in (InflightStatus.REQUEUED, InflightStatus.DROPPED)
+
+    def __post_init__(self) -> None:
+        """Enforce the I2-shadow invariant (task 1990 / MQ-invariants ε).
+
+        A passthrough entry (immediate-outcome delivery, no real verify) must
+        wrap a DECIDED item — i.e. passthrough_outcome is set only when the
+        wrapped item is a :class:`DecidedItem` (task ο).
+        """
+        if self.passthrough_outcome is not None and not isinstance(self.item, DecidedItem):
+            raise ValueError(
+                'InflightEntry.passthrough_outcome requires item to be a DecidedItem; got '
+                f'passthrough_outcome={self.passthrough_outcome!r} on an item of type '
+                f'{type(self.item).__name__}',
+            )
+
+
+@dataclass
+class InflightEntrySlot:
+    """The :class:`InflightEntry` wrapping a verify, handed to that verify (task 4582).
+
+    Built empty before the verify task for the reason
+    :class:`VerifyWorktreeHandle` gives, and filled by ``_dispatch_item`` once
+    the entry exists, before the verify first runs, so a verify that requeues
+    or drops its request vacates its OWN entry, and publishes its base facts
+    onto it.
+    """
+
+    entry: InflightEntry | None = None
+
+    def publish_verify_base(self, facts: VerifyBaseFacts) -> None:
+        """Record *facts* on the entry for ``snapshot()`` (task 5447).
+
+        An empty slot means the fill-before-the-verify-runs ordering broke:
+        warn, as ``_vacate_inflight_entry`` does, rather than leave
+        ``verify_base`` silently ``None``.
+        """
+        if self.entry is None:
+            logger.warning(
+                'verify_base %s not published: _dispatch_item never filled '
+                'the entry slot before the verify ran', facts,
+            )
+            return
+        self.entry.verify_base = facts
+
+
+class VerifyInFlightKind(StrEnum):
+    """What a :class:`VerifyInFlight` is doing; the heartbeat's ``kind`` vocabulary.
+
+    ``verify``: a dispatched verify (ordinary or speculative); ``gate_reverify``
+    and ``finalizing``: the finalize head's re-verify and landing;
+    ``train``: a coalesce/declared train held by the merger, whose verify runs
+    inline there; ``merging`` and ``dispatching``: any other item the lane
+    holds mid-merge or mid-dispatch, about to start a verify.
+    """
+
+    VERIFY = 'verify'
+    GATE_REVERIFY = 'gate_reverify'
+    FINALIZING = 'finalizing'
+    TRAIN = 'train'
+    MERGING = 'merging'
+    DISPATCHING = 'dispatching'
+
+    @classmethod
+    def for_phase(cls, phase: str) -> VerifyInFlightKind:
+        """The kind of a dispatched entry in lifecycle *phase*."""
+        if phase in (cls.GATE_REVERIFY, cls.FINALIZING):
+            return cls(phase)
+        return cls.VERIFY
+
+    @classmethod
+    def held(cls, state: str, *, is_train: bool) -> VerifyInFlightKind:
+        """The kind of an item held in lifecycle *state* with no in-flight entry."""
+        return cls.TRAIN if is_train else cls(state)
+
+
+@dataclass(frozen=True)
+class VerifyInFlight:
+    """One merge verify a restart would kill, as the restart drain sees it (task 5371).
+
+    ``started_ts`` is when the verify running NOW began: a dispatch, the latest
+    entry into a gate re-verify or finalize, or a train's latest inline verify
+    (``orchestrator/src/orchestrator/merge_lane/worker.py::SpeculativeMergeWorker._note_verify_started``).
+    ``deadline_ts`` adds the longest command timeout the request's merge
+    verify can be granted
+    (``orchestrator/src/orchestrator/verify.py::merge_verify_command_budget_secs``),
+    so a verify still running past it is one its own timeout would kill.
+    """
+
+    task_id: str
+    host: str | None
+    kind: VerifyInFlightKind
+    started_ts: float
+    deadline_ts: float
+
+    @classmethod
+    def for_request(
+        cls, request: MergeRequest, *, host: str | None, kind: VerifyInFlightKind, started_ts: float,
+    ) -> VerifyInFlight:
+        budget = merge_verify_command_budget_secs(request.config, request.module_configs)
+        return cls(
+            task_id=request.task_id, host=host, kind=kind,
+            started_ts=started_ts, deadline_ts=started_ts + budget,
+        )
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            'task_id': self.task_id, 'host': self.host, 'kind': str(self.kind),
+            'started_ts': self.started_ts, 'deadline_ts': self.deadline_ts,
+        }
+
+
+@dataclass
+class _HostUnavailability:
+    """Per-host RunnerUnavailable streak tracker entry (task 1795).
+
+    Tracks consecutive failures so the worker can fire a dedup'd escalation
+    once the streak threshold is reached, and can clear state on recovery.
+
+    Fields
+    ------
+    streak              : consecutive RunnerUnavailable count for this host.
+    first_unavailable_at: time.time() of the first failure in this episode.
+    reason              : str(exc) from the most recent RunnerUnavailable.
+    """
+
+    streak: int
+    first_unavailable_at: float
+    reason: str
+
+
+@dataclass
+class InflightVerifyResult:
+    """Result returned by SpeculativeMergeWorker._run_inflight_verify.
+
+    Fields
+    ------
+    outcome     : None if verification passed; MergeOutcome if it failed/was skipped.
+    merge_wt    : the (possibly warm-swapped) merge worktree path; may be None if
+                  the verify was aborted/dropped before starting.
+    warm_results: dict[str, bool] of per-test results from warm verify (for shadow compare);
+                  empty dict if the warm path was not taken.
+    status      : None on normal completion; sentinel InflightStatus member for
+                  special cases (see __post_init__ for the enforced subset):
+                  InflightStatus.DROPPED             — sole-waiter abandoned; merge_wt cleaned
+                  InflightStatus.REQUEUED             — operator halt; req re-queued on _queue
+                  InflightStatus.RUNNER_UNAVAILABLE — remote runner raised RunnerUnavailable;
+                                        merge_wt NOT cleaned at the raise site — it is carried
+                                        to _finalize_inflight, which disposes of it via
+                                        _release_or_cleanup before _remerge allocates the
+                                        replacement _merge-<uuid> (task 3251).  spec_warm is
+                                        carried with it, because that disposal routes on it.
+    reason      : str(exc) from the RunnerUnavailable exception when status is
+                  InflightStatus.RUNNER_UNAVAILABLE; None on all other paths.  Used by
+                  the unavailability tracker + alarm to name the actual failure cause
+                  in escalation summaries.
+    """
+
+    outcome: MergeOutcome | None
+    merge_wt: Path | None
+    warm_results: dict[str, str] = dataclasses.field(default_factory=dict)
+    status: InflightStatus | None = None  # None | DROPPED | REQUEUED | RUNNER_UNAVAILABLE
+    reason: str | None = None  # str(RunnerUnavailable exc) when status=RUNNER_UNAVAILABLE
+    spec_warm: bool = False   # True when merge_wt is a warm _spec- lane (not an ephemeral wt)
+
+    def __post_init__(self) -> None:
+        """Enforce status is restricted to the 3 verify-result sentinels (task
+        1990 review parity with SpeculativeItem / InflightEntry).
+
+        InflightVerifyResult is a verify-outcome message; ABANDONED_PREDISPATCH
+        and REQUEUED_PREDISPATCH are InflightEntry-only predispatch sentinels
+        (set before a verify even starts) and must never appear here. Raw
+        strings equal to a valid member (e.g. 'DROPPED') satisfy this via
+        InflightStatus's str-compatibility, matching existing test fixtures.
+        """
+        if self.status is not None and self.status not in (
+            InflightStatus.DROPPED,
+            InflightStatus.REQUEUED,
+            InflightStatus.RUNNER_UNAVAILABLE,
+        ):
+            raise ValueError(
+                'InflightVerifyResult.status must be one of None, '
+                'InflightStatus.DROPPED, InflightStatus.REQUEUED, or '
+                'InflightStatus.RUNNER_UNAVAILABLE (ABANDONED_PREDISPATCH / '
+                f'REQUEUED_PREDISPATCH are InflightEntry-only); got {self.status!r}',
+            )
 
 
 @dataclasses.dataclass(frozen=True)

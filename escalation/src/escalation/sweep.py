@@ -262,7 +262,10 @@ def sweep(queue_dir: Path, *, apply: bool = False) -> SweepReport:
     queue_dir = Path(queue_dir)
     report = SweepReport()
 
-    root_files = list(queue_dir.glob('esc-*.json'))
+    # Sorted: glob order is filesystem-dependent, and the pass acts on each
+    # record in turn, so an unsorted scan makes the order of moves, logs and
+    # race windows differ between hosts.
+    root_files = sorted(queue_dir.glob('esc-*.json'))
     report.root_before = len(root_files)
 
     archive_root = queue_dir / archive.ARCHIVE_SUBDIR
