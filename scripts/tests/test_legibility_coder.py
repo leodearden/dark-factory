@@ -1386,13 +1386,23 @@ def _slugged_prompt(invariant_slugs):
     return mod.build_prompt("digest text", "codebook index", invariant_slugs=invariant_slugs)
 
 
-@pytest.mark.parametrize("entry", [mod.build_prompt, mod.code_digest, mod.code_digests])
-def test_the_invariant_slugs_are_required_never_defaulted(entry):
-    """A default would tell the miner a project declares no slugs, silently."""
-    slugs = inspect.signature(entry).parameters["invariant_slugs"]
+def _never_invoked(*args, **kwargs):
+    pytest.fail("invoke reached: invariant_slugs acquired a default")
 
-    assert slugs.kind is inspect.Parameter.KEYWORD_ONLY
-    assert slugs.default is inspect.Parameter.empty
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda: mod.build_prompt("digest text", "codebook index"),  # pyright: ignore[reportCallIssue]
+        lambda: mod.code_digest("digest text", {}, project="p", invoke=_never_invoked),  # pyright: ignore[reportCallIssue]
+        lambda: mod.code_digests([], {}, project="p", invoke=_never_invoked),  # pyright: ignore[reportCallIssue]
+    ],
+    ids=["build_prompt", "code_digest", "code_digests"],
+)
+def test_the_invariant_slugs_are_required_never_defaulted(call):
+    """A default would tell the miner a project declares no slugs, silently."""
+    with pytest.raises(TypeError):
+        call()
 
 
 def test_the_prompt_carries_the_quality_definition_and_no_heuristic():
