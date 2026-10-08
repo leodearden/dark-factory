@@ -390,6 +390,9 @@ class AllAccountsCappedException(Exception):
 # shared/tests/test_wildcard_deny_live_inventory.py (``-m integration``).  If a
 # CLI change ever denies the schema tool itself, ``_parse_claude_output``
 # reports ``schema_tool_denied``.
+#
+# StructuredOutput survives a non-empty ``--tools`` list too, which is what a
+# caller's ``available_tools`` emits (measured CLI 2.1.287, task 4344).
 _SCHEMA_OUTPUT_TOOL = 'StructuredOutput'
 _SCHEMA_OUTPUT_ATTACHMENT = 'structured_output'
 
@@ -2136,6 +2139,8 @@ async def invoke_claude_agent(
     working_idle_secs: float | None = None,
     absolute_cap_secs: float | None = None,
     strict_mcp_config: bool = False,
+    available_tools: list[str] | None = None,
+    setting_sources: list[str] | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI and return structured result.
 
@@ -2144,6 +2149,19 @@ async def invoke_claude_agent(
     servers, ignoring the ambient ``.mcp.json`` merge (task 2796, THREAD 2);
     forwarded verbatim to ``build_claude_argv``. Default ``False`` keeps every
     existing caller byte-identical.
+
+    *available_tools*, when not None, is the CLI's built-in tool REGISTRY
+    filter (``--tools``): which built-in tools exist at all.  That is a
+    different axis from *allowed_tools* (permission allow rules) and
+    *disallowed_tools* (deny rules).  Like ``--tools ''`` it does NOT filter
+    MCP, so a caller must also pass ``mcp_config=no_mcp_servers_config()``
+    with ``strict_mcp_config=True``.  Forwarded verbatim to
+    ``build_claude_argv``, which validates it.
+
+    *setting_sources*, when not None, names the settings files the CLI reads
+    (``--setting-sources``); ``[]`` reads none, so no ambient permission allow
+    rule reaches the call.  Forwarded verbatim to ``build_claude_argv``, which
+    validates it.
 
     *oauth_token*, when set, overrides the Claude CLI's default credentials
     via the ``CLAUDE_CODE_OAUTH_TOKEN`` env var (multi-account failover).
@@ -2217,6 +2235,8 @@ async def invoke_claude_agent(
         working_idle_secs=working_idle_secs,
         absolute_cap_secs=absolute_cap_secs,
         strict_mcp_config=strict_mcp_config,
+        available_tools=available_tools,
+        setting_sources=setting_sources,
     )
 
 
@@ -3253,6 +3273,8 @@ def build_claude_argv(
     resume_session_id: str | None,
     session_id: str | None,
     strict_mcp_config: bool = False,
+    available_tools: list[str] | None = None,
+    setting_sources: list[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     """Assemble the Claude CLI argv — the single source of truth shared by the
     non-sandbox (``_invoke_claude``) and sandbox (``_invoke_claude_with_sandbox``)
@@ -3275,6 +3297,25 @@ def build_claude_argv(
     ``--mcp-config``). The default ``False`` keeps every existing caller's argv
     byte-identical.
 
+    ``available_tools`` (default ``None``, which emits nothing): the CLI's
+    built-in tool REGISTRY filter, emitted as ``--tools <a,b,c>`` (``[]`` gives
+    ``--tools ''``).  It decides which built-in tools exist, a different axis
+    from ``allowed_tools`` (permission allow rules) and ``disallowed_tools``
+    (deny rules).  Entries must be bare tool names; a permission-rule spec such
+    as ``'Bash(git log:*)'`` belongs in ``allowed_tools``.  It cannot be
+    combined with a ``'*'`` deny, which also sets the registry and would win.
+    Like ``--tools ''``, it does NOT filter MCP, so a caller must also pass
+    ``mcp_config=no_mcp_servers_config()`` with ``strict_mcp_config=True``.
+    Both refusals raise ``ValueError`` before any temp file exists.
+
+    ``setting_sources`` (default ``None``, which emits nothing and leaves the
+    CLI reading every settings file): the settings files the CLI reads, emitted
+    as ``--setting-sources <a,b>`` from ``'user'``, ``'project'`` and
+    ``'local'``.  ``[]`` gives ``--setting-sources ''``, which reads none of
+    them, so no ambient permission allow rule reaches the call.  Managed
+    (policy) settings are not a source and still apply.  An unknown entry
+    raises ``ValueError`` before any temp file exists.
+
     Returns ``(cmd, temp_files)``: ``cmd`` is the assembled argv list;
     ``temp_files`` lists the temp file paths created.  It is never empty — the
     sysprompt path is always present, on the resume path too (task 3983) —
@@ -3286,6 +3327,8 @@ def build_claude_argv(
     already created during this call are unlinked before the exception
     propagates — callers never need to clean up after a raised call.
     """
+    _check_available_tools(available_tools, disallowed_tools)
+    _check_setting_sources(setting_sources)
     # argv[0] is RESOLVED here rather than left for the kernel to look up
     # against whatever PATH the spawning process inherited. This one site
     # covers BOTH spawn paths — the sandbox and non-sandbox invocations here,
@@ -3368,6 +3411,8 @@ def build_claude_argv(
 
         cmd.extend(['--permission-mode', permission_mode])
         cmd.extend(['--max-turns', str(max_turns)])
+        if setting_sources is not None:
+            cmd.extend(['--setting-sources', ','.join(setting_sources)])
 
         if effort:
             cmd.extend(['--effort', effort])
@@ -3379,6 +3424,8 @@ def build_claude_argv(
             # registry filter keeps only that tool.  See _SCHEMA_OUTPUT_TOOL.
             cmd.extend(['--tools', ''])
             disallowed_tools = [t for t in disallowed_tools if t != '*']
+        if available_tools is not None:
+            cmd.extend(['--tools', ','.join(available_tools)])
         if disallowed_tools:
             cmd.extend(['--disallowed-tools', *disallowed_tools])
 
@@ -3403,6 +3450,37 @@ def build_claude_argv(
         raise
 
     return cmd, temp_files
+
+
+def _check_available_tools(
+    available_tools: list[str] | None, disallowed_tools: list[str] | None,
+) -> None:
+    """Refuse an ``available_tools`` registry the CLI would not honour as given."""
+    if available_tools is None:
+        return
+    if disallowed_tools and '*' in disallowed_tools:
+        raise ValueError(
+            "available_tools and disallowed_tools=['*'] both set the built-in "
+            "tool registry, and the '*' deny would win over the list; pass one"
+        )
+    for entry in available_tools:
+        if not entry.isidentifier():
+            raise ValueError(
+                f'available_tools entry {entry!r} is not a bare tool name; '
+                "permission-rule specs such as 'Bash(git log:*)' go in allowed_tools"
+            )
+
+
+_SETTING_SOURCES = frozenset({'user', 'project', 'local'})
+
+
+def _check_setting_sources(setting_sources: list[str] | None) -> None:
+    """Refuse a ``setting_sources`` entry that is not one of the CLI's file sources."""
+    for entry in setting_sources or ():
+        if entry not in _SETTING_SOURCES:
+            raise ValueError(
+                f'setting_sources entry {entry!r} is not one of {sorted(_SETTING_SOURCES)}'
+            )
 
 
 def apply_spawn_env(env: dict[str, str], spawn_env: dict[str, str] | None) -> None:
@@ -3461,6 +3539,8 @@ async def _invoke_claude(
     working_idle_secs: float | None = None,
     absolute_cap_secs: float | None = None,
     strict_mcp_config: bool = False,
+    available_tools: list[str] | None = None,
+    setting_sources: list[str] | None = None,
 ) -> AgentResult:
     """Invoke Claude Code CLI."""
     # BEFORE build_claude_argv, which writes system-prompt / mcp-config temp
@@ -3481,6 +3561,8 @@ async def _invoke_claude(
         resume_session_id=resume_session_id,
         session_id=session_id,
         strict_mcp_config=strict_mcp_config,
+        available_tools=available_tools,
+        setting_sources=setting_sources,
     )
 
     # User prompt goes over stdin, never argv, to avoid ARG_MAX on large

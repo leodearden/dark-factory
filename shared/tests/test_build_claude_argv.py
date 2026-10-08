@@ -294,6 +294,151 @@ def test_build_claude_argv_wildcard_without_schema_is_unchanged(pinned_claude: s
         _cleanup(temp_files)
 
 
+def _registry_argv(
+    available_tools: list[str] | None,
+    *,
+    disallowed_tools: list[str] | None = None,
+    output_schema: dict | None = None,
+) -> tuple[list[str], list[str]]:
+    return build_claude_argv(
+        model='opus',
+        max_budget_usd=5.0,
+        system_prompt='sys',
+        max_turns=20,
+        permission_mode='dontAsk',
+        allowed_tools=None,
+        disallowed_tools=disallowed_tools,
+        mcp_config=None,
+        output_schema=output_schema,
+        effort=None,
+        resume_session_id=None,
+        session_id=None,
+        available_tools=available_tools,
+    )
+
+
+def test_build_claude_argv_available_tools_emits_one_registry_filter() -> None:
+    """``available_tools`` is the CLI's built-in registry filter: one ``--tools``
+    flag carrying the comma-joined names, alongside the schema, with no deny.
+    """
+    cmd, temp_files = _registry_argv(
+        ['Read', 'Grep', 'Glob'], output_schema={'type': 'object'},
+    )
+    try:
+        assert cmd.count('--tools') == 1, f'got {cmd!r}'
+        assert cmd[cmd.index('--tools') + 1] == 'Read,Grep,Glob', f'got {cmd!r}'
+        assert '--json-schema' in cmd
+        assert '--disallowed-tools' not in cmd
+    finally:
+        _cleanup(temp_files)
+
+
+def test_build_claude_argv_empty_available_tools_is_an_empty_registry() -> None:
+    """``[]`` is spelled exactly like the '*'+schema substitution: ``--tools ''``."""
+    cmd, temp_files = _registry_argv([], output_schema={'type': 'object'})
+    try:
+        assert cmd.count('--tools') == 1, f'got {cmd!r}'
+        assert cmd[cmd.index('--tools') + 1] == '', f'got {cmd!r}'
+    finally:
+        _cleanup(temp_files)
+
+
+def test_build_claude_argv_default_emits_no_registry_filter() -> None:
+    cmd, temp_files = _registry_argv(None, output_schema={'type': 'object'})
+    try:
+        assert '--tools' not in cmd, f'got {cmd!r}'
+    finally:
+        _cleanup(temp_files)
+
+
+@pytest.mark.parametrize('output_schema', [None, {'type': 'object'}])
+def test_build_claude_argv_refuses_available_tools_with_wildcard_deny(
+    output_schema: dict | None,
+) -> None:
+    """'*' and available_tools both set the registry, and the '*' deny would win
+    over the list; the refusal comes before any temp file exists.
+    """
+    with (
+        patch('shared.cli_invoke.tempfile.mkstemp') as mkstemp,
+        pytest.raises(ValueError, match='available_tools') as excinfo,
+    ):
+        _registry_argv(['Read'], disallowed_tools=['*'], output_schema=output_schema)
+    assert 'disallowed_tools' in str(excinfo.value)
+    mkstemp.assert_not_called()
+
+
+@pytest.mark.parametrize('entry', ['Bash(git log:*)', 'Read,Grep', ''])
+def test_build_claude_argv_refuses_a_non_bare_registry_entry(entry: str) -> None:
+    """A permission-rule spec belongs in allowed_tools, never in the registry."""
+    with (
+        patch('shared.cli_invoke.tempfile.mkstemp') as mkstemp,
+        pytest.raises(ValueError) as excinfo,
+    ):
+        _registry_argv(['Read', entry], output_schema={'type': 'object'})
+    assert repr(entry) in str(excinfo.value), str(excinfo.value)
+    mkstemp.assert_not_called()
+
+
+def _sources_argv(setting_sources: list[str] | None) -> tuple[list[str], list[str]]:
+    return build_claude_argv(
+        model='opus',
+        max_budget_usd=5.0,
+        system_prompt='sys',
+        max_turns=20,
+        permission_mode='dontAsk',
+        allowed_tools=None,
+        disallowed_tools=None,
+        mcp_config=None,
+        output_schema=None,
+        effort=None,
+        resume_session_id=None,
+        session_id=None,
+        setting_sources=setting_sources,
+    )
+
+
+def test_build_claude_argv_empty_setting_sources_reads_no_settings_file() -> None:
+    """``[]`` is ``--setting-sources ''``: no user, project or local settings
+    file is read, so none of their permission allow rules reach the call.
+    """
+    cmd, temp_files = _sources_argv([])
+    try:
+        assert cmd.count('--setting-sources') == 1, f'got {cmd!r}'
+        assert cmd[cmd.index('--setting-sources') + 1] == '', f'got {cmd!r}'
+    finally:
+        _cleanup(temp_files)
+
+
+def test_build_claude_argv_setting_sources_are_comma_joined() -> None:
+    cmd, temp_files = _sources_argv(['project', 'local'])
+    try:
+        assert cmd[cmd.index('--setting-sources') + 1] == 'project,local', f'got {cmd!r}'
+    finally:
+        _cleanup(temp_files)
+
+
+def test_build_claude_argv_default_emits_no_setting_sources() -> None:
+    cmd, temp_files = _sources_argv(None)
+    try:
+        assert '--setting-sources' not in cmd, f'got {cmd!r}'
+    finally:
+        _cleanup(temp_files)
+
+
+@pytest.mark.parametrize('entry', ['policy', 'User', 'user,project', ''])
+def test_build_claude_argv_refuses_an_unknown_setting_source(entry: str) -> None:
+    """Only the CLI's three file sources are accepted; the refusal names the
+    entry and comes before any temp file exists.
+    """
+    with (
+        patch('shared.cli_invoke.tempfile.mkstemp') as mkstemp,
+        pytest.raises(ValueError) as excinfo,
+    ):
+        _sources_argv(['user', entry])
+    assert repr(entry) in str(excinfo.value), str(excinfo.value)
+    mkstemp.assert_not_called()
+
+
 def test_build_claude_argv_resume_keeps_system_prompt_schema_and_tool_filter() -> None:
     """RESUME + output_schema: BOTH the system prompt and the schema survive.
 
@@ -501,13 +646,12 @@ def test_no_mcp_servers_config_is_truthy_and_emits_strict_flag() -> None:
 def test_build_claude_argv_resume_keeps_mcp_config_and_strict_flag() -> None:
     """The MCP scoping survives --resume, the path real runs actually exercise.
 
-    Every AgentLoop turn >= 2 and every cap-retry reaches the CLI through
-    ``--resume``, so the four strict_mcp_config cases above — all of which pass
-    ``resume_session_id=None`` — cover only the first turn of any real run.
+    Every cap-retry resume reaches the CLI through ``--resume``, so the four
+    strict_mcp_config cases above — all of which pass
+    ``resume_session_id=None`` — cover only the first attempt of any real run.
     The resume half of the invariant was asserted only in prose, in the
-    docstrings of
-    ``fused-memory/src/fused_memory/reconciliation/agent_loop.py::AgentLoop._call_claude_cli``
-    and ``fused-memory/src/fused_memory/reconciliation/judge.py::Judge._call_judge_cli``,
+    docstring of
+    ``fused-memory/src/fused_memory/reconciliation/judge.py::Judge._call_judge_cli``,
     and prose cannot fail a suite.
 
     What that prose claims, and what this pins: the ``if mcp_config:`` block of
