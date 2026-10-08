@@ -7,24 +7,32 @@ before releasing, the waiter must not run on the detached inode, because a
 newcomer's ``O_CREAT`` makes a fresh one and the two would run side by side.
 
 Synchronisation is by ``/proc/self/fd``: two open fds naming the sidecar prove
-the waiter has opened the OLD inode before the main thread touches the path.
-That is a fact rather than a duration, so no verdict here rests on timing,
-and nothing patches the queue module — the tests drive the one public seam.
+the waiter has opened the OLD inode before its holder touches the path.  That
+is a fact rather than a duration, so no verdict here rests on timing, and
+nothing patches the queue module — the tests drive the one public seam.
+
+The holder is either the test itself, unlinking with ``os``, or the real
+remover, ``sweep.reap_orphan_locks``.  The reaper is held inside its own
+critical section by wrapping sweep's binding of the lock in one that delegates
+to the real lock — the ``test_sweep.py::TestReapOrphanLocksConcurrency`` idiom.
 """
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from escalation.queue import escalation_id_lock
+from escalation import sweep
+from escalation.models import Escalation
+from escalation.queue import EscalationQueue, escalation_id_lock
 
 pytestmark = [
     pytest.mark.skipif(
@@ -68,12 +76,13 @@ def _newcomer_is_blocked(lock_path: Path) -> bool:
         os.close(fd)
 
 
-def _run_waiter_across(
-    queue_dir: Path, between: Callable[[Path], None]
-) -> dict[str, Any]:
-    """Queue a waiter on the held sidecar, run ``between``, then release.
+_Waiter = tuple[threading.Thread, dict[str, Any]]
 
-    Returns what the waiter observed from inside its own critical section.
+
+def _queue_waiter(queue_dir: Path) -> _Waiter:
+    """Start a waiter on the sidecar its one holder owns; return once it has opened it.
+
+    The waiter records what it observes from inside its own critical section.
     """
     lock_path = _lock_path(queue_dir)
     seen: dict[str, Any] = {}
@@ -86,21 +95,31 @@ def _run_waiter_across(
         except BaseException as exc:  # noqa: BLE001 — surfaced by the caller
             seen['error'] = exc
 
-    with escalation_id_lock(queue_dir, ESC_ID):
-        thread = threading.Thread(target=waiter, daemon=True)
-        thread.start()
-        deadline = time.monotonic() + WAIT_SECS
-        while (opened := _open_fds_naming(lock_path)) < 2:
-            if time.monotonic() > deadline:
-                pytest.fail(
-                    f'waiter never opened the sidecar: {opened} fd(s) name it'
-                )
-            time.sleep(0.005)
-        between(lock_path)
+    thread = threading.Thread(target=waiter, daemon=True)
+    thread.start()
+    deadline = time.monotonic() + WAIT_SECS
+    while (opened := _open_fds_naming(lock_path)) < 2:
+        if time.monotonic() > deadline:
+            pytest.fail(f'waiter never opened the sidecar: {opened} fd(s) name it')
+        time.sleep(0.005)
+    return thread, seen
 
+
+def _observations_once_released(waiter: _Waiter) -> dict[str, Any]:
+    thread, seen = waiter
     thread.join(WAIT_SECS)
     assert not thread.is_alive(), 'waiter did not finish after the holder released'
     return seen
+
+
+def _run_waiter_across(
+    queue_dir: Path, between: Callable[[Path], None]
+) -> dict[str, Any]:
+    """Queue a waiter on the held sidecar, run ``between``, then release."""
+    with escalation_id_lock(queue_dir, ESC_ID):
+        waiter = _queue_waiter(queue_dir)
+        between(_lock_path(queue_dir))
+    return _observations_once_released(waiter)
 
 
 def _unlink_then_recreate(lock_path: Path) -> None:
@@ -146,3 +165,53 @@ def test_sidecar_unlinked_by_its_holder_is_recreated_and_locked_by_the_next_acqu
     with escalation_id_lock(tmp_path, ESC_ID):
         assert lock_path.exists()
         assert _newcomer_is_blocked(lock_path)
+
+
+def _archive_a_record(queue_dir: Path) -> None:
+    queue = EscalationQueue(queue_dir)
+    queue.submit(
+        Escalation(
+            id=ESC_ID,
+            task_id='1',
+            agent_role='test',
+            severity='info',
+            category='cleanup_needed',
+            summary='test escalation',
+        )
+    )
+    assert queue.resolve(ESC_ID, 'done', resolved_by='human') is not None
+    assert not (queue_dir / f'{ESC_ID}.json').exists(), 'precondition: resolve archived it'
+    assert _lock_path(queue_dir).exists(), 'precondition: the root sidecar outlives it'
+
+
+def test_writer_queued_while_the_reaper_unlinks_an_archived_sidecar_locks_the_current_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _archive_a_record(tmp_path)
+    queued: list[_Waiter] = []
+    real_lock = sweep.escalation_id_lock
+
+    @contextlib.contextmanager
+    def reaper_lock_with_a_writer_queued(
+        queue_dir: Path, escalation_id: str
+    ) -> Iterator[None]:
+        with real_lock(queue_dir, escalation_id):
+            queued.append(_queue_waiter(Path(queue_dir)))
+            yield
+
+    monkeypatch.setattr(sweep, 'escalation_id_lock', reaper_lock_with_a_writer_queued)
+
+    reaped = sweep.reap_orphan_locks(tmp_path)
+
+    assert reaped == 1, "the reaper did not unlink the archived record's sidecar"
+    [waiter] = queued
+    seen = _observations_once_released(waiter)
+    assert 'error' not in seen, seen.get('error')
+    assert seen['present'] is True, (
+        'a writer queued while the reaper unlinked the sidecar ran with no '
+        'sidecar at the path'
+    )
+    assert seen['newcomer_blocked'] is True, (
+        'a writer queued while the reaper unlinked the sidecar ran on the '
+        'detached inode — a newcomer locked a fresh sidecar beside it'
+    )
