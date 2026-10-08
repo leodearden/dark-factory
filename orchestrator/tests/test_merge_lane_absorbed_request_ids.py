@@ -12,12 +12,14 @@ with a different run_id: the simulated restart.
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.event_store import EventStore
+from orchestrator.git_ops import GitOps
 from orchestrator.merge_lane import (
     InFlightMergeRegistry,
     MergeOutcome,
@@ -47,7 +49,7 @@ def _real_config(tmp_path: Path) -> OrchestratorConfig:
     )
 
 
-def _make_req(tmp_path: Path) -> MergeRequest:
+def _make_req(tmp_path: Path, *, snapshot_tip: str = 'abc123') -> MergeRequest:
     config = _real_config(tmp_path)
     return MergeRequest(
         task_id=BRANCH,
@@ -58,7 +60,7 @@ def _make_req(tmp_path: Path) -> MergeRequest:
         module_configs=[],
         config=config,
         result=asyncio.get_running_loop().create_future(),
-        snapshot_tip='abc123',
+        snapshot_tip=snapshot_tip,
     )
 
 
@@ -73,6 +75,27 @@ def _waiter(request_id: str) -> WaiterRecord:
 async def _finalize(req: MergeRequest, outcome: MergeOutcome) -> None:
     req.result.set_result(outcome)
     await asyncio.sleep(0)
+
+
+def _linear_history(repo: Path, length: int) -> list[str]:
+    """A fresh repository whose every commit descends from the one before."""
+    repo.mkdir()
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ['git', *args], cwd=repo, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git('init', '-b', 'main')
+    git('config', 'user.email', 'test@test.com')
+    git('config', 'user.name', 'Test')
+    tips = []
+    for n in range(length):
+        (repo / f'{n}.txt').write_text(f'{n}\n')
+        git('add', '-A')
+        git('commit', '-m', f'commit {n}')
+        tips.append(git('rev-parse', 'HEAD'))
+    return tips
 
 
 def _first_run(tmp_path: Path) -> EventStore:
@@ -170,3 +193,47 @@ async def test_an_enqueue_without_a_registry_writes_an_empty_list(tmp_path: Path
     await _finalize(req, MergeOutcome('done', merge_sha='abc'))
 
     assert _absorbed_by(_after_restart(tmp_path), req.request_id) == []
+
+
+async def test_waiters_cancelled_with_a_replaced_primary_resolve_to_its_row(
+    tmp_path: Path,
+) -> None:
+    """A C3 REPLACE cancels the queued primary's waiters along with it; its row lists them.
+
+    Each row is read off the entry its primary owned at enqueue time, so a
+    waiter attached after the slot moved on is listed on the replacing row only.
+    """
+    repo = tmp_path / 'repo'
+    seed_tip, replaced_tip, replacing_tip = _linear_history(repo, 3)
+    classifier = GitOps(_real_config(tmp_path).git, repo)
+    registry = InFlightMergeRegistry()
+    store = _first_run(tmp_path)
+    queue: asyncio.Queue[MergeRequest] = asyncio.Queue()
+    assert registry.acquire(
+        BRANCH, BRANCH, asyncio.get_running_loop().create_future(),
+        request_id='mr-seed', snapshot_tip=seed_tip,
+    )
+    replaced = _make_req(tmp_path, snapshot_tip=replaced_tip)
+    replacing = _make_req(tmp_path, snapshot_tip=replacing_tip)
+
+    async def replace_with(req: MergeRequest) -> None:
+        result = await coalesce_or_enqueue_merge_request(
+            queue, req, store, registry, classifier_git_ops=classifier,
+        )
+        assert result.dispatched, result
+
+    await replace_with(replaced)
+    cancelled_peer = _waiter('mr-peer')
+    assert registry.attach(BRANCH, cancelled_peer)
+    await replace_with(replacing)
+    assert registry.attach(BRANCH, _waiter('mr-late'))
+
+    await _finalize(replacing, MergeOutcome('done', merge_sha='abc'))
+
+    assert cancelled_peer.future.cancelled()
+    restarted = _after_restart(tmp_path)
+    row = restarted.merge_finalized_absorbing('mr-peer', cross_run=True)
+    assert row is not None
+    assert (row['request_id'], row['state']) == (replaced.request_id, 'abandoned')
+    assert _absorbed_by(restarted, replaced.request_id) == ['mr-peer']
+    assert _absorbed_by(restarted, replacing.request_id) == ['mr-late']

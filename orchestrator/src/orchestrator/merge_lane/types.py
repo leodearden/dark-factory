@@ -139,15 +139,29 @@ class _InFlightEntry:
     coalesced_request_ids: list[str] = field(default_factory=list)
     """request_ids coalesced onto this entry at the merge_request door.  They
     are not waiters: no future mirror, no detach."""
+    released_waiter_ids: tuple[str, ...] = ()
+    """request_ids of the waiters :meth:`release_waiters` cancelled and dropped."""
+
+    def release_waiters(self) -> None:
+        """Cancel every still-pending waiter, then drop them all, keeping their ids."""
+        for w in self.waiters:
+            if not w.future.done():
+                w.future.cancel()
+        self.released_waiter_ids = tuple(w.request_id for w in self.waiters)
+        self.waiters.clear()
 
     def absorbed_request_ids(self) -> tuple[str, ...]:
         """Every other request whose outcome is this entry's primary's outcome.
 
-        The current waiters (so a detached one has already dropped out) then
-        the door-coalesced ids, de-duplicated in order, without the entry's own
-        request_id.
+        The current waiters (so a detached one has already dropped out), the
+        released waiters, then the door-coalesced ids, de-duplicated in order,
+        without the entry's own request_id.
         """
-        candidates = [w.request_id for w in self.waiters] + self.coalesced_request_ids
+        candidates = [
+            *(w.request_id for w in self.waiters),
+            *self.released_waiter_ids,
+            *self.coalesced_request_ids,
+        ]
         return tuple(
             rid for rid in dict.fromkeys(candidates) if rid and rid != self.request_id
         )
@@ -602,10 +616,7 @@ class InFlightMergeRegistry:
         if detach_waiters:
             entry = self._slots.get(branch)
             if entry is not None:
-                for w in entry.waiters:
-                    if not w.future.done():
-                        w.future.cancel()
-                entry.waiters.clear()
+                entry.release_waiters()
         self._slots.pop(branch, None)
 
     def _release_if_current(self, branch: str, entry: _InFlightEntry) -> None:
