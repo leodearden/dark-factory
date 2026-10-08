@@ -89,10 +89,11 @@ def escalation_id_lock(queue_dir: Path, escalation_id: str) -> Iterator[None]:
     It is never RENAMED or replaced — that is the stable-inode contract above
     (task 1609) and the whole reason the sidecar exists.  It IS unlinked, in
     exactly one place: ``sweep.reap_orphan_locks``, the server-start pass that
-    stops the root accumulating a sidecar per dead id.  That pass only ever
-    touches a DEAD id — one whose record is absent from both the queue root and
-    the archive — and ``make_id``'s monotonic durable counter can never re-mint
-    such an id, so no future writer can want the inode it removes.
+    stops the root accumulating a sidecar per id whose record has left it.  It
+    removes the sidecar of any id whose record is not in the queue root,
+    including archived ones a later writer may lock again — safe by the
+    DELETION-SAFE re-validation below.  ``make_id``'s counter sidecars are
+    never candidates (``SEQ_COUNTER_SUFFIX``).
 
     DELETION-SAFE:
     After acquiring the flock, the acquirer re-checks that the path still names

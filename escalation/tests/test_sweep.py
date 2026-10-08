@@ -1415,9 +1415,12 @@ class TestReapOrphanLocksResilience:
             report = sweep.run_startup_sweep(tmp_path, now=self._NOW)
 
         assert report.sweep.archived == 1, 'pass 1 succeeded and must still be reported'
-        assert report.orphan_locks_reaped == 1, 'only the healthy orphan was reaped'
+        # The healthy orphan plus esc-5-1's sidecar, which pass 1 created while
+        # relocating that record out of the root.
+        assert report.orphan_locks_reaped == 2, 'only the healthy sidecars were reaped'
         assert bad_lock.exists()
         assert not good_lock.exists()
+        assert not (tmp_path / 'esc-5-1.json.lock').exists()
 
         infos = [
             r.getMessage() for r in caplog.records
@@ -1427,7 +1430,7 @@ class TestReapOrphanLocksResilience:
             'the single startup summary line was lost — the reap raised past '
             f'run_startup_sweep before the report was built; got: {infos}'
         )
-        assert 'archived=1' in infos[0] and 'orphan_locks=1' in infos[0], infos[0]
+        assert 'archived=1' in infos[0] and 'orphan_locks=2' in infos[0], infos[0]
 
 
 class TestArchivedRecordStaysWritableAfterItsLockIsReaped:
