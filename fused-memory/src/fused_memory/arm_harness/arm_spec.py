@@ -37,6 +37,7 @@ StructuredOutputMode = Literal['json_schema', 'json_object']
 LLM_STACKS: frozenset[ServingStack] = frozenset({'vllm', 'llamacpp', 'openai'})
 EMBEDDING_STACKS: frozenset[ServingStack] = frozenset({'vllm', 'tei', 'openai'})
 METERED_STACK: ServingStack = 'openai'
+_TOKENS_PER_MTOK = 1_000_000
 
 
 def _fullmatching(pattern: re.Pattern[str], what: str) -> Callable[[str], str]:
@@ -91,6 +92,15 @@ class LlmParams(FrozenModel):
 class TokenPricing(FrozenModel):
     usd_per_mtok_input: float = Field(ge=0)
     usd_per_mtok_output: float = Field(ge=0)
+
+    def usd_for(self, input_tokens: int, output_tokens: int) -> float:
+        for name, count in (('input_tokens', input_tokens), ('output_tokens', output_tokens)):
+            if count < 0:
+                raise ValueError(f'{name} {count} is negative; a token count cannot be priced')
+        return (
+            input_tokens * self.usd_per_mtok_input
+            + output_tokens * self.usd_per_mtok_output
+        ) / _TOKENS_PER_MTOK
 
 
 class _ArmSpecBase(FrozenModel):
