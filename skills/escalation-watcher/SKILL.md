@@ -1407,10 +1407,11 @@ esc-id-citing correction block in the cluster's task descriptions, or the subjec
 advancing while the task is blocked/parked (tip-advance on an `in-progress` subject is ordinary
 work, not a signal).
 
-`triaged_by` is server-enforced when the stamping connection sends `X-Escalation-Identity` (the
-auto-watcher does), the same attribution contract this skill documents for `resolved_by` (see
-"Recognizing the supervised auto-watcher's resolutions" below); for a header-less interactive session
-it is a convention, not a guarantee — see "Shadow-mode standing-policy rulings (measurement only)".
+`triaged_by` is server-enforced (`escalation/src/escalation/server.py::stamp_triage`) when the
+stamping connection sends `X-Escalation-Identity` (the auto-watcher does), the same attribution
+contract this skill documents for `resolved_by` (see "Recognizing the supervised auto-watcher's
+resolutions" below); for a header-less interactive session it is a convention, not a guarantee —
+see "Shadow-mode standing-policy rulings (measurement only)".
 
 ### Refuting a premise: the claim's execution context, or it is not a refutation
 
@@ -2099,13 +2100,10 @@ them is reported as `gated_stamps` and excluded from every rate.
 
 ### Two facts about attribution and timing
 
-**Attribution here is a convention, not a guarantee.**
-`escalation/src/escalation/server.py::stamp_triage` overrides `triaged_by` from the
-`X-Escalation-Identity` header **only when that header is present**. The auto-watcher sends one, so
-for it the attribution is server-enforced; this session does not, so `triaged_by` is whatever you
-pass. This NARROWS the general statement in "Reading a triage-ack annotation" above for your own
-stamps. Therefore: **pass the same identity string you resolve with**, or `triaged_by` and
-`resolved_by` never compare and the `self_resolved` check silently never fires.
+**Attribution here is a convention, not a guarantee** (see "Reading a triage-ack annotation"
+above): this session sends no identity header, so `triaged_by` is whatever you pass. **Pass the
+same identity string you resolve with**, or `triaged_by` and `resolved_by` never compare and the
+`self_resolved` check silently never fires.
 
 **Stamp before the record is resolved.** `stamp_triage` refuses anything that is not `pending`, so a
 stamp written after the close is simply not written.
