@@ -16,6 +16,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -25,11 +26,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from legibility import (
     account_pool,
     census_trigger,
     codebook,
     digest,
+    invariants,
     nightly,
     session_ledger,
     session_runner,
@@ -40,6 +43,10 @@ from legibility import (
     config as config_mod,
 )
 from legibility.config import TrickleCensusCaps, load_config
+
+# Resolved through coder.py's own orchestrator/src bootstrap, which the
+# `nightly` import above has already run.
+from orchestrator.agents import code_quality
 from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES
 
 # ---------------------------------------------------------------------------
@@ -3758,7 +3765,8 @@ _BRANCH_NEEDS_MONKEYPATCH = (
 def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
                      branch=None, recorder=None, budget_bytes=None,
                      invoke=_fake_invoke_known_cause, committer=None, poster=None,
-                     transcript=True, now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC)):
+                     transcript=True, now=datetime(2026, 7, 14, 3, 0, 0, tzinfo=UTC),
+                     invariants_doc: str | None = None):
     """Run ``run_nightly`` end to end on a real temp git repo + transcript and
     return ``(result, repo)``.
 
@@ -3783,13 +3791,20 @@ def _run_e2e_nightly(tmp_path, *, monkeypatch: pytest.MonkeyPatch | None = None,
 
     The other knobs shape a run that does NOT fail: *budget_bytes* rewrites
     the config with a digest byte budget small enough to suppress the whole
-    night, *transcript=False* makes it a genuinely quiet one, and
+    night, *transcript=False* makes it a genuinely quiet one, *invariants_doc*
+    is committed as the project's design-invariants doc, and
     *recorder* / *committer* / *poster* / *invoke* are the injected seams
     (*poster* defaults to a no-op, so a test that does not care about
     escalations never has to build one).
     """
     work_cwd = str(tmp_path / 'work')
     repo, config_path = _init_e2e_repo(tmp_path, work_cwd=work_cwd)
+    if invariants_doc is not None:
+        doc_path = repo / invariants.DOC_RELPATH
+        doc_path.parent.mkdir(parents=True, exist_ok=True)
+        doc_path.write_text(invariants_doc, encoding='utf-8')
+        subprocess.run(['git', 'add', str(invariants.DOC_RELPATH)], cwd=repo, check=True)
+        subprocess.run(['git', 'commit', '-q', '-m', 'invariants'], cwd=repo, check=True)
     if budget_bytes is not None:
         _write_config(
             repo, project_id='testproj', escalation_port=8199,
@@ -5159,3 +5174,115 @@ class TestRunNightlyLedgersCodedSessions:
         assert second.ledger_rows_written == 0
         assert second.ledger_rows_failed == 0
         assert [row[0] for row in _ledger_rows()] == ['session-1']
+
+
+# ---------------------------------------------------------------------------
+# task 6400: the trickle tells the coder the project's invariant slugs and
+# the quality Definition, and journals what the merger kept and dropped
+# (plans/census-incremental-prd.md §4.8 rows 15 and 17)
+# ---------------------------------------------------------------------------
+
+_REIFY_FORM_INVARIANTS_DOC = """\
+# Design invariants
+
+## INV-SF-1 `undef-has-provenance`
+
+## INV-AD-1 `angle-crossings-explicit`
+"""
+
+
+def _fake_invoke_known_and_unknown_slug(prompt: str, model: str) -> str:
+    return json.dumps({
+        'matches': [{
+            'entry_id': 'known-cause',
+            'origin_phase': 'implement',
+            'manifested_phase': 'implement',
+            'invariant_violated': 'undef-has-provenance',
+        }],
+        'candidates': [{'title': 'novel', 'invariant_violated': 'made-up-free-text'}],
+    })
+
+
+def _committed_codebook(repo: Path) -> dict:
+    shown = subprocess.run(
+        ['git', 'show', 'HEAD:docs/legibility/confusion-codebook.yaml'],
+        cwd=repo, check=True, capture_output=True, text=True,
+    )
+    return yaml.safe_load(shown.stdout)
+
+
+def _messages(caplog, level):
+    return [r.getMessage() for r in caplog.records if r.levelno == level]
+
+
+def _quality_doc_text() -> str:
+    return code_quality.NORMATIVE_DOC.read_text(encoding='utf-8')
+
+
+def _heuristic_headlines() -> list[str]:
+    headlines = re.findall(
+        r'^\d+\. \*\*(.+?)\*\*',
+        code_quality.section(_quality_doc_text(), '## The fourteen heuristics'),
+        re.MULTILINE,
+    )
+    assert headlines, 'no numbered bold heuristic headline parsed from the normative doc'
+    return headlines
+
+
+class TestRunNightlyInvariantSlugs:
+
+    def test_every_merging_night_journals_its_slug_tally(self, tmp_path, caplog):
+        caplog.set_level(logging.INFO)
+
+        result, _repo = _run_e2e_nightly(tmp_path)
+
+        assert result.exit_code == 0
+        assert any(
+            'invariant slugs: 0 valid, 0 rejected' in m
+            for m in _messages(caplog, logging.INFO)
+        )
+
+    def test_a_known_slug_persists_and_an_unknown_one_is_dropped_and_warned(
+        self, tmp_path, caplog,
+    ):
+        caplog.set_level(logging.INFO)
+
+        result, repo = _run_e2e_nightly(
+            tmp_path, invoke=_fake_invoke_known_and_unknown_slug,
+            invariants_doc=_REIFY_FORM_INVARIANTS_DOC,
+        )
+
+        assert result.commit_made is True
+        committed = _committed_codebook(repo)
+        [entry] = [e for e in committed['entries'] if e['id'] == 'known-cause']
+        assert [s.get('invariant_violated') for s in entry['sightings']] == [
+            'undef-has-provenance',
+        ]
+        [candidate] = [c for c in committed['candidates'] if c['title'] == 'novel']
+        assert ['invariant_violated' in s for s in candidate['sightings']] == [False]
+        assert any(
+            'invariant slugs: 1 valid, 1 rejected' in m
+            for m in _messages(caplog, logging.INFO)
+        )
+        naming_it = [m for m in _messages(caplog, logging.WARNING) if 'made-up-free-text' in m]
+        assert len(naming_it) == 1, naming_it
+
+    def test_the_coder_is_given_the_definition_and_an_empty_verdict_mints_nothing(
+        self, tmp_path,
+    ):
+        prompts = []
+
+        def recording_invoke(prompt: str, model: str) -> str:
+            prompts.append(prompt)
+            return json.dumps({'matches': [], 'candidates': []})
+
+        result, repo = _run_e2e_nightly(tmp_path, invoke=recording_invoke)
+
+        assert result.exit_code == 0
+        assert _committed_codebook(repo)['candidates'] == []
+        assert [row[4] for row in _ledger_rows()] == [session_ledger.Outcome.EMPTY.value]
+        [prompt] = prompts
+        definition = code_quality.section(_quality_doc_text(), '## Definition').strip()
+        assert definition in prompt
+        for headline in _heuristic_headlines():
+            assert headline not in prompt
