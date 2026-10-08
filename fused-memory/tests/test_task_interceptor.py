@@ -12567,15 +12567,14 @@ async def test_journaled_write_emits_write_op_and_backend_op(
         await interceptor.update_task('1', '/project', prompt='tweak')
 
         # Verify the rows.
-        assert journal._db is not None
-        async with journal._db.execute(
+        async with journal._require_access().connection.execute(
             "SELECT id, operation FROM write_ops WHERE operation = 'update_task'",
         ) as cur:
             wo_rows = list(await cur.fetchall())
         assert len(wo_rows) == 1, wo_rows
         write_op_id = wo_rows[0][0]
 
-        async with journal._db.execute(
+        async with journal._require_access().connection.execute(
             'SELECT backend, success FROM backend_ops '
             "WHERE write_op_id = ? AND operation = 'update_task'",
             (write_op_id,),
@@ -12618,15 +12617,14 @@ async def test_journaled_write_logs_failure_row(
         with pytest.raises(TaskmasterError):
             await interceptor.update_task('1', '/project', prompt='x')
 
-        assert journal._db is not None
-        async with journal._db.execute(
+        async with journal._require_access().connection.execute(
             "SELECT COUNT(*) FROM write_ops WHERE operation = 'update_task'",
         ) as cur:
             row = await cur.fetchone()
             assert row is not None
             wo_count = row[0]
         assert wo_count == 1
-        async with journal._db.execute(
+        async with journal._require_access().connection.execute(
             "SELECT success, error FROM backend_ops WHERE operation = 'update_task'",
         ) as cur:
             bo_rows = list(await cur.fetchall())
@@ -12837,7 +12835,7 @@ async def test_client_op_id_failure_result_not_pinned(
 # Every non-done row keeps the literal and carries no `done_provenance_kind`
 # key, so no existing consumer changes meaning.
 #
-# Rows are read back through the PUBLIC readers. The `journal._db` sqlite
+# Rows are read back through the PUBLIC readers. The raw-connection sqlite
 # reads elsewhere in this file are the pattern to improve on, not to copy:
 # reaching a module's internals from a test is an interface smell.
 

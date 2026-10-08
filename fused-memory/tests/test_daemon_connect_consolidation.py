@@ -92,7 +92,7 @@ _DAEMON_CASES = [
     pytest.param(
         lambda tmp: WriteJournal(data_dir=tmp / 'journal'),
         _std_lifecycle,
-        lambda store, _root: store._db,
+        lambda store, _root: store._require_access().connection,
         id='WriteJournal',
     ),
     pytest.param(
