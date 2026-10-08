@@ -368,16 +368,16 @@ class TestRebuildEntitySummariesForceDryRun:
 
     Narrowed scope claim
     --------------------
-    get_all_valid_edges is NOT awaited when rebuild_entity_summaries is called
-    with force=True AND dry_run=True. This skip only applies to the force=True
+    The bulk edge read (enumerate_all_valid_edges) is NOT awaited when
+    rebuild_entity_summaries is called with force=True AND dry_run=True. This skip only applies to the force=True
     code path (the force branch); it does NOT apply to the force=False path.
 
-    Two production-code guards in graphiti_client.rebuild_entity_summaries
+    Two production-code guards in MemoryService.rebuild_entity_summaries
     protect this behaviour (referenced by semantic role, not by line number):
 
     1. **edge-fetch guard in the force branch** — inside the ``if force:`` block,
        an inner ``if not dry_run:`` gate controls whether
-       ``get_all_valid_edges(...)`` is awaited. When dry_run=True that gate is
+       ``enumerate_all_valid_edges(...)`` is awaited. When dry_run=True that gate is
        closed, so no edges are fetched at all.
 
     2. **dry_run early-return block before the semaphore loop** — after the
@@ -393,12 +393,12 @@ class TestRebuildEntitySummariesForceDryRun:
 
     - ``force=False, dry_run=True`` → calls ``detect_stale_dry_run``,
       which fetches edges per-entity via ``get_valid_edges_for_node`` and does
-      **NOT** call ``get_all_valid_edges``. This is the cheap-probe path added
+      **NOT** issue the bulk ``enumerate_all_valid_edges`` read. This is the cheap-probe path added
       by task 526 to avoid materialising the O(E) edge dict when the result is
       never passed to ``rebuild_entity_from_edges``.
 
     - ``force=False, dry_run=False`` → calls ``detect_stale_with_edges``,
-      which still issues a single bulk ``get_all_valid_edges`` query. That full
+      which still issues a single bulk ``enumerate_all_valid_edges`` read. That full
       edge map is needed because the actual rebuild loop (``rebuild_entity_from_edges``)
       will consume it.
 
@@ -415,8 +415,8 @@ class TestRebuildEntitySummariesForceDryRun:
     def _setup_force_dry_run(self, mock_config, entities):
         """Wire a service for force=True dry_run=True tests."""
         svc = _make_svc(mock_config)
-        svc.graphiti.list_entity_nodes = AsyncMock(return_value=entities)
-        svc.graphiti.get_all_valid_edges = AsyncMock(return_value={})
+        svc.graphiti.enumerate_entity_nodes = AsyncMock(return_value=(entities, complete_paged_read()))
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=({}, complete_paged_read()))
         svc.graphiti.rebuild_entity_from_edges = AsyncMock()
         return svc
 
@@ -425,17 +425,17 @@ class TestRebuildEntitySummariesForceDryRun:
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_force_dry_run_does_not_call_get_all_valid_edges(
+    async def test_force_dry_run_does_not_call_enumerate_all_valid_edges(
         self, mock_config, make_stale_list
     ):
-        """When force=True and dry_run=True, get_all_valid_edges is NOT called."""
+        """When force=True and dry_run=True, enumerate_all_valid_edges is NOT called."""
         svc = self._setup_force_dry_run(mock_config, make_stale_list())
 
         await svc.rebuild_entity_summaries(project_id='test', force=True, dry_run=True)
 
-        svc.graphiti.get_all_valid_edges.assert_not_awaited()  # type: ignore[attr-defined]
+        svc.graphiti.enumerate_all_valid_edges.assert_not_awaited()  # type: ignore[attr-defined]
         svc.graphiti.rebuild_entity_from_edges.assert_not_awaited()  # type: ignore[attr-defined]
-        svc.graphiti.list_entity_nodes.assert_awaited_once()  # type: ignore[attr-defined]
+        svc.graphiti.enumerate_entity_nodes.assert_awaited_once()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_force_dry_run_returns_correct_aggregate(self, mock_config):
@@ -460,23 +460,23 @@ class TestRebuildEntitySummariesForceDryRun:
         assert result['details'] == expected_details
         assert result['errors'] + result['rebuilt'] + result['skipped'] == result['stale_entities']
         svc.graphiti.rebuild_entity_from_edges.assert_not_awaited()  # type: ignore[attr-defined]
-        svc.graphiti.get_all_valid_edges.assert_not_awaited()  # type: ignore[attr-defined]
+        svc.graphiti.enumerate_all_valid_edges.assert_not_awaited()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
-    async def test_force_no_dry_run_calls_get_all_valid_edges(
+    async def test_force_no_dry_run_calls_enumerate_all_valid_edges(
         self, mock_config, make_stale_list
     ):
-        """Positive complement: force=True, dry_run=False calls get_all_valid_edges exactly once."""
+        """Positive complement: force=True, dry_run=False calls enumerate_all_valid_edges exactly once."""
         svc = _make_svc(mock_config)
-        svc.graphiti.list_entity_nodes = AsyncMock(return_value=make_stale_list())
-        svc.graphiti.get_all_valid_edges = AsyncMock(return_value={})
+        svc.graphiti.enumerate_entity_nodes = AsyncMock(return_value=(make_stale_list(), complete_paged_read()))
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=({}, complete_paged_read()))
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(
             return_value=make_rebuild_detail('u1', 'Alice')
         )
 
         await svc.rebuild_entity_summaries(project_id='test', force=True, dry_run=False)
 
-        svc.graphiti.get_all_valid_edges.assert_awaited_once_with(group_id='test')
+        svc.graphiti.enumerate_all_valid_edges.assert_awaited_once_with(group_id='test')
         assert svc.graphiti.rebuild_entity_from_edges.await_count == 2
 
 
@@ -541,19 +541,19 @@ class TestRebuildEntitySummariesDataFlow:
 
     @pytest.mark.asyncio
     async def test_force_false_dry_run_does_not_fetch_edge_map(self, mock_config):
-        """force=False, dry_run=True: get_all_valid_edges is NOT awaited.
+        """force=False, dry_run=True: enumerate_all_valid_edges is NOT awaited.
 
         The force=False dry_run=True path routes through detect_stale_dry_run and
-        never calls get_all_valid_edges. The dry_run block short-circuits before
+        never calls enumerate_all_valid_edges. The dry_run block short-circuits before
         the rebuild loop that would consume the edge map.
         """
         svc = _make_svc(mock_config)
         svc.graphiti.detect_stale_dry_run = AsyncMock(return_value=([], 1))
-        svc.graphiti.get_all_valid_edges = AsyncMock(return_value={})
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=({}, complete_paged_read()))
 
         await svc.rebuild_entity_summaries(project_id='test', force=False, dry_run=True)
 
-        svc.graphiti.get_all_valid_edges.assert_not_awaited()
+        svc.graphiti.enumerate_all_valid_edges.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_force_false_no_dry_run_still_fetches_edge_map(self, mock_config):
@@ -597,7 +597,7 @@ class TestRebuildEntitySummariesDataFlow:
         stale_list = make_stale_list(alice_summary='some summary 1', bob_summary='some summary 2')
         svc.graphiti.detect_stale_dry_run = AsyncMock(return_value=(stale_list, 2))
         svc.graphiti.detect_stale_with_edges = AsyncMock()
-        svc.graphiti.get_all_valid_edges = AsyncMock(return_value={})
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=({}, complete_paged_read()))
 
         result = await svc.rebuild_entity_summaries(project_id='test', force=False, dry_run=True)
 
@@ -605,7 +605,7 @@ class TestRebuildEntitySummariesDataFlow:
         svc.graphiti.detect_stale_dry_run.assert_awaited_once_with(group_id='test')
         svc.graphiti.detect_stale_with_edges.assert_not_awaited()
         # Bulk edge fetch must NOT be issued
-        svc.graphiti.get_all_valid_edges.assert_not_awaited()
+        svc.graphiti.enumerate_all_valid_edges.assert_not_awaited()
         # Result reflects dry_run short-circuit: both stale entities skipped, none rebuilt
         assert result['total_entities'] == 2
         assert result['rebuilt'] == 0
@@ -628,12 +628,12 @@ class TestRebuildEntitySummariesErrorHandling:
         into result['errors'] and result['details'] with status='error'.
         """
         svc = _make_svc(mock_config)
-        svc.graphiti.list_entity_nodes = AsyncMock(
-            return_value=[
+        svc.graphiti.enumerate_entity_nodes = AsyncMock(
+            return_value=([
                 {'uuid': 'u1', 'name': 'Alice', 'summary': 'stale summary'},
-            ]
+            ], complete_paged_read())
         )
-        svc.graphiti.get_all_valid_edges = AsyncMock(return_value={})
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=({}, complete_paged_read()))
         # Simulate rebuild_entity_from_edges failing for this entity
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(side_effect=RuntimeError('boom'))
 
@@ -661,15 +661,18 @@ class TestRebuildEntitySummariesErrorHandling:
         loop that is the core value of return_exceptions=True.
         """
         svc = _make_svc(mock_config)
-        svc.graphiti.list_entity_nodes = AsyncMock(
-            return_value=make_stale_list(alice_summary='stale summary', bob_summary='stale summary 2')
+        svc.graphiti.enumerate_entity_nodes = AsyncMock(
+            return_value=(
+                make_stale_list(alice_summary='stale summary', bob_summary='stale summary 2'),
+                complete_paged_read(),
+            )
         )
         u2_edges: list[EdgeDict] = [
             {'uuid': 'e-1', 'fact': 'fact1', 'name': 'knows'},
             {'uuid': 'e-2', 'fact': 'fact2', 'name': 'knows'},
             {'uuid': 'e-3', 'fact': 'fact3', 'name': 'knows'},
         ]
-        svc.graphiti.get_all_valid_edges = AsyncMock(return_value={'u2': u2_edges})
+        svc.graphiti.enumerate_all_valid_edges = AsyncMock(return_value=({'u2': u2_edges}, complete_paged_read()))
         svc.graphiti.rebuild_entity_from_edges = AsyncMock(
             side_effect=[
                 RuntimeError('boom'),
@@ -709,7 +712,7 @@ class TestRebuildEntitySummariesErrorHandling:
         # 1. mock→detail: ok_detail['old_summary'] == '<echoed-old-summary>' (above) proves
         #    the mock return value flows through the detail-assembly path.
         # 2. fixture→kwarg: assert_any_call(old_summary='stale summary 2') below proves
-        #    list_entity_nodes()[i]['summary'] is forwarded as the old_summary kwarg to
+        #    the node read's [i]['summary'] is forwarded as the old_summary kwarg to
         #    rebuild_entity_from_edges — independent of whatever the mock returns.
         svc.graphiti.rebuild_entity_from_edges.assert_any_call(
             'u2', 'Bob', u2_edges, group_id='test', old_summary='stale summary 2'
@@ -727,7 +730,7 @@ class TestRebuildEntitySummariesErrorHandling:
         This exercises the force=False bookkeeping path where total_entities comes
         from detect_stale_with_edges (result.total_count=5), which is
         independent of stale_entities (=len(targets)=2). This path is not reachable
-        via force=True — in that branch total_entities = len(list_entity_nodes()).
+        via force=True — in that branch total_entities is the node read's length.
 
         With two stale entities and rebuild_entity_from_edges raising for the first
         and succeeding for the second, the gather/zip accumulator must record
