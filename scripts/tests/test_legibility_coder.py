@@ -48,6 +48,10 @@ from shared.cap_markers import REAL_CLI_CAP_HIT_MESSAGES, REAL_CLI_CAP_MESSAGES
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _LIVE_CODEBOOK_PATH = _REPO_ROOT / "docs" / "legibility" / "confusion-codebook.yaml"
 
+# The vocabulary of a project declaring no invariant slugs, for every test
+# that is not about the slug list.
+_NO_SLUGS: tuple[str, ...] = ()
+
 # ---------------------------------------------------------------------------
 # Shared fixture helpers — synthetic transcript -> real digest text, mirrors
 # test_legibility_digest.py's helper shapes (own copies, per this repo's
@@ -253,14 +257,14 @@ def test_build_prompt_embeds_digest_and_index_verbatim():
     digest_text = '---\nsession: "s1"\n---\n\n## User Corrections\n- unique marker UC123'
     index = "- entry-a: Title A — cause a\n- entry-b: Title B — cause b"
 
-    prompt = mod.build_prompt(digest_text, index)
+    prompt = mod.build_prompt(digest_text, index, invariant_slugs=_NO_SLUGS)
 
     assert digest_text in prompt
     assert index in prompt
 
 
 def test_build_prompt_embeds_phase_enum_including_unknown():
-    prompt = mod.build_prompt("digest text", "codebook index")
+    prompt = mod.build_prompt("digest text", "codebook index", invariant_slugs=_NO_SLUGS)
 
     for phase in codebook_mod.PHASES:
         assert phase in prompt
@@ -344,7 +348,7 @@ def test_code_digest_happy_path_success(tmp_path):
 
     result = mod.code_digest(
         digest_text, live_codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is True
@@ -379,7 +383,7 @@ def test_code_digest_unparseable_output_is_failure_not_fabricated():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is False
@@ -412,7 +416,7 @@ def test_code_digest_schema_invalid_record_is_failure_not_fabricated():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is False
@@ -434,7 +438,7 @@ def test_code_digest_invocation_error_is_failure_not_fabricated():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is False
@@ -456,7 +460,7 @@ def test_code_digest_malformed_frontmatter_is_failure_not_raised():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is False
@@ -474,7 +478,7 @@ def test_code_digest_empty_judgment_is_success_not_failure():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.ok is True
@@ -526,7 +530,7 @@ def test_code_digest_cap_exhausted_is_a_labelled_failure_not_fabricated():
 
     result = mod.code_digest(
         digest_text, codebook, project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.capped is True, (
@@ -553,7 +557,7 @@ def _capped_flag_for(invoke):
     digest_text = _hand_digest(_SESSION_ID, "a confusing correction happened here")
     return mod.code_digest(
         digest_text, _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=invoke,
+        invoke=invoke, invariant_slugs=_NO_SLUGS,
     )
 
 
@@ -612,7 +616,7 @@ def test_code_digest_malformed_frontmatter_is_never_labelled_capped():
 
     result = mod.code_digest(
         "no frontmatter here, just prose", _tiny_codebook(),
-        project="dark_factory", model="haiku", invoke=fake_invoke,
+        project="dark_factory", model="haiku", invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
     assert result.ok is False
     assert result.capped is False
@@ -644,7 +648,7 @@ def test_code_digest_exit_zero_cap_banner_is_labelled_capped(message):
     result = mod.code_digest(
         _hand_digest(_SESSION_ID, "a confusing correction happened here"),
         _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.capped is True, (
@@ -663,7 +667,7 @@ def test_code_digest_exit_zero_cap_reason_names_the_marker():
     result = mod.code_digest(
         _hand_digest(_SESSION_ID, "a confusing correction happened here"),
         _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
     assert result.capped is True
     assert result.reason is not None, "a capped digest must still record WHY"
@@ -709,7 +713,7 @@ def test_code_digest_a_verdict_QUOTING_cap_text_is_never_read_as_a_banner():
     result = mod.code_digest(
         _hand_digest(_SESSION_ID, "a confusing correction happened here"),
         _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
 
     assert result.capped is False, (
@@ -758,7 +762,7 @@ def test_code_digest_ordinary_garbage_stays_an_unlabelled_parse_failure():
     result = mod.code_digest(
         _hand_digest(_SESSION_ID, "a confusing correction happened here"),
         _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=fake_invoke,
+        invoke=fake_invoke, invariant_slugs=_NO_SLUGS,
     )
     assert result.ok is False
     assert result.capped is False
@@ -808,7 +812,7 @@ def _run_mixed(*, capped, failed, ok):
     digests = _batch_digests(capped + failed + ok)
     return mod.code_digests(
         digests, _tiny_codebook(), project="dark_factory", model="haiku",
-        invoke=_mixed_batch_invoke(capped=capped, failed=failed),
+        invoke=_mixed_batch_invoke(capped=capped, failed=failed), invariant_slugs=_NO_SLUGS,
     )
 
 
@@ -928,7 +932,7 @@ def test_code_digests_all_succeed_batch_status_ok():
 
     result = mod.code_digests(
         digests, codebook, project="dark_factory", model="haiku",
-        invoke=_make_batch_invoke(fail_sessions=set()),
+        invoke=_make_batch_invoke(fail_sessions=set()), invariant_slugs=_NO_SLUGS,
     )
 
     assert result.status == "ok"
@@ -948,7 +952,7 @@ def test_code_digests_majority_failure_batch_status_failure():
 
     result = mod.code_digests(
         digests, codebook, project="dark_factory", model="haiku",
-        invoke=_make_batch_invoke(fail_sessions),
+        invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
     )
 
     assert result.status == "failure"
@@ -970,7 +974,7 @@ def test_code_digests_exactly_half_failure_is_not_a_storm():
 
     result = mod.code_digests(
         digests, codebook, project="dark_factory", model="haiku",
-        invoke=_make_batch_invoke(fail_sessions),
+        invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
     )
 
     assert result.status == "ok"
@@ -1027,7 +1031,7 @@ def test_code_digests_logs_every_failure_in_a_sub_storm_batch(caplog):
     with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
         result = mod.code_digests(
             digests, _tiny_codebook(), project="dark_factory", model="haiku",
-            invoke=_make_batch_invoke(fail_sessions),
+            invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
         )
 
     assert result.status == "ok", (
@@ -1067,7 +1071,7 @@ def test_code_digests_logs_one_record_per_failure_in_a_storm(caplog):
     with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
         result = mod.code_digests(
             digests, _tiny_codebook(), project="dark_factory", model="haiku",
-            invoke=_make_batch_invoke(fail_sessions),
+            invoke=_make_batch_invoke(fail_sessions), invariant_slugs=_NO_SLUGS,
         )
 
     assert result.status == "failure"
@@ -1094,7 +1098,7 @@ def test_code_digests_logs_the_isolated_crash_path_too(caplog):
     with caplog.at_level(logging.DEBUG, logger="legibility.coder"):
         result = mod.code_digests(
             digests, _tiny_codebook(), project="dark_factory", model="haiku",
-            invoke=_make_crashing_invoke({"batch-sess-1"}),
+            invoke=_make_crashing_invoke({"batch-sess-1"}), invariant_slugs=_NO_SLUGS,
         )
 
     # The batch kept going: the other two digests still coded.
@@ -1199,9 +1203,13 @@ def _main_digests(tmp_path, prefix, count):
 
 
 def _run_main(tmp_path, *args):
+    """Run main() with *tmp_path* as the observed project's root."""
     codebook_path = tmp_path / "codebook.yaml"
     codebook_mod.dump(_tiny_codebook(), codebook_path)
-    return mod.main([*map(str, args), "--codebook", str(codebook_path), "--project", "dark_factory"])
+    return mod.main([
+        *map(str, args), "--codebook", str(codebook_path), "--project", "dark_factory",
+        "--project-root", str(tmp_path),
+    ])
 
 
 def test_main_happy_path_writes_valid_jsonl_and_returns_0(

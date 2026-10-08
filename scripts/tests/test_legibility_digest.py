@@ -2896,7 +2896,7 @@ class TestCoderJudgmentPayloadClassifier:
         is read out of the prompt, never hand-built: a hand-built reply stays
         green when that schema is renamed, and a rename is the drift this
         pins."""
-        prompt = coder_mod.build_prompt(digest_text='', codebook_index='')
+        prompt = coder_mod.build_prompt(digest_text='', codebook_index='', invariant_slugs=())
         [prescribed_reply] = [line for line in prompt.splitlines() if line.startswith('{')]
 
         assert mod.is_coder_judgment_payload(prescribed_reply) is True

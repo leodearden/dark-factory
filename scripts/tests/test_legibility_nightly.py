@@ -2086,7 +2086,7 @@ class TestRunNightlyRunsOnThePooledSessionRunner:
 
         result = coder_module.code_digest(
             _HAND_DIGEST_FOR_IDENTITY, {'entries': []}, project='dark_factory',
-            invoke=capped_invoke,
+            invoke=capped_invoke, invariant_slugs=(),
         )
 
         assert result.capped is True

@@ -67,7 +67,7 @@ import sys
 import tempfile
 import time
 import traceback
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -263,8 +263,8 @@ class MiningResult:
 
 
 def mine_to_saturation(
-    batch_source, codebook_dict: dict, *, project: str, model: str, config, invoke,
-    max_batches: int | None = None,
+    batch_source, codebook_dict: dict, *, project: str, model: str, config,
+    invariant_slugs: Sequence[str], invoke, max_batches: int | None = None,
 ) -> MiningResult:
     """Code batches from *batch_source* against *codebook_dict* via
     ``coder.code_digests`` until novelty saturates.
@@ -273,7 +273,7 @@ def mine_to_saturation(
     is ready to code it, so a source that stops yielding once mining
     saturates never has its later batches materialized. Per batch: code
     via ``coder.code_digests(batch, codebook_dict, project=project,
-    model=model, invoke=invoke)``, compute this batch's ``dup_rate`` over
+    model=model, invariant_slugs=invariant_slugs, invoke=invoke)``, compute this batch's ``dup_rate`` over
     its own successful records (``batch_dup_rate`` -- failed codings are
     excluded from the denominator per that function's own contract), and
     track a consecutive-saturated-batch counter: incremented when
@@ -368,7 +368,8 @@ def mine_to_saturation(
             _MAX_PER_DIGEST_CODER_WARNINGS_PER_BATCH
         ) as bounded:
             run_result = coder.code_digests(
-                list(batch), codebook_dict, project=project, model=model, invoke=invoke,
+                list(batch), codebook_dict, project=project, model=model,
+                invariant_slugs=invariant_slugs, invoke=invoke,
             )
         result.records.extend(run_result.records)
 
@@ -2611,6 +2612,7 @@ def run_census(
         project=project_id,
         model=config.models.census_miner,
         config=config.census.saturation,
+        invariant_slugs=invariant_slugs,
         invoke=invoke,
         max_batches=max_batches,
     )

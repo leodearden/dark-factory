@@ -311,7 +311,7 @@ def test_mine_to_saturation_stops_after_two_consecutive_saturated_batches():
 
     result = mod.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
-        config=saturation, invoke=fake_invoke,
+        config=saturation, invoke=fake_invoke, invariant_slugs=(),
     )
 
     assert result.stop_reason == "saturated"
@@ -341,7 +341,7 @@ def test_mine_to_saturation_exhausts_source_that_never_saturates():
 
     result = mod.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
-        config=saturation, invoke=fake_invoke,
+        config=saturation, invoke=fake_invoke, invariant_slugs=(),
     )
 
     assert result.stop_reason == "exhausted"
@@ -400,7 +400,7 @@ def test_mine_to_saturation_storm_batch_never_counts_as_saturated():
 
     result = mod.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
-        config=saturation, invoke=fake_invoke,
+        config=saturation, invoke=fake_invoke, invariant_slugs=(),
     )
 
     assert result.stop_reason == "saturated"
@@ -452,7 +452,7 @@ def test_mine_to_saturation_stops_at_operator_batch_cap():
 
     result = mod.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
-        config=saturation, invoke=fake_invoke, max_batches=2,
+        config=saturation, invoke=fake_invoke, max_batches=2, invariant_slugs=(),
     )
 
     assert result.stop_reason == "capped", "the cap must be distinguishable from exhaustion"
@@ -473,7 +473,7 @@ def test_mine_to_saturation_cap_not_reached_leaves_stop_reason_unchanged():
 
     result = mod.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
-        config=saturation, invoke=fake_invoke, max_batches=99,
+        config=saturation, invoke=fake_invoke, max_batches=99, invariant_slugs=(),
     )
 
     assert result.stop_reason == "exhausted", "a cap never reached must not relabel the stop"
@@ -496,7 +496,7 @@ def test_mine_to_saturation_saturation_at_the_cap_reports_saturated_not_capped()
 
     result = mod.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
-        config=saturation, invoke=fake_invoke, max_batches=2,
+        config=saturation, invoke=fake_invoke, max_batches=2, invariant_slugs=(),
     )
 
     assert result.stop_reason == "saturated", (
@@ -514,14 +514,14 @@ def test_mine_to_saturation_records_max_batches_on_result():
     capped = mod.mine_to_saturation(
         source, live_codebook, project="dark_factory", model="sonnet",
         config=saturation, invoke=_make_fake_invoke(_mining_response_fn(novel_sessions)),
-        max_batches=2,
+        max_batches=2, invariant_slugs=(),
     )
     assert capped.max_batches == 2, "the cap must travel on the result for the report"
 
     source2, novel_sessions2 = _never_saturating_source(3)
     flagless = mod.mine_to_saturation(
         source2, live_codebook, project="dark_factory", model="sonnet",
-        config=saturation, invoke=_make_fake_invoke(_mining_response_fn(novel_sessions2)),
+        config=saturation, invoke=_make_fake_invoke(_mining_response_fn(novel_sessions2)), invariant_slugs=(),
     )
     assert flagless.max_batches is None, "no cap passed -> nothing to report"
     assert flagless.stop_reason == "exhausted"
@@ -541,7 +541,7 @@ def test_mine_to_saturation_rejects_a_nonpositive_batch_cap(bad_cap):
     with pytest.raises(ValueError, match="max_batches"):
         mod.mine_to_saturation(
             source, live_codebook, project="dark_factory", model="sonnet",
-            config=saturation, invoke=_poison("invoke"), max_batches=bad_cap,
+            config=saturation, invoke=_poison("invoke"), max_batches=bad_cap, invariant_slugs=(),
         )
 
     assert source.pulled == [], "the guard must fire before any batch is consumed"
@@ -6715,7 +6715,7 @@ def test_mine_to_saturation_emits_one_aggregated_warning_per_failing_batch(caplo
     with caplog.at_level(logging.WARNING):
         result = mod.mine_to_saturation(
             source, live_codebook, project="dark_factory", model="sonnet",
-            config=saturation, invoke=fake_invoke,
+            config=saturation, invoke=fake_invoke, invariant_slugs=(),
         )
 
     assert [s.failed for s in result.batch_stats] == [0, 6], "fixture sanity"
@@ -6777,7 +6777,7 @@ def test_mine_to_saturation_bounds_the_coder_per_digest_flood_without_silencing_
     with caplog.at_level(logging.WARNING):
         result = mod.mine_to_saturation(
             source, live_codebook, project="dark_factory", model="sonnet",
-            config=saturation, invoke=fake_invoke,
+            config=saturation, invoke=fake_invoke, invariant_slugs=(),
         )
 
     assert [s.failed for s in result.batch_stats] == [0, 6], "fixture sanity"
@@ -6822,13 +6822,13 @@ def test_mine_to_saturation_bound_leaves_a_later_direct_code_digests_call_untouc
     with caplog.at_level(logging.WARNING):
         mod.mine_to_saturation(
             source, live_codebook, project="dark_factory", model="sonnet",
-            config=saturation, invoke=fake_invoke,
+            config=saturation, invoke=fake_invoke, invariant_slugs=(),
         )
         caplog.clear()
         # The same failing fixture, called directly — as nightly.run_nightly does.
         direct = coder.code_digests(
             _batch_digests(10, "f1"), live_codebook,
-            project="dark_factory", model="sonnet", invoke=fake_invoke,
+            project="dark_factory", model="sonnet", invoke=fake_invoke, invariant_slugs=(),
         )
 
     assert direct.failed == 6, "fixture sanity"
@@ -6851,7 +6851,7 @@ def test_mine_to_saturation_bound_is_removed_when_the_batch_loop_unwinds(caplog)
     with pytest.raises(RuntimeError, match="blew up mid-iteration"):
         mod.mine_to_saturation(
             _RaisingBatchSource(), live_codebook, project="dark_factory",
-            model="sonnet", config=saturation, invoke=fake_invoke,
+            model="sonnet", config=saturation, invoke=fake_invoke, invariant_slugs=(),
         )
 
     assert logging.getLogger("legibility.coder").filters == [], (
@@ -6882,7 +6882,7 @@ def test_mine_to_saturation_bound_is_spent_only_on_warnings_not_on_chatter(caplo
     with caplog.at_level(logging.DEBUG):
         mod.mine_to_saturation(
             source, live_codebook, project="dark_factory", model="sonnet",
-            config=saturation, invoke=chatty_invoke,
+            config=saturation, invoke=chatty_invoke, invariant_slugs=(),
         )
 
     assert chatter == 20, "fixture sanity: two batches of ten digests each"

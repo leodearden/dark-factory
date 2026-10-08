@@ -57,6 +57,7 @@ import json
 import logging
 import re
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -70,10 +71,15 @@ from pathlib import Path
 # (scripts/legibility/, not scripts/). Unconditional -- deliberately NOT
 # inside a `__main__` guard -- because the `shared.cap_markers` import it
 # enables is module-level, so it must resolve under pytest and package import
-# too.
+# too. orchestrator/src is bound the same way, for the code-quality slicer
+# `orchestrator.agents.code_quality` (stdlib-only): under
+# `uv run --project shared` nothing else puts it on sys.path.
 _SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
+_ORCH_SRC = Path(__file__).resolve().parents[2] / "orchestrator" / "src"
+if str(_ORCH_SRC) not in sys.path:
+    sys.path.insert(0, str(_ORCH_SRC))
 
 # Self-bootstrap for a standalone `python scripts/legibility/coder.py` run --
 # must precede the `legibility.*` import below, since a direct script
@@ -84,7 +90,8 @@ if __name__ == "__main__":
 
 import codebook as codebook_mod  # noqa: E402
 import yaml  # noqa: E402
-from legibility import session_runner  # noqa: E402
+from legibility import invariants, session_runner  # noqa: E402
+from orchestrator.agents import code_quality  # noqa: E402
 from shared.cap_markers import looks_like_blocking_banner  # noqa: E402
 
 logger = logging.getLogger("legibility.coder")
@@ -210,13 +217,41 @@ def parse_frontmatter(digest_text: str) -> dict:
 # build_prompt — instructions + codebook index + digest, embedded verbatim
 # ---------------------------------------------------------------------------
 
-def build_prompt(digest_text: str, codebook_index: str) -> str:
+_DEFINITION_HEADING = "## Definition"
+
+
+def _quality_definition() -> str:
+    """The normative code-quality doc's ``## Definition`` body, read per call
+    so a renamed heading fails one digest rather than the import."""
+    doc_text = code_quality.NORMATIVE_DOC.read_text(encoding="utf-8")
+    return code_quality.section(doc_text, _DEFINITION_HEADING).strip()
+
+
+def _invariant_slugs_block(invariant_slugs: Sequence[str]) -> str:
+    if not invariant_slugs:
+        return (
+            "This project declares no invariant slugs in "
+            f"{invariants.DOC_RELPATH}, so invariant_violated must be null."
+        )
+    return (
+        "invariant_violated must be one of these slugs from this project's "
+        f"{invariants.DOC_RELPATH}, or null:\n"
+        + "\n".join(f"- {slug}" for slug in invariant_slugs)
+    )
+
+
+def build_prompt(
+    digest_text: str, codebook_index: str, *, invariant_slugs: Sequence[str]
+) -> str:
     """Compose the full prompt handed to the trickle coder LLM.
 
     Embeds *codebook_index* and *digest_text* verbatim (pure data
     plumbing — a broken coder would drop one), the legal phase vocabulary
-    (codebook.PHASES, including "unknown"), and the required strict-JSON
-    output shape (PRD §7.3).
+    (codebook.PHASES, including "unknown"), the required strict-JSON
+    output shape (PRD §7.3), the code-quality Definition as the test a
+    confusion must meet to be minted as a candidate, and the observed
+    project's *invariant_slugs* (an empty list is stated, not omitted).
+    The slugs are guidance only: the merger is what enforces them.
     """
     phases = ", ".join(codebook_mod.PHASES)
     return (
@@ -237,6 +272,12 @@ def build_prompt(digest_text: str, codebook_index: str) -> str:
         '"evidence_quote": "..."}]}\n'
         'If nothing matches and nothing is novel, respond with '
         '{"matches": [], "candidates": []}.\n\n'
+        "=== QUALITY DEFINITION ===\n"
+        "Mint a candidate only for a confusion that meets this definition, "
+        "that is, one that shows a cost or risk to the next change. "
+        "Otherwise do not mint one.\n"
+        + _quality_definition() + "\n\n"
+        "=== INVARIANT SLUGS ===\n" + _invariant_slugs_block(invariant_slugs) + "\n\n"
         "=== CODEBOOK INDEX ===\n" + codebook_index + "\n\n"
         "=== SESSION DIGEST ===\n" + digest_text
     )
@@ -345,6 +386,7 @@ def code_digest(
     *,
     project: str,
     model: str = "haiku",
+    invariant_slugs: Sequence[str],
     invoke,
 ) -> CodingResult:
     """Code one digest against one codebook.
@@ -376,7 +418,7 @@ def code_digest(
     session = meta.get("session")
 
     index = build_codebook_index(codebook)
-    prompt = build_prompt(digest_text, index)
+    prompt = build_prompt(digest_text, index, invariant_slugs=invariant_slugs)
 
     try:
         raw = invoke(prompt, model)
@@ -506,6 +548,7 @@ def code_digests(
     *,
     project: str,
     model: str = "haiku",
+    invariant_slugs: Sequence[str],
     invoke,
 ) -> RunResult:
     """Code a batch of digests against one codebook.
@@ -569,7 +612,8 @@ def code_digests(
     for digest_text in digests:
         try:
             result = code_digest(
-                digest_text, codebook, project=project, model=model, invoke=invoke,
+                digest_text, codebook, project=project, model=model,
+                invariant_slugs=invariant_slugs, invoke=invoke,
             )
         except Exception as exc:  # isolate: one crash can't abort the batch
             # An unexpected crash is never a cap: the cap paths are typed and
@@ -708,6 +752,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Project id stamped into each coding record's deterministic header",
     )
     parser.add_argument(
+        "--project-root", required=True,
+        help="The observed project's root, whose design-invariants doc "
+        "declares the invariant slugs the prompt lists",
+    )
+    parser.add_argument(
         "--model", default="haiku", help="LLM model tier (default: %(default)s)",
     )
     parser.add_argument(
@@ -735,10 +784,12 @@ def main(argv: list[str] | None = None) -> int:
 
     codebook = codebook_mod.load(args.codebook)
     digests = [p.read_text(encoding="utf-8") for p in digest_paths]
+    invariant_slugs = invariants.read_slugs(args.project_root)
 
     with session_runner.open_pooled_runner(label="legibility-coder-cli") as runner:
         result = code_digests(
             digests, codebook, project=args.project, model=args.model,
+            invariant_slugs=invariant_slugs,
             invoke=runner.invoker(TRICKLE_CODER_STAGE),
         )
 

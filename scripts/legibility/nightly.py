@@ -1464,7 +1464,8 @@ def run_nightly(
         invariant_slugs = invariants.read_slugs(cfg.project_root)
 
         run = coder.code_digests(
-            digests, cb, project=cfg.project_id, model=cfg.models.trickle, invoke=invoke,
+            digests, cb, project=cfg.project_id, model=cfg.models.trickle,
+            invariant_slugs=invariant_slugs, invoke=invoke,
         )
 
         if coder.is_cap_deferral(run):
