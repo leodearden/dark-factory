@@ -1164,6 +1164,14 @@ _HEADINGS_DUP_NUMBER = """\
 ## INV-2 `c-slug`
 """
 
+# (h) A family-prefixed id. Valid in another project's doc (reify's INV-SF-n),
+# never in dark-factory's, whose family is the unprefixed INV-<n>.
+_HEADINGS_FAMILY_PREFIXED = """\
+## INV-1 `a-slug`
+
+## INV-SF-1 `b-slug`
+"""
+
 _FIXTURE_SOURCE = "a hand-written fixture"
 
 
@@ -1202,6 +1210,9 @@ def test_parse_invariant_headings_ignores_every_decoy_shape() -> None:
         ),
         pytest.param(
             _HEADINGS_DUP_NUMBER, "duplicate number", [repr([2])], id="duplicate-number"
+        ),
+        pytest.param(
+            _HEADINGS_FAMILY_PREFIXED, "family-prefixed", ["INV-SF-1"], id="family-prefixed"
         ),
     ],
 )
