@@ -1070,15 +1070,6 @@ class SuppressionClass:
         return self.kind is site.kind and matches_code and self.scope.covers(site.path)
 
 
-RATIFIED_SUPPRESSION_CLASSES: Mapping[SuppressionClass, Policy] = MappingProxyType({})
-"""Blanket rulings, keyed by class — SHIPPED EMPTY, and the OPERATOR's (PRD D9).
-
-Rows are ruled by task 5603 and applied by task 5609.  An implementer adding a
-row here would be ratifying a blanket exception on the operator's behalf, which
-is the one thing D9 reserves.
-"""
-
-
 # ---------------------------------------------------------------------------
 # Layer 3 — classification.
 
@@ -1183,8 +1174,14 @@ class Classification:
         return {key: len(entries) for key, entries in self.unowned.items()}
 
 
-def classify(scan: Scan, model: ConsumerModel) -> Classification:
+def classify(
+    scan: Scan, model: ConsumerModel, *, classes: Mapping[SuppressionClass, Policy]
+) -> Classification:
     """Decide every site's ownership, and collect D6's two disposition faults.
+
+    *classes* is the ratified class table this run classifies against.  It is
+    required, so this reads no module global and every caller states the table
+    it means.
 
     THE ORDER IS FIXED — consumer, then ratified class, then inline
     disposition — and it is the single mechanism that makes D8's "accepts no
@@ -1197,8 +1194,7 @@ def classify(scan: Scan, model: ConsumerModel) -> Classification:
     still counts it.
 
     The class table is second rather than first only because D8's prohibition
-    is categorical whereas D9's valve is the operator's.  Since the table ships
-    EMPTY no site is affected by that relative order today; recording it now is
+    is categorical whereas D9's valve is the operator's; recording that order is
     what stops a later reader flipping it by accident.
 
     A MALFORMED MARKER IS A VIOLATION AND LEAVES ITS SITES UNOWNED.  Both are
@@ -1254,7 +1250,7 @@ def classify(scan: Scan, model: ConsumerModel) -> Classification:
             )
 
         for site in comment.sites:
-            entry = _classify_site(site, disposition, model)
+            entry = _classify_site(site, disposition, model, classes)
             classified.append(entry)
             if entry.ownership is Ownership.UNOWNED:
                 unowned.setdefault(key_for(site).render(), []).append(entry)
@@ -1269,7 +1265,10 @@ def classify(scan: Scan, model: ConsumerModel) -> Classification:
 
 
 def _classify_site(
-    site: Site, disposition: Disposition | None, model: ConsumerModel
+    site: Site,
+    disposition: Disposition | None,
+    model: ConsumerModel,
+    classes: Mapping[SuppressionClass, Policy],
 ) -> Classified:
     """One site, through the fixed order :func:`classify` documents."""
     consumer = model.consumer_for(site)
@@ -1277,7 +1276,7 @@ def _classify_site(
         return Classified(site=site, consumer=consumer, ownership=Ownership.UNOWNED)
 
     row = next(
-        (row for row in RATIFIED_SUPPRESSION_CLASSES if row.covers(site)),
+        (row for row in classes if row.covers(site)),
         None,
     )
     if row is not None:
@@ -1310,6 +1309,16 @@ def _classify_site(
 #: here and nowhere else, so ``--baseline`` has a default that cannot drift from
 #: the path task 5607 seeds and the merge gate reads.
 BASELINE_PATH = 'scripts/inline_suppression_baseline.json'
+
+RATIFIED_SUPPRESSION_CLASSES: Mapping[SuppressionClass, Policy] = MappingProxyType({})
+"""Blanket rulings, keyed by class — SHIPPED EMPTY, and the OPERATOR's (PRD D9).
+
+Rows are ruled by task 5603 and applied by task 5609.  An implementer adding a
+row here would be ratifying a blanket exception on the operator's behalf, which
+is the one thing D9 reserves.  :func:`main` hands it to :func:`classify`, and
+nothing reads it as a global.
+"""
+
 
 #: The ``--json`` report's own schema version, and deliberately NOT
 #: ``shared.ratchet.SCHEMA_VERSION`` — that one versions the BASELINE FILE's
@@ -1374,11 +1383,13 @@ class Request:
     Attributes:
         root: The checkout under measurement.
         baseline: The baseline file this run compares against or writes.
+        classes: The ratified class table this run classifies against.
         scope: The positional ``PATH`` arguments, empty for a whole-tree run.
     """
 
     root: Path
     baseline: Path
+    classes: Mapping[SuppressionClass, Policy]
     scope: tuple[str, ...] = ()
 
     @property
@@ -1427,7 +1438,11 @@ def _measure(request: Request) -> Measurement:
     """Scan and classify *request*'s tree — the work every verb starts with."""
     scan = scan_tree(request.root, scope=request.scope)
     model = ConsumerModel(request.root)
-    return Measurement(scan=scan, classification=classify(scan, model), model=model)
+    return Measurement(
+        scan=scan,
+        classification=classify(scan, model, classes=request.classes),
+        model=model,
+    )
 
 
 def _enumeration(classification: Classification, kernel: ModuleType) -> Enumeration:
@@ -2028,8 +2043,12 @@ def _refuse(exc: Exception) -> int:
     return 2
 
 
-def _run(args: argparse.Namespace, kernel: ModuleType) -> int:
-    """Perform the verb *args* selected, as the exit code it returns.
+def _run(
+    args: argparse.Namespace,
+    kernel: ModuleType,
+    classes: Mapping[SuppressionClass, Policy],
+) -> int:
+    """Perform the verb *args* selected against *classes*, as the exit code it returns.
 
     The kernel's whole error family is converted to this module's own
     instrument failure HERE, at the one place the kernel is reachable, because
@@ -2039,7 +2058,7 @@ def _run(args: argparse.Namespace, kernel: ModuleType) -> int:
     """
     root = Path(args.root)
     baseline = Path(args.baseline) if args.baseline is not None else root / BASELINE_PATH
-    request = Request(root=root, baseline=baseline, scope=tuple(args.paths))
+    request = Request(root=root, baseline=baseline, classes=classes, scope=tuple(args.paths))
     try:
         if args.seed:
             return _seed(request, kernel)
@@ -2054,11 +2073,19 @@ def _run(args: argparse.Namespace, kernel: ModuleType) -> int:
         ) from exc
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """The 0/1/2 entry point, with every broken-instrument path landing on 2."""
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    classes: Mapping[SuppressionClass, Policy] = RATIFIED_SUPPRESSION_CLASSES,
+) -> int:
+    """The 0/1/2 entry point, with every broken-instrument path landing on 2.
+
+    *classes* is the operator's table, injectable so a test can run the CLI
+    against a real non-empty table without patching a module global.
+    """
     args = _build_parser().parse_args(argv)
     try:
-        return _run(args, _shared('ratchet'))
+        return _run(args, _shared('ratchet'), classes)
     except InstrumentFailure as exc:
         return _refuse(exc)
 
