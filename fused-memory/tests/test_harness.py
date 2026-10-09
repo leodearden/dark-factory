@@ -594,6 +594,8 @@ async def test_harness_construction_has_no_vestigial_stages(
     `_propagate_escalation_queue`) and not through a stale `self.stages`
     reference inside `_start_escalation_server`.
     """
+    from pathlib import Path
+
     from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
     from fused_memory.reconciliation.harness import ReconciliationHarness
 
@@ -622,7 +624,7 @@ async def test_harness_construction_has_no_vestigial_stages(
     with (
         patch(
             'fused_memory.reconciliation.harness.EscalationQueue',
-            return_value=MagicMock(),
+            return_value=MagicMock(queue_dir=Path('/tmp/test/esc')),
         ),
         patch(
             'fused_memory.reconciliation.harness.create_escalation_server',
@@ -642,6 +644,64 @@ async def test_harness_construction_has_no_vestigial_stages(
     assert not hasattr(harness, 'stages'), (
         'Starting the escalation server must not resurrect a harness.stages attribute'
     )
+
+
+@pytest.mark.asyncio
+async def test_escalation_server_receives_a_reconciliation_store_identity(
+    journal, event_buffer, mock_memory_service, tmp_path
+):
+    """The recon escalation server is told it serves the reconciliation store (task 3165).
+
+    It is built harness-less, so there is no project to name: γ2 of
+    ``plans/escalation-store-ambiguity-prd.md`` answers a ``project_root``
+    assertion against it with "this is the reconciliation store".
+    """
+    from escalation.store_identity import StoreIdentity
+
+    from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
+    from fused_memory.reconciliation.harness import ReconciliationHarness
+
+    config = FusedMemoryConfig(
+        reconciliation=ReconciliationConfig(
+            enabled=True,
+            explore_codebase_root=str(tmp_path),
+            escalation_queue_dir='esc',
+            agent_llm_provider='anthropic',
+            agent_llm_model='claude-sonnet-4-20250514',
+        )
+    )
+    harness = ReconciliationHarness(
+        memory_service=mock_memory_service,
+        taskmaster=AsyncMock(),
+        journal=journal,
+        event_buffer=event_buffer,
+        config=config,
+    )
+
+    with (
+        patch(
+            'fused_memory.reconciliation.harness.create_escalation_server',
+            return_value=MagicMock(run_http_async=AsyncMock()),
+        ) as mock_create,
+        patch('fused_memory.reconciliation.harness._sleep', AsyncMock()),
+        patch('fused_memory.reconciliation.harness.HAS_ESCALATION', True),
+    ):
+        try:
+            await harness._start_escalation_server()
+        finally:
+            await harness._stop_escalation_server()
+
+    assert mock_create.called, '_start_escalation_server did not reach create_escalation_server'
+    kwargs = mock_create.call_args.kwargs
+    assert 'store_identity' in kwargs, (
+        f'store_identity not passed to create_escalation_server; got {sorted(kwargs)}'
+    )
+    identity = kwargs['store_identity']
+    assert isinstance(identity, StoreIdentity)
+    assert identity.kind == 'reconciliation'
+    assert identity.project_id is None
+    assert identity.project_root is None
+    assert identity.queue_dir == (tmp_path / 'esc').resolve()
 
 
 def _mock_stage_run(stage, items_flagged=None, before_return=None, capture_call_args=None):

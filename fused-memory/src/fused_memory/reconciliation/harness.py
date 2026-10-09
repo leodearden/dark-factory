@@ -124,6 +124,7 @@ try:
     from escalation.server import (  # type: ignore[import-untyped]
         create_server as create_escalation_server,
     )
+    from escalation.store_identity import StoreIdentity  # type: ignore[import-untyped]
     HAS_ESCALATION = True
 except ImportError:
     HAS_ESCALATION = False
@@ -2808,7 +2809,15 @@ class ReconciliationHarness:
             queue_dir = Path(self.config.explore_codebase_root) / queue_dir
         self._escalation_queue = EscalationQueue(queue_dir)  # type: ignore[possibly-undefined]
 
-        mcp_server = create_escalation_server(self._escalation_queue)  # type: ignore[possibly-undefined]
+        mcp_server = create_escalation_server(  # type: ignore[possibly-undefined]
+            self._escalation_queue,
+            store_identity=StoreIdentity(  # type: ignore[possibly-undefined]
+                kind='reconciliation',
+                queue_dir=self._escalation_queue.queue_dir,
+                project_id=None,
+                project_root=None,
+            ),
+        )
         host = self.config.escalation_host
         port = self.config.escalation_port
 
