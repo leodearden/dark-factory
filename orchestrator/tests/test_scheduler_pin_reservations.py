@@ -576,6 +576,44 @@ async def test_a_head_that_turns_blocked_or_deferred_loses_its_reservation_and_e
 
 
 @pytest.mark.asyncio
+async def test_a_released_pin_that_is_no_dispatch_candidate_completes_no_fairness_park(tmp_path):
+    """Only a dispatch candidate completes the fairness parks its skips earned (esc-6040-7 D5).
+
+    P1 stays pending, but its cross-project dependency is unknown this tick:
+    park GC keeps its entries, while dispatch treats it as not satisfied.  It
+    is unpinned the same tick, so the first-match release reason reads
+    ``unpinned`` and masks the ineligibility, which is why the completion
+    cannot key on that reason.  G is a free candidate, because a tick with no
+    candidates ends before the pin phase.
+    """
+    w = _one_blocked_pin_world(tmp_path, _Clock())
+    assert await w.scheduler.acquire_next() is None
+    assert _ranks(w.scheduler, 'a.py') == [('P1', PinOrder(1).rank)], (
+        "premise: only P1's pin reservation parks a"
+    )
+    w.store.events.clear()
+
+    waiting = make_task('P1', 'medium', ['a.py'])
+    waiting['metadata']['external_deps'] = ['other_project:9']
+    w.scheduler.get_tasks = AsyncMock(return_value=[
+        waiting,
+        make_task('H', 'low', ['a.py'], status='in-progress'),
+        make_task('G', 'low', ['g.py']),
+    ])
+    w.scheduler.get_external_statuses = AsyncMock(
+        return_value=({}, RuntimeError('resolver down'))
+    )
+    assert w.overrides.clear_override(w.root, 'P1', field='pinned')
+    await w.scheduler.acquire_next()
+
+    assert event_data_for(w.store, 'reservation_expired', 'P1') == [
+        {'reason': 'unpinned', 'source': 'pin'},
+    ]
+    assert event_data_for(w.store, 'reservation_installed', 'P1') == []
+    assert 'P1' not in _owners(w.scheduler, 'a.py')
+
+
+@pytest.mark.asyncio
 async def test_a_restored_pin_reservation_reads_source_pin(tmp_path):
     """P1 shadows P2's pin reservation on a; P1's dispatch restores it as a pin."""
     w = park_world(tmp_path, pinned=('P1', 'P2'), pin_reservation_max_active=2)
