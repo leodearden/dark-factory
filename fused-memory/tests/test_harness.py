@@ -665,6 +665,7 @@ async def test_escalation_server_receives_a_reconciliation_store_identity(
         reconciliation=ReconciliationConfig(
             enabled=True,
             explore_codebase_root=str(tmp_path),
+            escalation_queue_dir='esc',
             agent_llm_provider='anthropic',
             agent_llm_model='claude-sonnet-4-20250514',
         )
@@ -700,9 +701,7 @@ async def test_escalation_server_receives_a_reconciliation_store_identity(
     assert identity.kind == 'reconciliation'
     assert identity.project_id is None
     assert identity.project_root is None
-    queue = harness._escalation_queue
-    assert queue is not None
-    assert identity.queue_dir == queue.queue_dir.resolve()
+    assert identity.queue_dir == (tmp_path / 'esc').resolve()
 
 
 def _mock_stage_run(stage, items_flagged=None, before_return=None, capture_call_args=None):
