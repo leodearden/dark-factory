@@ -2497,6 +2497,24 @@
           "current": 31999
         }
       ]
+    },
+    {
+      "task_id": "5206",
+      "reason": "env pin for verify_use_cgroup_scope, sibling of the 5053 host-reaching pins: one setenv in _isolate_orch_config and its delenv in code_default_config",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/tests/conftest.py",
+          "baseline": 1258,
+          "current": 1260
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57518,
+          "current": 57520
+        }
+      ]
     }
   ]
 }
