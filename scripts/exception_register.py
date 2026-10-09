@@ -37,6 +37,7 @@ import dataclasses
 import datetime
 import inspect
 import json
+import re
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -235,10 +236,49 @@ class Violation:
 
 
 @dataclasses.dataclass(frozen=True)
+class SymbolRef:
+    """A name a declaration's ``keys`` expression reaches, resolved statically.
+
+    ``module`` is set when the name came through an import, ``path`` when it is a
+    module-level name of the declaring file itself.
+    """
+
+    module: str | None
+    path: str | None
+    symbol: str
+
+    def reaches(self, candidate: ListRef) -> bool:
+        """Whether this reference names *candidate*'s container."""
+        if self.symbol != candidate.symbol:
+            return False
+        if self.path is not None:
+            return self.path == candidate.path
+        dotted = _dotted_module(candidate.path)
+        return dotted == self.module or dotted.endswith(f'.{self.module}')
+
+
+@dataclasses.dataclass(frozen=True, order=True)
+class ListRef:
+    """A module-level container, named as ``path::symbol``."""
+
+    path: str
+    symbol: str
+
+    def render(self) -> str:
+        return f'{self.path}::{self.symbol}'
+
+
+def _dotted_module(path: str) -> str:
+    """*path* as a dotted module: ``pkg/a.py`` → ``pkg.a``, ``pkg/__init__.py`` → ``pkg``."""
+    return path.removesuffix('.py').removesuffix('/__init__').replace('/', '.')
+
+
+@dataclasses.dataclass(frozen=True)
 class Declaration:
     """One governed list, as its literals read statically (D5).
 
     The key set is deliberately absent: only the runtime call sees it.
+    ``key_refs`` are the containers its ``keys`` expression names, for D14.
     """
 
     path: str
@@ -248,7 +288,7 @@ class Declaration:
     default: Disposition | None
     default_covers: int | None
     overrides: Mapping[str, Disposition]
-    keys: ast.expr = dataclasses.field(compare=False, repr=False)
+    key_refs: tuple[SymbolRef, ...]
 
     def __post_init__(self) -> None:
         object.__setattr__(self, 'overrides', MappingProxyType(dict(self.overrides)))
@@ -311,28 +351,112 @@ def parse_tracked(path: str, raw: bytes) -> ast.Module:
         raise InstrumentFailure(str(exc)) from exc
 
 
-class _ImportTimeCalls(ast.NodeVisitor):
-    """Collect the calls to the declaring function that run at import.
+class _ModuleScan(ast.NodeVisitor):
+    """One file's import-time declaring calls and its module-level bindings.
 
     A call inside a ``def``, ``async def`` or ``lambda`` runs only when that code
-    does, so it is a use of the function and not a declaration.
+    does, so it is a use of the function and not a declaration; a call in a class
+    body runs at import and counts.  ``imports`` maps each imported name to the
+    dotted name it stands for; ``assigned`` holds names the module assigns.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, path: str) -> None:
+        self.path = path
         self.calls: list[ast.Call] = []
-        self._depth = 0
+        self.imports: dict[str, tuple[str, ...]] = {}
+        self.assigned: set[str] = set()
+        self._functions = 0
+        self._classes = 0
 
-    def _nested(self, node: ast.AST) -> None:
-        self._depth += 1
+    def _in_function(self, node: ast.AST) -> None:
+        self._functions += 1
         self.generic_visit(node)
-        self._depth -= 1
+        self._functions -= 1
 
-    visit_FunctionDef = visit_AsyncFunctionDef = visit_Lambda = _nested
+    visit_FunctionDef = visit_AsyncFunctionDef = visit_Lambda = _in_function
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._classes += 1
+        self.generic_visit(node)
+        self._classes -= 1
+
+    def _at_module_scope(self) -> bool:
+        return self._functions == 0 and self._classes == 0
 
     def visit_Call(self, node: ast.Call) -> None:
-        if self._depth == 0 and _terminal_name(node.func) == _FUNCTION_NAME:
+        if self._functions == 0 and _terminal_name(node.func) == _FUNCTION_NAME:
             self.calls.append(node)
         self.generic_visit(node)
+
+    def visit_Import(self, node: ast.Import) -> None:
+        if self._at_module_scope():
+            for alias in node.names:
+                dotted = tuple(alias.name.split('.'))
+                self.imports[alias.asname or dotted[0]] = dotted if alias.asname else dotted[:1]
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if self._at_module_scope():
+            base = _import_base(self.path, node)
+            for alias in node.names:
+                if alias.name != '*':
+                    self.imports[alias.asname or alias.name] = (*base, alias.name)
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self._assigns(node.targets)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self._assigns([node.target])
+        self.generic_visit(node)
+
+    def _assigns(self, targets: list[ast.expr]) -> None:
+        if self._at_module_scope():
+            self.assigned.update(target.id for target in targets if isinstance(target, ast.Name))
+
+
+def _import_base(path: str, node: ast.ImportFrom) -> tuple[str, ...]:
+    """The dotted package an ``ImportFrom`` reads from; relative to *path*'s directory."""
+    named = tuple(node.module.split('.')) if node.module else ()
+    if node.level == 0:
+        return named
+    package = Path(path).parent.parts
+    return (*package[: max(len(package) - (node.level - 1), 0)], *named)
+
+
+class _KeyNames(ast.NodeVisitor):
+    """Every name and dotted attribute chain in an expression, root first."""
+
+    def __init__(self) -> None:
+        self.chains: list[tuple[str, ...]] = []
+
+    def visit_Name(self, node: ast.Name) -> None:
+        self.chains.append((node.id,))
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        parts: list[str] = []
+        value: ast.expr = node
+        while isinstance(value, ast.Attribute):
+            parts.append(value.attr)
+            value = value.value
+        if isinstance(value, ast.Name):
+            self.chains.append((value.id, *reversed(parts)))
+        else:
+            self.generic_visit(node)
+
+
+def _key_refs(scan: _ModuleScan, keys: ast.expr) -> tuple[SymbolRef, ...]:
+    """The containers *keys* names, through *scan*'s imports or its own module names."""
+    names = _KeyNames()
+    names.visit(keys)
+    refs: set[SymbolRef] = set()
+    for root, *rest in names.chains:
+        if root in scan.imports:
+            qualified = (*scan.imports[root], *rest)
+            if len(qualified) > 1:
+                refs.add(SymbolRef('.'.join(qualified[:-1]), None, qualified[-1]))
+        elif not rest and root in scan.assigned:
+            refs.add(SymbolRef(None, scan.path, root))
+    return tuple(sorted(refs, key=lambda ref: (ref.module or '', ref.path or '', ref.symbol)))
 
 
 def _terminal_name(node: ast.expr) -> str | None:
@@ -472,8 +596,9 @@ def _overrides(
     return overrides
 
 
-def _declaration(path: str, call: ast.Call, faults: list[Violation]) -> Declaration | None:
+def _declaration(scan: _ModuleScan, call: ast.Call, faults: list[Violation]) -> Declaration | None:
     """*call* read into a :class:`Declaration`, or ``None`` when a literal is malformed."""
+    path = scan.path
     site = f'{path}:{call.lineno}'
     arguments = _bind(site, call)
     list_id = _str_literal(site, 'list_id', arguments['list_id'])
@@ -497,7 +622,7 @@ def _declaration(path: str, call: ast.Call, faults: list[Violation]) -> Declarat
         default=default,
         default_covers=default_covers,
         overrides={key: value for key, value in overrides.items() if value is not None},
-        keys=arguments['keys'],
+        key_refs=_key_refs(scan, arguments['keys']),
     )
 
 
@@ -526,10 +651,10 @@ def declarations_in(corpus: Corpus) -> Discovery:
         if _CALL_TEXT not in raw:
             continue
         parsed += 1
-        collector = _ImportTimeCalls()
-        collector.visit(parse_tracked(path, raw))
-        for call in collector.calls:
-            declaration = _declaration(path, call, faults)
+        scan = _ModuleScan(path)
+        scan.visit(parse_tracked(path, raw))
+        for call in scan.calls:
+            declaration = _declaration(scan, call, faults)
             if declaration is not None:
                 declarations.append(declaration)
     _require_unique(declarations)
@@ -544,6 +669,98 @@ def declarations_in(corpus: Corpus) -> Discovery:
 def discover_declarations(root: Path) -> Discovery:
     """Every import-time declaration in *root*'s tracked Python (D5)."""
     return declarations_in(read_corpus(root))
+
+
+# ---------------------------------------------------------------------------
+# D14 — the report-only census of unregistered candidate lists.
+
+#: The PRD brief's census grep, verbatim (PRD D14, Open question 3).
+CENSUS_NAME_PATTERN = re.compile(
+    r'ALLOW_?LIST|allowlist|ALLOWED_|_EXEMPT|EXEMPTIONS?|KNOWN_.*(FLAKE|EXCEPTION|VIOLATION)'
+    r'|PINNED_SITES|_TOLERATED|_GRANDFATHERED'
+)
+_CENSUS_BYTES = re.compile(CENSUS_NAME_PATTERN.pattern.encode())
+
+# Selects files for the AST, which stays the authority; misses chained and `;`-joined assignments.
+_COLUMN_ZERO_ASSIGNMENT = re.compile(rb'(?m)^([A-Za-z_]\w*)\s*[:=]')
+
+_COLLECTION_DISPLAYS = (ast.List, ast.Tuple, ast.Set, ast.Dict, ast.ListComp, ast.SetComp, ast.DictComp)
+_COLLECTION_FACTORIES = frozenset({'frozenset', 'set', 'tuple', 'list', 'dict', 'MappingProxyType'})
+
+NOT_EXCEPTION_LISTS: Mapping[ListRef, str] = MappingProxyType({})
+"""Containers whose names match the census but which are not exception lists.
+
+A classification, not a tolerated violation: each row carries a reason, never
+a ratification (D14).  Shipped empty; the day-one rulings seed it.  A row that
+matches no candidate is inert.
+"""
+
+
+def validate_not_exception_lists(rows: Mapping[ListRef, str]) -> None:
+    """Refuse a row whose reason is blank: a classification needs one (D14)."""
+    for key, reason in rows.items():
+        if not isinstance(reason, str) or not reason.strip():
+            raise InstrumentFailure(
+                f'NOT_EXCEPTION_LISTS row {key.render()} needs a reason, not {reason!r}'
+            )
+
+
+def _may_hold_candidate(raw: bytes) -> bool:
+    if not _CENSUS_BYTES.search(raw):
+        return False
+    return any(_CENSUS_BYTES.search(match.group(1)) for match in _COLUMN_ZERO_ASSIGNMENT.finditer(raw))
+
+
+def _is_collection(value: ast.expr | None) -> bool:
+    if isinstance(value, _COLLECTION_DISPLAYS):
+        return True
+    return isinstance(value, ast.Call) and _terminal_name(value.func) in _COLLECTION_FACTORIES
+
+
+def _module_candidates(path: str, tree: ast.Module) -> list[ListRef]:
+    found: list[ListRef] = []
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign):
+            targets, value = statement.targets, statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            targets, value = [statement.target], statement.value
+        else:
+            continue
+        if _is_collection(value):
+            found += [
+                ListRef(path, target.id)
+                for target in targets
+                if isinstance(target, ast.Name) and CENSUS_NAME_PATTERN.search(target.id)
+            ]
+    return found
+
+
+def candidates_in(corpus: Corpus) -> tuple[ListRef, ...]:
+    """Every module-level collection in *corpus* whose name matches the census."""
+    found: set[ListRef] = set()
+    for path, raw in corpus.files.items():
+        if _may_hold_candidate(raw):
+            found.update(_module_candidates(path, parse_tracked(path, raw)))
+    return tuple(sorted(found))
+
+
+def collection_candidates(root: Path) -> tuple[ListRef, ...]:
+    """D14's candidates in *root*'s tracked Python."""
+    return candidates_in(read_corpus(root))
+
+
+def unregistered_candidates(
+    candidates: Sequence[ListRef],
+    declarations: Sequence[Declaration],
+    not_exception_lists: Mapping[ListRef, str],
+) -> tuple[ListRef, ...]:
+    """*candidates* no declaration's keys reach and no classification row names."""
+    refs = [ref for declaration in declarations for ref in declaration.key_refs]
+    return tuple(
+        candidate
+        for candidate in candidates
+        if candidate not in not_exception_lists and not any(ref.reaches(candidate) for ref in refs)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -832,12 +1049,16 @@ class Register:
     discovery: Discovery
     inline: InlineReport
     violations: tuple[Violation, ...]
+    unregistered: tuple[ListRef, ...]
 
 
 def measure(root: Path) -> Register:
     """Measure *root*'s register once."""
+    validate_not_exception_lists(NOT_EXCEPTION_LISTS)
     table = load_ratifications(root / TABLE_PATH)
-    discovery = declarations_in(read_corpus(root))
+    corpus = read_corpus(root)
+    discovery = declarations_in(corpus)
+    candidates = candidates_in(corpus)
     inline = read_inline_report(root)
     closed = closed_world_violations(table, discovery.declarations, inline)
     return Register(
@@ -845,6 +1066,9 @@ def measure(root: Path) -> Register:
         discovery=discovery,
         inline=inline,
         violations=tuple(sorted(discovery.faults + closed, key=Violation.sort_key)),
+        unregistered=unregistered_candidates(
+            candidates, discovery.declarations, NOT_EXCEPTION_LISTS
+        ),
     )
 
 
@@ -897,6 +1121,9 @@ def register_document(register: Register) -> dict[str, object]:
         'grandfathered': {'seeded': inline.seeded, 'unowned': _grandfathered(inline)},
         'baseline': {'present': inline.seeded, 'slack_total': inline.slack_total},
         'inline': dict(inline.document),
+        'unregistered': [
+            {'path': ref.path, 'symbol': ref.symbol} for ref in register.unregistered
+        ],
         'violations': [violation.record() for violation in register.violations],
     }
 
@@ -988,6 +1215,8 @@ def render_report(register: Register) -> str:
         f'grandfathered (unowned): {"not seeded" if unowned is None else unowned}',
         f'ratification table: {TABLE_PATH}, {_plural(len(register.table), "row")}',
         *_governed_lines(register.discovery),
+        f'unregistered candidates (report-only): {len(register.unregistered)}',
+        *(f'  {ref.render()}' for ref in register.unregistered),
         *_inline_lines(register.inline),
         f'violations: {len(register.violations)}',
     ]

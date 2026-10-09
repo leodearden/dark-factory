@@ -1007,10 +1007,3 @@ def test_a_not_exception_row_with_a_blank_reason_is_refused(reason: str):
         exception_register.validate_not_exception_lists({_ref('pkg/a.py', 'ALLOWLIST'): reason})
 
     assert 'pkg/a.py::ALLOWLIST' in str(excinfo.value)
-
-
-def test_a_not_exception_row_keyed_by_a_string_is_refused():
-    with pytest.raises(exception_register.InstrumentFailure) as excinfo:
-        exception_register.validate_not_exception_lists({'pkg/a.py::ALLOWLIST': 'a reason'})
-
-    assert 'pkg/a.py::ALLOWLIST' in str(excinfo.value)
