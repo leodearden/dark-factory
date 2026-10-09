@@ -1,4 +1,4 @@
-"""is_stranded predicate — Table C4 of the task-status-authority contract.
+"""Claimant predicates — Table C4 of the task-status-authority contract.
 
 See PRD ``plans/task-status-authority-prd.md`` (contract C4, decision D4):
 "stranded" becomes a queryable predicate backed by first-class
@@ -10,11 +10,15 @@ NOT-infra-held rationale
 :func:`is_stranded` represents "NOT infra-held" primarily through its
 ``status == 'in-progress'`` gate: decision D3 makes ``infra-hold`` a
 first-class status, so an in-progress task is, by construction, never
-infra-held. The supplementary ``metadata.infra_hold`` check exists only as
-defensive safety for the pre-omega4 migration window, when some tasks may
-still carry the legacy "in-progress + metadata.infra_hold=True" overload
-instead of the new first-class status. Once omega4 completes that migration,
-the metadata check becomes permanently dead but harmless.
+infra-held. The supplementary ``metadata.infra_hold`` check, whose single
+home is :func:`is_stranded_any_status`, exists only as defensive safety for
+the pre-omega4 migration window, when some tasks may still carry the legacy
+"in-progress + metadata.infra_hold=True" overload instead of the new
+first-class status. Once omega4 completes that migration, the metadata check
+becomes permanently dead but harmless.
+
+The status-agnostic read rule and the shared TTL follow
+``docs/prds/claimant-invariant-enforcement.md`` (C4-E1/C4-E6/D3).
 
 This module is intentionally NOT re-exported from ``shared/__init__.py``.
 Consumers import via the fully-qualified path
@@ -31,11 +35,18 @@ from shared.task_statuses import TaskStatus
 from shared.timestamps import parse_timestamp_or_warn
 
 __all__ = [
+    'DEFAULT_CLAIMANT_HEARTBEAT_TTL',
     'compose_claimant_run_id',
     'has_live_claimant',
     'is_stranded',
+    'is_stranded_any_status',
     'is_stranded_blocked',
 ]
+
+# The single claimant heartbeat staleness window (docs/prds/claimant-invariant-enforcement.md
+# D6.2), shared by the reconcile/ground-truth, dashboard and fused-memory readers. The scheduler's
+# dispatch gate deliberately uses its own config knob, claimant_liveness_ttl_secs (300s).
+DEFAULT_CLAIMANT_HEARTBEAT_TTL: timedelta = timedelta(minutes=10)
 
 
 def compose_claimant_run_id(run_id: str, session_id: str, owner_pid: int) -> str:
@@ -71,7 +82,7 @@ def _claimant_liveness_stranded(task: Mapping, now: datetime, ttl: timedelta) ->
       - its ``heartbeat_at`` is older than *now* - *ttl*.
 
     Carries no status gate and no infra_hold check — those are the callers'
-    responsibility (see :func:`is_stranded` / :func:`is_stranded_blocked`).
+    responsibility (see :func:`is_stranded_any_status`).
 
     Parameters
     ----------
@@ -103,6 +114,30 @@ def _claimant_liveness_stranded(task: Mapping, now: datetime, ttl: timedelta) ->
     return heartbeat < now - ttl
 
 
+def is_stranded_any_status(task: Mapping, now: datetime, ttl: timedelta) -> bool:
+    """Return True when no one alive holds *task*, whatever its status (C4-E6).
+
+    Answers "is anyone alive holding this row?": TTL-based, status-agnostic,
+    and respecting the legacy ``metadata.infra_hold`` overload (see module
+    docstring). A first-class ``infra-hold`` STATUS gets no carve-out here —
+    callers gate on status themselves.
+
+    Parameters
+    ----------
+    task:
+        A task-dict-like mapping. Reads ``claimant_run_id``, ``heartbeat_at``
+        and ``metadata``.
+    now:
+        The reference "current time"; a naive value is normalized to UTC.
+    ttl:
+        Heartbeat staleness threshold.
+    """
+    metadata = task.get('metadata')
+    if isinstance(metadata, Mapping) and metadata.get('infra_hold'):
+        return False
+    return _claimant_liveness_stranded(task, now, ttl)
+
+
 def is_stranded(task: Mapping, now: datetime, ttl: timedelta) -> bool:
     """Return True when *task* is a claimed-but-abandoned in-progress task.
 
@@ -126,19 +161,9 @@ def is_stranded(task: Mapping, now: datetime, ttl: timedelta) -> bool:
         Heartbeat staleness threshold. A heartbeat older than ``now - ttl``
         is considered stale.
     """
-    status = str(task.get('status'))
-    if status != TaskStatus.IN_PROGRESS.value:
+    if str(task.get('status')) != TaskStatus.IN_PROGRESS.value:
         return False
-
-    # A first-class TaskStatus.INFRA_HOLD status can never reach this line —
-    # the in-progress gate above already returned False for it. Only the
-    # legacy metadata.infra_hold overload (pre-omega4 migration window, see
-    # module docstring) is checked here.
-    metadata = task.get('metadata')
-    if isinstance(metadata, Mapping) and metadata.get('infra_hold'):
-        return False
-
-    return _claimant_liveness_stranded(task, now, ttl)
+    return is_stranded_any_status(task, now, ttl)
 
 
 def is_stranded_blocked(task: Mapping, now: datetime, ttl: timedelta) -> bool:
@@ -173,15 +198,9 @@ def is_stranded_blocked(task: Mapping, now: datetime, ttl: timedelta) -> bool:
         Heartbeat staleness threshold. A heartbeat older than ``now - ttl``
         is considered stale.
     """
-    status = str(task.get('status'))
-    if status != TaskStatus.BLOCKED.value:
+    if str(task.get('status')) != TaskStatus.BLOCKED.value:
         return False
-
-    metadata = task.get('metadata')
-    if isinstance(metadata, Mapping) and metadata.get('infra_hold'):
-        return False
-
-    return _claimant_liveness_stranded(task, now, ttl)
+    return is_stranded_any_status(task, now, ttl)
 
 
 def has_live_claimant(task: Mapping, now: datetime, ttl: timedelta) -> bool:
