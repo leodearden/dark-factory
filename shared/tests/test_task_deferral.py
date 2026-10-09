@@ -7,19 +7,24 @@ moved by timedelta offsets; everything goes through the public names.
 from __future__ import annotations
 
 import json
+import subprocess
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
 from test_pure_stdlib_leaves import run_python_child
 
-from shared.process_identity import ProcessIdentity
+from shared.process_identity import Liveness, ProcessIdentity, capture, liveness
 from shared.task_deferral import (
     CALLER_KINDS,
     CONDITION_MAX_CHARS,
     DEFAULT_GRACE_SECS,
     GRACE_BOUNDS,
+    LAPSE_OVERDUE_AFTER_SECS,
     REASON_MAX_CHARS,
+    STALE_CONDITION_AFTER_SECS,
+    STALE_PLANNING_AFTER_SECS,
     CarriedByDeferral,
     CarriedByRequest,
     Deferral,
@@ -30,11 +35,15 @@ from shared.task_deferral import (
     HeldBySessionDeferral,
     HeldBySessionRequest,
     InvalidRecord,
+    LapseCause,
     LegacyUnknownDeferral,
     LegacyUnknownRequest,
+    NeedsHumanReason,
     PlanningDeferral,
     UntilConditionDeferral,
     UntilConditionRequest,
+    lapse_cause,
+    needs_human,
     parse_record,
     parse_request,
     parse_utc_timestamp,
@@ -286,12 +295,13 @@ def _stamped(
     raw: dict[str, object],
     *,
     holder: ProcessIdentity | None = None,
+    stamped_at: datetime = STAMPED_AT,
     deferred_at: datetime | None = NOW,
     stamped_by: str | None = _AGENT,
 ) -> Deferral:
     return stamp(
-        parse_request(raw, now=NOW),
-        stamped_at=STAMPED_AT,
+        parse_request(raw, now=stamped_at),
+        stamped_at=stamped_at,
         stamped_by=stamped_by,
         deferred_at=deferred_at,
         holder=holder,
@@ -489,3 +499,168 @@ def test_a_process_importing_only_task_metadata_types_the_deferral_slice():
 
 def test_a_process_importing_task_deferral_first_knows_the_key():
     assert run_python_child(_TASK_DEFERRAL_FIRST_CHILD) is True
+
+
+
+# --- the pure predicates -----------------------------------------------------
+
+_US = timedelta(microseconds=1)
+_EXPIRES_AT = NOW + timedelta(hours=1)
+_STALE_PLANNING = timedelta(seconds=STALE_PLANNING_AFTER_SECS)
+_STALE_CONDITION = timedelta(seconds=STALE_CONDITION_AFTER_SECS)
+_OVERDUE = timedelta(seconds=LAPSE_OVERDUE_AFTER_SECS)
+
+_CARRIED = _stamped(_carried(), stamped_at=NOW)
+_EXPIRING = _stamped(_until(expires_at=_EXPIRES_AT.isoformat()), stamped_at=NOW)
+_OPEN_ENDED = _stamped(_until(), stamped_at=NOW)
+_HELD_600 = _stamped(_held(holder_pid=HOLDER.pid, grace_secs=600), holder=HOLDER, stamped_at=NOW)
+_HELD_DEFAULT = _stamped(_held(holder_pid=HOLDER.pid), holder=HOLDER, stamped_at=NOW)
+_PLANNING = PlanningDeferral(deferred_at=NOW, stamped_at=NOW, stamped_by='orchestrator')
+_LEGACY = _stamped({'kind': 'legacy_unknown'}, stamped_at=NOW, deferred_at=None, stamped_by=None)
+_TRIAGED_YESTERDAY = _stamped(_until(), stamped_at=NOW - timedelta(days=1), deferred_at=None)
+_FAR_EXPIRY_STAMPED_LONG_AGO = _stamped(
+    _until(expires_at=(NOW + timedelta(days=1)).isoformat()), stamped_at=NOW - timedelta(days=60)
+)
+_LONG_DEAD = NOW - timedelta(days=1)
+
+_LAPSE_CASES = [
+    pytest.param(_EXPIRING, _EXPIRES_AT, None, LapseCause.EXPIRED, id='expires-now'),
+    pytest.param(_EXPIRING, _EXPIRES_AT - _US, None, None, id='expires-in-1us'),
+    pytest.param(_OPEN_ENDED, NOW + timedelta(days=365), None, None, id='no-expiry'),
+    pytest.param(_HELD_600, NOW + timedelta(days=1), None, None, id='holder-never-seen-dead'),
+    pytest.param(
+        _HELD_600, NOW + timedelta(seconds=600), NOW, LapseCause.HOLDER_LOST, id='grace-600-spent'
+    ),
+    pytest.param(_HELD_600, NOW + timedelta(seconds=600) - _US, NOW, None, id='grace-600-left'),
+    pytest.param(
+        _HELD_DEFAULT,
+        NOW + timedelta(seconds=DEFAULT_GRACE_SECS),
+        NOW,
+        LapseCause.HOLDER_LOST,
+        id='grace-default-spent',
+    ),
+    pytest.param(
+        _HELD_DEFAULT,
+        NOW + timedelta(seconds=DEFAULT_GRACE_SECS) - _US,
+        NOW,
+        None,
+        id='grace-default-left',
+    ),
+    pytest.param(_CARRIED, NOW + timedelta(days=365), _LONG_DEAD, None, id='carried-by'),
+    pytest.param(_PLANNING, NOW + timedelta(days=365), _LONG_DEAD, None, id='planning'),
+    pytest.param(_LEGACY, NOW + timedelta(days=365), _LONG_DEAD, None, id='legacy-unknown'),
+]
+
+
+@pytest.mark.parametrize(('record', 'now', 'dead_since', 'expected'), _LAPSE_CASES)
+def test_lapse_cause(record, now, dead_since, expected):
+    assert lapse_cause(record, now, dead_since) is expected
+
+
+def test_lapse_cases_cover_every_cause():
+    covered = {case.values[-1] for case in _LAPSE_CASES} - {None}
+
+    assert covered == set(LapseCause)
+
+
+_NEEDS_HUMAN_CASES = [
+    pytest.param(None, NOW, None, None, NeedsHumanReason.MISSING_RECORD, id='missing'),
+    pytest.param(InvalidRecord('x'), NOW, None, None, NeedsHumanReason.INVALID_RECORD, id='bad'),
+    pytest.param(_LEGACY, NOW, None, None, NeedsHumanReason.LEGACY_UNKNOWN, id='legacy'),
+    pytest.param(_CARRIED, NOW, 'done', None, NeedsHumanReason.CLOSABLE, id='carrier-done'),
+    pytest.param(
+        _CARRIED, NOW, 'cancelled', None, NeedsHumanReason.ORPHANED, id='carrier-cancelled'
+    ),
+    *(
+        pytest.param(_CARRIED, NOW, status, None, None, id=f'carrier-{status}')
+        for status in ('pending', 'in-progress', 'deferred', None)
+    ),
+    pytest.param(_PLANNING, NOW + _STALE_PLANNING, None, None, None, id='planning-at-limit'),
+    pytest.param(
+        _PLANNING,
+        NOW + _STALE_PLANNING + _US,
+        None,
+        None,
+        NeedsHumanReason.STALE_PLANNING,
+        id='planning-stale',
+    ),
+    pytest.param(_OPEN_ENDED, NOW + _STALE_CONDITION, None, None, None, id='condition-at-limit'),
+    pytest.param(
+        _OPEN_ENDED,
+        NOW + _STALE_CONDITION + _US,
+        None,
+        None,
+        NeedsHumanReason.STALE_CONDITION,
+        id='condition-stale',
+    ),
+    pytest.param(_TRIAGED_YESTERDAY, NOW, None, None, None, id='condition-triaged-yesterday'),
+    pytest.param(_EXPIRING, _EXPIRES_AT + _OVERDUE, None, None, None, id='expiry-at-limit'),
+    pytest.param(
+        _EXPIRING,
+        _EXPIRES_AT + _OVERDUE + _US,
+        None,
+        None,
+        NeedsHumanReason.EXPIRY_OVERDUE,
+        id='expiry-overdue',
+    ),
+    pytest.param(_FAR_EXPIRY_STAMPED_LONG_AGO, NOW, None, None, None, id='expiry-ahead-old-stamp'),
+    pytest.param(
+        _HELD_DEFAULT, NOW, None, None, NeedsHumanReason.LIVENESS_UNKNOWN, id='holder-unknown'
+    ),
+    pytest.param(
+        _HELD_DEFAULT, NOW, None, Liveness.DEAD, NeedsHumanReason.HOLDER_DEAD, id='holder-dead'
+    ),
+    pytest.param(
+        _HELD_DEFAULT,
+        NOW,
+        None,
+        Liveness.OTHER_HOST,
+        NeedsHumanReason.HOLDER_OTHER_HOST,
+        id='holder-other-host',
+    ),
+    pytest.param(
+        _HELD_DEFAULT, NOW + timedelta(days=7), None, Liveness.ALIVE, None, id='alive-a-week'
+    ),
+    pytest.param(
+        _HELD_DEFAULT, NOW + timedelta(days=365), None, Liveness.ALIVE, None, id='alive-a-year'
+    ),
+    pytest.param(_OPEN_ENDED, NOW, None, None, None, id='condition-ignores-liveness'),
+    pytest.param(_CARRIED, NOW, 'pending', Liveness.DEAD, None, id='carried-ignores-liveness'),
+]
+
+
+@pytest.mark.parametrize(
+    ('record', 'now', 'carrier_status', 'holder_liveness', 'expected'), _NEEDS_HUMAN_CASES
+)
+def test_needs_human(record, now, carrier_status, holder_liveness, expected):
+    assert needs_human(record, now, carrier_status, holder_liveness) is expected
+
+
+def test_needs_human_cases_cover_every_reason():
+    covered = {case.values[-1] for case in _NEEDS_HUMAN_CASES} - {None}
+
+    assert covered == set(NeedsHumanReason)
+
+
+@pytest.fixture
+def sleeping_child() -> Iterator[subprocess.Popen]:
+    child = subprocess.Popen(['sleep', '600'])
+    yield child
+    child.kill()
+    child.wait()
+
+
+def test_a_live_holder_is_silent_and_a_killed_one_needs_a_human(sleeping_child):
+    identity = capture(sleeping_child.pid)
+    assert identity is not None
+    record = _stamped(_held(holder_pid=identity.pid), holder=identity, stamped_at=NOW)
+    a_week_later = NOW + timedelta(days=7)
+
+    assert needs_human(record, a_week_later, None, liveness(identity)) is None
+
+    sleeping_child.kill()
+    sleeping_child.wait()
+
+    assert needs_human(record, a_week_later, None, liveness(identity)) is (
+        NeedsHumanReason.HOLDER_DEAD
+    )
