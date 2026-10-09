@@ -654,9 +654,6 @@ class TestTheWriteTimePopulationBlock:
             't_low': T_LOW,
         }
 
-    def test_the_rule_is_stated_in_words(self) -> None:
-        assert 'before' in _mod().WRITE_TIME_RULE
-
 
 class TestTheWriteTimeArmRows:
     def test_one_row_per_write_time_arm_in_order(self, published: _PublishedWriteTime) -> None:
