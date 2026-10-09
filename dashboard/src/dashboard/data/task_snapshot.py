@@ -435,7 +435,7 @@ def _strand_split(rows: Datum[list[dict]]) -> tuple[int | None, int | None]:
 
     Through ``tasks.task_is_stranded`` rather than ``shared.task_claimant``
     directly: that wrapper is the single dashboard-side strand predicate,
-    binding ``STRANDED_HEARTBEAT_TTL`` and the request-scoped clock onto the
+    binding ``DEFAULT_CLAIMANT_HEARTBEAT_TTL`` and the request-scoped clock onto the
     shared function so the task-row badge and this split cannot disagree.
 
     Judged at ``rows.as_of`` — the instant the rows were MEASURED — not at the

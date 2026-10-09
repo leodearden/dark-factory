@@ -28,7 +28,7 @@ selected task from ``dashboard/src/dashboard/api/task_prose.py::api_task_prose``
         'heartbeat_at': '2026-08-08T12:00:00+00:00',  # MCP get_tasks claim column; None if never
         'stranded': False,          # tasks.task_is_stranded(task, now) — in-progress with no live
                                     # claimant (null/blank claimant, or a heartbeat older than
-                                    # STRANDED_HEARTBEAT_TTL). Independent of 'agent': a leftover
+                                    # DEFAULT_CLAIMANT_HEARTBEAT_TTL). Independent of 'agent': a leftover
                                     # worktree makes 'agent' truthy while nothing is running.
         'started': 14,              # minutes since TaskRuntimeEntry.started (runtime snapshot);
                                     # None when the entry's own started is None
