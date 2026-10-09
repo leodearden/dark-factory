@@ -1488,7 +1488,8 @@ def test_json_names_every_debt_owner_and_every_ratified_id_with_its_sites(
 def test_json_publishes_the_resolved_ruff_lists_rather_than_the_params_block(
     tmp_path: Path, capsys
 ):
-    """``ConsumerModel.resolved``'s audit trail, kept out of ``params`` as ``_params`` records.
+    """``ConsumerModel.resolved``'s audit trail, kept out of ``params`` as
+    ``scripts/inline_suppression_key.py::key_params`` records.
 
     The consumer model's answer for a ``noqa`` depends entirely on these two
     lists, so a reader has to be able to see what the model actually read —
