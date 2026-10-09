@@ -4196,6 +4196,56 @@ class TestWriteJournalConfig:
         assert section.prune_batch_size == 5000
 
 
+class TestWriteJournalGrowthAlarmConfig:
+    """Task 3311: the write_journal growth alarm's ceilings are operator-tunable.
+
+    The measured basis of the defaults lives in the
+    ``write_journal_growth_alarm`` block of ``fused-memory/config/config.yaml``.
+    """
+
+    def test_section_is_a_bare_submodel_with_defaults(self):
+        from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+
+        section = FusedMemoryConfig().write_journal_growth_alarm
+        assert isinstance(section, WriteJournalGrowthAlarmConfig), (
+            'RED: write_journal_growth_alarm must be a BARE (non-Optional) '
+            'submodel — reload.py descends only into required submodels'
+        )
+        assert section.max_file_bytes == 19_327_352_832
+        assert section.max_rows_inserted_per_day == 1_500_000
+        assert section.check_interval_seconds == 3600.0
+
+    def test_values_load_from_yaml(self, tmp_path, monkeypatch):
+        config_data = {
+            'write_journal_growth_alarm': {
+                'max_file_bytes': 1024,
+                'check_interval_seconds': 60.0,
+            },
+        }
+        config_file = tmp_path / 'config.yaml'
+        config_file.write_text(yaml.dump(config_data))
+        monkeypatch.setenv('CONFIG_PATH', str(config_file))
+
+        section = FusedMemoryConfig().write_journal_growth_alarm
+
+        assert section.max_file_bytes == 1024, 'RED: the section must be tunable'
+        assert section.check_interval_seconds == 60.0
+        assert section.max_rows_inserted_per_day == 1_500_000
+
+    @pytest.mark.parametrize(
+        'field',
+        ['max_file_bytes', 'max_rows_inserted_per_day', 'check_interval_seconds'],
+    )
+    def test_non_positive_values_are_rejected(self, field):
+        from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            WriteJournalGrowthAlarmConfig.model_validate({field: 0})
+        assert field in str(excinfo.value), (
+            'RED: a ceiling of 0 fires permanently; the rejection must name the field'
+        )
+
+
 class TestDedupOutageDetectorConfig:
     """Task 4718: the TicketJanitor's dedup-outage detector is configured under
     ``curator.janitor.dedup_outage``. The defaults are back-tested in

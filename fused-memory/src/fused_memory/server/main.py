@@ -57,6 +57,7 @@ if TYPE_CHECKING:
     from fused_memory.reconciliation.recon_ledger import ReconLedgerStore
     from fused_memory.reconciliation.sqlite_watchdog import SqliteWatchdog
     from fused_memory.server.topic_cluster_store import TopicClusterStore
+    from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
 
 # Logging
 LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -1133,13 +1134,29 @@ async def run_server():
         recon_ledger=recon_ledger,
     )
     if _checkpoint_targets:
+        from fused_memory.services.journal_growth_alarm import JournalGrowthAlarm
+
+        growth_alarm = JournalGrowthAlarm(
+            write_journal,
+            config.write_journal_growth_alarm,
+            project_root=_primary_root or None,
+        )
         checkpoint_task = asyncio.create_task(
-            _periodic_checkpoint_loop(_checkpoint_targets),
+            _periodic_checkpoint_loop(_checkpoint_targets, growth_alarm=growth_alarm),
         )
         logger.info(
             '  Checkpoint loop: enabled (interval=%.0fs, targets=%s)',
             _CHECKPOINT_INTERVAL,
             [name for name, _ in _checkpoint_targets],
+        )
+        logger.info(
+            '  Write-journal growth alarm: max_file_bytes=%d '
+            'max_rows_inserted_per_day=%d interval=%.0fs, '
+            'rounded up to whole %.0fs checkpoint ticks',
+            config.write_journal_growth_alarm.max_file_bytes,
+            config.write_journal_growth_alarm.max_rows_inserted_per_day,
+            config.write_journal_growth_alarm.check_interval_seconds,
+            _CHECKPOINT_INTERVAL,
         )
     else:
         logger.info('  Checkpoint loop: no SQLite targets — skipped')
@@ -1669,20 +1686,32 @@ async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
                 )
 
 
-async def _periodic_checkpoint_loop(targets: list[tuple[str, object]]) -> None:
-    """Run ``_run_checkpoint_cycle`` every :data:`_CHECKPOINT_INTERVAL` s.
+async def _periodic_checkpoint_loop(
+    targets: list[tuple[str, object]],
+    *,
+    growth_alarm: JournalGrowthAlarm | None = None,
+    interval: float = _CHECKPOINT_INTERVAL,
+) -> None:
+    """Run ``_run_checkpoint_cycle`` every *interval* s (:data:`_CHECKPOINT_INTERVAL`).
 
     Bounds the un-flushed WAL window so a stalled PASSIVE auto-checkpoint
     (the 2026-05-13 failure mode) can't accumulate indefinitely. The
     cycle is independent of the per-project write lock — SQLite serialises
-    the checkpoint against writers internally.
+    the checkpoint against writers internally. After each cycle the
+    write-journal *growth_alarm* gets its tick; its failure is logged and
+    never stops checkpointing.
     """
     while True:
         try:
-            await asyncio.sleep(_CHECKPOINT_INTERVAL)
+            await asyncio.sleep(interval)
         except asyncio.CancelledError:
             return
         await _run_checkpoint_cycle(targets)
+        if growth_alarm is not None:
+            try:
+                await growth_alarm.maybe_check()
+            except Exception:
+                logger.exception('write_journal growth alarm failed; checkpointing continues')
 
 
 async def _run_rebuild_summaries_cycle(memory_service, cfg) -> None:

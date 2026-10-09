@@ -12,12 +12,15 @@ included.
 
 from __future__ import annotations
 
+import asyncio
 import collections
+import contextlib
 import json
 import logging
 import time
 import uuid as uuid_mod
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -190,9 +193,8 @@ CREATE INDEX IF NOT EXISTS idx_wo_operation ON write_ops(operation);
 --
 -- Steady state: created_at is monotonically increasing, so every insert is a
 -- right-most B-tree append — write amplification on the hot log_write_op path is
--- negligible. The +9.9% is permanent and grows with the table, though: write_ops
--- has no prune path (unlike prune_mem0_intents / prune_idempotent_ops), which is
--- what sibling task ζ (journal growth alarm) exists to watch.
+-- negligible. The +9.9% is permanent and grows with the table, though:
+-- prune_write_ops bounds the rows, and services/journal_growth_alarm.py watches the file.
 CREATE INDEX IF NOT EXISTS idx_wo_created ON write_ops(created_at);
 
 CREATE TABLE IF NOT EXISTS backend_ops (
@@ -327,6 +329,30 @@ def _backend_result_summary(
     return {'result': result_summary, 'tokens': llm_tokens.as_journal_dict()}
 
 
+@dataclass(frozen=True)
+class JournalGrowthSample:
+    """One growth measurement of the journal, taken by ``WriteJournal.growth_sample``.
+
+    ``file_bytes`` is the on-disk footprint (``.db`` + ``-wal`` + ``-shm``);
+    ``free_bytes`` is the part of it on the freelist, reusable by inserts and
+    reclaimable only by VACUUM; ``rows_inserted`` counts ``write_ops`` inserts
+    at or after ``since``.
+    """
+
+    file_bytes: int
+    free_bytes: int
+    rows_inserted: int
+    since: datetime
+
+
+async def _read_int(access: AtomicConnection, sql: str) -> int:
+    """The single integer *sql* selects, or a RuntimeError naming *sql*."""
+    row = await access.read_one(sql)
+    if row is None or row[0] is None:
+        raise RuntimeError(f'write_journal growth sample: {sql!r} returned no value')
+    return row[0]
+
+
 class WriteJournal:
     """Two-layer write journal backed by SQLite (WAL mode)."""
 
@@ -335,9 +361,13 @@ class WriteJournal:
         self._access: AtomicConnection | None = None
         self._dropped: collections.Counter[str] = collections.Counter()
 
+    @property
+    def db_path(self) -> Path:
+        return self.data_dir / 'write_journal.db'
+
     async def initialize(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        db_path = self.data_dir / 'write_journal.db'
+        db_path = self.db_path
         conn = await connect_daemon(str(db_path))
         conn.row_factory = aiosqlite.Row
         await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
@@ -354,6 +384,51 @@ class WriteJournal:
 
     async def checkpoint(self) -> CheckpointResult:
         return await AtomicConnection.checkpoint_or_unavailable(self._access)
+
+    async def growth_sample(self, *, since: datetime) -> JournalGrowthSample:
+        """Measure the journal's size and insert volume since ``since``.
+
+        Every statement is O(1) or a single index seek, because the live
+        ``write_ops`` table holds tens of millions of rows. The consumer is
+        ``services/journal_growth_alarm.py``.
+
+        ``rows_inserted`` relies on rowid order tracking ``created_at`` order, and
+        counts INSERTS: rows the retention prune has since deleted still count.
+        One known skew: ``log_write_op``'s upsert re-stamps ``created_at``, so the
+        boundary can shift by the rows inserted during one write's enqueue-to-journal
+        latency.
+        """
+        access = self._require_access()
+        freelist_count = await _read_int(access, 'PRAGMA freelist_count')
+        page_size = await _read_int(access, 'PRAGMA page_size')
+        return JournalGrowthSample(
+            file_bytes=await asyncio.to_thread(self._on_disk_bytes),
+            free_bytes=freelist_count * page_size,
+            rows_inserted=await self._rows_inserted_since(access, since),
+            since=since,
+        )
+
+    @staticmethod
+    async def _rows_inserted_since(access: AtomicConnection, since: datetime) -> int:
+        # MIN and MAX in ONE select is a full index scan (1m28s on the live
+        # journal); each alone is a seek. INDEXED BY makes a missing index an
+        # error instead of a silent table scan.
+        first_row = await access.read_one(
+            'SELECT rowid FROM write_ops INDEXED BY idx_wo_created '
+            'WHERE created_at >= ? ORDER BY created_at LIMIT 1',
+            (since.isoformat(),),
+        )
+        if first_row is None:
+            return 0
+        newest_rowid = await _read_int(access, 'SELECT MAX(rowid) FROM write_ops')
+        return newest_rowid - first_row[0] + 1
+
+    def _on_disk_bytes(self) -> int:
+        total = 0
+        for suffix in ('', '-wal', '-shm'):
+            with contextlib.suppress(FileNotFoundError):
+                total += self.db_path.with_name(self.db_path.name + suffix).stat().st_size
+        return total
 
     def _require_access(self) -> AtomicConnection:
         if self._access is None:
