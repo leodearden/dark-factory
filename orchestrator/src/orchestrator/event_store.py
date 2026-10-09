@@ -566,6 +566,8 @@ class EventType(StrEnum):
     # lies above every tier, so no tier describes it.
     reservation_installed = 'reservation_installed'
     reservation_install_blocked = 'reservation_install_blocked'
+    # reservation_expired reasons: owner-state ones on scheduler.py::Scheduler._park_gc_reason,
+    # pin-phase ones on pin_reservation.py::PinReleaseReason.
     reservation_expired = 'reservation_expired'
     reservation_evicted = 'reservation_evicted'
     reservation_shadowed = 'reservation_shadowed'
