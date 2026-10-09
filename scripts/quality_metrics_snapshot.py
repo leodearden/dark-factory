@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The whole-repo quality metrics snapshot: plans/quality-metrics-snapshot-prd.md §Contract, schema 1.
+"""The whole-repo quality metrics snapshot: plans/quality-metrics-snapshot-prd.md §Contract, schema 2 (schema 1 is still read).
 
 A report, never a gate: it emits measures and the quality doc's two heuristic-14
 marks, and no verdict, ranking, average or threshold of its own.

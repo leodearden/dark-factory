@@ -20,6 +20,14 @@ Its Part 2 shipped as `scripts/suite_census_pinning.py` with its own whole-tree 
 There is no task left to re-point, so S1 re-points that landed code onto
 `workspace_domain` (decision 3), and 5414 gets no `update_task` and no `add_dependency`.
 S1's move list also covers the seams 5414 added to `merge_lane_metrics.py` (decision 1).
+**Amended 2026-10-09 (task 6612, finding fk-6d9e5b64770a):** the snapshot is schema 2.
+`import_graph` gains `hidden_cycles` and `typing_cycles`, and each `deferred` entry gains
+`closes_cycle` (decision 10). Schema 1 is still read (§Contract). The finding: `cycles`, over
+import-time edges only, cannot see the cycles that function-local imports were written to
+break. Measured at `65c261863c`: 0 SCCs over import-time edges, 6 over run-time edges
+(sizes 20, 3, 3, 3, 2, 2), 9 over every edge; 42 deferred imports close a hidden cycle,
+of which 28 would be marked under the narrower rule "some target reaches the importer over
+import-time edges alone".
 
 ## Goal
 
@@ -212,8 +220,10 @@ enumeration (amended 2026-10-05: 5414 is done, `cdc15a6b56`).
    `inputs_consumed` belong to the consuming run's report, not to a measurement.
 10. **The import graph is emitted in the shape `/review-all` already expects.**
     `skills/review-all/references/orchestration.md` declares `import_graph_path` as
-    `{edges:[[from,to]], reach_back:[...], deferred:[...], cycles:[[...]]}`; the snapshot's
-    `import_graph` section is exactly that, so phase 1 writes it to scratch unchanged.
+    `{edges:[[from,to]], reach_back:[...], deferred:[...], cycles:[[...]]}` (since schema 2
+    also `hidden_cycles`, `typing_cycles` and each deferred entry's `closes_cycle`); the
+    snapshot's `import_graph` section is exactly that, so phase 1 writes it to scratch
+    unchanged.
     Edges are explicit first-party imports between `src` modules (absolute and resolved
     relative), excluding implicit parent-package imports. A *reach-back* is an import, in a
     module of package P, of a name defined in P's `__init__` or an ancestor's (an import of
@@ -223,6 +233,28 @@ enumeration (amended 2026-10-05: 5414 is done, `cdc15a6b56`).
     names are reported per file with a `package_init` flag, so a façade `__init__` is
     distinguishable from a shim in another module; the snapshot does not judge which is
     which.
+    *Amended 2026-10-09 (task 6612, schema 2).* Three cycle lists, each the strongly
+    connected components of size > 1 over one of three nested edge sets, named for when
+    the import executes:
+    - `cycles`, over **import-time** edges: module level, outside `if TYPE_CHECKING:`
+      (unchanged);
+    - `hidden_cycles`, over **run-time** edges: those plus function-local imports;
+    - `typing_cycles`, over **any-time** edges: those plus `if TYPE_CHECKING:` imports,
+      what a type checker follows.
+
+    Each set contains the one before, so every component of one list lies inside a
+    component of the next. The lists are not differences, so a cycle that grows by one
+    module never vanishes from one list and appears in another. In a codebase that starts,
+    `cycles` is near-tautologically empty, so `hidden_cycles` shows the cycles that
+    function-local imports hide, and `typing_cycles` adds the ones only `TYPE_CHECKING`
+    imports close.
+    A `deferred` entry's `closes_cycle` is true iff it is a run-time import (not under
+    `if TYPE_CHECKING:`) one of whose first-party targets lies in its importer's
+    `hidden_cycles` component, i.e. the edge it adds lies on a cycle of run-time edges.
+    It is derived from `hidden_cycles`, so the two cannot disagree, and every hidden cycle
+    that is not an import-time one holds at least one marked entry. `--diff` keys a
+    deferred entry by `(from, imports)` without the flag: a flip is the hidden cycle's own
+    change, already reported.
 11. **Per-function detail for `src` only.** Every file record carries `cognitive_total`,
     `cognitive_max` and the qualname holding the max (the doc's pair). The full
     `path::qualname → score` map is stored for the 7,006 `src` functions, not for the
@@ -258,7 +290,7 @@ Command line (`scripts/quality_metrics_snapshot.py`):
 exit 0 = done; exit 2 = instrument failure (MetricsError), message names the cause
 ```
 
-Snapshot (`schema_version: 1`):
+Snapshot (`schema_version: 2`):
 
 ```
 { schema_version, instrument: "quality-metrics-snapshot", run_id, as_of_sha, since,
@@ -273,8 +305,16 @@ Snapshot (`schema_version: 1`):
                       # kind == "tests":
                       private_patch_targets: [sorted dotted names], private_reads } },
   functions: { "<src path>::<qualname>": score },
-  import_graph: { edges: [[from, to]], reach_back: [...], deferred: [...], cycles: [[...]] } }
+  import_graph: { edges: [[from, to]], reach_back: [...],
+                  deferred: [{from, line, imports, closes_cycle}],
+                  cycles: [[...]], hidden_cycles: [[...]], typing_cycles: [[...]] } }
 ```
+
+Schema 1 (before task 6612) lacks `hidden_cycles`, `typing_cycles` and `closes_cycle`, and
+is still read, so a committed schema-1 snapshot stays a valid `--diff` previous and
+`--summary` input. Both name its absent cycle sets and `closes_cycle` unknown, never empty
+and never as wholesale additions (decision 7's polarity). Any other `schema_version` is an
+exit 2 naming the versions read.
 
 `--diff` prints, in this order and in path order within each section: completeness of
 both snapshots; added, removed and renamed (same blob) files; the complexity pair per
@@ -282,7 +322,7 @@ changed module, annotated with the doc's reading only where it applies ("max dow
 flat or down: complexity moved, per docs/code-quality.md §What to measure"; "total up:
 complexity added"); heuristic-14 crossings of either mark in either direction, labelled
 "ALARM — measure per heuristic 14, not a target"; import-graph changes (edges, reach-backs,
-deferred imports, cycles added and removed); per test file, private patch targets added and
+deferred imports, cycles, hidden cycles and typing cycles added and removed); per test file, private patch targets added and
 removed and the private-read delta. A measuring run without `--diff` ends by printing
 "no previous snapshot given; since = none" (INV-13), so a first run never reads as a run in
 which nothing moved; a `--diff` path that does not exist or does not parse is an exit 2
@@ -303,11 +343,12 @@ members; no measure is patched (Tests stance).
 | 6 | Alarm crossing | a file grows from 1,490 to 2,010 lines | `--diff` names both crossings with the "measure, not fix" label; nothing ranked |
 | 7 | Rename | `git mv` only | reported as a rename, no measure deltas |
 | 8 | Reach-back vs sibling | `pkg/a.py` imports a name from `pkg/__init__.py`; `pkg/b.py` imports submodule `pkg.c` | one reach-back (a), no reach-back for b |
-| 9 | Cycle | `a` imports `b`, `b` imports `a` at module level; `c`↔`d` only under `TYPE_CHECKING` | `cycles == [["a","b"]]` |
+| 9 | Cycle | `a` imports `b`, `b` imports `a` at module level; `c`↔`d` only under `TYPE_CHECKING`; `e` imports `a` inside a function | `cycles == [["a","b"]]`, `hidden_cycles == [["a","b"]]`, `typing_cycles == [["a","b"],["c","d"]]`; `e`'s deferred entry has `closes_cycle: false` (amended 2026-10-09, task 6612) |
 | 10 | Private patch targets | test patches `pkg.mod._x` by string, `pkg.mod.public`, and `patch.object(mod, "_y")` | `private_patch_targets == ["pkg.mod._x", "pkg.mod._y"]` |
 | 11 | No previous snapshot | measure without `--diff`; then with `--diff` naming a missing file | first: `since == "none"` and the "no previous snapshot given" line; second: exit 2 naming the path |
 | 12 | Cluster agreement | real repo | for every cluster path, snapshot `lines`/`prose_lines`/`cognitive_total` equal the ratchet report's |
 | 13 | Census enumerates the domain (S1b) | the row-2 fixture plus `hooks/tests/test_h.py`, and a `scripts/tests` test patching `legibility.mod._x` | `suite_census_pinning.measure_python_tree` counts exactly the domain's `tests` files (no `hooks/` file), grouped under the member names; `legibility.mod._x` counts as a first-party private target |
+| 14 | Schema-1 previous (task 6612) | a snapshot of the same tree with `schema_version: 1`, no `hidden_cycles`/`typing_cycles` and no `closes_cycle` | it validates; `--diff` against it exits 0 and its import-graph section is exactly "hidden cycles unknown: the previous snapshot is schema 1" and the same for typing cycles; `--summary` names them unknown; a schema-1 file carrying `closes_cycle` and a `schema_version` of 3 are exit 2 |
 
 ## Decomposition plan
 
