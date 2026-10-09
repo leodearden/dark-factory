@@ -432,6 +432,20 @@ def _hand_built_pip_spans(source: str, site: str) -> list[str]:
     return spans
 
 
+@pytest.mark.parametrize(
+    'lost_tag',
+    ['<ST a={1}', '<ST a={1} < b />', '<ST a={1}} />'],
+    ids=['never-closed', 'bare-angle-first', 'stray-brace'],
+)
+def test_the_census_walker_raises_on_a_lost_tag(lost_tag: str) -> None:
+    """A tag the walk cannot close fails the census by name and line, rather
+    than handing an absence probe a span it would pass by default."""
+    source = f'const a = 1;\n\n{lost_tag}'
+
+    with pytest.raises(AssertionError, match=r'probe\.jsx: .* at line 3 '):
+        _tag_spans(source, _STAT_TILE_TAG_RE, 'probe.jsx')
+
+
 @pytest.fixture(scope='module')
 def census_bodies(_client):
     """Comment-stripped served bodies for every file the census names.
