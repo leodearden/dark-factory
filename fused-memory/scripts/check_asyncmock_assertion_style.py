@@ -14,26 +14,25 @@ The rule is narrow by design: it only flags the exact regression pattern (mixing
 in the same function body) and produces zero false positives against the current
 fused-memory/tests/ codebase, where no single function mixes the two styles.
 
-This script is intentionally stdlib-only (ast, argparse, pathlib, sys) so hooks/project-checks
-can invoke it via plain python3 without uv env-resolution overhead. Adding a third-party
-dependency here would break that fast path.
+This script is intentionally stdlib-only (ast, pathlib, sys, plus its stdlib-only sibling
+_lint_cli.py) so hooks/project-checks can invoke it via plain python3 without uv
+env-resolution overhead. Adding a third-party dependency here would break that fast path.
 """
 from __future__ import annotations
 
-import argparse
 import ast
 import sys
 from pathlib import Path
-from typing import NamedTuple
 
+# Sibling import that survives `python3 -I`: see _lint_cli.py's module docstring.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from _lint_cli import Violation, run_cli
+finally:
+    del sys.path[0]
 
-class Violation(NamedTuple):
-    """A lint violation found by the checker."""
-
-    filename: str
-    lineno: int
-    col_offset: int
-    message: str
+# The files a DIRECTORY argument expands to; runtime code does not use AsyncMock.
+_DISCOVERY_GLOBS: tuple[str, ...] = ('test_*.py', 'conftest.py')
 
 
 class _AssertionCallCollector(ast.NodeVisitor):
@@ -119,64 +118,15 @@ def find_violations(source: str, filename: str) -> list[Violation]:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.  Accepts file paths and/or directories.
 
-    For directories, recursively scans for test_*.py and conftest.py files only.
-    Prints violations to stdout in 'path:lineno:col: message' format (ruff-style).
-
-    Explicit file paths are validated up front; a missing explicit path fails
-    fast with exit code 2 before any scan work. Mid-scan OSErrors (e.g. a file
-    yanked between rglob discovery and read) are accumulated and reported on
-    stderr without discarding violations already collected.
-
-    Returns 0 if clean, 1 if only violations were found, 2 on any fatal error
-    (missing explicit path or transient read failure).
+    For directories, recursively scans test_*.py and conftest.py files only.
+    Output and the 0/1/2 exit ladder are ``_lint_cli.run_cli``'s.
     """
-    parser = argparse.ArgumentParser(
-        description='Check for assert_not_called/assert_not_awaited style mixing in test files.'
+    return run_cli(
+        argv,
+        description='Check for assert_not_called/assert_not_awaited style mixing in test files.',
+        discovery_globs=_DISCOVERY_GLOBS,
+        find_violations=find_violations,
     )
-    parser.add_argument('paths', nargs='+', help='Files or directories to check')
-    args = parser.parse_args(argv)
-
-    # Phase 1: discovery + upfront validation of explicit paths.
-    # rglob results are guaranteed to exist at discovery time, so only
-    # non-directory (explicit) paths need the existence check.
-    files_to_scan: list[Path] = []
-    for path_str in args.paths:
-        p = Path(path_str)
-        if p.is_dir():
-            # Only scan test files and conftest; runtime code does not use AsyncMock.
-            files_to_scan.extend(
-                sorted(set(p.rglob('test_*.py')) | set(p.rglob('conftest.py')))
-            )
-        else:
-            if not p.exists():
-                print(f'error: {p}: No such file or directory', file=sys.stderr)
-                return 2
-            files_to_scan.append(p)
-
-    # Phase 2: scan. Accumulate per-file read errors without returning early,
-    # so a transient OSError on one file never discards violations already
-    # collected from earlier files.
-    all_violations: list[Violation] = []
-    read_errors: list[tuple[Path, OSError]] = []
-    for file_path in files_to_scan:
-        try:
-            source = file_path.read_text(encoding='utf-8')
-        except OSError as exc:
-            read_errors.append((file_path, exc))
-            continue
-
-        violations = find_violations(source, str(file_path))
-        all_violations.extend(violations)
-
-    # Phase 3: reporting.
-    for v in all_violations:
-        print(f'{v.filename}:{v.lineno}:{v.col_offset}: {v.message}')
-    for file_path, exc in read_errors:
-        print(f'error reading {file_path}: {exc}', file=sys.stderr)
-
-    if read_errors:
-        return 2
-    return 1 if all_violations else 0
 
 
 if __name__ == '__main__':
