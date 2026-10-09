@@ -31,10 +31,11 @@ import subprocess
 import sys
 from collections.abc import Mapping
 from pathlib import Path
-from types import MappingProxyType
 
 import inline_suppressions
 import pytest
+from inline_suppression_classify import Scope, SuppressionClass, classify
+from inline_suppression_consumers import ConsumerModel
 from inline_suppression_fixtures import (
     RUFF_CONFIG,
     SUBPROCESS_TIMEOUT_SECS,
@@ -83,7 +84,7 @@ def _check(
     root: Path,
     baseline_path: Path,
     *paths: str,
-    classes: Mapping[inline_suppressions.SuppressionClass, Policy] = (
+    classes: Mapping[SuppressionClass, Policy] = (
         inline_suppressions.RATIFIED_SUPPRESSION_CLASSES
     ),
 ) -> int:
@@ -137,21 +138,7 @@ def _run_script(
 
 
 # ---------------------------------------------------------------------------
-# Layer 3 — classification: owned, ratified by class, or unowned.
-
-
-def _classify(
-    tmp_path: Path,
-    files: Mapping[str, str],
-    *,
-    classes: Mapping[inline_suppressions.SuppressionClass, Policy] = MappingProxyType({}),
-):
-    """Scan and classify a fixture tree against *classes* in one step."""
-    _write_fixture_tree(tmp_path, files)
-    scan = scan_tree(tmp_path)
-    return inline_suppressions.classify(
-        scan, inline_suppressions.ConsumerModel(tmp_path), classes=classes
-    )
+# D9 — the operator's class table, which lives in the CLI module.
 
 
 def test_the_shipped_class_table_is_empty(tmp_path: Path):
@@ -163,161 +150,6 @@ def test_the_shipped_class_table_is_empty(tmp_path: Path):
     """
     del tmp_path
     assert dict(inline_suppressions.RATIFIED_SUPPRESSION_CLASSES) == {}
-
-
-def test_a_site_with_a_well_formed_disposition_is_owned(tmp_path: Path):
-    """BOUNDARY SCENARIO 2 — all three of D6's forms, and none contributes a
-    key to the unowned multiset."""
-    result = _classify(
-        tmp_path,
-        {
-            'pyproject.toml': RUFF_CONFIG,
-            'm.py': (
-                'a = 1  # noqa: E402  # debt: task 5601\n'
-                'b = 2  # noqa: F401  # debt: ticket tkt_0RTCC80EM92A7WD08D6RF6ZZPY\n'
-                'c = 3  # noqa: B006  # ratified: inv12-day-one-test-doubles\n'
-            ),
-        },
-    )
-
-    assert result.violations == ()
-    assert result.counts == {}
-    assert [entry.ownership for entry in result.classified] == [
-        inline_suppressions.Ownership.DEBT,
-        inline_suppressions.Ownership.DEBT,
-        inline_suppressions.Ownership.POLICY,
-    ]
-
-
-def test_a_site_with_no_disposition_is_unowned_and_contributes_a_key(tmp_path: Path):
-    result = _classify(
-        tmp_path, {'pyproject.toml': RUFF_CONFIG, 'm.py': 'a = 1  # noqa: E402\n'}
-    )
-
-    assert [entry.ownership for entry in result.classified] == [
-        inline_suppressions.Ownership.UNOWNED
-    ]
-    assert sum(result.counts.values()) == 1
-
-
-def test_a_marker_that_does_not_parse_is_a_violation_naming_its_comment(tmp_path: Path):
-    """BOUNDARY SCENARIO 7, first half.
-
-    Present-but-broken is the case worth being loud about: the author plainly
-    meant to disposition something, and the entry is silently undisposed until
-    somebody is told.  Exit 1 and not 2 — it is a fault at the SITE, fixed by
-    an agent, which is what ``MalformedDisposition``'s own docstring records.
-    """
-    result = _classify(
-        tmp_path,
-        {'pyproject.toml': RUFF_CONFIG, 'm.py': 'a = 1  # noqa: E402  # debt: soon\n'},
-    )
-
-    (violation,) = result.violations
-    assert violation.path == 'm.py'
-    assert violation.line == 1
-    rendered = violation.render()
-    for form in INLINE_MARKER_FORMS:
-        assert form in rendered
-
-
-def test_a_disposition_on_a_line_with_no_suppression_is_a_violation(tmp_path: Path):
-    """BOUNDARY SCENARIO 7, second half — and it CANNOT come from the parser.
-
-    ``parse_disposition_marker`` returns a perfectly valid ``Debt(TaskRef(5))``
-    here; its docstring says so outright and delegates this violation to the
-    scanner, because deciding it needs the kind table.  So the detection is
-    "this comment yielded a Disposition and no Site", never a parser outcome.
-
-    THE PREFILTER'S REACH BOUNDS THIS FINDING, and the bound is asserted rather
-    than left to be discovered.  A file carrying no marker byte substring at
-    all is never decoded, so a stray disposition alone in such a file is
-    invisible.  That is the honest limit and it lands on the harmless side: in
-    a file with no suppressions there is nothing anywhere for the marker to
-    answer for, so it is inert prose.  The dangerous case — an author who
-    believes a REAL marker in this file is now dispositioned when it is not —
-    is exactly the case that IS caught, because that file carries a marker.
-    Widening the prefilter to the disposition keywords would close the gap only
-    by putting a second copy of D6's grammar in the scanner, which is the one
-    thing ``shared.governed_exceptions`` exists to prevent.
-    """
-    result = _classify(
-        tmp_path,
-        {
-            'pyproject.toml': RUFF_CONFIG,
-            'm.py': 'a = 1  # noqa: E402  # debt: task 5601\nx = 2  # debt: task 5\n',
-            'markerless.py': 'y = 3  # debt: task 7\n',
-        },
-    )
-
-    (violation,) = result.violations
-    assert violation.path == 'm.py'
-    assert violation.line == 2
-    assert result.counts == {}
-
-
-def test_a_site_matching_a_ratified_class_is_policy_by_reference(tmp_path: Path):
-    """BOUNDARY SCENARIO 10 — outside the unowned multiset, and COUNTED under
-    its class so blanket policy stays visible in the report."""
-    row = inline_suppressions.SuppressionClass(
-        kind=Kind.NOQA,
-        code='E402',
-        scope=inline_suppressions.Scope.ANY,
-    )
-
-    result = _classify(
-        tmp_path,
-        {'pyproject.toml': RUFF_CONFIG, 'm.py': 'a = 1  # noqa: E402\n'},
-        classes={row: Policy('inv12-day-one')},
-    )
-
-    (entry,) = result.classified
-    assert entry.ownership is inline_suppressions.Ownership.CLASS
-    assert entry.suppression_class == row
-    assert result.counts == {}
-
-
-def test_class_scope_matches_src_tests_or_any(tmp_path: Path):
-    """A path is ``tests`` iff one of its COMPONENTS is ``tests``.
-
-    Verified complete for this repository: every tracked test module lives
-    under a ``tests`` component, so the rule needs no filename pattern beside
-    it.  ``src`` is then simply "not tests", which keeps the two scopes a
-    partition rather than two independent predicates that could both miss.
-    """
-    files = {
-        'pyproject.toml': RUFF_CONFIG,
-        'pkg/mod.py': 'a = 1  # noqa: E402\n',
-        'pkg/tests/test_mod.py': 'b = 2  # noqa: E402\n',
-    }
-    for scope, expected in (
-        (inline_suppressions.Scope.ANY, {'pkg/mod.py', 'pkg/tests/test_mod.py'}),
-        (inline_suppressions.Scope.SRC, {'pkg/mod.py'}),
-        (inline_suppressions.Scope.TESTS, {'pkg/tests/test_mod.py'}),
-    ):
-        row = inline_suppressions.SuppressionClass(
-            kind=Kind.NOQA, code='E402', scope=scope
-        )
-        tree = tmp_path / scope.value
-        tree.mkdir()
-        result = _classify(tree, files, classes={row: Policy('inv12-day-one')})
-
-        covered = {
-            entry.site.path
-            for entry in result.classified
-            if entry.ownership is inline_suppressions.Ownership.CLASS
-        }
-        assert covered == expected, scope
-
-
-def test_a_suppression_class_renders_d9s_published_key():
-    row = inline_suppressions.SuppressionClass(
-        kind=Kind.NOQA,
-        code='E402',
-        scope=inline_suppressions.Scope.TESTS,
-    )
-
-    assert row.render() == 'noqa[E402]@tests'
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +288,7 @@ def _dead_marker_violation(
     capsys,
     source: str,
     *,
-    classes: Mapping[inline_suppressions.SuppressionClass, Policy] = (
+    classes: Mapping[SuppressionClass, Policy] = (
         inline_suppressions.RATIFIED_SUPPRESSION_CLASSES
     ),
 ) -> str:
@@ -531,10 +363,10 @@ def test_a_ratified_class_does_not_rescue_a_marker_no_tool_reads(tmp_path: Path,
     marker nothing reads would ratify a no-op, so the consumer check running
     first makes the row inert rather than making it a widening.
     """
-    row = inline_suppressions.SuppressionClass(
+    row = SuppressionClass(
         kind=Kind.NOQA,
         code='PLC0415',
-        scope=inline_suppressions.Scope.ANY,
+        scope=Scope.ANY,
     )
 
     violation = _dead_marker_violation(
@@ -766,9 +598,9 @@ def test_seed_writes_the_unowned_multiset_under_the_kernels_preamble(tmp_path: P
     assert raw['schema_version'] == SCHEMA_VERSION
     written = load(baseline)
     scan = scan_tree(tmp_path)
-    expected = inline_suppressions.classify(
+    expected = classify(
         scan,
-        inline_suppressions.ConsumerModel(tmp_path),
+        ConsumerModel(tmp_path),
         classes=inline_suppressions.RATIFIED_SUPPRESSION_CLASSES,
     ).counts
     assert dict(written.counts) == expected
@@ -970,7 +802,7 @@ def _json_text(
     baseline_path: Path,
     capsys,
     *paths: str,
-    classes: Mapping[inline_suppressions.SuppressionClass, Policy] = (
+    classes: Mapping[SuppressionClass, Policy] = (
         inline_suppressions.RATIFIED_SUPPRESSION_CLASSES
     ),
 ) -> str:
@@ -995,7 +827,7 @@ def _json_report(
     baseline_path: Path,
     capsys,
     *paths: str,
-    classes: Mapping[inline_suppressions.SuppressionClass, Policy] = (
+    classes: Mapping[SuppressionClass, Policy] = (
         inline_suppressions.RATIFIED_SUPPRESSION_CLASSES
     ),
 ) -> dict:
@@ -1105,10 +937,10 @@ def test_json_counts_a_class_ratified_site_under_its_class(tmp_path: Path, capsy
     report counts them under the rendered class key, and D11's sweep can see how
     much each row is carrying.
     """
-    row = inline_suppressions.SuppressionClass(
+    row = SuppressionClass(
         kind=Kind.TYPE_IGNORE,
         code='arg-type',
-        scope=inline_suppressions.Scope.ANY,
+        scope=Scope.ANY,
     )
     baseline = _write_fixture_tree(tmp_path, _REPORT_TREE)
 

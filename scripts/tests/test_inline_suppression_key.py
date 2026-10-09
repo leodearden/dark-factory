@@ -8,10 +8,10 @@ rendering.  ``plans/inv12-exceptions-owned-or-ratified-prd.md``, D7.
 from collections import Counter
 from pathlib import Path
 
+from inline_suppression_classify import Scope, SuppressionClass
 from inline_suppression_fixtures import sites_in
 from inline_suppression_key import SuppressionKey, key_for
 from inline_suppression_kinds import Kind
-from inline_suppressions import Scope, SuppressionClass
 
 # ---------------------------------------------------------------------------
 # D7 — the multiset key: (kind, sorted codes, digest of the stripped line),
