@@ -35,7 +35,6 @@ import argparse
 import asyncio
 import contextlib
 import dataclasses
-import functools
 import hashlib
 import importlib.util
 import itertools
@@ -516,12 +515,11 @@ def _arm_probe_set(path: Path, spec: EmbeddingArmSpec) -> ProbeSet:
     return probe_set
 
 
-@functools.cache
 def load_probe_module() -> ModuleType:
     """E1's ``memory_eval_retrieval_probe``, loaded by path once (scripts/ is no package).
 
-    The shape of ``scripts/retro_stamp_topics.py::_load_probe_module``: an already
-    loaded module is reused, so every caller shares one set of its classes.
+    The shape of ``scripts/retro_stamp_topics.py::_load_probe_module``: a module already
+    in ``sys.modules`` is reused, so every caller shares one set of its classes.
     """
     mod_name = 'memory_eval_retrieval_probe'
     cached = sys.modules.get(mod_name)
