@@ -25,6 +25,7 @@ from _park_test_helpers import (
 from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import OrchestratorConfig
+from orchestrator.park_eviction_requests import ParkEvictionRequestStore
 from orchestrator.scheduler import Scheduler, TickContext
 
 EXTERNAL_DEP = 'other_project:99'
@@ -235,3 +236,64 @@ async def test_a_tick_keeps_the_park_of_an_owner_whose_external_dependency_is_un
 
     assert event_data_for(w.store, 'reservation_expired', 'A') == []
     assert _stack_owners(w.scheduler, 'm.py') == ['A']
+
+
+# ---------------------------------------------------------------------------
+# D4 — the operator eviction guard and park GC never disagree
+# ---------------------------------------------------------------------------
+#
+# Wherever park GC would expire an owner, the eviction drain (which runs
+# first) evicts it; wherever park GC keeps it, the drain refuses.
+
+
+def _eviction_world(tmp_path, owner: dict, resolved=({}, None)):
+    """X holds a high fairness park on e.py and an eviction for X is queued."""
+    evictions = ParkEvictionRequestStore(tmp_path / 'park_eviction_requests.db')
+    w = park_world(tmp_path, park_eviction_store=evictions)
+    w.scheduler.lock_table.install_parks('X', ['e.py'], 'high')
+    evictions.enqueue('X', w.root)
+    w.scheduler.get_tasks = AsyncMock(return_value=[owner])
+    w.scheduler.get_external_statuses = AsyncMock(return_value=resolved)
+    return w
+
+
+def _owner_waiting_on_external_dep() -> dict:
+    owner = make_task('X', 'high', ['e.py'])
+    owner['metadata']['external_deps'] = [EXTERNAL_DEP]
+    return owner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('owner', 'resolved'),
+    [
+        (make_task('X', 'high', ['e.py'], status='deferred'), ({}, None)),
+        (_owner_waiting_on_external_dep(), ({EXTERNAL_DEP: 'in-progress'}, None)),
+    ],
+    ids=['deferred', 'external-dep-not-done'],
+)
+async def test_an_owner_park_gc_would_expire_is_force_evicted(tmp_path, owner, resolved):
+    w = _eviction_world(tmp_path, owner, resolved)
+
+    await w.scheduler.acquire_next()
+
+    assert event_data_for(w.store, 'reservation_force_evicted', 'X') == [
+        {'owner': 'X', 'modules': ['e.py'], 'source': 'fairness'},
+    ]
+    assert event_data_for(w.store, 'reservation_force_evict_refused', 'X') == []
+    assert event_data_for(w.store, 'reservation_expired', 'X') == []
+
+
+@pytest.mark.asyncio
+async def test_an_owner_park_gc_keeps_on_an_unknown_dependency_is_refused_eviction(tmp_path):
+    w = _eviction_world(
+        tmp_path, _owner_waiting_on_external_dep(), ({}, RuntimeError('resolver down'))
+    )
+
+    await w.scheduler.acquire_next()
+
+    assert event_data_for(w.store, 'reservation_force_evict_refused', 'X') == [
+        {'reason': 'live_owner', 'source': 'fairness'},
+    ]
+    assert _stack_owners(w.scheduler, 'e.py') == ['X']
+    assert event_data_for(w.store, 'reservation_expired', 'X') == []
