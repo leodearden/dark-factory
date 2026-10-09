@@ -843,6 +843,13 @@ dependency gate as every other task (§3).
 }
 ```
 
+A relative `script` (and a relative `cwd`) resolves against the
+orchestrator's **configured** `project_root` — the `project_root` in its
+`dark-factory-orchestrator.yaml`, the same root `submit_task`'s guard
+validates the script under — never against the orchestrator process's
+working directory. See
+`orchestrator/src/orchestrator/before_done_paths.py::resolve_before_done_paths`.
+
 **`metadata.always_escalates`** (`bool`, default `false`) — file a
 born-at-L2 escalation after the action completes (or immediately if no
 action); task goes `blocked` until resolved.
