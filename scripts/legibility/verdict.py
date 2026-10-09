@@ -212,23 +212,68 @@ def _reason(raw: object) -> tuple[str, tuple[Normalisation, ...]]:
     return (raw.strip() if isinstance(raw, str) else ""), ()
 
 
+def _path_below_root(raw: str, root: Path) -> str | None:
+    """*raw* as a posix path relative to *root*, or ``None`` unless it names
+    something that EXISTS below that root. The root itself names no fix
+    surface: it would let a vague reply pass the singleton gate."""
+    try:
+        target = (root / raw).resolve()
+        below_root = target != root and target.is_relative_to(root) and target.exists()
+    except (OSError, ValueError):
+        return None
+    if not below_root:
+        return None
+    relative = target.relative_to(root).as_posix()
+    return relative if _is_repo_relative_path(relative) else None
+
+
 def _remediation(raw: object, root: Path) -> tuple[Remediation | None, tuple[Normalisation, ...]]:
-    shaped = filing_policy.proposed_remediation({"remediation": raw})
-    if shaped is None:
+    if raw is None:
         return None, ()
-    return Remediation(shaped["path"], shaped["change"].strip()), ()
+    shaped = filing_policy.proposed_remediation({"remediation": raw})
+    path = None if shaped is None else _path_below_root(shaped["path"], root)
+    if shaped is None or path is None:
+        offered = raw.get("path") if isinstance(raw, dict) else raw
+        return None, _normalised(NormalisationKind.REMEDIATION_REJECTED, offered, "")
+    return Remediation(path, shaped["change"].strip()), ()
 
 
 def _kebab(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
 
 
+_UNTITLED_SLUG = "untitled"
+
+
+def _repaired_anchor(anchor: str, root: Path) -> str | None:
+    if anchor.startswith(_SLUG_PREFIX):
+        slug = _kebab(anchor.removeprefix(_SLUG_PREFIX))
+        return _SLUG_PREFIX + slug if slug else None
+    unpinned = _LINE_PIN_RE.sub("", anchor.replace("\\", "/"))
+    raw_path, _, symbol = unpinned.partition("::")
+    path = _path_below_root(_LINE_PIN_RE.sub("", raw_path), root)
+    if path is None:
+        return None
+    repaired = f"{path}::{symbol}" if _SYMBOL_RE.fullmatch(symbol) else path
+    return repaired if is_anchor(repaired) else None
+
+
 def _anchor(
     raw: object, *, root: Path, remediation: Remediation | None, title: str,
 ) -> tuple[str, tuple[Normalisation, ...]]:
-    if isinstance(raw, str) and is_anchor(raw.strip()):
-        return raw.strip(), ()
-    return _SLUG_PREFIX + _kebab(title), ()
+    stripped = raw.strip() if isinstance(raw, str) else None
+    repaired = None if stripped is None else _repaired_anchor(stripped, root)
+    if repaired is not None:
+        notes = () if repaired == stripped else _normalised(
+            NormalisationKind.ANCHOR_REWRITTEN, raw, repaired,
+        )
+        return repaired, notes
+    if remediation is not None:
+        return remediation.path, _normalised(
+            NormalisationKind.ANCHOR_FROM_REMEDIATION, raw, remediation.path,
+        )
+    slug = _SLUG_PREFIX + (_kebab(title) or _UNTITLED_SLUG)
+    return slug, _normalised(NormalisationKind.ANCHOR_FROM_TITLE, raw, slug)
 
 
 def _tags(raw: object) -> tuple[tuple[str, ...], tuple[Normalisation, ...]]:
