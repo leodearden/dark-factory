@@ -924,12 +924,11 @@ class TestQuotedReportIsRepairable:
     that USED to assert a recovery was inverted in the same task; its docstring
     carries the old reading and why it moved.
 
-    (g)/(h) ARE A PAIR, NOT FULL COVERAGE of the opener side, and the last
-    control in BOUNDS pins where they stop: the rule sits behind
-    ``_parse_body``'s closing-tag prefilter, so a sibling opener with no
-    closing tag anywhere is still swallowed. Declared, owned by task **5639**,
-    and pinned there rather than left as prose — the omission that made (g) and
-    (h) necessary was itself a boundary nobody had written a failing test for.
+    (g)/(h) ARE A PAIR, NOT FULL COVERAGE of the opener side. Task **5639**
+    closed the residual 5620 declared, a sibling opener with no closing tag
+    anywhere, and the last test in BOUNDS
+    (``test_the_opener_verdict_does_not_depend_on_a_closing_tag``) pins the
+    opener verdict with and without a closer in both dialects.
     """
 
     # escalate_info's eleven parameters, and the five the corrupted call
@@ -1036,7 +1035,8 @@ class TestQuotedReportIsRepairable:
         canonical opener pattern's name group runs across *own_closer* and is
         closed by the BLEND sibling opener's stray quote. An item therefore
         opens right after the quoted ``foo`` closer although no complete opener
-        lies inside the value, which the opener mirror cannot see. That stray
+        lies inside the value, which repair()'s accept-time sibling-opener
+        condition cannot see. That stray
         quote is load-bearing. *sibling_closer* is the cell the two
         alternative_boundary tests vary; *opener* and *own_closer* carry the
         enclosing dialect, varied separately by ``_ENCLOSING_DIALECTS``.
@@ -1122,8 +1122,9 @@ class TestQuotedReportIsRepairable:
 
         An item's OWN closing tag appearing inside its value is a cross-dialect
         mis-close by definition, never prose about itself — which is why the
-        rule may state that condition categorically. Since task 5620 the
-        opener mirror refuses this specimen before condition (i) is consulted.
+        rule may state that condition categorically. Condition (i) refuses this
+        specimen; repair()'s accept-time sibling-opener condition would refuse
+        it too, so (b) and (d) are condition (i)'s sole witnesses.
         """
         clean = 'Recording the rationale for the routing change.'
         value = (
@@ -1236,7 +1237,7 @@ class TestQuotedReportIsRepairable:
         ) is None
 
     def test_a_canonical_sibling_opener_inside_a_value_is_refused(self):
-        """NEGATIVE CONTROL (g) — condition (i)'s OPENER MIRROR.
+        """NEGATIVE CONTROL (g) — repair()'s accept-time sibling-opener condition.
 
         Task **4502** narrowed B5 by reasoning about inner CLOSERS, and its
         rule iterates over closers alone. A well-formed parameter OPENER inside
@@ -1253,8 +1254,8 @@ class TestQuotedReportIsRepairable:
         reports ``outcome=repaired``; under FORWARD_REPAIR that wrong text goes
         straight into the tool's arguments. It is the no-silent-partial-repair
         failure of committed-corpus record 25 (negative control (a)) reached
-        through an OPENER instead of a closer, which is why the opener half is
-        stated as categorically as condition (i) states the closer half.
+        through an OPENER instead of a closer, which is why a canonical opener
+        is refused as categorically as condition (i) refuses the closer half.
 
         CONDITION (ii) CANNOT REACH THIS: it reads only the position after
         each inner closer, and both remainders here begin mid-prose. Only a
@@ -1404,8 +1405,10 @@ class TestQuotedReportIsRepairable:
 
         This specimen differs from negative control (g) in ONE cell — a single
         space where that one has a sentence of prose, which is why both are
-        built by ``_sibling_opener_tail``. The opener mirror refuses it before
-        condition (ii) is consulted. A recovery would be the swallowed-sibling
+        built by ``_sibling_opener_tail``. Condition (ii) refuses it, because
+        the opener sits at the quoted closer's alternative boundary; repair()'s
+        accept-time sibling-opener condition would refuse it too. A recovery
+        would be the swallowed-sibling
         partial repair (g) refuses: ``suggested_action``, a real parameter of
         this tool, not recovered, its text written into ``evidence`` instead.
         """

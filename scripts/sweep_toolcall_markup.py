@@ -597,7 +597,9 @@ ACTION_DID_NOT_CONVERGE = 'did-not-converge'
 #: recovered value now blocks — WITHOUT restoring the old premise: a quoted
 #: closer still repairs, which is 4502's whole carve-out. So a second round is
 #: reachable in principle, and :func:`repair_document`'s loop is load-bearing
-#: rather than merely structural.
+#: rather than merely structural. Task **5639** made the opener refusal uniform,
+#: closer or no closer, and still did not restore the premise: a quoted closer
+#: still repairs, so a second round stays reachable.
 #:
 #: WHAT JUSTIFIES THE SMALL CEILING is the round count actually recorded for
 #: both live corpora: every document converges in one round, a second yielding
@@ -934,8 +936,8 @@ def repair_document(obj: Any) -> tuple[Any, list[Outcome]]:
     # DISTINCT refusals that happen to collide on a path across rounds —
     # whereas replacement is exact. Replacement also preserves the case that
     # motivates the loop existing at all: a refusal that only becomes VISIBLE
-    # in a later round (the nested double-leak residue, refusable only once
-    # round 1 has landed it in its hole) is reported, where a naive "keep only
+    # in a later round (a recovered value that quotes a closer, refusable only
+    # once round 1 has landed it in its hole) is reported, where a naive "keep only
     # round 1" correction would drop it.
     #
     # The partition is exhaustive: the walk emits ONLY ACTION_REPAIRED and

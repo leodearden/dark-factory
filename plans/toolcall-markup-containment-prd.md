@@ -691,7 +691,7 @@ Implements C1. Extracts the real specimens from the archived transcripts into a 
 > `tkt_0RTT9N7HAZ2WP6DF3YNXAKHSX4`); negative control
 > `test_a_sibling_opener_with_NO_closing_tag_is_NOT_refused_TODAY` pins the residue,
 > so 5639 landing fails loudly here instead of silently contradicting this
-> paragraph. (2) The widened rule leaves `_parse_body`'s depth-1 probe short-circuit
+> paragraph. Closed by task 5639; see below. (2) The widened rule leaves `_parse_body`'s depth-1 probe short-circuit
 > unreachable by construction (instrumented: 1 execution before, 0 after). It is
 > documented in place and kept, because deleting it removes a recursion bound 4502
 > landed deliberately. **Task 5640** (filed as `tkt_0RTT9N05CHRSHN2MSCHNXX4A8D`).
@@ -720,6 +720,29 @@ Implements C1. Extracts the real specimens from the archived transcripts into a 
 > record changing outcome; both `esc-3514` specimen pins stay green (escalation markup
 > suites 74 passed), as do the shared markup suites (539 passed, 1 skipped), the sweep
 > suite and the plan-tools markup suites (244 passed).
+>
+> *Made uniform 2026-10-09 (task 5639) — the opener rule is an accept-time condition,
+> and it no longer depends on a closer.* 5620's opener clause sat inside the per-item
+> B5 function, behind `_parse_body`'s closing-tag prefilter, so its verdict flipped on
+> whether an UNRELATED quoted closer was present: on 5620's code every row of
+> `test_the_opener_verdict_does_not_depend_on_a_closing_tag` (which replaces the
+> residual (1) pin) got opposite answers in its two closer cells. The rule now lives
+> in `repair()` beside B8, as B8's value-side mirror, and applies to every recovered
+> value whether or not it carries a closer. The canonical opener stays categorical;
+> the name-echoing opener now blocks only when it names a schema parameter. That
+> narrowing is measured: applying 5620's broad both-dialect rule uniformly moved 3
+> committed-corpus records repaired → unrepairable, all placeholder false positives
+> (`\x3cname>` in `toolu_011GM1rYsnpdmE26YX3sjPpg`, `\x3cunknown>` in
+> `toolu_01JMhsqu24iuKFH9RuYxSTd2`, `\x3ctitle>` in `toolu_01QrpSawmZ3qASDFFoEH6SQK`),
+> while the shipped variant moves none. A non-schema echo tag names nothing B8 would
+> let `repair()` recover. The prefilter line is untouched, so its clean-path contract
+> is unchanged. The per-item function reasons only about inner closers again and is
+> renamed back to `_inner_closer_blocks`. In the sweep, the unterminated-inner-opener
+> nested leak now refuses in round one; a recovered value that QUOTES a closer is the
+> shape that still reaches round two. *Blast radius, re-measured at 5639:* the corpus
+> stays **444/60** with no record changing outcome; the shared markup suites (530
+> passed), both `esc-3514` specimen pins with the registration specimens (74 passed),
+> the sweep suite (94 passed) and the plan-tools markup suites (244 passed) are green.
 >
 > *The invariant that did NOT move.* `clean_value` stays envelope-free, stated against
 > `detect_for`. That is C1's post-condition on the value the repairer **rewrote**, and

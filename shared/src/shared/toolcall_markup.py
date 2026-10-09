@@ -618,7 +618,8 @@ def _inner_closer_blocks(
     canonical ``rationale`` closed by the name-echoing ``rationale`` closer
     and followed by the head of a whole NEXT invoke block; condition (i) is
     what refuses it, because its own ``rationale`` closer sits inside its
-    value.
+    value. The accept-time sibling-opener condition would refuse it too, so
+    negative controls (b) and (d) are condition (i)'s sole witnesses.
 
     *value_start* is *item_value*'s offset within *body*, so (ii) reads the
     position after an inner closer from the shared string rather than copying
