@@ -6,6 +6,7 @@ second, stdlib ``sqlite3`` connection on ``journal.db_path``.
 """
 
 import dataclasses
+import logging
 import os
 import sqlite3
 import uuid
@@ -19,6 +20,7 @@ import pytest_asyncio
 from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
 from fused_memory.services.journal_growth_alarm import (
     JournalCeiling,
+    JournalGrowthAlarm,
     JournalGrowthBreach,
     find_breaches,
 )
@@ -225,3 +227,109 @@ class TestFindBreaches:
         breach = JournalGrowthBreach(ceiling=JournalCeiling.FILE_SIZE, measured=2, limit=1)
         with pytest.raises(dataclasses.FrozenInstanceError):
             breach.measured = 3  # type: ignore[misc]
+
+
+_ALARM_LOGGER = 'fused_memory.services.journal_growth_alarm'
+_NEVER = 10**15
+
+
+def _warnings(caplog) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == _ALARM_LOGGER and r.levelno == logging.WARNING
+    ]
+
+
+def _size_words(sample: JournalGrowthSample) -> list[str]:
+    return [
+        f'{sample.file_bytes:,} B',
+        f'{sample.file_bytes / 2**30:.2f} GiB',
+        f'{sample.free_bytes:,} B free',
+    ]
+
+
+async def _log_reads(journal: WriteJournal, count: int) -> None:
+    for _ in range(count):
+        await journal.log_write_op(
+            write_op_id=str(uuid.uuid4()), operation='get_task', kind='read'
+        )
+
+
+class TestCheck:
+    @pytest.mark.asyncio
+    async def test_under_both_ceilings_is_silent(self, journal, caplog):
+        caplog.set_level(logging.WARNING, logger=_ALARM_LOGGER)
+        config = WriteJournalGrowthAlarmConfig(
+            max_file_bytes=_NEVER, max_rows_inserted_per_day=_NEVER
+        )
+
+        assert await JournalGrowthAlarm(journal, config, project_root=None).check() == ()
+        assert _warnings(caplog) == []
+
+    @pytest.mark.asyncio
+    async def test_a_size_breach_warns_naming_the_measured_size(self, journal, caplog):
+        caplog.set_level(logging.WARNING, logger=_ALARM_LOGGER)
+        config = WriteJournalGrowthAlarmConfig(
+            max_file_bytes=4097, max_rows_inserted_per_day=_NEVER
+        )
+
+        breaches = await JournalGrowthAlarm(journal, config, project_root=None).check()
+        sample = await journal.growth_sample(since=_an_hour_ago())
+
+        assert [b.ceiling for b in breaches] == [JournalCeiling.FILE_SIZE]
+        assert breaches[0].measured == sample.file_bytes
+        [message] = _warnings(caplog)
+        for words in [*_size_words(sample), 'ceiling of 4,097 B']:
+            assert words in message
+
+    @pytest.mark.asyncio
+    async def test_a_rate_breach_warns_naming_the_count_ceiling_and_size(
+        self, journal, caplog
+    ):
+        caplog.set_level(logging.WARNING, logger=_ALARM_LOGGER)
+        await _log_reads(journal, 12)
+        config = WriteJournalGrowthAlarmConfig(
+            max_file_bytes=_NEVER, max_rows_inserted_per_day=11
+        )
+
+        breaches = await JournalGrowthAlarm(journal, config, project_root=None).check()
+        sample = await journal.growth_sample(since=_an_hour_ago())
+
+        assert breaches == (
+            JournalGrowthBreach(ceiling=JournalCeiling.INSERT_RATE, measured=12, limit=11),
+        )
+        [message] = _warnings(caplog)
+        for words in [*_size_words(sample), '12 inserts in the trailing 24 h', 'ceiling of 11/day']:
+            assert words in message
+
+    @pytest.mark.asyncio
+    async def test_both_breached_warns_once_per_ceiling(self, journal, caplog):
+        caplog.set_level(logging.WARNING, logger=_ALARM_LOGGER)
+        await _log_reads(journal, 2)
+        config = WriteJournalGrowthAlarmConfig(max_file_bytes=1, max_rows_inserted_per_day=1)
+
+        breaches = await JournalGrowthAlarm(journal, config, project_root=None).check()
+
+        assert [b.ceiling for b in breaches] == [
+            JournalCeiling.FILE_SIZE,
+            JournalCeiling.INSERT_RATE,
+        ]
+        assert len(_warnings(caplog)) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_failed_sample_is_logged_not_raised(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING, logger=_ALARM_LOGGER)
+        alarm = JournalGrowthAlarm(
+            WriteJournal(tmp_path / 'never_initialized'),
+            WriteJournalGrowthAlarmConfig(max_file_bytes=1),
+            project_root=None,
+        )
+
+        assert await alarm.check() == ()
+        errors = [
+            r for r in caplog.records
+            if r.name == _ALARM_LOGGER and r.levelno == logging.ERROR
+        ]
+        assert len(errors) == 1
+        assert errors[0].exc_info is not None
