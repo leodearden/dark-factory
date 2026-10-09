@@ -429,7 +429,22 @@ def _create_after_curator_failure(exc: CuratorFailureError) -> CuratorDecision:
     Keeps the ZOT marker, so the no-orchestrator path still gets swept and
     stamped even though no escalation could be filed for it.
     """
-    return CuratorDecision(action='create', degraded_by_zot=exc.zero_output_timeout)
+    return CuratorDecision(
+        action='create',
+        justification=f'curator-failed: {exc}',
+        degraded_by_zot=exc.zero_output_timeout,
+    )
+
+
+def _create_reason(
+    decision: CuratorDecision | None, *, curator_unavailable: str | None = None,
+) -> str:
+    """The ``tickets.reason`` a ``created`` ticket persists: why it was created."""
+    if decision is None:
+        return 'create: curator-unavailable'
+    if decision.justification:
+        return f'create: {decision.justification}'
+    return 'create'
 
 
 class TaskInterceptor:
@@ -4610,6 +4625,7 @@ class TaskInterceptor:
             # strand the task and cause duplicate-on-retry.
             task_id = task_id_str
             status = 'created'
+            reason = _create_reason(decision)
             result_dict = dict(result)
             if curator_degrade_reason is not None:
                 result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}
