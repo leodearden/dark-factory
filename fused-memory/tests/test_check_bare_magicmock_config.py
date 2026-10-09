@@ -28,6 +28,12 @@ _checker = load_script_module(SCRIPT_PATH, mod_name='check_bare_magicmock_config
 find_violations = _checker.find_violations
 _lint_cli = load_script_module(SCRIPT_PATH.with_name('_lint_cli.py'))
 
+# Repo-wide scans (TestAllScannedTestDirsClean, TestWallClockDeadlineBaselineIntegrity) sweep all seven
+# packages' tests/; 61.52s x 8 = 492.16, rounded up to a whole minute. Family rationale:
+# orchestrator/tests/_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
+WHOLE_TREE_SCAN_TEST_TIMEOUT = 540
+pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
+
 # Worst root-bound wall clock of this module's repo-wide scans under real load, task 5442; corpus is plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 _WHOLE_TREE_SCAN_MEASURED_UNDER_LOAD_WORST_CASE = 61.52
 # Canonical home is orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR; fused-memory's tests cannot import orchestrator's test helpers.
