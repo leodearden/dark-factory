@@ -15893,9 +15893,10 @@ class TestIntegrityGateInputParityWithRenderer:
     def _heartbeat(delta: timedelta) -> str:
         """ISO heartbeat stamped *delta* from now (negative = past).
 
-        Stale/fresh margins are set against live_workflow_detector's
-        DEFAULT_HEARTBEAT_TTL (10 minutes) with enough slack that real-clock
-        drift during the test can never flip the verdict.
+        Stale/fresh margins are set against
+        shared.task_claimant.DEFAULT_CLAIMANT_HEARTBEAT_TTL (10 minutes) with
+        enough slack that real-clock drift during the test can never flip the
+        verdict.
         """
         return (datetime.now(UTC) + delta).isoformat()
 
@@ -16510,8 +16511,8 @@ class TestRemediationSnapshotClockPinnedToTreeRead:
     stamped `_tasks_snapshot_at` with a fresh `datetime.now(UTC)` taken AFTER
     the S1->S2->S3 stage loop that follows, which is minutes of LLM work away
     from the actual tree read. Since the gate compares a cited task's
-    `heartbeat_at` against `now - DEFAULT_HEARTBEAT_TTL` (10 minutes,
-    live_workflow_detector.DEFAULT_HEARTBEAT_TTL), that gap could silently
+    `heartbeat_at` against `now - DEFAULT_CLAIMANT_HEARTBEAT_TTL` (10 minutes,
+    shared.task_claimant.DEFAULT_CLAIMANT_HEARTBEAT_TTL), that gap could silently
     age a heartbeat that was fresh at the read past the TTL and let a
     spurious stranded-work escalation through for a task that was
     demonstrably live at the moment the tree was read — precisely the

@@ -197,7 +197,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from shared.git_async import run_git
-from shared.task_claimant import has_live_claimant
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
 from shared.task_metadata import RoutingState
 
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
@@ -258,18 +258,6 @@ DETERMINISTIC_TASK_KIND: str = 'deterministic'
 # _orchestrator_signal_ineligible (task 2409) to scope the blocked-normal
 # bare-orchestrator suppression.
 NORMAL_TASK_KIND: str = 'normal'
-
-# Heartbeat staleness threshold for the fresh-claimant corroboration signal
-# (task 2963). A killed workflow keeps its durable ``claimant_run_id`` but stops
-# advancing ``heartbeat_at``, so FRESHNESS (not presence) is the discriminator:
-# `has_live_claimant(task, now, ttl)` reports live only while the heartbeat is
-# newer than ``now - ttl``. Mirrors the orchestrator's validated
-# ``_RECONCILE_HEARTBEAT_TTL`` (harness.py:189) / ``_DEFAULT_HEARTBEAT_TTL``
-# (task_ground_truth.py:146) constant — the coordination point with sibling
-# task 2931's orphan-reaper liveness predicate (reuse this shared TTL, do not
-# invent a parallel heartbeat check).
-DEFAULT_HEARTBEAT_TTL: timedelta = timedelta(minutes=10)
-
 
 @dataclass(frozen=True)
 class WorkflowLiveness:
@@ -683,7 +671,7 @@ def corroboration_for_task(
     task_id: str | int,
     *,
     now: datetime,
-    heartbeat_ttl: timedelta = DEFAULT_HEARTBEAT_TTL,
+    heartbeat_ttl: timedelta = DEFAULT_CLAIMANT_HEARTBEAT_TTL,
     scheduler_state: Mapping | None = None,
     orchestrator_started_at: datetime | None = None,
 ) -> bool:
@@ -728,7 +716,7 @@ def claimant_label(
     task: object,
     *,
     now: datetime,
-    heartbeat_ttl: timedelta = DEFAULT_HEARTBEAT_TTL,
+    heartbeat_ttl: timedelta = DEFAULT_CLAIMANT_HEARTBEAT_TTL,
 ) -> ClaimantLabel:
     """Label *task*'s claimant for display; total, and it changes no ``is_live`` verdict.
 

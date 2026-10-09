@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
 
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 from shared.timestamps import parse_timestamp_or_warn
 
 from fused_memory.mcp_tools.scheduler_state import read_scheduler_state
@@ -23,7 +24,6 @@ from fused_memory.reconciliation.task_filter import MAX_ACTIVE_TASKS_RENDERED
 from fused_memory.services.landed_on_main import LandingQuery, LandingVerdict, probe_landing
 from fused_memory.services.live_workflow_detector import (
     DEFAULT_BRANCH_PREFIX,
-    DEFAULT_HEARTBEAT_TTL,
     ClaimantLabel,
     WorkflowLiveness,
     claimant_label,
@@ -84,7 +84,7 @@ class LandedToken(StrEnum):
 
 LIVE_WORKFLOW_RULES_HEADING = '### Reading the Live-Workflow Signals section'
 
-_HEARTBEAT_TTL_MINUTES = int(DEFAULT_HEARTBEAT_TTL.total_seconds() // 60)
+_HEARTBEAT_TTL_MINUTES = int(DEFAULT_CLAIMANT_HEARTBEAT_TTL.total_seconds() // 60)
 
 
 def render_live_workflow_authority_rules() -> str:

@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from shared.task_claimant import has_live_claimant
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, has_live_claimant
 
 from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.memory_metadata import normalize_supersedes
@@ -38,7 +38,6 @@ from fused_memory.reconciliation.task_filter import (
     is_proposed_resolution_framing,
 )
 from fused_memory.reconciliation.verify import CodebaseVerifier
-from fused_memory.services.live_workflow_detector import DEFAULT_HEARTBEAT_TTL
 from fused_memory.services.memory_service import MemoryService
 from fused_memory.services.orchestrator_detector import is_orchestrator_live_for
 from fused_memory.utils.task_dependency_ids import task_dependency_ids
@@ -2451,7 +2450,7 @@ class TargetedReconciler:
         per ``shared/task_claimant.py::has_live_claimant`` is left in place
         (``'claimant_live'``, a skip row): clearing it would switch off the
         scheduler's live-claimant dispatch gate under a running workflow.
-        ``DEFAULT_HEARTBEAT_TTL`` is longer than the scheduler's default
+        ``DEFAULT_CLAIMANT_HEARTBEAT_TTL`` is longer than the scheduler's default
         ``claimant_liveness_ttl_secs``, so a claimant that gate treats as live
         is never cleared here.
 
@@ -2468,7 +2467,7 @@ class TargetedReconciler:
             'satisfied_by': satisfied_by,
             'type': 'unblock_claimant_clear',
         }
-        if has_live_claimant(live_row, datetime.now(UTC), DEFAULT_HEARTBEAT_TTL):
+        if has_live_claimant(live_row, datetime.now(UTC), DEFAULT_CLAIMANT_HEARTBEAT_TTL):
             logger.info(
                 'sweep: leaving the live claimant on dependent %s (satisfied by %s)',
                 dep_id, satisfied_by,

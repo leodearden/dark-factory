@@ -41,11 +41,11 @@ import math
 import os
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, TypeVar
 
 import httpx
-from shared.task_claimant import is_stranded
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL, is_stranded
 
 from dashboard.config import DashboardConfig
 from dashboard.data.mcp_fanout import fanout_label, first_success
@@ -291,20 +291,6 @@ def _shape_task(task: dict) -> dict | None:
         'claimant_run_id': task.get('claimant_run_id'),
         'heartbeat_at': task.get('heartbeat_at'),
     }
-
-
-# ---------------------------------------------------------------------------
-# Stranded-task projection (task 3543 / PRD ι, spec S8)
-# ---------------------------------------------------------------------------
-
-# Mirrors the orchestrator's ``harness._RECONCILE_HEARTBEAT_TTL`` (10 minutes):
-# a claim whose heartbeat has not advanced within this window is treated as
-# abandoned.  The dashboard deliberately does NOT import the orchestrator
-# package — it is a separate deployable and the dashboard's dependency set is
-# intentionally narrow — so the value is restated here.  If the orchestrator's
-# TTL moves, this constant must move with it; the two are a documented pair,
-# not an accident.
-STRANDED_HEARTBEAT_TTL = timedelta(minutes=10)
 
 
 @dataclass(frozen=True, slots=True)
@@ -672,11 +658,12 @@ def task_is_stranded(task: Mapping[str, Any], now: datetime | None = None) -> bo
     """Return True when *task* is an in-progress task with no live claimant.
 
     THE single dashboard-side strand predicate.  A thin wrapper binding
-    :data:`STRANDED_HEARTBEAT_TTL` and the request-scoped clock onto
-    :func:`shared.task_claimant.is_stranded` (Table C4 of the
-    task-status-authority contract), so every dashboard surface that renders a
-    strand — the task-row badge, the burndown live/stranded split — resolves
-    it through one function and the surfaces cannot disagree (INV-5).
+    :data:`shared.task_claimant.DEFAULT_CLAIMANT_HEARTBEAT_TTL` and the
+    request-scoped clock onto :func:`shared.task_claimant.is_stranded` (Table
+    C4 of the task-status-authority contract), so every dashboard surface
+    that renders a strand — the task-row badge, the burndown live/stranded
+    split — resolves it through one function and the surfaces cannot
+    disagree (INV-5).
 
     ``is_stranded`` specifically, NOT its siblings:
 
@@ -697,7 +684,7 @@ def task_is_stranded(task: Mapping[str, Any], now: datetime | None = None) -> bo
     Returns:
         True when the task is stranded, else False.
     """
-    return is_stranded(task, resolve_now(now), STRANDED_HEARTBEAT_TTL)
+    return is_stranded(task, resolve_now(now), DEFAULT_CLAIMANT_HEARTBEAT_TTL)
 
 
 async def fetch_task_page(
