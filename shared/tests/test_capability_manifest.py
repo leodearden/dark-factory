@@ -508,13 +508,13 @@ class TestManifestTask:
     def test_both_task_id_and_external_task_id_rejected(self):
         """A block binds exactly one producer, in exactly one registry.
 
-        Guards the concrete path in ``manifest_stamping`` step 4: it stamps
-        any label present in the current ``commit_planning`` batch without
-        consulting the block's existing contents, so a future dark-factory
-        decompose re-using a label already bound to a foreign producer
-        would write a local ``task_id`` alongside the ``external_task_id``.
-        Failing loudly at load is the point — the corpus sweep turns it
-        into a red CI signal naming the file.
+        ``manifest_stamping`` step 4 relies on this rejection: it
+        re-validates a stamped sidecar before writing it, so a future
+        dark-factory decompose re-using a label already bound to a foreign
+        producer has its stamp refused rather than written alongside the
+        ``external_task_id``. Failing loudly at load is the point — the
+        corpus sweep also turns a hand-made violation into a red CI signal
+        naming the file.
         """
         with pytest.raises(ValidationError) as exc_info:
             ManifestTask(label='η', task_id=5613, external_task_id='reify:5613', capabilities=[])
@@ -562,9 +562,10 @@ class TestManifestTask:
     def test_external_task_id_normalisation_is_idempotent(self):
         """Re-validating a stored value is a no-op, so a round-trip is stable.
 
-        ``manifest_stamping``'s write-back re-dumps and the corpus sweep
-        re-loads; if normalisation were not idempotent, a sidecar would
-        churn on every pass.
+        ``manifest_stamping``'s write-back re-parses and validates the
+        stamped sidecar and the corpus sweep re-loads it; if normalisation
+        were not idempotent, the same value would validate differently on
+        each pass.
         """
         once = ManifestTask(label='η', external_task_id=' reify:5613 ', capabilities=[])
         twice = ManifestTask(
@@ -732,8 +733,8 @@ tasks:
         # A LOAD test, deliberately not named "round_trips": it proves the
         # YAML path decodes `note:` into the model, nothing more. The claim
         # ManifestTask's docstring actually rests on — that a declared field
-        # survives manifest_stamping's yaml.safe_dump write-back where a
-        # comment would not — can only be asserted on the stamping side, in
+        # survives manifest_stamping's write-back — can only be asserted on
+        # the stamping side, in
         # fused-memory/tests/test_manifest_stamping.py, which is outside this
         # task's lock scope. Filed as tkt_0RSNVJT1ZNWKS5Y7BM5F7A2QAD
         # (follow-up from task 4471); the round-trip name is reserved for it.

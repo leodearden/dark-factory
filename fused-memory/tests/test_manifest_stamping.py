@@ -72,8 +72,8 @@ tasks:
 # binding, not a measured absence — see ManifestCapability's docstring) plus
 # one ordinary mechanical grep capability. Exercises the claim
 # ManifestTask's own docstring makes about this module's step-4 write-back:
-# a DECLARED field (note) survives yaml.safe_dump(raw, ...) where a YAML
-# comment would not. See test_round_trip_preserves_task_level_note_and_open_verdict.
+# a DECLARED field (note) survives it. See
+# test_round_trip_preserves_task_level_note_and_open_verdict.
 _NOTE_AND_OPEN_VERDICT_SIDECAR_YAML = """\
 prd: plans/note-prd.md
 schema_version: 1
@@ -275,9 +275,8 @@ async def test_round_trip_preserves_task_level_note_and_open_verdict(tmp_path):
     the round-trip counterpart to shared's LOAD-only
     TestLoader::test_load_sidecar_with_task_level_note. ManifestTask's
     docstring claims a DECLARED `note` field survives this module's step-4
-    ``yaml.safe_dump(raw, sort_keys=False, allow_unicode=True)`` write-back
-    where a YAML comment would not — that claim can only be asserted here,
-    on the stamping side, since shared/ has no write path of its own. Stamp
+    write-back — that claim can only be asserted here, on the stamping
+    side, since shared/ has no write path of its own. Stamp
     a sidecar carrying a task-level `note:` and a `verdict: OPEN` capability
     row through the real helper and confirm both survive byte-for-byte
     (as decoded values) in the rewritten file, unstamped fields included.
@@ -328,7 +327,7 @@ async def test_round_trip_preserves_task_level_note_and_open_verdict(tmp_path):
     assert reloaded == expected
 
     # Named check for the specific claim this test exists to verify: the
-    # task-level `note:` survives the safe_dump write-back verbatim.
+    # task-level `note:` survives the write-back verbatim.
     # Subsumed by the whole-document equality above; kept as documentation
     # of intent, derived from the parsed fixture rather than retyped so it
     # can't silently desync from it.

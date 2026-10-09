@@ -12,6 +12,14 @@ is dropped; see :data:`shared.capability_manifest.MECHANICAL_CHECK_KINDS`)
 into the producer task's ``metadata.delivered_checks`` via the interceptor's
 per-project write lock.
 
+Write-back contract: a stamp changes only ``task_id`` values. Every other
+byte of the sidecar — comments, quoting, key order, line endings — is
+preserved (:func:`fused_memory.server.manifest_sidecar_text.stamp_task_ids`),
+and the result is re-parsed and schema-validated before the atomic replace.
+A stamp that cannot be verified, or that would leave an invalid sidecar
+(e.g. a ``task_id`` beside an ``external_task_id``), is refused, reported in
+``report['errors']``, and nothing is written.
+
 Fail-soft, loud: no sidecar on disk is a complete no-op (``None`` — the
 caller attaches no ``manifest_stamping`` key, keeping the legacy response
 byte-identical); a malformed sidecar or absent labels populate
@@ -67,6 +75,7 @@ from shared.delivered_check_polarity import GATE_REF, lint_delivered_checks
 from shared.safe_io import atomic_write_text
 
 from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
+from fused_memory.server.manifest_sidecar_text import SidecarStampRefused, stamp_task_ids
 
 logger = logging.getLogger(__name__)
 
@@ -499,9 +508,10 @@ def _load_and_stamp(
     #    malformed doc leaves the on-disk file byte-identical.
     sidecar_abs = root / sidecar_rel
     try:
-        raw_text = sidecar_abs.read_text(encoding='utf-8')
-        raw = yaml.safe_load(raw_text)
-        doc = parse_capability_manifest(raw)
+        # Bytes, then decode: read_text would translate CRLF, and the stamp
+        # below must hand back every byte it did not mean to change.
+        raw_text = sidecar_abs.read_bytes().decode('utf-8')
+        doc = parse_capability_manifest(yaml.safe_load(raw_text))
     except (OSError, yaml.YAMLError, ValidationError) as exc:
         logger.warning(
             'stamp_capability_manifests: failed to load/validate %s', sidecar_rel, exc_info=True,
@@ -522,24 +532,26 @@ def _load_and_stamp(
     # 4. Stamp task_id onto each matching label entry and write back to disk.
     #    label_to_task_id holds only batch tasks whose OWN derived rel path
     #    is this sidecar (relevant only for the unexpected multi-sidecar
-    #    case). Also guarded — an unexpected failure here (e.g. a disk write
-    #    error) must not raise, and must leave nothing reported as stamped
-    #    since the file was not confirmed written.
-    stamped_labels: list[str] = []
+    #    case). A stamp the text surgery or the schema refuses is reported
+    #    and nothing is written; any other failure (e.g. a disk write error)
+    #    must not raise either. Both leave nothing reported as stamped, since
+    #    the file was not confirmed written.
+    stamped_labels = tuple(task.label for task in doc.tasks if task.label in label_to_task_id)
     try:
-        for entry in raw.get('tasks', []):
-            if not isinstance(entry, dict):
-                continue
-            label = entry.get('label')
-            if label in label_to_task_id:
-                entry['task_id'] = int(label_to_task_id[label])
-                stamped_labels.append(label)
-        if stamped_labels:
-            atomic_write_text(
-                sidecar_abs,
-                yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
-                encoding='utf-8',
-            )
+        new_text = stamp_task_ids(
+            raw_text, {label: int(label_to_task_id[label]) for label in stamped_labels},
+        )
+        if new_text != raw_text:
+            parse_capability_manifest(yaml.safe_load(new_text))
+            atomic_write_text(sidecar_abs, new_text, encoding='utf-8')
+    except (SidecarStampRefused, ValidationError) as exc:
+        logger.warning(
+            'stamp_capability_manifests: refused to stamp %s', sidecar_rel, exc_info=True,
+        )
+        return _SidecarOutcome(
+            root, sidecar_rel, None, (),
+            (*errors, f'{sidecar_rel}: refused to stamp sidecar — {exc}'),
+        )
     except Exception as exc:
         logger.warning(
             'stamp_capability_manifests: failed to stamp/write %s', sidecar_rel, exc_info=True,
@@ -548,4 +560,4 @@ def _load_and_stamp(
             root, sidecar_rel, None, (),
             (*errors, f'{sidecar_rel}: failed to stamp/write sidecar — {exc}'),
         )
-    return _SidecarOutcome(root, sidecar_rel, doc, tuple(stamped_labels), errors)
+    return _SidecarOutcome(root, sidecar_rel, doc, stamped_labels, errors)
