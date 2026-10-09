@@ -2372,16 +2372,19 @@ async def invoke_with_cap_retry(
     *rebuild_prompt*, when provided, is a ``PromptBuilder`` awaited with no
     arguments immediately before EVERY re-dispatch — whatever triggered it
     (cap hit, auth failure, wedge, failed resume, pre-turn CLI rejection) —
-    and never before the first dispatch.  It runs after the cooldown and
-    after the next slot is acquired, so what it builds reflects the caller's
-    state at dispatch time, not at the start of a long cap wait.  A FRESH
-    re-dispatch sends the built string; a resumed one keeps
-    ``CAP_HIT_RESUME_PROMPT`` and discards it.  Returning ``None`` cancels the
-    retry: no further dispatch is made and the last attempt's result is
-    returned with ``retry_aborted=True`` and ``success=False``.  A builder that
-    raises or builds a blank prompt is logged and the retry proceeds on the
-    original prompt rather than aborting the loop.  Defaults to ``None``:
-    fresh retries replay the original prompt unchanged.
+    and never before the first dispatch, which sends ``prompt`` as the caller
+    built it, before any slot wait.  It runs after the cooldown and inside
+    the next acquired slot, so what it builds reflects the caller's state at
+    dispatch time, not at the start of a long cap wait, and its cost is paid
+    while holding that slot.  A FRESH re-dispatch sends the built string; a
+    resumed one keeps ``CAP_HIT_RESUME_PROMPT``, so there the builder runs
+    only for its decline answer and its string is discarded — a builder
+    should decide whether to decline before it builds.  Returning ``None``
+    cancels the retry: no further dispatch is made and the last attempt's
+    result is returned with ``retry_aborted=True`` and ``success=False``.  A
+    builder that raises or builds a blank prompt is logged and the retry
+    proceeds on the original prompt rather than aborting the loop.  Defaults
+    to ``None``: fresh retries replay the original prompt unchanged.
 
     *resume_delivers_prompt*, when ``True``, delivers the caller's real
     ``prompt`` on a caller-initiated resume (``resume_session_id`` pre-set
