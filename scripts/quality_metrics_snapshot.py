@@ -22,7 +22,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeGuard
 
 import source_measures
 
@@ -598,7 +598,7 @@ def _described(value: object) -> str:
 
 def _invalid(origin: str, where: str, found: str, expected: str) -> source_measures.MetricsError:
     return source_measures.MetricsError(
-        f'{origin}: {where} is {found}; schema {SCHEMA_VERSION} expects {expected}'
+        f'{origin}: {where} is {found}; expected {expected}'
     )
 
 
@@ -685,7 +685,7 @@ class _ByKind:
         _Object({**self.common, **self.kinds[kind]}).check(value, where, origin)
 
 
-def _is_int(value: object) -> bool:
+def _is_int(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
@@ -733,48 +733,70 @@ _RECORD = _ByKind(
     },
 )
 
+_EDGES = _ListOf(_Leaf(_is_edge, 'a [from, to] pair of module names'))
+_REACH_BACKS = _ListOf(_Object({'from': _STRING, 'to': _STRING, 'names': _STRINGS, 'line': _INTEGER}))
+_CYCLES = _ListOf(_STRINGS)
+
 _IMPORT_GRAPH = _Object({
-    'edges': _ListOf(_Leaf(_is_edge, 'a [from, to] pair of module names')),
-    'reach_back': _ListOf(_Object({'from': _STRING, 'to': _STRING, 'names': _STRINGS, 'line': _INTEGER})),
+    'edges': _EDGES,
+    'reach_back': _REACH_BACKS,
     'deferred': _ListOf(
         _Object({'from': _STRING, 'line': _INTEGER, 'imports': _STRINGS, 'closes_cycle': _BOOLEAN})
     ),
-    'cycles': _ListOf(_STRINGS),
-    'hidden_cycles': _ListOf(_STRINGS),
-    'typing_cycles': _ListOf(_STRINGS),
+    'cycles': _CYCLES,
+    'hidden_cycles': _CYCLES,
+    'typing_cycles': _CYCLES,
 })
 _IMPORT_GRAPH_KEYS = tuple(_IMPORT_GRAPH.fields)
 
-#: SCHEMA_VERSION (plans/quality-metrics-snapshot-prd.md §Contract): every field the file holds.
-_SNAPSHOT = _Object(
-    {
-        'schema_version': _Leaf(lambda value: _is_int(value) and value == SCHEMA_VERSION, str(SCHEMA_VERSION)),
-        'instrument': _Leaf(lambda value: value == INSTRUMENT, json.dumps(INSTRUMENT)),
-        'run_id': _STRING,
-        'as_of_sha': _STRING,
-        'since': _STRING,
-        'evidence': _Object(
-            {
-                'members': _ListOf(_Object({'name': _STRING, 'pseudo': _BOOLEAN, 'domain_files': _INTEGER})),
-                'domain_files': _INTEGER,
-                'measured_files': _INTEGER,
-                'unreadable': _STRINGS,
-                'complete': _BOOLEAN,
-            },
-            ordered=True,
-        ),
-        'cost': _Object({'wall_clock_s': _NUMBER}),
-        'params': _Object({
-            'complexipy_version': _STRING,
-            'h14_soft_ceiling_lines': _INTEGER,
-            'h14_alarm_lines': _INTEGER,
-        }),
-        'files': _MapOf(_RECORD),
-        'functions': _MapOf(_INTEGER),
-        'import_graph': _IMPORT_GRAPH,
-    },
-    ordered=True,
-)
+_SCHEMA_1_IMPORT_GRAPH = _Object({
+    'edges': _EDGES,
+    'reach_back': _REACH_BACKS,
+    'deferred': _ListOf(_Object({'from': _STRING, 'line': _INTEGER, 'imports': _STRINGS})),
+    'cycles': _CYCLES,
+})
+
+_INSTRUMENT = _Leaf(lambda value: value == INSTRUMENT, json.dumps(INSTRUMENT))
+
+
+def _snapshot_shape(version: int, import_graph: _Object) -> _Object:
+    """Every field a schema-*version* file holds (plans/quality-metrics-snapshot-prd.md §Contract)."""
+    return _Object(
+        {
+            'schema_version': _Leaf(lambda value: _is_int(value) and value == version, str(version)),
+            'instrument': _INSTRUMENT,
+            'run_id': _STRING,
+            'as_of_sha': _STRING,
+            'since': _STRING,
+            'evidence': _Object(
+                {
+                    'members': _ListOf(_Object({'name': _STRING, 'pseudo': _BOOLEAN, 'domain_files': _INTEGER})),
+                    'domain_files': _INTEGER,
+                    'measured_files': _INTEGER,
+                    'unreadable': _STRINGS,
+                    'complete': _BOOLEAN,
+                },
+                ordered=True,
+            ),
+            'cost': _Object({'wall_clock_s': _NUMBER}),
+            'params': _Object({
+                'complexipy_version': _STRING,
+                'h14_soft_ceiling_lines': _INTEGER,
+                'h14_alarm_lines': _INTEGER,
+            }),
+            'files': _MapOf(_RECORD),
+            'functions': _MapOf(_INTEGER),
+            'import_graph': import_graph,
+        },
+        ordered=True,
+    )
+
+
+#: Schema 1 is read so a committed pre-6612 snapshot still diffs and summarises (the PRD's §Contract).
+_SNAPSHOTS: Mapping[int, _Object] = {
+    1: _snapshot_shape(1, _SCHEMA_1_IMPORT_GRAPH),
+    SCHEMA_VERSION: _snapshot_shape(SCHEMA_VERSION, _IMPORT_GRAPH),
+}
 
 
 def _require_evidence_agrees(snapshot: Mapping[str, Any], origin: str) -> None:
@@ -864,10 +886,19 @@ def load_snapshot(path: Path) -> dict[str, Any]:
 
 
 def validate_snapshot(snapshot: object, *, origin: str) -> dict[str, Any]:
-    """*snapshot*, once it has every schema-1 field and its evidence agrees; else MetricsError naming *origin*."""
+    """*snapshot*, once it has every field of a schema read here and its evidence agrees.
+
+    Else a MetricsError naming *origin*, and the schema once it is known.
+    """
     top = _json_object(snapshot, 'the top level', origin)
-    _SNAPSHOT.check(top, '', origin)
-    _require_evidence_agrees(top, origin)
+    _INSTRUMENT.check(top.get('instrument'), 'instrument', origin)
+    version = top.get('schema_version')
+    shape = _SNAPSHOTS.get(version) if _is_int(version) else None
+    if shape is None:
+        raise _invalid(origin, 'schema_version', _described(version), f'one of {sorted(_SNAPSHOTS)}')
+    versioned = f'{origin} (schema {version})'
+    shape.check(top, '', versioned)
+    _require_evidence_agrees(top, versioned)
     return top
 
 
@@ -1027,14 +1058,28 @@ _GRAPH_KINDS: tuple[tuple[str, str, Any, Any], ...] = (
 )
 
 
+def _graph_kind_entries(
+    kind: tuple[str, str, Any, Any], current: Mapping[str, Any], previous: Mapping[str, Any]
+) -> list[str]:
+    """One kind's additions and removals; unknown, never compared, when a side's schema lacks it."""
+    label, name, key_of, render = kind
+    unknown = [
+        f'{label}s unknown: the {side} snapshot is schema {taken["schema_version"]}'
+        for side, taken in (('current', current), ('previous', previous))
+        if name not in taken['import_graph']
+    ]
+    if unknown:
+        return unknown
+    before = Counter(key_of(item) for item in previous['import_graph'][name])
+    after = Counter(key_of(item) for item in current['import_graph'][name])
+    return [
+        *(f'{label} added: {render(key)}' for key in sorted((after - before).elements())),
+        *(f'{label} removed: {render(key)}' for key in sorted((before - after).elements())),
+    ]
+
+
 def _graph_change_entries(current: Mapping[str, Any], previous: Mapping[str, Any]) -> list[str]:
-    entries = []
-    for label, name, key_of, render in _GRAPH_KINDS:
-        before = Counter(key_of(item) for item in previous['import_graph'][name])
-        after = Counter(key_of(item) for item in current['import_graph'][name])
-        entries += [f'{label} added: {render(key)}' for key in sorted((after - before).elements())]
-        entries += [f'{label} removed: {render(key)}' for key in sorted((before - after).elements())]
-    return entries
+    return [entry for kind in _GRAPH_KINDS for entry in _graph_kind_entries(kind, current, previous)]
 
 
 def _change_parts(old: Iterable[str], new: Iterable[str]) -> list[str]:
