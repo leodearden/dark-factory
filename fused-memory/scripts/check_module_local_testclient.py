@@ -28,73 +28,30 @@ That pragma is the repo's stated norm (pyproject.toml): local, visible and
 greppable, and it travels with the code under both rename and split — unlike the
 whitelist it replaces, which broke on a rename of a file it did not even name.
 
-This script is intentionally stdlib-only (ast, argparse, pathlib, re, sys) so
-hooks/project-checks can invoke it via plain python3 without uv env-resolution
-overhead.  Adding a third-party dependency here would break that fast path.
+This script is intentionally stdlib-only (ast, pathlib, sys, plus its stdlib-only
+sibling _lint_cli.py) so hooks/project-checks can invoke it via plain python3
+without uv env-resolution overhead.  Adding a third-party dependency here would
+break that fast path.
 """
 from __future__ import annotations
 
-import argparse
 import ast
-import re
 import sys
 from pathlib import Path
 from typing import NamedTuple
 
+# Sibling import that survives `python3 -I`: see _lint_cli.py's module docstring.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from _lint_cli import Violation, is_exempted, run_cli
+finally:
+    del sys.path[0]
 
-class Violation(NamedTuple):
-    """A lint violation found by the checker."""
-
-    filename: str
-    lineno: int
-    col_offset: int
-    message: str
-
-
-# Exemption comment regex.
-# Matches: ``# noqa: module-local-testclient — <non-empty-reason>``
-# Accepts em-dash (—) or ASCII hyphen (-) as separator.
-# Requires at least one non-space character after the separator.
-#
-# Template and contract are inherited VERBATIM from
-# ``check_bare_magicmock_config.py::_EXEMPT_TEMPLATE`` so this repo keeps ONE
-# suppression grammar rather than two.  Keying on the rule's own code also
-# guarantees a ``bare-magicmock`` pragma can never silently exempt this rule:
-# the remedies are unrelated, so a pragma for one is not informed consent for
-# the other.
-_EXEMPT_TEMPLATE = r'#\s*noqa:\s*{code}\s*[—\-]+\s*\S.*'
-
+# Pragma grammar is _lint_cli.py's, keyed on this code: no other rule's pragma exempts this one.
 _RULE_CODE = 'module-local-testclient'
 
-_EXEMPT_RE = re.compile(_EXEMPT_TEMPLATE.format(code=re.escape(_RULE_CODE)))
-
-
-def _is_exempted(lines: list[str], lineno: int) -> bool:
-    """Return True if the node at *lineno* (1-based) carries a valid exemption pragma.
-
-    Walks upward from the line ABOVE *lineno* over blank lines to the nearest
-    non-blank line.  If that line matches ``_EXEMPT_RE`` the node is exempt.
-    Any intervening non-blank, non-matching line breaks the exemption.
-
-    Inline trailing exemption NOT honored: only the nearest *preceding* non-blank
-    line is inspected.  A ``# noqa: ...`` comment on the same line as the node is
-    intentionally ignored — same contract as ``check_bare_magicmock_config.py``.
-
-    Takes no rule-code argument: this script carries exactly ONE rule, so the
-    code is already baked into ``_EXEMPT_RE``.  ``check_bare_magicmock_config.py``
-    passes one because it genuinely dispatches over three rules; mirroring that
-    signature here would be a parameter with a single possible value.
-    """
-    # lineno is 1-based; convert to 0-based index of the line ABOVE the node.
-    idx = lineno - 2  # the line immediately above
-    while idx >= 0:
-        stripped = lines[idx].strip()
-        if stripped == '':
-            idx -= 1
-            continue
-        # Nearest non-blank line found — must match the exemption regex.
-        return bool(_EXEMPT_RE.match(stripped))
-    return False
+# The files a DIRECTORY argument expands to (never conftest.py: see is_scannable).
+_DISCOVERY_GLOBS: tuple[str, ...] = ('test_*.py',)
 
 
 _VIOLATION_MSG = (
@@ -293,7 +250,7 @@ def find_violations(source: str, filename: str) -> list[Violation]:
                 seen.add(id(child))
                 # Computed LAZILY — only after a construction has matched — so
                 # the upward line walk never runs on every call node in the body.
-                if _is_exempted(lines, child.lineno):
+                if is_exempted(lines, child.lineno, _RULE_CODE):
                     continue
                 violations.append(
                     Violation(
@@ -311,68 +268,18 @@ def find_violations(source: str, filename: str) -> list[Violation]:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point.  Accepts file paths and/or directories.
 
-    For directories, recursively scans for ``test_*.py`` files only (never
-    ``conftest.py`` — see ``is_scannable``).  Prints violations to stdout in
-    ``path:lineno:col: message`` format (ruff-style).
-
-    Explicit file paths are validated up front; a missing explicit path fails
-    fast with exit code 2 before any scan work.  Mid-scan read failures (a file
-    yanked between rglob discovery and read, or undecodable bytes) are
-    accumulated and reported on stderr without discarding violations already
-    collected from earlier files.
-
-    Returns 0 if clean, 1 if only violations were found, 2 on any fatal error
-    (missing explicit path or transient read failure).
+    For directories, recursively scans for ``test_*.py`` files only.  Every
+    collected file, explicit or discovered, must pass ``is_scannable`` before it
+    is read, so an explicitly passed conftest.py is never even read.  Output and
+    the 0/1/2 exit ladder are ``_lint_cli.run_cli``'s.
     """
-    parser = argparse.ArgumentParser(
-        description='Check for pytest fixtures constructing their own TestClient.'
+    return run_cli(
+        argv,
+        description='Check for pytest fixtures constructing their own TestClient.',
+        discovery_globs=_DISCOVERY_GLOBS,
+        find_violations=find_violations,
+        is_scannable=is_scannable,
     )
-    parser.add_argument('paths', nargs='+', help='Files or directories to check')
-    args = parser.parse_args(argv)
-
-    # Phase 1: discovery + upfront validation of explicit paths.
-    # rglob results are guaranteed to exist at discovery time, so only
-    # non-directory (explicit) paths need the existence check.
-    files_to_scan: list[Path] = []
-    for path_str in args.paths:
-        p = Path(path_str)
-        if p.is_dir():
-            files_to_scan.extend(sorted(p.rglob('test_*.py')))
-        else:
-            if not p.exists():
-                print(f'error: {p}: No such file or directory', file=sys.stderr)
-                return 2
-            files_to_scan.append(p)
-
-    # The same gate find_violations applies, enforced at discovery so an
-    # explicitly passed conftest.py is never even read.
-    files_to_scan = [f for f in files_to_scan if is_scannable(str(f))]
-
-    # Phase 2: scan.  Accumulate per-file read errors without returning early,
-    # so a transient failure on one file never discards violations already
-    # collected from earlier files.
-    all_violations: list[Violation] = []
-    read_errors: list[tuple[Path, Exception]] = []
-    for file_path in files_to_scan:
-        try:
-            source = file_path.read_text(encoding='utf-8')
-        except (OSError, UnicodeDecodeError) as exc:
-            read_errors.append((file_path, exc))
-            continue
-
-        all_violations.extend(find_violations(source, str(file_path)))
-
-    # Phase 3: reporting.  Sort across files too, so multi-file output is
-    # deterministic regardless of discovery order.
-    all_violations.sort(key=lambda v: (v.filename, v.lineno, v.col_offset))
-    for v in all_violations:
-        print(f'{v.filename}:{v.lineno}:{v.col_offset}: {v.message}')
-    for file_path, exc in read_errors:
-        print(f'error reading {file_path}: {exc}', file=sys.stderr)
-
-    if read_errors:
-        return 2
-    return 1 if all_violations else 0
 
 
 if __name__ == '__main__':
