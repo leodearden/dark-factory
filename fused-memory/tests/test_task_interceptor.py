@@ -2532,7 +2532,7 @@ async def test_update_task_reembeds_on_title_change(
     curator_interceptor,
     taskmaster,
 ):
-    """update_task triggers fire-and-forget reembed when title/details change."""
+    """The update re-embed keeps the task's metadata.files, matching record_task/backfill_corpus."""
     curator_mock = _mock_curator(CuratorDecision(action='create'))
     curator_interceptor._curator = curator_mock
     taskmaster.get_task.return_value = {
@@ -2541,6 +2541,8 @@ async def test_update_task_reembeds_on_title_change(
         'title': 'Updated title',
         'description': 'desc',
         'details': 'details',
+        'priority': 'high',
+        'metadata': {'files': ['src/parser.py', 'tests/test_parser.py']},
     }
 
     await curator_interceptor.update_task(
@@ -2552,6 +2554,11 @@ async def test_update_task_reembeds_on_title_change(
     await curator_interceptor.drain()
 
     curator_mock.reembed_task.assert_called_once()
+    task_id, candidate, _project_id = curator_mock.reembed_task.call_args.args
+    assert task_id == '7'
+    assert candidate.files_to_modify == ['src/parser.py', 'tests/test_parser.py']
+    assert candidate.title == 'Updated title'
+    assert candidate.description == 'desc'
 
 
 @pytest.mark.asyncio
