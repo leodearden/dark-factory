@@ -7,11 +7,11 @@ every arm, the 1536-dimension incumbent included.
 """
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from fused_memory.arm_harness.arm_embedder import DocumentEmbeddings
+from fused_memory.arm_harness.arm_embedder import DocumentEmbedder, DocumentEmbeddings
 from fused_memory.arm_harness.frozen_model import FrozenModel
 from fused_memory.arm_harness.normalization import NormStats, norm_stats
 from fused_memory.arm_harness.scratch_guard import GuardCheckpoint, require_scratch_name
@@ -60,10 +60,6 @@ class GraphCopyClient(Protocol):
     async def list_graphs(self) -> list[str]: ...
 
     def select_graph(self, graph_id: str, /) -> CopyableGraph: ...
-
-
-class DocumentEmbedder(Protocol):
-    async def embed_documents(self, items: Sequence[tuple[str, str]], /) -> DocumentEmbeddings: ...
 
 
 class ReembedCensusError(RuntimeError):

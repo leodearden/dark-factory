@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import Protocol
 
 from graphiti_core.embedder import EmbedderClient
 from pydantic import Field
@@ -53,6 +54,12 @@ class DocumentEmbeddings:
     embed_seconds: float
     failures: tuple[tuple[str, str], ...]
     """(key, error class name) for each text the arm could not embed."""
+
+
+class DocumentEmbedder(Protocol):
+    """What a store re-embed needs of an arm: its documents in, keyed unit vectors out."""
+
+    async def embed_documents(self, items: Sequence[tuple[str, str]], /) -> DocumentEmbeddings: ...
 
 
 @dataclass(frozen=True)
