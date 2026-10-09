@@ -692,6 +692,20 @@ class TestSamplerReingestedContentParity:
         assert {name: sampled[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 1)
         assert {name: digested[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 1)
 
+    def test_a_briefing_split_across_text_blocks_is_judged_as_one_turn(self, tmp_path):
+        briefing = briefing_text(_LITERAL_LINE)
+        split = briefing.index('## Agent Identity')
+        head, tail = briefing[:split], briefing[split:]
+        record = _user_blocks({'type': 'text', 'text': head}, {'type': 'text', 'text': tail})
+        path = _write_transcript(tmp_path / 'split.jsonl', [record])
+
+        sampled = dataclasses.asdict(mod.score_signals(path))
+        digested = digest.signal_counts([record])
+
+        assert digest.is_non_dialogue_carrier(record, head) is False
+        assert {name: sampled[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 0)
+        assert {name: digested[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 0)
+
 
 def _scored(session_id, stratum, counts, first_turn_text, size_bytes=1000):
     session = inventory.SessionRecord(

@@ -138,29 +138,38 @@ class _Carrier:
 
 
 def _record_carriers(record: dict[str, Any]) -> list[_Carrier]:
-    """Every raw text carrier in a record's message.content.
+    """Every raw text carrier in a record's message.content, cut where the
+    digest cuts its carriers, so the shared predicate judges the same strings.
 
     ``content`` is either a plain string, which is one carrier, or a list of
-    content blocks; each block contributes its 'text' field (assistant/user
-    text, thinking) and its 'content' field (tool_result output, itself
-    sometimes a string) as separate carriers.
+    content blocks. In a list, each block's 'text' field (assistant text,
+    thinking) and its string 'content' field (tool_result output) are
+    separate carriers, except that a user record's 'text' blocks join into
+    ONE carrier, its turn text, as digest.py::_user_turn_text joins them.
     """
     content = _message_content(record)
     if isinstance(content, str):
         return [_Carrier(content, is_assistant_text=False)]
     if not isinstance(content, list):
         return []
-    is_assistant = record.get('type') == 'assistant'
+    record_type = record.get('type')
     carriers = []
+    turn_texts = []
     for block in content:
         if not isinstance(block, dict):
             continue
         text = block.get('text')
         if isinstance(text, str):
-            carriers.append(_Carrier(text, is_assistant and block.get('type') == 'text'))
+            is_text_block = block.get('type') == 'text'
+            if record_type == 'user' and is_text_block:
+                turn_texts.append(text)
+            else:
+                carriers.append(_Carrier(text, record_type == 'assistant' and is_text_block))
         block_content = block.get('content')
         if isinstance(block_content, str):
             carriers.append(_Carrier(block_content, is_assistant_text=False))
+    if turn_texts:
+        carriers.append(_Carrier('\n'.join(turn_texts), is_assistant_text=False))
     return carriers
 
 
