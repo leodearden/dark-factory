@@ -98,6 +98,12 @@ if __name__ == '__main__':
 _SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
+# orchestrator/src is bound the same way, for the stdlib-only quality
+# definition renderer `orchestrator.agents.code_quality` both census prompts
+# embed (docs/quality-findings-contract.md §10).
+_ORCH_SRC = Path(__file__).resolve().parents[2] / "orchestrator" / "src"
+if str(_ORCH_SRC) not in sys.path:
+    sys.path.insert(0, str(_ORCH_SRC))
 
 import codebook  # noqa: E402
 import coder  # noqa: E402
@@ -113,6 +119,7 @@ from legibility import (  # noqa: E402
     unlanded,
 )
 from legibility import verdict as verdict_mod  # noqa: E402
+from orchestrator.agents import code_quality  # noqa: E402
 
 # The banner marker list itself lives in shared.cap_markers and is never
 # restated here -- this module only asks the question, via the predicate.
@@ -3164,9 +3171,65 @@ DEFAULT_HARNESS_CONFIG_PATH = (
 own components can be a confusion's fix surface. Its project_root names the
 MAIN checkout even when the census runs from a worktree."""
 
-def _verify_prompt(cluster: dict, *, project_root: str) -> str:
+_QUALITY_DEFINITION_MARKER = "=== QUALITY DEFINITION ===\n"
+
+_SEVERITY_MEANINGS = {
+    "high": "the next change in this area is likely to be wrong or expensive without the fix",
+    "medium": "a real cost, contained",
+    "low": "worth doing when the area is next touched",
+}
+"""docs/quality-findings-contract.md §4's one-line meaning of each
+``verdict.SEVERITIES`` value, as the verify prompt states it."""
+
+_ROUTE_MEANINGS = {
+    verdict_mod.Route.MECHANICAL: (
+        "one anchor, no design choice; a competent agent can fix it from the reason"
+    ),
+    verdict_mod.Route.STRUCTURAL: (
+        "spans modules, chooses between designs, changes a contract, or proposes a split"
+    ),
+}
+"""docs/quality-findings-contract.md §6's meaning of each route."""
+
+
+def _verdict_response_shape(project_root: str) -> str:
+    severities = " | ".join(f'"{severity}"' for severity in verdict_mod.SEVERITIES)
+    routes = " | ".join(f'"{route.value}"' for route in verdict_mod.Route)
+    severity_lines = "".join(
+        f'  "{severity}": {_SEVERITY_MEANINGS[severity]}.\n'
+        for severity in verdict_mod.SEVERITIES
+    )
+    route_lines = "".join(
+        f'  "{route.value}": {_ROUTE_MEANINGS[route]}.\n' for route in verdict_mod.Route
+    )
+    return (
+        "Respond with STRICT JSON ONLY (no prose, no markdown fences), for a "
+        "verified and a refuted claim alike, exactly this shape: "
+        '{"verified": true|false, "reason": "...", '
+        '"anchor": "path/to/file.py::symbol | path/to/file | slug:<kebab>", '
+        '"tags": ["h<n>", ...], '
+        '"severity": ' + severities + ', "severity_reason": "...", '
+        '"route": ' + routes + ", "
+        '"remediation": {"path": "<path relative to ' + project_root + '>", '
+        '"change": "<one sentence>"} | null}.\n\n'
+        "anchor: relative to " + project_root + "; the enclosing top-level or "
+        "class-level definition, else the file, else slug:<kebab> for a non-code "
+        "subject (a prompt, a contract, an operating practice).\n"
+        "tags: h1..h14 for the heuristics of the definition above the finding "
+        "rests on, by number, the heuristic it most rests on FIRST; comments or "
+        "tests for its two stances; inv-<id> for an invariant of this tree's "
+        "docs/legibility/design-invariants.md.\n"
+        "severity: never critical, which is reserved for operational breakage.\n"
+        + severity_lines
+        + "route:\n"
+        + route_lines
+    )
+
+
+def _verify_prompt(cluster: dict, *, project_root: str, quality_block: str) -> str:
     """Prompt for the real Sonnet verify_fn: confirm-or-refute one novel
-    cluster against *project_root*'s current main via targeted file reads.
+    cluster against *project_root*'s current main via targeted file reads,
+    judged against *quality_block* (``code_quality.guidance``).
 
     The CLI subprocess this prompt is delivered to runs with its cwd set to
     *project_root* (``census_stage_specs`` binds it). That is load-bearing
@@ -3192,17 +3255,26 @@ def _verify_prompt(cluster: dict, *, project_root: str) -> str:
         "in this tree (never the tree root itself) produces, teaches, or fails to guard against the "
         "confusion; otherwise null -- including when the cause lies in "
         "tooling this tree does not contain.\n\n"
-        "Respond with STRICT JSON ONLY (no prose, no markdown fences), "
-        'exactly this shape: {"verified": true|false, "reason": "...", '
-        '"remediation": {"path": "<path relative to ' + str(project_root) + '>", '
-        '"change": "<one sentence>"} | null}.\n\n'
-        "=== CLUSTER ===\n" + json.dumps(cluster)
+        "Judge the cost the confusion imposes on the next change against the "
+        "quality definition below.\n\n"
+        + _QUALITY_DEFINITION_MARKER + quality_block
+        + "\n=== RESPONSE ===\n" + _verdict_response_shape(str(project_root))
+        + "\n=== CLUSTER ===\n" + json.dumps(cluster)
     )
 
 
-def _synthesis_prompt(verified: list) -> str:
+def _verdict_as_json(value):
+    """``json.dumps`` hook rendering a cluster's Verdict as its record."""
+    if isinstance(value, verdict_mod.Verdict):
+        return value.to_record()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _synthesis_prompt(verified: list, *, quality_block: str) -> str:
     """Prompt for the real Fable synthesize_fn: cluster + write prose for
-    the dated census report from the VERIFIED findings only."""
+    the dated census report from the VERIFIED findings only, citing the
+    heuristics of *quality_block* (``code_quality.guidance``) each finding's
+    verdict tags."""
     return (
         "You are the periodic-census synthesis writer for the dark-factory "
         "agent-confusion codebook (plans/confusion-reduction-prd.md "
@@ -3210,7 +3282,11 @@ def _synthesis_prompt(verified: list) -> str:
         "write clear, factual prose for a dated census report -- "
         "observations only, never a diagnosis that was not itself "
         "verified.\n\n"
-        "=== VERIFIED CLUSTERS ===\n" + json.dumps(verified)
+        "Each cluster's verdict tags name the heuristics of the quality "
+        "definition below that its finding rests on; cite those heuristics "
+        "by name where the prose discusses the finding.\n\n"
+        + _QUALITY_DEFINITION_MARKER + quality_block
+        + "\n=== VERIFIED CLUSTERS ===\n" + json.dumps(verified, default=_verdict_as_json)
     )
 
 
@@ -3353,6 +3429,8 @@ def _build_default_verify_fn(
       invocation error -- a deferral, not an exception escaping into
       ``main()``'s exit-1 path after the whole mining spend.
     """
+    quality_block = code_quality.guidance()
+
     def _verify_fn(clusters, *, model):
         verified, rejected = [], []
         # Every probe THIS verifier spends, reported back in the result dict
@@ -3399,7 +3477,9 @@ def _build_default_verify_fn(
             # reason -- together with `verified` the three always sum to the
             # clusters offered (see CensusHeadroomExhausted's INVARIANT).
             remaining = len(clusters) - index
-            prompt = _verify_prompt(cluster, project_root=project_root)
+            prompt = _verify_prompt(
+                cluster, project_root=project_root, quality_block=quality_block,
+            )
             try:
                 raw = invoke(prompt, model)
             except Exception as exc:  # noqa: BLE001 - an unverifiable claim rejects, never crashes
@@ -3511,10 +3591,12 @@ def _build_default_synthesize_fn(invoke):
     Fable call via *invoke* clustering + writing prose for the verified
     findings. An empty *verified* list is handled without a model call --
     there is nothing to synthesize."""
+    quality_block = code_quality.guidance()
+
     def _synthesize_fn(verified, *, model):
         if not verified:
             return "No novel, verified confusion clusters this census."
-        return invoke(_synthesis_prompt(verified), model)
+        return invoke(_synthesis_prompt(verified, quality_block=quality_block), model)
 
     return _synthesize_fn
 
