@@ -8,6 +8,7 @@ existed when it was written, its band re-decided by the shipped
 from __future__ import annotations
 
 import copy
+import dataclasses
 import functools
 import types
 from pathlib import Path
@@ -173,3 +174,115 @@ class TestTheWriteTimeSlate:
             _candidate('looks-late', 0.70, '2026-10-01T03:00:00+02:00'),
         ], created_at='2026-10-01T02:00:00+00:00')
         assert _ids(_write_time(write)) == ['looks-late']
+
+
+# ---------------------------------------------------------------------------
+# The run set
+# ---------------------------------------------------------------------------
+
+SNAPSHOT_SHA = 'a' * 64
+#: How many writes of the judge-band order a sampled run draws.
+SAMPLE = 5
+
+
+def _judge_band_write(memory_id: str) -> dict:
+    return _write(
+        [_candidate('a', 0.70, BEFORE), _candidate('b', 0.60, BEFORE)], memory_id=memory_id,
+    )
+
+
+def _leaver(memory_id: str) -> dict:
+    """In the judge band only because of a record created after it."""
+    return _write(
+        [_candidate('late', 0.80, AFTER), _candidate('a', 0.40, BEFORE)], memory_id=memory_id,
+    )
+
+
+def _snapshot(leavers: frozenset[str] = frozenset()) -> dict:
+    """Eight judge-band writes (*leavers* among them), one restated and one stored."""
+    writes = [
+        _leaver(m) if m in leavers else _judge_band_write(m)
+        for m in (f'w{i:02d}' for i in range(8))
+    ]
+    writes += [
+        # Restated only because of a later record: the judge band under the filter.
+        _write(
+            [_candidate('late', 0.95, AFTER), _candidate('a', 0.70, BEFORE)],
+            memory_id='det', band='restated',
+        ),
+        _write([_candidate('a', 0.40, BEFORE)], memory_id='low', band='stored'),
+    ]
+    return {'t_high': T_HIGH, 't_low': T_LOW, 'candidate_k': 20, 'writes': writes}
+
+
+def _order(snapshot: dict) -> list[str]:
+    return [w['memory_id'] for w in _mod().judge_band_order(snapshot, SNAPSHOT_SHA)]
+
+
+def _with_leavers() -> tuple[dict, tuple[str, ...]]:
+    """The snapshot with the 2nd and 4th writes of the order leaving the band."""
+    order = _order(_snapshot())
+    leavers = (order[1], order[3])
+    return _snapshot(frozenset(leavers)), leavers
+
+
+def _draw(snapshot: dict, slates: Any, max_writes: int | None = SAMPLE) -> Any:
+    return _mod().draw_run_set(snapshot, SNAPSHOT_SHA, max_writes=max_writes, slates=slates)
+
+
+def _by_id(snapshot: dict) -> dict[str, dict]:
+    return {w['memory_id']: w for w in snapshot['writes']}
+
+
+class TestTheRunSet:
+    def test_frozen_is_the_order_prefix_each_write_stamped_frozen(self) -> None:
+        snapshot, _ = _with_leavers()
+        run_set = _draw(snapshot, _mod().Slates.FROZEN)
+        frozen = _by_id(snapshot)
+        assert [w['memory_id'] for w in run_set.writes] == _order(snapshot)[:SAMPLE]
+        for write in run_set.writes:
+            assert write == {**frozen[write['memory_id']], 'slates': 'frozen'}
+        assert (run_set.slates, run_set.sample_size, run_set.left_judge_band) == (
+            'frozen', SAMPLE, (),
+        )
+
+    def test_a_run_set_is_immutable(self) -> None:
+        run_set = _draw(_snapshot(), _mod().Slates.FROZEN)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            run_set.sample_size = 7  # type: ignore[misc]
+
+    def test_write_time_is_the_same_prefix_less_the_writes_that_left_the_band(self) -> None:
+        snapshot, leavers = _with_leavers()
+        run_set = _draw(snapshot, _mod().Slates.WRITE_TIME)
+        frozen = _by_id(snapshot)
+        sample = _order(snapshot)[:SAMPLE]
+        assert [w['memory_id'] for w in run_set.writes] == [m for m in sample if m not in leavers]
+        for write in run_set.writes:
+            assert write == _mod().write_time_slate(
+                frozen[write['memory_id']], t_high=T_HIGH, t_low=T_LOW,
+            )
+        assert run_set.left_judge_band == leavers
+        assert (run_set.slates, run_set.sample_size) == ('write-time', SAMPLE)
+        assert len(run_set.writes) + len(run_set.left_judge_band) == SAMPLE
+
+    def test_a_write_that_left_the_band_is_never_back_filled(self) -> None:
+        snapshot, _ = _with_leavers()
+        run_set = _draw(snapshot, _mod().Slates.WRITE_TIME)
+        assert _order(snapshot)[SAMPLE] not in {w['memory_id'] for w in run_set.writes}
+
+    @pytest.mark.parametrize('max_writes', [SAMPLE, None])
+    def test_a_frozen_restated_write_the_filter_would_judge_is_not_drawn(
+        self, max_writes: int | None,
+    ) -> None:
+        snapshot, _ = _with_leavers()
+        assert _mod().write_time_slate(
+            _by_id(snapshot)['det'], t_high=T_HIGH, t_low=T_LOW,
+        )['band'] == 'judge'
+        run_set = _draw(snapshot, _mod().Slates.WRITE_TIME, max_writes=max_writes)
+        assert 'det' not in {w['memory_id'] for w in run_set.writes}
+
+    def test_no_limit_draws_the_whole_frozen_judge_band(self) -> None:
+        snapshot, leavers = _with_leavers()
+        run_set = _draw(snapshot, _mod().Slates.WRITE_TIME, max_writes=None)
+        assert run_set.sample_size == 8
+        assert len(run_set.writes) == 8 - len(leavers)
