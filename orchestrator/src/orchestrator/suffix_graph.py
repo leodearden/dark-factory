@@ -204,6 +204,39 @@ class SuffixConflictTracker:
         self.signature: tuple[tuple[str, ...], str] | None = None
         self.last_known_main_sha: str | None = None
         self.bounce_registry: MergeBounceRegistry = MergeBounceRegistry()
+        self._escalations_issued: int = 0
+
+    def _escalate(self, req: MergeRequest, detail: str) -> int:
+        """Divert *req* out of its lane and resolve it blocked; return the ordinal.
+
+        The outcome rides workflow.py's ordinary blocked path, whose
+        ``consecutive_merge_thrash`` ladder means "the SAME mechanical merge
+        failure repeated".  With both structured fields empty its signature is
+        the hash of this reason
+        (``shared/src/shared/task_metadata.py::RetryLedger.compute_merge_outcome_signature``),
+        so the reason must never be invariant across escalations.  The
+        per-branch bounce count cannot vary it (cleared here); the ordinal does,
+        as in the lane cap-out (``merge_lane/worker.py::SpeculativeMergeWorker``,
+        ``_contended_lease_cap_outs``).  Never set ``failure_category``: a
+        constant would collapse every bounce onto one signature.  Guard:
+        ``orchestrator/tests/test_merge_queue_bounce.py::TestBounceEscalationsNeverFeedTheThrashLadder``.
+        """
+        _, _, NEEDS_REBASE_REASON_PREFIX = _merge_queue_constants()
+        self._escalations_issued += 1
+        ordinal = self._escalations_issued
+        branch = req.branch.bare_id
+        self._lane_buffers()[req.lane].remove(req)
+        self.bounce_registry.clear(branch)  # fresh slate on resubmission
+        outcome = MergeOutcome(
+            status='blocked',
+            reason=(
+                f'{NEEDS_REBASE_REASON_PREFIX}: branch {branch!r} {detail} '
+                f'(bounce escalation #{ordinal})'
+            ),
+        )
+        if not req.result.done():
+            req.result.set_result(outcome)
+        return ordinal
 
     async def recompute(self) -> None:
         """Recompute and store the conflict-graph over the unfrozen suffix (task δ=1889).
@@ -607,22 +640,14 @@ class SuffixConflictTracker:
                 # A branch clean vs bare main can thus be escalated for a
                 # collision with an item that never lands.  Accepted: the steward
                 # resolves it; if the frozen item fails, the branch requeues.
-                self._lane_buffers()[req.lane].remove(req)
-                self.bounce_registry.clear(branch)  # fresh slate on resubmission
-                outcome = MergeOutcome(
-                    status='blocked',
-                    reason=(
-                        f'{NEEDS_REBASE_REASON_PREFIX}: branch {branch!r} '
-                        f'has a real rebase conflict onto frozen tip {frozen_tip!r}'
-                    ),
+                ordinal = self._escalate(
+                    req, f'has a real rebase conflict onto frozen tip {frozen_tip!r}',
                 )
                 logger.warning(
                     '_bounce_conflicting_suffix_items: rebase conflict task_id=%s '
-                    'branch=%s onto=%s; escalating',
-                    req.task_id, branch, frozen_tip,
+                    'branch=%s onto=%s escalation=#%d; escalating',
+                    req.task_id, branch, frozen_tip, ordinal,
                 )
-                if not req.result.done():
-                    req.result.set_result(outcome)
 
         if _any_bounced:
             # Invalidate the debounce signature so the next recompute re-probes
