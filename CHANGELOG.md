@@ -549,7 +549,9 @@ keeps the park.
 - **A released pin head** completes the fairness parks its skips earned only while it
   is still a dispatch candidate that tick, so a blocked or deferred head drops its whole
   footprint instead of re-parking it.
-- Dispatch is unchanged: it still treats an unknown dependency as not satisfied.
+- Dispatch is unchanged: it still treats an unknown dependency as not satisfied. Dispatch
+  and park GC read one tri-state dependency predicate,
+  `orchestrator/src/orchestrator/dependency_verdict.py::deps_verdict`.
 
 **Operator-visible signal.** `reservation_expired` rows with the new reasons in
 `runs.db`, and no fairness `reservation_installed` for a non-pending owner. The design
