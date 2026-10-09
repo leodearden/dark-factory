@@ -7,7 +7,8 @@ actually runs: in the environment the fixture leaves for each test.
 
 One knob is masked inside that binding: ``verify_use_cgroup_scope`` reaches out
 of the test sandbox into the operator's systemd user manager, so no test may
-take it from the yaml.
+take it from the yaml. The one test whose subject is its deployed value lifts
+the mask explicitly.
 """
 
 import os
@@ -16,6 +17,7 @@ from pathlib import Path
 from orchestrator.config import OrchestratorConfig
 
 OPERATIONAL_CONFIG = Path(__file__).resolve().parents[2] / 'dark-factory-orchestrator.yaml'
+OPERATIONAL_VERIFY_USE_CGROUP_SCOPE = True
 
 
 def test_the_suite_is_bound_to_the_operational_config_file():
@@ -53,4 +55,15 @@ def test_a_bound_test_never_spawns_a_real_verify_scope(monkeypatch, tmp_path):
     assert OrchestratorConfig(verify_use_cgroup_scope=True).verify_use_cgroup_scope is True, (
         'An explicit verify_use_cgroup_scope=True kwarg must still beat the pin: '
         'test_verify_scope_cpu_weight.py opts into scopes that way.'
+    )
+
+
+def test_the_operational_config_runs_verifies_in_cgroup_scopes(monkeypatch):
+    monkeypatch.delenv('ORCH_VERIFY_USE_CGROUP_SCOPE', raising=False)
+
+    assert OrchestratorConfig().verify_use_cgroup_scope is OPERATIONAL_VERIFY_USE_CGROUP_SCOPE, (
+        f'{OPERATIONAL_CONFIG.name} no longer sets verify_use_cgroup_scope to '
+        f'{OPERATIONAL_VERIFY_USE_CGROUP_SCOPE}. Task 5208 measures dark_factory '
+        'verifies running in weighted cgroup scopes; restore the task 5206 block, '
+        'or move this literal with a deliberate rollback.'
     )
