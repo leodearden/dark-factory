@@ -169,12 +169,10 @@ def wire_clear_claim_then_set_status(scheduler_mock: MagicMock) -> None:
 
 # task 3492/4215: the pyproject-configured default per-test timeout ceiling
 # that every heavy test in this suite must clear.  MIRROR of
-# `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml
-# (currently 420: raised 60 -> 300 -> 540 on 2026-09-12 / 2026-09-17, then
-# re-derived down to 420 by task 5581 once fused-memory's repo-wide scans were
-# marked -- see that setting's comment, shared/pyproject.toml for the canonical
-# rationale, and plans/pytest-per-test-timeout-measurement-2026-09-17.md for
-# the measurement the current value is derived from).  It was a bare
+# `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml -- see
+# that setting's comment, shared/pyproject.toml for the canonical rationale,
+# and plans/pytest-per-test-timeout-measurement-2026-09-17.md for the
+# measurement the value is derived from and its history.  It was a bare
 # literal in
 # test_merge_queue_concurrent_verify.py, whose own comment admitted the
 # defect -- "it is still a literal and CAN drift if that setting changes
@@ -249,9 +247,10 @@ PYPROJECT_DEFAULT_TIMEOUT = 420
 # encodes that independence; it has since been re-anchored, but its role is
 # unchanged.
 #
-# 300 -> 540 on 2026-09-17 (task 5442), when the never-narrow rule below forced
-# it.  Since task 5581 lowered the ini default to 420, 540 clears both the 420
-# floor and the 420 ini default rather than being forced by either.
+# It sits above both the floor and PYPROJECT_DEFAULT_TIMEOUT, and neither binds
+# it: the never-narrow rule below asks only `>=`.  Why it sits above its floor
+# is value history, recorded in
+# plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 #
 # Deliberately NOT taken from HEAVY_BARRIER_TEST_TIMEOUT: that one bounds a
 # different hazard, sized by merge-barrier waits, and an AST sweep performs
