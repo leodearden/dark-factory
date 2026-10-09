@@ -915,6 +915,7 @@ async def run_server():
             event_queue=event_queue,
             backlog_policy=backlog_policy,
             usage_gate=curator_usage_gate,
+            cost_store=curator_cost_store,
             ticket_store=ticket_store,
             bulk_reset_guard=bulk_reset_guard,
             prefix_registry=prefix_registry,
@@ -1003,6 +1004,7 @@ async def run_server():
             taskmaster, None, event_buffer,
             config=config, escalator=curator_escalator,
             usage_gate=curator_usage_gate,
+            cost_store=curator_cost_store,
             ticket_store=ticket_store,
             prefix_registry=prefix_registry,
             scope_violation_escalator=scope_violation_escalator,
@@ -1835,13 +1837,25 @@ def _resolve_curator_escalator_state_path(config: FusedMemoryConfig) -> Path:
     return Path('./data/curator_escalator_state.json')
 
 
+def _mint_curator_run_id() -> str:
+    """A readable per-process curator run id: a fused-memory restart is a run boundary."""
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    return f'fused-memory-{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{os.getpid()}'
+
+
 async def _setup_curator_usage_gate(
     config: FusedMemoryConfig,
+    *,
+    run_id: str | None = None,
 ) -> tuple[CostStore | None, UsageGate | None]:
     """Open a CostStore and construct a UsageGate for the curator, with leak protection.
 
     If ``config.usage_cap`` is None or disabled, returns ``(None, None)``
     without allocating any resources.
+
+    The gate is stamped with *run_id* (minted per process when omitted), the
+    run key the gate's account events and the curator's invocations share.
 
     Otherwise the CostStore is opened first (persistent aiosqlite connection).
     If ``UsageGate.__init__`` or the success-path log subsequently raises for
@@ -1874,6 +1888,7 @@ async def _setup_curator_usage_gate(
     curator_usage_gate: UsageGate | None = None
     try:
         curator_usage_gate = UsageGate(config.usage_cap, cost_store=curator_cost_store)
+        curator_usage_gate.run_id = run_id or _mint_curator_run_id()
         logger.info(
             f'  Curator usage gate: {curator_usage_gate.account_count} account(s) '
             f'from {config.usage_cap.accounts_file or "inline"}',

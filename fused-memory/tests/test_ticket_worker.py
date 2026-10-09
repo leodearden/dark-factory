@@ -2333,12 +2333,19 @@ class TestCreatePathReasonPersisted:
         assert healthy['ticket_id'] not in swept
 
 
+def _config_without_curator_startup_tasks() -> FusedMemoryConfig:
+    """No taskmaster project_root, so ``_get_curator`` schedules no backfill or self-check."""
+    config = FusedMemoryConfig()
+    config.taskmaster = None
+    return config
+
+
 @pytest_asyncio.fixture
 async def configured_interceptor(taskmaster, event_buffer, ticket_store):
     """An interceptor whose curator is built for real by ``_get_curator``."""
     ti = TaskInterceptor(
         taskmaster, None, event_buffer,
-        config=FusedMemoryConfig(), ticket_store=ticket_store,
+        config=_config_without_curator_startup_tasks(), ticket_store=ticket_store,
     )
     yield ti
     for t in list(ti._worker_tasks.values()):
@@ -2397,7 +2404,7 @@ class TestCuratorUnavailableReasonPersisted:
         from fused_memory.middleware.task_curator import CandidateTask
 
         interceptor = TaskInterceptor(
-            taskmaster, None, event_buffer, config=FusedMemoryConfig(),
+            taskmaster, None, event_buffer, config=_config_without_curator_startup_tasks(),
         )
         await interceptor.close()
 

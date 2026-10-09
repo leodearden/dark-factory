@@ -130,6 +130,7 @@ from fused_memory.reconciliation.stale_gate_citation_guard import (
 )
 
 if TYPE_CHECKING:
+    from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
 
     from fused_memory.config.schema import FusedMemoryConfig
@@ -474,6 +475,7 @@ class TaskInterceptor:
         event_queue: 'EventQueue | None' = None,
         backlog_policy: 'BacklogPolicy | None' = None,
         usage_gate: 'UsageGate | None' = None,
+        cost_store: 'CostStore | None' = None,
         ticket_store: 'TicketStore | None' = None,
         bulk_reset_guard: 'BulkResetGuard | None' = None,
         prefix_registry: ProjectPrefixRegistry | None = None,
@@ -513,6 +515,9 @@ class TaskInterceptor:
         # shared account pool. ``None`` falls back to the legacy single-shot
         # path with no cap retry — preserved for tests.
         self._usage_gate = usage_gate
+        # BORROWED from main.py, which owns its close; forwarded to TaskCurator
+        # so every curator CLI call lands a row in its invocations ledger.
+        self._cost_store = cost_store
         # Split per-project locks (2026-04-20; updated 2026-04-22 for ticket queue):
         #
         # ``_write_locks`` (short, high-frequency) serialises tasks.json
@@ -1943,6 +1948,7 @@ class TaskInterceptor:
                 cwd=cwd,
                 escalator=self._escalator,
                 usage_gate=self._usage_gate,
+                cost_store=self._cost_store,
             )
             self._curator_construction_error = None
             # Trigger the one-shot backfill check as a background task so the

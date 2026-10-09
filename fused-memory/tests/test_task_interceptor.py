@@ -6680,6 +6680,13 @@ async def test_get_curator_schedules_startup_self_check(
 # ── Curator invocations ledger wiring (task 4718) ──────────────────────────
 
 
+def _config_without_curator_startup_tasks() -> FusedMemoryConfig:
+    """No taskmaster project_root, so ``_get_curator`` schedules no backfill or self-check."""
+    config = FusedMemoryConfig()
+    config.taskmaster = None
+    return config
+
+
 @pytest.mark.asyncio
 async def test_get_curator_forwards_the_borrowed_cost_store(
     taskmaster, reconciler, event_buffer,
@@ -6688,7 +6695,7 @@ async def test_get_curator_forwards_the_borrowed_cost_store(
     store = MagicMock()
     interceptor = TaskInterceptor(
         taskmaster, reconciler, event_buffer,
-        config=FusedMemoryConfig(), usage_gate=gate, cost_store=store,
+        config=_config_without_curator_startup_tasks(), usage_gate=gate, cost_store=store,
     )
 
     with patch('fused_memory.middleware.task_interceptor.TaskCurator') as curator_cls:
@@ -6704,7 +6711,7 @@ async def test_get_curator_forwards_no_cost_store_by_default(
     taskmaster, reconciler, event_buffer,
 ):
     interceptor = TaskInterceptor(
-        taskmaster, reconciler, event_buffer, config=FusedMemoryConfig(),
+        taskmaster, reconciler, event_buffer, config=_config_without_curator_startup_tasks(),
     )
 
     with patch('fused_memory.middleware.task_interceptor.TaskCurator') as curator_cls:
