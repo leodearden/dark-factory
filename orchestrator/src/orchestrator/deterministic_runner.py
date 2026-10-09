@@ -375,6 +375,7 @@ from shared.task_metadata import (
 )
 
 from orchestrator import systemd_inspect
+from orchestrator.before_done_paths import BeforeDonePaths, resolve_before_done_paths
 from orchestrator.deploy_state import (
     DeployPhase,
     DeployState,
@@ -840,24 +841,23 @@ RECURRENCE_KEY: str = 'recurrence'
 _PROJECT_ROOT_PLACEHOLDER: str = '<project_root>'
 
 
-def _snippet_project_root(scheduler) -> str:
-    """Return the configured project_root for the operator runbook snippet.
+def _configured_project_root(scheduler) -> Path | None:
+    """Return the scheduler's configured project_root, or None if unusable.
 
-    Falls back to a VISIBLE placeholder rather than raising or interpolating a
-    repr.  ``scheduler`` is duck-typed here — ``Harness._run_deterministic_slot``
-    builds the runner "with only the minimal dependencies needed" — and
-    ``_file_curator_adjudication_missing_and_block``'s contract is that a
-    durable on-disk safety escalation is filed no matter what.  The attribute
-    chain is read while formatting the detail string, i.e. BEFORE
-    ``escalation_queue.submit()``, so an ``AttributeError`` there does not just
-    skip the BLOCK — it loses the escalation entirely and propagates, exactly
-    what that method's docstring forbids.
+    ``scheduler`` is duck-typed here — ``Harness._run_deterministic_slot``
+    builds the runner "with only the minimal dependencies needed" — so the
+    attribute chain must never raise.  That matters most to
+    ``_file_curator_adjudication_missing_and_block``, whose contract is that a
+    durable on-disk safety escalation is filed no matter what: the chain is
+    read while formatting the detail string, i.e. BEFORE
+    ``escalation_queue.submit()``, so an ``AttributeError`` there would not
+    just skip the BLOCK — it would lose the escalation entirely and propagate.
 
     Accepts the value ONLY when it is a non-empty ``str``/``Path`` that is not
-    the literal ``'None'``, so a test double's Mock attribute cannot reach an
-    operator as ``<MagicMock id=...>``.  The ``'None'`` rejection mirrors the
-    scheduler's own project_root guard, which defends against a value that
-    bypassed pydantic validation.
+    the literal ``'None'``, so a test double's Mock attribute reaches neither
+    an operator (as ``<MagicMock id=...>``) nor a filesystem path.  The
+    ``'None'`` rejection mirrors the scheduler's own project_root guard, which defends
+    against a value that bypassed pydantic validation.
 
     Deliberately no broad ``except Exception``: the two ``getattr`` defaults
     plus the isinstance/non-empty check are the entire failure surface.
@@ -866,8 +866,14 @@ def _snippet_project_root(scheduler) -> str:
     if isinstance(root, (str, Path)):
         text = str(root).strip()
         if text and text != 'None':
-            return text
-    return _PROJECT_ROOT_PLACEHOLDER
+            return Path(text)
+    return None
+
+
+def _snippet_project_root(scheduler) -> str:
+    """The configured project_root for the runbook snippet, else a visible placeholder."""
+    root = _configured_project_root(scheduler)
+    return str(root) if root is not None else _PROJECT_ROOT_PLACEHOLDER
 
 # Length bound applied to the externally-supplied `human_curator_adjudicated_at`
 # value when it is interpolated into the curator-gate `done_provenance.note`.
@@ -1383,6 +1389,17 @@ class DeterministicRunner:
         """
         return os.environ.get('ORCH_UNIT', '')
 
+    def _before_done_paths(self, before_done: dict) -> BeforeDonePaths:
+        root = _configured_project_root(self.scheduler)
+        if root is None:
+            root = Path.cwd()
+            logger.warning(
+                'DeterministicRunner: scheduler carries no configured project_root — '
+                'resolving before_done paths against the process cwd %s',
+                root,
+            )
+        return resolve_before_done_paths(before_done, root.resolve())
+
     async def _default_schedule_detached_restart(
         self,
         before_done: dict,
@@ -1441,20 +1458,9 @@ class DeterministicRunner:
             fails (tail carries the error detail).
         """
         target_unit = before_done.get('target_unit', 'unknown')
-        script = before_done['script']
         args = before_done.get('args') or []
-
-        # The transient unit runs under the systemd --user manager, which does
-        # NOT inherit the orchestrator's own working directory — it defaults to
-        # $HOME.  A relative deploy `script` would therefore fail to be found
-        # (exit 127) once the unit fires.  Resolve an explicit cwd from
-        # before_done['cwd'] when the caller supplied one; otherwise fall back
-        # to this process's own os.getcwd(), which is project_root because the
-        # orchestrator's own systemd unit pins WorkingDirectory=project_root.
-        # RestartPlan.__post_init__ absolutizes a relative `script` against
-        # this `cwd` (RP-3), byte-identical to this method's prior inline
-        # absolutization.
-        cwd = before_done.get('cwd') or os.getcwd()
+        # docs/task-authoring.md §5: paths resolve against the configured project_root (before_done_paths.py)
+        paths = self._before_done_paths(before_done)
 
         esc_summary = summary or (
             f'Self-restart fire-time failure: {target_unit}'
@@ -1533,9 +1539,9 @@ class DeterministicRunner:
         )
 
         plan = RestartPlan(
-            script=Path(script),
+            script=paths.script,
             args=list(args),
-            cwd=Path(cwd),
+            cwd=paths.cwd,
             target_unit=transient_unit,
             own_unit=transient_unit,
             on_failure_escalation=escalation_spec,
@@ -1673,18 +1679,17 @@ class DeterministicRunner:
                 script's OWN exit code when the teardown found the direct child
                 already exited.
         """
-        script = before_done['script']
+        paths = self._before_done_paths(before_done)
         args = before_done.get('args') or []
         # Merge over os.environ so the child sees a full environment (PATH, HOME,
         # XDG_RUNTIME_DIR …).  An empty / absent env dict means full inherit.
         env = {**os.environ, **before_done['env']} if before_done.get('env') else None
-        cwd = before_done.get('cwd') or None
         timeout_secs = before_done.get('timeout_secs', 60)
 
         proc = await asyncio.create_subprocess_exec(
-            script, *args,
+            str(paths.script), *args,
             env=env,
-            cwd=cwd,
+            cwd=paths.cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
@@ -4347,10 +4352,11 @@ class DeterministicRunner:
                     baseline_main_pid=baseline.get('MainPID', 0),
                     inspect_timeout_secs=self._inspect_timeout_secs,
                 )
+                paths = self._before_done_paths(before_done)
                 plan = RestartPlan(
-                    script=Path(before_done['script']),
+                    script=paths.script,
                     args=list(before_done.get('args') or []),
-                    cwd=Path(before_done.get('cwd') or os.getcwd()).resolve(),
+                    cwd=paths.cwd,
                     target_unit=target_unit,
                     # own_unit must be truthy and provably non-self here (this
                     # branch is only reached when the runner's OWN self_target
