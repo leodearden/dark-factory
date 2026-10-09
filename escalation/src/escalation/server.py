@@ -57,6 +57,7 @@ from escalation.merge_status_answer import (
     LastOutcome,
     MergeStatusAnswer,
     MergeStatusSource,
+    hint_for,
     map_terminal_state,
 )
 from escalation.models import (
@@ -5130,12 +5131,14 @@ def create_server(
             reason    (str|None) — None on success; non-None string on every other path.
 
         Branch order (all paths return — never raises):
-          1. Waiter absent from _waiters (finalized+popped, never submitted, or server
-             restarted): consult merge_status's current-run event-store tier to
-             distinguish 'already-terminal' from truly 'unknown'.  Note: coalesced submissions
-             (in_flight / attached paths in merge_request) do not register a separate
-             waiter — callers holding a coalesced id will resolve to 'unknown' here;
-             use the in-flight request_id (inflight_task_id / merge_status) to cancel.
+          1. Waiter absent from _waiters (finalized+popped, never submitted, server
+             restarted, or a coalesced id): resolve the request_id through merge_status's
+             durable walk (current run → journal → prior runs → no_record; git needs a
+             branch, so it is skipped).  A current-run outcome returns that state with
+             'Request already finalized; cannot cancel.'; an epistemic answer returns its
+             state with the reason's hint.  Coalesced submissions (in_flight / attached
+             paths in merge_request) do not register a separate waiter — use the
+             in-flight request_id (inflight_task_id / merge_status) to cancel.
           2. Waiter present, future already cancelled (idempotent double-cancel):
              {cancelled: False, state: 'abandoned', reason: ...}.
           3. Waiter present, future resolved-but-not-cancelled (mid-finalize window, i.e.
@@ -5166,29 +5169,26 @@ def create_server(
 
         The tool is async so that future mutation runs on the event loop (not a FastMCP
         threadpool worker — PRD Open Q4 off-loop lesson).  The lookup → cancel sequence
-        contains no await, preserving loop-synchronous race-freedom (I10) — the only
-        awaits are AFTER cancel, inside retirement.
+        contains no await, preserving loop-synchronous race-freedom (I10) — on the
+        waiter-present paths the only awaits are AFTER cancel, inside retirement.
         """
         rec = _waiters.get(request_id)
 
         if rec is None:
-            # No live waiter — finalized+popped, never submitted, or server restarted.
-            current = _current_run_answer(_PollKey(request_id=request_id))
-            if current is not None:
+            key = _PollKey(request_id=request_id)
+            answer = await _resolve_durable(key, _durable_history(key))
+            if answer.reason is None:
                 return {
                     'cancelled': False,
-                    'state': current.state,
+                    'state': answer.state,
                     'reason': 'Request already finalized; cannot cancel.',
                 }
             return {
                 'cancelled': False,
-                'state': MergeState.unknown,
+                'state': answer.state,
                 'reason': (
-                    f'No in-flight waiter for request_id {request_id!r} '
-                    '(already finalized, never submitted, server restarted, or this id '
-                    'was coalesced onto an in-flight request — coalesced requests share '
-                    "the in-flight entry's request_id and do not register a separate "
-                    'waiter; use the in-flight request_id to cancel).'
+                    f'No in-flight waiter for request_id {request_id!r}: '
+                    + hint_for(answer.reason)
                 ),
             }
 
