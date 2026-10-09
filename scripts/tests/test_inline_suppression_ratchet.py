@@ -46,6 +46,7 @@ import sys
 from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 import inline_suppressions
 import pytest
@@ -145,10 +146,18 @@ def _write_fixture_tree(
     return baseline_path
 
 
-def _check(root: Path, baseline_path: Path, *paths: str) -> int:
-    """Run ``--check`` over *root*, optionally scoped to *paths*."""
+def _check(
+    root: Path,
+    baseline_path: Path,
+    *paths: str,
+    classes: Mapping[inline_suppressions.SuppressionClass, Policy] = (
+        inline_suppressions.RATIFIED_SUPPRESSION_CLASSES
+    ),
+) -> int:
+    """Run ``--check`` over *root* against *classes*, optionally scoped to *paths*."""
     return inline_suppressions.main(
-        ['--check', '--root', str(root), '--baseline', str(baseline_path), *paths]
+        ['--check', '--root', str(root), '--baseline', str(baseline_path), *paths],
+        classes=classes,
     )
 
 
@@ -1107,11 +1116,18 @@ def test_the_first_party_table_matches_the_codes_that_checker_actually_emits(tmp
 # Layer 3 — classification: owned, ratified by class, or unowned.
 
 
-def _classify(tmp_path: Path, files: Mapping[str, str]):
-    """Scan and classify a fixture tree in one step."""
+def _classify(
+    tmp_path: Path,
+    files: Mapping[str, str],
+    *,
+    classes: Mapping[inline_suppressions.SuppressionClass, Policy] = MappingProxyType({}),
+):
+    """Scan and classify a fixture tree against *classes* in one step."""
     _write_fixture_tree(tmp_path, files)
     scan = inline_suppressions.scan_tree(tmp_path)
-    return inline_suppressions.classify(scan, inline_suppressions.ConsumerModel(tmp_path))
+    return inline_suppressions.classify(
+        scan, inline_suppressions.ConsumerModel(tmp_path), classes=classes
+    )
 
 
 def test_the_shipped_class_table_is_empty(tmp_path: Path):
@@ -1216,7 +1232,7 @@ def test_a_disposition_on_a_line_with_no_suppression_is_a_violation(tmp_path: Pa
     assert result.counts == {}
 
 
-def test_a_site_matching_a_ratified_class_is_policy_by_reference(tmp_path: Path, monkeypatch):
+def test_a_site_matching_a_ratified_class_is_policy_by_reference(tmp_path: Path):
     """BOUNDARY SCENARIO 10 — outside the unowned multiset, and COUNTED under
     its class so blanket policy stays visible in the report."""
     row = inline_suppressions.SuppressionClass(
@@ -1224,12 +1240,11 @@ def test_a_site_matching_a_ratified_class_is_policy_by_reference(tmp_path: Path,
         code='E402',
         scope=inline_suppressions.Scope.ANY,
     )
-    monkeypatch.setattr(
-        inline_suppressions, 'RATIFIED_SUPPRESSION_CLASSES', {row: Policy('inv12-day-one')}
-    )
 
     result = _classify(
-        tmp_path, {'pyproject.toml': _RUFF_CONFIG, 'm.py': 'a = 1  # noqa: E402\n'}
+        tmp_path,
+        {'pyproject.toml': _RUFF_CONFIG, 'm.py': 'a = 1  # noqa: E402\n'},
+        classes={row: Policy('inv12-day-one')},
     )
 
     (entry,) = result.classified
@@ -1238,7 +1253,7 @@ def test_a_site_matching_a_ratified_class_is_policy_by_reference(tmp_path: Path,
     assert result.counts == {}
 
 
-def test_class_scope_matches_src_tests_or_any(tmp_path: Path, monkeypatch):
+def test_class_scope_matches_src_tests_or_any(tmp_path: Path):
     """A path is ``tests`` iff one of its COMPONENTS is ``tests``.
 
     Verified complete for this repository: every tracked test module lives
@@ -1259,12 +1274,9 @@ def test_class_scope_matches_src_tests_or_any(tmp_path: Path, monkeypatch):
         row = inline_suppressions.SuppressionClass(
             kind=inline_suppressions.Kind.NOQA, code='E402', scope=scope
         )
-        monkeypatch.setattr(
-            inline_suppressions, 'RATIFIED_SUPPRESSION_CLASSES', {row: Policy('inv12-day-one')}
-        )
         tree = tmp_path / scope.value
         tree.mkdir()
-        result = _classify(tree, files)
+        result = _classify(tree, files, classes={row: Policy('inv12-day-one')})
 
         covered = {
             entry.site.path
@@ -1415,7 +1427,15 @@ def test_a_clean_whole_tree_run_labels_its_green_clean(tmp_path: Path, capsys):
     assert 'partial' not in report
 
 
-def _dead_marker_violation(tmp_path: Path, capsys, source: str) -> str:
+def _dead_marker_violation(
+    tmp_path: Path,
+    capsys,
+    source: str,
+    *,
+    classes: Mapping[inline_suppressions.SuppressionClass, Policy] = (
+        inline_suppressions.RATIFIED_SUPPRESSION_CLASSES
+    ),
+) -> str:
     """Seed a marker-free tree, add *source*, and return its one violation line."""
     baseline = _write_fixture_tree(
         tmp_path, {'pyproject.toml': _RUFF_CONFIG, 'm.py': 'a = 1\n'}, baseline=True
@@ -1423,7 +1443,7 @@ def _dead_marker_violation(tmp_path: Path, capsys, source: str) -> str:
     _revise(tmp_path, {'m.py': source})
     capsys.readouterr()
 
-    assert _check(tmp_path, baseline) == 1
+    assert _check(tmp_path, baseline, classes=classes) == 1
 
     (violation,) = capsys.readouterr().err.strip().splitlines()
     return violation
@@ -1479,9 +1499,7 @@ def test_a_disposition_does_not_rescue_a_marker_no_tool_reads(
     assert 'no tool reads it' in violation
 
 
-def test_a_ratified_class_does_not_rescue_a_marker_no_tool_reads(
-    tmp_path: Path, capsys, monkeypatch
-):
+def test_a_ratified_class_does_not_rescue_a_marker_no_tool_reads(tmp_path: Path, capsys):
     """BOUNDARY SCENARIO 9 against D9's valve, which is the other thing that
     could plausibly rescue a site and equally does not.
 
@@ -1489,19 +1507,15 @@ def test_a_ratified_class_does_not_rescue_a_marker_no_tool_reads(
     marker nothing reads would ratify a no-op, so the consumer check running
     first makes the row inert rather than making it a widening.
     """
-    monkeypatch.setattr(
-        inline_suppressions,
-        'RATIFIED_SUPPRESSION_CLASSES',
-        {
-            inline_suppressions.SuppressionClass(
-                kind=inline_suppressions.Kind.NOQA,
-                code='PLC0415',
-                scope=inline_suppressions.Scope.ANY,
-            ): Policy('inv12-day-one')
-        },
+    row = inline_suppressions.SuppressionClass(
+        kind=inline_suppressions.Kind.NOQA,
+        code='PLC0415',
+        scope=inline_suppressions.Scope.ANY,
     )
 
-    violation = _dead_marker_violation(tmp_path, capsys, 'a = 1  # noqa: PLC0415\n')
+    violation = _dead_marker_violation(
+        tmp_path, capsys, 'a = 1  # noqa: PLC0415\n', classes={row: Policy('inv12-day-one')}
+    )
 
     assert 'no tool reads it' in violation
 
@@ -1729,7 +1743,9 @@ def test_seed_writes_the_unowned_multiset_under_the_kernels_preamble(tmp_path: P
     written = load(baseline)
     scan = inline_suppressions.scan_tree(tmp_path)
     expected = inline_suppressions.classify(
-        scan, inline_suppressions.ConsumerModel(tmp_path)
+        scan,
+        inline_suppressions.ConsumerModel(tmp_path),
+        classes=inline_suppressions.RATIFIED_SUPPRESSION_CLASSES,
     ).counts
     assert dict(written.counts) == expected
     assert len(written.counts) == 3
@@ -1925,8 +1941,16 @@ _REPORT_TREE = {
 }
 
 
-def _json_text(root: Path, baseline_path: Path, capsys, *paths: str) -> str:
-    """Run ``--json`` and return its raw stdout, asserting the exit code is 0.
+def _json_text(
+    root: Path,
+    baseline_path: Path,
+    capsys,
+    *paths: str,
+    classes: Mapping[inline_suppressions.SuppressionClass, Policy] = (
+        inline_suppressions.RATIFIED_SUPPRESSION_CLASSES
+    ),
+) -> str:
+    """Run ``--json`` against *classes* and return its raw stdout, asserting exit 0.
 
     The buffer is drained first: a fixture seeded through ``--seed`` has already
     printed its own report line, and ``json.loads`` of the two concatenated fails
@@ -1934,16 +1958,25 @@ def _json_text(root: Path, baseline_path: Path, capsys, *paths: str) -> str:
     """
     capsys.readouterr()
     code = inline_suppressions.main(
-        ['--json', '--root', str(root), '--baseline', str(baseline_path), *paths]
+        ['--json', '--root', str(root), '--baseline', str(baseline_path), *paths],
+        classes=classes,
     )
     captured = capsys.readouterr()
     assert code == 0, captured.err
     return captured.out
 
 
-def _json_report(root: Path, baseline_path: Path, capsys, *paths: str) -> dict:
-    """The parsed ``--json`` report."""
-    return json.loads(_json_text(root, baseline_path, capsys, *paths))
+def _json_report(
+    root: Path,
+    baseline_path: Path,
+    capsys,
+    *paths: str,
+    classes: Mapping[inline_suppressions.SuppressionClass, Policy] = (
+        inline_suppressions.RATIFIED_SUPPRESSION_CLASSES
+    ),
+) -> dict:
+    """The parsed ``--json`` report, run against *classes*."""
+    return json.loads(_json_text(root, baseline_path, capsys, *paths, classes=classes))
 
 
 def test_json_publishes_every_block_the_register_reads(tmp_path: Path, capsys):
@@ -2039,7 +2072,7 @@ def test_json_publishes_the_resolved_ruff_lists_rather_than_the_params_block(
     assert 'select' not in report['params']
 
 
-def test_json_counts_a_class_ratified_site_under_its_class(tmp_path: Path, capsys, monkeypatch):
+def test_json_counts_a_class_ratified_site_under_its_class(tmp_path: Path, capsys):
     """BOUNDARY SCENARIO 10 in the report — blanket policy stays VISIBLE.
 
     A class row moves sites out of the unowned multiset, which is exactly the
@@ -2052,12 +2085,9 @@ def test_json_counts_a_class_ratified_site_under_its_class(tmp_path: Path, capsy
         code='arg-type',
         scope=inline_suppressions.Scope.ANY,
     )
-    monkeypatch.setattr(
-        inline_suppressions, 'RATIFIED_SUPPRESSION_CLASSES', {row: Policy('inv12-day-one')}
-    )
     baseline = _write_fixture_tree(tmp_path, _REPORT_TREE)
 
-    report = _json_report(tmp_path, baseline, capsys)
+    report = _json_report(tmp_path, baseline, capsys, classes={row: Policy('inv12-day-one')})
 
     assert report['classes'] == [
         {
