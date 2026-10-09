@@ -89,7 +89,11 @@ from typing import TYPE_CHECKING
 from escalation.pins import classify_pins
 from pydantic import ValidationError
 from shared.deploy_state import DeployPhase, DeployState
-from shared.task_claimant import compose_claimant_run_id, is_stranded
+from shared.task_claimant import (
+    DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+    compose_claimant_run_id,
+    is_stranded,
+)
 from shared.task_statuses import TaskStatus
 
 from orchestrator.artifacts import TaskArtifacts
@@ -312,13 +316,6 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
-# Default staleness threshold for the W2 db claimant signal (TG-3 / step-10).
-# Callers that care about the exact TTL (e.g. harness wiring in θ2) pass
-# their own value explicitly; this default only matters for callers that
-# don't.
-_DEFAULT_HEARTBEAT_TTL = timedelta(minutes=10)
-
-
 def _pid_alive(pid: int) -> bool:
     """Return True if the process identified by *pid* is alive.
 
@@ -366,8 +363,8 @@ def _lock_fresh(locked_at: object, now: datetime, ttl: timedelta) -> bool:
     """Return True if a plan.lock's ``locked_at`` is within *ttl* of *now*.
 
     Mirrors ``TaskArtifacts.clear_stale_plan_lock``'s own age-based
-    staleness check (its 600s default equals ``_DEFAULT_HEARTBEAT_TTL``
-    here) so a plan.lock owner_pid that happens to be alive isn't honored
+    staleness check (its 600s default equals ``DEFAULT_CLAIMANT_HEARTBEAT_TTL``
+    in value) so a plan.lock owner_pid that happens to be alive isn't honored
     as a live claimant on that basis alone — under PID reuse, a dead
     orchestrator's pid can be recycled by an unrelated, genuinely-alive
     process, which would otherwise read as a phantom-live claimant and
@@ -410,7 +407,7 @@ class TaskGroundTruth:
         worktree_resolver: Callable[[str], Path],
         *,
         now_fn: Callable[[], datetime] = _utc_now,
-        heartbeat_ttl: timedelta = _DEFAULT_HEARTBEAT_TTL,
+        heartbeat_ttl: timedelta = DEFAULT_CLAIMANT_HEARTBEAT_TTL,
     ) -> None:
         self.git_ops = git_ops
         self.scheduler = scheduler

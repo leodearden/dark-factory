@@ -35,7 +35,11 @@ from shared.eval_lane import eval_lane_provenance
 from shared.mcp_envelope import resolver_failed
 from shared.storm_counter import StormCounter
 from shared.systemd_listeners import take_systemd_listeners
-from shared.task_claimant import compose_claimant_run_id, has_live_claimant
+from shared.task_claimant import (
+    DEFAULT_CLAIMANT_HEARTBEAT_TTL,
+    compose_claimant_run_id,
+    has_live_claimant,
+)
 from shared.task_metadata import RoutingState
 from shared.timestamps import parse_timestamp_or_warn
 from shared.transcript_archive import (
@@ -308,16 +312,6 @@ _RECONCILE_SWEEP_STATUSES: frozenset[str] = frozenset({'in-progress', 'blocked'}
 # 'infra-hold' never reaches the gate — its pre-gate in
 # `_cascade_unblock_member` returns first.
 _RESUME_REPEND_STATUSES: frozenset[str] = frozenset({'blocked', 'in-progress'})
-
-# heartbeat_ttl the harness configures TaskGroundTruth (task 2243, W10-θ2)
-# with — the staleness threshold TG-3's live_claimant folding applies to the
-# W2 db claimant signal (shared.task_claimant.is_stranded) and the plan.lock
-# freshness cross-check. No dedicated OrchestratorConfig field exists for
-# this yet, so it is bound explicitly here rather than left to silently ride
-# whatever default TaskGroundTruth ships with; the value mirrors
-# TaskGroundTruth's own _DEFAULT_HEARTBEAT_TTL (task_ground_truth.py) and
-# TaskArtifacts.clear_stale_plan_lock's hardcoded 600s default.
-_RECONCILE_HEARTBEAT_TTL: timedelta = timedelta(minutes=10)
 
 # Non-terminal parked statuses whose worktrees are inviolable — owned by a
 # non-scheduler party, not by the task's own progress — and so must NEVER be
@@ -5466,7 +5460,7 @@ class Harness:
                 self.scheduler,
                 self._escalation_queue,
                 self._resolve_task_worktree,
-                heartbeat_ttl=_RECONCILE_HEARTBEAT_TTL,
+                heartbeat_ttl=DEFAULT_CLAIMANT_HEARTBEAT_TTL,
             )
             self._ground_truth = existing
         return existing
@@ -16896,17 +16890,17 @@ class Harness:
              DB-only oracle would read as stranded. ``_escalation_events`` does
              not cover this — it is popped at slot exit, while
              ``is_actively_held`` also folds in the cancel-grace window.
-          2. ``shared.task_claimant.has_live_claimant`` on the store row — the
-             only member of that module that fits, since ``is_stranded`` gates
-             on ``status == 'in-progress'`` and ``is_stranded_blocked`` on
-             ``status == 'blocked'``, so neither can answer the single
+          2. ``shared.task_claimant.has_live_claimant`` on the store row —
+             status-agnostic, unlike ``is_stranded`` (gated on
+             ``status == 'in-progress'``) and ``is_stranded_blocked`` (on
+             ``status == 'blocked'``), neither of which can answer the single
              status-agnostic question this fork asks. This is also the half
              that sees a claimant held by ANOTHER orchestrator, which the
              process-local ``_escalation_events`` check structurally cannot.
 
         TTL choice: ``config.claimant_liveness_ttl_secs`` (300s, operator-
-        tunable and green-tier hot-reloadable), NOT this module's hardcoded
-        600s ``_RECONCILE_HEARTBEAT_TTL``. The re-pend's immediate downstream
+        tunable and green-tier hot-reloadable), NOT the 600s
+        ``shared.task_claimant.DEFAULT_CLAIMANT_HEARTBEAT_TTL``. The re-pend's immediate downstream
         consumer is ``Scheduler._eligible_for_dispatch``, which gates on
         exactly this knob and this same ``has_live_claimant`` call; aligning
         them guarantees we never write ``pending`` to a row the dispatcher

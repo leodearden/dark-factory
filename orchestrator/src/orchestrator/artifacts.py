@@ -1375,6 +1375,7 @@ class TaskArtifacts:
             return None
         return json.loads(lock_path.read_text())
 
+    # plan.lock age, not the claimant TTL: equals DEFAULT_CLAIMANT_HEARTBEAT_TTL by coincidence, not derivation.
     def clear_stale_plan_lock(
         self, current_task_id: str, stale_threshold_secs: float = 600.0
     ) -> bool:
