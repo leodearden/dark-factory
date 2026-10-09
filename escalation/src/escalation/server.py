@@ -980,11 +980,8 @@ def create_server(
 
     *store_identity* (default None) — which store this server serves
     (``escalation.store_identity::StoreIdentity``), passed by both production
-    call sites.  Its consumers are the ``project_root`` assertion guard (γ2)
-    and the store line rendered into tool descriptions (γ3) of
-    ``plans/escalation-store-ambiguity-prd.md``.  None (tests, standalone)
-    degrades to the identity-less behaviour exactly: no assertion accepted,
-    no identity line rendered, and it never raises.
+    call sites.  Accepted but not yet read: its consumers are specified in
+    ``plans/escalation-store-ambiguity-prd.md`` §6.2–6.3.
     """
     mcp = FastMCP('escalation', instructions=ESCALATION_SERVER_INSTRUCTIONS)
 

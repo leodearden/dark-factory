@@ -15,16 +15,11 @@ from typing import Literal
 
 @dataclass(frozen=True)
 class StoreIdentity:
-    """Both path fields are made absolute and resolved at construction, so
-    ``queue_dir`` compares directly against any other resolved path —
-    ``escalation.queue::EscalationQueue.__init__`` keeps its ``queue_dir``
-    as given.
+    """Both path fields are made absolute and resolved at construction.
 
     A ``'project'`` identity must carry both ``project_id`` and
     ``project_root``; a ``'reconciliation'`` identity must carry neither.
-    Constructing an incoherent identity raises ``ValueError``: it is a wiring
-    bug. That raise is separate from ``create_server(store_identity=None)``,
-    which degrades to identity-less behaviour and never raises.
+    Constructing an incoherent identity raises ``ValueError``.
     """
 
     kind: Literal['project', 'reconciliation']

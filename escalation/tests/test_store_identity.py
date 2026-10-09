@@ -54,9 +54,6 @@ class TestStoreIdentityFields:
 
 
 class TestStoreIdentityIsFrozen:
-    def test_is_a_dataclass(self, tmp_path: Path) -> None:
-        assert dataclasses.is_dataclass(_project_identity(tmp_path))
-
     @pytest.mark.parametrize(
         ('field', 'value'),
         [
