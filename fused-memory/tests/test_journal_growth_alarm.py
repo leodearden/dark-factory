@@ -16,6 +16,12 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+from fused_memory.services.journal_growth_alarm import (
+    JournalCeiling,
+    JournalGrowthBreach,
+    find_breaches,
+)
 from fused_memory.services.write_journal import JournalGrowthSample, WriteJournal
 
 
@@ -177,3 +183,45 @@ class TestGrowthSampleRowsInserted:
         sample = await journal.growth_sample(since=_an_hour_ago())
 
         assert sample.rows_inserted == 2
+
+
+def _sample(*, file_bytes: int = 100, rows_inserted: int = 10) -> JournalGrowthSample:
+    return JournalGrowthSample(
+        file_bytes=file_bytes, free_bytes=7, rows_inserted=rows_inserted, since=_T0
+    )
+
+
+_CEILINGS = WriteJournalGrowthAlarmConfig(max_file_bytes=100, max_rows_inserted_per_day=10)
+
+
+class TestFindBreaches:
+    def test_at_or_below_both_ceilings_is_no_breach(self):
+        assert find_breaches(_sample(file_bytes=100, rows_inserted=10), _CEILINGS) == ()
+        assert find_breaches(_sample(file_bytes=1, rows_inserted=0), _CEILINGS) == ()
+
+    def test_a_file_over_its_ceiling_is_a_size_breach(self):
+        sample = _sample(file_bytes=101)
+
+        assert find_breaches(sample, _CEILINGS) == (
+            JournalGrowthBreach(ceiling=JournalCeiling.FILE_SIZE, measured=101, limit=100),
+        )
+
+    def test_inserts_over_their_ceiling_are_a_rate_breach(self):
+        sample = _sample(rows_inserted=11)
+
+        assert find_breaches(sample, _CEILINGS) == (
+            JournalGrowthBreach(ceiling=JournalCeiling.INSERT_RATE, measured=11, limit=10),
+        )
+
+    def test_both_over_reports_size_then_rate(self):
+        breaches = find_breaches(_sample(file_bytes=101, rows_inserted=11), _CEILINGS)
+
+        assert [b.ceiling for b in breaches] == [
+            JournalCeiling.FILE_SIZE,
+            JournalCeiling.INSERT_RATE,
+        ]
+
+    def test_a_breach_is_frozen(self):
+        breach = JournalGrowthBreach(ceiling=JournalCeiling.FILE_SIZE, measured=2, limit=1)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            breach.measured = 3  # type: ignore[misc]
