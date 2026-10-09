@@ -9,10 +9,17 @@ gate operational mode, absent meaning gate), the observed shape (a non-empty
 from __future__ import annotations
 
 import copy
+import logging
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from fused_memory.reconciliation.blocked_gate_audit_section import select_blocked_gate_tasks
+from fused_memory.reconciliation.blocked_gate_audit_section import (
+    BLOCKED_GATE_AUDIT_HEADER,
+    MAX_BLOCKED_GATE_AUDIT_RENDERED,
+    render_blocked_gate_audit_section,
+    select_blocked_gate_tasks,
+)
 
 STAMP = '2026-08-19T05:42:35Z'
 
@@ -140,3 +147,76 @@ class TestSelectBlockedGateTasks:
         before = copy.deepcopy(tasks)
         select_blocked_gate_tasks(tasks)
         assert tasks == before
+
+
+_MODULE_LOGGER = 'fused_memory.reconciliation.blocked_gate_audit_section'
+_CAP_EVENT = 'reconciliation.gate_task_audit_render_capped'
+
+
+def _stamped_gates(count: int) -> list[dict]:
+    """Blocked gates whose ids ascend with their ``gate_escalated_at``."""
+    start = datetime(2026, 8, 1, tzinfo=UTC)
+    return [
+        _task(i, {'task_kind': 'deterministic', 'gate_escalated_at': (start + timedelta(hours=i)).isoformat()})
+        for i in range(1, count + 1)
+    ]
+
+
+def _render(tasks: list[dict]) -> str:
+    return render_blocked_gate_audit_section(tasks, project_id='p', run_id='r')
+
+
+def _rendered_ids(section: str) -> list[int]:
+    return [int(line[3 : line.index(']')]) for line in section.splitlines() if line.startswith('- [')]
+
+
+def _cap_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.getMessage() == _CAP_EVENT]
+
+
+class TestRenderBlockedGateAuditSection:
+    def test_renders_every_gate_with_true_count(self):
+        gates = _stamped_gates(12)
+        non_gates = [
+            _task(100, {'task_kind': 'normal'}),
+            _task(101, {'task_kind': 'deterministic'}, status='pending'),
+        ]
+        section = _render(gates + non_gates)
+        assert f'{BLOCKED_GATE_AUDIT_HEADER} (12 gate task(s) awaiting review)' in section.splitlines()
+        assert _rendered_ids(section) == list(range(1, 13))
+
+    def test_empty_state_still_renders_header(self):
+        section = _render([_task(1, {'task_kind': 'normal'})])
+        assert f'{BLOCKED_GATE_AUDIT_HEADER} (0 gate task(s) awaiting review)' in section.splitlines()
+        assert 'No tasks.' in section
+
+    def test_render_cap_keeps_oldest_drops_newest_with_overflow_note(self, caplog):
+        total = MAX_BLOCKED_GATE_AUDIT_RENDERED + 5
+        with caplog.at_level(logging.WARNING, logger=_MODULE_LOGGER):
+            section = _render(_stamped_gates(total))
+        assert _rendered_ids(section) == list(range(1, MAX_BLOCKED_GATE_AUDIT_RENDERED + 1))
+        assert f'({total} gate task(s) awaiting review)' in section
+        note = next(line for line in section.splitlines() if line.startswith('_NOTE:'))
+        assert '5 additional' in note
+        assert 'clipped' in note
+        assert 'NOT complete this cycle' in note
+        [record] = _cap_records(caplog)
+        assert record.levelno == logging.WARNING
+        assert record.__dict__['project_id'] == 'p'
+        assert record.__dict__['run_id'] == 'r'
+        assert record.__dict__['total_gate_tasks'] == total
+        assert record.__dict__['rendered'] == MAX_BLOCKED_GATE_AUDIT_RENDERED
+        assert record.__dict__['omitted'] == 5
+
+    def test_unstamped_gate_survives_render_cap(self):
+        gates = _stamped_gates(MAX_BLOCKED_GATE_AUDIT_RENDERED + 5)
+        unstamped_id = 10_000
+        section = _render(gates + [_task(unstamped_id, {'task_kind': 'deterministic'})])
+        assert unstamped_id in _rendered_ids(section)
+
+    def test_no_overflow_note_or_warning_under_cap(self, caplog):
+        with caplog.at_level(logging.WARNING, logger=_MODULE_LOGGER):
+            section = _render(_stamped_gates(MAX_BLOCKED_GATE_AUDIT_RENDERED))
+        assert len(_rendered_ids(section)) == MAX_BLOCKED_GATE_AUDIT_RENDERED
+        assert '_NOTE' not in section
+        assert _cap_records(caplog) == []
