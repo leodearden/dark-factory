@@ -1300,17 +1300,15 @@ test_context_heading_mentioned_mid_sentence_is_not_excluded) must keep
 passing unchanged."""
 
 
-def _has_all_heading_lines(text: str, headings: tuple[str, ...]) -> bool:
-    """True when every entry of *headings* occurs in *text* as its own
-    stripped, lowercased line.
+def _heading_lines(text: str) -> frozenset[str]:
+    """*text*'s lines, each stripped and lowercased.
 
-    The single normalization used by every line-anchored heading-set
-    match. Shared rather than repeated per call site so a future change to
-    the anchoring rule (stripping trailing '#', handling '\\r\\n', ...)
-    lands in one place instead of silently diverging between two copies.
+    The single normalization used by every line-anchored heading match.
+    Shared rather than repeated per rule so a future change to the
+    anchoring rule (stripping trailing '#', handling '\\r\\n', ...) lands
+    in one place instead of silently diverging between two copies.
     """
-    lines = {line.strip() for line in text.lower().splitlines()}
-    return all(heading in lines for heading in headings)
+    return frozenset(line.strip() for line in text.lower().splitlines())
 
 
 def is_harness_injected_turn(text: str) -> bool:
@@ -1365,13 +1363,13 @@ def is_harness_injected_turn(text: str) -> bool:
     the worse error.
     """
     lowered = text.lower()
-    lines = {line.strip() for line in lowered.splitlines()}
+    lines = _heading_lines(text)
     anchors = [h for h in HARNESS_BRIEFING_HEADINGS if h in lines]
     if anchors:
         corroborators = [h for h in HARNESS_BRIEFING_SUBHEADINGS if h in lines]
         if len(anchors) + len(corroborators) >= 2:
             return True
-    if any(_has_all_heading_lines(text, headings) for headings in HARNESS_HEADING_SETS):
+    if any(lines.issuperset(headings) for headings in HARNESS_HEADING_SETS):
         return True
     if any(marker in lowered for marker in HARNESS_PROMPT_MARKERS):
         return True

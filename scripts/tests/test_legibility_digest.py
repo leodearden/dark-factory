@@ -3178,7 +3178,7 @@ class TestRunReviewPromptTurnFilter:
         assert mod.is_harness_injected_turn(crossed) is False
 
     def test_both_heading_sets_use_the_same_line_anchoring(self):
-        # One shared normalization (_has_all_heading_lines), so the two sets
+        # One shared normalization (_heading_lines), so the two sets
         # cannot silently diverge on what counts as a heading line: leading
         # and trailing whitespace and case are stripped for both alike.
         for headings in mod.HARNESS_HEADING_SETS:

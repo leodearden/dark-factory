@@ -128,7 +128,16 @@ def _message_content(record: dict[str, Any]) -> Any:
     return message.get('content')
 
 
-def _record_carriers(record: dict[str, Any]) -> list[str]:
+@dataclass(frozen=True)
+class _Carrier:
+    """One raw text carrier from a record's message.content."""
+
+    text: str
+    is_assistant_text: bool
+    """An assistant 'text' block: the only carrier self_correct reads."""
+
+
+def _record_carriers(record: dict[str, Any]) -> list[_Carrier]:
     """Every raw text carrier in a record's message.content.
 
     ``content`` is either a plain string, which is one carrier, or a list of
@@ -138,55 +147,47 @@ def _record_carriers(record: dict[str, Any]) -> list[str]:
     """
     content = _message_content(record)
     if isinstance(content, str):
-        return [content]
+        return [_Carrier(content, is_assistant_text=False)]
     if not isinstance(content, list):
         return []
+    is_assistant = record.get('type') == 'assistant'
     carriers = []
     for block in content:
         if not isinstance(block, dict):
             continue
         text = block.get('text')
         if isinstance(text, str):
-            carriers.append(text)
+            carriers.append(_Carrier(text, is_assistant and block.get('type') == 'text'))
         block_content = block.get('content')
         if isinstance(block_content, str):
-            carriers.append(block_content)
+            carriers.append(_Carrier(block_content, is_assistant_text=False))
     return carriers
 
 
-def _dialogue_only(record: dict[str, Any], carriers: list[str]) -> list[str]:
-    """*carriers* minus every one :func:`digest.is_non_dialogue_carrier`
-    rejects, so a text class scores this session's own dialogue only."""
-    return [c for c in carriers if not digest.is_non_dialogue_carrier(record, c)]
+@dataclass(frozen=True)
+class _DialogueText:
+    """A record's dialogue carriers, lowercased and joined for the
+    substring scans. A carrier is dialogue unless
+    :func:`digest.is_non_dialogue_carrier` rejects it, and each carrier is
+    asked exactly once."""
+
+    whole: str
+    """Every dialogue carrier: not_found, interrupt, the df_guard text patterns."""
+    assistant: str
+    """Assistant 'text' blocks only (native-carrier scoping): self_correct."""
 
 
-def _record_text(record: dict[str, Any]) -> str:
-    """Flatten a record's dialogue carriers (:func:`_dialogue_only`) into
-    one lowercased text blob.
-
-    Used for the plain substring-scan classes (not_found, df_guard text
-    patterns, interrupt) — never for self_correct, which is scoped to
-    assistant text blocks only via :func:`_assistant_text`.
-    """
-    return '\n'.join(_dialogue_only(record, _record_carriers(record))).lower()
-
-
-def _assistant_text(record: dict[str, Any]) -> str:
-    """Flatten only assistant 'text' content blocks (native-carrier
-    scoping), each one a dialogue carrier per :func:`_dialogue_only`."""
-    if record.get('type') != 'assistant':
-        return ''
-    content = _message_content(record)
-    if not isinstance(content, list):
-        return ''
-    # Walrus-bound so the isinstance narrowing reaches the element expression;
-    # see the note in digest.py's _first_text_block. Filtering is unchanged.
-    parts = [
-        block_text for block in content
-        if isinstance(block, dict) and block.get('type') == 'text'
-        and isinstance(block_text := block.get('text'), str)
+def _dialogue_text(record: dict[str, Any]) -> _DialogueText:
+    kept = [
+        carrier for carrier in _record_carriers(record)
+        if not digest.is_non_dialogue_carrier(record, carrier.text)
     ]
-    return '\n'.join(_dialogue_only(record, parts)).lower()
+    return _DialogueText(
+        whole='\n'.join(carrier.text for carrier in kept).lower(),
+        assistant='\n'.join(
+            carrier.text for carrier in kept if carrier.is_assistant_text
+        ).lower(),
+    )
 
 
 def _classify_tool_errors(record: dict[str, Any]) -> tuple[bool, bool]:
@@ -334,13 +335,14 @@ def scan_transcript(path: Path) -> TranscriptScan:
             if has_designed:
                 designed_outcome += 1
 
-            text = _record_text(record)
+            dialogue = _dialogue_text(record)
+            text = dialogue.whole
             if text and any(pattern in text for pattern in _NOT_FOUND_PATTERNS):
                 not_found += 1
             if text and any(pattern in text for pattern in _INTERRUPT_PATTERNS):
                 interrupt += 1
 
-            assistant_text = _assistant_text(record)
+            assistant_text = dialogue.assistant
             if assistant_text and any(
                 pattern in assistant_text for pattern in _SELF_CORRECT_PATTERNS
             ):
@@ -383,7 +385,7 @@ def score_signals(path: Path) -> SignalCounts:
     once. ``tool_error``/``designed_outcome`` and the tool-use half of
     ``df_guard`` are structural checks; every other class is a plain
     case-insensitive substring scan of dialogue carriers only
-    (:func:`_dialogue_only`). ``tool_error`` counts only GENUINE
+    (:class:`_DialogueText`). ``tool_error`` counts only GENUINE
     failures: declared-designed outcomes are split off into
     ``designed_outcome`` by :func:`_classify_tool_errors`, which reuses
     digest's classifier so the two modules cannot drift. Malformed/unreadable input degrades to an all-zero
