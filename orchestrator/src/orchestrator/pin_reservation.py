@@ -28,6 +28,12 @@ all operator-chosen; one reservation cannot gridlock with itself; its idle cost
 is one task's footprint; and C7 backfill still borrows through it exactly as
 it borrows through a fairness park.
 
+A pin reservation lives only while its owner may hold parks: pending, with no
+dependency known to be unsatisfied (esc-6040-7 D1/D2).  Park GC expires it on
+the tick the owner leaves that state, with an owner-state reason.  When the pin
+phase releases one, the owner completes the fairness parks its skips earned
+only if it is still a dispatch candidate.
+
 This module holds the vocabulary and policy only — rank, source, blocker
 naming, release reasons, the ``pin_blocked`` cadence — and imports nothing
 from the scheduler.
@@ -166,8 +172,11 @@ class Blocker:
 class PinReleaseReason(StrEnum):
     """Why the pin phase released a pin reservation: ``reservation_expired``'s ``reason``.
 
-    Owner-state releases (terminal, missing, deps unsatisfied) belong to park
-    GC and keep its vocabulary; these are the ones only the pin phase can see.
+    Owner-state releases (terminal, missing, not pending, a dependency known
+    to be unsatisfied) belong to park GC and keep its vocabulary; these
+    reasons cover owners park GC keeps.  INELIGIBLE means pending and kept by
+    park GC, but no dispatch candidate this tick (cooldown, milestone,
+    claimant, deferred-watch, an unknown dependency).
     """
 
     UNPINNED = 'unpinned'

@@ -7825,8 +7825,10 @@ class Scheduler:
         cap keeps this tick's heads first, and a displaced pin is outranked by
         the head's pin rank on every key they share.  (Pins with no stored
         pin_order tie at one rank, so there the shared key waits for the
-        head's next completion.)  Terminal, missing and deps-unsatisfied
-        owners are park GC's, earlier in the tick.
+        head's next completion.)  Owners that fail the park-hold predicate
+        (:meth:`_park_gc_reason`) lost every park, pin entries included, in
+        park GC earlier in the tick; completion runs only for an owner that
+        is still a dispatch candidate.
         """
         owners = self.lock_table.snapshot_pin_reservations()
         if not owners:
@@ -7861,51 +7863,72 @@ class Scheduler:
         While a pin reservation covered a module, the owner's top-skips parked
         nothing more there: the pin entry already covered it
         (:meth:`ModuleLockTable.unparked_modules`).  Once the pin reservation
-        is gone, an owner whose skip count has reached its tier's threshold
-        completes those fairness parks now, through the ordinary rule, rather
-        than leaving the modules open until it is next top-skipped.  An owner
-        below the threshold, or absent from this tick's tasks, is left alone.
+        is gone, an owner that is still a dispatch candidate this tick
+        (:meth:`_dispatch_candidacy`) and whose skip count has reached its
+        tier's threshold completes those fairness parks now, through the
+        ordinary rule, rather than leaving the modules open until it is next
+        top-skipped.  An owner below the threshold, or no dispatch candidate,
+        is left alone: no later skip would park for a non-candidate either
+        (esc-6040-7 D5).  The gate is candidacy, not the release reason,
+        which is first-match and can read ``unpinned`` or
+        ``pin_reservations_disabled`` for an ineligible owner.
         """
-        task = ctx.tasks_by_id.get(task_id)
-        if task is None:
+        candidate, _signal = self._dispatch_candidacy(ctx, task_id)
+        if not candidate:
             return
+        task = ctx.tasks_by_id[task_id]
         tier = ctx.effective_priorities.get(task_id, coerce_tier(task.get('priority')))
         skip_count = self._skip_count.get(task_id, 0)
         if skip_count < self.config.fairness.skip_threshold_for(tier):
             return
         self._complete_parks(task_id, self._get_modules(task), tier, skip_count=skip_count)
 
+    def _dispatch_candidacy(self, ctx: TickContext, tid: str) -> tuple[bool, str | None]:
+        """Whether *tid* is a dispatch candidate this tick, with its cooldown signal.
+
+        A candidate is in ``ctx.tasks_by_id``, passes
+        :meth:`_eligible_for_dispatch` with this tick's caches (the same
+        helper as the scored loop, so a new gate reaches every path) and is
+        not landed-outbox gated.
+        """
+        task = ctx.tasks_by_id.get(tid)
+        if task is None:
+            return False, None
+        eligible, signal = self._eligible_for_dispatch(
+            task, tid, ctx.status_map, ctx.tasks_by_id,
+            external_status_cache=ctx.external_cache,
+            external_resolver_failed=ctx.external_resolver_failed,
+            delivered_check_cache=ctx.delivered_check_cache,
+            terminal_dep_records=ctx.terminal_dep_records,
+        )
+        if not eligible:
+            return False, None
+        if tid in ctx.gated_ids:
+            # Landed-outbox gate (task 2156, SD-1/B5): this task's merge
+            # already landed on main and is being driven to done inline —
+            # skip it here too so the pin paths and the scored loop share
+            # the one gated_ids source of truth.
+            return False, None
+        return True, signal
+
     def _pin_queue(self, ctx: TickContext) -> list[_PinCandidate]:
         """Pinned tasks that may dispatch this tick, in pin_order ASC.
 
-        A pin is queued when its override row is pinned, its task is in
-        ``ctx.tasks_by_id``, it passes :meth:`_eligible_for_dispatch` (the
-        same helper as the scored loop, so a new gate reaches both paths)
-        and it is not landed-outbox gated.  A row with no stored pin_order
-        counts as 0; ties keep the override store's row order, as they did
-        before task 6040.  This order is the only one the pin phase uses:
-        it picks the heads and the reservations the cap keeps.
+        A pin is queued when its override row is pinned and its task is a
+        dispatch candidate (:meth:`_dispatch_candidacy`).  A row with no
+        stored pin_order counts as 0; ties keep the override store's row
+        order, as they did before task 6040.  This order is the only one the
+        pin phase uses: it picks the heads and the reservations the cap
+        keeps.
         """
         queue: list[_PinCandidate] = []
         for tid, row in ctx.overrides.items():
-            if not row.pinned or tid not in ctx.tasks_by_id:
+            if not row.pinned:
+                continue
+            candidate, signal = self._dispatch_candidacy(ctx, tid)
+            if not candidate:
                 continue
             task = ctx.tasks_by_id[tid]
-            eligible, signal = self._eligible_for_dispatch(
-                task, tid, ctx.status_map, ctx.tasks_by_id,
-                external_status_cache=ctx.external_cache,
-                external_resolver_failed=ctx.external_resolver_failed,
-                delivered_check_cache=ctx.delivered_check_cache,
-                terminal_dep_records=ctx.terminal_dep_records,
-            )
-            if not eligible:
-                continue
-            if tid in ctx.gated_ids:
-                # Landed-outbox gate (task 2156, SD-1/B5): this pinned
-                # task's merge already landed on main and is being driven
-                # to done inline — skip it here too so the pin loop and
-                # the scored loop share the one gated_ids source of truth.
-                continue
             queue.append(_PinCandidate(
                 task_id=tid,
                 task=task,
