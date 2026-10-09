@@ -152,8 +152,9 @@ def _make_worker(
 ) -> SpeculativeMergeWorker:
     """Build a bare MergeLane for these tests.
 
-    *clock* is for the one test whose SUBJECT is a wait: a FakeClock makes the
-    worker's deadline arithmetic run to completion without a wall-clock wait.
+    *clock* is for the one test whose SUBJECT is a wait: a
+    ``FakeClock(sleep_cap=0.0)`` makes the worker's deadline arithmetic run to
+    completion without a wall-clock wait.
     Everywhere else the wait is incidental and the production clock is what
     keeps the test honest about real concurrency, so it is left alone.
     """
@@ -2955,10 +2956,14 @@ class TestAwaitUnadvancedPredecessor:
         against the worker's clock, and that clock is the test's.  The proof
         that the wait really ran to its deadline rather than falling out early
         is the clock's own record of what it was asked to sleep.
+
+        The interlock polls every 50ms toward that real ~1920s deadline, about
+        38,400 polls, so each poll must be a bare yield: measured, at a 0.02s
+        real wait per poll the test hit the 300s timeout.
         """
         config = _make_config(tmp_path)
         queue: asyncio.Queue = asyncio.Queue()
-        clock = FakeClock()
+        clock = FakeClock(sleep_cap=0.0)
         worker = _make_worker(queue, config, clock=clock)
         pred = _make_single_req('pred', config=config)
         worker._last_merged_request = pred
