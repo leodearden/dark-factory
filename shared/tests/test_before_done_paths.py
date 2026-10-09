@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.before_done_paths import BeforeDonePaths, resolve_before_done_paths
+from shared.before_done_paths import BeforeDonePaths, resolve_before_done_paths
 
 ROOT = Path('/srv/project')
 RELATIVE_SCRIPT = 'data/ops/deploy.sh'

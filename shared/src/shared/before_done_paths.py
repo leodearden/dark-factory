@@ -1,8 +1,10 @@
 """Where a deterministic task's ``before_done`` script runs.
 
-Contract: ``docs/task-authoring.md`` §5. Must agree with the submit-time check
-``fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done``,
-which validates ``project_root / script``.
+Contract: ``docs/task-authoring.md`` §5. Lives in ``shared`` so the run-time
+executor (``orchestrator/src/orchestrator/deterministic_runner.py``) and the
+submit-time check
+(``fused-memory/src/fused_memory/middleware/deterministic_task_guard.py::_validate_before_done``,
+which validates ``project_root / script``) can read one definition.
 """
 
 from __future__ import annotations
@@ -30,6 +32,8 @@ class BeforeDonePaths:
 def resolve_before_done_paths(
     before_done: Mapping[str, Any], project_root: Path,
 ) -> BeforeDonePaths:
+    """``script`` joins ``project_root`` even when ``cwd`` is set: the file the
+    submit guard validated is the file that runs."""
     cwd = before_done.get('cwd')
     return BeforeDonePaths(
         script=project_root / before_done['script'],

@@ -367,6 +367,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from shared.before_done_paths import BeforeDonePaths, resolve_before_done_paths
 from shared.proc_group import unsafe_pgid_reason
 from shared.task_metadata import (
     HUMAN_CURATOR_ADJUDICATED_AT_KEY,
@@ -375,7 +376,6 @@ from shared.task_metadata import (
 )
 
 from orchestrator import systemd_inspect
-from orchestrator.before_done_paths import BeforeDonePaths, resolve_before_done_paths
 from orchestrator.deploy_state import (
     DeployPhase,
     DeployState,
@@ -1459,7 +1459,8 @@ class DeterministicRunner:
         """
         target_unit = before_done.get('target_unit', 'unknown')
         args = before_done.get('args') or []
-        # docs/task-authoring.md §5: paths resolve against the configured project_root (before_done_paths.py)
+        # docs/task-authoring.md §5: paths resolve against the configured
+        # project_root (shared/src/shared/before_done_paths.py).
         paths = self._before_done_paths(before_done)
 
         esc_summary = summary or (
