@@ -31,14 +31,18 @@ integration gate read ``--report``.
 
 from __future__ import annotations
 
+import argparse
 import ast
 import dataclasses
 import datetime
 import inspect
+import json
+import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import MappingProxyType
+from typing import TypeVar
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'shared' / 'src'))
 
@@ -47,6 +51,7 @@ try:
     import yaml
     from shared.governed_exceptions import (
         DECLARATION_FORMS,
+        INLINE_MARKER_FORMS,
         Debt,
         Disposition,
         MalformedDisposition,
@@ -62,6 +67,9 @@ except ImportError as exc:
         file=sys.stderr,
     )
     raise SystemExit(2) from exc
+
+#: The checkout holding this script: the default ``--root``.
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: The ratification table, relative to the checkout root.
 TABLE_PATH = 'docs/legibility/exception-ratifications.yaml'
@@ -201,17 +209,18 @@ class Violation:
     """One exit-1 finding, located at a site and carrying the forms that fix it."""
 
     path: str
-    line: int
+    line: int | None
     subject: str
     reason: str
     forms: tuple[str, ...]
 
     def render(self) -> str:
         """The one line ``--report`` prints to stderr."""
-        return (
-            f'{self.path}:{self.line}: {self.subject}: {self.reason} '
-            f'Accepted forms: {" | ".join(self.forms)}'
-        )
+        where = self.path if self.line is None else f'{self.path}:{self.line}'
+        return f'{where}: {self.subject}: {self.reason} Accepted forms: {" | ".join(self.forms)}'
+
+    def sort_key(self) -> tuple[str, int, str, str]:
+        return (self.path, self.line or 0, self.subject, self.reason)
 
     def record(self) -> dict[str, object]:
         """The violation as ``--json`` publishes it."""
@@ -534,3 +543,372 @@ def declarations_in(corpus: Corpus) -> Discovery:
 def discover_declarations(root: Path) -> Discovery:
     """Every import-time declaration in *root*'s tracked Python (D5)."""
     return declarations_in(read_corpus(root))
+
+
+# ---------------------------------------------------------------------------
+# The inline scanner's report, read from its published --json.
+
+#: Pins scripts/inline_suppressions.py::REPORT_SCHEMA_VERSION on the consumer side.
+INLINE_REPORT_SCHEMA_VERSION = 2
+
+_INLINE_SCRIPT = Path(__file__).resolve().parent / 'inline_suppressions.py'
+_INLINE_SOURCE = f'{_INLINE_SCRIPT.name} --json'
+
+#: Generous, not a performance budget: the scan's own budget is ~10 s.
+_INLINE_TIMEOUT_SECS = 600
+
+_T = TypeVar('_T')
+
+
+@dataclasses.dataclass(frozen=True)
+class InlineSite:
+    """One inline marker citing a ratification row."""
+
+    ratified: str
+    path: str
+    line: int
+    kind: str
+    codes: tuple[str, ...]
+
+    def marker(self) -> str:
+        """The suppression as a reader would search for it: ``kind[codes]``."""
+        return f'{self.kind}[{",".join(self.codes)}]' if self.codes else self.kind
+
+
+@dataclasses.dataclass(frozen=True)
+class ClassRow:
+    """One row of the scanner's ratified class table."""
+
+    suppression_class: str
+    ratified: str
+
+
+@dataclasses.dataclass(frozen=True)
+class KindCodeRow:
+    kind: str
+    code: str | None
+    sites: int
+
+    def marker(self) -> str:
+        """``kind[code]``, or the bare kind for a codeless marker."""
+        return self.kind if self.code is None else f'{self.kind}[{self.code}]'
+
+
+@dataclasses.dataclass(frozen=True)
+class FileRow:
+    path: str
+    sites: int
+
+
+@dataclasses.dataclass(frozen=True)
+class InlineReport:
+    """The fields of the inline scanner's report this register uses.
+
+    ``document`` is the report verbatim, passed through under ``inline`` in
+    ``--json`` so the owner sweep reads debt owners from the register alone.
+    ``excess_total`` and ``slack_total`` are ``None`` when not measured.
+    ``violations`` counts the scanner's own gate findings.
+    """
+
+    document: Mapping[str, object]
+    seeded: bool
+    unowned: int
+    excess_total: int | None
+    slack_total: int | None
+    ratified_sites: tuple[InlineSite, ...]
+    class_rows: tuple[ClassRow, ...]
+    by_kind_code: tuple[KindCodeRow, ...]
+    by_file: tuple[FileRow, ...]
+    kind_totals: Mapping[str, int]
+    ownership: Mapping[str, int]
+    sites: int
+    files_enumerated: int
+    files_tokenized: int
+    violations: int
+
+
+def _field(block: Mapping[str, object], key: str, kind: type[_T], where: str) -> _T:
+    """``block[key]``, refused unless present and of *kind* (``bool`` is not an int)."""
+    if key not in block:
+        raise InstrumentFailure(f'{_INLINE_SOURCE}: field `{where}{key}` is missing')
+    value = block[key]
+    if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
+        raise InstrumentFailure(
+            f'{_INLINE_SOURCE}: field `{where}{key}` is {value!r}, not {kind.__name__}'
+        )
+    return value
+
+
+def _optional(block: Mapping[str, object], key: str, kind: type[_T], where: str) -> _T | None:
+    if block.get(key, 0) is None:
+        return None
+    return _field(block, key, kind, where)
+
+
+def _rows(block: Mapping[str, object], key: str, where: str = '') -> list[Mapping[str, object]]:
+    rows = _field(block, key, list, where)
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise InstrumentFailure(f'{_INLINE_SOURCE}: `{where}{key}[{index}]` is not an object')
+    return rows
+
+
+def _counts(block: Mapping[str, object], key: str) -> Mapping[str, int]:
+    counts = _field(block, key, dict, '')
+    return MappingProxyType({name: _field(counts, name, int, f'{key}.') for name in counts})
+
+
+def _codes(row: Mapping[str, object], where: str) -> tuple[str, ...]:
+    codes = _field(row, 'codes', list, where)
+    if not all(isinstance(code, str) for code in codes):
+        raise InstrumentFailure(f'{_INLINE_SOURCE}: field `{where}codes` holds a non-str code')
+    return tuple(codes)
+
+
+def _total(block: Mapping[str, object], key: str) -> int | None:
+    counts = _optional(block, key, dict, 'baseline.')
+    if counts is None:
+        return None
+    return sum(_field(counts, name, int, f'baseline.{key}.') for name in counts)
+
+
+def _ratified_sites(document: Mapping[str, object]) -> tuple[InlineSite, ...]:
+    sites: list[InlineSite] = []
+    for row in _rows(document, 'ratified'):
+        ratified = _field(row, 'id', str, 'ratified[].')
+        for site in _rows(row, 'sites', 'ratified[].'):
+            sites.append(
+                InlineSite(
+                    ratified=ratified,
+                    path=_field(site, 'path', str, 'ratified[].sites[].'),
+                    line=_field(site, 'line', int, 'ratified[].sites[].'),
+                    kind=_field(site, 'kind', str, 'ratified[].sites[].'),
+                    codes=_codes(site, 'ratified[].sites[].'),
+                )
+            )
+    return tuple(sites)
+
+
+def parse_inline_report(document: object) -> InlineReport:
+    """The inline scanner's ``--json`` *document*, checked and typed.
+
+    Raises:
+        InstrumentFailure: another schema version, or a missing or mistyped field.
+    """
+    if not isinstance(document, dict):
+        raise InstrumentFailure(f'{_INLINE_SOURCE}: the report is not a JSON object')
+    version = document.get('schema_version')
+    if version != INLINE_REPORT_SCHEMA_VERSION:
+        raise InstrumentFailure(
+            f'{_INLINE_SOURCE} published schema_version {version}, but this register reads '
+            f'schema_version {INLINE_REPORT_SCHEMA_VERSION}; the two change together'
+        )
+    baseline = _field(document, 'baseline', dict, '')
+    ownership = _counts(document, 'ownership')
+    return InlineReport(
+        document=MappingProxyType(document),
+        seeded=_field(baseline, 'present', bool, 'baseline.'),
+        unowned=_field(ownership, 'unowned', int, 'ownership.'),
+        excess_total=_total(baseline, 'excess'),
+        slack_total=_total(baseline, 'slack'),
+        ratified_sites=_ratified_sites(document),
+        class_rows=tuple(
+            ClassRow(
+                suppression_class=_field(row, 'class', str, 'class_table[].'),
+                ratified=_field(row, 'ratified', str, 'class_table[].'),
+            )
+            for row in _rows(document, 'class_table')
+        ),
+        by_kind_code=tuple(
+            KindCodeRow(
+                kind=_field(row, 'kind', str, 'by_kind_code[].'),
+                code=_optional(row, 'code', str, 'by_kind_code[].'),
+                sites=_field(row, 'sites', int, 'by_kind_code[].'),
+            )
+            for row in _rows(document, 'by_kind_code')
+        ),
+        by_file=tuple(
+            FileRow(
+                path=_field(row, 'path', str, 'by_file[].'),
+                sites=_field(row, 'sites', int, 'by_file[].'),
+            )
+            for row in _rows(document, 'by_file')
+        ),
+        kind_totals=_counts(document, 'kind_totals'),
+        ownership=ownership,
+        sites=_field(document, 'sites', int, ''),
+        files_enumerated=_field(document, 'files_enumerated', int, ''),
+        files_tokenized=_field(document, 'files_tokenized', int, ''),
+        violations=len(_rows(document, 'violations')),
+    )
+
+
+def read_inline_report(root: Path) -> InlineReport:
+    """Run the inline scanner's ``--json`` over *root* and parse what it publishes."""
+    command = [sys.executable, str(_INLINE_SCRIPT), '--json', '--root', str(root)]
+    try:
+        completed = subprocess.run(
+            command, capture_output=True, text=True, timeout=_INLINE_TIMEOUT_SECS, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise InstrumentFailure(f'{_INLINE_SOURCE} could not be run -- {exc}') from exc
+    if completed.returncode != 0:
+        raise InstrumentFailure(
+            f'{_INLINE_SOURCE} exited {completed.returncode}: {completed.stderr.strip()}'
+        )
+    try:
+        document = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise InstrumentFailure(f'{_INLINE_SOURCE} printed something that is not JSON -- {exc}') from exc
+    return parse_inline_report(document)
+
+
+# ---------------------------------------------------------------------------
+# D3 — the closed world.
+
+#: Where the class table the inline scanner runs with is written.
+_CLASS_TABLE_SITE = 'scripts/inline_suppressions.py'
+
+
+def _unratified(policy_id: str) -> str:
+    return (
+        f"Policy('{policy_id}') names no row of {TABLE_PATH}; a Policy must cite an "
+        'operator ruling recorded there (PRD D3).'
+    )
+
+
+def _declared_policies(declaration: Declaration) -> list[tuple[str, Policy]]:
+    """Every Policy a declaration carries, with the subject a violation names."""
+    named: list[tuple[str, Disposition | None]] = [(declaration.list_id, declaration.default)]
+    named += [
+        (f'{declaration.list_id} override {key!r}', value)
+        for key, value in sorted(declaration.overrides.items())
+    ]
+    return [(subject, value) for subject, value in named if isinstance(value, Policy)]
+
+
+def closed_world_violations(
+    table: Sequence[Ratification],
+    declarations: Sequence[Declaration],
+    inline: InlineReport,
+) -> tuple[Violation, ...]:
+    """Every Policy, wherever written, that names no row of *table*."""
+    known = {row.id for row in table}
+    violations = [
+        Violation(declaration.path, declaration.line, subject, _unratified(policy.ratified), DECLARATION_FORMS)
+        for declaration in declarations
+        for subject, policy in _declared_policies(declaration)
+        if policy.ratified not in known
+    ]
+    violations += [
+        Violation(site.path, site.line, site.marker(), _unratified(site.ratified), INLINE_MARKER_FORMS)
+        for site in inline.ratified_sites
+        if site.ratified not in known
+    ]
+    violations += [
+        Violation(
+            _CLASS_TABLE_SITE,
+            None,
+            f'RATIFIED_SUPPRESSION_CLASSES {row.suppression_class}',
+            _unratified(row.ratified),
+            DECLARATION_FORMS,
+        )
+        for row in inline.class_rows
+        if row.ratified not in known
+    ]
+    return tuple(sorted(violations, key=Violation.sort_key))
+
+
+# ---------------------------------------------------------------------------
+# The register, and the CLI.
+
+
+@dataclasses.dataclass(frozen=True)
+class Register:
+    """One measurement of the whole register, rendered by both verbs."""
+
+    table: tuple[Ratification, ...]
+    discovery: Discovery
+    inline: InlineReport
+    violations: tuple[Violation, ...]
+
+
+def measure(root: Path) -> Register:
+    """Measure *root*'s register once."""
+    table = load_ratifications(root / TABLE_PATH)
+    discovery = declarations_in(read_corpus(root))
+    inline = read_inline_report(root)
+    closed = closed_world_violations(table, discovery.declarations, inline)
+    return Register(
+        table=table,
+        discovery=discovery,
+        inline=inline,
+        violations=tuple(sorted(discovery.faults + closed, key=Violation.sort_key)),
+    )
+
+
+_PROG = 'exception_register.py'
+
+_EPILOG = """exit codes:
+  --report  0 clean; 1 violations, one per line on stderr: a Policy naming no
+            row of the ratification table, or a malformed disposition literal;
+            2 instrument failure.
+  --json    0 whenever a document could be built, violations included as data;
+            2 instrument failure.
+  An instrument failure is a missing or malformed ratification table, a
+  declaration the static reader cannot read (a non-literal argument other than
+  keys, a duplicate list_id, an unparseable file), a failure of
+  inline_suppressions.py --json, or a missing import. Never a finding.
+"""
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=_PROG,
+        description=(
+            "INV-12's exception register: every governed exception list and inline "
+            'suppression, its disposition, and every Policy checked against the '
+            'ratification table.'
+        ),
+        epilog=_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    verbs = parser.add_mutually_exclusive_group()
+    verbs.add_argument('--report', action='store_true', help='print the register (the default)')
+    verbs.add_argument(
+        '--json', action='store_true', help='publish the register document; exit 0 unless broken'
+    )
+    parser.add_argument(
+        '--root',
+        type=Path,
+        default=REPO_ROOT,
+        help='the checkout to measure (default: the one holding this script)',
+    )
+    parser.add_argument(
+        '--sweep-state', type=Path, default=None, help="the owner sweep's run stamp"
+    )
+    return parser
+
+
+def _run(args: argparse.Namespace) -> int:
+    register = measure(Path(args.root))
+    if args.json:
+        print(json.dumps({'violations': [v.record() for v in register.violations]}, sort_keys=True))
+        return 0
+    for violation in register.violations:
+        print(violation.render(), file=sys.stderr)
+    return 1 if register.violations else 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """The entry point: every instrument failure lands on exit 2."""
+    args = _build_parser().parse_args(argv)
+    try:
+        return _run(args)
+    except InstrumentFailure as exc:
+        print(f'{_PROG}: {exc}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())
