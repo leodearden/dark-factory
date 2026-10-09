@@ -917,6 +917,25 @@ class _JsSpan(NamedTuple):
     closed: bool
 
 
+def _string_literal_end(source: str, quote_at: int) -> tuple[int, bool]:
+    """Return ``(end, closed)`` for the literal whose opening quote is at *quote_at*.
+
+    ``end`` is exclusive and clamped to ``len(source)``; ``closed`` is False
+    when the source ran out first.  A backslash skips the next character, so
+    an escaped quote cannot close the literal.
+    """
+    quote = source[quote_at]
+    i, n = quote_at + 1, len(source)
+    while i < n:
+        if source[i] == '\\':
+            i += 2
+            continue
+        if source[i] == quote:
+            return i + 1, True
+        i += 1
+    return n, False
+
+
 def _scan_js(source: str) -> list[_JsSpan]:
     """Return the string-literal and comment spans of *source*, in order.
 
@@ -933,19 +952,9 @@ def _scan_js(source: str) -> list[_JsSpan]:
         ch = source[i]
 
         if ch in '\'"`':
-            start = i
-            i += 1
-            closed = False
-            while i < n:
-                if source[i] == '\\':  # an escaped char cannot close the literal
-                    i += 2
-                    continue
-                if source[i] == ch:
-                    i += 1
-                    closed = True
-                    break
-                i += 1
-            spans.append(_JsSpan(start, min(i, n), 'string', ch, closed))
+            end, closed = _string_literal_end(source, i)
+            spans.append(_JsSpan(i, end, 'string', ch, closed))
+            i = end
             continue
 
         if source[i : i + 2] == '//':
@@ -1371,6 +1380,65 @@ def extract_df_data_block(src: str, key: str) -> str:
     if m is None:
         return ''
     return walk_balanced(src, m.end() - 1)  # m.end() - 1 is the opening `{`
+
+
+# ---------------------------------------------------------------------------
+# JSX opening-tag walk.
+#
+# Spans one opening tag, attributes included, so a probe can confine itself to
+# that element.  Contract: test_jsx_source_helpers.py::TestJsxOpenTagEnd.
+# ---------------------------------------------------------------------------
+
+
+def jsx_open_tag_end(src: str, start: int) -> int | None:
+    """Return the index JUST PAST the ``>`` closing the opening tag at *start*.
+
+    *start* must index the tag's ``<``; ``src[start:end]`` is then the whole
+    tag, and ``src[end - 2:end] == '/>'`` tells a self-closing one.
+
+    Quote- and brace-aware: a ``<`` or ``>`` inside an attribute EXPRESSION
+    (``onClick={() => ...}``, ``hint={x > 0 ? ...}``, a nested ``<Bar/>``) or
+    inside a string/template literal is an operator, not the end of the tag.
+
+    ``None`` when *start* does not begin a closed opening tag: it is never
+    closed, a literal is never terminated, a bare ``<`` opens at depth 0 first,
+    or a ``}`` drives brace depth negative.  It NEVER raises on a miss, because
+    what a miss means is the caller's call: to a probe trying candidate starts
+    it is the expected "not this one", but to a census running absence
+    assertions over the span it is a lost tag, a silent false GREEN, and that
+    caller must assert on ``None`` itself.  ``None`` rather than ``-1`` because
+    pyright rejects arithmetic on an unchecked Optional, whereas ``-1`` as an
+    exclusive slice end silently yields a near-whole-file span.
+
+    Not comment-aware (pass `strip_js_comments` output), and it shares
+    `_scan_js`'s lexer blind spots.
+    """
+    if src[start : start + 1] != '<':
+        raise ValueError(
+            f"jsx_open_tag_end: start={start} must index the tag's `<`, "
+            f'found {src[start : start + 1]!r}'
+        )
+    depth = 0
+    i = start + 1
+    while i < len(src):
+        c = src[i]
+        if c in '\'"`':
+            i, closed = _string_literal_end(src, i)
+            if not closed:
+                return None
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth < 0:
+                return None
+        elif depth == 0 and c == '>':
+            return i + 1
+        elif depth == 0 and c == '<':
+            return None
+        i += 1
+    return None
 
 
 # ---------------------------------------------------------------------------
