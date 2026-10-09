@@ -32,6 +32,7 @@ class NormalisationKind(enum.Enum):
     ANCHOR_FROM_REMEDIATION = "anchor_from_remediation"
     ANCHOR_FROM_TITLE = "anchor_from_title"
     TAG_DROPPED = "tag_dropped"
+    SEVERITY_MISSING = "severity_missing"
     SEVERITY_SUBSTITUTED = "severity_substituted"
     SEVERITY_REASON_MISSING = "severity_reason_missing"
     ROUTE_DEFAULTED = "route_defaulted"
@@ -65,7 +66,9 @@ def _normalised(kind: NormalisationKind, offered: object, used: str) -> tuple[No
     return (Normalisation(kind, _bounded_repr(offered), used),)
 
 
-_VERIFIER_TAG_RE = re.compile(r"h(?:[1-9]|1[0-4])|comments|tests|inv-\d+|inv-[a-z]+-\d+")
+_HEURISTIC_TAGS = tuple(f"h{number}" for number in range(1, 15))
+_STANCE_TAGS = ("comments", "tests")
+_INVARIANT_TAG_RE = re.compile(r"inv-(?:[a-z]+-)?\d+")
 _KEBAB_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _SYMBOL_RE = re.compile(r"[A-Za-z_][\w.]*")
 _LINE_PIN_RE = re.compile(r":\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*$")
@@ -73,7 +76,11 @@ _SLUG_PREFIX = "slug:"
 
 
 def _is_verifier_tag(tag: str) -> bool:
-    return _VERIFIER_TAG_RE.fullmatch(tag) is not None
+    return (
+        tag in _HEURISTIC_TAGS
+        or tag in _STANCE_TAGS
+        or _INVARIANT_TAG_RE.fullmatch(tag) is not None
+    )
 
 
 def is_finding_tag(tag: str) -> bool:
@@ -294,21 +301,30 @@ def _tags(raw: object) -> tuple[tuple[str, ...], tuple[Normalisation, ...]]:
     return (*kept, KIND_TAG), tuple(dropped)
 
 
+def _default_severity_note(raw: object) -> tuple[NormalisationKind, str]:
+    if raw is None:
+        return (
+            NormalisationKind.SEVERITY_MISSING,
+            f"verifier gave no severity; census used {DEFAULT_SEVERITY!r}",
+        )
+    return NormalisationKind.SEVERITY_SUBSTITUTED, (
+        f"verifier offered severity {_bounded_repr(raw)}, outside {SEVERITIES} "
+        f"(contract §4: critical is never a finding severity); census used "
+        f"{DEFAULT_SEVERITY!r}"
+    )
+
+
 def _severity(
     raw: object, raw_reason: object,
 ) -> tuple[str, str, tuple[Normalisation, ...]]:
     reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
     canonical = raw.strip().lower() if isinstance(raw, str) else ""
     if canonical not in SEVERITIES:
-        substitution = (
-            f"verifier offered severity {_bounded_repr(raw)}, outside {SEVERITIES} "
-            f"(contract §4: critical is never a finding severity); census used "
-            f"{DEFAULT_SEVERITY!r}"
-        )
+        kind, substitution = _default_severity_note(raw)
         return (
             DEFAULT_SEVERITY,
             f"{substitution}; verifier's reason: {reason}" if reason else substitution,
-            _normalised(NormalisationKind.SEVERITY_SUBSTITUTED, raw, DEFAULT_SEVERITY),
+            _normalised(kind, raw, DEFAULT_SEVERITY),
         )
     if reason:
         return canonical, reason, ()
@@ -366,4 +382,75 @@ def parse_verdict(
             *remediation_notes,
             *reason_notes,
         ),
+    )
+
+
+_SEVERITY_MEANINGS = {
+    "high": "the next change in this area is likely to be wrong or expensive without the fix",
+    "medium": "a real cost, contained",
+    "low": "worth doing when the area is next touched",
+}
+"""docs/quality-findings-contract.md §4's one-line meaning of each SEVERITIES value."""
+
+_ROUTE_MEANINGS = {
+    Route.MECHANICAL: "one anchor, no design choice; a competent agent can fix it from the reason",
+    Route.STRUCTURAL: (
+        "spans modules, chooses between designs, changes a contract, or proposes a split"
+    ),
+}
+"""docs/quality-findings-contract.md §6's meaning of each Route."""
+
+
+def _require_a_meaning_for_each(
+    table: str, stated: Iterable[str], required: Iterable[str],
+) -> None:
+    stated_values, required_values = sorted(stated), sorted(required)
+    if stated_values != required_values:
+        raise RuntimeError(
+            f"verdict.{table} must state a meaning for exactly {required_values}, "
+            f"got {stated_values}"
+        )
+
+
+_require_a_meaning_for_each("_SEVERITY_MEANINGS", _SEVERITY_MEANINGS, SEVERITIES)
+_require_a_meaning_for_each(
+    "_ROUTE_MEANINGS",
+    (route.value for route in _ROUTE_MEANINGS),
+    (route.value for route in Route),
+)
+
+_TAG_VOCABULARY = (
+    f"tags: {_HEURISTIC_TAGS[0]}..{_HEURISTIC_TAGS[-1]} for the heuristics of the "
+    "quality definition the finding rests on, by number, the heuristic it most "
+    f"rests on FIRST; {' or '.join(_STANCE_TAGS)} for its two stances; inv-<id> for "
+    "an invariant of this tree's docs/legibility/design-invariants.md.\n"
+)
+_SEVERITY_LINES = "".join(
+    f'  "{severity}": {_SEVERITY_MEANINGS[severity]}.\n' for severity in SEVERITIES
+)
+_ROUTE_LINES = "".join(f'  "{route.value}": {_ROUTE_MEANINGS[route]}.\n' for route in Route)
+
+
+def reply_instructions(project_root: str) -> str:
+    """The verify prompt's statement of the C4 reply: its JSON shape and the
+    anchors, tags, severities and routes ``parse_verdict`` keeps."""
+    severities = " | ".join(f'"{severity}"' for severity in SEVERITIES)
+    routes = " | ".join(f'"{route.value}"' for route in Route)
+    return (
+        "Respond with STRICT JSON ONLY (no prose, no markdown fences), for a "
+        "verified and a refuted claim alike, exactly this shape: "
+        '{"verified": true|false, "reason": "...", '
+        '"anchor": "path/to/file.py::symbol | path/to/file | slug:<kebab>", '
+        '"tags": ["h<n>", ...], '
+        f'"severity": {severities}, "severity_reason": "...", "route": {routes}, '
+        f'"remediation": {{"path": "<path relative to {project_root}>", '
+        '"change": "<one sentence>"} | null}.\n\n'
+        f"anchor: relative to {project_root}; the enclosing top-level or "
+        "class-level definition, else the file, else slug:<kebab> for a non-code "
+        "subject (a prompt, a contract, an operating practice).\n"
+        + _TAG_VOCABULARY
+        + "severity: never critical, which is reserved for operational breakage.\n"
+        + _SEVERITY_LINES
+        + "route:\n"
+        + _ROUTE_LINES
     )

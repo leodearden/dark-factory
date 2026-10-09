@@ -3169,58 +3169,6 @@ MAIN checkout even when the census runs from a worktree."""
 
 _QUALITY_DEFINITION_MARKER = "=== QUALITY DEFINITION ===\n"
 
-_SEVERITY_MEANINGS = {
-    "high": "the next change in this area is likely to be wrong or expensive without the fix",
-    "medium": "a real cost, contained",
-    "low": "worth doing when the area is next touched",
-}
-"""docs/quality-findings-contract.md §4's one-line meaning of each
-``verdict.SEVERITIES`` value, as the verify prompt states it."""
-
-_ROUTE_MEANINGS = {
-    verdict_mod.Route.MECHANICAL: (
-        "one anchor, no design choice; a competent agent can fix it from the reason"
-    ),
-    verdict_mod.Route.STRUCTURAL: (
-        "spans modules, chooses between designs, changes a contract, or proposes a split"
-    ),
-}
-"""docs/quality-findings-contract.md §6's meaning of each route."""
-
-
-def _verdict_response_shape(project_root: str) -> str:
-    severities = " | ".join(f'"{severity}"' for severity in verdict_mod.SEVERITIES)
-    routes = " | ".join(f'"{route.value}"' for route in verdict_mod.Route)
-    severity_lines = "".join(
-        f'  "{severity}": {_SEVERITY_MEANINGS[severity]}.\n'
-        for severity in verdict_mod.SEVERITIES
-    )
-    route_lines = "".join(
-        f'  "{route.value}": {_ROUTE_MEANINGS[route]}.\n' for route in verdict_mod.Route
-    )
-    return (
-        "Respond with STRICT JSON ONLY (no prose, no markdown fences), for a "
-        "verified and a refuted claim alike, exactly this shape: "
-        '{"verified": true|false, "reason": "...", '
-        '"anchor": "path/to/file.py::symbol | path/to/file | slug:<kebab>", '
-        '"tags": ["h<n>", ...], '
-        '"severity": ' + severities + ', "severity_reason": "...", '
-        '"route": ' + routes + ", "
-        '"remediation": {"path": "<path relative to ' + project_root + '>", '
-        '"change": "<one sentence>"} | null}.\n\n'
-        "anchor: relative to " + project_root + "; the enclosing top-level or "
-        "class-level definition, else the file, else slug:<kebab> for a non-code "
-        "subject (a prompt, a contract, an operating practice).\n"
-        "tags: h1..h14 for the heuristics of the definition above the finding "
-        "rests on, by number, the heuristic it most rests on FIRST; comments or "
-        "tests for its two stances; inv-<id> for an invariant of this tree's "
-        "docs/legibility/design-invariants.md.\n"
-        "severity: never critical, which is reserved for operational breakage.\n"
-        + severity_lines
-        + "route:\n"
-        + route_lines
-    )
-
 
 def _verify_prompt(cluster: dict, *, project_root: str, quality_block: str) -> str:
     """Prompt for the real Sonnet verify_fn: confirm-or-refute one novel
@@ -3254,7 +3202,7 @@ def _verify_prompt(cluster: dict, *, project_root: str, quality_block: str) -> s
         "Judge the cost the confusion imposes on the next change against the "
         "quality definition below.\n\n"
         + _QUALITY_DEFINITION_MARKER + quality_block
-        + "\n=== RESPONSE ===\n" + _verdict_response_shape(str(project_root))
+        + "\n=== RESPONSE ===\n" + verdict_mod.reply_instructions(str(project_root))
         + "\n=== CLUSTER ===\n" + json.dumps(cluster)
     )
 
@@ -3287,9 +3235,11 @@ def _synthesis_prompt(verified: list, *, quality_block: str) -> str:
 
 
 def _with_verdict(cluster: dict, found: verdict_mod.Verdict) -> dict:
-    """*cluster* carrying its Verdict, plus the Verdict's in-tree remediation
-    when the claim is verified: a refuted claim never carries one."""
-    with_verdict = {**cluster, "verdict": found}
+    """*cluster* carrying its Verdict, its remediation exactly the Verdict's
+    in-tree one when the claim is verified: a refuted claim, or a Verdict
+    without a remediation, carries none whatever the cluster arrived with."""
+    unremediated = {key: value for key, value in cluster.items() if key != "remediation"}
+    with_verdict = {**unremediated, "verdict": found}
     if found.verified and found.remediation is not None:
         return {**with_verdict, "remediation": found.remediation.to_record()}
     return with_verdict
@@ -3304,20 +3254,24 @@ def _log_verdict_normalisations(title, found: verdict_mod.Verdict) -> None:
 
 
 def _verdict_of(cluster: dict, *, project_root: str) -> verdict_mod.Verdict:
-    """*cluster*'s Verdict, else the verdict parser's defaults for a bare
-    verified reply: normalised, logged and counted like any other verdict."""
+    """*cluster*'s Verdict, else the verdict parser's reading of a verified
+    reply stating only the cluster's own remediation: normalised, logged and
+    counted like any other verdict."""
     found = cluster.get("verdict")
     if isinstance(found, verdict_mod.Verdict):
         return found
     defaulted = verdict_mod.parse_verdict(
-        {"verified": True}, title=cluster.get("title") or "", project_root=project_root,
+        {"verified": True, "remediation": cluster.get("remediation")},
+        title=cluster.get("title") or "",
+        project_root=project_root,
     )
     _log_verdict_normalisations(cluster.get("title"), defaulted)
     return defaulted
 
 
 def _verified_with_verdicts(verified: list, *, project_root: str) -> list[dict]:
-    """*verified*, every cluster carrying a Verdict (``_verdict_of``)."""
+    """*verified*, every cluster carrying a Verdict (``_verdict_of``) and
+    that Verdict's remediation (``_with_verdict``)."""
     verdictless = [
         cluster.get("title")
         for cluster in verified
@@ -3330,7 +3284,7 @@ def _verified_with_verdicts(verified: list, *, project_root: str) -> list[dict]:
             len(verdictless), verdictless,
         )
     return [
-        {**cluster, "verdict": _verdict_of(cluster, project_root=project_root)}
+        _with_verdict(cluster, _verdict_of(cluster, project_root=project_root))
         for cluster in verified
     ]
 

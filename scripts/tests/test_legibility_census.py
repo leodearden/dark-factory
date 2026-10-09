@@ -2033,13 +2033,14 @@ def test_build_method_conforms_to_the_independent_report_checker(tmp_path, state
     assert record["method"]["as_of_sha"] == "a" * 40
 
 
-def test_build_method_records_every_verify_normalisation_count():
+def test_build_method_records_a_copy_of_every_verify_normalisation_count():
     counts = {**verdict.count_normalisations([]), "tag_dropped": 2}
+    recorded = dict(counts)
 
     method = _method(verify_normalisations=counts)
+    counts["tag_dropped"] = 99
 
-    assert method["extra"]["verify_normalisations"] == counts
-    assert set(counts) == {kind.value for kind in verdict.NormalisationKind}
+    assert method["extra"]["verify_normalisations"] == recorded
 
 
 def test_build_method_since_is_none_text_without_a_prior_census():
@@ -3954,8 +3955,65 @@ def test_run_census_promotes_a_verdictless_cluster_through_the_parsers_defaults(
         for record in caplog.records
         if record.levelno == logging.WARNING
     )
+    assert "critical" not in entry["severity_reason"]
     assert _recorded_normalisations(kwargs) == _normalisation_counts(
-        anchor_from_title=1, severity_substituted=1, route_defaulted=1, reason_missing=1,
+        anchor_from_title=1, severity_missing=1, route_defaulted=1, reason_missing=1,
+    )
+
+
+def _verdictless_verify_fn(remediation):
+    def verify_fn(clusters, *, model):
+        verified = [
+            {**c, "remediation": remediation}
+            for c in clusters
+            if c.get("title") == _PROMOTED_TITLE
+        ]
+        return {"verified": verified, "rejected": [], "fixed": []}
+
+    return verify_fn
+
+
+def test_run_census_reads_a_verdictless_clusters_in_tree_remediation_into_its_verdict(
+    tmp_path,
+):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "fixture.md").write_text("fixture\n", encoding="utf-8")
+    synthesize_fn = _make_fake_synthesize_fn()
+    kwargs = _promotion_kwargs(tmp_path, verify_fn=_verdictless_verify_fn(_IN_TREE_REMEDIATION))
+    kwargs["synthesize_fn"] = synthesize_fn
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    [cluster] = synthesize_fn.calls[0]["verified"]
+    assert cluster["verdict"].remediation == verdict.Remediation(**_IN_TREE_REMEDIATION)
+    assert cluster["verdict"].route is verdict.Route.MECHANICAL
+    assert cluster["remediation"] == _IN_TREE_REMEDIATION
+    [filed] = kwargs["submit_fn"].calls
+    assert _IN_TREE_REMEDIATION["path"] in filed["description"]
+    assert _recorded_normalisations(kwargs) == _normalisation_counts(
+        anchor_from_remediation=1, severity_missing=1, route_defaulted=1, reason_missing=1,
+    )
+
+
+def test_run_census_drops_a_verdictless_clusters_out_of_tree_remediation(tmp_path):
+    synthesize_fn = _make_fake_synthesize_fn()
+    kwargs = _promotion_kwargs(
+        tmp_path,
+        verify_fn=_verdictless_verify_fn({"path": "docs/missing.md", "change": "Document X"}),
+    )
+    kwargs["synthesize_fn"] = synthesize_fn
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    [cluster] = synthesize_fn.calls[0]["verified"]
+    assert cluster["verdict"].remediation is None
+    assert "remediation" not in cluster
+    assert all("docs/missing.md" not in call["description"] for call in kwargs["submit_fn"].calls)
+    assert _recorded_normalisations(kwargs) == _normalisation_counts(
+        anchor_from_title=1, severity_missing=1, route_defaulted=1, reason_missing=1,
+        remediation_rejected=1,
     )
 
 

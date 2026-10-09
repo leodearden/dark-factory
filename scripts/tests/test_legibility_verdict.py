@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import codebook
@@ -460,6 +463,22 @@ def test_parse_verdict_drops_a_non_list_tags_value_as_one(root: Path) -> None:
     assert _offers(v, _K.TAG_DROPPED) == [repr("h13")]
 
 
+@pytest.mark.parametrize(
+    ("tag", "kept"),
+    [
+        ("h1", True), ("h14", True), ("h0", False), ("h15", False), ("h01", False),
+        ("comments", True), ("tests", True), ("comment", False),
+        ("inv-7", True), ("inv-sf-3", True), ("inv-", False), ("inv-sf", False),
+    ],
+)
+def test_parse_verdict_keeps_exactly_the_verifier_tag_vocabulary(
+    root: Path, tag: str, kept: bool,
+) -> None:
+    v = _parse({**_FULL_RAW, "tags": [tag]}, root)
+
+    assert (tag in v.tags) is kept
+
+
 @pytest.mark.parametrize("raw", [{"tags": []}, {"tags": None}, {}], ids=["empty", "null", "absent"])
 def test_parse_verdict_takes_no_tags_uncounted(root: Path, raw: dict) -> None:
     v = _parse({**_without(_FULL_RAW, "tags"), **raw}, root)
@@ -486,8 +505,7 @@ _OFF_ENUM_SEVERITIES = [
     pytest.param({"severity": "critical"}, "critical", id="critical"),
     pytest.param({"severity": "urgent"}, "urgent", id="urgent"),
     pytest.param({"severity": "severe"}, "severe", id="severe"),
-    pytest.param({"severity": None}, None, id="null"),
-    pytest.param({}, None, id="absent"),
+    pytest.param({"severity": ""}, "", id="empty"),
     pytest.param({"severity": 3}, 3, id="non-str"),
 ]
 
@@ -519,6 +537,42 @@ def test_parse_verdict_keeps_the_verifiers_reason_inside_a_substitution(
     assert "the merge lane halts" in v.severity_reason
     assert repr(offered) in v.severity_reason
     assert _kinds(v) == [_K.SEVERITY_SUBSTITUTED]
+
+
+_MISSING_SEVERITIES = [
+    pytest.param({}, id="absent"),
+    pytest.param({"severity": None}, id="null"),
+]
+
+
+@pytest.mark.parametrize("raw", _MISSING_SEVERITIES)
+def test_parse_verdict_states_a_missing_severity_as_none_given(root: Path, raw: dict) -> None:
+    base = _without(_without(_FULL_RAW, "severity"), "severity_reason")
+
+    v = _parse({**base, **raw}, root)
+
+    assert v.severity == "medium"
+    assert "no severity" in v.severity_reason
+    assert "medium" in v.severity_reason
+    assert "critical" not in v.severity_reason
+    assert "offered" not in v.severity_reason
+    assert v.normalisations == (
+        verdict.Normalisation(_K.SEVERITY_MISSING, repr(None), "medium"),
+    )
+
+
+@pytest.mark.parametrize("raw", _MISSING_SEVERITIES)
+def test_parse_verdict_keeps_the_verifiers_reason_beside_a_missing_severity(
+    root: Path, raw: dict,
+) -> None:
+    base = _without(_FULL_RAW, "severity")
+
+    v = _parse({**base, **raw, "severity_reason": "the merge lane halts"}, root)
+
+    assert v.severity == "medium"
+    assert "no severity" in v.severity_reason
+    assert "the merge lane halts" in v.severity_reason
+    assert _kinds(v) == [_K.SEVERITY_MISSING]
 
 
 @pytest.mark.parametrize("raw", [{}, {"severity_reason": "  "}, {"severity_reason": 4}],
@@ -628,3 +682,55 @@ def test_parse_verdict_normalises_the_row_6_malformed_verdict(root: Path) -> Non
         "severity_substituted": 1,
         "route_defaulted": 1,
     }
+
+
+# ---------------------------------------------------------------------------
+# reply_instructions: the verify prompt's statement of the C4 reply, built from
+# the same vocabulary parse_verdict keeps.
+# ---------------------------------------------------------------------------
+
+_OBSERVED_ROOT = "/observed/tree"
+
+
+def test_reply_instructions_give_every_severity_and_route_a_meaning() -> None:
+    text = verdict.reply_instructions(_OBSERVED_ROOT)
+
+    for severity in verdict.SEVERITIES:
+        assert re.search(rf'^  "{severity}": \S', text, re.MULTILINE), severity
+    for route in verdict.Route:
+        assert re.search(rf'^  "{route.value}": \S', text, re.MULTILINE), route
+    assert _OBSERVED_ROOT in text
+    assert verdict.KIND_TAG not in text
+
+
+def test_reply_instructions_state_the_tag_vocabulary_parse_verdict_keeps() -> None:
+    text = verdict.reply_instructions(_OBSERVED_ROOT)
+
+    assert "h1..h14" in text
+    assert "comments or tests" in text
+    assert "inv-<id>" in text
+
+
+_SCRIPTS_DIR = Path(__file__).resolve().parents[1]
+
+
+def test_importing_verdict_fails_on_a_codebook_severity_without_a_meaning() -> None:
+    probe = (
+        "from legibility import codebook\n"
+        "schema = codebook.V2_SCHEMA['properties']['entries']['items']['properties']\n"
+        "schema['severity']['enum'].append('critical')\n"
+        "from legibility import verdict\n"
+    )
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(
+        [str(_SCRIPTS_DIR), str(_SCRIPTS_DIR / "legibility")],
+    )}
+
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True, text=True, env=env, timeout=60, check=False,
+    )
+
+    assert result.returncode != 0
+    assert "RuntimeError" in result.stderr
+    assert "['critical', 'high', 'low', 'medium']" in result.stderr
+    assert "['high', 'low', 'medium']" in result.stderr
