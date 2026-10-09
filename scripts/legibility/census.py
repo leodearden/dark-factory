@@ -112,6 +112,7 @@ from legibility import (  # noqa: E402
     session_runner,
     unlanded,
 )
+from legibility import verdict as verdict_mod  # noqa: E402
 
 # The banner marker list itself lives in shared.cap_markers and is never
 # restated here -- this module only asks the question, via the predicate.
@@ -3213,40 +3214,21 @@ def _synthesis_prompt(verified: list) -> str:
     )
 
 
-def _in_tree_remediation(raw, *, project_root: str) -> dict | None:
-    """The verifier's proposed remediation, normalised to a path relative to
-    *project_root*, or ``None`` unless it names something that EXISTS below
-    that tree's root. The root itself names no fix surface: it would let a
-    vague reply pass the singleton gate. The verifier is sandboxed to the
-    observed tree, so a remediation is by construction a change the observed
-    project can make."""
-    if filing_policy.proposed_remediation({"remediation": raw}) is None:
-        return None
-    root = Path(project_root).resolve()
-    try:
-        target = (root / raw["path"]).resolve()
-        below_root = target != root and target.is_relative_to(root) and target.exists()
-    except (OSError, ValueError):
-        return None
-    if not below_root:
-        return None
-    return {"path": target.relative_to(root).as_posix(), "change": raw["change"].strip()}
+def _with_verdict(cluster: dict, found: verdict_mod.Verdict) -> dict:
+    """*cluster* carrying its Verdict, plus the Verdict's in-tree remediation
+    when the claim is verified: a refuted claim never carries one."""
+    with_verdict = {**cluster, "verdict": found}
+    if found.verified and found.remediation is not None:
+        return {**with_verdict, "remediation": found.remediation.to_record()}
+    return with_verdict
 
 
-def _with_in_tree_remediation(cluster: dict, raw, *, project_root: str) -> dict:
-    """*cluster*, plus the verifier's remediation when it survives
-    ``_in_tree_remediation``. An offered-but-rejected remediation is logged,
-    never silently dropped."""
-    remediation = _in_tree_remediation(raw, project_root=project_root)
-    if remediation is not None:
-        return {**cluster, "remediation": remediation}
-    if raw is not None:
+def _log_verdict_normalisations(title, found: verdict_mod.Verdict) -> None:
+    for note in found.normalisations:
         logger.warning(
-            "census: verifier remediation for cluster %r rejected (not an existing "
-            "path below %s): %r",
-            cluster.get("title"), project_root, raw.get("path") if isinstance(raw, dict) else raw,
+            "census: verdict for cluster %r normalised (%s): offered %s, used %r",
+            title, note.kind.value, note.offered, note.used,
         )
-    return cluster
 
 
 def _build_default_verify_fn(
@@ -3258,8 +3240,9 @@ def _build_default_verify_fn(
 ):
     """Build the real ``verify_fn(clusters, *, model)`` seam: one Sonnet
     call per cluster via *invoke* (in production the pooled runner's verify
-    stage, ``census_stage_specs``), parsed via ``coder.parse_coder_output``.
-    Any per-cluster failure (invocation error, unparseable output) rejects
+    stage, ``census_stage_specs``), parsed via ``coder.parse_coder_output``
+    and then ``verdict.parse_verdict``: verified and refuted clusters carry
+    their parsed Verdict under ``"verdict"``. Any per-cluster failure (invocation error, unparseable output) rejects
     that cluster rather than crashing the whole census -- a conservative
     fail-closed default for an unverifiable claim. This default never
     reports a "fixed" entry (a stronger claim than a per-cluster verify
@@ -3441,7 +3424,7 @@ def _build_default_verify_fn(
                 continue
 
             try:
-                verdict = coder.parse_coder_output(raw)
+                parsed = coder.parse_coder_output(raw)
             except Exception as exc:  # noqa: BLE001 - an unparseable verdict rejects, never crashes
                 # (a) Only a reply that failed to parse as a verdict is
                 # eligible for the banner scan. A parsed verdict is a verdict,
@@ -3474,14 +3457,22 @@ def _build_default_verify_fn(
                 )
                 rejected.append(cluster)
                 continue
-            if verdict.get("verified"):
-                verified.append(
-                    _with_in_tree_remediation(
-                        cluster, verdict.get("remediation"), project_root=project_root,
-                    )
+            try:
+                found = verdict_mod.parse_verdict(
+                    parsed, title=cluster.get("title") or "", project_root=project_root,
                 )
-            else:
+            except verdict_mod.VerdictError as exc:
+                logger.warning(
+                    "census: verify reply for cluster %r is not a verdict: %s",
+                    cluster.get("title"), exc,
+                )
                 rejected.append(cluster)
+                continue
+            _log_verdict_normalisations(cluster.get("title"), found)
+            if found.verified:
+                verified.append(_with_verdict(cluster, found))
+            else:
+                rejected.append(_with_verdict(cluster, found))
 
             # (c) The backstop. Guarded on `remaining > 1` so no probe is
             # spent after the last cluster, where it would guard a stage
