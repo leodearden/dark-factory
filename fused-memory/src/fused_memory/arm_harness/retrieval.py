@@ -47,13 +47,13 @@ def recall_metric(metric_id: str, ranks: Sequence[Rank], k: int) -> Metric | Non
     )
 
 
-def mrr_metric(ranks: Sequence[Rank]) -> Metric | None:
+def mrr_metric(ranks: Sequence[Rank], metric_id: str = EmbeddingMetricId.MRR) -> Metric | None:
     _require_one_based(ranks)
     if not ranks:
         return None
     reciprocal = [1 / rank if rank is not None else 0.0 for rank in ranks]
     return Metric(
-        metric_id=EmbeddingMetricId.MRR,
+        metric_id=metric_id,
         kind='scalar',
         value=sum(reciprocal) / len(ranks),
         n=len(ranks),
