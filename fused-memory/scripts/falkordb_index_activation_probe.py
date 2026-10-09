@@ -546,8 +546,9 @@ def _case_fold(reader: GraphReader, group_id: str) -> CaseFoldRecord:
 
 
 async def run_probe(
-    search: SearchFn, task_ids: Sequence[str], *, stores: tuple[str, ...] | None,
+    search: SearchFn, task_ids: Sequence[str], *, stores: tuple[str, ...] | None, asserted: bool,
 ) -> ProbeRun:
+    """The briefing probe over *task_ids*; only an *asserted* run carries a verdict."""
     queries: list[ProbeQuery] = []
     for task_id in task_ids:
         query = RETIRED_TASK_TEMPLATE.format(task_id=task_id)
@@ -561,15 +562,14 @@ async def run_probe(
             results=outcome.results,
             hit=query_hit(outcome.results, task_id),
         ))
+    verdict = (
+        briefing_verdict({query.task_id: query.hit for query in queries}, floor=PROBE_FLOOR)
+        if asserted else None
+    )
     return ProbeRun(
         template=RETIRED_TASK_TEMPLATE, stores=stores, limit=PROBE_LIMIT,
-        queries=tuple(queries), verdict=None,
+        queries=tuple(queries), verdict=verdict,
     )
-
-
-def with_verdict(probe: ProbeRun) -> ProbeRun:
-    hits_by_id = {query.task_id: query_hit(query.results, query.task_id) for query in probe.queries}
-    return dataclasses.replace(probe, verdict=briefing_verdict(hits_by_id, floor=PROBE_FLOOR))
 
 
 async def measure(
@@ -595,9 +595,9 @@ async def measure(
     )
 
     probe_ids = rebaselined_ids(replacements)
-    asserted = with_verdict(await run_probe(search, probe_ids, stores=(GRAPHITI_STORE,)))
-    original = await run_probe(search, ORIGINAL_PROBE_IDS, stores=(GRAPHITI_STORE,))
-    unscoped = await run_probe(search, probe_ids, stores=None)
+    asserted = await run_probe(search, probe_ids, stores=(GRAPHITI_STORE,), asserted=True)
+    original = await run_probe(search, ORIGINAL_PROBE_IDS, stores=(GRAPHITI_STORE,), asserted=False)
+    unscoped = await run_probe(search, probe_ids, stores=None, asserted=False)
 
     return ActivationRecord(
         measured_at=measured_at,
