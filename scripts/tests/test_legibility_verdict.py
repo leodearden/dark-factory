@@ -419,3 +419,212 @@ def test_count_normalisations_sums_each_kind_across_verdicts(root: Path) -> None
         "anchor_rewritten": 2,
         "remediation_rejected": 1,
     }
+
+
+# ---------------------------------------------------------------------------
+# Tags, severity, route and reason normalisation (PRD §4.8 row 6).
+# ---------------------------------------------------------------------------
+
+_K = verdict.NormalisationKind
+
+
+def _offers(v: verdict.Verdict, kind: verdict.NormalisationKind) -> list[str]:
+    return [note.offered for note in v.normalisations if note.kind is kind]
+
+
+def test_parse_verdict_keeps_vocabulary_tags_and_counts_every_drop(root: Path) -> None:
+    raw_tags = [
+        "h13", "bogus", "H2 ", "inv-11", "inv-sf-3", "kind:review", "kind:confusion", "h13", 7,
+    ]
+
+    v = _parse({**_FULL_RAW, "tags": raw_tags}, root)
+
+    assert v.tags == ("h13", "h2", "inv-11", "inv-sf-3", "kind:confusion")
+    assert _kinds(v) == [_K.TAG_DROPPED] * 5
+    assert _offers(v, _K.TAG_DROPPED) == [
+        repr("bogus"), repr("kind:review"), repr("kind:confusion"), repr("h13"), repr(7),
+    ]
+
+
+def test_parse_verdict_primary_tag_is_the_first_surviving_verifier_tag(root: Path) -> None:
+    v = _parse({**_FULL_RAW, "tags": ["bogus", "tests", "h3"]}, root)
+
+    assert v.tags == ("tests", "h3", verdict.KIND_TAG)
+
+
+def test_parse_verdict_drops_a_non_list_tags_value_as_one(root: Path) -> None:
+    v = _parse({**_FULL_RAW, "tags": "h13"}, root)
+
+    assert v.tags == (verdict.KIND_TAG,)
+    assert _kinds(v) == [_K.TAG_DROPPED]
+    assert _offers(v, _K.TAG_DROPPED) == [repr("h13")]
+
+
+@pytest.mark.parametrize("raw", [{"tags": []}, {"tags": None}, {}], ids=["empty", "null", "absent"])
+def test_parse_verdict_takes_no_tags_uncounted(root: Path, raw: dict) -> None:
+    v = _parse({**_without(_FULL_RAW, "tags"), **raw}, root)
+
+    assert v.tags == (verdict.KIND_TAG,)
+    assert v.normalisations == ()
+
+
+@pytest.mark.parametrize(
+    ("offered", "expected"),
+    [("high", "high"), ("medium", "medium"), ("low", "low"), (" HIGH ", "high")],
+)
+def test_parse_verdict_keeps_an_enum_severity_uncounted(
+    root: Path, offered: str, expected: str,
+) -> None:
+    v = _parse({**_FULL_RAW, "severity": offered, "severity_reason": "because"}, root)
+
+    assert v.severity == expected
+    assert v.severity_reason == "because"
+    assert v.normalisations == ()
+
+
+_OFF_ENUM_SEVERITIES = [
+    pytest.param({"severity": "critical"}, "critical", id="critical"),
+    pytest.param({"severity": "urgent"}, "urgent", id="urgent"),
+    pytest.param({"severity": "severe"}, "severe", id="severe"),
+    pytest.param({"severity": None}, None, id="null"),
+    pytest.param({}, None, id="absent"),
+    pytest.param({"severity": 3}, 3, id="non-str"),
+]
+
+
+@pytest.mark.parametrize(("raw", "offered"), _OFF_ENUM_SEVERITIES)
+def test_parse_verdict_substitutes_medium_for_an_off_enum_severity(
+    root: Path, raw: dict, offered,
+) -> None:
+    base = _without(_without(_FULL_RAW, "severity"), "severity_reason")
+
+    v = _parse({**base, **raw}, root)
+
+    assert v.severity == "medium"
+    assert repr(offered) in v.severity_reason
+    assert "medium" in v.severity_reason
+    assert _kinds(v) == [_K.SEVERITY_SUBSTITUTED]
+    assert _offers(v, _K.SEVERITY_SUBSTITUTED) == [repr(offered)]
+
+
+@pytest.mark.parametrize(("raw", "offered"), _OFF_ENUM_SEVERITIES)
+def test_parse_verdict_keeps_the_verifiers_reason_inside_a_substitution(
+    root: Path, raw: dict, offered,
+) -> None:
+    base = _without(_FULL_RAW, "severity")
+
+    v = _parse({**base, **raw, "severity_reason": "the merge lane halts"}, root)
+
+    assert v.severity == "medium"
+    assert "the merge lane halts" in v.severity_reason
+    assert repr(offered) in v.severity_reason
+    assert _kinds(v) == [_K.SEVERITY_SUBSTITUTED]
+
+
+@pytest.mark.parametrize("raw", [{}, {"severity_reason": "  "}, {"severity_reason": 4}],
+                         ids=["absent", "blank", "non-str"])
+def test_parse_verdict_states_a_missing_severity_reason_and_counts_it(
+    root: Path, raw: dict,
+) -> None:
+    v = _parse({**_without(_FULL_RAW, "severity_reason"), **raw}, root)
+
+    assert v.severity == "high"
+    assert v.severity_reason.strip()
+    assert _kinds(v) == [_K.SEVERITY_REASON_MISSING]
+
+
+@pytest.mark.parametrize(
+    ("offered", "expected"),
+    [
+        ("mechanical", verdict.Route.MECHANICAL),
+        ("structural", verdict.Route.STRUCTURAL),
+        ("MECHANICAL", verdict.Route.MECHANICAL),
+        (" Structural ", verdict.Route.STRUCTURAL),
+    ],
+)
+def test_parse_verdict_keeps_a_named_route_uncounted(
+    root: Path, offered: str, expected: verdict.Route,
+) -> None:
+    v = _parse({**_FULL_RAW, "route": offered}, root)
+
+    assert v.route is expected
+    assert v.normalisations == ()
+
+
+_UNNAMED_ROUTES = [
+    pytest.param({}, None, id="absent"),
+    pytest.param({"route": None}, None, id="null"),
+    pytest.param({"route": "maybe"}, "maybe", id="unknown"),
+]
+
+
+@pytest.mark.parametrize(("raw", "offered"), _UNNAMED_ROUTES)
+def test_parse_verdict_defaults_the_route_to_mechanical_with_a_remediation(
+    root: Path, raw: dict, offered,
+) -> None:
+    v = _parse({**_without(_FULL_RAW, "route"), **raw}, root)
+
+    assert v.route is verdict.Route.MECHANICAL
+    assert v.normalisations == (
+        verdict.Normalisation(_K.ROUTE_DEFAULTED, repr(offered), "mechanical"),
+    )
+
+
+@pytest.mark.parametrize(("raw", "offered"), _UNNAMED_ROUTES)
+def test_parse_verdict_defaults_the_route_to_structural_without_a_remediation(
+    root: Path, raw: dict, offered,
+) -> None:
+    v = _parse({**_without(_FULL_RAW, "route"), "remediation": None, **raw}, root)
+
+    assert v.route is verdict.Route.STRUCTURAL
+    assert v.normalisations == (
+        verdict.Normalisation(_K.ROUTE_DEFAULTED, repr(offered), "structural"),
+    )
+
+
+def test_parse_verdict_defaults_the_route_to_structural_for_a_rejected_remediation(
+    root: Path,
+) -> None:
+    raw = {
+        **_without(_FULL_RAW, "route"),
+        "remediation": {"path": "docs/missing.md", "change": "Document X"},
+    }
+
+    v = _parse(raw, root)
+
+    assert v.route is verdict.Route.STRUCTURAL
+    assert sorted(kind.value for kind in _kinds(v)) == ["remediation_rejected", "route_defaulted"]
+
+
+@pytest.mark.parametrize("raw", [{}, {"reason": None}, {"reason": 5}],
+                         ids=["absent", "null", "non-str"])
+def test_parse_verdict_records_a_missing_reason(root: Path, raw: dict) -> None:
+    v = _parse({**_without(_FULL_RAW, "reason"), **raw}, root)
+
+    assert v.reason == ""
+    assert _kinds(v) == [_K.REASON_MISSING]
+
+
+def test_parse_verdict_normalises_the_row_6_malformed_verdict(root: Path) -> None:
+    raw = {
+        "verified": True,
+        "reason": "r",
+        "anchor": "pkg/missing.py::f",
+        "tags": ["h13", "bogus"],
+        "severity": "critical",
+        "severity_reason": "s",
+    }
+
+    v = _parse(raw, root, title=_TITLE)
+
+    assert v.anchor == _TITLE_SLUG
+    assert v.tags == ("h13", verdict.KIND_TAG)
+    assert v.severity == "medium"
+    assert v.route is verdict.Route.STRUCTURAL
+    assert verdict.count_normalisations([v]) == {
+        **{kind.value: 0 for kind in verdict.NormalisationKind},
+        "anchor_from_title": 1,
+        "tag_dropped": 1,
+        "severity_substituted": 1,
+        "route_defaulted": 1,
+    }
