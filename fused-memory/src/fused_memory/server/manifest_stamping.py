@@ -48,8 +48,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
+import threading
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -57,16 +59,43 @@ import yaml
 from pydantic import ValidationError
 from shared.capability_manifest import (
     MECHANICAL_CHECK_KINDS,
+    CapabilityManifestDoc,
     DeliveredCheckMeta,
     parse_capability_manifest,
 )
 from shared.delivered_check_polarity import GATE_REF, lint_delivered_checks
+from shared.safe_io import atomic_write_text
 
 from fused_memory.middleware.task_interceptor import interceptor_write_succeeded
 
 logger = logging.getLogger(__name__)
 
 _SIDECAR_SUFFIX = '.capability-manifest.yaml'
+
+#: Serializes every sidecar read-modify-write in this process. The on-disk
+#: steps run in worker threads, where two concurrent commit_planning calls on
+#: one sidecar would otherwise each stamp a stale read and one stamp would be
+#: lost. A threading.Lock, not an asyncio.Lock: it is taken in those threads,
+#: and a module-level asyncio.Lock would bind to whichever loop first used it.
+_SIDECAR_RMW_LOCK = threading.Lock()
+
+#: (task_id, prd_task_label, derived sidecar rel path) for one batch task.
+_ManifestTask = tuple[str, str, str]
+
+
+@dataclass(frozen=True)
+class _SidecarOutcome:
+    """What the on-disk steps 2-4 hand back to the coroutine.
+
+    ``doc`` is None when the sidecar failed to load or its stamp failed to
+    write: the report then ends at ``errors``, with nothing stamped.
+    """
+
+    root: Path
+    sidecar_rel: str
+    doc: CapabilityManifestDoc | None
+    stamped: tuple[str, ...]
+    errors: tuple[str, ...]
 
 
 async def stamp_capability_manifests(
@@ -168,7 +197,7 @@ async def _stamp_capability_manifests_impl(
     #    non-empty prd_path and prd_task_label. The sidecar path is derived
     #    STRICTLY via regex substitution — drift-immune vs the historically
     #    drifting .md filename.
-    manifest_tasks: list[tuple[str, str, str]] = []
+    manifest_tasks: list[_ManifestTask] = []
     for tid, task in zip(ids, tasks_data, strict=False):
         if not isinstance(task, dict):
             continue
@@ -185,144 +214,29 @@ async def _stamp_capability_manifests_impl(
     if not manifest_tasks:
         return None
 
-    # 2. Keep only distinct rel paths (insertion order) that stay CONTAINED
-    #    under project_root and whose file actually exists on disk.
-    #    prd_path is author-controlled task metadata (set by the /prd
-    #    decompose skill, read here without re-validation) — an absolute
-    #    path or one containing '../' would otherwise let both this read
-    #    and the step-4 write-back escape project_root, so every candidate
-    #    is resolved and containment-checked before it is ever stat-ed.
-    root = Path(project_root).resolve()
-    seen_rel_paths: list[str] = []
-    for _tid, _label, rel in manifest_tasks:
-        if rel not in seen_rel_paths:
-            seen_rel_paths.append(rel)
-    unsafe_rel_paths: list[str] = []
-    existing_rel_paths: list[str] = []
-    for rel in seen_rel_paths:
-        resolved = (root / rel).resolve()
-        if not resolved.is_relative_to(root):
-            unsafe_rel_paths.append(rel)
-            continue
-        if resolved.is_file():
-            existing_rel_paths.append(rel)
-    existing_rel_paths.sort()
-    if not existing_rel_paths:
-        if unsafe_rel_paths:
-            # Nothing safe to attach a report to (see the "no sidecar"
-            # no-op contract above), but a path-traversal attempt is worth
-            # a server-side signal even so.
-            logger.warning(
-                'stamp_capability_manifests: derived sidecar path(s) resolve '
-                'outside project_root, refusing to read/write: %r',
-                unsafe_rel_paths,
-            )
+    # 2-4 touch the filesystem and parse YAML, so they run off the event
+    # loop in one hop — see _stamp_sidecar_on_disk.
+    outcome = await asyncio.to_thread(_stamp_sidecar_on_disk, project_root, manifest_tasks)
+    if outcome is None:
         return None
-
-    # One-sidecar-per-batch is the normal contract. An unexpected second
-    # distinct sidecar path is processed as the lexicographically-first
-    # (deterministic), with the rest — and any containment-rejected
-    # candidates — named loudly in errors rather than silently dropped.
-    sidecar_rel = existing_rel_paths[0]
+    sidecar_rel = outcome.sidecar_rel
     report: dict[str, Any] = {
         'path': sidecar_rel,
-        'stamped': [],
+        'stamped': list(outcome.stamped),
         'missing_labels': [],
-        'errors': [],
+        'errors': list(outcome.errors),
     }
-    if len(existing_rel_paths) > 1:
-        extra = ', '.join(existing_rel_paths[1:])
-        report['errors'].append(
-            f'multiple capability-manifest sidecars matched this batch; '
-            f'processing {sidecar_rel!r}, ignoring: {extra}'
-        )
-    if unsafe_rel_paths:
-        extra = ', '.join(unsafe_rel_paths)
-        report['errors'].append(
-            f'sidecar path(s) resolved outside project_root, refused: {extra}'
-        )
-
-    # 3. Read + validate the sidecar via the shared α-loader. Fail-soft/loud:
-    #    a malformed sidecar (bad YAML syntax, or a doc that fails α's
-    #    pydantic schema) must never raise out of this helper — it's
-    #    recorded in report['errors'] and stamping is skipped entirely for
-    #    this sidecar. Validating BEFORE any mutation below guarantees a
-    #    malformed doc leaves the on-disk file byte-identical.
-    sidecar_abs = root / sidecar_rel
-    try:
-        raw_text = sidecar_abs.read_text(encoding='utf-8')
-        raw = yaml.safe_load(raw_text)
-        doc = parse_capability_manifest(raw)
-    except (OSError, yaml.YAMLError, ValidationError) as exc:
-        logger.warning(
-            'stamp_capability_manifests: failed to load/validate %s', sidecar_rel, exc_info=True,
-        )
-        report['errors'].append(f'{sidecar_rel}: failed to load/validate sidecar — {exc}')
+    doc = outcome.doc
+    if doc is None:
         return report
-    except Exception as exc:  # pragma: no cover - defensive fallback, never raise
-        logger.warning(
-            'stamp_capability_manifests: unexpected error loading %s', sidecar_rel, exc_info=True,
-        )
-        report['errors'].append(f'{sidecar_rel}: unexpected error loading sidecar — {exc}')
-        return report
-
-    # 4. Stamp task_id onto each matching label entry and write back to disk.
-    #    Scoped to batch tasks whose OWN derived rel path is this sidecar
-    #    (relevant only for the unexpected multi-sidecar case above). Also
-    #    guarded — an unexpected failure here (e.g. a disk write error)
-    #    must not raise, and must leave report['stamped'] empty since the
-    #    file was not confirmed written.
-    label_to_task_id: dict[str, str] = {
-        label: tid for tid, label, rel in manifest_tasks if rel == sidecar_rel
-    }
-    stamped_labels: list[str] = []
-    try:
-        for entry in raw.get('tasks', []):
-            if not isinstance(entry, dict):
-                continue
-            label = entry.get('label')
-            if label in label_to_task_id:
-                entry['task_id'] = int(label_to_task_id[label])
-                stamped_labels.append(label)
-        if stamped_labels:
-            # Write-to-temp + os.replace (mirrors curator_escalator.py's
-            # _write): a crash mid-write never leaves a torn, unparseable
-            # tracked sidecar — os.replace is atomic, so the file is either
-            # the old contents or the fully-written new ones. Unique
-            # per-write temp filename (pid + id(raw)) so concurrent writers
-            # can never share a temp path. ``finally`` cleans up the temp
-            # file on a write/replace *exception* (e.g. the os.replace
-            # failure the test below simulates); it does NOT run on a hard
-            # process kill between the write and the replace, so a
-            # uniquely-named ``.tmp`` sibling can still linger on disk in
-            # that case. That litter is harmless — sidecar discovery (step 2
-            # above) matches only the exact derived rel path, never a
-            # ``.tmp`` suffix — but it's real, not just theoretical.
-            tmp_path = sidecar_abs.parent / (
-                f'{sidecar_abs.name}.{os.getpid()}.{id(raw)}.tmp'
-            )
-            try:
-                tmp_path.write_text(
-                    yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
-                    encoding='utf-8',
-                )
-                os.replace(tmp_path, sidecar_abs)
-            finally:
-                tmp_path.unlink(missing_ok=True)
-    except Exception as exc:
-        logger.warning(
-            'stamp_capability_manifests: failed to stamp/write %s', sidecar_rel, exc_info=True,
-        )
-        report['errors'].append(f'{sidecar_rel}: failed to stamp/write sidecar — {exc}')
-        return report
-    report['stamped'] = stamped_labels
+    label_to_task_id = _labels_bound_to(manifest_tasks, sidecar_rel)
 
     # 4b. Batch prd_task_labels that don't appear among this sidecar's own
     #     task labels are recorded loudly rather than silently dropped —
     #     e.g. the decompose session referenced a label that was renamed or
     #     removed from the manifest after authoring. Order follows the
     #     batch (manifest_tasks) order, deduped, first-occurrence.
-    stamped_label_set = set(stamped_labels)
+    stamped_label_set = set(outcome.stamped)
     missing_labels: list[str] = []
     for _tid, label, rel in manifest_tasks:
         if rel == sidecar_rel and label not in stamped_label_set and label not in missing_labels:
@@ -401,7 +315,7 @@ async def _stamp_capability_manifests_impl(
                 lint_delivered_checks,
                 [{**check_meta, 'manifest_path': sidecar_rel} for check_meta in mechanical],
                 files=files_by_task_id.get(tid, []),
-                repo_root=str(root),
+                repo_root=str(outcome.root),
                 ref=GATE_REF,
             )
             refused = {f.check_name: f for f in findings if f.severity == 'reject'}
@@ -495,3 +409,143 @@ async def _stamp_capability_manifests_impl(
         report['polarity_warnings'] = polarity_warnings
 
     return report
+
+
+def _labels_bound_to(manifest_tasks: Sequence[_ManifestTask], sidecar_rel: str) -> dict[str, str]:
+    """``{prd_task_label: task_id}`` for the batch tasks whose sidecar is *sidecar_rel*."""
+    return {label: tid for tid, label, rel in manifest_tasks if rel == sidecar_rel}
+
+
+def _stamp_sidecar_on_disk(
+    project_root: str, manifest_tasks: Sequence[_ManifestTask]
+) -> _SidecarOutcome | None:
+    """Steps 2-4, synchronous: select the batch's sidecar, load it, stamp it.
+
+    Returns None when no derived sidecar is both contained under
+    *project_root* and present on disk — the coroutine's complete no-op.
+    Run via ``asyncio.to_thread``; never call it on the event loop.
+    """
+    root = Path(project_root).resolve()
+    sidecar_rel, selection_errors = _select_sidecar(root, manifest_tasks)
+    if sidecar_rel is None:
+        return None
+    with _SIDECAR_RMW_LOCK:
+        return _load_and_stamp(
+            root, sidecar_rel, _labels_bound_to(manifest_tasks, sidecar_rel), selection_errors,
+        )
+
+
+def _select_sidecar(
+    root: Path, manifest_tasks: Sequence[_ManifestTask]
+) -> tuple[str | None, tuple[str, ...]]:
+    """Step 2: choose the one sidecar this batch stamps, plus the errors naming the rest."""
+    # Keep only distinct rel paths (insertion order) that stay CONTAINED
+    # under project_root and whose file actually exists on disk. prd_path is
+    # author-controlled task metadata (set by the /prd decompose skill, read
+    # here without re-validation) — an absolute path or one containing '../'
+    # would otherwise let both the read and the step-4 write-back escape
+    # project_root, so every candidate is resolved and containment-checked
+    # before it is ever stat-ed.
+    seen_rel_paths = list(dict.fromkeys(rel for _tid, _label, rel in manifest_tasks))
+    unsafe_rel_paths: list[str] = []
+    existing_rel_paths: list[str] = []
+    for rel in seen_rel_paths:
+        resolved = (root / rel).resolve()
+        if not resolved.is_relative_to(root):
+            unsafe_rel_paths.append(rel)
+            continue
+        if resolved.is_file():
+            existing_rel_paths.append(rel)
+    existing_rel_paths.sort()
+    if not existing_rel_paths:
+        if unsafe_rel_paths:
+            # Nothing safe to attach a report to (see the "no sidecar"
+            # no-op contract), but a path-traversal attempt is worth a
+            # server-side signal even so.
+            logger.warning(
+                'stamp_capability_manifests: derived sidecar path(s) resolve '
+                'outside project_root, refusing to read/write: %r',
+                unsafe_rel_paths,
+            )
+        return None, ()
+
+    # One-sidecar-per-batch is the normal contract. An unexpected second
+    # distinct sidecar path is processed as the lexicographically-first
+    # (deterministic), with the rest — and any containment-rejected
+    # candidates — named loudly in errors rather than silently dropped.
+    sidecar_rel = existing_rel_paths[0]
+    errors: list[str] = []
+    if len(existing_rel_paths) > 1:
+        extra = ', '.join(existing_rel_paths[1:])
+        errors.append(
+            f'multiple capability-manifest sidecars matched this batch; '
+            f'processing {sidecar_rel!r}, ignoring: {extra}'
+        )
+    if unsafe_rel_paths:
+        extra = ', '.join(unsafe_rel_paths)
+        errors.append(f'sidecar path(s) resolved outside project_root, refused: {extra}')
+    return sidecar_rel, tuple(errors)
+
+
+def _load_and_stamp(
+    root: Path, sidecar_rel: str, label_to_task_id: dict[str, str], errors: tuple[str, ...],
+) -> _SidecarOutcome:
+    """Steps 3-4: validate the sidecar, then stamp its bound labels' task_ids to disk."""
+    # 3. Read + validate the sidecar via the shared α-loader. Fail-soft/loud:
+    #    a malformed sidecar (bad YAML syntax, or a doc that fails α's
+    #    pydantic schema) must never raise out of this helper — it's
+    #    recorded in errors and stamping is skipped entirely for this
+    #    sidecar. Validating BEFORE any mutation below guarantees a
+    #    malformed doc leaves the on-disk file byte-identical.
+    sidecar_abs = root / sidecar_rel
+    try:
+        raw_text = sidecar_abs.read_text(encoding='utf-8')
+        raw = yaml.safe_load(raw_text)
+        doc = parse_capability_manifest(raw)
+    except (OSError, yaml.YAMLError, ValidationError) as exc:
+        logger.warning(
+            'stamp_capability_manifests: failed to load/validate %s', sidecar_rel, exc_info=True,
+        )
+        return _SidecarOutcome(
+            root, sidecar_rel, None, (),
+            (*errors, f'{sidecar_rel}: failed to load/validate sidecar — {exc}'),
+        )
+    except Exception as exc:  # pragma: no cover - defensive fallback, never raise
+        logger.warning(
+            'stamp_capability_manifests: unexpected error loading %s', sidecar_rel, exc_info=True,
+        )
+        return _SidecarOutcome(
+            root, sidecar_rel, None, (),
+            (*errors, f'{sidecar_rel}: unexpected error loading sidecar — {exc}'),
+        )
+
+    # 4. Stamp task_id onto each matching label entry and write back to disk.
+    #    label_to_task_id holds only batch tasks whose OWN derived rel path
+    #    is this sidecar (relevant only for the unexpected multi-sidecar
+    #    case). Also guarded — an unexpected failure here (e.g. a disk write
+    #    error) must not raise, and must leave nothing reported as stamped
+    #    since the file was not confirmed written.
+    stamped_labels: list[str] = []
+    try:
+        for entry in raw.get('tasks', []):
+            if not isinstance(entry, dict):
+                continue
+            label = entry.get('label')
+            if label in label_to_task_id:
+                entry['task_id'] = int(label_to_task_id[label])
+                stamped_labels.append(label)
+        if stamped_labels:
+            atomic_write_text(
+                sidecar_abs,
+                yaml.safe_dump(raw, sort_keys=False, allow_unicode=True),
+                encoding='utf-8',
+            )
+    except Exception as exc:
+        logger.warning(
+            'stamp_capability_manifests: failed to stamp/write %s', sidecar_rel, exc_info=True,
+        )
+        return _SidecarOutcome(
+            root, sidecar_rel, None, (),
+            (*errors, f'{sidecar_rel}: failed to stamp/write sidecar — {exc}'),
+        )
+    return _SidecarOutcome(root, sidecar_rel, doc, tuple(stamped_labels), errors)
