@@ -1004,6 +1004,77 @@ class TestImportGraphChanges:
         ]
 
 
+def _as_schema_1(taken: dict[str, Any]) -> dict[str, Any]:
+    """What a pre-6612 measurement of the same tree recorded, e.g. plans/quality-metrics/review-all-dark_factory-20261008.json."""
+    old = copy.deepcopy(taken)
+    old['schema_version'] = 1
+    graph = old['import_graph']
+    del graph['hidden_cycles'], graph['typing_cycles']
+    for entry in graph['deferred']:
+        del entry['closes_cycle']
+    return old
+
+
+def _unknown_cycle_sets(side: str) -> list[str]:
+    return [
+        f'  hidden cycles unknown: the {side} snapshot is schema 1',
+        f'  typing cycles unknown: the {side} snapshot is schema 1',
+    ]
+
+
+class TestASchema1SnapshotIsStillRead:
+    @pytest.fixture
+    def taken(self, tmp_path: Path) -> dict[str, Any]:
+        return _measured(tmp_path, _GRAPH)
+
+    def test_it_is_valid(self, taken: dict[str, Any]) -> None:
+        old = _as_schema_1(taken)
+        assert snapshot.validate_snapshot(old, origin='v1') == old
+
+    def test_its_absent_cycle_sets_are_unknown_on_either_side(self, taken: dict[str, Any]) -> None:
+        # Nothing else in the section: deferred entries compare equal without closes_cycle.
+        old = _as_schema_1(taken)
+        assert _section(snapshot.diff_lines(taken, old), 'import graph:') == _unknown_cycle_sets(
+            'previous'
+        )
+        assert _section(snapshot.diff_lines(old, taken), 'import graph:') == _unknown_cycle_sets(
+            'current'
+        )
+
+    def test_a_measuring_run_diffs_against_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        root = _repo(tmp_path, _GRAPH)
+        first, second, previous = tmp_path / 's1.json', tmp_path / 's2.json', tmp_path / 'prev.json'
+        assert _run(root, first) == 0
+        previous.write_text(json.dumps(_as_schema_1(_load(first))), encoding='utf-8')
+        capsys.readouterr()
+        assert _run(root, second, '--diff', str(previous)) == 0
+        printed = capsys.readouterr().out.splitlines()
+        assert _section(printed, 'import graph:') == _unknown_cycle_sets('previous')
+        assert snapshot.main(['--current', str(second), '--diff', str(previous)]) == 0
+        printed = capsys.readouterr().out.splitlines()
+        assert _section(printed, 'import graph:') == _unknown_cycle_sets('previous')
+
+    def test_one_carrying_a_schema_2_field_is_refused(self, taken: dict[str, Any]) -> None:
+        old = _as_schema_1(taken)
+        old['import_graph']['deferred'][0]['closes_cycle'] = False
+        with pytest.raises(source_measures.MetricsError) as raised:
+            snapshot.validate_snapshot(old, origin='v1')
+        assert 'import_graph.deferred[0] keys' in str(raised.value)
+
+    def test_an_unread_version_is_refused_naming_the_read_ones(self, taken: dict[str, Any]) -> None:
+        with pytest.raises(source_measures.MetricsError) as raised:
+            snapshot.validate_snapshot({**taken, 'schema_version': 3}, origin='v3')
+        assert 'schema_version is 3' in str(raised.value)
+        assert 'one of [1, 2]' in str(raised.value)
+
+    def test_the_instrument_is_checked_before_the_version(self) -> None:
+        with pytest.raises(source_measures.MetricsError) as raised:
+            snapshot.validate_snapshot({'schema_version': 7, 'instrument': 'other'}, origin='foreign')
+        assert 'instrument' in str(raised.value)
+
+
 _COUPLING_BEFORE = 'from pkg import mod\n\ndef test_it():\n    assert mod._y\n'
 _COUPLING_AFTER = (
     'from unittest.mock import patch\nfrom pkg import mod\n\ndef test_it():\n'
