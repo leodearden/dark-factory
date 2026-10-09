@@ -7,7 +7,9 @@ wording); each judge-band write of the snapshot that
 ``freeze_write_triage_population.py`` froze is judged once per arm, through
 the SHIPPED ``write_triage_judge._call_llm`` and parser. A row follows ι's
 per-case contract (``score_write_triage_pairs.py::JudgedCase``, C2''), so μ
-scores the arm files with ι unchanged.
+scores the arm files with ι unchanged. Task 6530 (π2, §12 D19) adds a
+write-time mode: the same sample, each slate cut to the records created
+before its write and its band re-decided.
 
 Usage
 -----
@@ -44,6 +46,7 @@ import time
 import types
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +60,7 @@ from fused_memory.server.write_triage import (
     OUTCOME_STORED,
     TRIAGE_OUTCOMES,
     JudgeUsage,
+    decide_band,
 )
 
 # `_call_llm` is the one PRIVATE reach: an arm needs the raw text, the usage of
@@ -144,6 +148,15 @@ ARMS: tuple[Arm, ...] = (
 )
 
 
+class Slates(StrEnum):
+    """Which slate a write is judged on."""
+
+    #: The slate as frozen 2026-10-05, records created after the write included (π).
+    FROZEN = 'frozen'
+    #: Only records created strictly before the write, band re-decided (π2, PRD §12 D19).
+    WRITE_TIME = 'write-time'
+
+
 def _as_memory_result(candidate: Mapping[str, Any]) -> MemoryResult:
     """A frozen slate record as the row the shipped selector reads (``store_score`` included)."""
     return MemoryResult(
@@ -152,6 +165,38 @@ def _as_memory_result(candidate: Mapping[str, Any]) -> MemoryResult:
         source_store=SourceStore.mem0,
         metadata=dict(candidate.get('metadata') or {}),
     )
+
+
+def write_time_slate(
+    write: Mapping[str, Any], *, t_high: float, t_low: float,
+) -> dict[str, Any]:
+    """*write* as it was at write time: a new dict, *write* untouched.
+
+    A candidate is kept only when its ``created_at`` is an instant strictly
+    before the write's; one whose instant cannot be parsed cannot be shown
+    earlier, so it is dropped. The band, its winner and the similarity are
+    then re-decided by the shipped ``decide_band`` at *t_high* / *t_low*.
+    """
+    written = _freeze.parse_created_at(write['created_at'])
+    if written is None:
+        raise ValueError(
+            f'write {write["memory_id"]} has no aware created_at ({write["created_at"]!r}); '
+            'the freeze excludes undated writes',
+        )
+    kept = [
+        candidate for candidate in write['candidates']
+        if (instant := _freeze.parse_created_at(candidate.get('created_at'))) is not None
+        and instant < written
+    ]
+    decision = decide_band([_as_memory_result(c) for c in kept], t_high=t_high, t_low=t_low)
+    return {
+        **write,
+        'slates': Slates.WRITE_TIME,
+        'candidates': kept,
+        'band': decision.outcome,
+        'band_winner_id': decision.canonical_id,
+        'similarity': decision.similarity,
+    }
 
 
 def _usage_row(usage: JudgeUsage | None) -> dict[str, int | None] | None:
