@@ -1202,14 +1202,30 @@ def _markdown_row(cells: Sequence[str]) -> str:
     return '| ' + ' | '.join(cells) + ' |'
 
 
+def _graph_line(graph: Mapping[str, Any]) -> str:
+    """The import graph's counts; a schema-1 graph's absent ones are unknown, never zero."""
+    counts = f'{len(graph["edges"])} edges, {len(graph["reach_back"])} reach-backs'
+    deferred, cycles = len(graph['deferred']), len(graph['cycles'])
+    if 'hidden_cycles' not in graph:
+        return (
+            f'import graph: {counts}, {deferred} deferred imports, {cycles} cycles; '
+            'hidden cycles, typing cycles and closes_cycle unknown (schema 1)'
+        )
+    closing = sum(entry['closes_cycle'] for entry in graph['deferred'])
+    return (
+        f'import graph: {counts}, {deferred} deferred imports ({closing} closing a cycle), '
+        f'{cycles} cycles, {len(graph["hidden_cycles"])} hidden cycles, '
+        f'{len(graph["typing_cycles"])} typing cycles'
+    )
+
+
 def _summary_header(snapshot: Mapping[str, Any]) -> list[str]:
-    evidence, graph = snapshot['evidence'], snapshot['import_graph']
+    evidence = snapshot['evidence']
     lines = [
         f'run: {snapshot["run_id"]} as_of {snapshot["as_of_sha"]} since {snapshot["since"]}',
         f'files: {evidence["measured_files"]}/{evidence["domain_files"]} measured, '
         f'complete={json.dumps(evidence["complete"])}',
-        f'import graph: {len(graph["edges"])} edges, {len(graph["reach_back"])} reach-backs, '
-        f'{len(graph["deferred"])} deferred imports, {len(graph["cycles"])} cycles',
+        _graph_line(snapshot['import_graph']),
     ]
     if evidence['unreadable']:
         lines.append('unreadable (measures unknown, never zero):')
