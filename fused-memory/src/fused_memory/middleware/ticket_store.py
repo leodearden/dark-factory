@@ -91,6 +91,18 @@ CREATE INDEX IF NOT EXISTS ix_tickets_status_created
 
 CREATE INDEX IF NOT EXISTS ix_tickets_status_escalated
     ON tickets (status, escalated_at);
+
+CREATE INDEX IF NOT EXISTS ix_tickets_project_status_resolved
+    ON tickets (project_id, status, resolved_at);
+"""
+
+# The window read behind :meth:`TicketStore.dedup_health`. It runs once a
+# janitor tick per project, so ``ix_tickets_project_status_resolved`` keeps
+# its cost bounded by the window rather than by the unpruned table.
+DEDUP_HEALTH_SQL = """
+SELECT status, reason, created_at, resolved_at FROM tickets
+WHERE project_id = ? AND status IN ('created', 'combined')
+  AND resolved_at IS NOT NULL AND resolved_at >= ?
 """
 
 # Back-compat alias — third-party code (and old tests) imported SCHEMA_SQL
@@ -336,10 +348,7 @@ class TicketStore:
         ``'(unrecorded)'``.
         """
         rows = await self._require_access().read_all(
-            "SELECT status, reason, created_at, resolved_at FROM tickets "
-            "WHERE project_id = ? AND resolved_at IS NOT NULL AND resolved_at >= ? "
-            "  AND status IN ('created', 'combined')",
-            (project_id, since.isoformat()),
+            DEDUP_HEALTH_SQL, (project_id, since.isoformat()),
         )
         latencies = [
             (

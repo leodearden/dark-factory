@@ -891,6 +891,24 @@ class TestDedupHealthWindow:
         )
 
     @pytest.mark.asyncio
+    async def test_window_read_seeks_on_resolved_at(self, store, db_path, since):
+        """EXPLAIN QUERY PLAN, so the per-tick read is bounded by the window, not the table."""
+        import sqlite3
+
+        from fused_memory.middleware.ticket_store import DEDUP_HEALTH_SQL
+
+        with sqlite3.connect(db_path) as conn:
+            plan = ' '.join(
+                row[3] for row in conn.execute(
+                    f'EXPLAIN QUERY PLAN {DEDUP_HEALTH_SQL}', ('proj', since.isoformat()),
+                )
+            )
+
+        assert 'SEARCH' in plan, plan
+        assert 'resolved_at>?' in plan, plan
+        assert 'SCAN' not in plan, plan
+
+    @pytest.mark.asyncio
     async def test_value_is_frozen(self, store, since):
         import dataclasses
 
