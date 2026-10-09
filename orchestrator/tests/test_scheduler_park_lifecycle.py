@@ -152,7 +152,7 @@ async def test_a_dispatch_restarts_the_blocked_install_streak(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_release_clears_a_park_armed_on_a_running_task_and_restores_the_shadow(tmp_path):
+async def test_release_clears_a_park_installed_after_dispatch_and_restores_the_shadow(tmp_path):
     w = park_world(tmp_path)
     low = make_task('L', 'low', ['r1.py'])
     w.scheduler.get_tasks = AsyncMock(return_value=[make_task('R', 'medium', ['r1.py']), low])
@@ -162,11 +162,10 @@ async def test_release_clears_a_park_armed_on_a_running_task_and_restores_the_sh
     running = make_task('R', 'medium', ['r1.py'], status='in-progress')
     w.scheduler.get_tasks = AsyncMock(return_value=[running, low])
     assert await w.scheduler.acquire_next() is None, 'post-dispatch park: L is held off r1'
-    w.overrides.set_override(w.root, 'R', reserve_now=True)
-    assert await w.scheduler.acquire_next() is None
+    w.scheduler.lock_table.install_parks('R', ['r1.py'], 'medium')
     stacks = w.scheduler.lock_table.snapshot_park_stacks()
     assert [entry['owner'] for entry in stacks['r1.py']] == ['L', 'R'], (
-        'post-dispatch park: premise — reserve_now on the running R shadows L on r1'
+        'post-dispatch park: premise — a park installed on the running R shadows L on r1'
     )
 
     w.scheduler.release('R')

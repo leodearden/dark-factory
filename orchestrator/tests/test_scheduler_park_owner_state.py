@@ -297,3 +297,50 @@ async def test_an_owner_park_gc_keeps_on_an_unknown_dependency_is_refused_evicti
     ]
     assert _stack_owners(w.scheduler, 'e.py') == ['X']
     assert event_data_for(w.store, 'reservation_expired', 'X') == []
+
+
+# ---------------------------------------------------------------------------
+# D6 — reserve_now installs only for an owner that may hold parks
+# ---------------------------------------------------------------------------
+
+
+def _owner_with_unsatisfied_local_dep() -> dict:
+    owner = make_task('A', 'high', ['a.py'])
+    owner['dependencies'] = ['7']
+    return owner
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('owner', 'reason'),
+    [
+        (make_task('A', 'high', ['a.py'], status='blocked'), 'not_pending:blocked'),
+        (make_task('A', 'high', ['a.py'], status='deferred'), 'not_pending:deferred'),
+        (make_task('A', 'high', ['a.py'], status='in-progress'), 'not_pending:in-progress'),
+        (_owner_with_unsatisfied_local_dep(), 'deps_unsatisfied'),
+    ],
+    ids=['blocked', 'deferred', 'in-progress', 'local-dep-unsatisfied'],
+)
+async def test_reserve_now_on_an_owner_that_may_not_hold_parks_is_refused_once(
+    tmp_path, owner, reason
+):
+    w = park_world(tmp_path)
+    w.overrides.set_override(w.root, 'A', reserve_now=True)
+    w.scheduler.get_tasks = AsyncMock(return_value=[
+        owner,
+        make_task('7', 'low', ['s.py'], status='in-progress'),
+    ])
+
+    await w.scheduler.acquire_next()
+
+    assert event_data_for(w.store, 'reserve_now_refused', 'A') == [{'reason': reason}]
+    assert event_data_for(w.store, 'reserve_now_consumed', 'A') == []
+    assert 'A' not in w.scheduler.lock_table.snapshot_parks()
+    stored = w.overrides.get_overrides(w.root).get('A')
+    assert stored is None or not stored.reserve_now, 'the refused flag is consumed'
+
+    w.store.events.clear()
+    await w.scheduler.acquire_next()
+
+    assert event_data_for(w.store, 'reserve_now_refused', 'A') == []
+    assert event_data_for(w.store, 'reservation_expired', 'A') == []
