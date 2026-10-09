@@ -9,6 +9,9 @@ catches, and why `timeout_method` and `--max-worker-restart=0` are deliberately
 left alone — is `shared/pyproject.toml`'s `timeout` block and is not restated
 here.
 
+**Superseded by the task 5581 addendum: the value is now 420.** The 540 derived
+below is history; see "Re-derivation addendum (task 5581, 2026-10-09)" at the end.
+
 ## What this replaces
 
 Until this measurement, every config carrying the setting said the same thing:
@@ -37,7 +40,8 @@ Adopted wholesale from what this repo already justifies, rather than invented:
   30.75` at loadavg 120-176, x8 = 246, rounded up); task 5572 re-anchored it to
   **420** (51.87 x 8 = 414.96, rounded up — see the addendum at the end).
   Re-evaluating the rule with the 420 floor leaves the ini value at 540:
-  max(420, 540) = 540. It is a never-narrow term: taking the max of two measured
+  max(420, 540) = 540 (superseded by the task 5581 addendum: the value is now
+  420). It is a never-narrow term: taking the max of two measured
   anchors can only validate or raise the number, never discard the older
   evidence and re-open the CPU-starvation false-red that the 60 -> 300 raise
   closed.
@@ -249,6 +253,8 @@ this repo's existing convention for exactly this reason.
 
 ## THE RESULT: 540 seconds. The measurement RAISES the value; it does not validate it.
 
+**Superseded by the task 5581 addendum: the value is now 420.**
+
 300 was too small. It is only 4.9x the worst unmarked wall clock this sweep
 measured, against the 8x the repo's own worker-death evidence demands, and a
 single honest whole-tree scan run under the root inifile already consumes a fifth
@@ -313,7 +319,8 @@ to surface faster.
    conservative direction — the measured member-to-root inflation factor is
    1.3-1.7x, so applying the largest of it to the next-worst unmarked figure in
    the corpus (25.27s) yields ~43s, still comfortably below the 61.52s the value
-   is derived from.
+   is derived from. (25.27s is the root dirs' figure, not a per-member one; the
+   task 5581 addendum restates the bound per member tree.)
 
 ## Re-anchoring addendum (task 5572, 2026-10-08)
 
@@ -417,20 +424,32 @@ the ini default from the tree that marking produced.
 
 ### What changed
 
-`fused-memory/tests/test_check_bare_magicmock_config.py` now carries a
-module-level `pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)`,
-with a module-local `WHOLE_TREE_SCAN_TEST_TIMEOUT = 540` = ceil60(61.52 x 8 =
-492.16). It is sized from that module's own anchor, not borrowed from
-orchestrator's constant of the same name. A runtime test in the same module,
-`test_the_repo_wide_scans_here_run_under_a_module_level_timeout_mark`, checks
-that the mark is present at module level, clears 61.52 x 8, and does not fall
-below the ini default.
+`fused-memory/tests/test_check_bare_magicmock_config.py` binds
+`@pytest.mark.timeout(MAGICMOCK_REPO_SCAN_TEST_TIMEOUT)` on its two repo-wide
+scan classes, `TestAllScannedTestDirsClean` and
+`TestWallClockDeadlineBaselineIntegrity`. The module-local constant
+`MAGICMOCK_REPO_SCAN_TEST_TIMEOUT = 540` is ceil60(61.52 x 8 = 492.16). It is
+sized from that module's own anchor and named for it, so it does not read as
+interchangeable with orchestrator's `WHOLE_TREE_SCAN_TEST_TIMEOUT`, which is
+derived from a different anchor (51.87s).
+
+The mark is bound per class, not module-wide. The rest of the module is ~170
+fast unit tests of `find_violations`. They stay on the ini default locally and
+on verify's CLI 300, so a hang among them still surfaces at the default rather
+than at 540.
+
+A runtime test in the same module guards both halves:
+`test_only_the_repo_wide_scans_run_under_their_own_ceiling`. It reads
+`get_closest_marker('timeout')` on the scan classes' collected items, which is
+what pytest-timeout itself reads. Each item must clear max(61.52 x 8, the ini
+default). The module's other tests must not resolve a mark above the ini
+default.
 
 ### The arithmetic
 
-No re-measurement. With the two scans marked, the worst unmarked figure in the
-corpus is 45.48s (`orchestrator/tests/test_hard_v2_fixture_pool.py`,
-root-bound):
+The derivation needed no re-measurement. With the two scans marked, the worst
+unmarked figure in the corpus is 45.48s
+(`orchestrator/tests/test_hard_v2_fixture_pool.py`, root-bound):
 
     worst unmarked wall clock                       =  45.48s
     x UNDER_LOAD_HEADROOM_FACTOR (8)                = 363.84s
@@ -440,17 +459,93 @@ root-bound):
 All eight configs, `CONTRIBUTING.md`'s mirror span and
 `orchestrator/tests/_orch_helpers.py::PYPROJECT_DEFAULT_TIMEOUT` carry 420.
 
-The result is robust. Any remaining unmarked figure up to 52.5s still derives
-420. Residue 4 puts the next-worst at 25.27s, about 43s after the largest
-measured root-bound inflation (x1.7).
+### Robustness, per member tree
+
+Any remaining unmarked figure up to 52.5s still derives 420, since
+52.5 x 8 = 420. The risk is an unmarked test measured only per-member that
+would exceed 52.5s root-bound. So each member tree is bounded by its worst
+per-member unmarked figure, excluding the marked scans, times 1.7. That is
+the largest member-to-root inflation measured (see "THE FINDING THAT DECIDES
+THE VALUE"). The root dirs need no inflation: they were measured root-bound
+directly.
+
+| tree | worst unmarked per-member, scans excluded | x 1.7 | margin to 52.5 |
+|---|---|---|---|
+| `orchestrator` | <= 27.13 call | <= 46.1 | >= 6.4 |
+| `fused-memory` | 24.48 call (2026-10-09, below) | 41.6 | 10.9 |
+| `shared` | 14.01 setup | 23.8 | 28.7 |
+| `dashboard` | 6.03 call | 10.3 | 42.2 |
+| `cockpit` | 4.85 call | 8.2 | 44.3 |
+| `escalation` | 1.59 call | 2.7 | 49.8 |
+| `sampler` | 0.66 call | 1.1 | 51.4 |
+| root dirs | 25.27 setup, root-bound | 25.27 | 27.2 |
+
+The binding row is `orchestrator`, with a margin of about 6s. Its 27.13 is the
+governing test's own per-member figure. That test was measured root-bound
+directly (45.48). The orchestrator tests below it were never root-bound
+measured, and the corpus does not record them individually, so 27.13 is an
+upper bound on them.
+
+The `fused-memory` row needed a fresh measurement. The 2026-09-17 corpus
+records only each suite's maximum, and in fused-memory that maximum was the
+two scans now marked.
+
+### Supplementary measurements (2026-10-09)
+
+Both runs used HEAD `1a73dca22d`, `--timeout=0` and `-p no:cacheprovider`.
+
+- **fused-memory, per-member.** Command:
+  `cd fused-memory && env -u VIRTUAL_ENV uv run --project . pytest tests -q --durations=80`.
+  `-n auto` resolved to 32 workers. The run went from 06:30:42Z to 06:40:50Z,
+  with 1-minute loadavg 146.38 -> 60.54. Result: 27628 passed, 12 skipped,
+  4 xfailed in 595.72s.
+  - The two scans took 42.08 and 39.31 call (the corpus recorded 41.76 and
+    42.63), so contention was comparable.
+  - Worst unmarked otherwise: 24.48 call,
+    `tests/test_bake_off_fetch_cache.py::TestDumpFetchesFlag::test_a_dumping_run_writes_the_cache_and_the_identical_report`.
+  - Next: 22.12 call,
+    `tests/test_bake_off_storage_shape.py::TestRunBakeOffWiring::test_it_never_attaches_to_the_shared_durable_write_queue`.
+  - Then 18.40 call for `TestFusedMemoryTestsDirectoryClean`, a one-package
+    sweep that the per-class mark leaves unmarked.
+  - Marked status was read with `get_closest_marker('timeout')` at collection,
+    not by grep.
+- **The governing test, re-measured.**
+  `orchestrator/tests/test_hard_v2_fixture_pool.py::TestMintedPool::test_reference_unavailable_only_when_no_landing_merge_exists`:
+  - Root-bound, serial: 33.87 call, at loadavg 99 -> 97.
+  - Per-member (`-n auto`): 42.84 call, at loadavg 182 -> 154.
+
+  Both are below the 45.48 anchor, so the worst-run rule leaves the anchor,
+  and 420, unchanged. Mind the root-bound setup. A single target under
+  `orchestrator/tests/` resolves orchestrator's own inifile, so a root-bound
+  run of it needs `-c pyproject.toml --rootdir=.` from the repo root. The
+  2026-09-17 root-bound row reached the root inifile because its targets
+  spanned two member trees.
+- **This task's own orchestrator verify** (`-n 8`, loadavg 156 -> 64, junit
+  per-test totals) agrees. The governing test took 35.79 total. The next-worst
+  unmarked test took 18.08 total:
+  `test_session_registry.py::TestStdlibOnlySelfContainment::test_forbidden_import_is_rejected`.
 
 ### What did NOT move
 
 - `WHOLE_TREE_SCAN_TEST_TIMEOUT` and `HEAVY_BARRIER_TEST_TIMEOUT` stay 540. The
   never-narrow rule requires only `>=` the ini default, and 540 >= 420. Neither
   is forced by the ini default any longer.
-- The other nine fused-memory glob-based guard modules stay unmarked. Each
-  sweeps one package rather than all seven `tests/` directories, and each is
-  at or below 25.27s.
-- Under verify, the marked module now runs at 540 instead of the CLI's 300,
-  because a mark overrides the CLI `--timeout`.
+- The other nine fused-memory glob-based guard modules are not given the
+  repo-scan mark. Each sweeps one package rather than all seven `tests/`
+  directories. In the 2026-10-09 run the slowest of them was
+  `test_store_mutation_preflight_contract.py` at 17.91 call, and its sweeps
+  already carry their own 300s mark. The other eight each fell below 4.87s,
+  that run's top-80 cut-off.
+- Under verify, the two marked scan classes run at 540 instead of the CLI's
+  300, because a mark overrides the CLI `--timeout`. The rest of the module
+  keeps the CLI's 300.
+
+### Observed, not acted on
+
+In this task's own orchestrator verify, marked members of the whole-tree-scan
+family took up to 131.93s per-test total:
+`test_steward_scaffolding_guards.py::TestAbsoluteTmpProjectRootLiteralsAreCensused::test_every_absolute_tmp_project_root_literal_is_adjudicated`,
+at `-n 8` and loadavg 156 -> 64. That is 2.5x the 51.87s anchor under
+`_ABSOLUTE_FLOOR_SECONDS`. Under this rule it would derive a family ceiling
+above 540. Re-anchoring that family is outside this task and is filed as a
+follow-up.
