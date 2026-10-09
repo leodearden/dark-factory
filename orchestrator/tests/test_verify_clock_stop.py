@@ -7,10 +7,12 @@ Covers:
 - _run_cmd clock-stop behavioral integration tests (step-7/step-8)
 - max_total_secs cumulative-stop cap (step-9/step-10)
 - _run_or_skip_timed / run_verification wiring test (step-11/step-12)
+- _run_cmd's wall-clock budget anchored at launch on every arming path (task 6382)
 """
 
 from __future__ import annotations
 
+import asyncio
 import re
 from importlib import resources as pkg_resources
 from pathlib import Path
@@ -538,8 +540,9 @@ class TestRunCmdClockStop:
     """Real-subprocess _run_cmd integration tests for the clock-stop state machine.
 
     Each test spawns a real bash stub and asserts on the (rc, out, timed_out)
-    tuple.  Timing margins are large (sub-second budgets vs multi-second sleeps)
-    so assertions are robust to CI timing jitter.
+    tuple.  Margins are not uniformly large: test_gate_disabled_markers_ignored's
+    stub outlives its 1.0s budget by only 0.2s, a margin that holds under load
+    only because the budget runs from launch (TestRunCmdBudgetAnchoredAtLaunch).
     """
 
     @pytest.mark.asyncio
@@ -638,6 +641,10 @@ class TestRunCmdClockStop:
 
         timeout=1.0.  Stub emits STOP + heartbeats past budget, but clock_stop
         is None so the stopped span is NOT excluded.  Expected: timed_out is True.
+
+        Deterministic despite the 0.2s margin because the budget is anchored at
+        launch: all 1.2s of the stub's sleeps start after launch, so the 1.0s
+        budget always expires first (TestRunCmdBudgetAnchoredAtLaunch).
         """
         from orchestrator.verify import _run_cmd
         log_path = tmp_path / 'verify.log'
@@ -650,7 +657,78 @@ class TestRunCmdClockStop:
         rc, out, timed_out = await _run_cmd(
             cmd, tmp_path, timeout=1.0, log_path=log_path,
         )
-        assert timed_out is True, f'Expected timed_out=True; got timed_out={timed_out}'
+        assert timed_out is True, (
+            f'Expected timed_out=True; got timed_out={timed_out}, rc={rc}, out={out!r}'
+        )
+
+
+# ── Task 6382: _run_cmd's wall-clock budget runs from launch ─────────────────
+
+
+def _spawn_then_stall(stall_secs: float):
+    """A stand-in for asyncio.create_subprocess_shell that really spawns the
+    child, then keeps the caller waiting *stall_secs* more before handing the
+    process back — the window in which the child runs but _run_cmd has not yet
+    regained control.  The stall is an asyncio.sleep, so the loop absorbs the
+    child's output, EOF and exit while it lasts."""
+    real_spawn = asyncio.create_subprocess_shell
+
+    async def spawn_then_stall(*args, **kwargs):
+        proc = await real_spawn(*args, **kwargs)
+        await asyncio.sleep(stall_secs)
+        return proc
+
+    return spawn_then_stall
+
+
+def _no_log_path(tmp_path: Path) -> dict:
+    return {}
+
+
+def _legacy_stream(tmp_path: Path) -> dict:
+    return {'log_path': tmp_path / 'verify.log'}
+
+
+def _clock_stop_loop(tmp_path: Path) -> dict:
+    return {
+        'log_path': tmp_path / 'verify.log',
+        'clock_stop': _make_clock_stop_cfg(heartbeat_idle_max=5.0),
+    }
+
+
+class TestRunCmdBudgetAnchoredAtLaunch:
+    """_run_cmd's *timeout* is measured from launch, on every arming path:
+    time the parent spends spawning the subprocess counts against the budget,
+    so a command still running *timeout* seconds after launch is timed out
+    however long the spawn took — even when the child has already finished by
+    the time _run_cmd regains control."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(REAL_SUBPROCESS_TEST_TIMEOUT)
+    @pytest.mark.parametrize('stall_secs', [
+        pytest.param(0.5, id='deadline-ahead-at-arming'),
+        pytest.param(1.5, id='deadline-spent-before-arming'),
+    ])
+    @pytest.mark.parametrize('arming_kwargs', [
+        pytest.param(_no_log_path, id='communicate'),
+        pytest.param(_legacy_stream, id='legacy-stream'),
+        pytest.param(_clock_stop_loop, id='clock-stop-loop'),
+    ])
+    async def test_command_outliving_the_budget_from_launch_times_out_despite_a_spawn_stall(
+        self, tmp_path: Path, arming_kwargs, stall_secs: float,
+    ):
+        from unittest.mock import patch
+
+        from orchestrator.verify import _run_cmd
+
+        cmd = 'for i in 1 2 3; do sleep 0.4; done; exit 0'
+        with patch('asyncio.create_subprocess_shell', _spawn_then_stall(stall_secs)):
+            rc, out, timed_out = await _run_cmd(
+                cmd, tmp_path, timeout=1.0, **arming_kwargs(tmp_path),
+            )
+        assert timed_out is True, (
+            f'Expected timed_out=True; got timed_out={timed_out}, rc={rc}, out={out!r}'
+        )
 
 
 # ── Step-9 / Step-10: max_total_secs cap tests ────────────────────────────────
