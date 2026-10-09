@@ -1,4 +1,4 @@
-"""Boundary tests for ``scripts/inline_suppressions.py`` — PRD γ1, scenarios 1-11.
+"""Boundary tests for ``scripts/inline_suppressions.py`` — task 5601, PRD scenarios 1-11.
 
 WHAT IS UNDER TEST.  The inline-suppression scanner: the kind table and its
 COMMENT-token scan, D7's content-addressed multiset key, D8's consumer model,
@@ -60,7 +60,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = REPO_ROOT / 'scripts' / 'inline_suppressions.py'
 
 #: Where a fixture tree's baseline lives.  The real one is
-#: ``scripts/inline_suppression_baseline.json`` and is κ1's to seed; fixtures
+#: ``scripts/inline_suppression_baseline.json`` and is task 5607's to seed; fixtures
 #: keep theirs inside ``tmp_path`` so no test can reach the committed file.
 _BASELINE_NAME = 'inline_suppression_baseline.json'
 
@@ -746,8 +746,9 @@ def test_every_kind_the_scanner_scans_resolves_to_a_consumer(tmp_path: Path):
 
     DRIVEN OFF ``KIND_SPECS`` AND THE PUBLIC RESOLVER, never by patching the
     private table by dotted path: that is the one shape ``docs/code-quality.md``
-    names outright, and design decision 10 already turned down the same
-    shortcut for the first-party code table.  A behavioural assertion is also
+    names outright, and the first-party drift guard
+    (``test_the_first_party_table_matches_the_codes_that_checker_actually_emits``)
+    turns down the same shortcut for the first-party code table.  A behavioural assertion is also
     strictly stronger here — it fails for a kind whose row exists but resolves
     by accident, which a patched-out table could not detect.
     """
@@ -1119,7 +1120,7 @@ def _classify(tmp_path: Path, files: Mapping[str, str]):
 def test_the_shipped_class_table_is_empty(tmp_path: Path):
     """D9 — the valve is the OPERATOR's, and it ships shut.
 
-    The rows are ruled by δ and applied by ζb; an implementer adding one here
+    The rows are ruled by task 5603 and applied by task 5609; an implementer adding one here
     would be ratifying a blanket exception on the operator's behalf, which is
     the one thing D9 reserves.
     """
@@ -1553,8 +1554,8 @@ def test_a_second_copy_of_a_grandfathered_dead_line_is_in_excess(tmp_path: Path,
 def test_with_no_baseline_yet_a_whole_tree_of_undisposed_markers_is_advisory(
     tmp_path: Path, capsys
 ):
-    """BOUNDARY SCENARIO 11 — the pre-κ1 state, which is every tree until the
-    cutover lands.
+    """BOUNDARY SCENARIO 11 — the unseeded state, which is every tree until
+    task 5607's cutover lands.
 
     D12 makes baseline ABSENCE a legitimate state, so the gate is green and says
     it is enforcing nothing.  The label has to be its own word rather than a
@@ -1571,7 +1572,7 @@ def test_with_no_baseline_yet_a_whole_tree_of_undisposed_markers_is_advisory(
 
     report = capsys.readouterr().out
     assert 'advisory' in report
-    assert 'κ1' in report
+    assert '--seed' in report
 
 
 def test_a_scoped_check_over_a_clean_scope_is_partial_and_ignores_the_rest(
@@ -1637,7 +1638,7 @@ def test_a_baseline_that_exists_but_cannot_be_read_is_never_green(
     ``shared.ratchet.load`` collapses absent, undecodable, unparseable, misshapen
     and wrong-schema into ONE refusal, because to the kernel's callers they mean
     one thing.  This consumer is the one place where they do not: absence is a
-    legitimate pre-κ1 state and everything else is a broken instrument.  Reaching
+    legitimate unseeded state and everything else is a broken instrument.  Reaching
     the advisory path by catching that refusal would report a corrupt baseline as
     a clean tree — exactly the silent fail-soft the kernel's own docstring says an
     empty baseline causes (INV-11).
@@ -1706,7 +1707,7 @@ def _seed(root: Path, baseline_path: Path, *paths: str) -> int:
 
 
 def test_seed_writes_the_unowned_multiset_under_the_kernels_preamble(tmp_path: Path):
-    """``--seed`` is κ1's one call, so what it writes has to be reviewable.
+    """``--seed`` is task 5607's one call, so what it writes has to be reviewable.
 
     The kernel owns the file's shape and its preamble — the paragraph stating
     that the only legal diff is a DELETION is re-emitted on every write, which is
@@ -1946,7 +1947,7 @@ def _json_report(root: Path, baseline_path: Path, capsys, *paths: str) -> dict:
 
 
 def test_json_publishes_every_block_the_register_reads(tmp_path: Path, capsys):
-    """``--json`` is γ2's only data source, so nothing downstream re-scans.
+    """``--json`` is task 5602's only data source, so nothing downstream re-scans.
 
     The totals are asserted as WHOLE collections rather than by spot-checking a
     key, because the failure this guards against is a block that quietly stops
@@ -1988,7 +1989,7 @@ def test_json_names_every_debt_owner_and_every_ratified_id_with_its_sites(
 ):
     """The two blocks that exist for a CONSUMER rather than for a reader.
 
-    γ2's closed-world check asks whether every inline ``ratified:`` id names a
+    Task 5602's closed-world check asks whether every inline ``ratified:`` id names a
     real ratification row, so it needs the ids AND the sites citing each one — an
     id with no sites to point at is a finding it cannot report.  The debt block
     is the same shape for the same reason: the owner has to be followable back to
@@ -2011,7 +2012,7 @@ def test_json_names_every_debt_owner_and_every_ratified_id_with_its_sites(
 def test_json_publishes_the_resolved_ruff_lists_rather_than_the_params_block(
     tmp_path: Path, capsys
 ):
-    """Decision 3's audit trail, and decision 8's placement of it.
+    """``ConsumerModel.resolved``'s audit trail, kept out of ``params`` as ``_params`` records.
 
     The consumer model's answer for a ``noqa`` depends entirely on these two
     lists, so a reader has to be able to see what the model actually read —
@@ -2099,7 +2100,7 @@ def test_json_exits_zero_even_when_the_gate_would_be_red(tmp_path: Path, capsys)
     """A REPORT verb, not a gate: a consumer parsing the report must not also be
     gated by it.
 
-    Only a broken instrument makes ``--json`` non-zero, which is what lets γ2
+    Only a broken instrument makes ``--json`` non-zero, which is what lets task 5602
     read a tree that is currently in breach — the state it most needs to read.
     """
     baseline = _write_fixture_tree(tmp_path, {'m.py': 'a = 1\n'}, baseline=True)
@@ -2189,7 +2190,7 @@ def test_a_missing_shared_import_is_exit_two_and_never_exit_one(tmp_path: Path):
 # ---------------------------------------------------------------------------
 # The live tree — the merge gate's actual enforcement point.
 
-#: Where κ1 seeds the committed baseline.  Absent until that cutover lands,
+#: Where task 5607 seeds the committed baseline.  Absent until that cutover lands,
 #: which is what makes the enforcing guard below a skip rather than a red.
 LIVE_BASELINE = REPO_ROOT / 'scripts' / _BASELINE_NAME
 
@@ -2240,14 +2241,14 @@ def test_the_live_tree_carries_no_disposition_faults(tmp_path: Path, capsys):
     ``_verdict`` reports ``classification.violations`` on the ADVISORY path too:
     a marker that does not parse, or a disposition on a line that suppresses
     nothing, is a fault at its site whatever a baseline holds.  The ratchet
-    grandfathers KEYS and a fault is not a key, so seeding at κ1 cannot turn one
+    grandfathers KEYS and a fault is not a key, so seeding cannot turn one
     green — which is why this test carries none of the seeded guard's skip, and
     why it is not one more line in the non-vacuity floor above: a named red says
     which of the two subjects broke.
 
     The run is pinned ADVISORY by pointing it at a baseline that cannot exist,
-    so the violations it reports are exactly the disposition faults, before κ1
-    and after it alike, and never ratchet excess.
+    so the violations it reports are exactly the disposition faults, before the
+    seed and after it alike, and never ratchet excess.
     """
     report = _live_report(capsys, '--baseline', str(tmp_path / _BASELINE_NAME))
 
@@ -2301,9 +2302,9 @@ def test_the_live_scan_tokenizes_exactly_the_marker_bearing_files(capsys):
 def test_the_live_tree_passes_the_gate_once_the_baseline_is_seeded(capsys):
     """The merge gate's actual assertion — ENFORCING iff the baseline exists.
 
-    It skips rather than reds before the κ1 cutover because D12 makes baseline
-    absence a legitimate state, and a guard that failed on the pre-cutover tree
-    would block every task until κ1 landed.  Everything about the gate MECHANISM
+    It skips rather than reds before task 5607's cutover because D12 makes
+    baseline absence a legitimate state, and a guard that failed on the
+    pre-cutover tree would block every task until that cutover landed.  Everything about the gate MECHANISM
     is covered hermetically by the fixture-tree tests above, so the skip loses no
     coverage of this module's behaviour — only of this repository's compliance,
     which is not yet a thing to be compliant with.
@@ -2311,7 +2312,7 @@ def test_the_live_tree_passes_the_gate_once_the_baseline_is_seeded(capsys):
     if not LIVE_BASELINE.exists():
         pytest.skip(
             f'{LIVE_BASELINE.relative_to(REPO_ROOT)} does not exist yet: the baseline is '
-            'seeded once, on main, by the operator step κ1. Until then every run is '
+            'seeded once, on main, with `--seed` (task 5607). Until then every run is '
             'advisory by design (D12), and the gate mechanism is covered hermetically by '
             'the fixture-tree tests in this module.'
         )
