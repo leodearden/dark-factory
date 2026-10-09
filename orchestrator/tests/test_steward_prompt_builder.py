@@ -13,6 +13,7 @@ builder that the shared loop awaits before every re-dispatch.  It must:
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -20,7 +21,9 @@ import pytest
 from escalation.queue import EscalationQueue
 from shared.cli_invoke import AgentResult
 from shared.testing import make_gate_mock
-from test_steward import _make_escalation, _make_result
+from test_steward import _make_escalation, _make_result, _sole_invocation_end_data
+
+from orchestrator.workflow_types import StewardResolved
 
 _SLEEP_PATCH = 'shared.cli_invoke.asyncio.sleep'
 
@@ -179,3 +182,61 @@ class TestBuilderThroughTheRealRetryLoop:
 
         assert inv.await_count == 1
         assert result.retry_aborted is True
+
+
+@pytest.mark.asyncio
+class TestDeclinedRunIsNoVerdictOnTheEscalation:
+    @pytest.mark.parametrize(
+        'last_attempt',
+        [
+            AgentResult(
+                success=False, output='', timed_out=True, cost_usd=0.4,
+                duration_ms=900_000,
+            ),
+            AgentResult(success=False, output='', subtype='error_empty_output'),
+        ],
+        ids=['timeout-kill', 'empty-output'],
+    )
+    async def test_declined_retry_goes_straight_to_the_resolved_check(
+        self, steward, queue, last_attempt,
+    ):
+        esc = _make_escalation()
+        queue.submit(esc)
+        steward._session_id = 'sess-live'
+        steward.event_store = MagicMock()
+        outcomes: asyncio.Queue = asyncio.Queue()
+        steward.set_outcome_channel(outcomes)
+        steward.usage_gate = make_gate_mock(
+            account_count=2, detect_cap_hit=MagicMock(side_effect=[True]),
+        )
+
+        async def invoke_agent(**_kwargs):
+            queue.resolve(esc.id, 'resolved before the attempt died')
+            return last_attempt
+
+        with (
+            patch('orchestrator.steward.invoke_agent', side_effect=invoke_agent) as inv,
+            patch(_SLEEP_PATCH, new_callable=AsyncMock),
+        ):
+            await steward._handle_escalation(esc)
+
+        assert inv.await_count == 1
+        assert esc.id not in steward._timeout_counts
+        assert esc.id not in steward._empty_output_counts
+        assert steward._session_id == 'sess-live'
+        assert steward.metrics.escalations_handled == 1
+        assert isinstance(outcomes.get_nowait(), StewardResolved)
+        assert _sole_invocation_end_data(steward.event_store.emit)['retry_aborted'] is True
+
+    async def test_an_unretried_run_records_retry_aborted_false(self, steward, queue):
+        esc = _make_escalation()
+        queue.submit(esc)
+        steward.event_store = MagicMock()
+
+        with patch(
+            'orchestrator.steward.invoke_agent', new_callable=AsyncMock,
+            return_value=_make_result(),
+        ):
+            await steward._handle_escalation(esc)
+
+        assert _sole_invocation_end_data(steward.event_store.emit)['retry_aborted'] is False

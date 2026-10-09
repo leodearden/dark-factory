@@ -690,12 +690,21 @@ class TaskSteward:
                     # False included, so the false-positive rate has a
                     # denominator.
                     'ended_awaiting_background': result.ended_awaiting_background,
+                    'retry_aborted': result.retry_aborted,
                 },
             )
 
+        # A declined retry means the escalation stopped being pending during
+        # the run, so the returned attempt is no verdict on it: neither
+        # recovery carve-out below applies.
+        if result.retry_aborted:
+            logger.info(
+                f'Steward for task {self.task_id}: retry cancelled — '
+                f'{escalation.id} is no longer pending'
+            )
         # Timeout-kill: treat as recoverable — do NOT consume retry budget.
         # The escalation remains pending so the run loop re-queues it naturally.
-        if is_timeout:
+        elif is_timeout:
             self.metrics.timeouts_recovered += 1
             self._timeout_counts[escalation.id] = (
                 self._timeout_counts.get(escalation.id, 0) + 1
@@ -709,8 +718,7 @@ class TaskSteward:
                 f'{self.config.steward_max_timeouts_per_escalation})'
             )
             return
-
-        if _is_empty_output(result):
+        elif _is_empty_output(result):
             self.metrics.empty_outputs_recovered += 1
             self._empty_output_counts[escalation.id] = (
                 self._empty_output_counts.get(escalation.id, 0) + 1
