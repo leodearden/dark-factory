@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 from pathlib import Path
 
 import codebook
@@ -172,3 +173,249 @@ def test_to_record_of_a_verdict_without_remediation_carries_none() -> None:
 
     assert json.loads(json.dumps(record)) == record
     assert record["remediation"] is None
+
+
+# ---------------------------------------------------------------------------
+# Anchor and remediation normalisation, each repair counted (C4).
+# ---------------------------------------------------------------------------
+
+_TITLE = "Docs omit the X convention!"
+_TITLE_SLUG = "slug:docs-omit-the-x-convention"
+_GUIDE = {"path": "docs/guide.md", "change": "Document X"}
+
+
+@pytest.fixture
+def root(tmp_path: Path) -> Path:
+    """An observed tree holding pkg/mod.py and docs/guide.md, with
+    tmp_path/outside.py beside it, outside the tree."""
+    tree_root = tmp_path / "tree"
+    (tree_root / "pkg").mkdir(parents=True)
+    (tree_root / "pkg" / "mod.py").write_text("def f():\n    pass\n")
+    (tree_root / "docs").mkdir()
+    (tree_root / "docs" / "guide.md").write_text("guide\n")
+    (tmp_path / "outside.py").write_text("outside\n")
+    return tree_root
+
+
+def _kinds(v: verdict.Verdict) -> list[verdict.NormalisationKind]:
+    return [note.kind for note in v.normalisations]
+
+
+@pytest.mark.parametrize(
+    ("offered", "expected"),
+    [
+        pytest.param("{root}/pkg/mod.py::f", "pkg/mod.py::f", id="absolute"),
+        pytest.param("pkg\\mod.py::f", "pkg/mod.py::f", id="backslash"),
+        pytest.param("pkg/mod.py:12", "pkg/mod.py", id="line-pin"),
+        pytest.param("pkg/mod.py:3-9", "pkg/mod.py", id="range-pin"),
+        pytest.param("pkg/mod.py:1,4-5", "pkg/mod.py", id="list-pin"),
+        pytest.param("pkg/mod.py::f:12", "pkg/mod.py::f", id="symbol-pin"),
+        pytest.param("pkg/mod.py::f()", "pkg/mod.py", id="non-identifier-symbol"),
+        pytest.param("slug:Prompt Contract", "slug:prompt-contract", id="slug-kebabed"),
+    ],
+)
+def test_parse_verdict_rewrites_a_repairable_anchor_and_counts_it(
+    root: Path, offered: str, expected: str,
+) -> None:
+    raw_anchor = offered.format(root=root)
+    v = _parse({**_FULL_RAW, "anchor": raw_anchor}, root)
+
+    assert v.anchor == expected
+    assert v.normalisations == (
+        verdict.Normalisation(
+            verdict.NormalisationKind.ANCHOR_REWRITTEN, repr(raw_anchor), expected,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("offered", "expected"),
+    [
+        pytest.param(" pkg/mod.py ", "pkg/mod.py", id="surrounding-whitespace"),
+        pytest.param("slug:valid-one", "slug:valid-one", id="valid-slug"),
+        pytest.param("pkg", "pkg", id="directory"),
+    ],
+)
+def test_parse_verdict_keeps_a_canonical_anchor_uncounted(
+    root: Path, offered: str, expected: str,
+) -> None:
+    v = _parse({**_FULL_RAW, "anchor": offered}, root)
+
+    assert v.anchor == expected
+    assert v.normalisations == ()
+
+
+_INVALID_ANCHORS = [
+    pytest.param(lambda root: "pkg/missing.py::f", id="nonexistent"),
+    pytest.param(lambda root: "../outside.py", id="outside-dot-dot"),
+    pytest.param(lambda root: str(root.parent / "outside.py"), id="outside-absolute"),
+    pytest.param(lambda root: ".", id="root-dot"),
+    pytest.param(lambda root: "./", id="root-dot-slash"),
+    pytest.param(lambda root: "pkg/..", id="root-up"),
+    pytest.param(lambda root: "pkg/\x00mod.py", id="nul-byte"),
+    pytest.param(lambda root: "x" * 5000, id="too-long"),
+    pytest.param(lambda root: None, id="null"),
+    pytest.param(lambda root: 7, id="non-str"),
+    pytest.param(lambda root: "", id="empty"),
+]
+
+
+def _without(raw: dict, key: str) -> dict:
+    return {k: v for k, v in raw.items() if k != key}
+
+
+@pytest.mark.parametrize("anchor_of", _INVALID_ANCHORS)
+def test_parse_verdict_falls_back_to_the_remediation_path(root: Path, anchor_of) -> None:
+    raw = {**_FULL_RAW, "anchor": anchor_of(root), "remediation": _GUIDE}
+
+    v = _parse(raw, root, title=_TITLE)
+
+    assert v.anchor == "docs/guide.md"
+    assert _kinds(v) == [verdict.NormalisationKind.ANCHOR_FROM_REMEDIATION]
+    assert v.normalisations[0].used == "docs/guide.md"
+
+
+def test_parse_verdict_falls_back_to_the_remediation_path_for_an_absent_anchor(
+    root: Path,
+) -> None:
+    v = _parse({**_without(_FULL_RAW, "anchor"), "remediation": _GUIDE}, root)
+
+    assert v.anchor == "docs/guide.md"
+    assert _kinds(v) == [verdict.NormalisationKind.ANCHOR_FROM_REMEDIATION]
+
+
+@pytest.mark.parametrize("anchor_of", _INVALID_ANCHORS)
+def test_parse_verdict_falls_back_to_the_title_slug(root: Path, anchor_of) -> None:
+    raw = {**_FULL_RAW, "anchor": anchor_of(root), "remediation": None}
+
+    v = _parse(raw, root, title=_TITLE)
+
+    assert v.anchor == _TITLE_SLUG
+    assert _kinds(v) == [verdict.NormalisationKind.ANCHOR_FROM_TITLE]
+    assert v.normalisations[0].used == _TITLE_SLUG
+
+
+def test_parse_verdict_falls_back_to_the_title_slug_for_an_absent_anchor(root: Path) -> None:
+    v = _parse(_without(_without(_FULL_RAW, "anchor"), "remediation"), root, title=_TITLE)
+
+    assert v.anchor == _TITLE_SLUG
+    assert _kinds(v) == [verdict.NormalisationKind.ANCHOR_FROM_TITLE]
+
+
+@pytest.mark.parametrize("title", ["", "!!! ???", "日本語"])
+def test_parse_verdict_title_slug_is_well_formed_for_any_title(root: Path, title: str) -> None:
+    v = _parse({**_FULL_RAW, "anchor": None, "remediation": None}, root, title=title)
+
+    assert re.fullmatch(r"slug:[a-z0-9]+(?:-[a-z0-9]+)*", v.anchor)
+    assert _kinds(v) == [verdict.NormalisationKind.ANCHOR_FROM_TITLE]
+
+
+@pytest.mark.parametrize("absolute", [False, True], ids=["relative", "absolute"])
+def test_parse_verdict_keeps_an_in_tree_remediation_repo_relative(
+    root: Path, absolute: bool,
+) -> None:
+    path = str(root / "docs" / "guide.md") if absolute else "docs/guide.md"
+
+    v = _parse({**_FULL_RAW, "remediation": {"path": path, "change": "  Document X "}}, root)
+
+    assert v.remediation == verdict.Remediation("docs/guide.md", "Document X")
+    assert v.normalisations == ()
+
+
+def test_parse_verdict_resolves_a_symlinked_remediation_to_its_in_tree_target(
+    root: Path,
+) -> None:
+    (root / "link.md").symlink_to(Path("docs") / "guide.md")
+
+    v = _parse({**_FULL_RAW, "remediation": {"path": "link.md", "change": "Document X"}}, root)
+
+    assert v.remediation == verdict.Remediation("docs/guide.md", "Document X")
+
+
+_REJECTED_REMEDIATION_PATHS = [
+    pytest.param(lambda root: "docs/missing.md", id="nonexistent"),
+    pytest.param(lambda root: "../outside.py", id="outside-dot-dot"),
+    pytest.param(lambda root: str(root.parent / "outside.py"), id="outside-absolute"),
+    pytest.param(lambda root: ".", id="root-dot"),
+    pytest.param(lambda root: "./", id="root-dot-slash"),
+    pytest.param(lambda root: "docs/..", id="root-up"),
+    pytest.param(str, id="root-absolute"),
+    pytest.param(lambda root: "docs/a\x00b.md", id="nul-byte"),
+]
+
+
+@pytest.mark.parametrize("path_of", _REJECTED_REMEDIATION_PATHS)
+def test_parse_verdict_rejects_an_out_of_tree_remediation_and_counts_it(
+    root: Path, path_of,
+) -> None:
+    path = path_of(root)
+
+    v = _parse({**_FULL_RAW, "remediation": {"path": path, "change": "Document X"}}, root)
+
+    assert v.remediation is None
+    assert v.normalisations == (
+        verdict.Normalisation(verdict.NormalisationKind.REMEDIATION_REJECTED, repr(path), ""),
+    )
+
+
+def test_parse_verdict_rejects_a_too_long_remediation_path_with_a_bounded_offer(
+    root: Path,
+) -> None:
+    v = _parse({**_FULL_RAW, "remediation": {"path": "x" * 5000, "change": "Document X"}}, root)
+
+    assert v.remediation is None
+    [note] = v.normalisations
+    assert note.kind is verdict.NormalisationKind.REMEDIATION_REJECTED
+    assert note.offered.startswith("'xxx")
+    assert len(note.offered) < 200
+
+
+@pytest.mark.parametrize(
+    ("remediation", "offered"),
+    [
+        pytest.param({"path": "docs/guide.md"}, repr("docs/guide.md"), id="no-change"),
+        pytest.param(
+            {"path": "docs/guide.md", "change": "  "}, repr("docs/guide.md"), id="blank-change",
+        ),
+        pytest.param({"change": "Document X"}, repr(None), id="no-path"),
+        pytest.param("docs/guide.md", repr("docs/guide.md"), id="bare-string"),
+        pytest.param(["docs/guide.md"], repr(["docs/guide.md"]), id="list"),
+    ],
+)
+def test_parse_verdict_rejects_a_malformed_remediation_and_counts_it(
+    root: Path, remediation, offered: str,
+) -> None:
+    v = _parse({**_FULL_RAW, "remediation": remediation}, root)
+
+    assert v.remediation is None
+    assert v.normalisations == (
+        verdict.Normalisation(verdict.NormalisationKind.REMEDIATION_REJECTED, offered, ""),
+    )
+
+
+def test_parse_verdict_takes_a_null_or_absent_remediation_uncounted(root: Path) -> None:
+    for raw in ({**_FULL_RAW, "remediation": None}, _without(_FULL_RAW, "remediation")):
+        v = _parse(raw, root)
+
+        assert v.remediation is None
+        assert v.normalisations == ()
+
+
+def test_count_normalisations_sums_each_kind_across_verdicts(root: Path) -> None:
+    pinned = _parse({**_FULL_RAW, "anchor": "pkg/mod.py:12"}, root)
+    pinned_and_rejected = _parse(
+        {
+            **_FULL_RAW,
+            "anchor": "pkg/mod.py:3",
+            "remediation": {"path": "docs/missing.md", "change": "Document X"},
+        },
+        root,
+    )
+
+    counts = verdict.count_normalisations([pinned, pinned_and_rejected])
+
+    assert counts == {
+        **{kind.value: 0 for kind in verdict.NormalisationKind},
+        "anchor_rewritten": 2,
+        "remediation_rejected": 1,
+    }
