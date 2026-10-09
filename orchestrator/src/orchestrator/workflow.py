@@ -16,6 +16,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol, cast
 
@@ -31,6 +32,7 @@ from pydantic import ValidationError
 from shared.cli_invoke import (
     AgentFailureKind,
     AllAccountsCappedException,
+    PromptBuilder,
     classify_agent_failure,
     classify_cap_kill,
     invoke_with_cap_retry,
@@ -8525,8 +8527,6 @@ class TaskWorkflow:
             await self._reconcile_done_step_commits()
             self.plan = self.artifacts.read_plan()
 
-            wip_notice = await self._detect_tip_wip_commits()
-
             # Snapshot completed steps before invocation
             completed_before = {
                 s['id']
@@ -8535,12 +8535,12 @@ class TaskWorkflow:
                 if isinstance(s, dict) and s.get('status') == 'done'
             }
 
-            prompt = await self.briefing.build_implementer_prompt(
-                self.plan, rebase_notice=rebase_notice,
-                task_id=self.task_id, wip_notice=wip_notice,
-            )
             pre_head = await self._get_head_commit()
-            result = await self._invoke(IMPLEMENTER, prompt, self.worktree)
+            result = await self._invoke(
+                IMPLEMENTER,
+                partial(self._build_implementer_prompt, rebase_notice),
+                self.worktree,
+            )
 
             self.metrics.execute_iterations += 1
 
@@ -8599,6 +8599,14 @@ class TaskWorkflow:
                     self.task_id,
                 )
             self.artifacts.stamp_plan_provenance(self.session_id)
+
+            if result.retry_aborted:
+                logger.info(
+                    'Task %s: implementer retry cancelled — no pending steps '
+                    'remain; not classifying the cancelled attempt',
+                    self.task_id,
+                )
+                continue
 
             if not result.success:
                 logger.warning(
@@ -9412,7 +9420,27 @@ class TaskWorkflow:
         )
         self.escalation_queue.submit(esc)
 
-    async def _detect_tip_wip_commits(self) -> list[dict]:
+    def _live_plan(self) -> dict:
+        """plan.json as it is on disk NOW — what every prompt builder renders.
+
+        Never ``self.plan``: that is whatever was last read, and a builder is
+        awaited again before every retry, possibly after a long cap wait.
+        """
+        assert self.artifacts is not None
+        return self.artifacts.read_plan()
+
+    async def _build_implementer_prompt(self, rebase_notice: str | None) -> str | None:
+        """The execute loop's implementer prompt, or None once no step is pending."""
+        assert self.artifacts is not None
+        if not self.artifacts.get_pending_steps():
+            return None
+        plan = self.artifacts.read_plan()
+        return await self.briefing.build_implementer_prompt(
+            plan, rebase_notice=rebase_notice,
+            task_id=self.task_id, wip_notice=await self._detect_tip_wip_commits(plan),
+        )
+
+    async def _detect_tip_wip_commits(self, plan: dict) -> list[dict]:
         """Detect a contiguous run of WIP safety-commits sitting at HEAD.
 
         Several harness paths auto-commit uncommitted work as a safety net
@@ -9434,7 +9462,7 @@ class TaskWorkflow:
         Returns HEAD-first ``[{'sha': ..., 'subject': ...}]`` for the
         contiguous run of WIP safety-commits at HEAD (stops at the first
         non-WIP commit), excluding any SHA already recorded as the
-        ``commit`` of a done plan step (dedup against ``self.plan``).
+        ``commit`` of a done step of *plan*.
         """
         if self.worktree is None or self.git_ops is None or self.artifacts is None:
             return []
@@ -9453,7 +9481,7 @@ class TaskWorkflow:
             recorded = {
                 s['commit']
                 for col in ('prerequisites', 'steps')
-                for s in self.plan.get(col, [])
+                for s in plan.get(col, [])
                 if isinstance(s, dict) and s.get('status') == 'done' and s.get('commit')
             }
             # Prefix-match rather than exact-match: the prompt shows an
@@ -13407,11 +13435,23 @@ class TaskWorkflow:
     async def _invoke(
         self,
         role: AgentRole,
-        prompt: str,
+        build_prompt: PromptBuilder,
         cwd: Path,
         output_schema: dict | None = None,
     ) -> AgentResult:
-        """Invoke an agent with role-specific configuration."""
+        """Invoke an agent with role-specific configuration.
+
+        *build_prompt* is awaited for the first dispatch and again before
+        every retry, so a retry is briefed from current state; it may return
+        None only to cancel a retry.
+        """
+        prompt = await build_prompt()
+        if prompt is None:
+            raise ValueError(
+                f'Task {self.task_id} [{role.name}]: the prompt builder declined '
+                f'the first dispatch; a prompt builder may decline only a retry '
+                f'— check for work before invoking'
+            )
         timeouts_cfg = self.config.timeouts
         backends_cfg = self.config.backends
 
@@ -13556,10 +13596,8 @@ class TaskWorkflow:
         # subprocess starts and cleared in the finally below — its presence
         # ⇔ "agent was in flight when the orchestrator exited".
         #
-        # Prompt-substitution ownership: cli_invoke owns the resume-continuation
-        # prompt swap (CRASH_RECOVERY_RESUME_PROMPT = 'continue').  Workflow
-        # always passes the real task prompt so that cli_invoke's
-        # original_prompt capture is correct for any fresh-fallback invocation.
+        # cli_invoke owns the resume-continuation prompt swap; a fresh
+        # fallback is briefed by build_prompt, handed down as rebuild_prompt.
         resume_session_id: str | None = None
         if (
             self._pending_resume_session_id
@@ -13834,6 +13872,7 @@ class TaskWorkflow:
                 config_dir=self._config_dir,
                 invoke_fn=invoke_agent,
                 prompt=prompt,
+                rebuild_prompt=build_prompt,
                 system_prompt=self._resolve_role_system_prompt(role, model),
                 cwd=cwd,
                 model=model,
@@ -14119,6 +14158,9 @@ class TaskWorkflow:
                     # false-positive rate computable from runs.db, since a
                     # True-only key leaves the denominator unknowable.
                     'ended_awaiting_background': result.ended_awaiting_background,
+                    # Present-and-false too: the rate at which a prompt
+                    # builder cancels a retry of finished work (task 5730).
+                    'retry_aborted': result.retry_aborted,
                     # Same present-and-false rationale for the cap pair, so
                     # ceiling saturation is computable.  model_id is the exact
                     # CLI-served version beside the alias in `model`; None
