@@ -136,7 +136,7 @@ async def run_embedding_arm(
     manifest = EmbeddingRunManifest(
         schema_version=EMBEDDING_RUN_MANIFEST_SCHEMA_VERSION,
         spec=arm,
-        settings=_settings(embedder, probe_set, mem0_project_id),
+        settings=_settings(embedder, probe_set, mem0_project_id, base_config),
         effective_embedder=_effective_embedder(arm, base_config),
         graph_reembed=graph.reembed,
         replica_reembed=replica,
@@ -232,7 +232,10 @@ async def _mem0_rank(
 
 
 def _settings(
-    embedder: ArmEmbedder, probe_set: ProbeSet, mem0_project_id: str
+    embedder: ArmEmbedder,
+    probe_set: ProbeSet,
+    mem0_project_id: str,
+    base_config: FusedMemoryConfig,
 ) -> EmbeddingRunSettings:
     return EmbeddingRunSettings(
         embed_batch_size=embedder.settings.batch_size,
@@ -241,6 +244,7 @@ def _settings(
         search_k=SEARCH_K,
         transcript_queries=len(probe_set.transcript.queries),
         mem0_project_id=mem0_project_id,
+        search_timeout_s=base_config.queue.search_timeout_seconds,
     )
 
 

@@ -3,16 +3,6 @@
 from collections.abc import Sequence
 
 import pytest
-from fused_memory.arm_harness.embedding_preregistration import (
-    EmbeddingPreregistrationError,
-    QueryLatencyEnvelope,
-    check_embedding_run_symmetry,
-    compare_embedding_arm,
-    derive_embedding_preregistration_inputs,
-    load_embedding_preregistration_inputs,
-    query_latency_envelope,
-    serialize_embedding_preregistration_inputs,
-)
 from pydantic import ValidationError
 
 from arm_harness._fakes import (
@@ -23,6 +13,16 @@ from arm_harness._fakes import (
     embedding_records,
     embedding_run_manifest,
     embedding_spec,
+)
+from fused_memory.arm_harness.embedding_preregistration import (
+    EmbeddingPreregistrationError,
+    QueryLatencyEnvelope,
+    check_embedding_run_symmetry,
+    compare_embedding_arm,
+    derive_embedding_preregistration_inputs,
+    load_embedding_preregistration_inputs,
+    query_latency_envelope,
+    serialize_embedding_preregistration_inputs,
 )
 from fused_memory.arm_harness.embedding_run_manifest import EmbeddingRunManifest
 from fused_memory.arm_harness.instrument_checks import InstrumentCheckId

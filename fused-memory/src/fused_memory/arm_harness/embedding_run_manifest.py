@@ -28,6 +28,8 @@ class EmbeddingRunSettings(FrozenModel):
     search_k: int = Field(gt=0)
     transcript_queries: int = Field(ge=0)
     mem0_project_id: str = Field(min_length=1)
+    search_timeout_s: float = Field(gt=0)
+    """The config's queue.search_timeout_seconds at run time: the query-latency envelope's anchor."""
 
 
 class QueryFailureCounts(FrozenModel):
