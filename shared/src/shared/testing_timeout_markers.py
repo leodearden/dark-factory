@@ -30,8 +30,9 @@ there costs depends on the suite's ``timeout_method``; that trade lives in
 ``tests/scripts/test_timeout_method_policy.py``.
 
 Each package instantiates the guard in its own
-``tests/test_timeout_marker_inversion_guard.py`` with its OWN B, read through
-:func:`verify_cli_timeout` from the ``test_command`` in its orchestrator.yaml.
+``tests/test_timeout_marker_inversion_guard.py`` through
+:func:`judge_inversion_band`, with its OWN B: the ``--timeout`` in the
+``test_command`` of its orchestrator.yaml.
 
 Pure stdlib and pytest-free, like every ``shared.testing_*`` module, and
 registered as such in ``shared/tests/test_pure_stdlib_leaves.py``.
@@ -52,15 +53,15 @@ from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_va
 
 __all__ = [
     'DELIBERATE_TIGHT_BOUND_CEILING',
-    'GrandfatherRatchet',
+    'InversionVerdict',
     'SiteKind',
+    'SweepFloors',
     'TimeoutSite',
     'TreeScan',
-    'grandfather_ratchet',
-    'inversion_failure_message',
     'inverts',
+    'judge_inversion_band',
     'scan_python_tree',
-    'stale_grandfather_message',
+    'scan_timeout_marker_sites',
     'timeout_marker_sites',
     'verify_cli_timeout',
 ]
@@ -252,13 +253,15 @@ def verify_cli_timeout(test_command: str) -> int | None:
 class TreeScan(Generic[T]):
     """One pass over a tree's ``*.py`` files, with the counters that prove it read them.
 
-    ``items`` is everything the extract callback yielded, in sorted-path order.
+    ``root`` is the directory scanned.  ``items`` is everything the extract
+    callback yielded, in sorted-path order.
     ``examined`` counts the files that decoded, parseable or not.
     ``unreadable`` names, relative to the root, the files that did not, so a
     sweep that silently stops reading cannot pass as a clean tree.  Frozen,
     because callers memoise one scan and share it.
     """
 
+    root: Path
     items: tuple[T, ...]
     examined: int
     unreadable: tuple[str, ...]
@@ -295,24 +298,170 @@ def scan_python_tree(
         except (SyntaxError, ValueError):
             continue
         items.extend(extract(module, tree))
-    return TreeScan(tuple(items), examined, tuple(unreadable))
+    return TreeScan(root, tuple(items), examined, tuple(unreadable))
 
 
-def inversion_failure_message(
-    offenders: Iterable[tuple[str, TimeoutSite]],
+def scan_timeout_marker_sites(
+    root: Path, sanctioned: Mapping[str, float]
+) -> TreeScan[tuple[str, TimeoutSite]]:
+    """:func:`timeout_marker_sites` over every module under *root*, each site paired with its module."""
+    return scan_python_tree(
+        root,
+        lambda module, tree: ((module, site) for site in timeout_marker_sites(tree, sanctioned)),
+    )
+
+
+@dataclass(frozen=True)
+class SweepFloors:
+    """One package's anti-vacuity floors: set BELOW its measured counts, never equal to them.
+
+    A broken sweep reports zero offenders, which is indistinguishable from a
+    clean tree without them.  ``test_files`` catches a sweep that stopped
+    reading files; ``marker_sites`` catches an extractor that stopped matching.
+    """
+
+    test_files: int
+    marker_sites: int
+
+
+@dataclass(frozen=True)
+class InversionVerdict:
+    """One package's census, judged once by :func:`judge_inversion_band`.
+
+    ``new_offenders`` are the in-band sites the allowlist does not name.
+    ``stale`` are the allowlist's ``(module, qualname)`` keys, sorted, that name
+    no live in-band site -- a raised or deleted marker, or a renamed test --
+    and so must be removed before they admit a newcomer reusing the name.  Both
+    are empty when a precondition failed and nothing was judged.
+
+    Each ``*_failure`` is the text its check prints, or None when it passes.
+    """
+
+    new_offenders: tuple[tuple[str, TimeoutSite], ...]
+    stale: tuple[tuple[str, str], ...]
+    budget_failure: str | None
+    census_failure: str | None
+    new_offender_failure: str | None
+    stale_failure: str | None
+
+
+def judge_inversion_band(
+    scan: TreeScan[tuple[str, TimeoutSite]],
+    *,
+    verify_test_command: str,
+    grandfathered: frozenset[tuple[str, str]],
+    floors: SweepFloors,
+    slow_test_marker: str | None = None,
+) -> InversionVerdict:
+    """Judge a package's marker census against its verify budget and its allowlist.
+
+    The budget is the ``--timeout`` in *verify_test_command*.  *grandfathered*
+    keys a site as ``(module, qualname)``, the module relative to the scanned
+    root: per SITE and never a per-module count, because a count nets to zero
+    when one marker is added and another removed in the same module.  An empty
+    allowlist makes every in-band site an offender.
+
+    *slow_test_marker* is the package's own spelling of "this test is slow",
+    offered first among the two remedies; by default, the budget as a literal.
+
+    The two checks that assert an ABSENCE -- no new offender, no stale entry --
+    fail with the precondition's text when the budget leaves the band empty or
+    the sweep read fewer files than the floor, because the absence would then
+    prove nothing.
+    """
+    budget = verify_cli_timeout(verify_test_command)
+    budget_failure = _budget_failure(budget, verify_test_command)
+    census_failure = _census_failure(scan, floors)
+    blind_spot = budget_failure or _unread_tree_failure(scan, floors)
+    if budget is None or blind_spot is not None:
+        return InversionVerdict((), (), budget_failure, census_failure, blind_spot, blind_spot)
+
+    in_band = tuple(pair for pair in scan.items if inverts(pair[1].seconds, verify_cli_budget=budget))
+    live = {(module, site.qualname) for module, site in in_band}
+    new_offenders = tuple(
+        (module, site) for module, site in in_band if (module, site.qualname) not in grandfathered
+    )
+    stale = tuple(sorted(grandfathered - live))
+    return InversionVerdict(
+        new_offenders=new_offenders,
+        stale=stale,
+        budget_failure=None,
+        census_failure=census_failure,
+        new_offender_failure=_inversion_failure(
+            new_offenders,
+            verify_cli_budget=budget,
+            slow_test_marker=slow_test_marker
+            or (
+                f'@pytest.mark.timeout({budget})   # slow test -- or drop the '
+                'marker and take the ambient budget'
+            ),
+            has_allowlist=bool(grandfathered),
+        ),
+        stale_failure=_stale_failure(stale),
+    )
+
+
+def _budget_failure(budget: int | None, verify_test_command: str) -> str | None:
+    if budget is None:
+        return (
+            "this package's verify test_command carries no --timeout (got: "
+            f'{verify_test_command!r}), so there is no verify budget for a '
+            'marker to invert and this guard would pass vacuously.'
+        )
+    if budget <= DELIBERATE_TIGHT_BOUND_CEILING:
+        return (
+            f"this package's verify test_command passes --timeout={budget}, "
+            f'which leaves the inversion band ({DELIBERATE_TIGHT_BOUND_CEILING}, '
+            f'{budget}) empty, so no marker could invert and this guard would '
+            'pass vacuously.'
+        )
+    return None
+
+
+def _unread_tree_failure(
+    scan: TreeScan[tuple[str, TimeoutSite]], floors: SweepFloors
+) -> str | None:
+    if scan.examined >= floors.test_files:
+        return None
+    return (
+        f'only {scan.examined} .py files examined under {scan.root} (expected '
+        f'at least {floors.test_files}; {len(scan.unreadable)} skipped as '
+        f'unreadable: {sorted(scan.unreadable)}) -- the sweep itself is broken, '
+        'so this guard would pass vacuously rather than because the tree is '
+        'clean.'
+    )
+
+
+def _census_failure(scan: TreeScan[tuple[str, TimeoutSite]], floors: SweepFloors) -> str | None:
+    if len(scan.items) >= floors.marker_sites:
+        return None
+    return (
+        f'only {len(scan.items)} timeout marker site(s) found across '
+        f'{scan.examined} files under {scan.root} (expected at least '
+        f'{floors.marker_sites}) -- timeout_marker_sites has probably stopped '
+        'matching, so the sweep would pass vacuously. Check it against '
+        'shared/tests/test_testing_timeout_markers.py.'
+    )
+
+
+def _inversion_failure(
+    offenders: tuple[tuple[str, TimeoutSite], ...],
     *,
     verify_cli_budget: int,
     slow_test_marker: str,
-) -> str:
-    """The failure text every package's guard prints for its in-band *offenders*.
-
-    *slow_test_marker* is the package's own spelling of "this test is slow",
-    offered first among the two remedies.
-    """
+    has_allowlist: bool,
+) -> str | None:
+    if not offenders:
+        return None
     ordered = sorted(offenders, key=lambda pair: (pair[0], pair[1].qualname))
     sites = '\n  '.join(
         f'{module}::{site.qualname} ({site.kind}, line {site.lineno}) pins {site.seconds:g}s'
         for module, site in ordered
+    )
+    allowlist_note = (
+        '\n\nThe grandfather allowlist only ever shrinks -- do not add yours to it.'
+        if has_allowlist
+        else ''
     )
     return (
         f'{len(ordered)} timeout marker(s) in the inversion band '
@@ -334,50 +483,16 @@ def inversion_failure_message(
         'allowed. Anything in between inverts. Full rationale: '
         'shared/src/shared/testing_timeout_markers.py.'
         f'\n\nOffending sites:\n  {sites}'
+        f'{allowlist_note}'
     )
 
 
-@dataclass(frozen=True)
-class GrandfatherRatchet:
-    """In-band sites checked against a per-site allowlist that may only shrink.
-
-    ``new_offenders`` are the in-band sites the allowlist does not name.
-    ``stale`` are the allowlist's ``(module, qualname)`` keys, sorted, that name
-    no live in-band site -- a raised or deleted marker, or a renamed test --
-    and so must be removed before they admit a newcomer reusing the name.
-    """
-
-    new_offenders: tuple[tuple[str, TimeoutSite], ...]
-    stale: tuple[tuple[str, str], ...]
-
-
-def grandfather_ratchet(
-    in_band: Iterable[tuple[str, TimeoutSite]],
-    grandfathered: frozenset[tuple[str, str]],
-) -> GrandfatherRatchet:
-    """Split *in_band* against *grandfathered*, keyed per SITE as ``(module, qualname)``.
-
-    Per site and never a per-module count, because a count nets to zero when
-    one marker is added and another removed in the same module.
-    """
-    in_band = tuple(in_band)
-    live = {(module, site.qualname) for module, site in in_band}
-    return GrandfatherRatchet(
-        new_offenders=tuple(
-            (module, site)
-            for module, site in in_band
-            if (module, site.qualname) not in grandfathered
-        ),
-        stale=tuple(sorted(grandfathered - live)),
-    )
-
-
-def stale_grandfather_message(stale: Iterable[tuple[str, str]]) -> str:
-    """The failure text for allowlist entries :func:`grandfather_ratchet` found stale."""
-    entries = tuple(stale)
-    listing = '\n  '.join(f'{module}::{qualname}' for module, qualname in entries)
+def _stale_failure(stale: tuple[tuple[str, str], ...]) -> str | None:
+    if not stale:
+        return None
+    listing = '\n  '.join(f'{module}::{qualname}' for module, qualname in stale)
     return (
-        f'{len(entries)} grandfathered timeout marker site(s) no longer sit in '
+        f'{len(stale)} grandfathered timeout marker site(s) no longer sit in '
         'the inversion band: the marker was raised or removed, or the test was '
         'renamed. Delete the entries from the allowlist, which may only ever '
         'shrink; a stale entry would silently admit a new in-band marker that '

@@ -12,13 +12,15 @@ import pytest
 
 from shared.testing_timeout_markers import (
     DELIBERATE_TIGHT_BOUND_CEILING,
+    InversionVerdict,
     SiteKind,
+    SweepFloors,
     TimeoutSite,
-    grandfather_ratchet,
-    inversion_failure_message,
+    TreeScan,
     inverts,
+    judge_inversion_band,
     scan_python_tree,
-    stale_grandfather_message,
+    scan_timeout_marker_sites,
     timeout_marker_sites,
     verify_cli_timeout,
 )
@@ -348,20 +350,17 @@ def scanned_root(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def _sites_by_module(module: str, tree: ast.Module) -> Iterator[tuple[str, TimeoutSite]]:
-    for site in timeout_marker_sites(tree, _NO_SANCTIONED_NAMES):
-        yield module, site
-
-
-def test_scan_hands_extract_each_module_keyed_by_its_relative_posix_path(
-    scanned_root: Path,
-) -> None:
-    scan = scan_python_tree(scanned_root, _sites_by_module)
+def test_scan_pairs_each_site_with_its_module_relative_posix_path(scanned_root: Path) -> None:
+    scan = scan_timeout_marker_sites(scanned_root, _NO_SANCTIONED_NAMES)
 
     assert [(module, site.qualname) for module, site in scan.items] == [
         ('sub/test_b.py', 'test_a'),
         ('test_z.py', 'test_a'),
     ]
+
+
+def test_scan_records_the_root_it_read(scanned_root: Path) -> None:
+    assert scan_timeout_marker_sites(scanned_root, _NO_SANCTIONED_NAMES).root == scanned_root
 
 
 def test_scan_visits_modules_in_sorted_path_order(scanned_root: Path) -> None:
@@ -391,7 +390,7 @@ def test_an_unparseable_module_is_examined_but_never_extracted(scanned_root: Pat
 
 
 def test_an_undecodable_module_is_counted_unreadable_not_examined(scanned_root: Path) -> None:
-    scan = scan_python_tree(scanned_root, _sites_by_module)
+    scan = scan_timeout_marker_sites(scanned_root, _NO_SANCTIONED_NAMES)
 
     assert scan.unreadable == ('sub/not_utf8.py',)
     assert scan.examined == 3
@@ -424,7 +423,7 @@ def test_one_pass_can_feed_several_extractions_per_module(scanned_root: Path) ->
 
 
 def test_a_scan_result_is_immutable(scanned_root: Path) -> None:
-    scan = scan_python_tree(scanned_root, _sites_by_module)
+    scan = scan_timeout_marker_sites(scanned_root, _NO_SANCTIONED_NAMES)
 
     assert isinstance(scan.items, tuple)
     assert isinstance(scan.unreadable, tuple)
@@ -433,33 +432,85 @@ def test_a_scan_result_is_immutable(scanned_root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# inversion_failure_message -- what every package's guard prints.
+# judge_inversion_band -- one package's census against its budget and allowlist.
 # ---------------------------------------------------------------------------
 
 _SLOW_IN_CLASS = ('test_z.py', TimeoutSite('TestB', SiteKind.CLASS_DECORATOR, 180.0, 12, '180'))
 _SLOW_IN_SUBDIR = ('sub/test_a.py', TimeoutSite('test_x', SiteKind.DECORATOR, 120.0, 5, '120'))
+_SECOND_IN_SUBDIR = ('sub/test_a.py', TimeoutSite('test_y', SiteKind.DECORATOR, 90.0, 9, '90'))
+_AT_THE_BUDGET = ('test_z.py', TimeoutSite('test_slow', SiteKind.DECORATOR, 600.0, 20, '600'))
+_TIGHT_BOUND = ('test_z.py', TimeoutSite('test_fast', SiteKind.DECORATOR, 60.0, 30, '60'))
 _SLOW_TEST_MARKER = '@pytest.mark.timeout(600)   # slow test'
+_ROOT = Path('/pkg/tests')
+_FLOORS_MET = SweepFloors(test_files=1, marker_sites=1)
+_NO_ALLOWLIST: frozenset[tuple[str, str]] = frozenset()
 
 
-def _message(verify_cli_budget: int = 600) -> str:
-    return inversion_failure_message(
-        [_SLOW_IN_CLASS, _SLOW_IN_SUBDIR],
-        verify_cli_budget=verify_cli_budget,
-        slow_test_marker=_SLOW_TEST_MARKER,
+def _judge(
+    *sites: tuple[str, TimeoutSite],
+    grandfathered: frozenset[tuple[str, str]] = _NO_ALLOWLIST,
+    verify_test_command: str = 'pytest tests/ --timeout=600 -q',
+    floors: SweepFloors = _FLOORS_MET,
+    examined: int = 10,
+    unreadable: tuple[str, ...] = (),
+    slow_test_marker: str | None = _SLOW_TEST_MARKER,
+) -> InversionVerdict:
+    return judge_inversion_band(
+        TreeScan(_ROOT, sites, examined, unreadable),
+        verify_test_command=verify_test_command,
+        grandfathered=grandfathered,
+        floors=floors,
+        slow_test_marker=slow_test_marker,
     )
 
 
+def _offender_text(verdict: InversionVerdict) -> str:
+    assert verdict.new_offender_failure is not None
+    return verdict.new_offender_failure
+
+
+def test_a_clean_census_passes_every_check() -> None:
+    verdict = _judge(_AT_THE_BUDGET, _TIGHT_BOUND)
+
+    assert verdict == InversionVerdict((), (), None, None, None, None)
+
+
+def test_only_an_in_band_site_is_an_offender() -> None:
+    verdict = _judge(_SLOW_IN_CLASS, _AT_THE_BUDGET, _TIGHT_BOUND)
+
+    assert verdict.new_offenders == (_SLOW_IN_CLASS,)
+
+
+def test_the_band_tops_out_at_the_test_commands_budget() -> None:
+    verdict = _judge(_SLOW_IN_CLASS, verify_test_command='pytest --timeout 150')
+
+    assert verdict.new_offenders == ()
+
+
+def test_a_verdict_is_immutable() -> None:
+    verdict = _judge(_SLOW_IN_CLASS)
+
+    with pytest.raises(AttributeError):
+        verdict.stale = ()  # pyright: ignore[reportAttributeAccessIssue]
+
+
+# -- the in-band failure text -------------------------------------------------
+
+
 def test_the_message_leads_with_the_offender_count() -> None:
-    assert _message().splitlines()[0].startswith('2 ')
+    assert _offender_text(_judge(_SLOW_IN_CLASS, _SLOW_IN_SUBDIR)).splitlines()[0].startswith('2 ')
 
 
-def test_the_message_states_the_band_for_the_budget_passed_in() -> None:
-    assert '(60 < N < 600)' in _message(600)
-    assert '(60 < N < 300)' in _message(300)
+def test_the_message_states_the_band_for_the_budget_in_force() -> None:
+    def band_in(command: str) -> str:
+        return _offender_text(_judge(_SLOW_IN_CLASS, verify_test_command=command))
+
+    assert '(60 < N < 600)' in band_in('pytest --timeout=600')
+    assert '(60 < N < 300)' in band_in('pytest --timeout=300')
 
 
 def test_the_message_lists_each_offender_sorted_by_module_then_qualname() -> None:
-    message = _message()
+    message = _offender_text(_judge(_SLOW_IN_CLASS, _SLOW_IN_SUBDIR))
     in_subdir = 'sub/test_a.py::test_x (decorator, line 5) pins 120s'
     in_class = 'test_z.py::TestB (class-decorator, line 12) pins 180s'
 
@@ -469,80 +520,129 @@ def test_the_message_lists_each_offender_sorted_by_module_then_qualname() -> Non
 
 
 def test_the_message_offers_both_remedies() -> None:
-    message = _message()
+    message = _offender_text(_judge(_SLOW_IN_CLASS))
 
     assert _SLOW_TEST_MARKER in message
     assert 'N <= 60' in message
 
 
+def test_the_default_slow_test_remedy_is_the_budget_as_a_literal() -> None:
+    message = _offender_text(_judge(_SLOW_IN_CLASS, slow_test_marker=None))
+
+    assert '@pytest.mark.timeout(600)   # slow test -- or drop the marker' in message
+
+
 def test_the_message_points_at_the_rationale_and_the_timeout_method_policy() -> None:
-    message = _message()
+    message = _offender_text(_judge(_SLOW_IN_CLASS))
 
     assert 'shared/src/shared/testing_timeout_markers.py' in message
     assert 'tests/scripts/test_timeout_method_policy.py' in message
 
 
-# ---------------------------------------------------------------------------
-# grandfather_ratchet -- a per-site allowlist that may only shrink.
-# ---------------------------------------------------------------------------
+def test_only_a_package_with_an_allowlist_is_told_it_only_shrinks() -> None:
+    allowlisted = _judge(_SLOW_IN_CLASS, grandfathered=frozenset({('test_z.py', 'TestOther')}))
 
-_SECOND_IN_SUBDIR = ('sub/test_a.py', TimeoutSite('test_y', SiteKind.DECORATOR, 90.0, 9, '90'))
+    assert 'only ever shrinks' in _offender_text(allowlisted)
+    assert 'only ever shrinks' not in _offender_text(_judge(_SLOW_IN_CLASS))
+
+
+# -- the grandfather allowlist: per site, and it may only shrink ----------------
 
 
 def test_a_grandfathered_site_is_not_a_new_offender() -> None:
-    ratchet = grandfather_ratchet(
-        [_SLOW_IN_CLASS, _SLOW_IN_SUBDIR], frozenset({('test_z.py', 'TestB')})
+    verdict = _judge(
+        _SLOW_IN_CLASS, _SLOW_IN_SUBDIR, grandfathered=frozenset({('test_z.py', 'TestB')})
     )
 
-    assert ratchet.new_offenders == (_SLOW_IN_SUBDIR,)
-    assert ratchet.stale == ()
+    assert verdict.new_offenders == (_SLOW_IN_SUBDIR,)
+    assert verdict.stale == ()
 
 
 def test_grandfathering_one_site_does_not_admit_its_neighbour() -> None:
-    ratchet = grandfather_ratchet(
-        [_SLOW_IN_SUBDIR, _SECOND_IN_SUBDIR], frozenset({('sub/test_a.py', 'test_x')})
+    verdict = _judge(
+        _SLOW_IN_SUBDIR,
+        _SECOND_IN_SUBDIR,
+        grandfathered=frozenset({('sub/test_a.py', 'test_x')}),
     )
 
-    assert ratchet.new_offenders == (_SECOND_IN_SUBDIR,)
+    assert verdict.new_offenders == (_SECOND_IN_SUBDIR,)
 
 
 def test_an_entry_naming_no_live_in_band_site_is_stale() -> None:
     """A raised marker, a deleted marker and a renamed test all look the same here."""
-    ratchet = grandfather_ratchet(
-        [_SLOW_IN_CLASS],
-        frozenset({
+    verdict = _judge(
+        _SLOW_IN_CLASS,
+        _AT_THE_BUDGET,
+        grandfathered=frozenset({
             ('test_z.py', 'TestB'),
             ('test_z.py', 'TestRenamed'),
-            ('sub/test_a.py', 'test_raised_to_the_budget'),
+            ('test_z.py', 'test_slow'),
         }),
     )
 
-    assert ratchet.new_offenders == ()
-    assert ratchet.stale == (
-        ('sub/test_a.py', 'test_raised_to_the_budget'),
-        ('test_z.py', 'TestRenamed'),
-    )
-
-
-def test_an_empty_allowlist_makes_every_in_band_site_new() -> None:
-    ratchet = grandfather_ratchet([_SLOW_IN_CLASS, _SLOW_IN_SUBDIR], frozenset())
-
-    assert ratchet.new_offenders == (_SLOW_IN_CLASS, _SLOW_IN_SUBDIR)
-    assert ratchet.stale == ()
-
-
-def test_a_ratchet_result_is_immutable() -> None:
-    ratchet = grandfather_ratchet([_SLOW_IN_CLASS], frozenset())
-
-    with pytest.raises(AttributeError):
-        ratchet.stale = ()  # pyright: ignore[reportAttributeAccessIssue]
+    assert verdict.new_offenders == ()
+    assert verdict.stale == (('test_z.py', 'TestRenamed'), ('test_z.py', 'test_slow'))
 
 
 def test_the_stale_message_names_the_count_and_every_entry() -> None:
-    message = stale_grandfather_message(
-        (('sub/test_a.py', 'test_raised_to_the_budget'), ('test_z.py', 'TestRenamed'))
+    verdict = _judge(
+        grandfathered=frozenset({
+            ('sub/test_a.py', 'test_raised_to_the_budget'),
+            ('test_z.py', 'TestRenamed'),
+        })
     )
 
-    assert message.splitlines()[0].startswith('2 ')
-    assert 'sub/test_a.py::test_raised_to_the_budget' in message
-    assert 'test_z.py::TestRenamed' in message
+    assert verdict.stale_failure is not None
+    assert verdict.stale_failure.splitlines()[0].startswith('2 ')
+    assert 'sub/test_a.py::test_raised_to_the_budget' in verdict.stale_failure
+    assert 'test_z.py::TestRenamed' in verdict.stale_failure
+
+
+# -- preconditions: a check that asserts an absence must not pass blind ---------
+
+
+@pytest.mark.parametrize(
+    ('verify_test_command', 'expected'),
+    [
+        ('pytest tests/ -q', 'carries no --timeout'),
+        ('pytest tests/ --timeout=60', 'band (60, 60) empty'),
+    ],
+)
+def test_a_budget_that_leaves_no_band_fails_every_absence_check(
+    verify_test_command: str, expected: str
+) -> None:
+    verdict = _judge(
+        _SLOW_IN_CLASS,
+        grandfathered=frozenset({('test_z.py', 'TestRenamed')}),
+        verify_test_command=verify_test_command,
+    )
+
+    assert verdict.budget_failure is not None
+    assert expected in verdict.budget_failure
+    assert verdict.new_offender_failure == verdict.budget_failure
+    assert verdict.stale_failure == verdict.budget_failure
+    assert (verdict.new_offenders, verdict.stale) == ((), ())
+
+
+def test_a_sweep_that_read_too_few_files_fails_every_absence_check() -> None:
+    verdict = _judge(
+        _SLOW_IN_CLASS,
+        floors=SweepFloors(test_files=5, marker_sites=1),
+        examined=4,
+        unreadable=('sub/not_utf8.py',),
+    )
+
+    assert verdict.budget_failure is None
+    assert verdict.new_offender_failure is not None
+    assert 'only 4 .py files examined under /pkg/tests' in verdict.new_offender_failure
+    assert "'sub/not_utf8.py'" in verdict.new_offender_failure
+    assert verdict.stale_failure == verdict.new_offender_failure
+    assert verdict.new_offenders == ()
+
+
+def test_a_census_below_its_floor_fails() -> None:
+    verdict = _judge(_AT_THE_BUDGET, floors=SweepFloors(test_files=1, marker_sites=2))
+
+    assert verdict.census_failure is not None
+    assert 'only 1 timeout marker site(s) found across 10 files' in verdict.census_failure
+    assert verdict.new_offender_failure is None

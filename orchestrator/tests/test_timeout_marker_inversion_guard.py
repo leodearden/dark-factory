@@ -11,15 +11,15 @@ follows from and the three regimes the two budgets carve out -- has ONE home:
 the module docstring of shared/src/shared/testing_timeout_markers.py.  Read it
 there.  This module points at it rather than restating it, so a pytest-timeout
 upgrade that moves that precedence invalidates one copy and not five.  The sole
-deliberate exception is the failure message,
-``shared.testing_timeout_markers.inversion_failure_message``, where the reader
-is looking at a traceback and not at the source.
+deliberate exception is the failure text ``judge_inversion_band`` renders,
+where the reader is looking at a traceback and not at the source.
 
 A SWEEP WITH NO ALLOWLIST: every in-band marker under this directory fails.
 
 SCOPE.  The extractor (``timeout_marker_sites``), the band (``inverts``) and
-the message live in ``shared.testing_timeout_markers``.  This module
-instantiates them for ``orchestrator/tests`` and adds the orchestrator-only
+the judgement with its messages (``judge_inversion_band``) live in
+``shared.testing_timeout_markers``.  This module instantiates them for
+``orchestrator/tests`` with an empty allowlist and adds the orchestrator-only
 pins: the sanctioned-name mirrors, the deep-gate and deep-landing spellings,
 and the spawn budgets.  fused-memory and shared instantiate the same guard in
 their own ``tests/test_timeout_marker_inversion_guard.py``.  tests/,
@@ -66,10 +66,12 @@ from _orch_helpers import (
 from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
 from shared.testing_timeout_markers import (
     DELIBERATE_TIGHT_BOUND_CEILING,
+    InversionVerdict,
     SiteKind,
+    SweepFloors,
     TimeoutSite,
-    inversion_failure_message,
-    inverts,
+    TreeScan,
+    judge_inversion_band,
     scan_python_tree,
     timeout_marker_sites,
     verify_cli_timeout,
@@ -89,6 +91,11 @@ pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
 #: cwd while a plain ``pytest orchestrator/tests`` runs from the repo root,
 #: and this pin must read identically under both.
 _ORCH_YAML = ORCH_DIR / 'orchestrator.yaml'
+
+
+def _verify_test_command() -> str:
+    """The ``test_command`` merge-verify runs for this package, from :data:`_ORCH_YAML`."""
+    return yaml.safe_load(_ORCH_YAML.read_text(encoding='utf-8'))['test_command']
 
 #: This directory, resolved from THIS FILE and never from the process CWD, for
 #: the same reason ``_ORCH_YAML`` is: the census must come out identical under
@@ -562,7 +569,7 @@ class TestVerifyCliBudgetConstant:
         upper edge moves with it and this fails loudly instead of leaving the
         guard silently policing a budget nobody passes any more.
         """
-        test_command = yaml.safe_load(_ORCH_YAML.read_text(encoding='utf-8'))['test_command']
+        test_command = _verify_test_command()
 
         configured = verify_cli_timeout(test_command)
         assert configured is not None, (
@@ -1542,7 +1549,7 @@ class TestRow7SceneIsGuarded:
         """The ``timeout`` marker site on the Row 7 class, or fail saying it is gone."""
         sites = [
             site
-            for module, site in _tree_scan().sites
+            for module, site in _tree_scan().sites.items
             if module == _DEEP_GATE_MODULE and site.qualname == _ROW7_CLASS
         ]
 
@@ -1652,7 +1659,9 @@ class TestDeepLandingModuleMarkers:
 
     def _sites(self) -> list[TimeoutSite]:
         """Every ``timeout`` marker site in the deep-landing module."""
-        return [site for module, site in _tree_scan().sites if module == _DEEP_LANDING_MODULE]
+        return [
+            site for module, site in _tree_scan().sites.items if module == _DEEP_LANDING_MODULE
+        ]
 
     def test_every_marker_site_is_spelled_as_the_named_constant(self) -> None:
         """Both halves matter, and neither implies the other.
@@ -1981,45 +1990,37 @@ def test_usefixtures_census_ignores_a_mark_bound_somewhere_else() -> None:
 # The tree-wide sweep.
 # ---------------------------------------------------------------------------
 
-#: Anti-vacuity FLOORS, not equalities -- 563 files and 148 marker sites
-#: MEASURED at authorship time -- so the guard survives the tree growing while
-#: still failing loudly if the sweep itself ever breaks (a wrong _TESTS_DIR, a
-#: read that silently yields nothing, an extractor rotted to always-empty).
-#: Without them a broken sweep reports zero offenders and passes, which is
-#: indistinguishable from a clean tree.  The house pattern for exactly this
-#: risk: test_whole_tree_scan_timeout_guard.py::_MIN_EXPECTED_TEST_FILES,
+#: Set below the 563 files and 148 marker sites MEASURED at authorship time,
+#: so the guard survives the tree growing while still failing loudly if the
+#: sweep itself ever breaks: a wrong _TESTS_DIR, a read that silently yields
+#: nothing, an extractor rotted to always-empty.  The house pattern for exactly
+#: this risk: test_whole_tree_scan_timeout_guard.py::_MIN_EXPECTED_TEST_FILES,
 #: test_marker_registration_drift.py::_MIN_EXPECTED_TEST_FILES.
-_MIN_EXPECTED_TEST_FILES = 400
-_MIN_EXPECTED_MARKER_SITES = 100
+_FLOORS = SweepFloors(test_files=400, marker_sites=100)
 
 
 class _TreeScan(NamedTuple):
-    """One pass over every ``*.py`` under :data:`_TESTS_DIR`, with sweep-health counters.
+    """One parse of every ``*.py`` under :data:`_TESTS_DIR`, feeding two extractions.
 
-    All fields are IMMUTABLE because the scan is memoised and shared: a caller
-    that mutated a list here would corrupt every later caller's view of the
-    tree.
-
-    ``sites`` pairs each timeout marker site with its module -- the path
-    relative to :data:`_TESTS_DIR`.  ``bindings`` is every assignment of a
-    :data:`_SANCTIONED_TIMEOUT_NAMES` name, for
-    :class:`TestSanctionedNameMirrors`.  Files skipped as ``unreadable`` are
-    NOT counted as ``examined`` (they were not).
+    ``sites`` is the timeout-marker census, each site paired with its module --
+    the path relative to :data:`_TESTS_DIR` -- and carrying the sweep-health
+    counters.  ``bindings`` is every assignment of a
+    :data:`_SANCTIONED_TIMEOUT_NAMES` name, for :class:`TestSanctionedNameMirrors`.
+    Immutable because the scan is memoised and shared: a caller that mutated it
+    would corrupt every later caller's view of the tree.
     """
 
-    sites: tuple[tuple[str, TimeoutSite], ...]
+    sites: TreeScan[tuple[str, TimeoutSite]]
     bindings: tuple[_Binding, ...]
-    examined: int
-    unreadable: tuple[str, ...]
 
 
 @functools.cache
 def _tree_scan() -> _TreeScan:
     """Read, parse and extract from every ``*.py`` under this directory -- ONCE.
 
-    MEMOISED because FOUR tests need it and one pass is not cheap: MEASURED
+    MEMOISED because several tests need it and one pass is not cheap: MEASURED
     15.03s over 569 files on this loaded machine (6.06s measured unloaded).
-    Uncached that is four passes where one does, and the surplus lands as
+    Uncached that is one pass per test where one does, and the surplus lands as
     contention on the very ``-n auto`` verify run this module exists to
     de-flake -- the same cost that motivated WHOLE_TREE_SCAN_TEST_TIMEOUT.
     Under xdist the tests may land on different workers, so the win is partial;
@@ -2040,19 +2041,28 @@ def _tree_scan() -> _TreeScan:
 
     scan = scan_python_tree(_TESTS_DIR, per_module)
     return _TreeScan(
-        sites=tuple(pair for sites, _ in scan.items for pair in sites),
+        sites=TreeScan(
+            root=scan.root,
+            items=tuple(pair for sites, _ in scan.items for pair in sites),
+            examined=scan.examined,
+            unreadable=scan.unreadable,
+        ),
         bindings=tuple(binding for _, bindings in scan.items for binding in bindings),
-        examined=scan.examined,
-        unreadable=scan.unreadable,
     )
 
 
-def _in_band_sites() -> tuple[tuple[str, TimeoutSite], ...]:
-    """:func:`_tree_scan`'s sites, narrowed to the ones that actually invert."""
-    return tuple(
-        pair
-        for pair in _tree_scan().sites
-        if inverts(pair[1].seconds, verify_cli_budget=VERIFY_CLI_PER_TEST_TIMEOUT)
+@functools.cache
+def _verdict() -> InversionVerdict:
+    """:func:`_tree_scan`'s census, judged against verify's budget with NO allowlist."""
+    return judge_inversion_band(
+        _tree_scan().sites,
+        verify_test_command=_verify_test_command(),
+        grandfathered=frozenset(),
+        floors=_FLOORS,
+        slow_test_marker=(
+            'from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT\n'
+            '@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)   # slow test'
+        ),
     )
 
 
@@ -2069,43 +2079,20 @@ def test_no_timeout_marker_sits_in_the_inversion_band() -> None:
     whatever innocent test shared the dead worker.  Three tasks (4176, 4384,
     4405) were failed that way by ONE such marker.
     """
-    scan = _tree_scan()
-    assert scan.examined >= _MIN_EXPECTED_TEST_FILES, (
-        f'only {scan.examined} .py files examined under {_TESTS_DIR} (expected '
-        f'at least {_MIN_EXPECTED_TEST_FILES}; {len(scan.unreadable)} skipped '
-        f'as unreadable: {sorted(scan.unreadable)}) -- the sweep itself is '
-        'broken, so this guard would pass vacuously rather than because the '
-        'tree is clean.'
-    )
-
-    offenders = _in_band_sites()
-    assert not offenders, inversion_failure_message(
-        offenders,
-        verify_cli_budget=VERIFY_CLI_PER_TEST_TIMEOUT,
-        slow_test_marker=(
-            'from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT\n'
-            '@pytest.mark.timeout(VERIFY_CLI_PER_TEST_TIMEOUT)   # slow test'
-        ),
-    )
+    failure = _verdict().new_offender_failure
+    assert failure is None, failure
 
 
 def test_the_marker_census_is_not_vacuous() -> None:
     """The sweep must find a substantial population of markers, in-band or not.
 
-    Distinct from the file floor above and load-bearing in a way it is not: a
+    Distinct from the file floor and load-bearing in a way it is not: a
     correct ``_TESTS_DIR`` with an EXTRACTOR rotted to always-empty would
     examine 563 files, find zero sites, report zero offenders and pass. This is
     the floor that catches that. 148 sites measured at authorship time.
     """
-    scan = _tree_scan()
-
-    assert len(scan.sites) >= _MIN_EXPECTED_MARKER_SITES, (
-        f'only {len(scan.sites)} timeout marker site(s) found across '
-        f'{scan.examined} files (expected at least '
-        f'{_MIN_EXPECTED_MARKER_SITES}) -- '
-        'timeout_marker_sites has probably stopped matching, so the sweep '
-        'would pass vacuously. Check it against shared/tests/test_testing_timeout_markers.py.'
-    )
+    failure = _verdict().census_failure
+    assert failure is None, failure
 
 
 def test_the_deep_gate_module_pins_every_timeout_by_name() -> None:
@@ -2128,7 +2115,7 @@ def test_the_deep_gate_module_pins_every_timeout_by_name() -> None:
     sanctioned name is held honest separately, by
     :class:`TestSanctionedNameMirrors`.
     """
-    sites = [site for module, site in _tree_scan().sites if module == _DEEP_GATE_MODULE]
+    sites = [site for module, site in _tree_scan().sites.items if module == _DEEP_GATE_MODULE]
 
     assert len(sites) >= _MIN_DEEP_GATE_MARKER_SITES, (
         f'only {len(sites)} timeout marker site(s) found in '
