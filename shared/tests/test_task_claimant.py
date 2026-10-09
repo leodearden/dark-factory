@@ -410,86 +410,39 @@ def _row(status, claimant, heartbeat, metadata=None) -> dict:
     }
 
 
-class TestIsStrandedAnyStatusIsStatusAgnostic:
-    @pytest.mark.parametrize('status', list(TaskStatus))
-    def test_stale_claimant_is_stranded(self, status):
-        now = _now()
-        stale = (now - timedelta(minutes=10)).isoformat()
-        assert is_stranded_any_status(_row(status, 'run-x', stale), now, _TTL) is True
-
-    @pytest.mark.parametrize('status', list(TaskStatus))
-    def test_fresh_claimant_is_not_stranded(self, status):
-        now = _now()
-        fresh = (now - timedelta(minutes=1)).isoformat()
-        assert is_stranded_any_status(_row(status, 'run-x', fresh), now, _TTL) is False
-
-    @pytest.mark.parametrize('status', list(TaskStatus))
-    def test_none_claimant_is_stranded(self, status):
-        now = _now()
-        assert is_stranded_any_status(_row(status, None, now.isoformat()), now, _TTL) is True
-
-    @pytest.mark.parametrize('status', list(TaskStatus))
-    def test_blank_claimant_is_stranded(self, status):
-        now = _now()
-        assert is_stranded_any_status(_row(status, '   ', now.isoformat()), now, _TTL) is True
-
-    @pytest.mark.parametrize('status', list(TaskStatus))
-    def test_missing_heartbeat_is_stranded(self, status):
-        now = _now()
-        assert is_stranded_any_status(_row(status, 'run-x', None), now, _TTL) is True
-
-    @pytest.mark.parametrize('status', list(TaskStatus))
-    def test_unparseable_heartbeat_is_stranded(self, status):
-        now = _now()
-        row = _row(status, 'run-x', 'not-a-timestamp')
-        assert is_stranded_any_status(row, now, _TTL) is True
-
-
-class TestIsStrandedAnyStatusInfraHoldCarveOut:
-    @pytest.mark.parametrize('status', ['in-progress', 'blocked', 'pending'])
-    def test_legacy_infra_hold_metadata_is_not_stranded(self, status):
-        """Boundary case B9 — the carve-out has no status gate."""
-        now = _now()
-        stale = (now - timedelta(minutes=10)).isoformat()
-        row = _row(status, 'run-x', stale, metadata={'infra_hold': True})
-        assert is_stranded_any_status(row, now, _TTL) is False
-
-    def test_non_mapping_metadata_does_not_trigger_carve_out(self):
-        now = _now()
-        stale = (now - timedelta(minutes=10)).isoformat()
-        row = _row('in-progress', 'run-x', stale, metadata='infra_hold')
-        assert is_stranded_any_status(row, now, _TTL) is True
-
-
-class TestIsStrandedAnyStatusNaiveNow:
-    def test_naive_now_is_normalized_not_raised(self):
-        now_aware = _now()
-        now_naive = now_aware.replace(tzinfo=None)
-        fresh = (now_aware - timedelta(minutes=1)).isoformat()
-        assert is_stranded_any_status(_row('pending', 'run-x', fresh), now_naive, _TTL) is False
-
-    def test_naive_now_past_ttl_is_stranded(self):
-        now_aware = _now()
-        now_naive = now_aware.replace(tzinfo=None)
-        stale = (now_aware - timedelta(minutes=10)).isoformat()
-        assert is_stranded_any_status(_row('pending', 'run-x', stale), now_naive, _TTL) is True
-
-
 _GRID_NOW = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
+_GRID_FRESH = (_GRID_NOW - timedelta(minutes=1)).isoformat()
+_GRID_STALE = (_GRID_NOW - timedelta(minutes=10)).isoformat()
 _GRID = [
     _row(status, claimant, heartbeat, metadata)
     for status, claimant, heartbeat, metadata in itertools.product(
         list(TaskStatus),
         [None, '   ', 'run-x'],
-        [
-            (_GRID_NOW - timedelta(minutes=1)).isoformat(),
-            (_GRID_NOW - timedelta(minutes=10)).isoformat(),
-            None,
-            'not-a-timestamp',
-        ],
+        [_GRID_FRESH, _GRID_STALE, None, 'not-a-timestamp'],
         [None, {'infra_hold': True}],
     )
 ]
+
+
+class TestIsStrandedAnyStatus:
+    @pytest.mark.parametrize('row', _GRID)
+    def test_stranded_unless_live_claimant_or_legacy_infra_hold(self, row):
+        """Status never matters; the infra_hold carve-out has no status gate (boundary B9)."""
+        live = row['claimant_run_id'] == 'run-x' and row['heartbeat_at'] == _GRID_FRESH
+        infra_held = row['metadata'] == {'infra_hold': True}
+        assert is_stranded_any_status(row, _GRID_NOW, _TTL) is not (live or infra_held)
+
+    def test_non_mapping_metadata_does_not_trigger_carve_out(self):
+        row = _row('in-progress', 'run-x', _GRID_STALE, metadata='infra_hold')
+        assert is_stranded_any_status(row, _GRID_NOW, _TTL) is True
+
+    def test_naive_now_is_normalized_not_raised(self):
+        now_naive = _GRID_NOW.replace(tzinfo=None)
+        assert is_stranded_any_status(_row('pending', 'run-x', _GRID_FRESH), now_naive, _TTL) is False
+
+    def test_naive_now_past_ttl_is_stranded(self):
+        now_naive = _GRID_NOW.replace(tzinfo=None)
+        assert is_stranded_any_status(_row('pending', 'run-x', _GRID_STALE), now_naive, _TTL) is True
 
 
 class TestSpecialisationsDelegate:

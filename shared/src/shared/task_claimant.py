@@ -50,13 +50,10 @@ __all__ = [
 # dispatch gate deliberately uses its own config knob, claimant_liveness_ttl_secs (300s).
 DEFAULT_CLAIMANT_HEARTBEAT_TTL: timedelta = timedelta(minutes=10)
 
-# D3's hygiene tier is an ALLOWLIST, so a new status stays excluded until deliberately classified
-# (docs/prds/claimant-invariant-enforcement.md D2/D3 and its status-producer audit). Excluded:
-#   in-progress  — the task-2588 un-claim class D2 rejects; is_stranded's (the reaper's) domain.
-#   infra-hold   — legitimately carries weeks-stale claimants by design.
-#   blocked      — owned by the stranded-blocked sweep (is_stranded_blocked /
-#                  Scheduler._phase_redispatch_stranded_blocked), which clears the claimant itself.
-#   done/cancelled — the invariant tier, violates_terminal_claimant_invariant, not hygiene.
+# D3's hygiene tier is an ALLOWLIST, so a new status stays excluded until deliberately classified.
+# Excluded: in-progress, infra-hold and the terminal statuses per
+# docs/prds/claimant-invariant-enforcement.md D2/D3; blocked, whose claimant the stranded-blocked
+# sweep (is_stranded_blocked) owns and clears itself.
 _HYGIENE_TIER_STATUSES: frozenset[TaskStatus] = frozenset(
     {TaskStatus.PENDING, TaskStatus.DEFERRED, TaskStatus.REVIEW, TaskStatus.MERGE_DEFERRED}
 )
