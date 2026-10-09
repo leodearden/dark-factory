@@ -1333,10 +1333,13 @@ class FakeMemoryLookup:
 
     Deliberately exposes NO ``get_memory``: ``citation_repair`` reads the
     replacement's fingerprint off the raw Qdrant payload this returns, not
-    through ``MemoryService.get_memory`` (whose mem0 fingerprint is
-    structurally ``{category: None, agent_id: None, ...}`` — see
-    ``citation_repair._fingerprint_from_record``). A test that needs to pin
-    that non-call subclasses this and adds a recording ``get_memory``.
+    through ``MemoryService.get_memory``: ``get_memory_by_id`` returns the
+    full unprocessed payload with all three fields at one level, whereas
+    ``get_memory`` consumes mem0's processed record with the promoted payload
+    keys lifted out of ``metadata``. The two extractions agree on values (see
+    ``tests/reconciliation/test_citation_repair.py::TestFingerprintExtractionConvergence``).
+    A test that needs to pin that non-call subclasses this and adds a
+    recording ``get_memory``.
     """
 
     def __init__(self, memories: dict[str, Any] | None = None):
