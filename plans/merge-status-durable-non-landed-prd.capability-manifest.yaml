@@ -62,9 +62,9 @@ tasks:
     verdict: PASS
     delivered_check:
       kind: grep
-      pattern: absorbed_request_ids
+      pattern: '''absorbed_request_ids'':[[:space:]]*[^][[:space:]]'
       paths:
-      - orchestrator/src/orchestrator/merge_queue.py
+      - orchestrator/src/orchestrator/merge_lane/worker.py
       expect: present
   - name: event-type-index-covers-the-predicate
     binding: capability→producer (wired) — idx_events_type ON events(event_type);
