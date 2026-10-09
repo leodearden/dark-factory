@@ -17,6 +17,7 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
+from _child_processes import spawned_children
 from test_pure_stdlib_leaves import run_python_child
 
 from shared.process_identity import (
@@ -44,21 +45,8 @@ _RENAME_THEN_SLEEP = (
 
 @pytest.fixture
 def spawn() -> Iterator[Callable[..., subprocess.Popen]]:
-    """Start real children; kill and reap every one at teardown, even if already reaped."""
-    children: list[subprocess.Popen] = []
-
-    def _spawn(argv: list[str], **popen_kwargs) -> subprocess.Popen:
-        child = subprocess.Popen(argv, **popen_kwargs)
-        children.append(child)
-        return child
-
-    yield _spawn
-    for child in children:
-        child.kill()
-        child.wait()
-        for stream in (child.stdin, child.stdout):
-            if stream is not None:
-                stream.close()
+    with spawned_children() as spawn_child:
+        yield spawn_child
 
 
 @pytest.fixture

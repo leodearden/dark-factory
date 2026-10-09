@@ -12,6 +12,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from _child_processes import spawned_children
 from pydantic import ValidationError
 from test_pure_stdlib_leaves import run_python_child
 
@@ -104,9 +105,11 @@ def test_caller_kinds_are_the_three_kinds_a_caller_may_choose():
 
 
 def test_migration_only_kinds_are_legacy_unknown_alone_and_no_caller_kind():
-    assert MIGRATION_ONLY_KINDS == {DeferralKind.LEGACY_UNKNOWN}
-    assert isinstance(MIGRATION_ONLY_KINDS, frozenset)
-    assert not MIGRATION_ONLY_KINDS & CALLER_KINDS
+    migration_only_kinds = MIGRATION_ONLY_KINDS
+
+    assert migration_only_kinds == {DeferralKind.LEGACY_UNKNOWN}
+    assert isinstance(migration_only_kinds, frozenset)
+    assert not migration_only_kinds & CALLER_KINDS
 
 
 @pytest.mark.parametrize('kind', sorted(set(DeferralKind) - CALLER_KINDS - MIGRATION_ONLY_KINDS))
@@ -682,10 +685,8 @@ def test_needs_human_cases_cover_every_reason():
 
 @pytest.fixture
 def sleeping_child() -> Iterator[subprocess.Popen]:
-    child = subprocess.Popen(['sleep', '600'])
-    yield child
-    child.kill()
-    child.wait()
+    with spawned_children() as spawn:
+        yield spawn(['sleep', '600'])
 
 
 def test_a_live_holder_is_silent_and_a_killed_one_needs_a_human(sleeping_child):
