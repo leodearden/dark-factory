@@ -38,6 +38,7 @@ from _dashboard_helpers import (
     extract_function_body,
     find_function_params,
     find_script_position,
+    jsx_open_tag_end,
     strip_js_comments,
     walk_balanced,
 )
@@ -843,6 +844,107 @@ class TestExtractDfDataBlock:
             'a real improvement, but update this pin deliberately'
         )
         assert 'open: 3' not in block
+
+
+class TestJsxOpenTagEnd:
+    """The opening-tag walk shared by test_tab_memory_evals.py's trend-tag probe
+    and test_datum_components.py's call-site census.  It spans one opening tag
+    from its `<` to just past its `>`, and answers `None`, never a raise, when
+    `start` does not begin one: each caller owns its own miss policy.
+    """
+
+    def test_returns_the_index_just_past_the_closing_angle(self) -> None:
+        src = '<div a="1">child</div>'
+        end = jsx_open_tag_end(src, 0)
+
+        assert end is not None
+        assert src[0:end] == '<div a="1">'
+
+    def test_a_self_closing_tag_is_spanned_whole_and_detectable(self) -> None:
+        src = '<Foo x={1} /> tail'
+        end = jsx_open_tag_end(src, 0)
+
+        assert end is not None
+        assert src[:end] == '<Foo x={1} />'
+        assert src[end - 2 : end] == '/>'
+
+    @pytest.mark.parametrize(
+        ('src', 'tail'),
+        [
+            ("<ST hint={x > 0 ? 'a' : 'b'} datum={d} />", 'datum={d} />'),
+            ('<ST format={n => n} datum={d} />', 'datum={d} />'),
+            ('<div aria-label={points > 1 ? a : b} data-testid="t">', 'data-testid="t">'),
+        ],
+    )
+    def test_an_angle_inside_an_attribute_expression_is_an_operator(
+        self, src: str, tail: str,
+    ) -> None:
+        """The measured false-RED trap both former copies were written for."""
+        end = jsx_open_tag_end(src, 0)
+
+        assert end is not None
+        assert src[:end] == src
+        assert src[:end].endswith(tail)
+
+    def test_a_nested_element_inside_an_attribute_expression_is_not_the_end(self) -> None:
+        src = '<Foo render={<Bar/>} x="1">'
+
+        assert jsx_open_tag_end(src, 0) == len(src)
+
+    @pytest.mark.parametrize(
+        'attr',
+        ['label="a > b"', "title={'a > b'}", 'title={`${a} > ${b}`}'],
+    )
+    def test_an_angle_inside_a_literal_does_not_end_the_tag(self, attr: str) -> None:
+        src = f'<div {attr} id="x">'
+
+        assert jsx_open_tag_end(src, 0) == len(src)
+
+    def test_an_escaped_quote_does_not_close_the_literal(self) -> None:
+        src = r"""<div title={'it\'s > ok'} id="x">"""
+
+        assert jsx_open_tag_end(src, 0) == len(src)
+
+    def test_nested_braces_are_depth_counted(self) -> None:
+        src = '<LC series={[{a: 1}, {b: 2}]} y={2}>'
+
+        assert jsx_open_tag_end(src, 0) == len(src)
+
+    def test_the_walk_is_local_to_the_tag(self) -> None:
+        """An unbalanced apostrophe in prose BEFORE `start` does not reach it."""
+        src = "don't <div a={1}>"
+        start = src.index('<div')
+        end = jsx_open_tag_end(src, start)
+
+        assert end is not None
+        assert src[start:end] == '<div a={1}>'
+
+    def test_none_when_the_tag_is_never_closed(self) -> None:
+        assert jsx_open_tag_end('<div a={1}', 0) is None
+
+    def test_none_when_a_literal_is_never_terminated(self) -> None:
+        assert jsx_open_tag_end('<div title="abc>', 0) is None
+
+    def test_none_when_a_bare_angle_opens_at_depth_zero_first(self) -> None:
+        """`start` was JSX text, not a tag: a new tag opened before it closed."""
+        src = 'a <b c <div>'
+
+        assert jsx_open_tag_end(src, src.index('<b')) is None
+
+    def test_none_when_brace_depth_goes_negative(self) -> None:
+        """`start` sat inside an attribute expression, not at a tag."""
+        src = '{a <b} <div>'
+
+        assert jsx_open_tag_end(src, src.index('<b')) is None
+
+    def test_start_must_index_the_opening_angle(self) -> None:
+        with pytest.raises(ValueError, match=r'start=0\b'):
+            jsx_open_tag_end('x <div>', 0)
+
+    def test_a_match_end_style_start_is_rejected(self) -> None:
+        """Past the tag name, as the census's old walk took it, is now loud."""
+        with pytest.raises(ValueError, match=r'start=4\b'):
+            jsx_open_tag_end('<Pip datum={d} />', 4)
 
 
 class TestScriptOrderHelpers:
