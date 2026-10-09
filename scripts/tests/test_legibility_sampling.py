@@ -1,9 +1,10 @@
 """Tests for scripts/legibility/sampling.py — zero-LLM signal scorer +
 stratified budget sampler (PRD §5.2 point 2, contract §7.4, boundary test §8.4).
 
-Self-contained: does not import task α's ``digest.py``. Imported as
-``from legibility import sampling`` (PEP-420 namespace package; see
-test_legibility_config.py's module docstring for the import mechanics).
+Imports ``digest.py`` for the sampler-vs-digest parity pins over the
+classifiers the two share. Imported as ``from legibility import sampling``
+(PEP-420 namespace package; see test_legibility_config.py's module docstring
+for the import mechanics).
 """
 from __future__ import annotations
 
@@ -502,6 +503,216 @@ class TestScoreSession:
 
     def test_scored_record_session_id_defaults_to_none(self):
         assert _scored('s', 'interactive', mod.SignalCounts(), '').session_id is None
+
+
+# ---------------------------------------------------------------------------
+# Re-ingested and non-human carriers (task 5693): the sampler's TEXT classes
+# ask digest's one carrier predicate, so a session whose only signal is
+# quoted machine content or harness material is not ranked on it.
+# ---------------------------------------------------------------------------
+
+_TEXT_CLASSES = ('self_correct', 'not_found', 'df_guard', 'interrupt')
+
+_SIGNAL_LITERALS = (
+    "that's wrong",
+    'No such file or directory',
+    'done_gate_missing_files',
+    '[Request interrupted by user]',
+)
+_LITERAL_LINE = ' / '.join(_SIGNAL_LITERALS)
+"""One carrier quoting a hit for every sampler text class."""
+
+_GENUINE_SELF_CORRECTION = "That's wrong: the lease was stale."
+
+
+def _coder_judgment(note: str = _LITERAL_LINE) -> str:
+    return json.dumps({
+        'matches': [{
+            'entry_id': 'watcher-loop-harness-mismatch',
+            'origin_phase': 'unknown',
+            'manifested_phase': 'recon',
+            'invariant_violated': None,
+            'note': note,
+        }],
+        'candidates': [],
+    })
+
+
+def _json_fenced(payload: str) -> str:
+    return f'```json\n{payload}\n```\n'
+
+
+def _origin_stamped(record: dict, kind: str) -> dict:
+    return {**record, 'origin': {'kind': kind}}
+
+
+def _assistant_texts(*texts: str) -> dict:
+    return {
+        'type': 'assistant',
+        'message': {'content': [{'type': 'text', 'text': text} for text in texts]},
+    }
+
+
+def _tool_result_block(content: str, *, is_error: bool = False) -> dict:
+    return {'type': 'tool_result', 'tool_use_id': 'tu-r', 'is_error': is_error, 'content': content}
+
+
+def _user_blocks(*blocks: dict) -> dict:
+    return {'type': 'user', 'isSidechain': False, 'message': {'content': list(blocks)}}
+
+
+def _briefing_turn(task_prose: str) -> dict:
+    return _user_turn(
+        '# Context\n\nProject overview and recent decisions go here.\n\n'
+        '## Agent Identity\n\n- **agent_id:** `claude-task-42-implementer`\n\n'
+        f'# Task\n\n{task_prose}\n'
+    )
+
+
+def _trickle_coder_prompt_turn() -> dict:
+    digest_text = '\n'.join(
+        f'- (turn {turn}) {literal}' for turn, literal in enumerate(_SIGNAL_LITERALS)
+    )
+    return _user_turn(
+        coder.build_prompt(digest_text=digest_text, codebook_index='', invariant_slugs=())
+    )
+
+
+def _stamped_tool_result_record() -> dict:
+    return _origin_stamped(
+        _user_blocks(_tool_result_block(
+            'BLOCKED: merge gate refused the branch\ncat: x: No such file or directory'
+        )),
+        'task-notification',
+    )
+
+
+def _text_class_counts(tmp_path: Path, records: list[dict]) -> dict[str, int]:
+    counts = dataclasses.asdict(mod.score_signals(_write_transcript(tmp_path / 's.jsonl', records)))
+    return {name: counts[name] for name in _TEXT_CLASSES}
+
+
+def _session_on_disk(encoded: Path, name: str, records: list[dict]) -> inventory.SessionRecord:
+    path = _write_transcript(encoded / f'{name}.jsonl', records)
+    return inventory.SessionRecord(
+        path=path, encoded_dir=encoded.name, cwd=MAIN_CWD,
+        date=dt_date(2026, 7, 13), size_bytes=path.stat().st_size,
+    )
+
+
+class TestReingestedContentIsNotScored:
+    @pytest.mark.parametrize('records', [
+        pytest.param([_assistant_texts(_coder_judgment())], id='coder_judgment'),
+        pytest.param([_assistant_texts(_json_fenced(_coder_judgment()))], id='json_fenced_coder_judgment'),
+        pytest.param([_trickle_coder_prompt_turn()], id='trickle_coder_prompt'),
+        pytest.param([_briefing_turn('Find out why the file was not found.')], id='briefing'),
+        pytest.param(
+            [_origin_stamped(_user_turn(_LITERAL_LINE), 'task-notification')],
+            id='non_human_origin_text',
+        ),
+        pytest.param([_stamped_tool_result_record()], id='non_human_origin_tool_result'),
+    ])
+    def test_a_non_dialogue_carrier_scores_no_text_class(self, tmp_path, records):
+        assert _text_class_counts(tmp_path, records) == dict.fromkeys(_TEXT_CLASSES, 0)
+
+    def test_a_trickle_coder_session_is_dropped_as_zero_signal(self, tmp_path):
+        encoded = tmp_path / '-home-leo-src-dark-factory'
+        encoded.mkdir()
+        sessions = [
+            _session_on_disk(encoded, 'coder-run', [
+                _trickle_coder_prompt_turn(), _assistant_texts(_coder_judgment()),
+            ]),
+            _session_on_disk(encoded, 'real-signal', [_clean_record(0), _not_found_record()]),
+        ]
+        config = config_mod.LegibilityConfig(
+            project_id='dark_factory',
+            project_root='/home/leo/src/dark-factory',
+            escalation_port=8103,
+            cwd_prefixes=['/home/leo/src/dark-factory'],
+            budgets=config_mod.Budgets(max_daily_digest_bytes=405_000),
+            sampling=config_mod.Sampling(top_fraction=0.12, per_stratum_min=2),
+        )
+
+        scored = [mod.score_session(session) for session in sessions]
+        result = mod.stratified_sample(scored, config)
+
+        assert scored[0].counts.total_signal == 0
+        assert result.zero_signal_dropped == 1
+        assert {r.path.stem for r in result.selected} == {'real-signal'}
+
+    def test_prose_quoting_the_schema_inline_still_self_corrects(self, tmp_path):
+        records = [_assistant_texts(
+            'The coder answers with {"matches": [], "candidates": []} '
+            "— that's wrong, it should be a single object per session."
+        )]
+
+        assert _text_class_counts(tmp_path, records)['self_correct'] == 1
+
+    def test_a_coder_judgment_block_does_not_mask_a_sibling_self_correction(self, tmp_path):
+        records = [_assistant_texts(_coder_judgment(), _GENUINE_SELF_CORRECTION)]
+
+        assert _text_class_counts(tmp_path, records)['self_correct'] == 1
+
+    def test_a_coder_judgment_tool_result_does_not_mask_a_sibling_not_found(self, tmp_path):
+        records = [_user_blocks(
+            _tool_result_block(_coder_judgment(note='the module was not found')),
+            _tool_result_block('cat: x: No such file or directory'),
+        )]
+
+        assert _text_class_counts(tmp_path, records)['not_found'] == 1
+
+    def test_human_origin_keeps_every_text_class(self, tmp_path):
+        records = [
+            _origin_stamped(_user_turn(_LITERAL_LINE), 'human'),
+            _assistant_texts(_GENUINE_SELF_CORRECTION),
+        ]
+
+        assert _text_class_counts(tmp_path, records) == dict.fromkeys(_TEXT_CLASSES, 1)
+
+    def test_a_guard_tool_use_still_counts_beside_a_coder_judgment(self, tmp_path):
+        record = _assistant_texts(_coder_judgment())
+        record['message']['content'].append({
+            'type': 'tool_use',
+            'id': 'tu-g',
+            'name': 'mcp__plan-tools__report_false_premise',
+            'input': {'task_id': '42', 'reason': 'premise invalid'},
+        })
+
+        assert _text_class_counts(tmp_path, [record])['df_guard'] == 1
+
+    def test_a_structural_error_in_a_non_human_record_still_counts(self, tmp_path):
+        records = [_origin_stamped(
+            _user_blocks(_tool_result_block('DARK_FACTORY_ROOT unset, exit code 2', is_error=True)),
+            'task-notification',
+        )]
+        path = _write_transcript(tmp_path / 's.jsonl', records)
+
+        assert mod.score_signals(path).tool_error == digest.signal_counts(records)['tool_error'] == 1
+
+
+class TestSamplerReingestedContentParity:
+    """The anti-drift pin for the carrier predicate the sampler shares with
+    the digest, in the shape of TestSamplerDesignedOutcomeParity: one
+    contaminated session, two scanners, the same text-class counts."""
+
+    def test_sampler_and_digest_agree_on_a_contaminated_session(self, tmp_path):
+        records = [
+            _trickle_coder_prompt_turn(),
+            _assistant_texts(_coder_judgment()),
+            _origin_stamped(_user_turn(_LITERAL_LINE), 'task-notification'),
+            _stamped_tool_result_record(),
+            _assistant_texts(_GENUINE_SELF_CORRECTION),
+            _user_blocks(_tool_result_block('cat: x: No such file or directory')),
+            _user_blocks(_tool_result_block('error: done_gate_missing_files')),
+            _user_turn('[Request interrupted by user for tool use]'),
+        ]
+        path = _write_transcript(tmp_path / 'parity.jsonl', records)
+
+        sampled = dataclasses.asdict(mod.score_signals(path))
+        digested = digest.signal_counts(records)
+
+        assert {name: sampled[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 1)
+        assert {name: digested[name] for name in _TEXT_CLASSES} == dict.fromkeys(_TEXT_CLASSES, 1)
 
 
 def _scored(session_id, stratum, counts, first_turn_text, size_bytes=1000):
