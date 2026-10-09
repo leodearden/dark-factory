@@ -7,16 +7,21 @@ existed when it was written, its band re-decided by the shipped
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 import dataclasses
 import functools
+import json
+import re
 import types
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from _fm_helpers import load_script_module
 
+from fused_memory.config.schema import FusedMemoryConfig
 from fused_memory.models.enums import SourceStore
 from fused_memory.models.memory import MemoryResult
 
@@ -41,6 +46,12 @@ def _mod() -> types.ModuleType:
 def _retrieval() -> types.ModuleType:
     return load_script_module(
         SCRIPTS / 'eval_write_triage_retrieval.py', 'eval_write_triage_retrieval',
+    )
+
+
+def _freeze() -> types.ModuleType:
+    return load_script_module(
+        SCRIPTS / 'freeze_write_triage_population.py', 'freeze_write_triage_population',
     )
 
 
@@ -286,3 +297,182 @@ class TestTheRunSet:
         run_set = _draw(snapshot, _mod().Slates.WRITE_TIME, max_writes=None)
         assert run_set.sample_size == 8
         assert len(run_set.writes) == 8 - len(leavers)
+
+
+# ---------------------------------------------------------------------------
+# The write-time run
+# ---------------------------------------------------------------------------
+
+#: A candidate line of the rendered user prompt, capturing its id.
+_ID_LINE = re.compile(r'^- id: (\S+)$', re.MULTILINE)
+
+WRITE_TIME_ARM_NAMES = ['gpt-4o-mini@5', 'gpt-5.6-terra:none@5', 'gpt-6.1-sol:low@5']
+
+
+def _response() -> types.SimpleNamespace:
+    return types.SimpleNamespace(
+        output_text='{"verdict": "distinct"}', status='completed', incomplete_details=None,
+        usage=types.SimpleNamespace(
+            input_tokens=1_000, output_tokens=50,
+            output_tokens_details=types.SimpleNamespace(reasoning_tokens=3),
+        ),
+    )
+
+
+class _Provider:
+    """The fake Responses endpoint: answers ``distinct``, keeping each rendered prompt."""
+
+    def __init__(self) -> None:
+        self.prompts: list[tuple[str, str]] = []
+
+    async def _create(self, **kwargs: Any) -> types.SimpleNamespace:
+        memory_id = kwargs['input'].split('\n')[1].removeprefix('entry ')
+        self.prompts.append((memory_id, kwargs['input']))
+        return _response()
+
+    def client(self) -> MagicMock:
+        """A fake ``AsyncOpenAI`` that is its own async context manager, as the SDK is."""
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.responses.create = AsyncMock(side_effect=self._create)
+        return client
+
+    def called(self) -> list[str]:
+        return [memory_id for memory_id, _ in self.prompts]
+
+    def shown(self, memory_id: str) -> list[str]:
+        [prompt] = [prompt for called, prompt in self.prompts if called == memory_id]
+        return _ID_LINE.findall(prompt)
+
+
+def _late_winner(memory_id: str) -> dict:
+    """Frozen band winner ``late`` was created after the write; so was ``same``'s instant."""
+    return _write([
+        _candidate('late', 0.86, AFTER),
+        _candidate('a', 0.70, BEFORE),
+        _candidate('same', 0.68, WRITTEN),
+        _candidate('b', 0.60, BEFORE),
+        _candidate('c', 0.55, BEFORE),
+    ], memory_id=memory_id)
+
+
+def _run_snapshot(tmp_path: Path) -> Path:
+    """Six judge-band writes: ``w-gone`` leaves the band, ``w-late``'s winner postdates it."""
+    writes = [_judge_band_write(f'w{i:02d}') for i in range(4)]
+    writes += [_leaver('w-gone'), _late_winner('w-late')]
+    writes += [_write([_candidate('a', 0.40, BEFORE)], memory_id='low', band='stored')]
+    return _freeze().write_snapshot(tmp_path / 'data', {
+        'schema_version': 2, 'frozen_at': '2026-10-05T07:00:00+00:00',
+        'projects': ['dark_factory', 'reify'], 'candidate_k': 20,
+        't_high': T_HIGH, 't_low': T_LOW, 'writes': writes, 'targets': {},
+        'excluded_writes': {'undated': 0, 'vanished': 0},
+        'slate_rows_dropped': {'self': 0, 'own_children': 0},
+    })
+
+
+def _service() -> types.SimpleNamespace:
+    return types.SimpleNamespace(config=FusedMemoryConfig())
+
+
+def _arm(name: str) -> Any:
+    [arm] = [a for a in _mod().ARMS if a.name == name]
+    return arm
+
+
+def _run(path: Path, provider: _Provider, arms_dir: Path, **slates: Any) -> dict:
+    snapshot, sha = _freeze().load_snapshot(path)
+    with patch('openai.AsyncOpenAI', return_value=provider.client()):
+        return asyncio.run(_mod().run_arms(
+            snapshot, sha, arms_dir, arms=[_arm('gpt-4o-mini@5')], service=_service(),
+            max_writes=None, concurrency=2, budget_usd=15.0, sleep=AsyncMock(), **slates,
+        ))
+
+
+def _rows(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
+
+
+class TestTheWriteTimeRun:
+    @staticmethod
+    def _write_time(tmp_path: Path) -> tuple[dict, list[dict], _Provider]:
+        path = _run_snapshot(tmp_path)
+        provider = _Provider()
+        arms_dir = path.parent / 'arms-write-time'
+        summary = _run(path, provider, arms_dir, slates=_mod().Slates.WRITE_TIME)
+        return summary, _rows(arms_dir / 'gpt-4o-mini@5.jsonl'), provider
+
+    def test_one_row_per_write_still_in_the_band_none_for_the_leaver(
+        self, tmp_path: Path,
+    ) -> None:
+        _, rows, provider = self._write_time(tmp_path)
+        judged = {'w00', 'w01', 'w02', 'w03', 'w-late'}
+        assert sorted(row['memory_id'] for row in rows) == sorted(judged)
+        assert sorted(provider.called()) == sorted(judged)
+        assert {row['slates'] for row in rows} == {'write-time'}
+
+    def test_a_later_band_winner_is_replaced_by_the_best_earlier_candidate(
+        self, tmp_path: Path,
+    ) -> None:
+        _, rows, provider = self._write_time(tmp_path)
+        [row] = [row for row in rows if row['memory_id'] == 'w-late']
+        assert row['band_winner_id'] == 'a'
+        assert provider.shown('w-late') == ['a', 'b', 'c']
+
+    def test_the_summary_says_which_slates_and_what_left_the_band(self, tmp_path: Path) -> None:
+        summary, _, _ = self._write_time(tmp_path)
+        assert (summary['slates'], summary['sample_size'], summary['left_judge_band']) == (
+            'write-time', 6, ['w-gone'],
+        )
+        assert summary['arms']['gpt-4o-mini@5'] == {
+            'complete': True, 'rows': 5, 'missing': 0, 'written_now': 5,
+        }
+
+    def test_the_default_is_still_the_frozen_slate(self, tmp_path: Path) -> None:
+        path = _run_snapshot(tmp_path)
+        provider = _Provider()
+        summary = _run(path, provider, path.parent / 'arms')
+        rows = _rows(path.parent / 'arms' / 'gpt-4o-mini@5.jsonl')
+        assert len(rows) == 6
+        assert {row['slates'] for row in rows} == {'frozen'}
+        assert (summary['slates'], summary['left_judge_band']) == ('frozen', [])
+        assert 'late' in provider.shown('w-late')
+
+
+class TestTheWriteTimeCommand:
+    def test_it_runs_the_write_time_arms_into_their_own_directory(self, tmp_path: Path) -> None:
+        path = _run_snapshot(tmp_path)
+        frozen_arms = path.parent / 'arms'
+        frozen_arms.mkdir()
+        frozen_row = frozen_arms / 'gpt-4o-mini@5.jsonl'
+        body = (json.dumps({'memory_id': 'w00', 'snapshot_sha256': 'f' * 64, 'usd': 0.0}) + '\n')
+        frozen_row.write_bytes(body.encode())
+        with patch('openai.AsyncOpenAI', return_value=_Provider().client()):
+            code = _mod().main([
+                'run', '--slates', 'write-time', '--snapshot', str(path), '--budget-usd', '15',
+            ])
+        assert code == 0
+        written = sorted(p.name for p in (path.parent / 'arms-write-time').iterdir())
+        assert written == sorted(f'{name}.jsonl' for name in WRITE_TIME_ARM_NAMES)
+        assert frozen_row.read_bytes() == body.encode()
+        assert list(frozen_arms.iterdir()) == [frozen_row]
+
+    def test_an_arm_outside_the_write_time_table_is_refused_before_any_call(
+        self, tmp_path: Path,
+    ) -> None:
+        path = _run_snapshot(tmp_path)
+        provider = _Provider()
+        with (
+            patch('openai.AsyncOpenAI', return_value=provider.client()),
+            pytest.raises(ValueError, match='gpt-6.1-sol:low@20'),
+        ):
+            _mod().main([
+                'run', '--slates', 'write-time', '--snapshot', str(path),
+                '--arms', 'gpt-6.1-sol:low@20',
+            ])
+        assert provider.prompts == []
+
+    def test_the_write_time_arms_are_three_members_of_the_one_arm_table(self) -> None:
+        arms = _mod().WRITE_TIME_ARMS
+        assert [arm.name for arm in arms] == WRITE_TIME_ARM_NAMES
+        assert all(any(arm is member for member in _mod().ARMS) for arm in arms)

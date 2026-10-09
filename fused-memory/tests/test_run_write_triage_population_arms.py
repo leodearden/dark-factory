@@ -96,6 +96,7 @@ def _write(candidates: list[dict] | None = None, band_winner_id: str | None = 'c
         'band': 'judge', 'band_winner_id': band_winner_id, 'similarity': 0.85,
         'retrieved_count': 20, 'self_retrieved': False, 'own_children_dropped': 0,
         'candidates': _slate_of_20() if candidates is None else candidates,
+        'slates': 'frozen',
     }
 
 
@@ -255,7 +256,7 @@ class TestTheRow:
             'timeout_seconds': resolve_judge_timeout(_service()),
             'memory_id': 'w', 'project_id': 'reify', 'category': 'procedural_knowledge',
             'recon_marker': True, 'declares_attach_keys': False,
-            'band': 'judge', 'band_winner_id': 'c12',
+            'band': 'judge', 'band_winner_id': 'c12', 'slates': 'frozen',
             'outcome': 'amended', 'verdict_candidate_id': 'c00', 'judged_candidate_id': 'c12',
             'raw_text': text,
             'usage': {'prompt_tokens': 1_000, 'completion_tokens': 50, 'reasoning_tokens': 3},
