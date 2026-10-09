@@ -1,9 +1,4 @@
-"""review.pre_test_commands: the config knobs and their wiring into the review checkpoint.
-
-Fixtures are kept MODULE-LOCAL (not conftest.py) — a conftest.py edit trips
-verify.py's has_conftest and forces the merge-time verify to fall back to
-running the full owning-package suite instead of a scoped subset.
-"""
+"""review.pre_test_commands: the config knobs and their wiring into the review checkpoint."""
 
 from __future__ import annotations
 
@@ -65,12 +60,7 @@ _PASSING_PHASE1 = VerifyResult(
 
 
 def _make_checkpoint(tmp_path: Path, commands: list[str]) -> ReviewCheckpoint:
-    """A ReviewCheckpoint over a spec_set config mock, mirroring test_review_checkpoint_cap.py.
-
-    project_root stays Path('/tmp') because _run_review refuses '/tmp/pytest*'
-    roots; reports land under the absolute tmp_path dir and the briefing path
-    names a file that does not exist.
-    """
+    """A ReviewCheckpoint over a spec_set config mock, mirroring test_review_checkpoint_cap.py."""
     config = MagicMock(spec_set=pydantic_spec(OrchestratorConfig))
     config.project_root = Path('/tmp')
     config.models.deep_reviewer = 'opus'

@@ -1135,7 +1135,7 @@ _ADJUDICATED_TMP_PROJECT_ROOT_LITERALS: dict[str, _Adjudicated] = {
             'same ReviewCheckpoint `/tmp/pytest`-guard family as '
             'test_review_checkpoint_cap.py; the pre-test setup commands need a '
             'real cwd, so the inert MOCK_WORKFLOW_PROJECT_ROOT cannot stand in '
-            "(task 6020; `_make_checkpoint`'s docstring)"
+            '(task 6020)'
         ),
     ),
     'test_task_creation_migration.py': _Adjudicated(

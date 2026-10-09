@@ -543,9 +543,10 @@ class ReviewConfig(BaseModel):
             'project_root), before each review checkpoint\'s Phase 1 — e.g. '
             'rebuilding frontend bundles that e2e tests serve.  Fail-soft: a '
             'failing or timed-out command is logged and reported in the '
-            'reviewer prompt and the saved review report; it never aborts the '
-            'review, and later commands still run (chain dependent steps with '
-            '&& inside one entry).  Empty = no setup step.'
+            'reviewer prompt and in the saved review report when one is '
+            'written (a review skipped for capped accounts writes none); it '
+            'never aborts the review, and later commands still run (chain '
+            'dependent steps with && inside one entry).  Empty = no setup step.'
         ),
     )
     pre_test_timeout_secs: float = Field(
