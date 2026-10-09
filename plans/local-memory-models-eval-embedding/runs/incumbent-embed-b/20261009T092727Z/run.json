@@ -1,0 +1,112 @@
+{
+  "check_results": [
+    {
+      "check_id": "code-sha-matches-checkout",
+      "detail": "HEAD 8bb8c8893b0f58957753954ab0338d47f4b609b9 is clean and matches the spec",
+      "offenders": [],
+      "passed": true
+    },
+    {
+      "check_id": "preregistration-sha",
+      "detail": "control arm 'incumbent-embed-b' carries no preregistration",
+      "offenders": [],
+      "passed": true
+    },
+    {
+      "check_id": "frozen-reference-unchanged",
+      "detail": "'evalmem_lme_ref_incumbent_a' still hashes to 56de651d10aff70b81e78911cc125eb8be0e81a254a856ef8e3c923c01a9085f",
+      "offenders": [],
+      "passed": true
+    },
+    {
+      "check_id": "reembed-integrity",
+      "detail": "'evalmem_lme_emb_ctl_b' keeps the reference topology: 1834 nodes, 3101 edges",
+      "offenders": [],
+      "passed": true
+    },
+    {
+      "check_id": "index-configuration",
+      "detail": "fulltext probe on 'evalmem_lme_emb_ctl_b' gave 0 row(s), as embedding-only expects",
+      "offenders": [],
+      "passed": true
+    },
+    {
+      "check_id": "index-configuration",
+      "detail": "fulltext probe on 'evalmem_lme_emb_ctl_b' gave 1 row(s), as with-indices expects",
+      "offenders": [],
+      "passed": true
+    },
+    {
+      "check_id": "reembed-integrity",
+      "detail": "'evalmem_lme_emb_ctl_b' keeps the reference topology: 1834 nodes, 3101 edges",
+      "offenders": [],
+      "passed": true
+    }
+  ],
+  "effective_embedder": {
+    "dimensions": 1536,
+    "model": "text-embedding-3-small"
+  },
+  "finished_at": "2026-10-09T09:33:31.334446Z",
+  "graph_reembed": {
+    "edge_count": 1087,
+    "embed_seconds": 5.027402087114751,
+    "entity_count": 1634,
+    "failures": [],
+    "raw_norms": {
+      "count": 2721,
+      "max": 1.0007050595584313,
+      "median": 1.0000005650991535,
+      "min": 0.9993715497925844
+    },
+    "write_seconds": 6.282882797066122,
+    "written": 2721
+  },
+  "query_failures": {
+    "known_item": {
+      "embedding-only": 0,
+      "with-indices": 0
+    },
+    "mem0_known_item": 0,
+    "query_latency": 0
+  },
+  "replica_reembed": {
+    "embed_seconds": 55.458301974926144,
+    "failures": [],
+    "points": 31237,
+    "raw_norms": {
+      "count": 31237,
+      "max": 1.000753638007524,
+      "median": 1.0000139370485657,
+      "min": 0.9993150163718797
+    },
+    "write_seconds": 56.430827651172876,
+    "written": 31237
+  },
+  "schema_version": 1,
+  "settings": {
+    "embed_batch_size": 64,
+    "embed_concurrency": 4,
+    "mem0_project_id": "dark_factory",
+    "query_concurrency": 3,
+    "search_k": 10,
+    "search_timeout_s": 30.0,
+    "transcript_queries": 500
+  },
+  "spec": {
+    "arm_id": "incumbent-embed-b",
+    "arm_role": "control",
+    "axis": "embedding",
+    "code_sha": "8bb8c8893b0f58957753954ab0338d47f4b609b9",
+    "corpus_sha": "1eb3ed883afb5396fcba47a240e41f4b501d5b678789c48541325eb7c811b287",
+    "embedding_dim": 1536,
+    "model_id": "text-embedding-3-small",
+    "preregistration_sha": null,
+    "scratch_group_id": "evalmem_lme_emb_ctl_b",
+    "serving": {
+      "base_url": "https://api.openai.com/v1",
+      "stack": "openai"
+    }
+  },
+  "started_at": "2026-10-09T09:27:30.960583Z"
+}

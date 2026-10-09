@@ -171,11 +171,20 @@ class LlmArmSpec(_ArmSpecBase):
 class EmbeddingArmSpec(_ArmSpecBase):
     axis: Literal['embedding']
     embedding_dim: int = Field(gt=0)
+    query_prefix: str | None = None
 
     @model_validator(mode='after')
     def _embedding_axis_rules(self) -> Self:
         self._require_stack_in(EMBEDDING_STACKS, 'embedding')
+        self._require_nonempty_query_prefix()
         return self
+
+    def _require_nonempty_query_prefix(self) -> None:
+        if self.query_prefix == '':
+            raise ValueError(
+                f'arm {self.arm_id!r}: query_prefix is empty; an arm without a query-side '
+                'prefix omits the field'
+            )
 
 
 ArmSpec = Annotated[LlmArmSpec | EmbeddingArmSpec, Field(discriminator='axis')]
