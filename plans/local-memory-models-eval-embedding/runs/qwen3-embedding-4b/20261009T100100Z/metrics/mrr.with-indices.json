@@ -1,0 +1,18 @@
+{
+  "arm_id": "qwen3-embedding-4b",
+  "arm_role": "candidate",
+  "axis": "embedding",
+  "code_sha": "8bb8c8893b0f58957753954ab0338d47f4b609b9",
+  "corpus_sha": "1eb3ed883afb5396fcba47a240e41f4b501d5b678789c48541325eb7c811b287",
+  "incomplete": false,
+  "index_configuration": "with-indices",
+  "measured_at": "2026-10-09T10:22:40.486906Z",
+  "metric": {
+    "kind": "scalar",
+    "metric_id": "mrr",
+    "n": 199,
+    "value": 0.6824818537130095
+  },
+  "preregistration_sha": "be4a44d6243b58a3293d66eb73f0ba56fa206efd",
+  "schema_version": 1
+}
