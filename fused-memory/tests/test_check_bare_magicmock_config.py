@@ -28,6 +28,39 @@ _checker = load_script_module(SCRIPT_PATH, mod_name='check_bare_magicmock_config
 find_violations = _checker.find_violations
 _lint_cli = load_script_module(SCRIPT_PATH.with_name('_lint_cli.py'))
 
+# Worst root-bound wall clock of this module's repo-wide scans under real load, task 5442; corpus is plans/pytest-per-test-timeout-measurement-2026-09-17.md.
+_WHOLE_TREE_SCAN_MEASURED_UNDER_LOAD_WORST_CASE = 61.52
+# Canonical home is orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR; fused-memory's tests cannot import orchestrator's test helpers.
+_UNDER_LOAD_HEADROOM_FACTOR = 8
+
+
+def test_the_repo_wide_scans_here_run_under_a_module_level_timeout_mark(request):
+    """The repo-wide scans in this module need a ceiling of their own, bound at module level.
+
+    A module-level function sees only the module-level binding, which is what
+    pytest-timeout reads for every item here without a closer mark. Family
+    rationale: orchestrator/tests/_orch_helpers.py::WHOLE_TREE_SCAN_TEST_TIMEOUT.
+    """
+    marker = request.node.get_closest_marker('timeout')
+    assert marker is not None and marker.args, (
+        'TestAllScannedTestDirsClean and TestWallClockDeadlineBaselineIntegrity sweep all seven '
+        "packages' tests/ directories, so this module must bind its own ceiling: add "
+        '`pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)` at module level '
+        f'(found marker={marker!r})'
+    )
+    ceiling = float(marker.args[0])
+    required = _WHOLE_TREE_SCAN_MEASURED_UNDER_LOAD_WORST_CASE * _UNDER_LOAD_HEADROOM_FACTOR
+    assert ceiling >= required, (
+        f'module timeout mark {ceiling}s is below the measured worst case '
+        f'{_WHOLE_TREE_SCAN_MEASURED_UNDER_LOAD_WORST_CASE}s x headroom '
+        f'{_UNDER_LOAD_HEADROOM_FACTOR} = {required}s'
+    )
+    ini_default = float(request.config.getini('timeout'))
+    assert ceiling >= ini_default, (
+        f'module timeout mark {ceiling}s is below the ini default {ini_default}s; a mark '
+        'REPLACES the ambient budget, so below the default it would tighten this whole module'
+    )
+
 
 class TestFindViolationsConfigNameDetection:
     """Core detection: flag bare MagicMock() assigned to config-named variables."""
