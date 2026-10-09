@@ -30,6 +30,9 @@ from fused_memory.models.reconciliation import (
     Watermark,
 )
 from fused_memory.models.scope import ProjectRoot, ProjectScope, resolve_main_checkout
+from fused_memory.reconciliation.blocked_gate_audit_section import (
+    render_blocked_gate_audit_section,
+)
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE2_DISALLOWED,
     STAGE3_DISALLOWED,
@@ -4444,6 +4447,15 @@ class TaskKnowledgeSync(BaseStage):
                 f'{overflow_note}'
             )
 
+        # Every blocked gate, not the MIN_TASK_SAMPLE survivors: in-progress tasks
+        # sort ahead of blocked ones and evict them from the sample. Remediation-gated
+        # like its siblings; selection and cap live in blocked_gate_audit_section.
+        gate_audit_section = ''
+        if not self.remediation_mode:
+            gate_audit_section = render_blocked_gate_audit_section(
+                filtered.active_tasks, project_id=self.project_id, run_id=self._current_run_id
+            )
+
         # Inference-bearing sections (see REQUIRED_SECTIONS), bound here so their probes run first.
         required_sections = await self._render_required_sections(filtered)
 
@@ -4771,7 +4783,7 @@ class TaskKnowledgeSync(BaseStage):
 
 ### Recently Completed Tasks
 {recently_completed_text}
-{provenance_section}{proactive_sample_section}{done_audit_section}{hint_conversion_section}{required_sections}
+{provenance_section}{proactive_sample_section}{done_audit_section}{gate_audit_section}{hint_conversion_section}{required_sections}
 
 ## Your Task
 Reconcile task state against memory:
