@@ -1151,10 +1151,12 @@ async def run_server():
         )
         logger.info(
             '  Write-journal growth alarm: max_file_bytes=%d '
-            'max_rows_inserted_per_day=%d interval=%.0fs',
+            'max_rows_inserted_per_day=%d interval=%.0fs, '
+            'rounded up to whole %.0fs checkpoint ticks',
             config.write_journal_growth_alarm.max_file_bytes,
             config.write_journal_growth_alarm.max_rows_inserted_per_day,
             config.write_journal_growth_alarm.check_interval_seconds,
+            _CHECKPOINT_INTERVAL,
         )
     else:
         logger.info('  Checkpoint loop: no SQLite targets — skipped')

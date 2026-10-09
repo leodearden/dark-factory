@@ -514,7 +514,9 @@ class WriteJournalGrowthAlarmConfig(BaseModel):
     max_file_bytes: int = Field(default=19_327_352_832, gt=0)
     #: ``write_ops`` rows inserted in the trailing 24 h.
     max_rows_inserted_per_day: int = Field(default=1_500_000, gt=0)
-    #: Minimum seconds between two checks; the checkpoint loop ticks more often.
+    #: Minimum seconds between two checks. Checks ride the checkpoint loop's tick
+    #: (``server/main.py::_CHECKPOINT_INTERVAL``), so the effective interval is
+    #: this value rounded UP to a whole number of ticks: below one tick, every tick.
     check_interval_seconds: float = Field(default=3600.0, gt=0)
 
 
