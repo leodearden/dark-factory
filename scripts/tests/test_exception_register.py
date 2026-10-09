@@ -1007,3 +1007,190 @@ def test_a_not_exception_row_with_a_blank_reason_is_refused(reason: str):
         exception_register.validate_not_exception_lists({_ref('pkg/a.py', 'ALLOWLIST'): reason})
 
     assert 'pkg/a.py::ALLOWLIST' in str(excinfo.value)
+
+
+# ---------------------------------------------------------------------------
+# The age of the owner sweep's last run.
+
+_NOW = datetime.datetime(2026, 10, 9, 12, 0, tzinfo=datetime.UTC)
+
+
+def _stamp(last_run: datetime.datetime | str, *, ok: object = True, **extra: object) -> dict:
+    """A sweep result object of the Contract's shape."""
+    return {
+        'checked': 3,
+        'findings': 0,
+        'filed': 0,
+        'escalated': 0,
+        'skipped_existing': 0,
+        'overflow': 0,
+        'slack': 0,
+        'last_run': last_run if isinstance(last_run, str) else last_run.isoformat(),
+        'ok': ok,
+        **extra,
+    }
+
+
+def _write_state(path: Path, content: object) -> Path:
+    path.write_text(content if isinstance(content, str) else json.dumps(content), encoding='utf-8')
+    return path
+
+
+def test_the_sweep_stamp_lives_under_the_gitignored_data_tree():
+    assert exception_register.SWEEP_STATE_PATH == 'data/exception-owner-sweep/state.json'
+    period = exception_register.SWEEP_PERIOD
+    assert period == datetime.timedelta(days=1)
+
+
+def test_an_absent_stamp_means_the_sweep_has_never_run(tmp_path: Path):
+    reading = exception_register.read_sweep(tmp_path / 'state.json', now=_NOW)
+
+    assert reading.status is exception_register.SweepStatus.NEVER_RUN
+    assert reading.state_path == tmp_path / 'state.json'
+
+
+def test_a_recent_stamp_is_fresh_and_carries_its_age_and_result(tmp_path: Path):
+    stamp = _stamp(_NOW - datetime.timedelta(hours=1))
+    path = _write_state(tmp_path / 'state.json', stamp)
+
+    reading = exception_register.read_sweep(path, now=_NOW)
+
+    assert reading.status is exception_register.SweepStatus.FRESH
+    assert reading.age == datetime.timedelta(hours=1)
+    assert reading.ok is True
+    assert reading.last_run == _NOW - datetime.timedelta(hours=1)
+    assert reading.result == stamp
+
+
+@pytest.mark.parametrize(
+    ('age', 'status'),
+    [
+        (2 * datetime.timedelta(days=1), 'FRESH'),
+        (2 * datetime.timedelta(days=1) + datetime.timedelta(seconds=1), 'STALE'),
+    ],
+)
+def test_a_stamp_goes_stale_after_two_timer_periods(
+    tmp_path: Path, age: datetime.timedelta, status: str
+):
+    path = _write_state(tmp_path / 'state.json', _stamp(_NOW - age))
+
+    reading = exception_register.read_sweep(path, now=_NOW)
+
+    assert reading.status is exception_register.SweepStatus[status]
+
+
+def test_a_failed_recent_run_is_fresh_and_says_it_failed(tmp_path: Path):
+    """The sweep leaves last_run unadvanced on failure, so age is the liveness signal."""
+    path = _write_state(tmp_path / 'state.json', _stamp(_NOW - datetime.timedelta(hours=2), ok=False))
+
+    reading = exception_register.read_sweep(path, now=_NOW)
+
+    assert reading.status is exception_register.SweepStatus.FRESH
+    assert reading.ok is False
+
+
+@pytest.mark.parametrize(
+    ('content', 'field'),
+    [
+        pytest.param('{not json', 'JSON', id='not-json'),
+        pytest.param([1, 2], 'object', id='not-an-object'),
+        pytest.param({'ok': True}, 'last_run', id='missing-last-run'),
+        pytest.param(_stamp('2026-10-09T11:00:00'), 'last_run', id='naive-timestamp'),
+        pytest.param(_stamp('yesterday'), 'last_run', id='unparseable-last-run'),
+        pytest.param(_stamp(_NOW, ok='yes'), 'ok', id='non-bool-ok'),
+    ],
+)
+def test_a_stamp_that_cannot_be_read_is_unreadable_naming_the_field(
+    tmp_path: Path, content: object, field: str
+):
+    path = _write_state(tmp_path / 'state.json', content)
+
+    reading = exception_register.read_sweep(path, now=_NOW)
+
+    assert reading.status is exception_register.SweepStatus.UNREADABLE
+    assert reading.detail is not None
+    assert field in reading.detail
+
+
+def _main_reading(root: Path, state: Path, *args: str) -> int:
+    return exception_register.main([*args, '--root', str(root), '--sweep-state', str(state)])
+
+
+def _sweep_tree(root: Path) -> None:
+    _register_tree(root, {'m.py': 'x = 1\n'})
+
+
+def test_a_fresh_stamp_reports_its_age_and_keeps_the_report_green(tmp_path: Path, capsys):
+    _sweep_tree(tmp_path)
+    recent = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=1)
+    state = _write_state(tmp_path / 'state.json', _stamp(recent))
+
+    code = _main_reading(tmp_path, state, '--report')
+
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    (line,) = [line for line in captured.out.splitlines() if line.startswith('last sweep:')]
+    assert 'h ago' in line
+
+
+def test_a_stale_stamp_is_exit_two_after_the_whole_report(tmp_path: Path, capsys):
+    _sweep_tree(tmp_path)
+    state = _write_state(tmp_path / 'state.json', _stamp('2020-01-01T00:00:00+00:00'))
+
+    code = _main_reading(tmp_path, state, '--report')
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert captured.out.splitlines()[0] == 'grandfathered (unowned): not seeded'
+    assert str(state) in captured.err
+    assert 'two timer periods (48 h)' in captured.err
+
+
+def test_an_unreadable_stamp_is_exit_two(tmp_path: Path, capsys):
+    _sweep_tree(tmp_path)
+    state = _write_state(tmp_path / 'state.json', '{not json')
+
+    assert _main_reading(tmp_path, state, '--report') == 2
+    assert str(state) in capsys.readouterr().err
+
+
+def test_an_absent_stamp_reads_never_run_and_stays_green(tmp_path: Path, capsys):
+    _sweep_tree(tmp_path)
+    state = tmp_path / 'state.json'
+
+    code = _main_reading(tmp_path, state, '--report')
+
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    (line,) = [line for line in captured.out.splitlines() if line.startswith('last sweep:')]
+    assert 'never run' in line
+    assert str(state) in line
+
+
+def test_json_publishes_a_stale_sweep_as_data_and_exits_zero(tmp_path: Path, capsys):
+    _sweep_tree(tmp_path)
+    stamp = _stamp('2020-01-01T00:00:00+00:00')
+    state = _write_state(tmp_path / 'state.json', stamp)
+
+    code = _main_reading(tmp_path, state, '--json')
+
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    sweep = json.loads(captured.out)['sweep']
+    assert sweep['status'] == 'stale'
+    assert sweep['state_path'] == str(state)
+    assert sweep['last_run'] == '2020-01-01T00:00:00+00:00'
+    assert sweep['ok'] is True
+    assert sweep['result'] == stamp
+
+
+def test_json_names_the_default_state_path_under_the_root(tmp_path: Path, capsys):
+    """The sweep takes its write path from here, so the path has one home."""
+    _sweep_tree(tmp_path)
+    capsys.readouterr()
+
+    assert exception_register.main(['--json', '--root', str(tmp_path)]) == 0
+
+    sweep = json.loads(capsys.readouterr().out)['sweep']
+    assert sweep['status'] == 'never_run'
+    assert sweep['state_path'] == str(tmp_path / exception_register.SWEEP_STATE_PATH)
