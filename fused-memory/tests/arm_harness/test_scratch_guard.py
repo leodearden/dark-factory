@@ -81,6 +81,7 @@ def test_checkpoints_are_a_closed_enum():
         'REEMBED',
         'INDEX_DROP',
         'REPLICA_BUILD',
+        'SEARCH',
     }
 
 
@@ -91,6 +92,7 @@ def test_checkpoints_are_a_closed_enum():
         ('REEMBED', 'reembed'),
         ('INDEX_DROP', 'index-drop'),
         ('REPLICA_BUILD', 'replica-build'),
+        ('SEARCH', 'search'),
     ],
 )
 def test_embedding_axis_checkpoints_refuse_a_live_graph_naming_themselves(member, value):
