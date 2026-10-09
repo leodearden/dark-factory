@@ -270,6 +270,11 @@ CRASH_RECOVERY_RESUME_PROMPT = (
 # W4-beta single-source collapse); this module now consumes the verdict
 # indirectly via classify_invocation's CliLocalError variant.
 
+# A caller's prompt source, awaited with no arguments for the prompt to send
+# NOW.  It returns None to decline: the work the prompt asks for is no longer
+# needed.  See invoke_with_cap_retry's *rebuild_prompt*.
+PromptBuilder = Callable[[], Awaitable[str | None]]
+
 
 __all__ = [
     'CAP_HIT_RESUME_PROMPT',
@@ -278,6 +283,7 @@ __all__ = [
     'AgentFailureKind',
     'AgentResult',
     'AllAccountsCappedException',
+    'PromptBuilder',
     'TranscriptEvidence',
     'build_failure_message',
     'classify_agent_failure',
@@ -513,6 +519,10 @@ class AgentResult:
       (not a list) so the default is a safe immutable dataclass default.
     - ``stop_reason``: the CLI result JSON's ``stop_reason`` (None when absent
       or not a string); ``'refusal'`` marks an API-side usage-policy refusal.
+    - ``retry_aborted``: True when the caller's prompt builder declined a retry
+      ``invoke_with_cap_retry`` was about to make, so this is the last
+      attempt's result returned unretried.  Never a success: every attempt
+      that triggers a retry was already judged unusable.
     """
 
     success: bool
@@ -538,6 +548,7 @@ class AgentResult:
     resume_fallbacks: int = 0
     resume_fallback_session_ids: tuple[str, ...] = ()
     stop_reason: str | None = None
+    retry_aborted: bool = False
     transcript_turns: int | None = None
     """Number of assistant turns found in the on-disk JSONL transcript, or None
     when the transcript could not be read or located.  Stamped on both the
@@ -2093,6 +2104,36 @@ def _reset_for_fresh_retry(invoke_kwargs: dict[str, Any], original_prompt: str) 
         invoke_kwargs['session_id'] = str(uuid.uuid4())
 
 
+async def _consult_prompt_builder(
+    build_prompt: PromptBuilder, invoke_kwargs: dict[str, Any], label: str,
+) -> bool:
+    """Ask the caller's builder for the prompt of the re-dispatch about to run.
+
+    Returns False when the builder declines (None).  Otherwise a FRESH
+    re-dispatch sends the built string, while a resumed one discards it and
+    keeps its continuation prompt.  A builder that raises or builds a blank
+    prompt is logged, and the re-dispatch keeps the prompt already in place:
+    for a fresh one, the original that ``_reset_for_fresh_retry`` restored.
+    """
+    try:
+        built = await build_prompt()
+        if built is None:
+            logger.warning(
+                f'{label}: prompt builder declined the retry — work no longer '
+                f'needed; returning the last attempt unretried',
+            )
+            return False
+        if not invoke_kwargs.get('resume_session_id'):
+            require_non_blank_prompt(built, context=f'{label} prompt builder')
+            invoke_kwargs['prompt'] = built
+    except Exception:
+        logger.warning(
+            f'{label}: prompt builder failed — re-dispatching without a rebuilt prompt',
+            exc_info=True,
+        )
+    return True
+
+
 @dataclass
 class _SubprocessResult:
     stdout: str
@@ -2252,7 +2293,7 @@ async def invoke_with_cap_retry(
     role: str = '',
     cap_wait_sanity_secs: float | None = _DEFAULT_CAP_WAIT_SANITY_SECS,
     max_cap_retries: int | None = None,
-    rebuild_prompt: Callable[[bool], Awaitable[str]] | None = None,
+    rebuild_prompt: PromptBuilder | None = None,
     resume_delivers_prompt: bool = False,
     invoke_fn: Callable[..., Awaitable[AgentResult]] | None = None,
     backend: str = 'claude',
@@ -2270,7 +2311,7 @@ async def invoke_with_cap_retry(
     retry resumes that session via ``--resume`` instead of starting fresh.
     This preserves all agent progress (tool calls, reasoning) across
     account switches.  If resume itself fails (non-cap-hit error), falls
-    back to a fresh invocation with the original prompt.
+    back to a fresh invocation with the original (or rebuilt) prompt.
 
     Resume eligibility is a TWO-PART rule, and both parts require a
     *config_dir* (without one there is no correct place to glob for the
@@ -2286,7 +2327,7 @@ async def invoke_with_cap_retry(
        ``CAP_HIT_RESUME_PROMPT`` ("continue where you left off") would point
        at nowhere.
 
-    Failing either part retries FRESH, which replays the real task prompt.
+    Failing either part retries FRESH, which sends the real task prompt.
     Both guards fire only on affirmative proof; every ambiguous or unreadable
     transcript resumes, because a wrong downgrade discards real agent work.
     The specific reason is named in the cap-hit warning (``resume_or_fresh``).
@@ -2328,16 +2369,19 @@ async def invoke_with_cap_retry(
     cap.  Failed results are always offered.  Consumer: the legibility runner,
     whose replies routinely quote cap text (task 6042).
 
-    *rebuild_prompt*, when provided, is awaited as ``rebuild_prompt(True)``
-    on a cap retry whose session cannot be resumed (no ``session_id`` on the
-    capped result) — ``True`` signals ``session_lost``.  Its return value
-    replaces ``prompt`` for the next invocation, letting the caller rebuild
-    fresh context (e.g. re-gathered pending escalations) instead of reusing
-    the stale original prompt.  The resumable path (capped result carries a
-    ``session_id``) is unaffected — it keeps resuming with
-    ``CAP_HIT_RESUME_PROMPT`` and never calls this hook.  Defaults to
-    ``None``, which preserves the existing fresh-retry behaviour (reuse the
-    original prompt unchanged).
+    *rebuild_prompt*, when provided, is a ``PromptBuilder`` awaited with no
+    arguments immediately before EVERY re-dispatch — whatever triggered it
+    (cap hit, auth failure, wedge, failed resume, pre-turn CLI rejection) —
+    and never before the first dispatch.  It runs after the cooldown and
+    after the next slot is acquired, so what it builds reflects the caller's
+    state at dispatch time, not at the start of a long cap wait.  A FRESH
+    re-dispatch sends the built string; a resumed one keeps
+    ``CAP_HIT_RESUME_PROMPT`` and discards it.  Returning ``None`` cancels the
+    retry: no further dispatch is made and the last attempt's result is
+    returned with ``retry_aborted=True`` and ``success=False``.  A builder that
+    raises or builds a blank prompt is logged and the retry proceeds on the
+    original prompt rather than aborting the loop.  Defaults to ``None``:
+    fresh retries replay the original prompt unchanged.
 
     *resume_delivers_prompt*, when ``True``, delivers the caller's real
     ``prompt`` on a caller-initiated resume (``resume_session_id`` pre-set
@@ -2349,14 +2393,6 @@ async def invoke_with_cap_retry(
     ``workflow._invoke``: a crash-recovered session already holds the full
     task context, so the short crash-recovery continuation prompt is sufficient
     and the real prompt is kept only as ``original_prompt`` for fresh-fallback.
-
-    The ``session_lost`` argument is currently always ``True`` — every wired
-    call site is an unresumable cap retry.  It is kept as an explicit
-    parameter (rather than a no-arg callable) as a forward-compat placeholder
-    matching the caller contract in PRD §7.4, so a future resumable-path call
-    (if ever wired) needs no signature change.  If the hook itself raises,
-    the failure is caught and logged, and the retry falls back to the
-    already-restored original prompt rather than aborting the retry loop.
 
     *label* identifies the caller in log messages (e.g. "Module tagging",
     "Task 7 [implementer]").
@@ -2482,34 +2518,6 @@ async def invoke_with_cap_retry(
             )
             last_cap_wait_log_at = now
 
-    async def _rebuild_fresh_prompt() -> None:
-        """Let the caller rebuild the prompt for an unresumable cap retry.
-
-        session_lost is always True at both call sites (exact-detect and
-        heuristic FRESH cap paths) — this helper only runs where the capped
-        session cannot be resumed, per the rebuild_prompt hook contract
-        (PRD §7.4 / task W4-zeta). Closes over: rebuild_prompt, invoke_kwargs,
-        label.
-
-        A failure raised by the caller's hook (e.g. a transient I/O/MCP error
-        while re-gathering pending escalations) is caught and logged rather
-        than propagated: propagating would abort the entire patient cap-retry
-        loop over a transient hook failure.  ``invoke_kwargs['prompt']`` was
-        already restored to ``original_prompt`` by the preceding
-        ``_reset_for_fresh_retry`` call, so on failure it is simply left as
-        that already-restored value — the retry degrades to the stale
-        original prompt instead of dying.
-        """
-        if rebuild_prompt is None:
-            return
-        try:
-            invoke_kwargs['prompt'] = await rebuild_prompt(True)
-        except Exception:
-            logger.warning(
-                f'{label}: rebuild_prompt hook raised — falling back to original prompt',
-                exc_info=True,
-            )
-
     account_name = ''
     unattributed_cap = False  # True when heuristic fires but token is unresolvable;
     # controls: (1) skip confirm, (2) mark capped=True in cost_store
@@ -2526,6 +2534,9 @@ async def invoke_with_cap_retry(
     # pre-allocated session_id, so the lost id is unrecoverable from the
     # returned result.
     resume_fallback_session_ids: list[str] = []
+    # Re-dispatches consult the caller's builder; the first dispatch does not.
+    dispatches = 0
+    retry_aborted = False
 
     # Default to Claude-specific invocation when no invoke_fn was provided
     invoke: Callable[..., Awaitable[AgentResult]] = invoke_fn or invoke_claude_agent
@@ -2564,11 +2575,19 @@ async def invoke_with_cap_retry(
     # fresh invocation discards nothing.
     if not usage_gate:
         while True:
+            if (
+                dispatches
+                and rebuild_prompt is not None
+                and not await _consult_prompt_builder(rebuild_prompt, invoke_kwargs, label)
+            ):
+                retry_aborted = True
+                break
             started_at = datetime.now(UTC).isoformat()
             result = await invoke(
                 **invoke_kwargs,
                 config_dir=config_dir.path if config_dir else None,
             )
+            dispatches += 1
             completed_at = datetime.now(UTC).isoformat()
             # Re-stamped per attempt (above), so started_at/completed_at always
             # describe the attempt actually RETURNED — leaving the discarded
@@ -2601,6 +2620,17 @@ async def invoke_with_cap_retry(
         scope = scope_for(model, _cfg) if (backend == 'claude' and _cfg is not None) else None
         while True:
             async with usage_gate.invoke_slot(scope=scope, park=park_on_frozen_pool) as slot:
+                # Consulted inside the acquired slot, after any cooldown or
+                # park, and before attribution and credentials: a declined
+                # retry keeps the last attempt's account, writes nothing, and
+                # leaves the unsettled slot for __aexit__ to release.
+                if (
+                    dispatches
+                    and rebuild_prompt is not None
+                    and not await _consult_prompt_builder(rebuild_prompt, invoke_kwargs, label)
+                ):
+                    retry_aborted = True
+                    break
                 # slot.account_name is derived from slot.lease — the SAME
                 # account slot.token came from (task W4-δ, PRD §7.4). This
                 # is what makes the attribution below (and the save_invocation
@@ -2619,6 +2649,7 @@ async def invoke_with_cap_retry(
                     oauth_token=slot.token,
                     config_dir=config_dir.path if config_dir else None,
                 )
+                dispatches += 1
                 completed_at = datetime.now(UTC).isoformat()
 
                 # Lazy (function-local) import: invocation_outcome.py imports
@@ -2655,14 +2686,9 @@ async def invoke_with_cap_retry(
                 # unconditionally; an unresolvable token means the account
                 # vanished/refreshed, so failing over is safe and
                 # self-terminating (no separate unattributed fall-through).
-                # Rebuild via the caller's hook (no-op when rebuild_prompt is
-                # None): a live-continuation caller's original_prompt
-                # (resume_delivers_prompt=True) is only valid inside the
-                # resumed session, not the brand-new one this failover starts.
                 if isinstance(outcome, AuthFailed):
                     slot.report(outcome)
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
-                    await _rebuild_fresh_prompt()
                     logger.warning(
                         f'{label}: account {account_name} auth-failed '
                         f'(HTTP {result.api_error_status}) — failing over',
@@ -2720,10 +2746,7 @@ async def invoke_with_cap_retry(
                 # there is nothing to resume, and reusing the prior attempt's
                 # pre-allocated session_id would hit the reify-3604 'Session ID
                 # ... is already in use' wedge.  _reset_for_fresh_retry
-                # regenerates it.  The caller's rebuild_prompt hook is
-                # deliberately NOT invoked: it signals session_lost, and here no
-                # context was ever built, let alone lost — the original prompt
-                # is still exactly the right thing to send.
+                # regenerates it.
                 #
                 # slot.confirm settles the slot as a normal zero-cost
                 # completion (mirroring the ModelNotFound branch's shape): no
@@ -2764,10 +2787,6 @@ async def invoke_with_cap_retry(
                 # response whose cap-pattern IS detectable, so cap accounting resumes
                 # on the very next iteration.  At most one extra full-timeout
                 # (~configured_timeout_ms) is incurred before the cap is re-detected.
-                # Rebuild via the caller's hook (no-op when rebuild_prompt is
-                # None): a live-continuation caller's original_prompt
-                # (resume_delivers_prompt=True) is only valid inside the
-                # wedged session, not the brand-new one this retry starts.
                 if isinstance(outcome, ZeroOutputWedge) and invoke_kwargs.get('resume_session_id'):
                     logger.warning(
                         f'{label}: zero-output timed-out invocation '
@@ -2776,7 +2795,6 @@ async def invoke_with_cap_retry(
                         f'before retry',
                     )
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
-                    await _rebuild_fresh_prompt()
                     continue  # __aexit__ releases probe slot
 
                 offered_to_cap_detector = (
@@ -2953,7 +2971,6 @@ async def invoke_with_cap_retry(
                     # greps keep matching.
                     if not result.session_id:
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
-                        await _rebuild_fresh_prompt()
                         resume_or_fresh = 'fresh (no session_id)'
                     elif config_dir is not None and not transcript_exists(
                         config_dir.path, result.session_id
@@ -2964,7 +2981,6 @@ async def invoke_with_cap_retry(
                             f'into an empty session (context from this attempt is lost)',
                         )
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
-                        await _rebuild_fresh_prompt()
                         resume_or_fresh = 'fresh (transcript unreachable)'
                     elif config_dir is not None and not resumable_progress_for_session(
                         config_dir.path, result.session_id
@@ -2977,7 +2993,6 @@ async def invoke_with_cap_retry(
                             f'nowhere',
                         )
                         _reset_for_fresh_retry(invoke_kwargs, original_prompt)
-                        await _rebuild_fresh_prompt()
                         resume_or_fresh = 'fresh (no resumable progress)'
                     else:
                         invoke_kwargs['resume_session_id'] = result.session_id
@@ -3089,7 +3104,6 @@ async def invoke_with_cap_retry(
                             )
                             # Cannot resume a session that never ran
                             _reset_for_fresh_retry(invoke_kwargs, original_prompt)
-                            await _rebuild_fresh_prompt()
                             acct_name = usage_gate.active_account_name
                             logger.warning(
                                 f'{label}: sleeping {cooldown:.0f}s then retrying fresh on {acct_name or "next account"}',
@@ -3181,10 +3195,6 @@ async def invoke_with_cap_retry(
                     break
 
                 # Non-cap-hit failure while resuming → fall back to fresh invocation.
-                # Rebuild via the caller's hook (no-op when rebuild_prompt is None):
-                # mirrors the two cap-hit fresh-fallback paths above, since a
-                # live-continuation caller's original_prompt (resume_delivers_prompt=True)
-                # is only valid inside the resumed session, not a brand-new one.
                 if not result.success and invoke_kwargs.get('resume_session_id'):
                     # This branch — and ONLY this branch — is the population
                     # task 3578 measured: 28 occurrences where a resume was
@@ -3210,13 +3220,15 @@ async def invoke_with_cap_retry(
                         f'retrying fresh',
                     )
                     _reset_for_fresh_retry(invoke_kwargs, original_prompt)
-                    await _rebuild_fresh_prompt()
                     continue  # __aexit__ releases probe slot
 
                 if not unattributed_cap:
                     slot.confirm(result.cost_usd)
                 break
 
+    if retry_aborted:
+        result.retry_aborted = True
+        result.success = False
     result.account_name = account_name
     result.resume_fallbacks = resume_fallbacks
     result.resume_fallback_session_ids = tuple(resume_fallback_session_ids)
