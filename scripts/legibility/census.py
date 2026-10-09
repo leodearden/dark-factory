@@ -1156,6 +1156,13 @@ SYNTHESIS_NOT_APPLIED_NOTICE = (
 """Runner-authored first line of every ``## Synthesis`` body, until
 plans/census-incremental-prd.md L10 retires or reconciles it."""
 
+SYNTHESIS_PROPOSALS_HEADING = (
+    "Proposed codebook changes (not applied; for a human or the next census)"
+)
+"""The heading :func:`_synthesis_prompt` tells the model to put any proposed
+codebook change under, in place of the "inputs to the merger" claim earlier
+reports made."""
+
 
 @dataclass(frozen=True)
 class ReportSection:
@@ -3236,6 +3243,12 @@ def _synthesis_prompt(verified: list, *, quality_block: str) -> str:
         "write clear, factual prose for a dated census report -- "
         "observations only, never a diagnosis that was not itself "
         "verified.\n\n"
+        "Your prose is embedded verbatim in the report and is never parsed: "
+        "nothing you write is applied to the codebook "
+        "(docs/legibility/confusion-codebook.yaml). Put any codebook change "
+        "you propose under a heading reading exactly "
+        f"'{SYNTHESIS_PROPOSALS_HEADING}', and never describe such proposals "
+        "as inputs to the merger.\n\n"
         "Each cluster's verdict tags name the heuristics of the quality "
         "definition below that its finding rests on; cite those heuristics "
         "by name where the prose discusses the finding.\n\n"
