@@ -18,7 +18,10 @@ from unittest.mock import AsyncMock
 import pytest
 import yaml
 
-from fused_memory.server.manifest_stamping import stamp_capability_manifests
+from fused_memory.server.manifest_stamping import (
+    stamp_capability_manifests,
+    stamping_action_required,
+)
 
 # Hand-written rather than built from _mechanical_sidecar_yaml below: this
 # fixture mixes grep + script + manual capabilities on a single label, and
@@ -1249,3 +1252,255 @@ async def test_stamper_non_git_root_copies_everything_and_logs(tmp_path, caplog)
         'an unevaluable check must be loudly recorded, not silently passed; '
         f'got {[r.getMessage() for r in caplog.records]}'
     )
+
+
+# ---------------------------------------------------------------------------
+# Every PRD-bound batch task lands in exactly one report bucket, and a report
+# that needs action says so (task 5276). The stamper never blocks the flip,
+# so these buckets and the action lines are the whole signal.
+# ---------------------------------------------------------------------------
+
+
+def _write_sidecar(root, prd_stem, labels):
+    plans_dir = root / 'plans'
+    plans_dir.mkdir(exist_ok=True)
+    sidecar_path = plans_dir / f'{prd_stem}-prd.capability-manifest.yaml'
+    sidecar_path.write_text(_mechanical_sidecar_yaml(prd_stem, labels), encoding='utf-8')
+    return sidecar_path
+
+
+async def _stamp_batch(root, batch):
+    """Stamp a batch given as ``[(task_id, metadata), ...]``; return (report, interceptor)."""
+    task_interceptor = AsyncMock()
+    task_interceptor.update_task = AsyncMock(return_value={'success': True})
+    report = await stamp_capability_manifests(
+        project_root=str(root),
+        ids=[tid for tid, _meta in batch],
+        tasks_data=[{'id': tid, 'metadata': meta} for tid, meta in batch],
+        task_interceptor=task_interceptor,
+    )
+    return report, task_interceptor
+
+
+@pytest.mark.asyncio
+async def test_unlabeled_task_is_reported_not_silently_skipped(tmp_path):
+    sidecar_path = _write_sidecar(tmp_path, 'gx', ['γ'])
+    original = sidecar_path.read_bytes()
+
+    report, task_interceptor = await _stamp_batch(
+        tmp_path, [('6700', {'prd_path': 'plans/gx-prd.md'})],
+    )
+
+    assert report == {
+        'path': 'plans/gx-prd.capability-manifest.yaml',
+        'stamped': [],
+        'missing_labels': [],
+        'errors': [],
+        'unlabeled_tasks': ['6700'],
+    }
+    assert sidecar_path.read_bytes() == original
+    task_interceptor.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('key', ['prd_label', 'label', 'PRD-Task-Label'])
+async def test_near_miss_key_is_reported(tmp_path, key):
+    _write_sidecar(tmp_path, 'gx', ['γ'])
+
+    report, task_interceptor = await _stamp_batch(
+        tmp_path, [('6708', {'prd_path': 'plans/gx-prd.md', key: 'gamma'})],
+    )
+
+    assert report == {
+        'path': 'plans/gx-prd.capability-manifest.yaml',
+        'stamped': [],
+        'missing_labels': [],
+        'errors': [],
+        'near_miss_keys': [
+            {'task_id': '6708', 'key': key, 'value': 'gamma', 'sidecar_label': 'γ'},
+        ],
+    }
+    task_interceptor.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_near_miss_key_whose_value_matches_no_label_names_none(tmp_path):
+    _write_sidecar(tmp_path, 'gx', ['γ'])
+
+    report, _ = await _stamp_batch(
+        tmp_path, [('6708', {'prd_path': 'plans/gx-prd.md', 'prd_label': 'omega-prime'})],
+    )
+
+    assert report is not None
+    assert report['near_miss_keys'] == [
+        {'task_id': '6708', 'key': 'prd_label', 'value': 'omega-prime', 'sidecar_label': None},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('label', ['gamma', ' γ ', 'Γ', 'GAMMA'])
+async def test_near_miss_label_is_reported_not_missing(tmp_path, label):
+    sidecar_path = _write_sidecar(tmp_path, 'gx', ['γ'])
+    original = sidecar_path.read_bytes()
+
+    report, task_interceptor = await _stamp_batch(
+        tmp_path, [('6709', {'prd_path': 'plans/gx-prd.md', 'prd_task_label': label})],
+    )
+
+    assert report == {
+        'path': 'plans/gx-prd.capability-manifest.yaml',
+        'stamped': [],
+        'missing_labels': [],
+        'errors': [],
+        'near_miss_labels': [{'task_id': '6709', 'label': label, 'sidecar_label': 'γ'}],
+    }
+    assert sidecar_path.read_bytes() == original
+    task_interceptor.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_every_prd_bound_task_lands_in_exactly_one_bucket(tmp_path):
+    _write_sidecar(tmp_path, 'mix', ['α', 'β', 'γ'])
+    prd = 'plans/mix-prd.md'
+
+    report, _ = await _stamp_batch(
+        tmp_path,
+        [
+            ('7001', {'prd_path': prd, 'prd_task_label': 'α'}),
+            ('7002', {'prd_path': prd, 'prd_task_label': 'ζ'}),
+            ('7003', {'prd_path': prd, 'prd_task_label': 'beta'}),
+            ('7004', {'prd_path': prd, 'prd_label': 'gamma'}),
+            ('7005', {'prd_path': prd}),
+            ('7006', {'files': ['src/unrelated.py']}),
+        ],
+    )
+
+    assert report == {
+        'path': 'plans/mix-prd.capability-manifest.yaml',
+        'stamped': ['α'],
+        'missing_labels': ['ζ'],
+        'errors': [],
+        'near_miss_labels': [{'task_id': '7003', 'label': 'beta', 'sidecar_label': 'β'}],
+        'near_miss_keys': [
+            {'task_id': '7004', 'key': 'prd_label', 'value': 'gamma', 'sidecar_label': 'γ'},
+        ],
+        'unlabeled_tasks': ['7005'],
+    }
+    assert '7006' not in json.dumps(report)
+
+
+@pytest.mark.asyncio
+async def test_labeled_sidecar_is_preferred_over_unlabeled_only_sidecar(tmp_path):
+    _write_sidecar(tmp_path, 'zz', ['alpha'])
+    _write_sidecar(tmp_path, 'aa', ['beta'])
+
+    report, _ = await _stamp_batch(
+        tmp_path,
+        [
+            ('7101', {'prd_path': 'plans/zz-prd.md', 'prd_task_label': 'alpha'}),
+            ('7102', {'prd_path': 'plans/aa-prd.md'}),
+        ],
+    )
+
+    assert report == {
+        'path': 'plans/zz-prd.capability-manifest.yaml',
+        'stamped': ['alpha'],
+        'missing_labels': [],
+        'errors': [
+            "multiple capability-manifest sidecars matched this batch; processing "
+            "'plans/zz-prd.capability-manifest.yaml', ignoring: "
+            'plans/aa-prd.capability-manifest.yaml'
+        ],
+    }
+
+
+_CLEAN_REPORT = {
+    'path': 'plans/x-prd.capability-manifest.yaml',
+    'stamped': ['α'],
+    'missing_labels': [],
+    'errors': [],
+}
+
+
+@pytest.mark.parametrize(
+    'report',
+    [
+        pytest.param(_CLEAN_REPORT, id='clean'),
+        pytest.param(
+            {
+                **_CLEAN_REPORT,
+                'polarity_warnings': [
+                    {
+                        'task_id': '1', 'label': 'α', 'name': 'n', 'code': 'absent_overbroad',
+                        'severity': 'warn', 'message': 'advisory',
+                    },
+                ],
+            },
+            id='polarity-warnings-only',
+        ),
+    ],
+)
+def test_clean_report_needs_no_action(report):
+    assert stamping_action_required(report) == []
+
+
+def test_action_required_has_one_line_per_non_clean_entry():
+    report = {
+        **_CLEAN_REPORT,
+        'missing_labels': ['ζ', 'η'],
+        'errors': ['plans/x-prd.capability-manifest.yaml: something broke'],
+        'near_miss_labels': [{'task_id': '7003', 'label': 'beta', 'sidecar_label': 'β'}],
+        'near_miss_keys': [
+            {'task_id': '7004', 'key': 'prd_label', 'value': 'gamma', 'sidecar_label': 'γ'},
+        ],
+        'unlabeled_tasks': ['7005'],
+    }
+
+    lines = stamping_action_required(report)
+
+    def naming(needle):
+        return [line for line in lines if needle in line]
+
+    assert len(lines) == 6
+    assert len(naming('ζ')) == 1
+    assert len(naming('η')) == 1
+    assert len(naming('something broke')) == 1
+    for task_id in ('7003', '7004', '7005'):
+        (line,) = naming(task_id)
+        assert 'prd_task_label' in line
+
+
+@pytest.mark.asyncio
+async def test_report_needing_action_logs_one_warning_naming_the_sidecar(tmp_path, caplog):
+    _write_sidecar(tmp_path, 'gx', ['γ'])
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.server.manifest_stamping'):
+        await _stamp_batch(tmp_path, [('6700', {'prd_path': 'plans/gx-prd.md'})])
+
+    warnings = [
+        r for r in caplog.records
+        if r.name == 'fused_memory.server.manifest_stamping' and r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert 'plans/gx-prd.capability-manifest.yaml' in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_clean_stamp_logs_no_warning(tmp_path, caplog):
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    (plans_dir / 'cl-prd.capability-manifest.yaml').write_text(
+        _mechanical_sidecar_yaml('cl', [], manual_labels=['alpha']), encoding='utf-8',
+    )
+
+    with caplog.at_level(logging.WARNING, logger='fused_memory.server.manifest_stamping'):
+        report, _ = await _stamp_batch(
+            tmp_path, [('6800', {'prd_path': 'plans/cl-prd.md', 'prd_task_label': 'alpha'})],
+        )
+
+    assert report is not None
+    assert report['stamped'] == ['alpha']
+    assert [
+        r for r in caplog.records
+        if r.name == 'fused_memory.server.manifest_stamping' and r.levelno == logging.WARNING
+    ] == []
