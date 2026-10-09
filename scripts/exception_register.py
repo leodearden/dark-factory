@@ -58,6 +58,7 @@ try:
         Policy,
         TaskRef,
         TicketRef,
+        disposition_record,
         governed_exceptions,
     )
 except ImportError as exc:
@@ -847,6 +848,152 @@ def measure(root: Path) -> Register:
     )
 
 
+#: The register document's own schema version.
+REGISTER_SCHEMA_VERSION = 1
+
+
+def _grandfathered(inline: InlineReport) -> int | None:
+    """The unowned sites the baseline holds, or ``None`` before it is seeded.
+
+    Excess sites are new violations, never grandfathered, so they are not folded in.
+    """
+    if not inline.seeded:
+        return None
+    return inline.unowned - (inline.excess_total or 0)
+
+
+def _declaration_record(declaration: Declaration) -> dict[str, object]:
+    return {
+        'list_id': declaration.list_id,
+        'rule': declaration.rule,
+        'path': declaration.path,
+        'line': declaration.line,
+        'default': None if declaration.default is None else disposition_record(declaration.default),
+        'default_covers': declaration.default_covers,
+        'overrides': [
+            {'key': key, 'disposition': disposition_record(value)}
+            for key, value in sorted(declaration.overrides.items())
+        ],
+    }
+
+
+def register_document(register: Register) -> dict[str, object]:
+    """The whole register as plain JSON data; every list is built sorted."""
+    inline = register.inline
+    return {
+        'schema_version': REGISTER_SCHEMA_VERSION,
+        'ratification_table': {
+            'path': TABLE_PATH,
+            'rows': [
+                {'id': row.id, 'date': row.date.isoformat(), 'source': row.source, 'covers': row.covers}
+                for row in sorted(register.table, key=lambda row: row.id)
+            ],
+        },
+        'discovery': {
+            'files_enumerated': register.discovery.files_enumerated,
+            'files_parsed': register.discovery.files_parsed,
+        },
+        'declarations': [_declaration_record(item) for item in register.discovery.declarations],
+        'grandfathered': {'seeded': inline.seeded, 'unowned': _grandfathered(inline)},
+        'baseline': {'present': inline.seeded, 'slack_total': inline.slack_total},
+        'inline': dict(inline.document),
+        'violations': [violation.record() for violation in register.violations],
+    }
+
+
+#: How many files the per-file table names before its remainder line.
+TOP_FILES = 15
+
+
+def declaration_form(disposition: Disposition) -> str:
+    """*disposition* spelled as a declaration writes it."""
+    if isinstance(disposition, Policy):
+        return f'Policy({disposition.ratified!r})'
+    owner = disposition.owner
+    ref = f'TaskRef({owner.id})' if isinstance(owner, TaskRef) else f'TicketRef({owner.id!r})'
+    return f'Debt({ref})'
+
+
+def _figure(total: int | None) -> str:
+    """A ratchet figure, or ``n/a`` when it was not measured."""
+    return 'n/a' if total is None else str(total)
+
+
+def _plural(count: int, noun: str) -> str:
+    return f'{count} {noun}' if count == 1 else f'{count} {noun}s'
+
+
+def _declaration_lines(declaration: Declaration) -> list[str]:
+    default = (
+        'default: none'
+        if declaration.default is None
+        else f'default: {declaration_form(declaration.default)} covers {declaration.default_covers}'
+    )
+    return [
+        f'  {declaration.list_id}  {declaration.path}:{declaration.line}',
+        f'    rule: {declaration.rule}',
+        f'    {default}',
+        f'    overrides: {len(declaration.overrides)}',
+        *(
+            f'      {key!r}: {declaration_form(value)}'
+            for key, value in sorted(declaration.overrides.items())
+        ),
+    ]
+
+
+def _governed_lines(discovery: Discovery) -> list[str]:
+    lines = [f'governed lists: {_plural(len(discovery.declarations), "declaration")}']
+    for declaration in discovery.declarations:
+        lines += _declaration_lines(declaration)
+    return lines
+
+
+def _tally(counts: Mapping[str, int]) -> str:
+    return ', '.join(f'{name} {count}' for name, count in sorted(counts.items()))
+
+
+def _kind_code_lines(inline: InlineReport) -> list[str]:
+    rows = sorted(inline.by_kind_code, key=lambda row: (-row.sites, row.kind, row.code or ''))
+    return ['  by kind and code:', *(f'    {row.sites:6d}  {row.marker()}' for row in rows)]
+
+
+def _file_lines(inline: InlineReport) -> list[str]:
+    rows = sorted(inline.by_file, key=lambda row: (-row.sites, row.path))
+    lines = [f'  by file (top {TOP_FILES} of {len(rows)}):']
+    lines += [f'    {row.sites:6d}  {row.path}' for row in rows[:TOP_FILES]]
+    if len(rows) > TOP_FILES:
+        lines.append(f'    … {len(rows) - TOP_FILES} more files')
+    return lines
+
+
+def _inline_lines(inline: InlineReport) -> list[str]:
+    return [
+        f'inline suppressions: {inline.sites} sites in {inline.files_tokenized} of '
+        f'{inline.files_enumerated} tracked files',
+        f'  kinds: {_tally(inline.kind_totals)}',
+        f'  ownership: {_tally(inline.ownership)}',
+        f'  ratified class rows: {len(inline.class_rows)}',
+        f'  violations at the inline gate: {inline.violations}',
+        *_kind_code_lines(inline),
+        *_file_lines(inline),
+        f'baseline excess: {_figure(inline.excess_total)}',
+        f'baseline slack: {_figure(inline.slack_total)}',
+    ]
+
+
+def render_report(register: Register) -> str:
+    """The human report; its first line is the grandfathered headline."""
+    unowned = _grandfathered(register.inline)
+    lines = [
+        f'grandfathered (unowned): {"not seeded" if unowned is None else unowned}',
+        f'ratification table: {TABLE_PATH}, {_plural(len(register.table), "row")}',
+        *_governed_lines(register.discovery),
+        *_inline_lines(register.inline),
+        f'violations: {len(register.violations)}',
+    ]
+    return '\n'.join(lines)
+
+
 _PROG = 'exception_register.py'
 
 _EPILOG = """exit codes:
@@ -893,8 +1040,9 @@ def _build_parser() -> argparse.ArgumentParser:
 def _run(args: argparse.Namespace) -> int:
     register = measure(Path(args.root))
     if args.json:
-        print(json.dumps({'violations': [v.record() for v in register.violations]}, sort_keys=True))
+        print(json.dumps(register_document(register), indent=2, sort_keys=True))
         return 0
+    print(render_report(register))
     for violation in register.violations:
         print(violation.render(), file=sys.stderr)
     return 1 if register.violations else 0
