@@ -62,6 +62,7 @@ from orchestrator.pin_reservation import (
     park_rank,
     pin_release_reason,
     priority_payload,
+    rank_payload,
 )
 from orchestrator.recovery_emission import (
     LeaveReason,
@@ -1812,6 +1813,10 @@ class ModuleLockTable:
         - ``shadowed``: bool — True for every entry except the active top
         - ``installed_at``: str — ISO8601 timestamp from ``_park_install_at``,
           or ``''`` if the owner has no recorded install timestamp
+        - ``source``: ``'pin'`` | ``'fairness'`` — derived from ``rank`` by
+          :func:`~orchestrator.pin_reservation.rank_payload`
+        - ``pin_order``: int (pin entries only) / ``tier``: str (fairness
+          entries only) — the priority behind ``rank``
 
         INV-3: ranks are strictly decreasing top-ward (``entry[i].rank > entry[i+1].rank``).
 
@@ -1830,6 +1835,7 @@ class ModuleLockTable:
                     'rank': rank,
                     'shadowed': idx != last_index,
                     'installed_at': self._park_install_at.get(owner, ''),
+                    **rank_payload(rank),
                 })
             result[module] = entries
         return result
@@ -8169,9 +8175,10 @@ class Scheduler:
         - skip_counts: {task_id: int}
         - parks: {task_id: {modules: [...], installed_at: str}} — every active
           top, pin reservations included
-        - park_stacks: {module: [{owner, rank, shadowed, installed_at}, ...]} —
-          full LIFO stack bottom→top per module (active top + shadowed owners);
-          additive sibling to the INV-7 top-only ``parks`` key
+        - park_stacks: {module: [entry, ...]} — full LIFO stack bottom→top
+          per module (active top + shadowed owners); additive sibling to the
+          INV-7 top-only ``parks`` key.  Entry fields:
+          :meth:`ModuleLockTable.snapshot_park_stacks`
         - pin_reservations: {task_id: {modules: [...], installed_at: str}} —
           the park entries held at a pin rank (task 6040), top or buried,
           shown apart from fairness parks

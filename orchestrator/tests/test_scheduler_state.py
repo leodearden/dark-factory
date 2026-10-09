@@ -16,6 +16,7 @@ import pytest
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
 from orchestrator.overrides import OverrideStore
+from orchestrator.pin_reservation import PinOrder
 from orchestrator.scheduler import ModuleLockTable, Scheduler
 
 # ---------------------------------------------------------------------------
@@ -404,6 +405,9 @@ class TestSnapshotParkStacks:
         assert e0['owner'] == 'L'
         assert e0['shadowed'] is True
         assert isinstance(e0['rank'], int)
+        assert e0['source'] == 'fairness'
+        assert e0['tier'] == 'low'
+        assert 'pin_order' not in e0
         datetime.fromisoformat(e0['installed_at'])
 
         # top entry: H (active)
@@ -444,6 +448,18 @@ class TestSnapshotParkStacks:
         assert entries[-1]['shadowed'] is False
         for e in entries[:-1]:
             assert e['shadowed'] is True
+
+    def test_pin_and_fairness_entries_for_one_owner_carry_source(self):
+        """A pin entry reports source/pin_order; the owner's fairness entry its tier."""
+        lt = self._make_lock_table()
+        lt.install_parks('T', ['mod/a'], 'medium')
+        lt.install_parks('T', ['mod/a'], PinOrder(1))
+
+        fairness, pin = lt.snapshot_park_stacks()['mod/a']
+        assert (fairness['source'], fairness['tier']) == ('fairness', 'medium')
+        assert 'pin_order' not in fairness
+        assert (pin['source'], pin['pin_order']) == ('pin', 1)
+        assert 'tier' not in pin
 
     def test_empty_when_no_parks(self):
         """Fresh table returns empty dict."""
