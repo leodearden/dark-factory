@@ -819,8 +819,8 @@ def _run(
 ) -> int:
     """Perform the verb *args* selected against *classes*, as the exit code it returns.
 
-    The kernel's whole error family is converted to this module's own
-    instrument failure HERE, at the one place the kernel is reachable, because
+    The kernel's whole error family is converted to :class:`InstrumentFailure`
+    HERE, at the one place the kernel is reachable, because
     to a caller they mean the identical thing: nothing was compared.  That is
     the single ``except`` clause ``shared.ratchet``'s docstring says a consumer
     wants, spent once rather than at every call site.

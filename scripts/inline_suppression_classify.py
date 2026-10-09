@@ -58,10 +58,11 @@ class Scope(Enum):
 class SuppressionClass:
     """D9's key: one kind, one code, one scope.
 
-    The operator's table, ``scripts/inline_suppressions.py::RATIFIED_SUPPRESSION_CLASSES``,
-    is keyed by this TYPE rather than by its rendering, so the operator's rows
-    are type-checked at import and a malformed row cannot
-    masquerade as a class nobody happens to match.  :meth:`render` exists only
+    The operator's table,
+    ``scripts/inline_suppressions.py::RATIFIED_SUPPRESSION_CLASSES``, is keyed
+    by this TYPE rather than by its rendering, so the operator's rows are
+    type-checked at import and a malformed row cannot masquerade as a class
+    nobody happens to match.  :meth:`render` exists only
     because the report publishes the key as a string.
 
     Attributes:

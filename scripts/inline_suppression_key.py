@@ -62,10 +62,10 @@ class SuppressionKey:
         The codes group is omitted entirely when there are none, because
         ``pragma: no cover[]`` reads as a missing code rather than as a kind
         that never has one.  The digest is separated by a SPACE, never by
-        ``@`` — ``@`` is ``scripts/inline_suppression_classify.py::SuppressionClass.render``'s
-        separator, and two
-        key spellings a reader could confuse is the one thing worth spending a
-        character to avoid.
+        ``@``, which is the separator of
+        ``scripts/inline_suppression_classify.py::SuppressionClass.render``, and
+        two key spellings a reader could confuse is the one thing worth
+        spending a character to avoid.
         """
         codes = f'[{",".join(self.codes)}]' if self.codes else ''
         return f'{self.kind.value}{codes} {self.digest}'
