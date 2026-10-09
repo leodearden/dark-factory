@@ -52,6 +52,7 @@ from escalation.merge_lane_resolution import (
     resolve_merge_lane,
     validate_requested_lane,
 )
+from escalation.merge_status_answer import map_terminal_state
 from escalation.models import (
     ACTION_KEEP_DRIVING,
     ACTION_TERMINATE_CLEANLY,
@@ -4847,25 +4848,6 @@ def create_server(
         """Convert an epoch-seconds float to an ISO-8601 UTC string (matches event-store format)."""
         return datetime.fromtimestamp(ts, tz=UTC).isoformat()
 
-    def _map_terminal_state(raw: str) -> MergeState:
-        """Map a raw terminal MergeOutcome.status / 'abandoned' / 'error' to coarse vocabulary.
-
-        The *input* raws are MergeSubmitStatus values (plus 'abandoned', which
-        only ever originates here); the *output* is the poll vocabulary
-        ``shared.merge_state.MergeState``.  Which raw maps where is unchanged.
-        """
-        if raw in ('done', 'done_wip_recovery', 'already_merged'):
-            return MergeState.done
-        if raw == 'conflict':
-            return MergeState.conflict
-        if raw == 'abandoned':
-            return MergeState.abandoned
-        if raw == 'superseded':
-            return MergeState.superseded
-        # blocked / wip_halted / wip_recovery_no_advance / unmerged_state /
-        # stash_failed / unknown_branch / error → blocked
-        return MergeState.blocked
-
     def _map_live_state(raw: str) -> MergeState | str:
         """Map a live snapshot state to the public merge_status vocabulary.
 
@@ -4936,7 +4918,7 @@ def create_server(
                     _v = getattr(rec, _f, None)
                     if _v is not None:
                         meta[_f] = _v
-                return _map_terminal_state(rec.state), meta
+                return map_terminal_state(rec.state), meta
 
         # Tier 3: event store (supports all three lookup keys).
         if event_store is not None:
@@ -4955,7 +4937,7 @@ def create_server(
                     _v = row.get(_f)
                     if _v is not None:
                         es_meta[_f] = _v
-                return _map_terminal_state(row['state']), es_meta
+                return map_terminal_state(row['state']), es_meta
 
         return None
 
@@ -5141,7 +5123,7 @@ def create_server(
              {cancelled: False, state: 'abandoned', reason: ...}.
           3. Waiter present, future resolved-but-not-cancelled (mid-finalize window, i.e.
              worker delivered an outcome but the _waiters.pop done-callback hasn't run yet):
-             {cancelled: False, state: <coarse terminal via _map_terminal_state>, reason: ...}.
+             {cancelled: False, state: <coarse terminal via map_terminal_state>, reason: ...}.
              Excepted futures (abnormal) map to state='blocked'.
           4. Waiter present, future pending: cancel the future, then FULLY RETIRE
              the entry (release the branch slot, reap the in-flight worktree via
@@ -5210,7 +5192,7 @@ def create_server(
             if rec.future.exception() is not None:
                 state: MergeState | str = MergeState.blocked
             else:
-                state = _map_terminal_state(rec.future.result().status)
+                state = map_terminal_state(rec.future.result().status)
             return {
                 'cancelled': False,
                 'state': state,

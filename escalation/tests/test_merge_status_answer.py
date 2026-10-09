@@ -12,6 +12,8 @@ import enum
 from typing import Any
 
 import pytest
+from shared.merge_state import MergeReason, MergeState
+
 from escalation.merge_status_answer import (
     PRESENT_TRUTH_SOURCES,
     LastOutcome,
@@ -20,7 +22,6 @@ from escalation.merge_status_answer import (
     hint_for,
     map_terminal_state,
 )
-from shared.merge_state import MergeReason, MergeState
 
 _PRESENT = (MergeStatusSource.live, MergeStatusSource.event_store, MergeStatusSource.git)
 _HISTORICAL = (
