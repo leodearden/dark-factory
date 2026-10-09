@@ -44,6 +44,7 @@ from orchestrator.config import (
     coerce_tier,
 )
 from orchestrator.delivered_checks import DeliveredCheckResult, run_delivered_check
+from orchestrator.dependency_verdict import DEPS_SATISFIED, DepKind, DepState, DepsVerdict
 from orchestrator.event_store import EventStore, EventType
 from orchestrator.fm_retry import fm_retry_backoffs
 from orchestrator.guard_state import PersistentSet, guard_path
@@ -4795,13 +4796,45 @@ class Scheduler:
         delivered_check_cache: dict[str, bool] | None = None,
         terminal_dep_records: dict[str, dict] | None = None,
     ) -> bool:
-        """Return True if every dependency of *task* is in a terminal status.
+        """The boolean view of :meth:`_deps_verdict`: True iff SATISFIED.
 
-        A dep is satisfied when its status is in :data:`TERMINAL_STATUSES`
-        (``done`` or ``cancelled``).  ``cancelled`` represents an obsolete
-        or duplicate task and should not block its dependents — the
-        dependent re-architects against current main and either finds the
-        work already merged or escalates for a different reason.
+        Dispatch reads this view, so an UNKNOWN dependency waits exactly as an
+        UNSATISFIED one does.
+        """
+        return self._deps_verdict(
+            task, status_map, tasks_by_id,
+            external_status_cache=external_status_cache,
+            external_resolver_failed=external_resolver_failed,
+            delivered_check_cache=delivered_check_cache,
+            terminal_dep_records=terminal_dep_records,
+        ).satisfied
+
+    def _deps_verdict(
+        self,
+        task: dict,
+        status_map: dict[str, str],
+        tasks_by_id: dict[str, dict] | None = None,
+        *,
+        external_status_cache: dict[str, str] | None = None,
+        external_resolver_failed: bool = False,
+        delivered_check_cache: dict[str, bool] | None = None,
+        terminal_dep_records: dict[str, dict] | None = None,
+    ) -> DepsVerdict:
+        """THE dependency predicate: are *task*'s dependencies satisfied?
+
+        Three arms, local then external then delivered-check, combined by
+        :meth:`DepsVerdict.combine`: the first arm known UNSATISFIED wins,
+        else the first UNKNOWN (task 6518).  The arms run lazily in that
+        order, so none runs, or logs, after an UNSATISFIED one.  Dispatch
+        reads the boolean view (:meth:`_deps_satisfied`); park GC expires
+        only on UNSATISFIED (:meth:`_park_gc_reason`).
+
+        **Local** (:meth:`_local_deps_verdict`): a dep is satisfied when its
+        status is in :data:`TERMINAL_STATUSES` (``done`` or ``cancelled``).
+        ``cancelled`` represents an obsolete or duplicate task and should not
+        block its dependents — the dependent re-architects against current
+        main and either finds the work already merged or escalates for a
+        different reason.  A dep with no *status_map* entry is UNSATISFIED.
 
         **Intra-train allowance (PRD § 9.3):** when *tasks_by_id* is supplied,
         a dep in status ``merge-deferred`` is also treated as satisfied provided
@@ -4809,35 +4842,31 @@ class Scheduler:
         AND their train IDs match.  This allows the next member of an atomic
         train to dispatch as soon as its predecessor has been parked by the
         merge-deferred gate, without waiting for a full ``done`` transition.
-
         When *tasks_by_id* is ``None`` (the default), the allowance is disabled
-        and behaviour is byte-identical to today — ``merge-deferred`` blocks like
-        any other non-terminal status.  This preserves backward compatibility for
-        the existing unit tests (TestDepsSatisfied, TestDepsSatisfiedLogging) and
-        any external callers that don't pass the new parameter.
+        and ``merge-deferred`` blocks like any other non-terminal status.  The
+        allowance also requires the dep record to be present in *tasks_by_id*;
+        a missing dep (stale snapshot) is treated conservatively as blocking.
 
-        The allowance also requires the dep record to be present in *tasks_by_id*.
-        A missing dep (stale snapshot) is treated conservatively as blocking.
+        **Cross-project external deps** (:meth:`_external_deps_verdict`):
+        consulted only when *external_status_cache* is not ``None``.  An
+        external dep in ``task.metadata.external_deps`` is satisfied iff its
+        cached status is exactly ``'done'``; any other reported value, live
+        status or sentinel (``unknown_project`` / ``unknown_task`` /
+        ``malformed``), is UNSATISFIED.  A dep missing from the cache, or any
+        external dep when *external_resolver_failed* is ``True``, is UNKNOWN.
 
-        **Cross-project external dep gate:** when *external_status_cache* is not
-        ``None``, after all local deps are satisfied the method checks
-        ``task.metadata.external_deps``.  An external dep is satisfied iff its
-        status in the cache is exactly ``'done'``.  Any other value (live status,
-        sentinel, missing from cache) is NOT satisfied.  When
-        *external_resolver_failed* is ``True``, all external deps are treated as
-        not satisfied regardless of the cache (fail-safe wait).
-
-        **Delivered-check gate (capability-delivered-checks PRD, task delta):**
-        when *delivered_check_cache* is not ``None`` AND *tasks_by_id* is
-        supplied, each TERMINAL (done/cancelled) local dep whose record in
-        *tasks_by_id* carries a truthy ``metadata.delivered_checks`` must
-        also resolve to exactly ``True`` in *delivered_check_cache* (keyed by
-        dep task id) to count as satisfied — this applies to a ``cancelled``
-        dep just as much as a ``done`` one, since the check trusts the state
-        of ``main``, not the status label.  A dep absent from the cache
-        (errored, over budget, or not yet evaluated this tick) is NOT
-        satisfied (fail-safe wait).  A dep whose record carries no
-        ``metadata.delivered_checks`` is never consulted — byte-identical.
+        **Delivered checks** (:meth:`_delivered_check_deps_verdict`,
+        capability-delivered-checks PRD, task delta): consulted only when
+        *delivered_check_cache* is not ``None`` AND *tasks_by_id* is supplied.
+        Each TERMINAL (done/cancelled) local dep whose record carries a truthy
+        ``metadata.delivered_checks`` must resolve to exactly ``True`` in
+        *delivered_check_cache* (keyed by dep task id) — this applies to a
+        ``cancelled`` dep just as much as a ``done`` one, since the check
+        trusts the state of ``main``, not the status label.  ``False`` (the
+        check ran and FAILED) is UNSATISFIED; a dep absent from the cache
+        (errored, over budget, or not yet evaluated this tick) is UNKNOWN.  A
+        dep whose record carries no ``metadata.delivered_checks`` is never
+        consulted.
 
         **``terminal_dep_records`` fallback (task 2692, δ/ε follow-up):**
         the active-only ``get_tasks`` fetch that seeds *tasks_by_id*
@@ -4846,19 +4875,15 @@ class Scheduler:
         status is already in *status_map*.  When the delivered-check arm's
         ``tasks_by_id.get(dep_id)`` misses (``None``) and
         *terminal_dep_records* is not ``None``, the dep record is looked up
-        there instead — a purely ADDITIVE fallback consulted ONLY in this
+        there instead — a purely ADDITIVE fallback consulted ONLY in that
         arm (never the intra-train merge-deferred allowance above, which
         deals exclusively with non-terminal deps already present in
         *tasks_by_id*).  If the dep is present in *tasks_by_id*,
         *terminal_dep_records* is never consulted (*tasks_by_id* wins).  If
-        the dep is absent from BOTH, the arm skips it exactly as before —
-        byte-identical when *terminal_dep_records* is ``None``/omitted.
+        the dep is absent from BOTH, the arm skips it.
 
-        Defaulting all four new parameters to ``None``/``False`` makes the
-        legacy 3-arg call from ``_park_gc`` and all existing tests
-        byte-identical. Side effects (escalation, counter increments) MUST
-        NOT live here — this method is a pure predicate called from
-        multiple sites.
+        Side effects (escalation, counter increments) MUST NOT live here —
+        this method is a pure predicate called from multiple sites.
 
         Handles three dependency formats:
           - dict with 'id' key: ``{'id': 1}`` or ``{'id': '1'}``
@@ -4869,7 +4894,32 @@ class Scheduler:
         ID and its current status to aid diagnosis of premature-dispatch issues.
         Emits a separate DEBUG log when the intra-train allowance fires.
         """
-        deps = task.get('dependencies', [])
+        dep_ids = [
+            str(d.get('id', d) if isinstance(d, dict) else d)
+            for d in task.get('dependencies', [])
+        ]
+        arms = (
+            partial(self._local_deps_verdict, task, dep_ids, status_map, tasks_by_id),
+            partial(
+                self._external_deps_verdict,
+                task, external_status_cache, external_resolver_failed,
+            ),
+            partial(
+                self._delivered_check_deps_verdict,
+                task, dep_ids, status_map, tasks_by_id,
+                delivered_check_cache, terminal_dep_records,
+            ),
+        )
+        return DepsVerdict.combine(arm() for arm in arms)
+
+    def _local_deps_verdict(
+        self,
+        task: dict,
+        dep_ids: list[str],
+        status_map: dict[str, str],
+        tasks_by_id: dict[str, dict] | None,
+    ) -> DepsVerdict:
+        """The local arm of :meth:`_deps_verdict`: SATISFIED or UNSATISFIED, never UNKNOWN."""
         task_id = str(task.get('id', '?'))
         # Resolve this task's train id once (None if not a train member).
         # Coerce empty string to None so that '' does not accidentally match
@@ -4878,8 +4928,7 @@ class Scheduler:
         task_train_id: str | None = (
             task_train.get('id') or None if isinstance(task_train, dict) else None
         )
-        for d in deps:
-            dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
+        for dep_id in dep_ids:
             dep_status = status_map.get(dep_id, 'unknown')
             if dep_status in TERMINAL_STATUSES:
                 continue
@@ -4911,75 +4960,95 @@ class Scheduler:
                 dep_id,
                 dep_status,
             )
-            return False
+            return DepsVerdict.unsatisfied(DepKind.LOCAL)
+        return DEPS_SATISFIED
 
-        # External-dep gate (cross-project).  Only active when the cache is
-        # supplied (not None) — defaults reproduce byte-identical legacy behaviour.
-        if external_status_cache is not None:
-            external_deps: list = _task_external_deps(task)
-            for ext_dep in external_deps:
-                if external_resolver_failed:
-                    logger.debug(
-                        'Task %s blocked: external dep %r not checked '
-                        '(resolver failed — fail-safe wait)',
-                        task_id,
-                        ext_dep,
-                    )
-                    return False
-                ext_status = external_status_cache.get(ext_dep)
-                if ext_status != 'done':
-                    logger.debug(
-                        'Task %s blocked: external dep %r has status %r, '
-                        'need done',
-                        task_id,
-                        ext_dep,
-                        ext_status,
-                    )
-                    return False
+    def _external_deps_verdict(
+        self,
+        task: dict,
+        external_status_cache: dict[str, str] | None,
+        external_resolver_failed: bool,
+    ) -> DepsVerdict:
+        """The cross-project arm of :meth:`_deps_verdict`; inactive without a cache."""
+        if external_status_cache is None:
+            return DEPS_SATISFIED
+        task_id = str(task.get('id', '?'))
+        verdict = DEPS_SATISFIED
+        for ext_dep in _task_external_deps(task):
+            if external_resolver_failed:
+                logger.debug(
+                    'Task %s blocked: external dep %r not checked '
+                    '(resolver failed — fail-safe wait)',
+                    task_id,
+                    ext_dep,
+                )
+                return DepsVerdict.unknown(DepKind.EXTERNAL)
+            ext_status = external_status_cache.get(ext_dep)
+            if ext_status == 'done':
+                continue
+            logger.debug(
+                'Task %s blocked: external dep %r has status %r, '
+                'need done',
+                task_id,
+                ext_dep,
+                ext_status,
+            )
+            if ext_dep in external_status_cache:
+                return DepsVerdict.unsatisfied(DepKind.EXTERNAL)
+            verdict = DepsVerdict.unknown(DepKind.EXTERNAL)
+        return verdict
 
-        # Delivered-check gate (capability-delivered-checks PRD, task delta).
-        # Only active when the cache is supplied (not None) AND tasks_by_id
-        # is available to look up each dep's metadata — defaults reproduce
-        # byte-identical legacy behaviour.  Only a TERMINAL local dep that
-        # itself carries a truthy metadata.delivered_checks is consulted; a
-        # dep without the metadata is never looked up in the cache.
-        if delivered_check_cache is not None and tasks_by_id is not None:
-            for d in deps:
-                dep_id = str(d.get('id', d) if isinstance(d, dict) else d)
-                dep_status = status_map.get(dep_id, 'unknown')
-                if dep_status not in TERMINAL_STATUSES:
-                    continue
-                dep_task = tasks_by_id.get(dep_id)
-                if dep_task is None and terminal_dep_records is not None:
-                    # Fallback (task 2692): the active-only get_tasks fetch
-                    # excludes this TERMINAL dep from tasks_by_id — consult
-                    # the per-tick backfilled record instead. Only reached
-                    # when tasks_by_id genuinely misses (tasks_by_id wins).
-                    dep_task = terminal_dep_records.get(dep_id)
-                if dep_task is None:
-                    # Conscious fail-OPEN, not a gap: see the identical
-                    # skip site in _compute_delivered_check_cache (task
-                    # 2692, reviewer_comprehensive robustness amendment)
-                    # for the full rationale. In short — an unreadable
-                    # record (fetch failed in
-                    # _phase_backfill_terminal_dep_records, which logs a
-                    # bounded WARNING for it) means this dep is simply
-                    # never gated here, rather than fail-safe-blocking a
-                    # dependent whose dep record may never be fetchable.
-                    continue
-                dep_checks = (dep_task.get('metadata') or {}).get('delivered_checks')
-                if not dep_checks:
-                    continue
-                if delivered_check_cache.get(dep_id) is not True:
-                    logger.debug(
-                        'Task %s blocked: dep %s delivered_checks not confirmed on '
-                        'main (cache=%r)',
-                        task_id,
-                        dep_id,
-                        delivered_check_cache.get(dep_id),
-                    )
-                    return False
-        return True
+    def _delivered_check_deps_verdict(
+        self,
+        task: dict,
+        dep_ids: list[str],
+        status_map: dict[str, str],
+        tasks_by_id: dict[str, dict] | None,
+        delivered_check_cache: dict[str, bool] | None,
+        terminal_dep_records: dict[str, dict] | None,
+    ) -> DepsVerdict:
+        """The delivered-check arm of :meth:`_deps_verdict`; inactive without a cache or *tasks_by_id*."""
+        if delivered_check_cache is None or tasks_by_id is None:
+            return DEPS_SATISFIED
+        task_id = str(task.get('id', '?'))
+        verdict = DEPS_SATISFIED
+        for dep_id in dep_ids:
+            if status_map.get(dep_id, 'unknown') not in TERMINAL_STATUSES:
+                continue
+            dep_task = tasks_by_id.get(dep_id)
+            if dep_task is None and terminal_dep_records is not None:
+                # Fallback (task 2692): the active-only get_tasks fetch
+                # excludes this TERMINAL dep from tasks_by_id — consult
+                # the per-tick backfilled record instead. Only reached
+                # when tasks_by_id genuinely misses (tasks_by_id wins).
+                dep_task = terminal_dep_records.get(dep_id)
+            if dep_task is None:
+                # Conscious fail-OPEN, not a gap: see the identical
+                # skip site in _compute_delivered_check_cache (task
+                # 2692, reviewer_comprehensive robustness amendment)
+                # for the full rationale. In short — an unreadable
+                # record (fetch failed in
+                # _phase_backfill_terminal_dep_records, which logs a
+                # bounded WARNING for it) means this dep is simply
+                # never gated here, rather than fail-safe-blocking a
+                # dependent whose dep record may never be fetchable.
+                continue
+            if not (dep_task.get('metadata') or {}).get('delivered_checks'):
+                continue
+            confirmed = delivered_check_cache.get(dep_id)
+            if confirmed is True:
+                continue
+            logger.debug(
+                'Task %s blocked: dep %s delivered_checks not confirmed on '
+                'main (cache=%r)',
+                task_id,
+                dep_id,
+                confirmed,
+            )
+            if confirmed is False:
+                return DepsVerdict.unsatisfied(DepKind.DELIVERED_CHECK)
+            verdict = DepsVerdict.unknown(DepKind.DELIVERED_CHECK)
+        return verdict
 
     def _dispatch_cooldown_signal(self, task: dict) -> str | None:
         """Return the signal label if *task* carries a dispatch-cooldown signal.
@@ -5367,23 +5436,21 @@ class Scheduler:
         to :meth:`_deps_satisfied` for the cross-project external dep gate.
         When both default (``None``/``False``), the external gate is skipped —
         behaviour is byte-identical to the pre-external-dep implementation.
-        The ``_park_gc`` call site does NOT pass these params (preserving
-        park-GC semantics, scope containment per design decision 4).
 
         *delivered_check_cache* is forwarded to :meth:`_deps_satisfied` for
         the delivered-check dep-gate (capability-delivered-checks PRD, task
         delta).  When ``None`` (the default), the gate is skipped —
-        byte-identical to the pre-delivered-check implementation.  The
-        ``_park_gc`` call site does NOT pass this param either (same scope
-        containment as the external cache).
+        byte-identical to the pre-delivered-check implementation.
 
         *terminal_dep_records* is forwarded to :meth:`_deps_satisfied` as the
         additive fallback source for a TERMINAL dep missing from
         *tasks_by_id* (task 2692, δ/ε follow-up — the active-only
         ``get_tasks`` fetch excludes done/cancelled producers). When ``None``
         (the default), the fallback is inert — byte-identical to before this
-        param existed. The ``_park_gc`` call site does NOT pass this param
-        either (same scope containment as the external cache).
+        param existed.
+
+        Park GC evaluates the same three caches through :meth:`_deps_verdict`
+        (task 6518), so it and dispatch read one dependency predicate.
 
         Returns ``(True, signal_label)`` when all gates pass.
         Returns ``(False, None)`` when any gate fails.  ``signal_label`` is
@@ -6574,10 +6641,16 @@ class Scheduler:
         - ``'terminal:<status>'`` — done or cancelled;
         - ``'missing'`` — absent from this tick's task read;
         - ``'not_pending:<status>'`` — any other non-pending status;
-        - ``'deps_unsatisfied'`` — a local dependency is unsatisfied.
+        - ``'deps_unsatisfied'`` — a local dependency is unsatisfied;
+        - ``'deps_unsatisfied:external'`` — the resolver reports a
+          cross-project dependency other than done;
+        - ``'deps_unsatisfied:delivered_check'`` — a dependency's delivered
+          check ran and failed.
 
-        Park GC expires on it; the operator eviction drain and ``reserve_now``
-        consult the same predicate.
+        A dependency that is merely UNKNOWN this tick keeps the parks:
+        expiry needs affirmative evidence (:meth:`_deps_verdict`).  Park GC
+        expires on this predicate; the operator eviction drain and
+        ``reserve_now`` consult the same one.
         """
         status = ctx.status_map.get(owner)
         if status in TERMINAL_STATUSES:
@@ -6586,9 +6659,18 @@ class Scheduler:
             return 'missing'
         if status != TaskStatus.PENDING:
             return f'not_pending:{status}'
-        if not self._deps_satisfied(ctx.tasks_by_id[owner], ctx.status_map, ctx.tasks_by_id):
+        verdict = self._deps_verdict(
+            ctx.tasks_by_id[owner], ctx.status_map, ctx.tasks_by_id,
+            external_status_cache=ctx.external_cache,
+            external_resolver_failed=ctx.external_resolver_failed,
+            delivered_check_cache=ctx.delivered_check_cache,
+            terminal_dep_records=ctx.terminal_dep_records,
+        )
+        if verdict.state is not DepState.UNSATISFIED:
+            return None
+        if verdict.kind is DepKind.LOCAL:
             return 'deps_unsatisfied'
-        return None
+        return f'deps_unsatisfied:{verdict.kind}'
 
     def _expire_parks(
         self,
