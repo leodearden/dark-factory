@@ -21,9 +21,15 @@ calls within an arm run concurrently.
       --snapshot <out-root>/write-triage-population-<date>/snapshot.json \\
       --max-writes N --budget-usd 40
 
-Rows land in ``arms/<arm>.jsonl`` beside the snapshot. A long run belongs
-detached (``setsid … > log 2>&1``), polled by reading the log. ``publish``
-then refuses anything partial and writes the two committed artifacts:
+Rows land in ``arms/<arm>.jsonl`` beside the snapshot. The write-time run
+(π2) judges the same sample with its own arm table into ``arms-write-time/``:
+
+  uv run python scripts/run_write_triage_population_arms.py run --slates write-time \\
+      --snapshot <snapshot.json> --max-writes 658 --budget-usd 15
+
+A long run belongs detached (``setsid … > log 2>&1``), polled by reading the
+log. ``publish`` then refuses anything partial and writes the two committed
+artifacts:
 
   uv run python scripts/run_write_triage_population_arms.py publish \\
       --snapshot <snapshot.json> \\
@@ -157,6 +163,17 @@ class Slates(StrEnum):
     WRITE_TIME = 'write-time'
 
 
+#: π2's arms (PRD §12.4): the flip-decision arms at width 5; sol:low@20 is over budget.
+WRITE_TIME_ARMS: tuple[Arm, ...] = tuple(
+    arm for arm in ARMS
+    if arm.name in {'gpt-4o-mini@5', 'gpt-5.6-terra:none@5', 'gpt-6.1-sol:low@5'}
+)
+#: Where each slate mode's arm files live, beside the snapshot.
+ARMS_DIR_NAME: dict[Slates, str] = {Slates.FROZEN: 'arms', Slates.WRITE_TIME: 'arms-write-time'}
+#: The arms each slate mode runs.
+ARMS_OF: dict[Slates, tuple[Arm, ...]] = {Slates.FROZEN: ARMS, Slates.WRITE_TIME: WRITE_TIME_ARMS}
+
+
 def _as_memory_result(candidate: Mapping[str, Any]) -> MemoryResult:
     """A frozen slate record as the row the shipped selector reads (``store_score`` included)."""
     return MemoryResult(
@@ -237,6 +254,7 @@ def _identity(
         'declares_attach_keys': write['declares_attach_keys'],
         'band': write['band'],
         'band_winner_id': write['band_winner_id'],
+        'slates': write['slates'],
         'attempts': 1,
         'transport_failures': [],
     }
@@ -550,23 +568,30 @@ async def run_arms(
     budget_usd: float,
     sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep,
     max_attempts: int = 4,
+    slates: Slates = Slates.FROZEN,
 ) -> dict[str, Any]:
     """Run *arms* in order over the first *max_writes* of :func:`judge_band_order`.
 
+    Each write is judged on its *slates* view (:func:`draw_run_set`), and only
+    the arms of ``ARMS_OF[slates]`` may run.
     Resumable: a row already in ``arms_dir/<arm>.jsonl`` is never re-judged.
     Dispatch stops once the list-price spend of every arm file reaches
     *budget_usd*; calls in flight then still land, so the spend can pass it
     by up to *concurrency* calls (see :class:`_Budget`). Returns per-arm
-    coverage of the run set, whether the budget refused a dispatch, and the
-    spend.
+    coverage of the run set, whether the budget refused a dispatch, the
+    spend, the slates, the sample size and the drawn writes that left the band.
     """
+    off_table = [arm.name for arm in arms if arm not in ARMS_OF[slates]]
+    if off_table:
+        raise ValueError(f'arms {", ".join(off_table)} are not run on {slates} slates')
     too_wide = [arm.name for arm in arms if arm.width > snapshot['candidate_k']]
     if too_wide:
         raise ValueError(
             f'arms {", ".join(too_wide)} are wider than the frozen slates '
             f'(candidate_k={snapshot["candidate_k"]})',
         )
-    run_set = judge_band_order(snapshot, snapshot_sha256)[:max_writes]
+    drawn = draw_run_set(snapshot, snapshot_sha256, max_writes=max_writes, slates=slates)
+    run_set = drawn.writes
     arms_dir = Path(arms_dir)
     arms_dir.mkdir(parents=True, exist_ok=True)
     existing = {arm.name: _rows_of_this_snapshot(arms_dir, arm.name, snapshot_sha256) for arm in arms}
@@ -589,7 +614,11 @@ async def run_arms(
             'missing': len(run_set) - rows,
             'written_now': landed,
         }
-    return {'arms': coverage, 'budget_exhausted': budget.refused, 'spent_usd': budget.spent}
+    return {
+        'arms': coverage, 'budget_exhausted': budget.refused, 'spent_usd': budget.spent,
+        'slates': slates, 'sample_size': drawn.sample_size,
+        'left_judge_band': list(drawn.left_judge_band),
+    }
 
 
 # --- publish -------------------------------------------------------------------
@@ -839,7 +868,7 @@ def build_population_artifact(
     are read from ``arms/`` beside *snapshot_path* for their path and digest.
     """
     run_set = _validated_run_set(snapshot, snapshot_sha256, arm_rows_by_name)
-    arms_dir = Path(snapshot_path).parent / 'arms'
+    arms_dir = Path(snapshot_path).parent / ARMS_DIR_NAME[Slates.FROZEN]
     arms = [
         _arm_row(arm, arm_rows_by_name[arm.name], arm_path(arms_dir, arm.name)) for arm in ARMS
     ]
@@ -921,13 +950,13 @@ def _command_run(args: argparse.Namespace) -> int:
     from fused_memory.config.schema import FusedMemoryConfig  # noqa: PLC0415
 
     snapshot, snapshot_sha256 = _freeze.load_snapshot(args.snapshot)
-    requested = set(args.arms or [arm.name for arm in ARMS])
+    requested = set(args.arms or [arm.name for arm in ARMS_OF[args.slates]])
     summary = asyncio.run(run_arms(
-        snapshot, snapshot_sha256, Path(args.snapshot).parent / 'arms',
+        snapshot, snapshot_sha256, Path(args.snapshot).parent / ARMS_DIR_NAME[args.slates],
         arms=[arm for arm in ARMS if arm.name in requested],
         service=types.SimpleNamespace(config=FusedMemoryConfig()),
         max_writes=args.max_writes, concurrency=args.concurrency,
-        budget_usd=args.budget_usd,
+        budget_usd=args.budget_usd, slates=args.slates,
     ))
     print(json.dumps(summary, indent=2))
     gaps = [f'{name} missing {c["missing"]}' for name, c in summary['arms'].items()
@@ -973,7 +1002,7 @@ def _write_staged(bodies: Mapping[Path, str]) -> None:
 
 def _command_publish(args: argparse.Namespace) -> int:
     snapshot, snapshot_sha256 = _freeze.load_snapshot(args.snapshot)
-    arms_dir = Path(args.snapshot).parent / 'arms'
+    arms_dir = Path(args.snapshot).parent / ARMS_DIR_NAME[Slates.FROZEN]
     arm_rows = {arm.name: read_rows(arm_path(arms_dir, arm.name)) for arm in ARMS}
     pairs, stats = build_pairs_to_rate(
         snapshot, snapshot_sha256, arm_rows,
@@ -1011,7 +1040,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     run.add_argument('--config', default=None,
                      help='path to a fused-memory config file (sets CONFIG_PATH)')
     run.add_argument('--snapshot', type=Path, required=True,
-                     help="a frozen snapshot.json; rows land in its directory's arms/")
+                     help="a frozen snapshot.json; rows land in its directory's arms/ "
+                          '(arms-write-time/ under --slates write-time)')
+    run.add_argument('--slates', type=Slates, choices=[s.value for s in Slates],
+                     default=Slates.FROZEN.value,
+                     help='judge each write on its frozen slate, or on the records created '
+                          'before it (default: frozen)')
     run.add_argument('--max-writes', dest='max_writes', type=int, default=None,
                      help='judge only this prefix of the judge-band order (default: all)')
     run.add_argument('--concurrency', type=int, default=8,
@@ -1021,7 +1055,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                           'calls in flight still land, so spend can pass it by up to '
                           '--concurrency calls (default: 40.0)')
     run.add_argument('--arms', nargs='+', choices=[arm.name for arm in ARMS], default=None,
-                     help='arms to run, in ARMS order whatever the order given (default: all)')
+                     help='arms to run, in ARMS order whatever the order given '
+                          "(default: every arm of the --slates mode's table)")
     run.set_defaults(handler=_command_run)
     publish = commands.add_parser(
         'publish', help='refuse anything partial, then write the committed artifacts',
