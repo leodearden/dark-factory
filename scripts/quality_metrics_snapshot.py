@@ -1017,10 +1017,13 @@ _GRAPH_KINDS: tuple[tuple[str, str, Any, Any], ...] = (
     (
         'deferred',
         'deferred',
+        # Not keyed on closes_cycle: a flip is the hidden cycle's own change, reported below.
         lambda entry: (entry['from'], tuple(entry['imports'])),
         lambda key: f'{key[0]}: {", ".join(key[1])}',
     ),
     ('cycle', 'cycles', lambda cycle: tuple(cycle), lambda key: ', '.join(key)),
+    ('hidden cycle', 'hidden_cycles', lambda cycle: tuple(cycle), lambda key: ', '.join(key)),
+    ('typing cycle', 'typing_cycles', lambda cycle: tuple(cycle), lambda key: ', '.join(key)),
 )
 
 
