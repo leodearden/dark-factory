@@ -662,9 +662,13 @@ class TestGetByTaskFindsRecordsWhoseStemDoesNotEncodeTaskId:
     and the id stem ``esc-{key}-{n}``, and nothing more.  Five production sites
     diverge deliberately — ``curator_escalator.py`` x3 (``make_id('curator')``
     with ``task_id='task-curator'``) and ``ticket_janitor.py`` x2
-    (``make_id('ticket-janitor')``, same task_id) — so ``'task-curator'`` alone
-    carries three stem families in the live corpus (``esc-curator-*`` 31,
-    ``esc-ticket-janitor-*`` 6, ``esc-task-curator-*`` 13).
+    (``make_id('ticket-janitor')``; ``TicketJanitor._surface_probe_defect``
+    stores the literal ``'task-curator'``, but ``TicketJanitor.tick`` stores the
+    ticket's REAL NUMERIC task_id when it has one, e.g. stem
+    ``esc-ticket-janitor-2`` with task_id ``'2859'``) — so ``'task-curator'``
+    alone carries three stem families in the live corpus (``esc-curator-*`` 31,
+    ``esc-ticket-janitor-*`` 6, ``esc-task-curator-*`` 13).  The real-numeric
+    case is what a scoped glob would silently lose for an ordinary task id.
 
     The false identity "for every record file, ``stem.startswith(
     f'esc-{record.task_id}-')``" is therefore FALSE (42 of 2,972 corpus records
