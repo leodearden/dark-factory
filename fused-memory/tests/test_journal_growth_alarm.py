@@ -441,3 +441,66 @@ class TestEscalationFailSoft:
 
         assert [b.ceiling for b in breaches] == [JournalCeiling.FILE_SIZE]
         assert len(_warnings(caplog)) == 1
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _errors(caplog) -> list[logging.LogRecord]:
+    return [
+        r for r in caplog.records
+        if r.name == _ALARM_LOGGER and r.levelno == logging.ERROR
+    ]
+
+
+class TestMaybeCheck:
+    @pytest.mark.asyncio
+    async def test_checks_at_most_once_per_interval(self, journal, caplog):
+        caplog.set_level(logging.WARNING, logger=_ALARM_LOGGER)
+        clock = _FakeClock()
+        alarm = JournalGrowthAlarm(
+            journal,
+            WriteJournalGrowthAlarmConfig(
+                max_file_bytes=1,
+                max_rows_inserted_per_day=_NEVER,
+                check_interval_seconds=3600,
+            ),
+            project_root=None,
+            clock=clock,
+        )
+
+        await alarm.maybe_check()
+        assert len(_warnings(caplog)) == 1
+
+        clock.now += 300
+        await alarm.maybe_check()
+        assert len(_warnings(caplog)) == 1
+
+        clock.now += 3300
+        await alarm.maybe_check()
+        assert len(_warnings(caplog)) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_failed_check_still_consumes_the_interval(self, tmp_path, caplog):
+        caplog.set_level(logging.WARNING, logger=_ALARM_LOGGER)
+        clock = _FakeClock()
+        alarm = JournalGrowthAlarm(
+            WriteJournal(tmp_path / 'never_initialized'),
+            WriteJournalGrowthAlarmConfig(check_interval_seconds=3600),
+            project_root=None,
+            clock=clock,
+        )
+
+        await alarm.maybe_check()
+        clock.now += 300
+        await alarm.maybe_check()
+        assert len(_errors(caplog)) == 1
+
+        clock.now += 3300
+        await alarm.maybe_check()
+        assert len(_errors(caplog)) == 2
