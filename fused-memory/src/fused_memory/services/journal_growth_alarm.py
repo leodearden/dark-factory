@@ -9,11 +9,21 @@ lives in the ``write_journal_growth_alarm`` block of
 
 from __future__ import annotations
 
+import logging
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 
 from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
-from fused_memory.services.write_journal import JournalGrowthSample
+from fused_memory.services.write_journal import JournalGrowthSample, WriteJournal
+
+logger = logging.getLogger(__name__)
+
+#: The insert-rate ceiling is per day, so the sample window is the trailing day.
+_INSERT_WINDOW = timedelta(days=1)
+_GIB = 2**30
 
 
 class JournalCeiling(Enum):
@@ -40,3 +50,48 @@ def find_breaches(
         for ceiling, measured, limit in measurements
         if measured > limit
     )
+
+
+def describe_breach(breach: JournalGrowthBreach, sample: JournalGrowthSample) -> str:
+    """The one-line account of *breach*: the WARNING text and the escalation summary."""
+    size = (
+        f'{sample.file_bytes:,} B ({sample.file_bytes / _GIB:.2f} GiB, '
+        f'{sample.free_bytes:,} B free)'
+    )
+    if breach.ceiling is JournalCeiling.FILE_SIZE:
+        return f'write_journal.db is {size}, over its file-size ceiling of {breach.limit:,} B'
+    return (
+        f'write_journal.db took {breach.measured:,} inserts in the trailing 24 h, '
+        f'over its ceiling of {breach.limit:,}/day; the file is {size}'
+    )
+
+
+class JournalGrowthAlarm:
+    def __init__(
+        self,
+        journal: WriteJournal,
+        config: WriteJournalGrowthAlarmConfig,
+        *,
+        project_root: str | None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._journal = journal
+        self._config = config
+        self._project_root = project_root
+        self._clock = clock
+
+    async def check(self) -> tuple[JournalGrowthBreach, ...]:
+        """Sample the journal and WARN once per crossed ceiling. Never raises."""
+        try:
+            sample = await self._journal.growth_sample(
+                since=datetime.now(UTC) - _INSERT_WINDOW
+            )
+        except Exception:
+            logger.exception(
+                'write_journal growth alarm: sampling failed; no growth check this cycle'
+            )
+            return ()
+        breaches = find_breaches(sample, self._config)
+        for breach in breaches:
+            logger.warning('write_journal growth alarm: %s', describe_breach(breach, sample))
+        return breaches
