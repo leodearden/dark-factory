@@ -1247,10 +1247,12 @@ def build_method(
     synthesis_calls: int,
     probe_calls: int,
     wall_clock_secs: float,
+    verify_normalisations: Mapping[str, int],
 ) -> dict[str, Any]:
     """The JSON-safe ``## Method`` block: the seven keys of the
     quality-findings contract §5, then ``extra``
-    (plans/census-incremental-prd.md §4.3). *selection* is ``None`` for a
+    (plans/census-incremental-prd.md §4.3), which carries
+    *verify_normalisations*: the verdict repairs per kind (§4.4). *selection* is ``None`` for a
     run with no mining window, which nulls the evidence and ledger fields it
     would have supplied; an unreadable ledger counts ``ledger_rows`` and
     ``ledger_pruned`` as ``None``, never 0."""
@@ -1271,7 +1273,11 @@ def build_method(
             "wall_clock_secs": wall_clock_secs,
         },
         "inputs_consumed": [],
-        "extra": {"inputs_consumed_note": _INPUTS_CONSUMED_NOTE, **_ledger_extra(selection)},
+        "extra": {
+            "inputs_consumed_note": _INPUTS_CONSUMED_NOTE,
+            **_ledger_extra(selection),
+            "verify_normalisations": dict(verify_normalisations),
+        },
     }
 
 
@@ -2081,18 +2087,6 @@ def _ensure_output_parents(*paths) -> None:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
-_VALID_ENTRY_SEVERITIES = ("high", "medium", "low")
-"""codebook.py's own ``_ENTRY_SCHEMA["severity"]`` enum, duplicated here
-since codebook.py is NOT modified by this module (see the module
-docstring's "Codebook handling" section). ``run_census`` clamps an
-untrusted verify_fn-returned cluster's severity to this closed set before
-it ever reaches ``codebook.validate()`` -- an out-of-enum value (e.g. an
-escalation-style ``"critical"``/``"urgent"``, valid elsewhere in this
-codebase but NOT in the codebook's own severity enum) would otherwise fail
-validation deep into the pipeline, after mining/verify/synthesis work is
-already spent (reviewer_comprehensive finding #3)."""
-
-
 @dataclass
 class CensusOutcome:
     """Outcome of ``run_census``. ``status`` is ``"deferred"`` (a headroom
@@ -2420,11 +2414,11 @@ def run_census(
     here) -> ``compute_matrix``/``render_matrix`` over verified sightings ->
     merge every mining record via ``codebook.apply_coding_record`` -> apply
     ``promote_candidate``/``reject_candidate`` for verified/rejected
-    clusters (resolved to the merge's real candidate ids by title, severity
-    clamped to the codebook's own enum -- an untrusted out-of-enum severity
-    from *verify_fn* would otherwise fail ``codebook.validate`` deep into
-    the pipeline) and ``retire_entry`` for any entry ids *verify_fn*
-    reports fixed -> ``codebook.validate`` (raises and aborts BEFORE
+    clusters (resolved to the merge's real candidate ids by title; a
+    promoted entry takes the cluster Verdict's severity and severity_reason,
+    and a verified cluster *verify_fn* returned without a Verdict gets the
+    verdict parser's defaults) and ``retire_entry`` for any entry ids
+    *verify_fn* reports fixed -> ``codebook.validate`` (raises and aborts BEFORE
     anything is written, on an invalid merge) -> the singleton filing gate
     (``_split_fileable``: a verified cluster files only with an in-tree
     remediation or a recurrence, counted in the merged codebook; a withheld
@@ -2700,9 +2694,16 @@ def run_census(
     reported_probes = verify_result.get("headroom_probes")
     probe_count[0] += reported_probes if isinstance(reported_probes, int) else 0
 
-    verified = verify_result.get("verified") or []
+    verified = _verified_with_verdicts(
+        verify_result.get("verified") or [], project_root=project_root,
+    )
     rejected = verify_result.get("rejected") or []
     fixed_entry_ids = verify_result.get("fixed") or []
+    verify_normalisations = verdict_mod.count_normalisations(
+        cluster["verdict"]
+        for cluster in (*verified, *rejected)
+        if isinstance(cluster.get("verdict"), verdict_mod.Verdict)
+    )
 
     # DETECTOR for a systemic verifier failure. Scoping the subprocess cwd
     # removed one CAUSE of the 2026-08-03 silent mass rejection; it is not a
@@ -2810,18 +2811,12 @@ def run_census(
                 contradicting_disposition="rejected",
             ))
             continue
-        severity = cluster.get("severity")
-        if severity not in _VALID_ENTRY_SEVERITIES:
-            if severity is not None:
-                logger.warning(
-                    "census: cluster %r carries out-of-enum severity %r; "
-                    "clamping to 'medium'", cluster.get("title"), severity,
-                )
-            severity = "medium"
+        found = cluster["verdict"]
         entry_fields = {
             "id": f"entry-{cand_id}",
             "title": cluster.get("title"),
-            "severity": severity,
+            "severity": found.severity,
+            "severity_reason": found.severity_reason,
             "status": "open",
             "origin_phase": cluster.get("origin_phase") or "unknown",
             "manifested_phase": cluster.get("manifested_phase") or "unknown",
@@ -3013,6 +3008,7 @@ def run_census(
         synthesis_calls=1,
         probe_calls=probe_count[0],
         wall_clock_secs=round(time.monotonic() - started, 3),
+        verify_normalisations=verify_normalisations,
     )
     record = build_census_record(
         method=method,
@@ -3305,6 +3301,38 @@ def _log_verdict_normalisations(title, found: verdict_mod.Verdict) -> None:
             "census: verdict for cluster %r normalised (%s): offered %s, used %r",
             title, note.kind.value, note.offered, note.used,
         )
+
+
+def _verdict_of(cluster: dict, *, project_root: str) -> verdict_mod.Verdict:
+    """*cluster*'s Verdict, else the verdict parser's defaults for a bare
+    verified reply: normalised, logged and counted like any other verdict."""
+    found = cluster.get("verdict")
+    if isinstance(found, verdict_mod.Verdict):
+        return found
+    defaulted = verdict_mod.parse_verdict(
+        {"verified": True}, title=cluster.get("title") or "", project_root=project_root,
+    )
+    _log_verdict_normalisations(cluster.get("title"), defaulted)
+    return defaulted
+
+
+def _verified_with_verdicts(verified: list, *, project_root: str) -> list[dict]:
+    """*verified*, every cluster carrying a Verdict (``_verdict_of``)."""
+    verdictless = [
+        cluster.get("title")
+        for cluster in verified
+        if not isinstance(cluster.get("verdict"), verdict_mod.Verdict)
+    ]
+    if verdictless:
+        logger.warning(
+            "census: %d verified cluster(s) arrived without a verdict; promoting "
+            "them on the verdict parser's defaults: %s",
+            len(verdictless), verdictless,
+        )
+    return [
+        {**cluster, "verdict": _verdict_of(cluster, project_root=project_root)}
+        for cluster in verified
+    ]
 
 
 def _build_default_verify_fn(

@@ -2409,6 +2409,24 @@ def test_run_census_defers_at_verify_boundary_when_cap_arrives_after_preflight(
 _IN_TREE_REMEDIATION = {"path": "docs/fixture.md", "change": "fixture remediation"}
 
 
+def _fake_verdict(remediation):
+    """The verdict.Verdict the real verifier attaches to a verified cluster,
+    as a fake verifier states it: no normalisation, severity medium."""
+    found = None if remediation is None else verdict.Remediation(
+        remediation["path"], remediation["change"],
+    )
+    return verdict.Verdict(
+        verified=True,
+        reason="fake verifier",
+        anchor="slug:fake-verdict" if found is None else found.path,
+        tags=("h13", verdict.KIND_TAG),
+        severity=verdict.DEFAULT_SEVERITY,
+        severity_reason="fake verifier",
+        route=verdict.Route.STRUCTURAL if found is None else verdict.Route.MECHANICAL,
+        remediation=found,
+    )
+
+
 def _make_fake_verify_fn(
     *, verified_titles=(), rejected_titles=(), fixed_entry_ids=(),
     remediation=_IN_TREE_REMEDIATION,
@@ -2419,15 +2437,20 @@ def _make_fake_verify_fn(
     retire_entry path independently of any particular cluster. Records
     every call's (clusters, model, result) in `.calls`.
 
-    Each VERIFIED cluster comes back as a new dict carrying *remediation*,
-    as the real verifier's in-tree proposal would: run_census files a
-    single-sighting cluster only when it has one (filing_policy.is_fileable),
-    so without it every "was it filed" assertion here would be vacuous.
-    Pass remediation=None to model an unremediated verdict."""
+    Each VERIFIED cluster comes back as a new dict carrying its Verdict and
+    *remediation*, as the real verifier's in-tree proposal would: run_census
+    files a single-sighting cluster only when it has one
+    (filing_policy.is_fileable), so without it every "was it filed" assertion
+    here would be vacuous. Pass remediation=None to model an unremediated
+    verdict."""
     calls = []
 
     def fake_verify_fn(clusters, *, model):
-        verified = [c for c in clusters if c.get("title") in verified_titles]
+        verified = [
+            {**c, "verdict": _fake_verdict(remediation)}
+            for c in clusters
+            if c.get("title") in verified_titles
+        ]
         if remediation is not None:
             verified = [{**c, "remediation": remediation} for c in verified]
         result = {
