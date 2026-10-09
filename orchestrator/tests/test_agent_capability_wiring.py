@@ -23,7 +23,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler
+from _workflow_helpers import FakeBriefing, FakeMcp, FakeScheduler, fixed_prompt
 
 from orchestrator.agents.invoke import AgentResult
 from orchestrator.config import GitConfig, OrchestratorConfig
@@ -369,7 +369,7 @@ async def _invoke_probe(role, config, git_ops, task_assignment, mcp=None):
         new_callable=AsyncMock,
         return_value=AgentResult(success=True, output=''),
     ) as mock_cap_retry:
-        await workflow._invoke(role, 'PROMPT', cwd)
+        await workflow._invoke(role, fixed_prompt('PROMPT'), cwd)
 
     assert mock_cap_retry.await_count == 1, 'invoke_with_cap_retry must be called once'
     assert mock_cap_retry.await_args is not None, 'await_args must be set after one await'

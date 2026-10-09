@@ -25,6 +25,7 @@ from _workflow_helpers import (
     FakeScheduler,
     _make_resolving_steward,
     _make_status_setting_steward,
+    fixed_prompt,
     same_module_siblings,
 )
 from escalation.models import Escalation
@@ -1294,7 +1295,7 @@ class TestRealPromptPassedToCliInvokeOnResume:
             new_callable=AsyncMock,
             return_value=AgentResult(success=True, output=''),
         ) as mock_cap_retry:
-            await workflow._invoke(IMPLEMENTER, 'REAL TASK PROMPT', cwd)
+            await workflow._invoke(IMPLEMENTER, fixed_prompt('REAL TASK PROMPT'), cwd)
 
         assert mock_cap_retry.await_count == 1, 'invoke_with_cap_retry must be called once'
         assert mock_cap_retry.await_args is not None, 'await_args must not be None'
@@ -1353,7 +1354,7 @@ class TestStartupGraceSecsReachesWatchdog:
             new_callable=AsyncMock,
             return_value=AgentResult(success=True, output=''),
         ) as mock_cap_retry:
-            await workflow._invoke(IMPLEMENTER, 'PROMPT', cwd)
+            await workflow._invoke(IMPLEMENTER, fixed_prompt('PROMPT'), cwd)
 
         assert mock_cap_retry.await_count == 1, 'invoke_with_cap_retry must be called once'
         assert mock_cap_retry.await_args is not None, 'await_args must be set after one await'

@@ -79,6 +79,7 @@ from _workflow_helpers import (
     _make,
     _make_review,
     _make_warmlane_workflow,
+    fixed_prompt,
 )
 from escalation.models import Escalation
 from escalation.queue import EscalationQueue
@@ -1853,7 +1854,7 @@ async def _invoke_probe(
         new_callable=AsyncMock,
         return_value=AgentResult(success=True, output=''),
     ) as mock_cap_retry:
-        await workflow._invoke(role, 'PROMPT', cwd)
+        await workflow._invoke(role, fixed_prompt('PROMPT'), cwd)
 
     assert mock_cap_retry.await_count == 1, 'invoke_with_cap_retry must be called once'
     assert mock_cap_retry.await_args is not None

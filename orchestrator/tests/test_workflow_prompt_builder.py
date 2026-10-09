@@ -154,14 +154,16 @@ class TestRetryIsBriefedFromTheLivePlan:
         wf = _make_workflow(tmp_path)
         _write_two_step_plan(wf)
         _stub_loop_collaborators(wf)
+        artifacts = wf.artifacts
+        assert artifacts is not None
         prompts: list[str] = []
 
         async def agent(**kwargs):
             prompts.append(kwargs['prompt'])
             if len(prompts) == 1:
-                plan = wf.artifacts.read_plan()
+                plan = artifacts.read_plan()
                 plan['analysis'] = 'MUTATED-ANALYSIS'
-                wf.artifacts.write_plan(plan)
+                artifacts.write_plan(plan)
                 return _cap_hit_fresh()
             _mark_done(wf, 'step-1', 'step-2')
             return _success()
@@ -214,6 +216,7 @@ class TestRetryOfFinishedWorkIsCancelled:
 
         assert inv.await_count == 1
         assert outcome == WorkflowOutcome.DONE
+        assert wf.artifacts is not None
         entries, _corrupted = wf.artifacts.read_iteration_log()
         implementer = [e for e in entries if e.get('agent') == 'implementer']
         assert implementer[-1]['steps_completed'] == ['step-1', 'step-2']
@@ -266,11 +269,14 @@ class TestCallSiteBuildersReGatherThePlan:
         wf.artifacts.validate_plan_owner = MagicMock(return_value=True)  # type: ignore[method-assign]
         wf.briefing.build_amender_prompt = AsyncMock(return_value='amend please')
 
+        artifacts = wf.artifacts
+        assert artifacts is not None
+
         async def fake_invoke(role, build_prompt, cwd, output_schema=None):
             await build_prompt()
-            plan = wf.artifacts.read_plan()
+            plan = artifacts.read_plan()
             plan['analysis'] = 'REWRITTEN-ANALYSIS'
-            wf.artifacts.write_plan(plan)
+            artifacts.write_plan(plan)
             await build_prompt()
             return _success()
 

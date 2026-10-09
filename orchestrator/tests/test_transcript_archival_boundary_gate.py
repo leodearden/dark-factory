@@ -62,6 +62,7 @@ from _workflow_helpers import (
     _make_git_ops,
     _make_transcript_workflow,
     _write_transcript,
+    fixed_prompt,
 )
 from shared.transcript_archive import _archival_failures, _reset_archival_failures
 
@@ -174,7 +175,7 @@ async def _producer_invoke(
         new_callable=AsyncMock,
         side_effect=_side_effect,
     ):
-        result = await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+        result = await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
     return result, captured['sid'], captured['src']
 

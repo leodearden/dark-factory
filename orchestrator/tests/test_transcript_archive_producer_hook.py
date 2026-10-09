@@ -31,6 +31,7 @@ from _workflow_helpers import (
     _init_transcript_repo,
     _make_git_ops,
     _make_transcript_workflow,
+    fixed_prompt,
 )
 
 from orchestrator.agents.invoke import AgentResult
@@ -94,7 +95,7 @@ class TestProducerHook:
             new_callable=AsyncMock,
             side_effect=_side_effect,
         ):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         sid = workflow._last_invoke_session_id
         assert sid is not None
@@ -114,7 +115,7 @@ class TestProducerHook:
             new_callable=AsyncMock,
             return_value=AgentResult(success=True, output=''),
         ):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         mock_helper.assert_not_called()
 
@@ -130,7 +131,7 @@ class TestProducerHook:
             new_callable=AsyncMock,
             return_value=AgentResult(success=True, output=''),
         ):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         assert workflow._config_dir is not None
         mock_helper.assert_called_once_with(
@@ -166,7 +167,7 @@ class TestProducerHook:
         ):
             # Must NOT raise RuntimeError out of the finally — _invoke returns
             # its result normally and the hook logs+swallows the archival error.
-            result = await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            result = await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         assert result.success is True
         mock_helper.assert_called_once()
@@ -195,7 +196,7 @@ class TestProducerHook:
             new_callable=AsyncMock,
             return_value=AgentResult(success=True, output=''),
         ), pytest.raises(asyncio.CancelledError):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
 
 @pytest.mark.asyncio
@@ -427,7 +428,7 @@ class TestProducerHookIsUncancellable:
             new_callable=AsyncMock,
             side_effect=self._writes_then(workflow, payload, _boom),
         ), pytest.raises(asyncio.CancelledError):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         sid = workflow._last_invoke_session_id
         assert sid is not None
@@ -460,7 +461,7 @@ class TestProducerHookIsUncancellable:
             side_effect=self._writes_then(workflow, payload, lambda: AgentResult(
                 success=True, output='')),
         ):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         sid = workflow._last_invoke_session_id
         assert sid is not None
@@ -488,7 +489,7 @@ class TestProducerHookIsUncancellable:
             side_effect=self._writes_then(workflow, payload, lambda: AgentResult(
                 success=True, output='')),
         ):
-            await workflow._invoke(SIMPLE_TASK, 'p', cwd)
+            await workflow._invoke(SIMPLE_TASK, fixed_prompt('p'), cwd)
 
         assert workflow._config_dir is not None
         sid = workflow._last_invoke_session_id
