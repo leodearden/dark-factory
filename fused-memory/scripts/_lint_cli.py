@@ -1,53 +1,26 @@
 """The CLI and pragma contract shared by the fused-memory/scripts/check_*.py lints.
 
-Each checker owns its rule logic, its rule code(s), its description and the globs
-a directory argument expands to.  This module owns everything else, once:
+A checker supplies its rule (``find_violations``, emitting ``Violation``), its
+description and its ``discover`` callable; ``run_cli`` owns the rest.
 
-  * ``Violation`` -- the one record type every checker emits.
-  * The exemption pragma.  ``# noqa: <code> — <reason>`` on the nearest PRECEDING
-    non-blank line exempts the node below it (``is_exempted``).  An em-dash or one
-    or more ASCII hyphens separate the code from the reason, and the reason is
-    mandatory: an unexplained suppression is not a suppression.  An inline
-    trailing ``# noqa`` on the node's own line is deliberately NOT honoured, so a
-    suppression always reads as a statement about the code below it.  Pragmas are
-    keyed on the rule's own code (``exemption_pattern``) and codes are strictly
-    separate: rules' remedies are unrelated, so a pragma written for one is not
-    informed consent for another.  One grammar for every rule means an author
-    learns it once.
-  * The CLI driver (``run_cli``).  Paths are files or directories; a directory
-    expands through the checker's globs (``discover_files``) while an explicit
-    file is taken as given, because hooks/project-checks hands over staged files
-    as-is.  A missing explicit path fails fast before anything is read.  A read
-    failure on one file (OSError, or undecodable bytes) is reported on stderr
-    without discarding violations found in other files.  Violations print to
-    stdout as ``path:lineno:col: message`` (ruff-style), sorted across files by
-    (filename, lineno, col_offset): ``ast.walk`` is breadth-first, so a checker's
-    own emission order is not source order.
-  * The exit ladder: 0 clean, 1 violations found, 2 fatal (a missing explicit
-    path or any read failure, which outranks violations).
+Pragma: ``# noqa: <code> — <reason>`` on the nearest PRECEDING non-blank line
+exempts the node below it.  The separator is an em-dash or ASCII hyphens, the
+reason is mandatory, an inline trailing pragma is not honoured, and a pragma
+exempts only its own code.
 
-STDLIB ONLY.  hooks/project-checks runs the checkers with plain ``python3`` to
-avoid uv environment resolution, and their suites prove it under
-``python3 -I -S``.  A third-party import here would break every checker at once.
+Output: ``path:lineno:col: message`` on stdout, sorted by (path, lineno, col).
+Exit codes: 0 clean, 1 violations found, 2 a missing explicit path or any read
+failure.
 
-HOW A CHECKER IMPORTS THIS MODULE::
+Stdlib only, because hooks/project-checks runs the checkers with plain
+``python3``.  A checker imports this module through this bootstrap, which works
+under ``python3 -I`` and leaves ``sys.path`` as it found it::
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
         from _lint_cli import ...
     finally:
         del sys.path[0]
-
-A plain sibling import is not enough.  ``python3 -I`` implies ``-P``, and
-``-P`` / ``PYTHONSAFEPATH`` drop the script's own directory from ``sys.path``, so
-``from _lint_cli import ...`` fails with ModuleNotFoundError under the ``-I -S``
-proofs.  Tests load a checker in-process by file path, with fused-memory/scripts
-deliberately off ``sys.path``, and the import would fail there too.  Restoring
-``sys.path`` in ``finally`` keeps scripts/ off it for those in-process loads,
-while the module stays registered in ``sys.modules`` as ``_lint_cli``.  Ruff's
-E402 exempts ``sys.path`` edits, so the bootstrap needs no suppression.
-
-This module is imported, never run.
 """
 from __future__ import annotations
 
@@ -117,16 +90,17 @@ def run_cli(
 ) -> int:
     """Run a checker over the paths in *argv* and return its exit code.
 
-    Directories expand through *discover*; explicit files are taken as given.  Every collected file, explicit or discovered, must pass
-    *is_scannable* before it is read.  See the module docstring for the output
-    and exit-code contract.
+    Directories expand through *discover*; explicit files are taken as given.
+    Every collected file, explicit or discovered, must pass *is_scannable*
+    before it is read.  See the module docstring for the output and exit-code
+    contract.
     """
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument('paths', nargs='+', help='Files or directories to check')
     args = parser.parse_args(argv)
 
-    # Phase 1: discovery.  Glob results exist at discovery time, so only explicit
-    # paths need the existence check, and it completes before anything is read.
+    # Phase 1: discovery.  Discovered files exist, so only explicit paths need the
+    # existence check, and it completes before anything is read.
     files_to_scan: list[Path] = []
     for path_str in args.paths:
         p = Path(path_str)
