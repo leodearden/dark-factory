@@ -14,6 +14,7 @@ introduced for the plan-files-not-touched architect-narrowing retry.
 from __future__ import annotations
 
 import re
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -25,6 +26,7 @@ from _briefing_helpers import (
     briefing,  # noqa: F401 — re-export: pytest fixture used by test methods
     memory_transport,
 )
+from _role_splice_contract import assert_nonempty
 from shared.capability_manifest import DeliveredCheckMeta
 from test_roles_ancestry_check import _tool_is_granted
 
@@ -34,7 +36,7 @@ from orchestrator.agents.briefing import (
     _format_delivered_checks,
 )
 from orchestrator.agents.memory_recall import MEMORY_CONTEXT_CAVEAT
-from orchestrator.agents.roles import ARCHITECT
+from orchestrator.agents.roles import ARCHITECT, ARCHITECT_PLAN_TOOLS_RECIPE, ROLES
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.mcp import plan_tools
 
@@ -725,6 +727,98 @@ class TestBuildPlanCompletionPrompt:
     async def test_includes_agent_identity(self, briefing: BriefingAssembler):
         prompt = await self._build(briefing)
         assert 'claude-task-3822-architect' in prompt
+
+
+_RECIPE_CALL_SIGNATURE = re.compile(r'`(\w+\([^`)]+\))`')
+
+
+def _recipe_call_signatures() -> list[str]:
+    """Every backticked call with arguments that the plan-tools recipe spells."""
+    signatures = _RECIPE_CALL_SIGNATURE.findall(ARCHITECT_PLAN_TOOLS_RECIPE)
+    assert signatures, (
+        'ARCHITECT_PLAN_TOOLS_RECIPE spells no backticked call signature with '
+        'arguments, which makes every exactly-once count below vacuous — either '
+        'the recipe stopped spelling its tool signatures or '
+        '_RECIPE_CALL_SIGNATURE no longer matches how it spells them.'
+    )
+    return signatures
+
+
+_SPOT_TASK = {
+    'id': '5532',
+    'title': 'Recipe single-home task',
+    'description': 'A task whose briefing renders every optional architect section.',
+    'metadata': {
+        'dry_run_proposals': [
+            {
+                'proposal_text': 'Root cause is a stale cache entry; fix by invalidating on write.',
+                'risk_label': 'medium',
+                'files_referenced': ['orchestrator/x.py'],
+                'timestamp': '2026-07-13T10:00:00+00:00',
+                'investigated_at': '2026-07-13T10:00:00+00:00',
+            },
+        ],
+    },
+}
+
+_SPOT_COMMITTED_WORK = [{'sha': 'a' * 40, 'subject': 'feat: an earlier attempt'}]
+
+_ARCHITECT_DISPATCHES: dict[str, Callable[[BriefingAssembler], Awaitable[str]]] = {
+    'fresh': lambda b: b.build_architect_prompt(_SPOT_TASK, context=''),
+    'fresh_with_optional_sections': lambda b: b.build_architect_prompt(
+        _SPOT_TASK,
+        context='',
+        include_prior_proposals=True,
+        committed_work=_SPOT_COMMITTED_WORK,
+    ),
+}
+
+
+class TestArchitectPlanToolsRecipeSingleHome:
+    """Every ARCHITECT dispatch spells each plan-tools recipe signature once.
+
+    The dispatched prompt is ``ARCHITECT.system_prompt`` plus the briefing.
+    ``_ARCHITECT_DISPATCHES`` is hand-maintained to match workflow.py's
+    ``_invoke(ARCHITECT, ...)`` sites; that pairing is not machine-checked.
+    """
+
+    def test_recipe_reaches_only_the_architect_exactly_once(self) -> None:
+        assert_nonempty(
+            'ARCHITECT_PLAN_TOOLS_RECIPE',
+            ARCHITECT_PLAN_TOOLS_RECIPE,
+            remedy='Restore the plan-tools call recipe in '
+            'roles.py::ARCHITECT_PLAN_TOOLS_RECIPE.',
+        )
+        reached = [
+            name for name, role in ROLES.items()
+            if ARCHITECT_PLAN_TOOLS_RECIPE in role.system_prompt
+        ]
+        assert reached == ['architect'], (
+            f'ARCHITECT_PLAN_TOOLS_RECIPE reaches roles {reached}; it is the '
+            "architect's recipe and belongs in ARCHITECT.system_prompt alone."
+        )
+        assert ARCHITECT.system_prompt.count(ARCHITECT_PLAN_TOOLS_RECIPE) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('dispatch', sorted(_ARCHITECT_DISPATCHES))
+    async def test_dispatch_spells_each_recipe_signature_exactly_once(
+        self, briefing: BriefingAssembler, dispatch: str,
+    ) -> None:
+        dispatched = ARCHITECT.system_prompt + await _ARCHITECT_DISPATCHES[dispatch](briefing)
+        miscounted = {
+            sig: dispatched.count(sig)
+            for sig in _recipe_call_signatures()
+            if dispatched.count(sig) != 1
+        }
+        assert not miscounted, (
+            f'The {dispatch!r} architect dispatch spells these plan-tools recipe '
+            f'signatures other than exactly once: {miscounted}. The recipe has '
+            'one home, roles.py::ARCHITECT_PLAN_TOOLS_RECIPE, which '
+            'ARCHITECT.system_prompt carries into every architect dispatch. A '
+            'briefing that re-spells a recipe signature shows the architect a '
+            'second recipe that can drift from the first (task 5532). Name the '
+            'tool without its signature, `tool(...)`, or point at the recipe.'
+        )
 
 
 @pytest.mark.asyncio
