@@ -533,6 +533,45 @@ if the pipeline is still sick. So a halt you find with an already-expired
 cooldown is about to clear itself on the next ~5s tick — in that one window a
 manual trigger IS consumed, and the tool says so.
 
+### Is the curator deduping, or just creating?
+
+The ticket janitor files a dedup-outage escalation when a window shows that
+the curator is creating tasks with no LLM judgement, so semantic dedup is off.
+The escalation is `infra_issue` / `blocking`, from agent role
+`fused-memory/ticket-janitor` with task id `task-curator`. Its summary reads
+`curator dedup outage signature for project …`. It means that in the last
+`curator.janitor.dedup_outage.window_seconds`, N tickets resolved, ZERO were
+combined, and the median resolve was at or below `max_median_resolve_seconds`.
+That latency is faster than any real model call.
+
+- **First look.** The escalation detail's `top_create_reasons` names the path
+  directly: `create: llm-failed: …`,
+  `create: curator-unavailable: construction-failed: <ExcType>`,
+  `create: zero-output-breaker-open`, and so on. Then look for task 4448's
+  `curator_consecutive_degraded` escalation from `fused-memory/task-curator`.
+  If it is absent while this one fires, suspect the `curator-unavailable` path,
+  where no curator exists to count its own failures.
+- **Corroborate.** First check whether, and when, the curator last really
+  called the model, by role (`task_curator`, `task_curator_batch`; the same
+  rows appear in the dashboard **Costs** tab):
+
+      sqlite3 -readonly data/reconciliation/curator_events.db "SELECT role, COUNT(*), MAX(completed_at) FROM invocations WHERE completed_at >= strftime('%Y-%m-%dT%H:%M:%S','now','-1 day') GROUP BY role;"
+
+  Then check the signature itself, created vs combined per day, with mean
+  resolve seconds:
+
+      sqlite3 -readonly data/reconciliation/tickets.db "SELECT substr(resolved_at,1,10) d, SUM(status='created'), SUM(status='combined'), ROUND(AVG((julianday(resolved_at)-julianday(created_at))*86400.0),1) FROM tickets WHERE resolved_at >= date('now','-7 days') AND status IN ('created','combined') GROUP BY d;"
+
+  A missing CLI binary raises before any call is recorded. So no
+  `invocations` rows next to a steady ticket rate is itself the signal.
+- **It does not fire during an all-accounts-capped period, by design.** Capped
+  tickets wait, so their latency rises. Caps show in `get_curator_state` and on
+  the dashboard. A project filing fewer than `min_samples` tickets per window
+  is below the detector's floor.
+
+Incident, back-test and residual risks:
+[`plans/curator-dedup-outage-2026-08-15-rca.md`](plans/curator-dedup-outage-2026-08-15-rca.md).
+
 ---
 
 ## 5. Unblocking work
