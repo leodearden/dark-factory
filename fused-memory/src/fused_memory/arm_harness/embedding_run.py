@@ -125,7 +125,9 @@ async def run_embedding_arm(
 ) -> EmbeddingRunManifest:
     arm = _require_embedding_spec(spec, embedder)
     pre_run = await asyncio.to_thread(require_pre_run_checks, arm, repo_root)
-    probe_set, snapshot = _require_runnable(arm, probe_set_path, mem0_snapshot, run_dir)
+    probe_set, snapshot = await asyncio.to_thread(
+        _require_runnable, arm, probe_set_path, mem0_snapshot, run_dir
+    )
     await _require_no_stale_scratch(arm, graph_client, qdrant)
     started_at = datetime.now(UTC)
     graph = await run_graph_phase(arm, probe_set, graph_client, backend, embedder, sleep=sleep)

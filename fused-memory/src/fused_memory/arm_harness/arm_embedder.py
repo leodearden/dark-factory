@@ -240,7 +240,11 @@ async def _latency_or_none(
     async with gate:
         try:
             _, latency_ms = await embedder.embed_query(query)
-        except Exception:
+        except Exception as error:
+            logger.warning(
+                'arm %r: a timed query failed and counts against the latency envelope (%s)',
+                embedder.spec.arm_id, type(error).__name__,
+            )
             return None
     return latency_ms
 
