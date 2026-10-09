@@ -1,0 +1,4669 @@
+{
+  "measured_at": "2026-10-08T19:11:28Z",
+  "mcp_url": "http://127.0.0.1:8002/mcp",
+  "registry": [
+    "autopilot_video",
+    "autotrade",
+    "dark_factory",
+    "know_live",
+    "mission_control",
+    "pump_web_ui",
+    "reify",
+    "scoping_intake",
+    "solar_challenge",
+    "solar_challenge_platform"
+  ],
+  "listed_graphs": [
+    "_probe",
+    "_probe4748b_05facdc0",
+    "_probe4748b_078c407e",
+    "_probe4748b_0cac8e8c",
+    "_probe4748b_0d84d7e7",
+    "_probe4748b_0e9cfe64",
+    "_probe4748b_172e77ce",
+    "_probe4748b_1d29fd71",
+    "_probe4748b_1fe61018",
+    "_probe4748b_228bd143",
+    "_probe4748b_29f34a51",
+    "_probe4748b_2b18cf8a",
+    "_probe4748b_2bfb5d75",
+    "_probe4748b_35b0cf78",
+    "_probe4748b_39714d49",
+    "_probe4748b_3d293f2c",
+    "_probe4748b_3ec6d8fb",
+    "_probe4748b_44b07b89",
+    "_probe4748b_47ba51a0",
+    "_probe4748b_4eac5211",
+    "_probe4748b_5196db87",
+    "_probe4748b_5607aa43",
+    "_probe4748b_5b8b056d",
+    "_probe4748b_66e1cc22",
+    "_probe4748b_690d82b1",
+    "_probe4748b_6a5a79cc",
+    "_probe4748b_71697c7b",
+    "_probe4748b_720f4507",
+    "_probe4748b_775bce31",
+    "_probe4748b_789e4685",
+    "_probe4748b_7949d20c",
+    "_probe4748b_7d5f5e98",
+    "_probe4748b_7dd492f8",
+    "_probe4748b_7eace8ae",
+    "_probe4748b_896a512c",
+    "_probe4748b_8a9b830e",
+    "_probe4748b_8c1d6a18",
+    "_probe4748b_8c9a071d",
+    "_probe4748b_8ef3e0d5",
+    "_probe4748b_8f6ea14b",
+    "_probe4748b_948c64b7",
+    "_probe4748b_95e14d0e",
+    "_probe4748b_96de5cec",
+    "_probe4748b_98e10aa3",
+    "_probe4748b_9d73c769",
+    "_probe4748b_9fc39c13",
+    "_probe4748b_a5f05a3c",
+    "_probe4748b_a7eacc85",
+    "_probe4748b_b3b9e0ed",
+    "_probe4748b_b4cc69f9",
+    "_probe4748b_bbd3e6b1",
+    "_probe4748b_c4cbf419",
+    "_probe4748b_c570635d",
+    "_probe4748b_c5a6b2f1",
+    "_probe4748b_c7e61172",
+    "_probe4748b_c8d11a40",
+    "_probe4748b_ce08daac",
+    "_probe4748b_cf02c6c1",
+    "_probe4748b_d053647d",
+    "_probe4748b_d292792c",
+    "_probe4748b_d2f6142c",
+    "_probe4748b_ddd9f470",
+    "_probe4748b_df819e21",
+    "_probe4748b_e08547e3",
+    "_probe4748b_e0ace169",
+    "_probe4748b_e3d67ee8",
+    "_probe4748b_e746d515",
+    "_probe4748b_e87896c9",
+    "_probe4748b_e914e7f6",
+    "_probe4748b_e966d28d",
+    "_probe4748b_e9db5dae",
+    "_probe4748b_f0ba912f",
+    "_probe4748b_f261131c",
+    "_probe4748b_f3c479da",
+    "_probe4748b_f663feeb",
+    "_probe4748b_f6cc3945",
+    "_probe4748b_f7807c4b",
+    "_probe4748b_f7bf2208",
+    "_probe4748b_f90ca768",
+    "_probe4748b_ff0bf517",
+    "_probe4748b_ff7d6b11",
+    "_test_2207_merge_entities_01473628",
+    "_test_2207_merge_entities_2f5e7021",
+    "_test_3334_falkor_fulltext_0cae32c2",
+    "_test_3334_falkor_fulltext_12743642",
+    "_test_3334_falkor_fulltext_24fd19f0",
+    "_test_3334_falkor_fulltext_2783b9ce",
+    "_test_3334_falkor_fulltext_3d800556",
+    "_test_3334_falkor_fulltext_55112d0b",
+    "_test_3334_falkor_fulltext_5bba0573",
+    "_test_3334_falkor_fulltext_67538eda",
+    "_test_3334_falkor_fulltext_6d41ada8",
+    "_test_3334_falkor_fulltext_71ae8b50",
+    "_test_3334_falkor_fulltext_77be9ed5",
+    "_test_3334_falkor_fulltext_81cd620c",
+    "_test_3334_falkor_fulltext_85115513",
+    "_test_3334_falkor_fulltext_856a499a",
+    "_test_3334_falkor_fulltext_8db27420",
+    "_test_3334_falkor_fulltext_9ea592e8",
+    "_test_3334_falkor_fulltext_9f2dba04",
+    "_test_3334_falkor_fulltext_a02a3461",
+    "_test_3334_falkor_fulltext_cd128b75",
+    "_test_3334_falkor_fulltext_d1baa216",
+    "_test_3334_falkor_fulltext_eb3d6de4",
+    "_test_3334_falkor_fulltext_ecb7aa9e",
+    "_test_3334_falkor_fulltext_f5ffa481",
+    "_test_3334_falkor_fulltext_f9da8f29",
+    "_test_3769_drop_vector_indices_39efa17b",
+    "_test_3769_drop_vector_indices_a8a78625",
+    "_test_4340_read_pagination_03b38704",
+    "_test_4340_read_pagination_17dfc32c",
+    "_test_4340_read_pagination_ced80ff8",
+    "_test_530_list_indices_integration_7ea892b5",
+    "_test_530_list_indices_integration_84e3d3d0",
+    "_test_530_list_indices_integration_92a86ca6",
+    "autopilot_video",
+    "dark_factory",
+    "evalmem_lme_ref_incumbent_a",
+    "evalmem_test_359416b1",
+    "evalmem_test_4b3170b5",
+    "know_live",
+    "knowlive",
+    "probe_e1_gw0",
+    "probe_e1_gw1",
+    "probe_e1_gw10",
+    "probe_e1_gw11",
+    "probe_e1_gw12",
+    "probe_e1_gw13",
+    "probe_e1_gw14",
+    "probe_e1_gw15",
+    "probe_e1_gw16",
+    "probe_e1_gw17",
+    "probe_e1_gw18",
+    "probe_e1_gw19",
+    "probe_e1_gw2",
+    "probe_e1_gw20",
+    "probe_e1_gw21",
+    "probe_e1_gw22",
+    "probe_e1_gw23",
+    "probe_e1_gw24",
+    "probe_e1_gw25",
+    "probe_e1_gw26",
+    "probe_e1_gw27",
+    "probe_e1_gw28",
+    "probe_e1_gw29",
+    "probe_e1_gw3",
+    "probe_e1_gw4",
+    "probe_e1_gw5",
+    "probe_e1_gw6",
+    "probe_e1_gw7",
+    "probe_e1_gw8",
+    "probe_e1_gw9",
+    "probe_e1_master",
+    "pump_web_ui",
+    "reify",
+    "scoping_intake",
+    "solar_challenge",
+    "solar_challenge_platform",
+    "sweep_e4_gw0",
+    "sweep_e4_gw1",
+    "sweep_e4_gw2"
+  ],
+  "expected_index_set": [
+    [
+      "Community",
+      "NODE",
+      "group_id",
+      "FULLTEXT"
+    ],
+    [
+      "Community",
+      "NODE",
+      "name",
+      "FULLTEXT"
+    ],
+    [
+      "Community",
+      "NODE",
+      "uuid",
+      "RANGE"
+    ],
+    [
+      "Entity",
+      "NODE",
+      "created_at",
+      "RANGE"
+    ],
+    [
+      "Entity",
+      "NODE",
+      "group_id",
+      "FULLTEXT"
+    ],
+    [
+      "Entity",
+      "NODE",
+      "group_id",
+      "RANGE"
+    ],
+    [
+      "Entity",
+      "NODE",
+      "name",
+      "FULLTEXT"
+    ],
+    [
+      "Entity",
+      "NODE",
+      "name",
+      "RANGE"
+    ],
+    [
+      "Entity",
+      "NODE",
+      "summary",
+      "FULLTEXT"
+    ],
+    [
+      "Entity",
+      "NODE",
+      "uuid",
+      "RANGE"
+    ],
+    [
+      "Episodic",
+      "NODE",
+      "content",
+      "FULLTEXT"
+    ],
+    [
+      "Episodic",
+      "NODE",
+      "created_at",
+      "RANGE"
+    ],
+    [
+      "Episodic",
+      "NODE",
+      "group_id",
+      "FULLTEXT"
+    ],
+    [
+      "Episodic",
+      "NODE",
+      "group_id",
+      "RANGE"
+    ],
+    [
+      "Episodic",
+      "NODE",
+      "source",
+      "FULLTEXT"
+    ],
+    [
+      "Episodic",
+      "NODE",
+      "source_description",
+      "FULLTEXT"
+    ],
+    [
+      "Episodic",
+      "NODE",
+      "uuid",
+      "RANGE"
+    ],
+    [
+      "Episodic",
+      "NODE",
+      "valid_at",
+      "RANGE"
+    ],
+    [
+      "HAS_EPISODE",
+      "RELATIONSHIP",
+      "group_id",
+      "RANGE"
+    ],
+    [
+      "HAS_EPISODE",
+      "RELATIONSHIP",
+      "uuid",
+      "RANGE"
+    ],
+    [
+      "HAS_MEMBER",
+      "RELATIONSHIP",
+      "uuid",
+      "RANGE"
+    ],
+    [
+      "MENTIONS",
+      "RELATIONSHIP",
+      "group_id",
+      "RANGE"
+    ],
+    [
+      "MENTIONS",
+      "RELATIONSHIP",
+      "uuid",
+      "RANGE"
+    ],
+    [
+      "NEXT_EPISODE",
+      "RELATIONSHIP",
+      "group_id",
+      "RANGE"
+    ],
+    [
+      "NEXT_EPISODE",
+      "RELATIONSHIP",
+      "uuid",
+      "RANGE"
+    ],
+    [
+      "RELATES_TO",
+      "RELATIONSHIP",
+      "created_at",
+      "RANGE"
+    ],
+    [
+      "RELATES_TO",
+      "RELATIONSHIP",
+      "expired_at",
+      "RANGE"
+    ],
+    [
+      "RELATES_TO",
+      "RELATIONSHIP",
+      "fact",
+      "FULLTEXT"
+    ],
+    [
+      "RELATES_TO",
+      "RELATIONSHIP",
+      "group_id",
+      "FULLTEXT"
+    ],
+    [
+      "RELATES_TO",
+      "RELATIONSHIP",
+      "group_id",
+      "RANGE"
+    ],
+    [
+      "RELATES_TO",
+      "RELATIONSHIP",
+      "invalid_at",
+      "RANGE"
+    ],
+    [
+      "RELATES_TO",
+      "RELATIONSHIP",
+      "name",
+      "FULLTEXT"
+    ],
+    [
+      "RELATES_TO",
+      "RELATIONSHIP",
+      "name",
+      "RANGE"
+    ],
+    [
+      "RELATES_TO",
+      "RELATIONSHIP",
+      "uuid",
+      "RANGE"
+    ],
+    [
+      "RELATES_TO",
+      "RELATIONSHIP",
+      "valid_at",
+      "RANGE"
+    ],
+    [
+      "Saga",
+      "NODE",
+      "group_id",
+      "RANGE"
+    ],
+    [
+      "Saga",
+      "NODE",
+      "name",
+      "RANGE"
+    ],
+    [
+      "Saga",
+      "NODE",
+      "uuid",
+      "RANGE"
+    ]
+  ],
+  "index_statuses": [
+    {
+      "group_id": "autopilot_video",
+      "present": true,
+      "expected_total": 38,
+      "actual": [
+        [
+          "Community",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Community",
+          "NODE",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "Community",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "name",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "summary",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "content",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "source",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "source_description",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "valid_at",
+          "RANGE"
+        ],
+        [
+          "HAS_EPISODE",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "HAS_EPISODE",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "HAS_MEMBER",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "MENTIONS",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "MENTIONS",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "NEXT_EPISODE",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "NEXT_EPISODE",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "expired_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "fact",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "invalid_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "name",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "valid_at",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "name",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ]
+      ],
+      "missing": [],
+      "unexpected": [],
+      "unsettled": [],
+      "complete": true
+    },
+    {
+      "group_id": "autotrade",
+      "present": false,
+      "expected_total": 38,
+      "actual": [],
+      "missing": [],
+      "unexpected": [],
+      "unsettled": [],
+      "complete": false
+    },
+    {
+      "group_id": "dark_factory",
+      "present": true,
+      "expected_total": 38,
+      "actual": [
+        [
+          "Community",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Community",
+          "NODE",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "Community",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "name",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "summary",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "content",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "source",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "source_description",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "valid_at",
+          "RANGE"
+        ],
+        [
+          "HAS_EPISODE",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "HAS_EPISODE",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "HAS_MEMBER",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "MENTIONS",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "MENTIONS",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "NEXT_EPISODE",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "NEXT_EPISODE",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "expired_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "fact",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "invalid_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "name",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "valid_at",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "name",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ]
+      ],
+      "missing": [],
+      "unexpected": [],
+      "unsettled": [],
+      "complete": true
+    },
+    {
+      "group_id": "know_live",
+      "present": true,
+      "expected_total": 38,
+      "actual": [
+        [
+          "Community",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Community",
+          "NODE",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "Community",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "name",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "summary",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "content",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "source",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "source_description",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "valid_at",
+          "RANGE"
+        ],
+        [
+          "HAS_EPISODE",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "HAS_EPISODE",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "HAS_MEMBER",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "MENTIONS",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "MENTIONS",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "NEXT_EPISODE",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "NEXT_EPISODE",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "expired_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "fact",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "invalid_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "name",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "valid_at",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "name",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ]
+      ],
+      "missing": [],
+      "unexpected": [],
+      "unsettled": [],
+      "complete": true
+    },
+    {
+      "group_id": "mission_control",
+      "present": false,
+      "expected_total": 38,
+      "actual": [],
+      "missing": [],
+      "unexpected": [],
+      "unsettled": [],
+      "complete": false
+    },
+    {
+      "group_id": "pump_web_ui",
+      "present": true,
+      "expected_total": 38,
+      "actual": [
+        [
+          "Community",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Community",
+          "NODE",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "Community",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "name",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "summary",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "content",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "source",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "source_description",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "valid_at",
+          "RANGE"
+        ],
+        [
+          "HAS_EPISODE",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "HAS_EPISODE",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "HAS_MEMBER",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "MENTIONS",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "MENTIONS",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "NEXT_EPISODE",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "NEXT_EPISODE",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "expired_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "fact",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "invalid_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "name",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "valid_at",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "name",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ]
+      ],
+      "missing": [],
+      "unexpected": [],
+      "unsettled": [],
+      "complete": true
+    },
+    {
+      "group_id": "reify",
+      "present": true,
+      "expected_total": 38,
+      "actual": [
+        [
+          "Community",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Community",
+          "NODE",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "Community",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "name",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "summary",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "content",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "source",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "source_description",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "valid_at",
+          "RANGE"
+        ],
+        [
+          "HAS_EPISODE",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "HAS_EPISODE",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "HAS_MEMBER",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "MENTIONS",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "MENTIONS",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "NEXT_EPISODE",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "NEXT_EPISODE",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "expired_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "fact",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "invalid_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "name",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "valid_at",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "name",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ]
+      ],
+      "missing": [],
+      "unexpected": [],
+      "unsettled": [],
+      "complete": true
+    },
+    {
+      "group_id": "scoping_intake",
+      "present": true,
+      "expected_total": 38,
+      "actual": [
+        [
+          "Community",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Community",
+          "NODE",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "Community",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "name",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "summary",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "content",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "source",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "source_description",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "valid_at",
+          "RANGE"
+        ],
+        [
+          "HAS_EPISODE",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "HAS_EPISODE",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "HAS_MEMBER",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "MENTIONS",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "MENTIONS",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "NEXT_EPISODE",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "NEXT_EPISODE",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "expired_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "fact",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "invalid_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "name",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "valid_at",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "name",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ]
+      ],
+      "missing": [],
+      "unexpected": [],
+      "unsettled": [],
+      "complete": true
+    },
+    {
+      "group_id": "solar_challenge",
+      "present": true,
+      "expected_total": 38,
+      "actual": [
+        [
+          "Community",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Community",
+          "NODE",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "Community",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "name",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "summary",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "content",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "source",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "source_description",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "valid_at",
+          "RANGE"
+        ],
+        [
+          "HAS_EPISODE",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "HAS_EPISODE",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "HAS_MEMBER",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "MENTIONS",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "MENTIONS",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "NEXT_EPISODE",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "NEXT_EPISODE",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "expired_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "fact",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "invalid_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "name",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "valid_at",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "name",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ]
+      ],
+      "missing": [],
+      "unexpected": [],
+      "unsettled": [],
+      "complete": true
+    },
+    {
+      "group_id": "solar_challenge_platform",
+      "present": true,
+      "expected_total": 38,
+      "actual": [
+        [
+          "Community",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Community",
+          "NODE",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "Community",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "name",
+          "RANGE"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "summary",
+          "FULLTEXT"
+        ],
+        [
+          "Entity",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "content",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "source",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "source_description",
+          "FULLTEXT"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "Episodic",
+          "NODE",
+          "valid_at",
+          "RANGE"
+        ],
+        [
+          "HAS_EPISODE",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "HAS_EPISODE",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "HAS_MEMBER",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "MENTIONS",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "MENTIONS",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "NEXT_EPISODE",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "NEXT_EPISODE",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "created_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "expired_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "fact",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "group_id",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "invalid_at",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "name",
+          "FULLTEXT"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "name",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "uuid",
+          "RANGE"
+        ],
+        [
+          "RELATES_TO",
+          "RELATIONSHIP",
+          "valid_at",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "group_id",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "name",
+          "RANGE"
+        ],
+        [
+          "Saga",
+          "NODE",
+          "uuid",
+          "RANGE"
+        ]
+      ],
+      "missing": [],
+      "unexpected": [],
+      "unsettled": [],
+      "complete": true
+    }
+  ],
+  "e1_preflight": {
+    "dup_uuid_groups": [
+      {
+        "group_id": "_probe",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_05facdc0",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_078c407e",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_0cac8e8c",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_0d84d7e7",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_0e9cfe64",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_172e77ce",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_1d29fd71",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_1fe61018",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_228bd143",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_29f34a51",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_2b18cf8a",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_2bfb5d75",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_35b0cf78",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_39714d49",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_3d293f2c",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_3ec6d8fb",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_44b07b89",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_47ba51a0",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_4eac5211",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_5196db87",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_5607aa43",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_5b8b056d",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_66e1cc22",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_690d82b1",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_6a5a79cc",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_71697c7b",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_720f4507",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_775bce31",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_789e4685",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_7949d20c",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_7d5f5e98",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_7dd492f8",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_7eace8ae",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_896a512c",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_8a9b830e",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_8c1d6a18",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_8c9a071d",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_8ef3e0d5",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_8f6ea14b",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_948c64b7",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_95e14d0e",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_96de5cec",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_98e10aa3",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_9d73c769",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_9fc39c13",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_a5f05a3c",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_a7eacc85",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_b3b9e0ed",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_b4cc69f9",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_bbd3e6b1",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_c4cbf419",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_c570635d",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_c5a6b2f1",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_c7e61172",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_c8d11a40",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_ce08daac",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_cf02c6c1",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_d053647d",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_d292792c",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_d2f6142c",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_ddd9f470",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_df819e21",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_e08547e3",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_e0ace169",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_e3d67ee8",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_e746d515",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_e87896c9",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_e914e7f6",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_e966d28d",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_e9db5dae",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_f0ba912f",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_f261131c",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_f3c479da",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_f663feeb",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_f6cc3945",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_f7807c4b",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_f7bf2208",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_f90ca768",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_ff0bf517",
+        "groups": 0
+      },
+      {
+        "group_id": "_probe4748b_ff7d6b11",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_2207_merge_entities_01473628",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_2207_merge_entities_2f5e7021",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_0cae32c2",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_12743642",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_24fd19f0",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_2783b9ce",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_3d800556",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_55112d0b",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_5bba0573",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_67538eda",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_6d41ada8",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_71ae8b50",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_77be9ed5",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_81cd620c",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_85115513",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_856a499a",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_8db27420",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_9ea592e8",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_9f2dba04",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_a02a3461",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_cd128b75",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_d1baa216",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_eb3d6de4",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_ecb7aa9e",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_f5ffa481",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3334_falkor_fulltext_f9da8f29",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3769_drop_vector_indices_39efa17b",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_3769_drop_vector_indices_a8a78625",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_4340_read_pagination_03b38704",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_4340_read_pagination_17dfc32c",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_4340_read_pagination_ced80ff8",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_530_list_indices_integration_7ea892b5",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_530_list_indices_integration_84e3d3d0",
+        "groups": 0
+      },
+      {
+        "group_id": "_test_530_list_indices_integration_92a86ca6",
+        "groups": 0
+      },
+      {
+        "group_id": "autopilot_video",
+        "groups": 0
+      },
+      {
+        "group_id": "dark_factory",
+        "groups": 0
+      },
+      {
+        "group_id": "evalmem_lme_ref_incumbent_a",
+        "groups": 0
+      },
+      {
+        "group_id": "evalmem_test_359416b1",
+        "groups": 0
+      },
+      {
+        "group_id": "evalmem_test_4b3170b5",
+        "groups": 0
+      },
+      {
+        "group_id": "know_live",
+        "groups": 0
+      },
+      {
+        "group_id": "knowlive",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw0",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw1",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw10",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw11",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw12",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw13",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw14",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw15",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw16",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw17",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw18",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw19",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw2",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw20",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw21",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw22",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw23",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw24",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw25",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw26",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw27",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw28",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw29",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw3",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw4",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw5",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw6",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw7",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw8",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_gw9",
+        "groups": 0
+      },
+      {
+        "group_id": "probe_e1_master",
+        "groups": 0
+      },
+      {
+        "group_id": "pump_web_ui",
+        "groups": 0
+      },
+      {
+        "group_id": "reify",
+        "groups": 0
+      },
+      {
+        "group_id": "scoping_intake",
+        "groups": 0
+      },
+      {
+        "group_id": "solar_challenge",
+        "groups": 0
+      },
+      {
+        "group_id": "solar_challenge_platform",
+        "groups": 0
+      },
+      {
+        "group_id": "sweep_e4_gw0",
+        "groups": 0
+      },
+      {
+        "group_id": "sweep_e4_gw1",
+        "groups": 0
+      },
+      {
+        "group_id": "sweep_e4_gw2",
+        "groups": 0
+      }
+    ],
+    "incomplete_graphs": [],
+    "maintenance_noop": true
+  },
+  "replacements": [
+    {
+      "anchor": "877",
+      "chosen": "876",
+      "examined": [
+        {
+          "task_id": "876",
+          "edges": [
+            {
+              "uuid": "2bc575da-0650-46e4-ad94-b10b5d0251f9",
+              "fact": "The DONE early-return becomes redundant when task #876 lands.",
+              "invalid_at": "2026-04-21T23:03:17.542237+00:00",
+              "expired_at": "2026-04-21T23:03:30.271553+00:00"
+            },
+            {
+              "uuid": "1273ee6f-faf9-4a61-8dc5-60f152cd17cf",
+              "fact": "The architectural fix is fused-memory task #876.",
+              "invalid_at": "2026-04-25T06:52:23.615552+00:00",
+              "expired_at": "2026-04-25T06:52:39.990871+00:00"
+            },
+            {
+              "uuid": "001ab3d9-d6fa-4c35-98d3-1ff3d7d23735",
+              "fact": "Task #876 landed (commit 6ed46027a4cd33f1be4d5058c2f6f81b997c5d96, 2026-04-23). workflow.run now has an explicit recovery path: 'branch already on main → DONE' recovery moved out of _mark_blocked into workflow.run, separating escalation creation from opportunistic recovery.",
+              "invalid_at": "2026-04-26T09:07:27.836311+00:00",
+              "expired_at": "2026-04-26T09:07:53.017696+00:00"
+            },
+            {
+              "uuid": "2e327d97-ceee-407f-aa8c-03c7501a7e25",
+              "fact": "fused-memory task #876 moves the ghost-loop recovery out of _mark_blocked.",
+              "invalid_at": "2026-04-21T23:03:17.542237+00:00",
+              "expired_at": "2026-04-21T23:03:30.271550+00:00"
+            },
+            {
+              "uuid": "2a964b2c-dce5-4c82-b323-728161efb396",
+              "fact": "Task 876 will further make the DONE early-return redundant by moving ghost-loop recovery out of _mark_blocked.",
+              "invalid_at": null,
+              "expired_at": null
+            },
+            {
+              "uuid": "60e41c10-63a9-4435-b0a5-c58ee4089918",
+              "fact": "Stage 2 task_knowledge_sync must re-run task tree review for task 876 once the bug is fixed.",
+              "invalid_at": "2026-04-23T20:00:00+00:00",
+              "expired_at": null
+            },
+            {
+              "uuid": "54814224-7b85-4dda-8752-73766a590209",
+              "fact": "Task 876 was completed on 2026-04-23 via commit 6ed46027a4cd33f1be4d5058c2f6f81b997c5d96.",
+              "invalid_at": null,
+              "expired_at": null
+            },
+            {
+              "uuid": "5abce8fe-87a1-40dd-8db9-b032aeaeb2fb",
+              "fact": "Stage 2 task_knowledge_sync has been blind to the empty-tree regression for 7 consecutive cycles (latest: cycle 8072eff5, 2026-04-23 evening). Active Task Tree consistently returns 0 tasks despite Taskmaster containing 900+ tasks and active task transitions (events confirm tasks 941, 934, 953, 939, 952, 919, 876 completed in latest cycle). Root cause unresolved.",
+              "invalid_at": "2026-04-23T19:56:50.339528+00:00",
+              "expired_at": "2026-04-23T19:57:01.038599+00:00"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "anchor": "3600",
+      "chosen": "3591",
+      "examined": [
+        {
+          "task_id": "3599",
+          "edges": []
+        },
+        {
+          "task_id": "3601",
+          "edges": []
+        },
+        {
+          "task_id": "3598",
+          "edges": []
+        },
+        {
+          "task_id": "3602",
+          "edges": []
+        },
+        {
+          "task_id": "3597",
+          "edges": [
+            {
+              "uuid": "1ea2f92a-f1ff-4fc1-982c-7013009a4143",
+              "fact": "The fixture LOAD_FLAKE_MAIN_RESULT is re-shaped to a complete session for the esc-3514-2 shape task 3597.",
+              "invalid_at": null,
+              "expired_at": "2026-10-04T10:53:27.641768+00:00"
+            },
+            {
+              "uuid": "0de76eb1-12d9-425b-a4b8-caaf97acb657",
+              "fact": "Task 3597's ground truth is based on the aborted run identified as esc-3514-2.",
+              "invalid_at": null,
+              "expired_at": "2026-10-05T07:52:03.721445+00:00"
+            }
+          ]
+        },
+        {
+          "task_id": "3603",
+          "edges": []
+        },
+        {
+          "task_id": "3596",
+          "edges": [
+            {
+              "uuid": "3b13d5d5-4457-465d-8c5c-b286d00bab54",
+              "fact": "Task 3596 resolves the value of DashboardConfig.project_root.default_factory in the context of the current working directory.",
+              "invalid_at": null,
+              "expired_at": null
+            }
+          ]
+        },
+        {
+          "task_id": "3604",
+          "edges": [
+            {
+              "uuid": "49bcd96d-26e8-4b2b-a0bb-c1b7a07757c9",
+              "fact": "The reify-3604 issue was fixed in dark-factory main on 2026-05-27.",
+              "invalid_at": "2026-05-27T11:13:08.163169+00:00",
+              "expired_at": "2026-05-27T13:48:16.445260+00:00"
+            }
+          ]
+        },
+        {
+          "task_id": "3595",
+          "edges": []
+        },
+        {
+          "task_id": "3605",
+          "edges": []
+        },
+        {
+          "task_id": "3594",
+          "edges": []
+        },
+        {
+          "task_id": "3606",
+          "edges": []
+        },
+        {
+          "task_id": "3593",
+          "edges": []
+        },
+        {
+          "task_id": "3607",
+          "edges": []
+        },
+        {
+          "task_id": "3592",
+          "edges": [
+            {
+              "uuid": "afb8a6a4-288b-4d42-a6c7-cc978da7fdf7",
+              "fact": "Task 3592 exceeded the steward lifetime budget cap.",
+              "invalid_at": null,
+              "expired_at": "2026-09-23T16:23:32.743300+00:00"
+            }
+          ]
+        },
+        {
+          "task_id": "3608",
+          "edges": []
+        },
+        {
+          "task_id": "3591",
+          "edges": [
+            {
+              "uuid": "b307e638-e274-4d7d-8eb4-734a16c60099",
+              "fact": "Task 3446's unwritten detector was split into its own task, task 3591.",
+              "invalid_at": null,
+              "expired_at": null
+            },
+            {
+              "uuid": "dd0bd78d-7237-4535-8928-d17f3b204773",
+              "fact": "Task 3591 carries the recovery recipe that task 3446 lacked, including tickets.db.candidate_json.",
+              "invalid_at": null,
+              "expired_at": null
+            },
+            {
+              "uuid": "b80fb370-48c2-4907-8044-2339e9fab332",
+              "fact": "Task 3591 carries the recovery recipe that task 3446 lacked, including the fidelity bound.",
+              "invalid_at": null,
+              "expired_at": null
+            },
+            {
+              "uuid": "ea59e4d4-f5c8-45cb-9912-5a136d61d2f3",
+              "fact": "Task 3591 carries the recovery recipe that task 3446 lacked, including rank-by-consumer output guidance.",
+              "invalid_at": null,
+              "expired_at": null
+            },
+            {
+              "uuid": "db88155f-d505-438a-991d-23d072b84c0f",
+              "fact": "Task 3591 carries the recovery recipe that task 3446 lacked, including the planning_mode/PRD coverage gap.",
+              "invalid_at": null,
+              "expired_at": "2026-09-09T15:42:52.912485+00:00"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "original_id_counts": [
+    {
+      "task_id": "877",
+      "edges": [
+        {
+          "uuid": "38241d9e-76f1-4f2d-92c7-7249b3db95a1",
+          "fact": "AllAccountsCappedException catch sites added in production orchestrator via task 877 (commit 371d476388d7c4f10de53bace256566ef97078c4, 2026-04-22). Previously had no catch sites as of 2026-04-21.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "bba24b78-a708-4de0-9481-7a6cb07eab61",
+          "fact": "AllAccountsCappedException catch sites added in fused-memory via task 877 (commit 371d476388d7c4f10de53bace256566ef97078c4, 2026-04-22). Previously had no catch sites as of 2026-04-21.",
+          "invalid_at": null,
+          "expired_at": "2026-07-28T15:37:21.328598+00:00"
+        },
+        {
+          "uuid": "5bf20c42-3abd-411d-8dcd-b887d3c602a2",
+          "fact": "Task 877 adds catch sites for AllAccountsCappedException in fused-memory.",
+          "invalid_at": "2026-04-21T09:08:40.249226+00:00",
+          "expired_at": "2026-04-21T09:08:49.643721+00:00"
+        },
+        {
+          "uuid": "4acfcebd-62d8-4d1b-a75c-7fbcb6b840e8",
+          "fact": "Task 877 (Add catch sites for AllAccountsCappedException in orchestrator and fused-memory) was moved from blocked to pending on 2026-04-22T02:07:49Z; it had been incorrectly blocked with no recorded reason. Its prerequisite Task 881 (Replace UsageGate.raise_if_all_capped pattern) was completed on 2026-04-21.",
+          "invalid_at": "2026-04-22T05:56:30.718975+00:00",
+          "expired_at": "2026-04-22T05:56:39.198343+00:00"
+        },
+        {
+          "uuid": "5d8b1c36-f295-41fe-ab9a-46d15aaaa66b",
+          "fact": "Only Task 877 addresses the missing catch sites for AllAccountsCappedException.",
+          "invalid_at": "2026-04-21T09:08:40.249226+00:00",
+          "expired_at": "2026-04-21T09:08:49.643726+00:00"
+        },
+        {
+          "uuid": "1330ec7b-a3b3-4adc-90e0-eb17fc3fb345",
+          "fact": "Task 877 was previously blocked but is now actionable since prerequisite Task 881 was already complete.",
+          "invalid_at": "2026-04-22T10:35:02.011146+00:00",
+          "expired_at": "2026-04-22T10:35:18.901069+00:00"
+        },
+        {
+          "uuid": "8813cc31-327f-4e3b-ac62-6e5dc6c6d7de",
+          "fact": "In the decision to unblock workflow, the user chose option 2 of 3 regarding task 877.",
+          "invalid_at": "2026-04-26T09:07:27.836311+00:00",
+          "expired_at": "2026-04-26T09:07:53.017705+00:00"
+        },
+        {
+          "uuid": "dbf74612-6e1d-44ea-b14c-0f48ea5fbabc",
+          "fact": "The FIRST id is chosen from drifted id 877 based on the replacement rule.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "f0465663-6398-449f-801b-bab00e424cf8",
+          "fact": "The 877 ranking observation was filed by the architect as tkt_0RVJFNZTMNA6N1HE3CR9VPZ2M9.",
+          "invalid_at": null,
+          "expired_at": null
+        }
+      ]
+    },
+    {
+      "task_id": "2286",
+      "edges": [
+        {
+          "uuid": "85ce18f3-f3eb-4852-b160-74ee4928afb5",
+          "fact": "Task 2286 is awaiting a verify retry on main.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "1296c54d-ac1e-4ace-9d99-a4fcb9795daf",
+          "fact": "Task 2286 is blocked due to the orchestrator xdist worker-crash verify flake.",
+          "invalid_at": "2026-08-18T17:28:52.609978+00:00",
+          "expired_at": "2026-07-14T11:19:47.408991+00:00"
+        },
+        {
+          "uuid": "53888255-4d91-402f-bb27-07342aad2872",
+          "fact": "Task 2335 should escalate/redispatch if Live-Workflow Signals remain cold, similar to what was done for tasks 2293 and 2286.",
+          "invalid_at": null,
+          "expired_at": "2026-07-10T01:34:32.229142+00:00"
+        },
+        {
+          "uuid": "30cd69ce-0612-45b6-b9f6-78bb6a7db4d0",
+          "fact": "Tasks 2335 and 2286 show live-workflow signals according to the Live-Workflow Authority policy.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "356e34f0-1c74-417d-ba36-51f371924764",
+          "fact": "Task 2408 addresses the stranded_task_redispatch_gap pattern observed in tasks 2293, 2335, and 2286.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "83563afa-6d61-495b-99c3-3a2d1545667b",
+          "fact": "Task 3127 is mentioned in the context of tasks 2293 and 2286.",
+          "invalid_at": null,
+          "expired_at": null
+        }
+      ]
+    },
+    {
+      "task_id": "3127",
+      "edges": [
+        {
+          "uuid": "f4d5a839-725a-4d7b-a8ca-1e4b84f7d9a9",
+          "fact": "Declaring `task:3129` while citing `Task 3127` creates a conflict.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "6866b896-6833-4d6c-b660-b50b0dbb1b95",
+          "fact": "The chain 3197 -> 3129 -> 3127 -> 3128 -> 3169 flip gate cannot be shortened by turning the existing REJECT guard up.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "83563afa-6d61-495b-99c3-3a2d1545667b",
+          "fact": "Task 3127 is mentioned in the context of tasks 2293 and 2286.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "7e2c524e-f585-46e6-abf3-3d7d1683b907",
+          "fact": "FalkorDB is referenced in the context of Task 3127.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "f882aad7-cc91-412d-bfda-2b98ffa86fe8",
+          "fact": "task/3711 is mentioned in relation to Task 3127.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "bdfb5021-7e1f-4f98-83e2-05bf2e82780b",
+          "fact": "Task #4856 is mentioned in relation to Task 3127.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "8ceb6a16-ed98-4dc1-a394-b61f688c1aaa",
+          "fact": "Task 1157 is mentioned as 'Task 1157's' in relation to Task 3127.",
+          "invalid_at": null,
+          "expired_at": null
+        }
+      ]
+    },
+    {
+      "task_id": "3600",
+      "edges": [
+        {
+          "uuid": "5fc4a62a-7b27-4649-9dfb-2bb85f37c8ab",
+          "fact": "Moving the orchestrator row to the census p50 raises the fleet floor to 3860.29, exceeding 3600.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "0782117a-f867-4678-8cf7-2e6da906868c",
+          "fact": "Main set verify_command_timeout_secs to 3600 seconds.",
+          "invalid_at": null,
+          "expired_at": "2026-09-12T07:25:03.575603+00:00"
+        },
+        {
+          "uuid": "26a7d98a-f12b-4955-b7f9-8b73d5950345",
+          "fact": "Leo ruled to raise reconciliation.stale_run_recovery_seconds from 1800 to 3600.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "8b7b4c0c-4bc5-42f8-953b-c921a8b24fe3",
+          "fact": "The VALUE was left at 3600 pending Leo's ruling.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "5068ddfb-9e4b-453f-9e22-3eb89c3b4f5e",
+          "fact": "The recon watcher adopts a timeout of 3600 seconds along with an explicit Bash timeout parameter.",
+          "invalid_at": null,
+          "expired_at": "2026-09-26T12:15:23.168003+00:00"
+        },
+        {
+          "uuid": "dd9d55b7-285f-4a86-908b-8b43f6e57df3",
+          "fact": "Task 3350 independently set verify_cold_command_timeout_secs to 3600 seconds.",
+          "invalid_at": null,
+          "expired_at": "2026-10-02T10:41:09.412903+00:00"
+        },
+        {
+          "uuid": "2bb6600b-73d4-4f3d-b0db-33758c2661a5",
+          "fact": "Executing the revert would turn the floor guard RED due to a 3600 ceiling being approximately 0.87 times the honest green path.",
+          "invalid_at": null,
+          "expired_at": "2026-10-04T15:31:19.398720+00:00"
+        },
+        {
+          "uuid": "6165e896-100c-4ff5-af0c-40081c5f122a",
+          "fact": "The lease_max_secs for the dark-factory scheduler is set to 3600.0 seconds.",
+          "invalid_at": null,
+          "expired_at": "2026-10-05T22:43:37.077406+00:00"
+        },
+        {
+          "uuid": "1cb0d138-c83d-4ea4-827d-d95a84a837bc",
+          "fact": "Task 5627 confirms that an isolated re-run belongs to Task 3600.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "850dca24-3de2-4724-ab83-7ee37f1f68fd",
+          "fact": "The FIRST id is chosen from drifted id 3600 based on the replacement rule.",
+          "invalid_at": null,
+          "expired_at": null
+        }
+      ]
+    },
+    {
+      "task_id": "1157",
+      "edges": [
+        {
+          "uuid": "2357cd3b-be94-461d-ae97-e667a9d6b6fc",
+          "fact": "As of 2026-05-10T14:00 UTC, dark_factory completed task 1157, which involved Stage 1 entity_uuid recording.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "d8d60a5b-43a8-4db4-b14f-5c1bb55da981",
+          "fact": "Task-count snapshot as of 2026-05-04 (recon run db9d4f7a): total=1157, done=1051 (90.8%), cancelled=87, pending=15 (1020, 1030, 1135, 1136, 1139, 1142, 1143, 1144, 1145, 1146, 1148, 1149, 1150, 1151, 1152), blocked=2 (1137 deps=1150, 1042 deps=1020), deferred=2 (1147, 1153), in_progress=0. Counts unchanged from prior run 00ad627a. Note: API total includes subtasks; direct tasks.json inspection yields ~1118 top-level tasks (~38-task discrepancy attributable to subtask double-counting).",
+          "invalid_at": "2026-05-06T12:37:22+00:00",
+          "expired_at": null
+        },
+        {
+          "uuid": "0756590a-7b5b-468e-bd16-a02add8207b0",
+          "fact": "As of 2026-05-10T07:28Z, the Dark-factory task-count snapshot indicates that tasks 1157 is pending.",
+          "invalid_at": "2026-05-10T12:02:01+00:00",
+          "expired_at": null
+        },
+        {
+          "uuid": "121e38d9-3df2-45b1-8fb2-edfa848a83ca",
+          "fact": "Task 1157 affects the refresh_entity_summary process when it encounters errors.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "1f4d1fd7-a758-4506-8a63-4e28e6959e6a",
+          "fact": "Task 1157 appends failed entity_uuid to the entity_refresh_failed_uuids list in stats.",
+          "invalid_at": "2026-05-10T14:00:00+00:00",
+          "expired_at": "2026-05-10T14:05:06.031029+00:00"
+        },
+        {
+          "uuid": "2155ac7d-bd2c-4374-bac9-94301d985513",
+          "fact": "Task 1157's fix requires handling NodeNotFoundError during refresh_entity_summary errors.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "c1185c8a-296f-4767-88ca-7d7b6201b826",
+          "fact": "Task 1157 transitioned from pending to in-progress.",
+          "invalid_at": "2026-05-10T13:28:58+00:00",
+          "expired_at": "2026-05-10T14:05:06.032546+00:00"
+        },
+        {
+          "uuid": "4b2c0282-6208-41fa-9a67-b06df570169f",
+          "fact": "Task 1157 was completed via the Stage 1 system prompt.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "8e43b971-3365-4772-b9f3-8b7b1debc57b",
+          "fact": "Task 1157 records the entity_uuid in stats on refresh_entity_summary failure.",
+          "invalid_at": "2026-05-10T14:00:00+00:00",
+          "expired_at": "2026-05-10T14:05:06.357465+00:00"
+        },
+        {
+          "uuid": "997d9754-5fd4-4bf1-9a0f-0dc6c8fe01c3",
+          "fact": "Task 1157 was completed via commit b9a3cdfd117feebf2eaacdc82c029609578e4e44.",
+          "invalid_at": null,
+          "expired_at": null
+        },
+        {
+          "uuid": "3ca250b8-0cdd-4429-a129-5c83176fd909",
+          "fact": "Task 1157 uses the entity_refresh_failed_uuids list to track failed entity_uuid.",
+          "invalid_at": "2026-05-10T14:00:00+00:00",
+          "expired_at": "2026-05-10T14:05:09.024030+00:00"
+        },
+        {
+          "uuid": "8ceb6a16-ed98-4dc1-a394-b61f688c1aaa",
+          "fact": "Task 1157 is mentioned as 'Task 1157's' in relation to Task 3127.",
+          "invalid_at": null,
+          "expired_at": null
+        }
+      ]
+    }
+  ],
+  "asserted_probe": {
+    "template": "task {task_id} context and related decisions",
+    "stores": [
+      "graphiti"
+    ],
+    "limit": 5,
+    "queries": [
+      {
+        "task_id": "876",
+        "query": "task 876 context and related decisions",
+        "degraded": false,
+        "results": [
+          {
+            "id": "b0ead89e-e4e0-44b2-a923-6bd5c2fcaf1b",
+            "source_store": "graphiti",
+            "content": "The decision regarding dark-factory's checkout was verified by rolling back one commit and re-pushing, which is related to dark_factory task 4536.",
+            "invalid_at": null
+          },
+          {
+            "id": "dd0a9fc3-9d09-4af5-be1e-4c191916ffce",
+            "source_store": "graphiti",
+            "content": "Task 3088 is related to decision task 3055.",
+            "invalid_at": null
+          },
+          {
+            "id": "6b5c0138-9057-4dbe-8c2c-6341a2aff2e0",
+            "source_store": "graphiti",
+            "content": "Task 3779's decision was related to the already open question regarding tasks that landed on 2026-08-08, which includes task 3640.",
+            "invalid_at": null
+          },
+          {
+            "id": "54814224-7b85-4dda-8752-73766a590209",
+            "source_store": "graphiti",
+            "content": "Task 876 was completed on 2026-04-23 via commit 6ed46027a4cd33f1be4d5058c2f6f81b997c5d96.",
+            "invalid_at": null
+          },
+          {
+            "id": "7c34a516-5262-41ea-a5f3-118feb513569",
+            "source_store": "graphiti",
+            "content": "Task 3779's decision was related to the already open question regarding tasks that landed on 2026-08-08, which includes task 3717.",
+            "invalid_at": null
+          }
+        ],
+        "hit": true
+      },
+      {
+        "task_id": "2286",
+        "query": "task 2286 context and related decisions",
+        "degraded": false,
+        "results": [
+          {
+            "id": "53888255-4d91-402f-bb27-07342aad2872",
+            "source_store": "graphiti",
+            "content": "Task 2335 should escalate/redispatch if Live-Workflow Signals remain cold, similar to what was done for tasks 2293 and 2286.",
+            "invalid_at": null
+          },
+          {
+            "id": "dd0a9fc3-9d09-4af5-be1e-4c191916ffce",
+            "source_store": "graphiti",
+            "content": "Task 3088 is related to decision task 3055.",
+            "invalid_at": null
+          },
+          {
+            "id": "b0ead89e-e4e0-44b2-a923-6bd5c2fcaf1b",
+            "source_store": "graphiti",
+            "content": "The decision regarding dark-factory's checkout was verified by rolling back one commit and re-pushing, which is related to dark_factory task 4536.",
+            "invalid_at": null
+          },
+          {
+            "id": "c488c908-a2b4-4949-af58-8099fb1b7839",
+            "source_store": "graphiti",
+            "content": "Task 2584 serves as a precedent for resolving task 2585.",
+            "invalid_at": null
+          },
+          {
+            "id": "6b5c0138-9057-4dbe-8c2c-6341a2aff2e0",
+            "source_store": "graphiti",
+            "content": "Task 3779's decision was related to the already open question regarding tasks that landed on 2026-08-08, which includes task 3640.",
+            "invalid_at": null
+          }
+        ],
+        "hit": true
+      },
+      {
+        "task_id": "3127",
+        "query": "task 3127 context and related decisions",
+        "degraded": false,
+        "results": [
+          {
+            "id": "b0ead89e-e4e0-44b2-a923-6bd5c2fcaf1b",
+            "source_store": "graphiti",
+            "content": "The decision regarding dark-factory's checkout was verified by rolling back one commit and re-pushing, which is related to dark_factory task 4536.",
+            "invalid_at": null
+          },
+          {
+            "id": "dd0a9fc3-9d09-4af5-be1e-4c191916ffce",
+            "source_store": "graphiti",
+            "content": "Task 3088 is related to decision task 3055.",
+            "invalid_at": null
+          },
+          {
+            "id": "52698983-2c12-4719-b78b-1f1daa29c963",
+            "source_store": "graphiti",
+            "content": "Task 1431 is related to sentinel.",
+            "invalid_at": null
+          },
+          {
+            "id": "f882aad7-cc91-412d-bfda-2b98ffa86fe8",
+            "source_store": "graphiti",
+            "content": "task/3711 is mentioned in relation to Task 3127.",
+            "invalid_at": null
+          },
+          {
+            "id": "79e8b87b-0604-4271-b2e7-ccc3a6cdb628",
+            "source_store": "graphiti",
+            "content": "Task 4222 is related to the claimant-invariant detection PRD document.",
+            "invalid_at": null
+          }
+        ],
+        "hit": true
+      },
+      {
+        "task_id": "3591",
+        "query": "task 3591 context and related decisions",
+        "degraded": false,
+        "results": [
+          {
+            "id": "b0ead89e-e4e0-44b2-a923-6bd5c2fcaf1b",
+            "source_store": "graphiti",
+            "content": "The decision regarding dark-factory's checkout was verified by rolling back one commit and re-pushing, which is related to dark_factory task 4536.",
+            "invalid_at": null
+          },
+          {
+            "id": "dd0a9fc3-9d09-4af5-be1e-4c191916ffce",
+            "source_store": "graphiti",
+            "content": "Task 3088 is related to decision task 3055.",
+            "invalid_at": null
+          },
+          {
+            "id": "6b5c0138-9057-4dbe-8c2c-6341a2aff2e0",
+            "source_store": "graphiti",
+            "content": "Task 3779's decision was related to the already open question regarding tasks that landed on 2026-08-08, which includes task 3640.",
+            "invalid_at": null
+          },
+          {
+            "id": "52698983-2c12-4719-b78b-1f1daa29c963",
+            "source_store": "graphiti",
+            "content": "Task 1431 is related to sentinel.",
+            "invalid_at": null
+          },
+          {
+            "id": "7c34a516-5262-41ea-a5f3-118feb513569",
+            "source_store": "graphiti",
+            "content": "Task 3779's decision was related to the already open question regarding tasks that landed on 2026-08-08, which includes task 3717.",
+            "invalid_at": null
+          }
+        ],
+        "hit": false
+      },
+      {
+        "task_id": "1157",
+        "query": "task 1157 context and related decisions",
+        "degraded": false,
+        "results": [
+          {
+            "id": "b0ead89e-e4e0-44b2-a923-6bd5c2fcaf1b",
+            "source_store": "graphiti",
+            "content": "The decision regarding dark-factory's checkout was verified by rolling back one commit and re-pushing, which is related to dark_factory task 4536.",
+            "invalid_at": null
+          },
+          {
+            "id": "dd0a9fc3-9d09-4af5-be1e-4c191916ffce",
+            "source_store": "graphiti",
+            "content": "Task 3088 is related to decision task 3055.",
+            "invalid_at": null
+          },
+          {
+            "id": "2155ac7d-bd2c-4374-bac9-94301d985513",
+            "source_store": "graphiti",
+            "content": "Task 1157's fix requires handling NodeNotFoundError during refresh_entity_summary errors.",
+            "invalid_at": null
+          },
+          {
+            "id": "7c34a516-5262-41ea-a5f3-118feb513569",
+            "source_store": "graphiti",
+            "content": "Task 3779's decision was related to the already open question regarding tasks that landed on 2026-08-08, which includes task 3717.",
+            "invalid_at": null
+          },
+          {
+            "id": "997d9754-5fd4-4bf1-9a0f-0dc6c8fe01c3",
+            "source_store": "graphiti",
+            "content": "Task 1157 was completed via commit b9a3cdfd117feebf2eaacdc82c029609578e4e44.",
+            "invalid_at": null
+          }
+        ],
+        "hit": true
+      }
+    ],
+    "verdict": {
+      "hits": 4,
+      "total": 5,
+      "floor": 4,
+      "passed": true,
+      "missed": [
+        "3591"
+      ]
+    }
+  },
+  "original_ids_probe": {
+    "template": "task {task_id} context and related decisions",
+    "stores": [
+      "graphiti"
+    ],
+    "limit": 5,
+    "queries": [
+      {
+        "task_id": "877",
+        "query": "task 877 context and related decisions",
+        "degraded": false,
+        "results": [
+          {
+            "id": "b0ead89e-e4e0-44b2-a923-6bd5c2fcaf1b",
+            "source_store": "graphiti",
+            "content": "The decision regarding dark-factory's checkout was verified by rolling back one commit and re-pushing, which is related to dark_factory task 4536.",
+            "invalid_at": null
+          },
+          {
+            "id": "7c34a516-5262-41ea-a5f3-118feb513569",
+            "source_store": "graphiti",
+            "content": "Task 3779's decision was related to the already open question regarding tasks that landed on 2026-08-08, which includes task 3717.",
+            "invalid_at": null
+          },
+          {
+            "id": "6b5c0138-9057-4dbe-8c2c-6341a2aff2e0",
+            "source_store": "graphiti",
+            "content": "Task 3779's decision was related to the already open question regarding tasks that landed on 2026-08-08, which includes task 3640.",
+            "invalid_at": null
+          },
+          {
+            "id": "79e8b87b-0604-4271-b2e7-ccc3a6cdb628",
+            "source_store": "graphiti",
+            "content": "Task 4222 is related to the claimant-invariant detection PRD document.",
+            "invalid_at": null
+          },
+          {
+            "id": "fdc87d44-6e38-4a2b-bb20-f7b5478813c8",
+            "source_store": "graphiti",
+            "content": "Task 3184 had five records related to L2 escalations that were collapsed into one survivor record.",
+            "invalid_at": null
+          }
+        ],
+        "hit": false
+      },
+      {
+        "task_id": "2286",
+        "query": "task 2286 context and related decisions",
+        "degraded": false,
+        "results": [
+          {
+            "id": "53888255-4d91-402f-bb27-07342aad2872",
+            "source_store": "graphiti",
+            "content": "Task 2335 should escalate/redispatch if Live-Workflow Signals remain cold, similar to what was done for tasks 2293 and 2286.",
+            "invalid_at": null
+          },
+          {
+            "id": "dd0a9fc3-9d09-4af5-be1e-4c191916ffce",
+            "source_store": "graphiti",
+            "content": "Task 3088 is related to decision task 3055.",
+            "invalid_at": null
+          },
+          {
+            "id": "b0ead89e-e4e0-44b2-a923-6bd5c2fcaf1b",
+            "source_store": "graphiti",
+            "content": "The decision regarding dark-factory's checkout was verified by rolling back one commit and re-pushing, which is related to dark_factory task 4536.",
+            "invalid_at": null
+          },
+          {
+            "id": "c488c908-a2b4-4949-af58-8099fb1b7839",
+            "source_store": "graphiti",
+            "content": "Task 2584 serves as a precedent for resolving task 2585.",
+            "invalid_at": null
+          },
+          {
+            "id": "6b5c0138-9057-4dbe-8c2c-6341a2aff2e0",
+            "source_store": "graphiti",
+            "content": "Task 3779's decision was related to the already open question regarding tasks that landed on 2026-08-08, which includes task 3640.",
+            "invalid_at": null
+          }
+        ],
+        "hit": true
+      },
+      {
+        "task_id": "3127",
+        "query": "task 3127 context and related decisions",
+        "degraded": false,
+        "results": [
+          {
+            "id": "b0ead89e-e4e0-44b2-a923-6bd5c2fcaf1b",
+            "source_store": "graphiti",
+            "content": "The decision regarding dark-factory's checkout was verified by rolling back one commit and re-pushing, which is related to dark_factory task 4536.",
+            "invalid_at": null
+          },
+          {
+            "id": "dd0a9fc3-9d09-4af5-be1e-4c191916ffce",
+            "source_store": "graphiti",
+            "content": "Task 3088 is related to decision task 3055.",
+            "invalid_at": null
+          },
+          {
+            "id": "52698983-2c12-4719-b78b-1f1daa29c963",
+            "source_store": "graphiti",
+            "content": "Task 1431 is related to sentinel.",
+            "invalid_at": null
+          },
+          {
+            "id": "f882aad7-cc91-412d-bfda-2b98ffa86fe8",
+            "source_store": "graphiti",
+            "content": "task/3711 is mentioned in relation to Task 3127.",
+            "invalid_at": null
+          },
+          {
+            "id": "79e8b87b-0604-4271-b2e7-ccc3a6cdb628",
+            "source_store": "graphiti",
+            "content": "Task 4222 is related to the claimant-invariant detection PRD document.",
+            "invalid_at": null
+          }
+        ],
+        "hit": true
+      },
+      {
+        "task_id": "3600",
+        "query": "task 3600 context and related decisions",
+        "degraded": false,
+        "results": [
+          {
+            "id": "b0ead89e-e4e0-44b2-a923-6bd5c2fcaf1b",
+            "source_store": "graphiti",
+            "content": "The decision regarding dark-factory's checkout was verified by rolling back one commit and re-pushing, which is related to dark_factory task 4536.",
+            "invalid_at": null
+          },
+          {
+            "id": "dd0a9fc3-9d09-4af5-be1e-4c191916ffce",
+            "source_store": "graphiti",
+            "content": "Task 3088 is related to decision task 3055.",
+            "invalid_at": null
+          },
+          {
+            "id": "6b5c0138-9057-4dbe-8c2c-6341a2aff2e0",
+            "source_store": "graphiti",
+            "content": "Task 3779's decision was related to the already open question regarding tasks that landed on 2026-08-08, which includes task 3640.",
+            "invalid_at": null
+          },
+          {
+            "id": "dd9d55b7-285f-4a86-908b-8b43f6e57df3",
+            "source_store": "graphiti",
+            "content": "Task 3350 independently set verify_cold_command_timeout_secs to 3600 seconds.",
+            "invalid_at": null
+          },
+          {
+            "id": "79e8b87b-0604-4271-b2e7-ccc3a6cdb628",
+            "source_store": "graphiti",
+            "content": "Task 4222 is related to the claimant-invariant detection PRD document.",
+            "invalid_at": null
+          }
+        ],
+        "hit": false
+      },
+      {
+        "task_id": "1157",
+        "query": "task 1157 context and related decisions",
+        "degraded": false,
+        "results": [
+          {
+            "id": "b0ead89e-e4e0-44b2-a923-6bd5c2fcaf1b",
+            "source_store": "graphiti",
+            "content": "The decision regarding dark-factory's checkout was verified by rolling back one commit and re-pushing, which is related to dark_factory task 4536.",
+            "invalid_at": null
+          },
+          {
+            "id": "dd0a9fc3-9d09-4af5-be1e-4c191916ffce",
+            "source_store": "graphiti",
+            "content": "Task 3088 is related to decision task 3055.",
+            "invalid_at": null
+          },
+          {
+            "id": "2155ac7d-bd2c-4374-bac9-94301d985513",
+            "source_store": "graphiti",
+            "content": "Task 1157's fix requires handling NodeNotFoundError during refresh_entity_summary errors.",
+            "invalid_at": null
+          },
+          {
+            "id": "7c34a516-5262-41ea-a5f3-118feb513569",
+            "source_store": "graphiti",
+            "content": "Task 3779's decision was related to the already open question regarding tasks that landed on 2026-08-08, which includes task 3717.",
+            "invalid_at": null
+          },
+          {
+            "id": "997d9754-5fd4-4bf1-9a0f-0dc6c8fe01c3",
+            "source_store": "graphiti",
+            "content": "Task 1157 was completed via commit b9a3cdfd117feebf2eaacdc82c029609578e4e44.",
+            "invalid_at": null
+          }
+        ],
+        "hit": true
+      }
+    ],
+    "verdict": null
+  },
+  "unscoped_probe": {
+    "template": "task {task_id} context and related decisions",
+    "stores": null,
+    "limit": 5,
+    "queries": [
+      {
+        "task_id": "876",
+        "query": "task 876 context and related decisions",
+        "degraded": false,
+        "results": [
+          {
+            "id": "b0ead89e-e4e0-44b2-a923-6bd5c2fcaf1b",
+            "source_store": "graphiti",
+            "content": "The decision regarding dark-factory's checkout was verified by rolling back one commit and re-pushing, which is related to dark_factory task 4536.",
+            "invalid_at": null
+          },
+          {
+            "id": "5e1ee93b-e814-47f3-b60a-0e03d1c269d2",
+            "source_store": "mem0",
+            "content": "Task context is related to task #928",
+            "invalid_at": null
+          },
+          {
+            "id": "dd0a9fc3-9d09-4af5-be1e-4c191916ffce",
+            "source_store": "graphiti",
+            "content": "Task 3088 is related to decision task 3055.",
+            "invalid_at": null
+          },
+          {
+            "id": "ba4f6e27-6bb7-4cc2-98f2-f9a265c75adf",
+            "source_store": "mem0",
+            "content": "Task 835 was created to investigate the substantive issue",
+            "invalid_at": null
+          },
+          {
+            "id": "6b5c0138-9057-4dbe-8c2c-6341a2aff2e0",
+            "source_store": "graphiti",
+            "content": "Task 3779's decision was related to the already open question regarding tasks that landed on 2026-08-08, which includes task 3640.",
+            "invalid_at": null
+          }
+        ],
+        "hit": false
+      },
+      {
+        "task_id": "2286",
+        "query": "task 2286 context and related decisions",
+        "degraded": false,
+        "results": [
+          {
+            "id": "53888255-4d91-402f-bb27-07342aad2872",
+            "source_store": "graphiti",
+            "content": "Task 2335 should escalate/redispatch if Live-Workflow Signals remain cold, similar to what was done for tasks 2293 and 2286.",
+            "invalid_at": null
+          },
+          {
+            "id": "5e1ee93b-e814-47f3-b60a-0e03d1c269d2",
+            "source_store": "mem0",
+            "content": "Task context is related to task #928",
+            "invalid_at": null
+          },
+          {
+            "id": "dd0a9fc3-9d09-4af5-be1e-4c191916ffce",
+            "source_store": "graphiti",
+            "content": "Task 3088 is related to decision task 3055.",
+            "invalid_at": null
+          },
+          {
+            "id": "2056c01e-1bb5-4001-8ee3-d9c17b2cf985",
+            "source_store": "mem0",
+            "content": "Reviewed task 722",
+            "invalid_at": null
+          },
+          {
+            "id": "b0ead89e-e4e0-44b2-a923-6bd5c2fcaf1b",
+            "source_store": "graphiti",
+            "content": "The decision regarding dark-factory's checkout was verified by rolling back one commit and re-pushing, which is related to dark_factory task 4536.",
+            "invalid_at": null
+          }
+        ],
+        "hit": true
+      },
+      {
+        "task_id": "3127",
+        "query": "task 3127 context and related decisions",
+        "degraded": false,
+        "results": [
+          {
+            "id": "b0ead89e-e4e0-44b2-a923-6bd5c2fcaf1b",
+            "source_store": "graphiti",
+            "content": "The decision regarding dark-factory's checkout was verified by rolling back one commit and re-pushing, which is related to dark_factory task 4536.",
+            "invalid_at": null
+          },
+          {
+            "id": "5e1ee93b-e814-47f3-b60a-0e03d1c269d2",
+            "source_store": "mem0",
+            "content": "Task context is related to task #928",
+            "invalid_at": null
+          },
+          {
+            "id": "dd0a9fc3-9d09-4af5-be1e-4c191916ffce",
+            "source_store": "graphiti",
+            "content": "Task 3088 is related to decision task 3055.",
+            "invalid_at": null
+          },
+          {
+            "id": "bcfd2115-a6c5-488f-848a-be87716fa047",
+            "source_store": "mem0",
+            "content": "Task 721 review follow-up",
+            "invalid_at": null
+          },
+          {
+            "id": "52698983-2c12-4719-b78b-1f1daa29c963",
+            "source_store": "graphiti",
+            "content": "Task 1431 is related to sentinel.",
+            "invalid_at": null
+          }
+        ],
+        "hit": false
+      },
+      {
+        "task_id": "3591",
+        "query": "task 3591 context and related decisions",
+        "degraded": false,
+        "results": [
+          {
+            "id": "b0ead89e-e4e0-44b2-a923-6bd5c2fcaf1b",
+            "source_store": "graphiti",
+            "content": "The decision regarding dark-factory's checkout was verified by rolling back one commit and re-pushing, which is related to dark_factory task 4536.",
+            "invalid_at": null
+          },
+          {
+            "id": "5e1ee93b-e814-47f3-b60a-0e03d1c269d2",
+            "source_store": "mem0",
+            "content": "Task context is related to task #928",
+            "invalid_at": null
+          },
+          {
+            "id": "dd0a9fc3-9d09-4af5-be1e-4c191916ffce",
+            "source_store": "graphiti",
+            "content": "Task 3088 is related to decision task 3055.",
+            "invalid_at": null
+          },
+          {
+            "id": "3a224dbe-54b7-4bcd-b01c-689c31c89608",
+            "source_store": "mem0",
+            "content": "Task depends on task 919",
+            "invalid_at": null
+          },
+          {
+            "id": "6b5c0138-9057-4dbe-8c2c-6341a2aff2e0",
+            "source_store": "graphiti",
+            "content": "Task 3779's decision was related to the already open question regarding tasks that landed on 2026-08-08, which includes task 3640.",
+            "invalid_at": null
+          }
+        ],
+        "hit": false
+      },
+      {
+        "task_id": "1157",
+        "query": "task 1157 context and related decisions",
+        "degraded": false,
+        "results": [
+          {
+            "id": "b0ead89e-e4e0-44b2-a923-6bd5c2fcaf1b",
+            "source_store": "graphiti",
+            "content": "The decision regarding dark-factory's checkout was verified by rolling back one commit and re-pushing, which is related to dark_factory task 4536.",
+            "invalid_at": null
+          },
+          {
+            "id": "5e1ee93b-e814-47f3-b60a-0e03d1c269d2",
+            "source_store": "mem0",
+            "content": "Task context is related to task #928",
+            "invalid_at": null
+          },
+          {
+            "id": "dd0a9fc3-9d09-4af5-be1e-4c191916ffce",
+            "source_store": "graphiti",
+            "content": "Task 3088 is related to decision task 3055.",
+            "invalid_at": null
+          },
+          {
+            "id": "56865844-12e5-4f8b-b070-df109777f718",
+            "source_store": "mem0",
+            "content": "Task 56",
+            "invalid_at": null
+          },
+          {
+            "id": "2155ac7d-bd2c-4374-bac9-94301d985513",
+            "source_store": "graphiti",
+            "content": "Task 1157's fix requires handling NodeNotFoundError during refresh_entity_summary errors.",
+            "invalid_at": null
+          }
+        ],
+        "hit": true
+      }
+    ],
+    "verdict": null
+  },
+  "case_fold": [
+    {
+      "group_id": "autopilot_video",
+      "keys": 2,
+      "nodes": 4.0,
+      "split_since": "2026-10-02T11:42:23+00:00",
+      "split_since_commit": "13a9caaca2",
+      "split_groups": []
+    },
+    {
+      "group_id": "dark_factory",
+      "keys": 68,
+      "nodes": 140.0,
+      "split_since": "2026-10-02T11:42:23+00:00",
+      "split_since_commit": "13a9caaca2",
+      "split_groups": [
+        {
+          "key": "bash",
+          "spellings": [
+            "Bash",
+            "bash"
+          ]
+        },
+        {
+          "key": "clear",
+          "spellings": [
+            "CLEAR",
+            "clear"
+          ]
+        },
+        {
+          "key": "cwd",
+          "spellings": [
+            "CWD",
+            "cwd"
+          ]
+        },
+        {
+          "key": "datum",
+          "spellings": [
+            "Datum",
+            "datum"
+          ]
+        },
+        {
+          "key": "escalations",
+          "spellings": [
+            "ESCALATIONS",
+            "escalations"
+          ]
+        },
+        {
+          "key": "flag",
+          "spellings": [
+            "FLAG",
+            "flag"
+          ]
+        },
+        {
+          "key": "gate",
+          "spellings": [
+            "GATE",
+            "gate"
+          ]
+        },
+        {
+          "key": "graphiti",
+          "spellings": [
+            "Graphiti",
+            "graphiti"
+          ]
+        },
+        {
+          "key": "green",
+          "spellings": [
+            "GREEN",
+            "green"
+          ]
+        },
+        {
+          "key": "harness",
+          "spellings": [
+            "Harness",
+            "harness"
+          ]
+        },
+        {
+          "key": "info",
+          "spellings": [
+            "INFO",
+            "info"
+          ]
+        },
+        {
+          "key": "judge",
+          "spellings": [
+            "JUDGE",
+            "Judge",
+            "judge"
+          ]
+        },
+        {
+          "key": "leo",
+          "spellings": [
+            "LEO",
+            "Leo",
+            "leo"
+          ]
+        },
+        {
+          "key": "owner",
+          "spellings": [
+            "Owner",
+            "owner"
+          ]
+        },
+        {
+          "key": "path",
+          "spellings": [
+            "PATH",
+            "Path",
+            "path"
+          ]
+        },
+        {
+          "key": "pid",
+          "spellings": [
+            "PID",
+            "pid"
+          ]
+        },
+        {
+          "key": "react",
+          "spellings": [
+            "React",
+            "react"
+          ]
+        },
+        {
+          "key": "redis",
+          "spellings": [
+            "Redis",
+            "redis"
+          ]
+        },
+        {
+          "key": "repo",
+          "spellings": [
+            "REPO",
+            "repo"
+          ]
+        },
+        {
+          "key": "root",
+          "spellings": [
+            "ROOT",
+            "root"
+          ]
+        },
+        {
+          "key": "scheduler",
+          "spellings": [
+            "Scheduler",
+            "scheduler"
+          ]
+        },
+        {
+          "key": "sha",
+          "spellings": [
+            "SHA",
+            "sha"
+          ]
+        },
+        {
+          "key": "spec",
+          "spellings": [
+            "SPEC",
+            "spec"
+          ]
+        },
+        {
+          "key": "stop",
+          "spellings": [
+            "Stop",
+            "stop"
+          ]
+        },
+        {
+          "key": "task",
+          "spellings": [
+            "Task",
+            "task"
+          ]
+        },
+        {
+          "key": "test",
+          "spellings": [
+            "TEST",
+            "Test"
+          ]
+        },
+        {
+          "key": "yaml",
+          "spellings": [
+            "YAML",
+            "yaml"
+          ]
+        },
+        {
+          "key": "γ3",
+          "spellings": [
+            "Γ3",
+            "γ3"
+          ]
+        }
+      ]
+    },
+    {
+      "group_id": "know_live",
+      "keys": 3,
+      "nodes": 6.0,
+      "split_since": "2026-10-02T11:42:23+00:00",
+      "split_since_commit": "13a9caaca2",
+      "split_groups": []
+    },
+    {
+      "group_id": "pump_web_ui",
+      "keys": 0,
+      "nodes": 0.0,
+      "split_since": "2026-10-02T11:42:23+00:00",
+      "split_since_commit": "13a9caaca2",
+      "split_groups": []
+    },
+    {
+      "group_id": "reify",
+      "keys": 96,
+      "nodes": 194.0,
+      "split_since": "2026-10-02T11:42:23+00:00",
+      "split_since_commit": "13a9caaca2",
+      "split_groups": [
+        {
+          "key": "axis",
+          "spellings": [
+            "Axis",
+            "axis"
+          ]
+        },
+        {
+          "key": "body",
+          "spellings": [
+            "Body",
+            "body"
+          ]
+        },
+        {
+          "key": "diff",
+          "spellings": [
+            "Diff",
+            "diff"
+          ]
+        },
+        {
+          "key": "enum",
+          "spellings": [
+            "Enum",
+            "enum"
+          ]
+        },
+        {
+          "key": "eval",
+          "spellings": [
+            "Eval",
+            "eval"
+          ]
+        },
+        {
+          "key": "gmsh",
+          "spellings": [
+            "Gmsh",
+            "gmsh"
+          ]
+        },
+        {
+          "key": "int",
+          "spellings": [
+            "INT",
+            "Int"
+          ]
+        },
+        {
+          "key": "k",
+          "spellings": [
+            "K",
+            "k"
+          ]
+        },
+        {
+          "key": "lane",
+          "spellings": [
+            "LANE",
+            "lane"
+          ]
+        },
+        {
+          "key": "leo",
+          "spellings": [
+            "Leo",
+            "leo"
+          ]
+        },
+        {
+          "key": "lib",
+          "spellings": [
+            "LIB",
+            "lib"
+          ]
+        },
+        {
+          "key": "lsp",
+          "spellings": [
+            "LSP",
+            "lsp"
+          ]
+        },
+        {
+          "key": "mesh",
+          "spellings": [
+            "Mesh",
+            "mesh"
+          ]
+        },
+        {
+          "key": "pdiag",
+          "spellings": [
+            "PDIAG",
+            "pdiag"
+          ]
+        },
+        {
+          "key": "reify",
+          "spellings": [
+            "Reify",
+            "reify"
+          ]
+        },
+        {
+          "key": "sdf",
+          "spellings": [
+            "SDF",
+            "Sdf"
+          ]
+        },
+        {
+          "key": "stamp",
+          "spellings": [
+            "STAMP",
+            "stamp"
+          ]
+        },
+        {
+          "key": "task",
+          "spellings": [
+            "TASK",
+            "task"
+          ]
+        },
+        {
+          "key": "term",
+          "spellings": [
+            "TERM",
+            "term"
+          ]
+        },
+        {
+          "key": "triplex_group_ids",
+          "spellings": [
+            "TRIPLEX_GROUP_IDS",
+            "triplex_group_ids"
+          ]
+        },
+        {
+          "key": "value",
+          "spellings": [
+            "Value",
+            "value"
+          ]
+        }
+      ]
+    },
+    {
+      "group_id": "scoping_intake",
+      "keys": 3,
+      "nodes": 6.0,
+      "split_since": "2026-10-02T11:42:23+00:00",
+      "split_since_commit": "13a9caaca2",
+      "split_groups": [
+        {
+          "key": "draft",
+          "spellings": [
+            "Draft",
+            "draft"
+          ]
+        }
+      ]
+    },
+    {
+      "group_id": "solar_challenge",
+      "keys": 32,
+      "nodes": 64.0,
+      "split_since": "2026-10-02T11:42:23+00:00",
+      "split_since_commit": "13a9caaca2",
+      "split_groups": [
+        {
+          "key": "cache",
+          "spellings": [
+            "Cache",
+            "cache"
+          ]
+        },
+        {
+          "key": "flask",
+          "spellings": [
+            "Flask",
+            "flask"
+          ]
+        },
+        {
+          "key": "fleet",
+          "spellings": [
+            "Fleet",
+            "fleet"
+          ]
+        },
+        {
+          "key": "h1",
+          "spellings": [
+            "H1",
+            "h1"
+          ]
+        },
+        {
+          "key": "json",
+          "spellings": [
+            "JSON",
+            "json"
+          ]
+        },
+        {
+          "key": "max",
+          "spellings": [
+            "Max",
+            "max"
+          ]
+        },
+        {
+          "key": "mean",
+          "spellings": [
+            "Mean",
+            "mean"
+          ]
+        },
+        {
+          "key": "min",
+          "spellings": [
+            "Min",
+            "min"
+          ]
+        },
+        {
+          "key": "probe",
+          "spellings": [
+            "Probe",
+            "probe"
+          ]
+        },
+        {
+          "key": "pv",
+          "spellings": [
+            "PV",
+            "pv"
+          ]
+        },
+        {
+          "key": "pvgis",
+          "spellings": [
+            "PVGIS",
+            "pvgis"
+          ]
+        },
+        {
+          "key": "rich",
+          "spellings": [
+            "Rich",
+            "rich"
+          ]
+        },
+        {
+          "key": "seed",
+          "spellings": [
+            "SEED",
+            "seed"
+          ]
+        },
+        {
+          "key": "table",
+          "spellings": [
+            "Table",
+            "table"
+          ]
+        },
+        {
+          "key": "tests",
+          "spellings": [
+            "Tests",
+            "tests"
+          ]
+        },
+        {
+          "key": "text",
+          "spellings": [
+            "Text",
+            "text"
+          ]
+        },
+        {
+          "key": "yaml",
+          "spellings": [
+            "YAML",
+            "yaml"
+          ]
+        }
+      ]
+    },
+    {
+      "group_id": "solar_challenge_platform",
+      "keys": 11,
+      "nodes": 23.0,
+      "split_since": "2026-10-02T11:42:23+00:00",
+      "split_since_commit": "13a9caaca2",
+      "split_groups": [
+        {
+          "key": "error",
+          "spellings": [
+            "ERROR",
+            "Error",
+            "error"
+          ]
+        },
+        {
+          "key": "home",
+          "spellings": [
+            "HOME",
+            "home"
+          ]
+        },
+        {
+          "key": "path",
+          "spellings": [
+            "PATH",
+            "path"
+          ]
+        },
+        {
+          "key": "tests",
+          "spellings": [
+            "Tests",
+            "tests"
+          ]
+        },
+        {
+          "key": "write",
+          "spellings": [
+            "WRITE",
+            "write"
+          ]
+        }
+      ]
+    }
+  ]
+}
