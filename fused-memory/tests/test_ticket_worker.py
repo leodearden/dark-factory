@@ -2420,6 +2420,32 @@ class TestCuratorUnavailableReasonPersisted:
         assert reason == 'create: curator-unavailable: closed'
 
     @pytest.mark.asyncio
+    async def test_present_curator_without_decision_is_not_called_unavailable(
+        self, interceptor_with_store, taskmaster,
+    ):
+        """The batch path's catch-all arm hands a live curator a None decision."""
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        curator = MagicMock()
+        curator.record_task = AsyncMock()
+        with patch.object(
+            type(interceptor_with_store), '_ensure_taskmaster',
+            new=AsyncMock(return_value=taskmaster),
+        ):
+            _, _, reason, _, _ = await interceptor_with_store._dispatch_ticket_decision(
+                ticket_id='tkt_nodecision',
+                project_root='/p',
+                project_id='p',
+                candidate=CandidateTask(title='No Decision'),
+                decision=None,
+                kwargs={'title': 'No Decision'},
+                metadata=None,
+                curator=curator,
+            )
+
+        assert reason == 'create: no-curator-decision'
+
+    @pytest.mark.asyncio
     async def test_reason_is_reevaluated_once_construction_recovers(
         self, configured_interceptor, ticket_store,
     ):

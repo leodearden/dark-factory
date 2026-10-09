@@ -439,9 +439,15 @@ def _create_after_curator_failure(exc: CuratorFailureError) -> CuratorDecision:
 def _create_reason(
     decision: CuratorDecision | None, *, curator_unavailable: str | None = None,
 ) -> str:
-    """The ``tickets.reason`` a ``created`` ticket persists: why it was created."""
+    """The ``tickets.reason`` a ``created`` ticket persists: why it was created.
+
+    *curator_unavailable* is given only when no curator existed to decide; a
+    curator that existed but produced no decision is ``no-curator-decision``.
+    """
     if decision is None:
-        return 'create: curator-unavailable'
+        if curator_unavailable is None:
+            return 'create: no-curator-decision'
+        return f'create: curator-unavailable: {curator_unavailable}'
     if decision.justification:
         return f'create: {decision.justification}'
     return 'create'
@@ -499,6 +505,9 @@ class TaskInterceptor:
         # _get_curator() because it pulls in a Qdrant client + embedder.
         self._config = config
         self._curator: TaskCurator | None = None
+        # Exception TYPE of the last failed TaskCurator construction; never the
+        # message, which can carry paths and reaches MCP callers via tickets.reason.
+        self._curator_construction_error: str | None = None
         self._escalator = escalator
         # Forwarded to ``TaskCurator`` for cap-aware LLM invocation across the
         # shared account pool. ``None`` falls back to the legacy single-shot
@@ -1935,6 +1944,7 @@ class TaskInterceptor:
                 escalator=self._escalator,
                 usage_gate=self._usage_gate,
             )
+            self._curator_construction_error = None
             # Trigger the one-shot backfill check as a background task so the
             # caller is not delayed by the Qdrant count() round-trip.
             if project_root is not None:
@@ -1960,9 +1970,20 @@ class TaskInterceptor:
                 self._background_tasks.add(check)
                 check.add_done_callback(lambda t: self._background_tasks.discard(t))
             return self._curator
-        except Exception:
+        except Exception as exc:
             logger.warning('Failed to create TaskCurator', exc_info=True)
+            self._curator_construction_error = type(exc).__name__
             return None
+
+    def _curator_unavailable_reason(self) -> str:
+        """Why ``_get_curator()`` has no curator to hand out right now."""
+        if self._closed:
+            return 'closed'
+        if self._config is None or not self._config.curator.enabled:
+            return 'disabled'
+        if self._curator_construction_error is not None:
+            return f'construction-failed: {self._curator_construction_error}'
+        return 'unknown'
 
     async def _maybe_backfill_corpus(self, curator: TaskCurator, project_root: str) -> None:
         """Trigger a one-shot background backfill if the collection is empty.
@@ -4625,7 +4646,12 @@ class TaskInterceptor:
             # strand the task and cause duplicate-on-retry.
             task_id = task_id_str
             status = 'created'
-            reason = _create_reason(decision)
+            reason = _create_reason(
+                decision,
+                curator_unavailable=(
+                    self._curator_unavailable_reason() if curator is None else None
+                ),
+            )
             result_dict = dict(result)
             if curator_degrade_reason is not None:
                 result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}
