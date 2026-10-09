@@ -1194,3 +1194,41 @@ def test_json_names_the_default_state_path_under_the_root(tmp_path: Path, capsys
     sweep = json.loads(capsys.readouterr().out)['sweep']
     assert sweep['status'] == 'never_run'
     assert sweep['state_path'] == str(tmp_path / exception_register.SWEEP_STATE_PATH)
+
+
+# ---------------------------------------------------------------------------
+# The live tree — the merge-time guard that the real register is clean.
+#
+# Invariants only, never populations: declarations, candidates, the seed and
+# NOT_EXCEPTION_LISTS all change legitimately as the batch's later tasks land.
+
+
+def test_the_live_register_is_clean(tmp_path: Path, capsys):
+    """Every Policy in every declaration, inline marker and class-table row
+    names a row of the real ratification table, and nothing is malformed."""
+    code = exception_register.main(
+        ['--report', '--root', str(REPO_ROOT), '--sweep-state', str(tmp_path / 'absent.json')]
+    )
+
+    assert code == 0, capsys.readouterr().err
+
+
+def test_the_live_register_document_reads_the_real_tree(tmp_path: Path, capsys):
+    capsys.readouterr()
+    code = exception_register.main(
+        ['--json', '--root', str(REPO_ROOT), '--sweep-state', str(tmp_path / 'absent.json')]
+    )
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    document = json.loads(captured.out)
+
+    assert document['inline']['sites'] >= 1000
+    assert document['discovery']['files_parsed'] >= 1
+    seeded = (REPO_ROOT / 'scripts' / 'inline_suppression_baseline.json').exists()
+    assert document['grandfathered']['seeded'] is seeded
+    assert (document['grandfathered']['unowned'] is None) is (not seeded)
+    rows = exception_register.load_ratifications(REPO_ROOT / exception_register.TABLE_PATH)
+    assert document['ratification_table']['rows'] == [
+        {'id': row.id, 'date': row.date.isoformat(), 'source': row.source, 'covers': row.covers}
+        for row in sorted(rows, key=lambda row: row.id)
+    ]
