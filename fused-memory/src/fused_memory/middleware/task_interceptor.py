@@ -5732,15 +5732,8 @@ class TaskInterceptor:
             if curator is not None:
                 try:
                     refreshed = await tm.get_task(task_id, project_root)
-                    candidate = CandidateTask(
-                        title=str(refreshed.get('title', '') or ''),
-                        description=str(refreshed.get('description', '') or ''),
-                        details=str(refreshed.get('details', '') or ''),
-                        files_to_modify=[],
-                        priority=str(refreshed.get('priority', 'medium')),
-                    )
-                    if candidate.title:
-                        project_id = resolve_project_id(project_root)
+                    candidate = self._build_candidate(refreshed)
+                    if candidate is not None:
                         bg = asyncio.create_task(
                             curator.reembed_task(
                                 task_id,
