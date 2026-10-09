@@ -4,7 +4,9 @@ The dashboard reads the same relative DB path out of every project it knows
 about: ``config.project_root`` first, then each of
 ``config.known_project_roots``, de-duplicated so a root named twice is
 opened once. These helpers are that walk, plus the two concrete paths —
-``runs.db`` and ``burndown.db`` — that more than one consumer asks for.
+``runs.db`` and ``burndown.db`` — that more than one consumer asks for, and
+``_cost_sources``: the cost view's runs.db list plus the fused-memory curator's
+own invocation ledger, which lives outside any project tree.
 
 This is its own module rather than part of ``app.py`` because its callers
 land on both sides of the route/loop boundary:
@@ -18,10 +20,11 @@ A missing DB file is not an error here: ``DbPool.get`` yields ``None`` for
 it, so a consumer fans out over whatever exists and a project that has not
 produced a given DB yet simply contributes nothing.
 
-All four names carry a leading underscore from when they were private to
-``app.py``, and all four are now this module's entire interface. Read the
-underscore as vestigial, not as a private-use signal — the move that
-created this module was a pure extraction, with renaming outside its scope.
+These five names are this module's entire interface. The first four carry
+a leading underscore from when they were private to ``app.py``, and
+``_cost_sources`` matches them. Read the underscore as vestigial, not as a
+private-use signal — the move that created this module was a pure
+extraction, with renaming outside its scope.
 
 This is the canonical home for that primary-root-first, de-duplicated walk
 but not yet its only copy: ``app.py::_performance_resources``,
@@ -79,6 +82,14 @@ async def _cost_dbs(
 ) -> list[aiosqlite.Connection | None]:
     """Connections for all known project runs.db files (costs and performance)."""
     return await _project_scoped_dbs(config, pool, Path('data/orchestrator/runs.db'))
+
+
+async def _cost_sources(
+    config: DashboardConfig,
+    pool: DbPool,
+) -> list[aiosqlite.Connection | None]:
+    """Every invocation ledger the cost view reads: each project's runs.db plus the fused-memory curator's."""
+    return [*await _cost_dbs(config, pool), await pool.get(config.curator_events_db)]
 
 
 async def _burndown_dbs(
