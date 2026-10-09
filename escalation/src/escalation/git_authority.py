@@ -28,14 +28,13 @@ the orchestrator process.  Hoisting either to module level would convert that
 degradation into an import-time crash.  ``shared.*`` imports are intra-workspace
 and unconstrained.
 
-**On the two non-landing outcomes.**  ``merge_status`` today renders
-:attr:`GitAuthorityOutcome.landed_unconfirmed` and
-:attr:`GitAuthorityOutcome.no_signal` IDENTICALLY — as the bare Tier-4
-``unknown``.  The distinction is materialized on the verdict rather than on
-the wire because the ``merge_status`` response vocabulary belongs to task
-**4831** (``plans/merge-status-durable-non-landed-prd.md`` D1/D2), which
-consumes this module and maps the two onto its epistemic states.  Do not add
-a response field here to carry it.
+**On the three non-landing outcomes.**  This module reports WHAT git
+established — :attr:`GitAuthorityOutcome.landed_unconfirmed`,
+:attr:`GitAuthorityOutcome.no_signal` or
+:attr:`GitAuthorityOutcome.probe_failed` — and never how a consumer renders
+it.  ``merge_status``'s mapping onto its epistemic states lives in
+``escalation/src/escalation/server.py::merge_status``.  Do not add a response
+field here to carry it.
 """
 from __future__ import annotations
 
@@ -58,12 +57,13 @@ class GitAuthorityOutcome(enum.StrEnum):
     ``shared.merge_state.MergeState`` above it and
     ``orchestrator.landing_evidence.LandingReason`` below.
 
-    ``landed_unconfirmed`` and ``no_signal`` are DIFFERENT PROPOSITIONS and
-    that is the whole reason both exist: the first means git positively
-    established a landing (the branch is an ancestor of main, or a merge
-    marker was found) but attribution or effect-survival could not be
-    confirmed; the second means nothing was established at all.  Collapsing
-    them is exactly the conflation task 4831 exists to undo.
+    ``landed_unconfirmed``, ``no_signal`` and ``probe_failed`` are DIFFERENT
+    PROPOSITIONS and that is the whole reason all three exist: the first
+    means git positively established a landing (the branch is an ancestor of
+    main, or a merge marker was found) but attribution or effect-survival
+    could not be confirmed; the second means the probe ran and established
+    nothing; the third means the probe raised, so nothing could be
+    established either way.
 
     NOT to be confused with the unrelated ``'no_signal'`` that
     ``orchestrator.landing_evidence`` writes into
@@ -77,6 +77,7 @@ class GitAuthorityOutcome(enum.StrEnum):
     found_on_main = 'found_on_main'
     landed_unconfirmed = 'landed_unconfirmed'
     no_signal = 'no_signal'
+    probe_failed = 'probe_failed'
 
 
 class GitAuthorityArm(enum.StrEnum):
@@ -268,12 +269,10 @@ class GitAuthorityVerdict:
     apart cannot tell "we found the landing but could not verify it" from
     "we found nothing".
 
-    ``merge_status`` renders BOTH identically today, as the bare Tier-4
-    ``unknown``.  That is deliberate and behaviour-preserving: the
-    ``merge_status`` response vocabulary belongs to task **4831**
-    (``plans/merge-status-durable-non-landed-prd.md`` label β), which maps
-    these outcomes onto its epistemic states and reason codes.  This
-    dataclass is that task's INPUT, and leaf η's (task 4651).
+    ``probe_failed`` is a third proposition again: the probe raised, so it
+    could not look at all.  How ``merge_status`` renders each outcome lives
+    in ``escalation/src/escalation/server.py::merge_status``; this dataclass
+    is that tool's INPUT, and leaf η's (task 4651).
 
     ``merge_sha`` is populated on ``found_on_main`` ONLY — it is the sha a
     caller may stamp as provenance, WITH TWO EXCEPTIONS that this dataclass
@@ -325,9 +324,9 @@ class GitAuthorityVerdict:
         (heuristic 11) — a future third weakening updates this expression
         rather than silently breaking every caller.
 
-        False on ``landed_unconfirmed`` and ``no_signal`` because there is
-        no sha to stamp at all; that is NOT a claim that the branch did not
-        land.
+        False on ``landed_unconfirmed``, ``no_signal`` and ``probe_failed``
+        because there is no sha to stamp at all; that is NOT a claim that the
+        branch did not land.
         """
         return (
             self.outcome is GitAuthorityOutcome.found_on_main
@@ -408,7 +407,7 @@ async def _evidence_verdict(
     reason = None if verdict.reason is None else str(verdict.reason)
     # `accepted` implies a non-None evidence_sha (see LandingEvidenceVerdict),
     # but assert it explicitly: found_on_main_response's merge_sha is a hard
-    # `str`, and a contract violation must degrade to the Tier-4 unknown
+    # `str`, and a contract violation must degrade to landed_unconfirmed
     # rather than emit a `done` with a null sha.
     if verdict.accepted and verdict.evidence_sha is not None:
         # EQUALITY, never truthiness: 'confirmed' is the only accept-path
@@ -462,9 +461,9 @@ async def probe_landing(
     ``orch_config`` and ``harness`` are KEYWORD-ONLY because all three
     collaborators are typed ``Any`` and are therefore interchangeable to a
     type checker: a transposed pair would raise inside the blanket
-    ``except`` below and degrade SILENTLY to ``no_signal``, i.e. a fresh
-    consumer reporting that nothing has ever landed.  Naming them at the
-    call site is what makes that mistake unwritable.
+    ``except`` below and degrade to ``probe_failed`` on every call, i.e. a
+    fresh consumer that can never answer.  Naming them at the call site is
+    what makes that mistake unwritable.
 
     ``site`` labels the CALLER in every degradation this probe logs, both
     its own and ``task_metadata``'s (task 3103 review #3: an unlabelled
@@ -473,9 +472,10 @@ async def probe_landing(
     leaf η's periodic writer first — passes its own.
 
     FIRE-SAFE: every failure — including an ImportError from the runtime
-    reverse import below — degrades to ``no_signal`` and is logged; this
+    reverse import below — degrades to ``probe_failed`` and is logged; this
     never raises.  The wrapper lives HERE rather than at the call site so
-    every consumer inherits the fire-safety instead of re-adding it.
+    every consumer inherits the fire-safety instead of re-adding it.  A
+    clean miss is ``no_signal``, never ``probe_failed``.
     """
     metadata_unavailable = False
 
@@ -495,7 +495,7 @@ async def probe_landing(
         # cycle (same shape as server.py:1423 / :2049 / :2148).  It resolves
         # at runtime because the escalation server is hosted inside the
         # orchestrator process.  An ImportError is an Exception and therefore
-        # already degrades to the honest Tier-4 unknown via the wrapper below.
+        # already degrades to probe_failed via the wrapper below.
         from orchestrator.landing_evidence import (  # type: ignore[reportMissingImports]
             branch_is_degenerate,
             is_valid_sha_40,
@@ -513,8 +513,8 @@ async def probe_landing(
             # AND distinct from main_tip — both conjuncts above pass — so
             # without this guard the tier stamps a confident `done`
             # against a commit containing none of the task's work.  A
-            # degenerate branch falls through to the honest Tier-4
-            # unknown.  Runs FIRST and independently of the citation gate:
+            # degenerate branch falls through to no_signal.  Runs FIRST
+            # and independently of the citation gate:
             # a degenerate branch whose task DOES have a citing commit on
             # main (reify 5493) is caught only by this ordering.
             # branch_tip_sha=tip: the probe judges degeneracy against the
@@ -581,7 +581,8 @@ async def probe_landing(
                     )
     except Exception:
         logger.warning(
-            '%s: git-authority probe failed for %s — returning no_signal',
+            '%s: git-authority probe failed for %s — returning probe_failed',
             site, key, exc_info=True,
         )
+        return _verdict(GitAuthorityOutcome.probe_failed)
     return _verdict(GitAuthorityOutcome.no_signal)
