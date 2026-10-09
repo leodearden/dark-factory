@@ -1330,6 +1330,22 @@ def test_render_report_carries_each_piece_in_its_own_section():
     assert any("batch 1:" in line and "dup_rate=0.90" in line for line in saturation)
 
 
+@pytest.mark.parametrize(
+    "synthesis_md",
+    ["prose", "No novel, verified confusion clusters this census."],
+    ids=["model-prose", "runner-empty-run-sentence"],
+)
+def test_synthesis_section_states_the_census_applies_nothing_it_proposes(synthesis_md):
+    # Behaviour only; the exact wording is _GOLDEN_FLAGLESS_REPORT's to lock.
+    # The notice is true of every run, so it must not depend on who wrote the
+    # body: the model's prose or the runner's own empty-run sentence.
+    lines = _section(_sections(synthesis_md=synthesis_md), mod.SECTION_SYNTHESIS).lines
+
+    assert lines.count(mod.SYNTHESIS_NOT_APPLIED_NOTICE) == 1
+    notice_at = lines.index(mod.SYNTHESIS_NOT_APPLIED_NOTICE)
+    assert lines.index("## Synthesis") < notice_at < lines.index(synthesis_md)
+
+
 def test_render_report_is_deterministic_no_clock():
     assert mod.render_report(_census_record()) == mod.render_report(_census_record())
 
