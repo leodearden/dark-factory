@@ -3190,7 +3190,17 @@ class EscalationQueue:
         - ``fused-memory/src/fused_memory/middleware/curator_escalator.py`` —
           three sites, ``make_id('curator')`` with ``task_id='task-curator'``
         - ``fused-memory/src/fused_memory/middleware/ticket_janitor.py`` —
-          two sites, ``make_id('ticket-janitor')`` with ``task_id='task-curator'``
+          two sites, both ``make_id('ticket-janitor')``, that differ in task_id:
+          ``ticket_janitor.py::TicketJanitor._surface_probe_defect`` stores the
+          literal ``task_id='task-curator'``; the second, in
+          ``ticket_janitor.py::TicketJanitor.tick``, stores the ticket's own
+          ``task_id`` whenever one is set and not ``'_unparseable_'``, and falls
+          back to ``'task-curator'`` only otherwise.  So the second site mints
+          stem ``esc-ticket-janitor-N`` carrying a REAL NUMERIC task_id (a live
+          specimen: stem ``esc-ticket-janitor-2`` with task_id ``'2859'``).
+
+        So the divergence is NOT confined to synthetic anchor ids: an ordinary
+        numeric task id can own a record whose stem does not encode it.
 
         THEREFORE NOTHING MAY DERIVE A TASK_ID FROM A FILENAME OR FROM AN
         ESCALATION ID.  State the false identity plainly so a future reader
