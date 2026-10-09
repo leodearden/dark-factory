@@ -25,7 +25,9 @@ _ARM_URL = 'http://127.0.0.1:8414/v1'
 @pytest.fixture
 def offline_config(mock_config, monkeypatch):
     real_driver_cls = graphiti_client_module._MultiTenantFalkorDriver
-    driver_cls = MagicMock(return_value=MagicMock(spec=real_driver_cls))
+    driver = MagicMock(spec=real_driver_cls)
+    driver.clone.return_value = MagicMock(spec=real_driver_cls)
+    driver_cls = MagicMock(return_value=driver)
     monkeypatch.setattr(graphiti_client_module, '_MultiTenantFalkorDriver', driver_cls)
     config = mock_config.model_copy(deep=True)
     config.graphiti.falkordb.uri = _UNROUTABLE_FALKOR

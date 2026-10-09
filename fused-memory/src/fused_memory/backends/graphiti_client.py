@@ -23,7 +23,7 @@ from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerCli
 from graphiti_core.driver.driver import GraphDriver
 from graphiti_core.driver.falkordb_driver import FalkorDriver
 from graphiti_core.edges import EntityEdge
-from graphiti_core.embedder import OpenAIEmbedder
+from graphiti_core.embedder import EmbedderClient, OpenAIEmbedder
 from graphiti_core.embedder.openai import OpenAIEmbedderConfig
 from graphiti_core.errors import EdgeNotFoundError
 from graphiti_core.errors import NodeNotFoundError as GraphitiCoreNodeNotFoundError
@@ -183,6 +183,28 @@ def build_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
     return llm_client
 
 
+def build_embedder(cfg: FusedMemoryConfig) -> OpenAIEmbedder | None:
+    """Construct the graphiti embedder from unified config, or None.
+
+    Returns None when the openai provider block is absent or carries no
+    api_key. Module-level and public for the reason ``build_llm_client`` is: a
+    per-arm caller builds its embedder without constructing a driver.
+    """
+    provider = cfg.embedder.providers.openai
+    if cfg.embedder.provider != 'openai' or provider is None or not provider.api_key:
+        return None
+    embedder = OpenAIEmbedder(
+        config=OpenAIEmbedderConfig(
+            api_key=provider.api_key,
+            embedding_model=cfg.embedder.model,
+            base_url=provider.api_url,
+            embedding_dim=cfg.embedder.dimensions,
+        )
+    )
+    logger.info(f'Graphiti embedder: {cfg.embedder.provider}/{cfg.embedder.model}')
+    return embedder
+
+
 def _construct_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
     # LLMConfig's validator already rejects this combination at construction,
     # but pydantic does not re-validate on attribute assignment, so a config
@@ -220,8 +242,9 @@ def _construct_llm_client(cfg: FusedMemoryConfig) -> LLMClient | None:
                 small_model=cfg.llm.model,
                 temperature=cfg.llm.temperature or 0.0,
                 max_tokens=cfg.llm.max_tokens,
-                # Mirrors the embedder (see initialize()) and the reranker,
-                # which have always passed the configured endpoint. The LLM
+                # Mirrors the embedder (see build_embedder()) and the reranker
+                # (see initialize()), which have always passed the configured
+                # endpoint. The LLM
                 # path was the outlier: a configured api_url was silently
                 # dropped in favour of the openai SDK default.
                 base_url=cfg.llm.providers.openai.api_url,
@@ -1654,7 +1677,11 @@ class GraphitiBackend:
             await self._ensure_indices(graph_name)
 
     async def initialize(
-        self, *, skip_maintenance: bool = False, llm_client: LLMClient | None = None
+        self,
+        *,
+        skip_maintenance: bool = False,
+        llm_client: LLMClient | None = None,
+        embedder: EmbedderClient | None = None,
     ) -> None:
         """Create FalkorDriver + Graphiti client from unified config.
 
@@ -1666,9 +1693,10 @@ class GraphitiBackend:
         driver/client-wired backend without mutating on init or contending
         with a running service's maintenance sweep.
 
-        llm_client: when given, used instead of ``build_llm_client(cfg)``, so a
-        per-arm caller (e.g. the arm-runner harness) can wrap the client
-        ``build_llm_client`` built before this backend shares it.
+        llm_client, embedder: when given, used instead of
+        ``build_llm_client(cfg)`` and ``build_embedder(cfg)`` respectively, so a
+        per-arm caller (e.g. the arm-runner harness) can wrap the client the
+        builder built before this backend shares it.
         """
         cfg = self.config
 
@@ -1676,18 +1704,7 @@ class GraphitiBackend:
         llm_client = llm_client if llm_client is not None else build_llm_client(cfg)
 
         # --- Embedder ---
-        embedder_client = None
-        if cfg.embedder.provider == 'openai' and cfg.embedder.providers.openai:
-            api_key = cfg.embedder.providers.openai.api_key
-            if api_key:
-                embedder_config = OpenAIEmbedderConfig(
-                    api_key=api_key,
-                    embedding_model=cfg.embedder.model,
-                    base_url=cfg.embedder.providers.openai.api_url,
-                    embedding_dim=cfg.embedder.dimensions,
-                )
-                embedder_client = OpenAIEmbedder(config=embedder_config)
-                logger.info(f'Graphiti embedder: {cfg.embedder.provider}/{cfg.embedder.model}')
+        embedder_client = embedder if embedder is not None else build_embedder(cfg)
 
         # --- FalkorDB driver ---
         # The driver is created with a placeholder database.  Actual graph
