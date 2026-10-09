@@ -7974,6 +7974,34 @@ def test_synthesis_prompt_embeds_the_quality_definition_and_the_verdicts(tmp_pat
     assert '"severity": "low"' in prompt
 
 
+def test_synthesis_prompt_names_the_not_applied_proposals_heading(tmp_path):
+    root = _tree_with_guide(tmp_path)
+    found = verdict.parse_verdict(
+        {
+            "verified": True,
+            "reason": "r",
+            "anchor": "docs/guide.md",
+            "tags": ["h2"],
+            "severity": "low",
+            "severity_reason": "contained",
+            "route": "structural",
+        },
+        title=_REMEDIATED_TITLE,
+        project_root=root,
+    )
+    fake_invoke = _make_fake_invoke(default="Synthesis prose.")
+
+    mod._build_default_synthesize_fn(fake_invoke)(
+        [{"title": _REMEDIATED_TITLE, "verdict": found}], model="fable",
+    )
+    prompt = fake_invoke.calls[0]["prompt"]
+
+    assert mod.SYNTHESIS_PROPOSALS_HEADING in prompt
+    # The one semantic guard on the heading: it cannot be retitled back into
+    # a claim that the proposals are merger inputs.
+    assert "not applied" in mod.SYNTHESIS_PROPOSALS_HEADING
+
+
 # ---------------------------------------------------------------------------
 # task 5931 step-11: RED — run_census files a verified cluster only when it
 # carries an in-tree remediation or has recurred (filing_policy.is_fileable);
