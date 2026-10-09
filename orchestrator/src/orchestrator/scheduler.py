@@ -2120,13 +2120,13 @@ class Scheduler:
     _TICK_PHASE_ORDER: tuple[str, ...] = (
         'backfill_dep_status',
         'backfill_terminal_dep_records',
-        'drain_park_eviction',
-        'park_gc',
         'stale_sweep',
         'cooldown_gc',
         'redispatch_stranded_blocked',
         'external_dep_policy',
         'delivered_check_gate',
+        'drain_park_eviction',
+        'park_gc',
         'stamp_milestone',
         'override_snapshot_gc',
         'compute_priorities',
@@ -6607,10 +6607,10 @@ class Scheduler:
 
         Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes: none on
         ctx (mutates the park-eviction store + lock table directly via
-        ``_drain_park_eviction_requests``). Runs BEFORE the automatic
-        park-GC sweep so operator-lever evictions emit
-        reservation_force_evicted (not reservation_expired) for the same
-        dead owner. Always continues.
+        ``_drain_park_eviction_requests``). Runs immediately ahead of
+        ``park_gc``, so an operator eviction emits reservation_force_evicted
+        rather than being pre-empted by reservation_expired for the same
+        owner. Always continues.
         """
         self._drain_park_eviction_requests(ctx.status_map, ctx.tasks_by_id)
         return _CONTINUE
@@ -6618,12 +6618,18 @@ class Scheduler:
     async def _phase_park_gc(self, ctx: TickContext) -> object:
         """Hygiene: owner-state park-GC sweep.
 
-        Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes: none on
-        ctx (mutates ``self.lock_table``/``self._skip_count`` and emits
+        Reads: ``ctx.status_map``, ``ctx.tasks_by_id``, ``ctx.external_cache``,
+        ``ctx.external_resolver_failed``, ``ctx.delivered_check_cache``,
+        ``ctx.terminal_dep_records``. Writes: none on ctx (mutates
+        ``self.lock_table``/``self._skip_count`` and emits
         reservation_expired/reservation_restored events). Replaces the
         wall-clock lease mechanic: every park whose owner fails the
         park-hold predicate (:meth:`_park_gc_reason`) is expired now, and
-        the owner's skip count goes with it. Always continues.
+        the owner's skip count goes with it. Runs after
+        ``external_dep_policy`` and ``delivered_check_gate``, so the
+        dependency arm sees this tick's caches, and before ``reserve_now``
+        and the dispatch loops, so neither builds on a dead park. Always
+        continues.
         """
         for owner in self._expire_parks(partial(self._park_gc_reason, ctx)):
             self._skip_count.pop(owner, None)
@@ -7241,7 +7247,8 @@ class Scheduler:
         issues ONE ``get_external_statuses`` call (zero deps → zero
         calls). The per-tick cache is forwarded to ``_eligible_for_dispatch``
         at both call sites below (``_phase_build_candidates`` /
-        ``_phase_select_pins``); ``_apply_external_dep_policy`` runs the
+        ``_phase_select_pins``) and read by park GC and the park-eviction
+        drain through ``_park_gc_reason``; ``_apply_external_dep_policy`` runs the
         side-effecting pass (counter increments, escalation callbacks)
         exactly once per tick, wrapped in try/except so a policy-pass
         failure degrades to fail-safe-wait instead of aborting the tick.
@@ -7288,7 +7295,8 @@ class Scheduler:
         Writes: ``ctx.delivered_check_cache``. Runs immediately after
         ``external_dep_policy`` and before either candidate-dispatch loop
         (``build_candidates`` / ``select_pins``), both of which forward the
-        cache into ``_eligible_for_dispatch`` → ``_deps_satisfied``.
+        cache into ``_eligible_for_dispatch`` → ``_deps_satisfied``; park GC
+        and the park-eviction drain read it through ``_park_gc_reason``.
         ``_compute_delivered_check_cache`` already collects the relevant
         (terminal, checked) deps internally — a dep-free or check-free
         pending task is a no-op for it — so this phase simply forwards all
