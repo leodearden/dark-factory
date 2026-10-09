@@ -167,3 +167,16 @@ async def test_clean_exit_under_cgroup_scope_runs_no_teardown(
 async def test_spawn_failure_still_returns_command_failed(tmp_path: Path):
     rc, out, timed_out = await _run_cmd('true', tmp_path / 'absent', timeout=5.0)
     _assert_command_failed(rc, out, timed_out)
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_spawn_failure_under_cgroup_scope_runs_no_teardown(
+    tmp_path: Path, fake_scope_tools: _ScopeRecords,
+):
+    rc, out, timed_out = await _run_cmd(
+        'true', tmp_path / 'absent', timeout=5.0, use_cgroup_scope=True,
+    )
+    _assert_command_failed(rc, out, timed_out)
+    assert not fake_scope_tools.unit.exists(), 'systemd-run ran despite the spawn failing'
+    assert not fake_scope_tools.systemctl.exists()

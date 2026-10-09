@@ -5280,10 +5280,16 @@ async def _reap_command_subtree(
     scope_unit: str | None,
 ) -> None:
     """Kill a spawned verify command's whole subtree: its cgroup scope first
-    (reaps process-group escapes), then its spawn process group as the backstop."""
+    (reaps process-group escapes), then its spawn process group as the backstop.
+
+    A no-op when the spawn never returned a process: either it failed before
+    any scope existed, or it was interrupted and asyncio's spawn cleanup
+    already killed the child."""
+    if proc is None:
+        return
     if scope_unit is not None:
         await _kill_cgroup_scope(scope_unit)
-    if proc is not None and pgid is not None:
+    if pgid is not None:
         await terminate_process_group(proc, pgid, grace_secs=5.0)
 
 
