@@ -344,6 +344,14 @@ class JournalGrowthSample:
     since: datetime
 
 
+async def _read_int(access: AtomicConnection, sql: str) -> int:
+    """The single integer *sql* selects, or a RuntimeError naming *sql*."""
+    row = await access.read_one(sql)
+    if row is None or row[0] is None:
+        raise RuntimeError(f'write_journal growth sample: {sql!r} returned no value')
+    return row[0]
+
+
 class WriteJournal:
     """Two-layer write journal backed by SQLite (WAL mode)."""
 
@@ -390,12 +398,11 @@ class WriteJournal:
         latency.
         """
         access = self._require_access()
-        freelist_row = await access.read_one('PRAGMA freelist_count')
-        page_size_row = await access.read_one('PRAGMA page_size')
-        assert freelist_row is not None and page_size_row is not None
+        freelist_count = await _read_int(access, 'PRAGMA freelist_count')
+        page_size = await _read_int(access, 'PRAGMA page_size')
         return JournalGrowthSample(
             file_bytes=self._on_disk_bytes(),
-            free_bytes=freelist_row[0] * page_size_row[0],
+            free_bytes=freelist_count * page_size,
             rows_inserted=await self._rows_inserted_since(access, since),
             since=since,
         )
@@ -412,9 +419,8 @@ class WriteJournal:
         )
         if first_row is None:
             return 0
-        newest_row = await access.read_one('SELECT MAX(rowid) FROM write_ops')
-        assert newest_row is not None
-        return newest_row[0] - first_row[0] + 1
+        newest_rowid = await _read_int(access, 'SELECT MAX(rowid) FROM write_ops')
+        return newest_rowid - first_row[0] + 1
 
     def _on_disk_bytes(self) -> int:
         total = 0

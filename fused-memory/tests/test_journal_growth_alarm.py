@@ -187,6 +187,26 @@ class TestGrowthSampleRowsInserted:
 
         assert sample.rows_inserted == 2
 
+    @pytest.mark.asyncio
+    async def test_a_terminal_first_row_overcounts_by_its_latency_inserts(self, journal):
+        """The documented skew, pinned at its size.
+
+        ``record_terminal_outcome`` takes the row's rowid; the producer's later
+        ``log_write_op`` upsert re-stamps its ``created_at``. A cutoff between the
+        two therefore counts every row inserted in that latency, and no more.
+        """
+        op_id = str(uuid.uuid4())
+        await journal.record_terminal_outcome(write_op_id=op_id, terminal_status='completed')
+        latency_start = datetime.now(UTC)
+        latency_inserts = [latency_start + timedelta(microseconds=i) for i in range(3)]
+        seed_ops(journal.db_path, latency_inserts)
+        since = latency_inserts[-1] + timedelta(microseconds=1)
+        await journal.log_write_op(write_op_id=op_id, operation='add_memory')
+
+        sample = await journal.growth_sample(since=since)
+
+        assert sample.rows_inserted == 1 + len(latency_inserts)
+
 
 def _sample(*, file_bytes: int = 100, rows_inserted: int = 10) -> JournalGrowthSample:
     return JournalGrowthSample(
