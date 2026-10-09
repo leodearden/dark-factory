@@ -1,6 +1,8 @@
 """One embedding arm run, end to end: refusals, the graph half, the Mem0 replica, query latency, then the records and ``run.json``.
 
-Every refusal and pre-run check comes before the first store call. The graph
+Every refusal and pre-run check comes before the first store write. The only
+store calls ahead of them ask whether the arm's scratch graph or replica already
+exists, so a stale one is refused before a graph phase is spent on the arm. The graph
 half (embedding_graph_phase.py) raises ``EmbeddingRunCheckFailed`` on a failed
 instrument check, so such a run writes nothing. A query the arm cannot embed is
 a measurement, not an error: it reads as a miss and is counted in the manifest.
@@ -63,8 +65,7 @@ from fused_memory.arm_harness.probe_set import (
     Mem0KnownItem,
     Mem0SnapshotPin,
     ProbeSet,
-    probe_set_sha,
-    serialize_probe_set,
+    read_probe_set,
 )
 from fused_memory.arm_harness.retrieval import (
     ProbeTally,
@@ -108,7 +109,7 @@ _MEM0_METRIC_IDS = _KnownItemMetricIds(
 
 async def run_embedding_arm(
     spec: LlmArmSpec | EmbeddingArmSpec,
-    probe_set: ProbeSet,
+    probe_set_path: Path,
     *,
     graph_client: ArmGraphClient,
     backend: EmbeddingSearchBackend,
@@ -124,7 +125,8 @@ async def run_embedding_arm(
 ) -> EmbeddingRunManifest:
     arm = _require_embedding_spec(spec, embedder)
     pre_run = await asyncio.to_thread(require_pre_run_checks, arm, repo_root)
-    snapshot = _require_runnable(arm, probe_set, mem0_snapshot, run_dir)
+    probe_set, snapshot = _require_runnable(arm, probe_set_path, mem0_snapshot, run_dir)
+    await _require_no_stale_scratch(arm, graph_client, qdrant)
     started_at = datetime.now(UTC)
     graph = await run_graph_phase(arm, probe_set, graph_client, backend, embedder, sleep=sleep)
     replica, mem0 = await _replica_phase(
@@ -167,19 +169,26 @@ def _require_embedding_spec(
 
 
 def _require_runnable(
-    arm: EmbeddingArmSpec, probe_set: ProbeSet, mem0_snapshot: Path, run_dir: Path
-) -> Mem0Snapshot:
-    """The pinned Mem0 snapshot, once the run dir is empty and the probe set is the arm's."""
+    arm: EmbeddingArmSpec, probe_set_path: Path, mem0_snapshot: Path, run_dir: Path
+) -> tuple[ProbeSet, Mem0Snapshot]:
+    """The arm's probe set and pinned Mem0 snapshot, once the run dir is empty."""
     if run_dir.exists() and any(run_dir.iterdir()):
         held = sorted(path.name for path in run_dir.iterdir())
         raise EmbeddingRunRefused(f'{run_dir} is not empty ({held}); a run dir is never reused')
-    probe_sha = probe_set_sha(serialize_probe_set(probe_set).encode())
+    probe_set = _arm_probe_set(arm, probe_set_path)
+    return probe_set, _pinned_snapshot(mem0_snapshot, probe_set.mem0_snapshot)
+
+
+def _arm_probe_set(arm: EmbeddingArmSpec, path: Path) -> ProbeSet:
+    try:
+        probe_set, probe_sha = read_probe_set(path)
+    except (OSError, ValueError) as error:
+        raise EmbeddingRunRefused(f'{path} is not a readable probe set: {error}') from error
     if arm.corpus_sha != probe_sha:
         raise EmbeddingRunRefused(
-            f'arm {arm.arm_id!r} names corpus_sha {arm.corpus_sha}, '
-            f'but its probe set hashes to {probe_sha}'
+            f'arm {arm.arm_id!r} names corpus_sha {arm.corpus_sha}, but {path} hashes to {probe_sha}'
         )
-    return _pinned_snapshot(mem0_snapshot, probe_set.mem0_snapshot)
+    return probe_set
 
 
 def _pinned_snapshot(path: Path, pin: Mem0SnapshotPin) -> Mem0Snapshot:
@@ -189,6 +198,26 @@ def _pinned_snapshot(path: Path, pin: Mem0SnapshotPin) -> Mem0Snapshot:
             f'Mem0 snapshot {path} hashes to {actual}, not the probe set pin {pin.sha256}'
         )
     return load_snapshot(path)
+
+
+async def _require_no_stale_scratch(
+    arm: EmbeddingArmSpec, graph_client: ArmGraphClient, qdrant: ReplicaClient
+) -> None:
+    """Read-only: neither the arm's scratch graph nor its replica is left from an earlier run."""
+    name = arm.scratch_group_id
+    graph_left = name in await graph_client.list_graphs()
+    replica_left = await qdrant.collection_exists(name)
+    stale = [
+        store
+        for store, left in (('scratch graph', graph_left), ('Mem0 replica', replica_left))
+        if left
+    ]
+    if stale:
+        raise EmbeddingRunRefused(
+            f'arm {arm.arm_id!r}: a stale {" and ".join(stale)} named {name!r} is left from an '
+            'earlier run, and a stale store is never reused; remove both with '
+            '`teardown --arm-spec <this spec> --collection`'
+        )
 
 
 # --- the Mem0 replica ---------------------------------------------------------------------

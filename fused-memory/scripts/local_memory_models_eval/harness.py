@@ -159,8 +159,8 @@ from fused_memory.arm_harness.probe_set import (
     ProbeSetError,
     TranscriptPin,
     build_probe_set,
-    load_probe_set,
     probe_set_sha,
+    read_probe_set,
     serialize_probe_set,
 )
 from fused_memory.arm_harness.replay import ArmGraph, ReplayJournal
@@ -501,7 +501,7 @@ def _scratch_graph(
 def _read_probe_set(path: Path) -> tuple[ProbeSet, str]:
     """The probe set at ``path`` and its sha, which every embedding arm's corpus_sha names."""
     try:
-        return load_probe_set(path), probe_set_sha(path.read_bytes())
+        return read_probe_set(path)
     except (OSError, ValueError) as error:
         raise _Refusal(EXIT_REFUSED, f'{path} is not a readable probe set: {error}') from error
 
@@ -1107,7 +1107,7 @@ async def _embed_run(
     ):
         return await run_embedding_arm(
             spec,
-            probe_set,
+            args.probe_set,
             graph_client=falkor,
             backend=backend,
             qdrant=qdrant,

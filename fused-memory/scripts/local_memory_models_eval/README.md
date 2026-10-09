@@ -248,7 +248,7 @@ Live endpoints come from `FusedMemoryConfig()` (honours `CONFIG_PATH`).
 | `mem0-snapshot --collection C --out F` | ι | A read-only scroll of Mem0 collection `C` into a fresh JSONL `F`, and its sha256 (`mem0_replica.py`) |
 | `probe-set --reference-json J --control-a-outcomes O --transcript-corpus T --mem0-snapshot F --registry R --out P` | ι | The embedding probe set, written to a fresh `P`. It reads the frozen reference through `ro_query` only and exits 3 if the reference's hash moved. δ's `corpus_sha` comes from the `run.json` beside `O`, and E1's registry and `content_key` are loaded from `memory_eval_retrieval_probe.py` (`probe_set.py`) |
 | `embed-specs --arms-manifest Y --probe-set P --code-sha C --preregistration-sha S --out-dir D` | ι | `D/<arm_id>.json` for the two incumbent controls, at the config's embedder, and for each `arms.yaml` embedding arm, all with `corpus_sha` = the sha of `P`. Writes all or none, and an existing spec is refused (`slate.py`) |
-| `embed-run --arm-spec S --probe-set P --mem0-snapshot F --out-root D [--repo-root R]` | ι | One embedding arm end to end: copy and re-embed the reference, probe both index configurations, build and probe the Mem0 replica, and time queries (`embedding_run.py`, `embedding_graph_phase.py`) |
+| `embed-run --arm-spec S --probe-set P --mem0-snapshot F --out-root D [--repo-root R]` | ι | One embedding arm end to end: copy and re-embed the reference, probe both index configurations, build and probe the Mem0 replica, and time queries. A scratch graph or replica left by an earlier run is refused (exit 2) before anything is copied (`embedding_run.py`, `embedding_graph_phase.py`) |
 | `embed-preregister --run-a A --run-b B --out F` | ι | The embedding control pair's margins and query-latency envelope, written to a fresh `F` (`embedding_preregistration.py`) |
 | `embed-compare --preregistration F --run R [--run …]` | ι | Offline: one markdown row per candidate and margin, then each candidate's envelope, reported rows and `non_inferior` verdict (`embedding_preregistration.py`) |
 
@@ -271,7 +271,7 @@ population.
 |---|---|
 | 0 | ok |
 | 1 | the run could not complete (store unreachable, index build failed, the index probe could not remove its seeded node — the error names it — or a traceback) |
-| 2 | refused: invalid spec or input, a pre-run instrument check failed, a run dir is not fresh or not complete, a control pair yields no valid pre-registration |
+| 2 | refused: invalid spec or input, a pre-run instrument check failed, a run dir is not fresh or not complete, an embedding arm's scratch graph or replica is stale, a control pair yields no valid pre-registration |
 | 3 | an instrument check failed (post-run, smoke, index-check, integrity, control-check, embed-run's mid-run checks, probe-set's frozen-reference check) |
 | 4 | INV-4 abort: consecutive episode failures stopped the run |
 | 5 | scratch guard: a non-`evalmem_` name reached a guarded checkpoint |

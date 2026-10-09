@@ -170,6 +170,12 @@ def load_probe_set(path: Path) -> ProbeSet:
     return ProbeSet.model_validate_json(Path(path).read_text(encoding='utf-8'))
 
 
+def read_probe_set(path: Path) -> tuple[ProbeSet, str]:
+    """The probe set at ``path`` and the sha of the very bytes it was parsed from: its one identity."""
+    data = Path(path).read_bytes()
+    return ProbeSet.model_validate_json(data), probe_set_sha(data)
+
+
 def probe_set_sha(data: bytes) -> str:
     """Every embedding arm's ``corpus_sha``: the probe set is that axis's corpus."""
     return corpus.corpus_sha(data)

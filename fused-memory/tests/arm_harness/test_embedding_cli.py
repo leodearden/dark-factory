@@ -1,5 +1,6 @@
 """The six embedding-axis subcommands of ``harness.py``: their wiring, exit codes and artifacts."""
 
+import asyncio
 import hashlib
 import json
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -13,6 +14,7 @@ import pytest
 import yaml
 from _fm_helpers import load_script_module
 
+from arm_harness import _embedding_doubles as doubles
 from arm_harness._fakes import (
     CODE_SHA,
     PREREG_SHA,
@@ -31,7 +33,8 @@ from arm_harness._fakes import (
     write_embedding_run,
     write_run,
 )
-from fused_memory.arm_harness.arm_embedder import EmbedSettings, QueryEmbedder
+from fused_memory.arm_harness import checks
+from fused_memory.arm_harness.arm_embedder import ArmEmbedder
 from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, load_arm_spec
 from fused_memory.arm_harness.embedding_preregistration import (
     compare_embedding_arm,
@@ -39,13 +42,18 @@ from fused_memory.arm_harness.embedding_preregistration import (
     load_embedding_preregistration_inputs,
     serialize_embedding_preregistration_inputs,
 )
+from fused_memory.arm_harness.embedding_run_manifest import load_embedding_run_manifest
 from fused_memory.arm_harness.mem0_replica import (
     Mem0Record,
     Mem0Snapshot,
-    ReplicaHit,
     load_snapshot,
     snapshot_sha,
     write_snapshot,
+)
+from fused_memory.arm_harness.metrics_record import (
+    EmbeddingMetricId,
+    IndexConfiguration,
+    load_metrics_records,
 )
 from fused_memory.arm_harness.probe_set import (
     FrozenReference,
@@ -55,7 +63,6 @@ from fused_memory.arm_harness.probe_set import (
     ProbeSet,
     TranscriptPin,
     build_probe_set,
-    load_probe_set,
     probe_set_sha,
     serialize_probe_set,
 )
@@ -177,25 +184,14 @@ class FakeQdrant:
         self.writes.append(f'delete_collection {collection_name}')
 
 
-@dataclass(frozen=True)
-class FakeArmEmbedder:
-    spec: EmbeddingArmSpec
-    settings: EmbedSettings
-
-
 @dataclass
 class EmbedLive:
-    """A ``deps`` factory over fakes; ``log`` records what each dependency was asked for."""
+    """A ``deps`` factory over the read-side fakes the offline-input subcommands use."""
 
     base_config: FusedMemoryConfig
     falkor: FakeFalkor = field(default_factory=lambda: FakeFalkor(_reference_rows))
     qdrant: FakeQdrant = field(default_factory=FakeQdrant)
-    backend: object = field(default_factory=object)
     factory_calls: int = 0
-    backend_opens: list[tuple[EmbeddingArmSpec, FusedMemoryConfig, Any]] = field(
-        default_factory=list
-    )
-    embedders: list[FakeArmEmbedder] = field(default_factory=list)
 
     def factory(self, harness: ModuleType) -> Callable[[], Any]:
         def build() -> Any:
@@ -207,29 +203,15 @@ class EmbedLive:
                 open_journal=_unused,
                 open_falkordb=_yielding(self.falkor),
                 open_qdrant=_yielding(self.qdrant),
-                open_embedding_arm_backend=self._open_backend,
-                build_arm_embedder=self._build_embedder,
+                open_embedding_arm_backend=_unused,
+                build_arm_embedder=_unused,
             )
 
         return build
 
-    @asynccontextmanager
-    async def _open_backend(
-        self, spec: EmbeddingArmSpec, base: FusedMemoryConfig, query_embedder: Any
-    ) -> AsyncIterator[object]:
-        self.backend_opens.append((spec, base, query_embedder))
-        yield self.backend
 
-    def _build_embedder(
-        self, spec: EmbeddingArmSpec, base: FusedMemoryConfig, *, settings: EmbedSettings
-    ) -> FakeArmEmbedder:
-        embedder = FakeArmEmbedder(spec, settings)
-        self.embedders.append(embedder)
-        return embedder
-
-
-def _unused(*args: Any) -> Any:
-    raise AssertionError('the embedding subcommands never touch the LLM replay dependencies')
+def _unused(*args: Any, **kwargs: Any) -> Any:
+    raise AssertionError('this subcommand never touches this dependency')
 
 
 def _yielding(value: Any) -> Callable[[], Any]:
@@ -610,6 +592,66 @@ def test_embed_specs_refuses_a_misshapen_arms_manifest_naming_it(
 # --- embed-run -------------------------------------------------------------------------
 
 
+@dataclass
+class RunLive:
+    """embed-run's live dependencies over the store and endpoint doubles of _embedding_doubles."""
+
+    base_config: FusedMemoryConfig
+    log: list[str] = field(default_factory=list)
+    factory_calls: int = 0
+
+    def __post_init__(self) -> None:
+        self.client = doubles.FakeGraphClient(self.log)
+        self.reference = doubles.reference_graph(self.log)
+        self.client.add(self.reference)
+        self.qdrant = doubles.FakeQdrant(self.log)
+        self.endpoint = doubles.FakeEndpoint()
+
+    def factory(self, harness: ModuleType) -> Callable[[], Any]:
+        def build() -> Any:
+            self.factory_calls += 1
+            return harness.HarnessDeps(
+                base_config=self.base_config,
+                episode_reader=_unused,
+                open_arm_backend=_unused,
+                open_journal=_unused,
+                open_falkordb=_yielding(self.client),
+                open_qdrant=_yielding(self.qdrant),
+                open_embedding_arm_backend=self._open_backend,
+                build_arm_embedder=self._build_embedder,
+            )
+
+        return build
+
+    @asynccontextmanager
+    async def _open_backend(
+        self, spec: EmbeddingArmSpec, base: FusedMemoryConfig, query_embedder: Any
+    ) -> AsyncIterator[doubles.FakeSearchBackend]:
+        yield doubles.FakeSearchBackend(self.client, query_embedder)
+
+    def _build_embedder(
+        self, spec: EmbeddingArmSpec, base: FusedMemoryConfig, *, settings: Any
+    ) -> ArmEmbedder:
+        return ArmEmbedder(self.endpoint, spec, settings, clock=self.endpoint.clock)
+
+
+@pytest.fixture
+def run_live(mock_config: FusedMemoryConfig, monkeypatch) -> RunLive:
+    monkeypatch.setattr(checks, 'INDEX_PROBE_INTERVAL_S', 0.0)
+    return RunLive(base_config=mock_config)
+
+
+REWORDED_TOPIC = Mem0KnownItem(
+    topic='topic-reworded', phrasing='where do runs live', held_out=False,
+    canonical_content_hash='deadbeefdeadbeef', canonical_last_known_id=doubles.MEM0_IDS[1],
+)
+"""Its canonical was reworded since it was hashed, so only its pinned id still finds it."""
+GONE_TOPIC = Mem0KnownItem(
+    topic='topic-gone', phrasing='what is a control pair', held_out=True,
+    canonical_content_hash='0123456789abcdef', canonical_last_known_id=None,
+)
+
+
 @dataclass(frozen=True)
 class RunInputs:
     repo: PreregRepo
@@ -635,16 +677,27 @@ def _spec_file(path: Path, spec: Any, **raw_overrides: Any) -> Path:
 
 
 @pytest.fixture
-def run_inputs(tmp_path: Path, monkeypatch) -> RunInputs:
+def run_inputs(tmp_path: Path, monkeypatch, run_live: RunLive) -> RunInputs:
+    """A probe set, Mem0 snapshot and spec pinned to ``run_live``'s reference graph."""
     monkeypatch.setenv('MEMORY_EVAL_RUN_STAMP', STAMP)
     repo = make_prereg_repo(tmp_path / 'repo')
     snapshot = tmp_path / 'mem0-source.jsonl'
-    write_snapshot(snapshot, Mem0Snapshot(source=SOURCE_COLLECTION, excluded_empty=0,
-                                          records=(HASHED_RECORD, ID_RECORD)))
-    probe_set = _probe_set_file(tmp_path / 'probe-set.json', snapshot_sha(snapshot))
+    write_snapshot(snapshot, doubles.mem0_snapshot())
+    probe_set = tmp_path / 'probe-set.json'
+    probe_set.write_text(serialize_probe_set(ProbeSet(
+        corpus_sha='b' * 64,
+        reference=asyncio.run(doubles.frozen_reference(run_live.reference)),
+        query_words=2,
+        known_items=doubles.KNOWN_ITEMS,
+        uncited_episodes=0,
+        transcript=TranscriptPin(path='corpus.jsonl', sha256='d' * 64, queries=TRANSCRIPT_QUERIES),
+        mem0_snapshot=Mem0SnapshotPin(source=doubles.SOURCE_COLLECTION, sha256=snapshot_sha(snapshot),
+                                      point_count=len(doubles.MEM0_IDS), excluded_empty=0),
+        mem0_known_items=(REWORDED_TOPIC, GONE_TOPIC),
+    )), encoding='utf-8')
     spec = embedding_spec(
         arm_id='granite-embedding-english-r2', model_id='granite-embedding-english-r2',
-        embedding_dim=768, code_sha=repo.with_prereg, preregistration_sha=repo.with_prereg,
+        embedding_dim=doubles.DIM, code_sha=repo.with_prereg, preregistration_sha=repo.with_prereg,
         corpus_sha=probe_set_sha(probe_set.read_bytes()),
         scratch_group_id='evalmem_lme_emb_granite_embedding_english_r2',
     )
@@ -652,115 +705,105 @@ def run_inputs(tmp_path: Path, monkeypatch) -> RunInputs:
                      snapshot, tmp_path / 'runs')
 
 
-def test_embed_run_hands_every_live_dependency_to_run_embedding_arm(
-    harness, live, run_inputs, monkeypatch, capsys
+def _metrics(run_dir: Path) -> dict[tuple[str, IndexConfiguration | None], Any]:
+    return {
+        (record.metric.metric_id, record.index_configuration): record.metric
+        for record in load_metrics_records(run_dir)
+    }
+
+
+def test_embed_run_commits_the_arms_run_json_and_its_measurements(
+    harness, run_live, run_inputs, capsys
 ):
-    captured: dict[str, Any] = {}
-
-    async def recording_run(spec: Any, probe_set: Any, **kwargs: Any) -> Any:
-        captured.update(spec=spec, probe_set=probe_set, **kwargs)
-        return embedding_run_manifest(spec)
-
-    monkeypatch.setattr(harness, 'run_embedding_arm', recording_run)
-
-    code = harness.main(run_inputs.argv(), deps=live.factory(harness))
+    code = harness.main(run_inputs.argv(), deps=run_live.factory(harness))
 
     assert code == harness.EXIT_OK
-    [embedder] = live.embedders
-    [(opened_spec, opened_base, query_embedder)] = live.backend_opens
-    assert embedder.spec == opened_spec == captured['spec'] == run_inputs.spec
-    assert isinstance(embedder.settings, EmbedSettings)
-    assert isinstance(query_embedder, QueryEmbedder) and query_embedder.arm is embedder
-    assert opened_base is captured['base_config'] is live.base_config
-    assert captured['probe_set'] == load_probe_set(run_inputs.probe_set)
-    assert captured['graph_client'] is live.falkor
-    assert captured['qdrant'] is live.qdrant
-    assert captured['backend'] is live.backend
-    assert captured['embedder'] is embedder
-    assert captured['mem0_snapshot'] == run_inputs.snapshot
-    assert captured['mem0_project_id'] == PROJECT
-    assert captured['run_dir'] == run_inputs.run_dir
-    assert captured['repo_root'] == run_inputs.repo.root
+    manifest = load_embedding_run_manifest(run_inputs.run_dir / 'run.json')
+    assert manifest.spec == run_inputs.spec
+    settings = manifest.settings
+    assert (settings.embed_batch_size, settings.embed_concurrency) == (
+        harness.EMBED_SETTINGS.batch_size, harness.EMBED_SETTINGS.concurrency
+    )
+    assert settings.mem0_project_id == PROJECT
+    assert settings.search_timeout_s == run_live.base_config.queue.search_timeout_seconds
+    assert settings.transcript_queries == len(TRANSCRIPT_QUERIES)
+    metrics = _metrics(run_inputs.run_dir)
+    recall_at_10 = EmbeddingMetricId.KNOWN_ITEM_RECALL_AT_10
+    assert metrics[(recall_at_10, IndexConfiguration.WITH_INDICES)].value == 1.0
+    assert metrics[(recall_at_10, IndexConfiguration.EMBEDDING_ONLY)].value == 2 / 3
+    scratch = run_inputs.spec.scratch_group_id
+    assert scratch in run_live.client.graphs and scratch in run_live.qdrant.points
     assert f'run: {run_inputs.run_dir}' in capsys.readouterr().out
 
 
-def test_the_mem0_ranker_is_e1s_own_canonical_hit_over_the_pinned_canonical(
-    harness, live, run_inputs, monkeypatch
+def test_embed_runs_mem0_recall_finds_a_reworded_canonical_by_its_pinned_id(
+    harness, run_live, run_inputs
 ):
-    probe = harness.load_probe_module()
-    entries: list[Any] = []
-    real_hit = probe.canonical_hit
+    assert harness.main(run_inputs.argv(), deps=run_live.factory(harness)) == harness.EXIT_OK
 
-    def recording_hit(results: list, entry: Any, k: int, **kwargs: Any) -> Any:
-        entries.append(entry)
-        return real_hit(results, entry, k, **kwargs)
-
-    captured: dict[str, Any] = {}
-
-    async def recording_run(spec: Any, probe_set: Any, **kwargs: Any) -> Any:
-        captured.update(kwargs)
-        return embedding_run_manifest(spec)
-
-    monkeypatch.setattr(probe, 'canonical_hit', recording_hit)
-    monkeypatch.setattr(harness, 'run_embedding_arm', recording_run)
-    assert harness.main(run_inputs.argv(), deps=live.factory(harness)) == harness.EXIT_OK
-
-    hits = (ReplicaHit(id='other', content='unrelated'),
-            ReplicaHit(id=ID_RECORD.id, content='reworded since the fixture was hashed'))
-    assert captured['rank_mem0']('topic-by-id', hits) == 2
-    [entry] = entries
-    assert entry.canonical.content_hash == 'deadbeefdeadbeef'
-    assert entry.canonical.last_known_id == ID_RECORD.id
+    metrics = _metrics(run_inputs.run_dir)
+    assert metrics[(EmbeddingMetricId.MEM0_KNOWN_ITEM_RECALL_AT_10, None)].value == 1 / 2
+    assert metrics[(EmbeddingMetricId.MEM0_MRR, None)].value == pytest.approx((1 / 2 + 0) / 2)
 
 
 def test_embed_run_refuses_an_llm_spec_before_any_dependency(
-    harness, live, run_inputs, tmp_path, capsys
+    harness, run_live, run_inputs, tmp_path, capsys
 ):
     llm = _spec_file(tmp_path / 'llm.json', llm_spec())
 
-    err = _refused(harness, run_inputs.argv(llm), live.factory(harness), capsys,
+    err = _refused(harness, run_inputs.argv(llm), run_live.factory(harness), capsys,
                    harness.EXIT_REFUSED)
 
     assert 'llm' in err
-    assert live.factory_calls == 0
+    assert run_live.factory_calls == 0
 
 
 def test_embed_run_whose_corpus_sha_is_not_the_probe_sets_exits_6(
-    harness, live, run_inputs, tmp_path, capsys
+    harness, run_live, run_inputs, tmp_path, capsys
 ):
     stale = _spec_file(tmp_path / 'stale.json', run_inputs.spec, corpus_sha='0' * 64)
 
-    err = _refused(harness, run_inputs.argv(stale), live.factory(harness), capsys,
+    err = _refused(harness, run_inputs.argv(stale), run_live.factory(harness), capsys,
                    harness.EXIT_CORPUS_INTEGRITY)
 
     assert str(run_inputs.probe_set) in err
-    assert live.factory_calls == 0
+    assert run_live.factory_calls == 0
 
 
-def test_embed_run_on_a_protected_graph_exits_5(harness, live, run_inputs, tmp_path, capsys):
+def test_embed_run_on_a_protected_graph_exits_5(harness, run_live, run_inputs, tmp_path, capsys):
     guarded = _spec_file(tmp_path / 'guarded.json', run_inputs.spec, scratch_group_id='dark_factory')
 
-    err = _refused(harness, run_inputs.argv(guarded), live.factory(harness), capsys,
+    err = _refused(harness, run_inputs.argv(guarded), run_live.factory(harness), capsys,
                    harness.EXIT_SCRATCH_GUARD)
 
     assert 'ScratchGuardError' in err
-    assert live.factory_calls == 0
+    assert run_live.factory_calls == 0
+
+
+def test_embed_run_over_a_stale_replica_exits_2_naming_teardown_before_any_copy(
+    harness, run_live, run_inputs, capsys
+):
+    run_live.qdrant.points[run_inputs.spec.scratch_group_id] = []
+
+    err = _refused(harness, run_inputs.argv(), run_live.factory(harness), capsys,
+                   harness.EXIT_REFUSED)
+
+    assert 'teardown --arm-spec' in err
+    assert set(run_live.log) == {'presence'}
+    assert not (run_inputs.run_dir / 'run.json').exists()
 
 
 def test_embed_run_whose_reference_moved_exits_3_with_no_run_json(
-    harness, live, run_inputs, capsys
+    harness, run_live, run_inputs, capsys
 ):
-    live.falkor = FakeFalkor(
-        lambda cypher: [[{**row, 'name': 'moved'}] for row in NODE_ROWS] if cypher == NODE_CYPHER
-        else _reference_rows(cypher)
-    )
+    run_live.reference.nodes['n0']['name'] = 'moved'
 
-    err = _refused(harness, run_inputs.argv(), live.factory(harness), capsys,
+    err = _refused(harness, run_inputs.argv(), run_live.factory(harness), capsys,
                    harness.EXIT_CHECK_FAILED)
 
     assert 'frozen-reference-unchanged' in err
     assert not (run_inputs.run_dir / 'run.json').exists()
-    assert {kind for kind, _ in live.falkor.calls} <= {'select_graph', 'ro_query'}
+    assert 'copy' not in run_live.log
 
 
 # --- embed-preregister and embed-compare -----------------------------------------------
