@@ -6047,40 +6047,24 @@ class Scheduler:
                 data={'new_order': new_order},
             )
 
-    def _owner_is_live_dispatchable(
-        self,
-        task_id: str,
-        status_map: dict[str, str],
-        tasks_by_id: dict[str, Any],
-    ) -> bool:
-        """Return True iff *task_id* is a live, dispatchable task.
+    def _owner_is_live_dispatchable(self, ctx: TickContext, task_id: str) -> bool:
+        """The park-hold predicate (:meth:`_park_gc_reason`) seen from the operator lever.
 
-        Logical INVERSE of the _park_gc reclaimability predicate
-        (scheduler.py:2996-3002): an owner is live-dispatchable iff
-        its status is not terminal AND it is present in tasks_by_id AND
-        all its deps are satisfied.
-
-        Used by the D4 guard in _drain_park_eviction_requests to refuse
-        force_clear on an owner the scheduler still considers legitimately
-        held — preventing re-introduction of the df-1865 destructive-eviction
-        starvation.
+        Since esc-6040-7 D1 the evict lever mostly duplicates park GC: any
+        owner GC would expire is evicted here first (the drain runs just
+        ahead of GC, so reservation_force_evicted wins), and the lever is
+        refused exactly for the owners GC keeps — pending, dependencies
+        satisfied or merely unknown.  That refusal is the D4 guard against
+        the df-1865 destructive-eviction starvation.
         """
-        if status_map.get(task_id) in TERMINAL_STATUSES:
-            return False
-        if task_id not in tasks_by_id:
-            return False
-        return self._deps_satisfied(tasks_by_id[task_id], status_map, tasks_by_id)
+        return self._park_gc_reason(ctx, task_id) is None
 
-    def _drain_park_eviction_requests(
-        self,
-        status_map: dict[str, str],
-        tasks_by_id: dict[str, Any],
-    ) -> None:
+    def _drain_park_eviction_requests(self, ctx: TickContext) -> None:
         """Drain queued park-eviction requests and apply force_clear for dead owners.
 
-        Called once per acquire_next tick BEFORE the owner-state park-GC sweep
-        so the operator audit event (reservation_force_evicted) wins over
-        park-GC's reservation_expired for the same dead owner.
+        Called once per acquire_next tick immediately ahead of the owner-state
+        park-GC sweep so the operator audit event (reservation_force_evicted)
+        wins over park-GC's reservation_expired for the same dead owner.
 
         D4 guard: if the owner is still a live dispatchable task, the row is
         consumed (one-shot) but force_clear is NOT applied — a
@@ -6096,7 +6080,7 @@ class Scheduler:
         for task_id in self._park_eviction_store.drain(self._project_root):
             # D4 guard: refuse eviction of a live, dispatchable owner.
             source = self.lock_table.reservation_source(task_id)
-            if self._owner_is_live_dispatchable(task_id, status_map, tasks_by_id):
+            if self._owner_is_live_dispatchable(ctx, task_id):
                 self._emit_reservation(
                     EventType.reservation_force_evict_refused,
                     task_id,
@@ -6605,14 +6589,14 @@ class Scheduler:
     async def _phase_drain_park_eviction(self, ctx: TickContext) -> object:
         """Hygiene: drain queued operator force-evict requests.
 
-        Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes: none on
-        ctx (mutates the park-eviction store + lock table directly via
-        ``_drain_park_eviction_requests``). Runs immediately ahead of
-        ``park_gc``, so an operator eviction emits reservation_force_evicted
-        rather than being pre-empted by reservation_expired for the same
-        owner. Always continues.
+        Reads: the same ctx fields as ``park_gc``, through the park-hold
+        predicate. Writes: none on ctx (mutates the park-eviction store +
+        lock table directly via ``_drain_park_eviction_requests``). Runs
+        immediately ahead of ``park_gc``, so an operator eviction emits
+        reservation_force_evicted rather than being pre-empted by
+        reservation_expired for the same owner. Always continues.
         """
-        self._drain_park_eviction_requests(ctx.status_map, ctx.tasks_by_id)
+        self._drain_park_eviction_requests(ctx)
         return _CONTINUE
 
     async def _phase_park_gc(self, ctx: TickContext) -> object:
@@ -8139,11 +8123,10 @@ class Scheduler:
         )
         if tasks is None:
             # fm read FAILURE (survey finding C3) — do NOT drain.  Draining
-            # here would call _drain_park_eviction_requests({}, {}), and with
-            # empty status_map/tasks_by_id, _owner_is_live_dispatchable
-            # returns False for EVERY task_id (not in tasks_by_id), bypassing
-            # the D4 live-owner guard and force-evicting still-live owners
-            # during exactly an fm outage/restart.  Defer instead — the next
+            # here would run on an empty TickContext, where the park-hold
+            # predicate reads EVERY owner as 'missing', bypassing the D4
+            # live-owner guard and force-evicting still-live owners during
+            # exactly an fm outage/restart.  Defer instead — the next
             # successful tick will drain any still-queued requests safely.
             self._note_fm_read_failure()
             self._emit_tick_telemetry(None, tick_started, {}, 'get_tasks_failed', None)
@@ -8151,13 +8134,15 @@ class Scheduler:
         self._reset_fm_read_failure_streak()
         if not tasks:
             # Genuine EMPTY project (not a failure) — drain queued
-            # park-eviction requests even though no active tasks exist. With
-            # empty status_map/tasks_by_id, _owner_is_live_dispatchable
-            # returns False for all task_ids (not in tasks_by_id) — all queued
-            # evictions are processed.  Without this, an operator-enqueued
-            # eviction for a stranded park sits in the table indefinitely until
-            # some active task happens to appear and trigger a normal tick.
-            self._drain_park_eviction_requests({}, {})
+            # park-eviction requests even though no active tasks exist. On an
+            # empty TickContext the park-hold predicate reads every owner as
+            # 'missing' — all queued evictions are processed.  Without this,
+            # an operator-enqueued eviction for a stranded park sits in the
+            # table indefinitely until some active task happens to appear and
+            # trigger a normal tick.
+            self._drain_park_eviction_requests(
+                TickContext(tasks=[], status_map={}, tasks_by_id={})
+            )
             self._emit_tick_telemetry(None, tick_started, {}, 'no_active_tasks', None)
             return None
 
