@@ -50,6 +50,18 @@ def _carried(**fields: object) -> dict[str, object]:
     return {'kind': 'carried_by', 'carrier_task_id': 6524, **fields}
 
 
+def _until_request(**fields: object) -> UntilConditionRequest:
+    request = parse_request(_until(**fields), now=NOW)
+    assert isinstance(request, UntilConditionRequest)
+    return request
+
+
+def _held_request(**fields: object) -> HeldBySessionRequest:
+    request = parse_request(_held(**fields), now=NOW)
+    assert isinstance(request, HeldBySessionRequest)
+    return request
+
+
 # --- vocabulary --------------------------------------------------------------
 
 
@@ -111,13 +123,13 @@ def test_reason_at_its_limit_is_accepted_on_every_kind(kind):
 def test_condition_at_its_limit_is_accepted():
     condition = 'c' * CONDITION_MAX_CHARS
 
-    assert parse_request(_until(condition=condition), now=NOW).condition == condition
+    assert _until_request(condition=condition).condition == condition
     assert CONDITION_MAX_CHARS == 500
 
 
 @pytest.mark.parametrize('grace_secs', GRACE_BOUNDS)
 def test_grace_bounds_are_inclusive(grace_secs):
-    assert parse_request(_held(grace_secs=grace_secs), now=NOW).grace_secs == grace_secs
+    assert _held_request(grace_secs=grace_secs).grace_secs == grace_secs
     assert GRACE_BOUNDS == (600, 86400)
 
 
@@ -126,23 +138,23 @@ def test_grace_bounds_are_inclusive(grace_secs):
     ['2026-10-10T00:00:00', '2026-10-10T02:00:00+02:00', '2026-10-10T00:00:00Z'],
 )
 def test_expires_at_is_normalised_to_utc(expires_at):
-    request = parse_request(_until(expires_at=expires_at), now=NOW)
+    expiry = _until_request(expires_at=expires_at).expires_at
 
-    assert request.expires_at == datetime(2026, 10, 10, tzinfo=UTC)
-    assert request.expires_at.tzinfo is UTC
+    assert expiry == datetime(2026, 10, 10, tzinfo=UTC)
+    assert expiry is not None and expiry.tzinfo is UTC
 
 
 def test_expires_at_one_microsecond_ahead_is_accepted():
     soonest = NOW + timedelta(microseconds=1)
 
-    assert parse_request(_until(expires_at=soonest.isoformat()), now=NOW).expires_at == soonest
+    assert _until_request(expires_at=soonest.isoformat()).expires_at == soonest
 
 
 def test_requests_are_frozen():
-    request = parse_request(_until(), now=NOW)
+    request = _until_request()
 
     with pytest.raises(ValidationError):
-        request.condition = 'y'  # type: ignore[misc]
+        request.condition = 'y'
 
 
 # --- refusals ----------------------------------------------------------------
