@@ -33,6 +33,7 @@ from fused_memory.models.scope import ProjectRoot, ProjectScope, resolve_main_ch
 from fused_memory.reconciliation.blocked_gate_audit_section import (
     render_blocked_gate_audit_section,
 )
+from fused_memory.reconciliation.capped_task_list import render_capped_task_list
 from fused_memory.reconciliation.cli_stage_runner import (
     STAGE2_DISALLOWED,
     STAGE3_DISALLOWED,
@@ -4413,38 +4414,27 @@ class TaskKnowledgeSync(BaseStage):
                 if boundary is not None
                 else 'no prior full-run boundary (first cycle — all done tasks in scope)'
             )
-            # Defensive render cap: never a silent truncation.  select_done_since_boundary
-            # sorts most-recent-first (and parse-failures to the front), so a clip
-            # drops only the oldest tasks, and the note + WARNING log make the
-            # clipped coverage explicit (no-silent-caps principle).
-            rendered_audit = audit_tasks
-            overflow_note = ''
-            if total_audit > self.MAX_DONE_AUDIT_RENDERED:
-                rendered_audit = audit_tasks[: self.MAX_DONE_AUDIT_RENDERED]
-                omitted = total_audit - self.MAX_DONE_AUDIT_RENDERED
-                overflow_note = (
-                    f'\n_NOTE: {omitted} additional done task(s) since the boundary were '
-                    f'omitted from this render by the MAX_DONE_AUDIT_RENDERED='
-                    f'{self.MAX_DONE_AUDIT_RENDERED} cap. Coverage was clipped — NOT complete '
-                    f'this cycle; the oldest since-boundary tasks were dropped first._'
-                )
-                logger.warning(
-                    'reconciliation.done_task_audit_render_capped',
-                    extra={
-                        'project_id': self.project_id,
-                        'run_id': self._current_run_id,
-                        'total_since_boundary': total_audit,
-                        'rendered': self.MAX_DONE_AUDIT_RENDERED,
-                        'omitted': omitted,
-                        'boundary': boundary_label,
-                    },
-                )
+            # select_done_since_boundary sorts most-recent-first (and parse-failures
+            # to the front), so a clip drops only the oldest tasks.
+            audit_body = render_capped_task_list(
+                audit_tasks,
+                cap=self.MAX_DONE_AUDIT_RENDERED,
+                cap_name='MAX_DONE_AUDIT_RENDERED',
+                omitted_noun='done task(s) since the boundary',
+                dropped_first='the oldest since-boundary tasks',
+                log_event='reconciliation.done_task_audit_render_capped',
+                log_extra={
+                    'project_id': self.project_id,
+                    'run_id': self._current_run_id,
+                    'total_since_boundary': total_audit,
+                    'boundary': boundary_label,
+                },
+            )
             done_audit_section = (
                 f'\n### Done-Task Completion-Memory Audit '
                 f'({total_audit} since last cycle)\n'
                 f'Boundary (last full-run completed): {boundary_label}\n'
-                f'{format_task_list(rendered_audit)}\n'
-                f'{overflow_note}'
+                f'{audit_body}'
             )
 
         # Every blocked gate, not the MIN_TASK_SAMPLE survivors: in-progress tasks

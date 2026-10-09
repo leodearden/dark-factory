@@ -6,15 +6,13 @@ human, the order they are listed in, and the section's rendered form.
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Iterable
 from datetime import UTC, datetime
 
 from shared.timestamps import parse_timestamp_or_warn
 
-from fused_memory.reconciliation.task_filter import format_task_list, id_key
-
-logger = logging.getLogger(__name__)
+from fused_memory.reconciliation.capped_task_list import render_capped_task_list
+from fused_memory.reconciliation.task_filter import id_key
 
 BLOCKED_GATE_AUDIT_HEADER = '### Blocked Gate-Task Review Audit'
 
@@ -30,33 +28,17 @@ def render_blocked_gate_audit_section(
     """Render every blocked gate task, rendering the header even when none exist."""
     gates = select_blocked_gate_tasks(active_tasks)
     total = len(gates)
-    rendered = gates
-    overflow_note = ''
-    if total > MAX_BLOCKED_GATE_AUDIT_RENDERED:
-        # The head is the OLDEST gates only because select_blocked_gate_tasks sorts ascending.
-        rendered = gates[:MAX_BLOCKED_GATE_AUDIT_RENDERED]
-        omitted = total - MAX_BLOCKED_GATE_AUDIT_RENDERED
-        overflow_note = (
-            f'\n_NOTE: {omitted} additional blocked gate task(s) were omitted from this render '
-            f'by the MAX_BLOCKED_GATE_AUDIT_RENDERED={MAX_BLOCKED_GATE_AUDIT_RENDERED} cap. '
-            f'Coverage was clipped — NOT complete this cycle; the most recently escalated '
-            f'gates were dropped first._'
-        )
-        logger.warning(
-            'reconciliation.gate_task_audit_render_capped',
-            extra={
-                'project_id': project_id,
-                'run_id': run_id,
-                'total_gate_tasks': total,
-                'rendered': MAX_BLOCKED_GATE_AUDIT_RENDERED,
-                'omitted': omitted,
-            },
-        )
-    return (
-        f'\n{BLOCKED_GATE_AUDIT_HEADER} ({total} gate task(s) awaiting review)\n'
-        f'{format_task_list(rendered)}\n'
-        f'{overflow_note}'
+    # The kept head is the OLDEST gates only because select_blocked_gate_tasks sorts ascending.
+    body = render_capped_task_list(
+        gates,
+        cap=MAX_BLOCKED_GATE_AUDIT_RENDERED,
+        cap_name='MAX_BLOCKED_GATE_AUDIT_RENDERED',
+        omitted_noun='blocked gate task(s)',
+        dropped_first='the most recently escalated gates',
+        log_event='reconciliation.gate_task_audit_render_capped',
+        log_extra={'project_id': project_id, 'run_id': run_id, 'total_gate_tasks': total},
     )
+    return f'\n{BLOCKED_GATE_AUDIT_HEADER} ({total} gate task(s) awaiting review)\n{body}'
 
 
 def select_blocked_gate_tasks(active_tasks: Iterable[object]) -> list[dict]:

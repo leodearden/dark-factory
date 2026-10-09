@@ -150,7 +150,6 @@ class TestSelectBlockedGateTasks:
         assert tasks == before
 
 
-_MODULE_LOGGER = 'fused_memory.reconciliation.blocked_gate_audit_section'
 _CAP_EVENT = 'reconciliation.gate_task_audit_render_capped'
 
 
@@ -193,7 +192,7 @@ class TestRenderBlockedGateAuditSection:
 
     def test_render_cap_keeps_oldest_drops_newest_with_overflow_note(self, caplog):
         total = MAX_BLOCKED_GATE_AUDIT_RENDERED + 5
-        with caplog.at_level(logging.WARNING, logger=_MODULE_LOGGER):
+        with caplog.at_level(logging.WARNING):
             section = _render(_stamped_gates(total))
         assert _rendered_ids(section) == list(range(1, MAX_BLOCKED_GATE_AUDIT_RENDERED + 1))
         assert f'({total} gate task(s) awaiting review)' in section
@@ -216,7 +215,7 @@ class TestRenderBlockedGateAuditSection:
         assert unstamped_id in _rendered_ids(section)
 
     def test_no_overflow_note_or_warning_under_cap(self, caplog):
-        with caplog.at_level(logging.WARNING, logger=_MODULE_LOGGER):
+        with caplog.at_level(logging.WARNING):
             section = _render(_stamped_gates(MAX_BLOCKED_GATE_AUDIT_RENDERED))
         assert len(_rendered_ids(section)) == MAX_BLOCKED_GATE_AUDIT_RENDERED
         assert '_NOTE' not in section
@@ -227,5 +226,5 @@ class TestStage2PromptNamesTheAudit:
     """The payload section never ships without the system prompt telling the model to review it."""
 
     @pytest.mark.parametrize('project_id', ['dark_factory', 'autopilot_video'])
-    def test_prompt_names_the_section_header(self, project_id):
-        assert BLOCKED_GATE_AUDIT_HEADER in build_stage2_system_prompt(project_id)
+    def test_prompt_names_the_section_header_exactly_once(self, project_id):
+        assert build_stage2_system_prompt(project_id).count(BLOCKED_GATE_AUDIT_HEADER) == 1
