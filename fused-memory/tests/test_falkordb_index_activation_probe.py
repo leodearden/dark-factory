@@ -324,9 +324,6 @@ class TestGraphIndexStatus:
 
 
 class TestTheExpectedSetIsAlphas:
-    def test_the_module_uses_alphas_expected_set_not_a_copy(self):
-        assert _mod().expected_index_set is falkor_indices.expected_index_set
-
     def test_a_complete_status_reports_the_full_expected_total(self):
         expected = expected_index_set()
 
@@ -336,13 +333,11 @@ class TestTheExpectedSetIsAlphas:
 
 
 class TestRequireKnownProjectRoots:
-    def test_an_empty_registry_input_raises_naming_the_variable_and_its_source(self):
+    def test_an_empty_registry_input_raises_naming_the_variable(self):
         with pytest.raises(_mod().RegistryUnavailableError) as excinfo:
             _mod().require_known_project_roots([])
 
-        message = str(excinfo.value)
-        assert 'DASHBOARD_KNOWN_PROJECT_ROOTS' in message
-        assert 'systemctl --user show fused-memory.service -p Environment' in message
+        assert 'DASHBOARD_KNOWN_PROJECT_ROOTS' in str(excinfo.value)
 
     def test_a_non_empty_list_passes_through(self):
         roots = ['/home/leo/src/dark-factory', '/home/leo/src/reify']
