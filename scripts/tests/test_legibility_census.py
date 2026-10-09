@@ -42,6 +42,7 @@ from legibility import (
     unlanded,
     verdict,
 )
+from quality_doc_texts import code_quality
 from shared.cap_markers import (
     BLOCKING_BANNER_MARKERS,
     REAL_CLI_CAP_HIT_MESSAGES,
@@ -7689,6 +7690,70 @@ def test_default_verify_fn_logs_one_warning_per_verdict_normalisation(tmp_path, 
     for kind, offered in (("tag_dropped", "'bogus'"), ("severity_substituted", "'critical'")):
         naming = [m for m in messages if _REMEDIATED_TITLE in m and kind in m and offered in m]
         assert len(naming) == 1, (kind, messages)
+
+
+# ---------------------------------------------------------------------------
+# task 6401 step-9: RED — both census prompts embed the quality definition
+# rendered by code_quality.guidance() (docs/quality-findings-contract.md §10),
+# computed here at test time, never pasted.
+# ---------------------------------------------------------------------------
+
+_QUALITY_MARKER = "=== QUALITY DEFINITION ===\n"
+
+
+def _quality_block_of(prompt):
+    assert prompt.count(_QUALITY_MARKER) == 1
+    return prompt.split(_QUALITY_MARKER, 1)[1].split("\n=== ", 1)[0]
+
+
+_C4_KEYS = (
+    "verified", "reason", "anchor", "tags", "severity", "severity_reason", "route",
+    "remediation",
+)
+
+
+def test_verify_prompt_embeds_the_quality_definition_and_asks_for_the_c4_verdict(tmp_path):
+    fake_invoke = _make_fake_invoke(default=_verdict())
+    mod._build_default_verify_fn(str(tmp_path), fake_invoke)(_clusters(1), model="sonnet")
+    prompt = fake_invoke.calls[0]["prompt"]
+
+    assert _quality_block_of(prompt) == code_quality.guidance()
+    assert prompt.startswith("You are the periodic-census verifier")
+    for key in _C4_KEYS:
+        assert f'"{key}"' in prompt, key
+    for severity in verdict.SEVERITIES:
+        assert f'"{severity}"' in prompt, severity
+    for route in verdict.Route:
+        assert f'"{route.value}"' in prompt, route
+    assert verdict.KIND_TAG not in prompt
+    assert str(tmp_path) in prompt
+
+
+def test_synthesis_prompt_embeds_the_quality_definition_and_the_verdicts(tmp_path):
+    root = _tree_with_guide(tmp_path)
+    found = verdict.parse_verdict(
+        {
+            "verified": True,
+            "reason": "r",
+            "anchor": "docs/guide.md",
+            "tags": ["h2"],
+            "severity": "low",
+            "severity_reason": "contained",
+            "route": "structural",
+        },
+        title=_REMEDIATED_TITLE,
+        project_root=root,
+    )
+    fake_invoke = _make_fake_invoke(default="Synthesis prose.")
+
+    mod._build_default_synthesize_fn(fake_invoke)(
+        [{"title": _REMEDIATED_TITLE, "verdict": found}], model="fable",
+    )
+    prompt = fake_invoke.calls[0]["prompt"]
+
+    assert _quality_block_of(prompt) == code_quality.guidance()
+    assert '"anchor": "docs/guide.md"' in prompt
+    assert '"severity": "low"' in prompt
 
 
 # ---------------------------------------------------------------------------
