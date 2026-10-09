@@ -711,3 +711,232 @@ async def test_checkpoint_after_close_answers_unavailable(tmp_path):
         assert await store.checkpoint() == CheckpointResult.unavailable()
     finally:
         await store.close()
+
+
+# ---------------------------------------------------------------------------
+# dedup_health — the rolling-window read behind the dedup-outage detector
+# ---------------------------------------------------------------------------
+
+
+async def _set_ticket_times(
+    db_path, ticket_id: str, *, created_at: datetime, resolved_at: datetime | None,
+) -> None:
+    """Rewrite a ticket's timestamps through an independent connection to the db file."""
+    import aiosqlite
+
+    async with aiosqlite.connect(str(db_path), timeout=5) as db:
+        await db.execute(
+            'UPDATE tickets SET created_at = ?, resolved_at = ? WHERE ticket_id = ?',
+            (
+                created_at.isoformat(),
+                resolved_at.isoformat() if resolved_at is not None else None,
+                ticket_id,
+            ),
+        )
+        await db.commit()
+
+
+async def _seed_resolved(
+    store: TicketStore,
+    db_path,
+    project_id: str,
+    *,
+    status: str,
+    latency_s: float,
+    resolved_at: datetime,
+    reason: str | None = None,
+) -> str:
+    """Submit and resolve one ticket, then pin its age and resolve latency."""
+    ticket_id = await store.submit(project_id, '{}')
+    await store.mark_resolved(ticket_id, status=status, task_id='1', reason=reason)
+    await _set_ticket_times(
+        db_path,
+        ticket_id,
+        created_at=resolved_at - timedelta(seconds=latency_s),
+        resolved_at=resolved_at,
+    )
+    return ticket_id
+
+
+class TestDedupHealthWindow:
+    """``TicketStore.dedup_health`` summarises one project's curator verdicts
+    over a window: resolved/combined counts, raw wall-clock median resolve
+    latency, and the most common create reasons as opaque strings.
+    """
+
+    _OUTAGE_REASON = 'create: llm-failed: FileNotFoundError: x'
+
+    @pytest.fixture
+    def db_path(self, tmp_path):
+        return tmp_path / 'tickets.db'
+
+    @pytest.fixture
+    def now(self):
+        return datetime.now(UTC)
+
+    @pytest.fixture
+    def since(self, now):
+        return now - timedelta(hours=6)
+
+    @pytest.mark.asyncio
+    async def test_outage_shape(self, store, db_path, now, since):
+        for i in range(20):
+            await _seed_resolved(
+                store, db_path, 'proj', status='created',
+                latency_s=1.5 + i * (1.5 / 19), resolved_at=now - timedelta(minutes=i + 1),
+                reason=self._OUTAGE_REASON,
+            )
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.resolved == 20
+        assert health.combined == 0
+        assert health.median_resolve_seconds == pytest.approx(2.25, abs=1e-3)
+        assert health.top_create_reasons == ((self._OUTAGE_REASON, 20),)
+
+    @pytest.mark.asyncio
+    async def test_healthy_shape(self, store, db_path, now, since):
+        for i in range(15):
+            await _seed_resolved(
+                store, db_path, 'proj', status='created', latency_s=60 + i * 8,
+                resolved_at=now - timedelta(minutes=i + 1), reason='create: new work',
+            )
+        for i in range(5):
+            await _seed_resolved(
+                store, db_path, 'proj', status='combined', latency_s=100 + i * 20,
+                resolved_at=now - timedelta(minutes=i + 1), reason='combine: same as 12',
+            )
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.resolved == 20
+        assert health.combined == 5
+        assert health.median_resolve_seconds is not None
+        assert 60 <= health.median_resolve_seconds <= 180
+        assert health.top_create_reasons == (('create: new work', 15),)
+
+    @pytest.mark.asyncio
+    async def test_since_excludes_older_rows(self, store, db_path, now, since):
+        await _seed_resolved(
+            store, db_path, 'proj', status='created', latency_s=2.0,
+            resolved_at=now - timedelta(days=7), reason=self._OUTAGE_REASON,
+        )
+        await _seed_resolved(
+            store, db_path, 'proj', status='created', latency_s=90.0,
+            resolved_at=now - timedelta(minutes=5), reason='create: new work',
+        )
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.resolved == 1
+        assert health.median_resolve_seconds == pytest.approx(90.0, abs=1e-3)
+        assert health.top_create_reasons == (('create: new work', 1),)
+
+    @pytest.mark.asyncio
+    async def test_only_the_named_project_is_counted(self, store, db_path, now, since):
+        await _seed_resolved(
+            store, db_path, 'proj', status='created', latency_s=2.0,
+            resolved_at=now - timedelta(minutes=5), reason=self._OUTAGE_REASON,
+        )
+        for _ in range(3):
+            await _seed_resolved(
+                store, db_path, 'other', status='combined', latency_s=120.0,
+                resolved_at=now - timedelta(minutes=5), reason='combine: x',
+            )
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.resolved == 1
+        assert health.combined == 0
+
+    @pytest.mark.asyncio
+    async def test_pending_and_non_verdict_statuses_are_excluded(
+        self, store, db_path, now, since,
+    ):
+        for latency in (1.0, 2.0, 3.0):
+            await _seed_resolved(
+                store, db_path, 'proj', status='created', latency_s=latency,
+                resolved_at=now - timedelta(minutes=5), reason=self._OUTAGE_REASON,
+            )
+        await store.submit('proj', '{}')
+        for status in ('failed', 'refused', 'cancelled'):
+            await _seed_resolved(
+                store, db_path, 'proj', status=status, latency_s=500.0,
+                resolved_at=now - timedelta(minutes=5), reason=f'{status}: x',
+            )
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.resolved == 3
+        assert health.combined == 0
+        assert health.median_resolve_seconds == pytest.approx(2.0, abs=1e-3)
+        assert health.top_create_reasons == ((self._OUTAGE_REASON, 3),)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('latencies', 'expected_median'),
+        [((1.0, 2.0, 10.0), 2.0), ((1.0, 2.0, 4.0, 10.0), 3.0)],
+        ids=['odd', 'even'],
+    )
+    async def test_median_for_odd_and_even_counts(
+        self, store, db_path, now, since, latencies, expected_median,
+    ):
+        for latency in latencies:
+            await _seed_resolved(
+                store, db_path, 'proj', status='created', latency_s=latency,
+                resolved_at=now - timedelta(minutes=5), reason='create: x',
+            )
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.median_resolve_seconds == pytest.approx(expected_median, abs=1e-3)
+
+    @pytest.mark.asyncio
+    async def test_empty_window(self, store, since):
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.resolved == 0
+        assert health.combined == 0
+        assert health.median_resolve_seconds is None
+        assert health.top_create_reasons == ()
+
+    @pytest.mark.asyncio
+    async def test_null_reason_buckets_as_unrecorded(self, store, db_path, now, since):
+        await _seed_resolved(
+            store, db_path, 'proj', status='created', latency_s=2.0,
+            resolved_at=now - timedelta(minutes=5), reason=None,
+        )
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.top_create_reasons == (('(unrecorded)', 1),)
+
+    @pytest.mark.asyncio
+    async def test_top_create_reasons_keeps_the_five_most_frequent(
+        self, store, db_path, now, since,
+    ):
+        for count, reason in enumerate(('a', 'b', 'c', 'd', 'e', 'f', 'g'), start=1):
+            for _ in range(count):
+                await _seed_resolved(
+                    store, db_path, 'proj', status='created', latency_s=2.0,
+                    resolved_at=now - timedelta(minutes=5), reason=f'create: {reason}',
+                )
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert health.top_create_reasons == (
+            ('create: g', 7), ('create: f', 6), ('create: e', 5),
+            ('create: d', 4), ('create: c', 3),
+        )
+
+    @pytest.mark.asyncio
+    async def test_value_is_frozen(self, store, since):
+        import dataclasses
+
+        from fused_memory.middleware.ticket_store import DedupHealth
+
+        health = await store.dedup_health('proj', since=since)
+
+        assert isinstance(health, DedupHealth)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            health.resolved = 1  # type: ignore[misc]
