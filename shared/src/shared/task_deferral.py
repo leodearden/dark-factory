@@ -112,6 +112,7 @@ class NeedsHumanReason(StrEnum):
     LEGACY_UNKNOWN = 'legacy_unknown'
     CLOSABLE = 'closable'
     ORPHANED = 'orphaned'
+    CARRIER_MISSING = 'carrier_missing'
     STALE_PLANNING = 'stale_planning'
     STALE_CONDITION = 'stale_condition'
     EXPIRY_OVERDUE = 'expiry_overdue'
@@ -426,7 +427,8 @@ def lapse_cause(record: Deferral, now: datetime, dead_since: datetime | None) ->
     return None
 
 
-_CARRIER_STATUS_REASONS: Final[Mapping[str | None, NeedsHumanReason]] = {
+_CARRIER_STATUS_REASONS: Final[Mapping[TaskStatus | None, NeedsHumanReason]] = {
+    None: NeedsHumanReason.CARRIER_MISSING,
     TaskStatus.DONE: NeedsHumanReason.CLOSABLE,
     TaskStatus.CANCELLED: NeedsHumanReason.ORPHANED,
 }
@@ -455,10 +457,14 @@ def _until_condition_reason(
 def needs_human(
     record: Deferral | InvalidRecord | None,
     now: datetime,
-    carrier_status: str | None,
+    carrier_status: TaskStatus | None,
     liveness: Liveness | None,
 ) -> NeedsHumanReason | None:
-    """Why this hold needs a human (decision 10), or None; liveness None means not read."""
+    """Why this hold needs a human (decision 10), or None.
+
+    carrier_status None means no carrier row was found; liveness None means not read.
+    Each kind ignores the argument that is not about it.
+    """
     match record:
         case None:
             return NeedsHumanReason.MISSING_RECORD

@@ -51,6 +51,7 @@ from shared.task_deferral import (
     stamp,
 )
 from shared.task_metadata import is_known_metadata_key, parse_metadata
+from shared.task_statuses import TERMINAL, TaskStatus
 
 NOW = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
 
@@ -576,13 +577,24 @@ _NEEDS_HUMAN_CASES = [
     pytest.param(None, NOW, None, None, NeedsHumanReason.MISSING_RECORD, id='missing'),
     pytest.param(InvalidRecord('x'), NOW, None, None, NeedsHumanReason.INVALID_RECORD, id='bad'),
     pytest.param(_LEGACY, NOW, None, None, NeedsHumanReason.LEGACY_UNKNOWN, id='legacy'),
-    pytest.param(_CARRIED, NOW, 'done', None, NeedsHumanReason.CLOSABLE, id='carrier-done'),
     pytest.param(
-        _CARRIED, NOW, 'cancelled', None, NeedsHumanReason.ORPHANED, id='carrier-cancelled'
+        _CARRIED, NOW, TaskStatus.DONE, None, NeedsHumanReason.CLOSABLE, id='carrier-done'
+    ),
+    pytest.param(
+        _CARRIED,
+        NOW,
+        TaskStatus.CANCELLED,
+        None,
+        NeedsHumanReason.ORPHANED,
+        id='carrier-cancelled',
     ),
     *(
         pytest.param(_CARRIED, NOW, status, None, None, id=f'carrier-{status}')
-        for status in ('pending', 'in-progress', 'deferred', None)
+        for status in TaskStatus
+        if status not in TERMINAL
+    ),
+    pytest.param(
+        _CARRIED, NOW, None, None, NeedsHumanReason.CARRIER_MISSING, id='carrier-missing'
     ),
     pytest.param(_PLANNING, NOW + _STALE_PLANNING, None, None, None, id='planning-at-limit'),
     pytest.param(
@@ -634,7 +646,9 @@ _NEEDS_HUMAN_CASES = [
         _HELD_DEFAULT, NOW + timedelta(days=365), None, Liveness.ALIVE, None, id='alive-a-year'
     ),
     pytest.param(_OPEN_ENDED, NOW, None, None, None, id='condition-ignores-liveness'),
-    pytest.param(_CARRIED, NOW, 'pending', Liveness.DEAD, None, id='carried-ignores-liveness'),
+    pytest.param(
+        _CARRIED, NOW, TaskStatus.PENDING, Liveness.DEAD, None, id='carried-ignores-liveness'
+    ),
 ]
 
 
