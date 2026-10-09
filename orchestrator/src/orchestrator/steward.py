@@ -44,7 +44,7 @@ import contextlib
 import json
 import logging
 from collections.abc import MutableMapping, MutableSet
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -816,12 +816,20 @@ class TaskSteward:
         delivers that real prompt to the agent on resume, instead of its
         crash-recovery placeholder ('continue').
 
-        On an unresumable cap hit (no session_id survives the capped call),
-        the shared loop calls back into ``rebuild_prompt`` below to rebuild
-        the full initial prompt with freshly-gathered pending escalations —
-        context is lost across account switches.
+        Before every re-dispatch the shared loop awaits ``rebuild_prompt``
+        below.  It re-reads *escalation* from the queue and declines (None)
+        once that record is no longer pending, so a retry never re-runs
+        finished work.  Otherwise it rebuilds the full initial prompt from
+        the LIVE record and freshly-gathered pending escalations; a fresh
+        retry sends it, a resumed one keeps its own continuation.  The
+        handled copy's ``detail``/``summary`` are laid over the live record
+        because pre-triage replaces exactly those two fields on a copy it
+        never persists.
         """
-        async def rebuild_prompt(session_lost: bool) -> str:
+        async def rebuild_prompt() -> str | None:
+            live = self.escalation_queue.get(escalation.id)
+            if live is None or live.status != 'pending':
+                return None
             pending_dicts = [
                 e.to_dict()
                 for e in self.escalation_queue.get_by_task(
@@ -830,7 +838,9 @@ class TaskSteward:
             ]
             return await self.briefing.build_steward_initial_prompt(
                 task=self.task,
-                escalation=escalation.to_dict(),
+                escalation=replace(
+                    live, detail=escalation.detail, summary=escalation.summary,
+                ).to_dict(),
                 pending_escalations=pending_dicts,
                 worktree=self.worktree,
             )

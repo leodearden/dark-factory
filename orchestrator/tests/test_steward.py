@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import logging
 from pathlib import Path
@@ -458,9 +459,11 @@ class TestStewardInvokeWithCapRetryWiring:
     async def test_rebuild_prompt_hook_regathers_pending_and_rebuilds_initial(
         self, steward, worktree, mock_mcp, mock_briefing,
     ):
-        """The rebuild_prompt closure re-queries pending escalations and calls
-        build_steward_initial_prompt with the freshly-gathered list."""
-        esc = _make_escalation()
+        """The rebuild_prompt closure re-reads the live record, re-queries pending
+        escalations and calls build_steward_initial_prompt with both."""
+        live = _make_escalation(detail='as filed')
+        esc = dataclasses.replace(live, detail='pre-triaged', summary='triaged summary')
+        steward.escalation_queue.get.return_value = live
         mcp_config = mock_mcp.mcp_config_json()
         fresh_pending = [_make_escalation(id='esc-42-9')]
         steward.escalation_queue.get_by_task.return_value = fresh_pending
@@ -478,14 +481,15 @@ class TestStewardInvokeWithCapRetryWiring:
             )
 
         rebuild_prompt = mock_iwcr.call_args.kwargs['rebuild_prompt']
-        result = await rebuild_prompt(True)
+        result = await rebuild_prompt()
 
+        steward.escalation_queue.get.assert_called_with(esc.id)
         steward.escalation_queue.get_by_task.assert_called_with(
             steward.task_id, status='pending',
         )
         mock_briefing.build_steward_initial_prompt.assert_called_once_with(
             task=steward.task,
-            escalation=esc.to_dict(),
+            escalation={**live.to_dict(), 'detail': esc.detail, 'summary': esc.summary},
             pending_escalations=[e.to_dict() for e in fresh_pending],
             worktree=steward.worktree,
         )
@@ -580,6 +584,8 @@ class TestStewardWedgeGuardInheritance:
         steward._session_id = 'sess-wedged'
         steward.usage_gate = _make_pre_triage_gate()
         mock_briefing.build_steward_initial_prompt.return_value = 'REBUILT-INITIAL'
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = esc  # still pending: the retry proceeds
 
         wedge_result = _make_result(
             success=False, cost=0, turns=0, duration_ms=1_800_000,
@@ -599,7 +605,7 @@ class TestStewardWedgeGuardInheritance:
                 cwd=worktree,
                 mcp_config={},
                 per_invocation_budget=5.0,
-                escalation=_make_escalation(),
+                escalation=esc,
             )
 
         assert mock_invoke.call_count == 2
@@ -636,9 +642,9 @@ class TestStewardCapHitBackoff:
         from shared.cli_invoke import _CAP_HIT_COOLDOWN_SECS
 
         esc = _make_escalation()
-        steward.escalation_queue.get.return_value = _make_escalation(
-            status='resolved', resolution='fixed',
-        )
+        # Still pending while the cap retry runs: a resolved record would
+        # (correctly) make the steward's prompt builder decline the retry.
+        steward.escalation_queue.get.return_value = esc
 
         steward.usage_gate = _make_pre_triage_gate(cap_effects=[True, False])
 
@@ -677,9 +683,9 @@ class TestStewardCapHitBackoff:
         it as an invocation count.
         """
         esc = _make_escalation()
-        steward.escalation_queue.get.return_value = _make_escalation(
-            status='resolved', resolution='fixed',
-        )
+        # Still pending while the cap retries run: a resolved record would
+        # (correctly) make the steward's prompt builder decline the retry.
+        steward.escalation_queue.get.return_value = esc
         steward.usage_gate = _make_pre_triage_gate(cap_effects=[True, True, False])
 
         with (
@@ -709,9 +715,9 @@ class TestStewardCapHitBackoff:
         # Set an existing session so _handle_escalation takes the continuation path
         steward._session_id = 'sess-existing'
         esc = _make_escalation()
-        steward.escalation_queue.get.return_value = _make_escalation(
-            status='resolved', resolution='fixed',
-        )
+        # Still pending while the cap retry runs: a resolved record would
+        # (correctly) make the steward's prompt builder decline the retry.
+        steward.escalation_queue.get.return_value = esc
 
         steward.usage_gate = _make_pre_triage_gate(cap_effects=[True, False])
 
@@ -725,15 +731,18 @@ class TestStewardCapHitBackoff:
             # Second call should resume with the capped session
             second_call = mock_invoke.call_args_list[1]
             assert second_call.kwargs.get('resume_session_id') == 'sess-capped'
-            # Briefing should NOT have been rebuilt (was continuation, not initial)
-            mock_briefing.build_steward_initial_prompt.assert_not_called()
+            # The builder is consulted before the resumed retry (so a finished
+            # escalation could cancel it), but the resumed session is NOT sent
+            # its rebuilt initial briefing.
+            from shared.cli_invoke import CAP_HIT_RESUME_PROMPT
+            assert second_call.kwargs.get('prompt') == CAP_HIT_RESUME_PROMPT
 
     async def test_rebuilds_prompt_only_when_no_session(self, steward, mock_briefing):
         """Cap hit with empty session_id → full prompt rebuild in _invoke_with_session."""
         esc = _make_escalation()
-        steward.escalation_queue.get.return_value = _make_escalation(
-            status='resolved', resolution='fixed',
-        )
+        # Still pending while the cap retry runs: a resolved record would
+        # (correctly) make the steward's prompt builder decline the retry.
+        steward.escalation_queue.get.return_value = esc
 
         steward.usage_gate = _make_pre_triage_gate(cap_effects=[True, False])
 
@@ -830,6 +839,7 @@ class TestStewardAccountName:
         ))
 
         esc = _make_escalation()
+        steward.escalation_queue.get.return_value = esc  # still pending: the retry proceeds
         mcp_config = mock_mcp.mcp_config_json()
 
         with (
@@ -1047,6 +1057,8 @@ class TestStewardTimeoutPassthrough:
         mock_config.timeouts.steward = 900.0
 
         steward.usage_gate = _make_pre_triage_gate(cap_effects=[True, False])
+        esc = _make_escalation()
+        steward.escalation_queue.get.return_value = esc  # still pending: the retry proceeds
 
         with (
             patch('orchestrator.steward.invoke_agent', new_callable=AsyncMock) as mock_invoke,
@@ -1058,7 +1070,7 @@ class TestStewardTimeoutPassthrough:
                 cwd=steward.worktree,
                 mcp_config={},
                 per_invocation_budget=5.0,
-                escalation=_make_escalation(),
+                escalation=esc,
             )
 
         assert mock_invoke.call_count == 2
