@@ -35,6 +35,16 @@ edit converts a grandfathered suppression into one somebody has to own.
 * *It models no suppression kind outside* :data:`KIND_SPECS`, whose
   docstring names the extension point.
 
+**Authoring rule.**  Every suppression or disposition marker this scanner's
+source mentions is written in a docstring or another string literal, never in
+a ``#`` comment.  A comment quoting one IS one: ruff parses it and warns that
+the directive is invalid, and this scanner reads it as a site of its own
+corpus.  A docstring is a STRING, which is precisely what the token walk tells
+apart.
+``scripts/tests/test_inline_suppression_ratchet.py::test_the_live_tree_carries_no_disposition_faults``
+enforces the rule tree-wide for disposition markers, and the ratchet enforces
+it for suppression markers once the baseline is seeded.
+
 **Consumers.**  Task 5602's exception register reads ``--json`` for the
 closed-world check of inline ``ratified:`` ids and for the per-``(kind, code)``
 table it renders; task 5607 runs ``--seed`` once at the cutover; task 5609 runs
@@ -90,8 +100,7 @@ class InstrumentFailure(Exception):
     THE NAME STATES THE CONSUMER-RELEVANT FACT RATHER THAN A CAUSE, the same
     choice ``shared.ratchet.BaselineUnusable`` argues for: every cause
     :data:`_EPILOG` lists under exit 2 means one identical thing to a caller —
-    *this run measured nothing you can trust*.  Splitting them by cause would
-    hand ``main`` five ``except`` clauses that all do one thing.
+    *this run measured nothing you can trust*.
 
     Categorically apart from a VIOLATION, which is exit 1.  That separation is
     the whole point: a broken instrument reported as a finding sends an agent
@@ -288,12 +297,9 @@ def _noqa_codes(match: re.Match[str]) -> tuple[str, ...]:
     """``# noqa: E402,F401`` — read left to right, STOPPING at the first token
     that is not code-shaped.
 
-    MEASURED, NOT ASSUMED (this tree, 2026-09-19).  ``noqa`` markers here carry
-    232 distinct tails and the prose-bearing ones are ordinary: ``# noqa: F401
-    — the binding IS the wiring``, ``# noqa: E402  (import after path fix)``.
-    Splitting a whole tail on whitespace manufactures 'the', 'never', 'a' and
-    'IS' as rule codes.  Stopping at the first non-code reproduces ruff's own
-    reading and yields 40 distinct codes over the tree, every one of them real.
+    That is ruff's own reading, and it is what keeps a prose tail such as
+    ``# noqa: E402  (import after path fix)`` from turning its words into rule
+    codes.
 
     KEBAB-CASE IS A CODE ONLY IN FIRST POSITION, which is the union of the two
     consumers' own grammars and nothing wider: ruff takes a
@@ -301,7 +307,7 @@ def _noqa_codes(match: re.Match[str]) -> tuple[str, ...]:
     ``fused-memory/scripts/check_bare_magicmock_config.py`` anchors its
     kebab-case code immediately after ``noqa:``.  Admitting kebab-case anywhere
     would read ``# noqa: F401  re-export shim`` as naming a second code
-    ``re-export`` (9 such sites measured), which is neither consumer's rule.
+    ``re-export``, which is neither consumer's rule.
     """
     tail = match.group(1)
     if tail is None:
@@ -367,15 +373,8 @@ question about tools rather than about syntax.
 def scan_source(source: str, *, path: str) -> tuple[Comment, ...]:
     """Every COMMENT token in *source*, each carrying the Sites it holds.
 
-    TOKENIZE, NEVER REGEX OVER THE SOURCE TEXT.  A string literal that merely
-    mentions ``#`` is not a comment, and no regex gets that right — the same
-    argument ``scripts/merge_lane_metrics.py::_comment_lines`` makes, and it
-    bites harder here: this repository's test modules are full of suppression
-    markers quoted as data, including every fixture in this scanner's own
-    suite.
-
-    ``token.type`` rather than ``token.exact_type``: COMMENT has no exact-type
-    refinement, and the coarse field is what the existing consumer uses.
+    TOKENIZE, NEVER REGEX OVER THE SOURCE TEXT: a string literal that merely
+    mentions ``#`` is not a comment, and no regex gets that right.
 
     THE CATCH IS A TRIO, not ``TokenError`` alone: a file with broken
     indentation raises ``IndentationError`` and one with a bad statement raises
@@ -445,12 +444,10 @@ class Scan:
             — the ones whose raw bytes carried a marker substring.
 
     THE TWO COUNTS ARE THE BUDGET'S ENFORCEMENT POINT.  The PRD gives this scan
-    ten seconds, and the prefilter is the only reason it fits; asserting the
-    CLOCK on the box the merge gate runs on would plant a flake (measured: ~5
-    CPU-seconds of work took 6.5-6.8 s of wall clock at load 105), so the guard
-    test asserts these two numbers instead.  They pin the mechanism the budget
-    rests on — this is a prefiltered scan, not a whole-tree tokenize — and
-    cannot flake.
+    ten seconds and the prefilter is the only reason it fits, so the guard
+    asserts these two numbers rather than the clock;
+    ``scripts/tests/test_inline_suppression_ratchet.py::test_the_live_scan_tokenizes_exactly_the_marker_bearing_files``
+    says why.
     """
 
     comments: tuple[Comment, ...]
@@ -644,10 +641,8 @@ class SuppressionKey:
     AND DELIBERATELY NO PATH.  That single omission is what buys the ratchet
     its two best properties: a file rename or split moves every marker without
     inventing a single new key, and an ordinary task therefore never has to
-    touch the baseline.  Its cost is stated in D7 rather than hidden — two
-    identical lines share one key, so an un-tightened baseline lets an
-    identical line back in where one was removed, which is what ``slack``
-    measures and what D11's sweep files a tighten task for.
+    touch the baseline.  Its accepted cost — two identical lines share one
+    key, which is what ``slack`` measures — is PRD D7's.
 
     Attributes:
         kind: Which suppression this is.
@@ -729,11 +724,9 @@ _KIND_CONSUMERS: Mapping[Kind, Consumer] = MappingProxyType(
         Kind.TYPE_IGNORE: Consumer.PYRIGHT,
         Kind.PYRIGHT_IGNORE: Consumer.PYRIGHT,
         # Nothing in this repository reads either one today: no coverage gate
-        # is configured, and bandit is not installed — which is why the live
-        # `nosec` count is zero.  Both rows are statements about TOOLS, and
-        # they change when a tool is adopted, not when code changes.  (Neither
-        # marker is spelled out here with its leading `#`: inside a comment
-        # that would BE a marker, and this scanner would read its own prose.)
+        # is configured, and bandit is not installed.  Both rows are
+        # statements about TOOLS, and they change when a tool is adopted, not
+        # when code changes.
         Kind.PRAGMA_NO_COVER: Consumer.NONE,
         Kind.NOSEC: Consumer.NONE,
     }
@@ -783,12 +776,9 @@ def parse_rule_code(raw: str) -> RuleCode:
 def selects(selector: RuleCode, code: RuleCode) -> bool:
     """Whether *selector* selects *code*, ruff's way and never by string prefix.
 
-    MEASURED AGAINST REAL RUFF, not assumed: ``ruff check --isolated --select
-    B`` does not flag ``BLE001`` while ``--select BLE`` does, and within one
-    linter ``--select E4`` flags E402 only while ``--select E5`` flags E501
-    only.  A selector is therefore a (linter, code-prefix) PAIR: the linter
-    must be EQUAL — ``B`` (flake8-bugbear) never reaches ``BLE``
-    (flake8-blind-except) — and the number is a prefix within it.
+    A selector is a (linter, code-prefix) PAIR: the linter must be EQUAL —
+    ``B`` (flake8-bugbear) never reaches ``BLE`` (flake8-blind-except) — and
+    the number is a prefix within it, so ``E4`` selects E402 and not E501.
 
     A naive ``code.startswith(selector)`` would report every ``BLE001`` marker
     as ruff-consumed under ``select = ["B"]``, defeating D8 for that population.
@@ -837,10 +827,9 @@ class RuffConfig:
 #: `extend` is in the list because config INHERITANCE widens in exactly that
 #: expensive direction: the inherited file carries its own `select` /
 #: `extend-select`, which this model does not follow, so the local list read
-#: here would be a subset of the rules ruff actually runs.  Nothing in this
-#: tree uses it today; completeness on the expensive side is the whole purpose
-#: of the list, so it is not left to be discovered by the first pyproject that
-#: does.
+#: here would be a subset of the rules ruff actually runs.  Completeness on the
+#: expensive side is the whole purpose of the list, so a key belongs here before
+#: the first pyproject uses it, not after.
 #:
 #: An ABSENT `select` belongs in this family for the same reason and is
 #: enforced with it: ruff then applies its BUILT-IN default rule set, which is
@@ -927,11 +916,6 @@ def _ruff_config_at(location: Path, *, relative: str) -> RuffConfig | None:
 #: table.  Equality, not containment — a table that merely holds real codes can
 #: still MISS one, which is the expensive direction (the scanner would tell an
 #: author to delete a marker a live checker reads).
-#:
-#: Rule C's `wall-clock-deadline` is named in neither the PRD's D8 prose nor
-#: this task's plan, both of which list the first two; it is here because the
-#: checker honours it and its violation message tells authors to write it
-#: (measured, esc-5601-1).
 FIRST_PARTY_CODES: Mapping[str, str] = MappingProxyType(
     {
         'bare-magicmock': 'fused-memory/scripts/check_bare_magicmock_config.py',
@@ -979,13 +963,6 @@ class ConsumerModel:
         A CODELESS marker silences whatever ruff would have said, so it is
         consumed exactly when ruff has something to say at all — and a config
         selecting nothing therefore leaves it dead.
-
-        EVERY MARKER THIS MODULE MENTIONS IS MENTIONED IN A DOCSTRING, never in
-        a ``#`` comment, and that is a rule rather than a habit.  A ``#``
-        comment quoting one is a real marker: ruff parses it and warns
-        ``Invalid # noqa directive``, and this very scanner reads it as a site
-        in its own corpus.  A docstring is a STRING, which is precisely what
-        the token walk exists to tell apart.
         """
         if any(code in FIRST_PARTY_CODES for code in site.codes):
             return Consumer.FIRST_PARTY
@@ -1053,9 +1030,7 @@ class Scope(Enum):
         """Whether *path* is in this scope.
 
         A path is ``tests`` iff one of its COMPONENTS is ``tests`` — not a
-        filename pattern.  Verified complete for this repository: every tracked
-        test module lives under a ``tests`` component, so no ``test_*.py`` rule
-        is needed beside this one.
+        filename pattern.
         """
         if self is Scope.ANY:
             return True
@@ -1096,18 +1071,11 @@ class SuppressionClass:
 
 
 RATIFIED_SUPPRESSION_CLASSES: Mapping[SuppressionClass, Policy] = MappingProxyType({})
-"""Blanket rulings, keyed by class — SHIPPED EMPTY, and that is D9's design.
+"""Blanket rulings, keyed by class — SHIPPED EMPTY, and the OPERATOR's (PRD D9).
 
-The valve is the OPERATOR's: task 5603 rules the rows against the inflow table
-so the valve is sized against the filing rate each row prevents, and task 5609
-applies them.
-An implementer adding a row here would be ratifying a blanket exception on the
-operator's behalf, which is the one thing D9 reserves.
-
-Rows added AFTER the baseline is seeded turn their sites' baseline keys into
-slack, which the next ``--tighten`` removes; removing a row makes its sites
-new.  Both directions are ordinary ratchet arithmetic, which is why no row
-needs a migration.
+Rows are ruled by task 5603 and applied by task 5609.  An implementer adding a
+row here would be ratifying a blanket exception on the operator's behalf, which
+is the one thing D9 reserves.
 """
 
 
@@ -1238,18 +1206,11 @@ def classify(scan: Scan, model: ConsumerModel) -> Classification:
     fault at the site (baseline-independent, as :func:`_verdict` records), and
     the sites it failed to disposition are genuinely undisposed.
 
-    THE PREFILTER BOUNDS THE SUPPRESSION-FREE-DISPOSITION FINDING, and the
-    bound is stated here rather than left to be found.  This layer sees only
-    the comments of files whose raw bytes carried a KIND marker, so a stray
-    ``# debt: …`` alone in a file with no suppressions anywhere is never read.
-    That limit falls on the harmless side: with nothing silenced in the file,
-    the marker answers for nothing and misleads nobody about a live detector.
-    The dangerous case — an author who believes a REAL marker in this file is
-    now dispositioned when it is not — is precisely the one that IS caught,
-    because such a file carries a marker by definition.  Widening the prefilter
-    to the disposition keywords would put a second copy of D6's grammar in this
-    module, which is the one thing ``shared.governed_exceptions`` exists to
-    prevent.
+    THE PREFILTER BOUNDS THE SUPPRESSION-FREE-DISPOSITION FINDING: this layer
+    sees only the comments of files whose raw bytes carried a KIND marker, so a
+    disposition alone in a file with no suppression anywhere is never read
+    (``scripts/tests/test_inline_suppression_ratchet.py::test_a_disposition_on_a_line_with_no_suppression_is_a_violation``
+    says why that limit is the harmless side).
     """
     governed = _shared('governed_exceptions')
 
@@ -1393,10 +1354,8 @@ class Status(Enum):
 
     :attr:`CLEAN` is the only one that means the WHOLE tree was measured against
     a real baseline and nothing was in excess.  The other two are green with a
-    stated limit, and saying which limit applies is the point: a reader who sees
-    a bare zero over a tree of undisposed markers concludes the scanner is
-    broken, and a reader who sees no label at all concludes the gate is live when
-    it is enforcing nothing.
+    stated limit, and the label says which; boundary scenario 11's test says why
+    a silent green would mislead.
 
     Red has no label here, and deliberately so: a run with violations reports
     how many, because a status word beside a finding would read as a verdict on
@@ -1844,11 +1803,10 @@ def _owner(debt: Debt) -> str:
 def _tally(values: Iterable[str], vocabulary: Iterable[str]) -> dict[str, int]:
     """Count *values*, with every word of *vocabulary* present even at zero.
 
-    THE ZERO ROWS ARE THE POINT.  ``nosec`` reading 0 is a measurement — this
-    repository configures no bandit — and a schema that omitted it would make "no
-    bandit markers in the tree" and "the scanner stopped looking for them" the
-    same output.  Every kind, consumer and ownership state therefore appears in
-    every report, which is also what lets the live guard assert a zero.
+    THE ZERO ROWS ARE THE POINT.  A zero is a measurement, and a schema that
+    omitted it would make "no markers of this kind" and "the scanner stopped
+    looking for them" the same output.  Every kind, consumer and ownership
+    state therefore appears in every report.
     """
     counted = Counter(values)
     return {word: counted.get(word, 0) for word in vocabulary}

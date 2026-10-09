@@ -28,13 +28,9 @@ from ``git ls-files``, so trackedness is a property the fixtures must exercise
 rather than one the tests assert by reading the code — the same argument
 ``scripts/tests/test_design_invariants_consistency.py::_write_scan_tree`` gives.
 
-NO WALL-CLOCK ASSERTION APPEARS IN THIS MODULE, on purpose.  The PRD's ≤10 s
-scan budget is enforced here as COUNTED WORK (``files_enumerated`` versus
-``files_tokenized``), never as ``assert elapsed < N``.
-``orchestrator/tests/test_merge_lane_ratchet.py`` already ruled on exactly this
-for the sibling ratchet — "count WORK, never wall-clock" — and the measurement
-behind that ruling holds here: this scan costs ~5 CPU-seconds but took 6.5-6.8 s
-of wall clock on a box at load 105, and the merge gate runs on that same box.
+NO WALL-CLOCK ASSERTION APPEARS IN THIS MODULE, on purpose: the PRD's ≤10 s
+scan budget is pinned as COUNTED WORK, and
+:func:`test_the_live_scan_tokenizes_exactly_the_marker_bearing_files` says why.
 Subprocesses therefore get a generous ``timeout=`` rather than a clock guard.
 
 XDIST-SAFE.  The merge gate runs ``pytest … -n auto --dist loadgroup``, so every
@@ -300,7 +296,8 @@ def test_a_kebab_case_code_is_a_code_only_in_first_position():
     ``fused-memory/scripts/check_bare_magicmock_config.py`` anchors its
     kebab-case code immediately after ``noqa:``.  Admitting kebab-case
     ANYWHERE would read the tail of ``# noqa: F401  re-export shim`` as a
-    second code, which is neither consumer's rule.
+    second code, which is neither consumer's rule (9 such sites measured over
+    this repository, 2026-09-19).
     """
     (first_party,) = _sites('a = 1  # noqa: bare-magicmock — deliberate')
     (invented,) = _sites('a = 1  # noqa: bare-something-else')
@@ -1200,6 +1197,9 @@ def test_a_disposition_on_a_line_with_no_suppression_is_a_violation(tmp_path: Pa
     answer for, so it is inert prose.  The dangerous case — an author who
     believes a REAL marker in this file is now dispositioned when it is not —
     is exactly the case that IS caught, because that file carries a marker.
+    Widening the prefilter to the disposition keywords would close the gap only
+    by putting a second copy of D6's grammar in the scanner, which is the one
+    thing ``shared.governed_exceptions`` exists to prevent.
     """
     result = _classify(
         tmp_path,
@@ -2271,6 +2271,8 @@ def test_the_live_scan_tokenizes_exactly_the_marker_bearing_files(capsys):
     marker substring.  An ``assert elapsed < 10`` would instead be a new flake on
     the box the merge gate runs on — measured, this scan costs about 5 CPU-seconds
     and took 6.5-6.8 s of wall clock at load 105 on 32 cores.
+    ``orchestrator/tests/test_merge_lane_ratchet.py`` ruled the same way for the
+    sibling ratchet: count WORK, never wall-clock.
 
     The expected count is re-derived from the PUBLIC kind table rather than read
     off the scanner's private prefilter constant, so the two can disagree; a
