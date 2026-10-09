@@ -1,0 +1,472 @@
+prd: plans/dashboard-prd-lanes-prd.md
+schema_version: 1
+tasks:
+- label: α
+  task_id: 6581
+  title: 'fused-memory get_tasks(fields=…): typed field projection'
+  capabilities:
+  - name: get-tasks-fields-parameter
+    binding: capability→producer — α adds `fields` to fused-memory/src/fused_memory/server/tools.py::get_tasks
+      and forwards it by name to the interceptor (PRD §5.1 fixes the name). Absent
+      on main f6e7ea4b3a (signature is project_root, tag, page_size, offset, statuses).
+      Function-scoped, not file-scoped (INV-10), and annotation-agnostic, because
+      the `statuses Any = None` precedent may be followed. Verified at decompose,
+      it exits 1 for `fields` and 0 for `statuses` on main.
+    verdict: PASS
+    delivered_check:
+      kind: script
+      script: scripts/check_method_param_wiring.py
+      args:
+      - --file
+      - fused-memory/src/fused_memory/server/tools.py
+      - --function
+      - get_tasks
+      - --param
+      - fields
+      - --forwards-to
+      - get_tasks
+      timeout_secs: 60
+  - name: projection-contract-shape
+    binding: capability→producer — α; the row shape (id always, only present metadata
+      keys, coercion kept, pages tile) is PRD §5.1 and boundary rows 1 and 3, asserted
+      by α's own real-store tests.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: row-shape semantics are test properties (boundary rows 1 and 3), not
+        greppable
+  - name: invalid-field-rejection
+    binding: rejection-mechanism — α builds the ValidationError branch (INV-2 shape)
+      and boundary row 2 observes it fire for 'foo' and 'metadata.a-b'.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: rejection quality is judged by boundary row 2's fixtures
+- label: β
+  task_id: 6582
+  title: Capability-manifest signal_leaves and sidecar_path; stamper, drift audit
+    and /prd skill text
+  capabilities:
+  - name: signal-leaves-field
+    binding: capability→producer — β adds `signal_leaves` to shared/src/shared/capability_manifest.py::CapabilityManifestDoc
+      (extra='forbid' on main, so no sidecar can carry it before β). Consumers γ2
+      and ε1–ε4 are downstream.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^[[:space:]]+signal_leaves[[:space:]]*:'
+      paths:
+      - shared/src/shared/capability_manifest.py
+      expect: present
+  - name: sidecar-path-one-home
+    binding: capability→producer — β adds `sidecar_path(prd_key)` to shared/src/shared/capability_manifest.py
+      (PRD §5.2). Absent on main; the stamper today derives the path inline with re.sub.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def[[:space:]]+sidecar_path\(
+      paths:
+      - shared/src/shared/capability_manifest.py
+      expect: present
+  - name: stamper-resolves-via-sidecar-path
+    binding: capability→producer (wired) — β repoints fused-memory/src/fused_memory/server/manifest_stamping.py::_stamp_capability_manifests_impl
+      at sidecar_path.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: sidecar_path
+      paths:
+      - fused-memory/src/fused_memory/server/manifest_stamping.py
+      expect: present
+  - name: field-survives-stamp
+    binding: capability→producer — premise owned by task 5276 (in progress, upstream
+      of β), which replaces the stamper's yaml.safe_dump(raw) write-back; β's boundary
+      row 5 re-verifies against what landed.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: survival across the landed write-back is a test property (boundary row
+        5)
+  - name: drift-audit-signal-binding
+    binding: capability→producer — β extends scripts/audit_manifest_descriptor_drift.py
+      to report a signal label bound to a missing task or another PRD's task (boundary
+      row 6).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: signal_leaves
+      paths:
+      - scripts/audit_manifest_descriptor_drift.py
+      expect: present
+  - name: decompose-authors-signal-leaves
+    binding: capability→producer — β edits skills/prd/references/decompose-mode.md
+      Step 2.5 so every later /prd decompose names its signal leaf.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: signal_leaves
+      paths:
+      - skills/prd/references/decompose-mode.md
+      expect: present
+- label: γ1
+  task_id: 6583
+  title: 'Dashboard /prds endpoint: task lineage, chain attribution, exact per-PRD
+    census, dark matter'
+  capabilities:
+  - name: terminal-link-fields-in-bulk
+    binding: capability→producer — α (upstream of γ1) adds get_tasks(fields=…); γ1's
+      typed projected read in dashboard/src/dashboard/data/tasks.py consumes it.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def[[:space:]]+acquire_lineage\(
+      paths:
+      - dashboard/src/dashboard/data/task_lineage.py
+      expect: present
+  - name: chain-attribution
+    binding: capability→producer — γ1 adds dashboard/src/dashboard/data/prd_attribution.py::attribute
+      (PRD §5.4).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^def[[:space:]]+attribute\(
+      paths:
+      - dashboard/src/dashboard/data/prd_attribution.py
+      expect: present
+  - name: coalescing-one-home
+    binding: capability→producer — γ1 moves active_tasks.py::_coalesce_prd to prd_attribution.coalesce_prd;
+      on main the private definition is present in dashboard/src/dashboard/data/active_tasks.py,
+      and after γ1 it is gone.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def[[:space:]]+_coalesce_prd\(
+      paths:
+      - dashboard/src/dashboard/data/active_tasks.py
+      expect: absent
+  - name: milestone-fired
+    binding: capability→producer — γ1 adds shared/src/shared/task_metadata.py::Milestone.fired
+      (PRD §4.5); main has Milestone with no fired method. Consumers are γ1's is_ready,
+      γ2's Parked and Ruling rules, and the low follow-up repointing Scheduler._milestone_time_gated.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def[[:space:]]+fired\(
+      paths:
+      - shared/src/shared/task_metadata.py
+      expect: present
+  - name: ready-predicate-one-home
+    binding: capability→producer — γ1 adds dashboard/src/dashboard/data/prd_view.py::is_ready
+      (PRD §4.5); pending_since / pending_since_backfilled are populated on 1,058
+      of 1,062 ready tasks at authoring (field-population PASS).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def[[:space:]]+is_ready\(
+      paths:
+      - dashboard/src/dashboard/data/prd_view.py
+      expect: present
+  - name: rule-per-figure
+    binding: capability→producer — γ1 adds FIGURE_RULES in dashboard/src/dashboard/data/prd_view.py,
+      shipped as `rules` (PRD §4.10); δ renders it.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^FIGURE_RULES
+      paths:
+      - dashboard/src/dashboard/data/prd_view.py
+      expect: present
+  - name: prds-endpoint
+    binding: capability→producer — γ1 adds dashboard/src/dashboard/api/prds.py serving
+      PRD_VIEW (PRD §4.4, §5.6).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: PRD_VIEW
+      paths:
+      - dashboard/src/dashboard/api/prds.py
+      expect: present
+  - name: lineage-access-grant
+    binding: capability→producer — γ1 adds one _GRANTS entry in dashboard/tests/test_datum_access_paths.py
+      (PRD §4.12, INV-12).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: task_lineage
+      paths:
+      - dashboard/tests/test_datum_access_paths.py
+      expect: present
+  - name: exact-per-prd-counts
+    binding: capability→producer — γ1; the census identity of PRD §5.5 is checked
+      by validate_prd_view at shaping and by boundary rows 9 and 12.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: an arithmetic identity over shaped payloads, proved by boundary rows
+        9 and 12
+- label: γ2
+  task_id: 6584
+  title: 'Dashboard /prds: lanes, signal mark, runs.db activity, ruling inputs, lock
+    contention'
+  capabilities:
+  - name: lane-rules
+    binding: capability→producer — γ2 adds LANE_RULES in dashboard/src/dashboard/data/prd_view.py
+      (PRD §4.8).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: ^LANE_RULES
+      paths:
+      - dashboard/src/dashboard/data/prd_view.py
+      expect: present
+  - name: scheduler-state-access-datum
+    binding: capability→producer — γ2 extracts acquire_scheduler_state from dashboard/src/dashboard/data/scheduler.py::collect_scheduler_state
+      (PRD §4.3); on main _one_project discards lock_depth, raw holders and the file's
+      snapshot_at.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: def[[:space:]]+acquire_scheduler_state\(
+      paths:
+      - dashboard/src/dashboard/data/scheduler.py
+      expect: present
+  - name: signal-mark-reader
+    binding: capability→producer — γ2 adds dashboard/src/dashboard/data/prd_signal.py
+      reading sidecars with load_capability_manifest; the signal_leaves field is β's
+      (upstream of γ2), the data ε1–ε4's (parallel to γ2, upstream of ζ).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: load_capability_manifest
+      paths:
+      - dashboard/src/dashboard/data/prd_signal.py
+      expect: present
+  - name: runs-db-activity
+    binding: capability→producer — γ2 adds dashboard/src/dashboard/data/task_activity.py
+      over runs.db events (task_started live, 9,954 rows since 2026-04-09) via project_dbs._project_scoped_dbs_labeled.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: task_started
+      paths:
+      - dashboard/src/dashboard/data/task_activity.py
+      expect: present
+  - name: contention-datum
+    binding: capability→producer — γ2 adds PRD_CONTENTION to dashboard/src/dashboard/api/prds.py
+      (PRD §4.4, §4.9).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: PRD_CONTENTION
+      paths:
+      - dashboard/src/dashboard/api/prds.py
+      expect: present
+  - name: parked-reads-deferral-record
+    binding: capability→producer — the record and needs_human are task 6524's (deferral
+      PRD α, in progress, upstream of γ2); γ2's Parked rule calls shared.task_deferral.needs_human
+      in dashboard/src/dashboard/data/prd_view.py.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: needs_human
+      paths:
+      - dashboard/src/dashboard/data/prd_view.py
+      expect: present
+  - name: holder-liveness
+    binding: capability→producer — task 6527 (deferral PRD δ, pending, upstream of
+      γ2) computes liveness per snapshot inside active_tasks.py; γ2 extracts it to
+      its own access module and reuses it (PRD §4.8).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the extracted module's name is the implementer's choice; boundary row
+        17 proves live/dead holders with a real spawned process
+  - name: ruling-l2-view
+    binding: capability→producer — γ2 adds a project-scoped pending-level-2 task-id
+      view to dashboard/src/dashboard/data/escalation_corpus.py (CorpusRecord carries
+      level, status and task_id on main).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: the view's name is the implementer's choice; boundary row 14 proves
+        it
+- label: δ
+  task_id: 6585
+  title: 'Tasks tab: PRD lanes page replaces the PRD boxes'
+  capabilities:
+  - name: prd-boxes-retired
+    binding: capability→producer — δ deletes prd_grouping.js and its callers in tab_tasks.jsx
+      (7 references to groupTasksByPrd on main).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: groupTasksByPrd
+      paths:
+      - dashboard/src/dashboard/static/
+      expect: absent
+  - name: lanes-page-exists
+    binding: capability→producer — δ adds dashboard/src/dashboard/static/redux/prd_lanes.jsx
+      (the filename is fixed by PRD §4.12) over γ2's PRD_VIEW (upstream). It is a
+      path check, not a grep, because the view may arrive as a prop from tab_tasks.jsx.
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - dashboard/src/dashboard/static/redux/prd_lanes.jsx
+      expect: present
+  - name: contention-registered-in-data-registry
+    binding: capability→producer — δ registers PRD_VIEW and PRD_CONTENTION in dashboard/src/dashboard/static/redux/data.js
+      (PRD §5.6).
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: PRD_CONTENTION
+      paths:
+      - dashboard/src/dashboard/static/redux/data.js
+      expect: present
+  - name: rules-on-hover
+    binding: capability→producer — δ adds the optional rule prop to shell.jsx DatumReading
+      and Pip over γ1's FIGURE_RULES; boundary row 20 asserts hover titles equal the
+      served rules.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a prop named rule is not distinctively greppable in shell.jsx; boundary
+        row 20 proves it
+- label: ε1
+  task_id: 6586
+  title: Backfill signal_leaves for dark_factory PRD sidecars, tranche 1 of 4
+  capabilities:
+  - name: tranche-completion-note
+    binding: capability→producer — ε1 commits plans/dashboard-prd-lanes-prd.signal-backfill-epsilon1.md
+      listing each tranche PRD as named or unnamed; ζ (e) reads it.
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - plans/dashboard-prd-lanes-prd.signal-backfill-epsilon1.md
+      expect: present
+  - name: signal-leaves-named-from-prd-text
+    binding: capability→producer — schema field from β (upstream); which label each
+      PRD's text names is a reading judgment under PRD §9's rule.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: naming is a reading judgment; the drift audit (β) checks every binding
+- label: ε2
+  task_id: 6588
+  title: Backfill signal_leaves for dark_factory PRD sidecars, tranche 2 of 4
+  capabilities:
+  - name: tranche-completion-note
+    binding: capability→producer — ε2 commits plans/dashboard-prd-lanes-prd.signal-backfill-epsilon2.md;
+      ζ (e) reads it.
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - plans/dashboard-prd-lanes-prd.signal-backfill-epsilon2.md
+      expect: present
+  - name: this-prd-names-its-gate
+    binding: capability→producer — ε2 adds signal_leaves naming ζ to this sidecar
+      (PRD §9 ε); it could not be authored at decompose because extra='forbid' predates
+      β.
+    verdict: PASS
+    delivered_check:
+      kind: grep
+      pattern: '^signal_leaves:'
+      paths:
+      - plans/dashboard-prd-lanes-prd.capability-manifest.yaml
+      expect: present
+  - name: signal-leaves-named-from-prd-text
+    binding: capability→producer — schema field from β (upstream); naming is a reading
+      judgment.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: naming is a reading judgment; the drift audit (β) checks every binding
+- label: ε3
+  task_id: 6590
+  title: Backfill signal_leaves for dark_factory PRD sidecars, tranche 3 of 4
+  capabilities:
+  - name: tranche-completion-note
+    binding: capability→producer — ε3 commits plans/dashboard-prd-lanes-prd.signal-backfill-epsilon3.md;
+      ζ (e) reads it.
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - plans/dashboard-prd-lanes-prd.signal-backfill-epsilon3.md
+      expect: present
+  - name: signal-leaves-named-from-prd-text
+    binding: capability→producer — schema field from β (upstream); naming is a reading
+      judgment.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: naming is a reading judgment; the drift audit (β) checks every binding
+- label: ε4
+  task_id: 6591
+  title: Backfill signal_leaves for dark_factory PRD sidecars, tranche 4 of 4
+  capabilities:
+  - name: tranche-completion-note
+    binding: capability→producer — ε4 commits plans/dashboard-prd-lanes-prd.signal-backfill-epsilon4.md;
+      ζ (e) reads it.
+    verdict: PASS
+    delivered_check:
+      kind: path
+      paths:
+      - plans/dashboard-prd-lanes-prd.signal-backfill-epsilon4.md
+      expect: present
+  - name: signal-leaves-named-from-prd-text
+    binding: capability→producer — schema field from β (upstream); naming is a reading
+      judgment.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: naming is a reading judgment; the drift audit (β) checks every binding
+- label: ζ
+  task_id: 6592
+  title: 'Human gate: PRD lanes view — restart fused-memory and the dashboard, then
+    live checks'
+  note: Integration gate and the PRD's signal leaf. ε2 adds signal_leaves naming this
+    label once β has landed.
+  capabilities:
+  - name: per-prd-exact-counts-live
+    binding: producer:γ1 upstream (exact counts), α upstream of γ1 (bulk terminal
+      link fields); ζ (a) compares the live payload to an independent sqlite recount.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a live comparison after restarts, worked by a human gate
+  - name: stuck-red-age-live
+    binding: producer:γ1 (ready age, lower-bound marker) and γ2 (14-day activity)
+      upstream; ζ (b).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a live cross-check against sqlite and runs.db
+  - name: contention-live
+    binding: producer:γ2 upstream (scheduler state datum); ζ (c) compares to scheduler_state.json.
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a live comparison at one snapshot_at
+  - name: rules-on-hover-live
+    binding: producer:γ1 (FIGURE_RULES) and δ (rule prop) upstream; ζ (d).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a hover check on the live page
+  - name: signal-mark-live
+    binding: producer:β (schema), ε1–ε4 (data), γ2 (reader) all upstream; ζ (e).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: a live check against the four ε completion notes
+  - name: lineage-read-live
+    binding: producer:α upstream; proven live after the fused-memory restart by ζ
+      (f) (PRD_VIEW[dark_factory] fresh).
+    verdict: PASS
+    delivered_check:
+      kind: manual
+      reason: requires the restarted services

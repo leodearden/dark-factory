@@ -1,6 +1,9 @@
 # Dashboard PRD view: lanes by what each PRD needs, honest progress, unowned work
 
-**Status:** authored 2026-10-09 (`/team` + `/prd` author mode). Not yet decomposed.
+**Status:** authored 2026-10-09 (`/team` + `/prd` author mode). **Decomposed 2026-10-09:**
+α 6581, β 6582, γ1 6583, γ2 6584, δ 6585, ε1 6586, ε2 6588, ε3 6590, ε4 6591, ζ 6592; follow-up
+6593 (repoint `Scheduler._milestone_time_gated`). Bindings, decompose decisions and the fresh
+review: `dashboard-prd-lanes-prd.capability-manifest.md` and its YAML sidecar.
 **Type:** extension of two shipped dashboard PRDs. It replaces the Tasks tab's PRD box grid
 with one server-computed view, adds one fused-memory read parameter, one optional
 capability-manifest field and one method on the shared milestone model.
