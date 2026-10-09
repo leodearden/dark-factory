@@ -2249,7 +2249,7 @@ class TestCreatePathReasonPersisted:
         )
 
         assert row['status'] == 'created'
-        assert row['reason'] == 'create: curator-failed: llm down'
+        assert row['reason'] == 'create: curator-failed: CuratorFailureError: llm down'
         assert json.loads(row['result_json'])['curator_degrade_reason'] == 'llm down'
 
     @pytest.mark.asyncio
@@ -2276,7 +2276,7 @@ class TestCreatePathReasonPersisted:
 
         row = await ticket_store.get(ticket_id)
         assert row is not None and row['status'] == 'created'
-        assert row['reason'] == 'create: curator-failed: llm down'
+        assert row['reason'] == 'create: curator-failed: CuratorFailureError: llm down'
         assert json.loads(row['result_json'])['curator_degrade_reason'] == 'llm down'
 
     @pytest.mark.asyncio
@@ -2308,6 +2308,52 @@ class TestCreatePathReasonPersisted:
         row = await ticket_store.get(ticket_id)
         assert row is not None and row['status'] == 'created'
         assert row['reason'] == 'create: novel in batch'
+
+    @pytest.mark.asyncio
+    async def test_combine_that_could_not_execute_is_labelled_combine_failed(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        """The justification argues the candidate IS a duplicate; the reason must
+        not read as though the curator judged it new."""
+        taskmaster.get_task = AsyncMock(side_effect=RuntimeError('target gone'))
+        curator = _curator_returning(CuratorDecision(
+            action='combine', target_id='999', justification='same work as 999',
+        ))
+
+        row = await _drive_ticket_through_worker(
+            interceptor_with_store, ticket_store, curator,
+        )
+
+        assert row['status'] == 'created'
+        assert row['reason'] == 'create: combine-failed: same work as 999'
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('decision', 'expected'),
+        [
+            (
+                CuratorDecision(action='drop', justification='dup of nothing'),
+                'create: drop-failed: dup of nothing',
+            ),
+            (
+                CuratorDecision(
+                    action='route_deterministic',
+                    justification='operational-ask-registry: restart: ops',
+                ),
+                'create: route_deterministic: operational-ask-registry: restart: ops',
+            ),
+        ],
+        ids=['drop-without-target', 'route-deterministic'],
+    )
+    async def test_non_create_actions_that_create_are_labelled_by_action(
+        self, interceptor_with_store, ticket_store, taskmaster, decision, expected,
+    ):
+        row = await _drive_ticket_through_worker(
+            interceptor_with_store, ticket_store, _curator_returning(decision),
+        )
+
+        assert row['status'] == 'created'
+        assert row['reason'] == expected
 
     @pytest.mark.asyncio
     async def test_created_rows_with_reason_never_enter_the_failure_sweep(
@@ -2381,12 +2427,12 @@ class TestCuratorUnavailableReasonPersisted:
         assert row['reason'] == 'create: curator-unavailable: disabled'
 
     @pytest.mark.asyncio
-    async def test_construction_failure_records_type_never_message(
+    async def test_construction_failure_records_the_exception_summary(
         self, configured_interceptor, ticket_store,
     ):
         with patch(
             'fused_memory.middleware.task_interceptor.TaskCurator',
-            side_effect=RuntimeError('qdrant down: secret-path'),
+            side_effect=RuntimeError('qdrant down\nTraceback (most recent call last):'),
         ):
             row = await _submit_and_resolve(
                 configured_interceptor, ticket_store, 'Broken Curator',
@@ -2395,9 +2441,8 @@ class TestCuratorUnavailableReasonPersisted:
         assert row['status'] == 'created'
         assert row['task_id']
         assert row['reason'] == (
-            'create: curator-unavailable: construction-failed: RuntimeError'
+            'create: curator-unavailable: construction-failed: RuntimeError: qdrant down'
         )
-        assert 'secret-path' not in row['reason']
 
     @pytest.mark.asyncio
     async def test_closed_interceptor(self, taskmaster, event_buffer):

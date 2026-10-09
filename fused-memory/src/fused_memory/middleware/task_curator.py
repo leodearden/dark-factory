@@ -142,6 +142,22 @@ class CuratorFailureError(RuntimeError):
         self.tools_used = tools_used
 
 
+_EXCEPTION_SUMMARY_MAX_CHARS = 120
+
+
+def exception_summary(exc: BaseException) -> str:
+    """How an exception is written into a decision justification or a ticket reason.
+
+    ``<ExcType>: <first line of the message>``, the line cut to
+    ``_EXCEPTION_SUMMARY_MAX_CHARS``: diagnostic enough to name a missing
+    binary, yet bounded, so identical failures group under one reason.
+    """
+    lines = str(exc).strip().splitlines()
+    first_line = lines[0][:_EXCEPTION_SUMMARY_MAX_CHARS] if lines else ''
+    name = type(exc).__name__
+    return f'{name}: {first_line}' if first_line else name
+
+
 # 'drop', 'combine' and 'create' are the only actions the LLM may request — see
 # CURATOR_OUTPUT_SCHEMA / CURATOR_BATCH_OUTPUT_SCHEMA below, whose enums stay
 # exactly those three. 'route_deterministic' and 'refuse' are DETERMINISTIC-ONLY
@@ -1875,7 +1891,7 @@ class TaskCurator:
                     exc_info=True,
                 )
                 decision = await self._degraded_create(
-                    justification=f'corpus-failed: {exc}',
+                    justification=f'corpus-failed: {exception_summary(exc)}',
                     pool_sizes={
                         'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0,
                     },
@@ -1999,7 +2015,7 @@ class TaskCurator:
                     pool_sizes=pool_sizes,
                 )
             decision = await self._degraded_create(
-                justification=f'llm-failed: {type(exc).__name__}: {exc}',
+                justification=f'llm-failed: {exception_summary(exc)}',
                 pool_sizes=pool_sizes,
                 start=start,
                 candidate=candidate,

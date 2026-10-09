@@ -101,6 +101,7 @@ from fused_memory.middleware.task_curator import (
     CuratorFailureError,
     PreparedCandidate,
     TaskCurator,
+    exception_summary,
     flatten_task_tree,
     is_combine_eligible_status,
     normalize_title,
@@ -432,9 +433,19 @@ def _create_after_curator_failure(exc: CuratorFailureError) -> CuratorDecision:
     """
     return CuratorDecision(
         action='create',
-        justification=f'curator-failed: {exc}',
+        justification=f'curator-failed: {exception_summary(exc)}',
         degraded_by_zot=exc.zero_output_timeout,
     )
+
+
+# The label a non-create decision carries when its ticket still ends in a
+# create: a combine or drop that could not be executed fell through, and
+# route_deterministic creates by design.
+_CREATE_FALLTHROUGH_LABELS: dict[str, str] = {
+    'combine': 'combine-failed',
+    'drop': 'drop-failed',
+    'route_deterministic': 'route_deterministic',
+}
 
 
 def _create_reason(
@@ -449,9 +460,12 @@ def _create_reason(
         if curator_unavailable is None:
             return 'create: no-curator-decision'
         return f'create: curator-unavailable: {curator_unavailable}'
+    parts = ['create']
+    if decision.action in _CREATE_FALLTHROUGH_LABELS:
+        parts.append(_CREATE_FALLTHROUGH_LABELS[decision.action])
     if decision.justification:
-        return f'create: {decision.justification}'
-    return 'create'
+        parts.append(decision.justification)
+    return ': '.join(parts)
 
 
 class TaskInterceptor:
@@ -507,8 +521,7 @@ class TaskInterceptor:
         # _get_curator() because it pulls in a Qdrant client + embedder.
         self._config = config
         self._curator: TaskCurator | None = None
-        # Exception TYPE of the last failed TaskCurator construction; never the
-        # message, which can carry paths and reaches MCP callers via tickets.reason.
+        # exception_summary() of the last failed TaskCurator construction.
         self._curator_construction_error: str | None = None
         self._escalator = escalator
         # Forwarded to ``TaskCurator`` for cap-aware LLM invocation across the
@@ -1978,7 +1991,7 @@ class TaskInterceptor:
             return self._curator
         except Exception as exc:
             logger.warning('Failed to create TaskCurator', exc_info=True)
-            self._curator_construction_error = type(exc).__name__
+            self._curator_construction_error = exception_summary(exc)
             return None
 
     def _curator_unavailable_reason(self) -> str:

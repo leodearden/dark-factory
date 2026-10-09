@@ -58,6 +58,7 @@ from fused_memory.middleware.task_curator import (
     _task_files,
     _to_pool_entry,
     _trim_pool,
+    exception_summary,
     clip_for_prompt,
     embedding_text,
     flatten_task_tree,
@@ -1502,6 +1503,29 @@ class TestCallLlmNeutralCwd:
         assert curator._cwd == tmp_path
 
 
+class TestExceptionSummary:
+    """The one policy for exception text in a justification or ``tickets.reason``."""
+
+    def test_type_and_message(self):
+        exc = FileNotFoundError(2, 'No such file or directory')
+        exc.filename = 'claude'
+
+        assert exception_summary(exc) == (
+            "FileNotFoundError: [Errno 2] No such file or directory: 'claude'"
+        )
+
+    def test_only_the_first_line_survives(self):
+        assert exception_summary(RuntimeError('boom\n  at frame 1\n  at frame 2')) == (
+            'RuntimeError: boom'
+        )
+
+    def test_a_long_first_line_is_cut(self):
+        assert exception_summary(RuntimeError('x' * 500)) == 'RuntimeError: ' + 'x' * 120
+
+    def test_an_empty_message_leaves_the_type(self):
+        assert exception_summary(TimeoutError()) == 'TimeoutError'
+
+
 _EMPTY_POOL_SIZES = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
 
 
@@ -1930,9 +1954,6 @@ class TestZeroOutputTimeoutAcceptance:
         assert result_a.action == 'create'
         assert result_b.action == 'drop'
         assert mock_llm.await_count == 2
-
-
-_EMPTY_POOL_SIZES = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
 
 
 def _prepared(candidate: CandidateTask) -> PreparedCandidate:
