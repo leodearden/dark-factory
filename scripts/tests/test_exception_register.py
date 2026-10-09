@@ -871,3 +871,146 @@ def test_json_carries_the_table_and_the_inline_report_verbatim(tmp_path: Path, c
     }
     assert inline_suppressions.main(['--json', '--root', str(tmp_path)]) == 0
     assert document['inline'] == json.loads(capsys.readouterr().out)
+
+
+# ---------------------------------------------------------------------------
+# D14 — the report-only census of unregistered candidate lists.
+
+_CENSUS_TREE = {
+    'pkg/__init__.py': '',
+    'pkg/a.py': (
+        'import re\n'
+        "ALLOWLIST = frozenset({'x'})\n"
+        "_GRANDFATHERED = ('y',)\n"
+        "KNOWN_FLAKES: tuple[str, ...] = ('z',)\n"
+        'PINNED_SITES = {k: v for k, v in []}\n'
+        "_EXEMPT_RE = re.compile('q')\n"
+        "NAMES = ['n']\n"
+        'def build():\n'
+        '    ALLOWLIST = []\n'
+        '    return ALLOWLIST\n'
+    ),
+    'tests/test_decl.py': (
+        _HEADER
+        + 'from pkg.a import ALLOWLIST\n'
+        + "governed_exceptions('pkg.allowlist', 'rule', sorted(ALLOWLIST), "
+        + "default=Policy('r'), default_covers=1)\n"
+    ),
+    'tests/test_decl2.py': (
+        _HEADER
+        + 'import pkg.a as a\n'
+        + "governed_exceptions('pkg.flakes', 'rule', a.KNOWN_FLAKES, "
+        + "default=Policy('r'), default_covers=1)\n"
+    ),
+}
+
+
+def _ref(path: str, symbol: str):
+    return exception_register.ListRef(path=path, symbol=symbol)
+
+
+def _unregistered(root: Path, not_exception_lists=None) -> tuple:
+    return exception_register.unregistered_candidates(
+        exception_register.collection_candidates(root),
+        exception_register.discover_declarations(root).declarations,
+        {} if not_exception_lists is None else not_exception_lists,
+    )
+
+
+def test_a_list_ref_renders_as_path_and_symbol():
+    assert _ref('pkg/a.py', 'ALLOWLIST').render() == 'pkg/a.py::ALLOWLIST'
+
+
+def test_the_census_finds_module_level_collections_whose_names_match(tmp_path: Path):
+    track_fixture_tree(tmp_path, _CENSUS_TREE)
+
+    assert exception_register.collection_candidates(tmp_path) == (
+        _ref('pkg/a.py', 'ALLOWLIST'),
+        _ref('pkg/a.py', 'KNOWN_FLAKES'),
+        _ref('pkg/a.py', 'PINNED_SITES'),
+        _ref('pkg/a.py', '_GRANDFATHERED'),
+    )
+
+
+def test_a_container_a_declaration_imports_is_not_unregistered(tmp_path: Path):
+    """Both spellings resolve through the declaring module's own imports:
+    ``from pkg.a import ALLOWLIST`` and ``import pkg.a as a`` then ``a.KNOWN_FLAKES``."""
+    track_fixture_tree(tmp_path, _CENSUS_TREE)
+
+    assert _unregistered(tmp_path) == (
+        _ref('pkg/a.py', 'PINNED_SITES'),
+        _ref('pkg/a.py', '_GRANDFATHERED'),
+    )
+
+
+def test_a_same_file_container_is_declared_by_that_files_declaration(tmp_path: Path):
+    track_fixture_tree(
+        tmp_path,
+        {
+            'tests/test_local.py': (
+                _HEADER
+                + "LOCAL_ALLOWLIST = ('a',)\n"
+                + "governed_exceptions('pkg.local', 'r', LOCAL_ALLOWLIST, "
+                + "default=Policy('r'), default_covers=1)\n"
+            )
+        },
+    )
+
+    assert exception_register.collection_candidates(tmp_path) == (
+        _ref('tests/test_local.py', 'LOCAL_ALLOWLIST'),
+    )
+    assert _unregistered(tmp_path) == ()
+
+
+def test_a_same_symbol_in_another_module_is_not_declared_by_it(tmp_path: Path):
+    """Matching by symbol alone would mark both guard tests' ``ALLOWLIST`` declared."""
+    files = dict(_CENSUS_TREE)
+    files['pkg/b.py'] = "ALLOWLIST = ['other']\n"
+    track_fixture_tree(tmp_path, files)
+
+    assert _ref('pkg/b.py', 'ALLOWLIST') in _unregistered(tmp_path)
+    assert _ref('pkg/a.py', 'ALLOWLIST') not in _unregistered(tmp_path)
+
+
+def test_a_reasoned_not_exception_row_removes_its_candidate_and_a_stale_one_is_inert(
+    tmp_path: Path,
+):
+    track_fixture_tree(tmp_path, _CENSUS_TREE)
+    rows = {
+        _ref('pkg/a.py', '_GRANDFATHERED'): 'grants authority; design, not an exception',
+        _ref('pkg/gone.py', 'ALLOWLIST'): 'the module this row named was deleted',
+    }
+
+    assert _unregistered(tmp_path, rows) == (_ref('pkg/a.py', 'PINNED_SITES'),)
+
+
+def test_the_census_reaches_the_report_and_never_the_exit_code(tmp_path: Path, capsys):
+    _register_tree(tmp_path, _CENSUS_TREE, table=_block(_with(_ROW, 'id', 'r')))
+
+    code, out, err = _report(tmp_path, capsys)
+
+    assert code == 0, err
+    lines = _normalised_lines(out)
+    assert 'unregistered candidates (report-only): 2' in lines
+    assert 'pkg/a.py::PINNED_SITES' in lines
+    assert 'pkg/a.py::_GRANDFATHERED' in lines
+    assert _document(tmp_path, capsys)['unregistered'] == [
+        {'path': 'pkg/a.py', 'symbol': 'PINNED_SITES'},
+        {'path': 'pkg/a.py', 'symbol': '_GRANDFATHERED'},
+    ]
+
+
+@pytest.mark.parametrize('reason', ['', '   '])
+def test_a_not_exception_row_with_a_blank_reason_is_refused(reason: str):
+    """A classification says the rule does not apply, so it needs a reason (D14)."""
+    with pytest.raises(exception_register.InstrumentFailure) as excinfo:
+        exception_register.validate_not_exception_lists({_ref('pkg/a.py', 'ALLOWLIST'): reason})
+
+    assert 'pkg/a.py::ALLOWLIST' in str(excinfo.value)
+
+
+def test_a_not_exception_row_keyed_by_a_string_is_refused():
+    with pytest.raises(exception_register.InstrumentFailure) as excinfo:
+        exception_register.validate_not_exception_lists({'pkg/a.py::ALLOWLIST': 'a reason'})
+
+    assert 'pkg/a.py::ALLOWLIST' in str(excinfo.value)
