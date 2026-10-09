@@ -31,6 +31,12 @@ import digest as mod
 import pytest
 import yaml
 from legibility import inventory as inventory_mod
+from legibility_carrier_fixtures import (
+    PROSE_QUOTING_THE_SCHEMA,
+    briefing_text,
+    coder_judgment,
+    json_fenced,
+)
 from orchestrator.agents.memory_recall import (
     MEMORY_CONTEXT_CAVEAT,
     MEMORY_DEGRADED_STORES_NOTICE,
@@ -401,9 +407,9 @@ class TestIterUserTurns:
         "is this re-ingested?" with ONE predicate. The genuine and briefing
         turns pin that sharing it neither widens nor narrows the filter."""
         records = [
-            _user_text(_coder_judgment()),
+            _user_text(coder_judgment()),
             _user_text('please redo the merge'),
-            _user_text(_briefing_text()),
+            _user_text(briefing_text()),
         ]
 
         turns = mod.iter_user_turns(records)
@@ -887,26 +893,26 @@ class TestIterSelfCorrections:
     def test_ignores_a_whole_block_coder_judgment(self):
         # The b203a05c record-22 sighting: a prior trickle-coder answer whose
         # note quotes "that's wrong" from the digest it coded.
-        records = [_assistant(_text(_coder_judgment()))]
+        records = [_assistant(_text(coder_judgment()))]
 
         assert mod.iter_self_corrections(records) == []
 
     def test_ignores_a_json_fenced_coder_judgment(self):
-        records = [_assistant(_text(_json_fenced(_coder_judgment())))]
+        records = [_assistant(_text(json_fenced(coder_judgment())))]
 
         assert mod.iter_self_corrections(records) == []
 
     def test_ignores_a_coder_judgment_quoting_i_was_wrong(self):
         # The 6a527d51 record-10 marker.
         records = [_assistant(_text(
-            _coder_judgment(note='I was wrong to keep reporting it as stuck'),
+            coder_judgment(note='I was wrong to keep reporting it as stuck'),
         ))]
 
         assert mod.iter_self_corrections(records) == []
 
     def test_coder_judgment_does_not_mask_a_prose_self_correction(self):
         records = [
-            _assistant(_text(_coder_judgment())),
+            _assistant(_text(coder_judgment())),
             _assistant(_text('My mistake, the lease check belongs in the watcher.')),
         ]
 
@@ -1021,7 +1027,7 @@ def _trickle_coder_session_records():
         f'{_TRICKLE_CODER_PREAMBLE}\n\n=== SESSION DIGEST ===\n'
         '## Guard Trips\n- (turn 21) blocked:\n'
     )
-    answer = _coder_judgment(note="that's wrong: its turn 21 reads blocked: twice")
+    answer = coder_judgment(note="that's wrong: its turn 21 reads blocked: twice")
     return [
         _with_session_meta(_user_text(prompt)),
         _with_session_meta(_assistant(_text(answer))),
@@ -1035,7 +1041,7 @@ class TestReingestedContentIsBucketAgnostic:
         assert mod.iter_df_guards(records) == []
 
     def test_df_guard_ignores_a_coder_judgment_quoting_a_trip(self):
-        records = [_assistant(_text(_coder_judgment(note='its turn 21 reads blocked:')))]
+        records = [_assistant(_text(coder_judgment(note='its turn 21 reads blocked:')))]
 
         assert mod.iter_df_guards(records) == []
 
@@ -1059,7 +1065,7 @@ class TestReingestedContentIsBucketAgnostic:
         assert mod.iter_not_found(records) == []
 
     def test_not_found_ignores_a_tool_result_that_is_a_coder_judgment(self):
-        records = [_tool_result('tu-1', _coder_judgment(note='cat: x.py: No such file or directory'))]
+        records = [_tool_result('tu-1', coder_judgment(note='cat: x.py: No such file or directory'))]
 
         assert mod.iter_not_found(records) == []
 
@@ -1116,7 +1122,7 @@ class TestReingestedContentIsBucketAgnostic:
         markers: reading the filtered layer would delete its own evidence and
         collapse this orchestrated session to 'interactive'. The first
         assertion is the premise that makes the second one discriminate."""
-        text = _briefing_text(
+        text = briefing_text(
             body_filler='Task ID: 42\nWorktree: /home/leo/src/dark-factory/.worktrees/42',
         )
         records = [_user_text(text)]
@@ -2041,27 +2047,6 @@ def _split_frontmatter(digest):
 # (HARNESS_PROMPT_MARKERS).
 # ---------------------------------------------------------------------------
 
-def _briefing_text(body_filler='Project overview and recent decisions go here.'):
-    """Build the text of an orchestrator-briefing-shaped user turn -- the
-    literal shape ``BriefingAssembler`` injects as the harness preamble of
-    every dispatched-agent session
-    (orchestrator/src/orchestrator/agents/briefing.py): a '# Context'
-    heading (``orchestrator/src/orchestrator/agents/memory_recall.py::render_context_block``,
-    emits '# Context\\n\\n...'), a
-    '## Agent Identity' heading with an agent_id bullet
-    (``_agent_identity``), and a '# Task' heading with a task block (the
-    per-role prompt templates, e.g. ``build_architect_prompt``)."""
-    return (
-        f'# Context\n\n{body_filler}\n\n'
-        '## Agent Identity\n\n'
-        '- **agent_id:** `claude-task-3278-implementer`\n'
-        '- **project_id:** `dark_factory`\n\n'
-        '# Task\n\n'
-        '**Task:** Some task title\n'
-        '**Description:** Do the thing.\n'
-    )
-
-
 _CENSUS_MEMORY_CONTEXT_TURN = (
     '# Context\n\n'
     '## Project Context\n\n'
@@ -2209,7 +2194,7 @@ def _resume_and_context_block_records():
 
 class TestHarnessInjectedTurnFilter:
     def test_briefing_shaped_turn_is_excluded_by_content(self):
-        records = [_user_text(_briefing_text())]
+        records = [_user_text(briefing_text())]
 
         assert mod.iter_user_turns(records) == []
 
@@ -2220,7 +2205,7 @@ class TestHarnessInjectedTurnFilter:
 
     def test_ordinary_correction_retained_after_briefing_turn_index_preserved(self):
         records = [
-            _user_text(_briefing_text()),
+            _user_text(briefing_text()),
             _user_text('This is wrong, please redo it.'),
         ]
 
@@ -2353,7 +2338,7 @@ class TestHarnessInjectedTurnFilter:
 
     def test_render_digest_excludes_briefing_turn_from_body_and_score(self):
         records = [
-            _with_session_meta(_user_text(_briefing_text())),
+            _with_session_meta(_user_text(briefing_text())),
             _with_session_meta(_user_text('This is wrong, please redo it.')),
         ]
 
@@ -2376,7 +2361,7 @@ class TestHarnessInjectedTurnFilter:
         # (_signal_text_sources, never filtered by iter_user_turns) so it
         # must be unaffected by the exclusion.
         text = (
-            _briefing_text()
+            briefing_text()
             + 'Task ID: 3278\nWorktree: /home/leo/src/dark-factory/.worktrees/3278\n'
         )
         records = [_user_text(text)]
@@ -2389,7 +2374,7 @@ class TestHarnessInjectedTurnFilter:
         # briefing turn with no NOT_FOUND/DF_GUARD/INTERRUPT pattern must
         # not perturb any of the five signal_counts.
         base = _all_signals_records()
-        with_briefing = [_user_text(_briefing_text())] + base
+        with_briefing = [_user_text(briefing_text())] + base
 
         assert mod.signal_counts(with_briefing) == mod.signal_counts(base)
 
@@ -2847,42 +2832,14 @@ class TestNonHumanOriginFilter:
 # or brace-slices, so prose that merely quotes the schema stays dialogue.
 # ---------------------------------------------------------------------------
 
-def _coder_judgment(note="that's wrong: the watcher re-armed on a stale lease"):
-    """A trickle-coder answer as it lands in a transcript: the whole
-    judgment on ONE line, shaped after session b203a05c record 22. *note*
-    rides inside a match, where a real coder quotes the digest it codes."""
-    return json.dumps({
-        'matches': [{
-            'entry_id': 'watcher-loop-harness-mismatch',
-            'origin_phase': 'unknown',
-            'manifested_phase': 'recon',
-            'invariant_violated': None,
-            'note': note,
-        }],
-        'candidates': [{
-            'title': 'Recon reaper closes a filed task with its escalation',
-            'cause': 'closure keys off escalation linkage, not task merit',
-            'area': 'recon',
-            'origin_phase': 'unknown',
-            'manifested_phase': 'recon',
-            'evidence_quote': 'Re-filing without an escalation_id.',
-        }],
-    })
-
-
-def _json_fenced(payload):
-    """*payload* inside one outer ```json fence, trailing newline included."""
-    return f'```json\n{payload}\n```\n'
-
-
 class TestCoderJudgmentPayloadClassifier:
     @pytest.mark.parametrize(
         'text',
         [
-            _coder_judgment(),
+            coder_judgment(),
             '{"matches": [], "candidates": []}',
-            _json_fenced(_coder_judgment()),
-            f'\n\n  {_coder_judgment()}  \n\n',
+            json_fenced(coder_judgment()),
+            f'\n\n  {coder_judgment()}  \n\n',
             json.dumps({'matches': [], 'candidates': [], 'rationale': 'nothing fits'}),
         ],
         ids=['bare', 'empty_judgment', 'json_fenced', 'surrounding_whitespace', 'extra_key'],
@@ -2949,14 +2906,14 @@ class TestCoderJudgmentPayloadClassifier:
 
 class TestReingestedContentClassifier:
     @pytest.mark.parametrize(
-        'text', [_coder_judgment(), _json_fenced(_coder_judgment())],
+        'text', [coder_judgment(), json_fenced(coder_judgment())],
         ids=['bare', 'json_fenced'],
     )
     def test_a_coder_judgment_is_reingested(self, text):
         assert mod.is_reingested_content(text) is True
 
     @pytest.mark.parametrize(
-        'text', [_briefing_text(), _CENSUS_MEMORY_CONTEXT_TURN, _TRICKLE_CODER_PREAMBLE],
+        'text', [briefing_text(), _CENSUS_MEMORY_CONTEXT_TURN, _TRICKLE_CODER_PREAMBLE],
         ids=['briefing', 'census_memory_context', 'trickle_coder_prompt'],
     )
     def test_a_harness_prompt_or_briefing_is_reingested(self, text):
@@ -2987,10 +2944,6 @@ class TestReingestedContentClassifier:
 
 _ORDINARY_DIALOGUE = 'please fix the bug in the merge worker'
 _PROSE_SELF_CORRECTION = "Actually, that's wrong — use the other branch"
-_PROSE_QUOTING_THE_SCHEMA = (
-    'The coder answers with {"matches": [], "candidates": []} '
-    "— that's wrong, it should be a single object per session."
-)
 
 
 class TestNonDialogueCarrierPredicate:
@@ -2998,9 +2951,9 @@ class TestNonDialogueCarrierPredicate:
         ('record', 'text'),
         [
             (_with_origin(_user_text(_ORDINARY_DIALOGUE), 'task-notification'), _ORDINARY_DIALOGUE),
-            (_assistant(_text(_coder_judgment())), _coder_judgment()),
-            (_assistant(_text(_json_fenced(_coder_judgment()))), _json_fenced(_coder_judgment())),
-            (_user_text(_briefing_text()), _briefing_text()),
+            (_assistant(_text(coder_judgment())), coder_judgment()),
+            (_assistant(_text(json_fenced(coder_judgment()))), json_fenced(coder_judgment())),
+            (_user_text(briefing_text()), briefing_text()),
             (_user_text(_TRICKLE_CODER_PREAMBLE), _TRICKLE_CODER_PREAMBLE),
         ],
         ids=[
@@ -3016,7 +2969,7 @@ class TestNonDialogueCarrierPredicate:
         [
             (_with_origin(_user_text(_ORDINARY_DIALOGUE), 'human'), _ORDINARY_DIALOGUE),
             (_assistant(_text(_PROSE_SELF_CORRECTION)), _PROSE_SELF_CORRECTION),
-            (_assistant(_text(_PROSE_QUOTING_THE_SCHEMA)), _PROSE_QUOTING_THE_SCHEMA),
+            (_assistant(_text(PROSE_QUOTING_THE_SCHEMA)), PROSE_QUOTING_THE_SCHEMA),
         ],
         ids=['human_origin', 'genuine_self_correction', 'prose_quoting_the_schema_inline'],
     )
@@ -3163,7 +3116,7 @@ class TestRunReviewPromptTurnFilter:
         # is_harness_injected_turn rather than to a separate predicate whose
         # name would assert a human typed it.
         assert mod.is_harness_injected_turn(_recon_run_review_text()) is True
-        assert mod.is_harness_injected_turn(_briefing_text()) is True
+        assert mod.is_harness_injected_turn(briefing_text()) is True
 
     def test_each_harness_heading_set_is_matched_independently(self):
         # HARNESS_HEADING_SETS is an any()-over-sets fan-out with two real
@@ -4005,7 +3958,7 @@ class TestEmitConsistencyGuard:
         # non-empty, briefing-free digest with an intact frontmatter
         # contract.
         records = [
-            _with_session_meta(_user_text(_briefing_text('x' * 21000))),
+            _with_session_meta(_user_text(briefing_text('x' * 21000))),
             _with_session_meta(_user_text('This is wrong, please redo it.')),
             _with_session_meta(_assistant(_tool_use('Bash', {'command': 'false'}, id='tu-err'))),
             _with_session_meta(_tool_result('tu-err', 'Exit code 1', is_error=True)),

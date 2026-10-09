@@ -18,6 +18,12 @@ import pytest
 from legibility import coder, digest, inventory
 from legibility import config as config_mod
 from legibility import sampling as mod
+from legibility_carrier_fixtures import (
+    PROSE_QUOTING_THE_SCHEMA,
+    briefing_text,
+    coder_judgment,
+    json_fenced,
+)
 
 MAIN_CWD = '/home/leo/src/dark-factory'
 
@@ -525,23 +531,6 @@ _LITERAL_LINE = ' / '.join(_SIGNAL_LITERALS)
 _GENUINE_SELF_CORRECTION = "That's wrong: the lease was stale."
 
 
-def _coder_judgment(note: str = _LITERAL_LINE) -> str:
-    return json.dumps({
-        'matches': [{
-            'entry_id': 'watcher-loop-harness-mismatch',
-            'origin_phase': 'unknown',
-            'manifested_phase': 'recon',
-            'invariant_violated': None,
-            'note': note,
-        }],
-        'candidates': [],
-    })
-
-
-def _json_fenced(payload: str) -> str:
-    return f'```json\n{payload}\n```\n'
-
-
 def _origin_stamped(record: dict, kind: str) -> dict:
     return {**record, 'origin': {'kind': kind}}
 
@@ -559,14 +548,6 @@ def _tool_result_block(content: str, *, is_error: bool = False) -> dict:
 
 def _user_blocks(*blocks: dict) -> dict:
     return {'type': 'user', 'isSidechain': False, 'message': {'content': list(blocks)}}
-
-
-def _briefing_turn(task_prose: str) -> dict:
-    return _user_turn(
-        '# Context\n\nProject overview and recent decisions go here.\n\n'
-        '## Agent Identity\n\n- **agent_id:** `claude-task-42-implementer`\n\n'
-        f'# Task\n\n{task_prose}\n'
-    )
 
 
 def _trickle_coder_prompt_turn() -> dict:
@@ -602,10 +583,10 @@ def _session_on_disk(encoded: Path, name: str, records: list[dict]) -> inventory
 
 class TestReingestedContentIsNotScored:
     @pytest.mark.parametrize('records', [
-        pytest.param([_assistant_texts(_coder_judgment())], id='coder_judgment'),
-        pytest.param([_assistant_texts(_json_fenced(_coder_judgment()))], id='json_fenced_coder_judgment'),
+        pytest.param([_assistant_texts(coder_judgment(_LITERAL_LINE))], id='coder_judgment'),
+        pytest.param([_assistant_texts(json_fenced(coder_judgment(_LITERAL_LINE)))], id='json_fenced_coder_judgment'),
         pytest.param([_trickle_coder_prompt_turn()], id='trickle_coder_prompt'),
-        pytest.param([_briefing_turn('Find out why the file was not found.')], id='briefing'),
+        pytest.param([_user_turn(briefing_text(_LITERAL_LINE))], id='briefing'),
         pytest.param(
             [_origin_stamped(_user_turn(_LITERAL_LINE), 'task-notification')],
             id='non_human_origin_text',
@@ -620,7 +601,7 @@ class TestReingestedContentIsNotScored:
         encoded.mkdir()
         sessions = [
             _session_on_disk(encoded, 'coder-run', [
-                _trickle_coder_prompt_turn(), _assistant_texts(_coder_judgment()),
+                _trickle_coder_prompt_turn(), _assistant_texts(coder_judgment(_LITERAL_LINE)),
             ]),
             _session_on_disk(encoded, 'real-signal', [_clean_record(0), _not_found_record()]),
         ]
@@ -641,21 +622,18 @@ class TestReingestedContentIsNotScored:
         assert {r.path.stem for r in result.selected} == {'real-signal'}
 
     def test_prose_quoting_the_schema_inline_still_self_corrects(self, tmp_path):
-        records = [_assistant_texts(
-            'The coder answers with {"matches": [], "candidates": []} '
-            "— that's wrong, it should be a single object per session."
-        )]
+        records = [_assistant_texts(PROSE_QUOTING_THE_SCHEMA)]
 
         assert _text_class_counts(tmp_path, records)['self_correct'] == 1
 
     def test_a_coder_judgment_block_does_not_mask_a_sibling_self_correction(self, tmp_path):
-        records = [_assistant_texts(_coder_judgment(), _GENUINE_SELF_CORRECTION)]
+        records = [_assistant_texts(coder_judgment(_LITERAL_LINE), _GENUINE_SELF_CORRECTION)]
 
         assert _text_class_counts(tmp_path, records)['self_correct'] == 1
 
     def test_a_coder_judgment_tool_result_does_not_mask_a_sibling_not_found(self, tmp_path):
         records = [_user_blocks(
-            _tool_result_block(_coder_judgment(note='the module was not found')),
+            _tool_result_block(coder_judgment(note='the module was not found')),
             _tool_result_block('cat: x: No such file or directory'),
         )]
 
@@ -670,7 +648,7 @@ class TestReingestedContentIsNotScored:
         assert _text_class_counts(tmp_path, records) == dict.fromkeys(_TEXT_CLASSES, 1)
 
     def test_a_guard_tool_use_still_counts_beside_a_coder_judgment(self, tmp_path):
-        record = _assistant_texts(_coder_judgment())
+        record = _assistant_texts(coder_judgment(_LITERAL_LINE))
         record['message']['content'].append({
             'type': 'tool_use',
             'id': 'tu-g',
@@ -698,7 +676,7 @@ class TestSamplerReingestedContentParity:
     def test_sampler_and_digest_agree_on_a_contaminated_session(self, tmp_path):
         records = [
             _trickle_coder_prompt_turn(),
-            _assistant_texts(_coder_judgment()),
+            _assistant_texts(coder_judgment(_LITERAL_LINE)),
             _origin_stamped(_user_turn(_LITERAL_LINE), 'task-notification'),
             _stamped_tool_result_record(),
             _assistant_texts(_GENUINE_SELF_CORRECTION),
