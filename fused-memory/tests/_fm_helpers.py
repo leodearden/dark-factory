@@ -29,6 +29,7 @@ import warnings
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -2283,3 +2284,33 @@ class FakeMemoryLookup:
         if isinstance(verdict, BaseException):
             raise verdict
         return verdict
+
+
+async def seed_resolved_ticket(
+    store: Any,
+    db_path: pathlib.Path,
+    project_id: str,
+    *,
+    status: str,
+    latency_s: float,
+    resolved_at: datetime,
+    reason: str | None = None,
+) -> str:
+    """Submit and resolve one ticket, then pin its age and resolve latency.
+
+    The ticket goes through ``TicketStore``'s public writers, which both stamp
+    the wall clock; the timestamps are then rewritten through an independent
+    connection to *db_path*, treating the db file as the fixture.
+    """
+    import aiosqlite
+
+    ticket_id = await store.submit(project_id, '{}')
+    await store.mark_resolved(ticket_id, status=status, task_id='1', reason=reason)
+    created_at = resolved_at - timedelta(seconds=latency_s)
+    async with aiosqlite.connect(str(db_path), timeout=5) as db:
+        await db.execute(
+            'UPDATE tickets SET created_at = ?, resolved_at = ? WHERE ticket_id = ?',
+            (created_at.isoformat(), resolved_at.isoformat(), ticket_id),
+        )
+        await db.commit()
+    return ticket_id

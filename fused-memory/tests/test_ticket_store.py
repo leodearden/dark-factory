@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import pytest_asyncio
+from _fm_helpers import seed_resolved_ticket
 from shared.async_sqlite_base import CheckpointResult
 from test_daemon_connect_consolidation import assert_connection_thread_is_daemon
 
@@ -718,46 +719,6 @@ async def test_checkpoint_after_close_answers_unavailable(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-async def _set_ticket_times(
-    db_path, ticket_id: str, *, created_at: datetime, resolved_at: datetime | None,
-) -> None:
-    """Rewrite a ticket's timestamps through an independent connection to the db file."""
-    import aiosqlite
-
-    async with aiosqlite.connect(str(db_path), timeout=5) as db:
-        await db.execute(
-            'UPDATE tickets SET created_at = ?, resolved_at = ? WHERE ticket_id = ?',
-            (
-                created_at.isoformat(),
-                resolved_at.isoformat() if resolved_at is not None else None,
-                ticket_id,
-            ),
-        )
-        await db.commit()
-
-
-async def _seed_resolved(
-    store: TicketStore,
-    db_path,
-    project_id: str,
-    *,
-    status: str,
-    latency_s: float,
-    resolved_at: datetime,
-    reason: str | None = None,
-) -> str:
-    """Submit and resolve one ticket, then pin its age and resolve latency."""
-    ticket_id = await store.submit(project_id, '{}')
-    await store.mark_resolved(ticket_id, status=status, task_id='1', reason=reason)
-    await _set_ticket_times(
-        db_path,
-        ticket_id,
-        created_at=resolved_at - timedelta(seconds=latency_s),
-        resolved_at=resolved_at,
-    )
-    return ticket_id
-
-
 class TestDedupHealthWindow:
     """``TicketStore.dedup_health`` summarises one project's curator verdicts
     over a window: resolved/combined counts, raw wall-clock median resolve
@@ -781,7 +742,7 @@ class TestDedupHealthWindow:
     @pytest.mark.asyncio
     async def test_outage_shape(self, store, db_path, now, since):
         for i in range(20):
-            await _seed_resolved(
+            await seed_resolved_ticket(
                 store, db_path, 'proj', status='created',
                 latency_s=1.5 + i * (1.5 / 19), resolved_at=now - timedelta(minutes=i + 1),
                 reason=self._OUTAGE_REASON,
@@ -797,12 +758,12 @@ class TestDedupHealthWindow:
     @pytest.mark.asyncio
     async def test_healthy_shape(self, store, db_path, now, since):
         for i in range(15):
-            await _seed_resolved(
+            await seed_resolved_ticket(
                 store, db_path, 'proj', status='created', latency_s=60 + i * 8,
                 resolved_at=now - timedelta(minutes=i + 1), reason='create: new work',
             )
         for i in range(5):
-            await _seed_resolved(
+            await seed_resolved_ticket(
                 store, db_path, 'proj', status='combined', latency_s=100 + i * 20,
                 resolved_at=now - timedelta(minutes=i + 1), reason='combine: same as 12',
             )
@@ -817,11 +778,11 @@ class TestDedupHealthWindow:
 
     @pytest.mark.asyncio
     async def test_since_excludes_older_rows(self, store, db_path, now, since):
-        await _seed_resolved(
+        await seed_resolved_ticket(
             store, db_path, 'proj', status='created', latency_s=2.0,
             resolved_at=now - timedelta(days=7), reason=self._OUTAGE_REASON,
         )
-        await _seed_resolved(
+        await seed_resolved_ticket(
             store, db_path, 'proj', status='created', latency_s=90.0,
             resolved_at=now - timedelta(minutes=5), reason='create: new work',
         )
@@ -834,12 +795,12 @@ class TestDedupHealthWindow:
 
     @pytest.mark.asyncio
     async def test_only_the_named_project_is_counted(self, store, db_path, now, since):
-        await _seed_resolved(
+        await seed_resolved_ticket(
             store, db_path, 'proj', status='created', latency_s=2.0,
             resolved_at=now - timedelta(minutes=5), reason=self._OUTAGE_REASON,
         )
         for _ in range(3):
-            await _seed_resolved(
+            await seed_resolved_ticket(
                 store, db_path, 'other', status='combined', latency_s=120.0,
                 resolved_at=now - timedelta(minutes=5), reason='combine: x',
             )
@@ -854,13 +815,13 @@ class TestDedupHealthWindow:
         self, store, db_path, now, since,
     ):
         for latency in (1.0, 2.0, 3.0):
-            await _seed_resolved(
+            await seed_resolved_ticket(
                 store, db_path, 'proj', status='created', latency_s=latency,
                 resolved_at=now - timedelta(minutes=5), reason=self._OUTAGE_REASON,
             )
         await store.submit('proj', '{}')
         for status in ('failed', 'refused', 'cancelled'):
-            await _seed_resolved(
+            await seed_resolved_ticket(
                 store, db_path, 'proj', status=status, latency_s=500.0,
                 resolved_at=now - timedelta(minutes=5), reason=f'{status}: x',
             )
@@ -882,7 +843,7 @@ class TestDedupHealthWindow:
         self, store, db_path, now, since, latencies, expected_median,
     ):
         for latency in latencies:
-            await _seed_resolved(
+            await seed_resolved_ticket(
                 store, db_path, 'proj', status='created', latency_s=latency,
                 resolved_at=now - timedelta(minutes=5), reason='create: x',
             )
@@ -902,7 +863,7 @@ class TestDedupHealthWindow:
 
     @pytest.mark.asyncio
     async def test_null_reason_buckets_as_unrecorded(self, store, db_path, now, since):
-        await _seed_resolved(
+        await seed_resolved_ticket(
             store, db_path, 'proj', status='created', latency_s=2.0,
             resolved_at=now - timedelta(minutes=5), reason=None,
         )
@@ -917,7 +878,7 @@ class TestDedupHealthWindow:
     ):
         for count, reason in enumerate(('a', 'b', 'c', 'd', 'e', 'f', 'g'), start=1):
             for _ in range(count):
-                await _seed_resolved(
+                await seed_resolved_ticket(
                     store, db_path, 'proj', status='created', latency_s=2.0,
                     resolved_at=now - timedelta(minutes=5), reason=f'create: {reason}',
                 )
