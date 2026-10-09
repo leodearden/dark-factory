@@ -311,8 +311,8 @@ class ManifestTask(BaseModel):
       ``commit_planning`` never stamps such a block: its step-4 write-back
       only touches labels present in the batch being committed, a foreign
       producer is by construction not in a dark-factory batch, and a batch
-      label that does name one is refused by the write-back's own schema
-      re-validation.
+      label that does name one is left unstamped and reported in the
+      stamping report's ``external_labels`` bucket.
     - both ``None`` — authoring time; the block binds nothing yet.
 
     The two id fields are MUTUALLY EXCLUSIVE (enforced below): a block that

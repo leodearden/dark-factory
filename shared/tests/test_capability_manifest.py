@@ -508,10 +508,10 @@ class TestManifestTask:
     def test_both_task_id_and_external_task_id_rejected(self):
         """A block binds exactly one producer, in exactly one registry.
 
-        ``manifest_stamping`` step 4 relies on this rejection: it
-        re-validates a stamped sidecar before writing it, so a future
-        dark-factory decompose re-using a label already bound to a foreign
-        producer has its stamp refused rather than written alongside the
+        ``manifest_stamping`` step 4 skips a batch label whose block is
+        bound to a foreign producer, and its re-validation of the stamped
+        sidecar before writing it is the backstop: a stamp that slipped past
+        the skip is refused rather than written alongside the
         ``external_task_id``. Failing loudly at load is the point — the
         corpus sweep also turns a hand-made violation into a red CI signal
         naming the file.

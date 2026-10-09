@@ -2,9 +2,9 @@
 
 :func:`stamp_task_ids` rewrites only the ``task_id`` values of the labelled
 task blocks it is given, inserting the key where a block has none. Every other
-byte — comments, quoting, key order, blank lines, a BOM, CRLF line endings —
-is preserved, because the text is edited at the spans PyYAML's composer
-reports rather than re-dumped.
+byte — comments, quoting, key order, blank lines, a BOM, LF, CRLF or CR line
+endings — is preserved, because the text is edited at the spans PyYAML's
+composer reports rather than re-dumped.
 
 The result is checked before it is returned: re-parsed, it must equal the
 original document with exactly those blocks' ``task_id`` set. A shape the edit
@@ -15,22 +15,39 @@ of producing a sidecar that says something else.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import yaml
 from yaml.nodes import MappingNode, Node, ScalarNode, SequenceNode
+
+_LINE_BREAK = re.compile(r'\r\n|\r|\n')
 
 
 class SidecarStampRefused(ValueError):
     """The sidecar cannot be stamped without changing more than task_id values."""
 
 
-def stamp_task_ids(text: str, task_ids: Mapping[str, int]) -> str:
-    """Return *text* with each ``label`` in *task_ids* bound to its task_id.
+@dataclass(frozen=True)
+class SidecarStamp:
+    """A stamped sidecar's ``text``, and the ``document`` that text parses to.
+
+    ``document`` is the verifier's own parse, so a caller validating the
+    stamped sidecar need not parse it again. It is ``None`` when the stamp
+    changed nothing — ``text`` is then the input, and there is nothing to write.
+    """
+
+    text: str
+    document: Any = None
+
+
+def stamp_task_ids(text: str, task_ids: Mapping[str, int]) -> SidecarStamp:
+    """Stamp *text* so each ``label`` in *task_ids* is bound to its task_id.
 
     Labels absent from the sidecar are ignored. Stamping a value a block
-    already carries returns *text* unchanged.
+    already carries leaves *text* unchanged.
 
     Raises:
         SidecarStampRefused: the text is not a sidecar-shaped YAML document,
@@ -50,9 +67,11 @@ def stamp_task_ids(text: str, task_ids: Mapping[str, int]) -> str:
     for start in sorted(edits, reverse=True):
         end, replacement = edits[start]
         stamped = stamped[:start] + replacement + stamped[end:]
-    if stamped != text:
-        _verify_only_task_ids_changed(text, stamped, task_ids, bound_labels)
-    return stamped
+    if stamped == text:
+        return SidecarStamp(text)
+    return SidecarStamp(
+        stamped, _verify_only_task_ids_changed(text, stamped, task_ids, bound_labels),
+    )
 
 
 def _bound_entries(
@@ -110,18 +129,22 @@ def _task_id_edit(
 
 
 def _line_after(text: str, index: int, line: str) -> tuple[int, int, str]:
-    """An insertion of *line* after the line holding *index*, in that line's own ending."""
-    newline = text.find('\n', index)
-    if newline == -1:
-        eol = '\r\n' if '\r\n' in text else '\n'
+    """An insertion of *line* after the line holding *index*, in that line's own ending.
+
+    An unterminated final line takes the ending of the line before it.
+    """
+    line_break = _LINE_BREAK.search(text, index)
+    if line_break is None:
+        earlier_breaks = _LINE_BREAK.findall(text, 0, index)
+        eol = earlier_breaks[-1] if earlier_breaks else '\n'
         return len(text), len(text), f'{eol}{line}{eol}'
-    eol = '\r\n' if text[newline - 1 : newline] == '\r' else '\n'
-    return newline + 1, newline + 1, f'{line}{eol}'
+    return line_break.end(), line_break.end(), f'{line}{line_break.group()}'
 
 
 def _verify_only_task_ids_changed(
     original: str, stamped: str, task_ids: Mapping[str, int], bound_labels: list[str],
-) -> None:
+) -> Any:
+    """The parse of *stamped*, once it is shown to differ from *original* only in task_ids."""
     expected: Any = yaml.safe_load(original)
     for entry in expected['tasks']:
         label = entry.get('label') if isinstance(entry, dict) else None
@@ -136,3 +159,4 @@ def _verify_only_task_ids_changed(
             f'stamping task_id for label(s) {", ".join(map(repr, bound_labels))} would '
             f'change more than their task_id values'
         )
+    return actual

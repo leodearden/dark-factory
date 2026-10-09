@@ -165,10 +165,11 @@ If a single bulk call is rejected (e.g. payload-size cap), split into the smalle
 
 `commit_planning` is also the mechanical Greek-label → real-task-id mapping point: for every task in the batch carrying `metadata.prd_path` + `metadata.prd_task_label`, it locates the YAML sidecar from Step 2.5, stamps the matching label's `task_id`, writes the file back, and copies that label's `delivered_check`s of every kind except `manual` into the producer task's `metadata.delivered_checks` (`manual` checks are never copied — they stay sidecar-only, excluded from the dispatch gate). The write-back rewrites only `task_id` values, so comments, quoting and key order survive; a stamp it cannot verify, or one that would leave the sidecar invalid, is refused, named in `errors`, and nothing is written. No sidecar on disk is a no-op — every non-manifest batch is byte-identical to today.
 
-The response carries a structured `manifest_stamping` report: always `{path, stamped, missing_labels, errors}`, plus `near_miss_labels`, `near_miss_keys`, `unlabeled_tasks` and `polarity_warnings` when non-empty. Every batch task carrying `prd_path` whose sidecar exists lands in exactly one bucket:
+The response carries a structured `manifest_stamping` report: always `{path, stamped, missing_labels, errors}`, plus `external_labels`, `near_miss_labels`, `near_miss_keys`, `unlabeled_tasks` and `polarity_warnings` when non-empty. Every batch task carrying `prd_path` whose sidecar exists lands in exactly one bucket:
 
 - `stamped` — its label was found and stamped;
 - `missing_labels` — its `prd_task_label` names no block in the sidecar;
+- `external_labels` — its `prd_task_label` names a block that sets `external_task_id`, so it is not stamped (Step 2.5); the other labels in the batch still are;
 - `near_miss_labels` — its `prd_task_label` only resembles a sidecar label (case, whitespace, or a transliteration such as `gamma` for `γ`);
 - `near_miss_keys` — it carries its label under a misspelt key (`prd_label`, `label`, `task_label`, …);
 - `unlabeled_tasks` — it has no label at all, which is correct only for an out-of-plan follow-up (Step 3).

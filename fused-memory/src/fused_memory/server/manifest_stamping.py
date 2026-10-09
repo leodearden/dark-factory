@@ -16,9 +16,10 @@ Write-back contract: a stamp changes only ``task_id`` values. Every other
 byte of the sidecar — comments, quoting, key order, line endings — is
 preserved (:func:`fused_memory.server.manifest_sidecar_text.stamp_task_ids`),
 and the result is re-parsed and schema-validated before the atomic replace.
-A stamp that cannot be verified, or that would leave an invalid sidecar
-(e.g. a ``task_id`` beside an ``external_task_id``), is refused, reported in
-``report['errors']``, and nothing is written.
+A batch label naming a block whose producer is external (``external_task_id``)
+is never stamped; it is reported on its own, and its siblings still stamp. Any
+other stamp that cannot be verified, or that would leave an invalid sidecar,
+is refused, reported in ``report['errors']``, and nothing is written.
 
 Never raises, and NEVER blocks the ``commit_planning`` flip: stamping runs
 after the flip, a sidecar is scoped and may legitimately omit a label, and an
@@ -27,10 +28,10 @@ out-of-plan follow-up legitimately carries ``prd_path`` without a
 Loud instead. No sidecar on disk is a complete no-op (``None``: the caller
 attaches no ``manifest_stamping`` key). Otherwise every batch task whose
 ``prd_path`` derives the processed sidecar lands in exactly one bucket —
-``stamped``, ``missing_labels``, ``near_miss_labels``, ``near_miss_keys`` or
-``unlabeled_tasks``, the last three attached only when non-empty — and a
-report with anything to repair renders :func:`stamping_action_required`
-lines, which ``commit_planning`` attaches as
+``stamped``, ``missing_labels``, ``external_labels``, ``near_miss_labels``,
+``near_miss_keys`` or ``unlabeled_tasks``, the last four attached only when
+non-empty — and a report with anything to repair renders
+:func:`stamping_action_required` lines, which ``commit_planning`` attaches as
 ``manifest_stamping_action_required`` and this module logs once at WARNING.
 
 I/O contract: every filesystem and YAML step runs in one ``asyncio.to_thread``
@@ -80,6 +81,7 @@ from shared.capability_manifest import (
     MECHANICAL_CHECK_KINDS,
     CapabilityManifestDoc,
     DeliveredCheckMeta,
+    ManifestTask,
     parse_capability_manifest,
 )
 from shared.delivered_check_polarity import GATE_REF, lint_delivered_checks
@@ -132,12 +134,15 @@ class _PrdBoundTask:
 class _SidecarOutcome:
     """What the on-disk steps 2-4 hand back to the coroutine.
 
-    ``doc`` is None when the sidecar failed to load or its stamp failed to
-    write: the report then ends at ``errors``, with nothing stamped.
+    ``bound`` is ``{prd_task_label: task_id}`` for the batch's labeled tasks
+    whose sidecar this is. ``doc`` is None when the sidecar failed to load or
+    its stamp failed to write: the report then ends at ``errors``, with
+    nothing stamped.
     """
 
     root: Path
     sidecar_rel: str
+    bound: Mapping[str, str]
     doc: CapabilityManifestDoc | None
     stamped: tuple[str, ...]
     errors: tuple[str, ...]
@@ -176,8 +181,9 @@ async def stamp_capability_manifests(
         when no derived sidecar exists on disk — a complete no-op in both
         cases. Otherwise a structured report ``{path, stamped,
         missing_labels, errors}`` (``path`` relative to ``project_root``),
-        plus ``near_miss_labels``, ``near_miss_keys``, ``unlabeled_tasks``
-        and ``polarity_warnings`` when non-empty; see the module docstring.
+        plus ``external_labels``, ``near_miss_labels``, ``near_miss_keys``,
+        ``unlabeled_tasks`` and ``polarity_warnings`` when non-empty; see the
+        module docstring.
 
     This is a thin never-raising wrapper around
     :func:`_stamp_capability_manifests_impl`. The implementation's steps
@@ -266,20 +272,20 @@ async def _stamp_capability_manifests_impl(
     if doc is None:
         _warn_if_action_required(report)
         return report
-    label_to_task_id = _labels_bound_to(prd_bound, sidecar_rel)
+    label_to_task_id = outcome.bound
 
     # 4b. Every one of this sidecar's tasks that was not stamped is recorded
     #     loudly in exactly one bucket rather than silently dropped — e.g.
     #     the decompose session referenced a label that was renamed or
     #     removed from the manifest after authoring (missing_labels: batch
-    #     order, deduped, first-occurrence), transliterated it
-    #     (near_miss_labels), misspelt its key (near_miss_keys), or set
-    #     none (unlabeled_tasks).
+    #     order, deduped, first-occurrence), named a foreign-produced block
+    #     (external_labels), transliterated it (near_miss_labels), misspelt
+    #     its key (near_miss_keys), or set none (unlabeled_tasks).
     stamped_label_set = set(outcome.stamped)
     report.update(
         _unstamped_buckets(
             [task for task in prd_bound if task.sidecar_rel == sidecar_rel],
-            sidecar_labels=[task.label for task in doc.tasks],
+            sidecar_tasks=doc.tasks,
             stamped=stamped_label_set,
         )
     )
@@ -466,6 +472,13 @@ def stamping_action_required(report: Mapping[str, Any]) -> list[str]:
         for label in report.get('missing_labels', [])
     ]
     lines += [
+        f"{sidecar}: task {entry['task_id']} has prd_task_label {entry['label']!r}, but that "
+        f"block's producer is external ({entry['external_task_id']}) — a local task cannot "
+        f'also own it; drop the prd_task_label, or bind the block by task_id if the '
+        f'producer is local'
+        for entry in report.get('external_labels', [])
+    ]
+    lines += [
         f"{sidecar}: task {entry['task_id']} has prd_task_label {entry['label']!r}, which "
         f"only resembles sidecar label {entry['sidecar_label']!r} — the value must equal "
         f'the sidecar label byte-for-byte'
@@ -520,20 +533,30 @@ def _near_miss_label_key(meta: Mapping[str, Any]) -> tuple[str, Any] | None:
 
 
 def _unstamped_buckets(
-    tasks: Sequence[_PrdBoundTask], *, sidecar_labels: Sequence[str], stamped: set[str],
+    tasks: Sequence[_PrdBoundTask], *, sidecar_tasks: Sequence[ManifestTask], stamped: set[str],
 ) -> dict[str, list[Any]]:
     """Step 4b: each unstamped task of one sidecar in exactly one bucket.
 
     ``missing_labels`` is always present (legacy shape); the other buckets
     only when non-empty.
     """
+    sidecar_labels = [block.label for block in sidecar_tasks]
+    external_producers = _external_producers(sidecar_tasks)
     missing_labels: list[Any] = []
+    external_labels: list[dict[str, Any]] = []
     near_miss_labels: list[dict[str, Any]] = []
     near_miss_keys: list[dict[str, Any]] = []
     unlabeled_tasks: list[str] = []
     for task in tasks:
         if task.label is not None:
             if task.label in stamped:
+                continue
+            if task.label in external_producers:
+                external_labels.append({
+                    'task_id': task.task_id,
+                    'label': task.label,
+                    'external_task_id': external_producers[task.label],
+                })
                 continue
             sidecar_label = _sidecar_label_resembling(task.label, sidecar_labels)
             if sidecar_label is not None:
@@ -553,11 +576,21 @@ def _unstamped_buckets(
         else:
             unlabeled_tasks.append(task.task_id)
     optional = {
+        'external_labels': external_labels,
         'near_miss_labels': near_miss_labels,
         'near_miss_keys': near_miss_keys,
         'unlabeled_tasks': unlabeled_tasks,
     }
     return {'missing_labels': missing_labels, **{k: v for k, v in optional.items() if v}}
+
+
+def _external_producers(sidecar_tasks: Sequence[ManifestTask]) -> dict[str, str]:
+    """``{label: external_task_id}`` for the blocks another project's task produces."""
+    return {
+        block.label: block.external_task_id
+        for block in sidecar_tasks
+        if block.external_task_id is not None
+    }
 
 
 def _sidecar_label_resembling(value: Any, sidecar_labels: Sequence[str]) -> str | None:
@@ -596,10 +629,11 @@ def _stamp_sidecar_on_disk(
     sidecar_rel, selection_errors = _select_sidecar(root, prd_bound)
     if sidecar_rel is None:
         return None
+    bound = _labels_bound_to(prd_bound, sidecar_rel)
     with _SIDECAR_RMW_LOCK:
-        return _load_and_stamp(
-            root, sidecar_rel, _labels_bound_to(prd_bound, sidecar_rel), selection_errors,
-        )
+        doc, stamped, error = _load_and_stamp(root / sidecar_rel, sidecar_rel, bound)
+    errors = selection_errors if error is None else (*selection_errors, error)
+    return _SidecarOutcome(root, sidecar_rel, bound, doc, stamped, errors)
 
 
 def _select_sidecar(
@@ -658,16 +692,19 @@ def _select_sidecar(
 
 
 def _load_and_stamp(
-    root: Path, sidecar_rel: str, label_to_task_id: dict[str, str], errors: tuple[str, ...],
-) -> _SidecarOutcome:
-    """Steps 3-4: validate the sidecar, then stamp its bound labels' task_ids to disk."""
+    sidecar_abs: Path, sidecar_rel: str, bound: Mapping[str, str],
+) -> tuple[CapabilityManifestDoc | None, tuple[str, ...], str | None]:
+    """Steps 3-4: validate the sidecar, then stamp its bound labels' task_ids to disk.
+
+    Returns ``(doc, stamped labels, error)``; ``doc`` is None exactly when
+    ``error`` is set, and then nothing was stamped.
+    """
     # 3. Read + validate the sidecar via the shared α-loader. Fail-soft/loud:
     #    a malformed sidecar (bad YAML syntax, or a doc that fails α's
     #    pydantic schema) must never raise out of this helper — it's
     #    recorded in errors and stamping is skipped entirely for this
     #    sidecar. Validating BEFORE any mutation below guarantees a
     #    malformed doc leaves the on-disk file byte-identical.
-    sidecar_abs = root / sidecar_rel
     try:
         # Bytes, then decode: read_text would translate CRLF, and the stamp
         # below must hand back every byte it did not mean to change.
@@ -677,48 +714,39 @@ def _load_and_stamp(
         logger.warning(
             'stamp_capability_manifests: failed to load/validate %s', sidecar_rel, exc_info=True,
         )
-        return _SidecarOutcome(
-            root, sidecar_rel, None, (),
-            (*errors, f'{sidecar_rel}: failed to load/validate sidecar — {exc}'),
-        )
+        return None, (), f'{sidecar_rel}: failed to load/validate sidecar — {exc}'
     except Exception as exc:  # pragma: no cover - defensive fallback, never raise
         logger.warning(
             'stamp_capability_manifests: unexpected error loading %s', sidecar_rel, exc_info=True,
         )
-        return _SidecarOutcome(
-            root, sidecar_rel, None, (),
-            (*errors, f'{sidecar_rel}: unexpected error loading sidecar — {exc}'),
-        )
+        return None, (), f'{sidecar_rel}: unexpected error loading sidecar — {exc}'
 
-    # 4. Stamp task_id onto each matching label entry and write back to disk.
-    #    label_to_task_id holds only batch tasks whose OWN derived rel path
-    #    is this sidecar (relevant only for the unexpected multi-sidecar
-    #    case). A stamp the text surgery or the schema refuses is reported
-    #    and nothing is written; any other failure (e.g. a disk write error)
-    #    must not raise either. Both leave nothing reported as stamped, since
-    #    the file was not confirmed written.
-    stamped_labels = tuple(task.label for task in doc.tasks if task.label in label_to_task_id)
+    # 4. Stamp task_id onto each bound label's block and write back to disk.
+    #    bound holds only batch tasks whose OWN derived rel path is this
+    #    sidecar (relevant only for the unexpected multi-sidecar case). A
+    #    block another project produces is skipped here — step 4b reports
+    #    it — so it cannot cost its siblings their stamp. A stamp the text
+    #    surgery or the schema still refuses is reported and nothing is
+    #    written; any other failure (e.g. a disk write error) must not raise
+    #    either. Both leave nothing reported as stamped, since the file was
+    #    not confirmed written.
+    external = _external_producers(doc.tasks)
+    stamped_labels = tuple(
+        task.label for task in doc.tasks if task.label in bound and task.label not in external
+    )
     try:
-        new_text = stamp_task_ids(
-            raw_text, {label: int(label_to_task_id[label]) for label in stamped_labels},
-        )
-        if new_text != raw_text:
-            parse_capability_manifest(yaml.safe_load(new_text))
-            atomic_write_text(sidecar_abs, new_text, encoding='utf-8')
+        stamp = stamp_task_ids(raw_text, {label: int(bound[label]) for label in stamped_labels})
+        if stamp.text != raw_text:
+            parse_capability_manifest(stamp.document)
+            atomic_write_text(sidecar_abs, stamp.text, encoding='utf-8')
     except (SidecarStampRefused, ValidationError) as exc:
         logger.warning(
             'stamp_capability_manifests: refused to stamp %s', sidecar_rel, exc_info=True,
         )
-        return _SidecarOutcome(
-            root, sidecar_rel, None, (),
-            (*errors, f'{sidecar_rel}: refused to stamp sidecar — {exc}'),
-        )
+        return None, (), f'{sidecar_rel}: refused to stamp sidecar — {exc}'
     except Exception as exc:
         logger.warning(
             'stamp_capability_manifests: failed to stamp/write %s', sidecar_rel, exc_info=True,
         )
-        return _SidecarOutcome(
-            root, sidecar_rel, None, (),
-            (*errors, f'{sidecar_rel}: failed to stamp/write sidecar — {exc}'),
-        )
-    return _SidecarOutcome(root, sidecar_rel, doc, stamped_labels, errors)
+        return None, (), f'{sidecar_rel}: failed to stamp/write sidecar — {exc}'
+    return doc, stamped_labels, None
