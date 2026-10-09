@@ -6,27 +6,42 @@ moved by timedelta offsets; everything goes through the public names.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
+from test_pure_stdlib_leaves import run_python_child
 
+from shared.process_identity import ProcessIdentity
 from shared.task_deferral import (
     CALLER_KINDS,
     CONDITION_MAX_CHARS,
     DEFAULT_GRACE_SECS,
     GRACE_BOUNDS,
     REASON_MAX_CHARS,
+    CarriedByDeferral,
     CarriedByRequest,
+    Deferral,
     DeferralInvalid,
     DeferralInvalidReason,
     DeferralKind,
+    DeferralRecord,
+    HeldBySessionDeferral,
     HeldBySessionRequest,
+    InvalidRecord,
+    LegacyUnknownDeferral,
     LegacyUnknownRequest,
+    PlanningDeferral,
+    UntilConditionDeferral,
     UntilConditionRequest,
+    parse_record,
     parse_request,
     parse_utc_timestamp,
+    record_to_json,
+    stamp,
 )
+from shared.task_metadata import is_known_metadata_key, parse_metadata
 
 NOW = datetime(2026, 10, 9, 12, 0, tzinfo=UTC)
 
@@ -258,3 +273,219 @@ def test_naive_timestamp_reads_as_utc():
 def test_timestamp_parser_refuses_a_number():
     with pytest.raises(ValueError):
         parse_utc_timestamp(1760000000)  # type: ignore[arg-type]
+
+
+# --- the stored record -------------------------------------------------------
+
+HOLDER = ProcessIdentity(pid=4242, start_ticks=99, boot_id='b' * 8, host='h')
+STAMPED_AT = NOW + timedelta(microseconds=123456)
+_AGENT = 'claude-task-6524'
+
+
+def _stamped(
+    raw: dict[str, object],
+    *,
+    holder: ProcessIdentity | None = None,
+    deferred_at: datetime | None = NOW,
+    stamped_by: str | None = _AGENT,
+) -> Deferral:
+    return stamp(
+        parse_request(raw, now=NOW),
+        stamped_at=STAMPED_AT,
+        stamped_by=stamped_by,
+        deferred_at=deferred_at,
+        holder=holder,
+    )
+
+
+def _held_record(**fields: object) -> HeldBySessionDeferral:
+    record = _stamped(_held(holder_pid=HOLDER.pid, **fields), holder=HOLDER)
+    assert isinstance(record, HeldBySessionDeferral)
+    return record
+
+
+def test_stamped_carried_by_keeps_the_request_and_the_stamp():
+    record = _stamped(_carried(reason='rides on 6524'))
+
+    assert isinstance(record, CarriedByDeferral)
+    assert record.kind is DeferralKind.CARRIED_BY
+    assert record.carrier_task_id == 6524
+    assert record.reason == 'rides on 6524'
+    assert record.deferred_at == NOW
+    assert record.stamped_at == STAMPED_AT
+    assert record.stamped_by == _AGENT
+
+
+def test_stamped_until_condition_keeps_condition_and_expiry():
+    expires_at = NOW + timedelta(days=1)
+
+    record = _stamped(_until(condition='CI green', expires_at=expires_at.isoformat()))
+
+    assert isinstance(record, UntilConditionDeferral)
+    assert record.kind is DeferralKind.UNTIL_CONDITION
+    assert record.condition == 'CI green'
+    assert record.expires_at == expires_at
+
+
+def test_stamped_held_by_session_stores_the_holder_identity_not_its_pid():
+    record = _held_record()
+
+    assert record.kind is DeferralKind.HELD_BY_SESSION
+    assert record.holder == HOLDER
+    assert record.grace_secs == DEFAULT_GRACE_SECS
+    assert 'holder_pid' not in record_to_json(record)
+
+
+def test_stamped_held_by_session_keeps_a_custom_grace():
+    assert _held_record(grace_secs=900).grace_secs == 900
+
+
+def test_legacy_unknown_may_be_unattributed_with_no_known_entry_time():
+    record = _stamped({'kind': 'legacy_unknown'}, deferred_at=None, stamped_by=None)
+
+    assert isinstance(record, LegacyUnknownDeferral)
+    assert record.deferred_at is None
+    assert record.stamped_by is None
+
+
+@pytest.mark.parametrize(
+    ('raw', 'holder', 'named'),
+    [
+        pytest.param(_held(holder_pid=4242), None, ['held_by_session', 'holder'], id='none'),
+        pytest.param(_held(holder_pid=1234), HOLDER, ['1234', '4242'], id='other-pid'),
+        pytest.param(_carried(), HOLDER, ['carried_by', '4242'], id='carried-by'),
+        pytest.param(_until(), HOLDER, ['until_condition', '4242'], id='until-condition'),
+    ],
+)
+def test_stamp_refuses_a_holder_that_does_not_fit_the_kind(raw, holder, named):
+    request = parse_request(raw, now=NOW)
+
+    with pytest.raises(ValueError) as refused:
+        stamp(request, stamped_at=NOW, stamped_by=_AGENT, deferred_at=NOW, holder=holder)
+
+    assert type(refused.value) is ValueError
+    for text in named:
+        assert text in str(refused.value)
+
+
+_EVERY_KIND_OF_RECORD = [
+    _stamped(_carried()),
+    _stamped(_until(expires_at=(NOW + timedelta(days=1)).isoformat())),
+    _stamped(_until()),
+    _stamped(_held(holder_pid=HOLDER.pid, grace_secs=900), holder=HOLDER),
+    _stamped({'kind': 'legacy_unknown'}, deferred_at=None, stamped_by=None),
+    PlanningDeferral(deferred_at=STAMPED_AT, stamped_at=STAMPED_AT, stamped_by='orchestrator'),
+]
+
+
+@pytest.mark.parametrize('record', _EVERY_KIND_OF_RECORD, ids=lambda r: r.kind.value)
+def test_record_round_trips_through_json(record):
+    wire = json.loads(json.dumps(record_to_json(record)))
+
+    restored = parse_record(wire)
+
+    assert restored == record
+    assert not isinstance(restored, InvalidRecord | None)
+    assert restored.stamped_at.microsecond == STAMPED_AT.microsecond == 123456
+
+
+@pytest.mark.parametrize('record', _EVERY_KIND_OF_RECORD, ids=lambda r: r.kind.value)
+def test_records_are_frozen(record):
+    with pytest.raises(ValidationError):
+        record.reason = 'changed'
+
+
+def test_no_record_is_none():
+    assert parse_record(None) is None
+
+
+def test_a_wrapped_record_unwraps_to_its_variant():
+    record = _stamped(_carried())
+
+    assert parse_record(DeferralRecord(record)) == record
+
+
+def test_a_variant_is_already_parsed():
+    record = _stamped(_carried())
+
+    assert parse_record(record) is record
+
+
+_HELD_JSON = record_to_json(_stamped(_held(holder_pid=HOLDER.pid), holder=HOLDER))
+
+
+@pytest.mark.parametrize(
+    'raw',
+    [
+        pytest.param({'kind': 'carried_by', 'carrier_task_id': 1}, id='never-stamped'),
+        pytest.param({**_HELD_JSON, 'surprise': 1}, id='unknown-key'),
+        pytest.param([_HELD_JSON], id='list'),
+        pytest.param({**_HELD_JSON, 'holder': {**_HELD_JSON['holder'], 'pid': 0}}, id='pid-0'),
+        pytest.param({**_HELD_JSON, 'grace_secs': 5}, id='grace-5'),
+    ],
+)
+def test_malformed_record_is_invalid_with_a_detail(raw):
+    parsed = parse_record(raw)
+
+    assert isinstance(parsed, InvalidRecord)
+    assert parsed.detail
+
+
+# --- registration as metadata.deferral ---------------------------------------
+
+
+def test_deferral_is_a_known_metadata_key():
+    assert is_known_metadata_key('deferral')
+
+
+def test_metadata_read_types_the_deferral_slice():
+    held = _held_record()
+
+    metadata, warnings = parse_metadata({'deferral': record_to_json(held)}, direction='read')
+
+    assert warnings == []
+    assert metadata.model_extra is not None
+    assert parse_record(metadata.model_extra['deferral']) == held
+
+
+def test_malformed_slice_reads_as_an_invalid_submodel():
+    _, warnings = parse_metadata({'deferral': {'kind': 'carried_by'}}, direction='read')
+
+    assert [(w.field, w.code) for w in warnings] == [('deferral', 'invalid_submodel')]
+
+
+def test_malformed_slice_is_refused_on_an_enforced_write():
+    with pytest.raises(ValidationError):
+        parse_metadata({'deferral': {'kind': 'carried_by'}}, direction='write', enforce=True)
+
+
+_TASK_METADATA_ONLY_CHILD = """
+import json, sys
+from shared.task_metadata import is_known_metadata_key, parse_metadata
+metadata, warnings = parse_metadata(json.loads(sys.argv[1]), direction='read')
+deferral = metadata.model_extra['deferral']
+print(json.dumps([
+    is_known_metadata_key('deferral'),
+    [warning.code for warning in warnings],
+    type(deferral).__name__,
+    type(deferral.root).__name__,
+]))
+"""
+
+_TASK_DEFERRAL_FIRST_CHILD = """
+import json, sys
+import shared.task_deferral
+print(json.dumps(sys.modules['shared.task_metadata'].is_known_metadata_key('deferral')))
+"""
+
+
+def test_a_process_importing_only_task_metadata_types_the_deferral_slice():
+    blob = json.dumps({'deferral': record_to_json(_held_record())})
+
+    seen = run_python_child(_TASK_METADATA_ONLY_CHILD, blob)
+
+    assert seen == [True, [], 'DeferralRecord', 'HeldBySessionDeferral']
+
+
+def test_a_process_importing_task_deferral_first_knows_the_key():
+    assert run_python_child(_TASK_DEFERRAL_FIRST_CHILD) is True
