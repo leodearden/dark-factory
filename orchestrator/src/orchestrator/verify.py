@@ -5327,6 +5327,11 @@ async def _run_cmd(
     the read only when the measured elapsed and remaining time are
     consistent with it, otherwise it reports the stop as unattributed.
 
+    *timeout* is measured from launch: time spent spawning the subprocess
+    counts against it, so a command still running *timeout* seconds after
+    ``_run_cmd`` began launching it is reported timed out however long the
+    spawn took.
+
     ``PYTHONUNBUFFERED=1`` is unconditionally injected into the subprocess env
     so that python children (pytest, ruff, pyright via uv) flush their stdout
     per-line — necessary for the partial-log invariant under heavy buffering.
@@ -5380,6 +5385,9 @@ async def _run_cmd(
     # handler can emit a message with the real elapsed wall time and, when
     # consistent with what genuinely elapsed, which deadline fired.
     _cs_timeout_msg: list[str] = []
+
+    launched_at = time.monotonic()
+    wall_deadline = launched_at + timeout
     try:
         if scope_unit is not None:
             # Launch inside a transient --user scope (its own cgroup) so a
@@ -5410,7 +5418,9 @@ async def _run_cmd(
         pgid = proc.pid
 
         if log_path is None:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            stdout, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=wall_deadline - time.monotonic(),
+            )
             rc = proc.returncode if proc.returncode is not None else 1
             return rc, stdout.decode(errors='replace'), False
 
@@ -5435,7 +5445,7 @@ async def _run_cmd(
                         log_fh.flush()
                     await proc.wait()
 
-                await asyncio.wait_for(_stream(), timeout=timeout)
+                await asyncio.wait_for(_stream(), timeout=wall_deadline - time.monotonic())
             else:
                 # ── Marker-aware clock-stop loop (task 1916) ────────────────
                 # State machine: RUNNING enforces a wall-clock deadline that
@@ -5449,10 +5459,10 @@ async def _run_cmd(
                 _CS_RUNNING = 'running'
                 _CS_STOPPED = 'stopped'
                 state = _CS_RUNNING
-                t0 = time.monotonic()
-                # Wall-clock deadline: start + timeout, shifted forward on each
+                t0 = launched_at
+                # Wall-clock deadline: launch + timeout, shifted forward on each
                 # STOP→START transition by the duration of the stopped span.
-                deadline = t0 + timeout
+                deadline = wall_deadline
                 stop_entered: float = 0.0
                 idle_deadline: float = 0.0
                 # Cumulative stopped time across all completed stop/start cycles
