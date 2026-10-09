@@ -13,11 +13,13 @@ included.
 from __future__ import annotations
 
 import collections
+import contextlib
 import json
 import logging
 import time
 import uuid as uuid_mod
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -327,6 +329,22 @@ def _backend_result_summary(
     return {'result': result_summary, 'tokens': llm_tokens.as_journal_dict()}
 
 
+@dataclass(frozen=True)
+class JournalGrowthSample:
+    """One growth measurement of the journal, taken by ``WriteJournal.growth_sample``.
+
+    ``file_bytes`` is the on-disk footprint (``.db`` + ``-wal`` + ``-shm``);
+    ``free_bytes`` is the part of it on the freelist, reusable by inserts and
+    reclaimable only by VACUUM; ``rows_inserted`` counts ``write_ops`` inserts
+    at or after ``since``.
+    """
+
+    file_bytes: int
+    free_bytes: int
+    rows_inserted: int
+    since: datetime
+
+
 class WriteJournal:
     """Two-layer write journal backed by SQLite (WAL mode)."""
 
@@ -335,9 +353,13 @@ class WriteJournal:
         self._access: AtomicConnection | None = None
         self._dropped: collections.Counter[str] = collections.Counter()
 
+    @property
+    def db_path(self) -> Path:
+        return self.data_dir / 'write_journal.db'
+
     async def initialize(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        db_path = self.data_dir / 'write_journal.db'
+        db_path = self.db_path
         conn = await connect_daemon(str(db_path))
         conn.row_factory = aiosqlite.Row
         await apply_full_durability_pragmas(conn, busy_timeout_ms=5000)
@@ -354,6 +376,31 @@ class WriteJournal:
 
     async def checkpoint(self) -> CheckpointResult:
         return await AtomicConnection.checkpoint_or_unavailable(self._access)
+
+    async def growth_sample(self, *, since: datetime) -> JournalGrowthSample:
+        """Measure the journal's size and insert volume since ``since``.
+
+        Every statement is O(1) or a single index seek, because the live
+        ``write_ops`` table holds tens of millions of rows. The consumer is
+        ``services/journal_growth_alarm.py``.
+        """
+        access = self._require_access()
+        freelist_row = await access.read_one('PRAGMA freelist_count')
+        page_size_row = await access.read_one('PRAGMA page_size')
+        assert freelist_row is not None and page_size_row is not None
+        return JournalGrowthSample(
+            file_bytes=self._on_disk_bytes(),
+            free_bytes=freelist_row[0] * page_size_row[0],
+            rows_inserted=0,
+            since=since,
+        )
+
+    def _on_disk_bytes(self) -> int:
+        total = 0
+        for suffix in ('', '-wal', '-shm'):
+            with contextlib.suppress(FileNotFoundError):
+                total += self.db_path.with_name(self.db_path.name + suffix).stat().st_size
+        return total
 
     def _require_access(self) -> AtomicConnection:
         if self._access is None:
