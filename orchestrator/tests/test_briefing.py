@@ -13,9 +13,11 @@ introduced for the plan-files-not-touched architect-narrowing retry.
 
 from __future__ import annotations
 
+import ast
+import inspect
 import re
-from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import NamedTuple
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -30,6 +32,7 @@ from _role_splice_contract import assert_nonempty
 from shared.capability_manifest import DeliveredCheckMeta
 from test_roles_ancestry_check import _tool_is_granted
 
+from orchestrator import workflow
 from orchestrator.agents.briefing import (
     DELIVERED_CHECK_BULLET_LIMIT,
     BriefingAssembler,
@@ -729,19 +732,35 @@ class TestBuildPlanCompletionPrompt:
         assert 'claude-task-3822-architect' in prompt
 
 
-_RECIPE_CALL_SIGNATURE = re.compile(r'`(\w+\([^`)]+\))`')
+_RECIPE_TOOL_NAME = re.compile(r'`(\w+)\(')
 
 
-def _recipe_call_signatures() -> list[str]:
-    """Every backticked call with arguments that the plan-tools recipe spells."""
-    signatures = _RECIPE_CALL_SIGNATURE.findall(ARCHITECT_PLAN_TOOLS_RECIPE)
-    assert signatures, (
-        'ARCHITECT_PLAN_TOOLS_RECIPE spells no backticked call signature with '
-        'arguments, which makes every exactly-once count below vacuous — either '
-        'the recipe stopped spelling its tool signatures or '
-        '_RECIPE_CALL_SIGNATURE no longer matches how it spells them.'
+def _recipe_tool_names() -> list[str]:
+    """Every tool the plan-tools recipe spells as a backticked call."""
+    names = sorted(set(_RECIPE_TOOL_NAME.findall(ARCHITECT_PLAN_TOOLS_RECIPE)))
+    assert names, (
+        'ARCHITECT_PLAN_TOOLS_RECIPE spells no backticked tool call, which makes '
+        'every recipe-signature check below vacuous — either the recipe stopped '
+        'spelling its tool calls or _RECIPE_TOOL_NAME no longer matches how it '
+        'spells them.'
     )
-    return signatures
+    return names
+
+
+def _recipe_signature_spellings(text: str) -> list[str]:
+    """Every recipe tool call in *text* that spells a parameter list.
+
+    Any parameter list counts, whatever its names, and so does an
+    ``mcp__plan-tools__``-qualified spelling. ``tool(...)`` names the tool
+    without restating its signature, and ``confirm_plan()`` has no
+    parameters to drift.
+    """
+    return [
+        match.group(0)
+        for name in _recipe_tool_names()
+        for match in re.finditer(re.escape(name) + r'\(([^)`]+)\)', text)
+        if match.group(1) != '...'
+    ]
 
 
 _SPOT_TASK = {
@@ -768,34 +787,82 @@ _SPOT_PLAN = {
     'steps': [{'id': 's1', 'type': 'test', 'description': 'x', 'status': 'pending'}],
 }
 
-_ARCHITECT_DISPATCHES: dict[str, Callable[[BriefingAssembler], Awaitable[str]]] = {
-    'fresh': lambda b: b.build_architect_prompt(_SPOT_TASK, context=''),
-    'fresh_with_optional_sections': lambda b: b.build_architect_prompt(
-        _SPOT_TASK,
-        context='',
-        include_prior_proposals=True,
-        committed_work=_SPOT_COMMITTED_WORK,
+class _ArchitectDispatch(NamedTuple):
+    builder: str
+    args: tuple[object, ...]
+    options: dict[str, object]
+
+
+_ARCHITECT_DISPATCHES: dict[str, _ArchitectDispatch] = {
+    'fresh': _ArchitectDispatch('build_architect_prompt', (_SPOT_TASK,), {}),
+    'fresh_with_optional_sections': _ArchitectDispatch(
+        'build_architect_prompt',
+        (_SPOT_TASK,),
+        {'include_prior_proposals': True, 'committed_work': _SPOT_COMMITTED_WORK},
     ),
-    'revalidation': lambda b: b.build_revalidation_prompt(
-        _SPOT_TASK, _SPOT_PLAN, ['a.py'], context='',
+    'revalidation': _ArchitectDispatch(
+        'build_revalidation_prompt', (_SPOT_TASK, _SPOT_PLAN, ['a.py']), {},
     ),
-    'completion': lambda b: b.build_plan_completion_prompt(
-        _SPOT_TASK, _SPOT_PLAN, context='',
+    'completion': _ArchitectDispatch(
+        'build_plan_completion_prompt', (_SPOT_TASK, _SPOT_PLAN), {},
     ),
-    'tightening': lambda b: b.build_plan_tightening_prompt(
-        _SPOT_TASK, _SPOT_PLAN, ['a.py'], context='',
+    'tightening': _ArchitectDispatch(
+        'build_plan_tightening_prompt', (_SPOT_TASK, _SPOT_PLAN, ['a.py']), {},
     ),
-    'schema_repair': lambda b: b.build_plan_schema_repair_prompt(_SPOT_TASK, context=''),
-    'replan': lambda b: b.build_replan_prompt(_SPOT_TASK, 'REVIEW-FEEDBACK', context=''),
+    'schema_repair': _ArchitectDispatch('build_plan_schema_repair_prompt', (_SPOT_TASK,), {}),
+    'replan': _ArchitectDispatch('build_replan_prompt', (_SPOT_TASK, 'REVIEW-FEEDBACK'), {}),
 }
+
+
+async def _dispatch_briefing(briefing: BriefingAssembler, dispatch: str) -> str:
+    builder, args, options = _ARCHITECT_DISPATCHES[dispatch]
+    return await getattr(briefing, builder)(*args, context='', **options)
+
+
+def _invokes_architect(call: ast.Call) -> bool:
+    return (
+        isinstance(call.func, ast.Attribute)
+        and call.func.attr == '_invoke'
+        and bool(call.args)
+        and isinstance(call.args[0], ast.Name)
+        and call.args[0].id == 'ARCHITECT'
+    )
+
+
+def _briefing_builder_name(call: ast.Call) -> str | None:
+    func = call.func
+    if (
+        isinstance(func, ast.Attribute)
+        and func.attr.startswith('build_')
+        and isinstance(func.value, ast.Attribute)
+        and func.value.attr == 'briefing'
+    ):
+        return func.attr
+    return None
+
+
+def _workflow_architect_builders() -> set[str]:
+    """The briefing builders of every workflow.py function that invokes ARCHITECT."""
+    builders: set[str] = set()
+    for function in ast.walk(ast.parse(inspect.getsource(workflow))):
+        if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        calls = [node for node in ast.walk(function) if isinstance(node, ast.Call)]
+        if any(_invokes_architect(call) for call in calls):
+            builders.update(
+                name for call in calls if (name := _briefing_builder_name(call))
+            )
+    return builders
 
 
 class TestArchitectPlanToolsRecipeSingleHome:
     """Every ARCHITECT dispatch spells each plan-tools recipe signature once.
 
-    The dispatched prompt is ``ARCHITECT.system_prompt`` plus the briefing.
-    ``_ARCHITECT_DISPATCHES`` is hand-maintained to match workflow.py's
-    ``_invoke(ARCHITECT, ...)`` sites; that pairing is not machine-checked.
+    The dispatched prompt is ``ARCHITECT.system_prompt`` plus the briefing:
+    the signatures live in the recipe, and the briefing spells none of them.
+    ``_ARCHITECT_DISPATCHES`` must cover every briefing builder that
+    workflow.py dispatches to ARCHITECT; a test below derives that set from
+    workflow.py's source.
     """
 
     def test_recipe_reaches_only_the_architect_exactly_once(self) -> None:
@@ -815,25 +882,66 @@ class TestArchitectPlanToolsRecipeSingleHome:
         )
         assert ARCHITECT.system_prompt.count(ARCHITECT_PLAN_TOOLS_RECIPE) == 1
 
+    def test_system_prompt_spells_recipe_signatures_only_inside_the_recipe(self) -> None:
+        in_recipe = _recipe_signature_spellings(ARCHITECT_PLAN_TOOLS_RECIPE)
+        assert in_recipe, (
+            '_recipe_signature_spellings finds no signature in '
+            'ARCHITECT_PLAN_TOOLS_RECIPE, so it cannot see a re-spelled one '
+            'anywhere else either.'
+        )
+        assert len(set(in_recipe)) == len(in_recipe), (
+            f'ARCHITECT_PLAN_TOOLS_RECIPE spells a signature twice: {in_recipe}.'
+        )
+        outside = _recipe_signature_spellings(
+            ARCHITECT.system_prompt.replace(ARCHITECT_PLAN_TOOLS_RECIPE, ''),
+        )
+        assert not outside, (
+            f'ARCHITECT.system_prompt re-spells {outside} outside '
+            'ARCHITECT_PLAN_TOOLS_RECIPE. Name the tool without its signature, '
+            '`tool(...)`, or point at the recipe.'
+        )
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize('dispatch', sorted(_ARCHITECT_DISPATCHES))
-    async def test_dispatch_spells_each_recipe_signature_exactly_once(
+    async def test_dispatch_briefing_spells_no_recipe_signature(
         self, briefing: BriefingAssembler, dispatch: str,
     ) -> None:
-        dispatched = ARCHITECT.system_prompt + await _ARCHITECT_DISPATCHES[dispatch](briefing)
-        miscounted = {
-            sig: dispatched.count(sig)
-            for sig in _recipe_call_signatures()
-            if dispatched.count(sig) != 1
-        }
-        assert not miscounted, (
-            f'The {dispatch!r} architect dispatch spells these plan-tools recipe '
-            f'signatures other than exactly once: {miscounted}. The recipe has '
-            'one home, roles.py::ARCHITECT_PLAN_TOOLS_RECIPE, which '
-            'ARCHITECT.system_prompt carries into every architect dispatch. A '
-            'briefing that re-spells a recipe signature shows the architect a '
+        respelled = _recipe_signature_spellings(await _dispatch_briefing(briefing, dispatch))
+        assert not respelled, (
+            f'The {dispatch!r} architect briefing re-spells these plan-tools '
+            f'recipe signatures: {respelled}. The recipe has one home, '
+            'roles.py::ARCHITECT_PLAN_TOOLS_RECIPE, which ARCHITECT.system_prompt '
+            'carries into every architect dispatch. A briefing that re-spells a '
+            'recipe signature, under any parameter names, shows the architect a '
             'second recipe that can drift from the first (task 5532). Name the '
             'tool without its signature, `tool(...)`, or point at the recipe.'
+        )
+
+    @pytest.mark.asyncio
+    async def test_optional_sections_dispatch_renders_every_optional_section(
+        self, briefing: BriefingAssembler,
+    ) -> None:
+        rendered = await _dispatch_briefing(briefing, 'fresh_with_optional_sections')
+        proposal = _SPOT_TASK['metadata']['dry_run_proposals'][-1]['proposal_text']
+        assert proposal in rendered, 'the prior-proposal section did not render'
+        assert _SPOT_COMMITTED_WORK[0]['subject'] in rendered, (
+            'the already-committed-work section did not render'
+        )
+
+    def test_dispatch_table_covers_every_workflow_architect_builder(self) -> None:
+        dispatched = _workflow_architect_builders()
+        assert dispatched, (
+            'No workflow.py function calls a self.briefing.build_* method and '
+            "self._invoke(ARCHITECT, ...), so this check sees nothing; "
+            '_workflow_architect_builders no longer matches how workflow.py '
+            'dispatches the architect.'
+        )
+        tabled = {dispatch.builder for dispatch in _ARCHITECT_DISPATCHES.values()}
+        assert tabled == dispatched, (
+            f'workflow.py dispatches these ARCHITECT briefing builders that '
+            f'_ARCHITECT_DISPATCHES lacks: {sorted(dispatched - tabled)}; and '
+            f'the table holds these that workflow.py no longer dispatches to '
+            f'ARCHITECT: {sorted(tabled - dispatched)}.'
         )
 
 
