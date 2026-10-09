@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar, cast
 
 from graphiti_core.nodes import EpisodeType
+from shared.storm_counter import KeyedStormCounters
 
 from fused_memory.backends.graphiti_client import (
     ActiveEdgesError,
@@ -102,7 +103,6 @@ from fused_memory.reconciliation.standing_decision_writer import (
 )
 from fused_memory.routing.classifier import WriteClassifier
 from fused_memory.routing.router import ReadRouter
-from fused_memory.server.storm_counter import StormCounter
 from fused_memory.services.completion_claim_gate import UNVERIFIED_CLAIM_TAG
 from fused_memory.services.durable_queue import DeadLetterEvent, DurableWriteQueue
 from fused_memory.services.memory_metadata_census import (
@@ -2283,14 +2283,15 @@ class MemoryService:
         # service). An alarm bound to either would vanish in exactly the
         # degraded configuration where an unattended rewrite loop is least
         # likely to be noticed any other way.
-        self._mem0_update_storm_counters: dict[str, StormCounter] = {}
+        self._mem0_update_storm_counters: KeyedStormCounters[str] = KeyedStormCounters()
         self._mem0_update_storm_escalator = Mem0UpdateStormEscalator()
         # INV-4 storm escape for the ensure_entity_node MCP tool (task 4932),
-        # keyed per `agent_id` for the same attribution reason as the dict above.
+        # keyed per `agent_id` for the same attribution reason as the registry
+        # above.
         # No escalator OBJECT beside it: `middleware/entity_mint_storm_escalator`
         # is a module FUNCTION taking project_root explicitly, so there is no
         # queue cache to own and no set_known_projects lifecycle to keep in sync.
-        self._entity_mint_storm_counters: dict[str, StormCounter] = {}
+        self._entity_mint_storm_counters: KeyedStormCounters[str] = KeyedStormCounters()
         # Warn-ONCE latch for a corrupt/absent `entity_mint.storm_*` leaf. The
         # corrupt-leaf branch of `_record_entity_mint` is reached on EVERY mint
         # (unlike the `_known_projects` miss beside it, which only fires at a
@@ -2421,6 +2422,25 @@ class MemoryService:
         unwired, which callers treat as "skip journalling", never as an error.
         """
         return self._write_journal
+
+    @property
+    def mem0_update_storm_tracked_agents(self) -> frozenset[str]:
+        """The ``agent_id`` labels holding an ``update_memory`` storm window.
+
+        ``agent_id`` is caller-supplied and unbounded, so evicting dormant
+        agents is a real memory bound on a long-lived server and belongs in the
+        interface, as ``UnknownKeyStormDetector.tracked_writers`` argues.
+        """
+        return self._mem0_update_storm_counters.tracked_keys
+
+    @property
+    def entity_mint_storm_tracked_agents(self) -> frozenset[str]:
+        """The ``agent_id`` labels holding an ``ensure_entity_node`` storm window.
+
+        The same bound as :attr:`mem0_update_storm_tracked_agents`, for the
+        entity-mint burst alarm.
+        """
+        return self._entity_mint_storm_counters.tracked_keys
 
     def set_planned_registry(self, registry: PlannedEpisodeRegistry) -> None:
         """Wire the planned episode registry into the service."""
@@ -9339,39 +9359,21 @@ class MemoryService:
         they would make both green-tier leaves restart-only in disguise.
         """
         label = agent_id or '<unattributed>'
-        counter = self._mem0_update_storm_counters.get(label)
-        if counter is None:
-            counter = StormCounter(time_provider=self._mem0_update_storm_time_provider)
-            self._mem0_update_storm_counters[label] = counter
-
         cfg = getattr(self.config, 'mem0_update', None)
         threshold = getattr(cfg, 'storm_threshold', None)
         window_seconds = getattr(cfg, 'storm_window_seconds', None)
         if not isinstance(threshold, int) or not isinstance(window_seconds, int | float):
             return
 
-        storm = counter.record(
+        # agent_id is caller-supplied and unbounded; KeyedStormCounters sweeps
+        # the dormant ones on every record.
+        storm = self._mem0_update_storm_counters.record(
+            label,
             threshold=threshold,
             window_seconds=float(window_seconds),
             label=label,
+            now=self._mem0_update_storm_time_provider(),
         )
-
-        # Evict counters whose window has gone empty. Each counter self-prunes
-        # its own deque, but nothing would drop the counter OBJECT, and
-        # ``agent_id`` is caller-supplied and unbounded in cardinality — the
-        # gate is a self-reported prefix match, so a widened prefix admits
-        # arbitrary suffixes (``recon-stage-1-run-<uuid>`` mints a fresh key
-        # every run). A server designed to run for weeks between restarts would
-        # otherwise accumulate one dead counter per agent it ever saw.
-        #
-        # Runs on EVERY amend, not just a breach: the leak is on the common
-        # path. It is O(live agents) because the sweep is itself what keeps
-        # that from becoming O(agents ever seen). See StormCounter.prune on why
-        # dropping an empty counter is behaviour-preserving.
-        for other, dormant in list(self._mem0_update_storm_counters.items()):
-            if other != label and dormant.prune(float(window_seconds)) == 0:
-                del self._mem0_update_storm_counters[other]
-
         if storm is None:
             return
 
@@ -10296,11 +10298,6 @@ class MemoryService:
         they would make both green-tier leaves restart-only in disguise.
         """
         label = agent_id or '<unattributed>'
-        counter = self._entity_mint_storm_counters.get(label)
-        if counter is None:
-            counter = StormCounter(time_provider=self._entity_mint_storm_time_provider)
-            self._entity_mint_storm_counters[label] = counter
-
         cfg = getattr(self.config, 'entity_mint', None)
         threshold = getattr(cfg, 'storm_threshold', None)
         window_seconds = getattr(cfg, 'storm_window_seconds', None)
@@ -10333,25 +10330,15 @@ class MemoryService:
             return
         self._entity_mint_storm_config_warned = False
 
-        storm = counter.record(
+        # agent_id is caller-supplied and unbounded; KeyedStormCounters sweeps
+        # the dormant ones on every record.
+        storm = self._entity_mint_storm_counters.record(
+            label,
             threshold=threshold,
             window_seconds=float(window_seconds),
             label=label,
+            now=self._entity_mint_storm_time_provider(),
         )
-
-        # Evict counters whose window has gone empty. Each counter self-prunes
-        # its own deque, but nothing would drop the counter OBJECT, and
-        # ``agent_id`` is caller-supplied and unbounded in cardinality — the
-        # gate is a self-reported prefix match, so a widened prefix admits
-        # arbitrary suffixes (``recon-stage-1-run-<uuid>`` mints a fresh key
-        # every run). A server designed to run for weeks between restarts would
-        # otherwise accumulate one dead counter per agent it ever saw. Mirrors
-        # ``_record_content_amend``'s sweep exactly; see StormCounter.prune on
-        # why dropping an empty counter is behaviour-preserving.
-        for other, dormant in list(self._entity_mint_storm_counters.items()):
-            if other != label and dormant.prune(float(window_seconds)) == 0:
-                del self._entity_mint_storm_counters[other]
-
         if storm is None:
             return
 
