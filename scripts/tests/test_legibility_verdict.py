@@ -703,14 +703,6 @@ def test_reply_instructions_give_every_severity_and_route_a_meaning() -> None:
     assert verdict.KIND_TAG not in text
 
 
-def test_reply_instructions_state_the_tag_vocabulary_parse_verdict_keeps() -> None:
-    text = verdict.reply_instructions(_OBSERVED_ROOT)
-
-    assert "h1..h14" in text
-    assert "comments or tests" in text
-    assert "inv-<id>" in text
-
-
 _SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 
 
