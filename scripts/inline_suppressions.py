@@ -946,7 +946,7 @@ def _ruff_config_at(location: Path, *, relative: str) -> RuffConfig | None:
             "applies its BUILT-IN default rule set. This consumer model does not "
             'implement those defaults — they are wider than the nothing it would '
             'otherwise infer, and they drift with the ruff version. Declare `select` '
-            'explicitly, as all eight pyprojects in this repository do.'
+            'explicitly.'
         )
 
     return RuffConfig(path=relative, select=select, ignore=declared('ignore') or ())
@@ -1772,9 +1772,9 @@ def _seed(request: Request, kernel: ModuleType) -> int:
     if request.baseline.exists():
         raise InstrumentFailure(
             f'refusing to seed over the baseline already at {request.baseline}: a baseline is '
-            'seeded ONCE, by the operator step κ1, and tightened thereafter. Re-seeding an '
-            'existing one silently widens the gate by every key this scan added. Use '
-            '--tighten to remove what the tree no longer needs.'
+            "seeded ONCE, as the operator's one-time cutover on main, and tightened "
+            'thereafter. Re-seeding an existing one silently widens the gate by every key '
+            'this scan added. Use --tighten to remove what the tree no longer needs.'
         )
     measured = _measure(request)
     kernel.dump(_enumeration(measured.classification, kernel), request.baseline)
@@ -1794,14 +1794,12 @@ def _seed(request: Request, kernel: ModuleType) -> int:
 #:
 #: IT SCOPES ITS CLAIM TO THE RATCHET, because the run it accompanies may not be
 #: green at all: a disposition fault is a fault at the site whatever any baseline
-#: holds, so an advisory run still reports one and still exits 1.  The earlier
-#: wording ("nothing is enforced yet: ... none is a violation") contradicted the
-#: violation printed directly above it on this repository's own tree.
+#: holds, so an advisory run still reports one and still exits 1.
 _ADVISORY_NOTICE = (
     'no baseline at {baseline}, so the RATCHET is not enforced yet: every suppression '
     'here is reported and none of them counts as excess. Disposition faults are '
     'reported regardless, because a marker that does not parse is a fault whatever a '
-    'baseline holds. The baseline is seeded once, on main, by the operator step κ1'
+    'baseline holds. The baseline is seeded once, on main, with --seed'
 )
 
 
