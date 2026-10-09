@@ -8,21 +8,18 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from fused_memory.arm_harness.embedding_run import (
-    EmbeddingRunCheckFailed,
-    EmbeddingRunRefused,
-    run_embedding_arm,
-)
-from fused_memory.arm_harness.embedding_run_manifest import (
-    EmbeddingRunManifest,
-    load_embedding_run_manifest,
-)
 from graphiti_core.embedder import EmbedderClient
 from qdrant_client.models import Filter, PointStruct, VectorParams
 
 from arm_harness._fakes import embedding_spec, llm_spec, make_prereg_repo
 from fused_memory.arm_harness import checks, graph_copy, topology
 from fused_memory.arm_harness.arm_embedder import ArmEmbedder, EmbedSettings, QueryEmbedder
+from fused_memory.arm_harness.embedding_graph_phase import EmbeddingRunCheckFailed
+from fused_memory.arm_harness.embedding_run import EmbeddingRunRefused, run_embedding_arm
+from fused_memory.arm_harness.embedding_run_manifest import (
+    EmbeddingRunManifest,
+    load_embedding_run_manifest,
+)
 from fused_memory.arm_harness.instrument_checks import InstrumentCheckId
 from fused_memory.arm_harness.mem0_replica import (
     Mem0Record,
@@ -209,15 +206,15 @@ class FakeGraph:
             checks.CLEANUP_CYPHER: ('index-probe', self._cleanup),
         }
 
-    async def query(self, cypher: str, params: dict[str, Any] | None = None) -> Any:
+    async def query(self, q: str, params: dict[str, Any] | None = None) -> Any:
         if self.name == REFERENCE:
-            raise AssertionError(f'a write to the frozen reference: {cypher}')
-        phase, handler = self._handlers()[cypher]
+            raise AssertionError(f'a write to the frozen reference: {q}')
+        phase, handler = self._handlers()[q]
         self.log.append(phase)
         return handler(params or {})
 
-    async def ro_query(self, cypher: str, params: dict[str, Any] | None = None) -> Any:
-        phase, handler = self._handlers()[cypher]
+    async def ro_query(self, q: str, params: dict[str, Any] | None = None) -> Any:
+        phase, handler = self._handlers()[q]
         self.log.append(phase)
         return handler(params or {})
 
@@ -358,7 +355,7 @@ class FakeQdrant:
 
     def __init__(self, log: list[str]) -> None:
         self.log = log
-        self.points: dict[str, list[PointStruct]] = {}
+        self.points: dict[str, list[SimpleNamespace]] = {}
         self.vector_params: dict[str, VectorParams] = {}
 
     async def collection_exists(self, collection_name: str) -> bool:
@@ -380,7 +377,10 @@ class FakeQdrant:
     ) -> None:
         assert collection_name.startswith('evalmem_'), collection_name
         self.log.append('replica-build')
-        self.points[collection_name].extend(points)
+        self.points[collection_name].extend(
+            SimpleNamespace(id=point.id, payload=point.payload, vector=point.vector)
+            for point in points
+        )
 
     async def query_points(
         self,
@@ -421,6 +421,7 @@ class FakeEndpoint(EmbedderClient):
 
     async def create(self, input_data):
         (text,) = input_data
+        assert isinstance(text, str)
         self.clock.now += SECONDS_PER_CALL
         return self._vector(text)
 
@@ -583,7 +584,7 @@ def _by_metric(records: Sequence[MetricsRecord]) -> dict[tuple[str, str | None],
 
 @pytest.fixture
 def make_world(tmp_path, mock_config) -> Callable[..., World]:
-    return lambda **kwargs: make_world(mock_config, **kwargs)
+    return lambda **kwargs: World(tmp_path, mock_config, **kwargs)
 
 
 EXPECTED_PHASES = [

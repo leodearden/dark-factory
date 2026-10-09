@@ -62,6 +62,15 @@ class DocumentEmbedder(Protocol):
     async def embed_documents(self, items: Sequence[tuple[str, str]], /) -> DocumentEmbeddings: ...
 
 
+class QueryEmbedError(RuntimeError):
+    """The arm could not turn one query into a valid vector; a probe reads that query as a miss."""
+
+    def __init__(self, arm_id: str, error: Exception) -> None:
+        self.arm_id = arm_id
+        self.error_class = type(error).__name__
+        super().__init__(f'arm {arm_id!r} could not embed a query: {self.error_class}: {error}')
+
+
 @dataclass(frozen=True)
 class _Embedded:
     key: str
@@ -112,7 +121,13 @@ class ArmEmbedder:
         )
 
     async def embed_query(self, query: str) -> tuple[Vector, float]:
-        text = query_text(self.spec.query_prefix, query)
+        """The query's unit vector and the call's latency; any failure is a ``QueryEmbedError``."""
+        try:
+            return await self._timed_query_vector(query_text(self.spec.query_prefix, query))
+        except Exception as error:
+            raise QueryEmbedError(self.spec.arm_id, error) from error
+
+    async def _timed_query_vector(self, text: str) -> tuple[Vector, float]:
         started = self._clock()
         raw = await self.inner.create(input_data=[text])
         latency_ms = (self._clock() - started) * 1000

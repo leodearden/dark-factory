@@ -47,6 +47,12 @@ class ArmBackend(ArmGraph, Protocol):
     async def close(self) -> None: ...
 
 
+class IndexBuilder(Protocol):
+    """The one call ``build_scratch_indices`` makes of a backend."""
+
+    async def ensure_indices(self, *, group_id: str) -> IndexProvisionResult: ...
+
+
 BackendFactory = Callable[[FusedMemoryConfig], ArmBackend]
 
 
@@ -127,7 +133,7 @@ def audited_arm_client(
     return client, ledger
 
 
-async def build_scratch_indices(backend: ArmBackend, group_id: str) -> None:
+async def build_scratch_indices(backend: IndexBuilder, group_id: str) -> None:
     require_scratch_name(group_id, checkpoint=GuardCheckpoint.INDEX_BUILD)
     result = await backend.ensure_indices(group_id=group_id)
     if result.failed:

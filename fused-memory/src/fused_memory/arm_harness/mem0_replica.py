@@ -117,6 +117,10 @@ class ReplicaSearcher(Protocol):
     ) -> Any: ...
 
 
+class ReplicaClient(ReplicaWriter, ReplicaSearcher, Protocol):
+    """The AsyncQdrantClient slice one arm's replica build and probe use."""
+
+
 async def snapshot_collection(
     qdrant: CollectionReader, source: str, *, page_size: int = SNAPSHOT_PAGE_SIZE
 ) -> Mem0Snapshot:
