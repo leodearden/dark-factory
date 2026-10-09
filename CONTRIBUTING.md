@@ -372,6 +372,11 @@ branch, before any merge submission:
 3. `uv run pyright` in each touched, pyright-configured package — any of the
    seven workspace members the §3 **Type-check** command walks.
 
+The inline-suppression ratchet guard,
+`scripts/tests/test_inline_suppression_ratchet.py`, runs with the suite: a
+new `type: ignore`, `noqa` or similar suppression without a disposition
+marker turns it red.
+
 Do this **before** `merge_request`/`/merge-queue`, not after — a red
 post-merge verify blocks or reverts the merge, which is more expensive than
 catching it locally.

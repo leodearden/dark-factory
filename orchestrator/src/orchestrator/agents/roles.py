@@ -4,6 +4,7 @@ import textwrap
 from dataclasses import dataclass, field
 from typing import Literal
 
+from shared.governed_exceptions import DECLARATION_FORMS, INLINE_MARKER_FORMS
 from shared.prompt_artifact import PromptSpec
 
 from orchestrator.agents.bash_cwd_guidance import BASH_CWD_ANCHOR_GUIDANCE
@@ -1792,6 +1793,25 @@ Call `submit_review_verdict` with these fields:
 - **summary**: a one-paragraph summary of the review.
 """
 
+_REVIEWER_INV12_BLOCKERS = """
+## Exception-list changes (INV-12) — blockers no tree-pure check can see
+
+A gate checks that every suppression carries a disposition; it cannot judge
+whether the disposition is honest. Report each of these as `blocking`:
+
+1. **Self-citation** — a marker or declaration the diff adds cites the task under
+   review as its own owner.
+2. **Unrelated citation** — a marker cites a task or ticket that has nothing to do
+   with the debt it excuses.
+3. **Type contortion** — an Any or cast introduced in place of a scoped ignore
+   (or in place of fixing the type).
+4. **Baseline growth** — any added line in the inline baseline
+   (`scripts/inline_suppression_baseline.json`).
+5. **Raised default** — an incremented `default_covers`.
+6. **Unordered ratification edit** — any edit to
+   `docs/legibility/exception-ratifications.yaml` that the task's brief did not order.
+"""
+
 _REVIEWER_HEURISTICS_TEMPLATE = """\
 ## Rules
 
@@ -1809,7 +1829,7 @@ _REVIEWER_HEURISTICS_TEMPLATE = """\
    meets this rule's definition of broken, and otherwise a `suggestion`.
 3. **When in doubt, suggest.** If you're unsure whether something is blocking, it's a suggestion.
 4. **Read the codebase** to understand context before judging patterns or naming.
-""" + CODE_QUALITY_GUIDANCE + """
+""" + CODE_QUALITY_GUIDANCE + _REVIEWER_INV12_BLOCKERS + """
 ## Your Specialization: {specialization}
 """
 
@@ -2214,8 +2234,33 @@ reaper to maybe recover:
     ),
 )
 
+_IMPLEMENTER_INV12_INSTRUCTIONS = (
+    """
+## Silencing a detector (INV-12: exceptions are owned or ratified)
+
+Every entry that silences a detector carries a disposition: a named owner who
+will remove it, or a recorded operator ruling that it stays. Accepted inline
+forms (a trailing comment on the suppressed line):
+
+"""
+    + '\n'.join(f'    {form}' for form in INLINE_MARKER_FORMS)
+    + """
+
+Accepted forms in a governed-list declaration:
+
+"""
+    + '\n'.join(f'    {form}' for form in DECLARATION_FORMS)
+    + """
+
+- Fix the type before suppressing it, and never trade an ignore for Any or cast.
+- File one follow-up ticket per branch and cite it on every marker you add.
+- Never cite your own task as the owner of a marker.
+"""
+)
+
 ARCHITECT.system_prompt = ARCHITECT.system_prompt + _FOLLOWUP_FILING_INSTRUCTIONS
 IMPLEMENTER.system_prompt = IMPLEMENTER.system_prompt + _FOLLOWUP_FILING_INSTRUCTIONS
+IMPLEMENTER.system_prompt = IMPLEMENTER.system_prompt + _IMPLEMENTER_INV12_INSTRUCTIONS
 
 
 MERGE_HALT_ESCALATION_CATEGORIES: tuple[str, ...] = (
