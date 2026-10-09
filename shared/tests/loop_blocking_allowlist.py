@@ -190,28 +190,6 @@ _BACKLOG_POLICY_RECORD_IO_WHY = (
     'into the same offload.'
 )
 
-#: The shared justification of every ``server/manifest_stamping.py`` row.
-_MANIFEST_STAMPING_INLINE_IO_WHY = (
-    'ROOT CAUSE (one defect): _stamp_capability_manifests_impl '
-    'does its sidecar I/O INLINE in one coroutine, with no helper '
-    'anywhere for a definition-side census to point at -- the shape '
-    'task 3778\'s methodology is structurally blind to: an is_file() '
-    'existence probe per distinct manifest path, read_text + '
-    'yaml.safe_load of the sidecar, then an atomic write-back '
-    '(write_text of yaml.safe_dump to a temp sibling, os.replace onto '
-    'the sidecar, and the finally-block unlink of the temp). Task 4201 '
-    'measured yaml.safe_load at 8.15 ms for an 11 KB document, so the '
-    'parse alone is the same order as a subprocess spawn and this '
-    'coroutine pays it twice plus every filesystem round trip above. '
-    'One asyncio.to_thread around the whole probe-read-parse-write '
-    'closes every row. The read/parse/write rows are OWNED BY '
-    'TASK 5276 -- do not file again: task 4484 step-9\'s ticket '
-    'tkt_0RT7QYENVS6J9WVWCY3FJAVNFR became task 5073, coalesced into '
-    '5276. The is_file, os.replace and unlink rows task 5099 added '
-    'when it widened the vocabulary are TASK 6087, filed to fold into '
-    'the same offload.'
-)
-
 #: The shared justification of every ``CodebaseVerifier.verify`` LLM-tool row.
 _VERIFIER_LLM_TOOL_IO_WHY = (
     'ROOT CAUSE (one defect): the async tools '
@@ -794,57 +772,6 @@ AUDITED_SITES: list[tuple[str, str, str, str, str]] = [
         'serving traffic, so there is no concurrent work to stall. If it '
         'ever moves onto a request or reload path, the content_hash '
         'changes and the gate re-asks.',
-    ),
-
-    # ---- server/manifest_stamping.py ----
-    (
-        'fused-memory/src/fused_memory/server/manifest_stamping.py',
-        '_stamp_capability_manifests_impl',
-        '3817640cc33d',
-        'filed',
-        _MANIFEST_STAMPING_INLINE_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/server/manifest_stamping.py',
-        '_stamp_capability_manifests_impl',
-        'e19569fdcfa0',
-        'filed',
-        _MANIFEST_STAMPING_INLINE_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/server/manifest_stamping.py',
-        '_stamp_capability_manifests_impl',
-        '78912ffb516a',
-        'filed',
-        _MANIFEST_STAMPING_INLINE_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/server/manifest_stamping.py',
-        '_stamp_capability_manifests_impl',
-        '93a769609c9b',
-        'filed',
-        _MANIFEST_STAMPING_INLINE_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/server/manifest_stamping.py',
-        '_stamp_capability_manifests_impl',
-        'dfdb79e84d56',
-        'filed',
-        _MANIFEST_STAMPING_INLINE_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/server/manifest_stamping.py',
-        '_stamp_capability_manifests_impl',
-        '364eac0531d3',
-        'filed',
-        _MANIFEST_STAMPING_INLINE_IO_WHY,
-    ),
-    (
-        'fused-memory/src/fused_memory/server/manifest_stamping.py',
-        '_stamp_capability_manifests_impl',
-        'edbfd36fd257',
-        'filed',
-        _MANIFEST_STAMPING_INLINE_IO_WHY,
     ),
 
     # ---- server/tools.py ----

@@ -267,14 +267,6 @@ _ALLOWED_RENAMERS = {
         're-replay, since a second call finds nothing left to snapshot. A '
         'claim, not a write; same class as escalation sweep._atomic_move / '
         'queue._archive_resolved.',
-    ('fused-memory/src/fused_memory/server/manifest_stamping.py', '_stamp_capability_manifests_impl'):
-        'Out of task 3223 enumerated scope; left alone deliberately. A genuine '
-        'writer: yaml.safe_dump into a uniquely-named '
-        '``<sidecar>.{pid}.{id(raw)}.tmp`` sibling, then os.replace. Its '
-        'surrounding comment already documents the one tradeoff a migration '
-        'must not silently change — a hard kill between write and replace can '
-        'leave a .tmp sibling, which is harmless only because sidecar '
-        'discovery matches the exact derived rel path and never a .tmp suffix.',
     ('fused-memory/scripts/bake_off_storage_shape.py', '_atomic_write_text'):
         'Out of task 3223 enumerated scope; left alone deliberately — but note '
         'what this entry COSTS, because leaving that implicit would hide a '

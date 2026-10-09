@@ -8,8 +8,10 @@ a mocked task_interceptor — no DB/backend involved (that's covered by the
 commit_planning integration tests in test_task_tools.py).
 """
 
+import asyncio
 import json
 import logging
+import os
 import subprocess
 from unittest.mock import AsyncMock
 
@@ -461,24 +463,19 @@ async def test_missing_label_and_manual_only(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_write_failure_mid_stamp_leaves_original_sidecar_intact(tmp_path, monkeypatch):
-    """A write/replace *exception* between temp-write and os.replace (e.g. a
-    disk error — the path where the ``finally`` unlink runs, unlike a hard
-    process kill) must never corrupt the tracked sidecar: os.replace is
-    atomic, so the original file is left byte-identical and parseable, and
-    no stray .tmp file lingers on disk for this exception path."""
+@pytest.mark.skipif(os.geteuid() == 0, reason='root ignores directory write permission')
+async def test_write_failure_mid_stamp_leaves_original_sidecar_intact(tmp_path):
+    """A real write failure must never corrupt the tracked sidecar.
+
+    The sidecar's directory is made read+execute only, so the read still
+    succeeds but the atomic write-back cannot create its temp sibling. The
+    original file is left byte-identical and parseable, nothing else appears
+    in the directory, and no delivered_checks are copied for a stamp that
+    never landed."""
     plans_dir = tmp_path / 'plans'
     plans_dir.mkdir()
     sidecar_path = plans_dir / 'foo-prd.capability-manifest.yaml'
     sidecar_path.write_text(_HAPPY_PATH_SIDECAR_YAML, encoding='utf-8')
-
-    def _boom(*args, **kwargs):
-        raise OSError('simulated crash between temp-write and replace')
-
-    monkeypatch.setattr(
-        'fused_memory.server.manifest_stamping.os.replace',
-        _boom,
-    )
 
     task_interceptor = AsyncMock()
     ids = ['101']
@@ -493,12 +490,17 @@ async def test_write_failure_mid_stamp_leaves_original_sidecar_intact(tmp_path, 
         },
     ]
 
-    report = await stamp_capability_manifests(
-        project_root=str(tmp_path),
-        ids=ids,
-        tasks_data=tasks_data,
-        task_interceptor=task_interceptor,
-    )
+    plans_dir.chmod(0o555)
+    try:
+        report = await stamp_capability_manifests(
+            project_root=str(tmp_path),
+            ids=ids,
+            tasks_data=tasks_data,
+            task_interceptor=task_interceptor,
+        )
+        leftovers = sorted(p.name for p in plans_dir.iterdir())
+    finally:
+        plans_dir.chmod(0o755)
 
     assert report is not None
     assert report['stamped'] == []
@@ -509,11 +511,58 @@ async def test_write_failure_mid_stamp_leaves_original_sidecar_intact(tmp_path, 
     assert sidecar_path.read_text(encoding='utf-8') == _HAPPY_PATH_SIDECAR_YAML
     yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
 
-    # No stray temp file left behind in the sidecar's directory.
-    leftovers = [p for p in plans_dir.iterdir() if p.name.endswith('.tmp')]
-    assert leftovers == []
+    # No stray .tmp sibling (nor anything else) left beside the sidecar.
+    assert leftovers == [sidecar_path.name]
 
     task_interceptor.update_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_stamps_of_one_sidecar_both_land(tmp_path):
+    """Two commit_planning batches stamping DIFFERENT labels of the SAME
+    sidecar concurrently must both land: neither read-modify-write may
+    overwrite the other's stamp with a stale copy of the file."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'race-prd.capability-manifest.yaml'
+    sidecar_path.write_text(_mechanical_sidecar_yaml('race', ['alpha', 'beta']), encoding='utf-8')
+
+    task_interceptor = AsyncMock()
+    task_interceptor.update_task = AsyncMock(return_value={'success': True})
+
+    def _batch(task_id: str, label: str) -> list[dict]:
+        return [
+            {
+                'id': task_id,
+                'metadata': {'prd_path': 'plans/race-prd.md', 'prd_task_label': label},
+            },
+        ]
+
+    report_alpha, report_beta = await asyncio.gather(
+        stamp_capability_manifests(
+            project_root=str(tmp_path),
+            ids=['501'],
+            tasks_data=_batch('501', 'alpha'),
+            task_interceptor=task_interceptor,
+        ),
+        stamp_capability_manifests(
+            project_root=str(tmp_path),
+            ids=['502'],
+            tasks_data=_batch('502', 'beta'),
+            task_interceptor=task_interceptor,
+        ),
+    )
+
+    assert report_alpha is not None
+    assert report_alpha['stamped'] == ['alpha']
+    assert report_alpha['errors'] == []
+    assert report_beta is not None
+    assert report_beta['stamped'] == ['beta']
+    assert report_beta['errors'] == []
+
+    reloaded = yaml.safe_load(sidecar_path.read_text(encoding='utf-8'))
+    by_label = {t['label']: t['task_id'] for t in reloaded['tasks']}
+    assert by_label == {'alpha': 501, 'beta': 502}
 
 
 @pytest.mark.asyncio
