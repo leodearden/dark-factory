@@ -668,7 +668,7 @@ Rationale behind the inline scanner that no caller relies on and no test pins,
 kept here so the code carries only its contract. One bullet per note, each
 citing the symbol it explains.
 
-- `scripts/inline_suppressions.py::InstrumentFailure` is one exception type for
+- `scripts/inline_suppression_refusal.py::InstrumentFailure` is one exception type for
   every exit-2 cause, not one per cause. Splitting by cause would hand `main`
   five `except` clauses that all do the same thing, and would let the stderr
   prefix a log reader greps for differ between causes.

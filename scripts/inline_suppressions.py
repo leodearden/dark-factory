@@ -32,8 +32,9 @@ edit converts a grandfathered suppression into one somebody has to own.
 * *It parses no disposition grammar of its own.*  D6's forms live in
   ``shared.governed_exceptions`` and are reached only through
   ``parse_disposition_marker``.
-* *It models no suppression kind outside* :data:`KIND_SPECS`, whose
-  docstring names the extension point.
+* *It models no suppression kind outside*
+  ``scripts/inline_suppression_kinds.py::KIND_SPECS``, whose docstring names
+  the extension point.
 
 **Authoring rule.**  Every suppression or disposition marker this scanner's
 source mentions is written in a docstring or another string literal, never in
@@ -57,571 +58,33 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib
 import json
 import re
-import subprocess
 import sys
-import tokenize
 import tomllib
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from functools import cached_property
-from io import StringIO
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING
+
+from inline_suppression_kinds import Kind, Site
+from inline_suppression_refusal import InstrumentFailure, import_shared
+from inline_suppression_scan import Scan, scan_tree
 
 if TYPE_CHECKING:
     from shared.governed_exceptions import Debt, Disposition, Policy
     from shared.ratchet import Enumeration
 
-# The shared/src bootstrap. Every path this scanner derives from its own
-# checkout is resolved from __file__, NEVER from the working directory: a run
-# inside a task worktree must read THAT checkout's disposition grammar, ratchet
-# kernel, tracked corpus and configuration, wherever it was launched from. The
-# idiom and the precedence argument are scripts/scan_plan_decision_pairing.py's:
-# the editable install of `shared` is an ordinary .pth entry, so sys.path ORDER
-# decides the winner, which is why this inserts at sys.path[0]. It sits BELOW
-# every import in this file rather than above them, which is the whole reason no
-# import here needs a suppression for E402: every `shared` name is fetched
-# lazily through :func:`_shared`, so there is no module-level import left to sit
-# after this statement.
-_SHARED_SRC = Path(__file__).resolve().parents[1] / 'shared' / 'src'
-if str(_SHARED_SRC) not in sys.path:
-    sys.path.insert(0, str(_SHARED_SRC))
-
-
-class InstrumentFailure(Exception):
-    """The scanner could not take a measurement it was asked for — exit 2.
-
-    THE NAME STATES THE CONSUMER-RELEVANT FACT RATHER THAN A CAUSE, the same
-    choice ``shared.ratchet.BaselineUnusable`` argues for: every cause
-    :data:`_EPILOG` lists under exit 2 means one identical thing to a caller —
-    *this run measured nothing you can trust*.
-
-    Categorically apart from a VIOLATION, which is exit 1.  That separation is
-    the whole point: a broken instrument reported as a finding sends an agent
-    to fix code that was never the problem, and a finding reported as a broken
-    instrument is an INV-12 breach nobody is told about.  Every message names
-    the file, path or key at fault, because that is the one thing the operator
-    cannot derive from the rest of it.
-    """
-
-
-#: Generous, and not a performance assertion: `git ls-files` over this tree
-#: takes well under a second, so anything approaching this has hung.
-_GIT_TIMEOUT_SECS = 60
-
-def _shared(name: str) -> ModuleType:
-    """Import ``shared.<name>`` lazily, as exit 2 rather than exit 1.
-
-    THE ONLY PLACE THIS MODULE IMPORTS ``shared``, and the reason is the PRD
-    Contract: an ImportError must be 2, never 1.  A top-level ``from shared… import
-    …`` cannot satisfy that — it raises while this module is still executing, so
-    ``main`` is never defined, the ``__main__`` block never runs, and Python's own
-    uncaught-exception exit is 1, the exact code the ladder reserves for a FINDING;
-    :class:`InstrumentFailure` says why the two must never be confused.
-
-    Returning the module rather than the names is what keeps the conversion in one
-    place, following ``scripts/merge_lane_metrics.py::_import_complexipy``.  The
-    cost is measured and bounded: attributes come back as ``Any``, so a caller that
-    needs ``isinstance`` NARROWING binds the class through a ``type[X]``
-    annotation first (verified: ``isinstance(x, module.Debt)`` does not narrow,
-    ``debt_type: type[Debt] = module.Debt`` then ``isinstance(x, debt_type)``
-    does).  A caller that only needs the runtime class — an ``except`` clause, a
-    branch predicate — uses the attribute directly.
-    """
-    try:
-        return importlib.import_module(f'shared.{name}')
-    except ImportError as exc:
-        raise InstrumentFailure(
-            f'`shared.{name}` could not be imported, so this scanner has no disposition '
-            f'grammar and no ratchet kernel to work with -- {exc}. It is a workspace '
-            'member of this repository: run the scanner as `uv run --project shared '
-            'python scripts/inline_suppressions.py`, which is how the merge gate and '
-            'every declared check invoke it.'
-        ) from exc
-
-
-#: This checkout, resolved from ``__file__`` for the reason the ``_SHARED_SRC``
-#: bootstrap comment gives.
+#: This checkout, resolved from ``__file__`` for the reason the bootstrap
+#: comment above ``scripts/inline_suppression_refusal.py::_SHARED_SRC`` gives.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: How this scanner names itself in a refusal, so a reader of a bare exit 2 in
 #: a merge log knows which instrument spoke.
 _PROG = 'inline_suppressions.py'
-
-
-class Kind(Enum):
-    """The suppression kinds this scanner models.
-
-    The value is the label rendered in violations, in ``--json`` and in D9's
-    class keys — one spelling, published from one place, so a report and a
-    class row can never disagree about what a kind is called.
-    """
-
-    TYPE_IGNORE = 'type: ignore'
-    NOQA = 'noqa'
-    PYRIGHT_IGNORE = 'pyright: ignore'
-    PRAGMA_NO_COVER = 'pragma: no cover'
-    NOSEC = 'nosec'
-
-
-@dataclass(frozen=True)
-class Site:
-    """One suppression: which kind, where, and the line it rides on.
-
-    Attributes:
-        path: Repo-relative path of the file holding it.
-        line: 1-based physical line number.
-        kind: Which row of :data:`KIND_SPECS` matched.
-        codes: The rule codes the marker names, in SOURCE order.  Empty for a
-            bare marker and for a kind that carries none.  Sorting is D7's
-            key's job, not the scan's — a report that renders a site verbatim
-            should show what the author wrote.
-        text: The whole physical line, stripped.  This is what D7 digests, so
-            editing anything on the line — the code, the disposition, a
-            neighbouring argument — changes the key.  It is NOT the comment:
-            see :class:`Comment`.
-    """
-
-    path: str
-    line: int
-    kind: Kind
-    codes: tuple[str, ...]
-    text: str
-
-
-@dataclass(frozen=True)
-class Comment:
-    """One COMMENT token, and the suppressions it holds.
-
-    THE SCAN'S UNIT IS THE COMMENT, NOT THE SITE, and that is load-bearing.
-    D6 names two disposition violations, and the second — a marker on a line
-    with NO suppression — is a property of a comment that produced zero Sites.
-    Nothing downstream could reconstruct it from the Sites alone, because such
-    a comment contributes none.
-
-    Attributes:
-        path: Repo-relative path of the file holding it.
-        line: 1-based physical line number.
-        text: The comment token verbatim, ``#`` included.  This is what
-            ``shared.governed_exceptions.parse_disposition_marker`` reads.
-        sites: One :class:`Site` per kind present, in :data:`KIND_SPECS` order.
-    """
-
-    path: str
-    line: int
-    text: str
-    sites: tuple[Site, ...]
-
-
-@dataclass(frozen=True)
-class KindSpec:
-    """How one :class:`Kind` is found, and how its codes are read.
-
-    Attributes:
-        marker: The substring that must be present for :attr:`pattern` to have
-            any chance of matching, tested TWICE — against a file's raw bytes
-            before it is decoded, and against a comment token before the
-            pattern is run.  It must therefore appear in EVERY form
-            :attr:`pattern` accepts, so it is the longest run of the pattern
-            that no whitespace can interrupt: ``'type:'`` and not
-            ``'type: ignore'``, because ``# type:ignore`` is a marker too.  The
-            direction of error decides this — a substring that is too short
-            costs only scan time, while one that is not invariant silently
-            drops real sites.
-        pattern: Searched against a whole COMMENT token.  Anchoring each form
-            to its own ``#`` is what stops ``# see the noqa convention`` from
-            registering, and matches how ruff and mypy read their own
-            directives.  Compiled with ``re.IGNORECASE`` exactly when the
-            consuming tool reads the directive case-insensitively; that flag is
-            the one statement of the kind's case rule, and both marker tests
-            follow it through :attr:`folds_case`.
-        codes: Reads the rule codes out of that match.
-    """
-
-    marker: str
-    pattern: re.Pattern[str]
-    codes: Callable[[re.Match[str]], tuple[str, ...]]
-
-    def __post_init__(self) -> None:
-        if self.folds_case and self.marker != self.marker.lower():
-            raise ValueError(
-                f'case-folding kind marker {self.marker!r} must be lower-case, '
-                'because it is tested against lower-cased text'
-            )
-
-    @cached_property
-    def folds_case(self) -> bool:
-        """Whether the directive is read case-insensitively, from the pattern's flags."""
-        return bool(self.pattern.flags & re.IGNORECASE)
-
-    def may_match(self, text: str) -> bool:
-        """The cheap substring test that stands in front of :attr:`pattern`."""
-        return self.marker in (text.lower() if self.folds_case else text)
-
-
-def _no_codes(match: re.Match[str]) -> tuple[str, ...]:
-    """For the kinds that name no rule: ``pragma: no cover`` and ``nosec``."""
-    del match
-    return ()
-
-
-def _bracketed_codes(match: re.Match[str]) -> tuple[str, ...]:
-    """``[attr-defined, arg-type]`` — mypy's and pyright's shared spelling.
-
-    The bracket must follow the directive with no space, which is what both
-    tools require; ``# type: ignore [arg-type]`` is a bare ignore to mypy and
-    is read as one here too.
-    """
-    inside = match.group(1)
-    if inside is None:
-        return ()
-    return tuple(code.strip() for code in inside.split(',') if code.strip())
-
-
-#: A ruff rule code: a linter's letters followed by its number.
-_RUFF_CODE_RE = re.compile(r'[A-Za-z]+[0-9]+')
-
-#: A first-party checker's code, e.g. ``bare-magicmock``.  Kebab-case carries
-#: no numeric run at all, which is why the consumer model's ``(linter,
-#: number)`` split has to tolerate one.
-_KEBAB_CODE_RE = re.compile(r'[a-z][a-z0-9]*(?:-[a-z0-9]+)+')
-
-
-def _noqa_codes(match: re.Match[str]) -> tuple[str, ...]:
-    """``# noqa: E402,F401`` — read left to right, STOPPING at the first token
-    that is not code-shaped.
-
-    That is ruff's own reading, and it is what keeps a prose tail such as
-    ``# noqa: E402  (import after path fix)`` from turning its words into rule
-    codes.
-
-    KEBAB-CASE IS A CODE ONLY IN FIRST POSITION, which is the union of the two
-    consumers' own grammars and nothing wider: ruff takes a
-    ``<letters><digits>`` code anywhere in the list, while
-    ``fused-memory/scripts/check_bare_magicmock_config.py`` anchors its
-    kebab-case code immediately after ``noqa:``.  Admitting kebab-case anywhere
-    would read ``# noqa: F401  re-export shim`` as naming a second code
-    ``re-export``, which is neither consumer's rule.
-    """
-    tail = match.group(1)
-    if tail is None:
-        return ()
-    codes: list[str] = []
-    for position, token in enumerate(token for token in re.split(r'[,\s]+', tail.strip()) if token):
-        first = position == 0
-        if _RUFF_CODE_RE.fullmatch(token) or (first and _KEBAB_CODE_RE.fullmatch(token)):
-            codes.append(token)
-        else:
-            break
-    return tuple(codes)
-
-
-#: The optional ``[code, code]`` suffix mypy and pyright share.
-_BRACKET_SUFFIX = r'(?:\[([^\]]*)\])?'
-
-KIND_SPECS: MappingProxyType[Kind, KindSpec] = MappingProxyType(
-    {
-        Kind.TYPE_IGNORE: KindSpec(
-            marker='type:',
-            pattern=re.compile(r'#\s*type:\s*ignore' + _BRACKET_SUFFIX),
-            codes=_bracketed_codes,
-        ),
-        Kind.NOQA: KindSpec(
-            marker='noqa',
-            # The tail stops at the next `#`, so a disposition riding in the
-            # same comment can never be read as a rule code.
-            # Case-insensitive because ruff reads the directive in any case.
-            pattern=re.compile(r'#\s*noqa(?::\s*([^#]*))?', re.IGNORECASE),
-            codes=_noqa_codes,
-        ),
-        Kind.PYRIGHT_IGNORE: KindSpec(
-            marker='pyright:',
-            pattern=re.compile(r'#\s*pyright:\s*ignore' + _BRACKET_SUFFIX),
-            codes=_bracketed_codes,
-        ),
-        Kind.PRAGMA_NO_COVER: KindSpec(
-            marker='pragma:',
-            pattern=re.compile(r'#\s*pragma:\s*no\s+cover\b'),
-            codes=_no_codes,
-        ),
-        Kind.NOSEC: KindSpec(
-            # `\b` on both sides, because 'nanosecond' CONTAINS 'nosec' and
-            # 'nosecret' starts with it.
-            marker='nosec',
-            pattern=re.compile(r'#\s*nosec\b'),
-            codes=_no_codes,
-        ),
-    }
-)
-"""The kind table, which only the scan reads — the byte prefilter and the token walk.
-
-SPOT (heuristic 11), and the PRD's named extension point: ``pytest.mark.skip`` /
-``xfail`` and ``shellcheck disable`` are out of scope for this batch and are
-added HERE when they come in scope, not as a second scanner.  A row supplies a
-prefilter substring, a detection pattern and a code rule; the consumer model
-maps the :class:`Kind` — not the row — to a consumer family, because that is a
-question about tools rather than about syntax.
-"""
-
-
-def scan_source(source: str, *, path: str) -> tuple[Comment, ...]:
-    """Every COMMENT token in *source*, each carrying the Sites it holds.
-
-    TOKENIZE, NEVER REGEX OVER THE SOURCE TEXT: a string literal that merely
-    mentions ``#`` is not a comment, and no regex gets that right.
-
-    THE CATCH IS A TRIO, not ``TokenError`` alone: a file with broken
-    indentation raises ``IndentationError`` and one with a bad statement raises
-    ``SyntaxError``, and either would otherwise escape as a bare traceback
-    instead of the named exit 2 boundary scenario 8 requires.
-
-    Raises:
-        InstrumentFailure: *source* could not be tokenized.  Never a skip —
-            see :class:`InstrumentFailure` for why the polarity matters.
-    """
-    comments: list[Comment] = []
-    try:
-        for token in tokenize.generate_tokens(StringIO(source).readline):
-            if token.type != tokenize.COMMENT:
-                continue
-            comments.append(_comment_at(token, path=path))
-    except (tokenize.TokenError, IndentationError, SyntaxError) as exc:
-        raise InstrumentFailure(
-            f'{path}: could not be tokenized -- {type(exc).__name__}: {exc}'
-        ) from exc
-    return tuple(comments)
-
-
-def _comment_at(token: tokenize.TokenInfo, *, path: str) -> Comment:
-    """Build the :class:`Comment` for one COMMENT *token*.
-
-    The kind table's marker substring is tested here as well as in the
-    pre-decode prefilter, and for the same reason one scale down: a marker-free
-    comment is the overwhelming majority, and a substring test is far cheaper
-    than the five pattern searches it stands in front of.  One table, two
-    granularities — not a second policy.
-
-    THE PHYSICAL LINE IS STRIPPED ONLY FOR A COMMENT THAT MATCHED, which is the
-    same economy one step further in.  The strip feeds nothing but a
-    :class:`Site`, so every marker-free comment would otherwise allocate a
-    string that is discarded on the next line — paid inside the one function
-    the ten-second budget rests on.  The marker test
-    already decides whether it is wanted, so nothing new is being consulted.
-    """
-    line = token.start[0]
-    text = token.string
-    matched = [
-        (kind, spec.codes(match))
-        for kind, spec in KIND_SPECS.items()
-        if spec.may_match(text) and (match := spec.pattern.search(text)) is not None
-    ]
-    stripped = token.line.strip() if matched else ''
-    sites = tuple(
-        Site(path=path, line=line, kind=kind, codes=codes, text=stripped)
-        for kind, codes in matched
-    )
-    return Comment(path=path, line=line, text=text, sites=sites)
-
-
-@dataclass(frozen=True)
-class Scan:
-    """One sweep of a tree: what it found, and how much work it did.
-
-    Attributes:
-        comments: Every COMMENT token in every file that survived the
-            prefilter, in enumeration order.
-        files_enumerated: How many tracked paths this scan set out to read —
-            what ``git ls-files`` listed, narrowed to the scope when the run is
-            a scoped one, and INCLUDING any whose worktree file has since been
-            deleted.
-        files_tokenized: How many of those were actually decoded and tokenized
-            — the ones whose raw bytes carried a marker substring.
-
-    THE TWO COUNTS ARE THE BUDGET'S ENFORCEMENT POINT.  The PRD gives this scan
-    ten seconds and the prefilter is the only reason it fits, so the guard
-    asserts these two numbers rather than the clock;
-    ``scripts/tests/test_inline_suppression_ratchet.py::test_the_live_scan_tokenizes_exactly_the_marker_bearing_files``
-    says why.
-    """
-
-    comments: tuple[Comment, ...]
-    files_enumerated: int
-    files_tokenized: int
-
-    @property
-    def sites(self) -> tuple[Site, ...]:
-        """Every :class:`Site` held by every comment, flattened.
-
-        A property rather than a field, so it cannot go stale against
-        ``comments`` — the two would otherwise be a redundant pair that a
-        future edit could desynchronise (heuristic 11).
-        """
-        return tuple(site for comment in self.comments for site in comment.sites)
-
-
-#: The case-sensitive kinds' prefilter substrings as raw bytes, for the
-#: pre-decode pass.  Derived from the one table rather than written twice; the
-#: markers are ASCII, so the encoding is exact.
-_EXACT_MARKER_BYTES: tuple[bytes, ...] = tuple(
-    spec.marker.encode('utf-8') for spec in KIND_SPECS.values() if not spec.folds_case
-)
-
-#: The case-folding kinds' substrings, tested against the lower-cased bytes.
-_FOLDED_MARKER_BYTES: tuple[bytes, ...] = tuple(
-    spec.marker.encode('utf-8') for spec in KIND_SPECS.values() if spec.folds_case
-)
-
-
-def _may_hold_marker(raw: bytes) -> bool:
-    """The byte prefilter: could any kind's pattern match somewhere in *raw*?"""
-    if any(marker in raw for marker in _EXACT_MARKER_BYTES):
-        return True
-    folded = raw.lower()
-    return any(marker in folded for marker in _FOLDED_MARKER_BYTES)
-
-
-def _tracked_python_files(root: Path) -> tuple[str, ...]:
-    """Every TRACKED ``*.py`` under *root*, repo-relative, sorted and unique.
-
-    REFUSES RATHER THAN DEGRADING TO ``[]``.  An empty corpus and a clean
-    corpus are indistinguishable in a violation count, and only one of them is
-    good news — the argument
-    ``scripts/audit_manifest_descriptor_drift.py::ManifestDiscoveryUnavailable``
-    makes.  It is sharper here: an empty scan handed to ``--seed`` or
-    ``--tighten`` writes an empty baseline, which compares clean against
-    everything and opens the gate for good.
-
-    The return code is inspected by hand rather than with ``check=True``, so
-    the refusal can carry git's own stderr.  Deduped through a set because an
-    UNMERGED path is listed once per merge stage, and sorted so a scan's
-    enumeration order — and therefore a report's — is reproducible.
-    """
-    try:
-        completed = subprocess.run(
-            ['git', '-C', str(root), 'ls-files', '-z', '--', '*.py'],
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT_SECS,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise InstrumentFailure(
-            f'could not run `git ls-files` in {root} -- {type(exc).__name__}: {exc}. '
-            'The tracked corpus is this scan\'s only source; there is no filesystem-walk '
-            'fallback, because a walk would silently restore untracked working-tree state '
-            'as an input to the gate.'
-        ) from exc
-
-    if completed.returncode != 0:
-        raise InstrumentFailure(
-            f'`git ls-files` failed in {root} (rc={completed.returncode}): '
-            f'{completed.stderr.strip() or "no stderr"}'
-        )
-
-    return tuple(sorted({path for path in completed.stdout.split('\0') if path}))
-
-
-def _source_of(root: Path, relative: str) -> str | None:
-    """Decode *relative*'s bytes, or ``None`` when the prefilter rejects it.
-
-    Reading the raw BYTES and testing them for a marker substring before
-    decoding is the whole prefilter: the files that cannot hold a suppression
-    are never decoded and never tokenized.
-
-    ``FileNotFoundError`` is the one read failure that is not a fault:
-    ``git ls-files`` reads the INDEX, so it lists a path whose worktree file
-    has been deleted mid-edit, and that is an ordinary state rather than a
-    broken instrument.  Every OTHER ``OSError``, and any decode failure,
-    raises — a file that exists and cannot be read is exactly the case where
-    carrying on would measure low.
-    """
-    location = root / relative
-    try:
-        raw = location.read_bytes()
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise InstrumentFailure(
-            f'{relative}: could not be read -- {type(exc).__name__}: {exc}'
-        ) from exc
-
-    if not _may_hold_marker(raw):
-        return None
-
-    try:
-        return raw.decode('utf-8')
-    except UnicodeDecodeError as exc:
-        raise InstrumentFailure(
-            f'{relative}: could not be decoded as UTF-8 -- {exc}. A tracked Python file '
-            'this scanner cannot decode is never skipped: it might hold the very '
-            'suppression the gate exists to find.'
-        ) from exc
-
-
-def _within(relative: str, scope: tuple[str, ...]) -> bool:
-    """Whether *relative* is one of *scope*'s entries, or sits under one.
-
-    COMPARED AS PATH COMPONENTS, never as a string prefix: ``scripts`` must not
-    scope ``scripts_old/`` and ``sc`` must not scope anything, which is the same
-    mistake in the same shape as the string-prefix one :func:`selects` refuses.
-    Both sides are ``PurePosixPath``, because ``git ls-files`` emits forward
-    slashes on every platform and a scope typed as ``./pkg`` should mean ``pkg``.
-    """
-    wanted = tuple(PurePosixPath(entry).parts for entry in scope)
-    parts = PurePosixPath(relative).parts
-    return any(parts[: len(entry)] == entry for entry in wanted)
-
-
-def scan_tree(root: Path, *, scope: tuple[str, ...] = ()) -> Scan:
-    """Scan every tracked ``*.py`` under *root*, or only those under *scope*.
-
-    The prefilter means ``files_tokenized`` is strictly smaller than
-    ``files_enumerated`` on any real tree, and a file it rejects is reported
-    honestly as enumerated-not-tokenized rather than silently vanishing.
-
-    A SCOPE NARROWS THE ENUMERATION, not the report of it: a scoped run reads
-    fewer files and says so in both counts, which is what makes it the cheap
-    early-feedback run D12 keeps it for.  Every verb that a partial view could
-    mislead refuses a scope outright rather than relying on this being noticed.
-
-    A SCOPE THAT SELECTS NOTHING IS REFUSED, for the reason
-    :func:`_tracked_python_files` refuses an empty corpus one step earlier —
-    and reaching it needs no broken git, only a mistyped path on the
-    early-feedback run.  The ``0 of 0`` the report line prints is a tell only a
-    reader who looks will catch, and this module chooses refusal over that.
-
-    Raises:
-        InstrumentFailure: the tracked corpus is empty, or *scope* selected
-            none of it.
-    """
-    tracked = _tracked_python_files(root)
-    if scope:
-        tracked = tuple(path for path in tracked if _within(path, scope))
-        if not tracked:
-            raise InstrumentFailure(
-                f'scope {", ".join(scope)} matched no tracked *.py file under {root}. '
-                'An empty scan and a clean scan are indistinguishable in a violation '
-                'count, and only one of them is good news -- the same argument '
-                '`_tracked_python_files` makes for an empty corpus.'
-            )
-    comments: list[Comment] = []
-    tokenized = 0
-    for relative in tracked:
-        source = _source_of(root, relative)
-        if source is None:
-            continue
-        tokenized += 1
-        comments.extend(scan_source(source, path=relative))
-    return Scan(
-        comments=tuple(comments),
-        files_enumerated=len(tracked),
-        files_tokenized=tokenized,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -714,7 +177,7 @@ class Consumer(Enum):
 #: Which consumer a kind resolves to WITHOUT consulting the code or any
 #: config.  ``noqa`` is deliberately absent — it is the one kind whose answer
 #: depends on both.  Totality over :class:`Kind` is enforced at the one read
-#: site rather than assumed, so a sixth row added to :data:`KIND_SPECS` with no
+#: site rather than assumed, so a sixth row added to ``KIND_SPECS`` with no
 #: consumer row is a loud exit 2 instead of silently inheriting ``noqa``'s
 #: behaviour.
 _KIND_CONSUMERS: Mapping[Kind, Consumer] = MappingProxyType(
@@ -1208,7 +671,7 @@ def classify(
     (``scripts/tests/test_inline_suppression_ratchet.py::test_a_disposition_on_a_line_with_no_suppression_is_a_violation``
     says why that limit is the harmless side).
     """
-    governed = _shared('governed_exceptions')
+    governed = import_shared('governed_exceptions')
 
     classified: list[Classified] = []
     violations: list[Violation] = []
@@ -1295,7 +758,7 @@ def _classify_site(
         consumer=consumer,
         ownership=(
             Ownership.DEBT
-            if isinstance(disposition, _shared('governed_exceptions').Debt)
+            if isinstance(disposition, import_shared('governed_exceptions').Debt)
             else Ownership.POLICY
         ),
         disposition=disposition,
@@ -1495,7 +958,7 @@ def _violation_for(entry: Classified) -> Violation:
         kind=entry.site.kind,
         codes=entry.site.codes,
         reason=_DEAD_REASON if dead else _UNDISPOSED_REASON,
-        forms=() if dead else _shared('governed_exceptions').INLINE_MARKER_FORMS,
+        forms=() if dead else import_shared('governed_exceptions').INLINE_MARKER_FORMS,
     )
 
 
@@ -1809,7 +1272,7 @@ def _owner(debt: Debt) -> str:
     """
     noun = (
         'task'
-        if isinstance(debt.owner, _shared('governed_exceptions').TaskRef)
+        if isinstance(debt.owner, import_shared('governed_exceptions').TaskRef)
         else 'ticket'
     )
     return f'{noun} {debt.owner.id}'
@@ -1869,7 +1332,7 @@ def _owned_blocks(classification: Classification) -> dict[str, object]:
     sites to point at, and ``classes`` carries its own so a blanket ruling cannot
     quietly absorb a growing population.
     """
-    governed = _shared('governed_exceptions')
+    governed = import_shared('governed_exceptions')
     debt_type: type[Debt] = governed.Debt
     policy_type: type[Policy] = governed.Policy
 
@@ -2085,7 +1548,7 @@ def main(
     """
     args = _build_parser().parse_args(argv)
     try:
-        return _run(args, _shared('ratchet'), classes)
+        return _run(args, import_shared('ratchet'), classes)
     except InstrumentFailure as exc:
         return _refuse(exc)
 
