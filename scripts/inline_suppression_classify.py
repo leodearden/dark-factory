@@ -3,7 +3,7 @@
 A site is owned by an inline disposition (D6), ratified by a class row (D9), or
 unowned, and only an unowned site contributes a key to the ratchet's multiset.
 :func:`classify` takes the class table as an argument and reads no module
-global; the operator's table lives in the entry module, which hands it in.
+global, so its caller decides which table a run classifies against.
 :func:`classify` also collects the two disposition faults D6 names.
 """
 
@@ -23,7 +23,7 @@ from inline_suppression_refusal import import_shared
 from inline_suppression_scan import Scan
 
 if TYPE_CHECKING:
-    from shared.governed_exceptions import Disposition, Policy
+    from shared.governed_exceptions import Debt, Disposition, Policy
 
 
 # D9 — the key a ratified class is written in.
@@ -58,11 +58,9 @@ class Scope(Enum):
 class SuppressionClass:
     """D9's key: one kind, one code, one scope.
 
-    The operator's table,
-    ``scripts/inline_suppressions.py::RATIFIED_SUPPRESSION_CLASSES``, is keyed
-    by this TYPE rather than by its rendering, so the operator's rows are
-    type-checked at import and a malformed row cannot masquerade as a class
-    nobody happens to match.  :meth:`render` exists only
+    A class table is keyed by this TYPE rather than by its rendering, so an
+    operator's rows are type-checked at import and a malformed row cannot
+    masquerade as a class nobody happens to match.  :meth:`render` exists only
     because the report publishes the key as a string.
 
     Attributes:
@@ -107,7 +105,13 @@ class Ownership(Enum):
 
 @dataclass(frozen=True)
 class Classified:
-    """One site, and everything the pipeline decided about it."""
+    """One site, and everything the pipeline decided about it.
+
+    An owned entry carries exactly one of :attr:`disposition` and
+    :attr:`suppression_class`, the one that owns it.  An :attr:`Ownership.UNOWNED`
+    entry carries NEITHER, even when its comment held a disposition D8 refused,
+    so a reader can group by what is written down without consulting the label.
+    """
 
     site: Site
     consumer: Consumer
@@ -217,9 +221,8 @@ def classify(
 
     A MALFORMED MARKER IS A VIOLATION AND LEAVES ITS SITES UNOWNED.  Both are
     true at once and neither substitutes for the other: the broken marker is a
-    fault at the site (baseline-independent, as
-    ``scripts/inline_suppressions.py::_verdict`` records), and
-    the sites it failed to disposition are genuinely undisposed.
+    fault at the site whatever any baseline holds, and the sites it failed to
+    disposition are genuinely undisposed.
 
     THE PREFILTER BOUNDS THE SUPPRESSION-FREE-DISPOSITION FINDING: this layer
     sees only the comments of files whose raw bytes carried a KIND marker, so a
@@ -228,6 +231,7 @@ def classify(
     says why that limit is the harmless side).
     """
     governed = import_shared('governed_exceptions')
+    debt_type: type[Debt] = governed.Debt
 
     classified: list[Classified] = []
     violations: list[Violation] = []
@@ -269,7 +273,7 @@ def classify(
             )
 
         for site in comment.sites:
-            entry = _classify_site(site, disposition, model, classes)
+            entry = _classify_site(site, disposition, model, classes, debt_type)
             classified.append(entry)
             if entry.ownership is Ownership.UNOWNED:
                 unowned.setdefault(key_for(site).render(), []).append(entry)
@@ -288,6 +292,7 @@ def _classify_site(
     disposition: Disposition | None,
     model: ConsumerModel,
     classes: Mapping[SuppressionClass, Policy],
+    debt_type: type[Debt],
 ) -> Classified:
     """One site, through the fixed order :func:`classify` documents."""
     consumer = model.consumer_for(site)
@@ -312,10 +317,6 @@ def _classify_site(
     return Classified(
         site=site,
         consumer=consumer,
-        ownership=(
-            Ownership.DEBT
-            if isinstance(disposition, import_shared('governed_exceptions').Debt)
-            else Ownership.POLICY
-        ),
+        ownership=Ownership.DEBT if isinstance(disposition, debt_type) else Ownership.POLICY,
         disposition=disposition,
     )

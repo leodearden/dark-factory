@@ -85,16 +85,12 @@ from inline_suppression_classify import (
 from inline_suppression_consumers import Consumer, ConsumerModel
 from inline_suppression_key import key_params
 from inline_suppression_kinds import Kind, Site
-from inline_suppression_refusal import InstrumentFailure, import_shared
+from inline_suppression_refusal import REPO_ROOT, InstrumentFailure, import_shared
 from inline_suppression_scan import Scan, scan_tree
 
 if TYPE_CHECKING:
     from shared.governed_exceptions import Debt, Policy
     from shared.ratchet import Enumeration
-
-#: This checkout, resolved from ``__file__`` for the reason the bootstrap
-#: comment above ``scripts/inline_suppression_refusal.py::_SHARED_SRC`` gives.
-_REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: How this scanner names itself in a refusal, so a reader of a bare exit 2 in
 #: a merge log knows which instrument spoke.
@@ -623,10 +619,10 @@ def _owned_blocks(classification: Classification) -> dict[str, object]:
     """The three site-level ownership blocks, built in one pass.
 
     GROUPED BY WHAT EACH ENTRY CARRIES rather than by its :class:`Ownership`
-    label, and the two agree by construction:
-    ``scripts/inline_suppression_classify.py::_classify_site`` sets exactly
-    one of ``disposition`` and ``suppression_class``, and sets NEITHER on an
-    unowned site — including one whose comment did carry a disposition that D8
+    label, and the two agree by construction: a
+    ``scripts/inline_suppression_classify.py::Classified`` carries exactly one
+    of ``disposition`` and ``suppression_class`` when owned, and NEITHER when
+    unowned — including a site whose comment did carry a disposition that D8
     refused.  Keying off the field removes the unreachable branch a label-first
     grouping would need, and the report then says what is actually written down.
 
@@ -779,7 +775,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--root',
         type=Path,
-        default=_REPO_ROOT,
+        default=REPO_ROOT,
         help='the checkout to measure (default: the one holding this script)',
     )
     parser.add_argument(

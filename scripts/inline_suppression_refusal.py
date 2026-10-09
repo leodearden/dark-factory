@@ -4,7 +4,9 @@ Two things live here and nowhere else: :class:`InstrumentFailure`, the single
 exception every stratum raises when it could not take a measurement, and
 :func:`import_shared`, the scanner's only route to the ``shared`` workspace
 member.  The ``shared/src`` bootstrap below the imports is what makes that route
-read THIS checkout's ``shared``.  Nothing here imports another stratum.
+read THIS checkout's ``shared``; :data:`REPO_ROOT`, the checkout it resolves,
+is public because every other path the scanner derives from its own checkout
+starts there too.  Nothing here imports another stratum.
 """
 
 from __future__ import annotations
@@ -25,7 +27,8 @@ from types import ModuleType
 # import in the scanner needs a suppression for E402: every `shared` name is
 # fetched lazily through :func:`import_shared`, so there is no module-level
 # import left to sit after this statement.
-_SHARED_SRC = Path(__file__).resolve().parents[1] / 'shared' / 'src'
+REPO_ROOT = Path(__file__).resolve().parents[1]
+_SHARED_SRC = REPO_ROOT / 'shared' / 'src'
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
 
@@ -34,9 +37,8 @@ class InstrumentFailure(Exception):
     """The scanner could not take a measurement it was asked for — exit 2.
 
     THE NAME STATES THE CONSUMER-RELEVANT FACT RATHER THAN A CAUSE, the same
-    choice ``shared.ratchet.BaselineUnusable`` argues for: every cause
-    ``scripts/inline_suppressions.py::_EPILOG`` lists under exit 2 means one
-    identical thing to a caller —
+    choice ``shared.ratchet.BaselineUnusable`` argues for: every cause of an
+    exit 2 means one identical thing to a caller —
     *this run measured nothing you can trust*.
 
     Categorically apart from a VIOLATION, which is exit 1.  That separation is
