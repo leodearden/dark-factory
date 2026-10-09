@@ -170,8 +170,9 @@ def wire_clear_claim_then_set_status(scheduler_mock: MagicMock) -> None:
 # task 3492/4215: the pyproject-configured default per-test timeout ceiling
 # that every heavy test in this suite must clear.  MIRROR of
 # `[tool.pytest.ini_options].timeout` in orchestrator/pyproject.toml
-# (currently 540, raised from 60 on 2026-09-12 and from 300 on 2026-09-17 --
-# see that setting's comment, shared/pyproject.toml for the canonical
+# (currently 420: raised 60 -> 300 -> 540 on 2026-09-12 / 2026-09-17, then
+# re-derived down to 420 by task 5581 once fused-memory's repo-wide scans were
+# marked -- see that setting's comment, shared/pyproject.toml for the canonical
 # rationale, and plans/pytest-per-test-timeout-measurement-2026-09-17.md for
 # the measurement the current value is derived from).  It was a bare
 # literal in
@@ -182,7 +183,7 @@ def wire_clear_claim_then_set_status(scheduler_mock: MagicMock) -> None:
 # test_whole_tree_scan_timeout_guard.py::TestTimeoutConstants reads the real
 # pyproject with `tomllib` at runtime and fails if the two disagree.  Do NOT
 # add a second copy -- import this one.
-PYPROJECT_DEFAULT_TIMEOUT = 540
+PYPROJECT_DEFAULT_TIMEOUT = 420
 
 # task 4215: per-test ceiling for the family of guard tests that sweep the
 # WHOLE tree -- `rglob('*.py')` over ~500 files, `ast.parse` on each -- and so
@@ -248,8 +249,9 @@ PYPROJECT_DEFAULT_TIMEOUT = 540
 # encodes that independence; it has since been re-anchored, but its role is
 # unchanged.
 #
-# 300 -> 540 on 2026-09-17 (task 5442): the never-narrow rule below forces it,
-# since the ini default moved to 540, and 540 also clears the family's own 420.
+# 300 -> 540 on 2026-09-17 (task 5442), when the never-narrow rule below forced
+# it.  Since task 5581 lowered the ini default to 420, 540 clears both the 420
+# floor and the 420 ini default rather than being forced by either.
 #
 # Deliberately NOT taken from HEAVY_BARRIER_TEST_TIMEOUT: that one bounds a
 # different hazard, sized by merge-barrier waits, and an AST sweep performs
@@ -616,7 +618,7 @@ DEEP_GATE_SCENE_BUDGET = SpawnBudget(
 # TestDeepLandingSceneBudget:
 #   * `>= VERIFY_CLI_PER_TEST_TIMEOUT` (300) -- 1080 is far above it, so the
 #     marker loosens under the budget verify's CLI passes and cannot invert;
-#   * `>= PYPROJECT_DEFAULT_TIMEOUT` (540) -- the never-narrow rule this file
+#   * `>= PYPROJECT_DEFAULT_TIMEOUT` (420) -- the never-narrow rule this file
 #     states a few constants above, at WHOLE_TREE_SCAN_TEST_TIMEOUT: a mark
 #     meant as a FLOOR must never fall below the ambient ini default, or it
 #     starts narrowing its own module.  Until 2026-09-17 these first two were
@@ -625,7 +627,7 @@ DEEP_GATE_SCENE_BUDGET = SpawnBudget(
 #     300, so a value can now clear the verify edge while narrowing the
 #     ambient one.  That is not hypothetical -- the same commit recorded its
 #     own casualty, HEAVY_BARRIER_TEST_TIMEOUT, left at 300 below the default
-#     it used to equal until task 5572 re-derived it to 540.  1080 clears 540
+#     it used to equal until task 5572 re-derived it to 540.  1080 clears 420
 #     today, so this pin changes
 #     nothing now; it exists so a future re-derivation landing somewhere like
 #     360 cannot satisfy the verify edge and reproduce that gap in silence;
