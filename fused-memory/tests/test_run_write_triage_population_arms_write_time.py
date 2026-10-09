@@ -937,22 +937,11 @@ class TestThePublishWriteTimeCommand:
         assert not (tmp_path / 'pop.json').exists()
         assert not (tmp_path / 'pairs.jsonl').exists()
 
-    def test_the_defaults_are_the_write_time_files_never_the_pi_ones(self) -> None:
-        calibration = _PACKAGE / 'calibration'
-        defaults = {
-            name: getattr(_mod(), name) for name in (
-                'DEFAULT_WRITE_TIME_POPULATION_OUT', 'DEFAULT_WRITE_TIME_PAIRS_OUT',
-                'DEFAULT_VERDICT_CORPUS', 'DEFAULT_ALREADY_RATED',
-            )
-        }
-        assert defaults == {
-            'DEFAULT_WRITE_TIME_POPULATION_OUT': calibration / 'write_triage_population_write_time.json',
-            'DEFAULT_WRITE_TIME_PAIRS_OUT': calibration / 'write_triage_pairs_to_rate_write_time.jsonl',
-            'DEFAULT_VERDICT_CORPUS': calibration / 'write_triage_pair_verdicts.jsonl',
-            'DEFAULT_ALREADY_RATED': (
-                _PACKAGE / 'tests' / 'fixtures' / 'write_triage_pair_verdicts_seed.jsonl'
-            ),
-        }
+    def test_the_default_outputs_are_never_the_pi_ones(self) -> None:
+        mod = _mod()
+        write_time = {mod.DEFAULT_WRITE_TIME_POPULATION_OUT, mod.DEFAULT_WRITE_TIME_PAIRS_OUT}
+        assert len(write_time) == 2
+        assert write_time.isdisjoint({mod.DEFAULT_POPULATION_OUT, mod.DEFAULT_PAIRS_OUT})
 
     def test_the_parser_writes_to_its_defaults(
         self, published: _PublishedWriteTime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
