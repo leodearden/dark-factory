@@ -26,6 +26,7 @@ SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'check_bare_magicmock_c
 
 _checker = load_script_module(SCRIPT_PATH, mod_name='check_bare_magicmock_config')
 find_violations = _checker.find_violations
+_lint_cli = load_script_module(SCRIPT_PATH.with_name('_lint_cli.py'))
 
 
 class TestFindViolationsConfigNameDetection:
@@ -554,6 +555,14 @@ class TestCliErrorHandling:
         # Read failure from the broken file is reported on stderr.
         assert 'test_broken.py' in captured.err
         assert 'simulated transient read error' in captured.err
+
+    def test_explicit_non_test_file_is_still_scanned(self, tmp_path: Path, capsys):
+        """An explicit path bypasses the discovery globs: hooks pass staged files as-is."""
+        other = tmp_path / 'other_file.py'
+        other.write_text(_VIOLATION_SOURCE)
+
+        assert _checker.main([str(other)]) == 1
+        assert str(other) in capsys.readouterr().out
 
 
 class TestStdlibOnlyProof:
@@ -1734,7 +1743,7 @@ _RULE_C_SOURCE = 'asyncio.wait_for(req_a.result, timeout=25.0)\n'
 class TestWallClockDeadlineExemption:
     """Rule C honours its OWN noqa code, on the preceding non-blank line, with a reason.
 
-    The contract is inherited verbatim from ``_EXEMPT_TEMPLATE`` / ``_is_exempted``
+    The contract is inherited verbatim from ``_lint_cli.py::is_exempted``
     rather than re-parsed, so an author learns the em-dash-or-hyphen,
     mandatory-reason, preceding-line-only, no-inline-trailing rules once and they
     hold for all three codes.  What is NOT shared is the code itself: Rule A's
@@ -1831,7 +1840,7 @@ class TestWallClockDeadlineCrossCodeIsolation:
         )
 
     def test_rule_a_and_rule_b_exemptions_are_bit_identical_after_registering_rule_c(self):
-        """Regression pin: adding a third _EXEMPT_RES key changed nothing for A or B."""
+        """Regression pin: registering a third rule code changed nothing for A or B."""
         assert find_violations(
             '# noqa: bare-magicmock — needed for legacy fixture migration\n' + _RULE_A_SOURCE,
             'test_a_still_exempt_after_c.py',
@@ -1841,18 +1850,19 @@ class TestWallClockDeadlineCrossCodeIsolation:
             'test_b_still_exempt_after_c.py',
         ) == [], "Rule B's own exemption must remain bit-identical"
 
-    def test_all_three_codes_are_registered_from_the_shared_template(self):
-        """The three codes live in one registry, so the contract cannot drift per rule."""
-        assert set(_checker._EXEMPT_RES) == {
-            _checker._RULE_A_CODE,
-            _checker._RULE_B_CODE,
-            _checker._RULE_C_CODE,
-        }
+    def test_all_three_codes_share_the_one_pragma_grammar(self):
+        """Three distinct codes, one shared grammar, and no pragma leaks across codes."""
+        codes = (_checker._RULE_A_CODE, _checker._RULE_B_CODE, _checker._RULE_C_CODE)
+        assert len(set(codes)) == 3
         assert _checker._RULE_C_CODE == 'wall-clock-deadline'
+        for code in codes:
+            for other in codes:
+                matched = _lint_cli.exemption_pattern(code).match(f'# noqa: {other} — a reason')
+                assert bool(matched) is (code == other), (code, other)
 
 
 class TestExemptionSeparatorVariants:
-    """Every rule honours every separator ``_EXEMPT_TEMPLATE`` accepts.
+    """Every rule honours every separator ``_lint_cli.py::exemption_pattern`` accepts.
 
     A uniform cross-rule pin of the exemption contract: em-dash, ASCII hyphen and a
     repeated hyphen, for all three codes.  A future regex edit cannot then honour a
@@ -2360,12 +2370,12 @@ def _merge_speculation_source() -> str:
 def _strip_exemption_pragmas(source: str, code: str) -> str:
     """Return *source* without the lines the checker reads as a *code* exemption.
 
-    Matches with ``_EXEMPT_RES[code]`` on the stripped line, the exact predicate
-    ``_is_exempted`` applies, so this proof and the rule cannot disagree about
-    which separators spell a pragma.  Line endings are kept, so the result equals
-    *source* exactly when no line matched.
+    Matches with ``_lint_cli.py::exemption_pattern`` on the stripped line, the
+    exact predicate ``_lint_cli.py::is_exempted`` applies, so this proof and the
+    rule cannot disagree about which separators spell a pragma.  Line endings are
+    kept, so the result equals *source* exactly when no line matched.
     """
-    exempt_re = _checker._EXEMPT_RES[code]
+    exempt_re = _lint_cli.exemption_pattern(code)
     return ''.join(
         line
         for line in source.splitlines(keepends=True)
