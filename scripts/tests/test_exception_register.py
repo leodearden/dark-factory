@@ -12,6 +12,7 @@ in ``tmp_path``, and every run passes an absent ``--sweep-state``.
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import shutil
 import subprocess
@@ -20,8 +21,15 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import exception_register
+import inline_suppressions
 import pytest
-from inline_suppression_fixtures import RUFF_CONFIG, SUBPROCESS_TIMEOUT_SECS, track_fixture_tree
+from inline_suppression_fixtures import (
+    RUFF_CONFIG,
+    SUBPROCESS_TIMEOUT_SECS,
+    run_git,
+    track_fixture_tree,
+    write_files,
+)
 from shared.governed_exceptions import (
     DECLARATION_FORMS,
     INLINE_MARKER_FORMS,
@@ -651,3 +659,215 @@ def test_a_missing_shared_import_is_exit_two_and_never_exit_one(tmp_path: Path):
     assert completed.returncode == 2, completed.stderr
     assert 'uv run --project shared' in completed.stderr
     assert 'Traceback' not in completed.stderr
+
+
+# ---------------------------------------------------------------------------
+# The report (scenario 15) and the --json document.
+
+
+def _report(root: Path, capsys) -> tuple[int, str, str]:
+    capsys.readouterr()
+    code = _main(root, '--report')
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def _json_text(root: Path, capsys) -> str:
+    capsys.readouterr()
+    code = _main(root, '--json')
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    return captured.out
+
+
+def _document(root: Path, capsys) -> dict:
+    return json.loads(_json_text(root, capsys))
+
+
+def _normalised_lines(text: str) -> list[str]:
+    """Each line of *text* with its whitespace runs collapsed, for row lookups."""
+    return [' '.join(line.split()) for line in text.splitlines()]
+
+
+_SCENARIO_15_TREE = {
+    'pkg/__init__.py': '',
+    'pkg/allow.py': (
+        "ALLOWLIST = frozenset({'secret-key-alpha', 'secret-key-beta', 'secret-key-gamma'})\n"
+    ),
+    'tests/test_decl.py': (
+        _HEADER
+        + 'from pkg.allow import ALLOWLIST\n'
+        + 'governed_exceptions(\n'
+        + "    'pkg.allowlist',\n"
+        + "    'every allowed key is owned or ratified',\n"
+        + '    sorted(ALLOWLIST),\n'
+        + '    default=Debt(TaskRef(5149)),\n'
+        + '    default_covers=2,\n'
+        + "    dispositions={'secret-key-gamma': Policy('inv12-x')},\n"
+        + ')\n'
+    ),
+}
+
+_TABLE_WITH_INV12_X = _block(_with(_ROW, 'id', 'inv12-x'))
+
+
+def test_scenario_15_a_defaulted_list_is_reported_without_its_key_set(tmp_path: Path, capsys):
+    _register_tree(tmp_path, _SCENARIO_15_TREE, table=_TABLE_WITH_INV12_X)
+
+    code, out, err = _report(tmp_path, capsys)
+
+    assert code == 0, err
+    lines = _normalised_lines(out)
+    assert 'governed lists: 1 declaration' in lines
+    assert 'pkg.allowlist tests/test_decl.py:3' in lines
+    assert 'rule: every allowed key is owned or ratified' in lines
+    assert 'default: Debt(TaskRef(5149)) covers 2' in lines
+    assert 'overrides: 1' in lines
+    assert "'secret-key-gamma': Policy('inv12-x')" in lines
+    assert 'secret-key-alpha' not in out
+    assert 'secret-key-beta' not in out
+
+
+def test_json_declarations_carry_the_literals_and_never_the_key_set(tmp_path: Path, capsys):
+    _register_tree(tmp_path, _SCENARIO_15_TREE, table=_TABLE_WITH_INV12_X)
+
+    (declaration,) = _document(tmp_path, capsys)['declarations']
+
+    assert declaration == {
+        'list_id': 'pkg.allowlist',
+        'rule': 'every allowed key is owned or ratified',
+        'path': 'tests/test_decl.py',
+        'line': 3,
+        'default': {'type': 'debt', 'owner': {'type': 'task', 'id': 5149}},
+        'default_covers': 2,
+        'overrides': [
+            {'key': 'secret-key-gamma', 'disposition': {'type': 'policy', 'ratified': 'inv12-x'}}
+        ],
+    }
+
+
+def test_an_unseeded_tree_heads_the_report_with_not_seeded(tmp_path: Path, capsys):
+    _register_tree(tmp_path, {'m.py': 'a = 1  # type: ignore[arg-type]\n'})
+
+    code, out, err = _report(tmp_path, capsys)
+
+    assert code == 0, err
+    assert out.splitlines()[0] == 'grandfathered (unowned): not seeded'
+    assert 'baseline slack: n/a' in _normalised_lines(out)
+    assert _document(tmp_path, capsys)['grandfathered'] == {'seeded': False, 'unowned': None}
+
+
+def _seed(root: Path, files: dict[str, str]) -> None:
+    """Track *files* and seed the inline baseline from them, where the register reads it."""
+    _register_tree(root, files)
+    (root / 'scripts').mkdir(exist_ok=True)
+    assert inline_suppressions.main(['--seed', '--root', str(root)]) == 0
+
+
+def _retrack(root: Path, files: dict[str, str], *, removing: tuple[str, ...] = ()) -> None:
+    write_files(root, files)
+    for relative in removing:
+        (root / relative).unlink()
+    run_git(['add', '-A', '-f'], cwd=root)
+
+
+_TWO_UNOWNED = {'m.py': 'a = 1  # type: ignore[arg-type]\nb = 2  # type: ignore[attr-defined]\n'}
+
+
+def test_the_headline_counts_only_what_the_baseline_holds(tmp_path: Path, capsys):
+    """A new unowned marker is excess — a violation at the inline gate — and is
+    never folded into the grandfathered population, which can only fall."""
+    _seed(tmp_path, _TWO_UNOWNED)
+    _retrack(tmp_path, {'n.py': 'c = 3  # type: ignore[no-any-return]\n'})
+
+    code, out, err = _report(tmp_path, capsys)
+
+    assert code == 0, err
+    assert out.splitlines()[0] == 'grandfathered (unowned): 2'
+    assert 'baseline excess: 1' in _normalised_lines(out)
+    assert _document(tmp_path, capsys)['grandfathered'] == {'seeded': True, 'unowned': 2}
+
+
+def test_a_removed_grandfathered_marker_is_baseline_slack(tmp_path: Path, capsys):
+    _seed(tmp_path, _TWO_UNOWNED)
+    _retrack(tmp_path, {'m.py': 'a = 1  # type: ignore[arg-type]\nb = 2\n'})
+
+    _, out, _ = _report(tmp_path, capsys)
+
+    assert out.splitlines()[0] == 'grandfathered (unowned): 1'
+    assert 'baseline slack: 1' in _normalised_lines(out)
+    document = _document(tmp_path, capsys)
+    assert document['baseline'] == {'present': True, 'slack_total': 1}
+
+
+def test_the_report_tabulates_inline_sites_by_kind_and_code_and_by_file(
+    tmp_path: Path, capsys
+):
+    files = {
+        f'pkg/f{index:02d}.py': 'x = 1  # pragma: no cover\n'
+        for index in range(exception_register.TOP_FILES + 2)
+    }
+    files['pkg/f00.py'] = (
+        'x = 1  # type: ignore[arg-type]\n'
+        'y = 2  # type: ignore[arg-type]\n'
+        'z = 3  # noqa: E402, F401\n'
+    )
+    _register_tree(tmp_path, files)
+
+    _, out, _ = _report(tmp_path, capsys)
+
+    lines = _normalised_lines(out)
+    assert '2 type: ignore[arg-type]' in lines
+    assert '1 noqa[E402]' in lines
+    assert '1 noqa[F401]' in lines
+    assert f'{exception_register.TOP_FILES + 1} pragma: no cover' in lines
+    assert '3 pkg/f00.py' in lines
+    assert '1 pkg/f01.py' in lines
+    assert '… 2 more files' in lines
+    assert f'1 pkg/f{exception_register.TOP_FILES + 1:02d}.py' not in lines
+
+
+def test_a_tree_with_no_declarations_says_so(tmp_path: Path, capsys):
+    _register_tree(tmp_path, {'m.py': 'x = 1\n'})
+
+    _, out, _ = _report(tmp_path, capsys)
+
+    assert 'governed lists: 0 declarations' in _normalised_lines(out)
+
+
+def test_json_exits_zero_and_carries_a_closed_world_violation_as_data(tmp_path: Path, capsys):
+    _register_tree(tmp_path, _UNRATIFIED_TREES['declaration-default'])
+
+    (violation,) = _document(tmp_path, capsys)['violations']
+
+    assert (violation['path'], violation['line']) == ('tests/test_decl.py', 2)
+    assert 'no-such-row' in violation['reason']
+
+
+def test_two_json_runs_over_one_tree_emit_identical_bytes(tmp_path: Path, capsys):
+    _register_tree(tmp_path, _SCENARIO_15_TREE, table=_TABLE_WITH_INV12_X)
+
+    first = _json_text(tmp_path, capsys)
+    second = _json_text(tmp_path, capsys)
+
+    assert first == second
+    document = json.loads(first)
+    assert list(document) == sorted(document)
+    assert document['schema_version'] == exception_register.REGISTER_SCHEMA_VERSION
+
+
+def test_json_carries_the_table_and_the_inline_report_verbatim(tmp_path: Path, capsys):
+    _register_tree(
+        tmp_path, {'m.py': 'a = 1  # type: ignore[arg-type]\n'}, table=_TABLE_WITH_INV12_X
+    )
+
+    document = _document(tmp_path, capsys)
+
+    assert document['ratification_table'] == {
+        'path': exception_register.TABLE_PATH,
+        'rows': [
+            {'id': 'inv12-x', 'date': '2026-10-09', 'source': 'esc-5602-1', 'covers': 'Fixture rows only.'}
+        ],
+    }
+    assert inline_suppressions.main(['--json', '--root', str(tmp_path)]) == 0
+    assert document['inline'] == json.loads(capsys.readouterr().out)
