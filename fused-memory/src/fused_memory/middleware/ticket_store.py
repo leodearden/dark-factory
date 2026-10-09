@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import logging
 import secrets
+import statistics
 import time
+from collections import Counter
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -20,6 +23,17 @@ from shared.async_sqlite_base import (
     apply_full_durability_pragmas,
     connect_daemon,
 )
+
+
+@dataclass(frozen=True)
+class DedupHealth:
+    """One project's curator verdicts over a window (see :meth:`TicketStore.dedup_health`)."""
+
+    resolved: int
+    combined: int
+    median_resolve_seconds: float | None
+    top_create_reasons: tuple[tuple[str, int], ...]
+
 
 # Crockford Base32 alphabet — omits I, L, O, U to reduce transcription errors.
 _CROCKFORD = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
@@ -312,6 +326,37 @@ class TicketStore:
         params.append(limit)
         rows = await self._require_access().read_all(' '.join(sql_parts), tuple(params))
         return [dict(r) for r in rows]
+
+    async def dedup_health(self, project_id: str, *, since: datetime) -> DedupHealth:
+        """Summarise ``created`` / ``combined`` verdicts resolved at or after *since*.
+
+        Latency is raw wall clock (``resolved_at - created_at``). Pending rows
+        and ``failed`` / ``refused`` / ``cancelled`` rows are not curator dedup
+        verdicts and are excluded. A NULL create reason counts as
+        ``'(unrecorded)'``.
+        """
+        rows = await self._require_access().read_all(
+            "SELECT status, reason, created_at, resolved_at FROM tickets "
+            "WHERE project_id = ? AND resolved_at IS NOT NULL AND resolved_at >= ? "
+            "  AND status IN ('created', 'combined')",
+            (project_id, since.isoformat()),
+        )
+        latencies = [
+            (
+                datetime.fromisoformat(row['resolved_at'])
+                - datetime.fromisoformat(row['created_at'])
+            ).total_seconds()
+            for row in rows
+        ]
+        create_reasons = Counter(
+            row['reason'] or '(unrecorded)' for row in rows if row['status'] == 'created'
+        )
+        return DedupHealth(
+            resolved=len(rows),
+            combined=sum(1 for row in rows if row['status'] == 'combined'),
+            median_resolve_seconds=statistics.median(latencies) if latencies else None,
+            top_create_reasons=tuple(create_reasons.most_common(5)),
+        )
 
     async def fetch_unescalated_failures(
         self,
