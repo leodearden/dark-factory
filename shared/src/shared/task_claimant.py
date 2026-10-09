@@ -91,8 +91,7 @@ def _carries_claimant(task: Mapping) -> bool:
 
 def _claimant_liveness_stranded(task: Mapping, now: datetime, ttl: timedelta) -> bool:
     """Status-agnostic claimant/heartbeat liveness core shared by
-    :func:`is_stranded`, :func:`is_stranded_blocked`, and (negated) by
-    :func:`has_live_claimant`.
+    :func:`is_stranded_any_status` and (negated) by :func:`has_live_claimant`.
 
     Returns True when *task* has no live claimant — i.e. either:
       - it has no claimant at all (``claimant_run_id`` is ``None``/blank), OR
