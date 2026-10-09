@@ -412,6 +412,46 @@ class TestStatusPreservationOnResume:
             f'Resume invocation must use IMPLEMENTER role; got {role!r}'
         )
 
+    async def test_resume_builder_rereads_the_plan_on_every_build(
+        self, config, git_ops, task_assignment, tmp_path,
+    ):
+        """A retried resume is briefed from plan.json as it is THEN (task 5730)."""
+        wt = await _make_advanced_worktree(git_ops, task_assignment.task_id)
+        queue = EscalationQueue(tmp_path / 'queue')
+        _submit_l0(queue, task_assignment.task_id)
+        workflow, _scheduler = _build_workflow(
+            config, git_ops, task_assignment, queue, wt,
+        )
+        workflow._steward_factory = _make_resolving_steward(
+            queue, task_assignment.task_id,
+        )
+        evrl_mock, _state = _make_evrl_returner(
+            [WorkflowOutcome.ESCALATED, WorkflowOutcome.DONE],
+        )
+        workflow._execute_verify_review_loop = evrl_mock  # type: ignore[method-assign]
+        rendered: list[str] = []
+
+        async def build_resume_prompt(task, plan, escalation_summary, resolution, worktree=None):
+            rendered.append(plan.get('analysis'))
+            return 'Resume'
+
+        workflow.briefing.build_resume_prompt = build_resume_prompt  # type: ignore[method-assign]
+
+        async def invoke_building_twice(role, build_prompt, cwd, output_schema=None):
+            await build_prompt()
+            assert workflow.artifacts is not None
+            plan = workflow.artifacts.read_plan()
+            plan['analysis'] = 'REWRITTEN-ANALYSIS'
+            workflow.artifacts.write_plan(plan)
+            await build_prompt()
+            return AgentResult(success=True, output='')
+
+        workflow._invoke = invoke_building_twice  # type: ignore[method-assign]
+
+        await workflow.run()
+
+        assert rendered == [PLAN['analysis'], 'REWRITTEN-ANALYSIS']
+
     async def test_scope_violation_resume_clean_tree_reinvokes_implementer(
         self, config, git_ops, task_assignment, tmp_path,
     ):

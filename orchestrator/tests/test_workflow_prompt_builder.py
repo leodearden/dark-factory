@@ -13,7 +13,11 @@ subprocess (``invoke_agent``) and the usage gate are doubles.
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -26,6 +30,7 @@ from orchestrator.agents.roles import IMPLEMENTER
 from orchestrator.artifacts import TaskArtifacts
 from orchestrator.config import OrchestratorConfig
 from orchestrator.event_store import EventType
+from orchestrator.verify import VerifyResult
 from orchestrator.workflow import TaskWorkflow, WorkflowOutcome
 
 _TASK_ID = '5730'
@@ -260,31 +265,151 @@ class TestInvokeTakesABuilder:
         wf.artifacts.write_agent_session.assert_not_called()
 
 
+class _BuiltTwice(Exception):
+    """Ends the method under test once its builder has been awaited twice."""
+
+
+def _invoke_building_twice(wf: TaskWorkflow, between_builds: Callable[[TaskArtifacts], None]):
+    """An _invoke double standing in for a re-dispatch: build, change disk, build again."""
+    artifacts = wf.artifacts
+    assert artifacts is not None
+
+    async def fake_invoke(role, build_prompt, cwd, output_schema=None):
+        await build_prompt()
+        between_builds(artifacts)
+        await build_prompt()
+        raise _BuiltTwice
+
+    return fake_invoke
+
+
+def _rewrite_analysis(artifacts: TaskArtifacts) -> None:
+    plan = artifacts.read_plan()
+    plan['analysis'] = 'REWRITTEN-ANALYSIS'
+    artifacts.write_plan(plan)
+
+
+def _remove_plan(artifacts: TaskArtifacts) -> None:
+    (artifacts.root / 'plan.json').unlink()
+
+
+def _stamp_prior_session(wf: TaskWorkflow) -> None:
+    assert wf.artifacts is not None
+    plan = wf.artifacts.read_plan()
+    plan['_session_id'] = 'prior-session'
+    wf.artifacts.write_plan(plan)
+    wf._old_plan_base = 'base0000'
+    wf.git_ops.get_main_sha = AsyncMock(return_value='main1111')  # type: ignore[method-assign]
+    wf.git_ops.get_changed_files = AsyncMock(return_value=['elsewhere.py'])  # type: ignore[method-assign]
+    wf.config.revalidation_skip_enabled = False
+
+
+def _fail_verification_once(wf: TaskWorkflow) -> None:
+    wf.config.rebase_before_verify = False
+    wf.config.escalate_preexisting_main_break = False
+    wf.config.max_opaque_timeout_attempts = 3
+    wf.config.max_failure_signature_repeat = 5
+    wf.config.max_verify_attempts = 5
+    wf._run_scoped_verification_with_infra_retry = AsyncMock(  # type: ignore[method-assign]
+        return_value=VerifyResult(
+            passed=False, test_output='FAILED test_x', lint_output='', type_output='',
+            summary='1 test failed', category='test_failure', cause_hint='boom',
+        ),
+    )
+    wf._maybe_file_chronic_flakes = AsyncMock()  # type: ignore[method-assign]
+    wf._get_head_commit = AsyncMock(return_value='head0000')  # type: ignore[method-assign]
+
+
+def _diff_from_base(wf: TaskWorkflow) -> None:
+    assert wf.artifacts is not None
+    wf.artifacts.init(_TASK_ID, 'T', 'd', base_commit='base0000')
+    wf.git_ops.get_diff_from_base = AsyncMock(return_value='diff --git a/x b/x')  # type: ignore[method-assign]
+
+
+def _amendable(wf: TaskWorkflow) -> None:
+    assert wf.artifacts is not None
+    wf._get_head_commit = AsyncMock(return_value='head0000')  # type: ignore[method-assign]
+    wf.artifacts.validate_plan_owner = MagicMock(return_value=True)  # type: ignore[method-assign]
+
+
+@dataclass(frozen=True)
+class _PlanRenderingSite:
+    briefing_method: str
+    rendered_plan: Callable[[Any], dict]
+    arrange: Callable[[TaskWorkflow], None]
+    drive: Callable[[TaskWorkflow], Awaitable[object]]
+
+
+def _positional_plan(call) -> dict:
+    return call.args[1]
+
+
+def _keyword_plan(call) -> dict:
+    return call.kwargs['plan']
+
+
+_COMPLETION = _PlanRenderingSite(
+    'build_plan_completion_prompt', _positional_plan, lambda wf: None,
+    lambda wf: wf._plan(),
+)
+_REVALIDATION = _PlanRenderingSite(
+    'build_revalidation_prompt', _positional_plan, _stamp_prior_session,
+    lambda wf: wf._plan(),
+)
+_PLAN_RENDERING_SITES = {
+    'completion': _COMPLETION,
+    'revalidation': _REVALIDATION,
+    'judge': _PlanRenderingSite(
+        'build_completion_judge_prompt', _keyword_plan, _diff_from_base,
+        lambda wf: wf._run_completion_judge([]),
+    ),
+    'debugger': _PlanRenderingSite(
+        'build_debugger_prompt', _positional_plan, _fail_verification_once,
+        lambda wf: wf._verify_debugfix_loop(),
+    ),
+    'tightening': _PlanRenderingSite(
+        'build_plan_tightening_prompt', _positional_plan, lambda wf: None,
+        lambda wf: wf._try_narrow_plan(['unused.py']),
+    ),
+    'amender': _PlanRenderingSite(
+        'build_amender_prompt', _keyword_plan, _amendable,
+        lambda wf: wf._amend([{'id': 's-1', 'text': 'tidy'}], amendment_round=1),
+    ),
+}
+
+
+async def _rendered_plans(
+    tmp_path: Path, site: _PlanRenderingSite, between_builds: Callable[[TaskArtifacts], None],
+) -> list[dict]:
+    wf = _make_workflow(tmp_path)
+    _write_two_step_plan(wf)
+    site.arrange(wf)
+    render = AsyncMock(return_value='PROMPT')
+    setattr(wf.briefing, site.briefing_method, render)
+    wf._invoke = _invoke_building_twice(wf, between_builds)  # type: ignore[method-assign]
+
+    with contextlib.suppress(_BuiltTwice):
+        await site.drive(wf)
+
+    return [site.rendered_plan(call) for call in render.call_args_list]
+
+
 @pytest.mark.asyncio
 class TestCallSiteBuildersReGatherThePlan:
-    async def test_amender_builder_rereads_the_plan_on_every_build(self, tmp_path):
-        wf = _make_workflow(tmp_path)
-        _write_two_step_plan(wf)
-        wf._get_head_commit = AsyncMock(return_value='head0000')  # type: ignore[method-assign]
-        wf.artifacts.validate_plan_owner = MagicMock(return_value=True)  # type: ignore[method-assign]
-        wf.briefing.build_amender_prompt = AsyncMock(return_value='amend please')
+    @pytest.mark.parametrize(
+        'site', _PLAN_RENDERING_SITES.values(), ids=_PLAN_RENDERING_SITES.keys(),
+    )
+    async def test_builder_rereads_the_plan_on_every_build(self, tmp_path, site):
+        plans = await _rendered_plans(tmp_path, site, _rewrite_analysis)
 
-        artifacts = wf.artifacts
-        assert artifacts is not None
+        assert [p['analysis'] for p in plans] == ['ORIGINAL-ANALYSIS', 'REWRITTEN-ANALYSIS']
 
-        async def fake_invoke(role, build_prompt, cwd, output_schema=None):
-            await build_prompt()
-            plan = artifacts.read_plan()
-            plan['analysis'] = 'REWRITTEN-ANALYSIS'
-            artifacts.write_plan(plan)
-            await build_prompt()
-            return _success()
+    @pytest.mark.parametrize(
+        'site', [_COMPLETION, _REVALIDATION], ids=['completion', 'revalidation'],
+    )
+    async def test_a_vanished_plan_is_briefed_from_the_plan_planning_began_with(
+        self, tmp_path, site,
+    ):
+        plans = await _rendered_plans(tmp_path, site, _remove_plan)
 
-        wf._invoke = fake_invoke  # type: ignore[method-assign]
-
-        assert await wf._amend([{'id': 's-1', 'text': 'tidy'}], amendment_round=1)
-
-        calls = wf.briefing.build_amender_prompt.call_args_list
-        assert len(calls) == 2
-        assert calls[0].kwargs['plan']['analysis'] == 'ORIGINAL-ANALYSIS'
-        assert calls[1].kwargs['plan']['analysis'] == 'REWRITTEN-ANALYSIS'
+        assert [p['analysis'] for p in plans] == ['ORIGINAL-ANALYSIS', 'ORIGINAL-ANALYSIS']

@@ -4870,7 +4870,8 @@ class TaskWorkflow:
             )
             async def build_completion_prompt() -> str:
                 return await self.briefing.build_plan_completion_prompt(
-                    self.task, self._live_plan(), worktree=self.worktree,
+                    self.task, self._live_plan() or existing_plan,
+                    worktree=self.worktree,
                 )
 
             build_prompt = build_completion_prompt
@@ -4915,7 +4916,7 @@ class TaskWorkflow:
 
             async def build_revalidation_prompt() -> str:
                 return await self.briefing.build_revalidation_prompt(
-                    self.task, self._live_plan(), changed_files,
+                    self.task, self._live_plan() or existing_plan, changed_files,
                     worktree=self.worktree,
                 )
 
