@@ -401,7 +401,12 @@ class RunSet:
     slates: Slates
     sample_size: int
     writes: tuple[dict[str, Any], ...]
-    left_judge_band: tuple[str, ...]
+    #: The drawn writes, viewed under *slates*, that the view moved out of the judge band.
+    leavers: tuple[dict[str, Any], ...]
+
+    @property
+    def left_judge_band(self) -> tuple[str, ...]:
+        return tuple(view['memory_id'] for view in self.leavers)
 
 
 def draw_run_set(
@@ -426,7 +431,7 @@ def draw_run_set(
         slates=slates,
         sample_size=len(sample),
         writes=tuple(view for view in viewed if view['band'] == OUTCOME_JUDGE),
-        left_judge_band=tuple(view['memory_id'] for view in viewed if view['band'] != OUTCOME_JUDGE),
+        leavers=tuple(view for view in viewed if view['band'] != OUTCOME_JUDGE),
     )
 
 
@@ -799,20 +804,17 @@ def _write_time_population_block(
     snapshot: Mapping[str, Any], snapshot_sha256: str, snapshot_path: Path, run_set: RunSet,
 ) -> dict[str, Any]:
     frozen = {write['memory_id']: write for write in snapshot['writes']}
-    order = judge_band_order(snapshot, snapshot_sha256)
-    sample = order[:run_set.sample_size]
-    judged = run_set.writes
-    leavers = [
-        write_time_slate(frozen[memory_id], t_high=snapshot['t_high'], t_low=snapshot['t_low'])
-        for memory_id in run_set.left_judge_band
-    ]
+    n_judge_band_frozen = sum(1 for write in snapshot['writes'] if write['band'] == OUTCOME_JUDGE)
+    judged, leavers = run_set.writes, run_set.leavers
     sizes = [len(write['candidates']) for write in judged]
     return {
         'slates': Slates.WRITE_TIME,
         'slates_rule': WRITE_TIME_RULE,
         'n_writes': len(snapshot['writes']),
-        'n_judge_band_frozen': len(order),
-        'judge_band_sample': {'order': _RUN_SET_ORDER, 'size': len(sample), 'of': len(order)},
+        'n_judge_band_frozen': n_judge_band_frozen,
+        'judge_band_sample': {
+            'order': _RUN_SET_ORDER, 'size': run_set.sample_size, 'of': n_judge_band_frozen,
+        },
         'n_judge_band_write_time': len(judged),
         'excluded_by_write_time_filter': {
             'count': len(leavers),
@@ -822,8 +824,10 @@ def _write_time_population_block(
         'band_winner_changed': sum(
             1 for w in judged if w['band_winner_id'] != frozen[w['memory_id']]['band_winner_id']
         ),
-        'writes_with_later_candidates': sum(1 for w in sample if _has_later_candidate(w)),
-        'later_candidates_dropped': sum(
+        'writes_with_later_candidates': sum(
+            1 for w in (*judged, *leavers) if _has_later_candidate(frozen[w['memory_id']])
+        ),
+        'candidates_dropped': sum(
             len(frozen[w['memory_id']]['candidates']) - len(w['candidates']) for w in judged
         ),
         'write_time_slate_size': {

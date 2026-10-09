@@ -104,6 +104,7 @@
   },
   "population": {
     "band_winner_changed": 129,
+    "candidates_dropped": 1166,
     "declares_attach_keys_run_set": 10,
     "excluded_by_write_time_filter": {
       "by_band": {},
@@ -116,7 +117,6 @@
       "order": "sha256(snapshot_sha256:memory_id)",
       "size": 658
     },
-    "later_candidates_dropped": 1166,
     "n_judge_band_frozen": 1454,
     "n_judge_band_write_time": 658,
     "n_writes": 1517,

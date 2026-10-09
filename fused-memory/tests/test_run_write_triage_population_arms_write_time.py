@@ -253,9 +253,8 @@ class TestTheRunSet:
         assert [w['memory_id'] for w in run_set.writes] == _order(snapshot)[:SAMPLE]
         for write in run_set.writes:
             assert write == {**frozen[write['memory_id']], 'slates': 'frozen'}
-        assert (run_set.slates, run_set.sample_size, run_set.left_judge_band) == (
-            'frozen', SAMPLE, (),
-        )
+        assert (run_set.slates, run_set.sample_size, run_set.leavers) == ('frozen', SAMPLE, ())
+        assert run_set.left_judge_band == ()
 
     def test_a_run_set_is_immutable(self) -> None:
         run_set = _draw(_snapshot(), _mod().Slates.FROZEN)
@@ -272,9 +271,13 @@ class TestTheRunSet:
             assert write == _mod().write_time_slate(
                 frozen[write['memory_id']], t_high=T_HIGH, t_low=T_LOW,
             )
+        assert run_set.leavers == tuple(
+            _mod().write_time_slate(frozen[memory_id], t_high=T_HIGH, t_low=T_LOW)
+            for memory_id in leavers
+        )
         assert run_set.left_judge_band == leavers
         assert (run_set.slates, run_set.sample_size) == ('write-time', SAMPLE)
-        assert len(run_set.writes) + len(run_set.left_judge_band) == SAMPLE
+        assert len(run_set.writes) + len(run_set.leavers) == SAMPLE
 
     def test_a_write_that_left_the_band_is_never_back_filled(self) -> None:
         snapshot, _ = _with_leavers()
@@ -642,7 +645,7 @@ class TestTheWriteTimePopulationBlock:
             },
             'band_winner_changed': 1,
             'writes_with_later_candidates': 2,
-            'later_candidates_dropped': 1,
+            'candidates_dropped': 1,
             'write_time_slate_size': {'min': 2, 'median': 2, 'max': 4},
             'recon_marker_run_set': 1,
             'declares_attach_keys_run_set': 1,
