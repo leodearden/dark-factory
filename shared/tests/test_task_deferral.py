@@ -431,6 +431,15 @@ _HELD_JSON = record_to_json(_stamped(_held(holder_pid=HOLDER.pid), holder=HOLDER
         pytest.param({**_HELD_JSON, 'surprise': 1}, id='unknown-key'),
         pytest.param([_HELD_JSON], id='list'),
         pytest.param({**_HELD_JSON, 'holder': {**_HELD_JSON['holder'], 'pid': 0}}, id='pid-0'),
+        *(
+            pytest.param({**_HELD_JSON, 'holder': {**_HELD_JSON['holder'], name: value}}, id=label)
+            for name, value, label in (
+                ('pid', True, 'holder-pid-bool'),
+                ('pid', str(HOLDER.pid), 'holder-pid-text'),
+                ('start_ticks', float(HOLDER.start_ticks), 'holder-ticks-float'),
+                ('boot_id', 7, 'holder-boot-id-int'),
+            )
+        ),
         pytest.param({**_HELD_JSON, 'grace_secs': 5}, id='grace-5'),
     ],
 )

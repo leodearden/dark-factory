@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Annotated, Any, Final, Literal, LiteralString, cast
+from typing import Annotated, Any, Final, Literal, LiteralString, cast, get_type_hints
 
 from pydantic import (
     AfterValidator,
@@ -179,6 +179,19 @@ def _decimal_text_as_int(value: Any) -> Any:
     return value
 
 
+_HOLDER_FIELDS: Final = {
+    name: TypeAdapter(field_type) for name, field_type in get_type_hints(ProcessIdentity).items()
+}
+
+
+def _exactly_typed_holder(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        for name, field in _HOLDER_FIELDS.items():
+            if name in value:
+                field.validate_python(value[name], strict=True)
+    return value
+
+
 UtcTimestamp = Annotated[datetime, BeforeValidator(_utc_timestamp_field)]
 ConditionText = Annotated[
     str, StringConstraints(max_length=CONDITION_MAX_CHARS), AfterValidator(_non_blank)
@@ -187,6 +200,7 @@ ReasonText = Annotated[str, StringConstraints(max_length=REASON_MAX_CHARS)]
 GraceSecs = Annotated[int, Field(strict=True), AfterValidator(_within_grace_bounds)]
 PositiveId = Annotated[int, Field(strict=True, gt=0)]
 TaskId = Annotated[PositiveId, BeforeValidator(_decimal_text_as_int)]
+StoredHolder = Annotated[ProcessIdentity, BeforeValidator(_exactly_typed_holder)]
 
 
 class _DeferralRequestBase(BaseModel):
@@ -296,7 +310,7 @@ class UntilConditionDeferral(_DeferralRecordBase):
 
 class HeldBySessionDeferral(_DeferralRecordBase):
     kind: Literal[DeferralKind.HELD_BY_SESSION] = DeferralKind.HELD_BY_SESSION
-    holder: ProcessIdentity
+    holder: StoredHolder
     grace_secs: GraceSecs = DEFAULT_GRACE_SECS
 
 
