@@ -714,11 +714,10 @@ def has_non_human_origin(record: dict[str, Any]) -> bool:
 
 
 def is_non_dialogue_carrier(record: dict[str, Any], text: str) -> bool:
-    """The ONE question the gold bucket, every signal detector and the
-    sampling.py pre-scorer's text classes ask of a carrier
-    (plans/confusion-reduction-prd.md §7.2.3): the record half is
-    provenance, the text half is content. The record half covers every
-    carrier the record holds, tool_results included."""
+    """The ONE question asked of a carrier before it counts as this
+    session's own dialogue (plans/confusion-reduction-prd.md §7.2.3): the
+    record half is provenance, the text half is content. The record half
+    covers every carrier the record holds, tool_results included."""
     return has_non_human_origin(record) or is_reingested_content(text)
 
 

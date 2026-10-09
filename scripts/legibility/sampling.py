@@ -11,23 +11,8 @@ budget-bounded, stratified subset for the nightly digest
 stratified_sample -> render_manifest`` into the CLI acceptance surface.
 
 Task β of the confusion-reduction PRD (plans/confusion-reduction-prd.md
-§5.2, contract §7.4). It owns its own signal-scoring primitives, reusing
-only the low-level JSONL-line iterator
-(:func:`legibility.inventory.iter_json_lines`) from its own sibling
-module rather than duplicating it.
-
-This module was originally "self-contained — does not import task α's
-``digest.py``". That is now deliberately relaxed. ``budgets.max_daily_digest_bytes``
-is a DIGEST-OUTPUT budget, and charging a record's real cost against it
-means knowing how big its digest will be, which only the digest renderer
-can answer (:func:`digest_byte_cost_fn`). And two classifiers are digest's,
-so the two layers cannot drift: :func:`digest.classify_error_content`
-splits genuine from designed errors, and :func:`digest.is_non_dialogue_carrier`
-decides which text carriers are this session's own dialogue
-(plans/confusion-reduction-prd.md §7.2.3). The pattern tables and the
-carrier extraction stay this module's own. The dependency is
-one-directional: ``digest.py`` imports only ``legibility.inventory``, so
-there is no cycle.
+§5.2, contract §7.4). Its pattern tables and carrier extraction are its
+own; what it takes from ``digest.py``, and why, is PRD §7.2.3.
 """
 from __future__ import annotations
 
