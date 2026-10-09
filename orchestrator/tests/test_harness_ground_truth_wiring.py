@@ -18,8 +18,9 @@ from __future__ import annotations
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
+from shared.task_claimant import DEFAULT_CLAIMANT_HEARTBEAT_TTL
 
-from orchestrator.harness import _RECONCILE_HEARTBEAT_TTL, Harness
+from orchestrator.harness import Harness
 from orchestrator.task_ground_truth import (
     BranchState,
     BranchStateKind,
@@ -82,17 +83,15 @@ class TestGetGroundTruthWiring:
         assert resolver.scheduler is harness.scheduler
         assert resolver.worktree_resolver == harness._resolve_task_worktree
 
-    def test_heartbeat_ttl_matches_reconcile_constant(self, harness: Harness):
-        """No dedicated OrchestratorConfig field exists for heartbeat_ttl (see
-        harness.py's _RECONCILE_HEARTBEAT_TTL docstring) — the resolver is
-        bound to that hardcoded module constant, not sourced from config.
-        Pin against the imported constant (not a literal timedelta) so a
-        future change to the constant can't silently drift from this test."""
+    def test_heartbeat_ttl_is_the_shared_claimant_ttl(self, harness: Harness):
+        """The harness binds the shared claimant TTL explicitly rather than
+        riding TaskGroundTruth's default; identity proves it is the single
+        definition, not an equal local copy."""
         harness._escalation_queue = MagicMock(name='live_escalation_queue')
 
         resolver = harness._get_ground_truth()
 
-        assert resolver.heartbeat_ttl == _RECONCILE_HEARTBEAT_TTL
+        assert resolver.heartbeat_ttl is DEFAULT_CLAIMANT_HEARTBEAT_TTL
 
     def test_memoizes_across_calls_once_queue_is_stable(self, harness: Harness):
         """Once _escalation_queue is stable (the steady-state post-startup

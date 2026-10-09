@@ -959,7 +959,8 @@ class TestReconcileStrandedInProgress:
         reverted above) — the pre-2243 sweep's actual root cause for the
         2588 un-claim (a live task reverted out from under its own live
         claimant). But get_task returns a FRESH db claimant
-        (claimant_run_id + heartbeat within _RECONCILE_HEARTBEAT_TTL), so
+        (claimant_run_id + heartbeat within
+        shared.task_claimant.DEFAULT_CLAIMANT_HEARTBEAT_TTL), so
         recovery_for's live_claimant resolution defers to the db signal and
         classifies LEAVE: _revert_in_progress_if_no_live_claimant must
         never be dispatched — no revert, no un-claim, lock preserved.
