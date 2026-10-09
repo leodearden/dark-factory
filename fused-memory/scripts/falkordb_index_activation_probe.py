@@ -421,13 +421,24 @@ def _search_hit(result: object) -> SearchHit:
         isinstance(result.get(key), str) for key in ('id', 'source_store', 'content')
     ):
         raise SearchPayloadShapeError(f'search result lacks id/source_store/content: {result!r}')
-    temporal = result.get('temporal') or {}
     return SearchHit(
         id=result['id'],
         source_store=result['source_store'],
         content=result['content'],
-        invalid_at=temporal.get('invalid_at'),
+        invalid_at=_invalid_at(result),
     )
+
+
+def _invalid_at(result: Mapping) -> str | None:
+    temporal = result.get('temporal')
+    if temporal is None:
+        return None
+    if not isinstance(temporal, Mapping):
+        raise SearchPayloadShapeError(f'search result temporal is not a mapping: {result!r}')
+    invalid_at = temporal.get('invalid_at')
+    if invalid_at is not None and not isinstance(invalid_at, str):
+        raise SearchPayloadShapeError(f'search result invalid_at is not a string: {result!r}')
+    return invalid_at
 
 
 def parse_search_payload(payload: object) -> SearchOutcome:

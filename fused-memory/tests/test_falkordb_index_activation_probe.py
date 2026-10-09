@@ -865,6 +865,8 @@ class TestParseSearchPayload:
             {'results': 'not a list'},
             {'results': [{'id': 'u1'}]},
             ['not', 'a', 'mapping'],
+            {'results': [{'id': 'u1', 'source_store': 'graphiti', 'content': 'x', 'temporal': 'yesterday'}]},
+            {'results': [{'id': 'u1', 'source_store': 'graphiti', 'content': 'x', 'temporal': {'invalid_at': 20260101}}]},
         ],
     )
     def test_an_unrecognised_shape_raises(self, payload):
