@@ -31,7 +31,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 
-from shared.task_statuses import TaskStatus
+from shared.task_statuses import TERMINAL, TaskStatus
 from shared.timestamps import parse_timestamp_or_warn
 
 __all__ = [
@@ -41,6 +41,7 @@ __all__ = [
     'is_stranded',
     'is_stranded_any_status',
     'is_stranded_blocked',
+    'violates_terminal_claimant_invariant',
 ]
 
 # The single claimant heartbeat staleness window (docs/prds/claimant-invariant-enforcement.md
@@ -69,6 +70,11 @@ def compose_claimant_run_id(run_id: str, session_id: str, owner_pid: int) -> str
     consumed by :func:`is_stranded` via the ``claimant_run_id`` column.
     """
     return f'{run_id}/{session_id}/pid={owner_pid}'
+
+
+def _carries_claimant(task: Mapping) -> bool:
+    claimant = task.get('claimant_run_id')
+    return not (claimant is None or (isinstance(claimant, str) and not claimant.strip()))
 
 
 def _claimant_liveness_stranded(task: Mapping, now: datetime, ttl: timedelta) -> bool:
@@ -100,8 +106,7 @@ def _claimant_liveness_stranded(task: Mapping, now: datetime, ttl: timedelta) ->
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
 
-    claimant = task.get('claimant_run_id')
-    if claimant is None or (isinstance(claimant, str) and not claimant.strip()):
+    if not _carries_claimant(task):
         return True
 
     heartbeat, ok = parse_timestamp_or_warn(
@@ -226,3 +231,15 @@ def has_live_claimant(task: Mapping, now: datetime, ttl: timedelta) -> bool:
         is considered stale (i.e. not live).
     """
     return not _claimant_liveness_stranded(task, now, ttl)
+
+
+def violates_terminal_claimant_invariant(task: Mapping) -> bool:
+    """Return True when a terminal *task* still carries a claimant (C4-E1).
+
+    C4-E1 (``status ∈ TERMINAL ⇒ no claimant``) is D3's enforced, alarmable
+    tier. It is stated on ``claimant_run_id`` alone, so a (NULL claimant,
+    re-stamped heartbeat) residue is not a violation
+    (``docs/prds/claimant-invariant-enforcement.md`` "Contract"). It takes no
+    TTL: freshness is irrelevant to the terminal tier.
+    """
+    return str(task.get('status')) in TERMINAL and _carries_claimant(task)
