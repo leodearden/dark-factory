@@ -941,30 +941,11 @@ verify_admission_pytest_n: "8"
 # plans/verify-admission-task-slots-gate.md.
 verify_admission_task_slots: 1
 
-# Run each verify leg in its own weighted cgroup scope (task 5206, operator
-# decision Leo 2026-09-08, load-tuning session; the step after task 5205). Off,
-# every verify ran inside orchestrator-dark-factory.service, where only nice
-# orders threads, so agents at nice 10 lost thread-for-thread to the merge leg's
-# xdist workers at nice 5 (2026-09-08: agents stalled 89%, merge workers 51%,
-# task workers 57%). On, verify.py::_run_cmd launches each leg through
-# `systemd-run --user --scope` as df-verify-dark-factory-<hash>-<uuid>.scope, a
-# cgroup sibling of the unit under app.slice, and a timeout kills it by cgroup
-# (verify.py::_kill_cgroup_scope). Observe with
-# `systemctl --user list-units --type=scope | grep df-verify-dark-factory-`
-# (hyphenated: the scope tag is the project_root basename slug).
-# Weights: verify_cgroup_cpu_weight_merge/_task/_background at their code
-# defaults 100/33/10 (task 5205, config.py, green-tier) against the unit's unset
-# CPUWeight (default 100).
-# RESTART TIER: not in config.py RELOADABLE_FIELDS, so reload_config lists it
-# under restart_required, as expected; it goes live at the next fleet redeploy.
-# From that redeploy the sampler's own_cpu_some10 series (the unit's own cgroup
-# pressure) no longer includes verify load.
-# BEFORE, flag off: scripts/cgroup-stall-ratio.py --window 30 --json, stall% (run/wait cores)
-#                         df_agents        df_merge_workers  df_task_workers  psi avg10  procs_running
-#   2026-10-04T18:56:41Z  92% (0.05/0.50)  null (0.0/0.0)    85% (0.77/4.39)  59.22      118
-#   2026-10-04T18:59:43Z  84% (0.05/0.26)  null (0.0/0.0)    73% (1.27/3.47)  51.69      86
-#   2026-10-04T19:02:44Z  88% (0.10/0.69)  69% (0.91/2.06)   null (0.0/0.0)   58.56      157
-# AFTER: task 5208 re-runs the same command 24h after this lands.
+# Run each verify leg in its own weighted cgroup scope, a sibling of this unit
+# under app.slice, so agents stop losing thread-for-thread to verify xdist
+# workers (task 5206, operator decision Leo 2026-09-08; per-role weights from
+# task 5205). It also takes verify load out of this unit's own_cpu_some10.
+# Restart tier: not in RELOADABLE_FIELDS, so it goes live at the next redeploy.
 verify_use_cgroup_scope: true
 
 # Pin `-n auto` for every verify subprocess (task 3589's residual, operator
