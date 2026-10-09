@@ -104,6 +104,7 @@ from orchestrator.verify_cancel import (
 )
 from orchestrator.verify_classify import _ENOSPC_MARKERS
 from orchestrator.warm_lane_pool import WarmLanePoolCensus
+from orchestrator.worktree_admin_entries import unlock_dangling_locked_entries
 from orchestrator.worktree_identity import identities_match, read_worktree_title
 
 logger = logging.getLogger(__name__)
@@ -2722,25 +2723,14 @@ def _merge_subject(branch: str, main_branch: str) -> str:
     return f'Merge {branch} into {main_branch}'
 
 
-def _dangling_locked_worktree(admin_entry: Path, worktree_base: Path) -> Path | None:
-    """The worktree of a LOCKED admin entry whose tree is gone, else None.
+def _merge_worktree_remove_argv(path: Path) -> list[str]:
+    """``git worktree remove`` for a ``_merge-*`` tree, overriding git's lock.
 
-    *admin_entry* is a ``.git/worktrees/<id>`` dir; its ``locked`` and
-    ``gitdir`` files are git's documented layout (gitrepository-layout(5)).
-    Qualifies only a direct child of *worktree_base*. Never raises.
+    git refuses a single ``--force`` on a locked tree. Nothing in this repo
+    locks a worktree, so a lock on a ``_merge-*`` tree is git's abandoned
+    ``initializing`` marker (task 4828), never a liveness signal.
     """
-    try:
-        if not (admin_entry / 'locked').exists():
-            return None
-        gitdir = admin_entry / (admin_entry / 'gitdir').read_text().strip()
-        if gitdir.name != '.git':
-            return None
-        worktree = gitdir.parent
-        if worktree.parent.resolve() != worktree_base.resolve() or worktree.is_dir():
-            return None
-        return worktree
-    except OSError:
-        return None
+    return ['git', 'worktree', 'remove', '--force', '--force', str(path)]
 
 
 # Sentinel range used to represent files that are fully deleted or renamed.
@@ -12580,10 +12570,7 @@ class GitOps:
         flock — this method never consults holder liveness directly). The
         holder-pgid rendezvous file is read ONLY to name the holder in
         that WARNING — a best-effort, fail-open diagnostic hint, never a
-        removal gate. The removal overrides git's worktree lock
-        (``--force --force``): the held flock is the liveness gate, and
-        nothing in this repo sets git's ``locked`` marker, so the only one a
-        ``_merge-*`` tree can carry is git's abandoned ``initializing`` one.
+        removal gate.
 
         That WARNING carries TWO attributions, and ``rendezvous pgid=None``
         in it is EXPECTED, not a defect: this method only reaches the refusal
@@ -12739,13 +12726,8 @@ class GitOps:
                 unlink_lock = True
                 return 'not_present'
             try:
-                # Double force: git refuses a single --force on a locked tree
-                # ('use remove -f -f'), and 'failed' would send it to cleanup's
-                # rmtree, after which prune cannot reclaim the locked entry
-                # (task 4828).
                 rc, _, err = await _run(
-                    ['git', 'worktree', 'remove', str(path), '--force', '--force'],
-                    cwd=self.project_root,
+                    _merge_worktree_remove_argv(path), cwd=self.project_root,
                 )
             except OSError as exc:
                 # The SECOND escape from cleanup_merge_worktree's never-raises
@@ -12822,11 +12804,10 @@ class GitOps:
         (its pinned contract — see task 2924's
         ``test_non_worktree_directory_returns_failed``). But ``'failed'`` is
         NOT proof of shape-1 specifically: it is simply *any* non-zero git
-        worktree removal — a transient filesystem/I/O error yields it too
-        (a ``git worktree lock``-ed tree does not: the primitive overrides
-        the lock and removes it). The fallback deliberately does
-        NOT try to distinguish the cause; it force-removes any unleased
-        ``_merge-`` tree git could not remove, whatever the reason. That is
+        worktree removal — a transient filesystem/I/O error yields it too.
+        The fallback deliberately does NOT try to distinguish the cause; it
+        force-removes any unleased ``_merge-`` tree git could not remove,
+        whatever the reason. That is
         safe here because merge worktrees are throwaway/ephemeral by
         construction AND ``'failed'`` already means the primitive's lease
         acquire confirmed NO live holder (a live holder yields
@@ -12848,10 +12829,9 @@ class GitOps:
         now-orphaned lane lock, honouring the no-leak convention); (4)
         :meth:`_prune_registrations` clears any dangling admin entry. The
         order — remove-tree-then-prune — leaves at most the inverse shape
-        (admin entry without a tree). A bare prune reclaims that only when
-        it is unlocked: a locked one is permanent to git and hard-failed
-        every merge_request enqueue (task 4828, correcting task 2922's
-        claim), so :meth:`_prune_registrations` unlocks it before pruning.
+        (admin entry without a tree), which :meth:`_prune_registrations`
+        reclaims even when git has it locked, so an interrupted teardown is
+        always completable by a later sweep.
 
         Every other outcome (``'removed'`` / ``'not_present'`` / the three
         ``'skipped_*'``, including ``'skipped_lock_error'``) returns
@@ -12897,8 +12877,7 @@ class GitOps:
         # Crash-safe fallback (task 2922): the guarded git removal returned
         # 'failed' — i.e. ANY non-zero git worktree removal. Most commonly the
         # shape-1 case (the .git/worktrees/<name> admin dir was already removed
-        # by an interrupted teardown), but a transient FS/I/O error too (a
-        # locked tree is removed by the primitive, never 'failed'). We
+        # by an interrupted teardown), but a transient FS/I/O error too. We
         # intentionally do NOT distinguish the cause: the
         # primitive's lease acquire already confirmed no live holder, so we
         # force-remove this unleased throwaway _merge- tree git could no longer
@@ -13581,9 +13560,7 @@ class GitOps:
         and :meth:`find_inflight_merge_worktree`.  Enumerates via
         ``git worktree list --porcelain``, filtering to direct children of
         ``worktree_base`` whose name starts with ``_merge-``.  Yields nothing
-        on git error (fail-closed).  A registered entry whose directory is
-        absent is skipped with a WARNING: git keeps listing it (permanently
-        while it is locked), and no consumer can run git inside it (task 4828).
+        on git error (fail-closed).
 
         *wt_path* is the raw path from porcelain output (used for git commands).
         *wt_resolved* is the resolved path (used for identity comparisons such
@@ -13617,13 +13594,6 @@ class GitOps:
             # Exempt the persistent warm merge-verify worktree — prune and
             # find_inflight must never touch it (invariant 4).
             if wt_resolved.name == PERSISTENT_MERGE_WORKTREE_NAME:
-                continue
-            if not wt_resolved.is_dir():
-                logger.warning(
-                    'registered merge worktree %s is absent on disk — skipping; '
-                    'git keeps listing it, and _prune_registrations reclaims it',
-                    wt_path,
-                )
                 continue
             yield wt_path, wt_resolved
 
@@ -13679,8 +13649,7 @@ class GitOps:
             ):
                 continue
             rc_rm, _, err = await _run(
-                ['git', 'worktree', 'remove', '--force', str(wt_path)],
-                cwd=self.project_root,
+                _merge_worktree_remove_argv(wt_path), cwd=self.project_root,
             )
             if rc_rm == 0:
                 removed.append(str(wt_path))
@@ -13711,9 +13680,10 @@ class GitOps:
         match is found.
 
         Fail-closed on git errors: a candidate whose ``git log`` fails, or
-        cannot spawn because its directory vanished (:class:`WorktreeMissing`),
-        is skipped (logged at WARNING level) rather than raising — avoids
-        crashing the coalesce dispatch on a partially-written worktree.
+        whose directory is absent though git still lists it
+        (:class:`WorktreeMissing`), is skipped (logged at WARNING level)
+        rather than raising — avoids crashing the coalesce dispatch on a
+        partially-written or half-torn-down worktree.
 
         Crash-safety / cross-restart source of truth: even if the in-memory
         ``InFlightMergeRegistry`` was cleared by a process restart, an
@@ -13738,8 +13708,8 @@ class GitOps:
                 )
             except WorktreeMissing:
                 logger.warning(
-                    'find_inflight_merge_worktree: %s vanished before git log '
-                    'could run — skipping',
+                    'find_inflight_merge_worktree: registered %s is absent on '
+                    'disk — skipping',
                     wt_path,
                 )
                 continue
@@ -15834,47 +15804,6 @@ class GitOps:
             )
             return None
 
-    def _unlock_dangling_locked_entries(self, context: str) -> list[str]:
-        """Unlink ``locked`` from admin entries whose ``worktree_base`` tree is gone.
-
-        Does what ``git worktree unlock`` does, without a subprocess. Nothing
-        in this repo locks a worktree, so such a marker is git's abandoned
-        ``initializing`` one. A no-op for a ``.git``-file layout (mirroring
-        :meth:`_index_lock_path`'s fast path) or an absent ``worktree_base``.
-        Returns the unlocked entry names. Never raises.
-        """
-        dot_git = self.project_root / '.git'
-        if not dot_git.is_dir() or not self.worktree_base.is_dir():
-            return []
-        try:
-            entries = sorted((dot_git / 'worktrees').iterdir())
-        except OSError:
-            return []
-        unlocked: list[str] = []
-        for entry in entries:
-            worktree = _dangling_locked_worktree(entry, self.worktree_base)
-            if worktree is None:
-                continue
-            lock = entry / 'locked'
-            reason = ''
-            with contextlib.suppress(OSError):
-                reason = lock.read_text().strip()
-            try:
-                os.unlink(lock)
-            except OSError as exc:
-                logger.warning(
-                    '%s: could not unlock worktree admin entry %s (%s): %s',
-                    context, entry.name, worktree, exc,
-                )
-                continue
-            logger.warning(
-                '%s: unlocked worktree admin entry %s for vanished %s '
-                '(lock reason %r) so prune can reclaim it',
-                context, entry.name, worktree, reason,
-            )
-            unlocked.append(entry.name)
-        return unlocked
-
     async def _prune_registrations(self, context: str) -> None:
         """Best-effort ``git worktree prune`` — clears stale admin entries.
 
@@ -15925,15 +15854,17 @@ class GitOps:
         hot sweep sites (e.g. ``create_worktree``, ``reap_interactive_worktrees``)
         do not multiply operator-visible escalations.
 
-        **Locked entries (task 4828)**: prune skips a locked entry forever.
-        A locked entry under ``worktree_base`` whose tree is gone has its
-        lock removed first (:meth:`_unlock_dangling_locked_entries`), inside
-        the pool-storage gate above. A locked entry elsewhere keeps its
-        lock: that is git's documented portable-device use.
+        **Locked entries (task 4828)**: prune skips a locked entry forever,
+        so :func:`~orchestrator.worktree_admin_entries.unlock_dangling_locked_entries`
+        first unlocks those whose ``worktree_base`` tree is gone. It runs
+        inside the pool-storage gate above, because an unmounted
+        ``worktree_base`` makes every lane look gone.
         """
         if not self._reconcile_pool_storage_before_sweep(context):
             return
-        self._unlock_dangling_locked_entries(context)
+        unlock_dangling_locked_entries(
+            self.project_root / '.git', self.worktree_base, context,
+        )
         try:
             rc, _, err = await _run(
                 ['git', 'worktree', 'prune'], cwd=self.project_root,

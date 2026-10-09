@@ -6,11 +6,13 @@ In production one ``_merge-*`` entry of this shape made every
 ``merge_request`` enqueue fail with ``Worktree missing: <path>``, while the
 already-queued entries kept landing.
 
-TestLockedDanglingEntryDoesNotPoisonMergeEnumeration pins that merge-worktree
-enumeration, and through it the enqueue gate, skips such an entry rather than
+TestLockedDanglingEntryDoesNotPoisonMergeEnumeration pins that the in-flight
+merge lookup, and through it the enqueue gate, skips such an entry rather than
 raising. TestPruneReclaimsLockedDanglingEntries pins that the prune chokepoint
 reclaims such an entry under ``worktree_base``, and nowhere else, and never
 past the task-2099 pool-storage refusal.
+TestPruneStaleMergeWorktreesReclaimsAbsentEntries pins that the disk-pressure
+sweep reclaims a tree-gone ``_merge-*`` registration on its own, locked or not.
 """
 from __future__ import annotations
 
@@ -22,6 +24,7 @@ from pathlib import Path
 
 import pytest
 from _git_fixtures import seed_repo
+from _worktree_registrations import lane_admin_dir, registered_worktree_paths
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps
@@ -38,24 +41,6 @@ def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(
         ['git', *args], cwd=cwd, check=True, capture_output=True, text=True,
     ).stdout
-
-
-def _lane_admin_dir(lane: Path) -> Path:
-    """Parse the ``.git/worktrees/<name>`` admin dir path out of a lane's
-    ``.git`` pointer file (``gitdir: <repo>/.git/worktrees/<name>``)."""
-    content = (lane / '.git').read_text().strip()
-    prefix = 'gitdir:'
-    assert content.startswith(prefix), f'unexpected worktree .git pointer: {content!r}'
-    return Path(content[len(prefix):].strip())
-
-
-def _registered_paths(repo: Path) -> set[str]:
-    porcelain = _git(repo, 'worktree', 'list', '--porcelain')
-    return {
-        str(Path(line[len('worktree '):]).resolve())
-        for line in porcelain.splitlines()
-        if line.startswith('worktree ')
-    }
 
 
 @pytest.fixture
@@ -79,14 +64,15 @@ def git_ops(git_config: GitConfig, git_repo: Path) -> GitOps:
     return GitOps(git_config, git_repo)
 
 
-async def _plant_locked_dangling_entry(git_ops: GitOps) -> tuple[Path, Path]:
-    """Reproduce the incident: a real ``_merge-*`` registration whose admin
-    entry carries git's interrupted-``worktree add`` lock and whose tree is
-    gone. Returns ``(worktree_path, admin_dir)``."""
+async def _plant_dangling_entry(git_ops: GitOps, *, locked: bool) -> tuple[Path, Path]:
+    """A real ``_merge-*`` registration whose tree is gone. *locked* adds git's
+    interrupted-``worktree add`` lock, reproducing the incident. Returns
+    ``(worktree_path, admin_dir)``."""
     head = _git(git_ops.project_root, 'rev-parse', 'HEAD').strip()
     wt = await git_ops.create_throwaway_verify_worktree(head)
-    admin = _lane_admin_dir(wt)
-    (admin / 'locked').write_text('initializing')
+    admin = lane_admin_dir(wt)
+    if locked:
+        (admin / 'locked').write_text('initializing')
     shutil.rmtree(wt)
     return wt, admin
 
@@ -96,9 +82,9 @@ class TestLockedDanglingEntryDoesNotPoisonMergeEnumeration:
     async def test_precondition_git_keeps_the_entry_and_prune_skips_it(
         self, git_ops: GitOps, git_repo: Path,
     ):
-        wt, _ = await _plant_locked_dangling_entry(git_ops)
+        wt, _ = await _plant_dangling_entry(git_ops, locked=True)
 
-        assert str(wt.resolve()) in _registered_paths(git_repo), (
+        assert str(wt.resolve()) in registered_worktree_paths(git_repo), (
             'git must keep listing a locked registration whose tree is gone'
         )
         dry_run = _git(git_repo, 'worktree', 'prune', '--dry-run', '-v')
@@ -109,7 +95,7 @@ class TestLockedDanglingEntryDoesNotPoisonMergeEnumeration:
     async def test_find_inflight_skips_the_dangling_entry_with_a_warning(
         self, git_ops: GitOps, caplog,
     ):
-        wt, _ = await _plant_locked_dangling_entry(git_ops)
+        wt, _ = await _plant_dangling_entry(git_ops, locked=True)
 
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
             found = await git_ops.find_inflight_merge_worktree('some-branch')
@@ -123,7 +109,7 @@ class TestLockedDanglingEntryDoesNotPoisonMergeEnumeration:
     async def test_merge_request_enqueue_succeeds_with_the_entry_present(
         self, git_ops: GitOps, git_repo: Path, git_config: GitConfig,
     ):
-        wt, _ = await _plant_locked_dangling_entry(git_ops)
+        wt, _ = await _plant_dangling_entry(git_ops, locked=True)
         config = OrchestratorConfig(project_root=git_repo, git=git_config)
         req = MergeRequest(
             task_id='7001',
@@ -156,12 +142,12 @@ class TestPruneReclaimsLockedDanglingEntries:
     async def test_locked_dangling_entry_under_worktree_base_is_reclaimed(
         self, git_ops: GitOps, git_repo: Path, caplog,
     ):
-        wt, admin = await _plant_locked_dangling_entry(git_ops)
+        wt, admin = await _plant_dangling_entry(git_ops, locked=True)
 
         await git_ops.prune_worktrees()
 
         assert not admin.exists(), 'the locked, tree-gone admin entry must be reclaimed'
-        assert str(wt.resolve()) not in _registered_paths(git_repo)
+        assert str(wt.resolve()) not in registered_worktree_paths(git_repo)
 
         caplog.clear()
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
@@ -175,25 +161,23 @@ class TestPruneReclaimsLockedDanglingEntries:
     ):
         head = _git(git_repo, 'rev-parse', 'HEAD').strip()
         wt = await git_ops.create_throwaway_verify_worktree(head)
-        admin = _lane_admin_dir(wt)
+        admin = lane_admin_dir(wt)
         (admin / 'locked').write_text('initializing')
 
         await git_ops.prune_worktrees()
 
         assert wt.is_dir()
         assert (admin / 'locked').read_text() == 'initializing'
-        assert str(wt.resolve()) in _registered_paths(git_repo)
+        assert str(wt.resolve()) in registered_worktree_paths(git_repo)
 
     async def test_unlocked_dangling_entry_is_still_pruned(
         self, git_ops: GitOps, git_repo: Path,
     ):
-        head = _git(git_repo, 'rev-parse', 'HEAD').strip()
-        wt = await git_ops.create_throwaway_verify_worktree(head)
-        shutil.rmtree(wt)
+        wt, _ = await _plant_dangling_entry(git_ops, locked=False)
 
         await git_ops.prune_worktrees()
 
-        assert str(wt.resolve()) not in _registered_paths(git_repo)
+        assert str(wt.resolve()) not in registered_worktree_paths(git_repo)
 
     async def test_locked_dangling_entry_outside_worktree_base_keeps_its_lock(
         self, git_ops: GitOps, git_repo: Path, tmp_path: Path,
@@ -205,12 +189,12 @@ class TestPruneReclaimsLockedDanglingEntries:
         portable = tmp_path / 'portable'
         _git(git_repo, 'worktree', 'add', '--detach', str(portable), 'HEAD')
         _git(git_repo, 'worktree', 'lock', '--reason', 'usb drive', str(portable))
-        admin = _lane_admin_dir(portable)
+        admin = lane_admin_dir(portable)
         shutil.rmtree(portable)
 
         await git_ops.prune_worktrees()
 
-        assert str(portable.resolve()) in _registered_paths(git_repo)
+        assert str(portable.resolve()) in registered_worktree_paths(git_repo)
         assert (admin / 'locked').exists()
 
     async def test_pool_storage_refusal_leaves_the_lock_in_place(
@@ -219,7 +203,7 @@ class TestPruneReclaimsLockedDanglingEntries:
         """An unmounted ``worktree_base`` makes every lane look dangling, so
         an unlock outside the task-2099 refusal gate would hand the next
         prune a wholesale wipe of every registration."""
-        wt, admin = await _plant_locked_dangling_entry(git_ops)
+        wt, admin = await _plant_dangling_entry(git_ops, locked=True)
         git_ops.warm_lane_pool = WarmLanePool(worktree_base=git_ops.worktree_base, size=1)
         assert git_ops.pool_in_use()
         assert not git_ops.pool_storage_present()
@@ -227,4 +211,22 @@ class TestPruneReclaimsLockedDanglingEntries:
         await git_ops.prune_worktrees()
 
         assert (admin / 'locked').exists()
-        assert str(wt.resolve()) in _registered_paths(git_repo)
+        assert str(wt.resolve()) in registered_worktree_paths(git_repo)
+
+
+@pytest.mark.asyncio
+class TestPruneStaleMergeWorktreesReclaimsAbsentEntries:
+    """No other sweep runs here, so the disk-pressure sweep must reclaim the
+    registration by itself."""
+
+    @pytest.mark.parametrize('locked', [False, True], ids=['unlocked', 'locked'])
+    async def test_absent_registration_is_removed(
+        self, git_ops: GitOps, git_repo: Path, locked: bool,
+    ):
+        wt, admin = await _plant_dangling_entry(git_ops, locked=locked)
+
+        removed = await git_ops.prune_stale_merge_worktrees()
+
+        assert [Path(p).resolve() for p in removed] == [wt.resolve()]
+        assert not admin.exists()
+        assert str(wt.resolve()) not in registered_worktree_paths(git_repo)

@@ -33,6 +33,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+from _worktree_registrations import lane_admin_dir, registered_worktree_paths
 
 from orchestrator.config import GitConfig
 from orchestrator.git_ops import GitOps, _run
@@ -87,25 +88,6 @@ def git_ops(git_repo: Path) -> GitOps:
 async def _make_ephemeral_worktree(git_ops: GitOps) -> Path:
     """Build a real ephemeral ``_merge-<uuid>`` worktree at the repo's HEAD."""
     return await git_ops.create_throwaway_verify_worktree(await _head_sha(git_ops.project_root))
-
-
-def _lane_admin_dir(lane: Path) -> Path:
-    """Parse the ``.git/worktrees/<name>`` admin dir path out of a lane's
-    ``.git`` pointer file (``gitdir: <repo>/.git/worktrees/<name>``)."""
-    content = (lane / '.git').read_text().strip()
-    prefix = 'gitdir:'
-    assert content.startswith(prefix), f'unexpected worktree .git pointer: {content!r}'
-    return Path(content[len(prefix):].strip())
-
-
-async def _registered_paths(repo: Path) -> set[str]:
-    rc, out, err = await _run(['git', 'worktree', 'list', '--porcelain'], cwd=repo)
-    assert rc == 0, err
-    return {
-        str(Path(line[len('worktree '):]).resolve())
-        for line in out.splitlines()
-        if line.startswith('worktree ')
-    }
 
 
 def _raise_enospc(*_a, **_k):
@@ -576,7 +558,7 @@ async def _make_locked_ephemeral_worktree(git_ops: GitOps) -> tuple[Path, Path]:
     """A real ``_merge-*`` worktree whose admin entry carries git's own
     interrupted-``worktree add`` lock. Returns ``(worktree, admin_dir)``."""
     wt = await _make_ephemeral_worktree(git_ops)
-    admin = _lane_admin_dir(wt)
+    admin = lane_admin_dir(wt)
     (admin / 'locked').write_text('initializing')
     return wt, admin
 
@@ -597,20 +579,19 @@ class TestRemoveLockedMergeWorktree:
         assert outcome == 'removed'
         assert not wt.exists()
         assert not admin.exists(), 'the locked admin entry must go with its tree'
-        assert str(wt.resolve()) not in await _registered_paths(git_repo)
+        assert str(wt.resolve()) not in registered_worktree_paths(git_repo)
 
     async def test_cleanup_merge_worktree_on_a_locked_tree_leaves_no_registration(
         self, git_ops: GitOps, git_repo: Path,
     ):
-        """A 'failed' here sends the tree to cleanup's rmtree fallback, after
-        which the prune cannot reclaim the locked entry: the tree-gone,
-        entry-present state that failed every merge_request enqueue."""
+        """The tree-gone, entry-present state this rules out failed every
+        merge_request enqueue."""
         wt, _ = await _make_locked_ephemeral_worktree(git_ops)
 
         await git_ops.cleanup_merge_worktree(wt)
 
         assert not wt.exists()
-        assert str(wt.resolve()) not in await _registered_paths(git_repo), (
+        assert str(wt.resolve()) not in registered_worktree_paths(git_repo), (
             'cleanup must not leave a registration for the removed tree'
         )
 
@@ -619,7 +600,7 @@ class TestRemoveLockedMergeWorktree:
         of ``--force`` flags overrides 'not a working tree', so overriding
         the lock must not widen what the primitive removes."""
         wt = await _make_ephemeral_worktree(git_ops)
-        shutil.rmtree(_lane_admin_dir(wt))
+        shutil.rmtree(lane_admin_dir(wt))
 
         outcome = await git_ops.remove_merge_worktree_guarded(wt, reason='test')
 
