@@ -10,7 +10,9 @@ Covers:
   * the bookkeeping a bounce leaves behind — the per-branch bounce count,
     the untouched enqueue time, the ``needs_rebase`` log line, and the
     ``get_main_sha`` fail-open — read off ``SuffixConflictTracker``'s own
-    public state.
+    public state;
+  * bounce escalations stay signature-distinct, so they never walk
+    ``workflow.py``'s ``consecutive_merge_thrash`` ladder (task 3910).
 
 Task 5030 (PRD ``plans/merge-lane-quality-prd.md`` task γ7) replaced this
 file's drive mechanism. Every test here used to reach into the worker: it
@@ -52,6 +54,7 @@ from unittest.mock import AsyncMock
 import pytest
 from _merge_lane_fakes import FakeVerifier, hangs_until
 from _orch_helpers import wait_responsive
+from shared.task_metadata import RetryLedger
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -65,6 +68,7 @@ from orchestrator.merge_queue import (
 )
 from orchestrator.merge_types import QueuedBranch
 from orchestrator.suffix_graph import SuffixConflictGraph, SuffixConflictTracker
+from orchestrator.workflow import _evaluate_merge_thrash
 
 _STOP_TIMEOUT = 30.0
 
@@ -275,6 +279,68 @@ def _conflicting(req: MergeRequest) -> SuffixConflictGraph:
         footprint_edges=frozenset(),
         conflicts_with_main=frozenset({req.request_id}),
     )
+
+
+async def _escalate_at_tracker(
+    tracker: SuffixConflictTracker,
+    buffers: dict[str, collections.deque],
+    req: MergeRequest,
+) -> MergeOutcome:
+    """Queue *req*, mark it conflicting, bounce it, and return its escalation."""
+    buffers['normal'].append(req)
+    tracker.graph = _conflicting(req)
+    tracker.signature = ((req.request_id,), 'abc123')
+    await tracker.bounce_conflicting_suffix_items()
+    assert req.result.done(), f'{req.request_id} was not escalated'
+    assert req not in buffers['normal'], f'{req.request_id} stayed queued'
+    return req.result.result()
+
+
+def _resubmission(req: MergeRequest) -> MergeRequest:
+    """A fresh request for *req*'s branch, as the post-steward resubmission is.
+
+    Built field by field rather than with ``dataclasses.replace``, which would
+    copy ``request_id``: a resubmission is a new request with a new identity.
+    """
+    return MergeRequest(
+        task_id=req.task_id,
+        branch=req.branch,
+        worktree=req.worktree,
+        pre_rebased=req.pre_rebased,
+        task_files=req.task_files,
+        module_configs=req.module_configs,
+        config=req.config,
+        result=asyncio.get_running_loop().create_future(),
+        lane=req.lane,
+    )
+
+
+# ── Helpers: workflow.py's merge-thrash ladder ───────────────────────────────
+
+
+def _signature(outcome: MergeOutcome) -> str:
+    """The ladder key workflow.py computes for a blocked *outcome*."""
+    return RetryLedger.compute_merge_outcome_signature(
+        outcome.failure_category, outcome.failure_cause_hint, outcome.reason,
+    )
+
+
+def _fold_through_thrash_ladder(
+    outcomes: list[MergeOutcome], threshold: int,
+) -> tuple[RetryLedger, list[bool]]:
+    """Feed *outcomes*, in order, through workflow.py's shipped ladder.
+
+    Returns the final ledger and each step's escalate flag.
+    """
+    ledger = RetryLedger()
+    escalations: list[bool] = []
+    for outcome in outcomes:
+        verdict = _evaluate_merge_thrash(
+            ledger, ledger.last_merge_outcome_signature, _signature(outcome), threshold,
+        )
+        ledger = verdict.ledger
+        escalations.append(verdict.escalate)
+    return ledger, escalations
 
 
 # ── The bounce primitives ────────────────────────────────────────────────────
@@ -586,3 +652,125 @@ class TestBounceBookkeeping:
         assert any('get_main_sha' in r.message for r in caplog.records), (
             'expected a warning naming get_main_sha but none was logged'
         )
+
+
+# ── Bounce escalations and workflow.py's merge-thrash ladder ─────────────────
+
+
+_DISTINCTNESS_FAILURE = (
+    'task 3910: bounce escalations must never render an invariant reason -- '
+    'with no failure_category/failure_cause_hint the ladder keys on the reason '
+    'alone, so two bounces of one branch hash identically and '
+    'consecutive_merge_thrash walks to a false L1'
+)
+
+
+class TestBounceEscalationsNeverFeedTheThrashLadder:
+    """Task 3910: a bounce escalation must not look like a repeated failure.
+
+    The incident shape (tasks 3763/3404/3764/5031/5237/5099): one branch is
+    bounced twice against one frozen tip, 2.5s to 12min apart.  Each
+    escalation rides workflow.py's ordinary blocked path, both render the
+    same reason, the merge-outcome signature repeats, and
+    ``consecutive_merge_thrash`` reaches its threshold of 2 -- a false L1 for
+    what is a fresh collision each time.
+
+    Every outcome here is folded through the SHIPPED ``_evaluate_merge_thrash``
+    at the SHIPPED ``max_consecutive_merge_thrash``; the control proves that
+    fold escalates on genuinely identical input.
+    """
+
+    def test_identical_outcomes_reach_the_threshold(
+        self, config: OrchestratorConfig,
+    ) -> None:
+        """CONTROL: the fold is not inert -- a repeated outcome does escalate."""
+        threshold = config.max_consecutive_merge_thrash
+        repeated = MergeOutcome('blocked', reason=f'{NEEDS_REBASE_REASON_PREFIX}: x')
+
+        ledger, escalations = _fold_through_thrash_ladder(
+            [repeated] * threshold, threshold,
+        )
+
+        assert ledger.consecutive_merge_thrash == threshold
+        assert escalations[-1] is True
+
+    @pytest.mark.asyncio
+    async def test_two_real_conflict_escalations_of_one_branch_are_signature_distinct(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """Two real-conflict escalations of one branch, one tip: distinct keys."""
+        frozen_tip = 'deadbeefcafe3910'
+        buffers = {'high': collections.deque(), 'normal': collections.deque()}
+        tracker = _make_tracker(git_ops, lane_buffers=buffers, frozen_tip=frozen_tip)
+        git_ops.rebase_onto_main = AsyncMock(return_value=False)  # type: ignore[method-assign]
+
+        o1 = await _escalate_at_tracker(
+            tracker, buffers, _make_req('591', '591', config, git_repo),
+        )
+        o2 = await _escalate_at_tracker(
+            tracker, buffers, _make_req('591', '591', config, git_repo),
+        )
+
+        for outcome in (o1, o2):
+            assert outcome.status == 'blocked', outcome
+            assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX), outcome.reason
+            assert frozen_tip in outcome.reason, outcome.reason
+            assert 'real rebase conflict' in outcome.reason, outcome.reason
+            assert outcome.failure_category == '', (
+                'a constant failure_category would collapse every bounce onto '
+                f'one signature; got {outcome.failure_category!r}'
+            )
+        assert _signature(o1) != _signature(o2), (
+            f'{_DISTINCTNESS_FAILURE}; reasons: {o1.reason!r} / {o2.reason!r}'
+        )
+
+        ledger, escalations = _fold_through_thrash_ladder(
+            [o1, o2], config.max_consecutive_merge_thrash,
+        )
+        assert not any(escalations), escalations
+        assert ledger.consecutive_merge_thrash == 1
+
+    @pytest.mark.asyncio
+    async def test_two_lane_bounces_of_one_branch_against_one_frozen_tip_do_not_thrash(
+        self, git_ops: GitOps, config: OrchestratorConfig,
+    ) -> None:
+        """The incident end to end: submit, bounce, resubmit, bounce again."""
+        release = asyncio.Event()
+        verifier = FakeVerifier(scripts={'frozen-a': hangs_until(release)})
+        async with _running_lane(git_ops, verifier) as (lane, queue):
+            frozen = await _prepare(
+                git_ops, config, 'frozen-a', 'shared.txt', 'line1\nFROZEN-LINE2\nline3\n',
+            )
+            suffix = await _prepare(
+                git_ops, config, 'suffix-b', 'shared.txt', 'line1\nSUFFIX-LINE2\nline3\n',
+            )
+
+            try:
+                await queue.put(frozen)
+                tip = await _await_frozen_tip(lane)
+
+                await queue.put(suffix)
+                o1 = await wait_responsive(suffix.result, label='first bounce')
+                resubmitted = _resubmission(suffix)
+                await queue.put(resubmitted)
+                o2 = await wait_responsive(resubmitted.result, label='second bounce')
+
+                for outcome in (o1, o2):
+                    assert outcome.status == 'blocked', outcome
+                    assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX), (
+                        outcome.reason
+                    )
+                    assert tip in outcome.reason, (
+                        f'both rounds must bounce off the same frozen tip {tip!r}; '
+                        f'got {outcome.reason!r}'
+                    )
+                assert _signature(o1) != _signature(o2), (
+                    f'{_DISTINCTNESS_FAILURE}; reasons: {o1.reason!r} / {o2.reason!r}'
+                )
+                _, escalations = _fold_through_thrash_ladder(
+                    [o1, o2], config.max_consecutive_merge_thrash,
+                )
+                assert not any(escalations), escalations
+                assert 'suffix-b' not in verifier.verified, verifier.verified
+            finally:
+                release.set()
