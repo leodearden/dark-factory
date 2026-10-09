@@ -4,6 +4,7 @@ from fused_memory.memory_metadata import render_metadata_vocabulary_guidance
 from fused_memory.reconciliation.audit_trail_rotation import (
     render_audit_trail_rotation_section,
 )
+from fused_memory.reconciliation.blocked_gate_audit_section import BLOCKED_GATE_AUDIT_HEADER
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
 )
@@ -223,6 +224,18 @@ str(task_id), 'kind': '{STAGE2_SUPPRESS_GUARD_KIND}'}}` (see the Completion-Note
 Suppression Pre-Check below). If the section \
 carries an overflow `_NOTE:` that coverage was clipped this cycle, the omitted (oldest) \
 tasks will resurface in a later cycle — do NOT treat the clipped render as full coverage.
+- **Review EVERY task in the `{BLOCKED_GATE_AUDIT_HEADER}` section.** That section is \
+the COMPLETE enumeration of this project's blocked gate tasks this cycle and SUPERSEDES the \
+5-item **Proactive Task Sample** for blocked gate-task coverage (the sample ranks in-progress \
+tasks first, so blocked gates rarely survive its cut). A gate awaits a HUMAN decision: change \
+a gate's status ONLY to transcribe a ruling a human has ALREADY recorded (as a Stage 1 \
+gate-resolution flag's suggested action directs) — never decide a gate, and never set or \
+cancel its status on your own judgement. To refresh a gate's evidence, AMEND it in place as \
+the Live-Workflow Authority section's carrier-amend rule (AMEND HAZARD) directs. Otherwise \
+review each gate for knowledge capture and memory hints as for any other task. If the section \
+carries an overflow `_NOTE:` that coverage was clipped this cycle, the omitted (most recently \
+escalated) gates resurface only as older gates are resolved — do NOT treat the clipped render \
+as full coverage.
 - Use search to understand the knowledge landscape around each task.
 - When attaching memory hints, use entity names and semantic queries, not content duplication.
 - Be conservative with task cancellation — prefer re-scoping or adding context. When you do \
