@@ -40,6 +40,7 @@ from legibility import (
     session_runner,
     trickle_state,
     unlanded,
+    verdict,
 )
 from shared.cap_markers import (
     BLOCKING_BANNER_MARKERS,
@@ -7604,6 +7605,90 @@ def test_verify_prompt_requests_the_remediation_key(tmp_path):
     fake_invoke = _make_fake_invoke(default=_verdict())
     mod._build_default_verify_fn(str(tmp_path), fake_invoke)(_clusters(1), model="sonnet")
     assert '"remediation"' in fake_invoke.calls[0]["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# task 6401 step-7: RED — the default verifier parses every reply into a
+# typed verdict.Verdict (plans/census-incremental-prd.md §4.4 C4) and logs
+# each normalisation it needed.
+# ---------------------------------------------------------------------------
+
+_GUIDE_REMEDIATION = {"path": "docs/guide.md", "change": "Document X"}
+
+
+def _c4_reply(**overrides):
+    reply = {
+        "verified": True,
+        "reason": "r",
+        "anchor": "docs/guide.md",
+        "tags": ["h11"],
+        "severity": "high",
+        "severity_reason": "the next edit to the guide repeats it",
+        "route": "mechanical",
+        "remediation": _GUIDE_REMEDIATION,
+    }
+    reply.update(overrides)
+    return json.dumps(reply)
+
+
+def test_default_verify_fn_attaches_the_parsed_verdict_to_a_verified_cluster(tmp_path):
+    [cluster] = _verify_one(_tree_with_guide(tmp_path), _c4_reply())["verified"]
+
+    v = cluster["verdict"]
+    assert isinstance(v, verdict.Verdict)
+    assert v.severity == "high"
+    assert v.tags == ("h11", "kind:confusion")
+    assert v.anchor == "docs/guide.md"
+    assert v.remediation is not None
+    assert cluster["remediation"] == v.remediation.to_record()
+
+
+def test_default_verify_fn_attaches_the_parsed_verdict_to_a_refuted_cluster(tmp_path):
+    result = _verify_one(_tree_with_guide(tmp_path), _c4_reply(verified=False))
+
+    assert result["verified"] == []
+    [cluster] = result["rejected"]
+    assert isinstance(cluster["verdict"], verdict.Verdict)
+    assert cluster["verdict"].verified is False
+    assert "remediation" not in cluster
+
+
+def test_default_verify_fn_rejects_a_parsed_reply_that_is_no_verdict_without_a_probe(
+    tmp_path, caplog,
+):
+    reply = json.dumps({"verified": "yes", "reason": REAL_CLI_CAP_MESSAGES[0]})
+    probe = _make_recording_probe(mod.HeadroomResult(ok=False, reason="must never be consulted"))
+    verify_fn = mod._build_default_verify_fn(
+        str(_tree_with_guide(tmp_path)), lambda prompt, model: reply, headroom_probe=probe,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="legibility.census"):
+        result = verify_fn([{"title": _REMEDIATED_TITLE}], model="sonnet")
+
+    assert result["verified"] == []
+    assert result["rejected"] == [{"title": _REMEDIATED_TITLE}]
+    assert probe.calls == []
+    assert any(
+        _REMEDIATED_TITLE in record.getMessage() and "verified" in record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    )
+
+
+def test_default_verify_fn_logs_one_warning_per_verdict_normalisation(tmp_path, caplog):
+    reply = _c4_reply(severity="critical", tags=["h11", "bogus"])
+
+    with caplog.at_level(logging.WARNING, logger="legibility.census"):
+        _verify_one(_tree_with_guide(tmp_path), reply)
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and record.name == "legibility.census"
+    ]
+    for kind, offered in (("tag_dropped", "'bogus'"), ("severity_substituted", "'critical'")):
+        naming = [m for m in messages if _REMEDIATED_TITLE in m and kind in m and offered in m]
+        assert len(naming) == 1, (kind, messages)
 
 
 # ---------------------------------------------------------------------------
