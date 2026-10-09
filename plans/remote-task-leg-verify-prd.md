@@ -1,6 +1,6 @@
 # Remote task-leg verifies: a `TaskVerifySpec` transport and a host pool shared by the merge lane and the task leg
 
-**Status:** authored 2026-10-09 (`/team --fable` + `/prd` author mode, unattended; brief `~/.claude/spawn-briefs/remote-task-leg-verify-prd-2026-10-09.md`, item 12 of `plans/verify-rate-improvement-2026-10-09/MEMO.md`; three code-reader seats and one fable critic pass whose 21 findings are folded in). Not yet decomposed.
+**Status:** authored 2026-10-09 (`/team --fable` + `/prd` author mode, unattended; brief `~/.claude/spawn-briefs/remote-task-leg-verify-prd-2026-10-09.md`, item 12 of `plans/verify-rate-improvement-2026-10-09/MEMO.md`; three code-reader seats and one fable critic pass whose 21 findings are folded in). Decomposed 2026-10-09 into tasks 6667–6674 plus reify:8430; see §14, which re-scopes γ, δ1 and δ2 and adds one serialising edge.
 **Type:** extension of the shipped multi-host merge-verify lever (Lever C, `plans/concurrent-merge-verify-prd.md`, `plans/merge-lane-throughput-prd.md` D1/D2) to the task role, plus one new ownership seam (a harness-owned host allocator).
 **Approach:** B+H. G5 applies on every count: two seams (transport and allocation), five hub files (`config.py`, `workflow.py`, `harness.py`, `merge_lane/worker.py`, `verify_runner.py`), three consumers of the allocator (merge dispatch, drift check, task leg), and a strand class Leo ranks first (a false red in the VERIFY phase drives the debugger).
 **Code anchors** verified against main `00725ff2b6` (2026-10-09). Main moves fast — cite-by-symbol; re-locate at implementation time.
@@ -181,9 +181,16 @@ class TaskVerifyPort(Protocol):
     async def __call__(self, worktree, config, module_configs, task_files=None, *, attempt_id, task_id, archive_root, force_workspace, role='task', event_store=None) -> VerifyResult
     # exactly run_scoped_verification's call shape at the workflow site
 
+@dataclass(frozen=True)
+class TaskVerifyPolicy:       # decompose 2026-10-09 (§14): γ's value; δ2's config-backed reader builds it
+    host_policy: Literal['local', 'remote_modules', 'remote_all']; remote_modules: tuple[str, ...]
+    cross_check_every_n: int; red_confirms_locally: bool
+
 class TaskVerifyDispatcher:   # satisfies TaskVerifyPort
-    def __init__(self, pool: HostPool, git_ops: GitOps, *, run_local: TaskVerifyPort = run_scoped_verification) -> None
+    def __init__(self, pool: HostPool, git_ops: GitOps, *, policy_of: Callable[[OrchestratorConfig], TaskVerifyPolicy],
+                 run_local: TaskVerifyPort = run_scoped_verification) -> None
     async def __call__(...) -> VerifyResult
+    def decision_for(self, task_id: str, attempt_id: int) -> DispatchDecision | None   # keyed, never a shared "last" slot
 
 @dataclass(frozen=True)
 class DispatchDecision:
@@ -192,16 +199,16 @@ class DispatchDecision:
     tip_sha: str | None; base_sha: str | None; remote_wall_secs: float | None; lease_held_secs: float | None
     cross_check: CrossCheck | None; red_confirmed_locally: RedConfirmation | None
 
-def eligible(config, executed_prefixes: Iterable[str], *, force_workspace, per_module_env_present: bool) -> bool   # pure; the static leg class
+def eligible(policy: TaskVerifyPolicy, executed_prefixes: Iterable[str], *, force_workspace, per_module_env_present: bool) -> bool   # pure; the static leg class
 ```
 
-Ordering, as in §4.7, inside one `try/finally` that releases the lease on every exit. The dispatcher writes its own sidecar `attempt-N.dispatch-<stamp>.json` under `archive_root/<task_id>/` (nothing when policy is `local`); it never edits files other modules write. `config` is read per call (hot-reloaded policy reaches the next dispatch, never a running one).
+Ordering, as in §4.7, inside one `try/finally` that releases the lease on every exit. The dispatcher writes its own sidecar `attempt-N.dispatch-<stamp>.json` under `archive_root/<task_id>/` (nothing when policy is `local`); it never edits files other modules write. The policy is read per call, as `policy_of(config)` on that call's `config`, so a hot-reloaded policy reaches the next dispatch and never a running one.
 
 ### 5.6 Workflow, worker, harness seams
 
-- `TaskWorkflow.__init__(..., *, task_verify: TaskVerifyPort | None = None)`, forwarded by `build_workflow`. `_run_scoped_verification_with_infra_retry` calls `self._task_verify or run_scoped_verification` with the unchanged argument list, still inside `git_ops.task_verify_lease` (the lane lease keeps warm-lane GC off the workstation worktree the workflow still uses). After `_verify_debugfix_loop` returns DONE, `_verify_green_runner` is read from the last `DispatchDecision` and emitted on `workflow_verify` as `runner` (through 5409's `emit_workflow_verify` if it has landed; readers ignore unknown keys).
+- `TaskWorkflow.__init__(..., *, task_verify: TaskVerifyPort | None = None)`, forwarded by `build_workflow`. `_run_scoped_verification_with_infra_retry` calls `self._task_verify or run_scoped_verification` with the unchanged argument list, still inside `git_ops.task_verify_lease` (the lane lease keeps warm-lane GC off the workstation worktree the workflow still uses). After `_verify_debugfix_loop` returns DONE, `_verify_green_runner` is read from the dispatcher's `decision_for(task_id, attempt_id)` (`'local'` when none) and emitted on `workflow_verify` as `runner` (through 5409's `emit_workflow_verify` if it has landed; readers ignore unknown keys).
 - `SpeculativeMergeWorker.__init__(..., host_allocator: HostAllocator | None = None, runner_quarantine: set[str] | None = None, host_holder_reader: Callable[[], Mapping[str, str]] | None = None)`; `merge_lane_wants_host() -> bool`; `note_runner_unavailable(name, reason)` and `note_runner_recovered(name)` (public names over the existing `_quarantine_unreachable_host` / `_record_runner_recovered` tracker paths); `_host_states_block` adds `held_by`.
-- `Harness.__init__` owns `_runner_quarantine`, `_host_allocator` (via `build_remote_runners`), `_host_pool` and `_task_verify_dispatcher` for the process lifetime; `_start_merge_worker` injects the allocator and set into each worker it builds; `merge_demand` and the two hooks resolve `self._merge_worker` lazily (no worker → `False` / no-op). `build_workflow(..., task_verify=self._task_verify_dispatcher)`. When `enabled_verify_runners` is empty, `acquire_for_task` always returns `Refusal('no_host')` and every eligible verify runs local.
+- `Harness.__init__` owns `_runner_quarantine`, `_host_allocator` (via `build_remote_runners`), `_host_pool` and `_task_verify_dispatcher` for the process lifetime; `_start_merge_worker` injects the allocator and set into each worker it builds; `merge_demand` and the two hooks resolve `self._merge_worker` lazily (no worker → `False` / no-op). `build_workflow(..., task_verify=self._task_verify_dispatcher)`. When `enabled_verify_runners` is empty, `acquire_for_task` always returns `Refusal('no_host')` and every eligible verify runs local. (Decompose split, §14: δ1 builds the quarantine set, allocator and pool; δ2 builds `_task_verify_dispatcher` with `policy_of=policy_from_config` and adds the `task_verify=` argument at the harness `build_workflow` call.)
 
 ### 5.7 Config (`config.py`, green tier unless stated)
 
@@ -300,7 +307,7 @@ Sizes follow the overlay bands. Labels are Greek; ids are assigned at decompose.
 - **η — Binary pressure hold for task legs (HUB: `config.py`; hand-carry).** [~300 LOC; `verify_hosts.py` (probe loop, `PressureReading`), `task_verify_dispatch.py`, `config.py`, tests]. Filed `deferred` with an `x_deferral` naming ε's report as its flip condition; ε step 6 is the only thing that flips it. Signal: with threshold 60 and a cached reading of 70 younger than `max_age_secs`, `acquire_for_task` returns `Refusal('pressure_hold')` and the verify runs local; a reading older than `max_age_secs` yields no hold and `pressure_hold_stale` in the sidecar; merge dispatch never consults the reading.
 - **Companion corrections (filed at decompose as amendments, not leaves):** amend 6106 per §8; note on 6127 that the task spec already carries the preprovision command; note on 5651/5409 that `workflow_verify.runner` is added by δ2; file the reify adoption task on reify with an external dependency on `dark_factory:ε`.
 
-Dependency DAG: α → β; α → γ; γ → δ1 → δ2 (δ2 also ← 6580); β, γ, δ2 → ι; ι, 6565, 6127, 3310, 6648, 6580 → ε; η deferred, flipped by ε step 6 (no status edge).
+Dependency DAG: α → β; α → γ; γ → δ1 → δ2 (δ2 also ← 6580); β, γ, δ2 → ι; ι, 6565, 6127, 3310, 6648, 6580 → ε; η deferred, flipped by ε step 6 (no status edge). Decompose added β → γ and ι → η; §14 gives the reasons.
 
 ## 10. G7 walk (advisory, author mode)
 
@@ -330,3 +337,65 @@ Dependency DAG: α → β; α → γ; γ → δ1 → δ2 (δ2 also ← 6580); β
 ## 13. META check
 
 If decomposed and queued without further oversight: every mechanism has a named consumer (the dispatcher consumes the spec, transport and pool; the workflow consumes the dispatcher; the merge lane consumes the injected allocator unchanged); every leaf names an executable signal that is load-independent; the substrate was verified symbol by symbol; the two seams are contracted with signatures and invariants and faced by twenty-five boundary scenarios one gate executes; the hub carries are two chained stages with their ratchet and tripwire costs named; the rulings against host-wide admission and load-derived counts are honoured by construction; and the rollout is a measured, reversible config flip gated on the four prerequisites that each remove a strand path. Yes.
+
+## 14. Decompose record (2026-10-09)
+
+Decomposed by a sibling `/prd` decompose session against main `f188b4b568`. `orchestrator/src`
+had not changed since the verify SHA `00725ff2b6`. The G1, G3, G4 and G7 re-walks found no
+drift, and every substrate symbol §7 names still exists. Manifest:
+`plans/remote-task-leg-verify-prd.capability-manifest.md`, with its stamped YAML twin beside it.
+
+| Label | Task | Status at filing | Prereqs |
+|---|---|---|---|
+| α | 6667 | pending | — |
+| β | 6668 | pending | α |
+| γ | 6669 | pending | α, β |
+| δ1 | 6670 | pending (hub carry, stage 1) | γ |
+| δ2 | 6671 | pending (hub carry, stage 2) | δ1, 6580 |
+| ι | 6672 | pending | β, γ, δ2 |
+| ε | 6673 | pending (operator gate: execution_class operational) | ι, 6565, 6127, 3310, 6648, 6580 |
+| η | 6674 | **deferred** (`x_deferral` names 6673 step 6) | ι |
+| reify adoption | reify:8430 | pending (operator gate) | external `dark_factory:6673` |
+
+Companion amendments applied in the task store:
+- 6106 was re-scoped to the memory config field and drop-in retirement. Its no-verdict
+  classification moved to α. Its new field must express MemoryHigh as well as MemoryMax and
+  MemorySwapMax, per the 10-09 throttle ruling.
+- 6127 now notes the shared preprovision rule, and that ε depends on it.
+- 5651 and 5409 now note that δ2 adds `runner`. 5651 is told that a remote leg's slot wait
+  belongs to the laptop.
+
+Re-scopes made at decompose. None changes a §4 decision.
+
+1. **γ does not read config keys that δ2 produces.** As written, γ's `eligible(config, …)`
+   read the `verify_task_*` fields, which land in δ2, downstream of γ. That is a
+   producer-downstream G6 fail, and pyright would reject the attribute reads.
+   - γ owns a frozen `TaskVerifyPolicy`.
+   - `eligible()` takes it.
+   - The dispatcher reads it per call via an injected `policy_of(config)` (§5.5 updated).
+   - δ2 adds the keys and `policy_from_config`. It therefore also constructs the dispatcher
+     in `Harness.__init__` and adds `task_verify=` at the harness `build_workflow` call
+     (§5.6 updated). `build_workflow`'s kwarg is δ2's, so that edit could never have been δ1's.
+   - δ1 keeps the quarantine set, the allocator, the pool and the worker injection.
+2. **New edge β → γ.** β (`git_ops.py`), γ (`merge_lane/drift.py`) and δ1 (`worker.py`) each
+   regenerate `orchestrator/tests/merge_lane_ratchet_baseline.json`, and
+   `test_merge_lane_ratchet.py::test_baseline_matches_a_fresh_measurement` demands an exact
+   match. The overlay's same-file rule serialises them, so the chain is α → β → γ → δ1 → δ2.
+   β and γ are no longer parallel.
+3. **Rows split by producer.**
+   - Row 3: transport half α, CLI exit-1 half β.
+   - Rows 9 and 12: hook call γ, RU-tracker half δ1.
+   - Row 13: dispatcher cancel order γ; the workflow `SOFT_CANCELLED` half needs δ2's
+     wiring and is asserted by ι.
+   ι joins all of them.
+4. **Two single homes.**
+   - The `verify-(merge|task)` probe-pattern constant lives in α's `verify_runner.py`.
+   - `runner` is read from `TaskVerifyDispatcher.decision_for(task_id, attempt_id)`, never from
+     a shared "last decision" slot, because up to `max_concurrent_tasks` workflows share one
+     dispatcher.
+5. **ι → η.** η depends on ι, so a premature flip cannot dispatch it before the dispatcher
+   exists. This is not the ε status edge §4.11 forbids.
+
+Delivered checks: 16 mechanical checks (`grep`/`path`) were copied by `commit_planning` onto
+α, β, γ, δ1, δ2 and ι. Each was linted absent on main before filing. ε's and η's checks are
+`manual`.
