@@ -89,8 +89,8 @@ def _addopts_tokens(pyproject_text: str | None) -> list[str] | None:
 
 #: Shell chain operators that terminate one clause of a chained command.
 #: Mirrors ``verify_cmd._CHAIN_OPERATOR_TOKENS`` by value, duplicated rather
-#: than imported to keep this module free of orchestrator imports (see the
-#: module docstring); its one import is the stdlib-only shared mark grammar.
+#: than imported to keep this module free of orchestrator imports; its one
+#: non-stdlib import is the stdlib-only ``shared.pytest_mark_grammar``.
 _CHAIN_OPERATOR_TOKENS = frozenset({'&&', '||', ';', '|'})
 
 

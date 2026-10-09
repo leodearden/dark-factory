@@ -67,6 +67,7 @@ from pathlib import Path
 
 import pytest
 from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
+from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
 
 # This guard sweeps every *.py under orchestrator/tests/ -- 535 files at
 # authorship time -- and ast.parse()s each one; its module-scoped
@@ -82,60 +83,6 @@ from _orch_helpers import WHOLE_TREE_SCAN_TEST_TIMEOUT
 # WHOLE_TREE_SCAN_TEST_TIMEOUT in _orch_helpers.py, and
 # test_whole_tree_scan_timeout_guard.py (task 4215).
 pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)
-
-
-def _marker_name(element: ast.expr) -> str | None:
-    """The marker name in a ``pytest.mark.NAME`` / ``pytest.mark.NAME(...)`` element.
-
-    Mirrors ``shared.pytest_mark_grammar.marker_name`` BY CONSTRUCTION, not
-    by import — see the module docstring's note on the two modules'
-    deliberately opposite fail-safe polarities. Anything else — a bare
-    constant, a local name, an unrelated attribute chain — yields None and is
-    skipped silently, without suppressing its siblings.
-    """
-    if isinstance(element, ast.Call):
-        element = element.func
-    if not isinstance(element, ast.Attribute):
-        return None
-    owner = element.value
-    if (
-        isinstance(owner, ast.Attribute)
-        and owner.attr == 'mark'
-        and isinstance(owner.value, ast.Name)
-        and owner.value.id == 'pytest'
-    ):
-        return element.attr
-    return None
-
-
-def _is_pytestmark_target(node: ast.expr) -> bool:
-    """True iff *node* is the bare name ``pytestmark``."""
-    return isinstance(node, ast.Name) and node.id == 'pytestmark'
-
-
-def _pytestmark_value(statement: ast.stmt) -> ast.expr | None:
-    """The value *statement* binds to ``pytestmark``, else None.
-
-    Covers both the plain ``pytestmark = ...`` and the annotated
-    ``pytestmark: list = ...`` spellings; an annotation with no value binds
-    nothing. Anything other than an ``Assign``/``AnnAssign`` — including
-    every ``ast.expr`` node ``ast.walk`` also yields — falls through to None.
-    """
-    if isinstance(statement, ast.Assign):
-        if any(_is_pytestmark_target(target) for target in statement.targets):
-            return statement.value
-        return None
-    if isinstance(statement, ast.AnnAssign) and _is_pytestmark_target(statement.target):
-        return statement.value
-    return None
-
-
-def _names_from_marker_value(value: ast.expr) -> frozenset[str]:
-    """Accepted value shapes: a bare element, or a list/tuple of elements."""
-    elements = list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
-    return frozenset(
-        name for name in (_marker_name(element) for element in elements) if name is not None
-    )
 
 
 def _applied_marker_names(source: str) -> frozenset[str]:
@@ -166,18 +113,15 @@ def _applied_marker_names(source: str) -> frozenset[str]:
     make a drift guard built on top of this silently vacuous.
     """
     tree = ast.parse(source)
-    names: set[str] = set()
+    elements: list[ast.expr] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
-            for decorator in node.decorator_list:
-                name = _marker_name(decorator)
-                if name is not None:
-                    names.add(name)
+            elements.extend(node.decorator_list)
         elif isinstance(node, ast.Assign | ast.AnnAssign):
-            value = _pytestmark_value(node)
+            value = pytestmark_value(node)
             if value is not None:
-                names |= _names_from_marker_value(value)
-    return frozenset(names)
+                elements.extend(mark_elements(value))
+    return frozenset(name for name in map(marker_name, elements) if name is not None)
 
 
 def _registered_marker_names(ini_lines: Sequence[str]) -> frozenset[str]:
@@ -318,15 +262,15 @@ class TestAppliedMarkerNames:
 
     def test_module_level_pytestmark_annotated_assignment(self):
         """``pytestmark: list = [...]`` — the ``AnnAssign``-with-value
-        spelling ``_pytestmark_value``'s own docstring documents but which no
-        prior case here exercised (reviewer finding, task 3532 amendment
-        pass)."""
+        spelling ``shared.pytest_mark_grammar.pytestmark_value``'s docstring
+        documents but which no prior case here exercised (reviewer finding,
+        task 3532 amendment pass)."""
         source = 'import pytest\n\npytestmark: list = [pytest.mark.slow]\n'
         assert _applied_marker_names(source) == frozenset({'slow'})
 
     def test_module_level_pytestmark_bare_annotation_binds_nothing(self):
         """``pytestmark: list`` with NO value binds nothing — the other
-        ``_pytestmark_value``-documented ``AnnAssign`` case with no prior
+        ``pytestmark_value``-documented ``AnnAssign`` case with no prior
         coverage (reviewer finding, task 3532 amendment pass). This is the
         branch that would silently under-sweep if it ever regressed to
         treating a bare annotation as an applied marker.
@@ -414,55 +358,6 @@ class TestAppliedMarkerNames:
         """
         with pytest.raises(SyntaxError):
             _applied_marker_names('def f(:\n    pass\n')
-
-
-class TestMirrorsPytestMarkGrammarByConstruction:
-    """Cross-checks that ``_marker_name``, ``_is_pytestmark_target`` and
-    ``_pytestmark_value`` above have not silently DRIFTED from the public
-    originals in ``shared.pytest_mark_grammar`` they mirror BY CONSTRUCTION
-    rather than by import (reviewer finding, task 3532 amendment pass).
-
-    The guard's own operation keeps using the local mirrors; the originals are
-    imported LOCALLY, inside each test, for comparison ONLY.  A future fix to
-    the source (e.g. recognising an aliased ``import pytest as _pytest`` -- a
-    gap both modules' docstrings already flag) that lands there without a
-    matching update here is thereby a LOUD, immediate failure rather than a
-    silent divergence.  ``_is_pytestmark_target`` is compared through
-    ``pytestmark_value``, the public function it serves: the shared module
-    keeps that predicate private.
-    """
-
-    @pytest.mark.parametrize('source_expr', [
-        'pytest.mark.slow',
-        'pytest.mark.timeout(120)',
-        'pytest.mark',
-        'other.mark.thing',
-        'functools.wraps(f)',
-        'pytest.raises',
-    ])
-    def test_marker_name_matches_the_source_module(self, source_expr):
-        from shared.pytest_mark_grammar import marker_name as upstream_marker_name
-
-        element = ast.parse(source_expr, mode='eval').body
-        assert _marker_name(element) == upstream_marker_name(element)
-
-    @pytest.mark.parametrize('source', [
-        'pytestmark = pytest.mark.slow\n',
-        'pytestmark: list = [pytest.mark.slow]\n',
-        'pytestmark: list\n',
-        'not_pytestmark = pytest.mark.slow\n',
-        'x = 1\n',
-        'x: int = 1\n',
-    ])
-    def test_pytestmark_value_matches_the_source_module(self, source):
-        from shared.pytest_mark_grammar import pytestmark_value as upstream
-
-        statement = ast.parse(source).body[0]
-        # Both implementations, given the SAME statement object, either
-        # return None or hand back the identical `statement.value` child --
-        # `is`, not `==`, is the precise check (ast nodes have no structural
-        # equality).
-        assert _pytestmark_value(statement) is upstream(statement)
 
 
 class TestUnregisteredMarkers:
