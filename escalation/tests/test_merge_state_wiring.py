@@ -290,12 +290,12 @@ class TestMergeCancelEmitsCancelStates:
             merge_inflight_registry=InFlightMergeRegistry(),
         )
 
-    async def test_no_waiter_miss_returns_unknown_member(self, tmp_path: Path) -> None:
+    async def test_no_waiter_miss_returns_no_record_member(self, tmp_path: Path) -> None:
         result = await call_merge_cancel(_server(tmp_path), request_id='mr-never-seen')
 
         assert result['cancelled'] is False
         _assert_is_member(result['state'], CANCEL_STATES, 'merge_cancel no-waiter miss')
-        assert result['state'] == MergeState.unknown
+        assert result['state'] == MergeState.no_record
 
     async def test_no_waiter_durable_hit_returns_terminal_member(self, tmp_path: Path) -> None:
         server = _server(

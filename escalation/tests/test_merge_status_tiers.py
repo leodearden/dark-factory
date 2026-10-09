@@ -21,7 +21,7 @@ from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from _merge_tool_calls import call_merge_status
+from _merge_tool_calls import call_merge_cancel, call_merge_status
 from orchestrator.config import (  # type: ignore[reportMissingImports]
     GitConfig,
     OrchestratorConfig,
@@ -30,7 +30,7 @@ from orchestrator.event_store import EventStore, EventType  # type: ignore[repor
 from orchestrator.merge_lane.queue_store import (  # type: ignore[reportMissingImports]
     MergeQueueStore,
 )
-from shared.merge_state import OUTCOME_STATES, MergeReason, MergeState
+from shared.merge_state import CANCEL_STATES, OUTCOME_STATES, MergeReason, MergeState
 
 from escalation import git_authority
 from escalation.git_authority import GitAuthorityArm, GitAuthorityOutcome, GitAuthorityVerdict
@@ -466,3 +466,54 @@ class TestAliasResolution:
         assert response['source'] == 'event_store'
         assert response['request_id'] == 'mr-primary'
         assert response['last_outcome']['request_id'] == 'mr-primary'
+
+
+class TestMergeCancelDurableResolution:
+    """merge_cancel with no live waiter reuses merge_status's durable resolution."""
+
+    async def _cancel(self, server: Any, request_id: str) -> dict[str, Any]:
+        response = await call_merge_cancel(server, request_id=request_id)
+        assert response['cancelled'] is False
+        assert response['state'] in CANCEL_STATES
+        assert isinstance(response['reason'], str) and response['reason']
+        return response
+
+    async def test_never_submitted_is_no_record(self, tmp_path: Path) -> None:
+        _, current = _event_stores(tmp_path)
+
+        response = await self._cancel(_server(tmp_path, current), 'mr-never')
+
+        assert response['state'] is MergeState.no_record
+
+    async def test_finalized_in_a_prior_run_is_a_stale_record(self, tmp_path: Path) -> None:
+        prior, current = _event_stores(tmp_path)
+        _finalize(prior, request_id='mr-old', state='conflict')
+
+        response = await self._cancel(_server(tmp_path, current), 'mr-old')
+
+        assert response['state'] is MergeState.stale_record
+
+    async def test_journal_only_is_journaled(self, tmp_path: Path) -> None:
+        _, current = _event_stores(tmp_path)
+        journal = _journal(tmp_path, _journal_entry('mr-j'))
+
+        response = await self._cancel(_server(tmp_path, current, journal=journal), 'mr-j')
+
+        assert response['state'] is MergeState.journaled
+
+    async def test_finalized_this_run_keeps_its_outcome(self, tmp_path: Path) -> None:
+        _, current = _event_stores(tmp_path)
+        _finalize(current, request_id='mr-1', state='conflict')
+
+        response = await self._cancel(_server(tmp_path, current), 'mr-1')
+
+        assert response['state'] is MergeState.conflict
+        assert response['reason'] == 'Request already finalized; cannot cancel.'
+
+    async def test_an_unreadable_journal_is_unknown(self, tmp_path: Path) -> None:
+        _, current = _event_stores(tmp_path)
+        journal = _journal(tmp_path, store_type=_UnreadableJournal)
+
+        response = await self._cancel(_server(tmp_path, current, journal=journal), 'mr-x')
+
+        assert response['state'] is MergeState.unknown

@@ -1772,11 +1772,11 @@ class TestMergeCancel:
             f'done={req.result.done()} cancelled={req.result.cancelled()}'
         )
 
-    async def test_cancel_unknown_request_id_returns_unknown(self, tmp_path: Path):
-        """Cancelling a request_id with no live waiter returns cancelled=False, state='unknown'.
+    async def test_cancel_never_submitted_request_id_returns_no_record(self, tmp_path: Path):
+        """Cancelling a never-submitted request_id returns cancelled=False, state='no_record'.
 
         Fresh server with no submissions.  Call merge_cancel with a random id.
-        Must return a dict (no raise) with cancelled=False, state='unknown', and
+        Must return a dict (no raise) with cancelled=False, state='no_record', and
         a non-empty reason string.
 
         RED until step-4 impl: the current minimal body calls rec.future on a None rec,
@@ -1799,8 +1799,8 @@ class TestMergeCancel:
         assert result.get('cancelled') is False, (
             f"Expected cancelled=False for unknown id, got: {result}"
         )
-        assert result.get('state') == 'unknown', (
-            f"Expected state='unknown' for unknown id, got: {result}"
+        assert result.get('state') == 'no_record', (
+            f"Expected state='no_record' for a never-submitted id, got: {result}"
         )
         assert result.get('reason'), (
             f"Expected non-empty reason string for unknown id, got: {result}"
@@ -2007,7 +2007,7 @@ class TestMergeCancel:
         A real event store holds a 'done' merge_finalized row for 'mr-finalized' in
         the server's own run.  No waiter is registered (simulating finalized+popped).
         merge_cancel('mr-finalized') must return {cancelled: False, state: 'done', reason:
-        <non-empty>} — not 'unknown'.  merge_cancel('mr-never') must still return state='unknown'.
+        <non-empty>} — not an epistemic state.  merge_cancel('mr-never') returns 'no_record'.
         """
         from orchestrator.event_store import (  # type: ignore[reportMissingImports]
             EventStore,
@@ -2047,10 +2047,9 @@ class TestMergeCancel:
             f"Expected non-empty reason for finalized id, got: {result_finalized}"
         )
 
-        # An id not in the event_store must still return 'unknown'
         result_never = await call_merge_cancel(server, request_id='mr-never')
-        assert result_never.get('state') == 'unknown', (
-            f"Expected state='unknown' for truly unknown id, got: {result_never}"
+        assert result_never.get('state') == 'no_record', (
+            f"Expected state='no_record' for a never-submitted id, got: {result_never}"
         )
 
     async def test_cancel_finalized_popped_id_ignores_the_retention_ring(
@@ -2098,8 +2097,8 @@ class TestMergeCancel:
         )
 
         result_never = await call_merge_cancel(server, request_id='mr-never')
-        assert result_never.get('state') == 'unknown', (
-            f"Expected state='unknown' when both durable tiers miss, got: {result_never}"
+        assert result_never.get('state') == 'no_record', (
+            f"Expected state='no_record' when every durable tier misses, got: {result_never}"
         )
 
 
