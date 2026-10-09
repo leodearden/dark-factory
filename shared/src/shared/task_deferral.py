@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Any, Final, Literal, LiteralString, cast
 
@@ -24,8 +24,9 @@ from pydantic import (
 )
 from pydantic_core import ErrorDetails, PydanticCustomError
 
-from shared.process_identity import ProcessIdentity
+from shared.process_identity import Liveness, ProcessIdentity
 from shared.task_metadata import register_metadata_submodel
+from shared.task_statuses import TaskStatus
 
 __all__ = [
     'CALLER_KINDS',
@@ -48,11 +49,15 @@ __all__ = [
     'HeldBySessionDeferral',
     'HeldBySessionRequest',
     'InvalidRecord',
+    'LapseCause',
     'LegacyUnknownDeferral',
     'LegacyUnknownRequest',
+    'NeedsHumanReason',
     'PlanningDeferral',
     'UntilConditionDeferral',
     'UntilConditionRequest',
+    'lapse_cause',
+    'needs_human',
     'parse_record',
     'parse_request',
     'parse_utc_timestamp',
@@ -94,6 +99,25 @@ class DeferralInvalidReason(StrEnum):
     NOT_PLANNING_HOLD = 'not_planning_hold'
     CAS_NEEDS_SINGLE_ID = 'cas_needs_single_id'
     INVALID_VALUE = 'invalid_value'
+
+
+class LapseCause(StrEnum):
+    EXPIRED = 'expired'
+    HOLDER_LOST = 'holder_lost'
+
+
+class NeedsHumanReason(StrEnum):
+    MISSING_RECORD = 'missing_record'
+    INVALID_RECORD = 'invalid_record'
+    LEGACY_UNKNOWN = 'legacy_unknown'
+    CLOSABLE = 'closable'
+    ORPHANED = 'orphaned'
+    STALE_PLANNING = 'stale_planning'
+    STALE_CONDITION = 'stale_condition'
+    EXPIRY_OVERDUE = 'expiry_overdue'
+    HOLDER_DEAD = 'holder_dead'
+    HOLDER_OTHER_HOST = 'holder_other_host'
+    LIVENESS_UNKNOWN = 'liveness_unknown'
 
 
 DEFAULT_GRACE_SECS: Final = 7200
@@ -228,6 +252,10 @@ def _refusal(error: ErrorDetails, raw: Mapping[Any, Any]) -> DeferralInvalid:
     return DeferralInvalid(reason, '.'.join(map(str, path_below_tag)), value)
 
 
+def _not_after(moment: datetime | None, now: datetime) -> bool:
+    return moment is not None and moment <= now
+
+
 def parse_request(raw: object, *, now: datetime) -> DeferralRequest:
     """Validate a caller's `deferral` argument; every pure refusal raises DeferralInvalid."""
     if not isinstance(raw, Mapping):
@@ -244,10 +272,6 @@ def parse_request(raw: object, *, now: datetime) -> DeferralRequest:
             DeferralInvalidReason.EXPIRES_AT_NOT_FUTURE, 'expires_at', raw['expires_at']
         )
     return request
-
-
-def _not_after(moment: datetime | None, now: datetime) -> bool:
-    return moment is not None and moment <= now
 
 
 class _DeferralRecordBase(BaseModel):
@@ -373,3 +397,67 @@ def parse_record(raw: object) -> Deferral | InvalidRecord | None:
 def record_to_json(record: Deferral) -> dict[str, Any]:
     """The one serialization of a record into metadata.deferral."""
     return DeferralRecord(record).model_dump(mode='json')
+
+
+def _grace_spent(record: HeldBySessionDeferral, now: datetime, dead_since: datetime | None) -> bool:
+    return dead_since is not None and now - dead_since >= timedelta(seconds=record.grace_secs)
+
+
+def lapse_cause(record: Deferral, now: datetime, dead_since: datetime | None) -> LapseCause | None:
+    """Why the hold has run out, if it has: expiry reached, or the holder dead for its grace."""
+    if isinstance(record, UntilConditionDeferral) and _not_after(record.expires_at, now):
+        return LapseCause.EXPIRED
+    if isinstance(record, HeldBySessionDeferral) and _grace_spent(record, now, dead_since):
+        return LapseCause.HOLDER_LOST
+    return None
+
+
+_CARRIER_STATUS_REASONS: Final[Mapping[str | None, NeedsHumanReason]] = {
+    TaskStatus.DONE: NeedsHumanReason.CLOSABLE,
+    TaskStatus.CANCELLED: NeedsHumanReason.ORPHANED,
+}
+_HOLDER_LIVENESS_REASONS: Final[Mapping[Liveness | None, NeedsHumanReason | None]] = {
+    None: NeedsHumanReason.LIVENESS_UNKNOWN,
+    Liveness.DEAD: NeedsHumanReason.HOLDER_DEAD,
+    Liveness.OTHER_HOST: NeedsHumanReason.HOLDER_OTHER_HOST,
+    Liveness.ALIVE: None,
+}
+
+
+def _older_than(moment: datetime, now: datetime, secs: int) -> bool:
+    return now - moment > timedelta(seconds=secs)
+
+
+def _until_condition_reason(
+    record: UntilConditionDeferral, now: datetime
+) -> NeedsHumanReason | None:
+    if record.expires_at is not None:
+        overdue = _older_than(record.expires_at, now, LAPSE_OVERDUE_AFTER_SECS)
+        return NeedsHumanReason.EXPIRY_OVERDUE if overdue else None
+    stale = _older_than(record.stamped_at, now, STALE_CONDITION_AFTER_SECS)
+    return NeedsHumanReason.STALE_CONDITION if stale else None
+
+
+def needs_human(
+    record: Deferral | InvalidRecord | None,
+    now: datetime,
+    carrier_status: str | None,
+    liveness: Liveness | None,
+) -> NeedsHumanReason | None:
+    """Why this hold needs a human (decision 10), or None; liveness None means not read."""
+    match record:
+        case None:
+            return NeedsHumanReason.MISSING_RECORD
+        case InvalidRecord():
+            return NeedsHumanReason.INVALID_RECORD
+        case LegacyUnknownDeferral():
+            return NeedsHumanReason.LEGACY_UNKNOWN
+        case CarriedByDeferral():
+            return _CARRIER_STATUS_REASONS.get(carrier_status)
+        case PlanningDeferral():
+            stale = _older_than(record.stamped_at, now, STALE_PLANNING_AFTER_SECS)
+            return NeedsHumanReason.STALE_PLANNING if stale else None
+        case UntilConditionDeferral():
+            return _until_condition_reason(record, now)
+        case HeldBySessionDeferral():
+            return _HOLDER_LIVENESS_REASONS[liveness]
