@@ -3199,11 +3199,8 @@ class EscalationQueue:
           stem ``esc-ticket-janitor-N`` carrying a REAL NUMERIC task_id (a live
           specimen: stem ``esc-ticket-janitor-2`` with task_id ``'2859'``).
 
-        The real-numeric case is the one that matters: it shows the divergence is
-        NOT confined to synthetic anchor ids that nobody queries.  A scoped
-        ``f'esc-{task_id}-*.json'`` glob would make ``get_by_task('2859')``
-        return 0 of its 1 record — a silent 100% loss for an ordinary numeric
-        task id.
+        So the divergence is NOT confined to synthetic anchor ids: an ordinary
+        numeric task id can own a record whose stem does not encode it.
 
         THEREFORE NOTHING MAY DERIVE A TASK_ID FROM A FILENAME OR FROM AN
         ESCALATION ID.  State the false identity plainly so a future reader
