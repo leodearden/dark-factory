@@ -13550,7 +13550,9 @@ class GitOps:
         and :meth:`find_inflight_merge_worktree`.  Enumerates via
         ``git worktree list --porcelain``, filtering to direct children of
         ``worktree_base`` whose name starts with ``_merge-``.  Yields nothing
-        on git error (fail-closed).
+        on git error (fail-closed).  A registered entry whose directory is
+        absent is skipped with a WARNING: git keeps listing it (permanently
+        while it is locked), and no consumer can run git inside it (task 4828).
 
         *wt_path* is the raw path from porcelain output (used for git commands).
         *wt_resolved* is the resolved path (used for identity comparisons such
@@ -13584,6 +13586,13 @@ class GitOps:
             # Exempt the persistent warm merge-verify worktree — prune and
             # find_inflight must never touch it (invariant 4).
             if wt_resolved.name == PERSISTENT_MERGE_WORKTREE_NAME:
+                continue
+            if not wt_resolved.is_dir():
+                logger.warning(
+                    'registered merge worktree %s is absent on disk — skipping; '
+                    'git keeps listing it, and _prune_registrations reclaims it',
+                    wt_path,
+                )
                 continue
             yield wt_path, wt_resolved
 
@@ -13670,8 +13679,9 @@ class GitOps:
         Returns the first matching :class:`~pathlib.Path`, or ``None`` if no
         match is found.
 
-        Fail-closed on git errors: a candidate whose ``git log`` fails is
-        skipped (logged at WARNING level) rather than raising — avoids
+        Fail-closed on git errors: a candidate whose ``git log`` fails, or
+        cannot spawn because its directory vanished (:class:`WorktreeMissing`),
+        is skipped (logged at WARNING level) rather than raising — avoids
         crashing the coalesce dispatch on a partially-written worktree.
 
         Crash-safety / cross-restart source of truth: even if the in-memory
@@ -13690,10 +13700,18 @@ class GitOps:
 
         async for wt_path, _ in self._iter_merge_worktrees():
             # Read HEAD commit subject of this candidate
-            rc_log, subject, err_log = await _run(
-                ['git', 'log', '-1', '--format=%s'],
-                cwd=wt_path,
-            )
+            try:
+                rc_log, subject, err_log = await _run(
+                    ['git', 'log', '-1', '--format=%s'],
+                    cwd=wt_path,
+                )
+            except WorktreeMissing:
+                logger.warning(
+                    'find_inflight_merge_worktree: %s vanished before git log '
+                    'could run — skipping',
+                    wt_path,
+                )
+                continue
             if rc_log != 0:
                 logger.warning(
                     'find_inflight_merge_worktree: git log failed for %s: %s',
