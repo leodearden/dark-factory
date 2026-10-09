@@ -370,6 +370,42 @@ def judge_band_order(
     return sorted((w for w in snapshot['writes'] if w['band'] == OUTCOME_JUDGE), key=rank)
 
 
+@dataclass(frozen=True)
+class RunSet:
+    """The writes a run judges under its slates, and the drawn writes those slates moved out."""
+
+    slates: Slates
+    sample_size: int
+    writes: tuple[dict[str, Any], ...]
+    left_judge_band: tuple[str, ...]
+
+
+def draw_run_set(
+    snapshot: Mapping[str, Any], snapshot_sha256: str, *,
+    max_writes: int | None, slates: Slates,
+) -> RunSet:
+    """The first *max_writes* of the frozen judge-band order, each viewed under *slates*.
+
+    A drawn write the view moves out of the judge band is listed, never
+    replaced by the next write of the order, so every mode judges π's sample.
+    """
+    sample = judge_band_order(snapshot, snapshot_sha256)[:max_writes]
+    match slates:
+        case Slates.FROZEN:
+            viewed = [{**write, 'slates': Slates.FROZEN} for write in sample]
+        case Slates.WRITE_TIME:
+            viewed = [
+                write_time_slate(write, t_high=snapshot['t_high'], t_low=snapshot['t_low'])
+                for write in sample
+            ]
+    return RunSet(
+        slates=slates,
+        sample_size=len(sample),
+        writes=tuple(view for view in viewed if view['band'] == OUTCOME_JUDGE),
+        left_judge_band=tuple(view['memory_id'] for view in viewed if view['band'] != OUTCOME_JUDGE),
+    )
+
+
 def arm_path(arms_dir: Path, arm_name: str) -> Path:
     return Path(arms_dir) / f'{arm_name}.jsonl'
 
