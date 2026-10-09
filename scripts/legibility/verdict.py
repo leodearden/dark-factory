@@ -209,7 +209,9 @@ def _verified(raw: Mapping[str, object]) -> bool:
 
 
 def _reason(raw: object) -> tuple[str, tuple[Normalisation, ...]]:
-    return (raw.strip() if isinstance(raw, str) else ""), ()
+    if isinstance(raw, str):
+        return raw.strip(), ()
+    return "", _normalised(NormalisationKind.REASON_MISSING, raw, "")
 
 
 def _path_below_root(raw: str, root: Path) -> str | None:
@@ -277,26 +279,56 @@ def _anchor(
 
 
 def _tags(raw: object) -> tuple[tuple[str, ...], tuple[Normalisation, ...]]:
-    offered = raw if isinstance(raw, list) else []
-    kept = tuple(tag for tag in offered if isinstance(tag, str) and _is_verifier_tag(tag))
-    return (*kept, KIND_TAG), ()
+    if raw is None:
+        return (KIND_TAG,), ()
+    if not isinstance(raw, list):
+        return (KIND_TAG,), _normalised(NormalisationKind.TAG_DROPPED, raw, "")
+    kept: list[str] = []
+    dropped: list[Normalisation] = []
+    for tag in raw:
+        canonical = tag.strip().lower() if isinstance(tag, str) else ""
+        if _is_verifier_tag(canonical) and canonical not in kept:
+            kept.append(canonical)
+        else:
+            dropped.extend(_normalised(NormalisationKind.TAG_DROPPED, tag, ""))
+    return (*kept, KIND_TAG), tuple(dropped)
 
 
 def _severity(
     raw: object, raw_reason: object,
 ) -> tuple[str, str, tuple[Normalisation, ...]]:
     reason = raw_reason.strip() if isinstance(raw_reason, str) else ""
-    if raw in SEVERITIES and reason:
-        return str(raw), reason, ()
-    return DEFAULT_SEVERITY, f"verifier offered severity {_bounded_repr(raw)}", ()
+    canonical = raw.strip().lower() if isinstance(raw, str) else ""
+    if canonical not in SEVERITIES:
+        substitution = (
+            f"verifier offered severity {_bounded_repr(raw)}, outside {SEVERITIES} "
+            f"(contract §4: critical is never a finding severity); census used "
+            f"{DEFAULT_SEVERITY!r}"
+        )
+        return (
+            DEFAULT_SEVERITY,
+            f"{substitution}; verifier's reason: {reason}" if reason else substitution,
+            _normalised(NormalisationKind.SEVERITY_SUBSTITUTED, raw, DEFAULT_SEVERITY),
+        )
+    if reason:
+        return canonical, reason, ()
+    stated = f"verifier gave severity {canonical!r} without a severity_reason"
+    return canonical, stated, _normalised(
+        NormalisationKind.SEVERITY_REASON_MISSING, raw_reason, stated,
+    )
+
+
+_ROUTES_BY_VALUE = {route.value: route for route in Route}
 
 
 def _route(
     raw: object, *, remediation: Remediation | None,
 ) -> tuple[Route, tuple[Normalisation, ...]]:
-    if isinstance(raw, str) and raw in {route.value for route in Route}:
-        return Route(raw), ()
-    return (Route.MECHANICAL if remediation is not None else Route.STRUCTURAL), ()
+    named = _ROUTES_BY_VALUE.get(raw.strip().lower()) if isinstance(raw, str) else None
+    if named is not None:
+        return named, ()
+    default = Route.MECHANICAL if remediation is not None else Route.STRUCTURAL
+    return default, _normalised(NormalisationKind.ROUTE_DEFAULTED, raw, default.value)
 
 
 def parse_verdict(
