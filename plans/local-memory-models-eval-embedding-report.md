@@ -196,10 +196,13 @@ store, not a correction to these results.
   `GraphitiBackend.search` returns whose `episodes` cites that node.
 - **Why K = 10.** K is the median word count of the 500 real transcript queries
   (`probe_set.py::derive_query_words`, rounded half up). A probe as long as a real query
-  exercises the BM25 leg as production does. K must also stay under graphiti's 128-term
-  fulltext cutoff (`search_utils.MAX_QUERY_LENGTH`). FalkorDB's `build_fulltext_query`
-  returns `''` once a query's terms plus its group ids reach that cutoff; the BM25 leg then
-  goes dead, and with-indices silently becomes embedding-only. `derive_query_words`
+  exercises the BM25 leg as production does. K must also stay under the fulltext cutoff.
+  `fused_memory/backends/falkor_fulltext.py::build_query` (and graphiti's FalkorDB `build_fulltext_query`) returns
+  `''` once `len(' | '.join(terms).split(' ')) + len(group_ids)` reaches
+  `search_utils.MAX_QUERY_LENGTH` (128). N searchable terms count as 2N-1 fields, so with
+  the one scratch group id the BM25 leg goes dead at 64 searchable terms, not 128
+  (`tests/arm_harness/test_probe_set.py::test_the_bm25_leg_dies_at_64_searchable_terms_not_128`). When it
+  does, with-indices silently becomes embedding-only. K = 10 is far below that. `derive_query_words`
   refuses such a K.
 - **Mem0 probe.** Its known items are E1's registry phrasings whose canonical the snapshot
   holds: 42 phrasings over 14 topics. Its metrics (`mem0-known-item-recall@5/@10`,
