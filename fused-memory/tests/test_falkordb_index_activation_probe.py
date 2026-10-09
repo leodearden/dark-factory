@@ -7,11 +7,13 @@ functions only: no network, no FalkorDB, no MCP server, and no
 """
 from __future__ import annotations
 
+import contextlib
 import functools
 import json
 import types
 from pathlib import Path
 
+import anyio
 import pytest
 from _falkor_index_doubles import rows_for
 from _fm_helpers import load_script_module
@@ -389,9 +391,12 @@ def _graphiti(task_id: str, content: str):
 class FakeReader:
     """Serves canned ``ro_query`` results keyed by graph and query kind; logs every call."""
 
-    def __init__(self, graphs, *, indexes, dup_groups=None, population=(3, 6.0), split=None):
+    def __init__(
+        self, graphs, *, indexes, dup_groups=None, population=(3, 6.0), split=None, fulltext=None,
+    ):
         self.graphs = list(graphs)
         self.indexes = indexes
+        self.fulltext = FULLTEXT_ROWS if fulltext is None else fulltext
         self.dup_groups = dup_groups or {}
         self.population = population
         self.split = split if split is not None else [['ab', ['AB', 'Ab']]]
@@ -408,7 +413,7 @@ class FakeReader:
             return mod.QueryRows(header=LIVE_HEADER, rows=rows_for(self.indexes[graph]))
         if cypher == mod.FULLTEXT:
             assert graph == 'dark_factory' and params is not None
-            return mod.QueryRows(header=[], rows=FULLTEXT_ROWS.get(params['q'], []))
+            return mod.QueryRows(header=[], rows=self.fulltext.get(params['q'], []))
         if cypher == mod.DUP_UUID:
             return mod.QueryRows(header=[], rows=[[self.dup_groups.get(graph, 0)]])
         if cypher == mod.CASE_FOLD_POPULATION:
@@ -737,6 +742,86 @@ class TestMainRefusesWithoutTheRegistry:
 
         assert mod.main(['--out-dir', str(tmp_path)]) != 0
         assert list(tmp_path.iterdir()) == []
+
+
+@contextlib.asynccontextmanager
+async def _task_group_transport(_url):
+    """Stands in for mcp's ``streamablehttp_client``: it yields inside a live anyio task group."""
+    async with anyio.create_task_group() as group:
+        group.start_soon(anyio.sleep_forever)
+        try:
+            yield None, None, None
+        finally:
+            group.cancel_scope.cancel()
+
+
+def _session_answering(result):
+    class _Session:
+        def __init__(self, _read, _write):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc_info):
+            return None
+
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, _name, _arguments, read_timeout_seconds=None):
+            return result
+
+    return _Session
+
+
+SEARCH_ANSWERS_NOTHING = types.SimpleNamespace(isError=False, content=[], structuredContent={'results': []})
+SEARCH_ERRORS = types.SimpleNamespace(isError=True, content=['backend down'], structuredContent=None)
+
+
+class TestMainReportsARunFailureAsOneLine:
+    """A declared run failure raised inside the MCP session ends in one ``error:`` line."""
+
+    def _main(self, monkeypatch, tmp_path, capsys, *, reader, search_result):
+        mod = _mod()
+        project_root = tmp_path / 'dark_factory'
+        project_root.mkdir()
+        monkeypatch.setenv('DASHBOARD_KNOWN_PROJECT_ROOTS', str(project_root))
+        monkeypatch.setattr(
+            mod.FalkorReadOnlyReader, 'connect',
+            lambda _uri, _password: mod.FalkorReadOnlyReader(_FalkorLikeClient(reader)),
+        )
+        monkeypatch.setattr(mod, 'streamablehttp_client', _task_group_transport)
+        monkeypatch.setattr(mod, 'ClientSession', _session_answering(search_result))
+        out_dir = tmp_path / 'out'
+
+        exit_code = mod.main(['--out-dir', str(out_dir)])
+
+        err = capsys.readouterr().err
+        return exit_code, [line for line in err.splitlines() if line.startswith('error: ')], err, out_dir
+
+    def test_a_search_tool_error_exits_run_failed_with_one_error_line(self, monkeypatch, tmp_path, capsys):
+        exit_code, error_lines, err, out_dir = self._main(
+            monkeypatch, tmp_path, capsys, reader=_reader(), search_result=SEARCH_ERRORS,
+        )
+
+        assert exit_code == _mod().EXIT_RUN_FAILED
+        (line,) = error_lines
+        assert 'backend down' in line
+        assert 'Traceback' not in err
+        assert not out_dir.exists()
+
+    def test_no_replacement_exits_run_failed_with_one_error_line(self, monkeypatch, tmp_path, capsys):
+        exit_code, error_lines, err, out_dir = self._main(
+            monkeypatch, tmp_path, capsys,
+            reader=_reader(fulltext={}), search_result=SEARCH_ANSWERS_NOTHING,
+        )
+
+        assert exit_code == _mod().EXIT_RUN_FAILED
+        (line,) = error_lines
+        assert '877' in line
+        assert 'Traceback' not in err
+        assert not out_dir.exists()
 
 
 class TestParseSearchPayload:

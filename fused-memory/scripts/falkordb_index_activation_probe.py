@@ -467,7 +467,13 @@ class FalkorReadOnlyReader:
 
 @contextlib.asynccontextmanager
 async def open_mcp_search(url: str = MCP_URL) -> AsyncIterator[SearchFn]:
-    """A :class:`SearchFn` over the live fused-memory MCP ``search`` tool."""
+    """A :class:`SearchFn` over the live fused-memory MCP ``search`` tool.
+
+    An exception from the ``async with`` body is re-raised once the session has
+    closed, so the caller receives it as itself rather than inside the
+    ExceptionGroup the MCP client's anyio task groups would wrap it in.
+    """
+    body_error: Exception | None = None
     async with streamablehttp_client(url) as (read, write, _session_id), ClientSession(read, write) as session:
         await session.initialize()
 
@@ -486,7 +492,12 @@ async def open_mcp_search(url: str = MCP_URL) -> AsyncIterator[SearchFn]:
                 raise SearchToolError(f'search {query!r} failed: {result.content!r}')
             return parse_search_payload(result.structuredContent)
 
-        yield search
+        try:
+            yield search
+        except Exception as exc:
+            body_error = exc
+    if body_error is not None:
+        raise body_error
 
 
 def _single_row(rows: QueryRows) -> list:
