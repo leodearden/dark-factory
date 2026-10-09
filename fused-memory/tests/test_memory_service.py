@@ -2775,13 +2775,13 @@ class TestUpdateMemoryStormCounter:
 
         for i in range(5):
             await self._amend(service, agent_id=f'recon-stage-1-run-{i}')
-        assert len(service._mem0_update_storm_counters.tracked_keys) == 5
+        assert len(service.mem0_update_storm_tracked_agents) == 5
 
         # Every one of those agents has now gone quiet for a full window.
         clock.advance(window + 1)
         await self._amend(service, agent_id='recon-stage-2')
 
-        assert service._mem0_update_storm_counters.tracked_keys == {'recon-stage-2'}, (
+        assert service.mem0_update_storm_tracked_agents == {'recon-stage-2'}, (
             'a counter whose window has emptied carries no state that could '
             'change a later decision, so it must not survive'
         )
@@ -2800,7 +2800,7 @@ class TestUpdateMemoryStormCounter:
         for i in range(3):
             await self._amend(service, agent_id=f'recon-stage-1-run-{i}')
 
-        assert service._mem0_update_storm_counters.tracked_keys == frozenset()
+        assert service.mem0_update_storm_tracked_agents == frozenset()
 
     @pytest.mark.asyncio
     async def test_eviction_does_not_disarm_a_live_burst(self, stormy):

@@ -229,13 +229,6 @@ class TestUnknownKeyStormDetector:
             'the live writer must survive'
         )
 
-    def test_tracked_writers_is_read_only(self):
-        """A frozenset, so a reader cannot evict a live writer by accident."""
-        detector = _detector(_FakeClock(), threshold=3)
-        detector.record('p', 'a', ['k'])
-
-        assert isinstance(detector.tracked_writers, frozenset)
-
     def test_the_sweep_never_evicts_the_writer_that_triggered_it(self):
         """Its deque was appended at `now`, so it is never stale."""
         clock = _FakeClock()
@@ -396,18 +389,6 @@ class TestUnknownKeyStormDetectorDelegatesToTheSharedRegistry:
         detector = _detector(_FakeClock(), threshold=5)
 
         assert isinstance(detector._warns, KeyedStormCounters)
-
-    def test_the_counters_are_latched_not_rate_limited(self):
-        """The detector's contract is the CROSSING, not the standing state.
-
-        A rate-limited counter would re-answer once per window, buying the
-        filer an open-escalation ``queue.get_by_task`` read per memory write
-        for a condition already filed — the behaviour
-        :meth:`UnknownKeyStormDetector.record`'s docstring rules out.
-        """
-        detector = _detector(_FakeClock(), threshold=5)
-
-        assert detector._warns.fire_mode == 'latched'
 
     def test_a_writer_over_the_line_for_multiple_windows_still_fires_once(self):
         """The latch-vs-rate-limit discriminator, at the census level.

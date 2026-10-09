@@ -743,7 +743,7 @@ class TestEntityMintStormAlarm:
             await self._mint(service, agent_id=f'curator-{i % 2}')
 
         emitter.assert_not_called()
-        assert service._entity_mint_storm_counters.tracked_keys == {
+        assert service.entity_mint_storm_tracked_agents == {
             'curator-0', 'curator-1',
         }
 
@@ -757,7 +757,7 @@ class TestEntityMintStormAlarm:
 
         emitter.assert_called_once()
         assert emitter.call_args.kwargs['agent_id'] == '<unattributed>'
-        assert service._entity_mint_storm_counters.tracked_keys == {'<unattributed>'}
+        assert service.entity_mint_storm_tracked_agents == {'<unattributed>'}
 
     @pytest.mark.asyncio
     async def test_dormant_counters_are_evicted(self, stormy):
@@ -771,12 +771,12 @@ class TestEntityMintStormAlarm:
         window = service.config.entity_mint.storm_window_seconds
 
         await self._mint(service, agent_id='curator-gone')
-        assert 'curator-gone' in service._entity_mint_storm_counters.tracked_keys
+        assert 'curator-gone' in service.entity_mint_storm_tracked_agents
 
         clock.advance(window * 2)
         await self._mint(service, agent_id='curator-live')
 
-        assert service._entity_mint_storm_counters.tracked_keys == {'curator-live'}, (
+        assert service.entity_mint_storm_tracked_agents == {'curator-live'}, (
             'a counter whose window has gone empty must be dropped, not merely '
             'self-pruned'
         )
@@ -795,4 +795,4 @@ class TestEntityMintStormAlarm:
         await self._mint(service, agent_id='curator-a')
         await self._mint(service, agent_id='curator-b')
 
-        assert service._entity_mint_storm_counters.tracked_keys == frozenset()
+        assert service.entity_mint_storm_tracked_agents == frozenset()

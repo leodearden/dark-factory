@@ -2423,6 +2423,25 @@ class MemoryService:
         """
         return self._write_journal
 
+    @property
+    def mem0_update_storm_tracked_agents(self) -> frozenset[str]:
+        """The ``agent_id`` labels holding an ``update_memory`` storm window.
+
+        ``agent_id`` is caller-supplied and unbounded, so evicting dormant
+        agents is a real memory bound on a long-lived server and belongs in the
+        interface, as ``UnknownKeyStormDetector.tracked_writers`` argues.
+        """
+        return self._mem0_update_storm_counters.tracked_keys
+
+    @property
+    def entity_mint_storm_tracked_agents(self) -> frozenset[str]:
+        """The ``agent_id`` labels holding an ``ensure_entity_node`` storm window.
+
+        The same bound as :attr:`mem0_update_storm_tracked_agents`, for the
+        entity-mint burst alarm.
+        """
+        return self._entity_mint_storm_counters.tracked_keys
+
     def set_planned_registry(self, registry: PlannedEpisodeRegistry) -> None:
         """Wire the planned episode registry into the service."""
         self.planned_episode_registry = registry
