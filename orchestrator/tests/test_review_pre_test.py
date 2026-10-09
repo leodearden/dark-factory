@@ -68,7 +68,7 @@ class TestRunPreTestCommands:
         assert marker.exists()
         assert results[1].failed is False
         assert any(
-            failing in msg and '3' in msg and 'boom-tail-marker' in msg
+            failing in msg and 'exit code 3' in msg and 'boom-tail-marker' in msg
             for msg in _warnings(caplog)
         ), _warnings(caplog)
 
@@ -144,7 +144,7 @@ class TestRenderPreTestSection:
         )
 
         assert 'make bundle' in rendered
-        assert '7' in rendered
+        assert 'exit code 7' in rendered
         assert 'tail-xyz' in rendered
         assert 'FAILED' in rendered
 
