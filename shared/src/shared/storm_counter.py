@@ -44,14 +44,20 @@ leaf (``mem0_update.storm_threshold``) must read it live on every call, or the
 leaf is restart-only in disguise — registered in ``RELOADABLE_FIELDS`` while
 silently ignoring reloads. Callers whose thresholds are module constants
 (``MarkupStormCounter``) simply pass their stored values through.
+
+KEYED REGISTRY — :class:`KeyedStormCounters` is the single home of "one
+counter per key, built lazily, dormant ones swept". Task 5102 extracted it from
+five hand-rolled copies; its consumers are ``shared.boundary_storm_escape``
+(and through it both boundary guards), ``services/memory_service`` and
+``services/memory_metadata_census``.
 """
 
 from __future__ import annotations
 
 import time
 from collections import deque
-from collections.abc import Callable
-from typing import Any, Literal, get_args
+from collections.abc import Callable, Hashable
+from typing import Any, Generic, Literal, TypeVar, get_args
 
 #: The accepted ``fire_mode`` spellings as a TYPE. The mode is structural and
 #: fixed by the call site (see the class docstring), which is exactly the case
@@ -68,6 +74,27 @@ FireMode = Literal['rate_limited', 'latched']
 #: type and the constant cannot drift apart. See the module docstring's FIRE
 #: POLICY note for what each one means.
 FIRE_MODES: tuple[FireMode, ...] = get_args(FireMode)
+
+
+def _require_fire_mode(fire_mode: FireMode) -> FireMode:
+    """Return *fire_mode*, or raise if it is not one of :data:`FIRE_MODES`.
+
+    Kept despite the :data:`FireMode` annotation, which only closes the TYPED
+    call sites: a mode arriving as a dynamically-computed string (a
+    dict-splatted kwarg, a plain-script import) is still checked here. Every
+    constructor that takes a mode calls this, so a bad one fails at
+    construction even where counters are built lazily.
+    """
+    if fire_mode not in FIRE_MODES:
+        raise ValueError(
+            f'fire_mode={fire_mode!r} is not a StormCounter fire mode; '
+            f'accepted spellings are {", ".join(repr(m) for m in FIRE_MODES)}. '
+            'The mode is structural and fixed by the call site, so an '
+            'unrecognised spelling is a wiring bug: defaulting it would '
+            'silently degrade a latched consumer to per-window rate '
+            'limiting.'
+        )
+    return fire_mode
 
 
 class StormCounter:
@@ -141,24 +168,12 @@ class StormCounter:
         count_distinct: bool = False,
         fire_mode: FireMode = 'rate_limited',
     ) -> None:
-        # Kept despite the :data:`FireMode` annotation, which only closes the
-        # TYPED call sites: a mode arriving as a dynamically-computed string (a
-        # dict-splatted kwarg, a plain-script import) is still checked here.
-        if fire_mode not in FIRE_MODES:
-            raise ValueError(
-                f'fire_mode={fire_mode!r} is not a StormCounter fire mode; '
-                f'accepted spellings are {", ".join(repr(m) for m in FIRE_MODES)}. '
-                'The mode is structural and fixed by the call site, so an '
-                'unrecognised spelling is a wiring bug: defaulting it would '
-                'silently degrade a latched consumer to per-window rate '
-                'limiting.'
-            )
         self._now = time_provider
         self._count_distinct = count_distinct
         # Annotated, not inferred: pyright widens a literal to its base type
         # when inferring a mutable attribute, which would make this ``str`` and
         # silently drop the guarantee :data:`FireMode` exists to give.
-        self._fire_mode: FireMode = fire_mode
+        self._fire_mode: FireMode = _require_fire_mode(fire_mode)
         self._events: deque[tuple[float, str | None, str | None]] = deque()
         self._last_fire_ts: float | None = None
         self._latched: bool = False
@@ -419,3 +434,92 @@ class StormCounter:
             # nothing to escalate them against, so they are simply not named.
             'labels': sorted({lbl for _, lbl, _ in self._events if lbl is not None}),
         }
+
+
+K = TypeVar('K', bound=Hashable)
+
+
+class KeyedStormCounters(Generic[K]):
+    """One :class:`StormCounter` per key, built lazily; dormant ones swept.
+
+    One counter per key, because a label buys a burst ATTRIBUTION, never a
+    per-key THRESHOLD: a single counter's count spans every event in its
+    window, so pooling keys would fire an alarm naming a key that never burst.
+
+    Keys are caller-supplied and unbounded, so every *sweep_every* records the
+    counters of other keys whose :meth:`StormCounter.prune` returns ``0`` are
+    dropped. That is behaviour-preserving by ``prune``'s licence, and the key
+    just recorded is never swept.
+
+    *threshold* and *window_seconds* are per :meth:`record` call (RELOAD
+    SAFETY, module docstring). *fire_mode* is structural and applies to every
+    counter. There is no ``count_distinct``: no keyed consumer needs one, and
+    adding it later is additive.
+    """
+
+    def __init__(
+        self,
+        time_provider: Callable[[], float] = time.time,
+        *,
+        fire_mode: FireMode = 'rate_limited',
+        sweep_every: int = 1,
+    ) -> None:
+        if sweep_every < 1:
+            raise ValueError(
+                f'sweep_every={sweep_every!r} must be >= 1: it is how many '
+                'records pass between sweeps of dormant counters.'
+            )
+        self._time_provider = time_provider
+        self._fire_mode: FireMode = _require_fire_mode(fire_mode)
+        self._sweep_every = sweep_every
+        self._records_since_sweep = 0
+        self._counters: dict[K, StormCounter] = {}
+
+    @property
+    def fire_mode(self) -> FireMode:
+        """The FIRE POLICY every per-key counter is built with."""
+        return self._fire_mode
+
+    @property
+    def tracked_keys(self) -> frozenset[K]:
+        """The keys currently holding a counter; read-only by construction."""
+        return frozenset(self._counters)
+
+    def record(
+        self,
+        key: K,
+        *,
+        threshold: int,
+        window_seconds: float,
+        label: str | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Record one event for *key*; return its storm summary iff it fired.
+
+        The summary is :meth:`StormCounter.record`'s, over *key*'s window only.
+        *now* is resolved ONCE and drives both the record and the sweep, so an
+        injected instant ages every key exactly as it ages this one.
+        """
+        effective_now = now if now is not None else self._time_provider()
+        counter = self._counters.get(key)
+        if counter is None:
+            counter = StormCounter(
+                time_provider=self._time_provider, fire_mode=self._fire_mode
+            )
+            self._counters[key] = counter
+        summary = counter.record(
+            threshold=threshold,
+            window_seconds=window_seconds,
+            label=label,
+            now=effective_now,
+        )
+        self._records_since_sweep += 1
+        if self._records_since_sweep >= self._sweep_every:
+            self._records_since_sweep = 0
+            self._sweep(key, window_seconds, effective_now)
+        return summary
+
+    def _sweep(self, current: K, window_seconds: float, now: float) -> None:
+        for other, dormant in list(self._counters.items()):
+            if other != current and dormant.prune(window_seconds, now=now) == 0:
+                del self._counters[other]
