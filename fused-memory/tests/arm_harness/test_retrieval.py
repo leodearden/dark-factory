@@ -7,6 +7,7 @@ import pytest
 
 from arm_harness._fakes import FakeArmGraph, llm_spec
 from fused_memory.arm_harness.arm_spec import LlmArmSpec
+from fused_memory.arm_harness.metrics_record import EmbeddingMetricId
 from fused_memory.arm_harness.replay_types import EpisodeOutcome, ReplayItem
 from fused_memory.arm_harness.retrieval import (
     RETRIEVAL_UTILITY_K,
@@ -116,6 +117,16 @@ def test_mrr_counts_misses_as_zero():
 
 def test_mrr_is_absent_without_ranks():
     assert mrr_metric([]) is None
+
+
+def test_mrr_emits_the_metric_id_it_is_given():
+    default = mrr_metric(RANKS)
+    mem0 = mrr_metric(RANKS, metric_id=EmbeddingMetricId.MEM0_MRR)
+
+    assert mem0 is not None
+    assert default is not None
+    assert mem0.metric_id == 'mem0-mrr'
+    assert (mem0.value, mem0.n, mem0.kind) == (default.value, default.n, default.kind)
 
 
 def test_provenance_matcher_matches_results_citing_the_replayed_episode():

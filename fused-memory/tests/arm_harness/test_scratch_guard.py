@@ -77,4 +77,28 @@ def test_checkpoints_are_a_closed_enum():
         'TOPOLOGY_READ',
         'TEARDOWN_GRAPH',
         'TEARDOWN_COLLECTION',
+        'GRAPH_COPY',
+        'REEMBED',
+        'INDEX_DROP',
+        'REPLICA_BUILD',
     }
+
+
+@pytest.mark.parametrize(
+    ('member', 'value'),
+    [
+        ('GRAPH_COPY', 'graph-copy'),
+        ('REEMBED', 'reembed'),
+        ('INDEX_DROP', 'index-drop'),
+        ('REPLICA_BUILD', 'replica-build'),
+    ],
+)
+def test_embedding_axis_checkpoints_refuse_a_live_graph_naming_themselves(member, value):
+    checkpoint = GuardCheckpoint[member]
+
+    with pytest.raises(ScratchGuardError) as caught:
+        require_scratch_name('dark_factory', checkpoint=checkpoint)
+
+    assert checkpoint.value == value
+    assert caught.value.checkpoint is checkpoint
+    assert repr(value) in str(caught.value)

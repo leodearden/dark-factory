@@ -34,7 +34,12 @@ from fused_memory.arm_harness.screening_evidence import (
     write_arm_commands,
     write_screening_spec,
 )
-from fused_memory.arm_harness.slate import SlateArm, arm_endpoint, candidate_spec
+from fused_memory.arm_harness.slate import (
+    EmbeddingSlateArm,
+    SlateArm,
+    arm_endpoint,
+    candidate_spec,
+)
 from fused_memory.arm_harness.usage_tap import CallRecord
 from fused_memory.backends.llm_token_usage import (
     AttributingTokenUsageTracker,
@@ -312,6 +317,26 @@ def slate_arm(**overrides) -> SlateArm:
         'max_model_len': 32768,
     }
     return SlateArm.model_validate(data | overrides)
+
+
+QWEN_QUERY_PREFIX = (
+    'Instruct: Given a search query, retrieve relevant memory records that answer the query\n'
+    'Query: '
+)
+
+
+def embedding_slate_arm(**overrides) -> EmbeddingSlateArm:
+    """qwen3-embedding-0.6b as arms.yaml declares it; override any field by keyword."""
+    data = {
+        'arm_id': 'qwen3-embedding-0.6b',
+        'stack': 'vllm',
+        'port': 8414,
+        'served_model_name': 'qwen3-embedding-0.6b',
+        'quant': 'none',
+        'dims': 1024,
+        'query_prefix': QWEN_QUERY_PREFIX,
+    }
+    return EmbeddingSlateArm.model_validate(data | overrides)
 
 
 def screening_spec(arm: SlateArm) -> LlmArmSpec:
