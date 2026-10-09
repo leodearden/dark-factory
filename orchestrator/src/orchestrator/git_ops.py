@@ -2722,6 +2722,27 @@ def _merge_subject(branch: str, main_branch: str) -> str:
     return f'Merge {branch} into {main_branch}'
 
 
+def _dangling_locked_worktree(admin_entry: Path, worktree_base: Path) -> Path | None:
+    """The worktree of a LOCKED admin entry whose tree is gone, else None.
+
+    *admin_entry* is a ``.git/worktrees/<id>`` dir; its ``locked`` and
+    ``gitdir`` files are git's documented layout (gitrepository-layout(5)).
+    Qualifies only a direct child of *worktree_base*. Never raises.
+    """
+    try:
+        if not (admin_entry / 'locked').exists():
+            return None
+        gitdir = admin_entry / (admin_entry / 'gitdir').read_text().strip()
+        if gitdir.name != '.git':
+            return None
+        worktree = gitdir.parent
+        if worktree.parent.resolve() != worktree_base.resolve() or worktree.is_dir():
+            return None
+        return worktree
+    except OSError:
+        return None
+
+
 # Sentinel range used to represent files that are fully deleted or renamed.
 # The range (0, 2**30) spans every plausible line number, so an intersection
 # check against any real hunk range always returns True (not stackable).
@@ -12826,10 +12847,11 @@ class GitOps:
         ``.lock`` (the primitive RETAINS it on ``'failed'``, so we clear the
         now-orphaned lane lock, honouring the no-leak convention); (4)
         :meth:`_prune_registrations` clears any dangling admin entry. The
-        order — remove-tree-then-prune — leaves at most the benign inverse
-        shape (admin entry without a tree) that git prune / name-reuse
-        already handle, so an interrupted teardown is always completable by
-        a later sweep.
+        order — remove-tree-then-prune — leaves at most the inverse shape
+        (admin entry without a tree). A bare prune reclaims that only when
+        it is unlocked: a locked one is permanent to git and hard-failed
+        every merge_request enqueue (task 4828, correcting task 2922's
+        claim), so :meth:`_prune_registrations` unlocks it before pruning.
 
         Every other outcome (``'removed'`` / ``'not_present'`` / the three
         ``'skipped_*'``, including ``'skipped_lock_error'``) returns
@@ -15812,6 +15834,47 @@ class GitOps:
             )
             return None
 
+    def _unlock_dangling_locked_entries(self, context: str) -> list[str]:
+        """Unlink ``locked`` from admin entries whose ``worktree_base`` tree is gone.
+
+        Does what ``git worktree unlock`` does, without a subprocess. Nothing
+        in this repo locks a worktree, so such a marker is git's abandoned
+        ``initializing`` one. A no-op for a ``.git``-file layout (mirroring
+        :meth:`_index_lock_path`'s fast path) or an absent ``worktree_base``.
+        Returns the unlocked entry names. Never raises.
+        """
+        dot_git = self.project_root / '.git'
+        if not dot_git.is_dir() or not self.worktree_base.is_dir():
+            return []
+        try:
+            entries = sorted((dot_git / 'worktrees').iterdir())
+        except OSError:
+            return []
+        unlocked: list[str] = []
+        for entry in entries:
+            worktree = _dangling_locked_worktree(entry, self.worktree_base)
+            if worktree is None:
+                continue
+            lock = entry / 'locked'
+            reason = ''
+            with contextlib.suppress(OSError):
+                reason = lock.read_text().strip()
+            try:
+                os.unlink(lock)
+            except OSError as exc:
+                logger.warning(
+                    '%s: could not unlock worktree admin entry %s (%s): %s',
+                    context, entry.name, worktree, exc,
+                )
+                continue
+            logger.warning(
+                '%s: unlocked worktree admin entry %s for vanished %s '
+                '(lock reason %r) so prune can reclaim it',
+                context, entry.name, worktree, reason,
+            )
+            unlocked.append(entry.name)
+        return unlocked
+
     async def _prune_registrations(self, context: str) -> None:
         """Best-effort ``git worktree prune`` — clears stale admin entries.
 
@@ -15861,9 +15924,16 @@ class GitOps:
         refusal — see that method's docstring for why repeated calls from
         hot sweep sites (e.g. ``create_worktree``, ``reap_interactive_worktrees``)
         do not multiply operator-visible escalations.
+
+        **Locked entries (task 4828)**: prune skips a locked entry forever.
+        A locked entry under ``worktree_base`` whose tree is gone has its
+        lock removed first (:meth:`_unlock_dangling_locked_entries`), inside
+        the pool-storage gate above. A locked entry elsewhere keeps its
+        lock: that is git's documented portable-device use.
         """
         if not self._reconcile_pool_storage_before_sweep(context):
             return
+        self._unlock_dangling_locked_entries(context)
         try:
             rc, _, err = await _run(
                 ['git', 'worktree', 'prune'], cwd=self.project_root,

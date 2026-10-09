@@ -163,6 +163,7 @@ class TestPruneReclaimsLockedDanglingEntries:
         assert not admin.exists(), 'the locked, tree-gone admin entry must be reclaimed'
         assert str(wt.resolve()) not in _registered_paths(git_repo)
 
+        caplog.clear()
         with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
             assert await git_ops.find_inflight_merge_worktree('x') is None
         assert not any(str(wt) in record.getMessage() for record in caplog.records), (
