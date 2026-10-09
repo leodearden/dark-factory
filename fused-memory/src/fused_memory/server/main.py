@@ -1064,8 +1064,9 @@ async def run_server():
     loop_lag_task: asyncio.Task[None] = _start_loop_lag_monitor(config)
 
     # Ticket janitor — periodic sweep that surfaces failed tickets to the
-    # orchestrator as info-severity ticket_failure escalations. Replaces the
-    # per-call resolve_ticket wait the steward / deep_reviewer used to chain.
+    # orchestrator as info-severity ticket_failure escalations, and the curator
+    # dedup-outage signature as a blocking infra_issue. Replaces the per-call
+    # resolve_ticket wait the steward / deep_reviewer used to chain.
     janitor_task: asyncio.Task[None] | None = None
     janitor_cfg = getattr(config.curator, 'janitor', None)
     if janitor_cfg is not None and janitor_cfg.enabled and ticket_store is not None:
@@ -1092,15 +1093,18 @@ async def run_server():
                 if task_interceptor is not None else None
             ),
             known_projects=_known_projects_map,
+            dedup_outage=janitor_cfg.dedup_outage,
         )
         janitor_task = asyncio.create_task(
             ticket_janitor.run_loop(janitor_cfg.interval_seconds),
         )
         logger.info(
-            '  Ticket janitor: enabled (interval=%.0fs cooldown=%.0fs batch=%d)',
+            '  Ticket janitor: enabled (interval=%.0fs cooldown=%.0fs batch=%d '
+            'dedup_outage=%s)',
             janitor_cfg.interval_seconds,
             janitor_cfg.cooldown_seconds,
             janitor_cfg.batch_limit,
+            janitor_cfg.dedup_outage.enabled,
         )
     else:
         logger.info('  Ticket janitor: disabled')
