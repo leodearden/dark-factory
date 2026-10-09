@@ -4827,7 +4827,7 @@ class Scheduler:
         else the first UNKNOWN (task 6518).  The arms run lazily in that
         order, so none runs, or logs, after an UNSATISFIED one.  Dispatch
         reads the boolean view (:meth:`_deps_satisfied`); park GC expires
-        only on UNSATISFIED (:meth:`_park_gc_reason`).
+        only on UNSATISFIED (:meth:`_park_hold_refusal`).
 
         **Local** (:meth:`_local_deps_verdict`): a dep is satisfied when its
         status is in :data:`TERMINAL_STATUSES` (``done`` or ``cancelled``).
@@ -6047,18 +6047,6 @@ class Scheduler:
                 data={'new_order': new_order},
             )
 
-    def _owner_is_live_dispatchable(self, ctx: TickContext, task_id: str) -> bool:
-        """The park-hold predicate (:meth:`_park_gc_reason`) seen from the operator lever.
-
-        Since esc-6040-7 D1 the evict lever mostly duplicates park GC: any
-        owner GC would expire is evicted here first (the drain runs just
-        ahead of GC, so reservation_force_evicted wins), and the lever is
-        refused exactly for the owners GC keeps — pending, dependencies
-        satisfied or merely unknown.  That refusal is the D4 guard against
-        the df-1865 destructive-eviction starvation.
-        """
-        return self._park_gc_reason(ctx, task_id) is None
-
     def _drain_park_eviction_requests(self, ctx: TickContext) -> None:
         """Drain queued park-eviction requests and apply force_clear for dead owners.
 
@@ -6066,9 +6054,11 @@ class Scheduler:
         park-GC sweep so the operator audit event (reservation_force_evicted)
         wins over park-GC's reservation_expired for the same dead owner.
 
-        D4 guard: if the owner is still a live dispatchable task, the row is
-        consumed (one-shot) but force_clear is NOT applied — a
-        reservation_force_evict_refused event is emitted instead.
+        D4 guard (df-1865 destructive-eviction starvation): if the owner may
+        still hold parks (:meth:`_park_hold_refusal` names no refusal), the
+        row is consumed (one-shot) but force_clear is NOT applied — a
+        reservation_force_evict_refused event is emitted instead.  The lever
+        is therefore refused for exactly the owners park GC keeps.
 
         For each drained task_id (dead owner):
           - force_clear + pop _skip_count
@@ -6078,9 +6068,8 @@ class Scheduler:
         if not self._park_eviction_store:
             return
         for task_id in self._park_eviction_store.drain(self._project_root):
-            # D4 guard: refuse eviction of a live, dispatchable owner.
             source = self.lock_table.reservation_source(task_id)
-            if self._owner_is_live_dispatchable(ctx, task_id):
+            if self._park_hold_refusal(ctx, task_id) is None:
                 self._emit_reservation(
                     EventType.reservation_force_evict_refused,
                     task_id,
@@ -6608,19 +6597,19 @@ class Scheduler:
         ``self.lock_table``/``self._skip_count`` and emits
         reservation_expired/reservation_restored events). Replaces the
         wall-clock lease mechanic: every park whose owner fails the
-        park-hold predicate (:meth:`_park_gc_reason`) is expired now, and
+        park-hold predicate (:meth:`_park_hold_refusal`) is expired now, and
         the owner's skip count goes with it. Runs after
         ``external_dep_policy`` and ``delivered_check_gate``, so the
         dependency arm sees this tick's caches, and before ``reserve_now``
         and the dispatch loops, so neither builds on a dead park. Always
         continues.
         """
-        for owner in self._expire_parks(partial(self._park_gc_reason, ctx)):
+        for owner in self._expire_parks(partial(self._park_hold_refusal, ctx)):
             self._skip_count.pop(owner, None)
         return _CONTINUE
 
-    def _park_gc_reason(self, ctx: TickContext, owner: str) -> str | None:
-        """The park-hold predicate: why *owner* may not hold parks, or None.
+    def _park_hold_refusal(self, ctx: TickContext, owner: str) -> str | None:
+        """The park-hold predicate: why *owner* may not hold parks, or None if it may.
 
         An owner may hold parks, pin reservations included, iff it is pending
         and its dependencies are not known to be unsatisfied (esc-6040-7
@@ -7232,7 +7221,7 @@ class Scheduler:
         calls). The per-tick cache is forwarded to ``_eligible_for_dispatch``
         at both call sites below (``_phase_build_candidates`` /
         ``_phase_select_pins``) and read by park GC and the park-eviction
-        drain through ``_park_gc_reason``; ``_apply_external_dep_policy`` runs the
+        drain through ``_park_hold_refusal``; ``_apply_external_dep_policy`` runs the
         side-effecting pass (counter increments, escalation callbacks)
         exactly once per tick, wrapped in try/except so a policy-pass
         failure degrades to fail-safe-wait instead of aborting the tick.
@@ -7280,7 +7269,7 @@ class Scheduler:
         ``external_dep_policy`` and before either candidate-dispatch loop
         (``build_candidates`` / ``select_pins``), both of which forward the
         cache into ``_eligible_for_dispatch`` → ``_deps_satisfied``; park GC
-        and the park-eviction drain read it through ``_park_gc_reason``.
+        and the park-eviction drain read it through ``_park_hold_refusal``.
         ``_compute_delivered_check_cache`` already collects the relevant
         (terminal, checked) deps internally — a dep-free or check-free
         pending task is a no-op for it — so this phase simply forwards all
@@ -7383,7 +7372,7 @@ class Scheduler:
         """Snapshot pre-short-circuit overrides, then reserve-now.
 
         Reads: ``ctx.overrides``, the ctx fields the park-hold predicate
-        (:meth:`_park_gc_reason`) reads, and ``ctx.effective_priorities``
+        (:meth:`_park_hold_refusal`) reads, and ``ctx.effective_priorities``
         (parks install at, or an owner's lower-tier park is raised to, the
         effective tier).  Writes: ``ctx.overrides_for_diff`` (snapshot
         BEFORE the short-circuit below), then mutates ``ctx.overrides`` in
@@ -7402,7 +7391,7 @@ class Scheduler:
         for rid, rrow in list(ctx.overrides.items()):
             if not rrow.reserve_now:
                 continue
-            refusal = self._park_gc_reason(ctx, rid)
+            refusal = self._park_hold_refusal(ctx, rid)
             if refusal is not None:
                 self._consume_reserve_now(store, ctx, rid)
                 if self.event_store:
@@ -7825,7 +7814,7 @@ class Scheduler:
         the head's pin rank on every key they share.  (Pins with no stored
         pin_order tie at one rank, so there the shared key waits for the
         head's next completion.)  Owners that fail the park-hold predicate
-        (:meth:`_park_gc_reason`) lost every park, pin entries included, in
+        (:meth:`_park_hold_refusal`) lost every park, pin entries included, in
         park GC earlier in the tick; completion runs only for an owner that
         is still a dispatch candidate.
         """

@@ -524,7 +524,7 @@ delivered-check dependency was never consulted, because park GC ran before the p
 that fill those caches.
 
 **New behaviour.** One owner-state predicate,
-`orchestrator/src/orchestrator/scheduler.py::Scheduler._park_gc_reason`, decides whether
+`orchestrator/src/orchestrator/scheduler.py::Scheduler._park_hold_refusal`, decides whether
 an owner may hold parks, pin reservations included: it must be `pending`, and no
 dependency may be known to be unsatisfied. An UNKNOWN dependency (resolver failed,
 dependency absent from the resolver's answer, delivered check not evaluated this tick)

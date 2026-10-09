@@ -537,7 +537,7 @@ merely unknown this tick keeps the park (INV-3, corroborate before acting). This
 earned-fairness completion now runs only for an owner that is still a dispatch
 candidate that tick, so a blocked or deferred pin head drops its whole footprint instead
 of re-parking it. Hand-carries (deferred owners) get no park protection (D8). The rule
-has one home, `orchestrator/src/orchestrator/scheduler.py::Scheduler._park_gc_reason`,
+has one home, `orchestrator/src/orchestrator/scheduler.py::Scheduler._park_hold_refusal`,
 which park GC, the operator eviction guard and `reserve_now` all consult.
 
 ## 8. Pre-conditions and substrate verification (G3)

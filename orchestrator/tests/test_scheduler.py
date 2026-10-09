@@ -12334,8 +12334,8 @@ class TestDrainFiresWithNoActiveTasks:
 class TestAcquireNextFmReadFailureFailSafe:
     """acquire_next() must NOT drain park-evictions when get_tasks signals a
     read FAILURE (get_tasks(distinguish_failure=True) returns None) — draining
-    with empty status_map/tasks_by_id would make _owner_is_live_dispatchable
-    return False for every id, bypassing the D4 live-owner guard and
+    with empty status_map/tasks_by_id would make _park_hold_refusal name a
+    refusal ('missing') for every id, bypassing the D4 live-owner guard and
     force-evicting still-live owners during an fm outage/restart.
 
     A genuine empty result ([]) is NOT a failure and still drains exactly as

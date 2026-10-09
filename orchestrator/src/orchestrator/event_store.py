@@ -566,7 +566,7 @@ class EventType(StrEnum):
     # lies above every tier, so no tier describes it.
     reservation_installed = 'reservation_installed'
     reservation_install_blocked = 'reservation_install_blocked'
-    # reservation_expired reasons: owner-state ones on scheduler.py::Scheduler._park_gc_reason,
+    # reservation_expired reasons: owner-state ones on scheduler.py::Scheduler._park_hold_refusal,
     # pin-phase ones on pin_reservation.py::PinReleaseReason.
     reservation_expired = 'reservation_expired'
     reservation_evicted = 'reservation_evicted'
@@ -715,7 +715,7 @@ class EventType(StrEnum):
     # scheduler.py::Scheduler._phase_reserve_now, when the owner fails the
     # park-hold predicate; the flag is consumed and nothing installs.  Data
     # {reason}, in the owner-state reservation_expired vocabulary documented
-    # on scheduler.py::Scheduler._park_gc_reason.
+    # on scheduler.py::Scheduler._park_hold_refusal.
     reserve_now_armed = 'reserve_now_armed'
     reserve_now_consumed = 'reserve_now_consumed'
     reserve_now_refused = 'reserve_now_refused'
