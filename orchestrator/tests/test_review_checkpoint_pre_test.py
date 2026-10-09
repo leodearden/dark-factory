@@ -33,7 +33,7 @@ class TestReviewPreTestConfig:
     def test_commands_preserve_order(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
-        cfg = OrchestratorConfig(review={'pre_test_commands': ['a', 'b']})
+        cfg = OrchestratorConfig(review=ReviewConfig(pre_test_commands=['a', 'b']))
         assert cfg.review.pre_test_commands == ['a', 'b']
 
     @pytest.mark.parametrize('bad', [0, -1])
@@ -45,9 +45,9 @@ class TestReviewPreTestConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         live = OrchestratorConfig()
-        fresh = OrchestratorConfig(
-            review={'pre_test_commands': ['npm run build'], 'pre_test_timeout_secs': 600.0},
-        )
+        fresh = OrchestratorConfig(review=ReviewConfig(
+            pre_test_commands=['npm run build'], pre_test_timeout_secs=600.0,
+        ))
 
         report = apply_reload(live, fresh)
 
@@ -110,6 +110,11 @@ def _patch_phase1(monkeypatch, phase1: AsyncMock) -> AsyncMock:
     return phase1
 
 
+def _prompt_of(reviewer: AsyncMock) -> str:
+    assert reviewer.await_args is not None
+    return reviewer.await_args.kwargs['prompt']
+
+
 def _saved_report(tmp_path: Path, report: ReviewReport) -> dict:
     path = tmp_path / 'reports' / f'review-{report.review_id}.json'
     return json.loads(path.read_text())
@@ -149,7 +154,7 @@ class TestReviewCheckpointPreTest:
         phase1.assert_awaited_once()
         assert report.pre_test == ()
         assert 'pre_test_commands' not in _saved_report(tmp_path, report)
-        assert 'Pre-test' not in reviewer.await_args.kwargs['prompt']
+        assert 'Pre-test' not in _prompt_of(reviewer)
 
     async def test_failing_command_does_not_abort_review_and_is_reported(
         self, monkeypatch, tmp_path, caplog,
@@ -166,7 +171,7 @@ class TestReviewCheckpointPreTest:
 
         phase1.assert_awaited_once()
         reviewer.assert_awaited_once()
-        prompt = reviewer.await_args.kwargs['prompt']
+        prompt = _prompt_of(reviewer)
         assert (
             prompt.index('## Phase 1 Results')
             < prompt.index('setup-broke-tail')
