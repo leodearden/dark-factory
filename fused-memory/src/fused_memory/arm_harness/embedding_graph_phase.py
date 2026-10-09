@@ -142,18 +142,20 @@ async def _require_frozen_reference(
     arm: EmbeddingArmSpec, client: ArmGraphClient, reference: FrozenReference
 ) -> tuple[Topology, CheckResult]:
     live = await read_topology(client.select_graph(reference.graph), reference.graph)
-    live_hash = topology_hash(*live)
+    return live, _require_passed(arm, frozen_reference_check(reference, topology_hash(*live)))
+
+
+def frozen_reference_check(reference: FrozenReference, live_hash: str) -> CheckResult:
+    """Whether the graph every arm copies still hashes to its pin."""
     check_id = InstrumentCheckId.FROZEN_REFERENCE_UNCHANGED
     if live_hash != reference.topology_hash:
-        check = check_failed(
+        return check_failed(
             check_id,
-            f'{reference.graph!r} hashes to {live_hash} live, not the probe set pin '
+            f'{reference.graph!r} hashes to {live_hash} live, not its pin '
             f'{reference.topology_hash}: the graph every arm copies has changed',
             (reference.graph,),
         )
-    else:
-        check = check_passed(check_id, f'{reference.graph!r} still hashes to {live_hash}')
-    return live, _require_passed(arm, check)
+    return check_passed(check_id, f'{reference.graph!r} still hashes to {live_hash}')
 
 
 async def _require_integrity(

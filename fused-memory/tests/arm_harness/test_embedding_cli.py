@@ -846,8 +846,10 @@ def test_embed_compare_prints_a_row_per_margin_then_the_envelope_and_verdict(
     inputs = _derived_inputs()
     prereg = tmp_path / 'inputs.json'
     prereg.write_text(serialize_embedding_preregistration_inputs(inputs))
-    runs = {GRANITE: {}, QWEN: {'with_indices': (0.5, 0.6, 0.4)}}
-    run_dirs = [_embedding_run(tmp_path, spec, **values) for spec, values in runs.items()]
+    runs: tuple[tuple[EmbeddingArmSpec, dict[str, Any]], ...] = (
+        (GRANITE, {}), (QWEN, {'with_indices': (0.5, 0.6, 0.4)})
+    )
+    run_dirs = [_embedding_run(tmp_path, spec, **values) for spec, values in runs]
     argv = ['embed-compare', '--preregistration', str(prereg)]
     for run_dir in run_dirs:
         argv += ['--run', str(run_dir)]
@@ -857,7 +859,7 @@ def test_embed_compare_prints_a_row_per_margin_then_the_envelope_and_verdict(
     assert code == harness.EXIT_OK
     lines = capsys.readouterr().out.splitlines()
     assert load_embedding_preregistration_inputs(prereg) == inputs
-    for spec, values in runs.items():
+    for spec, values in runs:
         comparison = compare_embedding_arm(
             inputs, embedding_run_manifest(spec), embedding_records(spec, **values)
         )
