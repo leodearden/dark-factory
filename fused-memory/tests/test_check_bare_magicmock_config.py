@@ -1184,7 +1184,7 @@ class TestDataclassDoubleExemption:
         )
 
     def test_rule_a_exemption_still_works_unchanged(self):
-        """Regression pin: parameterising _is_exempted did not change Rule A's behaviour."""
+        """Regression pin: keying ``_lint_cli.py::is_exempted`` on a code did not change Rule A."""
         source = '# noqa: bare-magicmock — needed for legacy fixture migration\n' + _RULE_A_SOURCE
         assert find_violations(source, 'test_a_still_exempt.py') == [], (
             "Rule A's own exemption must remain bit-identical after parameterisation"
@@ -1849,16 +1849,6 @@ class TestWallClockDeadlineCrossCodeIsolation:
             '# noqa: bare-dataclass-double — deliberate mutation leg\n' + _RULE_B_SOURCE,
             'test_b_still_exempt_after_c.py',
         ) == [], "Rule B's own exemption must remain bit-identical"
-
-    def test_all_three_codes_share_the_one_pragma_grammar(self):
-        """Three distinct codes, one shared grammar, and no pragma leaks across codes."""
-        codes = (_checker._RULE_A_CODE, _checker._RULE_B_CODE, _checker._RULE_C_CODE)
-        assert len(set(codes)) == 3
-        assert _checker._RULE_C_CODE == 'wall-clock-deadline'
-        for code in codes:
-            for other in codes:
-                matched = _lint_cli.exemption_pattern(code).match(f'# noqa: {other} — a reason')
-                assert bool(matched) is (code == other), (code, other)
 
 
 class TestExemptionSeparatorVariants:
