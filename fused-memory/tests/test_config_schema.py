@@ -4194,3 +4194,43 @@ class TestWriteJournalConfig:
         # Unmentioned leaves keep their defaults rather than being clobbered.
         assert section.write_retention_days == 730.0
         assert section.prune_batch_size == 5000
+
+
+class TestDedupOutageDetectorConfig:
+    """Task 4718: the TicketJanitor's dedup-outage detector is configured under
+    ``curator.janitor.dedup_outage``. The defaults are back-tested in
+    ``plans/curator-dedup-outage-2026-08-15-rca.md``.
+    """
+
+    def test_nested_under_the_ticket_janitor_config(self):
+        from fused_memory.config.schema import DedupOutageDetectorConfig, TicketJanitorConfig
+
+        assert isinstance(TicketJanitorConfig().dedup_outage, DedupOutageDetectorConfig)
+
+    def test_defaults(self):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        cfg = DedupOutageDetectorConfig()
+
+        assert cfg.enabled is True
+        assert cfg.window_seconds == 21600.0
+        assert cfg.min_samples == 10
+        assert cfg.max_median_resolve_seconds == 15.0
+
+    @pytest.mark.parametrize(
+        'field',
+        ['window_seconds', 'max_median_resolve_seconds', 'min_samples'],
+    )
+    def test_non_positive_bounds_are_rejected(self, field):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        with pytest.raises(ValidationError) as excinfo:
+            DedupOutageDetectorConfig.model_validate({field: 0})
+        assert field in str(excinfo.value)
+
+    def test_reachable_from_the_top_level_config(self):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        section = FusedMemoryConfig().curator.janitor.dedup_outage
+
+        assert isinstance(section, DedupOutageDetectorConfig)

@@ -6677,6 +6677,49 @@ async def test_get_curator_schedules_startup_self_check(
     assert (await_args.kwargs.get('project_root') or await_args.args[-1]) == str(tmp_path)
 
 
+# ── Curator invocations ledger wiring (task 4718) ──────────────────────────
+
+
+def _config_without_curator_startup_tasks() -> FusedMemoryConfig:
+    """No taskmaster project_root, so ``_get_curator`` schedules no backfill or self-check."""
+    config = FusedMemoryConfig()
+    config.taskmaster = None
+    return config
+
+
+@pytest.mark.asyncio
+async def test_get_curator_forwards_the_borrowed_cost_store(
+    taskmaster, reconciler, event_buffer,
+):
+    gate = MagicMock()
+    store = MagicMock()
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer,
+        config=_config_without_curator_startup_tasks(), usage_gate=gate, cost_store=store,
+    )
+
+    with patch('fused_memory.middleware.task_interceptor.TaskCurator') as curator_cls:
+        assert await interceptor._get_curator() is curator_cls.return_value
+
+    kwargs = curator_cls.call_args.kwargs
+    assert kwargs['cost_store'] is store
+    assert kwargs['usage_gate'] is gate
+
+
+@pytest.mark.asyncio
+async def test_get_curator_forwards_no_cost_store_by_default(
+    taskmaster, reconciler, event_buffer,
+):
+    interceptor = TaskInterceptor(
+        taskmaster, reconciler, event_buffer, config=_config_without_curator_startup_tasks(),
+    )
+
+    with patch('fused_memory.middleware.task_interceptor.TaskCurator') as curator_cls:
+        await interceptor._get_curator()
+
+    assert curator_cls.call_args.kwargs['cost_store'] is None
+
+
 # ── Tests for background task retention (step-3) ───────────────────────────
 
 

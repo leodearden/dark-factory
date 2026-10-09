@@ -12,6 +12,7 @@ import socket
 import sys
 import threading
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -24,7 +25,10 @@ from functools import partial  # noqa: E402
 from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
 from shared.systemd_listeners import take_systemd_listeners  # noqa: E402
 
-from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
+from fused_memory.config.schema import (  # noqa: E402
+    DedupOutageDetectorConfig,
+    FusedMemoryConfig,
+)
 from fused_memory.reconciliation.audit_trail_rotation import (  # noqa: E402
     memory_service_archive,
 )
@@ -915,6 +919,7 @@ async def run_server():
             event_queue=event_queue,
             backlog_policy=backlog_policy,
             usage_gate=curator_usage_gate,
+            cost_store=curator_cost_store,
             ticket_store=ticket_store,
             bulk_reset_guard=bulk_reset_guard,
             prefix_registry=prefix_registry,
@@ -1003,6 +1008,7 @@ async def run_server():
             taskmaster, None, event_buffer,
             config=config, escalator=curator_escalator,
             usage_gate=curator_usage_gate,
+            cost_store=curator_cost_store,
             ticket_store=ticket_store,
             prefix_registry=prefix_registry,
             scope_violation_escalator=scope_violation_escalator,
@@ -1062,8 +1068,9 @@ async def run_server():
     loop_lag_task: asyncio.Task[None] = _start_loop_lag_monitor(config)
 
     # Ticket janitor — periodic sweep that surfaces failed tickets to the
-    # orchestrator as info-severity ticket_failure escalations. Replaces the
-    # per-call resolve_ticket wait the steward / deep_reviewer used to chain.
+    # orchestrator as info-severity ticket_failure escalations, and the curator
+    # dedup-outage signature as a blocking infra_issue. Replaces the per-call
+    # resolve_ticket wait the steward / deep_reviewer used to chain.
     janitor_task: asyncio.Task[None] | None = None
     janitor_cfg = getattr(config.curator, 'janitor', None)
     if janitor_cfg is not None and janitor_cfg.enabled and ticket_store is not None:
@@ -1076,6 +1083,7 @@ async def run_server():
             _janitor_primary_root = str(
                 Path(_janitor_primary_root).expanduser().resolve(),
             )
+        dedup_outage_cfg = _dedup_outage_detector_config(config)
         ticket_janitor = TicketJanitor(
             ticket_store,
             cooldown_secs=janitor_cfg.cooldown_seconds,
@@ -1090,15 +1098,18 @@ async def run_server():
                 if task_interceptor is not None else None
             ),
             known_projects=_known_projects_map,
+            dedup_outage=dedup_outage_cfg,
         )
         janitor_task = asyncio.create_task(
             ticket_janitor.run_loop(janitor_cfg.interval_seconds),
         )
         logger.info(
-            '  Ticket janitor: enabled (interval=%.0fs cooldown=%.0fs batch=%d)',
+            '  Ticket janitor: enabled (interval=%.0fs cooldown=%.0fs batch=%d '
+            'dedup_outage=%s)',
             janitor_cfg.interval_seconds,
             janitor_cfg.cooldown_seconds,
             janitor_cfg.batch_limit,
+            dedup_outage_cfg is not None and dedup_outage_cfg.enabled,
         )
     else:
         logger.info('  Ticket janitor: disabled')
@@ -1604,8 +1615,6 @@ async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
     from :func:`_periodic_checkpoint_loop` so unit tests can exercise the
     bookkeeping without waiting for ``_CHECKPOINT_INTERVAL``.
     """
-    from datetime import UTC, datetime
-
     now_iso = datetime.now(UTC).isoformat()
     for name, fn in targets:
         try:
@@ -1835,13 +1844,37 @@ def _resolve_curator_escalator_state_path(config: FusedMemoryConfig) -> Path:
     return Path('./data/curator_escalator_state.json')
 
 
+def _dedup_outage_detector_config(
+    config: FusedMemoryConfig,
+) -> DedupOutageDetectorConfig | None:
+    """The janitor's dedup-outage detector config, or None with the curator disabled.
+
+    A deliberately disabled curator resolves every ticket as a fast create
+    with no combine, which is the outage signature; there is no dedup to lose.
+    ``curator.enabled`` is restart-only, so deciding once at wiring is exact.
+    """
+    if not config.curator.enabled:
+        return None
+    return config.curator.janitor.dedup_outage
+
+
+def _mint_curator_run_id() -> str:
+    """A readable per-process curator run id: a fused-memory restart is a run boundary."""
+    return f'fused-memory-{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{os.getpid()}'
+
+
 async def _setup_curator_usage_gate(
     config: FusedMemoryConfig,
+    *,
+    run_id: str | None = None,
 ) -> tuple[CostStore | None, UsageGate | None]:
     """Open a CostStore and construct a UsageGate for the curator, with leak protection.
 
     If ``config.usage_cap`` is None or disabled, returns ``(None, None)``
     without allocating any resources.
+
+    The gate is stamped with *run_id* (minted per process when omitted), the
+    run key the gate's account events and the curator's invocations share.
 
     Otherwise the CostStore is opened first (persistent aiosqlite connection).
     If ``UsageGate.__init__`` or the success-path log subsequently raises for
@@ -1874,6 +1907,7 @@ async def _setup_curator_usage_gate(
     curator_usage_gate: UsageGate | None = None
     try:
         curator_usage_gate = UsageGate(config.usage_cap, cost_store=curator_cost_store)
+        curator_usage_gate.run_id = run_id or _mint_curator_run_id()
         logger.info(
             f'  Curator usage gate: {curator_usage_gate.account_count} account(s) '
             f'from {config.usage_cap.accounts_file or "inline"}',

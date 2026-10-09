@@ -979,3 +979,243 @@ async def test_worker_dead_reap_no_signal_callback_is_safe(store, tmp_path):
         assert row['reason'] == 'worker_dead'
     finally:
         handle.close()
+
+
+class TestDedupOutageDetector:
+    """The janitor escalates the dedup-outage signature: a window of curated
+    tickets with no combine at all, resolved faster than a real curator LLM
+    call can complete (task 4718).
+
+    The detector walks the injected project registry, so an unresolvable
+    project_root cannot arise for it; its routing bail-outs are the
+    escalation package being absent, the orchestrator not running, and the
+    submit raising.
+    """
+
+    _OUTAGE_REASON = 'create: llm-failed: FileNotFoundError: x'
+
+    @pytest.fixture
+    def pid(self, tmp_path):
+        return _project_id_for(tmp_path)
+
+    @pytest.fixture
+    def lock(self, tmp_path):
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        yield handle
+        handle.close()
+
+    @staticmethod
+    def _janitor(store, tmp_path, pid, cfg=None, **kwargs):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        return TicketJanitor(
+            store,
+            known_projects={pid: str(tmp_path)},
+            dedup_outage=cfg if cfg is not None else DedupOutageDetectorConfig(),
+            **kwargs,
+        )
+
+    @staticmethod
+    async def _seed(store, tmp_path, pid, *, created, combined=0, latency_s=2.0,
+                    reason=_OUTAGE_REASON):
+        from datetime import UTC, datetime, timedelta
+
+        from _fm_helpers import seed_resolved_ticket
+
+        resolved_at = datetime.now(UTC) - timedelta(minutes=5)
+        for _ in range(created):
+            await seed_resolved_ticket(
+                store, tmp_path / 'tickets.db', pid, status='created',
+                latency_s=latency_s, resolved_at=resolved_at, reason=reason,
+            )
+        for _ in range(combined):
+            await seed_resolved_ticket(
+                store, tmp_path / 'tickets.db', pid, status='combined',
+                latency_s=latency_s, resolved_at=resolved_at, reason='combine: x',
+            )
+
+    @staticmethod
+    def _escalations(root: Path) -> list[dict]:
+        esc_dir = root / 'data' / 'escalations'
+        if not esc_dir.exists():
+            return []
+        return [json.loads(f.read_text()) for f in sorted(esc_dir.glob('esc-*.json'))]
+
+    @pytest.mark.asyncio
+    async def test_fires_one_blocking_infra_escalation_naming_the_reason(
+        self, store, tmp_path, pid, lock,
+    ):
+        await self._seed(store, tmp_path, pid, created=10)
+
+        await self._janitor(store, tmp_path, pid).tick()
+
+        escalations = self._escalations(tmp_path)
+        assert len(escalations) == 1, escalations
+        body = escalations[0]
+        assert body['category'] == 'infra_issue'
+        assert body['agent_role'] == 'fused-memory/ticket-janitor'
+        assert body['task_id'] == 'task-curator'
+        assert body['level'] == 1
+        assert body['severity'] == 'blocking'
+        assert pid in body['summary']
+        assert '10 tickets resolved' in body['summary']
+        assert '0 combined' in body['summary']
+        assert 'median resolve 2.0s' in body['summary']
+        detail = json.loads(body['detail'])
+        assert detail['project_id'] == pid
+        assert detail['window_seconds'] == 21600.0
+        assert detail['resolved'] == 10
+        assert detail['combined'] == 0
+        assert detail['median_resolve_seconds'] == pytest.approx(2.0, abs=1e-3)
+        assert detail['top_create_reasons'] == [[self._OUTAGE_REASON, 10]]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('created', 'combined', 'latency_s'),
+        [(10, 1, 2.0), (10, 0, 100.0), (9, 0, 2.0)],
+        ids=['one-combine', 'slow-median', 'too-few-samples'],
+    )
+    async def test_does_not_fire_without_the_full_signature(
+        self, store, tmp_path, pid, lock, created, combined, latency_s,
+    ):
+        await self._seed(
+            store, tmp_path, pid, created=created, combined=combined, latency_s=latency_s,
+        )
+
+        await self._janitor(store, tmp_path, pid).tick()
+
+        assert self._escalations(tmp_path) == []
+
+    @pytest.mark.asyncio
+    async def test_disabled_or_omitted_config_does_not_fire(self, store, tmp_path, pid, lock):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        await self._seed(store, tmp_path, pid, created=10)
+
+        await self._janitor(
+            store, tmp_path, pid, cfg=DedupOutageDetectorConfig(enabled=False),
+        ).tick()
+        await TicketJanitor(store, known_projects={pid: str(tmp_path)}).tick()
+
+        assert self._escalations(tmp_path) == []
+
+    @pytest.mark.asyncio
+    async def test_rate_limited_on_its_own_window_length(
+        self, store, tmp_path, pid, lock, monkeypatch,
+    ):
+        import types
+
+        clock = [1_000_000.0]
+        monkeypatch.setattr(
+            ticket_janitor, 'time', types.SimpleNamespace(monotonic=lambda: clock[0]),
+        )
+        await self._seed(store, tmp_path, pid, created=10)
+        janitor = self._janitor(store, tmp_path, pid, cooldown_secs=3600.0)
+
+        await janitor.tick()
+        await janitor.tick()
+        clock[0] += 3601.0
+        await janitor.tick()
+        assert len(self._escalations(tmp_path)) == 1, (
+            'a sustained outage must not re-escalate inside window_seconds, '
+            'even past the janitor-wide cooldown'
+        )
+
+        clock[0] += 21600.0
+        await janitor.tick()
+        assert len(self._escalations(tmp_path)) == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('bail_out', ['no-escalation-package', 'submit-raises'])
+    async def test_bail_out_records_no_rate_limit(
+        self, store, tmp_path, pid, lock, monkeypatch, bail_out,
+    ):
+        await self._seed(store, tmp_path, pid, created=10)
+        janitor = self._janitor(store, tmp_path, pid)
+
+        def _raise(*_args, **_kwargs):
+            raise OSError('disk full')
+
+        with monkeypatch.context() as m:
+            if bail_out == 'no-escalation-package':
+                m.setattr(ticket_janitor, 'HAS_ESCALATION', False)
+            else:
+                m.setattr(ticket_janitor.EscalationQueue, 'submit', _raise)
+            await janitor.tick()
+        assert self._escalations(tmp_path) == []
+
+        await janitor.tick()
+        assert len(self._escalations(tmp_path)) == 1
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_not_running_records_no_rate_limit(self, store, tmp_path, pid):
+        _make_orchestrator_layout(tmp_path, hold_lock=False)
+        await self._seed(store, tmp_path, pid, created=10)
+        janitor = self._janitor(store, tmp_path, pid)
+
+        await janitor.tick()
+        assert self._escalations(tmp_path) == []
+
+        handle = _make_orchestrator_layout(tmp_path, hold_lock=True)
+        try:
+            await janitor.tick()
+        finally:
+            handle.close()
+        assert len(self._escalations(tmp_path)) == 1
+
+    @pytest.mark.asyncio
+    async def test_raising_health_read_leaves_the_failure_sweep_running(
+        self, store, tmp_path, pid, lock, monkeypatch,
+    ):
+        from unittest.mock import AsyncMock
+
+        ticket_id = await store.submit(
+            project_id=pid,
+            candidate_json=_candidate_blob(task_id='task-7', escalation_id='esc-7-1'),
+        )
+        await _force_failed(store, ticket_id, reason='curator_rejected')
+        monkeypatch.setattr(
+            store, 'dedup_health', AsyncMock(side_effect=RuntimeError('db gone')),
+        )
+
+        await self._janitor(store, tmp_path, pid).tick()
+
+        assert _escalation_categories(tmp_path) == ['ticket_failure']
+
+    @pytest.mark.asyncio
+    async def test_detector_and_failure_sweep_both_run_in_one_tick(
+        self, store, tmp_path, pid, lock,
+    ):
+        await self._seed(store, tmp_path, pid, created=10)
+        ticket_id = await store.submit(
+            project_id=pid,
+            candidate_json=_candidate_blob(task_id='task-7', escalation_id='esc-7-1'),
+        )
+        await _force_failed(store, ticket_id, reason='curator_rejected')
+
+        await self._janitor(store, tmp_path, pid).tick()
+
+        assert sorted(_escalation_categories(tmp_path)) == ['infra_issue', 'ticket_failure']
+
+    @pytest.mark.asyncio
+    async def test_each_project_is_judged_independently(self, store, tmp_path):
+        from fused_memory.config.schema import DedupOutageDetectorConfig
+
+        roots = {name: tmp_path / name for name in ('alpha', 'beta')}
+        handles = [_make_orchestrator_layout(root, hold_lock=True) for root in roots.values()]
+        try:
+            await self._seed(store, tmp_path, 'alpha', created=10)
+            await self._seed(store, tmp_path, 'beta', created=10, combined=3, latency_s=90.0)
+            janitor = TicketJanitor(
+                store,
+                known_projects={pid: str(root) for pid, root in roots.items()},
+                dedup_outage=DedupOutageDetectorConfig(),
+            )
+
+            await janitor.tick()
+        finally:
+            for handle in handles:
+                handle.close()
+
+        assert len(self._escalations(roots['alpha'])) == 1
+        assert self._escalations(roots['beta']) == []

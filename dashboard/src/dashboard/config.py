@@ -249,6 +249,11 @@ class DashboardConfig:
         return self._runtime_data_dir('RECONCILIATION_DATA_DIR', 'reconciliation') / 'tickets.db'
 
     @property
+    def curator_events_db(self) -> Path:
+        """The fused-memory curator's invocation ledger (sibling of tickets.db)."""
+        return self._runtime_data_dir('RECONCILIATION_DATA_DIR', 'reconciliation') / 'curator_events.db'
+
+    @property
     def write_queue_db(self) -> Path:
         return self._runtime_data_dir('QUEUE_DATA_DIR', 'queue') / 'write_queue.db'
 

@@ -76,6 +76,7 @@ from fused_memory.utils.task_dependency_ids import task_dependency_ids as _task_
 
 if TYPE_CHECKING:
     from qdrant_client.models import ExtendedPointId
+    from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
 
     from fused_memory.backends.task_backend_protocol import TaskBackendProtocol
@@ -139,6 +140,22 @@ class CuratorFailureError(RuntimeError):
         self.cost_usd = cost_usd
         self.transcript_turns = transcript_turns
         self.tools_used = tools_used
+
+
+_EXCEPTION_SUMMARY_MAX_CHARS = 120
+
+
+def exception_summary(exc: BaseException) -> str:
+    """How an exception is written into a decision justification or a ticket reason.
+
+    ``<ExcType>: <first line of the message>``, the line cut to
+    ``_EXCEPTION_SUMMARY_MAX_CHARS``: diagnostic enough to name a missing
+    binary, yet bounded, so identical failures group under one reason.
+    """
+    lines = str(exc).strip().splitlines()
+    first_line = lines[0][:_EXCEPTION_SUMMARY_MAX_CHARS] if lines else ''
+    name = type(exc).__name__
+    return f'{name}: {first_line}' if first_line else name
 
 
 # 'drop', 'combine' and 'create' are the only actions the LLM may request — see
@@ -902,10 +919,12 @@ class TaskCurator:
         escalator: CuratorEscalator | None = None,
         prompt_store: PromptArtifactStore | None = None,
         config_dir_base: Path | None = None,
+        cost_store: CostStore | None = None,
     ) -> None:
         self._config = config
         self._taskmaster = taskmaster
         self._usage_gate = usage_gate
+        self._cost_store = cost_store
         self._cwd = cwd
         self._escalator = escalator
         self._prompt_store = prompt_store
@@ -1872,7 +1891,7 @@ class TaskCurator:
                     exc_info=True,
                 )
                 decision = await self._degraded_create(
-                    justification=f'corpus-failed: {exc}',
+                    justification=f'corpus-failed: {exception_summary(exc)}',
                     pool_sizes={
                         'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0,
                     },
@@ -1996,7 +2015,7 @@ class TaskCurator:
                     pool_sizes=pool_sizes,
                 )
             decision = await self._degraded_create(
-                justification=f'llm-failed: {type(exc).__name__}: {exc}',
+                justification=f'llm-failed: {exception_summary(exc)}',
                 pool_sizes=pool_sizes,
                 start=start,
                 candidate=candidate,
@@ -3116,6 +3135,15 @@ class TaskCurator:
             )
         return self._config_dir
 
+    def _ledger_kwargs(self, role: str) -> dict[str, Any]:
+        """The ``invoke_with_cap_retry`` kwargs that land a call in the invocations ledger.
+
+        ``run_id`` is read from the gate, so curator invocations and the gate's
+        own account events share one run key.
+        """
+        run_id = (self._usage_gate.run_id or '') if self._usage_gate is not None else ''
+        return {'cost_store': self._cost_store, 'role': role, 'run_id': run_id}
+
     def _transcript_scope(self, timeout_seconds: float) -> _TranscriptScope | None:
         """A fresh transcript scope for one call, or None when there is no UsageGate."""
         config_dir = self._transcript_config_dir()
@@ -3255,6 +3283,7 @@ class TaskCurator:
             permission_mode='bypassPermissions',
             timeout_seconds=self._config.curator.timeout_seconds,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
+            **self._ledger_kwargs('task_curator'),
             **(transcript_scope.as_invoke_kwargs() if transcript_scope else {}),
         )
 
@@ -3361,6 +3390,7 @@ class TaskCurator:
             permission_mode='bypassPermissions',
             timeout_seconds=timeout,
             cap_wait_sanity_secs=_CURATOR_CAP_WAIT_SANITY_SECS,
+            **self._ledger_kwargs('task_curator_batch'),
             **(transcript_scope.as_invoke_kwargs() if transcript_scope else {}),
         )
 

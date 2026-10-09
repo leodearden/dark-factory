@@ -60,6 +60,7 @@ from fused_memory.middleware.task_curator import (
     _trim_pool,
     clip_for_prompt,
     embedding_text,
+    exception_summary,
     flatten_task_tree,
     is_combine_eligible_status,
     normalize_title,
@@ -1502,6 +1503,197 @@ class TestCallLlmNeutralCwd:
         assert curator._cwd == tmp_path
 
 
+class TestExceptionSummary:
+    """The one policy for exception text in a justification or ``tickets.reason``."""
+
+    def test_type_and_message(self):
+        exc = FileNotFoundError(2, 'No such file or directory')
+        exc.filename = 'claude'
+
+        assert exception_summary(exc) == (
+            "FileNotFoundError: [Errno 2] No such file or directory: 'claude'"
+        )
+
+    def test_only_the_first_line_survives(self):
+        assert exception_summary(RuntimeError('boom\n  at frame 1\n  at frame 2')) == (
+            'RuntimeError: boom'
+        )
+
+    def test_a_long_first_line_is_cut(self):
+        assert exception_summary(RuntimeError('x' * 500)) == 'RuntimeError: ' + 'x' * 120
+
+    def test_an_empty_message_leaves_the_type(self):
+        assert exception_summary(TimeoutError()) == 'TimeoutError'
+
+
+_EMPTY_POOL_SIZES = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
+
+
+async def _empty_corpus(*_args, **_kwargs):
+    return [], dict(_EMPTY_POOL_SIZES), PoolWithheld()
+
+
+async def _invocation_rows(db_path: Path) -> list[dict]:
+    import aiosqlite
+
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('SELECT * FROM invocations') as cursor:
+            return [dict(row) for row in await cursor.fetchall()]
+
+
+class TestCuratorInvocationLedger:
+    """Every curator CLI call lands one row in the CostStore ``invocations`` ledger.
+
+    Before task 4718 the curator passed no ``cost_store``, so its ledger stayed
+    empty and a dead curator was indistinguishable from an idle one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_single_call_passes_ledger_keys(self, tmp_path):
+        config = _make_config()
+        gate = MagicMock()
+        gate.run_id = 'fm-run-1'
+        store_sentinel: Any = object()
+        curator = TaskCurator(
+            config=config, taskmaster=None, usage_gate=gate,
+            config_dir_base=tmp_path, cost_store=store_sentinel,
+        )
+        mock = AsyncMock(return_value=_agent_result(
+            {'action': 'create', 'justification': 'x'},
+        ))
+
+        with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=mock):
+            await curator.curate(CandidateTask(title='T'), 'proj-a', str(tmp_path))
+
+        kwargs = mock.call_args.kwargs
+        assert kwargs['cost_store'] is store_sentinel
+        assert kwargs['role'] == 'task_curator'
+        assert kwargs['run_id'] == 'fm-run-1'
+        assert kwargs['project_id'] == 'proj-a'
+        assert kwargs['usage_gate'] is gate
+        assert kwargs['label'] == 'task-curator[proj-a]'
+        assert kwargs['model'] == config.curator.model
+        assert kwargs['max_turns'] == config.curator.max_turns
+        assert kwargs['disallowed_tools'] == ['*']
+        assert kwargs['output_schema'] is CURATOR_OUTPUT_SCHEMA
+        assert kwargs['timeout_seconds'] == config.curator.timeout_seconds
+        assert kwargs['cap_wait_sanity_secs'] is not None
+
+    @pytest.mark.asyncio
+    async def test_batch_call_passes_ledger_keys_with_batch_role(self, tmp_path):
+        gate = MagicMock()
+        gate.run_id = 'fm-run-1'
+        store_sentinel: Any = object()
+        curator = TaskCurator(
+            config=_make_config(), taskmaster=None, usage_gate=gate,
+            config_dir_base=tmp_path, cost_store=store_sentinel,
+        )
+        mock = AsyncMock(return_value=_agent_result({'decisions': [
+            {'candidate_index': 0, 'action': 'create', 'justification': 'n0'},
+            {'candidate_index': 1, 'action': 'create', 'justification': 'n1'},
+        ]}))
+
+        with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=mock):
+            await curator.curate_batch(
+                [CandidateTask(title='T0'), CandidateTask(title='T1')],
+                'proj-b', str(tmp_path),
+            )
+
+        kwargs = mock.call_args.kwargs
+        assert kwargs['cost_store'] is store_sentinel
+        assert kwargs['role'] == 'task_curator_batch'
+        assert kwargs['run_id'] == 'fm-run-1'
+        assert kwargs['project_id'] == 'proj-b'
+        assert kwargs['usage_gate'] is gate
+        assert kwargs['label'] == 'task-curator-batch[proj-b]'
+        assert kwargs['output_schema'] is CURATOR_BATCH_OUTPUT_SCHEMA
+
+    @pytest.mark.asyncio
+    async def test_two_arg_construction_passes_no_store_and_empty_run_id(self, tmp_path):
+        curator = TaskCurator(_make_config(), None)
+        mock = AsyncMock(return_value=_agent_result(
+            {'action': 'create', 'justification': 'x'},
+        ))
+
+        with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=mock):
+            await curator.curate(CandidateTask(title='T'), 'proj-c', str(tmp_path))
+
+        kwargs = mock.call_args.kwargs
+        assert kwargs['cost_store'] is None
+        assert kwargs['run_id'] == ''
+        assert kwargs['role'] == 'task_curator'
+
+    @pytest.mark.asyncio
+    async def test_one_curate_call_lands_one_invocations_row(self, tmp_path):
+        from shared.cost_store import CostStore
+
+        db_path = tmp_path / 'curator_events.db'
+        store = CostStore(db_path)
+        await store.open()
+        try:
+            config = _make_config()
+            curator = TaskCurator(
+                config=config, taskmaster=None, usage_gate=None, cost_store=store,
+            )
+            served = AgentResult(
+                success=True, output='',
+                structured_output={'action': 'create', 'justification': 'new work'},
+                duration_ms=1234, cost_usd=0.01,
+            )
+            with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+                 patch('shared.cli_invoke.invoke_claude_agent',
+                       new=AsyncMock(return_value=served)):
+                decision = await curator.curate(
+                    CandidateTask(title='Ledger Candidate'), 'proj-x', str(tmp_path),
+                )
+        finally:
+            await store.close()
+
+        assert decision.action == 'create'
+        rows = await _invocation_rows(db_path)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row['role'] == 'task_curator'
+        assert row['project_id'] == 'proj-x'
+        assert row['model'] == config.curator.model
+        assert row['duration_ms'] == 1234
+        assert row['capped'] == 0
+
+    @pytest.mark.asyncio
+    async def test_returned_failure_still_lands_a_row(self, tmp_path):
+        from shared.cost_store import CostStore
+
+        db_path = tmp_path / 'curator_events.db'
+        store = CostStore(db_path)
+        await store.open()
+        try:
+            curator = TaskCurator(
+                config=_make_config(), taskmaster=None, usage_gate=None, cost_store=store,
+            )
+            hung = AgentResult(
+                success=False, output='', structured_output=None,
+                timed_out=True, duration_ms=180_000,
+            )
+            with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+                 patch('shared.cli_invoke.invoke_claude_agent',
+                       new=AsyncMock(return_value=hung)):
+                decision = await curator.curate(
+                    CandidateTask(title='Hung Candidate'), 'proj-x', str(tmp_path),
+                )
+        finally:
+            await store.close()
+
+        assert decision.action == 'create'
+        assert decision.degraded is True
+        rows = await _invocation_rows(db_path)
+        assert len(rows) == 1
+        assert rows[0]['duration_ms'] == 180_000
+
+
 class TestZeroOutputTimeoutSignal:
     """Step-1 RED: CuratorFailureError carries zero_output_timeout + forensic evidence."""
 
@@ -1762,9 +1954,6 @@ class TestZeroOutputTimeoutAcceptance:
         assert result_a.action == 'create'
         assert result_b.action == 'drop'
         assert mock_llm.await_count == 2
-
-
-_EMPTY_POOL_SIZES = {'anchor': 0, 'module': 0, 'embedding': 0, 'dependency': 0}
 
 
 def _prepared(candidate: CandidateTask) -> PreparedCandidate:

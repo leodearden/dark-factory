@@ -101,6 +101,7 @@ from fused_memory.middleware.task_curator import (
     CuratorFailureError,
     PreparedCandidate,
     TaskCurator,
+    exception_summary,
     flatten_task_tree,
     is_combine_eligible_status,
     normalize_title,
@@ -130,6 +131,7 @@ from fused_memory.reconciliation.stale_gate_citation_guard import (
 )
 
 if TYPE_CHECKING:
+    from shared.cost_store import CostStore
     from shared.usage_gate import UsageGate
 
     from fused_memory.config.schema import FusedMemoryConfig
@@ -429,7 +431,41 @@ def _create_after_curator_failure(exc: CuratorFailureError) -> CuratorDecision:
     Keeps the ZOT marker, so the no-orchestrator path still gets swept and
     stamped even though no escalation could be filed for it.
     """
-    return CuratorDecision(action='create', degraded_by_zot=exc.zero_output_timeout)
+    return CuratorDecision(
+        action='create',
+        justification=f'curator-failed: {exception_summary(exc)}',
+        degraded_by_zot=exc.zero_output_timeout,
+    )
+
+
+# The label a non-create decision carries when its ticket still ends in a
+# create: a combine or drop that could not be executed fell through, and
+# route_deterministic creates by design.
+_CREATE_FALLTHROUGH_LABELS: dict[str, str] = {
+    'combine': 'combine-failed',
+    'drop': 'drop-failed',
+    'route_deterministic': 'route_deterministic',
+}
+
+
+def _create_reason(
+    decision: CuratorDecision | None, *, curator_unavailable: str | None = None,
+) -> str:
+    """The ``tickets.reason`` a ``created`` ticket persists: why it was created.
+
+    *curator_unavailable* is given only when no curator existed to decide; a
+    curator that existed but produced no decision is ``no-curator-decision``.
+    """
+    if decision is None:
+        if curator_unavailable is None:
+            return 'create: no-curator-decision'
+        return f'create: curator-unavailable: {curator_unavailable}'
+    parts = ['create']
+    if decision.action in _CREATE_FALLTHROUGH_LABELS:
+        parts.append(_CREATE_FALLTHROUGH_LABELS[decision.action])
+    if decision.justification:
+        parts.append(decision.justification)
+    return ': '.join(parts)
 
 
 class TaskInterceptor:
@@ -453,6 +489,7 @@ class TaskInterceptor:
         event_queue: 'EventQueue | None' = None,
         backlog_policy: 'BacklogPolicy | None' = None,
         usage_gate: 'UsageGate | None' = None,
+        cost_store: 'CostStore | None' = None,
         ticket_store: 'TicketStore | None' = None,
         bulk_reset_guard: 'BulkResetGuard | None' = None,
         prefix_registry: ProjectPrefixRegistry | None = None,
@@ -484,11 +521,16 @@ class TaskInterceptor:
         # _get_curator() because it pulls in a Qdrant client + embedder.
         self._config = config
         self._curator: TaskCurator | None = None
+        # exception_summary() of the last failed TaskCurator construction.
+        self._curator_construction_error: str | None = None
         self._escalator = escalator
         # Forwarded to ``TaskCurator`` for cap-aware LLM invocation across the
         # shared account pool. ``None`` falls back to the legacy single-shot
         # path with no cap retry — preserved for tests.
         self._usage_gate = usage_gate
+        # BORROWED from main.py, which owns its close; forwarded to TaskCurator
+        # so every curator CLI call lands a row in its invocations ledger.
+        self._cost_store = cost_store
         # Split per-project locks (2026-04-20; updated 2026-04-22 for ticket queue):
         #
         # ``_write_locks`` (short, high-frequency) serialises tasks.json
@@ -1919,7 +1961,9 @@ class TaskInterceptor:
                 cwd=cwd,
                 escalator=self._escalator,
                 usage_gate=self._usage_gate,
+                cost_store=self._cost_store,
             )
+            self._curator_construction_error = None
             # Trigger the one-shot backfill check as a background task so the
             # caller is not delayed by the Qdrant count() round-trip.
             if project_root is not None:
@@ -1945,9 +1989,20 @@ class TaskInterceptor:
                 self._background_tasks.add(check)
                 check.add_done_callback(lambda t: self._background_tasks.discard(t))
             return self._curator
-        except Exception:
+        except Exception as exc:
             logger.warning('Failed to create TaskCurator', exc_info=True)
+            self._curator_construction_error = exception_summary(exc)
             return None
+
+    def _curator_unavailable_reason(self) -> str:
+        """Why ``_get_curator()`` has no curator to hand out right now."""
+        if self._closed:
+            return 'closed'
+        if self._config is None or not self._config.curator.enabled:
+            return 'disabled'
+        if self._curator_construction_error is not None:
+            return f'construction-failed: {self._curator_construction_error}'
+        return 'unknown'
 
     async def _maybe_backfill_corpus(self, curator: TaskCurator, project_root: str) -> None:
         """Trigger a one-shot background backfill if the collection is empty.
@@ -4610,6 +4665,12 @@ class TaskInterceptor:
             # strand the task and cause duplicate-on-retry.
             task_id = task_id_str
             status = 'created'
+            reason = _create_reason(
+                decision,
+                curator_unavailable=(
+                    self._curator_unavailable_reason() if curator is None else None
+                ),
+            )
             result_dict = dict(result)
             if curator_degrade_reason is not None:
                 result_dict = {**result_dict, 'curator_degrade_reason': curator_degrade_reason}

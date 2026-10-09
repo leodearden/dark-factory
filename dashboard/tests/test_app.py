@@ -1603,6 +1603,56 @@ def test_costs_route_includes_by_model_role(client):
     assert by_model_role['turn_cap_saturation'] == fake_rollup['turn_cap_saturation']
 
 
+@pytest.fixture()
+def curator_ledger_row(client):
+    """One ``task_curator`` invocation in the running app's curator ledger.
+
+    The ledger sits under the session-scoped project root every ``client``
+    shares, so the db file (and its directory, if this fixture made it) is
+    deleted afterwards.
+    """
+    import asyncio
+    from datetime import UTC
+
+    from shared.cost_store import CostStore
+
+    ledger = client.app.state.config.curator_events_db
+    assert not ledger.exists(), f'{ledger} already exists; refusing to delete it afterwards'
+    made_dir = not ledger.parent.exists()
+    now = datetime.now(UTC).isoformat()
+
+    async def _write() -> None:
+        store = CostStore(ledger)
+        await store.open()
+        try:
+            await store.save_invocation(
+                run_id='fused-memory-x', task_id=None, project_id='dark_factory',
+                account_name='a', model='opus', role='task_curator', cost_usd=0.02,
+                input_tokens=None, output_tokens=None, cache_read_tokens=None,
+                cache_create_tokens=None, duration_ms=1234, capped=False,
+                started_at=now, completed_at=now,
+            )
+        finally:
+            await store.close()
+
+    asyncio.run(_write())
+    yield
+    for suffix in ('', '-wal', '-shm'):
+        ledger.with_name(ledger.name + suffix).unlink(missing_ok=True)
+    if made_dir:
+        ledger.parent.rmdir()
+
+
+def test_costs_by_role_includes_curator_ledger(client, curator_ledger_row):
+    """The cost view reads the fused-memory curator's ledger as well as each
+    project's runs.db, labelling the curator's spend by its role."""
+    resp = client.get('/api/v2/dashboard/costs?window=7d')
+
+    assert resp.status_code == 200
+    roles = [entry['role'] for entry in resp.json()['COSTS']['by_role']]
+    assert 'task_curator' in roles, roles
+
+
 def test_shape_costs_places_model_role_rollup_under_by_model_role():
     """shape_costs(..., by_model_role=<aggregate_model_role_rollup output>)
     places rows+turn_cap_saturation under COSTS.by_model_role without

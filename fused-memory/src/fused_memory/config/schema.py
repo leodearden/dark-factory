@@ -2120,6 +2120,20 @@ class ReconciliationConfig(BaseModel):
         ),
     )
 
+class DedupOutageDetectorConfig(BaseModel):
+    """Detects a window of curated tickets with no combine at all, resolved
+    faster than any real curator LLM call can complete.
+
+    The back-test behind these defaults is in
+    ``plans/curator-dedup-outage-2026-08-15-rca.md``.
+    """
+
+    enabled: bool = Field(default=True)
+    window_seconds: float = Field(default=21600.0, gt=0)
+    min_samples: int = Field(default=10, ge=1)
+    max_median_resolve_seconds: float = Field(default=15.0, gt=0)
+
+
 class TicketJanitorConfig(BaseModel):
     """Background sweep that surfaces failed tickets to the orchestrator.
 
@@ -2134,6 +2148,7 @@ class TicketJanitorConfig(BaseModel):
     interval_seconds: float = Field(default=60.0)
     cooldown_seconds: float = Field(default=3600.0)
     batch_limit: int = Field(default=100)
+    dedup_outage: DedupOutageDetectorConfig = Field(default_factory=DedupOutageDetectorConfig)
 
 
 class SummaryRebuildConfig(BaseModel):

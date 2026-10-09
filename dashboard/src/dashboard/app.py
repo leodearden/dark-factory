@@ -96,7 +96,7 @@ from dashboard.data.utils import safe_gather_result
 from dashboard.data.write_journal import empty_memory_ops, get_memory_ops
 from dashboard.http_pool import reaper_loop
 from dashboard.loops import _burndown_loop, _BurndownStore, _metrics_loop, _MetricsStore
-from dashboard.project_dbs import _cost_dbs
+from dashboard.project_dbs import _cost_dbs, _cost_sources
 
 _pkg_dir = Path(__file__).parent
 _redux_dir = _pkg_dir / 'static' / 'redux'
@@ -991,7 +991,7 @@ async def api_costs(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     pool: DbPool = request.app.state.db
     window = _parse_window(request.query_params)
-    dbs = await _cost_dbs(config, pool)
+    dbs = await _cost_sources(config, pool)
     now = datetime.now(UTC)  # clock-exempt: single-capture route
     summary, by_project, by_account, by_role, trend, events, by_model_role = await asyncio.gather(
         aggregate_cost_summary(dbs, days=window.days, now=now),
