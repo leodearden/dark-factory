@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from dashboard.app import _CANCEL_DETAIL_EXC_CHAR_LIMIT
+from dashboard.app import _MCP_WRITE_DETAIL_CHAR_LIMIT
 from dashboard.data import memory as memory_data
 
 # ---------------------------------------------------------------------------
@@ -379,7 +379,7 @@ def test_cancel_handler_logs_warning_and_includes_exc_in_detail(client, caplog):
     ],
 )
 def test_cancel_handler_502_detail_truncates_exception_text(client, caplog, exc):
-    """502 detail is capped at _CANCEL_DETAIL_EXC_CHAR_LIMIT chars; WARNING keeps full text.
+    """502 detail is capped at _MCP_WRITE_DETAIL_CHAR_LIMIT chars; WARNING keeps full text.
 
     Parametrized over caught exception types so the cap is confirmed to apply
     uniformly.  BaseException.__str__ returns args[0] verbatim (single-arg case),
@@ -397,11 +397,11 @@ def test_cancel_handler_502_detail_truncates_exception_text(client, caplog, exc)
 
     assert resp.status_code == 502
     detail = resp.json().get('detail', '')
-    assert 'X' * _CANCEL_DETAIL_EXC_CHAR_LIMIT in detail, (
-        'Expected first _CANCEL_DETAIL_EXC_CHAR_LIMIT X chars in detail'
+    assert 'X' * _MCP_WRITE_DETAIL_CHAR_LIMIT in detail, (
+        'Expected first _MCP_WRITE_DETAIL_CHAR_LIMIT X chars in detail'
     )
-    assert 'X' * (_CANCEL_DETAIL_EXC_CHAR_LIMIT + 1) not in detail, (
-        'Detail must not contain _CANCEL_DETAIL_EXC_CHAR_LIMIT+1 X chars (exc text not truncated)'
+    assert 'X' * (_MCP_WRITE_DETAIL_CHAR_LIMIT + 1) not in detail, (
+        'Detail must not contain _MCP_WRITE_DETAIL_CHAR_LIMIT+1 X chars (exc text not truncated)'
     )
     warning_records = [
         r for r in caplog.records if r.levelno == logging.WARNING and r.name == 'dashboard.app'

@@ -1062,7 +1062,69 @@ async def api_performance(request: Request) -> JSONResponse:
 # slightly in what they bound: the cancel handler truncates str(exc) and then
 # prefixes the type, while _scheduler_proxy truncates the already-rendered
 # 'Type: message' — so the type name there is inside the cap, never after it.
-_CANCEL_DETAIL_EXC_CHAR_LIMIT = 200
+_MCP_WRITE_DETAIL_CHAR_LIMIT = 200
+
+
+def _fused_memory_unreachable_response(errors: list[str]) -> JSONResponse:
+    return JSONResponse(
+        {'error': 'fused_memory_unreachable', 'detail': '; '.join(errors)},
+        status_code=502,
+    )
+
+
+async def _mcp_write_proxy(
+    http_client: httpx.AsyncClient,
+    config: DashboardConfig,
+    tool_name: str,
+    args: dict,
+    *,
+    treat_not_found_as_404: bool = True,
+) -> JSONResponse:
+    """Fan out an MCP tool call over all fused_memory_urls, return first success.
+
+    Validation and argument construction happen in the calling route handler;
+    this helper is responsible only for the fan-out, transport error handling,
+    and status-code mapping (502 when all URLs fail, optional 404 on not_found).
+    """
+
+    async def _call(url: str) -> JSONResponse:
+        try:
+            result = await memory_data.mcp_tool_call(http_client, url, tool_name, args)
+        except FANOUT_FAILURE_EXCEPTIONS as exc:
+            # describe_exc, not the bare exc: several exceptions on this path
+            # stringify to '' (most importantly httpx.PoolTimeout, i.e. THIS
+            # client's pool is saturated rather than the server being down), so
+            # a bare str(exc) made both this WARNING and the 502 detail
+            # content-free.  PreformattedFanoutError, not ValueError: the
+            # message is already a rendered 'Type: message' and first_success
+            # renders every caught exception through describe_exc again, which
+            # would prepend a second type name.  Mirrors the cancel_ticket
+            # fan-out above — the two proxies must render errors identically.
+            detail = describe_exc(exc)
+            logger.warning('%s failed for %s: %s', tool_name, url, detail)
+            raise PreformattedFanoutError(detail[:_MCP_WRITE_DETAIL_CHAR_LIMIT]) from exc
+        # Guard the not_found mapping with isinstance: an MCP tool that
+        # returns a list or None (buggy/older server) would AttributeError
+        # on `.get(...)` and escape as a 500.  Defensive at the single
+        # boundary that all override/clear/reorder endpoints share.
+        if (
+            treat_not_found_as_404
+            and isinstance(result, dict)
+            and result.get('error') == 'not_found'
+        ):
+            return JSONResponse(result, status_code=404)
+        return JSONResponse(result)
+
+    return await first_success(
+        config.fused_memory_urls,
+        _call,
+        log_label=tool_name,
+        # See the cancel_ticket fan-out: _call already logs each failing URL at
+        # WARNING with the same content, so first_success stays quiet here and
+        # the failure is reported exactly once.
+        log_failures=False,
+        offline_result=_fused_memory_unreachable_response,
+    )
 
 
 @app.post('/api/v2/dashboard/curator/cancel')
@@ -1131,7 +1193,7 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
             # class's docstring. str(exc) (NOT the composed string) is what
             # gets truncated, so the cap bounds the exception text alone.
             raise PreformattedFanoutError(
-                f'{type(exc).__name__}: {str(exc)[:_CANCEL_DETAIL_EXC_CHAR_LIMIT]}'
+                f'{type(exc).__name__}: {str(exc)[:_MCP_WRITE_DETAIL_CHAR_LIMIT]}'
             ) from exc
         if result.get('error') == 'not_found':
             return JSONResponse(result, status_code=404)
@@ -1337,68 +1399,6 @@ _VALID_BOOST_TIERS = frozenset({'critical', 'high', 'medium', 'low', 'polish'})
 _VALID_CLEAR_FIELDS = frozenset({'boost_tier', 'pinned', 'reserve_now', 'ttl_until'})
 
 
-def _sched_fan_out_error(errors: list[str]) -> JSONResponse:
-    return JSONResponse(
-        {'error': 'fused_memory_unreachable', 'detail': '; '.join(errors)},
-        status_code=502,
-    )
-
-
-async def _scheduler_proxy(
-    http_client: httpx.AsyncClient,
-    config: DashboardConfig,
-    tool_name: str,
-    args: dict,
-    *,
-    treat_not_found_as_404: bool = True,
-) -> JSONResponse:
-    """Fan out an MCP tool call over all fused_memory_urls, return first success.
-
-    Validation and argument construction happen in the calling route handler;
-    this helper is responsible only for the fan-out, transport error handling,
-    and status-code mapping (502 when all URLs fail, optional 404 on not_found).
-    """
-
-    async def _call(url: str) -> JSONResponse:
-        try:
-            result = await memory_data.mcp_tool_call(http_client, url, tool_name, args)
-        except FANOUT_FAILURE_EXCEPTIONS as exc:
-            # describe_exc, not the bare exc: several exceptions on this path
-            # stringify to '' (most importantly httpx.PoolTimeout, i.e. THIS
-            # client's pool is saturated rather than the server being down), so
-            # a bare str(exc) made both this WARNING and the 502 detail
-            # content-free.  PreformattedFanoutError, not ValueError: the
-            # message is already a rendered 'Type: message' and first_success
-            # renders every caught exception through describe_exc again, which
-            # would prepend a second type name.  Mirrors the cancel_ticket
-            # fan-out above — the two proxies must render errors identically.
-            detail = describe_exc(exc)
-            logger.warning('%s failed for %s: %s', tool_name, url, detail)
-            raise PreformattedFanoutError(detail[:_CANCEL_DETAIL_EXC_CHAR_LIMIT]) from exc
-        # Guard the not_found mapping with isinstance: an MCP tool that
-        # returns a list or None (buggy/older server) would AttributeError
-        # on `.get(...)` and escape as a 500.  Defensive at the single
-        # boundary that all override/clear/reorder endpoints share.
-        if (
-            treat_not_found_as_404
-            and isinstance(result, dict)
-            and result.get('error') == 'not_found'
-        ):
-            return JSONResponse(result, status_code=404)
-        return JSONResponse(result)
-
-    return await first_success(
-        config.fused_memory_urls,
-        _call,
-        log_label=tool_name,
-        # See the cancel_ticket fan-out: _call already logs each failing URL at
-        # WARNING with the same content, so first_success stays quiet here and
-        # the failure is reported exactly once.
-        log_failures=False,
-        offline_result=_sched_fan_out_error,
-    )
-
-
 @app.post('/api/v2/dashboard/scheduler/override')
 async def api_scheduler_override(request: Request) -> JSONResponse:
     """Proxy POST /scheduler/override → set_task_priority_override MCP tool."""
@@ -1492,7 +1492,7 @@ async def api_scheduler_override(request: Request) -> JSONResponse:
 
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
-    return await _scheduler_proxy(http_client, config, 'set_task_priority_override', args)
+    return await _mcp_write_proxy(http_client, config, 'set_task_priority_override', args)
 
 
 @app.post('/api/v2/dashboard/scheduler/clear-override')
@@ -1535,7 +1535,7 @@ async def api_scheduler_clear_override(request: Request) -> JSONResponse:
 
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
-    return await _scheduler_proxy(http_client, config, 'clear_task_priority_override', args)
+    return await _mcp_write_proxy(http_client, config, 'clear_task_priority_override', args)
 
 
 @app.post('/api/v2/dashboard/scheduler/reorder-pin-queue')
@@ -1577,7 +1577,7 @@ async def api_scheduler_reorder_pin_queue(request: Request) -> JSONResponse:
     http_client: httpx.AsyncClient = request.app.state.http_client
     # reorder_pin_queue forwards MCP results verbatim (no not_found→404 mapping),
     # so the React layer can toast on 'mismatch' without an extra round-trip.
-    return await _scheduler_proxy(
+    return await _mcp_write_proxy(
         http_client,
         config,
         'reorder_pin_queue',
@@ -1609,7 +1609,7 @@ async def api_scheduler_evict_park(request: Request) -> JSONResponse:
     http_client: httpx.AsyncClient = request.app.state.http_client
     # request_park_eviction is a pure enqueue (returns {'requested': True, ...})
     # with no not_found semantics — forward results verbatim like reorder_pin_queue.
-    return await _scheduler_proxy(
+    return await _mcp_write_proxy(
         http_client,
         config,
         'request_park_eviction',
