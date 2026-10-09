@@ -17,6 +17,8 @@ from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
+from test_pure_stdlib_leaves import run_python_child
+
 from shared.process_identity import (
     Liveness,
     ProcessIdentity,
@@ -24,15 +26,16 @@ from shared.process_identity import (
     command_name,
     liveness,
 )
-from test_pure_stdlib_leaves import run_python_child
 
 _LIVE_BOOT_ID = Path('/proc/sys/kernel/random/boot_id')
 _FORGED_BOOT_ID = '00000000-0000-0000-0000-000000000000'
 _COMM_WITH_PARENS = 'a) b (c d'
+_PR_SET_NAME = 15
+# prctl rather than a write to /proc/self/comm: the agent sandbox denies that write.
 _RENAME_THEN_SLEEP = (
-    'import sys, time\n'
+    'import ctypes, sys, time\n'
     'sys.stdin.readline()\n'
-    f'open("/proc/self/comm", "w").write({_COMM_WITH_PARENS!r})\n'
+    f'ctypes.CDLL(None).prctl({_PR_SET_NAME}, {_COMM_WITH_PARENS.encode()!r}, 0, 0, 0)\n'
     'print("ready", flush=True)\n'
     'time.sleep(600)\n'
 )
