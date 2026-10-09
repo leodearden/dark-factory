@@ -245,6 +245,12 @@ Live endpoints come from `FusedMemoryConfig()` (honours `CONFIG_PATH`).
 | `incumbent-cost --telemetry T --until U --pricing-spec S --control-run A [--control-run …] --out-dir D` | θ | Offline: windows `telemetry_query.py`'s JSONL dump `T` from the first token-bearing graphiti LLM attempt up to `U` (ISO-8601 with an offset), prices it at `S`'s token rates, and adds each control run's replay unit cost. The dump must reach back past that first attempt and forward to `U`, or it is refused. Writes `D/production-telemetry.jsonl` and `D/incumbent-cost.json`, both or neither; an existing output is refused, never overwritten (`incumbent_cost.py`) |
 | `topology --graph G` | ζ, ι | A scratch graph's node and edge counts and topology hash: ζ freezes the reference graph, ι re-runs it to verify the graph is unchanged (`topology.py`) |
 | `teardown --arm-spec S [--collection]` | ι | Deletes the arm's scratch graph and, with `--collection`, its Qdrant replica (`teardown.py`) |
+| `mem0-snapshot --collection C --out F` | ι | A read-only scroll of Mem0 collection `C` into a fresh JSONL `F`, and its sha256 (`mem0_replica.py`) |
+| `probe-set --reference-json J --control-a-outcomes O --transcript-corpus T --mem0-snapshot F --registry R --out P` | ι | The embedding probe set, written to a fresh `P`. It reads the frozen reference through `ro_query` only and exits 3 if the reference's hash moved. δ's `corpus_sha` comes from the `run.json` beside `O`, and E1's registry and `content_key` are loaded from `memory_eval_retrieval_probe.py` (`probe_set.py`) |
+| `embed-specs --arms-manifest Y --probe-set P --code-sha C --preregistration-sha S --out-dir D` | ι | `D/<arm_id>.json` for the two incumbent controls, at the config's embedder, and for each `arms.yaml` embedding arm, all with `corpus_sha` = the sha of `P`. Writes all or none, and an existing spec is refused (`slate.py`) |
+| `embed-run --arm-spec S --probe-set P --mem0-snapshot F --out-root D [--repo-root R]` | ι | One embedding arm end to end: copy and re-embed the reference, probe both index configurations, build and probe the Mem0 replica, and time queries (`embedding_run.py`, `embedding_graph_phase.py`) |
+| `embed-preregister --run-a A --run-b B --out F` | ι | The embedding control pair's margins and query-latency envelope, written to a fresh `F` (`embedding_preregistration.py`) |
+| `embed-compare --preregistration F --run R [--run …]` | ι | Offline: one markdown row per candidate and margin, then each candidate's envelope, reported rows and `non_inferior` verdict (`embedding_preregistration.py`) |
 
 `screen_slate.py`, beside `harness.py`, is η's sweep driver. It runs every LLM
 arm in turn: start, smoke, run, α's healthcheck, stop and teardown, all through
@@ -266,7 +272,7 @@ population.
 | 0 | ok |
 | 1 | the run could not complete (store unreachable, index build failed, the index probe could not remove its seeded node — the error names it — or a traceback) |
 | 2 | refused: invalid spec or input, a pre-run instrument check failed, a run dir is not fresh or not complete, a control pair yields no valid pre-registration |
-| 3 | an instrument check failed (post-run, smoke, index-check, integrity, control-check) |
+| 3 | an instrument check failed (post-run, smoke, index-check, integrity, control-check, embed-run's mid-run checks, probe-set's frozen-reference check) |
 | 4 | INV-4 abort: consecutive episode failures stopped the run |
 | 5 | scratch guard: a non-`evalmem_` name reached a guarded checkpoint |
 | 6 | corpus integrity: `corpus_sha` mismatch, or δ's verdict is not ok |
@@ -288,6 +294,20 @@ artifacts.
 | `graph_sameness_details.json` | Present only with `--reference-outcomes` |
 | `journal/` | The run-local write journal; read it with `OPERATOR_TELEMETRY_QUERY` |
 
+### Embedding run directory
+
+`embed-run` uses the same `<out-root>/<arm_id>/<STAMP>/` layout.
+
+| Path | Content |
+|---|---|
+| `run.json` | The `EmbeddingRunManifest`, written last; a failed instrument check writes none |
+| `metrics/` | Six per-configuration records (known-item recall@5, recall@10 and MRR for each index configuration), plus the Mem0, query-latency and re-embed-throughput records |
+
+Each embedding arm uses one graph (= `scratch_group_id`), which passes through
+embedding-only and then with-indices, plus a same-named Qdrant replica. So
+`teardown --arm-spec S --collection` removes both. The rationale is in
+`plans/local-memory-models-eval-embedding-report.md`.
+
 ## Scratch names
 
 Every graph or collection the harness writes, indexes, reads for topology or
@@ -302,7 +322,8 @@ uv run pytest -m integration tests/arm_harness
 
 It replays two episodes onto `evalmem_test_` graphs on the FalkorDB at
 `FALKOR_HOST`/`FALKOR_PORT` against a local mock endpoint, and asserts that no
-protected graph or index changed.
+protected graph or index changed. `test_live_embedding_integration.py` does
+the same for an embedding arm's copy, re-embed and index transitions.
 
 ## Known limitations
 
