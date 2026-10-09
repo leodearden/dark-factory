@@ -6714,15 +6714,18 @@ def test_print_fused_memory_liveness_row_enriched_stays_read_only(
 # ---------------------------------------------------------------------------
 
 
-def test_fm_watched_paths_constant() -> None:
-    """FM_WATCHED_PATHS is exactly [fused-memory/src/, shared/src/].
+def test_fm_watched_paths_are_distinct_existing_paths() -> None:
+    """Every FM_WATCHED_PATHS entry is distinct and names a path in this checkout.
 
-    fused-memory imports shared.* (e.g. shared.task_metadata), so a change to
-    shared/src/ can alter fm's behavior and must count toward fm staleness —
-    hence both prefixes are watched.
+    Membership is decided in one place:
+    tests/scripts/test_fm_watched_paths_import_closure.py. Its set comparison
+    cannot see a duplicate entry, or a non-src/ entry that names nothing,
+    which `git log -- <pathspec>` would silently match no commits for.
     """
-    wdog = _load_watchdog()
-    assert wdog.FM_WATCHED_PATHS == ["fused-memory/src/", "shared/src/"]
+    watched = _load_watchdog().FM_WATCHED_PATHS
+    assert len(watched) == len(set(watched)), f"duplicate entries in {watched}"
+    missing = [path for path in watched if not (REPO_ROOT / path).exists()]
+    assert not missing, f"FM_WATCHED_PATHS entries naming no path in the checkout: {missing}"
 
 
 def test_fm_deploy_clock_path_default(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -6918,17 +6921,15 @@ def test_unit_active_enter_epoch_timeout_returns_none(monkeypatch: pytest.Monkey
 # Part C: _newest_fm_watched_commit_epoch() (step 5)
 #
 # fm sibling of _newest_watched_commit_epoch: identical body but diffs
-# FM_WATCHED_PATHS (fused-memory/src/ + shared/src/) rather than WATCHED_PATHS.
+# FM_WATCHED_PATHS rather than WATCHED_PATHS.
 # ---------------------------------------------------------------------------
-
-_EXPECTED_FM_WATCHED_PATHS = ["fused-memory/src/", "shared/src/"]
 
 
 def test_newest_fm_watched_commit_epoch_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """_newest_fm_watched_commit_epoch parses git's %ct output to an int.
 
-    Also pins that the argv diffs the fm-watched paths (both fused-memory/src/
-    and shared/src/) rather than the orchestrator WATCHED_PATHS.
+    Also pins that the argv diffs FM_WATCHED_PATHS rather than the orchestrator
+    WATCHED_PATHS.
     """
     wdog = _load_watchdog()
     calls: list[list[str]] = []
@@ -6950,8 +6951,10 @@ def test_newest_fm_watched_commit_epoch_happy_path(monkeypatch: pytest.MonkeyPat
     assert argv[3:7] == ["log", "-1", "--format=%ct", "HEAD"]
     assert "--" in argv, f"argv must separate revision from pathspec with '--': {argv}"
     watched_args = argv[argv.index("--") + 1 :]
-    for path in _EXPECTED_FM_WATCHED_PATHS:
-        assert path in watched_args, f"Expected fm-watched path {path!r} in argv {argv}"
+    assert watched_args == list(wdog.FM_WATCHED_PATHS), (
+        f"Expected the pathspec to be exactly FM_WATCHED_PATHS {wdog.FM_WATCHED_PATHS}, "
+        f"got {watched_args} (argv {argv})"
+    )
 
 
 def test_newest_fm_watched_commit_epoch_empty_stdout_returns_none(
