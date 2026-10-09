@@ -362,10 +362,10 @@ def _known_str(value: object) -> str | None:
 def _lock_fresh(locked_at: object, now: datetime, ttl: timedelta) -> bool:
     """Return True if a plan.lock's ``locked_at`` is within *ttl* of *now*.
 
-    Mirrors ``TaskArtifacts.clear_stale_plan_lock``'s own age-based
-    staleness check (its 600s default equals ``DEFAULT_CLAIMANT_HEARTBEAT_TTL``
-    in value) so a plan.lock owner_pid that happens to be alive isn't honored
-    as a live claimant on that basis alone — under PID reuse, a dead
+    An age bound on the caller's *ttl*, independent of
+    ``TaskArtifacts.clear_stale_plan_lock``'s own eviction window, so a
+    plan.lock owner_pid that happens to be alive isn't honored as a live
+    claimant on that basis alone — under PID reuse, a dead
     orchestrator's pid can be recycled by an unrelated, genuinely-alive
     process, which would otherwise read as a phantom-live claimant and
     silently block recovery of a genuinely stranded task (review finding).

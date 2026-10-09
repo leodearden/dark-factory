@@ -1375,11 +1375,15 @@ class TaskArtifacts:
             return None
         return json.loads(lock_path.read_text())
 
-    # plan.lock age, not the claimant TTL: equals DEFAULT_CLAIMANT_HEARTBEAT_TTL by coincidence, not derivation.
     def clear_stale_plan_lock(
         self, current_task_id: str, stale_threshold_secs: float = 600.0
     ) -> bool:
-        """Remove plan.lock if it's stale. Returns True if lock was cleared."""
+        """Remove plan.lock if it's stale. Returns True if lock was cleared.
+
+        *stale_threshold_secs* is plan.lock's own eviction window; its default
+        equals ``shared.task_claimant.DEFAULT_CLAIMANT_HEARTBEAT_TTL`` only
+        coincidentally and is deliberately not derived from it.
+        """
         lock_data = self.read_plan_lock()
         if lock_data is None:
             return False
