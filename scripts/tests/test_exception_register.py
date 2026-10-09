@@ -17,6 +17,15 @@ from pathlib import Path
 
 import exception_register
 import pytest
+from inline_suppression_fixtures import track_fixture_tree
+from shared.governed_exceptions import (
+    DECLARATION_FORMS,
+    Debt,
+    MalformedDisposition,
+    Policy,
+    TaskRef,
+    TicketRef,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -144,3 +153,297 @@ def test_a_table_that_breaks_the_schema_is_an_instrument_failure(
     assert exception_register.TABLE_PATH in message
     for fragment in fragments:
         assert fragment in message
+
+
+# ---------------------------------------------------------------------------
+# D5 — static discovery of governed-list declarations (scenario 13).
+
+#: The import every fixture declaration module opens with, so a call written
+#: after it sits on line 2.
+_HEADER = (
+    'from shared.governed_exceptions import Debt, Policy, TaskRef, TicketRef, '
+    'governed_exceptions\n'
+)
+
+_TICKET_ID = 'tkt_0RTCC80EM92A7WD08D6RF6ZZPY'
+
+
+def _declaring(call_args: str) -> str:
+    """A fixture module whose line 2 is ``governed_exceptions(<call_args>)``."""
+    return f'{_HEADER}governed_exceptions({call_args})\n'
+
+
+def _discover(root: Path, files: dict[str, str]):
+    track_fixture_tree(root, files)
+    return exception_register.discover_declarations(root)
+
+
+def _refusal(root: Path, files: dict[str, str]) -> str:
+    track_fixture_tree(root, files)
+    with pytest.raises(exception_register.InstrumentFailure) as excinfo:
+        exception_register.discover_declarations(root)
+    return str(excinfo.value)
+
+
+def test_a_module_level_declaration_is_read_into_typed_values(tmp_path: Path):
+    source = (
+        _HEADER
+        + 'ALLOWLIST = frozenset({"a", "b", "c"})\n'
+        + 'governed_exceptions(\n'
+        + "    'pkg.tests.allowlist',\n"
+        + "    'every entry is owned or ratified',\n"
+        + '    sorted(ALLOWLIST),\n'
+        + '    default=Debt(TaskRef(5149)),\n'
+        + '    default_covers=2,\n'
+        + "    dispositions={'c': Policy('inv12-x')},\n"
+        + ')\n'
+    )
+
+    discovery = _discover(tmp_path, {'tests/test_decl.py': source})
+
+    (declaration,) = discovery.declarations
+    assert (declaration.path, declaration.line) == ('tests/test_decl.py', 3)
+    assert declaration.list_id == 'pkg.tests.allowlist'
+    assert declaration.rule == 'every entry is owned or ratified'
+    assert declaration.default == Debt(TaskRef(5149))
+    assert declaration.default_covers == 2
+    assert dict(declaration.overrides) == {'c': Policy('inv12-x')}
+    assert discovery.faults == ()
+
+
+def test_overrides_are_read_only(tmp_path: Path):
+    discovery = _discover(
+        tmp_path,
+        {'tests/test_decl.py': _declaring("'pkg.x', 'r', ['a'], dispositions={'a': Policy('inv12-x')}")},
+    )
+
+    assert not hasattr(discovery.declarations[0].overrides, '__setitem__')
+
+
+@pytest.mark.parametrize(
+    ('source', 'list_id', 'default'),
+    [
+        pytest.param(
+            _declaring("list_id='pkg.kw', rule='r', keys=[], dispositions={}"),
+            'pkg.kw',
+            None,
+            id='keyword-binding',
+        ),
+        pytest.param(
+            'import shared.governed_exceptions as ge\n'
+            "ge.governed_exceptions('pkg.alias', 'r', [], default=ge.Debt(ge.TaskRef(1)), "
+            'default_covers=0)\n',
+            'pkg.alias',
+            Debt(TaskRef(1)),
+            id='module-attribute',
+        ),
+        pytest.param(
+            _declaring(f"'pkg.ticket', 'r', [], default=Debt(TicketRef('{_TICKET_ID}')), default_covers=0"),
+            'pkg.ticket',
+            Debt(TicketRef(_TICKET_ID)),
+            id='ticket-owner',
+        ),
+        pytest.param(
+            _HEADER + 'class Holder:\n    governed_exceptions(\'pkg.cls\', \'r\', [])\n',
+            'pkg.cls',
+            None,
+            id='class-body',
+        ),
+        pytest.param(
+            _HEADER + "if True:\n    governed_exceptions('pkg.branch', 'r', [])\n",
+            'pkg.branch',
+            None,
+            id='module-level-block',
+        ),
+    ],
+)
+def test_every_import_time_spelling_is_a_declaration(
+    tmp_path: Path, source: str, list_id: str, default: object
+):
+    discovery = _discover(tmp_path, {'tests/test_decl.py': source})
+
+    (declaration,) = discovery.declarations
+    assert declaration.list_id == list_id
+    assert declaration.default == default
+
+
+def test_a_call_inside_a_function_or_lambda_is_not_a_declaration(tmp_path: Path):
+    """A call in a def, a method or a lambda is a USE of the function, evaluated
+    only when that code runs — the vocabulary's own tests are exactly this shape,
+    with a non-literal list id and an unratified Policy — so it is ignored.
+    """
+    source = (
+        _HEADER
+        + 'LIST_ID = "pkg.x"\n'
+        + 'def test_x():\n'
+        + "    governed_exceptions(LIST_ID, 'r', ['a'], dispositions={'a': Policy('inv12-x')})\n"
+        + 'async def test_async():\n'
+        + "    governed_exceptions(LIST_ID, 'r', [])\n"
+        + 'class TestY:\n'
+        + '    def test_m(self):\n'
+        + "        governed_exceptions(self.ID, 'r', [])\n"
+        + "make = lambda: governed_exceptions(LIST_ID, 'r', [])\n"
+    )
+
+    discovery = _discover(tmp_path, {'tests/test_decl.py': source})
+
+    assert discovery.declarations == ()
+    assert discovery.faults == ()
+    assert discovery.files_parsed == 1
+
+
+def test_an_untracked_declaration_is_not_read(tmp_path: Path):
+    track_fixture_tree(tmp_path, {'tests/test_tracked.py': 'x = 1\n'})
+    (tmp_path / 'tests' / 'test_untracked.py').write_text(
+        _declaring("'pkg.untracked', 'r', []"), encoding='utf-8'
+    )
+
+    discovery = exception_register.discover_declarations(tmp_path)
+
+    assert discovery.declarations == ()
+
+
+def test_only_files_holding_the_call_text_are_parsed(tmp_path: Path):
+    """The byte prefilter decides what the AST sees, so a tracked file that does
+    not parse but never mentions the call is not this instrument's business."""
+    discovery = _discover(
+        tmp_path,
+        {
+            'tests/test_decl.py': _declaring("'pkg.x', 'r', []"),
+            'pkg/plain.py': 'x = 1\n',
+            'pkg/broken.py': 'def broken(:\n',
+        },
+    )
+
+    assert discovery.files_enumerated == 3
+    assert discovery.files_parsed == 1
+    assert [declaration.list_id for declaration in discovery.declarations] == ['pkg.x']
+
+
+def test_scenario_13a_a_computed_list_id_is_an_instrument_failure(tmp_path: Path):
+    message = _refusal(
+        tmp_path,
+        {'tests/test_decl.py': _HEADER + "LIST_ID = 'pkg.x'\ngoverned_exceptions(LIST_ID, 'r', [])\n"},
+    )
+
+    assert 'tests/test_decl.py:3' in message
+    assert '`list_id`' in message
+
+
+def test_scenario_13b_two_declarations_sharing_a_list_id_is_an_instrument_failure(
+    tmp_path: Path,
+):
+    message = _refusal(
+        tmp_path,
+        {
+            'tests/test_a.py': _declaring("'pkg.same', 'r', []"),
+            'tests/test_b.py': _declaring("'pkg.same', 'other rule', []"),
+        },
+    )
+
+    assert 'pkg.same' in message
+    assert 'tests/test_a.py:2' in message
+    assert 'tests/test_b.py:2' in message
+
+
+@pytest.mark.parametrize(
+    ('call_args', 'parameter'),
+    [
+        pytest.param("5, 'r', []", 'list_id', id='non-str-list-id'),
+        pytest.param("'pkg.x', 'r', [], default=DEFAULT, default_covers=1", 'default', id='name-default'),
+        pytest.param(
+            "'pkg.x', 'r', [], default=make_policy('x'), default_covers=1", 'default', id='call-default'
+        ),
+        pytest.param("'pkg.x', 'r', [], dispositions=OVERRIDES", 'dispositions', id='name-overrides'),
+        pytest.param(
+            "'pkg.x', 'r', [], dispositions={**OVERRIDES}", 'dispositions', id='spread-overrides'
+        ),
+        pytest.param('*ARGS', '*ARGS', id='starred-args'),
+        pytest.param("'pkg.x', 'r', [], **KW", '**KW', id='double-starred-kwargs'),
+        pytest.param("'pkg.x', 'r', [], bogus=1", 'bogus', id='unknown-keyword'),
+        pytest.param("'pkg.x'", 'rule', id='missing-rule'),
+        pytest.param("'pkg.x', 5, []", 'rule', id='non-str-rule'),
+        pytest.param(
+            "'pkg.x', 'r', [], default=Policy('inv12-x'), default_covers=True",
+            'default_covers',
+            id='bool-count',
+        ),
+        pytest.param(
+            "'pkg.x', 'r', [], default=Policy('inv12-x'), default_covers='2'",
+            'default_covers',
+            id='str-count',
+        ),
+        pytest.param(
+            "'pkg.x', 'r', [], default=TaskRef(1), default_covers=1", 'default', id='bare-ref-default'
+        ),
+        pytest.param(
+            "'pkg.x', 'r', ['a'], dispositions={'a': TaskRef(1)}", 'dispositions', id='bare-ref-override'
+        ),
+        pytest.param(
+            "'pkg.x', 'r', ['a'], dispositions={1: Policy('inv12-x')}",
+            'dispositions',
+            id='non-str-override-key',
+        ),
+    ],
+)
+def test_a_declaration_the_static_reader_cannot_bind_is_an_instrument_failure(
+    tmp_path: Path, call_args: str, parameter: str
+):
+    """D5: a non-literal argument other than ``keys`` is exit 2, never a skip."""
+    message = _refusal(tmp_path, {'tests/test_decl.py': _declaring(call_args)})
+
+    assert 'tests/test_decl.py:2' in message
+    assert f'`{parameter}`' in message
+
+
+@pytest.mark.parametrize(
+    'keys', ['sorted(ALLOWLIST)', '(key for key in ALLOWLIST)', 'ALLOWLIST', 'mod.KEYS']
+)
+def test_keys_are_never_evaluated(tmp_path: Path, keys: str):
+    """Only the runtime call sees the key set (D5), so any expression is accepted."""
+    discovery = _discover(tmp_path, {'tests/test_decl.py': _declaring(f"'pkg.x', 'r', {keys}")})
+
+    assert [declaration.list_id for declaration in discovery.declarations] == ['pkg.x']
+
+
+def test_a_tracked_file_holding_the_call_that_does_not_parse_is_an_instrument_failure(
+    tmp_path: Path,
+):
+    message = _refusal(tmp_path, {'tests/test_decl.py': "governed_exceptions('pkg.x',\n"})
+
+    assert 'tests/test_decl.py' in message
+
+
+@pytest.mark.parametrize(
+    ('call_args', 'construct'),
+    [
+        pytest.param(
+            "'pkg.x', 'r', [], default=Debt(TaskRef(0)), default_covers=1",
+            lambda: TaskRef(0),
+            id='task-zero',
+        ),
+        pytest.param(
+            "'pkg.x', 'r', ['a'], dispositions={'a': Policy('Not_Kebab')}",
+            lambda: Policy('Not_Kebab'),
+            id='non-kebab-policy',
+        ),
+        pytest.param(
+            "'pkg.x', 'r', [], default=Debt(TicketRef('nope')), default_covers=1",
+            lambda: TicketRef('nope'),
+            id='bad-ticket',
+        ),
+    ],
+)
+def test_a_malformed_disposition_literal_is_a_fault_at_the_site(
+    tmp_path: Path, call_args: str, construct
+):
+    """Exit 1, not 2: the vocabulary fixes a malformed disposition at the site."""
+    with pytest.raises(MalformedDisposition) as expected:
+        construct()
+
+    discovery = _discover(tmp_path, {'tests/test_decl.py': _declaring(call_args)})
+
+    (fault,) = discovery.faults
+    assert (fault.path, fault.line) == ('tests/test_decl.py', 2)
+    assert str(expected.value) in fault.reason
+    assert fault.forms == DECLARATION_FORMS
