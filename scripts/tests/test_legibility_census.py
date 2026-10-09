@@ -2004,6 +2004,7 @@ def _method(**overrides):
         synthesis_calls=1,
         probe_calls=2,
         wall_clock_secs=12.5,
+        verify_normalisations=verdict.count_normalisations([]),
     )
     kwargs.update(overrides)
     return mod.build_method(**kwargs)
@@ -2030,6 +2031,15 @@ def test_build_method_conforms_to_the_independent_report_checker(tmp_path, state
     ) == []
     assert record["method"]["run_id"] == "census-dark_factory-20260714"
     assert record["method"]["as_of_sha"] == "a" * 40
+
+
+def test_build_method_records_every_verify_normalisation_count():
+    counts = {**verdict.count_normalisations([]), "tag_dropped": 2}
+
+    method = _method(verify_normalisations=counts)
+
+    assert method["extra"]["verify_normalisations"] == counts
+    assert set(counts) == {kind.value for kind in verdict.NormalisationKind}
 
 
 def test_build_method_since_is_none_text_without_a_prior_census():
@@ -3819,32 +3829,37 @@ def test_run_census_submit_fn_error_shape_is_not_counted_as_filed(tmp_path, capl
     assert "None" not in filed_section, "an unfilable result must never render as a '- None' bullet"
 
 
-def test_run_census_promote_clamps_out_of_enum_severity_to_medium(tmp_path):
-    """A custom verify_fn may enrich a cluster with a severity outside
-    codebook.py's {high, medium, low} entry enum (e.g. an escalation-style
-    'critical', valid elsewhere in this codebase but not in the codebook's
-    own schema). That must be clamped, not persisted verbatim into a
-    codebook.dump() that would otherwise raise deep into the pipeline
-    (reviewer_comprehensive finding #3)."""
-    batch = [
+_PROMOTED_TITLE = "Silent no-op subagent contract"
+
+
+def _novel_verified_batch():
+    return [
         _hand_digest("dup-1", "nothing new here"),
         _hand_digest("novel-verified", "a genuinely new confusion shape"),
     ]
-    fake_invoke = _make_fake_invoke(_happy_invoke_response)
 
-    def bad_severity_verify_fn(clusters, *, model):
-        verified = [
-            {**c, "severity": "critical"}
-            for c in clusters
-            if c.get("title") == "Silent no-op subagent contract"
-        ]
-        return {"verified": verified, "rejected": [], "fixed": []}
 
-    kwargs = _run_census_kwargs(
+def _persisted_promoted_entry(kwargs):
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    return next(e for e in persisted["entries"] if e["title"] == _PROMOTED_TITLE)
+
+
+def _recorded_normalisations(kwargs):
+    record = json.loads(kwargs["report_path"].with_suffix(".json").read_text(encoding="utf-8"))
+    return record["method"]["extra"]["verify_normalisations"]
+
+
+def _normalisation_counts(**nonzero):
+    return {**verdict.count_normalisations([]), **nonzero}
+
+
+def _promotion_kwargs(tmp_path, *, verify_fn, invoke=None):
+    return _run_census_kwargs(
         tmp_path,
-        invoke=fake_invoke,
-        batch_source=[batch],
-        verify_fn=bad_severity_verify_fn,
+        invoke=invoke or _make_fake_invoke(_happy_invoke_response),
+        batch_source=[_novel_verified_batch()],
+        verify_fn=verify_fn,
         synthesize_fn=_make_fake_synthesize_fn(),
         submit_fn=_make_fake_submit_fn(),
         escalate_fn=_poison("escalate_fn"),
@@ -3852,15 +3867,119 @@ def test_run_census_promote_clamps_out_of_enum_severity_to_medium(tmp_path):
         commit=_make_fake_commit(),
     )
 
+
+def test_run_census_promotes_with_the_verdicts_severity_and_reason(tmp_path):
+    def verdict_verify_fn(clusters, *, model):
+        verified = [
+            {
+                **c,
+                "verdict": verdict.parse_verdict(
+                    {
+                        "verified": True,
+                        "reason": "r",
+                        "tags": ["h13"],
+                        "severity": "high",
+                        "severity_reason": "r-high",
+                        "route": "structural",
+                    },
+                    title=c["title"],
+                    project_root=tmp_path,
+                ),
+            }
+            for c in clusters
+            if c.get("title") == _PROMOTED_TITLE
+        ]
+        return {"verified": verified, "rejected": [], "fixed": []}
+
+    kwargs = _promotion_kwargs(tmp_path, verify_fn=verdict_verify_fn)
+
     outcome = mod.run_census(**kwargs)
 
-    assert outcome.status == "done", "an out-of-enum severity from verify_fn must not crash the census"
-    persisted = codebook.load(kwargs["codebook_path"])
-    assert codebook.validate(persisted) == []
-    promoted_entry = next(
-        e for e in persisted["entries"] if e["title"] == "Silent no-op subagent contract"
+    assert outcome.status == "done"
+    entry = _persisted_promoted_entry(kwargs)
+    assert entry["severity"] == "high"
+    assert entry["severity_reason"] == "r-high"
+
+
+def test_run_census_promotes_a_verdictless_cluster_through_the_parsers_defaults(
+    tmp_path, caplog,
+):
+    """A custom verify_fn may return a verified cluster with no Verdict, even
+    one carrying its own out-of-enum severity ('critical'). The cluster-level
+    severity is ignored: the cluster is parsed as an empty verdict, so its
+    defaults are normalised and counted like any other verdict's."""
+    def bad_severity_verify_fn(clusters, *, model):
+        verified = [
+            {**c, "severity": "critical"}
+            for c in clusters
+            if c.get("title") == _PROMOTED_TITLE
+        ]
+        return {"verified": verified, "rejected": [], "fixed": []}
+
+    kwargs = _promotion_kwargs(tmp_path, verify_fn=bad_severity_verify_fn)
+
+    with caplog.at_level(logging.WARNING, logger="legibility.census"):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    entry = _persisted_promoted_entry(kwargs)
+    assert entry["severity"] == "medium"
+    assert "medium" in entry["severity_reason"]
+    assert any(
+        _PROMOTED_TITLE in record.getMessage()
+        and "without a verdict" in record.getMessage().lower()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
     )
-    assert promoted_entry["severity"] == "medium", "an out-of-enum severity is clamped, never persisted verbatim"
+    assert _recorded_normalisations(kwargs) == _normalisation_counts(
+        anchor_from_title=1, severity_substituted=1, route_defaulted=1, reason_missing=1,
+    )
+
+
+def test_run_census_normalises_and_counts_a_malformed_verdict_from_the_real_verifier(
+    tmp_path,
+):
+    """PRD §4.8 row 6, end to end: unknown tag, missing anchor path and
+    severity 'critical' are each normalised and counted, and the run completes."""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "fixture.md").write_text("fixture\n", encoding="utf-8")
+    malformed = json.dumps(
+        {
+            "verified": True,
+            "reason": "r",
+            "anchor": "docs/missing.py::f",
+            "tags": ["h13", "bogus"],
+            "severity": "critical",
+            "severity_reason": "s",
+            "remediation": _IN_TREE_REMEDIATION,
+        }
+    )
+
+    def respond(prompt, model):
+        if prompt.startswith("You are the periodic-census verifier"):
+            return malformed
+        return _happy_invoke_response(prompt, model)
+
+    fake_invoke = _make_fake_invoke(respond)
+    kwargs = _promotion_kwargs(
+        tmp_path,
+        invoke=fake_invoke,
+        verify_fn=mod._build_default_verify_fn(str(tmp_path), fake_invoke),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    entry = _persisted_promoted_entry(kwargs)
+    assert entry["severity"] == "medium"
+    assert "critical" in entry["severity_reason"]
+    expected = _normalisation_counts(
+        anchor_from_remediation=1, tag_dropped=1, severity_substituted=1, route_defaulted=1,
+    )
+    assert _recorded_normalisations(kwargs) == expected
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    method_yaml = report_text.split("## Method", 1)[1].split("```yaml\n", 1)[1].split("```", 1)[0]
+    assert yaml.safe_load(method_yaml)["extra"]["verify_normalisations"] == expected
 
 
 def test_run_census_storm_batch_is_logged_and_noted_in_report(tmp_path, caplog):
