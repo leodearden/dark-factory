@@ -771,6 +771,7 @@ async def test_the_manifest_records_settings_embedder_reembeds_and_checks(make_w
     assert (settings.query_concurrency, settings.search_k) == (3, SEARCH_K)
     assert settings.transcript_queries == len(TRANSCRIPT_QUERIES)
     assert settings.mem0_project_id == PROJECT
+    assert settings.search_timeout_s == world.base_config.queue.search_timeout_seconds
     assert (manifest.effective_embedder.model, manifest.effective_embedder.dimensions) == (
         manifest.spec.model_id, DIM
     )

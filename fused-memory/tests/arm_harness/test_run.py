@@ -12,6 +12,7 @@ from arm_harness._fakes import (
     FakeArmGraph,
     PreregRepo,
     RecordingJournal,
+    embedding_spec,
     fail,
     incumbent_control_spec,
     llm_spec,
@@ -272,6 +273,18 @@ def test_pre_run_checks_are_callable_alone_before_any_resource_is_opened(repo):
     assert InstrumentCheckId.CODE_SHA_MATCHES_CHECKOUT in {
         check.check_id for check in caught.value.check_results if not check.passed
     }
+    assert [check.check_id for check in passed] == [
+        InstrumentCheckId.CODE_SHA_MATCHES_CHECKOUT,
+        InstrumentCheckId.PREREGISTRATION_SHA,
+    ]
+    assert all(check.passed for check in passed)
+
+
+def test_pre_run_checks_accept_an_embedding_arm(repo):
+    spec = embedding_spec(code_sha=repo.with_prereg, preregistration_sha=repo.with_prereg)
+
+    passed = require_pre_run_checks(spec, repo.root)
+
     assert [check.check_id for check in passed] == [
         InstrumentCheckId.CODE_SHA_MATCHES_CHECKOUT,
         InstrumentCheckId.PREREGISTRATION_SHA,
