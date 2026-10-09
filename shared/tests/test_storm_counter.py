@@ -1015,13 +1015,16 @@ class TestPruneReturnsRawCountInDistinctMode:
 #
 # Five consumers each hand-rolled "lazily build one StormCounter per key,
 # record, sweep the ones whose prune() returns 0". These pin the registry they
-# now share, through its public surface only.
+# now share, through its public surface only. The registry holds no clock, so
+# every record names its instant.
 # ---------------------------------------------------------------------------
+
+T0 = 1000.0
 
 
 @pytest.fixture
-def keyed(clock):
-    return KeyedStormCounters(time_provider=clock)
+def keyed():
+    return KeyedStormCounters()
 
 
 class TestKeyedThresholds:
@@ -1035,7 +1038,7 @@ class TestKeyedThresholds:
 
     def test_two_keys_below_threshold_each_never_pool_into_a_fire(self, keyed):
         results = [
-            keyed.record(key, threshold=3, window_seconds=3600.0, label=key)
+            keyed.record(key, threshold=3, window_seconds=3600.0, now=T0, label=key)
             for key in ('k1', 'k1', 'k2', 'k2')
         ]
 
@@ -1043,18 +1046,19 @@ class TestKeyedThresholds:
 
     def test_each_key_fires_on_its_own_third_event(self, keyed):
         for key in ('k1', 'k2', 'k1', 'k2'):
-            assert keyed.record(key, threshold=3, window_seconds=3600.0) is None
+            assert keyed.record(key, threshold=3, window_seconds=3600.0, now=T0) is None
 
-        assert keyed.record('k1', threshold=3, window_seconds=3600.0) is not None
-        assert keyed.record('k2', threshold=3, window_seconds=3600.0) is not None
+        assert keyed.record('k1', threshold=3, window_seconds=3600.0, now=T0) is not None
+        assert keyed.record('k2', threshold=3, window_seconds=3600.0, now=T0) is not None
 
     def test_the_summary_is_storm_counters_and_names_only_that_keys_labels(
         self, keyed
     ):
-        keyed.record('k1', threshold=3, window_seconds=3600.0, label='x')
-        keyed.record('k2', threshold=3, window_seconds=3600.0, label='other')
-        keyed.record('k1', threshold=3, window_seconds=3600.0, label='y')
-        summary = keyed.record('k1', threshold=3, window_seconds=3600.0, label='x')
+        for key, label in (('k1', 'x'), ('k2', 'other'), ('k1', 'y')):
+            keyed.record(key, threshold=3, window_seconds=3600.0, now=T0, label=label)
+        summary = keyed.record(
+            'k1', threshold=3, window_seconds=3600.0, now=T0, label='x'
+        )
 
         assert summary == {
             'count': 3,
@@ -1071,12 +1075,12 @@ class TestLazyConstruction:
         assert keyed.tracked_keys == frozenset()
 
     def test_a_recorded_key_is_tracked(self, keyed):
-        keyed.record('a', threshold=3, window_seconds=100.0)
+        keyed.record('a', threshold=3, window_seconds=100.0, now=T0)
 
         assert keyed.tracked_keys == frozenset({'a'})
 
     def test_tracked_keys_is_a_frozenset_so_a_reader_cannot_evict(self, keyed):
-        keyed.record('a', threshold=3, window_seconds=100.0)
+        keyed.record('a', threshold=3, window_seconds=100.0, now=T0)
 
         assert isinstance(keyed.tracked_keys, frozenset)
 
@@ -1089,18 +1093,16 @@ class TestDormantSweep:
     """
 
     def test_a_key_idle_past_its_window_is_evicted_by_another_keys_record(
-        self, keyed, clock
+        self, keyed
     ):
-        keyed.record('a', threshold=3, window_seconds=100.0)
-        clock.advance(200.0)
-        keyed.record('b', threshold=3, window_seconds=100.0)
+        keyed.record('a', threshold=3, window_seconds=100.0, now=T0)
+        keyed.record('b', threshold=3, window_seconds=100.0, now=T0 + 200.0)
 
         assert keyed.tracked_keys == frozenset({'b'})
 
-    def test_a_key_still_inside_its_window_survives(self, keyed, clock):
-        keyed.record('a', threshold=3, window_seconds=100.0)
-        clock.advance(10.0)
-        keyed.record('b', threshold=3, window_seconds=100.0)
+    def test_a_key_still_inside_its_window_survives(self, keyed):
+        keyed.record('a', threshold=3, window_seconds=100.0, now=T0)
+        keyed.record('b', threshold=3, window_seconds=100.0, now=T0 + 10.0)
 
         assert keyed.tracked_keys == frozenset({'a', 'b'})
 
@@ -1111,7 +1113,7 @@ class TestDormantSweep:
         window, so an include-everything sweep would delete the counter the
         caller is holding a summary from.
         """
-        keyed.record('a', threshold=3, window_seconds=0.0)
+        keyed.record('a', threshold=3, window_seconds=0.0, now=T0)
 
         assert keyed.tracked_keys == frozenset({'a'})
 
@@ -1119,19 +1121,19 @@ class TestDormantSweep:
 class TestSweepCadence:
     """``sweep_every`` amortizes the sweep; it counts every RECORDED event."""
 
-    def test_an_idle_key_is_evicted_on_the_sweep_every_th_record(self, clock):
-        keyed = KeyedStormCounters(time_provider=clock, sweep_every=3)
+    def test_an_idle_key_is_evicted_on_the_sweep_every_th_record(self):
+        keyed = KeyedStormCounters(sweep_every=3)
         # Three records of 'a' close one cadence, so the next three of 'b'
         # are records 1, 2 and 3 of a fresh one.
         for _ in range(3):
-            keyed.record('a', threshold=99, window_seconds=100.0)
-        clock.advance(200.0)
+            keyed.record('a', threshold=99, window_seconds=100.0, now=T0)
+        later = T0 + 200.0
 
-        keyed.record('b', threshold=99, window_seconds=100.0)
+        keyed.record('b', threshold=99, window_seconds=100.0, now=later)
         assert 'a' in keyed.tracked_keys, 'the 1st record does not sweep'
-        keyed.record('b', threshold=99, window_seconds=100.0)
+        keyed.record('b', threshold=99, window_seconds=100.0, now=later)
         assert 'a' in keyed.tracked_keys, 'nor does the 2nd'
-        keyed.record('b', threshold=99, window_seconds=100.0)
+        keyed.record('b', threshold=99, window_seconds=100.0, now=later)
         assert keyed.tracked_keys == frozenset({'b'}), 'the 3rd one does'
 
     def test_a_cadence_below_one_is_rejected(self):
@@ -1142,39 +1144,36 @@ class TestSweepCadence:
         assert 'sweep_every' in message and '0' in message
 
 
-class TestPerCallNow:
-    """``now=`` threads ONE instant through the record and the sweep alike."""
+class TestTheCallerOwnsTheClock:
+    """``now`` is the ONLY clock: it drives the window and the sweep alike."""
 
-    def test_spread_events_never_fire_under_an_injected_instant(self):
-        keyed = KeyedStormCounters(time_provider=lambda: 0.0)
-
+    def test_events_spread_wider_than_the_window_never_fire(self, keyed):
         results = [
             keyed.record('a', threshold=3, window_seconds=100.0, now=now)
             for now in (0.0, 150.0, 300.0)
         ]
 
-        assert results == [None, None, None], (
-            'read off the frozen provider, all three would share t=0 and fire'
-        )
+        assert results == [None, None, None]
 
-    def test_the_sweep_ages_keys_against_the_injected_instant(self):
-        keyed = KeyedStormCounters(time_provider=lambda: 0.0)
-
+    def test_the_sweep_ages_keys_against_the_recorded_instant(self, keyed):
         keyed.record('a', threshold=3, window_seconds=100.0, now=0.0)
         keyed.record('b', threshold=3, window_seconds=100.0, now=500.0)
 
-        assert keyed.tracked_keys == frozenset({'b'}), (
-            'swept at the frozen provider instant, a would still look live'
-        )
+        assert keyed.tracked_keys == frozenset({'b'})
+
+    def test_a_record_without_an_instant_is_refused(self, keyed):
+        """No wall-clock fallback for a caller holding an injected clock to miss."""
+        with pytest.raises(TypeError):
+            keyed.record('a', threshold=3, window_seconds=100.0)  # pyright: ignore[reportCallIssue]
 
 
 class TestLiveTuning:
     """Threshold and window are per call (StormCounter's RELOAD SAFETY)."""
 
     def test_a_threshold_lowered_between_calls_takes_effect_next_call(self, keyed):
-        assert keyed.record('a', threshold=3, window_seconds=3600.0) is None
+        assert keyed.record('a', threshold=3, window_seconds=3600.0, now=T0) is None
 
-        summary = keyed.record('a', threshold=2, window_seconds=3600.0)
+        summary = keyed.record('a', threshold=2, window_seconds=3600.0, now=T0)
 
         assert summary is not None and summary['count'] == 2
 
@@ -1188,12 +1187,13 @@ class TestFireModePassthrough:
     def test_fire_mode_is_readable_back(self):
         assert KeyedStormCounters(fire_mode='latched').fire_mode == 'latched'
 
-    def test_a_latched_key_fires_once_across_a_full_window_and_recurs(self, clock):
-        keyed = KeyedStormCounters(time_provider=clock, fire_mode='latched')
+    def test_a_latched_key_fires_once_across_a_full_window_and_recurs(self):
+        keyed = KeyedStormCounters(fire_mode='latched')
 
         def drive(key, offset):
-            clock.now = 1000.0 + offset
-            return keyed.record(key, threshold=3, window_seconds=300.0)
+            return keyed.record(
+                key, threshold=3, window_seconds=300.0, now=T0 + offset
+            )
 
         fired = [drive('p', offset) is not None for offset in (0, 1, 2)]
         assert fired == [False, False, True]

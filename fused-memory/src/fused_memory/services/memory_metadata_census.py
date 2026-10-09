@@ -152,7 +152,7 @@ class UnknownKeyStormDetector:
         # ``sweep_every`` is injectable for the reason ``time_fn`` is: so the
         # eviction contract is testable without DEFAULT_SWEEP_EVERY records.
         self._warns: KeyedStormCounters[tuple[str, str]] = KeyedStormCounters(
-            time_provider=time_fn, fire_mode='latched', sweep_every=sweep_every
+            fire_mode='latched', sweep_every=sweep_every
         )
 
     @property
