@@ -918,3 +918,108 @@ class TestThePublishWriteTimeCommand:
     def test_the_sample_size_is_required(self, published: _PublishedWriteTime) -> None:
         with pytest.raises(SystemExit):
             _mod().main(['publish-write-time', '--snapshot', str(published.path)])
+
+
+# ---------------------------------------------------------------------------
+# The committed artifacts
+# ---------------------------------------------------------------------------
+
+_REPO = _PACKAGE.parent
+_COMMITTED_WRITE_TIME = _PACKAGE / 'calibration' / 'write_triage_population_write_time.json'
+_COMMITTED_WRITE_TIME_PAIRS = _PACKAGE / 'calibration' / 'write_triage_pairs_to_rate_write_time.jsonl'
+_COMMITTED_PI = _PACKAGE / 'calibration' / 'write_triage_population.json'
+_TRUNCATION = re.compile(r'…\[truncated, \d+ chars total\]$')
+
+
+@functools.cache
+def _committed() -> dict:
+    return json.loads(_COMMITTED_WRITE_TIME.read_text(encoding='utf-8'))
+
+
+@functools.cache
+def _committed_pairs() -> tuple[bytes, tuple[dict, ...]]:
+    body = _COMMITTED_WRITE_TIME_PAIRS.read_bytes()
+    return body, tuple(json.loads(line) for line in body.decode('utf-8').splitlines())
+
+
+class TestCommittedWriteTimePopulationIsTraceable:
+    """The committed π2 artifacts say which arms ran, on which slates, over what.
+
+    No numeric floor is asserted (e.g. ``n_judge_band_write_time >= 300``):
+    that is Γ3's predicate, and a floor in a test would make the test the decision.
+    """
+
+    def test_the_arms_are_the_write_time_table_in_order(self) -> None:
+        rows = _committed()['arms']
+        assert [row['arm'] for row in rows] == [arm.name for arm in _mod().WRITE_TIME_ARMS]
+        for row, arm in zip(rows, _mod().WRITE_TIME_ARMS, strict=True):
+            assert {'calls', 'parse_failures', 'usd'} <= set(row), row['arm']
+            assert (row['model'], row['reasoning_effort'], row['width'], row['wording']) == (
+                arm.model, arm.reasoning_effort, arm.width, arm.wording,
+            )
+            assert row['system_prompt_sha256'] == _sha(_wording().system_prompt(arm.wording))
+            assert row['field_chars'] == 4_000
+            assert '/arms-write-time/' in row['cases_path'], row['arm']
+            assert '/arms/' not in row['cases_path'], row['arm']
+
+    def test_every_arm_judged_every_write_still_in_the_band(self) -> None:
+        population = _committed()['population']
+        n_judged = population['n_judge_band_write_time']
+        excluded = population['excluded_by_write_time_filter']
+        for row in _committed()['arms']:
+            assert row['calls'] == n_judged, row['arm']
+        assert n_judged + excluded['count'] == population['judge_band_sample']['size']
+        assert len(excluded['memory_ids']) == excluded['count']
+        assert population['slates'] == 'write-time'
+
+    def test_the_sample_is_pis_sample_of_the_same_snapshot(self) -> None:
+        pi = json.loads(_COMMITTED_PI.read_text(encoding='utf-8'))['population']
+        population = _committed()['population']
+        assert population['snapshot_sha256'] == pi['snapshot_sha256']
+        assert population['judge_band_sample']['size'] == pi['n_judge_band']
+
+    def test_the_spend_is_the_sum_of_the_arms(self) -> None:
+        import math  # noqa: PLC0415
+
+        artifact = _committed()
+        assert artifact['spend']['usd_total'] == round(
+            math.fsum(row['usd'] for row in artifact['arms']), 6,
+        )
+        assert artifact['spend']['budget_usd'] is not None
+
+    def test_the_pairs_file_is_the_one_the_artifact_names(self) -> None:
+        body, rows = _committed_pairs()
+        block = _committed()['pairs_to_rate']
+        assert len(rows) == block['n_pairs']
+        assert _sha(body) == block['sha256']
+
+    def test_every_pair_row_is_blind(self) -> None:
+        _, rows = _committed_pairs()
+        for row in rows:
+            assert set(row) == {'entry_id', 'target_id', 'entry_text', 'target_text'}, row
+
+    def test_no_text_exceeds_the_rater_cap(self) -> None:
+        _, rows = _committed_pairs()
+        for row in rows:
+            for key in ('entry_text', 'target_text'):
+                text = row[key]
+                if text is not None and len(text) > 4_000:
+                    assert len(_TRUNCATION.sub('', text)) == 4_000, (row['entry_id'], key)
+                    assert _TRUNCATION.search(text), (row['entry_id'], key)
+
+    def test_no_pair_is_one_already_rated_when_it_was_published(self) -> None:
+        sources = _committed()['pairs_to_rate']['already_rated']
+        assert {
+            'fused-memory/calibration/write_triage_pair_verdicts.jsonl',
+            'fused-memory/tests/fixtures/write_triage_pair_verdicts_seed.jsonl',
+        } <= {source['path'] for source in sources}
+        _, rows = _committed_pairs()
+        asked = {(row['entry_id'], row['target_id']) for row in rows}
+        for source in sources:
+            # Verdict files are only appended to, so the published prefix is still there.
+            lines = (_REPO / source['path']).read_bytes().splitlines(keepends=True)
+            prefix = lines[:source['rows']]
+            assert len(prefix) == source['rows'], source['path']
+            assert _sha(b''.join(prefix)) == source['sha256'], source['path']
+            rated = {(v['entry_id'], v['target_id']) for v in map(json.loads, prefix)}
+            assert not asked & rated, source['path']
