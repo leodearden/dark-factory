@@ -122,10 +122,12 @@ _UNIT_DOWN_MARKERS = (
 )
 
 # The observed boundaries of the two recovery terms. Teardown ends at
-# whichever came first of a clean stop and a SIGKILL, so an ignored SIGTERM
-# is measured rather than assumed away.
+# whichever came first of a clean stop, a SIGKILL and systemd's stop-time
+# accounting, so an ignored SIGTERM is measured rather than assumed away; the
+# accounting is the only witness when systemd goes straight from `Consumed` to
+# `Starting` (scripts/tests/test_fm_wedge_forensics.py::NO_STOPPED_LINE_JOURNAL).
 _TEARDOWN_START = ("Stopping fused-memory",)
-_TEARDOWN_END = ("Stopped fused-memory", "with signal SIGKILL")
+_TEARDOWN_END = ("Stopped fused-memory", "with signal SIGKILL", "Consumed ")
 _STARTUP_START = ("Starting fused-memory",)
 _STARTUP_END = ("Started fused-memory",)
 
