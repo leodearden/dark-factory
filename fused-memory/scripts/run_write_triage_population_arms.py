@@ -678,18 +678,29 @@ def _count(rows: Iterable[Mapping[str, Any]], key: str) -> dict[str, int]:
     return dict(sorted(collections.Counter(row[key] for row in rows).items()))
 
 
-def _validated_rows(
-    arms: Sequence[Arm],
+#: The ``slates`` a published row may say under each mode. π's rows predate the
+#: field, so a frozen row may lack it; no row may say another mode's slates.
+_PUBLISHABLE_SLATES: dict[Slates, frozenset[Slates | None]] = {
+    Slates.FROZEN: frozenset({Slates.FROZEN, None}),
+    Slates.WRITE_TIME: frozenset({Slates.WRITE_TIME}),
+}
+
+
+def _refuse_partial_arms(
     arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
     snapshot_sha256: str,
     expected_ids: Collection[str],
     *,
-    run_set: str,
+    slates: Slates,
+    expected_description: str,
 ) -> None:
-    """Refuse, naming the arm, any of *arms* not covering exactly *expected_ids* once each.
+    """Refuse, naming the arm, any arm of *slates* whose rows are not this run's.
 
-    *run_set* describes the expected writes for the refusal message.
+    Each arm of ``ARMS_OF[slates]`` must cover exactly *expected_ids*, once
+    each, with rows of this snapshot judged on *slates*.
+    *expected_description* names the expected writes in the refusal message.
     """
+    arms = ARMS_OF[slates]
     for arm in arms:
         if not arm_rows_by_name.get(arm.name):
             raise ValueError(f'arm {arm.name} has no rows to publish')
@@ -698,23 +709,34 @@ def _validated_rows(
         foreign = sorted({str(row.get('snapshot_sha256')) for row in rows} - {snapshot_sha256})
         if foreign:
             raise ValueError(f'arm {arm.name} holds rows from another snapshot: {foreign}')
+        stray = sorted({
+            str(row.get('slates')) for row in rows
+            if row.get('slates') not in _PUBLISHABLE_SLATES[slates]
+        })
+        if stray:
+            raise ValueError(
+                f'arm {arm.name} holds rows judged on {", ".join(stray)} slates, not {slates}',
+            )
         if len({row['memory_id'] for row in rows}) != len(rows):
             raise ValueError(f'arm {arm.name} judged a write more than once')
     for arm in arms:
         if {row['memory_id'] for row in arm_rows_by_name[arm.name]} != set(expected_ids):
-            raise ValueError(f'arm {arm.name} does not cover {run_set}')
+            raise ValueError(f'arm {arm.name} does not cover {expected_description}')
 
 
 def _validated_run_set(
     snapshot: Mapping[str, Any], snapshot_sha256: str,
     arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
 ) -> list[dict[str, Any]]:
-    """The run set every arm covers, refusing anything that would read as partial."""
+    """The run set every arm covers, refusing anything partial or on other slates."""
     first_arm_rows = arm_rows_by_name.get(ARMS[0].name) or []
     prefix = judge_band_order(snapshot, snapshot_sha256)[:len(first_arm_rows)]
-    _validated_rows(
-        ARMS, arm_rows_by_name, snapshot_sha256, {write['memory_id'] for write in prefix},
-        run_set=f'the common prefix of the judge-band order, its first {len(prefix)} writes',
+    _refuse_partial_arms(
+        arm_rows_by_name, snapshot_sha256, {write['memory_id'] for write in prefix},
+        slates=Slates.FROZEN,
+        expected_description=(
+            f'the common prefix of the judge-band order, its first {len(prefix)} writes'
+        ),
     )
     return prefix
 
@@ -728,23 +750,14 @@ def _validated_write_time_run_set(
     run_set = draw_run_set(
         snapshot, snapshot_sha256, max_writes=sample_size, slates=Slates.WRITE_TIME,
     )
-    _validated_rows(
-        WRITE_TIME_ARMS, arm_rows_by_name, snapshot_sha256,
-        {write['memory_id'] for write in run_set.writes},
-        run_set=(
+    _refuse_partial_arms(
+        arm_rows_by_name, snapshot_sha256, {write['memory_id'] for write in run_set.writes},
+        slates=Slates.WRITE_TIME,
+        expected_description=(
             f'the {len(run_set.writes)} of the first {run_set.sample_size} writes of the '
             'judge-band order still in the judge band at write time'
         ),
     )
-    for arm in WRITE_TIME_ARMS:
-        stray = sorted(
-            {str(row.get('slates')) for row in arm_rows_by_name[arm.name]} - {Slates.WRITE_TIME},
-        )
-        if stray:
-            raise ValueError(
-                f'arm {arm.name} holds rows judged on {", ".join(stray)} slates, '
-                f'not {Slates.WRITE_TIME}',
-            )
     return run_set
 
 

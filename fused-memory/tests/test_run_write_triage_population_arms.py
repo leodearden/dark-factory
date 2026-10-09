@@ -828,6 +828,22 @@ class TestPublishRefuses:
         with pytest.raises(ValueError, match='gpt-6-luna:low@5'):
             published.pairs()
 
+    def test_a_row_judged_on_write_time_slates(self, published: _Published) -> None:
+        published.rows['gpt-6-luna:low@5'][2]['slates'] = 'write-time'
+        with pytest.raises(ValueError, match='gpt-6-luna:low@5'):
+            published.artifact()
+        with pytest.raises(ValueError, match='gpt-6-luna:low@5'):
+            published.pairs()
+
+
+def test_rows_saying_frozen_publish_beside_rows_that_predate_the_field(
+    published: _Published,
+) -> None:
+    for rows in published.rows.values():
+        rows[0]['slates'] = 'frozen'
+    assert len(published.artifact()['arms']) == len(_mod().ARMS)
+    published.pairs()
+
 
 class TestThePublishCommand:
     @staticmethod
