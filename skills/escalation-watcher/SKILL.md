@@ -1038,9 +1038,25 @@ switches on and off. Three behavioural shifts:
    days helps no one. Where the decision can be safely *postponed* without baking anything in:
    - Queue a follow-up task capturing the decision to be made (two-phase `submit_task` →
      `resolve_ticket`), and
-   - `resolve_issue(..., action='park')` so the blocking task lands `blocked`, held under an open L2
-     (no re-dispatch while the escalation is open; the stranded-blocked sweep skips a blocked task
-     that has an open escalation), and
+   - Hold the task, choosing by the record's **severity**:
+     - **Not `info`:** `resolve_issue(..., action='park')`. The task lands `blocked`, held under
+       the open L2, because a pinning escalation vetoes the stranded-blocked sweep.
+     - **`info`:** never park. An info record never pins
+       (`escalation/src/escalation/pins.py::classify_pins`; intended, Leo 2026-10-09). The sweep
+       re-pends a parked task within a tick, as with esc-5708-3, reify esc-7881-5 and
+       esc-4681-3 (16 s). Leave the escalation pending and **defer** the task:
+       1. `update_task(id, metadata={'x_deferral': {'escalation_id': '<esc-id>', 'until_condition':
+          'Leo rules <esc-id>', 'reason': '<one line>'}}, metadata_mode='merge')`;
+       2. `set_task_status(id, status='deferred')`;
+       3. confirm both with `get_task` about 30 s later.
+
+       A deferral keeps a not-yet-running task out of dispatch. It does not stop a live run, and
+       an info filer was told to keep driving, so leave an `in-progress` task alone (leave
+       pending + digest). When the ruling lands, carry it out, then re-pend the task with
+       `set_task_status(id, status='pending')` unless the ruling says otherwise, and set
+       `x_deferral` to null. Once the deferral-record gate is live (task 6525), the record goes
+       in `set_task_status(..., deferral=...)` instead. Task 6579 makes it the typed
+       `until_escalation` kind. And
    - File a DecisionRecord via `write-decision` (see "Filing Parked Decisions to the Cockpit
      Registry" below) — IN ADDITION to the follow-up task, so the parked decision surfaces in the
      cockpit decision queue.
@@ -2222,14 +2238,14 @@ its values may be passed to `resolve_issue`.
 |---|---|---|---|---|
 | `resume` (default) | `resolved` | resumes; resolution text injected (L0 live path) | `blocked` → `pending` (any task-attached level ≥ 1, incl. memberless born-at-L2) | "Here's the answer — continue." |
 | `restart` | `resolved` | killed (soft-cancel → grace → hard) | → `pending` (from `in-progress` or `blocked`) | "This run is off-course — re-run fresh." |
-| `park` | kept open at L2 | killed | → `blocked` (from any non-terminal status) | "Stop; human decides later; held blocked under an open L2." |
+| `park` | kept open at L2 | killed | → `blocked` (from any non-terminal status) | "Stop; human decides later; held blocked under an open L2." **Never on an `info` record:** info never pins, so the sweep re-pends the task within a tick. Defer the task instead (AFK shift 1). `resolve_issue` will refuse it once task 6578 lands. |
 | `abandon` | `dismissed` | killed | → `cancelled` | "Never run again." |
 | `close_only` | `dismissed` | untouched | none | "Record is noise/duplicate — change nothing." |
 
 **C1 notes:**
 - Terminal task statuses (`done`, `cancelled`) are never overwritten by any action.
 - The removed `terminate` parameter now raises a hard error naming the five actions above.
-- **L2 cluster cascade**: the action applies uniformly to the L2 and every member task. `queue.resolve()` cascades members via `resolved_by='l2-cascade:<L2-id>'`; the harness member callback reads the parent action from the queue read API. For `action='park'`: `queue.park()` keeps the L2 and all member L1s open (status=`pending`); each member task ends `blocked`, covered by its still-open member L1 escalation — the stranded-blocked sweep skips each because Fix #1b finds the open L1.
+- **L2 cluster cascade**: the action applies uniformly to the L2 and every member task. `queue.resolve()` cascades members via `resolved_by='l2-cascade:<L2-id>'`; the harness member callback reads the parent action from the queue read API. For `action='park'`: `queue.park()` keeps the L2 and all member L1s open (status=`pending`); each member task ends `blocked`, covered by its still-open member L1 escalation — the stranded-blocked sweep skips each because Fix #1b finds the open L1. That cover holds only where the member L1 pins. An `info` member never pins by itself, so treat its task as unheld (see the `park` row).
 - Legacy in-process callers with `resolution_action=None`: `dismiss=True` maps to `close_only`; `dismiss=False` maps to `resume`.
 
 **Where the `resolution` text actually goes.** It reaches the working agent **only** in the L0

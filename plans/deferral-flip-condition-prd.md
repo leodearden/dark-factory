@@ -3,6 +3,8 @@
 **Status:** authored 2026-10-07 (`/team` + `/prd` author mode); decomposed 2026-10-08 into
 tasks 6524 (α), 6525 (β), 6526 (γ), 6527 (δ), 6528 (ε) and 6529 (ζ), plus reify 8368. The decompose re-walk corrected premises that had drifted or were false
 on main `fc55c9c7c8`. The corrections are made in place, and §12 records each one and why.
+Amended 2026-10-09 with a fourth caller kind, `until_escalation`, and its task 6579 (η),
+which lands after α–ε; §13 records the amendment.
 **Type:** new contract at the task-status write choke point, one new orchestrator sweep,
 two readers, one migration. No new store and no schema migration: the record is task metadata.
 **Approach:** B+H. G5 applies on several counts: five packages, the persistence choke point,
@@ -18,6 +20,8 @@ forever if the session dies." The brief's recommendations 1–4 were accepted ("
 sessions can legitimately sit for days while a complex question waits its turn. The 24 h
 idle-holder notice is gone; a live holder is never notified, flipped or counted as needing
 a human. Only holder death files a notice and, after the grace window, flips the task.
+**Amended 2026-10-09 (Leo, info-park ruling):** a deferral may name the escalation it waits
+on, and is listed closable once that escalation closes (`until_escalation`, η, §13).
 §3 records where this PRD departs from their wording and why.
 
 ## 1. Goal
@@ -157,6 +161,7 @@ violation either way (decision 10).
 | `carried_by` | `carrier_task_id` | a human: once the carrier is terminal, they close the row (`done` with `found_on_main`, or `cancelled`) or re-pend it | carrier `done` ⇒ **closable**; carrier `cancelled` ⇒ **orphaned** (the absorbed work never landed: re-pend or re-carry). While the carrier is live, the scheduler owns the carrier and so bounds the hold; a deferred carrier has its own record. | any caller |
 | `until_condition` | `condition` (text, ≤ 500 chars); optional `expires_at` | a human who judges the condition | `expires_at` ⇒ the sweep flips to `pending`. Without it, the hold is **stale** after 30 days and is listed for review. | any caller |
 | `held_by_session` | `holder_pid` (the caller's `$CLAUDE_PID`); optional `grace_secs` | the holding session, which lands or releases it | holder death ⇒ one informational notice (decision 7); death observed for `grace_secs` ⇒ flip to `pending`; while the holder lives, nothing (decision 6) | any caller whose pid is a live `claude` process on the fused-memory host |
+| `until_escalation` [η, §13] | `escalation_id` | the human or L2 watcher who rules that escalation, and who releases the task while carrying out the ruling | escalation no longer `pending` ⇒ **closable**; escalation missing from the project's queue ⇒ **orphaned**. While it is pending, nothing, however long (a question can wait days, as in decision 6). Never released automatically. | any caller |
 | `planning` | none | the planner, via `commit_planning` | **stale batch** after 24 h; never lapses, because an unwired batch must not auto-release | the server only, at `planning_mode` birth |
 | `legacy_unknown` | none | the migration triage gate (ζ) | listed with a count until triaged | the migration only (decision 9) |
 
@@ -275,6 +280,13 @@ old and new records.
     (INV-3).
   - `grace_secs` defaults to 7,200 and must lie in [600, 86,400]. The default was chosen to
     match the session registry's `LEASE_HEARTBEAT_TTL`, but the two are separate policies.
+- **`until_escalation`** (η). The escalation exists in the deferred task's own project queue
+  and is `pending`. The server opens that queue as its escalators already do
+  (`fused-memory/src/fused_memory/middleware/curator_escalator.py`:
+  `EscalationQueue(Path(project_root) / _QUEUE_DIRNAME)`), off the event loop and before the
+  write lock (INV-8). Refusals: `escalation_not_found`, `escalation_not_pending`. The
+  escalation's `task_id` need not be the deferred task's, because one question can hold
+  several tasks.
 - **Server-only kinds.** `planning` and `legacy_unknown` from a caller are refused
   (`server_only_kind`), except `legacy_unknown` in decision 9's migration shape.
 - **Refusals.** Every refusal names `reason_code`, `field` and `value` (INV-2). The `hint`
@@ -470,6 +482,8 @@ one or more `--project-root` values and re-stamps through the MCP, idempotently:
 already have a valid record are skipped. Its mapping:
 - `x_coalesced_into` → `carried_by(carrier_task_id)`;
 - `deferred_watch` with `trigger`, or `x_armed_by` → `until_condition(condition=<that text>)`;
+- `x_deferral` with a non-null `escalation_id` → `until_escalation(escalation_id)` (η adds this
+  row; it is the L2 watcher's interim hold shape from 2026-10-09, §13);
 - everything else → `legacy_unknown`. The `reason` notes "human_decomposed: possibly an
   uncommitted planning birth" where that flag is set, because `pending_since` cannot tell the
   two apart (§2).
@@ -500,6 +514,8 @@ must act on:
   sweep intervals: the sweep is not running);
 - `held_by_session` whose holder is dead (release pending), on another host, or whose
   liveness could not be read (`liveness_unknown`);
+- `until_escalation` whose escalation is no longer `pending` (closable), is missing
+  (orphaned), or could not be read (η);
 - any missing or invalid record.
 
 A `held_by_session` row with a live holder is never in `needs_human` (decision 6).
@@ -509,6 +525,7 @@ A `held_by_session` row with a live holder is never in `needs_human` (decision 6
   - "parked: carried by #N (closable | orphaned)";
   - "parked until <condition> (lapses <date>)";
   - "held by session <pid> (live | lost, releasing)";
+  - "parked until <esc-id> is ruled (closable | orphaned)" (η);
   - "planning batch";
   - "legacy: no recorded reason".
 
@@ -590,16 +607,18 @@ class DeferralKind(StrEnum):
     CARRIED_BY = 'carried_by'
     UNTIL_CONDITION = 'until_condition'
     HELD_BY_SESSION = 'held_by_session'
+    UNTIL_ESCALATION = 'until_escalation'  # η (§13)
     PLANNING = 'planning'              # server-only
     LEGACY_UNKNOWN = 'legacy_unknown'  # migration-only
 
-CALLER_KINDS = frozenset({CARRIED_BY, UNTIL_CONDITION, HELD_BY_SESSION})
+CALLER_KINDS = frozenset({CARRIED_BY, UNTIL_CONDITION, HELD_BY_SESSION, UNTIL_ESCALATION})
 
 # caller input (the MCP `deferral` argument), discriminated on `kind`
 DeferralRequest =
     {kind: 'carried_by',      carrier_task_id: int,             reason?: str}
   | {kind: 'until_condition', condition: str, expires_at?: str, reason?: str}
   | {kind: 'held_by_session', holder_pid: int, grace_secs?: int, reason?: str}
+  | {kind: 'until_escalation', escalation_id: str,              reason?: str}  # η
   | {kind: 'legacy_unknown',  reason?: str}       # accepted only per decision 9
 
 # stored as metadata.deferral (frozen, heuristic 8)
@@ -620,7 +639,12 @@ LAPSE_OVERDUE_AFTER_SECS = 2 * DEFAULT_SWEEP_INTERVAL_SECS
 def lapse_cause(record, now, dead_since: datetime | None) -> LapseCause | None  # expired | holder_lost
 def needs_human(record, now, carrier_status, liveness: Liveness | None) -> NeedsHumanReason | None
     # liveness None = not read or unreadable: held_by_session → liveness_unknown; other kinds ignore it
+    # η adds the escalation's status, read by the caller as carrier_status is; η may fold the
+    # two referent statuses into one argument (heuristic 3) and updates δ's and ε's callers
 ```
+
+α–ε implement without `UNTIL_ESCALATION`; η (§13) adds it and its predicate input. They do
+not anticipate it.
 
 The predicates take liveness and times as arguments and do no I/O (heuristic 7). The
 registry entry is the **stored** `Deferral` shape (wrapped in a `RootModel`), not the request.
@@ -677,7 +701,8 @@ A successful write that stores or clears a record echoes it in the response (`de
 `field_not_allowed`, `server_only_kind`, `holder_not_live`, `holder_not_session`,
 `holder_unverifiable`,
 `carrier_not_found`, `carrier_is_self`, `expires_at_not_future`, `grace_out_of_range`,
-`text_too_long`, `status_not_deferred`, `not_planning_hold`, `cas_needs_single_id`.
+`text_too_long`, `status_not_deferred`, `not_planning_hold`, `cas_needs_single_id`; η adds
+`escalation_not_found` and `escalation_not_pending`.
 
 Events: `task_status_changed` gains `deferral` (on entry) and `deferral_cleared` (on exit),
 and a new event `deferral_restamped {task_id, old, new}` covers re-stamps.
@@ -738,6 +763,9 @@ and the dashboard over its own fixture dicts. No row patches private names (Test
 | 26 | Unreadable `/proc` [α, β] | a process-identity read pointed at an unreadable proc root | `liveness` and `capture` raise `ProcessIdentityUnreadable`, never `DEAD`/`None`; a `held_by_session` entry is refused `holder_unverifiable` |
 | 27 | Echo [β] | any successful entry, re-stamp and exit | the response carries `deferral` (entry, re-stamp) or `deferral_cleared` (exit) |
 | 28 | Quiet passes [γ] | five unrecorded deferred rows, three passes, nothing changing | one `deferral_sweep_pass` event, not three; a sixth unrecorded row → one more |
+| 29 | `until_escalation` entry [η] | a real escalation queue dir in the temp `project_root` holding one `pending`, one `dismissed` record | entry naming the pending one → `deferred` with the record echoed; naming the dismissed one → `escalation_not_pending`; naming an absent id → `escalation_not_found`; row unchanged on each refusal |
+| 30 | `until_escalation` surfaced [η] | a recorded row; the escalation's status as `pending`, `resolved`, absent, unread | `needs_human` is `None` while pending (also with a fake clock advanced 60 days); closable after resolve; orphaned when absent; the unknown reason when unread; the dashboard row text and the census list agree on the same fixture |
+| 31 | `until_escalation` migration [η] | fixture row with `x_deferral: {escalation_id, until_condition, reason}` | dry-run maps it to `until_escalation`; a refused mapping falls back to `legacy_unknown` per decision 9 |
 
 ## 7. Pre-conditions (G3): substrate verified on `5b645d822a`, re-verified on `fc55c9c7c8` (decompose, 2026-10-08)
 
@@ -793,7 +821,7 @@ deferral record or the sweep.
 
 ## 9. Decomposition plan
 
-There are six tasks (decomposed 2026-10-08; ids in brackets):
+There are seven tasks (six decomposed 2026-10-08, η added 2026-10-09 by §13; ids in brackets):
 - α, β, γ, δ and ε are code tasks. Each one's completion signal is its boundary rows, which its
   own agent can make green in its worktree.
 - ε also carries a live check its own agent can run before β is live (read-only).
@@ -938,8 +966,21 @@ same file; the dependency edges serialize any re-grep overlap.
   - **Signal:** row 24 is green. The live check after β is live and the dashboard restarts is
     ζ's step 5.
 
+- **η — Kind `until_escalation`.** [6579; medium; normal; ~400–700 LOC; ~15 files] depends on
+  α, β, γ, δ and ε (amendment 2026-10-09, §13). It edits files each of them owns, γ's watcher
+  skill included, so it runs last. Intermediate: it unlocks ζ.
+  - Files: `shared/src/shared/task_deferral.py` and its tests (the kind, the request and
+    stored variant, `needs_human`'s escalation-status input); β's `deferral_gate.py`,
+    `server/tools.py` docstrings and hint, and `test_deferral_gate.py` (validation, two
+    reason codes); δ's `active_tasks.py`, `tab_tasks.jsx`, `index.html` cache-buster and tests
+    (the row text, escalation status from the dashboard's existing escalation corpus);
+    ε's `deferral_census.py`, `migrate_deferrals.py` and their tests (classification, the
+    `x_deferral` mapping); `skills/escalation-watcher/SKILL.md` AFK shift 1 (the watcher's
+    hold becomes `until_escalation`); the `docs/task-authoring.md` §9 recipe.
+  - **Signal:** rows 29–31 are green. The live check is ζ's step 5b.
+
 - **ζ — Human gate: restarts, live checks, migration, triage.** [6529; medium;
-  `execution_class='operational'` pure gate] depends on γ, δ and ε (β and α transitively).
+  `execution_class='operational'` pure gate] depends on γ, δ, ε and η (β and α transitively).
   The operator works this checklist in order:
   0. Confirm fused-memory restarted after β's merge (`systemctl --user show fused-memory.service
      -p ActiveEnterTimestamp`). It normally redeploys within 8 h; otherwise restart it per
@@ -969,6 +1010,11 @@ same file; the dependency edges serialize any re-grep overlap.
      needs-human count for dark_factory equals `deferral_census.py`'s for the same project,
      both read on this host within the same minute. A mismatch counts only if a re-read
      repeats it.
+  5b. **η live check:** file a scratch info escalation (`escalate_info`) on a scratch task and
+     defer the task `until_escalation` on it, confirming the echo. The tasks tab shows
+     "parked until <esc-id> is ruled". `close_only` the escalation: within one dashboard
+     refresh the row reads closable, and `deferral_census.py` lists it, with the header's
+     needs-human count equal to the census's.
   6. Close or re-pend the closable `carried_by` rows (45 in dark_factory at authoring), and
      re-pend or re-carry the orphaned ones. Triage `legacy_unknown` rows, de-flake owners
      first, into a real kind, `pending` or `cancelled`, as time allows.
@@ -993,11 +1039,11 @@ same file; the dependency edges serialize any re-grep overlap.
   at the end.
 
   **Signal (leaf):** `deferral_census.py --check` exits 0 for every migrated project, each
-  project's `legacy_unknown` count is reported, the step 1, 4 and 5 live checks passed, and
-  every project with needs-human rows left has a successor gate.
+  project's `legacy_unknown` count is reported, the step 1, 4, 5 and 5b live checks passed,
+  and every project with needs-human rows left has a successor gate.
 
-Dependencies: α → β; α, β → γ; α, β → ε; α, β, ε → δ; γ, δ, ε → ζ. γ and ε run in parallel
-once β lands, and δ follows ε. One out-of-batch follow-up: reify's audit-skill re-stamp
+Dependencies: α → β; α, β → γ; α, β → ε; α, β, ε → δ; α–ε → η; γ, δ, ε, η → ζ. γ and ε run
+in parallel once β lands, δ follows ε, and η follows all five. One out-of-batch follow-up: reify's audit-skill re-stamp
 (reify 8368), which depends on β through `metadata.external_deps`.
 
 ### Capability bindings
@@ -1144,3 +1190,54 @@ a manifest seat (sonnet) and a fresh critic (opus). Main had moved from `5b645d8
 11. **Population** at decompose (read-only, 2026-10-08): dark_factory 334 deferred, 158 with
     `x_coalesced_into` (carriers: 113 `pending`, 45 `done`); reify 227; know_live 10;
     autopilot_video 1; solar-challenge 2.
+
+## 13. Amendment record (2026-10-09): `until_escalation`
+
+**Ruling (Leo, 2026-10-09)**, in the discussion of esc-4681-3 and task 4082: a deferral may
+name the escalation it waits on, and it is listed closable once that escalation closes.
+
+**Why it arose.** The L2 watcher keeps a task out of dispatch while a design question waits on
+Leo. It used to do that with `resolve_issue(action='park')`. On an `info` record a park holds
+nothing. `escalation/src/escalation/pins.py::classify_pins` never lets an info record pin (by
+design: the filer was told to keep driving), so
+`orchestrator/src/orchestrator/scheduler.py::_phase_redispatch_stranded_blocked` re-pends the
+parked task within a tick. There were three specimens: esc-5708-3, reify esc-7881-5 and
+esc-5101-8, and esc-4681-3, re-pended after 16 s. Leo ruled that info never pinning is
+intended. Task 6578 makes `resolve_issue` refuse `park` on an info record, and the watcher holds
+such a task with a deferral instead (`skills/escalation-watcher/SKILL.md` AFK shift 1). Its hold
+has a natural exit, the escalation's ruling, which `until_condition` could carry only as prose.
+
+**What it adds.** One caller kind, `until_escalation(escalation_id)`, with these entries:
+- §2: the kinds table row;
+- §5: validation;
+- §5.1: the model, and `needs_human`'s escalation-status input;
+- §5.3: two reason codes;
+- §9: the `x_deferral` migration row;
+- §10: the needs-human entries and the dashboard text;
+- §6: boundary rows 29–31;
+- the decomposition plan: task η (6579) and ζ step 5b.
+
+**Decisions taken here.**
+- **Listed, never released.** A closed escalation makes the row closable, as a done carrier
+  does for `carried_by` (decision 8). Nothing flips it. A ruling can say "cancel the task" or
+  "re-scope first", so the release belongs to whoever carries out the ruling. A pending
+  escalation is never needs-human however old, in the spirit of decision 6.
+- **Not D-a's `until_task`.** D-a rejected `until_task` because a dependency edge already
+  expresses "run me after task X". An escalation has no edge equivalent, and this kind only
+  lists, never gates dispatch on its own.
+- **After α–ε, not folded into them.** α (6524) had passed review with its merge enqueued when
+  this was ruled, and it ships `DeferralKind` closed. η extends the vocabulary additively. α–ε
+  implement without the kind, and 6525's details carry a note not to add it early. η edits
+  files each of them owns, γ's watcher skill included, so it depends on all five. ζ depends on
+  η and gains step 5b.
+- **Interim shape.** Until β is live, the watcher writes `metadata.x_deferral` with an
+  `escalation_id` field. β converts that instruction to `until_condition`, keeping the id in the
+  condition text, and η converts it to `until_escalation`. η's migration row maps the structured
+  `x_deferral.escalation_id` and parses no prose (heuristic 12).
+- **Manifest.** η's only dependent is ζ, a human gate that runs the live check itself, so η has
+  no delivered check and the capability manifest is unchanged.
+
+**G3 substrate** (main `a27351b0c4`): fused-memory already opens per-project escalation
+queues (`curator_escalator.py`, `dead_letter_escalator.py`, `scope_violation_escalator.py`,
+among others). The dashboard already walks every escalation queue
+(`dashboard/src/dashboard/data/escalations.py`).
