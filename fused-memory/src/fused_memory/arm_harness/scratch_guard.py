@@ -29,6 +29,7 @@ class GuardCheckpoint(StrEnum):
     REEMBED = 'reembed'
     INDEX_DROP = 'index-drop'
     REPLICA_BUILD = 'replica-build'
+    SEARCH = 'search'
 
 
 class ScratchGuardError(Exception):

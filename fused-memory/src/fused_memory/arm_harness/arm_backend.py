@@ -1,18 +1,21 @@
-"""An arm's backend: built on its audited LLM client, with its scratch indices built explicitly.
+"""An arm's backend: built on the arm's own client, with its scratch indices built explicitly.
 
-``open_arm_backend`` is the one place an arm's backend is opened. The scratch guard
-runs before anything is built. The client is β's ``build_llm_client`` output with the
-conformance audit installed, handed to the backend's own construction path.
+``open_arm_backend`` (LLM axis) and ``open_embedding_arm_backend`` (embedding axis) are
+the only places an arm's backend is opened. The scratch guard runs before anything
+is built. An LLM arm's client is β's ``build_llm_client`` output with the conformance
+audit installed; an embedding arm's is the query embedder its caller built. Either is
+handed to the backend's own construction path.
 """
 
 import contextlib
 from collections.abc import AsyncIterator, Callable
 from typing import Protocol
 
+from graphiti_core.embedder.client import EmbedderClient
 from graphiti_core.llm_client import LLMClient
 
-from fused_memory.arm_harness.arm_config import llm_arm_config
-from fused_memory.arm_harness.arm_spec import LlmArmSpec
+from fused_memory.arm_harness.arm_config import embedding_arm_config, llm_arm_config
+from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec
 from fused_memory.arm_harness.conformance import (
     ConformanceLedger,
     ResponseValidator,
@@ -32,7 +35,11 @@ class ArmBackend(ArmGraph, Protocol):
     """An ArmGraph plus the lifecycle ``open_arm_backend`` drives; GraphitiBackend is the real one."""
 
     async def initialize(
-        self, *, skip_maintenance: bool = ..., llm_client: LLMClient | None = ...
+        self,
+        *,
+        skip_maintenance: bool = ...,
+        llm_client: LLMClient | None = ...,
+        embedder: EmbedderClient | None = ...,
     ) -> None: ...
 
     async def ensure_indices(self, *, group_id: str) -> IndexProvisionResult: ...
@@ -78,8 +85,29 @@ async def open_arm_backend(
     try:
         await backend.initialize(skip_maintenance=True, llm_client=client)
         if settings.index_configuration is IndexConfiguration.WITH_INDICES:
-            await _build_scratch_indices(backend, spec.scratch_group_id)
+            await build_scratch_indices(backend, spec.scratch_group_id)
         yield backend, ledger
+    finally:
+        await backend.close()
+
+
+@contextlib.asynccontextmanager
+async def open_embedding_arm_backend(
+    spec: EmbeddingArmSpec,
+    base_config: FusedMemoryConfig,
+    query_embedder: EmbedderClient,
+    *,
+    backend_factory: BackendFactory = scratch_graphiti_backend,
+) -> AsyncIterator[ArmBackend]:
+    """The arm's search backend over its scratch graph, embedding queries through ``query_embedder``.
+
+    No index is built here: the caller moves the graph between index configurations.
+    """
+    require_scratch_name(spec.scratch_group_id, checkpoint=GuardCheckpoint.SEARCH)
+    backend = backend_factory(embedding_arm_config(spec, base_config))
+    try:
+        await backend.initialize(skip_maintenance=True, embedder=query_embedder)
+        yield backend
     finally:
         await backend.close()
 
@@ -99,7 +127,7 @@ def audited_arm_client(
     return client, ledger
 
 
-async def _build_scratch_indices(backend: ArmBackend, group_id: str) -> None:
+async def build_scratch_indices(backend: ArmBackend, group_id: str) -> None:
     require_scratch_name(group_id, checkpoint=GuardCheckpoint.INDEX_BUILD)
     result = await backend.ensure_indices(group_id=group_id)
     if result.failed:
