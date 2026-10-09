@@ -22,6 +22,7 @@ from shared.task_deferral import (
     DEFAULT_GRACE_SECS,
     GRACE_BOUNDS,
     LAPSE_OVERDUE_AFTER_SECS,
+    MIGRATION_ONLY_KINDS,
     REASON_MAX_CHARS,
     STALE_CONDITION_AFTER_SECS,
     STALE_PLANNING_AFTER_SECS,
@@ -100,6 +101,20 @@ def test_caller_kinds_are_the_three_kinds_a_caller_may_choose():
     }
     assert isinstance(caller_kinds, frozenset)
     assert caller_kinds <= set(DeferralKind)
+
+
+def test_migration_only_kinds_are_legacy_unknown_alone_and_no_caller_kind():
+    assert MIGRATION_ONLY_KINDS == {DeferralKind.LEGACY_UNKNOWN}
+    assert isinstance(MIGRATION_ONLY_KINDS, frozenset)
+    assert not MIGRATION_ONLY_KINDS & CALLER_KINDS
+
+
+@pytest.mark.parametrize('kind', sorted(set(DeferralKind) - CALLER_KINDS - MIGRATION_ONLY_KINDS))
+def test_every_kind_neither_caller_nor_migration_only_is_server_only(kind):
+    with pytest.raises(DeferralInvalid) as refused:
+        parse_request({'kind': kind}, now=NOW)
+
+    assert refused.value.reason is DeferralInvalidReason.SERVER_ONLY_KIND
 
 
 # --- accepted requests -------------------------------------------------------

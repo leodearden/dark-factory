@@ -35,6 +35,7 @@ __all__ = [
     'DEFAULT_SWEEP_INTERVAL_SECS',
     'GRACE_BOUNDS',
     'LAPSE_OVERDUE_AFTER_SECS',
+    'MIGRATION_ONLY_KINDS',
     'REASON_MAX_CHARS',
     'STALE_CONDITION_AFTER_SECS',
     'STALE_PLANNING_AFTER_SECS',
@@ -77,7 +78,8 @@ class DeferralKind(StrEnum):
 CALLER_KINDS: Final = frozenset(
     {DeferralKind.CARRIED_BY, DeferralKind.UNTIL_CONDITION, DeferralKind.HELD_BY_SESSION}
 )
-_SERVER_ONLY_KINDS: Final = frozenset(DeferralKind) - CALLER_KINDS - {DeferralKind.LEGACY_UNKNOWN}
+MIGRATION_ONLY_KINDS: Final = frozenset({DeferralKind.LEGACY_UNKNOWN})
+_SERVER_ONLY_KINDS: Final = frozenset(DeferralKind) - CALLER_KINDS - MIGRATION_ONLY_KINDS
 
 
 class DeferralInvalidReason(StrEnum):
@@ -272,7 +274,11 @@ def _not_after(moment: datetime | None, now: datetime) -> bool:
 
 
 def parse_request(raw: object, *, now: datetime) -> DeferralRequest:
-    """Validate a caller's `deferral` argument; every pure refusal raises DeferralInvalid."""
+    """Validate a caller's `deferral` argument of a CALLER_KINDS or MIGRATION_ONLY_KINDS kind.
+
+    A MIGRATION_ONLY_KINDS request passes here; the gate admits it only in decision 9's row
+    shape. Every pure refusal raises DeferralInvalid.
+    """
     if not isinstance(raw, Mapping):
         raise DeferralInvalid(DeferralInvalidReason.INVALID_VALUE, 'deferral', raw)
     kind = raw.get('kind')
