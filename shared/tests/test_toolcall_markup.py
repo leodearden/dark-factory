@@ -1419,59 +1419,66 @@ class TestQuotedReportIsRepairable:
 
         assert self._repair(value) is None
 
-    def test_a_sibling_opener_with_NO_closing_tag_is_NOT_refused_TODAY(self):
-        """THE OPENER RULE'S OUTER BOUND — where (g) and (h) STOP.
+    @staticmethod
+    def _opener_verdict_tail(
+        opener: Callable[[str], str], sibling: str, quoted_closer: bool
+    ) -> str:
+        """An ``evidence`` value quoting *opener*(*sibling*), and optionally a closer.
 
-        The rule lives in ``_inner_markup_blocks``, which :func:`_parse_body`
-        consults only after its cheap prefilter finds a closing-tag SEQUENCE in
-        the value. A sibling opener with no closing tag anywhere therefore
-        never reaches the rule at all. This specimen is (g) with exactly one
-        cell removed — the trailing ``xyz`` closer that
-        :func:`_sibling_opener_tail` calls load-bearing — and it gets the
-        OPPOSITE answer.
-
-        THIS PIN ASSERTS A DEFECT, deliberately. ``suggested_action`` is a real
-        parameter disjoint from ``_SUPPLIED``, so what is measured here is the
-        sibling silently NOT recovered and its text written into ``evidence``
-        instead: the same no-silent-partial-repair failure (g) refuses. It is
-        pinned rather than fixed because it predates 4502 instead of regressing
-        at it, and closing it means moving the test up beside the prefilter,
-        which rewrites the sweep's documented unterminated-inner-opener
-        convergence case. TASK **5639** owns that.
-
-        WHEN 5639 LANDS THIS TEST MUST FAIL, which is its whole job: a boundary
-        stated only in PRD prose is one nobody is told about when it moves.
-        Invert it then, the way 5620 inverted the pin above.
-
-        BOTH DIALECTS IN ONE TEST, unlike the (g)/(h) and (a)/(d) pairs, and
-        for a reason that does not weaken the standing "keep the pair together"
-        instruction: the decision here is taken by the PREFILTER, which never
-        looks at a dialect. There is no rule in front of these two that could
-        treat them differently, so there is no asymmetry for a mirror control
-        to catch — which is exactly what stops being true the moment 5639
-        moves the test behind the prefilter.
+        The quoted ``foo`` closer is followed by a sentence of prose, so the
+        opener never sits at that closer's alternative boundary, where
+        condition (ii) would refuse it for a reason unrelated to the opener.
         """
-        for dialect, opener in (('canonical', _canonical_opener), ('echo', _opener)):
-            value = (
-                self._CLEAN
-                + _CANONICAL_CLOSER + '\n'
-                + _canonical_opener('evidence')
-                + 'the report quotes ' + opener('suggested_action')
-                + 'refile once the guard is narrowed'
-                + '\n' + INVOKE_CLOSER
-            )
+        quoted = _closer('foo') + ' and then prose: ' if quoted_closer else ''
+        return (
+            'the report quotes ' + quoted + opener(sibling)
+            + 'refile once the guard is narrowed'
+        )
 
-            result = self._repair(value)
+    @pytest.mark.parametrize(
+        'quoted_closer', [False, True], ids=['no-closer', 'quoted-closer']
+    )
+    @pytest.mark.parametrize(
+        ('opener', 'sibling', 'refused'),
+        [
+            (_canonical_opener, 'suggested_action', True),
+            (_canonical_opener, 'unrelated_field', True),
+            (_opener, 'suggested_action', True),
+            (_opener, 'name', False),
+        ],
+        ids=[
+            'canonical-schema-sibling',
+            'canonical-non-schema-name',
+            'echo-schema-sibling',
+            'echo-placeholder',
+        ],
+    )
+    def test_the_opener_verdict_does_not_depend_on_a_closing_tag(
+        self, opener, sibling, refused, quoted_closer
+    ):
+        """A sibling opener's verdict depends on the OPENER, never on a closer.
 
-            assert result is not None, (
-                f'{dialect}: task 5639 has landed — invert this pin, do not delete it'
-            )
-            assert 'suggested_action' not in result.recovered, (
-                f'{dialect}: the sibling is swallowed, not recovered — that is the bound'
-            )
-            assert opener('suggested_action') in result.recovered['evidence'], (
-                f'{dialect}: the swallowed opener lands verbatim in another argument'
-            )
+        Whether an unrelated quoted closer appears elsewhere in the value must
+        not flip the answer. The echo placeholder row recovers because its tag
+        names no parameter of this tool, so it hides nothing repair could have
+        restored (B8). Replaces the task 5620 pin that asserted the closer-free
+        half of this table was swallowed; see the PRD's B5 entry.
+        """
+        tail = self._opener_verdict_tail(opener, sibling, quoted_closer)
+        value = (
+            self._CLEAN
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('evidence') + tail
+            + '\n' + INVOKE_CLOSER
+        )
+
+        result = self._repair(value)
+
+        if refused:
+            assert result is None
+        else:
+            assert result is not None
+            assert result.recovered == {'evidence': tail}
 
 class TestRepairInvariants:
     """The four C1 invariants: totality, determinism, purity, D5."""
