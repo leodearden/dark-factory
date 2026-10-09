@@ -98,6 +98,12 @@ if __name__ == '__main__':
 _SHARED_SRC = Path(__file__).resolve().parents[2] / "shared" / "src"
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
+# orchestrator/src is bound the same way, for the stdlib-only quality
+# definition renderer `orchestrator.agents.code_quality` both census prompts
+# embed (docs/quality-findings-contract.md §10).
+_ORCH_SRC = Path(__file__).resolve().parents[2] / "orchestrator" / "src"
+if str(_ORCH_SRC) not in sys.path:
+    sys.path.insert(0, str(_ORCH_SRC))
 
 import codebook  # noqa: E402
 import coder  # noqa: E402
@@ -112,6 +118,8 @@ from legibility import (  # noqa: E402
     session_runner,
     unlanded,
 )
+from legibility import verdict as verdict_mod  # noqa: E402
+from orchestrator.agents import code_quality  # noqa: E402
 
 # The banner marker list itself lives in shared.cap_markers and is never
 # restated here -- this module only asks the question, via the predicate.
@@ -1239,10 +1247,12 @@ def build_method(
     synthesis_calls: int,
     probe_calls: int,
     wall_clock_secs: float,
+    verify_normalisations: Mapping[str, int],
 ) -> dict[str, Any]:
     """The JSON-safe ``## Method`` block: the seven keys of the
     quality-findings contract §5, then ``extra``
-    (plans/census-incremental-prd.md §4.3). *selection* is ``None`` for a
+    (plans/census-incremental-prd.md §4.3), which carries
+    *verify_normalisations*: the verdict repairs per kind (§4.4). *selection* is ``None`` for a
     run with no mining window, which nulls the evidence and ledger fields it
     would have supplied; an unreadable ledger counts ``ledger_rows`` and
     ``ledger_pruned`` as ``None``, never 0."""
@@ -1263,7 +1273,11 @@ def build_method(
             "wall_clock_secs": wall_clock_secs,
         },
         "inputs_consumed": [],
-        "extra": {"inputs_consumed_note": _INPUTS_CONSUMED_NOTE, **_ledger_extra(selection)},
+        "extra": {
+            "inputs_consumed_note": _INPUTS_CONSUMED_NOTE,
+            **_ledger_extra(selection),
+            "verify_normalisations": dict(verify_normalisations),
+        },
     }
 
 
@@ -2073,18 +2087,6 @@ def _ensure_output_parents(*paths) -> None:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
-_VALID_ENTRY_SEVERITIES = ("high", "medium", "low")
-"""codebook.py's own ``_ENTRY_SCHEMA["severity"]`` enum, duplicated here
-since codebook.py is NOT modified by this module (see the module
-docstring's "Codebook handling" section). ``run_census`` clamps an
-untrusted verify_fn-returned cluster's severity to this closed set before
-it ever reaches ``codebook.validate()`` -- an out-of-enum value (e.g. an
-escalation-style ``"critical"``/``"urgent"``, valid elsewhere in this
-codebase but NOT in the codebook's own severity enum) would otherwise fail
-validation deep into the pipeline, after mining/verify/synthesis work is
-already spent (reviewer_comprehensive finding #3)."""
-
-
 @dataclass
 class CensusOutcome:
     """Outcome of ``run_census``. ``status`` is ``"deferred"`` (a headroom
@@ -2412,11 +2414,11 @@ def run_census(
     here) -> ``compute_matrix``/``render_matrix`` over verified sightings ->
     merge every mining record via ``codebook.apply_coding_record`` -> apply
     ``promote_candidate``/``reject_candidate`` for verified/rejected
-    clusters (resolved to the merge's real candidate ids by title, severity
-    clamped to the codebook's own enum -- an untrusted out-of-enum severity
-    from *verify_fn* would otherwise fail ``codebook.validate`` deep into
-    the pipeline) and ``retire_entry`` for any entry ids *verify_fn*
-    reports fixed -> ``codebook.validate`` (raises and aborts BEFORE
+    clusters (resolved to the merge's real candidate ids by title; a
+    promoted entry takes the cluster Verdict's severity and severity_reason,
+    and a verified cluster *verify_fn* returned without a Verdict gets the
+    verdict parser's defaults) and ``retire_entry`` for any entry ids
+    *verify_fn* reports fixed -> ``codebook.validate`` (raises and aborts BEFORE
     anything is written, on an invalid merge) -> the singleton filing gate
     (``_split_fileable``: a verified cluster files only with an in-tree
     remediation or a recurrence, counted in the merged codebook; a withheld
@@ -2692,9 +2694,16 @@ def run_census(
     reported_probes = verify_result.get("headroom_probes")
     probe_count[0] += reported_probes if isinstance(reported_probes, int) else 0
 
-    verified = verify_result.get("verified") or []
+    verified = _verified_with_verdicts(
+        verify_result.get("verified") or [], project_root=project_root,
+    )
     rejected = verify_result.get("rejected") or []
     fixed_entry_ids = verify_result.get("fixed") or []
+    verify_normalisations = verdict_mod.count_normalisations(
+        cluster["verdict"]
+        for cluster in (*verified, *rejected)
+        if isinstance(cluster.get("verdict"), verdict_mod.Verdict)
+    )
 
     # DETECTOR for a systemic verifier failure. Scoping the subprocess cwd
     # removed one CAUSE of the 2026-08-03 silent mass rejection; it is not a
@@ -2802,18 +2811,12 @@ def run_census(
                 contradicting_disposition="rejected",
             ))
             continue
-        severity = cluster.get("severity")
-        if severity not in _VALID_ENTRY_SEVERITIES:
-            if severity is not None:
-                logger.warning(
-                    "census: cluster %r carries out-of-enum severity %r; "
-                    "clamping to 'medium'", cluster.get("title"), severity,
-                )
-            severity = "medium"
+        found = cluster["verdict"]
         entry_fields = {
             "id": f"entry-{cand_id}",
             "title": cluster.get("title"),
-            "severity": severity,
+            "severity": found.severity,
+            "severity_reason": found.severity_reason,
             "status": "open",
             "origin_phase": cluster.get("origin_phase") or "unknown",
             "manifested_phase": cluster.get("manifested_phase") or "unknown",
@@ -3005,6 +3008,7 @@ def run_census(
         synthesis_calls=1,
         probe_calls=probe_count[0],
         wall_clock_secs=round(time.monotonic() - started, 3),
+        verify_normalisations=verify_normalisations,
     )
     record = build_census_record(
         method=method,
@@ -3163,9 +3167,13 @@ DEFAULT_HARNESS_CONFIG_PATH = (
 own components can be a confusion's fix surface. Its project_root names the
 MAIN checkout even when the census runs from a worktree."""
 
-def _verify_prompt(cluster: dict, *, project_root: str) -> str:
+_QUALITY_DEFINITION_MARKER = "=== QUALITY DEFINITION ===\n"
+
+
+def _verify_prompt(cluster: dict, *, project_root: str, quality_block: str) -> str:
     """Prompt for the real Sonnet verify_fn: confirm-or-refute one novel
-    cluster against *project_root*'s current main via targeted file reads.
+    cluster against *project_root*'s current main via targeted file reads,
+    judged against *quality_block* (``code_quality.guidance``).
 
     The CLI subprocess this prompt is delivered to runs with its cwd set to
     *project_root* (``census_stage_specs`` binds it). That is load-bearing
@@ -3191,17 +3199,26 @@ def _verify_prompt(cluster: dict, *, project_root: str) -> str:
         "in this tree (never the tree root itself) produces, teaches, or fails to guard against the "
         "confusion; otherwise null -- including when the cause lies in "
         "tooling this tree does not contain.\n\n"
-        "Respond with STRICT JSON ONLY (no prose, no markdown fences), "
-        'exactly this shape: {"verified": true|false, "reason": "...", '
-        '"remediation": {"path": "<path relative to ' + str(project_root) + '>", '
-        '"change": "<one sentence>"} | null}.\n\n'
-        "=== CLUSTER ===\n" + json.dumps(cluster)
+        "Judge the cost the confusion imposes on the next change against the "
+        "quality definition below.\n\n"
+        + _QUALITY_DEFINITION_MARKER + quality_block
+        + "\n=== RESPONSE ===\n" + verdict_mod.reply_instructions(str(project_root))
+        + "\n=== CLUSTER ===\n" + json.dumps(cluster)
     )
 
 
-def _synthesis_prompt(verified: list) -> str:
+def _verdict_as_json(value):
+    """``json.dumps`` hook rendering a cluster's Verdict as its record."""
+    if isinstance(value, verdict_mod.Verdict):
+        return value.to_record()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _synthesis_prompt(verified: list, *, quality_block: str) -> str:
     """Prompt for the real Fable synthesize_fn: cluster + write prose for
-    the dated census report from the VERIFIED findings only."""
+    the dated census report from the VERIFIED findings only, citing the
+    heuristics of *quality_block* (``code_quality.guidance``) each finding's
+    verdict tags."""
     return (
         "You are the periodic-census synthesis writer for the dark-factory "
         "agent-confusion codebook (plans/confusion-reduction-prd.md "
@@ -3209,44 +3226,67 @@ def _synthesis_prompt(verified: list) -> str:
         "write clear, factual prose for a dated census report -- "
         "observations only, never a diagnosis that was not itself "
         "verified.\n\n"
-        "=== VERIFIED CLUSTERS ===\n" + json.dumps(verified)
+        "Each cluster's verdict tags name the heuristics of the quality "
+        "definition below that its finding rests on; cite those heuristics "
+        "by name where the prose discusses the finding.\n\n"
+        + _QUALITY_DEFINITION_MARKER + quality_block
+        + "\n=== VERIFIED CLUSTERS ===\n" + json.dumps(verified, default=_verdict_as_json)
     )
 
 
-def _in_tree_remediation(raw, *, project_root: str) -> dict | None:
-    """The verifier's proposed remediation, normalised to a path relative to
-    *project_root*, or ``None`` unless it names something that EXISTS below
-    that tree's root. The root itself names no fix surface: it would let a
-    vague reply pass the singleton gate. The verifier is sandboxed to the
-    observed tree, so a remediation is by construction a change the observed
-    project can make."""
-    if filing_policy.proposed_remediation({"remediation": raw}) is None:
-        return None
-    root = Path(project_root).resolve()
-    try:
-        target = (root / raw["path"]).resolve()
-        below_root = target != root and target.is_relative_to(root) and target.exists()
-    except (OSError, ValueError):
-        return None
-    if not below_root:
-        return None
-    return {"path": target.relative_to(root).as_posix(), "change": raw["change"].strip()}
+def _with_verdict(cluster: dict, found: verdict_mod.Verdict) -> dict:
+    """*cluster* carrying its Verdict, its remediation exactly the Verdict's
+    in-tree one when the claim is verified: a refuted claim, or a Verdict
+    without a remediation, carries none whatever the cluster arrived with."""
+    unremediated = {key: value for key, value in cluster.items() if key != "remediation"}
+    with_verdict = {**unremediated, "verdict": found}
+    if found.verified and found.remediation is not None:
+        return {**with_verdict, "remediation": found.remediation.to_record()}
+    return with_verdict
 
 
-def _with_in_tree_remediation(cluster: dict, raw, *, project_root: str) -> dict:
-    """*cluster*, plus the verifier's remediation when it survives
-    ``_in_tree_remediation``. An offered-but-rejected remediation is logged,
-    never silently dropped."""
-    remediation = _in_tree_remediation(raw, project_root=project_root)
-    if remediation is not None:
-        return {**cluster, "remediation": remediation}
-    if raw is not None:
+def _log_verdict_normalisations(title, found: verdict_mod.Verdict) -> None:
+    for note in found.normalisations:
         logger.warning(
-            "census: verifier remediation for cluster %r rejected (not an existing "
-            "path below %s): %r",
-            cluster.get("title"), project_root, raw.get("path") if isinstance(raw, dict) else raw,
+            "census: verdict for cluster %r normalised (%s): offered %s, used %r",
+            title, note.kind.value, note.offered, note.used,
         )
-    return cluster
+
+
+def _verdict_of(cluster: dict, *, project_root: str) -> verdict_mod.Verdict:
+    """*cluster*'s Verdict, else the verdict parser's reading of a verified
+    reply stating only the cluster's own remediation: normalised, logged and
+    counted like any other verdict."""
+    found = cluster.get("verdict")
+    if isinstance(found, verdict_mod.Verdict):
+        return found
+    defaulted = verdict_mod.parse_verdict(
+        {"verified": True, "remediation": cluster.get("remediation")},
+        title=cluster.get("title") or "",
+        project_root=project_root,
+    )
+    _log_verdict_normalisations(cluster.get("title"), defaulted)
+    return defaulted
+
+
+def _verified_with_verdicts(verified: list, *, project_root: str) -> list[dict]:
+    """*verified*, every cluster carrying a Verdict (``_verdict_of``) and
+    that Verdict's remediation (``_with_verdict``)."""
+    verdictless = [
+        cluster.get("title")
+        for cluster in verified
+        if not isinstance(cluster.get("verdict"), verdict_mod.Verdict)
+    ]
+    if verdictless:
+        logger.warning(
+            "census: %d verified cluster(s) arrived without a verdict; promoting "
+            "them on the verdict parser's defaults: %s",
+            len(verdictless), verdictless,
+        )
+    return [
+        _with_verdict(cluster, _verdict_of(cluster, project_root=project_root))
+        for cluster in verified
+    ]
 
 
 def _build_default_verify_fn(
@@ -3258,8 +3298,9 @@ def _build_default_verify_fn(
 ):
     """Build the real ``verify_fn(clusters, *, model)`` seam: one Sonnet
     call per cluster via *invoke* (in production the pooled runner's verify
-    stage, ``census_stage_specs``), parsed via ``coder.parse_coder_output``.
-    Any per-cluster failure (invocation error, unparseable output) rejects
+    stage, ``census_stage_specs``), parsed via ``coder.parse_coder_output``
+    and then ``verdict.parse_verdict``: verified and refuted clusters carry
+    their parsed Verdict under ``"verdict"``. Any per-cluster failure (invocation error, unparseable output) rejects
     that cluster rather than crashing the whole census -- a conservative
     fail-closed default for an unverifiable claim. This default never
     reports a "fixed" entry (a stronger claim than a per-cluster verify
@@ -3370,6 +3411,8 @@ def _build_default_verify_fn(
       invocation error -- a deferral, not an exception escaping into
       ``main()``'s exit-1 path after the whole mining spend.
     """
+    quality_block = code_quality.guidance()
+
     def _verify_fn(clusters, *, model):
         verified, rejected = [], []
         # Every probe THIS verifier spends, reported back in the result dict
@@ -3416,7 +3459,9 @@ def _build_default_verify_fn(
             # reason -- together with `verified` the three always sum to the
             # clusters offered (see CensusHeadroomExhausted's INVARIANT).
             remaining = len(clusters) - index
-            prompt = _verify_prompt(cluster, project_root=project_root)
+            prompt = _verify_prompt(
+                cluster, project_root=project_root, quality_block=quality_block,
+            )
             try:
                 raw = invoke(prompt, model)
             except Exception as exc:  # noqa: BLE001 - an unverifiable claim rejects, never crashes
@@ -3441,7 +3486,7 @@ def _build_default_verify_fn(
                 continue
 
             try:
-                verdict = coder.parse_coder_output(raw)
+                parsed = coder.parse_coder_output(raw)
             except Exception as exc:  # noqa: BLE001 - an unparseable verdict rejects, never crashes
                 # (a) Only a reply that failed to parse as a verdict is
                 # eligible for the banner scan. A parsed verdict is a verdict,
@@ -3474,14 +3519,22 @@ def _build_default_verify_fn(
                 )
                 rejected.append(cluster)
                 continue
-            if verdict.get("verified"):
-                verified.append(
-                    _with_in_tree_remediation(
-                        cluster, verdict.get("remediation"), project_root=project_root,
-                    )
+            try:
+                found = verdict_mod.parse_verdict(
+                    parsed, title=cluster.get("title") or "", project_root=project_root,
                 )
-            else:
+            except verdict_mod.VerdictError as exc:
+                logger.warning(
+                    "census: verify reply for cluster %r is not a verdict: %s",
+                    cluster.get("title"), exc,
+                )
                 rejected.append(cluster)
+                continue
+            _log_verdict_normalisations(cluster.get("title"), found)
+            if found.verified:
+                verified.append(_with_verdict(cluster, found))
+            else:
+                rejected.append(_with_verdict(cluster, found))
 
             # (c) The backstop. Guarded on `remaining > 1` so no probe is
             # spent after the last cluster, where it would guard a stage
@@ -3520,10 +3573,12 @@ def _build_default_synthesize_fn(invoke):
     Fable call via *invoke* clustering + writing prose for the verified
     findings. An empty *verified* list is handled without a model call --
     there is nothing to synthesize."""
+    quality_block = code_quality.guidance()
+
     def _synthesize_fn(verified, *, model):
         if not verified:
             return "No novel, verified confusion clusters this census."
-        return invoke(_synthesis_prompt(verified), model)
+        return invoke(_synthesis_prompt(verified, quality_block=quality_block), model)
 
     return _synthesize_fn
 

@@ -40,7 +40,9 @@ from legibility import (
     session_runner,
     trickle_state,
     unlanded,
+    verdict,
 )
+from quality_doc_texts import code_quality
 from shared.cap_markers import (
     BLOCKING_BANNER_MARKERS,
     REAL_CLI_CAP_HIT_MESSAGES,
@@ -2002,6 +2004,7 @@ def _method(**overrides):
         synthesis_calls=1,
         probe_calls=2,
         wall_clock_secs=12.5,
+        verify_normalisations=verdict.count_normalisations([]),
     )
     kwargs.update(overrides)
     return mod.build_method(**kwargs)
@@ -2028,6 +2031,16 @@ def test_build_method_conforms_to_the_independent_report_checker(tmp_path, state
     ) == []
     assert record["method"]["run_id"] == "census-dark_factory-20260714"
     assert record["method"]["as_of_sha"] == "a" * 40
+
+
+def test_build_method_records_a_copy_of_every_verify_normalisation_count():
+    counts = {**verdict.count_normalisations([]), "tag_dropped": 2}
+    recorded = dict(counts)
+
+    method = _method(verify_normalisations=counts)
+    counts["tag_dropped"] = 99
+
+    assert method["extra"]["verify_normalisations"] == recorded
 
 
 def test_build_method_since_is_none_text_without_a_prior_census():
@@ -2397,6 +2410,24 @@ def test_run_census_defers_at_verify_boundary_when_cap_arrives_after_preflight(
 _IN_TREE_REMEDIATION = {"path": "docs/fixture.md", "change": "fixture remediation"}
 
 
+def _fake_verdict(remediation):
+    """The verdict.Verdict the real verifier attaches to a verified cluster,
+    as a fake verifier states it: no normalisation, severity medium."""
+    found = None if remediation is None else verdict.Remediation(
+        remediation["path"], remediation["change"],
+    )
+    return verdict.Verdict(
+        verified=True,
+        reason="fake verifier",
+        anchor="slug:fake-verdict" if found is None else found.path,
+        tags=("h13", verdict.KIND_TAG),
+        severity=verdict.DEFAULT_SEVERITY,
+        severity_reason="fake verifier",
+        route=verdict.Route.STRUCTURAL if found is None else verdict.Route.MECHANICAL,
+        remediation=found,
+    )
+
+
 def _make_fake_verify_fn(
     *, verified_titles=(), rejected_titles=(), fixed_entry_ids=(),
     remediation=_IN_TREE_REMEDIATION,
@@ -2407,15 +2438,20 @@ def _make_fake_verify_fn(
     retire_entry path independently of any particular cluster. Records
     every call's (clusters, model, result) in `.calls`.
 
-    Each VERIFIED cluster comes back as a new dict carrying *remediation*,
-    as the real verifier's in-tree proposal would: run_census files a
-    single-sighting cluster only when it has one (filing_policy.is_fileable),
-    so without it every "was it filed" assertion here would be vacuous.
-    Pass remediation=None to model an unremediated verdict."""
+    Each VERIFIED cluster comes back as a new dict carrying its Verdict and
+    *remediation*, as the real verifier's in-tree proposal would: run_census
+    files a single-sighting cluster only when it has one
+    (filing_policy.is_fileable), so without it every "was it filed" assertion
+    here would be vacuous. Pass remediation=None to model an unremediated
+    verdict."""
     calls = []
 
     def fake_verify_fn(clusters, *, model):
-        verified = [c for c in clusters if c.get("title") in verified_titles]
+        verified = [
+            {**c, "verdict": _fake_verdict(remediation)}
+            for c in clusters
+            if c.get("title") in verified_titles
+        ]
         if remediation is not None:
             verified = [{**c, "remediation": remediation} for c in verified]
         result = {
@@ -3817,32 +3853,37 @@ def test_run_census_submit_fn_error_shape_is_not_counted_as_filed(tmp_path, capl
     assert "None" not in filed_section, "an unfilable result must never render as a '- None' bullet"
 
 
-def test_run_census_promote_clamps_out_of_enum_severity_to_medium(tmp_path):
-    """A custom verify_fn may enrich a cluster with a severity outside
-    codebook.py's {high, medium, low} entry enum (e.g. an escalation-style
-    'critical', valid elsewhere in this codebase but not in the codebook's
-    own schema). That must be clamped, not persisted verbatim into a
-    codebook.dump() that would otherwise raise deep into the pipeline
-    (reviewer_comprehensive finding #3)."""
-    batch = [
+_PROMOTED_TITLE = "Silent no-op subagent contract"
+
+
+def _novel_verified_batch():
+    return [
         _hand_digest("dup-1", "nothing new here"),
         _hand_digest("novel-verified", "a genuinely new confusion shape"),
     ]
-    fake_invoke = _make_fake_invoke(_happy_invoke_response)
 
-    def bad_severity_verify_fn(clusters, *, model):
-        verified = [
-            {**c, "severity": "critical"}
-            for c in clusters
-            if c.get("title") == "Silent no-op subagent contract"
-        ]
-        return {"verified": verified, "rejected": [], "fixed": []}
 
-    kwargs = _run_census_kwargs(
+def _persisted_promoted_entry(kwargs):
+    persisted = codebook.load(kwargs["codebook_path"])
+    assert codebook.validate(persisted) == []
+    return next(e for e in persisted["entries"] if e["title"] == _PROMOTED_TITLE)
+
+
+def _recorded_normalisations(kwargs):
+    record = json.loads(kwargs["report_path"].with_suffix(".json").read_text(encoding="utf-8"))
+    return record["method"]["extra"]["verify_normalisations"]
+
+
+def _normalisation_counts(**nonzero):
+    return {**verdict.count_normalisations([]), **nonzero}
+
+
+def _promotion_kwargs(tmp_path, *, verify_fn, invoke=None):
+    return _run_census_kwargs(
         tmp_path,
-        invoke=fake_invoke,
-        batch_source=[batch],
-        verify_fn=bad_severity_verify_fn,
+        invoke=invoke or _make_fake_invoke(_happy_invoke_response),
+        batch_source=[_novel_verified_batch()],
+        verify_fn=verify_fn,
         synthesize_fn=_make_fake_synthesize_fn(),
         submit_fn=_make_fake_submit_fn(),
         escalate_fn=_poison("escalate_fn"),
@@ -3850,15 +3891,176 @@ def test_run_census_promote_clamps_out_of_enum_severity_to_medium(tmp_path):
         commit=_make_fake_commit(),
     )
 
+
+def test_run_census_promotes_with_the_verdicts_severity_and_reason(tmp_path):
+    def verdict_verify_fn(clusters, *, model):
+        verified = [
+            {
+                **c,
+                "verdict": verdict.parse_verdict(
+                    {
+                        "verified": True,
+                        "reason": "r",
+                        "tags": ["h13"],
+                        "severity": "high",
+                        "severity_reason": "r-high",
+                        "route": "structural",
+                    },
+                    title=c["title"],
+                    project_root=tmp_path,
+                ),
+            }
+            for c in clusters
+            if c.get("title") == _PROMOTED_TITLE
+        ]
+        return {"verified": verified, "rejected": [], "fixed": []}
+
+    kwargs = _promotion_kwargs(tmp_path, verify_fn=verdict_verify_fn)
+
     outcome = mod.run_census(**kwargs)
 
-    assert outcome.status == "done", "an out-of-enum severity from verify_fn must not crash the census"
-    persisted = codebook.load(kwargs["codebook_path"])
-    assert codebook.validate(persisted) == []
-    promoted_entry = next(
-        e for e in persisted["entries"] if e["title"] == "Silent no-op subagent contract"
+    assert outcome.status == "done"
+    entry = _persisted_promoted_entry(kwargs)
+    assert entry["severity"] == "high"
+    assert entry["severity_reason"] == "r-high"
+
+
+def test_run_census_promotes_a_verdictless_cluster_through_the_parsers_defaults(
+    tmp_path, caplog,
+):
+    """A custom verify_fn may return a verified cluster with no Verdict, even
+    one carrying its own out-of-enum severity ('critical'). The cluster-level
+    severity is ignored: the cluster is parsed as an empty verdict, so its
+    defaults are normalised and counted like any other verdict's."""
+    def bad_severity_verify_fn(clusters, *, model):
+        verified = [
+            {**c, "severity": "critical"}
+            for c in clusters
+            if c.get("title") == _PROMOTED_TITLE
+        ]
+        return {"verified": verified, "rejected": [], "fixed": []}
+
+    kwargs = _promotion_kwargs(tmp_path, verify_fn=bad_severity_verify_fn)
+
+    with caplog.at_level(logging.WARNING, logger="legibility.census"):
+        outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    entry = _persisted_promoted_entry(kwargs)
+    assert entry["severity"] == "medium"
+    assert "medium" in entry["severity_reason"]
+    assert any(
+        _PROMOTED_TITLE in record.getMessage()
+        and "without a verdict" in record.getMessage().lower()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
     )
-    assert promoted_entry["severity"] == "medium", "an out-of-enum severity is clamped, never persisted verbatim"
+    assert "critical" not in entry["severity_reason"]
+    assert _recorded_normalisations(kwargs) == _normalisation_counts(
+        anchor_from_title=1, severity_missing=1, route_defaulted=1, reason_missing=1,
+    )
+
+
+def _verdictless_verify_fn(remediation):
+    def verify_fn(clusters, *, model):
+        verified = [
+            {**c, "remediation": remediation}
+            for c in clusters
+            if c.get("title") == _PROMOTED_TITLE
+        ]
+        return {"verified": verified, "rejected": [], "fixed": []}
+
+    return verify_fn
+
+
+def test_run_census_reads_a_verdictless_clusters_in_tree_remediation_into_its_verdict(
+    tmp_path,
+):
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "fixture.md").write_text("fixture\n", encoding="utf-8")
+    synthesize_fn = _make_fake_synthesize_fn()
+    kwargs = _promotion_kwargs(tmp_path, verify_fn=_verdictless_verify_fn(_IN_TREE_REMEDIATION))
+    kwargs["synthesize_fn"] = synthesize_fn
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    [cluster] = synthesize_fn.calls[0]["verified"]
+    assert cluster["verdict"].remediation == verdict.Remediation(**_IN_TREE_REMEDIATION)
+    assert cluster["verdict"].route is verdict.Route.MECHANICAL
+    assert cluster["remediation"] == _IN_TREE_REMEDIATION
+    [filed] = kwargs["submit_fn"].calls
+    assert _IN_TREE_REMEDIATION["path"] in filed["description"]
+    assert _recorded_normalisations(kwargs) == _normalisation_counts(
+        anchor_from_remediation=1, severity_missing=1, route_defaulted=1, reason_missing=1,
+    )
+
+
+def test_run_census_drops_a_verdictless_clusters_out_of_tree_remediation(tmp_path):
+    synthesize_fn = _make_fake_synthesize_fn()
+    kwargs = _promotion_kwargs(
+        tmp_path,
+        verify_fn=_verdictless_verify_fn({"path": "docs/missing.md", "change": "Document X"}),
+    )
+    kwargs["synthesize_fn"] = synthesize_fn
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    [cluster] = synthesize_fn.calls[0]["verified"]
+    assert cluster["verdict"].remediation is None
+    assert "remediation" not in cluster
+    assert all("docs/missing.md" not in call["description"] for call in kwargs["submit_fn"].calls)
+    assert _recorded_normalisations(kwargs) == _normalisation_counts(
+        anchor_from_title=1, severity_missing=1, route_defaulted=1, reason_missing=1,
+        remediation_rejected=1,
+    )
+
+
+def test_run_census_normalises_and_counts_a_malformed_verdict_from_the_real_verifier(
+    tmp_path,
+):
+    """PRD §4.8 row 6, end to end: unknown tag, missing anchor path and
+    severity 'critical' are each normalised and counted, and the run completes."""
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "fixture.md").write_text("fixture\n", encoding="utf-8")
+    malformed = json.dumps(
+        {
+            "verified": True,
+            "reason": "r",
+            "anchor": "docs/missing.py::f",
+            "tags": ["h13", "bogus"],
+            "severity": "critical",
+            "severity_reason": "s",
+            "remediation": _IN_TREE_REMEDIATION,
+        }
+    )
+
+    def respond(prompt, model):
+        if prompt.startswith("You are the periodic-census verifier"):
+            return malformed
+        return _happy_invoke_response(prompt, model)
+
+    fake_invoke = _make_fake_invoke(respond)
+    kwargs = _promotion_kwargs(
+        tmp_path,
+        invoke=fake_invoke,
+        verify_fn=mod._build_default_verify_fn(str(tmp_path), fake_invoke),
+    )
+
+    outcome = mod.run_census(**kwargs)
+
+    assert outcome.status == "done"
+    entry = _persisted_promoted_entry(kwargs)
+    assert entry["severity"] == "medium"
+    assert "critical" in entry["severity_reason"]
+    expected = _normalisation_counts(
+        anchor_from_remediation=1, tag_dropped=1, severity_substituted=1, route_defaulted=1,
+    )
+    assert _recorded_normalisations(kwargs) == expected
+    report_text = kwargs["report_path"].read_text(encoding="utf-8")
+    method_yaml = report_text.split("## Method", 1)[1].split("```yaml\n", 1)[1].split("```", 1)[0]
+    assert yaml.safe_load(method_yaml)["extra"]["verify_normalisations"] == expected
 
 
 def test_run_census_storm_batch_is_logged_and_noted_in_report(tmp_path, caplog):
@@ -7604,6 +7806,154 @@ def test_verify_prompt_requests_the_remediation_key(tmp_path):
     fake_invoke = _make_fake_invoke(default=_verdict())
     mod._build_default_verify_fn(str(tmp_path), fake_invoke)(_clusters(1), model="sonnet")
     assert '"remediation"' in fake_invoke.calls[0]["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# task 6401 step-7: RED — the default verifier parses every reply into a
+# typed verdict.Verdict (plans/census-incremental-prd.md §4.4 C4) and logs
+# each normalisation it needed.
+# ---------------------------------------------------------------------------
+
+_GUIDE_REMEDIATION = {"path": "docs/guide.md", "change": "Document X"}
+
+
+def _c4_reply(**overrides):
+    reply = {
+        "verified": True,
+        "reason": "r",
+        "anchor": "docs/guide.md",
+        "tags": ["h11"],
+        "severity": "high",
+        "severity_reason": "the next edit to the guide repeats it",
+        "route": "mechanical",
+        "remediation": _GUIDE_REMEDIATION,
+    }
+    reply.update(overrides)
+    return json.dumps(reply)
+
+
+def test_default_verify_fn_attaches_the_parsed_verdict_to_a_verified_cluster(tmp_path):
+    [cluster] = _verify_one(_tree_with_guide(tmp_path), _c4_reply())["verified"]
+
+    v = cluster["verdict"]
+    assert isinstance(v, verdict.Verdict)
+    assert v.severity == "high"
+    assert v.tags == ("h11", "kind:confusion")
+    assert v.anchor == "docs/guide.md"
+    assert v.remediation is not None
+    assert cluster["remediation"] == v.remediation.to_record()
+
+
+def test_default_verify_fn_attaches_the_parsed_verdict_to_a_refuted_cluster(tmp_path):
+    result = _verify_one(_tree_with_guide(tmp_path), _c4_reply(verified=False))
+
+    assert result["verified"] == []
+    [cluster] = result["rejected"]
+    assert isinstance(cluster["verdict"], verdict.Verdict)
+    assert cluster["verdict"].verified is False
+    assert "remediation" not in cluster
+
+
+def test_default_verify_fn_rejects_a_parsed_reply_that_is_no_verdict_without_a_probe(
+    tmp_path, caplog,
+):
+    reply = json.dumps({"verified": "yes", "reason": REAL_CLI_CAP_MESSAGES[0]})
+    probe = _make_recording_probe(mod.HeadroomResult(ok=False, reason="must never be consulted"))
+    verify_fn = mod._build_default_verify_fn(
+        str(_tree_with_guide(tmp_path)), lambda prompt, model: reply, headroom_probe=probe,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="legibility.census"):
+        result = verify_fn([{"title": _REMEDIATED_TITLE}], model="sonnet")
+
+    assert result["verified"] == []
+    assert result["rejected"] == [{"title": _REMEDIATED_TITLE}]
+    assert probe.calls == []
+    assert any(
+        _REMEDIATED_TITLE in record.getMessage() and "verified" in record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    )
+
+
+def test_default_verify_fn_logs_one_warning_per_verdict_normalisation(tmp_path, caplog):
+    reply = _c4_reply(severity="critical", tags=["h11", "bogus"])
+
+    with caplog.at_level(logging.WARNING, logger="legibility.census"):
+        _verify_one(_tree_with_guide(tmp_path), reply)
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and record.name == "legibility.census"
+    ]
+    for kind, offered in (("tag_dropped", "'bogus'"), ("severity_substituted", "'critical'")):
+        naming = [m for m in messages if _REMEDIATED_TITLE in m and kind in m and offered in m]
+        assert len(naming) == 1, (kind, messages)
+
+
+# ---------------------------------------------------------------------------
+# task 6401 step-9: RED — both census prompts embed the quality definition
+# rendered by code_quality.guidance() (docs/quality-findings-contract.md §10),
+# computed here at test time, never pasted.
+# ---------------------------------------------------------------------------
+
+_QUALITY_MARKER = "=== QUALITY DEFINITION ===\n"
+
+
+def _quality_block_of(prompt):
+    assert prompt.count(_QUALITY_MARKER) == 1
+    return prompt.split(_QUALITY_MARKER, 1)[1].split("\n=== ", 1)[0]
+
+
+_C4_KEYS = (
+    "verified", "reason", "anchor", "tags", "severity", "severity_reason", "route",
+    "remediation",
+)
+
+
+def test_verify_prompt_embeds_the_quality_definition_and_asks_for_the_c4_verdict(tmp_path):
+    fake_invoke = _make_fake_invoke(default=_verdict())
+    mod._build_default_verify_fn(str(tmp_path), fake_invoke)(_clusters(1), model="sonnet")
+    prompt = fake_invoke.calls[0]["prompt"]
+
+    assert _quality_block_of(prompt) == code_quality.guidance()
+    assert prompt.startswith("You are the periodic-census verifier")
+    for key in _C4_KEYS:
+        assert f'"{key}"' in prompt, key
+    for severity in verdict.SEVERITIES:
+        assert f'"{severity}"' in prompt, severity
+    for route in verdict.Route:
+        assert f'"{route.value}"' in prompt, route
+    assert verdict.KIND_TAG not in prompt
+    assert str(tmp_path) in prompt
+
+
+def test_synthesis_prompt_embeds_the_quality_definition_and_the_verdicts(tmp_path):
+    root = _tree_with_guide(tmp_path)
+    found = verdict.parse_verdict(
+        {
+            "verified": True,
+            "reason": "r",
+            "anchor": "docs/guide.md",
+            "tags": ["h2"],
+            "severity": "low",
+            "severity_reason": "contained",
+            "route": "structural",
+        },
+        title=_REMEDIATED_TITLE,
+        project_root=root,
+    )
+    fake_invoke = _make_fake_invoke(default="Synthesis prose.")
+
+    mod._build_default_synthesize_fn(fake_invoke)(
+        [{"title": _REMEDIATED_TITLE, "verdict": found}], model="fable",
+    )
+    prompt = fake_invoke.calls[0]["prompt"]
+
+    assert _quality_block_of(prompt) == code_quality.guidance()
+    assert '"anchor": "docs/guide.md"' in prompt
+    assert '"severity": "low"' in prompt
 
 
 # ---------------------------------------------------------------------------
