@@ -6714,18 +6714,18 @@ def test_print_fused_memory_liveness_row_enriched_stays_read_only(
 # ---------------------------------------------------------------------------
 
 
-def test_fm_watched_paths_constant() -> None:
-    """Each entry is the src/ of a workspace member whose code the fused-memory process loads.
+def test_fm_watched_paths_are_distinct_existing_paths() -> None:
+    """Every FM_WATCHED_PATHS entry is distinct and names a path in this checkout.
 
-    The derivation is enforced by tests/scripts/test_fm_watched_paths_import_closure.py.
+    Membership is decided in one place:
+    tests/scripts/test_fm_watched_paths_import_closure.py. Its set comparison
+    cannot see a duplicate entry, or a non-src/ entry that names nothing,
+    which `git log -- <pathspec>` would silently match no commits for.
     """
-    wdog = _load_watchdog()
-    assert wdog.FM_WATCHED_PATHS == [
-        "fused-memory/src/",
-        "shared/src/",
-        "escalation/src/",
-        "orchestrator/src/",
-    ]
+    watched = _load_watchdog().FM_WATCHED_PATHS
+    assert len(watched) == len(set(watched)), f"duplicate entries in {watched}"
+    missing = [path for path in watched if not (REPO_ROOT / path).exists()]
+    assert not missing, f"FM_WATCHED_PATHS entries naming no path in the checkout: {missing}"
 
 
 def test_fm_deploy_clock_path_default(monkeypatch: pytest.MonkeyPatch) -> None:
