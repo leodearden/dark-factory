@@ -106,27 +106,29 @@ filterwarnings = [
 # mechanisms intact: timeout_method and --max-worker-restart=0 are UNCHANGED,
 # each having been chosen against a measured worse failure (task 1907).
 #
-# 540 IS DERIVED FROM MEASUREMENT (task 5442, 2026-09-17), which is what this
-# paragraph used to say nobody had done. The worst per-test wall clock of an
-# UNMARKED test, across every suite and both inifile-resolution modes under real
-# fleet load, measured 61.52s; times the 8x headroom factor whose rationale is
-# orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR, rounded up
-# to a whole minute, floored at
-# orchestrator/tests/test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS.
-# The full corpus, the run-to-run spread and the
-# arithmetic are in
+# 420 IS DERIVED FROM MEASUREMENT (task 5442, 2026-09-17; re-derived by task
+# 5581), which is what this paragraph used to say nobody had done. The worst
+# per-test wall clock of an UNMARKED test, across every suite and both
+# inifile-resolution modes under real fleet load, measured 45.48s
+# (orchestrator/tests/test_hard_v2_fixture_pool.py, root-bound, task 5442's
+# corpus); times the 8x headroom factor whose rationale is
+# orchestrator/tests/_orch_helpers.py::UNDER_LOAD_HEADROOM_FACTOR = 363.84,
+# rounded up to a whole minute = 420, floored at
+# orchestrator/tests/test_whole_tree_scan_timeout_guard.py::_ABSOLUTE_FLOOR_SECONDS
+# (also 420). The two whole-tree scans that drove the earlier 540 (61.52s and
+# 54.52s) now carry their own module-level mark (task 5581) and are excluded by
+# design. The full corpus, the run-to-run spread and the arithmetic are in
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md — read that before
 # moving this number, and re-measure rather than re-judging it.
 #
-# THE MEASUREMENT RAISED THE VALUE RATHER THAN CONFIRMING IT: 300 was only 4.9x
-# the measured worst case, against the 8x this repo's own worker-death evidence
-# demands. The cost is unchanged in kind and stated plainly — a genuinely hung
-# test now takes 9 minutes to surface, not 5. @pytest.mark.timeout(N) remains
-# the escape hatch for any test that wants to surface faster.
+# 540 was the value before those two scans were marked. The cost is stated
+# plainly — a genuinely hung test now takes 7 minutes to surface.
+# @pytest.mark.timeout(N) remains the escape hatch for any test that wants to
+# surface faster.
 #
 # signal method is load-bearing HERE: thread method prints a stack trace but
 # can't actually interrupt a blocking asyncio.sleep in the main thread.
-timeout = 540
+timeout = 420
 timeout_method = "signal"
 
 [tool.pyright]

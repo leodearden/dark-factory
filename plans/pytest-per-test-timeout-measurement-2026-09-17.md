@@ -245,6 +245,7 @@ this repo's existing convention for exactly this reason.
     round up to a multiple of 60                               = 540s
     max(300, 540)                                              = 540s
       (300 was the floor on 2026-09-17; with task 5572's 420, max(420, 540) = 540s)
+      (superseded: see "Re-derivation addendum (task 5581, 2026-10-09)" below, now 420s)
 
 ## THE RESULT: 540 seconds. The measurement RAISES the value; it does not validate it.
 
@@ -292,7 +293,9 @@ to surface faster.
    rather than discovered later; the yaml knob is outside this task's scope ("every
    module pyproject.toml") and is filed as a follow-up.
 
-3. **The two governing tests are an unmarked branch of the whole-tree-scan
+3. **RESOLVED by task 5581** — see "Re-derivation addendum (task 5581,
+   2026-10-09)" below. The original record follows.
+   **The two governing tests are an unmarked branch of the whole-tree-scan
    family.** Marking them the way `orchestrator/tests/` marks its own members
    would re-derive this value as 420 rather than 540, putting ~16000 tests under
    a tighter hang-catching ceiling. The full argument for why this task derived
@@ -406,3 +409,48 @@ Task 5570 may raise verify's CLI `--timeout` from 300 to 540. Either way, 540
 is outside the inversion band
 `DELIBERATE_TIGHT_BOUND_CEILING < N < VERIFY_CLI_PER_TEST_TIMEOUT`: it is above
 300 today, and at 540 it would sit on the band's open upper edge.
+
+## Re-derivation addendum (task 5581, 2026-10-09)
+
+Task 5581 resolved residue 3: it marked the two governing tests and re-derived
+the ini default from the tree that marking produced.
+
+### What changed
+
+`fused-memory/tests/test_check_bare_magicmock_config.py` now carries a
+module-level `pytestmark = pytest.mark.timeout(WHOLE_TREE_SCAN_TEST_TIMEOUT)`,
+with a module-local `WHOLE_TREE_SCAN_TEST_TIMEOUT = 540` = ceil60(61.52 x 8 =
+492.16). It is sized from that module's own anchor, not borrowed from
+orchestrator's constant of the same name. A runtime test in the same module,
+`test_the_repo_wide_scans_here_run_under_a_module_level_timeout_mark`, checks
+that the mark is present at module level, clears 61.52 x 8, and does not fall
+below the ini default.
+
+### The arithmetic
+
+No re-measurement. With the two scans marked, the worst unmarked figure in the
+corpus is 45.48s (`orchestrator/tests/test_hard_v2_fixture_pool.py`,
+root-bound):
+
+    worst unmarked wall clock                       =  45.48s
+    x UNDER_LOAD_HEADROOM_FACTOR (8)                = 363.84s
+    round up to a multiple of 60                    = 420s
+    max(_ABSOLUTE_FLOOR_SECONDS 420, 420)           = 420s
+
+All eight configs, `CONTRIBUTING.md`'s mirror span and
+`orchestrator/tests/_orch_helpers.py::PYPROJECT_DEFAULT_TIMEOUT` carry 420.
+
+The result is robust. Any remaining unmarked figure up to 52.5s still derives
+420. Residue 4 puts the next-worst at 25.27s, about 43s after the largest
+measured root-bound inflation (x1.7).
+
+### What did NOT move
+
+- `WHOLE_TREE_SCAN_TEST_TIMEOUT` and `HEAVY_BARRIER_TEST_TIMEOUT` stay 540. The
+  never-narrow rule requires only `>=` the ini default, and 540 >= 420. Neither
+  is forced by the ini default any longer.
+- The other nine fused-memory glob-based guard modules stay unmarked. Each
+  sweeps one package rather than all seven `tests/` directories, and each is
+  at or below 25.27s.
+- Under verify, the marked module now runs at 540 instead of the CLI's 300,
+  because a mark overrides the CLI `--timeout`.

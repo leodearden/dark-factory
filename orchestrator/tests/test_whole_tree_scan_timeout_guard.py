@@ -15,9 +15,10 @@ starvation on a loaded host false-redding a shifting victim; see
 shared/pyproject.toml.  That default has since moved again, to a
 MEASURED 540 (2026-09-17, task 5442), and the family ceiling followed it up --
 not because this family was re-measured, but because the never-narrow rule
-forbids the ceiling sitting below the global default.  The marks this module
-demands are therefore equal to, not above, that default: they still guarantee
-the family never drops BELOW it, which is what a floor is for).
+forbids the ceiling sitting below the global default.  The default was then
+re-derived to 420 (task 5581) once fused-memory's members of this family were
+marked, so the 540 marks this module demands now sit above it: they still
+guarantee the family never drops BELOW it, which is what a floor is for).
 
 What makes the breach so expensive is the two settings around it:
 
@@ -47,7 +48,8 @@ tests to buy headroom only ~13 modules need.  (The global default did later
 move 60 -> 300 and then 300 -> 540, but for a different hazard -- wall-clock
 CPU starvation false-redding a shifting victim -- and the per-module marks
 stayed, because a sweep's cost and a host's contention are separate things to
-size against.)
+size against; and back to 420 once this family's fused-memory members were
+marked (task 5581).)
 
 WHERE THE RATIONALE LIVES.  The mechanism is restated here because this is the
 module a failing run points at, but the CANONICAL home -- the derivation of the
@@ -220,8 +222,8 @@ class TestTimeoutConstants:
           suite -- the current anchor, ``_MEASURED_UNDER_LOAD_WORST_CASE``.
 
         The 420s floor clears 8 x 51.87.  WHOLE_TREE_SCAN_TEST_TIMEOUT (540)
-        clears both the floor and the ini default, and the ini default is the
-        binding one.  Asserted as ``>=`` rather than ``==`` so raising the
+        clears both the floor (420) and the ini default (420); neither binds.
+        Asserted as ``>=`` rather than ``==`` so raising the
         constant later is never blocked by this test -- the never-narrow
         polarity the neighbouring shared timeouts use.
 
