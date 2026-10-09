@@ -44,6 +44,7 @@ import collections
 import dataclasses
 import functools
 import logging
+import secrets
 from collections.abc import Callable
 
 from orchestrator.git_ops import GitOps
@@ -205,21 +206,13 @@ class SuffixConflictTracker:
         self.last_known_main_sha: str | None = None
         self.bounce_registry: MergeBounceRegistry = MergeBounceRegistry()
         self._escalations_issued: int = 0
+        self._incarnation: str = secrets.token_hex(4)
 
     def _escalate(self, req: MergeRequest, detail: str) -> int:
         """Divert *req* out of its lane and resolve it blocked; return the ordinal.
 
-        The outcome rides workflow.py's ordinary blocked path, whose
-        ``consecutive_merge_thrash`` ladder means "the SAME mechanical merge
-        failure repeated".  With both structured fields empty its signature is
-        the hash of this reason
-        (``shared/src/shared/task_metadata.py::RetryLedger.compute_merge_outcome_signature``),
-        so the reason must never be invariant across escalations.  The
-        per-branch bounce count cannot vary it (cleared here); the ordinal does,
-        as in the lane cap-out (``merge_lane/worker.py::SpeculativeMergeWorker``,
-        ``_contended_lease_cap_outs``).  Never set ``failure_category``: a
-        constant would collapse every bounce onto one signature.  Guard:
-        ``orchestrator/tests/test_merge_queue_bounce.py::TestBounceEscalationsNeverFeedTheThrashLadder``.
+        Its reason never repeats, not even across a restart (guard and why:
+        ``orchestrator/tests/test_merge_queue_bounce.py::TestBounceEscalationsNeverFeedTheThrashLadder``).
 
         Trade-off note (robustness_premature_escalation): the frozen tip is
         speculative — the frozen items are still verifying and may fail.  A
@@ -237,7 +230,7 @@ class SuffixConflictTracker:
             status='blocked',
             reason=(
                 f'{NEEDS_REBASE_REASON_PREFIX}: branch {branch!r} {detail} '
-                f'(bounce escalation #{ordinal})'
+                f'(bounce escalation #{ordinal} of tracker {self._incarnation})'
             ),
         )
         if not req.result.done():

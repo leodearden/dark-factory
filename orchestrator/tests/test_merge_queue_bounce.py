@@ -296,6 +296,17 @@ async def _escalate_at_tracker(
     return req.result.result()
 
 
+async def _cap_out_at_tracker(
+    tracker: SuffixConflictTracker,
+    buffers: dict[str, collections.deque],
+    req: MergeRequest,
+) -> MergeOutcome:
+    """Bring *req*'s branch to the bounce cap, then return the cap-out escalation."""
+    for _ in range(MERGE_BOUNCE_CAP):
+        tracker.bounce_registry.record_bounce(req.branch.bare_id)
+    return await _escalate_at_tracker(tracker, buffers, req)
+
+
 def _resubmission(req: MergeRequest) -> MergeRequest:
     """A fresh request for *req*'s branch, as the post-steward resubmission is.
 
@@ -738,7 +749,6 @@ class TestBounceEscalationsNeverFeedTheThrashLadder:
 
         It fires at the first count past the cap and then clears the registry,
         so the ``count=`` it renders is always ``MERGE_BOUNCE_CAP + 1``.
-        Before the fix its reason varied only by branch.
         """
         buffers = {'high': collections.deque(), 'normal': collections.deque()}
         tracker = _make_tracker(
@@ -749,9 +759,7 @@ class TestBounceEscalationsNeverFeedTheThrashLadder:
 
         outcomes: list[MergeOutcome] = []
         for _round in range(2):
-            for _ in range(MERGE_BOUNCE_CAP):
-                tracker.bounce_registry.record_bounce('591')
-            outcomes.append(await _escalate_at_tracker(
+            outcomes.append(await _cap_out_at_tracker(
                 tracker, buffers, _make_req('591', '591', config, git_repo),
             ))
         o1, o2 = outcomes
@@ -771,6 +779,38 @@ class TestBounceEscalationsNeverFeedTheThrashLadder:
         )
         assert not any(escalations), escalations
         assert ledger.consecutive_merge_thrash == 1
+
+    @pytest.mark.asyncio
+    async def test_cap_outs_either_side_of_a_restart_are_signature_distinct(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """Every process builds a fresh tracker, so its ordinal restarts at #1.
+
+        The ladder's ledger is persisted in task metadata and outlives the
+        process, so the last cap-out before a restart and the first one after
+        it are consecutive on the ladder.  The cap arm renders no frozen tip,
+        so nothing else in its reason changes across the restart.
+        """
+        git_ops.rebase_onto_main = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+        outcomes: list[MergeOutcome] = []
+        for _process in range(2):
+            buffers = {'high': collections.deque(), 'normal': collections.deque()}
+            tracker = _make_tracker(
+                git_ops, lane_buffers=buffers, frozen_tip='deadbeefcafe3910',
+            )
+            outcomes.append(await _cap_out_at_tracker(
+                tracker, buffers, _make_req('591', '591', config, git_repo),
+            ))
+        o1, o2 = outcomes
+
+        assert _signature(o1) != _signature(o2), (
+            f'{_DISTINCTNESS_FAILURE}; reasons: {o1.reason!r} / {o2.reason!r}'
+        )
+        _, escalations = _fold_through_thrash_ladder(
+            [o1, o2], config.max_consecutive_merge_thrash,
+        )
+        assert not any(escalations), escalations
 
     @pytest.mark.asyncio
     async def test_two_lane_bounces_of_one_branch_against_one_frozen_tip_do_not_thrash(
