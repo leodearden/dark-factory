@@ -126,7 +126,10 @@ from fused_memory.server.grouped_read import (
     group_memory_document,
     group_search_results,
 )
-from fused_memory.server.manifest_stamping import stamp_capability_manifests
+from fused_memory.server.manifest_stamping import (
+    stamp_capability_manifests,
+    stamping_action_required,
+)
 from fused_memory.server.markup_tripwire import (
     # The write-time gate this module hosted was retired in task 4458: the ONE
     # markup mechanism now runs at the dispatch boundary
@@ -9464,6 +9467,12 @@ def create_mcp_server(
         Like ``manifest_stamping``, the key is attached ONLY when non-empty,
         so a clean batch's response is byte-identical to the pre-gate one.
 
+        A ``pending`` commit also stamps any capability-manifest sidecar the
+        batch names and attaches the ``manifest_stamping`` report, plus
+        ``manifest_stamping_action_required`` when it needs repair; it never
+        blocks the flip. The contract is the
+        ``fused_memory.server.manifest_stamping`` module docstring.
+
         Returns ``{success, results: [{task_id, result: ...}, ...]}`` matching
         the multi-id ``set_task_status`` response shape.
         """
@@ -9625,6 +9634,9 @@ def create_mcp_server(
             )
             if manifest_report is not None and isinstance(result, dict):
                 result['manifest_stamping'] = manifest_report
+                action_required = stamping_action_required(manifest_report)
+                if action_required:
+                    result['manifest_stamping_action_required'] = action_required
         # Non-blocking half of the polarity gate (task 3500), attached in the
         # same CONDITIONAL shape as `manifest_stamping` directly above: only
         # when non-empty, so a clean batch's response is byte-identical to the
