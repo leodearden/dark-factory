@@ -884,16 +884,20 @@ class TestThePublishWriteTimeCommand:
 
     def test_the_defaults_are_the_write_time_files_never_the_pi_ones(self) -> None:
         calibration = _PACKAGE / 'calibration'
-        assert _mod().DEFAULT_WRITE_TIME_POPULATION_OUT == (
-            calibration / 'write_triage_population_write_time.json'
-        )
-        assert _mod().DEFAULT_WRITE_TIME_PAIRS_OUT == (
-            calibration / 'write_triage_pairs_to_rate_write_time.jsonl'
-        )
-        assert _mod().DEFAULT_VERDICT_CORPUS == calibration / 'write_triage_pair_verdicts.jsonl'
-        assert _mod().DEFAULT_ALREADY_RATED == (
-            _PACKAGE / 'tests' / 'fixtures' / 'write_triage_pair_verdicts_seed.jsonl'
-        )
+        defaults = {
+            name: getattr(_mod(), name) for name in (
+                'DEFAULT_WRITE_TIME_POPULATION_OUT', 'DEFAULT_WRITE_TIME_PAIRS_OUT',
+                'DEFAULT_VERDICT_CORPUS', 'DEFAULT_ALREADY_RATED',
+            )
+        }
+        assert defaults == {
+            'DEFAULT_WRITE_TIME_POPULATION_OUT': calibration / 'write_triage_population_write_time.json',
+            'DEFAULT_WRITE_TIME_PAIRS_OUT': calibration / 'write_triage_pairs_to_rate_write_time.jsonl',
+            'DEFAULT_VERDICT_CORPUS': calibration / 'write_triage_pair_verdicts.jsonl',
+            'DEFAULT_ALREADY_RATED': (
+                _PACKAGE / 'tests' / 'fixtures' / 'write_triage_pair_verdicts_seed.jsonl'
+            ),
+        }
 
     def test_the_parser_writes_to_its_defaults(
         self, published: _PublishedWriteTime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

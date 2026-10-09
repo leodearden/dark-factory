@@ -35,6 +35,11 @@ artifacts:
       --snapshot <snapshot.json> \\
       --fixture-report shipped=<dir>/fixture-shipped.json \\
       --fixture-report pre-psi=<dir>/fixture-pre-psi.json
+
+and ``publish-write-time`` does the same for the write-time run:
+
+  uv run python scripts/run_write_triage_population_arms.py publish-write-time \\
+      --snapshot <snapshot.json> --max-writes 658 --budget-usd 15
 """
 from __future__ import annotations
 
@@ -47,6 +52,7 @@ import json
 import logging
 import math
 import os
+import statistics
 import sys
 import time
 import types
@@ -634,6 +640,25 @@ _MATCHED_FIXTURE_PROVENANCE = ('field_chars', 'slate_mode', 'project_id', 'judge
 DEFAULT_POPULATION_OUT = _PACKAGE_ROOT / 'calibration' / 'write_triage_population.json'
 DEFAULT_PAIRS_OUT = _PACKAGE_ROOT / 'calibration' / 'write_triage_pairs_to_rate.jsonl'
 DEFAULT_ALREADY_RATED = _PACKAGE_ROOT / 'tests' / 'fixtures' / 'write_triage_pair_verdicts_seed.jsonl'
+DEFAULT_WRITE_TIME_POPULATION_OUT = (
+    _PACKAGE_ROOT / 'calibration' / 'write_triage_population_write_time.json'
+)
+DEFAULT_WRITE_TIME_PAIRS_OUT = (
+    _PACKAGE_ROOT / 'calibration' / 'write_triage_pairs_to_rate_write_time.jsonl'
+)
+#: The append-only verdict corpus the raters' answers land in.
+DEFAULT_VERDICT_CORPUS = _PACKAGE_ROOT / 'calibration' / 'write_triage_pair_verdicts.jsonl'
+
+#: How the write-time artifact's slates were cut, as the artifact states it.
+WRITE_TIME_RULE = (
+    "Each write is judged on the candidates of its frozen slate whose created_at is strictly "
+    "before the write's (an unparseable created_at cannot be shown earlier, so it is dropped); "
+    "band, band winner and similarity are re-decided by the shipped decide_band at the "
+    "snapshot's t_high and t_low. Where at least n candidates remain, the top n equal "
+    "production's write-time top n among records still live at the freeze. The sample is the "
+    "frozen judge-band prefix; a sampled write that leaves the judge band is listed, never "
+    "replaced."
+)
 
 
 def _sha256(data: bytes | str) -> str:
@@ -653,30 +678,74 @@ def _count(rows: Iterable[Mapping[str, Any]], key: str) -> dict[str, int]:
     return dict(sorted(collections.Counter(row[key] for row in rows).items()))
 
 
-def _validated_run_set(
-    snapshot: Mapping[str, Any], snapshot_sha256: str,
+def _validated_rows(
+    arms: Sequence[Arm],
     arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
-) -> list[dict[str, Any]]:
-    """The run set every arm covers, refusing anything that would read as partial."""
-    for arm in ARMS:
+    snapshot_sha256: str,
+    expected_ids: Collection[str],
+    *,
+    run_set: str,
+) -> None:
+    """Refuse, naming the arm, any of *arms* not covering exactly *expected_ids* once each.
+
+    *run_set* describes the expected writes for the refusal message.
+    """
+    for arm in arms:
         if not arm_rows_by_name.get(arm.name):
             raise ValueError(f'arm {arm.name} has no rows to publish')
-    for arm in ARMS:
+    for arm in arms:
         rows = arm_rows_by_name[arm.name]
         foreign = sorted({str(row.get('snapshot_sha256')) for row in rows} - {snapshot_sha256})
         if foreign:
             raise ValueError(f'arm {arm.name} holds rows from another snapshot: {foreign}')
         if len({row['memory_id'] for row in rows}) != len(rows):
             raise ValueError(f'arm {arm.name} judged a write more than once')
-    prefix = judge_band_order(snapshot, snapshot_sha256)[:len(arm_rows_by_name[ARMS[0].name])]
-    expected = {write['memory_id'] for write in prefix}
-    for arm in ARMS:
-        if {row['memory_id'] for row in arm_rows_by_name[arm.name]} != expected:
-            raise ValueError(
-                f'arm {arm.name} does not cover the common prefix of the judge-band '
-                f'order, its first {len(prefix)} writes',
-            )
+    for arm in arms:
+        if {row['memory_id'] for row in arm_rows_by_name[arm.name]} != set(expected_ids):
+            raise ValueError(f'arm {arm.name} does not cover {run_set}')
+
+
+def _validated_run_set(
+    snapshot: Mapping[str, Any], snapshot_sha256: str,
+    arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> list[dict[str, Any]]:
+    """The run set every arm covers, refusing anything that would read as partial."""
+    first_arm_rows = arm_rows_by_name.get(ARMS[0].name) or []
+    prefix = judge_band_order(snapshot, snapshot_sha256)[:len(first_arm_rows)]
+    _validated_rows(
+        ARMS, arm_rows_by_name, snapshot_sha256, {write['memory_id'] for write in prefix},
+        run_set=f'the common prefix of the judge-band order, its first {len(prefix)} writes',
+    )
     return prefix
+
+
+def _validated_write_time_run_set(
+    snapshot: Mapping[str, Any], snapshot_sha256: str,
+    arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
+    sample_size: int,
+) -> RunSet:
+    """The write-time run set every arm covers, refusing anything partial or on other slates."""
+    run_set = draw_run_set(
+        snapshot, snapshot_sha256, max_writes=sample_size, slates=Slates.WRITE_TIME,
+    )
+    _validated_rows(
+        WRITE_TIME_ARMS, arm_rows_by_name, snapshot_sha256,
+        {write['memory_id'] for write in run_set.writes},
+        run_set=(
+            f'the {len(run_set.writes)} of the first {run_set.sample_size} writes of the '
+            'judge-band order still in the judge band at write time'
+        ),
+    )
+    for arm in WRITE_TIME_ARMS:
+        stray = sorted(
+            {str(row.get('slates')) for row in arm_rows_by_name[arm.name]} - {Slates.WRITE_TIME},
+        )
+        if stray:
+            raise ValueError(
+                f'arm {arm.name} holds rows judged on {", ".join(stray)} slates, '
+                f'not {Slates.WRITE_TIME}',
+            )
+    return run_set
 
 
 def _has_later_candidate(write: Mapping[str, Any]) -> bool:
@@ -710,6 +779,51 @@ def _population_block(
         'declares_attach_keys_writes': sum(1 for w in writes if w['declares_attach_keys']),
         **_freeze.exclusions(snapshot),
         'judge_band_with_later_candidates': sum(1 for w in run_set if _has_later_candidate(w)),
+    }
+
+
+def _write_time_population_block(
+    snapshot: Mapping[str, Any], snapshot_sha256: str, snapshot_path: Path, run_set: RunSet,
+) -> dict[str, Any]:
+    frozen = {write['memory_id']: write for write in snapshot['writes']}
+    order = judge_band_order(snapshot, snapshot_sha256)
+    sample = order[:run_set.sample_size]
+    judged = run_set.writes
+    leavers = [
+        write_time_slate(frozen[memory_id], t_high=snapshot['t_high'], t_low=snapshot['t_low'])
+        for memory_id in run_set.left_judge_band
+    ]
+    sizes = [len(write['candidates']) for write in judged]
+    return {
+        'slates': Slates.WRITE_TIME,
+        'slates_rule': WRITE_TIME_RULE,
+        'n_writes': len(snapshot['writes']),
+        'n_judge_band_frozen': len(order),
+        'judge_band_sample': {'order': _RUN_SET_ORDER, 'size': len(sample), 'of': len(order)},
+        'n_judge_band_write_time': len(judged),
+        'excluded_by_write_time_filter': {
+            'count': len(leavers),
+            'memory_ids': list(run_set.left_judge_band),
+            'by_band': _count(leavers, 'band'),
+        },
+        'band_winner_changed': sum(
+            1 for w in judged if w['band_winner_id'] != frozen[w['memory_id']]['band_winner_id']
+        ),
+        'writes_with_later_candidates': sum(1 for w in sample if _has_later_candidate(w)),
+        'later_candidates_dropped': sum(
+            len(frozen[w['memory_id']]['candidates']) - len(w['candidates']) for w in judged
+        ),
+        'write_time_slate_size': {
+            'min': min(sizes), 'median': statistics.median(sizes), 'max': max(sizes),
+        },
+        'recon_marker_run_set': sum(1 for w in judged if w['recon_marker']),
+        'declares_attach_keys_run_set': sum(1 for w in judged if w['declares_attach_keys']),
+        'projects': list(snapshot['projects']),
+        'frozen_at': snapshot['frozen_at'],
+        'snapshot_sha256': snapshot_sha256,
+        'snapshot_path': repo_relative(snapshot_path),
+        't_high': snapshot['t_high'],
+        't_low': snapshot['t_low'],
     }
 
 
@@ -884,6 +998,41 @@ def build_population_artifact(
     }
 
 
+def build_write_time_population_artifact(
+    snapshot: Mapping[str, Any],
+    snapshot_sha256: str,
+    snapshot_path: Path,
+    arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    sample_size: int,
+    budget_usd: float,
+    pairs_to_rate: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The committed π2 artifact; refuses (``ValueError``) any partial or mixed arm.
+
+    Every arm of :data:`WRITE_TIME_ARMS` must cover, on write-time slates,
+    exactly the writes of the first *sample_size* of :func:`judge_band_order`
+    still in the judge band. Arm files are read from ``arms-write-time/``
+    beside *snapshot_path* for their path and digest.
+    """
+    run_set = _validated_write_time_run_set(
+        snapshot, snapshot_sha256, arm_rows_by_name, sample_size,
+    )
+    arms_dir = Path(snapshot_path).parent / ARMS_DIR_NAME[Slates.WRITE_TIME]
+    arms = [
+        _arm_row(arm, arm_rows_by_name[arm.name], arm_path(arms_dir, arm.name))
+        for arm in WRITE_TIME_ARMS
+    ]
+    return {
+        'population': _write_time_population_block(
+            snapshot, snapshot_sha256, snapshot_path, run_set,
+        ),
+        'arms': arms,
+        'spend': _spend_block(arms, budget_usd),
+        'pairs_to_rate': None if pairs_to_rate is None else dict(pairs_to_rate),
+    }
+
+
 def _capped(text: str | None) -> str | None:
     if text is None or len(text) <= _PAIR_TEXT_CHARS:
         return text
@@ -912,6 +1061,28 @@ def build_pairs_to_rate(
     :func:`build_population_artifact` refuses.
     """
     _validated_run_set(snapshot, snapshot_sha256, arm_rows_by_name)
+    return _pair_rows(snapshot, snapshot_sha256, arm_rows_by_name, already_rated)
+
+
+def build_write_time_pairs_to_rate(
+    snapshot: Mapping[str, Any],
+    snapshot_sha256: str,
+    arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    sample_size: int,
+    already_rated: Collection[tuple[str, str]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """:func:`build_pairs_to_rate` for the π2 run, refusing what its artifact refuses."""
+    _validated_write_time_run_set(snapshot, snapshot_sha256, arm_rows_by_name, sample_size)
+    return _pair_rows(snapshot, snapshot_sha256, arm_rows_by_name, already_rated)
+
+
+def _pair_rows(
+    snapshot: Mapping[str, Any],
+    snapshot_sha256: str,
+    arm_rows_by_name: Mapping[str, Sequence[Mapping[str, Any]]],
+    already_rated: Collection[tuple[str, str]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     writes = {write['memory_id']: write for write in snapshot['writes']}
     judged = {
         (row['memory_id'], row['judged_candidate_id'])
@@ -941,6 +1112,16 @@ def load_rated_pairs(paths: Iterable[Path]) -> set[tuple[str, str]]:
     return {
         (row['entry_id'], row['target_id'])
         for path in paths for row in read_rows(Path(path))
+    }
+
+
+def _rated_source(path: Path) -> dict[str, Any]:
+    """A verdict file as it stood: an append-only file's later state keeps this prefix."""
+    body = Path(path).read_bytes()
+    return {
+        'path': repo_relative(path),
+        'rows': len(body.splitlines(keepends=True)),
+        'sha256': _sha256(body),
     }
 
 
@@ -1000,6 +1181,14 @@ def _write_staged(bodies: Mapping[Path, str]) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def _jsonl_body(rows: Iterable[Mapping[str, Any]]) -> str:
+    return ''.join(json.dumps(row, sort_keys=True, ensure_ascii=False) + '\n' for row in rows)
+
+
+def _json_body(artifact: Mapping[str, Any]) -> str:
+    return json.dumps(artifact, indent=2, sort_keys=True, ensure_ascii=False) + '\n'
+
+
 def _command_publish(args: argparse.Namespace) -> int:
     snapshot, snapshot_sha256 = _freeze.load_snapshot(args.snapshot)
     arms_dir = Path(args.snapshot).parent / ARMS_DIR_NAME[Slates.FROZEN]
@@ -1008,7 +1197,7 @@ def _command_publish(args: argparse.Namespace) -> int:
         snapshot, snapshot_sha256, arm_rows,
         already_rated=load_rated_pairs(args.already_rated),
     )
-    pairs_body = ''.join(json.dumps(p, sort_keys=True, ensure_ascii=False) + '\n' for p in pairs)
+    pairs_body = _jsonl_body(pairs)
     artifact = build_population_artifact(
         snapshot, snapshot_sha256, args.snapshot, arm_rows,
         budget_usd=args.budget_usd,
@@ -1017,14 +1206,38 @@ def _command_publish(args: argparse.Namespace) -> int:
             **stats, 'path': repo_relative(args.pairs_out), 'sha256': _sha256(pairs_body),
         },
     )
-    _write_staged({
-        args.pairs_out: pairs_body,
-        args.population_out: json.dumps(artifact, indent=2, sort_keys=True, ensure_ascii=False)
-        + '\n',
-    })
+    _write_staged({args.pairs_out: pairs_body, args.population_out: _json_body(artifact)})
     print(json.dumps({
         'population_out': str(args.population_out), 'pairs_out': str(args.pairs_out),
         'n_judge_band': artifact['population']['n_judge_band'],
+        'n_pairs': stats['n_pairs'], 'usd_total': artifact['spend']['usd_total'],
+    }, indent=2))
+    return 0
+
+
+def _command_publish_write_time(args: argparse.Namespace) -> int:
+    snapshot, snapshot_sha256 = _freeze.load_snapshot(args.snapshot)
+    arms_dir = Path(args.snapshot).parent / ARMS_DIR_NAME[Slates.WRITE_TIME]
+    arm_rows = {arm.name: read_rows(arm_path(arms_dir, arm.name)) for arm in WRITE_TIME_ARMS}
+    pairs, stats = build_write_time_pairs_to_rate(
+        snapshot, snapshot_sha256, arm_rows, sample_size=args.max_writes,
+        already_rated=load_rated_pairs(args.already_rated),
+    )
+    pairs_body = _jsonl_body(pairs)
+    artifact = build_write_time_population_artifact(
+        snapshot, snapshot_sha256, args.snapshot, arm_rows,
+        sample_size=args.max_writes, budget_usd=args.budget_usd,
+        pairs_to_rate={
+            **stats, 'path': repo_relative(args.pairs_out), 'sha256': _sha256(pairs_body),
+            'already_rated': [_rated_source(path) for path in args.already_rated],
+        },
+    )
+    _write_staged({args.pairs_out: pairs_body, args.population_out: _json_body(artifact)})
+    population = artifact['population']
+    print(json.dumps({
+        'population_out': str(args.population_out), 'pairs_out': str(args.pairs_out),
+        'n_judge_band_write_time': population['n_judge_band_write_time'],
+        'excluded_by_write_time_filter': population['excluded_by_write_time_filter']['count'],
         'n_pairs': stats['n_pairs'], 'usd_total': artifact['spend']['usd_total'],
     }, indent=2))
     return 0
@@ -1074,6 +1287,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                          help='a fixture eval report per wording; both or neither')
     publish.add_argument('--budget-usd', dest='budget_usd', type=float, default=40.0)
     publish.set_defaults(handler=_command_publish)
+    write_time = commands.add_parser(
+        'publish-write-time',
+        help='refuse anything partial, then write the π2 write-time artifacts',
+    )
+    write_time.add_argument('--snapshot', type=Path, required=True,
+                            help='the frozen snapshot.json whose arms-write-time/ to publish')
+    write_time.add_argument('--max-writes', dest='max_writes', type=int, required=True,
+                            help="the run's sample size, a prefix of the judge-band order "
+                                 "(π's is 658)")
+    write_time.add_argument('--population-out', dest='population_out', type=Path,
+                            default=DEFAULT_WRITE_TIME_POPULATION_OUT)
+    write_time.add_argument('--pairs-out', dest='pairs_out', type=Path,
+                            default=DEFAULT_WRITE_TIME_PAIRS_OUT)
+    write_time.add_argument('--already-rated', dest='already_rated', type=Path, nargs='+',
+                            default=[DEFAULT_VERDICT_CORPUS, DEFAULT_ALREADY_RATED],
+                            help='verdict files whose pairs are left out of the rater file '
+                                 '(default: the verdict corpus and the seed)')
+    write_time.add_argument('--budget-usd', dest='budget_usd', type=float, default=15.0)
+    write_time.set_defaults(handler=_command_publish_write_time)
     args = parser.parse_args(argv)
     if getattr(args, 'config', None):
         os.environ['CONFIG_PATH'] = str(args.config)
