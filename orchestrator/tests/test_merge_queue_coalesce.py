@@ -2957,9 +2957,8 @@ class TestAwaitUnadvancedPredecessor:
         that the wait really ran to its deadline rather than falling out early
         is the clock's own record of what it was asked to sleep.
 
-        The interlock polls every 50ms toward that real ~1920s deadline, about
-        38,400 polls, so each poll must be a bare yield: measured, at a 0.02s
-        real wait per poll the test hit the 300s timeout.
+        The interlock polls toward that real deadline ~38,400 times, so each
+        poll must be a bare yield (``sleep_cap=0.0``).
         """
         config = _make_config(tmp_path)
         queue: asyncio.Queue = asyncio.Queue()

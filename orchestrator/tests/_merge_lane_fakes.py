@@ -318,11 +318,11 @@ class FakeClock:
     timeout lands in ``waits``.
 
     How much real time the polled task gets before that is NOT dependable.
-    At the defaults a started lane's loops charge 150s per 0.02s of real
-    sleep (heartbeat 30s + reprobe 120s) and the abort poll charges 10s per
-    wait, so a parked verify's 5400s no-progress budget runs out in under a
-    second of real time. Load only lengthens that, but it is still no
-    load-safe slack: a scene that must not call a verify dead shows the
+    A started lane's loops charge 150s (heartbeat 30s + reprobe 120s) per
+    ``sleep_cap`` of real sleep and the abort poll charges its full poll
+    interval per ``wait_cap``, so at the defaults a parked verify's
+    no-progress budget runs out in under a second of real time. Load
+    only lengthens that, but it is still no load-safe slack: a scene that must not call a verify dead shows the
     content progress a healthy verify makes -- ``healthy_verify_clock`` --
     and only a scene exercising the dead-verify abort leaves
     ``content_mtime`` frozen.

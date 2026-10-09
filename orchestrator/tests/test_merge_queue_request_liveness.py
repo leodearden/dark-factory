@@ -2479,7 +2479,7 @@ class TestContendedLeaseDefers:
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         # PRODUCTION_CLOCK: a cancellation landing INSIDE the backoff is this
         # test's subject, so the backoff has to be a real park the test can
-        # cancel — a fake clock's sleep returns within its 20ms sleep_cap, too
+        # cancel — a fake clock's sleep returns within its sleep_cap, too
         # short a window to land the cancellation in reliably.
         worker = make_lane(warm_git_ops, q, clock=PRODUCTION_CLOCK)
         worker._register_owned_merge_worktree(item.merge_wt)

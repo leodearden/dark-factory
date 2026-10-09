@@ -189,8 +189,7 @@ class TestFakeClockSleeps:
     """``sleep`` on the fake every merge-lane test injects.
 
     A started lane's ``_heartbeat_loop`` and ``_reprobe_loop`` sleep on this
-    clock, so a bare-yield sleep spins them at event-loop speed: task 6494
-    measured 5116 sleeps and 383710s of ``mono`` in a 1.5s real park.
+    clock, so a bare-yield sleep would spin them at event-loop speed.
     """
 
     @pytest.mark.asyncio
@@ -206,6 +205,10 @@ class TestFakeClockSleeps:
     @pytest.mark.asyncio
     async def test_a_sleep_waits_no_longer_than_the_cap_not_the_requested_period(self) -> None:
         await asyncio.wait_for(FakeClock().sleep(3600.0), timeout=5.0)
+
+    @pytest.mark.asyncio
+    async def test_a_sleep_shorter_than_the_cap_waits_only_the_requested_period(self) -> None:
+        await asyncio.wait_for(FakeClock(sleep_cap=60.0).sleep(0.01), timeout=5.0)
 
     @pytest.mark.asyncio
     async def test_a_sleep_advances_both_readings_by_the_full_request_and_records_it(self) -> None:
@@ -227,7 +230,7 @@ class TestFakeClockSleeps:
             for _ in range(1000):
                 await clock.sleep(0.05)
 
-        # At the default cap the same loop needs 20s of real time.
+        # At the default cap each of these polls would be a real wait.
         await asyncio.wait_for(_poll_a_thousand_times(), timeout=10.0)
         assert len(clock.sleeps) == 1000
 

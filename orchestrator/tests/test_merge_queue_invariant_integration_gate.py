@@ -84,8 +84,8 @@ Fault-injection inventory (no real ssh/build/merge-to-main):
   - a fake remote runner injected through the two-host allocator gives the
     speculative downstream its own host.
   - ``clock=healthy_verify_clock()`` ages the heartbeat for row 5 in
-    production-sized ticks of at most 20ms real each, on a merge worktree the
-    wedged verify keeps writing to.
+    production-sized ticks of at most ``FakeClock.sleep_cap`` real each, on
+    a merge worktree the wedged verify keeps writing to.
   - ``patch.object(git_ops, 'advance_main')`` forges the CAS-retry outcome
     row 8 needs (a git_ops method, not a lane internal).
 """
@@ -629,17 +629,16 @@ class TestScenario5LivenessEscalation:
     [η=1992].
 
     The ageing is done by the injected clock: each heartbeat poll waits at
-    most 20ms of real time and charges its full 30s ``_HEARTBEAT_POLL_S``,
-    alongside the reprobe loop's 120s, so the lane's own cadence carries
-    wall-clock time past the threshold. The escalation therefore comes off
-    the real heartbeat wiring rather than a direct call to the check.
+    most ``FakeClock.sleep_cap`` of real time and charges its full
+    ``_HEARTBEAT_POLL_S``, alongside the reprobe loop's interval, so the
+    lane's own cadence carries wall-clock time past the threshold. The
+    escalation therefore comes off the real heartbeat wiring rather than a
+    direct call to the check.
 
-    The clock shows content progress (``healthy_verify_clock``): with a
-    frozen merge worktree the dead-verify abort requeues, then abandons, the
-    wedged verify before the 4.5h stuck threshold -- measured, 'no in-flight
-    verify progress ... (3/3 consecutive dead aborts)', then a 30s timeout.
-    In production too, a verify must keep writing to stay in flight that
-    long.
+    The clock shows content progress (``healthy_verify_clock``) because a
+    frozen merge worktree would be aborted as dead before the stuck
+    threshold. In production too, a verify must keep writing to stay in
+    flight that long.
     """
 
     async def test_wedged_verify_escalates_liveness(
