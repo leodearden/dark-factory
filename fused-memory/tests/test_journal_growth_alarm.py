@@ -18,6 +18,7 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.config.schema import WriteJournalGrowthAlarmConfig
+from fused_memory.middleware import _folded_escalation
 from fused_memory.services.journal_growth_alarm import (
     JournalCeiling,
     JournalGrowthAlarm,
@@ -333,3 +334,110 @@ class TestCheck:
         ]
         assert len(errors) == 1
         assert errors[0].exc_info is not None
+
+
+_needs_escalation = pytest.mark.skipif(
+    not _folded_escalation.HAS_ESCALATION,
+    reason='escalation package unavailable (minimal env); the HAS_ESCALATION '
+           'no-op arm is covered separately below',
+)
+
+
+def _pending(tmp_path: Path) -> list:
+    from escalation.queue import EscalationQueue  # noqa: PLC0415
+
+    return EscalationQueue(tmp_path / 'data' / 'escalations').get_pending()
+
+
+def _detail_fields(detail: str) -> dict[str, str]:
+    return dict(
+        line.split('=', 1) for line in detail.splitlines() if '=' in line.split(' ', 1)[0]
+    )
+
+
+@_needs_escalation
+class TestEscalation:
+    @pytest.mark.asyncio
+    async def test_a_size_breach_files_one_operator_escalation(self, journal, tmp_path):
+        config = WriteJournalGrowthAlarmConfig(
+            max_file_bytes=4097, max_rows_inserted_per_day=_NEVER
+        )
+
+        [breach] = await JournalGrowthAlarm(
+            journal, config, project_root=str(tmp_path)
+        ).check()
+        sample = await journal.growth_sample(since=_an_hour_ago())
+
+        [esc] = _pending(tmp_path)
+        assert esc.agent_role == 'fused-memory/write-journal-growth-alarm'
+        assert esc.severity == 'blocking'
+        assert esc.category == 'risk_identified'
+        assert esc.level == 1
+        assert f'{breach.measured:,} B' in esc.summary
+        assert esc.suggested_action
+        fields = _detail_fields(esc.detail)
+        assert fields['file_bytes'] == str(breach.measured)
+        assert fields['free_bytes'] == str(sample.free_bytes)
+        assert fields['ceiling'] == 'file_size'
+        assert fields['limit'] == '4097'
+        assert fields['db_path'] == str(journal.db_path)
+        trailing_day = datetime.now(UTC) - timedelta(days=1)
+        assert abs(datetime.fromisoformat(fields['since']) - trailing_day) < timedelta(minutes=5)
+        for words in (
+            'write_journal_growth_alarm',
+            'fused-memory/config/config.yaml',
+            'deleted nothing',
+            'VACUUM',
+        ):
+            assert words in esc.detail
+
+    @pytest.mark.asyncio
+    async def test_a_persisting_breach_folds_into_the_open_record(self, journal, tmp_path):
+        alarm = JournalGrowthAlarm(
+            journal,
+            WriteJournalGrowthAlarmConfig(max_file_bytes=1, max_rows_inserted_per_day=_NEVER),
+            project_root=str(tmp_path),
+        )
+
+        await alarm.check()
+        await alarm.check()
+
+        assert len(_pending(tmp_path)) == 1
+
+    @pytest.mark.asyncio
+    async def test_each_ceiling_keeps_its_own_record(self, journal, tmp_path):
+        await _log_reads(journal, 2)
+        alarm = JournalGrowthAlarm(
+            journal,
+            WriteJournalGrowthAlarmConfig(max_file_bytes=1, max_rows_inserted_per_day=1),
+            project_root=str(tmp_path),
+        )
+
+        await alarm.check()
+        await alarm.check()
+
+        pending = _pending(tmp_path)
+        assert sorted(_detail_fields(e.detail)['ceiling'] for e in pending) == [
+            'file_size',
+            'insert_rate',
+        ]
+        assert len({e.task_id for e in pending}) == 2
+
+
+class TestEscalationFailSoft:
+    @pytest.mark.asyncio
+    async def test_without_the_escalation_package_the_warning_still_fires(
+        self, journal, tmp_path, caplog, monkeypatch
+    ):
+        monkeypatch.setattr(_folded_escalation, 'HAS_ESCALATION', False)
+        caplog.set_level(logging.WARNING, logger=_ALARM_LOGGER)
+        alarm = JournalGrowthAlarm(
+            journal,
+            WriteJournalGrowthAlarmConfig(max_file_bytes=1, max_rows_inserted_per_day=_NEVER),
+            project_root=str(tmp_path),
+        )
+
+        breaches = await alarm.check()
+
+        assert [b.ceiling for b in breaches] == [JournalCeiling.FILE_SIZE]
+        assert len(_warnings(caplog)) == 1
