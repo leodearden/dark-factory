@@ -28,7 +28,7 @@ import source_measures
 
 from shared import safe_io
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 INSTRUMENT = 'quality-metrics-snapshot'
 
 #: heuristic 14's two marks (docs/code-quality.md, heuristic 14) -- the doc's figures, not this script's thresholds.
@@ -135,12 +135,13 @@ def _imported_names(statement: source_measures.ImportStatement, source: _FileImp
 
 
 def _deferred_entry(
-    statement: source_measures.ImportStatement, module: str, source: _FileImports
+    statement: source_measures.ImportStatement, module: str, source: _FileImports, *, closes_cycle: bool
 ) -> dict[str, Any]:
     return {
         'from': module,
         'line': statement.line,
         'imports': sorted(_imported_names(statement, source)),
+        'closes_cycle': closes_cycle,
     }
 
 
@@ -198,15 +199,88 @@ def _cycles(edges: Iterable[tuple[str, str]]) -> tuple[tuple[str, ...], ...]:
     return tuple(sorted(components))
 
 
+_Include = Callable[[source_measures.ImportStatement], bool]
+
+
+def _at_import_time(statement: source_measures.ImportStatement) -> bool:
+    """Module level, outside ``if TYPE_CHECKING:``: it runs when its importer is imported."""
+    return statement.runtime and not statement.deferred
+
+
+def _at_run_time(statement: source_measures.ImportStatement) -> bool:
+    """It runs at some point: a function-local import too."""
+    return statement.runtime
+
+
+def _at_any_time(statement: source_measures.ImportStatement) -> bool:
+    """Every import, ``if TYPE_CHECKING:`` too: what a type checker follows."""
+    return True
+
+
 def _module_edges(
-    module: str, source: _FileImports, known: frozenset[str], *, runtime_only: bool
+    module: str, source: _FileImports, known: frozenset[str], *, include: _Include
 ) -> set[tuple[str, str]]:
     return {
         (module, target)
         for statement in source.statements
-        if not runtime_only or (statement.runtime and not statement.deferred)
+        if include(statement)
         for target in _targets(statement, source, known)
     }
+
+
+_SrcImports = Sequence[tuple[str, _FileImports]]
+
+
+def _src_imports(sources: Iterable[_FileImports]) -> list[tuple[str, _FileImports]]:
+    """(module, imports) for every src file; a tests file has no module."""
+    return [(source.module, source) for source in sources if source.module is not None]
+
+
+def _edges(src: _SrcImports, known: frozenset[str], include: _Include) -> set[tuple[str, str]]:
+    return {
+        edge for module, source in src for edge in _module_edges(module, source, known, include=include)
+    }
+
+
+def _reach_backs(src: _SrcImports, known: frozenset[str]) -> list[dict[str, Any]]:
+    return [
+        entry
+        for module, source in src
+        for statement in source.statements
+        if (entry := _reach_back(statement, module, source, known)) is not None
+    ]
+
+
+def _closes_cycle(
+    statement: source_measures.ImportStatement,
+    module: str,
+    source: _FileImports,
+    known: frozenset[str],
+    component: Mapping[str, int],
+) -> bool:
+    """A run-time import one of whose targets shares its importer's hidden-cycle component."""
+    if not _at_run_time(statement) or module not in component:
+        return False
+    return any(
+        component.get(target) == component[module] for target in _targets(statement, source, known)
+    )
+
+
+def _deferred_entries(
+    src: _SrcImports, known: frozenset[str], hidden_cycles: Iterable[Sequence[str]]
+) -> list[dict[str, Any]]:
+    component = {module: number for number, cycle in enumerate(hidden_cycles) for module in cycle}
+    return [
+        _deferred_entry(
+            statement,
+            module,
+            source,
+            closes_cycle=_closes_cycle(statement, module, source, known, component),
+        )
+        for module, source in src
+        for statement in source.statements
+        if statement.deferred
+    ]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -214,7 +288,9 @@ class _ImportGraph:
     edges: tuple[tuple[str, str], ...]
     reach_back: tuple[Mapping[str, Any], ...]
     deferred: tuple[Mapping[str, Any], ...]
-    cycles: tuple[tuple[str, ...], ...]
+    cycles: tuple[tuple[str, ...], ...]  # over import-time edges
+    hidden_cycles: tuple[tuple[str, ...], ...]  # over run-time edges
+    typing_cycles: tuple[tuple[str, ...], ...]  # over every edge
     field_counts: Mapping[str, Mapping[str, int]]  # src record field -> module -> count
 
     def file_fields(self, module: str) -> dict[str, int]:
@@ -227,6 +303,8 @@ class _ImportGraph:
             'reach_back': [dict(entry) for entry in self.reach_back],
             'deferred': [dict(entry) for entry in self.deferred],
             'cycles': [list(cycle) for cycle in self.cycles],
+            'hidden_cycles': [list(cycle) for cycle in self.hidden_cycles],
+            'typing_cycles': [list(cycle) for cycle in self.typing_cycles],
         }
 
 
@@ -243,26 +321,18 @@ def _tests_importers(sources: Iterable[_FileImports], known: frozenset[str]) -> 
 
 def _import_graph(sources: Sequence[_FileImports], known: frozenset[str]) -> _ImportGraph:
     """The graph over src modules; tests files only count toward fan_in_tests."""
-    edges: set[tuple[str, str]] = set()
-    runtime_edges: set[tuple[str, str]] = set()
-    reach_back: list[dict[str, Any]] = []
-    deferred: list[dict[str, Any]] = []
-    for source in sources:
-        module = source.module
-        if module is None:
-            continue
-        edges |= _module_edges(module, source, known, runtime_only=False)
-        runtime_edges |= _module_edges(module, source, known, runtime_only=True)
-        for statement in source.statements:
-            if (entry := _reach_back(statement, module, source, known)) is not None:
-                reach_back.append(entry)
-            if statement.deferred:
-                deferred.append(_deferred_entry(statement, module, source))
+    src = _src_imports(sources)
+    edges = _edges(src, known, _at_any_time)
+    hidden_cycles = _cycles(_edges(src, known, _at_run_time))
+    reach_back = _reach_backs(src, known)
+    deferred = _deferred_entries(src, known, hidden_cycles)
     return _ImportGraph(
         edges=tuple(sorted(edges)),
         reach_back=tuple(sorted(reach_back, key=lambda e: (e['from'], e['line'], e['to']))),
         deferred=tuple(sorted(deferred, key=lambda e: (e['from'], e['line']))),
-        cycles=_cycles(runtime_edges),
+        cycles=_cycles(_edges(src, known, _at_import_time)),
+        hidden_cycles=hidden_cycles,
+        typing_cycles=_cycles(edges),
         field_counts={
             'reach_back_imports': Counter(entry['from'] for entry in reach_back),
             'fan_out': Counter(source for source, _target in edges),
@@ -484,7 +554,7 @@ def _require_unmoved_head(root: Path, as_of: str) -> None:
 
 
 def take_snapshot(root: Path, *, run_id: str, since: str) -> dict[str, Any]:
-    """Measure *root*'s HEAD as a schema-1 snapshot; refuse a dirty domain or a moved HEAD."""
+    """Measure *root*'s HEAD as a SCHEMA_VERSION snapshot; refuse a dirty domain or a moved HEAD."""
     started = time.monotonic()
     version = source_measures.require_complexipy()
     as_of = source_measures.head_commit(root)
@@ -666,12 +736,16 @@ _RECORD = _ByKind(
 _IMPORT_GRAPH = _Object({
     'edges': _ListOf(_Leaf(_is_edge, 'a [from, to] pair of module names')),
     'reach_back': _ListOf(_Object({'from': _STRING, 'to': _STRING, 'names': _STRINGS, 'line': _INTEGER})),
-    'deferred': _ListOf(_Object({'from': _STRING, 'line': _INTEGER, 'imports': _STRINGS})),
+    'deferred': _ListOf(
+        _Object({'from': _STRING, 'line': _INTEGER, 'imports': _STRINGS, 'closes_cycle': _BOOLEAN})
+    ),
     'cycles': _ListOf(_STRINGS),
+    'hidden_cycles': _ListOf(_STRINGS),
+    'typing_cycles': _ListOf(_STRINGS),
 })
 _IMPORT_GRAPH_KEYS = tuple(_IMPORT_GRAPH.fields)
 
-#: Schema 1 (plans/quality-metrics-snapshot-prd.md §Contract): every field the file holds.
+#: SCHEMA_VERSION (plans/quality-metrics-snapshot-prd.md §Contract): every field the file holds.
 _SNAPSHOT = _Object(
     {
         'schema_version': _Leaf(lambda value: _is_int(value) and value == SCHEMA_VERSION, str(SCHEMA_VERSION)),
@@ -1124,7 +1198,7 @@ def summary_table(snapshot: Mapping[str, Any]) -> str:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            'Measure every workspace member\'s tracked Python at HEAD as a schema-1 '
+            f'Measure every workspace member\'s tracked Python at HEAD as a schema-{SCHEMA_VERSION} '
             'snapshot (plans/quality-metrics-snapshot-prd.md), diff two snapshots, '
             'or print one as a per-member table. A report, never a gate.'
         ),
