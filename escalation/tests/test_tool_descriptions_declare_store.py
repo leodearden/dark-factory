@@ -15,19 +15,16 @@ from pathlib import Path
 
 import pytest
 from fastmcp import Client, FastMCP
-from fastmcp.tools import FunctionTool
 
 from escalation.queue import EscalationQueue
 from escalation.server import create_server
 from escalation.store_identity import StoreIdentity
 
 
-def expected_block(identity: StoreIdentity) -> str:
-    project = 'n/a' if identity.project_id is None else identity.project_id
+def expected_block(queue_dir: Path, kind: str, project: str) -> str:
     return '\n'.join(
         [
-            f'THIS ENDPOINT SERVES: {identity.queue_dir} '
-            f'(kind={identity.kind}, project={project}).',
+            f'THIS ENDPOINT SERVES: {queue_dir} (kind={kind}, project={project}).',
             'It contains ONLY escalations for that store. A task id belonging to any other',
             'project returns an empty result because the record is not HERE — not because it',
             'does not exist. To ask whether an escalation was EVER filed for a task',
@@ -61,38 +58,36 @@ async def listed_descriptions(server: FastMCP) -> dict[str, str | None]:
         return {tool.name: tool.description for tool in await client.list_tools()}
 
 
-KINDS = pytest.mark.parametrize('kind', ['project', 'reconciliation'])
+KINDS = pytest.mark.parametrize(
+    ('kind', 'rendered_project'), [('project', 'test-project'), ('reconciliation', 'n/a')]
+)
 
 
 @KINDS
 @pytest.mark.asyncio
 async def test_every_listed_tool_ends_with_the_store_identity_block(
-    tmp_path: Path, kind: str
+    tmp_path: Path, kind: str, rendered_project: str
 ) -> None:
     queue = EscalationQueue(tmp_path / 'esc')
     identity = identity_for(kind, queue, tmp_path)
+    block = expected_block(identity.queue_dir, kind, rendered_project)
 
     descriptions = await listed_descriptions(identity_server(queue, identity))
 
     assert descriptions
-    if kind == 'reconciliation':
-        must_appear = [str(identity.queue_dir), 'kind=reconciliation', 'project=n/a']
-    else:
-        must_appear = [str(identity.queue_dir), 'kind=project', 'project=test-project']
     for name, description in descriptions.items():
         assert description is not None, name
-        assert description.endswith('\n\n' + expected_block(identity)), name
-        for fragment in must_appear:
-            assert fragment in description, (name, fragment)
+        assert description.endswith('\n\n' + block), name
 
 
 @KINDS
 @pytest.mark.asyncio
 async def test_the_block_is_purely_additive_to_each_docstring(
-    tmp_path: Path, kind: str
+    tmp_path: Path, kind: str, rendered_project: str
 ) -> None:
     queue = EscalationQueue(tmp_path / 'with-identity')
     identity = identity_for(kind, queue, tmp_path)
+    block = expected_block(identity.queue_dir, kind, rendered_project)
 
     with_identity = await listed_descriptions(identity_server(queue, identity))
     without_identity = await listed_descriptions(
@@ -101,7 +96,7 @@ async def test_the_block_is_purely_additive_to_each_docstring(
 
     assert set(with_identity) == set(without_identity)
     for name, description in with_identity.items():
-        assert description == f'{without_identity[name]}\n\n{expected_block(identity)}', name
+        assert description == f'{without_identity[name]}\n\n{block}', name
 
 
 @pytest.mark.asyncio
@@ -149,9 +144,8 @@ async def test_the_cited_history_tool_is_registered_on_the_same_server(
 @pytest.mark.asyncio
 async def test_tools_still_dispatch_on_an_identity_bearing_server(tmp_path: Path) -> None:
     queue = EscalationQueue(tmp_path / 'esc')
-    server = identity_server(queue, project_identity(queue, tmp_path))
 
-    async with Client(server) as client:
+    async with Client(identity_server(queue, project_identity(queue, tmp_path))) as client:
         filed = await client.call_tool(
             'escalate_info',
             {
@@ -161,9 +155,8 @@ async def test_tools_still_dispatch_on_an_identity_bearing_server(tmp_path: Path
                 'summary': 's',
             },
         )
+        history = await client.call_tool('get_task_escalation_history', {'task_id': '3167'})
 
     assert filed.data['status'] == 'queued'
     assert len(queue.get_by_task('3167')) == 1
-    history_tool = await server.get_tool('get_task_escalation_history')
-    assert isinstance(history_tool, FunctionTool)
-    assert history_tool.fn(task_id='3167')['count'] == 1
+    assert history.data['count'] == 1

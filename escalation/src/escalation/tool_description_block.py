@@ -13,9 +13,6 @@ class AppendToEveryToolDescription(Transform):
     def __init__(self, block: str) -> None:
         self._block = block
 
-    def __repr__(self) -> str:
-        return f'{self.__class__.__name__}()'
-
     def _with_block(self, tool: Tool) -> Tool:
         description = f'{tool.description}\n\n{self._block}' if tool.description else self._block
         return tool.model_copy(update={'description': description})
