@@ -13,9 +13,6 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from dashboard.app import _MCP_WRITE_DETAIL_CHAR_LIMIT
-from dashboard.data.mcp_fanout import describe_exc
-
 _PATCH_TARGET = 'dashboard.data.memory.mcp_tool_call'
 
 _WRITE_ROUTES = [
@@ -51,15 +48,31 @@ _WRITE_ROUTES = [
     ),
 ]
 
-_LONG_MESSAGE_FAILURES = [
-    pytest.param(ValueError('X' * 300), id='ValueError'),
+_DETAIL_CAUSE_CHAR_CAP = 200
+
+
+def _http_status_error(message: str) -> httpx.HTTPStatusError:
+    request = httpx.Request('POST', 'http://x')
+    return httpx.HTTPStatusError(
+        message, request=request, response=httpx.Response(500, request=request)
+    )
+
+
+_RENDERED_FAILURES = [
+    pytest.param(httpx.ConnectError('refused'), 'ConnectError: refused', id='ConnectError'),
     pytest.param(
-        httpx.HTTPStatusError(
-            'X' * 300,
-            request=httpx.Request('POST', 'http://x'),
-            response=httpx.Response(500, request=httpx.Request('POST', 'http://x')),
-        ),
-        id='HTTPStatusError',
+        httpx.TimeoutException('timed out'),
+        'TimeoutException: timed out',
+        id='TimeoutException',
+    ),
+    pytest.param(
+        _http_status_error('server error'), 'HTTPStatusError: server error', id='HTTPStatusError'
+    ),
+    pytest.param(ValueError('X' * 300), 'ValueError: ' + 'X' * 300, id='long-ValueError'),
+    pytest.param(
+        _http_status_error('X' * 300),
+        'HTTPStatusError: ' + 'X' * 300,
+        id='long-HTTPStatusError',
     ),
 ]
 
@@ -132,17 +145,17 @@ def test_failure_with_empty_message_names_the_exception_type(
     ], 'log_failures=False must leave reporting entirely to the call site'
 
 
-@pytest.mark.parametrize('exc', _LONG_MESSAGE_FAILURES)
+@pytest.mark.parametrize(('exc', 'rendered_cause'), _RENDERED_FAILURES)
 @pytest.mark.parametrize(('path', 'body', 'tool_name'), _WRITE_ROUTES)
-def test_502_detail_caps_the_rendered_cause_and_warning_keeps_full_text(
-    client, caplog, path, body, tool_name, exc
+def test_failure_names_its_type_once_capped_in_the_502_detail_but_whole_in_the_warning(
+    client, caplog, path, body, tool_name, exc, rendered_cause
 ):
     url = _only_fused_memory_url(client)
     with caplog.at_level(logging.WARNING, logger='dashboard.app'):
         resp = _post_with_tool_outcome(client, path, body, tool_name, exc)
 
     assert resp.status_code == 502
-    assert resp.json()['detail'] == f'{url}: {describe_exc(exc)[:_MCP_WRITE_DETAIL_CHAR_LIMIT]}'
+    assert resp.json()['detail'] == f'{url}: {rendered_cause[:_DETAIL_CAUSE_CHAR_CAP]}'
     assert _call_site_warnings(caplog, tool_name) == [
-        f'{tool_name} failed for {url}: {describe_exc(exc)}'
+        f'{tool_name} failed for {url}: {rendered_cause}'
     ]

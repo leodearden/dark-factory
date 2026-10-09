@@ -10,7 +10,6 @@ Step-by-step TDD:
 from __future__ import annotations
 
 import asyncio
-import logging
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -289,11 +288,6 @@ def test_all_servers_unreachable_returns_502(client, exc):
 
 
 # ---------------------------------------------------------------------------
-# Two-URL fan-out tests (suggestion 3): fallback and short-circuit
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # step-3 (task-1285): invalidate_session called on transport error
 # ---------------------------------------------------------------------------
 
@@ -319,48 +313,8 @@ def test_cancel_handler_invalidates_session_on_transport_error(client):
 
 
 # ---------------------------------------------------------------------------
-# step-5 (task-1285): logger.warning + str(exc) in 502 detail
+# Two-URL fan-out tests (suggestion 3): fallback and short-circuit
 # ---------------------------------------------------------------------------
-
-
-def test_cancel_handler_logs_warning_and_includes_exc_in_detail(client, caplog):
-    """Transport error → WARNING logged and str(exc) included in 502 detail.
-
-    Three simultaneous assertions:
-      (a) response is 502
-      (b) a WARNING-level record is emitted by the 'dashboard.app' logger
-          whose message contains both the URL and the exception text
-      (c) the response body's 'detail' field contains the full exception
-          message ('connection refused: port 8002'), not just the type name
-    """
-    exc_msg = 'connection refused: port 8002'
-    with (
-        patch(
-            _PATCH_TARGET,
-            new=AsyncMock(side_effect=httpx.ConnectError(exc_msg)),
-        ),
-        caplog.at_level(logging.WARNING, logger='dashboard.app'),
-    ):
-        resp = client.post(
-            '/api/v2/dashboard/curator/cancel',
-            json={'ticket_id': 'tkt_xyz'},
-        )
-
-    # (a) 502
-    assert resp.status_code == 502
-
-    # (b) WARNING log
-    warning_records = [
-        r for r in caplog.records if r.levelno == logging.WARNING and r.name == 'dashboard.app'
-    ]
-    assert warning_records, 'Expected at least one WARNING from dashboard.app'
-    combined_msg = ' '.join(r.getMessage() for r in warning_records)
-    assert 'cancel_ticket failed' in combined_msg
-    assert exc_msg in combined_msg
-
-    # (c) detail includes full exception message (not just type name)
-    detail = resp.json().get('detail', '')
-    assert exc_msg in detail, f'Expected "{exc_msg}" in detail, got: {detail!r}'
 
 
 def test_two_url_fallback_url0_fails_url1_succeeds(two_url_client):
@@ -486,59 +440,3 @@ def test_cancel_handler_not_found_does_not_fan_out(two_url_client):
     assert resp.status_code == 404
     assert resp.json() == mcp_result
     assert [c.args[1] for c in _cancel_ticket_calls(mock_mcp)] == ['http://localhost:9000']
-
-
-# ---------------------------------------------------------------------------
-# Task 4133: the 502 detail must name the exception type exactly once
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ('exc', 'type_name'),
-    [
-        pytest.param(httpx.ConnectError('refused'), 'ConnectError', id='ConnectError'),
-        pytest.param(
-            httpx.TimeoutException('timed out'), 'TimeoutException', id='TimeoutException'
-        ),
-        pytest.param(
-            httpx.HTTPStatusError(
-                'server error',
-                request=httpx.Request('POST', 'http://x'),
-                response=httpx.Response(500, request=httpx.Request('POST', 'http://x')),
-            ),
-            'HTTPStatusError',
-            id='HTTPStatusError',
-        ),
-    ],
-)
-def test_cancel_handler_502_detail_names_the_type_exactly_once(client, exc, type_name):
-    """The user-visible 502 detail must not carry a doubled type prefix.
-
-    _call hand-formats 'Type: message' and re-raises it; first_success then
-    renders THAT through describe_exc, which unconditionally prepends the
-    re-raised exception's own type name. A bare ValueError re-raise therefore
-    reached the operator (and the dashboard's offline pill) as
-    'http://...: ValueError: ConnectError: refused'.
-    """
-    with patch(_PATCH_TARGET, new=AsyncMock(side_effect=exc)):
-        resp = client.post(
-            '/api/v2/dashboard/curator/cancel',
-            json={'ticket_id': 'tkt_xyz'},
-        )
-
-    assert resp.status_code == 502
-    detail = resp.json().get('detail', '')
-
-    assert detail.count(f'{type_name}:') == 1, (
-        f'the real cause must be named exactly once, got {detail!r}'
-    )
-    assert f'ValueError: {type_name}' not in detail, (
-        f'the type prefix must not be doubled, got {detail!r}'
-    )
-    assert str(exc) in detail, (
-        f'the underlying message must survive the fix, got {detail!r}'
-    )
-    # No '<Type>: <Type>:' doubling of any shape.
-    assert 'PreformattedFanoutError' not in detail, (
-        f'the marker type is an internal signal, not operator-facing text, got {detail!r}'
-    )

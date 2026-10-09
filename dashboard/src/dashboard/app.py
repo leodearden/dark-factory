@@ -1081,21 +1081,11 @@ async def _mcp_write_proxy(
         try:
             result = await memory_data.mcp_tool_call(http_client, url, tool_name, args)
         except FANOUT_FAILURE_EXCEPTIONS as exc:
-            # describe_exc, not the bare exc: several exceptions on this path
-            # stringify to '' (most importantly httpx.PoolTimeout, i.e. THIS
-            # client's pool is saturated rather than the server being down), so
-            # a bare str(exc) made both this WARNING and the 502 detail
-            # content-free.  PreformattedFanoutError, not ValueError: the
-            # message is already a rendered 'Type: message' and first_success
-            # renders every caught exception through describe_exc again, which
-            # would prepend a second type name.
+            # Rendering rationale: the describe_exc and PreformattedFanoutError docstrings.
             detail = describe_exc(exc)
             logger.warning('%s failed for %s: %s', tool_name, url, detail)
             raise PreformattedFanoutError(detail[:_MCP_WRITE_DETAIL_CHAR_LIMIT]) from exc
-        # Guard the not_found mapping with isinstance: an MCP tool that
-        # returns a list or None (buggy/older server) would AttributeError
-        # on `.get(...)` and escape as a 500.  Defensive at the single
-        # boundary every MCP-write route shares.
+        # A non-dict result (list, None) is forwarded verbatim, never a 500.
         if (
             treat_not_found_as_404
             and isinstance(result, dict)
