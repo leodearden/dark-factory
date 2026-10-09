@@ -109,6 +109,7 @@ from orchestrator.merge_lane.liveness import (
     newest_content_mtime,
     release_chain_build_lane,
 )
+from orchestrator.merge_lane.no_progress_abort import NoProgressAbort, emit_no_progress_abort
 from orchestrator.merge_lane.ports import (
     ClockPort,
     ContainmentPredicate,
@@ -18655,6 +18656,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
             # per-attempt t0 at the top of the dequeue loop).
             _last_progress_at = self._clock.monotonic()
             _last_probe_at = _last_progress_at
+            _dispatch_seen_in_flight = False
             # task 2420 amend (reviewer finding, correctness); revised by task
             # 4579: guard against INFLIGHT_VERIFY_PROGRESS_PROBE_SECS not
             # being comfortably smaller than INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS.
@@ -18770,10 +18772,12 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 # un-gated to cover REMOTE leases by task 2566, closing the
                 # latent 7200s-coast gap; task 4579 unions the two evidence
                 # sources instead of branching on lease type — see below):
-                # terminate a deterministically dead/hung verify and
-                # RE-QUEUE, mirroring the operator-halt branch above.
+                # terminate a verify with no progress observed for a full
+                # budget and RE-QUEUE, mirroring the operator-halt branch above.
                 # Checked last so abandon/halt precedence (triggers 1/2) is
                 # preserved when they land on the same poll.
+                # Each firing is recorded, and counted as a strike, per
+                # orchestrator/src/orchestrator/merge_lane/no_progress_abort.py::NoProgressAbort.
                 #
                 # PROGRESS is the UNION of two independent evidence sources
                 # (task 4579 — previously an if/elif branched by lease type,
@@ -18837,6 +18841,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                 )
                 if _dispatch_live:
                     _last_progress_at = _now
+                    _dispatch_seen_in_flight = True
                 # Evidence A — content progress under merge_wt (BOTH lease kinds), probed only when
                 # evidence B is not already live.
                 elif _now - _last_probe_at >= _progress_probe_secs:
@@ -18854,33 +18859,44 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                     # no-progress aborts per task_id.  Once the count
                     # reaches MAX_INFLIGHT_DEAD_VERIFY_ABORTS, stop
                     # re-queuing and resolve terminally instead —
-                    # converting a deterministically-hanging verify into
-                    # a loud 'blocked' escalation rather than an
-                    # unbounded churn of the same dead slot.  Cleared on
-                    # a successful verify for this task (see the `out is
-                    # None` pass path below).
+                    # converting a verify that shows no progress for a full
+                    # budget on every attempt into a loud 'blocked'
+                    # escalation rather than an unbounded churn of the same
+                    # slot.  Cleared on a successful verify for this task
+                    # (see the `out is None` pass path below).
                     _dead_abort_n = self._inflight_dead_verify_aborts.get(req.task_id, 0) + 1
                     self._inflight_dead_verify_aborts[req.task_id] = _dead_abort_n
-                    _busy_loop_capped = _dead_abort_n >= self.MAX_INFLIGHT_DEAD_VERIFY_ABORTS
+                    _abort = NoProgressAbort(
+                        task_id=req.task_id,
+                        request_id=req.request_id,
+                        runner=lease.name,
+                        is_local=lease.is_local,
+                        no_progress_secs=_no_progress_secs,
+                        budget_secs=self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS,
+                        strike=_dead_abort_n,
+                        max_strikes=self.MAX_INFLIGHT_DEAD_VERIFY_ABORTS,
+                        dispatch_seen_in_flight=_dispatch_seen_in_flight,
+                    )
                     logger.warning(
                         'Task %s: no in-flight verify progress for %.0fs '
                         '(budget=%.0fs) — %s (%d/%d consecutive dead aborts)',
-                        req.task_id,
-                        _no_progress_secs,
-                        self.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS,
-                        'abandoning without re-queue' if _busy_loop_capped
+                        _abort.task_id,
+                        _abort.no_progress_secs,
+                        _abort.budget_secs,
+                        'abandoning without re-queue' if _abort.capped
                         else 'aborting and re-queuing merge for re-verify',
-                        _dead_abort_n,
-                        self.MAX_INFLIGHT_DEAD_VERIFY_ABORTS,
+                        _abort.strike,
+                        _abort.max_strikes,
                     )
+                    emit_no_progress_abort(self._event_store, _abort)
                     await self._teardown_verify_task(lease, verify_task, req.task_id)
                     await _dispose_verify_worktree()
-                    # task 3003 amend (robustness): a dead/hung verify — abort or
-                    # busy-loop cap — is not lane contention either (the verify
+                    # task 3003 amend (robustness): a no-progress abort — requeue
+                    # or busy-loop cap — is not lane contention either (the verify
                     # got as far as running), so neither branch below may leave a
                     # contended-lane streak open behind it.
                     self._clear_contended_lease_streak(req.task_id)
-                    if _busy_loop_capped:
+                    if _abort.capped:
                         # task 2420 amend (reviewer finding #2): the
                         # counter has served its purpose once the
                         # request resolves terminally — pop it so a
@@ -18898,13 +18914,7 @@ class SpeculativeMergeWorker(_WipHaltMixin):
                         # argument -- the dead-verify busy-loop cap-out is a
                         # terminal 'blocked' for this task_id.
                         self._chain_error_suppressed.discard(req.task_id)
-                        err_outcome = MergeOutcome(
-                            'blocked',
-                            reason=(
-                                'repeated dead/hung in-flight verify (no '
-                                f'progress for budget) x{_dead_abort_n}'
-                            ),
-                        )
+                        err_outcome = MergeOutcome('blocked', reason=_abort.terminal_reason())
                         if not req.result.done():
                             req.result.set_result(err_outcome)
                         return InflightVerifyResult(outcome=err_outcome, merge_wt=None)

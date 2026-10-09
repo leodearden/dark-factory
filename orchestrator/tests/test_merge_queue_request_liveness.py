@@ -60,6 +60,7 @@ from _merge_lane_fakes import (
     raises,
 )
 from _orch_helpers import VERIFY_CLI_PER_TEST_TIMEOUT, wait_responsive
+from _recording_event_store import _RecordingEventStore
 
 from orchestrator.config import GitConfig, OrchestratorConfig
 from orchestrator.git_ops import GitOps, _run
@@ -757,6 +758,24 @@ async def _poll_for_lane_budgets(
         await asyncio.sleep(worker.VERIFY_ABANDON_POLL_SECS)
 
 
+def _progress_aborts(store: _RecordingEventStore) -> list[dict]:
+    """Every ``merge_verify_progress_abort`` the lane emitted, as ``{task_id, **data}``."""
+    return [
+        {'task_id': event['task_id'], **event['data']}
+        for event_type, event in store.events
+        if event_type == 'merge_verify_progress_abort'
+    ]
+
+
+def _assert_reason_restates(reason: str, capped_abort: dict, *fragments: str) -> None:
+    """A cap-out reason restates its capped event's budget and strike, plus *fragments*, and diagnoses nothing."""
+    lowered = reason.lower()
+    assert 'dead' not in lowered and 'hung' not in lowered, reason
+    expected = (f"{capped_abort['budget_secs']:g}s", f"{capped_abort['strike']} consecutive", *fragments)
+    missing = [fragment for fragment in expected if fragment not in reason]
+    assert not missing, f'{reason!r} lacks {missing!r}'
+
+
 class _DispatchReturnsMidVerifyRemote:
     """Stub RemoteRunner whose `dispatch_in_flight` is a real `@property`
     over a mutable flag — not a MagicMock snapshot — so it can genuinely
@@ -863,10 +882,12 @@ class TestDeadInflightVerifyAborts:
             git_ops, config, 'dead-verify-a', 'da.py', 'x=1\n',
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
+        store = _RecordingEventStore()
         worker = make_lane(
             git_ops, q,
             verifier=FakeVerifier(hangs_until(never_release)),
             clock=_dead_verify_clock(),
+            event_store=store,
         )
         worker._register_owned_merge_worktree(item.merge_wt)
 
@@ -900,6 +921,21 @@ class TestDeadInflightVerifyAborts:
             for r in warnings
         ), f'expected a WARNING naming the task + no-progress budget, got: {caplog.text}'
 
+        [abort] = _progress_aborts(store)
+        budget = worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS
+        assert abort.pop('no_progress_secs') >= budget
+        assert abort == {
+            'task_id': req.task_id,
+            'request_id': req.request_id,
+            'lease_kind': 'local',
+            'runner': 'local',
+            'budget_secs': budget,
+            'strike': 1,
+            'max_strikes': worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS,
+            'capped': False,
+            'dispatch_seen_in_flight': None,
+        }
+
     async def test_healthy_writing_local_verify_is_not_aborted(
         self,
         git_ops: GitOps,
@@ -930,10 +966,12 @@ class TestDeadInflightVerifyAborts:
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         clock = _writing_verify_clock()
+        store = _RecordingEventStore()
         worker = make_lane(
             git_ops, q,
             verifier=FakeVerifier(hangs_until(release_event)),
             clock=clock,
+            event_store=store,
         )
         worker._register_owned_merge_worktree(item.merge_wt)
 
@@ -955,6 +993,7 @@ class TestDeadInflightVerifyAborts:
             f'got status={result.status!r}'
         )
         assert q.empty(), 'healthy verify must not be re-dispatched'
+        assert _progress_aborts(store) == []
 
     async def test_remote_lease_held_with_no_live_dispatch_is_aborted_and_requeued_within_budget(
         self,
@@ -992,7 +1031,8 @@ class TestDeadInflightVerifyAborts:
             git_ops, config, 'remote-coast-verify-a', 'rca.py', 'x=1\n',
         )
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = make_lane(git_ops, q, clock=_dead_verify_clock())
+        store = _RecordingEventStore()
+        worker = make_lane(git_ops, q, clock=_dead_verify_clock(), event_store=store)
         worker._register_owned_merge_worktree(item.merge_wt)
 
         worker.VERIFY_ABANDON_POLL_SECS = 0.02
@@ -1022,6 +1062,14 @@ class TestDeadInflightVerifyAborts:
             req.task_id in r.message and 'progress' in r.message.lower()
             for r in warnings
         ), f'expected a WARNING naming the task + no-progress budget, got: {caplog.text}'
+
+        [abort] = _progress_aborts(store)
+        assert abort['task_id'] == req.task_id
+        assert abort['lease_kind'] == 'remote'
+        assert abort['runner'] == 'remote-host'
+        assert abort['dispatch_seen_in_flight'] is False
+        assert abort['strike'] == 1
+        assert abort['capped'] is False
 
     async def test_remote_lease_with_live_dispatch_is_not_progress_aborted(
         self,
@@ -1216,7 +1264,8 @@ class TestDeadInflightVerifyAborts:
         # task-2822 cross-check writing under merge_wt, without coupling this
         # must-NOT-abort assertion to real file I/O timing.
         clock = _writing_verify_clock()
-        worker = make_lane(git_ops, q, clock=clock)
+        store = _RecordingEventStore()
+        worker = make_lane(git_ops, q, clock=clock, event_store=store)
         worker._register_owned_merge_worktree(item.merge_wt)
 
         worker.VERIFY_ABANDON_POLL_SECS = 0.02
@@ -1238,6 +1287,7 @@ class TestDeadInflightVerifyAborts:
         assert worker._inflight_dead_verify_aborts.get(req.task_id, 0) == 0, (
             'no strike should be recorded while local content is progressing'
         )
+        assert _progress_aborts(store) == []
 
         verify_future.cancel()
         with contextlib.suppress(BaseException):
@@ -1330,6 +1380,10 @@ class TestDeadInflightVerifyAborts:
         must NOT rescue it. If a future change makes this test abort late or not at all, trigger 3
         has been silently disabled for remote leases.
 
+        The abort's event reports dispatch_seen_in_flight=True, the field that makes the mr-945466ca
+        shape self-diagnosing, and strike 1: a dispatch-returned abort still counts towards the cap
+        (orchestrator/src/orchestrator/merge_lane/no_progress_abort.py's module docstring says why).
+
         The seed-ordering pin is a separate concern, split into
         test_remote_lease_content_mtime_seed_is_unconditional_before_first_dispatch_turn below, so
         this test stays a pure behavioural guard.
@@ -1347,7 +1401,8 @@ class TestDeadInflightVerifyAborts:
         # PRODUCTION_CLOCK for the same reason as the positive twin above: the
         # real probe reading the real static merge worktree is the subject, so
         # the pair differ ONLY in whether anything writes to it.
-        worker = make_lane(git_ops, q, clock=PRODUCTION_CLOCK)
+        store = _RecordingEventStore()
+        worker = make_lane(git_ops, q, clock=PRODUCTION_CLOCK, event_store=store)
         worker._register_owned_merge_worktree(item.merge_wt)
 
         worker.VERIFY_ABANDON_POLL_SECS = 0.02
@@ -1375,6 +1430,12 @@ class TestDeadInflightVerifyAborts:
             req.task_id in r.message and 'progress' in r.message.lower()
             for r in warnings
         ), f'expected a WARNING naming the task + no-progress budget, got: {caplog.text}'
+
+        [abort] = _progress_aborts(store)
+        assert abort['task_id'] == req.task_id
+        assert abort['lease_kind'] == 'remote'
+        assert abort['dispatch_seen_in_flight'] is True
+        assert abort['strike'] == 1
 
     async def test_remote_lease_content_mtime_seed_is_unconditional_before_first_dispatch_turn(
         self,
@@ -1491,13 +1552,20 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         verifier = FakeVerifier(hangs_until(never_release))
         clock = _dead_verify_clock()
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
-        worker = make_lane(git_ops, q, verifier=verifier, clock=clock)
+        store = _RecordingEventStore()
+        worker = make_lane(git_ops, q, verifier=verifier, clock=clock, event_store=store)
         worker.VERIFY_ABANDON_POLL_SECS = 0.02
         worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS = 2
 
         fake_local = MagicMock()
         fake_local.name = 'local'
         fake_local.is_local = True
+
+        def _strikes() -> list[tuple[str, int, bool]]:
+            return [(a['task_id'], a['strike'], a['capped']) for a in _progress_aborts(store)]
+
+        first = (task_id, 1, False)
+        capped = (task_id, 2, True)
 
         # ── Attempt 1: dead verify → REQUEUED (counter -> 1, below MAX) ──
         req1, item1 = await _make_merged_item(
@@ -1531,18 +1599,22 @@ class TestRepeatedDeadVerifyBusyLoopCap:
             f'again — got status={result2.status!r}'
         )
         assert result2.outcome is not None and result2.outcome.status == 'blocked'
-        reason = result2.outcome.reason.lower()
-        assert 'dead' in reason and 'hung' in reason, (
-            f"expected the blocked reason to mention 'dead'/'hung' verify, got: "
-            f'{result2.outcome.reason!r}'
+        _assert_reason_restates(
+            result2.outcome.reason,
+            _progress_aborts(store)[-1],
+            f'{worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS:g}s',
+            f'{worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS} consecutive',
+            'local',
         )
         assert result2.merge_wt is None
 
         assert req2.result.done(), 'the MAX-th abort must resolve req2.result directly'
         outcome2 = req2.result.result()
         assert outcome2.status == 'blocked'
+        assert outcome2.reason == result2.outcome.reason
 
         assert q.empty(), 'the MAX-th dead abort must NOT be re-queued (busy-loop guard)'
+        assert _strikes() == [first, capped]
 
         # ── Attempt 3: a SUCCESSFUL verify for the SAME task_id clears the counter ──
         # The verify now returns, and lane time stops moving with it: a
@@ -1566,6 +1638,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         assert worker._inflight_dead_verify_aborts.get(task_id, 0) == 0, (
             'a successful verify must clear the per-task dead-verify-abort counter'
         )
+        assert _strikes() == [first, capped], 'a successful verify must emit no progress abort'
 
         # ── Attempt 4: dead verify again for the SAME task_id starts a FRESH episode ──
         verifier.default = hangs_until(never_release)
@@ -1582,6 +1655,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
             'after a successful verify clears the counter, the next dead verify '
             'must start a fresh episode (REQUEUED), not immediately resolve blocked'
         )
+        assert _strikes() == [first, capped, first]
 
     async def test_failed_verify_also_clears_dead_verify_abort_counter(
         self,
@@ -1777,7 +1851,8 @@ class TestRepeatedDeadVerifyBusyLoopCap:
 
         q: asyncio.Queue[MergeRequest] = asyncio.Queue()
         clock = _dead_verify_clock()
-        worker = make_lane(git_ops, q, clock=clock)
+        store = _RecordingEventStore()
+        worker = make_lane(git_ops, q, clock=clock, event_store=store)
         worker.VERIFY_ABANDON_POLL_SECS = 0.02
         worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS = 2
 
@@ -1785,6 +1860,15 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         fake_remote.name = 'remote-host'
         fake_remote.is_local = False
         fake_remote.cancel_verify = AsyncMock(return_value=0)
+
+        def _strikes() -> list[tuple[str, int, bool, str, bool | None]]:
+            return [
+                (a['task_id'], a['strike'], a['capped'], a['lease_kind'], a['dispatch_seen_in_flight'])
+                for a in _progress_aborts(store)
+            ]
+
+        first = (task_id, 1, False, 'remote', False)
+        capped = (task_id, 2, True, 'remote', False)
 
         # ── Attempt 1: remote coast (no live dispatch) -> REQUEUED (counter -> 1, below MAX) ──
         req1, item1 = await _make_merged_item(
@@ -1820,18 +1904,23 @@ class TestRepeatedDeadVerifyBusyLoopCap:
             f'not REQUEUED again — got status={result2.status!r}'
         )
         assert result2.outcome is not None and result2.outcome.status == 'blocked'
-        reason = result2.outcome.reason.lower()
-        assert 'dead' in reason and 'hung' in reason, (
-            f"expected the blocked reason to mention 'dead'/'hung' verify, got: "
-            f'{result2.outcome.reason!r}'
+        _assert_reason_restates(
+            result2.outcome.reason,
+            _progress_aborts(store)[-1],
+            f'{worker.INFLIGHT_VERIFY_PROGRESS_BUDGET_SECS:g}s',
+            f'{worker.MAX_INFLIGHT_DEAD_VERIFY_ABORTS} consecutive',
+            'remote',
+            'no dispatch seen in flight',
         )
         assert result2.merge_wt is None
 
         assert req2.result.done(), 'the MAX-th abort must resolve req2.result directly'
         outcome2 = req2.result.result()
         assert outcome2.status == 'blocked'
+        assert outcome2.reason == result2.outcome.reason
 
         assert q.empty(), 'the MAX-th remote coast must NOT be re-queued (busy-loop guard)'
+        assert _strikes() == [first, capped]
 
         # ── Attempt 3: a SUCCESSFUL remote verify for the SAME task_id clears the counter ──
         # The remote runner returns a passing verify instead of coasting, and
@@ -1855,6 +1944,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
         assert worker._inflight_dead_verify_aborts.get(task_id, 0) == 0, (
             'a successful remote verify must clear the per-task dead-verify-abort counter'
         )
+        assert _strikes() == [first, capped], 'a successful verify must emit no progress abort'
 
         # ── Attempt 4: remote coast again for the SAME task_id starts a FRESH episode ──
         req4, item4 = await _make_merged_item(
@@ -1873,6 +1963,7 @@ class TestRepeatedDeadVerifyBusyLoopCap:
             'coast must start a fresh episode (REQUEUED), not immediately '
             'resolve blocked'
         )
+        assert _strikes() == [first, capped, first]
 
 
 # ---------------------------------------------------------------------------

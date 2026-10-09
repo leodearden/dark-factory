@@ -2407,6 +2407,96 @@
           "current": 31967
         }
       ]
+    },
+    {
+      "task_id": "4580",
+      "reason": "Task 4580: new merge_lane/no_progress_abort.py, the durable record for Abort trigger 3 (event payload and observation-language blocked reason). Net-additive observability, kept out of worker.py.",
+      "measures": [
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4831,
+          "current": 4838
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57409,
+          "current": 57507
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31967,
+          "current": 31992
+        }
+      ]
+    },
+    {
+      "task_id": "4580",
+      "reason": "Task 4580: Abort trigger 3 now records each firing as a merge_verify_progress_abort event via merge_lane/no_progress_abort.py. A few call-site lines; no new branch in _run_inflight_verify.",
+      "measures": [
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 22081,
+          "current": 22097
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/worker.py",
+          "baseline": 12519,
+          "current": 12521
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57507,
+          "current": 57523
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31992,
+          "current": 31994
+        }
+      ]
+    },
+    {
+      "task_id": "4580",
+      "reason": "Task 4580 review amendment: the dispatch_seen_in_flight semantics move out of event_store.py (outside the cluster) into no_progress_abort.py's module docstring, so the payload has one documented home; the None-on-local-lease conditional moves from the removed dispatch_returned property into event_data (module cognitive unchanged). Records the landed cluster totals.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/merge_lane/no_progress_abort.py::NoProgressAbort::event_data",
+          "baseline": 1,
+          "current": 2
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/no_progress_abort.py",
+          "baseline": 98,
+          "current": 99
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/merge_lane/no_progress_abort.py",
+          "baseline": 25,
+          "current": 30
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57517,
+          "current": 57518
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31994,
+          "current": 31999
+        }
+      ]
     }
   ]
 }

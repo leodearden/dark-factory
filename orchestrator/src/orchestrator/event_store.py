@@ -187,6 +187,13 @@ class EventType(StrEnum):
     # measured_at: ISO-8601 str} — the suppressed pytest node-ids, the merge
     # commit whose verify was suppressed, and when the suppression was decided.
     merge_flake_suppressed = 'merge_flake_suppressed'
+    # One firing of Abort trigger 3 (no in-flight verify progress for a full
+    # budget) in orchestrator/src/orchestrator/merge_lane/worker.py::
+    # SpeculativeMergeWorker._run_inflight_verify, requeue and cap-out alike.
+    # task_id-keyed, phase='merge'; data is defined by
+    # orchestrator/src/orchestrator/merge_lane/no_progress_abort.py::
+    # NoProgressAbort.event_data.
+    merge_verify_progress_abort = 'merge_verify_progress_abort'
     # The branch's OWN pre-merge verify verdict, recorded by the orchestrator
     # workflow VERIFY phase (branch-vs-its-merge-base) — distinct from
     # merge_verify, which is the merge worker's POST-rebase verify (branch
