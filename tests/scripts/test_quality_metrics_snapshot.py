@@ -150,7 +150,7 @@ class TestTheHeader:
         out = tmp_path / 'out' / 'snapshot.json'
         assert _run(root, out) == 0
         measured = json.loads(out.read_text(encoding='utf-8'))
-        assert measured['schema_version'] == 1
+        assert measured['schema_version'] == 2
         assert measured['instrument'] == 'quality-metrics-snapshot'
         assert measured['run_id'] == 'run-1'
         assert measured['as_of_sha'] == git(root, 'rev-parse', 'HEAD').strip()
@@ -366,8 +366,10 @@ class TestTheImportGraph:
     def measured(self, tmp_path: Path) -> dict[str, Any]:
         return _measured(tmp_path, _GRAPH)
 
-    def test_it_has_exactly_the_four_sections(self, measured: dict[str, Any]) -> None:
-        assert set(measured['import_graph']) == {'edges', 'reach_back', 'deferred', 'cycles'}
+    def test_it_has_exactly_the_six_sections(self, measured: dict[str, Any]) -> None:
+        assert list(measured['import_graph']) == [
+            'edges', 'reach_back', 'deferred', 'cycles', 'hidden_cycles', 'typing_cycles',
+        ]
 
     def test_edges_are_explicit_first_party_src_imports(self, measured: dict[str, Any]) -> None:
         # Module-level, TYPE_CHECKING and function-local imports all count; no
@@ -390,6 +392,14 @@ class TestTheImportGraph:
         # c <-> d exists only under TYPE_CHECKING, and e -> a is function-local.
         assert measured['import_graph']['cycles'] == [['a', 'b']]
 
+    def test_the_wider_cycle_sets_add_function_local_then_type_checking_edges(
+        self, measured: dict[str, Any]
+    ) -> None:
+        # e -> a is function-local, but a never reaches e; c <-> d is TYPE_CHECKING only.
+        graph = measured['import_graph']
+        assert graph['hidden_cycles'] == [['a', 'b']]
+        assert graph['typing_cycles'] == [['a', 'b'], ['c', 'd']]
+
     def test_a_name_from_the_package_init_is_a_reach_back_and_a_submodule_is_not(
         self, measured: dict[str, Any]
     ) -> None:
@@ -399,7 +409,7 @@ class TestTheImportGraph:
 
     def test_deferred_imports_are_listed_by_site(self, measured: dict[str, Any]) -> None:
         deferred = measured['import_graph']['deferred']
-        assert deferred == [{'from': 'e', 'line': 5, 'imports': ['a']}]
+        assert deferred == [{'from': 'e', 'line': 5, 'imports': ['a'], 'closes_cycle': False}]
         assert (
             len([entry for entry in deferred if entry['from'] == 'e'])
             == measured['files']['alpha/src/e.py']['function_local_imports']
@@ -464,6 +474,51 @@ class TestTheImportGraph:
         assert 'alpha/src/broken.py' in measured['evidence']['unreadable']
         assert 'alpha/src/broken.py' not in measured['files']
         assert measured['files']['alpha/src/user.py']['fan_out'] == 1
+
+
+#: Cycles that only function-local (j <-> m, f <-> g) or TYPE_CHECKING (t <-> v) imports close.
+_CYCLE_SETS: dict[str, str] = {
+    'alpha/src/f.py': 'import g\n',
+    'alpha/src/g.py': 'def h():\n    import w, f\n    return f\n',
+    'alpha/src/w.py': 'W = 1\n',
+    'alpha/src/j.py': 'def k():\n    import m\n    return m\n',
+    'alpha/src/m.py': 'def n():\n    import j\n    return j\n',
+    'alpha/src/t.py': (
+        'from typing import TYPE_CHECKING\n\n\ndef u():\n    if TYPE_CHECKING:\n        import v\n'
+    ),
+    'alpha/src/v.py': 'import t\n',
+    'alpha/src/e.py': 'def late():\n    import f\n    return f\n',
+    'beta/src/beta/b.py': 'B = 1\n',
+}
+
+
+class TestTheCycleSets:
+    @pytest.fixture
+    def graph(self, tmp_path: Path) -> dict[str, Any]:
+        return _measured(tmp_path, _CYCLE_SETS)['import_graph']
+
+    def test_each_set_adds_the_edges_of_a_later_moment(self, graph: dict[str, Any]) -> None:
+        assert graph['cycles'] == []
+        assert graph['hidden_cycles'] == [['f', 'g'], ['j', 'm']]
+        assert graph['typing_cycles'] == [['f', 'g'], ['j', 'm'], ['t', 'v']]
+
+    def test_a_deferred_import_closes_a_cycle_when_it_lies_on_a_hidden_one(
+        self, graph: dict[str, Any]
+    ) -> None:
+        # g: one target in the importer's hidden cycle suffices; j and m: both
+        # function-local edges of one cycle are marked; t: a TYPE_CHECKING import
+        # lies on a typing cycle only; e: its target never reaches back.
+        assert graph['deferred'] == [
+            {'from': 'e', 'line': 2, 'imports': ['f'], 'closes_cycle': False},
+            {'from': 'g', 'line': 2, 'imports': ['f', 'w'], 'closes_cycle': True},
+            {'from': 'j', 'line': 2, 'imports': ['m'], 'closes_cycle': True},
+            {'from': 'm', 'line': 2, 'imports': ['j'], 'closes_cycle': True},
+            {'from': 't', 'line': 6, 'imports': ['v'], 'closes_cycle': False},
+        ]
+
+    def test_every_closing_importer_is_in_a_hidden_cycle(self, graph: dict[str, Any]) -> None:
+        closing = {entry['from'] for entry in graph['deferred'] if entry['closes_cycle']}
+        assert closing <= {module for cycle in graph['hidden_cycles'] for module in cycle}
 
 
 # ---------------------------------------------------------------------------
@@ -1259,7 +1314,7 @@ class TestABadPreviousSnapshotIsRefusedBeforeMeasuring:
         assert _run(root, measured) == 0
         previous = tmp_path / 'previous.json'
         previous.write_text(
-            json.dumps({**json.loads(measured.read_text(encoding='utf-8')), 'schema_version': 2}),
+            json.dumps({**json.loads(measured.read_text(encoding='utf-8')), 'schema_version': 3}),
             encoding='utf-8',
         )
         capsys.readouterr()
@@ -1352,6 +1407,26 @@ _MISSHAPEN: list[Any] = [
     ),
     pytest.param(
         'import_graph.cycles[0][1]', _setting('import_graph', 'cycles', to=[['a', 1]]), id='cycles'
+    ),
+    pytest.param(
+        'import_graph.deferred[0].closes_cycle',
+        _setting('import_graph', 'deferred', 0, 'closes_cycle', to='no'),
+        id='deferred-closes-cycle',
+    ),
+    pytest.param(
+        'import_graph.hidden_cycles[0][1]',
+        _setting('import_graph', 'hidden_cycles', to=[['a', 1]]),
+        id='hidden-cycles',
+    ),
+    pytest.param(
+        'import_graph.typing_cycles[0][1]',
+        _setting('import_graph', 'typing_cycles', to=[['a', 1]]),
+        id='typing-cycles',
+    ),
+    pytest.param(
+        'import_graph keys',
+        lambda taken: taken['import_graph'].pop('hidden_cycles'),
+        id='import-graph-keys',
     ),
 ]
 
