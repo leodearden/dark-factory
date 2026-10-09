@@ -222,7 +222,7 @@ def _within(relative: str, scope: tuple[str, ...]) -> bool:
     COMPARED AS PATH COMPONENTS, never as a string prefix: ``scripts`` must not
     scope ``scripts_old/`` and ``sc`` must not scope anything, which is the same
     mistake in the same shape as the string-prefix one
-    ``scripts/inline_suppressions.py::selects`` refuses.
+    ``scripts/inline_suppression_consumers.py::selects`` refuses.
     Both sides are ``PurePosixPath``, because ``git ls-files`` emits forward
     slashes on every platform and a scope typed as ``./pkg`` should mean ``pkg``.
     """
