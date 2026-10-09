@@ -912,5 +912,6 @@ def test_embed_compare_prints_a_row_per_margin_then_the_envelope_and_verdict(
             assert verdict.metric_id in row and str(verdict.candidate_value) in row
         envelope = next(line for line in lines if line.startswith(f'envelope {spec.arm_id}:'))
         assert str(comparison.envelope.candidate_p95_ms) in envelope
+        assert f'{comparison.envelope.failed_queries} failed queries' in envelope
         assert f'non_inferior {spec.arm_id}: {comparison.non_inferior}' in lines
     assert f'non_inferior {QWEN.arm_id}: False' in lines

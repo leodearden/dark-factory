@@ -14,8 +14,9 @@ was taken, including why the runs' code sha predates a rebase of this branch. Li
 ## 1. Verdict
 
 The rule: an arm is non-inferior when every with-indices margin admits it AND its
-query-embed-latency-p95 is under the 15000 ms envelope
-(`embedding_preregistration.py::compare_embedding_arm`). embedding-only is reported, not
+query-embed-latency-p95 is under the 15000 ms envelope with no latency query failed
+(`embedding_preregistration.py::compare_embedding_arm`). A run whose re-embed left any
+text unembedded is not judged at all; none did. embedding-only is reported, not
 deciding.
 
 | arm | with-indices margins | latency envelope | verdict |
@@ -314,25 +315,25 @@ uv run --no-sync python scripts/local_memory_models_eval/harness.py embed-compar
 | gte-modernbert-base | known-item-recall@5 | with-indices | 0.8190954773869347 | 0.005025125628140704 | 0.8291457286432161 | True |
 | gte-modernbert-base | mrr | embedding-only | 0.7570252053920395 | 0.0 | 0.7706708143894073 | True |
 | gte-modernbert-base | mrr | with-indices | 0.681064050410784 | 0.0 | 0.6907035175879397 | True |
-envelope qwen3-embedding-0.6b: p95 31.063311733305454 ms, bound 15000.0 ms, admits True
+envelope qwen3-embedding-0.6b: p95 31.063311733305454 ms, 0 failed queries, bound 15000.0 ms, admits True
 reported qwen3-embedding-0.6b mem0-known-item-recall@5: 0.40476190476190477 (n 42)
 reported qwen3-embedding-0.6b mem0-known-item-recall@10: 0.4523809523809524 (n 42)
 reported qwen3-embedding-0.6b mem0-mrr: 0.2816137566137566 (n 42)
 reported qwen3-embedding-0.6b reembed-throughput: 201.3845934981401 (n 33958)
 non_inferior qwen3-embedding-0.6b: True
-envelope granite-embedding-english-r2: p95 30.112157110124826 ms, bound 15000.0 ms, admits True
+envelope granite-embedding-english-r2: p95 30.112157110124826 ms, 0 failed queries, bound 15000.0 ms, admits True
 reported granite-embedding-english-r2 mem0-known-item-recall@5: 0.42857142857142855 (n 42)
 reported granite-embedding-english-r2 mem0-known-item-recall@10: 0.4523809523809524 (n 42)
 reported granite-embedding-english-r2 mem0-mrr: 0.27681405895691613 (n 42)
 reported granite-embedding-english-r2 reembed-throughput: 657.914016649956 (n 33958)
 non_inferior granite-embedding-english-r2: True
-envelope qwen3-embedding-4b: p95 64.88543702289462 ms, bound 15000.0 ms, admits True
+envelope qwen3-embedding-4b: p95 64.88543702289462 ms, 0 failed queries, bound 15000.0 ms, admits True
 reported qwen3-embedding-4b mem0-known-item-recall@5: 0.42857142857142855 (n 42)
 reported qwen3-embedding-4b mem0-known-item-recall@10: 0.4523809523809524 (n 42)
 reported qwen3-embedding-4b mem0-mrr: 0.3419312169312169 (n 42)
 reported qwen3-embedding-4b reembed-throughput: 35.71350848204817 (n 33958)
 non_inferior qwen3-embedding-4b: False
-envelope gte-modernbert-base: p95 40.29964283108711 ms, bound 15000.0 ms, admits True
+envelope gte-modernbert-base: p95 40.29964283108711 ms, 0 failed queries, bound 15000.0 ms, admits True
 reported gte-modernbert-base mem0-known-item-recall@5: 0.35714285714285715 (n 42)
 reported gte-modernbert-base mem0-known-item-recall@10: 0.42857142857142855 (n 42)
 reported gte-modernbert-base mem0-mrr: 0.24404761904761904 (n 42)

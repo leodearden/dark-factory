@@ -76,6 +76,20 @@ def _inputs():
     return derive_embedding_preregistration_inputs(*_pair())
 
 
+def _failing(spec, *, latency: int = 0, graph: int = 0, replica: int = 0) -> EmbeddingRunManifest:
+    """A run of ``spec`` with that many failed latency queries and unembedded texts."""
+    run = embedding_run_manifest(spec)
+    return run.model_copy(update={
+        'query_failures': run.query_failures.model_copy(update={'query_latency': latency}),
+        'graph_reembed': run.graph_reembed.model_copy(
+            update={'failures': tuple((f'g{i}', 'TimeoutError') for i in range(graph))}
+        ),
+        'replica_reembed': run.replica_reembed.model_copy(
+            update={'failures': tuple((f'r{i}', 'TimeoutError') for i in range(replica))}
+        ),
+    })
+
+
 # --- symmetry -------------------------------------------------------------------------
 
 
@@ -222,6 +236,17 @@ def test_an_incumbent_p95_outside_its_own_envelope_is_refused():
         derive_embedding_preregistration_inputs(*_pair(records_b=records_b))
 
 
+def test_a_control_with_a_failed_latency_query_yields_no_preregistration():
+    with pytest.raises(EmbeddingPreregistrationError, match='1 failed latency'):
+        derive_embedding_preregistration_inputs(*_pair(run_b=_failing(CONTROL_B, latency=1)))
+
+
+@pytest.mark.parametrize('failures', [{'graph': 1}, {'replica': 2}])
+def test_a_control_whose_reembed_left_texts_unembedded_yields_no_preregistration(failures):
+    with pytest.raises(EmbeddingPreregistrationError, match='partial store'):
+        derive_embedding_preregistration_inputs(*_pair(run_a=_failing(CONTROL_A, **failures)))
+
+
 def test_serialization_is_canonical_and_round_trips(tmp_path):
     inputs = _inputs()
     path = tmp_path / 'embedding-preregistration-inputs.json'
@@ -288,6 +313,33 @@ def test_a_candidate_outside_the_envelope_is_not_non_inferior():
     assert not comparison.envelope.admits
     assert comparison.envelope.candidate_p95_ms == 15000.0
     assert not comparison.non_inferior
+
+
+def test_a_candidate_with_failed_latency_queries_is_outside_the_envelope():
+    run = _failing(CANDIDATE, latency=400)
+
+    comparison = compare_embedding_arm(_inputs(), run, embedding_records(CANDIDATE))
+
+    assert all(row.admits for row in comparison.margins)
+    assert comparison.envelope.candidate_p95_ms < comparison.envelope.p95_bound_ms
+    assert comparison.envelope.failed_queries == 400
+    assert not comparison.envelope.admits
+    assert not comparison.non_inferior
+
+
+@pytest.mark.parametrize('failures', [{'graph': 2721}, {'replica': 1}])
+def test_a_candidate_whose_reembed_left_texts_unembedded_is_not_judged(failures):
+    run = _failing(CANDIDATE, **failures)
+
+    with pytest.raises(EmbeddingPreregistrationError, match='partial store'):
+        compare_embedding_arm(_inputs(), run, embedding_records(CANDIDATE))
+
+
+def test_a_candidate_run_under_another_search_timeout_is_refused():
+    run = embedding_run_manifest(CANDIDATE, settings=_settings(search_timeout_s=15.0))
+
+    with pytest.raises(EmbeddingPreregistrationError, match='settings.search_timeout_s'):
+        compare_embedding_arm(_inputs(), run, embedding_records(CANDIDATE))
 
 
 def test_mem0_and_throughput_rows_are_reported():

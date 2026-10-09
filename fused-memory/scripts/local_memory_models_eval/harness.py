@@ -1202,7 +1202,8 @@ def _print_comparison_verdict(comparison: EmbeddingComparison) -> None:
     arm_id, envelope = comparison.arm_id, comparison.envelope
     print(
         f'envelope {arm_id}: p95 {envelope.candidate_p95_ms} ms, '
-        f'bound {envelope.p95_bound_ms} ms, admits {envelope.admits}'
+        f'{envelope.failed_queries} failed queries, bound {envelope.p95_bound_ms} ms, '
+        f'admits {envelope.admits}'
     )
     for row in comparison.reported:
         print(f'reported {arm_id} {row.metric_id}: {row.value} (n {row.n})')

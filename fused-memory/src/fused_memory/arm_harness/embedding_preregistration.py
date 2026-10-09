@@ -5,6 +5,11 @@ The query-latency envelope is ``p95_bound = search_timeout / LATENCY_HEADROOM``,
 anchored on the search timeout the runs recorded. Only the with-indices margins
 and the envelope decide non-inferiority. The embedding-only, Mem0 and throughput
 rows are reported (preregistration §6).
+
+A query the arm could not embed is the arm's failure: a known-item query reads as
+a miss in its metric, and a latency query, having no latency, keeps the envelope
+from admitting the arm. A run whose re-embed left texts unembedded probed a
+partial store, so it measured that run rather than the model and is not judged.
 """
 
 import math
@@ -88,6 +93,16 @@ def _symmetric_values(run: EmbeddingRunManifest) -> dict[str, object]:
     return {**settings, 'corpus_sha': run.spec.corpus_sha, 'code_sha': run.spec.code_sha}
 
 
+def _require_complete_build(run: EmbeddingRunManifest) -> None:
+    graph, replica = run.graph_reembed.failures, run.replica_reembed.failures
+    if graph or replica:
+        raise EmbeddingPreregistrationError(
+            f'arm {run.spec.arm_id!r} could not embed {len(graph)} graph texts and '
+            f'{len(replica)} Mem0 records, so its probes searched a partial store: the run '
+            'measured itself, not the model; re-run it'
+        )
+
+
 # --- the query-latency envelope ---------------------------------------------------------
 
 
@@ -121,6 +136,13 @@ def query_latency_envelope(search_timeout_s: float) -> QueryLatencyEnvelope:
     )
 
 
+def _envelope_admits_run(
+    envelope: QueryLatencyEnvelope, p95_ms: float, failed_queries: int
+) -> bool:
+    """A failed latency query has no latency to fall inside the bound, so it lies outside."""
+    return failed_queries == 0 and envelope.admits(p95_ms)
+
+
 # --- derivation -------------------------------------------------------------------------
 
 
@@ -138,7 +160,9 @@ class EmbeddingPreregistrationInputs(FrozenModel):
         arm_a, arm_b = self.control_arm_ids
         if arm_a == arm_b:
             raise ValueError(f'control_arm_ids name arm {arm_a!r} twice; a control pair is two')
-        _require_incumbent_inside(self.query_latency_envelope, self.incumbent_query_latency_p95_ms)
+        _require_incumbent_inside(
+            self.query_latency_envelope, self.incumbent_query_latency_p95_ms, failed_queries=0
+        )
         return self
 
 
@@ -156,7 +180,8 @@ def derive_embedding_preregistration_inputs(
         raise EmbeddingPreregistrationError(f'the control pair is asymmetric: {symmetry.detail}')
     envelope = query_latency_envelope(run_a.settings.search_timeout_s)
     p95_ms = max(_query_latency_p95_ms(records_a), _query_latency_p95_ms(records_b))
-    _require_incumbent_inside(envelope, p95_ms)
+    failed = run_a.query_failures.query_latency + run_b.query_failures.query_latency
+    _require_incumbent_inside(envelope, p95_ms, failed_queries=failed)
     return EmbeddingPreregistrationInputs(
         schema_version=1,
         control_arm_ids=(run_a.spec.arm_id, run_b.spec.arm_id),
@@ -175,6 +200,7 @@ def _require_control_run(run: EmbeddingRunManifest, records: Sequence[MetricsRec
             'takes two control runs'
         )
     _require_records_of(run, records)
+    _require_complete_build(run)
 
 
 def _require_records_of(run: EmbeddingRunManifest, records: Sequence[MetricsRecord]) -> None:
@@ -185,12 +211,14 @@ def _require_records_of(run: EmbeddingRunManifest, records: Sequence[MetricsReco
         )
 
 
-def _require_incumbent_inside(envelope: QueryLatencyEnvelope, p95_ms: float) -> None:
-    if not envelope.admits(p95_ms):
+def _require_incumbent_inside(
+    envelope: QueryLatencyEnvelope, p95_ms: float, *, failed_queries: int
+) -> None:
+    if not _envelope_admits_run(envelope, p95_ms, failed_queries):
         raise EmbeddingPreregistrationError(
-            f'the incumbent query-embed p95 {p95_ms} ms is not inside the envelope bound '
-            f'{envelope.p95_bound_ms} ms: an envelope the incumbent fails is not a valid '
-            'pre-registration'
+            f'the incumbent query-embed p95 {p95_ms} ms, with {failed_queries} failed latency '
+            f'queries, is not inside the envelope bound {envelope.p95_bound_ms} ms: an envelope '
+            'the incumbent fails is not a valid pre-registration'
         )
 
 
@@ -240,6 +268,7 @@ class MarginVerdict(FrozenModel):
 class EnvelopeVerdict(FrozenModel):
     p95_bound_ms: float
     candidate_p95_ms: float
+    failed_queries: int = Field(ge=0)
     admits: bool
 
 
@@ -278,7 +307,11 @@ def compare_embedding_arm(
     _require_candidate_of(inputs, candidate_run, candidate_records)
     keyed = _keyed(candidate_records)
     margins = tuple(_margin_verdict(entry, keyed) for entry in inputs.margins)
-    envelope = _envelope_verdict(inputs.query_latency_envelope, _query_latency_p95_ms(candidate_records))
+    envelope = _envelope_verdict(
+        inputs.query_latency_envelope,
+        _query_latency_p95_ms(candidate_records),
+        candidate_run.query_failures.query_latency,
+    )
     deciding = (row.admits for row in margins if row.index_configuration is DECIDING_CONFIGURATION)
     return EmbeddingComparison(
         arm_id=candidate_run.spec.arm_id,
@@ -303,13 +336,24 @@ def _require_candidate_of(
         raise EmbeddingPreregistrationError(
             f'arm {spec.arm_id!r} is a {spec.arm_role} run; only a candidate is compared'
         )
-    for field, expected in (('code_sha', inputs.code_sha), ('corpus_sha', inputs.corpus_sha)):
-        if getattr(spec, field) != expected:
+    ran_at = _symmetric_values(run)
+    for field, expected in _recorded_symmetric_values(inputs).items():
+        if ran_at[field] != expected:
             raise EmbeddingPreregistrationError(
-                f'arm {spec.arm_id!r} ran at {field} {getattr(spec, field)}, but the '
+                f'arm {spec.arm_id!r} ran at {field} {ran_at[field]}, but the '
                 f'pre-registration was derived at {expected}'
             )
     _require_records_of(run, records)
+    _require_complete_build(run)
+
+
+def _recorded_symmetric_values(inputs: EmbeddingPreregistrationInputs) -> dict[str, object]:
+    """The symmetric values the inputs record, under ``_symmetric_values``'s keys."""
+    return {
+        'code_sha': inputs.code_sha,
+        'corpus_sha': inputs.corpus_sha,
+        'settings.search_timeout_s': inputs.query_latency_envelope.search_timeout_s,
+    }
 
 
 def _margin_verdict(
@@ -326,7 +370,12 @@ def _margin_verdict(
     )
 
 
-def _envelope_verdict(envelope: QueryLatencyEnvelope, p95_ms: float) -> EnvelopeVerdict:
+def _envelope_verdict(
+    envelope: QueryLatencyEnvelope, p95_ms: float, failed_queries: int
+) -> EnvelopeVerdict:
     return EnvelopeVerdict(
-        p95_bound_ms=envelope.p95_bound_ms, candidate_p95_ms=p95_ms, admits=envelope.admits(p95_ms)
+        p95_bound_ms=envelope.p95_bound_ms,
+        candidate_p95_ms=p95_ms,
+        failed_queries=failed_queries,
+        admits=_envelope_admits_run(envelope, p95_ms, failed_queries),
     )

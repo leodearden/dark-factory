@@ -33,7 +33,12 @@ class EmbeddingRunSettings(FrozenModel):
 
 
 class QueryFailureCounts(FrozenModel):
-    """Queries the arm could not embed. Each still counts in its metric's n, as a miss."""
+    """Queries the arm could not embed.
+
+    A known-item or Mem0 query still counts in its metric's n, as a miss. A latency query
+    has no latency, so it is left out of the p95 and keeps the envelope from admitting the
+    arm (embedding_preregistration.py).
+    """
 
     known_item: dict[IndexConfiguration, int]
     mem0_known_item: int = Field(ge=0)
