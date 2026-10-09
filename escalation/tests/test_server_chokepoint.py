@@ -2004,24 +2004,22 @@ class TestMergeCancel:
     async def test_cancel_finalized_popped_id_resolves_via_durable_tier(self, tmp_path: Path):
         """Cancelling a finalized+popped request_id returns the durable terminal state.
 
-        Injects a tiny fake event_store that returns a finalized row for 'mr-finalized'
-        and None for other ids.  No waiter is registered (simulating finalized+popped).
+        A real event store holds a 'done' merge_finalized row for 'mr-finalized' in
+        the server's own run.  No waiter is registered (simulating finalized+popped).
         merge_cancel('mr-finalized') must return {cancelled: False, state: 'done', reason:
         <non-empty>} — not 'unknown'.  merge_cancel('mr-never') must still return state='unknown'.
-
-        RED until step-10 impl: the None-rec branch always returns 'unknown' and never
-        consults event_store.
         """
+        from orchestrator.event_store import (  # type: ignore[reportMissingImports]
+            EventStore,
+            EventType,
+        )
 
-        class FakeEventStore:
-            def latest_merge_finalized(self, request_id=None, branch=None, task_id=None):
-                if request_id == 'mr-finalized':
-                    return {
-                        'request_id': request_id,
-                        'state': 'done',
-                        'finished_at': '2026-01-01T00:00:00+00:00',
-                    }
-                return None
+        event_store = EventStore(db_path=tmp_path / 'events-finalized.db', run_id='cancel')
+        event_store.emit(
+            EventType.merge_finalized,
+            task_id='T-fin',
+            data={'request_id': 'mr-finalized', 'branch': 'T-fin', 'state': 'done'},
+        )
 
         esc_queue = EscalationQueue(tmp_path / 'esc')
         mq: asyncio.Queue = asyncio.Queue()
@@ -2033,7 +2031,7 @@ class TestMergeCancel:
             merge_queue=mq,
             orch_config=orch_config,
             merge_inflight_registry=registry,
-            event_store=FakeEventStore(),
+            event_store=event_store,
         )
 
         # No waiter registered for 'mr-finalized' (simulates finalized+popped)

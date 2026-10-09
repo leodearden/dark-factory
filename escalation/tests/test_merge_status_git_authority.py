@@ -369,7 +369,7 @@ class TestMergeStatusGitAuthority:
     ) -> None:
         """(a) fire-safe: is_ancestor raising → a git probe_failed unknown, no raise."""
         tip = 'c' * 40
-        rsb = AsyncMock(return_value=tip)
+        rsb = AsyncMock(side_effect=lambda b: tip if b.startswith('task/') else 'm' * 40)
         ia = AsyncMock(side_effect=RuntimeError('git subprocess died'))
         stub_git = _stub_git_ops(resolve_branch_sha=rsb, is_ancestor=ia)
         server = await self._make_server_with_git_ops(tmp_path, stub_git)
