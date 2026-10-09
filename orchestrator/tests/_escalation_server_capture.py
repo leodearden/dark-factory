@@ -41,4 +41,4 @@ async def create_server_kwargs(h: Harness) -> dict[str, Any]:
         coro.close()
 
     assert mock_create.called, '_start_escalation_server did not reach create_server'
-    return mock_create.call_args.kwargs
+    return dict(mock_create.call_args.kwargs)
