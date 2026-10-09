@@ -603,10 +603,10 @@ def _inner_closer_blocks(
         genuine AMBIGUITY B5's own wording describes, where the item's boundary
         really is a guess.
 
-    Otherwise the occurrence is QUOTED PROSE and recovery proceeds. A sibling
-    OPENER in the value is not this function's question: :func:`repair` asks
-    it of every recovered value at accept time, closer or no closer (see
-    :func:`_hides_sibling_opener`).
+    Otherwise the occurrence is QUOTED PROSE and recovery proceeds. A
+    parameter OPENER in the value is not this function's question:
+    :func:`repair` asks it of every recovered value at accept time, closer or
+    no closer (see :func:`_hides_parameter_opener`).
 
     CONDITION (i) IS NOT REDUNDANT, and dropping it is the single most likely
     way a reimplementation goes wrong. Condition (ii) alone — or qualifying
@@ -616,10 +616,9 @@ def _inner_closer_blocks(
     failure, strictly worse than ``None``. The witness is committed-corpus
     record 25 (``mcp__plan-tools__add_design_decision`` / ``decision``), a
     canonical ``rationale`` closed by the name-echoing ``rationale`` closer
-    and followed by the head of a whole NEXT invoke block; condition (i) is
-    what refuses it, because its own ``rationale`` closer sits inside its
-    value. The accept-time sibling-opener condition would refuse it too, so
-    negative controls (b) and (d) are condition (i)'s sole witnesses.
+    and followed by the head of a whole NEXT invoke block. Negative control
+    (a) pins that shape; (b) and (d) pin the mis-close in values that carry
+    no opener at all.
 
     *value_start* is *item_value*'s offset within *body*, so (ii) reads the
     position after an inner closer from the shared string rather than copying
@@ -714,8 +713,8 @@ def _parse_tail(tail: str) -> dict[str, str] | None:
     inside a recovered item's value blocks recovery when a closing tag
     mis-closes THAT item or spans a tool-call boundary, or when reading it as
     the terminator leaves the parser at an item boundary — but NOT when a
-    closer is merely quoted prose. A sibling OPENER in the value is refused
-    by :func:`repair`'s accept-time sibling-opener condition instead. A
+    closer is merely quoted prose. A parameter OPENER in the value is refused
+    by :func:`repair`'s accept-time parameter-opener condition instead. A
     recovered value is verbatim caller
     text under invariant D5, and a faithful report of a markup leak necessarily
     quotes the leak; ``clean_value``'s envelope-free post-condition is
@@ -730,10 +729,10 @@ def _parse_tail(tail: str) -> dict[str, str] | None:
     return _parse_body(body)
 
 
-def _hides_sibling_opener(item_value: str, schema: frozenset[str]) -> bool:
-    """Does a recovered value hide an opener :func:`_parse_body` would open on?
+def _hides_parameter_opener(item_value: str, schema: frozenset[str]) -> bool:
+    """Does a value carry a canonical opener, or an echo opener for a *schema* name?
 
-    The invariant: a recovered value must not hide a sibling opener, whether
+    The invariant: a recovered value must not hide a parameter opener, whether
     or not it also carries a closer. The canonical opener blocks for ANY name,
     because it is unambiguous harness markup, including a spill into another
     tool's call whose names fall outside *schema*. The name-echoing opener
@@ -768,8 +767,8 @@ def repair(
     ``parameter`` closer. For each candidate the remaining tail is parsed by
     :func:`_parse_tail`; the EARLIEST candidate is accepted for which the tail
     parses with zero leftover, every recovered name is in *schema_params*, no
-    recovered name is in *supplied*, no recovered value hides a sibling opener
-    (:func:`_hides_sibling_opener`), and the resulting ``clean_value`` is
+    recovered name is in *supplied*, no recovered value hides a parameter
+    opener (:func:`_hides_parameter_opener`), and the resulting ``clean_value`` is
     itself envelope-free. Otherwise ``None`` — never a guess, and never a
     PARTIAL repair.
 
@@ -896,7 +895,7 @@ def repair(
             continue
         # B8's value-side mirror: B8 asks that every recovered NAME be a
         # parameter, this that no recovered VALUE hide one.
-        if any(_hides_sibling_opener(v, schema) for v in recovered.values()):
+        if any(_hides_parameter_opener(v, schema) for v in recovered.values()):
             continue
         clean_value = value[: candidate.start()]
         # PREFIX-CLEAN, the third accept-time condition. The scan steps over a

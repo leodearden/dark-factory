@@ -691,7 +691,9 @@ Implements C1. Extracts the real specimens from the archived transcripts into a 
 > `tkt_0RTT9N7HAZ2WP6DF3YNXAKHSX4`); negative control
 > `test_a_sibling_opener_with_NO_closing_tag_is_NOT_refused_TODAY` pins the residue,
 > so 5639 landing fails loudly here instead of silently contradicting this
-> paragraph. Closed by task 5639; see below. (2) The widened rule leaves `_parse_body`'s depth-1 probe short-circuit
+> paragraph. Closed by task 5639: that pin is replaced by
+> `test_the_opener_verdict_does_not_depend_on_a_closing_tag`; see below.
+> (2) The widened rule leaves `_parse_body`'s depth-1 probe short-circuit
 > unreachable by construction (instrumented: 1 execution before, 0 after). It is
 > documented in place and kept, because deleting it removes a recursion bound 4502
 > landed deliberately. **Task 5640** (filed as `tkt_0RTT9N05CHRSHN2MSCHNXX4A8D`).
@@ -740,7 +742,7 @@ Implements C1. Extracts the real specimens from the archived transcripts into a 
 > renamed back to `_inner_closer_blocks`. In the sweep, the unterminated-inner-opener
 > nested leak now refuses in round one; a recovered value that QUOTES a closer is the
 > shape that still reaches round two. *Blast radius, re-measured at 5639:* the corpus
-> stays **444/60** with no record changing outcome; the shared markup suites (530
+> stays **444/60** with no record changing outcome; the shared markup suites (535
 > passed), both `esc-3514` specimen pins with the registration specimens (74 passed),
 > the sweep suite (94 passed) and the plan-tools markup suites (244 passed) are green.
 >

@@ -1035,9 +1035,8 @@ class TestQuotedReportIsRepairable:
         canonical opener pattern's name group runs across *own_closer* and is
         closed by the BLEND sibling opener's stray quote. An item therefore
         opens right after the quoted ``foo`` closer although no complete opener
-        lies inside the value, which repair()'s accept-time sibling-opener
-        condition cannot see. That stray
-        quote is load-bearing. *sibling_closer* is the cell the two
+        lies inside the value. That stray quote is load-bearing.
+        *sibling_closer* is the cell the two
         alternative_boundary tests vary; *opener* and *own_closer* carry the
         enclosing dialect, varied separately by ``_ENCLOSING_DIALECTS``.
         """
@@ -1122,9 +1121,9 @@ class TestQuotedReportIsRepairable:
 
         An item's OWN closing tag appearing inside its value is a cross-dialect
         mis-close by definition, never prose about itself — which is why the
-        rule may state that condition categorically. Condition (i) refuses this
-        specimen; repair()'s accept-time sibling-opener condition would refuse
-        it too, so (b) and (d) are condition (i)'s sole witnesses.
+        rule may state that condition categorically. This value also carries
+        the next block's opener; (b) and (d) pin the mis-close in values that
+        carry no opener at all.
         """
         clean = 'Recording the rationale for the routing change.'
         value = (
@@ -1237,7 +1236,7 @@ class TestQuotedReportIsRepairable:
         ) is None
 
     def test_a_canonical_sibling_opener_inside_a_value_is_refused(self):
-        """NEGATIVE CONTROL (g) — repair()'s accept-time sibling-opener condition.
+        """NEGATIVE CONTROL (g) — a canonical parameter opener inside a value.
 
         Task **4502** narrowed B5 by reasoning about inner CLOSERS, and its
         rule iterates over closers alone. A well-formed parameter OPENER inside
@@ -1405,10 +1404,8 @@ class TestQuotedReportIsRepairable:
 
         This specimen differs from negative control (g) in ONE cell — a single
         space where that one has a sentence of prose, which is why both are
-        built by ``_sibling_opener_tail``. Condition (ii) refuses it, because
-        the opener sits at the quoted closer's alternative boundary; repair()'s
-        accept-time sibling-opener condition would refuse it too. A recovery
-        would be the swallowed-sibling
+        built by ``_sibling_opener_tail``: here the opener sits at the quoted
+        closer's alternative boundary. A recovery would be the swallowed-sibling
         partial repair (g) refuses: ``suggested_action``, a real parameter of
         this tool, not recovered, its text written into ``evidence`` instead.
         """
@@ -1429,8 +1426,9 @@ class TestQuotedReportIsRepairable:
         """An ``evidence`` value quoting *opener*(*sibling*), and optionally a closer.
 
         The quoted ``foo`` closer is followed by a sentence of prose, so the
-        opener never sits at that closer's alternative boundary, where
-        condition (ii) would refuse it for a reason unrelated to the opener.
+        opener never sits at that closer's alternative boundary. The
+        echo-placeholder rows are the executable check that nothing but the
+        opener is refused here: they recover, quoted closer and all.
         """
         quoted = _closer('foo') + ' and then prose: ' if quoted_closer else ''
         return (
@@ -1482,6 +1480,64 @@ class TestQuotedReportIsRepairable:
         else:
             assert result is not None
             assert result.recovered == {'evidence': tail}
+
+    @_ENCLOSING_DIALECTS
+    @pytest.mark.parametrize(
+        ('evidence', 'refused'),
+        [
+            ('the report quotes ' + _opener('suggested_action') + 'refile', True),
+            ('the report quotes nothing but prose', False),
+        ],
+        ids=['hidden-opener', 'prose'],
+    )
+    def test_an_opener_hidden_in_a_LATER_recovered_value_is_refused(
+        self, opener, own_closer, evidence, refused
+    ):
+        """Every recovered value is checked, not only the first.
+
+        ``severity`` recovers cleanly ahead of ``evidence``, so the opener sits
+        in the SECOND recovered value, inside an item of the enclosing dialect.
+        The prose row is the both-ways control: the same two items recover.
+        """
+        value = (
+            self._CLEAN
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('severity') + 'low' + _CANONICAL_CLOSER + '\n'
+            + opener('evidence') + evidence + own_closer
+            + '\n' + INVOKE_CLOSER
+        )
+
+        result = self._repair(value)
+
+        if refused:
+            assert result is None
+        else:
+            assert result is not None
+            assert result.recovered == {'severity': 'low', 'evidence': evidence}
+
+    def test_an_opener_refusal_does_not_fall_through_to_a_later_truncation(self):
+        """Refusing a candidate for its hidden opener only ADVANCES the scan.
+
+        The sibling's own closer is a second candidate, and the tail after it,
+        a well-formed ``severity`` item, parses. Accepting it would truncate
+        ``detail`` there, leaving the first closer and the swallowed sibling
+        in ``clean_value``: a partial repair.
+
+        MUTATION-VERIFIED: deleting repair()'s prefix-clean condition makes
+        this specimen return exactly that truncation.
+        """
+        value = (
+            self._CLEAN
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('evidence') + 'x '
+            + _canonical_opener('suggested_action') + 'y'
+            + _CANONICAL_CLOSER + '\n'
+            + _canonical_opener('severity') + 'low'
+            + '\n' + INVOKE_CLOSER
+        )
+
+        assert self._repair(value) is None
+
 
 class TestRepairInvariants:
     """The four C1 invariants: totality, determinism, purity, D5."""
