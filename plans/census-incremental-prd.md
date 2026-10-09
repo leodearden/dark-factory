@@ -326,7 +326,7 @@ L1–L10 are intermediates whose user-observable completion is G's check of a li
   - **Signal:** `similarity.py queue --project-root /home/leo/src/dark-factory` (embedding spend only, no verify) prints the queue depth and the top clusters over the live codebook. G (`## Adjudication` with an audit line per attach).
 - **L10: structured synthesis** (normal; deps L7; ~700 LOC).
   - **Files:** new `scripts/legibility/synthesis.py` (schema, validation, deterministic renderer); `census.py` (`_synthesis_prompt` input: this run's verified, screened and attached findings plus counts, never prior reports; the guidance block; apply `phase_refinements` and `corrections`); tests.
-  - **Behaviour:** C6. Heuristic 12: prose is rendered from data. The report's per-slug invariant counts come from L9's sightings.
+  - **Behaviour:** C6. Heuristic 12: prose is rendered from data. The report's per-slug invariant counts come from L9's sightings. Reconcile task 5692's interim `census.py::SYNTHESIS_NOT_APPLIED_NOTICE` and `::SYNTHESIS_PROPOSALS_HEADING`: once `corrections` and `phase_refinements` are applied, the notice must name what was applied, not deny it.
   - **Tests:** row 14, plus a golden render.
   - **Consumer:** operator.
   - **Signal:** G (`## Synthesis` has "New" and "Re-observed" sub-blocks; a standing count; the matrix reflects refinements).
