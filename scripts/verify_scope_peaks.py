@@ -5,9 +5,11 @@ A verify scope is `--collect`ed the instant its last process exits, so its
 cgroup memory.peak cannot be read after the gate finishes. `poll` therefore
 samples live scopes, carries the monotonic peak per scope across ticks, and
 appends one JSONL record per scope using the LAST observation once the scope
-disappears. `report` turns those records into the per-project p50/p90/max,
-the recommended laptop MemoryMax, and the 16/16 vs 8/8 thread-split
-recommendation.
+disappears. When the poller itself stops (SIGTERM, Ctrl-C or an error) it
+flushes every still-live scope with `truncated: true`; `report` folds the
+records a poller restart split one scope into back together. `report` turns
+those records into the per-project p50/p90/max, the recommended laptop
+MemoryMax, and the 16/16 vs 8/8 thread-split recommendation.
 
   verify_scope_peaks.py poll   --out peaks.jsonl [--interval 5]
   verify_scope_peaks.py report peaks.jsonl [--since 2026-10-09] [--scale dark-factory=2 --scale reify=0.6667]
@@ -20,16 +22,19 @@ concurrent, so the sum of legs is reported as the upper bound).
 from __future__ import annotations
 
 import argparse
+import calendar
 import glob
 import json
 import math
 import os
 import re
-import statistics
+import signal
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from collections.abc import Iterable, Mapping
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from typing import Literal
 
 GIB = 1024**3
 GATE_GAP_SECS = 60.0
@@ -41,7 +46,7 @@ THREAD_ENV_KEYS = ('PYTEST_XDIST_AUTO_NUM_WORKERS', 'CARGO_BUILD_JOBS', 'NEXTEST
 DEFAULT_SCALES = {'dark-factory': 16 / 8, 'reify': 16 / 24}
 
 
-@dataclass
+@dataclass(frozen=True)
 class ScopeRecord:
     unit: str
     slug: str
@@ -52,9 +57,27 @@ class ScopeRecord:
     mem_total_gib: float
     mem_available_gib_at_start: float
     threads: dict[str, str] = field(default_factory=dict)
+    cwd_basename: str | None = None
+    truncated: bool = False
 
 
-def classify_role(cwd_basename: str) -> str:
+@dataclass(frozen=True)
+class ScopeObservation:
+    unit: str
+    peak_bytes: int
+    cwd_basename: str | None
+    threads: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class HostMemory:
+    total_gib: float
+    available_gib: float
+
+
+def classify_role(cwd_basename: str | None) -> str:
+    if cwd_basename is None:
+        return 'other'
     if cwd_basename.startswith('_merge'):
         return 'merge'
     if cwd_basename.startswith('_lane-'):
@@ -62,23 +85,52 @@ def classify_role(cwd_basename: str) -> str:
     return 'other'
 
 
-def meminfo_gib(path: str = '/proc/meminfo') -> tuple[float, float]:
-    values: dict[str, int] = {}
-    for line in Path(path).read_text().splitlines():
-        key, _, rest = line.partition(':')
-        values[key] = int(rest.split()[0])
-    return values['MemTotal'] / 1024**2, values['MemAvailable'] / 1024**2
+def _colon_fields(text: str) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        key, _, value = line.partition(':')
+        fields[key] = value.strip()
+    return fields
 
 
-def _first_pid(scope_dir: str) -> str | None:
+def read_host_memory(path: str = '/proc/meminfo') -> HostMemory:
+    fields = _colon_fields(Path(path).read_text())
+    kib = {key: int(fields[key].split()[0]) for key in ('MemTotal', 'MemAvailable')}
+    return HostMemory(total_gib=kib['MemTotal'] / 1024**2, available_gib=kib['MemAvailable'] / 1024**2)
+
+
+def scope_root(parents: Mapping[int, int]) -> int | None:
+    """The scope's root process: the one whose parent lies outside the scope, given pid -> ppid."""
+    roots = [pid for pid, ppid in parents.items() if ppid not in parents]
+    return min(roots or parents, default=None)
+
+
+def _parent_pids(scope_dir: str) -> dict[int, int]:
     try:
         pids = Path(scope_dir, 'cgroup.procs').read_text().split()
     except OSError:
+        return {}
+    parents: dict[int, int] = {}
+    for pid in pids:
+        try:
+            parents[int(pid)] = int(_colon_fields(Path(f'/proc/{pid}/status').read_text())['PPid'])
+        except (OSError, KeyError, ValueError):
+            continue
+    return parents
+
+
+def _cwd_basename(pid: int | None) -> str | None:
+    if pid is None:
         return None
-    return pids[0] if pids else None
+    try:
+        return os.path.basename(os.readlink(f'/proc/{pid}/cwd'))
+    except OSError:
+        return None
 
 
-def _thread_env(pid: str) -> dict[str, str]:
+def _thread_env(pid: int | None) -> dict[str, str]:
+    if pid is None:
+        return {}
     try:
         raw = Path(f'/proc/{pid}/environ').read_bytes()
     except OSError:
@@ -88,15 +140,6 @@ def _thread_env(pid: str) -> dict[str, str]:
     return {k: env[k.encode()].decode('utf8', 'replace') for k in THREAD_ENV_KEYS if k.encode() in env}
 
 
-def _role_of(pid: str | None) -> str:
-    if pid is None:
-        return 'other'
-    try:
-        return classify_role(os.path.basename(os.readlink(f'/proc/{pid}/cwd')))
-    except OSError:
-        return 'other'
-
-
 def _read_peak(scope_dir: str) -> int | None:
     try:
         return int(Path(scope_dir, 'memory.peak').read_text())
@@ -104,33 +147,59 @@ def _read_peak(scope_dir: str) -> int | None:
         return None
 
 
+def _observe_scopes(scope_glob: str) -> list[ScopeObservation]:
+    observations: list[ScopeObservation] = []
+    for scope_dir in glob.glob(scope_glob):
+        peak = _read_peak(scope_dir)
+        if peak is None:
+            continue
+        root = scope_root(_parent_pids(scope_dir))
+        observations.append(ScopeObservation(
+            unit=os.path.basename(scope_dir), peak_bytes=peak, cwd_basename=_cwd_basename(root),
+            threads=_thread_env(root),
+        ))
+    return observations
+
+
+def tick(
+    live: Mapping[str, ScopeRecord], observations: Iterable[ScopeObservation], now: float, memory: HostMemory,
+) -> tuple[dict[str, ScopeRecord], list[ScopeRecord]]:
+    """Advance the live-scope table by one poll; returns (scopes still live, records of scopes that ended)."""
+    current: dict[str, ScopeRecord] = {}
+    for obs in observations:
+        match = SCOPE_NAME.match(obs.unit)
+        if match is None:
+            continue
+        prev = live.get(obs.unit)
+        current[obs.unit] = _first_sighting(obs, match['slug'], now, memory) if prev is None else replace(
+            prev, last_seen=now, peak_bytes=max(prev.peak_bytes, obs.peak_bytes),
+        )
+    return current, [rec for unit, rec in live.items() if unit not in current]
+
+
+def _first_sighting(obs: ScopeObservation, slug: str, now: float, memory: HostMemory) -> ScopeRecord:
+    return ScopeRecord(
+        unit=obs.unit, slug=slug, role=classify_role(obs.cwd_basename), first_seen=now, last_seen=now,
+        peak_bytes=obs.peak_bytes, mem_total_gib=memory.total_gib, mem_available_gib_at_start=memory.available_gib,
+        threads=dict(obs.threads), cwd_basename=obs.cwd_basename,
+    )
+
+
+def _append(out: Path, records: list[ScopeRecord]) -> None:
+    if records:
+        with out.open('a') as f:
+            f.writelines(json.dumps(asdict(rec)) + '\n' for rec in records)
+
+
 def poll(out: Path, interval: float, scope_glob: str) -> None:
     live: dict[str, ScopeRecord] = {}
-    while True:
-        now = time.time()
-        seen: set[str] = set()
-        for scope_dir in glob.glob(scope_glob):
-            unit = os.path.basename(scope_dir)
-            match = SCOPE_NAME.match(unit)
-            peak = _read_peak(scope_dir)
-            if match is None or peak is None:
-                continue
-            seen.add(unit)
-            rec = live.get(unit)
-            if rec is None:
-                pid = _first_pid(scope_dir)
-                total, available = meminfo_gib()
-                rec = live[unit] = ScopeRecord(
-                    unit=unit, slug=match['slug'], role=_role_of(pid), first_seen=now, last_seen=now,
-                    peak_bytes=peak, mem_total_gib=total, mem_available_gib_at_start=available,
-                    threads=_thread_env(pid) if pid else {},
-                )
-            rec.peak_bytes = max(rec.peak_bytes, peak)
-            rec.last_seen = now
-        for unit in [u for u in live if u not in seen]:
-            with out.open('a') as f:
-                f.write(json.dumps(asdict(live.pop(unit))) + '\n')
-        time.sleep(interval)
+    try:
+        while True:
+            live, ended = tick(live, _observe_scopes(scope_glob), time.time(), read_host_memory())
+            _append(out, ended)
+            time.sleep(interval)
+    finally:
+        _append(out, [replace(rec, truncated=True) for rec in live.values()])
 
 
 @dataclass(frozen=True)
@@ -166,6 +235,8 @@ def group_gates(records: list[ScopeRecord], gap: float = GATE_GAP_SECS) -> list[
 
 
 def percentile(values: list[float], q: float) -> float:
+    if not values:
+        raise ValueError('percentile of an empty sample')
     ordered = sorted(values)
     rank = q * (len(ordered) - 1)
     lo, hi = math.floor(rank), math.ceil(rank)
@@ -199,17 +270,23 @@ def summarise(gates: list[Gate], scales: dict[str, float]) -> list[ProjectSummar
                 for k, v in leg.threads.items():
                     threads.setdefault(k, set()).add(v)
         out.append(ProjectSummary(
-            slug=slug, gates=len(mine), p50=statistics.median(peaks), p90=p90, max=max(peaks),
+            slug=slug, gates=len(mine), p50=percentile(peaks, 0.5), p90=p90, max=max(peaks),
             sum_legs_max=max(g.sum_legs_gib for g in mine), recommended_max_gib=math.ceil(p90 * RECOMMEND_HEADROOM),
             scale=scale, scaled_p90=p90 * scale, threads=threads,
         ))
     return out
 
 
-def split_recommendation(summaries: list[ProjectSummary]) -> str:
+@dataclass(frozen=True)
+class SplitVerdict:
+    scaled_p90_sum_gib: float
+    limit_gib: float
+    split: Literal['16/16', '8/8 for Reify']
+
+
+def split_recommendation(summaries: list[ProjectSummary]) -> SplitVerdict:
     total = sum(s.scaled_p90 for s in summaries)
-    verdict = '16/16' if total < SPLIT_SUM_LIMIT_GIB else '8/8 for Reify'
-    return f'sum of scaled p90 = {total:.1f} GiB (limit {SPLIT_SUM_LIMIT_GIB:.0f}) -> {verdict}'
+    return SplitVerdict(total, SPLIT_SUM_LIMIT_GIB, '16/16' if total < SPLIT_SUM_LIMIT_GIB else '8/8 for Reify')
 
 
 def render_report(records: list[ScopeRecord], scales: dict[str, float]) -> str:
@@ -217,6 +294,7 @@ def render_report(records: list[ScopeRecord], scales: dict[str, float]) -> str:
     if not summaries:
         return 'no merge-role gates recorded\n'
     baselines = [r.mem_available_gib_at_start for r in records if r.role == 'merge']
+    verdict = split_recommendation(summaries)
     lines = [
         '| project | gates | p50 GiB | p90 GiB | max GiB | sum-of-legs max | MemoryMax (p90x1.25) | scale | scaled p90 | thread env in force |',
         '|---|---|---|---|---|---|---|---|---|---|',
@@ -229,16 +307,30 @@ def render_report(records: list[ScopeRecord], scales: dict[str, float]) -> str:
         )
     lines += [
         '',
-        split_recommendation(summaries),
-        f'MemAvailable at scope start (merge legs): min {min(baselines):.0f} / median {statistics.median(baselines):.0f} '
+        f'sum of scaled p90 = {verdict.scaled_p90_sum_gib:.1f} GiB (limit {verdict.limit_gib:.0f}) -> {verdict.split}',
+        f'MemAvailable at scope start (merge legs): min {min(baselines):.0f} / median {percentile(baselines, 0.5):.0f} '
         f'/ max {max(baselines):.0f} GiB of {records[0].mem_total_gib:.0f} GiB total',
     ]
+    truncated = sum(r.truncated for r in records)
+    if truncated:
+        lines.append(f'{truncated} scope(s) were still live when the poller stopped; their peak is a lower bound')
     return '\n'.join(lines) + '\n'
+
+
+def _coalesce_units(records: Iterable[ScopeRecord]) -> list[ScopeRecord]:
+    by_unit: dict[str, ScopeRecord] = {}
+    for rec in sorted(records, key=lambda r: r.first_seen):
+        prev = by_unit.get(rec.unit)
+        by_unit[rec.unit] = rec if prev is None else replace(
+            prev, last_seen=max(prev.last_seen, rec.last_seen), peak_bytes=max(prev.peak_bytes, rec.peak_bytes),
+            truncated=rec.truncated,
+        )
+    return list(by_unit.values())
 
 
 def load_records(path: Path, since: float) -> list[ScopeRecord]:
     rows = (json.loads(line) for line in path.read_text().splitlines() if line.strip())
-    return [ScopeRecord(**row) for row in rows if row['first_seen'] >= since]
+    return [rec for rec in _coalesce_units(ScopeRecord(**row) for row in rows) if rec.first_seen >= since]
 
 
 def _parse_scales(items: list[str]) -> dict[str, float]:
@@ -247,6 +339,10 @@ def _parse_scales(items: list[str]) -> dict[str, float]:
         slug, _, factor = item.partition('=')
         scales[slug] = float(factor)
     return scales
+
+
+def _exit_on_sigterm(signum: int, _frame: object) -> None:
+    raise SystemExit(128 + signum)
 
 
 def main(argv: list[str]) -> int:
@@ -262,9 +358,10 @@ def main(argv: list[str]) -> int:
     p_rep.add_argument('--scale', action='append', default=[], metavar='SLUG=FACTOR')
     args = parser.parse_args(argv)
     if args.cmd == 'poll':
+        signal.signal(signal.SIGTERM, _exit_on_sigterm)
         poll(args.out, args.interval, args.scope_glob)
         return 0
-    since = time.mktime(time.strptime(args.since, '%Y-%m-%d')) - time.timezone
+    since = calendar.timegm(time.strptime(args.since, '%Y-%m-%d'))
     sys.stdout.write(render_report(load_records(args.records, since), _parse_scales(args.scale)))
     return 0
 
