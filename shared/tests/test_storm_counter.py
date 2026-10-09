@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import pytest
 
-from shared.storm_counter import StormCounter
+from shared.storm_counter import KeyedStormCounters, StormCounter
 
 
 class _FakeClock:
@@ -52,8 +52,11 @@ class TestReExportShim:
 
     The re-export contract, in the shape task 3688 established for
     ``MCP_MARKUP_PATTERNS``: promote to ``shared``, re-export from the old home,
-    public names unchanged, so fused-memory's importers
-    (``server/markup_tripwire.py``, ``services/memory_service.py``) need no edit.
+    public names unchanged. No fused-memory source module imports the shim any
+    more — ``server/markup_tripwire.py`` stopped at task 4458 and
+    ``services/memory_service.py`` imports ``shared.storm_counter`` directly
+    since task 5102 — so what it still serves is its own test suite and the
+    prose that names it.
 
     This identity is the one thing the OLD suite is uniquely qualified to pin,
     and it is what makes every contract assertion below cover both import paths
@@ -1005,3 +1008,212 @@ class TestPruneReturnsRawCountInDistinctMode:
             'zero distinct keys but one live event — a sweeper that evicted '
             'this counter would discard live window state'
         )
+
+
+# ---------------------------------------------------------------------------
+# KeyedStormCounters — the ONE keyed registry (INV-5, task 5102).
+#
+# Five consumers each hand-rolled "lazily build one StormCounter per key,
+# record, sweep the ones whose prune() returns 0". These pin the registry they
+# now share, through its public surface only.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def keyed(clock):
+    return KeyedStormCounters(time_provider=clock)
+
+
+class TestKeyedThresholds:
+    """Each key thresholds on its OWN events — the reason the registry exists.
+
+    One StormCounter holds a single deque, so a label buys per-key attribution
+    but never a per-key threshold: four events split two-and-two across two
+    keys would fire a pooled counter at threshold 3 (the B10 pooling defect),
+    naming a key that never burst.
+    """
+
+    def test_two_keys_below_threshold_each_never_pool_into_a_fire(self, keyed):
+        results = [
+            keyed.record(key, threshold=3, window_seconds=3600.0, label=key)
+            for key in ('k1', 'k1', 'k2', 'k2')
+        ]
+
+        assert results == [None, None, None, None]
+
+    def test_each_key_fires_on_its_own_third_event(self, keyed):
+        for key in ('k1', 'k2', 'k1', 'k2'):
+            assert keyed.record(key, threshold=3, window_seconds=3600.0) is None
+
+        assert keyed.record('k1', threshold=3, window_seconds=3600.0) is not None
+        assert keyed.record('k2', threshold=3, window_seconds=3600.0) is not None
+
+    def test_the_summary_is_storm_counters_and_names_only_that_keys_labels(
+        self, keyed
+    ):
+        keyed.record('k1', threshold=3, window_seconds=3600.0, label='x')
+        keyed.record('k2', threshold=3, window_seconds=3600.0, label='other')
+        keyed.record('k1', threshold=3, window_seconds=3600.0, label='y')
+        summary = keyed.record('k1', threshold=3, window_seconds=3600.0, label='x')
+
+        assert summary == {
+            'count': 3,
+            'threshold': 3,
+            'window_seconds': 3600.0,
+            'labels': ['x', 'y'],
+        }
+
+
+class TestLazyConstruction:
+    """A counter exists only for a key that has been recorded."""
+
+    def test_nothing_is_tracked_before_the_first_record(self, keyed):
+        assert keyed.tracked_keys == frozenset()
+
+    def test_a_recorded_key_is_tracked(self, keyed):
+        keyed.record('a', threshold=3, window_seconds=100.0)
+
+        assert keyed.tracked_keys == frozenset({'a'})
+
+    def test_tracked_keys_is_a_frozenset_so_a_reader_cannot_evict(self, keyed):
+        keyed.record('a', threshold=3, window_seconds=100.0)
+
+        assert isinstance(keyed.tracked_keys, frozenset)
+
+
+class TestDormantSweep:
+    """Keys are caller-supplied and unbounded, so dormant counters are dropped.
+
+    Eviction is by AGE (``prune() == 0``), which StormCounter.prune's licence
+    makes behaviour-preserving — never "everything but the current key".
+    """
+
+    def test_a_key_idle_past_its_window_is_evicted_by_another_keys_record(
+        self, keyed, clock
+    ):
+        keyed.record('a', threshold=3, window_seconds=100.0)
+        clock.advance(200.0)
+        keyed.record('b', threshold=3, window_seconds=100.0)
+
+        assert keyed.tracked_keys == frozenset({'b'})
+
+    def test_a_key_still_inside_its_window_survives(self, keyed, clock):
+        keyed.record('a', threshold=3, window_seconds=100.0)
+        clock.advance(10.0)
+        keyed.record('b', threshold=3, window_seconds=100.0)
+
+        assert keyed.tracked_keys == frozenset({'a', 'b'})
+
+    def test_the_key_being_recorded_is_never_swept(self, keyed):
+        """Even when its own window is degenerate and holds nothing.
+
+        At ``window_seconds=0`` the event just recorded is already out of the
+        window, so an include-everything sweep would delete the counter the
+        caller is holding a summary from.
+        """
+        keyed.record('a', threshold=3, window_seconds=0.0)
+
+        assert keyed.tracked_keys == frozenset({'a'})
+
+
+class TestSweepCadence:
+    """``sweep_every`` amortizes the sweep; it counts every RECORDED event."""
+
+    def test_an_idle_key_is_evicted_on_the_sweep_every_th_record(self, clock):
+        keyed = KeyedStormCounters(time_provider=clock, sweep_every=3)
+        # Three records of 'a' close one cadence, so the next three of 'b'
+        # are records 1, 2 and 3 of a fresh one.
+        for _ in range(3):
+            keyed.record('a', threshold=99, window_seconds=100.0)
+        clock.advance(200.0)
+
+        keyed.record('b', threshold=99, window_seconds=100.0)
+        assert 'a' in keyed.tracked_keys, 'the 1st record does not sweep'
+        keyed.record('b', threshold=99, window_seconds=100.0)
+        assert 'a' in keyed.tracked_keys, 'nor does the 2nd'
+        keyed.record('b', threshold=99, window_seconds=100.0)
+        assert keyed.tracked_keys == frozenset({'b'}), 'the 3rd one does'
+
+    def test_a_cadence_below_one_is_rejected(self):
+        with pytest.raises(ValueError) as excinfo:
+            KeyedStormCounters(sweep_every=0)
+
+        message = str(excinfo.value)
+        assert 'sweep_every' in message and '0' in message
+
+
+class TestPerCallNow:
+    """``now=`` threads ONE instant through the record and the sweep alike."""
+
+    def test_spread_events_never_fire_under_an_injected_instant(self):
+        keyed = KeyedStormCounters(time_provider=lambda: 0.0)
+
+        results = [
+            keyed.record('a', threshold=3, window_seconds=100.0, now=now)
+            for now in (0.0, 150.0, 300.0)
+        ]
+
+        assert results == [None, None, None], (
+            'read off the frozen provider, all three would share t=0 and fire'
+        )
+
+    def test_the_sweep_ages_keys_against_the_injected_instant(self):
+        keyed = KeyedStormCounters(time_provider=lambda: 0.0)
+
+        keyed.record('a', threshold=3, window_seconds=100.0, now=0.0)
+        keyed.record('b', threshold=3, window_seconds=100.0, now=500.0)
+
+        assert keyed.tracked_keys == frozenset({'b'}), (
+            'swept at the frozen provider instant, a would still look live'
+        )
+
+
+class TestLiveTuning:
+    """Threshold and window are per call (StormCounter's RELOAD SAFETY)."""
+
+    def test_a_threshold_lowered_between_calls_takes_effect_next_call(self, keyed):
+        assert keyed.record('a', threshold=3, window_seconds=3600.0) is None
+
+        summary = keyed.record('a', threshold=2, window_seconds=3600.0)
+
+        assert summary is not None and summary['count'] == 2
+
+
+class TestFireModePassthrough:
+    """Every per-key counter is built in the registry's one ``fire_mode``."""
+
+    def test_fire_mode_defaults_to_rate_limited(self, keyed):
+        assert keyed.fire_mode == 'rate_limited'
+
+    def test_fire_mode_is_readable_back(self):
+        assert KeyedStormCounters(fire_mode='latched').fire_mode == 'latched'
+
+    def test_a_latched_key_fires_once_across_a_full_window_and_recurs(self, clock):
+        keyed = KeyedStormCounters(time_provider=clock, fire_mode='latched')
+
+        def drive(key, offset):
+            clock.now = 1000.0 + offset
+            return keyed.record(key, threshold=3, window_seconds=300.0)
+
+        fired = [drive('p', offset) is not None for offset in (0, 1, 2)]
+        assert fired == [False, False, True]
+        for offset in (100, 200, 300, 400):
+            assert drive('p', offset) is None, (
+                f'still over the line at t={offset}: the latch holds, where '
+                'rate limiting would re-fire at t=400'
+            )
+
+        drive('other', 1000)
+        assert 'p' not in keyed.tracked_keys, 'p drained and was swept'
+
+        recurrence = [drive('p', offset) is not None for offset in (1000, 1001, 1002)]
+        assert recurrence == [False, False, True], 'the recurrence is heard'
+
+    def test_an_unknown_fire_mode_raises_at_construction(self):
+        """Before any record: counters are built lazily, the check is not."""
+        with pytest.raises(ValueError) as excinfo:
+            KeyedStormCounters(fire_mode='latch')  # pyright: ignore[reportArgumentType]
+
+        message = str(excinfo.value)
+        assert "fire_mode='latch'" in message
+        assert 'rate_limited' in message and 'latched' in message
