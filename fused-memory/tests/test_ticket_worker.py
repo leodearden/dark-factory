@@ -2333,6 +2333,119 @@ class TestCreatePathReasonPersisted:
         assert healthy['ticket_id'] not in swept
 
 
+@pytest_asyncio.fixture
+async def configured_interceptor(taskmaster, event_buffer, ticket_store):
+    """An interceptor whose curator is built for real by ``_get_curator``."""
+    ti = TaskInterceptor(
+        taskmaster, None, event_buffer,
+        config=FusedMemoryConfig(), ticket_store=ticket_store,
+    )
+    yield ti
+    for t in list(ti._worker_tasks.values()):
+        if not t.done():
+            t.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await t
+
+
+async def _submit_and_resolve(interceptor, ticket_store, title: str) -> dict:
+    result = await interceptor.submit_task(
+        project_root='/project', title=title, description='d',
+    )
+    return await _poll_ticket_resolved(ticket_store, result['ticket'])
+
+
+class TestCuratorUnavailableReasonPersisted:
+    """A ticket created with NO curator records why the curator was missing.
+
+    This is the path a curator's own degraded-streak alarm cannot see: when
+    ``_get_curator()`` returns None there is no curator left to count.
+    """
+
+    @pytest.mark.asyncio
+    async def test_disabled_curator(self, configured_interceptor, ticket_store):
+        configured_interceptor._config.curator.enabled = False
+
+        row = await _submit_and_resolve(
+            configured_interceptor, ticket_store, 'Disabled Curator',
+        )
+
+        assert row['status'] == 'created'
+        assert row['reason'] == 'create: curator-unavailable: disabled'
+
+    @pytest.mark.asyncio
+    async def test_construction_failure_records_type_never_message(
+        self, configured_interceptor, ticket_store,
+    ):
+        with patch(
+            'fused_memory.middleware.task_interceptor.TaskCurator',
+            side_effect=RuntimeError('qdrant down: secret-path'),
+        ):
+            row = await _submit_and_resolve(
+                configured_interceptor, ticket_store, 'Broken Curator',
+            )
+
+        assert row['status'] == 'created'
+        assert row['task_id']
+        assert row['reason'] == (
+            'create: curator-unavailable: construction-failed: RuntimeError'
+        )
+        assert 'secret-path' not in row['reason']
+
+    @pytest.mark.asyncio
+    async def test_closed_interceptor(self, taskmaster, event_buffer):
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        interceptor = TaskInterceptor(
+            taskmaster, None, event_buffer, config=FusedMemoryConfig(),
+        )
+        await interceptor.close()
+
+        with patch.object(
+            type(interceptor), '_ensure_taskmaster',
+            new=AsyncMock(return_value=taskmaster),
+        ):
+            status, _, reason, _, _ = await interceptor._dispatch_ticket_decision(
+                ticket_id='tkt_closed',
+                project_root='/p',
+                project_id='p',
+                candidate=CandidateTask(title='After Close'),
+                decision=None,
+                kwargs={'title': 'After Close'},
+                metadata=None,
+                curator=None,
+            )
+
+        assert status == 'created'
+        assert reason == 'create: curator-unavailable: closed'
+
+    @pytest.mark.asyncio
+    async def test_reason_is_reevaluated_once_construction_recovers(
+        self, configured_interceptor, ticket_store,
+    ):
+        with patch(
+            'fused_memory.middleware.task_interceptor.TaskCurator',
+            side_effect=RuntimeError('qdrant down'),
+        ):
+            await _submit_and_resolve(
+                configured_interceptor, ticket_store, 'While Broken',
+            )
+
+        recovered = _curator_returning(
+            CuratorDecision(action='create', justification='novel'),
+        )
+        with patch(
+            'fused_memory.middleware.task_interceptor.TaskCurator',
+            return_value=recovered,
+        ):
+            row = await _submit_and_resolve(
+                configured_interceptor, ticket_store, 'After Recovery',
+            )
+
+        assert row['status'] == 'created'
+        assert row['reason'] == 'create: novel'
+
+
 # ---------------------------------------------------------------------------
 # TestCuratorWorkerBatchDrain — step-39 / step-41 / step-43 / step-45
 # ---------------------------------------------------------------------------
