@@ -186,3 +186,52 @@ async def test_an_unsatisfied_local_dependency_keeps_its_reason():
     await _assert_gc_expires(
         _ctx(owner, make_task('7', 'low', ['s.py'], status='in-progress')), 'deps_unsatisfied'
     )
+
+
+# ---------------------------------------------------------------------------
+# D3 — park GC sees this tick's dependency caches
+# ---------------------------------------------------------------------------
+
+
+def _external_dep_world(tmp_path, resolved: tuple[dict[str, str], Exception | None]):
+    """A pending A, held off m.py for good, parks it high; *resolved* is what the resolver answers."""
+    w = park_world(tmp_path)
+    assert w.scheduler.lock_table.try_acquire('H', ['m.py'])
+    w.scheduler.lock_table.install_parks('A', ['m.py'], 'high')
+    owner = make_task('A', 'high', ['m.py'])
+    owner['metadata']['external_deps'] = [EXTERNAL_DEP]
+    w.scheduler.get_tasks = AsyncMock(return_value=[
+        owner,
+        make_task('H', 'low', ['m.py'], status='in-progress'),
+    ])
+    w.scheduler.get_external_statuses = AsyncMock(return_value=resolved)
+    return w
+
+
+@pytest.mark.asyncio
+async def test_a_tick_expires_the_park_of_an_owner_whose_external_dependency_is_not_done(tmp_path):
+    w = _external_dep_world(tmp_path, ({EXTERNAL_DEP: 'in-progress'}, None))
+
+    assert await w.scheduler.acquire_next() is None
+
+    assert event_data_for(w.store, 'reservation_expired', 'A') == [
+        {'reason': 'deps_unsatisfied:external', 'source': 'fairness'},
+    ]
+    assert 'A' not in w.scheduler.get_state_snapshot()['skip_counts']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'resolved',
+    [({}, RuntimeError('resolver down')), ({EXTERNAL_DEP: 'done'}, None)],
+    ids=['resolver-failed', 'done'],
+)
+async def test_a_tick_keeps_the_park_of_an_owner_whose_external_dependency_is_unknown_or_done(
+    tmp_path, resolved
+):
+    w = _external_dep_world(tmp_path, resolved)
+
+    assert await w.scheduler.acquire_next() is None
+
+    assert event_data_for(w.store, 'reservation_expired', 'A') == []
+    assert _stack_owners(w.scheduler, 'm.py') == ['A']
