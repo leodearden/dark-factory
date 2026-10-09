@@ -22,6 +22,7 @@ from test_pure_stdlib_leaves import run_python_child
 from shared.process_identity import (
     Liveness,
     ProcessIdentity,
+    ProcessIdentityUnreadable,
     capture,
     command_name,
     liveness,
@@ -76,12 +77,21 @@ def _kill_and_reap(child: subprocess.Popen) -> None:
     child.wait()
 
 
-def _fake_proc_root(root: Path, *, boot_id: str) -> Path:
+def _fake_proc_root(root: Path, *, boot_id: str | None) -> Path:
     (root / '1').mkdir(parents=True)
-    boot_id_path = root / 'sys' / 'kernel' / 'random' / 'boot_id'
-    boot_id_path.parent.mkdir(parents=True)
-    boot_id_path.write_text(f'{boot_id}\n')
+    if boot_id is not None:
+        boot_id_path = root / 'sys' / 'kernel' / 'random' / 'boot_id'
+        boot_id_path.parent.mkdir(parents=True)
+        boot_id_path.write_text(f'{boot_id}\n')
     return root
+
+
+def _write_pid_files(root: Path, pid: int, *, stat: str) -> list[Path]:
+    pid_dir = root / str(pid)
+    pid_dir.mkdir()
+    (pid_dir / 'stat').write_text(stat)
+    (pid_dir / 'comm').write_text('sleep\n')
+    return [pid_dir / 'stat', pid_dir / 'comm']
 
 
 def test_capture_reads_the_live_identity(live_child):
@@ -190,3 +200,110 @@ def test_printed_liveness_of_the_current_process_reads_alive():
     )
 
     assert printed == 'ALIVE'
+
+
+def _live_stat_line(pid: int) -> str:
+    return (Path('/proc') / str(pid) / 'stat').read_text()
+
+
+def _with_start_ticks(stat: str, start_ticks: str) -> str:
+    head, _, tail = stat.rpartition(')')
+    fields = tail.split()
+    fields[19] = start_ticks
+    return f'{head}) {" ".join(fields)}\n'
+
+
+def _proc_not_mounted(root: Path, identity: ProcessIdentity) -> Path:
+    return root / 'absent'
+
+
+def _every_pid_invisible(root: Path, identity: ProcessIdentity) -> Path:
+    root.mkdir()
+    return root
+
+
+def _pid_files_mode_000(root: Path, identity: ProcessIdentity) -> Path:
+    fake = _fake_proc_root(root, boot_id=identity.boot_id)
+    for path in _write_pid_files(fake, identity.pid, stat=_live_stat_line(identity.pid)):
+        path.chmod(0)
+    return fake
+
+
+def _malformed_stat(stat_of: Callable[[int], str]) -> Callable[[Path, ProcessIdentity], Path]:
+    def build(root: Path, identity: ProcessIdentity) -> Path:
+        fake = _fake_proc_root(root, boot_id=identity.boot_id)
+        _write_pid_files(fake, identity.pid, stat=stat_of(identity.pid))
+        return fake
+
+    return build
+
+
+def _boot_id_missing(root: Path, identity: ProcessIdentity) -> Path:
+    fake = _fake_proc_root(root, boot_id=None)
+    _write_pid_files(fake, identity.pid, stat=_live_stat_line(identity.pid))
+    return fake
+
+
+_ALL_READS = ('capture', 'liveness', 'command_name')
+_STAT_READS = ('capture', 'liveness')
+_UNREADABLE_PROC_ROOTS = [
+    pytest.param(_proc_not_mounted, _ALL_READS, id='proc-not-mounted'),
+    pytest.param(_every_pid_invisible, _ALL_READS, id='hidepid-invisible'),
+    pytest.param(
+        _pid_files_mode_000,
+        _ALL_READS,
+        id='eacces',
+        marks=pytest.mark.skipif(os.geteuid() == 0, reason='root ignores file modes'),
+    ),
+    pytest.param(
+        _malformed_stat(lambda pid: _live_stat_line(pid).replace(')', ' ')),
+        _STAT_READS,
+        id='stat-without-paren',
+    ),
+    pytest.param(
+        _malformed_stat(lambda pid: f'{pid} (sleep) S 1 2 3\n'),
+        _STAT_READS,
+        id='stat-too-few-fields',
+    ),
+    pytest.param(
+        _malformed_stat(lambda pid: _with_start_ticks(_live_stat_line(pid), 'soon')),
+        _STAT_READS,
+        id='stat-start-ticks-not-a-number',
+    ),
+    pytest.param(_boot_id_missing, _STAT_READS, id='boot-id-missing'),
+]
+
+
+def _read(name: str, identity: ProcessIdentity, proc_root: Path) -> object:
+    if name == 'capture':
+        return capture(identity.pid, proc_root=proc_root)
+    if name == 'liveness':
+        return liveness(identity, proc_root=proc_root)
+    return command_name(identity.pid, proc_root=proc_root)
+
+
+@pytest.fixture
+def removable_tmp_path(tmp_path) -> Iterator[Path]:
+    """tmp_path whose mode-000 files are made removable again at teardown."""
+    yield tmp_path
+    for path in tmp_path.rglob('*'):
+        path.chmod(0o700)
+
+
+@pytest.mark.parametrize(('build_proc_root', 'reads'), _UNREADABLE_PROC_ROOTS)
+def test_unreadable_proc_raises_and_never_reads_as_dead(
+    build_proc_root, reads, live_child, removable_tmp_path
+):
+    identity = _captured(live_child.pid)
+    proc_root = build_proc_root(removable_tmp_path / 'proc', identity)
+
+    for name in reads:
+        with pytest.raises(ProcessIdentityUnreadable) as raised:
+            answer = _read(name, identity, proc_root)
+            pytest.fail(f'{name} answered {answer!r} from an unreadable proc root')
+        assert str(raised.value.path) in str(raised.value), name
+        assert raised.value.path.is_relative_to(proc_root), name
+
+
+def test_unreadable_is_not_an_os_error():
+    assert not issubclass(ProcessIdentityUnreadable, OSError)
