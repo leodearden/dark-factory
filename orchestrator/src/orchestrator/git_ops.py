@@ -12559,7 +12559,10 @@ class GitOps:
         flock — this method never consults holder liveness directly). The
         holder-pgid rendezvous file is read ONLY to name the holder in
         that WARNING — a best-effort, fail-open diagnostic hint, never a
-        removal gate.
+        removal gate. The removal overrides git's worktree lock
+        (``--force --force``): the held flock is the liveness gate, and
+        nothing in this repo sets git's ``locked`` marker, so the only one a
+        ``_merge-*`` tree can carry is git's abandoned ``initializing`` one.
 
         That WARNING carries TWO attributions, and ``rendezvous pgid=None``
         in it is EXPECTED, not a defect: this method only reaches the refusal
@@ -12715,8 +12718,12 @@ class GitOps:
                 unlink_lock = True
                 return 'not_present'
             try:
+                # Double force: git refuses a single --force on a locked tree
+                # ('use remove -f -f'), and 'failed' would send it to cleanup's
+                # rmtree, after which prune cannot reclaim the locked entry
+                # (task 4828).
                 rc, _, err = await _run(
-                    ['git', 'worktree', 'remove', str(path), '--force'],
+                    ['git', 'worktree', 'remove', str(path), '--force', '--force'],
                     cwd=self.project_root,
                 )
             except OSError as exc:
@@ -12794,8 +12801,9 @@ class GitOps:
         (its pinned contract — see task 2924's
         ``test_non_worktree_directory_returns_failed``). But ``'failed'`` is
         NOT proof of shape-1 specifically: it is simply *any* non-zero git
-        worktree removal — a ``git worktree lock``-ed tree or a transient
-        filesystem/I/O error yield it too. The fallback deliberately does
+        worktree removal — a transient filesystem/I/O error yields it too
+        (a ``git worktree lock``-ed tree does not: the primitive overrides
+        the lock and removes it). The fallback deliberately does
         NOT try to distinguish the cause; it force-removes any unleased
         ``_merge-`` tree git could not remove, whatever the reason. That is
         safe here because merge worktrees are throwaway/ephemeral by
@@ -12867,8 +12875,9 @@ class GitOps:
         # Crash-safe fallback (task 2922): the guarded git removal returned
         # 'failed' — i.e. ANY non-zero git worktree removal. Most commonly the
         # shape-1 case (the .git/worktrees/<name> admin dir was already removed
-        # by an interrupted teardown), but a locked tree or a transient FS/I/O
-        # error too. We intentionally do NOT distinguish the cause: the
+        # by an interrupted teardown), but a transient FS/I/O error too (a
+        # locked tree is removed by the primitive, never 'failed'). We
+        # intentionally do NOT distinguish the cause: the
         # primitive's lease acquire already confirmed no live holder, so we
         # force-remove this unleased throwaway _merge- tree git could no longer
         # remove, whatever the reason. The band guard is defense-in-depth over
