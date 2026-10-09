@@ -731,6 +731,48 @@ class TestBounceEscalationsNeverFeedTheThrashLadder:
         assert ledger.consecutive_merge_thrash == 1
 
     @pytest.mark.asyncio
+    async def test_two_cap_exceeded_escalations_of_one_branch_are_signature_distinct(
+        self, git_ops: GitOps, config: OrchestratorConfig, git_repo: Path,
+    ) -> None:
+        """The cap arm needs its own guard: its rendered count is a constant.
+
+        It fires at the first count past the cap and then clears the registry,
+        so the ``count=`` it renders is always ``MERGE_BOUNCE_CAP + 1``.
+        Before the fix its reason varied only by branch.
+        """
+        buffers = {'high': collections.deque(), 'normal': collections.deque()}
+        tracker = _make_tracker(
+            git_ops, lane_buffers=buffers, frozen_tip='deadbeefcafe3910',
+        )
+        rebase_spy = AsyncMock(return_value=True)
+        git_ops.rebase_onto_main = rebase_spy  # type: ignore[method-assign]
+
+        outcomes: list[MergeOutcome] = []
+        for _round in range(2):
+            for _ in range(MERGE_BOUNCE_CAP):
+                tracker.bounce_registry.record_bounce('591')
+            outcomes.append(await _escalate_at_tracker(
+                tracker, buffers, _make_req('591', '591', config, git_repo),
+            ))
+        o1, o2 = outcomes
+
+        rebase_spy.assert_not_awaited()
+        for outcome in (o1, o2):
+            assert outcome.status == 'blocked', outcome
+            assert outcome.reason.startswith(NEEDS_REBASE_REASON_PREFIX), outcome.reason
+            assert 'bounce cap exceeded' in outcome.reason, outcome.reason
+            assert outcome.failure_category == '', outcome.failure_category
+        assert _signature(o1) != _signature(o2), (
+            f'{_DISTINCTNESS_FAILURE}; reasons: {o1.reason!r} / {o2.reason!r}'
+        )
+
+        ledger, escalations = _fold_through_thrash_ladder(
+            [o1, o2], config.max_consecutive_merge_thrash,
+        )
+        assert not any(escalations), escalations
+        assert ledger.consecutive_merge_thrash == 1
+
+    @pytest.mark.asyncio
     async def test_two_lane_bounces_of_one_branch_against_one_frozen_tip_do_not_thrash(
         self, git_ops: GitOps, config: OrchestratorConfig,
     ) -> None:
