@@ -500,6 +500,24 @@ class WriteJournalConfig(BaseModel):
         return self
 
 
+class WriteJournalGrowthAlarmConfig(BaseModel):
+    """Ceilings for ``services/journal_growth_alarm.py``.
+
+    Restart-only, in the same posture as ``WriteJournalConfig``: absent from
+    ``config/reload.py::RELOADABLE_FIELDS``. The measured basis of both ceilings
+    lives in the ``write_journal_growth_alarm`` block of
+    ``fused-memory/config/config.yaml``. Task 5405 must re-anchor both values
+    after its rollup lands.
+    """
+
+    #: On-disk bytes of ``write_journal.db`` plus its ``-wal`` / ``-shm`` sidecars.
+    max_file_bytes: int = Field(default=19_327_352_832, gt=0)
+    #: ``write_ops`` rows inserted in the trailing 24 h.
+    max_rows_inserted_per_day: int = Field(default=1_500_000, gt=0)
+    #: Minimum seconds between two checks; the checkpoint loop ticks more often.
+    check_interval_seconds: float = Field(default=3600.0, gt=0)
+
+
 # --- Taskmaster ---
 
 class TaskmasterConfig(BaseModel):
@@ -3357,6 +3375,9 @@ class FusedMemoryConfig(BaseSettings):
     # startup-only prune. Nullability would bucket the whole section as one
     # atomic leaf instead.
     write_journal: WriteJournalConfig = Field(default_factory=WriteJournalConfig)
+    write_journal_growth_alarm: WriteJournalGrowthAlarmConfig = Field(
+        default_factory=WriteJournalGrowthAlarmConfig
+    )
     taskmaster: TaskmasterConfig | None = Field(default=None)
     task_metadata: TaskMetadataConfig = Field(default_factory=TaskMetadataConfig)
     memory_metadata: MemoryMetadataConfig = Field(default_factory=MemoryMetadataConfig)
