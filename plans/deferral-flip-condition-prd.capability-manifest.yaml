@@ -432,11 +432,12 @@ tasks:
       reason: pre-existing best-effort resolver γ consumes
   - name: notice-reaches-human-queue-without-pinning
     binding: substrate CONFIRMED — the born-at-L2 sentinel precedent is orchestrator/src/orchestrator/harness.py::_DIRTY_TREE_ESCALATION_SENTINEL
-      (a stable synthetic task id, severity critical, level=2). Born at L2 means a
-      severity in escalation/src/escalation/models.py::BORN_AT_L2_SEVERITIES, so the
-      notice is severity urgent with category deferral_holder_lost (PRD decision 7,
-      amended at decompose; §12 item 2 records Leo's option of info). The harness
-      sentinel role prefix `orchestrator-` is in escalation/src/escalation/server.py::_HARNESS_SENTINEL_ROLE_PREFIXES,
+      (a stable synthetic task id, severity critical, level=2). The notice is filed
+      in-process at level 2 with severity info and category deferral_holder_lost (Leo,
+      2026-10-09; PRD decision 7 and §12 item 2), a documented exception to escalation/src/escalation/models.py::BORN_AT_L2_SEVERITIES
+      that no reader breaks on (the watcher selects by level; escalation/src/escalation/pins.py
+      classifies info as non-pinning). The harness sentinel role prefix `orchestrator-`
+      is in escalation/src/escalation/server.py::_HARNESS_SENTINEL_ROLE_PREFIXES,
       so `orchestrator-deferral-sweep` is admitted. Dedup in any status reads the
       whole archive (EscalationQueue.get_by_task(status=None), ~1.2 s), so γ seeds
       it once, off the loop, at service start.

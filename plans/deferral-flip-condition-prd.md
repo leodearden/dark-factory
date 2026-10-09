@@ -360,21 +360,25 @@ moves the merge to a separate carrier task, the hand-carry guidance re-stamps th
   | holder liveness unreadable (`ProcessIdentityUnreadable`) | `Hold`, surfaced as `liveness_unknown`; never a flip |
 
   The last row fails safe toward holding, as the milestone gate fails toward withholding.
-- **Notices.** A notice is one born-at-L2 escalation per holder. It is filed against a
+- **Notices.** A notice is one level-2 escalation per holder. It is filed against a
   stable sentinel task id derived from the holder identity
   (`deferral-holder:<host>:<boot_id8>:<pid>:<start_ticks>`), following the
   `_DIRTY_TREE_ESCALATION_SENTINEL` precedent, with `agent_role='orchestrator-deferral-sweep'`
   (a harness sentinel role). The escalation id comes from `make_id` over one fixed key,
   `deferral-holder`, so no per-holder sequence files accumulate.
-  - **Shape.** Born at L2 means a severity in `escalation/src/escalation/models.py::BORN_AT_L2_SEVERITIES`
-    (`critical`, `urgent`); a level-2 `info` record is incoherent to the readers of that
-    contract. The notice uses `severity='urgent'` (the lower of the two) and
-    `category='deferral_holder_lost'`. Its summary says it is informational: nothing waits on
-    it, and the release happens without anyone acting. Leo's word "INFO" (2026-10-08) is
-    carried by that content and by the watcher's `close_only` handling, not by the severity
-    field. Consequence: the escalation watcher pushes every born-at-L2 record to the phone at
-    urgent priority (`escalation/src/escalation/watcher.py::_send_ntfy`). §12 records this as
-    the one choice Leo may want to revisit.
+  - **Shape (Leo, 2026-10-09).** The notice is filed in-process at `level=2` with
+    `severity='info'` and `category='deferral_holder_lost'`. Its summary says it is
+    informational: nothing waits on it, and the release happens without anyone acting. The
+    escalation watcher selects records by level and pushes `info` at default priority, not
+    the urgent push every `critical`/`urgent` record gets
+    (`escalation/src/escalation/watcher.py::_send_ntfy`).
+  - **A documented exception.** `escalation/src/escalation/models.py` states that records
+    are born at L2 when their severity is in `BORN_AT_L2_SEVERITIES` (`critical`, `urgent`). γ
+    adds the exception to that docstring: informational harness-sentinel notices filed
+    in-process at level 2. Checked at decompose: no reader breaks.
+    - `escalation/src/escalation/pins.py` classifies `info` as non-pinning.
+    - The MCP server's born-at-L2 gates are not on the in-process path.
+    - Nothing validates the level/severity pair.
   - It names the holder (pid, best-effort slug), every task it holds with its worktree path and
     branch where one exists (so a human can `/resume` or salvage within grace), and what will
     happen ("released to `pending` at <t>" / "released").
@@ -718,7 +722,7 @@ and the dashboard over its own fixture dicts. No row patches private names (Test
 | 10 | Legacy shape [β] | a row inserted `deferred` with no record | `legacy_unknown` re-stamp accepted with `deferred_at=null`; the same kind on a recorded row → `server_only_kind` |
 | 11 | Raw-SQL exit [β] | deferred row hit by the candidate-key self-heal | cancelled, no `metadata.deferral` |
 | 12 | Liveness [α] | a spawned process; its identity with a forged old `boot_id`; with another `host` | `ALIVE`; `DEAD` (reboot is death); `OTHER_HOST` |
-| 13 | Holder lost [γ] | `claude`-named helper process holds a row (`grace_secs=600`), then is killed; fake clock | first pass after death → one `deferral_holder_lost` notice (born at L2, severity `urgent`), row still `deferred`; pass 601 s after first-seen-dead → row `pending`, `deferral_expired{cause:'holder_lost'}`; no second notice |
+| 13 | Holder lost [γ] | `claude`-named helper process holds a row (`grace_secs=600`), then is killed; fake clock | first pass after death → one `deferral_holder_lost` notice (level 2, severity `info`), row still `deferred`; pass 601 s after first-seen-dead → row `pending`, `deferral_expired{cause:'holder_lost'}`; no second notice |
 | 14 | Live holder is silent [γ] | live holder; fake clock advanced 7 days | `Hold` on every pass; no escalation filed; not in `needs_human`; never flipped |
 | 15 | `expires_at` lapses [γ] | `until_condition`, `expires_at` in the past | one pass → `pending`; no escalation; `deferral_expired{cause:'expired'}` |
 | 16 | Paused [γ] | row as in 13, scheduler paused | notice filed ("released on resume"); no flip; `would_flip=1`; first unpaused pass flips |
@@ -749,7 +753,7 @@ and the dashboard over its own fixture dicts. No row patches private names (Test
 | Typed sub-model registry | `shared/src/shared/task_metadata.py::register_metadata_submodel`; self-registering `deploy_state.py`, `capability_manifest.py` |
 | A sweep host that survives a halt | `orchestrator/src/orchestrator/background_service.py::BackgroundService` (sleep-first loop: period = interval + pass time); `Harness._build_lifecycle_registry` registers `stranded-reconcile` and others; the paused branch says background services keep running |
 | Sweep config tier | `orchestrator/src/orchestrator/config.py::RELOADABLE_FIELDS` holds no sweep interval; the service reads its interval once at registration. The new keys are restart-only |
-| Born-at-L2 shape | `escalation/src/escalation/models.py::BORN_AT_L2_SEVERITIES` = {`critical`, `urgent`}; the in-process `EscalationQueue.submit` writes what it is given; `escalation/src/escalation/watcher.py::_send_ntfy` pushes `critical`/`urgent`/`blocking` at urgent priority |
+| Born-at-L2 shape, and the notice's exception to it | `escalation/src/escalation/models.py::BORN_AT_L2_SEVERITIES` = {`critical`, `urgent`}; `escalation/src/escalation/pins.py` classifies `info` as non-pinning; the in-process `EscalationQueue.submit` writes what it is given; `escalation/src/escalation/watcher.py::_send_ntfy` pushes `critical`/`urgent`/`blocking` at urgent priority |
 | Pause predicate | `orchestrator/src/orchestrator/scheduler.py::Scheduler.is_paused` |
 | Live-claimant predicate | `shared/src/shared/task_claimant.py::has_live_claimant(task, now, ttl)`, as used by the dispatch gate |
 | Sentinel born-at-L2 escalation precedent | `harness.py::_DIRTY_TREE_ESCALATION_SENTINEL`; harness sentinel role prefix `orchestrator-` (`escalation/src/escalation/server.py::_HARNESS_SENTINEL_ROLE_PREFIXES`) |
@@ -855,7 +859,7 @@ same file; the dependency edges serialize any re-grep overlap.
     check after fused-memory restarts onto β is ζ's step 1.
 
 - **γ — Expiry sweep, client mapping, de-flake scope (orchestrator).** [6526; medium; normal;
-  ~1,100–1,400 LOC; 12 files] depends on α and β. Intermediate: it unlocks ζ.
+  ~1,100–1,400 LOC; 13 files] depends on α and β. Intermediate: it unlocks ζ.
   - Files:
     - `orchestrator/src/orchestrator/deferral_sweep.py` (new: liveness read, `decide`, pass,
       sentinel notices, merge-queue and train check, streak, edge-triggered pass event);
@@ -870,6 +874,8 @@ same file; the dependency edges serialize any re-grep overlap.
     - `orchestrator/tests/test_deferral_sweep.py` (rows 13–21, 28) and
       `orchestrator/tests/test_flake_ledger.py`;
     - `skills/escalation-watcher/SKILL.md` (the `close_only` row for `deferral_holder_lost`);
+    - `escalation/src/escalation/models.py` (the documented exception for the level-2 `info`
+      notice);
     - `docs/task-escalation-state-spec.md` (the `deferred` row: owner per kind, the sweep as the
       only automatic exit; a pointer to the `docs/task-authoring.md` recipe, not a copy);
     - `ARCHITECTURE.md` (state diagram and planning-mode prose);
@@ -975,7 +981,8 @@ same file; the dependency edges serialize any re-grep overlap.
      `procedural_defer_a_pinned_task_to_guard_a_hand_carry.md` and
      `feedback_hand_carry_procedure.md`, and their two `MEMORY.md` index lines, to point at the
      `docs/task-authoring.md` recipe.
-  9. Confirm the holder-notice severity Leo ruled (§12 item 2) matches what γ shipped.
+  9. Confirm the step-4 notice was a level-2 `info` record, delivered as a default-priority
+     push (§12 item 2).
   10. Cancel every scratch task.
 
   **Scratch-task recipe.** `submit_task(planning_mode=True, task_kind='normal', priority='low',
@@ -1093,11 +1100,12 @@ a manifest seat (sonnet) and a fresh critic (opus). Main had moved from `5b645d8
    the agent that owns the task. β, γ and δ complete on their boundary rows, γ and δ became
    intermediates, and ζ became the integration gate that orders the restarts (decision 12,
    §9). ε's live check stays in ε, because it reads only and needs no restart.
-2. **Notice severity.** "Born-at-L2 INFO" is incoherent to the escalation package: born at L2
-   means `critical` or `urgent`. The notice is `urgent` with the informational category
-   `deferral_holder_lost` (decision 7). **Leo may prefer** a default-priority phone push, which
-   needs `severity='info'` at level 2 and an explicit exception to the models' contract. That
-   change belongs in γ's text, before γ dispatches.
+2. **Notice severity.** The decompose first filed the notice as `urgent`, because born at L2
+   means `critical` or `urgent` in the escalation package. That made every abandoned hold an
+   urgent phone push. **Leo ruled `info` (2026-10-09):** a level-2 `info` record with a
+   default-priority push, under a documented exception to the models' contract (decision 7).
+   A reader check found nothing that breaks. 6526's and 6529's texts were updated the same
+   day. The failure-streak escalation stays `urgent`.
 3. **Sweep interval ownership.** "Two sweep intervals" had no owner upstream of α and ε (the
    manifest's two `producer-downstream` FAILs). α now owns `DEFAULT_SWEEP_INTERVAL_SECS` and
    `LAPSE_OVERDUE_AFTER_SECS`, and γ's config default reads the former (§5.1).

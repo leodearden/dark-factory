@@ -95,7 +95,7 @@ has no inversion.
 | `scheduler-forwards-expected-stamped-at` | capability→producer, β upstream — `Scheduler.set_task_status` forwards it, with optional `agent_id` and `client_op_id` (§5.4, amended) | PASS |
 | `sweep-config-keys` | capability→producer — three restart-only keys (not green-tier: `config.py::RELOADABLE_FIELDS` holds no sweep interval); the interval default reads α's constant; manual | PASS |
 | `dead-holder-named-in-notice` | substrate CONFIRMED — `resolve_session_slug_for_pid` | PASS |
-| `notice-reaches-human-queue-without-pinning` | substrate CONFIRMED — `_DIRTY_TREE_ESCALATION_SENTINEL` precedent; severity `urgent` (born at L2 ⟺ `BORN_AT_L2_SEVERITIES`), category `deferral_holder_lost`; archive dedup seeded once off-loop | PASS |
+| `notice-reaches-human-queue-without-pinning` | substrate CONFIRMED — `_DIRTY_TREE_ESCALATION_SENTINEL` precedent; level 2, severity `info` (Leo, 2026-10-09; a documented exception to `BORN_AT_L2_SEVERITIES`, which no reader breaks on), category `deferral_holder_lost`; archive dedup seeded once off-loop | PASS |
 | `live-claimant-guard` | substrate CONFIRMED — `shared/src/shared/task_claimant.py::has_live_claimant` | PASS |
 | `merge-in-flight-lookup` | substrate CONFIRMED — `SpeculativeMergeWorker.snapshot` entries by `task_id` | PASS |
 | `pause-predicate` | substrate CONFIRMED — `Scheduler.is_paused` | PASS |
