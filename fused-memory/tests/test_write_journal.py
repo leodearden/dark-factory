@@ -11,9 +11,9 @@ import pytest
 import pytest_asyncio
 
 from fused_memory.backends.llm_token_usage import LlmTokenUsage
-from fused_memory.services.memory_service import ReferentFinding
 from fused_memory.services.write_journal import OPERATOR_TELEMETRY_QUERY, WriteJournal
 from fused_memory.utils.canonical_labels import Referent
+from fused_memory.utils.referent_verification import ReferentFinding
 
 
 @pytest_asyncio.fixture
