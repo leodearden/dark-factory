@@ -1437,6 +1437,8 @@ extra:
 matrix
 ## Synthesis
 
+_The census does not parse this section: nothing proposed in it has been applied to the codebook._
+
 prose
 
 ## Filed Tasks

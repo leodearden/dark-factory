@@ -1149,6 +1149,13 @@ SECTION_COST = "cost"
 Never rendered -- they exist so a caller can ask WHICH blocks a report
 carries and in what order without matching on the English inside them."""
 
+SYNTHESIS_NOT_APPLIED_NOTICE = (
+    "_The census does not parse this section: nothing proposed in it has been "
+    "applied to the codebook._"
+)
+"""Runner-authored first line of every ``## Synthesis`` body, until
+plans/census-incremental-prd.md L10 retires or reconciles it."""
+
 
 @dataclass(frozen=True)
 class ReportSection:
@@ -1531,7 +1538,10 @@ def census_report_sections(record: Mapping[str, Any]) -> tuple[ReportSection, ..
     # immediately. The golden pins `matrix\n## Synthesis`; normalising this
     # during a refactor is the one plausible way to break byte-identity while
     # every structural assertion still passes.
-    emit(SECTION_SYNTHESIS, ["## Synthesis", "", record["synthesis_md"]])
+    emit(
+        SECTION_SYNTHESIS,
+        ["## Synthesis", "", SYNTHESIS_NOT_APPLIED_NOTICE, "", record["synthesis_md"]],
+    )
 
     filed_tasks = ["", "## Filed Tasks", ""]
     if dry_run is not None:
