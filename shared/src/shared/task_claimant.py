@@ -38,6 +38,7 @@ __all__ = [
     'DEFAULT_CLAIMANT_HEARTBEAT_TTL',
     'compose_claimant_run_id',
     'has_live_claimant',
+    'is_stale_hygiene_tier_claimant',
     'is_stranded',
     'is_stranded_any_status',
     'is_stranded_blocked',
@@ -48,6 +49,17 @@ __all__ = [
 # D6.2), shared by the reconcile/ground-truth, dashboard and fused-memory readers. The scheduler's
 # dispatch gate deliberately uses its own config knob, claimant_liveness_ttl_secs (300s).
 DEFAULT_CLAIMANT_HEARTBEAT_TTL: timedelta = timedelta(minutes=10)
+
+# D3's hygiene tier is an ALLOWLIST, so a new status stays excluded until deliberately classified
+# (docs/prds/claimant-invariant-enforcement.md D2/D3 and its status-producer audit). Excluded:
+#   in-progress  — the task-2588 un-claim class D2 rejects; is_stranded's (the reaper's) domain.
+#   infra-hold   — legitimately carries weeks-stale claimants by design.
+#   blocked      — owned by the stranded-blocked sweep (is_stranded_blocked /
+#                  Scheduler._phase_redispatch_stranded_blocked), which clears the claimant itself.
+#   done/cancelled — the invariant tier, violates_terminal_claimant_invariant, not hygiene.
+_HYGIENE_TIER_STATUSES: frozenset[TaskStatus] = frozenset(
+    {TaskStatus.PENDING, TaskStatus.DEFERRED, TaskStatus.REVIEW, TaskStatus.MERGE_DEFERRED}
+)
 
 
 def compose_claimant_run_id(run_id: str, session_id: str, owner_pid: int) -> str:
@@ -243,3 +255,18 @@ def violates_terminal_claimant_invariant(task: Mapping) -> bool:
     TTL: freshness is irrelevant to the terminal tier.
     """
     return str(task.get('status')) in TERMINAL and _carries_claimant(task)
+
+
+def is_stale_hygiene_tier_claimant(task: Mapping, now: datetime, ttl: timedelta) -> bool:
+    """Return True when *task* is in D3's hygiene tier: a stale claimant on an allowlisted status.
+
+    Repairable, never alarmable. Named for the tier rather than for
+    "non-terminal": several non-terminal statuses are deliberately excluded
+    (see ``_HYGIENE_TIER_STATUSES``). Staleness is read through
+    :func:`is_stranded_any_status` (C4-E6).
+    """
+    return (
+        str(task.get('status')) in _HYGIENE_TIER_STATUSES
+        and _carries_claimant(task)
+        and is_stranded_any_status(task, now, ttl)
+    )
