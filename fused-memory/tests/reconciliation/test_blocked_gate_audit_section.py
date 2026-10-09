@@ -20,6 +20,7 @@ from fused_memory.reconciliation.blocked_gate_audit_section import (
     render_blocked_gate_audit_section,
     select_blocked_gate_tasks,
 )
+from fused_memory.reconciliation.prompts.stage2 import build_stage2_system_prompt
 
 STAMP = '2026-08-19T05:42:35Z'
 
@@ -220,3 +221,11 @@ class TestRenderBlockedGateAuditSection:
         assert len(_rendered_ids(section)) == MAX_BLOCKED_GATE_AUDIT_RENDERED
         assert '_NOTE' not in section
         assert _cap_records(caplog) == []
+
+
+class TestStage2PromptNamesTheAudit:
+    """The payload section never ships without the system prompt telling the model to review it."""
+
+    @pytest.mark.parametrize('project_id', ['dark_factory', 'autopilot_video'])
+    def test_prompt_names_the_section_header(self, project_id):
+        assert BLOCKED_GATE_AUDIT_HEADER in build_stage2_system_prompt(project_id)
