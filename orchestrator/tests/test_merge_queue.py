@@ -5941,8 +5941,8 @@ class TestLaneSceneVerifyIsNotCalledDead:
 
         The in-flight abort poll measures its no-progress budget off the
         FakeClock's ``monotonic()``, which the lane's own periodic loops push
-        forward at event-loop speed, so that budget buys no dependable real
-        time. What keeps a verify alive is content progress under its merge
+        forward by far more than a poll per real second, so that budget buys
+        no dependable real time. What keeps a verify alive is content progress under its merge
         worktree, as a healthy verify shows. With the budget shrunk to ten
         polls, a verify parked for a real second must still run once, not be
         called dead and requeued.
