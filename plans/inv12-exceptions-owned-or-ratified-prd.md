@@ -664,9 +664,11 @@ mem0-update prefix configs;
 
 ## Appendix B — inline scanner design notes
 
-Rationale behind the inline scanner that no caller relies on and no test pins,
-kept here so the code carries only its contract. One bullet per note, each
-citing the symbol it explains.
+Rationale behind the inline scanner that no caller relies on and no test pins.
+A note lands here when it is moved out of the code; the scanner's docstrings
+still carry rationale that has not been moved, so a note's absence from this
+list says nothing about whether one exists. One bullet per note, each citing
+the symbol it explains.
 
 - `scripts/inline_suppression_refusal.py::InstrumentFailure` is one exception type for
   every exit-2 cause, not one per cause. Splitting by cause would hand `main`
