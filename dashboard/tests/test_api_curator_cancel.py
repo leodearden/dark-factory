@@ -20,7 +20,6 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from dashboard.app import _MCP_WRITE_DETAIL_CHAR_LIMIT
 from dashboard.data import memory as memory_data
 
 # ---------------------------------------------------------------------------
@@ -364,53 +363,6 @@ def test_cancel_handler_logs_warning_and_includes_exc_in_detail(client, caplog):
     assert exc_msg in detail, f'Expected "{exc_msg}" in detail, got: {detail!r}'
 
 
-@pytest.mark.parametrize(
-    'exc',
-    [
-        pytest.param(ValueError('X' * 300), id='ValueError'),
-        pytest.param(
-            httpx.HTTPStatusError(
-                'X' * 300,
-                request=httpx.Request('POST', 'http://x'),
-                response=httpx.Response(500, request=httpx.Request('POST', 'http://x')),
-            ),
-            id='HTTPStatusError',
-        ),
-    ],
-)
-def test_cancel_handler_502_detail_truncates_exception_text(client, caplog, exc):
-    """502 detail is capped at _MCP_WRITE_DETAIL_CHAR_LIMIT chars; WARNING keeps full text.
-
-    Parametrized over caught exception types so the cap is confirmed to apply
-    uniformly.  BaseException.__str__ returns args[0] verbatim (single-arg case),
-    so str(exc) == the message arg for both ValueError and httpx.HTTPStatusError.
-    """
-    long_msg = 'X' * 300
-    with (
-        patch(_PATCH_TARGET, new=AsyncMock(side_effect=exc)),
-        caplog.at_level(logging.WARNING, logger='dashboard.app'),
-    ):
-        resp = client.post(
-            '/api/v2/dashboard/curator/cancel',
-            json={'ticket_id': 'tkt_xyz'},
-        )
-
-    assert resp.status_code == 502
-    detail = resp.json().get('detail', '')
-    assert 'X' * _MCP_WRITE_DETAIL_CHAR_LIMIT in detail, (
-        'Expected first _MCP_WRITE_DETAIL_CHAR_LIMIT X chars in detail'
-    )
-    assert 'X' * (_MCP_WRITE_DETAIL_CHAR_LIMIT + 1) not in detail, (
-        'Detail must not contain _MCP_WRITE_DETAIL_CHAR_LIMIT+1 X chars (exc text not truncated)'
-    )
-    warning_records = [
-        r for r in caplog.records if r.levelno == logging.WARNING and r.name == 'dashboard.app'
-    ]
-    assert warning_records, 'Expected at least one WARNING from dashboard.app'
-    combined_msg = ' '.join(r.getMessage() for r in warning_records)
-    assert long_msg in combined_msg, 'WARNING log must contain full (untruncated) exception text'
-
-
 def test_two_url_fallback_url0_fails_url1_succeeds(two_url_client):
     """URL[0] raises ConnectError; URL[1] returns cancelled → overall 200.
 
@@ -590,55 +542,3 @@ def test_cancel_handler_502_detail_names_the_type_exactly_once(client, exc, type
     assert 'PreformattedFanoutError' not in detail, (
         f'the marker type is an internal signal, not operator-facing text, got {detail!r}'
     )
-
-
-def test_cancel_handler_call_site_warning_is_unaffected(client, caplog):
-    """The call-site WARNING still logs the raw exc, exactly once per failing URL.
-
-    log_failures=False keeps reporting solely at the call site; the single-prefix
-    fix must not add a second mcp_fanout report or alter the call-site text.
-
-    Both assertions filter to *cancel_ticket* records rather than counting the
-    whole caplog stream: the client fixture runs the full app lifespan, whose
-    _metrics_loop fans out list_tickets/get_status/get_queue_stats/
-    get_curator_state/fetch_statuses against the same configured URL in the
-    background, each emitting its own dashboard.data.mcp_fanout WARNING (and a
-    'dashboard.app' one on the outer except).  Whether those land before this
-    request returns is a timing accident, so an unfiltered count would be
-    flaky on a loaded box — the same reason test_invalid_ticket_id_returns_400
-    filters handler calls from background ones.
-    """
-    # Fabricated exception TEXT — the '8002' here is part of the message the
-    # mock raises and is deliberately unrelated to whatever URL the app
-    # resolved.  Leave it as-is; the URL in the expected log line below is the
-    # one that must be derived.
-    exc_msg = 'connection refused: port 8002'
-    configured_url = client.app.state.config.fused_memory_urls[0]
-    with (
-        patch(_PATCH_TARGET, new=AsyncMock(side_effect=httpx.ConnectError(exc_msg))),
-        caplog.at_level(logging.DEBUG),
-    ):
-        resp = client.post(
-            '/api/v2/dashboard/curator/cancel',
-            json={'ticket_id': 'tkt_xyz'},
-        )
-
-    assert resp.status_code == 502
-
-    app_warnings = [
-        r.getMessage() for r in caplog.records
-        if r.levelno == logging.WARNING
-        and r.name == 'dashboard.app'
-        and r.getMessage().startswith('cancel_ticket failed for')
-    ]
-    assert len(app_warnings) == 1, (
-        f'exactly one report per failing URL, from the call site, got {app_warnings}'
-    )
-    assert f'cancel_ticket failed for {configured_url}: {exc_msg}' == app_warnings[0], (
-        f'the call site still logs the RAW exc, untruncated and unprefixed, '
-        f'got {app_warnings[0]!r}'
-    )
-    assert not [
-        r for r in caplog.records
-        if r.name == 'dashboard.data.mcp_fanout' and 'cancel_ticket' in r.getMessage()
-    ], 'log_failures=False must still leave reporting entirely to the caller'

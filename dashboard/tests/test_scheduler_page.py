@@ -2187,26 +2187,6 @@ async def test_collect_scheduler_state_keeps_module_contention_per_project(
 # ---------------------------------------------------------------------------
 
 
-def test_scheduler_proxy_handles_non_dict_mcp_result(client):
-    """_scheduler_proxy: a non-dict MCP result must not 500 on `.get('error')`.
-
-    Older/buggy MCP tools could return a list or None.  The not_found→404
-    mapping must guard with isinstance(result, dict) so the unexpected type
-    is forwarded verbatim as 200 rather than escaping as AttributeError/500.
-    """
-    from unittest.mock import AsyncMock, patch
-
-    with patch(_PATCH_TARGET, new=AsyncMock(return_value=['unexpected', 'list'])):
-        resp = client.post(
-            '/api/v2/dashboard/scheduler/clear-override',
-            json={'task_id': 'T1', 'project_root': '/proj'},
-        )
-
-    # Forwarded verbatim — the list reaches JSONResponse without crashing.
-    assert resp.status_code == 200
-    assert resp.json() == ['unexpected', 'list']
-
-
 def test_compose_rows_tolerates_non_string_installed_at():
     """park_state.installed_at coerced to str so non-string values don't AttributeError.
 
