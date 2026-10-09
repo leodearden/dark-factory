@@ -12,6 +12,7 @@ import socket
 import sys
 import threading
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -24,7 +25,10 @@ from functools import partial  # noqa: E402
 from shared.mcp_markup_middleware import RepairPolicy  # noqa: E402
 from shared.systemd_listeners import take_systemd_listeners  # noqa: E402
 
-from fused_memory.config.schema import FusedMemoryConfig  # noqa: E402
+from fused_memory.config.schema import (  # noqa: E402
+    DedupOutageDetectorConfig,
+    FusedMemoryConfig,
+)
 from fused_memory.reconciliation.audit_trail_rotation import (  # noqa: E402
     memory_service_archive,
 )
@@ -1079,6 +1083,7 @@ async def run_server():
             _janitor_primary_root = str(
                 Path(_janitor_primary_root).expanduser().resolve(),
             )
+        dedup_outage_cfg = _dedup_outage_detector_config(config)
         ticket_janitor = TicketJanitor(
             ticket_store,
             cooldown_secs=janitor_cfg.cooldown_seconds,
@@ -1093,7 +1098,7 @@ async def run_server():
                 if task_interceptor is not None else None
             ),
             known_projects=_known_projects_map,
-            dedup_outage=janitor_cfg.dedup_outage,
+            dedup_outage=dedup_outage_cfg,
         )
         janitor_task = asyncio.create_task(
             ticket_janitor.run_loop(janitor_cfg.interval_seconds),
@@ -1104,7 +1109,7 @@ async def run_server():
             janitor_cfg.interval_seconds,
             janitor_cfg.cooldown_seconds,
             janitor_cfg.batch_limit,
-            janitor_cfg.dedup_outage.enabled,
+            dedup_outage_cfg is not None and dedup_outage_cfg.enabled,
         )
     else:
         logger.info('  Ticket janitor: disabled')
@@ -1610,8 +1615,6 @@ async def _run_checkpoint_cycle(targets: list[tuple[str, object]]) -> None:
     from :func:`_periodic_checkpoint_loop` so unit tests can exercise the
     bookkeeping without waiting for ``_CHECKPOINT_INTERVAL``.
     """
-    from datetime import UTC, datetime
-
     now_iso = datetime.now(UTC).isoformat()
     for name, fn in targets:
         try:
@@ -1841,10 +1844,22 @@ def _resolve_curator_escalator_state_path(config: FusedMemoryConfig) -> Path:
     return Path('./data/curator_escalator_state.json')
 
 
+def _dedup_outage_detector_config(
+    config: FusedMemoryConfig,
+) -> DedupOutageDetectorConfig | None:
+    """The janitor's dedup-outage detector config, or None with the curator disabled.
+
+    A deliberately disabled curator resolves every ticket as a fast create
+    with no combine, which is the outage signature; there is no dedup to lose.
+    ``curator.enabled`` is restart-only, so deciding once at wiring is exact.
+    """
+    if not config.curator.enabled:
+        return None
+    return config.curator.janitor.dedup_outage
+
+
 def _mint_curator_run_id() -> str:
     """A readable per-process curator run id: a fused-memory restart is a run boundary."""
-    from datetime import UTC, datetime  # noqa: PLC0415
-
     return f'fused-memory-{datetime.now(UTC):%Y%m%dT%H%M%SZ}-{os.getpid()}'
 
 
