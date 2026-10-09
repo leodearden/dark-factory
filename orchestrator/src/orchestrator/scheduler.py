@@ -5569,7 +5569,7 @@ class Scheduler:
         block same-tier installs (INV-3) until release, which is where
         partial installs came from.  ``Scheduler.release`` keeps its
         defensive clear only for parks installed AFTER dispatch, e.g. a
-        reserve_now armed on a running task.
+        park rehydrated at startup for a task that is already running.
         """
         self._skip_count.pop(task_id, None)
         self._streak_park_install_blocked.clear(task_id)
@@ -6021,7 +6021,7 @@ class Scheduler:
                     pin_queue_changed = True
 
             # --- reserve_now diffs (False→True only; True→False is handled by
-            # --- reserve_now_consumed at the short-circuit emit site)
+            # --- reserve_now_consumed / reserve_now_refused at the short-circuit)
             prev_rn = prev_row.reserve_now if prev_row else False
             cur_rn = cur_row.reserve_now if cur_row else False
             if not prev_rn and cur_rn:
@@ -7382,91 +7382,90 @@ class Scheduler:
     async def _phase_reserve_now(self, ctx: TickContext) -> object:
         """Snapshot pre-short-circuit overrides, then reserve-now.
 
-        Reads: ``ctx.overrides``, ``ctx.tasks_by_id``, ``ctx.status_map``,
-        ``ctx.effective_priorities`` (parks install at, or an owner's
-        lower-tier park is raised to, the effective tier).
-        Writes: ``ctx.overrides_for_diff`` (snapshot BEFORE the
-        short-circuit below), then mutates ``ctx.overrides`` in place via
-        the reserve-now short-circuit: for any task with reserve_now=1,
-        eagerly install parks on its modules then clear the flag. This is
-        single-tick fire-and-forget — the parks survive until the owner-GC
-        sweep evicts them (owner goes terminal/missing or its deps lapse).
-        Always continues.
+        Reads: ``ctx.overrides``, the ctx fields the park-hold predicate
+        (:meth:`_park_gc_reason`) reads, and ``ctx.effective_priorities``
+        (parks install at, or an owner's lower-tier park is raised to, the
+        effective tier).  Writes: ``ctx.overrides_for_diff`` (snapshot
+        BEFORE the short-circuit below), then mutates ``ctx.overrides`` in
+        place via the reserve-now short-circuit: every armed flag is
+        consumed this tick.  reserve_now installs parks only for an owner
+        the park-hold predicate accepts; any other owner is refused with
+        ``reserve_now_refused`` {reason} and nothing installs (esc-6040-7
+        D6, restoring task 1229's stated intent).  The parks then live as
+        long as that predicate holds.  Always continues.
         """
         ctx.overrides_for_diff = dict(ctx.overrides)
+        store = self._override_store
+        if store is None:
+            return _CONTINUE
 
-        if self._override_store:
-            for rid, rrow in list(ctx.overrides.items()):
-                if not rrow.reserve_now:
-                    continue
-                if rid not in ctx.tasks_by_id:
-                    continue
-                if ctx.status_map.get(rid) in TERMINAL_STATUSES:
-                    continue
-                r_task = ctx.tasks_by_id[rid]
-                r_modules = self._get_modules(r_task)
-                r_tier = ctx.effective_priorities.get(
-                    rid, coerce_tier(r_task.get('priority'))
+        for rid, rrow in list(ctx.overrides.items()):
+            if not rrow.reserve_now:
+                continue
+            refusal = self._park_gc_reason(ctx, rid)
+            if refusal is not None:
+                self._consume_reserve_now(store, ctx, rid)
+                if self.event_store:
+                    self.event_store.emit(
+                        EventType.reserve_now_refused,
+                        task_id=rid,
+                        data={'reason': refusal},
+                    )
+                continue
+            r_task = ctx.tasks_by_id[rid]
+            r_modules = self._get_modules(r_task)
+            r_tier = ctx.effective_priorities.get(
+                rid, coerce_tier(r_task.get('priority'))
+            )
+            # Consume the flag BEFORE installing parks.  The opposite order
+            # risks a duplicate reserve_now_consumed event if the clear
+            # fails after a successful install, whereas a re-run install
+            # is harmless: ModuleLockTable.install_parks is idempotent per
+            # owner.
+            #
+            # In-process exceptions from install_parks are handled separately:
+            # the flag is restored via set_override so the next tick retries.
+            self._consume_reserve_now(store, ctx, rid)
+            try:
+                installed, _evicted = self.lock_table.install_parks(
+                    rid, r_modules, r_tier
                 )
-                # Clear the flag BEFORE installing parks.  The opposite order
-                # risks a duplicate reserve_now_consumed event if the clear
-                # fails after a successful install, whereas a re-run install
-                # is harmless: ModuleLockTable.install_parks is idempotent per
-                # owner.
-                #
-                # In-process exceptions from install_parks are handled separately:
-                # the flag is restored via set_override so the next tick retries.
-                self._override_store.clear_override(
-                    self._project_root, rid, field='reserve_now'
+                if self.event_store and installed:
+                    self.event_store.emit(
+                        EventType.reserve_now_consumed,
+                        task_id=rid,
+                        data={'modules': installed, 'priority': r_tier},
+                    )
+            except Exception:
+                logger.warning(
+                    'reserve_now: install_parks failed for task %s; restoring reserve_now flag',
+                    rid,
+                    exc_info=True,
                 )
                 try:
-                    installed, _evicted = self.lock_table.install_parks(
-                        rid, r_modules, r_tier
-                    )
-                    if self.event_store and installed:
-                        self.event_store.emit(
-                            EventType.reserve_now_consumed,
-                            task_id=rid,
-                            data={'modules': installed, 'priority': r_tier},
-                        )
-                    # Reflect the cleared flag in the in-memory snapshot so
-                    # downstream diff-detection doesn't spuriously re-emit for
-                    # this tick.
-                    ctx.overrides[rid] = OverrideRow(
-                        boost_tier=rrow.boost_tier,
-                        pinned=rrow.pinned,
-                        pin_order=rrow.pin_order,
-                        reserve_now=False,
-                        ttl_until=rrow.ttl_until,
-                    )
+                    store.set_override(self._project_root, rid, reserve_now=True)
                 except Exception:
+                    # Restore failed — the store still holds the consumed
+                    # flag, and so does ctx.overrides, so the diff-layer
+                    # does not fabricate a spurious priority_override_cleared
+                    # event next tick.
                     logger.warning(
-                        'reserve_now: install_parks failed for task %s; restoring reserve_now flag',
+                        'reserve_now: failed to restore reserve_now flag for task %s',
                         rid,
                         exc_info=True,
                     )
-                    try:
-                        self._override_store.set_override(
-                            self._project_root, rid, reserve_now=True
-                        )
-                    except Exception:
-                        logger.warning(
-                            'reserve_now: failed to restore reserve_now flag for task %s',
-                            rid,
-                            exc_info=True,
-                        )
-                        # Restore failed — DB still holds reserve_now=False (cleared
-                        # above).  Mirror that in memory so the diff-layer doesn't
-                        # fabricate a spurious priority_override_cleared event next tick.
-                        ctx.overrides[rid] = OverrideRow(
-                            boost_tier=rrow.boost_tier,
-                            pinned=rrow.pinned,
-                            pin_order=rrow.pin_order,
-                            reserve_now=False,
-                            ttl_until=rrow.ttl_until,
-                        )
-                    continue
+                else:
+                    ctx.overrides[rid] = rrow
         return _CONTINUE
+
+    def _consume_reserve_now(self, store: OverrideStore, ctx: TickContext, rid: str) -> None:
+        """Clear *rid*'s stored reserve_now flag and mirror it in ``ctx.overrides``.
+
+        The in-memory mirror keeps this tick's diff-detection from re-emitting
+        for the consumed flag.
+        """
+        store.clear_override(self._project_root, rid, field='reserve_now')
+        ctx.overrides[rid] = replace(ctx.overrides[rid], reserve_now=False)
 
     async def _phase_override_diff(self, ctx: TickContext) -> object:
         """Diff-detect override changes and emit events.
@@ -8973,8 +8972,8 @@ class Scheduler:
         modules = list(self.lock_table._held.get(task_id, set()))
         self.lock_table.release(task_id)
         # Defensive: dispatch already settled this task's parks, so this only
-        # clears parks installed after dispatch (e.g. a reserve_now armed on
-        # a running task).
+        # clears parks installed after dispatch (e.g. a park rehydrated at
+        # startup for a task that is already running).
         restored_pairs = self.lock_table.clear_parks_for(task_id)
         if modules:
             self._emit_lock_event(
