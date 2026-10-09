@@ -462,13 +462,10 @@ class TicketJanitor:
                 for _stale_pid in _stale:
                     self._probe_failures.pop(_stale_pid, None)
 
-        # 1b) the dedup-outage detector; a fault here never stops the sweep.
+        # 1b) the dedup-outage detector, fault-isolated per project.
         cfg = self._dedup_outage_cfg
         if cfg is not None and cfg.enabled:
-            try:
-                await self._check_dedup_outage(cfg)
-            except Exception:
-                logger.exception('ticket_janitor: dedup-outage detector raised')
+            await self._check_dedup_outage(cfg)
 
         # 2) collect rows that haven't been escalated yet
         try:
