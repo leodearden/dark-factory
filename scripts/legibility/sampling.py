@@ -17,13 +17,17 @@ only the low-level JSONL-line iterator
 module rather than duplicating it.
 
 This module was originally "self-contained — does not import task α's
-``digest.py``". That is now deliberately relaxed for exactly one reason:
-``budgets.max_daily_digest_bytes`` is a DIGEST-OUTPUT budget, and charging
-a record's real cost against it means knowing how big its digest will be,
-which only the digest renderer can answer (:func:`digest_byte_cost_fn`).
-The signal-scoring primitives remain unshared; the dependency is on
-α's renderer alone, and it is one-directional (``digest.py`` imports
-nothing from ``legibility.*``, so there is no cycle).
+``digest.py``". That is now deliberately relaxed. ``budgets.max_daily_digest_bytes``
+is a DIGEST-OUTPUT budget, and charging a record's real cost against it
+means knowing how big its digest will be, which only the digest renderer
+can answer (:func:`digest_byte_cost_fn`). And two classifiers are digest's,
+so the two layers cannot drift: :func:`digest.classify_error_content`
+splits genuine from designed errors, and :func:`digest.is_non_dialogue_carrier`
+decides which text carriers are this session's own dialogue
+(plans/confusion-reduction-prd.md §7.2.3). The pattern tables and the
+carrier extraction stay this module's own. The dependency is
+one-directional: ``digest.py`` imports only ``legibility.inventory``, so
+there is no cycle.
 """
 from __future__ import annotations
 
@@ -124,36 +128,52 @@ def _message_content(record: dict[str, Any]) -> Any:
     return message.get('content')
 
 
-def _record_text(record: dict[str, Any]) -> str:
-    """Flatten a record's message.content into one lowercased text blob.
+def _record_carriers(record: dict[str, Any]) -> list[str]:
+    """Every raw text carrier in a record's message.content.
 
-    ``content`` is either a plain string or a list of content blocks; each
-    block contributes its 'text' field (assistant/user text, thinking) and
-    its 'content' field (tool_result output, itself sometimes a string).
+    ``content`` is either a plain string, which is one carrier, or a list of
+    content blocks; each block contributes its 'text' field (assistant/user
+    text, thinking) and its 'content' field (tool_result output, itself
+    sometimes a string) as separate carriers.
+    """
+    content = _message_content(record)
+    if isinstance(content, str):
+        return [content]
+    if not isinstance(content, list):
+        return []
+    carriers = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        text = block.get('text')
+        if isinstance(text, str):
+            carriers.append(text)
+        block_content = block.get('content')
+        if isinstance(block_content, str):
+            carriers.append(block_content)
+    return carriers
+
+
+def _dialogue_only(record: dict[str, Any], carriers: list[str]) -> list[str]:
+    """*carriers* minus every one :func:`digest.is_non_dialogue_carrier`
+    rejects, so a text class scores this session's own dialogue only."""
+    return [c for c in carriers if not digest.is_non_dialogue_carrier(record, c)]
+
+
+def _record_text(record: dict[str, Any]) -> str:
+    """Flatten a record's dialogue carriers (:func:`_dialogue_only`) into
+    one lowercased text blob.
+
     Used for the plain substring-scan classes (not_found, df_guard text
     patterns, interrupt) — never for self_correct, which is scoped to
     assistant text blocks only via :func:`_assistant_text`.
     """
-    content = _message_content(record)
-    if isinstance(content, str):
-        return content.lower()
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            text = block.get('text')
-            if isinstance(text, str):
-                parts.append(text)
-            block_content = block.get('content')
-            if isinstance(block_content, str):
-                parts.append(block_content)
-        return '\n'.join(parts).lower()
-    return ''
+    return '\n'.join(_dialogue_only(record, _record_carriers(record))).lower()
 
 
 def _assistant_text(record: dict[str, Any]) -> str:
-    """Flatten only assistant 'text' content blocks (native-carrier scoping)."""
+    """Flatten only assistant 'text' content blocks (native-carrier
+    scoping), each one a dialogue carrier per :func:`_dialogue_only`."""
     if record.get('type') != 'assistant':
         return ''
     content = _message_content(record)
@@ -166,7 +186,7 @@ def _assistant_text(record: dict[str, Any]) -> str:
         if isinstance(block, dict) and block.get('type') == 'text'
         and isinstance(block_text := block.get('text'), str)
     ]
-    return '\n'.join(parts).lower()
+    return '\n'.join(_dialogue_only(record, parts)).lower()
 
 
 def _classify_tool_errors(record: dict[str, Any]) -> tuple[bool, bool]:
@@ -362,7 +382,8 @@ def score_signals(path: Path) -> SignalCounts:
     carrying multiple synonymous markers for the same class still counts
     once. ``tool_error``/``designed_outcome`` and the tool-use half of
     ``df_guard`` are structural checks; every other class is a plain
-    case-insensitive substring scan. ``tool_error`` counts only GENUINE
+    case-insensitive substring scan of dialogue carriers only
+    (:func:`_dialogue_only`). ``tool_error`` counts only GENUINE
     failures: declared-designed outcomes are split off into
     ``designed_outcome`` by :func:`_classify_tool_errors`, which reuses
     digest's classifier so the two modules cannot drift. Malformed/unreadable input degrades to an all-zero
