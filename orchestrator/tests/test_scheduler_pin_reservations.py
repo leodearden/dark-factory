@@ -19,8 +19,7 @@ Now:
 
 Every module is a single-segment ``.py`` file, so its lock key is its own name.
 Holders take their locks through ``lock_table.try_acquire`` and appear in the
-task list as ``in-progress``: park GC keeps their parks and they are never
-candidates.
+task list as ``in-progress``: they own no parks and are never candidates.
 """
 
 from __future__ import annotations
@@ -543,15 +542,16 @@ async def test_a_released_pin_keeps_the_fairness_park_it_earned(tmp_path, reason
 
 
 @pytest.mark.asyncio
-async def test_a_head_that_turns_ineligible_parks_what_its_skips_earned(tmp_path):
-    """Released as ``ineligible``, P parks w at its tier straight away.
+@pytest.mark.parametrize('status', ['blocked', 'deferred'])
+async def test_a_head_that_turns_blocked_or_deferred_loses_its_reservation_and_earns_no_park(
+    tmp_path, status
+):
+    """A pin head that leaves pending drops its whole footprint (esc-6040-7 D1).
 
-    While P's pin reservation covered w, P's top-skip parked nothing more
-    there.  Once P is blocked it is no scored candidate either, so no later
-    skip would park w for it.  The release completes it instead.  (A requeue
-    cooldown is not a route here: requeueing goes through Scheduler.release,
-    which clears every park the task holds.)  G is a free candidate on the
-    second tick, because a tick with no candidates ends before the pin phase.
+    Park GC expires P1's pin reservation with an owner-state reason, so the pin
+    phase has nothing to release and completes no fairness park for it.  G is
+    a free candidate on the second tick, because a tick with no candidates ends
+    before the pin phase.
     """
     w = _one_blocked_pin_world(tmp_path, _Clock())
     assert await w.scheduler.acquire_next() is None
@@ -561,20 +561,18 @@ async def test_a_head_that_turns_ineligible_parks_what_its_skips_earned(tmp_path
     w.store.events.clear()
 
     w.scheduler.get_tasks = AsyncMock(return_value=[
-        make_task('P1', 'medium', ['a.py'], status='blocked'),
+        make_task('P1', 'medium', ['a.py'], status=status),
         make_task('H', 'low', ['a.py'], status='in-progress'),
         make_task('G', 'low', ['g.py']),
     ])
     await w.scheduler.acquire_next()
 
     assert event_data_for(w.store, 'reservation_expired', 'P1') == [
-        {'reason': 'ineligible', 'source': 'pin'},
+        {'reason': f'not_pending:{status}', 'source': 'pin'},
     ]
-    assert event_data_for(w.store, 'reservation_installed', 'P1') == [
-        {'modules': ['a.py'], 'skip_count': 1, 'priority': 'medium', 'source': 'fairness'},
-    ]
-    assert _reservation_events(w.store, 'P1') == ['reservation_expired', 'reservation_installed']
-    assert _ranks(w.scheduler, 'a.py') == [('P1', PRIORITY_RANK['medium'])]
+    assert event_data_for(w.store, 'reservation_installed', 'P1') == []
+    assert _reservation_events(w.store, 'P1') == ['reservation_expired']
+    assert 'P1' not in _owners(w.scheduler, 'a.py')
 
 
 @pytest.mark.asyncio

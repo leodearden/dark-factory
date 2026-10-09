@@ -21,6 +21,7 @@ from _park_test_helpers import (
     event_index,
     event_payloads,
     make_task,
+    make_withheld_task,
     park_world,
 )
 from _recording_event_store import _RecordingEventStore
@@ -119,7 +120,7 @@ async def test_a_dispatch_restarts_the_blocked_install_streak(tmp_path):
     lock_table = w.scheduler.lock_table
     tasks = [
         make_task('T', 'high', ['a.py', 'b.py']),
-        make_task('F', 'high', ['b.py'], status='in-progress'),
+        make_withheld_task('F', 'high', ['b.py']),
     ]
     w.scheduler.get_tasks = AsyncMock(return_value=tasks)
 
@@ -324,8 +325,8 @@ async def test_completion_events_carry_the_fairness_source(tmp_path):
     lock_table.install_parks('F', ['f.py'], 'critical')
     w.scheduler.get_tasks = AsyncMock(return_value=[
         make_task('T', 'critical', ['s.py', 'f.py']),
-        make_task('L', 'low', ['s.py'], status='in-progress'),
-        make_task('F', 'critical', ['f.py'], status='in-progress'),
+        make_withheld_task('L', 'low', ['s.py']),
+        make_withheld_task('F', 'critical', ['f.py']),
     ])
 
     assert await w.scheduler.acquire_next() is None, 'source: T is held off'
@@ -345,7 +346,7 @@ async def test_park_gc_expiry_and_restore_carry_the_fairness_source(tmp_path):
     w.scheduler.lock_table.install_parks('D', ['g.py'], 'high')
     w.scheduler.get_tasks = AsyncMock(return_value=[
         make_task('D', 'high', ['g.py'], status='done'),
-        make_task('L', 'low', ['g.py'], status='in-progress'),
+        make_withheld_task('L', 'low', ['g.py']),
     ])
 
     await w.scheduler.acquire_next()
@@ -374,7 +375,7 @@ async def test_the_park_eviction_drain_carries_the_fairness_source(tmp_path):
     evictions.enqueue('X', str(config.project_root))
     scheduler.get_tasks = AsyncMock(return_value=[
         make_task('X', 'high', ['e.py'], status='cancelled'),
-        make_task('L', 'low', ['e.py'], status='in-progress'),
+        make_withheld_task('L', 'low', ['e.py']),
     ])
 
     await scheduler.acquire_next()
