@@ -110,3 +110,70 @@ class TestGrowthSampleBytes:
         )
         with pytest.raises(dataclasses.FrozenInstanceError):
             sample.file_bytes = 2  # type: ignore[misc]
+
+
+_T0 = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def _seconds_after_t0(*offsets: float) -> list[datetime]:
+    return [_T0 + timedelta(seconds=s) for s in offsets]
+
+
+def _delete_ops_at(db_path: Path, created_ats: Sequence[datetime]) -> None:
+    """Delete rows the way a retention prune would, through a second connection."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executemany(
+            'DELETE FROM write_ops WHERE created_at = ?',
+            [(ts.isoformat(),) for ts in created_ats],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestGrowthSampleRowsInserted:
+    @pytest.mark.asyncio
+    async def test_counts_the_rows_inserted_at_or_after_since(self, journal):
+        seed_ops(journal.db_path, _seconds_after_t0(1, 2, 3, 4, 5, 6))
+
+        sample = await journal.growth_sample(since=_T0 + timedelta(seconds=3.5))
+
+        assert sample.rows_inserted == 3
+
+    @pytest.mark.asyncio
+    async def test_a_cutoff_after_the_newest_row_counts_nothing(self, journal):
+        seed_ops(journal.db_path, _seconds_after_t0(1, 2, 3))
+
+        sample = await journal.growth_sample(since=_T0 + timedelta(seconds=10))
+
+        assert sample.rows_inserted == 0
+
+    @pytest.mark.asyncio
+    async def test_an_empty_journal_counts_nothing(self, journal):
+        sample = await journal.growth_sample(since=_T0)
+
+        assert sample.rows_inserted == 0
+
+    @pytest.mark.asyncio
+    async def test_counts_inserts_not_live_rows(self, journal):
+        seed_ops(journal.db_path, _seconds_after_t0(1, 2, 3, 4, 5, 6))
+        since = _T0 + timedelta(seconds=3.5)
+
+        _delete_ops_at(journal.db_path, _seconds_after_t0(1, 2))
+        assert (await journal.growth_sample(since=since)).rows_inserted == 3
+
+        _delete_ops_at(journal.db_path, _seconds_after_t0(5))
+        assert (await journal.growth_sample(since=since)).rows_inserted == 3
+
+    @pytest.mark.asyncio
+    async def test_counts_rows_logged_through_the_journal(self, journal):
+        seed_ops(journal.db_path, _seconds_after_t0(1, 2, 3))
+        for operation in ('get_task', 'get_statuses'):
+            await journal.log_write_op(
+                write_op_id=str(uuid.uuid4()), operation=operation, kind='read'
+            )
+
+        sample = await journal.growth_sample(since=_an_hour_ago())
+
+        assert sample.rows_inserted == 2
