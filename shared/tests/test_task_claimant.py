@@ -39,6 +39,10 @@ is_stranded_any_status(task, now, ttl) (C4-E6) is the status-agnostic read rule
 plus the liveness core. is_stranded / is_stranded_blocked are pinned, over a
 grid, as status gates delegating to it. DEFAULT_CLAIMANT_HEARTBEAT_TTL carries
 the single exact-value pin for the one shared heartbeat TTL.
+
+violates_terminal_claimant_invariant(task) is C4-E1 (status in TERMINAL implies
+no claimant): any claimant, fresh or stale, on a terminal row; stated on
+claimant_run_id alone, so a (NULL, heartbeat) residue is not a violation.
 """
 
 from __future__ import annotations
@@ -56,8 +60,9 @@ from shared.task_claimant import (
     is_stranded,
     is_stranded_any_status,
     is_stranded_blocked,
+    violates_terminal_claimant_invariant,
 )
-from shared.task_statuses import TaskStatus
+from shared.task_statuses import ACTIVE, TERMINAL, TaskStatus
 
 _TTL = timedelta(minutes=5)
 
@@ -502,7 +507,50 @@ class TestSpecialisationsDelegate:
         )
 
 
+class TestViolatesTerminalClaimantInvariant:
+    _FRESH = (_GRID_NOW - timedelta(minutes=1)).isoformat()
+    _STALE = (_GRID_NOW - timedelta(hours=12)).isoformat()
+
+    @pytest.mark.parametrize('status', sorted(TERMINAL))
+    @pytest.mark.parametrize('heartbeat', [_FRESH, _STALE, None])
+    def test_terminal_row_with_any_claimant_violates(self, status, heartbeat):
+        row = _row(status, 'run-a/4028-x/pid=1', heartbeat)
+        assert violates_terminal_claimant_invariant(row) is True
+
+    def test_freeform_claimant_without_heartbeat_violates(self):
+        """The reify-5225 shape: freeform claimant, no pid=, no heartbeat."""
+        row = _row('cancelled', 'agent-esc-5053-2-docs-fix', None)
+        assert violates_terminal_claimant_invariant(row) is True
+
+    def test_heartbeat_residue_without_claimant_is_not_a_violation(self):
+        """Boundary case B15: C4-E1 is stated on claimant_run_id alone."""
+        row = _row('done', None, self._FRESH)
+        assert violates_terminal_claimant_invariant(row) is False
+
+    def test_blank_claimant_is_not_a_violation(self):
+        row = _row('done', '   ', self._FRESH)
+        assert violates_terminal_claimant_invariant(row) is False
+
+    @pytest.mark.parametrize('status', sorted(ACTIVE))
+    @pytest.mark.parametrize('heartbeat', [_FRESH, _STALE])
+    def test_active_status_never_violates(self, status, heartbeat):
+        row = _row(status, 'run-a/4028-x/pid=1', heartbeat)
+        assert violates_terminal_claimant_invariant(row) is False
+
+    def test_enum_status_matches_str_status(self):
+        enum_row = _row(TaskStatus.DONE, 'run-x', self._FRESH)
+        str_row = _row('done', 'run-x', self._FRESH)
+        assert violates_terminal_claimant_invariant(enum_row) is True
+        assert violates_terminal_claimant_invariant(str_row) is True
+
+    def test_row_without_status_does_not_violate(self):
+        row = {'claimant_run_id': 'run-x', 'heartbeat_at': self._FRESH}
+        assert violates_terminal_claimant_invariant(row) is False
+
+
 def test_public_api_surface():
-    assert {'is_stranded_any_status', 'DEFAULT_CLAIMANT_HEARTBEAT_TTL'} <= set(
-        shared.task_claimant.__all__
-    )
+    assert {
+        'is_stranded_any_status',
+        'DEFAULT_CLAIMANT_HEARTBEAT_TTL',
+        'violates_terminal_claimant_invariant',
+    } <= set(shared.task_claimant.__all__)
