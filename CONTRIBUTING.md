@@ -373,9 +373,13 @@ branch, before any merge submission:
    seven workspace members the §3 **Type-check** command walks.
 
 The inline-suppression ratchet guard,
-`scripts/tests/test_inline_suppression_ratchet.py`, runs with the suite: a
-new `type: ignore`, `noqa` or similar suppression without a disposition
-marker turns it red.
+`scripts/tests/test_inline_suppression_ratchet.py`, runs with the suite. A
+malformed disposition marker turns it red now. A new `type: ignore`, `noqa`
+or similar suppression with no disposition marker turns it red only once the
+operator has seeded `scripts/inline_suppression_baseline.json` (step κ1 of
+`plans/inv12-exceptions-owned-or-ratified-prd.md`). Until then that check
+skips and its skip reason says so, so a green suite does not yet mean your
+suppressions were checked.
 
 Do this **before** `merge_request`/`/merge-queue`, not after — a red
 post-merge verify blocks or reverts the merge, which is more expensive than
