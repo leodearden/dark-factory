@@ -6,6 +6,7 @@ Contract: plans/deferral-flip-condition-prd.md §5.1 and decisions 1, 2, 5, 9 an
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Final, Literal, LiteralString, cast
@@ -16,11 +17,15 @@ from pydantic import (
     BeforeValidator,
     ConfigDict,
     Field,
+    RootModel,
     StringConstraints,
     TypeAdapter,
     ValidationError,
 )
 from pydantic_core import ErrorDetails, PydanticCustomError
+
+from shared.process_identity import ProcessIdentity
+from shared.task_metadata import register_metadata_submodel
 
 __all__ = [
     'CALLER_KINDS',
@@ -32,16 +37,27 @@ __all__ = [
     'REASON_MAX_CHARS',
     'STALE_CONDITION_AFTER_SECS',
     'STALE_PLANNING_AFTER_SECS',
+    'CarriedByDeferral',
     'CarriedByRequest',
+    'Deferral',
     'DeferralInvalid',
     'DeferralInvalidReason',
     'DeferralKind',
+    'DeferralRecord',
     'DeferralRequest',
+    'HeldBySessionDeferral',
     'HeldBySessionRequest',
+    'InvalidRecord',
+    'LegacyUnknownDeferral',
     'LegacyUnknownRequest',
+    'PlanningDeferral',
+    'UntilConditionDeferral',
     'UntilConditionRequest',
+    'parse_record',
     'parse_request',
     'parse_utc_timestamp',
+    'record_to_json',
+    'stamp',
 ]
 
 
@@ -232,3 +248,128 @@ def parse_request(raw: object, *, now: datetime) -> DeferralRequest:
 
 def _not_after(moment: datetime | None, now: datetime) -> bool:
     return moment is not None and moment <= now
+
+
+class _DeferralRecordBase(BaseModel):
+    model_config = ConfigDict(frozen=True, extra='forbid')
+
+    reason: ReasonText | None = None
+    deferred_at: UtcTimestamp | None
+    stamped_at: UtcTimestamp
+    stamped_by: str | None = None
+
+
+class CarriedByDeferral(_DeferralRecordBase):
+    kind: Literal[DeferralKind.CARRIED_BY] = DeferralKind.CARRIED_BY
+    carrier_task_id: PositiveId
+
+
+class UntilConditionDeferral(_DeferralRecordBase):
+    kind: Literal[DeferralKind.UNTIL_CONDITION] = DeferralKind.UNTIL_CONDITION
+    condition: ConditionText
+    expires_at: UtcTimestamp | None = None
+
+
+class HeldBySessionDeferral(_DeferralRecordBase):
+    kind: Literal[DeferralKind.HELD_BY_SESSION] = DeferralKind.HELD_BY_SESSION
+    holder: ProcessIdentity
+    grace_secs: GraceSecs = DEFAULT_GRACE_SECS
+
+
+class PlanningDeferral(_DeferralRecordBase):
+    kind: Literal[DeferralKind.PLANNING] = DeferralKind.PLANNING
+
+
+class LegacyUnknownDeferral(_DeferralRecordBase):
+    kind: Literal[DeferralKind.LEGACY_UNKNOWN] = DeferralKind.LEGACY_UNKNOWN
+
+
+_DeferralVariant = (
+    CarriedByDeferral
+    | UntilConditionDeferral
+    | HeldBySessionDeferral
+    | PlanningDeferral
+    | LegacyUnknownDeferral
+)
+Deferral = Annotated[_DeferralVariant, Field(discriminator='kind')]
+
+
+class DeferralRecord(RootModel[Deferral]):
+    model_config = ConfigDict(frozen=True)
+
+
+register_metadata_submodel('deferral', DeferralRecord, cardinality='dict')
+
+
+def _required_holder(
+    request: HeldBySessionRequest, holder: ProcessIdentity | None
+) -> ProcessIdentity:
+    if holder is None:
+        raise ValueError(
+            f'a held_by_session deferral needs the holder identity of pid '
+            f'{request.holder_pid}, got holder=None'
+        )
+    if holder.pid != request.holder_pid:
+        raise ValueError(
+            f'holder pid {holder.pid} does not match the requested holder_pid '
+            f'{request.holder_pid}'
+        )
+    return holder
+
+
+def stamp(
+    request: DeferralRequest,
+    *,
+    stamped_at: datetime,
+    stamped_by: str | None,
+    deferred_at: datetime | None,
+    holder: ProcessIdentity | None = None,
+) -> Deferral:
+    """The one request-to-record translation; only held_by_session takes, and needs, a holder."""
+    if holder is not None and not isinstance(request, HeldBySessionRequest):
+        raise ValueError(f'a {request.kind.value} deferral has no holder, got {holder!r}')
+    stamped: dict[str, Any] = {
+        'reason': request.reason,
+        'deferred_at': deferred_at,
+        'stamped_at': stamped_at,
+        'stamped_by': stamped_by,
+    }
+    match request:
+        case CarriedByRequest():
+            return CarriedByDeferral(carrier_task_id=request.carrier_task_id, **stamped)
+        case UntilConditionRequest():
+            return UntilConditionDeferral(
+                condition=request.condition, expires_at=request.expires_at, **stamped
+            )
+        case HeldBySessionRequest():
+            return HeldBySessionDeferral(
+                holder=_required_holder(request, holder), grace_secs=request.grace_secs, **stamped
+            )
+        case LegacyUnknownRequest():
+            return LegacyUnknownDeferral(**stamped)
+
+
+@dataclass(frozen=True)
+class InvalidRecord:
+    """A metadata.deferral slice that does not parse; detail says why."""
+
+    detail: str
+
+
+def parse_record(raw: object) -> Deferral | InvalidRecord | None:
+    """Any metadata.deferral slice as its variant: None when absent, InvalidRecord when malformed."""
+    if raw is None:
+        return None
+    if isinstance(raw, DeferralRecord):
+        return raw.root
+    if isinstance(raw, _DeferralVariant):
+        return raw
+    try:
+        return DeferralRecord.model_validate(raw).root
+    except ValidationError as exc:
+        return InvalidRecord(str(exc))
+
+
+def record_to_json(record: Deferral) -> dict[str, Any]:
+    """The one serialization of a record into metadata.deferral."""
+    return DeferralRecord(record).model_dump(mode='json')

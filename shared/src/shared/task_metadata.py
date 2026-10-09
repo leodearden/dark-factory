@@ -1558,3 +1558,6 @@ def parse_metadata(
         )
 
     return model, warnings
+
+
+import shared.task_deferral  # noqa: E402,F401
