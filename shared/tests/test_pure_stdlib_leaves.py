@@ -72,6 +72,7 @@ PURE_STDLIB_LEAVES = (
     'mcp_idempotency',
     'neutral_cwd',
     'proc_group',
+    'process_identity',
     'psi',
     'pytest_jobserver',
     'pytest_mark_grammar',
