@@ -763,6 +763,11 @@ _SPOT_TASK = {
 
 _SPOT_COMMITTED_WORK = [{'sha': 'a' * 40, 'subject': 'feat: an earlier attempt'}]
 
+_SPOT_PLAN = {
+    'files': ['a.py'],
+    'steps': [{'id': 's1', 'type': 'test', 'description': 'x', 'status': 'pending'}],
+}
+
 _ARCHITECT_DISPATCHES: dict[str, Callable[[BriefingAssembler], Awaitable[str]]] = {
     'fresh': lambda b: b.build_architect_prompt(_SPOT_TASK, context=''),
     'fresh_with_optional_sections': lambda b: b.build_architect_prompt(
@@ -771,6 +776,17 @@ _ARCHITECT_DISPATCHES: dict[str, Callable[[BriefingAssembler], Awaitable[str]]] 
         include_prior_proposals=True,
         committed_work=_SPOT_COMMITTED_WORK,
     ),
+    'revalidation': lambda b: b.build_revalidation_prompt(
+        _SPOT_TASK, _SPOT_PLAN, ['a.py'], context='',
+    ),
+    'completion': lambda b: b.build_plan_completion_prompt(
+        _SPOT_TASK, _SPOT_PLAN, context='',
+    ),
+    'tightening': lambda b: b.build_plan_tightening_prompt(
+        _SPOT_TASK, _SPOT_PLAN, ['a.py'], context='',
+    ),
+    'schema_repair': lambda b: b.build_plan_schema_repair_prompt(_SPOT_TASK, context=''),
+    'replan': lambda b: b.build_replan_prompt(_SPOT_TASK, 'REVIEW-FEEDBACK', context=''),
 }
 
 
