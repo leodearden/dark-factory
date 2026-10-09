@@ -12,6 +12,7 @@ included.
 
 from __future__ import annotations
 
+import asyncio
 import collections
 import contextlib
 import json
@@ -401,7 +402,7 @@ class WriteJournal:
         freelist_count = await _read_int(access, 'PRAGMA freelist_count')
         page_size = await _read_int(access, 'PRAGMA page_size')
         return JournalGrowthSample(
-            file_bytes=self._on_disk_bytes(),
+            file_bytes=await asyncio.to_thread(self._on_disk_bytes),
             free_bytes=freelist_count * page_size,
             rows_inserted=await self._rows_inserted_since(access, since),
             since=since,
