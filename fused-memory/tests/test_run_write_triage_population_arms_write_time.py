@@ -879,6 +879,61 @@ class TestThePublishWriteTimeCommand:
         assert not (tmp_path / 'pop.json').exists()
         assert not (tmp_path / 'pairs.jsonl').exists()
 
+    def test_the_recorded_verdicts_are_the_ones_kept_apart_while_the_corpus_grows(
+        self, published: _PublishedWriteTime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        published.write_arm_files()
+        corpus, seed = self._rated(tmp_path)
+        appended = json.dumps({'entry_id': 'w-long', 'target_id': 'b', 'verdict': 'duplicate'})
+
+        def appending_after(read: Any) -> Any:
+            def read_then_append(path: Path, *args: Any, **kwargs: Any) -> Any:
+                body = read(path, *args, **kwargs)
+                if path == corpus:
+                    with open(corpus, 'a', encoding='utf-8') as raters:
+                        raters.write(appended + '\n')
+                return body
+            return read_then_append
+
+        monkeypatch.setattr(Path, 'read_bytes', appending_after(Path.read_bytes))
+        monkeypatch.setattr(Path, 'read_text', appending_after(Path.read_text))
+        assert self._publish(
+            published,
+            '--population-out', str(tmp_path / 'pop.json'),
+            '--pairs-out', str(tmp_path / 'pairs.jsonl'),
+            '--already-rated', str(corpus), str(seed),
+        ) == 0
+        monkeypatch.undo()
+        artifact = json.loads((tmp_path / 'pop.json').read_text(encoding='utf-8'))
+        [record] = [
+            s for s in artifact['pairs_to_rate']['already_rated'] if s['path'] == 'verdicts.jsonl'
+        ]
+        prefix = corpus.read_bytes().splitlines(keepends=True)[:record['rows']]
+        assert _sha(b''.join(prefix)) == record['sha256']
+        recorded = {(v['entry_id'], v['target_id']) for v in map(json.loads, prefix)}
+        asked = {
+            (p['entry_id'], p['target_id'])
+            for p in map(json.loads, (tmp_path / 'pairs.jsonl').read_text().splitlines())
+        }
+        assert ('w-long', 'b') in asked
+        assert not asked & recorded
+
+    def test_a_verdict_file_whose_last_row_is_unterminated_is_refused(
+        self, published: _PublishedWriteTime, tmp_path: Path,
+    ) -> None:
+        published.write_arm_files()
+        corpus, seed = self._rated(tmp_path)
+        corpus.write_bytes(corpus.read_bytes().removesuffix(b'\n'))
+        with pytest.raises(ValueError, match=re.escape(str(corpus))):
+            self._publish(
+                published,
+                '--population-out', str(tmp_path / 'pop.json'),
+                '--pairs-out', str(tmp_path / 'pairs.jsonl'),
+                '--already-rated', str(corpus), str(seed),
+            )
+        assert not (tmp_path / 'pop.json').exists()
+        assert not (tmp_path / 'pairs.jsonl').exists()
+
     def test_the_defaults_are_the_write_time_files_never_the_pi_ones(self) -> None:
         calibration = _PACKAGE / 'calibration'
         defaults = {

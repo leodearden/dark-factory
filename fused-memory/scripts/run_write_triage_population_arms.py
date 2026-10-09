@@ -1128,14 +1128,21 @@ def load_rated_pairs(paths: Iterable[Path]) -> set[tuple[str, str]]:
     }
 
 
-def _rated_source(path: Path) -> dict[str, Any]:
-    """A verdict file as it stood: an append-only file's later state keeps this prefix."""
+def read_rated_source(path: Path) -> tuple[frozenset[tuple[str, str]], dict[str, Any]]:
+    """The pairs a verdict file holds, and its ``{path, rows, sha256}`` record, from one read.
+
+    The record covers exactly the rows whose pairs are returned, so an
+    append-only file's later state keeps it as a prefix. A body whose last row
+    has no newline is refused: the next append would change that row.
+    """
     body = Path(path).read_bytes()
-    return {
-        'path': repo_relative(path),
-        'rows': len(body.splitlines(keepends=True)),
-        'sha256': _sha256(body),
-    }
+    if body and not body.endswith(b'\n'):
+        raise ValueError(f'{path} does not end in a newline; its last row may be a torn append')
+    lines = body.decode('utf-8').split('\n')[:-1]
+    pairs = frozenset(
+        (row['entry_id'], row['target_id']) for row in map(json.loads, filter(None, lines))
+    )
+    return pairs, {'path': repo_relative(path), 'rows': len(lines), 'sha256': _sha256(body)}
 
 
 # --- CLI -----------------------------------------------------------------------
@@ -1232,9 +1239,10 @@ def _command_publish_write_time(args: argparse.Namespace) -> int:
     snapshot, snapshot_sha256 = _freeze.load_snapshot(args.snapshot)
     arms_dir = Path(args.snapshot).parent / ARMS_DIR_NAME[Slates.WRITE_TIME]
     arm_rows = {arm.name: read_rows(arm_path(arms_dir, arm.name)) for arm in WRITE_TIME_ARMS}
+    sources = [read_rated_source(path) for path in args.already_rated]
     pairs, stats = build_write_time_pairs_to_rate(
         snapshot, snapshot_sha256, arm_rows, sample_size=args.max_writes,
-        already_rated=load_rated_pairs(args.already_rated),
+        already_rated=frozenset().union(*(rated for rated, _ in sources)),
     )
     pairs_body = _jsonl_body(pairs)
     artifact = build_write_time_population_artifact(
@@ -1242,7 +1250,7 @@ def _command_publish_write_time(args: argparse.Namespace) -> int:
         sample_size=args.max_writes, budget_usd=args.budget_usd,
         pairs_to_rate={
             **stats, 'path': repo_relative(args.pairs_out), 'sha256': _sha256(pairs_body),
-            'already_rated': [_rated_source(path) for path in args.already_rated],
+            'already_rated': [record for _, record in sources],
         },
     )
     _write_staged({args.pairs_out: pairs_body, args.population_out: _json_body(artifact)})
