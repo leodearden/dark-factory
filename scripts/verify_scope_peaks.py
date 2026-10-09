@@ -83,7 +83,8 @@ def _thread_env(pid: str) -> dict[str, str]:
         raw = Path(f'/proc/{pid}/environ').read_bytes()
     except OSError:
         return {}
-    env = dict(item.partition(b'=')[::2] for item in raw.split(b'\0') if item)
+    pairs = (item.partition(b'=') for item in raw.split(b'\0') if item)
+    env = {key: value for key, _, value in pairs}
     return {k: env[k.encode()].decode('utf8', 'replace') for k in THREAD_ENV_KEYS if k.encode() in env}
 
 
