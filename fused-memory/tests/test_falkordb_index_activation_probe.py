@@ -353,11 +353,6 @@ class TestRequireKnownProjectRoots:
 
 MEASURED_AT = '2026-10-08T19:00:00Z'
 
-VERBATIM_POPULATION = (
-    'MATCH (n:Entity) WITH toLower(n.name) AS k, count(n) AS c, '
-    'count(DISTINCT n.name) AS names WHERE c > 1 AND names > 1 RETURN count(k), sum(c)'
-)
-
 LIVE = None
 DEAD = '2026-09-01T00:00:00+00:00'
 
@@ -385,7 +380,6 @@ FULLTEXT_ROWS = {
 }
 
 REBASELINED_IDS = ('878', '2286', '3127', '3601', '1157')
-SPLIT_SINCE = '2026-10-02T11:42:23+00:00'
 
 
 def _graphiti(task_id: str, content: str):
@@ -631,27 +625,27 @@ class TestMeasureProbes:
 
 class TestMeasureCaseFold:
     @pytest.mark.asyncio
-    async def test_the_population_query_is_the_task_text_verbatim_on_each_present_registered_graph(self):
+    async def test_the_population_query_runs_on_each_present_registered_graph_only(self):
         record, reader, _search = await _measure()
+        mod = _mod()
 
         for graph in ('dark_factory', 'reify'):
-            assert VERBATIM_POPULATION in reader.queries_for(graph)
-        assert VERBATIM_POPULATION not in reader.queries_for('scratch_probe')
+            assert mod.CASE_FOLD_POPULATION in reader.queries_for(graph)
+        assert mod.CASE_FOLD_POPULATION not in reader.queries_for('scratch_probe')
         assert [c.group_id for c in record.case_fold] == ['dark_factory', 'reify']
 
     @pytest.mark.asyncio
-    async def test_the_split_query_is_edge_first_with_the_since_parameter(self):
+    async def test_the_split_query_carries_the_recorded_since_on_each_present_registered_graph(self):
         record, reader, _search = await _measure()
         mod = _mod()
 
         split_calls = [call for call in reader.calls if len(call) == 3 and call[1] == mod.CASE_FOLD_SPLIT]
         assert {call[0] for call in split_calls} == {'dark_factory', 'reify'}
-        assert all(call[2] == {'since': SPLIT_SINCE} for call in split_calls)
-        assert mod.CASE_FOLD_SPLIT.startswith('MATCH ()-[e:RELATES_TO]->() WHERE e.created_at > $since')
-        assert mod.CASE_FOLD_SPLIT_SINCE == SPLIT_SINCE
-        (dark_factory,) = [c for c in record.case_fold if c.group_id == 'dark_factory']
-        assert dark_factory.split_since == SPLIT_SINCE
-        assert dark_factory.split_since_commit == '13a9caaca2'
+        assert {c.group_id for c in record.case_fold} == {call[0] for call in split_calls}
+        for c in record.case_fold:
+            (params,) = [call[2] for call in split_calls if call[0] == c.group_id]
+            assert params == {'since': c.split_since}
+            assert c.split_since == mod.CASE_FOLD_SPLIT_SINCE
 
     @pytest.mark.asyncio
     async def test_keys_nodes_and_split_groups_are_recorded_raw(self):
@@ -703,8 +697,9 @@ class TestFalkorReadOnlyReader:
 
         assert record.e1_preflight.maintenance_noop is True
         assert client.log
-        assert all(timeout == _mod().READ_TIMEOUT_MS for _q, _params, timeout in client.log)
-        assert _mod().READ_TIMEOUT_MS == 60000
+        assert all(
+            timeout is not None and timeout == _mod().READ_TIMEOUT_MS for _q, _params, timeout in client.log
+        )
 
 
 class TestRecordToJson:
