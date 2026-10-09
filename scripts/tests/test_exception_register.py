@@ -12,14 +12,19 @@ in ``tmp_path``, and every run passes an absent ``--sweep-state``.
 from __future__ import annotations
 
 import datetime
+import os
+import shutil
+import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
 import exception_register
 import pytest
-from inline_suppression_fixtures import track_fixture_tree
+from inline_suppression_fixtures import RUFF_CONFIG, SUBPROCESS_TIMEOUT_SECS, track_fixture_tree
 from shared.governed_exceptions import (
     DECLARATION_FORMS,
+    INLINE_MARKER_FORMS,
     Debt,
     MalformedDisposition,
     Policy,
@@ -447,3 +452,202 @@ def test_a_malformed_disposition_literal_is_a_fault_at_the_site(
     assert (fault.path, fault.line) == ('tests/test_decl.py', 2)
     assert str(expected.value) in fault.reason
     assert fault.forms == DECLARATION_FORMS
+
+
+# ---------------------------------------------------------------------------
+# D3 — the closed world, and the exit ladder, through main().
+
+_UNRATIFIED_TREES = {
+    'declaration-default': {
+        'tests/test_decl.py': _declaring(
+            "'pkg.x', 'r', [], default=Policy('no-such-row'), default_covers=0"
+        )
+    },
+    'declaration-override': {
+        'tests/test_decl.py': _declaring(
+            "'pkg.x', 'r', ['a'], dispositions={'a': Policy('no-such-row')}"
+        )
+    },
+    'inline-marker': {'m.py': 'x = 1  # type: ignore[arg-type]  # ratified: no-such-row\n'},
+}
+
+
+def _register_tree(root: Path, files: dict[str, str], *, table: str = '[]\n') -> None:
+    """A fixture checkout the register can measure: a table, a ruff config, *files*."""
+    track_fixture_tree(
+        root,
+        {'pyproject.toml': RUFF_CONFIG, exception_register.TABLE_PATH: table, **files},
+    )
+
+
+def _main(root: Path, *args: str) -> int:
+    """The register over *root*, never reading host sweep state."""
+    return exception_register.main(
+        [*args, '--root', str(root), '--sweep-state', str(root / 'absent.json')]
+    )
+
+
+@pytest.mark.parametrize(
+    ('tree', 'site', 'subject', 'forms'),
+    [
+        ('declaration-default', 'tests/test_decl.py:2', 'pkg.x', DECLARATION_FORMS),
+        ('declaration-override', 'tests/test_decl.py:2', 'pkg.x', DECLARATION_FORMS),
+        ('inline-marker', 'm.py:1', 'type: ignore', INLINE_MARKER_FORMS),
+    ],
+)
+def test_scenario_14_a_policy_naming_no_table_row_is_one_violation_line(
+    tmp_path: Path, capsys, tree: str, site: str, subject: str, forms: tuple[str, ...]
+):
+    _register_tree(tmp_path, _UNRATIFIED_TREES[tree])
+
+    assert _main(tmp_path, '--report') == 1
+
+    (line,) = capsys.readouterr().err.strip().splitlines()
+    assert 'no-such-row' in line
+    assert exception_register.TABLE_PATH in line
+    assert site in line
+    assert subject in line
+    for form in forms:
+        assert form in line
+
+
+@pytest.mark.parametrize('tree', sorted(_UNRATIFIED_TREES))
+def test_scenario_14_the_same_policy_is_green_once_the_row_exists(
+    tmp_path: Path, capsys, tree: str
+):
+    _register_tree(
+        tmp_path, _UNRATIFIED_TREES[tree], table=_block(_with(_ROW, 'id', 'no-such-row'))
+    )
+
+    assert _main(tmp_path, '--report') == 0, capsys.readouterr().err
+
+
+def _inline_document(**overrides: object) -> dict[str, object]:
+    """A hand-written inline report of the schema the register pins."""
+    document: dict[str, object] = {
+        'schema_version': exception_register.INLINE_REPORT_SCHEMA_VERSION,
+        'status': 'advisory',
+        'files_enumerated': 0,
+        'files_tokenized': 0,
+        'sites': 0,
+        'kind_totals': {},
+        'ownership': {'class': 0, 'debt': 0, 'policy': 0, 'unowned': 0},
+        'by_kind_code': [],
+        'by_file': [],
+        'debt': [],
+        'ratified': [],
+        'classes': [],
+        'class_table': [],
+        'baseline': {'path': 'b.json', 'present': False, 'excess': None, 'slack': None},
+        'violations': [],
+    }
+    document.update(overrides)
+    return document
+
+
+def test_a_class_row_citing_no_table_row_is_a_closed_world_violation():
+    """The class table is reached only through the inline report, so it is
+    tested at the parsing seam: the scanner's class-table injection runs in
+    another process and cannot be reached from here."""
+    inline = exception_register.parse_inline_report(
+        _inline_document(class_table=[{'class': 'noqa[E731]@tests', 'ratified': 'no-such-row'}])
+    )
+
+    (violation,) = exception_register.closed_world_violations((), (), inline)
+
+    rendered = violation.render()
+    assert 'no-such-row' in rendered
+    assert 'noqa[E731]@tests' in rendered
+    assert exception_register.TABLE_PATH in rendered
+    row = exception_register.Ratification(
+        id='no-such-row', date=datetime.date(2026, 10, 9), source='s', covers='c'
+    )
+    assert exception_register.closed_world_violations((row,), (), inline) == ()
+
+
+def test_a_malformed_disposition_literal_fails_the_report(tmp_path: Path, capsys):
+    _register_tree(
+        tmp_path,
+        {'tests/test_decl.py': _declaring("'pkg.x', 'r', [], default=Debt(TaskRef(0)), default_covers=1")},
+    )
+
+    assert _main(tmp_path, '--report') == 1
+    assert 'tests/test_decl.py:2' in capsys.readouterr().err
+
+
+def test_scenario_13_through_main_is_exit_two_with_no_traceback(tmp_path: Path, capsys):
+    _register_tree(
+        tmp_path,
+        {'tests/test_decl.py': _HEADER + "LIST_ID = 'pkg.x'\ngoverned_exceptions(LIST_ID, 'r', [])\n"},
+    )
+
+    assert _main(tmp_path, '--report') == 2
+
+    err = capsys.readouterr().err
+    assert err.startswith('exception_register.py:')
+    assert 'Traceback' not in err
+
+
+def test_a_failure_of_the_inline_scanner_is_the_registers_exit_two(tmp_path: Path, capsys):
+    _register_tree(tmp_path, {'broken.py': 'value = (  # noqa: E402\n'})
+
+    assert _main(tmp_path, '--report') == 2
+
+    err = capsys.readouterr().err
+    assert err.startswith('exception_register.py:')
+    assert 'inline_suppressions.py' in err
+
+
+def test_an_inline_report_of_another_schema_version_is_refused():
+    with pytest.raises(exception_register.InstrumentFailure) as excinfo:
+        exception_register.parse_inline_report(_inline_document(schema_version=7))
+
+    message = str(excinfo.value)
+    assert 'schema_version 7' in message
+    assert f'schema_version {exception_register.INLINE_REPORT_SCHEMA_VERSION}' in message
+
+
+@pytest.mark.parametrize(
+    'block', ['baseline', 'by_file', 'by_kind_code', 'class_table', 'ownership', 'ratified', 'sites']
+)
+def test_an_inline_report_missing_a_block_is_refused(block: str):
+    document = _inline_document()
+    del document[block]
+
+    with pytest.raises(exception_register.InstrumentFailure) as excinfo:
+        exception_register.parse_inline_report(document)
+
+    assert block in str(excinfo.value)
+
+
+def test_an_inline_report_with_a_mistyped_field_is_refused():
+    with pytest.raises(exception_register.InstrumentFailure) as excinfo:
+        exception_register.parse_inline_report(_inline_document(sites='many'))
+
+    assert 'sites' in str(excinfo.value)
+
+
+def test_a_missing_shared_import_is_exit_two_and_never_exit_one(tmp_path: Path):
+    """Only a real process can prove it: the fault happens before main exists.
+
+    The script is copied with ``source_measures.py``, its one sibling import, so
+    the import that fails is yaml's or shared's; ``-S`` hides the editable
+    install, which an emptied ``PYTHONPATH`` alone cannot.
+    """
+    scripts = REPO_ROOT / 'scripts'
+    for name in ('exception_register.py', 'source_measures.py'):
+        shutil.copyfile(scripts / name, tmp_path / name)
+    env = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
+
+    completed = subprocess.run(
+        [sys.executable, '-S', str(tmp_path / 'exception_register.py'), '--report'],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=SUBPROCESS_TIMEOUT_SECS,
+        env=env,
+    )
+
+    assert completed.returncode == 2, completed.stderr
+    assert 'uv run --project shared' in completed.stderr
+    assert 'Traceback' not in completed.stderr
