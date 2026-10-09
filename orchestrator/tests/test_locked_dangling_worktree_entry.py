@@ -8,7 +8,9 @@ already-queued entries kept landing.
 
 TestLockedDanglingEntryDoesNotPoisonMergeEnumeration pins that merge-worktree
 enumeration, and through it the enqueue gate, skips such an entry rather than
-raising.
+raising. TestPruneReclaimsLockedDanglingEntries pins that the prune chokepoint
+reclaims such an entry under ``worktree_base``, and nowhere else, and never
+past the task-2099 pool-storage refusal.
 """
 from __future__ import annotations
 
@@ -29,6 +31,7 @@ from orchestrator.merge_lane.types import (
     QueuedBranch,
 )
 from orchestrator.merge_lane.worker import coalesce_or_enqueue_merge_request
+from orchestrator.warm_lane_pool import WarmLanePool
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -146,3 +149,81 @@ class TestLockedDanglingEntryDoesNotPoisonMergeEnumeration:
         )
         assert result.dispatched is True, symptom
         assert queue.qsize() == 1, symptom
+
+
+@pytest.mark.asyncio
+class TestPruneReclaimsLockedDanglingEntries:
+    async def test_locked_dangling_entry_under_worktree_base_is_reclaimed(
+        self, git_ops: GitOps, git_repo: Path, caplog,
+    ):
+        wt, admin = await _plant_locked_dangling_entry(git_ops)
+
+        await git_ops.prune_worktrees()
+
+        assert not admin.exists(), 'the locked, tree-gone admin entry must be reclaimed'
+        assert str(wt.resolve()) not in _registered_paths(git_repo)
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.git_ops'):
+            assert await git_ops.find_inflight_merge_worktree('x') is None
+        assert not any(str(wt) in record.getMessage() for record in caplog.records), (
+            'a reclaimed entry is gone, so enumeration must no longer even skip it'
+        )
+
+    async def test_lock_on_a_live_tree_is_left_alone(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        head = _git(git_repo, 'rev-parse', 'HEAD').strip()
+        wt = await git_ops.create_throwaway_verify_worktree(head)
+        admin = _lane_admin_dir(wt)
+        (admin / 'locked').write_text('initializing')
+
+        await git_ops.prune_worktrees()
+
+        assert wt.is_dir()
+        assert (admin / 'locked').read_text() == 'initializing'
+        assert str(wt.resolve()) in _registered_paths(git_repo)
+
+    async def test_unlocked_dangling_entry_is_still_pruned(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        head = _git(git_repo, 'rev-parse', 'HEAD').strip()
+        wt = await git_ops.create_throwaway_verify_worktree(head)
+        shutil.rmtree(wt)
+
+        await git_ops.prune_worktrees()
+
+        assert str(wt.resolve()) not in _registered_paths(git_repo)
+
+    async def test_locked_dangling_entry_outside_worktree_base_keeps_its_lock(
+        self, git_ops: GitOps, git_repo: Path, tmp_path: Path,
+    ):
+        """git documents ``worktree lock`` for a worktree on a portable
+        device that is not always mounted: locked and absent is its intended
+        shape outside the orchestrator's namespace."""
+        git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
+        portable = tmp_path / 'portable'
+        _git(git_repo, 'worktree', 'add', '--detach', str(portable), 'HEAD')
+        _git(git_repo, 'worktree', 'lock', '--reason', 'usb drive', str(portable))
+        admin = _lane_admin_dir(portable)
+        shutil.rmtree(portable)
+
+        await git_ops.prune_worktrees()
+
+        assert str(portable.resolve()) in _registered_paths(git_repo)
+        assert (admin / 'locked').exists()
+
+    async def test_pool_storage_refusal_leaves_the_lock_in_place(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """An unmounted ``worktree_base`` makes every lane look dangling, so
+        an unlock outside the task-2099 refusal gate would hand the next
+        prune a wholesale wipe of every registration."""
+        wt, admin = await _plant_locked_dangling_entry(git_ops)
+        git_ops.warm_lane_pool = WarmLanePool(worktree_base=git_ops.worktree_base, size=1)
+        assert git_ops.pool_in_use()
+        assert not git_ops.pool_storage_present()
+
+        await git_ops.prune_worktrees()
+
+        assert (admin / 'locked').exists()
+        assert str(wt.resolve()) in _registered_paths(git_repo)
