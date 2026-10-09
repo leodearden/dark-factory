@@ -7,6 +7,7 @@ checker's rule.
 """
 from __future__ import annotations
 
+import functools
 from pathlib import Path
 
 import pytest
@@ -166,7 +167,7 @@ def finder() -> _RecordingFinder:
 def _run(argv: list[str], finder: _RecordingFinder, **overrides) -> int:
     kwargs = {
         'description': 'stub lint',
-        'discovery_globs': ('test_*.py',),
+        'discover': functools.partial(discover_files, globs=('test_*.py',)),
         'find_violations': finder,
     }
     kwargs.update(overrides)
@@ -281,30 +282,29 @@ class TestRunCliErrors:
 
 
 class TestRunCliFileSelection:
-    """Directories expand through the globs; ``is_scannable`` gates every file before it is read."""
+    """Directories expand through ``discover``; ``is_scannable`` gates every file before it is read."""
 
-    def test_directory_arg_expands_through_discovery_globs_only(
+    def test_directory_arg_expands_to_exactly_what_discover_returns(
         self, tmp_path: Path, finder: _RecordingFinder
     ):
-        sub = tmp_path / 'sub'
-        sub.mkdir()
-        for f in (
-            tmp_path / 'test_top.py',
-            sub / 'test_nested.py',
-            tmp_path / 'conftest.py',
-            tmp_path / 'helpers.py',
-        ):
+        """The checker's own ``discover`` is the one directory expansion the CLI uses."""
+        chosen = tmp_path / 'helpers.py'
+        for f in (chosen, tmp_path / 'test_not_chosen.py'):
             f.write_text('BAD\n')
+        asked: list[Path] = []
 
-        assert _run([str(tmp_path)], finder) == 1
-        assert sorted(finder.scanned) == sorted(
-            [str(tmp_path / 'test_top.py'), str(sub / 'test_nested.py')]
-        )
+        def discover(directory: Path) -> list[Path]:
+            asked.append(directory)
+            return [chosen]
+
+        assert _run([str(tmp_path)], finder, discover=discover) == 1
+        assert asked == [tmp_path]
+        assert finder.scanned == [str(chosen)]
 
     def test_default_is_scannable_admits_every_explicit_file(
         self, tmp_path: Path, finder: _RecordingFinder, capsys
     ):
-        """Explicit paths bypass the discovery globs: hooks hand over staged files as-is."""
+        """Explicit paths bypass ``discover``: hooks hand over staged files as-is."""
         helper = tmp_path / 'helpers.py'
         helper.write_text('BAD\n')
 

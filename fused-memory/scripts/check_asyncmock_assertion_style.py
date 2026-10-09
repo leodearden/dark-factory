@@ -21,13 +21,14 @@ env-resolution overhead. Adding a third-party dependency here would break that f
 from __future__ import annotations
 
 import ast
+import functools
 import sys
 from pathlib import Path
 
 # Sibling import that survives `python3 -I`: see _lint_cli.py's module docstring.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
-    from _lint_cli import Violation, run_cli
+    from _lint_cli import Violation, discover_files, run_cli
 finally:
     del sys.path[0]
 
@@ -124,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     return run_cli(
         argv,
         description='Check for assert_not_called/assert_not_awaited style mixing in test files.',
-        discovery_globs=_DISCOVERY_GLOBS,
+        discover=functools.partial(discover_files, globs=_DISCOVERY_GLOBS),
         find_violations=find_violations,
     )
 

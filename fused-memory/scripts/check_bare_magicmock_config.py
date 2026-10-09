@@ -1054,10 +1054,9 @@ _DISCOVERY_GLOBS: tuple[str, ...] = ('test_*.py', 'conftest.py', '_*.py')
 def discover_scan_targets(directory: Path) -> list[Path]:
     """Return every file under *directory* the checker scans, sorted.
 
-    The CLI (``main``) and the baseline-integrity census in
-    fused-memory/tests/test_check_bare_magicmock_config.py both resolve
-    ``_DISCOVERY_GLOBS`` through ``_lint_cli.discover_files``, so the gate and its
-    census cannot scan different file sets.
+    The one directory expansion: ``main`` hands it to ``run_cli`` and the
+    baseline-integrity census in fused-memory/tests/test_check_bare_magicmock_config.py
+    calls it, so the gate and its census cannot scan different file sets.
     """
     return discover_files(directory, _DISCOVERY_GLOBS)
 
@@ -1069,7 +1068,7 @@ def main(argv: list[str] | None = None) -> int:
     ``wall-clock-deadline`` — in a single AST pass per file.
 
     For directories, recursively scans test_*.py, conftest.py and _*.py helper
-    modules only (``_DISCOVERY_GLOBS``).  Output and the 0/1/2 exit ladder are
+    modules only (``discover_scan_targets``).  Output and the 0/1/2 exit ladder are
     ``_lint_cli.run_cli``'s.
     """
     return run_cli(
@@ -1080,7 +1079,7 @@ def main(argv: list[str] | None = None) -> int:
             'a registered dataclass (bare-dataclass-double), and load-bearing waits '
             'carrying a wall-clock deadline (wall-clock-deadline).'
         ),
-        discovery_globs=_DISCOVERY_GLOBS,
+        discover=discover_scan_targets,
         find_violations=find_violations,
     )
 

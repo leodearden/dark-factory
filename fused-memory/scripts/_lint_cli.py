@@ -111,14 +111,13 @@ def run_cli(
     argv: Sequence[str] | None,
     *,
     description: str,
-    discovery_globs: tuple[str, ...],
+    discover: Callable[[Path], Iterable[Path]],
     find_violations: Callable[[str, str], list[Violation]],
     is_scannable: Callable[[str], bool] = _scan_every_file,
 ) -> int:
     """Run a checker over the paths in *argv* and return its exit code.
 
-    Directories expand through *discovery_globs*; explicit files are taken as
-    given.  Every collected file, explicit or discovered, must pass
+    Directories expand through *discover*; explicit files are taken as given.  Every collected file, explicit or discovered, must pass
     *is_scannable* before it is read.  See the module docstring for the output
     and exit-code contract.
     """
@@ -132,7 +131,7 @@ def run_cli(
     for path_str in args.paths:
         p = Path(path_str)
         if p.is_dir():
-            files_to_scan.extend(discover_files(p, discovery_globs))
+            files_to_scan.extend(discover(p))
         elif not p.exists():
             print(f'error: {p}: No such file or directory', file=sys.stderr)
             return 2

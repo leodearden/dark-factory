@@ -36,6 +36,7 @@ break that fast path.
 from __future__ import annotations
 
 import ast
+import functools
 import sys
 from pathlib import Path
 from typing import NamedTuple
@@ -43,7 +44,7 @@ from typing import NamedTuple
 # Sibling import that survives `python3 -I`: see _lint_cli.py's module docstring.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 try:
-    from _lint_cli import Violation, is_exempted, run_cli
+    from _lint_cli import Violation, discover_files, is_exempted, run_cli
 finally:
     del sys.path[0]
 
@@ -276,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
     return run_cli(
         argv,
         description='Check for pytest fixtures constructing their own TestClient.',
-        discovery_globs=_DISCOVERY_GLOBS,
+        discover=functools.partial(discover_files, globs=_DISCOVERY_GLOBS),
         find_violations=find_violations,
         is_scannable=is_scannable,
     )
