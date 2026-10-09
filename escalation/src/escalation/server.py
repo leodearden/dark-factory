@@ -5119,7 +5119,8 @@ def create_server(
             state     (str)   — Coarse terminal state; always a member of
                                 ``shared.merge_state.MergeState``.
                                 merge-state-vocab:begin partition=CANCEL_STATES
-                                'done' | 'conflict' | 'blocked' | 'abandoned' | 'superseded' | 'unknown'
+                                'done' | 'conflict' | 'blocked' | 'abandoned' | 'superseded' |
+                                'no_record' | 'stale_record' | 'journaled' | 'unknown'
                                 merge-state-vocab:end
                                 Source of truth: shared/src/shared/merge_state.py::CANCEL_STATES.
                                 The span above is machine-pinned to it by
