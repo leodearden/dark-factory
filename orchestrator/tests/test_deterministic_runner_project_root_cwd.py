@@ -17,7 +17,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from escalation.queue import EscalationQueue
 
-from orchestrator.deterministic_runner import DeterministicRunner
+from orchestrator.deterministic_runner import (
+    DeterministicRunner,
+    ProcessTeardown,
+    ScriptTimeout,
+)
 from orchestrator.proc_supervision import RestartDisposition, RestartOutcome, RestartPlan
 from orchestrator.scheduler import TaskAssignment
 from orchestrator.workflow import WorkflowOutcome
@@ -90,6 +94,39 @@ def _degraded_scheduler(shape: str, task: dict):
 
 def _assignment(task: dict) -> TaskAssignment:
     return TaskAssignment(task_id=str(task['id']), task=task, modules=[])
+
+
+async def _run_capturing_restart_plan(
+    runner: DeterministicRunner, task: dict,
+) -> tuple[WorkflowOutcome, RestartPlan]:
+    captured_plans: list[RestartPlan] = []
+
+    async def _fake_execute(self, *, runner=None, inspector=None):
+        captured_plans.append(self)
+        return RestartOutcome(disposition=RestartDisposition.SCHEDULED)
+
+    with patch.object(RestartPlan, 'execute', _fake_execute):
+        outcome = await runner.run(_assignment(task))
+    [plan] = captured_plans
+    return outcome, plan
+
+
+def _self_target_task(task_id: str, own_unit: str) -> dict:
+    return _task(task_id, {
+        'script': 'scripts/restart.sh',
+        'timeout_secs': 10,
+        'target_unit': own_unit,
+    })
+
+
+def _assert_warned_no_project_root(caplog: pytest.LogCaptureFixture) -> None:
+    warnings = [
+        r for r in caplog.records
+        if r.name == 'orchestrator.deterministic_runner'
+        and r.levelno == logging.WARNING
+        and 'no configured project_root' in r.getMessage()
+    ]
+    assert warnings, [r.getMessage() for r in caplog.records]
 
 
 def _done_provenance_kind(scheduler) -> str:
@@ -188,28 +225,16 @@ class TestBeforeDoneRunsUnderConfiguredProjectRoot:
         self, project_root: Path, elsewhere: Path, queue: EscalationQueue,
     ) -> None:
         own_unit = 'orchestrator-self.service'
-        task = _task('6467', {
-            'script': 'scripts/restart.sh',
-            'timeout_secs': 10,
-            'target_unit': own_unit,
-        })
-        scheduler = _scheduler(task, project_root)
+        task = _self_target_task('6467', own_unit)
         runner = DeterministicRunner(
-            scheduler=scheduler,
+            scheduler=_scheduler(task, project_root),
             escalation_queue=queue,
             own_unit_resolver=lambda: own_unit,
         )
-        captured_plans: list[RestartPlan] = []
 
-        async def _fake_execute(self, *, runner=None, inspector=None):
-            captured_plans.append(self)
-            return RestartOutcome(disposition=RestartDisposition.SCHEDULED)
-
-        with patch.object(RestartPlan, 'execute', _fake_execute):
-            outcome = await runner.run(_assignment(task))
+        outcome, plan = await _run_capturing_restart_plan(runner, task)
 
         assert outcome == WorkflowOutcome.DONE
-        [plan] = captured_plans
         assert plan.cwd == project_root.resolve()
         assert plan.script == project_root.resolve() / 'scripts/restart.sh'
 
@@ -256,10 +281,57 @@ class TestNoConfiguredProjectRoot:
 
         assert outcome == WorkflowOutcome.DONE
         assert marker.read_text().strip() == str(elsewhere.resolve())
-        warnings = [
-            r for r in caplog.records
-            if r.name == 'orchestrator.deterministic_runner'
-            and r.levelno == logging.WARNING
-            and 'no configured project_root' in r.getMessage()
-        ]
-        assert warnings, [r.getMessage() for r in caplog.records]
+        _assert_warned_no_project_root(caplog)
+
+    @pytest.mark.parametrize('shape', ['mock-config', 'no-config'])
+    async def test_detached_restart_falls_back_to_process_cwd_with_warning(
+        self, shape: str, elsewhere: Path, queue: EscalationQueue,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        own_unit = 'orchestrator-self.service'
+        task = _self_target_task('6470', own_unit)
+        runner = DeterministicRunner(
+            scheduler=_degraded_scheduler(shape, task),
+            escalation_queue=queue,
+            own_unit_resolver=lambda: own_unit,
+        )
+
+        with caplog.at_level(logging.WARNING, logger='orchestrator.deterministic_runner'):
+            outcome, plan = await _run_capturing_restart_plan(runner, task)
+
+        assert outcome == WorkflowOutcome.DONE
+        assert plan.cwd == elsewhere.resolve()
+        assert plan.script == elsewhere.resolve() / 'scripts/restart.sh'
+        _assert_warned_no_project_root(caplog)
+
+
+@pytest.mark.asyncio
+class TestScriptTimeoutEscalationNamesTheScriptThatRan:
+    @pytest.mark.parametrize('target_unit', [None, 'orchestrator-other.service'])
+    async def test_survivor_search_key_is_the_resolved_absolute_script(
+        self, target_unit: str | None, project_root: Path, elsewhere: Path,
+        queue: EscalationQueue,
+    ) -> None:
+        task = _task('6471', {
+            'script': RELATIVE_SCRIPT,
+            'timeout_secs': 10,
+            'target_unit': target_unit,
+        })
+        runner = DeterministicRunner(
+            scheduler=_scheduler(task, project_root),
+            escalation_queue=queue,
+            own_unit_resolver=lambda: 'orchestrator.service',
+            unit_inspector=AsyncMock(side_effect=[BASELINE_UNIT_STATE, FRESH_UNIT_STATE]),
+            script_runner=AsyncMock(
+                side_effect=ScriptTimeout(
+                    10, exit_code=0, teardown=ProcessTeardown.NOT_SIGNALLED,
+                ),
+            ),
+        )
+
+        outcome = await runner.run(_assignment(task))
+
+        assert outcome == WorkflowOutcome.BLOCKED
+        [esc] = queue.get_by_task('6471', status='pending')
+        assert esc.summary.startswith('Deploy script timed out'), esc.summary
+        assert str(project_root.resolve() / RELATIVE_SCRIPT) in esc.detail, esc.detail

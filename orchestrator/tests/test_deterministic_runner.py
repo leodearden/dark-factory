@@ -9117,14 +9117,15 @@ class TestDetachedRestartWorkingDirectory:
         from orchestrator.deterministic_runner import DeterministicRunner
 
         queue = EscalationQueue(tmp_path)
+        project_root = (tmp_path / 'project').resolve()
         scheduler = MagicMock()
-        scheduler.config.project_root = Path('/home/leo/src/dark-factory')
+        scheduler.config.project_root = project_root
         runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
 
         before_done = {
             'script': 'scripts/restart-all-orchestrators.sh',
             'args': [],
-            'cwd': '/home/leo/src/dark-factory',
+            'cwd': str(project_root),
             'target_unit': 'orchestrator-dark-factory.service',
         }
         mock_proc = self._make_mock_proc()
@@ -9142,7 +9143,7 @@ class TestDetachedRestartWorkingDirectory:
             f'expected a /bin/sh -c wrapper payload, got {argv!r}'
         )
         wrapped = argv[-1]
-        expected_abs = str(Path('/home/leo/src/dark-factory') / 'scripts/restart-all-orchestrators.sh')
+        expected_abs = str(project_root / 'scripts/restart-all-orchestrators.sh')
         assert expected_abs in wrapped, (
             f'payload must embed the absolutized script path {expected_abs!r}: {wrapped!r}'
         )

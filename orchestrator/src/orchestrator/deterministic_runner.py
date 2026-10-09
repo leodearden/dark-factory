@@ -612,7 +612,7 @@ def _script_timeout_budget_line(exc: ScriptTimeout, subject: str) -> str:
     )
 
 
-def _survivor_processes_line(script: str) -> str:
+def _survivor_processes_line(script: Path) -> str:
     """The actionable sentence for a teardown that left the script's children
     alive — printed by BOTH deploy arms whenever the whole-group kill was not
     the signal dispatched (task 4252 reviewer finding).
@@ -632,7 +632,7 @@ def _survivor_processes_line(script: str) -> str:
     )
 
 
-def _script_timeout_fact_lines(exc: ScriptTimeout, *, script: str) -> list[str]:
+def _script_timeout_fact_lines(exc: ScriptTimeout, *, script: Path) -> list[str]:
     """The FACT sentences both DEPLOY arms print for a ``ScriptTimeout``.
 
     Shared so the two deploy branches cannot come to say different things
@@ -655,9 +655,10 @@ def _script_timeout_fact_lines(exc: ScriptTimeout, *, script: str) -> list[str]:
         exc: the timeout, carrying the three measured facts these sentences
             are built from — budget, the script's own exit code if it had
             one, and which signal the teardown dispatched.
-        script: ``before_done['script']``, the search key the survivor
-            sentence hands the operator when that teardown left the script's
-            children running.  Not on ``exc``: it is the deploy's own
+        script: the absolute path the runner executed
+            (``DeterministicRunner._before_done_paths``), the search key the
+            survivor sentence hands the operator when that teardown left the
+            script's children running.  Not on ``exc``: it is the deploy's own
             configuration, not something the timeout measured.
     """
     group_killed = exc.teardown is ProcessTeardown.GROUP_KILLED
@@ -3270,7 +3271,9 @@ class DeterministicRunner:
             inner_timeout_detail = '\n'.join([
                 description,
                 note,
-                *_script_timeout_fact_lines(exc, script=before_done['script']),
+                *_script_timeout_fact_lines(
+                    exc, script=self._before_done_paths(before_done).script,
+                ),
                 'before_done_ran_at is already stamped (I1) — the deploy is NOT re-run.',
             ])
             return await self._file_infra_issue_and_block(
@@ -4411,7 +4414,7 @@ class DeterministicRunner:
                     inner_timeout_detail = '\n'.join([
                         description,
                         f'Target unit: {target_unit}',
-                        *_script_timeout_fact_lines(exc, script=before_done['script']),
+                        *_script_timeout_fact_lines(exc, script=paths.script),
                         'The post-deploy fresh-PID verify never ran, so the unit state '
                         'after the timeout is unobserved — check it out-of-band (e.g. '
                         'systemctl --user status) before resolving.',
