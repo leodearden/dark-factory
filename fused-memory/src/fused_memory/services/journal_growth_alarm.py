@@ -145,6 +145,22 @@ class JournalGrowthAlarm:
         self._config = config
         self._project_root = project_root
         self._clock = clock
+        self._last_check_at: float | None = None
+
+    async def maybe_check(self) -> None:
+        """Run :meth:`check` at most once per ``check_interval_seconds``.
+
+        The interval is consumed BEFORE the check runs, so a failing check
+        costs one ERROR per interval rather than one per caller tick.
+        """
+        now = self._clock()
+        if (
+            self._last_check_at is not None
+            and now - self._last_check_at < self._config.check_interval_seconds
+        ):
+            return
+        self._last_check_at = now
+        await self.check()
 
     async def check(self) -> tuple[JournalGrowthBreach, ...]:
         """Sample the journal and WARN once per crossed ceiling. Never raises."""
