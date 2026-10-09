@@ -941,6 +941,13 @@ verify_admission_pytest_n: "8"
 # plans/verify-admission-task-slots-gate.md.
 verify_admission_task_slots: 1
 
+# Run each verify leg in its own weighted cgroup scope, a sibling of this unit
+# under app.slice, so agents stop losing thread-for-thread to verify xdist
+# workers (task 5206, operator decision Leo 2026-09-08; per-role weights from
+# task 5205). It also takes verify load out of this unit's own_cpu_some10.
+# Restart tier: not in RELOADABLE_FIELDS, so it goes live at the next redeploy.
+verify_use_cgroup_scope: true
+
 # Pin `-n auto` for every verify subprocess (task 3589's residual, operator
 # decision Leo 2026-09-08). pytest-xdist resolves `-n auto` via psutil physical
 # cores (16) when psutil is importable and via sched_getaffinity (32) when it is
