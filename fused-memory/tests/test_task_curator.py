@@ -1525,62 +1525,57 @@ class TestCuratorInvocationLedger:
     empty and a dead curator was indistinguishable from an idle one.
     """
 
-    _UNCHANGED_KWARGS = (
-        'usage_gate', 'label', 'model', 'max_turns', 'disallowed_tools',
-        'output_schema', 'timeout_seconds', 'cap_wait_sanity_secs',
-    )
-
-    @staticmethod
-    def _gated_curator(tmp_path: Path, cost_store: Any) -> TaskCurator:
-        gate = MagicMock()
-        gate.run_id = 'fm-run-1'
-        return TaskCurator(
-            config=_make_config(), taskmaster=None, usage_gate=gate,
-            config_dir_base=tmp_path, cost_store=cost_store,
-        )
-
     @pytest.mark.asyncio
     async def test_single_call_passes_ledger_keys(self, tmp_path):
-        store_sentinel = object()
-        curator = self._gated_curator(tmp_path, store_sentinel)
+        config = _make_config()
+        gate = MagicMock()
+        gate.run_id = 'fm-run-1'
+        store_sentinel: Any = object()
+        curator = TaskCurator(
+            config=config, taskmaster=None, usage_gate=gate,
+            config_dir_base=tmp_path, cost_store=store_sentinel,
+        )
         mock = AsyncMock(return_value=_agent_result(
             {'action': 'create', 'justification': 'x'},
         ))
 
-        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=mock):
-            await curator._call_llm(
-                CandidateTask(title='T'), pool=[], pool_sizes=dict(_EMPTY_POOL_SIZES),
-                start=0.0, project_id='proj-a', project_root=str(tmp_path),
-            )
+        with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=mock):
+            await curator.curate(CandidateTask(title='T'), 'proj-a', str(tmp_path))
 
         kwargs = mock.call_args.kwargs
         assert kwargs['cost_store'] is store_sentinel
         assert kwargs['role'] == 'task_curator'
         assert kwargs['run_id'] == 'fm-run-1'
         assert kwargs['project_id'] == 'proj-a'
-        assert kwargs['usage_gate'] is curator._usage_gate
+        assert kwargs['usage_gate'] is gate
         assert kwargs['label'] == 'task-curator[proj-a]'
-        assert kwargs['model'] == curator._config.curator.model
-        assert kwargs['max_turns'] == curator._config.curator.max_turns
+        assert kwargs['model'] == config.curator.model
+        assert kwargs['max_turns'] == config.curator.max_turns
         assert kwargs['disallowed_tools'] == ['*']
         assert kwargs['output_schema'] is CURATOR_OUTPUT_SCHEMA
-        assert kwargs['timeout_seconds'] == curator._config.curator.timeout_seconds
+        assert kwargs['timeout_seconds'] == config.curator.timeout_seconds
         assert kwargs['cap_wait_sanity_secs'] is not None
 
     @pytest.mark.asyncio
     async def test_batch_call_passes_ledger_keys_with_batch_role(self, tmp_path):
-        store_sentinel = object()
-        curator = self._gated_curator(tmp_path, store_sentinel)
+        gate = MagicMock()
+        gate.run_id = 'fm-run-1'
+        store_sentinel: Any = object()
+        curator = TaskCurator(
+            config=_make_config(), taskmaster=None, usage_gate=gate,
+            config_dir_base=tmp_path, cost_store=store_sentinel,
+        )
         mock = AsyncMock(return_value=_agent_result({'decisions': [
             {'candidate_index': 0, 'action': 'create', 'justification': 'n0'},
             {'candidate_index': 1, 'action': 'create', 'justification': 'n1'},
         ]}))
 
-        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=mock):
-            await curator._call_llm_batch(
+        with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=mock):
+            await curator.curate_batch(
                 [CandidateTask(title='T0'), CandidateTask(title='T1')],
-                pools=[[], []], pool_sizes_list=[{}, {}],
-                start=0.0, project_id='proj-b', project_root=str(tmp_path),
+                'proj-b', str(tmp_path),
             )
 
         kwargs = mock.call_args.kwargs
@@ -1588,7 +1583,7 @@ class TestCuratorInvocationLedger:
         assert kwargs['role'] == 'task_curator_batch'
         assert kwargs['run_id'] == 'fm-run-1'
         assert kwargs['project_id'] == 'proj-b'
-        assert kwargs['usage_gate'] is curator._usage_gate
+        assert kwargs['usage_gate'] is gate
         assert kwargs['label'] == 'task-curator-batch[proj-b]'
         assert kwargs['output_schema'] is CURATOR_BATCH_OUTPUT_SCHEMA
 
@@ -1599,11 +1594,9 @@ class TestCuratorInvocationLedger:
             {'action': 'create', 'justification': 'x'},
         ))
 
-        with patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=mock):
-            await curator._call_llm(
-                CandidateTask(title='T'), pool=[], pool_sizes=dict(_EMPTY_POOL_SIZES),
-                start=0.0, project_id='proj-c', project_root=str(tmp_path),
-            )
+        with patch.object(curator, '_build_corpus', side_effect=_empty_corpus), \
+             patch('fused_memory.middleware.task_curator.invoke_with_cap_retry', new=mock):
+            await curator.curate(CandidateTask(title='T'), 'proj-c', str(tmp_path))
 
         kwargs = mock.call_args.kwargs
         assert kwargs['cost_store'] is None

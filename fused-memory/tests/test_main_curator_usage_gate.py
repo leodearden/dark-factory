@@ -392,6 +392,19 @@ def _enabled_cap_config(data_dir: Path) -> MagicMock:
     return config
 
 
+async def _landed_account_event_run_ids(db_path: Path, timeout: float = 5.0) -> list:
+    """Every ``account_events.run_id``, once the gate's fire-and-forget write has landed."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        async with aiosqlite.connect(db_path) as conn:
+            cursor = await conn.execute('SELECT run_id FROM account_events')
+            run_ids = [row[0] for row in await cursor.fetchall()]
+        if run_ids or loop.time() >= deadline:
+            return run_ids
+        await asyncio.sleep(0.02)
+
+
 class TestCuratorRunId:
     """One run key for both curator writers: the gate's account events and the
     curator's invocations, which ``TaskCurator`` reads back from the gate."""
@@ -439,21 +452,19 @@ class TestCuratorRunId:
             store, gate = await _setup_curator_usage_gate(_enabled_cap_config(tmp_path))
         assert store is not None and gate is not None
         try:
-            gate._run_probe = AsyncMock(return_value=True)
-            gate._handle_cap_detected('test cap reason', None, gate._accounts[0].token)
-            pending = list(gate._background_tasks)
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-
-            async with aiosqlite.connect(tmp_path / 'curator_events.db') as conn:
-                cursor = await conn.execute('SELECT run_id FROM account_events')
-                run_ids = [row[0] for row in await cursor.fetchall()]
+            lease = await gate.before_invoke()
+            assert lease is not None
+            assert gate.detect_cap_hit(
+                '', "You've hit your usage limit. Your plan resets in 3 hours.",
+                oauth_token=lease.token,
+            )
+            run_ids = await _landed_account_event_run_ids(tmp_path / 'curator_events.db')
         finally:
             await gate.shutdown()
             await store.close()
 
-        assert run_ids == [gate.run_id]
         assert gate.run_id
+        assert run_ids == [gate.run_id]
 
     @pytest.mark.asyncio
     async def test_disabled_cap_with_run_id_allocates_nothing(self):
