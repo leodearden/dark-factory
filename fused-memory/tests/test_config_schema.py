@@ -4225,7 +4225,7 @@ class TestDedupOutageDetectorConfig:
         from fused_memory.config.schema import DedupOutageDetectorConfig
 
         with pytest.raises(ValidationError) as excinfo:
-            DedupOutageDetectorConfig(**{field: 0})
+            DedupOutageDetectorConfig.model_validate({field: 0})
         assert field in str(excinfo.value)
 
     def test_reachable_from_the_top_level_config(self):

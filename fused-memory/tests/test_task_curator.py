@@ -1531,7 +1531,7 @@ class TestCuratorInvocationLedger:
     )
 
     @staticmethod
-    def _gated_curator(tmp_path: Path, cost_store: object) -> TaskCurator:
+    def _gated_curator(tmp_path: Path, cost_store: Any) -> TaskCurator:
         gate = MagicMock()
         gate.run_id = 'fm-run-1'
         return TaskCurator(

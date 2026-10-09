@@ -416,14 +416,14 @@ class TestCuratorRunId:
     async def test_explicit_run_id_is_carried_by_the_gate(self, tmp_path):
         from fused_memory.server.main import _setup_curator_usage_gate  # noqa: PLC0415
 
-        opened: list[tuple[object, object]] = []
+        opened: list[tuple[CostStore | None, UsageGate | None]] = []
         try:
             with patch.dict(os.environ, {'TEST_TOKEN_ACCT_A': 'fake-token'}):
                 for run_id in ('run-a', 'run-b'):
                     opened.append(await _setup_curator_usage_gate(
                         _enabled_cap_config(tmp_path / run_id), run_id=run_id,
                     ))
-            assert [gate.run_id for _, gate in opened] == ['run-a', 'run-b']
+            assert [gate and gate.run_id for _, gate in opened] == ['run-a', 'run-b']
         finally:
             for store, gate in opened:
                 if gate is not None:
