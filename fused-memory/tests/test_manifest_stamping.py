@@ -348,6 +348,96 @@ async def test_round_trip_preserves_task_level_note_and_open_verdict(tmp_path):
     assert checks[0]['kind'] == 'grep'
 
 
+# The header the eval-framework-revival sidecar carried before a
+# yaml.safe_dump write-back discarded it.
+_MEASURED_EVAL_REVIVAL_HEADER = (
+    '# Machine-readable sidecar for plans/eval-framework-revival-prd.md\n'
+    '# Created 2026-07-20 for the paired-edit task π (architect-fable OFAT candidate,\n'
+    "# added by plans/fable-architect-eval-admission-prd.md's authoring session —\n"
+    '# the ο precedent). Earlier eval-revival tasks predate the sidecar convention;\n'
+    '# their bindings live in the hand-named .md manifest only.\n'
+    '# Schema: plans/capability-delivered-checks-prd.md §Contract\n'
+    '# (shared/src/shared/capability_manifest.py). task_id stamped by commit_planning.\n'
+)
+
+
+@pytest.mark.asyncio
+async def test_stamp_preserves_sidecar_header_comment(tmp_path):
+    """A stamp rewrites only the bound label's task_id value: the header
+    comment block, inline comments and every other byte survive on disk."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'eval-framework-revival-prd.capability-manifest.yaml'
+    original = _MEASURED_EVAL_REVIVAL_HEADER + (
+        _mechanical_sidecar_yaml('eval-framework-revival', ['π', 'ρ'])
+        .replace('  - label: π\n', '  - label: π  # the paired-edit task\n')
+        .replace('    title: Mechanical task ρ\n', '    title: Mechanical task ρ  # not yet decomposed\n')
+    )
+    sidecar_path.write_bytes(original.encode('utf-8'))
+
+    task_interceptor = AsyncMock()
+    task_interceptor.update_task = AsyncMock(return_value={'success': True})
+
+    report = await stamp_capability_manifests(
+        project_root=str(tmp_path),
+        ids=['2861'],
+        tasks_data=[
+            {
+                'id': '2861',
+                'metadata': {
+                    'prd_path': 'plans/eval-framework-revival-prd.md',
+                    'prd_task_label': 'π',
+                },
+            },
+        ],
+        task_interceptor=task_interceptor,
+    )
+
+    assert report == {
+        'path': 'plans/eval-framework-revival-prd.capability-manifest.yaml',
+        'stamped': ['π'],
+        'missing_labels': [],
+        'errors': [],
+    }
+    expected = original.replace(
+        '  - label: π  # the paired-edit task\n    task_id: null\n',
+        '  - label: π  # the paired-edit task\n    task_id: 2861\n',
+    )
+    assert sidecar_path.read_bytes() == expected.encode('utf-8')
+
+
+@pytest.mark.asyncio
+async def test_stamp_refuses_label_bound_to_external_producer(tmp_path):
+    """A batch label naming a block whose producer is EXTERNAL must not be
+    stamped: a block binding both task_id and external_task_id no longer
+    loads, so the write is refused, reported, and the file left untouched."""
+    plans_dir = tmp_path / 'plans'
+    plans_dir.mkdir()
+    sidecar_path = plans_dir / 'ext-prd.capability-manifest.yaml'
+    original = _mechanical_sidecar_yaml('ext', ['ext']).replace(
+        '    task_id: null\n', '    external_task_id: reify:5613\n'
+    )
+    sidecar_path.write_bytes(original.encode('utf-8'))
+
+    task_interceptor = AsyncMock()
+
+    report = await stamp_capability_manifests(
+        project_root=str(tmp_path),
+        ids=['601'],
+        tasks_data=[
+            {'id': '601', 'metadata': {'prd_path': 'plans/ext-prd.md', 'prd_task_label': 'ext'}},
+        ],
+        task_interceptor=task_interceptor,
+    )
+
+    assert report is not None
+    assert report['stamped'] == []
+    assert len(report['errors']) == 1
+    assert 'refused' in report['errors'][0]
+    assert sidecar_path.read_bytes() == original.encode('utf-8')
+    task_interceptor.update_task.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_sidecar_missing_on_disk_returns_none(tmp_path):
     """prd_path/prd_task_label are present but the derived sidecar file doesn't exist."""
