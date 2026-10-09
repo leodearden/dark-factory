@@ -1393,22 +1393,14 @@ def extract_df_data_block(src: str, key: str) -> str:
 def jsx_open_tag_end(src: str, start: int) -> int | None:
     """Return the index JUST PAST the ``>`` closing the opening tag at *start*.
 
-    *start* must index the tag's ``<``; ``src[start:end]`` is then the whole
-    tag, and ``src[end - 2:end] == '/>'`` tells a self-closing one.
+    *start* must index the tag's ``<``, else ``ValueError``.  ``src[start:end]``
+    is the whole tag; ``src[end - 2:end] == '/>'`` tells a self-closing one.  A
+    ``<`` or ``>`` inside a ``{...}`` attribute expression or a string/template
+    literal does not end the tag.
 
-    Quote- and brace-aware: a ``<`` or ``>`` inside an attribute EXPRESSION
-    (``onClick={() => ...}``, ``hint={x > 0 ? ...}``, a nested ``<Bar/>``) or
-    inside a string/template literal is an operator, not the end of the tag.
-
-    ``None`` when *start* does not begin a closed opening tag: it is never
-    closed, a literal is never terminated, a bare ``<`` opens at depth 0 first,
-    or a ``}`` drives brace depth negative.  It NEVER raises on a miss, because
-    what a miss means is the caller's call: to a probe trying candidate starts
-    it is the expected "not this one", but to a census running absence
-    assertions over the span it is a lost tag, a silent false GREEN, and that
-    caller must assert on ``None`` itself.  ``None`` rather than ``-1`` because
-    pyright rejects arithmetic on an unchecked Optional, whereas ``-1`` as an
-    exclusive slice end silently yields a near-whole-file span.
+    ``None``, never a raise, when *start* begins no closed opening tag: it is
+    never closed, a literal is never terminated, a bare ``<`` opens at depth 0
+    first, or a ``}`` drives brace depth negative.
 
     Not comment-aware (pass `strip_js_comments` output), and it shares
     `_scan_js`'s lexer blind spots.
