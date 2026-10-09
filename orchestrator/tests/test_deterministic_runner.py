@@ -9105,44 +9105,8 @@ class TestDetachedRestartWorkingDirectory:
             f'the /bin/sh -c wrapper tail must be preserved: {argv!r}'
         )
 
-    async def test_relative_script_absent_cwd_falls_back_to_getcwd(self, tmp_path: Path):
-        """With no before_done['cwd'], --working-directory must fall back to os.getcwd().
-
-        The orchestrator's own systemd unit pins WorkingDirectory=project_root, so
-        os.getcwd() at scheduling time is the correct fallback root.
-        """
-        import os
-        from unittest.mock import patch
-
-        from orchestrator.deterministic_runner import DeterministicRunner
-
-        queue = EscalationQueue(tmp_path)
-        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
-
-        before_done = {
-            'script': 'scripts/restart-all-orchestrators.sh',
-            'args': [],
-            'target_unit': 'orchestrator-dark-factory.service',
-        }
-        mock_proc = self._make_mock_proc()
-
-        with patch('asyncio.create_subprocess_exec', return_value=mock_proc) as mock_exec:
-            await runner._default_schedule_detached_restart(
-                before_done,
-                transient_unit='orch-redeploy-restart-2106.service',
-                on_active_secs=60,
-                task_id='2106',
-            )
-
-        all_argv = ' '.join(
-            str(a) for call in mock_exec.call_args_list for a in call.args
-        )
-        assert f'--working-directory={os.getcwd()}' in all_argv, (
-            f'--working-directory must fall back to os.getcwd(): {all_argv!r}'
-        )
-
     async def test_relative_script_absolutized_in_payload(self, tmp_path: Path):
-        """A relative script must be absolutized against cwd in the /bin/sh -c payload.
+        """A relative script must be absolutized against project_root in the /bin/sh -c payload.
 
         --working-directory alone is not enough to trust for the leading command
         of the payload: absolutizing the script too is defense-in-depth so it is
@@ -9153,7 +9117,9 @@ class TestDetachedRestartWorkingDirectory:
         from orchestrator.deterministic_runner import DeterministicRunner
 
         queue = EscalationQueue(tmp_path)
-        runner = DeterministicRunner(scheduler=MagicMock(), escalation_queue=queue)
+        scheduler = MagicMock()
+        scheduler.config.project_root = Path('/home/leo/src/dark-factory')
+        runner = DeterministicRunner(scheduler=scheduler, escalation_queue=queue)
 
         before_done = {
             'script': 'scripts/restart-all-orchestrators.sh',
