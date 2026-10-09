@@ -2981,6 +2981,50 @@ class TestReingestedContentClassifier:
 
 
 # ---------------------------------------------------------------------------
+# is_non_dialogue_carrier -- the ONE composite question (provenance + content)
+# the digest's detectors and the sampler's pre-scorer both ask of a carrier.
+# ---------------------------------------------------------------------------
+
+_ORDINARY_DIALOGUE = 'please fix the bug in the merge worker'
+_PROSE_SELF_CORRECTION = "Actually, that's wrong — use the other branch"
+_PROSE_QUOTING_THE_SCHEMA = (
+    'The coder answers with {"matches": [], "candidates": []} '
+    "— that's wrong, it should be a single object per session."
+)
+
+
+class TestNonDialogueCarrierPredicate:
+    @pytest.mark.parametrize(
+        ('record', 'text'),
+        [
+            (_with_origin(_user_text(_ORDINARY_DIALOGUE), 'task-notification'), _ORDINARY_DIALOGUE),
+            (_assistant(_text(_coder_judgment())), _coder_judgment()),
+            (_assistant(_text(_json_fenced(_coder_judgment()))), _json_fenced(_coder_judgment())),
+            (_user_text(_briefing_text()), _briefing_text()),
+            (_user_text(_TRICKLE_CODER_PREAMBLE), _TRICKLE_CODER_PREAMBLE),
+        ],
+        ids=[
+            'non_human_origin_alone_decides', 'coder_judgment', 'json_fenced_coder_judgment',
+            'briefing', 'trickle_coder_prompt',
+        ],
+    )
+    def test_a_non_dialogue_carrier_is_rejected(self, record, text):
+        assert mod.is_non_dialogue_carrier(record, text) is True
+
+    @pytest.mark.parametrize(
+        ('record', 'text'),
+        [
+            (_with_origin(_user_text(_ORDINARY_DIALOGUE), 'human'), _ORDINARY_DIALOGUE),
+            (_assistant(_text(_PROSE_SELF_CORRECTION)), _PROSE_SELF_CORRECTION),
+            (_assistant(_text(_PROSE_QUOTING_THE_SCHEMA)), _PROSE_QUOTING_THE_SCHEMA),
+        ],
+        ids=['human_origin', 'genuine_self_correction', 'prose_quoting_the_schema_inline'],
+    )
+    def test_this_sessions_own_dialogue_is_kept(self, record, text):
+        assert mod.is_non_dialogue_carrier(record, text) is False
+
+
+# ---------------------------------------------------------------------------
 # Run-review-prompt exclusion via is_harness_injected_turn -- R1 (confusion
 # census 2026-07-31 §1.1 facet (b), :81/:85): 5 sightings across 5 sessions
 # where the flagged "User Correction" is a full Reconciliation Run Review.
