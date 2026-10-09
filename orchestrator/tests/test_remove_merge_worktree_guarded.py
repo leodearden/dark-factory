@@ -20,6 +20,8 @@ sibling ``<path>.lock`` file unlink-on-removal vs. retain-on-skip contract.
 TestCleanupMergeWorktreeRouting pins that cleanup_merge_worktree delegates
 to the guarded primitive, so a lease-held tree is skipped rather than
 force-removed, while uncontended removal is unchanged.
+TestRemoveLockedMergeWorktree pins that a tree carrying git's ``locked``
+marker is removed together with its admin entry (task 4828).
 """
 from __future__ import annotations
 
@@ -27,6 +29,7 @@ import asyncio
 import errno
 import logging
 import os
+import shutil
 from pathlib import Path
 
 import pytest
@@ -84,6 +87,25 @@ def git_ops(git_repo: Path) -> GitOps:
 async def _make_ephemeral_worktree(git_ops: GitOps) -> Path:
     """Build a real ephemeral ``_merge-<uuid>`` worktree at the repo's HEAD."""
     return await git_ops.create_throwaway_verify_worktree(await _head_sha(git_ops.project_root))
+
+
+def _lane_admin_dir(lane: Path) -> Path:
+    """Parse the ``.git/worktrees/<name>`` admin dir path out of a lane's
+    ``.git`` pointer file (``gitdir: <repo>/.git/worktrees/<name>``)."""
+    content = (lane / '.git').read_text().strip()
+    prefix = 'gitdir:'
+    assert content.startswith(prefix), f'unexpected worktree .git pointer: {content!r}'
+    return Path(content[len(prefix):].strip())
+
+
+async def _registered_paths(repo: Path) -> set[str]:
+    rc, out, err = await _run(['git', 'worktree', 'list', '--porcelain'], cwd=repo)
+    assert rc == 0, err
+    return {
+        str(Path(line[len('worktree '):]).resolve())
+        for line in out.splitlines()
+        if line.startswith('worktree ')
+    }
 
 
 def _raise_enospc(*_a, **_k):
@@ -543,3 +565,63 @@ class TestCleanupMergeWorktreeRouting:
         # Idempotency half: a re-call over the now-absent tree must not raise
         # either (the primitive short-circuits to 'not_present').
         await git_ops.cleanup_merge_worktree(wt)
+
+
+# ---------------------------------------------------------------------------
+# task 4828: a tree carrying git's `locked` marker
+# ---------------------------------------------------------------------------
+
+
+async def _make_locked_ephemeral_worktree(git_ops: GitOps) -> tuple[Path, Path]:
+    """A real ``_merge-*`` worktree whose admin entry carries git's own
+    interrupted-``worktree add`` lock. Returns ``(worktree, admin_dir)``."""
+    wt = await _make_ephemeral_worktree(git_ops)
+    admin = _lane_admin_dir(wt)
+    (admin / 'locked').write_text('initializing')
+    return wt, admin
+
+
+@pytest.mark.asyncio
+class TestRemoveLockedMergeWorktree:
+    """Nothing in this repo sets git's ``locked`` marker, so on a ``_merge-*``
+    tree it can only be git's abandoned ``initializing`` one; the held lease,
+    not that marker, is the liveness gate."""
+
+    async def test_locked_merge_worktree_is_removed_with_its_admin_entry(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        wt, admin = await _make_locked_ephemeral_worktree(git_ops)
+
+        outcome = await git_ops.remove_merge_worktree_guarded(wt, reason='test')
+
+        assert outcome == 'removed'
+        assert not wt.exists()
+        assert not admin.exists(), 'the locked admin entry must go with its tree'
+        assert str(wt.resolve()) not in await _registered_paths(git_repo)
+
+    async def test_cleanup_merge_worktree_on_a_locked_tree_leaves_no_registration(
+        self, git_ops: GitOps, git_repo: Path,
+    ):
+        """A 'failed' here sends the tree to cleanup's rmtree fallback, after
+        which the prune cannot reclaim the locked entry: the tree-gone,
+        entry-present state that failed every merge_request enqueue."""
+        wt, _ = await _make_locked_ephemeral_worktree(git_ops)
+
+        await git_ops.cleanup_merge_worktree(wt)
+
+        assert not wt.exists()
+        assert str(wt.resolve()) not in await _registered_paths(git_repo), (
+            'cleanup must not leave a registration for the removed tree'
+        )
+
+    async def test_missing_admin_dir_still_returns_failed(self, git_ops: GitOps):
+        """Positive control for the task-2924/2922 shape-1 contract: no number
+        of ``--force`` flags overrides 'not a working tree', so overriding
+        the lock must not widen what the primitive removes."""
+        wt = await _make_ephemeral_worktree(git_ops)
+        shutil.rmtree(_lane_admin_dir(wt))
+
+        outcome = await git_ops.remove_merge_worktree_guarded(wt, reason='test')
+
+        assert outcome == 'failed'
+        assert wt.exists(), 'a failed removal must leave the directory intact'
