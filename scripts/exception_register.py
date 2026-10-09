@@ -35,6 +35,7 @@ import argparse
 import ast
 import dataclasses
 import datetime
+import enum
 import inspect
 import json
 import re
@@ -1038,6 +1039,119 @@ def closed_world_violations(
 
 
 # ---------------------------------------------------------------------------
+# The owner sweep's run stamp.
+
+#: Where the owner sweep writes its result object, relative to the checkout
+#: root; under the gitignored data/ tree, as scripts/dashboard-watchdog.py::STATE_PATH.
+SWEEP_STATE_PATH = 'data/exception-owner-sweep/state.json'
+
+#: The sweep timer's period.  A stamp older than two periods is stale.
+SWEEP_PERIOD = datetime.timedelta(days=1)
+
+
+class SweepStatus(enum.Enum):
+    NEVER_RUN = 'never_run'
+    FRESH = 'fresh'
+    STALE = 'stale'
+    UNREADABLE = 'unreadable'
+
+
+@dataclasses.dataclass(frozen=True)
+class SweepReading:
+    """What the sweep's stamp says, and whether it can be trusted.
+
+    ``result`` is the stamp's object verbatim when it is one; ``detail`` says
+    why an unreadable stamp could not be read.
+    """
+
+    status: SweepStatus
+    state_path: Path
+    last_run: datetime.datetime | None = None
+    age: datetime.timedelta | None = None
+    ok: bool | None = None
+    detail: str | None = None
+    result: Mapping[str, object] | None = None
+
+
+def _stale_after() -> str:
+    return f'two timer periods ({int(2 * SWEEP_PERIOD / datetime.timedelta(hours=1))} h)'
+
+
+def _unreadable(path: Path, detail: str, result: Mapping[str, object] | None = None) -> SweepReading:
+    return SweepReading(SweepStatus.UNREADABLE, path, detail=detail, result=result)
+
+
+def read_sweep(path: Path, *, now: datetime.datetime) -> SweepReading:
+    """The sweep stamp at *path* as of *now*.  An absent stamp means it never ran."""
+    try:
+        text = path.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return SweepReading(SweepStatus.NEVER_RUN, path)
+    except (OSError, UnicodeDecodeError) as exc:
+        return _unreadable(path, f'could not be read -- {exc}')
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return _unreadable(path, f'is not JSON -- {exc}')
+    if not isinstance(result, dict):
+        return _unreadable(path, f'is not a JSON object but {type(result).__name__}')
+    raw = result.get('last_run')
+    try:
+        last_run = datetime.datetime.fromisoformat(raw) if isinstance(raw, str) else None
+    except ValueError:
+        last_run = None
+    if last_run is None or last_run.utcoffset() is None:
+        return _unreadable(
+            path, f'last_run={raw!r} is not an ISO-8601 timestamp with a UTC offset', result
+        )
+    ok = result.get('ok')
+    if not isinstance(ok, bool):
+        return _unreadable(path, f'ok={ok!r} is not a bool', result)
+    age = now - last_run
+    status = SweepStatus.STALE if age > 2 * SWEEP_PERIOD else SweepStatus.FRESH
+    return SweepReading(status, path, last_run=last_run, age=age, ok=ok, result=result)
+
+
+def _sweep_record(reading: SweepReading) -> dict[str, object]:
+    return {
+        'status': reading.status.value,
+        'state_path': str(reading.state_path),
+        'last_run': None if reading.last_run is None else reading.last_run.isoformat(),
+        'age_seconds': None if reading.age is None else reading.age.total_seconds(),
+        'ok': reading.ok,
+        'detail': reading.detail,
+        'result': None if reading.result is None else dict(reading.result),
+    }
+
+
+def _sweep_line(reading: SweepReading) -> str:
+    if reading.status is SweepStatus.NEVER_RUN:
+        return f'last sweep: never run (no stamp at {reading.state_path})'
+    if reading.status is SweepStatus.UNREADABLE:
+        return f'last sweep: unreadable stamp at {reading.state_path} -- {reading.detail}'
+    assert reading.age is not None
+    hours = reading.age / datetime.timedelta(hours=1)
+    outcome = 'ok' if reading.ok else 'FAILED'
+    stale = f', STALE: older than {_stale_after()}' if reading.status is SweepStatus.STALE else ''
+    return f'last sweep: {hours:.1f} h ago ({outcome}{stale}) -- {reading.state_path}'
+
+
+def _sweep_failure(reading: SweepReading) -> str | None:
+    """The exit-2 line for a sweep whose stamp cannot be trusted, else ``None``."""
+    if reading.status is SweepStatus.STALE:
+        return (
+            f"the owner sweep's stamp at {reading.state_path} is stale: its last run is older "
+            f'than {_stale_after()}, so dead owners are no longer being detected'
+        )
+    if reading.status is SweepStatus.UNREADABLE:
+        return (
+            f"the owner sweep's stamp at {reading.state_path} is unreadable ({reading.detail}), "
+            f'so whether it ran within {_stale_after()} cannot be told'
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
 # The register, and the CLI.
 
 
@@ -1050,10 +1164,11 @@ class Register:
     inline: InlineReport
     violations: tuple[Violation, ...]
     unregistered: tuple[ListRef, ...]
+    sweep: SweepReading
 
 
-def measure(root: Path) -> Register:
-    """Measure *root*'s register once."""
+def measure(root: Path, *, sweep_state: Path, now: datetime.datetime) -> Register:
+    """Measure *root*'s register once, reading the sweep stamp at *sweep_state* as of *now*."""
     validate_not_exception_lists(NOT_EXCEPTION_LISTS)
     table = load_ratifications(root / TABLE_PATH)
     corpus = read_corpus(root)
@@ -1069,6 +1184,7 @@ def measure(root: Path) -> Register:
         unregistered=unregistered_candidates(
             candidates, discovery.declarations, NOT_EXCEPTION_LISTS
         ),
+        sweep=read_sweep(sweep_state, now=now),
     )
 
 
@@ -1125,6 +1241,7 @@ def register_document(register: Register) -> dict[str, object]:
             {'path': ref.path, 'symbol': ref.symbol} for ref in register.unregistered
         ],
         'violations': [violation.record() for violation in register.violations],
+        'sweep': _sweep_record(register.sweep),
     }
 
 
@@ -1219,18 +1336,21 @@ def render_report(register: Register) -> str:
         *(f'  {ref.render()}' for ref in register.unregistered),
         *_inline_lines(register.inline),
         f'violations: {len(register.violations)}',
+        _sweep_line(register.sweep),
     ]
     return '\n'.join(lines)
 
 
 _PROG = 'exception_register.py'
 
-_EPILOG = """exit codes:
+_EPILOG = f"""exit codes:
   --report  0 clean; 1 violations, one per line on stderr: a Policy naming no
             row of the ratification table, or a malformed disposition literal;
-            2 instrument failure.
-  --json    0 whenever a document could be built, violations included as data;
-            2 instrument failure.
+            2 an instrument failure, or an owner-sweep stamp that is stale
+            (older than {_stale_after()}) or unreadable. A sweep that has
+            never run is not a failure.
+  --json    0 whenever a document could be built, violations and the sweep's
+            status included as data; 2 an instrument failure.
   An instrument failure is a missing or malformed ratification table, a
   declaration the static reader cannot read (a non-literal argument other than
   keys, a duplicate list_id, an unparseable file), a failure of
@@ -1261,19 +1381,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help='the checkout to measure (default: the one holding this script)',
     )
     parser.add_argument(
-        '--sweep-state', type=Path, default=None, help="the owner sweep's run stamp"
+        '--sweep-state',
+        type=Path,
+        default=None,
+        help=f"the owner sweep's run stamp (default: <root>/{SWEEP_STATE_PATH})",
     )
     return parser
 
 
 def _run(args: argparse.Namespace) -> int:
-    register = measure(Path(args.root))
+    root = Path(args.root)
+    sweep_state = Path(args.sweep_state) if args.sweep_state else root / SWEEP_STATE_PATH
+    register = measure(root, sweep_state=sweep_state, now=datetime.datetime.now(datetime.UTC))
     if args.json:
         print(json.dumps(register_document(register), indent=2, sort_keys=True))
         return 0
     print(render_report(register))
     for violation in register.violations:
         print(violation.render(), file=sys.stderr)
+    failure = _sweep_failure(register.sweep)
+    if failure is not None:
+        print(f'{_PROG}: {failure}', file=sys.stderr)
+        return 2
     return 1 if register.violations else 0
 
 
