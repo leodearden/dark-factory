@@ -294,9 +294,9 @@ _DEFAULT_PER_URL_DEADLINE_SECONDS = 75.0
 # ── why the deadline is default-on ──────────────────────────────────
 #
 # Most live :func:`first_success` call sites carry no enclosing deadline of
-# their own — measured under task 4958: ``app::api_curator_cancel`` (the
-# ``cancel_ticket`` proxy), ``app::_scheduler_proxy``, the three ``tasks``
-# sites, and ``scheduler``'s. Only ``metrics`` wraps its own inner call, and it
+# their own — measured under task 4958: ``app::_mcp_write_proxy`` (the
+# ``cancel_ticket`` and scheduler write proxy), the three ``tasks`` sites, and
+# ``scheduler``'s. Only ``metrics`` wraps its own inner call, and it
 # had to hand-convert ``TimeoutError`` into ``ValueError`` to do so. Those
 # unwrapped sites are precisely the ones that could park forever, and they are
 # outside this module — so an opt-in parameter would have left the hole open
@@ -565,10 +565,10 @@ async def first_success(
     an ``httpx.PoolTimeout`` (this client's own pool is saturated) is
     distinguishable from a genuinely unreachable endpoint.
 
-    ``log_failures=False`` suppresses that reporting for the two ``app.py``
-    proxies that already emit their own fully-detailed WARNING at the call
-    site: the failure is then reported exactly once, by the caller, rather
-    than twice at the same level.
+    ``log_failures=False`` suppresses that reporting for ``app.py``'s
+    MCP-write proxy, which already emits its own fully-detailed WARNING at the
+    call site: the failure is then reported exactly once, by the caller,
+    rather than twice at the same level.
 
     **A builtin ``TimeoutError`` is exempt from that suppression** and is
     always reported. It cannot be a duplicate of a call-site line, by
@@ -576,7 +576,7 @@ async def first_success(
     the call site sees is a ``CancelledError`` — a ``BaseException``, outside
     its own ``except (ConnectError, TimeoutException, HTTPStatusError,
     ValueError)`` — and it logs nothing. Suppressing here too would make a hang
-    the ONE failure at those two sites that leaves no journal trace at all,
+    the ONE failure at that site that leaves no journal trace at all,
     which is the task-1814 shape this module's log policy exists to prevent.
 
     ``per_url_timeout`` is a **whole-operation deadline applied to each URL's
@@ -586,7 +586,7 @@ async def first_success(
     deliberately no way to disable it. A backstop with an off switch is a
     footgun — the only caller who would reach for it is one that has not
     thought about hangs, which is exactly the population it protects. Most live
-    call sites (``app.py``'s two proxies, the three ``tasks.py`` sites,
+    call sites (``app.py``'s MCP-write proxy, the three ``tasks.py`` sites,
     ``scheduler.py``'s) have no enclosing deadline of their own and are the
     ones that can park forever; a default-on bound closes that for them without
     editing any of them, and is non-binding for the callers that already wrap

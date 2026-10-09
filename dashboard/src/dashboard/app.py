@@ -1049,19 +1049,8 @@ async def api_performance(request: Request) -> JSONResponse:
     return JSONResponse(with_window(shaped, window))
 
 
-# Cap str(exc) inside the 502 `detail` field to bound arbitrary-length
-# exception message text from any of the caught exception types (e.g. a
-# long ValueError arg, or a long httpx exception message string).  Note:
-# httpx.HTTPStatusError.__str__ (inherited from BaseException) returns
-# only its message arg — NOT the response body — so the cap defends
-# against long message strings rather than response-body leakage.  The
-# WARNING log still records the full untruncated exception text.
-# Also adopted by _scheduler_proxy, whose hand-rolled `str(exc)[:200]` was the
-# "equivalent truncation path" this comment anticipated; the name is kept for
-# its original site rather than renamed across both.  Note the two caps differ
-# slightly in what they bound: the cancel handler truncates str(exc) and then
-# prefixes the type, while _scheduler_proxy truncates the already-rendered
-# 'Type: message' — so the type name there is inside the cap, never after it.
+# Bounds each URL's rendered 'Type: message' cause in the 502 detail; the
+# call-site WARNING keeps the full text.
 _MCP_WRITE_DETAIL_CHAR_LIMIT = 200
 
 
@@ -1080,11 +1069,12 @@ async def _mcp_write_proxy(
     *,
     treat_not_found_as_404: bool = True,
 ) -> JSONResponse:
-    """Fan out an MCP tool call over all fused_memory_urls, return first success.
+    """The single MCP-write proxy behind the curator-cancel and scheduler write routes.
 
-    Validation and argument construction happen in the calling route handler;
-    this helper is responsible only for the fan-out, transport error handling,
-    and status-code mapping (502 when all URLs fail, optional 404 on not_found).
+    Validation and argument construction stay in the calling route handler.
+    This fans *tool_name* out over all fused_memory_urls and returns the first
+    success, rendering transport errors, mapping not_found to 404 when
+    *treat_not_found_as_404*, and answering 502 when every URL fails.
     """
 
     async def _call(url: str) -> JSONResponse:
@@ -1098,15 +1088,14 @@ async def _mcp_write_proxy(
             # content-free.  PreformattedFanoutError, not ValueError: the
             # message is already a rendered 'Type: message' and first_success
             # renders every caught exception through describe_exc again, which
-            # would prepend a second type name.  Mirrors the cancel_ticket
-            # fan-out above — the two proxies must render errors identically.
+            # would prepend a second type name.
             detail = describe_exc(exc)
             logger.warning('%s failed for %s: %s', tool_name, url, detail)
             raise PreformattedFanoutError(detail[:_MCP_WRITE_DETAIL_CHAR_LIMIT]) from exc
         # Guard the not_found mapping with isinstance: an MCP tool that
         # returns a list or None (buggy/older server) would AttributeError
         # on `.get(...)` and escape as a 500.  Defensive at the single
-        # boundary that all override/clear/reorder endpoints share.
+        # boundary every MCP-write route shares.
         if (
             treat_not_found_as_404
             and isinstance(result, dict)
@@ -1119,9 +1108,8 @@ async def _mcp_write_proxy(
         config.fused_memory_urls,
         _call,
         log_label=tool_name,
-        # See the cancel_ticket fan-out: _call already logs each failing URL at
-        # WARNING with the same content, so first_success stays quiet here and
-        # the failure is reported exactly once.
+        # _call already logs each failing URL at WARNING, so first_success
+        # stays quiet and the failure is reported exactly once.
         log_failures=False,
         offline_result=_fused_memory_unreachable_response,
     )
@@ -1155,63 +1143,15 @@ async def api_curator_cancel(request: Request) -> JSONResponse:
     config: DashboardConfig = request.app.state.config
     http_client: httpx.AsyncClient = request.app.state.http_client
 
-    # Single-Homed Ticket Invariant: each ticket lives on exactly one
-    # fused-memory instance, enforced at two independent levels:
-    #   • OS-wide singleton lock — fused-memory/src/fused_memory/server/
-    #     main.py:_acquire_singleton_lock binds abstract Unix socket
-    #     \0fused-memory-singleton; any second process exits immediately.
-    #   • Per-process SQLite store — fused-memory/src/fused_memory/
-    #     middleware/ticket_store.py persists tickets in <data_dir>/tickets.db
-    #     with no cross-instance replication.
-    # See DESIGN.md → Curator Tickets & Routing Invariant for the full
-    # audit trail including the failover-only role of fused_memory_urls.
-    #
-    # Because only one instance can own a ticket, cancel_ticket is idempotent
-    # and first-success-or-not_found semantics are correct.  A not_found from
-    # the first reachable instance is authoritative — we short-circuit to 404
-    # and do NOT fan out to avoid double-cancelling.  Only network/transport
-    # errors trigger fallthrough to the next URL.
-    #
-    # If a future infra change introduces ticket replication or multi-region
-    # deployment, this assumption must be re-evaluated and the loop relaxed to
-    # fan-out-then-quorum.
-    async def _call(url: str) -> JSONResponse:
-        try:
-            result = await memory_data.mcp_tool_call(
-                http_client,
-                url,
-                'cancel_ticket',
-                {'ticket_id': ticket_id},
-            )
-        except FANOUT_FAILURE_EXCEPTIONS as exc:
-            logger.warning('cancel_ticket failed for %s: %s', url, exc)
-            # PreformattedFanoutError, not ValueError: the message below is
-            # already a rendered 'Type: message', and first_success renders
-            # every caught exception through describe_exc — which would
-            # prepend a second type name, surfacing 'ValueError: ConnectError:
-            # refused' in the 502 detail and the offline pill. See that
-            # class's docstring. str(exc) (NOT the composed string) is what
-            # gets truncated, so the cap bounds the exception text alone.
-            raise PreformattedFanoutError(
-                f'{type(exc).__name__}: {str(exc)[:_MCP_WRITE_DETAIL_CHAR_LIMIT]}'
-            ) from exc
-        if result.get('error') == 'not_found':
-            return JSONResponse(result, status_code=404)
-        return JSONResponse(result)
-
-    return await first_success(
-        config.fused_memory_urls,
-        _call,
-        log_label='cancel_ticket',
-        # log_failures=False: _call above already emits a fully-detailed
-        # WARNING per failing URL (pinned by test_api_curator_cancel.py), so
-        # letting first_success report too would give one failure two
-        # identical-level lines. Reported exactly once, at the call site.
-        log_failures=False,
-        offline_result=lambda errs: JSONResponse(
-            {'error': 'fused_memory_unreachable', 'detail': '; '.join(errs)},
-            status_code=502,
-        ),
+    # Each ticket lives on exactly one fused-memory instance, so not_found from
+    # the first reachable URL is authoritative and short-circuits the fan-out
+    # as a 404. Rationale: DESIGN.md → "Curator Tickets & Routing Invariant".
+    return await _mcp_write_proxy(
+        http_client,
+        config,
+        'cancel_ticket',
+        {'ticket_id': ticket_id},
+        treat_not_found_as_404=True,
     )
 
 
