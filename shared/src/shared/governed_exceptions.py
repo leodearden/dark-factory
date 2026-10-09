@@ -69,7 +69,9 @@ __all__ = [
     'TaskRef',
     'TicketRef',
     'UndisposedException',
+    'disposition_record',
     'governed_exceptions',
+    'owner_record',
     'parse_disposition_marker',
 ]
 
@@ -300,6 +302,44 @@ Disposition = Debt | Policy
 """D2's three legal states, as two types: ``Debt(TaskRef | TicketRef)`` and
 ``Policy(row id)``.  A bare ref is not a disposition — it answers "who", not
 "why this entry is legal"."""
+
+
+def owner_record(ref: TaskRef | TicketRef) -> dict[str, object]:
+    """*ref* as the vocabulary's JSON wire format: ``{'type', 'id'}``.
+
+    The one shape the inline scanner's report, the register's ``--json`` and
+    the owner sweep all speak, so no consumer parses a ``task 5601``-style
+    string back into a ref (heuristic 12).
+
+    Raises:
+        MalformedDisposition: *ref* is not a :class:`TaskRef` or :class:`TicketRef`.
+    """
+    if isinstance(ref, TaskRef):
+        return {'type': 'task', 'id': ref.id}
+    if isinstance(ref, TicketRef):
+        return {'type': 'ticket', 'id': ref.id}
+    raise MalformedDisposition(
+        f'owner_record: {ref!r} is not a TaskRef or a TicketRef.', value=ref
+    )
+
+
+def disposition_record(disposition: Disposition) -> dict[str, object]:
+    """*disposition* as the vocabulary's JSON wire format.
+
+    ``{'type': 'debt', 'owner': <owner_record>}`` or
+    ``{'type': 'policy', 'ratified': <row id>}`` — the twin of
+    :func:`owner_record`, and spoken by the same consumers.
+
+    Raises:
+        MalformedDisposition: *disposition* is not a :class:`Debt` or :class:`Policy`.
+    """
+    if isinstance(disposition, Debt):
+        return {'type': 'debt', 'owner': owner_record(disposition.owner)}
+    if isinstance(disposition, Policy):
+        return {'type': 'policy', 'ratified': disposition.ratified}
+    raise MalformedDisposition(
+        f'disposition_record: {disposition!r} is not a Debt or a Policy.', value=disposition
+    )
 
 
 def parse_disposition_marker(comment: str) -> Disposition | None:
