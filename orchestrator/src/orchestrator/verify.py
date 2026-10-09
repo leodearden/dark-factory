@@ -5328,9 +5328,9 @@ async def _run_cmd(
     consistent with it, otherwise it reports the stop as unattributed.
 
     *timeout* is measured from launch: time spent spawning the subprocess
-    counts against it, so a command still running *timeout* seconds after
-    ``_run_cmd`` began launching it is reported timed out however long the
-    spawn took.
+    counts against it, so a command whose result has not been collected
+    *timeout* seconds after ``_run_cmd`` began launching it is reported timed
+    out however long the spawn took.
 
     ``PYTHONUNBUFFERED=1`` is unconditionally injected into the subprocess env
     so that python children (pytest, ruff, pyright via uv) flush their stdout
@@ -5459,7 +5459,6 @@ async def _run_cmd(
                 _CS_RUNNING = 'running'
                 _CS_STOPPED = 'stopped'
                 state = _CS_RUNNING
-                t0 = launched_at
                 # Wall-clock deadline: launch + timeout, shifted forward on each
                 # STOP→START transition by the duration of the stopped span.
                 deadline = wall_deadline
@@ -5513,7 +5512,7 @@ async def _run_cmd(
                         t_stop = time.monotonic()
                         _cs_timeout_msg.append(_clock_stop_reason(
                             kind=_cs_kind, limit=_cs_limit,
-                            elapsed=t_stop - t0, remaining=_cs_armed - t_stop,
+                            elapsed=t_stop - launched_at, remaining=_cs_armed - t_stop,
                         ))
                         raise TimeoutError()
 
@@ -5526,7 +5525,7 @@ async def _run_cmd(
                         t_stop = time.monotonic()
                         _cs_timeout_msg.append(_clock_stop_reason(
                             kind=_cs_kind, limit=_cs_limit,
-                            elapsed=t_stop - t0, remaining=_cs_armed - t_stop,
+                            elapsed=t_stop - launched_at, remaining=_cs_armed - t_stop,
                         ))
                         raise
 
