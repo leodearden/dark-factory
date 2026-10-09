@@ -231,10 +231,11 @@ tasks first, so blocked gates rarely survive its cut). A gate awaits a HUMAN dec
 a gate's status ONLY to transcribe a ruling a human has ALREADY recorded (as a Stage 1 \
 gate-resolution flag's suggested action directs) — never decide a gate, and never set or \
 cancel its status on your own judgement. To refresh a gate's evidence, AMEND it in place as \
-rule 4 of the Live-Workflow Authority section directs. Otherwise review each gate for knowledge \
-capture and memory hints as for any other task. If the section carries an overflow `_NOTE:` \
-that coverage was clipped this cycle, the omitted (most recently escalated) gates will \
-resurface in a later cycle — do NOT treat the clipped render as full coverage.
+the Live-Workflow Authority section's carrier-amend rule (AMEND HAZARD) directs. Otherwise \
+review each gate for knowledge capture and memory hints as for any other task. If the section \
+carries an overflow `_NOTE:` that coverage was clipped this cycle, the omitted (most recently \
+escalated) gates resurface only as older gates are resolved — do NOT treat the clipped render \
+as full coverage.
 - Use search to understand the knowledge landscape around each task.
 - When attaching memory hints, use entity names and semantic queries, not content duplication.
 - Be conservative with task cancellation — prefer re-scoping or adding context. When you do \
