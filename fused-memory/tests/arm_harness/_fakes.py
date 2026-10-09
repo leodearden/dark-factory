@@ -16,7 +16,10 @@ from shared.safe_io import atomic_write_text
 
 from fused_memory.arm_harness.arm_spec import EmbeddingArmSpec, LlmArmSpec, LlmParams
 from fused_memory.arm_harness.conformance import ConformanceCounts
-from fused_memory.arm_harness.embedding_run_manifest import EmbeddingRunManifest
+from fused_memory.arm_harness.embedding_run_manifest import (
+    EmbeddingRunManifest,
+    serialize_embedding_run_manifest,
+)
 from fused_memory.arm_harness.instrument_checks import PREREGISTRATION_DOC_PATH
 from fused_memory.arm_harness.llm_metrics import llm_axis_records
 from fused_memory.arm_harness.metrics_record import (
@@ -739,6 +742,18 @@ def embedding_control(arm_id: str = 'incumbent-embed-a', **overrides) -> Embeddi
         'scratch_group_id': 'evalmem_lme_emb_ctl_a',
     }
     return embedding_control_spec(arm_id, **(data | overrides))
+
+
+def write_embedding_run(
+    run_dir: Path, manifest: EmbeddingRunManifest, records: Sequence[MetricsRecord]
+) -> Path:
+    """A committed embedding run directory, through the harness writers."""
+    for record in records:
+        write_metrics_record(record, run_dir)
+    atomic_write_text(
+        run_dir / RUN_MANIFEST_FILENAME, serialize_embedding_run_manifest(manifest), mkdir=True
+    )
+    return run_dir
 
 
 def embedding_run_manifest(spec: EmbeddingArmSpec, /, **overrides) -> EmbeddingRunManifest:
