@@ -930,6 +930,8 @@ class TestImportGraphChanges:
             '  edge added: a -> b',
             '  edge added: b -> a',
             '  cycle added: a, b',
+            '  hidden cycle added: a, b',
+            '  typing cycle added: a, b',
             '  reach-back added: pkg.a -> pkg (THING)',
             '  deferred added: e: a',
         ):
@@ -939,6 +941,8 @@ class TestImportGraphChanges:
             '  edge removed: a -> b',
             '  edge removed: b -> a',
             '  cycle removed: a, b',
+            '  hidden cycle removed: a, b',
+            '  typing cycle removed: a, b',
             '  reach-back removed: pkg.a -> pkg (THING)',
             '  deferred removed: e: a',
         ):
@@ -951,6 +955,53 @@ class TestImportGraphChanges:
         shifted = '\n' + _GRAPH_CHANGED['alpha/src/pkg/a.py']
         diff = _diff_of(tmp_path, capsys, coupled, _rewrite('alpha/src/pkg/a.py', shifted))
         assert _section(diff, self._GRAPH) == ['  (none)']
+
+    def test_a_function_local_import_closing_a_cycle_is_a_hidden_cycle_only(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        base = {**_BASE, 'alpha/src/f.py': 'import g\n', 'alpha/src/g.py': 'G = 1\n'}
+        diff = _diff_of(
+            tmp_path, capsys, base, _rewrite('alpha/src/g.py', 'def h():\n    import f\n    return f\n')
+        )
+        assert _section(diff, self._GRAPH) == [
+            '  edge added: g -> f',
+            '  deferred added: g: f',
+            '  hidden cycle added: f, g',
+            '  typing cycle added: f, g',
+        ]
+
+    def test_a_deferred_import_that_starts_closing_a_cycle_is_not_a_deferred_change(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # g's entry flips closes_cycle false -> true; the hidden cycle already says so.
+        base = {
+            **_BASE,
+            'alpha/src/f.py': 'F = 1\n',
+            'alpha/src/g.py': 'def h():\n    import f\n    return f\n',
+        }
+        diff = _diff_of(tmp_path, capsys, base, _rewrite('alpha/src/f.py', 'import g\nF = 1\n'))
+        assert _section(diff, self._GRAPH) == [
+            '  edge added: f -> g',
+            '  hidden cycle added: f, g',
+            '  typing cycle added: f, g',
+        ]
+
+    def test_a_type_checking_only_cycle_is_a_typing_cycle_only(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        base = {**_BASE, 'alpha/src/c.py': 'X = 1\n', 'alpha/src/d.py': 'X = 1\n'}
+
+        def couple(root: Path) -> None:
+            _commit(root, 'couple', write={
+                'alpha/src/c.py': _GRAPH['alpha/src/c.py'],
+                'alpha/src/d.py': _GRAPH['alpha/src/d.py'],
+            })
+
+        assert _section(_diff_of(tmp_path, capsys, base, couple), self._GRAPH) == [
+            '  edge added: c -> d',
+            '  edge added: d -> c',
+            '  typing cycle added: c, d',
+        ]
 
 
 _COUPLING_BEFORE = 'from pkg import mod\n\ndef test_it():\n    assert mod._y\n'
