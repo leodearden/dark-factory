@@ -1,12 +1,13 @@
 """Boundary tests for ``scripts/inline_suppressions.py`` — task 5601, PRD scenarios 1-11.
 
-WHAT IS UNDER TEST.  The inline-suppression scanner: D9's ratified classes and
-the ``--check`` / ``--seed`` / ``--tighten`` / ``--json`` verbs with the 0/1/2
-exit ladder the PRD Contract fixes.
+WHAT IS UNDER TEST.  The gate's entry module: the ``--check`` / ``--seed`` /
+``--tighten`` / ``--json`` verbs with the 0/1/2 exit ladder the PRD Contract
+fixes, the report ``--json`` publishes, the operator's shipped class table, and
+the live tree the merge gate measures.
 ``plans/inv12-exceptions-owned-or-ratified-prd.md``, boundary-test sketch rows
-1-11.  What the scan recognises, D7's key and D8's consumer model are the
-subjects of ``test_inline_suppression_scan.py``, ``test_inline_suppression_key.py``
-and ``test_inline_suppression_consumers.py``.
+1-11.  Each stratum below the entry module has its own test module:
+``test_inline_suppression_scan.py``, ``test_inline_suppression_key.py``,
+``test_inline_suppression_consumers.py`` and ``test_inline_suppression_classify.py``.
 
 HOW IT IS TESTED.  Almost every test builds a throwaway git repository under
 ``tmp_path`` and calls ``inline_suppressions.main([...])`` IN-PROCESS,
