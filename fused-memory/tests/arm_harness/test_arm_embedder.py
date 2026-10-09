@@ -83,6 +83,7 @@ class FakeInner(EmbedderClient):
 
     async def create(self, input_data):
         (text,) = input_data
+        assert isinstance(text, str)
         self.singles.append(text)
         await self._call([text])
         return self._vector(text)
