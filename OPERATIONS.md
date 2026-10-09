@@ -546,7 +546,7 @@ That latency is faster than any real model call.
 
 - **First look.** The escalation detail's `top_create_reasons` names the path
   directly: `create: llm-failed: …`,
-  `create: curator-unavailable: construction-failed: <ExcType>`,
+  `create: curator-unavailable: construction-failed: <ExcType>: <first line>`,
   `create: zero-output-breaker-open`, and so on. Then look for task 4448's
   `curator_consecutive_degraded` escalation from `fused-memory/task-curator`.
   If it is absent while this one fires, suspect the `curator-unavailable` path,
@@ -563,11 +563,15 @@ That latency is faster than any real model call.
       sqlite3 -readonly data/reconciliation/tickets.db "SELECT substr(resolved_at,1,10) d, SUM(status='created'), SUM(status='combined'), ROUND(AVG((julianday(resolved_at)-julianday(created_at))*86400.0),1) FROM tickets WHERE resolved_at >= date('now','-7 days') AND status IN ('created','combined') GROUP BY d;"
 
   A missing CLI binary raises before any call is recorded. So no
-  `invocations` rows next to a steady ticket rate is itself the signal.
+  `invocations` rows next to a steady ticket rate is itself the signal. The
+  ledger is written only while `usage_cap.enabled`; without it the table
+  stays empty whatever the curator does, so skip this check.
 - **It does not fire during an all-accounts-capped period, by design.** Capped
   tickets wait, so their latency rises. Caps show in `get_curator_state` and on
   the dashboard. A project filing fewer than `min_samples` tickets per window
-  is below the detector's floor.
+  is below the detector's floor. Nor is the detector wired while
+  `curator.enabled` is false: a disabled curator creates every ticket fast
+  with no combine, and its tickets read `create: curator-unavailable: disabled`.
 
 Incident, back-test and residual risks:
 [`plans/curator-dedup-outage-2026-08-15-rca.md`](plans/curator-dedup-outage-2026-08-15-rca.md).

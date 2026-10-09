@@ -215,9 +215,14 @@ ticket. The streak alarm would have fired at the 5th ticket, which resolved at
 
 - **Ticket provenance.** All 209 rows would have carried
   `reason = 'create: llm-failed: FileNotFoundError: [Errno 2] No such file or directory: 'claude''`.
-  The vocabulary is `task_interceptor.py::_create_reason`. The one path 4448's
-  streak cannot see, a curator that was never constructed, now reads
-  `create: curator-unavailable: closed | disabled | construction-failed: <ExcType>`.
+  The vocabulary is `task_interceptor.py::_create_reason`. A combine or drop
+  that could not be executed reads `create: combine-failed: …` /
+  `create: drop-failed: …`. The one path 4448's streak cannot see, a curator
+  that was never constructed, now reads
+  `create: curator-unavailable: closed | disabled | construction-failed: <ExcType>: <first line>`.
+  Exception text enters a reason only through
+  `task_curator.py::exception_summary`: the type and the message's first
+  line, cut to 120 characters.
 - **Invocation ledger.** `curator_events.db::invocations` would have shown
   **zero** rows, because the call raised before the CLI ran, against 209
   tickets. It is threaded `server/main.py::run_server` → `TaskInterceptor` →
@@ -320,6 +325,14 @@ print('after 08-19:', sum(x >= datetime(2026, 8, 19, tzinfo=UTC) for ts in fires
   and never fired. 4448's 5-curation streak is the guard there.
 - **The detector stays silent during an all-accounts-capped period, by
   design.** Capped tickets wait, so their wall-clock latency rises.
+- **The detector is not wired while `curator.enabled` is false.** A
+  deliberately disabled curator produces the signature itself, so wiring it
+  would page every window (`server/main.py::_dedup_outage_detector_config`).
+  A curator disabled by mistake therefore raises no alarm here; its tickets
+  still read `create: curator-unavailable: disabled`.
+- **The ledger exists only while `usage_cap.enabled`.** Without it,
+  `server/main.py::_setup_curator_usage_gate` opens no CostStore, so an empty
+  `invocations` table says nothing about the curator.
 - **Both alarms' state resets on restart.** The detector's rate limit and
   4448's streak live in process memory. The detector re-derives its evidence
   from tickets.db on each tick, so a restart costs at most one duplicate
