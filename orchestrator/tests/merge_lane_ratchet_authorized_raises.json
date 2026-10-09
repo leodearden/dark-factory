@@ -2515,6 +2515,60 @@
           "current": 57520
         }
       ]
+    },
+    {
+      "task_id": "4828",
+      "reason": "Net-additive defect fix, not a failed refactor: a git worktree admin entry left LOCKED (git's own 'initializing' marker) after its tree was removed could never be pruned and hard-failed every merge_request enqueue. Adds the registered-but-absent skip in merge-worktree enumeration, --force --force in the C1 removal primitive, and an unlock-then-prune self-heal scoped to worktree_base inside the task-2099 pool-storage gate.",
+      "measures": [
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 1422,
+          "current": 1439
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::_iter_merge_worktrees",
+          "baseline": 12,
+          "current": 14
+        },
+        {
+          "measure": "cognitive",
+          "key": "orchestrator/src/orchestrator/git_ops.py::GitOps::find_inflight_merge_worktree",
+          "baseline": 6,
+          "current": 8
+        },
+        {
+          "measure": "lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 15857,
+          "current": 15954
+        },
+        {
+          "measure": "prose_lines",
+          "key": "orchestrator/src/orchestrator/git_ops.py",
+          "baseline": 9280,
+          "current": 9313
+        },
+        {
+          "measure": "total:cognitive",
+          "key": "<cluster>",
+          "baseline": 4838,
+          "current": 4855
+        },
+        {
+          "measure": "total:lines",
+          "key": "<cluster>",
+          "baseline": 57520,
+          "current": 57617
+        },
+        {
+          "measure": "total:prose_lines",
+          "key": "<cluster>",
+          "baseline": 31999,
+          "current": 32032
+        }
+      ]
     }
   ]
 }
