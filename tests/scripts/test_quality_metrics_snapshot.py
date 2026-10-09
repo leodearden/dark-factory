@@ -1223,11 +1223,30 @@ class TestTheSummary:
         table_at = summary.index(_SUMMARY_HEADER)
         assert summary.index(f'run: run-1 as_of {taken["as_of_sha"]} since none') < table_at
         assert summary.index('files: 12/12 measured, complete=true') < table_at
+        closing = sum(entry['closes_cycle'] for entry in graph['deferred'])
         assert summary.index(
             f'import graph: {len(graph["edges"])} edges, {len(graph["reach_back"])} reach-backs, '
-            f'{len(graph["deferred"])} deferred imports, {len(graph["cycles"])} cycles'
+            f'{len(graph["deferred"])} deferred imports ({closing} closing a cycle), '
+            f'{len(graph["cycles"])} cycles, {len(graph["hidden_cycles"])} hidden cycles, '
+            f'{len(graph["typing_cycles"])} typing cycles'
         ) < table_at
         assert 'unreadable (measures unknown, never zero):' not in summary
+
+    def test_a_schema_1_snapshot_names_its_cycle_sets_unknown(
+        self, measured: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        taken = _load(measured)
+        graph = taken['import_graph']
+        old = tmp_path / 'schema-1.json'
+        old.write_text(json.dumps(_as_schema_1(taken)), encoding='utf-8')
+        summary = _summary_of(old, capsys)
+        assert (
+            f'import graph: {len(graph["edges"])} edges, {len(graph["reach_back"])} reach-backs, '
+            f'{len(graph["deferred"])} deferred imports, {len(graph["cycles"])} cycles; '
+            'hidden cycles, typing cycles and closes_cycle unknown (schema 1)'
+        ) in summary
+        # File records are one shape across the versions, so the table is too.
+        assert _table(summary)[1] == _table(_summary_of(measured, capsys))[1]
 
     def test_an_incomplete_snapshot_names_its_unreadable_paths(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
