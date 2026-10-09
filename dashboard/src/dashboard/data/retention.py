@@ -42,6 +42,7 @@ async def apply_retention(
     hour): the first row matching *prefer* when there is one, else the
     newest. Rows older than ``MAX_RETENTION`` are deleted. Does not commit.
     """
+    _require_identifiers(table, partition_by)
     hourly_before = (now - RAW_RETENTION).isoformat()
     expire_before = (now - MAX_RETENTION).isoformat()
     partition = ', '.join((*partition_by, _HOUR_BUCKET))
@@ -70,3 +71,11 @@ async def apply_retention(
         (hourly_before, *prefer_params, hourly_before),
     )
     await conn.execute(f'DELETE FROM {table} WHERE ts < ?', (expire_before,))
+
+
+def _require_identifiers(table: str, partition_by: tuple[str, ...]) -> None:
+    for name in (table, *partition_by):
+        if not name.isidentifier():
+            raise ValueError(
+                f'apply_retention on table {table!r}: {name!r} is not a SQL identifier'
+            )

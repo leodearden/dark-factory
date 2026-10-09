@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
+import pytest
 
 from dashboard.data.retention import (
     MAX_RETENTION,
@@ -145,3 +146,26 @@ async def test_a_preferred_row_outranks_a_newer_one_in_its_hour(tmp_path):
     ]
     got = _survivors(db_path)
     assert got == expected, f'expected {expected}, got {got}'
+
+
+async def test_a_partition_column_that_is_not_an_identifier_is_refused(tmp_path):
+    db_path = tmp_path / 'retention.db'
+    rows = _two_projects_two_old_hours()
+    _create_table(db_path, rows)
+
+    with pytest.raises(ValueError, match=r"'t'.*'project id'"):
+        await _retain(db_path, partition_by=('project id',))
+
+    got = _survivors(db_path)
+    assert got == sorted(rows, key=lambda row: (row[1], row[0])), (
+        f'expected the refused call to leave every row, got {got}'
+    )
+
+
+async def test_a_table_name_that_is_not_an_identifier_is_refused(tmp_path):
+    db_path = tmp_path / 'retention.db'
+    _create_table(db_path, [])
+
+    async with aiosqlite.connect(str(db_path)) as conn:
+        with pytest.raises(ValueError, match=r"'t; DROP TABLE t'"):
+            await apply_retention(conn, 't; DROP TABLE t', now=NOW)
