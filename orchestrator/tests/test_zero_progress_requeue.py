@@ -14,6 +14,7 @@ unresolved incident and auto-resolving when the loop breaks.
 from __future__ import annotations
 
 import pytest
+from _orch_helpers import load_packaged_defaults
 
 from orchestrator.workflow import WorkflowOutcome
 
@@ -645,16 +646,6 @@ class TestResolveZeroProgressRequeueAlert:
 # ---------------------------------------------------------------------------
 
 
-def _load_package_defaults() -> dict:
-    """Read the shipped defaults.yaml (test_config_merge_deep.py:63-69 idiom)."""
-    import importlib.resources as pkg_resources
-
-    import yaml
-
-    defaults_file = pkg_resources.files('orchestrator') / 'defaults.yaml'
-    return yaml.safe_load(defaults_file.read_text())
-
-
 class TestZeroProgressRequeueConfig:
     """The detector must be operator-visible, tunable, and hot-reloadable."""
 
@@ -709,7 +700,7 @@ class TestZeroProgressRequeueConfig:
         STANZA — not the Field(default=...) — is what actually applies.  A
         drifted stanza would silently win.
         """
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert 'zero_progress_requeue' in defaults, (
             'the shipped defaults.yaml must declare the zero_progress_requeue: '
             'block so the knob is discoverable without reading pydantic source'

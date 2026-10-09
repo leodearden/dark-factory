@@ -14,12 +14,10 @@ from __future__ import annotations
 
 import asyncio
 import re
-from importlib import resources as pkg_resources
 from pathlib import Path
 
 import pytest
-import yaml
-from _orch_helpers import DELIBERATE_TIGHT_BOUND_CEILING
+from _orch_helpers import DELIBERATE_TIGHT_BOUND_CEILING, load_packaged_defaults
 from pydantic import ValidationError
 
 from orchestrator.config import OrchestratorConfig
@@ -38,12 +36,6 @@ _TERMINATE_GRACE_SECS = 5.0
 _UNREACHED_RUN_CMD_TIMEOUT_SECS = 10.0
 _WORST_CASE_SECS = _UNREACHED_RUN_CMD_TIMEOUT_SECS + 2 * _TERMINATE_GRACE_SECS
 REAL_SUBPROCESS_TEST_TIMEOUT = int(3 * _WORST_CASE_SECS)
-
-
-def _load_package_defaults() -> dict:
-    """Read the shipped defaults.yaml so tests stay in sync automatically."""
-    defaults_file = pkg_resources.files('orchestrator') / 'defaults.yaml'
-    return yaml.safe_load(defaults_file.read_text())
 
 
 def _make_clock_stop_cfg(
@@ -121,7 +113,7 @@ class TestClockStopConfigDefaults:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.verify_clock_stop_marker_stop == defaults['verify_clock_stop_marker_stop']
         assert config.verify_clock_stop_marker_stop == '@@REIFY_CLOCK_STOP@@'
 
@@ -130,7 +122,7 @@ class TestClockStopConfigDefaults:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.verify_clock_stop_marker_heartbeat == defaults['verify_clock_stop_marker_heartbeat']
         assert config.verify_clock_stop_marker_heartbeat == '@@REIFY_CLOCK_HEARTBEAT@@'
 
@@ -139,7 +131,7 @@ class TestClockStopConfigDefaults:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.verify_clock_stop_marker_start == defaults['verify_clock_stop_marker_start']
         assert config.verify_clock_stop_marker_start == '@@REIFY_CLOCK_START@@'
 
@@ -148,7 +140,7 @@ class TestClockStopConfigDefaults:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.verify_clock_stop_heartbeat_idle_max == defaults['verify_clock_stop_heartbeat_idle_max']
         assert config.verify_clock_stop_heartbeat_idle_max == 180.0
 
@@ -157,7 +149,7 @@ class TestClockStopConfigDefaults:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.verify_clock_stop_max_total_secs == defaults['verify_clock_stop_max_total_secs']
         assert config.verify_clock_stop_max_total_secs == 0.0
 

@@ -23,21 +23,12 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime, timedelta
-from importlib import resources as pkg_resources
 from unittest.mock import MagicMock
 
 import pytest
-import yaml
-from _orch_helpers import mcp_tool_envelope, pydantic_spec
+from _orch_helpers import load_packaged_defaults, mcp_tool_envelope, pydantic_spec
 
 from orchestrator.config import OrchestratorConfig
-
-
-def _load_package_defaults() -> dict:
-    """Read the shipped defaults.yaml so tests stay in sync automatically."""
-    defaults_file = pkg_resources.files('orchestrator') / 'defaults.yaml'
-    return yaml.safe_load(defaults_file.read_text())
-
 
 # ── Step-1 / Step-2: Config default tests ─────────────────────────────────────
 
@@ -90,7 +81,7 @@ class TestChronicFlakeConfigDefaults:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert 'chronic_flake' in defaults
         block = defaults['chronic_flake']
         assert block['enabled'] is False

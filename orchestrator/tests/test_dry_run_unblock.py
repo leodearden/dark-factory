@@ -12,13 +12,12 @@ import json as _json
 import logging
 import re
 import subprocess
-from importlib import resources as pkg_resources
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import yaml
 from _orch_helpers import (
+    load_packaged_defaults,
     pydantic_spec,
     skip_role_config_layer,
     stamp_stock_routing_config,
@@ -56,8 +55,7 @@ class TestUnblockAutoConfigDefaults:
         assert ua.b3_proposal_keep_last == 5
 
     def test_defaults_yaml_has_unblock_auto_section(self):
-        defaults_file = pkg_resources.files('orchestrator') / 'defaults.yaml'
-        data = yaml.safe_load(defaults_file.read_text())
+        data = load_packaged_defaults()
         assert 'unblock_auto' in data, (
             "defaults.yaml must have an 'unblock_auto' section"
         )

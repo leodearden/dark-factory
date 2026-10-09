@@ -3,11 +3,11 @@
 import logging
 import os
 import warnings
-from importlib import resources as pkg_resources
 from pathlib import Path
 
 import pytest
 import yaml
+from _orch_helpers import load_packaged_defaults
 from pydantic import ValidationError
 
 from orchestrator.config import (
@@ -35,13 +35,6 @@ from orchestrator.config import (
     diff_config,
     load_config,
 )
-
-
-def _load_package_defaults() -> dict:
-    """Read the shipped defaults.yaml so tests stay in sync automatically."""
-    defaults_file = pkg_resources.files('orchestrator') / 'defaults.yaml'
-    return yaml.safe_load(defaults_file.read_text())
-
 
 # Shared diagnostic phrase used by both lock_depth boundary tests.
 # Hoisted to module scope so both the positive and negative tests reference one
@@ -99,7 +92,7 @@ class TestDefaults:
         # Ensure no external config is loaded - must unset env before instantiation
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         # Values from package defaults.yaml (not Pydantic field defaults)
         assert config.max_concurrent_tasks == defaults['max_concurrent_tasks']
         assert config.max_per_module == defaults['max_per_module']
@@ -430,7 +423,7 @@ class TestDefaults:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.verify_cold_command_timeout_secs == defaults['verify_cold_command_timeout_secs']
         assert config.verify_cold_command_timeout_secs == 5400
 
@@ -458,7 +451,7 @@ class TestDefaults:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.merge_verify_cold_command_timeout_secs == defaults['merge_verify_cold_command_timeout_secs']
         assert config.merge_verify_cold_command_timeout_secs == 7200
 
@@ -509,7 +502,7 @@ class TestDefaults:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.max_failure_signature_repeat == defaults['max_failure_signature_repeat']
 
 
@@ -1231,7 +1224,7 @@ class TestParkStopConfig:
         field defaults — any OrchestratorConfig() instantiation will pull the
         YAML values first (via settings_customise_sources).
         """
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert 'park_stop_enabled' in defaults, (
             "defaults.yaml is missing 'park_stop_enabled'"
         )
@@ -1316,7 +1309,7 @@ class TestMergeVerifyBreadthConfig:
         above), and that value flows through both a bare OrchestratorConfig()
         and load_config() over an otherwise-empty explicit config file.
         """
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert 'merge_verify_breadth' in defaults, (
             "defaults.yaml is missing 'merge_verify_breadth'"
         )
@@ -2296,7 +2289,7 @@ class TestTransientRequeueBackoffConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert 'transient_requeue_backoff_base_secs' in defaults
         assert 'transient_requeue_backoff_cap_secs' in defaults
         assert (
@@ -2680,7 +2673,7 @@ class TestSimpleTaskRoleConfigAddressability:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert config.models.simple_task == defaults['models']['simple_task'] == 'sonnet'
         assert config.budgets.simple_task == defaults['budgets']['simple_task'] == 2.50
         assert config.max_turns.simple_task == defaults['max_turns']['simple_task'] == 50
@@ -3200,7 +3193,7 @@ class TestProgressExtensionConfig:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv('ORCH_CONFIG_PATH', '')
         config = OrchestratorConfig()
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
 
         assert defaults['timeouts']['working_idle_secs'] == 1800
         assert config.timeouts.working_idle_secs == defaults['timeouts']['working_idle_secs']
@@ -3270,7 +3263,7 @@ class TestOrchestratorConfigPrices:
         table (task 2459 amendment) — nothing else enforces they agree, so
         assert equality directly to catch future drift.
         """
-        assert default_price_table() == _load_package_defaults()['prices']
+        assert default_price_table() == load_packaged_defaults()['prices']
 
 
 class TestPricesReloadDisposition:
@@ -4126,7 +4119,7 @@ class TestRecoveryEmissionConfig:
         STANZA — not the ``Field(default=...)`` — is what actually applies.  A
         drifted stanza would silently win.
         """
-        defaults = _load_package_defaults()
+        defaults = load_packaged_defaults()
         assert 'recovery_emission' in defaults, (
             'the shipped defaults.yaml must declare the recovery_emission: '
             'block so the knobs are discoverable without reading pydantic source'
