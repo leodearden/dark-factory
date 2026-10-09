@@ -189,13 +189,9 @@ MARKER_LIFECYCLE: dict[str, MarkerLifecycle] = {
         # {'flag_for_stage2': True} rather than a {'source': ...} filter,
         # since these markers carry no source metadata field.
         #
-        # That collector is NO LONGER age-based (task 4375). Retirement is now
-        # COMPOSITE: a marker is deleted only when it is past the
-        # _FLAG_FOR_STAGE2_MEM0_MAX_AGE_DAYS age cutoff AND is not a protected
-        # cycle_summary mirror AND its kind is not in
-        # mem0_tombstone.PROTECTED_AUDIT_KINDS AND its task_id is confirmed
-        # terminal. The age-only rule destroyed 40 kind='cadence_check' audit
-        # records in autopilot_video, all citing a merely-'deferred' task.
+        # That collector is NO LONGER age-based: retirement is composite and
+        # gated on terminal-task closure (tasks 4375, 4995); that sweep's
+        # docstring owns the rule.
         #
         # Second firing site (task 4376), a latency layer applying the same
         # rule to the one task that just closed:

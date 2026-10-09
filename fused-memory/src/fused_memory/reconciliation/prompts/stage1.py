@@ -945,6 +945,15 @@ Every `flag_for_stage2=true` Mem0 write MUST also include `metadata.run_id=<curr
 and `metadata.kind='{FLAG_FOR_STAGE2_MARKER_KIND}'`, which keeps the marker a standalone \
 record rather than one filed under a memory it resembles.
 
+Garbage collection of this marker keys on `metadata.task_id` and `metadata.kind`. When the \
+flag concerns a task, set `metadata.task_id` to that ONE task's id, never a comma-joined \
+list: the marker is collected once that task is done or cancelled AND the marker has aged \
+past the relay's minimum age, so a marker outliving its task's closure for a while is \
+normal and needs no action from you. A comma-joined or otherwise unresolvable `task_id` is \
+never collected. A marker with no `task_id` has no task to close, so it is collected only \
+after a much longer age ceiling and only if its `kind` is exactly \
+`'{FLAG_FOR_STAGE2_MARKER_KIND}'`; one declaring any other kind is never collected.
+
 Post-write confirmation (LLM-side variant of the findability discipline enforced in code by flag_dedup.confirm_marker_persisted — task-1400, post-task-1413): \
 `add_memory` returns a `memory_ids` list, but Mem0 may store the content under a DIFFERENT \
 canonical id. After every `flag_for_stage2=true` add_memory call you MUST immediately \
