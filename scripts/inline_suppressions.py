@@ -9,17 +9,8 @@ owned, and ratchets the rest so the population can shrink but never grow.
 ``plans/inv12-exceptions-owned-or-ratified-prd.md``, decisions **D6**-**D9**
 and **D12**.
 
-**The four layers**, each reading only the one below it:
-
-1. *Scan.*  ``git ls-files`` gives the tracked corpus; a byte prefilter over
-   the kind table's marker substrings drops the files that cannot hold a
-   marker; the survivors are tokenized and only COMMENT tokens are read.
-2. *Consumer model* (D8).  Which tool, if any, actually honours this marker.
-3. *Classify.*  Consumer first, then ratified class, then inline disposition
-   — THAT fixed order is what makes a marker no tool reads un-rescuable by
-   either of the other two; a site none of them owns is unowned.
-4. *Ratchet.*  ``shared.ratchet`` does all the arithmetic and all the baseline
-   I/O; this module supplies the keys and renders the violations.
+**Layer order**, each layer reading only the layers listed before it:
+refusal → kinds → scan → key → consumers → classify → ratchet/CLI.
 
 **The key** (D7).  An unowned site contributes ``(kind, sorted codes, a 12-hex
 sha256 of its stripped physical line)`` to a multiset — and no path.  A rename
@@ -27,51 +18,29 @@ or a file split therefore invents no key and needs no baseline diff, while
 editing the line a marker rides on does invent one, which is how an ordinary
 edit converts a grandfathered suppression into one somebody has to own.
 
-**The exit-code ladder**, which is the PRD Contract's and is restated in the
-argparse epilog:
-
-* **0** — clean.  A scoped run says ``partial``, and a run with no baseline yet
-  says ``advisory``; both are green, and the label says which green it is.
-* **1** — violations, one per line: site, kind, codes, the reason, and the
-  accepted forms.
-* **2** — instrument failure or a refusal to act.  A file that cannot be read
-  or tokenized, a baseline that exists but cannot be compared against, a config
-  key this model does not implement, a missing import, a scope that matches no
-  tracked file, a scoped ``--seed`` or ``--tighten``, or ``--seed`` over an
-  existing baseline.  Never a finding.
+**Exit codes** are the PRD Contract's 0/1/2 ladder, stated once in
+:data:`_EPILOG` so that ``--help`` prints it.
 
 **What it deliberately does NOT do.**
 
 * *It commits no baseline.*  ``scripts/inline_suppression_baseline.json`` is
-  seeded once, on main, by the operator step κ1 — not by this module's author
-  and not by a test.  Until it exists every run is green and says ``advisory``.
-* *It rules on nothing.*  ``RATIFIED_SUPPRESSION_CLASSES`` ships EMPTY; the
-  rows are the operator's (δ) and are applied by ζb.
+  seeded once, on main, at task 5607's operator cutover — not by this module's
+  author and not by a test.  Until it exists the ratchet is not enforced and
+  every run says ``advisory``.
+* *It rules on nothing.*  :data:`RATIFIED_SUPPRESSION_CLASSES` is the
+  operator's.
 * *It parses no disposition grammar of its own.*  D6's forms live in
   ``shared.governed_exceptions`` and are reached only through
   ``parse_disposition_marker``.
-* *It models no suppression kind outside the table below.*
-  ``pytest.mark.skip`` / ``xfail`` and ``shellcheck disable`` are named in the
-  PRD's out-of-scope list; :data:`KIND_SPECS` is the one place a later task
-  adds them.
+* *It models no suppression kind outside* :data:`KIND_SPECS`, whose
+  docstring names the extension point.
 
-**Consumers.**  γ2's exception register reads ``--json`` for the closed-world
-check of inline ``ratified:`` ids and for the per-``(kind, code)`` table it
-renders; κ1 runs ``--seed`` once at the cutover; ζb runs ``--tighten`` after
-the rulings land; θ's integration gate reads the report.  ``--json`` is the
-report's only data source, so nothing downstream re-implements the scan.
-
-**Why this is one file, measured rather than asserted.**  ~2,050 raw lines, of
-which ~760 are code and ~46% is prose — and ``docs/code-quality.md`` says in
-terms not to steer by raw line count, citing a 55%-prose precedent.  Heuristic
-14's 2,000-line alarm is nevertheless crossed on the figure it names (one
-default ``Read``), so the alternatives were measured rather than waved off: the
-docstrings carry no redundancy to cut (the largest is this one at ~60 lines and
-the rest are flat, with each load-bearing phrase appearing once), and a split
-is illegitimate because all four layers read :data:`KIND_SPECS` and pass
-:class:`Site` — satellites over that shared state would be the function-bags
-heuristic 14 names as cheating, failing 13 to pass 14.  So: one file, alarm
-acknowledged, and this paragraph is the record that it was weighed.
+**Consumers.**  Task 5602's exception register reads ``--json`` for the
+closed-world check of inline ``ratified:`` ids and for the per-``(kind, code)``
+table it renders; task 5607 runs ``--seed`` once at the cutover; task 5609 runs
+``--tighten`` after the rulings land; task 5611's integration gate reads the
+report.  ``--json`` is the report's only data source, so nothing downstream
+re-implements the scan.
 """
 
 from __future__ import annotations
@@ -99,16 +68,17 @@ if TYPE_CHECKING:
     from shared.governed_exceptions import Debt, Disposition, Policy
     from shared.ratchet import Enumeration
 
-# The shared/src bootstrap, resolved from __file__ and inserted at sys.path[0] —
-# the idiom and the precedence argument of
-# scripts/scan_plan_decision_pairing.py. A run inside a task worktree must read
-# THAT checkout's disposition grammar and ratchet kernel, not whichever editable
-# install happens to be on the path; the editable install is an ordinary .pth
-# entry, so sys.path ORDER decides the winner. It sits BELOW every import in this
-# file rather than above them, which is the whole reason no import here needs a
-# suppression for E402: every `shared` name is fetched lazily through
-# :func:`_shared`, so there is no module-level import left to sit after this
-# statement.
+# The shared/src bootstrap. Every path this scanner derives from its own
+# checkout is resolved from __file__, NEVER from the working directory: a run
+# inside a task worktree must read THAT checkout's disposition grammar, ratchet
+# kernel, tracked corpus and configuration, wherever it was launched from. The
+# idiom and the precedence argument are scripts/scan_plan_decision_pairing.py's:
+# the editable install of `shared` is an ordinary .pth entry, so sys.path ORDER
+# decides the winner, which is why this inserts at sys.path[0]. It sits BELOW
+# every import in this file rather than above them, which is the whole reason no
+# import here needs a suppression for E402: every `shared` name is fetched
+# lazily through :func:`_shared`, so there is no module-level import left to sit
+# after this statement.
 _SHARED_SRC = Path(__file__).resolve().parents[1] / 'shared' / 'src'
 if str(_SHARED_SRC) not in sys.path:
     sys.path.insert(0, str(_SHARED_SRC))
@@ -118,12 +88,10 @@ class InstrumentFailure(Exception):
     """The scanner could not take a measurement it was asked for — exit 2.
 
     THE NAME STATES THE CONSUMER-RELEVANT FACT RATHER THAN A CAUSE, the same
-    choice ``shared.ratchet.BaselineUnusable`` argues for.  A file that cannot
-    be read, a file that cannot be tokenized, a ``git ls-files`` that did not
-    run, a config key this model does not implement and a missing ``shared``
-    import all mean one identical thing to a caller — *this run measured
-    nothing you can trust* — and all map to the same exit 2.  Splitting them by
-    cause would hand ``main`` five ``except`` clauses that all do one thing.
+    choice ``shared.ratchet.BaselineUnusable`` argues for: every cause
+    :data:`_EPILOG` lists under exit 2 means one identical thing to a caller —
+    *this run measured nothing you can trust*.  Splitting them by cause would
+    hand ``main`` five ``except`` clauses that all do one thing.
 
     Categorically apart from a VIOLATION, which is exit 1.  That separation is
     the whole point: a broken instrument reported as a finding sends an agent
@@ -145,9 +113,8 @@ def _shared(name: str) -> ModuleType:
     Contract: an ImportError must be 2, never 1.  A top-level ``from shared… import
     …`` cannot satisfy that — it raises while this module is still executing, so
     ``main`` is never defined, the ``__main__`` block never runs, and Python's own
-    uncaught-exception exit is 1, the exact code the ladder reserves for a FINDING.
-    A gate reporting a broken environment as an INV-12 breach sends an agent to
-    fix code that was never the problem.
+    uncaught-exception exit is 1, the exact code the ladder reserves for a FINDING;
+    :class:`InstrumentFailure` says why the two must never be confused.
 
     Returning the module rather than the names is what keeps the conversion in one
     place, following ``scripts/merge_lane_metrics.py::_import_complexipy``.  The
@@ -170,10 +137,8 @@ def _shared(name: str) -> ModuleType:
         ) from exc
 
 
-#: This checkout, resolved from ``__file__`` rather than from the working
-#: directory, so a run inside a task worktree measures THAT worktree's tracked
-#: corpus and reads THAT worktree's configuration.  The argument
-#: ``scripts/scan_plan_decision_pairing.py`` makes for the same resolution.
+#: This checkout, resolved from ``__file__`` for the reason the ``_SHARED_SRC``
+#: bootstrap comment gives.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 #: How this scanner names itself in a refusal, so a reader of a bare exit 2 in
@@ -388,7 +353,7 @@ KIND_SPECS: MappingProxyType[Kind, KindSpec] = MappingProxyType(
         ),
     }
 )
-"""The one table the prefilter and the token scan read.
+"""The kind table, which only the scan reads — the byte prefilter and the token walk.
 
 SPOT (heuristic 11), and the PRD's named extension point: ``pytest.mark.skip`` /
 ``xfail`` and ``shellcheck disable`` are out of scope for this batch and are
@@ -439,16 +404,15 @@ def _comment_at(token: tokenize.TokenInfo, *, path: str) -> Comment:
 
     The kind table's marker substring is tested here as well as in the
     pre-decode prefilter, and for the same reason one scale down: a marker-free
-    comment is the overwhelming majority (measured over this tree: 140,237
-    comments hold 6,047 sites), and a substring test is far cheaper than the
-    five pattern searches it stands in front of.  One table, two granularities
-    — not a second policy.
+    comment is the overwhelming majority, and a substring test is far cheaper
+    than the five pattern searches it stands in front of.  One table, two
+    granularities — not a second policy.
 
     THE PHYSICAL LINE IS STRIPPED ONLY FOR A COMMENT THAT MATCHED, which is the
     same economy one step further in.  The strip feeds nothing but a
-    :class:`Site`, so over this tree the ~134,000 marker-free comments would
-    otherwise each allocate a string that is discarded on the next line — paid
-    inside the one function the ten-second budget rests on.  The marker test
+    :class:`Site`, so every marker-free comment would otherwise allocate a
+    string that is discarded on the next line — paid inside the one function
+    the ten-second budget rests on.  The marker test
     already decides whether it is wanted, so nothing new is being consulted.
     """
     line = token.start[0]
@@ -570,8 +534,7 @@ def _source_of(root: Path, relative: str) -> str | None:
 
     Reading the raw BYTES and testing them for a marker substring before
     decoding is the whole prefilter: the files that cannot hold a suppression
-    are never decoded and never tokenized.  Measured over this tree, that is
-    1,212 of 1,933 files skipped.
+    are never decoded and never tokenized.
 
     ``FileNotFoundError`` is the one read failure that is not a fault:
     ``git ls-files`` reads the INDEX, so it lists a path whose worktree file
@@ -608,7 +571,7 @@ def _within(relative: str, scope: tuple[str, ...]) -> bool:
 
     COMPARED AS PATH COMPONENTS, never as a string prefix: ``scripts`` must not
     scope ``scripts_old/`` and ``sc`` must not scope anything, which is the same
-    mistake in the same shape as the selector-matching one decision 2 records.
+    mistake in the same shape as the string-prefix one :func:`selects` refuses.
     Both sides are ``PurePosixPath``, because ``git ls-files`` emits forward
     slashes on every platform and a scope typed as ``./pkg`` should mean ``pkg``.
     """
@@ -827,12 +790,12 @@ def selects(selector: RuleCode, code: RuleCode) -> bool:
     must be EQUAL — ``B`` (flake8-bugbear) never reaches ``BLE``
     (flake8-blind-except) — and the number is a prefix within it.
 
-    A naive ``code.startswith(selector)`` would report this tree's 202
-    ``# noqa: BLE001`` markers as ruff-consumed, defeating D8 for its
-    second-largest population.
+    A naive ``code.startswith(selector)`` would report every ``BLE001`` marker
+    as ruff-consumed under ``select = ["B"]``, defeating D8 for that population.
 
     KNOWN LIMIT, recorded rather than hidden: ruff's meta-prefix selectors
-    (``PL`` covering PLC/PLE/PLR/PLW) read as unselected under this rule.  No
+    (``PL`` covering PLC/PLE/PLR/PLW) read as unselected under this rule, which
+    is the expensive direction of error :data:`_WIDENING_KEYS` describes.  No
     ``pyproject.toml`` in this repository uses one, and ``--json`` publishes
     the resolved select lists so a reader can see exactly what the model used.
     """
@@ -847,10 +810,9 @@ class RuffConfig:
         path: The declaring file, repo-relative, so ``--json`` can name it.
         select: The selectors, parsed.
         ignore: The suppressors, parsed.  Read because it is the same tomllib
-            call and is strictly more honest: all eight pyprojects here set
-            ``ignore = ["E501"]``, so ruff provably never emits E501 and every
-            ``# noqa: E501`` in the tree is dead — which is exactly what D8
-            exists to say.
+            call and is strictly more honest: ruff provably never emits an
+            ignored code, so every ``noqa`` naming one is dead — which is
+            exactly what D8 exists to say.
     """
 
     path: str
@@ -883,8 +845,7 @@ class RuffConfig:
 #: An ABSENT `select` belongs in this family for the same reason and is
 #: enforced with it: ruff then applies its BUILT-IN default rule set, which is
 #: wider than the nothing this model would otherwise infer and which drifts
-#: with the ruff version.  All eight pyprojects here declare `select`
-#: explicitly, so nothing in this tree reaches that refusal.
+#: with the ruff version.
 _WIDENING_KEYS: tuple[str, ...] = ('extend-select', 'extend')
 
 
@@ -984,8 +945,8 @@ class ConsumerModel:
     """Resolves each site's consumer, reading the nearest ``pyproject.toml``.
 
     STATEFUL FOR ONE REASON ONLY — the memo.  Resolution walks from a site's
-    directory up to the scan root, and a tree of 6,000 sites in 800 files would
-    otherwise re-read and re-parse the same eight manifests thousands of times.
+    directory up to the scan root, so without it every site would re-read and
+    re-parse the same few manifests.
     The memo is keyed by DIRECTORY rather than by file, so one read serves every
     file in a package, and it is private to one scan.
     """
@@ -1013,8 +974,7 @@ class ConsumerModel:
         THE FIRST-PARTY TABLE IS CONSULTED FIRST, because those codes are not
         ruff codes at all and no config could ever answer for them.  A site is
         consumed if ANY of its codes is — the direction that over-reads, which
-        decision 3 establishes is the cheap failure (it grandfathers a dead
-        marker) where under-reading would falsely reject a live one.
+        :data:`_WIDENING_KEYS` records as the cheap direction of error.
 
         A CODELESS marker silences whatever ruff would have said, so it is
         consumed exactly when ruff has something to say at all — and a config
@@ -1044,8 +1004,8 @@ class ConsumerModel:
         THE REPORT'S AUDIT TRAIL, and the reason it is the model that publishes
         it: what a reader needs is not every ``pyproject.toml`` in the tree but
         the ones whose ``select``/``ignore`` decided an answer here — including,
-        by their absence, the meta-prefix selectors decision 2 records as a known
-        limit.  Deduped by path, because the memo is keyed by directory and one
+        by their absence, the meta-prefix selectors :func:`selects` records as
+        its KNOWN LIMIT.  Deduped by path, because the memo is keyed by directory and one
         manifest serves a whole subtree.
         """
         return tuple(
@@ -1138,8 +1098,9 @@ class SuppressionClass:
 RATIFIED_SUPPRESSION_CLASSES: Mapping[SuppressionClass, Policy] = MappingProxyType({})
 """Blanket rulings, keyed by class — SHIPPED EMPTY, and that is D9's design.
 
-The valve is the OPERATOR's: δ rules the rows against the inflow table so the
-valve is sized against the filing rate each row prevents, and ζb applies them.
+The valve is the OPERATOR's: task 5603 rules the rows against the inflow table
+so the valve is sized against the filing rate each row prevents, and task 5609
+applies them.
 An implementer adding a row here would be ratifying a blanket exception on the
 operator's behalf, which is the one thing D9 reserves.
 
@@ -1274,8 +1235,8 @@ def classify(scan: Scan, model: ConsumerModel) -> Classification:
 
     A MALFORMED MARKER IS A VIOLATION AND LEAVES ITS SITES UNOWNED.  Both are
     true at once and neither substitutes for the other: the broken marker is a
-    fault at the site whatever the baseline says, and the sites it failed to
-    disposition are genuinely undisposed.
+    fault at the site (baseline-independent, as :func:`_verdict` records), and
+    the sites it failed to disposition are genuinely undisposed.
 
     THE PREFILTER BOUNDS THE SUPPRESSION-FREE-DISPOSITION FINDING, and the
     bound is stated here rather than left to be found.  This layer sees only
@@ -1386,7 +1347,7 @@ def _classify_site(
 
 #: Where the committed baseline lives, relative to the repository root.  Named
 #: here and nowhere else, so ``--baseline`` has a default that cannot drift from
-#: the path κ1 seeds and the merge gate reads.
+#: the path task 5607 seeds and the merge gate reads.
 BASELINE_PATH = 'scripts/inline_suppression_baseline.json'
 
 #: The ``--json`` report's own schema version, and deliberately NOT
@@ -1474,7 +1435,7 @@ def _status(request: Request) -> Status:
     catching ``shared.ratchet.BaselineUnusable``.  That kernel refusal collapses
     absent, undecodable, unparseable, misshapen and wrong-schema into one case
     because they mean one thing to its callers; this consumer is the one place
-    where they do not.  D12 makes absence a legitimate pre-κ1 state, while a
+    where they do not.  D12 makes absence a legitimate unseeded state, while a
     baseline that exists and cannot be read is a broken instrument.  Reaching the
     advisory path by catching the refusal would report a corrupt or truncated
     baseline as a clean tree, which is the silent fail-soft an empty baseline
@@ -1700,9 +1661,8 @@ def _report_line(
 def _check(request: Request, kernel: ModuleType) -> int:
     """Compare *request*'s tree against its baseline — the merge gate's verb.
 
-    The violations are the two independent kinds added together: the disposition
-    faults D6 names, which are faults at the site whatever any baseline says,
-    and the ratchet's excess.  Either alone is exit 1.
+    The violations are :func:`_verdict`'s: the disposition faults D6 names plus
+    the ratchet's excess.  Either alone is exit 1.
     """
     measured = _measure(request)
     verdict = _verdict(request, measured.classification, kernel)
@@ -1751,7 +1711,7 @@ def _require_whole_tree(request: Request, verb: str) -> None:
 
 
 def _seed(request: Request, kernel: ModuleType) -> int:
-    """Write *request*'s tree as a fresh baseline — κ1's one-time verb.
+    """Write *request*'s tree as a fresh baseline — task 5607's one-time verb.
 
     BOTH REFUSALS PRECEDE ``dump``, and they have to: ``dump`` writes the
     enumeration it is handed and checks nothing about the file already at the
@@ -1792,9 +1752,9 @@ def _seed(request: Request, kernel: ModuleType) -> int:
 #: What a run with no baseline tells the reader, so the next question — "then
 #: why is this green?" — is answered in the same output.
 #:
-#: IT SCOPES ITS CLAIM TO THE RATCHET, because the run it accompanies may not be
-#: green at all: a disposition fault is a fault at the site whatever any baseline
-#: holds, so an advisory run still reports one and still exits 1.
+#: IT SCOPES ITS CLAIM TO THE RATCHET, because the run it accompanies may still
+#: exit 1 on a disposition fault, which :func:`_verdict` reports with or without
+#: a baseline.
 _ADVISORY_NOTICE = (
     'no baseline at {baseline}, so the RATCHET is not enforced yet: every suppression '
     'here is reported and none of them counts as excess. Disposition faults are '
@@ -1804,7 +1764,7 @@ _ADVISORY_NOTICE = (
 
 
 def _tighten(request: Request, kernel: ModuleType) -> int:
-    """Spend the baseline's headroom — ζb's verb, run after the rulings land.
+    """Spend the baseline's headroom — task 5609's verb, run after the rulings land.
 
     THROUGH ``tighten_into``, NEVER ``tighten`` PLUS ``dump``.  The kernel makes
     the composition the SHORT way to write the safe call for a reason: persisting
