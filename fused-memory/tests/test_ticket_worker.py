@@ -1547,7 +1547,7 @@ class TestDispatchTicketDecision:
     async def test_dispatch_create_decision_returns_created_status_and_task_id(
         self, interceptor_with_store, taskmaster,
     ):
-        """action='create' → calls tm.add_task, returns (created, '77', None, {...})."""
+        """action='create' → calls tm.add_task, returns (created, '77', 'create: novel', {...})."""
         from fused_memory.middleware.task_curator import CandidateTask
 
         candidate = CandidateTask(title='New Feature', description='Details here')
@@ -1578,10 +1578,42 @@ class TestDispatchTicketDecision:
 
         assert status == 'created'
         assert task_id == '77'
-        assert reason is None
+        assert reason == 'create: novel'
         assert isinstance(result_dict, dict)
         assert result_dict.get('id') == '77'
         assert degrade_reason is None
+
+    @pytest.mark.asyncio
+    async def test_dispatch_create_with_empty_justification_reason_is_bare_create(
+        self, interceptor_with_store, taskmaster,
+    ):
+        from fused_memory.middleware.task_curator import CandidateTask
+
+        add_task_result = {'id': '77', 'title': 'New Feature'}
+        taskmaster.add_task = AsyncMock(return_value=add_task_result)
+        mock_curator = MagicMock()
+        mock_curator.record_task = AsyncMock()
+
+        with patch.object(
+            type(interceptor_with_store), '_ensure_taskmaster',
+            new=AsyncMock(return_value=taskmaster),
+        ):
+            status, _, reason, result_dict, _ = (
+                await interceptor_with_store._dispatch_ticket_decision(
+                    ticket_id='tkt_bare',
+                    project_root='/p',
+                    project_id='p',
+                    candidate=CandidateTask(title='New Feature'),
+                    decision=CuratorDecision(action='create', justification=''),
+                    kwargs={'title': 'New Feature'},
+                    metadata=None,
+                    curator=mock_curator,
+                )
+            )
+
+        assert status == 'created'
+        assert reason == 'create'
+        assert result_dict == add_task_result
 
     @pytest.mark.asyncio
     async def test_dispatch_drop_returns_combined_with_target_id(
@@ -2113,6 +2145,192 @@ class TestProcessAddTicketsBatch:
         assert r2['task_id'] == '77'
 
         assert taskmaster.add_task.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Create-path provenance — task 4718
+# ---------------------------------------------------------------------------
+
+
+_ADD_TASK_RESULT = {'id': '42', 'title': 'New Task'}
+
+
+def _curator_returning(decision: CuratorDecision) -> MagicMock:
+    """A curator mock whose single-item ``curate`` returns *decision*.
+
+    ``prepare_candidate`` returns None, so the worker's batch path takes the
+    unprepared-record backfill and asks ``curate`` for the verdict.
+    """
+    mock_curator = MagicMock()
+    mock_curator.prepare_candidate = AsyncMock(return_value=None)
+    mock_curator.curate = AsyncMock(return_value=decision)
+    mock_curator.note_created = MagicMock()
+    mock_curator.record_task = AsyncMock()
+    return mock_curator
+
+
+async def _drive_ticket_through_worker(interceptor, ticket_store, curator) -> dict:
+    with patch.object(
+        type(interceptor), '_get_curator', new=AsyncMock(return_value=curator),
+    ):
+        result = await interceptor.submit_task(
+            project_root='/project',
+            title='Provenance Task',
+            description='Which path created me?',
+        )
+        ticket_id = result['ticket']
+        return await _poll_ticket_resolved(ticket_store, ticket_id)
+
+
+class TestCreatePathReasonPersisted:
+    """A ``created`` ticket records WHY it was created in ``tickets.reason``.
+
+    The drop, combine and refuse branches already persist ``drop: …``,
+    ``combine: …`` and ``refused (no task created): …``; the create branch
+    completes that vocabulary as ``create: <justification>`` so a degraded
+    create is visible in the durable store, not only in process logs.
+    """
+
+    @pytest.mark.asyncio
+    async def test_degraded_create_records_its_justification(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        curator = _curator_returning(CuratorDecision(
+            action='create',
+            justification='llm-failed: FileNotFoundError: boom',
+            degraded=True,
+        ))
+
+        row = await _drive_ticket_through_worker(
+            interceptor_with_store, ticket_store, curator,
+        )
+
+        assert row['status'] == 'created'
+        assert row['reason'] == 'create: llm-failed: FileNotFoundError: boom'
+        assert json.loads(row['result_json']) == _ADD_TASK_RESULT
+
+    @pytest.mark.asyncio
+    async def test_healthy_create_records_full_justification_verbatim(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        prose = (
+            'No existing task covers the retry semantics of the merge lane. '
+            'The closest candidate, task 812, concerns the scheduler and '
+            'touches disjoint files. ' + 'Further detail. ' * 40
+        ).strip()
+        curator = _curator_returning(
+            CuratorDecision(action='create', justification=prose, degraded=False),
+        )
+
+        row = await _drive_ticket_through_worker(
+            interceptor_with_store, ticket_store, curator,
+        )
+
+        assert row['status'] == 'created'
+        assert row['reason'] == 'create: ' + prose
+        assert json.loads(row['result_json']) == _ADD_TASK_RESULT
+
+    @pytest.mark.asyncio
+    async def test_curator_failure_records_curator_failed_reason(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        from fused_memory.middleware.task_curator import CuratorFailureError
+
+        exc = CuratorFailureError('llm down', timed_out=False, duration_ms=100)
+        curator = MagicMock()
+        curator.curate = AsyncMock(side_effect=exc)
+        curator.curate_batch = AsyncMock(side_effect=exc)
+        _stub_prepare_candidate(curator)
+        curator.note_created = MagicMock()
+        curator.record_task = AsyncMock()
+
+        row = await _drive_ticket_through_worker(
+            interceptor_with_store, ticket_store, curator,
+        )
+
+        assert row['status'] == 'created'
+        assert row['reason'] == 'create: curator-failed: llm down'
+        assert json.loads(row['result_json'])['curator_degrade_reason'] == 'llm down'
+
+    @pytest.mark.asyncio
+    async def test_single_ticket_path_curator_failure_records_reason(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        from fused_memory.middleware.task_curator import CuratorFailureError
+
+        curator = MagicMock()
+        curator.curate = AsyncMock(side_effect=CuratorFailureError('llm down'))
+        curator.note_created = MagicMock()
+        curator.record_task = AsyncMock()
+        ticket_id = await ticket_store.submit('project', json.dumps({
+            'project_root': '/project',
+            'kwargs': {'title': 'Single Path', 'description': 'd'},
+            'metadata': None,
+        }))
+
+        with patch.object(
+            type(interceptor_with_store), '_get_curator',
+            new=AsyncMock(return_value=curator),
+        ):
+            await interceptor_with_store._process_add_ticket(ticket_id)
+
+        row = await ticket_store.get(ticket_id)
+        assert row is not None and row['status'] == 'created'
+        assert row['reason'] == 'create: curator-failed: llm down'
+        assert json.loads(row['result_json'])['curator_degrade_reason'] == 'llm down'
+
+    @pytest.mark.asyncio
+    async def test_batch_path_records_create_reason(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        ticket_id = await ticket_store.submit('project', json.dumps({
+            'project_root': '/project',
+            'kwargs': {'title': 'Batch Path', 'description': 'd'},
+            'metadata': None,
+        }))
+        curator = MagicMock()
+        curator.curate_batch = AsyncMock(return_value=[
+            CuratorDecision(action='create', justification='novel in batch'),
+        ])
+        _stub_prepare_candidate(curator)
+        curator.note_created = MagicMock()
+        curator.record_task = AsyncMock()
+
+        with patch.object(
+            type(interceptor_with_store), '_get_curator',
+            new=AsyncMock(return_value=curator),
+        ), patch.object(
+            type(interceptor_with_store), '_ensure_taskmaster',
+            new=AsyncMock(return_value=taskmaster),
+        ):
+            await interceptor_with_store._process_add_tickets_batch([ticket_id])
+
+        row = await ticket_store.get(ticket_id)
+        assert row is not None and row['status'] == 'created'
+        assert row['reason'] == 'create: novel in batch'
+
+    @pytest.mark.asyncio
+    async def test_created_rows_with_reason_never_enter_the_failure_sweep(
+        self, interceptor_with_store, ticket_store, taskmaster,
+    ):
+        degraded = await _drive_ticket_through_worker(
+            interceptor_with_store, ticket_store, _curator_returning(
+                CuratorDecision(
+                    action='create', justification='llm-failed: x', degraded=True,
+                ),
+            ),
+        )
+        healthy = await _drive_ticket_through_worker(
+            interceptor_with_store, ticket_store, _curator_returning(
+                CuratorDecision(action='create', justification='novel'),
+            ),
+        )
+
+        failures = await ticket_store.fetch_unescalated_failures(limit=100)
+
+        swept = {f['ticket_id'] for f in failures}
+        assert degraded['ticket_id'] not in swept
+        assert healthy['ticket_id'] not in swept
 
 
 # ---------------------------------------------------------------------------
