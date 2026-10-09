@@ -31,6 +31,7 @@ from shared.psi import PsiSample, read_psi_sample
 from shared.task_claimant import has_live_claimant, is_stranded_blocked
 from shared.task_metadata import parse_metadata
 from shared.task_metadata_wire import coerce_task_metadata
+from shared.task_statuses import TaskStatus
 
 from orchestrator import git_ops
 from orchestrator.config import (
@@ -6553,26 +6554,38 @@ class Scheduler:
         Reads: ``ctx.status_map``, ``ctx.tasks_by_id``. Writes: none on
         ctx (mutates ``self.lock_table``/``self._skip_count`` and emits
         reservation_expired/reservation_restored events). Replaces the
-        wall-clock lease mechanic: a park whose owner is terminal /
-        missing / deps-unsatisfied has no reason to keep blocking other
-        tasks, so it's evicted now. Always continues.
+        wall-clock lease mechanic: every park whose owner fails the
+        park-hold predicate (:meth:`_park_gc_reason`) is expired now, and
+        the owner's skip count goes with it. Always continues.
         """
         for owner in self._expire_parks(partial(self._park_gc_reason, ctx)):
             self._skip_count.pop(owner, None)
         return _CONTINUE
 
     def _park_gc_reason(self, ctx: TickContext, owner: str) -> str | None:
-        """Why park GC expires *owner*'s parks, or None to keep them.
+        """The park-hold predicate: why *owner* may not hold parks, or None.
 
-        ``'terminal:<status>'``, ``'missing'`` (absent from the task read) or
-        ``'deps_unsatisfied'`` — an owner in any of these has no reason to keep
-        blocking other tasks.
+        An owner may hold parks, pin reservations included, iff it is pending
+        and its dependencies are not known to be unsatisfied (esc-6040-7
+        D1/D2).  The status test is an allowlist, so any status other than
+        pending fails closed.  This is THE home of the owner-state
+        ``reservation_expired`` reason vocabulary, first match wins:
+
+        - ``'terminal:<status>'`` — done or cancelled;
+        - ``'missing'`` — absent from this tick's task read;
+        - ``'not_pending:<status>'`` — any other non-pending status;
+        - ``'deps_unsatisfied'`` — a local dependency is unsatisfied.
+
+        Park GC expires on it; the operator eviction drain and ``reserve_now``
+        consult the same predicate.
         """
         status = ctx.status_map.get(owner)
         if status in TERMINAL_STATUSES:
             return f'terminal:{status}'
         if owner not in ctx.tasks_by_id:
             return 'missing'
+        if status != TaskStatus.PENDING:
+            return f'not_pending:{status}'
         if not self._deps_satisfied(ctx.tasks_by_id[owner], ctx.status_map, ctx.tasks_by_id):
             return 'deps_unsatisfied'
         return None
