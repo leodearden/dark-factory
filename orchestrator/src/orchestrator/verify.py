@@ -7698,11 +7698,7 @@ def _executed_module_configs_from_plan(
     ``None`` for a subproject with zero matching files: the caller must skip
     that subproject rather than run its full unscoped suite.
 
-    Uses ``dataclasses.replace`` (imported as ``replace``) rather than a
-    hand-listed ``ModuleConfig(...)`` reconstruction, so every other
-    ModuleConfig field survives onto the executed config unchanged (the same
-    pattern :func:`_apply_cargo_scope` uses), so ``run_verification``'s resolvers see identical per-module
-    overrides to what they'd have seen from *mc* directly.
+    Copies *mc* via ``dataclasses.replace`` so all non-command fields survive.
 
     Guard: a TRIVIAL *plan* (``derive_verify_plan``'s top-level "no
     .py/.rs file at all" short-circuit — a single run with

@@ -819,8 +819,7 @@ class TestRunVerificationColdFirstUse:
 
 
 def test_apply_cargo_scope_preserves_every_non_command_field(tmp_path: Path):
-    """Cargo scoping rewrites only the three commands; every other ModuleConfig field
-    must survive (sequential_lint_first was dropped by a hand-listed rebuild)."""
+    """Cargo scoping rewrites only the three commands; every other ModuleConfig field survives."""
     (tmp_path / 'Cargo.toml').write_text('[workspace]\nmembers = ["crates/*"]\n')
     crate_dir = tmp_path / 'crates' / 'foo'
     crate_dir.mkdir(parents=True)
@@ -861,13 +860,7 @@ def test_apply_cargo_scope_preserves_every_non_command_field(tmp_path: Path):
         f.name for f in fields(ModuleConfig)
         if f.name not in command_fields and getattr(result, f.name) != getattr(mc, f.name)
     ]
-    assert replace(
-        result,
-        test_command=mc.test_command,
-        lint_command=mc.lint_command,
-        type_check_command=mc.type_check_command,
-    ) == mc, f'Non-command fields changed by cargo scoping: {differing}'
-    assert result.sequential_lint_first is True
+    assert differing == [], f'Non-command fields changed by cargo scoping: {differing}'
 
 
 class TestIsTestFile:
