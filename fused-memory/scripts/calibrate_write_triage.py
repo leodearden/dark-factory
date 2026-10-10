@@ -56,6 +56,12 @@ Usage
   # Also write the derived thresholds into config.yaml's write_triage block.
   python scripts/calibrate_write_triage.py --project-id reify --write-config
 
+  # Calibrate another project on its own fixture; write ONLY its per-project cutoffs.
+  python scripts/calibrate_write_triage.py --config config/config.yaml --project-id dark_factory \\
+      --fixture tests/fixtures/write_triage_calibration_dark_factory.jsonl \\
+      --report-path calibration/write_triage_calibration_report_dark_factory.json \\
+      --retrieval production --k 1 --k 3 --k 5 --k 10 --k 20 --write-project-config
+
   # Regenerate the committed report: production recall re-measured, bands of record carried.
   python scripts/calibrate_write_triage.py --project-id reify --retrieval production \\
       --canonical-aliases tests/fixtures/write_triage_calibration.canonical_aliases.json \\
@@ -71,6 +77,8 @@ import math
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -918,6 +926,55 @@ def _preserved_block_lines(lines: Sequence[str]) -> tuple[list[str], list[str]]:
     return kept, trailing
 
 
+def _top_level_block_span(lines: Sequence[str], block_key: str) -> tuple[int | None, int]:
+    """``(start, end)`` of the top-level section opened by *block_key*.
+
+    ``start`` is the index of the column-0 key line, or ``None`` when the
+    section is absent (``end`` is then ``len(lines)``). ``end`` is exclusive.
+
+    The scan runs to the next line that opens a new TOP-LEVEL key (column 0,
+    not a comment and not blank). Bounding the span this way is what keeps a
+    section declared after this one from being eaten.
+
+    Then ``end`` walks back: a run of COLUMN-0 comment lines, plus any blank
+    lines before it, is the HEADER for the section that FOLLOWS — that is
+    config.yaml's convention throughout (see the 6-line comment block before
+    `summary_rebuild:`). It must survive a replacement rather than being
+    consumed as block-internal. The column-0 test is deliberately
+    `startswith('#')` and NOT `lstrip().startswith('#')`: an INDENTED comment
+    belongs to the block it sits inside, so the walk stops at it.
+    """
+    start = next(
+        (i for i, line in enumerate(lines) if line.startswith(block_key)),
+        None,
+    )
+    end = len(lines)
+    if start is None:
+        return None, end
+    for i in range(start + 1, len(lines)):
+        line = lines[i]
+        if line.strip() and not line[0].isspace() and not line.lstrip().startswith('#'):
+            end = i
+            break
+    while end > start + 1 and (
+        not lines[end - 1].strip() or lines[end - 1].startswith('#')
+    ):
+        end -= 1
+    return start, end
+
+
+def _splice_block(yaml_text: str, lines: Sequence[str], span: tuple[int | None, int],
+                  block: str) -> str:
+    """Put *block* where *span* was, or append it at EOF when the section is absent."""
+    start, end = span
+    if start is None:
+        separator = '' if yaml_text.endswith('\n\n') or not yaml_text else '\n'
+        return yaml_text + separator + block
+    # No trailing accumulator: `lines[end:]` already emits every reclaimed line
+    # verbatim, so collecting them separately would double-emit them.
+    return ''.join(lines[:start]) + block + ''.join(lines[end:])
+
+
 def write_triage_config_block(
     yaml_text: str,
     t_high: float | None,
@@ -981,33 +1038,7 @@ def write_triage_config_block(
         )
 
     lines = yaml_text.splitlines(keepends=True)
-    start = next(
-        (i for i, line in enumerate(lines) if line.startswith(_BLOCK_KEY)),
-        None,
-    )
-
-    # Scan to the next line that opens a new TOP-LEVEL key (column 0, not a
-    # comment and not blank). Bounding the span this way is what keeps a
-    # section declared after write_triage from being eaten.
-    end = len(lines)
-    if start is not None:
-        for i in range(start + 1, len(lines)):
-            line = lines[i]
-            if line.strip() and not line[0].isspace() and not line.lstrip().startswith('#'):
-                end = i
-                break
-
-        # Then walk `end` back: a run of COLUMN-0 comment lines, plus any blank
-        # lines before it, is the HEADER for the section that FOLLOWS — that is
-        # config.yaml's convention throughout (see the 6-line comment block before
-        # `summary_rebuild:`). It must survive the replacement rather than being
-        # consumed as block-internal. The column-0 test is deliberately
-        # `startswith('#')` and NOT `lstrip().startswith('#')`: an INDENTED comment
-        # belongs to the block it sits inside, so the walk stops at it.
-        while end > start + 1 and (
-            not lines[end - 1].strip() or lines[end - 1].startswith('#')
-        ):
-            end -= 1
+    start, end = _top_level_block_span(lines, _BLOCK_KEY)
 
     # Hand-set knobs found in the existing block, re-emitted ABOVE the
     # calibration fence so the shipped file's layout round-trips unchanged and
@@ -1041,13 +1072,82 @@ def write_triage_config_block(
         f'{trailing}'
     )
 
-    if start is None:
-        separator = '' if yaml_text.endswith('\n\n') or not yaml_text else '\n'
-        return yaml_text + separator + block
+    return _splice_block(yaml_text, lines, (start, end), block)
 
-    # No trailing accumulator: `lines[end:]` already emits every reclaimed line
-    # verbatim, so collecting them separately would double-emit them.
-    return ''.join(lines[:start]) + block + ''.join(lines[end:])
+
+def derived_category_cutoffs(report: Mapping[str, Any]) -> dict[str, float]:
+    """``{category: t_high}`` for exactly the categories whose band was DERIVED.
+
+    A refused category is ABSENT rather than mapped to a null, so a consumer
+    reads "uncalibrated for this category" from one unambiguous signal.
+    """
+    return {
+        category: entry['t_high']
+        for category, entry in report.get('per_category', {}).items()
+        if entry['t_high'] is not None
+    }
+
+
+_PROJECT_SECTION = 'write_triage_project_calibrations'
+_PROJECT_BLOCK_KEY = f'{_PROJECT_SECTION}:'
+
+# Indented, so the fence belongs to the section's own span: a column-0 run
+# would be read by _top_level_block_span's walk-back as the NEXT section's
+# header and stranded outside it.
+_PROJECT_BLOCK_FENCE = (
+    '  # CALIBRATION OUTPUT — machine-owned; do not hand-edit.\n'
+    "  # Per-project per-category cutoffs, each measured on that project's own\n"
+    '  # fixture by scripts/calibrate_write_triage.py --write-project-config.\n'
+    '  # Read only by scripts/audit_duplicate_memories.py for a run whose\n'
+    "  # --project-id equals the key; never pooled with write_triage's bands.\n"
+    '  # Hand edits inside this section are not preserved.\n'
+)
+
+
+def _render_project_section(entries: Mapping[str, Mapping[str, Any]]) -> str:
+    """The whole section, projects and categories sorted, so equal input is equal bytes."""
+    out = [f'{_PROJECT_BLOCK_KEY}\n', _PROJECT_BLOCK_FENCE]
+    for project in sorted(entries):
+        cutoffs = entries[project]['t_high_by_category']
+        out.append(f'  {project}:\n')
+        out.append(f'    calibration_report_path: {entries[project]["calibration_report_path"]}\n')
+        out.append('    t_high_by_category:\n')
+        out.extend(f'      {category}: {cutoffs[category]}\n' for category in sorted(cutoffs))
+    return ''.join(out)
+
+
+def write_project_calibration_block(
+    yaml_text: str,
+    project_id: str,
+    report_path: str,
+    t_high_by_category: Mapping[str, float],
+) -> str:
+    """Return *yaml_text* with ``write_triage_project_calibrations.<project_id>`` replaced.
+
+    Writes ONLY that one project's entry, replacing it wholesale (a category
+    the latest run stopped deriving is dropped, never merged), and never
+    touches ``write_triage:``'s pooled keys. The section is machine-owned, so
+    unlike ``write_triage_config_block`` it is parsed and re-rendered whole;
+    hand edits inside it are not preserved. Raises on an empty map, and the
+    input string is never mutated, so a refusal leaves nothing half-written.
+    """
+    if not t_high_by_category:
+        raise ValueError(
+            f'refusing to write a {project_id!r} project entry with no derived '
+            'category: a calibration that evidences nothing must stay absent.',
+        )
+    lines = yaml_text.splitlines(keepends=True)
+    start, end = _top_level_block_span(lines, _PROJECT_BLOCK_KEY)
+    existing = (
+        yaml.safe_load(''.join(lines[start:end]))[_PROJECT_SECTION]
+        if start is not None else None
+    )
+    entries = dict(existing or {})
+    entries[project_id] = {
+        'calibration_report_path': report_path,
+        't_high_by_category': dict(t_high_by_category),
+    }
+    return _splice_block(yaml_text, lines, (start, end), _render_project_section(entries))
 
 
 def render_markdown(report: dict[str, Any]) -> str:
@@ -1423,6 +1523,57 @@ def build_embed_fn(config: Any) -> Any:
     return embed
 
 
+def _warn_refused_categories(
+    report: Mapping[str, Any], derived: Mapping[str, float], destination: str,
+) -> None:
+    refused = sorted(set(report.get('per_category', {})) - set(derived))
+    if refused:
+        logger.warning(
+            'No per-category cutoff derived for %s — left ABSENT from '
+            '%s; see the report per_category section for '
+            'each refusal reason.', ', '.join(refused), destination,
+        )
+
+
+def _write_project_config(
+    report: Mapping[str, Any], config_path: Path, project_id: str, report_path: str,
+) -> int:
+    """Write ONLY ``write_triage_project_calibrations.<project_id>``, or refuse.
+
+    The run's pooled chosen_t_high/t_low describe this project's corpus alone,
+    which no consumer reads, so they are never written: write_triage keeps the
+    pooled bands of record (R3).
+    """
+    cutoffs = derived_category_cutoffs(report)
+    destination = f'{_PROJECT_SECTION}.{project_id}'
+    if not cutoffs:
+        logger.error(
+            'ABORT: no per-category cutoff derived for project %s (reasons: %s) — '
+            'refusing to write config; %s stays absent.',
+            project_id,
+            '; '.join(
+                f'{category}: {entry["reason"]}'
+                for category, entry in sorted(report.get('per_category', {}).items())
+            ) or 'no per_category section',
+            destination,
+        )
+        return 1
+    _warn_refused_categories(report, cutoffs, destination)
+    logger.info(
+        'Pooled chosen_t_high=%s / chosen_t_low=%s of this %s run are NOT written; '
+        'write_triage keeps its pooled bands of record.',
+        report.get('chosen_t_high'), report.get('chosen_t_low'), project_id,
+    )
+    config_path.write_text(write_project_calibration_block(
+        config_path.read_text(), project_id, package_relative(report_path), cutoffs,
+    ))
+    logger.info(
+        'Wrote %s to %s (per-category cutoffs: %s)',
+        destination, config_path, ', '.join(sorted(cutoffs)),
+    )
+    return 0
+
+
 async def _run(args: Any) -> int:
     import os  # noqa: PLC0415
 
@@ -1506,6 +1657,11 @@ async def _run(args: Any) -> int:
         if args.bands_from:
             logger.info('Recall only — bands carried from %s; config unchanged.', args.bands_from)
             return 0
+        config_path = Path(args.config) if args.config else (
+            Path(__file__).parent.parent / 'config' / 'config.yaml'
+        )
+        if args.write_project_config:
+            return _write_project_config(report, config_path, args.project_id, args.report_path)
         if not args.write_config:
             logger.info('Report only — config unchanged. Use --write-config to commit.')
             return 0
@@ -1518,26 +1674,8 @@ async def _run(args: Any) -> int:
             )
             return 1
 
-        config_path = Path(args.config) if args.config else (
-            Path(__file__).parent.parent / 'config' / 'config.yaml'
-        )
-        # Only the categories whose band was actually DERIVED. A refused one
-        # is left ABSENT rather than written as a null, so the consumer reads
-        # "uncalibrated for this category" from one unambiguous signal.
-        derived_by_category = {
-            category: entry['t_high']
-            for category, entry in result['report']['per_category'].items()
-            if entry['t_high'] is not None
-        }
-        refused = sorted(
-            set(result['report']['per_category']) - set(derived_by_category),
-        )
-        if refused:
-            logger.warning(
-                'No per-category cutoff derived for %s — left ABSENT from '
-                't_high_by_category; see the report per_category section for '
-                'each refusal reason.', ', '.join(refused),
-            )
+        derived_by_category = derived_category_cutoffs(report)
+        _warn_refused_categories(report, derived_by_category, 't_high_by_category')
         updated = write_triage_config_block(
             config_path.read_text(), result['t_high'], result['t_low'],
             package_relative(args.report_path),
@@ -1572,6 +1710,11 @@ def main() -> int:
     outcome.add_argument('--write-config', dest='write_config', action='store_true',
                          help='Write the derived thresholds into config.yaml '
                               '(default: report only)')
+    outcome.add_argument('--write-project-config', dest='write_project_config',
+                         action='store_true',
+                         help='Write ONLY write_triage_project_calibrations.<--project-id> '
+                              'from the per-category cutoffs this run derived; never '
+                              "touches write_triage's pooled keys (R3).")
     outcome.add_argument('--bands-from', dest='bands_from', default=None,
                          help='Recall-only: re-measure recall_at_k and carry this '
                               "report's band section verbatim, with no embedding and no "

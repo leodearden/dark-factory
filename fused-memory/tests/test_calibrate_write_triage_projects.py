@@ -187,7 +187,10 @@ def _section(text: str) -> dict:
 
 
 def _block_lines(text: str, key: str) -> list[str]:
-    """The lines of top-level *key*'s block, from its key line to the next column-0 key."""
+    """The lines of top-level *key*'s block: its key line up to the next column-0 key.
+
+    Trailing blank lines are separators between sections, not block content.
+    """
     lines = text.splitlines()
     start = lines.index(key)
     end = next(
@@ -195,6 +198,8 @@ def _block_lines(text: str, key: str) -> list[str]:
          if lines[i].strip() and not lines[i][0].isspace() and not lines[i].startswith('#')),
         len(lines),
     )
+    while not lines[end - 1].strip():
+        end -= 1
     return lines[start:end]
 
 
@@ -334,7 +339,7 @@ class TestWriteProjectConfigHelper:
     ) -> None:
         config = tmp_path / 'config.yaml'
         config.write_text(POOLED_YAML)
-        report_path = Path(_mod().__file__).resolve().parents[1] / 'calibration' / 'df.json'
+        report_path = SCRIPT_PATH.resolve().parents[1] / 'calibration' / 'df.json'
         report = _report({
             'observations_and_summaries': {'t_high': 0.87, 't_low': 0.6, 'reason': None},
             'preferences_and_norms': {
