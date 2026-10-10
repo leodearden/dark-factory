@@ -3674,6 +3674,7 @@ class ReconciliationHarness:
         events: list[ReconciliationEvent] | None = None,
         assembled_payload: AssembledPayload | None = None,
         resume_run: ReconciliationRun | None = None,
+        run_id: str | None = None,
     ) -> ReconciliationRun:
         """Execute the three-stage pipeline for a project.
 
@@ -3696,6 +3697,8 @@ class ReconciliationHarness:
                     ``resume_run.stage_cursor`` by threading
                     ``resume_run.session_id`` into it.  The remaining stages run
                     fresh, and the completion/judge/remediation tail is unchanged.
+            run_id: caller-minted id for this run, so a caller whose wait_for
+                    timed out can still scope the restore of its events (task 6453).
         """
         # task 1143: pre-flight guard — raises before any side effects (no journal row,
         # no buffer drain) if project_id has no KNOWN_PROJECT_ROOTS entry.
@@ -3705,6 +3708,11 @@ class ReconciliationHarness:
         tier = tier or TierConfig()
         watermark = await self.journal.get_watermark(project_id)
 
+        if resume_run is not None and run_id is not None:
+            raise ValueError(
+                'run_full_cycle(resume_run=..., run_id=...) are mutually exclusive: '
+                'a resumed run keeps resume_run.id'
+            )
         if resume_run is not None:
             # Task σ adopt-and-resume: reuse the interrupted run wholesale — no
             # fresh run row, no re-drain. The startup pass supplies the run's
@@ -3724,7 +3732,7 @@ class ReconciliationHarness:
             # this resumed cycle completes.
             run.status = RunStatus.running
         else:
-            run_id = str(uuid4())
+            run_id = run_id if run_id is not None else str(uuid4())
             if events is None:
                 events = await self.buffer.drain(project_id, run_id=run_id)
             else:
