@@ -186,6 +186,14 @@ def _declaring(call_args: str) -> str:
     return f'{_HEADER}governed_exceptions({call_args})\n'
 
 
+#: The reviewer's reproduction: the function bound as ``declare``, whose call
+#: carries an unratified Policy the register must never report clean.
+_ALIASED_DECLARATION = (
+    'from shared.governed_exceptions import Policy, governed_exceptions as declare\n'
+    "declare('pkg.x', 'r', ['a'], dispositions={'a': Policy('no-such-row')})\n"
+)
+
+
 def _discover(root: Path, files: dict[str, str]):
     track_fixture_tree(root, files)
     return exception_register.discover_declarations(root)
@@ -424,7 +432,61 @@ def test_a_declaration_the_static_reader_cannot_bind_is_an_instrument_failure(
 
 
 @pytest.mark.parametrize(
-    'keys', ['sorted(ALLOWLIST)', '(key for key in ALLOWLIST)', 'ALLOWLIST', 'mod.KEYS']
+    ('source', 'line'),
+    [
+        pytest.param(_ALIASED_DECLARATION, 1, id='import-alias'),
+        pytest.param(
+            'from pkg.helpers import governed_exceptions as declare\n',
+            1,
+            id='import-alias-from-any-module',
+        ),
+        pytest.param(_HEADER + 'declare = governed_exceptions\n', 2, id='assignment'),
+        pytest.param(
+            'import shared.governed_exceptions as ge\ndeclare = ge.governed_exceptions\n',
+            2,
+            id='attribute-assignment',
+        ),
+        pytest.param(
+            _HEADER + 'declare: object = governed_exceptions\n', 2, id='annotated-assignment'
+        ),
+        pytest.param(_HEADER + '(declare := governed_exceptions)\n', 2, id='walrus'),
+        pytest.param(
+            _HEADER + 'class Holder:\n    declare = governed_exceptions\n', 3, id='class-body'
+        ),
+    ],
+)
+def test_binding_the_function_under_another_name_is_an_instrument_failure(
+    tmp_path: Path, source: str, line: int
+):
+    """D5: the register follows calls by the function's own name, so an
+    import-time alias would hide them — here, and in any module importing it."""
+    message = _refusal(tmp_path, {'tests/test_decl.py': source})
+
+    assert f'tests/test_decl.py:{line}' in message
+    assert '`declare`' in message
+    assert 'governed_exceptions' in message
+
+
+def test_naming_the_function_without_renaming_it_is_not_refused(tmp_path: Path):
+    source = (
+        _HEADER
+        + 'NAME = governed_exceptions.__name__\n'
+        + 'governed_exceptions = governed_exceptions\n'
+        + 'import shared.governed_exceptions as ge\n'
+        + 'def helper():\n'
+        + '    from shared.governed_exceptions import governed_exceptions as inner\n'
+        + '    rebound = governed_exceptions\n'
+        + '    return inner, rebound\n'
+    )
+
+    discovery = _discover(tmp_path, {'tests/test_decl.py': source})
+
+    assert discovery.declarations == ()
+    assert discovery.faults == ()
+
+
+@pytest.mark.parametrize(
+    'keys',['sorted(ALLOWLIST)', '(key for key in ALLOWLIST)', 'ALLOWLIST', 'mod.KEYS']
 )
 def test_keys_are_never_evaluated(tmp_path: Path, keys: str):
     """Only the runtime call sees the key set (D5), so any expression is accepted."""
@@ -608,6 +670,18 @@ def test_scenario_13_through_main_is_exit_two_with_no_traceback(tmp_path: Path, 
     err = capsys.readouterr().err
     assert err.startswith('exception_register.py:')
     assert 'Traceback' not in err
+
+
+def test_an_aliased_declaration_is_exit_two_and_never_a_clean_report(tmp_path: Path, capsys):
+    _register_tree(tmp_path, {'tests/test_decl.py': _ALIASED_DECLARATION})
+
+    assert _main(tmp_path, '--report') == 2
+
+    err = capsys.readouterr().err
+    assert err.startswith('exception_register.py:')
+    assert 'tests/test_decl.py:1' in err
+    assert 'Traceback' not in err
+    assert _main(tmp_path, '--json') == 2
 
 
 def test_a_failure_of_the_inline_scanner_is_the_registers_exit_two(tmp_path: Path, capsys):
