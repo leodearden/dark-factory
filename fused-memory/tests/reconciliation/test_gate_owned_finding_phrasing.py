@@ -266,7 +266,7 @@ class TestCanonicalHumanGateAction:
     def test_heading_constant_is_exported_and_well_formed(self):
         """The section heading is a constant so tests locate it without pinning prose.
 
-        Follows the ``EXECUTING_A_CLUSTER_FOLD_HEADING`` precedent in
+        Follows the ``PROPOSING_A_CONSOLIDATION_HEADING`` precedent in
         ``prompts/stage1.py``: a pure rename with a byte-identical body must
         not turn the wiring pins red for no behavioural reason.
         """
