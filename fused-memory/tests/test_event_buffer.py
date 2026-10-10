@@ -1562,6 +1562,30 @@ async def test_peek_then_drain_by_ids_workflow(buf):
     assert (await buf.get_buffer_stats('test-project'))['size'] == 2
 
 
+@pytest.mark.asyncio
+async def test_drain_by_ids_stamps_run_id_for_run_scoped_restore(buf):
+    """drain_by_ids(run_id=) attributes the chunk so a run-scoped restore targets exactly it."""
+    e1, e2, e3 = _make_event(), _make_event(), _make_event()
+    for event in (e1, e2, e3):
+        await buf.push(event)
+
+    assert await buf.drain_by_ids('test-project', [e1.id, e2.id], run_id='R1') == 2
+    assert [e.id for e in await buf.drain('test-project', run_id='R2')] == [e3.id]
+
+    assert {e.id for e in await buf.get_drained_events('test-project', 'R1')} == {e1.id, e2.id}
+    assert await buf.restore_drained('test-project', run_id='R1') == 2
+    assert await buf.count_buffered('test-project') == 2
+    assert [e.id for e in await buf.get_drained_events('test-project', 'R2')] == [e3.id]
+
+    unattributed = _make_event()
+    await buf.push(unattributed)
+    assert await buf.drain_by_ids('test-project', [unattributed.id]) == 1
+    for run_id in ('R1', 'R2'):
+        drained_ids = {e.id for e in await buf.get_drained_events('test-project', run_id)}
+        assert unattributed.id not in drained_ids
+    assert await buf.count_buffered('test-project') == 2
+
+
 # ── _debug_get_deferred_row tests ─────────────────────────────────────
 
 
