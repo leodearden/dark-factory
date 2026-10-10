@@ -684,6 +684,128 @@ class TestReconArchiveRoot:
         assert isinstance(recon_archive_root(cfg), Path)
 
 
+class TestGcArchivesBeforeDelete:
+    """gc_run_config_dir moves a run's transcripts into the archive before it
+    destroys the per-run config dir (task 3972)."""
+
+    RUN_ID = 'd6782083-9319-48fa-b72c-1730fd9b1a35'
+    SID = '0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0'
+    ENC = '-home-leo-src-dark-factory'
+    TRANSCRIPT = b'{"type":"user","message":"hello"}\n{"type":"assistant"}\n'
+
+    def _plant(self, tmp_path):
+        from fused_memory.reconciliation.cli_stage_runner import run_config_dir_path
+
+        data_dir = tmp_path / 'data'
+        config_dir = run_config_dir_path(data_dir, self.RUN_ID)
+        session_dir = config_dir / 'projects' / self.ENC
+        session_dir.mkdir(parents=True)
+        transcript = session_dir / f'{self.SID}.jsonl'
+        transcript.write_bytes(self.TRANSCRIPT)
+        (config_dir / '.credentials.json').write_text('{"token": "secret"}')
+        return data_dir, config_dir, transcript
+
+    def _archived(self, archive_root):
+        return archive_root / f'recon-{self.RUN_ID}' / self.ENC / f'{self.SID}.jsonl'
+
+    def test_transcript_is_archived_then_the_dir_is_destroyed(self, tmp_path):
+        from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+
+        data_dir, config_dir, _ = self._plant(tmp_path)
+        archive_root = tmp_path / 'archive'
+
+        gc_run_config_dir(data_dir, self.RUN_ID, archive_root=archive_root)
+
+        assert self._archived(archive_root).read_bytes() == self.TRANSCRIPT
+        assert not config_dir.exists()
+
+    def test_archive_layout_is_key_enc_sid(self, tmp_path):
+        """Exactly ``<key>/<enc>/<sid>.jsonl``: an extra key segment would leave
+        the archive unenumerable by ``scripts/legibility/inventory.py::_archive_enc``."""
+        from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+
+        data_dir, _, _ = self._plant(tmp_path)
+        archive_root = tmp_path / 'archive'
+
+        gc_run_config_dir(data_dir, self.RUN_ID, archive_root=archive_root)
+
+        [archived] = list(archive_root.rglob('*.jsonl'))
+        assert archived.relative_to(archive_root).parts == (
+            f'recon-{self.RUN_ID}', self.ENC, f'{self.SID}.jsonl',
+        )
+
+    def test_only_jsonl_under_projects_is_archived(self, tmp_path):
+        from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+
+        data_dir, _, _ = self._plant(tmp_path)
+        archive_root = tmp_path / 'archive'
+
+        gc_run_config_dir(data_dir, self.RUN_ID, archive_root=archive_root)
+
+        assert list(archive_root.rglob('.credentials.json')) == []
+
+    def test_no_archive_root_keeps_todays_rmtree_behaviour(self, tmp_path):
+        from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+
+        data_dir, config_dir, _ = self._plant(tmp_path)
+        archive_root = tmp_path / 'archive'
+
+        gc_run_config_dir(data_dir, self.RUN_ID)
+
+        assert not config_dir.exists()
+        assert not archive_root.exists()
+
+    def test_is_still_a_noop_when_the_dir_is_absent(self, tmp_path):
+        from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+
+        archive_root = tmp_path / 'archive'
+
+        gc_run_config_dir(tmp_path / 'data', 'never-created', archive_root=archive_root)
+
+        assert not archive_root.exists()
+
+    def test_never_raises_on_an_unwritable_archive_root(self, tmp_path):
+        """The un-archivable transcript is HELD while the credential is still
+        purged, and gc stays total so it cannot mask a run's terminal outcome."""
+        import os
+
+        from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+
+        if os.geteuid() == 0:
+            pytest.skip('chmod does not bind root')
+
+        data_dir, config_dir, transcript = self._plant(tmp_path)
+        archive_root = tmp_path / 'archive'
+        archive_root.mkdir()
+        archive_root.chmod(0o500)
+        try:
+            gc_run_config_dir(data_dir, self.RUN_ID, archive_root=archive_root)
+        finally:
+            archive_root.chmod(0o700)
+
+        assert transcript.read_bytes() == self.TRANSCRIPT
+        assert not (config_dir / '.credentials.json').exists()
+
+    @pytest.mark.parametrize('mock_cls', [MagicMock, AsyncMock])
+    def test_a_mock_data_dir_with_archival_touches_no_filesystem(
+        self, tmp_path, monkeypatch, mock_cls
+    ):
+        """Archival passes the mock through ``Path(...)``, whose ``__fspath__``
+        coercion yields a relative path; nothing may land under the cwd."""
+        from fused_memory.reconciliation.cli_stage_runner import gc_run_config_dir
+
+        monkeypatch.chdir(tmp_path)
+
+        gc_run_config_dir(
+            mock_cls().data_dir, 'run-x', archive_root=tmp_path / 'archive',
+        )
+
+        assert list(tmp_path.iterdir()) == [], (
+            f'archival with a mock data_dir created '
+            f'{[p.name for p in tmp_path.iterdir()]!r} under the cwd'
+        )
+
+
 class TestResumeParamForwarding:
     """run_stage_via_cli forwards resume_session_id + resume_delivers_prompt into
     invoke_with_cap_retry (task 2717 σ resume seam); both default to None/False so
