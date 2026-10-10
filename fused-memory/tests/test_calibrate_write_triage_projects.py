@@ -354,3 +354,136 @@ class TestWriteProjectConfigHelper:
             't_high_by_category': {'observations_and_summaries': 0.87},
         }}
         assert _block_lines(out, 'write_triage:') == _block_lines(POOLED_YAML, 'write_triage:')
+
+
+# ---------------------------------------------------------------------------
+# The committed artifacts: config <-> report <-> fixture, no network
+# ---------------------------------------------------------------------------
+
+PACKAGE_ROOT = Path(__file__).parent.parent
+CONFIG_PATH = PACKAGE_ROOT / 'config' / 'config.yaml'
+DF_REPORT_PATH = PACKAGE_ROOT / 'calibration' / 'write_triage_calibration_report_dark_factory.json'
+DF_FIXTURE_REL = 'tests/fixtures/write_triage_calibration_dark_factory.jsonl'
+
+
+@functools.cache
+def _df_report() -> dict:
+    assert DF_REPORT_PATH.exists(), f'report missing: {DF_REPORT_PATH}'
+    return json.loads(DF_REPORT_PATH.read_text())
+
+
+@functools.cache
+def _shipped_config() -> dict:
+    return yaml.safe_load(CONFIG_PATH.read_text())
+
+
+def _pooled_report() -> dict:
+    named = _shipped_config()['write_triage']['calibration_report_path']
+    return json.loads((PACKAGE_ROOT / named).read_text())
+
+
+def _project_entries() -> dict:
+    return _shipped_config().get(SECTION) or {}
+
+
+def _max_negative(entry: dict) -> float:
+    maxima = [entry['distributions'][cls]['max'] for cls in ('unrelated', 'hard_negative')]
+    measured = [m for m in maxima if m is not None]
+    assert measured, 'a derived cutoff needs at least one measured negative'
+    return max(measured)
+
+
+class TestCommittedDarkFactoryCalibration:
+    def test_the_report_pair_is_committed(self) -> None:
+        assert DF_REPORT_PATH.exists()
+        assert DF_REPORT_PATH.with_suffix('.md').exists()
+
+    def test_provenance_names_the_dark_factory_corpus(self) -> None:
+        provenance = _df_report()['provenance']
+        assert provenance['project_id'] == 'dark_factory'
+        assert provenance['fixture_path'] == DF_FIXTURE_REL
+        assert provenance['retrieval_mode'] == 'production'
+
+    def test_the_record_count_is_the_committed_fixtures(
+        self, dark_factory_records: list[dict],
+    ) -> None:
+        assert _df_report()['provenance']['record_count'] == len(dark_factory_records)
+
+    def test_the_pair_counts_are_recomputed_from_the_committed_fixture(
+        self, dark_factory_records: list[dict],
+    ) -> None:
+        """A fixture edit without a re-run fails here."""
+        buckets = _mod().partition_pairs_by_category(dark_factory_records)['by_category']
+        recomputed = {
+            category: {cls.removesuffix('_pairs'): len(pairs) for cls, pairs in bucket.items()}
+            for category, bucket in buckets.items()
+        }
+        assert _df_report()['provenance']['per_category_pair_counts'] == recomputed
+
+    def test_both_target_categories_have_an_outcome(self) -> None:
+        assert TARGET_CATEGORIES <= set(_df_report()['per_category'])
+
+    @pytest.mark.parametrize('category', sorted(TARGET_CATEGORIES))
+    def test_a_category_derives_a_separating_cutoff_or_states_a_measured_refusal(
+        self, category: str,
+    ) -> None:
+        entry = _df_report()['per_category'][category]
+        if entry['t_high'] is not None:
+            assert 0.0 <= entry['t_high'] <= 1.0
+            assert entry['t_high'] > _max_negative(entry), (
+                'a derived cutoff admits no in-category negative'
+            )
+            return
+        assert entry['t_low'] is None
+        code, _, detail = str(entry['reason']).partition(':')
+        assert code in {
+            _mod().REASON_EMPTY_CLASS, _mod().REASON_NOT_SEPARABLE,
+            _mod().REASON_INSUFFICIENT_PAIRS,
+        }, entry['reason']
+        assert detail.strip(), 'a refusal must state what was measured'
+
+    def test_the_corpus_is_isolated_from_the_pooled_report_of_record(self) -> None:
+        pooled_named = _shipped_config()['write_triage']['calibration_report_path']
+        assert (PACKAGE_ROOT / pooled_named).resolve() != DF_REPORT_PATH.resolve()
+        pooled = _pooled_report()['provenance']
+        assert pooled['project_id'] == 'reify'
+        assert pooled['fixture_path'] != _df_report()['provenance']['fixture_path']
+
+
+class TestCommittedProjectCalibrationsAreTraceable:
+    def test_every_entry_validates_as_the_schema_model(self) -> None:
+        for entry in _project_entries().values():
+            WriteTriageProjectCalibration.model_validate(entry)
+
+    def test_every_entry_names_a_committed_report_for_its_own_project(self) -> None:
+        for project, entry in _project_entries().items():
+            named = Path(entry['calibration_report_path'])
+            assert not named.is_absolute(), 'a worktree path dangles once merged'
+            report = json.loads((PACKAGE_ROOT / named).read_text())
+            assert report['provenance']['project_id'] == project
+
+    def test_every_cutoff_is_its_reports_derived_value_and_nothing_else(self) -> None:
+        for entry in _project_entries().values():
+            report = json.loads((PACKAGE_ROOT / entry['calibration_report_path']).read_text())
+            derived = _mod().derived_category_cutoffs(report)
+            assert entry['t_high_by_category'] == derived, (
+                'a derived cutoff is wired and a refused category is absent, '
+                'never hand-edited'
+            )
+
+    def test_no_entry_shadows_the_pooled_corpus_of_record(self) -> None:
+        assert _pooled_report()['provenance']['project_id'] not in _project_entries()
+
+    def test_the_dark_factory_entry_exists_exactly_when_a_cutoff_was_derived(self) -> None:
+        derived = _mod().derived_category_cutoffs(_df_report())
+        assert ('dark_factory' in _project_entries()) == bool(derived)
+
+    def test_rewriting_the_shipped_entry_is_a_byte_for_byte_no_op(self) -> None:
+        entry = _project_entries().get('dark_factory')
+        if entry is None:
+            pytest.skip('no dark_factory entry: both categories refused')
+        shipped = CONFIG_PATH.read_text()
+        assert _mod().write_project_calibration_block(
+            shipped, 'dark_factory', entry['calibration_report_path'],
+            entry['t_high_by_category'],
+        ) == shipped
