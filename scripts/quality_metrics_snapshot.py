@@ -106,20 +106,28 @@ def _ancestor_packages(module: str, known: frozenset[str]) -> frozenset[str]:
     return frozenset(prefix for prefix in prefixes if prefix in known)
 
 
-def _reach_back(
-    statement: source_measures.ImportStatement, module: str, source: _FileImports, known: frozenset[str]
-) -> dict[str, Any] | None:
+@dataclasses.dataclass(frozen=True)
+class _ImportSite:
+    """One import statement of src *module*, its first-party src targets resolved once."""
+
+    module: str
+    source: _FileImports
+    statement: source_measures.ImportStatement
+    targets: tuple[str, ...]
+
+
+def _reach_back(site: _ImportSite, known: frozenset[str]) -> dict[str, Any] | None:
     """A from-import of names (not submodules) out of an ancestor package, or None."""
-    node = statement.node
+    node = site.statement.node
     if not isinstance(node, ast.ImportFrom):
         return None
-    resolved = _from_module(node, source)
-    if resolved is None or resolved not in _ancestor_packages(module, known):
+    resolved = _from_module(node, site.source)
+    if resolved is None or resolved not in _ancestor_packages(site.module, known):
         return None
     names = sorted({alias.name for alias in node.names if f'{resolved}.{alias.name}' not in known})
     if not names:
         return None
-    return {'from': module, 'to': resolved, 'names': names, 'line': statement.line}
+    return {'from': site.module, 'to': resolved, 'names': names, 'line': site.statement.line}
 
 
 def _imported_names(statement: source_measures.ImportStatement, source: _FileImports) -> list[str]:
@@ -134,13 +142,11 @@ def _imported_names(statement: source_measures.ImportStatement, source: _FileImp
     return [f'{prefix}{alias.name}' for alias in node.names]
 
 
-def _deferred_entry(
-    statement: source_measures.ImportStatement, module: str, source: _FileImports, *, closes_cycle: bool
-) -> dict[str, Any]:
+def _deferred_entry(site: _ImportSite, *, closes_cycle: bool) -> dict[str, Any]:
     return {
-        'from': module,
-        'line': statement.line,
-        'imports': sorted(_imported_names(statement, source)),
+        'from': site.module,
+        'line': site.statement.line,
+        'imports': sorted(_imported_names(site.statement, site.source)),
         'closes_cycle': closes_cycle,
     }
 
@@ -217,69 +223,39 @@ def _at_any_time(statement: source_measures.ImportStatement) -> bool:
     return True
 
 
-def _module_edges(
-    module: str, source: _FileImports, known: frozenset[str], *, include: _Include
-) -> set[tuple[str, str]]:
-    return {
-        (module, target)
-        for statement in source.statements
-        if include(statement)
-        for target in _targets(statement, source, known)
-    }
-
-
-_SrcImports = Sequence[tuple[str, _FileImports]]
-
-
-def _src_imports(sources: Iterable[_FileImports]) -> list[tuple[str, _FileImports]]:
-    """(module, imports) for every src file; a tests file has no module."""
-    return [(source.module, source) for source in sources if source.module is not None]
-
-
-def _edges(src: _SrcImports, known: frozenset[str], include: _Include) -> set[tuple[str, str]]:
-    return {
-        edge for module, source in src for edge in _module_edges(module, source, known, include=include)
-    }
-
-
-def _reach_backs(src: _SrcImports, known: frozenset[str]) -> list[dict[str, Any]]:
+def _import_sites(sources: Iterable[_FileImports], known: frozenset[str]) -> list[_ImportSite]:
+    """Every src file's import statements; a tests file has no module."""
     return [
-        entry
-        for module, source in src
+        _ImportSite(source.module, source, statement, _targets(statement, source, known))
+        for source in sources
+        if source.module is not None
         for statement in source.statements
-        if (entry := _reach_back(statement, module, source, known)) is not None
     ]
 
 
-def _closes_cycle(
-    statement: source_measures.ImportStatement,
-    module: str,
-    source: _FileImports,
-    known: frozenset[str],
-    component: Mapping[str, int],
-) -> bool:
+def _edges(sites: Iterable[_ImportSite], include: _Include) -> set[tuple[str, str]]:
+    return {(site.module, target) for site in sites if include(site.statement) for target in site.targets}
+
+
+def _reach_backs(sites: Iterable[_ImportSite], known: frozenset[str]) -> list[dict[str, Any]]:
+    return [entry for site in sites if (entry := _reach_back(site, known)) is not None]
+
+
+def _closes_cycle(site: _ImportSite, component: Mapping[str, int]) -> bool:
     """A run-time import one of whose targets shares its importer's hidden-cycle component."""
-    if not _at_run_time(statement) or module not in component:
+    if not _at_run_time(site.statement) or site.module not in component:
         return False
-    return any(
-        component.get(target) == component[module] for target in _targets(statement, source, known)
-    )
+    return any(component.get(target) == component[site.module] for target in site.targets)
 
 
 def _deferred_entries(
-    src: _SrcImports, known: frozenset[str], hidden_cycles: Iterable[Sequence[str]]
+    sites: Iterable[_ImportSite], hidden_cycles: Iterable[Sequence[str]]
 ) -> list[dict[str, Any]]:
     component = {module: number for number, cycle in enumerate(hidden_cycles) for module in cycle}
     return [
-        _deferred_entry(
-            statement,
-            module,
-            source,
-            closes_cycle=_closes_cycle(statement, module, source, known, component),
-        )
-        for module, source in src
-        for statement in source.statements
-        if statement.deferred
+        _deferred_entry(site, closes_cycle=_closes_cycle(site, component))
+        for site in sites
+        if site.statement.deferred
     ]
 
 
@@ -321,16 +297,16 @@ def _tests_importers(sources: Iterable[_FileImports], known: frozenset[str]) -> 
 
 def _import_graph(sources: Sequence[_FileImports], known: frozenset[str]) -> _ImportGraph:
     """The graph over src modules; tests files only count toward fan_in_tests."""
-    src = _src_imports(sources)
-    edges = _edges(src, known, _at_any_time)
-    hidden_cycles = _cycles(_edges(src, known, _at_run_time))
-    reach_back = _reach_backs(src, known)
-    deferred = _deferred_entries(src, known, hidden_cycles)
+    sites = _import_sites(sources, known)
+    edges = _edges(sites, _at_any_time)
+    hidden_cycles = _cycles(_edges(sites, _at_run_time))
+    reach_back = _reach_backs(sites, known)
+    deferred = _deferred_entries(sites, hidden_cycles)
     return _ImportGraph(
         edges=tuple(sorted(edges)),
         reach_back=tuple(sorted(reach_back, key=lambda e: (e['from'], e['line'], e['to']))),
         deferred=tuple(sorted(deferred, key=lambda e: (e['from'], e['line']))),
-        cycles=_cycles(_edges(src, known, _at_import_time)),
+        cycles=_cycles(_edges(sites, _at_import_time)),
         hidden_cycles=hidden_cycles,
         typing_cycles=_cycles(edges),
         field_counts={
