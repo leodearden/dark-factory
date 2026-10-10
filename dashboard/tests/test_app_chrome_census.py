@@ -138,3 +138,34 @@ def test_the_topbar_queue_reads_the_write_queue_datum(app_jsx_body: str) -> None
         f'summary.queue is not a <DatumReading> over writeQueue(DD):\n{summary}'
     )
     assert 'queue.counts' not in _app_body(app_jsx_body)
+
+
+def test_the_topbar_spend_reads_the_shared_spend_reading(app_jsx_body: str) -> None:
+    """The topbar spend is a Datum reading, never a seeded $0.00.
+
+    ``DD.COSTS?.summary?.today ?? 0`` rendered a confident $0.00 before /costs
+    had ever delivered (data.js seeds today = 0). spend_readings.js::todaySpend
+    reads it through the /costs receipt, for the topbar and the Overview tile
+    alike; spend_readings.test.mjs executes that reading, and this pins only
+    the wiring.
+    """
+    code = _app_code(app_jsx_body)
+    destructure = re.search(r'const\s*\{([^}]*)\}\s*=\s*window\.DF_SPEND_READINGS\s*;', code)
+    assert destructure, 'app.jsx does not destructure window.DF_SPEND_READINGS at module scope.'
+    assert {'todaySpend', 'spendText'} <= set(re.findall(r'\w+', destructure.group(1)))
+    assert not re.search(r'window\.DF_SPEND_READINGS\s*(\|\||&&|\?\?)', code)
+    summary = _const_object(_app_body(app_jsx_body), 'summary')
+    assert re.search(
+        r'\bspend24h\s*:\s*<DatumReading\s+datum=\{\s*todaySpend\(\s*DD\s*\)\s*\}\s+format=\{\s*spendText\s*\}\s*/>',
+        summary,
+    ), f'summary.spend24h is not a <DatumReading> over todaySpend(DD) formatted by spendText:\n{summary}'
+    assert '?? 0' not in summary, f'the topbar summary still zero-fills a reading:\n{summary}'
+
+
+def test_stat_strip_renders_the_spend_node(shell_jsx_body: str) -> None:
+    """A spend hole reaches the operator as '—', not as a TypeError on ``.toFixed``."""
+    body = extract_function_body(strip_js_comments(shell_jsx_body), 'StatStrip')
+    assert re.search(r'\{\s*summary\.spend24h\s*\}', body), (
+        'StatStrip does not render {summary.spend24h}, the DatumReading node App builds.'
+    )
+    assert 'spend24h.toFixed' not in body, 'StatStrip still formats the spend as a bare number.'

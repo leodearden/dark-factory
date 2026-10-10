@@ -25,6 +25,7 @@ from typing import Any
 
 import aiosqlite
 
+from dashboard.data.datum import Datum, DatumState, unknown_datum
 from dashboard.data.db import with_db
 from dashboard.data.utils import resolve_now
 
@@ -61,6 +62,10 @@ MEMORY_OPS_SQL = (
 MEMORY_OPS_SQL_UNHINTED = MEMORY_OPS_SQL.replace(' INDEXED BY idx_wo_created', '')
 
 _HOUR_KEY_FORMAT = '%Y-%m-%dT%H:00'
+
+# A healthy read of the live journal takes ~4s (measured 2026-10-03, see
+# get_memory_ops), so only a wedged read ages a reading past this.
+MEMORY_OPS_FRESHNESS_BOUND_SECONDS = 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,18 +106,6 @@ def _hour_keys(newest_hour: datetime, hours: int) -> tuple[str, ...]:
     )
 
 
-def _newest_hour(now: datetime | None) -> datetime:
-    return resolve_now(now).replace(minute=0, second=0, microsecond=0)
-
-
-def empty_memory_ops(*, hours: int = 24, now: datetime | None = None) -> MemoryOps:
-    """The window :func:`get_memory_ops` reads, every bucket zero and no operations.
-
-    What :func:`get_memory_ops` returns when the journal cannot be read.
-    """
-    return _reduce_memory_ops(_hour_keys(_newest_hour(now), hours), ())
-
-
 def _reduce_memory_ops(
     hour_keys: Sequence[str], rows: Iterable[Sequence[Any]],
 ) -> MemoryOps:
@@ -147,7 +140,7 @@ def _reduce_memory_ops(
 
 async def get_memory_ops(
     db: aiosqlite.Connection | None, *, hours: int = 24, now: datetime | None = None,
-) -> MemoryOps:
+) -> Datum[MemoryOps]:
     """Memory operations over the *hours* whole hours ending with now's hour.
 
     The window is hour-ALIGNED and bounded on both sides:
@@ -156,11 +149,15 @@ async def get_memory_ops(
     row before the oldest bucket or dated in the future is in neither. (The
     two queries this replaced disagreed: the timeseries dropped the window's
     partial oldest hour and every kind outside read/write, while the
-    breakdown counted both.) On a missing DB or a query error it returns
-    :func:`empty_memory_ops` for the same window.
+    breakdown counted both.)
 
-    *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`;
-    pass an explicit value for deterministic results.
+    A read is a ``fresh`` Datum measured at *now*. A missing journal or a
+    failed query is an ``unknown`` Datum whose reason names the cause, never
+    a zero window: that would read as a quiet day. A readable journal with no
+    rows in the window IS a quiet day, and is served as one.
+
+    *now* defaults to the live clock via :func:`dashboard.data.utils.resolve_now`
+    and is read once; pass an explicit value for deterministic results.
 
     Performance — one ``GROUP BY hour, kind, operation`` over a
     ``SEARCH ... USING INDEX idx_wo_created`` range seek. Measured 2026-10-03
@@ -188,34 +185,56 @@ async def get_memory_ops(
     the "Follow-on: α's residual is now owned (added 2026-08-02)" section of
     plans/dashboard-availability-prd.md.
     """
-    newest_hour = _newest_hour(now)
+    measured_at = resolve_now(now)
+    newest_hour = measured_at.replace(minute=0, second=0, microsecond=0)
     hour_keys = _hour_keys(newest_hour, hours)
     window = (
         (newest_hour - timedelta(hours=hours - 1)).isoformat(),
         (newest_hour + timedelta(hours=1)).isoformat(),
     )
+    if db is None:
+        return unknown_datum(
+            'the write journal is missing or could not be opened',
+            MEMORY_OPS_FRESHNESS_BOUND_SECONDS,
+        )
+    try:
+        rows = await _memory_ops_rows(db, window)
+    except (sqlite3.OperationalError, OSError) as exc:
+        logger.warning('memory ops: write journal query failed', exc_info=True)
+        return unknown_datum(
+            f'the write journal query failed: {type(exc).__name__}: {exc}',
+            MEMORY_OPS_FRESHNESS_BOUND_SECONDS,
+        )
+    return Datum(
+        _reduce_memory_ops(hour_keys, rows),
+        measured_at,
+        DatumState.FRESH,
+        None,
+        MEMORY_OPS_FRESHNESS_BOUND_SECONDS,
+    )
 
-    async def _query(db: aiosqlite.Connection) -> MemoryOps:
-        try:
-            async with db.execute(MEMORY_OPS_SQL, window) as cursor:
-                rows = await cursor.fetchall()
-        except sqlite3.OperationalError as exc:
-            if 'no such index' not in str(exc):
-                raise
-            # idx_wo_created is missing — see the coupling comment at
-            # MEMORY_OPS_SQL. Fall back to the unhinted query so the chart
-            # stays correct (just slow), and log loudly enough to name the
-            # index without needing the traceback.
-            logger.error(
-                'write_ops index idx_wo_created missing — memory ops '
-                'falling back to unhinted scan',
-                exc_info=True,
-            )
-            async with db.execute(MEMORY_OPS_SQL_UNHINTED, window) as cursor:
-                rows = await cursor.fetchall()
-        return _reduce_memory_ops(hour_keys, rows)
 
-    return await with_db(db, _query, _reduce_memory_ops(hour_keys, ()))
+async def _memory_ops_rows(
+    db: aiosqlite.Connection, window: tuple[str, str],
+) -> Iterable[Sequence[Any]]:
+    """The ``(hour, kind, operation, count)`` rows of *window*, hinted when it can be."""
+    try:
+        async with db.execute(MEMORY_OPS_SQL, window) as cursor:
+            return await cursor.fetchall()
+    except sqlite3.OperationalError as exc:
+        if 'no such index' not in str(exc):
+            raise
+        # idx_wo_created is missing — see the coupling comment at
+        # MEMORY_OPS_SQL. Fall back to the unhinted query so the chart
+        # stays correct (just slow), and log loudly enough to name the
+        # index without needing the traceback.
+        logger.error(
+            'write_ops index idx_wo_created missing — memory ops '
+            'falling back to unhinted scan',
+            exc_info=True,
+        )
+        async with db.execute(MEMORY_OPS_SQL_UNHINTED, window) as cursor:
+            return await cursor.fetchall()
 
 
 async def get_agent_breakdown(

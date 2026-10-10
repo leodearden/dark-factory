@@ -14,7 +14,7 @@ const {
 } = window.DF_PRD_GROUPING;
 const { strandBadgeState, agentCellState } = window.DF_TASK_ROW_CELLS;
 const { rtCell, rtAge, rtProbe, rtProbeSummary } = window.DF_RUNTIME_FMT;
-const { tasksBannerNotices } = window.DF_TASKS_OFFLINE_BANNER;
+const { tasksBannerNoticesFor } = window.DF_TASKS_OFFLINE_BANNER;
 // Const exports renamed, function exports not: test_tab_tasks_prose.py::_LOAD_SAFETY_MECHANISM.
 const {
   projectCensus, projectRows, viewRows, snapshotRowsOver, unrequestedTerminalRows, terminalWindowProjects,
@@ -718,13 +718,7 @@ function TasksTab({ projectFilter, search }) {
   // one too — PROJECTS is the orchestrator-derived list, a different
   // population that diverges whenever a root has no orchestrator (or the
   // reverse), which made the notice understate how many projects failed.
-  const bannerNotices = tasksBannerNotices({
-    offline: !!DF_T.TASKS_OFFLINE,
-    offlineProjects: DF_T.TASKS_OFFLINE_PROJECTS || [],
-    degradedProjects: DF_T.TASKS_DEGRADED_PROJECTS || [],
-    countUnknownProjects: DF_T.TASKS_COUNT_UNKNOWN_PROJECTS || [],
-    totalProjects: DF_T.TASKS_PROJECT_COUNT || 0,
-  });
+  const bannerNotices = tasksBannerNoticesFor(DF_T);
   const bannerTestIds = {
     global: 'tasks-offline-banner',
     partial: 'tasks-partial-banner',

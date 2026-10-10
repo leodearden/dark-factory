@@ -74,6 +74,8 @@ const EXPECTED_WINDOW_GLOBALS = {
   'escalation_views.js': 'DF_ESCALATION_VIEWS',
   'escalation_focus.js': 'DF_ESCALATION_FOCUS',
   'memory_readings.js': 'DF_MEMORY_READINGS',
+  'system_health.js': 'DF_SYSTEM_HEALTH',
+  'spend_readings.js': 'DF_SPEND_READINGS',
   'persisted_state.js': 'DF_PERSISTED_STATE',
 };
 

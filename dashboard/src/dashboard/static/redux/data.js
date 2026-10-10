@@ -175,14 +175,13 @@ window.DF_DATA = {
   // performance_cards.js::cardsListing answers a missing Datum, so no zero is seeded.
   PERFORMANCE_LISTING: null,
   MEMORY_STATUS: {
-    graphiti: { connected: false, node_count: 0, edge_count: 0, episode_count: 0 },
-    mem0: { connected: false, memory_count: 0 },
-    taskmaster: { connected: false },
+    graphiti: { connected: null, node_count: 0, edge_count: 0, episode_count: 0 },
+    mem0: { connected: null, memory_count: 0 },
     queue: { stats: null, spark: { labels: [], values: [] } },
     projects: {},
     wal: { status: 'offline', reason: null, rows: [] },
   },
-  MEMORY_OPS: { labels: [], reads: [], writes: [], other: [], total: [], totals: null, by_operation: [] },
+  MEMORY_OPS: { labels: [], reads: [], writes: [], other: [], total: [], by_operation: [], totals: null, newest_hour_total: null },
   RECON_STATE: {
     buffer: { buffered_count: 0, oldest_event_age_seconds: null },
     burst_state: [],
