@@ -111,14 +111,14 @@ _SIGKILL_MARKERS = ("State 'stop-sigterm' timed out", "with signal SIGKILL")
 _STOP_MARKERS = ("Stopping fused-memory", "Stopped fused-memory")
 # A stall that BEGINS here began with the unit already down, so its socket was
 # unbound and a watchdog probe would have seen 'port-down' rather than 'wedged'.
-# `Consumed ` earns its place: systemd emits its stop-time accounting as the
-# unit deactivates, which makes that the LAST line of a real stop sequence, so
+# The stop-time accounting earns its place: systemd emits it as the unit
+# deactivates, which makes that the LAST line of a real stop sequence, so
 # without it a gap opening after a stop would still read 'wedged'.
 _UNIT_DOWN_MARKERS = (
     "Stopped fused-memory",
     "Main process exited",
     "with signal SIGKILL",
-    "Consumed ",
+    _CONSUMED_PATTERN,
 )
 
 # The observed boundaries of the two recovery terms. Teardown ends at
@@ -127,7 +127,7 @@ _UNIT_DOWN_MARKERS = (
 # accounting is the only witness when systemd goes straight from `Consumed` to
 # `Starting` (scripts/tests/test_fm_wedge_forensics.py::NO_STOPPED_LINE_JOURNAL).
 _TEARDOWN_START = ("Stopping fused-memory",)
-_TEARDOWN_END = ("Stopped fused-memory", "with signal SIGKILL", "Consumed ")
+_TEARDOWN_END = ("Stopped fused-memory", "with signal SIGKILL", _CONSUMED_PATTERN)
 _STARTUP_START = ("Starting fused-memory",)
 _STARTUP_END = ("Started fused-memory",)
 
@@ -250,6 +250,20 @@ def _size_bytes(size: str | None, unit: str | None) -> float | None:
     return float(size) * _SIZE_MULTIPLIER[unit]
 
 
+def _carries_marker(line: str, markers: tuple[str | re.Pattern[str], ...]) -> bool:
+    """Does *line* carry any of *markers*?
+
+    A marker is a literal substring, or a pattern for a line no substring can
+    pin: the bare word "Consumed" also turns up in application lines, so
+    systemd's stop-time accounting is recognised by `_CONSUMED_PATTERN` alone,
+    the same definition :func:`parse_consumed` reads it with.
+    """
+    return any(
+        marker in line if isinstance(marker, str) else marker.search(line) is not None
+        for marker in markers
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class StallEpisode:
     """One window in which the unit emitted nothing at all.
@@ -282,16 +296,16 @@ class StallEpisode:
         The single fact both :attr:`outcome` and :attr:`watchdog_verdict` turn
         on, asked once so the two can never disagree about it.
         """
-        return any(marker in self.last_line_before_stall for marker in _UNIT_DOWN_MARKERS)
+        return _carries_marker(self.last_line_before_stall, _UNIT_DOWN_MARKERS)
 
     @property
     def outcome(self) -> str:
         """Whether the loop was still blocked when systemd tried to stop it."""
         if self.began_with_unit_down:
             return UNIT_DOWN
-        if any(marker in line for line in self.aftermath for marker in _SIGKILL_MARKERS):
+        if any(_carries_marker(line, _SIGKILL_MARKERS) for line in self.aftermath):
             return SIGTERM_UNSERVICED
-        if any(marker in line for line in self.aftermath for marker in _STOP_MARKERS):
+        if any(_carries_marker(line, _STOP_MARKERS) for line in self.aftermath):
             return STOPPED_ON_SIGNAL
         return SELF_RECOVERED
 
@@ -325,9 +339,9 @@ class StallEpisode:
             total_seconds=_elapsed(self.stall_started_at, recovered_at),
         )
 
-    def _first_time(self, markers: tuple[str, ...]) -> dt.datetime | None:
+    def _first_time(self, markers: tuple[str | re.Pattern[str], ...]) -> dt.datetime | None:
         for timestamp, line in self.restart_sequence:
-            if any(marker in line for marker in markers):
+            if _carries_marker(line, markers):
                 return timestamp
         return None
 
@@ -417,12 +431,12 @@ def restart_sequence_after(lines: list[tuple[dt.datetime, str]], stall_end: int)
     the loop resumes reads as self-recovered, which understates a cost rather
     than inventing one.
     """
-    if not any(marker in lines[stall_end][1] for marker in _TEARDOWN_START):
+    if not _carries_marker(lines[stall_end][1], _TEARDOWN_START):
         return ()
     sequence = []
     for entry in lines[stall_end:]:
         sequence.append(entry)
-        if any(marker in entry[1] for marker in _STARTUP_END):
+        if _carries_marker(entry[1], _STARTUP_END):
             break
     return tuple(sequence)
 

@@ -26,6 +26,10 @@ LOGGING_CHILD_JOURNAL (a spawned child that wrote a line of its own). Both
 cover branches that a real capture in this retention window cannot reach, and
 both use real line texts with only the separation or the pid attribution
 changed.
+
+The two APPLICATION_SAYS_CONSUMED_* inputs are assembled too, and carry one
+INVENTED application line: an application log line containing the word that
+begins systemd's stop-time accounting, which none of the captures above holds.
 """
 from __future__ import annotations
 
@@ -235,6 +239,31 @@ LOGGING_CHILD_JOURNAL = """\
 2026-09-16T12:08:22+01:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Killing process 1289425 (git) with signal SIGKILL.
 2026-09-16T12:08:22+01:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
 2026-09-16T12:09:03+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
+# ASSEMBLED, not captured: NO_STOPPED_LINE_JOURNAL reduced to its restart, plus
+# ONE invented application line mid-teardown that carries the word systemd's
+# stop-time accounting begins with. Only systemd's own `Consumed <n>s CPU time`
+# line witnesses the end of a teardown; an application line that happens to say
+# "Consumed" must not cut the 62s short.
+APPLICATION_SAYS_CONSUMED_MID_TEARDOWN_JOURNAL = """\
+2026-09-19T19:24:35+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:24:35 - fused_memory.reconciliation.stages.task_knowledge_sync - WARNING - reconciliation.done_provenance_section_truncated
+2026-09-19T19:26:54+01:00 leo-MS-7C35 systemd[2626]: Stopping fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-19T19:27:41+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:27:41 - __main__ - INFO - Received SIGTERM — initiating operator shutdown
+2026-09-19T19:27:45+01:00 leo-MS-7C35 uv[1601425]: 2026-09-19 19:27:45 - fused_memory.reconciliation.event_buffer - INFO - Consumed 3 buffered events before shutdown
+2026-09-19T19:27:55+01:00 leo-MS-7C35 uv[1601425]: asyncio.exceptions.CancelledError
+2026-09-19T19:27:56+01:00 leo-MS-7C35 systemd[2626]: fused-memory.service: Consumed 8min 16.382s CPU time, 2.2G memory peak, 477.3M memory swap peak.
+2026-09-19T19:27:56+01:00 leo-MS-7C35 systemd[2626]: Starting fused-memory.service - Fused Memory MCP Server (dark-factory)...
+2026-09-19T19:28:36+01:00 leo-MS-7C35 systemd[2626]: Started fused-memory.service - Fused Memory MCP Server (dark-factory).
+"""
+
+# ASSEMBLED, not captured: SELF_RECOVERED_STALL_JOURNAL with its last line
+# before the silence replaced by the same invented application line. The unit
+# was running throughout, so the silence must not read as a down window.
+APPLICATION_SAYS_CONSUMED_BEFORE_SILENCE_JOURNAL = """\
+2026-09-16T12:16:06+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:16:06 - fused_memory.reconciliation.event_buffer - INFO - reconciliation.event_buffered
+2026-09-16T12:16:07+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:16:07 - fused_memory.reconciliation.event_buffer - INFO - Consumed 3 buffered events before shutdown
+2026-09-16T12:18:47+01:00 leo-MS-7C35 uv[1289738]: 2026-09-16 12:18:47 - __main__ - INFO - thread_monitor: threads=33 delta=-1
 """
 
 # A healthy busy window: real consecutive lines from 2026-09-16 12:03, where fm
@@ -552,6 +581,17 @@ def test_a_teardown_with_no_stopped_line_ends_at_systemd_s_stop_accounting():
 def test_a_teardown_with_no_stopped_line_is_still_weighed_against_startup():
     """62s of teardown against a 40s start."""
     assert analyze(NO_STOPPED_LINE_JOURNAL)[0].costs.dominant_recovery_term == "teardown"
+
+
+def test_an_application_line_saying_consumed_does_not_end_a_teardown():
+    costs = analyze(APPLICATION_SAYS_CONSUMED_MID_TEARDOWN_JOURNAL)[0].costs
+
+    assert costs.teardown_seconds == 62.0
+    assert costs.dominant_recovery_term == "teardown"
+
+
+def test_an_application_line_saying_consumed_does_not_mark_the_unit_down():
+    assert analyze(APPLICATION_SAYS_CONSUMED_BEFORE_SILENCE_JOURNAL)[0].outcome == "self-recovered"
 
 
 def test_detection_interval_is_reported_unavailable_not_fabricated():
