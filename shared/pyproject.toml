@@ -87,6 +87,9 @@ filterwarnings = [
 # invoke_with_cap_retry through 19 real exponential-backoff sleeps), and
 # deadlocked lock implementations. Slow tests can opt out with
 # @pytest.mark.timeout(N).
+# In-band markers (60 < N < verify --timeout) are rejected by
+# tests/test_timeout_marker_inversion_guard.py; see
+# shared/src/shared/testing_timeout_markers.py.
 #
 # WHY A LARGE VALUE AND NOT THE ORIGINAL 60 (2026-09-12). The cap is
 # WALL-CLOCK, not CPU time. On this 32-core host under sustained load (~180 at

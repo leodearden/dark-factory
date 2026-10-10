@@ -49,6 +49,9 @@ addopts = "-n auto --dist loadgroup --max-worker-restart=0 -m 'not integration'"
 # governs them, and they are what the value is derived from. See
 # plans/pytest-per-test-timeout-measurement-2026-09-17.md.
 # Slow tests opt out with @pytest.mark.timeout(N).
+# In-band markers (60 < N < verify --timeout) are rejected by
+# tests/test_timeout_marker_inversion_guard.py; see
+# shared/src/shared/testing_timeout_markers.py.
 # thread method is RETAINED. Its original premise, that signal is incompatible
 # with pytest-xdist workers, is falsified by
 # tests/scripts/test_timeout_method_policy.py, where the signal-vs-thread trade

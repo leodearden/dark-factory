@@ -19,8 +19,8 @@ from pathlib import Path
 
 import pytest
 import yaml
-from _orch_helpers import DELIBERATE_TIGHT_BOUND_CEILING
 from pydantic import ValidationError
+from shared.testing_timeout_markers import DELIBERATE_TIGHT_BOUND_CEILING
 
 from orchestrator.config import OrchestratorConfig
 

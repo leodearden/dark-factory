@@ -808,8 +808,8 @@ class TestPerItemMarkerNames:
 #: -- ``pytestmark = [qdrant_skipif(), pytest.mark.timeout(60), pytest.mark.integration]``
 #: -- generalised to one class per accepted spelling: the class-BODY ``pytestmark``
 #: list (whose leading ``qdrant_skipif()`` is a non-marker ``Call`` on a bare
-#: ``Name``, which ``_marker_name`` must keep skipping WITHOUT suppressing its
-#: siblings) and the class DECORATOR.  No module-level ``pytestmark`` and no
+#: ``Name``, which ``shared.pytest_mark_grammar.marker_name`` must keep skipping
+#: WITHOUT suppressing its siblings) and the class DECORATOR.  No module-level ``pytestmark`` and no
 #: module-level test function, so the whole answer comes from the class tier.
 _ALL_CLASSES_MARKED_SOURCE = """\
 import pytest

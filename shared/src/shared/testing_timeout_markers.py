@@ -1,0 +1,500 @@
+"""Census of ``pytest.mark.timeout(...)`` markers, and the band in which one inverts a verify budget.
+
+A MARKER IS A TWO-WAY OVERRIDE, NEVER A FLOOR.  Read verbatim from
+``pytest_timeout.py::_get_item_settings`` in the installed package::
+
+    if marker is not None:
+        timeout = _validate_timeout(settings.timeout, "marker")
+    if timeout is None:
+        timeout = item.config._env_timeout
+
+The marker wins unconditionally.  ``config._env_timeout`` -- fed by CLI
+``--timeout``, then ``PYTEST_TIMEOUT``, then the ini ``timeout`` -- is consulted
+only when the marker yielded None.  So ``@pytest.mark.timeout(N)`` REPLACES
+whatever budget is in force: it raises the budget wherever the ambient one is
+smaller, and LOWERS it under verify's ``--timeout``.
+
+THE INVERSION BAND.  Against a verify budget B, a marker at N falls in one of
+three regimes:
+
+* N <= DELIBERATE_TIGHT_BOUND_CEILING -- small enough to read as a deliberate
+  tight bound rather than a slow test's opt-out;
+* DELIBERATE_TIGHT_BOUND_CEILING < N < B -- INVERTS.  Too large to read as a
+  deliberate fast bound, and below the budget verify passes, so the author's
+  intended LOOSENING for a slow test silently becomes a TIGHTENING of the run
+  that gates their merge: B becomes N;
+* N >= B -- loosens under both.  Safe.
+
+Only the middle band contradicts its author's evident intent.  What a breach
+there costs depends on the suite's ``timeout_method``; that trade lives in
+``tests/scripts/test_timeout_method_policy.py``.
+
+Each package instantiates the guard in its own
+``tests/test_timeout_marker_inversion_guard.py`` through
+:func:`judge_inversion_band`, with its OWN B: the ``--timeout`` in the
+``test_command`` of its orchestrator.yaml.
+
+Pure stdlib and pytest-free, like every ``shared.testing_*`` module, and
+registered as such in ``shared/tests/test_pure_stdlib_leaves.py``.
+"""
+
+from __future__ import annotations
+
+import ast
+import re
+import textwrap
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
+from enum import StrEnum
+from pathlib import Path
+from typing import Generic, NamedTuple, TypeVar
+
+from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
+
+__all__ = [
+    'DELIBERATE_TIGHT_BOUND_CEILING',
+    'InversionVerdict',
+    'SiteKind',
+    'SweepFloors',
+    'TimeoutSite',
+    'TreeScan',
+    'inverts',
+    'judge_inversion_band',
+    'scan_python_tree',
+    'scan_timeout_marker_sites',
+    'timeout_marker_sites',
+    'verify_cli_timeout',
+]
+
+T = TypeVar('T')
+
+#: The band's LOWER edge: the largest N that still reads as a DELIBERATE tight
+#: bound rather than a slow test's opt-out.
+#:
+#: A LITERAL, and deliberately NOT a mirror of any package's ini ``timeout``.
+#: It was first written as one, while orchestrator's ini default was 60.
+#: Commit 64e24b547f raised that default 60 -> 300 fleet-wide and the mirror
+#: followed it: (300, 300) is EMPTY, so every sweep built on the band passed
+#: VACUOUSLY.  Task 5442 then raised the default to 540, where a mirror would
+#: sit ABOVE the verify budget and invert the band outright.  So the edge stays
+#: at the value the design always used, and :func:`inverts` refuses a budget
+#: that would empty the band.
+DELIBERATE_TIGHT_BOUND_CEILING = 60
+
+_MODULE_QUALNAME = '<module>'
+_PYTESTMARK_QUALNAME = '<pytestmark>'
+
+_TIMEOUT_FLAG = re.compile(r'--timeout[=\s](\d+)')
+
+
+class SiteKind(StrEnum):
+    """Which of the four binding forms a timeout marker was written in."""
+
+    DECORATOR = 'decorator'
+    CLASS_DECORATOR = 'class-decorator'
+    MODULE_PYTESTMARK = 'module-pytestmark'
+    CLASS_PYTESTMARK = 'class-pytestmark'
+
+
+class TimeoutSite(NamedTuple):
+    """One ``pytest.mark.timeout(...)`` occurrence in a module.
+
+    ``qualname`` keys the site stably across ordinary edits: ``test_a``,
+    ``TestThing::test_a``, ``TestThing`` (class decorator), ``<module>``
+    (module ``pytestmark``) or ``TestThing::<pytestmark>``.  Angle brackets
+    cannot occur in an identifier, so these never collide with a real name.
+
+    ``seconds`` is None when the argument is absent or not statically
+    resolvable: "no opinion", never "too small".
+
+    ``spelling`` is the argument's unparsed source (``'300'``,
+    ``'VERIFY_CLI_PER_TEST_TIMEOUT'``), empty when there is none.  A literal and
+    a constant naming the same number resolve identically; only the spelling
+    tells a marker that moves with a re-derivation from one that must be found
+    and hand-edited.
+    """
+
+    qualname: str
+    kind: SiteKind
+    seconds: float | None
+    lineno: int
+    spelling: str
+
+
+def _timeout_call_arg(call: ast.Call) -> ast.expr | None:
+    if call.args:
+        return call.args[0]
+    for keyword in call.keywords:
+        if keyword.arg == 'timeout':
+            return keyword.value
+    return None
+
+
+def _resolve_seconds(arg: ast.expr | None, sanctioned: Mapping[str, float]) -> float | None:
+    if arg is None:
+        return None
+    if (
+        isinstance(arg, ast.Constant)
+        and isinstance(arg.value, int | float)
+        and not isinstance(arg.value, bool)
+    ):
+        return float(arg.value)
+    if isinstance(arg, ast.Name):
+        return sanctioned.get(arg.id)
+    if isinstance(arg, ast.Attribute):
+        return sanctioned.get(arg.attr)
+    return None
+
+
+def _sites_among(
+    elements: list[ast.expr],
+    qualname: str,
+    kind: SiteKind,
+    sanctioned: Mapping[str, float],
+) -> list[TimeoutSite]:
+    sites: list[TimeoutSite] = []
+    for element in elements:
+        if not isinstance(element, ast.Call) or marker_name(element) != 'timeout':
+            continue
+        arg = _timeout_call_arg(element)
+        sites.append(
+            TimeoutSite(
+                qualname=qualname,
+                kind=kind,
+                seconds=_resolve_seconds(arg, sanctioned),
+                lineno=element.lineno,
+                spelling='' if arg is None else ast.unparse(arg),
+            )
+        )
+    return sites
+
+
+def timeout_marker_sites(
+    tree: ast.Module, sanctioned: Mapping[str, float]
+) -> tuple[TimeoutSite, ...]:
+    """Every ``pytest.mark.timeout(...)`` site in *tree*, in source order.
+
+    Both argument spellings pytest-timeout accepts are read, ``timeout(300)``
+    and ``timeout(timeout=300)``.  Seconds resolve, deliberately tinily, from a
+    numeric literal (``bool`` excluded: ``timeout(True)`` is not 1s) or from a
+    bare or dotted NAME looked up by its trailing identifier in *sanctioned*.
+    Anything else -- arithmetic, a call, a name *sanctioned* lacks -- is None.
+    The census is therefore a FLOOR: an in-band value reached through an
+    indirection it cannot follow is not seen.
+
+    Classes are walked at any depth; function bodies are not, because a
+    function defined inside another is not a collected pytest item.
+    """
+    sites: list[TimeoutSite] = []
+
+    def walk(body: list[ast.stmt], prefix: str) -> None:
+        for statement in body:
+            bound = pytestmark_value(statement)
+            if bound is not None:
+                if prefix:
+                    qualname, kind = f'{prefix}{_PYTESTMARK_QUALNAME}', SiteKind.CLASS_PYTESTMARK
+                else:
+                    qualname, kind = _MODULE_QUALNAME, SiteKind.MODULE_PYTESTMARK
+                sites.extend(_sites_among(mark_elements(bound), qualname, kind, sanctioned))
+            if isinstance(statement, ast.ClassDef):
+                qualname = f'{prefix}{statement.name}'
+                sites.extend(
+                    _sites_among(
+                        statement.decorator_list, qualname, SiteKind.CLASS_DECORATOR, sanctioned
+                    )
+                )
+                walk(statement.body, f'{qualname}::')
+            elif isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
+                sites.extend(
+                    _sites_among(
+                        statement.decorator_list,
+                        f'{prefix}{statement.name}',
+                        SiteKind.DECORATOR,
+                        sanctioned,
+                    )
+                )
+
+    walk(tree.body, '')
+    return tuple(sites)
+
+
+def inverts(seconds: float | None, *, verify_cli_budget: int) -> bool:
+    """True iff a marker at *seconds* TIGHTENS verify while reading as a loosening.
+
+    The band is ``(DELIBERATE_TIGHT_BOUND_CEILING, verify_cli_budget)``, open at
+    both ends: a mark AT the ceiling is still a deliberate tight bound, and one
+    AT the budget is the recommended remediation.  None cannot invert.
+
+    Raises ValueError when *verify_cli_budget* leaves the band empty, since a
+    sweep over an empty band would pass vacuously.
+    """
+    if verify_cli_budget <= DELIBERATE_TIGHT_BOUND_CEILING:
+        raise ValueError(
+            f'the inversion band ({DELIBERATE_TIGHT_BOUND_CEILING}, {verify_cli_budget}) '
+            f'is empty: a verify --timeout of {verify_cli_budget} does not exceed '
+            f'DELIBERATE_TIGHT_BOUND_CEILING={DELIBERATE_TIGHT_BOUND_CEILING}, so no '
+            'marker could ever invert and every sweep would pass vacuously.'
+        )
+    return seconds is not None and DELIBERATE_TIGHT_BOUND_CEILING < seconds < verify_cli_budget
+
+
+def verify_cli_timeout(test_command: str) -> int | None:
+    """The per-test ``--timeout`` *test_command* passes pytest, else None.
+
+    Reads both ``--timeout=300`` and ``--timeout 300``, the spelling
+    ``tests/scripts/test_fallback_verify_config.py`` pins on the fleet chain.
+    In a chained command the FIRST flag wins.
+    """
+    match = _TIMEOUT_FLAG.search(test_command)
+    return None if match is None else int(match.group(1))
+
+
+@dataclass(frozen=True)
+class TreeScan(Generic[T]):
+    """One pass over a tree's ``*.py`` files, with the counters that prove it read them.
+
+    ``root`` is the directory scanned.  ``items`` is everything the extract
+    callback yielded, in sorted-path order.
+    ``examined`` counts the files that decoded, parseable or not.
+    ``unreadable`` names, relative to the root, the files that did not, so a
+    sweep that silently stops reading cannot pass as a clean tree.  Frozen,
+    because callers memoise one scan and share it.
+    """
+
+    root: Path
+    items: tuple[T, ...]
+    examined: int
+    unreadable: tuple[str, ...]
+
+
+def scan_python_tree(
+    root: Path, extract: Callable[[str, ast.Module], Iterable[T]]
+) -> TreeScan[T]:
+    """Read and parse every ``*.py`` under *root* once, handing each tree to *extract*.
+
+    *extract* receives the module's POSIX path relative to *root* (never its
+    basename, which nested modules share) and its parsed tree; one callback can
+    therefore feed several extractions from a single parse.  No tree outlives
+    its callback.
+
+    FAIL-SOFT: a file that does not decode as UTF-8 or cannot be read is
+    ``unreadable``; one that does not parse is examined but never extracted.  A
+    test tree holds deliberately malformed fixtures, and they must not turn a
+    census red for a reason unrelated to what it counts.
+    """
+    items: list[T] = []
+    unreadable: list[str] = []
+    examined = 0
+    for py_file in sorted(root.rglob('*.py')):
+        module = py_file.relative_to(root).as_posix()
+        try:
+            source = py_file.read_text(encoding='utf-8')
+        except (UnicodeDecodeError, OSError):
+            unreadable.append(module)
+            continue
+        examined += 1
+        try:
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError):
+            continue
+        items.extend(extract(module, tree))
+    return TreeScan(root, tuple(items), examined, tuple(unreadable))
+
+
+def scan_timeout_marker_sites(
+    root: Path, sanctioned: Mapping[str, float]
+) -> TreeScan[tuple[str, TimeoutSite]]:
+    """:func:`timeout_marker_sites` over every module under *root*, each site paired with its module."""
+    return scan_python_tree(
+        root,
+        lambda module, tree: ((module, site) for site in timeout_marker_sites(tree, sanctioned)),
+    )
+
+
+@dataclass(frozen=True)
+class SweepFloors:
+    """One package's anti-vacuity floors: set BELOW its measured counts, never equal to them.
+
+    A broken sweep reports zero offenders, which is indistinguishable from a
+    clean tree without them.  ``test_files`` catches a sweep that stopped
+    reading files; ``marker_sites`` catches an extractor that stopped matching.
+    """
+
+    test_files: int
+    marker_sites: int
+
+
+@dataclass(frozen=True)
+class InversionVerdict:
+    """One package's census, judged once by :func:`judge_inversion_band`.
+
+    ``new_offenders`` are the in-band sites the allowlist does not name.
+    ``stale`` are the allowlist's ``(module, qualname)`` keys, sorted, that name
+    no live in-band site -- a raised or deleted marker, or a renamed test --
+    and so must be removed before they admit a newcomer reusing the name.  Both
+    are empty when a precondition failed and nothing was judged.
+
+    Each ``*_failure`` is the text its check prints, or None when it passes.
+    """
+
+    new_offenders: tuple[tuple[str, TimeoutSite], ...]
+    stale: tuple[tuple[str, str], ...]
+    budget_failure: str | None
+    census_failure: str | None
+    new_offender_failure: str | None
+    stale_failure: str | None
+
+
+def judge_inversion_band(
+    scan: TreeScan[tuple[str, TimeoutSite]],
+    *,
+    verify_test_command: str,
+    grandfathered: frozenset[tuple[str, str]],
+    floors: SweepFloors,
+    slow_test_marker: str | None = None,
+) -> InversionVerdict:
+    """Judge a package's marker census against its verify budget and its allowlist.
+
+    The budget is the ``--timeout`` in *verify_test_command*.  *grandfathered*
+    keys a site as ``(module, qualname)``, the module relative to the scanned
+    root: per SITE and never a per-module count, because a count nets to zero
+    when one marker is added and another removed in the same module.  An empty
+    allowlist makes every in-band site an offender.
+
+    *slow_test_marker* is the package's own spelling of "this test is slow",
+    offered first among the two remedies; by default, the budget as a literal.
+
+    The two checks that assert an ABSENCE -- no new offender, no stale entry --
+    fail with the precondition's text when the budget leaves the band empty or
+    the sweep read fewer files than the floor, because the absence would then
+    prove nothing.
+    """
+    budget = verify_cli_timeout(verify_test_command)
+    budget_failure = _budget_failure(budget, verify_test_command)
+    census_failure = _census_failure(scan, floors)
+    blind_spot = budget_failure or _unread_tree_failure(scan, floors)
+    if budget is None or blind_spot is not None:
+        return InversionVerdict((), (), budget_failure, census_failure, blind_spot, blind_spot)
+
+    in_band = tuple(pair for pair in scan.items if inverts(pair[1].seconds, verify_cli_budget=budget))
+    live = {(module, site.qualname) for module, site in in_band}
+    new_offenders = tuple(
+        (module, site) for module, site in in_band if (module, site.qualname) not in grandfathered
+    )
+    stale = tuple(sorted(grandfathered - live))
+    return InversionVerdict(
+        new_offenders=new_offenders,
+        stale=stale,
+        budget_failure=None,
+        census_failure=census_failure,
+        new_offender_failure=_inversion_failure(
+            new_offenders,
+            verify_cli_budget=budget,
+            slow_test_marker=slow_test_marker
+            or (
+                f'@pytest.mark.timeout({budget})   # slow test -- or drop the '
+                'marker and take the ambient budget'
+            ),
+            has_allowlist=bool(grandfathered),
+        ),
+        stale_failure=_stale_failure(stale),
+    )
+
+
+def _budget_failure(budget: int | None, verify_test_command: str) -> str | None:
+    if budget is None:
+        return (
+            "this package's verify test_command carries no --timeout (got: "
+            f'{verify_test_command!r}), so there is no verify budget for a '
+            'marker to invert and this guard would pass vacuously.'
+        )
+    if budget <= DELIBERATE_TIGHT_BOUND_CEILING:
+        return (
+            f"this package's verify test_command passes --timeout={budget}, "
+            f'which leaves the inversion band ({DELIBERATE_TIGHT_BOUND_CEILING}, '
+            f'{budget}) empty, so no marker could invert and this guard would '
+            'pass vacuously.'
+        )
+    return None
+
+
+def _unread_tree_failure(
+    scan: TreeScan[tuple[str, TimeoutSite]], floors: SweepFloors
+) -> str | None:
+    if scan.examined >= floors.test_files:
+        return None
+    return (
+        f'only {scan.examined} .py files examined under {scan.root} (expected '
+        f'at least {floors.test_files}; {len(scan.unreadable)} skipped as '
+        f'unreadable: {sorted(scan.unreadable)}) -- the sweep itself is broken, '
+        'so this guard would pass vacuously rather than because the tree is '
+        'clean.'
+    )
+
+
+def _census_failure(scan: TreeScan[tuple[str, TimeoutSite]], floors: SweepFloors) -> str | None:
+    if len(scan.items) >= floors.marker_sites:
+        return None
+    return (
+        f'only {len(scan.items)} timeout marker site(s) found across '
+        f'{scan.examined} files under {scan.root} (expected at least '
+        f'{floors.marker_sites}) -- timeout_marker_sites has probably stopped '
+        'matching, so the sweep would pass vacuously. Check it against '
+        'shared/tests/test_testing_timeout_markers.py.'
+    )
+
+
+def _inversion_failure(
+    offenders: tuple[tuple[str, TimeoutSite], ...],
+    *,
+    verify_cli_budget: int,
+    slow_test_marker: str,
+    has_allowlist: bool,
+) -> str | None:
+    if not offenders:
+        return None
+    ordered = sorted(offenders, key=lambda pair: (pair[0], pair[1].qualname))
+    sites = '\n  '.join(
+        f'{module}::{site.qualname} ({site.kind}, line {site.lineno}) pins {site.seconds:g}s'
+        for module, site in ordered
+    )
+    allowlist_note = (
+        '\n\nThe grandfather allowlist only ever shrinks -- do not add yours to it.'
+        if has_allowlist
+        else ''
+    )
+    return (
+        f'{len(ordered)} timeout marker(s) in the inversion band '
+        f'({DELIBERATE_TIGHT_BOUND_CEILING} < N < {verify_cli_budget}).\n\n'
+        'A marker there is a TWO-WAY override, not a floor: it REPLACES the '
+        'ambient budget in both directions, so a number big enough to give a '
+        'slow test room, yet below the '
+        f'--timeout={verify_cli_budget} verify passes, silently clamps the run '
+        'that actually gates your merge to N. Under timeout_method="thread" a '
+        'breach does not even fail that one test: it kills the whole xdist '
+        'worker. Which suites run thread, and why: '
+        'tests/scripts/test_timeout_method_policy.py.\n\n'
+        'Write one of:\n\n'
+        f'{textwrap.indent(slow_test_marker, "    ")}\n\n'
+        f'    @pytest.mark.timeout(N)  # N <= {DELIBERATE_TIGHT_BOUND_CEILING}, a '
+        'DELIBERATE tight bound\n\n'
+        'The second is for a test that asserts something happens FAST; it is '
+        'small enough to read as that deliberate bound, which is why it is '
+        'allowed. Anything in between inverts. Full rationale: '
+        'shared/src/shared/testing_timeout_markers.py.'
+        f'\n\nOffending sites:\n  {sites}'
+        f'{allowlist_note}'
+    )
+
+
+def _stale_failure(stale: tuple[tuple[str, str], ...]) -> str | None:
+    if not stale:
+        return None
+    listing = '\n  '.join(f'{module}::{qualname}' for module, qualname in stale)
+    return (
+        f'{len(stale)} grandfathered timeout marker site(s) no longer sit in '
+        'the inversion band: the marker was raised or removed, or the test was '
+        'renamed. Delete the entries from the allowlist, which may only ever '
+        'shrink; a stale entry would silently admit a new in-band marker that '
+        f'reuses its name.\n  {listing}'
+    )

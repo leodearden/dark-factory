@@ -71,12 +71,9 @@ from _orch_helpers import (
     VERIFY_CLI_PER_TEST_TIMEOUT,
     WHOLE_TREE_SCAN_TEST_TIMEOUT,
 )
+from shared.pytest_mark_grammar import mark_elements, marker_name, pytestmark_value
 
-from orchestrator.pytest_markers import (
-    _marker_name,
-    _pytestmark_value,
-    module_level_marker_names,
-)
+from orchestrator.pytest_markers import module_level_marker_names
 
 # This module is ITSELF a member of the family it polices -- the invariant
 # below rglob()s every *.py under this directory and ast.parse()s each one --
@@ -411,8 +408,8 @@ def _module_level_timeout_ceiling(source: str) -> float | None:
     legal), the SMALLEST resolvable one wins -- the ambiguity is real and the
     conservative reading is the one that surfaces it.
 
-    ``_pytestmark_value`` and ``_marker_name`` are imported from
-    :mod:`orchestrator.pytest_markers` rather than re-derived, for the same
+    ``pytestmark_value``, ``marker_name`` and ``mark_elements`` are imported
+    from :mod:`shared.pytest_mark_grammar` rather than re-derived, for the same
     reason the family invariant imports ``module_level_marker_names``: the
     grammar of a module-level ``pytestmark`` (``Assign`` vs ``AnnAssign``,
     last-assignment-wins, list/tuple element forms) belongs in exactly one
@@ -426,16 +423,15 @@ def _module_level_timeout_ceiling(source: str) -> float | None:
 
     value: ast.expr | None = None
     for statement in tree.body:
-        bound = _pytestmark_value(statement)
+        bound = pytestmark_value(statement)
         if bound is not None:
             value = bound
     if value is None:
         return None
 
-    elements = list(value.elts) if isinstance(value, ast.List | ast.Tuple) else [value]
     resolved: list[float] = []
-    for element in elements:
-        if not isinstance(element, ast.Call) or _marker_name(element) != 'timeout':
+    for element in mark_elements(value):
+        if not isinstance(element, ast.Call) or marker_name(element) != 'timeout':
             continue
         arg = _timeout_call_arg(element)
         if arg is None:
@@ -721,7 +717,7 @@ def test_ceiling_is_unknown_with_no_pytestmark_at_all() -> None:
 
 
 def test_ceiling_ignores_a_function_local_pytestmark() -> None:
-    """Only ``tree.body`` is walked, inheriting ``_pytestmark_value``'s contract.
+    """Only ``tree.body`` is walked, inheriting ``pytestmark_value``'s contract.
 
     A ``pytestmark`` bound inside a function body applies to nothing, so
     reading it would be worse than reading nothing.
