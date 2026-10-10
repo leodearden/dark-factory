@@ -465,6 +465,29 @@ class ReconLedgerStore:
             project_id, RECORD_KIND_MEM0_TOMBSTONE, task_id=memory_id
         )
 
+    async def list_by_kind(
+        self, project_id: str, record_kind: str, state: str
+    ) -> list[ReconLedgerRecord]:
+        """Return every *record_kind* row in *state* for *project_id*.
+
+        The generic kind/state reader, served by the ``(project_id,
+        record_kind, state)`` index; ordered by ``created_at`` then identity.
+        Returns raw records: decoding a payload is its kind's owner's job.
+
+        Does NOT filter on ``expires_at``. A kind gets TTL by its writer always
+        stamping ``expires_at`` and :meth:`gc` reaping it; a consumer that
+        acts on a row re-checks expiry at use.
+        """
+        rows = await self._require_access().read_all(
+            """
+            SELECT * FROM recon_ledger
+            WHERE project_id = ? AND record_kind = ? AND state = ?
+            ORDER BY created_at, task_id, flag_type, run_id
+            """,
+            (project_id, record_kind, state),
+        )
+        return [_record_from_row(row) for row in rows]
+
     async def list_suppressions(self, project_id: str) -> list[ReconLedgerRecord]:
         """Return the active ``stage1_flag_suppression`` rows for a project.
 

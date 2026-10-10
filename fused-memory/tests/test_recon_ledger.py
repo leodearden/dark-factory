@@ -2042,7 +2042,7 @@ async def test_list_by_kind_is_empty_when_nothing_matches(store):
 
 @pytest.mark.asyncio
 async def test_list_by_kind_orders_by_created_at_then_identity(store):
-    late = _kind_row(flag_type='topic-a', created_at='2026-07-03T00:00:00+00:00')
+    late = _kind_row(flag_type='topic-0', created_at='2026-07-03T00:00:00+00:00')
     early_b = _kind_row(flag_type='topic-b', created_at='2026-07-01T00:00:00+00:00')
     early_a_run2 = _kind_row(
         flag_type='topic-a', run_id='run-2', created_at='2026-07-01T00:00:00+00:00'
