@@ -31,6 +31,11 @@ DEFAULT_THRESHOLD = 5
 DEFAULT_WINDOW_SECONDS = 3600.0
 
 
+def journal_params(fallback: ClassificationFallback | None) -> dict[str, str]:
+    """The write-journal params entry naming *fallback*; empty for a real classification."""
+    return {} if fallback is None else {JOURNAL_PARAM_KEY: fallback.value}
+
+
 def emit_classification_fallback_storm_escalation(
     project_root: str, *, project_id: str, storm: dict[str, Any],
 ) -> str | None:

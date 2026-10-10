@@ -106,6 +106,9 @@ class AddMemoryResponse(BaseModel):
     stores_written: list[SourceStore] = Field(default_factory=list)
     category: MemoryCategory | None = None
     message: str = ''
+    # Set when category was not supplied and the classifier returned a default
+    # rather than a classification.
+    classification_fallback: ClassificationFallback | None = None
 
 
 class ReadRouteResult(BaseModel):
