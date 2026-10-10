@@ -1,8 +1,7 @@
 """Tests for the write classifier heuristics."""
 
-from unittest.mock import AsyncMock, MagicMock
-
 import pytest
+from _openai_stubs import completion_client, raising_client
 
 from fused_memory.models.enums import (
     LLM_CLASSIFIER_FAILURES,
@@ -12,26 +11,6 @@ from fused_memory.models.enums import (
 from fused_memory.routing.classifier import WriteClassifier
 
 _NO_HEURISTIC_MATCH = 'Hello world'
-
-
-def _completion_client(content: str) -> MagicMock:
-    """Return a mock AsyncOpenAI client that yields *content* as LLM output."""
-    mock_msg = MagicMock()
-    mock_msg.content = content
-    mock_choice = MagicMock()
-    mock_choice.message = mock_msg
-    mock_response = MagicMock()
-    mock_response.choices = [mock_choice]
-    mock_client = MagicMock()
-    mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
-    return mock_client
-
-
-def _raising_client(exc: Exception) -> MagicMock:
-    """Return a mock AsyncOpenAI client whose completion call raises *exc*."""
-    mock_client = MagicMock()
-    mock_client.chat.completions.create = AsyncMock(side_effect=exc)
-    return mock_client
 
 
 @pytest.fixture
@@ -120,9 +99,6 @@ class TestClassifyAsync:
 class TestLLMClassification:
     """Test _llm_classify with a mocked OpenAI client."""
 
-    def _make_mock_client(self, content: str) -> MagicMock:
-        return _completion_client(content)
-
     @pytest.mark.asyncio
     async def test_nested_braces_in_reasoning_parsed(self, classifier):
         """_llm_classify correctly parses JSON whose reasoning value contains nested braces."""
@@ -133,7 +109,7 @@ class TestLLMClassification:
             '"confidence": 0.9, '
             '"reasoning": "chose PostgreSQL because {it has ACID + JSON support}"}'
         )
-        classifier._openai_client = self._make_mock_client(llm_output)
+        classifier._openai_client = completion_client(llm_output)
 
         result = await classifier._llm_classify('chose PostgreSQL')
 
@@ -151,7 +127,7 @@ class TestLLMClassification:
             '"reasoning": "time references like {since v3.0} detected"}\n'
             '```'
         )
-        classifier._openai_client = self._make_mock_client(llm_output)
+        classifier._openai_client = completion_client(llm_output)
 
         result = await classifier._llm_classify('The API was deprecated since v3.0')
 
@@ -161,7 +137,7 @@ class TestLLMClassification:
     @pytest.mark.asyncio
     async def test_no_json_falls_back_to_default(self, classifier):
         """_llm_classify returns the default when the LLM returns no JSON at all."""
-        classifier._openai_client = self._make_mock_client('I cannot classify this.')
+        classifier._openai_client = completion_client('I cannot classify this.')
 
         result = await classifier._llm_classify('some content')
 
@@ -180,7 +156,7 @@ class TestClassificationFallbackReason:
     @pytest.mark.asyncio
     async def test_llm_call_raising_is_llm_error(self, llm_config):
         classifier = WriteClassifier(
-            llm_config, openai_client=_raising_client(RuntimeError('connection refused')),
+            llm_config, openai_client=raising_client(RuntimeError('connection refused')),
         )
 
         result = await classifier.classify(_NO_HEURISTIC_MATCH)
@@ -192,7 +168,7 @@ class TestClassificationFallbackReason:
     @pytest.mark.asyncio
     async def test_llm_returning_no_json_is_llm_no_json(self, llm_config):
         classifier = WriteClassifier(
-            llm_config, openai_client=_completion_client('I cannot classify this.'),
+            llm_config, openai_client=completion_client('I cannot classify this.'),
         )
 
         result = await classifier.classify(_NO_HEURISTIC_MATCH)
@@ -204,7 +180,7 @@ class TestClassificationFallbackReason:
     @pytest.mark.asyncio
     async def test_llm_naming_an_invalid_category_is_llm_error(self, llm_config):
         classifier = WriteClassifier(
-            llm_config, openai_client=_completion_client('{"primary": "nonsense"}'),
+            llm_config, openai_client=completion_client('{"primary": "nonsense"}'),
         )
 
         result = await classifier.classify(_NO_HEURISTIC_MATCH)
@@ -216,7 +192,7 @@ class TestClassificationFallbackReason:
     async def test_successful_llm_classification_is_not_a_fallback(self, llm_config):
         classifier = WriteClassifier(
             llm_config,
-            openai_client=_completion_client(
+            openai_client=completion_client(
                 '{"primary": "decisions_and_rationale", "secondary": null, '
                 '"confidence": 0.9, "reasoning": "a choice"}'
             ),
