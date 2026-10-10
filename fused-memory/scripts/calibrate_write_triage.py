@@ -1102,18 +1102,41 @@ _PROJECT_BLOCK_FENCE = (
     "  # --project-id equals the key; never pooled with write_triage's bands.\n"
     '  # Hand edits inside this section are not preserved.\n'
 )
+# A long report path stays on its key's line rather than being folded.
+_NO_LINE_FOLDING = 1 << 16
 
 
 def _render_project_section(entries: Mapping[str, Mapping[str, Any]]) -> str:
-    """The whole section, projects and categories sorted, so equal input is equal bytes."""
-    out = [f'{_PROJECT_BLOCK_KEY}\n', _PROJECT_BLOCK_FENCE]
-    for project in sorted(entries):
-        cutoffs = entries[project]['t_high_by_category']
-        out.append(f'  {project}:\n')
-        out.append(f'    calibration_report_path: {entries[project]["calibration_report_path"]}\n')
-        out.append('    t_high_by_category:\n')
-        out.extend(f'      {category}: {cutoffs[category]}\n' for category in sorted(cutoffs))
-    return ''.join(out)
+    """The whole section, projects and categories sorted, so equal input is equal bytes.
+
+    The body is rendered by the same YAML library that parses it back, so a
+    project id such as ``123`` or ``yes`` stays a quoted string key and a
+    report path is never re-read as YAML syntax.
+    """
+    body = yaml.safe_dump(
+        {
+            project: {
+                'calibration_report_path': entry['calibration_report_path'],
+                't_high_by_category': dict(entry['t_high_by_category']),
+            }
+            for project, entry in entries.items()
+        },
+        sort_keys=True, default_flow_style=False, allow_unicode=True, width=_NO_LINE_FOLDING,
+    )
+    indented = ''.join(f'  {line}' for line in body.splitlines(keepends=True))
+    return f'{_PROJECT_BLOCK_KEY}\n{_PROJECT_BLOCK_FENCE}{indented}'
+
+
+def _existing_project_entries(section_text: str) -> dict[str, Any]:
+    """The parsed section's entries; refuses a project key that did not load as a string."""
+    entries = yaml.safe_load(section_text)[_PROJECT_SECTION] or {}
+    non_string = sorted(repr(key) for key in entries if not isinstance(key, str))
+    if non_string:
+        raise ValueError(
+            f'{_PROJECT_SECTION} carries project key(s) {", ".join(non_string)} that YAML '
+            'loaded as a non-string; quote them in config.yaml before re-running.',
+        )
+    return dict(entries)
 
 
 def write_project_calibration_block(
@@ -1138,11 +1161,9 @@ def write_project_calibration_block(
         )
     lines = yaml_text.splitlines(keepends=True)
     start, end = _top_level_block_span(lines, _PROJECT_BLOCK_KEY)
-    existing = (
-        yaml.safe_load(''.join(lines[start:end]))[_PROJECT_SECTION]
-        if start is not None else None
+    entries = (
+        _existing_project_entries(''.join(lines[start:end])) if start is not None else {}
     )
-    entries = dict(existing or {})
     entries[project_id] = {
         'calibration_report_path': report_path,
         't_high_by_category': dict(t_high_by_category),
@@ -1535,6 +1556,38 @@ def _warn_refused_categories(
         )
 
 
+def pooled_corpus_conflict(
+    project_id: str,
+    report_path: str | Path,
+    *,
+    pooled_report: Path | None,
+    pooled_project_id: str | None,
+) -> str | None:
+    """Why a ``--write-project-config`` run would clobber or shadow the pooled corpus, or None.
+
+    Checked before any I/O: the report is written before the config entry, so
+    a refusal after the run would come too late to save the report of record.
+    A project entry for the pooled corpus's own project would shadow
+    ``write_triage.t_high_by_category`` for every audit of that project.
+    """
+    if pooled_report is not None and Path(report_path).resolve() == pooled_report.resolve():
+        return f'--report-path {report_path} is the pooled report of record'
+    if project_id == pooled_project_id:
+        return f'--project-id {project_id} is the pooled corpus of record'
+    return None
+
+
+def _pooled_corpus_of_record(config: Any) -> tuple[Path | None, str | None]:
+    """The pooled report config.yaml names, and the project its provenance records."""
+    named = config.write_triage.calibration_report_path
+    if named is None:
+        return None, None
+    report = _PACKAGE_ROOT / named
+    if not report.exists():
+        return report, None
+    return report, json.loads(report.read_text())['provenance']['project_id']
+
+
 def _write_project_config(
     report: Mapping[str, Any], config_path: Path, project_id: str, report_path: str,
 ) -> int:
@@ -1596,6 +1649,15 @@ async def _run(args: Any) -> int:
     base_report = json.loads(Path(args.bands_from).read_text()) if args.bands_from else None
 
     config = FusedMemoryConfig()
+    if args.write_project_config:
+        pooled_report, pooled_project_id = _pooled_corpus_of_record(config)
+        conflict = pooled_corpus_conflict(
+            args.project_id, args.report_path,
+            pooled_report=pooled_report, pooled_project_id=pooled_project_id,
+        )
+        if conflict:
+            logger.error('ABORT: %s — refusing to calibrate; nothing was written.', conflict)
+            return 1
     memory = MemoryService(config)
     await memory.initialize()
     try:
@@ -1696,14 +1758,16 @@ def main() -> int:
     import asyncio  # noqa: PLC0415
 
     repo = Path(__file__).parent.parent
+    pooled_fixture = repo / 'tests' / 'fixtures' / 'write_triage_calibration.jsonl'
+    pooled_report = repo / 'calibration' / 'write_triage_calibration_report.json'
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--fixture', default=str(
-        repo / 'tests' / 'fixtures' / 'write_triage_calibration.jsonl'))
+    parser.add_argument('--fixture', default=None,
+                        help=f'default: {pooled_fixture} (required with --write-project-config)')
     parser.add_argument('--project-id', dest='project_id', default='reify')
     parser.add_argument('--k', type=int, action='append', default=None,
                         help='recall@k value (repeatable; default 1 3 5 10)')
-    parser.add_argument('--report-path', dest='report_path', default=str(
-        repo / 'calibration' / 'write_triage_calibration_report.json'))
+    parser.add_argument('--report-path', dest='report_path', default=None,
+                        help=f'default: {pooled_report} (required with --write-project-config)')
     parser.add_argument('--config', default=None,
                         help='Path to fused-memory config file (sets CONFIG_PATH)')
     outcome = parser.add_mutually_exclusive_group()
@@ -1736,6 +1800,11 @@ def main() -> int:
                              '--canonical-aliases, its alias) is first reached, '
                              'or -1. See compute_first_hit_ranks.')
     args = parser.parse_args()
+    if args.write_project_config and (args.fixture is None or args.report_path is None):
+        parser.error('--write-project-config requires an explicit --fixture and --report-path: '
+                     'their defaults are the pooled corpus and its report of record')
+    args.fixture = args.fixture or str(pooled_fixture)
+    args.report_path = args.report_path or str(pooled_report)
     if not args.k:
         args.k = [1, 3, 5, 10]
     return asyncio.run(_run(args))

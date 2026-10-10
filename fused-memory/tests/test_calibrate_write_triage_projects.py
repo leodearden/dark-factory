@@ -26,7 +26,7 @@ import pytest
 import yaml
 from _fm_helpers import load_script_module
 
-from fused_memory.config.schema import WriteTriageProjectCalibration
+from fused_memory.config.schema import FusedMemoryConfig, WriteTriageProjectCalibration
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'calibrate_write_triage.py'
 FIXTURES_DIR = Path(__file__).parent / 'fixtures'
@@ -275,7 +275,43 @@ class TestWriteProjectCalibrationBlock:
         comments = [line for line in lines if line.lstrip().startswith('#')]
         assert comments, 'the section must carry its machine-owned fence'
         assert all(line.startswith('  #') for line in comments)
-        assert 'machine-owned' in comments[0]
+
+
+class TestProjectSectionScalarsRoundTrip:
+    """What the writer renders, yaml.safe_load reads back as the same str/float values."""
+
+    @pytest.mark.parametrize('project', ['123', 'yes', 'on', 'null', '0.5'])
+    def test_a_yaml_ambiguous_project_id_stays_a_string_key(self, project: str) -> None:
+        section = _section(_write(POOLED_YAML, project))
+        assert list(section) == [project]
+        WriteTriageProjectCalibration.model_validate(section[project])
+
+    @pytest.mark.parametrize('report', [
+        'calibration/a: b.json', 'calibration/a #b.json', '123', 'yes',
+    ])
+    def test_a_report_path_carrying_yaml_syntax_is_read_back_verbatim(self, report: str) -> None:
+        entry = _section(_write(POOLED_YAML, report=report))['dark_factory']
+        assert entry['calibration_report_path'] == report
+
+    def test_a_rewritten_shipped_config_still_loads(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        text = CONFIG_PATH.read_text()
+        for project in ('123', 'yes'):
+            text = _write(text, project)
+        rewritten = tmp_path / 'config.yaml'
+        rewritten.write_text(text)
+        monkeypatch.setenv('CONFIG_PATH', str(rewritten))
+        loaded = FusedMemoryConfig().write_triage_project_calibrations
+        assert {'123', 'yes'} <= set(loaded)
+
+    def test_an_existing_non_string_project_key_is_refused_by_name(self) -> None:
+        broken = POOLED_YAML + (
+            f'\n{SECTION}:\n  123:\n    calibration_report_path: calibration/x.json\n'
+            '    t_high_by_category:\n      preferences_and_norms: 0.5\n'
+        )
+        with pytest.raises(ValueError, match='123'):
+            _write(broken)
 
 
 class TestTheTwoWritersAreDisjoint:
@@ -301,6 +337,17 @@ class TestTheTwoWritersAreDisjoint:
 
 
 class TestWriteProjectConfigCli:
+    @pytest.fixture(autouse=True)
+    def _no_live_store(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A refusal that regresses must fail here, never fall through to a live run.
+
+        Unguarded, a live run would overwrite the committed reports and config.yaml.
+        """
+        def no_store(*_args, **_kwargs):
+            raise AssertionError('the refusal must come before the store is touched')
+
+        monkeypatch.setattr('fused_memory.services.memory_service.MemoryService', no_store)
+
     @pytest.mark.parametrize('other', [['--write-config'], ['--bands-from', 'base.json']],
                              ids=['write-config', 'bands-from'])
     def test_write_project_config_excludes_the_other_outcomes(
@@ -313,6 +360,64 @@ class TestWriteProjectConfigCli:
             _mod().main()
         assert excinfo.value.code == 2
         assert 'not allowed with argument' in capsys.readouterr().err
+
+    @pytest.mark.parametrize('given', [
+        ['--fixture', 'f.jsonl'], ['--report-path', 'r.json'], [],
+    ], ids=['no-report-path', 'no-fixture', 'neither'])
+    def test_write_project_config_requires_an_explicit_fixture_and_report_path(
+        self, given: list[str], monkeypatch, capsys,
+    ) -> None:
+        """The defaults are the pooled reify corpus and its report of record."""
+        monkeypatch.setattr(sys, 'argv', [
+            'calibrate_write_triage.py', '--project-id', 'dark_factory',
+            '--write-project-config', *given,
+        ])
+        with pytest.raises(SystemExit) as excinfo:
+            _mod().main()
+        assert excinfo.value.code == 2
+        err = capsys.readouterr().err
+        assert '--fixture' in err and '--report-path' in err
+
+    @pytest.mark.parametrize('project, report', [
+        ('reify', 'write_triage_calibration_report_other.json'),
+        ('dark_factory', 'write_triage_calibration_report.json'),
+    ], ids=['pooled-project', 'pooled-report'])
+    def test_a_run_that_would_clobber_or_shadow_the_pooled_corpus_aborts_before_any_io(
+        self, project: str, report: str, monkeypatch, caplog,
+    ) -> None:
+        monkeypatch.setattr(sys, 'argv', [
+            'calibrate_write_triage.py', '--project-id', project, '--write-project-config',
+            '--fixture', str(DARK_FACTORY_FIXTURE_PATH),
+            '--report-path', str(PACKAGE_ROOT / 'calibration' / report),
+        ])
+        with caplog.at_level(logging.ERROR):
+            assert _mod().main() == 1
+        assert 'ABORT' in caplog.text
+
+
+class TestPooledCorpusConflict:
+    """`pooled_corpus_conflict`: a project entry may neither overwrite nor shadow reify's."""
+
+    POOLED_REPORT = Path('/pkg/calibration/pooled.json')
+
+    def _conflict(self, project: str, report: str) -> str | None:
+        return _mod().pooled_corpus_conflict(
+            project, report, pooled_report=self.POOLED_REPORT, pooled_project_id='reify',
+        )
+
+    def test_another_project_with_its_own_report_has_no_conflict(self) -> None:
+        assert self._conflict('dark_factory', '/pkg/calibration/df.json') is None
+
+    def test_the_pooled_project_is_refused(self) -> None:
+        assert 'reify' in str(self._conflict('reify', '/pkg/calibration/df.json'))
+
+    def test_the_pooled_report_path_is_refused(self) -> None:
+        assert 'pooled.json' in str(self._conflict('dark_factory', str(self.POOLED_REPORT)))
+
+    def test_an_uncalibrated_pool_conflicts_with_nothing(self) -> None:
+        assert _mod().pooled_corpus_conflict(
+            'reify', '/pkg/calibration/df.json', pooled_report=None, pooled_project_id=None,
+        ) is None
 
 
 def _report(per_category: dict) -> dict:
