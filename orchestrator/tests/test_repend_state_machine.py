@@ -211,18 +211,22 @@ class TestWorkflowGatesB1B2:
     harness slot exited (spec E1 strand).  It now enters the same bounded
     ESCALATED machinery every other phase uses; a born-at-L2 record trips
     ``_wait_for_resolution``'s stop-the-line short-circuit immediately, so the
-    outcome is BLOCKED with the row written before the return.  What gates is
-    unchanged — ``_is_gating_escalation`` is untouched — and B2 still returns
-    ESCALATED because that gate sits on the execute/verify/review path, which
-    has always routed through ``run()``'s own ESCALATED branch.
+    outcome is BLOCKED with the row written before the return.  What gates
+    is unchanged for blocking and critical records — ``_is_gating_escalation``
+    was narrowed only for info in task 5222 (an info L2 never gates) — and B2
+    still returns ESCALATED because that gate sits on the
+    execute/verify/review path, which has always routed through ``run()``'s
+    own ESCALATED branch.
     """
 
+    @pytest.mark.parametrize('severity', ['critical', 'blocking'])
     async def test_b1_merge_entry_gate(
-        self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+        self, config, git_ops, task_assignment, monkeypatch, tmp_path, severity,
     ):
-        """[B1] Born-at-L2 (critical/level=2) pending at MERGE entry → BLOCKED
-        (row written before the return); escalation stays pending (gate does
-        not consume)."""
+        """[B1] A non-info L2 pending at MERGE entry → BLOCKED (row written
+        before the return) with a reason naming the L2 and no steward
+        (boundary row #8 of the info-l0-disposition-router PRD); escalation
+        stays pending (gate does not consume)."""
         stub = AgentStub()
         workflow, scheduler, queue = _build_workflow_with_escalation(
             config, git_ops, task_assignment, stub, tmp_path,
@@ -233,15 +237,16 @@ class TestWorkflowGatesB1B2:
         # File the born-at-L2 escalation inside the stubbed verify/review phase
         # so it is pending at MERGE entry but absent during _execute_iterations.
         task_id = task_assignment.task_id
+        esc_id = queue.make_id(task_id)
 
         async def _exec_and_escalate():
             queue.submit(Escalation(
-                id=queue.make_id(task_id),
+                id=esc_id,
                 task_id=task_id,
                 agent_role='implementer',
-                severity='critical',
+                severity=severity,
                 category='risk_identified',
-                summary='Critical risk filed before MERGE (born at L2)',
+                summary=f'{severity} L2 filed before MERGE',
                 level=2,
             ))
             return WorkflowOutcome.DONE
@@ -252,11 +257,13 @@ class TestWorkflowGatesB1B2:
         # loop, so no steward window is ever ridden; the guard is here so a
         # regression that DOES wait fails loudly instead of hanging CI on this
         # module's stock (unshrunk) timeouts.steward.
-        outcome = (await asyncio.wait_for(workflow.run(), 60)).outcome
+        report = await asyncio.wait_for(workflow.run(), 60)
+        outcome = report.outcome
 
         assert outcome == WorkflowOutcome.BLOCKED, (
             f'MERGE-entry gate must park the row via _mark_blocked; got {outcome}'
         )
+        assert report.reason == f'Gated by open L2 {esc_id}; no steward applicable'
         # The row is written BEFORE the terminal return (spec S1) — the half
         # of the strand shape the old bare-ESCALATED bail never did.
         assert scheduler.statuses.get(task_id, [])[-1:] == ['blocked'], (
@@ -270,7 +277,7 @@ class TestWorkflowGatesB1B2:
         assert len(still_pending) == 1, (
             f'Pending L2 must survive the gate (not consumed); got {still_pending}'
         )
-        assert still_pending[0].severity == 'critical'
+        assert still_pending[0].severity == severity
 
     async def test_b2_post_implementer_gate(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,

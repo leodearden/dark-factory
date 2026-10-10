@@ -6474,22 +6474,29 @@ class TestBornAtL2HaltsRunViaWaitForResolution:
 @pytest.mark.asyncio
 @pytest.mark.mocks_dry_run_unblock
 class TestReescalationDetailPropagatedToBlockReport:
-    """task 2553: the ``except _StewardReescalated`` clause in ``run()``
-    (workflow.py:2444) must thread the carried escalation payload into
-    ``_mark_blocked``'s ``detail=`` instead of discarding it.
+    """task 2553: the hand-off clause in ``run()``'s ESCALATED branch must
+    thread the carried escalation payload into ``_mark_blocked``'s
+    ``detail=`` instead of discarding it, so ``report.detail`` names the
+    record rather than copying ``report.reason``.
 
     Mirrors ``TestBornAtL2HaltsRunViaWaitForResolution`` but asserts on the
     returned ``TerminalReport.detail``/``.reason`` rather than only
-    ``.outcome``. RED today: the except clause has no ``as reesc`` binding
-    and calls ``_mark_blocked('Steward re-escalated to human',
-    skip_escalation=True)`` with no ``detail=``, so ``_mark_blocked``'s
-    ``detail = detail or reason`` fallback makes ``report.detail`` an exact
-    copy of ``report.reason`` — neither the escalation's detail text nor its
-    id appear anywhere in the report.
+    ``.outcome``.  The REASON names which of ``_wait_for_resolution``'s two
+    hand-offs fired (PRD info-l0-disposition-router D13, task 5222): an open
+    non-info L2 short-circuits before any steward work, so its reason is
+    ``Gated by open L2 <ids>; no steward applicable`` and its detail must not
+    claim a steward acted; an open L1 is the steward's own hand-off, whose
+    reason stays ``Steward re-escalated to human``.
     """
 
+    @pytest.mark.parametrize(('severity', 'level', 'expected_reason'), [
+        ('critical', 2, 'Gated by open L2 {esc_id}; no steward applicable'),
+        ('blocking', 2, 'Gated by open L2 {esc_id}; no steward applicable'),
+        ('blocking', 1, 'Steward re-escalated to human'),
+    ])
     async def test_detail_contains_escalation_payload(
         self, config, git_ops, task_assignment, monkeypatch, tmp_path,
+        severity, level, expected_reason,
     ):
         from escalation.models import Escalation
 
@@ -6515,17 +6522,17 @@ class TestReescalationDetailPropagatedToBlockReport:
             call_count += 1
             if call_count == 1:
                 # Simulate a post-implementer/post-debugger gate firing:
-                # the inner loop submitted a critical/level-2 escalation and
-                # returned ESCALATED — which bubbles up to run().
+                # the inner loop submitted an escalation a human must decide
+                # and returned ESCALATED — which bubbles up to run().
                 queue.submit(Escalation(
                     id=esc_id,
                     task_id=task_assignment.task_id,
                     agent_role='implementer',
-                    severity='critical',
+                    severity=severity,
                     category='risk_identified',
-                    summary='Stop-the-line: critical risk needing human review',
-                    detail='Born at L2 — cannot be auto-resolved by steward',
-                    level=2,
+                    summary='Stop-the-line: risk needing human review',
+                    detail='Needs a human decision — no steward can resolve it',
+                    level=level,
                 ))
             return WorkflowOutcome.ESCALATED
 
@@ -6536,11 +6543,12 @@ class TestReescalationDetailPropagatedToBlockReport:
         assert report.outcome == WorkflowOutcome.BLOCKED
         # The escalation's own detail text and id must be recoverable from
         # the block report — not just a copy of the generic reason.
-        assert 'Born at L2 — cannot be auto-resolved by steward' in report.detail
+        assert 'Needs a human decision — no steward can resolve it' in report.detail
         assert esc_id in report.detail
-        # reason stays the stable generic summary; detail must differ from it.
-        assert report.reason == 'Steward re-escalated to human'
+        assert report.reason == expected_reason.format(esc_id=esc_id)
         assert report.detail != report.reason
+        if level >= 2:
+            assert 'Steward re-escalated' not in report.detail, report.detail
 
 
 @pytest.mark.asyncio
