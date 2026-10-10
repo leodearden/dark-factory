@@ -21,13 +21,12 @@ There is no task left to re-point, so S1 re-points that landed code onto
 `workspace_domain` (decision 3), and 5414 gets no `update_task` and no `add_dependency`.
 S1's move list also covers the seams 5414 added to `merge_lane_metrics.py` (decision 1).
 **Amended 2026-10-09 (task 6612, finding fk-6d9e5b64770a):** the snapshot is schema 2.
-`import_graph` gains `hidden_cycles` and `typing_cycles`, and each `deferred` entry gains
-`closes_cycle` (decision 10). Schema 1 is still read (§Contract). The finding: `cycles`, over
-import-time edges only, cannot see the cycles that function-local imports were written to
-break. Measured at `65c261863c`: 0 SCCs over import-time edges, 6 over run-time edges
-(sizes 20, 3, 3, 3, 2, 2), 9 over every edge; 42 deferred imports close a hidden cycle,
-of which 28 would be marked under the narrower rule "some target reaches the importer over
-import-time edges alone".
+`import_graph` gains `hidden_cycles` and `typing_cycles`, each `deferred` entry gains
+`closes_cycle`, and each `src` record gains `cycle_closing_imports` (decision 10). Schema 1
+is still read (§Contract). The finding: `cycles`, over import-time edges only, cannot see
+the cycles that function-local imports were written to break. Measured at `65c261863c`:
+0 SCCs over import-time edges, 6 over run-time edges (sizes 20, 3, 3, 3, 2, 2), 9 over
+every edge; 42 deferred imports close a hidden cycle.
 
 ## Goal
 
@@ -252,9 +251,13 @@ enumeration (amended 2026-10-05: 5414 is done, `cdc15a6b56`).
     `if TYPE_CHECKING:`) one of whose first-party targets lies in its importer's
     `hidden_cycles` component, i.e. the edge it adds lies on a cycle of run-time edges.
     It is derived from `hidden_cycles`, so the two cannot disagree, and every hidden cycle
-    that is not an import-time one holds at least one marked entry. `--diff` keys a
-    deferred entry by `(from, imports)` without the flag: a flip is the hidden cycle's own
-    change, already reported.
+    that is not an import-time one holds at least one marked entry. A `src` record's
+    `cycle_closing_imports` counts its module's marked entries, as `reach_back_imports`
+    counts its reach-backs. `--diff` keys a deferred import by `(from, imports)`, and
+    compares the marked ones as a kind of their own. So a deferred import that starts or
+    stops closing a cycle is reported even where no edge, cycle set or deferred import
+    changed, e.g. a function-local import that leaves `if TYPE_CHECKING:` onto an existing
+    hidden cycle.
 11. **Per-function detail for `src` only.** Every file record carries `cognitive_total`,
     `cognitive_max` and the qualname holding the max (the doc's pair). The full
     `path::qualname → score` map is stored for the 7,006 `src` functions, not for the
@@ -301,7 +304,8 @@ Snapshot (`schema_version: 2`):
                       cognitive_total, cognitive_max, cognitive_max_function, functions,
                       # kind == "src":
                       function_local_imports, reexport_names, package_init,
-                      reach_back_imports, fan_out, fan_in_src, fan_in_tests,
+                      reach_back_imports, cycle_closing_imports, fan_out, fan_in_src,
+                      fan_in_tests,
                       # kind == "tests":
                       private_patch_targets: [sorted dotted names], private_reads } },
   functions: { "<src path>::<qualname>": score },
@@ -310,11 +314,11 @@ Snapshot (`schema_version: 2`):
                   cycles: [[...]], hidden_cycles: [[...]], typing_cycles: [[...]] } }
 ```
 
-Schema 1 (before task 6612) lacks `hidden_cycles`, `typing_cycles` and `closes_cycle`, and
-is still read, so a committed schema-1 snapshot stays a valid `--diff` previous and
-`--summary` input. Both name its absent cycle sets and `closes_cycle` unknown, never empty
-and never as wholesale additions (decision 7's polarity). Any other `schema_version` is an
-exit 2 naming the versions read.
+Schema 1 (before task 6612) lacks `hidden_cycles`, `typing_cycles`, `closes_cycle` and
+`cycle_closing_imports`, and is still read, so a committed schema-1 snapshot stays a valid
+`--diff` previous and `--summary` input. Both name its cycle-closing deferred imports, hidden
+cycles and typing cycles unknown, never empty and never as wholesale additions (decision 7's
+polarity). Any other `schema_version` is an exit 2 naming the versions read.
 
 `--diff` prints, in this order and in path order within each section: completeness of
 both snapshots; added, removed and renamed (same blob) files; the complexity pair per
@@ -322,8 +326,9 @@ changed module, annotated with the doc's reading only where it applies ("max dow
 flat or down: complexity moved, per docs/code-quality.md §What to measure"; "total up:
 complexity added"); heuristic-14 crossings of either mark in either direction, labelled
 "ALARM — measure per heuristic 14, not a target"; import-graph changes (edges, reach-backs,
-deferred imports, cycles, hidden cycles and typing cycles added and removed); per test file, private patch targets added and
-removed and the private-read delta. A measuring run without `--diff` ends by printing
+deferred imports, cycle-closing deferred imports, cycles, hidden cycles and typing cycles
+added and removed); per test file, private patch targets added and removed and the
+private-read delta. A measuring run without `--diff` ends by printing
 "no previous snapshot given; since = none" (INV-13), so a first run never reads as a run in
 which nothing moved; a `--diff` path that does not exist or does not parse is an exit 2
 naming it.
@@ -348,7 +353,7 @@ members; no measure is patched (Tests stance).
 | 11 | No previous snapshot | measure without `--diff`; then with `--diff` naming a missing file | first: `since == "none"` and the "no previous snapshot given" line; second: exit 2 naming the path |
 | 12 | Cluster agreement | real repo | for every cluster path, snapshot `lines`/`prose_lines`/`cognitive_total` equal the ratchet report's |
 | 13 | Census enumerates the domain (S1b) | the row-2 fixture plus `hooks/tests/test_h.py`, and a `scripts/tests` test patching `legibility.mod._x` | `suite_census_pinning.measure_python_tree` counts exactly the domain's `tests` files (no `hooks/` file), grouped under the member names; `legibility.mod._x` counts as a first-party private target |
-| 14 | Schema-1 previous (task 6612) | a snapshot of the same tree with `schema_version: 1`, no `hidden_cycles`/`typing_cycles` and no `closes_cycle` | it validates; `--diff` against it exits 0 and its import-graph section is exactly "hidden cycles unknown: the previous snapshot is schema 1" and the same for typing cycles; `--summary` names them unknown; a schema-1 file carrying `closes_cycle` and a `schema_version` of 3 are exit 2 |
+| 14 | Schema-1 previous (task 6612) | a snapshot of the same tree with `schema_version: 1`, no `hidden_cycles`/`typing_cycles`, no `closes_cycle` and no `cycle_closing_imports` | it validates; `--diff` against it exits 0 and its import-graph section is exactly "cycle-closing deferred imports unknown: the previous snapshot is schema 1" and the same for hidden and typing cycles; `--summary` names them unknown; a schema-1 file carrying `closes_cycle` or `cycle_closing_imports`, and a `schema_version` of 3, are exit 2 |
 
 ## Decomposition plan
 
