@@ -530,6 +530,10 @@ class _SourceEdge:
     def uuid(self) -> str:
         return self.properties['uuid']
 
+    @property
+    def group_id(self) -> str | None:
+        return self.properties['group_id']
+
     @classmethod
     def from_row(cls, row: Sequence[Any]) -> _SourceEdge:
         if len(row) != len(_EDGE_READ_COLUMNS):
@@ -1471,7 +1475,7 @@ async def _recreate_subgraph_relationships_batch(
                 # the wrong copy verbatim -- MERGE has no rewrite_group_id
                 # analogue (mirrors merge_foreign_duplicate).
                 edge_create_result = await _create_edge_copy(
-                    home, edge, group_id=edge.properties['group_id'],
+                    home, edge, group_id=edge.group_id,
                     embedding_clause=embedding_clause,
                 )
                 if edge_create_result.relationships_created:
@@ -1885,7 +1889,7 @@ async def merge_foreign_duplicate(
         # endpoint must already exist in home_graph, or the edge is
         # silently skipped (same convention as move_entity_across_graphs).
         await _create_edge_copy(
-            home, edge, group_id=edge.properties['group_id'],
+            home, edge, group_id=edge.group_id,
             embedding_clause=_embedding_set_clause('r.fact_embedding', edge_embedding_reply),
         )
         edges_recreated += 1
