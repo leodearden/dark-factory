@@ -29,6 +29,10 @@ from fused_memory.config.schema import (  # noqa: E402
     DedupOutageDetectorConfig,
     FusedMemoryConfig,
 )
+from fused_memory.middleware.recurrence_mint import (  # noqa: E402
+    REMINT_SWEEP_INTERVAL_SECS,
+    run_remint_sweep_loop,
+)
 from fused_memory.reconciliation.audit_trail_rotation import (  # noqa: E402
     memory_service_archive,
 )
@@ -1179,6 +1183,26 @@ async def run_server():
     else:
         logger.info('  Summary rebuild loop: disabled')
 
+    # Recurrence re-mint sweep (task 6572) — repairs chains left done with no
+    # successor by a failed mint or a crash between the done write and the mint.
+    remint_sweep_task: asyncio.Task[None] | None = None
+    if taskmaster is not None:
+        remint_sweep_task = asyncio.create_task(
+            run_remint_sweep_loop(
+                task_interceptor.remint_broken_recurrence_chains,
+                _known_projects_map.values(),
+            ),
+            name='recurrence_remint_sweep',
+        )
+        logger.info(
+            '  Recurrence re-mint sweep: enabled (at startup, then every %.0fs, '
+            '%d project root(s))',
+            REMINT_SWEEP_INTERVAL_SECS,
+            len(_known_projects_map),
+        )
+    else:
+        logger.info('  Recurrence re-mint sweep: disabled (no task backend)')
+
     # Run transport
     transport = config.server.transport
     logger.info(f'Starting MCP server with transport: {transport}')
@@ -1352,6 +1376,10 @@ async def run_server():
             rebuild_summaries_task.cancel()
             with contextlib.suppress(BaseException):
                 await rebuild_summaries_task
+        if remint_sweep_task is not None:
+            remint_sweep_task.cancel()
+            with contextlib.suppress(BaseException):
+                await remint_sweep_task
         loop_lag_task.cancel()
         with contextlib.suppress(BaseException):
             await loop_lag_task
