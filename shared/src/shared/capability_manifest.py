@@ -311,9 +311,13 @@ class ManifestTask(BaseModel):
     registry (if any) holds the task that produces its capabilities:
 
     - ``task_id`` set — the producer is a LOCAL dark-factory task, stamped
-      by ``commit_planning``; never author-supplied for a real batch. This
-      is the ordinary case, and the only one whose ``delivered_check``\\ s
-      this project's dispatch gate evaluates.
+      by ``commit_planning``; never author-supplied for a real batch. The one
+      sanctioned exception (INV-12) is the minimal sidecar that ε1–ε4 of
+      ``plans/dashboard-prd-lanes-prd.md`` write for a legacy, chain-only
+      PRD: it binds an EXISTING task's id by hand (that PRD's §9 ε), is not
+      a real batch, and ``commit_planning`` never stamps it. A local
+      ``task_id`` is the ordinary case, and the only one whose
+      ``delivered_check``\\ s this project's dispatch gate evaluates.
     - ``external_task_id`` set — the producer lives in ANOTHER project's
       registry, named in the repo's canonical qualified
       ``"project_id:task_id"`` form (``docs/task-authoring.md`` §3.2, the
@@ -402,6 +406,13 @@ class CapabilityManifestDoc(BaseModel):
     ``min_length=1`` on ``label`` already rejects an empty label on its
     own, so that branch here is a defense-in-depth restatement of the same
     rule at doc granularity).
+
+    ``signal_leaves`` names the label(s) of the block(s) whose completion
+    delivers the PRD's goal signal, usually its integration gate. The
+    dashboard derives the PRD's delivered / partial / not-yet mark from those
+    tasks' status at read time; nothing writes it at runtime. Absent means
+    the PRD names no signal leaf. Contract: ``plans/dashboard-prd-lanes-prd.md``
+    §4.7 and §5.2.
     """
 
     model_config = ConfigDict(extra='forbid')
@@ -409,6 +420,7 @@ class CapabilityManifestDoc(BaseModel):
     prd: str
     schema_version: Literal[1]
     tasks: list[ManifestTask]
+    signal_leaves: list[str] | None = None
 
     @model_validator(mode='after')
     def _check_labels(self) -> CapabilityManifestDoc:
@@ -419,6 +431,24 @@ class CapabilityManifestDoc(BaseModel):
             if task.label in seen:
                 raise ValueError(f'CapabilityManifestDoc: duplicate task label {task.label!r}.')
             seen.add(task.label)
+        return self
+
+    @model_validator(mode='after')
+    def _check_signal_leaves(self) -> CapabilityManifestDoc:
+        if self.signal_leaves is None:
+            return self
+        if not self.signal_leaves:
+            raise ValueError(
+                'CapabilityManifestDoc: signal_leaves must be non-empty when present — '
+                'omit the field when the PRD names no signal leaf.'
+            )
+        known = [task.label for task in self.tasks]
+        for label in self.signal_leaves:
+            if label not in known:
+                raise ValueError(
+                    f'CapabilityManifestDoc: signal_leaves label {label!r} names no task '
+                    f'block; known labels: {known!r}.'
+                )
         return self
 
 
