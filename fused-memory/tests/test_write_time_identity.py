@@ -10,6 +10,9 @@ Covers:
 - GraphitiBackend.ensure_entity_node (task 3335): the resolve-or-MINT sibling of
   _resolve_or_create_entity — delegates resolve/collapse to it and adds only the
   mint on its documented 0-match None branch.
+- GraphitiBackend._mint_entity_node (task 5003): the unconditional mint
+  primitive — CREATE plus best-effort embedding, with no read, resolve or
+  collapse; its 0-match precondition is the caller's to establish.
 """
 from __future__ import annotations
 
@@ -27,6 +30,7 @@ from fused_memory.backends.graphiti_client import (
     AmbiguousEntityError,
     GraphitiBackend,
 )
+from fused_memory.utils.validation import PathShapedProjectIdError
 
 # ---------------------------------------------------------------------------
 # step-1/2: GraphitiBackend._identity_lock_for
@@ -681,6 +685,149 @@ class TestEnsureEntityNodeNoMerge:
         assert result == 'u-a'
         backend.merge_entities.assert_awaited_once_with('u-b', 'u-a', group_id='dark_factory')
         assert _create_calls(backend._test_graph) == []
+
+
+# ---------------------------------------------------------------------------
+# task 5003: GraphitiBackend._mint_entity_node — the unconditional mint primitive
+# ---------------------------------------------------------------------------
+
+_EXACT_NAME_READ = 'MATCH (n:Entity {name: $name})'
+
+
+class TestMintEntityNode:
+    """GraphitiBackend._mint_entity_node(name, *, group_id, summary='').
+
+    CREATEs one :Entity node and best-effort embeds its name — nothing else.
+    It performs no exact-name read, no resolve and no collapse: the caller
+    holds _identity_lock_for(group_id) and has already seen zero exact-name
+    matches under that hold, so a second read would only repeat the answer.
+    """
+
+    @pytest.fixture
+    def backend_with_mocks(self, mock_config, make_backend, make_graph_mock):
+        """Same shape as TestEnsureEntityNode's fixture. The read, collapse and
+        merge seams are AsyncMocks so assert_not_awaited is meaningful."""
+        backend = make_backend(mock_config)
+        graph = make_graph_mock([])
+        backend._driver._get_graph = MagicMock(return_value=graph)
+        backend.get_nodes_by_exact_name = AsyncMock(return_value=[])
+        backend.find_duplicate_entity_nodes = AsyncMock(return_value=[])
+        backend.merge_entities = AsyncMock()
+        backend.update_node_embedding = AsyncMock()
+        backend.client.embedder.create = AsyncMock(return_value=[0.1, 0.2, 0.3])
+        backend._test_graph = graph
+        return backend
+
+    @pytest.mark.asyncio
+    async def test_mints_one_entity_node_and_returns_its_uuid(self, backend_with_mocks):
+        backend = backend_with_mocks
+        result = await backend._mint_entity_node(
+            'dark_factory:2500', group_id='reify', summary='cross-project ref'
+        )
+        creates = _create_calls(backend._test_graph)
+        assert len(creates) == 1
+        params = extract_params(creates[0])
+        assert ':Entity' in extract_cypher(creates[0])
+        assert params['name'] == 'dark_factory:2500'
+        assert params['group_id'] == 'reify'
+        assert params['summary'] == 'cross-project ref'
+        assert params['created_at']
+        assert uuid.UUID(params['uuid'])
+        assert result == params['uuid']
+
+    @pytest.mark.asyncio
+    async def test_issues_no_exact_name_read_and_never_resolves_or_merges(
+        self, backend_with_mocks
+    ):
+        """The whole point of the primitive: the caller already read the name."""
+        backend = backend_with_mocks
+        await backend._mint_entity_node('dark_factory:2500', group_id='reify')
+        backend.get_nodes_by_exact_name.assert_not_awaited()
+        backend.find_duplicate_entity_nodes.assert_not_awaited()
+        backend.merge_entities.assert_not_awaited()
+        exact_name_reads = [
+            c for c in backend._test_graph.ro_query.call_args_list
+            if _EXACT_NAME_READ in extract_cypher(c)
+        ]
+        assert exact_name_reads == []
+
+    @pytest.mark.asyncio
+    async def test_mints_even_when_a_same_name_node_exists(self, backend_with_mocks):
+        """The 0-match precondition is the CALLER's to establish; the primitive
+        must not quietly re-introduce a read to check it."""
+        backend = backend_with_mocks
+        backend.get_nodes_by_exact_name.return_value = [
+            {'uuid': 'u-1', 'name': 'dark_factory:2500', 'summary': '', 'labels': []}
+        ]
+        await backend._mint_entity_node('dark_factory:2500', group_id='reify')
+        assert len(_create_calls(backend._test_graph)) == 1
+
+    @pytest.mark.asyncio
+    async def test_summary_defaults_to_empty_string(self, backend_with_mocks):
+        backend = backend_with_mocks
+        await backend._mint_entity_node('dark_factory:2500', group_id='reify')
+        assert extract_params(_create_calls(backend._test_graph)[0])['summary'] == ''
+
+    @pytest.mark.asyncio
+    async def test_created_at_is_a_utc_isoformat_string(self, backend_with_mocks):
+        backend = backend_with_mocks
+        await backend._mint_entity_node('dark_factory:2500', group_id='reify')
+        created_at = extract_params(_create_calls(backend._test_graph)[0])['created_at']
+        assert isinstance(created_at, str)
+        assert datetime.fromisoformat(created_at).utcoffset() == timedelta(0)
+
+    @pytest.mark.asyncio
+    async def test_regenerates_name_embedding_for_the_new_uuid(self, backend_with_mocks):
+        backend = backend_with_mocks
+        result = await backend._mint_entity_node('dark_factory:2500', group_id='reify')
+        backend.client.embedder.create.assert_awaited_once_with('dark_factory:2500')
+        backend.update_node_embedding.assert_awaited_once_with(
+            result, [0.1, 0.2, 0.3], group_id='reify'
+        )
+
+    @pytest.mark.asyncio
+    async def test_embedder_failure_is_swallowed(self, backend_with_mocks):
+        backend = backend_with_mocks
+        backend.client.embedder.create = AsyncMock(side_effect=RuntimeError('embedder down'))
+        result = await backend._mint_entity_node('dark_factory:2500', group_id='reify')
+        assert result == extract_params(_create_calls(backend._test_graph)[0])['uuid']
+        backend.update_node_embedding.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_embedding_write_failure_is_swallowed(self, backend_with_mocks):
+        backend = backend_with_mocks
+        backend.update_node_embedding = AsyncMock(side_effect=RuntimeError('write failed'))
+        result = await backend._mint_entity_node('dark_factory:2500', group_id='reify')
+        assert result == extract_params(_create_calls(backend._test_graph)[0])['uuid']
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        'exc_type', [asyncio.CancelledError, KeyboardInterrupt, SystemExit]
+    )
+    async def test_cancellation_during_embedding_propagates(
+        self, backend_with_mocks, exc_type
+    ):
+        backend = backend_with_mocks
+        backend.client.embedder.create = AsyncMock(side_effect=exc_type())
+        with pytest.raises(exc_type):
+            await backend._mint_entity_node('dark_factory:2500', group_id='reify')
+
+    @pytest.mark.asyncio
+    async def test_group_id_is_canonicalized(self, backend_with_mocks):
+        backend = backend_with_mocks
+        await backend._mint_entity_node('dark_factory:2500', group_id='Dark-Factory')
+        assert extract_params(_create_calls(backend._test_graph)[0])['group_id'] == 'dark_factory'
+        backend._driver._get_graph.assert_called_with('dark_factory')
+
+    @pytest.mark.asyncio
+    async def test_path_shaped_group_id_is_rejected_before_any_db_call(
+        self, backend_with_mocks
+    ):
+        backend = backend_with_mocks
+        with pytest.raises(PathShapedProjectIdError):
+            await backend._mint_entity_node('dark_factory:2500', group_id='-home-leo-src-x')
+        backend._test_graph.query.assert_not_awaited()
+        backend.client.embedder.create.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
