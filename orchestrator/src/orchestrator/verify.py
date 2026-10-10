@@ -1288,8 +1288,9 @@ _BASELINE_FAILING_IDS_CACHE: dict[str, tuple[float, frozenset[str]]] = {}
 # 3226).  Deliberately a PARALLEL dict rather than a widened
 # _BASELINE_FAILING_IDS_CACHE value tuple: that tuple's 2-element shape is
 # unpacked directly by callers and tests (see
-# orchestrator/tests/test_merge_queue_main_health.py), and seed_main_baseline
-# keeps its two-argument signature.
+# orchestrator/tests/test_merge_queue_main_health.py).  Both dicts are written
+# only by seed_main_baseline, so they always agree about which shas have a
+# baseline at all.
 #
 # WHY a second baseline at all: the failing baseline can only say "id X was
 # red on main".  Its ABSENCE is ambiguous — it conflates "main RAN X and it
@@ -1304,28 +1305,29 @@ _BASELINE_FAILING_IDS_CACHE: dict[str, tuple[float, frozenset[str]]] = {}
 _BASELINE_SKIPPED_IDS_CACHE: dict[str, tuple[float, frozenset[str]]] = {}
 
 
-def seed_main_baseline_skipped(main_sha: str, ids: Iterable[str]) -> None:
-    """Seed (or refresh) the per-main-SHA SKIPPED-id baseline cache.
-
-    Mirror of :func:`seed_main_baseline` for the skipped population, with the
-    same monotonic-timestamp value shape and the same
-    :data:`_PROBE_CACHE_TTL` discipline.  Seeded from the SAME bare-main probe
-    that seeds the failing side (see :func:`main_baseline_failing_ids`), so
-    the two caches always agree about which shas have been probed.
-    """
-    _BASELINE_SKIPPED_IDS_CACHE[main_sha] = (time.monotonic(), frozenset(ids))
-
-
-def seed_main_baseline(main_sha: str, ids: Iterable[str]) -> None:
-    """Seed (or refresh) the per-main-SHA failing-id baseline cache for free.
+def seed_main_baseline(
+    main_sha: str, ids: Iterable[str], *, skipped: Iterable[str] | None = (),
+) -> None:
+    """Seed (or refresh) BOTH per-main-SHA baselines — failing and skipped.
 
     Called from the PASS path of a merge+full gate run (merge_sha IS the
     merged tree that is about to CAS-advance to become the next main tip —
     see merge_queue.py's ``_run_post_merge_verify``), so in steady state
     ``main_baseline_failing_ids`` below is always a cache hit and never pays
-    for a probe (B2).
+    for a probe (B2); and from that function's own cold-start probe.
+
+    One call seeds both caches (task 3226) so they can never disagree about
+    which shas have a baseline: a cold skipped side beside a warm failing side
+    would make :func:`cached_main_baseline_skipped_ids` read "never probed"
+    and leave the skip-is-not-a-pass guard inert in steady state.  A
+    *skipped* of ``None`` (a result that collected no skipped ids) seeds the
+    EMPTY set, never "unseeded".  Callers pass *skipped* verbatim: a run
+    genuinely did skip those tests, whereas the pass path overrides *ids* to
+    empty because a passing run has no live failures (task 2590).
     """
-    _BASELINE_FAILING_IDS_CACHE[main_sha] = (time.monotonic(), frozenset(ids))
+    _now = time.monotonic()
+    _BASELINE_FAILING_IDS_CACHE[main_sha] = (_now, frozenset(ids))
+    _BASELINE_SKIPPED_IDS_CACHE[main_sha] = (_now, frozenset(skipped or ()))
 
 
 async def main_baseline_failing_ids(
@@ -1410,16 +1412,7 @@ async def main_baseline_failing_ids(
                 return None
 
             ids = frozenset(probe_result.failing_test_ids)
-            seed_main_baseline(main_sha, ids)
-            # Task 3226: the SAME probe seeds the parallel SKIPPED baseline.
-            # A skipped_test_ids of None (this probe collected a junit report
-            # — the B3 early return above already handled the no-junit case —
-            # but nothing was skipped, or an older result shape) seeds EMPTY
-            # rather than leaving the skipped side unseeded, so the two caches
-            # never disagree about which shas were probed at all.  Leaving it
-            # unseeded would make a cache-only peek read "main skipped
-            # nothing" as "main was never probed".
-            seed_main_baseline_skipped(main_sha, probe_result.skipped_test_ids or ())
+            seed_main_baseline(main_sha, ids, skipped=probe_result.skipped_test_ids)
             return ids
 
     except EphemeralWorktreeError as e:
@@ -1481,6 +1474,61 @@ def cached_main_baseline_skipped_ids(main_sha: str) -> 'frozenset[str] | None':
     if time.monotonic() - _cached_at >= _PROBE_CACHE_TTL:
         return None
     return _cached_ids
+
+
+def ids_skipped_on_main(ids: Iterable[str], main_sha: str) -> frozenset[str]:
+    """The subset of *ids* that main *main_sha* SKIPPED — main never ran them.
+
+    A failing id in this subset is UNATTRIBUTABLE: its absence from main's
+    failing baseline is not evidence that the branch broke it.  Cache-only
+    (via :func:`cached_main_baseline_skipped_ids`), so it never probes on the
+    critical path (G4, task 2564); a cold skipped baseline yields the empty
+    set, which degrades every caller to its pre-3226 behaviour exactly.
+    """
+    return frozenset(ids) & (cached_main_baseline_skipped_ids(main_sha) or frozenset())
+
+
+SKIPPED_ON_MAIN_REASON_CLAUSE = (
+    'test(s) SKIPPED on main (main never ran them — not evidence of a branch fault)'
+)
+
+
+def describe_new_failing_ids(new_ids: Iterable[str], main_sha: str) -> str:
+    """Word the failing ids absent from main's failing baseline for a block reason.
+
+    "Absent from main's failing baseline" covers two populations that must not
+    be counted together (task 3226): ids main RAN and passed — evidence the
+    branch broke them — and ids main SKIPPED (:func:`ids_skipped_on_main`),
+    which are named under :data:`SKIPPED_ON_MAIN_REASON_CLAUSE` but NOT
+    counted as new failures.  With no skipped id the wording is the pre-3226
+    one byte for byte.
+    """
+    skipped = ids_skipped_on_main(new_ids, main_sha)
+    genuinely_new = frozenset(new_ids) - skipped
+    clauses = []
+    if genuinely_new:
+        clauses.append(
+            f'{len(genuinely_new)} new failing test(s) not present on main: '
+            f"{', '.join(sorted(genuinely_new))}"
+        )
+    if skipped:
+        clauses.append(
+            f'{len(skipped)} {SKIPPED_ON_MAIN_REASON_CLAUSE}: '
+            f"{', '.join(sorted(skipped))}"
+        )
+    return '; plus '.join(clauses)
+
+
+def clear_main_probe_caches() -> None:
+    """Forget every process-wide main-probe verdict and per-main-SHA baseline.
+
+    The single reset for :data:`_PROBE_CACHE`, :data:`_BASELINE_FAILING_IDS_CACHE`
+    and :data:`_BASELINE_SKIPPED_IDS_CACHE`; a cache added beside them belongs
+    here too, so every caller that resets one resets all of them.
+    """
+    _PROBE_CACHE.clear()
+    _BASELINE_FAILING_IDS_CACHE.clear()
+    _BASELINE_SKIPPED_IDS_CACHE.clear()
 
 
 def _worst_category(categories: list[str]) -> str:
@@ -7975,9 +8023,8 @@ async def verify_failure_is_preexisting_on_main(
                 # (never a probing variant) so this costs nothing on the
                 # critical path (G4, task 2564); a cold skipped cache reads as
                 # an empty set and degrades to the pre-3226 verdict exactly.
-                _new_ids = diff_new_failures(branch_ids, baseline)
-                _unattributable = _new_ids & (
-                    cached_main_baseline_skipped_ids(main_sha) or frozenset()
+                _unattributable = ids_skipped_on_main(
+                    diff_new_failures(branch_ids, baseline), main_sha,
                 )
                 if _unattributable:
                     logger.warning(

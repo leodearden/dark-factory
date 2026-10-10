@@ -69,6 +69,17 @@ DIFFERENT_RESULT = VerifyResult(
 )
 
 
+def _seed_probe_verdict(failing: VerifyResult, verdict: bool) -> None:
+    """Pre-seed verify's signature-probe cache: *failing* on MAIN_SHA is *verdict*."""
+    import time as time_module
+
+    from orchestrator import verify as verify_module
+    from orchestrator.workflow import _normalize_cause_hint as _norm
+
+    key = (MAIN_SHA, failing.category or '', _norm(failing.cause_hint))
+    verify_module._PROBE_CACHE[key] = (time_module.monotonic(), verdict)
+
+
 def _make_config(tmp_path: Path) -> OrchestratorConfig:
     return OrchestratorConfig(
         project_root=tmp_path,
@@ -1884,10 +1895,7 @@ class TestPreexistingVerdictDowngradedByIsolatedRerun:
     def test_cache_hit_path_untouched(self, tmp_path: Path) -> None:
         """(step-7d) A pre-seeded _PROBE_CACHE True entry short-circuits to
         (True, MAIN_SHA) without running the probe or the gate."""
-        import time as time_module
-
         from orchestrator import verify as verify_module
-        from orchestrator.workflow import _normalize_cause_hint as _norm
 
         config = _make_config(tmp_path)
         worktree = tmp_path / 'task-wt'
@@ -1896,9 +1904,7 @@ class TestPreexistingVerdictDowngradedByIsolatedRerun:
         mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
         mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
 
-        _norm_hint = _norm(FAILING_RESULT.cause_hint)
-        _cache_key = (MAIN_SHA, FAILING_RESULT.category or '', _norm_hint)
-        verify_module._PROBE_CACHE[_cache_key] = (time_module.monotonic(), True)
+        _seed_probe_verdict(FAILING_RESULT, True)
 
         scoped_probe_mock = AsyncMock(return_value=PASSING_RESULT)
         isolated_rerun_mock = AsyncMock(return_value=PASSING_RESULT)
@@ -1930,32 +1936,23 @@ class TestPreexistingVerdictDowngradedByIsolatedRerun:
 #           _BASELINE_FAILING_IDS_CACHE value tuple: the 2-tuple shape is
 #           pinned by test_merge_queue_main_health.py's
 #           _BASELINE_FAILING_IDS_CACHE['abcsha'] unpack, and
-#           seed_main_baseline's 2-arg signature is pinned by every existing
-#           caller.  Both back-compat facts are asserted below so a future
-#           "just widen the tuple" refactor fails here first.
+#           seed_main_baseline's 2-arg call is pinned by every existing
+#           caller.
 # ---------------------------------------------------------------------------
 
 
 class TestMainBaselineSkippedIds:
-    """seed_main_baseline_skipped / cached_main_baseline_skipped_ids mirror the
-    failing-side pair, and ONE probe seeds BOTH sides so the two caches never
-    disagree about whether a given sha was probed at all."""
-
-    @pytest.fixture(autouse=True)
-    def _clear_both_caches(self):
-        from orchestrator import verify as verify_module
-        verify_module._BASELINE_FAILING_IDS_CACHE.clear()
-        verify_module._BASELINE_SKIPPED_IDS_CACHE.clear()
-        yield
-        verify_module._BASELINE_FAILING_IDS_CACHE.clear()
-        verify_module._BASELINE_SKIPPED_IDS_CACHE.clear()
+    """seed_main_baseline's *skipped* side and cached_main_baseline_skipped_ids
+    mirror the failing-side pair, and ONE seed — from the pass path or from a
+    probe — fills BOTH sides, so the two caches never disagree about whether a
+    given sha has a baseline at all."""
 
     def test_seed_then_cached_round_trips_a_frozenset(self) -> None:
-        """seed_main_baseline_skipped(sha, ids) -> cached_main_baseline_skipped_ids(sha)
+        """seed_main_baseline(sha, ..., skipped=ids) -> cached_main_baseline_skipped_ids(sha)
         returns exactly those ids as a frozenset."""
         from orchestrator import verify as verify_module
 
-        verify_module.seed_main_baseline_skipped(MAIN_SHA, ['t::a', 't::b', 't::a'])
+        verify_module.seed_main_baseline(MAIN_SHA, (), skipped=['t::a', 't::b', 't::a'])
 
         got = verify_module.cached_main_baseline_skipped_ids(MAIN_SHA)
         assert got == frozenset({'t::a', 't::b'}), f'expected the seeded ids; got {got!r}'
@@ -1971,25 +1968,23 @@ class TestMainBaselineSkippedIds:
         assert verify_module.cached_main_baseline_skipped_ids('neverseensha') is None
 
     def test_entry_older_than_ttl_returns_none(self, monkeypatch) -> None:
-        """An entry seeded more than _PROBE_CACHE_TTL ago is treated as absent,
-        matching the failing-side TTL discipline."""
+        """A long-stale entry is treated as absent, expiring together with the
+        failing side it was seeded beside."""
         import time as time_module
 
         from orchestrator import verify as verify_module
 
         base = time_module.monotonic()
         monkeypatch.setattr(verify_module.time, 'monotonic', lambda: base)
-        verify_module.seed_main_baseline_skipped(MAIN_SHA, ['t::stale'])
+        verify_module.seed_main_baseline(MAIN_SHA, ['t::fails'], skipped=['t::stale'])
         assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) == frozenset({'t::stale'})
 
-        # Advance past the TTL.
-        monkeypatch.setattr(
-            verify_module.time, 'monotonic',
-            lambda: base + verify_module._PROBE_CACHE_TTL + 1.0,
-        )
+        a_year_later = base + 365 * 24 * 3600.0
+        monkeypatch.setattr(verify_module.time, 'monotonic', lambda: a_year_later)
         assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) is None, (
-            'an entry older than _PROBE_CACHE_TTL must read as absent'
+            'a year-old skipped entry must read as absent'
         )
+        assert verify_module.cached_main_baseline_failing_ids(MAIN_SHA) is None
 
     def test_one_probe_seeds_both_caches(self, tmp_path: Path) -> None:
         """A single cache-miss probe of bare main seeds the failing AND the
@@ -2089,44 +2084,14 @@ class TestMainBaselineSkippedIds:
             'a degraded (B3) probe must not seed the skipped side either'
         )
 
-    def test_failing_cache_shape_stays_back_compat(self) -> None:
-        """BACK-COMPAT PIN — this is what forbids "just widen the value tuple".
-
-        ``verify._BASELINE_FAILING_IDS_CACHE[sha]`` must stay a 2-tuple
-        unpackable as ``_, ids = ...``: that exact unpack is performed
-        directly by test_merge_queue_main_health.py, so a widened value tuple
-        would break it.  The skipped population therefore has to live in a
-        PARALLEL dict, not a third slot here.
-
-        Arity back-compat needs no introspection and gets none: the
-        ``seed_main_baseline(MAIN_SHA, ['t::x'])`` call below is itself the
-        behavioural pin — it passes two positional arguments and would raise
-        ``TypeError`` if a third required parameter were ever added.  Every
-        real caller passes positionally too (main_baseline_failing_ids and
-        merge_queue's post-merge pass path), so PARAMETER NAMES are not part
-        of the contract and are deliberately not asserted: renaming ``ids``
-        is a pure refactor that must not redden this test.
-        """
+    def test_the_two_populations_stay_apart(self) -> None:
+        """One seed fills both sides without mixing them: the failing ids read
+        back only as failing, the skipped ids only as skipped.  The 2-arg call
+        is itself the arity pin — every pre-3226 caller seeds positionally."""
         from orchestrator import verify as verify_module
 
-        verify_module.seed_main_baseline(MAIN_SHA, ['t::x'])
-        entry = verify_module._BASELINE_FAILING_IDS_CACHE[MAIN_SHA]
-        assert isinstance(entry, tuple) and len(entry) == 2, (
-            f'_BASELINE_FAILING_IDS_CACHE values must stay 2-tuples; got {entry!r}'
-        )
-        _, ids = entry  # the exact unpack pinned by test_merge_queue_main_health.py
-        assert ids == frozenset({'t::x'})
+        verify_module.seed_main_baseline(MAIN_SHA, ['t::fails'], skipped=['t::skips'])
 
-    def test_the_two_caches_are_distinct_objects(self) -> None:
-        """The skipped baseline is a separate dict, not an alias — seeding one
-        side must not mutate the other."""
-        from orchestrator import verify as verify_module
-
-        verify_module.seed_main_baseline(MAIN_SHA, ['t::fails'])
-        verify_module.seed_main_baseline_skipped(MAIN_SHA, ['t::skips'])
-
-        assert verify_module._BASELINE_FAILING_IDS_CACHE is not \
-            verify_module._BASELINE_SKIPPED_IDS_CACHE
         assert verify_module.cached_main_baseline_failing_ids(MAIN_SHA) == frozenset({'t::fails'})
         assert verify_module.cached_main_baseline_skipped_ids(MAIN_SHA) == frozenset({'t::skips'})
 
@@ -2160,15 +2125,6 @@ class TestIdDiffFastPathSkippedOnMainGuard:
     CATEGORY = 'test_failure'
     CAUSE_HINT = 'AssertionError in t::x'
 
-    def _seed_probe_cache(self, verdict: bool) -> None:
-        import time as time_module
-
-        from orchestrator import verify as verify_module
-        from orchestrator.workflow import _normalize_cause_hint as _norm
-
-        key = (MAIN_SHA, self.CATEGORY, _norm(self.CAUSE_HINT))
-        verify_module._PROBE_CACHE[key] = (time_module.monotonic(), verdict)
-
     def _run(
         self,
         tmp_path: Path,
@@ -2186,9 +2142,7 @@ class TestIdDiffFastPathSkippedOnMainGuard:
         mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
         mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
 
-        verify_module.seed_main_baseline(MAIN_SHA, main_failing)
-        verify_module.seed_main_baseline_skipped(MAIN_SHA, main_skipped)
-        self._seed_probe_cache(signature_verdict)
+        verify_module.seed_main_baseline(MAIN_SHA, main_failing, skipped=main_skipped)
 
         failing_result = VerifyResult(
             passed=False, test_output='', lint_output='', type_output='',
@@ -2196,6 +2150,7 @@ class TestIdDiffFastPathSkippedOnMainGuard:
             cause_hint=self.CAUSE_HINT, category=self.CATEGORY,
             failing_test_ids=branch_ids,
         )
+        _seed_probe_verdict(failing_result, signature_verdict)
         # Would mint a probe worktree if the seeded _PROBE_CACHE entry were
         # somehow missed — asserted un-awaited so a real probe can't hide.
         legacy_probe_mock = AsyncMock(return_value=DIFFERENT_RESULT)
@@ -2281,56 +2236,5 @@ class TestIdDiffFastPathSkippedOnMainGuard:
         assert result == (True, MAIN_SHA), (
             'one unattributable id must invalidate the whole diff and defer to '
             f'the signature probe; got {result!r}'
-        )
-        legacy_probe_mock.assert_not_awaited()
-
-    def test_no_skipped_baseline_cached_behaves_as_today(self, tmp_path: Path) -> None:
-        """An UNSEEDED skipped baseline (cache-only peek returns None) must not
-        change anything: the guard is a cache-only refinement, never a probe,
-        so a cold skipped cache degrades to today's verdict.
-
-        NOT the normal state, and reading it as one is what let the step-19
-        defect ship.  A sha with a WARM failing cache and a COLD skipped one is
-        reachable only at cold start, on TTL expiry, or from a test (like this
-        one) that seeds a single side by hand — never in steady state.  Both
-        producers seed the two caches TOGETHER: ``main_baseline_failing_ids``
-        seeds both from one probe, and merge_queue's post-merge pass path seeds
-        both inside one guard.  The steady-state path — the guard firing against
-        a MERGE-seeded rather than a hand-seeded baseline — is covered by
-        test_merge_queue_main_health.py::TestPostMergeVerifySeedsBaseline::
-        test_merge_seeded_baseline_arms_the_skipped_on_main_guard.  So this case
-        pins a genuine fail-safe degrade, NOT evidence that the guard is
-        expected to be inert.
-        """
-        from orchestrator import verify as verify_module
-
-        config = _make_config(tmp_path)
-        worktree = tmp_path / 'task-wt'
-        worktree.mkdir()
-        mock_git_ops = GitOps(config.git, config.project_root)
-        mock_git_ops.get_main_sha = AsyncMock(return_value=MAIN_SHA)  # type: ignore[method-assign]
-        mock_git_ops.worktree_base.mkdir(parents=True, exist_ok=True)
-
-        verify_module.seed_main_baseline(MAIN_SHA, frozenset())
-        # deliberately NOT seeding the skipped side
-        self._seed_probe_cache(True)
-
-        failing_result = VerifyResult(
-            passed=False, test_output='', lint_output='', type_output='',
-            summary='Failures: tests failed',
-            cause_hint=self.CAUSE_HINT, category=self.CATEGORY,
-            failing_test_ids=['t::whatever'],
-        )
-        legacy_probe_mock = AsyncMock(return_value=DIFFERENT_RESULT)
-
-        with patch.object(verify_module, 'run_scoped_verification', new=legacy_probe_mock):
-            result = asyncio.run(
-                verify_module.verify_failure_is_preexisting_on_main(
-                    worktree, config, [], ['src/foo.py'], failing_result, mock_git_ops,
-                )
-            )
-
-        assert result == (False, ''), (
-            f'a cold skipped cache must degrade to today behaviour; got {result!r}'
         )
         legacy_probe_mock.assert_not_awaited()

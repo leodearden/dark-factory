@@ -215,12 +215,11 @@ from orchestrator.verify import (
     VerifyResult,
     _derive_task_files_from_git,
     cached_main_baseline_failing_ids,
-    cached_main_baseline_skipped_ids,
+    describe_new_failing_ids,
     diff_new_failures,
     run_scoped_verification,
     run_verification,
     seed_main_baseline,
-    seed_main_baseline_skipped,
     verify_failure_is_preexisting_on_main,
 )
 from orchestrator.verify_categories import (
@@ -598,27 +597,6 @@ via MAIN_RED) until a non-trivial merge or an operator greens main. The gate
 logs a distinct WITHHELD warning so this edge is recognisable rather than read
 as routine main-red churn."""
 
-
-
-SKIPPED_ON_MAIN_REASON_CLAUSE = (
-    'test(s) SKIPPED on main (main never ran them — not evidence of a branch fault)'
-)
-"""Clause appended to a branch-block ``MergeOutcome.reason`` naming
-branch-failing test ids that main's SKIPPED baseline covers (task 3226).
-
-WHY the partition exists: the enrichment below cites "N new failing test(s)
-not present on main", where "not present on main" means "absent from main's
-FAILING baseline".  That is true of two categorically different populations —
-tests main RAN and passed (real evidence the branch broke them) and tests main
-NEVER RAN (evidence of nothing at all).  Counting them together overstates the
-branch's fault in the one artifact a human actually reads, and the 2026-07-29
-reify-allowlist incident is exactly that shape: a guard that SKIPPED on one
-side of a comparison and looked pass-shaped on the other.
-
-Ids under this clause are named, but explicitly NOT counted as new failures.
-Sourced from :func:`verify.cached_main_baseline_skipped_ids` — a CACHE-ONLY
-peek that never triggers a probe on the critical path (G4, task 2564); a cold
-skipped baseline degrades to the pre-3226 wording byte-identically."""
 
 MAIN_HEALTH_PROBE_PENDING_NOTE = (
     'provisional: an off-critical-path main-health probe is still checking '
@@ -3668,32 +3646,9 @@ async def _run_post_merge_verify(
                 if _cached_baseline is not None:
                     new_ids = diff_new_failures(verify.failing_test_ids, _cached_baseline)
         if new_ids:
-            # Task 3226: partition the new ids against main's SKIPPED baseline
-            # before counting any of them as a branch fault.  See
-            # SKIPPED_ON_MAIN_REASON_CLAUSE for the full rationale; CACHE-ONLY
-            # peek (never a probe, G4/task 2564) and a cold skipped baseline
-            # reads as an empty set, degrading to the pre-3226 wording exactly.
-            _skipped_baseline = (
-                cached_main_baseline_skipped_ids(_current_main_sha) or frozenset()
+            reason = 'Post-merge verification failed: ' + describe_new_failing_ids(
+                new_ids, _current_main_sha,
             )
-            skipped_on_main = new_ids & _skipped_baseline
-            genuinely_new = new_ids - skipped_on_main
-            _skipped_clause = (
-                f'{len(skipped_on_main)} {SKIPPED_ON_MAIN_REASON_CLAUSE}: '
-                f"{', '.join(sorted(skipped_on_main))}"
-            ) if skipped_on_main else ''
-            if genuinely_new:
-                reason = (
-                    f'Post-merge verification failed: {len(genuinely_new)} new failing '
-                    f"test(s) not present on main: {', '.join(sorted(genuinely_new))}"
-                )
-                if _skipped_clause:
-                    reason = f'{reason}; plus {_skipped_clause}'
-            else:
-                # Every new id was skipped on main — there is no genuinely-new
-                # failing test to claim, so the affirmative block wording would
-                # be a false statement.  Report only what is actually known.
-                reason = f'Post-merge verification failed: {_skipped_clause}'
         else:
             reason = f'Post-merge verification failed: {verify.summary}'
             # Append the failure category so the timeout-vs-real-failure
@@ -3915,29 +3870,7 @@ async def _run_post_merge_verify(
                 req.task_id, len(verify.failing_test_ids),
                 ', '.join(sorted(verify.failing_test_ids)), merge_sha,
             )
-        seed_main_baseline(merge_sha, frozenset())
-        # Task 3226 (step-19): seed the SKIPPED baseline from the SAME pass,
-        # inside the SAME guard, so the two caches keep agreeing about which
-        # shas have a baseline at all.  Without this the skipped cache is
-        # cold for every merge-seeded sha while the failing cache is warm,
-        # `cached_main_baseline_skipped_ids` returns None, and the whole
-        # skip-is-not-a-pass guard (verify_failure_is_preexisting_on_main's
-        # unattributable-id fall-through, and the branch-block reason
-        # partition above) is inert in steady state — a cold probe only runs
-        # at process start or after a TTL expiry.
-        #
-        # ASYMMETRY, deliberate: the failing side two lines up is overridden
-        # to the EMPTY set and never trusted verbatim (see the task-2590
-        # amendment comment above — verify.passed is True by construction
-        # here, so main has no live failures, and a rerun-plugin
-        # fail-then-pass would otherwise poison the baseline).  The skipped
-        # side is the opposite and IS trusted verbatim: a passing run
-        # genuinely did skip those tests, and there is no analogous way for a
-        # pass to fabricate a skip.  Overriding it to empty would recreate
-        # exactly the cold-skipped-cache no-op this seed exists to remove.
-        # `or ()` keeps the None-means-empty normalization identical to
-        # main_baseline_failing_ids' own seed call.
-        seed_main_baseline_skipped(merge_sha, verify.skipped_test_ids or ())
+        seed_main_baseline(merge_sha, frozenset(), skipped=verify.skipped_test_ids)
 
     return None
 
