@@ -6611,11 +6611,10 @@ class GitOps:
         and delta-touches sources against the base commit, so freshness never
         depends on lane history; ``--reset-in-place`` would refuse that target/.
 
-        **Cold-fallback path** (pool exhausted or seed failure — inv.6):
-            On any failure (pool exhausted, worktree creation failure, seed
-            failure) the partially-acquired lane (if any) is released back to
-            FREE and an ephemeral cold worktree is returned with warm=False.
-            Logs at DEBUG; never raises (a fallback cannot block the scheduler).
+        **Cold-fallback path** (inv.6: never raises, never blocks the scheduler):
+            Knob off or pool exhausted returns a cold worktree with warm=False,
+            logged at DEBUG.  A fault while holding a lane goes through
+            :meth:`_spec_lane_cold_fallback`, which logs at WARNING.
 
         Args:
             merge_commit: The merge commit SHA to check out in the spec lane.
@@ -6682,34 +6681,25 @@ class GitOps:
                         )
                         self.mark_pool_storage_present()
                     else:
-                        logger.warning(
-                            'acquire_spec_lane: create-once — pool storage '
-                            'absent/unmounted at %s — refusing to create spec '
-                            'lane %s on the underlying filesystem; cold fallback',
-                            self.worktree_base, lane,
-                        )
                         self._note_pool_storage_absent()
-                        await self.spec_warm_lane_pool.release(lane)
-                        wt = await self.create_throwaway_verify_worktree(merge_commit)
-                        return wt, False
+                        return await self._spec_lane_cold_fallback(
+                            lane, merge_commit,
+                            'create-once refused: pool storage absent/unmounted '
+                            f'at {self.worktree_base}',
+                        )
                 # Self-heal a stale unregistered directory first
                 # (mirrors reset_persistent_merge_worktree's self-heal pattern).
                 if lane.exists():
-                    import shutil as _shutil
-                    _shutil.rmtree(lane)
+                    shutil.rmtree(lane)
                 lane.parent.mkdir(parents=True, exist_ok=True)
                 rc, _, err = await _run(
                     ['git', 'worktree', 'add', '--detach', str(lane), merge_commit],
                     cwd=self.project_root,
                 )
                 if rc != 0:
-                    logger.warning(
-                        'acquire_spec_lane: worktree add failed for %s (rc=%d,'
-                        ' err=%r) — releasing lane, cold fallback', lane, rc, err,
+                    return await self._spec_lane_cold_fallback(
+                        lane, merge_commit, f'worktree add failed (rc={rc}, err={err!r})',
                     )
-                    await self.spec_warm_lane_pool.release(lane)
-                    wt = await self.create_throwaway_verify_worktree(merge_commit)
-                    return wt, False
                 logger.info(
                     'acquire_spec_lane: created %s (HEAD=%s)', lane, merge_commit[:8],
                 )
@@ -6721,24 +6711,16 @@ class GitOps:
                 cwd=lane,
             )
             if rc != 0:
-                logger.debug(
-                    'acquire_spec_lane: reset --hard failed for %s (rc=%d, err=%r)'
-                    ' — releasing lane, cold fallback', lane, rc, err,
+                return await self._spec_lane_cold_fallback(
+                    lane, merge_commit, f'reset --hard failed (rc={rc}, err={err!r})',
                 )
-                await self.spec_warm_lane_pool.release(lane)
-                wt = await self.create_throwaway_verify_worktree(merge_commit)
-                return wt, False
             ok, err = await self._clean_lane_retaining_artifacts(
                 lane, caller='acquire_spec_lane',
             )
             if not ok:
-                logger.debug(
-                    'acquire_spec_lane: git clean failed for %s (err=%r)'
-                    ' — releasing lane, cold fallback', lane, err,
+                return await self._spec_lane_cold_fallback(
+                    lane, merge_commit, f'git clean failed (err={err!r})',
                 )
-                await self.spec_warm_lane_pool.release(lane)
-                wt = await self.create_throwaway_verify_worktree(merge_commit)
-                return wt, False
             logger.info(
                 'acquire_spec_lane: reset %s to HEAD=%s', lane, merge_commit[:8],
             )
@@ -6746,17 +6728,22 @@ class GitOps:
         # ── inv.8: ALWAYS re-seed target/ from the current warm base ─────────
         rc = await self._seed_warm_lane(lane, '--fresh-checkout')
         if rc != 0:
-            # Seed failed — release the partially-acquired lane back to FREE
-            # (inv.6: cold fallback on seed failure, never block scheduler).
-            logger.debug(
-                'acquire_spec_lane: seed failed for %s (rc=%d) — releasing lane, cold fallback',
-                lane, rc,
+            return await self._spec_lane_cold_fallback(
+                lane, merge_commit, f'seed failed (rc={rc})',
             )
-            await self.spec_warm_lane_pool.release(lane)
-            wt = await self.create_throwaway_verify_worktree(merge_commit)
-            return wt, False
-
         return lane, True
+
+    async def _spec_lane_cold_fallback(
+        self, lane: Path, merge_commit: str, reason: str,
+    ) -> tuple[Path, bool]:
+        """Give an acquired ``_spec-`` lane back and verify cold instead (inv.6)."""
+        logger.warning(
+            'acquire_spec_lane: %s for %s — releasing lane; speculative verify '
+            'of %s runs COLD', reason, lane, merge_commit[:8],
+        )
+        assert self.spec_warm_lane_pool is not None
+        await self.spec_warm_lane_pool.release(lane)
+        return await self.create_throwaway_verify_worktree(merge_commit), False
 
     async def release_spec_lane(self, lane: Path, *, warm: bool) -> None:
         """Release a ``_spec-`` lane after a speculative merge verify.
