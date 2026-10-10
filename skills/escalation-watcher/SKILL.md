@@ -360,6 +360,28 @@ promoted. `member_ids` is the projection of the record's `members` list; the raw
 stays dropped, as does `detail` — the unbounded free-text field compact mode exists to keep out
 of your context.
 
+**Match `root_cause` keys in canonical form, never as raw strings.** The server folds a promote
+into the pending L2 whose `root_cause` canonicalises the same under
+`escalation.canonical.canonical_root_cause`. Run that helper over the rebuilt keys and your
+candidate rather than reimplementing it; why the drain carries no canonical field is recorded at
+`escalation/src/escalation/server.py::_COMPACT_ESCALATION_FIELDS`.
+
+```bash
+uv run --directory "$DARK_FACTORY_ROOT/escalation" python -c '
+import json, sys
+from escalation.canonical import canonical_root_cause
+print(json.dumps({key: canonical_root_cause(key) for key in json.load(sys.stdin)}, indent=1))
+' <<'JSON'
+["<root_cause of each pending L2>", "<the root_cause you are about to promote under>"]
+JSON
+```
+
+Keys that map to the same canonical form are one cluster. A near-duplicate you miss is not free:
+the server still folds it (no duplicate L2), but the fold records the new spelling as an amendment
+and a `root_cause` variant and bumps `updated_at`. That makes the L2's triage-ack stale (see
+"Reading a triage-ack annotation") and counts toward the over-fold alarm (see "Reading preserved
+framing"). An unexpected `status: 'updated'` from `promote_to_l2` means your match missed.
+
 Triage from that; fetch the full record with `get_escalation(id)` **only** for
 the one item you're about to act on (and when you do, read its `amendments` —
 see "Reading preserved framing" below) — and prefer doing that full read inside the handling sub-agent
