@@ -47,7 +47,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
-from nested_pytest_session import binding_conftest, run_nested_pytest  # noqa: E402
+from nested_pytest_session import (  # noqa: E402
+    NESTED_SESSION_TIMEOUT_SECS,
+    binding_conftest,
+    run_nested_pytest,
+)
 
 import df_pytest_isolation  # noqa: E402
 from df_pytest_isolation import (  # noqa: E402
@@ -1033,6 +1037,11 @@ class TestGuardIsLiveInThisRun:
 _LEAKER_NAME = 'restart-all-orchestrators.sh'
 _LEAKED_PIDFILE_NAME = 'leaked.pid'
 
+# A must-not-hang bound on a condition that normally holds within milliseconds,
+# derived to sit strictly below the outer cap so the nested test's own
+# diagnostic, not a TimeoutExpired, is what surfaces if the premise ever fails.
+_LEAKER_VISIBLE_CEILING_SECS = NESTED_SESSION_TIMEOUT_SECS // 4
+
 # 45s: long enough to still be alive at the nested session's teardown (~2-4s)
 # by a wide margin, short enough that a residue from a BROKEN guard expires on
 # its own rather than sitting on the box. The trailing statement keeps bash
@@ -1056,39 +1065,52 @@ exec bash "${{0%/*}}/{_LEAKER_NAME}"
 '''
 
 
+_LEAKING_TEST_BODY = '''\
+    proc = subprocess.Popen(
+        ["bash", str(SCRIPT)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True, env=dict(os.environ),
+    )
+    PIDFILE.write_text(str(proc.pid))
+    token = os.environ[LEAK_TOKEN_ENV]
+    deadline = time.monotonic() + VISIBLE_WITHIN_SECS
+    while proc.pid not in {pid for pid, _ in leaked_drain_processes(token)}:
+        assert proc.poll() is None and time.monotonic() < deadline, (
+            f'leaker pid {proc.pid} never became visible to the guard scan '
+            f'(returncode={proc.returncode})'
+        )
+        time.sleep(0.05)
+'''
+
+
 def _nested_test_source(*, leaks: bool, entrypoint: str = _LEAKER_NAME) -> str:
     """Source for the nested test module — which PASSES either way.
 
     The spawn mirrors both real spawners: ``dict(os.environ)`` for the child
     env, which is what hands it the NESTED session's token. That is also what
     keeps THIS session's guard blind to it — a different token — so the outer
-    run cannot fail on the leak its own test deliberately created.
+    run cannot fail on the leak its own test deliberately created. The leaking
+    test does not return until the guard's own scan can see its leaker, because
+    ``Popen`` returning does not mean ``/proc`` shows the new image yet.
     """
-    body = (
-        (
-            '    proc = subprocess.Popen(\n'
-            '        ["bash", str(SCRIPT)],\n'
-            '        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n'
-            '        start_new_session=True, env=dict(os.environ),\n'
-            '    )\n'
-            '    PIDFILE.write_text(str(proc.pid))\n'
-        )
-        if leaks
-        else '    pass\n'
-    )
     return (
         'import os\n'
         'import subprocess\n'
+        'import time\n'
         'from pathlib import Path\n'
+        '\n'
+        # Never the guard fixture itself: see _GUARD_NAME on shadowing.
+        'from df_pytest_isolation import LEAK_TOKEN_ENV, leaked_drain_processes\n'
         '\n'
         'HERE = Path(__file__).resolve().parent\n'
         f'SCRIPT = HERE / {entrypoint!r}\n'
         f'PIDFILE = HERE / {_LEAKED_PIDFILE_NAME!r}\n'
+        f'VISIBLE_WITHIN_SECS = {_LEAKER_VISIBLE_CEILING_SECS!r}\n'
         '\n'
         '\n'
         'def test_a_forgetful_spawner():\n'
         '    """PASSES. The damage is the surviving process, not this result."""\n'
-        + body
+        + (_LEAKING_TEST_BODY if leaks else '    pass\n')
     )
 
 
