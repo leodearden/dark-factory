@@ -361,6 +361,7 @@ from fused_memory.reconciliation.flag_record_contract import (
     canonical_flag_types,
     normalize_flag_record_metadata,
 )
+from fused_memory.reconciliation.flag_shape import contains_any_casefolded
 from fused_memory.reconciliation.flag_task_ids import task_id_components
 from fused_memory.reconciliation.internal_writers import is_internal_writer
 from fused_memory.reconciliation.recon_ledger import (
@@ -891,11 +892,7 @@ def _flag_type_in_grounds_family(flag_type: Any, grounds: Any) -> bool:
     """
     if not isinstance(flag_type, str) or not flag_type:
         return False
-    family = GROUNDS_TOKEN_FAMILIES.get(grounds)
-    if not family:
-        return False
-    folded = flag_type.casefold()
-    return any(stem.casefold() in folded for stem in family)
+    return contains_any_casefolded(flag_type, GROUNDS_TOKEN_FAMILIES.get(grounds) or ())
 
 
 @dataclass(frozen=True)
