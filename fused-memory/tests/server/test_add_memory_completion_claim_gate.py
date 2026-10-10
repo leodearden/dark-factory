@@ -251,6 +251,69 @@ class TestGateOrdering:
         )
 
 
+class TestNonAssertiveMoodIsNotTagged:
+    """Task 6677: phrasing that mentions a task's landing without asserting it
+    reaches the service untagged, files nothing and consults no authority."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ('content', 'ref'),
+        [
+            pytest.param(
+                '- esc-unverified-claim-5471-3: "#5471 owns the shipped Bool-balance '
+                '... examples" while 5471 was pending.',
+                '5471',
+                id='esc-unverified-claim-5471-4',
+            ),
+            pytest.param(
+                'Doing it BEFORE #7407 stamps the PRD SHIPPED is the correct order',
+                '7407',
+                id='esc-unverified-claim-7407-3',
+            ),
+            pytest.param(
+                "check #8246's status for whether it has landed)",
+                '8246',
+                id='esc-unverified-claim-8246-5',
+            ),
+            pytest.param(
+                '(3) PRD2 ε #5471 owns the shipped Bool-balance and stock-size '
+                'examples, so a new Bool exemplar here would duplicate it',
+                '5471',
+                id='esc-unverified-claim-5471-1',
+            ),
+        ],
+    )
+    async def test_non_assertive_phrasing_is_not_tagged(self, tmp_path, content, ref):
+        mock_service = _mock_service()
+        server, task_interceptor = _server(
+            mock_service, tmp_path, statuses={ref: 'in-progress'},
+        )
+
+        result = await _call(server, content=content)
+
+        assert 'error' not in result, f'{result!r}'
+        assert 'unverified_claim' not in mock_service.add_memory.call_args.kwargs
+        assert 'unverified_claim' not in result, f'{result!r}'
+        assert _pending_escalations(tmp_path) == []
+        task_interceptor.get_statuses.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_declarative_landing_is_still_tagged(self, tmp_path):
+        mock_service = _mock_service()
+        server, _ = _server(mock_service, tmp_path, statuses={'8246': 'in-progress'})
+
+        result = await _call(server, content='#8246 landed in abc123')
+
+        assert mock_service.add_memory.call_args.kwargs.get('unverified_claim') is True
+        claims = result.get('unverified_claim', {}).get('claims')
+        assert isinstance(claims, list) and len(claims) == 1, f'{result!r}'
+        entry = claims[0]
+        assert entry.get('ref') == '8246', f'{entry!r}'
+        assert entry.get('subject') == 'task', f'{entry!r}'
+        assert entry.get('status') == 'mismatch', f'{entry!r}'
+        assert entry.get('observed') == 'in-progress', f'{entry!r}'
+
+
 class TestBothServiceCallSitesCarryTheTag:
 
     @pytest.mark.asyncio
