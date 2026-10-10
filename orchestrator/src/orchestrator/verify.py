@@ -3181,19 +3181,8 @@ def _apply_cargo_scope(
         if old != new:
             logger.info('cargo scope (%s): %r -> %r', label, old, new)
 
-    return ModuleConfig(
-        prefix=mc.prefix,
-        test_command=new_test,
-        lint_command=new_lint,
-        type_check_command=new_type,
-        lock_depth=mc.lock_depth,
-        max_per_module=mc.max_per_module,
-        module_overrides=mc.module_overrides,
-        verify_command_timeout_secs=mc.verify_command_timeout_secs,
-        verify_cold_command_timeout_secs=mc.verify_cold_command_timeout_secs,
-        concurrent_verify=mc.concurrent_verify,
-        verify_env=mc.verify_env,
-        scope_cargo=mc.scope_cargo,
+    return replace(
+        mc, test_command=new_test, lint_command=new_lint, type_check_command=new_type,
     )
 
 
@@ -7709,14 +7698,7 @@ def _executed_module_configs_from_plan(
     ``None`` for a subproject with zero matching files: the caller must skip
     that subproject rather than run its full unscoped suite.
 
-    Uses ``dataclasses.replace`` (imported as ``replace``) rather than a
-    hand-listed ``ModuleConfig(...)`` reconstruction, so every other
-    ModuleConfig field — lock_depth, max_per_module, module_overrides,
-    verify_command_timeout_secs, verify_cold_command_timeout_secs,
-    concurrent_verify, verify_env, scope_cargo — survives onto the executed
-    config unchanged (the same pattern :func:`_apply_cargo_scope` already
-    uses), so ``run_verification``'s resolvers see identical per-module
-    overrides to what they'd have seen from *mc* directly.
+    Copies *mc* via ``dataclasses.replace`` so all non-command fields survive.
 
     Guard: a TRIVIAL *plan* (``derive_verify_plan``'s top-level "no
     .py/.rs file at all" short-circuit — a single run with

@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import logging
 import shlex
-from dataclasses import asdict, replace
+from dataclasses import asdict, fields, replace
 from pathlib import Path
 from typing import Any, Literal
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -818,41 +818,49 @@ class TestRunVerificationColdFirstUse:
         )
 
 
-def test_apply_cargo_scope_preserves_verify_cold_command_timeout_secs(tmp_path: Path):
-    """_apply_cargo_scope propagates verify_cold_command_timeout_secs to the rebuilt ModuleConfig.
-
-    Constructs a ModuleConfig with both warm and cold timeout values, forces the
-    cargo-scope rewrite path via mocked workspace discovery, and asserts the
-    returned ModuleConfig carries both timeout fields unchanged.
-    """
-    from unittest.mock import patch
-
-    from orchestrator.config import ModuleConfig
-    from orchestrator.verify import _apply_cargo_scope
+def test_apply_cargo_scope_preserves_every_non_command_field(tmp_path: Path):
+    """Cargo scoping rewrites only the three commands; every other ModuleConfig field survives."""
+    (tmp_path / 'Cargo.toml').write_text('[workspace]\nmembers = ["crates/*"]\n')
+    crate_dir = tmp_path / 'crates' / 'foo'
+    crate_dir.mkdir(parents=True)
+    (crate_dir / 'Cargo.toml').write_text('[package]\nname = "foo"\nversion = "0.1.0"\n')
 
     mc = ModuleConfig(
         prefix='crates',
         test_command='cargo test --workspace',
         lint_command='cargo clippy --workspace',
-        type_check_command=None,
+        type_check_command='cargo check --workspace',
+        lock_depth=3,
+        max_per_module=2,
+        module_overrides={'crates/foo': 1},
         verify_command_timeout_secs=2000.0,
         verify_cold_command_timeout_secs=6000.0,
+        concurrent_verify=False,
+        sequential_lint_first=True,
+        verify_env={'K': 'V'},
+        scope_cargo=True,
+    )
+    left_default = [f.name for f in fields(ModuleConfig) if getattr(mc, f.name) == f.default]
+    assert left_default == [], (
+        f'Every ModuleConfig field must be set to a non-default value here so a dropped '
+        f'field is observable; still at default: {left_default}'
     )
 
-    # Force the rewrite path: workspace has one crate, and the .rs file maps to it.
-    with (
-        patch('orchestrator.verify.discover_workspace_crates', return_value={'crates/foo': 'foo'}),
-        patch('orchestrator.verify.files_to_crates', return_value=['foo']),
-    ):
-        result = _apply_cargo_scope(
-            mc,
-            task_files=['crates/foo/src/lib.rs'],
-            project_root=tmp_path,
-            scope_cargo_enabled=True,
-        )
+    result = _apply_cargo_scope(
+        mc,
+        task_files=['crates/foo/src/lib.rs'],
+        project_root=tmp_path,
+        scope_cargo_enabled=True,
+    )
 
-    assert result.verify_command_timeout_secs == 2000.0
-    assert result.verify_cold_command_timeout_secs == 6000.0
+    assert result is not mc
+    assert result.test_command == 'cargo test -p foo'
+    command_fields = {'test_command', 'lint_command', 'type_check_command'}
+    differing = [
+        f.name for f in fields(ModuleConfig)
+        if f.name not in command_fields and getattr(result, f.name) != getattr(mc, f.name)
+    ]
+    assert differing == [], f'Non-command fields changed by cargo scoping: {differing}'
 
 
 class TestIsTestFile:
