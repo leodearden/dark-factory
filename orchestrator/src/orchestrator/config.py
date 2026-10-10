@@ -1344,10 +1344,16 @@ class SandboxConfig(BaseModel):
     """Filesystem sandbox configuration.
 
     ``backend`` selects the enforcement mechanism:
-    - ``auto`` (default): prefer landlock if available, else bwrap, else unsandboxed
-    - ``landlock``: kernel LSM; works in all namespaces. Requires kernel 5.13+
-    - ``bwrap``: bubblewrap + user namespace. Bun v1.3.13 crashes under this
-      on kernel 6.17; prefer landlock on affected hosts
+    - ``auto`` (default): prefer landlock if available, else bwrap; a sandboxed
+      role that resolves to neither is refused, not run unsandboxed
+      (``agents/sandbox_dispatch.py::resolve_backend_or_refuse``, PRD D4)
+    - ``landlock``: kernel LSM; works in all namespaces. Requires kernel 5.13+.
+      Validated on x86_64 only: its syscall numbers are hardcoded with no
+      architecture gate (``agents/landlock.py::SYS_landlock_create_ruleset``).
+      The fleet's posture: ``docs/sandbox-fleet-status.md``
+    - ``bwrap``: bubblewrap + user namespace; legacy passthrough (PRD D10).
+      Bun v1.3.13 crashes under this on kernel 6.17; prefer landlock on
+      affected hosts
     - ``none``: explicit opt-out — run unsandboxed (same effect as ``enabled: false``)
     """
 
