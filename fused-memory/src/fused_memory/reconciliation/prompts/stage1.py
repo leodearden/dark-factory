@@ -3,6 +3,7 @@
 import json
 
 from fused_memory.memory_metadata import render_metadata_vocabulary_guidance
+from fused_memory.models.reconciliation import FindingSeverity
 from fused_memory.reconciliation.consolidation_gate import (
     render_consolidation_gate_section,
 )
@@ -1015,19 +1016,19 @@ lifecycle; the rules below say how to confirm it.
 
 **For any task with a LIVE row in `### Live-Workflow Signals` (any row not reading \
 `{NOT_LIVE_TOKEN}`), do NOT emit a stranded-work or blocked-escalation flag** (e.g. `flag_type='task_blocked_stale_escalations'`) **at \
-`severity='moderate'` with `actionable=true`.** A task under an active live pipeline is \
-mid-flight, not stranded — asserting a moderate/actionable disposition for it contradicts \
+`severity='{FindingSeverity.moderate}'` with `actionable=true`.** A task under an active live pipeline is \
+mid-flight, not stranded — asserting a {FindingSeverity.moderate}/actionable disposition for it contradicts \
 Stage 2's own Live-Workflow Authority policy (task 1655) and produces two contradictory \
 disposition markers for the same `task_id`+`flag_type` in a single reconciliation cycle.
 
 Instead, for a task with a live row, do one of:
-1. **Downgrade** the flag to `severity='info'` and `actionable=false`, or
+1. **Downgrade** the flag to `severity='{FindingSeverity.minor}'` and `actionable=false`, or
 2. **Annotate** the flag's description with "pending Stage 2 live-workflow confirmation" \
    and leave the final disposition to Stage 2, which has direct access to live scheduler \
    state.
 
 Either remediation is acceptable; what is NOT acceptable is emitting the flag at \
-`severity='moderate'` with `actionable=true` as though the task were genuinely stranded.
+`severity='{FindingSeverity.moderate}'` with `actionable=true` as though the task were genuinely stranded.
 
 **Only treat a stranded / blocked-escalation flag as fully actionable when NO live signal \
 is present** — i.e., the task has no live row in `### Live-Workflow Signals`, or \
@@ -1055,7 +1056,7 @@ verdicts on this exact question; read each row's prose. Use this scroll rather t
 `search`, whose top-N cutoff can drop the one row that matters.
 
 If either names the task as a preserved / validation specimen, do NOT recommend a status \
-reset, a redispatch, or an operator gate task. Emit the finding at `severity='info'` with \
+reset, a redispatch, or an operator gate task. Emit the finding at `severity='{FindingSeverity.minor}'` with \
 `actionable=false`, or omit it, and say in the description which citation you read.
 
 **The deterministic gate is enforced in code** by \

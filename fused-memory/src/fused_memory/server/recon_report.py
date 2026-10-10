@@ -22,7 +22,11 @@ from typing import Any, Literal
 
 from graphiti_core.errors import EdgeNotFoundError
 
-from fused_memory.models.reconciliation import StageId
+from fused_memory.models.reconciliation import (
+    FINDING_SEVERITY_SET,
+    FINDING_SEVERITY_VALUES,
+    StageId,
+)
 from fused_memory.reconciliation import citation_repair
 from fused_memory.services.memory_service import MemoryNotFoundError
 from fused_memory.utils.validation import is_full_uuid
@@ -284,10 +288,9 @@ def _apply_cross_project_routing_guard(finding: dict) -> dict:
 
 # Generous cap: legitimate findings never come close to this; only
 # pathological input (e.g. a runaway agent dumping a huge blob into
-# description/suggested_action/category) is ever capped.  severity is
-# intentionally NOT capped: it is expected to be a short enum-like label
-# (e.g. 'low'/'moderate'/'high'), not open-ended free text, so it does not
-# carry the same pathological-length risk as the three free-text fields.
+# description/suggested_action/category) is ever capped.  severity is not
+# capped because it is not free text: add_finding rejects any value outside
+# FINDING_SEVERITY_SET, so a length cap on it would be moot.
 _MAX_FINDING_TEXT_CHARS = 10_000
 _TRUNCATION_MARKER = '…[truncated]'
 # Cap on description/suggested_action inside a cite_task fold's purge record
@@ -569,6 +572,22 @@ def _unknown_stage_error(stage: str, known: frozenset[str]) -> dict[str, Any]:
         'error_type': 'ReconReportUnknownStage',
         'stage': stage,
         'known_stages': sorted(known),
+    }
+
+
+def _invalid_severity_error(severity: str) -> dict[str, Any]:
+    """Build the invalid_severity error dict; the listed vocabulary lets a
+    confused caller self-correct from the response alone."""
+    return {
+        'error': 'invalid_severity',
+        'error_type': 'ReconReportInvalidSeverity',
+        'severity': severity,
+        'known_severities': list(FINDING_SEVERITY_VALUES),
+        'hint': (
+            f'severity must be one of {", ".join(FINDING_SEVERITY_VALUES)}. '
+            'A finding that is present but not automatically fixable is '
+            'expressed with actionable=false, not with a lower severity.'
+        ),
     }
 
 
@@ -1425,9 +1444,16 @@ class ReconReportState:
         10_000-char cap — revisit only if the cap is ever tightened.
         ``category`` is capped alongside description/suggested_action
         because it is free text supplied by the calling agent and is
-        surfaced verbatim in the assembled report; ``severity`` is left
-        unbounded as it is expected to be a short enum-like label (see the
-        module-level comment above ``_MAX_FINDING_TEXT_CHARS``).
+        surfaced verbatim in the assembled report; ``severity`` is not capped
+        because it is a closed vocabulary, checked below.
+
+        ``severity`` is the closed ``FindingSeverity`` vocabulary; any other
+        value fails the WHOLE call with ``invalid_severity`` (see
+        :func:`_invalid_severity_error`) and mutates nothing.  "Present but
+        not automatically fixable" is ``actionable=False``, never a lower
+        severity.  Ordering against the other guards and legacy hydration:
+        tests/server/test_recon_report.py::TestAddFindingSeverityIsValidated,
+        tests/server/test_recon_report_store.py::TestLegacySeverityHydrates.
 
         ``supersedes`` (task-4653) names the finding_id of an EARLIER finding
         in this run that the new one makes historical; on success the TARGET's
@@ -1509,6 +1535,16 @@ class ReconReportState:
                 entry.stage,
             )
             return _ERR_ALREADY_COMPLETED.copy()
+
+        if severity not in FINDING_SEVERITY_SET:
+            logger.warning(
+                'recon_report: add_finding severity=%r is not a finding severity for '
+                'run_id=%r stage=%r; rejected',
+                severity,
+                run_id,
+                entry.stage,
+            )
+            return _invalid_severity_error(severity)
 
         # task-4653 validate-early: resolve the supersession target BEFORE any
         # truncation, dedup or allocation work, so an unresolvable target fails
@@ -3645,6 +3681,12 @@ def create_recon_report_server(state: ReconReportState):  # -> FastMCP
         one, since retiring an earlier stage's claim is its whole purpose.
         A supersedes that does not resolve in this run fails the WHOLE call
         with finding_unknown — nothing is filed.
+
+        severity is a closed vocabulary; any other value fails the WHOLE call
+        with {error: invalid_severity, severity, known_severities, hint}, whose
+        known_severities lists the legal values — nothing is filed.  To say a
+        finding is present but not automatically fixable, pass
+        actionable=false; there is no lower severity for it.
         """
         return state.add_finding(
             run_id=run_id,

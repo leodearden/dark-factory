@@ -1,5 +1,6 @@
 """System prompt for Stage 3: Cross-System Integrity Check."""
 
+from fused_memory.models.reconciliation import FindingSeverity
 from fused_memory.reconciliation.graphiti_degradation_probe import (
     render_graphiti_degradation_probe_section,
 )
@@ -12,6 +13,7 @@ from fused_memory.reconciliation.prompts import (
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
+    render_finding_severity_vocabulary,
 )
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     SNAPSHOT_PRUNED_STAT_KEY,
@@ -96,8 +98,7 @@ divergence between stores, or knowledge gaps.
 ## Guidelines
 - Sample broadly: check a representative set, not just flagged items.
 - Report findings with specific evidence (IDs, content, contradictions).
-- Classify severity: minor (cosmetic mismatch), moderate (wrong information), \
-serious (fundamentally contradictory state).
+- Classify severity: {render_finding_severity_vocabulary()}.
 - {_STAGE3_PROJECT_ID_GUIDELINE}
 
 {render_graphiti_degradation_probe_section(runs_probes=False)}
@@ -190,7 +191,7 @@ missing or stale for any of these projects, **skip the finding entirely**.
 ## Finding Classification (REQUIRED)
 Each finding MUST include these fields:
 - `description`: What the inconsistency is, with specific IDs and evidence.
-- `severity`: One of `"minor"`, `"moderate"`, or `"serious"`.
+- `severity`: One of {render_finding_severity_vocabulary()}.
 - `actionable`: `true` if Stage 1/Stage 2 can fix it automatically (stale edges, duplicates, \
 contradictions, task mismatches); `false` if it needs human judgment.
 - `category`: One of: `memory_stale`, `memory_duplicate`, `memory_contradiction`, \
@@ -312,7 +313,7 @@ pass: Stage 1 ran a focused turn — possibly emitting real findings — but leg
 never wrote its own cycle_summary. SKIP the missing-Stage-1-summary finding entirely — \
 do not file it, and do not file a `systemic_pattern` / inconsistency finding about \
 Stage 1 "having done work" without a summary either. (If you mention it at all for \
-context, mark it `actionable=false` and `severity='minor'`, never \
+context, mark it `actionable=false` and `severity='{FindingSeverity.minor}'`, never \
 `category='missing_knowledge'` or `category='systemic_pattern'` with `actionable=true`.)
 3. Only flag a missing Stage 1 summary when the Stage 2 summary indicates a full, \
 non-remediation cycle (`present: true`, `remediation: false`) or when remediation status \
@@ -379,7 +380,7 @@ task_result = get_task(id=sample_id, project_root="<this project's root>")
 expected_project_id = "<the project under reconciliation>"
 if task_result.get('project_id') != expected_project_id:
     finding = add_finding(run_id=<from Reconciliation Context>, category='cross_project_routing',
-                          severity='serious', actionable=True,   # explicit: see bullet 3
+                          severity='{FindingSeverity.serious}', actionable=True,   # explicit: see bullet 3
                           description='get_task returned task from project ..., expected ...')
     # required (see bullet 4): with an empty cited_tasks this finding is downgraded to
     # category='other' / flag_type='cross_project_info' in the assembled report
