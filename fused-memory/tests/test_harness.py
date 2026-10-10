@@ -11411,6 +11411,66 @@ async def test_known_project_roots_wins_over_event_payload_in_backlog_iterator(
     )
 
 
+def _one_event_per_chunk_assembler(memory_service, taskmaster, config, project_root=''):
+    """A ContextAssembler stand-in whose every chunk is the oldest peeked event."""
+    inst = MagicMock()
+
+    async def assemble(peeked, watermark, project_id):
+        if not peeked:
+            return AssembledPayload(events=[])
+        return AssembledPayload(events=[peeked[0]], events_remaining=len(peeked) - 1)
+
+    inst.assemble = assemble
+    return inst
+
+
+def _first_stage_completes_once_then(harness, later_run) -> None:
+    """Stage 1 completes its first run and behaves as *later_run* afterwards."""
+    first_run = harness.stages[0].run
+    calls = 0
+
+    async def run(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return await (first_run if calls == 1 else later_run)(*args, **kwargs)
+
+    harness.stages[0].run = run
+
+
+@pytest.mark.asyncio
+async def test_backlog_iterator_chunk_failure_restores_only_the_failing_chunk(
+    journal, event_buffer, mock_memory_service, tmp_path,
+):
+    """Task 6453: a failed chunk re-buffers only its own event, attributed at
+    drain, and leaves the earlier completed chunk's event drained."""
+    harness, esc_queue = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    _first_stage_completes_once_then(
+        harness, _raising_stage_run(lambda: RuntimeError('chunk 2 exploded')),
+    )
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+    drain_spy = AsyncMock(side_effect=event_buffer.drain_by_ids)
+    event_buffer.drain_by_ids = drain_spy
+
+    with patch(
+        'fused_memory.reconciliation.context_assembler.ContextAssembler',
+        side_effect=_one_event_per_chunk_assembler,
+    ):
+        await BacklogIterator(
+            harness.config, harness.journal, harness.buffer, harness,
+        ).run('test-project')
+
+    failed_chunk, completed_chunk = await journal.get_recent_runs('test-project')
+    assert completed_chunk.status == 'completed'
+    assert failed_chunk.status == 'failed'
+    assert len(await event_buffer.get_drained_events('test-project', completed_chunk.id)) == 1
+    assert await event_buffer.count_buffered('test-project') == 2
+    assert [e for e in esc_queue.get_pending() if e.category == 'recon_backlog_overflow']
+    assert failed_chunk.id in {c.kwargs.get('run_id') for c in drain_spy.await_args_list}
+
+
 # ── Tests for Task 2040: bound BacklogIterator with a cumulative budget ────
 
 
