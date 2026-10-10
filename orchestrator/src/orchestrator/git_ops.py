@@ -6598,17 +6598,18 @@ class GitOps:
 
         **Create-once path** (lane not yet a registered worktree):
             ``git worktree add --detach <lane> <merge_commit>``, then seed via
-            :meth:`_seed_warm_lane(lane, '--reset-in-place')`.
+            :meth:`_seed_warm_lane(lane, '--fresh-checkout')`.
 
         **Reset-in-place path** (lane already registered):
             ``git reset --hard <merge_commit>`` + ONE ``git clean -xfd -e <dir>``
             invocation (one -e per :attr:`~GitConfig.reap_build_artifact_dirs`
             entry) mirroring :meth:`reset_persistent_merge_worktree`'s pattern,
-            then always re-seeded via :meth:`_seed_warm_lane(lane, '--reset-in-place')`.
+            then always re-seeded via :meth:`_seed_warm_lane(lane, '--fresh-checkout')`.
 
-        **inv.8 always-re-seed-at-acquire**: target/ is re-CoW-seeded from the
-        current warm base on every acquire, so each speculative verify starts
-        from the latest base regardless of which lane it lands on.
+        **inv.8 always-re-seed-at-acquire**: every acquire re-seeds with
+        ``--fresh-checkout`` (reify PRD D10), which replaces the retained target/
+        and delta-touches sources against the base commit, so freshness never
+        depends on lane history; ``--reset-in-place`` would refuse that target/.
 
         **Cold-fallback path** (pool exhausted or seed failure — inv.6):
             On any failure (pool exhausted, worktree creation failure, seed
@@ -6743,7 +6744,7 @@ class GitOps:
             )
 
         # ── inv.8: ALWAYS re-seed target/ from the current warm base ─────────
-        rc = await self._seed_warm_lane(lane, '--reset-in-place')
+        rc = await self._seed_warm_lane(lane, '--fresh-checkout')
         if rc != 0:
             # Seed failed — release the partially-acquired lane back to FREE
             # (inv.6: cold fallback on seed failure, never block scheduler).
@@ -6762,9 +6763,8 @@ class GitOps:
 
         **Warm path** (``warm=True`` — pool lane):
             ``await self.spec_warm_lane_pool.release(lane)`` — flips
-            ASSIGNED→FREE retaining the worktree and ``target/`` on disk so
-            the next :meth:`acquire_spec_lane` can re-seed from a warm base
-            (CoW-cheap, harmless to retain).  The worktree is never removed.
+            ASSIGNED→FREE, never removing the worktree; its retained ``target/``
+            is harmless, since the next acquire's ``--fresh-checkout`` replaces it.
 
         **Cold path** (``warm=False`` — ephemeral fallback worktree):
             ``await self.cleanup_merge_worktree(lane)`` — removes the
