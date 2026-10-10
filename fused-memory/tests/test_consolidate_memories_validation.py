@@ -21,6 +21,8 @@ Two properties are load-bearing here and pinned as such:
 
 import pytest
 
+from fused_memory.config.schema import ConsolidationAutoConfig
+from fused_memory.models.enums import MemoryCategory
 from fused_memory.server.consolidation import (
     ProposalLimits,
     validate_consolidate_args,
@@ -335,15 +337,17 @@ def _propose(**overrides):
 
     The proposal shape carries no `canonical_content` (task gamma's tool has
     not written one yet — it is proposing that the cluster be consolidated at
-    all) and no delete arm, so `supersedes` and `run_id` stay absent.
+    all) and no delete arm, so `supersedes` stays absent. `run_id` is present:
+    it is the proposal's ledger identity, not a tombstone attribution.
     """
     kwargs = {
         'canonical_content': None,
         'topic': _TOPIC,
         'supersedes': None,
         'retain': _ids(5),
-        'run_id': None,
+        'run_id': 'run-1',
         'claim': _OK,
+        'category': 'procedural_knowledge',
         'limits': _LIMITS,
     }
     kwargs.update(overrides)
@@ -552,7 +556,7 @@ class TestProposalArm:
 
         assert err is not None
         assert str(count) in err['error']
-        assert 'retain' in err['error']
+        assert 'member_ids' in err['error']
 
     @pytest.mark.parametrize('count', [2, 20])
     def test_the_member_count_bounds_are_inclusive(self, count):
@@ -574,14 +578,16 @@ class TestProposalArm:
         """PRD C1's reason for checking at the emit boundary: the LLM fixes its
         shape IN-TURN, which it can only do if one refusal names every fault."""
         claim = 'INDEX\n' + 'x' * 300
-        err, _, _ = _propose(claim=claim, retain=_ids(1))
+        err, _, _ = _propose(claim=claim, retain=_ids(1), category='facts')
 
         assert err is not None
         assert 'single line' in err['error'], err['error']
         assert str(_LIMITS.claim_max_chars) in err['error'], err['error']
         assert 'INDEX' in err['error'], err['error']
         assert '8' in err['error'], err['error']
-        assert 'retain' in err['error'], err['error']
+        assert 'member_ids' in err['error'], err['error']
+        assert "category" in err['error'], err['error']
+        assert "'facts'" in err['error'], err['error']
 
     def test_the_hint_names_the_shape_rules(self):
         """PRD D3: the emitting stage needs something actionable, not just a
@@ -591,3 +597,122 @@ class TestProposalArm:
         assert err is not None
         assert err['hint']
         assert 'claim' in err['hint']
+
+
+class TestProposalCategory:
+    """A proposal names the category its canonical is written under (PRD C1)."""
+
+    @pytest.mark.parametrize('bad', ['facts', 'Procedural_Knowledge', None, 3])
+    def test_a_category_outside_the_six_is_refused_by_name(self, bad):
+        err, _, _ = _propose(category=bad)
+
+        assert err is not None
+        assert err['error_type'] == 'ValidationError'
+        assert 'category' in err['error']
+        assert repr(bad) in err['error']
+
+    @pytest.mark.parametrize('category', [c.value for c in MemoryCategory])
+    def test_each_of_the_six_categories_passes(self, category):
+        err, _, _ = _propose(category=category)
+
+        assert err is None, err
+
+    def test_the_hint_names_the_six_categories(self):
+        err, _, _ = _propose(category='facts')
+
+        assert err is not None
+        for category in MemoryCategory:
+            assert category.value in err['hint']
+
+
+class TestProposalRunId:
+    """`run_id` is a component of the proposal row's ledger identity, so a
+    proposal without one has nowhere to land."""
+
+    @pytest.mark.parametrize('missing', [None, '', '   ', 7])
+    def test_a_proposal_without_a_run_id_is_refused(self, missing):
+        err, _, _ = _propose(run_id=missing)
+
+        assert err is not None
+        assert err['error_type'] == 'ValidationError'
+        assert 'run_id' in err['error']
+        assert 'run_id' in err['hint']
+
+
+class TestOpArmRefusesACategory:
+    """The fail-closed mirror of the claim-without-limits rule."""
+
+    def test_a_category_without_limits_is_refused_by_name(self):
+        err, _, _ = _call(category='procedural_knowledge')
+
+        assert err is not None
+        assert err['error_type'] == 'ValidationError'
+        assert 'category' in err['error']
+        assert 'limits' in err['error']
+
+    def test_an_explicit_none_category_is_indistinguishable_from_omitting_it(self):
+        assert _call(category=None) == _call()
+        assert _call(category=None, topic='bad_topic') == _call(topic='bad_topic')
+
+
+class TestProposalArmSpeaksItsOwnVocabulary:
+    """A proposal's caller passed `member_ids` to `propose_consolidation`; an
+    error naming `retain` and `consolidate_memories` describes an interface
+    that caller never saw."""
+
+    def test_the_error_is_prefixed_with_the_proposal_tool(self):
+        err, _, _ = _propose(topic='memory_consolidation')
+
+        assert err is not None
+        assert err['error'].startswith('propose_consolidation: ')
+
+    def test_the_op_arm_prefix_is_unchanged(self):
+        err, _, _ = _call(topic='memory_consolidation')
+
+        assert err is not None
+        assert err['error'].startswith('consolidate_memories: ')
+
+    def test_a_malformed_member_is_named_by_its_member_ids_slot(self):
+        members = _ids(5)
+        members[2] = '873889a1'
+        err, _, _ = _propose(retain=members)
+
+        assert err is not None
+        assert "member_ids[2] is not a full 36-character UUID: '873889a1'" in err['error']
+        assert 'retain' not in err['error']
+        assert 'retain' not in err['hint']
+
+    def test_a_repeated_member_names_both_member_ids_slots(self):
+        members = _ids(4)
+        members.append(members[1])
+        err, _, _ = _propose(retain=members)
+
+        assert err is not None
+        assert 'member_ids[4] repeats member_ids[1]' in err['error']
+        assert 'retain' not in err['error']
+        assert 'retain' not in err['hint']
+
+    def test_the_count_problem_names_member_ids(self):
+        err, _, _ = _propose(retain=_ids(1))
+
+        assert err is not None
+        assert 'member_ids' in err['error']
+        assert 'retain' not in err['error']
+        assert 'retain' not in err['hint']
+
+    @pytest.mark.parametrize('empty', [None, []])
+    def test_an_empty_member_list_reports_the_count_not_the_op_arm_rule(self, empty):
+        err, _, _ = _propose(retain=empty)
+
+        assert err is not None
+        assert '0 members' in err['error']
+        assert 'member_ids' in err['error']
+        assert 'requires at least one arm' not in err['error']
+        assert 'add_memory' not in err['hint']
+
+
+def test_proposal_limits_from_config_maps_the_three_leaves():
+    """The ONE place the config -> limits mapping lives (gamma and delta share it)."""
+    config = ConsolidationAutoConfig(claim_max_chars=150, member_min=3, member_max=9)
+
+    assert ProposalLimits.from_config(config) == ProposalLimits(150, 3, 9)
