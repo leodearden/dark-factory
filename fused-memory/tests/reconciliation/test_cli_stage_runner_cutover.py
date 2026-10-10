@@ -356,6 +356,32 @@ class TestReconConfigDirHelpers:
         # No dir created — GC must be a silent no-op (ignore_errors), never raise.
         gc_run_config_dir(tmp_path, 'never-created')
 
+    def test_run_config_dir_path_matches_task_config_dir_path(self, tmp_path):
+        """The pure derivation names exactly the dir ``TaskConfigDir`` builds."""
+        from shared.config_dir import TaskConfigDir
+
+        from fused_memory.reconciliation.cli_stage_runner import (
+            recon_config_base_dir,
+            run_config_dir_path,
+        )
+
+        run_id = 'run-abc123'
+        cfg = TaskConfigDir(task_id=run_id, base_dir=recon_config_base_dir(tmp_path))
+        assert run_config_dir_path(tmp_path, run_id) == cfg.path
+
+    def test_run_config_dir_path_does_not_create_anything(self, tmp_path):
+        """Deriving the path is a read: a probe must not resurrect the dir."""
+        from fused_memory.reconciliation.cli_stage_runner import (
+            recon_config_base_dir,
+            run_config_dir_path,
+        )
+
+        path = run_config_dir_path(tmp_path, 'never-created')
+
+        assert not path.exists()
+        assert not recon_config_base_dir(tmp_path).exists()
+        assert list(tmp_path.iterdir()) == []
+
     def test_recon_config_base_dir_absolutizes_a_relative_data_dir(
         self, tmp_path, monkeypatch
     ):
