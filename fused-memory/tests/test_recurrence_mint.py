@@ -625,6 +625,7 @@ async def test_rerunning_the_sweep_does_not_double_mint(interceptor, backend, ro
     await _done_without_mint(backend, pid, root)
     await interceptor.remint_broken_recurrence_chains(root)
     count_after_repair = len(await _all_tasks(backend, root))
+    caplog.clear()
 
     with caplog.at_level(logging.INFO, logger=MINT_LOGGER):
         outcomes = await interceptor.remint_broken_recurrence_chains(root)

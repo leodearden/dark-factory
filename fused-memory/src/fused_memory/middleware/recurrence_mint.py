@@ -4,7 +4,8 @@ docs/prds/recurring-deterministic-tasks.md R-D2/R-D3: completing a carrier
 link ``done`` mints exactly one pending successor (C-3), never while another
 non-terminal link of the same chain exists (C-2), firing ``interval_secs``
 after the predecessor's persisted terminal time (C-6). A mint failure is
-logged and never fails the status write that triggered it.
+logged, never fails the status write that triggered it, and is repaired by
+the re-mint sweep.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any
 
+from shared.recurrence_chains import current_links, recurrence_key
 from shared.task_metadata import Recurrence
 from shared.task_statuses import ACTIVE, TaskStatus
 
@@ -26,10 +28,14 @@ from fused_memory.middleware.deterministic_task_guard import deterministic_task_
 
 __all__ = [
     'RECURRENCE_MINT_SOURCE',
+    'BrokenChain',
     'MintOutcome',
     'MintOutcomeKind',
+    'MintTrigger',
+    'broken_chains',
     'mint_successor',
     'mints_successor',
+    'remint_broken_chain',
 ]
 
 logger = logging.getLogger(__name__)
@@ -48,6 +54,20 @@ class MintOutcome:
     kind: MintOutcomeKind
     successor_id: str | None = None
     detail: str | None = None
+
+
+class MintTrigger(StrEnum):
+    DONE_WRITE = 'done_write'
+    REMINT_SWEEP = 'remint_sweep'
+
+
+@dataclass(frozen=True)
+class BrokenChain:
+    """A chain whose current link *link_id* is done, with no live link of *key* in *tag*."""
+
+    key: str
+    tag: str
+    link_id: str
 
 
 @dataclass(frozen=True)
@@ -127,7 +147,7 @@ async def _existing_link_id(
 ) -> str | None:
     active = await tm.get_tasks(project_root, tag, statuses=sorted(s.value for s in ACTIVE))
     for task in active['tasks']:
-        if _recurrence_of(task).get('key') == key:
+        if recurrence_key(task) == key:
             return str(task['id'])
     return None
 
@@ -213,3 +233,44 @@ async def mint_successor(
         raise
     except Exception as exc:
         return _failed(predecessor_id, predecessor, f'{type(exc).__name__}: {exc}', exc_info=True)
+
+
+async def broken_chains(tm: TaskBackendProtocol, project_root: str) -> tuple[BrokenChain, ...]:
+    """Every chain in *project_root*, across all tags, whose current link is done.
+
+    A done current link means its mint failed or never ran (a crash between
+    the done write and the mint). Read-only and lock-free: each repair
+    re-checks C-2 under the write lock.
+    """
+    broken: list[BrokenChain] = []
+    for tag in await tm.list_tags(project_root):
+        rows = (await tm.get_tasks(project_root, tag))['tasks']
+        broken.extend(
+            BrokenChain(key=key, tag=tag, link_id=str(link['id']))
+            for key, link in current_links(rows).items()
+            if link['status'] == TaskStatus.DONE
+        )
+    return tuple(broken)
+
+
+async def remint_broken_chain(
+    tm: TaskBackendProtocol,
+    *,
+    write_lock: asyncio.Lock,
+    chain: BrokenChain,
+    project_root: str,
+) -> MintOutcome:
+    """Mint *chain*'s missing successor through :func:`mint_successor`, logging each repair."""
+    outcome = await mint_successor(
+        tm,
+        write_lock=write_lock,
+        predecessor_id=chain.link_id,
+        project_root=project_root,
+        tag=chain.tag,
+    )
+    if outcome.kind is MintOutcomeKind.MINTED:
+        logger.warning(
+            'recurrence_remint: predecessor=%s key=%s successor=%s project_root=%s tag=%s',
+            chain.link_id, chain.key, outcome.successor_id, project_root, chain.tag,
+        )
+    return outcome
