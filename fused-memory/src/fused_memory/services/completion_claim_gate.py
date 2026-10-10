@@ -296,6 +296,31 @@ def _blank(match: re.Match[str]) -> str:
     return ' ' * len(match.group(0))
 
 
+# A double-quoted span is a MENTION of someone's words, not the writer's own
+# assertion. Pairing is sequential within one line; a span opened right after
+# '=' or ':' is a key/value literal and still asserts. Pinned by
+# tests/test_completion_claim_mood.py::TestQuotationsAreMentions.
+_QUOTATION_RE: re.Pattern[str] = re.compile(r'"[^"\n]*"|“[^”\n]*”')
+_KEY_VALUE_OPENERS: frozenset[str] = frozenset('=:')
+
+
+def _blank_quotations(text: str) -> str:
+    """*text* with every quotation span blanked, offsets preserved.
+
+    Text level, not per clause: a quotation can straddle a clause boundary
+    (the '...' inside the esc-unverified-claim-5471-4 quote), leaving the
+    clause that holds the marker with no closing quote of its own.
+    """
+
+    def blank_unless_key_value(match: re.Match[str]) -> str:
+        opener_lead = text[match.start() - 1:match.start()]
+        if opener_lead in _KEY_VALUE_OPENERS:
+            return match.group(0)
+        return _blank(match)
+
+    return _QUOTATION_RE.sub(blank_unless_key_value, text)
+
+
 def _strip_exemptions(clause: str) -> str:
     """Blank out negated-terminal and future/aspirational spans in *clause*.
 
@@ -370,6 +395,7 @@ def extract_completion_claims(
 
     claims: list[CompletionClaim] = []
     seen: set[tuple[str, str, str, str | None]] = set()
+    assertive = _blank_quotations(text)
 
     for clause, offset in _iter_clauses(text):
         mentions = _ref_mentions(
@@ -380,7 +406,8 @@ def extract_completion_claims(
         if not mentions:
             continue
         span = (offset, offset + len(clause))
-        for marker in _marker_spans(_strip_exemptions(clause)):
+        assertive_clause = assertive[span[0]:span[1]]
+        for marker in _marker_spans(_strip_exemptions(assertive_clause)):
             bound = _bind_marker(clause, marker, mentions, known_project_ids)
             if bound is None:
                 continue
