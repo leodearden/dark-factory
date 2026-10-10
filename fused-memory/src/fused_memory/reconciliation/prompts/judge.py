@@ -91,13 +91,8 @@ misbehaviour.
 fused-memory MCP server whenever a write operation executes. The stats in stage reports \
 (e.g., memories consolidated, tasks updated) reflect actual work performed via these MCP calls.
 
-**Journal Entries** may be empty for CLI-executed stages. This is expected — CLI stages log \
-their mutations through the MCP server (captured as MCP Actions), not through the journal_entries \
-table. Empty journal entries with non-zero MCP actions is normal, not a contradiction.
-
 When evaluating a run, cross-reference stage report stats against MCP Actions to verify \
-consistency. Do NOT flag a run as contradictory simply because journal entries are empty \
-while stats show mutations were performed.
+consistency.
 
 **Write counters count writes that LANDED, not writes that were accepted.** A write can be \
 accepted at enqueue and still never reach the backend, because the durable queue retries it \
@@ -142,7 +137,6 @@ Respond with a JSON object:
   "severity": "ok|minor|moderate|serious",
   "findings": [
     {
-      "entry_id": "journal entry ID",
       "issue": "description of the problem",
       "severity": "ok|minor|moderate|serious",
       "recommendation": "what should be done"
