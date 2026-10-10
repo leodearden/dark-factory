@@ -794,6 +794,16 @@ def _committed(name: str) -> Any:
     return json.loads((CALIBRATION / name).read_text(encoding='utf-8'))
 
 
+def _line_prefix_sha256s(path: Path) -> set[str]:
+    """The digest of every line prefix: the verdict corpus is only appended to, so μ's pin is one of them."""
+    digest = hashlib.sha256()
+    prefixes = {digest.hexdigest()}
+    for line in path.read_bytes().splitlines(keepends=True):
+        digest.update(line)
+        prefixes.add(digest.hexdigest())
+    return prefixes
+
+
 def test_committed_best_config_is_the_committed_matrix_winner() -> None:
     mod = _mod()
     matrix = _committed(MATRIX_NAME)
@@ -813,7 +823,7 @@ def test_committed_best_config_is_the_committed_matrix_winner() -> None:
     assert matrix['inputs']['population_sha256'] == _sha256(
         CALIBRATION / 'write_triage_population.json',
     )
-    assert matrix['inputs']['verdicts_sha256'] == _sha256(
+    assert matrix['inputs']['verdicts_sha256'] in _line_prefix_sha256s(
         CALIBRATION / 'write_triage_pair_verdicts.jsonl',
     )
 
