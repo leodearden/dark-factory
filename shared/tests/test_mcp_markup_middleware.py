@@ -70,6 +70,7 @@ from fastmcp.exceptions import ToolError
 from shared.boundary_storm_escape import BoundaryStormEscape
 from shared.mcp_markup_middleware import (
     _ATTRIBUTION_AXIS_MAXLEN,
+    MARKUP_RECURRENCE_ROUTING,
     MarkupGuardMiddleware,
     RepairPolicy,
     _bounded_axis,
@@ -2684,7 +2685,8 @@ class TestB10StormEscape:
         — which is DONE and CLOSED to appends, so a reader sent there reports
         it nowhere. Same correction commit e0ea6e3fe9 already made to the
         ``_markup_gate`` ERROR line and commit 2b38fd89a2 made across
-        ``markup_tripwire.py``.
+        ``markup_tripwire.py``. The routing sentence now has a single home,
+        ``MARKUP_RECURRENCE_ROUTING``, so it cannot drift again (task 5698).
         """
         clock = _Clock()
         h = self._harness(RepairPolicy.FORWARD_REPAIR, clock)
@@ -2711,6 +2713,10 @@ class TestB10StormEscape:
         for line in storm_lines:
             assert 'toolcall-markup-containment-prd.md' in line, (
                 f'must name the live owner, not the closed predecessor: {line!r}'
+            )
+            assert MARKUP_RECURRENCE_ROUTING in line, (
+                f'the storm line must carry the ONE shared routing sentence, '
+                f'not a local copy: {line!r}'
             )
 
     # -- the rate limit, and the window ------------------------------------
