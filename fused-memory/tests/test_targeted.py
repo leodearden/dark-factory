@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import pytest_asyncio
 from _flag_for_stage2_pool_fake import LiveFlagPool
-from _fm_helpers import make_8df8_scenario, pydantic_spec
+from _fm_helpers import complete_paged_read, make_8df8_scenario, pydantic_spec
 from _git_root_helper import make_git_root
 
 from fused_memory.config.schema import FusedMemoryConfig, ReconciliationConfig
@@ -7601,3 +7601,163 @@ class TestOnTaskDoneFlagRetirementIsIdempotent:
         for call in pool.add_memory.await_args_list:
             assert _VICTIM_ID not in repr(call)
             assert _VICTIM_CONTENT not in repr(call)
+
+
+class TestStaleStatusSnapshotTransitionTrigger:
+    """A done/cancelled/deferred transition retires the task's stale snapshots now.
+
+    A latency complement to Stage 1's periodic sweep (task 4851): the same
+    rules over a read narrowed to the facts naming the task, judged against
+    the LIVE status rather than the transition payload.
+    """
+
+    _SWEPT = 'stale_status_snapshot_edges_swept'
+
+    @staticmethod
+    def _wire(mock_memory_service, mock_taskmaster, fact, status):
+        mock_memory_service.graphiti.enumerate_valid_edges_mentioning = AsyncMock(
+            return_value=(
+                {'ent': [{'uuid': 'edge-1', 'fact': fact, 'name': ''}]},
+                complete_paged_read(rows_seen=1),
+            ),
+        )
+        mock_memory_service.update_edge = AsyncMock()
+        mock_taskmaster.get_statuses = AsyncMock(return_value={'1': status})
+
+    @staticmethod
+    async def _reconcile(reconciler, transition, task_id='1'):
+        return await reconciler.reconcile_task(
+            task_id=task_id, transition=transition, project_id='test-project',
+            project_root='/tmp/test',
+            task_before={'id': task_id, 'title': 'Test', 'status': 'in-progress'},
+        )
+
+    @staticmethod
+    def _actions_of(result, action_type):
+        return [a for a in result.get('actions', []) if a['type'] == action_type]
+
+    @staticmethod
+    def _invalidated_uuids(mock_memory_service):
+        return [c.args[0] for c in mock_memory_service.update_edge.await_args_list if c.args]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('transition', ['done', 'cancelled'])
+    async def test_terminal_transition_retires_the_task_snapshot(
+        self, reconciler, mock_memory_service, mock_taskmaster, transition,
+    ):
+        self._wire(
+            mock_memory_service, mock_taskmaster,
+            'Task 1 is an active pending task', transition,
+        )
+
+        result = await self._reconcile(reconciler, transition)
+
+        mock_memory_service.graphiti.enumerate_valid_edges_mentioning.assert_awaited_once_with(
+            '1', group_id='test-project',
+        )
+        assert self._invalidated_uuids(mock_memory_service) == ['edge-1']
+        swept = self._actions_of(result, self._SWEPT)
+        assert len(swept) == 1, f'got actions {result.get("actions")!r}'
+        assert swept[0]['invalidated'] == 1
+        assert swept[0]['candidate_edges'] == 1
+        assert swept[0]['errors'] == 0
+
+    @pytest.mark.asyncio
+    async def test_deferred_transition_retires_a_blocked_assertion(
+        self, reconciler, mock_memory_service, mock_taskmaster,
+    ):
+        self._wire(mock_memory_service, mock_taskmaster, 'Task 1 is blocked.', 'deferred')
+
+        result = await self._reconcile(reconciler, 'deferred')
+
+        assert self._invalidated_uuids(mock_memory_service) == ['edge-1']
+        swept = self._actions_of(result, self._SWEPT)
+        assert len(swept) == 1
+        assert swept[0]['invalidated'] == 1
+
+    @pytest.mark.asyncio
+    async def test_blocked_transition_does_not_sweep(
+        self, reconciler, mock_memory_service, mock_taskmaster,
+    ):
+        """'blocked' contradicts no snapshot about the task, so nothing is read."""
+        self._wire(mock_memory_service, mock_taskmaster, 'Task 1 is blocked.', 'blocked')
+
+        result = await self._reconcile(reconciler, 'blocked')
+
+        mock_memory_service.graphiti.enumerate_valid_edges_mentioning.assert_not_awaited()
+        assert self._actions_of(result, self._SWEPT) == []
+
+    @pytest.mark.asyncio
+    async def test_non_integer_task_id_is_skipped_and_says_so(
+        self, reconciler, mock_memory_service, mock_taskmaster,
+    ):
+        """Snapshot ids are ints by construction, so a subtask id cannot match."""
+        self._wire(
+            mock_memory_service, mock_taskmaster,
+            'Task 1 is an active pending task', 'done',
+        )
+
+        result = await self._reconcile(reconciler, 'done', task_id='15.2')
+
+        mock_memory_service.graphiti.enumerate_valid_edges_mentioning.assert_not_awaited()
+        assert self._actions_of(result, self._SWEPT) == []
+        assert self._actions_of(result, 'stale_status_snapshot_sweep_skipped') == [
+            {'type': 'stale_status_snapshot_sweep_skipped', 'reason': 'non_integer_task_id'},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_an_active_full_cycle_owns_the_sweep(
+        self, reconciler, mock_memory_service, mock_taskmaster, mock_event_buffer,
+    ):
+        """Racing Stage 1's own sweep could double-write a superseding fact."""
+        self._wire(
+            mock_memory_service, mock_taskmaster,
+            'Task 1 is an active pending task', 'done',
+        )
+        mock_event_buffer.is_full_recon_active = AsyncMock(return_value=True)
+
+        result = await self._reconcile(reconciler, 'done')
+
+        mock_memory_service.graphiti.enumerate_valid_edges_mentioning.assert_not_awaited()
+        assert self._actions_of(result, 'stale_status_snapshot_sweep_deferred_to_cycle') == [
+            {'type': 'stale_status_snapshot_sweep_deferred_to_cycle'},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_failing_read_never_fails_the_transition(
+        self, reconciler, mock_memory_service, mock_taskmaster,
+    ):
+        self._wire(
+            mock_memory_service, mock_taskmaster,
+            'Task 1 is an active pending task', 'done',
+        )
+        mock_memory_service.graphiti.enumerate_valid_edges_mentioning = AsyncMock(
+            side_effect=RuntimeError('falkordb down'),
+        )
+
+        result = await self._reconcile(reconciler, 'done')
+
+        assert 'error' not in result, f'got {result!r}'
+        assert self._actions_of(result, 'knowledge_captured_fast')
+        swept = self._actions_of(result, self._SWEPT)
+        assert len(swept) == 1
+        assert swept[0]['errors'] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_sweep_is_journaled(
+        self, reconciler, mock_memory_service, mock_taskmaster, journal,
+    ):
+        self._wire(
+            mock_memory_service, mock_taskmaster,
+            'Task 1 is an active pending task', 'done',
+        )
+
+        await self._reconcile(reconciler, 'done')
+
+        rows = await _journal_rows(
+            journal, 'write', 'graphiti', 'invalidate_stale_status_snapshots',
+        )
+        assert len(rows) == 1, f'got {rows!r}'
+        assert rows[0]['detail']['task_id'] == '1'
+        assert rows[0]['detail']['invalidated'] == 1
+        assert rows[0]['detail']['candidate_edges'] == 1
