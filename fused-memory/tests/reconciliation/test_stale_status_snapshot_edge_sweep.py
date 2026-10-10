@@ -61,6 +61,7 @@ from fused_memory.reconciliation.stale_status_snapshot_edge_sweep import (
     flatten_dedup_edges,
     select_stale_status_snapshot_edges,
     sweep_stale_status_snapshot_edges,
+    sweep_stale_status_snapshot_edges_for_task,
 )
 
 # The pinned shape corpora live in a plain data module so task 3949's
@@ -4077,3 +4078,216 @@ class TestSweepStaleStatusSnapshotEdgesEnumerationCompleteness:
         assert empirical['enumeration_complete'] is False
         assert structural['enumeration_complete'] is False
         assert unread['enumeration_complete'] is None
+
+
+# --------------------------------------------------------------------------- #
+# sweep_stale_status_snapshot_edges_for_task — the per-task sweep (task 4851)
+# --------------------------------------------------------------------------- #
+
+
+def _make_memory_service_mentioning(edges, paged=None) -> MagicMock:
+    """A memory service whose NARROWED read returns *edges*.
+
+    The full-corpus read keeps its default stub, so a test can assert it was
+    never awaited.
+    """
+    memory_service = _make_memory_service()
+    memory_service.graphiti.enumerate_valid_edges_mentioning = AsyncMock(
+        return_value=(
+            {'entity-a': edges},
+            paged if paged is not None else complete_paged_read(rows_seen=len(edges)),
+        ),
+    )
+    return memory_service
+
+
+def _edge(uuid: str, fact: str) -> dict:
+    return {'uuid': uuid, 'fact': fact, 'name': ''}
+
+
+class TestSweepStaleStatusSnapshotEdgesForTask:
+    """The same rules as the periodic sweep, over a narrowed read. (task 4851)"""
+
+    NOW = datetime(2026, 10, 10, 12, 0, tzinfo=UTC)
+    NOISE_EDGES = [
+        _edge('e-1420', 'Task 1420 is pending'),
+        _edge('e-noise', 'The 142 retries were pending review'),
+    ]
+
+    async def _sweep(self, memory_service, taskmaster, task_id):
+        return await sweep_stale_status_snapshot_edges_for_task(
+            memory_service, taskmaster, 'test_project', '/tmp/reify', task_id,
+            run_id='run-4851', now=self.NOW,
+        )
+
+    @staticmethod
+    def _taskmaster_saying(statuses: dict[str, str]) -> MagicMock:
+        taskmaster = _make_taskmaster()
+        taskmaster.get_statuses = AsyncMock(return_value=statuses)
+        return taskmaster
+
+    @pytest.mark.asyncio
+    async def test_reads_only_the_narrowed_population(self):
+        """HOT PATH: one narrowed read, never the whole-graph enumeration."""
+        memory_service = _make_memory_service_mentioning(
+            [_edge('e-142', 'Task 142 is an active pending task')],
+        )
+
+        await self._sweep(memory_service, self._taskmaster_saying({'142': 'done'}), 142)
+
+        memory_service.graphiti.enumerate_valid_edges_mentioning.assert_awaited_once_with(
+            '142', group_id='test_project',
+        )
+        memory_service.graphiti.enumerate_all_valid_edges.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_substring_superset_is_post_filtered_to_the_task(self):
+        """'1420' and a bare '142' match the needle but do not name task 142."""
+        memory_service = _make_memory_service_mentioning(
+            [_edge('e-142', 'Task 142 is an active pending task'), *self.NOISE_EDGES],
+        )
+        taskmaster = self._taskmaster_saying({'142': 'done', '1420': 'done'})
+
+        stats = await self._sweep(memory_service, taskmaster, 142)
+
+        memory_service.update_edge.assert_awaited_once()
+        assert memory_service.update_edge.await_args is not None
+        assert memory_service.update_edge.await_args.args[0] == 'e-142'
+        taskmaster.get_statuses.assert_awaited_once_with('/tmp/reify', ids=['142'])
+        assert stats['scanned'] == 3
+        assert stats['candidate_edges'] == 1
+        assert stats['invalidated'] == 1
+
+    @pytest.mark.asyncio
+    async def test_an_aggregate_naming_the_task_is_judged_on_all_its_ids(self):
+        """Exactly the periodic sweep's judgement: a sibling id may retire it."""
+        memory_service = _make_memory_service_mentioning(
+            [_edge('e-agg', 'Tasks 142 and 1030 are pending')],
+        )
+        taskmaster = self._taskmaster_saying({'142': 'pending', '1030': 'done'})
+
+        stats = await self._sweep(memory_service, taskmaster, 142)
+
+        taskmaster.get_statuses.assert_awaited_once_with('/tmp/reify', ids=['1030', '142'])
+        assert stats['invalidated'] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_blocked_rule_retires_and_supersedes_through_this_path(self):
+        memory_service = _make_memory_service_mentioning(
+            [_edge('e-2848', 'Task 2848 remains blocked as of 2026-07-22')],
+        )
+
+        stats = await self._sweep(
+            memory_service, self._taskmaster_saying({'2848': 'deferred'}), 2848,
+        )
+
+        assert stats['invalidated'] == 1
+        assert stats['superseded'] == 1
+        memory_service.add_memory.assert_awaited_once()
+        assert memory_service.add_memory.await_args is not None
+        assert memory_service.add_memory.await_args.kwargs['content'] == (
+            build_supersede_fact(2848, 'deferred', self.NOW)
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_uncontradicted_live_status_retires_nothing(self):
+        memory_service = _make_memory_service_mentioning(
+            [_edge('e-142', 'Task 142 is pending')],
+        )
+
+        stats = await self._sweep(
+            memory_service, self._taskmaster_saying({'142': 'pending'}), 142,
+        )
+
+        memory_service.update_edge.assert_not_awaited()
+        assert stats['candidate_edges'] == 0
+        assert stats['invalidated'] == 0
+        assert stats['errors'] == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('noise', [False, True], ids=['no-edges', 'only-noise'])
+    async def test_no_edge_naming_the_task_skips_the_status_read(self, noise):
+        edges = list(self.NOISE_EDGES) if noise else []
+        memory_service = _make_memory_service_mentioning(edges)
+        taskmaster = self._taskmaster_saying({'1420': 'done'})
+
+        stats = await self._sweep(memory_service, taskmaster, 142)
+
+        taskmaster.get_statuses.assert_not_awaited()
+        memory_service.update_edge.assert_not_awaited()
+        assert stats['scanned'] == len(edges)
+        for key in ('candidate_edges', 'invalidated', 'errors', 'superseded'):
+            assert stats[key] == 0, f'{key} should be 0, got {stats!r}'
+
+    @pytest.mark.asyncio
+    async def test_a_failing_narrowed_read_is_swallowed_and_counted(self):
+        memory_service = _make_memory_service()
+        memory_service.graphiti.enumerate_valid_edges_mentioning = AsyncMock(
+            side_effect=RuntimeError('falkordb down'),
+        )
+        taskmaster = self._taskmaster_saying({'142': 'done'})
+
+        stats = await self._sweep(memory_service, taskmaster, 142)
+
+        assert stats['errors'] == 1
+        assert stats['enumeration_complete'] is None
+        taskmaster.get_statuses.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('kind', sorted(INCOMPLETE_STRUCTURAL_KINDS))
+    async def test_a_structurally_incomplete_narrowed_read_aborts_like_the_periodic_one(
+        self, kind,
+    ):
+        memory_service = _make_memory_service_mentioning(
+            [_edge('e-142', 'Task 142 is an active pending task')],
+            paged=incomplete_paged_read(kind, rows_seen=1, expected_rows=9999),
+        )
+
+        stats = await self._sweep(
+            memory_service, self._taskmaster_saying({'142': 'done'}), 142,
+        )
+
+        assert stats['errors'] == 1
+        assert stats['enumeration_complete'] is False
+        assert stats['enumeration_incomplete_kind'] == kind
+        memory_service.update_edge.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_returns_the_same_stats_keys_as_the_periodic_sweep(self):
+        periodic = await sweep_stale_status_snapshot_edges(
+            _make_memory_service(), _make_taskmaster(), 'test_project', '/tmp/reify',
+            run_id='run-4851',
+        )
+        per_task = await self._sweep(
+            _make_memory_service_mentioning([]), _make_taskmaster(), 142,
+        )
+
+        assert per_task.keys() == periodic.keys()
+
+    @pytest.mark.asyncio
+    async def test_extraction_runs_exactly_once_per_edge_read(self):
+        """LIVENESS twin of test_extraction_runs_exactly_once_per_edge.
+
+        The post-filter must reuse the single by-class extraction, so every
+        edge READ enters the extraction pipeline exactly once, whether it is
+        kept or filtered out.
+        """
+        facts = [
+            CountingStr('Task 142 is an active pending task'),
+            CountingStr('Tasks 142 and 1030 are blocked'),
+            CountingStr('Task 1420 is pending'),
+        ]
+        memory_service = _make_memory_service_mentioning(
+            [_edge(f'edge-{i}', fact) for i, fact in enumerate(facts)],
+        )
+        taskmaster = self._taskmaster_saying(
+            {'142': 'done', '1030': 'pending', '1420': 'done'},
+        )
+
+        await self._sweep(memory_service, taskmaster, 142)
+
+        for fact in facts:
+            assert fact.reads == 1, (
+                f'Expected exactly one extraction entry for {str(fact)!r}, '
+                f'got {fact.reads}'
+            )
