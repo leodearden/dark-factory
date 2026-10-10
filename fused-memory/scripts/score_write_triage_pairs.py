@@ -65,6 +65,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from itertools import chain
+from numbers import Real
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, TypeAlias
@@ -349,6 +350,139 @@ PAIRED_ERRORS: Mapping[str, Callable[[ScoredCase], bool]] = MappingProxyType({
 """The per-write errors each arm is paired against the reference arm on."""
 
 
+class OutcomeCell(StrEnum):
+    """What one production-judged write came to under one regime (PRD §12.3 C2‴).
+
+    :data:`COMPARATIVE_RULES` states each cell's rule; :func:`_outcome_cells`
+    is its one implementation.
+    """
+
+    ATTACH_BELONGS = 'attach_belongs'
+    CONTRADICTION_FLAGGED = 'contradiction_flagged'
+    PLACEABLE_LEFT_FLAT = 'placeable_left_flat'
+    CONTRADICTION_UNFLAGGED = 'contradiction_unflagged'
+    MISFILE_ATTACH = 'misfile_attach'
+    CONTESTED_MISFILE = 'contested_misfile'
+    FALSE_CONTESTED = 'false_contested'
+
+
+DEFAULT_HARM_WEIGHTS: Mapping[str, float] = MappingProxyType({
+    OutcomeCell.CONTESTED_MISFILE: 3,
+    OutcomeCell.FALSE_CONTESTED: 2,
+    OutcomeCell.CONTRADICTION_UNFLAGGED: 2,
+    OutcomeCell.MISFILE_ATTACH: 1,
+    OutcomeCell.PLACEABLE_LEFT_FLAT: 0.5,
+})
+"""PRD §12 D20, provisional (G6). A cell left out weighs 0."""
+
+COMPARATIVE_RULES: Mapping[str, str] = MappingProxyType({
+    'n_writes': (
+        'production-judged writes: judge-band rows whose recon_marker and declares_attach_keys'
+        ' are both false'
+    ),
+    'placeable_writes': (
+        'production-judged writes with at least one pair resolved AGREEING or CORRECTS whose'
+        ' target predates the write (strictly earlier created_at; an undated record is never'
+        ' earlier)'
+    ),
+    'contradiction_writes': (
+        'production-judged writes with at least one pair resolved CORRECTS whose target'
+        ' predates the write'
+    ),
+    'placeable_attaches': (
+        'attaches of placeable writes whose pair resolved AGREEING, CORRECTS or MISFILE'
+    ),
+    'wrong_sibling_misfiles': (
+        'attaches of placeable writes whose pair resolved MISFILE: the write had an earlier'
+        ' home and the arm filed it under another record'
+    ),
+    'wrong_sibling_rate_placeable': (
+        'wrong_sibling_misfiles / placeable_attaches; None when placeable_attaches is 0'
+    ),
+    'wrong_sibling_rate_wilson95': (
+        'Wilson 95% interval (z = 1.96) on wrong_sibling_misfiles of placeable_attaches;'
+        ' None when placeable_attaches is 0'
+    ),
+    'no_known_home_attaches': (
+        'attaches whose pair resolved AGREEING, CORRECTS or MISFILE, of writes that are not'
+        ' placeable'
+    ),
+    'unclear_attaches': (
+        'attaches whose pair resolved UNCLEAR; outside every other figure and every outcome cell'
+    ),
+    'outcomes': (
+        'per regime, the production-judged writes in each cell; one write may fall in two'
+        ' cells. status_quo stores every write flat; arm is what this arm did'
+    ),
+    'harm_weights': (
+        'the weight of each outcome cell, as passed to the scorer; a cell left out weighs 0'
+        ' (PRD §12 D20, provisional)'
+    ),
+    'harm_total': (
+        'per regime, the sum over cells of harm_weights[cell] x outcomes[regime][cell];'
+        ' None when n_writes is 0'
+    ),
+    'harm_delta_vs_status_quo': (
+        'harm_total.arm - harm_total.status_quo, on the same writes; at most 0 means no more'
+        ' harm than storing every write flat; None when n_writes is 0'
+    ),
+    OutcomeCell.ATTACH_BELONGS: 'attached, not filed contested, pair resolved AGREEING',
+    OutcomeCell.CONTRADICTION_FLAGGED: 'filed contested, pair resolved CORRECTS',
+    OutcomeCell.PLACEABLE_LEFT_FLAT: 'a placeable write stored flat',
+    OutcomeCell.CONTRADICTION_UNFLAGGED: (
+        'a contradiction write that was not filed contested against a target resolved'
+        ' CORRECTS, whatever else the regime did with it'
+    ),
+    OutcomeCell.MISFILE_ATTACH: 'attached, not filed contested, pair resolved MISFILE',
+    OutcomeCell.CONTESTED_MISFILE: 'filed contested, pair resolved MISFILE',
+    OutcomeCell.FALSE_CONTESTED: 'filed contested, pair resolved AGREEING',
+})
+"""The rule of every comparative figure and outcome cell; the block carries it as ``rules``."""
+
+_ATTACH_CELLS: Mapping[tuple[Resolution, bool], OutcomeCell] = MappingProxyType({
+    (Resolution.AGREEING, False): OutcomeCell.ATTACH_BELONGS,
+    (Resolution.AGREEING, True): OutcomeCell.FALSE_CONTESTED,
+    (Resolution.CORRECTS, False): OutcomeCell.CONTRADICTION_UNFLAGGED,
+    (Resolution.CORRECTS, True): OutcomeCell.CONTRADICTION_FLAGGED,
+    (Resolution.MISFILE, False): OutcomeCell.MISFILE_ATTACH,
+    (Resolution.MISFILE, True): OutcomeCell.CONTESTED_MISFILE,
+})
+"""An attach's cell by (its pair's resolution, filed contested); UNCLEAR has none."""
+
+
+def _outcome_cells(
+    attached: bool, contested: bool, resolution: Resolution | None,
+    placeable: bool, contradicts: bool,
+) -> frozenset[OutcomeCell]:
+    """The cells one write falls in, under whichever regime took this action."""
+    if attached:
+        cell = _ATTACH_CELLS.get((resolution, contested)) if resolution is not None else None
+        cells = set() if cell is None else {cell}
+    else:
+        cells = {OutcomeCell.PLACEABLE_LEFT_FLAT} if placeable else set()
+    if contradicts and not (contested and resolution is Resolution.CORRECTS):
+        cells.add(OutcomeCell.CONTRADICTION_UNFLAGGED)
+    return frozenset(cells)
+
+
+def _validated_weights(harm_weights: Mapping[str, float]) -> Mapping[OutcomeCell, float]:
+    validated: dict[OutcomeCell, float] = {}
+    for key, weight in harm_weights.items():
+        if key not in OutcomeCell.__members__.values():
+            raise ValueError(
+                f'harm weight {key!r}: {weight!r} names no outcome cell;'
+                f' the cells are {[cell.value for cell in OutcomeCell]}'
+            )
+        if isinstance(weight, bool) or not isinstance(weight, Real) or not (
+            math.isfinite(weight) and weight >= 0
+        ):
+            raise ValueError(
+                f'harm weight {key!r}: {weight!r} is not a finite non-negative number'
+            )
+        validated[OutcomeCell(key)] = weight
+    return MappingProxyType(validated)
+
+
 def _predates(created_at: Mapping[str, datetime], target: str, write: str) -> bool:
     target_at, write_at = created_at.get(target), created_at.get(write)
     return target_at is not None and write_at is not None and target_at < write_at
@@ -405,6 +539,26 @@ class ComparedWrite:
         write = scored.case.memory_id
         return cls(scored, homes.placeable(write), homes.contradicts(write))
 
+    @property
+    def arm_cells(self) -> frozenset[OutcomeCell]:
+        scored = self.scored
+        return _outcome_cells(
+            scored.case.attached, scored.contested, scored.resolution,
+            self.placeable, self.contradicts,
+        )
+
+    @property
+    def status_quo_cells(self) -> frozenset[OutcomeCell]:
+        """Production today stores every write flat."""
+        return _outcome_cells(False, False, None, self.placeable, self.contradicts)
+
+
+REGIMES: Mapping[str, Callable[[ComparedWrite], frozenset[OutcomeCell]]] = MappingProxyType({
+    'status_quo': lambda write: write.status_quo_cells,
+    'arm': lambda write: write.arm_cells,
+})
+"""The two regimes every arm's comparative block scores on the same writes."""
+
 
 @dataclass(frozen=True)
 class ListPrice:
@@ -444,6 +598,7 @@ def score_pairs(
     *,
     reference_arm: str,
     created_at: Mapping[str, datetime] | None = None,
+    harm_weights: Mapping[str, float] = DEFAULT_HARM_WEIGHTS,
 ) -> dict[str, Any]:
     """Score every arm in *cases* against the verdict corpus *verdicts*.
 
@@ -527,21 +682,15 @@ def score_pairs(
     given. *created_at* maps record ids, writes and targets alike, to aware
     instants; :class:`WriteHomes` states when a target predates a write. With
     it, every judge-band row must also carry ``recon_marker`` and
-    ``declares_attach_keys`` as booleans, and the block covers the arm's
-    production-judged writes, the judge-band rows with both flags false:
-
-    - ``n_writes``: production-judged writes.
-    - ``placeable_writes``, ``contradiction_writes``: writes the corpus says
-      belong under, or correct, some record that predates them.
-    - ``placeable_attaches``, ``wrong_sibling_misfiles``,
-      ``wrong_sibling_rate_placeable``, ``wrong_sibling_rate_wilson95``:
-      decided attaches of placeable writes, how many resolved MISFILE, and
-      that ratio with its Wilson 95% interval.
-    - ``no_known_home_attaches``: decided attaches of writes that are not
-      placeable.
-    - ``unclear_attaches``: attaches whose pair resolved UNCLEAR, outside
-      every figure above.
+    ``declares_attach_keys`` as booleans, and the block scores the arm's
+    production-judged writes, the judge-band rows with both flags false,
+    against the status quo, which stores every one of them flat. Each figure
+    and :class:`OutcomeCell` is defined by its entry in
+    :data:`COMPARATIVE_RULES`, which the block carries as ``rules``.
+    *harm_weights* weighs the cells (default :data:`DEFAULT_HARM_WEIGHTS`)
+    and is recorded in the block.
     """
+    weights = _validated_weights(harm_weights)
     cases_by_arm = _cases_by_arm(cases)
     if reference_arm not in cases_by_arm:
         raise ValueError(
@@ -567,7 +716,7 @@ def score_pairs(
                 cases_by_arm[arm],
                 scored[arm],
                 None if arm == reference_arm else scored[reference_arm],
-                homes,
+                None if homes is None else _comparative(scored[arm], homes, weights),
             )
             for arm in cases_by_arm
         },
@@ -621,7 +770,7 @@ def _arm_report(
     cases: Sequence[JudgedCase],
     scored: Sequence[ScoredCase],
     reference: Sequence[ScoredCase] | None,
-    homes: WriteHomes | None,
+    comparative: dict[str, Any] | None,
 ) -> dict[str, Any]:
     judged = [s.case for s in scored]
     return {
@@ -629,7 +778,7 @@ def _arm_report(
         'quality': _quality(scored),
         'runtime': _runtime(judged),
         'paired_vs_reference': None if reference is None else _paired(scored, reference),
-        'comparative': None if homes is None else _comparative(scored, homes),
+        'comparative': comparative,
     }
 
 
@@ -689,13 +838,40 @@ def _quality(scored: Sequence[ScoredCase]) -> dict[str, Any]:
     }
 
 
-def _comparative(scored: Sequence[ScoredCase], homes: WriteHomes) -> dict[str, Any]:
+def _comparative(
+    scored: Sequence[ScoredCase], homes: WriteHomes, weights: Mapping[OutcomeCell, float],
+) -> dict[str, Any]:
     writes = [ComparedWrite.of(s, homes) for s in scored if s.case.production_judged]
+    outcomes = {
+        regime: {cell.value: sum(cell in cells_of(write) for write in writes) for cell in OutcomeCell}
+        for regime, cells_of in REGIMES.items()
+    }
     return {
         'n_writes': len(writes),
         'placeable_writes': sum(write.placeable for write in writes),
         'contradiction_writes': sum(write.contradicts for write in writes),
         **_attach_figures([write for write in writes if write.scored.case.attached]),
+        'outcomes': outcomes,
+        'harm_weights': {cell.value: weight for cell, weight in weights.items()},
+        **_harm_figures(outcomes, weights, measured=bool(writes)),
+        'rules': {str(key): rule for key, rule in COMPARATIVE_RULES.items()},
+    }
+
+
+def _harm_figures(
+    outcomes: Mapping[str, Mapping[str, int]], weights: Mapping[OutcomeCell, float],
+    *, measured: bool,
+) -> dict[str, Any]:
+    totals = {
+        regime: sum(weight * table[cell] for cell, weight in weights.items())
+        for regime, table in outcomes.items()
+    }
+    return {
+        'harm_total': {regime: round(total, 4) if measured else None
+                       for regime, total in totals.items()},
+        'harm_delta_vs_status_quo': (
+            round(totals['arm'] - totals['status_quo'], 4) if measured else None
+        ),
     }
 
 
