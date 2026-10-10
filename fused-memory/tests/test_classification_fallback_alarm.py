@@ -8,6 +8,10 @@ import logging
 from pathlib import Path
 
 import pytest
+
+from fused_memory.middleware import _folded_escalation
+from fused_memory.models.enums import ClassificationFallback
+from fused_memory.services import classification_fallback_alarm
 from fused_memory.services.classification_fallback_alarm import (
     _ANCHOR_TASK_ID,
     DEFAULT_THRESHOLD,
@@ -16,10 +20,6 @@ from fused_memory.services.classification_fallback_alarm import (
     LOG_EVENT,
     ClassificationFallbackAlarm,
 )
-
-from fused_memory.middleware import _folded_escalation
-from fused_memory.models.enums import ClassificationFallback
-from fused_memory.services import classification_fallback_alarm
 
 _ALARM_LOGGER = classification_fallback_alarm.__name__
 
