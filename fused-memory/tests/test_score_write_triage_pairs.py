@@ -34,6 +34,7 @@ import json
 import subprocess
 import sys
 import types
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -783,3 +784,186 @@ class TestSeedRegression:
     def test_paired(self, error: str, expected: dict[str, Any]) -> None:
         paired = _seed_result()['arms'][SEED_CANDIDATE]['paired_vs_reference']
         assert paired[error] == expected
+
+
+# Comparative fixture (PRD §12 C2''': each arm against the status quo on the
+# same write-time writes). Every write is created at T0; a target is created a
+# day before (it predates the write), a day after, or is absent from
+# CREATED_AT (undated, so it can never be shown to predate the write).
+T0 = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
+EARLIER = T0 - timedelta(days=1)
+LATER = T0 + timedelta(days=1)
+COMPARATIVE_WRITES = tuple(f'c{n}' for n in range(13))
+EARLIER_TARGETS = ('a1', 'a2', 'a3', 'a3b', 'a4', 'a5', 'a8', 'a9', 'a11', 'a11b', 'a12')
+CREATED_AT: dict[str, datetime] = {
+    **dict.fromkeys(COMPARATIVE_WRITES, T0),
+    **dict.fromkeys(EARLIER_TARGETS, EARLIER),
+    **dict.fromkeys(('a6', 'a7'), LATER),
+}
+
+COMPARATIVE_VERDICTS = [
+    _vote('c1', 'a1', 'SAME', 'a'),
+    _vote('c2', 'a2', 'CORRECTS', 'a'),
+    _vote('c3', 'a3', 'RELATED', 'a'),
+    _vote('c3', 'a3b', 'EXTENDS', 'a'),
+    _vote('c4', 'a4', 'SUBSUMED', 'a'),
+    _vote('c5', 'a5', 'UNRELATED', 'a'),
+    _vote('c6', 'a6', 'SAME', 'a'),
+    _vote('c7', 'a7', 'CORRECTS', 'a'),
+    _vote('c8', 'a8', 'SAME', 'a'),
+    _vote('c9', 'a9', 'SAME', 'a'),
+    _vote('c10', 'a10', 'SAME', 'a'),
+    _vote('c11', 'a11', 'CORRECTS', 'a'),
+    _vote('c11', 'a11b', 'SAME', 'a'),
+    _vote('c12', 'a12', 'UNCLEAR', 'a'),
+]
+PLACEABLE_WRITES = frozenset({'c1', 'c2', 'c3', 'c4', 'c11'})
+CONTRADICTION_WRITES = frozenset({'c2', 'c11'})
+NOT_PRODUCTION_JUDGED = {'c8': {'recon_marker': True}, 'c9': {'declares_attach_keys': True}}
+
+ARM_ANSWERS: dict[str, dict[str, tuple[str, str | None]]] = {
+    'A': {
+        'c1': ('amended', 'a1'),
+        'c2': ('contested', 'a2'),
+        'c3': ('amended', 'a3'),
+        'c4': ('contested', 'a4'),
+        'c5': ('amended', 'a5'),
+        'c8': ('amended', 'a8'),
+        'c9': ('amended', 'a9'),
+        'c11': ('amended', 'a11b'),
+        'c12': ('amended', 'a12'),
+    },
+    'B': {
+        'c2': ('amended', 'a2'),
+        'c3': ('contested', 'a3'),
+        'c4': ('restated', 'a4'),
+        'c11': ('contested', 'a11'),
+    },
+}
+"""Each arm's non-``stored`` answers; every other judge-band write is stored."""
+
+
+def _write_time(
+    arm: str, memory_id: str, outcome: str, judged: str | None = None,
+    *, recon_marker: bool = False, declares_attach_keys: bool = False, **fields: Any,
+) -> dict[str, Any]:
+    fields.setdefault('band_winner', f'p-{memory_id}')
+    return {
+        **_case(arm, memory_id, outcome, judged, **fields),
+        'recon_marker': recon_marker,
+        'declares_attach_keys': declares_attach_keys,
+        'slates': 'write-time',
+    }
+
+
+def _comparative_arm(arm: str, answers: dict[str, tuple[str, str | None]]) -> list[dict[str, Any]]:
+    judged = [
+        _write_time(arm, write, *answers.get(write, ('stored', None)),
+                    **NOT_PRODUCTION_JUDGED.get(write, {}))
+        for write in COMPARATIVE_WRITES[1:]
+    ]
+    deterministic = _write_time(
+        arm, 'c0', 'restated', band='restated',
+        judge_seconds=None, judge_model=None, usage=None,
+    )
+    return [*judged, deterministic]
+
+
+COMPARATIVE_CASES = [row for arm, answers in ARM_ANSWERS.items()
+                     for row in _comparative_arm(arm, answers)]
+STORE_EVERYTHING = _comparative_arm('S', {})
+
+
+def _score_comparative(
+    cases: list[dict[str, Any]] = COMPARATIVE_CASES, reference_arm: str = 'A', **kwargs: Any,
+) -> dict[str, Any]:
+    kwargs.setdefault('created_at', CREATED_AT)
+    return _mod().score_pairs(cases, COMPARATIVE_VERDICTS, reference_arm=reference_arm, **kwargs)
+
+
+@functools.cache
+def _comparative_result() -> dict[str, Any]:
+    return _score_comparative()
+
+
+def _comparative(arm: str) -> dict[str, Any]:
+    return _comparative_result()['arms'][arm]['comparative']
+
+
+class TestComparativePopulation:
+    def test_without_created_at_no_arm_reports_a_comparative_block(self) -> None:
+        result = _score_comparative(created_at=None)
+        assert {arm: report['comparative'] for arm, report in result['arms'].items()} == {
+            'A': None, 'B': None,
+        }
+
+    def test_the_c2_scorer_reports_comparative_none_on_its_own_inputs(self) -> None:
+        assert all(report['comparative'] is None for report in _synth_result()['arms'].values())
+
+    @pytest.mark.parametrize('arm', ['A', 'B'])
+    def test_with_created_at_every_arm_reports_a_comparative_block(self, arm: str) -> None:
+        assert isinstance(_comparative(arm), dict)
+
+    @pytest.mark.parametrize('arm', ['A', 'B'])
+    def test_only_production_judged_writes_are_compared(self, arm: str) -> None:
+        report = _comparative_result()['arms'][arm]
+        assert report['population'] == {'n_cases': 13, 'n_judge_band': 12}
+        assert report['comparative']['n_writes'] == 10
+
+    def test_recon_markers_and_declared_links_still_count_in_quality(self) -> None:
+        assert _comparative_result()['arms']['A']['quality']['attaches'] == 9
+
+    @pytest.mark.parametrize('write', COMPARATIVE_WRITES[1:])
+    def test_a_write_is_placeable_only_with_an_earlier_belongs_target(self, write: str) -> None:
+        rows = [row for row in STORE_EVERYTHING if row['memory_id'] == write]
+        comparative = _score_comparative(rows, reference_arm='S')['arms']['S']['comparative']
+        production_judged = write not in NOT_PRODUCTION_JUDGED
+        assert {
+            key: comparative[key]
+            for key in ('n_writes', 'placeable_writes', 'contradiction_writes')
+        } == {
+            'n_writes': int(production_judged),
+            'placeable_writes': int(write in PLACEABLE_WRITES),
+            'contradiction_writes': int(write in CONTRADICTION_WRITES),
+        }
+
+    @pytest.mark.parametrize(('arm', 'expected'), [
+        ('A', {
+            'n_writes': 10,
+            'placeable_writes': 5,
+            'contradiction_writes': 2,
+            'placeable_attaches': 5,
+            'wrong_sibling_misfiles': 1,
+            'wrong_sibling_rate_placeable': 0.2,
+            'wrong_sibling_rate_wilson95': [0.0362, 0.6245],
+            'no_known_home_attaches': 1,
+            'unclear_attaches': 1,
+        }),
+        ('B', {
+            'n_writes': 10,
+            'placeable_writes': 5,
+            'contradiction_writes': 2,
+            'placeable_attaches': 4,
+            'wrong_sibling_misfiles': 1,
+            'wrong_sibling_rate_placeable': 0.25,
+            'wrong_sibling_rate_wilson95': [0.0456, 0.6994],
+            'no_known_home_attaches': 0,
+            'unclear_attaches': 0,
+        }),
+    ])
+    def test_wrong_sibling_rate_over_decided_attaches_of_placeable_writes(
+        self, arm: str, expected: dict[str, Any],
+    ) -> None:
+        assert _subset(_comparative(arm), expected) == expected
+
+    def test_no_placeable_decided_attach_reads_none_never_zero(self) -> None:
+        comparative = _score_comparative(STORE_EVERYTHING, reference_arm='S')['arms']['S'][
+            'comparative'
+        ]
+        expected = {
+            'placeable_attaches': 0,
+            'wrong_sibling_misfiles': 0,
+            'wrong_sibling_rate_placeable': None,
+            'wrong_sibling_rate_wilson95': None,
+        }
+        assert _subset(comparative, expected) == expected
