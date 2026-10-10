@@ -7,7 +7,6 @@ import re
 from pathlib import Path
 
 import pytest
-
 from legibility import finding_area
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
