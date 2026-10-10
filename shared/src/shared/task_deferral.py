@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Annotated, Any, Final, Literal, LiteralString, cast, get_type_hints
+from typing import Annotated, Any, Final, Literal, TypedDict, get_type_hints
 
 from pydantic import (
     AfterValidator,
@@ -142,35 +142,26 @@ def parse_utc_timestamp(value: str | datetime) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def _field_error(
-    reason: DeferralInvalidReason, message: LiteralString, **context: object
-) -> PydanticCustomError:
-    return PydanticCustomError(cast(LiteralString, reason.value), message, context)
-
-
 def _utc_timestamp_field(value: Any) -> datetime:
     try:
         return parse_utc_timestamp(value)
     except ValueError as exc:
-        raise _field_error(
-            DeferralInvalidReason.INVALID_VALUE, '{error}', error=str(exc)
-        ) from exc
+        raise PydanticCustomError('invalid_value', '{error}', {'error': str(exc)}) from exc
 
 
 def _non_blank(text: str) -> str:
     if not text.strip():
-        raise _field_error(DeferralInvalidReason.MISSING_FIELD, 'must not be blank')
+        raise PydanticCustomError('missing_field', 'must not be blank')
     return text
 
 
 def _within_grace_bounds(secs: int) -> int:
     low, high = GRACE_BOUNDS
     if not low <= secs <= high:
-        raise _field_error(
-            DeferralInvalidReason.GRACE_OUT_OF_RANGE,
+        raise PydanticCustomError(
+            'grace_out_of_range',
             'must be within {low}..{high} seconds',
-            low=low,
-            high=high,
+            {'low': low, 'high': high},
         )
     return secs
 
@@ -358,6 +349,13 @@ def _required_holder(
     return holder
 
 
+class _Stamp(TypedDict):
+    reason: str | None
+    deferred_at: datetime | None
+    stamped_at: datetime
+    stamped_by: str | None
+
+
 def stamp(
     request: DeferralRequest,
     *,
@@ -369,7 +367,7 @@ def stamp(
     """The one request-to-record translation; only held_by_session takes, and needs, a holder."""
     if holder is not None and not isinstance(request, HeldBySessionRequest):
         raise ValueError(f'a {request.kind.value} deferral has no holder, got {holder!r}')
-    stamped: dict[str, Any] = {
+    stamped: _Stamp = {
         'reason': request.reason,
         'deferred_at': deferred_at,
         'stamped_at': stamped_at,
