@@ -723,9 +723,8 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
 # longer clause gives the guard nothing to fire on.
 #
 # Excluded from OCCURRENCE as token-internal — such an occurrence ends no
-# sentence — each over-selecting when it was treated as a break. The '.'
-# shapes were measured by task 4149 (amendment, reviewer_comprehensive
-# correctness-precision finding); the rest by task 4851:
+# sentence — each measured over-selecting when it was treated as a break
+# (amendment, reviewer_comprehensive correctness-precision finding, task 4149):
 #
 #     filename extension     'Reviews for verify_cmd.py tasks 1020 and 1030
 #                             are pending.' -> {1020, 1030}; the
@@ -738,16 +737,10 @@ _ENUM_PREP_WORDS: tuple[str, ...] = (
 #                             1030 are pending.'
 #     dotted section number  'Reviews for section 4.2.1 tasks 1020 and 1030
 #                             are pending.'
-#     URL query '?'          'Reviews for https://ci/build?ref=main tasks
-#                             1020 and 1030 are pending.'
-#     path/branch ';'        'Statuses of the branch;main tasks 1020 and 1030
-#                             are pending.'
-#     token-internal '!'     'Notes about the yahoo!mail tasks 1020 and 1030
-#                             are pending.'
-#     HTML entity ';'        "Reviews for task_id 'review-&lt;id&gt;' tasks
-#                             1020 and 1030 are pending." — the final ';' is
-#                             followed by a quote, so only the entity rule
-#                             (not the flanking test) excludes it.
+#
+# The same holds for a token-internal ';', '?' or '!' and for the ';' that
+# ends an HTML entity (task 4851). Every excluded shape is pinned in
+# tests/reconciliation/plural_enum_shapes.py::PRECISION_GUARD_SHAPES.
 #
 # A prefix-FINAL break (nothing to its right within prefix, e.g. prefix cut
 # at '\\btasks\\b' immediately after the period) has no right flank and so is

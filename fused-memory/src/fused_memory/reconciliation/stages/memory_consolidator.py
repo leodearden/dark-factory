@@ -1295,7 +1295,7 @@ class MemoryConsolidator(BaseStage):
         # stats rather than left for a reader to reconstruct from logs.
         # The `_candidates`/`_errors` pair closes the last one (task 4851):
         # `_invalidated` alone cannot tell "nothing was stale" from "every
-        # invalidation failed", which is how task 3079 misread a cycle.
+        # invalidation failed".
         # Best-effort: a sweep failure must never abort the stage or leave a
         # partial/incorrect stat — it is logged and swallowed, and NONE of
         # these stats is set for this cycle.  That includes the enumeration
