@@ -126,7 +126,7 @@ SGLang and re-opening the slate are not listed: esc-3720-5 declined option B (§
 Each test re-applies the committed rule to the committed evidence. If one fails, this
 record is stale.
 
-- `fused-memory/tests/arm_harness/test_lme_decision_premises.py::test_every_llm_arm_fell_at_the_throughput_floor_alone_so_none_reached_the_section_5_comparison`
+- `fused-memory/tests/arm_harness/test_lme_decision_premises.py::test_throughput_floor_is_every_llm_arms_only_fail_and_screening_is_negative`
 - `fused-memory/tests/arm_harness/test_lme_screening_artifacts.py::test_the_committed_verdict_is_the_rule_over_the_committed_evidence`
 - `fused-memory/tests/arm_harness/test_lme_llm_axis_artifacts.py::test_theta_ran_no_arm_because_screening_left_no_survivor`
 

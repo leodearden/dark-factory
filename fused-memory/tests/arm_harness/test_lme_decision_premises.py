@@ -9,13 +9,9 @@ Lane discipline: file reads plus ``git`` subprocesses only, and NO ``integration
 marker, so the merge lane's default selection runs them.
 """
 
-import shutil
-import subprocess
 from functools import cache
-from pathlib import Path
 
-import pytest
-
+from arm_harness._lme_artifacts import REPO_ROOT, committed_run_dir, git
 from fused_memory.arm_harness.embedding_preregistration import (
     DECIDING_CONFIGURATION,
     EMBEDDING_PREREGISTRATION_INPUTS_FILENAME,
@@ -35,7 +31,6 @@ from fused_memory.arm_harness.screening import (
 )
 from fused_memory.arm_harness.slate import load_embedding_slate
 
-REPO_ROOT = Path(__file__).parents[3]
 LLM_RECORD = 'plans/local-memory-models-eval-decision-llm.md'
 EMBEDDING_RECORD = 'plans/local-memory-models-eval-decision-embedding.md'
 SCREENING_VERDICT = (
@@ -47,27 +42,14 @@ NON_INFERIOR_EMBEDDERS = frozenset({'granite-embedding-english-r2', 'qwen3-embed
 INFERIOR_EMBEDDERS = frozenset({'qwen3-embedding-4b', 'gte-modernbert-base'})
 
 
-def _git(*args: str) -> subprocess.CompletedProcess[str]:
-    if shutil.which('git') is None:
-        pytest.skip('git is not available; cannot check the committed index')
-    inside = subprocess.run(
-        ['git', 'rev-parse', '--is-inside-work-tree'],
-        cwd=REPO_ROOT, capture_output=True, text=True, check=False,
-    )
-    if inside.returncode != 0:
-        pytest.skip('not a git working tree; cannot check the committed index')
-    return subprocess.run(
-        ['git', *args], cwd=REPO_ROOT, capture_output=True, text=True, check=False
-    )
-
-
 def test_the_llm_decision_record_is_committed():
-    assert LLM_RECORD in _git('ls-files', '--', LLM_RECORD).stdout.splitlines()
+    assert LLM_RECORD in git('ls-files', '--', LLM_RECORD).stdout.splitlines()
 
 
-def test_every_llm_arm_fell_at_the_throughput_floor_alone_so_none_reached_the_section_5_comparison():
+def test_throughput_floor_is_every_llm_arms_only_fail_and_screening_is_negative():
     verdict = load_screening_verdict(SCREENING_VERDICT)
 
+    assert verdict.survivors == ()
     assert verdict.outcome is ScreeningOutcome.NEGATIVE_VERDICT
     assert {
         arm.arm_id: {gate.gate for gate in arm.gates if gate.verdict is GateVerdict.FAIL}
@@ -79,13 +61,6 @@ def test_every_llm_arm_fell_at_the_throughput_floor_alone_so_none_reached_the_se
     }
 
 
-def _run_dir(arm_id: str) -> Path:
-    runs = EMBEDDING / 'runs' / arm_id
-    stamps = sorted(path for path in runs.iterdir() if path.is_dir()) if runs.is_dir() else []
-    assert len(stamps) == 1, f'{arm_id} must have exactly one committed stamp dir: {stamps}'
-    return stamps[0]
-
-
 @cache
 def _embedding_comparisons() -> dict[str, EmbeddingComparison]:
     inputs = load_embedding_preregistration_inputs(
@@ -93,7 +68,7 @@ def _embedding_comparisons() -> dict[str, EmbeddingComparison]:
     )
     comparisons: dict[str, EmbeddingComparison] = {}
     for arm in load_embedding_slate(ARMS_YAML):
-        run_dir = _run_dir(arm.arm_id)
+        run_dir = committed_run_dir(EMBEDDING, arm.arm_id)
         comparisons[arm.arm_id] = compare_embedding_arm(
             inputs,
             load_embedding_run_manifest(run_dir / RUN_MANIFEST_FILENAME),
@@ -103,7 +78,7 @@ def _embedding_comparisons() -> dict[str, EmbeddingComparison]:
 
 
 def test_the_embedding_decision_record_is_committed():
-    assert EMBEDDING_RECORD in _git('ls-files', '--', EMBEDDING_RECORD).stdout.splitlines()
+    assert EMBEDDING_RECORD in git('ls-files', '--', EMBEDDING_RECORD).stdout.splitlines()
 
 
 def test_the_preregistered_rule_admits_exactly_granite_and_qwen3_0_6b():
@@ -118,9 +93,9 @@ def test_each_inferior_embedder_fails_only_with_indices_recall_at_10_and_every_e
 
     for arm in INFERIOR_EMBEDDERS:
         failing = {
-            (row.metric_id, row.index_configuration)
+            row.metric_id
             for row in comparisons[arm].margins
             if row.index_configuration is DECIDING_CONFIGURATION and not row.admits
         }
-        assert failing == {(EmbeddingMetricId.KNOWN_ITEM_RECALL_AT_10, DECIDING_CONFIGURATION)}, arm
+        assert failing == {EmbeddingMetricId.KNOWN_ITEM_RECALL_AT_10}, arm
     assert all(c.envelope.admits for c in comparisons.values())
