@@ -172,9 +172,10 @@ def make_escalation_server(tmp_path: Path, *, status_lookup=None):
     ('critical', 2, True),   # born-at-L2 at level 2 (B1/B2 primary)
     ('critical', 0, True),   # born-at-L2 severity disjunct at level 0
     ('urgent', 1, True),     # born-at-L2 severity disjunct at level 1
-    # Level≥2 catch-all (D4) — any pending L2 is stop-the-line
+    # Level≥2 (D4) — a pending L2 is stop-the-line only when escalation.pins
+    # classifies it a queue handoff, so info never gates (info-l0-router D3)
     ('blocking', 2, True),   # level≥2 disjunct
-    ('info', 2, True),       # even 'info' at level 2 gates
+    ('info', 2, False),      # info at level 2 never gates
     # B3 — stale plain L1 must NOT gate a fresh run
     ('blocking', 1, False),  # [B3] blocking/L1 → False
     # Plain blocking L0 — primary gate

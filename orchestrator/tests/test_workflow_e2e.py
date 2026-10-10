@@ -6067,16 +6067,18 @@ class TestStaleL1DoesNotSinkRun:
     ('info', 0, False),
     # info at level 1 — same
     ('info', 1, False),
-    # info at level 2 — gated by the level≥2 catch-all (D4: any L2+ is stop-the-line)
-    ('info', 2, True),
+    # info at level 2 — never gates: a level≥2 record gates only when
+    # escalation.pins classifies it a queue handoff (info-l0-router PRD D3)
+    ('info', 2, False),
 ])
 class TestIsGatingEscalation:
     """Unit test of ``_is_gating_escalation`` (truth table over severity×level).
 
     Pins full PRD C7/D4 semantics including B3 (plain blocking L1 → False)
     and disjunct isolation (critical at level 0 hits severity branch only;
-    blocking at level 2 hits level branch only; info at level 2 hits level≥2
-    catch-all regardless of severity).
+    blocking at level 2 hits level branch only).  A level≥2 record gates only
+    when escalation.pins classifies it a queue handoff, so info at level 2
+    never gates (PRD info-l0-router D3).
     """
 
     def test_predicate(self, severity, level, expected):
