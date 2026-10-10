@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
-"""Score every π judge arm with ι and name the configuration Γ3 is asked about.
+"""Score every π2 judge arm with ι and name the configuration Γ3 is asked about.
 
-Task 5807 (μ), plans/write-triage-flip-readiness-prd.md §11 C2''. π
-(``run_write_triage_population_arms.py``) ran each judge arm over one frozen
-population and published ``calibration/write_triage_population.json``. λ rated
-every pair any arm's judge named (``calibration/write_triage_pair_verdicts.jsonl``).
+Task 5807 (μ), plans/write-triage-flip-readiness-prd.md §11 C2'', rerun on
+write-time slates by task 6532 (§12.3 C2‴). π2
+(``run_write_triage_population_arms.py``) ran each judge arm over the
+write-time slates of one frozen population and published
+``calibration/write_triage_population_write_time.json``. λ and λ2 rated every
+pair any arm's judge named (``calibration/write_triage_pair_verdicts.jsonl``).
 This module scores every arm with ι (``score_write_triage_pairs.py::score_pairs``,
-the one definition of the flip metrics), measures it against Γ3's bounds with
-Γ3's own predicate, and picks the winner.
+the one definition of the flip metrics), against the status quo on the same
+writes, measures it against Γ3's bounds with Γ3's own predicate, and picks the
+winner.
 
 Inputs
 ------
-- The π population artifact, whose ``arms`` rows name each arm's settings and
-  its gitignored case file (``cases_path``, ``cases_sha256``).
+- π2's write-time population artifact, whose ``arms`` rows name each arm's
+  settings and its gitignored case file (``cases_path``, ``cases_sha256``),
+  and whose population block pins the frozen snapshot (``snapshot_path``,
+  ``snapshot_sha256``).
 - The λ verdict corpus.
-- The checkout whose ``data/`` holds π's case files (``--data-root``).
+- The checkout whose ``data/`` holds π2's case files and the snapshot
+  (``--data-root``); the snapshot gives every record's instant.
 - Γ3's bounds, each ``--require PATH OP VALUE`` as task 5808's before_done
   args spell them, without the ``best`` report handle.
 - The shipped judge configuration, resolved from the live fused-memory config.
@@ -52,6 +58,7 @@ import sys
 import types
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
+from datetime import datetime
 from itertools import chain
 from pathlib import Path
 from types import MappingProxyType
@@ -94,15 +101,28 @@ def _load_script(path: Path, mod_name: str) -> types.ModuleType:
 
 _scorer = _load_script(_SCRIPTS / 'score_write_triage_pairs.py', 'score_write_triage_pairs')
 _wording = _load_script(_SCRIPTS / 'write_triage_judge_wording.py', 'write_triage_judge_wording')
+_freeze = _load_script(
+    _SCRIPTS / 'freeze_write_triage_population.py', 'freeze_write_triage_population',
+)
+_arms = _load_script(
+    _SCRIPTS / 'run_write_triage_population_arms.py', 'run_write_triage_population_arms',
+)
 _gate = _load_script(
     _REPO_ROOT / 'scripts' / 'check_write_triage_readiness_gate.py',
     'check_write_triage_readiness_gate',
 )
 
-POPULATION_KEYS: tuple[str, ...] = (
-    'n_writes', 'n_judge_band', 'projects', 'frozen_at', 'snapshot_sha256',
-)
-"""The C2'' subset of π's population block that μ's artifacts carry."""
+_C2_SOURCE_KEYS: Mapping[str, str] = MappingProxyType({
+    'n_writes': 'n_writes',
+    'n_judge_band': 'n_judge_band_write_time',
+    'projects': 'projects',
+    'frozen_at': 'frozen_at',
+    'snapshot_sha256': 'snapshot_sha256',
+})
+"""Each population key μ's artifacts carry, and the key of π2's population block it is read from."""
+
+POPULATION_KEYS: tuple[str, ...] = tuple(_C2_SOURCE_KEYS)
+"""The C2'' population keys μ's artifacts carry, read from π2's write-time population block."""
 
 
 class MatrixInputError(ValueError):
@@ -167,7 +187,7 @@ class PiArm:
 
 @dataclass(frozen=True)
 class Population:
-    """π's published population: its population block and its arms, in π's order."""
+    """π2's published population: its population block and its arms, in π2's order."""
 
     block: Mapping[str, Any]
     arms: tuple[PiArm, ...]
@@ -184,7 +204,15 @@ class Population:
             raise MatrixInputError(
                 f'the population artifact is not shaped as π publishes it: {malformed}'
             ) from None
-        absent = [key for key in POPULATION_KEYS if key not in block]
+        slates = block.get('slates')
+        if slates != _arms.Slates.WRITE_TIME:
+            raise MatrixInputError(
+                'μ scores write-time slates (PRD §12 D19); this artifact\'s population.slates'
+                f' is {slates!r}, not {_arms.Slates.WRITE_TIME.value!r}'
+            )
+        absent = [
+            key for key in (*_C2_SOURCE_KEYS.values(), 'snapshot_path') if key not in block
+        ]
         if absent:
             raise MatrixInputError(f'the population artifact\'s population block lacks {absent}')
         names = [arm.name for arm in arms]
@@ -198,7 +226,7 @@ class Population:
         return [arm.name for arm in self.arms]
 
     def c2_block(self) -> dict[str, Any]:
-        return {key: self.block[key] for key in POPULATION_KEYS}
+        return {key: self.block[source] for key, source in _C2_SOURCE_KEYS.items()}
 
 
 def _pi_arm(index: int, row: Mapping[str, Any]) -> PiArm:
@@ -237,6 +265,7 @@ def _read_arm(arm: PiArm, population: Population, data_root: Path) -> list[dict[
     rows = _read_jsonl(path)
     _refuse_foreign_rows(arm, path, rows, 'arm', arm.name)
     _refuse_foreign_rows(arm, path, rows, 'snapshot_sha256', population.block['snapshot_sha256'])
+    _refuse_foreign_rows(arm, path, rows, 'slates', _arms.Slates.WRITE_TIME.value)
     return rows
 
 
@@ -248,6 +277,24 @@ def _refuse_foreign_rows(
         raise MatrixInputError(
             f'arm {arm.name}: {path} holds rows whose {key} is {foreign}, not {expected!r}'
         )
+
+
+def read_record_created_at(population: Population, data_root: Path) -> dict[str, datetime]:
+    """Every record's instant, from the snapshot the population pins and nothing else."""
+    path = Path(data_root) / population.block['snapshot_path']
+    try:
+        snapshot, actual = _freeze.load_snapshot(path)
+    except FileNotFoundError as missing:
+        raise MatrixInputError(
+            f'{missing.filename} does not exist; pass the checkout holding π2\'s data/'
+            ' (e.g. the main checkout) as --data-root'
+        ) from None
+    pinned = population.block['snapshot_sha256']
+    if actual != pinned:
+        raise MatrixInputError(
+            f'{path} has sha256 {actual}, but the population pins snapshot_sha256 {pinned}'
+        )
+    return _freeze.record_created_at(snapshot)
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -475,7 +522,7 @@ def _paired_against(
 
 
 def _refuse_judge_band_drift(population: Population, scored: Mapping[str, Any]) -> None:
-    published = population.block['n_judge_band']
+    published = population.c2_block()['n_judge_band']
     for arm in population.arms:
         held = scored[arm.name]['population']['n_judge_band']
         if held != published:
