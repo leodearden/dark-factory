@@ -7,9 +7,11 @@ document is measured from the tree and rendered two ways:
 * **Ratification table** (D3) — ``docs/legibility/exception-ratifications.yaml``,
   the closed world of operator rulings.  This module is its only loader.
 * **Static discovery** (D5) — every ``governed_exceptions(...)`` call evaluated
-  at import, read from the AST of the tracked tree.  Its literals are bound
-  through the vocabulary's own signature and constructors; the key set and its
-  count rules stay with the runtime call at collection.
+  at import, read from the AST of the tracked tree.  The call is by its own
+  name, bare or as a module attribute; binding it under another name at import
+  is an instrument failure.  Its literals are bound through the vocabulary's own
+  signature and constructors; the key set and its count rules stay with the
+  runtime call at collection.
 * **Inline suppressions** — read from ``scripts/inline_suppressions.py --json``
   in a subprocess, and passed through verbatim.
 * **Closed world** — every ``Policy`` in a declaration, an inline marker or a
@@ -357,8 +359,10 @@ class _ModuleScan(ast.NodeVisitor):
 
     A call inside a ``def``, ``async def`` or ``lambda`` runs only when that code
     does, so it is a use of the function and not a declaration; a call in a class
-    body runs at import and counts.  ``imports`` maps each imported name to the
-    dotted name it stands for; ``assigned`` holds names the module assigns.
+    body runs at import and counts.  An import-time binding of the function under
+    any other name raises, since its calls could not be followed.  ``imports``
+    maps each imported name to the dotted name it stands for; ``assigned`` holds
+    names the module assigns.
     """
 
     def __init__(self, path: str) -> None:
@@ -385,7 +389,7 @@ class _ModuleScan(ast.NodeVisitor):
         return self._functions == 0 and self._classes == 0
 
     def visit_Call(self, node: ast.Call) -> None:
-        if self._functions == 0 and _terminal_name(node.func) == _FUNCTION_NAME:
+        if self._functions == 0 and _names_function(node.func):
             self.calls.append(node)
         self.generic_visit(node)
 
@@ -396,19 +400,37 @@ class _ModuleScan(ast.NodeVisitor):
                 self.imports[alias.asname or dotted[0]] = dotted if alias.asname else dotted[:1]
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        alias = _renaming_alias(node)
+        if self._functions == 0 and alias is not None:
+            raise _renamed(self.path, node, alias)
         if self._at_module_scope():
             base = _import_base(self.path, node)
-            for alias in node.names:
-                if alias.name != '*':
-                    self.imports[alias.asname or alias.name] = (*base, alias.name)
+            for imported in node.names:
+                if imported.name != '*':
+                    self.imports[imported.asname or imported.name] = (*base, imported.name)
 
     def visit_Assign(self, node: ast.Assign) -> None:
+        self._refuse_renaming(node, node.value, node.targets)
         self._assigns(node.targets)
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self._refuse_renaming(node, node.value, [node.target])
         self._assigns([node.target])
         self.generic_visit(node)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self._refuse_renaming(node, node.value, [node.target])
+        self.generic_visit(node)
+
+    def _refuse_renaming(
+        self, node: ast.stmt | ast.expr, value: ast.expr | None, targets: Sequence[ast.expr]
+    ) -> None:
+        if self._functions > 0 or value is None or not _names_function(value):
+            return
+        renaming = [target for target in targets if not _is_function_name(target)]
+        if renaming:
+            raise _renamed(self.path, node, ast.unparse(renaming[0]))
 
     def _assigns(self, targets: list[ast.expr]) -> None:
         if self._at_module_scope():
@@ -467,6 +489,32 @@ def _terminal_name(node: ast.expr) -> str | None:
     if isinstance(node, ast.Attribute):
         return node.attr
     return None
+
+
+def _names_function(node: ast.expr) -> bool:
+    """Whether *node* names the function, bare or as a module attribute."""
+    return _terminal_name(node) == _FUNCTION_NAME
+
+
+def _is_function_name(target: ast.expr) -> bool:
+    return isinstance(target, ast.Name) and target.id == _FUNCTION_NAME
+
+
+def _renaming_alias(node: ast.ImportFrom) -> str | None:
+    """The other name *node* binds the function under, if any; whatever the source module."""
+    for alias in node.names:
+        if alias.name == _FUNCTION_NAME and alias.asname not in (None, _FUNCTION_NAME):
+            return alias.asname
+    return None
+
+
+def _renamed(path: str, node: ast.stmt | ast.expr, alias: str) -> InstrumentFailure:
+    return InstrumentFailure(
+        f'{path}:{node.lineno}: `{ast.unparse(node)}` binds {_FUNCTION_NAME} as `{alias}`, so '
+        'the static register could not follow its calls here or in any module importing it '
+        f'(PRD D5); import and call it as `{_FUNCTION_NAME}`, or alias the module with '
+        '`import shared.governed_exceptions as <name>`'
+    )
 
 
 def _bind(site: str, call: ast.Call) -> Mapping[str, ast.expr]:

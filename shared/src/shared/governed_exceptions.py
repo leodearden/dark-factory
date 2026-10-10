@@ -577,7 +577,9 @@ def governed_exceptions(
     literals.  Only this runtime call also sees the KEY SET — the container's
     actual contents, which no AST can enumerate — so this is the one place keys
     and dispositions are reconciled, and the only place that can notice a list
-    has quietly grown an entry.
+    has quietly grown an entry.  Call it by its own name, bare or as
+    ``<module>.governed_exceptions``: the static register refuses an
+    import-time alias with exit 2.
 
     ``dispositions`` defaults to an empty ``MappingProxyType`` rather than
     ``{}``: ruff's B006 forbids a mutable default, and the immutable proxy is
