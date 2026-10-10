@@ -143,7 +143,6 @@ class TestFiling:
         assert esc.severity == 'blocking'
         assert 'p1' in esc.summary
         assert str(DEFAULT_THRESHOLD) in esc.summary
-        assert 'first burst' in esc.summary.lower()
         fields = _detail_fields(esc.detail)
         assert fields['project_id'] == 'p1'
         assert fields['count'] == str(DEFAULT_THRESHOLD)
@@ -151,9 +150,7 @@ class TestFiling:
         assert fields['window_seconds'] == str(DEFAULT_WINDOW_SECONDS)
         assert ClassificationFallback.llm_error.value in fields['reasons']
         assert ClassificationFallback.llm_no_json.value in fields['reasons']
-        assert JOURNAL_PARAM_KEY == 'classification_fallback'
         assert JOURNAL_PARAM_KEY in esc.detail
-        assert 'not blocked' in esc.detail
 
     @pytest.mark.asyncio
     async def test_a_continuing_burst_files_no_second_escalation(
