@@ -5,6 +5,7 @@ import inspect
 import logging
 from collections.abc import Mapping
 
+from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES
 from fused_memory.reconciliation.standing_decision_writer import ARM2_MIN_DISTINCT_RUNS
 from fused_memory.utils.referent_resolution import render_referent_declaration_guidance
 
@@ -817,7 +818,7 @@ _STAGE2_GRAPHITI_QUEUED_GUIDANCE = _GRAPHITI_QUEUED_GUIDANCE_TEMPLATE.format(
 _RECON_REPORT_PLACEHOLDERS = {
     'run_id': '<from Reconciliation Context>',
     'finding_id': '<finding_id from add_finding response>',
-    'severity': '<severity>',
+    'severity': '<' + '|'.join(repr(v) for v in FINDING_SEVERITY_VALUES) + '>',
     'category': '<category>',
     'description': '<description>',
     'suggested_action': '<suggested_action>',
@@ -836,6 +837,21 @@ _RECON_REPORT_PLACEHOLDERS = {
     'store': "<'mem0'|'graphiti'>",
     'cited_run_id': '<full 36-char run UUID>',
 }
+
+
+# Keys are machine-checked against FINDING_SEVERITY_VALUES by
+# tests/test_finding_severity_vocabulary.py.
+FINDING_SEVERITY_GLOSSES: dict[str, str] = {
+    'minor': 'cosmetic mismatch',
+    'moderate': 'wrong information',
+    'serious': 'fundamentally contradictory state',
+}
+
+
+def render_finding_severity_vocabulary() -> str:
+    """Render the finding severity vocabulary, glossed, in ascending order."""
+    items = [f'`{s}` ({FINDING_SEVERITY_GLOSSES[s]})' for s in FINDING_SEVERITY_VALUES]
+    return f'{", ".join(items[:-1])}, or {items[-1]}'
 
 
 

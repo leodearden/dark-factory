@@ -12,6 +12,7 @@ from fused_memory.reconciliation.prompts import (
     DUPLICATE_FINDING_SALVAGE_GUIDANCE,
     get_recon_report_tool_guidance,
     render_escalation_boundary_note,
+    render_finding_severity_vocabulary,
 )
 from fused_memory.reconciliation.task_count_snapshot_cadence import (
     SNAPSHOT_PRUNED_STAT_KEY,
@@ -96,8 +97,7 @@ divergence between stores, or knowledge gaps.
 ## Guidelines
 - Sample broadly: check a representative set, not just flagged items.
 - Report findings with specific evidence (IDs, content, contradictions).
-- Classify severity: minor (cosmetic mismatch), moderate (wrong information), \
-serious (fundamentally contradictory state).
+- Classify severity: {render_finding_severity_vocabulary()}.
 - {_STAGE3_PROJECT_ID_GUIDELINE}
 
 {render_graphiti_degradation_probe_section(runs_probes=False)}
@@ -190,7 +190,7 @@ missing or stale for any of these projects, **skip the finding entirely**.
 ## Finding Classification (REQUIRED)
 Each finding MUST include these fields:
 - `description`: What the inconsistency is, with specific IDs and evidence.
-- `severity`: One of `"minor"`, `"moderate"`, or `"serious"`.
+- `severity`: One of {render_finding_severity_vocabulary()}.
 - `actionable`: `true` if Stage 1/Stage 2 can fix it automatically (stale edges, duplicates, \
 contradictions, task mismatches); `false` if it needs human judgment.
 - `category`: One of: `memory_stale`, `memory_duplicate`, `memory_contradiction`, \
