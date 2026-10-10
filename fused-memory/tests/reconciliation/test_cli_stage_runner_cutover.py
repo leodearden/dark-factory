@@ -627,6 +627,63 @@ class TestReconTranscriptArchiveKey:
         assert not recon_transcript_archive_key(self.RUN_ID).isdigit()
 
 
+class TestReconArchiveRoot:
+    """recon_archive_root: the one composition home for the recon archive root."""
+
+    LOGGER = 'fused_memory.reconciliation.cli_stage_runner'
+
+    def test_composes_against_explore_codebase_root(self, tmp_path):
+        from fused_memory.config.schema import ReconciliationConfig
+        from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
+
+        cfg = ReconciliationConfig(explore_codebase_root=str(tmp_path))
+
+        assert recon_archive_root(cfg) == (
+            tmp_path / 'data' / 'orchestrator' / 'agent-transcripts'
+        )
+
+    def test_disabled_returns_none_and_creates_nothing(self, tmp_path):
+        from fused_memory.config.schema import ReconciliationConfig
+        from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
+
+        cfg = ReconciliationConfig(
+            explore_codebase_root=str(tmp_path), transcript_archive_enabled=False,
+        )
+
+        assert recon_archive_root(cfg) is None
+        assert list(tmp_path.iterdir()) == []
+
+    def test_malformed_config_returns_none_and_warns(self, tmp_path, caplog):
+        """A config regression disables archival loudly rather than raising on
+        the recon dispatch path. The plain assignment is the shape an in-place
+        ``apply_reload`` mutation lands in: no validate_assignment."""
+        import logging
+
+        from fused_memory.config.schema import ReconciliationConfig
+        from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
+
+        cfg = ReconciliationConfig(explore_codebase_root=str(tmp_path))
+        cfg.transcript_archive_root = None  # type: ignore[assignment]
+
+        with caplog.at_level(logging.WARNING, logger=self.LOGGER):
+            result = recon_archive_root(cfg)
+
+        assert result is None
+        warnings = [
+            r for r in caplog.records
+            if r.name == self.LOGGER and r.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1, [r.getMessage() for r in warnings]
+
+    def test_returns_a_path_not_a_string(self, tmp_path):
+        from fused_memory.config.schema import ReconciliationConfig
+        from fused_memory.reconciliation.cli_stage_runner import recon_archive_root
+
+        cfg = ReconciliationConfig(explore_codebase_root=str(tmp_path))
+
+        assert isinstance(recon_archive_root(cfg), Path)
+
+
 class TestResumeParamForwarding:
     """run_stage_via_cli forwards resume_session_id + resume_delivers_prompt into
     invoke_with_cap_retry (task 2717 σ resume seam); both default to None/False so
