@@ -2423,50 +2423,10 @@ class TestPromoteToL2SeverityInheritance:
 
     The explicit argument stays fully honoured — a cluster of individually
     informational findings CAN be collectively blocking, and the watcher must
-    still be able to say so.
+    still be able to say so.  A derivation that lands on 'info' is now REFUSED
+    rather than minted (PRD info-l0-disposition-router D4, task 5222), and is
+    observable through the refusal's ``derived_severity``.
     """
-
-    @pytest.mark.asyncio
-    async def test_lone_info_member_yields_info_l2(self, tmp_path: Path):
-        """(a) The esc-3037 regression: an info L1 must not mint a blocking L2.
-
-        Observed incident: esc-3037-1 (L0, info, architect) → esc-3037-3 (L1,
-        info, harness-orphan-reaper — severity faithfully preserved) →
-        esc-3037-4 (L2, *blocking*, escalation-watcher-auto,
-        members=['esc-3037-3'], later closed as benign).  The inflation happens
-        at the promotion seam and only there.
-        """
-        queue = EscalationQueue(tmp_path / 'esc')
-        server = create_server(queue)
-        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
-
-        result = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
-        )
-
-        assert 'error' not in result, f'Unexpected error: {result}'
-        record = queue.get(result['id'])
-        assert record is not None
-        assert record.severity == 'info', (
-            f'Lone info member must yield an info L2, got {record.severity!r}'
-        )
-        assert record.level == 2, f'Expected level=2, got {record.level}'
-
-    @pytest.mark.asyncio
-    async def test_all_info_members_yield_info_l2(self, tmp_path: Path):
-        """(b) An all-info member set inherits 'info'."""
-        queue = EscalationQueue(tmp_path / 'esc')
-        server = create_server(queue)
-        _seed_l1(queue, 'esc-l1-a', 'task-1', 'info')
-        _seed_l1(queue, 'esc-l1-b', 'task-2', 'info')
-
-        result = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-a', 'esc-l1-b']},
-        )
-
-        record = queue.get(result['id'])
-        assert record is not None
-        assert record.severity == 'info', f'Expected info, got {record.severity!r}'
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2674,12 +2634,12 @@ class TestPromoteToL2SeverityInheritance:
                     'root_cause': f'corrupt-sibling {order[0]}',
                 },
             )
-            record = queue.get(result['id'])
-            assert record is not None
-            assert record.severity == 'info', (
+            assert result['status'] == 'refused', result
+            assert result['derived_severity'] == 'info', (
                 f'Order {order} must derive from the valid subset only, got '
-                f'{record.severity!r}'
+                f'{result!r}'
             )
+        assert await _get_pending(server, level=2) == []
 
     @pytest.mark.asyncio
     async def test_partial_resolution_derives_from_the_resolvable_subset(
@@ -2700,11 +2660,10 @@ class TestPromoteToL2SeverityInheritance:
                 **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info', 'esc-phantom-2']},
             )
 
-        record = queue.get(result['id'])
-        assert record is not None
-        assert record.severity == 'info', (
+        assert result['status'] == 'refused', result
+        assert result['derived_severity'] == 'info', (
             'Partial resolution must derive from the resolvable subset, '
-            f'got {record.severity!r}'
+            f'got {result!r}'
         )
         warned = [
             r for r in caplog.records
@@ -2763,16 +2722,20 @@ class TestPromoteToL2SeverityInResponse:
     async def test_create_response_reports_the_inherited_severity(
         self, tmp_path: Path,
     ):
-        """(a) An inherited severity is visible in the response and matches disk."""
+        """(a) An inherited severity is visible in the response and matches disk.
+
+        A lone 'critical' member, because an inherited 'critical' cannot be
+        mistaken for the create path's fail-safe 'blocking'.
+        """
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
-        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+        _seed_l1(queue, 'esc-l1-crit', 'task-1', 'critical')
 
         result = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-crit']},
         )
 
-        assert result['severity'] == 'info', (
+        assert result['severity'] == 'critical', (
             f'Response must report the inherited severity, got: {result}'
         )
         assert result['severity'] == queue.get(result['id']).severity  # type: ignore[union-attr]
@@ -2823,7 +2786,8 @@ class TestPromoteToL2SeverityInResponse:
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
         first = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
         assert first['severity'] == 'info'
 
@@ -2845,10 +2809,10 @@ class TestPromoteToL2SeverityInResponse:
         """(e) The added key is purely additive — no existing consumer breaks."""
         queue = EscalationQueue(tmp_path / 'esc')
         server = create_server(queue)
-        _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
+        _seed_l1(queue, 'esc-l1-blk', 'task-1', 'blocking')
 
         created = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-blk']},
         )
         updated = await _promote_to_l2(
             server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-other']},
@@ -3166,7 +3130,9 @@ class TestPromoteToL2SeverityFloorOnUpdate:
     The root-cause dedup path appends members to an existing pending L2.  Now
     that an L2 can be born `info`, that path must raise the record when the
     incoming members justify it — otherwise the inherited default would trade
-    the old inflation for under-escalation, which is strictly worse.
+    the old inflation for under-escalation, which is strictly worse.  The info
+    L2s below are minted with an explicit ``severity='info'``, because a silent
+    all-info promote is refused rather than minted (task 5222).
     """
 
     @pytest.mark.asyncio
@@ -3181,7 +3147,8 @@ class TestPromoteToL2SeverityFloorOnUpdate:
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
         first = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
         assert queue.get(first['id']).severity == 'info'  # type: ignore[union-attr]
 
@@ -3212,7 +3179,8 @@ class TestPromoteToL2SeverityFloorOnUpdate:
 
         _seed_l1(queue, 'esc-l1-info', 'task-2', 'info')
         second = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
 
         assert second['status'] == 'updated'
@@ -3237,7 +3205,8 @@ class TestPromoteToL2SeverityFloorOnUpdate:
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
         first = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
         assert queue.get(first['id']).severity == 'info'  # type: ignore[union-attr]
 
@@ -3289,7 +3258,8 @@ class TestPromoteToL2SeverityFloorOnUpdate:
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
         first = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
         before = queue.get(first['id'])
         assert before is not None and before.severity == 'info'
@@ -3331,7 +3301,8 @@ class TestPromoteToL2SeverityFloorOnUpdate:
         _seed_l1(queue, 'esc-l1-info', 'task-1', 'info')
 
         first = await _promote_to_l2(
-            server, **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info']},
+            server,
+            **{**_L2_DEFAULTS, 'member_ids': ['esc-l1-info'], 'severity': 'info'},
         )
         # Append a phantom id once so it is already a member...
         await _promote_to_l2(
