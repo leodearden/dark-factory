@@ -11471,6 +11471,39 @@ async def test_backlog_iterator_chunk_failure_restores_only_the_failing_chunk(
     assert failed_chunk.id in {c.kwargs.get('run_id') for c in drain_spy.await_args_list}
 
 
+@pytest.mark.asyncio
+async def test_backlog_iterator_deadline_restores_only_the_in_flight_chunk(
+    journal, event_buffer, mock_memory_service, tmp_path,
+):
+    """Task 6453: BacklogIterator.run owns its cycle_timeout_seconds deadline.
+    When it fires, the in-flight chunk's event is restored, the earlier
+    completed chunk's event stays drained, and TimeoutError propagates."""
+    harness, _ = _make_completing_harness(
+        journal, event_buffer, mock_memory_service, tmp_path,
+    )
+    harness.config.cycle_timeout_seconds = 2
+    _first_stage_completes_once_then(harness, _stalling_stage_run(asyncio.Event()))
+    for _ in range(3):
+        await event_buffer.push(_make_event())
+
+    with patch(
+        'fused_memory.reconciliation.context_assembler.ContextAssembler',
+        side_effect=_one_event_per_chunk_assembler,
+    ):
+        task = asyncio.create_task(BacklogIterator(
+            harness.config, harness.journal, harness.buffer, harness,
+        ).run('test-project'))
+        await asyncio.wait([task], timeout=30)
+
+    assert task.done()
+    assert isinstance(task.exception(), TimeoutError)
+    [completed_chunk] = [
+        r for r in await journal.get_recent_runs('test-project') if r.status == 'completed'
+    ]
+    assert len(await event_buffer.get_drained_events('test-project', completed_chunk.id)) == 1
+    assert await event_buffer.count_buffered('test-project') == 2
+
+
 # ── Tests for Task 2040: bound BacklogIterator with a cumulative budget ────
 
 
