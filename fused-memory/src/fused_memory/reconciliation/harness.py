@@ -6572,12 +6572,46 @@ class BacklogIterator:
             if not assembled.events:
                 break
 
-            # Drain exactly the events that fit the budget
-            event_ids = [e.id for e in assembled.events]
-            await self.buffer.drain_by_ids(project_id, event_ids)
-
             chunk_num += 1
-            chunk_id = str(uuid4())
+            run_id = str(uuid4())
+            if not await self._run_chunk(project_id, chunk_num, assembled, run_id, opus_tier):
+                return  # Stop iteration on failure
+
+        # Final consolidation pass — skipped when the loop yielded on the
+        # cumulative budget (task 2040): the remaining backlog stays
+        # buffered for the next cycle instead of forcing an extra
+        # consolidation cycle past the budget.
+        if chunk_num > 0 and not yielded:
+            logger.info(f'Backlog final consolidation for {project_id}')
+            run_id = str(uuid4())
+            try:
+                await asyncio.wait_for(
+                    self.harness.run_full_cycle(
+                        project_id, 'backlog_final_consolidation',
+                        tier=opus_tier,
+                        run_id=run_id,
+                    ),
+                    timeout=self.config.cycle_timeout_seconds,
+                )
+            except Exception as e:
+                logger.error(f'Backlog final consolidation failed: {e}')
+                await self._restore_unless_completed(project_id, run_id)
+
+    async def _run_chunk(
+        self,
+        project_id: str,
+        chunk_num: int,
+        assembled: AssembledPayload,
+        run_id: str,
+        tier: TierConfig,
+    ) -> bool:
+        """Drain and process one chunk as run *run_id*; False when it failed,
+        its own events restored, and iteration must stop."""
+        chunk_id = str(uuid4())
+        try:
+            await self.buffer.drain_by_ids(
+                project_id, [e.id for e in assembled.events], run_id=run_id,
+            )
             await self.journal.record_chunk_boundary(
                 project_id, chunk_id, len(assembled.events),
             )
@@ -6588,39 +6622,29 @@ class BacklogIterator:
                 f'{assembled.events_remaining} remaining) for {project_id}'
             )
 
-            try:
-                await asyncio.wait_for(
-                    self.harness.run_full_cycle(
-                        project_id, f'backlog_chunk:{chunk_num}:{len(assembled.events)}',
-                        tier=opus_tier,
-                        events=assembled.events,
-                        assembled_payload=assembled,
-                    ),
-                    timeout=self.config.cycle_timeout_seconds,
-                )
-            except Exception as e:
-                logger.error(f'Backlog chunk {chunk_num} failed: {e}')
-                self.harness._escalate(
-                    'recon_backlog_overflow', chunk_id,
-                    f'Backlog chunk {chunk_num} failed, stopping iteration: {e}',
-                )
-                await self.buffer.restore_drained(project_id)
-                return  # Stop iteration on failure
+            await asyncio.wait_for(
+                self.harness.run_full_cycle(
+                    project_id, f'backlog_chunk:{chunk_num}:{len(assembled.events)}',
+                    tier=tier,
+                    events=assembled.events,
+                    assembled_payload=assembled,
+                    run_id=run_id,
+                ),
+                timeout=self.config.cycle_timeout_seconds,
+            )
+        except Exception as e:
+            logger.error(f'Backlog chunk {chunk_num} failed: {e}')
+            self.harness._escalate(
+                'recon_backlog_overflow', chunk_id,
+                f'Backlog chunk {chunk_num} failed, stopping iteration: {e}',
+            )
+            await self._restore_unless_completed(project_id, run_id)
+            return False
+        return True
 
-        # Final consolidation pass — skipped when the loop yielded on the
-        # cumulative budget (task 2040): the remaining backlog stays
-        # buffered for the next cycle instead of forcing an extra
-        # consolidation cycle past the budget.
-        if chunk_num > 0 and not yielded:
-            logger.info(f'Backlog final consolidation for {project_id}')
-            try:
-                await asyncio.wait_for(
-                    self.harness.run_full_cycle(
-                        project_id, 'backlog_final_consolidation',
-                        tier=opus_tier,
-                    ),
-                    timeout=self.config.cycle_timeout_seconds,
-                )
-            except Exception as e:
-                logger.error(f'Backlog final consolidation failed: {e}')
-                await self.buffer.restore_drained(project_id)
+    async def _restore_unless_completed(self, project_id: str, run_id: str) -> None:
+        await await_best_effort(
+            restore_unless_completed(self.journal, self.buffer, project_id, run_id),
+            what='restore_unless_completed', run_id=run_id,
+            logger=logger, level=logging.ERROR,
+        )

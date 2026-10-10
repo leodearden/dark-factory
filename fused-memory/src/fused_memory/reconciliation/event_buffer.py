@@ -681,12 +681,14 @@ class EventBuffer:
         ``drained_by_run_id IS NULL`` when ``run_id`` is set (ignored
         otherwise — the project-wide path already covers them). This closes
         the upgrade-boundary gap where events drained by a pre-task-2711
-        process carry no run attribution: since every current code path now
-        always stamps ``drained_by_run_id`` on drain, a NULL row can only be
-        left over from a process that no longer exists by the time a recovery
-        pass runs, so it is provably safe to fold into a *specific* run's
-        recovery without reintroducing the concurrent-run clobber the run
-        scoping was added to prevent (task 2711 amendment, reviewer finding).
+        process carry no run attribution: since every production drain path
+        (``drain`` from ``run_full_cycle``, ``drain_by_ids`` from
+        ``BacklogIterator``, task 6453) stamps ``drained_by_run_id`` as it
+        drains, a NULL row can only be left over from a process that no longer
+        exists by the time a recovery pass runs, so it is provably safe to
+        fold into a *specific* run's recovery without reintroducing the
+        concurrent-run clobber the run scoping was added to prevent (task 2711
+        amendment, reviewer finding).
         Callers that need the exact-match-only contract (e.g. one caller's
         ``mark_drained_run_id`` attribution racing another's) must keep the
         default ``False``.
@@ -725,12 +727,11 @@ class EventBuffer:
     ) -> int:
         """Attribute already-drained rows to the run about to process them.
 
-        Used by the BacklogIterator path: ``drain_by_ids`` drains a chunk's
-        events *before* ``run_full_cycle`` mints that chunk's run_id, so those
-        rows would otherwise carry no ``drained_by_run_id`` attribution. This
-        lets the harness stamp them retroactively so a later run-scoped
-        ``restore_drained`` can restore exactly that chunk's events (task 2711
-        / E7).
+        ``run_full_cycle``'s attribution for caller-supplied ``events``, so a
+        later run-scoped ``restore_drained`` can restore exactly that run's
+        events (task 2711 / E7). BacklogIterator already stamps each chunk's
+        run_id at ``drain_by_ids`` (task 6453), which makes this an idempotent
+        re-stamp on that path.
 
         Only rows currently ``status = 'drained'`` are touched; ids that don't
         exist, aren't currently drained, or are empty are silently ignored (no
