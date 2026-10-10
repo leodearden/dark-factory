@@ -620,9 +620,10 @@ def _default_census_launcher(
 
     Captures the census exit code and, on a NON-ZERO exit, emits ONE loud
     warning (PRD decision 8: degradation never silent -- the silent-census
-    incident, task 2952). census.py's own main() files the escalation for the
-    failing stage; this loud log is the trickle-side trace so a failed census
-    is never invisible in the nightly's own journal. Keeps ``check=False``:
+    incident, task 2952). census.py's main() escalates every failure once its
+    config has loaded; a failure before that (a bad ``--project-root``, an
+    unreadable config, an import-time crash, a signal kill) leaves only its
+    stderr and this warning. Keeps ``check=False``:
     census runs AFTER the trickle's own commit work, so a census failure must
     never crash or fail the nightly run.
 
@@ -654,9 +655,9 @@ def _default_census_launcher(
     result = subprocess.run(argv, check=False)
     if result.returncode != 0:
         logger.warning(
-            "legibility trickle: census subprocess exited non-zero (returncode=%s) "
-            "-- census filed its own escalation for the failing stage; the nightly "
-            "trickle's own commit work is unaffected",
+            "legibility trickle: census subprocess exited non-zero (returncode=%s); "
+            "its own stderr above carries the cause -- the nightly trickle's own "
+            "commit work is unaffected",
             result.returncode,
         )
 
