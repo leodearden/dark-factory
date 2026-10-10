@@ -23,6 +23,8 @@ from _store_mutation_preflight_contract import (
 )
 from shared.testing_streams import StdoutWithAFailingFlush
 
+from fused_memory.config.schema import WriteTriageProjectCalibration
+
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'audit_duplicate_memories.py'
 
 
@@ -3930,8 +3932,6 @@ def _fake_config(t_high: float | None = 0.9,
                  t_high_by_category: dict[str, float] | None = None,
                  project_calibrations: dict[str, dict[str, float]] | None = None):
     """*project_calibrations* maps project -> cutoffs; None omits the section."""
-    from fused_memory.config.schema import WriteTriageProjectCalibration  # noqa: PLC0415
-
     config = types.SimpleNamespace(
         write_triage=types.SimpleNamespace(
             t_high=t_high, t_high_by_category=t_high_by_category,

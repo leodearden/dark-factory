@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 from _fm_helpers import load_script_module
+from _jsonl_fixture import parse_jsonl_fixture
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'calibrate_write_triage.py'
 FIXTURE_PATH = Path(__file__).parent / 'fixtures' / 'write_triage_calibration.jsonl'
@@ -57,29 +58,10 @@ def _mod() -> types.ModuleType:
 # Fixture contract
 # ---------------------------------------------------------------------------
 
-def _parse_fixture(path: Path) -> list[dict]:
-    """Parse a committed fixture line-by-line.
-
-    Deliberately parsed here with the stdlib rather than through the
-    script's own load_fixture(), so a bug in the loader cannot mask a
-    defect in the data (and vice versa).
-    """
-    assert path.exists(), f'fixture missing: {path}'
-    out: list[dict] = []
-    for lineno, line in enumerate(path.read_text().splitlines(), 1):
-        if not line.strip():
-            continue
-        try:
-            out.append(json.loads(line))
-        except json.JSONDecodeError as exc:  # pragma: no cover - data defect
-            raise AssertionError(f'{path}:{lineno} is not valid JSON: {exc}') from exc
-    return out
-
-
 @pytest.fixture(scope='module')
 def records() -> list[dict]:
     """The reify fixture — the one the reify-specific rulings and counts pin."""
-    return _parse_fixture(FIXTURE_PATH)
+    return parse_jsonl_fixture(FIXTURE_PATH)
 
 
 @pytest.fixture(
@@ -89,7 +71,7 @@ def records() -> list[dict]:
 )
 def fixture_records(request: pytest.FixtureRequest) -> list[dict]:
     """Every committed curator fixture — the shape contract both must keep."""
-    return _parse_fixture(request.param)
+    return parse_jsonl_fixture(request.param)
 
 
 def _by_prefix(records: list[dict], prefix: str) -> list[dict]:

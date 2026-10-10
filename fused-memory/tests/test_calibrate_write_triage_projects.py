@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 import yaml
 from _fm_helpers import load_script_module
+from _jsonl_fixture import parse_jsonl_fixture
 
 from fused_memory.config.schema import FusedMemoryConfig, WriteTriageProjectCalibration
 
@@ -42,14 +43,9 @@ def _mod() -> types.ModuleType:
     return load_script_module(SCRIPT_PATH, mod_name='calibrate_write_triage')
 
 
-def _parse_fixture(path: Path) -> list[dict]:
-    assert path.exists(), f'fixture missing: {path}'
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-
-
 @pytest.fixture(scope='module')
 def dark_factory_records() -> list[dict]:
-    return _parse_fixture(DARK_FACTORY_FIXTURE_PATH)
+    return parse_jsonl_fixture(DARK_FACTORY_FIXTURE_PATH)
 
 
 def _canonicals_by_cluster(records: list[dict]) -> dict[str, dict]:
@@ -137,7 +133,7 @@ class TestDarkFactoryFixtureContract:
     def test_the_corpus_shares_no_memory_with_the_reify_fixture(
         self, dark_factory_records: list[dict],
     ) -> None:
-        reify_ids = {r['memory_id'] for r in _parse_fixture(REIFY_FIXTURE_PATH)}
+        reify_ids = {r['memory_id'] for r in parse_jsonl_fixture(REIFY_FIXTURE_PATH)}
         shared = sorted(reify_ids & {r['memory_id'] for r in dark_factory_records})
         assert not shared, f'the two corpora must be disjoint (R3); shared: {shared}'
 
