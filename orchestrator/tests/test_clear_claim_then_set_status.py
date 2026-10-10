@@ -16,11 +16,12 @@ import pytest
 from shared.task_claimant import is_stranded
 
 from orchestrator.config import OrchestratorConfig
-from orchestrator.scheduler import Scheduler, SetTaskStatusRejected
+from orchestrator.scheduler import Scheduler, SetTaskStatusRejected, TickContext
 
 TID = '4621'
 DEAD_CLAIMANT = 'run-dead0000/4621-x/pid=999999'
 STALE_HEARTBEAT = '2026-08-19T21:57:20+00:00'
+FIXED_DT = datetime(2026, 10, 10, 12, 0, 0, tzinfo=UTC)
 
 
 class _TaskRowStore:
@@ -140,3 +141,30 @@ async def test_rejected_flip_leaves_cleared_row_never_pending_with_stale_claiman
     assert (row['status'], row['claimant_run_id']) == ('in-progress', None)
     assert store.pending_with_stale_claimant() == []
     assert is_stranded(row, datetime.now(UTC), timedelta(seconds=300))
+
+
+class _NoOpenEscalations:
+    def get_by_task(self, task_id: str, status: str | None = None) -> list:
+        return []
+
+
+@pytest.mark.asyncio
+async def test_stranded_blocked_sweep_leaves_pending_with_null_claimant(
+    tmp_path: Path, forbid_live_mcp,
+) -> None:
+    store = _TaskRowStore(_claimed_row('blocked'))
+    scheduler = Scheduler(
+        OrchestratorConfig(project_root=tmp_path),
+        mcp_session=store,
+        wall_time_source=lambda: FIXED_DT,
+    )
+    scheduler.escalation_queue = _NoOpenEscalations()  # type: ignore[assignment]
+    task = dict(store.row)
+    ctx = TickContext(tasks=[task], status_map={TID: 'blocked'}, tasks_by_id={TID: task})
+
+    await scheduler._phase_redispatch_stranded_blocked(ctx)
+
+    row = await scheduler.get_task(TID)
+    assert row is not None
+    assert (row['status'], row['claimant_run_id']) == ('pending', None)
+    assert [name for name, _ in store.writes] == ['set_task_claimant', 'set_task_status']
