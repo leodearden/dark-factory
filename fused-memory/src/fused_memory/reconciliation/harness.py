@@ -10,7 +10,7 @@ import os
 import socket
 import time
 import traceback
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -72,6 +72,11 @@ from fused_memory.reconciliation.scope_freshness import (
     ScopeFreshnessResult,
     compute_scope_signature,
     precheck_scope_correction_freshness,
+)
+from fused_memory.reconciliation.sqlite_failures import (
+    await_best_effort,
+    sqlite_classification,
+    sqlite_log_fields,
 )
 from fused_memory.reconciliation.stages.memory_consolidator import (
     MemoryConsolidator,
@@ -734,16 +739,6 @@ def _stage2_ledger_write_missing(report: object) -> bool:
     return _cycle_summary_ledger_write_missing(report, 'stage2')
 
 
-def _sqlite_classification(exc: BaseException) -> dict[str, object]:
-    """Set by the sqlite3 module on errors it raises, None for any other
-    exception; see plans/recon-sqlite-database-locked-rca-2026-09-16.md for
-    what they mean."""
-    return {
-        'sqlite_errorname': getattr(exc, 'sqlite_errorname', None),
-        'sqlite_errorcode': getattr(exc, 'sqlite_errorcode', None),
-    }
-
-
 def _run_failure_record(
     exc: BaseException,
     *,
@@ -762,15 +757,8 @@ def _run_failure_record(
         'error_message': str(exc) if error_message is None else error_message,
         'failed_stage': failed_stage,
         'traceback': ''.join(traceback.format_exception(exc)),
-        **_sqlite_classification(exc),
+        **sqlite_classification(exc),
     }
-
-
-def _run_failure_log_fields(run_id: str, record: Mapping[str, object]) -> str:
-    return (
-        f"run_id={run_id} sqlite_errorname={record['sqlite_errorname']} "
-        f"sqlite_errorcode={record['sqlite_errorcode']}"
-    )
 
 
 def _log_dropped_escalation(category: str, run_id: str, summary: str, *, reason: str) -> None:
@@ -2462,9 +2450,10 @@ class ReconciliationHarness:
           the per-run config dir.  ``record_run_session``'s snapshot is
           best-effort (can go stale after an internal cap retry), so a missing
           transcript means there is nothing to ``--resume``.  A NULL session_id
-          is NOT a failure — the interrupt landed between stages, so the run
-          resumes with every remaining stage fresh (no --resume), degrading
-          cleanly.
+          is NOT a failure — no session was captured (the interrupt landed
+          between stages, or the stage's best-effort ``record_run_session``
+          write failed), so the run resumes with every remaining stage fresh
+          (no --resume), degrading cleanly.
         """
         # Freshness — measured from the interrupt instant (completed_at).
         if run.completed_at is None:
@@ -3966,44 +3955,23 @@ class ReconciliationHarness:
                 run.completed_at = datetime.now(UTC)
                 run.status = RunStatus.completed
                 await self.journal.complete_run(run_id, 'completed')
-
-                # Cross-check self-reported stats against write-journal ops BEFORE the
-                # judge reads them. Stage agents sometimes over-report successful
-                # writes when Mem0 silently dedups; the verifier overwrites those
-                # counts with observed truth and keeps the originals under _reported.
-                await verify_and_rewrite_stats(
-                    run_id, run.stage_reports, self.journal.write_journal,
+            except asyncio.CancelledError:
+                await self._record_cancelled_run(run, project_id, current_stage_name)
+                raise
+            except AllAccountsCappedException as e:
+                await self._record_deferred_run(run, project_id, current_stage_name, e)
+                return run
+            except Exception as e:
+                await self._record_failed_run(run, project_id, current_stage_name, e)
+                raise
+            else:
+                # Durably completed: the handlers above can no longer relabel it.
+                await self._finish_durably_completed_cycle(
+                    project_id, run_id, run, tier,
+                    scope=scope,
+                    filtered_task_tree=filtered_task_tree,
+                    filtered_task_tree_fetched_at=filtered_task_tree_fetched_at,
                 )
-
-                # Persist stage reports before judge — the judge reads from the DB,
-                # so reports must be committed before firing the async task.
-                await self.journal.update_run_stage_reports(run_id, run.stage_reports)
-
-                # Task 2278: structural cadence guard for the Stage-2 task_count_snapshot
-                # write — escalates once a confirmed miss has recurred for
-                # TASK_COUNT_SNAPSHOT_MISS_THRESHOLD consecutive full cycles.  Full-cycle
-                # path only (not evaluated from _maybe_remediate); reads the just-persisted
-                # stage report, so this runs after update_run_stage_reports above.
-                await self._maybe_escalate_stale_task_count_snapshot(project_id, run_id, run)
-
-                # Async judge review. Fire-and-forget: it outlives this cycle and
-                # is intentionally NOT tracked by _active_runs / recon_busy (which
-                # scopes to the stage pipeline only — see recon_busy_snapshot).
-                # Stage reports are already persisted above, so a cycle-aware
-                # restart cancelling an in-flight judge here is an accepted
-                # trade-off (task 2703 δ) — made non-lossy by the durable
-                # judge_pending marker _spawn_judge writes before firing (task 2708).
-                if self.judge:
-                    await self._spawn_judge(run_id, project_id)
-
-                # Remediation pass: thread scope resolved above (task 1163) and pass
-                # pre-fetched tree to avoid a redundant fetch (ref: task 478), plus
-                # the instant it was read so the live-workflow gate ages heartbeats
-                # against that read, not a fresh clock (task 4115).
-                await self._maybe_remediate(project_id, run_id, run, tier,
-                                            scope=scope,
-                                            filtered_task_tree=filtered_task_tree,
-                                            filtered_task_tree_fetched_at=filtered_task_tree_fetched_at)
 
                 logger.info(
                     'reconciliation.run_completed',
@@ -4014,97 +3982,6 @@ class ReconciliationHarness:
                     },
                 )
                 return run
-
-            except asyncio.CancelledError:
-                # asyncio.wait_for cancels via CancelledError, which is NOT a subclass of
-                # Exception in Python 3.8+.  Without this handler the journal run is left
-                # stuck in 'running'.  Mark it failed, restore events, then re-raise so
-                # asyncio cancellation semantics are preserved.
-                #
-                # Two defences against cleanup being interrupted:
-                # 1. asyncio.shield() — runs the cleanup coroutine in its own Task so a
-                #    second cancellation (e.g. server shutdown) cannot abort the DB write.
-                # 2. Independent try/except BaseException per cleanup step — each step
-                #    runs regardless of the other's outcome, and CancelledError is still
-                #    re-raised to the caller.
-                #
-                # Task σ: when resume_after_restart is enabled, a restart cancelling an
-                # in-flight stage is a RESUMABLE interrupt, not a failure. Mark the run
-                # `interrupted` and DELIBERATELY skip restore_drained — the drained
-                # events must stay drained so the startup adopt-and-resume pass can feed
-                # a resumed cycle's fresh later stages without double-processing. The
-                # (session_id, stage_cursor) snapshot survives on the run row (BaseStage
-                # .run skips clear_run_session on cancel), and the finally below skips the
-                # config-dir GC for interrupted runs so the transcript survives for
-                # --resume. When the knob is off, keep today's failed + restore path
-                # verbatim (a deploy that changed recon prompts/tooling opts out of resume
-                # this way, since a --resume'd session finishes under the OLD system
-                # prompt by construction).
-                if self.config.resume_after_restart:
-                    run.status = RunStatus.interrupted
-                    try:
-                        await asyncio.shield(
-                            self.journal.complete_run(run_id, 'interrupted')
-                        )
-                    except BaseException as cleanup_err:
-                        logger.error(
-                            'complete_run(interrupted) failed after cancellation: '
-                            f'{cleanup_err}'
-                        )
-                    logger.warning(
-                        f'Reconciliation run {run_id} INTERRUPTED (resumable) for '
-                        f'{project_id} (stage: {current_stage_name})'
-                    )
-                    raise
-                run.status = RunStatus.failed
-                run.stage_reports['_error'] = {
-                    'error_type': 'CancelledError',
-                    'error_message': 'Run cancelled (timeout or external cancellation)',
-                    'failed_stage': current_stage_name,
-                    'traceback': '',
-                }
-                try:
-                    await asyncio.shield(self.journal.complete_run(run_id, 'failed'))
-                except BaseException as cleanup_err:
-                    logger.error(f'complete_run failed after cancellation: {cleanup_err}')
-                try:
-                    await asyncio.shield(self.buffer.restore_drained(project_id))
-                except BaseException as cleanup_err:
-                    logger.error(f'restore_drained failed after cancellation: {cleanup_err}')
-                logger.error(
-                    f'Reconciliation run {run_id} cancelled for {project_id} '
-                    f'(stage: {current_stage_name})'
-                )
-                raise
-            except AllAccountsCappedException as e:
-                run.status = RunStatus.failed
-                run.stage_reports['_error'] = {
-                    'error_type': 'AllAccountsCappedException',
-                    'error_message': str(e),
-                    'failed_stage': current_stage_name,
-                    'deferred': True,
-                }
-                await self.journal.complete_run(run_id, 'failed')
-                await self.buffer.restore_drained(project_id)
-                logger.warning(
-                    f'Reconciliation deferred: all accounts capped during stage '
-                    f'{current_stage_name} ({e.retries} retries in {e.elapsed_secs:.1f}s)'
-                )
-                return run
-            except Exception as e:
-                failure = _run_failure_record(e, failed_stage=current_stage_name)
-                logger.error(
-                    'Reconciliation failed: %s (%s)', e, _run_failure_log_fields(run_id, failure),
-                )
-                run.status = RunStatus.failed
-                run.stage_reports['_error'] = failure
-                await self.journal.complete_run(run_id, 'failed')
-                await self.buffer.restore_drained(project_id)
-                self._escalate(
-                    'recon_failure', run_id,
-                    f'Stage {current_stage_name} failed: {e}',
-                )
-                raise
             finally:
                 # TERMINAL backstop. Task 4186 hoisted a copy of this call to
                 # the top of the Stage-3 iteration above (the pre-Stage-3
@@ -4122,6 +3999,192 @@ class ReconciliationHarness:
                     run, run_id, project_id, current_stage_name, cycle_start_time,
                 )
                 await self._persist_stage_reports_then_gc_config_dir(run)
+
+    async def _record_cancelled_run(
+        self, run: ReconciliationRun, project_id: str, current_stage_name: str | None,
+    ) -> None:
+        """Journal a ``run_full_cycle`` cancelled before durable completion; the
+        caller re-raises, so asyncio cancellation semantics hold
+        (``asyncio.wait_for`` cancels via CancelledError, which is not an
+        Exception, so without this the row would stay 'running').
+
+        Task σ: when resume_after_restart is enabled, a restart cancelling an
+        in-flight stage is a RESUMABLE interrupt, not a failure. The run is
+        marked `interrupted` and restore_drained is DELIBERATELY skipped — the
+        drained events must stay drained so the startup adopt-and-resume pass
+        can feed a resumed cycle's fresh later stages without double-processing.
+        The (session_id, stage_cursor) snapshot survives on the run row
+        (BaseStage.run skips clear_run_session on cancel), and run_full_cycle's
+        finally skips the config-dir GC for interrupted runs so the transcript
+        survives for --resume. When the knob is off the run is failed and its
+        events restored (a deploy that changed recon prompts/tooling opts out of
+        resume this way, since a --resume'd session finishes under the OLD
+        system prompt by construction).
+
+        Every write is best-effort and shielded, so a second cancellation (e.g.
+        server shutdown) cannot abort it and a write failure cannot replace the
+        cancellation.
+        """
+        run_id = run.id
+        if self.config.resume_after_restart:
+            run.status = RunStatus.interrupted
+            await asyncio.shield(await_best_effort(
+                self.journal.complete_run(run_id, 'interrupted'),
+                what='complete_run(interrupted)', run_id=run_id,
+                logger=logger, level=logging.ERROR,
+            ))
+            logger.warning(
+                f'Reconciliation run {run_id} INTERRUPTED (resumable) for '
+                f'{project_id} (stage: {current_stage_name})'
+            )
+            return
+        run.status = RunStatus.failed
+        run.stage_reports['_error'] = {
+            'error_type': 'CancelledError',
+            'error_message': 'Run cancelled (timeout or external cancellation)',
+            'failed_stage': current_stage_name,
+            'traceback': '',
+        }
+        await self._journal_failed_and_restore_drained(run_id, project_id)
+        logger.error(
+            f'Reconciliation run {run_id} cancelled for {project_id} '
+            f'(stage: {current_stage_name})'
+        )
+
+    async def _record_deferred_run(
+        self,
+        run: ReconciliationRun,
+        project_id: str,
+        current_stage_name: str | None,
+        exc: AllAccountsCappedException,
+    ) -> None:
+        """Journal a ``run_full_cycle`` deferred because every account is capped:
+        failed, with its drained events restored for a later cycle. The caller
+        returns the run rather than raising."""
+        run.status = RunStatus.failed
+        run.stage_reports['_error'] = {
+            'error_type': 'AllAccountsCappedException',
+            'error_message': str(exc),
+            'failed_stage': current_stage_name,
+            'deferred': True,
+        }
+        await self._journal_failed_and_restore_drained(run.id, project_id)
+        logger.warning(
+            f'Reconciliation deferred: all accounts capped during stage '
+            f'{current_stage_name} ({exc.retries} retries in {exc.elapsed_secs:.1f}s)'
+        )
+
+    async def _record_failed_run(
+        self,
+        run: ReconciliationRun,
+        project_id: str,
+        current_stage_name: str | None,
+        exc: Exception,
+    ) -> None:
+        """Journal a ``run_full_cycle`` ended by *exc* before durable completion
+        and file recon_failure; the caller re-raises *exc*."""
+        run_id = run.id
+        failure = _run_failure_record(exc, failed_stage=current_stage_name)
+        logger.error(
+            'Reconciliation failed: %s (%s)', exc, sqlite_log_fields(run_id, failure),
+        )
+        run.status = RunStatus.failed
+        run.stage_reports['_error'] = failure
+        # Filed first: a failing or cancelled bookkeeping write below must not lose it (esc-5545-1).
+        self._escalate(
+            'recon_failure', run_id,
+            f'Stage {current_stage_name} failed: {exc}',
+        )
+        await self._journal_failed_and_restore_drained(run_id, project_id)
+
+    async def _journal_failed_and_restore_drained(self, run_id: str, project_id: str) -> None:
+        """The bookkeeping every ``run_full_cycle`` failure arm shares: journal
+        *run_id* failed, then re-buffer *project_id*'s drained events.
+
+        Each write is best-effort, so neither skips the other nor replaces the
+        failure being handled. The pair is shielded as one unit, so a second
+        cancellation landing mid-way still lets both land, and still propagates.
+        """
+        async def journal_failed_then_restore() -> None:
+            await await_best_effort(
+                self.journal.complete_run(run_id, 'failed'),
+                what='complete_run(failed)', run_id=run_id,
+                logger=logger, level=logging.ERROR,
+            )
+            await await_best_effort(
+                self.buffer.restore_drained(project_id),
+                what='restore_drained', run_id=run_id,
+                logger=logger, level=logging.ERROR,
+            )
+
+        await asyncio.shield(journal_failed_then_restore())
+
+    async def _finish_durably_completed_cycle(
+        self,
+        project_id: str,
+        run_id: str,
+        run: ReconciliationRun,
+        tier: TierConfig,
+        *,
+        scope: ProjectScope,
+        filtered_task_tree: FilteredTaskTree,
+        filtered_task_tree_fetched_at: datetime,
+    ) -> None:
+        """The stats/judge/remediation tail of a run that ``complete_run(run_id,
+        'completed')`` has already made durable.
+
+        A failure here is a logged degradation that never relabels the run,
+        restores its drained events or files recon_failure, and cancellation
+        propagates (task 5561, pinned by
+        tests/test_harness.py::test_run_full_cycle_post_completion_failure_keeps_run_completed).
+        A failing step skips the steps after it, so the judge never reviews stage
+        reports that failed to persist
+        (tests/test_harness.py::test_run_full_cycle_failed_stage_report_persist_skips_the_judge).
+        """
+        try:
+            # Cross-check self-reported stats against write-journal ops BEFORE the
+            # judge reads them. Stage agents sometimes over-report successful
+            # writes when Mem0 silently dedups; the verifier overwrites those
+            # counts with observed truth and keeps the originals under _reported.
+            await verify_and_rewrite_stats(
+                run_id, run.stage_reports, self.journal.write_journal,
+            )
+
+            # Persist stage reports before judge — the judge reads from the DB,
+            # so reports must be committed before firing the async task.
+            await self.journal.update_run_stage_reports(run_id, run.stage_reports)
+
+            # Task 2278: structural cadence guard for the Stage-2 task_count_snapshot
+            # write — escalates once a confirmed miss has recurred for
+            # TASK_COUNT_SNAPSHOT_MISS_THRESHOLD consecutive full cycles.  Full-cycle
+            # path only (not evaluated from _maybe_remediate); reads the just-persisted
+            # stage report, so this runs after update_run_stage_reports above.
+            await self._maybe_escalate_stale_task_count_snapshot(project_id, run_id, run)
+
+            # Async judge review. Fire-and-forget: it outlives this cycle and
+            # is intentionally NOT tracked by _active_runs / recon_busy (which
+            # scopes to the stage pipeline only — see recon_busy_snapshot).
+            # Stage reports are already persisted above, so a cycle-aware
+            # restart cancelling an in-flight judge here is an accepted
+            # trade-off (task 2703 δ) — made non-lossy by the durable
+            # judge_pending marker _spawn_judge writes before firing (task 2708).
+            if self.judge:
+                await self._spawn_judge(run_id, project_id)
+
+            # Remediation pass: thread scope resolved by run_full_cycle (task 1163) and pass
+            # pre-fetched tree to avoid a redundant fetch (ref: task 478), plus
+            # the instant it was read so the live-workflow gate ages heartbeats
+            # against that read, not a fresh clock (task 4115).
+            await self._maybe_remediate(project_id, run_id, run, tier,
+                                        scope=scope,
+                                        filtered_task_tree=filtered_task_tree,
+                                        filtered_task_tree_fetched_at=filtered_task_tree_fetched_at)
+        except Exception as e:
+            logger.warning(
+                'reconciliation.post_completion_tail_failed: %r (%s)',
+                e, sqlite_log_fields(run_id, sqlite_classification(e)),
+                exc_info=True,
+            )
 
     # ── Shared cycle-summary backstop arms ────────────────────────────
     #
@@ -6314,7 +6377,7 @@ class ReconciliationHarness:
                 logger.error(
                     'complete_run(failed) failed after remediation cancellation: %r (%s)',
                     cleanup_err,
-                    _run_failure_log_fields(run_id, _sqlite_classification(cleanup_err)),
+                    sqlite_log_fields(run_id, sqlite_classification(cleanup_err)),
                 )
             logger.error(
                 'Remediation pass %s (parent %s) cancelled for %s (stage: %s)',
@@ -6339,7 +6402,7 @@ class ReconciliationHarness:
         except Exception as e:
             failure = _run_failure_record(e, failed_stage=current_stage_name)
             logger.error(
-                'Remediation pass failed: %s (%s)', e, _run_failure_log_fields(run_id, failure),
+                'Remediation pass failed: %s (%s)', e, sqlite_log_fields(run_id, failure),
             )
             run.status = RunStatus.failed
             run.stage_reports['_error'] = failure
@@ -6349,7 +6412,7 @@ class ReconciliationHarness:
                 logger.error(
                     'complete_run(failed) failed after remediation failure: %r (%s)',
                     write_err,
-                    _run_failure_log_fields(run_id, _sqlite_classification(write_err)),
+                    sqlite_log_fields(run_id, sqlite_classification(write_err)),
                 )
             # Do NOT re-raise — parent run already completed
             # Do NOT restore events — there are none

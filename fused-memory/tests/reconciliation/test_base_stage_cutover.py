@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import sqlite3
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -53,6 +55,15 @@ def _make_stage(
         recon_report_state=recon_report_state,
     )
     return stage
+
+
+def _sqlite_busy_error() -> sqlite3.OperationalError:
+    """The journal lock error, carrying the classification the sqlite3 module
+    stamps on errors it raises itself (mirrors tests/test_harness.py::_sqlite_busy_error)."""
+    err = sqlite3.OperationalError('database is locked')
+    err.sqlite_errorname = 'SQLITE_BUSY'
+    err.sqlite_errorcode = 5
+    return err
 
 
 class _FakeReconState:
@@ -909,6 +920,106 @@ class TestSessionCaptureLifecycle:
             await stage.run([], watermark, [], run_id='run-normal')
 
         journal.clear_run_session.assert_awaited_once_with('run-normal')
+
+    @staticmethod
+    def _one_snapshot_warning(caplog, op: str) -> str:
+        lines = [
+            r.getMessage() for r in caplog.records
+            if r.name == 'fused_memory.reconciliation.stages.base'
+            and r.levelno == logging.WARNING
+            and op in r.getMessage()
+        ]
+        assert len(lines) == 1, f'expected exactly one {op!r} WARNING, got {lines!r}'
+        return lines[0]
+
+    @pytest.mark.asyncio
+    async def test_record_session_failure_is_logged_and_stage_still_runs(
+        self, tmp_path, caplog,
+    ):
+        """The snapshot is advisory: a journal lock on record_run_session must
+        not stop the stage from running (task 5561)."""
+        from fused_memory.models.reconciliation import StageReport
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
+        journal.record_run_session.side_effect = _sqlite_busy_error()
+        runner = AsyncMock(return_value=StageResult(report={}, success=True))
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.reconciliation.stages.base',
+        ), patch('fused_memory.reconciliation.stages.base.run_stage_via_cli', new=runner):
+            report = await stage.run(
+                [], Watermark(project_id='test_project'), [], run_id='run-rec-locked',
+            )
+
+        assert isinstance(report, StageReport)
+        runner.assert_awaited_once()
+        journal.clear_run_session.assert_awaited_once_with('run-rec-locked')
+        line = self._one_snapshot_warning(caplog, 'record_run_session')
+        assert 'run-rec-locked' in line
+        assert stage.stage_id.value in line
+        assert 'sqlite_errorname=SQLITE_BUSY' in line
+
+    @pytest.mark.asyncio
+    async def test_clear_session_failure_does_not_replace_a_successful_return(
+        self, tmp_path, caplog,
+    ):
+        from fused_memory.models.reconciliation import StageReport
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
+        journal.clear_run_session.side_effect = _sqlite_busy_error()
+
+        with caplog.at_level(
+            logging.WARNING, logger='fused_memory.reconciliation.stages.base',
+        ), patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(return_value=StageResult(report={}, success=True)),
+        ):
+            report = await stage.run(
+                [], Watermark(project_id='test_project'), [], run_id='run-clr-locked',
+            )
+
+        assert isinstance(report, StageReport)
+        line = self._one_snapshot_warning(caplog, 'clear_run_session')
+        assert 'run-clr-locked' in line
+        assert 'sqlite_errorname=SQLITE_BUSY' in line
+
+    @pytest.mark.asyncio
+    async def test_clear_session_failure_does_not_mask_the_stage_exception(self, tmp_path):
+        stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
+        journal.clear_run_session.side_effect = _sqlite_busy_error()
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli',
+            new=AsyncMock(side_effect=RuntimeError('subprocess boom')),
+        ), pytest.raises(RuntimeError, match='subprocess boom'):
+            await stage.run(
+                [], Watermark(project_id='test_project'), [], run_id='run-clr-mask',
+            )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize('cancelled_write', ['record_run_session', 'clear_run_session'])
+    async def test_session_write_cancellation_still_propagates(
+        self, tmp_path, cancelled_write,
+    ):
+        """Best-effort means Exception only: a cancellation landing in either
+        snapshot write still cancels the stage."""
+        from fused_memory.reconciliation.cli_stage_runner import StageResult
+
+        stage, journal = self._make_stage_with_real_journal_dir(tmp_path)
+        getattr(journal, cancelled_write).side_effect = asyncio.CancelledError()
+        runner = AsyncMock(return_value=StageResult(report={}, success=True))
+
+        with patch(
+            'fused_memory.reconciliation.stages.base.run_stage_via_cli', new=runner,
+        ), pytest.raises(asyncio.CancelledError):
+            await stage.run(
+                [], Watermark(project_id='test_project'), [], run_id='run-cancel-write',
+            )
+
+        if cancelled_write == 'record_run_session':
+            runner.assert_not_awaited()
 
 
 class TestBaseStageResumeSession:

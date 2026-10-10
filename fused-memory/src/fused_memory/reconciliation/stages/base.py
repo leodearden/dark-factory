@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Awaitable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -33,6 +34,7 @@ from fused_memory.reconciliation.cli_stage_runner import (
     recon_config_base_dir,
     run_stage_via_cli,
 )
+from fused_memory.reconciliation.sqlite_failures import await_best_effort
 from fused_memory.utils.validation import require_project_id, require_run_id
 
 if TYPE_CHECKING:
@@ -277,13 +279,18 @@ class BaseStage:
         # The config dir is derived deterministically from (data_dir, run_id) so
         # all three stages of a run share it and the harness GCs the same path;
         # attempt auto-increments per launch as durable history for task σ (resume).
+        # Both snapshot writes are best-effort (task 5561).
         session_id = str(uuid4())
         config_dir = TaskConfigDir(
             task_id=run_id,
             base_dir=recon_config_base_dir(self.journal.data_dir),
         )
-        await self.journal.record_run_session(
-            run_id, session_id=session_id, stage_cursor=self.stage_id.value
+        await self._write_session_snapshot_best_effort(
+            'record_run_session',
+            run_id,
+            self.journal.record_run_session(
+                run_id, session_id=session_id, stage_cursor=self.stage_id.value
+            ),
         )
 
         # Task σ resume seam: when the startup adopt-and-resume pass supplies the
@@ -340,7 +347,9 @@ class BaseStage:
             raise
         finally:
             if not cancelled:
-                await self.journal.clear_run_session(run_id)
+                await self._write_session_snapshot_best_effort(
+                    'clear_run_session', run_id, self.journal.clear_run_session(run_id),
+                )
 
         completed = datetime.now(UTC)
 
@@ -530,6 +539,22 @@ class BaseStage:
             )
 
         return stage_report
+
+    async def _write_session_snapshot_best_effort(
+        self, op: str, run_id: str, write: Awaitable[None],
+    ) -> None:
+        """Await one session-snapshot journal write, logging rather than raising on failure.
+
+        The snapshot is advisory: the task-σ resume gate
+        (``harness.py::ReconciliationHarness._resume_guard_reason`` and the
+        transcript check in ``run``) validates the transcript on disk instead
+        of trusting it. Cancellation propagates.
+        """
+        await await_best_effort(
+            write,
+            what=f'Stage {self.stage_id.value} session-snapshot write {op}',
+            run_id=run_id, logger=logger, level=logging.WARNING,
+        )
 
     def _build_recovery_prompt(self, run_id: str, stage_payload: str) -> str:
         """Build the continuation prompt delivered to a ``--resume``d stage (task σ).
