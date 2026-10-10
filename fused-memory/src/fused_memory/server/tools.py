@@ -9262,9 +9262,13 @@ def create_mcp_server(
                 the change is a single coherent edit — docs or comments, a
                 rename, a localized behaviour-preserving refactor, a typo/wording
                 fix, a one-spot bug fix — that needs no new abstraction and no
-                cross-module design, and you can name the target file(s). It is
-                fine for a simple task to be high priority or to touch several
-                files/modules, as long as the change is mechanically simple.
+                cross-module design, and you can name the target file(s).
+                Declaring "simple" REQUIRES a non-empty metadata.files naming
+                those files: a fileless simple submission is rejected
+                (error_type='SimpleTaskFilesRequired'), and files=[] does not
+                satisfy it. It is fine for a simple task to be high priority or
+                to touch several files/modules, as long as the change is
+                mechanically simple.
                 When unsure, omit it — the full path is the safe default, and a
                 mis-declared task simply falls back to the architect.
             tag: Tag context (optional)

@@ -2137,9 +2137,12 @@ commits; the architect+implementer pair is skipped, but verify/review/merge
 still run). Declare "simple" only when the change is a single coherent edit
 — docs or comments, a rename, a localized behaviour-preserving refactor, a
 typo/wording fix, a one-spot bug fix — that needs no new abstraction and no
-cross-module design, and you can name the target file(s). It is fine for a
-simple task to be high priority or to touch several files/modules, as long
-as the change is mechanically simple. When unsure, omit it — the full path
+cross-module design, and you can name the target file(s). Declaring
+"simple" REQUIRES a non-empty metadata.files naming those files: a fileless
+simple submission is rejected at submit (SimpleTaskFilesRequired), and
+files=[] does not satisfy it. It is fine for a simple task to be high
+priority or to touch several files/modules, as long as the change is
+mechanically simple. When unsure, omit it — the full path
 is the safe default, and a mis-declared task simply falls back to the
 architect.\
 """
