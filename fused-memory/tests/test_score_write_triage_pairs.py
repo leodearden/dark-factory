@@ -972,3 +972,104 @@ class TestComparativePopulation:
             'wrong_sibling_rate_wilson95': None,
         }
         assert _subset(comparative, expected) == expected
+
+
+OUTCOME_CELLS = (
+    'attach_belongs', 'contradiction_flagged', 'placeable_left_flat', 'contradiction_unflagged',
+    'misfile_attach', 'contested_misfile', 'false_contested',
+)
+D20_WEIGHTS = {
+    'contested_misfile': 3, 'false_contested': 2, 'contradiction_unflagged': 2,
+    'misfile_attach': 1, 'placeable_left_flat': 0.5,
+}
+ALL_ONES = dict.fromkeys(OUTCOME_CELLS, 1)
+
+
+def _table(*counts: int) -> dict[str, int]:
+    return dict(zip(OUTCOME_CELLS, counts, strict=True))
+
+
+STATUS_QUO_TABLE = _table(0, 0, 5, 2, 0, 0, 0)
+ARM_TABLES = {
+    'A': _table(2, 1, 0, 1, 2, 0, 1),
+    'B': _table(1, 1, 1, 1, 0, 1, 0),
+}
+
+
+def _store_everything_comparative(**kwargs: Any) -> dict[str, Any]:
+    return _score_comparative(STORE_EVERYTHING, reference_arm='S', **kwargs)['arms']['S'][
+        'comparative'
+    ]
+
+
+class TestComparativeOutcomes:
+    @pytest.mark.parametrize('arm', ['A', 'B'])
+    def test_each_regime_maps_the_seven_cells_in_order(self, arm: str) -> None:
+        outcomes = _comparative(arm)['outcomes']
+        assert list(outcomes) == ['status_quo', 'arm']
+        assert [list(table) for table in outcomes.values()] == [list(OUTCOME_CELLS)] * 2
+
+    @pytest.mark.parametrize('arm', ['A', 'B'])
+    def test_arm_outcome_table(self, arm: str) -> None:
+        assert _comparative(arm)['outcomes']['arm'] == ARM_TABLES[arm]
+
+    @pytest.mark.parametrize('arm', ['A', 'B'])
+    def test_the_status_quo_stores_every_production_judged_write_flat(self, arm: str) -> None:
+        comparative = _comparative(arm)
+        status_quo = comparative['outcomes']['status_quo']
+        assert status_quo == STATUS_QUO_TABLE
+        assert status_quo['placeable_left_flat'] == comparative['placeable_writes']
+        assert status_quo['contradiction_unflagged'] == comparative['contradiction_writes']
+
+    def test_an_arm_that_stores_everything_is_the_status_quo(self) -> None:
+        comparative = _store_everything_comparative()
+        assert comparative['outcomes']['arm'] == comparative['outcomes']['status_quo']
+        assert comparative['harm_delta_vs_status_quo'] == 0
+
+    @pytest.mark.parametrize('arm', ['A', 'B'])
+    def test_the_default_harm_weights_are_d20_and_recorded(self, arm: str) -> None:
+        assert _comparative(arm)['harm_weights'] == D20_WEIGHTS
+
+    @pytest.mark.parametrize(('arm', 'status_quo', 'harm'), [('A', 6.5, 6.0), ('B', 6.5, 5.5)])
+    def test_harm_totals_and_delta_under_the_default_weights(
+        self, arm: str, status_quo: float, harm: float,
+    ) -> None:
+        comparative = _comparative(arm)
+        assert comparative['harm_total'] == {'status_quo': status_quo, 'arm': harm}
+        assert comparative['harm_delta_vs_status_quo'] == harm - status_quo
+
+    @pytest.mark.parametrize(('arm', 'harm'), [('A', 7), ('B', 5)])
+    def test_custom_harm_weights_are_recorded_and_used(self, arm: str, harm: int) -> None:
+        comparative = _score_comparative(harm_weights=ALL_ONES)['arms'][arm]['comparative']
+        assert comparative['harm_weights'] == ALL_ONES
+        assert comparative['harm_total'] == {'status_quo': 7, 'arm': harm}
+        assert comparative['harm_delta_vs_status_quo'] == harm - 7
+
+    def test_no_production_judged_write_reads_none_harm(self) -> None:
+        rows = [{**row, 'recon_marker': True} for row in STORE_EVERYTHING]
+        comparative = _score_comparative(rows, reference_arm='S')['arms']['S']['comparative']
+        assert comparative['n_writes'] == 0
+        assert comparative['harm_total'] == {'status_quo': None, 'arm': None}
+        assert comparative['harm_delta_vs_status_quo'] is None
+
+    @pytest.mark.parametrize(('key', 'value'), [
+        ('wrong_sibling', 1),
+        ('misfile_attach', -1),
+        ('misfile_attach', float('inf')),
+        ('misfile_attach', float('nan')),
+        ('misfile_attach', True),
+        ('misfile_attach', '1'),
+    ])
+    def test_a_malformed_harm_weight_is_refused_naming_key_and_value(
+        self, key: str, value: object,
+    ) -> None:
+        with pytest.raises(ValueError) as caught:
+            _score_comparative(harm_weights={**D20_WEIGHTS, key: value})
+        assert key in str(caught.value) and repr(value) in str(caught.value), str(caught.value)
+
+    @pytest.mark.parametrize('arm', ['A', 'B'])
+    def test_every_figure_and_cell_carries_its_rule(self, arm: str) -> None:
+        comparative = _comparative(arm)
+        rules = comparative['rules']
+        assert set(rules) == (set(comparative) - {'rules'}) | set(OUTCOME_CELLS)
+        assert all(isinstance(rule, str) and rule.strip() for rule in rules.values())
