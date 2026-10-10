@@ -17,6 +17,7 @@ from shared.cli_invoke import (
     is_zero_output_timeout,
 )
 from shared.config_dir import CONFIG_DIR_PREFIX
+from shared.transcript_archive import resolve_archive_root
 
 from fused_memory.models.reconciliation import FINDING_SEVERITY_VALUES, StageAgentOutcome
 from fused_memory.reconciliation import _RECONCILIATION_STAGE_CAP_WAIT_SANITY_SECS
@@ -703,6 +704,45 @@ def recon_transcript_archive_key(run_id: str) -> str:
       keeps the two producers distinguishable.
     """
     return f'recon-{run_id}'
+
+
+def recon_archive_root(config: ReconciliationConfig) -> Path | None:
+    """Archive root for recon transcripts, or ``None`` when archival is off.
+
+    The SINGLE composition home for both consumers — the ``BaseStage.run``
+    producer hook and ``gc_run_config_dir``'s teardown hook — for the reason
+    ``shared/src/shared/transcript_archive.py::resolve_archive_root`` gives
+    (INV-5): a layout with one home in read and write but several in
+    composition can still drift.
+
+    Anchored at ``explore_codebase_root``, NOT
+    ``ReconciliationHarness._project_root``. ``ReconciliationConfig`` is a
+    sibling of ``TaskmasterConfig`` and carries no project_root of its own;
+    ``_project_root`` is ``''`` whenever ``config.taskmaster is None`` (the
+    schema default); and ``BaseStage`` holds only this submodel. Anchoring on
+    ``_project_root`` would force a second anchor for one layout.
+
+    ``resolve_archive_root`` is deliberately not total. A malformed config
+    (e.g. a reload that lands a non-path root) disables archival with one
+    WARNING instead of raising on the recon dispatch path — the posture the
+    orchestrator's ``Harness._archive_available`` takes for the same call.
+    """
+    if not config.transcript_archive_enabled:
+        return None
+    try:
+        return resolve_archive_root(
+            config.explore_codebase_root, config.transcript_archive_root,
+        )
+    except (TypeError, ValueError) as exc:
+        logger.warning(
+            'recon transcript archival disabled: archive root unresolvable '
+            '(explore_codebase_root=%r transcript_archive_root=%r): %s: %s',
+            config.explore_codebase_root,
+            config.transcript_archive_root,
+            type(exc).__name__,
+            exc,
+        )
+        return None
 
 
 def gc_run_config_dir(data_dir: Path, run_id: str) -> None:
