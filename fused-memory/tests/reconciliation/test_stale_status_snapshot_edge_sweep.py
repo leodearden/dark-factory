@@ -1674,8 +1674,9 @@ class TestPluralEnumerationPerformance:
     Why this is a liveness property and not a micro-optimisation:
     ``sweep_stale_status_snapshot_edges`` calls this extractor once per
     valid edge in an unguarded dict comprehension with no per-edge timeout,
-    over the whole group's edge set (~5868 edges in the task-3042 record).
-    One pathological fact stalls the entire reconciliation cycle.
+    over the whole group's edge set (tens of thousands of edges; current
+    figure in plans/stale-status-snapshot-sweep-report.md). One
+    pathological fact stalls the entire reconciliation cycle.
 
     SIZING NOTE: the blowup base scales with the WIDTH of the whitespace
     run — each extra whitespace character adds another way to split it — so
@@ -2305,7 +2306,7 @@ class TestSelectStaleStatusSnapshotEdgesBlockedRule:
         assert select_stale_status_snapshot_edges([edge], {'2848': 'unknown'}) == []
         assert select_stale_status_snapshot_edges([edge], {'2848': ''}) == []
 
-    @pytest.mark.parametrize('status', ['in-progress', 'review'])
+    @pytest.mark.parametrize('status', ['in-progress', 'review', 'deferred', 'blocked'])
     def test_non_blocked_assertion_is_out_of_the_new_rule_scope(self, status):
         """SCOPE GUARD — this is what forbids the new rule generalising.
 
@@ -2330,6 +2331,32 @@ class TestSelectStaleStatusSnapshotEdgesBlockedRule:
         edge = {'uuid': 'edge-999', 'fact': 'Task 999 is an active pending task', 'name': ''}
 
         assert select_stale_status_snapshot_edges([edge], {'999': status}) == [edge]
+
+    @pytest.mark.parametrize('fact', ['Task 7 is stalled.', 'Task 7 is an active task'])
+    @pytest.mark.parametrize(
+        ('status', 'selected'),
+        [
+            ('pending', False),
+            ('in-progress', False),
+            ('review', False),
+            ('deferred', False),
+            ('blocked', False),
+            ('done', True),
+            ('cancelled', True),
+        ],
+    )
+    def test_stalled_and_active_assertions_are_terminal_rule_only(self, fact, status, selected):
+        """Pins the task-4851 decision NOT to adopt a general contradiction rule.
+
+        'active' maps to several TaskStatus values and 'stalled' to none, so
+        neither marker has a live status it could be contradicted by. Only
+        the terminal rule retires them; any non-terminal live status leaves
+        them alone. Verdict: plans/stale-status-snapshot-sweep-report.md.
+        """
+        edge = {'uuid': 'edge-7', 'fact': fact, 'name': ''}
+
+        expected = [edge] if selected else []
+        assert select_stale_status_snapshot_edges([edge], {'7': status}) == expected
 
     def test_aggregate_blocked_edge_selected_on_a_single_unblocked_member(self):
         """'Blocked tasks: 142, 148' with 142 unblocked to 'pending' and 148
@@ -2913,8 +2940,9 @@ class TestSweepStaleStatusSnapshotEdgesBlockedRuleAndCounters:
 
         Extractor cost is a whole-cycle liveness property in this module (see
         the module docstring): the extractor runs once per valid edge over the
-        whole group's edge set — ~12k edges and ~3.3 s per enumeration on
-        dark_factory post-task-4340 — with no per-edge timeout, so one
+        whole group's edge set — tens of thousands of edges, current figure
+        in plans/stale-status-snapshot-sweep-report.md — with no per-edge
+        timeout, so one
         pathological fact stalls the entire reconciliation cycle. A second
         full pass per edge doubles the cost the module's own performance tests
         exist to bound.

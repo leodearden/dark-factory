@@ -54,7 +54,7 @@ constant — do not restate them here.)
   aggregate list path was once left resting on the gate alone and had to
   be re-anchored (``LIST_INTRODUCER_RE``) once 'blocked' widened the gate
   — task 2885 repro: 4 stale edges survived a blocked->done transition
-  (scanned=5868, invalidated=0) because the gate short-circuited before
+  (invalidated=0) because the gate short-circuited before
   the ``INACTIVE_TASK_STATUSES`` cross-reference ever ran. Any marker
   added to ``_STATUS_MARKER_ALT`` must therefore be re-checked against
   every path individually, not just the individual form —
@@ -83,7 +83,12 @@ constant — do not restate them here.)
   BLOCKED-ASSERTION rule (a blocked-asserted id has a positively-known
   status other than 'blocked'). Neither ever fires on an id whose census
   value is absent or outside the closed
-  ``shared.task_statuses.TaskStatus`` vocabulary.
+  ``shared.task_statuses.TaskStatus`` vocabulary.  The GENERAL rule
+  (asserted status != live status, for every marker) was measured by task
+  4851 and NOT adopted — verdict in
+  ``plans/stale-status-snapshot-sweep-report.md``.  'active' and 'stalled'
+  have no ``TaskStatus`` counterpart, hence no contradiction test, so they
+  stay terminal-rule-only.
 - The sweep is best-effort throughout (mirrors
   ``degenerate_task_node_sweep``): an edge-enumeration
   (``get_all_valid_edges``) or status cross-reference (``get_statuses``)
@@ -170,6 +175,14 @@ Known residuals (deliberate; all fail-safe/under-selection unless noted)
   immediately followed by an alphanumeric ('done.Then', 'done?Then') reads
   as token-internal, so a snapshot behind a listed preposition in the
   previous sentence is missed — see ``_is_token_internal_break``.
+- task 4851, measured: four lexical classes of genuine snapshot sit outside
+  the closed-class copula/article anchoring and are not extracted — a
+  relative clause ('task N, which is pending'), an attributive pre-modifier
+  or predicate nominal ('Blocked task N ...'), a gerund ('due to being
+  pending') and a secondary or coordinated predicate ('is filed and
+  pending').  All four under-select; each would need its own precision
+  pass before widening.  Triage and samples:
+  ``plans/stale-status-snapshot-sweep-report.md``.
 
 Two hypotheses were investigated and RULED OUT for the task-2613 miss
 rate; do not re-open them:
@@ -189,13 +202,18 @@ rate; do not re-open them:
    are recorded).  So at the time of the task-2613
    investigation this sweep saw about half the edges, and the miss rate was
    computed against a truncated denominator.  ``get_all_valid_edges`` is
-   paginated as of task 4340 and the truncation is gone, but the RATE has
-   not been recomputed: a re-measurement against the now-complete corpus is
-   warranted, and the residuals list above is calibrated against the old
-   figure.  Filed as ticket tkt_0RSJP92VQNATQB0FSR20YMXGW8 (a TICKET id,
-   not a task id — the curator resolves it to a task asynchronously).  Do
-   not re-open the LEXICAL hypothesis; do not treat the old rate as
-   measured on a whole corpus.
+   paginated as of task 4340 and the truncation is gone.
+
+   RE-MEASURED, task 4851, against the complete corpus.  The metric's
+   definition and every figure live in
+   ``plans/stale-status-snapshot-sweep-report.md`` and nowhere else.  The
+   durable finding: at steady state the shipped rules select approximately
+   nothing, because the sweep keeps up.  The facts that still name a
+   now-terminal task are an UPPER bound on misses, and by-eye triage finds
+   them mostly NOT status snapshots at all.  The genuine misses are the
+   fail-safe lexical classes listed under Known residuals.  Do not re-open
+   the LEXICAL hypothesis; do not treat the task-2613 rate as measured on a
+   whole corpus.
 2. A shared blind spot with ``task_count_verification``: that function is
    an aggregate census-vs-tree consistency check (``task_filter``), not a
    per-task edge sweep at all — its 'healthy' report was correct, not
@@ -205,19 +223,16 @@ Why a regex in this module gets a performance test at all:
 ``sweep_stale_status_snapshot_edges`` calls
 ``extract_snapshot_edge_task_ids_by_marker_class`` once per valid edge from
 an UNGUARDED dict comprehension with no per-edge timeout, over the whole
-group's edge set (tens of thousands of edges; current figures in
-``plans/falkordb-resultset-cap-audit.md``).  Extractor cost is
+group's edge set (tens of thousands of edges; current figure in
+``plans/stale-status-snapshot-sweep-report.md``).  Extractor cost is
 therefore a whole-cycle LIVENESS property — one pathological fact stalls
 the entire reconciliation cycle — not a micro-optimisation. (amendment,
 task 3079)
 
-The figure was ~5868 in the task-3042 record; that number is consistent
-with a truncated enumeration and has been corrected upward by task 4340's
-live census (see the amendment to ruled-out hypothesis 1 above). The
-LIVENESS argument gets STRONGER, not weaker: with the truncation removed
-the per-edge extractor now runs over roughly twice as many edges per
-cycle, so the per-edge cost this test guards matters more than the
-original number implied, not less.  The read that feeds it was timed
+The corpus this guards keeps growing, and the task-4340 pagination
+removed a truncation that had hidden about half of it (see the amendment
+to ruled-out hypothesis 1 above), so the LIVENESS argument only gets
+STRONGER over time.  The read that feeds it was timed
 2026-08-18 at ~3.3 s per full enumeration on dark_factory (~3.7 s on
 reify) — bounded, and roughly +2.6 s per cycle over the old truncated
 read; see the MEASURED COST section of that same audit doc, so this
@@ -423,9 +438,9 @@ _BLOCKED_MARKER_ALT = r'(?:blocked)'
 # set() after ONE substring scan rather than running five anchored patterns.
 #
 # This is a LIVENESS measure, not a micro-optimisation. The extractor runs
-# once per valid edge over the whole group's edge set (~12k edges post-task-
-# 4340 pagination, ~3.3 s per full enumeration — see the module docstring),
-# and the overwhelming majority of those edges carry no 'blocked' token, so
+# once per valid edge over the whole group's edge set (tens of thousands of
+# edges; current figure in plans/stale-status-snapshot-sweep-report.md; ~3.3 s
+# per full enumeration — see the module docstring), and the overwhelming majority of those edges carry no 'blocked' token, so
 # the pre-gate is what keeps the second pattern family off the hot path.
 _BLOCKED_MARKER_RE: re.Pattern[str] = re.compile(r'\bblocked\b', re.IGNORECASE)
 
@@ -1860,7 +1875,10 @@ def select_stale_status_snapshot_edges(
     became blocked, and — because rule 1 reads union ids — a blocked-status
     trigger there could fire on an id some OTHER marker contributed. Rule 2
     reads only the ids the fact asserts as blocked, which is exactly its
-    scope.
+    scope. The general rule (any asserted status contradicted by the live
+    one) was measured by task 4851 and not adopted; 'active' and 'stalled'
+    have no ``TaskStatus`` counterpart to contradict, so they remain
+    terminal-rule-only — see ``plans/stale-status-snapshot-sweep-report.md``.
 
     Invalidate-only-on-positively-known, throughout: an id absent from
     *statuses*, or mapped to a value outside the closed
