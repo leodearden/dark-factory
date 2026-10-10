@@ -201,3 +201,57 @@ class TestNonAssertiveScopes:
     )
     def test_an_asserted_landing_outside_any_scope_is_still_a_claim(self, text, ref):
         assert _triples(text) == [('applied_work', 'task', ref)]
+
+
+_ESC_5471_1 = (
+    '(3) PRD2 ε #5471 owns the shipped Bool-balance and stock-size examples, '
+    'so a new Bool exemplar here would duplicate it'
+)
+
+
+class TestAttributiveMarkersBindForwardOnly:
+
+    @pytest.mark.parametrize(
+        'text',
+        [
+            pytest.param(_ESC_5471_1, id='esc-unverified-claim-5471-1'),
+            pytest.param(
+                'task 5578 is merge-deferred with a queued carrier branch',
+                id='queued-carrier',
+            ),
+        ],
+    )
+    def test_an_attributive_marker_does_not_claim_an_earlier_ref(self, text):
+        assert _triples(text) == []
+
+    def test_an_attributive_marker_does_not_add_applied_work(self):
+        text = (
+            'task 5317 was EXPANDED to also own wiring the Manifold route into '
+            'the shipped `reify build` CLI'
+        )
+        assert [t for t in _triples(text) if t[0] == 'applied_work'] == []
+
+    def test_an_attributive_marker_leaves_the_filing_claim(self):
+        text = 'dark_factory task 3846 was filed to give recon a landed-on-main check'
+        assert _triples(text) == [('filing_dispatch', 'task', '3846')]
+
+    def test_an_attributive_marker_still_binds_forward(self):
+        assert _triples('the merged commit abc1234 fixed it') == [
+            ('applied_work', 'commit', 'abc1234'),
+        ]
+
+    @pytest.mark.parametrize(
+        ('text', 'ref'),
+        [
+            pytest.param(
+                "Task 4105's landed fix deviates from its task text", '4105',
+                id='possessive-is-not-attributive',
+            ),
+            pytest.param(
+                "task 5422's de-flake fix has been applied", '5422',
+                id='possessive-copula',
+            ),
+        ],
+    )
+    def test_a_possessive_lead_still_claims_its_owner(self, text, ref):
+        assert _triples(text) == [('applied_work', 'task', ref)]

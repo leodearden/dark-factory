@@ -275,6 +275,12 @@ class TestNonAssertiveMoodIsNotTagged:
                 '8246',
                 id='esc-unverified-claim-8246-5',
             ),
+            pytest.param(
+                '(3) PRD2 ε #5471 owns the shipped Bool-balance and stock-size '
+                'examples, so a new Bool exemplar here would duplicate it',
+                '5471',
+                id='esc-unverified-claim-5471-1',
+            ),
         ],
     )
     async def test_non_assertive_phrasing_is_not_tagged(self, tmp_path, content, ref):
