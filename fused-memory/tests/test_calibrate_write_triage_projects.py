@@ -16,12 +16,17 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
+import sys
 import types
 from collections import defaultdict
 from pathlib import Path
 
 import pytest
+import yaml
 from _fm_helpers import load_script_module
+
+from fused_memory.config.schema import WriteTriageProjectCalibration
 
 SCRIPT_PATH = Path(__file__).parent.parent / 'scripts' / 'calibrate_write_triage.py'
 FIXTURES_DIR = Path(__file__).parent / 'fixtures'
@@ -135,3 +140,212 @@ class TestDarkFactoryFixtureContract:
         reify_ids = {r['memory_id'] for r in _parse_fixture(REIFY_FIXTURE_PATH)}
         shared = sorted(reify_ids & {r['memory_id'] for r in dark_factory_records})
         assert not shared, f'the two corpora must be disjoint (R3); shared: {shared}'
+
+
+# ---------------------------------------------------------------------------
+# The project-config writer
+# ---------------------------------------------------------------------------
+
+SECTION = 'write_triage_project_calibrations'
+
+# Restated, not imported: a test module never reaches into a sibling's fixtures.
+# The shipped config.yaml's shape — write_triage is the LAST block, its hand-set
+# knobs sit above the calibration fence, and hand-written prose trails it.
+POOLED_YAML = """\
+# Leading comment that must survive.
+server:
+  host: localhost
+
+write_triage:
+  # OPERATOR KNOBS — hand-set, NOT calibration outputs.
+  enabled: false
+  candidate_k: 32
+  # CALIBRATION OUTPUT — do not hand-edit.
+  t_high: 0.11
+  t_low: 0.05
+  calibration_report_path: old/report.json
+  t_high_by_category:
+    procedural_knowledge: 0.12
+  # EVIDENCE STATUS (hand-added prose — no numbers here).
+  # - procedural_knowledge: has its own cutoff above.
+"""
+
+OTHER = {'calibration_report_path': 'calibration/other.json',
+         't_high_by_category': {'observations_and_summaries': 0.7}}
+
+
+def _write(text: str, project: str = 'dark_factory', cutoffs: dict | None = None,
+           report: str = 'calibration/df.json') -> str:
+    return _mod().write_project_calibration_block(
+        text, project, report,
+        cutoffs if cutoffs is not None else {'preferences_and_norms': 0.9},
+    )
+
+
+def _section(text: str) -> dict:
+    return yaml.safe_load(text)[SECTION]
+
+
+def _block_lines(text: str, key: str) -> list[str]:
+    """The lines of top-level *key*'s block, from its key line to the next column-0 key."""
+    lines = text.splitlines()
+    start = lines.index(key)
+    end = next(
+        (i for i in range(start + 1, len(lines))
+         if lines[i].strip() and not lines[i][0].isspace() and not lines[i].startswith('#')),
+        len(lines),
+    )
+    return lines[start:end]
+
+
+class TestDerivedCategoryCutoffs:
+    def test_only_entries_with_a_derived_t_high_are_returned(self) -> None:
+        report = {'per_category': {
+            'procedural_knowledge': {'t_high': 0.84, 't_low': 0.57, 'reason': None},
+            'observations_and_summaries': {
+                't_high': None, 't_low': None, 'reason': 'insufficient_pairs: 4 duplicate',
+            },
+            'preferences_and_norms': {
+                't_high': None, 't_low': None, 'reason': 'no_judge_band: every measured',
+            },
+        }}
+        assert _mod().derived_category_cutoffs(report) == {'procedural_knowledge': 0.84}
+
+    @pytest.mark.parametrize('report', [{'per_category': {}}, {}], ids=['empty', 'missing'])
+    def test_no_per_category_section_derives_nothing(self, report: dict) -> None:
+        assert _mod().derived_category_cutoffs(report) == {}
+
+
+class TestWriteProjectCalibrationBlock:
+    def test_an_absent_section_is_appended_and_every_existing_line_survives(self) -> None:
+        out = _write(POOLED_YAML)
+        assert out.startswith(POOLED_YAML)
+        assert _section(out) == {'dark_factory': {
+            'calibration_report_path': 'calibration/df.json',
+            't_high_by_category': {'preferences_and_norms': 0.9},
+        }}
+
+    def test_only_the_named_project_entry_is_replaced(self) -> None:
+        with_other = _write(POOLED_YAML, 'other_project', OTHER['t_high_by_category'],
+                            OTHER['calibration_report_path'])
+        out = _write(with_other)
+        assert _section(out)['other_project'] == OTHER
+        assert _section(out)['dark_factory']['t_high_by_category'] == {
+            'preferences_and_norms': 0.9,
+        }
+
+    def test_rewriting_a_project_replaces_its_entry_never_merges(self) -> None:
+        first = _write(POOLED_YAML, cutoffs={
+            'preferences_and_norms': 0.9, 'observations_and_summaries': 0.8,
+        })
+        out = _write(first, cutoffs={'observations_and_summaries': 0.85})
+        assert _section(out)['dark_factory']['t_high_by_category'] == {
+            'observations_and_summaries': 0.85,
+        }
+
+    def test_output_is_sorted_and_idempotent(self) -> None:
+        out = _write(
+            _write(POOLED_YAML, 'z_project', {'b_cat': 0.6, 'a_cat': 0.5}),
+            'a_project', {'d_cat': 0.7, 'c_cat': 0.8},
+        )
+        lines = _block_lines(out, f'{SECTION}:')
+        assert lines.index('  a_project:') < lines.index('  z_project:')
+        assert lines.index('      a_cat: 0.5') < lines.index('      b_cat: 0.6')
+        assert lines.index('      c_cat: 0.8') < lines.index('      d_cat: 0.7')
+        again = _write(out, 'a_project', {'d_cat': 0.7, 'c_cat': 0.8})
+        assert again == out
+
+    def test_an_empty_map_is_refused(self) -> None:
+        with pytest.raises(ValueError, match='evidences nothing'):
+            _write(POOLED_YAML, cutoffs={})
+
+    def test_every_written_entry_validates_as_the_schema_model(self) -> None:
+        out = _write(_write(POOLED_YAML, 'other_project', {'observations_and_summaries': 0.7}))
+        for entry in _section(out).values():
+            WriteTriageProjectCalibration.model_validate(entry)
+
+    def test_the_section_comments_belong_to_the_section(self) -> None:
+        """Indented, so the pooled writer's walk-back cannot claim them as a header."""
+        lines = _block_lines(_write(POOLED_YAML), f'{SECTION}:')
+        comments = [line for line in lines if line.lstrip().startswith('#')]
+        assert comments, 'the section must carry its machine-owned fence'
+        assert all(line.startswith('  #') for line in comments)
+        assert 'machine-owned' in comments[0]
+
+
+class TestTheTwoWritersAreDisjoint:
+    """Neither writer can touch the other's bytes."""
+
+    def test_the_pooled_writer_leaves_the_project_section_intact(self) -> None:
+        text = _write(_write(POOLED_YAML, 'other_project', {'observations_and_summaries': 0.7}))
+        out = _mod().write_triage_config_block(
+            text, 0.2, 0.1, 'calibration/new.json',
+            t_high_by_category={'procedural_knowledge': 0.3},
+        )
+        assert _block_lines(out, f'{SECTION}:') == _block_lines(text, f'{SECTION}:')
+        assert yaml.safe_load(out)['write_triage']['t_high'] == 0.2
+
+    @pytest.mark.parametrize('already_written', [False, True], ids=['append', 'replace'])
+    def test_the_project_writer_leaves_the_pooled_block_intact(
+        self, already_written: bool,
+    ) -> None:
+        text = _write(POOLED_YAML, cutoffs={'observations_and_summaries': 0.5}) \
+            if already_written else POOLED_YAML
+        out = _write(text)
+        assert _block_lines(out, 'write_triage:') == _block_lines(POOLED_YAML, 'write_triage:')
+
+
+class TestWriteProjectConfigCli:
+    @pytest.mark.parametrize('other', [['--write-config'], ['--bands-from', 'base.json']],
+                             ids=['write-config', 'bands-from'])
+    def test_write_project_config_excludes_the_other_outcomes(
+        self, other: list[str], monkeypatch, capsys,
+    ) -> None:
+        monkeypatch.setattr(sys, 'argv', [
+            'calibrate_write_triage.py', '--write-project-config', *other,
+        ])
+        with pytest.raises(SystemExit) as excinfo:
+            _mod().main()
+        assert excinfo.value.code == 2
+        assert 'not allowed with argument' in capsys.readouterr().err
+
+
+def _report(per_category: dict) -> dict:
+    return {'chosen_t_high': 0.99, 'chosen_t_low': 0.01, 'per_category': per_category}
+
+
+class TestWriteProjectConfigHelper:
+    """`_write_project_config`: the CLI's one write, and its refusal."""
+
+    def test_no_derived_category_aborts_and_writes_nothing(self, tmp_path: Path, caplog) -> None:
+        config = tmp_path / 'config.yaml'
+        config.write_text(POOLED_YAML)
+        report = _report({'preferences_and_norms': {
+            't_high': None, 't_low': None, 'reason': 'insufficient_pairs: 10 duplicate',
+        }})
+        with caplog.at_level(logging.ERROR):
+            rc = _mod()._write_project_config(report, config, 'dark_factory', 'r.json')
+        assert rc == 1
+        assert config.read_text() == POOLED_YAML
+        assert 'ABORT' in caplog.text and 'insufficient_pairs' in caplog.text
+
+    def test_a_derived_category_is_written_and_the_pooled_bands_are_not(
+        self, tmp_path: Path,
+    ) -> None:
+        config = tmp_path / 'config.yaml'
+        config.write_text(POOLED_YAML)
+        report_path = Path(_mod().__file__).resolve().parents[1] / 'calibration' / 'df.json'
+        report = _report({
+            'observations_and_summaries': {'t_high': 0.87, 't_low': 0.6, 'reason': None},
+            'preferences_and_norms': {
+                't_high': None, 't_low': None, 'reason': 'insufficient_pairs: 10 duplicate',
+            },
+        })
+        rc = _mod()._write_project_config(report, config, 'dark_factory', str(report_path))
+        out = config.read_text()
+        assert rc == 0
+        assert _section(out) == {'dark_factory': {
+            'calibration_report_path': 'calibration/df.json',
+            't_high_by_category': {'observations_and_summaries': 0.87},
+        }}
+        assert _block_lines(out, 'write_triage:') == _block_lines(POOLED_YAML, 'write_triage:')
