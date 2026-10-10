@@ -82,7 +82,7 @@ def _make_checkpoint(project_root: Path, tmp_path: Path) -> ReviewCheckpoint:
     config.fused_memory.project_id = 'test-project'
     config.escalation.host = 'localhost'
     config.escalation.port = 9999
-    config.module_configs_or_empty.return_value = {}
+    config.module_configs_or_empty = {}
     config.review.briefing_path = 'df-6687-no-such-briefing.yaml'
     config.review.reports_dir = str(tmp_path / 'reports')
     stamp_stock_routing_config(config)
@@ -109,6 +109,7 @@ def reviewer(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
 
 
 def _prompt(reviewer: AsyncMock) -> str:
+    assert reviewer.await_args is not None, 'the deep reviewer was never invoked'
     return reviewer.await_args.kwargs['prompt']
 
 
