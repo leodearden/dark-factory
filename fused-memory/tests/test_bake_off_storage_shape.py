@@ -8266,13 +8266,16 @@ class TestTheSelfHitFilterIsProvenanceBasedNotIdBased:
 
 @pytest.mark.asyncio
 class TestAFailedQueryIsNotAMeasuredZero:
-    """`Mem0Client.search` swallows `TimeoutError` and returns `{}`.
+    """A backend read can come back empty without having measured anything.
 
-    So a network failure and a shape that ranked nothing arrive at `_search`
-    as the same empty list — which this module's own rule ("an empty hits list
-    with a real expectation IS a measured zero") then scores as 0.0 recall,
-    0.0 discoverability and 0.0 guard, indistinguishable in the artifact from
-    a real result.  Every arm seeds the SHARED distractor slab, so an empty
+    The backend's `search` propagates a read `TimeoutError`, but an empty
+    response (`{}`, `None`, no results) is still a possible reply, and a
+    failed query must never be counted as a measured zero.  If a network
+    failure and a shape that ranked nothing ever arrived at `_search` as the
+    same empty list, this module's own rule ("an empty hits list with a real
+    expectation IS a measured zero") would score it as 0.0 recall, 0.0
+    discoverability and 0.0 guard, indistinguishable in the artifact from a
+    real result.  Every arm seeds the SHARED distractor slab, so an empty
     ranking is not a possible outcome here: it is unambiguously detectable and
     must be loud, per the no-silent-fail-soft design invariant.
     """
