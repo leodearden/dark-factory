@@ -4022,14 +4022,28 @@ class TestRunNightlyRecordsTrickleState:
     def test_a_codebook_dump_failure_escalates_instead_of_escaping(
         self, tmp_path, monkeypatch,
     ):
-        def _failing_dump(cb, path):
-            raise OSError('No such file or directory')
+        """Only the night's own dump fails: the fixture seeds its codebook
+        through the same function, before any coding starts."""
+        coding_started = []
 
-        monkeypatch.setattr(codebook, 'dump', _failing_dump)
+        def _invoke(prompt, model):
+            coding_started.append(True)
+            return _fake_invoke_known_cause(prompt, model)
+
+        real_dump = codebook.dump
+
+        def _dump_failing_once_coding_started(cb, path):
+            if coding_started:
+                raise OSError('No such file or directory')
+            real_dump(cb, path)
+
+        monkeypatch.setattr(codebook, 'dump', _dump_failing_once_coding_started)
         recorder, calls = _recorder_spy()
         poster, posted = _capture_poster()
 
-        result, _repo = _run_e2e_nightly(tmp_path, recorder=recorder, poster=poster)
+        result, _repo = _run_e2e_nightly(
+            tmp_path, recorder=recorder, poster=poster, invoke=_invoke,
+        )
 
         assert result.exit_code == 1
         assert result.escalated is True

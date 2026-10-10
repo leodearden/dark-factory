@@ -27,6 +27,7 @@ import os
 import subprocess
 import sys
 import time
+import traceback
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -1308,6 +1309,9 @@ def run_nightly(
     *now* threads through to :func:`evaluate_census_step`'s clock seam and
     to the run-state recorder's ``recorded_at``.
 
+    Every failure after the config loads is returned as ``exit_code=1`` with
+    one escalation (:func:`_crashed_night`); before that it raises.
+
     *status_fetcher* defaults to the real MCP-backed ``get_statuses``
     fetcher for ``cfg.project_root``
     (:func:`census_trigger.default_status_fetcher`) -- inject to override.
@@ -1348,7 +1352,31 @@ def run_nightly(
             raise ValueError('run_nightly requires either config_path or project_id')
         resolved_config_path = resolve_config_path(project_id)
     cfg = load_config(resolved_config_path)
+    try:
+        return _run_configured_nightly(
+            cfg, resolved_config_path,
+            projects_root=projects_root, target_date=target_date, now=now,
+            invoke=invoke, status_fetcher=status_fetcher, poster=poster,
+            committer=committer, recorder=recorder,
+        )
+    except Exception as exc:
+        return _crashed_night(cfg, exc, poster=poster)
 
+
+def _run_configured_nightly(
+    cfg: LegibilityConfig,
+    resolved_config_path: Path,
+    *,
+    projects_root: Path | str | None,
+    target_date: date | None,
+    now: datetime | None,
+    invoke,
+    status_fetcher,
+    poster,
+    committer,
+    recorder,
+) -> NightlyResult:
+    """:func:`run_nightly`'s pass once *cfg* has loaded."""
     if target_date is None:
         target_date = (datetime.now(UTC) - timedelta(days=1)).date()
     if projects_root is None:
@@ -1746,6 +1774,15 @@ def run_nightly(
                 cfg, sample, target_date, result,
                 recorder=recorder, poster=poster, now=now,
             )
+
+
+def _crashed_night(cfg: LegibilityConfig, exc: Exception, *, poster) -> NightlyResult:
+    """The fail-loud result of a pass that raised: one ERROR escalation
+    carrying the full traceback."""
+    summary = f'legibility trickle run crashed: {type(exc).__name__}: {exc}'
+    detail = ''.join(traceback.format_exception(exc))
+    escalated = post_escalation(cfg, summary, detail, poster=poster)
+    return NightlyResult(exit_code=1, escalated=escalated, reason=summary)
 
 
 def _parse_date(value: str) -> date:
