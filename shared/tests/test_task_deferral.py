@@ -513,7 +513,9 @@ print(json.dumps([
 _TASK_DEFERRAL_FIRST_CHILD = """
 import json, sys
 import shared.task_deferral
-print(json.dumps(sys.modules['shared.task_metadata'].is_known_metadata_key('deferral')))
+loaded_metadata = 'shared.task_metadata' in sys.modules
+from shared.task_metadata import is_known_metadata_key
+print(json.dumps([loaded_metadata, is_known_metadata_key('deferral')]))
 """
 
 
@@ -525,8 +527,8 @@ def test_a_process_importing_only_task_metadata_types_the_deferral_slice():
     assert seen == [True, [], 'DeferralRecord', 'HeldBySessionDeferral']
 
 
-def test_a_process_importing_task_deferral_first_knows_the_key():
-    assert run_python_child(_TASK_DEFERRAL_FIRST_CHILD) is True
+def test_task_deferral_loads_without_task_metadata_and_the_key_is_known_after():
+    assert run_python_child(_TASK_DEFERRAL_FIRST_CHILD) == [False, True]
 
 
 
